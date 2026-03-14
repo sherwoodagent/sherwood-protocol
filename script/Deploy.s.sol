@@ -6,10 +6,15 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SyndicateVault} from "../src/SyndicateVault.sol";
 import {ISyndicateVault} from "../src/interfaces/ISyndicateVault.sol";
-import {BatchExecutor} from "../src/BatchExecutor.sol";
+import {BatchExecutorLib} from "../src/BatchExecutorLib.sol";
+import {SyndicateFactory} from "../src/SyndicateFactory.sol";
 
 /**
- * @notice Deploy SyndicateVault (UUPS proxy) + BatchExecutor to Base.
+ * @notice Deploy Sherwood infrastructure to Base:
+ *         1. BatchExecutorLib (shared, stateless)
+ *         2. SyndicateVault implementation
+ *         3. SyndicateFactory (registers both)
+ *         4. First syndicate via factory
  *
  *   Usage:
  *     forge script script/Deploy.s.sol:Deploy \
@@ -44,30 +49,20 @@ contract Deploy is Script {
 
         vm.startBroadcast(deployerKey);
 
-        // 1. Deploy SyndicateVault implementation
-        SyndicateVault impl = new SyndicateVault();
-        console.log("Vault implementation:", address(impl));
+        // 1. Deploy BatchExecutorLib (shared, stateless — deploy once)
+        BatchExecutorLib executorLib = new BatchExecutorLib();
+        console.log("BatchExecutorLib:", address(executorLib));
 
-        // 2. Deploy proxy with initialize calldata
-        ISyndicateVault.SyndicateCaps memory caps = ISyndicateVault.SyndicateCaps({
-            maxPerTx: 10_000e6, // 10k USDC
-            maxDailyTotal: 50_000e6, // 50k USDC
-            maxBorrowRatio: 7500 // 75% LTV
-        });
+        // 2. Deploy SyndicateVault implementation
+        SyndicateVault vaultImpl = new SyndicateVault();
+        console.log("Vault implementation:", address(vaultImpl));
 
-        bytes memory initData =
-            abi.encodeCall(SyndicateVault.initialize, (IERC20(USDC), "Sherwood Vault", "shUSDC", deployer, caps));
+        // 3. Deploy SyndicateFactory
+        SyndicateFactory factory = new SyndicateFactory(address(executorLib), address(vaultImpl));
+        console.log("SyndicateFactory:", address(factory));
 
-        ERC1967Proxy proxy = new ERC1967Proxy(address(impl), initData);
-        address vaultProxy = address(proxy);
-        console.log("Vault proxy:", vaultProxy);
-
-        // 3. Deploy BatchExecutor
-        BatchExecutor executor = new BatchExecutor(vaultProxy, deployer);
-        console.log("BatchExecutor:", address(executor));
-
-        // 4. Allowlist targets
-        address[] memory targets = new address[](8);
+        // 4. Create first syndicate via factory
+        address[] memory targets = new address[](9);
         targets[0] = USDC;
         targets[1] = MOONWELL_mUSDC;
         targets[2] = MOONWELL_COMPTROLLER;
@@ -76,13 +71,26 @@ contract Deploy is Script {
         targets[5] = cbETH;
         targets[6] = wstETH;
         targets[7] = cbBTC;
-        executor.addTargets(targets);
-        // AERO separately (addTargets already used)
-        executor.addTarget(AERO);
-        console.log("Allowlisted 9 targets");
+        targets[8] = AERO;
+
+        (uint256 syndicateId, address vaultProxy) = factory.createSyndicate(
+            SyndicateFactory.SyndicateConfig({
+                metadataURI: "",
+                asset: IERC20(USDC),
+                name: "Sherwood Vault",
+                symbol: "shUSDC",
+                caps: ISyndicateVault.SyndicateCaps({
+                    maxPerTx: 10_000e6, // 10k USDC
+                    maxDailyTotal: 50_000e6, // 50k USDC
+                    maxBorrowRatio: 7500 // 75% LTV
+                }),
+                initialTargets: targets
+            })
+        );
+        console.log("Syndicate #%d vault:", syndicateId, vaultProxy);
 
         // 5. Register deployer as agent (dev mode — PKP and EOA are both deployer)
-        SyndicateVault(vaultProxy)
+        SyndicateVault(payable(vaultProxy))
             .registerAgent(
                 deployer, // pkpAddress (in dev, deployer acts as agent)
                 deployer, // operatorEOA
@@ -96,7 +104,8 @@ contract Deploy is Script {
         // Summary
         console.log("\n=== Deployment Summary ===");
         console.log("VAULT_ADDRESS=%s", vaultProxy);
-        console.log("BATCH_EXECUTOR_ADDRESS=%s", address(executor));
-        console.log("\nCopy these to cli/.env");
+        console.log("FACTORY_ADDRESS=%s", address(factory));
+        console.log("EXECUTOR_LIB_ADDRESS=%s", address(executorLib));
+        console.log("\nCopy VAULT_ADDRESS to cli/.env (no more BATCH_EXECUTOR_ADDRESS needed)");
     }
 }
