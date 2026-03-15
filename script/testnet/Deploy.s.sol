@@ -22,7 +22,7 @@ import {StrategyRegistry} from "../../src/StrategyRegistry.sol";
  *   Usage:
  *     forge script script/testnet/Deploy.s.sol:DeployTestnet \
  *       --rpc-url base_sepolia \
- *       --private-key $PRIVATE_KEY \
+ *       --account sherwood-agent \
  *       --broadcast
  */
 contract DeployTestnet is Script {
@@ -41,13 +41,13 @@ contract DeployTestnet is Script {
     address constant AGENT_REGISTRY = 0x8004A818BFB912233c491871b3d84c89A494BD9e;
 
     function run() external {
-        uint256 deployerKey = vm.envUint("PRIVATE_KEY");
-        address deployer = vm.addr(deployerKey);
+        // Use --account flag (keystore) instead of raw PRIVATE_KEY
+        address deployer = msg.sender;
 
         console.log("Deployer:", deployer);
         console.log("Network: Base Sepolia (testnet)");
 
-        vm.startBroadcast(deployerKey);
+        vm.startBroadcast();
 
         // 1. Deploy BatchExecutorLib (shared, stateless)
         BatchExecutorLib executorLib = new BatchExecutorLib();
