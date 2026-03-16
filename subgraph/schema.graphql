@@ -6,6 +6,7 @@ type Syndicate @entity(immutable: false) {
   vault: Bytes! # vault proxy address
   creator: Bytes!
   metadataURI: String!
+  subdomain: String!
   createdAt: BigInt!
   active: Boolean!
 
@@ -27,6 +28,7 @@ Agent — a registered PKP wallet that can execute strategies.
 type Agent @entity(immutable: false) {
   id: ID! # vault-pkpAddress
   syndicate: Syndicate!
+  agentId: BigInt!
   pkpAddress: Bytes!
   operatorEOA: Bytes!
   maxPerTx: BigInt!

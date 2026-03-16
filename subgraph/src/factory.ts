@@ -13,6 +13,7 @@ export function handleSyndicateCreated(event: SyndicateCreated): void {
   syndicate.vault = event.params.vault;
   syndicate.creator = event.params.creator;
   syndicate.metadataURI = event.params.metadataURI;
+  syndicate.subdomain = event.params.subdomain;
   syndicate.createdAt = event.block.timestamp;
   syndicate.active = true;
   syndicate.totalDeposits = BigDecimal.zero();

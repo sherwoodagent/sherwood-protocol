@@ -1,0 +1,14 @@
+{
+  "base-sepolia": {
+    "SyndicateFactory": {
+      "address": "0xc705F04fF2781aF9bB53ba416Cb32A29540c4624",
+      "startBlock": 38921771
+    }
+  },
+  "base": {
+    "SyndicateFactory": {
+      "address": "0x0000000000000000000000000000000000000000",
+      "startBlock": 0
+    }
+  }
+}

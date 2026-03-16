@@ -7,13 +7,11 @@ schema:
 dataSources:
   - kind: ethereum
     name: SyndicateFactory
-    network: base
+    network: base-sepolia
     source:
-      # Replace with deployed factory address
-      address: "0x0000000000000000000000000000000000000000"
+      address: "0xc705F04fF2781aF9bB53ba416Cb32A29540c4624"
       abi: SyndicateFactory
-      # Replace with deployment block number
-      startBlock: 0
+      startBlock: 38921771
     mapping:
       kind: ethereum/events
       apiVersion: 0.0.9
@@ -22,11 +20,11 @@ dataSources:
         - Syndicate
       abis:
         - name: SyndicateFactory
-          file: ./abis/SyndicateFactory.json
+          file: ../out/SyndicateFactory.sol/SyndicateFactory.json
         - name: SyndicateVault
-          file: ./abis/SyndicateVault.json
+          file: ../out/SyndicateVault.sol/SyndicateVault.json
       eventHandlers:
-        - event: SyndicateCreated(indexed uint256,indexed address,indexed address,string)
+        - event: SyndicateCreated(indexed uint256,indexed address,indexed address,string,string)
           handler: handleSyndicateCreated
         - event: MetadataUpdated(indexed uint256,string)
           handler: handleMetadataUpdated
@@ -37,7 +35,7 @@ dataSources:
 templates:
   - kind: ethereum
     name: SyndicateVault
-    network: base
+    network: base-sepolia
     source:
       abi: SyndicateVault
     mapping:
@@ -54,10 +52,10 @@ templates:
         - Ragequit
       abis:
         - name: SyndicateVault
-          file: ./abis/SyndicateVault.json
+          file: ../out/SyndicateVault.sol/SyndicateVault.json
       eventHandlers:
         # Agent management
-        - event: AgentRegistered(indexed address,indexed address,uint256,uint256)
+        - event: AgentRegistered(indexed uint256,indexed address,indexed address,uint256,uint256)
           handler: handleAgentRegistered
         - event: AgentRemoved(indexed address)
           handler: handleAgentRemoved

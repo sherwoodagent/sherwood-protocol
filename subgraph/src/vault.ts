@@ -45,6 +45,7 @@ export function handleAgentRegistered(event: AgentRegistered): void {
   let agent = new Agent(id);
 
   agent.syndicate = syndicateId;
+  agent.agentId = event.params.agentId;
   agent.pkpAddress = event.params.pkpAddress;
   agent.operatorEOA = event.params.operatorEOA;
   agent.maxPerTx = event.params.maxPerTx;
