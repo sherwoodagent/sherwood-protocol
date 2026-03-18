@@ -14,7 +14,7 @@ import {IL2Registrar} from "./interfaces/IL2Registrar.sol";
  *
  *   All syndicates share the same executor lib (stateless, called via delegatecall)
  *   and vault implementation. Each vault proxy has its own storage: positions,
- *   agent registry, allowlist, and caps.
+ *   agent registry, and depositor whitelist.
  *
  *   ENS subnames are registered atomically via Durin L2 Registrar, so each
  *   syndicate gets a <subdomain>.sherwoodagent.eth name resolving to its vault.
@@ -29,14 +29,13 @@ contract SyndicateFactory {
     error SubdomainTooShort();
     error SubdomainTaken();
     error NotCreator();
+    error InvalidGovernor();
 
     struct SyndicateConfig {
         string metadataURI; // ipfs://Qm... (name, description, strategies)
         IERC20 asset; // Deposit asset (e.g., USDC)
         string name; // Vault token name
         string symbol; // Vault token symbol
-        ISyndicateVault.SyndicateCaps caps; // Syndicate-wide limits
-        address[] initialTargets; // Protocol addresses to allowlist
         bool openDeposits; // If true, anyone can deposit. If false, depositor whitelist enforced.
         string subdomain; // ENS subdomain label (e.g. "alpha-seekers")
     }
@@ -63,6 +62,12 @@ contract SyndicateFactory {
     /// @notice ERC-8004 agent identity registry (ERC-721)
     IERC721 public immutable agentRegistry;
 
+    /// @notice Shared governor contract
+    address public immutable governor;
+
+    /// @notice Management fee for vault owners: 0.5% of strategy profits
+    uint256 public constant MANAGEMENT_FEE_BPS = 50;
+
     /// @notice All syndicates
     mapping(uint256 => Syndicate) public syndicates;
     uint256 public syndicateCount;
@@ -79,15 +84,23 @@ contract SyndicateFactory {
     event MetadataUpdated(uint256 indexed id, string metadataURI);
     event SyndicateDeactivated(uint256 indexed id);
 
-    constructor(address executorImpl_, address vaultImpl_, address ensRegistrar_, address agentRegistry_) {
+    constructor(
+        address executorImpl_,
+        address vaultImpl_,
+        address ensRegistrar_,
+        address agentRegistry_,
+        address governor_
+    ) {
         if (executorImpl_ == address(0)) revert InvalidExecutorImpl();
         if (vaultImpl_ == address(0)) revert InvalidVaultImpl();
         if (ensRegistrar_ == address(0)) revert InvalidENSRegistrar();
         if (agentRegistry_ == address(0)) revert InvalidAgentRegistry();
+        if (governor_ == address(0)) revert InvalidGovernor();
         executorImpl = executorImpl_;
         vaultImpl = vaultImpl_;
         ensRegistrar = IL2Registrar(ensRegistrar_);
         agentRegistry = IERC721(agentRegistry_);
+        governor = governor_;
     }
 
     /// @notice Create a new syndicate — deploys vault proxy, registers ENS subname, stores everything
@@ -109,20 +122,18 @@ contract SyndicateFactory {
         syndicateId = ++syndicateCount;
 
         // Deploy vault as UUPS proxy
-        bytes memory initData = abi.encodeCall(
-            SyndicateVault.initialize,
-            (
-                config.asset,
-                config.name,
-                config.symbol,
-                msg.sender, // owner = creator
-                config.caps,
-                executorImpl,
-                config.initialTargets,
-                config.openDeposits,
-                address(agentRegistry)
-            )
-        );
+        ISyndicateVault.InitParams memory initParams = ISyndicateVault.InitParams({
+            asset: address(config.asset),
+            name: config.name,
+            symbol: config.symbol,
+            owner: msg.sender,
+            executorImpl: executorImpl,
+            openDeposits: config.openDeposits,
+            agentRegistry: address(agentRegistry),
+            governor: governor,
+            managementFeeBps: MANAGEMENT_FEE_BPS
+        });
+        bytes memory initData = abi.encodeCall(SyndicateVault.initialize, (initParams));
 
         vault = address(new ERC1967Proxy(vaultImpl, initData));
 

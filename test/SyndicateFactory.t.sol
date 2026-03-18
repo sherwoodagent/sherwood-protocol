@@ -20,6 +20,7 @@ contract SyndicateFactoryTest is Test {
 
     address public creator1 = makeAddr("creator1");
     address public creator2 = makeAddr("creator2");
+    address public governorAddr = makeAddr("governor");
 
     uint256 public creator1AgentId;
     uint256 public creator2AgentId;
@@ -31,7 +32,7 @@ contract SyndicateFactoryTest is Test {
         ensRegistrar = new MockL2Registrar();
         agentRegistry = new MockAgentRegistry();
         factory = new SyndicateFactory(
-            address(executorLib), address(vaultImpl), address(ensRegistrar), address(agentRegistry)
+            address(executorLib), address(vaultImpl), address(ensRegistrar), address(agentRegistry), governorAddr
         );
 
         // Mint ERC-8004 identity NFTs for creators
@@ -40,16 +41,11 @@ contract SyndicateFactoryTest is Test {
     }
 
     function _defaultConfig() internal view returns (SyndicateFactory.SyndicateConfig memory) {
-        address[] memory targets = new address[](1);
-        targets[0] = address(usdc);
-
         return SyndicateFactory.SyndicateConfig({
             metadataURI: "ipfs://QmTest",
             asset: usdc,
             name: "Test Vault",
             symbol: "tVault",
-            caps: ISyndicateVault.SyndicateCaps({maxPerTx: 10_000e6, maxDailyTotal: 50_000e6, maxBorrowRatio: 7500}),
-            initialTargets: targets,
             openDeposits: false,
             subdomain: "test-syndicate"
         });
@@ -81,15 +77,6 @@ contract SyndicateFactoryTest is Test {
         assertEq(vault.owner(), creator1);
         assertEq(address(vault.asset()), address(usdc));
         assertEq(vault.getExecutorImpl(), address(executorLib));
-
-        // Verify targets
-        assertTrue(vault.isAllowedTarget(address(usdc)));
-
-        // Verify caps
-        ISyndicateVault.SyndicateCaps memory caps = vault.getSyndicateCaps();
-        assertEq(caps.maxPerTx, 10_000e6);
-        assertEq(caps.maxDailyTotal, 50_000e6);
-        assertEq(caps.maxBorrowRatio, 7500);
     }
 
     function test_createSyndicate_notAgentOwner_reverts() public {
@@ -141,7 +128,7 @@ contract SyndicateFactoryTest is Test {
         address agent = makeAddr("agent");
         uint256 agentNftId = agentRegistry.mint(agent);
         vm.prank(creator1);
-        vault.registerAgent(agentNftId, agent, agent, 5_000e6, 20_000e6);
+        vault.registerAgent(agentNftId, agent, agent);
 
         // Approve LP as depositor (vault has openDeposits=false)
         address lp = makeAddr("lp");
@@ -155,14 +142,14 @@ contract SyndicateFactoryTest is Test {
         vault.deposit(50_000e6, lp);
         vm.stopPrank();
 
-        // Agent executes batch (simple approve call)
+        // Owner executes batch (simple approve call — owner-only in governor model)
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](1);
         calls[0] = BatchExecutorLib.Call({
             target: address(usdc), data: abi.encodeCall(usdc.approve, (makeAddr("protocol"), 1_000e6)), value: 0
         });
 
-        vm.prank(agent);
-        vault.executeBatch(calls, 0);
+        vm.prank(creator1); // vault owner
+        vault.executeBatch(calls);
 
         // Verify: vault set the approval (delegatecall)
         assertEq(usdc.allowance(vaultAddr, makeAddr("protocol")), 1_000e6);
@@ -185,9 +172,9 @@ contract SyndicateFactoryTest is Test {
         uint256 agent2NftId = agentRegistry.mint(agent2);
 
         vm.prank(creator1);
-        vault1.registerAgent(agent1NftId, agent1, agent1, 5_000e6, 20_000e6);
+        vault1.registerAgent(agent1NftId, agent1, agent1);
         vm.prank(creator2);
-        vault2.registerAgent(agent2NftId, agent2, agent2, 5_000e6, 20_000e6);
+        vault2.registerAgent(agent2NftId, agent2, agent2);
 
         // Agent1 is only on vault1
         assertTrue(vault1.isAgent(agent1));

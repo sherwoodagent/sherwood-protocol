@@ -2,11 +2,13 @@
 pragma solidity 0.8.28;
 
 import {Script, console} from "forge-std/Script.sol";
+import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SyndicateVault} from "../src/SyndicateVault.sol";
 import {ISyndicateVault} from "../src/interfaces/ISyndicateVault.sol";
 import {BatchExecutorLib} from "../src/BatchExecutorLib.sol";
 import {SyndicateFactory} from "../src/SyndicateFactory.sol";
+import {SyndicateGovernor} from "../src/SyndicateGovernor.sol";
 
 /**
  * @notice Deploy Sherwood infrastructure to Base:
@@ -65,23 +67,29 @@ contract Deploy is Script {
         SyndicateVault vaultImpl = new SyndicateVault();
         console.log("Vault implementation:", address(vaultImpl));
 
-        // 3. Deploy SyndicateFactory
+        // 3. Deploy SyndicateGovernor (UUPS proxy)
+        SyndicateGovernor govImpl = new SyndicateGovernor();
+        bytes memory govInitData = abi.encodeCall(
+            SyndicateGovernor.initialize,
+            (
+                deployer, // owner
+                1 days, // votingPeriod
+                1 days, // executionWindow
+                4000, // quorumBps (40%)
+                3000, // maxPerformanceFeeBps (30%)
+                30 days, // maxStrategyDuration
+                1 days // cooldownPeriod
+            )
+        );
+        address governorProxy = address(new ERC1967Proxy(address(govImpl), govInitData));
+        console.log("SyndicateGovernor:", governorProxy);
+
+        // 4. Deploy SyndicateFactory
         SyndicateFactory factory =
-            new SyndicateFactory(address(executorLib), address(vaultImpl), L2_REGISTRAR, AGENT_REGISTRY);
+            new SyndicateFactory(address(executorLib), address(vaultImpl), L2_REGISTRAR, AGENT_REGISTRY, governorProxy);
         console.log("SyndicateFactory:", address(factory));
 
         // 4. Create first syndicate via factory
-        address[] memory targets = new address[](9);
-        targets[0] = USDC;
-        targets[1] = MOONWELL_MUSDC;
-        targets[2] = MOONWELL_COMPTROLLER;
-        targets[3] = UNISWAP_SWAP_ROUTER;
-        targets[4] = WETH;
-        targets[5] = CB_ETH;
-        targets[6] = WST_ETH;
-        targets[7] = CB_BTC;
-        targets[8] = AERO;
-
         // NOTE: creatorAgentId must be set to the deployer's ERC-8004 agent ID
         uint256 creatorAgentId = vm.envUint("CREATOR_AGENT_ID");
 
@@ -92,12 +100,6 @@ contract Deploy is Script {
                 asset: IERC20(USDC),
                 name: "Sherwood Vault",
                 symbol: "swUSDC",
-                caps: ISyndicateVault.SyndicateCaps({
-                    maxPerTx: 10_000e6, // 10k USDC
-                    maxDailyTotal: 50_000e6, // 50k USDC
-                    maxBorrowRatio: 7500 // 75% LTV
-                }),
-                initialTargets: targets,
                 openDeposits: false, // Whitelist-gated deposits
                 subdomain: "sherwood"
             })
@@ -111,9 +113,7 @@ contract Deploy is Script {
             .registerAgent(
                 agentId, // ERC-8004 identity
                 deployer, // pkpAddress (in dev, deployer acts as agent)
-                deployer, // operatorEOA
-                10_000e6, // maxPerTx: 10k USDC
-                50_000e6 // dailyLimit: 50k USDC
+                deployer // operatorEOA
             );
         console.log("Registered deployer as agent");
 
