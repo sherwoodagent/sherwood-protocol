@@ -3,10 +3,10 @@ pragma solidity 0.8.28;
 
 import {ISyndicateGovernor} from "./interfaces/ISyndicateGovernor.sol";
 import {ISyndicateVault} from "./interfaces/ISyndicateVault.sol";
+import {GovernorParameters} from "./GovernorParameters.sol";
 import {BatchExecutorLib} from "./BatchExecutorLib.sol";
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
-import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {EnumerableSet} from "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
@@ -22,32 +22,12 @@ import {IVotes} from "@openzeppelin/contracts/governance/utils/IVotes.sol";
  *   - Cooldown window between strategies for depositor exit
  *   - Permissionless settlement after strategy duration ends
  *   - P&L calculated via balance snapshot diffs
- *   - Vote weight from ERC20Votes checkpoints (block-number snapshots)
+ *   - Vote weight from ERC20Votes checkpoints (timestamp-based snapshots)
  *   - Collaborative proposals: multiple agents co-submit with fee splits
+ *   - Parameter changes require timelock delay
  */
-contract SyndicateGovernor is ISyndicateGovernor, Initializable, OwnableUpgradeable, UUPSUpgradeable {
+contract SyndicateGovernor is GovernorParameters, UUPSUpgradeable {
     using EnumerableSet for EnumerableSet.AddressSet;
-
-    // ── Safety bounds (hardcoded) ──
-
-    uint256 public constant MIN_VOTING_PERIOD = 1 hours;
-    uint256 public constant MAX_VOTING_PERIOD = 30 days;
-    uint256 public constant MIN_EXECUTION_WINDOW = 1 hours;
-    uint256 public constant MAX_EXECUTION_WINDOW = 7 days;
-    uint256 public constant MIN_QUORUM_BPS = 1000; // 10%
-    uint256 public constant MAX_QUORUM_BPS = 10000; // 100%
-    uint256 public constant MAX_PERFORMANCE_FEE_CAP = 5000; // 50%
-    uint256 public constant ABSOLUTE_MIN_STRATEGY_DURATION = 1 hours;
-    uint256 public constant ABSOLUTE_MAX_STRATEGY_DURATION = 30 days;
-    uint256 public constant MIN_COOLDOWN_PERIOD = 1 hours;
-    uint256 public constant MAX_COOLDOWN_PERIOD = 30 days;
-
-    // ── Collaborative proposal constants (safety bounds) ──
-
-    uint256 public constant MIN_SPLIT_BPS = 100; // 1%
-    uint256 public constant MIN_COLLABORATION_WINDOW = 1 hours;
-    uint256 public constant MAX_COLLABORATION_WINDOW = 7 days;
-    uint256 public constant ABSOLUTE_MAX_CO_PROPOSERS = 10;
 
     // ── Storage (existing — DO NOT reorder) ──
 
@@ -59,9 +39,6 @@ contract SyndicateGovernor is ISyndicateGovernor, Initializable, OwnableUpgradea
 
     /// @notice Proposal ID → proposal data
     mapping(uint256 => StrategyProposal) private _proposals;
-
-    /// @notice Proposal ID → calls array (stored separately for gas)
-    mapping(uint256 => BatchExecutorLib.Call[]) private _proposalCalls;
 
     /// @notice Proposal ID → voter → bool
     mapping(uint256 => mapping(address => bool)) private _hasVoted;
@@ -98,8 +75,25 @@ contract SyndicateGovernor is ISyndicateGovernor, Initializable, OwnableUpgradea
     uint256 private constant _NOT_ENTERED = 1;
     uint256 private constant _ENTERED = 2;
 
-    /// @dev Reserved storage for future upgrades. Decrease by 1 for each new slot added.
-    uint256[40] private __gap;
+    // ── New storage (appended — UUPS safe) ──
+
+    /// @notice Proposal ID → minimum acceptable vault balance after settlement (Change C)
+    mapping(uint256 => uint256) private _minSettlementBalance;
+
+    /// @notice Proposal ID → execute (opening) calls (Change B)
+    mapping(uint256 => BatchExecutorLib.Call[]) private _executeCalls;
+
+    /// @notice Proposal ID → settlement (closing) calls (Change B)
+    mapping(uint256 => BatchExecutorLib.Call[]) private _settlementCalls;
+
+    /// @notice Delay (seconds) before queued parameter changes take effect (Change A)
+    uint256 private _parameterChangeDelay;
+
+    /// @notice Parameter key → pending change (Change A)
+    mapping(bytes32 => PendingChange) private _pendingChanges;
+
+    /// @dev Reserved storage for future upgrades. Decreased from 40 by 5 (new slots above).
+    uint256[35] private __gap;
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -117,6 +111,9 @@ contract SyndicateGovernor is ISyndicateGovernor, Initializable, OwnableUpgradea
             revert InvalidCollaborationWindow();
         }
         if (p.maxCoProposers == 0 || p.maxCoProposers > ABSOLUTE_MAX_CO_PROPOSERS) revert InvalidMaxCoProposers();
+        if (p.parameterChangeDelay < MIN_PARAM_CHANGE_DELAY || p.parameterChangeDelay > MAX_PARAM_CHANGE_DELAY) {
+            revert InvalidParameterChangeDelay();
+        }
 
         __Ownable_init(p.owner);
 
@@ -137,6 +134,7 @@ contract SyndicateGovernor is ISyndicateGovernor, Initializable, OwnableUpgradea
             minStrategyDuration: p.minStrategyDuration,
             maxStrategyDuration: p.maxStrategyDuration
         });
+        _parameterChangeDelay = p.parameterChangeDelay;
         _reentrancyStatus = _NOT_ENTERED;
     }
 
@@ -147,6 +145,20 @@ contract SyndicateGovernor is ISyndicateGovernor, Initializable, OwnableUpgradea
         _reentrancyStatus = _NOT_ENTERED;
     }
 
+    // ── GovernorParameters virtual accessor overrides ──
+
+    function _getParams() internal view override returns (GovernorParams storage) {
+        return _params;
+    }
+
+    function _getParameterChangeDelay() internal view override returns (uint256) {
+        return _parameterChangeDelay;
+    }
+
+    function _getPendingChanges() internal view override returns (mapping(bytes32 => PendingChange) storage) {
+        return _pendingChanges;
+    }
+
     // ==================== PROPOSAL LIFECYCLE ====================
 
     /// @inheritdoc ISyndicateGovernor
@@ -155,17 +167,18 @@ contract SyndicateGovernor is ISyndicateGovernor, Initializable, OwnableUpgradea
         string calldata metadataURI,
         uint256 performanceFeeBps,
         uint256 strategyDuration,
-        BatchExecutorLib.Call[] calldata calls,
-        uint256 splitIndex,
-        CoProposer[] calldata coProposers
+        BatchExecutorLib.Call[] calldata executeCalls,
+        BatchExecutorLib.Call[] calldata settlementCalls,
+        CoProposer[] calldata coProposers,
+        uint256 minSettlementBalance
     ) external returns (uint256 proposalId) {
         if (!_registeredVaults.contains(vault)) revert VaultNotRegistered();
         if (!ISyndicateVault(vault).isAgent(msg.sender)) revert NotRegisteredAgent();
         if (performanceFeeBps > _params.maxPerformanceFeeBps) revert PerformanceFeeTooHigh();
         if (strategyDuration > _params.maxStrategyDuration) revert StrategyDurationTooLong();
         if (strategyDuration < _params.minStrategyDuration) revert StrategyDurationTooShort();
-        if (calls.length == 0) revert EmptyCalls();
-        if (splitIndex == 0 || splitIndex >= calls.length) revert InvalidSplitIndex();
+        if (executeCalls.length == 0) revert EmptyExecuteCalls();
+        if (settlementCalls.length == 0) revert EmptySettlementCalls();
 
         // Validate co-proposers if present
         if (coProposers.length > 0) {
@@ -182,7 +195,6 @@ contract SyndicateGovernor is ISyndicateGovernor, Initializable, OwnableUpgradea
             vault: vault,
             metadataURI: metadataURI,
             performanceFeeBps: performanceFeeBps,
-            splitIndex: splitIndex,
             strategyDuration: strategyDuration,
             votesFor: 0,
             votesAgainst: 0,
@@ -195,14 +207,20 @@ contract SyndicateGovernor is ISyndicateGovernor, Initializable, OwnableUpgradea
         });
 
         // Store calls separately
-        _storeCalls(proposalId, calls);
+        _storeCalls(_executeCalls, proposalId, executeCalls);
+        _storeCalls(_settlementCalls, proposalId, settlementCalls);
+
+        // Store min settlement balance
+        if (minSettlementBalance > 0) {
+            _minSettlementBalance[proposalId] = minSettlementBalance;
+        }
 
         // Store co-proposers and set collaboration deadline
         if (coProposers.length > 0) {
             _storeCoProposers(proposalId, coProposers);
         }
 
-        _emitProposalCreated(proposalId, calls.length, metadataURI);
+        _emitProposalCreated(proposalId, executeCalls.length, settlementCalls.length, minSettlementBalance);
     }
 
     /// @inheritdoc ISyndicateGovernor
@@ -251,25 +269,25 @@ contract SyndicateGovernor is ISyndicateGovernor, Initializable, OwnableUpgradea
         _capitalSnapshots[proposalId] = balanceBefore;
 
         // Execute the opening calls via the vault
-        BatchExecutorLib.Call[] storage calls = _proposalCalls[proposalId];
-        uint256 splitIdx = proposal.splitIndex;
+        BatchExecutorLib.Call[] memory callsToRun = _loadCalls(_executeCalls, proposalId);
 
-        BatchExecutorLib.Call[] memory executeCalls = new BatchExecutorLib.Call[](splitIdx);
-        for (uint256 i = 0; i < splitIdx; i++) {
-            executeCalls[i] = calls[i];
-        }
         // Update state
         _activeProposal[vault] = proposalId;
         proposal.state = ProposalState.Executed;
         proposal.executedAt = block.timestamp;
 
-        ISyndicateVault(vault).executeGovernorBatch(executeCalls);
+        ISyndicateVault(vault).executeGovernorBatch(callsToRun);
 
         emit ProposalExecuted(proposalId, vault, balanceBefore);
     }
 
     /// @inheritdoc ISyndicateGovernor
     /// @notice Path 1: Agent settles. Tries pre-committed calls first, falls back to custom calls. Enforces no loss.
+    /// @dev minSettlementBalance is enforced here only (not in settleProposal/emergencySettle escape hatches).
+    ///      It is an absolute floor set by the proposer — voters should evaluate it relative to vault size.
+    ///      NOTE: This is not a complete settlement trust solution. The agent controls the floor value,
+    ///      and timing manipulation is still possible. Follow-up improvements may include settlement
+    ///      delays, oracle/TWAP checks, or depositor challenge windows.
     function settleByAgent(uint256 proposalId, BatchExecutorLib.Call[] calldata calls) external nonReentrant {
         StrategyProposal storage proposal = _proposals[proposalId];
         if (_resolveState(proposal) != ProposalState.Executed) revert ProposalNotExecuted();
@@ -283,6 +301,10 @@ contract SyndicateGovernor is ISyndicateGovernor, Initializable, OwnableUpgradea
         uint256 balanceAfter = IERC20(asset).balanceOf(proposal.vault);
         if (balanceAfter < _capitalSnapshots[proposalId]) revert SettlementCausedLoss();
 
+        // Enforce min settlement balance if set
+        uint256 minBalance = _minSettlementBalance[proposalId];
+        if (minBalance > 0 && balanceAfter < minBalance) revert SettlementBelowMinimum();
+
         (int256 pnl, uint256 agentFee) = _finishSettlement(proposalId, proposal);
 
         emit AgentSettled(proposalId, proposal.vault, pnl, agentFee);
@@ -295,16 +317,8 @@ contract SyndicateGovernor is ISyndicateGovernor, Initializable, OwnableUpgradea
         if (_resolveState(proposal) != ProposalState.Executed) revert ProposalNotExecuted();
         if (block.timestamp < proposal.executedAt + proposal.strategyDuration) revert StrategyDurationNotElapsed();
 
-        // Run the pre-committed unwind calls
-        BatchExecutorLib.Call[] storage calls = _proposalCalls[proposalId];
-        uint256 splitIdx = proposal.splitIndex;
-        uint256 totalCalls = calls.length;
-
-        BatchExecutorLib.Call[] memory settleCalls = new BatchExecutorLib.Call[](totalCalls - splitIdx);
-        for (uint256 i = splitIdx; i < totalCalls; i++) {
-            settleCalls[i - splitIdx] = calls[i];
-        }
-        ISyndicateVault(proposal.vault).executeGovernorBatch(settleCalls);
+        // Run the pre-committed settlement calls
+        ISyndicateVault(proposal.vault).executeGovernorBatch(_loadCalls(_settlementCalls, proposalId));
 
         _finishSettlement(proposalId, proposal);
     }
@@ -436,94 +450,6 @@ contract SyndicateGovernor is ISyndicateGovernor, Initializable, OwnableUpgradea
         emit VaultRemoved(vault);
     }
 
-    // ==================== PARAMETER SETTERS ====================
-
-    /// @inheritdoc ISyndicateGovernor
-    function setVotingPeriod(uint256 newVotingPeriod) external onlyOwner {
-        _validateVotingPeriod(newVotingPeriod);
-        uint256 old = _params.votingPeriod;
-        _params.votingPeriod = newVotingPeriod;
-        emit VotingPeriodUpdated(old, newVotingPeriod);
-    }
-
-    /// @inheritdoc ISyndicateGovernor
-    function setExecutionWindow(uint256 newExecutionWindow) external onlyOwner {
-        _validateExecutionWindow(newExecutionWindow);
-        uint256 old = _params.executionWindow;
-        _params.executionWindow = newExecutionWindow;
-        emit ExecutionWindowUpdated(old, newExecutionWindow);
-    }
-
-    /// @inheritdoc ISyndicateGovernor
-    function setQuorumBps(uint256 newQuorumBps) external onlyOwner {
-        _validateQuorumBps(newQuorumBps);
-        uint256 old = _params.quorumBps;
-        _params.quorumBps = newQuorumBps;
-        emit QuorumBpsUpdated(old, newQuorumBps);
-    }
-
-    /// @inheritdoc ISyndicateGovernor
-    function setMaxPerformanceFeeBps(uint256 newMaxPerformanceFeeBps) external onlyOwner {
-        _validateMaxPerformanceFeeBps(newMaxPerformanceFeeBps);
-        uint256 old = _params.maxPerformanceFeeBps;
-        _params.maxPerformanceFeeBps = newMaxPerformanceFeeBps;
-        emit MaxPerformanceFeeBpsUpdated(old, newMaxPerformanceFeeBps);
-    }
-
-    /// @inheritdoc ISyndicateGovernor
-    function setMinStrategyDuration(uint256 newMinStrategyDuration) external onlyOwner {
-        if (
-            newMinStrategyDuration < ABSOLUTE_MIN_STRATEGY_DURATION
-                || newMinStrategyDuration > _params.maxStrategyDuration
-        ) {
-            revert InvalidStrategyDurationBounds();
-        }
-        uint256 old = _params.minStrategyDuration;
-        _params.minStrategyDuration = newMinStrategyDuration;
-        emit MinStrategyDurationUpdated(old, newMinStrategyDuration);
-    }
-
-    /// @inheritdoc ISyndicateGovernor
-    function setMaxStrategyDuration(uint256 newMaxStrategyDuration) external onlyOwner {
-        if (
-            newMaxStrategyDuration > ABSOLUTE_MAX_STRATEGY_DURATION
-                || newMaxStrategyDuration < _params.minStrategyDuration
-        ) {
-            revert InvalidStrategyDurationBounds();
-        }
-        uint256 old = _params.maxStrategyDuration;
-        _params.maxStrategyDuration = newMaxStrategyDuration;
-        emit MaxStrategyDurationUpdated(old, newMaxStrategyDuration);
-    }
-
-    /// @inheritdoc ISyndicateGovernor
-    function setCooldownPeriod(uint256 newCooldownPeriod) external onlyOwner {
-        _validateCooldownPeriod(newCooldownPeriod);
-        uint256 old = _params.cooldownPeriod;
-        _params.cooldownPeriod = newCooldownPeriod;
-        emit CooldownPeriodUpdated(old, newCooldownPeriod);
-    }
-
-    /// @inheritdoc ISyndicateGovernor
-    function setCollaborationWindow(uint256 newCollaborationWindow) external onlyOwner {
-        if (newCollaborationWindow < MIN_COLLABORATION_WINDOW || newCollaborationWindow > MAX_COLLABORATION_WINDOW) {
-            revert InvalidCollaborationWindow();
-        }
-        uint256 old = _params.collaborationWindow;
-        _params.collaborationWindow = newCollaborationWindow;
-        emit CollaborationWindowUpdated(old, newCollaborationWindow);
-    }
-
-    /// @inheritdoc ISyndicateGovernor
-    function setMaxCoProposers(uint256 newMaxCoProposers) external onlyOwner {
-        if (newMaxCoProposers == 0 || newMaxCoProposers > ABSOLUTE_MAX_CO_PROPOSERS) {
-            revert InvalidMaxCoProposers();
-        }
-        uint256 old = _params.maxCoProposers;
-        _params.maxCoProposers = newMaxCoProposers;
-        emit MaxCoProposersUpdated(old, newMaxCoProposers);
-    }
-
     // ==================== VIEWS ====================
 
     /// @inheritdoc ISyndicateGovernor
@@ -538,8 +464,28 @@ contract SyndicateGovernor is ISyndicateGovernor, Initializable, OwnableUpgradea
     }
 
     /// @inheritdoc ISyndicateGovernor
+    /// @dev Returns concatenation of executeCalls + settlementCalls for backwards compatibility
     function getProposalCalls(uint256 proposalId) external view returns (BatchExecutorLib.Call[] memory) {
-        return _proposalCalls[proposalId];
+        BatchExecutorLib.Call[] memory exec = _loadCalls(_executeCalls, proposalId);
+        BatchExecutorLib.Call[] memory settle = _loadCalls(_settlementCalls, proposalId);
+        BatchExecutorLib.Call[] memory result = new BatchExecutorLib.Call[](exec.length + settle.length);
+        for (uint256 i = 0; i < exec.length; i++) {
+            result[i] = exec[i];
+        }
+        for (uint256 i = 0; i < settle.length; i++) {
+            result[exec.length + i] = settle[i];
+        }
+        return result;
+    }
+
+    /// @inheritdoc ISyndicateGovernor
+    function getExecuteCalls(uint256 proposalId) external view returns (BatchExecutorLib.Call[] memory) {
+        return _loadCalls(_executeCalls, proposalId);
+    }
+
+    /// @inheritdoc ISyndicateGovernor
+    function getSettlementCalls(uint256 proposalId) external view returns (BatchExecutorLib.Call[] memory) {
+        return _loadCalls(_settlementCalls, proposalId);
     }
 
     /// @inheritdoc ISyndicateGovernor
@@ -557,11 +503,6 @@ contract SyndicateGovernor is ISyndicateGovernor, Initializable, OwnableUpgradea
     /// @inheritdoc ISyndicateGovernor
     function proposalCount() external view returns (uint256) {
         return _proposalCount;
-    }
-
-    /// @inheritdoc ISyndicateGovernor
-    function getGovernorParams() external view returns (GovernorParams memory) {
-        return _params;
     }
 
     /// @inheritdoc ISyndicateGovernor
@@ -594,17 +535,44 @@ contract SyndicateGovernor is ISyndicateGovernor, Initializable, OwnableUpgradea
         return _coProposers[proposalId];
     }
 
+    /// @inheritdoc ISyndicateGovernor
+    function getMinSettlementBalance(uint256 proposalId) external view returns (uint256) {
+        return _minSettlementBalance[proposalId];
+    }
+
     // ==================== INTERNAL ====================
 
-    /// @dev Store proposal calls separately for gas efficiency
-    function _storeCalls(uint256 proposalId, BatchExecutorLib.Call[] calldata calls) internal {
+    /// @dev Push calldata calls into a storage mapping slot
+    function _storeCalls(
+        mapping(uint256 => BatchExecutorLib.Call[]) storage target,
+        uint256 proposalId,
+        BatchExecutorLib.Call[] calldata calls
+    ) internal {
         for (uint256 i = 0; i < calls.length; i++) {
-            _proposalCalls[proposalId].push(calls[i]);
+            target[proposalId].push(calls[i]);
+        }
+    }
+
+    /// @dev Copy calls from storage to memory
+    function _loadCalls(mapping(uint256 => BatchExecutorLib.Call[]) storage source, uint256 proposalId)
+        internal
+        view
+        returns (BatchExecutorLib.Call[] memory result)
+    {
+        BatchExecutorLib.Call[] storage stored = source[proposalId];
+        result = new BatchExecutorLib.Call[](stored.length);
+        for (uint256 i = 0; i < stored.length; i++) {
+            result[i] = stored[i];
         }
     }
 
     /// @dev Emit ProposalCreated event (reads from storage to avoid stack-too-deep in propose())
-    function _emitProposalCreated(uint256 proposalId, uint256 callCount, string calldata metadataURI) internal {
+    function _emitProposalCreated(
+        uint256 proposalId,
+        uint256 executeCallCount,
+        uint256 settlementCallCount,
+        uint256 minSettlementBalance_
+    ) internal {
         StrategyProposal storage p = _proposals[proposalId];
         emit ProposalCreated(
             proposalId,
@@ -612,9 +580,10 @@ contract SyndicateGovernor is ISyndicateGovernor, Initializable, OwnableUpgradea
             p.vault,
             p.performanceFeeBps,
             p.strategyDuration,
-            p.splitIndex,
-            callCount,
-            metadataURI
+            executeCallCount,
+            settlementCallCount,
+            minSettlementBalance_,
+            p.metadataURI
         );
     }
 
@@ -673,24 +642,14 @@ contract SyndicateGovernor is ISyndicateGovernor, Initializable, OwnableUpgradea
         if (totalCoSplitBps > 9000) revert LeadSplitTooLow();
     }
 
-    /// @dev Try pre-committed unwind calls first. If they revert, run fallback calls or bubble original error.
+    /// @dev Try pre-committed settlement calls first. If they revert, run fallback calls or bubble original error.
     function _tryPrecommittedThenFallback(
         uint256 proposalId,
         StrategyProposal storage proposal,
         BatchExecutorLib.Call[] calldata fallbackCalls
     ) internal {
-        // Build pre-committed settle calls
-        BatchExecutorLib.Call[] storage storedCalls = _proposalCalls[proposalId];
-        uint256 splitIdx = proposal.splitIndex;
-        uint256 totalCalls = storedCalls.length;
-
-        BatchExecutorLib.Call[] memory settleCalls = new BatchExecutorLib.Call[](totalCalls - splitIdx);
-        for (uint256 i = splitIdx; i < totalCalls; i++) {
-            settleCalls[i - splitIdx] = storedCalls[i];
-        }
-
         // Try pre-committed calls first
-        try ISyndicateVault(proposal.vault).executeGovernorBatch(settleCalls) {
+        try ISyndicateVault(proposal.vault).executeGovernorBatch(_loadCalls(_settlementCalls, proposalId)) {
         // Pre-committed calls succeeded — done
         }
         catch (bytes memory reason) {
@@ -705,65 +664,26 @@ contract SyndicateGovernor is ISyndicateGovernor, Initializable, OwnableUpgradea
         }
     }
 
+    /// @dev Compute the resolved state and persist any transitions to storage.
     function _resolveState(StrategyProposal storage proposal) internal returns (ProposalState) {
         ProposalState stored = proposal.state;
+        ProposalState resolved = _resolveStateView(proposal);
 
-        // Draft → Expired when collaboration deadline passes
-        if (stored == ProposalState.Draft) {
-            if (block.timestamp > collaborationDeadline[proposal.id]) {
-                proposal.state = ProposalState.Expired;
+        if (resolved != stored) {
+            proposal.state = resolved;
+            if (stored == ProposalState.Draft && resolved == ProposalState.Expired) {
                 emit CollaborationDeadlineExpired(proposal.id);
-                return ProposalState.Expired;
             }
-            return ProposalState.Draft;
         }
-
-        // Pending → Approved/Rejected/Expired when voting ends
-        if (stored == ProposalState.Pending) {
-            if (block.timestamp <= proposal.voteEnd) return ProposalState.Pending;
-
-            // Voting ended — determine outcome
-            // Abstain votes count toward quorum but not for/against
-            uint256 totalVotes = proposal.votesFor + proposal.votesAgainst + proposal.votesAbstain;
-            uint256 pastTotalSupply = IVotes(proposal.vault).getPastTotalSupply(proposal.snapshotTimestamp);
-            uint256 quorumRequired = (pastTotalSupply * _params.quorumBps) / 10000;
-
-            if (totalVotes < quorumRequired || proposal.votesFor <= proposal.votesAgainst) {
-                proposal.state = ProposalState.Rejected;
-                return ProposalState.Rejected;
-            }
-
-            if (block.timestamp > proposal.executeBy) {
-                proposal.state = ProposalState.Expired;
-                return ProposalState.Expired;
-            }
-
-            proposal.state = ProposalState.Approved;
-            return ProposalState.Approved;
-        }
-
-        // Approved → Expired when execution window passes
-        if (stored == ProposalState.Approved) {
-            if (block.timestamp > proposal.executeBy) {
-                proposal.state = ProposalState.Expired;
-                return ProposalState.Expired;
-            }
-            return ProposalState.Approved;
-        }
-
-        // Executed, Settled, Cancelled, Rejected, Expired — terminal states
-        return stored;
+        return resolved;
     }
 
-    /// @dev View-only version of state resolution (doesn't modify storage)
+    /// @dev Pure state resolution logic (view-only, no storage writes).
     function _resolveStateView(StrategyProposal storage proposal) internal view returns (ProposalState) {
         ProposalState stored = proposal.state;
 
         if (stored == ProposalState.Draft) {
-            if (block.timestamp > collaborationDeadline[proposal.id]) {
-                return ProposalState.Expired;
-            }
-            return ProposalState.Draft;
+            return block.timestamp > collaborationDeadline[proposal.id] ? ProposalState.Expired : ProposalState.Draft;
         }
 
         if (stored == ProposalState.Pending) {
@@ -776,19 +696,11 @@ contract SyndicateGovernor is ISyndicateGovernor, Initializable, OwnableUpgradea
             if (totalVotes < quorumRequired || proposal.votesFor <= proposal.votesAgainst) {
                 return ProposalState.Rejected;
             }
-
-            if (block.timestamp > proposal.executeBy) {
-                return ProposalState.Expired;
-            }
-
-            return ProposalState.Approved;
+            return block.timestamp > proposal.executeBy ? ProposalState.Expired : ProposalState.Approved;
         }
 
         if (stored == ProposalState.Approved) {
-            if (block.timestamp > proposal.executeBy) {
-                return ProposalState.Expired;
-            }
-            return ProposalState.Approved;
+            return block.timestamp > proposal.executeBy ? ProposalState.Expired : ProposalState.Approved;
         }
 
         return stored;
@@ -852,28 +764,6 @@ contract SyndicateGovernor is ISyndicateGovernor, Initializable, OwnableUpgradea
 
         uint256 duration = block.timestamp - proposal.executedAt;
         emit ProposalSettled(proposalId, vault, pnl, agentFee + mgmtFee, duration);
-    }
-
-    // ── Validation helpers ──
-
-    function _validateVotingPeriod(uint256 value) internal pure {
-        if (value < MIN_VOTING_PERIOD || value > MAX_VOTING_PERIOD) revert InvalidVotingPeriod();
-    }
-
-    function _validateExecutionWindow(uint256 value) internal pure {
-        if (value < MIN_EXECUTION_WINDOW || value > MAX_EXECUTION_WINDOW) revert InvalidExecutionWindow();
-    }
-
-    function _validateQuorumBps(uint256 value) internal pure {
-        if (value < MIN_QUORUM_BPS || value > MAX_QUORUM_BPS) revert InvalidQuorumBps();
-    }
-
-    function _validateMaxPerformanceFeeBps(uint256 value) internal pure {
-        if (value > MAX_PERFORMANCE_FEE_CAP) revert InvalidMaxPerformanceFeeBps();
-    }
-
-    function _validateCooldownPeriod(uint256 value) internal pure {
-        if (value < MIN_COOLDOWN_PERIOD || value > MAX_COOLDOWN_PERIOD) revert InvalidCooldownPeriod();
     }
 
     // ==================== UUPS ====================
