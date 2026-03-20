@@ -7,7 +7,6 @@ interface ISyndicateVault {
     // ── Errors ──
     error InvalidOwner();
     error InvalidExecutorImpl();
-    error NoShares();
     error NotActiveAgent();
     error SimulationFailed();
     error InvalidDepositor();
@@ -43,9 +42,6 @@ interface ISyndicateVault {
         bool active;
     }
 
-    // ── LP Functions ──
-    function ragequit(address receiver) external returns (uint256 assets);
-
     // ── Owner Functions ──
     function executeBatch(BatchExecutorLib.Call[] calldata calls) external;
 
@@ -63,7 +59,6 @@ interface ISyndicateVault {
     function getAgentCount() external view returns (uint256);
     function isAgent(address agentAddress) external view returns (bool);
     function getExecutorImpl() external view returns (address);
-    function totalDeposited() external view returns (uint256);
     function getAgentAddresses() external view returns (address[] memory);
 
     // ── Governor ──
@@ -82,7 +77,6 @@ interface ISyndicateVault {
     // ── Events ──
     event AgentRegistered(uint256 indexed agentId, address indexed agentAddress);
     event AgentRemoved(address indexed agentAddress);
-    event Ragequit(address indexed lp, uint256 shares, uint256 assets);
     event DepositorApproved(address indexed depositor);
     event DepositorRemoved(address indexed depositor);
     event OpenDepositsUpdated(bool open);

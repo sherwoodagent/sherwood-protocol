@@ -34,7 +34,7 @@ import {EnumerableSet} from "@openzeppelin/contracts/utils/structs/EnumerableSet
  *   Inherits ERC20VotesUpgradeable to provide proper vote checkpointing for
  *   the governor's snapshot-based voting system.
  *
- *   LPs can ragequit at any time for their pro-rata share.
+ *   LPs can redeem at any time for their pro-rata share.
  */
 contract SyndicateVault is
     ISyndicateVault,
@@ -72,9 +72,6 @@ contract SyndicateVault is
     /// @notice ERC-8004 agent identity registry (ERC-721)
     IERC721 private _agentRegistry;
 
-    /// @notice Cumulative deposits for profit calculation
-    uint256 private _totalDeposited;
-
     // ── Governor storage (appended — UUPS safe) ──
 
     /// @notice Trusted governor contract
@@ -108,18 +105,6 @@ contract SyndicateVault is
         _agentRegistry = IERC721(p.agentRegistry);
         _governor = p.governor;
         _managementFeeBps = p.managementFeeBps;
-    }
-
-    // ==================== LP FUNCTIONS ====================
-
-    /// @inheritdoc ISyndicateVault
-    function ragequit(address receiver) external whenNotPaused returns (uint256 assets) {
-        uint256 shares = balanceOf(msg.sender);
-        if (shares == 0) revert NoShares();
-
-        assets = redeem(shares, receiver, msg.sender);
-
-        emit Ragequit(msg.sender, shares, assets);
     }
 
     // ==================== BATCH EXECUTION ====================
@@ -202,11 +187,6 @@ contract SyndicateVault is
     /// @inheritdoc ISyndicateVault
     function getExecutorImpl() external view returns (address) {
         return _executorImpl;
-    }
-
-    /// @inheritdoc ISyndicateVault
-    function totalDeposited() external view returns (uint256) {
-        return _totalDeposited;
     }
 
     /// @inheritdoc ISyndicateVault
@@ -318,14 +298,7 @@ contract SyndicateVault is
         return super.decimals();
     }
 
-    /// @dev Mitigate ERC-4626 first-depositor share price inflation attack.
-    ///      Offset equals the underlying asset's decimals, creating adequate virtual shares
-    ///      regardless of asset denomination (6 for USDC, 18 for WETH/DAI, etc.).
-    function _decimalsOffset() internal view override returns (uint8) {
-        return IERC20Metadata(asset()).decimals();
-    }
-
-    /// @dev Block deposits when paused or depositor not approved. Track totalDeposited.
+    /// @dev Block deposits when paused or depositor not approved.
     ///      Auto-delegate to self on first deposit so shareholders get voting power.
     function _deposit(address caller, address receiver, uint256 assets, uint256 shares)
         internal
@@ -333,7 +306,6 @@ contract SyndicateVault is
         whenNotPaused
     {
         if (!_openDeposits && !_approvedDepositors.contains(receiver)) revert NotApprovedDepositor();
-        _totalDeposited += assets;
         super._deposit(caller, receiver, assets, shares);
 
         // Auto-delegate: if receiver has no delegate, delegate to self
@@ -348,11 +320,6 @@ contract SyndicateVault is
         whenNotPaused
     {
         if (ISyndicateGovernor(_governor).getActiveProposal(address(this)) != 0) revert RedemptionsLocked();
-        if (assets > _totalDeposited) {
-            _totalDeposited = 0;
-        } else {
-            _totalDeposited -= assets;
-        }
         super._withdraw(caller, receiver, _owner, assets, shares);
     }
 

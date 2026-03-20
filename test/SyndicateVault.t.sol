@@ -154,7 +154,7 @@ contract SyndicateVaultTest is Test {
         assertGt(vault.getVotes(lp1), 0);
     }
 
-    function test_ragequit() public {
+    function test_redeemAll() public {
         // LP1 deposits
         vm.startPrank(lp1);
         usdc.approve(address(vault), 10_000e6);
@@ -169,9 +169,10 @@ contract SyndicateVaultTest is Test {
 
         uint256 balBefore = usdc.balanceOf(lp1);
 
-        // LP1 ragequits
+        // LP1 redeems all shares
+        uint256 lp1Shares = vault.balanceOf(lp1);
         vm.prank(lp1);
-        uint256 assets = vault.ragequit(lp1);
+        uint256 assets = vault.redeem(lp1Shares, lp1, lp1);
 
         assertEq(assets, 10_000e6);
         assertEq(usdc.balanceOf(lp1), balBefore + 10_000e6);
@@ -180,10 +181,10 @@ contract SyndicateVaultTest is Test {
         assertGt(vault.balanceOf(lp2), 0);
     }
 
-    function test_ragequit_noShares_reverts() public {
+    function test_redeem_noShares_reverts() public {
         vm.prank(lp1);
-        vm.expectRevert(ISyndicateVault.NoShares.selector);
-        vault.ragequit(lp1);
+        vm.expectRevert(); // ERC4626: cannot redeem more than balance
+        vault.redeem(1, lp1, lp1);
     }
 
     // ==================== INFLATION ATTACK MITIGATION ====================
@@ -457,70 +458,6 @@ contract SyndicateVaultTest is Test {
     function test_openDeposits_initialized_true() public view {
         // The main vault in setUp was created with openDeposits=true
         assertTrue(vault.openDeposits());
-    }
-
-    // ==================== TOTAL DEPOSITED TRACKING ====================
-
-    function test_totalDeposited_increments_on_deposit() public {
-        assertEq(vault.totalDeposited(), 0);
-
-        vm.startPrank(lp1);
-        usdc.approve(address(vault), 10_000e6);
-        vault.deposit(10_000e6, lp1);
-        vm.stopPrank();
-
-        assertEq(vault.totalDeposited(), 10_000e6);
-
-        vm.startPrank(lp2);
-        usdc.approve(address(vault), 5_000e6);
-        vault.deposit(5_000e6, lp2);
-        vm.stopPrank();
-
-        assertEq(vault.totalDeposited(), 15_000e6);
-    }
-
-    function test_totalDeposited_decrements_on_withdraw() public {
-        vm.startPrank(lp1);
-        usdc.approve(address(vault), 10_000e6);
-        vault.deposit(10_000e6, lp1);
-        vault.withdraw(3_000e6, lp1, lp1);
-        vm.stopPrank();
-
-        assertEq(vault.totalDeposited(), 7_000e6);
-    }
-
-    function test_totalDeposited_decrements_on_ragequit() public {
-        vm.startPrank(lp1);
-        usdc.approve(address(vault), 10_000e6);
-        vault.deposit(10_000e6, lp1);
-        vm.stopPrank();
-
-        assertEq(vault.totalDeposited(), 10_000e6);
-
-        vm.prank(lp1);
-        vault.ragequit(lp1);
-
-        assertEq(vault.totalDeposited(), 0);
-    }
-
-    function test_totalDeposited_multiple_lps() public {
-        vm.startPrank(lp1);
-        usdc.approve(address(vault), 50_000e6);
-        vault.deposit(50_000e6, lp1);
-        vm.stopPrank();
-
-        vm.startPrank(lp2);
-        usdc.approve(address(vault), 30_000e6);
-        vault.deposit(30_000e6, lp2);
-        vm.stopPrank();
-
-        assertEq(vault.totalDeposited(), 80_000e6);
-
-        // LP1 ragequits
-        vm.prank(lp1);
-        vault.ragequit(lp1);
-
-        assertEq(vault.totalDeposited(), 30_000e6);
     }
 
     // ==================== GET AGENT ADDRESSES ====================

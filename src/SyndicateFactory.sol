@@ -4,6 +4,9 @@ pragma solidity 0.8.28;
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
+import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {SyndicateVault} from "./SyndicateVault.sol";
 import {ISyndicateVault} from "./interfaces/ISyndicateVault.sol";
 import {ISyndicateGovernor} from "./interfaces/ISyndicateGovernor.sol";
@@ -20,7 +23,7 @@ import {IL2Registrar} from "./interfaces/IL2Registrar.sol";
  *   ENS subnames are registered atomically via Durin L2 Registrar, so each
  *   syndicate gets a <subdomain>.sherwoodagent.eth name resolving to its vault.
  */
-contract SyndicateFactory {
+contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     // ── Errors ──
     error InvalidExecutorImpl();
     error InvalidVaultImpl();
@@ -52,19 +55,19 @@ contract SyndicateFactory {
     }
 
     /// @notice Shared executor lib (deployed once, stateless)
-    address public immutable executorImpl;
+    address public executorImpl;
 
     /// @notice Shared vault implementation (for UUPS proxies)
-    address public immutable vaultImpl;
+    address public vaultImpl;
 
     /// @notice Durin L2 Registrar for ENS subnames
-    IL2Registrar public immutable ensRegistrar;
+    IL2Registrar public ensRegistrar;
 
     /// @notice ERC-8004 agent identity registry (ERC-721)
-    IERC721 public immutable agentRegistry;
+    IERC721 public agentRegistry;
 
     /// @notice Shared governor contract
-    address public immutable governor;
+    address public governor;
 
     /// @notice Management fee for vault owners: 0.5% of strategy profits
     uint256 public constant MANAGEMENT_FEE_BPS = 50;
@@ -84,25 +87,71 @@ contract SyndicateFactory {
     );
     event MetadataUpdated(uint256 indexed id, string metadataURI);
     event SyndicateDeactivated(uint256 indexed id);
+    event ExecutorImplUpdated(address indexed oldImpl, address indexed newImpl);
+    event VaultImplUpdated(address indexed oldImpl, address indexed newImpl);
+    event EnsRegistrarUpdated(address indexed oldRegistrar, address indexed newRegistrar);
+    event AgentRegistryUpdated(address indexed oldRegistry, address indexed newRegistry);
+    event GovernorUpdated(address indexed oldGovernor, address indexed newGovernor);
 
-    constructor(
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    function initialize(
+        address owner_,
         address executorImpl_,
         address vaultImpl_,
         address ensRegistrar_,
         address agentRegistry_,
         address governor_
-    ) {
+    ) external initializer {
         if (executorImpl_ == address(0)) revert InvalidExecutorImpl();
         if (vaultImpl_ == address(0)) revert InvalidVaultImpl();
         if (governor_ == address(0)) revert InvalidGovernor();
         // ensRegistrar_ and agentRegistry_ may be address(0) on chains
         // without ENS/Durin or ERC-8004 (e.g. Robinhood L2)
+
+        __Ownable_init(owner_);
+
         executorImpl = executorImpl_;
         vaultImpl = vaultImpl_;
         ensRegistrar = IL2Registrar(ensRegistrar_);
         agentRegistry = IERC721(agentRegistry_);
         governor = governor_;
     }
+
+    // ── Config setters (owner only) ──
+
+    function setExecutorImpl(address executorImpl_) external onlyOwner {
+        if (executorImpl_ == address(0)) revert InvalidExecutorImpl();
+        emit ExecutorImplUpdated(executorImpl, executorImpl_);
+        executorImpl = executorImpl_;
+    }
+
+    function setVaultImpl(address vaultImpl_) external onlyOwner {
+        if (vaultImpl_ == address(0)) revert InvalidVaultImpl();
+        emit VaultImplUpdated(vaultImpl, vaultImpl_);
+        vaultImpl = vaultImpl_;
+    }
+
+    function setEnsRegistrar(address ensRegistrar_) external onlyOwner {
+        emit EnsRegistrarUpdated(address(ensRegistrar), ensRegistrar_);
+        ensRegistrar = IL2Registrar(ensRegistrar_);
+    }
+
+    function setAgentRegistry(address agentRegistry_) external onlyOwner {
+        emit AgentRegistryUpdated(address(agentRegistry), agentRegistry_);
+        agentRegistry = IERC721(agentRegistry_);
+    }
+
+    function setGovernor(address governor_) external onlyOwner {
+        if (governor_ == address(0)) revert InvalidGovernor();
+        emit GovernorUpdated(governor, governor_);
+        governor = governor_;
+    }
+
+    // ── Core functions ──
 
     /// @notice Create a new syndicate — deploys vault proxy, registers ENS subname, stores everything
     /// @param creatorAgentId ERC-8004 agent ID of the creator (must be owned by msg.sender)
@@ -204,4 +253,6 @@ contract SyndicateFactory {
         }
         return result;
     }
+
+    function _authorizeUpgrade(address) internal override onlyOwner {}
 }

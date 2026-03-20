@@ -65,9 +65,13 @@ contract DeployRobinhoodTestnet is Script {
         address governorProxy = address(new ERC1967Proxy(address(govImpl), govInitData));
         console.log("SyndicateGovernor:", governorProxy);
 
-        // 4. Deploy SyndicateFactory (no ENS registrar, no agent registry)
-        SyndicateFactory factory =
-            new SyndicateFactory(address(executorLib), address(vaultImpl), L2_REGISTRAR, AGENT_REGISTRY, governorProxy);
+        // 4. Deploy SyndicateFactory (UUPS proxy, no ENS registrar, no agent registry)
+        SyndicateFactory factoryImpl = new SyndicateFactory();
+        bytes memory factoryInitData = abi.encodeCall(
+            SyndicateFactory.initialize,
+            (deployer, address(executorLib), address(vaultImpl), L2_REGISTRAR, AGENT_REGISTRY, governorProxy)
+        );
+        SyndicateFactory factory = SyndicateFactory(address(new ERC1967Proxy(address(factoryImpl), factoryInitData)));
         console.log("SyndicateFactory:", address(factory));
         ISyndicateGovernor(governorProxy).setFactory(address(factory));
 

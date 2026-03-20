@@ -12,6 +12,7 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 import {MockL2Registrar} from "./mocks/MockL2Registrar.sol";
 import {MockAgentRegistry} from "./mocks/MockAgentRegistry.sol";
+import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 
 contract SyndicateFactoryTest is Test {
     SyndicateFactory public factory;
@@ -57,9 +58,20 @@ contract SyndicateFactoryTest is Test {
         );
         governor = SyndicateGovernor(address(new ERC1967Proxy(address(govImpl), govInit)));
 
-        factory = new SyndicateFactory(
-            address(executorLib), address(vaultImpl), address(ensRegistrar), address(agentRegistry), address(governor)
+        // Deploy factory as UUPS proxy
+        SyndicateFactory factoryImpl = new SyndicateFactory();
+        bytes memory factoryInit = abi.encodeCall(
+            SyndicateFactory.initialize,
+            (
+                owner,
+                address(executorLib),
+                address(vaultImpl),
+                address(ensRegistrar),
+                address(agentRegistry),
+                address(governor)
+            )
         );
+        factory = SyndicateFactory(address(new ERC1967Proxy(address(factoryImpl), factoryInit)));
 
         // Set factory on governor so it can call addVault
         vm.prank(owner);
@@ -89,6 +101,19 @@ contract SyndicateFactoryTest is Test {
         SyndicateFactory.SyndicateConfig memory cfg = _defaultConfig();
         cfg.subdomain = subdomain_;
         return cfg;
+    }
+
+    /// @dev Helper to deploy a no-registry factory as a UUPS proxy
+    function _deployNoRegFactory() internal returns (SyndicateFactory) {
+        SyndicateFactory impl = new SyndicateFactory();
+        bytes memory initData = abi.encodeCall(
+            SyndicateFactory.initialize,
+            (owner, address(executorLib), address(vaultImpl), address(0), address(0), address(governor))
+        );
+        SyndicateFactory f = SyndicateFactory(address(new ERC1967Proxy(address(impl), initData)));
+        vm.prank(owner);
+        governor.setFactory(address(f));
+        return f;
     }
 
     // ==================== CREATION ====================
@@ -309,11 +334,7 @@ contract SyndicateFactoryTest is Test {
     // ==================== NO-REGISTRY DEPLOYMENT (Robinhood L2) ====================
 
     function test_createFactory_noRegistries() public {
-        // Deploy factory with address(0) for ENS + agent registry (Robinhood L2 scenario)
-        SyndicateFactory noRegFactory =
-            new SyndicateFactory(address(executorLib), address(vaultImpl), address(0), address(0), address(governor));
-        vm.prank(owner);
-        governor.setFactory(address(noRegFactory));
+        SyndicateFactory noRegFactory = _deployNoRegFactory();
 
         // createSyndicate works without identity verification
         vm.prank(creator1);
@@ -329,10 +350,7 @@ contract SyndicateFactoryTest is Test {
     }
 
     function test_createFactory_noRegistries_noENSRegistration() public {
-        SyndicateFactory noRegFactory =
-            new SyndicateFactory(address(executorLib), address(vaultImpl), address(0), address(0), address(governor));
-        vm.prank(owner);
-        governor.setFactory(address(noRegFactory));
+        SyndicateFactory noRegFactory = _deployNoRegFactory();
 
         vm.prank(creator1);
         noRegFactory.createSyndicate(0, _configWithSubdomain("no-ens-fund"));
@@ -343,10 +361,7 @@ contract SyndicateFactoryTest is Test {
     }
 
     function test_createFactory_noRegistries_isSubdomainAvailable() public {
-        SyndicateFactory noRegFactory =
-            new SyndicateFactory(address(executorLib), address(vaultImpl), address(0), address(0), address(governor));
-        vm.prank(owner);
-        governor.setFactory(address(noRegFactory));
+        SyndicateFactory noRegFactory = _deployNoRegFactory();
 
         assertTrue(noRegFactory.isSubdomainAvailable("available-name"));
 
@@ -357,10 +372,7 @@ contract SyndicateFactoryTest is Test {
     }
 
     function test_createFactory_noRegistries_registerAgent() public {
-        SyndicateFactory noRegFactory =
-            new SyndicateFactory(address(executorLib), address(vaultImpl), address(0), address(0), address(governor));
-        vm.prank(owner);
-        governor.setFactory(address(noRegFactory));
+        SyndicateFactory noRegFactory = _deployNoRegFactory();
 
         vm.prank(creator1);
         (, address vaultAddr) = noRegFactory.createSyndicate(0, _defaultConfig());
@@ -388,5 +400,121 @@ contract SyndicateFactoryTest is Test {
 
         SyndicateFactory.Syndicate[] memory active = factory.getActiveSyndicates();
         assertEq(active.length, 2);
+    }
+
+    // ==================== UUPS UPGRADE ====================
+
+    function test_upgradeFactory() public {
+        // Create a syndicate before upgrade
+        vm.prank(creator1);
+        (uint256 id, address vaultAddr) = factory.createSyndicate(creator1AgentId, _defaultConfig());
+
+        // Deploy new implementation
+        SyndicateFactory newImpl = new SyndicateFactory();
+
+        // Upgrade
+        vm.prank(owner);
+        factory.upgradeToAndCall(address(newImpl), "");
+
+        // State preserved after upgrade
+        assertEq(factory.syndicateCount(), 1);
+        assertEq(factory.vaultToSyndicate(vaultAddr), id);
+        assertEq(factory.executorImpl(), address(executorLib));
+        assertEq(factory.vaultImpl(), address(vaultImpl));
+        assertEq(factory.governor(), address(governor));
+        assertEq(factory.owner(), owner);
+    }
+
+    function test_upgradeFactory_notOwner_reverts() public {
+        SyndicateFactory newImpl = new SyndicateFactory();
+
+        vm.prank(creator1);
+        vm.expectRevert(abi.encodeWithSelector(OwnableUpgradeable.OwnableUnauthorizedAccount.selector, creator1));
+        factory.upgradeToAndCall(address(newImpl), "");
+    }
+
+    // ==================== CONFIG SETTERS ====================
+
+    function test_setExecutorImpl() public {
+        address newExecutor = makeAddr("newExecutor");
+        vm.prank(owner);
+        factory.setExecutorImpl(newExecutor);
+        assertEq(factory.executorImpl(), newExecutor);
+    }
+
+    function test_setExecutorImpl_notOwner_reverts() public {
+        vm.prank(creator1);
+        vm.expectRevert(abi.encodeWithSelector(OwnableUpgradeable.OwnableUnauthorizedAccount.selector, creator1));
+        factory.setExecutorImpl(makeAddr("newExecutor"));
+    }
+
+    function test_setExecutorImpl_zero_reverts() public {
+        vm.prank(owner);
+        vm.expectRevert(SyndicateFactory.InvalidExecutorImpl.selector);
+        factory.setExecutorImpl(address(0));
+    }
+
+    function test_setVaultImpl() public {
+        address newVaultImpl = makeAddr("newVaultImpl");
+        vm.prank(owner);
+        factory.setVaultImpl(newVaultImpl);
+        assertEq(factory.vaultImpl(), newVaultImpl);
+    }
+
+    function test_setVaultImpl_notOwner_reverts() public {
+        vm.prank(creator1);
+        vm.expectRevert(abi.encodeWithSelector(OwnableUpgradeable.OwnableUnauthorizedAccount.selector, creator1));
+        factory.setVaultImpl(makeAddr("newVaultImpl"));
+    }
+
+    function test_setVaultImpl_zero_reverts() public {
+        vm.prank(owner);
+        vm.expectRevert(SyndicateFactory.InvalidVaultImpl.selector);
+        factory.setVaultImpl(address(0));
+    }
+
+    function test_setEnsRegistrar() public {
+        address newRegistrar = makeAddr("newRegistrar");
+        vm.prank(owner);
+        factory.setEnsRegistrar(newRegistrar);
+        assertEq(address(factory.ensRegistrar()), newRegistrar);
+    }
+
+    function test_setEnsRegistrar_notOwner_reverts() public {
+        vm.prank(creator1);
+        vm.expectRevert(abi.encodeWithSelector(OwnableUpgradeable.OwnableUnauthorizedAccount.selector, creator1));
+        factory.setEnsRegistrar(makeAddr("newRegistrar"));
+    }
+
+    function test_setGovernor() public {
+        address newGovernor = makeAddr("newGovernor");
+        vm.prank(owner);
+        factory.setGovernor(newGovernor);
+        assertEq(factory.governor(), newGovernor);
+    }
+
+    function test_setGovernor_notOwner_reverts() public {
+        vm.prank(creator1);
+        vm.expectRevert(abi.encodeWithSelector(OwnableUpgradeable.OwnableUnauthorizedAccount.selector, creator1));
+        factory.setGovernor(makeAddr("newGovernor"));
+    }
+
+    function test_setGovernor_zero_reverts() public {
+        vm.prank(owner);
+        vm.expectRevert(SyndicateFactory.InvalidGovernor.selector);
+        factory.setGovernor(address(0));
+    }
+
+    function test_setAgentRegistry() public {
+        address newRegistry = makeAddr("newRegistry");
+        vm.prank(owner);
+        factory.setAgentRegistry(newRegistry);
+        assertEq(address(factory.agentRegistry()), newRegistry);
+    }
+
+    function test_setAgentRegistry_notOwner_reverts() public {
+        vm.prank(creator1);
+        vm.expectRevert(abi.encodeWithSelector(OwnableUpgradeable.OwnableUnauthorizedAccount.selector, creator1));
+        factory.setAgentRegistry(makeAddr("newRegistry"));
     }
 }
