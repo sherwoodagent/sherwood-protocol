@@ -3,10 +3,10 @@
   "chainId": 84532,
   "deployer": "0x1804c8AB1F12E6bbf3894d4083f33e07309d1f38",
   "contracts": {
-    "batchExecutorLib": "0xd5C4eE2E4c5B606b9401E69A3B3FeE169037C284",
-    "vaultImplementation": "0x61d2c54Af8154E696dfdf909d23ba090dD365c3c",
-    "syndicateGovernor": "0x6fc67a9aD15eD3A9DE25c29CCe10D662079129E2",
-    "syndicateFactory": "0x2efD194ADb3Db40E0e6faAe06c4e602c7a3D9199"
+    "batchExecutorLib": "0x3e9aFad2DAAD410F9aeF997ebeE6cE9c46D63163",
+    "vaultImplementation": "0x6d026e2f5Ff0C34A01690EC46Cb601B8fF391985",
+    "syndicateGovernor": "0x18Fd69B362E935f52b233bEeD033425C859605C5",
+    "syndicateFactory": "0xffB15e53360b01fEecb8952Ec4F4e809cB0D4965"
   },
   "externalContracts": {
     "l2Registrar": "0x1fCbe9dFC25e3fa3F7C55b26c7992684A4758b47",
@@ -15,6 +15,6 @@
   },
   "deployedAt": "2026-03-15",
   "redeployedAt": "2026-03-21",
-  "redeployReason": "PR #78 — optimistic governance, veto, strategy templates, protocol fee",
+  "redeployReason": "PR #91 — audit fixes: optimizer_runs=50, TOCTOU finalize check, rescueERC721 blocking",
   "explorer": "https://sepolia.basescan.org"
 }
