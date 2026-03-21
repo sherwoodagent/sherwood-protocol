@@ -16,9 +16,6 @@ import {
   Depositor,
 } from "../generated/schema";
 
-// USDC has 6 decimals
-let USDC_DECIMALS = 6;
-
 function toDecimal(value: BigInt, decimals: i32): BigDecimal {
   let factor = BigInt.fromI32(10).pow(decimals as u8).toBigDecimal();
   return value.toBigDecimal().div(factor);
@@ -42,8 +39,6 @@ export function handleAgentRegistered(event: AgentRegistered): void {
   agent.agentAddress = event.params.agentAddress;
   agent.active = true;
   agent.registeredAt = event.block.timestamp;
-  agent.totalBatches = BigInt.zero();
-  agent.totalAssetAmount = BigInt.zero();
 
   agent.save();
 }
@@ -80,7 +75,7 @@ export function handleDeposit(event: DepositEvent): void {
   let syndicate = Syndicate.load(syndicateId);
   if (syndicate != null) {
     syndicate.totalDeposits = syndicate.totalDeposits.plus(
-      toDecimal(event.params.assets, USDC_DECIMALS)
+      toDecimal(event.params.assets, syndicate.assetDecimals as i32)
     );
     syndicate.save();
   }
@@ -108,7 +103,7 @@ export function handleWithdraw(event: WithdrawEvent): void {
   let syndicate = Syndicate.load(syndicateId);
   if (syndicate != null) {
     syndicate.totalWithdrawals = syndicate.totalWithdrawals.plus(
-      toDecimal(event.params.assets, USDC_DECIMALS)
+      toDecimal(event.params.assets, syndicate.assetDecimals as i32)
     );
     syndicate.save();
   }
@@ -142,7 +137,11 @@ export function handleDepositorRemoved(event: DepositorRemoved): void {
 // ── Config Changes ──
 
 export function handleOpenDepositsUpdated(event: OpenDepositsUpdated): void {
-  // Open deposits toggle — indexed for event filtering.
+  let syndicateId = getSyndicateId();
+  let syndicate = Syndicate.load(syndicateId);
+  if (syndicate == null) return;
+  syndicate.openDeposits = event.params.open;
+  syndicate.save();
 }
 
 

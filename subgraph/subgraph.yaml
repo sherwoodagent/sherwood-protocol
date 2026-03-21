@@ -23,6 +23,8 @@ dataSources:
           file: ../out/SyndicateFactory.sol/SyndicateFactory.json
         - name: SyndicateVault
           file: ../out/SyndicateVault.sol/SyndicateVault.json
+        - name: ERC20
+          file: ../out/ERC20.sol/ERC20.json
       eventHandlers:
         - event: SyndicateCreated(indexed uint256,indexed address,indexed
             address,string,string)
@@ -65,6 +67,16 @@ dataSources:
           handler: handleProposalCancelled
         - event: EmergencySettled(indexed uint256,indexed address,int256,uint256)
           handler: handleEmergencySettled
+        - event: ProposalVetoed(indexed uint256,indexed address)
+          handler: handleProposalVetoed
+        - event: CollaborativeProposalCreated(indexed uint256,indexed address,address[],uint256[])
+          handler: handleCollaborativeProposalCreated
+        - event: CollaborationApproved(indexed uint256,indexed address)
+          handler: handleCollaborationApproved
+        - event: CollaborationRejected(indexed uint256,indexed address)
+          handler: handleCollaborationRejected
+        - event: CollaborationTransitionedToPending(indexed uint256)
+          handler: handleCollaborationTransitionedToPending
       file: ./src/governor.ts
 templates:
   - kind: ethereum
@@ -86,6 +98,8 @@ templates:
       abis:
         - name: SyndicateVault
           file: ../out/SyndicateVault.sol/SyndicateVault.json
+        - name: ERC20
+          file: ../out/ERC20.sol/ERC20.json
       eventHandlers:
         - event: AgentRegistered(indexed uint256,indexed address)
           handler: handleAgentRegistered
