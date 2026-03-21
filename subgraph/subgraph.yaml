@@ -6,11 +6,11 @@ schema:
 dataSources:
   - kind: ethereum
     name: SyndicateFactory
-    network: base-sepolia
+    network: base
     source:
-      address: "0x2efD194ADb3Db40E0e6faAe06c4e602c7a3D9199"
       abi: SyndicateFactory
-      startBlock: 39036984
+      address: "0x8776F4C9b181C3AC14eB3271B69D297627d79cee"
+      startBlock: 43638807
     mapping:
       kind: ethereum/events
       apiVersion: 0.0.9
@@ -34,11 +34,11 @@ dataSources:
       file: ./src/factory.ts
   - kind: ethereum
     name: SyndicateGovernor
-    network: base-sepolia
+    network: base
     source:
-      address: "0x6fc67a9aD15eD3A9DE25c29CCe10D662079129E2"
       abi: SyndicateGovernor
-      startBlock: 39036984
+      address: "0x4eC24F423c79cc94624c6f555071FF49989910bD"
+      startBlock: 43638807
     mapping:
       kind: ethereum/events
       apiVersion: 0.0.9
@@ -69,7 +69,7 @@ dataSources:
 templates:
   - kind: ethereum
     name: SyndicateVault
-    network: base-sepolia
+    network: base
     source:
       abi: SyndicateVault
     mapping:
