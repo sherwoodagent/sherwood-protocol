@@ -3,7 +3,6 @@ pragma solidity 0.8.28;
 
 import {Script, console} from "forge-std/Script.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
-import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SyndicateVault} from "../src/SyndicateVault.sol";
 import {BatchExecutorLib} from "../src/BatchExecutorLib.sol";
 import {SyndicateFactory} from "../src/SyndicateFactory.sol";
@@ -19,8 +18,8 @@ import {ISyndicateGovernor} from "../src/interfaces/ISyndicateGovernor.sol";
  *
  *   Usage:
  *     forge script script/Deploy.s.sol:Deploy \
- *       --rpc-url $BASE_RPC_URL \
- *       --private-key $PRIVATE_KEY \
+ *       --rpc-url base \
+ *       --account sherwood-agent \
  *       --broadcast \
  *       --verify
  */
@@ -43,8 +42,7 @@ contract Deploy is Script {
     address constant AERO = 0x940181a94A35A4569E4529A3CDfB74e38FD98631;
 
     // Durin L2 Registrar (ENS subnames for sherwoodagent.eth)
-    // TODO: set once Durin L2 Registrar is deployed on Base mainnet
-    address constant L2_REGISTRAR = address(0);
+    address constant L2_REGISTRAR = 0x866996c808E6244216a3d0df15464FCF5d495394;
 
     // ERC-8004 Agent Identity Registry
     // Base Mainnet: 0x8004A169FB4a3325136EB29fA0ceB6D2e539a432
@@ -52,12 +50,11 @@ contract Deploy is Script {
     address constant AGENT_REGISTRY = 0x8004A169FB4a3325136EB29fA0ceB6D2e539a432;
 
     function run() external {
-        uint256 deployerKey = vm.envUint("PRIVATE_KEY");
-        address deployer = vm.addr(deployerKey);
+        address deployer = msg.sender;
 
         console.log("Deployer:", deployer);
 
-        vm.startBroadcast(deployerKey);
+        vm.startBroadcast();
 
         // 1. Deploy BatchExecutorLib (shared, stateless — deploy once)
         BatchExecutorLib executorLib = new BatchExecutorLib();
@@ -107,31 +104,9 @@ contract Deploy is Script {
         SyndicateFactory factory = SyndicateFactory(address(new ERC1967Proxy(address(factoryImpl), factoryInitData)));
         console.log("SyndicateFactory:", address(factory));
 
-        // 5. Create first syndicate + register agent
-        {
-            uint256 creatorAgentId = vm.envUint("CREATOR_AGENT_ID");
-
-            (uint256 syndicateId, address vaultProxy) = factory.createSyndicate(
-                creatorAgentId,
-                SyndicateFactory.SyndicateConfig({
-                    metadataURI: "",
-                    asset: IERC20(USDC),
-                    name: "Sherwood Vault",
-                    symbol: "swUSDC",
-                    openDeposits: false,
-                    subdomain: "sherwood"
-                })
-            );
-            console.log("Syndicate #%d vault:", syndicateId, vaultProxy);
-
-            SyndicateVault(payable(vaultProxy)).registerAgent(creatorAgentId, deployer);
-            console.log("Registered deployer as agent");
-
-            console.log("\n=== Deployment Summary ===");
-            console.log("VAULT_ADDRESS=%s", vaultProxy);
-        }
-
+        console.log("\n=== Base Mainnet Deployment Summary ===");
         console.log("FACTORY_ADDRESS=%s", address(factory));
+        console.log("GOVERNOR_ADDRESS=%s", governorProxy);
         console.log("EXECUTOR_LIB_ADDRESS=%s", address(executorLib));
 
         vm.stopBroadcast();
