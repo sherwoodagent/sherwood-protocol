@@ -40,14 +40,14 @@ abstract contract ScriptBase is Script {
         vm.serializeUint(obj, "chainId", block.chainid);
         string memory json = vm.serializeString(obj, "name", name);
 
-        string memory path = string.concat("chains/", vm.toString(block.chainid), ".json");
+        string memory path = string.concat(vm.projectRoot(), "/chains/", vm.toString(block.chainid), ".json");
         vm.writeJson(json, path);
         console.log("Addresses written to %s", path);
     }
 
     /// @notice Read a deployed address from chains/{chainId}.json
     function _readAddress(string memory key) internal view returns (address) {
-        string memory path = string.concat("chains/", vm.toString(block.chainid), ".json");
+        string memory path = string.concat(vm.projectRoot(), "/chains/", vm.toString(block.chainid), ".json");
         string memory json = vm.readFile(path);
         return vm.parseJsonAddress(json, string.concat(".", key));
     }

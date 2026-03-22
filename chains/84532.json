@@ -1,20 +1,9 @@
 {
-  "network": "base-sepolia",
+  "BATCH_EXECUTOR_LIB": "0x847758DDb37F1709da5bB3d3F8aC395938e6a84f",
+  "DEPLOYER": "0x1804c8AB1F12E6bbf3894d4083f33e07309d1f38",
+  "SYNDICATE_FACTORY": "0x121AaC2B96Ec365e457fcCc1C2ED5a6142064069",
+  "SYNDICATE_GOVERNOR": "0xE5ecf2B06E3f3e298B632C0cf6575f9d9422F55E",
+  "SYNDICATE_VAULT_IMPL": "0x2E97621f49D5b8263E244daB25f177DF739e58a9",
   "chainId": 84532,
-  "deployer": "0x1804c8AB1F12E6bbf3894d4083f33e07309d1f38",
-  "contracts": {
-    "batchExecutorLib": "0x3e9aFad2DAAD410F9aeF997ebeE6cE9c46D63163",
-    "vaultImplementation": "0x6d026e2f5Ff0C34A01690EC46Cb601B8fF391985",
-    "syndicateGovernor": "0x18Fd69B362E935f52b233bEeD033425C859605C5",
-    "syndicateFactory": "0xffB15e53360b01fEecb8952Ec4F4e809cB0D4965"
-  },
-  "externalContracts": {
-    "l2Registrar": "0x1fCbe9dFC25e3fa3F7C55b26c7992684A4758b47",
-    "identityRegistry": "0x8004A818BFB912233c491871b3d84c89A494BD9e",
-    "reputationRegistry": "0x8004B663056A597Dffe9eCcC1965A193B7388713"
-  },
-  "deployedAt": "2026-03-15",
-  "redeployedAt": "2026-03-21",
-  "redeployReason": "PR #91 — audit fixes: optimizer_runs=50, TOCTOU finalize check, rescueERC721 blocking",
-  "explorer": "https://sepolia.basescan.org"
+  "name": "Base Sepolia"
 }
