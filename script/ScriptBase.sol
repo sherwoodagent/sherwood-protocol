@@ -51,4 +51,25 @@ abstract contract ScriptBase is Script {
         string memory json = vm.readFile(path);
         return vm.parseJsonAddress(json, string.concat(".", key));
     }
+
+    /// @notice Write tokenomics addresses to chains/{chainId}.json (appends to existing)
+    function _writeTokenomicsAddresses(
+        address woodToken,
+        address votingEscrow,
+        address voter,
+        address minter,
+        address rewardsDistributor,
+        address voteIncentive
+    ) internal {
+        string memory path = string.concat(vm.projectRoot(), "/chains/", vm.toString(block.chainid), ".json");
+
+        vm.writeJson(vm.serializeAddress("", "", woodToken), path, ".WOOD_TOKEN");
+        vm.writeJson(vm.serializeAddress("", "", votingEscrow), path, ".VOTING_ESCROW");
+        vm.writeJson(vm.serializeAddress("", "", voter), path, ".VOTER");
+        vm.writeJson(vm.serializeAddress("", "", minter), path, ".MINTER");
+        vm.writeJson(vm.serializeAddress("", "", rewardsDistributor), path, ".REWARDS_DISTRIBUTOR");
+        vm.writeJson(vm.serializeAddress("", "", voteIncentive), path, ".VOTE_INCENTIVE");
+
+        console.log("Tokenomics addresses written to %s", path);
+    }
 }
