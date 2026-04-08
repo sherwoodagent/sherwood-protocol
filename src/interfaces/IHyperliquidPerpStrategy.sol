@@ -14,6 +14,9 @@ interface IHyperliquidPerpStrategy is IStrategy {
     event PositionClosed(uint32 asset, uint64 limitPx, uint64 sz);
     event StopLossUpdated(uint64 triggerPx);
     event FundsParked(uint256 amount);
+    event SettlePhase1Complete();
+    event SettlePhase2Complete(uint256 amountReturned);
+    event LeverageUpdated(uint32 asset, uint32 leverage);
 
     // ── Views ──
 
@@ -35,9 +38,9 @@ interface IHyperliquidPerpStrategy is IStrategy {
     /// @notice Whether a perp position is currently open
     function positionOpen() external view returns (bool);
 
-    /// @notice The order ID of the current stop loss order
-    function stopLossOrderId() external view returns (uint64);
+    /// @notice Current settlement phase (NONE, CLOSING, SWEEPING)
+    function settlePhase() external view returns (uint8);
 
-    /// @notice The order ID of the entry order
-    function entryOrderId() external view returns (uint64);
+    /// @notice Phase 2 of settlement: push USDC to vault after async transfer completes
+    function sweepToVault() external;
 }

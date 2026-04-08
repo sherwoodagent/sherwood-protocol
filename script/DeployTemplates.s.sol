@@ -119,15 +119,20 @@ contract DeployTemplates is ScriptBase {
             console.log("  Skipped  MamoYieldStrategy:        %s (already deployed)", t.mamo);
         }
 
-        if (_needsDeploy(t.hyperliquid)) {
-            if (t.hyperliquid != address(0)) {
-                console.log("  Stale    HyperliquidPerpStrategy:  %s (no code, redeploying)", t.hyperliquid);
+        // A1: HyperliquidPerpStrategy only deploys on HyperEVM (chain ID 999)
+        if (block.chainid == 999) {
+            if (_needsDeploy(t.hyperliquid)) {
+                if (t.hyperliquid != address(0)) {
+                    console.log("  Stale    HyperliquidPerpStrategy:  %s (no code, redeploying)", t.hyperliquid);
+                }
+                t.hyperliquid = address(new HyperliquidPerpStrategy());
+                console.log("  Deployed HyperliquidPerpStrategy:  %s", t.hyperliquid);
+                anyDeployed = true;
+            } else {
+                console.log("  Skipped  HyperliquidPerpStrategy:  %s (already deployed)", t.hyperliquid);
             }
-            t.hyperliquid = address(new HyperliquidPerpStrategy());
-            console.log("  Deployed HyperliquidPerpStrategy:  %s", t.hyperliquid);
-            anyDeployed = true;
         } else {
-            console.log("  Skipped  HyperliquidPerpStrategy:  %s (already deployed)", t.hyperliquid);
+            console.log("  Skipped  HyperliquidPerpStrategy:  N/A (not on HyperEVM, chainId=%s)", block.chainid);
         }
 
         vm.stopBroadcast();
@@ -140,7 +145,9 @@ contract DeployTemplates is ScriptBase {
             vm.writeJson(vm.toString(t.venice), path, string.concat(".", VENICE_KEY));
             vm.writeJson(vm.toString(t.wsteth), path, string.concat(".", WSTETH_KEY));
             vm.writeJson(vm.toString(t.mamo), path, string.concat(".", MAMO_KEY));
-            vm.writeJson(vm.toString(t.hyperliquid), path, string.concat(".", HYPERLIQUID_KEY));
+            if (block.chainid == 999) {
+                vm.writeJson(vm.toString(t.hyperliquid), path, string.concat(".", HYPERLIQUID_KEY));
+            }
             console.log("\n  Addresses saved to %s", path);
         } else {
             console.log("\n  All templates already deployed, nothing to save.");
@@ -185,8 +192,13 @@ contract DeployTemplates is ScriptBase {
         require(t.mamo.code.length > 0, "MamoYieldStrategy: no code");
         console.log("  MamoYieldStrategy:       code OK (%s bytes)", t.mamo.code.length);
 
-        require(t.hyperliquid.code.length > 0, "HyperliquidPerpStrategy: no code");
-        console.log("  HyperliquidPerpStrategy: code OK (%s bytes)", t.hyperliquid.code.length);
+        // A1: Only validate Hyperliquid on HyperEVM (chain ID 999)
+        if (block.chainid == 999) {
+            require(t.hyperliquid.code.length > 0, "HyperliquidPerpStrategy: no code");
+            console.log("  HyperliquidPerpStrategy: code OK (%s bytes)", t.hyperliquid.code.length);
+        } else {
+            console.log("  HyperliquidPerpStrategy: skipped (not on HyperEVM)");
+        }
 
         // Verify each returns the correct strategy name
         _validateName(t.moonwell, "Moonwell Supply", "MoonwellSupplyStrategy");
@@ -194,7 +206,9 @@ contract DeployTemplates is ScriptBase {
         _validateName(t.venice, "Venice Inference", "VeniceInferenceStrategy");
         _validateName(t.wsteth, "wstETH Moonwell Yield", "WstETHMoonwellStrategy");
         _validateName(t.mamo, "Mamo Yield", "MamoYieldStrategy");
-        _validateName(t.hyperliquid, "Hyperliquid Perp", "HyperliquidPerpStrategy");
+        if (block.chainid == 999) {
+            _validateName(t.hyperliquid, "Hyperliquid Perp", "HyperliquidPerpStrategy");
+        }
 
         // Templates should NOT be initialized (vault == address(0))
         require(IStrategy(t.moonwell).vault() == address(0), "MoonwellSupplyStrategy: already initialized");
@@ -202,7 +216,9 @@ contract DeployTemplates is ScriptBase {
         require(IStrategy(t.venice).vault() == address(0), "VeniceInferenceStrategy: already initialized");
         require(IStrategy(t.wsteth).vault() == address(0), "WstETHMoonwellStrategy: already initialized");
         require(IStrategy(t.mamo).vault() == address(0), "MamoYieldStrategy: already initialized");
-        require(IStrategy(t.hyperliquid).vault() == address(0), "HyperliquidPerpStrategy: already initialized");
+        if (block.chainid == 999) {
+            require(IStrategy(t.hyperliquid).vault() == address(0), "HyperliquidPerpStrategy: already initialized");
+        }
         console.log("  All templates: vault == address(0) (not initialized) OK");
     }
 
