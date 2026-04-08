@@ -23,3 +23,9 @@ exclude_lints = ["screaming-snake-case-immutable", "mixed-case-variable"]
 base = "${BASE_RPC_URL}"
 base_sepolia = "${BASE_SEPOLIA_RPC_URL}"
 robinhood_testnet = "${ROBINHOOD_TESTNET_RPC_URL}"
+hyperevm = "${HYPEREVM_RPC_URL}"
+hyperevm_testnet = "${HYPEREVM_TESTNET_RPC_URL}"
+
+[etherscan]
+hyperevm = { key = "verifyContract", url = "https://api.routescan.io/v2/network/mainnet/evm/999/etherscan/api" }
+hyperevm_testnet = { key = "verifyContract", url = "https://api.routescan.io/v2/network/testnet/evm/998/etherscan/api" }
