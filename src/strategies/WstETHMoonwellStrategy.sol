@@ -7,15 +7,6 @@ import {ICToken} from "../interfaces/ICToken.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
-/// @notice Minimal wstETH interface — the bridged Lido wstETH on Base
-///         exposes the same `stEthPerToken` rate function as mainnet L1.
-///         Returns stETH per 1e18 wstETH (scaled 1e18). Since stETH ≈ ETH
-///         (post-beacon-chain merge, 1:1 with negligible variance), this
-///         is the conversion factor we use for WETH-denominated valuation.
-interface IWstETH {
-    function stEthPerToken() external view returns (uint256);
-}
-
 /// @notice Aerodrome Router swap interface
 interface IAeroRouter {
     struct Route {
@@ -204,20 +195,13 @@ contract WstETHMoonwellStrategy is BaseStrategy {
     }
 
     // ── positionValue ──
-
-    /// @dev Compose the two conversions we already own:
-    ///        1. mwstETH → wstETH via Moonwell's stored exchange rate
-    ///        2. wstETH  → stETH (≈ WETH) via Lido's stEthPerToken
-    ///      WETH is this strategy's asset so the stETH-denominated value
-    ///      is returned as-is. The stETH/ETH peg is maintained by Lido
-    ///      within a narrow band; this is accurate enough for a P&L
-    ///      readout. Uses `exchangeRateStored` (no accrual, cheap view).
-    function _positionValue() internal view override returns (uint256, bool) {
-        uint256 cBal = ICToken(mwsteth).balanceOf(address(this));
-        if (cBal == 0) return (0, true);
-        uint256 rate = ICToken(mwsteth).exchangeRateStored();
-        uint256 wstethAmount = (cBal * rate) / 1e18;
-        uint256 stethPerWsteth = IWstETH(wsteth).stEthPerToken();
-        return ((wstethAmount * stethPerWsteth) / 1e18, true);
-    }
+    // Inherits BaseStrategy's (0, false) default. On Base mainnet the
+    // bridged Lido wstETH (ERC20Bridged via OssifiableProxy) does NOT
+    // expose stEthPerToken / tokensPerStEth / any rate view — an earlier
+    // impl here that called stEthPerToken reverted on the forked
+    // mainnet integration test. The correct fix is to read Chainlink's
+    // WSTETH/ETH feed (Base: 0x43a5C292A453A3bF3606fa856197f09D7B74251a),
+    // which requires threading a new oracle address through InitParams
+    // and all construction callers (CLI + scripts). Deferred to a
+    // focused follow-up; keeping this stub honest in the meantime.
 }

@@ -57,10 +57,6 @@ contract MockMwstETH {
         exchangeRate = rate;
     }
 
-    function exchangeRateStored() external view returns (uint256) {
-        return exchangeRate;
-    }
-
     function mint(uint256 mintAmount) external returns (uint256) {
         underlying.transferFrom(msg.sender, address(this), mintAmount);
         uint256 mTokens = (mintAmount * 1e18) / exchangeRate;
@@ -74,23 +70,6 @@ contract MockMwstETH {
         uint256 underlyingAmount = (redeemTokens * exchangeRate) / 1e18;
         ERC20Mock(address(underlying)).mint(msg.sender, underlyingAmount);
         return 0; // success
-    }
-}
-
-/// @notice Mock wstETH — ERC20 plus Lido's stEthPerToken view.
-contract MockWstETH is ERC20Mock {
-    uint256 public stEthRate; // stETH per 1e18 wstETH, scaled 1e18
-
-    constructor() ERC20Mock("wstETH", "wstETH", 18) {
-        stEthRate = 1.15e18; // typical late-2025 wstETH:stETH ratio
-    }
-
-    function setStEthPerToken(uint256 rate) external {
-        stEthRate = rate;
-    }
-
-    function stEthPerToken() external view returns (uint256) {
-        return stEthRate;
     }
 }
 
@@ -129,7 +108,7 @@ contract WstETHMoonwellStrategyTest is Test {
     WstETHMoonwellStrategy public strategy;
 
     ERC20Mock public wethToken;
-    MockWstETH public wstethToken;
+    ERC20Mock public wstethToken;
     MockMwstETH public mwstethToken;
     MockAeroRouter public aeroRouterMock;
 
@@ -153,7 +132,7 @@ contract WstETHMoonwellStrategyTest is Test {
     function setUp() public {
         // Deploy mock tokens
         wethToken = new ERC20Mock("WETH", "WETH", 18);
-        wstethToken = new MockWstETH();
+        wstethToken = new ERC20Mock("wstETH", "wstETH", 18);
         mwstethToken = new MockMwstETH(address(wstethToken));
 
         // Deploy mock router
@@ -533,52 +512,17 @@ contract WstETHMoonwellStrategyTest is Test {
     }
 
     // ==================== POSITION VALUE ====================
+    // Inherits BaseStrategy's (0, false) default — see contract comment
+    // for rationale (Base bridged wstETH has no rate view).
 
-    function test_positionValue_beforeExecute() public view {
+    function test_positionValue_alwaysStubbed() public {
         (uint256 value, bool valid) = strategy.positionValue();
         assertEq(value, 0);
         assertFalse(valid);
-    }
 
-    function test_positionValue_afterExecute() public {
         _executeStrategy();
 
-        // Strategy holds mwstETH redeemable for (SUPPLY_AMOUNT * WETH→wstETH rate)
-        // wstETH balance (mint rate 1:1 at start):
-        uint256 wstethAmount = (SUPPLY_AMOUNT * WETH_WSTETH_RATE) / 1e18;
-        // stEthRate default is 1.15 — so expected WETH-equivalent value:
-        uint256 expected = (wstethAmount * 1.15e18) / 1e18;
-
-        (uint256 value, bool valid) = strategy.positionValue();
-        assertTrue(valid);
-        assertEq(value, expected);
-    }
-
-    function test_positionValue_afterExecute_withMoonwellYield() public {
-        _executeStrategy();
-
-        // Simulate 3% Moonwell yield on mwstETH
-        mwstethToken.setExchangeRate(1.03e18);
-
-        uint256 wstethAmount = (SUPPLY_AMOUNT * WETH_WSTETH_RATE) / 1e18;
-        uint256 mBal = mwstethToken.balanceOf(address(strategy));
-        uint256 wstethRedeemable = (mBal * 1.03e18) / 1e18;
-        assertApproxEqAbs(wstethRedeemable, (wstethAmount * 103) / 100, 1);
-
-        uint256 expected = (wstethRedeemable * 1.15e18) / 1e18;
-
-        (uint256 value, bool valid) = strategy.positionValue();
-        assertTrue(valid);
-        assertEq(value, expected);
-    }
-
-    function test_positionValue_afterSettle() public {
-        _executeStrategy();
-
-        vm.prank(vault);
-        strategy.settle();
-
-        (uint256 value, bool valid) = strategy.positionValue();
+        (value, valid) = strategy.positionValue();
         assertEq(value, 0);
         assertFalse(valid);
     }
