@@ -354,6 +354,73 @@ contract MoonwellSupplyStrategyTest is Test {
         assertFalse(valid);
     }
 
+    /// @notice Coverage for the 18-decimal mWETH path.
+    /// @dev Historical context: a prior production bug was specific to the
+    ///      mWETH market (commit 9523994 required a template redeploy). The
+    ///      exchange-rate formula (`balanceOf × rate / 1e18`) is
+    ///      decimals-independent because Compound scales `exchangeRateStored`
+    ///      with `10 ** (18 - underlyingDecimals + 10)` — for 18-decimal
+    ///      underlyings the scalar is much larger than for 6-decimal USDC.
+    ///      This test asserts the math still comes out right when the
+    ///      underlying has 18 decimals and the exchange rate is the
+    ///      corresponding large value.
+    function test_positionValue_mWETH_18decimals() public {
+        // Fresh clone targeting a 1e18-decimals underlying (mWETH market).
+        ERC20Mock weth = new ERC20Mock("Wrapped Ether", "WETH", 18);
+        MockCToken mWeth = new MockCToken(address(weth));
+
+        uint256 supplyAmount = 50 ether;
+        uint256 minRedeem = 49 ether;
+
+        weth.mint(vault, 100 ether);
+        weth.mint(address(mWeth), 200 ether);
+
+        // Real Moonwell mWETH's `exchangeRateStored` is on the order of
+        // ~2e26 (per Compound's `2 × 10 ** (18 - 18 + 10) = 2e10` base scaled
+        // by accumulated yield). The mock also scales by 1e18 internally
+        // via `mint` / `redeem`, so we pin a realistic-magnitude rate here
+        // to exercise the large-scalar code path.
+        uint256 initialRate = 2e26;
+        mWeth.setExchangeRate(initialRate);
+
+        address payable clone = payable(Clones.clone(address(template)));
+        MoonwellSupplyStrategy wethStrategy = MoonwellSupplyStrategy(clone);
+        bytes memory initData = abi.encode(address(weth), address(mWeth), supplyAmount, minRedeem);
+        wethStrategy.initialize(vault, proposer, initData);
+
+        // Pre-execute: always (0, false).
+        (uint256 preValue, bool preValid) = wethStrategy.positionValue();
+        assertEq(preValue, 0);
+        assertFalse(preValid);
+
+        // Execute — pulls 50 WETH from the vault, mints mWETH at the large rate.
+        vm.prank(vault);
+        weth.approve(address(wethStrategy), supplyAmount);
+        vm.prank(vault);
+        wethStrategy.execute();
+
+        // Immediately post-execute: value should equal supplyAmount (the mock's
+        // `mint` formula is the inverse of `positionValue`'s read).
+        (uint256 v0, bool valid0) = wethStrategy.positionValue();
+        assertTrue(valid0);
+        assertApproxEqAbs(v0, supplyAmount, 1, "post-execute WETH value drift");
+
+        // Simulate 3% yield — bump the exchange rate by 1.03x.
+        mWeth.setExchangeRate((initialRate * 1.03e18) / 1e18);
+
+        (uint256 v1, bool valid1) = wethStrategy.positionValue();
+        assertTrue(valid1);
+        // Allow 1 wei of rounding tolerance — (a × 103 / 100) ≤ (a × 1.03e18 / 1e18).
+        assertApproxEqAbs(v1, (supplyAmount * 103) / 100, 1, "post-yield WETH value drift");
+
+        // Post-settle: back to (0, false) regardless of the rate.
+        vm.prank(vault);
+        wethStrategy.settle();
+        (uint256 postValue, bool postValid) = wethStrategy.positionValue();
+        assertEq(postValue, 0);
+        assertFalse(postValid);
+    }
+
     // ==================== CLONING ====================
 
     function test_clonesHaveIsolatedStorage() public {
