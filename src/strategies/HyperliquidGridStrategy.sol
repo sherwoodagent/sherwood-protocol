@@ -21,17 +21,30 @@ import {L1Read, Position, SpotBalance, AccountMarginSummary} from "../hyperliqui
  *     - ACTION_CANCEL_ALL: cancel all open orders for an asset (CLOIDs in calldata)
  *     - ACTION_CANCEL_AND_PLACE: atomic cancel + place (rebalance)
  *
- *   Settlement: _settle() force-closes all positions on tracked assets +
- *   requests async USD transfer back to spot. sweepToVault() pushes USDC
- *   back to the vault when it arrives.
+ *   Settlement: _settle() walks the on-chain CLOID mirror to cancel every
+ *   resting GTC grid order before force-closing all positions and requesting
+ *   the async USD transfer back to spot. sweepToVault() pushes USDC back to
+ *   the vault when it arrives.
+ *
+ *   Live NAV: _positionValue() reports HyperCore perp account equity via
+ *   L1Read.accountMarginSummary, so the vault can mark shares to market and
+ *   accept deposits / withdrawals while the proposal is active.
  *
  *   HyperCore note: contract addresses (unlike EOAs) need explicit
  *   registration before bridged-token transfers auto-credit HC spot.
- *   `_execute()` self-heals on first run with safe defaults for ERC-1167
- *   clones (token = USDC, variant = FirstStorageSlot). For non-default
- *   deployments (plain CREATE, UUPS proxy, non-USDC tokens), the proposer
- *   should call `finalizeForHyperCore(...)` once before opening the
- *   proposal that triggers `_execute()`, to override the defaults.
+ *   `_initialize` finalizes the clone with HC using `FirstStorageSlot` by
+ *   transiently swapping slot 0 (which `BaseStrategy.initialize` has just
+ *   set to `_vault`) to `address(this)`, firing the precompile, then
+ *   restoring the original `_vault` value. HC only reads slot 0 once at
+ *   finalize time, so the swap is invisible to subsequent vault reads.
+ *   This closes the slot-0-mismatch bug where ERC-1167 clones registered
+ *   with the *vault* address (a UUPS proxy contract, not the strategy)
+ *   and HC silently rejected USDC auto-credits, surfacing as
+ *   `HyperCoreSpotCreditFailed` at execute time.
+ *
+ *   For non-default deployments (non-USDC tokens, alternate variants), the
+ *   proposer can still call `finalizeForHyperCore(...)` post-init to fire
+ *   an additional registration with custom params.
  */
 contract HyperliquidGridStrategy is BaseStrategy {
     using SafeERC20 for IERC20;
@@ -53,6 +66,7 @@ contract HyperliquidGridStrategy is BaseStrategy {
     error TooManyOrders(uint256 actual, uint256 max);
     error OrderTooLarge(uint256 actual, uint256 max);
     error AssetNotWhitelisted(uint32 asset);
+    error HyperCoreSpotCreditFailed(uint64 spotBefore, uint64 spotAfter, uint64 expectedIncrease);
 
     // ── Action types ──
     uint8 constant ACTION_PLACE_GRID = 1;
@@ -83,6 +97,14 @@ contract HyperliquidGridStrategy is BaseStrategy {
     ///         explicit `finalizeForHyperCore` proposer call, or the implicit
     ///         self-heal in `_execute()` on first run.
     bool public hyperCoreFinalized;
+
+    /// @notice CLOIDs of resting GTC grid orders, tracked per asset. Maintained
+    ///         on-chain so `_settle` can self-cancel without keeper assistance.
+    ///         Updated on every place / cancel through `_updateParams`.
+    mapping(uint32 => uint128[]) internal _liveCloids;
+    /// @notice 1-based index into `_liveCloids[ai]` for swap-and-pop removal.
+    ///         0 means the cloid is not currently tracked.
+    mapping(uint32 => mapping(uint128 => uint256)) internal _liveCloidIndex;
 
     struct GridOrder {
         uint32 assetIndex;
@@ -126,6 +148,25 @@ contract HyperliquidGridStrategy is BaseStrategy {
             assetIndices.push(ai);
             isAssetWhitelisted[ai] = true;
         }
+
+        // HC FirstStorageSlot finalize: transiently swap slot 0 from `_vault`
+        // (just written by BaseStrategy.initialize) to `address(this)` so HC's
+        // self-attestation check passes, then restore. HC reads slot 0 once at
+        // finalize time and registration is permanent — the post-restore value
+        // is irrelevant to HC. Done at init (not execute) so the registration
+        // is in place before the first proposal opens; eliminates the silent
+        // mismatch that surfaced as HyperCoreSpotCreditFailed on prop #6.
+        bytes32 saved;
+        assembly {
+            saved := sload(0)
+            sstore(0, address())
+        }
+        L1Write.sendFinalizeEvmContract(0, FinalizeVariant.FirstStorageSlot, 0);
+        assembly {
+            sstore(0, saved)
+        }
+        hyperCoreFinalized = true;
+        emit HyperCoreFinalized(0, FinalizeVariant.FirstStorageSlot, 0);
     }
 
     /**
@@ -162,20 +203,27 @@ contract HyperliquidGridStrategy is BaseStrategy {
         if (amountIn == 0) revert InvalidAmount();
         if (amountIn > type(uint64).max) revert DepositAmountTooLarge();
 
-        // Self-heal: if the proposer didn't call finalizeForHyperCore manually
-        // with a non-default variant, register this contract with HyperCore
-        // using safe defaults (USDC = token 0, FirstStorageSlot for ERC-1167
-        // clones). Without this, the ERC20 transfer below lands on HyperEVM
-        // only and `sendUsdClassTransfer` runs against zero HC spot balance.
-        if (!hyperCoreFinalized) {
-            L1Write.sendFinalizeEvmContract(0, FinalizeVariant.FirstStorageSlot, 0);
-            hyperCoreFinalized = true;
-            emit HyperCoreFinalized(0, FinalizeVariant.FirstStorageSlot, 0);
-        }
+        // HC finalize already ran at init via the slot-0 swap — no self-heal
+        // needed here. The spot-credit guard below catches any residual
+        // misregistration before we hand USDC to HC.
+        (uint64 spotBefore, bool preSpotOk) = _tryGetUsdcSpotTotal();
 
         _pullFromVault(address(asset), amountIn);
 
         uint64 ntl = uint64(amountIn);
+
+        (uint64 spotAfter, bool postSpotOk) = _tryGetUsdcSpotTotal();
+        // HyperCore tracks USDC at 8 decimals; HyperEVM USDC is 6 decimals
+        // (evmExtraWeiDecimals = -2). A real credit grows HC spot by ntl HC-wei,
+        // which is always >= ntl EVM-wei. This is a one-sided lower-bound
+        // monotonicity check, not an exact reconciliation. Subtraction (after
+        // the >= sanity) avoids uint64 overflow on `spotBefore + ntl`.
+        if (preSpotOk && postSpotOk) {
+            uint64 delta = spotAfter >= spotBefore ? spotAfter - spotBefore : 0;
+            if (delta < ntl) {
+                revert HyperCoreSpotCreditFailed(spotBefore, spotAfter, ntl);
+            }
+        }
 
         for (uint256 i = 0; i < assetIndices.length; i++) {
             L1Write.sendUpdateLeverage(assetIndices[i], true, leverage);
@@ -219,6 +267,7 @@ contract HyperliquidGridStrategy is BaseStrategy {
             uint256 approxUsd = uint256(o.sz) * uint256(o.limitPx) / 1e6;
             if (approxUsd > maxOrderSize) revert OrderTooLarge(approxUsd, maxOrderSize);
             L1Write.sendLimitOrder(o.assetIndex, o.isBuy, o.limitPx, o.sz, false, TimeInForce.Gtc, o.cloid);
+            _trackCloid(o.assetIndex, o.cloid);
             emit GridOrderPlaced(o.assetIndex, o.isBuy, o.limitPx, o.sz, o.cloid);
         }
     }
@@ -227,22 +276,53 @@ contract HyperliquidGridStrategy is BaseStrategy {
         if (!isAssetWhitelisted[assetIndex]) revert AssetNotWhitelisted(assetIndex);
         for (uint256 i = 0; i < cloids.length; i++) {
             L1Write.sendCancelOrderByCloid(assetIndex, cloids[i]);
+            _untrackCloid(assetIndex, cloids[i]);
             emit GridOrderCancelled(assetIndex, cloids[i]);
         }
     }
 
-    /// @notice Force-close all positions on tracked assets, transfer USD back to spot.
-    /// @dev IMPORTANT — SETTLEMENT RUNBOOK:
-    ///      Before the vault calls this (via the governor's settle action), the
-    ///      keeper MUST call `updateParams(ACTION_CANCEL_ALL)` for each asset to
-    ///      cancel all resting GTC grid orders. Otherwise resting orders may
-    ///      fill against the IOC reduce-only force-close orders here, leaving
-    ///      net positions and stranded margin. The contract cannot self-cancel
-    ///      because it does not store CLOIDs (keeper provides them per-call).
-    /// @dev USDC arrives async — call sweepToVault() in a separate tx after arrival.
+    /// @dev Idempotent: re-tracking an already-live cloid is a no-op so a keeper
+    ///      that re-uses cloids does not corrupt the index map. NO_CLOID (0) is
+    ///      the HL "no client id" sentinel and is intentionally untracked — only
+    ///      cloids the keeper can later cancel are worth remembering.
+    function _trackCloid(uint32 ai, uint128 cloid) internal {
+        if (cloid == NO_CLOID) return;
+        if (_liveCloidIndex[ai][cloid] != 0) return;
+        _liveCloids[ai].push(cloid);
+        _liveCloidIndex[ai][cloid] = _liveCloids[ai].length;
+    }
+
+    /// @dev Tolerant of unknown cloids (no-op) so the on-chain mirror stays in
+    ///      sync even if the keeper sends spurious cancels. Swap-and-pop keeps
+    ///      removal O(1).
+    function _untrackCloid(uint32 ai, uint128 cloid) internal {
+        uint256 idx = _liveCloidIndex[ai][cloid];
+        if (idx == 0) return;
+        uint128[] storage arr = _liveCloids[ai];
+        uint256 last = arr.length;
+        if (idx != last) {
+            uint128 lastCloid = arr[last - 1];
+            arr[idx - 1] = lastCloid;
+            _liveCloidIndex[ai][lastCloid] = idx;
+        }
+        arr.pop();
+        delete _liveCloidIndex[ai][cloid];
+    }
+
+    /// @notice Cancel every tracked GTC order, force-close all positions, and
+    ///         request async USD transfer back to spot.
+    /// @dev    Self-cancellation walks `_liveCloids[asset]` from the tail and
+    ///         pops, so resting orders are guaranteed cancelled before the IOC
+    ///         reduce-only sweep below — eliminating the prior race where a
+    ///         resting buy could fill against the force-close at a stale price.
+    ///         The keeper can still pre-cancel off-chain to save the on-chain
+    ///         loop's gas, but it is no longer required for safety.
+    /// @dev    USDC arrives async — call sweepToVault() in a separate tx after
+    ///         arrival.
     function _settle() internal override {
         for (uint256 i = 0; i < assetIndices.length; i++) {
             uint32 ai = assetIndices[i];
+            _cancelAllTrackedOrders(ai);
             // Force-close LONG: reduce-only sell at min price
             L1Write.sendLimitOrder(ai, false, 1, type(uint64).max, true, TimeInForce.Ioc, NO_CLOID);
             // Force-close SHORT: reduce-only buy at max price
@@ -252,6 +332,25 @@ contract HyperliquidGridStrategy is BaseStrategy {
         L1Write.sendUsdClassTransfer(type(uint64).max, false);
         settled = true;
         emit Settled();
+    }
+
+    /// @dev Drains `_liveCloids[ai]` by popping from the tail, so each cancel
+    ///      costs one SLOAD + one SSTORE refund (no swap). Bounded by however
+    ///      many orders the keeper placed; in normal operation the active grid
+    ///      is `levelsPerSide * 2` per asset (~24 at default config).
+    function _cancelAllTrackedOrders(uint32 ai) internal {
+        uint128[] storage arr = _liveCloids[ai];
+        uint256 len = arr.length;
+        while (len > 0) {
+            uint128 cloid = arr[len - 1];
+            L1Write.sendCancelOrderByCloid(ai, cloid);
+            delete _liveCloidIndex[ai][cloid];
+            arr.pop();
+            unchecked {
+                len--;
+            }
+            emit GridOrderCancelled(ai, cloid);
+        }
     }
 
     /// @notice Push USDC back to the vault after async transfer completes.
@@ -288,5 +387,52 @@ contract HyperliquidGridStrategy is BaseStrategy {
 
     function getMarginSummary() external view returns (AccountMarginSummary memory) {
         return L1Read.accountMarginSummary(0, address(this));
+    }
+
+    /// @notice Read the tracked GTC CLOIDs for an asset (introspection /
+    ///         keeper reconciliation against `~/.sherwood/grid/onchain-state.json`).
+    function liveCloids(uint32 assetIndex) external view returns (uint128[] memory) {
+        return _liveCloids[assetIndex];
+    }
+
+    /// @notice Number of tracked GTC CLOIDs for an asset (cheaper than
+    ///         decoding the full array off-chain).
+    function liveCloidsLength(uint32 assetIndex) external view returns (uint256) {
+        return _liveCloids[assetIndex].length;
+    }
+
+    /// @inheritdoc BaseStrategy
+    /// @dev Live NAV reads HyperCore perp account equity (already in USDC 6
+    ///      decimals — same denomination as the vault asset). On non-HyperEVM
+    ///      chains or any environment where the precompile is absent (EOA
+    ///      staticcall returns success=true with empty returndata, so we also
+    ///      check `ret.length`), `valid=false` and the vault falls back to
+    ///      queue-only behavior. Negative equity (severely underwater) returns
+    ///      `(0, true)` rather than reverting — share-price math should clamp,
+    ///      not blow up. EVM-side stranded USDC is not added here because the
+    ///      Executed-state invariant is "all vault funds parked on HC".
+    function _positionValue() internal view override returns (uint256, bool) {
+        (bool success, bytes memory ret) = L1Read.ACCOUNT_MARGIN_SUMMARY_PRECOMPILE_ADDRESS
+        .staticcall{gas: L1Read.ACCOUNT_MARGIN_SUMMARY_GAS}(
+            abi.encode(uint32(0), address(this))
+        );
+        if (!success || ret.length < 128) return (0, false);
+        AccountMarginSummary memory s = abi.decode(ret, (AccountMarginSummary));
+        if (s.accountValue <= 0) return (0, true);
+        return (uint256(int256(s.accountValue)), true);
+    }
+
+    /// @dev Reuses `L1Read`'s precompile address + 15k gas cap (a misbehaving
+    ///      precompile consumes all forwarded gas on revert, so capping prevents
+    ///      griefing). Tolerates short returndata so off-HyperEVM environments
+    ///      (tests with no precompile etched at `0x...0801`) bypass the gate.
+    function _tryGetUsdcSpotTotal() internal view returns (uint64 total, bool ok) {
+        (bool success, bytes memory ret) = L1Read.SPOT_BALANCE_PRECOMPILE_ADDRESS
+        .staticcall{gas: L1Read.SPOT_BALANCE_GAS}(
+            abi.encode(address(this), uint64(0))
+        );
+        if (!success || ret.length < 96) return (0, false);
+        SpotBalance memory bal = abi.decode(ret, (SpotBalance));
+        return (bal.total, true);
     }
 }

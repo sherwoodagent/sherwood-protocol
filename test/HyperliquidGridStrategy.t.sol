@@ -8,6 +8,9 @@ import {BaseStrategy} from "../src/strategies/BaseStrategy.sol";
 import {MockCoreWriter} from "./mocks/MockCoreWriter.sol";
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 import {FinalizeVariant} from "../src/hyperliquid/L1Write.sol";
+import {MockSpotBalancePrecompile} from "./mocks/MockSpotBalancePrecompile.sol";
+import {MockSpotBalanceCrediting} from "./mocks/MockSpotBalanceCrediting.sol";
+import {MockAccountMarginSummaryPrecompile} from "./mocks/MockAccountMarginSummaryPrecompile.sol";
 
 contract HyperliquidGridStrategyTest is Test {
     HyperliquidGridStrategy public template;
@@ -62,6 +65,26 @@ contract HyperliquidGridStrategyTest is Test {
         assertTrue(strategy.isAssetWhitelisted(ETH_ASSET));
         assertTrue(strategy.isAssetWhitelisted(SOL_ASSET));
         assertFalse(strategy.isAssetWhitelisted(99));
+        // HC finalize runs during initialize via the slot-0 swap.
+        assertTrue(strategy.hyperCoreFinalized());
+    }
+
+    function test_initialize_finalizesForHyperCore_atInitTime() public {
+        address payable rawClone = payable(Clones.clone(address(template)));
+        HyperliquidGridStrategy s = HyperliquidGridStrategy(rawClone);
+        assertFalse(s.hyperCoreFinalized());
+
+        uint32[] memory assets = new uint32[](1);
+        assets[0] = BTC_ASSET;
+        bytes memory initData = abi.encode(address(usdc), DEPOSIT, LEVERAGE, MAX_ORDER_SIZE, MAX_ORDERS, assets);
+
+        vm.expectEmit(true, true, true, true, address(s));
+        emit HyperliquidGridStrategy.HyperCoreFinalized(0, FinalizeVariant.FirstStorageSlot, 0);
+        s.initialize(vault, proposer, initData);
+
+        assertTrue(s.hyperCoreFinalized());
+        bytes32 slot0 = vm.load(address(s), bytes32(uint256(0)));
+        assertEq(address(uint160(uint256(slot0))), vault, "slot 0 must be restored to _vault");
     }
 
     function test_execute_pullsUsdcAndParksMargin() public {
@@ -206,11 +229,13 @@ contract HyperliquidGridStrategyTest is Test {
     // ── HyperCore finalization ──
 
     function test_finalizeForHyperCore_emitsAndForwardsToL1Write() public {
-        assertFalse(strategy.hyperCoreFinalized());
+        // init already finalized with default variant; an additional proposer
+        // call (e.g. registering a non-USDC token) still emits and updates.
+        assertTrue(strategy.hyperCoreFinalized());
         vm.expectEmit(true, true, true, true, address(strategy));
-        emit HyperliquidGridStrategy.HyperCoreFinalized(0, FinalizeVariant.FirstStorageSlot, 0);
+        emit HyperliquidGridStrategy.HyperCoreFinalized(7, FinalizeVariant.CustomStorageSlot, 42);
         vm.prank(proposer);
-        strategy.finalizeForHyperCore(0, FinalizeVariant.FirstStorageSlot, 0);
+        strategy.finalizeForHyperCore(7, FinalizeVariant.CustomStorageSlot, 42);
         assertTrue(strategy.hyperCoreFinalized());
     }
 
@@ -220,22 +245,11 @@ contract HyperliquidGridStrategyTest is Test {
         strategy.finalizeForHyperCore(0, FinalizeVariant.FirstStorageSlot, 0);
     }
 
-    function test_execute_selfHeals_finalizesForHyperCoreOnFirstRun() public {
-        assertFalse(strategy.hyperCoreFinalized());
-        vm.expectEmit(true, true, true, true, address(strategy));
-        emit HyperliquidGridStrategy.HyperCoreFinalized(0, FinalizeVariant.FirstStorageSlot, 0);
-        vm.prank(vault);
-        strategy.execute();
-        assertTrue(strategy.hyperCoreFinalized());
-    }
-
-    function test_execute_skipsAutoFinalize_whenManuallyFinalized() public {
-        // Proposer manually finalizes with a non-default variant first.
-        vm.prank(proposer);
-        strategy.finalizeForHyperCore(7, FinalizeVariant.CustomStorageSlot, 42);
-        assertTrue(strategy.hyperCoreFinalized());
-
-        // _execute should NOT emit a second HyperCoreFinalized event.
+    function test_execute_emitsNoFinalize_sinceInitAlreadyDidIt() public {
+        // Auto-finalize moved from _execute to _initialize via the slot-0
+        // swap, so executing the proposal must NOT fire any
+        // HyperCoreFinalized event (init already did, and there is no
+        // self-heal path left).
         vm.recordLogs();
         vm.prank(vault);
         strategy.execute();
@@ -244,9 +258,43 @@ contract HyperliquidGridStrategyTest is Test {
         for (uint256 i = 0; i < entries.length; i++) {
             assertTrue(
                 entries[i].topics.length == 0 || entries[i].topics[0] != sig,
-                "auto-finalize fired despite manual finalize"
+                "_execute must not fire HyperCoreFinalized; init owns that"
             );
         }
+    }
+
+    function test_execute_succeedsWhenHyperCoreSpotIsCredited() public {
+        // Etch a stateful mock at the HC spot-balance precompile that mirrors
+        // the strategy's USDC balance into HC spot (scaled 6→8 decimals). Pre-pull
+        // reads 0; post-pull reads DEPOSIT * 100, which exceeds ntl=DEPOSIT — so
+        // the spot-credit gate must NOT revert.
+        MockSpotBalanceCrediting m = new MockSpotBalanceCrediting();
+        vm.etch(0x0000000000000000000000000000000000000801, address(m).code);
+        // Seed the etched contract's slot 0 with the USDC address so `fallback`
+        // can read balanceOf via the live token.
+        vm.store(
+            0x0000000000000000000000000000000000000801, bytes32(uint256(0)), bytes32(uint256(uint160(address(usdc))))
+        );
+
+        uint256 vaultBefore = usdc.balanceOf(vault);
+        vm.prank(vault);
+        strategy.execute();
+        assertEq(usdc.balanceOf(vault), vaultBefore - DEPOSIT);
+        assertEq(usdc.balanceOf(address(strategy)), DEPOSIT);
+    }
+
+    function test_execute_revertsWhenHyperCoreSpotNotCredited() public {
+        MockSpotBalancePrecompile spot = new MockSpotBalancePrecompile();
+        spot.setSpot(0, 0, 0);
+        vm.etch(0x0000000000000000000000000000000000000801, address(spot).code);
+
+        vm.prank(vault);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                HyperliquidGridStrategy.HyperCoreSpotCreditFailed.selector, uint64(0), uint64(0), uint64(DEPOSIT)
+            )
+        );
+        strategy.execute();
     }
 
     function test_sweepToVault_repeatableForPartialArrivals() public {
@@ -262,5 +310,162 @@ contract HyperliquidGridStrategyTest is Test {
         uint256 vaultBefore = usdc.balanceOf(vault);
         strategy.sweepToVault();
         assertEq(usdc.balanceOf(vault), vaultBefore + 5_000e6);
+    }
+
+    // ── On-chain CLOID tracking & self-cancel ──
+
+    function _placeFourBtcOrders() internal {
+        HyperliquidGridStrategy.GridOrder[] memory orders = new HyperliquidGridStrategy.GridOrder[](4);
+        orders[0] = _gridOrder(BTC_ASSET, true, 76000_000000, 100, 11);
+        orders[1] = _gridOrder(BTC_ASSET, true, 75000_000000, 100, 12);
+        orders[2] = _gridOrder(BTC_ASSET, false, 78000_000000, 100, 13);
+        orders[3] = _gridOrder(BTC_ASSET, false, 79000_000000, 100, 14);
+        bytes memory data = abi.encode(uint8(1), orders);
+        vm.prank(proposer);
+        strategy.updateParams(data);
+    }
+
+    function test_placeOrders_tracksLiveCloids() public {
+        _execAndPrep();
+        _placeFourBtcOrders();
+        assertEq(strategy.liveCloidsLength(BTC_ASSET), 4);
+        uint128[] memory live = strategy.liveCloids(BTC_ASSET);
+        assertEq(live.length, 4);
+        // Order preserved by push order
+        assertEq(uint256(live[0]), 11);
+        assertEq(uint256(live[3]), 14);
+    }
+
+    function test_cancelOrders_untracksCloids() public {
+        _execAndPrep();
+        _placeFourBtcOrders();
+        uint128[] memory cancelCloids = new uint128[](2);
+        cancelCloids[0] = 12;
+        cancelCloids[1] = 14;
+        bytes memory data = abi.encode(uint8(2), BTC_ASSET, cancelCloids);
+        vm.prank(proposer);
+        strategy.updateParams(data);
+        assertEq(strategy.liveCloidsLength(BTC_ASSET), 2);
+    }
+
+    function test_cancelOrders_unknownCloid_isNoOp() public {
+        _execAndPrep();
+        _placeFourBtcOrders();
+        uint128[] memory cancelCloids = new uint128[](1);
+        cancelCloids[0] = 999; // never placed
+        bytes memory data = abi.encode(uint8(2), BTC_ASSET, cancelCloids);
+        vm.prank(proposer);
+        // Should not revert; tracker unchanged.
+        strategy.updateParams(data);
+        assertEq(strategy.liveCloidsLength(BTC_ASSET), 4);
+    }
+
+    function test_placeOrders_repeatedCloid_idempotent() public {
+        _execAndPrep();
+        HyperliquidGridStrategy.GridOrder[] memory orders = new HyperliquidGridStrategy.GridOrder[](2);
+        orders[0] = _gridOrder(BTC_ASSET, true, 76000_000000, 100, 42);
+        orders[1] = _gridOrder(BTC_ASSET, true, 76000_000000, 100, 42);
+        bytes memory data = abi.encode(uint8(1), orders);
+        vm.prank(proposer);
+        strategy.updateParams(data);
+        assertEq(strategy.liveCloidsLength(BTC_ASSET), 1);
+    }
+
+    function test_settle_selfCancelsTrackedCloids() public {
+        _execAndPrep();
+        _placeFourBtcOrders();
+        // Sanity
+        assertEq(strategy.liveCloidsLength(BTC_ASSET), 4);
+
+        vm.recordLogs();
+        vm.prank(vault);
+        strategy.settle();
+
+        // Tracker drained for all assets
+        assertEq(strategy.liveCloidsLength(BTC_ASSET), 0);
+        assertEq(strategy.liveCloidsLength(ETH_ASSET), 0);
+        assertEq(strategy.liveCloidsLength(SOL_ASSET), 0);
+
+        // GridOrderCancelled fired for each placed cloid
+        Vm.Log[] memory entries = vm.getRecordedLogs();
+        bytes32 sig = keccak256("GridOrderCancelled(uint32,uint128)");
+        uint256 found;
+        for (uint256 i = 0; i < entries.length; i++) {
+            if (entries[i].topics.length > 0 && entries[i].topics[0] == sig) {
+                found++;
+            }
+        }
+        assertEq(found, 4, "expected one cancel event per tracked cloid");
+    }
+
+    function test_cancelAndPlace_replacesTrackedCloid() public {
+        _execAndPrep();
+        _placeFourBtcOrders();
+
+        uint128[] memory cancelCloids = new uint128[](1);
+        cancelCloids[0] = 11;
+        HyperliquidGridStrategy.GridOrder[] memory orders = new HyperliquidGridStrategy.GridOrder[](1);
+        orders[0] = _gridOrder(BTC_ASSET, true, 75500_000000, 100, 21);
+        bytes memory data = abi.encode(uint8(3), BTC_ASSET, cancelCloids, orders);
+
+        vm.prank(proposer);
+        strategy.updateParams(data);
+
+        // 4 placed - 1 cancelled + 1 replaced = 4
+        assertEq(strategy.liveCloidsLength(BTC_ASSET), 4);
+    }
+
+    function test_placeOrders_noCloid_isNotTracked() public {
+        _execAndPrep();
+        HyperliquidGridStrategy.GridOrder[] memory orders = new HyperliquidGridStrategy.GridOrder[](1);
+        orders[0] = _gridOrder(BTC_ASSET, true, 76000_000000, 100, 0); // NO_CLOID
+        bytes memory data = abi.encode(uint8(1), orders);
+        vm.prank(proposer);
+        strategy.updateParams(data);
+        assertEq(strategy.liveCloidsLength(BTC_ASSET), 0);
+    }
+
+    // ── Live NAV via positionValue ──
+
+    function _etchAccountMarginSummary() internal returns (MockAccountMarginSummaryPrecompile) {
+        MockAccountMarginSummaryPrecompile m = new MockAccountMarginSummaryPrecompile();
+        vm.etch(0x000000000000000000000000000000000000080F, address(m).code);
+        return MockAccountMarginSummaryPrecompile(0x000000000000000000000000000000000000080F);
+    }
+
+    function test_positionValue_returnsAccountMarginEquity() public {
+        _execAndPrep();
+        MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
+        m.setSummary(int64(int256(uint256(12_345e6))), 0, 0, 0);
+        (uint256 value, bool valid) = strategy.positionValue();
+        assertTrue(valid);
+        assertEq(value, 12_345e6);
+    }
+
+    function test_positionValue_clampsNegativeEquityToZero() public {
+        _execAndPrep();
+        MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
+        m.setSummary(int64(-1_000), 0, 0, 0);
+        (uint256 value, bool valid) = strategy.positionValue();
+        assertTrue(valid);
+        assertEq(value, 0);
+    }
+
+    function test_positionValue_invalidWhenPrecompileMissing() public {
+        _execAndPrep();
+        // No etch at 0x...080F
+        (uint256 value, bool valid) = strategy.positionValue();
+        assertFalse(valid);
+        assertEq(value, 0);
+    }
+
+    function test_positionValue_invalidBeforeExecute() public {
+        // BaseStrategy gates `_positionValue` behind State.Executed. Without
+        // calling execute, valid must be false even if the precompile is etched.
+        MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
+        m.setSummary(int64(int256(uint256(99_999e6))), 0, 0, 0);
+        (uint256 value, bool valid) = strategy.positionValue();
+        assertFalse(valid);
+        assertEq(value, 0);
     }
 }

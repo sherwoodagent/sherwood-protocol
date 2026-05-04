@@ -25,6 +25,11 @@ import {HyperliquidGridStrategy} from "../src/strategies/HyperliquidGridStrategy
  *
  *   Dry run (no broadcast):
  *     forge script script/DeployTemplates.s.sol:DeployTemplates --rpc-url base
+ *
+ *   Force-redeploy `HyperliquidGridStrategy` (e.g. after a slot-0 finalize
+ *   patch where existing clones are unrecoverable on HC):
+ *     FORCE_GRID_REDEPLOY=1 forge script script/DeployTemplates.s.sol:DeployTemplates \
+ *       --rpc-url hyperevm --broadcast --account sherwood-agent
  */
 contract DeployTemplates is ScriptBase {
     string constant MOONWELL_KEY = "MOONWELL_SUPPLY_TEMPLATE";
@@ -147,12 +152,24 @@ contract DeployTemplates is ScriptBase {
                 console.log("  Skipped  HyperliquidPerpStrategy:  %s (already deployed)", t.hyperliquid);
             }
 
-            if (_needsDeploy(t.hyperliquidGrid)) {
-                if (t.hyperliquidGrid != address(0)) {
+            // Grid template carries the slot-0 swap finalize fix (init-time HC
+            // FirstStorageSlot registration). Existing clones of a pre-fix
+            // template cannot be retroactively repaired — set
+            // `FORCE_GRID_REDEPLOY=1` to redeploy the template without
+            // hand-editing chains/999.json. Defaults to false so normal runs
+            // remain idempotent.
+            bool forceGridRedeploy = vm.envOr("FORCE_GRID_REDEPLOY", false);
+            if (_needsDeploy(t.hyperliquidGrid) || forceGridRedeploy) {
+                if (t.hyperliquidGrid != address(0) && t.hyperliquidGrid.code.length > 0) {
+                    console.log(
+                        "  Stale    HyperliquidGridStrategy:  %s (FORCE_GRID_REDEPLOY=1, redeploying)",
+                        t.hyperliquidGrid
+                    );
+                } else if (t.hyperliquidGrid != address(0)) {
                     console.log("  Stale    HyperliquidGridStrategy:  %s (no code, redeploying)", t.hyperliquidGrid);
                 }
                 t.hyperliquidGrid = address(new HyperliquidGridStrategy());
-                console.log("  Deployed HyperliquidGridStrategy:  %s", t.hyperliquidGrid);
+                console.log("  Deployed HyperliquidGridStrategy:  %s (slot-0 swap finalize)", t.hyperliquidGrid);
                 anyDeployed = true;
             } else {
                 console.log("  Skipped  HyperliquidGridStrategy:  %s (already deployed)", t.hyperliquidGrid);
