@@ -235,6 +235,20 @@ contract HyperliquidGridStrategy is BaseStrategy {
         emit FundsParked(amountIn);
     }
 
+    /// @dev Routes a mid-proposal LP deposit into the live HC perp account.
+    ///      The vault has already pushed `assets` USDC to this address before
+    ///      calling here. HC auto-credits spot (registration done at init), so
+    ///      a single class transfer moves the funds to perp margin immediately.
+    ///      The keeper sees the expanded margin and places additional orders via
+    ///      updateParams — no leverage re-push needed (leverage is per-asset, not
+    ///      account-wide).
+    function _onLiveDeposit(uint256 assets) internal override {
+        if (assets == 0) return;
+        if (assets > type(uint64).max) revert DepositAmountTooLarge();
+        L1Write.sendUsdClassTransfer(uint64(assets), true);
+        emit FundsParked(assets);
+    }
+
     function _updateParams(bytes calldata data) internal override {
         if (data.length < 32) revert InvalidAction();
         uint8 action = abi.decode(data[:32], (uint8));

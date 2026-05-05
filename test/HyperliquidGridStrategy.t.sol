@@ -469,6 +469,40 @@ contract HyperliquidGridStrategyTest is Test {
         assertEq(value, 0);
     }
 
+    // ── onLiveDeposit ──
+
+    function test_onLiveDeposit_sendsClassTransferToPerp() public {
+        _execAndPrep();
+        uint256 liveAmount = 5_000e6;
+        usdc.mint(address(strategy), liveAmount); // vault pre-pushes before calling hook
+        vm.recordLogs();
+        vm.prank(vault);
+        strategy.onLiveDeposit(liveAmount);
+        // Expect a class transfer RawAction with (liveAmount, toPerp=true)
+        (bool found, uint64 ntl, bool toPerp) = _decodeClassTransfer(vm.getRecordedLogs());
+        assertTrue(found, "class transfer RawAction not emitted");
+        assertEq(ntl, uint64(liveAmount));
+        assertTrue(toPerp, "toPerp must be true for live deposit");
+        // FundsParked event
+        // (covered implicitly — if class transfer fired, the full hook ran)
+    }
+
+    function test_onLiveDeposit_zeroAmount_isNoOp() public {
+        _execAndPrep();
+        vm.recordLogs();
+        vm.prank(vault);
+        strategy.onLiveDeposit(0);
+        assertEq(_countClassTransferLogs(vm.getRecordedLogs()), 0, "no-op for zero");
+    }
+
+    function test_onLiveDeposit_overflowReverts() public {
+        _execAndPrep();
+        uint256 tooLarge = uint256(type(uint64).max) + 1;
+        vm.prank(vault);
+        vm.expectRevert(HyperliquidGridStrategy.DepositAmountTooLarge.selector);
+        strategy.onLiveDeposit(tooLarge);
+    }
+
     // ── initiateReturn / _initiateClassTransfer ──
 
     function test_initiateReturn_revertsIfNotSettled() public {
