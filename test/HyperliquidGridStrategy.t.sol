@@ -468,4 +468,83 @@ contract HyperliquidGridStrategyTest is Test {
         assertFalse(valid);
         assertEq(value, 0);
     }
+
+    // ── initiateReturn / _initiateClassTransfer ──
+
+    function test_initiateReturn_revertsIfNotSettled() public {
+        _execAndPrep();
+        vm.expectRevert(HyperliquidGridStrategy.NotSweepable.selector);
+        strategy.initiateReturn();
+    }
+
+    function test_settle_skipsClassTransferWhenNoPrecompile() public {
+        // No AccountMarginSummary precompile etched → _initiateClassTransfer no-ops.
+        // Settle must still complete and mark settled=true.
+        _execAndPrep();
+        vm.recordLogs();
+        vm.prank(vault);
+        strategy.settle();
+        assertTrue(strategy.settled());
+        assertEq(_countClassTransferLogs(vm.getRecordedLogs()), 0);
+    }
+
+    function test_settle_usesPrecompileAmountForClassTransfer() public {
+        _execAndPrep();
+        MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
+        int64 equity = int64(int256(uint256(9_800e6)));
+        m.setSummary(equity, 0, 0, 0);
+
+        vm.recordLogs();
+        vm.prank(vault);
+        strategy.settle();
+
+        (bool found, uint64 ntl, bool toPerp) = _decodeClassTransfer(vm.getRecordedLogs());
+        assertTrue(found, "expected class transfer RawAction");
+        assertEq(ntl, uint64(equity));
+        assertFalse(toPerp);
+    }
+
+    function test_initiateReturn_resweepsResidualPerp() public {
+        _execAndPrep();
+        MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
+        m.setSummary(int64(int256(uint256(9_800e6))), 0, 0, 0);
+        vm.prank(vault);
+        strategy.settle();
+
+        // Simulate residual equity left in perp after IOC slippage.
+        m.setSummary(int64(int256(uint256(200e6))), 0, 0, 0);
+        vm.recordLogs();
+        strategy.initiateReturn();
+        (bool found, uint64 ntl,) = _decodeClassTransfer(vm.getRecordedLogs());
+        assertTrue(found);
+        assertEq(ntl, uint64(200e6));
+    }
+
+    // ── Helpers ──
+
+    bytes4 constant CLASS_TRANSFER_ACTION = 0x01000007;
+
+    function _countClassTransferLogs(Vm.Log[] memory logs) internal view returns (uint256 count) {
+        bytes32 sig = keccak256("RawAction(address,bytes)");
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].topics[0] != sig) continue;
+            bytes memory raw = abi.decode(logs[i].data, (bytes));
+            if (raw.length >= 4 && bytes4(raw) == CLASS_TRANSFER_ACTION) count++;
+        }
+    }
+
+    function _decodeClassTransfer(Vm.Log[] memory logs) internal view returns (bool found, uint64 ntl, bool toPerp) {
+        bytes32 sig = keccak256("RawAction(address,bytes)");
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].topics[0] != sig) continue;
+            bytes memory raw = abi.decode(logs[i].data, (bytes));
+            if (raw.length < 4 || bytes4(raw) != CLASS_TRANSFER_ACTION) continue;
+            bytes memory payload = new bytes(raw.length - 4);
+            for (uint256 j = 0; j < payload.length; j++) {
+                payload[j] = raw[j + 4];
+            }
+            (ntl, toPerp) = abi.decode(payload, (uint64, bool));
+            return (true, ntl, toPerp);
+        }
+    }
 }

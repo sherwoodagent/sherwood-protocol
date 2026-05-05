@@ -317,8 +317,10 @@ contract HyperliquidGridStrategy is BaseStrategy {
     ///         resting buy could fill against the force-close at a stale price.
     ///         The keeper can still pre-cancel off-chain to save the on-chain
     ///         loop's gas, but it is no longer required for safety.
-    /// @dev    USDC arrives async — call sweepToVault() in a separate tx after
-    ///         arrival.
+    /// @dev    The class transfer amount is read from the precompile at settle
+    ///         time (pre-IOC-close equity). After IOC fills, any residual perp
+    ///         balance (due to slippage vs mark price) can be swept via
+    ///         initiateReturn(). USDC arrives async — call sweepToVault() after.
     function _settle() internal override {
         for (uint256 i = 0; i < assetIndices.length; i++) {
             uint32 ai = assetIndices[i];
@@ -329,9 +331,40 @@ contract HyperliquidGridStrategy is BaseStrategy {
             L1Write.sendLimitOrder(ai, true, type(uint64).max, type(uint64).max, true, TimeInForce.Ioc, NO_CLOID);
         }
 
-        L1Write.sendUsdClassTransfer(type(uint64).max, false);
+        // Read the exact perp equity from the precompile (accountValue is in
+        // USDC-6-decimal, same denomination as sendUsdClassTransfer's ntl param).
+        // Avoids passing type(uint64).max, which is undocumented as a "sweep all"
+        // sentinel in HyperCore's class transfer protocol and risks stranding funds.
+        // If precompile is unavailable (non-HyperEVM env), skip gracefully —
+        // sendUsdClassTransfer would be a no-op there anyway.
+        _initiateClassTransfer();
+
         settled = true;
         emit Settled();
+    }
+
+    /// @notice Re-initiate the perp→spot class transfer for any residual perp
+    ///         balance left after IOC fill slippage at settlement.
+    /// @dev    Permissionless: funds only flow to HC spot (same address), no
+    ///         diversion possible. Call this if sweepToVault keeps returning 0
+    ///         after settlement — it means some equity remains in perp.
+    function initiateReturn() external {
+        if (!settled) revert NotSweepable();
+        _initiateClassTransfer();
+    }
+
+    /// @dev Reads current perp accountValue via precompile and sends a class
+    ///      transfer (perp→spot) for that exact amount. No-ops when the
+    ///      precompile is unavailable or when accountValue <= 0.
+    function _initiateClassTransfer() internal {
+        (bool ok, bytes memory ret) = L1Read.ACCOUNT_MARGIN_SUMMARY_PRECOMPILE_ADDRESS
+        .staticcall{gas: L1Read.ACCOUNT_MARGIN_SUMMARY_GAS}(
+            abi.encode(uint32(0), address(this))
+        );
+        if (!ok || ret.length < 128) return;
+        AccountMarginSummary memory s = abi.decode(ret, (AccountMarginSummary));
+        if (s.accountValue <= 0) return;
+        L1Write.sendUsdClassTransfer(uint64(s.accountValue), false);
     }
 
     /// @dev Drains `_liveCloids[ai]` by popping from the tail, so each cancel
