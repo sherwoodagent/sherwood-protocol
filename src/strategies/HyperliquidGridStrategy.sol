@@ -367,9 +367,12 @@ contract HyperliquidGridStrategy is BaseStrategy {
         _initiateClassTransfer();
     }
 
-    /// @dev Reads current perp accountValue via precompile and sends a class
-    ///      transfer (perp→spot) for that exact amount. No-ops when the
-    ///      precompile is unavailable or when accountValue <= 0.
+    /// @dev Reads current perp free margin (accountValue - marginUsed) via precompile
+    ///      and sends a class transfer (perp→spot) for that amount. Using accountValue
+    ///      alone would include margin locked by any still-open positions — HyperCore
+    ///      rejects class transfers that exceed withdrawable margin rather than filling
+    ///      partially, so we subtract marginUsed to stay within the withdrawable bound.
+    ///      No-ops when the precompile is unavailable or when free margin <= 0.
     function _initiateClassTransfer() internal {
         (bool ok, bytes memory ret) = L1Read.ACCOUNT_MARGIN_SUMMARY_PRECOMPILE_ADDRESS
         .staticcall{gas: L1Read.ACCOUNT_MARGIN_SUMMARY_GAS}(
@@ -378,7 +381,11 @@ contract HyperliquidGridStrategy is BaseStrategy {
         if (!ok || ret.length < 128) return;
         AccountMarginSummary memory s = abi.decode(ret, (AccountMarginSummary));
         if (s.accountValue <= 0) return;
-        L1Write.sendUsdClassTransfer(uint64(s.accountValue), false);
+        // marginUsed ≤ accountValue for solvent accounts; int64 cast is safe because
+        // marginUsed > int64.max would require ~$9.2T in perp positions.
+        int64 freeMargin = s.accountValue - int64(s.marginUsed);
+        if (freeMargin <= 0) return;
+        L1Write.sendUsdClassTransfer(uint64(freeMargin), false);
     }
 
     /// @dev Drains `_liveCloids[ai]` by popping from the tail, so each cancel

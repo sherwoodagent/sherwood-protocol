@@ -526,7 +526,7 @@ contract HyperliquidGridStrategyTest is Test {
         _execAndPrep();
         MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
         int64 equity = int64(int256(uint256(9_800e6)));
-        m.setSummary(equity, 0, 0, 0);
+        m.setSummary(equity, 0, 0, 0); // marginUsed=0 → freeMargin == equity
 
         vm.recordLogs();
         vm.prank(vault);
@@ -536,6 +536,36 @@ contract HyperliquidGridStrategyTest is Test {
         assertTrue(found, "expected class transfer RawAction");
         assertEq(ntl, uint64(equity));
         assertFalse(toPerp);
+    }
+
+    function test_settle_subtractsMarginUsedFromClassTransfer() public {
+        // If IOC orders partially fill, some marginUsed remains. The class transfer
+        // must use (accountValue - marginUsed) so HC doesn't reject it.
+        _execAndPrep();
+        MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
+        int64 equity = int64(int256(uint256(9_800e6)));
+        uint64 marginUsed = uint64(500e6); // residual locked margin from partial fill
+        m.setSummary(equity, marginUsed, 0, 0);
+
+        vm.recordLogs();
+        vm.prank(vault);
+        strategy.settle();
+
+        (bool found, uint64 ntl,) = _decodeClassTransfer(vm.getRecordedLogs());
+        assertTrue(found, "expected class transfer");
+        assertEq(ntl, uint64(equity) - marginUsed, "must subtract marginUsed");
+    }
+
+    function test_settle_skipsClassTransferWhenFreeMarginZero() public {
+        // Fully locked account (all equity = marginUsed) → no transfer.
+        _execAndPrep();
+        MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
+        int64 equity = int64(int256(uint256(9_800e6)));
+        m.setSummary(equity, uint64(equity), 0, 0); // freeMargin == 0
+        vm.recordLogs();
+        vm.prank(vault);
+        strategy.settle();
+        assertEq(_countClassTransferLogs(vm.getRecordedLogs()), 0, "no transfer when all margin locked");
     }
 
     function test_initiateReturn_resweepsResidualPerp() public {
