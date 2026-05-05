@@ -196,7 +196,14 @@ contract Governor_emergencyCancelOnSettle_Test is Test {
     function _createExecutedProposal(uint256 duration) internal returns (uint256 pid) {
         vm.prank(agent);
         pid = governor.propose(
-            address(vault), "ipfs://emergency-cancel", 1000, duration, _execCalls(), _settleCalls(), _emptyCoProposers()
+            address(vault),
+            address(0),
+            "ipfs://emergency-cancel",
+            1000,
+            duration,
+            _execCalls(),
+            _settleCalls(),
+            _emptyCoProposers()
         );
         vm.warp(vm.getBlockTimestamp() + 1);
         vm.prank(lp1);

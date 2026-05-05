@@ -36,13 +36,6 @@ interface ISyndicateVault {
     error InsufficientShares();
     error RedemptionsNotLocked();
     error QueueReserveBreached();
-    /// @notice I-3: Revert from `setActiveStrategyAdapter` if the candidate
-    ///         adapter is an EOA, a contract without bytecode, or a contract
-    ///         whose `positionValue()` reverts / returns malformed data.
-    ///         Bubbles back through `governor.bindProposalAdapter`. Without
-    ///         this smoke-test a malformed adapter would brick
-    ///         `vault.totalAssets()` and every LP entrypoint until settle.
-    error AdapterNotIStrategy();
 
     // ── Init Params ──
     struct InitParams {
@@ -90,8 +83,11 @@ interface ISyndicateVault {
     function governor() external view returns (address);
     function redemptionsLocked() external view returns (bool);
     function managementFeeBps() external view returns (uint256);
+    /// @notice Convenience view that resolves the active strategy through the
+    ///         governor (`getProposal(activePid).strategy`). Returns
+    ///         `address(0)` when no proposal is active or when the active
+    ///         proposal opted out of live NAV.
     function activeStrategyAdapter() external view returns (address);
-    function setActiveStrategyAdapter(address adapter) external; // governor-only; pass address(0) to unbind
 
     // ── Async Withdrawal Queue ──
     function setWithdrawalQueue(address queue) external; // factory-only, set-once
@@ -103,6 +99,13 @@ interface ISyndicateVault {
     ///         the given proposal's Executed window. Read by the governor at
     ///         settle so the principal is not counted as strategy profit.
     function liveAdapterPrincipal(uint256 proposalId) external view returns (uint256);
+
+    /// @notice Sum of asset principal pulled back from the live-NAV adapter
+    ///         to satisfy LP withdrawals during the given proposal's
+    ///         Executed window. Read by the governor at settle so the
+    ///         out-flow does not register as a strategy loss
+    ///         (PnL = balance + withdrawn - (snapshot + principal)).
+    function liveAdapterWithdrawn(uint256 proposalId) external view returns (uint256);
 
     // ── Rescue ──
     function rescueEth(address payable to, uint256 amount) external;
@@ -131,6 +134,13 @@ interface ISyndicateVault {
     event GovernorBatchExecuted(address indexed governor, uint256 callCount);
     event WithdrawalQueueSet(address indexed queue);
     event RedeemRequested(uint256 indexed requestId, address indexed owner, uint256 shares);
-    event ActiveStrategyAdapterSet(address indexed adapter);
-    event ActiveStrategyAdapterCleared();
+    /// @notice Emitted when `vault._deposit` forwarded principal to the live
+    ///         adapter but its `onLiveDeposit` hook reverted (or wasn't
+    ///         implemented). The assets are now held by the adapter and
+    ///         tracked under `liveAdapterPrincipal[proposalId]` so they're
+    ///         reclaimed at settle without counting as strategy profit. This
+    ///         is the runtime backstop for adapters that ship without
+    ///         `onLiveDeposit` or whose hook reverts transiently (paused
+    ///         upstream pool, max-deposit cap).
+    event LiveDepositForwardFailed(uint256 indexed proposalId, address indexed adapter, uint256 assets);
 }

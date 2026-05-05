@@ -139,6 +139,16 @@ abstract contract BaseStrategy is IStrategy {
         _onLiveDeposit(assets);
     }
 
+    /// @inheritdoc IStrategy
+    /// @dev Default returns 0 — strategies that can free liquidity on demand
+    ///      override `_onLiveWithdraw`. The vault treats any returned amount
+    ///      less than `assetsNeeded` as "cannot fulfil" and reverts the LP's
+    ///      withdraw (all-or-nothing), falling back to the async-redeem queue.
+    function onLiveWithdraw(uint256 assetsNeeded) external virtual onlyVault returns (uint256) {
+        if (_state != State.Executed) return 0;
+        return _onLiveWithdraw(assetsNeeded);
+    }
+
     // ── Internal helpers ──
 
     /// @notice Pull tokens from the vault into this strategy
@@ -188,5 +198,20 @@ abstract contract BaseStrategy is IStrategy {
         internal
         virtual {
         // default: do nothing
+    }
+
+    /// @notice Override to free `assetsNeeded` of underlying from the live
+    ///         position and push it to the vault. Default: returns 0,
+    ///         signalling no partial-unwind capability — LPs use the async
+    ///         queue while the strategy is active. Only invoked while the
+    ///         strategy is `Executed`.
+    function _onLiveWithdraw(
+        uint256 /*assetsNeeded*/
+    )
+        internal
+        virtual
+        returns (uint256 assetsReturned)
+    {
+        return 0;
     }
 }

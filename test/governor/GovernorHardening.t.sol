@@ -141,7 +141,8 @@ contract GovernorHardeningTest is Test {
         cps[3] = ISyndicateGovernor.CoProposer({agent: co4, splitBps: 1000});
 
         vm.prank(leadAgent);
-        proposalId = governor.propose(address(vault), "ipfs://gh2", 2000, 7 days, _execCalls(), _settleCalls(), cps);
+        proposalId =
+            governor.propose(address(vault), address(0), "ipfs://gh2", 2000, 7 days, _execCalls(), _settleCalls(), cps);
     }
 
     /// @dev Create a 2-party collab: lead + 1 co-prop to land in Draft quickly.
@@ -149,7 +150,9 @@ contract GovernorHardeningTest is Test {
         ISyndicateGovernor.CoProposer[] memory cps = new ISyndicateGovernor.CoProposer[](1);
         cps[0] = ISyndicateGovernor.CoProposer({agent: co1, splitBps: 3000});
         vm.prank(leadAgent);
-        proposalId = governor.propose(address(vault), "ipfs://draft", 2000, 7 days, _execCalls(), _settleCalls(), cps);
+        proposalId = governor.propose(
+            address(vault), address(0), "ipfs://draft", 2000, 7 days, _execCalls(), _settleCalls(), cps
+        );
     }
 
     // ==================== FIX 2 — G-H3 ====================
@@ -206,6 +209,7 @@ contract GovernorHardeningTest is Test {
         vm.prank(leadAgent);
         uint256 proposalId = governor.propose(
             address(vault),
+            address(0),
             "ipfs://snap",
             2000,
             7 days,
@@ -248,6 +252,7 @@ contract GovernorHardeningTest is Test {
         vm.prank(leadAgent);
         uint256 proposalId = governor.propose(
             address(vault),
+            address(0),
             "ipfs://empty",
             2000,
             7 days,
@@ -312,6 +317,7 @@ contract GovernorHardeningTest is Test {
         vm.prank(leadAgent);
         proposalId = governor.propose(
             address(vault),
+            address(0),
             "ipfs://term",
             2000,
             7 days,
@@ -411,6 +417,7 @@ contract GovernorHardeningTest is Test {
         vm.expectRevert(ISyndicateGovernor.TooManyCalls.selector);
         governor.propose(
             address(vault),
+            address(0),
             "ipfs://big",
             2000,
             7 days,
@@ -428,7 +435,14 @@ contract GovernorHardeningTest is Test {
         vm.prank(leadAgent);
         vm.expectRevert(ISyndicateGovernor.TooManyCalls.selector);
         governor.propose(
-            address(vault), "ipfs://big", 2000, 7 days, _execCalls(), oversized, new ISyndicateGovernor.CoProposer[](0)
+            address(vault),
+            address(0),
+            "ipfs://big",
+            2000,
+            7 days,
+            _execCalls(),
+            oversized,
+            new ISyndicateGovernor.CoProposer[](0)
         );
     }
 
@@ -449,6 +463,7 @@ contract GovernorHardeningTest is Test {
         vm.expectRevert(ISyndicateGovernor.MetadataURITooLong.selector);
         governor.propose(
             address(vault),
+            address(0),
             string(tooLong),
             2000,
             7 days,
@@ -473,6 +488,7 @@ contract GovernorHardeningTest is Test {
         vm.expectRevert(ISyndicateGovernor.VaultHasOpenProposal.selector);
         governor.propose(
             address(vault),
+            address(0),
             "ipfs://dup",
             2000,
             7 days,
@@ -493,14 +509,16 @@ contract GovernorHardeningTest is Test {
         ISyndicateGovernor.CoProposer[] memory cps = new ISyndicateGovernor.CoProposer[](1);
         cps[0] = ISyndicateGovernor.CoProposer({agent: co1, splitBps: 3000});
         vm.prank(leadAgent);
-        uint256 draftId =
-            governor.propose(address(vault), "ipfs://draft", 2000, 7 days, _execCalls(), _settleCalls(), cps);
+        uint256 draftId = governor.propose(
+            address(vault), address(0), "ipfs://draft", 2000, 7 days, _execCalls(), _settleCalls(), cps
+        );
 
         // Create a separate solo Pending that bumps the counter to 1.
         // Use a fresh agent — the lead is already attached to draftId.
         vm.prank(co2);
         governor.propose(
             address(vault),
+            address(0),
             "ipfs://pending",
             2000,
             7 days,

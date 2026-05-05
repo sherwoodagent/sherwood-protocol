@@ -4,6 +4,7 @@ pragma solidity 0.8.28;
 import {Test} from "forge-std/Test.sol";
 import {SyndicateVault} from "../../src/SyndicateVault.sol";
 import {ISyndicateVault} from "../../src/interfaces/ISyndicateVault.sol";
+import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
@@ -54,13 +55,20 @@ contract VaultLiveDepositPrincipalTest is Test {
 
         vm.mockCall(address(this), abi.encodeWithSignature("governor()"), abi.encode(MOCK_GOVERNOR));
         // Active proposal == ACTIVE_PID so the vault tags the principal under
-        // that key when the live-NAV adapter forwards it.
-        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal(address)"), abi.encode(ACTIVE_PID));
+        // that key when the live-NAV adapter forwards it. Strategy is read
+        // from the proposal struct (`strategy` field) — set at propose time,
+        // no separate bind call.
+        _mockProposalWithStrategy(ACTIVE_PID, address(adapter));
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("openProposalCount(address)"), abi.encode(uint256(1)));
+    }
 
-        // Bind the live-NAV adapter (vault gates on _lpFlowGate via governor-only).
-        vm.prank(MOCK_GOVERNOR);
-        vault.setActiveStrategyAdapter(address(adapter));
+    function _mockProposalWithStrategy(uint256 pid, address strategy) internal {
+        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal(address)"), abi.encode(pid));
+        ISyndicateGovernor.StrategyProposal memory p;
+        p.id = pid;
+        p.vault = address(vault);
+        p.strategy = strategy;
+        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSelector(ISyndicateGovernor.getProposal.selector, pid), abi.encode(p));
     }
 
     /// @notice Live deposits during Executed forward principal to the adapter
@@ -107,7 +115,7 @@ contract VaultLiveDepositPrincipalTest is Test {
 
         // Simulate a new proposal taking over the slot.
         uint256 newPid = ACTIVE_PID + 1;
-        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal(address)"), abi.encode(newPid));
+        _mockProposalWithStrategy(newPid, address(adapter));
 
         vm.prank(depositor);
         vault.deposit(50_000e6, depositor);

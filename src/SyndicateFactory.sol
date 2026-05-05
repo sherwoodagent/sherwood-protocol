@@ -456,11 +456,21 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
             end = total;
         }
 
-        result = new Syndicate[](end - offset);
-        for (uint256 i = offset; i < end; i++) {
-            uint256 id = _activeSyndicateIds.at(i);
-            result[i - offset] = syndicates[id];
+        uint256 outLen = end - offset;
+        result = new Syndicate[](outLen);
+        for (uint256 i = 0; i < outLen; i++) {
+            result[i] = _syndicateAt(offset + i);
         }
+    }
+
+    /// @dev Memberwise copy of one syndicate from storage to memory. Extracted
+    ///      from `getActiveSyndicates`'s loop so the legacy compiler pipeline
+    ///      (forge coverage, no via_ir) doesn't trip stack-too-deep when
+    ///      copying the 7-field struct (two of which are dynamic strings) on
+    ///      each iteration. Pure pass-through — no bounds re-check; the
+    ///      caller has already clamped against `_activeSyndicateIds.length()`.
+    function _syndicateAt(uint256 indexInActiveSet) private view returns (Syndicate memory) {
+        return syndicates[_activeSyndicateIds.at(indexInActiveSet)];
     }
 
     /// @notice Get ALL active syndicates. Clamped at `MAX_PAGE_LIMIT` per call;

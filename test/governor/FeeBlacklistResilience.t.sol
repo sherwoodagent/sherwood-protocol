@@ -141,8 +141,9 @@ contract FeeBlacklistResilienceTest is Test {
         returns (uint256 proposalId)
     {
         vm.prank(agent);
-        proposalId =
-            governor.propose(address(vault), "ipfs://test", perfFeeBps, duration, _noopCalls(), _noopCalls(), coProps);
+        proposalId = governor.propose(
+            address(vault), address(0), "ipfs://test", perfFeeBps, duration, _noopCalls(), _noopCalls(), coProps
+        );
         vm.warp(block.timestamp + 1);
 
         if (coProps.length > 0) {

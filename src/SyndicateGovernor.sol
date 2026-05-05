@@ -232,6 +232,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
     /// @inheritdoc ISyndicateGovernor
     function propose(
         address vault,
+        address strategy,
         string calldata metadataURI,
         uint256 performanceFeeBps,
         uint256 strategyDuration,
@@ -278,6 +279,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
         p.id = proposalId;
         p.proposer = msg.sender;
         p.vault = vault;
+        p.strategy = strategy;
         p.metadataURI = metadataURI;
         p.performanceFeeBps = performanceFeeBps;
         p.strategyDuration = strategyDuration;
@@ -376,39 +378,18 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
     }
 
     /// @inheritdoc ISyndicateGovernor
-    /// @dev Smoke-test happens inside `vault.setActiveStrategyAdapter`.
-    ///      Centralising the validation on the vault lets governor stay
-    ///      under EIP-170 (the via_ir-inlined staticcall + return-size
-    ///      check costs ~25 bytes and the vault has the headroom). The
-    ///      vault is also the consumer of the pointer, so the validation
-    ///      logically belongs there. Errors surface here through the
-    ///      bubbled `AdapterNotIStrategy` revert from the vault.
-    /// @dev IMP-1: bind allowed only during `Draft` (collaborative
-    ///      pre-approvals) or `Pending` (lead retains full authority during
-    ///      voting), AND only while no co-proposer has approved. Once a
-    ///      co-proposer approves the proposal hash, the adapter pointer is
-    ///      locked — co-proposers approve the executeCalls/settlementCalls
-    ///      hash but NOT the adapter, so a post-approval rebind would be a
-    ///      side-channel mutation of the executed strategy.
-    function bindProposalAdapter(uint256 proposalId, address adapter) external nonReentrant {
-        StrategyProposal storage proposal = _proposals[proposalId];
-        // Proposer check covers the nonexistent-proposal case (proposer is
-        // the zero address for unset slots and msg.sender can never be zero).
-        if (msg.sender != proposal.proposer) revert NotProposer();
-
-        ProposalState s = _resolveStateView(proposal);
-        if (s != ProposalState.Draft && s != ProposalState.Pending) revert AdapterBindingClosed();
-        if (_approvedCount[proposalId] != 0) revert AdapterBindingClosed();
-
-        // Push directly to the vault — no governor-side mapping needed (the
-        // vault is per-proposal anyway, and the adapter is implicitly cleared
-        // post-settle because `totalAssets` only reads it while
-        // `redemptionsLocked()`). Vault performs the I-3 smoke-test.
-        ISyndicateVault(proposal.vault).setActiveStrategyAdapter(adapter);
-        emit ProposalAdapterBound(proposalId, adapter);
-    }
-
-    /// @inheritdoc ISyndicateGovernor
+    /// @dev Proposer abandonment is allowed at any pre-execute stage. Symmetric
+    ///      with `settleProposal` (proposer-anytime), which already lets the
+    ///      proposer abandon mid-strategy at no penalty. Cancel-Approved /
+    ///      cancel-GuardianReview are strictly less harmful than early settle —
+    ///      no capital was deployed, no fees accrued. Cancel during
+    ///      GuardianReview drives the registry's `cancelReview` so a stale
+    ///      `resolveReview` after `reviewEnd` cannot still slash approvers
+    ///      (registry cancelReview reverts after reviewEnd, mirroring
+    ///      cancelEmergency — proposer must commit at that point).
+    ///      `_lastSettledAt` is bumped on every cancel branch that decrements
+    ///      the open count, rate-limiting propose-cancel-propose-execute via
+    ///      the same cooldown that gates execute after a successful settle.
     function cancelProposal(uint256 proposalId) external nonReentrant {
         StrategyProposal storage proposal = _proposals[proposalId];
         if (msg.sender != proposal.proposer) revert NotProposer();
@@ -417,6 +398,19 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
             // Pending: only during the voting period.
             if (block.timestamp > proposal.voteEnd) revert ProposalNotCancellable();
             _decOpen(proposal.vault);
+            _lastSettledAt[proposal.vault] = block.timestamp;
+        } else if (s == ProposalState.GuardianReview) {
+            // Close the registry-side review BEFORE marking the proposal
+            // Cancelled. Registry reverts the cancelReview if reviewEnd has
+            // already elapsed — bubbles up here as the cancel-window closer.
+            IGuardianRegistry(_guardianRegistry).cancelReview(proposalId);
+            _decOpen(proposal.vault);
+            _lastSettledAt[proposal.vault] = block.timestamp;
+        } else if (s == ProposalState.Approved) {
+            // Approved means review already resolved as not-blocked. No
+            // registry cleanup needed — slashing path is closed.
+            _decOpen(proposal.vault);
+            _lastSettledAt[proposal.vault] = block.timestamp;
         } else if (s == ProposalState.Draft) {
             // G-H2: block lead cancel once all-but-one co-prop has approved,
             // preventing a front-run of the final approve tx.
@@ -583,20 +577,10 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
         return _resolveStateView(_proposals[proposalId]);
     }
 
-    /// @inheritdoc ISyndicateGovernor
-    /// @dev Returns concatenation of executeCalls + settlementCalls for backwards compatibility
-    function getProposalCalls(uint256 proposalId) external view returns (BatchExecutorLib.Call[] memory) {
-        BatchExecutorLib.Call[] memory exec = _loadCalls(_executeCalls, proposalId);
-        BatchExecutorLib.Call[] memory settle = _loadCalls(_settlementCalls, proposalId);
-        BatchExecutorLib.Call[] memory result = new BatchExecutorLib.Call[](exec.length + settle.length);
-        for (uint256 i = 0; i < exec.length; i++) {
-            result[i] = exec[i];
-        }
-        for (uint256 i = 0; i < settle.length; i++) {
-            result[exec.length + i] = settle[i];
-        }
-        return result;
-    }
+    // V1.5 cleanup: dropped `getProposalCalls(uint256)` (concat helper).
+    // Off-chain consumers call `getExecuteCalls + getSettlementCalls`
+    // directly — same data, no duplicate storage→memory copy loop. The
+    // legacy concat dispatcher cost ~150-250 bytes of governor runtime.
 
     /// @inheritdoc ISyndicateGovernor
     function getExecuteCalls(uint256 proposalId) external view returns (BatchExecutorLib.Call[] memory) {
@@ -938,10 +922,15 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
 
         // Asset-only measurement (see NatSpec above). Subtract the live-adapter
         // principal forwarded during the Executed window so live-deposit
-        // principal is not counted as strategy profit.
+        // principal is not counted as strategy profit; add live-adapter
+        // withdrawals back so a mid-flight LP exit is not counted as a
+        // strategy loss (PnL = balance + withdrawn − (snapshot + principal)).
         // forge-lint: disable-next-line(unsafe-typecast)
         uint256 snapshot = _capitalSnapshots[proposalId] + ISyndicateVault(vault).liveAdapterPrincipal(proposalId);
-        pnl = int256(IERC20(asset).balanceOf(vault)) - int256(snapshot);
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint256 balanceAdjusted =
+            IERC20(asset).balanceOf(vault) + ISyndicateVault(vault).liveAdapterWithdrawn(proposalId);
+        pnl = int256(balanceAdjusted) - int256(snapshot);
 
         // Finalize state before external transfers to prevent reentrancy on stale state
         _activeProposal[vault] = 0;

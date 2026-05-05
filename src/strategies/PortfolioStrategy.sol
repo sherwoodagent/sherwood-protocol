@@ -296,9 +296,27 @@ contract PortfolioStrategy is BaseStrategy {
         emit Rebalanced(tokens, oldWeights, newWeights, oldBalances, newBalances, assetBalance);
     }
 
+    /// @dev Pre-rebalance snapshot bundle. Bundling the parallel arrays
+    ///      lets the legacy compiler pass them around through a single
+    ///      memory-pointer slot rather than spreading 4–6 separate
+    ///      pointers across the stack of `rebalanceDelta`.
+    struct DeltaSnapshot {
+        address[] tokens;
+        uint256[] oldWeights;
+        uint256[] newWeights;
+        uint256[] oldBalances;
+        uint256[] prices;
+        uint256[] currentValues;
+    }
+
     /// @notice Delta-based rebalance using Chainlink Data Streams prices.
     ///         Only swaps the difference between current and target allocations.
     /// @param priceReports Signed Chainlink Data Streams reports (one per allocation, same order)
+    /// @dev Heavy loop bodies extracted into `_sellOverweight`,
+    ///      `_buyUnderweight`, and `_snapshotAllocations` so the legacy
+    ///      compiler pipeline (forge coverage, no via_ir) doesn't trip
+    ///      stack-too-deep on the per-iteration mix of storage struct reads
+    ///      + external swap calls + memory array writes.
     function rebalanceDelta(bytes[] calldata priceReports) external onlyProposer {
         if (_state != State.Executed) revert NotExecuted();
         if (_rebalancing) revert RebalancingInProgress();
@@ -307,89 +325,106 @@ contract PortfolioStrategy is BaseStrategy {
         uint256 len = _allocations.length;
         if (priceReports.length != len) revert LengthMismatch();
 
-        // Snapshot before state for event
-        address[] memory tokens = new address[](len);
-        uint256[] memory oldWeights = new uint256[](len);
-        uint256[] memory newWeights = new uint256[](len);
-        uint256[] memory oldBalances = new uint256[](len);
-        for (uint256 i; i < len; ++i) {
-            tokens[i] = _allocations[i].token;
-            oldWeights[i] = _allocations[i].targetWeightBps;
-            newWeights[i] = _allocations[i].targetWeightBps;
-            oldBalances[i] = IERC20(_allocations[i].token).balanceOf(address(this));
-        }
+        DeltaSnapshot memory snap = _snapshotAllocations(len);
 
-        // 1. Verify prices and compute current portfolio value
-        uint256[] memory prices = new uint256[](len);
-        uint256[] memory currentValues = new uint256[](len);
+        // 1. Verify prices and compute current portfolio value.
         uint256 totalValue;
-
         for (uint256 i; i < len; ++i) {
-            prices[i] = _verifyPrice(priceReports[i]);
-            currentValues[i] = (oldBalances[i] * prices[i]) / PRICE_PRECISION;
-            totalValue += currentValues[i];
+            snap.prices[i] = _verifyPrice(priceReports[i]);
+            snap.currentValues[i] = (snap.oldBalances[i] * snap.prices[i]) / PRICE_PRECISION;
+            totalValue += snap.currentValues[i];
         }
+        // Include any asset balance already held (e.g. from previous partial rebalances).
+        totalValue += IERC20(asset).balanceOf(address(this));
 
-        // Include any asset balance already held (e.g., from previous partial rebalances)
-        uint256 assetHeld = IERC20(asset).balanceOf(address(this));
-        totalValue += assetHeld;
-
-        // 2. Compute target values and deltas
+        // 2. Sell overweight positions.
         uint256 swapsExecuted;
         for (uint256 i; i < len; ++i) {
-            uint256 targetValue = (totalValue * _allocations[i].targetWeightBps) / BPS_DENOMINATOR;
-
-            if (currentValues[i] > targetValue) {
-                // Overweight: sell the excess
-                uint256 excessValue = currentValues[i] - targetValue;
-                uint256 tokensToSell = (excessValue * PRICE_PRECISION) / prices[i];
-                uint256 bal = IERC20(_allocations[i].token).balanceOf(address(this));
-                if (tokensToSell > bal) tokensToSell = bal;
-                if (tokensToSell > 0) {
-                    IERC20(_allocations[i].token).forceApprove(address(swapAdapter), tokensToSell);
-                    // Expected output (in `asset` units) = tokensToSell * price / PRECISION.
-                    // Apply slippage off the chainlink-priced expectation so an AMM
-                    // sandwich can't drift output below this floor.
-                    uint256 expected = (tokensToSell * prices[i]) / PRICE_PRECISION;
-                    uint256 minOut = (expected * (BPS_DENOMINATOR - maxSlippageBps)) / BPS_DENOMINATOR;
-                    swapAdapter.swap(_allocations[i].token, asset, tokensToSell, minOut, _swapExtraData[i]);
-                    ++swapsExecuted;
-                }
-            }
+            if (_sellOverweight(i, totalValue, snap.currentValues[i], snap.prices[i])) ++swapsExecuted;
         }
 
-        // 3. Buy underweight positions with available asset
+        // 3. Buy underweight positions with available asset.
         for (uint256 i; i < len; ++i) {
-            uint256 targetValue = (totalValue * _allocations[i].targetWeightBps) / BPS_DENOMINATOR;
-
-            if (currentValues[i] < targetValue) {
-                // Underweight: buy the deficit
-                uint256 deficitValue = targetValue - currentValues[i];
-                uint256 available = IERC20(asset).balanceOf(address(this));
-                uint256 amountToSpend = deficitValue > available ? available : deficitValue;
-                if (amountToSpend > 0) {
-                    IERC20(asset).forceApprove(address(swapAdapter), amountToSpend);
-                    // Expected output (in `_allocations[i].token` units) =
-                    //   amountToSpend * PRECISION / price.
-                    uint256 expected = (amountToSpend * PRICE_PRECISION) / prices[i];
-                    uint256 minOut = (expected * (BPS_DENOMINATOR - maxSlippageBps)) / BPS_DENOMINATOR;
-                    uint256 amountOut =
-                        swapAdapter.swap(asset, _allocations[i].token, amountToSpend, minOut, _swapExtraData[i]);
-                    if (amountOut == 0) revert SwapFailed();
-                    ++swapsExecuted;
-                }
-            }
+            if (_buyUnderweight(i, totalValue, snap.currentValues[i], snap.prices[i])) ++swapsExecuted;
         }
 
-        // 4. Update stored token amounts and snapshot after balances
+        // 4. Update stored token amounts and snapshot post-balances.
         uint256[] memory newBalances = new uint256[](len);
         for (uint256 i; i < len; ++i) {
-            _allocations[i].tokenAmount = IERC20(_allocations[i].token).balanceOf(address(this));
-            newBalances[i] = _allocations[i].tokenAmount;
+            uint256 bal = IERC20(_allocations[i].token).balanceOf(address(this));
+            _allocations[i].tokenAmount = bal;
+            newBalances[i] = bal;
         }
 
         _rebalancing = false;
-        emit RebalancedDelta(tokens, oldWeights, newWeights, oldBalances, newBalances, totalValue, swapsExecuted);
+        emit RebalancedDelta(
+            snap.tokens, snap.oldWeights, snap.newWeights, snap.oldBalances, newBalances, totalValue, swapsExecuted
+        );
+    }
+
+    /// @dev Capture the pre-rebalance state of every allocation. Returns a
+    ///      fully-formed snapshot — every array field is allocated even when
+    ///      the price/value fields are populated later by the caller, so
+    ///      there's no two-phase init footgun.
+    function _snapshotAllocations(uint256 len) private view returns (DeltaSnapshot memory snap) {
+        snap.tokens = new address[](len);
+        snap.oldWeights = new uint256[](len);
+        snap.newWeights = new uint256[](len);
+        snap.oldBalances = new uint256[](len);
+        snap.prices = new uint256[](len);
+        snap.currentValues = new uint256[](len);
+        for (uint256 i; i < len; ++i) {
+            address t = _allocations[i].token;
+            uint256 w = _allocations[i].targetWeightBps;
+            snap.tokens[i] = t;
+            snap.oldWeights[i] = w;
+            snap.newWeights[i] = w;
+            snap.oldBalances[i] = IERC20(t).balanceOf(address(this));
+        }
+    }
+
+    /// @dev If allocation `i` is overweight at `currentValue`, sell the
+    ///      excess back to the asset using the chainlink-priced floor.
+    ///      Returns true when a swap was executed.
+    function _sellOverweight(uint256 i, uint256 totalValue, uint256 currentValue, uint256 price)
+        private
+        returns (bool)
+    {
+        uint256 targetValue = (totalValue * _allocations[i].targetWeightBps) / BPS_DENOMINATOR;
+        if (currentValue <= targetValue) return false;
+        uint256 tokensToSell = ((currentValue - targetValue) * PRICE_PRECISION) / price;
+        address token = _allocations[i].token;
+        uint256 bal = IERC20(token).balanceOf(address(this));
+        if (tokensToSell > bal) tokensToSell = bal;
+        if (tokensToSell == 0) return false;
+        IERC20(token).forceApprove(address(swapAdapter), tokensToSell);
+        // Apply slippage off the chainlink-priced expectation so an AMM
+        // sandwich can't drift output below this floor.
+        uint256 minOut =
+            (((tokensToSell * price) / PRICE_PRECISION) * (BPS_DENOMINATOR - maxSlippageBps)) / BPS_DENOMINATOR;
+        swapAdapter.swap(token, asset, tokensToSell, minOut, _swapExtraData[i]);
+        return true;
+    }
+
+    /// @dev If allocation `i` is underweight at `currentValue`, buy the
+    ///      deficit (capped at currently-available asset balance). Returns
+    ///      true when a swap was executed.
+    function _buyUnderweight(uint256 i, uint256 totalValue, uint256 currentValue, uint256 price)
+        private
+        returns (bool)
+    {
+        uint256 targetValue = (totalValue * _allocations[i].targetWeightBps) / BPS_DENOMINATOR;
+        if (currentValue >= targetValue) return false;
+        uint256 deficitValue = targetValue - currentValue;
+        uint256 available = IERC20(asset).balanceOf(address(this));
+        uint256 amountToSpend = deficitValue > available ? available : deficitValue;
+        if (amountToSpend == 0) return false;
+        IERC20(asset).forceApprove(address(swapAdapter), amountToSpend);
+        uint256 minOut =
+            (((amountToSpend * PRICE_PRECISION) / price) * (BPS_DENOMINATOR - maxSlippageBps)) / BPS_DENOMINATOR;
+        uint256 amountOut = swapAdapter.swap(asset, _allocations[i].token, amountToSpend, minOut, _swapExtraData[i]);
+        if (amountOut == 0) revert SwapFailed();
+        return true;
     }
 
     // ── Slippage helper ──

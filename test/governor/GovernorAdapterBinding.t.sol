@@ -14,12 +14,12 @@ import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 import {MockStrategyAdapter} from "../mocks/MockStrategyAdapter.sol";
 
-/// @title GovernorAdapterBindingTest
-/// @notice Coverage for `bindProposalAdapter` (size-aware redesign: governor
-///         pushes adapter onto vault directly, no governor-side mapping;
-///         vault `totalAssets` ignores stale pointers via lock-gated read).
-///         See Task 11 of the live-NAV plan.
-contract GovernorAdapterBindingTest is Test {
+/// @title GovernorStrategyOnProposalTest
+/// @notice Coverage for the strategy-on-proposal model: the proposer passes
+///         `strategy` directly to `propose(...)`, no separate
+///         `bindProposalAdapter` step. The vault resolves the live-NAV adapter
+///         by reading `governor.getProposal(activePid).strategy`.
+contract GovernorStrategyOnProposalTest is Test {
     SyndicateGovernor public governor;
     SyndicateVault public vault;
     BatchExecutorLib public executorLib;
@@ -32,7 +32,6 @@ contract GovernorAdapterBindingTest is Test {
     address public agent = makeAddr("agent");
     address public lp1 = makeAddr("lp1");
     address public lp2 = makeAddr("lp2");
-    address public random = makeAddr("random");
 
     uint256 public agentNftId;
 
@@ -94,7 +93,6 @@ contract GovernorAdapterBindingTest is Test {
         );
         governor = SyndicateGovernor(address(new ERC1967Proxy(address(govImpl), govInit)));
 
-        // Vault reads governor via factory.governor() — this test contract acts as the factory.
         vm.mockCall(address(this), abi.encodeWithSignature("governor()"), abi.encode(address(governor)));
 
         vm.prank(owner);
@@ -138,237 +136,97 @@ contract GovernorAdapterBindingTest is Test {
         return cs;
     }
 
-    function _propose() internal returns (uint256 proposalId) {
+    function _propose(address strategy) internal returns (uint256 proposalId) {
         vm.prank(agent);
         proposalId = governor.propose(
-            address(vault), "ipfs://test", 1500, 7 days, _execCalls(), _settleCalls(), _emptyCoProposers()
+            address(vault), strategy, "ipfs://test", 1500, 7 days, _execCalls(), _settleCalls(), _emptyCoProposers()
         );
         vm.warp(vm.getBlockTimestamp() + 1);
     }
 
-    function _proposeAndApprove() internal returns (uint256 proposalId) {
-        proposalId = _propose();
+    function _proposeAndApprove(address strategy) internal returns (uint256 proposalId) {
+        proposalId = _propose(strategy);
         vm.prank(lp1);
         governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
         vm.prank(lp2);
         governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
         vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
-    }
-
-    function _proposeAndExecute() internal returns (uint256 proposalId) {
-        proposalId = _proposeAndApprove();
-        governor.executeProposal(proposalId);
     }
 
     // ==================== TESTS ====================
 
-    function test_bindProposalAdapter_proposerOnly() public {
-        uint256 proposalId = _propose();
+    function test_propose_storesStrategyOnProposal() public {
         MockStrategyAdapter adapter = new MockStrategyAdapter();
-        vm.prank(random);
-        vm.expectRevert(ISyndicateGovernor.NotProposer.selector);
-        governor.bindProposalAdapter(proposalId, address(adapter));
+        uint256 pid = _propose(address(adapter));
+        ISyndicateGovernor.StrategyProposal memory p = governor.getProposal(pid);
+        assertEq(p.strategy, address(adapter), "strategy field stored on proposal");
     }
 
-    function test_bindProposalAdapter_setsAndEmits() public {
-        uint256 proposalId = _propose();
+    function test_propose_strategyZeroIsValid() public {
+        // Queue-only proposal: no live NAV.
+        uint256 pid = _propose(address(0));
+        ISyndicateGovernor.StrategyProposal memory p = governor.getProposal(pid);
+        assertEq(p.strategy, address(0));
+    }
+
+    function test_vault_activeStrategyAdapter_zeroBeforeExecute() public {
+        // Strategy is on the proposal but `_activeProposal[vault]` is unset
+        // until `executeProposal`. Vault resolves through governor and sees
+        // pid == 0 → returns address(0).
         MockStrategyAdapter adapter = new MockStrategyAdapter();
-        vm.expectEmit(true, true, false, false, address(governor));
-        emit ISyndicateGovernor.ProposalAdapterBound(proposalId, address(adapter));
-        vm.prank(agent);
-        governor.bindProposalAdapter(proposalId, address(adapter));
-        // Bind pushes synchronously to the vault.
-        assertEq(vault.activeStrategyAdapter(), address(adapter));
+        _propose(address(adapter));
+        assertEq(vault.activeStrategyAdapter(), address(0), "no live strategy until execute");
     }
 
-    function test_bindProposalAdapter_zeroAddressUnbinds() public {
-        uint256 proposalId = _propose();
+    function test_vault_activeStrategyAdapter_resolvesAfterExecute() public {
         MockStrategyAdapter adapter = new MockStrategyAdapter();
-        vm.prank(agent);
-        governor.bindProposalAdapter(proposalId, address(adapter));
-        assertEq(vault.activeStrategyAdapter(), address(adapter));
-        vm.prank(agent);
-        governor.bindProposalAdapter(proposalId, address(0));
-        assertEq(vault.activeStrategyAdapter(), address(0));
+        adapter.setValue(0, true);
+        uint256 pid = _proposeAndApprove(address(adapter));
+        governor.executeProposal(pid);
+
+        // Post-execute: vault reads strategy from governor's proposal struct.
+        assertEq(vault.activeStrategyAdapter(), address(adapter), "vault resolves strategy through governor");
     }
 
-    function test_bindProposalAdapter_overwritesExisting() public {
-        uint256 proposalId = _propose();
-        MockStrategyAdapter a1 = new MockStrategyAdapter();
-        MockStrategyAdapter a2 = new MockStrategyAdapter();
-        vm.prank(agent);
-        governor.bindProposalAdapter(proposalId, address(a1));
-        vm.prank(agent);
-        governor.bindProposalAdapter(proposalId, address(a2));
-        assertEq(vault.activeStrategyAdapter(), address(a2));
-    }
-
-    function test_bindProposalAdapter_postExecuteReverts() public {
-        uint256 proposalId = _proposeAndExecute();
+    function test_vault_activeStrategyAdapter_zeroAfterSettle() public {
         MockStrategyAdapter adapter = new MockStrategyAdapter();
-        vm.prank(agent);
-        vm.expectRevert(ISyndicateGovernor.AdapterBindingClosed.selector);
-        governor.bindProposalAdapter(proposalId, address(adapter));
-    }
-
-    function test_executeProposal_preservesBoundAdapter() public {
-        // IMP-1: bind must happen during Draft or Pending (with no co-proposer
-        // approvals). Bind here while the proposal is still Pending, then
-        // approve and execute.
-        uint256 proposalId = _propose();
-        MockStrategyAdapter adapter = new MockStrategyAdapter();
-        vm.prank(agent);
-        governor.bindProposalAdapter(proposalId, address(adapter));
-        // Already bound on the vault before execute.
-        assertEq(vault.activeStrategyAdapter(), address(adapter));
-
-        // Drive to Approved.
-        vm.prank(lp1);
-        governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
-        vm.prank(lp2);
-        governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
-        vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
-
-        governor.executeProposal(proposalId);
-
-        // Execute does not touch the adapter — still bound.
-        assertEq(vault.activeStrategyAdapter(), address(adapter));
-    }
-
-    function test_executeProposal_noAdapterIsBenign() public {
-        // Standard flow with no bindProposalAdapter call — vault adapter must remain unset.
-        uint256 proposalId = _proposeAndApprove();
-        governor.executeProposal(proposalId);
-        assertEq(vault.activeStrategyAdapter(), address(0));
-    }
-
-    function test_settleProposal_implicitlyClearsAdapter() public {
-        // IMP-1: bind during Pending, then drive to Approved + Execute.
-        uint256 proposalId = _propose();
-        MockStrategyAdapter adapter = new MockStrategyAdapter();
-        // Adapter NAV would be 9_999e6 if read.
-        adapter.setValue(9_999e6, true);
-        vm.prank(agent);
-        governor.bindProposalAdapter(proposalId, address(adapter));
-
-        vm.prank(lp1);
-        governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
-        vm.prank(lp2);
-        governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
-        vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
-
-        governor.executeProposal(proposalId);
+        adapter.setValue(0, true);
+        uint256 pid = _proposeAndApprove(address(adapter));
+        governor.executeProposal(pid);
         assertEq(vault.activeStrategyAdapter(), address(adapter));
 
         // MS-H3: proposer self-settle requires MIN_STRATEGY_DURATION_BEFORE_SELF_SETTLE.
         vm.warp(vm.getBlockTimestamp() + 1 hours + 1);
         vm.prank(agent);
-        governor.settleProposal(proposalId);
+        governor.settleProposal(pid);
 
-        // Implicit clear: storage pointer remains, but `redemptionsLocked()`
-        // is false post-settle so `totalAssets` short-circuits to float-only.
+        // Post-settle: governor clears `_activeProposal`, so the vault read
+        // resolves to pid=0 → strategy=address(0). Implicit clear without
+        // the vault holding any storage.
         assertFalse(vault.redemptionsLocked());
-        // Behaviorally cleared — totalAssets returns float, not adapter NAV.
-        assertEq(vault.totalAssets(), 100_000e6);
+        assertEq(vault.activeStrategyAdapter(), address(0));
     }
 
-    // ──────────────────────── I-3: smoke-test on bindProposalAdapter ────────────────────────
-
-    /// @notice I-3 regression: an EOA passed as adapter must be rejected at
-    ///         bind time. The vault's `setActiveStrategyAdapter` does a
-    ///         low-level staticcall + return-size check that catches EOAs
-    ///         (zero returndata) along with non-IStrategy contracts.
-    /// @dev    The revert bubbles from `vault.setActiveStrategyAdapter` back
-    ///         through `governor.bindProposalAdapter` to the test caller.
-    function test_bindProposalAdapter_rejectsEOA() public {
-        uint256 proposalId = _propose();
-        address eoa = makeAddr("eoa");
-        vm.prank(agent);
-        vm.expectRevert(ISyndicateVault.AdapterNotIStrategy.selector);
-        governor.bindProposalAdapter(proposalId, eoa);
+    function test_executeProposal_queueOnlyStrategyZeroIsBenign() public {
+        // Standard flow with `strategy=address(0)` — vault's adapter resolution
+        // returns zero, behaviour matches the legacy queue-only path.
+        uint256 pid = _proposeAndApprove(address(0));
+        governor.executeProposal(pid);
+        assertEq(vault.activeStrategyAdapter(), address(0));
     }
 
-    /// @notice I-3 regression: a contract whose `positionValue()` reverts
-    ///         (or doesn't exist) must be rejected at bind time. Without
-    ///         this guard the bound adapter would brick `totalAssets()`
-    ///         and every LP entrypoint until the proposal settles.
-    function test_bindProposalAdapter_rejectsRevertingContract() public {
-        uint256 proposalId = _propose();
-        RevertingAdapter ra = new RevertingAdapter();
-        vm.prank(agent);
-        vm.expectRevert(ISyndicateVault.AdapterNotIStrategy.selector);
-        governor.bindProposalAdapter(proposalId, address(ra));
-    }
-
-    // ──────────────────────── IMP-1: collaborative-approval adapter lock ────────────────────────
-
-    /// @notice IMP-1 regression: once any co-proposer approves the proposal
-    ///         hash, the lead proposer can no longer rebind the adapter.
-    ///         Co-proposers approve `executeCalls`/`settlementCalls` but not
-    ///         the adapter pointer — allowing post-approval rebinding would
-    ///         be a side-channel mutation of the executed strategy.
-    function test_bindProposalAdapter_locksAfterFirstCoProposerApproval() public {
-        // Mint NFT for co-proposer and register on vault
-        address co = makeAddr("co");
-        uint256 coNftId = agentRegistry.mint(co);
-        vm.prank(owner);
-        vault.registerAgent(coNftId, co);
-
-        ISyndicateGovernor.CoProposer[] memory cps = new ISyndicateGovernor.CoProposer[](1);
-        cps[0] = ISyndicateGovernor.CoProposer({agent: co, splitBps: 5000});
-
-        vm.prank(agent);
-        uint256 pid = governor.propose(address(vault), "ipfs://test", 1500, 7 days, _execCalls(), _settleCalls(), cps);
-
-        MockStrategyAdapter ad1 = new MockStrategyAdapter();
-        MockStrategyAdapter ad2 = new MockStrategyAdapter();
-
-        // Pre-approval (Draft, _approvedCount == 0): lead can bind freely.
-        vm.prank(agent);
-        governor.bindProposalAdapter(pid, address(ad1));
-        assertEq(vault.activeStrategyAdapter(), address(ad1));
-
-        // Co-proposer approves; with only 1 co-proposer this also transitions
-        // to Pending. We assert lock irrespective of state — the IMP-1 contract
-        // is "any co-proposer approval locks the adapter".
-        vm.prank(co);
-        governor.approveCollaboration(pid);
-
-        // After approval the adapter pointer is sealed.
-        // Single co-proposer with 5000 bps → all-approved → Pending; rebind
-        // would otherwise be allowed in Pending. The IMP-1 lock disallows it
-        // because `_approvedCount` is now nonzero (we are no longer in Draft
-        // and the Pending branch is reachable only if no co-proposer has
-        // approved … but the only path into Pending here is via
-        // approveCollaboration, which guarantees an approval). So rebind
-        // must revert with AdapterBindingClosed.
-        vm.prank(agent);
-        vm.expectRevert(ISyndicateGovernor.AdapterBindingClosed.selector);
-        governor.bindProposalAdapter(pid, address(ad2));
-
-        // Adapter pointer unchanged.
-        assertEq(vault.activeStrategyAdapter(), address(ad1));
-    }
-
-    /// @notice IMP-1 regression: once the proposal leaves `Pending`
-    ///         (i.e. enters GuardianReview / Approved / Executed), the
-    ///         adapter cannot be rebound. `_proposeAndApprove` warps past
-    ///         `voteEnd` so the proposal resolves to Approved (no review
-    ///         period in this test setup since `MockRegistryMinimal` returns
-    ///         zero from `reviewPeriod`).
-    function test_bindProposalAdapter_rejectsAfterPending() public {
-        uint256 proposalId = _proposeAndApprove();
+    function test_strategy_immutableOnceProposed() public {
+        // The proposal struct is set at propose time. There is no setter, no
+        // governor-side bind function — voters always see the same strategy
+        // they approved.
         MockStrategyAdapter adapter = new MockStrategyAdapter();
-        vm.prank(agent);
-        vm.expectRevert(ISyndicateGovernor.AdapterBindingClosed.selector);
-        governor.bindProposalAdapter(proposalId, address(adapter));
-    }
-}
+        uint256 pid = _propose(address(adapter));
 
-/// @dev Adapter whose `positionValue()` reverts. Used to verify the
-///      I-3 smoke-test in `bindProposalAdapter`.
-contract RevertingAdapter {
-    function positionValue() external pure returns (uint256, bool) {
-        revert("nope");
+        ISyndicateGovernor.StrategyProposal memory before = governor.getProposal(pid);
+        // No way to mutate strategy: confirm the field is the same after voting.
+        vm.prank(lp1);
+        governor.vote(pid, ISyndicateGovernor.VoteType.For);
+        ISyndicateGovernor.StrategyProposal memory afterVote = governor.getProposal(pid);
+        assertEq(before.strategy, afterVote.strategy, "strategy unchanged across vote");
     }
 }

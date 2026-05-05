@@ -194,7 +194,14 @@ contract OpenProposalCountTest is Test {
     function _propose() internal returns (uint256 proposalId) {
         vm.prank(agent);
         proposalId = governor.propose(
-            address(vault), "ipfs://open-count", 1000, 7 days, _execCalls(), _settleCalls(), _emptyCoProposers()
+            address(vault),
+            address(0),
+            "ipfs://open-count",
+            1000,
+            7 days,
+            _execCalls(),
+            _settleCalls(),
+            _emptyCoProposers()
         );
     }
 
@@ -468,8 +475,9 @@ contract OpenProposalCountTest is Test {
         coProps[0] = ISyndicateGovernor.CoProposer({agent: agent2, splitBps: 2000});
 
         vm.prank(agent);
-        uint256 pid =
-            governor.propose(address(vault), "ipfs://collab", 1000, 7 days, _execCalls(), _settleCalls(), coProps);
+        uint256 pid = governor.propose(
+            address(vault), address(0), "ipfs://collab", 1000, 7 days, _execCalls(), _settleCalls(), coProps
+        );
 
         // Draft state → counter stays at 0.
         assertEq(
@@ -507,7 +515,7 @@ contract OpenProposalCountTest is Test {
 
         vm.prank(agent);
         uint256 pid = governor.propose(
-            address(vault), "ipfs://collab-reject", 1000, 7 days, _execCalls(), _settleCalls(), coProps
+            address(vault), address(0), "ipfs://collab-reject", 1000, 7 days, _execCalls(), _settleCalls(), coProps
         );
         assertEq(governor.openProposalCount(address(vault)), 0, "Draft does not count");
 

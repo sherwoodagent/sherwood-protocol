@@ -198,7 +198,7 @@ abstract contract HyperEVMIntegrationTest is Test {
     ) internal returns (uint256 proposalId) {
         vm.prank(agent);
         proposalId = governor.propose(
-            address(vault), "ipfs://test", feeBps, duration, execCalls, settleCalls, _emptyCoProposers()
+            address(vault), address(0), "ipfs://test", feeBps, duration, execCalls, settleCalls, _emptyCoProposers()
         );
 
         vm.warp(block.timestamp + 1);

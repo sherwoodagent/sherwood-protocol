@@ -4,6 +4,7 @@ pragma solidity 0.8.28;
 import {Test} from "forge-std/Test.sol";
 import {SyndicateVault} from "../../../src/SyndicateVault.sol";
 import {VaultWithdrawalQueue} from "../../../src/queue/VaultWithdrawalQueue.sol";
+import {ISyndicateGovernor} from "../../../src/interfaces/ISyndicateGovernor.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 /// @notice Adapter mock for the live-NAV invariant harness. Supports independent
@@ -91,16 +92,14 @@ contract LiveNAVHandler is Test {
         mockGovernor = mg;
         adapter = new MaliciousAdapter();
 
-        // Bind-time smoke-test: `setActiveStrategyAdapter` staticcalls
-        // `positionValue()` and requires non-reverting return data >= 64 bytes.
-        // Configure adapter to return a valid (uint256, bool) before binding.
         adapter.setValid(true);
         adapter.setValue(0);
         adapter.setShouldRevert(false);
 
-        // Bind via mocked governor authority — vault checks msg.sender == _getGovernor().
-        vm.prank(mockGovernor);
-        vault.setActiveStrategyAdapter(address(adapter));
+        // Strategy is now read from `governor.getProposal(activePid).strategy`
+        // — no separate bind setter. The handler swaps adapters by remocking
+        // `getProposal(...)` (see `_mockProposalWithStrategy` below) instead of
+        // calling a vault setter.
 
         actors.push(makeAddr("actor0LN"));
         actors.push(makeAddr("actor1LN"));
@@ -113,21 +112,32 @@ contract LiveNAVHandler is Test {
         }
     }
 
+    /// @dev Mocks the governor's `getProposal(pid)` to return a struct with
+    ///      `strategy = adapter`, so vault `_activeStrategy()` resolves to it.
+    function _mockProposalWithStrategy(uint256 pid, address strategy) internal {
+        ISyndicateGovernor.StrategyProposal memory p;
+        p.id = pid;
+        p.vault = address(vault);
+        p.strategy = strategy;
+        vm.mockCall(mockGovernor, abi.encodeWithSelector(ISyndicateGovernor.getProposal.selector, pid), abi.encode(p));
+    }
+
     // ------------ State togglers ------------
 
     function toggleLock(bool locked) external {
         lockToggleCalls++;
-        vm.mockCall(
-            mockGovernor,
-            abi.encodeWithSignature("getActiveProposal(address)"),
-            abi.encode(locked ? uint256(1) : uint256(0))
-        );
-        // MS-H4: deposits are also gated by `openProposalCount` — mirror lock state.
+        uint256 pid = locked ? uint256(1) : uint256(0);
+        vm.mockCall(mockGovernor, abi.encodeWithSignature("getActiveProposal(address)"), abi.encode(pid));
         vm.mockCall(
             mockGovernor,
             abi.encodeWithSignature("openProposalCount(address)"),
             abi.encode(locked ? uint256(1) : uint256(0))
         );
+        if (locked) {
+            // Adapter must be resolvable through the governor proposal struct
+            // for live-NAV path tests to exercise `_lpFlowGate` / `totalAssets`.
+            _mockProposalWithStrategy(pid, address(adapter));
+        }
     }
 
     function toggleAdapterValid(bool v) external {

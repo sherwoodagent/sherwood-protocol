@@ -72,4 +72,11 @@ contract MockStrategyAdapter is IStrategy {
         lastLiveDeposit = assets;
         liveDepositCount++;
     }
+
+    /// @notice Stubbed live-withdraw hook. Returns 0 by default (cannot free
+    ///         on-demand liquidity); tests that need partial-unwind behavior
+    ///         can mock this via `vm.mockCall`.
+    function onLiveWithdraw(uint256) external pure returns (uint256) {
+        return 0;
+    }
 }

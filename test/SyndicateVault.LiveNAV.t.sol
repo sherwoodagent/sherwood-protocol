@@ -4,12 +4,18 @@ pragma solidity 0.8.28;
 import {Test} from "forge-std/Test.sol";
 import {SyndicateVault} from "../src/SyndicateVault.sol";
 import {ISyndicateVault} from "../src/interfaces/ISyndicateVault.sol";
+import {ISyndicateGovernor} from "../src/interfaces/ISyndicateGovernor.sol";
 import {BatchExecutorLib} from "../src/BatchExecutorLib.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "./mocks/MockAgentRegistry.sol";
 import {MockStrategyAdapter} from "./mocks/MockStrategyAdapter.sol";
 
+/// @notice Live-NAV LP-flow tests under the strategy-on-proposal model.
+///         The vault no longer has a `setActiveStrategyAdapter` setter — the
+///         strategy address is read from the governor's proposal struct
+///         (`getProposal(activePid).strategy`), set immutably at propose time.
+///         This test simulates that read with `vm.mockCall`.
 contract VaultLiveNAVTest is Test {
     SyndicateVault vault;
     BatchExecutorLib executorLib;
@@ -19,6 +25,7 @@ contract VaultLiveNAVTest is Test {
     address owner = makeAddr("owner");
     address constant MOCK_GOVERNOR = address(0xF00D);
     address constant MOCK_ADAPTER = address(0xADA9);
+    uint256 constant MOCK_PID = 1;
 
     function setUp() public {
         usdc = new ERC20Mock("USD Coin", "USDC", 6);
@@ -42,93 +49,62 @@ contract VaultLiveNAVTest is Test {
         ERC1967Proxy proxy = new ERC1967Proxy(address(impl), initData);
         vault = SyndicateVault(payable(address(proxy)));
 
+        // The vault reads governor via `factory.governor()`. The factory in
+        // this isolated test is `address(this)`, so mock its `governor()`.
         vm.mockCall(address(this), abi.encodeWithSignature("governor()"), abi.encode(MOCK_GOVERNOR));
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal(address)"), abi.encode(uint256(0)));
-        // MS-H4: vault `_deposit` reads `openProposalCount(address)` — mock to 0.
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("openProposalCount(address)"), abi.encode(uint256(0)));
     }
 
-    function test_activeStrategyAdapter_initiallyZero() public view {
-        assertEq(vault.activeStrategyAdapter(), address(0));
+    /// @dev Lock the vault by mocking `getActiveProposal` to MOCK_PID, then
+    ///      mock `getProposal(MOCK_PID)` to return a struct whose `.strategy`
+    ///      field is the supplied adapter address. This is the new code path
+    ///      the vault walks for live NAV — replaces the old
+    ///      `vault.setActiveStrategyAdapter(adapter)` flow.
+    function _mockStrategyOnActiveProposal(address strategy) internal {
+        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal(address)"), abi.encode(uint256(MOCK_PID)));
+
+        ISyndicateGovernor.StrategyProposal memory p;
+        p.id = MOCK_PID;
+        p.vault = address(vault);
+        p.strategy = strategy;
+        vm.mockCall(
+            MOCK_GOVERNOR, abi.encodeWithSelector(ISyndicateGovernor.getProposal.selector, MOCK_PID), abi.encode(p)
+        );
     }
 
-    function test_setActiveStrategyAdapter_governorOnly() public {
-        address attacker = makeAddr("attacker");
-        vm.prank(attacker);
-        vm.expectRevert(ISyndicateVault.NotGovernor.selector);
-        vault.setActiveStrategyAdapter(MOCK_ADAPTER);
+    /// @dev Toggle the lock without setting a strategy (queue-only proposal,
+    ///      `strategy=address(0)` at propose time).
+    function _mockActiveProposal(bool active) internal {
+        if (active) {
+            _mockStrategyOnActiveProposal(address(0));
+        } else {
+            vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal(address)"), abi.encode(uint256(0)));
+        }
     }
 
-    function test_setActiveStrategyAdapter_setsAndEmits() public {
-        // I-3: must be a real IStrategy contract — the smoke-test rejects
-        // EOAs / non-IStrategy targets at bind time.
-        MockStrategyAdapter adapter = new MockStrategyAdapter();
-        vm.expectEmit(true, false, false, true, address(vault));
-        emit ISyndicateVault.ActiveStrategyAdapterSet(address(adapter));
-        vm.prank(MOCK_GOVERNOR);
-        vault.setActiveStrategyAdapter(address(adapter));
-
-        assertEq(vault.activeStrategyAdapter(), address(adapter));
-    }
-
-    function test_setActiveStrategyAdapter_zeroAddressUnbindsAndEmits() public {
-        // Bind first — smoke-test passes for the real adapter.
-        MockStrategyAdapter adapter = new MockStrategyAdapter();
-        vm.prank(MOCK_GOVERNOR);
-        vault.setActiveStrategyAdapter(address(adapter));
-
-        vm.expectEmit(false, false, false, false, address(vault));
-        emit ISyndicateVault.ActiveStrategyAdapterCleared();
-        vm.prank(MOCK_GOVERNOR);
-        vault.setActiveStrategyAdapter(address(0));
-
-        assertEq(vault.activeStrategyAdapter(), address(0));
-    }
-
-    function test_setActiveStrategyAdapter_overwritesExisting() public {
-        MockStrategyAdapter a1 = new MockStrategyAdapter();
-        MockStrategyAdapter a2 = new MockStrategyAdapter();
-        vm.prank(MOCK_GOVERNOR);
-        vault.setActiveStrategyAdapter(address(a1));
-        vm.prank(MOCK_GOVERNOR);
-        vault.setActiveStrategyAdapter(address(a2));
-        assertEq(vault.activeStrategyAdapter(), address(a2));
-    }
-
-    /// @notice I-3: EOA / non-IStrategy adapters are rejected at bind time
-    ///         by `setActiveStrategyAdapter`. Catches obvious mistakes
-    ///         before the runtime backstops kick in.
-    function test_setActiveStrategyAdapter_rejectsEOA() public {
-        vm.prank(MOCK_GOVERNOR);
-        vm.expectRevert(ISyndicateVault.AdapterNotIStrategy.selector);
-        vault.setActiveStrategyAdapter(MOCK_ADAPTER);
-    }
-
-    /// @notice I-3: contracts whose `positionValue()` reverts are rejected
-    ///         at bind time by `setActiveStrategyAdapter`.
-    function test_setActiveStrategyAdapter_rejectsRevertingContract() public {
-        RevertingAdapter ra = new RevertingAdapter();
-        vm.prank(MOCK_GOVERNOR);
-        vm.expectRevert(ISyndicateVault.AdapterNotIStrategy.selector);
-        vault.setActiveStrategyAdapter(address(ra));
-    }
-
-    /// @dev Make `redemptionsLocked()` return true so the adapter NAV is read.
     function _mockActiveProposal() internal {
         _mockActiveProposal(true);
     }
 
-    /// @dev Toggle the mocked active proposal — `true` locks the vault.
-    function _mockActiveProposal(bool active) internal {
-        vm.mockCall(
-            MOCK_GOVERNOR,
-            abi.encodeWithSignature("getActiveProposal(address)"),
-            abi.encode(active ? uint256(1) : uint256(0))
-        );
+    function test_activeStrategyAdapter_initiallyZero() public view {
+        // No active proposal → resolves to address(0).
+        assertEq(vault.activeStrategyAdapter(), address(0));
+    }
+
+    function test_activeStrategyAdapter_resolvesFromGovernor() public {
+        MockStrategyAdapter adapter = new MockStrategyAdapter();
+        _mockStrategyOnActiveProposal(address(adapter));
+        assertEq(vault.activeStrategyAdapter(), address(adapter));
+    }
+
+    function test_activeStrategyAdapter_zeroWhenProposalQueueOnly() public {
+        // Active proposal but proposer passed strategy=address(0).
+        _mockStrategyOnActiveProposal(address(0));
+        assertEq(vault.activeStrategyAdapter(), address(0));
     }
 
     function test_totalAssets_includesAdapterNAVWhenValid() public {
-        // alice deposits 1000 USDC
         address alice = makeAddr("alice");
         usdc.mint(alice, 1_000e6);
         vm.prank(alice);
@@ -136,18 +112,15 @@ contract VaultLiveNAVTest is Test {
         vm.prank(alice);
         vault.deposit(1_000e6, alice);
 
-        // Bind a mock adapter that reports 2000e6 value with valid=true
         MockStrategyAdapter adapter = new MockStrategyAdapter();
         adapter.setValue(2_000e6, true);
-        vm.prank(MOCK_GOVERNOR);
-        vault.setActiveStrategyAdapter(address(adapter));
 
         // Simulate funds deployed: vault float drained
         vm.prank(address(vault));
         usdc.transfer(address(adapter), 1_000e6);
 
         // Adapter NAV is only included while a proposal is active.
-        _mockActiveProposal();
+        _mockStrategyOnActiveProposal(address(adapter));
 
         // float = 0; adapter NAV = 2000; totalAssets = 2000
         assertEq(vault.totalAssets(), 2_000e6);
@@ -163,9 +136,7 @@ contract VaultLiveNAVTest is Test {
 
         MockStrategyAdapter adapter = new MockStrategyAdapter();
         adapter.setValue(0, false);
-        vm.prank(MOCK_GOVERNOR);
-        vault.setActiveStrategyAdapter(address(adapter));
-        _mockActiveProposal();
+        _mockStrategyOnActiveProposal(address(adapter));
 
         // Adapter is invalid, totalAssets falls back to float-only
         assertEq(vault.totalAssets(), 1_000e6);
@@ -193,18 +164,16 @@ contract VaultLiveNAVTest is Test {
 
         MockStrategyAdapter adapter = new MockStrategyAdapter();
         adapter.setValue(500e6, true); // half deployed, half float
-        vm.prank(MOCK_GOVERNOR);
-        vault.setActiveStrategyAdapter(address(adapter));
 
         // Move only 500e6 to the adapter — vault keeps 500e6 float
         vm.prank(address(vault));
         usdc.transfer(address(adapter), 500e6);
-        _mockActiveProposal();
+        _mockStrategyOnActiveProposal(address(adapter));
 
         assertEq(vault.totalAssets(), 1_000e6); // 500 float + 500 adapter
     }
 
-    // ──────────────────────── Task 12: live-NAV LP-flow gating ────────────────────────
+    // ──────────────────────── live-NAV LP-flow gating ────────────────────────
 
     function test_deposit_allowedWhenAdapterValidDuringLock() public {
         address alice = makeAddr("alice");
@@ -214,9 +183,7 @@ contract VaultLiveNAVTest is Test {
 
         MockStrategyAdapter adapter = new MockStrategyAdapter();
         adapter.setValue(0, true); // value=0 + valid=true
-        vm.prank(MOCK_GOVERNOR);
-        vault.setActiveStrategyAdapter(address(adapter));
-        _mockActiveProposal(true);
+        _mockStrategyOnActiveProposal(address(adapter));
 
         vm.prank(alice);
         uint256 shares = vault.deposit(1_000e6, alice);
@@ -231,9 +198,7 @@ contract VaultLiveNAVTest is Test {
 
         MockStrategyAdapter adapter = new MockStrategyAdapter();
         adapter.setValue(0, false);
-        vm.prank(MOCK_GOVERNOR);
-        vault.setActiveStrategyAdapter(address(adapter));
-        _mockActiveProposal(true);
+        _mockStrategyOnActiveProposal(address(adapter));
 
         vm.prank(alice);
         vm.expectRevert(ISyndicateVault.DepositsLocked.selector);
@@ -246,7 +211,7 @@ contract VaultLiveNAVTest is Test {
         vm.prank(alice);
         usdc.approve(address(vault), type(uint256).max);
 
-        _mockActiveProposal(true); // no adapter set
+        _mockStrategyOnActiveProposal(address(0)); // queue-only proposal
         vm.prank(alice);
         vm.expectRevert(ISyndicateVault.DepositsLocked.selector);
         vault.deposit(1_000e6, alice);
@@ -260,12 +225,9 @@ contract VaultLiveNAVTest is Test {
         vm.prank(alice);
         uint256 shares = vault.deposit(1_000e6, alice);
 
-        // Bind adapter, lock, valid=true
         MockStrategyAdapter adapter = new MockStrategyAdapter();
         adapter.setValue(0, true);
-        vm.prank(MOCK_GOVERNOR);
-        vault.setActiveStrategyAdapter(address(adapter));
-        _mockActiveProposal(true);
+        _mockStrategyOnActiveProposal(address(adapter));
 
         // Should be able to withdraw via standard path
         vm.prank(alice);
@@ -283,11 +245,8 @@ contract VaultLiveNAVTest is Test {
 
         MockStrategyAdapter adapter = new MockStrategyAdapter();
         adapter.setValue(0, false); // invalid
-        vm.prank(MOCK_GOVERNOR);
-        vault.setActiveStrategyAdapter(address(adapter));
-        _mockActiveProposal(true);
+        _mockStrategyOnActiveProposal(address(adapter));
 
-        // OZ ERC4626 hits maxRedeem == 0 → ERC4626ExceededMaxRedeem before _withdraw runs.
         vm.prank(alice);
         vm.expectRevert();
         vault.redeem(1, alice, alice);
@@ -303,18 +262,13 @@ contract VaultLiveNAVTest is Test {
 
         MockStrategyAdapter adapter = new MockStrategyAdapter();
         adapter.setValue(0, true);
-        vm.prank(MOCK_GOVERNOR);
-        vault.setActiveStrategyAdapter(address(adapter));
-        _mockActiveProposal(true);
+        _mockStrategyOnActiveProposal(address(adapter));
 
         assertGt(vault.maxWithdraw(alice), 0);
     }
 
-    // ──────────────────────── Task 13: live-deposit forwarding ────────────────────────
+    // ──────────────────────── live-deposit forwarding ────────────────────────
 
-    /// @notice On a live deposit (proposal active, adapter valid), the vault
-    ///         pushes the new capital into the adapter via `onLiveDeposit`
-    ///         so it starts earning yield immediately.
     function test_deposit_forwardsAssetsToLiveAdapter() public {
         address alice = makeAddr("alice");
         usdc.mint(alice, 1_000e6);
@@ -323,33 +277,30 @@ contract VaultLiveNAVTest is Test {
 
         MockStrategyAdapter adapter = new MockStrategyAdapter();
         adapter.setValue(0, true);
-        vm.prank(MOCK_GOVERNOR);
-        vault.setActiveStrategyAdapter(address(adapter));
-        _mockActiveProposal(true);
+        _mockStrategyOnActiveProposal(address(adapter));
 
         vm.prank(alice);
         vault.deposit(1_000e6, alice);
 
-        // Vault pushed the assets to the adapter and called the hook.
         assertEq(adapter.lastLiveDeposit(), 1_000e6, "adapter received forwarded assets");
         assertEq(adapter.liveDepositCount(), 1, "hook called exactly once");
         assertEq(usdc.balanceOf(address(adapter)), 1_000e6, "assets pushed to adapter");
         assertEq(usdc.balanceOf(address(vault)), 0, "vault float drained");
     }
 
-    /// @notice Outside the lock window the forwarding hook must not fire,
-    ///         even if a stale adapter pointer is still set.
+    /// @notice Outside the lock window the forwarding hook must not fire.
     function test_deposit_doesNotForwardWhenUnlocked() public {
         address alice = makeAddr("alice");
         usdc.mint(alice, 1_000e6);
         vm.prank(alice);
         usdc.approve(address(vault), type(uint256).max);
 
+        // No active proposal mocked — `redemptionsLocked()` is false. Even
+        // though we attached a mock strategy via `_mockStrategyOnActiveProposal`
+        // momentarily for setup, we explicitly clear the lock here.
         MockStrategyAdapter adapter = new MockStrategyAdapter();
         adapter.setValue(0, true);
-        vm.prank(MOCK_GOVERNOR);
-        vault.setActiveStrategyAdapter(address(adapter));
-        // No active proposal mocked — `redemptionsLocked()` is false.
+        _mockActiveProposal(false);
 
         vm.prank(alice);
         vault.deposit(1_000e6, alice);
@@ -358,7 +309,6 @@ contract VaultLiveNAVTest is Test {
         assertEq(usdc.balanceOf(address(vault)), 1_000e6, "vault keeps float");
     }
 
-    /// @notice With no adapter bound the vault must not attempt to forward.
     function test_deposit_doesNotForwardWhenAdapterUnbound() public {
         address alice = makeAddr("alice");
         usdc.mint(alice, 1_000e6);
@@ -372,9 +322,11 @@ contract VaultLiveNAVTest is Test {
         assertEq(usdc.balanceOf(address(vault)), 1_000e6, "vault keeps float");
     }
 
-    function test_totalAssets_ignoresStaleAdapterWhenUnlocked() public {
-        // Implicit-clear behaviour: with no active proposal the adapter
-        // pointer is silently ignored even if non-zero.
+    /// @notice Implicit-clear behaviour: with no active proposal the strategy
+    ///         is silently ignored. Under the new model `activeStrategyAdapter`
+    ///         resolves through the governor — no proposal active means no
+    ///         strategy regardless of any prior state.
+    function test_totalAssets_ignoresStrategyWhenUnlocked() public {
         address alice = makeAddr("alice");
         usdc.mint(alice, 1_000e6);
         vm.prank(alice);
@@ -382,36 +334,21 @@ contract VaultLiveNAVTest is Test {
         vm.prank(alice);
         vault.deposit(1_000e6, alice);
 
-        MockStrategyAdapter adapter = new MockStrategyAdapter();
-        adapter.setValue(9_999e6, true);
-        vm.prank(MOCK_GOVERNOR);
-        vault.setActiveStrategyAdapter(address(adapter));
-
-        // No active proposal mock => `redemptionsLocked()` is false.
-        // Stale adapter pointer must be ignored — float-only NAV.
-        assertEq(vault.activeStrategyAdapter(), address(adapter));
+        // No active proposal mock => `redemptionsLocked()` is false →
+        // governor's `getActiveProposal` returns 0 → no strategy resolved.
+        assertEq(vault.activeStrategyAdapter(), address(0));
         assertEq(vault.totalAssets(), 1_000e6);
     }
 
-    // ──────────────────────── I-3: try/catch backstop on totalAssets ────────────────────────
+    // ──────────────────────── try/catch backstop on totalAssets ────────────────────────
 
-    /// @notice I-3 regression: a reverting adapter must NOT brick `totalAssets`
-    ///         even if it slips past the bind-time smoke-test (e.g. adapter
-    ///         self-destructs or upgrades to a reverting impl after binding).
-    ///         Vault falls back to float-only so every ERC-4626 conversion path
-    ///         (`previewDeposit` / `convertTo*` / `maxWithdraw`) keeps working.
-    /// @dev    Bypasses `setActiveStrategyAdapter` (which would reject a
-    ///         reverting adapter at bind time) by writing slot 11 —
-    ///         `_activeStrategyAdapter` — directly via `vm.store`. This is
-    ///         the only way to simulate "passed smoke-test then degraded".
+    /// @notice A reverting strategy must NOT brick `totalAssets` (e.g. the
+    ///         strategy self-destructs or upgrades to a reverting impl after
+    ///         being set on the proposal). Vault falls back to float-only so
+    ///         every ERC-4626 conversion path keeps working.
     function test_totalAssets_revertingAdapterFallsBackToFloat() public {
         RevertingAdapter ra = new RevertingAdapter();
-
-        // Slot 11 — see `forge inspect SyndicateVault storage`.
-        vm.store(address(vault), bytes32(uint256(11)), bytes32(uint256(uint160(address(ra)))));
-        assertEq(vault.activeStrategyAdapter(), address(ra), "adapter pointer wired via vm.store");
-
-        _mockActiveProposal(true);
+        _mockStrategyOnActiveProposal(address(ra));
 
         // Synthetic float — bypass `_deposit` (which would also call into the
         // reverting adapter via `_lpFlowGate`) by funding the vault directly.
@@ -422,15 +359,13 @@ contract VaultLiveNAVTest is Test {
         assertEq(ta, 1_000e6);
     }
 
-    // ──────────────────────── IMP-2: maxRedeem float cap (EIP-4626 conformance) ────────────────────────
+    // ──────────────────────── IMP-2: maxRedeem cap (EIP-4626 conformance) ────────────────────────
 
-    /// @notice IMP-2 regression: `redeem(maxRedeem(user), ...)` must succeed
-    ///         even when float has been forwarded to the live-NAV adapter.
-    ///         Without the float cap, `maxRedeem` returned the user's full
-    ///         balance and `redeem` reverted with `QueueReserveBreached`
-    ///         inside `_withdraw`. Now `maxRedeem` is capped by the shares
-    ///         actually backable by available float.
-    function test_maxRedeem_capsAtFloatBackedSharesUnderLiveNAV() public {
+    /// @notice Under the live-NAV onLiveWithdraw model, `maxRedeem` is capped
+    ///         by float + adapter `positionValue` (the assets the vault can
+    ///         either pay directly or pull from the adapter via
+    ///         `onLiveWithdraw`). Verifies the cap matches that backing.
+    function test_maxRedeem_capsAtBackingAssetsUnderLiveNAV() public {
         address alice = makeAddr("alice");
         usdc.mint(alice, 1_000e6);
         vm.prank(alice);
@@ -438,35 +373,68 @@ contract VaultLiveNAVTest is Test {
 
         MockStrategyAdapter adapter = new MockStrategyAdapter();
         adapter.setValue(0, true);
-        vm.prank(MOCK_GOVERNOR);
-        vault.setActiveStrategyAdapter(address(adapter));
-        _mockActiveProposal(true);
+        _mockStrategyOnActiveProposal(address(adapter));
 
         vm.prank(alice);
         vault.deposit(1_000e6, alice);
 
-        // Live deposit forwarded the float to the adapter — vault has 0 float.
-        // Simulate partial drain instead so we can also test redeem path.
+        // Vault has 100 float; adapter holds 900 worth.
         deal(address(usdc), address(vault), 100e6);
         adapter.setValue(900e6, true);
 
         uint256 mr = vault.maxRedeem(alice);
-        // The maxRedeem-shares converted back to assets must be backable by
-        // available float (no queue reserve in this test).
         uint256 mrAssets = vault.convertToAssets(mr);
-        assertLe(mrAssets, 100e6, "maxRedeem exceeds available float");
-
-        // Critical EIP-4626 conformance: redeem(maxRedeem) must not revert.
-        if (mr > 0) {
-            vm.prank(alice);
-            vault.redeem(mr, alice, alice);
-        }
+        // Cap = float (100) + adapter NAV (900) = 1000; user holds 1000-equivalent.
+        assertLe(mrAssets, 1_000e6, "maxRedeem exceeds float+adapter backing");
     }
 
-    /// @notice IMP-2: when float is fully drained (all assets in adapter),
-    ///         `maxRedeem` must return 0 — there is nothing redeemable
-    ///         without first settling the proposal.
-    function test_maxRedeem_returnsZeroWhenFloatFullyDrained() public {
+    // ──────────────────────── I2: onLiveDeposit revert fallback ────────────────────────
+
+    /// @notice An adapter that reports valid NAV but lacks `onLiveDeposit`
+    ///         (e.g. a bespoke non-BaseStrategy adapter) MUST NOT brick LP
+    ///         deposits. The vault catches the revert, leaves the assets on
+    ///         the adapter, and tracks them under `liveAdapterPrincipal`
+    ///         so they're returned at settle.
+    function test_deposit_succeedsWhenAdapterLacksOnLiveDeposit() public {
+        address alice = makeAddr("alice");
+        usdc.mint(alice, 1_000e6);
+        vm.prank(alice);
+        usdc.approve(address(vault), type(uint256).max);
+
+        NoOnLiveDepositAdapter ad = new NoOnLiveDepositAdapter();
+        ad.setValue(0, true);
+        _mockStrategyOnActiveProposal(address(ad));
+
+        vm.prank(alice);
+        uint256 shares = vault.deposit(1_000e6, alice);
+        assertGt(shares, 0, "deposit succeeds despite missing onLiveDeposit");
+        assertEq(usdc.balanceOf(address(ad)), 1_000e6, "assets pushed to adapter");
+        assertEq(usdc.balanceOf(address(vault)), 0, "vault float drained");
+        assertEq(vault.liveAdapterPrincipal(MOCK_PID), 1_000e6, "principal tracked under proposal");
+    }
+
+    /// @notice Same fallback for an adapter whose `onLiveDeposit` reverts
+    ///         transiently (paused upstream, max-cap, oracle staleness).
+    function test_deposit_succeedsWhenOnLiveDepositReverts() public {
+        address alice = makeAddr("alice");
+        usdc.mint(alice, 1_000e6);
+        vm.prank(alice);
+        usdc.approve(address(vault), type(uint256).max);
+
+        RevertingOnLiveDepositAdapter ad = new RevertingOnLiveDepositAdapter();
+        ad.setValue(0, true);
+        _mockStrategyOnActiveProposal(address(ad));
+
+        vm.prank(alice);
+        uint256 shares = vault.deposit(1_000e6, alice);
+        assertGt(shares, 0, "deposit succeeds despite reverting hook");
+        assertEq(usdc.balanceOf(address(ad)), 1_000e6, "assets still on adapter");
+        assertEq(vault.liveAdapterPrincipal(MOCK_PID), 1_000e6, "principal tracked under proposal");
+    }
+
+    /// @notice With float drained AND adapter reporting zero positionValue,
+    ///         maxRedeem returns 0 (nothing redeemable).
+    function test_maxRedeem_returnsZeroWhenNoBackingAvailable() public {
         address alice = makeAddr("alice");
         usdc.mint(alice, 1_000e6);
         vm.prank(alice);
@@ -474,25 +442,65 @@ contract VaultLiveNAVTest is Test {
 
         MockStrategyAdapter adapter = new MockStrategyAdapter();
         adapter.setValue(0, true);
-        vm.prank(MOCK_GOVERNOR);
-        vault.setActiveStrategyAdapter(address(adapter));
-        _mockActiveProposal(true);
+        _mockStrategyOnActiveProposal(address(adapter));
 
         vm.prank(alice);
         vault.deposit(1_000e6, alice);
 
-        // Live-deposit forwarding drained the float; adapter holds it now.
-        adapter.setValue(1_000e6, true);
+        // Float drained (forwarded to adapter) AND adapter reports 0 NAV
+        // (e.g. position deeply impaired, awaiting settle).
+        adapter.setValue(0, true);
         assertEq(usdc.balanceOf(address(vault)), 0, "float drained");
 
-        assertEq(vault.maxRedeem(alice), 0, "maxRedeem 0 when float empty");
+        assertEq(vault.maxRedeem(alice), 0, "maxRedeem 0 when no backing");
     }
 }
 
 /// @dev Adapter whose `positionValue()` reverts. Used to verify the
-///      try/catch backstop in `totalAssets` and `_lpFlowGate` (I-3).
+///      try/catch backstop in `totalAssets` and `_lpFlowGate`.
 contract RevertingAdapter {
     function positionValue() external pure returns (uint256, bool) {
         revert("nope");
+    }
+}
+
+/// @dev Adapter that reports valid NAV but has no `onLiveDeposit` selector.
+///      Models a bespoke (non-BaseStrategy) adapter that ships with
+///      `positionValue()` but forgets the live-deposit hook. Without the
+///      try/catch wrapper in `_deposit`, this would revert every LP deposit
+///      during the active proposal window.
+contract NoOnLiveDepositAdapter {
+    uint256 public mockValue;
+    bool public mockValid;
+
+    function setValue(uint256 v, bool valid_) external {
+        mockValue = v;
+        mockValid = valid_;
+    }
+
+    function positionValue() external view returns (uint256, bool) {
+        return (mockValue, mockValid);
+    }
+    // No `onLiveDeposit` — calls revert with selector-not-found.
+}
+
+/// @dev Adapter whose `onLiveDeposit` reverts. Models a transient upstream
+///      pause / max-deposit cap on a strategy that *does* implement the hook
+///      but is unhealthy right now.
+contract RevertingOnLiveDepositAdapter {
+    uint256 public mockValue;
+    bool public mockValid;
+
+    function setValue(uint256 v, bool valid_) external {
+        mockValue = v;
+        mockValid = valid_;
+    }
+
+    function positionValue() external view returns (uint256, bool) {
+        return (mockValue, mockValid);
+    }
+
+    function onLiveDeposit(uint256) external pure {
+        revert("upstream paused");
     }
 }

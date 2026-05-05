@@ -4,6 +4,7 @@ pragma solidity 0.8.28;
 import {Test} from "forge-std/Test.sol";
 import {SyndicateVault} from "../../src/SyndicateVault.sol";
 import {ISyndicateVault} from "../../src/interfaces/ISyndicateVault.sol";
+import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
@@ -70,16 +71,29 @@ contract VaultRedemptionLockSemanticsTest is Test {
 
     /// @dev Mocks the two governor view selectors used by the vault locks.
     ///      `active` drives `redemptionsLocked()` (Executed); `openCount`
-    ///      drives the MS-H4 deposit lock (Pending..Executed).
+    ///      drives the MS-H4 deposit lock (Pending..Executed). Optional
+    ///      `strategy` parameter (defaults to address(0)) is the address the
+    ///      vault will resolve as `activeStrategyAdapter()` via
+    ///      `getProposal(activePid).strategy`.
     function _mockState(bool active, uint256 openCount) internal {
-        vm.mockCall(
-            MOCK_GOVERNOR,
-            abi.encodeWithSignature("getActiveProposal(address)"),
-            abi.encode(active ? uint256(1) : uint256(0))
-        );
+        _mockStateWithStrategy(active, openCount, address(0));
+    }
+
+    function _mockStateWithStrategy(bool active, uint256 openCount, address strategy) internal {
+        uint256 pid = active ? uint256(1) : uint256(0);
+        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal(address)"), abi.encode(pid));
         vm.mockCall(
             MOCK_GOVERNOR, abi.encodeWithSignature("openProposalCount(address)", address(vault)), abi.encode(openCount)
         );
+        if (active) {
+            ISyndicateGovernor.StrategyProposal memory p;
+            p.id = pid;
+            p.vault = address(vault);
+            p.strategy = strategy;
+            vm.mockCall(
+                MOCK_GOVERNOR, abi.encodeWithSelector(ISyndicateGovernor.getProposal.selector, pid), abi.encode(p)
+            );
+        }
     }
 
     // ──────────────────────── MS-H4: deposit lock during Pending ────────────────────────
@@ -127,13 +141,11 @@ contract VaultRedemptionLockSemanticsTest is Test {
     ///         the `feat/live-nav-async-withdrawals` branch — MS-H4 must NOT
     ///         regress this).
     function test_deposit_allowedDuringExecutedWithLiveNAV() public {
-        // Bind a valid adapter via governor.
+        // Strategy is on the active proposal (governor.getProposal(pid).strategy).
         MockStrategyAdapter adapter = new MockStrategyAdapter();
         adapter.setValue(0, true);
-        vm.prank(MOCK_GOVERNOR);
-        vault.setActiveStrategyAdapter(address(adapter));
 
-        _mockState({active: true, openCount: 1});
+        _mockStateWithStrategy({active: true, openCount: 1, strategy: address(adapter)});
 
         vm.prank(alice);
         uint256 shares = vault.deposit(1_000e6, alice);

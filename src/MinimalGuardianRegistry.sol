@@ -48,6 +48,17 @@ contract MinimalGuardianRegistry {
     /// @notice Permissionless review opener — no-op in beta.
     function openReview(uint256) external pure {}
 
+    /// @notice Governor-only cancel during GuardianReview — no-op in beta
+    ///         because reviews never open. Mirrors the IGuardianRegistry
+    ///         signature so governor's `cancelProposal` GuardianReview branch
+    ///         still compiles against this stub.
+    /// @dev Production `GuardianRegistry.cancelReview` reverts after
+    ///      `reviewEnd` to block proposer-races-resolveReview slashing.
+    ///      The stub has no review state and no slash path, so the post-
+    ///      reviewEnd guard is meaningless here — silent no-op is
+    ///      sufficient and matches the `openReview` no-op above.
+    function cancelReview(uint256) external pure {}
+
     /// @notice Required by the factory's vault-create gate.
     function canCreateVault(address) external pure returns (bool) {
         return true;

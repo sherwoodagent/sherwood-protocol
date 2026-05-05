@@ -109,20 +109,19 @@ contract SyndicateVault is
     /// @notice Per-vault async withdrawal queue (set-once at deploy by the factory).
     address private _withdrawalQueue;
 
-    /// @notice Active strategy adapter (set by the governor on `executeProposal`,
-    ///         cleared on `_finishSettlement`). When non-zero AND the adapter
-    ///         reports `valid=true`, `totalAssets()` adds its `positionValue()`
-    ///         to the float and live deposit/withdraw is unlocked. See
-    ///         `docs/superpowers/specs/2026-04-30-live-nav-async-withdrawals-design.md`.
-    address private _activeStrategyAdapter;
-
     /// @notice Per-proposal sum of asset principal forwarded to the live
     ///         adapter during the proposal's Executed window. Subtracted from
     ///         PnL at `_finishSettlement` so live-deposit principal is not
     ///         counted as strategy profit.
     mapping(uint256 proposalId => uint256) public liveAdapterPrincipal;
 
-    /// @dev Reserved storage for future upgrades (shrunk by 1 for liveAdapterPrincipal)
+    /// @notice Per-proposal sum of asset principal pulled back from the live
+    ///         adapter to fund LP withdrawals during the proposal's Executed
+    ///         window. Added to the PnL snapshot at `_finishSettlement` so a
+    ///         mid-flight LP exit doesn't masquerade as a strategy loss.
+    mapping(uint256 proposalId => uint256) public liveAdapterWithdrawn;
+
+    /// @dev Reserved storage for future upgrades.
     uint256[35] private __gap;
 
     /// @custom:oz-upgrades-unsafe-allow constructor
@@ -412,37 +411,29 @@ contract SyndicateVault is
     }
 
     /// @inheritdoc ISyndicateVault
+    /// @dev Reads through the governor: the strategy is whatever address the
+    ///      proposer set on the active proposal at propose time. Returns
+    ///      `address(0)` outside the active window or for queue-only proposals
+    ///      (proposer passed `address(0)` to `propose`).
     function activeStrategyAdapter() external view returns (address) {
-        return _activeStrategyAdapter;
+        return _activeStrategy();
     }
 
-    /// @inheritdoc ISyndicateVault
-    /// @dev Governor-only. Always overwrites — the proposer can re-bind freely
-    ///      via `governor.bindProposalAdapter` while the proposal is
-    ///      pre-execute. Pass `address(0)` to unbind. The pointer is implicitly
-    ///      ignored after settle because `totalAssets` only reads it while
-    ///      `redemptionsLocked()` returns true (lock-gated read).
-    /// @dev I-3: smoke-test the adapter at bind time. EOA / no-bytecode /
-    ///      reverting `positionValue` / non-IStrategy ABI all surface as
-    ///      `AdapterNotIStrategy`. Runtime backstops in `totalAssets` and
-    ///      `_lpFlowGate` cover post-bind degradation; this rejects obvious
-    ///      mistakes early so the proposer sees a clean error. Lives on the
-    ///      vault rather than the governor: vault is the consumer of the
-    ///      pointer, validation logically belongs here, and the governor
-    ///      is bytecode-pressed — vault has the headroom.
-    function setActiveStrategyAdapter(address adapter) external onlyGovernor {
-        if (adapter != address(0)) {
-            // Low-level staticcall — typed `try IStrategy(adapter).positionValue()`
-            // emits a Solidity extcodesize precheck that reverts outside the
-            // try/catch on EOA targets. Folding EOA detection into a return-size
-            // check (`(uint256, bool)` ABI = 64 bytes) covers EOAs and bad ABIs
-            // in one branch.
-            (bool ok, bytes memory ret) = adapter.staticcall(abi.encodeWithSelector(IStrategy.positionValue.selector));
-            if (!ok || ret.length < 64) revert AdapterNotIStrategy();
+    /// @dev Reads the active proposal's `strategy` field through the governor.
+    ///      Returns `address(0)` when no proposal is active OR when the active
+    ///      proposal opted out of live NAV (proposer passed `strategy=0`).
+    ///      Wrapped in try/catch for `getProposal` because struct-shape drift
+    ///      across pre-V1.5 governors must not brick LP flow.
+    function _activeStrategy() internal view returns (address) {
+        address gov = _getGovernor();
+        if (gov == address(0)) return address(0);
+        uint256 pid = ISyndicateGovernor(gov).getActiveProposal(address(this));
+        if (pid == 0) return address(0);
+        try ISyndicateGovernor(gov).getProposal(pid) returns (ISyndicateGovernor.StrategyProposal memory p) {
+            return p.strategy;
+        } catch {
+            return address(0);
         }
-        _activeStrategyAdapter = adapter;
-        if (adapter == address(0)) emit ActiveStrategyAdapterCleared();
-        else emit ActiveStrategyAdapterSet(adapter);
     }
 
     /// @inheritdoc ISyndicateVault
@@ -519,14 +510,14 @@ contract SyndicateVault is
     ///      is treated as `blocked=true` so a malicious/broken adapter can't
     ///      brick LP flow with an unhandled revert. Pairs with the `totalAssets`
     ///      try/catch fallback below.
-    function _lpFlowGate() private view returns (bool blocked, address liveAdapter) {
-        if (!redemptionsLocked()) return (false, address(0));
-        address adapter = _activeStrategyAdapter;
-        if (adapter == address(0)) return (true, address(0));
-        try IStrategy(adapter).positionValue() returns (uint256, bool valid) {
-            if (valid) return (false, adapter);
+    function _lpFlowGate() private view returns (bool blocked, address liveAdapter, uint256 adapterValue) {
+        if (!redemptionsLocked()) return (false, address(0), 0);
+        address adapter = _activeStrategy();
+        if (adapter == address(0)) return (true, address(0), 0);
+        try IStrategy(adapter).positionValue() returns (uint256 v, bool valid) {
+            if (valid) return (false, adapter, v);
         } catch {}
-        return (true, address(0));
+        return (true, address(0), 0);
     }
 
     /// @dev True while any non-terminal proposal binds the vault
@@ -570,25 +561,26 @@ contract SyndicateVault is
     /// @inheritdoc ERC4626Upgradeable
     /// @dev Aggregates the vault's idle float with the active strategy
     ///      adapter's `positionValue()` when the adapter reports `valid=true`.
-    ///      Lock-gated: the adapter is only read while `redemptionsLocked()` is
-    ///      true (i.e. an active proposal binds the vault). Outside the active
-    ///      window the adapter pointer may be stale from a prior settle, so
-    ///      `totalAssets` falls back to float-only — the implicit clear that
-    ///      lets the governor skip an explicit `clearActiveStrategyAdapter`
-    ///      call (saved bytecode on the governor; see
-    ///      `docs/superpowers/specs/2026-04-30-live-nav-async-withdrawals-design.md`
-    ///      §5 Phase 2 NAV Math).
-    /// @dev I-3: a reverting `positionValue()` falls back to float-only so a
-    ///      malicious or buggy adapter can't brick this view (and every
-    ///      ERC-4626 conversion path that depends on it). The bind-time
-    ///      smoke-test in `setActiveStrategyAdapter` is the first line of
-    ///      defence; this try/catch is the runtime backstop for adapters
-    ///      that degrade after binding (e.g. self-destruct, upgrade to a
-    ///      reverting impl).
+    ///      Lock-gated: the strategy is only resolved while `redemptionsLocked()`
+    ///      is true. Outside the active window `governor.getActiveProposal`
+    ///      returns 0 → `_activeStrategy()` returns `address(0)` →
+    ///      `totalAssets` falls back to float-only. No vault-side cleanup is
+    ///      needed when a proposal settles; the governor clearing
+    ///      `_activeProposal[vault]` is the implicit clear.
+    /// @dev The try/catch on `positionValue()` is the ONLY defence against a
+    ///      malformed strategy bricking this view — V1.5 dropped the bind-time
+    ///      smoke-test that previously rejected non-IStrategy targets at bind
+    ///      time. `propose()` does not validate the `strategy` argument
+    ///      (voters do, by reading the proposal struct and accepting or
+    ///      rejecting the address). Any contract whose `positionValue` reverts
+    ///      or returns malformed data resolves here as float-only — every
+    ///      ERC-4626 conversion path (`previewDeposit` / `convertTo*` /
+    ///      `maxWithdraw`) keeps working regardless of the strategy's health.
     function totalAssets() public view override returns (uint256) {
         uint256 float = IERC20(asset()).balanceOf(address(this));
-        address adapter = _activeStrategyAdapter;
-        if (adapter == address(0) || !redemptionsLocked()) return float;
+        if (!redemptionsLocked()) return float;
+        address adapter = _activeStrategy();
+        if (adapter == address(0)) return float;
         try IStrategy(adapter).positionValue() returns (uint256 value, bool valid) {
             return valid ? float + value : float;
         } catch {
@@ -610,7 +602,7 @@ contract SyndicateVault is
         // strategy they never voted on by the next `executeProposal`. The
         // `liveAdapter == 0` precondition preserves the live-NAV unlock
         // during Executed when the adapter accepts inbound deposits.
-        (bool blocked, address liveAdapter) = _lpFlowGate();
+        (bool blocked, address liveAdapter,) = _lpFlowGate();
         if (liveAdapter == address(0) && (blocked || _depositsLocked())) revert DepositsLocked();
         if (!_openDeposits && !_approvedDepositors.contains(receiver)) revert NotApprovedDepositor();
         super._deposit(caller, receiver, assets, shares);
@@ -625,13 +617,25 @@ contract SyndicateVault is
         // returned a non-zero adapter, so no extra positionValue check is
         // needed here. Push model: transfer the assets to the adapter then
         // call the hook — avoids needing an approve + transferFrom.
+        // try/catch around `onLiveDeposit`: a transient revert (paused
+        // upstream pool, max-deposit cap, momentary oracle staleness, or a
+        // bespoke adapter that didn't implement the hook) must not brick
+        // every LP deposit until settle. The assets were already pushed to
+        // the adapter; track them under principal so they're returned at
+        // settle and not counted as profit. Symmetric with the runtime
+        // try/catches on `positionValue` (totalAssets / _lpFlowGate) and
+        // `onLiveWithdraw` (_withdraw partial-unwind path).
         if (liveAdapter != address(0)) {
             IERC20(asset()).safeTransfer(liveAdapter, assets);
-            IStrategy(liveAdapter).onLiveDeposit(assets);
-            // Forwarded principal is tracked per-proposal so it is not
-            // double-counted as profit at settle (PnL = balance - snapshot,
-            // and `_settle` redeems all positions including this principal).
             uint256 pid = ISyndicateGovernor(_getGovernor()).getActiveProposal(address(this));
+            try IStrategy(liveAdapter).onLiveDeposit(assets) {
+            // Hook accepted — capital is now earning yield.
+            }
+            catch {
+                // Hook unavailable / reverted — capital sits idle on the
+                // adapter, recoverable at settle via `liveAdapterPrincipal`.
+                emit LiveDepositForwardFailed(pid, liveAdapter, assets);
+            }
             liveAdapterPrincipal[pid] += assets;
         }
     }
@@ -640,6 +644,15 @@ contract SyndicateVault is
     ///      ERC4626 invokes them before `_withdraw`). The redundant
     ///      `redemptionsLocked()` check here was dropped to fit live-NAV
     ///      logic under the bytecode budget.
+    /// @dev Live-NAV partial-unwind: when float is short and a live adapter
+    ///      is bound + reporting valid NAV, the vault asks the adapter to
+    ///      free `deficit` of underlying via `onLiveWithdraw`. The
+    ///      authoritative measure is the balance delta — strategies cannot
+    ///      lie about how much they returned. All-or-nothing: anything less
+    ///      than `deficit` reverts and the LP must use the async-redeem
+    ///      queue. The pulled amount is recorded per-proposal so the
+    ///      governor's settlement PnL formula can credit it back into the
+    ///      snapshot (see `liveAdapterWithdrawn` natspec).
     function _withdraw(address caller, address receiver, address _owner, uint256 assets, uint256 shares)
         internal
         override
@@ -649,9 +662,31 @@ contract SyndicateVault is
         if (caller != _withdrawalQueue) {
             uint256 reserve = reservedQueueAssets();
             uint256 float = IERC20(asset()).balanceOf(address(this));
-            if (assets + reserve > float) revert QueueReserveBreached();
+            if (assets + reserve > float) {
+                if (!_pullFromLiveAdapter(assets + reserve - float)) revert QueueReserveBreached();
+            }
         }
         super._withdraw(caller, receiver, _owner, assets, shares);
+    }
+
+    /// @dev Best-effort pull from the bound live-NAV adapter. Returns true
+    ///      iff exactly `needed` (or more) of asset arrived. Records the
+    ///      delta against the active proposal so settlement PnL stays
+    ///      neutral on LP flow. Falls back to false on: not locked, no
+    ///      adapter, adapter reverting, partial fill.
+    function _pullFromLiveAdapter(uint256 needed) private returns (bool) {
+        (bool blocked, address adapter,) = _lpFlowGate();
+        if (blocked || adapter == address(0)) return false;
+        uint256 before = IERC20(asset()).balanceOf(address(this));
+        try IStrategy(adapter).onLiveWithdraw(needed) returns (uint256) {}
+        catch {
+            return false;
+        }
+        uint256 received = IERC20(asset()).balanceOf(address(this)) - before;
+        if (received < needed) return false;
+        uint256 pid = ISyndicateGovernor(_getGovernor()).getActiveProposal(address(this));
+        liveAdapterWithdrawn[pid] += received;
+        return true;
     }
 
     /// @dev Cap visible to integrators so they don't propose withdrawals that
@@ -661,14 +696,17 @@ contract SyndicateVault is
     ///      reserved float belongs to it — capping the queue would block
     ///      `claim()` whenever pending shares dominate supply.
     function maxWithdraw(address owner_) public view override returns (uint256) {
-        (bool blocked,) = _lpFlowGate();
+        (bool blocked, address adapter, uint256 adapterValue) = _lpFlowGate();
         if (paused() || blocked) return 0;
         if (owner_ == _withdrawalQueue) return super.maxWithdraw(owner_);
         uint256 userMax = super.maxWithdraw(owner_);
         uint256 reserve = reservedQueueAssets();
         uint256 float = IERC20(asset()).balanceOf(address(this));
-        if (float <= reserve) return 0;
-        uint256 available = float - reserve;
+        uint256 available = float > reserve ? float - reserve : 0;
+        // Live-NAV branch: cap also includes the adapter's reported position
+        // value (already fetched by `_lpFlowGate` via the same staticcall —
+        // reuse it instead of issuing a second positionValue call).
+        if (adapter != address(0)) available += adapterValue;
         return userMax > available ? available : userMax;
     }
 
@@ -686,7 +724,7 @@ contract SyndicateVault is
     ///      so the returned share count corresponds to assets actually backable
     ///      by float at the current NAV.
     function maxRedeem(address owner_) public view override returns (uint256) {
-        (bool blocked,) = _lpFlowGate();
+        (bool blocked, address adapter, uint256 adapterValue) = _lpFlowGate();
         if (paused() || blocked) return 0;
         if (owner_ == _withdrawalQueue) return super.maxRedeem(owner_);
         uint256 userMax = super.maxRedeem(owner_);
@@ -694,13 +732,16 @@ contract SyndicateVault is
         uint256 ts = totalSupply();
         if (ts == 0 || reserveShares >= ts) return 0;
         uint256 availableShares = ts - reserveShares;
-        // EIP-4626 conformance: redeem(maxRedeem(user), ...) must succeed even
-        // when float has been forwarded to the live-NAV adapter. Cap by the
-        // shares actually backable by available float.
+        // EIP-4626 conformance: redeem(maxRedeem(user), ...) must succeed
+        // even when float has been forwarded to the live-NAV adapter. Cap
+        // by float plus the adapter's already-fetched positionValue (reused
+        // from `_lpFlowGate` — no second staticcall).
         uint256 reserve = reservedQueueAssets();
         uint256 float = IERC20(asset()).balanceOf(address(this));
-        if (float <= reserve) return 0;
-        uint256 floatShares = convertToShares(float - reserve);
+        uint256 backingAssets = float > reserve ? float - reserve : 0;
+        if (adapter != address(0)) backingAssets += adapterValue;
+        if (backingAssets == 0) return 0;
+        uint256 floatShares = convertToShares(backingAssets);
         if (floatShares < availableShares) availableShares = floatShares;
         return userMax > availableShares ? availableShares : userMax;
     }

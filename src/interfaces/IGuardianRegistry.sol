@@ -126,6 +126,15 @@ interface IGuardianRegistry {
     function cancelEmergency(uint256 proposalId) external;
     function finalizeEmergency(uint256 proposalId) external returns (bool blocked, BatchExecutorLib.Call[] memory calls);
 
+    /// @notice Governor-only: invalidate an open guardian review when the
+    ///         proposer cancels the underlying proposal during
+    ///         GuardianReview. Marks the review resolved as not-blocked so a
+    ///         subsequent permissionless `resolveReview` cannot still slash
+    ///         approvers. Mirrors `cancelEmergency` for the standard review
+    ///         path. Idempotent on already-resolved reviews. Reverts after
+    ///         `reviewEnd` to prevent cancel-after-block-quorum bypass.
+    function cancelReview(uint256 proposalId) external;
+
     // ── Views (emergency) ──
     function isEmergencyOpen(uint256 proposalId) external view returns (bool);
 

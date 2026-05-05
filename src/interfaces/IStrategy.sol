@@ -79,6 +79,37 @@ interface IStrategy {
     /// @dev    `onlyVault` enforced by `BaseStrategy`. Default impl in
     ///         `BaseStrategy` is a no-op for strategies that cannot route
     ///         mid-position capital (Mamo, Venice, off-chain).
+    /// @dev    **MANDATORY for any contract passed as the `strategy` field on
+    ///         a proposal.** The vault calls this unguarded after pushing the
+    ///         deposited assets to the strategy. A strategy whose
+    ///         `positionValue()` returns `valid=true` but that lacks a
+    ///         non-reverting `onLiveDeposit` implementation will revert every
+    ///         LP deposit during its `Executed` window. A no-op override is
+    ///         sufficient if the strategy cannot route the capital — assets
+    ///         then sit idle on the strategy and are reclaimed at settle via
+    ///         the `liveAdapterPrincipal[pid]` accounting on the vault.
+    ///         Inheriting `BaseStrategy` satisfies this requirement by default.
     /// @param  assets Amount of vault asset just deposited.
     function onLiveDeposit(uint256 assets) external;
+
+    /// @notice Vault hook: called from `vault._withdraw` when an LP exit
+    ///         during the active proposal exceeds the vault's idle float.
+    ///         Optional — strategies that cannot partial-unwind on demand
+    ///         inherit the `BaseStrategy` default which returns 0.
+    ///
+    ///         All-or-nothing semantics: the vault verifies the asset
+    ///         balance delta and reverts the entire LP withdraw if less
+    ///         than `assetsNeeded` arrived. The LP then falls back to the
+    ///         async-redeem queue, which always works while the vault is
+    ///         locked and pays out at settle.
+    /// @dev    `onlyVault` enforced by `BaseStrategy`. The strategy MUST
+    ///         transfer the underlying asset directly to `msg.sender` (the
+    ///         vault) before returning — the vault does not call
+    ///         `transferFrom`.
+    /// @param  assetsNeeded Shortfall the vault wants pulled back, in
+    ///                      asset units.
+    /// @return assetsReturned Self-reported amount transferred. The vault
+    ///                        ignores this and uses its own balance delta
+    ///                        as the authoritative measure.
+    function onLiveWithdraw(uint256 assetsNeeded) external returns (uint256 assetsReturned);
 }

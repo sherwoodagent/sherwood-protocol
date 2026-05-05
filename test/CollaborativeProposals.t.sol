@@ -154,7 +154,14 @@ contract CollaborativeProposalsTest is Test {
 
         vm.prank(leadAgent);
         proposalId = governor.propose(
-            address(vault), "ipfs://collab", 2000, 7 days, _simpleExecuteCalls(), _simpleSettlementCalls(), coProps
+            address(vault),
+            address(0),
+            "ipfs://collab",
+            2000,
+            7 days,
+            _simpleExecuteCalls(),
+            _simpleSettlementCalls(),
+            coProps
         );
     }
 
@@ -190,6 +197,7 @@ contract CollaborativeProposalsTest is Test {
         vm.prank(leadAgent);
         uint256 proposalId = governor.propose(
             address(vault),
+            address(0),
             "ipfs://solo",
             1500,
             7 days,
@@ -209,6 +217,7 @@ contract CollaborativeProposalsTest is Test {
         vm.prank(leadAgent);
         uint256 proposalId = governor.propose(
             address(vault),
+            address(0),
             "ipfs://solo",
             1500,
             7 days,
@@ -416,7 +425,14 @@ contract CollaborativeProposalsTest is Test {
 
         vm.prank(leadAgent);
         uint256 proposalId = governor.propose(
-            address(vault), "ipfs://round", 2000, 7 days, _simpleExecuteCalls(), _simpleSettlementCalls(), coProps
+            address(vault),
+            address(0),
+            "ipfs://round",
+            2000,
+            7 days,
+            _simpleExecuteCalls(),
+            _simpleSettlementCalls(),
+            coProps
         );
 
         vm.prank(coAgent1);
@@ -480,7 +496,14 @@ contract CollaborativeProposalsTest is Test {
 
         vm.prank(leadAgent);
         uint256 proposalId = governor.propose(
-            address(vault), "ipfs://tiny", 2000, 7 days, _simpleExecuteCalls(), _simpleSettlementCalls(), coProps
+            address(vault),
+            address(0),
+            "ipfs://tiny",
+            2000,
+            7 days,
+            _simpleExecuteCalls(),
+            _simpleSettlementCalls(),
+            coProps
         );
         vm.prank(coAgent1);
         governor.approveCollaboration(proposalId);
@@ -558,7 +581,14 @@ contract CollaborativeProposalsTest is Test {
         vm.prank(leadAgent);
         vm.expectRevert(ISyndicateGovernor.LeadSplitTooLow.selector);
         governor.propose(
-            address(vault), "ipfs://test", 2000, 7 days, _simpleExecuteCalls(), _simpleSettlementCalls(), coProps
+            address(vault),
+            address(0),
+            "ipfs://test",
+            2000,
+            7 days,
+            _simpleExecuteCalls(),
+            _simpleSettlementCalls(),
+            coProps
         );
     }
 
@@ -569,7 +599,14 @@ contract CollaborativeProposalsTest is Test {
         vm.prank(leadAgent);
         vm.expectRevert(ISyndicateGovernor.SplitTooLow.selector);
         governor.propose(
-            address(vault), "ipfs://test", 2000, 7 days, _simpleExecuteCalls(), _simpleSettlementCalls(), coProps
+            address(vault),
+            address(0),
+            "ipfs://test",
+            2000,
+            7 days,
+            _simpleExecuteCalls(),
+            _simpleSettlementCalls(),
+            coProps
         );
     }
 
@@ -596,7 +633,14 @@ contract CollaborativeProposalsTest is Test {
         vm.prank(leadAgent);
         vm.expectRevert(ISyndicateGovernor.TooManyCoProposers.selector);
         governor.propose(
-            address(vault), "ipfs://test", 2000, 7 days, _simpleExecuteCalls(), _simpleSettlementCalls(), coProps
+            address(vault),
+            address(0),
+            "ipfs://test",
+            2000,
+            7 days,
+            _simpleExecuteCalls(),
+            _simpleSettlementCalls(),
+            coProps
         );
     }
 
@@ -607,7 +651,14 @@ contract CollaborativeProposalsTest is Test {
         vm.prank(leadAgent);
         vm.expectRevert(ISyndicateGovernor.NotRegisteredAgent.selector);
         governor.propose(
-            address(vault), "ipfs://test", 2000, 7 days, _simpleExecuteCalls(), _simpleSettlementCalls(), coProps
+            address(vault),
+            address(0),
+            "ipfs://test",
+            2000,
+            7 days,
+            _simpleExecuteCalls(),
+            _simpleSettlementCalls(),
+            coProps
         );
     }
 
@@ -619,7 +670,14 @@ contract CollaborativeProposalsTest is Test {
         vm.prank(leadAgent);
         vm.expectRevert(ISyndicateGovernor.DuplicateCoProposer.selector);
         governor.propose(
-            address(vault), "ipfs://test", 2000, 7 days, _simpleExecuteCalls(), _simpleSettlementCalls(), coProps
+            address(vault),
+            address(0),
+            "ipfs://test",
+            2000,
+            7 days,
+            _simpleExecuteCalls(),
+            _simpleSettlementCalls(),
+            coProps
         );
     }
 }

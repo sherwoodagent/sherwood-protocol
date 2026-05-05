@@ -123,6 +123,7 @@ contract ExecuteByBoundaryTest is Test {
         vm.prank(agent);
         proposalId = governor.propose(
             address(vault),
+            address(0),
             "ipfs://boundary",
             2000,
             7 days,

@@ -208,6 +208,7 @@ contract VaultSolvencyHandler is Test {
         vm.prank(leadAgent);
         uint256 proposalId = governor.propose(
             address(vault),
+            address(0),
             "ipfs://test",
             perfFeeBps,
             strategyDuration,

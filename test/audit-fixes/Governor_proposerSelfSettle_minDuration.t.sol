@@ -129,6 +129,7 @@ contract Governor_proposerSelfSettle_minDuration_Test is Test {
         vm.prank(agent);
         pid = governor.propose(
             address(vault),
+            address(0),
             "ipfs://self-settle",
             2000,
             STRATEGY_DURATION,

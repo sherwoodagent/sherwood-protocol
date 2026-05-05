@@ -49,4 +49,17 @@ contract MockRegistryMinimal {
     /// @dev V2: stub so governor unit tests compile. Never called when
     ///      `isEmergencyOpen` returns false.
     function cancelEmergency(uint256) external pure {}
+
+    /// @notice Tracks calls so cancel-during-GuardianReview tests can assert
+    ///         the governor invokes the registry hook on proposer cancel.
+    uint256 public cancelReviewCallCount;
+    uint256 public lastCancelledProposalId;
+
+    /// @dev Called by the governor when the proposer cancels during
+    ///      `GuardianReview`. Production registry rejects this after
+    ///      `reviewEnd`; the mock unconditionally records the call.
+    function cancelReview(uint256 proposalId) external {
+        cancelReviewCallCount++;
+        lastCancelledProposalId = proposalId;
+    }
 }

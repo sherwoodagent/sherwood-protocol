@@ -136,7 +136,14 @@ contract SyndicateGovernorIntegrationTest is Test {
     ) internal returns (uint256 proposalId) {
         vm.prank(agent);
         proposalId = governor.propose(
-            address(vault), "ipfs://test", feeBps, duration, executeCalls, settlementCalls, _emptyCoProposers()
+            address(vault),
+            address(0),
+            "ipfs://test",
+            feeBps,
+            duration,
+            executeCalls,
+            settlementCalls,
+            _emptyCoProposers()
         );
         // via_ir-safe: use vm.getBlockTimestamp() so the IR optimizer can't reorder
         // block.timestamp reads across vm.warp cheatcodes
@@ -211,8 +218,9 @@ contract SyndicateGovernorIntegrationTest is Test {
         });
 
         vm.prank(agent);
-        uint256 proposalId =
-            governor.propose(address(vault), "ipfs://test", 1500, 7 days, execCalls, settleCalls, _emptyCoProposers());
+        uint256 proposalId = governor.propose(
+            address(vault), address(0), "ipfs://test", 1500, 7 days, execCalls, settleCalls, _emptyCoProposers()
+        );
         vm.warp(block.timestamp + 1);
 
         // Both vote against -- triggers veto threshold

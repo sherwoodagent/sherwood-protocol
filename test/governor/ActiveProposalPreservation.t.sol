@@ -202,8 +202,9 @@ contract ActiveProposalPreservationTest is Test {
 
     function _propose(string memory uri) internal returns (uint256 proposalId) {
         vm.prank(agent);
-        proposalId =
-            governor.propose(address(vault), uri, 1000, 7 days, _execCalls(), _settleCalls(), _emptyCoProposers());
+        proposalId = governor.propose(
+            address(vault), address(0), uri, 1000, 7 days, _execCalls(), _settleCalls(), _emptyCoProposers()
+        );
     }
 
     function _voteFor(uint256 pid) internal {
@@ -265,7 +266,9 @@ contract ActiveProposalPreservationTest is Test {
         // Attempt to create a second proposal on the same vault — must revert.
         vm.prank(agent);
         vm.expectRevert(ISyndicateGovernor.VaultHasOpenProposal.selector);
-        governor.propose(address(vault), "ipfs://B", 1000, 7 days, _execCalls(), _settleCalls(), _emptyCoProposers());
+        governor.propose(
+            address(vault), address(0), "ipfs://B", 1000, 7 days, _execCalls(), _settleCalls(), _emptyCoProposers()
+        );
 
         // A remains live, pointer untouched.
         _assertAStillLive(pidA);
@@ -280,7 +283,9 @@ contract ActiveProposalPreservationTest is Test {
 
         vm.prank(agent);
         vm.expectRevert(ISyndicateGovernor.VaultHasOpenProposal.selector);
-        governor.propose(address(vault), "ipfs://B", 1000, 7 days, _execCalls(), _settleCalls(), _emptyCoProposers());
+        governor.propose(
+            address(vault), address(0), "ipfs://B", 1000, 7 days, _execCalls(), _settleCalls(), _emptyCoProposers()
+        );
 
         _assertAStillLive(pidA);
     }
@@ -293,7 +298,9 @@ contract ActiveProposalPreservationTest is Test {
 
         vm.prank(agent);
         vm.expectRevert(ISyndicateGovernor.VaultHasOpenProposal.selector);
-        governor.propose(address(vault), "ipfs://B", 1000, 7 days, _execCalls(), _settleCalls(), _emptyCoProposers());
+        governor.propose(
+            address(vault), address(0), "ipfs://B", 1000, 7 days, _execCalls(), _settleCalls(), _emptyCoProposers()
+        );
 
         _assertAStillLive(pidA);
     }

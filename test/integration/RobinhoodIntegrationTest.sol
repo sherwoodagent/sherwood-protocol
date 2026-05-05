@@ -148,7 +148,7 @@ abstract contract RobinhoodIntegrationTest is Test {
     ) internal returns (uint256 proposalId) {
         vm.prank(agent);
         proposalId = governor.propose(
-            address(vault), "ipfs://rh-test", feeBps, duration, execCalls, settleCalls, _emptyCoProposers()
+            address(vault), address(0), "ipfs://rh-test", feeBps, duration, execCalls, settleCalls, _emptyCoProposers()
         );
 
         vm.warp(block.timestamp + 1);

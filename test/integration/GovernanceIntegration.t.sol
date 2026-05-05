@@ -68,6 +68,7 @@ contract GovernanceIntegrationTest is BaseIntegrationTest {
         vm.prank(agent);
         uint256 proposalId = governor.propose(
             address(vault),
+            address(0),
             "ipfs://veto-test",
             PERF_FEE_BPS,
             STRATEGY_DURATION,
@@ -106,6 +107,7 @@ contract GovernanceIntegrationTest is BaseIntegrationTest {
         vm.prank(agent);
         uint256 proposalId = governor.propose(
             address(vault),
+            address(0),
             "ipfs://reject-test",
             PERF_FEE_BPS,
             STRATEGY_DURATION,
@@ -172,7 +174,14 @@ contract GovernanceIntegrationTest is BaseIntegrationTest {
         // Propose
         vm.prank(agent);
         uint256 pid2 = governor.propose(
-            address(vault), "ipfs://cooldown-test", PERF_FEE_BPS, STRATEGY_DURATION, exec2, settle2, _emptyCoProposers()
+            address(vault),
+            address(0),
+            "ipfs://cooldown-test",
+            PERF_FEE_BPS,
+            STRATEGY_DURATION,
+            exec2,
+            settle2,
+            _emptyCoProposers()
         );
 
         // Warp 1 second for snapshot

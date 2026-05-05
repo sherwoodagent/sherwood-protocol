@@ -156,7 +156,7 @@ abstract contract BaseIntegrationTest is Test {
         // Agent proposes
         vm.prank(agent);
         proposalId = governor.propose(
-            address(vault), "ipfs://test", feeBps, duration, execCalls, settleCalls, _emptyCoProposers()
+            address(vault), address(0), "ipfs://test", feeBps, duration, execCalls, settleCalls, _emptyCoProposers()
         );
 
         // Warp 1 second so snapshot timestamp is in the past

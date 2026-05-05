@@ -137,6 +137,7 @@ contract SyndicateGovernorTest is Test {
         vm.prank(agent);
         proposalId = governor.propose(
             address(vault),
+            address(0),
             "ipfs://test",
             perfFeeBps,
             duration,
@@ -197,8 +198,6 @@ contract SyndicateGovernorTest is Test {
         assertEq(execCalls.length, 1);
         BatchExecutorLib.Call[] memory settleCalls = governor.getSettlementCalls(proposalId);
         assertEq(settleCalls.length, 1);
-        BatchExecutorLib.Call[] memory allCalls = governor.getProposalCalls(proposalId);
-        assertEq(allCalls.length, 2);
     }
 
     function test_propose_notRegisteredAgent_reverts() public {
@@ -206,6 +205,7 @@ contract SyndicateGovernorTest is Test {
         vm.expectRevert(ISyndicateGovernor.NotRegisteredAgent.selector);
         governor.propose(
             address(vault),
+            address(0),
             "ipfs://test",
             1500,
             7 days,
@@ -220,6 +220,7 @@ contract SyndicateGovernorTest is Test {
         vm.expectRevert(ISyndicateGovernor.VaultNotRegistered.selector);
         governor.propose(
             makeAddr("fakeVault"),
+            address(0),
             "ipfs://test",
             1500,
             7 days,
@@ -234,6 +235,7 @@ contract SyndicateGovernorTest is Test {
         vm.expectRevert(ISyndicateGovernor.PerformanceFeeTooHigh.selector);
         governor.propose(
             address(vault),
+            address(0),
             "ipfs://test",
             MAX_PERF_FEE_BPS + 1,
             7 days,
@@ -248,6 +250,7 @@ contract SyndicateGovernorTest is Test {
         vm.expectRevert(ISyndicateGovernor.StrategyDurationTooLong.selector);
         governor.propose(
             address(vault),
+            address(0),
             "ipfs://test",
             1500,
             MAX_STRATEGY_DURATION + 1,
@@ -262,6 +265,7 @@ contract SyndicateGovernorTest is Test {
         vm.expectRevert(ISyndicateGovernor.StrategyDurationTooShort.selector);
         governor.propose(
             address(vault),
+            address(0),
             "ipfs://test",
             1500,
             30 minutes,
@@ -276,7 +280,14 @@ contract SyndicateGovernorTest is Test {
         vm.prank(agent);
         vm.expectRevert(ISyndicateGovernor.EmptyExecuteCalls.selector);
         governor.propose(
-            address(vault), "ipfs://test", 1500, 7 days, empty, _simpleSettlementCalls(), _emptyCoProposers()
+            address(vault),
+            address(0),
+            "ipfs://test",
+            1500,
+            7 days,
+            empty,
+            _simpleSettlementCalls(),
+            _emptyCoProposers()
         );
     }
 
@@ -284,7 +295,9 @@ contract SyndicateGovernorTest is Test {
         BatchExecutorLib.Call[] memory empty = new BatchExecutorLib.Call[](0);
         vm.prank(agent);
         vm.expectRevert(ISyndicateGovernor.EmptySettlementCalls.selector);
-        governor.propose(address(vault), "ipfs://test", 1500, 7 days, _simpleExecuteCalls(), empty, _emptyCoProposers());
+        governor.propose(
+            address(vault), address(0), "ipfs://test", 1500, 7 days, _simpleExecuteCalls(), empty, _emptyCoProposers()
+        );
     }
 
     /// @notice G-C1: propose() stamps snapshot at block.timestamp - 1 so any
@@ -296,6 +309,7 @@ contract SyndicateGovernorTest is Test {
         vm.prank(agent);
         governor.propose(
             address(vault),
+            address(0),
             "ipfs://test",
             1500,
             7 days,
@@ -328,6 +342,7 @@ contract SyndicateGovernorTest is Test {
         vm.prank(agent);
         uint256 proposalId = governor.propose(
             address(vault),
+            address(0),
             "ipfs://test",
             1500,
             7 days,
@@ -448,6 +463,7 @@ contract SyndicateGovernorTest is Test {
         vm.expectRevert(ISyndicateGovernor.VaultHasOpenProposal.selector);
         governor.propose(
             address(vault),
+            address(0),
             "ipfs://dup",
             1500,
             7 days,

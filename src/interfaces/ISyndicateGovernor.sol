@@ -58,6 +58,11 @@ interface ISyndicateGovernor {
         uint256 id;
         address proposer;
         address vault;
+        /// @notice Address of the strategy contract whose `positionValue()` the
+        ///         vault polls during the active strategy window for live NAV.
+        ///         Set at propose time; immutable thereafter. Pass `address(0)`
+        ///         at propose to opt out of live NAV (queue-only behavior).
+        address strategy;
         string metadataURI;
         uint256 performanceFeeBps;
         uint256 strategyDuration;
@@ -175,13 +180,6 @@ interface ISyndicateGovernor {
 
     error InvalidGuardianFeeBps();
 
-    /// @notice Revert if `bindProposalAdapter` is called once the proposal has
-    ///         passed the pre-execute window (Executed / Settled / Rejected /
-    ///         Cancelled / Expired). Pre-execute the binding is mutable; after
-    ///         that point the vault binding is either already locked-in or
-    ///         meaningless.
-    error AdapterBindingClosed();
-
     // ── Events ──
 
     event ProposalCreated(
@@ -255,11 +253,6 @@ interface ISyndicateGovernor {
     // ── Parameter change event (owner-instant, no queue/cancel) ──
     event ParameterChangeFinalized(bytes32 indexed paramKey, uint256 oldValue, uint256 newValue);
 
-    /// @notice Emitted when the proposer binds (or unbinds, with `address(0)`)
-    ///         an `IStrategy` adapter on the proposal's vault. The vault setter
-    ///         is invoked synchronously from `bindProposalAdapter`.
-    event ProposalAdapterBound(uint256 indexed proposalId, address indexed adapter);
-
     /// @notice Emitted in `_distributeFees` when `guardianFeeBps > 0`.
     ///         Guardian fee is carved from gross PnL and transferred to
     ///         `recipient` (the GuardianRegistry).
@@ -285,8 +278,24 @@ interface ISyndicateGovernor {
 
     // ── Functions ──
 
+    /// @notice Submit a strategy proposal for `vault`. The optional `strategy`
+    ///         parameter is the contract whose `positionValue()` the vault
+    ///         polls for live NAV during the active strategy window. Pass
+    ///         `address(0)` to opt out of live NAV (queue-only behavior).
+    /// @dev    **`strategy` requirements when non-zero.** The address must be
+    ///         a contract that implements the full `IStrategy` interface. In
+    ///         particular `onLiveDeposit(uint256)` MUST exist and not revert
+    ///         on a normal call from the vault — the vault forwards LP
+    ///         deposits via this hook unguarded during the proposal's
+    ///         `Executed` window, and a missing or reverting hook silently
+    ///         bricks every LP deposit until settle. Inheriting `BaseStrategy`
+    ///         satisfies this requirement by default; bespoke adapters must
+    ///         provide at minimum a no-op override. The strategy is set
+    ///         immutably at propose time — voters approve based on this
+    ///         address, and there is no later bind / rebind path.
     function propose(
         address vault,
+        address strategy,
         string calldata metadataURI,
         uint256 performanceFeeBps,
         uint256 strategyDuration,
@@ -300,17 +309,6 @@ interface ISyndicateGovernor {
     function executeProposal(uint256 proposalId) external;
 
     function settleProposal(uint256 proposalId) external;
-
-    /// @notice Bind an `IStrategy` adapter on the proposal's vault so
-    ///         `totalAssets` aggregates live position value during the active
-    ///         strategy window. After settle, the vault's `redemptionsLocked()`
-    ///         short-circuit silently ignores any stale pointer (implicit clear).
-    /// @dev Callable only by the proposer, only while the proposal is in a
-    ///      pre-execute state (Draft / Pending / GuardianReview / Approved).
-    ///      Re-binding is allowed within that window — the vault setter
-    ///      always overwrites. Pass `address(0)` to unbind. Once the proposal
-    ///      reaches Executed (or terminal), reverts with `AdapterBindingClosed`.
-    function bindProposalAdapter(uint256 proposalId, address adapter) external;
 
     // ── Guardian-review emergency settle lifecycle ──
     // Owner-driven paths: `unstick` (pre-committed calls) or
@@ -359,7 +357,6 @@ interface ISyndicateGovernor {
 
     function getProposal(uint256 proposalId) external view returns (StrategyProposal memory);
     function getProposalState(uint256 proposalId) external view returns (ProposalState);
-    function getProposalCalls(uint256 proposalId) external view returns (BatchExecutorLib.Call[] memory);
     function getExecuteCalls(uint256 proposalId) external view returns (BatchExecutorLib.Call[] memory);
     function getSettlementCalls(uint256 proposalId) external view returns (BatchExecutorLib.Call[] memory);
     function getVoteWeight(uint256 proposalId, address voter) external view returns (uint256);

@@ -1079,10 +1079,16 @@ contract GuardianRegistry is IGuardianRegistry, OwnableUpgradeable, UUPSUpgradea
     }
 
     /// @dev Stores emergency calls in storage, replacing any prior array.
+    ///      The storage-array reference and the calldata length are cached
+    ///      outside the loop so the legacy compiler pipeline (forge coverage,
+    ///      no via_ir) doesn't trip stack-too-deep on the per-iteration
+    ///      mapping derivation + calldata struct copy.
     function _storeEmergencyCalls(uint256 proposalId, BatchExecutorLib.Call[] calldata calls) private {
         delete _emergencyCalls[proposalId];
-        for (uint256 i; i < calls.length;) {
-            _emergencyCalls[proposalId].push(calls[i]);
+        BatchExecutorLib.Call[] storage stored = _emergencyCalls[proposalId];
+        uint256 n = calls.length;
+        for (uint256 i; i < n;) {
+            stored.push(calls[i]);
             unchecked {
                 ++i;
             }
@@ -1115,6 +1121,25 @@ contract GuardianRegistry is IGuardianRegistry, OwnableUpgradeable, UUPSUpgradea
     function isEmergencyOpen(uint256 proposalId) external view returns (bool) {
         EmergencyReview storage er = _emergencyReviews[proposalId];
         return er.reviewEnd > 0 && !er.resolved;
+    }
+
+    /// @inheritdoc IGuardianRegistry
+    /// @dev Mirrors `cancelEmergency` for the standard `_reviews` path. Closes
+    ///      the review by stamping `resolved=true, blocked=false` so an
+    ///      after-the-fact `resolveReview` cannot still slash approvers when
+    ///      the proposer abandoned the proposal mid-review. Reverts after
+    ///      `reviewEnd` (proposer no longer has an out — must face resolution).
+    function cancelReview(uint256 proposalId) external onlyGovernor {
+        Review storage r = _reviews[proposalId];
+        if (r.resolved) return; // idempotent
+        // Reject after the review window has closed: the proposer has had the
+        // entire window to bail out; permitting cancel after `reviewEnd` would
+        // let the proposer race a pending `resolveReview` slash.
+        uint256 ve = IGovernorMinimal(governor).getProposalView(proposalId).reviewEnd;
+        if (ve > 0 && block.timestamp >= ve) revert ReviewNotOpen();
+        r.resolved = true;
+        r.blocked = false;
+        emit ReviewResolved(proposalId, false, 0);
     }
 
     // ── Permissionless ──
@@ -1216,41 +1241,48 @@ contract GuardianRegistry is IGuardianRegistry, OwnableUpgradeable, UUPSUpgradea
     ///      `wood.transfer(BURN, total)`. If the transfer reverts or returns
     ///      false, the amount is queued in `_pendingBurn[address(this)]` for
     ///      retry via `flushBurn`.
+    /// @dev Per-approver slash logic extracted from the `_slashApprovers`
+    ///      loop body to keep that function's stack frame shallow under
+    ///      the legacy compiler pipeline (forge coverage, no via_ir).
+    ///      Returns the amount actually slashed from `approver` (zero if
+    ///      no live stake or snapshot was zero).
+    function _slashOneApprover(uint256 proposalId, address approver) private returns (uint256 amt) {
+        Guardian storage gs = _guardians[approver];
+        uint256 live = gs.stakedAmount;
+        if (live == 0) return 0;
+        uint256 snapshot = uint256(_voteStake[proposalId][approver]);
+        // Clamp: snapshot should never exceed live stake, but if it does
+        // (e.g. guardian partially slashed by a concurrent proposal that
+        // resolved first), take only what's there.
+        amt = snapshot <= live ? snapshot : live;
+        if (amt == 0) return 0;
+        // forge-lint: disable-next-line(unchecked-cast)
+        gs.stakedAmount = uint128(live - amt);
+        // If the approver was still active (hadn't requested unstake), the
+        // aggregate counter includes their stake → remove the slashed
+        // amount from totalGuardianStake. If they'd already requested
+        // unstake, `totalGuardianStake` was already decremented at
+        // request time.
+        if (gs.unstakeRequestedAt == 0) {
+            totalGuardianStake -= amt;
+            // Checkpoint the post-slash votable stake. Only when the
+            // approver was still active; if unstake was requested they
+            // were already at 0-votable and the checkpoint push already
+            // happened in requestUnstakeGuardian.
+            _stakeCheckpoints[approver].push(uint32(block.timestamp), uint224(gs.stakedAmount));
+        } else if (gs.stakedAmount == 0) {
+            // Defense in depth: a fully-slashed guardian keeps no stake
+            // — there's nothing for cancelUnstake to restore, so clear
+            // the timestamp too.
+            gs.unstakeRequestedAt = 0;
+        }
+    }
+
     function _slashApprovers(uint256 proposalId) private returns (uint256 total) {
         address[] storage approvers = _approvers[proposalId];
         uint256 n = approvers.length;
         for (uint256 i = 0; i < n; i++) {
-            address a = approvers[i];
-            Guardian storage gs = _guardians[a];
-            uint256 live = gs.stakedAmount;
-            if (live == 0) continue;
-            uint256 snapshot = uint256(_voteStake[proposalId][a]);
-            // Clamp: snapshot should never exceed live stake, but if it does
-            // (e.g. guardian partially slashed by a concurrent proposal that
-            // resolved first), take only what's there.
-            uint256 amt = snapshot <= live ? snapshot : live;
-            if (amt == 0) continue;
-            total += amt;
-            // forge-lint: disable-next-line(unchecked-cast)
-            gs.stakedAmount = uint128(live - amt);
-            // If the approver was still active (hadn't requested unstake), the
-            // aggregate counter includes their stake → remove the slashed
-            // amount from totalGuardianStake. If they'd already requested
-            // unstake, `totalGuardianStake` was already decremented at
-            // request time.
-            if (gs.unstakeRequestedAt == 0) {
-                totalGuardianStake -= amt;
-                // Checkpoint the post-slash votable stake. Only when the
-                // approver was still active; if unstake was requested they
-                // were already at 0-votable and the checkpoint push already
-                // happened in requestUnstakeGuardian.
-                _stakeCheckpoints[a].push(uint32(block.timestamp), uint224(gs.stakedAmount));
-            } else if (gs.stakedAmount == 0) {
-                // Defense in depth: a fully-slashed guardian keeps no stake
-                // — there's nothing for cancelUnstake to restore, so clear
-                // the timestamp too.
-                gs.unstakeRequestedAt = 0;
-            }
+            total += _slashOneApprover(proposalId, approvers[i]);
         }
 
         if (total == 0) return 0;

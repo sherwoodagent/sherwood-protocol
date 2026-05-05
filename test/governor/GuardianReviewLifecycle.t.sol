@@ -215,7 +215,14 @@ contract GuardianReviewLifecycleTest is Test {
     function _propose() internal returns (uint256 proposalId) {
         vm.prank(agent);
         proposalId = governor.propose(
-            address(vault), "ipfs://review-lifecycle", 1000, 7 days, _execCalls(), _settleCalls(), _emptyCoProposers()
+            address(vault),
+            address(0),
+            "ipfs://review-lifecycle",
+            1000,
+            7 days,
+            _execCalls(),
+            _settleCalls(),
+            _emptyCoProposers()
         );
     }
 
