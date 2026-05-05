@@ -8,6 +8,7 @@ import {SyndicateVault} from "../../src/SyndicateVault.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Vm} from "forge-std/Vm.sol";
+import {MockAccountMarginSummaryPrecompile} from "../mocks/MockAccountMarginSummaryPrecompile.sol";
 
 /**
  * @title HyperliquidGridFork
@@ -188,6 +189,68 @@ contract HyperliquidGridForkTest is HyperEVMIntegrationTest {
         vm.prank(lp1);
         uint256 lp1Got = vault.redeem(lp1Shares, lp1, lp1);
         assertGt(lp1Got, 0, "lp1 redeems non-zero (proportional to remaining)");
+    }
+
+    /// @notice Verifies that _settle() reads the AccountMarginSummary precompile and sends
+    ///         a class transfer with that exact amount — not type(uint64).max.
+    ///
+    ///         On a real HyperEVM fork the precompile exists at 0x080F. The test strategy
+    ///         address has 0 equity on HyperCore (it was never registered), so normally the
+    ///         class transfer is a no-op. We vm.etch a mock precompile to simulate a funded
+    ///         perp account and confirm the exact amount reaches the CoreWriter.
+    function test_settle_classTransferUsesPrecompileEquity() public {
+        address clone = _cloneAndInit(hyperliquidGridTemplate, _initData());
+        HyperliquidGridStrategy strategy = HyperliquidGridStrategy(clone);
+        (BatchExecutorLib.Call[] memory exec, BatchExecutorLib.Call[] memory settle) = _execAndSettleCalls(clone);
+        uint256 proposalId = _proposeVoteApprove(exec, settle, 1000, DURATION);
+
+        // Etch mock precompile at 0x080F to simulate 48,500 USDC perp equity
+        // (DEPOSIT minus simulated trading fees and slippage).
+        address precompileAddr = 0x000000000000000000000000000000000000080F;
+        MockAccountMarginSummaryPrecompile mock = new MockAccountMarginSummaryPrecompile();
+        vm.etch(precompileAddr, address(mock).code);
+        int64 equity = int64(int256(uint256(48_500e6)));
+        MockAccountMarginSummaryPrecompile(precompileAddr).setSummary(equity, 0, 0, 0);
+
+        // Settle the proposal — _initiateClassTransfer() should read equity and
+        // emit a RawAction with ACTION_USD_CLASS_TRANSFER + (48_500e6, false).
+        vm.warp(block.timestamp + DURATION + 1);
+        vm.recordLogs();
+        governor.settleProposal(proposalId);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+
+        (bool found, uint64 ntl, bool toPerp) = _decodeClassTransfer(logs);
+        assertTrue(found, "class transfer RawAction not found");
+        assertEq(ntl, uint64(equity), "class transfer amount must match precompile equity");
+        assertFalse(toPerp, "toPerp must be false (perp->spot)");
+
+        // initiateReturn() — simulate residual after IOC slippage
+        MockAccountMarginSummaryPrecompile(precompileAddr).setSummary(int64(int256(uint256(300e6))), 0, 0, 0);
+        vm.recordLogs();
+        strategy.initiateReturn();
+        (bool found2, uint64 ntl2,) = _decodeClassTransfer(vm.getRecordedLogs());
+        assertTrue(found2, "initiateReturn must emit a class transfer");
+        assertEq(ntl2, uint64(300e6), "initiateReturn amount must match updated precompile equity");
+    }
+
+    // ── Helpers ──
+
+    bytes4 constant CLASS_TRANSFER_ACTION = 0x01000007;
+
+    function _decodeClassTransfer(Vm.Log[] memory logs) internal pure returns (bool found, uint64 ntl, bool toPerp) {
+        bytes32 sig = keccak256("RawAction(address,bytes)");
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].emitter != CORE_WRITER) continue;
+            if (logs[i].topics[0] != sig) continue;
+            bytes memory raw = abi.decode(logs[i].data, (bytes));
+            if (raw.length < 4 || bytes4(raw) != CLASS_TRANSFER_ACTION) continue;
+            bytes memory payload = new bytes(raw.length - 4);
+            for (uint256 j = 0; j < payload.length; j++) {
+                payload[j] = raw[j + 4];
+            }
+            (ntl, toPerp) = abi.decode(payload, (uint64, bool));
+            return (true, ntl, toPerp);
+        }
     }
 
     function _gridOrder(uint32 ai, bool isBuy, uint64 px, uint64 sz, uint128 cloid)
