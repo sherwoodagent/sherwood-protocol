@@ -103,6 +103,8 @@ contract HyperliquidPerpStrategy is BaseStrategy {
     ///         bridge) has been triggered. Set by `initiateReturn()` (proposer
     ///         pre-settle) or by `_settle()` defensively. Idempotent.
     bool public returnsInitiated;
+    /// @notice Block number of the last `recoverHcResiduals()` call. See grid.
+    uint256 public lastRecoverBlock;
     /// @dev Cumulative USDC pushed back to the vault across all sweepToVault() calls.
     ///      Off-chain accounting only — does not gate withdrawals.
     uint256 public cumulativeSwept;
@@ -366,7 +368,9 @@ contract HyperliquidPerpStrategy is BaseStrategy {
     ///         See `HyperliquidGridStrategy.initiateReturn` for full rationale.
     /// @dev    Auth: proposer always; anyone after proposal duration expired.
     /// @dev    HYPE GAS: spot→EVM consumes HC HYPE. Proposer must fund the
-    ///         strategy's HC HYPE balance for the bridge to succeed.
+    ///         strategy's HC HYPE balance for the bridge to succeed. If
+    ///         HYPE is missing pre-settle, retry via `initiateReturn()`
+    ///         after funding; post-settle, retry via `recoverHcResiduals()`.
     function initiateReturn() external {
         if (_state != State.Executed) revert NotExecuted();
         if (returnsInitiated) return;
@@ -385,8 +389,10 @@ contract HyperliquidPerpStrategy is BaseStrategy {
 
     /// @dev Cancel stop-loss, force-close all traded assets (or fall back to
     ///      `perpAssetIndex` for legacy single-asset proposals), and queue
-    ///      perp→spot + spot→EVM bridges. Used by both `initiateReturn`
-    ///      (path 1) and `_settle` (path 2 defensive fallback).
+    ///      perp→spot + spot→EVM bridges. Three callers:
+    ///      - `initiateReturn` (path 1, proposer pre-settle)
+    ///      - `_settle` (path 2 defensive fallback when path 1 was skipped)
+    ///      - `recoverHcResiduals` (post-settle retry for HC residuals)
     function _drainHC() internal {
         _cancelCurrentStopLoss();
 
@@ -419,6 +425,10 @@ contract HyperliquidPerpStrategy is BaseStrategy {
     ///         vault). Repeatable.
     function recoverHcResiduals() external {
         if (!settled) revert NotSweepable();
+        // Same-block idempotence — see grid. SPOT_BALANCE precompile is
+        // pre-block; same-block re-calls would queue duplicate bridges.
+        if (block.number == lastRecoverBlock) return;
+        lastRecoverBlock = block.number;
         _drainHC();
     }
 

@@ -652,11 +652,13 @@ contract HyperliquidGridStrategyTest is Test {
     function test_recoverHcResiduals_refiresDrainPostSettle() public {
         // After settle, residual HC margin (e.g. from IOC slippage) can be
         // recovered by re-firing the drain via this permissionless entrypoint.
+        // Roll one block past settle so the same-block gate doesn't suppress.
         _execAndPrep();
         MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
         m.setSummary(int64(int256(uint256(9_800e6))), uint64(0), 0, 0);
         vm.prank(vault);
         strategy.settle();
+        vm.roll(block.number + 1);
 
         // Simulate residual perp margin appearing after settle (e.g. IOC fill
         // releasing locked margin) and confirm a re-fire emits a fresh class
@@ -677,10 +679,28 @@ contract HyperliquidGridStrategyTest is Test {
         m.setSummary(int64(int256(uint256(1_000e6))), uint64(0), 0, 0);
         vm.prank(vault);
         strategy.settle();
+        vm.roll(block.number + 1);
 
         m.setSummary(int64(int256(uint256(50e6))), uint64(0), 0, 0);
         vm.prank(attacker);
         strategy.recoverHcResiduals(); // should not revert
+    }
+
+    function test_recoverHcResiduals_sameBlockGateSkips() public {
+        // Same-block re-calls are silently skipped to prevent duplicate
+        // spot→EVM bridge actions reading the same pre-block SPOT_BALANCE.
+        _execAndPrep();
+        MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
+        m.setSummary(int64(int256(uint256(9_800e6))), uint64(0), 0, 0);
+        vm.prank(vault);
+        strategy.settle();
+        vm.roll(block.number + 1);
+
+        m.setSummary(int64(int256(uint256(200e6))), uint64(0), 0, 0);
+        strategy.recoverHcResiduals(); // first call: fires
+        vm.recordLogs();
+        strategy.recoverHcResiduals(); // same-block second call: skipped
+        assertEq(_countClassTransferLogs(vm.getRecordedLogs()), 0, "same-block re-call must not re-fire");
     }
 
     function test_initiateReturn_drainsHcOnPath1() public {

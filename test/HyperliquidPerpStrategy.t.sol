@@ -402,6 +402,37 @@ contract HyperliquidPerpStrategyTest is Test {
         strategy.sweepToVault();
     }
 
+    // ==================== RECOVER HC RESIDUALS ====================
+
+    function test_recoverHcResiduals_revertsBeforeSettle() public {
+        // Path-1 / path-2 separation: recoverHcResiduals must not run while
+        // the strategy is still Executed (would conflict with initiateReturn).
+        _executeFirst();
+        vm.expectRevert(HyperliquidPerpStrategy.NotSweepable.selector);
+        strategy.recoverHcResiduals();
+    }
+
+    function test_recoverHcResiduals_permissionlessPostSettle() public {
+        // Anyone can call after settle. Funds only flow to strategy/vault,
+        // so no diversion is possible.
+        _settleFirst();
+        vm.roll(block.number + 1);
+        vm.prank(attacker);
+        strategy.recoverHcResiduals(); // should not revert
+    }
+
+    function test_recoverHcResiduals_sameBlockGateSkips() public {
+        // Same-block re-call is suppressed by the lastRecoverBlock gate to
+        // prevent duplicate spot→EVM bridge actions reading the same
+        // pre-block SPOT_BALANCE.
+        _settleFirst();
+        vm.roll(block.number + 1);
+        strategy.recoverHcResiduals(); // first call sets lastRecoverBlock
+        uint256 lastBlock = strategy.lastRecoverBlock();
+        strategy.recoverHcResiduals(); // same-block second call skipped
+        assertEq(strategy.lastRecoverBlock(), lastBlock, "lastRecoverBlock must not change on same-block re-call");
+    }
+
     function test_sweepToVault_repeatable() public {
         _settleFirst();
         _burnStrategyBalance();

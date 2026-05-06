@@ -107,6 +107,12 @@ contract HyperliquidGridStrategy is BaseStrategy {
     ///         spot→EVM bridge) has been triggered. Set by `initiateReturn()`
     ///         (proposer pre-settle) or by `_settle()` defensively. Idempotent.
     bool public returnsInitiated;
+    /// @notice Block number of the last `recoverHcResiduals()` call. Same-
+    ///         block re-calls are skipped to avoid HC double-queueing the
+    ///         spot→EVM bridge for an amount that the precompile read sees
+    ///         twice (`SPOT_BALANCE` returns pre-block state). Cross-block
+    ///         retries see freshly-processed state and resume normally.
+    uint256 public lastRecoverBlock;
 
     /// @notice CLOIDs of resting GTC grid orders, tracked per asset. Maintained
     ///         on-chain so `_settle` can self-cancel without keeper assistance.
@@ -360,8 +366,9 @@ contract HyperliquidGridStrategy is BaseStrategy {
     ///         the spot→EVM leg consumes HC HYPE. The PROPOSER MUST FUND the
     ///         strategy's HC HYPE balance before `_execute` (or before this
     ///         call) so the bridge action lands on HC. If HYPE is absent,
-    ///         spot→EVM no-ops and USDC stays on HC spot — recovery is a
-    ///         HYPE-funded retry of `initiateReturn()`.
+    ///         spot→EVM no-ops and USDC stays on HC spot — pre-settle
+    ///         recovery is a HYPE-funded retry of `initiateReturn()`;
+    ///         post-settle recovery is `recoverHcResiduals()`.
     function initiateReturn() external {
         if (_state != State.Executed) revert NotExecuted();
         if (returnsInitiated) return;
@@ -379,8 +386,10 @@ contract HyperliquidGridStrategy is BaseStrategy {
     }
 
     /// @dev Cancel resting orders, force-close all positions, and queue
-    ///      perp→spot + spot→EVM bridges. Used by both `initiateReturn`
-    ///      (path 1) and `_settle` (path 2 defensive fallback).
+    ///      perp→spot + spot→EVM bridges. Three callers:
+    ///      - `initiateReturn` (path 1, proposer pre-settle)
+    ///      - `_settle` (path 2 defensive fallback when path 1 was skipped)
+    ///      - `recoverHcResiduals` (post-settle retry for HC residuals)
     function _drainHC() internal {
         for (uint256 i = 0; i < assetIndices.length; i++) {
             uint32 ai = assetIndices[i];
@@ -418,6 +427,12 @@ contract HyperliquidGridStrategy is BaseStrategy {
     ///         strategy is a cheap-ish no-op (only cancel-loop SLOADs).
     function recoverHcResiduals() external {
         if (!settled) revert NotSweepable();
+        // Same-block idempotence: SPOT_BALANCE precompile returns pre-block
+        // state, so a second call in the same block would queue another
+        // spot→EVM bridge for the same amount. Wait for the next block to
+        // see HC's processed state.
+        if (block.number == lastRecoverBlock) return;
+        lastRecoverBlock = block.number;
         _drainHC();
     }
 
