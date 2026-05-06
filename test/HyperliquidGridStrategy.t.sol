@@ -63,12 +63,14 @@ contract HyperliquidGridStrategyTest is Test {
         assertTrue(strategy.isAssetWhitelisted(ETH_ASSET));
         assertTrue(strategy.isAssetWhitelisted(SOL_ASSET));
         assertFalse(strategy.isAssetWhitelisted(99));
-        // HC registration is NOT done at init — finalizeForHyperCore must be
-        // called separately after initialize() with FinalizeVariant.Create.
+        // hyperCoreFinalized is set by finalizeForHyperCore(), not by initialize().
         assertFalse(strategy.hyperCoreFinalized());
+        // _hcSelf (slot 0) is written to address(this) during initialize() so HC
+        // FirstStorageSlot registration reads the correct value post-block.
+        assertEq(address(uint160(uint256(vm.load(address(strategy), bytes32(0))))), address(strategy));
     }
 
-    function test_initialize_doesNotFinalizeHyperCore() public {
+    function test_initialize_setsHcSelfSlot() public {
         address payable rawClone = payable(Clones.clone(address(template)));
         HyperliquidGridStrategy s = HyperliquidGridStrategy(rawClone);
 
@@ -78,6 +80,8 @@ contract HyperliquidGridStrategyTest is Test {
         s.initialize(vault, proposer, initData);
 
         assertFalse(s.hyperCoreFinalized());
+        // Slot 0 (_hcSelf) must equal the clone's own address after init.
+        assertEq(address(uint160(uint256(vm.load(address(s), bytes32(0))))), address(s));
     }
 
     function test_finalizeForHyperCore_setsFlag() public {
@@ -90,9 +94,9 @@ contract HyperliquidGridStrategyTest is Test {
         s.initialize(vault, proposer, initData);
 
         vm.expectEmit(true, true, true, true, address(s));
-        emit HyperliquidGridStrategy.HyperCoreFinalized(0, FinalizeVariant.Create, 1684);
+        emit HyperliquidGridStrategy.HyperCoreFinalized(0, FinalizeVariant.FirstStorageSlot, 0);
         vm.prank(proposer);
-        s.finalizeForHyperCore(0, FinalizeVariant.Create, 1684);
+        s.finalizeForHyperCore(0, FinalizeVariant.FirstStorageSlot, 0);
 
         assertTrue(s.hyperCoreFinalized());
     }
@@ -422,6 +426,18 @@ contract HyperliquidGridStrategyTest is Test {
         (uint256 value, bool valid) = strategy.positionValue();
         assertTrue(valid);
         assertEq(value, 0);
+    }
+
+    // When HC reports accountValue == 0 (in-transit: USDC pulled from vault but
+    // not yet credited to HC spot), positionValue() falls back to the EVM balance
+    // so totalAssets() doesn't drop to 0 for one block after execute().
+    function test_positionValue_inTransitFallback() public {
+        _execAndPrep(); // strategy holds DEPOSIT USDC (MockCoreWriter doesn't move it)
+        MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
+        m.setSummary(int64(0), 0, 0, 0); // HC reports zero (in-transit)
+        (uint256 value, bool valid) = strategy.positionValue();
+        assertTrue(valid);
+        assertEq(value, DEPOSIT); // EVM balance used as placeholder
     }
 
     function test_positionValue_invalidWhenPrecompileMissing() public {

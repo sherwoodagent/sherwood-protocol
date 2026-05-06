@@ -42,6 +42,11 @@ abstract contract BaseStrategy is IStrategy {
         Settled
     }
 
+    // slot 0: reserved for HyperCore FirstStorageSlot registration.
+    // HyperliquidGridStrategy._initialize() writes address(this) here so HC
+    // reads slot 0 post-block and confirms it equals the contract address.
+    // Other strategies leave this as address(0) — no functional impact.
+    address internal _hcSelf;
     address private _vault;
     address private _proposer;
     State internal _state;

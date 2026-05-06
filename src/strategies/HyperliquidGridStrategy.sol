@@ -31,11 +31,11 @@ import {L1Read, Position, SpotBalance, AccountMarginSummary} from "../hyperliqui
  *   accept deposits / withdrawals while the proposal is active.
  *
  *   HyperCore note: ERC-1167 clone addresses need explicit HC registration
- *   before ERC-20 USDC transfers auto-credit HC spot. The CLI calls
- *   `finalizeForHyperCore(0, FinalizeVariant.Create, deployerNonce)` as a
- *   separate tx immediately after `initialize()`. HC verifies the clone via
- *   CREATE address derivation (keccak256(rlp(deployer, nonce))) from its own
- *   EVM history — no storage manipulation needed.
+ *   before ERC-20 USDC transfers auto-credit HC spot. `_initialize()` writes
+ *   `address(this)` to slot 0 (`_hcSelf` from BaseStrategy). The CLI then
+ *   calls `finalizeForHyperCore(0, FinalizeVariant.FirstStorageSlot, 0)` as
+ *   a separate tx. HC reads slot 0 post-block, confirms it equals the
+ *   contract address, and completes registration.
  */
 contract HyperliquidGridStrategy is BaseStrategy {
     using SafeERC20 for IERC20;
@@ -140,23 +140,11 @@ contract HyperliquidGridStrategy is BaseStrategy {
             isAssetWhitelisted[ai] = true;
         }
 
-        // HC registration is intentionally NOT done here.
-        //
-        // ICoreWriter.sendRawAction emits a RawAction event that HyperCore
-        // processes asynchronously — after the EVM block completes. The
-        // slot-0 swap trick (swap _vault → address(this), fire finalize,
-        // restore) was written assuming HC reads slot 0 at call time, but HC
-        // reads it from the post-block state, where the slot has already been
-        // restored to _vault. The clone ends up registered under the vault's
-        // address, not its own, so USDC auto-credits never land and
-        // _execute() reverts with HyperCoreSpotCreditFailed.
-        //
-        // Correct path: FinalizeVariant.Create — HC verifies
-        //   keccak256(rlp(deployer, createNonce)) == address(this)
-        // using its own EVM state history; no storage read is needed.
-        // The CLI calls finalizeForHyperCore(0, Create, deployerNonce) as a
-        // separate tx immediately after initialize(). hyperCoreFinalized is
-        // set to true there, not here.
+        // Stamp slot 0 with address(this) for HC FirstStorageSlot registration.
+        // HC processes RawActions post-block; by the time it reads slot 0 to
+        // verify the finalizeForHyperCore call (sent in a separate tx after
+        // initialize), this value is already stably set.
+        _hcSelf = address(this);
     }
 
     /**
@@ -164,18 +152,18 @@ contract HyperliquidGridStrategy is BaseStrategy {
      *         auto-credit the HC spot account. MUST be called once after
      *         `initialize()` and before the proposal that triggers `_execute()`.
      *
-     *         For ERC-1167 clones deployed via the SyndicateFactory CLI:
-     *           finalizeForHyperCore(0, FinalizeVariant.Create, deployerNonce)
-     *         HC verifies keccak256(rlp(deployer, createNonce)) == address(this)
-     *         using its own EVM history — no storage manipulation needed.
+     *         Standard call for SyndicateFactory CLI clones:
+     *           finalizeForHyperCore(0, FinalizeVariant.FirstStorageSlot, 0)
+     *         `_initialize()` already wrote `address(this)` to slot 0 (`_hcSelf`).
+     *         HC reads slot 0 post-block, confirms it equals the contract address,
+     *         and completes registration — no nonce math required.
      *
      * @param token        HyperCore token index (USDC = 0).
      * @param variant      Deployment-method variant:
-     *                       Create (0)            — ERC-1167 clone (use this)
-     *                       FirstStorageSlot (1)  — contract whose slot 0 == address(this)
+     *                       Create (0)            — plain CREATE, pass deployer nonce
+     *                       FirstStorageSlot (1)  — slot 0 == address(this) (use this)
      *                       CustomStorageSlot (2) — UUPS / custom proxy
-     * @param createNonce  Deployer nonce at clone creation time
-     *                     (only used for the Create variant; pass 0 otherwise).
+     * @param createNonce  Deployer nonce (only used for the Create variant; pass 0 otherwise).
      */
     function finalizeForHyperCore(uint64 token, FinalizeVariant variant, uint64 createNonce) external onlyProposer {
         L1Write.sendFinalizeEvmContract(token, variant, createNonce);
@@ -439,8 +427,13 @@ contract HyperliquidGridStrategy is BaseStrategy {
     ///      check `ret.length`), `valid=false` and the vault falls back to
     ///      queue-only behavior. Negative equity (severely underwater) returns
     ///      `(0, true)` rather than reverting — share-price math should clamp,
-    ///      not blow up. EVM-side stranded USDC is not added here because the
-    ///      Executed-state invariant is "all vault funds parked on HC".
+    ///      not blow up.
+    ///
+    ///      When HC reports zero equity, EVM USDC balance is used as a fallback.
+    ///      This covers the in-transit window between `_pullFromVault` (sync) and
+    ///      the HC spot credit (async, processed post-block by HC). Without this,
+    ///      `totalAssets()` drops to 0 for one block on every execute, causing
+    ///      the app to show `Position Value: 0` and a spurious -100% delta.
     function _positionValue() internal view override returns (uint256, bool) {
         (bool success, bytes memory ret) = L1Read.ACCOUNT_MARGIN_SUMMARY_PRECOMPILE_ADDRESS
         .staticcall{gas: L1Read.ACCOUNT_MARGIN_SUMMARY_GAS}(
@@ -448,7 +441,13 @@ contract HyperliquidGridStrategy is BaseStrategy {
         );
         if (!success || ret.length < 128) return (0, false);
         AccountMarginSummary memory s = abi.decode(ret, (AccountMarginSummary));
-        if (s.accountValue <= 0) return (0, true);
+        if (s.accountValue < 0) return (0, true); // clamp: severely underwater
+        if (s.accountValue == 0) {
+            // In-transit fallback: USDC pulled from vault but not yet credited
+            // to HC spot (HC credits are async, post-block). Return EVM balance
+            // so totalAssets() stays stable during that one-block window.
+            return (IERC20(asset).balanceOf(address(this)), true);
+        }
         return (uint256(int256(s.accountValue)), true);
     }
 }
