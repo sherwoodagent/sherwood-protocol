@@ -8,8 +8,6 @@ import {BaseStrategy} from "../src/strategies/BaseStrategy.sol";
 import {MockCoreWriter} from "./mocks/MockCoreWriter.sol";
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 import {FinalizeVariant} from "../src/hyperliquid/L1Write.sol";
-import {MockSpotBalancePrecompile} from "./mocks/MockSpotBalancePrecompile.sol";
-import {MockSpotBalanceCrediting} from "./mocks/MockSpotBalanceCrediting.sol";
 import {MockAccountMarginSummaryPrecompile} from "./mocks/MockAccountMarginSummaryPrecompile.sol";
 
 contract HyperliquidGridStrategyTest is Test {
@@ -65,26 +63,38 @@ contract HyperliquidGridStrategyTest is Test {
         assertTrue(strategy.isAssetWhitelisted(ETH_ASSET));
         assertTrue(strategy.isAssetWhitelisted(SOL_ASSET));
         assertFalse(strategy.isAssetWhitelisted(99));
-        // HC finalize runs during initialize via the slot-0 swap.
-        assertTrue(strategy.hyperCoreFinalized());
+        // HC registration is NOT done at init — finalizeForHyperCore must be
+        // called separately after initialize() with FinalizeVariant.Create.
+        assertFalse(strategy.hyperCoreFinalized());
     }
 
-    function test_initialize_finalizesForHyperCore_atInitTime() public {
+    function test_initialize_doesNotFinalizeHyperCore() public {
         address payable rawClone = payable(Clones.clone(address(template)));
         HyperliquidGridStrategy s = HyperliquidGridStrategy(rawClone);
-        assertFalse(s.hyperCoreFinalized());
 
         uint32[] memory assets = new uint32[](1);
         assets[0] = BTC_ASSET;
         bytes memory initData = abi.encode(address(usdc), DEPOSIT, LEVERAGE, MAX_ORDER_SIZE, MAX_ORDERS, assets);
-
-        vm.expectEmit(true, true, true, true, address(s));
-        emit HyperliquidGridStrategy.HyperCoreFinalized(0, FinalizeVariant.FirstStorageSlot, 0);
         s.initialize(vault, proposer, initData);
 
+        assertFalse(s.hyperCoreFinalized());
+    }
+
+    function test_finalizeForHyperCore_setsFlag() public {
+        address payable rawClone = payable(Clones.clone(address(template)));
+        HyperliquidGridStrategy s = HyperliquidGridStrategy(rawClone);
+
+        uint32[] memory assets = new uint32[](1);
+        assets[0] = BTC_ASSET;
+        bytes memory initData = abi.encode(address(usdc), DEPOSIT, LEVERAGE, MAX_ORDER_SIZE, MAX_ORDERS, assets);
+        s.initialize(vault, proposer, initData);
+
+        vm.expectEmit(true, true, true, true, address(s));
+        emit HyperliquidGridStrategy.HyperCoreFinalized(0, FinalizeVariant.Create, 1684);
+        vm.prank(proposer);
+        s.finalizeForHyperCore(0, FinalizeVariant.Create, 1684);
+
         assertTrue(s.hyperCoreFinalized());
-        bytes32 slot0 = vm.load(address(s), bytes32(uint256(0)));
-        assertEq(address(uint160(uint256(slot0))), vault, "slot 0 must be restored to _vault");
     }
 
     function test_execute_pullsUsdcAndParksMargin() public {
@@ -229,9 +239,8 @@ contract HyperliquidGridStrategyTest is Test {
     // ── HyperCore finalization ──
 
     function test_finalizeForHyperCore_emitsAndForwardsToL1Write() public {
-        // init already finalized with default variant; an additional proposer
-        // call (e.g. registering a non-USDC token) still emits and updates.
-        assertTrue(strategy.hyperCoreFinalized());
+        // init does NOT finalize; proposer must call explicitly.
+        assertFalse(strategy.hyperCoreFinalized());
         vm.expectEmit(true, true, true, true, address(strategy));
         emit HyperliquidGridStrategy.HyperCoreFinalized(7, FinalizeVariant.CustomStorageSlot, 42);
         vm.prank(proposer);
@@ -246,10 +255,8 @@ contract HyperliquidGridStrategyTest is Test {
     }
 
     function test_execute_emitsNoFinalize_sinceInitAlreadyDidIt() public {
-        // Auto-finalize moved from _execute to _initialize via the slot-0
-        // swap, so executing the proposal must NOT fire any
-        // HyperCoreFinalized event (init already did, and there is no
-        // self-heal path left).
+        // _execute must NOT fire HyperCoreFinalized — registration is
+        // the proposer's responsibility via finalizeForHyperCore, not execute.
         vm.recordLogs();
         vm.prank(vault);
         strategy.execute();
@@ -261,40 +268,6 @@ contract HyperliquidGridStrategyTest is Test {
                 "_execute must not fire HyperCoreFinalized; init owns that"
             );
         }
-    }
-
-    function test_execute_succeedsWhenHyperCoreSpotIsCredited() public {
-        // Etch a stateful mock at the HC spot-balance precompile that mirrors
-        // the strategy's USDC balance into HC spot (scaled 6→8 decimals). Pre-pull
-        // reads 0; post-pull reads DEPOSIT * 100, which exceeds ntl=DEPOSIT — so
-        // the spot-credit gate must NOT revert.
-        MockSpotBalanceCrediting m = new MockSpotBalanceCrediting();
-        vm.etch(0x0000000000000000000000000000000000000801, address(m).code);
-        // Seed the etched contract's slot 0 with the USDC address so `fallback`
-        // can read balanceOf via the live token.
-        vm.store(
-            0x0000000000000000000000000000000000000801, bytes32(uint256(0)), bytes32(uint256(uint160(address(usdc))))
-        );
-
-        uint256 vaultBefore = usdc.balanceOf(vault);
-        vm.prank(vault);
-        strategy.execute();
-        assertEq(usdc.balanceOf(vault), vaultBefore - DEPOSIT);
-        assertEq(usdc.balanceOf(address(strategy)), DEPOSIT);
-    }
-
-    function test_execute_revertsWhenHyperCoreSpotNotCredited() public {
-        MockSpotBalancePrecompile spot = new MockSpotBalancePrecompile();
-        spot.setSpot(0, 0, 0);
-        vm.etch(0x0000000000000000000000000000000000000801, address(spot).code);
-
-        vm.prank(vault);
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                HyperliquidGridStrategy.HyperCoreSpotCreditFailed.selector, uint64(0), uint64(0), uint64(DEPOSIT)
-            )
-        );
-        strategy.execute();
     }
 
     function test_sweepToVault_repeatableForPartialArrivals() public {

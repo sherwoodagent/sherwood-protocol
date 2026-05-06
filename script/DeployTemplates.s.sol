@@ -152,12 +152,11 @@ contract DeployTemplates is ScriptBase {
                 console.log("  Skipped  HyperliquidPerpStrategy:  %s (already deployed)", t.hyperliquid);
             }
 
-            // Grid template carries the slot-0 swap finalize fix (init-time HC
-            // FirstStorageSlot registration). Existing clones of a pre-fix
-            // template cannot be retroactively repaired — set
-            // `FORCE_GRID_REDEPLOY=1` to redeploy the template without
-            // hand-editing chains/999.json. Defaults to false so normal runs
-            // remain idempotent.
+            // Grid template uses post-init HC registration: after cloning,
+            // the CLI calls finalizeForHyperCore(0, Create, deployerNonce).
+            // Set `FORCE_GRID_REDEPLOY=1` to redeploy the template without
+            // hand-editing chains/{chainId}.json. Defaults to false so normal
+            // runs remain idempotent.
             bool forceGridRedeploy = vm.envOr("FORCE_GRID_REDEPLOY", false);
             if (_needsDeploy(t.hyperliquidGrid) || forceGridRedeploy) {
                 if (t.hyperliquidGrid != address(0) && t.hyperliquidGrid.code.length > 0) {
@@ -169,7 +168,7 @@ contract DeployTemplates is ScriptBase {
                     console.log("  Stale    HyperliquidGridStrategy:  %s (no code, redeploying)", t.hyperliquidGrid);
                 }
                 t.hyperliquidGrid = address(new HyperliquidGridStrategy());
-                console.log("  Deployed HyperliquidGridStrategy:  %s (slot-0 swap finalize)", t.hyperliquidGrid);
+                console.log("  Deployed HyperliquidGridStrategy:  %s (post-init Create finalize)", t.hyperliquidGrid);
                 anyDeployed = true;
             } else {
                 console.log("  Skipped  HyperliquidGridStrategy:  %s (already deployed)", t.hyperliquidGrid);

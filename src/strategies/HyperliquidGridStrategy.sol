@@ -30,21 +30,12 @@ import {L1Read, Position, SpotBalance, AccountMarginSummary} from "../hyperliqui
  *   L1Read.accountMarginSummary, so the vault can mark shares to market and
  *   accept deposits / withdrawals while the proposal is active.
  *
- *   HyperCore note: contract addresses (unlike EOAs) need explicit
- *   registration before bridged-token transfers auto-credit HC spot.
- *   `_initialize` finalizes the clone with HC using `FirstStorageSlot` by
- *   transiently swapping slot 0 (which `BaseStrategy.initialize` has just
- *   set to `_vault`) to `address(this)`, firing the precompile, then
- *   restoring the original `_vault` value. HC only reads slot 0 once at
- *   finalize time, so the swap is invisible to subsequent vault reads.
- *   This closes the slot-0-mismatch bug where ERC-1167 clones registered
- *   with the *vault* address (a UUPS proxy contract, not the strategy)
- *   and HC silently rejected USDC auto-credits, surfacing as
- *   `HyperCoreSpotCreditFailed` at execute time.
- *
- *   For non-default deployments (non-USDC tokens, alternate variants), the
- *   proposer can still call `finalizeForHyperCore(...)` post-init to fire
- *   an additional registration with custom params.
+ *   HyperCore note: ERC-1167 clone addresses need explicit HC registration
+ *   before ERC-20 USDC transfers auto-credit HC spot. The CLI calls
+ *   `finalizeForHyperCore(0, FinalizeVariant.Create, deployerNonce)` as a
+ *   separate tx immediately after `initialize()`. HC verifies the clone via
+ *   CREATE address derivation (keccak256(rlp(deployer, nonce))) from its own
+ *   EVM history — no storage manipulation needed.
  */
 contract HyperliquidGridStrategy is BaseStrategy {
     using SafeERC20 for IERC20;
@@ -66,7 +57,6 @@ contract HyperliquidGridStrategy is BaseStrategy {
     error TooManyOrders(uint256 actual, uint256 max);
     error OrderTooLarge(uint256 actual, uint256 max);
     error AssetNotWhitelisted(uint32 asset);
-    error HyperCoreSpotCreditFailed(uint64 spotBefore, uint64 spotAfter, uint64 expectedIncrease);
 
     // ── Action types ──
     uint8 constant ACTION_PLACE_GRID = 1;
@@ -93,9 +83,10 @@ contract HyperliquidGridStrategy is BaseStrategy {
     bool public settled;
     uint256 public cumulativeSwept;
     /// @notice True once this contract has been registered with HyperCore so
-    ///         bridged-token transfers auto-credit HC spot. Set by either the
-    ///         explicit `finalizeForHyperCore` proposer call, or the implicit
-    ///         self-heal in `_execute()` on first run.
+    ///         bridged-token transfers auto-credit HC spot. Set only by
+    ///         `finalizeForHyperCore`, which the CLI auto-calls in a separate
+    ///         tx immediately after `initialize()` (see
+    ///         `cli/src/commands/strategy-template.ts`).
     bool public hyperCoreFinalized;
 
     /// @notice CLOIDs of resting GTC grid orders, tracked per asset. Maintained
@@ -149,45 +140,42 @@ contract HyperliquidGridStrategy is BaseStrategy {
             isAssetWhitelisted[ai] = true;
         }
 
-        // HC FirstStorageSlot finalize: transiently swap slot 0 from `_vault`
-        // (just written by BaseStrategy.initialize) to `address(this)` so HC's
-        // self-attestation check passes, then restore. HC reads slot 0 once at
-        // finalize time and registration is permanent — the post-restore value
-        // is irrelevant to HC. Done at init (not execute) so the registration
-        // is in place before the first proposal opens; eliminates the silent
-        // mismatch that surfaced as HyperCoreSpotCreditFailed on prop #6.
-        bytes32 saved;
-        assembly {
-            saved := sload(0)
-            sstore(0, address())
-        }
-        L1Write.sendFinalizeEvmContract(0, FinalizeVariant.FirstStorageSlot, 0);
-        assembly {
-            sstore(0, saved)
-        }
-        hyperCoreFinalized = true;
-        emit HyperCoreFinalized(0, FinalizeVariant.FirstStorageSlot, 0);
+        // HC registration is intentionally NOT done here.
+        //
+        // ICoreWriter.sendRawAction emits a RawAction event that HyperCore
+        // processes asynchronously — after the EVM block completes. The
+        // slot-0 swap trick (swap _vault → address(this), fire finalize,
+        // restore) was written assuming HC reads slot 0 at call time, but HC
+        // reads it from the post-block state, where the slot has already been
+        // restored to _vault. The clone ends up registered under the vault's
+        // address, not its own, so USDC auto-credits never land and
+        // _execute() reverts with HyperCoreSpotCreditFailed.
+        //
+        // Correct path: FinalizeVariant.Create — HC verifies
+        //   keccak256(rlp(deployer, createNonce)) == address(this)
+        // using its own EVM state history; no storage read is needed.
+        // The CLI calls finalizeForHyperCore(0, Create, deployerNonce) as a
+        // separate tx immediately after initialize(). hyperCoreFinalized is
+        // set to true there, not here.
     }
 
     /**
-     * @notice Override the default HyperCore finalization with non-default
-     *         variant/token/createNonce. **Optional** — `_execute()` will
-     *         self-heal on first run using safe defaults
-     *         (`token=0`, `FirstStorageSlot`, `createNonce=0`) suitable for
-     *         the canonical SyndicateFactory ERC-1167 clone case.
+     * @notice Register this clone with HyperCore so that USDC ERC-20 transfers
+     *         auto-credit the HC spot account. MUST be called once after
+     *         `initialize()` and before the proposal that triggers `_execute()`.
      *
-     *         Call this BEFORE the proposal that triggers `_execute()` only
-     *         if the deployment method differs from the default (e.g. plain
-     *         CREATE or a custom storage layout) or if a non-USDC token
-     *         needs to be finalized.
+     *         For ERC-1167 clones deployed via the SyndicateFactory CLI:
+     *           finalizeForHyperCore(0, FinalizeVariant.Create, deployerNonce)
+     *         HC verifies keccak256(rlp(deployer, createNonce)) == address(this)
+     *         using its own EVM history — no storage manipulation needed.
      *
      * @param token        HyperCore token index (USDC = 0).
      * @param variant      Deployment-method variant:
-     *                       Create (1)            — contract deployed via plain CREATE
-     *                       FirstStorageSlot (2)  — typical ERC-1167 clone (default)
-     *                       CustomStorageSlot (3) — UUPS / custom proxy
-     * @param createNonce  Deployer nonce when the contract was created
-     *                     (only consulted for the Create variant; pass 0 otherwise).
+     *                       Create (0)            — ERC-1167 clone (use this)
+     *                       FirstStorageSlot (1)  — contract whose slot 0 == address(this)
+     *                       CustomStorageSlot (2) — UUPS / custom proxy
+     * @param createNonce  Deployer nonce at clone creation time
+     *                     (only used for the Create variant; pass 0 otherwise).
      */
     function finalizeForHyperCore(uint64 token, FinalizeVariant variant, uint64 createNonce) external onlyProposer {
         L1Write.sendFinalizeEvmContract(token, variant, createNonce);
@@ -203,27 +191,15 @@ contract HyperliquidGridStrategy is BaseStrategy {
         if (amountIn == 0) revert InvalidAmount();
         if (amountIn > type(uint64).max) revert DepositAmountTooLarge();
 
-        // HC finalize already ran at init via the slot-0 swap — no self-heal
-        // needed here. The spot-credit guard below catches any residual
-        // misregistration before we hand USDC to HC.
-        (uint64 spotBefore, bool preSpotOk) = _tryGetUsdcSpotTotal();
-
+        // L1Read (precompile 0x...0801) returns a pre-block HC state snapshot.
+        // ERC-20 auto-credit for registered contracts is processed by HC AFTER
+        // the EVM block completes, so spotAfter always equals spotBefore within
+        // the same tx — any delta check would always fire. The guard is gone.
+        // Safety: if HC registration somehow failed, USDC stays on the strategy
+        // EVM address and settle()/sweepToVault() returns it to the vault.
         _pullFromVault(address(asset), amountIn);
 
         uint64 ntl = uint64(amountIn);
-
-        (uint64 spotAfter, bool postSpotOk) = _tryGetUsdcSpotTotal();
-        // HyperCore tracks USDC at 8 decimals; HyperEVM USDC is 6 decimals
-        // (evmExtraWeiDecimals = -2). A real credit grows HC spot by ntl HC-wei,
-        // which is always >= ntl EVM-wei. This is a one-sided lower-bound
-        // monotonicity check, not an exact reconciliation. Subtraction (after
-        // the >= sanity) avoids uint64 overflow on `spotBefore + ntl`.
-        if (preSpotOk && postSpotOk) {
-            uint64 delta = spotAfter >= spotBefore ? spotAfter - spotBefore : 0;
-            if (delta < ntl) {
-                revert HyperCoreSpotCreditFailed(spotBefore, spotAfter, ntl);
-            }
-        }
 
         for (uint256 i = 0; i < assetIndices.length; i++) {
             L1Write.sendUpdateLeverage(assetIndices[i], true, leverage);
@@ -474,19 +450,5 @@ contract HyperliquidGridStrategy is BaseStrategy {
         AccountMarginSummary memory s = abi.decode(ret, (AccountMarginSummary));
         if (s.accountValue <= 0) return (0, true);
         return (uint256(int256(s.accountValue)), true);
-    }
-
-    /// @dev Reuses `L1Read`'s precompile address + 15k gas cap (a misbehaving
-    ///      precompile consumes all forwarded gas on revert, so capping prevents
-    ///      griefing). Tolerates short returndata so off-HyperEVM environments
-    ///      (tests with no precompile etched at `0x...0801`) bypass the gate.
-    function _tryGetUsdcSpotTotal() internal view returns (uint64 total, bool ok) {
-        (bool success, bytes memory ret) = L1Read.SPOT_BALANCE_PRECOMPILE_ADDRESS
-        .staticcall{gas: L1Read.SPOT_BALANCE_GAS}(
-            abi.encode(address(this), uint64(0))
-        );
-        if (!success || ret.length < 96) return (0, false);
-        SpotBalance memory bal = abi.decode(ret, (SpotBalance));
-        return (bal.total, true);
     }
 }
