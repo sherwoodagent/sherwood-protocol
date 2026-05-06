@@ -46,7 +46,6 @@ contract HyperliquidGridStrategy is BaseStrategy {
     event FundsParked(uint256 amount);
     event Settled();
     event FundsSwept(uint256 amount);
-    event LeverageUpdated(uint32 asset, uint32 leverage);
     event HyperCoreFinalized(uint64 token, FinalizeVariant variant, uint64 createNonce);
 
     // ── Errors ──
@@ -69,6 +68,12 @@ contract HyperliquidGridStrategy is BaseStrategy {
     // ── Storage (per-clone) ──
     IERC20 public asset;
     uint256 public depositAmount;
+    /// @notice The intended leverage for HyperCore positions opened by this strategy.
+    /// @dev Off-chain keepers MUST set this leverage on HyperCore via the exchange
+    ///      API (`updateLeverage`) before the proposal opens. There is no CoreWriter
+    ///      action for leverage (Hyperliquid's spec defines actions 1-15 only), so
+    ///      the value here is a covenant the keeper must honor — guardians review
+    ///      by inspecting HyperCore state via `L1Read.position2`.
     uint32 public leverage;
     /// @notice Per-order notional cap (USD, 6 decimals). Each individual GridOrder's
     ///         notional (sz * limitPx / 1e6) must be <= this value. This is NOT a
@@ -189,11 +194,8 @@ contract HyperliquidGridStrategy is BaseStrategy {
 
         uint64 ntl = uint64(amountIn);
 
-        for (uint256 i = 0; i < assetIndices.length; i++) {
-            L1Write.sendUpdateLeverage(assetIndices[i], true, leverage);
-            emit LeverageUpdated(assetIndices[i], leverage);
-        }
-
+        // Leverage is set off-chain via the exchange API before the proposal opens.
+        // See `leverage` storage NatSpec.
         L1Write.sendUsdClassTransfer(ntl, true);
 
         emit FundsParked(amountIn);
