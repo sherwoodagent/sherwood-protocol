@@ -543,10 +543,45 @@ contract HyperliquidGridStrategyTest is Test {
 
     // ── initiateReturn / _initiateClassTransfer ──
 
-    function test_initiateReturn_revertsIfNotSettled() public {
+    function test_initiateReturn_revertsForNonProposerBeforeDuration() public {
+        // Path 1 of two-path settle: anyone-but-proposer must wait until
+        // proposal duration expires. The mock governor used by these tests
+        // does not implement `getActiveProposal/getProposal`, so the auth
+        // call from a non-proposer reverts (no data) — that's the expected
+        // gate firing. Proposer call (pre-duration) must succeed.
         _execAndPrep();
-        vm.expectRevert(HyperliquidGridStrategy.NotSweepable.selector);
+        vm.prank(attacker);
+        vm.expectRevert();
         strategy.initiateReturn();
+    }
+
+    function test_initiateReturn_revertsBeforeExecute() public {
+        // Auth gate: state must be Executed (no _execute call yet).
+        vm.prank(proposer);
+        vm.expectRevert(BaseStrategy.NotExecuted.selector);
+        strategy.initiateReturn();
+    }
+
+    function test_initiateReturn_proposerCanCallAnytime() public {
+        _execAndPrep();
+        MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
+        m.setSummary(int64(int256(uint256(8_000e6))), uint64(2_000e6), 0, 0);
+        vm.prank(proposer);
+        strategy.initiateReturn();
+        assertTrue(strategy.returnsInitiated());
+    }
+
+    function test_initiateReturn_idempotent() public {
+        _execAndPrep();
+        MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
+        m.setSummary(int64(int256(uint256(8_000e6))), uint64(2_000e6), 0, 0);
+        vm.prank(proposer);
+        strategy.initiateReturn();
+        // Second call: silent no-op (returns) — does NOT re-fire bridge actions.
+        vm.recordLogs();
+        vm.prank(proposer);
+        strategy.initiateReturn();
+        assertEq(_countClassTransferLogs(vm.getRecordedLogs()), 0, "second initiateReturn must be no-op");
     }
 
     function test_settle_skipsClassTransferWhenNoPrecompile() public {
@@ -606,20 +641,22 @@ contract HyperliquidGridStrategyTest is Test {
         assertEq(_countClassTransferLogs(vm.getRecordedLogs()), 0, "no transfer when all margin locked");
     }
 
-    function test_initiateReturn_resweepsResidualPerp() public {
+    function test_initiateReturn_drainsHcOnPath1() public {
+        // Path 1: proposer calls initiateReturn pre-settle. HC drain queues:
+        // perp→spot class transfer + spot→EVM sendAsset. Then governor's
+        // _settle runs (≥1 block later in production) to push EVM USDC to vault.
         _execAndPrep();
         MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
-        m.setSummary(int64(int256(uint256(9_800e6))), 0, 0, 0);
-        vm.prank(vault);
-        strategy.settle();
-
-        // Simulate residual equity left in perp after IOC slippage.
-        m.setSummary(int64(int256(uint256(200e6))), 0, 0, 0);
+        m.setSummary(int64(int256(uint256(9_800e6))), uint64(0), 0, 0);
         vm.recordLogs();
+        vm.prank(proposer);
         strategy.initiateReturn();
+        // Class transfer for the full freeMargin emitted.
         (bool found, uint64 ntl,) = _decodeClassTransfer(vm.getRecordedLogs());
         assertTrue(found);
-        assertEq(ntl, uint64(200e6));
+        assertEq(ntl, uint64(9_800e6));
+        assertTrue(strategy.returnsInitiated());
+        assertFalse(strategy.settled());
     }
 
     // ── Helpers ──

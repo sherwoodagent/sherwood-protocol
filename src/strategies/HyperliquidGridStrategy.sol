@@ -8,6 +8,8 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {L1Write, TimeInForce, NO_CLOID, FinalizeVariant} from "../hyperliquid/L1Write.sol";
 import {L1Read, Position, SpotBalance, AccountMarginSummary} from "../hyperliquid/L1Read.sol";
 import {HyperliquidBridge} from "../hyperliquid/HyperliquidBridge.sol";
+import {ISyndicateGovernor} from "../interfaces/ISyndicateGovernor.sol";
+import {ISyndicateVault} from "../interfaces/ISyndicateVault.sol";
 
 /**
  * @title HyperliquidGridStrategy
@@ -52,6 +54,7 @@ contract HyperliquidGridStrategy is BaseStrategy {
     event Settled();
     event FundsSwept(uint256 amount);
     event HyperCoreFinalized(uint64 token, FinalizeVariant variant, uint64 createNonce);
+    event ReturnsInitiated();
 
     // ── Errors ──
     error InvalidAmount();
@@ -62,6 +65,7 @@ contract HyperliquidGridStrategy is BaseStrategy {
     error OrderTooLarge(uint256 actual, uint256 max);
     error AssetNotWhitelisted(uint32 asset);
     error AlreadyFinalized();
+    error NotAuthorized();
 
     // ── Action types ──
     uint8 constant ACTION_PLACE_GRID = 1;
@@ -99,6 +103,10 @@ contract HyperliquidGridStrategy is BaseStrategy {
     ///         tx immediately after `initialize()` (see
     ///         `cli/src/commands/strategy-template.ts`).
     bool public hyperCoreFinalized;
+    /// @notice True once the HC drain (cancel + force-close + perp→spot +
+    ///         spot→EVM bridge) has been triggered. Set by `initiateReturn()`
+    ///         (proposer pre-settle) or by `_settle()` defensively. Idempotent.
+    bool public returnsInitiated;
 
     /// @notice CLOIDs of resting GTC grid orders, tracked per asset. Maintained
     ///         on-chain so `_settle` can self-cancel without keeper assistance.
@@ -296,62 +304,92 @@ contract HyperliquidGridStrategy is BaseStrategy {
         delete _liveCloidIndex[ai][cloid];
     }
 
-    /// @notice Cancel every tracked GTC order, force-close all positions,
-    ///         request async USD transfer back to spot, and push EVM-side
-    ///         USDC back to the vault so the governor's settle batch sees
-    ///         the final NAV in vault.totalAssets() for fee math.
-    /// @dev    Self-cancellation walks `_liveCloids[asset]` from the tail and
-    ///         pops, so resting orders are guaranteed cancelled before the IOC
-    ///         reduce-only sweep below — eliminating the prior race where a
-    ///         resting buy could fill against the force-close at a stale price.
-    ///         The keeper can still pre-cancel off-chain to save the on-chain
-    ///         loop's gas, but it is no longer required for safety.
-    /// @dev    Order matters: class-transfer first (HC perp → HC spot, async),
-    ///         then push EVM USDC to vault. HC may auto-credit the strategy's
-    ///         EVM balance later via the spot bridge — those latecomer funds
-    ///         are recovered via `sweepToVault()` post-settle.
-    /// @dev    The governor's settle batch computes PnL by diffing
-    ///         `vault.totalAssets()` before/after this call. Pushing EVM USDC
-    ///         here is what makes that math correct — the previous "settle
-    ///         initiates async, sweep returns funds later" model under-reported
-    ///         vault balance during fee calculation.
+    /// @notice TWO-PATH SETTLEMENT — Path 2 (governor-called).
+    ///
+    ///         If `initiateReturn()` was NOT called pre-settle, fall back to
+    ///         a defensive in-call HC drain (same actions, same block — but
+    ///         the EVM USDC won't be available to push to vault until HC
+    ///         processes the bridges in the next block, so vault.totalAssets
+    ///         will under-report). The recommended flow is:
+    ///
+    ///           Block N: proposer (or anyone after duration) calls
+    ///                    `initiateReturn()` — queues HC drain.
+    ///           Block N+1+: HC processes the perp→spot + spot→EVM actions,
+    ///                       USDC arrives on the strategy's EVM address.
+    ///           Block N+1+: governor calls `settleProposal` →
+    ///                       strategy.settle() → `_pushAllToVault` correctly
+    ///                       reports the realized NAV.
+    ///
+    /// @dev    If proposer never called `initiateReturn()` and `_settle()`
+    ///         drains in the same block, push 0 to the vault (HC bridge is
+    ///         async). `sweepToVault()` recovers the USDC once HC delivers.
     function _settle() internal override {
-        for (uint256 i = 0; i < assetIndices.length; i++) {
-            uint32 ai = assetIndices[i];
-            _cancelAllTrackedOrders(ai);
-            // Force-close LONG: reduce-only sell at min price
-            L1Write.sendLimitOrder(ai, false, 1, type(uint64).max, true, TimeInForce.Ioc, NO_CLOID);
-            // Force-close SHORT: reduce-only buy at max price
-            L1Write.sendLimitOrder(ai, true, type(uint64).max, type(uint64).max, true, TimeInForce.Ioc, NO_CLOID);
+        if (!returnsInitiated) {
+            _drainHC();
+            returnsInitiated = true;
+            emit ReturnsInitiated();
         }
-
-        // Read the exact perp equity from the precompile and class-transfer
-        // it back to spot. accountValue is in USDC 6-decimal, same as ntl.
-        // Avoids passing type(uint64).max, which is undocumented as a "sweep
-        // all" sentinel and risks stranding funds. Skips gracefully when the
-        // precompile is unavailable (non-HyperEVM env).
-        _initiateReturn();
 
         // Push current EVM USDC balance to the vault. Covers two cases:
         //   - HC registration failed: USDC never bridged, sits on EVM here.
-        //   - In-transit / partial: whatever made it back from HC by now.
-        // Late HC arrivals (post-block credits) recovered via sweepToVault().
+        //   - Bridge completed in a prior block: USDC arrived on EVM, push it.
+        // Late HC arrivals (post-block credits after settle) recovered via
+        // `sweepToVault()`.
         _pushAllToVault(address(asset));
 
         settled = true;
         emit Settled();
     }
 
-    /// @notice Re-fire both legs of the HC drain — perp→spot class transfer
-    ///         + spot→EVM bridge — for any residual margin left on HC after
-    ///         settlement. Use after IOC fills released previously-locked
-    ///         margin, or after funding the strategy with HYPE on HC to
-    ///         retry a previously-failed spot→EVM bridge leg.
-    /// @dev    Permissionless: funds only flow to HC spot or to the
-    ///         strategy's EVM address (which `sweepToVault()` then forwards
-    ///         to the vault). No diversion possible.
+    /// @notice TWO-PATH SETTLEMENT — Path 1 (proposer-driven async drain).
+    ///
+    ///         Cancels all resting orders, force-closes perp positions, and
+    ///         queues the perp→spot + spot→EVM bridges. HC processes these
+    ///         post-block so USDC arrives on the strategy's EVM address in
+    ///         the NEXT block (or later). After ≥1 block, the governor's
+    ///         settle batch can call `strategy.settle()` and `_pushAllToVault`
+    ///         will see the bridged USDC and push it to the vault — giving
+    ///         the governor an accurate `vault.totalAssets()` for PnL.
+    ///
+    /// @dev    Auth: proposer can call anytime in `Executed`; anyone else
+    ///         must wait until proposal duration has expired (so a stuck
+    ///         proposer cannot block settlement). Read end-time from
+    ///         governor's StrategyProposal struct.
+    /// @dev    Idempotent: silent return if already initiated.
+    /// @dev    HYPE GAS: per `HyperliquidBridge.bridgeUsdcSpotToEvm` NatSpec,
+    ///         the spot→EVM leg consumes HC HYPE. The PROPOSER MUST FUND the
+    ///         strategy's HC HYPE balance before `_execute` (or before this
+    ///         call) so the bridge action lands on HC. If HYPE is absent,
+    ///         spot→EVM no-ops and USDC stays on HC spot — recovery is a
+    ///         HYPE-funded retry of `initiateReturn()`.
     function initiateReturn() external {
-        if (!settled) revert NotSweepable();
+        if (_state != State.Executed) revert NotExecuted();
+        if (returnsInitiated) return;
+
+        if (msg.sender != proposer()) {
+            ISyndicateGovernor gov = ISyndicateGovernor(ISyndicateVault(vault()).governor());
+            uint256 pid = gov.getActiveProposal(vault());
+            ISyndicateGovernor.StrategyProposal memory p = gov.getProposal(pid);
+            if (block.timestamp < p.executedAt + p.strategyDuration) revert NotAuthorized();
+        }
+
+        _drainHC();
+        returnsInitiated = true;
+        emit ReturnsInitiated();
+    }
+
+    /// @dev Cancel resting orders, force-close all positions, and queue
+    ///      perp→spot + spot→EVM bridges. Used by both `initiateReturn`
+    ///      (path 1) and `_settle` (path 2 defensive fallback).
+    function _drainHC() internal {
+        for (uint256 i = 0; i < assetIndices.length; i++) {
+            uint32 ai = assetIndices[i];
+            _cancelAllTrackedOrders(ai);
+            // Force-close LONG: reduce-only sell at min price.
+            L1Write.sendLimitOrder(ai, false, 1, type(uint64).max, true, TimeInForce.Ioc, NO_CLOID);
+            // Force-close SHORT: reduce-only buy at max price.
+            L1Write.sendLimitOrder(ai, true, type(uint64).max, type(uint64).max, true, TimeInForce.Ioc, NO_CLOID);
+        }
         _initiateReturn();
     }
 

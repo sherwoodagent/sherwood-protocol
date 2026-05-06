@@ -8,6 +8,8 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {L1Write, TimeInForce, NO_CLOID, FinalizeVariant} from "../hyperliquid/L1Write.sol";
 import {L1Read, Position, SpotBalance, AccountMarginSummary} from "../hyperliquid/L1Read.sol";
 import {HyperliquidBridge} from "../hyperliquid/HyperliquidBridge.sol";
+import {ISyndicateGovernor} from "../interfaces/ISyndicateGovernor.sol";
+import {ISyndicateVault} from "../interfaces/ISyndicateVault.sol";
 
 /**
  * @title HyperliquidPerpStrategy
@@ -47,6 +49,7 @@ contract HyperliquidPerpStrategy is BaseStrategy {
     event Settled();
     event FundsSwept(uint256 amount);
     event HyperCoreFinalized(uint64 token, FinalizeVariant variant, uint64 createNonce);
+    event ReturnsInitiated();
 
     // ── Errors ──
     error InvalidAmount();
@@ -56,6 +59,7 @@ contract HyperliquidPerpStrategy is BaseStrategy {
     error MaxTradesExceeded();
     error PositionTooLarge(uint256 actual, uint256 max);
     error AlreadyFinalized();
+    error NotAuthorized();
 
     // ── Action types ──
     // Legacy single-asset actions (use perpAssetIndex from storage):
@@ -95,6 +99,10 @@ contract HyperliquidPerpStrategy is BaseStrategy {
     ///         tx immediately after `initialize()` for grid; for perp, the
     ///         CLI calls it as part of the propose flow.
     bool public hyperCoreFinalized;
+    /// @notice True once the HC drain (force-close + perp→spot + spot→EVM
+    ///         bridge) has been triggered. Set by `initiateReturn()` (proposer
+    ///         pre-settle) or by `_settle()` defensively. Idempotent.
+    bool public returnsInitiated;
     /// @dev Cumulative USDC pushed back to the vault across all sweepToVault() calls.
     ///      Off-chain accounting only — does not gate withdrawals.
     uint256 public cumulativeSwept;
@@ -336,25 +344,52 @@ contract HyperliquidPerpStrategy is BaseStrategy {
         }
     }
 
-    /// @notice Close all positions, request USD transfer perp→spot, and push
-    ///         EVM USDC back to the vault so the governor's settle batch sees
-    ///         correct NAV for fee math.
-    /// @dev Order: close positions (HC) → class transfer (HC, async) → push
-    ///      EVM USDC to vault. Late HC arrivals (post-block credits) are
-    ///      recovered via `sweepToVault()` post-settle.
-    /// @dev The governor's settle batch computes PnL by diffing
-    ///      `vault.totalAssets()` before/after this call. Pushing EVM USDC
-    ///      here is what makes that math correct — the previous "settle
-    ///      initiates async, sweep returns later" model under-reported vault
-    ///      balance during fee calculation.
+    /// @notice TWO-PATH SETTLEMENT — Path 2 (governor-called).
+    ///         See `HyperliquidGridStrategy._settle` for the design rationale.
+    /// @dev    If `initiateReturn()` was NOT called pre-settle, fall back to
+    ///         a defensive in-call HC drain. The recommended flow is to call
+    ///         `initiateReturn()` (path 1) at least one block BEFORE
+    ///         `settleProposal` so HC has time to bridge USDC back to EVM
+    ///         and `_pushAllToVault` reports the realized NAV correctly.
     function _settle() internal override {
+        if (!returnsInitiated) {
+            _drainHC();
+            returnsInitiated = true;
+            emit ReturnsInitiated();
+        }
+        _pushAllToVault(address(asset));
+        settled = true;
+        emit Settled();
+    }
+
+    /// @notice TWO-PATH SETTLEMENT — Path 1 (proposer-driven async drain).
+    ///         See `HyperliquidGridStrategy.initiateReturn` for full rationale.
+    /// @dev    Auth: proposer always; anyone after proposal duration expired.
+    /// @dev    HYPE GAS: spot→EVM consumes HC HYPE. Proposer must fund the
+    ///         strategy's HC HYPE balance for the bridge to succeed.
+    function initiateReturn() external {
+        if (_state != State.Executed) revert NotExecuted();
+        if (returnsInitiated) return;
+
+        if (msg.sender != proposer()) {
+            ISyndicateGovernor gov = ISyndicateGovernor(ISyndicateVault(vault()).governor());
+            uint256 pid = gov.getActiveProposal(vault());
+            ISyndicateGovernor.StrategyProposal memory p = gov.getProposal(pid);
+            if (block.timestamp < p.executedAt + p.strategyDuration) revert NotAuthorized();
+        }
+
+        _drainHC();
+        returnsInitiated = true;
+        emit ReturnsInitiated();
+    }
+
+    /// @dev Cancel stop-loss, force-close all traded assets (or fall back to
+    ///      `perpAssetIndex` for legacy single-asset proposals), and queue
+    ///      perp→spot + spot→EVM bridges. Used by both `initiateReturn`
+    ///      (path 1) and `_settle` (path 2 defensive fallback).
+    function _drainHC() internal {
         _cancelCurrentStopLoss();
 
-        // Close positions on ALL traded assets (not just perpAssetIndex).
-        // Each asset gets both a long-close and short-close attempt — the
-        // reduce-only flag makes the wrong direction a no-op on HyperCore.
-        // If no multi-asset trades were made, falls back to perpAssetIndex
-        // (backwards compat with legacy single-asset actions).
         if (tradedAssets.length > 0) {
             for (uint256 i = 0; i < tradedAssets.length; i++) {
                 uint32 ai = tradedAssets[i];
@@ -368,21 +403,7 @@ contract HyperliquidPerpStrategy is BaseStrategy {
             );
         }
 
-        // Move free perp margin → HC spot using the precompile-read amount.
-        // type(uint64).max is undocumented as a "sweep all" sentinel and HC
-        // rejects class transfers exceeding withdrawable margin rather than
-        // partial-filling, so passing the exact freeMargin avoids stranding
-        // funds (mirrors grid's `_initiateClassTransfer`).
         _initiateReturn();
-
-        // Push EVM USDC balance to vault. Covers the case where HC bridge
-        // never landed (registration failed, USDC sat on EVM throughout) and
-        // the partial case where some funds are already back. Late HC
-        // arrivals recovered via sweepToVault().
-        _pushAllToVault(address(asset));
-
-        settled = true;
-        emit Settled();
     }
 
     /// @notice Push any latecomer USDC back to the vault after `_settle()`.
@@ -471,13 +492,6 @@ contract HyperliquidPerpStrategy is BaseStrategy {
 
         uint64 totalSpotWei = preSpot + perpToSpot * HyperliquidBridge.PERP_TO_SPOT_WEI;
         HyperliquidBridge.bridgeUsdcSpotToEvm(totalSpotWei);
-    }
-
-    /// @notice Re-fire both legs of the HC drain (perp→spot + spot→EVM)
-    ///         for residual margin after settlement. Permissionless.
-    function initiateReturn() external {
-        if (!settled) revert NotSweepable();
-        _initiateReturn();
     }
 
     /// @inheritdoc BaseStrategy

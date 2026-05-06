@@ -128,7 +128,7 @@ abstract contract BaseStrategy is IStrategy {
     }
 
     /// @inheritdoc IStrategy
-    function proposer() external view returns (address) {
+    function proposer() public view returns (address) {
         return _proposer;
     }
 
