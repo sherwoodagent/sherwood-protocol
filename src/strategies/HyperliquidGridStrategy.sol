@@ -393,6 +393,34 @@ contract HyperliquidGridStrategy is BaseStrategy {
         _initiateReturn();
     }
 
+    /// @notice Post-settle recovery for HC residuals. Re-fires the full HC
+    ///         drain (cancel + force-close + perp→spot + spot→EVM bridge) so
+    ///         the proposer (or anyone) can recover funds stranded on HC
+    ///         after settle. Two main use cases:
+    ///
+    ///           - IOC slippage: the initial force-close at settle didn't
+    ///             fully fill (thin market, price impact). Residual perp
+    ///             margin sits on HC. This call retries the close + drain.
+    ///           - HYPE-funded retry: the spot→EVM `sendAsset` action
+    ///             consumes HC HYPE; if the strategy's HC HYPE balance was
+    ///             zero at settle time, the bridge no-op'd and USDC stayed
+    ///             on HC spot. After topping up HYPE on HC, this call
+    ///             re-attempts the spot→EVM bridge.
+    ///
+    /// @dev    Gated to `settled == true` so it cannot conflict with the
+    ///         pre-settle path-1 `initiateReturn()`. Permissionless: funds
+    ///         only flow to HC spot or to the strategy's EVM address (which
+    ///         `sweepToVault()` then forwards to the vault). No diversion.
+    /// @dev    Repeatable. Each call reads fresh precompile state (free
+    ///         margin, spot balance) and queues HC actions for the current
+    ///         residual amount. Reduce-only IOC force-close orders no-op on
+    ///         HC when there's no position, so calling on a fully-drained
+    ///         strategy is a cheap-ish no-op (only cancel-loop SLOADs).
+    function recoverHcResiduals() external {
+        if (!settled) revert NotSweepable();
+        _drainHC();
+    }
+
     /// @notice Drain HC perp + HC spot back to the strategy's EVM USDC balance.
     ///         Queues two CoreWriter actions in order: (1) `sendUsdClassTransfer`
     ///         perp→spot for the current `freeMargin`, (2) `sendAsset` spot→EVM

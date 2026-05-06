@@ -641,6 +641,48 @@ contract HyperliquidGridStrategyTest is Test {
         assertEq(_countClassTransferLogs(vm.getRecordedLogs()), 0, "no transfer when all margin locked");
     }
 
+    function test_recoverHcResiduals_revertsBeforeSettle() public {
+        // Path-1 / path-2 separation: recoverHcResiduals must not run while
+        // the strategy is still Executed (would conflict with initiateReturn).
+        _execAndPrep();
+        vm.expectRevert(HyperliquidGridStrategy.NotSweepable.selector);
+        strategy.recoverHcResiduals();
+    }
+
+    function test_recoverHcResiduals_refiresDrainPostSettle() public {
+        // After settle, residual HC margin (e.g. from IOC slippage) can be
+        // recovered by re-firing the drain via this permissionless entrypoint.
+        _execAndPrep();
+        MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
+        m.setSummary(int64(int256(uint256(9_800e6))), uint64(0), 0, 0);
+        vm.prank(vault);
+        strategy.settle();
+
+        // Simulate residual perp margin appearing after settle (e.g. IOC fill
+        // releasing locked margin) and confirm a re-fire emits a fresh class
+        // transfer for the residual amount.
+        m.setSummary(int64(int256(uint256(200e6))), uint64(0), 0, 0);
+        vm.recordLogs();
+        strategy.recoverHcResiduals();
+        (bool found, uint64 ntl,) = _decodeClassTransfer(vm.getRecordedLogs());
+        assertTrue(found, "recoverHcResiduals must re-fire perp->spot class transfer");
+        assertEq(ntl, uint64(200e6));
+    }
+
+    function test_recoverHcResiduals_permissionless() public {
+        // Anyone can call after settle (no auth check) — funds only flow to
+        // strategy/vault, so no diversion is possible.
+        _execAndPrep();
+        MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
+        m.setSummary(int64(int256(uint256(1_000e6))), uint64(0), 0, 0);
+        vm.prank(vault);
+        strategy.settle();
+
+        m.setSummary(int64(int256(uint256(50e6))), uint64(0), 0, 0);
+        vm.prank(attacker);
+        strategy.recoverHcResiduals(); // should not revert
+    }
+
     function test_initiateReturn_drainsHcOnPath1() public {
         // Path 1: proposer calls initiateReturn pre-settle. HC drain queues:
         // perp→spot class transfer + spot→EVM sendAsset. Then governor's

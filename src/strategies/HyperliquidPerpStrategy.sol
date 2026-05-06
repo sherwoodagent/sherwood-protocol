@@ -406,6 +406,22 @@ contract HyperliquidPerpStrategy is BaseStrategy {
         _initiateReturn();
     }
 
+    /// @notice Post-settle recovery for HC residuals. Re-fires the full HC
+    ///         drain (cancel stop-loss + force-close + perp→spot + spot→EVM
+    ///         bridge) so funds stranded on HC after settle can be recovered.
+    ///         Use after IOC slippage left residual margin, or after funding
+    ///         the strategy's HC HYPE balance to retry a previously no-op'd
+    ///         spot→EVM bridge leg. See `HyperliquidGridStrategy.recoverHcResiduals`
+    ///         for full design rationale.
+    /// @dev    Gated to `settled == true` so it cannot conflict with path-1
+    ///         `initiateReturn()`. Permissionless: funds only flow to HC spot
+    ///         or to the strategy's EVM address (then `sweepToVault()` →
+    ///         vault). Repeatable.
+    function recoverHcResiduals() external {
+        if (!settled) revert NotSweepable();
+        _drainHC();
+    }
+
     /// @notice Push any latecomer USDC back to the vault after `_settle()`.
     /// @dev `_settle()` already pushes the strategy's current EVM balance.
     ///      `sweepToVault` exists for HC auto-credit dust that arrives AFTER
