@@ -209,15 +209,27 @@ contract HyperliquidGridStrategyTest is Test {
         assertTrue(strategy.settled());
     }
 
-    function test_sweepToVault_pushesUsdcBack() public {
+    function test_settle_pushesUsdcBack() public {
+        // settle() now does the EVM USDC push directly so the governor's
+        // settle batch sees correct vault.totalAssets() for fee math.
+        _execAndPrep();
+        uint256 vaultBefore = usdc.balanceOf(vault);
+        vm.prank(vault);
+        strategy.settle();
+        assertEq(usdc.balanceOf(vault), vaultBefore + DEPOSIT);
+        assertEq(usdc.balanceOf(address(strategy)), 0);
+    }
+
+    function test_sweepToVault_isNoOpAfterSettleHandledFunds() public {
+        // After _settle pushed all EVM USDC, sweepToVault is a no-op (no
+        // funds to push — late HC arrivals have not yet landed).
         _execAndPrep();
         vm.prank(vault);
         strategy.settle();
-        // Strategy still holds DEPOSIT in mock (USD class transfer is just an event).
-        uint256 vaultBefore = usdc.balanceOf(vault);
+        uint256 vaultBalance = usdc.balanceOf(vault);
         strategy.sweepToVault();
-        assertEq(usdc.balanceOf(vault), vaultBefore + DEPOSIT);
-        assertGt(strategy.cumulativeSwept(), 0);
+        assertEq(usdc.balanceOf(vault), vaultBalance);
+        assertEq(strategy.cumulativeSwept(), 0);
     }
 
     function test_sweepToVault_revertsIfNotSettled() public {
@@ -274,19 +286,21 @@ contract HyperliquidGridStrategyTest is Test {
         }
     }
 
-    function test_sweepToVault_repeatableForPartialArrivals() public {
+    function test_sweepToVault_pullsLateHcArrivals() public {
+        // settle() pushed the initial DEPOSIT. HC may auto-credit the
+        // strategy's EVM USDC later (post-block bridge). sweepToVault()
+        // recovers those late arrivals.
         _execAndPrep();
         vm.prank(vault);
         strategy.settle();
-        // First sweep: full balance (DEPOSIT)
-        strategy.sweepToVault();
-        assertEq(strategy.cumulativeSwept(), DEPOSIT);
-        // Simulate more USDC arriving from async transfer
+        // settle already pushed DEPOSIT — confirm strategy has 0 now.
+        assertEq(usdc.balanceOf(address(strategy)), 0);
+        // Simulate late HC auto-credit arriving on EVM after settle.
         usdc.mint(address(strategy), 5_000e6);
-        // Second sweep: should succeed without minReturn check
         uint256 vaultBefore = usdc.balanceOf(vault);
         strategy.sweepToVault();
         assertEq(usdc.balanceOf(vault), vaultBefore + 5_000e6);
+        assertEq(strategy.cumulativeSwept(), 5_000e6);
     }
 
     // ── On-chain CLOID tracking & self-cancel ──
@@ -419,13 +433,16 @@ contract HyperliquidGridStrategyTest is Test {
         assertEq(value, 12_345e6);
     }
 
-    function test_positionValue_clampsNegativeEquityToZero() public {
+    function test_positionValue_negativeHcEquityFallsBackToEvmBalance() public {
+        // HC reports negative equity (severely underwater). Fallback returns
+        // EVM USDC balance — that's what's actually recoverable. Math should
+        // clamp to non-negative, never blow up the deposit modal.
         _execAndPrep();
         MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
         m.setSummary(int64(-1_000), 0, 0, 0);
         (uint256 value, bool valid) = strategy.positionValue();
         assertTrue(valid);
-        assertEq(value, 0);
+        assertEq(value, DEPOSIT);
     }
 
     // When HC reports accountValue == 0 (in-transit: USDC pulled from vault but
@@ -440,12 +457,18 @@ contract HyperliquidGridStrategyTest is Test {
         assertEq(value, DEPOSIT); // EVM balance used as placeholder
     }
 
-    function test_positionValue_invalidWhenPrecompileMissing() public {
+    function test_positionValue_precompileMissingFallsBackToEvmBalance() public {
+        // When the precompile staticcall returns empty (HC registration
+        // never landed, or non-HyperEVM env), fall back to EVM USDC balance.
+        // CRITICAL: must return valid=true so vault's totalAssets() reports
+        // the real value (not 0) — prevents the share inflation bug where
+        // totalAssets()==0 with totalSupply>0 made previewDeposit(1) return
+        // ~10M shares.
         _execAndPrep();
-        // No etch at 0x...080F
+        // No etch at 0x...080F — staticcall returns empty bytes
         (uint256 value, bool valid) = strategy.positionValue();
-        assertFalse(valid);
-        assertEq(value, 0);
+        assertTrue(valid);
+        assertEq(value, DEPOSIT);
     }
 
     function test_positionValue_invalidBeforeExecute() public {

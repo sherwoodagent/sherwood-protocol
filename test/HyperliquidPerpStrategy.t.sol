@@ -378,12 +378,15 @@ contract HyperliquidPerpStrategyTest is Test {
         assertEq(usdc.balanceOf(attacker), 0); // Attacker gets nothing
     }
 
-    function test_sweepToVault_zeroBalance_reverts() public {
+    function test_sweepToVault_zeroBalance_isNoOp() public {
+        // _settle() now pushes EVM USDC to vault directly. After _burnStrategyBalance
+        // there's nothing for sweep to do — no-op return (not revert) so callers
+        // can blindly retry sweepToVault for late HC arrivals without checking first.
         _settleFirst();
         _burnStrategyBalance();
-
-        vm.expectRevert(HyperliquidPerpStrategy.InvalidAmount.selector);
+        uint256 vaultBefore = usdc.balanceOf(vault);
         strategy.sweepToVault();
+        assertEq(usdc.balanceOf(vault), vaultBefore);
     }
 
     function test_sweepToVault_notSettled_reverts() public {

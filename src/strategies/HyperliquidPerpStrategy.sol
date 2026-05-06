@@ -290,9 +290,17 @@ contract HyperliquidPerpStrategy is BaseStrategy {
         }
     }
 
-    /// @notice Close any open position and request USD transfer from perp to spot.
-    /// @dev After this call, USDC has NOT yet arrived on the EVM side.
-    ///      Call sweepToVault() in a separate tx once USDC arrives.
+    /// @notice Close all positions, request USD transfer perp→spot, and push
+    ///         EVM USDC back to the vault so the governor's settle batch sees
+    ///         correct NAV for fee math.
+    /// @dev Order: close positions (HC) → class transfer (HC, async) → push
+    ///      EVM USDC to vault. Late HC arrivals (post-block credits) are
+    ///      recovered via `sweepToVault()` post-settle.
+    /// @dev The governor's settle batch computes PnL by diffing
+    ///      `vault.totalAssets()` before/after this call. Pushing EVM USDC
+    ///      here is what makes that math correct — the previous "settle
+    ///      initiates async, sweep returns later" model under-reported vault
+    ///      balance during fee calculation.
     function _settle() internal override {
         _cancelCurrentStopLoss();
 
@@ -304,39 +312,41 @@ contract HyperliquidPerpStrategy is BaseStrategy {
         if (tradedAssets.length > 0) {
             for (uint256 i = 0; i < tradedAssets.length; i++) {
                 uint32 ai = tradedAssets[i];
-                // Force-close LONG: sell at min price
                 L1Write.sendLimitOrder(ai, false, 1, type(uint64).max, true, TimeInForce.Ioc, NO_CLOID);
-                // Force-close SHORT: buy at max price
                 L1Write.sendLimitOrder(ai, true, type(uint64).max, type(uint64).max, true, TimeInForce.Ioc, NO_CLOID);
             }
         } else {
-            // Legacy path: only perpAssetIndex from storage
             L1Write.sendLimitOrder(perpAssetIndex, false, 1, type(uint64).max, true, TimeInForce.Ioc, NO_CLOID);
             L1Write.sendLimitOrder(
                 perpAssetIndex, true, type(uint64).max, type(uint64).max, true, TimeInForce.Ioc, NO_CLOID
             );
         }
 
-        // Transfer all USD from perp margin back to spot (async)
+        // Transfer all USD from perp margin back to spot (async — HC processes
+        // post-block). type(uint64).max is the sentinel "all available".
         L1Write.sendUsdClassTransfer(type(uint64).max, false);
 
-        settled = true;
+        // Push EVM USDC balance to vault. Covers the case where HC bridge
+        // never landed (registration failed, USDC sat on EVM throughout) and
+        // the partial case where some funds are already back. Late HC
+        // arrivals recovered via sweepToVault().
+        _pushAllToVault(address(asset));
 
+        settled = true;
         emit Settled();
     }
 
-    /// @notice Push USDC back to the vault after async transfer completes.
+    /// @notice Push any latecomer USDC back to the vault after `_settle()`.
+    /// @dev `_settle()` already pushes the strategy's current EVM balance.
+    ///      `sweepToVault` exists for HC auto-credit dust that arrives AFTER
+    ///      settle (HC bridge is async post-block). Idempotent on zero-balance.
     /// @dev Permissionless — funds only go to the vault, no diversion possible.
-    ///      Repeatable for partial async arrivals. NO minReturnAmount guard:
-    ///      a strategy that loses money must still be able to return whatever
-    ///      remains. The cumulative tracker (`cumulativeSwept`) records totals
-    ///      for off-chain monitoring but does not gate withdrawals.
     /// @dev Closes #255 S-C6: minReturnAmount removed (was permanently locking funds on lossy strategies).
     function sweepToVault() external {
         if (!settled) revert NotSweepable();
 
         uint256 bal = IERC20(asset).balanceOf(address(this));
-        if (bal == 0) revert InvalidAmount();
+        if (bal == 0) return;
 
         cumulativeSwept += bal;
 

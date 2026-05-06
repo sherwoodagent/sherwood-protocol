@@ -144,12 +144,8 @@ contract HyperliquidGridStrategy is BaseStrategy {
             assetIndices.push(ai);
             isAssetWhitelisted[ai] = true;
         }
-
-        // Stamp slot 0 with address(this) for HC FirstStorageSlot registration.
-        // HC processes RawActions post-block; by the time it reads slot 0 to
-        // verify the finalizeForHyperCore call (sent in a separate tx after
-        // initialize), this value is already stably set.
-        _hcSelf = address(this);
+        // Slot 0 (`_hcSelf = address(this)`) is stamped by BaseStrategy.initialize
+        // before this hook runs. HC's FirstStorageSlot finalize reads it post-block.
     }
 
     /**
@@ -289,18 +285,25 @@ contract HyperliquidGridStrategy is BaseStrategy {
         delete _liveCloidIndex[ai][cloid];
     }
 
-    /// @notice Cancel every tracked GTC order, force-close all positions, and
-    ///         request async USD transfer back to spot.
+    /// @notice Cancel every tracked GTC order, force-close all positions,
+    ///         request async USD transfer back to spot, and push EVM-side
+    ///         USDC back to the vault so the governor's settle batch sees
+    ///         the final NAV in vault.totalAssets() for fee math.
     /// @dev    Self-cancellation walks `_liveCloids[asset]` from the tail and
     ///         pops, so resting orders are guaranteed cancelled before the IOC
     ///         reduce-only sweep below — eliminating the prior race where a
     ///         resting buy could fill against the force-close at a stale price.
     ///         The keeper can still pre-cancel off-chain to save the on-chain
     ///         loop's gas, but it is no longer required for safety.
-    /// @dev    The class transfer amount is read from the precompile at settle
-    ///         time (pre-IOC-close equity). After IOC fills, any residual perp
-    ///         balance (due to slippage vs mark price) can be swept via
-    ///         initiateReturn(). USDC arrives async — call sweepToVault() after.
+    /// @dev    Order matters: class-transfer first (HC perp → HC spot, async),
+    ///         then push EVM USDC to vault. HC may auto-credit the strategy's
+    ///         EVM balance later via the spot bridge — those latecomer funds
+    ///         are recovered via `sweepToVault()` post-settle.
+    /// @dev    The governor's settle batch computes PnL by diffing
+    ///         `vault.totalAssets()` before/after this call. Pushing EVM USDC
+    ///         here is what makes that math correct — the previous "settle
+    ///         initiates async, sweep returns funds later" model under-reported
+    ///         vault balance during fee calculation.
     function _settle() internal override {
         for (uint256 i = 0; i < assetIndices.length; i++) {
             uint32 ai = assetIndices[i];
@@ -311,13 +314,18 @@ contract HyperliquidGridStrategy is BaseStrategy {
             L1Write.sendLimitOrder(ai, true, type(uint64).max, type(uint64).max, true, TimeInForce.Ioc, NO_CLOID);
         }
 
-        // Read the exact perp equity from the precompile (accountValue is in
-        // USDC-6-decimal, same denomination as sendUsdClassTransfer's ntl param).
-        // Avoids passing type(uint64).max, which is undocumented as a "sweep all"
-        // sentinel in HyperCore's class transfer protocol and risks stranding funds.
-        // If precompile is unavailable (non-HyperEVM env), skip gracefully —
-        // sendUsdClassTransfer would be a no-op there anyway.
+        // Read the exact perp equity from the precompile and class-transfer
+        // it back to spot. accountValue is in USDC 6-decimal, same as ntl.
+        // Avoids passing type(uint64).max, which is undocumented as a "sweep
+        // all" sentinel and risks stranding funds. Skips gracefully when the
+        // precompile is unavailable (non-HyperEVM env).
         _initiateClassTransfer();
+
+        // Push current EVM USDC balance to the vault. Covers two cases:
+        //   - HC registration failed: USDC never bridged, sits on EVM here.
+        //   - In-transit / partial: whatever made it back from HC by now.
+        // Late HC arrivals (post-block credits) recovered via sweepToVault().
+        _pushAllToVault(address(asset));
 
         settled = true;
         emit Settled();
@@ -373,18 +381,23 @@ contract HyperliquidGridStrategy is BaseStrategy {
         }
     }
 
-    /// @notice Push USDC back to the vault after async transfer completes.
+    /// @notice Push any latecomer USDC back to the vault after `_settle()`.
+    /// @dev `_settle()` itself pushes the strategy's current EVM USDC balance
+    ///      to the vault so the governor's settle batch sees correct NAV.
+    ///      `sweepToVault` exists to handle HC auto-credit dust that arrives
+    ///      AFTER settle (HC bridge is async post-block) — call any time the
+    ///      strategy's EVM USDC balance is non-zero post-settle.
     /// @dev Permissionless — funds only go to the vault, no diversion possible.
-    ///      Repeatable for partial async arrivals. NO minReturnAmount guard:
-    ///      a strategy that loses money must still be able to return whatever
-    ///      remains. The cumulative tracker (`cumulativeSwept`) records totals
-    ///      for off-chain monitoring but does not gate withdrawals.
+    ///      Idempotent on zero-balance (no-op return) so it's safe to call
+    ///      blindly without checking balance off-chain. The cumulative tracker
+    ///      (`cumulativeSwept`) records totals for off-chain monitoring but
+    ///      does not gate withdrawals.
     /// @dev Closes #255 S-C6: minReturnAmount removed (was permanently locking funds on lossy strategies).
     function sweepToVault() external {
         if (!settled) revert NotSweepable();
 
         uint256 bal = IERC20(asset).balanceOf(address(this));
-        if (bal == 0) revert InvalidAmount();
+        if (bal == 0) return;
 
         cumulativeSwept += bal;
 
@@ -422,34 +435,49 @@ contract HyperliquidGridStrategy is BaseStrategy {
     }
 
     /// @inheritdoc BaseStrategy
-    /// @dev Live NAV reads HyperCore perp account equity (already in USDC 6
-    ///      decimals — same denomination as the vault asset). On non-HyperEVM
-    ///      chains or any environment where the precompile is absent (EOA
-    ///      staticcall returns success=true with empty returndata, so we also
-    ///      check `ret.length`), `valid=false` and the vault falls back to
-    ///      queue-only behavior. Negative equity (severely underwater) returns
-    ///      `(0, true)` rather than reverting — share-price math should clamp,
-    ///      not blow up.
+    /// @dev Live NAV combines HyperCore perp equity with EVM-side USDC sitting
+    ///      on this contract. Both denominations are USDC 6-decimal so summing
+    ///      is dimensionally clean.
     ///
-    ///      When HC reports zero equity, EVM USDC balance is used as a fallback.
-    ///      This covers the in-transit window between `_pullFromVault` (sync) and
-    ///      the HC spot credit (async, processed post-block by HC). Without this,
-    ///      `totalAssets()` drops to 0 for one block on every execute, causing
-    ///      the app to show `Position Value: 0` and a spurious -100% delta.
+    ///      Always returns `valid=true` once the strategy is in `Executed`
+    ///      state — the vault has already pulled funds in, so `totalAssets()`
+    ///      MUST report something rather than degrading to queue-only and
+    ///      bricking the deposit modal. The fallback covers four failure modes:
+    ///
+    ///        1. In-transit window: USDC pulled from vault but HC has not yet
+    ///           processed the auto-credit (cross-block async).
+    ///        2. HC registration silently failed (e.g. `_hcSelf` slot was
+    ///           overwritten before finalize, deploy used stale source) —
+    ///           USDC stays on EVM, HC accountValue stays at 0.
+    ///        3. HC precompile returns empty bytes for unregistered accounts —
+    ///           handled the same as (2).
+    ///        4. Severely underwater HC equity — clamped to non-negative; the
+    ///           remaining EVM balance is what's recoverable.
+    ///
+    ///      Without this fallback, the bug pattern observed pre-fix was:
+    ///      `totalAssets() == 0` while `totalSupply > 0` → `previewDeposit(1)`
+    ///      returns `~10,000,001` shares (catastrophic share inflation).
     function _positionValue() internal view override returns (uint256, bool) {
         (bool success, bytes memory ret) = L1Read.ACCOUNT_MARGIN_SUMMARY_PRECOMPILE_ADDRESS
         .staticcall{gas: L1Read.ACCOUNT_MARGIN_SUMMARY_GAS}(
             abi.encode(uint32(0), address(this))
         );
-        if (!success || ret.length < 128) return (0, false);
-        AccountMarginSummary memory s = abi.decode(ret, (AccountMarginSummary));
-        if (s.accountValue < 0) return (0, true); // clamp: severely underwater
-        if (s.accountValue == 0) {
-            // In-transit fallback: USDC pulled from vault but not yet credited
-            // to HC spot (HC credits are async, post-block). Return EVM balance
-            // so totalAssets() stays stable during that one-block window.
-            return (IERC20(asset).balanceOf(address(this)), true);
+        uint256 evmBal = IERC20(asset).balanceOf(address(this));
+        if (!success || ret.length < 128) {
+            // Precompile unavailable (non-HyperEVM env) or returned empty
+            // (account not registered with HC). Fall back to EVM balance.
+            return (evmBal, true);
         }
+        AccountMarginSummary memory s = abi.decode(ret, (AccountMarginSummary));
+        if (s.accountValue <= 0) {
+            // HC has no positive equity (zero/negative). Whatever value
+            // remains is on EVM — return that.
+            return (evmBal, true);
+        }
+        // HC has live equity — that's the authoritative position value once
+        // the auto-credit has landed. EVM USDC is left out to avoid double-
+        // counting (HC's spot mirrors the strategy's EVM balance once
+        // registered).
         return (uint256(int256(s.accountValue)), true);
     }
 }
