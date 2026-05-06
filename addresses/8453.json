@@ -2,30 +2,13 @@
   "chainId": 8453,
   "name": "Base",
   "protocol": {
-    "SyndicateFactory": "0x4a761D4C101a3aaDE53C7aA2b5c3278b217B6C29",
-    "SyndicateGovernor": "0x2F7C27007AC5Bad8400EaDBcdaa767597cfE186a",
-    "SyndicateVaultImpl": "0x2523dc3063c6166593DC314B4C3e3C5e216decFE",
-    "BatchExecutorLib": "0x4DB19b6F8A0B299fD73c40A72B265cfBCF64664a"
+    "SyndicateFactory": "0xAC74EC56858d7F1f7618c8e77F65Fc26aDf33c82",
+    "SyndicateGovernor": "0x9Fd3c87B34F254e3c5652A0394B9780c2F05d367",
+    "GuardianRegistry": "0x49E4163b5e4b23F8f3d469Cf6fa197FB6b06A26E",
+    "SyndicateVaultImpl": "0xfce4bcE08E9C047E4736f75C2B8557e2754Ce36A",
+    "BatchExecutorLib": "0xbC79FbD5036C1Cc4A9d10BDf8628BF09a558496E"
   },
-  "templates": {
-    "MoonwellSupplyStrategy": "0x25E33fAeE061E752fDFe851911ccC4C6D9FBA346",
-    "AerodromeLPStrategy": "0x1c61c740702690B86b874ab929A6F04A4Ec56C1c",
-    "VeniceInferenceStrategy": "0xd882056ba6b0aEd8908c541884B327121E2f2C9C",
-    "WstETHMoonwellStrategy": "0x6d026e2f5Ff0C34A01690EC46Cb601B8fF391985"
-  },
-  "syndicates": {
-    "alpha-fund": {
-      "id": 1,
-      "vault": "0x38c499361048513E0cce30dbAe16622aA1CE0229"
-    },
-    "test-flagship-xyz": {
-      "id": 2,
-      "vault": "0x1475fFC5d81D558e169441b6587874b4f773f992"
-    },
-    "flagship-fund": {
-      "id": 3,
-      "vault": "0xa4aF960CAFDe8BF5dc93Fc3b62175968C107892f"
-    }
-  },
+  "templates": {},
+  "syndicates": {},
   "deployer": "0x5A00afAecE9CF61A768E2AE2713084C8d354DF94"
 }

@@ -46,14 +46,28 @@ import {ScriptBase} from "./ScriptBase.sol";
  */
 contract DeploySherwood is ScriptBase {
     // ── CREATE3 salts ──
-    bytes32 constant SALT_EXECUTOR = keccak256("sherwood.deploy.executor.2");
-    bytes32 constant SALT_VAULT_IMPL = keccak256("sherwood.deploy.vault-impl.2");
-    bytes32 constant SALT_GOVERNOR_IMPL = keccak256("sherwood.deploy.governor-impl.2");
-    bytes32 constant SALT_GOVERNOR_PROXY = keccak256("sherwood.deploy.governor-proxy.2");
-    bytes32 constant SALT_FACTORY_IMPL = keccak256("sherwood.deploy.factory-impl.2");
-    bytes32 constant SALT_FACTORY_PROXY = keccak256("sherwood.deploy.factory-proxy.2");
-    bytes32 constant SALT_REGISTRY_IMPL = keccak256("sherwood.deploy.guardian-registry-impl.1");
-    bytes32 constant SALT_REGISTRY_PROXY = keccak256("sherwood.deploy.guardian-registry-proxy.1");
+    // V1.5 beta redeploy (PR #282): bumped governor/vault/factory/executor
+    // .2 → .3, guardian-registry .1 → .2. Required because storage layout
+    // AND runtime bytecode changed materially:
+    //   - StrategyProposal struct now carries `address strategy` (drops
+    //     bindProposalAdapter)
+    //   - SyndicateGovernor: cancelProposal extends to GuardianReview/Approved
+    //     + drives registry.cancelReview; getProposalCalls dropped
+    //   - SyndicateVault: liveAdapterWithdrawn mapping, _pullFromLiveAdapter,
+    //     NAV-aware max{Redeem,Withdraw}, _lpFlowGate adapterValue tuple
+    //   - GuardianRegistry: cancelReview added; _slashApprovers extracted
+    //   - PortfolioStrategy: rebalanceDelta refactored into snapshot/sell/buy
+    //     helpers
+    // Old .2/.1 proxies remain at their addresses for historical / settle-
+    // out access. New addresses get written to chains/{chainId}.json.
+    bytes32 constant SALT_EXECUTOR = keccak256("sherwood.deploy.executor.3");
+    bytes32 constant SALT_VAULT_IMPL = keccak256("sherwood.deploy.vault-impl.3");
+    bytes32 constant SALT_GOVERNOR_IMPL = keccak256("sherwood.deploy.governor-impl.3");
+    bytes32 constant SALT_GOVERNOR_PROXY = keccak256("sherwood.deploy.governor-proxy.3");
+    bytes32 constant SALT_FACTORY_IMPL = keccak256("sherwood.deploy.factory-impl.3");
+    bytes32 constant SALT_FACTORY_PROXY = keccak256("sherwood.deploy.factory-proxy.3");
+    bytes32 constant SALT_REGISTRY_IMPL = keccak256("sherwood.deploy.guardian-registry-impl.2");
+    bytes32 constant SALT_REGISTRY_PROXY = keccak256("sherwood.deploy.guardian-registry-proxy.2");
 
     // ── Registry default parameters (spec §3.1; overridable via env) ──
     uint256 constant DEFAULT_MIN_GUARDIAN_STAKE = 10_000e18;
