@@ -5,20 +5,31 @@ import {BaseStrategy} from "./BaseStrategy.sol";
 import {IStrategy} from "../interfaces/IStrategy.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import {L1Write, TimeInForce, NO_CLOID} from "../hyperliquid/L1Write.sol";
+import {L1Write, TimeInForce, NO_CLOID, FinalizeVariant} from "../hyperliquid/L1Write.sol";
 import {L1Read, Position, SpotBalance, AccountMarginSummary} from "../hyperliquid/L1Read.sol";
+import {HyperliquidBridge} from "../hyperliquid/HyperliquidBridge.sol";
 
 /**
  * @title HyperliquidPerpStrategy
  * @notice On-chain perpetual trading strategy using HyperEVM precompiles.
  *
- *   USDC is pulled from the vault and transferred to perp margin via
- *   L1Write.sendUsdClassTransfer(). The proposer then triggers trades
- *   (open long, close position, update stop loss) via updateParams().
+ *   USDC is pulled from the vault, bridged EVM→HC spot via Circle's
+ *   CoreDepositWallet (`HyperliquidBridge.bridgeUsdcToSpot`), and moved
+ *   onto HC perp margin via `L1Write.sendUsdClassTransfer`. The proposer
+ *   then triggers trades (open long, close position, update stop loss)
+ *   via updateParams().
  *
- *   Settlement: _settle() closes positions + requests async USD transfer.
- *   sweepToVault() pushes USDC back to vault once it arrives on the EVM side.
- *   Callable by anyone (funds only go to vault). Repeatable for partial arrivals.
+ *   Settlement: _settle() force-closes all positions, runs the perp→spot
+ *   class transfer (using the precompile-read free margin amount, NOT the
+ *   undocumented `uint64.max` sentinel), and pushes the strategy's current
+ *   EVM USDC balance back to the vault — the governor's settle batch reads
+ *   vault.totalAssets() right after, so the EVM push must happen here.
+ *   sweepToVault() recovers any late HC arrivals (post-block bridge credits).
+ *
+ *   HyperCore registration: `_initialize()` writes `address(this)` to slot 0
+ *   (`_hcSelf` from BaseStrategy). The CLI then calls
+ *   `finalizeForHyperCore(0, FinalizeVariant.FirstStorageSlot, 0)` as a
+ *   separate tx so HC reads slot 0 post-block and confirms the registration.
  *
  *   Position state is NOT tracked on-chain — L1Read.position2() is the source
  *   of truth. The proposer must check actual HyperCore state before acting.
@@ -35,6 +46,7 @@ contract HyperliquidPerpStrategy is BaseStrategy {
     event FundsParked(uint256 amount);
     event Settled();
     event FundsSwept(uint256 amount);
+    event HyperCoreFinalized(uint64 token, FinalizeVariant variant, uint64 createNonce);
 
     // ── Errors ──
     error InvalidAmount();
@@ -43,6 +55,7 @@ contract HyperliquidPerpStrategy is BaseStrategy {
     error NotSweepable();
     error MaxTradesExceeded();
     error PositionTooLarge(uint256 actual, uint256 max);
+    error AlreadyFinalized();
 
     // ── Action types ──
     // Legacy single-asset actions (use perpAssetIndex from storage):
@@ -76,6 +89,12 @@ contract HyperliquidPerpStrategy is BaseStrategy {
     uint32 public leverage;
     bool public hasActiveStopLoss; // Whether a GTC stop-loss is currently live
     bool public settled; // Whether _settle() has been called
+    /// @notice True once this contract has been registered with HyperCore so
+    ///         bridged-token transfers auto-credit HC spot. Set only by
+    ///         `finalizeForHyperCore`, which the CLI auto-calls in a separate
+    ///         tx immediately after `initialize()` for grid; for perp, the
+    ///         CLI calls it as part of the propose flow.
+    bool public hyperCoreFinalized;
     /// @dev Cumulative USDC pushed back to the vault across all sweepToVault() calls.
     ///      Off-chain accounting only — does not gate withdrawals.
     uint256 public cumulativeSwept;
@@ -134,6 +153,10 @@ contract HyperliquidPerpStrategy is BaseStrategy {
 
         _pullFromVault(address(asset), amountIn);
 
+        // Bridge EVM → HC spot via Circle's CoreDepositWallet. Without this,
+        // HC spot stays empty and the class-transfer below is a no-op.
+        HyperliquidBridge.bridgeUsdcToSpot(asset, amountIn);
+
         uint64 ntl = uint64(amountIn);
 
         // Leverage is set off-chain via the exchange API before the proposal opens.
@@ -141,6 +164,29 @@ contract HyperliquidPerpStrategy is BaseStrategy {
         L1Write.sendUsdClassTransfer(ntl, true);
 
         emit FundsParked(amountIn);
+    }
+
+    /**
+     * @notice Register this clone with HyperCore so that bridged USDC ERC-20
+     *         transfers auto-credit the HC spot account. MUST be called once
+     *         after `initialize()` and before the proposal that triggers
+     *         `_execute()`.
+     *
+     *         Standard call for SyndicateFactory CLI clones:
+     *           finalizeForHyperCore(0, FinalizeVariant.FirstStorageSlot, 0)
+     *         BaseStrategy.initialize() writes `address(this)` to slot 0
+     *         (`_hcSelf`). HC reads slot 0 post-block, confirms it equals
+     *         the contract address, and completes registration.
+     *
+     * @param token        HyperCore token index (USDC = 0).
+     * @param variant      FinalizeVariant enum (Create / FirstStorageSlot / CustomStorageSlot).
+     * @param createNonce  Deployer nonce (Create variant only; pass 0 for FirstStorageSlot).
+     */
+    function finalizeForHyperCore(uint64 token, FinalizeVariant variant, uint64 createNonce) external onlyProposer {
+        if (hyperCoreFinalized) revert AlreadyFinalized();
+        L1Write.sendFinalizeEvmContract(token, variant, createNonce);
+        hyperCoreFinalized = true;
+        emit HyperCoreFinalized(token, variant, createNonce);
     }
 
     /// @notice Proposer-driven trading actions via precompiles
@@ -322,9 +368,12 @@ contract HyperliquidPerpStrategy is BaseStrategy {
             );
         }
 
-        // Transfer all USD from perp margin back to spot (async — HC processes
-        // post-block). type(uint64).max is the sentinel "all available".
-        L1Write.sendUsdClassTransfer(type(uint64).max, false);
+        // Move free perp margin → HC spot using the precompile-read amount.
+        // type(uint64).max is undocumented as a "sweep all" sentinel and HC
+        // rejects class transfers exceeding withdrawable margin rather than
+        // partial-filling, so passing the exact freeMargin avoids stranding
+        // funds (mirrors grid's `_initiateClassTransfer`).
+        _initiateClassTransfer();
 
         // Push EVM USDC balance to vault. Covers the case where HC bridge
         // never landed (registration failed, USDC sat on EVM throughout) and
@@ -385,11 +434,51 @@ contract HyperliquidPerpStrategy is BaseStrategy {
         }
     }
 
-    // ── positionValue ──
-    // Inherits BaseStrategy's (0, false) default. A HyperEVM-native impl
-    // would wrap `L1Read.accountMarginSummary(...)` and return
-    // `accountValue` (clamped at zero, converted from 8-decimal USD to
-    // the asset's 6-decimal USDC). Deferred until there's fork-test
-    // infrastructure on HyperEVM; the existing `getMarginSummary()`
-    // view is already available for any caller that wants it directly.
+    /// @dev Reads current perp free margin (accountValue - marginUsed) via
+    ///      precompile and sends a class transfer (perp→spot) for that
+    ///      amount. accountValue is in 6-decimal USDC (HL convention: perp =
+    ///      spot-wei / 100, where USDC spot wei is 8-decimal). marginUsed is
+    ///      subtracted because HC rejects class transfers exceeding
+    ///      withdrawable margin rather than partial-filling. No-ops when the
+    ///      precompile is unavailable (non-HyperEVM env) or free margin <= 0.
+    function _initiateClassTransfer() internal {
+        (bool ok, bytes memory ret) = L1Read.ACCOUNT_MARGIN_SUMMARY_PRECOMPILE_ADDRESS
+        .staticcall{gas: L1Read.ACCOUNT_MARGIN_SUMMARY_GAS}(
+            abi.encode(uint32(0), address(this))
+        );
+        if (!ok || ret.length < 128) return;
+        AccountMarginSummary memory s = abi.decode(ret, (AccountMarginSummary));
+        if (s.accountValue <= 0) return;
+        int64 freeMargin = s.accountValue - int64(s.marginUsed);
+        if (freeMargin <= 0) return;
+        L1Write.sendUsdClassTransfer(uint64(freeMargin), false);
+    }
+
+    /// @inheritdoc BaseStrategy
+    /// @dev Live NAV from HC perp account equity (6-decimal USDC, same
+    ///      denomination as the vault asset). Always returns valid=true once
+    ///      the strategy is in Executed state — the vault has already pulled
+    ///      funds in, so totalAssets() MUST report something rather than
+    ///      degrading to queue-only. EVM USDC fallback handles four cases:
+    ///        1. In-transit: bridge submitted, HC has not processed yet.
+    ///        2. Bridge failed entirely: USDC stayed on EVM.
+    ///        3. HC reports zero/negative equity (severely underwater clamp).
+    ///        4. Non-HyperEVM env: precompile staticcall returns empty.
+    ///      Without this, totalAssets() drops to 0 with totalSupply > 0,
+    ///      causing share inflation in `previewDeposit`.
+    function _positionValue() internal view override returns (uint256, bool) {
+        (bool success, bytes memory ret) = L1Read.ACCOUNT_MARGIN_SUMMARY_PRECOMPILE_ADDRESS
+        .staticcall{gas: L1Read.ACCOUNT_MARGIN_SUMMARY_GAS}(
+            abi.encode(uint32(0), address(this))
+        );
+        uint256 evmBal = IERC20(asset).balanceOf(address(this));
+        if (!success || ret.length < 128) {
+            return (evmBal, true);
+        }
+        AccountMarginSummary memory s = abi.decode(ret, (AccountMarginSummary));
+        if (s.accountValue <= 0) {
+            return (evmBal, true);
+        }
+        return (uint256(int256(s.accountValue)), true);
+    }
 }

@@ -7,14 +7,17 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {L1Write, TimeInForce, NO_CLOID, FinalizeVariant} from "../hyperliquid/L1Write.sol";
 import {L1Read, Position, SpotBalance, AccountMarginSummary} from "../hyperliquid/L1Read.sol";
+import {HyperliquidBridge} from "../hyperliquid/HyperliquidBridge.sol";
 
 /**
  * @title HyperliquidGridStrategy
  * @notice On-chain grid trading strategy using HyperEVM precompiles.
  *
- *   USDC is pulled from the vault and parked on HyperCore margin via
- *   L1Write.sendUsdClassTransfer(). The proposer (keeper EOA) drives
- *   the grid by calling updateParams() every 60s with batch orders.
+ *   USDC is pulled from the vault, bridged EVM→HC spot via Circle's
+ *   CoreDepositWallet (`HyperliquidBridge.bridgeUsdcToSpot`), and moved
+ *   onto HC perp margin via `L1Write.sendUsdClassTransfer`. The proposer
+ *   (keeper EOA) drives the grid by calling `updateParams()` every 60s
+ *   with batch orders.
  *
  *   Action types:
  *     - ACTION_PLACE_GRID: place batch of GTC limit orders
@@ -22,9 +25,11 @@ import {L1Read, Position, SpotBalance, AccountMarginSummary} from "../hyperliqui
  *     - ACTION_CANCEL_AND_PLACE: atomic cancel + place (rebalance)
  *
  *   Settlement: _settle() walks the on-chain CLOID mirror to cancel every
- *   resting GTC grid order before force-closing all positions and requesting
- *   the async USD transfer back to spot. sweepToVault() pushes USDC back to
- *   the vault when it arrives.
+ *   resting GTC grid order, force-closes all positions, runs the perp→spot
+ *   class transfer, and pushes the strategy's current EVM USDC balance back
+ *   to the vault — the governor's settle batch reads vault.totalAssets()
+ *   right after, so the EVM push must happen here. sweepToVault() recovers
+ *   any late HC arrivals (post-block bridge credits).
  *
  *   Live NAV: _positionValue() reports HyperCore perp account equity via
  *   L1Read.accountMarginSummary, so the vault can mark shares to market and
@@ -56,6 +61,7 @@ contract HyperliquidGridStrategy is BaseStrategy {
     error TooManyOrders(uint256 actual, uint256 max);
     error OrderTooLarge(uint256 actual, uint256 max);
     error AssetNotWhitelisted(uint32 asset);
+    error AlreadyFinalized();
 
     // ── Action types ──
     uint8 constant ACTION_PLACE_GRID = 1;
@@ -167,6 +173,7 @@ contract HyperliquidGridStrategy is BaseStrategy {
      * @param createNonce  Deployer nonce (only used for the Create variant; pass 0 otherwise).
      */
     function finalizeForHyperCore(uint64 token, FinalizeVariant variant, uint64 createNonce) external onlyProposer {
+        if (hyperCoreFinalized) revert AlreadyFinalized();
         L1Write.sendFinalizeEvmContract(token, variant, createNonce);
         hyperCoreFinalized = true;
         emit HyperCoreFinalized(token, variant, createNonce);
@@ -180,13 +187,15 @@ contract HyperliquidGridStrategy is BaseStrategy {
         if (amountIn == 0) revert InvalidAmount();
         if (amountIn > type(uint64).max) revert DepositAmountTooLarge();
 
-        // L1Read (precompile 0x...0801) returns a pre-block HC state snapshot.
-        // ERC-20 auto-credit for registered contracts is processed by HC AFTER
-        // the EVM block completes, so spotAfter always equals spotBefore within
-        // the same tx — any delta check would always fire. The guard is gone.
-        // Safety: if HC registration somehow failed, USDC stays on the strategy
-        // EVM address and settle()/sweepToVault() returns it to the vault.
         _pullFromVault(address(asset), amountIn);
+
+        // Bridge EVM → HC spot via Circle's CoreDepositWallet. The prior model
+        // assumed HC auto-credits the strategy's HC spot when an ERC-20 lands
+        // on its EVM address (after FirstStorageSlot registration), but every
+        // ecosystem reference (Circle, hyper-evm-lib, across-protocol) bridges
+        // explicitly. Without this call, HC spot stays empty and the
+        // class-transfer below operates on zero balance.
+        HyperliquidBridge.bridgeUsdcToSpot(asset, amountIn);
 
         uint64 ntl = uint64(amountIn);
 
@@ -207,6 +216,8 @@ contract HyperliquidGridStrategy is BaseStrategy {
     function _onLiveDeposit(uint256 assets) internal override {
         if (assets == 0) return;
         if (assets > type(uint64).max) revert DepositAmountTooLarge();
+        // Bridge new deposit's EVM USDC → HC spot, then move spot → perp.
+        HyperliquidBridge.bridgeUsdcToSpot(asset, assets);
         L1Write.sendUsdClassTransfer(uint64(assets), true);
         emit FundsParked(assets);
     }
@@ -474,10 +485,13 @@ contract HyperliquidGridStrategy is BaseStrategy {
             // remains is on EVM — return that.
             return (evmBal, true);
         }
-        // HC has live equity — that's the authoritative position value once
-        // the auto-credit has landed. EVM USDC is left out to avoid double-
-        // counting (HC's spot mirrors the strategy's EVM balance once
-        // registered).
+        // HC has live equity. accountValue is in 6-decimal USDC (HL convention:
+        // perp uses spot-wei / 100, where USDC spot wei is 8-decimal). After
+        // the explicit CoreDepositWallet.deposit bridge, EVM USDC has moved
+        // INTO the bridge contract — the strategy's EVM balance is 0 once
+        // the bridge clears. So summing here would NOT double-count, but is
+        // also unnecessary: HC's accountValue already reflects every cent
+        // that's been bridged + traded.
         return (uint256(int256(s.accountValue)), true);
     }
 }

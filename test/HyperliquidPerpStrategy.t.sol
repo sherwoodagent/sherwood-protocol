@@ -163,20 +163,27 @@ contract HyperliquidPerpStrategyTest is Test {
     }
 
     // ==================== POSITION VALUE ====================
-    // Inherits BaseStrategy's (0, false) default — HyperCore precompile
-    // integration is deferred to a HyperEVM-gated follow-up.
+    // Live NAV from HC accountMarginSummary precompile, with EVM USDC fallback
+    // when the precompile is absent (non-HyperEVM env / registration failed).
+    // Mirrors HyperliquidGridStrategy._positionValue.
 
-    function test_positionValue_alwaysStubbed() public {
+    function test_positionValue_invalidBeforeExecute() public view {
+        // BaseStrategy gates on State.Executed — must return (0, false) before execute().
         (uint256 value, bool valid) = strategy.positionValue();
         assertEq(value, 0);
         assertFalse(valid);
+    }
 
+    function test_positionValue_precompileMissingFallsBackToEvmBalance() public {
+        // After execute, USDC sits on the strategy (test env has no bridge / no
+        // precompile). _positionValue MUST return (evmBal, true) — returning
+        // (0, false) would brick the deposit modal and recreate the share
+        // inflation bug.
         vm.prank(vault);
         strategy.execute();
-
-        (value, valid) = strategy.positionValue();
-        assertEq(value, 0);
-        assertFalse(valid);
+        (uint256 value, bool valid) = strategy.positionValue();
+        assertTrue(valid);
+        assertEq(value, DEPOSIT);
     }
 
     // ==================== EXECUTE ====================
