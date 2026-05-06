@@ -330,7 +330,7 @@ contract HyperliquidGridStrategy is BaseStrategy {
         // Avoids passing type(uint64).max, which is undocumented as a "sweep
         // all" sentinel and risks stranding funds. Skips gracefully when the
         // precompile is unavailable (non-HyperEVM env).
-        _initiateClassTransfer();
+        _initiateReturn();
 
         // Push current EVM USDC balance to the vault. Covers two cases:
         //   - HC registration failed: USDC never bridged, sits on EVM here.
@@ -342,35 +342,80 @@ contract HyperliquidGridStrategy is BaseStrategy {
         emit Settled();
     }
 
-    /// @notice Re-initiate the perp→spot class transfer for any residual perp
-    ///         balance left after IOC fill slippage at settlement.
-    /// @dev    Permissionless: funds only flow to HC spot (same address), no
-    ///         diversion possible. Call this if sweepToVault keeps returning 0
-    ///         after settlement — it means some equity remains in perp.
+    /// @notice Re-fire both legs of the HC drain — perp→spot class transfer
+    ///         + spot→EVM bridge — for any residual margin left on HC after
+    ///         settlement. Use after IOC fills released previously-locked
+    ///         margin, or after funding the strategy with HYPE on HC to
+    ///         retry a previously-failed spot→EVM bridge leg.
+    /// @dev    Permissionless: funds only flow to HC spot or to the
+    ///         strategy's EVM address (which `sweepToVault()` then forwards
+    ///         to the vault). No diversion possible.
     function initiateReturn() external {
         if (!settled) revert NotSweepable();
-        _initiateClassTransfer();
+        _initiateReturn();
     }
 
-    /// @dev Reads current perp free margin (accountValue - marginUsed) via precompile
-    ///      and sends a class transfer (perp→spot) for that amount. Using accountValue
-    ///      alone would include margin locked by any still-open positions — HyperCore
-    ///      rejects class transfers that exceed withdrawable margin rather than filling
-    ///      partially, so we subtract marginUsed to stay within the withdrawable bound.
-    ///      No-ops when the precompile is unavailable or when free margin <= 0.
-    function _initiateClassTransfer() internal {
+    /// @notice Drain HC perp + HC spot back to the strategy's EVM USDC balance.
+    ///         Queues two CoreWriter actions in order: (1) `sendUsdClassTransfer`
+    ///         perp→spot for the current `freeMargin`, (2) `sendAsset` spot→EVM
+    ///         for the COMBINED post-class-transfer spot balance. HC processes
+    ///         them post-block in the same order — so step 2 sees the freshly-
+    ///         class-transferred amount on top of any pre-existing HC spot.
+    /// @dev    Reads pre-block state via precompiles (`ACCOUNT_MARGIN_SUMMARY`
+    ///         + `SPOT_BALANCE`). HC processes actions sequentially per submitter,
+    ///         so combining the pre-existing spot with the freshly moved perp
+    ///         margin is the correct projected post-state.
+    /// @dev    `accountValue - marginUsed` (perp 6-decimal) gives the
+    ///         withdrawable amount with positions still open — HC rejects
+    ///         class transfers exceeding withdrawable rather than partial-
+    ///         filling. Multiplied by `PERP_TO_SPOT_WEI` (100) for the spot
+    ///         8-decimal denomination of `sendAsset.amount`.
+    /// @dev    HYPE GAS: per `HyperliquidBridge.bridgeUsdcSpotToEvm` NatSpec,
+    ///         the spot→EVM leg consumes HC-side HYPE gas. If the strategy's
+    ///         HC HYPE balance is zero, that action silently no-ops on HC and
+    ///         USDC remains on HC spot — `sweepToVault()` retry recovers EVM
+    ///         arrivals; HYPE-funded re-call of `initiateReturn()` recovers
+    ///         the spot leftover.
+    /// @dev    No-ops gracefully when precompiles are unavailable (non-
+    ///         HyperEVM env / fork tests without etched precompiles).
+    function _initiateReturn() internal {
+        // Read pre-block perp account margin summary
         (bool ok, bytes memory ret) = L1Read.ACCOUNT_MARGIN_SUMMARY_PRECOMPILE_ADDRESS
         .staticcall{gas: L1Read.ACCOUNT_MARGIN_SUMMARY_GAS}(
             abi.encode(uint32(0), address(this))
         );
-        if (!ok || ret.length < 128) return;
-        AccountMarginSummary memory s = abi.decode(ret, (AccountMarginSummary));
-        if (s.accountValue <= 0) return;
-        // marginUsed ≤ accountValue for solvent accounts; int64 cast is safe because
-        // marginUsed > int64.max would require ~$9.2T in perp positions.
-        int64 freeMargin = s.accountValue - int64(s.marginUsed);
-        if (freeMargin <= 0) return;
-        L1Write.sendUsdClassTransfer(uint64(freeMargin), false);
+
+        // Pre-existing HC spot balance for USDC (token 0). Read defensively —
+        // SPOT_BALANCE precompile address may be missing on non-HC envs.
+        (bool spotOk, bytes memory spotRet) = L1Read.SPOT_BALANCE_PRECOMPILE_ADDRESS
+        .staticcall{gas: L1Read.SPOT_BALANCE_GAS}(
+            abi.encode(address(this), uint64(HyperliquidBridge.USDC_TOKEN_INDEX))
+        );
+        uint64 preSpot = 0;
+        if (spotOk && spotRet.length >= 96) {
+            SpotBalance memory sb = abi.decode(spotRet, (SpotBalance));
+            preSpot = sb.total;
+        }
+
+        // Compute perp→spot amount (6-decimal) and queue class transfer.
+        uint64 perpToSpot = 0;
+        if (ok && ret.length >= 128) {
+            AccountMarginSummary memory s = abi.decode(ret, (AccountMarginSummary));
+            if (s.accountValue > 0) {
+                int64 freeMargin = s.accountValue - int64(s.marginUsed);
+                if (freeMargin > 0) {
+                    perpToSpot = uint64(freeMargin);
+                    L1Write.sendUsdClassTransfer(perpToSpot, false);
+                }
+            }
+        }
+
+        // Combined projected HC spot balance after class transfer
+        // (8-decimal). Queue the spot→EVM bridge for the full amount.
+        // perpToSpot * 100 cannot overflow uint64 unless perpToSpot >
+        // ~1.8e17 (=$1.8e11 USDC), which is unreachable in practice.
+        uint64 totalSpotWei = preSpot + perpToSpot * HyperliquidBridge.PERP_TO_SPOT_WEI;
+        HyperliquidBridge.bridgeUsdcSpotToEvm(totalSpotWei);
     }
 
     /// @dev Drains `_liveCloids[ai]` by popping from the tail, so each cancel

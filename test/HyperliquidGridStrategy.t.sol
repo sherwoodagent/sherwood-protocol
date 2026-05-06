@@ -286,6 +286,32 @@ contract HyperliquidGridStrategyTest is Test {
         }
     }
 
+    function test_settle_queuesSpotToEvmBridge() public {
+        // _initiateReturn must queue a sendAsset (action 13) targeting the
+        // USDC system address (0x2000...0000) so HC drains spot back to EVM.
+        // Without this, USDC arriving on HC spot from the perp→spot class
+        // transfer would strand on HC indefinitely.
+        _execAndPrep();
+        MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
+        m.setSummary(int64(int256(uint256(8_000e6))), uint64(2_000e6), 0, 0); // freeMargin = 6_000e6
+
+        vm.recordLogs();
+        vm.prank(vault);
+        strategy.settle();
+
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        (bool found, SendAssetCall memory call) = _findSendAsset(logs);
+        assertTrue(found, "settle must queue spot->EVM sendAsset bridge");
+        // USDC system address = BASE_SYSTEM_ADDRESS + token_index_0
+        assertEq(call.destination, address(0x2000000000000000000000000000000000000000));
+        assertEq(call.subAccount, address(0));
+        assertEq(call.sourceDex, type(uint32).max); // SPOT_DEX
+        assertEq(call.destinationDex, type(uint32).max);
+        assertEq(call.token, uint64(0)); // USDC
+        // 6_000e6 perp * 100 = 6_000e8 spot wei. preSpot = 0 in this test.
+        assertEq(call.amount, uint64(6_000e6) * 100);
+    }
+
     function test_sweepToVault_pullsLateHcArrivals() public {
         // settle() pushed the initial DEPOSIT. HC may auto-credit the
         // strategy's EVM USDC later (post-block bridge). sweepToVault()
@@ -599,6 +625,33 @@ contract HyperliquidGridStrategyTest is Test {
     // ── Helpers ──
 
     bytes4 constant CLASS_TRANSFER_ACTION = 0x01000007;
+    bytes4 constant SEND_ASSET_ACTION = 0x0100000d;
+
+    /// @dev Decoded sendAsset action used by spot→EVM bridge regression tests.
+    struct SendAssetCall {
+        address destination;
+        address subAccount;
+        uint32 sourceDex;
+        uint32 destinationDex;
+        uint64 token;
+        uint64 amount;
+    }
+
+    function _findSendAsset(Vm.Log[] memory logs) internal view returns (bool found, SendAssetCall memory call) {
+        bytes32 sig = keccak256("RawAction(address,bytes)");
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].topics[0] != sig) continue;
+            bytes memory raw = abi.decode(logs[i].data, (bytes));
+            if (raw.length < 4 || bytes4(raw) != SEND_ASSET_ACTION) continue;
+            bytes memory payload = new bytes(raw.length - 4);
+            for (uint256 j = 0; j < payload.length; j++) {
+                payload[j] = raw[j + 4];
+            }
+            (call.destination, call.subAccount, call.sourceDex, call.destinationDex, call.token, call.amount) =
+                abi.decode(payload, (address, address, uint32, uint32, uint64, uint64));
+            return (true, call);
+        }
+    }
 
     function _countClassTransferLogs(Vm.Log[] memory logs) internal view returns (uint256 count) {
         bytes32 sig = keccak256("RawAction(address,bytes)");

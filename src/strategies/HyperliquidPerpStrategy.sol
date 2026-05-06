@@ -373,7 +373,7 @@ contract HyperliquidPerpStrategy is BaseStrategy {
         // rejects class transfers exceeding withdrawable margin rather than
         // partial-filling, so passing the exact freeMargin avoids stranding
         // funds (mirrors grid's `_initiateClassTransfer`).
-        _initiateClassTransfer();
+        _initiateReturn();
 
         // Push EVM USDC balance to vault. Covers the case where HC bridge
         // never landed (registration failed, USDC sat on EVM throughout) and
@@ -434,24 +434,50 @@ contract HyperliquidPerpStrategy is BaseStrategy {
         }
     }
 
-    /// @dev Reads current perp free margin (accountValue - marginUsed) via
-    ///      precompile and sends a class transfer (perp→spot) for that
-    ///      amount. accountValue is in 6-decimal USDC (HL convention: perp =
-    ///      spot-wei / 100, where USDC spot wei is 8-decimal). marginUsed is
-    ///      subtracted because HC rejects class transfers exceeding
-    ///      withdrawable margin rather than partial-filling. No-ops when the
-    ///      precompile is unavailable (non-HyperEVM env) or free margin <= 0.
-    function _initiateClassTransfer() internal {
+    /// @notice Drain HC perp + HC spot back to the strategy's EVM USDC
+    ///         balance. See `HyperliquidGridStrategy._initiateReturn` for
+    ///         full design rationale (perp→spot class transfer + spot→EVM
+    ///         bridge via Circle's CoreDepositWallet).
+    /// @dev    HYPE GAS: spot→EVM consumes HC HYPE; if absent, that leg
+    ///         no-ops on HC and `sweepToVault()` recovers EVM arrivals.
+    ///         A HYPE-funded retry of `initiateReturn()` drains stuck spot.
+    function _initiateReturn() internal {
         (bool ok, bytes memory ret) = L1Read.ACCOUNT_MARGIN_SUMMARY_PRECOMPILE_ADDRESS
         .staticcall{gas: L1Read.ACCOUNT_MARGIN_SUMMARY_GAS}(
             abi.encode(uint32(0), address(this))
         );
-        if (!ok || ret.length < 128) return;
-        AccountMarginSummary memory s = abi.decode(ret, (AccountMarginSummary));
-        if (s.accountValue <= 0) return;
-        int64 freeMargin = s.accountValue - int64(s.marginUsed);
-        if (freeMargin <= 0) return;
-        L1Write.sendUsdClassTransfer(uint64(freeMargin), false);
+
+        (bool spotOk, bytes memory spotRet) = L1Read.SPOT_BALANCE_PRECOMPILE_ADDRESS
+        .staticcall{gas: L1Read.SPOT_BALANCE_GAS}(
+            abi.encode(address(this), uint64(HyperliquidBridge.USDC_TOKEN_INDEX))
+        );
+        uint64 preSpot = 0;
+        if (spotOk && spotRet.length >= 96) {
+            SpotBalance memory sb = abi.decode(spotRet, (SpotBalance));
+            preSpot = sb.total;
+        }
+
+        uint64 perpToSpot = 0;
+        if (ok && ret.length >= 128) {
+            AccountMarginSummary memory s = abi.decode(ret, (AccountMarginSummary));
+            if (s.accountValue > 0) {
+                int64 freeMargin = s.accountValue - int64(s.marginUsed);
+                if (freeMargin > 0) {
+                    perpToSpot = uint64(freeMargin);
+                    L1Write.sendUsdClassTransfer(perpToSpot, false);
+                }
+            }
+        }
+
+        uint64 totalSpotWei = preSpot + perpToSpot * HyperliquidBridge.PERP_TO_SPOT_WEI;
+        HyperliquidBridge.bridgeUsdcSpotToEvm(totalSpotWei);
+    }
+
+    /// @notice Re-fire both legs of the HC drain (perp→spot + spot→EVM)
+    ///         for residual margin after settlement. Permissionless.
+    function initiateReturn() external {
+        if (!settled) revert NotSweepable();
+        _initiateReturn();
     }
 
     /// @inheritdoc BaseStrategy
