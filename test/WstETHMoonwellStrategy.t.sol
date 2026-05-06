@@ -57,6 +57,12 @@ contract MockMwstETH {
         exchangeRate = rate;
     }
 
+    /// @dev Strategy reads `exchangeRateStored()` (cToken convention) for live NAV.
+    ///      Returns the same value as the public `exchangeRate` variable.
+    function exchangeRateStored() external view returns (uint256) {
+        return exchangeRate;
+    }
+
     function mint(uint256 mintAmount) external returns (uint256) {
         underlying.transferFrom(msg.sender, address(this), mintAmount);
         uint256 mTokens = (mintAmount * 1e18) / exchangeRate;
@@ -88,6 +94,32 @@ contract MockFailingMint {
     }
 }
 
+/// @notice Mock Chainlink AggregatorV3 returning a configurable WSTETH/ETH price.
+contract MockChainlinkAggregator {
+    uint8 public decimals;
+    int256 public answer;
+    uint256 public updatedAt;
+
+    constructor(uint8 _decimals, int256 _initialAnswer) {
+        decimals = _decimals;
+        answer = _initialAnswer;
+        updatedAt = block.timestamp;
+    }
+
+    function set(int256 _answer, uint256 _updatedAt) external {
+        answer = _answer;
+        updatedAt = _updatedAt;
+    }
+
+    function latestRoundData()
+        external
+        view
+        returns (uint80 roundId, int256 _answer, uint256 startedAt, uint256 _updatedAt, uint80 answeredInRound)
+    {
+        return (1, answer, updatedAt, updatedAt, 1);
+    }
+}
+
 /// @notice Mock cToken that always fails redeem
 contract MockFailingRedeem {
     mapping(address => uint256) public balanceOf;
@@ -111,12 +143,15 @@ contract WstETHMoonwellStrategyTest is Test {
     ERC20Mock public wstethToken;
     MockMwstETH public mwstethToken;
     MockAeroRouter public aeroRouterMock;
+    MockChainlinkAggregator public oracleMock;
 
     address public vault = makeAddr("vault");
     address public proposer = makeAddr("proposer");
     address public aeroFactory = makeAddr("aeroFactory");
 
     uint256 constant SUPPLY_AMOUNT = 25e18; // 25 WETH
+    // Oracle: 1 wstETH = 1.18 WETH (typical wstETH/ETH near 1.18 in 2026), 18 decimals.
+    int256 constant WSTETH_ETH_PRICE_18 = 1.18e18;
     // Per-unit rates (1e18-scaled). Mock rate 0.85 WETH→wstETH; allow down to 0.80.
     uint256 constant MIN_WSTETH_OUT_PER_WETH = 0.8e18;
     // Mock rate 1.1765 wstETH→WETH; allow down to 0.95.
@@ -142,6 +177,9 @@ contract WstETHMoonwellStrategyTest is Test {
         aeroRouterMock.setRate(address(wethToken), address(wstethToken), WETH_WSTETH_RATE);
         aeroRouterMock.setRate(address(wstethToken), address(wethToken), WSTETH_WETH_RATE);
 
+        // Deploy mock Chainlink WSTETH/ETH feed (18 decimals, fresh price)
+        oracleMock = new MockChainlinkAggregator(18, WSTETH_ETH_PRICE_18);
+
         // Fund the vault with WETH
         wethToken.mint(vault, 100e18);
 
@@ -151,17 +189,7 @@ contract WstETHMoonwellStrategyTest is Test {
         strategy = WstETHMoonwellStrategy(clone);
 
         // Initialize
-        WstETHMoonwellStrategy.InitParams memory params = WstETHMoonwellStrategy.InitParams({
-            weth: address(wethToken),
-            wsteth: address(wstethToken),
-            mwsteth: address(mwstethToken),
-            aeroRouter: address(aeroRouterMock),
-            aeroFactory: aeroFactory,
-            supplyAmount: SUPPLY_AMOUNT,
-            minWstethOutPerWeth: MIN_WSTETH_OUT_PER_WETH,
-            minWethOutPerWsteth: MIN_WETH_OUT_PER_WSTETH,
-            deadlineOffset: DEADLINE_OFFSET
-        });
+        WstETHMoonwellStrategy.InitParams memory params = _defaultParams();
         strategy.initialize(vault, proposer, abi.encode(params));
     }
 
@@ -175,6 +203,7 @@ contract WstETHMoonwellStrategyTest is Test {
         assertEq(strategy.mwsteth(), address(mwstethToken));
         assertEq(strategy.aeroRouter(), address(aeroRouterMock));
         assertEq(strategy.aeroFactory(), aeroFactory);
+        assertEq(strategy.chainlinkWstethEthFeed(), address(oracleMock));
         assertEq(strategy.supplyAmount(), SUPPLY_AMOUNT);
         assertEq(strategy.minWstethOutPerWeth(), MIN_WSTETH_OUT_PER_WETH);
         assertEq(strategy.minWethOutPerWsteth(), MIN_WETH_OUT_PER_WSTETH);
@@ -237,6 +266,14 @@ contract WstETHMoonwellStrategyTest is Test {
         params.minWstethOutPerWeth = 0;
         address clone = Clones.clone(address(template));
         vm.expectRevert(WstETHMoonwellStrategy.InvalidAmount.selector);
+        WstETHMoonwellStrategy(clone).initialize(vault, proposer, abi.encode(params));
+    }
+
+    function test_initialize_zeroChainlinkFeed_reverts() public {
+        WstETHMoonwellStrategy.InitParams memory params = _defaultParams();
+        params.chainlinkWstethEthFeed = address(0);
+        address clone = Clones.clone(address(template));
+        vm.expectRevert(BaseStrategy.ZeroAddress.selector);
         WstETHMoonwellStrategy(clone).initialize(vault, proposer, abi.encode(params));
     }
 
@@ -512,19 +549,97 @@ contract WstETHMoonwellStrategyTest is Test {
     }
 
     // ==================== POSITION VALUE ====================
-    // Inherits BaseStrategy's (0, false) default — see contract comment
-    // for rationale (Base bridged wstETH has no rate view).
+    //
+    // _positionValue reads the Chainlink WSTETH/ETH feed + Moonwell mwstETH
+    // exchange rate to compute the strategy's WETH-equivalent NAV. Returns
+    // valid=false before execute / when the oracle is stale or non-positive.
 
-    function test_positionValue_alwaysStubbed() public {
+    function test_positionValue_pending_returnsInvalid() public view {
         (uint256 value, bool valid) = strategy.positionValue();
         assertEq(value, 0);
         assertFalse(valid);
+    }
 
+    function test_positionValue_executed_returnsWethValue() public {
         _executeStrategy();
+        // After execute we hold mwstETH representing 25 WETH * 0.85 = 21.25 wstETH.
+        // Oracle: 1 wstETH = 1.18 WETH → expected NAV ≈ 21.25 * 1.18 = 25.075 WETH.
+        (uint256 value, bool valid) = strategy.positionValue();
+        assertTrue(valid);
+        // Allow ±1% rounding for integer math.
+        assertApproxEqRel(value, uint256(25.075e18), 0.01e18);
+    }
 
-        (value, valid) = strategy.positionValue();
+    function test_positionValue_staleOracle_returnsInvalid() public {
+        _executeStrategy();
+        // Lock the oracle update at "now", then warp >25h forward so it stales out.
+        uint256 stalePoint = vm.getBlockTimestamp();
+        oracleMock.set(WSTETH_ETH_PRICE_18, stalePoint);
+        vm.warp(stalePoint + 26 hours);
+        (uint256 value, bool valid) = strategy.positionValue();
         assertEq(value, 0);
         assertFalse(valid);
+    }
+
+    function test_positionValue_zeroOracleAnswer_returnsInvalid() public {
+        _executeStrategy();
+        oracleMock.set(int256(0), vm.getBlockTimestamp());
+        (uint256 value, bool valid) = strategy.positionValue();
+        assertEq(value, 0);
+        assertFalse(valid);
+    }
+
+    function test_positionValue_negativeAnswer_returnsInvalid() public {
+        _executeStrategy();
+        oracleMock.set(int256(-1e18), vm.getBlockTimestamp());
+        (uint256 value, bool valid) = strategy.positionValue();
+        assertEq(value, 0);
+        assertFalse(valid);
+    }
+
+    // ==================== ON LIVE DEPOSIT ====================
+
+    function test_onLiveDeposit_swapsAndMints() public {
+        _executeStrategy();
+
+        // Vault sends 5 WETH directly to the strategy (mirrors SyndicateVault._deposit).
+        uint256 newDeposit = 5e18;
+        vm.prank(vault);
+        wethToken.transfer(address(strategy), newDeposit);
+        uint256 mwstethBefore = mwstethToken.balanceOf(address(strategy));
+
+        vm.prank(vault);
+        strategy.onLiveDeposit(newDeposit);
+
+        // Should have minted additional mwstETH against the swapped wstETH.
+        uint256 mwstethAfter = mwstethToken.balanceOf(address(strategy));
+        assertGt(mwstethAfter, mwstethBefore);
+        // No WETH or wstETH residue left on the strategy.
+        assertEq(wethToken.balanceOf(address(strategy)), 0);
+        assertEq(wstethToken.balanceOf(address(strategy)), 0);
+    }
+
+    function test_onLiveDeposit_zeroAssets_isNoop() public {
+        _executeStrategy();
+        uint256 mwstethBefore = mwstethToken.balanceOf(address(strategy));
+        vm.prank(vault);
+        strategy.onLiveDeposit(0);
+        assertEq(mwstethToken.balanceOf(address(strategy)), mwstethBefore);
+    }
+
+    function test_onLiveDeposit_onlyVault() public {
+        _executeStrategy();
+        vm.prank(proposer);
+        vm.expectRevert(BaseStrategy.NotVault.selector);
+        strategy.onLiveDeposit(1e18);
+    }
+
+    function test_onLiveDeposit_beforeExecute_isNoop() public {
+        // Default no-op gate in BaseStrategy: returns silently when state != Executed.
+        vm.prank(vault);
+        strategy.onLiveDeposit(1e18);
+        // No mwstETH minted, no swap performed.
+        assertEq(mwstethToken.balanceOf(address(strategy)), 0);
     }
 
     // ==================== CLONING ====================
@@ -569,6 +684,7 @@ contract WstETHMoonwellStrategyTest is Test {
             mwsteth: address(mwstethToken),
             aeroRouter: address(aeroRouterMock),
             aeroFactory: aeroFactory,
+            chainlinkWstethEthFeed: address(oracleMock),
             supplyAmount: SUPPLY_AMOUNT,
             minWstethOutPerWeth: MIN_WSTETH_OUT_PER_WETH,
             minWethOutPerWsteth: MIN_WETH_OUT_PER_WSTETH,
@@ -586,6 +702,8 @@ contract WstETHMoonwellStrategyForkTest is Test {
     address constant MWSTETH = 0x627Fe393Bc6EdDA28e99AE648fD6fF362514304b;
     address constant AERO_ROUTER = 0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43;
     address constant AERO_FACTORY = 0x420DD381b31aEf6683db6B902084cB0FFECe40Da;
+    /// @notice Chainlink WSTETH/ETH price feed on Base mainnet (heartbeat 24h, 18 decimals).
+    address constant CHAINLINK_WSTETH_ETH = 0x43a5C292A453A3bF3606fa856197f09D7B74251a;
 
     WstETHMoonwellStrategy public template;
     WstETHMoonwellStrategy public strategy;
@@ -620,6 +738,7 @@ contract WstETHMoonwellStrategyForkTest is Test {
             mwsteth: MWSTETH,
             aeroRouter: AERO_ROUTER,
             aeroFactory: AERO_FACTORY,
+            chainlinkWstethEthFeed: CHAINLINK_WSTETH_ETH,
             supplyAmount: SUPPLY_AMOUNT,
             minWstethOutPerWeth: 0.8e18, // 20% slippage tolerance for fork (per-unit rate, 1e18-scaled)
             minWethOutPerWsteth: 0.8e18, // 20% slippage tolerance for fork

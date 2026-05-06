@@ -6,6 +6,7 @@ import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {HyperliquidPerpStrategy} from "../src/strategies/HyperliquidPerpStrategy.sol";
 import {BaseStrategy} from "../src/strategies/BaseStrategy.sol";
 import {MockCoreWriter} from "./mocks/MockCoreWriter.sol";
+import {MockAccountMarginSummaryPrecompile} from "./mocks/MockAccountMarginSummaryPrecompile.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 
@@ -564,5 +565,98 @@ contract HyperliquidPerpStrategyTest is Test {
         vm.prank(proposer);
         vm.expectRevert(abi.encodeWithSelector(HyperliquidPerpStrategy.PositionTooLarge.selector, 3000e6, 1000e6));
         strat.updateParams(abi.encode(uint8(1), uint64(3000e6), uint64(1e6), uint64(2800e6), uint64(1e6)));
+    }
+
+    // ==================== POSITION VALUE / LIVE NAV ====================
+
+    function _etchAccountMarginSummary() internal returns (MockAccountMarginSummaryPrecompile) {
+        MockAccountMarginSummaryPrecompile m = new MockAccountMarginSummaryPrecompile();
+        vm.etch(0x000000000000000000000000000000000000080F, address(m).code);
+        return MockAccountMarginSummaryPrecompile(0x000000000000000000000000000000000000080F);
+    }
+
+    function test_positionValue_returnsAccountMarginEquity() public {
+        vm.prank(vault);
+        strategy.execute();
+        MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
+        m.setSummary(int64(int256(uint256(7_500e6))), 0, 0, 0);
+        (uint256 value, bool valid) = strategy.positionValue();
+        assertTrue(valid);
+        assertEq(value, 7_500e6);
+    }
+
+    function test_positionValue_clampsNegativeEquityToZero() public {
+        vm.prank(vault);
+        strategy.execute();
+        MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
+        m.setSummary(int64(-1_000), 0, 0, 0);
+        (uint256 value, bool valid) = strategy.positionValue();
+        assertTrue(valid);
+        assertEq(value, 0);
+    }
+
+    function test_positionValue_invalidWhenPrecompileMissing() public {
+        vm.prank(vault);
+        strategy.execute();
+        // No etch at 0x...080F: staticcall returns (true, 0 bytes) on EOA — gated by ret.length check
+        (uint256 value, bool valid) = strategy.positionValue();
+        assertFalse(valid);
+        assertEq(value, 0);
+    }
+
+    function test_positionValue_invalidBeforeExecute() public {
+        // BaseStrategy gates _positionValue behind State.Executed.
+        MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
+        m.setSummary(int64(int256(uint256(99_999e6))), 0, 0, 0);
+        (uint256 value, bool valid) = strategy.positionValue();
+        assertFalse(valid);
+        assertEq(value, 0);
+    }
+
+    // ==================== ON LIVE DEPOSIT ====================
+
+    function test_onLiveDeposit_routesToHcMargin() public {
+        vm.prank(vault);
+        strategy.execute();
+        // Vault pre-pushes liveAmount before calling the hook (matches SyndicateVault._deposit).
+        uint256 liveAmount = 2_500e6;
+        usdc.mint(address(strategy), liveAmount);
+        vm.prank(vault);
+        strategy.onLiveDeposit(liveAmount);
+        // Strategy still holds the USDC on the EVM side (HC auto-credits async); FundsParked
+        // event is emitted but not asserted here — covered by Grid suite via class-transfer log.
+        assertEq(usdc.balanceOf(address(strategy)), DEPOSIT + liveAmount);
+    }
+
+    function test_onLiveDeposit_zeroAmount_isNoop() public {
+        vm.prank(vault);
+        strategy.execute();
+        uint256 balBefore = usdc.balanceOf(address(strategy));
+        vm.prank(vault);
+        strategy.onLiveDeposit(0);
+        assertEq(usdc.balanceOf(address(strategy)), balBefore);
+    }
+
+    function test_onLiveDeposit_revertsOnOversizeAmount() public {
+        vm.prank(vault);
+        strategy.execute();
+        uint256 tooLarge = uint256(type(uint64).max) + 1;
+        vm.prank(vault);
+        vm.expectRevert(HyperliquidPerpStrategy.DepositAmountTooLarge.selector);
+        strategy.onLiveDeposit(tooLarge);
+    }
+
+    function test_onLiveDeposit_onlyVault() public {
+        vm.prank(vault);
+        strategy.execute();
+        vm.prank(proposer);
+        vm.expectRevert(BaseStrategy.NotVault.selector);
+        strategy.onLiveDeposit(1e6);
+    }
+
+    function test_onLiveDeposit_beforeExecute_isNoop() public {
+        // Default no-op gate in BaseStrategy: returns silently when state != Executed.
+        vm.prank(vault);
+        strategy.onLiveDeposit(1e6);
     }
 }

@@ -9,6 +9,8 @@ import {AerodromeLPStrategy} from "../src/strategies/AerodromeLPStrategy.sol";
 import {VeniceInferenceStrategy} from "../src/strategies/VeniceInferenceStrategy.sol";
 import {WstETHMoonwellStrategy} from "../src/strategies/WstETHMoonwellStrategy.sol";
 import {MamoYieldStrategy} from "../src/strategies/MamoYieldStrategy.sol";
+import {PortfolioStrategy} from "../src/strategies/PortfolioStrategy.sol";
+import {UniswapSwapAdapter} from "../src/adapters/UniswapSwapAdapter.sol";
 import {HyperliquidPerpStrategy} from "../src/strategies/HyperliquidPerpStrategy.sol";
 import {HyperliquidGridStrategy} from "../src/strategies/HyperliquidGridStrategy.sol";
 
@@ -18,6 +20,11 @@ import {HyperliquidGridStrategy} from "../src/strategies/HyperliquidGridStrategy
  *
  *         Skips templates already deployed (address exists in chains/{chainId}.json).
  *         Appends new addresses and validates all templates after deployment.
+ *
+ *         Per-chain matrix:
+ *           Base (8453):   Moonwell, Aerodrome, Venice, wstETH, Mamo, Portfolio + UniswapSwapAdapter
+ *           HyperEVM (999): HyperliquidPerp, HyperliquidGrid
+ *           Other:          Moonwell, Aerodrome, Venice, wstETH, Mamo (Portfolio skipped if no Uniswap V3)
  *
  *   Usage:
  *     forge script script/DeployTemplates.s.sol:DeployTemplates \
@@ -30,6 +37,10 @@ import {HyperliquidGridStrategy} from "../src/strategies/HyperliquidGridStrategy
  *   patch where existing clones are unrecoverable on HC):
  *     FORCE_GRID_REDEPLOY=1 forge script script/DeployTemplates.s.sol:DeployTemplates \
  *       --rpc-url hyperevm --broadcast --account sherwood-agent
+ *
+ *   Force-redeploy `HyperliquidPerpStrategy` (e.g. after shipping a code upgrade):
+ *     FORCE_PERP_REDEPLOY=1 forge script script/DeployTemplates.s.sol:DeployTemplates \
+ *       --rpc-url hyperevm --broadcast --account sherwood-agent
  */
 contract DeployTemplates is ScriptBase {
     string constant MOONWELL_KEY = "MOONWELL_SUPPLY_TEMPLATE";
@@ -37,8 +48,22 @@ contract DeployTemplates is ScriptBase {
     string constant VENICE_KEY = "VENICE_INFERENCE_TEMPLATE";
     string constant WSTETH_KEY = "WSTETH_MOONWELL_TEMPLATE";
     string constant MAMO_KEY = "MAMO_YIELD_TEMPLATE";
+    string constant PORTFOLIO_KEY = "PORTFOLIO_TEMPLATE";
+    string constant UNISWAP_SWAP_ADAPTER_KEY = "UNISWAP_SWAP_ADAPTER";
     string constant HYPERLIQUID_KEY = "HYPERLIQUID_PERP_TEMPLATE";
     string constant HYPERLIQUID_GRID_KEY = "HYPERLIQUID_GRID_TEMPLATE";
+
+    // Uniswap V3 deployment per chain. Portfolio + UniswapSwapAdapter only deploy
+    // on chains where these are non-zero. Add new chains here when extending.
+    function _uniswapV3Router(uint256 chainId) internal pure returns (address) {
+        if (chainId == 8453) return 0x2626664c2603336E57B271c5C0b26F421741e481; // Base SwapRouter02
+        return address(0);
+    }
+
+    function _uniswapV3Quoter(uint256 chainId) internal pure returns (address) {
+        if (chainId == 8453) return 0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a; // Base QuoterV2
+        return address(0);
+    }
 
     struct Templates {
         address moonwell;
@@ -46,6 +71,8 @@ contract DeployTemplates is ScriptBase {
         address venice;
         address wsteth;
         address mamo;
+        address portfolio;
+        address uniswapSwapAdapter;
         address hyperliquid;
         address hyperliquidGrid;
     }
@@ -62,10 +89,15 @@ contract DeployTemplates is ScriptBase {
         t.venice = _tryReadAddress(json, VENICE_KEY);
         t.wsteth = _tryReadAddress(json, WSTETH_KEY);
         t.mamo = _tryReadAddress(json, MAMO_KEY);
+        t.portfolio = _tryReadAddress(json, PORTFOLIO_KEY);
+        t.uniswapSwapAdapter = _tryReadAddress(json, UNISWAP_SWAP_ADAPTER_KEY);
         t.hyperliquid = _tryReadAddress(json, HYPERLIQUID_KEY);
         t.hyperliquidGrid = _tryReadAddress(json, HYPERLIQUID_GRID_KEY);
 
         bool isHyperEvm = block.chainid == 999;
+        // Portfolio + UniswapSwapAdapter deploy only where Uniswap V3 is wired.
+        // Currently Base mainnet (8453); extend `_uniswapV3*` per chain to enable.
+        bool hasUniswapV3 = _uniswapV3Router(block.chainid) != address(0);
         bool anyDeployed = false;
 
         console.log("\n=== Strategy Template Deployment ===\n");
@@ -138,11 +170,55 @@ contract DeployTemplates is ScriptBase {
             } else {
                 console.log("  Skipped  MamoYieldStrategy:        %s (already deployed)", t.mamo);
             }
+
+            // Portfolio + UniswapSwapAdapter ship as a pair — the strategy hardcodes
+            // the adapter address into each clone's InitParams, so they're always
+            // deployed together. Skip on chains without a known Uniswap V3 router.
+            if (hasUniswapV3) {
+                if (_needsDeploy(t.uniswapSwapAdapter)) {
+                    if (t.uniswapSwapAdapter != address(0)) {
+                        console.log(
+                            "  Stale    UniswapSwapAdapter:        %s (no code, redeploying)", t.uniswapSwapAdapter
+                        );
+                    }
+                    t.uniswapSwapAdapter = address(
+                        new UniswapSwapAdapter(_uniswapV3Router(block.chainid), _uniswapV3Quoter(block.chainid))
+                    );
+                    console.log("  Deployed UniswapSwapAdapter:        %s", t.uniswapSwapAdapter);
+                    anyDeployed = true;
+                } else {
+                    console.log("  Skipped  UniswapSwapAdapter:        %s (already deployed)", t.uniswapSwapAdapter);
+                }
+
+                if (_needsDeploy(t.portfolio)) {
+                    if (t.portfolio != address(0)) {
+                        console.log("  Stale    PortfolioStrategy:        %s (no code, redeploying)", t.portfolio);
+                    }
+                    t.portfolio = address(new PortfolioStrategy());
+                    console.log("  Deployed PortfolioStrategy:        %s", t.portfolio);
+                    anyDeployed = true;
+                } else {
+                    console.log("  Skipped  PortfolioStrategy:        %s (already deployed)", t.portfolio);
+                }
+            } else {
+                console.log("  Skipped  UniswapSwapAdapter:        N/A (no Uniswap V3 on chainId=%s)", block.chainid);
+                console.log("  Skipped  PortfolioStrategy:        N/A (no Uniswap V3 on chainId=%s)", block.chainid);
+            }
         }
 
         if (isHyperEvm) {
-            if (_needsDeploy(t.hyperliquid)) {
-                if (t.hyperliquid != address(0)) {
+            // Set `FORCE_PERP_REDEPLOY=1` to redeploy the Perp template even when
+            // an address with code is already on file (e.g. when shipping a code
+            // upgrade like the live-NAV / onLiveDeposit hooks). Mirrors the
+            // FORCE_GRID_REDEPLOY pattern below — defaults to false so normal
+            // runs stay idempotent.
+            bool forcePerpRedeploy = vm.envOr("FORCE_PERP_REDEPLOY", false);
+            if (_needsDeploy(t.hyperliquid) || forcePerpRedeploy) {
+                if (t.hyperliquid != address(0) && t.hyperliquid.code.length > 0) {
+                    console.log(
+                        "  Stale    HyperliquidPerpStrategy:  %s (FORCE_PERP_REDEPLOY=1, redeploying)", t.hyperliquid
+                    );
+                } else if (t.hyperliquid != address(0)) {
                     console.log("  Stale    HyperliquidPerpStrategy:  %s (no code, redeploying)", t.hyperliquid);
                 }
                 t.hyperliquid = address(new HyperliquidPerpStrategy());
@@ -192,6 +268,10 @@ contract DeployTemplates is ScriptBase {
                 vm.writeJson(vm.toString(t.venice), path, string.concat(".", VENICE_KEY));
                 vm.writeJson(vm.toString(t.wsteth), path, string.concat(".", WSTETH_KEY));
                 vm.writeJson(vm.toString(t.mamo), path, string.concat(".", MAMO_KEY));
+                if (hasUniswapV3) {
+                    vm.writeJson(vm.toString(t.uniswapSwapAdapter), path, string.concat(".", UNISWAP_SWAP_ADAPTER_KEY));
+                    vm.writeJson(vm.toString(t.portfolio), path, string.concat(".", PORTFOLIO_KEY));
+                }
             }
             console.log("\n  Addresses saved to %s", path);
         } else {
@@ -201,7 +281,7 @@ contract DeployTemplates is ScriptBase {
         // ── 4. Validate ──
 
         console.log("\n=== Validation ===\n");
-        _validate(t, isHyperEvm);
+        _validate(t, isHyperEvm, hasUniswapV3);
         console.log("\n  All validations passed.\n");
     }
 
@@ -227,7 +307,7 @@ contract DeployTemplates is ScriptBase {
     }
 
     /// @notice Validate all deployed templates have correct on-chain state.
-    function _validate(Templates memory t, bool isHyperEvm) internal view {
+    function _validate(Templates memory t, bool isHyperEvm, bool hasUniswapV3) internal view {
         // Each template should have code deployed (skip the five disabled-on-HyperEVM)
         if (isHyperEvm) {
             console.log("  MoonwellSupplyStrategy:  skipped (not on HyperEVM)");
@@ -235,6 +315,8 @@ contract DeployTemplates is ScriptBase {
             console.log("  VeniceInferenceStrategy: skipped (not on HyperEVM)");
             console.log("  WstETHMoonwellStrategy:  skipped (not on HyperEVM)");
             console.log("  MamoYieldStrategy:       skipped (not on HyperEVM)");
+            console.log("  UniswapSwapAdapter:      skipped (not on HyperEVM)");
+            console.log("  PortfolioStrategy:       skipped (not on HyperEVM)");
 
             require(t.hyperliquid.code.length > 0, "HyperliquidPerpStrategy: no code");
             console.log("  HyperliquidPerpStrategy: code OK (%s bytes)", t.hyperliquid.code.length);
@@ -262,6 +344,20 @@ contract DeployTemplates is ScriptBase {
 
             require(t.mamo.code.length > 0, "MamoYieldStrategy: no code");
             console.log("  MamoYieldStrategy:       code OK (%s bytes)", t.mamo.code.length);
+
+            if (hasUniswapV3) {
+                require(t.uniswapSwapAdapter.code.length > 0, "UniswapSwapAdapter: no code");
+                console.log("  UniswapSwapAdapter:      code OK (%s bytes)", t.uniswapSwapAdapter.code.length);
+
+                require(t.portfolio.code.length > 0, "PortfolioStrategy: no code");
+                console.log("  PortfolioStrategy:       code OK (%s bytes)", t.portfolio.code.length);
+
+                _validateName(t.portfolio, "Portfolio", "PortfolioStrategy");
+                require(IStrategy(t.portfolio).vault() == address(0), "PortfolioStrategy: already initialized");
+            } else {
+                console.log("  UniswapSwapAdapter:      skipped (no Uniswap V3)");
+                console.log("  PortfolioStrategy:       skipped (no Uniswap V3)");
+            }
 
             console.log("  HyperliquidPerpStrategy: skipped (not on HyperEVM)");
             console.log("  HyperliquidGridStrategy: skipped (not on HyperEVM)");

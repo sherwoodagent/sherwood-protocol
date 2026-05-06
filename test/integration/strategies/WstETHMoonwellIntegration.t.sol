@@ -24,6 +24,8 @@ contract WstETHMoonwellIntegrationTest is BaseIntegrationTest {
 
     address constant WSTETH = 0xc1CBa3fCea344f92D9239c08C0568f6F2F0ee452;
     address constant MWSTETH = 0x627Fe393Bc6EdDA28e99AE648fD6fF362514304b;
+    /// @notice Chainlink WSTETH/ETH price feed on Base mainnet (heartbeat 24h, 18 decimals).
+    address constant CHAINLINK_WSTETH_ETH = 0x43a5C292A453A3bF3606fa856197f09D7B74251a;
 
     address wstethTemplate;
 
@@ -108,6 +110,7 @@ contract WstETHMoonwellIntegrationTest is BaseIntegrationTest {
             mwsteth: MWSTETH,
             aeroRouter: AERO_ROUTER,
             aeroFactory: AERO_FACTORY,
+            chainlinkWstethEthFeed: CHAINLINK_WSTETH_ETH,
             supplyAmount: supplyAmount,
             minWstethOutPerWeth: 0.8e18, // 20% slippage tolerance (per-unit 1e18 rate)
             minWethOutPerWsteth: 0.8e18, // 20% slippage tolerance

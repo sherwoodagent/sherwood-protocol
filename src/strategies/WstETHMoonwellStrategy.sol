@@ -25,6 +25,18 @@ interface IAeroRouter {
     ) external returns (uint256[] memory amounts);
 }
 
+/// @notice Minimal Chainlink AggregatorV3 view-only interface (used for live NAV).
+///         Reading via `latestRoundData` keeps `_positionValue` `view`-callable;
+///         the data feed is updated by Chainlink on heartbeat or threshold so
+///         no on-chain refresh is required.
+interface IAggregatorV3 {
+    function decimals() external view returns (uint8);
+    function latestRoundData()
+        external
+        view
+        returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound);
+}
+
 /**
  * @title WstETHMoonwellStrategy
  * @notice Single-hop yield strategy: WETH → wstETH → Moonwell.
@@ -56,6 +68,14 @@ contract WstETHMoonwellStrategy is BaseStrategy {
     error RedeemFailed();
     error SwapFailed();
     error AlreadySettledParams();
+    error InvalidPrice();
+    error StalePrice();
+
+    /// @notice Maximum age of the Chainlink WSTETH/ETH price before live NAV
+    ///         drops `valid=false` (vault falls back to async-redeem queue).
+    ///         Base WSTETH/ETH heartbeat is 24h; we add a 1h buffer so a
+    ///         late round push doesn't immediately stale the feed.
+    uint256 public constant MAX_ORACLE_STALENESS = 25 hours;
 
     // ── Initialization parameters ──
     struct InitParams {
@@ -64,6 +84,7 @@ contract WstETHMoonwellStrategy is BaseStrategy {
         address mwsteth;
         address aeroRouter;
         address aeroFactory;
+        address chainlinkWstethEthFeed; // Chainlink WSTETH/ETH feed (e.g. Base 0x43a5C292…)
         uint256 supplyAmount;
         uint256 minWstethOutPerWeth; // rate (1e18): min wstETH per 1e18 WETH (execute swap)
         uint256 minWethOutPerWsteth; // rate (1e18): min WETH per 1e18 wstETH (settle swap)
@@ -76,6 +97,11 @@ contract WstETHMoonwellStrategy is BaseStrategy {
     address public mwsteth;
     address public aeroRouter;
     address public aeroFactory;
+    /// @notice Chainlink WSTETH/ETH price feed used by `_positionValue` for live NAV.
+    address public chainlinkWstethEthFeed;
+    /// @dev Cached at init from `IAggregatorV3.decimals()` so `_positionValue`
+    ///      stays cheap and avoids one external call per share-price read.
+    uint8 internal _oracleDecimals;
 
     uint256 public supplyAmount;
     uint256 public minWstethOutPerWeth;
@@ -93,6 +119,7 @@ contract WstETHMoonwellStrategy is BaseStrategy {
 
         if (p.weth == address(0) || p.wsteth == address(0) || p.mwsteth == address(0)) revert ZeroAddress();
         if (p.aeroRouter == address(0) || p.aeroFactory == address(0)) revert ZeroAddress();
+        if (p.chainlinkWstethEthFeed == address(0)) revert ZeroAddress();
         if (p.minWstethOutPerWeth == 0 || p.minWethOutPerWsteth == 0) revert InvalidAmount();
 
         weth = p.weth;
@@ -100,6 +127,9 @@ contract WstETHMoonwellStrategy is BaseStrategy {
         mwsteth = p.mwsteth;
         aeroRouter = p.aeroRouter;
         aeroFactory = p.aeroFactory;
+        chainlinkWstethEthFeed = p.chainlinkWstethEthFeed;
+        // Cache once — Chainlink feed decimals are immutable per feed.
+        _oracleDecimals = IAggregatorV3(p.chainlinkWstethEthFeed).decimals();
         supplyAmount = p.supplyAmount;
         minWstethOutPerWeth = p.minWstethOutPerWeth;
         minWethOutPerWsteth = p.minWethOutPerWsteth;
@@ -194,14 +224,70 @@ contract WstETHMoonwellStrategy is BaseStrategy {
         if (newDeadlineOffset > 0) deadlineOffset = newDeadlineOffset;
     }
 
-    // ── positionValue ──
-    // Inherits BaseStrategy's (0, false) default. On Base mainnet the
-    // bridged Lido wstETH (ERC20Bridged via OssifiableProxy) does NOT
-    // expose stEthPerToken / tokensPerStEth / any rate view — an earlier
-    // impl here that called stEthPerToken reverted on the forked
-    // mainnet integration test. The correct fix is to read Chainlink's
-    // WSTETH/ETH feed (Base: 0x43a5C292A453A3bF3606fa856197f09D7B74251a),
-    // which requires threading a new oracle address through InitParams
-    // and all construction callers (CLI + scripts). Deferred to a
-    // focused follow-up; keeping this stub honest in the meantime.
+    /// @inheritdoc BaseStrategy
+    /// @dev Live NAV in WETH (the vault asset). Reads the Chainlink WSTETH/ETH
+    ///      feed (view-only) and converts the strategy's mwstETH balance via
+    ///      `exchangeRateStored` into wstETH, then into WETH at the oracle
+    ///      price. Returns `valid=false` when the feed is stale (>25h old) or
+    ///      the reported price is non-positive — vault then falls back to the
+    ///      async-redeem queue, which is the safe default.
+    ///
+    ///      Note: `exchangeRateStored` is the last-accrued rate (no fresh
+    ///      interest). The one-block staleness is acceptable for a
+    ///      display-style NAV used to gate share-price math; it cannot be
+    ///      pumped because Compound/Moonwell rate updates are monotonic.
+    function _positionValue() internal view override returns (uint256, bool) {
+        (, int256 answer,, uint256 updatedAt,) = IAggregatorV3(chainlinkWstethEthFeed).latestRoundData();
+        if (answer <= 0) return (0, false);
+        if (updatedAt == 0 || block.timestamp - updatedAt > MAX_ORACLE_STALENESS) return (0, false);
+
+        uint256 oraclePow = 10 ** uint256(_oracleDecimals);
+        uint256 totalWstethWad;
+
+        // Position held inside Moonwell: mwstETH × exchangeRate / 1e18 → wstETH (18 dec)
+        uint256 mBal = ICToken(mwsteth).balanceOf(address(this));
+        if (mBal != 0) {
+            uint256 rate = ICToken(mwsteth).exchangeRateStored();
+            totalWstethWad += (mBal * rate) / 1e18;
+        }
+        // Any wstETH dust currently held on the strategy (e.g., during _onLiveDeposit
+        // between swap and mint) — counts toward NAV at oracle price.
+        totalWstethWad += IERC20(wsteth).balanceOf(address(this));
+
+        // Convert to WETH at oracle price (both 18 decimals; oracle scales by _oracleDecimals).
+        uint256 wethFromWsteth = (totalWstethWad * uint256(answer)) / oraclePow;
+
+        // Add raw WETH dust held on strategy (already in WETH terms).
+        uint256 totalWeth = wethFromWsteth + IERC20(weth).balanceOf(address(this));
+
+        return (totalWeth, true);
+    }
+
+    /// @notice Routes a mid-proposal LP deposit (vault asset = WETH) through
+    ///         the same swap+mint path as `_execute`. The vault has already
+    ///         pushed `assets` WETH to this contract before calling here, so
+    ///         we approve the router with the strategy's own balance — no
+    ///         `_pullFromVault` needed.
+    /// @dev    Slippage uses the same per-unit `minWstethOutPerWeth` rate as
+    ///         `_execute`. If the rate is mis-set the swap reverts and the
+    ///         vault catches the revert in its try/catch — assets stay on the
+    ///         strategy and are reclaimed at settle via `liveAdapterPrincipal`.
+    function _onLiveDeposit(uint256 assets) internal override {
+        if (assets == 0) return;
+
+        uint256 minWstethOut = (assets * minWstethOutPerWeth) / 1e18;
+        if (minWstethOut == 0) revert InvalidAmount();
+
+        IERC20(weth).forceApprove(aeroRouter, assets);
+        IAeroRouter.Route[] memory routes = new IAeroRouter.Route[](1);
+        routes[0] = IAeroRouter.Route({from: weth, to: wsteth, stable: true, factory: aeroFactory});
+        uint256[] memory amounts = IAeroRouter(aeroRouter)
+            .swapExactTokensForTokens(assets, minWstethOut, routes, address(this), block.timestamp + deadlineOffset);
+        uint256 wstethReceived = amounts[amounts.length - 1];
+        if (wstethReceived == 0) revert SwapFailed();
+
+        IERC20(wsteth).forceApprove(mwsteth, wstethReceived);
+        uint256 err = ICToken(mwsteth).mint(wstethReceived);
+        if (err != 0) revert MintFailed();
+    }
 }

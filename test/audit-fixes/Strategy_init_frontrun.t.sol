@@ -114,8 +114,11 @@ contract StrategyInitFrontrunTest is Test {
         weights[0] = 10_000;
         bytes[] memory extra = new bytes[](1);
         extra[0] = "";
-        bytes memory initData =
-            abi.encode(stubToken, makeAddr("adapter"), address(0), tokens, weights, uint256(1e6), uint256(100), extra);
+        uint8[] memory priceDecs = new uint8[](1);
+        priceDecs[0] = 18;
+        bytes memory initData = abi.encode(
+            stubToken, makeAddr("adapter"), address(0), tokens, weights, uint256(1e6), uint256(100), extra, priceDecs
+        );
 
         vm.prank(attacker);
         vm.expectRevert(BaseStrategy.AlreadyInitialized.selector);
@@ -125,14 +128,22 @@ contract StrategyInitFrontrunTest is Test {
     function test_portfolio_clone_initializes() public {
         PortfolioStrategy template = new PortfolioStrategy();
         address payable clone = payable(Clones.clone(address(template)));
+        address tokenA = makeAddr("tokenA");
+        // Mock decimals() so init can cache _assetDecimals + _tokenDecimals
+        vm.mockCall(stubToken, abi.encodeWithSignature("decimals()"), abi.encode(uint8(18)));
+        vm.mockCall(tokenA, abi.encodeWithSignature("decimals()"), abi.encode(uint8(18)));
+
         address[] memory tokens = new address[](1);
-        tokens[0] = makeAddr("tokenA");
+        tokens[0] = tokenA;
         uint256[] memory weights = new uint256[](1);
         weights[0] = 10_000;
         bytes[] memory extra = new bytes[](1);
         extra[0] = "";
-        bytes memory initData =
-            abi.encode(stubToken, makeAddr("adapter"), address(0), tokens, weights, uint256(1e6), uint256(100), extra);
+        uint8[] memory priceDecs = new uint8[](1);
+        priceDecs[0] = 18;
+        bytes memory initData = abi.encode(
+            stubToken, makeAddr("adapter"), address(0), tokens, weights, uint256(1e6), uint256(100), extra, priceDecs
+        );
 
         PortfolioStrategy(clone).initialize(vault, proposer, initData);
         assertEq(PortfolioStrategy(clone).vault(), vault);
@@ -148,6 +159,7 @@ contract StrategyInitFrontrunTest is Test {
             mwsteth: makeAddr("mwsteth"),
             aeroRouter: makeAddr("router"),
             aeroFactory: makeAddr("factory"),
+            chainlinkWstethEthFeed: makeAddr("chainlink"),
             supplyAmount: 1e18,
             minWstethOutPerWeth: 1e17,
             minWethOutPerWsteth: 1e17,
@@ -162,12 +174,17 @@ contract StrategyInitFrontrunTest is Test {
     function test_wsteth_clone_initializes() public {
         WstETHMoonwellStrategy template = new WstETHMoonwellStrategy();
         address payable clone = payable(Clones.clone(address(template)));
+        address feed = makeAddr("chainlink-wsteth-eth");
+        // Mock IAggregatorV3.decimals() so init can cache _oracleDecimals
+        vm.mockCall(feed, abi.encodeWithSignature("decimals()"), abi.encode(uint8(18)));
+
         WstETHMoonwellStrategy.InitParams memory p = WstETHMoonwellStrategy.InitParams({
             weth: stubToken,
             wsteth: makeAddr("wsteth"),
             mwsteth: makeAddr("mwsteth"),
             aeroRouter: makeAddr("router"),
             aeroFactory: makeAddr("factory"),
+            chainlinkWstethEthFeed: feed,
             supplyAmount: 1e18,
             minWstethOutPerWeth: 1e17,
             minWethOutPerWsteth: 1e17,

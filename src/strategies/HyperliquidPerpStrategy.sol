@@ -388,11 +388,38 @@ contract HyperliquidPerpStrategy is BaseStrategy {
         }
     }
 
-    // ── positionValue ──
-    // Inherits BaseStrategy's (0, false) default. A HyperEVM-native impl
-    // would wrap `L1Read.accountMarginSummary(...)` and return
-    // `accountValue` (clamped at zero, converted from 8-decimal USD to
-    // the asset's 6-decimal USDC). Deferred until there's fork-test
-    // infrastructure on HyperEVM; the existing `getMarginSummary()`
-    // view is already available for any caller that wants it directly.
+    /// @inheritdoc BaseStrategy
+    /// @dev Live NAV reads HyperCore perp account equity (already in USDC 6
+    ///      decimals — same denomination as the vault asset). On non-HyperEVM
+    ///      chains or any environment where the precompile is absent (EOA
+    ///      staticcall returns success=true with empty returndata, so we also
+    ///      check `ret.length`), `valid=false` and the vault falls back to
+    ///      queue-only behavior. Negative equity (severely underwater) returns
+    ///      `(0, true)` rather than reverting — share-price math should clamp,
+    ///      not blow up. EVM-side stranded USDC is not added here because the
+    ///      Executed-state invariant is "all vault funds parked on HC".
+    function _positionValue() internal view override returns (uint256, bool) {
+        (bool ok, bytes memory ret) = L1Read.ACCOUNT_MARGIN_SUMMARY_PRECOMPILE_ADDRESS
+        .staticcall{gas: L1Read.ACCOUNT_MARGIN_SUMMARY_GAS}(
+            abi.encode(uint32(0), address(this))
+        );
+        if (!ok || ret.length < 128) return (0, false);
+        AccountMarginSummary memory s = abi.decode(ret, (AccountMarginSummary));
+        if (s.accountValue <= 0) return (0, true);
+        return (uint256(int256(s.accountValue)), true);
+    }
+
+    /// @dev Routes a mid-proposal LP deposit into HC perp margin. Vault has
+    ///      already pushed `assets` USDC to this address before calling here.
+    ///      HC auto-credits spot (registration done at first execute), so a
+    ///      single class transfer moves the funds to perp margin immediately.
+    ///      The proposer sees the expanded margin and places additional trades
+    ///      via updateParams — no leverage re-push needed (leverage is per-asset,
+    ///      not account-wide).
+    function _onLiveDeposit(uint256 assets) internal override {
+        if (assets == 0) return;
+        if (assets > type(uint64).max) revert DepositAmountTooLarge();
+        L1Write.sendUsdClassTransfer(uint64(assets), true);
+        emit FundsParked(assets);
+    }
 }
