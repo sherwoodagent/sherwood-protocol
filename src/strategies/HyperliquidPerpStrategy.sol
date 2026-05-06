@@ -74,10 +74,6 @@ contract HyperliquidPerpStrategy is BaseStrategy {
     ///      (Hyperliquid's spec defines actions 1-15 only). Guardians review by
     ///      inspecting HyperCore state via `L1Read.position2` against this covenant.
     uint32 public leverage;
-    /// @dev Storage placeholder preserving slot layout for clones initialized
-    ///      before the on-chain leverage call was removed. Was `bool public
-    ///      leverageSentToCore`. Do not reuse — see PR #300 spec.
-    bool private __removed_leverageSentToCore;
     bool public hasActiveStopLoss; // Whether a GTC stop-loss is currently live
     bool public settled; // Whether _settle() has been called
     /// @dev Cumulative USDC pushed back to the vault across all sweepToVault() calls.
