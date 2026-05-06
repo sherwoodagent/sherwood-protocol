@@ -186,7 +186,6 @@ contract HyperliquidPerpStrategyTest is Test {
         strategy.execute();
 
         assertEq(uint8(strategy.state()), uint8(BaseStrategy.State.Executed));
-        assertEq(strategy.leverageSentToCore(), true);
         assertEq(usdc.balanceOf(address(strategy)), DEPOSIT);
     }
 

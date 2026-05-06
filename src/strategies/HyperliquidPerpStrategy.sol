@@ -35,7 +35,6 @@ contract HyperliquidPerpStrategy is BaseStrategy {
     event FundsParked(uint256 amount);
     event Settled();
     event FundsSwept(uint256 amount);
-    event LeverageUpdated(uint32 asset, uint32 leverage);
 
     // ── Errors ──
     error InvalidAmount();
@@ -68,8 +67,17 @@ contract HyperliquidPerpStrategy is BaseStrategy {
     IERC20 public asset;
     uint256 public depositAmount;
     uint32 public perpAssetIndex;
+    /// @notice The intended leverage for HyperCore positions opened by this strategy.
+    /// @dev Off-chain keepers MUST set this leverage on HyperCore via the exchange
+    ///      API (`updateLeverage`) before the proposal opens. The contract cannot
+    ///      enforce this on chain — there is no CoreWriter action for leverage
+    ///      (Hyperliquid's spec defines actions 1-15 only). Guardians review by
+    ///      inspecting HyperCore state via `L1Read.position2` against this covenant.
     uint32 public leverage;
-    bool public leverageSentToCore; // Whether leverage has been set on HyperCore
+    /// @dev Storage placeholder preserving slot layout for clones initialized
+    ///      before the on-chain leverage call was removed. Was `bool public
+    ///      leverageSentToCore`. Do not reuse — see PR #300 spec.
+    bool private __removed_leverageSentToCore;
     bool public hasActiveStopLoss; // Whether a GTC stop-loss is currently live
     bool public settled; // Whether _settle() has been called
     /// @dev Cumulative USDC pushed back to the vault across all sweepToVault() calls.
@@ -132,10 +140,8 @@ contract HyperliquidPerpStrategy is BaseStrategy {
 
         uint64 ntl = uint64(amountIn);
 
-        L1Write.sendUpdateLeverage(perpAssetIndex, true, leverage);
-        leverageSentToCore = true;
-        emit LeverageUpdated(perpAssetIndex, leverage);
-
+        // Leverage is set off-chain via the exchange API before the proposal opens.
+        // See `leverage` storage NatSpec.
         L1Write.sendUsdClassTransfer(ntl, true);
 
         emit FundsParked(amountIn);
@@ -169,12 +175,6 @@ contract HyperliquidPerpStrategy is BaseStrategy {
         if (action == ACTION_OPEN_LONG) {
             (, uint64 limitPx, uint64 sz, uint64 stopLossPx, uint64 stopLossSz) =
                 abi.decode(data, (uint8, uint64, uint64, uint64, uint64));
-
-            if (!leverageSentToCore) {
-                L1Write.sendUpdateLeverage(perpAssetIndex, true, leverage);
-                leverageSentToCore = true;
-                emit LeverageUpdated(perpAssetIndex, leverage);
-            }
 
             // On-chain position size check (approximate: sz * limitPx in 6-decimal USDC units)
             uint256 approxUsd = uint256(sz) * uint256(limitPx) / 1e6;
@@ -222,12 +222,6 @@ contract HyperliquidPerpStrategy is BaseStrategy {
             (, uint64 limitPx, uint64 sz, uint64 stopLossPx, uint64 stopLossSz) =
                 abi.decode(data, (uint8, uint64, uint64, uint64, uint64));
 
-            if (!leverageSentToCore) {
-                L1Write.sendUpdateLeverage(perpAssetIndex, true, leverage);
-                leverageSentToCore = true;
-                emit LeverageUpdated(perpAssetIndex, leverage);
-            }
-
             // On-chain position size check
             uint256 approxUsd = uint256(sz) * uint256(limitPx) / 1e6;
             if (approxUsd > maxPositionSize) revert PositionTooLarge(approxUsd, maxPositionSize);
@@ -259,9 +253,6 @@ contract HyperliquidPerpStrategy is BaseStrategy {
             // Decode: (action, assetIndex, limitPx, sz, stopLossPx, stopLossSz)
             (, uint32 ai, uint64 limitPx, uint64 sz, uint64 stopLossPx, uint64 stopLossSz) =
                 abi.decode(data, (uint8, uint32, uint64, uint64, uint64, uint64));
-
-            // Set leverage on HyperCore for this asset (idempotent per asset on HyperCore)
-            L1Write.sendUpdateLeverage(ai, true, leverage);
 
             // On-chain position size check
             uint256 approxUsd = uint256(sz) * uint256(limitPx) / 1e6;
