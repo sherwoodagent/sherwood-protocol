@@ -780,14 +780,13 @@ contract HyperliquidGridStrategyTest is Test {
         assertEq(_countClassTransferLogs(vm.getRecordedLogs()), 0, "same-block re-call must not re-fire");
     }
 
-    function test_positionValue_trustsObservableWhenHcVisibleAfterCircleFee() public {
+    function test_positionValue_trustsObservableWhenGapWithinCircleFeeTolerance() public {
         // Issue #1 regression: Circle's 1-USDC first-deposit fee leaves
         // inFlightToHc permanently above observable (we incremented by full
-        // bridged amount but HC only credits amount-fee). Once HC is visible
-        // (perp or spot > 0), positionValue must return observable directly,
-        // not the stale high-water mark.
+        // bridged amount but HC only credits amount-fee). When the gap is
+        // ≤ CORE_ACCOUNT_FEE_TOLERANCE (1 USDC), positionValue must trust
+        // live observable instead of the stale high-water mark.
         _execAndPrep();
-        // Pre-condition: _execute set inFlightToHc = DEPOSIT.
         assertEq(strategy.inFlightToHc(), DEPOSIT, "inFlight must be set by execute");
         // Simulate Circle fee: HC perp credits DEPOSIT - 1 USDC, EVM cleared.
         MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
@@ -795,9 +794,35 @@ contract HyperliquidGridStrategyTest is Test {
         usdc.burn(address(strategy), usdc.balanceOf(address(strategy)));
         (uint256 value, bool valid) = strategy.positionValue();
         assertTrue(valid);
-        // Without the fix, max(observable=DEPOSIT-1e6, inFlight=DEPOSIT) = DEPOSIT.
-        // With the fix, hcVisible > 0 → trust observable = DEPOSIT - 1e6.
-        assertEq(value, DEPOSIT - 1e6, "must trust observable when HC visible");
+        // observable = DEPOSIT - 1e6; gap = 1e6 = tolerance → trust observable.
+        assertEq(value, DEPOSIT - 1e6, "must trust observable when gap <= tolerance");
+    }
+
+    function test_positionValue_subsequentDepositInTransitUsesHighWater() public {
+        // Issue #1b regression: a SUBSEQUENT live deposit's in-transit window
+        // has HC visible from the prior bridge but observable trails
+        // inFlightToHc by the new in-flight amount. The prior `hcVisible > 0`
+        // short-circuit would under-report by the new in-flight amount; the
+        // tolerance fallback correctly falls back to the high-water mark when
+        // the gap exceeds CORE_ACCOUNT_FEE_TOLERANCE.
+        _execAndPrep();
+        // Simulate prior bridge fully credited: HC perp = 9_000e6, EVM = 0.
+        MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
+        m.setSummary(int64(int256(uint256(9_000e6))), uint64(0), 0, 0);
+        usdc.burn(address(strategy), usdc.balanceOf(address(strategy)));
+
+        // Force a higher inFlightToHc as if a subsequent live deposit just
+        // bumped it past the currently-visible HC balance (gap = 1_500e6 ≫
+        // 1 USDC tolerance). _execAndPrep already set inFlightToHc = DEPOSIT
+        // = 10_000e6, which gives a gap of exactly 10_000e6 - 9_000e6 =
+        // 1_000e6 — well above tolerance, so the fallback path fires.
+        assertEq(strategy.inFlightToHc(), DEPOSIT);
+
+        (uint256 value, bool valid) = strategy.positionValue();
+        assertTrue(valid);
+        // Old code: hcVisible=9_000e6 > 0 → return observable = 9_000e6 (UNDER).
+        // New code: gap = 10_000e6 - 9_000e6 = 1_000e6 > 1e6 → return inFlightToHc.
+        assertEq(value, DEPOSIT, "must use high-water when gap exceeds tolerance");
     }
 
     function test_positionValue_outboundInFlightCoversDrainTransitGap() public {
@@ -806,18 +831,29 @@ contract HyperliquidGridStrategyTest is Test {
         // HC visibility is restored, both sides report 0 — NAV would drop
         // to 0 and trigger share inflation. The high-water mark captured
         // in _initiateReturn covers that gap.
+        //
+        // Discriminating against the prior `inFlightToHc = DEPOSIT` set by
+        // `_execute`: pick a pre-drain HC total STRICTLY GREATER than DEPOSIT
+        // (simulating a profitable proposal). The new max-update in
+        // `_initiateReturn` MUST raise `inFlightToHc` from DEPOSIT to the
+        // higher pre-drain total. If the max-update code is deleted, the
+        // assertion fails because `inFlightToHc` would stay at DEPOSIT.
         _execAndPrep();
-        // Pre-drain: HC perp = 9_800e6, spot = 200e6 (= 200_00 spot wei * 100).
+        assertEq(strategy.inFlightToHc(), DEPOSIT, "preconditon: execute set high-water = DEPOSIT");
+
+        // Pre-drain: HC perp = 12_000e6, spot = 500e6 (= 500e6 * 100 spot wei).
+        // preDrainHcTotal = 12_500e6 > DEPOSIT (10_000e6).
         MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
-        m.setSummary(int64(int256(uint256(9_800e6))), uint64(0), 0, 0);
+        m.setSummary(int64(int256(uint256(12_000e6))), uint64(0), 0, 0);
         MockSpotBalancePrecompile sb = _etchSpotBalance();
-        sb.setSpot(uint64(200e6 * 100), 0, 0);
+        sb.setSpot(uint64(500e6 * 100), 0, 0);
 
         vm.prank(proposer);
         strategy.initiateReturn();
 
-        // Drain captured: inFlightToHc must be ≥ 9_800e6 + 200e6 = 10_000e6.
-        assertGe(strategy.inFlightToHc(), 10_000e6, "drain must lock high-water at pre-drain HC total");
+        // Drain captured: max-update must raise high-water to 12_500e6.
+        // assertEq is strict — only the new code can produce this value.
+        assertEq(strategy.inFlightToHc(), 12_500e6, "drain must raise high-water to pre-drain HC total");
 
         // Now simulate cross-block in-transit: HC precompiles report 0
         // (bridge processed, balances cleared) but EVM USDC hasn't arrived.
@@ -827,8 +863,8 @@ contract HyperliquidGridStrategyTest is Test {
 
         (uint256 value, bool valid) = strategy.positionValue();
         assertTrue(valid);
-        // observable = 0; high-water mark fills the gap.
-        assertGe(value, 10_000e6, "in-transit gap must be covered by high-water");
+        // observable = 0; gap = 12_500e6 ≫ tolerance → fallback to high-water.
+        assertEq(value, 12_500e6, "in-transit gap must be covered by high-water");
     }
 
     function test_initiateReturn_drainsHcOnPath1() public {
