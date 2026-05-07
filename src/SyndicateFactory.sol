@@ -169,6 +169,7 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     event OwnerRotated(address indexed vault, address indexed newOwner);
     event WithdrawalQueueDeployed(address indexed vault, address indexed queue);
     event GuardianRegistrySet(address indexed oldRegistry, address indexed newRegistry);
+    event EnsRegistrarUpdated(address indexed oldRegistrar, address indexed newRegistrar);
 
     struct InitParams {
         address owner;
@@ -351,6 +352,21 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     function setUpgradesEnabled(bool enabled) external onlyOwner {
         upgradesEnabled = enabled;
         emit UpgradesEnabledUpdated(enabled);
+    }
+
+    /// @notice Update the Durin L2 Registrar used for ENS subname registration on
+    ///         new syndicates. Setting `newRegistrar` to the zero address disables
+    ///         ENS registration on `createSyndicate` (the call is guarded by an
+    ///         `address(0)` check at line 282). This setter only affects FUTURE
+    ///         syndicates — existing syndicates that were created against a
+    ///         misconfigured registrar (e.g. zero) keep their on-chain state and
+    ///         must be backfilled per-syndicate by calling
+    ///         `IL2Registrar(registrar).register(subdomain, vault)` directly
+    ///         (the registrar's `register` is permissionless).
+    function setEnsRegistrar(address newRegistrar) external onlyOwner {
+        address old = address(ensRegistrar);
+        ensRegistrar = IL2Registrar(newRegistrar);
+        emit EnsRegistrarUpdated(old, newRegistrar);
     }
 
     /// @notice Re-point the factory at a new guardian registry. Used when WOOD
