@@ -24,8 +24,11 @@ contract HyperliquidGridStrategyTest is Test {
     uint32 constant LEVERAGE = 5;
     uint256 constant MAX_ORDER_SIZE = 100_000e6;
     uint32 constant MAX_ORDERS = 32;
-    uint32 constant BTC_ASSET = 3;
-    uint32 constant ETH_ASSET = 4;
+    // Hyperliquid mainnet perp asset indices (verified against PERP_ASSET_INFO
+    // precompile 0x...080a): BTC=0, ETH=1, ATOM=2, MATIC=3, DYDX=4, SOL=5.
+    // Universe is append-only — once assigned, indices never move.
+    uint32 constant BTC_ASSET = 0;
+    uint32 constant ETH_ASSET = 1;
     uint32 constant SOL_ASSET = 5;
 
     function setUp() public {
