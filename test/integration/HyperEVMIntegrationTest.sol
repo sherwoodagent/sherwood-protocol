@@ -32,17 +32,12 @@ import {ERC20Mock} from "../mocks/ERC20Mock.sol";
  */
 abstract contract HyperEVMIntegrationTest is Test {
     // ── HyperEVM mainnet addresses ──
-    // Canonical spot-linked USDC: tokens[0].evmContract.address from
-    // Hyperliquid's spotMeta API. The earlier-used bridged ERC20
-    // 0xb88339CB... is NOT linked to HC spot.
-    address constant USDC = 0x6B9E773128f453f5c2C60935Ee2DE2CBc5390A24;
+    address constant USDC = 0xb88339CB7199b77E23DB6E890353E22632Ba630f;
     address constant CORE_WRITER = 0x3333333333333333333333333333333333333333;
 
-    // Hyperliquid mainnet perp asset indices (verified via PERP_ASSET_INFO
-    // precompile 0x...080a): BTC=0, ETH=1, ATOM=2, MATIC=3, DYDX=4, SOL=5.
-    // Universe is append-only — once assigned, indices never move.
-    uint32 constant HL_BTC = 0;
-    uint32 constant HL_ETH = 1;
+    // Hyperliquid perp asset indices (current as of 2026-04)
+    uint32 constant HL_BTC = 3;
+    uint32 constant HL_ETH = 4;
     uint32 constant HL_SOL = 5;
 
     // ── Test actors ──
