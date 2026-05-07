@@ -200,6 +200,7 @@ contract PortfolioStrategy is BaseStrategy {
 
     function _execute() internal override {
         _pullFromVault(asset, totalAmount);
+        _recordPrincipal(totalAmount);
 
         uint256 len = _allocations.length;
         for (uint256 i; i < len; ++i) {

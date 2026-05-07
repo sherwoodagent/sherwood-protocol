@@ -210,6 +210,7 @@ contract HyperliquidGridStrategy is BaseStrategy {
         if (amountIn > type(uint64).max) revert DepositAmountTooLarge();
 
         _pullFromVault(address(asset), amountIn);
+        _recordPrincipal(amountIn);
 
         // Bridge EVM → HC spot via Circle's CoreDepositWallet. The prior model
         // assumed HC auto-credits the strategy's HC spot when an ERC-20 lands

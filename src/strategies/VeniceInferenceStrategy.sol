@@ -143,6 +143,7 @@ contract VeniceInferenceStrategy is BaseStrategy {
     function _execute() internal override {
         // 1. Pull asset from vault
         _pullFromVault(asset, assetAmount);
+        _recordPrincipal(assetAmount);
 
         uint256 vvvToStake;
 

@@ -508,4 +508,78 @@ contract MoonwellSupplyStrategyTest is Test {
         strategy.onLiveDeposit(0);
         assertEq(mUsdc.balanceOf(address(strategy)), mBalBefore, "no mint on zero");
     }
+
+    // ==================== NAV FLOOR (share-inflation defense) ====================
+
+    /// @notice The floor (50% of principal) returns valid=true when the
+    ///         strategy reports a value at or above the floor — honest
+    ///         losses up to half the principal still expose a live NAV.
+    function test_positionValue_floor_atExactly50pct_isValid() public {
+        vm.prank(vault);
+        usdc.approve(address(strategy), SUPPLY_AMOUNT);
+        vm.prank(vault);
+        strategy.execute();
+
+        assertEq(strategy.principal(), SUPPLY_AMOUNT, "principal recorded at execute");
+
+        // Exchange rate halved → reported value drops to 50% of principal.
+        mUsdc.setExchangeRate(0.5e18);
+        (uint256 value, bool valid) = strategy.positionValue();
+        assertTrue(valid, "exact-floor still valid");
+        assertEq(value, SUPPLY_AMOUNT / 2);
+    }
+
+    /// @notice Below the floor → valid=false. Closes the share-inflation
+    ///         attack: the vault's `_lpFlowGate` falls through to queue-only
+    ///         when `valid=false`, so a new depositor can't mint cheap
+    ///         shares against the under-reported NAV.
+    function test_positionValue_floor_belowFloor_isInvalid() public {
+        vm.prank(vault);
+        usdc.approve(address(strategy), SUPPLY_AMOUNT);
+        vm.prank(vault);
+        strategy.execute();
+
+        // 49% — just below the 50% floor.
+        mUsdc.setExchangeRate(0.49e18);
+        (uint256 value, bool valid) = strategy.positionValue();
+        assertFalse(valid, "below-floor must be invalid (queue-only)");
+        assertEq(value, 0, "value zeroed when invalid");
+    }
+
+    /// @notice The classic share-inflation symptom: positionValue=0 with
+    ///         non-zero principal must report invalid so the vault's
+    ///         deposit path reverts (LPs use the queue) instead of letting
+    ///         a new depositor mint against `totalAssets() ≈ 0`.
+    function test_positionValue_floor_zeroValue_withPrincipal_isInvalid() public {
+        vm.prank(vault);
+        usdc.approve(address(strategy), SUPPLY_AMOUNT);
+        vm.prank(vault);
+        strategy.execute();
+
+        // Simulate the bug we observed on-chain: oracle/precompile says 0.
+        mUsdc.setExchangeRate(0);
+        (uint256 value, bool valid) = strategy.positionValue();
+        assertFalse(valid);
+        assertEq(value, 0);
+    }
+
+    /// @notice `principal()` accumulates `_execute()` outflow plus
+    ///         every `onLiveDeposit` call, so the floor denominator
+    ///         reflects all in-flight capital.
+    function test_principal_accumulatesAcrossLiveDeposits() public {
+        vm.prank(vault);
+        usdc.approve(address(strategy), SUPPLY_AMOUNT);
+        vm.prank(vault);
+        strategy.execute();
+        assertEq(strategy.principal(), SUPPLY_AMOUNT);
+
+        // Simulate a mid-flight LP deposit: vault pre-pushes assets, then
+        // calls onLiveDeposit (mirrors SyndicateVault._deposit's push flow).
+        uint256 liveAmount = SUPPLY_AMOUNT / 4;
+        usdc.mint(address(strategy), liveAmount);
+        vm.prank(vault);
+        strategy.onLiveDeposit(liveAmount);
+
+        assertEq(strategy.principal(), SUPPLY_AMOUNT + liveAmount, "live deposit added");
+    }
 }

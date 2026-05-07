@@ -145,6 +145,13 @@ contract AerodromeLPStrategy is BaseStrategy {
         if (amountADesired > 0) _pullFromVault(tokenA, amountADesired);
         if (amountBDesired > 0) _pullFromVault(tokenB, amountBDesired);
 
+        // Record principal for the NAV-floor guard. Convention: tokenA is the
+        // vault asset (per the contract docstring — tokenB is acquired via a
+        // swap appended before this strategy in the batch). If a future
+        // deployment binds tokenB as the vault asset, swap the arg below;
+        // otherwise the floor degrades to over-permissive.
+        _recordPrincipal(amountADesired);
+
         // Approve router
         IERC20(tokenA).forceApprove(router, amountADesired);
         IERC20(tokenB).forceApprove(router, amountBDesired);

@@ -143,6 +143,7 @@ contract WstETHMoonwellStrategy is BaseStrategy {
 
         // 1. Pull WETH from vault
         _pullFromVault(weth, amountIn);
+        _recordPrincipal(amountIn);
 
         // 2. Swap WETH → wstETH via Aerodrome stable pool
         //    minOut scales with actual amountIn — safe for dynamic-all mode.
