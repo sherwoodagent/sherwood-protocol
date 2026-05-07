@@ -524,8 +524,8 @@ contract HyperliquidGridStrategy is BaseStrategy {
         // precompiles will report HC = 0 while EVM hasn't received yet. Lock
         // `inFlightToHc` to the pre-drain HC observable so NAV doesn't drop
         // to 0 in that gap. Once EVM USDC arrives, `_positionValue`'s
-        // tolerance fallback (observable + CORE_ACCOUNT_FEE_TOLERANCE >=
-        // inFlightToHc) brings NAV back to live observable.
+        // tolerance fallback (observable + HyperliquidBridge.CORE_ACCOUNT_FEE_TOLERANCE
+        // >= inFlightToHc) brings NAV back to live observable.
         uint256 preDrainPerpVal = preDrainAccountValue > 0 ? uint256(int256(preDrainAccountValue)) : 0;
         uint256 preDrainSpotVal = uint256(preSpot) / HyperliquidBridge.PERP_TO_SPOT_WEI;
         uint256 preDrainHcTotal = preDrainPerpVal + preDrainSpotVal;
@@ -617,8 +617,11 @@ contract HyperliquidGridStrategy is BaseStrategy {
     ///      outbound `_initiateReturn`) opens a gap ≫ tolerance, so the
     ///      fallback returns `inFlightToHc` and NAV stays stable.
     ///
-    ///      Always `valid=true` in `Executed` state — vault has pulled funds,
-    ///      so `totalAssets()` must report something concrete.
+    ///      Always `valid=true` in `Executed` state. Vault has already pulled
+    ///      funds in, and `valid=false` would degrade `totalAssets()` to the
+    ///      queue-only path — deposits would revert with `DepositsLocked` and
+    ///      the LP UI would brick. Conservatism (returning live `observable`
+    ///      or the high-water mark) is always preferable to flagging invalid.
     function _positionValue() internal view override returns (uint256, bool) {
         // Read HC perp account margin
         (bool success, bytes memory ret) = L1Read.ACCOUNT_MARGIN_SUMMARY_PRECOMPILE_ADDRESS
