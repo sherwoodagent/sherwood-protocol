@@ -780,6 +780,57 @@ contract HyperliquidGridStrategyTest is Test {
         assertEq(_countClassTransferLogs(vm.getRecordedLogs()), 0, "same-block re-call must not re-fire");
     }
 
+    function test_positionValue_trustsObservableWhenHcVisibleAfterCircleFee() public {
+        // Issue #1 regression: Circle's 1-USDC first-deposit fee leaves
+        // inFlightToHc permanently above observable (we incremented by full
+        // bridged amount but HC only credits amount-fee). Once HC is visible
+        // (perp or spot > 0), positionValue must return observable directly,
+        // not the stale high-water mark.
+        _execAndPrep();
+        // Pre-condition: _execute set inFlightToHc = DEPOSIT.
+        assertEq(strategy.inFlightToHc(), DEPOSIT, "inFlight must be set by execute");
+        // Simulate Circle fee: HC perp credits DEPOSIT - 1 USDC, EVM cleared.
+        MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
+        m.setSummary(int64(int256(uint256(DEPOSIT - 1e6))), uint64(0), 0, 0);
+        usdc.burn(address(strategy), usdc.balanceOf(address(strategy)));
+        (uint256 value, bool valid) = strategy.positionValue();
+        assertTrue(valid);
+        // Without the fix, max(observable=DEPOSIT-1e6, inFlight=DEPOSIT) = DEPOSIT.
+        // With the fix, hcVisible > 0 → trust observable = DEPOSIT - 1e6.
+        assertEq(value, DEPOSIT - 1e6, "must trust observable when HC visible");
+    }
+
+    function test_positionValue_outboundInFlightCoversDrainTransitGap() public {
+        // Issue #2 regression: after initiateReturn queues the spot→EVM
+        // bridge, HC processes async post-block. Until EVM USDC arrives or
+        // HC visibility is restored, both sides report 0 — NAV would drop
+        // to 0 and trigger share inflation. The high-water mark captured
+        // in _initiateReturn covers that gap.
+        _execAndPrep();
+        // Pre-drain: HC perp = 9_800e6, spot = 200e6 (= 200_00 spot wei * 100).
+        MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
+        m.setSummary(int64(int256(uint256(9_800e6))), uint64(0), 0, 0);
+        MockSpotBalancePrecompile sb = _etchSpotBalance();
+        sb.setSpot(uint64(200e6 * 100), 0, 0);
+
+        vm.prank(proposer);
+        strategy.initiateReturn();
+
+        // Drain captured: inFlightToHc must be ≥ 9_800e6 + 200e6 = 10_000e6.
+        assertGe(strategy.inFlightToHc(), 10_000e6, "drain must lock high-water at pre-drain HC total");
+
+        // Now simulate cross-block in-transit: HC precompiles report 0
+        // (bridge processed, balances cleared) but EVM USDC hasn't arrived.
+        m.setSummary(int64(0), uint64(0), 0, 0);
+        sb.setSpot(uint64(0), 0, 0);
+        usdc.burn(address(strategy), usdc.balanceOf(address(strategy)));
+
+        (uint256 value, bool valid) = strategy.positionValue();
+        assertTrue(valid);
+        // observable = 0; high-water mark fills the gap.
+        assertGe(value, 10_000e6, "in-transit gap must be covered by high-water");
+    }
+
     function test_initiateReturn_drainsHcOnPath1() public {
         // Path 1: proposer calls initiateReturn pre-settle. HC drain queues:
         // perp→spot class transfer + spot→EVM sendAsset. Then governor's

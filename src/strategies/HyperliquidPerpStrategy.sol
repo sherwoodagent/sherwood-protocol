@@ -422,9 +422,6 @@ contract HyperliquidPerpStrategy is BaseStrategy {
         }
 
         _initiateReturn();
-        // Funds are leaving HC — clear in-flight high-water mark so post-
-        // settle vault NAV doesn't double-count via inFlightToHc.
-        inFlightToHc = 0;
     }
 
     /// @notice Post-settle recovery for HC residuals. Re-fires the full HC
@@ -520,8 +517,10 @@ contract HyperliquidPerpStrategy is BaseStrategy {
         }
 
         uint64 perpToSpot = 0;
+        int64 preDrainAccountValue = 0;
         if (ok && ret.length >= 128) {
             AccountMarginSummary memory s = abi.decode(ret, (AccountMarginSummary));
+            preDrainAccountValue = s.accountValue;
             if (s.accountValue > 0) {
                 int64 freeMargin = s.accountValue - int64(s.marginUsed);
                 if (freeMargin > 0) {
@@ -533,6 +532,12 @@ contract HyperliquidPerpStrategy is BaseStrategy {
 
         uint64 totalSpotWei = preSpot + perpToSpot * HyperliquidBridge.PERP_TO_SPOT_WEI;
         HyperliquidBridge.bridgeUsdcSpotToEvm(totalSpotWei);
+
+        // Outbound in-transit high-water mark — see grid for rationale.
+        uint256 preDrainPerpVal = preDrainAccountValue > 0 ? uint256(int256(preDrainAccountValue)) : 0;
+        uint256 preDrainSpotVal = uint256(preSpot) / HyperliquidBridge.PERP_TO_SPOT_WEI;
+        uint256 preDrainHcTotal = preDrainPerpVal + preDrainSpotVal;
+        if (preDrainHcTotal > inFlightToHc) inFlightToHc = preDrainHcTotal;
     }
 
     /// @inheritdoc BaseStrategy
@@ -562,7 +567,12 @@ contract HyperliquidPerpStrategy is BaseStrategy {
         }
 
         uint256 evmBal = IERC20(asset).balanceOf(address(this));
-        uint256 observable = perpVal + spotVal + evmBal;
+        uint256 hcVisible = perpVal + spotVal;
+        uint256 observable = hcVisible + evmBal;
+
+        // Once HC is visible, trust observable directly — Circle 1-USDC fee
+        // would otherwise leave inFlightToHc permanently above observable.
+        if (hcVisible > 0) return (observable, true);
         return (observable >= inFlightToHc ? observable : inFlightToHc, true);
     }
 

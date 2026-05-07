@@ -417,10 +417,6 @@ contract HyperliquidGridStrategy is BaseStrategy {
             L1Write.sendLimitOrder(ai, true, type(uint64).max, type(uint64).max, true, TimeInForce.Ioc, NO_CLOID);
         }
         _initiateReturn();
-        // Funds are leaving HC — clear the in-flight high-water mark so
-        // post-settle vault NAV (which sums float + positionValue) doesn't
-        // double-count the bridged amount via inFlightToHc.
-        inFlightToHc = 0;
     }
 
     /// @notice Post-settle recovery for HC residuals. Re-fires the full HC
@@ -500,9 +496,13 @@ contract HyperliquidGridStrategy is BaseStrategy {
         }
 
         // Compute perp→spot amount (6-decimal) and queue class transfer.
+        // Also capture the full pre-drain perp account value (not just
+        // free margin) for the outbound in-transit high-water mark.
         uint64 perpToSpot = 0;
+        int64 preDrainAccountValue = 0;
         if (ok && ret.length >= 128) {
             AccountMarginSummary memory s = abi.decode(ret, (AccountMarginSummary));
+            preDrainAccountValue = s.accountValue;
             if (s.accountValue > 0) {
                 int64 freeMargin = s.accountValue - int64(s.marginUsed);
                 if (freeMargin > 0) {
@@ -518,6 +518,18 @@ contract HyperliquidGridStrategy is BaseStrategy {
         // ~1.8e17 (=$1.8e11 USDC), which is unreachable in practice.
         uint64 totalSpotWei = preSpot + perpToSpot * HyperliquidBridge.PERP_TO_SPOT_WEI;
         HyperliquidBridge.bridgeUsdcSpotToEvm(totalSpotWei);
+
+        // Outbound in-transit high-water mark: the spot→EVM bridge is async
+        // (HC processes post-block). Between this tx and HC's bridge ack, the
+        // precompiles will report HC = 0 while EVM hasn't received yet. Lock
+        // `inFlightToHc` to the pre-drain HC observable so NAV doesn't drop
+        // to 0 in that gap. Once EVM USDC arrives or HC re-activity restores
+        // visibility, `_positionValue`'s `hcVisible > 0` short-circuit (or
+        // observable >= inFlightToHc) brings NAV back to truth.
+        uint256 preDrainPerpVal = preDrainAccountValue > 0 ? uint256(int256(preDrainAccountValue)) : 0;
+        uint256 preDrainSpotVal = uint256(preSpot) / HyperliquidBridge.PERP_TO_SPOT_WEI;
+        uint256 preDrainHcTotal = preDrainPerpVal + preDrainSpotVal;
+        if (preDrainHcTotal > inFlightToHc) inFlightToHc = preDrainHcTotal;
     }
 
     /// @dev Drains `_liveCloids[ai]` by popping from the tail, so each cancel
@@ -642,13 +654,18 @@ contract HyperliquidGridStrategy is BaseStrategy {
         }
 
         uint256 evmBal = IERC20(asset).balanceOf(address(this));
-        uint256 observable = perpVal + spotVal + evmBal;
+        uint256 hcVisible = perpVal + spotVal;
+        uint256 observable = hcVisible + evmBal;
 
-        // High-water mark covers the cross-block in-transit window: when a
-        // bridge has been queued but HC's precompile snapshot doesn't yet
-        // reflect it, `observable < inFlightToHc`. Otherwise HC has caught
-        // up and observable >= inFlightToHc, so the max collapses to
-        // observable. `_drainHC` resets `inFlightToHc` when funds leave HC.
+        // Once HC has any visible balance (perp or spot), trust observable
+        // directly. Otherwise the Circle 1-USDC first-deposit fee would leave
+        // `inFlightToHc` permanently above `observable` (we incremented by the
+        // full bridged amount but HC only credits amount-fee), causing NAV to
+        // over-report indefinitely.
+        if (hcVisible > 0) return (observable, true);
+
+        // HC not yet visible: cross-block in-transit window. The high-water
+        // mark covers the gap until HC's precompile snapshot catches up.
         return (observable >= inFlightToHc ? observable : inFlightToHc, true);
     }
 
