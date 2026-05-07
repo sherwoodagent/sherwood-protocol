@@ -108,14 +108,9 @@ contract HyperliquidPerpStrategy is BaseStrategy {
     /// @notice High-water mark of USDC committed to HC but not yet observed
     ///         on HC by the precompile (in 6-decimal USDC units). See grid
     ///         for full rationale — covers both inbound and outbound cross-
-    ///         block transit windows. Never reset to zero; consulted by
-    ///         `_positionValue` via the `CORE_ACCOUNT_FEE_TOLERANCE`-based
-    ///         fallback so post-Circle-fee steady state stops over-reporting.
+    ///         block transit windows. Reconciled in `_positionValue` via
+    ///         `HyperliquidBridge.CORE_ACCOUNT_FEE_TOLERANCE`.
     uint256 public inFlightToHc;
-
-    /// @notice See grid for rationale. Sized to absorb Circle's
-    ///         `DEFAULT_NEW_CORE_ACCOUNT_FEE` (1 USDC).
-    uint256 internal constant CORE_ACCOUNT_FEE_TOLERANCE = 1e6;
     /// @dev Cumulative USDC pushed back to the vault across all sweepToVault() calls.
     ///      Off-chain accounting only — does not gate withdrawals.
     uint256 public cumulativeSwept;
@@ -576,8 +571,9 @@ contract HyperliquidPerpStrategy is BaseStrategy {
         uint256 evmBal = IERC20(asset).balanceOf(address(this));
         uint256 observable = perpVal + spotVal + evmBal;
 
-        // Tolerance fallback — see grid for full rationale.
-        if (observable + CORE_ACCOUNT_FEE_TOLERANCE >= inFlightToHc) return (observable, true);
+        if (observable + HyperliquidBridge.CORE_ACCOUNT_FEE_TOLERANCE >= inFlightToHc) {
+            return (observable, true);
+        }
         return (inFlightToHc, true);
     }
 

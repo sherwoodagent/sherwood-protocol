@@ -117,20 +117,10 @@ contract HyperliquidGridStrategy is BaseStrategy {
     ///         on HC by the precompile (in 6-decimal USDC units). Incremented
     ///         in `_execute` and `_onLiveDeposit` after each `bridgeUsdcToSpot`,
     ///         and bumped to `max(self, preDrainHcTotal)` inside `_initiateReturn`
-    ///         to also cover the outbound HC→EVM transit window. Never reset
-    ///         to zero — it grows monotonically until the proposal lifecycle
-    ///         ends. `_positionValue` consults it via tolerance-based fallback
-    ///         (see `CORE_ACCOUNT_FEE_TOLERANCE`) so vault NAV stays stable
-    ///         across both inbound and outbound cross-block windows.
+    ///         to cover the outbound HC→EVM transit window. Grows monotonically
+    ///         until the proposal lifecycle ends. `_positionValue` reconciles it
+    ///         against observable HC + EVM via `HyperliquidBridge.CORE_ACCOUNT_FEE_TOLERANCE`.
     uint256 public inFlightToHc;
-
-    /// @notice Tolerance used when deciding whether to trust live `observable`
-    ///         vs. the `inFlightToHc` high-water mark. Sized to absorb Circle's
-    ///         `DEFAULT_NEW_CORE_ACCOUNT_FEE` (1 USDC) so the post-fee steady
-    ///         state stops over-reporting NAV by the stranded fee while a real
-    ///         in-transit window (gap ≫ 1 USDC) still falls back to the high-
-    ///         water mark. 6-decimal USDC.
-    uint256 internal constant CORE_ACCOUNT_FEE_TOLERANCE = 1e6;
 
     /// @notice CLOIDs of resting GTC grid orders, tracked per asset. Maintained
     ///         on-chain so `_settle` can self-cancel without keeper assistance.
@@ -533,9 +523,9 @@ contract HyperliquidGridStrategy is BaseStrategy {
         // (HC processes post-block). Between this tx and HC's bridge ack, the
         // precompiles will report HC = 0 while EVM hasn't received yet. Lock
         // `inFlightToHc` to the pre-drain HC observable so NAV doesn't drop
-        // to 0 in that gap. Once EVM USDC arrives or HC re-activity restores
-        // visibility, `_positionValue`'s `hcVisible > 0` short-circuit (or
-        // observable >= inFlightToHc) brings NAV back to truth.
+        // to 0 in that gap. Once EVM USDC arrives, `_positionValue`'s
+        // tolerance fallback (observable + CORE_ACCOUNT_FEE_TOLERANCE >=
+        // inFlightToHc) brings NAV back to live observable.
         uint256 preDrainPerpVal = preDrainAccountValue > 0 ? uint256(int256(preDrainAccountValue)) : 0;
         uint256 preDrainSpotVal = uint256(preSpot) / HyperliquidBridge.PERP_TO_SPOT_WEI;
         uint256 preDrainHcTotal = preDrainPerpVal + preDrainSpotVal;
@@ -615,49 +605,20 @@ contract HyperliquidGridStrategy is BaseStrategy {
     }
 
     /// @inheritdoc BaseStrategy
-    /// @dev Live NAV sums every place the strategy can hold value:
-    ///        - HC perp `accountValue` (6-decimal USDC) — clamped at 0 if negative
-    ///        - HC spot `total` (8-decimal spot wei, scaled to 6-decimal)
-    ///        - EVM USDC balance on this contract (6-decimal)
-    ///      then chooses between live `observable` and the `inFlightToHc`
-    ///      high-water mark using a tolerance test:
+    /// @dev Live NAV = HC perp + HC spot + EVM. Reconciles against
+    ///      `inFlightToHc` via a Circle-fee-sized tolerance:
     ///
-    ///        if (observable + CORE_ACCOUNT_FEE_TOLERANCE >= inFlightToHc)
-    ///            return observable                 // small or zero gap
-    ///        else
-    ///            return max(observable, inFlightToHc)  // genuine in-transit gap
+    ///        observable + tolerance >= inFlightToHc ? observable : inFlightToHc
     ///
-    ///      The tolerance (1 USDC) absorbs Circle's `DEFAULT_NEW_CORE_ACCOUNT_FEE`
-    ///      so the post-fee steady state stops over-reporting NAV by the
-    ///      stranded fee. A real cross-block in-transit window opens a gap of
-    ///      the full bridged amount (≫ 1 USDC), so it falls through to the
-    ///      high-water mark and NAV does not drop to 0.
+    ///      Tolerance (1 USDC = `HyperliquidBridge.CORE_ACCOUNT_FEE_TOLERANCE`)
+    ///      absorbs Circle's `DEFAULT_NEW_CORE_ACCOUNT_FEE` permanent strand
+    ///      so the post-fee steady state trusts observable. A genuine cross-
+    ///      block in-transit window (inbound `_execute`/`_onLiveDeposit` or
+    ///      outbound `_initiateReturn`) opens a gap ≫ tolerance, so the
+    ///      fallback returns `inFlightToHc` and NAV stays stable.
     ///
-    ///      Always returns `valid=true` once the strategy is in `Executed`
-    ///      state — the vault has already pulled funds in, so `totalAssets()`
-    ///      MUST report something rather than degrading to queue-only and
-    ///      bricking the deposit modal.
-    ///
-    ///      Failure modes covered:
-    ///        1. Same-tx-as-execute / in-transit cross-block window (inbound):
-    ///           HC = 0, EVM = 0, observable = 0, gap = inFlightToHc. The
-    ///           tolerance test fails and `max(observable, inFlightToHc)`
-    ///           reports the in-flight amount.
-    ///        2. Subsequent live deposit's in-transit window: existing HC
-    ///           visible (perpVal+spotVal>0) but the newly-bumped
-    ///           `inFlightToHc` exceeds it by the in-transit amount. Gap ≫
-    ///           tolerance, max-fallback fires — earlier behavior of trusting
-    ///           observable purely on `hcVisible > 0` would have under-
-    ///           reported.
-    ///        3. Outbound HC→EVM transit: `_initiateReturn` snapshotted the
-    ///           pre-drain HC total into `inFlightToHc`. After HC clears spot
-    ///           but before EVM credits, observable = 0; max-fallback covers.
-    ///        4. Circle 1-USDC first-deposit fee permanently strands ~1 USDC:
-    ///           gap ≤ tolerance → observable wins, no permanent over-report.
-    ///        5. HC registration failed entirely: USDC stays on EVM, observable
-    ///           ≈ inFlightToHc → tolerance test passes, returns observable.
-    ///        6. Severely underwater perp: accountValue clamped at 0; spot +
-    ///           EVM make up the rest of recoverable value.
+    ///      Always `valid=true` in `Executed` state — vault has pulled funds,
+    ///      so `totalAssets()` must report something concrete.
     function _positionValue() internal view override returns (uint256, bool) {
         // Read HC perp account margin
         (bool success, bytes memory ret) = L1Read.ACCOUNT_MARGIN_SUMMARY_PRECOMPILE_ADDRESS
@@ -685,15 +646,9 @@ contract HyperliquidGridStrategy is BaseStrategy {
         uint256 evmBal = IERC20(asset).balanceOf(address(this));
         uint256 observable = perpVal + spotVal + evmBal;
 
-        // Tolerance-based fallback: trust live observable when the gap to the
-        // high-water mark is ≤ Circle's first-deposit fee (1 USDC permanent
-        // strand). For genuine cross-block in-transit windows, the gap is the
-        // full bridged amount (≫ 1 USDC) so we fall through to the high-water
-        // mark and NAV stays stable. Earlier `hcVisible > 0` short-circuit was
-        // unsafe — a subsequent live deposit's in-transit window has HC
-        // visible from the prior bridge, but observable still trails
-        // inFlightToHc by the new in-flight amount.
-        if (observable + CORE_ACCOUNT_FEE_TOLERANCE >= inFlightToHc) return (observable, true);
+        if (observable + HyperliquidBridge.CORE_ACCOUNT_FEE_TOLERANCE >= inFlightToHc) {
+            return (observable, true);
+        }
         return (inFlightToHc, true);
     }
 

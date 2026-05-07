@@ -60,6 +60,12 @@ library HyperliquidBridge {
     /// @dev Source: hyperliquid-dev/hyper-evm-lib HLConversions.perpToWei.
     uint64 constant PERP_TO_SPOT_WEI = 100;
 
+    /// @notice Circle's `DEFAULT_NEW_CORE_ACCOUNT_FEE` — charged once on the
+    ///         first EVM→HC bridge for a fresh HC account. Used by strategies
+    ///         as the tolerance when reconciling on-chain `inFlightToHc`
+    ///         against observable HC balances. 6-decimal USDC.
+    uint256 constant CORE_ACCOUNT_FEE_TOLERANCE = 1e6;
+
     /// @notice Bridge USDC from this contract's EVM balance to its HC spot
     ///         balance via Circle's CoreDepositWallet.
     /// @dev Inlined into the calling strategy (library `internal`), so

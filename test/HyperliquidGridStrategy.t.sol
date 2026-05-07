@@ -801,28 +801,60 @@ contract HyperliquidGridStrategyTest is Test {
     function test_positionValue_subsequentDepositInTransitUsesHighWater() public {
         // Issue #1b regression: a SUBSEQUENT live deposit's in-transit window
         // has HC visible from the prior bridge but observable trails
-        // inFlightToHc by the new in-flight amount. The prior `hcVisible > 0`
-        // short-circuit would under-report by the new in-flight amount; the
-        // tolerance fallback correctly falls back to the high-water mark when
-        // the gap exceeds CORE_ACCOUNT_FEE_TOLERANCE.
+        // inFlightToHc by the new in-flight amount. The earlier `hcVisible >
+        // 0` short-circuit would under-report by the new in-flight amount;
+        // the tolerance fallback correctly falls back to the high-water mark
+        // when the gap exceeds CORE_ACCOUNT_FEE_TOLERANCE.
+        //
+        // Faithfully reproduces the scenario by actually calling
+        // `onLiveDeposit` (rather than just mocking inFlightToHc), so the
+        // test fails if `_onLiveDeposit` ever stops bumping `inFlightToHc`.
         _execAndPrep();
-        // Simulate prior bridge fully credited: HC perp = 9_000e6, EVM = 0.
+
+        // Simulate the FIRST bridge fully credited: HC perp = DEPOSIT, EVM = 0.
         MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
-        m.setSummary(int64(int256(uint256(9_000e6))), uint64(0), 0, 0);
+        m.setSummary(int64(int256(uint256(DEPOSIT))), uint64(0), 0, 0);
         usdc.burn(address(strategy), usdc.balanceOf(address(strategy)));
 
-        // Force a higher inFlightToHc as if a subsequent live deposit just
-        // bumped it past the currently-visible HC balance (gap = 1_500e6 ≫
-        // 1 USDC tolerance). _execAndPrep already set inFlightToHc = DEPOSIT
-        // = 10_000e6, which gives a gap of exactly 10_000e6 - 9_000e6 =
-        // 1_000e6 — well above tolerance, so the fallback path fires.
-        assertEq(strategy.inFlightToHc(), DEPOSIT);
+        // Sanity: at this point observable >= inFlightToHc, so positionValue
+        // returns observable (live HC). No fallback yet.
+        (uint256 v0,) = strategy.positionValue();
+        assertEq(v0, DEPOSIT, "pre-condition: observable trusted when fully credited");
+
+        // Now simulate a SECOND live deposit hitting the strategy. Vault
+        // pushes `liveAssets` to the strategy (mint USDC into the strategy
+        // address) then calls `onLiveDeposit`. The bridge no-ops in tests,
+        // so EVM stays at `liveAssets` and HC remains at the prior DEPOSIT
+        // — but `inFlightToHc` jumps to DEPOSIT + liveAssets.
+        uint256 liveAssets = 2_500e6;
+        usdc.mint(address(strategy), liveAssets);
+        vm.prank(vault);
+        strategy.onLiveDeposit(liveAssets);
+
+        // _onLiveDeposit must have bumped inFlightToHc by exactly `liveAssets`.
+        assertEq(strategy.inFlightToHc(), DEPOSIT + liveAssets, "live deposit must bump high-water");
 
         (uint256 value, bool valid) = strategy.positionValue();
         assertTrue(valid);
-        // Old code: hcVisible=9_000e6 > 0 → return observable = 9_000e6 (UNDER).
-        // New code: gap = 10_000e6 - 9_000e6 = 1_000e6 > 1e6 → return inFlightToHc.
-        assertEq(value, DEPOSIT, "must use high-water when gap exceeds tolerance");
+        // observable = HC(DEPOSIT) + spot(0) + EVM(liveAssets) = DEPOSIT + liveAssets.
+        // gap = inFlightToHc - observable = 0 (exact match because mocks make
+        // the second bridge a no-op so EVM still holds liveAssets), so the
+        // tolerance test passes and observable wins. This is the steady-
+        // state assertion. The fallback path is exercised in
+        // `test_positionValue_outboundInFlightCoversDrainTransitGap`.
+        assertEq(value, DEPOSIT + liveAssets, "observable wins when EVM still holds new deposit");
+
+        // Now drop EVM to 0 to simulate the bridge actually completing the
+        // EVM→HC class transfer mid-block — HC precompile snapshot is still
+        // pre-block (DEPOSIT), so `observable = DEPOSIT` while `inFlightToHc
+        // = DEPOSIT + liveAssets`. Gap = liveAssets ≫ tolerance → fallback.
+        usdc.burn(address(strategy), usdc.balanceOf(address(strategy)));
+        (value, valid) = strategy.positionValue();
+        assertTrue(valid);
+        // Old `hcVisible > 0` short-circuit: returns observable = DEPOSIT
+        // (under by `liveAssets`). New tolerance fallback: returns
+        // inFlightToHc = DEPOSIT + liveAssets (correct).
+        assertEq(value, DEPOSIT + liveAssets, "must use high-water when gap exceeds tolerance");
     }
 
     function test_positionValue_outboundInFlightCoversDrainTransitGap() public {
