@@ -73,7 +73,6 @@ contract MoonwellSupplyStrategy is BaseStrategy {
     function _execute() internal override {
         // Pull tokens from vault (vault must have approved us first via batch call)
         _pullFromVault(underlying, supplyAmount);
-        _recordPrincipal(supplyAmount);
 
         // Approve mToken to spend our underlying
         IERC20(underlying).forceApprove(mToken, supplyAmount);

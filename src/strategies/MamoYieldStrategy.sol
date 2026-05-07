@@ -67,7 +67,6 @@ contract MamoYieldStrategy is BaseStrategy {
         uint256 amount = IERC20(underlying).balanceOf(vault());
         if (amount == 0) revert InvalidAmount();
         _pullFromVault(underlying, amount);
-        _recordPrincipal(amount);
         supplyAmount = amount; // record for reference
 
         // Create a Mamo strategy owned by this contract

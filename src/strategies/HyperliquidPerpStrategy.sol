@@ -168,7 +168,6 @@ contract HyperliquidPerpStrategy is BaseStrategy {
         if (amountIn > type(uint64).max) revert DepositAmountTooLarge();
 
         _pullFromVault(address(asset), amountIn);
-        _recordPrincipal(amountIn);
 
         // Bridge EVM → HC spot via Circle's CoreDepositWallet. Without this,
         // HC spot stays empty and the class-transfer below is a no-op.

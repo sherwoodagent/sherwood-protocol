@@ -52,16 +52,6 @@ abstract contract BaseStrategy is IStrategy {
     State internal _state;
     bool private _initialized;
 
-    /// @notice Cumulative asset principal received by the strategy: sum of
-    ///         what `_execute()` pulled from the vault plus any mid-flight
-    ///         live deposits routed through `onLiveDeposit`. Used by
-    ///         `positionValue` as the denominator for the NAV-floor guard
-    ///         that defeats share-inflation dilution attacks (a strategy
-    ///         under-reporting `_positionValue()` can let a new depositor
-    ///         mint cheap shares against fake-low NAV; the floor returns
-    ///         `valid=false` to force LPs onto the queue path until settle).
-    uint256 internal _principal;
-
     /**
      * @notice Disables `initialize` on the template itself so an attacker
      *         can't front-run a clone deploy with their own init.
@@ -155,44 +145,17 @@ abstract contract BaseStrategy is IStrategy {
     /// @inheritdoc IStrategy
     /// @dev State gating is centralized here so concrete strategies only
     ///      need to override `_positionValue` for the Executed case.
-    ///
-    ///      NAV-floor guard: when the underlying value falls below
-    ///      `_principal / 2` (50% floor) we return `valid=false` so the
-    ///      vault's `_lpFlowGate` falls through to queue-only. Defeats the
-    ///      share-inflation attack where an under-reporting strategy
-    ///      (`positionValue`=0 due to oracle bug or stranded funds) lets a
-    ///      new depositor mint cheap shares and dilute existing LPs. The
-    ///      bound is intentionally permissive (50% loss tolerated) — real
-    ///      losses smaller than that report through; anything beyond signals
-    ///      the strategy needs to settle, not keep accepting LP transactions.
     function positionValue() external view virtual returns (uint256, bool) {
         if (_state != State.Executed) return (0, false);
-        (uint256 v, bool valid) = _positionValue();
-        if (!valid) return (0, false);
-        if (v < _principal >> 1) return (0, false);
-        return (v, true);
-    }
-
-    /// @notice Cumulative asset principal received by the strategy across
-    ///         `_execute()` and `onLiveDeposit` paths. Read by the vault's
-    ///         off-chain monitoring; the on-chain NAV-floor check uses the
-    ///         same value internally via `positionValue`.
-    function principal() external view returns (uint256) {
-        return _principal;
+        return _positionValue();
     }
 
     /// @inheritdoc IStrategy
     /// @dev Default no-op — strategies that can absorb mid-position
     ///      capital override `_onLiveDeposit`. Only callable by the vault and
-    ///      only while the strategy is `Executed`. The base wrapper records
-    ///      `assets` into the principal accumulator BEFORE delegating so the
-    ///      floor calculation reflects the new inflow even if `_onLiveDeposit`
-    ///      reverts (the vault's try/catch catches that, leaving assets on
-    ///      the strategy as principal — `_principal` correctly reflects the
-    ///      stranded amount).
+    ///      only while the strategy is `Executed`.
     function onLiveDeposit(uint256 assets) external virtual onlyVault {
         if (_state != State.Executed) return;
-        _principal += assets;
         _onLiveDeposit(assets);
     }
 
@@ -211,17 +174,6 @@ abstract contract BaseStrategy is IStrategy {
     /// @notice Pull tokens from the vault into this strategy
     function _pullFromVault(address token, uint256 amount) internal {
         IERC20(token).safeTransferFrom(_vault, address(this), amount);
-    }
-
-    /// @notice Record `amount` as asset principal received from the vault.
-    /// @dev Strategies call this from their `_execute()` after pulling the
-    ///      asset from the vault so the NAV-floor denominator is accurate.
-    ///      Live-deposit accumulation is automatic via `onLiveDeposit`.
-    ///      Concrete strategies that pull a single asset typically call
-    ///      `_recordPrincipal(amountIn)` once per `_execute()`. Multi-asset
-    ///      strategies (Aerodrome) record only the asset matching the vault.
-    function _recordPrincipal(uint256 amount) internal {
-        _principal += amount;
     }
 
     /// @notice Push tokens from this strategy back to the vault
