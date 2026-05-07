@@ -432,23 +432,66 @@ contract HyperliquidGridStrategy is BaseStrategy {
     }
 
     /// @inheritdoc BaseStrategy
-    /// @dev Live NAV reads HyperCore perp account equity (already in USDC 6
-    ///      decimals — same denomination as the vault asset). On non-HyperEVM
-    ///      chains or any environment where the precompile is absent (EOA
-    ///      staticcall returns success=true with empty returndata, so we also
-    ///      check `ret.length`), `valid=false` and the vault falls back to
-    ///      queue-only behavior. Negative equity (severely underwater) returns
-    ///      `(0, true)` rather than reverting — share-price math should clamp,
-    ///      not blow up. EVM-side stranded USDC is not added here because the
-    ///      Executed-state invariant is "all vault funds parked on HC".
+    /// @dev Live NAV sums HyperCore perp margin equity (6-dec) + HC spot USDC
+    ///      balance (8-dec, scaled down by 100 to 6-dec). Spot is included
+    ///      because `_execute()`'s class-transfer can be silently rejected by
+    ///      HyperCore when the bridge fee shaves the spot balance below the
+    ///      requested amount — funds park on spot, NAV must still reflect
+    ///      them (otherwise vault.totalAssets() reads zero with non-zero
+    ///      shares, and live deposits mint at infinite share price). Either
+    ///      precompile being available is enough to mark NAV valid; only when
+    ///      both fail do we fall back to queue-only via `valid=false`.
+    ///      Negative perp equity (severely underwater) is clamped to 0.
     function _positionValue() internal view override returns (uint256, bool) {
-        (bool success, bytes memory ret) = L1Read.ACCOUNT_MARGIN_SUMMARY_PRECOMPILE_ADDRESS
+        uint256 total;
+        bool anyValid;
+
+        (bool perpOk, bytes memory perpRet) = L1Read.ACCOUNT_MARGIN_SUMMARY_PRECOMPILE_ADDRESS
         .staticcall{gas: L1Read.ACCOUNT_MARGIN_SUMMARY_GAS}(
             abi.encode(uint32(0), address(this))
         );
-        if (!success || ret.length < 128) return (0, false);
-        AccountMarginSummary memory s = abi.decode(ret, (AccountMarginSummary));
-        if (s.accountValue <= 0) return (0, true);
-        return (uint256(int256(s.accountValue)), true);
+        if (perpOk && perpRet.length >= 128) {
+            anyValid = true;
+            int64 av = abi.decode(perpRet, (AccountMarginSummary)).accountValue;
+            if (av > 0) total += uint256(int256(av));
+        }
+
+        (bool spotOk, bytes memory spotRet) = L1Read.SPOT_BALANCE_PRECOMPILE_ADDRESS
+        .staticcall{gas: L1Read.SPOT_BALANCE_GAS}(
+            abi.encode(address(this), uint64(0))
+        );
+        if (spotOk && spotRet.length >= 96) {
+            anyValid = true;
+            uint64 spotTotal = abi.decode(spotRet, (SpotBalance)).total;
+            if (spotTotal > 0) total += uint256(spotTotal) / 100;
+        }
+
+        if (!anyValid) return (0, false);
+        return (total, true);
+    }
+
+    /// @notice Permissionless retry: read the strategy's HC spot USDC balance
+    ///         and class-transfer the free portion to perp margin.
+    /// @dev    Recovery path for the bridge-fee/class-transfer mismatch: if
+    ///         `_execute()` queued `sendUsdClassTransfer(N)` but HyperCore
+    ///         deducted a deposit fee on the bridged USDC, spot lands with
+    ///         `N - fee` and HC silently rejects the over-large transfer.
+    ///         Anyone (typically the keeper, on the next HC block after
+    ///         execute) can call this to push the actually-credited balance
+    ///         to perp. Funds only move strategy-spot → strategy-perp — no
+    ///         diversion possible. Idempotent: no-ops when spot is empty.
+    ///
+    ///         Spot USDC is 8-decimal on HyperCore; class-transfer takes a
+    ///         6-decimal `ntl`, so the free balance is divided by 100.
+    ///         Emits `FundsParked` with the 6-dec amount transferred.
+    function bridgeToMargin() external {
+        (SpotBalance memory s, bool ok) = L1Read.trySpotBalance(address(this), 0);
+        if (!ok) return;
+        if (s.total <= s.hold) return;
+        uint64 free = s.total - s.hold;
+        uint64 amount6 = free / 100;
+        if (amount6 == 0) return;
+        L1Write.sendUsdClassTransfer(amount6, true);
+        emit FundsParked(uint256(amount6));
     }
 }

@@ -9,6 +9,7 @@ import {MockCoreWriter} from "./mocks/MockCoreWriter.sol";
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 import {FinalizeVariant} from "../src/hyperliquid/L1Write.sol";
 import {MockAccountMarginSummaryPrecompile} from "./mocks/MockAccountMarginSummaryPrecompile.sol";
+import {MockSpotBalancePrecompile} from "./mocks/MockSpotBalancePrecompile.sol";
 
 contract HyperliquidGridStrategyTest is Test {
     HyperliquidGridStrategy public template;
@@ -440,6 +441,135 @@ contract HyperliquidGridStrategyTest is Test {
         (uint256 value, bool valid) = strategy.positionValue();
         assertFalse(valid);
         assertEq(value, 0);
+    }
+
+    // ── Live NAV: spot-balance fallback (bridge-fee/classTransfer mismatch) ──
+
+    function _etchSpotBalance() internal returns (MockSpotBalancePrecompile) {
+        MockSpotBalancePrecompile m = new MockSpotBalancePrecompile();
+        vm.etch(0x0000000000000000000000000000000000000801, address(m).code);
+        return MockSpotBalancePrecompile(0x0000000000000000000000000000000000000801);
+    }
+
+    function test_positionValue_includesSpotUsdcWhenPerpEmpty() public {
+        // Reproduces the on-chain bug: bridged USDC parked on HC spot because
+        // classTransfer to perp was rejected (bridge fee shaved spot balance).
+        // Perp accountValue=0, spot=8 USDC (8-dec) → NAV must read 8 USDC (6-dec).
+        _execAndPrep();
+        _etchAccountMarginSummary(); // perp present but accountValue=0
+        MockSpotBalancePrecompile sp = _etchSpotBalance();
+        sp.setSpot(uint64(8 * 1e8), 0, 0); // 8 USDC at 8-dec = 800_000_000
+
+        (uint256 value, bool valid) = strategy.positionValue();
+        assertTrue(valid);
+        assertEq(value, 8 * 1e6, "spot 8e8 must scale to 8e6 in 6-dec NAV");
+    }
+
+    function test_positionValue_sumsPerpAndSpot() public {
+        _execAndPrep();
+        MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
+        m.setSummary(int64(int256(uint256(5_000e6))), 0, 0, 0); // 5k USDC perp
+        MockSpotBalancePrecompile sp = _etchSpotBalance();
+        sp.setSpot(uint64(2 * 1e8), 0, 0); // 2 USDC spot (8-dec)
+
+        (uint256 value, bool valid) = strategy.positionValue();
+        assertTrue(valid);
+        assertEq(value, 5_000e6 + 2e6, "perp + spot must sum in 6-dec");
+    }
+
+    function test_positionValue_validIfOnlySpotPrecompileAvailable() public {
+        // No perp precompile etched, only spot. NAV must still report valid.
+        _execAndPrep();
+        MockSpotBalancePrecompile sp = _etchSpotBalance();
+        sp.setSpot(uint64(3 * 1e8), 0, 0); // 3 USDC spot
+
+        (uint256 value, bool valid) = strategy.positionValue();
+        assertTrue(valid);
+        assertEq(value, 3e6);
+    }
+
+    function test_positionValue_spotHoldDoesNotShrinkTotal() public {
+        // `total` already includes `hold`; we add total/100, not (total-hold)/100,
+        // because held funds still belong to the strategy (locked in resting orders).
+        _execAndPrep();
+        MockSpotBalancePrecompile sp = _etchSpotBalance();
+        sp.setSpot(uint64(10 * 1e8), uint64(4 * 1e8), 0); // total=10, hold=4
+
+        (uint256 value, bool valid) = strategy.positionValue();
+        assertTrue(valid);
+        assertEq(value, 10e6, "total includes hold; NAV must reflect total");
+    }
+
+    // ── bridgeToMargin: recovery from bridge-fee classTransfer mismatch ──
+
+    function test_bridgeToMargin_classTransfersFreeSpotBalance() public {
+        _execAndPrep();
+        MockSpotBalancePrecompile sp = _etchSpotBalance();
+        sp.setSpot(uint64(8 * 1e8), 0, 0); // 8 USDC free on spot (8-dec)
+
+        vm.recordLogs();
+        strategy.bridgeToMargin();
+
+        (bool found, uint64 ntl, bool toPerp) = _decodeClassTransfer(vm.getRecordedLogs());
+        assertTrue(found, "expected class transfer");
+        assertEq(ntl, uint64(8e6), "8 USDC at 6-dec");
+        assertTrue(toPerp);
+    }
+
+    function test_bridgeToMargin_subtractsHoldBeforeTransfer() public {
+        _execAndPrep();
+        MockSpotBalancePrecompile sp = _etchSpotBalance();
+        sp.setSpot(uint64(10 * 1e8), uint64(3 * 1e8), 0); // 10 total, 3 hold → 7 free
+
+        vm.recordLogs();
+        strategy.bridgeToMargin();
+
+        (bool found, uint64 ntl,) = _decodeClassTransfer(vm.getRecordedLogs());
+        assertTrue(found);
+        assertEq(ntl, uint64(7e6));
+    }
+
+    function test_bridgeToMargin_noOpsWhenSpotEmpty() public {
+        _execAndPrep();
+        MockSpotBalancePrecompile sp = _etchSpotBalance();
+        sp.setSpot(0, 0, 0);
+
+        vm.recordLogs();
+        strategy.bridgeToMargin();
+        assertEq(_countClassTransferLogs(vm.getRecordedLogs()), 0);
+    }
+
+    function test_bridgeToMargin_noOpsWhenSpotEntirelyHeld() public {
+        _execAndPrep();
+        MockSpotBalancePrecompile sp = _etchSpotBalance();
+        sp.setSpot(uint64(5 * 1e8), uint64(5 * 1e8), 0); // total == hold → free=0
+
+        vm.recordLogs();
+        strategy.bridgeToMargin();
+        assertEq(_countClassTransferLogs(vm.getRecordedLogs()), 0);
+    }
+
+    function test_bridgeToMargin_noOpsWhenSubMicrounitFree() public {
+        _execAndPrep();
+        MockSpotBalancePrecompile sp = _etchSpotBalance();
+        sp.setSpot(50, 0, 0); // 50 in 8-dec = 0.5 microUSDC; /100 truncates to 0
+
+        vm.recordLogs();
+        strategy.bridgeToMargin();
+        assertEq(_countClassTransferLogs(vm.getRecordedLogs()), 0, "dust must not fire transfer");
+    }
+
+    function test_bridgeToMargin_isPermissionless() public {
+        _execAndPrep();
+        MockSpotBalancePrecompile sp = _etchSpotBalance();
+        sp.setSpot(uint64(8 * 1e8), 0, 0);
+
+        vm.recordLogs();
+        vm.prank(attacker); // anyone can call — funds only move strat-spot → strat-perp
+        strategy.bridgeToMargin();
+
+        (bool found,,) = _decodeClassTransfer(vm.getRecordedLogs());
+        assertTrue(found);
     }
 
     // ── onLiveDeposit ──
