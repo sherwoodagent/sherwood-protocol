@@ -575,6 +575,48 @@ contract HyperliquidGridStrategyTest is Test {
         assertTrue(found);
     }
 
+    // ── Cross-margin guard: underwater perp ignores spot in NAV ──
+
+    function test_positionValue_underwaterPerpIgnoresSpot() public {
+        // Unified-account semantics: an underwater perp can be auto-liquidated
+        // against spot USDC. Reporting spot as recoverable when perp is
+        // negative would over-state NAV. Guard returns (0, true).
+        _execAndPrep();
+        MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
+        m.setSummary(int64(-500e6), 0, 0, 0); // perp -$500
+        MockSpotBalancePrecompile sp = _etchSpotBalance();
+        sp.setSpot(uint64(8 * 1e8), 0, 0); // spot 8 USDC — must be ignored
+
+        (uint256 value, bool valid) = strategy.positionValue();
+        assertTrue(valid, "valid stays true (precompile responsive)");
+        assertEq(value, 0, "spot must be ignored when perp is underwater");
+    }
+
+    // ── bridgeToMargin: post-settle griefing guard ──
+
+    function test_bridgeToMargin_noOpsAfterSettled() public {
+        _execAndPrep();
+        // Etch margin summary so settle() can call _initiateClassTransfer
+        MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
+        m.setSummary(int64(0), 0, 0, 0);
+        vm.prank(vault);
+        strategy.settle();
+        assertTrue(strategy.settled());
+
+        // Spot has funds (e.g. perp→spot from settle just landed)
+        MockSpotBalancePrecompile sp = _etchSpotBalance();
+        sp.setSpot(uint64(5 * 1e8), 0, 0);
+
+        vm.recordLogs();
+        vm.prank(attacker);
+        strategy.bridgeToMargin(); // must be a no-op
+        assertEq(
+            _countClassTransferLogs(vm.getRecordedLogs()),
+            0,
+            "post-settle bridgeToMargin must NOT reverse the perp->spot direction"
+        );
+    }
+
     // ── onLiveDeposit ──
 
     function test_onLiveDeposit_sendsClassTransferToPerp() public {

@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
-import {Test} from "forge-std/Test.sol";
+import {Test, Vm} from "forge-std/Test.sol";
 import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {HyperliquidPerpStrategy} from "../src/strategies/HyperliquidPerpStrategy.sol";
 import {BaseStrategy} from "../src/strategies/BaseStrategy.sol";
 import {MockCoreWriter} from "./mocks/MockCoreWriter.sol";
 import {MockAccountMarginSummaryPrecompile} from "./mocks/MockAccountMarginSummaryPrecompile.sol";
+import {MockSpotBalancePrecompile} from "./mocks/MockSpotBalancePrecompile.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 
@@ -658,5 +659,153 @@ contract HyperliquidPerpStrategyTest is Test {
         // Default no-op gate in BaseStrategy: returns silently when state != Executed.
         vm.prank(vault);
         strategy.onLiveDeposit(1e6);
+    }
+
+    // ==================== SPOT-AWARE NAV + bridgeToMargin (parity w/ Grid) ====================
+
+    bytes4 constant CLASS_TRANSFER_ACTION = 0x01000007;
+
+    function _etchSpotBalance() internal returns (MockSpotBalancePrecompile) {
+        MockSpotBalancePrecompile m = new MockSpotBalancePrecompile();
+        vm.etch(0x0000000000000000000000000000000000000801, address(m).code);
+        return MockSpotBalancePrecompile(0x0000000000000000000000000000000000000801);
+    }
+
+    function _countClassTransferLogs(Vm.Log[] memory logs) internal pure returns (uint256 count) {
+        bytes32 sig = keccak256("RawAction(address,bytes)");
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].topics[0] != sig) continue;
+            bytes memory raw = abi.decode(logs[i].data, (bytes));
+            if (raw.length >= 4 && bytes4(raw) == CLASS_TRANSFER_ACTION) count++;
+        }
+    }
+
+    function _decodeClassTransfer(Vm.Log[] memory logs) internal pure returns (bool found, uint64 ntl, bool toPerp) {
+        bytes32 sig = keccak256("RawAction(address,bytes)");
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].topics[0] != sig) continue;
+            bytes memory raw = abi.decode(logs[i].data, (bytes));
+            if (raw.length < 4 || bytes4(raw) != CLASS_TRANSFER_ACTION) continue;
+            bytes memory payload = new bytes(raw.length - 4);
+            for (uint256 j = 0; j < payload.length; j++) {
+                payload[j] = raw[j + 4];
+            }
+            (ntl, toPerp) = abi.decode(payload, (uint64, bool));
+            return (true, ntl, toPerp);
+        }
+    }
+
+    function test_positionValue_includesSpotUsdcWhenPerpEmpty() public {
+        vm.prank(vault);
+        strategy.execute();
+        _etchAccountMarginSummary();
+        MockSpotBalancePrecompile sp = _etchSpotBalance();
+        sp.setSpot(uint64(8 * 1e8), 0, 0); // 8 USDC at 8-dec — must scale to 8e6 (6-dec)
+
+        (uint256 value, bool valid) = strategy.positionValue();
+        assertTrue(valid);
+        assertEq(value, 8e6);
+    }
+
+    function test_positionValue_sumsPerpAndSpot() public {
+        vm.prank(vault);
+        strategy.execute();
+        MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
+        m.setSummary(int64(int256(uint256(5_000e6))), 0, 0, 0);
+        MockSpotBalancePrecompile sp = _etchSpotBalance();
+        sp.setSpot(uint64(2 * 1e8), 0, 0);
+
+        (uint256 value, bool valid) = strategy.positionValue();
+        assertTrue(valid);
+        assertEq(value, 5_000e6 + 2e6);
+    }
+
+    function test_positionValue_underwaterPerpIgnoresSpot() public {
+        // Cross-margin guard: HC unified accounts can liquidate spot to cover
+        // perp deficit. Underwater perp must clamp NAV to 0, ignoring spot.
+        vm.prank(vault);
+        strategy.execute();
+        MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
+        m.setSummary(int64(-500e6), 0, 0, 0);
+        MockSpotBalancePrecompile sp = _etchSpotBalance();
+        sp.setSpot(uint64(8 * 1e8), 0, 0);
+
+        (uint256 value, bool valid) = strategy.positionValue();
+        assertTrue(valid);
+        assertEq(value, 0, "spot must be ignored when perp is underwater");
+    }
+
+    function test_bridgeToMargin_classTransfersFreeSpotBalance() public {
+        vm.prank(vault);
+        strategy.execute();
+        MockSpotBalancePrecompile sp = _etchSpotBalance();
+        sp.setSpot(uint64(8 * 1e8), 0, 0);
+
+        vm.recordLogs();
+        strategy.bridgeToMargin();
+
+        (bool found, uint64 ntl, bool toPerp) = _decodeClassTransfer(vm.getRecordedLogs());
+        assertTrue(found, "expected class transfer");
+        assertEq(ntl, uint64(8e6));
+        assertTrue(toPerp);
+    }
+
+    function test_bridgeToMargin_subtractsHold() public {
+        vm.prank(vault);
+        strategy.execute();
+        MockSpotBalancePrecompile sp = _etchSpotBalance();
+        sp.setSpot(uint64(10 * 1e8), uint64(3 * 1e8), 0);
+
+        vm.recordLogs();
+        strategy.bridgeToMargin();
+        (bool found, uint64 ntl,) = _decodeClassTransfer(vm.getRecordedLogs());
+        assertTrue(found);
+        assertEq(ntl, uint64(7e6));
+    }
+
+    function test_bridgeToMargin_noOpsAfterSettled() public {
+        vm.prank(vault);
+        strategy.execute();
+        // Etch margin summary so settle()'s _initiateClassTransfer is a clean no-op
+        MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
+        m.setSummary(int64(0), 0, 0, 0);
+        vm.prank(vault);
+        strategy.settle();
+        assertTrue(strategy.settled());
+
+        MockSpotBalancePrecompile sp = _etchSpotBalance();
+        sp.setSpot(uint64(5 * 1e8), 0, 0);
+
+        vm.recordLogs();
+        vm.prank(attacker);
+        strategy.bridgeToMargin();
+        assertEq(_countClassTransferLogs(vm.getRecordedLogs()), 0, "post-settle bridgeToMargin must no-op");
+    }
+
+    function test_initiateReturn_revertsBeforeSettled() public {
+        vm.prank(vault);
+        strategy.execute();
+        vm.expectRevert(HyperliquidPerpStrategy.NotSweepable.selector);
+        strategy.initiateReturn();
+    }
+
+    function test_settle_usesPrecompileAmount_notUint64Max() public {
+        // Replaces the prior `sendUsdClassTransfer(type(uint64).max, false)`
+        // sentinel pattern — settle should now read accountValue - marginUsed
+        // and class-transfer that exact amount.
+        vm.prank(vault);
+        strategy.execute();
+        MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
+        int64 equity = int64(int256(uint256(7_500e6)));
+        m.setSummary(equity, 0, 0, 0);
+
+        vm.recordLogs();
+        vm.prank(vault);
+        strategy.settle();
+
+        (bool found, uint64 ntl, bool toPerp) = _decodeClassTransfer(vm.getRecordedLogs());
+        assertTrue(found, "expected class transfer at settle");
+        assertEq(ntl, uint64(equity), "must transfer free margin, not uint64.max");
+        assertFalse(toPerp);
     }
 }

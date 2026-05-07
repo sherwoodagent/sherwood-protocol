@@ -434,14 +434,19 @@ contract HyperliquidGridStrategy is BaseStrategy {
     /// @inheritdoc BaseStrategy
     /// @dev Live NAV sums HyperCore perp margin equity (6-dec) + HC spot USDC
     ///      balance (8-dec, scaled down by 100 to 6-dec). Spot is included
-    ///      because `_execute()`'s class-transfer can be silently rejected by
-    ///      HyperCore when the bridge fee shaves the spot balance below the
-    ///      requested amount — funds park on spot, NAV must still reflect
-    ///      them (otherwise vault.totalAssets() reads zero with non-zero
-    ///      shares, and live deposits mint at infinite share price). Either
-    ///      precompile being available is enough to mark NAV valid; only when
-    ///      both fail do we fall back to queue-only via `valid=false`.
-    ///      Negative perp equity (severely underwater) is clamped to 0.
+    ///      because `_execute()`'s class-transfer may be rejected by HyperCore
+    ///      when the bridge fee shaves the spot balance below the requested
+    ///      amount — funds park on spot, NAV must still reflect them (otherwise
+    ///      vault.totalAssets() reads zero with non-zero shares and live
+    ///      deposits mint at infinite share price). Either precompile being
+    ///      available is enough to mark NAV valid; only when both fail do we
+    ///      fall back to queue-only via `valid=false`.
+    ///
+    ///      Cross-margin safety: HyperCore unified accounts share collateral
+    ///      between spot and perp — an underwater perp can be liquidated
+    ///      against spot USDC. When perp `accountValue < 0` we therefore
+    ///      return `(0, true)` and ignore spot rather than reporting an
+    ///      over-stated recoverable value. Conservative read until settle.
     function _positionValue() internal view override returns (uint256, bool) {
         uint256 total;
         bool anyValid;
@@ -453,6 +458,8 @@ contract HyperliquidGridStrategy is BaseStrategy {
         if (perpOk && perpRet.length >= 128) {
             anyValid = true;
             int64 av = abi.decode(perpRet, (AccountMarginSummary)).accountValue;
+            // Underwater perp: cross-margin can consume spot. Report 0 (still valid).
+            if (av < 0) return (0, true);
             if (av > 0) total += uint256(int256(av));
         }
 
@@ -475,16 +482,26 @@ contract HyperliquidGridStrategy is BaseStrategy {
     /// @dev    Recovery path for the bridge-fee/class-transfer mismatch: if
     ///         `_execute()` queued `sendUsdClassTransfer(N)` but HyperCore
     ///         deducted a deposit fee on the bridged USDC, spot lands with
-    ///         `N - fee` and HC silently rejects the over-large transfer.
-    ///         Anyone (typically the keeper, on the next HC block after
-    ///         execute) can call this to push the actually-credited balance
-    ///         to perp. Funds only move strategy-spot → strategy-perp — no
-    ///         diversion possible. Idempotent: no-ops when spot is empty.
+    ///         `N - fee` and HC may reject the over-large transfer (L1
+    ///         actions are async fire-and-forget; the exact behavior — full
+    ///         reject vs partial fill — is empirically observed, not
+    ///         documented). Anyone (typically the keeper, on the next HC
+    ///         block after execute) can call this to push the actually-
+    ///         credited balance to perp. Funds only move strategy-spot →
+    ///         strategy-perp — no diversion possible. Idempotent: no-ops when
+    ///         spot is empty or once `settled` is true.
+    ///
+    ///         Settled guard: after `_settle()` runs `_initiateClassTransfer`
+    ///         (perp → spot), allowing this function to reverse it would let
+    ///         a griefer cycle funds spot↔perp until the keeper retried
+    ///         `initiateReturn()`. We block the spot→perp direction post-
+    ///         settle so the sweep path is monotonic.
     ///
     ///         Spot USDC is 8-decimal on HyperCore; class-transfer takes a
     ///         6-decimal `ntl`, so the free balance is divided by 100.
     ///         Emits `FundsParked` with the 6-dec amount transferred.
     function bridgeToMargin() external {
+        if (settled) return;
         (SpotBalance memory s, bool ok) = L1Read.trySpotBalance(address(this), 0);
         if (!ok) return;
         if (s.total <= s.hold) return;

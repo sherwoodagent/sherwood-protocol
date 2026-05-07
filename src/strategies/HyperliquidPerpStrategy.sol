@@ -330,8 +330,12 @@ contract HyperliquidPerpStrategy is BaseStrategy {
             );
         }
 
-        // Transfer all USD from perp margin back to spot (async)
-        L1Write.sendUsdClassTransfer(type(uint64).max, false);
+        // Read exact perp free margin from precompile and class-transfer
+        // perp → spot. Avoids `type(uint64).max` (an undocumented "sweep all"
+        // sentinel that risks stranding funds when HC validates the request).
+        // Residual margin from IOC fill slippage can be retried via
+        // `initiateReturn()` post-settle.
+        _initiateClassTransfer();
 
         settled = true;
 
@@ -389,24 +393,97 @@ contract HyperliquidPerpStrategy is BaseStrategy {
     }
 
     /// @inheritdoc BaseStrategy
-    /// @dev Live NAV reads HyperCore perp account equity (already in USDC 6
-    ///      decimals — same denomination as the vault asset). On non-HyperEVM
-    ///      chains or any environment where the precompile is absent (EOA
-    ///      staticcall returns success=true with empty returndata, so we also
-    ///      check `ret.length`), `valid=false` and the vault falls back to
-    ///      queue-only behavior. Negative equity (severely underwater) returns
-    ///      `(0, true)` rather than reverting — share-price math should clamp,
-    ///      not blow up. EVM-side stranded USDC is not added here because the
-    ///      Executed-state invariant is "all vault funds parked on HC".
+    /// @dev Live NAV sums HyperCore perp margin equity (6-dec) + HC spot USDC
+    ///      balance (8-dec, scaled down by 100 to 6-dec). Spot is included
+    ///      because `_execute()`'s class-transfer may be rejected by HyperCore
+    ///      when the bridge fee shaves the spot balance below the requested
+    ///      amount — funds park on spot, NAV must still reflect them.
+    ///
+    ///      Cross-margin safety: HyperCore unified accounts share collateral
+    ///      between spot and perp — an underwater perp can be liquidated
+    ///      against spot USDC. When perp `accountValue < 0` we return
+    ///      `(0, true)` and ignore spot rather than reporting an over-stated
+    ///      recoverable value. Either precompile being available is enough
+    ///      to mark NAV valid; both failing falls back to queue-only.
     function _positionValue() internal view override returns (uint256, bool) {
+        uint256 total;
+        bool anyValid;
+
+        (bool perpOk, bytes memory perpRet) = L1Read.ACCOUNT_MARGIN_SUMMARY_PRECOMPILE_ADDRESS
+        .staticcall{gas: L1Read.ACCOUNT_MARGIN_SUMMARY_GAS}(
+            abi.encode(uint32(0), address(this))
+        );
+        if (perpOk && perpRet.length >= 128) {
+            anyValid = true;
+            int64 av = abi.decode(perpRet, (AccountMarginSummary)).accountValue;
+            // Underwater perp: cross-margin can consume spot. Report 0 (still valid).
+            if (av < 0) return (0, true);
+            if (av > 0) total += uint256(int256(av));
+        }
+
+        (bool spotOk, bytes memory spotRet) = L1Read.SPOT_BALANCE_PRECOMPILE_ADDRESS
+        .staticcall{gas: L1Read.SPOT_BALANCE_GAS}(
+            abi.encode(address(this), uint64(0))
+        );
+        if (spotOk && spotRet.length >= 96) {
+            anyValid = true;
+            uint64 spotTotal = abi.decode(spotRet, (SpotBalance)).total;
+            if (spotTotal > 0) total += uint256(spotTotal) / 100;
+        }
+
+        if (!anyValid) return (0, false);
+        return (total, true);
+    }
+
+    /// @notice Permissionless retry: read the strategy's HC spot USDC balance
+    ///         and class-transfer the free portion to perp margin.
+    /// @dev    Mirrors `HyperliquidGridStrategy.bridgeToMargin`. Recovery for
+    ///         the bridge-fee/class-transfer mismatch: if `_execute()` queued
+    ///         a transfer that HC rejected because post-fee spot was less
+    ///         than requested, this pushes the actually-landed balance to
+    ///         perp on the next HC block. Funds only move strategy-spot →
+    ///         strategy-perp; no diversion. Idempotent. Blocked once
+    ///         `settled` is true so post-settle griefers can't reverse the
+    ///         perp→spot transfer initiated by `_settle`.
+    function bridgeToMargin() external {
+        if (settled) return;
+        (SpotBalance memory s, bool ok) = L1Read.trySpotBalance(address(this), 0);
+        if (!ok) return;
+        if (s.total <= s.hold) return;
+        uint64 free = s.total - s.hold;
+        uint64 amount6 = free / 100;
+        if (amount6 == 0) return;
+        L1Write.sendUsdClassTransfer(amount6, true);
+        emit FundsParked(uint256(amount6));
+    }
+
+    /// @notice Re-initiate the perp→spot class transfer for residual perp
+    ///         balance after settlement (e.g. fill slippage on IOC closes).
+    /// @dev    Permissionless: funds only flow to HC spot at the same
+    ///         address. Mirrors `HyperliquidGridStrategy.initiateReturn`.
+    ///         Call this if `sweepToVault` keeps returning 0 — it means
+    ///         some equity remains in perp.
+    function initiateReturn() external {
+        if (!settled) revert NotSweepable();
+        _initiateClassTransfer();
+    }
+
+    /// @dev Reads current perp free margin (`accountValue - marginUsed`) via
+    ///      precompile and sends a class transfer (perp → spot) for that
+    ///      amount. HC may reject class transfers that exceed withdrawable
+    ///      margin, so we subtract `marginUsed` to stay within bounds.
+    ///      No-ops when the precompile is unavailable or free margin <= 0.
+    function _initiateClassTransfer() internal {
         (bool ok, bytes memory ret) = L1Read.ACCOUNT_MARGIN_SUMMARY_PRECOMPILE_ADDRESS
         .staticcall{gas: L1Read.ACCOUNT_MARGIN_SUMMARY_GAS}(
             abi.encode(uint32(0), address(this))
         );
-        if (!ok || ret.length < 128) return (0, false);
+        if (!ok || ret.length < 128) return;
         AccountMarginSummary memory s = abi.decode(ret, (AccountMarginSummary));
-        if (s.accountValue <= 0) return (0, true);
-        return (uint256(int256(s.accountValue)), true);
+        if (s.accountValue <= 0) return;
+        int64 freeMargin = s.accountValue - int64(s.marginUsed);
+        if (freeMargin <= 0) return;
+        L1Write.sendUsdClassTransfer(uint64(freeMargin), false);
     }
 
     /// @dev Routes a mid-proposal LP deposit into HC perp margin. Vault has
