@@ -9,6 +9,7 @@ import {MockCoreWriter} from "./mocks/MockCoreWriter.sol";
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 import {FinalizeVariant} from "../src/hyperliquid/L1Write.sol";
 import {MockAccountMarginSummaryPrecompile} from "./mocks/MockAccountMarginSummaryPrecompile.sol";
+import {MockSpotBalancePrecompile} from "./mocks/MockSpotBalancePrecompile.sol";
 
 contract HyperliquidGridStrategyTest is Test {
     HyperliquidGridStrategy public template;
@@ -450,13 +451,17 @@ contract HyperliquidGridStrategyTest is Test {
         return MockAccountMarginSummaryPrecompile(0x000000000000000000000000000000000000080F);
     }
 
-    function test_positionValue_returnsAccountMarginEquity() public {
+    function test_positionValue_sumsHcAndEvmAndSpot() public {
+        // Live NAV sums HC perp + HC spot + EVM USDC. In test env, the
+        // CoreDepositWallet bridge no-ops (no code at 0x6B9E77...) so DEPOSIT
+        // stays on strategy EVM. With HC perp = 12_345e6 (mock), spot = 0
+        // (no etch), evm = DEPOSIT, total = perp + 0 + DEPOSIT.
         _execAndPrep();
         MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
         m.setSummary(int64(int256(uint256(12_345e6))), 0, 0, 0);
         (uint256 value, bool valid) = strategy.positionValue();
         assertTrue(valid);
-        assertEq(value, 12_345e6);
+        assertEq(value, 12_345e6 + DEPOSIT);
     }
 
     function test_positionValue_negativeHcEquityFallsBackToEvmBalance() public {
@@ -684,6 +689,78 @@ contract HyperliquidGridStrategyTest is Test {
         m.setSummary(int64(int256(uint256(50e6))), uint64(0), 0, 0);
         vm.prank(attacker);
         strategy.recoverHcResiduals(); // should not revert
+    }
+
+    function _etchSpotBalance() internal returns (MockSpotBalancePrecompile) {
+        MockSpotBalancePrecompile m = new MockSpotBalancePrecompile();
+        vm.etch(0x0000000000000000000000000000000000000801, address(m).code);
+        return MockSpotBalancePrecompile(0x0000000000000000000000000000000000000801);
+    }
+
+    function test_moveSpotToPerp_classTransfersAllSpot() public {
+        // _execute strands USDC on HC spot when Circle's first-deposit fee
+        // makes the original class transfer fail. moveSpotToPerp() reads
+        // current spot balance and class-transfers it to perp, recovering
+        // the orphaned funds.
+        _execAndPrep();
+        MockSpotBalancePrecompile sb = _etchSpotBalance();
+        // Spot has 9 USDC = 9e8 spot wei (8-decimal). Should class-transfer
+        // 9e8 / 100 = 9e6 perp-decimal.
+        sb.setSpot(uint64(9e8), 0, 0);
+        vm.recordLogs();
+        vm.prank(proposer);
+        strategy.moveSpotToPerp();
+        (bool found, uint64 ntl, bool toPerp) = _decodeClassTransfer(vm.getRecordedLogs());
+        assertTrue(found, "moveSpotToPerp must emit class-transfer RawAction");
+        assertEq(ntl, uint64(9e6));
+        assertTrue(toPerp, "must be spot->perp direction");
+    }
+
+    function test_moveSpotToPerp_revertsForNonProposer() public {
+        _execAndPrep();
+        vm.prank(attacker);
+        vm.expectRevert(BaseStrategy.NotProposer.selector);
+        strategy.moveSpotToPerp();
+    }
+
+    function test_moveSpotToPerp_zeroSpotIsNoOp() public {
+        _execAndPrep();
+        // No spot etched → precompile returns empty / zeros → no class transfer.
+        vm.recordLogs();
+        vm.prank(proposer);
+        strategy.moveSpotToPerp();
+        assertEq(_countClassTransferLogs(vm.getRecordedLogs()), 0, "must not fire on empty spot");
+    }
+
+    function test_positionValue_inFlightHighWaterMarkCoversInTransit() public {
+        // After _execute, inFlightToHc = DEPOSIT. In test env, the bridge
+        // is a no-op so EVM bal stays = DEPOSIT. With perp = 0 and spot = 0
+        // (precompile not etched), observable = DEPOSIT. max(observable,
+        // inFlightToHc) = DEPOSIT. NAV stays stable.
+        _execAndPrep();
+        assertEq(strategy.inFlightToHc(), DEPOSIT, "execute must set inFlight high-water");
+        (uint256 value, bool valid) = strategy.positionValue();
+        assertTrue(valid);
+        assertEq(value, DEPOSIT);
+    }
+
+    function test_positionValue_includesHcSpotBalance() public {
+        // Circle's first-deposit-fee strand: perp = 0, spot = 9e8 wei (= 9 USDC),
+        // EVM = 0 (in real flow; in test env the bridge no-ops so use a fresh
+        // strategy with no _execute). positionValue must surface the spot value
+        // so the vault's NAV reflects it.
+        _execAndPrep();
+        MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
+        m.setSummary(0, 0, 0, 0);
+        MockSpotBalancePrecompile sb = _etchSpotBalance();
+        sb.setSpot(uint64(9e8), 0, 0); // 9 USDC on HC spot
+
+        (uint256 value, bool valid) = strategy.positionValue();
+        assertTrue(valid);
+        // observable = perp(0) + spot(9e8/100=9e6) + evm(DEPOSIT) = 9e6 + DEPOSIT.
+        // inFlightToHc = DEPOSIT (set by _execute).
+        // max = 9e6 + DEPOSIT.
+        assertEq(value, 9e6 + DEPOSIT);
     }
 
     function test_recoverHcResiduals_sameBlockGateSkips() public {

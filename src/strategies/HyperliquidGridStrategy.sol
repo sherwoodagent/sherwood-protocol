@@ -113,6 +113,14 @@ contract HyperliquidGridStrategy is BaseStrategy {
     ///         twice (`SPOT_BALANCE` returns pre-block state). Cross-block
     ///         retries see freshly-processed state and resume normally.
     uint256 public lastRecoverBlock;
+    /// @notice High-water mark of USDC bridged EVM→HC but not yet observed on
+    ///         HC by the precompile (in 6-decimal USDC units). Incremented in
+    ///         `_execute` and `_onLiveDeposit` after each `bridgeUsdcToSpot`,
+    ///         reset to 0 in `_drainHC` (funds leaving HC). `_positionValue`
+    ///         takes `max(observable, inFlightToHc)` so vault NAV doesn't
+    ///         under-report during the cross-block in-transit window between
+    ///         the bridge tx and HC's post-block processing.
+    uint256 public inFlightToHc;
 
     /// @notice CLOIDs of resting GTC grid orders, tracked per asset. Maintained
     ///         on-chain so `_settle` can self-cancel without keeper assistance.
@@ -215,24 +223,33 @@ contract HyperliquidGridStrategy is BaseStrategy {
 
         // Leverage is set off-chain via the exchange API before the proposal opens.
         // See `leverage` storage NatSpec.
+        // Note: Circle's CoreDepositWallet charges a 1 USDC new-account fee on
+        // first deposit per HC address, so the actual landed spot can be
+        // (amountIn - 1e6) and HC drops this class transfer if it exceeds spot.
+        // The proposer can call `moveSpotToPerp()` 1+ block later to recover by
+        // class-transferring whatever actually landed.
         L1Write.sendUsdClassTransfer(ntl, true);
+
+        // Track the in-flight bridge so vault NAV (`positionValue`) doesn't
+        // under-report during the cross-block window before HC processes.
+        inFlightToHc += amountIn;
 
         emit FundsParked(amountIn);
     }
 
     /// @dev Routes a mid-proposal LP deposit into the live HC perp account.
     ///      The vault has already pushed `assets` USDC to this address before
-    ///      calling here. HC auto-credits spot (registration done at init), so
-    ///      a single class transfer moves the funds to perp margin immediately.
-    ///      The keeper sees the expanded margin and places additional orders via
-    ///      updateParams — no leverage re-push needed (leverage is per-asset, not
-    ///      account-wide).
+    ///      calling here. Bridge EVM → HC spot via Circle's CoreDepositWallet,
+    ///      then class-transfer spot → perp. Subsequent deposits don't pay the
+    ///      first-deposit fee (the HC account already exists), so the class
+    ///      transfer for the full `assets` succeeds.
     function _onLiveDeposit(uint256 assets) internal override {
         if (assets == 0) return;
         if (assets > type(uint64).max) revert DepositAmountTooLarge();
         // Bridge new deposit's EVM USDC → HC spot, then move spot → perp.
         HyperliquidBridge.bridgeUsdcToSpot(asset, assets);
         L1Write.sendUsdClassTransfer(uint64(assets), true);
+        inFlightToHc += assets;
         emit FundsParked(assets);
     }
 
@@ -400,6 +417,10 @@ contract HyperliquidGridStrategy is BaseStrategy {
             L1Write.sendLimitOrder(ai, true, type(uint64).max, type(uint64).max, true, TimeInForce.Ioc, NO_CLOID);
         }
         _initiateReturn();
+        // Funds are leaving HC — clear the in-flight high-water mark so
+        // post-settle vault NAV (which sums float + positionValue) doesn't
+        // double-count the bridged amount via inFlightToHc.
+        inFlightToHc = 0;
     }
 
     /// @notice Post-settle recovery for HC residuals. Re-fires the full HC
@@ -572,52 +593,92 @@ contract HyperliquidGridStrategy is BaseStrategy {
     }
 
     /// @inheritdoc BaseStrategy
-    /// @dev Live NAV combines HyperCore perp equity with EVM-side USDC sitting
-    ///      on this contract. Both denominations are USDC 6-decimal so summing
-    ///      is dimensionally clean.
+    /// @dev Live NAV sums every place the strategy can hold value:
+    ///        - HC perp `accountValue` (6-decimal USDC) — clamped at 0 if negative
+    ///        - HC spot `total` (8-decimal spot wei, scaled to 6-decimal)
+    ///        - EVM USDC balance on this contract (6-decimal)
+    ///      Then takes `max(observable, inFlightToHc)` so the cross-block
+    ///      in-transit window (bridge tx submitted, HC not yet processed)
+    ///      doesn't drop NAV to 0 and trigger share inflation.
     ///
     ///      Always returns `valid=true` once the strategy is in `Executed`
     ///      state — the vault has already pulled funds in, so `totalAssets()`
     ///      MUST report something rather than degrading to queue-only and
-    ///      bricking the deposit modal. The fallback covers four failure modes:
+    ///      bricking the deposit modal.
     ///
-    ///        1. In-transit window: USDC pulled from vault but HC has not yet
-    ///           processed the auto-credit (cross-block async).
-    ///        2. HC registration silently failed (e.g. `_hcSelf` slot was
-    ///           overwritten before finalize, deploy used stale source) —
-    ///           USDC stays on EVM, HC accountValue stays at 0.
-    ///        3. HC precompile returns empty bytes for unregistered accounts —
-    ///           handled the same as (2).
-    ///        4. Severely underwater HC equity — clamped to non-negative; the
-    ///           remaining EVM balance is what's recoverable.
-    ///
-    ///      Without this fallback, the bug pattern observed pre-fix was:
-    ///      `totalAssets() == 0` while `totalSupply > 0` → `previewDeposit(1)`
-    ///      returns `~10,000,001` shares (catastrophic share inflation).
+    ///      Failure modes covered:
+    ///        1. Same-tx-as-execute / in-transit cross-block window: precompile
+    ///           returns pre-block state showing 0 on HC, EVM = 0 too. The
+    ///           `inFlightToHc` high-water mark fills the gap.
+    ///        2. Circle 1-USDC first-deposit fee strands the class transfer:
+    ///           perp = 0, spot has the bridged-minus-fee amount. The spot
+    ///           branch picks it up.
+    ///        3. HC registration failed entirely: USDC stays on EVM. The EVM
+    ///           branch picks it up.
+    ///        4. Severely underwater perp: accountValue clamped at 0; spot +
+    ///           EVM make up the rest of recoverable value.
     function _positionValue() internal view override returns (uint256, bool) {
+        // Read HC perp account margin
         (bool success, bytes memory ret) = L1Read.ACCOUNT_MARGIN_SUMMARY_PRECOMPILE_ADDRESS
         .staticcall{gas: L1Read.ACCOUNT_MARGIN_SUMMARY_GAS}(
             abi.encode(uint32(0), address(this))
         );
+        uint256 perpVal = 0;
+        if (success && ret.length >= 128) {
+            AccountMarginSummary memory s = abi.decode(ret, (AccountMarginSummary));
+            if (s.accountValue > 0) perpVal = uint256(int256(s.accountValue));
+        }
+
+        // Read HC spot balance for USDC (token=0). Convert spot wei (8-dec) →
+        // perp/EVM units (6-dec) via `/ PERP_TO_SPOT_WEI`.
+        (bool spotOk, bytes memory spotRet) = L1Read.SPOT_BALANCE_PRECOMPILE_ADDRESS
+        .staticcall{gas: L1Read.SPOT_BALANCE_GAS}(
+            abi.encode(address(this), uint64(HyperliquidBridge.USDC_TOKEN_INDEX))
+        );
+        uint256 spotVal = 0;
+        if (spotOk && spotRet.length >= 96) {
+            SpotBalance memory sb = abi.decode(spotRet, (SpotBalance));
+            spotVal = uint256(sb.total) / HyperliquidBridge.PERP_TO_SPOT_WEI;
+        }
+
         uint256 evmBal = IERC20(asset).balanceOf(address(this));
-        if (!success || ret.length < 128) {
-            // Precompile unavailable (non-HyperEVM env) or returned empty
-            // (account not registered with HC). Fall back to EVM balance.
-            return (evmBal, true);
-        }
-        AccountMarginSummary memory s = abi.decode(ret, (AccountMarginSummary));
-        if (s.accountValue <= 0) {
-            // HC has no positive equity (zero/negative). Whatever value
-            // remains is on EVM — return that.
-            return (evmBal, true);
-        }
-        // HC has live equity. accountValue is in 6-decimal USDC (HL convention:
-        // perp uses spot-wei / 100, where USDC spot wei is 8-decimal). After
-        // the explicit CoreDepositWallet.deposit bridge, EVM USDC has moved
-        // INTO the bridge contract — the strategy's EVM balance is 0 once
-        // the bridge clears. So summing here would NOT double-count, but is
-        // also unnecessary: HC's accountValue already reflects every cent
-        // that's been bridged + traded.
-        return (uint256(int256(s.accountValue)), true);
+        uint256 observable = perpVal + spotVal + evmBal;
+
+        // High-water mark covers the cross-block in-transit window: when a
+        // bridge has been queued but HC's precompile snapshot doesn't yet
+        // reflect it, `observable < inFlightToHc`. Otherwise HC has caught
+        // up and observable >= inFlightToHc, so the max collapses to
+        // observable. `_drainHC` resets `inFlightToHc` when funds leave HC.
+        return (observable >= inFlightToHc ? observable : inFlightToHc, true);
+    }
+
+    /// @notice Move all HC spot USDC to perp margin via class transfer.
+    /// @dev    Reads the strategy's current HC spot balance (8-decimal),
+    ///         converts to perp 6-decimal, and queues a `sendUsdClassTransfer`
+    ///         action. Recovers from:
+    ///           - Circle's 1-USDC first-deposit fee dropping the original
+    ///             class transfer in `_execute` (spot has 9, perp has 0).
+    ///           - Any partial bridge / dust that landed on spot.
+    ///         Repeatable. Each call queues a fresh class transfer for the
+    ///         current spot balance.
+    /// @dev    Proposer-only because timing matters (the class transfer must
+    ///         be queued AFTER HC has processed the bridge, otherwise the
+    ///         pre-block spot read is stale). Permissionless would also be
+    ///         safe (funds stay within the strategy's HC account, no
+    ///         diversion), but proposer-only keeps the responsibility clear.
+    /// @dev    Same-block re-call is idempotent on intent but wasteful: the
+    ///         second call would queue another class transfer for the same
+    ///         pre-block spot read. Wait at least one block between calls.
+    function moveSpotToPerp() external onlyProposer {
+        if (_state != State.Executed) revert NotExecuted();
+        (bool ok, bytes memory ret) = L1Read.SPOT_BALANCE_PRECOMPILE_ADDRESS.staticcall{gas: L1Read.SPOT_BALANCE_GAS}(
+            abi.encode(address(this), uint64(HyperliquidBridge.USDC_TOKEN_INDEX))
+        );
+        if (!ok || ret.length < 96) return;
+        SpotBalance memory sb = abi.decode(ret, (SpotBalance));
+        if (sb.total == 0) return;
+        uint64 perpAmount = sb.total / HyperliquidBridge.PERP_TO_SPOT_WEI;
+        if (perpAmount == 0) return;
+        L1Write.sendUsdClassTransfer(perpAmount, true);
     }
 }
