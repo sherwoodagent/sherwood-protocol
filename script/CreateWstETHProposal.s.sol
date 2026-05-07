@@ -28,6 +28,9 @@ contract CreateWstETHProposal is Script {
     address constant AERO_ROUTER = 0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43;
     address constant AERO_FACTORY = 0x420DD381b31aEf6683db6B902084cB0FFECe40Da;
 
+    // Chainlink WSTETH/ETH feed on Base (heartbeat 24h, 18 decimals).
+    address constant CHAINLINK_WSTETH_ETH = 0x43a5C292A453A3bF3606fa856197f09D7B74251a;
+
     // Strategy params
     // Fixed-amount script. Set SUPPLY_AMOUNT = 0 to use the vault's full WETH
     // balance at execute time (dynamic-all mode supported by the strategy).
@@ -54,6 +57,7 @@ contract CreateWstETHProposal is Script {
             mwsteth: MWSTETH,
             aeroRouter: AERO_ROUTER,
             aeroFactory: AERO_FACTORY,
+            chainlinkWstethEthFeed: CHAINLINK_WSTETH_ETH,
             supplyAmount: SUPPLY_AMOUNT,
             minWstethOutPerWeth: MIN_WSTETH_OUT_PER_WETH,
             minWethOutPerWsteth: MIN_WETH_OUT_PER_WSTETH,

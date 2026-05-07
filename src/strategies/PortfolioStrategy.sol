@@ -5,6 +5,7 @@ import {BaseStrategy} from "./BaseStrategy.sol";
 import {IStrategy} from "../interfaces/IStrategy.sol";
 import {ISwapAdapter} from "../interfaces/ISwapAdapter.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 /// @notice Chainlink Data Streams verifier proxy interface
@@ -61,6 +62,7 @@ contract PortfolioStrategy is BaseStrategy {
     error StalePrice();
     error InvalidSlippage();
     error QuoteUnavailable();
+    error InvalidPriceDecimals();
 
     // ── Constants ──
     uint256 public constant MAX_BASKET_SIZE = 20;
@@ -89,6 +91,26 @@ contract PortfolioStrategy is BaseStrategy {
 
     bool private _rebalancing;
 
+    /// @notice Last verified Chainlink Data Streams price per token (raw oracle units).
+    /// @dev    Populated by `rebalanceDelta` (in-loop write) and the standalone
+    ///         `refreshPrices` helper. Read by `_positionValue` for live NAV.
+    mapping(address token => uint256 price) public cachedPrice;
+
+    /// @notice Wall-clock timestamp of the last cache write per token.
+    mapping(address token => uint256 updatedAt) public cachedPriceUpdatedAt;
+
+    /// @dev Cached `decimals()` of the vault asset, read once at init so
+    ///      `_positionValue` doesn't need an external call per share-price read.
+    uint8 internal _assetDecimals;
+
+    /// @dev Cached `decimals()` per allocation, parallel to `_allocations`.
+    uint8[] internal _tokenDecimals;
+
+    /// @dev Declared per-allocation Chainlink feed decimals (raw oracle scale).
+    ///      Required because Chainlink Data Streams reports for tokenized stocks
+    ///      may use 1e8 while crypto pairs use 1e18 — we must not hard-code 1e18.
+    uint8[] internal _priceDecimals;
+
     // ── Events ──
     event WeightsUpdated(address[] tokens, uint256[] oldWeights, uint256[] newWeights);
     event Rebalanced(
@@ -109,6 +131,12 @@ contract PortfolioStrategy is BaseStrategy {
         uint256 swapsExecuted
     );
 
+    /// @notice Emitted whenever the Chainlink price cache is refreshed (either
+    ///         via the dedicated `refreshPrices` helper or as a side effect of
+    ///         `rebalanceDelta`). Keepers / monitoring use this to observe the
+    ///         live-NAV freshness gate.
+    event PricesRefreshed(uint256 timestamp);
+
     /// @inheritdoc IStrategy
     function name() external pure returns (string memory) {
         return "Portfolio";
@@ -118,7 +146,12 @@ contract PortfolioStrategy is BaseStrategy {
 
     /// @notice Decode: (address asset, address swapAdapter, address chainlinkVerifier,
     ///         address[] tokens, uint256[] weightsBps, uint256 totalAmount,
-    ///         uint256 maxSlippageBps, bytes[] swapExtraData)
+    ///         uint256 maxSlippageBps, bytes[] swapExtraData, uint8[] priceDecimals)
+    /// @dev    `priceDecimals[i]` declares the raw Chainlink feed scale for
+    ///         allocation `i` (typically 8 for tokenized stocks, 18 for crypto
+    ///         pairs). Must be ≤ 36 to keep `10**(...)` math safe. Token decimals
+    ///         are read once via `IERC20Metadata.decimals()` and cached so
+    ///         `_positionValue` stays cheap.
     function _initialize(bytes calldata data) internal override {
         (
             address asset_,
@@ -128,23 +161,30 @@ contract PortfolioStrategy is BaseStrategy {
             uint256[] memory weightsBps,
             uint256 totalAmount_,
             uint256 maxSlippageBps_,
-            bytes[] memory swapExtraData_
-        ) = abi.decode(data, (address, address, address, address[], uint256[], uint256, uint256, bytes[]));
+            bytes[] memory swapExtraData_,
+            uint8[] memory priceDecimals_
+        ) = abi.decode(data, (address, address, address, address[], uint256[], uint256, uint256, bytes[], uint8[]));
 
         if (asset_ == address(0) || swapAdapter_ == address(0)) revert ZeroAddress();
         if (tokens.length == 0 || tokens.length > MAX_BASKET_SIZE) revert TooManyTokens();
         if (tokens.length != weightsBps.length || tokens.length != swapExtraData_.length) revert LengthMismatch();
+        if (tokens.length != priceDecimals_.length) revert LengthMismatch();
         if (totalAmount_ == 0) revert InvalidAmount();
         if (maxSlippageBps_ == 0 || maxSlippageBps_ >= BPS_DENOMINATOR) revert InvalidSlippage();
 
         uint256 weightSum;
         for (uint256 i; i < tokens.length; ++i) {
             if (tokens[i] == address(0)) revert ZeroAddress();
+            // 36 ≈ max informally seen across Chainlink feeds; main guard is
+            // against bogus calldata that would overflow `10 ** denom` math.
+            if (priceDecimals_[i] > 36) revert InvalidPriceDecimals();
             weightSum += weightsBps[i];
             _allocations.push(
                 TokenAllocation({token: tokens[i], targetWeightBps: weightsBps[i], tokenAmount: 0, investedAmount: 0})
             );
             _swapExtraData.push(swapExtraData_[i]);
+            _tokenDecimals.push(IERC20Metadata(tokens[i]).decimals());
+            _priceDecimals.push(priceDecimals_[i]);
         }
         if (weightSum != BPS_DENOMINATOR) revert InvalidWeights();
 
@@ -153,6 +193,7 @@ contract PortfolioStrategy is BaseStrategy {
         chainlinkVerifier = chainlinkVerifier_;
         totalAmount = totalAmount_;
         maxSlippageBps = maxSlippageBps_;
+        _assetDecimals = IERC20Metadata(asset_).decimals();
     }
 
     // ── Execute: buy basket tokens ──
@@ -327,13 +368,20 @@ contract PortfolioStrategy is BaseStrategy {
 
         DeltaSnapshot memory snap = _snapshotAllocations(len);
 
-        // 1. Verify prices and compute current portfolio value.
+        // 1. Verify prices and compute current portfolio value. Verified prices
+        //    are cached so live NAV (`_positionValue`) stays fresh as a
+        //    side effect of every rebalance.
         uint256 totalValue;
+        uint256 nowTs = block.timestamp;
         for (uint256 i; i < len; ++i) {
             snap.prices[i] = _verifyPrice(priceReports[i]);
             snap.currentValues[i] = (snap.oldBalances[i] * snap.prices[i]) / PRICE_PRECISION;
             totalValue += snap.currentValues[i];
+            address tok = _allocations[i].token;
+            cachedPrice[tok] = snap.prices[i];
+            cachedPriceUpdatedAt[tok] = nowTs;
         }
+        emit PricesRefreshed(nowTs);
         // Include any asset balance already held (e.g. from previous partial rebalances).
         totalValue += IERC20(asset).balanceOf(address(this));
 
@@ -458,8 +506,32 @@ contract PortfolioStrategy is BaseStrategy {
         if (block.timestamp > report.expiresAt) revert StalePrice();
         if (report.price <= 0) revert InvalidAmount();
 
-        // Chainlink prices are int192 with 18 decimals — convert to uint256
+        // Chainlink prices are int192 with the report's declared decimals (8 for
+        // tokenized stocks, 18 for crypto pairs). The raw oracle units are
+        // preserved here; decimal-correct scaling happens in `_positionValue`
+        // using the per-allocation `_priceDecimals` declared at init.
         price = uint256(uint192(report.price));
+    }
+
+    /// @notice Verify a batch of signed Chainlink Data Streams reports and
+    ///         refresh the live-NAV cache. Permissionless — caller pays LINK
+    ///         at `verify` time but funds cannot be diverted (only effect is
+    ///         cache writes). Designed to be called every ~3 minutes during
+    ///         an active proposal so `_positionValue.valid` stays true within
+    ///         the `MAX_PRICE_AGE` (5 min) freshness window.
+    /// @param  reports Signed Chainlink Data Streams reports, parallel to
+    ///                 `_allocations` (same order).
+    function refreshPrices(bytes[] calldata reports) external {
+        uint256 len = _allocations.length;
+        if (reports.length != len) revert LengthMismatch();
+        uint256 nowTs = block.timestamp;
+        for (uint256 i; i < len; ++i) {
+            uint256 price = _verifyPrice(reports[i]);
+            address tok = _allocations[i].token;
+            cachedPrice[tok] = price;
+            cachedPriceUpdatedAt[tok] = nowTs;
+        }
+        emit PricesRefreshed(nowTs);
     }
 
     // ── View functions ──
@@ -479,11 +551,88 @@ contract PortfolioStrategy is BaseStrategy {
         return _swapExtraData;
     }
 
+    /// @notice Per-allocation price-feed decimals declared at init. Off-chain
+    ///         keepers / UIs use this to know how to format the cached price.
+    function getPriceDecimals() external view returns (uint8[] memory) {
+        return _priceDecimals;
+    }
+
+    /// @notice Per-allocation token decimals snapshotted at init.
+    function getTokenDecimals() external view returns (uint8[] memory) {
+        return _tokenDecimals;
+    }
+
+    /// @notice Vault asset decimals snapshotted at init.
+    function assetDecimals() external view returns (uint8) {
+        return _assetDecimals;
+    }
+
     // ── positionValue ──
-    // Inherits BaseStrategy's (0, false) default — PortfolioStrategy has no
-    // cheap *view* path to a current value. Chainlink Data Streams `verify`
-    // is non-view (charges LINK) and the ISwapAdapter quote is likewise
-    // non-view. The frontend reads `getAllocations()` + offchain prices
-    // (CoinGecko) to compute display-only P&L for Portfolio, which is a
-    // better signal than any onchain spot-quote we could synthesize here.
+
+    /// @inheritdoc BaseStrategy
+    /// @dev Live NAV reads cached Chainlink Data Streams prices populated by
+    ///      `refreshPrices` (or `rebalanceDelta`). Returns `valid=false` when
+    ///      ANY allocation's cache is empty or stale (>`MAX_PRICE_AGE` old) —
+    ///      vault then falls back to the async-redeem queue, which is the
+    ///      safe default.
+    ///
+    ///      Decimal scaling (closes punch list D-3 / D-4):
+    ///        value_in_asset_decimals
+    ///          = balance * price * 10^assetDecimals
+    ///            / 10^(tokenDecimals + priceDecimals)
+    ///      The per-token `tokenDecimals` and `priceDecimals` are cached at
+    ///      init; the vault asset's decimals are cached as `_assetDecimals`.
+    function _positionValue() internal view override returns (uint256, bool) {
+        uint256 len = _allocations.length;
+        uint256 totalAssetValue;
+        uint256 nowTs = block.timestamp;
+        uint256 assetDec = uint256(_assetDecimals);
+
+        for (uint256 i; i < len; ++i) {
+            address token = _allocations[i].token;
+            uint256 ts = cachedPriceUpdatedAt[token];
+            if (ts == 0 || nowTs - ts > MAX_PRICE_AGE) return (0, false);
+
+            uint256 bal = IERC20(token).balanceOf(address(this));
+            if (bal == 0) continue;
+
+            uint256 price = cachedPrice[token];
+            uint256 denom = uint256(_tokenDecimals[i]) + uint256(_priceDecimals[i]);
+            uint256 numerator = bal * price;
+            if (denom >= assetDec) {
+                totalAssetValue += numerator / (10 ** (denom - assetDec));
+            } else {
+                totalAssetValue += numerator * (10 ** (assetDec - denom));
+            }
+        }
+
+        // Add any asset balance held on the strategy (already in asset decimals).
+        totalAssetValue += IERC20(asset).balanceOf(address(this));
+        return (totalAssetValue, true);
+    }
+
+    /// @notice Routes a mid-proposal LP deposit across the basket at the
+    ///         currently-stored target weights. Vault has already pushed
+    ///         `assets` of underlying to this contract before calling here.
+    /// @dev    Reuses `_quoteMinOut` so each leg gets adapter-quote-driven
+    ///         slippage. Updates `tokenAmount` / `investedAmount` per
+    ///         allocation so subsequent rebalances see the new principal.
+    ///         Allocations whose post-split share rounds to zero are skipped —
+    ///         the residual asset stays on the strategy and is reclaimed at
+    ///         settle (or at the next rebalance).
+    function _onLiveDeposit(uint256 assets) internal override {
+        if (assets == 0) return;
+        uint256 len = _allocations.length;
+        for (uint256 i; i < len; ++i) {
+            TokenAllocation storage alloc = _allocations[i];
+            uint256 allocation = (assets * alloc.targetWeightBps) / BPS_DENOMINATOR;
+            if (allocation == 0) continue;
+            IERC20(asset).forceApprove(address(swapAdapter), allocation);
+            uint256 minOut = _quoteMinOut(asset, alloc.token, allocation, _swapExtraData[i]);
+            uint256 amountOut = swapAdapter.swap(asset, alloc.token, allocation, minOut, _swapExtraData[i]);
+            if (amountOut == 0) revert SwapFailed();
+            alloc.tokenAmount += amountOut;
+            alloc.investedAmount += allocation;
+        }
+    }
 }

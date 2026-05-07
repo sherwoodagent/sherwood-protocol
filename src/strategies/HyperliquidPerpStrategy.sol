@@ -593,4 +593,21 @@ contract HyperliquidPerpStrategy is BaseStrategy {
         if (perpAmount == 0) return;
         L1Write.sendUsdClassTransfer(perpAmount, true);
     }
+
+    /// @dev Routes a mid-proposal LP deposit into HC perp margin. Vault has
+    ///      already pushed `assets` USDC to this address before calling here.
+    ///      Mirrors `_execute`: bridge EVM → HC spot via Circle's CoreDepositWallet,
+    ///      then class-transfer spot → perp. The first-deposit fee is only
+    ///      charged on a fresh HC account, so subsequent deposits land at full
+    ///      `assets` on HC. Bumping `inFlightToHc` covers the cross-block
+    ///      window between this tx and HC's post-block credit; `_positionValue`
+    ///      reconciles via the tolerance fallback.
+    function _onLiveDeposit(uint256 assets) internal override {
+        if (assets == 0) return;
+        if (assets > type(uint64).max) revert DepositAmountTooLarge();
+        HyperliquidBridge.bridgeUsdcToSpot(asset, assets);
+        L1Write.sendUsdClassTransfer(uint64(assets), true);
+        inFlightToHc += assets;
+        emit FundsParked(assets);
+    }
 }

@@ -43,8 +43,12 @@ contract PortfolioIntegrationTest is RobinhoodIntegrationTest {
         returns (bytes memory)
     {
         bytes[] memory extraData = new bytes[](tokens.length);
+        // Tokenized stocks on Robinhood Chain are 18-decimal ERC20s and the
+        // Chainlink Data Streams reports for them quote in 1e18 USD units.
+        uint8[] memory priceDecimals = new uint8[](tokens.length);
         for (uint256 i; i < tokens.length; ++i) {
             extraData[i] = abi.encode(uint24(FEE_TIER));
+            priceDecimals[i] = 18;
         }
 
         return abi.encode(
@@ -55,7 +59,8 @@ contract PortfolioIntegrationTest is RobinhoodIntegrationTest {
             weightsBps,
             totalAmt,
             uint256(500), // maxSlippageBps = 5%
-            extraData
+            extraData,
+            priceDecimals
         );
     }
 
