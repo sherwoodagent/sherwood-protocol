@@ -42,6 +42,11 @@ abstract contract BaseStrategy is IStrategy {
         Settled
     }
 
+    // slot 0: reserved for HyperCore FirstStorageSlot registration.
+    // HyperliquidGridStrategy._initialize() writes address(this) here so HC
+    // reads slot 0 post-block and confirms it equals the contract address.
+    // Other strategies leave this as address(0) — no functional impact.
+    address internal _hcSelf;
     address private _vault;
     address private _proposer;
     State internal _state;
@@ -70,16 +75,31 @@ abstract contract BaseStrategy is IStrategy {
     }
 
     /// @inheritdoc IStrategy
+    /// @dev Stamps `_hcSelf = address(this)` at slot 0 BEFORE delegating to
+    ///      `_initialize` so HyperCore's FirstStorageSlot finalize variant
+    ///      always sees the correct value. Foolproof for every strategy that
+    ///      inherits BaseStrategy — strategy-specific `_initialize` overrides
+    ///      cannot forget the stamp. Slot 0 is reserved for this purpose at
+    ///      the storage layout level (see `_hcSelf` declaration above);
+    ///      non-Hyperliquid strategies pay the cost (one SSTORE) but get
+    ///      consistent layout in exchange.
     function initialize(address vault_, address proposer_, bytes calldata data) external {
         if (_initialized) revert AlreadyInitialized();
         if (vault_ == address(0)) revert ZeroAddress();
         if (proposer_ == address(0)) revert ZeroAddress();
         _initialized = true;
+        _hcSelf = address(this);
         _vault = vault_;
         _proposer = proposer_;
         _state = State.Pending;
 
         _initialize(data);
+    }
+
+    /// @notice Slot 0 contents — used by HyperCore FirstStorageSlot variant.
+    ///         Should equal `address(this)` after `initialize`. Diagnostic only.
+    function hcSelf() external view returns (address) {
+        return _hcSelf;
     }
 
     /// @inheritdoc IStrategy
@@ -108,7 +128,7 @@ abstract contract BaseStrategy is IStrategy {
     }
 
     /// @inheritdoc IStrategy
-    function proposer() external view returns (address) {
+    function proposer() public view returns (address) {
         return _proposer;
     }
 

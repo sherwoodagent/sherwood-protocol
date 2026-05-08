@@ -670,4 +670,64 @@ contract SyndicateFactoryTest is Test {
         assertTrue(q != address(0), "queue not bound");
         assertEq(VaultWithdrawalQueue(q).vault(), syndicateVault, "queue's vault mismatch");
     }
+
+    // ==================== setEnsRegistrar ====================
+
+    event EnsRegistrarUpdated(address indexed oldRegistrar, address indexed newRegistrar);
+
+    /// @notice Owner can repoint the ENS registrar; future syndicates use the new one.
+    ///         Recovery path for the Base mainnet deploy where `ensRegistrar` was
+    ///         initialized to `address(0)` and every syndicate created since then
+    ///         silently skipped ENS registration.
+    function test_setEnsRegistrar_ownerRepointsRegistrar() public {
+        address oldRegistrar = address(ensRegistrar);
+        MockL2Registrar newRegistrar = new MockL2Registrar();
+
+        vm.expectEmit(true, true, false, true);
+        emit EnsRegistrarUpdated(oldRegistrar, address(newRegistrar));
+
+        vm.prank(owner);
+        factory.setEnsRegistrar(address(newRegistrar));
+
+        assertEq(address(factory.ensRegistrar()), address(newRegistrar), "ensRegistrar not updated");
+    }
+
+    /// @notice Owner can clear the registrar by setting to zero — disables ENS
+    ///         registration for future syndicates without breaking creation.
+    ///         (createSyndicate's `address(0)` guard already covers this case.)
+    function test_setEnsRegistrar_zeroAddressDisablesEns() public {
+        vm.prank(owner);
+        factory.setEnsRegistrar(address(0));
+
+        assertEq(address(factory.ensRegistrar()), address(0));
+
+        // createSyndicate still succeeds — the ENS register call is guarded.
+        vm.prank(creator1);
+        (, address vaultAddr) = factory.createSyndicate(creator1AgentId, _defaultConfig());
+        assertTrue(vaultAddr != address(0));
+    }
+
+    /// @notice Non-owner cannot change the registrar.
+    function test_setEnsRegistrar_revertsForNonOwner() public {
+        vm.prank(creator1);
+        vm.expectRevert();
+        factory.setEnsRegistrar(makeAddr("rogueRegistrar"));
+    }
+
+    /// @notice After repointing, new syndicates register against the new registrar.
+    function test_setEnsRegistrar_futureSyndicatesUseNewRegistrar() public {
+        MockL2Registrar newRegistrar = new MockL2Registrar();
+        vm.prank(owner);
+        factory.setEnsRegistrar(address(newRegistrar));
+
+        vm.prank(creator1);
+        SyndicateFactory.SyndicateConfig memory cfg = _defaultConfig();
+        cfg.subdomain = "fresh-after-repoint";
+        factory.createSyndicate(creator1AgentId, cfg);
+
+        // The MockL2Registrar tracks calls; new registrar should have been hit,
+        // old one untouched for this subdomain.
+        assertTrue(newRegistrar.isRegistered("fresh-after-repoint"), "new registrar missed");
+        assertFalse(ensRegistrar.isRegistered("fresh-after-repoint"), "old registrar called");
+    }
 }

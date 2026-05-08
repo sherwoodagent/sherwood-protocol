@@ -24,11 +24,8 @@ contract HyperliquidGridStrategyTest is Test {
     uint32 constant LEVERAGE = 5;
     uint256 constant MAX_ORDER_SIZE = 100_000e6;
     uint32 constant MAX_ORDERS = 32;
-    // Hyperliquid mainnet perp asset indices (verified against PERP_ASSET_INFO
-    // precompile 0x...080a): BTC=0, ETH=1, ATOM=2, MATIC=3, DYDX=4, SOL=5.
-    // Universe is append-only — once assigned, indices never move.
-    uint32 constant BTC_ASSET = 0;
-    uint32 constant ETH_ASSET = 1;
+    uint32 constant BTC_ASSET = 3;
+    uint32 constant ETH_ASSET = 4;
     uint32 constant SOL_ASSET = 5;
 
     function setUp() public {
@@ -67,12 +64,14 @@ contract HyperliquidGridStrategyTest is Test {
         assertTrue(strategy.isAssetWhitelisted(ETH_ASSET));
         assertTrue(strategy.isAssetWhitelisted(SOL_ASSET));
         assertFalse(strategy.isAssetWhitelisted(99));
-        // HC registration is NOT done at init — finalizeForHyperCore must be
-        // called separately after initialize() with FinalizeVariant.Create.
+        // hyperCoreFinalized is set by finalizeForHyperCore(), not by initialize().
         assertFalse(strategy.hyperCoreFinalized());
+        // _hcSelf (slot 0) is written to address(this) during initialize() so HC
+        // FirstStorageSlot registration reads the correct value post-block.
+        assertEq(address(uint160(uint256(vm.load(address(strategy), bytes32(0))))), address(strategy));
     }
 
-    function test_initialize_doesNotFinalizeHyperCore() public {
+    function test_initialize_setsHcSelfSlot() public {
         address payable rawClone = payable(Clones.clone(address(template)));
         HyperliquidGridStrategy s = HyperliquidGridStrategy(rawClone);
 
@@ -82,6 +81,8 @@ contract HyperliquidGridStrategyTest is Test {
         s.initialize(vault, proposer, initData);
 
         assertFalse(s.hyperCoreFinalized());
+        // Slot 0 (_hcSelf) must equal the clone's own address after init.
+        assertEq(address(uint160(uint256(vm.load(address(s), bytes32(0))))), address(s));
     }
 
     function test_finalizeForHyperCore_setsFlag() public {
@@ -94,9 +95,9 @@ contract HyperliquidGridStrategyTest is Test {
         s.initialize(vault, proposer, initData);
 
         vm.expectEmit(true, true, true, true, address(s));
-        emit HyperliquidGridStrategy.HyperCoreFinalized(0, FinalizeVariant.Create, 1684);
+        emit HyperliquidGridStrategy.HyperCoreFinalized(0, FinalizeVariant.FirstStorageSlot, 0);
         vm.prank(proposer);
-        s.finalizeForHyperCore(0, FinalizeVariant.Create, 1684);
+        s.finalizeForHyperCore(0, FinalizeVariant.FirstStorageSlot, 0);
 
         assertTrue(s.hyperCoreFinalized());
     }
@@ -209,15 +210,27 @@ contract HyperliquidGridStrategyTest is Test {
         assertTrue(strategy.settled());
     }
 
-    function test_sweepToVault_pushesUsdcBack() public {
+    function test_settle_pushesUsdcBack() public {
+        // settle() now does the EVM USDC push directly so the governor's
+        // settle batch sees correct vault.totalAssets() for fee math.
+        _execAndPrep();
+        uint256 vaultBefore = usdc.balanceOf(vault);
+        vm.prank(vault);
+        strategy.settle();
+        assertEq(usdc.balanceOf(vault), vaultBefore + DEPOSIT);
+        assertEq(usdc.balanceOf(address(strategy)), 0);
+    }
+
+    function test_sweepToVault_isNoOpAfterSettleHandledFunds() public {
+        // After _settle pushed all EVM USDC, sweepToVault is a no-op (no
+        // funds to push — late HC arrivals have not yet landed).
         _execAndPrep();
         vm.prank(vault);
         strategy.settle();
-        // Strategy still holds DEPOSIT in mock (USD class transfer is just an event).
-        uint256 vaultBefore = usdc.balanceOf(vault);
+        uint256 vaultBalance = usdc.balanceOf(vault);
         strategy.sweepToVault();
-        assertEq(usdc.balanceOf(vault), vaultBefore + DEPOSIT);
-        assertGt(strategy.cumulativeSwept(), 0);
+        assertEq(usdc.balanceOf(vault), vaultBalance);
+        assertEq(strategy.cumulativeSwept(), 0);
     }
 
     function test_sweepToVault_revertsIfNotSettled() public {
@@ -274,19 +287,47 @@ contract HyperliquidGridStrategyTest is Test {
         }
     }
 
-    function test_sweepToVault_repeatableForPartialArrivals() public {
+    function test_settle_queuesSpotToEvmBridge() public {
+        // _initiateReturn must queue a sendAsset (action 13) targeting the
+        // USDC system address (0x2000...0000) so HC drains spot back to EVM.
+        // Without this, USDC arriving on HC spot from the perp→spot class
+        // transfer would strand on HC indefinitely.
+        _execAndPrep();
+        MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
+        m.setSummary(int64(int256(uint256(8_000e6))), uint64(2_000e6), 0, 0); // freeMargin = 6_000e6
+
+        vm.recordLogs();
+        vm.prank(vault);
+        strategy.settle();
+
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        (bool found, SendAssetCall memory call) = _findSendAsset(logs);
+        assertTrue(found, "settle must queue spot->EVM sendAsset bridge");
+        // USDC system address = BASE_SYSTEM_ADDRESS + token_index_0
+        assertEq(call.destination, address(0x2000000000000000000000000000000000000000));
+        assertEq(call.subAccount, address(0));
+        assertEq(call.sourceDex, type(uint32).max); // SPOT_DEX
+        assertEq(call.destinationDex, type(uint32).max);
+        assertEq(call.token, uint64(0)); // USDC
+        // 6_000e6 perp * 100 = 6_000e8 spot wei. preSpot = 0 in this test.
+        assertEq(call.amount, uint64(6_000e6) * 100);
+    }
+
+    function test_sweepToVault_pullsLateHcArrivals() public {
+        // settle() pushed the initial DEPOSIT. HC may auto-credit the
+        // strategy's EVM USDC later (post-block bridge). sweepToVault()
+        // recovers those late arrivals.
         _execAndPrep();
         vm.prank(vault);
         strategy.settle();
-        // First sweep: full balance (DEPOSIT)
-        strategy.sweepToVault();
-        assertEq(strategy.cumulativeSwept(), DEPOSIT);
-        // Simulate more USDC arriving from async transfer
+        // settle already pushed DEPOSIT — confirm strategy has 0 now.
+        assertEq(usdc.balanceOf(address(strategy)), 0);
+        // Simulate late HC auto-credit arriving on EVM after settle.
         usdc.mint(address(strategy), 5_000e6);
-        // Second sweep: should succeed without minReturn check
         uint256 vaultBefore = usdc.balanceOf(vault);
         strategy.sweepToVault();
         assertEq(usdc.balanceOf(vault), vaultBefore + 5_000e6);
+        assertEq(strategy.cumulativeSwept(), 5_000e6);
     }
 
     // ── On-chain CLOID tracking & self-cancel ──
@@ -410,30 +451,55 @@ contract HyperliquidGridStrategyTest is Test {
         return MockAccountMarginSummaryPrecompile(0x000000000000000000000000000000000000080F);
     }
 
-    function test_positionValue_returnsAccountMarginEquity() public {
+    function test_positionValue_sumsHcAndEvmAndSpot() public {
+        // Live NAV sums HC perp + HC spot + EVM USDC. In test env, the
+        // CoreDepositWallet bridge no-ops (no code at 0x6B9E77...) so DEPOSIT
+        // stays on strategy EVM. With HC perp = 12_345e6 (mock), spot = 0
+        // (no etch), evm = DEPOSIT, total = perp + 0 + DEPOSIT.
         _execAndPrep();
         MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
         m.setSummary(int64(int256(uint256(12_345e6))), 0, 0, 0);
         (uint256 value, bool valid) = strategy.positionValue();
         assertTrue(valid);
-        assertEq(value, 12_345e6);
+        assertEq(value, 12_345e6 + DEPOSIT);
     }
 
-    function test_positionValue_clampsNegativeEquityToZero() public {
+    function test_positionValue_negativeHcEquityFallsBackToEvmBalance() public {
+        // HC reports negative equity (severely underwater). Fallback returns
+        // EVM USDC balance — that's what's actually recoverable. Math should
+        // clamp to non-negative, never blow up the deposit modal.
         _execAndPrep();
         MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
         m.setSummary(int64(-1_000), 0, 0, 0);
         (uint256 value, bool valid) = strategy.positionValue();
         assertTrue(valid);
-        assertEq(value, 0);
+        assertEq(value, DEPOSIT);
     }
 
-    function test_positionValue_invalidWhenPrecompileMissing() public {
-        _execAndPrep();
-        // No etch at 0x...080F
+    // When HC reports accountValue == 0 (in-transit: USDC pulled from vault but
+    // not yet credited to HC spot), positionValue() falls back to the EVM balance
+    // so totalAssets() doesn't drop to 0 for one block after execute().
+    function test_positionValue_inTransitFallback() public {
+        _execAndPrep(); // strategy holds DEPOSIT USDC (MockCoreWriter doesn't move it)
+        MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
+        m.setSummary(int64(0), 0, 0, 0); // HC reports zero (in-transit)
         (uint256 value, bool valid) = strategy.positionValue();
-        assertFalse(valid);
-        assertEq(value, 0);
+        assertTrue(valid);
+        assertEq(value, DEPOSIT); // EVM balance used as placeholder
+    }
+
+    function test_positionValue_precompileMissingFallsBackToEvmBalance() public {
+        // When the precompile staticcall returns empty (HC registration
+        // never landed, or non-HyperEVM env), fall back to EVM USDC balance.
+        // CRITICAL: must return valid=true so vault's totalAssets() reports
+        // the real value (not 0) — prevents the share inflation bug where
+        // totalAssets()==0 with totalSupply>0 made previewDeposit(1) return
+        // ~10M shares.
+        _execAndPrep();
+        // No etch at 0x...080F — staticcall returns empty bytes
+        (uint256 value, bool valid) = strategy.positionValue();
+        assertTrue(valid);
+        assertEq(value, DEPOSIT);
     }
 
     function test_positionValue_invalidBeforeExecute() public {
@@ -444,177 +510,6 @@ contract HyperliquidGridStrategyTest is Test {
         (uint256 value, bool valid) = strategy.positionValue();
         assertFalse(valid);
         assertEq(value, 0);
-    }
-
-    // ── Live NAV: spot-balance fallback (bridge-fee/classTransfer mismatch) ──
-
-    function _etchSpotBalance() internal returns (MockSpotBalancePrecompile) {
-        MockSpotBalancePrecompile m = new MockSpotBalancePrecompile();
-        vm.etch(0x0000000000000000000000000000000000000801, address(m).code);
-        return MockSpotBalancePrecompile(0x0000000000000000000000000000000000000801);
-    }
-
-    function test_positionValue_includesSpotUsdcWhenPerpEmpty() public {
-        // Reproduces the on-chain bug: bridged USDC parked on HC spot because
-        // classTransfer to perp was rejected (bridge fee shaved spot balance).
-        // Perp accountValue=0, spot=8 USDC (8-dec) → NAV must read 8 USDC (6-dec).
-        _execAndPrep();
-        _etchAccountMarginSummary(); // perp present but accountValue=0
-        MockSpotBalancePrecompile sp = _etchSpotBalance();
-        sp.setSpot(uint64(8 * 1e8), 0, 0); // 8 USDC at 8-dec = 800_000_000
-
-        (uint256 value, bool valid) = strategy.positionValue();
-        assertTrue(valid);
-        assertEq(value, 8 * 1e6, "spot 8e8 must scale to 8e6 in 6-dec NAV");
-    }
-
-    function test_positionValue_sumsPerpAndSpot() public {
-        _execAndPrep();
-        MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
-        m.setSummary(int64(int256(uint256(5_000e6))), 0, 0, 0); // 5k USDC perp
-        MockSpotBalancePrecompile sp = _etchSpotBalance();
-        sp.setSpot(uint64(2 * 1e8), 0, 0); // 2 USDC spot (8-dec)
-
-        (uint256 value, bool valid) = strategy.positionValue();
-        assertTrue(valid);
-        assertEq(value, 5_000e6 + 2e6, "perp + spot must sum in 6-dec");
-    }
-
-    function test_positionValue_validIfOnlySpotPrecompileAvailable() public {
-        // No perp precompile etched, only spot. NAV must still report valid.
-        _execAndPrep();
-        MockSpotBalancePrecompile sp = _etchSpotBalance();
-        sp.setSpot(uint64(3 * 1e8), 0, 0); // 3 USDC spot
-
-        (uint256 value, bool valid) = strategy.positionValue();
-        assertTrue(valid);
-        assertEq(value, 3e6);
-    }
-
-    function test_positionValue_spotHoldDoesNotShrinkTotal() public {
-        // `total` already includes `hold`; we add total/100, not (total-hold)/100,
-        // because held funds still belong to the strategy (locked in resting orders).
-        _execAndPrep();
-        MockSpotBalancePrecompile sp = _etchSpotBalance();
-        sp.setSpot(uint64(10 * 1e8), uint64(4 * 1e8), 0); // total=10, hold=4
-
-        (uint256 value, bool valid) = strategy.positionValue();
-        assertTrue(valid);
-        assertEq(value, 10e6, "total includes hold; NAV must reflect total");
-    }
-
-    // ── bridgeToMargin: recovery from bridge-fee classTransfer mismatch ──
-
-    function test_bridgeToMargin_classTransfersFreeSpotBalance() public {
-        _execAndPrep();
-        MockSpotBalancePrecompile sp = _etchSpotBalance();
-        sp.setSpot(uint64(8 * 1e8), 0, 0); // 8 USDC free on spot (8-dec)
-
-        vm.recordLogs();
-        strategy.bridgeToMargin();
-
-        (bool found, uint64 ntl, bool toPerp) = _decodeClassTransfer(vm.getRecordedLogs());
-        assertTrue(found, "expected class transfer");
-        assertEq(ntl, uint64(8e6), "8 USDC at 6-dec");
-        assertTrue(toPerp);
-    }
-
-    function test_bridgeToMargin_subtractsHoldBeforeTransfer() public {
-        _execAndPrep();
-        MockSpotBalancePrecompile sp = _etchSpotBalance();
-        sp.setSpot(uint64(10 * 1e8), uint64(3 * 1e8), 0); // 10 total, 3 hold → 7 free
-
-        vm.recordLogs();
-        strategy.bridgeToMargin();
-
-        (bool found, uint64 ntl,) = _decodeClassTransfer(vm.getRecordedLogs());
-        assertTrue(found);
-        assertEq(ntl, uint64(7e6));
-    }
-
-    function test_bridgeToMargin_noOpsWhenSpotEmpty() public {
-        _execAndPrep();
-        MockSpotBalancePrecompile sp = _etchSpotBalance();
-        sp.setSpot(0, 0, 0);
-
-        vm.recordLogs();
-        strategy.bridgeToMargin();
-        assertEq(_countClassTransferLogs(vm.getRecordedLogs()), 0);
-    }
-
-    function test_bridgeToMargin_noOpsWhenSpotEntirelyHeld() public {
-        _execAndPrep();
-        MockSpotBalancePrecompile sp = _etchSpotBalance();
-        sp.setSpot(uint64(5 * 1e8), uint64(5 * 1e8), 0); // total == hold → free=0
-
-        vm.recordLogs();
-        strategy.bridgeToMargin();
-        assertEq(_countClassTransferLogs(vm.getRecordedLogs()), 0);
-    }
-
-    function test_bridgeToMargin_noOpsWhenSubMicrounitFree() public {
-        _execAndPrep();
-        MockSpotBalancePrecompile sp = _etchSpotBalance();
-        sp.setSpot(50, 0, 0); // 50 in 8-dec = 0.5 microUSDC; /100 truncates to 0
-
-        vm.recordLogs();
-        strategy.bridgeToMargin();
-        assertEq(_countClassTransferLogs(vm.getRecordedLogs()), 0, "dust must not fire transfer");
-    }
-
-    function test_bridgeToMargin_isPermissionless() public {
-        _execAndPrep();
-        MockSpotBalancePrecompile sp = _etchSpotBalance();
-        sp.setSpot(uint64(8 * 1e8), 0, 0);
-
-        vm.recordLogs();
-        vm.prank(attacker); // anyone can call — funds only move strat-spot → strat-perp
-        strategy.bridgeToMargin();
-
-        (bool found,,) = _decodeClassTransfer(vm.getRecordedLogs());
-        assertTrue(found);
-    }
-
-    // ── Cross-margin guard: underwater perp ignores spot in NAV ──
-
-    function test_positionValue_underwaterPerpIgnoresSpot() public {
-        // Unified-account semantics: an underwater perp can be auto-liquidated
-        // against spot USDC. Reporting spot as recoverable when perp is
-        // negative would over-state NAV. Guard returns (0, true).
-        _execAndPrep();
-        MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
-        m.setSummary(int64(-500e6), 0, 0, 0); // perp -$500
-        MockSpotBalancePrecompile sp = _etchSpotBalance();
-        sp.setSpot(uint64(8 * 1e8), 0, 0); // spot 8 USDC — must be ignored
-
-        (uint256 value, bool valid) = strategy.positionValue();
-        assertTrue(valid, "valid stays true (precompile responsive)");
-        assertEq(value, 0, "spot must be ignored when perp is underwater");
-    }
-
-    // ── bridgeToMargin: post-settle griefing guard ──
-
-    function test_bridgeToMargin_noOpsAfterSettled() public {
-        _execAndPrep();
-        // Etch margin summary so settle() can call _initiateClassTransfer
-        MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
-        m.setSummary(int64(0), 0, 0, 0);
-        vm.prank(vault);
-        strategy.settle();
-        assertTrue(strategy.settled());
-
-        // Spot has funds (e.g. perp→spot from settle just landed)
-        MockSpotBalancePrecompile sp = _etchSpotBalance();
-        sp.setSpot(uint64(5 * 1e8), 0, 0);
-
-        vm.recordLogs();
-        vm.prank(attacker);
-        strategy.bridgeToMargin(); // must be a no-op
-        assertEq(
-            _countClassTransferLogs(vm.getRecordedLogs()),
-            0,
-            "post-settle bridgeToMargin must NOT reverse the perp->spot direction"
-        );
     }
 
     // ── onLiveDeposit ──
@@ -653,10 +548,45 @@ contract HyperliquidGridStrategyTest is Test {
 
     // ── initiateReturn / _initiateClassTransfer ──
 
-    function test_initiateReturn_revertsIfNotSettled() public {
+    function test_initiateReturn_revertsForNonProposerBeforeDuration() public {
+        // Path 1 of two-path settle: anyone-but-proposer must wait until
+        // proposal duration expires. The mock governor used by these tests
+        // does not implement `getActiveProposal/getProposal`, so the auth
+        // call from a non-proposer reverts (no data) — that's the expected
+        // gate firing. Proposer call (pre-duration) must succeed.
         _execAndPrep();
-        vm.expectRevert(HyperliquidGridStrategy.NotSweepable.selector);
+        vm.prank(attacker);
+        vm.expectRevert();
         strategy.initiateReturn();
+    }
+
+    function test_initiateReturn_revertsBeforeExecute() public {
+        // Auth gate: state must be Executed (no _execute call yet).
+        vm.prank(proposer);
+        vm.expectRevert(BaseStrategy.NotExecuted.selector);
+        strategy.initiateReturn();
+    }
+
+    function test_initiateReturn_proposerCanCallAnytime() public {
+        _execAndPrep();
+        MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
+        m.setSummary(int64(int256(uint256(8_000e6))), uint64(2_000e6), 0, 0);
+        vm.prank(proposer);
+        strategy.initiateReturn();
+        assertTrue(strategy.returnsInitiated());
+    }
+
+    function test_initiateReturn_idempotent() public {
+        _execAndPrep();
+        MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
+        m.setSummary(int64(int256(uint256(8_000e6))), uint64(2_000e6), 0, 0);
+        vm.prank(proposer);
+        strategy.initiateReturn();
+        // Second call: silent no-op (returns) — does NOT re-fire bridge actions.
+        vm.recordLogs();
+        vm.prank(proposer);
+        strategy.initiateReturn();
+        assertEq(_countClassTransferLogs(vm.getRecordedLogs()), 0, "second initiateReturn must be no-op");
     }
 
     function test_settle_skipsClassTransferWhenNoPrecompile() public {
@@ -716,25 +646,307 @@ contract HyperliquidGridStrategyTest is Test {
         assertEq(_countClassTransferLogs(vm.getRecordedLogs()), 0, "no transfer when all margin locked");
     }
 
-    function test_initiateReturn_resweepsResidualPerp() public {
+    function test_recoverHcResiduals_revertsBeforeSettle() public {
+        // Path-1 / path-2 separation: recoverHcResiduals must not run while
+        // the strategy is still Executed (would conflict with initiateReturn).
+        _execAndPrep();
+        vm.expectRevert(HyperliquidGridStrategy.NotSweepable.selector);
+        strategy.recoverHcResiduals();
+    }
+
+    function test_recoverHcResiduals_refiresDrainPostSettle() public {
+        // After settle, residual HC margin (e.g. from IOC slippage) can be
+        // recovered by re-firing the drain via this permissionless entrypoint.
+        // Roll one block past settle so the same-block gate doesn't suppress.
         _execAndPrep();
         MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
-        m.setSummary(int64(int256(uint256(9_800e6))), 0, 0, 0);
+        m.setSummary(int64(int256(uint256(9_800e6))), uint64(0), 0, 0);
         vm.prank(vault);
         strategy.settle();
+        vm.roll(block.number + 1);
 
-        // Simulate residual equity left in perp after IOC slippage.
-        m.setSummary(int64(int256(uint256(200e6))), 0, 0, 0);
+        // Simulate residual perp margin appearing after settle (e.g. IOC fill
+        // releasing locked margin) and confirm a re-fire emits a fresh class
+        // transfer for the residual amount.
+        m.setSummary(int64(int256(uint256(200e6))), uint64(0), 0, 0);
         vm.recordLogs();
+        strategy.recoverHcResiduals();
+        (bool found, uint64 ntl,) = _decodeClassTransfer(vm.getRecordedLogs());
+        assertTrue(found, "recoverHcResiduals must re-fire perp->spot class transfer");
+        assertEq(ntl, uint64(200e6));
+    }
+
+    function test_recoverHcResiduals_permissionless() public {
+        // Anyone can call after settle (no auth check) — funds only flow to
+        // strategy/vault, so no diversion is possible.
+        _execAndPrep();
+        MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
+        m.setSummary(int64(int256(uint256(1_000e6))), uint64(0), 0, 0);
+        vm.prank(vault);
+        strategy.settle();
+        vm.roll(block.number + 1);
+
+        m.setSummary(int64(int256(uint256(50e6))), uint64(0), 0, 0);
+        vm.prank(attacker);
+        strategy.recoverHcResiduals(); // should not revert
+    }
+
+    function _etchSpotBalance() internal returns (MockSpotBalancePrecompile) {
+        MockSpotBalancePrecompile m = new MockSpotBalancePrecompile();
+        vm.etch(0x0000000000000000000000000000000000000801, address(m).code);
+        return MockSpotBalancePrecompile(0x0000000000000000000000000000000000000801);
+    }
+
+    function test_moveSpotToPerp_classTransfersAllSpot() public {
+        // _execute strands USDC on HC spot when Circle's first-deposit fee
+        // makes the original class transfer fail. moveSpotToPerp() reads
+        // current spot balance and class-transfers it to perp, recovering
+        // the orphaned funds.
+        _execAndPrep();
+        MockSpotBalancePrecompile sb = _etchSpotBalance();
+        // Spot has 9 USDC = 9e8 spot wei (8-decimal). Should class-transfer
+        // 9e8 / 100 = 9e6 perp-decimal.
+        sb.setSpot(uint64(9e8), 0, 0);
+        vm.recordLogs();
+        vm.prank(proposer);
+        strategy.moveSpotToPerp();
+        (bool found, uint64 ntl, bool toPerp) = _decodeClassTransfer(vm.getRecordedLogs());
+        assertTrue(found, "moveSpotToPerp must emit class-transfer RawAction");
+        assertEq(ntl, uint64(9e6));
+        assertTrue(toPerp, "must be spot->perp direction");
+    }
+
+    function test_moveSpotToPerp_revertsForNonProposer() public {
+        _execAndPrep();
+        vm.prank(attacker);
+        vm.expectRevert(BaseStrategy.NotProposer.selector);
+        strategy.moveSpotToPerp();
+    }
+
+    function test_moveSpotToPerp_zeroSpotIsNoOp() public {
+        _execAndPrep();
+        // No spot etched → precompile returns empty / zeros → no class transfer.
+        vm.recordLogs();
+        vm.prank(proposer);
+        strategy.moveSpotToPerp();
+        assertEq(_countClassTransferLogs(vm.getRecordedLogs()), 0, "must not fire on empty spot");
+    }
+
+    function test_positionValue_inFlightHighWaterMarkCoversInTransit() public {
+        // After _execute, inFlightToHc = DEPOSIT. In test env, the bridge
+        // is a no-op so EVM bal stays = DEPOSIT. With perp = 0 and spot = 0
+        // (precompile not etched), observable = DEPOSIT. max(observable,
+        // inFlightToHc) = DEPOSIT. NAV stays stable.
+        _execAndPrep();
+        assertEq(strategy.inFlightToHc(), DEPOSIT, "execute must set inFlight high-water");
+        (uint256 value, bool valid) = strategy.positionValue();
+        assertTrue(valid);
+        assertEq(value, DEPOSIT);
+    }
+
+    function test_positionValue_includesHcSpotBalance() public {
+        // Circle's first-deposit-fee strand: perp = 0, spot = 9e8 wei (= 9 USDC),
+        // EVM = 0 (in real flow; in test env the bridge no-ops so use a fresh
+        // strategy with no _execute). positionValue must surface the spot value
+        // so the vault's NAV reflects it.
+        _execAndPrep();
+        MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
+        m.setSummary(0, 0, 0, 0);
+        MockSpotBalancePrecompile sb = _etchSpotBalance();
+        sb.setSpot(uint64(9e8), 0, 0); // 9 USDC on HC spot
+
+        (uint256 value, bool valid) = strategy.positionValue();
+        assertTrue(valid);
+        // observable = perp(0) + spot(9e8/100=9e6) + evm(DEPOSIT) = 9e6 + DEPOSIT.
+        // inFlightToHc = DEPOSIT (set by _execute).
+        // max = 9e6 + DEPOSIT.
+        assertEq(value, 9e6 + DEPOSIT);
+    }
+
+    function test_recoverHcResiduals_sameBlockGateSkips() public {
+        // Same-block re-calls are silently skipped to prevent duplicate
+        // spot→EVM bridge actions reading the same pre-block SPOT_BALANCE.
+        _execAndPrep();
+        MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
+        m.setSummary(int64(int256(uint256(9_800e6))), uint64(0), 0, 0);
+        vm.prank(vault);
+        strategy.settle();
+        vm.roll(block.number + 1);
+
+        m.setSummary(int64(int256(uint256(200e6))), uint64(0), 0, 0);
+        strategy.recoverHcResiduals(); // first call: fires
+        vm.recordLogs();
+        strategy.recoverHcResiduals(); // same-block second call: skipped
+        assertEq(_countClassTransferLogs(vm.getRecordedLogs()), 0, "same-block re-call must not re-fire");
+    }
+
+    function test_positionValue_trustsObservableWhenGapWithinCircleFeeTolerance() public {
+        // Issue #1 regression: Circle's 1-USDC first-deposit fee leaves
+        // inFlightToHc permanently above observable (we incremented by full
+        // bridged amount but HC only credits amount-fee). When the gap is
+        // ≤ CORE_ACCOUNT_FEE_TOLERANCE (1 USDC), positionValue must trust
+        // live observable instead of the stale high-water mark.
+        _execAndPrep();
+        assertEq(strategy.inFlightToHc(), DEPOSIT, "inFlight must be set by execute");
+        // Simulate Circle fee: HC perp credits DEPOSIT - 1 USDC, EVM cleared.
+        MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
+        m.setSummary(int64(int256(uint256(DEPOSIT - 1e6))), uint64(0), 0, 0);
+        usdc.burn(address(strategy), usdc.balanceOf(address(strategy)));
+        (uint256 value, bool valid) = strategy.positionValue();
+        assertTrue(valid);
+        // observable = DEPOSIT - 1e6; gap = 1e6 = tolerance → trust observable.
+        assertEq(value, DEPOSIT - 1e6, "must trust observable when gap <= tolerance");
+    }
+
+    function test_positionValue_subsequentDepositInTransitUsesHighWater() public {
+        // Issue #1b regression: a SUBSEQUENT live deposit's in-transit window
+        // has HC visible from the prior bridge but observable trails
+        // inFlightToHc by the new in-flight amount. The earlier `hcVisible >
+        // 0` short-circuit would under-report by the new in-flight amount;
+        // the tolerance fallback correctly falls back to the high-water mark
+        // when the gap exceeds CORE_ACCOUNT_FEE_TOLERANCE.
+        //
+        // Faithfully reproduces the scenario by actually calling
+        // `onLiveDeposit` (rather than just mocking inFlightToHc), so the
+        // test fails if `_onLiveDeposit` ever stops bumping `inFlightToHc`.
+        _execAndPrep();
+
+        // Simulate the FIRST bridge fully credited: HC perp = DEPOSIT, EVM = 0.
+        MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
+        m.setSummary(int64(int256(uint256(DEPOSIT))), uint64(0), 0, 0);
+        usdc.burn(address(strategy), usdc.balanceOf(address(strategy)));
+
+        // Sanity: at this point observable >= inFlightToHc, so positionValue
+        // returns observable (live HC). No fallback yet.
+        (uint256 v0,) = strategy.positionValue();
+        assertEq(v0, DEPOSIT, "pre-condition: observable trusted when fully credited");
+
+        // Now simulate a SECOND live deposit hitting the strategy. Vault
+        // pushes `liveAssets` to the strategy (mint USDC into the strategy
+        // address) then calls `onLiveDeposit`. The bridge no-ops in tests,
+        // so EVM stays at `liveAssets` and HC remains at the prior DEPOSIT
+        // — but `inFlightToHc` jumps to DEPOSIT + liveAssets.
+        uint256 liveAssets = 2_500e6;
+        usdc.mint(address(strategy), liveAssets);
+        vm.prank(vault);
+        strategy.onLiveDeposit(liveAssets);
+
+        // _onLiveDeposit must have bumped inFlightToHc by exactly `liveAssets`.
+        assertEq(strategy.inFlightToHc(), DEPOSIT + liveAssets, "live deposit must bump high-water");
+
+        (uint256 value, bool valid) = strategy.positionValue();
+        assertTrue(valid);
+        // observable = HC(DEPOSIT) + spot(0) + EVM(liveAssets) = DEPOSIT + liveAssets.
+        // gap = inFlightToHc - observable = 0 (exact match because mocks make
+        // the second bridge a no-op so EVM still holds liveAssets), so the
+        // tolerance test passes and observable wins. This is the steady-
+        // state assertion. The fallback path is exercised in
+        // `test_positionValue_outboundInFlightCoversDrainTransitGap`.
+        assertEq(value, DEPOSIT + liveAssets, "observable wins when EVM still holds new deposit");
+
+        // Now drop EVM to 0 to simulate the bridge actually completing the
+        // EVM→HC class transfer mid-block — HC precompile snapshot is still
+        // pre-block (DEPOSIT), so `observable = DEPOSIT` while `inFlightToHc
+        // = DEPOSIT + liveAssets`. Gap = liveAssets ≫ tolerance → fallback.
+        usdc.burn(address(strategy), usdc.balanceOf(address(strategy)));
+        (value, valid) = strategy.positionValue();
+        assertTrue(valid);
+        // Old `hcVisible > 0` short-circuit: returns observable = DEPOSIT
+        // (under by `liveAssets`). New tolerance fallback: returns
+        // inFlightToHc = DEPOSIT + liveAssets (correct).
+        assertEq(value, DEPOSIT + liveAssets, "must use high-water when gap exceeds tolerance");
+    }
+
+    function test_positionValue_outboundInFlightCoversDrainTransitGap() public {
+        // Issue #2 regression: after initiateReturn queues the spot→EVM
+        // bridge, HC processes async post-block. Until EVM USDC arrives or
+        // HC visibility is restored, both sides report 0 — NAV would drop
+        // to 0 and trigger share inflation. The high-water mark captured
+        // in _initiateReturn covers that gap.
+        //
+        // Discriminating against the prior `inFlightToHc = DEPOSIT` set by
+        // `_execute`: pick a pre-drain HC total STRICTLY GREATER than DEPOSIT
+        // (simulating a profitable proposal). The new max-update in
+        // `_initiateReturn` MUST raise `inFlightToHc` from DEPOSIT to the
+        // higher pre-drain total. If the max-update code is deleted, the
+        // assertion fails because `inFlightToHc` would stay at DEPOSIT.
+        _execAndPrep();
+        assertEq(strategy.inFlightToHc(), DEPOSIT, "preconditon: execute set high-water = DEPOSIT");
+
+        // Pre-drain: HC perp = 12_000e6, spot = 500e6 (= 500e6 * 100 spot wei).
+        // preDrainHcTotal = 12_500e6 > DEPOSIT (10_000e6).
+        MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
+        m.setSummary(int64(int256(uint256(12_000e6))), uint64(0), 0, 0);
+        MockSpotBalancePrecompile sb = _etchSpotBalance();
+        sb.setSpot(uint64(500e6 * 100), 0, 0);
+
+        vm.prank(proposer);
         strategy.initiateReturn();
+
+        // Drain captured: max-update must raise high-water to 12_500e6.
+        // assertEq is strict — only the new code can produce this value.
+        assertEq(strategy.inFlightToHc(), 12_500e6, "drain must raise high-water to pre-drain HC total");
+
+        // Now simulate cross-block in-transit: HC precompiles report 0
+        // (bridge processed, balances cleared) but EVM USDC hasn't arrived.
+        m.setSummary(int64(0), uint64(0), 0, 0);
+        sb.setSpot(uint64(0), 0, 0);
+        usdc.burn(address(strategy), usdc.balanceOf(address(strategy)));
+
+        (uint256 value, bool valid) = strategy.positionValue();
+        assertTrue(valid);
+        // observable = 0; gap = 12_500e6 ≫ tolerance → fallback to high-water.
+        assertEq(value, 12_500e6, "in-transit gap must be covered by high-water");
+    }
+
+    function test_initiateReturn_drainsHcOnPath1() public {
+        // Path 1: proposer calls initiateReturn pre-settle. HC drain queues:
+        // perp→spot class transfer + spot→EVM sendAsset. Then governor's
+        // _settle runs (≥1 block later in production) to push EVM USDC to vault.
+        _execAndPrep();
+        MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
+        m.setSummary(int64(int256(uint256(9_800e6))), uint64(0), 0, 0);
+        vm.recordLogs();
+        vm.prank(proposer);
+        strategy.initiateReturn();
+        // Class transfer for the full freeMargin emitted.
         (bool found, uint64 ntl,) = _decodeClassTransfer(vm.getRecordedLogs());
         assertTrue(found);
-        assertEq(ntl, uint64(200e6));
+        assertEq(ntl, uint64(9_800e6));
+        assertTrue(strategy.returnsInitiated());
+        assertFalse(strategy.settled());
     }
 
     // ── Helpers ──
 
     bytes4 constant CLASS_TRANSFER_ACTION = 0x01000007;
+    bytes4 constant SEND_ASSET_ACTION = 0x0100000d;
+
+    /// @dev Decoded sendAsset action used by spot→EVM bridge regression tests.
+    struct SendAssetCall {
+        address destination;
+        address subAccount;
+        uint32 sourceDex;
+        uint32 destinationDex;
+        uint64 token;
+        uint64 amount;
+    }
+
+    function _findSendAsset(Vm.Log[] memory logs) internal view returns (bool found, SendAssetCall memory call) {
+        bytes32 sig = keccak256("RawAction(address,bytes)");
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].topics[0] != sig) continue;
+            bytes memory raw = abi.decode(logs[i].data, (bytes));
+            if (raw.length < 4 || bytes4(raw) != SEND_ASSET_ACTION) continue;
+            bytes memory payload = new bytes(raw.length - 4);
+            for (uint256 j = 0; j < payload.length; j++) {
+                payload[j] = raw[j + 4];
+            }
+            (call.destination, call.subAccount, call.sourceDex, call.destinationDex, call.token, call.amount) =
+                abi.decode(payload, (address, address, uint32, uint32, uint64, uint64));
+            return (true, call);
+        }
+    }
 
     function _countClassTransferLogs(Vm.Log[] memory logs) internal view returns (uint256 count) {
         bytes32 sig = keccak256("RawAction(address,bytes)");

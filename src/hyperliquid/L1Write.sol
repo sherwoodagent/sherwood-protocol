@@ -63,23 +63,10 @@ library L1Write {
     bytes4 constant ACTION_SEND_ASSET = 0x0100000d;
     bytes4 constant ACTION_REFLECT_EVM_SUPPLY_CHANGE = 0x0100000e;
     bytes4 constant ACTION_BORROW_LEND_OPERATION = 0x0100000f;
-    bytes4 constant ACTION_UPDATE_LEVERAGE = 0x01000010;
 
-    /// @notice Encodes an update leverage action
-    /// @param asset The perp asset index
-    /// @param isCross Whether to use cross margin (true) or isolated margin (false)
-    /// @param leverage The leverage multiplier
-    function encodeUpdateLeverage(uint32 asset, bool isCross, uint32 leverage) internal pure returns (bytes memory) {
-        return abi.encodePacked(ACTION_UPDATE_LEVERAGE, abi.encode(asset, isCross, leverage));
-    }
-
-    /// @notice Sends an update leverage action
-    /// @param asset The perp asset index
-    /// @param isCross Whether to use cross margin (true) or isolated margin (false)
-    /// @param leverage The leverage multiplier
-    function sendUpdateLeverage(uint32 asset, bool isCross, uint32 leverage) internal {
-        _sendAction(encodeUpdateLeverage(asset, isCross, leverage));
-    }
+    // NOTE: There is no on-chain CoreWriter action for setting leverage.
+    // Hyperliquid's spec defines actions 1-15 only. Leverage must be set via
+    // the off-chain exchange API (`updateLeverage`) before opening positions.
 
     /// @notice Encodes a limit order action
     /// @param asset The perp asset index

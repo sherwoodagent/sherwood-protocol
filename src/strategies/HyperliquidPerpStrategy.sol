@@ -5,20 +5,33 @@ import {BaseStrategy} from "./BaseStrategy.sol";
 import {IStrategy} from "../interfaces/IStrategy.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import {L1Write, TimeInForce, NO_CLOID} from "../hyperliquid/L1Write.sol";
+import {L1Write, TimeInForce, NO_CLOID, FinalizeVariant} from "../hyperliquid/L1Write.sol";
 import {L1Read, Position, SpotBalance, AccountMarginSummary} from "../hyperliquid/L1Read.sol";
+import {HyperliquidBridge} from "../hyperliquid/HyperliquidBridge.sol";
+import {ISyndicateGovernor} from "../interfaces/ISyndicateGovernor.sol";
+import {ISyndicateVault} from "../interfaces/ISyndicateVault.sol";
 
 /**
  * @title HyperliquidPerpStrategy
  * @notice On-chain perpetual trading strategy using HyperEVM precompiles.
  *
- *   USDC is pulled from the vault and transferred to perp margin via
- *   L1Write.sendUsdClassTransfer(). The proposer then triggers trades
- *   (open long, close position, update stop loss) via updateParams().
+ *   USDC is pulled from the vault, bridged EVM→HC spot via Circle's
+ *   CoreDepositWallet (`HyperliquidBridge.bridgeUsdcToSpot`), and moved
+ *   onto HC perp margin via `L1Write.sendUsdClassTransfer`. The proposer
+ *   then triggers trades (open long, close position, update stop loss)
+ *   via updateParams().
  *
- *   Settlement: _settle() closes positions + requests async USD transfer.
- *   sweepToVault() pushes USDC back to vault once it arrives on the EVM side.
- *   Callable by anyone (funds only go to vault). Repeatable for partial arrivals.
+ *   Settlement: _settle() force-closes all positions, runs the perp→spot
+ *   class transfer (using the precompile-read free margin amount, NOT the
+ *   undocumented `uint64.max` sentinel), and pushes the strategy's current
+ *   EVM USDC balance back to the vault — the governor's settle batch reads
+ *   vault.totalAssets() right after, so the EVM push must happen here.
+ *   sweepToVault() recovers any late HC arrivals (post-block bridge credits).
+ *
+ *   HyperCore registration: `_initialize()` writes `address(this)` to slot 0
+ *   (`_hcSelf` from BaseStrategy). The CLI then calls
+ *   `finalizeForHyperCore(0, FinalizeVariant.FirstStorageSlot, 0)` as a
+ *   separate tx so HC reads slot 0 post-block and confirms the registration.
  *
  *   Position state is NOT tracked on-chain — L1Read.position2() is the source
  *   of truth. The proposer must check actual HyperCore state before acting.
@@ -35,7 +48,8 @@ contract HyperliquidPerpStrategy is BaseStrategy {
     event FundsParked(uint256 amount);
     event Settled();
     event FundsSwept(uint256 amount);
-    event LeverageUpdated(uint32 asset, uint32 leverage);
+    event HyperCoreFinalized(uint64 token, FinalizeVariant variant, uint64 createNonce);
+    event ReturnsInitiated();
 
     // ── Errors ──
     error InvalidAmount();
@@ -44,6 +58,8 @@ contract HyperliquidPerpStrategy is BaseStrategy {
     error NotSweepable();
     error MaxTradesExceeded();
     error PositionTooLarge(uint256 actual, uint256 max);
+    error AlreadyFinalized();
+    error NotAuthorized();
 
     // ── Action types ──
     // Legacy single-asset actions (use perpAssetIndex from storage):
@@ -68,10 +84,33 @@ contract HyperliquidPerpStrategy is BaseStrategy {
     IERC20 public asset;
     uint256 public depositAmount;
     uint32 public perpAssetIndex;
+    /// @notice The intended leverage for HyperCore positions opened by this strategy.
+    /// @dev Off-chain keepers MUST set this leverage on HyperCore via the exchange
+    ///      API (`updateLeverage`) before the proposal opens. The contract cannot
+    ///      enforce this on chain — there is no CoreWriter action for leverage
+    ///      (Hyperliquid's spec defines actions 1-15 only). Guardians review by
+    ///      inspecting HyperCore state via `L1Read.position2` against this covenant.
     uint32 public leverage;
-    bool public leverageSentToCore; // Whether leverage has been set on HyperCore
     bool public hasActiveStopLoss; // Whether a GTC stop-loss is currently live
     bool public settled; // Whether _settle() has been called
+    /// @notice True once this contract has been registered with HyperCore so
+    ///         bridged-token transfers auto-credit HC spot. Set only by
+    ///         `finalizeForHyperCore`, which the CLI auto-calls in a separate
+    ///         tx immediately after `initialize()` for grid; for perp, the
+    ///         CLI calls it as part of the propose flow.
+    bool public hyperCoreFinalized;
+    /// @notice True once the HC drain (force-close + perp→spot + spot→EVM
+    ///         bridge) has been triggered. Set by `initiateReturn()` (proposer
+    ///         pre-settle) or by `_settle()` defensively. Idempotent.
+    bool public returnsInitiated;
+    /// @notice Block number of the last `recoverHcResiduals()` call. See grid.
+    uint256 public lastRecoverBlock;
+    /// @notice High-water mark of USDC committed to HC but not yet observed
+    ///         on HC by the precompile (in 6-decimal USDC units). See grid
+    ///         for full rationale — covers both inbound and outbound cross-
+    ///         block transit windows. Reconciled in `_positionValue` via
+    ///         `HyperliquidBridge.CORE_ACCOUNT_FEE_TOLERANCE`.
+    uint256 public inFlightToHc;
     /// @dev Cumulative USDC pushed back to the vault across all sweepToVault() calls.
     ///      Off-chain accounting only — does not gate withdrawals.
     uint256 public cumulativeSwept;
@@ -130,15 +169,47 @@ contract HyperliquidPerpStrategy is BaseStrategy {
 
         _pullFromVault(address(asset), amountIn);
 
+        // Bridge EVM → HC spot via Circle's CoreDepositWallet. Without this,
+        // HC spot stays empty and the class-transfer below is a no-op.
+        HyperliquidBridge.bridgeUsdcToSpot(asset, amountIn);
+
         uint64 ntl = uint64(amountIn);
 
-        L1Write.sendUpdateLeverage(perpAssetIndex, true, leverage);
-        leverageSentToCore = true;
-        emit LeverageUpdated(perpAssetIndex, leverage);
-
+        // Leverage is set off-chain via the exchange API before the proposal opens.
+        // See `leverage` storage NatSpec.
+        // Note: Circle's CoreDepositWallet charges a 1 USDC new-account fee on
+        // first deposit per HC address, so this class transfer can be dropped
+        // by HC if it exceeds the actually-landed spot. Recover via
+        // `moveSpotToPerp()` 1+ block later.
         L1Write.sendUsdClassTransfer(ntl, true);
 
+        // Track in-flight bridge (see grid for rationale).
+        inFlightToHc += amountIn;
+
         emit FundsParked(amountIn);
+    }
+
+    /**
+     * @notice Register this clone with HyperCore so that bridged USDC ERC-20
+     *         transfers auto-credit the HC spot account. MUST be called once
+     *         after `initialize()` and before the proposal that triggers
+     *         `_execute()`.
+     *
+     *         Standard call for SyndicateFactory CLI clones:
+     *           finalizeForHyperCore(0, FinalizeVariant.FirstStorageSlot, 0)
+     *         BaseStrategy.initialize() writes `address(this)` to slot 0
+     *         (`_hcSelf`). HC reads slot 0 post-block, confirms it equals
+     *         the contract address, and completes registration.
+     *
+     * @param token        HyperCore token index (USDC = 0).
+     * @param variant      FinalizeVariant enum (Create / FirstStorageSlot / CustomStorageSlot).
+     * @param createNonce  Deployer nonce (Create variant only; pass 0 for FirstStorageSlot).
+     */
+    function finalizeForHyperCore(uint64 token, FinalizeVariant variant, uint64 createNonce) external onlyProposer {
+        if (hyperCoreFinalized) revert AlreadyFinalized();
+        L1Write.sendFinalizeEvmContract(token, variant, createNonce);
+        hyperCoreFinalized = true;
+        emit HyperCoreFinalized(token, variant, createNonce);
     }
 
     /// @notice Proposer-driven trading actions via precompiles
@@ -169,12 +240,6 @@ contract HyperliquidPerpStrategy is BaseStrategy {
         if (action == ACTION_OPEN_LONG) {
             (, uint64 limitPx, uint64 sz, uint64 stopLossPx, uint64 stopLossSz) =
                 abi.decode(data, (uint8, uint64, uint64, uint64, uint64));
-
-            if (!leverageSentToCore) {
-                L1Write.sendUpdateLeverage(perpAssetIndex, true, leverage);
-                leverageSentToCore = true;
-                emit LeverageUpdated(perpAssetIndex, leverage);
-            }
 
             // On-chain position size check (approximate: sz * limitPx in 6-decimal USDC units)
             uint256 approxUsd = uint256(sz) * uint256(limitPx) / 1e6;
@@ -222,12 +287,6 @@ contract HyperliquidPerpStrategy is BaseStrategy {
             (, uint64 limitPx, uint64 sz, uint64 stopLossPx, uint64 stopLossSz) =
                 abi.decode(data, (uint8, uint64, uint64, uint64, uint64));
 
-            if (!leverageSentToCore) {
-                L1Write.sendUpdateLeverage(perpAssetIndex, true, leverage);
-                leverageSentToCore = true;
-                emit LeverageUpdated(perpAssetIndex, leverage);
-            }
-
             // On-chain position size check
             uint256 approxUsd = uint256(sz) * uint256(limitPx) / 1e6;
             if (approxUsd > maxPositionSize) revert PositionTooLarge(approxUsd, maxPositionSize);
@@ -259,9 +318,6 @@ contract HyperliquidPerpStrategy is BaseStrategy {
             // Decode: (action, assetIndex, limitPx, sz, stopLossPx, stopLossSz)
             (, uint32 ai, uint64 limitPx, uint64 sz, uint64 stopLossPx, uint64 stopLossSz) =
                 abi.decode(data, (uint8, uint32, uint64, uint64, uint64, uint64));
-
-            // Set leverage on HyperCore for this asset (idempotent per asset on HyperCore)
-            L1Write.sendUpdateLeverage(ai, true, leverage);
 
             // On-chain position size check
             uint256 approxUsd = uint256(sz) * uint256(limitPx) / 1e6;
@@ -303,57 +359,103 @@ contract HyperliquidPerpStrategy is BaseStrategy {
         }
     }
 
-    /// @notice Close any open position and request USD transfer from perp to spot.
-    /// @dev After this call, USDC has NOT yet arrived on the EVM side.
-    ///      Call sweepToVault() in a separate tx once USDC arrives.
+    /// @notice TWO-PATH SETTLEMENT — Path 2 (governor-called).
+    ///         See `HyperliquidGridStrategy._settle` for the design rationale.
+    /// @dev    If `initiateReturn()` was NOT called pre-settle, fall back to
+    ///         a defensive in-call HC drain. The recommended flow is to call
+    ///         `initiateReturn()` (path 1) at least one block BEFORE
+    ///         `settleProposal` so HC has time to bridge USDC back to EVM
+    ///         and `_pushAllToVault` reports the realized NAV correctly.
     function _settle() internal override {
+        if (!returnsInitiated) {
+            _drainHC();
+            returnsInitiated = true;
+            emit ReturnsInitiated();
+        }
+        _pushAllToVault(address(asset));
+        settled = true;
+        emit Settled();
+    }
+
+    /// @notice TWO-PATH SETTLEMENT — Path 1 (proposer-driven async drain).
+    ///         See `HyperliquidGridStrategy.initiateReturn` for full rationale.
+    /// @dev    Auth: proposer always; anyone after proposal duration expired.
+    /// @dev    HYPE GAS: spot→EVM consumes HC HYPE. Proposer must fund the
+    ///         strategy's HC HYPE balance for the bridge to succeed. If
+    ///         HYPE is missing pre-settle, retry via `initiateReturn()`
+    ///         after funding; post-settle, retry via `recoverHcResiduals()`.
+    function initiateReturn() external {
+        if (_state != State.Executed) revert NotExecuted();
+        if (returnsInitiated) return;
+
+        if (msg.sender != proposer()) {
+            ISyndicateGovernor gov = ISyndicateGovernor(ISyndicateVault(vault()).governor());
+            uint256 pid = gov.getActiveProposal(vault());
+            ISyndicateGovernor.StrategyProposal memory p = gov.getProposal(pid);
+            if (block.timestamp < p.executedAt + p.strategyDuration) revert NotAuthorized();
+        }
+
+        _drainHC();
+        returnsInitiated = true;
+        emit ReturnsInitiated();
+    }
+
+    /// @dev Cancel stop-loss, force-close all traded assets (or fall back to
+    ///      `perpAssetIndex` for legacy single-asset proposals), and queue
+    ///      perp→spot + spot→EVM bridges. Three callers:
+    ///      - `initiateReturn` (path 1, proposer pre-settle)
+    ///      - `_settle` (path 2 defensive fallback when path 1 was skipped)
+    ///      - `recoverHcResiduals` (post-settle retry for HC residuals)
+    function _drainHC() internal {
         _cancelCurrentStopLoss();
 
-        // Close positions on ALL traded assets (not just perpAssetIndex).
-        // Each asset gets both a long-close and short-close attempt — the
-        // reduce-only flag makes the wrong direction a no-op on HyperCore.
-        // If no multi-asset trades were made, falls back to perpAssetIndex
-        // (backwards compat with legacy single-asset actions).
         if (tradedAssets.length > 0) {
             for (uint256 i = 0; i < tradedAssets.length; i++) {
                 uint32 ai = tradedAssets[i];
-                // Force-close LONG: sell at min price
                 L1Write.sendLimitOrder(ai, false, 1, type(uint64).max, true, TimeInForce.Ioc, NO_CLOID);
-                // Force-close SHORT: buy at max price
                 L1Write.sendLimitOrder(ai, true, type(uint64).max, type(uint64).max, true, TimeInForce.Ioc, NO_CLOID);
             }
         } else {
-            // Legacy path: only perpAssetIndex from storage
             L1Write.sendLimitOrder(perpAssetIndex, false, 1, type(uint64).max, true, TimeInForce.Ioc, NO_CLOID);
             L1Write.sendLimitOrder(
                 perpAssetIndex, true, type(uint64).max, type(uint64).max, true, TimeInForce.Ioc, NO_CLOID
             );
         }
 
-        // Read exact perp free margin from precompile and class-transfer
-        // perp → spot. Avoids `type(uint64).max` (an undocumented "sweep all"
-        // sentinel that risks stranding funds when HC validates the request).
-        // Residual margin from IOC fill slippage can be retried via
-        // `initiateReturn()` post-settle.
-        _initiateClassTransfer();
-
-        settled = true;
-
-        emit Settled();
+        _initiateReturn();
     }
 
-    /// @notice Push USDC back to the vault after async transfer completes.
+    /// @notice Post-settle recovery for HC residuals. Re-fires the full HC
+    ///         drain (cancel stop-loss + force-close + perp→spot + spot→EVM
+    ///         bridge) so funds stranded on HC after settle can be recovered.
+    ///         Use after IOC slippage left residual margin, or after funding
+    ///         the strategy's HC HYPE balance to retry a previously no-op'd
+    ///         spot→EVM bridge leg. See `HyperliquidGridStrategy.recoverHcResiduals`
+    ///         for full design rationale.
+    /// @dev    Gated to `settled == true` so it cannot conflict with path-1
+    ///         `initiateReturn()`. Permissionless: funds only flow to HC spot
+    ///         or to the strategy's EVM address (then `sweepToVault()` →
+    ///         vault). Repeatable.
+    function recoverHcResiduals() external {
+        if (!settled) revert NotSweepable();
+        // Same-block idempotence — see grid. SPOT_BALANCE precompile is
+        // pre-block; same-block re-calls would queue duplicate bridges.
+        if (block.number == lastRecoverBlock) return;
+        lastRecoverBlock = block.number;
+        _drainHC();
+    }
+
+    /// @notice Push any latecomer USDC back to the vault after `_settle()`.
+    /// @dev `_settle()` already pushes the strategy's current EVM balance.
+    ///      `sweepToVault` exists for HC auto-credit dust that arrives AFTER
+    ///      settle (HC bridge is async post-block). Idempotent on zero-balance.
     /// @dev Permissionless — funds only go to the vault, no diversion possible.
-    ///      Repeatable for partial async arrivals. NO minReturnAmount guard:
-    ///      a strategy that loses money must still be able to return whatever
-    ///      remains. The cumulative tracker (`cumulativeSwept`) records totals
-    ///      for off-chain monitoring but does not gate withdrawals.
     /// @dev Closes #255 S-C6: minReturnAmount removed (was permanently locking funds on lossy strategies).
     function sweepToVault() external {
         if (!settled) revert NotSweepable();
 
         uint256 bal = IERC20(asset).balanceOf(address(this));
-        if (bal == 0) revert InvalidAmount();
+        if (bal == 0) return;
 
         cumulativeSwept += bal;
 
@@ -392,111 +494,120 @@ contract HyperliquidPerpStrategy is BaseStrategy {
         }
     }
 
-    /// @inheritdoc BaseStrategy
-    /// @dev Live NAV sums HyperCore perp margin equity (6-dec) + HC spot USDC
-    ///      balance (8-dec, scaled down by 100 to 6-dec). Spot is included
-    ///      because `_execute()`'s class-transfer may be rejected by HyperCore
-    ///      when the bridge fee shaves the spot balance below the requested
-    ///      amount — funds park on spot, NAV must still reflect them.
-    ///
-    ///      Cross-margin safety: HyperCore unified accounts share collateral
-    ///      between spot and perp — an underwater perp can be liquidated
-    ///      against spot USDC. When perp `accountValue < 0` we return
-    ///      `(0, true)` and ignore spot rather than reporting an over-stated
-    ///      recoverable value. Either precompile being available is enough
-    ///      to mark NAV valid; both failing falls back to queue-only.
-    function _positionValue() internal view override returns (uint256, bool) {
-        uint256 total;
-        bool anyValid;
-
-        (bool perpOk, bytes memory perpRet) = L1Read.ACCOUNT_MARGIN_SUMMARY_PRECOMPILE_ADDRESS
-        .staticcall{gas: L1Read.ACCOUNT_MARGIN_SUMMARY_GAS}(
-            abi.encode(uint32(0), address(this))
-        );
-        if (perpOk && perpRet.length >= 128) {
-            anyValid = true;
-            int64 av = abi.decode(perpRet, (AccountMarginSummary)).accountValue;
-            // Underwater perp: cross-margin can consume spot. Report 0 (still valid).
-            if (av < 0) return (0, true);
-            if (av > 0) total += uint256(int256(av));
-        }
-
-        (bool spotOk, bytes memory spotRet) = L1Read.SPOT_BALANCE_PRECOMPILE_ADDRESS
-        .staticcall{gas: L1Read.SPOT_BALANCE_GAS}(
-            abi.encode(address(this), uint64(0))
-        );
-        if (spotOk && spotRet.length >= 96) {
-            anyValid = true;
-            uint64 spotTotal = abi.decode(spotRet, (SpotBalance)).total;
-            if (spotTotal > 0) total += uint256(spotTotal) / 100;
-        }
-
-        if (!anyValid) return (0, false);
-        return (total, true);
-    }
-
-    /// @notice Permissionless retry: read the strategy's HC spot USDC balance
-    ///         and class-transfer the free portion to perp margin.
-    /// @dev    Mirrors `HyperliquidGridStrategy.bridgeToMargin`. Recovery for
-    ///         the bridge-fee/class-transfer mismatch: if `_execute()` queued
-    ///         a transfer that HC rejected because post-fee spot was less
-    ///         than requested, this pushes the actually-landed balance to
-    ///         perp on the next HC block. Funds only move strategy-spot →
-    ///         strategy-perp; no diversion. Idempotent. Blocked once
-    ///         `settled` is true so post-settle griefers can't reverse the
-    ///         perp→spot transfer initiated by `_settle`.
-    function bridgeToMargin() external {
-        if (settled) return;
-        (SpotBalance memory s, bool ok) = L1Read.trySpotBalance(address(this), 0);
-        if (!ok) return;
-        if (s.total <= s.hold) return;
-        uint64 free = s.total - s.hold;
-        uint64 amount6 = free / 100;
-        if (amount6 == 0) return;
-        L1Write.sendUsdClassTransfer(amount6, true);
-        emit FundsParked(uint256(amount6));
-    }
-
-    /// @notice Re-initiate the perp→spot class transfer for residual perp
-    ///         balance after settlement (e.g. fill slippage on IOC closes).
-    /// @dev    Permissionless: funds only flow to HC spot at the same
-    ///         address. Mirrors `HyperliquidGridStrategy.initiateReturn`.
-    ///         Call this if `sweepToVault` keeps returning 0 — it means
-    ///         some equity remains in perp.
-    function initiateReturn() external {
-        if (!settled) revert NotSweepable();
-        _initiateClassTransfer();
-    }
-
-    /// @dev Reads current perp free margin (`accountValue - marginUsed`) via
-    ///      precompile and sends a class transfer (perp → spot) for that
-    ///      amount. HC may reject class transfers that exceed withdrawable
-    ///      margin, so we subtract `marginUsed` to stay within bounds.
-    ///      No-ops when the precompile is unavailable or free margin <= 0.
-    function _initiateClassTransfer() internal {
+    /// @notice Drain HC perp + HC spot back to the strategy's EVM USDC
+    ///         balance. See `HyperliquidGridStrategy._initiateReturn` for
+    ///         full design rationale (perp→spot class transfer + spot→EVM
+    ///         bridge via Circle's CoreDepositWallet).
+    /// @dev    HYPE GAS: spot→EVM consumes HC HYPE; if absent, that leg
+    ///         no-ops on HC and `sweepToVault()` recovers EVM arrivals.
+    ///         A HYPE-funded retry of `initiateReturn()` drains stuck spot.
+    function _initiateReturn() internal {
         (bool ok, bytes memory ret) = L1Read.ACCOUNT_MARGIN_SUMMARY_PRECOMPILE_ADDRESS
         .staticcall{gas: L1Read.ACCOUNT_MARGIN_SUMMARY_GAS}(
             abi.encode(uint32(0), address(this))
         );
-        if (!ok || ret.length < 128) return;
-        AccountMarginSummary memory s = abi.decode(ret, (AccountMarginSummary));
-        if (s.accountValue <= 0) return;
-        int64 freeMargin = s.accountValue - int64(s.marginUsed);
-        if (freeMargin <= 0) return;
-        L1Write.sendUsdClassTransfer(uint64(freeMargin), false);
+
+        (bool spotOk, bytes memory spotRet) = L1Read.SPOT_BALANCE_PRECOMPILE_ADDRESS
+        .staticcall{gas: L1Read.SPOT_BALANCE_GAS}(
+            abi.encode(address(this), uint64(HyperliquidBridge.USDC_TOKEN_INDEX))
+        );
+        uint64 preSpot = 0;
+        if (spotOk && spotRet.length >= 96) {
+            SpotBalance memory sb = abi.decode(spotRet, (SpotBalance));
+            preSpot = sb.total;
+        }
+
+        uint64 perpToSpot = 0;
+        int64 preDrainAccountValue = 0;
+        if (ok && ret.length >= 128) {
+            AccountMarginSummary memory s = abi.decode(ret, (AccountMarginSummary));
+            preDrainAccountValue = s.accountValue;
+            if (s.accountValue > 0) {
+                int64 freeMargin = s.accountValue - int64(s.marginUsed);
+                if (freeMargin > 0) {
+                    perpToSpot = uint64(freeMargin);
+                    L1Write.sendUsdClassTransfer(perpToSpot, false);
+                }
+            }
+        }
+
+        uint64 totalSpotWei = preSpot + perpToSpot * HyperliquidBridge.PERP_TO_SPOT_WEI;
+        HyperliquidBridge.bridgeUsdcSpotToEvm(totalSpotWei);
+
+        // Outbound in-transit high-water mark — see grid for rationale.
+        uint256 preDrainPerpVal = preDrainAccountValue > 0 ? uint256(int256(preDrainAccountValue)) : 0;
+        uint256 preDrainSpotVal = uint256(preSpot) / HyperliquidBridge.PERP_TO_SPOT_WEI;
+        uint256 preDrainHcTotal = preDrainPerpVal + preDrainSpotVal;
+        if (preDrainHcTotal > inFlightToHc) inFlightToHc = preDrainHcTotal;
+    }
+
+    /// @inheritdoc BaseStrategy
+    /// @dev See `HyperliquidGridStrategy._positionValue` for full design.
+    ///      Live NAV sums HC perp + HC spot + EVM, then chooses between
+    ///      observable and the high-water mark via `CORE_ACCOUNT_FEE_TOLERANCE`:
+    ///      gap ≤ tolerance → trust observable (Circle-fee steady state); gap
+    ///      ≫ tolerance → fall back to `inFlightToHc` (genuine in-transit).
+    function _positionValue() internal view override returns (uint256, bool) {
+        (bool success, bytes memory ret) = L1Read.ACCOUNT_MARGIN_SUMMARY_PRECOMPILE_ADDRESS
+        .staticcall{gas: L1Read.ACCOUNT_MARGIN_SUMMARY_GAS}(
+            abi.encode(uint32(0), address(this))
+        );
+        uint256 perpVal = 0;
+        if (success && ret.length >= 128) {
+            AccountMarginSummary memory s = abi.decode(ret, (AccountMarginSummary));
+            if (s.accountValue > 0) perpVal = uint256(int256(s.accountValue));
+        }
+
+        (bool spotOk, bytes memory spotRet) = L1Read.SPOT_BALANCE_PRECOMPILE_ADDRESS
+        .staticcall{gas: L1Read.SPOT_BALANCE_GAS}(
+            abi.encode(address(this), uint64(HyperliquidBridge.USDC_TOKEN_INDEX))
+        );
+        uint256 spotVal = 0;
+        if (spotOk && spotRet.length >= 96) {
+            SpotBalance memory sb = abi.decode(spotRet, (SpotBalance));
+            spotVal = uint256(sb.total) / HyperliquidBridge.PERP_TO_SPOT_WEI;
+        }
+
+        uint256 evmBal = IERC20(asset).balanceOf(address(this));
+        uint256 observable = perpVal + spotVal + evmBal;
+
+        if (observable + HyperliquidBridge.CORE_ACCOUNT_FEE_TOLERANCE >= inFlightToHc) {
+            return (observable, true);
+        }
+        return (inFlightToHc, true);
+    }
+
+    /// @notice Move all HC spot USDC to perp margin via class transfer.
+    ///         See grid for full rationale — recovers from Circle's first-
+    ///         deposit fee dropping the original class transfer in `_execute`.
+    /// @dev    Proposer-only; `Executed` state required.
+    function moveSpotToPerp() external onlyProposer {
+        if (_state != State.Executed) revert NotExecuted();
+        (bool ok, bytes memory ret) = L1Read.SPOT_BALANCE_PRECOMPILE_ADDRESS.staticcall{gas: L1Read.SPOT_BALANCE_GAS}(
+            abi.encode(address(this), uint64(HyperliquidBridge.USDC_TOKEN_INDEX))
+        );
+        if (!ok || ret.length < 96) return;
+        SpotBalance memory sb = abi.decode(ret, (SpotBalance));
+        if (sb.total == 0) return;
+        uint64 perpAmount = sb.total / HyperliquidBridge.PERP_TO_SPOT_WEI;
+        if (perpAmount == 0) return;
+        L1Write.sendUsdClassTransfer(perpAmount, true);
     }
 
     /// @dev Routes a mid-proposal LP deposit into HC perp margin. Vault has
     ///      already pushed `assets` USDC to this address before calling here.
-    ///      HC auto-credits spot (registration done at first execute), so a
-    ///      single class transfer moves the funds to perp margin immediately.
-    ///      The proposer sees the expanded margin and places additional trades
-    ///      via updateParams — no leverage re-push needed (leverage is per-asset,
-    ///      not account-wide).
+    ///      Mirrors `_execute`: bridge EVM → HC spot via Circle's CoreDepositWallet,
+    ///      then class-transfer spot → perp. The first-deposit fee is only
+    ///      charged on a fresh HC account, so subsequent deposits land at full
+    ///      `assets` on HC. Bumping `inFlightToHc` covers the cross-block
+    ///      window between this tx and HC's post-block credit; `_positionValue`
+    ///      reconciles via the tolerance fallback.
     function _onLiveDeposit(uint256 assets) internal override {
         if (assets == 0) return;
         if (assets > type(uint64).max) revert DepositAmountTooLarge();
+        HyperliquidBridge.bridgeUsdcToSpot(asset, assets);
         L1Write.sendUsdClassTransfer(uint64(assets), true);
+        inFlightToHc += assets;
         emit FundsParked(assets);
     }
 }
