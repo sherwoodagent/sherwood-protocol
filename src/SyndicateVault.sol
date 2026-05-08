@@ -505,14 +505,25 @@ contract SyndicateVault is
             // `principal / 2` (50% floor, hardcoded as `>> 1`). Defeats the
             // share-inflation attack where an under-reporting strategy
             // (positionValue ≈ 0 with non-zero supply) lets a new depositor
-            // mint cheap shares against the deflated NAV. Falls through to
-            // queue-only — LPs settle at real-NAV time. Principal =
-            // governor's `_capitalSnapshots[pid]` (execute-time outflow) +
-            // `liveAdapterPrincipal[pid]` (mid-flight LP deposits).
-            ISyndicateGovernor gov = ISyndicateGovernor(_getGovernor());
-            uint256 pid = gov.getActiveProposal(address(this));
-            uint256 principal = gov.getCapitalSnapshot(pid) + liveAdapterPrincipal[pid];
-            if (v < principal >> 1) return (true, address(0), 0);
+            // mint cheap shares against the deflated NAV.
+            //
+            // I-3: the snapshot read uses a low-level staticcall + assembly
+            // decode so a governor without `getCapitalSnapshot` (e.g. UUPS
+            // upgrade misconfig) can't brick LP flow with an unhandled revert.
+            // Failure defaults snapshot to 0 — fail-open for the floor itself,
+            // but the queue path stays open so LPs are never stranded.
+            // Assembly is used over high-level `(bool ok, bytes memory ret)`
+            // tuple to fit under the EIP-170 cap.
+            address gov_ = _getGovernor();
+            uint256 pid = ISyndicateGovernor(gov_).getActiveProposal(address(this));
+            bytes memory cd = abi.encodeCall(ISyndicateGovernor.getCapitalSnapshot, (pid));
+            uint256 snapshot;
+            assembly {
+                if staticcall(gas(), gov_, add(cd, 0x20), mload(cd), 0, 0x20) {
+                    if eq(returndatasize(), 0x20) { snapshot := mload(0) }
+                }
+            }
+            if (v < (snapshot + liveAdapterPrincipal[pid]) >> 1) return (true, address(0), 0);
             return (false, adapter, v);
         } catch {}
         return (true, address(0), 0);
