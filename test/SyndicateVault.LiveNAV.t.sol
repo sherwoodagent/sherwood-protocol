@@ -54,6 +54,9 @@ contract VaultLiveNAVTest is Test {
         vm.mockCall(address(this), abi.encodeWithSignature("governor()"), abi.encode(MOCK_GOVERNOR));
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal(address)"), abi.encode(uint256(0)));
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("openProposalCount(address)"), abi.encode(uint256(0)));
+        // NAV-floor guard reads `getCapitalSnapshot(pid)` from the governor.
+        // Mock to 0 — tests with non-zero principal override per-call.
+        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getCapitalSnapshot(uint256)"), abi.encode(uint256(0)));
     }
 
     /// @dev Lock the vault by mocking `getActiveProposal` to MOCK_PID, then
@@ -203,6 +206,50 @@ contract VaultLiveNAVTest is Test {
         vm.prank(alice);
         vm.expectRevert(ISyndicateVault.DepositsLocked.selector);
         vault.deposit(1_000e6, alice);
+    }
+
+    // ──────────────── NAV-floor guard (share-inflation defense) ────────────────
+
+    /// @notice Deposit reverts when the strategy reports a NAV below
+    ///         `principal / 2`. Closes the share-inflation attack: a new
+    ///         depositor minting against fake-low totalAssets() would dilute
+    ///         existing LPs. The gate falls through to queue-only.
+    function test_deposit_blockedWhenAdapterReportsBelowNavFloor() public {
+        address alice = makeAddr("alice");
+        usdc.mint(alice, 1_000e6);
+        vm.prank(alice);
+        usdc.approve(address(vault), type(uint256).max);
+
+        MockStrategyAdapter adapter = new MockStrategyAdapter();
+        // Strategy reports value=400 with valid=true while principal=1000:
+        // 400 < 1000 / 2 (= 500) → floor blocks the deposit.
+        adapter.setValue(400e6, true);
+        _mockStrategyOnActiveProposal(address(adapter));
+        // Mock principal at 1000 USDC via the governor's getCapitalSnapshot.
+        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getCapitalSnapshot(uint256)"), abi.encode(uint256(1_000e6)));
+
+        vm.prank(alice);
+        vm.expectRevert(ISyndicateVault.DepositsLocked.selector);
+        vault.deposit(1_000e6, alice);
+    }
+
+    /// @notice Boundary: value at exactly `principal / 2` is still valid —
+    ///         honest losses up to 50% don't strand LPs on the queue path.
+    function test_deposit_allowedWhenAdapterReportsAtNavFloor() public {
+        address alice = makeAddr("alice");
+        usdc.mint(alice, 1_000e6);
+        vm.prank(alice);
+        usdc.approve(address(vault), type(uint256).max);
+
+        MockStrategyAdapter adapter = new MockStrategyAdapter();
+        // value=500, principal=1000 → 500 == 500 (not strictly less than) → allowed.
+        adapter.setValue(500e6, true);
+        _mockStrategyOnActiveProposal(address(adapter));
+        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getCapitalSnapshot(uint256)"), abi.encode(uint256(1_000e6)));
+
+        vm.prank(alice);
+        uint256 shares = vault.deposit(1_000e6, alice);
+        assertGt(shares, 0);
     }
 
     function test_deposit_blockedWhenAdapterUnboundDuringLock() public {

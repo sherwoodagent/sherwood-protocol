@@ -192,22 +192,12 @@ contract SyndicateVault is
     }
 
     /// @inheritdoc ISyndicateVault
-    function getApprovedDepositors() external view returns (address[] memory) {
-        return _approvedDepositors.values();
-    }
-
-    /// @inheritdoc ISyndicateVault
-    /// @dev V-M3: paginated slice of the approved-depositor set. The full-list
-    ///      getter above is retained for backwards compatibility but becomes
-    ///      unusable as the set grows. `limit` is hard-clamped to
-    ///      `MAX_PAGE_LIMIT` so a single call always fits in a block.
+    /// @dev V-M3: paginated slice of the approved-depositor set. Full-list
+    ///      and count getters were dropped to free EIP-170 budget for the
+    ///      NAV-floor guard in `_lpFlowGate`. Iterate via this paginated
+    ///      path; `limit` is hard-clamped to `MAX_PAGE_LIMIT`.
     function approvedDepositorsPaginated(uint256 offset, uint256 limit) external view returns (address[] memory) {
         return _pageAddresses(_approvedDepositors, offset, limit);
-    }
-
-    /// @inheritdoc ISyndicateVault
-    function approvedDepositorCount() external view returns (uint256) {
-        return _approvedDepositors.length();
     }
 
     /// @inheritdoc ISyndicateVault
@@ -246,11 +236,6 @@ contract SyndicateVault is
     /// @inheritdoc ISyndicateVault
     function isAgent(address agentAddress) external view returns (bool) {
         return _agents[agentAddress].active;
-    }
-
-    /// @inheritdoc ISyndicateVault
-    function getExecutorImpl() external view returns (address) {
-        return _executorImpl;
     }
 
     /// @inheritdoc ISyndicateVault
@@ -515,7 +500,20 @@ contract SyndicateVault is
         address adapter = _activeStrategy();
         if (adapter == address(0)) return (true, address(0), 0);
         try IStrategy(adapter).positionValue() returns (uint256 v, bool valid) {
-            if (valid) return (false, adapter, v);
+            if (!valid) return (true, address(0), 0);
+            // NAV-floor guard: suspend live NAV when reported value falls below
+            // `principal / 2` (50% floor, hardcoded as `>> 1`). Defeats the
+            // share-inflation attack where an under-reporting strategy
+            // (positionValue ≈ 0 with non-zero supply) lets a new depositor
+            // mint cheap shares against the deflated NAV. Falls through to
+            // queue-only — LPs settle at real-NAV time. Principal =
+            // governor's `_capitalSnapshots[pid]` (execute-time outflow) +
+            // `liveAdapterPrincipal[pid]` (mid-flight LP deposits).
+            ISyndicateGovernor gov = ISyndicateGovernor(_getGovernor());
+            uint256 pid = gov.getActiveProposal(address(this));
+            uint256 principal = gov.getCapitalSnapshot(pid) + liveAdapterPrincipal[pid];
+            if (v < principal >> 1) return (true, address(0), 0);
+            return (false, adapter, v);
         } catch {}
         return (true, address(0), 0);
     }
