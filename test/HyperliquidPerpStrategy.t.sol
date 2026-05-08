@@ -6,6 +6,7 @@ import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {HyperliquidPerpStrategy} from "../src/strategies/HyperliquidPerpStrategy.sol";
 import {BaseStrategy} from "../src/strategies/BaseStrategy.sol";
 import {MockCoreWriter} from "./mocks/MockCoreWriter.sol";
+import {MockAccountMarginSummaryPrecompile} from "./mocks/MockAccountMarginSummaryPrecompile.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 
@@ -163,20 +164,20 @@ contract HyperliquidPerpStrategyTest is Test {
     }
 
     // ==================== POSITION VALUE ====================
-    // Inherits BaseStrategy's (0, false) default — HyperCore precompile
-    // integration is deferred to a HyperEVM-gated follow-up.
+    // Live NAV from HC accountMarginSummary precompile, with EVM USDC fallback
+    // when the precompile is absent (non-HyperEVM env / registration failed).
+    // Mirrors HyperliquidGridStrategy._positionValue.
 
-    function test_positionValue_alwaysStubbed() public {
-        (uint256 value, bool valid) = strategy.positionValue();
-        assertEq(value, 0);
-        assertFalse(valid);
-
+    function test_positionValue_precompileMissingFallsBackToEvmBalance() public {
+        // After execute, USDC sits on the strategy (test env has no bridge / no
+        // precompile). _positionValue MUST return (evmBal, true) — returning
+        // (0, false) would brick the deposit modal and recreate the share
+        // inflation bug.
         vm.prank(vault);
         strategy.execute();
-
-        (value, valid) = strategy.positionValue();
-        assertEq(value, 0);
-        assertFalse(valid);
+        (uint256 value, bool valid) = strategy.positionValue();
+        assertTrue(valid);
+        assertEq(value, DEPOSIT);
     }
 
     // ==================== EXECUTE ====================
@@ -378,18 +379,52 @@ contract HyperliquidPerpStrategyTest is Test {
         assertEq(usdc.balanceOf(attacker), 0); // Attacker gets nothing
     }
 
-    function test_sweepToVault_zeroBalance_reverts() public {
+    function test_sweepToVault_zeroBalance_isNoOp() public {
+        // _settle() now pushes EVM USDC to vault directly. After _burnStrategyBalance
+        // there's nothing for sweep to do — no-op return (not revert) so callers
+        // can blindly retry sweepToVault for late HC arrivals without checking first.
         _settleFirst();
         _burnStrategyBalance();
-
-        vm.expectRevert(HyperliquidPerpStrategy.InvalidAmount.selector);
+        uint256 vaultBefore = usdc.balanceOf(vault);
         strategy.sweepToVault();
+        assertEq(usdc.balanceOf(vault), vaultBefore);
     }
 
     function test_sweepToVault_notSettled_reverts() public {
         _executeFirst();
         vm.expectRevert(HyperliquidPerpStrategy.NotSweepable.selector);
         strategy.sweepToVault();
+    }
+
+    // ==================== RECOVER HC RESIDUALS ====================
+
+    function test_recoverHcResiduals_revertsBeforeSettle() public {
+        // Path-1 / path-2 separation: recoverHcResiduals must not run while
+        // the strategy is still Executed (would conflict with initiateReturn).
+        _executeFirst();
+        vm.expectRevert(HyperliquidPerpStrategy.NotSweepable.selector);
+        strategy.recoverHcResiduals();
+    }
+
+    function test_recoverHcResiduals_permissionlessPostSettle() public {
+        // Anyone can call after settle. Funds only flow to strategy/vault,
+        // so no diversion is possible.
+        _settleFirst();
+        vm.roll(block.number + 1);
+        vm.prank(attacker);
+        strategy.recoverHcResiduals(); // should not revert
+    }
+
+    function test_recoverHcResiduals_sameBlockGateSkips() public {
+        // Same-block re-call is suppressed by the lastRecoverBlock gate to
+        // prevent duplicate spot→EVM bridge actions reading the same
+        // pre-block SPOT_BALANCE.
+        _settleFirst();
+        vm.roll(block.number + 1);
+        strategy.recoverHcResiduals(); // first call sets lastRecoverBlock
+        uint256 lastBlock = strategy.lastRecoverBlock();
+        strategy.recoverHcResiduals(); // same-block second call skipped
+        assertEq(strategy.lastRecoverBlock(), lastBlock, "lastRecoverBlock must not change on same-block re-call");
     }
 
     function test_sweepToVault_repeatable() public {
@@ -563,5 +598,69 @@ contract HyperliquidPerpStrategyTest is Test {
         vm.prank(proposer);
         vm.expectRevert(abi.encodeWithSelector(HyperliquidPerpStrategy.PositionTooLarge.selector, 3000e6, 1000e6));
         strat.updateParams(abi.encode(uint8(1), uint64(3000e6), uint64(1e6), uint64(2800e6), uint64(1e6)));
+    }
+
+    // ==================== POSITION VALUE / LIVE NAV ====================
+
+    function _etchAccountMarginSummary() internal returns (MockAccountMarginSummaryPrecompile) {
+        MockAccountMarginSummaryPrecompile m = new MockAccountMarginSummaryPrecompile();
+        vm.etch(0x000000000000000000000000000000000000080F, address(m).code);
+        return MockAccountMarginSummaryPrecompile(0x000000000000000000000000000000000000080F);
+    }
+
+    function test_positionValue_invalidBeforeExecute() public {
+        // BaseStrategy gates _positionValue behind State.Executed.
+        MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
+        m.setSummary(int64(int256(uint256(99_999e6))), 0, 0, 0);
+        (uint256 value, bool valid) = strategy.positionValue();
+        assertFalse(valid);
+        assertEq(value, 0);
+    }
+
+    // ==================== ON LIVE DEPOSIT ====================
+
+    function test_onLiveDeposit_routesToHcMargin() public {
+        vm.prank(vault);
+        strategy.execute();
+        // Vault pre-pushes liveAmount before calling the hook (matches SyndicateVault._deposit).
+        uint256 liveAmount = 2_500e6;
+        usdc.mint(address(strategy), liveAmount);
+        vm.prank(vault);
+        strategy.onLiveDeposit(liveAmount);
+        // Strategy still holds the USDC on the EVM side (HC auto-credits async); FundsParked
+        // event is emitted but not asserted here — covered by Grid suite via class-transfer log.
+        assertEq(usdc.balanceOf(address(strategy)), DEPOSIT + liveAmount);
+    }
+
+    function test_onLiveDeposit_zeroAmount_isNoop() public {
+        vm.prank(vault);
+        strategy.execute();
+        uint256 balBefore = usdc.balanceOf(address(strategy));
+        vm.prank(vault);
+        strategy.onLiveDeposit(0);
+        assertEq(usdc.balanceOf(address(strategy)), balBefore);
+    }
+
+    function test_onLiveDeposit_revertsOnOversizeAmount() public {
+        vm.prank(vault);
+        strategy.execute();
+        uint256 tooLarge = uint256(type(uint64).max) + 1;
+        vm.prank(vault);
+        vm.expectRevert(HyperliquidPerpStrategy.DepositAmountTooLarge.selector);
+        strategy.onLiveDeposit(tooLarge);
+    }
+
+    function test_onLiveDeposit_onlyVault() public {
+        vm.prank(vault);
+        strategy.execute();
+        vm.prank(proposer);
+        vm.expectRevert(BaseStrategy.NotVault.selector);
+        strategy.onLiveDeposit(1e6);
+    }
+
+    function test_onLiveDeposit_beforeExecute_isNoop() public {
+        // Default no-op gate in BaseStrategy: returns silently when state != Executed.
+        vm.prank(vault);
+        strategy.onLiveDeposit(1e6);
     }
 }
