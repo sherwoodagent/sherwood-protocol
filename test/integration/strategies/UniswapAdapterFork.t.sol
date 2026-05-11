@@ -143,6 +143,46 @@ contract UniswapAdapterForkTest is Test {
         vm.stopPrank();
     }
 
+    // ── Quoter ABI regression ──
+    //
+    // The adapter's `quote()` previously used the legacy Quoter V1
+    // signature (5 positional args with fee before amountIn). The actual
+    // Uniswap QuoterV2 deployed on Base takes a STRUCT with amountIn
+    // before fee — every quote call silently reverted, surfacing as
+    // PortfolioStrategy.QuoteUnavailable() at execute time. These tests
+    // pin the V2 ABI to prevent regression.
+
+    function test_quote_singleHop_USDC_to_WETH() public {
+        bytes memory extraData = abi.encodePacked(uint8(0), abi.encode(uint24(500)));
+        uint256 expected = adapter.quote(USDC, WETH, 100e6, extraData);
+        console2.log("Quote USDC->WETH (100 USDC):", expected);
+        assertGt(expected, 0, "quote must return a non-zero amount");
+        // Sanity bound: 100 USDC should quote to somewhere in
+        // 0.01-1 WETH range at any sane ETH price.
+        assertLt(expected, 1e18, "quote should be < 1 WETH");
+        assertGt(expected, 1e15, "quote should be > 0.001 WETH");
+    }
+
+    function test_quote_multiHop_USDC_to_AERO() public {
+        bytes memory path = abi.encodePacked(USDC, uint24(500), WETH, uint24(3000), AERO);
+        bytes memory extraData = abi.encodePacked(uint8(1), abi.encode(path));
+        uint256 expected = adapter.quote(USDC, AERO, 100e6, extraData);
+        console2.log("Quote USDC->WETH->AERO (100 USDC):", expected);
+        assertGt(expected, 0, "multi-hop quote must return a non-zero amount");
+    }
+
+    function test_quote_multiHop_autoReverse() public {
+        // Store path in execute direction (USDC->WETH->AERO) but quote
+        // the settle direction (AERO->USDC). The adapter should detect
+        // tokenIn (AERO) != pathStart (USDC) and reverse the path, just
+        // like swap() does.
+        bytes memory forwardPath = abi.encodePacked(USDC, uint24(500), WETH, uint24(3000), AERO);
+        bytes memory extraData = abi.encodePacked(uint8(1), abi.encode(forwardPath));
+        uint256 expected = adapter.quote(AERO, USDC, 1e18, extraData);
+        console2.log("Quote AERO->WETH->USDC reversed (1 AERO):", expected);
+        assertGt(expected, 0, "reversed multi-hop quote must return a non-zero amount");
+    }
+
     // ── No leftover tokens in adapter ──
 
     function test_multiHop_noLeftoverTokens() public {

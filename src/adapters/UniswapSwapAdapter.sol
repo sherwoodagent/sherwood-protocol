@@ -31,15 +31,32 @@ interface ISwapRouter {
 }
 
 interface IQuoterV2 {
-    function quoteExactInputSingle(
-        address tokenIn,
-        address tokenOut,
-        uint24 fee,
-        uint256 amountIn,
-        uint160 sqrtPriceLimitX96
-    )
+    // QuoterV2 (the Uniswap V3 Quoter actually deployed on every chain we
+    // target, including Base mainnet at 0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a)
+    // takes a STRUCT — not five positional args — and reorders amountIn
+    // before fee vs the legacy V1 Quoter. The earlier `(address,address,uint24,uint256,uint160)`
+    // shape silently reverted on every call (selector miss + arg-order swap),
+    // surfacing as `QuoteUnavailable()` from `_quoteMinOut`.
+    struct QuoteExactInputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint256 amountIn;
+        uint24 fee;
+        uint160 sqrtPriceLimitX96;
+    }
+
+    function quoteExactInputSingle(QuoteExactInputSingleParams memory params)
         external
         returns (uint256 amountOut, uint160 sqrtPriceX96After, uint32 initializedTicksCrossed, uint256 gasEstimate);
+
+    function quoteExactInput(bytes memory path, uint256 amountIn)
+        external
+        returns (
+            uint256 amountOut,
+            uint160[] memory sqrtPriceX96AfterList,
+            uint32[] memory initializedTicksCrossedList,
+            uint256 gasEstimate
+        );
 }
 
 // ── Uniswap V4 interfaces (minimal) ──
@@ -229,7 +246,26 @@ contract UniswapSwapAdapter is ISwapAdapter {
 
         if (mode == 0) {
             uint24 fee = abi.decode(routeData, (uint24));
-            (amountOut,,,) = quoter.quoteExactInputSingle(tokenIn, tokenOut, fee, amountIn, 0);
+            (amountOut,,,) = quoter.quoteExactInputSingle(
+                IQuoterV2.QuoteExactInputSingleParams({
+                    tokenIn: tokenIn,
+                    tokenOut: tokenOut,
+                    amountIn: amountIn,
+                    fee: fee,
+                    sqrtPriceLimitX96: 0
+                })
+            );
+        } else if (mode == 1) {
+            // Multi-hop quote — feed the same packed path the swap path uses.
+            // The auto-detector in the CLI may reverse the path so the start
+            // address matches tokenIn; mirror that here so a forward-encoded
+            // path also quotes correctly without round-tripping the bytes.
+            bytes memory path = abi.decode(routeData, (bytes));
+            address pathStart = _extractFirstAddress(path);
+            if (pathStart != tokenIn) {
+                path = _reversePath(path);
+            }
+            (amountOut,,,) = quoter.quoteExactInput(path, amountIn);
         } else {
             revert UnsupportedMode();
         }
