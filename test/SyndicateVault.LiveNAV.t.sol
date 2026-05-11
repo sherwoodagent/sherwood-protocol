@@ -252,6 +252,67 @@ contract VaultLiveNAVTest is Test {
         assertGt(shares, 0);
     }
 
+    /// @notice I-3 fail-closed: when `getCapitalSnapshot` reverts (e.g. UUPS
+    ///         upgrade dropped the selector) the gate blocks the live path
+    ///         instead of silently zeroing the floor and re-enabling the
+    ///         share-inflation attack. LPs route through the queue.
+    function test_deposit_blockedWhenGovernorSnapshotReverts() public {
+        address alice = makeAddr("alice");
+        usdc.mint(alice, 1_000e6);
+        vm.prank(alice);
+        usdc.approve(address(vault), type(uint256).max);
+
+        MockStrategyAdapter adapter = new MockStrategyAdapter();
+        // Honest report (above floor for any non-zero snapshot) — only the
+        // snapshot read fails. Without the I-3 fail-closed branch, snapshot
+        // defaults to 0 and the floor becomes 0, so this deposit succeeds
+        // (the bug). With fail-closed, the gate returns blocked.
+        adapter.setValue(800e6, true);
+        _mockStrategyOnActiveProposal(address(adapter));
+        vm.mockCallRevert(
+            MOCK_GOVERNOR, abi.encodeWithSignature("getCapitalSnapshot(uint256)"), "GovernorSnapshotMissing()"
+        );
+
+        vm.prank(alice);
+        vm.expectRevert(ISyndicateVault.DepositsLocked.selector);
+        vault.deposit(1_000e6, alice);
+    }
+
+    /// @notice `totalAssets()` and `_lpFlowGate` must agree byte-for-byte:
+    ///         when the floor fires, `totalAssets()` falls back to float-only
+    ///         so `previewDeposit`/`previewWithdraw` quote a NAV that the
+    ///         on-chain entry/exit gate would actually honour.
+    function test_totalAssets_dropsToFloatWhenFloorFires() public {
+        // Seed float so we can observe the strategy slice being excluded.
+        usdc.mint(address(vault), 200e6);
+
+        MockStrategyAdapter adapter = new MockStrategyAdapter();
+        // Sub-floor: value=100, principal=1000 → 100 < 500 → blocked.
+        adapter.setValue(100e6, true);
+        _mockStrategyOnActiveProposal(address(adapter));
+        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getCapitalSnapshot(uint256)"), abi.encode(uint256(1_000e6)));
+
+        // Float (200) only — the 100 from the under-reporting strategy must
+        // be excluded so previews match the gate's block decision.
+        assertEq(vault.totalAssets(), 200e6);
+    }
+
+    /// @notice Same fail-closed semantics on the view surface: a reverting
+    ///         `getCapitalSnapshot` excludes the strategy slice from
+    ///         `totalAssets()` rather than counting it under a zeroed floor.
+    function test_totalAssets_dropsToFloatWhenGovernorSnapshotReverts() public {
+        usdc.mint(address(vault), 200e6);
+
+        MockStrategyAdapter adapter = new MockStrategyAdapter();
+        adapter.setValue(800e6, true);
+        _mockStrategyOnActiveProposal(address(adapter));
+        vm.mockCallRevert(
+            MOCK_GOVERNOR, abi.encodeWithSignature("getCapitalSnapshot(uint256)"), "GovernorSnapshotMissing()"
+        );
+
+        assertEq(vault.totalAssets(), 200e6);
+    }
+
     function test_deposit_blockedWhenAdapterUnboundDuringLock() public {
         address alice = makeAddr("alice");
         usdc.mint(alice, 1_000e6);
