@@ -192,22 +192,12 @@ contract SyndicateVault is
     }
 
     /// @inheritdoc ISyndicateVault
-    function getApprovedDepositors() external view returns (address[] memory) {
-        return _approvedDepositors.values();
-    }
-
-    /// @inheritdoc ISyndicateVault
-    /// @dev V-M3: paginated slice of the approved-depositor set. The full-list
-    ///      getter above is retained for backwards compatibility but becomes
-    ///      unusable as the set grows. `limit` is hard-clamped to
-    ///      `MAX_PAGE_LIMIT` so a single call always fits in a block.
+    /// @dev V-M3: paginated slice of the approved-depositor set. Full-list
+    ///      and count getters were dropped to free EIP-170 budget for the
+    ///      NAV-floor guard in `_lpFlowGate`. Iterate via this paginated
+    ///      path; `limit` is hard-clamped to `MAX_PAGE_LIMIT`.
     function approvedDepositorsPaginated(uint256 offset, uint256 limit) external view returns (address[] memory) {
         return _pageAddresses(_approvedDepositors, offset, limit);
-    }
-
-    /// @inheritdoc ISyndicateVault
-    function approvedDepositorCount() external view returns (uint256) {
-        return _approvedDepositors.length();
     }
 
     /// @inheritdoc ISyndicateVault
@@ -246,11 +236,6 @@ contract SyndicateVault is
     /// @inheritdoc ISyndicateVault
     function isAgent(address agentAddress) external view returns (bool) {
         return _agents[agentAddress].active;
-    }
-
-    /// @inheritdoc ISyndicateVault
-    function getExecutorImpl() external view returns (address) {
-        return _executorImpl;
     }
 
     /// @inheritdoc ISyndicateVault
@@ -515,7 +500,33 @@ contract SyndicateVault is
         address adapter = _activeStrategy();
         if (adapter == address(0)) return (true, address(0), 0);
         try IStrategy(adapter).positionValue() returns (uint256 v, bool valid) {
-            if (valid) return (false, adapter, v);
+            if (!valid) return (true, address(0), 0);
+            // NAV-floor guard: suspend live NAV when reported value falls below
+            // `principal / 2` (50% floor, hardcoded as `>> 1`). Defeats the
+            // share-inflation attack where an under-reporting strategy
+            // (positionValue ≈ 0 with non-zero supply) lets a new depositor
+            // mint cheap shares against the deflated NAV.
+            //
+            // I-3: the snapshot read uses a low-level staticcall + assembly
+            // decode so a governor without `getCapitalSnapshot` (e.g. UUPS
+            // upgrade misconfig) can't brick LP flow with an unhandled revert.
+            // Fail-closed: a missing / malformed return blocks the live path
+            // (queue still works). Fail-open here would silently zero the
+            // floor and re-enable the share-inflation attack.
+            // Assembly is used over high-level `(bool ok, bytes memory ret)`
+            // tuple to fit under the EIP-170 cap.
+            address gov_ = _getGovernor();
+            uint256 pid = ISyndicateGovernor(gov_).getActiveProposal(address(this));
+            bytes memory cd = abi.encodeCall(ISyndicateGovernor.getCapitalSnapshot, (pid));
+            uint256 snapshot;
+            bool snapOk;
+            assembly {
+                snapOk := and(staticcall(gas(), gov_, add(cd, 0x20), mload(cd), 0, 0x20), eq(returndatasize(), 0x20))
+                if snapOk { snapshot := mload(0) }
+            }
+            if (!snapOk) return (true, address(0), 0);
+            if (v < (snapshot + liveAdapterPrincipal[pid]) >> 1) return (true, address(0), 0);
+            return (false, adapter, v);
         } catch {}
         return (true, address(0), 0);
     }
@@ -560,32 +571,18 @@ contract SyndicateVault is
 
     /// @inheritdoc ERC4626Upgradeable
     /// @dev Aggregates the vault's idle float with the active strategy
-    ///      adapter's `positionValue()` when the adapter reports `valid=true`.
-    ///      Lock-gated: the strategy is only resolved while `redemptionsLocked()`
-    ///      is true. Outside the active window `governor.getActiveProposal`
-    ///      returns 0 → `_activeStrategy()` returns `address(0)` →
-    ///      `totalAssets` falls back to float-only. No vault-side cleanup is
-    ///      needed when a proposal settles; the governor clearing
-    ///      `_activeProposal[vault]` is the implicit clear.
-    /// @dev The try/catch on `positionValue()` is the ONLY defence against a
-    ///      malformed strategy bricking this view — V1.5 dropped the bind-time
-    ///      smoke-test that previously rejected non-IStrategy targets at bind
-    ///      time. `propose()` does not validate the `strategy` argument
-    ///      (voters do, by reading the proposal struct and accepting or
-    ///      rejecting the address). Any contract whose `positionValue` reverts
-    ///      or returns malformed data resolves here as float-only — every
-    ///      ERC-4626 conversion path (`previewDeposit` / `convertTo*` /
-    ///      `maxWithdraw`) keeps working regardless of the strategy's health.
+    ///      adapter's `positionValue()` when the adapter reports `valid=true`
+    ///      AND clears the NAV floor. Delegates to `_lpFlowGate` so the
+    ///      preview surface (`previewDeposit`/`previewWithdraw`) and the
+    ///      on-chain entry/exit gate agree byte-for-byte: any case that
+    ///      blocks LP flow (unbound adapter, invalid value, sub-floor NAV,
+    ///      governor staticcall failure, reverting `positionValue`) falls
+    ///      back to float-only here, so the quoted NAV is exactly what
+    ///      a deposit/withdraw would mint/burn against.
     function totalAssets() public view override returns (uint256) {
         uint256 float = IERC20(asset()).balanceOf(address(this));
-        if (!redemptionsLocked()) return float;
-        address adapter = _activeStrategy();
-        if (adapter == address(0)) return float;
-        try IStrategy(adapter).positionValue() returns (uint256 value, bool valid) {
-            return valid ? float + value : float;
-        } catch {
-            return float;
-        }
+        (, address liveAdapter, uint256 adapterValue) = _lpFlowGate();
+        return liveAdapter == address(0) ? float : float + adapterValue;
     }
 
     /// @dev Block deposits when paused or depositor not approved.
