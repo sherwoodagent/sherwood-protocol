@@ -61,8 +61,6 @@ contract VaultRedemptionLockSemanticsTest is Test {
 
         // factory.governor() returns the mock governor address.
         vm.mockCall(address(this), abi.encodeWithSignature("governor()"), abi.encode(MOCK_GOVERNOR));
-        // NAV-floor guard reads `getCapitalSnapshot(pid)` — mock to 0 default.
-        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getCapitalSnapshot(uint256)"), abi.encode(uint256(0)));
         // Default: no active proposal anywhere — deposits/withdraws unlocked.
         _mockState({active: false, openCount: 0});
 

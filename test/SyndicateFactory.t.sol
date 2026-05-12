@@ -104,9 +104,7 @@ contract SyndicateFactoryTest is Test {
         assertEq(vault.symbol(), "tVault");
         assertEq(vault.owner(), creator1);
         assertEq(address(vault.asset()), address(usdc));
-        // _executorImpl getter was dropped to free EIP-170 budget; verifying
-        // the slot via vm.load is sufficient for this round-trip check.
-        assertEq(address(uint160(uint256(vm.load(address(vault), bytes32(uint256(3)))))), address(executorLib));
+        assertEq(vault.getExecutorImpl(), address(executorLib));
     }
 
     function test_createSyndicate_notAgentOwner_reverts() public {
@@ -144,9 +142,8 @@ contract SyndicateFactoryTest is Test {
         assertEq(factory.syndicateCount(), 2);
 
         // Both share same executor lib
-        // _executorImpl slot 3 — getter was dropped to free EIP-170 budget.
-        assertEq(address(uint160(uint256(vm.load(vault1, bytes32(uint256(3)))))), address(executorLib));
-        assertEq(address(uint160(uint256(vm.load(vault2, bytes32(uint256(3)))))), address(executorLib));
+        assertEq(SyndicateVault(payable(vault1)).getExecutorImpl(), address(executorLib));
+        assertEq(SyndicateVault(payable(vault2)).getExecutorImpl(), address(executorLib));
     }
 
     function test_syndicateVaultIsFullyFunctional() public {

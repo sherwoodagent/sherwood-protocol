@@ -50,10 +50,7 @@ contract VaultLiveDepositPrincipalTest is Test {
         );
         vault = SyndicateVault(payable(address(new ERC1967Proxy(address(impl), initData))));
         adapter = new MockStrategyAdapter();
-        // Stamp a value far above any principal accumulated in these tests so
-        // the vault's NAV-floor guard (v >= principal / 2) never fires —
-        // these tests target principal accounting, not the floor.
-        adapter.setValue(1e30, true);
+        adapter.setValue(0, true);
         adapter.setConfiguredVault(address(vault));
 
         vm.mockCall(address(this), abi.encodeWithSignature("governor()"), abi.encode(MOCK_GOVERNOR));
@@ -63,8 +60,6 @@ contract VaultLiveDepositPrincipalTest is Test {
         // no separate bind call.
         _mockProposalWithStrategy(ACTIVE_PID, address(adapter));
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("openProposalCount(address)"), abi.encode(uint256(1)));
-        // NAV-floor guard reads `getCapitalSnapshot(pid)` — mock to 0.
-        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getCapitalSnapshot(uint256)"), abi.encode(uint256(0)));
     }
 
     function _mockProposalWithStrategy(uint256 pid, address strategy) internal {

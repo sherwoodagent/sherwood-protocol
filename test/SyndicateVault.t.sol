@@ -103,6 +103,7 @@ contract SyndicateVaultTest is Test {
         assertEq(vault.symbol(), "swUSDC");
         assertEq(vault.owner(), owner);
         assertEq(address(vault.asset()), address(usdc));
+        assertEq(vault.getExecutorImpl(), address(executorLib));
     }
 
     // ==================== DEPOSITS & WITHDRAWALS ====================
@@ -286,7 +287,7 @@ contract SyndicateVaultTest is Test {
 
         assertTrue(vault.isApprovedDepositor(depositor));
 
-        address[] memory depositors = vault.approvedDepositorsPaginated(0, 100);
+        address[] memory depositors = vault.getApprovedDepositors();
         assertEq(depositors.length, 1);
         assertEq(depositors[0], depositor);
     }
@@ -319,7 +320,7 @@ contract SyndicateVaultTest is Test {
         assertTrue(vault.isApprovedDepositor(depositors[0]));
         assertTrue(vault.isApprovedDepositor(depositors[1]));
         assertTrue(vault.isApprovedDepositor(depositors[2]));
-        assertEq(vault.approvedDepositorsPaginated(0, 100).length, 3);
+        assertEq(vault.getApprovedDepositors().length, 3);
     }
 
     /// @dev Helper to deploy a closed-deposits vault for whitelist tests
@@ -795,7 +796,7 @@ contract SyndicateVaultTest is Test {
         vm.prank(owner);
         vault.approveDepositors(ds);
 
-        assertEq(vault.approvedDepositorsPaginated(0, 100).length, 5);
+        assertEq(vault.approvedDepositorCount(), 5);
 
         address[] memory full = vault.approvedDepositorsPaginated(0, 100);
         assertEq(full.length, 5, "full page = 5");
@@ -875,10 +876,7 @@ contract SyndicateVaultTest is Test {
 
         // Overwrite _executorImpl (slot 3) with the evil address.
         vm.store(address(vault), bytes32(uint256(3)), bytes32(uint256(uint160(address(evil)))));
-        // Confirm the slot was overwritten by reading it back via vm.load —
-        // public getter was dropped to free EIP-170 budget for the NAV-floor
-        // guard; the slot still exists at index 3.
-        assertEq(address(uint160(uint256(vm.load(address(vault), bytes32(uint256(3)))))), address(evil));
+        assertEq(vault.getExecutorImpl(), address(evil));
 
         // Attempt to execute a batch through the governor — should revert
         // because the live codehash no longer matches the one pinned at init.

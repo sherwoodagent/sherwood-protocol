@@ -54,8 +54,6 @@ contract VaultLiveWithdrawTest is Test {
         vm.mockCall(address(this), abi.encodeWithSignature("governor()"), abi.encode(MOCK_GOVERNOR));
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal(address)"), abi.encode(uint256(0)));
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("openProposalCount(address)"), abi.encode(uint256(0)));
-        // NAV-floor guard reads `getCapitalSnapshot(pid)` — mock to 0 default.
-        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getCapitalSnapshot(uint256)"), abi.encode(uint256(0)));
     }
 
     /// @dev Lock the vault and wire the supplied adapter as the resolved
