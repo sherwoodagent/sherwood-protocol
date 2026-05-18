@@ -71,7 +71,7 @@ contract OwnerStakeAtCreationTest is Test {
                     votingPeriod: 1 days,
                     executionWindow: 1 days,
                     vetoThresholdBps: 4000,
-                    maxPerformanceFeeBps: 3000,
+                    maxPerformanceFeeBps: 1000,
                     cooldownPeriod: 1 days,
                     collaborationWindow: 48 hours,
                     maxCoProposers: 5,
@@ -170,7 +170,7 @@ contract OwnerStakeAtCreationTest is Test {
 
         assertEq(id, 1);
         assertTrue(vault != address(0));
-        assertTrue(registry.hasOwnerStake(vault), "owner stake bound to vault");
+        assertTrue((registry.ownerStake(vault) > 0), "owner stake bound to vault");
         assertEq(registry.ownerStake(vault), MIN_OWNER_STAKE);
         assertFalse(registry.canCreateVault(creator), "prepared stake consumed");
     }
@@ -204,15 +204,28 @@ contract OwnerStakeAtCreationTest is Test {
         vm.warp(block.timestamp + 7 days + 1);
         vm.prank(creator);
         registry.claimUnstakeOwner(vault);
-        assertFalse(registry.hasOwnerStake(vault));
+        assertFalse((registry.ownerStake(vault) > 0));
     }
 
-    function test_rotateOwner_onlyOwner() public {
+    /// @notice Sherlock #32: rotateOwner is now gated to vault owner /
+    ///         original creator (was previously factory `onlyOwner`).
+    function test_rotateOwner_rejectsNonOwnerNonCreator() public {
         address vault = _createAndUnstake();
         _prepareStake(newOwner);
 
         vm.prank(random);
-        vm.expectRevert();
+        vm.expectRevert(SyndicateFactory.NotVaultOwnerOrCreator.selector);
+        factory.rotateOwner(vault, newOwner);
+    }
+
+    /// @notice Sherlock #32 — factory owner can NOT rotate without the
+    ///         current vault owner's consent.
+    function test_rotateOwner_rejectsFactoryOwner() public {
+        address vault = _createAndUnstake();
+        _prepareStake(newOwner);
+
+        vm.prank(owner); // factory owner — pre-fix this was the auth path
+        vm.expectRevert(SyndicateFactory.NotVaultOwnerOrCreator.selector);
         factory.rotateOwner(vault, newOwner);
     }
 
@@ -222,7 +235,7 @@ contract OwnerStakeAtCreationTest is Test {
         (, address vault) = factory.createSyndicate(creatorAgentId, _cfg("still-staked"));
 
         _prepareStake(newOwner);
-        vm.prank(owner);
+        vm.prank(creator);
         vm.expectRevert(SyndicateFactory.VaultStillStaked.selector);
         factory.rotateOwner(vault, newOwner);
     }
@@ -260,7 +273,7 @@ contract OwnerStakeAtCreationTest is Test {
         vm.store(address(governor), slot, bytes32(uint256(uint160(other))));
         assertEq(governor.guardianRegistry(), other, "governor now points at other registry");
 
-        vm.prank(owner);
+        vm.prank(creator);
         vm.expectRevert(SyndicateFactory.RegistryMismatch.selector);
         factory.rotateOwner(vault, newOwner);
     }
@@ -269,11 +282,11 @@ contract OwnerStakeAtCreationTest is Test {
         address vault = _createAndUnstake();
         _prepareStake(newOwner);
 
-        vm.prank(owner);
+        vm.prank(creator);
         factory.rotateOwner(vault, newOwner);
 
         assertEq(SyndicateVault(payable(vault)).owner(), newOwner, "vault ownership rotated");
-        assertTrue(registry.hasOwnerStake(vault), "new owner stake bound");
+        assertTrue((registry.ownerStake(vault) > 0), "new owner stake bound");
         assertEq(registry.ownerStake(vault), MIN_OWNER_STAKE);
         // Creator record updated so downstream NotCreator gates follow the new owner.
         (,, address recordedCreator,,,,) = factory.syndicates(factory.vaultToSyndicate(vault));

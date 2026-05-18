@@ -49,7 +49,7 @@ contract OpenProposalCountTest is Test {
     uint256 constant VOTING_PERIOD = 1 days;
     uint256 constant EXECUTION_WINDOW = 1 days;
     uint256 constant VETO_THRESHOLD_BPS = 4000;
-    uint256 constant MAX_PERF_FEE_BPS = 3000;
+    uint256 constant MAX_PERF_FEE_BPS = 1500;
     uint256 constant COOLDOWN_PERIOD = 1 days;
 
     uint256 constant MIN_GUARDIAN_STAKE = 10_000e18;
@@ -197,7 +197,7 @@ contract OpenProposalCountTest is Test {
             address(vault),
             address(0),
             "ipfs://open-count",
-            1000,
+            1500,
             7 days,
             _execCalls(),
             _settleCalls(),
@@ -479,15 +479,17 @@ contract OpenProposalCountTest is Test {
             address(vault), address(0), "ipfs://collab", 1000, 7 days, _execCalls(), _settleCalls(), coProps
         );
 
-        // Draft state → counter stays at 0.
+        // Sherlock #8: Draft now binds the vault — counter incremented at
+        // propose time.
         assertEq(
             uint256(governor.getProposalState(pid)),
             uint256(ISyndicateGovernor.ProposalState.Draft),
             "in Draft until co-proposers approve"
         );
-        assertEq(governor.openProposalCount(address(vault)), 0, "Draft does not count");
+        assertEq(governor.openProposalCount(address(vault)), 1, "Sherlock #8: Draft binds the vault");
 
-        // Co-proposer approves → transitions to Pending → counter increments.
+        // Co-proposer approves → transitions to Pending → counter stays at 1
+        // (already counted from propose time).
         vm.prank(agent2);
         governor.approveCollaboration(pid);
         assertEq(
@@ -495,7 +497,7 @@ contract OpenProposalCountTest is Test {
             uint256(ISyndicateGovernor.ProposalState.Pending),
             "collab -> Pending"
         );
-        assertEq(governor.openProposalCount(address(vault)), 1, "inc on Draft -> Pending");
+        assertEq(governor.openProposalCount(address(vault)), 1, "still 1 after Draft -> Pending (no double-count)");
 
         // Cancel.
         vm.prank(agent);
@@ -517,11 +519,102 @@ contract OpenProposalCountTest is Test {
         uint256 pid = governor.propose(
             address(vault), address(0), "ipfs://collab-reject", 1000, 7 days, _execCalls(), _settleCalls(), coProps
         );
-        assertEq(governor.openProposalCount(address(vault)), 0, "Draft does not count");
+        // Sherlock #8: Draft binds the vault.
+        assertEq(governor.openProposalCount(address(vault)), 1, "Sherlock #8: Draft counted");
 
-        // Reject collaboration — Draft → Cancelled, counter stays at 0.
-        vm.prank(agent2);
+        // Reject collaboration — Draft → Cancelled, counter decrements to 0.
+        // Sherlock #9: must be called by the lead, not the co-proposer.
+        vm.prank(agent);
         governor.rejectCollaboration(pid);
-        assertEq(governor.openProposalCount(address(vault)), 0, "no double-dec on rejectCollaboration");
+        assertEq(governor.openProposalCount(address(vault)), 0, "decremented on rejectCollaboration");
+    }
+
+    /// @notice PR #324 review comment 4454151855 — owner-`emergencyCancel`
+    ///         on a Draft proposal must decrement `openProposalCount`. Pre-fix
+    ///         the Draft branch in `emergencyCancel` fell through to set
+    ///         `state = Cancelled` without calling `_decOpen`, soft-locking
+    ///         the vault: subsequent `propose` calls reverted
+    ///         `VaultHasOpenProposal` because the counter stayed bumped from
+    ///         the cancelled Draft.
+    function test_emergencyCancel_draftDecrements() public {
+        // Register co-proposer.
+        address agent2 = makeAddr("agent2");
+        uint256 agent2Id = agentRegistry.mint(agent2);
+        vm.prank(owner);
+        vault.registerAgent(agent2Id, agent2);
+
+        ISyndicateGovernor.CoProposer[] memory coProps = new ISyndicateGovernor.CoProposer[](1);
+        coProps[0] = ISyndicateGovernor.CoProposer({agent: agent2, splitBps: 2000});
+
+        vm.prank(agent);
+        uint256 pid = governor.propose(
+            address(vault), address(0), "ipfs://draft-emerg", 1000, 7 days, _execCalls(), _settleCalls(), coProps
+        );
+        // Sherlock #8: Draft binds the vault.
+        assertEq(governor.openProposalCount(address(vault)), 1, "Sherlock #8: Draft counted");
+        assertEq(
+            uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Draft), "in Draft state"
+        );
+
+        // Owner emergency-cancels the Draft.
+        vm.prank(owner);
+        governor.emergencyCancel(pid);
+
+        // R9 fix: counter must drop back to 0.
+        assertEq(governor.openProposalCount(address(vault)), 0, "R9: emergencyCancel decremented Draft");
+        assertEq(
+            uint256(governor.getProposalState(pid)),
+            uint256(ISyndicateGovernor.ProposalState.Cancelled),
+            "state is Cancelled"
+        );
+
+        // Liveness regression: a fresh `propose` must succeed. Pre-fix this
+        // reverted `VaultHasOpenProposal` because the counter stayed at 1.
+        vm.prank(agent);
+        uint256 pid2 = governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://draft-emerg-2",
+            1500,
+            7 days,
+            _execCalls(),
+            _settleCalls(),
+            _emptyCoProposers()
+        );
+        assertGt(pid2, pid, "new proposal created post-emergencyCancel");
+        assertEq(governor.openProposalCount(address(vault)), 1, "counter at 1 after fresh propose");
+    }
+
+    /// @notice Sherlock run #1 finding #8 — once a Draft exists, the vault
+    ///         is bound and new deposits are blocked (vault's
+    ///         `_depositsLocked` reads `governor.openProposalCount > 0`).
+    ///         Pre-fix, Draft sat outside the counter, so depositors could
+    ///         front-run the Draft→Pending snapshot during the up-to-7-day
+    ///         collab window and have their fresh balance counted at vote time.
+    function test_draft_locksDeposits() public {
+        address agent2 = makeAddr("agent2");
+        uint256 agent2Id = agentRegistry.mint(agent2);
+        vm.prank(owner);
+        vault.registerAgent(agent2Id, agent2);
+
+        ISyndicateGovernor.CoProposer[] memory coProps = new ISyndicateGovernor.CoProposer[](1);
+        coProps[0] = ISyndicateGovernor.CoProposer({agent: agent2, splitBps: 2000});
+
+        vm.prank(agent);
+        governor.propose(
+            address(vault), address(0), "ipfs://draft-lock", 1000, 7 days, _execCalls(), _settleCalls(), coProps
+        );
+
+        // openProposalCount = 1; vault's _depositsLocked() returns true.
+        assertEq(governor.openProposalCount(address(vault)), 1, "Draft bumps openProposalCount");
+
+        // Attempt to deposit during the Draft window — must revert.
+        address depositor = makeAddr("depositor");
+        usdc.mint(depositor, 1_000e6);
+        vm.startPrank(depositor);
+        usdc.approve(address(vault), type(uint256).max);
+        vm.expectRevert(ISyndicateVault.DepositsLocked.selector);
+        vault.deposit(1_000e6, depositor);
+        vm.stopPrank();
     }
 }

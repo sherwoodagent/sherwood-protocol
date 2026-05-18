@@ -63,7 +63,7 @@ contract ProtocolInvariantsTest is StdInvariant, Test {
     uint256 constant VOTING_PERIOD = 1 days;
     uint256 constant EXECUTION_WINDOW = 1 days;
     uint256 constant VETO_THRESHOLD_BPS = 4_000;
-    uint256 constant MAX_PERF_FEE_BPS = 3_000;
+    uint256 constant MAX_PERF_FEE_BPS = 1_500;
     uint256 constant COOLDOWN_PERIOD = 1 days;
     uint256 constant COLLAB_WINDOW = 48 hours;
     uint256 constant MAX_CO_PROPOSERS = 5;

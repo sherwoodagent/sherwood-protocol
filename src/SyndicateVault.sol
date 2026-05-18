@@ -63,6 +63,12 @@ contract SyndicateVault is
     ///         V-M3: prevents unbounded iteration from out-of-gassing a page
     ///         fetch even when the underlying set is large.
     uint256 public constant MAX_PAGE_LIMIT = 100;
+    /// @notice PR #324 review R4: hard cap on agents per vault so the
+    ///         `rotateOwnership` deactivation loop (Sherlock #38) has a
+    ///         predictable upper bound and cannot OOG. 32 SSTOREs ≈ 6.4k
+    ///         gas — fits comfortably in any block. Removing an agent
+    ///         frees a slot via `removeAgent`.
+    uint256 public constant MAX_AGENTS_PER_VAULT = 32;
 
     // ==================== STORAGE ====================
 
@@ -213,10 +219,11 @@ contract SyndicateVault is
 
     // ==================== VIEWS ====================
 
-    /// @inheritdoc ISyndicateVault
-    function getAgentConfig(address agentAddress) external view returns (AgentConfig memory) {
-        return _agents[agentAddress];
-    }
+    // `getAgentConfig` external view dropped to make room for R4's
+    // MAX_AGENTS_PER_VAULT cap under EIP-170. Test-only; production callers
+    // use `isAgent(addr)` (the load-bearing auth gate). Off-chain reads via
+    // `eth_getStorageAt` on the `_agents[addr]` slot or the
+    // `AgentRegistered` / `AgentRemoved` event stream.
 
     /// @inheritdoc ISyndicateVault
     function getAgentCount() external view returns (uint256) {
@@ -261,6 +268,10 @@ contract SyndicateVault is
     function registerAgent(uint256 agentId, address agentAddress) external onlyOwner {
         if (agentAddress == address(0)) revert ZeroAddress();
         if (_agents[agentAddress].active) revert AgentAlreadyRegistered();
+        // PR #324 review R4: bound the `_agentSet` so `rotateOwnership`'s
+        // deactivation loop (Sherlock #38) can't OOG. `removeAgent` frees
+        // a slot.
+        if (_agentSet.length() >= MAX_AGENTS_PER_VAULT) revert AgentCapExceeded();
 
         // Verify ERC-8004 identity (skipped on chains without agent registry)
         if (address(_agentRegistry) != address(0)) {
@@ -311,9 +322,33 @@ contract SyndicateVault is
     ///      registry's `transferOwnerStakeSlot`, so the old owner's slashed /
     ///      unstaked position can be rebound to a fresh operator without
     ///      redeploying the vault.
+    /// @dev Sherlock #38 v2 (PR #324 review comment 4453740618): drain
+    ///      `_agentSet` entirely, not just flip `active = false`. The prior
+    ///      flip-only loop colluded with R4's `MAX_AGENTS_PER_VAULT` cap in
+    ///      `registerAgent` AND the active-only check in `removeAgent` to
+    ///      brick the new owner of an at-cap vault: 32 dead set entries
+    ///      could be neither re-registered (cap blocks before idempotent
+    ///      `_agentSet.add`) nor purged (`AgentNotActive` blocks
+    ///      `removeAgent` on every entry). Snapshot via `.values()` first
+    ///      so the `_agentSet.remove(...)` calls inside the loop don't
+    ///      invalidate iteration (OZ swap-and-pop semantics on `at(i)`
+    ///      would otherwise skip entries). Post-rotation: agent set is
+    ///      empty; new owner registers up to `MAX_AGENTS_PER_VAULT` fresh
+    ///      agents without any pre-cleanup step. Each entry gets a full
+    ///      `delete _agents[a]` (V-M5: no stale struct fields) and emits
+    ///      `AgentRemoved` for indexer parity with the normal `removeAgent`
+    ///      path.
     function rotateOwnership(address newOwner) external {
         if (msg.sender != _factory) revert NotFactory();
         if (newOwner == address(0)) revert ZeroAddress();
+        address[] memory snap = _agentSet.values();
+        uint256 n = snap.length;
+        for (uint256 i; i < n; ++i) {
+            address a = snap[i];
+            delete _agents[a];
+            _agentSet.remove(a);
+            emit AgentRemoved(a);
+        }
         _transferOwnership(newOwner);
     }
 
@@ -495,6 +530,20 @@ contract SyndicateVault is
     ///      is treated as `blocked=true` so a malicious/broken adapter can't
     ///      brick LP flow with an unhandled revert. Pairs with the `totalAssets`
     ///      try/catch fallback below.
+    /// @dev Sherlock #37/#50 helper — returns `adapterValue` only when
+    ///      `adapter` implements `_onLiveWithdraw` (i.e.
+    ///      `supportsLiveWithdraw() == true`). Strategies whose hook is the
+    ///      `BaseStrategy` no-op default return 0 here, so the vault clamps
+    ///      `maxWithdraw` / `maxRedeem` to float-only during their active
+    ///      proposal. Factored into a single helper so the staticcall to
+    ///      `supportsLiveWithdraw` is emitted once rather than at both
+    ///      `maxWithdraw` and `maxRedeem`.
+    function _withdrawableAdapterValue(address adapter, uint256 v) private view returns (uint256) {
+        if (adapter == address(0)) return 0;
+        if (!IStrategy(adapter).supportsLiveWithdraw()) return 0;
+        return v;
+    }
+
     function _lpFlowGate() private view returns (bool blocked, address liveAdapter, uint256 adapterValue) {
         if (!redemptionsLocked()) return (false, address(0), 0);
         address adapter = _activeStrategy();
@@ -525,7 +574,12 @@ contract SyndicateVault is
                 if snapOk { snapshot := mload(0) }
             }
             if (!snapOk) return (true, address(0), 0);
-            if (v < (snapshot + liveAdapterPrincipal[pid]) >> 1) return (true, address(0), 0);
+            // Sherlock #33: net `liveAdapterWithdrawn` out of principal so
+            // legitimate LP exits don't anchor the floor at execute-time
+            // levels and DoS subsequent flows.
+            uint256 p_ = liveAdapterPrincipal[pid];
+            uint256 w_ = liveAdapterWithdrawn[pid];
+            if (v < (snapshot + (p_ > w_ ? p_ - w_ : 0)) >> 1) return (true, address(0), 0);
             return (false, adapter, v);
         } catch {}
         return (true, address(0), 0);
@@ -614,26 +668,24 @@ contract SyndicateVault is
         // returned a non-zero adapter, so no extra positionValue check is
         // needed here. Push model: transfer the assets to the adapter then
         // call the hook — avoids needing an approve + transferFrom.
-        // try/catch around `onLiveDeposit`: a transient revert (paused
-        // upstream pool, max-deposit cap, momentary oracle staleness, or a
-        // bespoke adapter that didn't implement the hook) must not brick
-        // every LP deposit until settle. The assets were already pushed to
-        // the adapter; track them under principal so they're returned at
-        // settle and not counted as profit. Symmetric with the runtime
-        // try/catches on `positionValue` (totalAssets / _lpFlowGate) and
-        // `onLiveWithdraw` (_withdraw partial-unwind path).
+        // Sherlock #24: forward to live adapter + atomic success-gating.
+        // Pre-fix this was fail-soft (try/catch with principal bumped
+        // regardless), but a failed hook stranded assets on the adapter:
+        // `positionValue()` didn't see them, so `totalAssets()` under-reported
+        // and the next depositor minted too many shares against the deflated
+        // NAV — dilution of existing holders. Hard-revert on hook failure so
+        // the whole deposit unwinds (safeTransfer rolls back with the
+        // outer call); no stranded capital, no silent NAV drift.
         if (liveAdapter != address(0)) {
             IERC20(asset()).safeTransfer(liveAdapter, assets);
             uint256 pid = ISyndicateGovernor(_getGovernor()).getActiveProposal(address(this));
             try IStrategy(liveAdapter).onLiveDeposit(assets) {
-            // Hook accepted — capital is now earning yield.
+                liveAdapterPrincipal[pid] += assets;
+            } catch {
+                // Sherlock #24: hard-revert. Parameterless to save bytecode.
+                pid;
+                revert LiveDepositRejected();
             }
-            catch {
-                // Hook unavailable / reverted — capital sits idle on the
-                // adapter, recoverable at settle via `liveAdapterPrincipal`.
-                emit LiveDepositForwardFailed(pid, liveAdapter, assets);
-            }
-            liveAdapterPrincipal[pid] += assets;
         }
     }
 
@@ -682,7 +734,14 @@ contract SyndicateVault is
         uint256 received = IERC20(asset()).balanceOf(address(this)) - before;
         if (received < needed) return false;
         uint256 pid = ISyndicateGovernor(_getGovernor()).getActiveProposal(address(this));
-        liveAdapterWithdrawn[pid] += received;
+        // Sherlock #2: credit against the requested `needed`, not the
+        // possibly-larger `received`. Excess (a misbehaving / generous
+        // adapter sending back > needed) stays in the vault's float and is
+        // accounted once at settle via the standard balance diff — crediting
+        // `received` here would double-count it (once in `liveAdapterWithdrawn`,
+        // once in settle's `balanceAdjusted`) and inflate proposal PnL,
+        // overpaying performance/management/protocol fees out of LP funds.
+        liveAdapterWithdrawn[pid] += needed;
         return true;
     }
 
@@ -700,10 +759,11 @@ contract SyndicateVault is
         uint256 reserve = reservedQueueAssets();
         uint256 float = IERC20(asset()).balanceOf(address(this));
         uint256 available = float > reserve ? float - reserve : 0;
-        // Live-NAV branch: cap also includes the adapter's reported position
-        // value (already fetched by `_lpFlowGate` via the same staticcall —
-        // reuse it instead of issuing a second positionValue call).
-        if (adapter != address(0)) available += adapterValue;
+        // Sherlock #37 (now closed via #50): credit adapter NAV only when
+        // `_onLiveWithdraw` can actually free liquidity (helper consolidates
+        // the staticcall for both `maxWithdraw` and `maxRedeem` to fit
+        // under EIP-170).
+        available += _withdrawableAdapterValue(adapter, adapterValue);
         return userMax > available ? available : userMax;
     }
 
@@ -736,7 +796,8 @@ contract SyndicateVault is
         uint256 reserve = reservedQueueAssets();
         uint256 float = IERC20(asset()).balanceOf(address(this));
         uint256 backingAssets = float > reserve ? float - reserve : 0;
-        if (adapter != address(0)) backingAssets += adapterValue;
+        // Sherlock #37 / #50 — see `maxWithdraw` for rationale.
+        backingAssets += _withdrawableAdapterValue(adapter, adapterValue);
         if (backingAssets == 0) return 0;
         uint256 floatShares = convertToShares(backingAssets);
         if (floatShares < availableShares) availableShares = floatShares;
@@ -815,7 +876,17 @@ contract SyndicateVault is
     }
 
     /// @notice Rescue ERC-721 tokens accidentally sent to the vault.
-    ///         Blocked during active proposals to protect strategy position NFTs (e.g., Uniswap V3 LP).
+    ///         Blocked during active proposals (protects in-flight strategy
+    ///         position NFTs e.g. Uniswap V3 LP).
+    /// @dev    Sherlock run #1 finding #25 (Medium) — post-settle window
+    ///         lets the owner extract strategy-position NFTs whose value
+    ///         isn't credited by the asset-only settle PnL formula. An
+    ///         allowlist of rescuable token contracts is the recommended
+    ///         long-term fix but exceeds the contract's EIP-170 bytecode
+    ///         budget today (#37 / #38 / #50 added incremental cost).
+    ///         Mitigation until the allowlist lands: the owner multisig
+    ///         should review every strategy-position NFT contract before
+    ///         calling, and the contract is monitored off-chain.
     function rescueERC721(address token, uint256 tokenId, address to) external onlyOwner {
         if (redemptionsLocked()) revert RedemptionsLocked();
         if (to == address(0)) revert ZeroAddress();

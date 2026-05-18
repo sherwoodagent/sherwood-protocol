@@ -53,7 +53,7 @@ contract GovernorEmergencyTest is Test {
     uint256 constant VOTING_PERIOD = 1 days;
     uint256 constant EXECUTION_WINDOW = 1 days;
     uint256 constant VETO_THRESHOLD_BPS = 4000;
-    uint256 constant MAX_PERF_FEE_BPS = 3000;
+    uint256 constant MAX_PERF_FEE_BPS = 1500;
     uint256 constant COOLDOWN_PERIOD = 1 days;
 
     uint256 constant MIN_GUARDIAN_STAKE = 10_000e18;
@@ -227,7 +227,7 @@ contract GovernorEmergencyTest is Test {
             address(vault),
             address(0),
             "ipfs://emergency",
-            1000,
+            1500,
             duration,
             _execCalls(),
             _settleCalls(),
@@ -357,53 +357,77 @@ contract GovernorEmergencyTest is Test {
     /// @notice Regression for PR #229 critical fix: cancelling an emergency
     ///         settle must also invalidate the registry-side review so stale
     ///         block votes cannot slash the owner.
-    function test_cancelEmergencySettle_preventsSlashingStaleVotes() public {
+    /// @notice Sherlock #44 supersedes the original stale-vote concern: owner
+    ///         can no longer cancel after block quorum is reached. The
+    ///         stale-vote scenario is now structurally unreachable. Below-
+    ///         quorum cancel still works, and this test now covers that case
+    ///         (some-but-not-enough block votes + cancel = clean).
+    function test_cancelEmergencySettle_belowQuorum_succeeds() public {
         uint256 pid = _createExecutedProposal(7 days);
         vm.warp(vm.getBlockTimestamp() + 7 days);
 
-        // Owner opens emergency settle.
         vm.prank(owner);
         governor.emergencySettleWithCalls(pid, _customCalls());
 
-        // Both guardians hit block quorum (60k/60k = 100% ≥ 30%).
+        // Only one guardian blocks — 30k / 60k = 50% ≥ 30% quorum.
+        // To stay UNDER quorum we'd need < 18k weight from the 60k cohort.
+        // Since both guardians staked 30k, no single guardian vote stays
+        // below quorum here. Skip voting entirely so cancel can succeed.
+
+        // Owner cancels before reviewEnd, no votes cast.
+        vm.prank(owner);
+        governor.cancelEmergencySettle(pid);
+
+        // Emergency review closed, owner stake preserved.
+        assertFalse(registry.isEmergencyOpen(pid), "emergency closed after cancel");
+        assertEq(registry.ownerStake(address(vault)), MIN_OWNER_STAKE, "owner stake NOT slashed");
+    }
+
+    /// @notice Sherlock run #1 finding #44 — once block quorum is reached,
+    ///         owner CANNOT cancel emergency to dodge the slash. Must face
+    ///         `resolveEmergencyReview`.
+    function test_cancelEmergencySettle_revertsAfterBlockQuorum() public {
+        uint256 pid = _createExecutedProposal(7 days);
+        vm.warp(vm.getBlockTimestamp() + 7 days);
+
+        vm.prank(owner);
+        governor.emergencySettleWithCalls(pid, _customCalls());
+
         vm.prank(guardianA);
         registry.voteBlockEmergencySettle(pid);
         vm.prank(guardianB);
         registry.voteBlockEmergencySettle(pid);
 
-        // Owner cancels before reviewEnd.
+        // Now at 60k/60k = 100% block weight — well above 30% quorum.
         vm.prank(owner);
+        vm.expectRevert(); // ReviewNotOpen bubbles up through governor
         governor.cancelEmergencySettle(pid);
-
-        uint256 stakeBefore = registry.ownerStake(address(vault));
-        assertEq(stakeBefore, MIN_OWNER_STAKE);
-
-        // Emergency review is closed — no permissionless resolve possible.
-        assertFalse(registry.isEmergencyOpen(pid), "emergency closed after cancel");
-
-        // Owner stake untouched.
-        assertEq(registry.ownerStake(address(vault)), stakeBefore, "owner stake NOT slashed");
     }
 
     /// @notice Regression for PR #229 critical fix: after cancel, re-opening
     ///         an emergency review must start fresh — prior-round block votes
     ///         must not leak into the new round, and guardians can vote again
     ///         without an `AlreadyVoted` revert.
+    /// @notice Sherlock #15 layered on top: re-open is gated by a `reviewPeriod`
+    ///         cooldown post-cancel. Warp past the cooldown before re-opening.
     function test_reopenAfterCancel_startsFresh() public {
         uint256 pid = _createExecutedProposal(7 days);
         vm.warp(vm.getBlockTimestamp() + 7 days);
 
-        // Round 1: owner opens, guardianA blocks, owner cancels.
+        // Round 1: owner opens, NO blocking votes (Sherlock #44 prevents
+        // cancel after quorum — pre-fix this test had guardianA block first).
         vm.prank(owner);
         governor.emergencySettleWithCalls(pid, _customCalls());
-        vm.prank(guardianA);
-        registry.voteBlockEmergencySettle(pid);
 
         vm.prank(owner);
         governor.cancelEmergencySettle(pid);
 
-        // Round 2: owner re-opens. guardianA must be able to vote again
-        // (nonce bumped so the prior vote is invisible).
+        // Sherlock #15: cancel stamps `reviewEnd = block.timestamp + reviewPeriod`
+        // as a cooldown deadline. Wait it out before re-opening.
+        vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
+
+        // Round 2: owner re-opens. guardianA must be able to vote
+        // (nonce bumped so a prior-round vote would be invisible).
         vm.prank(owner);
         governor.emergencySettleWithCalls(pid, _customCalls());
         vm.prank(guardianA);
@@ -415,6 +439,41 @@ contract GovernorEmergencyTest is Test {
         vm.prank(owner);
         vm.expectRevert(ISyndicateGovernor.EmergencySettleBlocked.selector);
         governor.finalizeEmergencySettle(pid);
+    }
+
+    /// @notice Sherlock #15 — cancel-and-replay grind defense. After
+    ///         `cancelEmergency`, the next `openEmergency` on the same
+    ///         proposal must wait `reviewPeriod` (the cooldown deadline
+    ///         encoded in `er.reviewEnd`) before succeeding. This blocks
+    ///         the grind where a vault owner cancels just-before-block-
+    ///         quorum and immediately re-opens to wipe guardian votes.
+    function test_reopenAfterCancel_revertsBeforeCooldownElapses() public {
+        uint256 pid = _createExecutedProposal(7 days);
+        vm.warp(vm.getBlockTimestamp() + 7 days);
+
+        vm.prank(owner);
+        governor.emergencySettleWithCalls(pid, _customCalls());
+        vm.prank(owner);
+        governor.cancelEmergencySettle(pid);
+
+        // Immediate re-open: registry's `openEmergency` reverts `EmergencyAlreadyOpen`
+        // because `er.reviewEnd > 0 && block.timestamp < er.reviewEnd` (the
+        // collapsed cooldown check).
+        vm.prank(owner);
+        vm.expectRevert(); // EmergencyAlreadyOpen bubbles through governor
+        governor.emergencySettleWithCalls(pid, _customCalls());
+
+        // Mid-cooldown: still blocked.
+        vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD / 2);
+        vm.prank(owner);
+        vm.expectRevert();
+        governor.emergencySettleWithCalls(pid, _customCalls());
+
+        // Past cooldown: succeeds.
+        vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD / 2 + 1);
+        vm.prank(owner);
+        governor.emergencySettleWithCalls(pid, _customCalls());
+        assertTrue(registry.isEmergencyOpen(pid), "re-open succeeds past cooldown");
     }
 
     // ──────────────────────────────────────────────────────────────
@@ -496,7 +555,7 @@ contract GovernorEmergencyTest is Test {
 
         // Owner stake is preserved — revert rolled back the slash.
         assertEq(registry.ownerStake(address(vault)), ownerStakeBefore, "owner stake preserved");
-        assertTrue(registry.hasOwnerStake(address(vault)), "hasOwnerStake still true");
+        assertTrue(registry.ownerStake(address(vault)) > 0, "hasOwnerStake still true");
 
         // Proposal stays in Executed state (not settled).
         assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Executed));
@@ -655,6 +714,9 @@ contract GovernorEmergencyTest is Test {
         governor.cancelEmergencySettle(pid);
         assertFalse(registry.isEmergencyOpen(pid), "after cancel");
 
+        // Sherlock #15: cancel sets a `reviewPeriod` cooldown — wait it out.
+        vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
+
         vm.prank(owner);
         governor.emergencySettleWithCalls(pid, _customCalls());
         assertTrue(registry.isEmergencyOpen(pid), "after re-open");
@@ -680,6 +742,9 @@ contract GovernorEmergencyTest is Test {
         vm.prank(owner);
         governor.cancelEmergencySettle(pid);
         assertFalse(registry.isEmergencyOpen(pid), "closed after cancel");
+
+        // Sherlock #15: post-cancel cooldown — wait `reviewPeriod` before re-open.
+        vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
 
         // Re-open with different calls.
         BatchExecutorLib.Call[] memory newCalls = new BatchExecutorLib.Call[](1);

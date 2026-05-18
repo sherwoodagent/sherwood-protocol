@@ -102,6 +102,86 @@ contract VaultLiveWithdrawTest is Test {
         assertEq(vault.liveAdapterWithdrawn(PID), 400e6, "withdrawn principal accumulated under pid");
     }
 
+    /// @notice Sherlock run #1 finding #2 — when an adapter returns MORE
+    ///         than `needed` from `onLiveWithdraw` (e.g. a generous unwind
+    ///         rounding up), `liveAdapterWithdrawn[pid]` must increment by
+    ///         `needed`, not by the full `received` amount. Pre-fix, the
+    ///         excess was double-counted at settle — once as part of vault
+    ///         float (in `balanceAdjusted`), once via the adapter accumulator
+    ///         — inflating proposal PnL and overpaying fees from LP capital.
+    function test_withdraw_overReturn_capsAccumulatorAtNeeded() public {
+        LiveWithdrawAdapter adapter = new LiveWithdrawAdapter(usdc, address(vault));
+        adapter.setValue(1_000e6, true);
+        address alice = _seedAndAttach(adapter, 1_000e6);
+
+        // Adapter holds 1000, will send back 200 = 150 (needed) + 50 (excess).
+        adapter.setReturnExcess(50e6);
+
+        vm.prank(alice);
+        vault.withdraw(150e6, alice, alice);
+
+        // Adapter received the request for 150, sent 200 back.
+        assertEq(adapter.lastOnLiveWithdrawArg(), 150e6);
+        // Vault's `liveAdapterWithdrawn` must be 150 (the request), NOT 200.
+        // Otherwise settle's PnL double-counts the 50e6 excess.
+        assertEq(vault.liveAdapterWithdrawn(PID), 150e6, "accumulator capped at needed, not over-return");
+        // Excess 50 stays in vault float for settle-time accounting.
+        assertEq(usdc.balanceOf(address(vault)), 50e6, "over-return excess sits in vault float");
+    }
+
+    /// @notice Sherlock run #1 finding #33 — `_lpFlowGate` floor must net
+    ///         `liveAdapterWithdrawn` out of `liveAdapterPrincipal` so the
+    ///         denominator tracks net capital under management. Pre-fix, a
+    ///         legitimate LP exit accumulated into `liveAdapterWithdrawn`
+    ///         without lowering the floor, so as the adapter's
+    ///         `positionValue` shrank in lockstep with the exit, the gate
+    ///         eventually DoS'd every subsequent LP flow.
+    ///
+    ///         Setup: while locked, build principal=500 via a live-NAV
+    ///         deposit, then withdraw 400 so withdrawn=400. After that,
+    ///         adapter reports value=100. With snapshot=0:
+    ///           - OLD floor = (0 + 500) / 2     = 250 — 100 < 250 → blocked
+    ///           - NEW floor = (0 + 500-400) / 2 = 50  — 100 ≥ 50  → allowed
+    ///         totalAssets reflects whether the gate fired.
+    function test_lpFlowGate_floor_netsLiveAdapterWithdrawn() public {
+        LiveWithdrawAdapter adapter = new LiveWithdrawAdapter(usdc, address(vault));
+        adapter.setValue(1_000e6, true);
+        // _seedAndAttach: alice deposits 1000 unlocked then we lock.
+        // After this: float=0, adapter has 1000, principal=0, withdrawn=0.
+        address alice = _seedAndAttach(adapter, 1_000e6);
+
+        // While locked, bob deposits 500 via live-NAV path → principal += 500.
+        address bob = makeAddr("bob");
+        usdc.mint(bob, 500e6);
+        vm.prank(bob);
+        usdc.approve(address(vault), type(uint256).max);
+        adapter.setReturnable(adapter.returnable() + 500e6); // adapter holds it
+        vm.prank(bob);
+        vault.deposit(500e6, bob);
+        assertEq(vault.liveAdapterPrincipal(PID), 500e6, "principal post bob.deposit");
+
+        // Alice withdraws 400, must pull from adapter → withdrawn += 400.
+        vm.prank(alice);
+        vault.withdraw(400e6, alice, alice);
+        assertEq(vault.liveAdapterWithdrawn(PID), 400e6, "withdrawn post alice.withdraw");
+
+        // Adapter now under-reports: value=100. Under the old (broken) floor,
+        // this would be < 250 → blocked. Under the fixed floor (uses
+        // 500-400=100 net principal) → floor=50, 100 ≥ 50 → allowed.
+        adapter.setValue(100e6, true);
+
+        // `totalAssets` is float + adapter.positionValue when the gate is
+        // open, or float-only when blocked. Float is currently:
+        //   pre-withdraw it was 0 (all on adapter)
+        //   + 400 withdrawn from adapter, minus 400 paid out to alice
+        // so vault float ≈ 0. If totalAssets > 0, the gate's open with our fix.
+        uint256 ta = vault.totalAssets();
+        assertGt(ta, 0, "Sherlock #33: floor does NOT block after legit LP exit");
+        // Note: totalAssets is float + 100 = some-small-number + 100. We only
+        // need to verify the gate stayed open (totalAssets includes the
+        // 100 from positionValue), not the exact value.
+    }
+
     function test_withdraw_accumulatesAcrossMultiplePulls() public {
         LiveWithdrawAdapter adapter = new LiveWithdrawAdapter(usdc, address(vault));
         adapter.setValue(1_000e6, true);
@@ -254,6 +334,12 @@ contract LiveWithdrawAdapter {
     uint256 public returnable;
     bool public shouldRevert;
 
+    /// @notice Sherlock #2 — when set, the adapter returns `assetsNeeded +
+    ///         returnExcess` instead of `min(returnable, assetsNeeded)`. Used
+    ///         to verify the vault caps `liveAdapterWithdrawn` at `needed`
+    ///         even when an adapter sends back more.
+    uint256 public returnExcess;
+
     constructor(ERC20Mock asset_, address vault_) {
         asset = asset_;
         boundVault = vault_;
@@ -272,6 +358,10 @@ contract LiveWithdrawAdapter {
         shouldRevert = x;
     }
 
+    function setReturnExcess(uint256 e) external {
+        returnExcess = e;
+    }
+
     function positionValue() external view returns (uint256, bool) {
         return (mockValue, mockValid);
     }
@@ -280,8 +370,16 @@ contract LiveWithdrawAdapter {
         if (shouldRevert) revert("paused");
         liveWithdrawCount++;
         lastOnLiveWithdrawArg = assetsNeeded;
-        // Transfer `min(returnable, assetsNeeded)` back to the vault.
-        uint256 amount = returnable < assetsNeeded ? returnable : assetsNeeded;
+        // Over-return mode (Sherlock #2 regression): if `returnExcess` is set,
+        // try to send `assetsNeeded + returnExcess` so the vault sees more than
+        // it asked for.
+        uint256 amount;
+        if (returnExcess > 0) {
+            amount = assetsNeeded + returnExcess;
+            if (amount > returnable) amount = returnable; // cap at what the mock holds
+        } else {
+            amount = returnable < assetsNeeded ? returnable : assetsNeeded;
+        }
         if (amount > 0) {
             asset.transfer(boundVault, amount);
             returnable -= amount;
@@ -292,5 +390,11 @@ contract LiveWithdrawAdapter {
     function onLiveDeposit(uint256 assets) external {
         liveDepositCount++;
         lastOnLiveDepositArg = assets;
+    }
+
+    /// @notice Sherlock #37/#50 capability flag — this adapter implements
+    ///         `onLiveWithdraw`, so it advertises true.
+    function supportsLiveWithdraw() external pure returns (bool) {
+        return true;
     }
 }

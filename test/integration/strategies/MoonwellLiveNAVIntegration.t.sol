@@ -53,7 +53,8 @@ contract MoonwellLiveNAVIntegrationTest is BaseIntegrationTest {
     // ──────────────────────── helpers ────────────────────────
 
     function _cloneStrategy() internal returns (address strategy) {
-        bytes memory initData = abi.encode(USDC, MOONWELL_MUSDC, SUPPLY_AMOUNT, MIN_REDEEM);
+        // 5-arg init: `isNativeEthMarket_ = false` for the USDC market.
+        bytes memory initData = abi.encode(USDC, MOONWELL_MUSDC, SUPPLY_AMOUNT, MIN_REDEEM, false);
         strategy = _cloneAndInit(moonwellTemplate, initData);
     }
 

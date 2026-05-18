@@ -38,6 +38,16 @@ interface ISynthraQuoter {
         uint256 amountIn,
         uint160 sqrtPriceLimitX96
     ) external returns (uint256 amountOut);
+
+    /// @dev Sherlock #62 — multi-hop quote on a packed V3 path.
+    function quoteExactInput(bytes calldata path, uint256 amountIn)
+        external
+        returns (
+            uint256 amountOut,
+            uint160[] memory sqrtPriceX96AfterList,
+            uint32[] memory initializedTicksCrossedList,
+            uint256 gasEstimate
+        );
 }
 
 /**
@@ -101,12 +111,23 @@ contract SynthraSwapAdapter is ISwapAdapter {
     }
 
     /// @inheritdoc ISwapAdapter
+    /// @dev Sherlock #62: branch on `extraData.length` to support both
+    ///      single-hop (32 bytes = abi.encode(uint24 fee)) and multi-hop
+    ///      (longer = abi.encode(uint24 fee, bytes path)) encodings, mirroring
+    ///      the dispatch in `swap()` above. Pre-fix, the multi-hop case
+    ///      reverted in the abi.decode of a packed path as a single uint24,
+    ///      bricking `PortfolioStrategy` for any Synthra multi-hop allocation.
     function quote(address tokenIn, address tokenOut, uint256 amountIn, bytes calldata extraData)
         external
         override
         returns (uint256 amountOut)
     {
-        uint24 fee = abi.decode(extraData, (uint24));
-        amountOut = quoter.quoteExactInputSingle(tokenIn, tokenOut, fee, amountIn, 0);
+        if (extraData.length == 32) {
+            uint24 fee = abi.decode(extraData, (uint24));
+            amountOut = quoter.quoteExactInputSingle(tokenIn, tokenOut, fee, amountIn, 0);
+        } else {
+            (, bytes memory path) = abi.decode(extraData, (uint24, bytes));
+            (amountOut,,,) = quoter.quoteExactInput(path, amountIn);
+        }
     }
 }

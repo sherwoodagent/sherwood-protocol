@@ -66,6 +66,21 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
     ///      blocked even if `redemptionsLocked() == false`. The `cancel` path
     ///      remains unpaused so escrowed shares are recoverable during a pause.
     function claim(uint256 requestId) external nonReentrant returns (uint256 assets) {
+        return _claim(requestId, 0);
+    }
+
+    /// @inheritdoc IVaultWithdrawalQueue
+    /// @dev Sherlock #27: slippage-floored claim. Pre-fix, an LP who queued
+    ///      a redemption while a profitable proposal was active could be
+    ///      forced to wait through a subsequent lossy proposal, and the
+    ///      queue's `claim` would happily redeem at the new (lower) NAV.
+    ///      With `minAssets`, the LP can refuse a settlement that's
+    ///      materially worse than the price they expected.
+    function claim(uint256 requestId, uint256 minAssets) external nonReentrant returns (uint256 assets) {
+        return _claim(requestId, minAssets);
+    }
+
+    function _claim(uint256 requestId, uint256 minAssets) private returns (uint256 assets) {
         if (requestId == 0 || requestId >= _requests.length) revert RequestNotFound();
         Request storage r = _requests[requestId];
         if (r.claimed) revert AlreadyClaimed();
@@ -79,6 +94,7 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
         // share balance and `_pendingShares` only diverge inside the same
         // nonReentrant window; `r.claimed` blocks double-claim reentry.
         assets = IRedeemableVault(vault).redeem(shares, r.owner, address(this));
+        if (assets < minAssets) revert ClaimSlippage(assets, minAssets);
         _pendingShares -= shares;
         emit WithdrawalClaimed(requestId, r.owner, shares, assets);
     }

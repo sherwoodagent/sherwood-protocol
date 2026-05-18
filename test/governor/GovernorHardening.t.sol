@@ -37,7 +37,7 @@ contract GovernorHardeningTest is Test {
     uint256 constant VOTING_PERIOD = 1 days;
     uint256 constant EXECUTION_WINDOW = 1 days;
     uint256 constant VETO_THRESHOLD_BPS = 4000;
-    uint256 constant MAX_PERF_FEE_BPS = 3000;
+    uint256 constant MAX_PERF_FEE_BPS = 1500;
     uint256 constant COOLDOWN_PERIOD = 1 days;
 
     function setUp() public {
@@ -142,7 +142,7 @@ contract GovernorHardeningTest is Test {
 
         vm.prank(leadAgent);
         proposalId =
-            governor.propose(address(vault), address(0), "ipfs://gh2", 2000, 7 days, _execCalls(), _settleCalls(), cps);
+            governor.propose(address(vault), address(0), "ipfs://gh2", 1000, 7 days, _execCalls(), _settleCalls(), cps);
     }
 
     /// @dev Create a 2-party collab: lead + 1 co-prop to land in Draft quickly.
@@ -151,7 +151,7 @@ contract GovernorHardeningTest is Test {
         cps[0] = ISyndicateGovernor.CoProposer({agent: co1, splitBps: 3000});
         vm.prank(leadAgent);
         proposalId = governor.propose(
-            address(vault), address(0), "ipfs://draft", 2000, 7 days, _execCalls(), _settleCalls(), cps
+            address(vault), address(0), "ipfs://draft", 1000, 7 days, _execCalls(), _settleCalls(), cps
         );
     }
 
@@ -211,7 +211,7 @@ contract GovernorHardeningTest is Test {
             address(vault),
             address(0),
             "ipfs://snap",
-            2000,
+            1500,
             7 days,
             _execCalls(),
             _settleCalls(),
@@ -241,6 +241,60 @@ contract GovernorHardeningTest is Test {
         assertEq(p.vetoThresholdBps, VETO_THRESHOLD_BPS);
     }
 
+    // ==================== SHERLOCK #14 — DRAFT TIMING SNAPSHOT ====================
+
+    /// @notice Sherlock #14 — for COLLABORATIVE proposals, `votingPeriod` and
+    ///         `executionWindow` are snapshotted at propose-time. A mid-Draft
+    ///         owner change to `_params.votingPeriod` must NOT shrink the
+    ///         vote-end window for co-proposers who already agreed under the
+    ///         original timing.
+    function test_votingPeriod_snapshotAtPropose_collaborative() public {
+        _depositLps();
+
+        // Open a 2-party collab Draft under the current VOTING_PERIOD.
+        uint256 originalVotingPeriod = governor.getGovernorParams().votingPeriod;
+        uint256 proposalId = _create2PartyCollab();
+
+        // Owner shrinks votingPeriod mid-Draft (worst case: 1 hour MIN).
+        vm.prank(owner);
+        governor.setVotingPeriod(1 hours);
+        assertEq(governor.getGovernorParams().votingPeriod, 1 hours);
+
+        // Co-proposer approves → all-approved → Draft transitions to Pending.
+        // The snapshot must drive voteEnd, NOT the new 1-hour value.
+        uint256 transitionTs = vm.getBlockTimestamp() + 1;
+        vm.warp(transitionTs);
+        vm.prank(co1);
+        governor.approveCollaboration(proposalId);
+
+        ISyndicateGovernor.StrategyProposal memory p = governor.getProposal(proposalId);
+        assertEq(uint256(p.state), uint256(ISyndicateGovernor.ProposalState.Pending), "transitioned to Pending");
+        // voteEnd was set from the propose-time snapshot, not the live 1-hour.
+        assertEq(p.voteEnd, transitionTs + originalVotingPeriod, "voteEnd uses snapshot, not live param");
+    }
+
+    /// @notice Sherlock #14 — same for `executionWindow`. A mid-Draft owner
+    ///         shrink of `_params.executionWindow` must not compress the
+    ///         executeBy deadline for co-proposers who approved earlier.
+    function test_executionWindow_snapshotAtPropose_collaborative() public {
+        _depositLps();
+        uint256 originalExecutionWindow = governor.getGovernorParams().executionWindow;
+        uint256 proposalId = _create2PartyCollab();
+
+        // Owner shrinks executionWindow mid-Draft (MIN_EXECUTION_WINDOW = 1h).
+        vm.prank(owner);
+        governor.setExecutionWindow(1 hours);
+
+        uint256 transitionTs = vm.getBlockTimestamp() + 1;
+        vm.warp(transitionTs);
+        vm.prank(co1);
+        governor.approveCollaboration(proposalId);
+
+        ISyndicateGovernor.StrategyProposal memory p = governor.getProposal(proposalId);
+        // executeBy = reviewEnd + originalExecutionWindow (snapshotted).
+        assertEq(p.executeBy, p.reviewEnd + originalExecutionWindow, "executeBy uses snapshot, not live param");
+    }
+
     // ==================== FIX 3 — G-H4 ====================
 
     /// @notice When totalSupply is 0 at snapshot time, the veto threshold would
@@ -254,7 +308,7 @@ contract GovernorHardeningTest is Test {
             address(vault),
             address(0),
             "ipfs://empty",
-            2000,
+            1500,
             7 days,
             _execCalls(),
             _settleCalls(),
@@ -308,6 +362,27 @@ contract GovernorHardeningTest is Test {
         assertEq(uint256(p.state), uint256(ISyndicateGovernor.ProposalState.Cancelled));
     }
 
+    /// @notice Sherlock run #1 finding #7 — lead MUST be able to cancel a
+    ///         Draft with a single co-proposer. Pre-fix, the near-quorum
+    ///         guard `_approvedCount + 1 >= total` evaluated true at Draft
+    ///         creation (0 + 1 >= 1), trapping the lead in an unwanted
+    ///         proposal until the collaboration window expired.
+    function test_cancelProposal_Draft_singleCoProposer_leadCanCancel() public {
+        uint256 proposalId = _create2PartyCollab();
+
+        // No approvals yet from co1. Pre-fix, this reverted with
+        // CancelNotAllowedNearQuorum because total=1 and 0+1>=1.
+        vm.prank(leadAgent);
+        governor.cancelProposal(proposalId);
+
+        ISyndicateGovernor.StrategyProposal memory p = governor.getProposal(proposalId);
+        assertEq(
+            uint256(p.state),
+            uint256(ISyndicateGovernor.ProposalState.Cancelled),
+            "Sherlock #7: single-co-prop Draft cancellable by lead"
+        );
+    }
+
     // (remaining tests for G-H3, G-H4, G-H6 appended in later commits)
 
     // ==================== G-M7 — emergencyCancel rejects terminal states ====================
@@ -319,7 +394,7 @@ contract GovernorHardeningTest is Test {
             address(vault),
             address(0),
             "ipfs://term",
-            2000,
+            1500,
             7 days,
             _execCalls(),
             _settleCalls(),
@@ -419,7 +494,7 @@ contract GovernorHardeningTest is Test {
             address(vault),
             address(0),
             "ipfs://big",
-            2000,
+            1500,
             7 days,
             oversized,
             _settleCalls(),
@@ -438,7 +513,7 @@ contract GovernorHardeningTest is Test {
             address(vault),
             address(0),
             "ipfs://big",
-            2000,
+            1500,
             7 days,
             _execCalls(),
             oversized,
@@ -465,7 +540,7 @@ contract GovernorHardeningTest is Test {
             address(vault),
             address(0),
             string(tooLong),
-            2000,
+            1000,
             7 days,
             _execCalls(),
             _settleCalls(),
@@ -490,7 +565,7 @@ contract GovernorHardeningTest is Test {
             address(vault),
             address(0),
             "ipfs://dup",
-            2000,
+            1500,
             7 days,
             _execCalls(),
             _settleCalls(),
@@ -498,39 +573,30 @@ contract GovernorHardeningTest is Test {
         );
     }
 
-    /// @notice G-M1: `approveCollaboration` must revert the Draft -> Pending
-    ///         transition if the vault has another non-terminal proposal.
-    ///         The Draft itself stays alive so it can re-transition later.
-    function test_approveCollaboration_revertsIfVaultHasPending() public {
+    /// @notice Sherlock #8: under the new "Draft binds vault" semantics,
+    ///         the G-M1 vault-has-pending case now reverts at `propose()`
+    ///         time, not later at `approveCollaboration`. The vault simply
+    ///         can't have two simultaneous open proposals (Draft or Pending).
+    function test_propose_revertsWhenVaultHasDraft() public {
         _depositLps();
 
-        // Stage a Draft (lead + 1 co-prop) BEFORE the blocking Pending exists.
-        // Draft doesn't bump openProposalCount.
         ISyndicateGovernor.CoProposer[] memory cps = new ISyndicateGovernor.CoProposer[](1);
         cps[0] = ISyndicateGovernor.CoProposer({agent: co1, splitBps: 3000});
         vm.prank(leadAgent);
-        uint256 draftId = governor.propose(
-            address(vault), address(0), "ipfs://draft", 2000, 7 days, _execCalls(), _settleCalls(), cps
-        );
+        governor.propose(address(vault), address(0), "ipfs://draft", 1000, 7 days, _execCalls(), _settleCalls(), cps);
 
-        // Create a separate solo Pending that bumps the counter to 1.
-        // Use a fresh agent — the lead is already attached to draftId.
+        // Vault already has a counted Draft — a second propose reverts.
         vm.prank(co2);
+        vm.expectRevert(ISyndicateGovernor.VaultHasOpenProposal.selector);
         governor.propose(
             address(vault),
             address(0),
             "ipfs://pending",
-            2000,
+            1500,
             7 days,
             _execCalls(),
             _settleCalls(),
             new ISyndicateGovernor.CoProposer[](0)
         );
-
-        // The final co-prop approve would flip draftId to Pending, but the
-        // G-M1 guard blocks it.
-        vm.prank(co1);
-        vm.expectRevert(ISyndicateGovernor.VaultHasOpenProposal.selector);
-        governor.approveCollaboration(draftId);
     }
 }

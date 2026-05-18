@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import {Test} from "forge-std/Test.sol";
 import {WoodToken} from "../src/WoodToken.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {ERC20Votes} from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Votes.sol";
 
 /// @title WoodDelegationToken — smoke tests for WOOD's ERC20Votes extension
@@ -10,12 +11,11 @@ import {ERC20Votes} from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Vo
 ///         - basic ERC20 transfers + permit
 ///         - ERC20Votes delegation + getPastVotes
 ///         - timestamp-based clock (overridden from default block-number)
-///         - minter restriction + 1B supply cap
+///         - owner-restricted mint + 1B supply cap
 contract WoodDelegationTokenTest is Test {
     WoodToken public wood;
 
     address public delegate_ = makeAddr("delegate");
-    address public minter = makeAddr("minter");
     address public alice = makeAddr("alice");
     address public bob = makeAddr("bob");
     address public carol = makeAddr("carol");
@@ -25,17 +25,17 @@ contract WoodDelegationTokenTest is Test {
 
     function setUp() public {
         endpoint = new MockEndpoint();
-        wood = new WoodToken(address(endpoint), delegate_, minter);
+        wood = new WoodToken(address(endpoint), delegate_);
     }
 
     // ── Basic ERC20 + mint cap ──
 
-    function test_mint_onlyMinter() public {
-        vm.expectRevert(WoodToken.OnlyMinter.selector);
+    function test_mint_onlyOwner() public {
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
         vm.prank(alice);
         wood.mint(alice, 1e18);
 
-        vm.prank(minter);
+        vm.prank(delegate_);
         uint256 minted = wood.mint(alice, 1e18);
         assertEq(minted, 1e18);
         assertEq(wood.balanceOf(alice), 1e18);
@@ -43,17 +43,17 @@ contract WoodDelegationTokenTest is Test {
 
     function test_mint_capsAtMaxSupply() public {
         uint256 maxSupply = wood.MAX_SUPPLY();
-        vm.prank(minter);
+        vm.prank(delegate_);
         wood.mint(alice, maxSupply);
         assertEq(wood.totalSupply(), maxSupply);
 
-        vm.prank(minter);
+        vm.prank(delegate_);
         uint256 minted = wood.mint(bob, 1e18);
         assertEq(minted, 0, "no-op mint past cap");
     }
 
     function test_transfer_works() public {
-        vm.prank(minter);
+        vm.prank(delegate_);
         wood.mint(alice, 100e18);
 
         vm.prank(alice);
@@ -66,7 +66,7 @@ contract WoodDelegationTokenTest is Test {
     // ── ERC20Votes delegation ──
 
     function test_delegation_routesVotes() public {
-        vm.prank(minter);
+        vm.prank(delegate_);
         wood.mint(alice, 1000e18);
 
         assertEq(wood.getVotes(alice), 0, "no votes until delegation");
@@ -80,7 +80,7 @@ contract WoodDelegationTokenTest is Test {
     }
 
     function test_delegation_selfDelegateActivatesVotes() public {
-        vm.prank(minter);
+        vm.prank(delegate_);
         wood.mint(alice, 500e18);
         vm.prank(alice);
         wood.delegate(alice);
@@ -88,7 +88,7 @@ contract WoodDelegationTokenTest is Test {
     }
 
     function test_delegation_checkpointsByTimestamp() public {
-        vm.prank(minter);
+        vm.prank(delegate_);
         wood.mint(alice, 1000e18);
         vm.prank(alice);
         wood.delegate(bob);
@@ -116,7 +116,7 @@ contract WoodDelegationTokenTest is Test {
     }
 
     function test_votesFollowTransfers() public {
-        vm.prank(minter);
+        vm.prank(delegate_);
         wood.mint(alice, 1000e18);
         vm.prank(alice);
         wood.delegate(bob);

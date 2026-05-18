@@ -67,6 +67,13 @@ contract HyperliquidGridStrategy is BaseStrategy {
     error AlreadyFinalized();
     error NotAuthorized();
 
+    /// @notice Sherlock run #1 finding #23 — `_settle` refuses to push to the
+    ///         vault until `initiateReturn()` has run in an earlier block.
+    ///         HC bridge is async: same-block drain+push would settle a near-
+    ///         zero balance and the proposal would record a total loss while
+    ///         the actual USDC arrives in N+1 as a windfall for the next LPs.
+    error ReturnsNotInitiated();
+
     // ── Action types ──
     uint8 constant ACTION_PLACE_GRID = 1;
     uint8 constant ACTION_CANCEL_ALL = 2;
@@ -303,11 +310,25 @@ contract HyperliquidGridStrategy is BaseStrategy {
     ///      that re-uses cloids does not corrupt the index map. NO_CLOID (0) is
     ///      the HL "no client id" sentinel and is intentionally untracked — only
     ///      cloids the keeper can later cancel are worth remembering.
+    ///      Sherlock #40: cap per-asset cloid count. Pre-fix, `_liveCloids[ai]`
+    ///      grew unbounded across grid lifetime (filled / cancelled cloids
+    ///      had no on-chain fill events to drive `_untrackCloid`). After
+    ///      enough operations, `_cancelAllTrackedOrders` (called from
+    ///      `_drainHC`) iterated past the block-gas limit and bricked
+    ///      `settle` / `initiateReturn` / `recoverHcResiduals`. Cap at
+    ///      MAX_TRACKED_CLOIDS so the keeper must explicitly cancel and
+    ///      untrack to make room.
+    uint256 internal constant MAX_TRACKED_CLOIDS = 500;
+
+    error TooManyTrackedCloids(uint32 ai);
+
     function _trackCloid(uint32 ai, uint128 cloid) internal {
         if (cloid == NO_CLOID) return;
         if (_liveCloidIndex[ai][cloid] != 0) return;
-        _liveCloids[ai].push(cloid);
-        _liveCloidIndex[ai][cloid] = _liveCloids[ai].length;
+        uint128[] storage arr = _liveCloids[ai];
+        if (arr.length >= MAX_TRACKED_CLOIDS) revert TooManyTrackedCloids(ai);
+        arr.push(cloid);
+        _liveCloidIndex[ai][cloid] = arr.length;
     }
 
     /// @dev Tolerant of unknown cloids (no-op) so the on-chain mirror stays in
@@ -327,13 +348,14 @@ contract HyperliquidGridStrategy is BaseStrategy {
         delete _liveCloidIndex[ai][cloid];
     }
 
-    /// @notice TWO-PATH SETTLEMENT — Path 2 (governor-called).
+    /// @notice TWO-STEP SETTLEMENT — push-EVM-USDC half (governor-called).
     ///
-    ///         If `initiateReturn()` was NOT called pre-settle, fall back to
-    ///         a defensive in-call HC drain (same actions, same block — but
-    ///         the EVM USDC won't be available to push to vault until HC
-    ///         processes the bridges in the next block, so vault.totalAssets
-    ///         will under-report). The recommended flow is:
+    ///         Settle is now strictly the second half of a two-step exit
+    ///         (Sherlock run #1 finding #23): the HC drain must have run in
+    ///         an earlier block via `initiateReturn()`, and the bridged USDC
+    ///         must have arrived on the strategy's EVM address. `_settle`
+    ///         then pushes that USDC to the vault and marks the strategy
+    ///         `Settled`. The expected flow:
     ///
     ///           Block N: proposer (or anyone after duration) calls
     ///                    `initiateReturn()` — queues HC drain.
@@ -343,15 +365,15 @@ contract HyperliquidGridStrategy is BaseStrategy {
     ///                       strategy.settle() → `_pushAllToVault` correctly
     ///                       reports the realized NAV.
     ///
-    /// @dev    If proposer never called `initiateReturn()` and `_settle()`
-    ///         drains in the same block, push 0 to the vault (HC bridge is
-    ///         async). `sweepToVault()` recovers the USDC once HC delivers.
+    /// @dev    The pre-#23 path-2 "defensive in-call HC drain inside `_settle`
+    ///         when path 1 was skipped" is gone — it caused a phantom total
+    ///         loss whenever the governor settled before HC bridged (the
+    ///         drain queued, balance still zero, settle pushed near-nothing,
+    ///         late HC arrivals later credited new depositors). Now if
+    ///         `returnsInitiated == false` at settle-time, we revert with
+    ///         `ReturnsNotInitiated` rather than corrupt PnL.
     function _settle() internal override {
-        if (!returnsInitiated) {
-            _drainHC();
-            returnsInitiated = true;
-            emit ReturnsInitiated();
-        }
+        if (!returnsInitiated) revert ReturnsNotInitiated();
 
         // Push current EVM USDC balance to the vault. Covers two cases:
         //   - HC registration failed: USDC never bridged, sits on EVM here.
@@ -397,15 +419,26 @@ contract HyperliquidGridStrategy is BaseStrategy {
             if (block.timestamp < p.executedAt + p.strategyDuration) revert NotAuthorized();
         }
 
-        _drainHC();
+        // PR #324 review R1: flip `returnsInitiated` BEFORE `_drainHC()`. If
+        // the drain reverts (precompile failure / oracle staleness /
+        // cancellation loop near the block gas limit), the revert bubbles
+        // and rolls back this write too — so the proposer can retry. Pre-
+        // fix order (drain first, flag after) had no observable difference
+        // on success but, on revert, the flag stayed in the half-state on
+        // a SUCCESSFUL drain that ran out of gas in the middle of its
+        // cancellation loop — leaving `_settle` reverting forever with
+        // ReturnsNotInitiated and no recovery path. Flipping the flag
+        // first preserves the idempotency guarantee (re-call after a
+        // successful previous call is still a no-op via the early return).
         returnsInitiated = true;
         emit ReturnsInitiated();
+        _drainHC();
     }
 
     /// @dev Cancel resting orders, force-close all positions, and queue
-    ///      perp→spot + spot→EVM bridges. Three callers:
-    ///      - `initiateReturn` (path 1, proposer pre-settle)
-    ///      - `_settle` (path 2 defensive fallback when path 1 was skipped)
+    ///      perp→spot + spot→EVM bridges. Two callers (Sherlock #23 dropped
+    ///      the in-call `_settle` fallback):
+    ///      - `initiateReturn` (proposer / duration-elapsed pre-settle)
     ///      - `recoverHcResiduals` (post-settle retry for HC residuals)
     function _drainHC() internal {
         for (uint256 i = 0; i < assetIndices.length; i++) {
@@ -504,11 +537,16 @@ contract HyperliquidGridStrategy is BaseStrategy {
             AccountMarginSummary memory s = abi.decode(ret, (AccountMarginSummary));
             preDrainAccountValue = s.accountValue;
             if (s.accountValue > 0) {
-                int64 freeMargin = s.accountValue - int64(s.marginUsed);
-                if (freeMargin > 0) {
-                    perpToSpot = uint64(freeMargin);
-                    L1Write.sendUsdClassTransfer(perpToSpot, false);
-                }
+                // Sherlock #26: transfer full pre-drain account value, not
+                // free-margin. The precompile read is pre-block; HC's
+                // batch processor closes the queued force-close orders
+                // BEFORE the class transfer in the same batch, releasing
+                // `marginUsed` back into free margin in time for the
+                // transfer to succeed. Subtracting marginUsed stranded
+                // that amount on the perp account, requiring a manual
+                // recoverHcResiduals to retrieve.
+                perpToSpot = uint64(s.accountValue);
+                L1Write.sendUsdClassTransfer(perpToSpot, false);
             }
         }
 
@@ -649,10 +687,12 @@ contract HyperliquidGridStrategy is BaseStrategy {
         uint256 evmBal = IERC20(asset).balanceOf(address(this));
         uint256 observable = perpVal + spotVal + evmBal;
 
-        if (observable + HyperliquidBridge.CORE_ACCOUNT_FEE_TOLERANCE >= inFlightToHc) {
-            return (observable, true);
-        }
-        return (inFlightToHc, true);
+        // Sherlock #55: drop the `inFlightToHc` high-water-mark fallback.
+        // Same root cause as the perp strategy (#22): the HWM never
+        // decremented, so realized grid losses (adverse fills, funding)
+        // were masked — NAV stayed inflated, new LPs minted cheap shares,
+        // remaining LPs diluted. Honest observable-only is correct.
+        return (observable, true);
     }
 
     /// @notice Move all HC spot USDC to perp margin via class transfer.

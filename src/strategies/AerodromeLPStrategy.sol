@@ -6,7 +6,8 @@ import {IStrategy} from "../interfaces/IStrategy.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
-/// @notice Minimal Aerodrome Router interface (addLiquidity / removeLiquidity)
+/// @notice Minimal Aerodrome Router interface (addLiquidity / removeLiquidity /
+///         swap — Sherlock #30 reward-conversion path).
 interface IAeroRouter {
     function addLiquidity(
         address tokenA,
@@ -30,6 +31,21 @@ interface IAeroRouter {
         address to,
         uint256 deadline
     ) external returns (uint256 amountA, uint256 amountB);
+
+    struct Route {
+        address from;
+        address to;
+        bool stable;
+        address factory;
+    }
+
+    function swapExactTokensForTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        Route[] calldata routes,
+        address to,
+        uint256 deadline
+    ) external returns (uint256[] memory amounts);
 }
 
 /// @notice Minimal Aerodrome Gauge interface (deposit / withdraw / getReward)
@@ -67,6 +83,18 @@ contract AerodromeLPStrategy is BaseStrategy {
     // ── Errors ──
     error InvalidAmount();
     error GaugeMismatch();
+    /// @notice Sherlock #30 — `rewardSwapTarget` must be one of {tokenA,
+    ///         tokenB, address(0)}. Any other value is rejected at init
+    ///         because the AERO swap would push a token the vault can't
+    ///         account for at settle.
+    error InvalidRewardSwapTarget();
+
+    // ── Events ──
+    /// @notice Sherlock #30 — emitted when the post-settle AERO→target swap
+    ///         reverts (e.g. AERO/target pool depth, slippage). The unswapped
+    ///         AERO is then pushed to the vault as-is; off-chain treats this
+    ///         as a strategy-loss flag for that proposal.
+    event AeroRewardSwapFailed(uint256 rewardAmount);
 
     // ── Storage (per-clone) ──
     address public tokenA;
@@ -84,6 +112,20 @@ contract AerodromeLPStrategy is BaseStrategy {
 
     uint256 public minAmountAOut; // min tokenA on remove (slippage)
     uint256 public minAmountBOut; // min tokenB on remove (slippage)
+
+    /// @notice Sherlock #30 — target token for the post-settle AERO→X swap.
+    ///         Must be tokenA, tokenB, or `address(0)` (no swap; pre-fix
+    ///         behaviour where AERO is pushed to the vault as-is).
+    address public rewardSwapTarget;
+
+    /// @notice Pool type for the AERO→target swap (stable vs volatile).
+    bool public rewardSwapStable;
+
+    /// @notice Slippage floor as a 1e18-scaled rate: min target tokens per
+    ///         1e18 AERO. Mirrors the WstETHMoonwellStrategy slippage
+    ///         pattern. Validated > 0 at init only if `rewardSwapTarget !=
+    ///         address(0)`.
+    uint256 public rewardSwapMinOutPerAero;
 
     /// @inheritdoc IStrategy
     function name() external pure returns (string memory) {
@@ -105,6 +147,10 @@ contract AerodromeLPStrategy is BaseStrategy {
         uint256 amountBMin;
         uint256 minAmountAOut;
         uint256 minAmountBOut;
+        // Sherlock #30 — optional AERO→tokenA/tokenB swap at settle.
+        address rewardSwapTarget; // address(0) = no swap; else must be tokenA or tokenB
+        bool rewardSwapStable;
+        uint256 rewardSwapMinOutPerAero; // 1e18-scaled rate; required when target != 0
     }
 
     /// @notice Decode: InitParams struct
@@ -114,14 +160,27 @@ contract AerodromeLPStrategy is BaseStrategy {
         if (p.tokenA == address(0) || p.tokenB == address(0)) revert ZeroAddress();
         if (p.router == address(0) || p.lpToken == address(0)) revert ZeroAddress();
         if (p.amountADesired == 0 && p.amountBDesired == 0) revert InvalidAmount();
-        // Require at least one execute-side slippage min so addLiquidity is sandwich-resistant.
-        if (p.amountAMin == 0 && p.amountBMin == 0) revert InvalidAmount();
-        // Require at least one settlement slippage param to prevent sandwich attacks
-        if (p.minAmountAOut == 0 && p.minAmountBOut == 0) revert InvalidAmount();
+        // Sherlock #31: require BOTH execute-side slippage mins non-zero.
+        // Pre-fix, the gate was `&&` — one side could legally be zero, but
+        // Aerodrome's router enforces slippage independently per token. An
+        // attacker could skew the pool pre-call so the unprotected leg gets
+        // drained to dust while the protected leg passes. Two-sided
+        // protection makes the entire add/remove sandwich-resistant.
+        if (p.amountAMin == 0 || p.amountBMin == 0) revert InvalidAmount();
+        if (p.minAmountAOut == 0 || p.minAmountBOut == 0) revert InvalidAmount();
 
         // If gauge is set, verify its staking token matches the LP
         if (p.gauge != address(0)) {
             if (IAeroGauge(p.gauge).stakingToken() != p.lpToken) revert GaugeMismatch();
+        }
+
+        // Sherlock #30: reward-swap target must be one of the LP legs
+        // (otherwise the swap output would be a token the vault doesn't
+        // know how to account for). Empty target = legacy behaviour
+        // (push AERO as-is, vault treats as loss).
+        if (p.rewardSwapTarget != address(0)) {
+            if (p.rewardSwapTarget != p.tokenA && p.rewardSwapTarget != p.tokenB) revert InvalidRewardSwapTarget();
+            if (p.rewardSwapMinOutPerAero == 0) revert InvalidAmount();
         }
 
         tokenA = p.tokenA;
@@ -137,6 +196,9 @@ contract AerodromeLPStrategy is BaseStrategy {
         amountBMin = p.amountBMin;
         minAmountAOut = p.minAmountAOut;
         minAmountBOut = p.minAmountBOut;
+        rewardSwapTarget = p.rewardSwapTarget;
+        rewardSwapStable = p.rewardSwapStable;
+        rewardSwapMinOutPerAero = p.rewardSwapMinOutPerAero;
     }
 
     /// @notice Pull tokens from vault, add liquidity, optionally stake LP
@@ -209,11 +271,41 @@ contract AerodromeLPStrategy is BaseStrategy {
                 );
         }
 
-        // Push everything back to vault
+        // Sherlock #30: if a reward-swap target was configured, swap the
+        // claimed AERO into the target leg (tokenA or tokenB) BEFORE
+        // pushing tokens back. This avoids handing the vault an asset
+        // it can't price into PnL (asset-only accounting at settle would
+        // otherwise treat the AERO as a loss). Fail-soft: swap revert
+        // falls through to the legacy `_pushAllToVault(rewardToken)`
+        // below, emitting `AeroRewardSwapFailed` so the off-chain
+        // tracker flags the proposal.
+        if (gauge != address(0) && rewardSwapTarget != address(0)) {
+            address rewardToken = IAeroGauge(gauge).rewardToken();
+            uint256 rewardBal = IERC20(rewardToken).balanceOf(address(this));
+            if (rewardBal > 0) {
+                uint256 minOut = (rewardBal * rewardSwapMinOutPerAero) / 1e18;
+                IERC20(rewardToken).forceApprove(router, rewardBal);
+                IAeroRouter.Route[] memory routes = new IAeroRouter.Route[](1);
+                routes[0] = IAeroRouter.Route({
+                    from: rewardToken, to: rewardSwapTarget, stable: rewardSwapStable, factory: factory
+                });
+                try IAeroRouter(router)
+                    .swapExactTokensForTokens(rewardBal, minOut, routes, address(this), block.timestamp) {}
+                catch {
+                    emit AeroRewardSwapFailed(rewardBal);
+                }
+            }
+        }
+
+        // Push everything back to vault. If the AERO swap succeeded the
+        // converted proceeds are now in tokenA or tokenB's balance and
+        // get pushed via the lines below. Any residual AERO (or all of
+        // it if the swap reverted) is pushed by the legacy line.
         _pushAllToVault(tokenA);
         _pushAllToVault(tokenB);
 
-        // Push AERO rewards to vault if any
+        // Push AERO rewards to vault if any (dust on swap success, or full
+        // amount on swap failure / when no target was configured).
         if (gauge != address(0)) {
             address rewardToken = IAeroGauge(gauge).rewardToken();
             _pushAllToVault(rewardToken);

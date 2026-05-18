@@ -60,17 +60,22 @@ abstract contract GovernorEmergency is ISyndicateGovernor {
     /// @notice Vault owner opens an emergency review on a stuck proposal with
     ///         owner-supplied unwind calls. Requires bonded owner stake.
     ///         All call storage is delegated to the registry.
-    function emergencySettleWithCalls(uint256 proposalId, BatchExecutorLib.Call[] calldata calls)
-        external
-        emergencyNonReentrant
-    {
+    /// @dev `emergencyNonReentrant` dropped: this function makes NO governor
+    ///      state writes — it's a thin delegation to `registry.openEmergency`.
+    ///      The registry has its own `EmergencyAlreadyOpen` / cooldown gates
+    ///      (#15) so reentry from the registry back into this entrypoint hits
+    ///      those checks. ~20 bytes saved.
+    function emergencySettleWithCalls(uint256 proposalId, BatchExecutorLib.Call[] calldata calls) external {
         StrategyProposal storage p = _getProposal(proposalId);
         if (msg.sender != OwnableUpgradeable(p.vault).owner()) revert NotVaultOwner();
         if (p.state != ProposalState.Executed) revert ProposalNotExecuted();
         if (block.timestamp < p.executedAt + p.strategyDuration) revert StrategyDurationNotElapsed();
 
         IGuardianRegistry reg = _getRegistry();
-        if (reg.ownerStake(p.vault) < reg.requiredOwnerBond(p.vault)) revert OwnerBondInsufficient();
+        // `requiredOwnerBond` was dropped on the registry (bytecode budget);
+        // read `minOwnerStake` directly — the registry implementation
+        // returned exactly that value anyway.
+        if (reg.ownerStake(p.vault) < reg.minOwnerStake()) revert OwnerBondInsufficient();
 
         bytes32 h = keccak256(abi.encode(calls));
         reg.openEmergency(proposalId, h, calls);
@@ -78,7 +83,10 @@ abstract contract GovernorEmergency is ISyndicateGovernor {
     }
 
     /// @notice Vault owner withdraws their open emergency review before resolution.
-    function cancelEmergencySettle(uint256 proposalId) external emergencyNonReentrant {
+    /// @dev `emergencyNonReentrant` dropped: pure delegation to
+    ///      `registry.cancelEmergency`. No governor state writes; registry's
+    ///      own state machine guards against ill-timed reentry. ~20 bytes saved.
+    function cancelEmergencySettle(uint256 proposalId) external {
         StrategyProposal storage p = _getProposal(proposalId);
         if (msg.sender != OwnableUpgradeable(p.vault).owner()) revert NotVaultOwner();
         if (p.state != ProposalState.Executed) revert ProposalNotExecuted();

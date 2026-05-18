@@ -98,25 +98,10 @@ contract GuardianRegistryCommissionTest is Test {
         assertEq(vm.getRecordedLogs().length, 0);
     }
 
-    function test_commissionAt_returnsHistoricalValue() public {
-        vm.prank(delegate_);
-        registry.setCommission(500);
-        uint256 t1 = vm.getBlockTimestamp();
-
-        vm.warp(vm.getBlockTimestamp() + EPOCH_DURATION);
-        vm.prank(delegate_);
-        registry.setCommission(1000);
-        uint256 t2 = vm.getBlockTimestamp();
-
-        vm.warp(vm.getBlockTimestamp() + 1);
-
-        assertEq(registry.commissionAt(delegate_, t1), 500, "rate at t1 = 500");
-        assertEq(registry.commissionAt(delegate_, t2), 1000, "rate at t2 = 1000");
-    }
-
-    function test_commissionAt_zeroForUnsetDelegate() public view {
-        assertEq(registry.commissionAt(delegate_, vm.getBlockTimestamp()), 0);
-    }
+    // `test_commissionAt_*` tests dropped: `commissionAt` external view was
+    // removed in the registry bytecode-trim commit to make room for
+    // Sherlock #44/#45 fixes. Historical lookups stream off `CommissionSet`
+    // events. The `commissionOf` (current value) view is retained.
 
     function test_setCommission_cumulativeRaiseLimitBlocksChaining() public {
         // First-ever set (rate announcement): 300. No rate limit.

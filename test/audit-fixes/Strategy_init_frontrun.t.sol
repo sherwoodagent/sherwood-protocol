@@ -71,9 +71,13 @@ contract StrategyInitFrontrunTest is Test {
             amountADesired: 1e18,
             amountBDesired: 1e18,
             amountAMin: 1,
-            amountBMin: 0,
+            amountBMin: 1,
             minAmountAOut: 1,
-            minAmountBOut: 0
+            minAmountBOut: 1,
+            // Sherlock #30: no reward-swap target — legacy behaviour.
+            rewardSwapTarget: address(0),
+            rewardSwapStable: false,
+            rewardSwapMinOutPerAero: 0
         });
 
         vm.prank(attacker);
@@ -95,9 +99,13 @@ contract StrategyInitFrontrunTest is Test {
             amountADesired: 1e18,
             amountBDesired: 1e18,
             amountAMin: 1,
-            amountBMin: 0,
+            amountBMin: 1,
             minAmountAOut: 1,
-            minAmountBOut: 0
+            minAmountBOut: 1,
+            // Sherlock #30: no reward-swap target — legacy behaviour.
+            rewardSwapTarget: address(0),
+            rewardSwapStable: false,
+            rewardSwapMinOutPerAero: 0
         });
 
         AerodromeLPStrategy(clone).initialize(vault, proposer, abi.encode(p));
@@ -116,8 +124,19 @@ contract StrategyInitFrontrunTest is Test {
         extra[0] = "";
         uint8[] memory priceDecs = new uint8[](1);
         priceDecs[0] = 18;
+        bytes32[] memory feedIds = new bytes32[](1);
+        feedIds[0] = keccak256("test.feed.tokenA");
         bytes memory initData = abi.encode(
-            stubToken, makeAddr("adapter"), address(0), tokens, weights, uint256(1e6), uint256(100), extra, priceDecs
+            stubToken,
+            makeAddr("adapter"),
+            address(0),
+            tokens,
+            weights,
+            uint256(1e6),
+            uint256(100),
+            extra,
+            priceDecs,
+            feedIds
         );
 
         vm.prank(attacker);
@@ -141,8 +160,19 @@ contract StrategyInitFrontrunTest is Test {
         extra[0] = "";
         uint8[] memory priceDecs = new uint8[](1);
         priceDecs[0] = 18;
+        bytes32[] memory feedIds = new bytes32[](1);
+        feedIds[0] = keccak256("test.feed.tokenA");
         bytes memory initData = abi.encode(
-            stubToken, makeAddr("adapter"), address(0), tokens, weights, uint256(1e6), uint256(100), extra, priceDecs
+            stubToken,
+            makeAddr("adapter"),
+            address(0),
+            tokens,
+            weights,
+            uint256(1e6),
+            uint256(100),
+            extra,
+            priceDecs,
+            feedIds
         );
 
         PortfolioStrategy(clone).initialize(vault, proposer, initData);

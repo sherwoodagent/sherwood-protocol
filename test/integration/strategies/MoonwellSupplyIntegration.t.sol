@@ -49,7 +49,7 @@ contract MoonwellSupplyIntegrationTest is BaseIntegrationTest {
     /// @dev Deploy, init, propose, vote, and execute a Moonwell strategy in one shot.
     ///      Returns the strategy clone address and proposal ID.
     function _deployAndExecute() internal returns (address strategy, uint256 proposalId) {
-        bytes memory initData = abi.encode(USDC, MOONWELL_MUSDC, SUPPLY_AMOUNT, MIN_REDEEM);
+        bytes memory initData = abi.encode(USDC, MOONWELL_MUSDC, SUPPLY_AMOUNT, MIN_REDEEM, false);
         strategy = _cloneAndInit(moonwellTemplate, initData);
 
         BatchExecutorLib.Call[] memory execCalls = _buildExecCalls(strategy);
@@ -117,14 +117,28 @@ contract MoonwellSupplyIntegrationTest is BaseIntegrationTest {
     }
 
     /// @notice Redemptions (withdrawals) should be blocked while a strategy is active.
+    /// @dev This test exercises the QUEUE-ONLY proposal path
+    ///      (`_proposeVoteExecute` passes `strategy = address(0)` at propose
+    ///      time). The vault therefore has NO live-NAV adapter bound
+    ///      through `governor.getProposal(pid).strategy` and the
+    ///      partial-unwind path is unavailable regardless of whether the
+    ///      strategy template implements `_onLiveWithdraw`. The
+    ///      live-NAV-aware withdraw path is covered by
+    ///      `MoonwellLiveNAVIntegrationTest`.
     function test_moonwell_redemptionLocked() public {
         (, uint256 proposalId) = _deployAndExecute();
 
-        // Redemptions should be locked during active strategy
+        // Redemptions are semantically locked: `redemptionsLocked()` returns
+        // true AND `_lpFlowGate` returns `blocked=true` because adapter=0
+        // (the queue-only proposal). `maxWithdraw` therefore clamps to 0
+        // and OZ ERC4626 reverts with `ERC4626ExceededMaxWithdraw` at the
+        // entrypoint (before reaching `_withdraw`'s `RedemptionsLocked`
+        // gate — same security outcome, different revert symbol).
         assertTrue(vault.redemptionsLocked(), "redemptions should be locked during strategy");
+        assertEq(vault.maxWithdraw(lp1), 0, "maxWithdraw clamped to 0 during locked queue-only proposal");
 
         vm.prank(lp1);
-        vm.expectRevert(ISyndicateVault.RedemptionsLocked.selector);
+        vm.expectRevert();
         vault.withdraw(1_000e6, lp1, lp1);
 
         // Settle the strategy
@@ -180,7 +194,7 @@ contract MoonwellSupplyIntegrationTest is BaseIntegrationTest {
     ///         and grows over time as interest accrues.
     function test_moonwell_positionValue_matchesMoonwellMath() public {
         // Before any execution the value is (0, false).
-        bytes memory initData = abi.encode(USDC, MOONWELL_MUSDC, SUPPLY_AMOUNT, MIN_REDEEM);
+        bytes memory initData = abi.encode(USDC, MOONWELL_MUSDC, SUPPLY_AMOUNT, MIN_REDEEM, false);
         address strategy = _cloneAndInit(moonwellTemplate, initData);
         (uint256 v0, bool valid0) = MoonwellSupplyStrategy(payable(strategy)).positionValue();
         assertEq(v0, 0, "pre-execute value");
@@ -238,18 +252,24 @@ contract MoonwellSupplyIntegrationTest is BaseIntegrationTest {
         vm.stopPrank();
     }
 
-    /// @notice The proposer (agent) can settle immediately without waiting for duration.
+    /// @notice The proposer (agent) can settle early without waiting the full
+    ///         strategyDuration, but the governor still enforces a minimum of
+    ///         `MIN_STRATEGY_DURATION_BEFORE_SELF_SETTLE = 1 hour` to block
+    ///         the single-block execute → self-settle skim attack.
     function test_moonwell_settleByProposer_early() public {
         (, uint256 proposalId) = _deployAndExecute();
 
-        // Agent (proposer) settles immediately -- should succeed
+        // Warp past the proposer self-settle minimum (1 hour). Anyone other
+        // than the proposer still waits for the full `STRATEGY_DURATION`.
+        vm.warp(block.timestamp + 1 hours + 1);
+
         vm.prank(agent);
         governor.settleProposal(proposalId);
 
         assertEq(
             uint256(governor.getProposalState(proposalId)),
             uint256(ISyndicateGovernor.ProposalState.Settled),
-            "proposer should be able to settle early"
+            "proposer can self-settle after the 1-hour skim-block window"
         );
         assertFalse(vault.redemptionsLocked(), "redemptions should be unlocked after early settlement");
     }

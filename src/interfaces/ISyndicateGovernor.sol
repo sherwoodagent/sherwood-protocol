@@ -170,6 +170,10 @@ interface ISyndicateGovernor {
     ///         co-proposer has approved (G-H2). Prevents front-running the
     ///         final approve tx.
     error CancelNotAllowedNearQuorum();
+    /// @notice Sherlock #9 — `rejectCollaboration` is gated to the lead
+    ///         proposer; a co-proposer who disagrees must withhold approval
+    ///         (Draft lapses naturally at the collaboration window).
+    error NotLeadProposer();
     /// @notice Revert when `getVoteWeight` is called on a Draft proposal whose
     ///         snapshotTimestamp hasn't been stamped yet (G-H3). The prior
     ///         silent zero return confused callers who assumed no power.

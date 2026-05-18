@@ -15,6 +15,10 @@ interface ISyndicateVault {
     error NotApprovedDepositor();
     error AgentAlreadyRegistered();
     error AgentNotActive();
+    /// @notice PR #324 review R4 — registering this agent would push
+    ///         `_agentSet.length()` past `MAX_AGENTS_PER_VAULT`. Bound for the
+    ///         `rotateOwnership` deactivation loop.
+    error AgentCapExceeded();
     error InvalidAgentRegistry();
     error NotAgentOwner();
     error NotGovernor();
@@ -36,6 +40,10 @@ interface ISyndicateVault {
     error InsufficientShares();
     error RedemptionsNotLocked();
     error QueueReserveBreached();
+    /// @notice Sherlock #24 — the live adapter rejected an inbound deposit
+    ///         (e.g. its `onLiveDeposit` hook reverted because the upstream
+    ///         pool is paused or at cap). The deposit unwinds atomically.
+    error LiveDepositRejected();
 
     // ── Init Params ──
     struct InitParams {
@@ -66,7 +74,8 @@ interface ISyndicateVault {
     function openDeposits() external view returns (bool);
 
     // ── Views ──
-    function getAgentConfig(address agentAddress) external view returns (AgentConfig memory);
+    // `getAgentConfig` dropped to fit MAX_AGENTS_PER_VAULT cap under
+    // EIP-170. Use `isAgent(addr)` for the auth check.
     function getAgentCount() external view returns (uint256);
     function agentsPaginated(uint256 offset, uint256 limit) external view returns (address[] memory);
     function isAgent(address agentAddress) external view returns (bool);
@@ -136,8 +145,7 @@ interface ISyndicateVault {
     ///         implemented). The assets are now held by the adapter and
     ///         tracked under `liveAdapterPrincipal[proposalId]` so they're
     ///         reclaimed at settle without counting as strategy profit. This
-    ///         is the runtime backstop for adapters that ship without
-    ///         `onLiveDeposit` or whose hook reverts transiently (paused
-    ///         upstream pool, max-deposit cap).
-    event LiveDepositForwardFailed(uint256 indexed proposalId, address indexed adapter, uint256 assets);
+    ///         was the runtime backstop in the fail-soft path. Sherlock #24
+    ///         flipped to hard-revert; event retired, `LiveDepositRejected`
+    ///         carries the diagnostic now.
 }

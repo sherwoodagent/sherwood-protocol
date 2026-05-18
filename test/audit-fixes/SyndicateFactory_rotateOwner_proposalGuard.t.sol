@@ -77,7 +77,7 @@ contract SyndicateFactory_rotateOwner_proposalGuard is Test {
                     votingPeriod: 1 days,
                     executionWindow: 1 days,
                     vetoThresholdBps: 4000,
-                    maxPerformanceFeeBps: 3000,
+                    maxPerformanceFeeBps: 1000,
                     cooldownPeriod: 1 days,
                     collaborationWindow: 48 hours,
                     maxCoProposers: 5,
@@ -161,7 +161,7 @@ contract SyndicateFactory_rotateOwner_proposalGuard is Test {
         vm.warp(block.timestamp + 7 days + 1);
         vm.prank(creator);
         registry.claimUnstakeOwner(vault);
-        assertFalse(registry.hasOwnerStake(vault));
+        assertFalse((registry.ownerStake(vault) > 0));
     }
 
     // ──────────────────────────────────────────────────────────────
@@ -179,11 +179,13 @@ contract SyndicateFactory_rotateOwner_proposalGuard is Test {
         assertEq(governor.getActiveProposal(vault), 0);
         assertEq(governor.openProposalCount(vault), 0);
 
-        vm.prank(owner);
+        // Sherlock #32: rotateOwner is now called by the vault owner (creator)
+        // not the factory owner.
+        vm.prank(creator);
         factory.rotateOwner(vault, newOwner);
 
         assertEq(SyndicateVault(payable(vault)).owner(), newOwner, "vault rotated");
-        assertTrue(registry.hasOwnerStake(vault), "new owner stake bound");
+        assertTrue((registry.ownerStake(vault) > 0), "new owner stake bound");
     }
 
     /// @notice Reverts with `ProposalActive` when `getActiveProposal != 0`.
@@ -207,7 +209,7 @@ contract SyndicateFactory_rotateOwner_proposalGuard is Test {
             abi.encode(uint256(0))
         );
 
-        vm.prank(owner);
+        vm.prank(creator);
         vm.expectRevert(SyndicateFactory.ProposalActive.selector);
         factory.rotateOwner(vault, newOwner);
 
@@ -234,7 +236,7 @@ contract SyndicateFactory_rotateOwner_proposalGuard is Test {
             abi.encode(uint256(1))
         );
 
-        vm.prank(owner);
+        vm.prank(creator);
         vm.expectRevert(SyndicateFactory.ProposalsOpen.selector);
         factory.rotateOwner(vault, newOwner);
 
@@ -266,9 +268,8 @@ contract SyndicateFactory_rotateOwner_proposalGuard is Test {
             abi.encode(uint256(99))
         );
 
-        vm.prank(owner);
+        vm.prank(creator);
         vm.expectRevert(SyndicateFactory.VaultStillStaked.selector);
         factory.rotateOwner(vault, newOwner);
     }
 }
-

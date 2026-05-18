@@ -76,8 +76,10 @@ contract StrategyFactoryAuthTest is Test {
 
         registry.register(address(registeredVault), 1);
 
-        factory = new StrategyFactory(address(registry));
+        factory = new StrategyFactory(address(registry), address(this));
         template = new MoonwellSupplyStrategy();
+        // Sherlock #34: allowlist template for cloneAndInit happy path.
+        factory.setTemplateApproval(address(template), true);
         usdc = new ERC20Mock("USDC", "USDC", 6);
         mUsdc = new MockMToken(address(usdc), "Moonwell USDC", "mUsdc");
     }
@@ -90,7 +92,22 @@ contract StrategyFactoryAuthTest is Test {
 
     function test_constructor_zeroSyndicateFactory_reverts() public {
         vm.expectRevert(StrategyFactory.InvalidSyndicateFactory.selector);
-        new StrategyFactory(address(0));
+        new StrategyFactory(address(0), address(this));
+    }
+
+    /// @notice Sherlock run #1 finding #34 — clone reverts for a template
+    ///         not on the allowlist.
+    function test_cloneAndInit_revertsForUnapprovedTemplate() public {
+        MoonwellSupplyStrategy bad = new MoonwellSupplyStrategy();
+        vm.prank(vaultOwner);
+        vm.expectRevert(abi.encodeWithSelector(StrategyFactory.TemplateNotApproved.selector, address(bad)));
+        factory.cloneAndInit(address(bad), address(registeredVault), proposer, _initData());
+    }
+
+    function test_setTemplateApproval_onlyOwner() public {
+        vm.prank(attacker);
+        vm.expectRevert();
+        factory.setTemplateApproval(address(template), false);
     }
 
     // ── cloneAndInit ──

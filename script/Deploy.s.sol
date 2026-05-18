@@ -108,7 +108,7 @@ contract DeploySherwood is ScriptBase {
             ensRegistrar: vm.envOr("ENS_REGISTRAR", address(0)),
             agentRegistry: vm.envOr("AGENT_REGISTRY", address(0)),
             managementFeeBps: vm.envOr("MANAGEMENT_FEE", uint256(50)),
-            protocolFeeBps: vm.envOr("PROTOCOL_FEE", uint256(200)),
+            protocolFeeBps: vm.envOr("PROTOCOL_FEE", uint256(100)),
             maxStrategyDays: vm.envOr("MAX_STRATEGY_DAYS", uint256(14)),
             votingPeriod: vm.envOr("VOTING_PERIOD", betaMode ? uint256(1 hours) : uint256(1 days)),
             // WOOD_TOKEN is required for prod (full GuardianRegistry).
@@ -243,7 +243,7 @@ contract DeploySherwood is ScriptBase {
                     votingPeriod: cfg.votingPeriod,
                     executionWindow: 1 days,
                     vetoThresholdBps: 4000,
-                    maxPerformanceFeeBps: 3000,
+                    maxPerformanceFeeBps: 1000,
                     cooldownPeriod: cfg.betaMode ? 1 hours : 1 days,
                     collaborationWindow: cfg.betaMode ? 24 hours : 48 hours,
                     maxCoProposers: 5,
@@ -385,7 +385,7 @@ contract DeploySherwood is ScriptBase {
         _checkUint("gov.votingPeriod", p.votingPeriod, cfg.votingPeriod);
         _checkUint("gov.executionWindow", p.executionWindow, 1 days);
         _checkUint("gov.vetoThresholdBps", p.vetoThresholdBps, 4000);
-        _checkUint("gov.maxPerformanceFeeBps", p.maxPerformanceFeeBps, 3000);
+        _checkUint("gov.maxPerformanceFeeBps", p.maxPerformanceFeeBps, 1000);
         _checkUint("gov.cooldownPeriod", p.cooldownPeriod, cfg.betaMode ? 1 hours : 1 days);
         _checkUint("gov.collaborationWindow", p.collaborationWindow, cfg.betaMode ? 24 hours : 48 hours);
         _checkUint("gov.maxCoProposers", p.maxCoProposers, 5);

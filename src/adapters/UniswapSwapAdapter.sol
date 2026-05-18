@@ -40,6 +40,16 @@ interface IQuoterV2 {
     )
         external
         returns (uint256 amountOut, uint160 sqrtPriceX96After, uint32 initializedTicksCrossed, uint256 gasEstimate);
+
+    /// @dev Sherlock #58 — packed V3 path quoting for mode-1 multi-hop routes.
+    function quoteExactInput(bytes calldata path, uint256 amountIn)
+        external
+        returns (
+            uint256 amountOut,
+            uint160[] memory sqrtPriceX96AfterList,
+            uint32[] memory initializedTicksCrossedList,
+            uint256 gasEstimate
+        );
 }
 
 // ── Uniswap V4 interfaces (minimal) ──
@@ -219,6 +229,12 @@ contract UniswapSwapAdapter is ISwapAdapter {
     }
 
     /// @inheritdoc ISwapAdapter
+    /// @dev Sherlock #58: mode-1 multi-hop quoting was unsupported, so
+    ///      `PortfolioStrategy._quoteMinOut` (which wraps this) reverted with
+    ///      `QuoteUnavailable` for any allocation configured with a packed
+    ///      V3 path. The matching `swap()` already supports mode 1 — adding
+    ///      the symmetric `quoteExactInput(path, amountIn)` here unblocks
+    ///      multi-hop routes end-to-end.
     function quote(address tokenIn, address tokenOut, uint256 amountIn, bytes calldata extraData)
         external
         override
@@ -230,6 +246,12 @@ contract UniswapSwapAdapter is ISwapAdapter {
         if (mode == 0) {
             uint24 fee = abi.decode(routeData, (uint24));
             (amountOut,,,) = quoter.quoteExactInputSingle(tokenIn, tokenOut, fee, amountIn, 0);
+        } else if (mode == 1) {
+            bytes memory path = abi.decode(routeData, (bytes));
+            // Match `swap()`'s path orientation: ensure tokenIn is the head
+            // of the path before passing to the quoter.
+            if (_extractFirstAddress(path) != tokenIn) path = _reversePath(path);
+            (amountOut,,,) = quoter.quoteExactInput(path, amountIn);
         } else {
             revert UnsupportedMode();
         }

@@ -24,6 +24,15 @@ import {BatchExecutorLib} from "./BatchExecutorLib.sol";
 contract MinimalGuardianRegistry {
     error Disabled();
 
+    /// @notice Sherlock #28 — `setGuardianRegistry` on the factory checks
+    ///         the new registry's `factory()`. Returning `address(0)`
+    ///         signals "stateless beta stub, no factory alignment check
+    ///         needed". The production `GuardianRegistry` returns its
+    ///         actual factory.
+    function factory() external pure returns (address) {
+        return address(0);
+    }
+
     /// @notice Lets the governor `IGuardianRegistry(_).reviewPeriod()` cast
     ///         resolve to 0, skipping the review phase.
     function reviewPeriod() external pure returns (uint256) {
@@ -70,9 +79,10 @@ contract MinimalGuardianRegistry {
     /// @notice Factory-only `rotateOwner` slot transfer — no-op in beta.
     function transferOwnerStakeSlot(address, address) external pure {}
 
-    /// @notice Used by `rotateOwner` to gate on stake state — always false.
-    function hasOwnerStake(address) external pure returns (bool) {
-        return false;
+    /// @notice Used by `rotateOwner` (factory inlines `ownerStake > 0`) and
+    ///         `GovernorEmergency` bond check. Stub always returns 0.
+    function ownerStake(address) external pure returns (uint256) {
+        return 0;
     }
 
     // ── Loud reverts on the disabled surface ──

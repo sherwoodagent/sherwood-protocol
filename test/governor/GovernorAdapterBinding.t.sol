@@ -38,7 +38,7 @@ contract GovernorStrategyOnProposalTest is Test {
     uint256 constant VOTING_PERIOD = 1 days;
     uint256 constant EXECUTION_WINDOW = 1 days;
     uint256 constant VETO_THRESHOLD_BPS = 4000;
-    uint256 constant MAX_PERF_FEE_BPS = 3000;
+    uint256 constant MAX_PERF_FEE_BPS = 1500;
     uint256 constant MAX_STRATEGY_DURATION = 30 days;
     uint256 constant COOLDOWN_PERIOD = 1 days;
 
@@ -84,7 +84,7 @@ contract GovernorStrategyOnProposalTest is Test {
                     maxCoProposers: 5,
                     minStrategyDuration: 1 hours,
                     maxStrategyDuration: MAX_STRATEGY_DURATION,
-                    protocolFeeBps: 200,
+                    protocolFeeBps: 100,
                     protocolFeeRecipient: owner,
                     guardianFeeBps: 0
                 }),

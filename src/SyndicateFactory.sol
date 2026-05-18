@@ -40,6 +40,10 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     error InvalidENSRegistrar();
     error InvalidAgentRegistry();
     error NotAgentOwner();
+    /// @notice Sherlock #32 — `rotateOwner` restricted to vault owner / creator.
+    error NotVaultOwnerOrCreator();
+    /// @notice Sherlock #28 — new registry doesn't recognize this factory.
+    error RegistryFactoryMismatch();
     error SubdomainTooShort();
     error SubdomainTaken();
     error NotCreator();
@@ -146,8 +150,8 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     ///         Paginated reads above this cap silently clamp to `MAX_PAGE_LIMIT`.
     uint256 public constant MAX_PAGE_LIMIT = 100;
 
-    /// @notice Maximum management fee a vault owner may charge (10% of post-strategy net).
-    uint256 public constant MAX_MANAGEMENT_FEE_BPS = 1000;
+    /// @notice Maximum management fee a vault owner may charge (5% of post-strategy net).
+    uint256 public constant MAX_MANAGEMENT_FEE_BPS = 500;
 
     /// @dev Reserved for future storage — reduced by 1 for `guardianRegistry`,
     ///      reduced by 1 for `_activeSyndicateIds` (EnumerableSet.UintSet uses
@@ -342,7 +346,7 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
 
     /// @notice Update management fee for new vaults (existing vaults unaffected)
     function setManagementFeeBps(uint256 newBps) external onlyOwner {
-        if (newBps > 1000) revert ManagementFeeTooHigh(); // max 10%
+        if (newBps > MAX_MANAGEMENT_FEE_BPS) revert ManagementFeeTooHigh();
         uint256 old = managementFeeBps;
         managementFeeBps = newBps;
         emit ManagementFeeBpsUpdated(old, newBps);
@@ -373,8 +377,27 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     ///         ships and the protocol migrates from the beta stub to the real
     ///         `GuardianRegistry`. The governor and factory MUST share the same
     ///         registry; flip both in the same multisig batch.
+    /// @dev Sherlock #28: validate that the new registry's `factory()` view
+    ///      reports this contract — otherwise the factory and registry are
+    ///      misaligned and `bindOwnerStake` / `transferOwnerStakeSlot` will
+    ///      revert with `NotFactory`. Pre-fix, this caused new vaults /
+    ///      rotations to brick after a registry swap with no early signal.
+    ///      Strict: any view-call failure (no `factory` selector, wrong
+    ///      return shape, etc.) also reverts — fail-closed.
     function setGuardianRegistry(address newRegistry) external onlyOwner {
         if (newRegistry == address(0)) revert InvalidGuardianRegistry();
+        // Sherlock #28: require the new registry to either advertise this
+        // factory (alignment) or return address(0) (stateless beta stub).
+        // Any other non-zero value is a misconfig — fail fast at swap time
+        // instead of letting bindOwnerStake / transferOwnerStakeSlot revert
+        // silently later.
+        try IGuardianRegistry(newRegistry).factory() returns (address registryFactory) {
+            if (registryFactory != address(0) && registryFactory != address(this)) {
+                revert RegistryFactoryMismatch();
+            }
+        } catch {
+            revert RegistryFactoryMismatch();
+        }
         address old = guardianRegistry;
         guardianRegistry = newRegistry;
         emit GuardianRegistrySet(old, newRegistry);
@@ -382,18 +405,43 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
 
     /// @notice Transfer a vault's ownership to `newOwner` and rebind the owner-stake
     ///         slot in the guardian registry.
-    /// @dev Owner-only. Requires the old owner to have already unstaked
-    ///      (`hasOwnerStake(vault) == false`) — otherwise rotating would strand
-    ///      the old stake. Asserts the factory + governor point at the same
-    ///      registry to catch misconfiguration. `newOwner` must have a prepared
-    ///      stake sized ≥ `requiredOwnerBond(vault)`; the registry's
-    ///      `transferOwnerStakeSlot` enforces this.
-    function rotateOwner(address vault, address newOwner) external onlyOwner {
+    /// @dev Auth: `msg.sender` must be the vault's current owner OR the original
+    ///      syndicate creator (Sherlock #32 — factory-owner-only was the
+    ///      pre-fix gate and presented a centralization risk). The factory
+    ///      owner has no privileged path here.
+    /// @dev Requires the old owner to have already unstaked (verified inline as
+    ///      `reg.ownerStake(vault) > 0` — the `hasOwnerStake` external view was
+    ///      dropped in the registry bytecode trim) — otherwise rotating would
+    ///      strand the old stake.
+    /// @dev Asserts the factory + governor point at the same registry to catch
+    ///      misconfiguration. `newOwner` must have a prepared stake sized
+    ///      ≥ `reg.minOwnerStake()` (the `requiredOwnerBond` view was a
+    ///      passthrough to `minOwnerStake` and was dropped alongside the
+    ///      registry trim); the registry's `transferOwnerStakeSlot` enforces
+    ///      this at bind time.
+    /// @dev Forbidden while any proposal binds the vault — the new owner would
+    ///      otherwise inherit `pause()` and other owner-only powers mid-flight.
+    function rotateOwner(address vault, address newOwner) external {
         if (newOwner == address(0)) revert ZeroAddress();
-        if (vaultToSyndicate[vault] == 0) revert VaultNotDeployed();
+        uint256 syndicateId = vaultToSyndicate[vault];
+        if (syndicateId == 0) revert VaultNotDeployed();
+
+        // Sherlock #32: require current vault owner OR original creator
+        // consent. Pre-fix, the factory owner could unilaterally rotate any
+        // vault to an arbitrary address once the old stake was claimed —
+        // the new owner inherited pause / agent-registration / strategy-
+        // proposal rights with no prior approval from the vault's
+        // operator. Factory-owner-only would be a centralization risk
+        // even with an honest multisig.
+        address currentOwner = SyndicateVault(payable(vault)).owner();
+        if (msg.sender != currentOwner && msg.sender != syndicates[syndicateId].creator) {
+            revert NotVaultOwnerOrCreator();
+        }
 
         IGuardianRegistry reg = IGuardianRegistry(guardianRegistry);
-        if (reg.hasOwnerStake(vault)) revert VaultStillStaked();
+        // Sherlock registry bytecode trim: `hasOwnerStake` (`ownerStake > 0`)
+        // view dropped on the registry; inline the equivalent check here.
+        if (reg.ownerStake(vault) > 0) revert VaultStillStaked();
         // Registry-consistency invariant: governor and factory must share one registry.
         ISyndicateGovernor gov = ISyndicateGovernor(governor);
         if (gov.guardianRegistry() != guardianRegistry) revert RegistryMismatch();

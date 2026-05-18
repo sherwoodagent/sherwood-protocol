@@ -290,4 +290,50 @@ contract WstETHMoonwellStrategy is BaseStrategy {
         uint256 err = ICToken(mwsteth).mint(wstethReceived);
         if (err != 0) revert MintFailed();
     }
+
+    /// @notice Sherlock #50 — free `assetsNeeded` WETH by redeeming
+    ///         wstETH from Moonwell, swapping wstETH → WETH via the
+    ///         configured Aerodrome stable pool, and pushing exactly
+    ///         `assetsNeeded` to the vault.
+    /// @dev    Mirrors the `_settle` swap-back path but bounded to the
+    ///         requested deficit. Returns 0 on any partial fulfilment
+    ///         (Moonwell under-delivers, swap below `minWethOut`, etc.) —
+    ///         the vault's outer try/catch then surfaces a queue-fallback.
+    ///         Residual wstETH / WETH stays on the strategy and is reclaimed
+    ///         at settle via `liveAdapterPrincipal` accounting.
+    function _onLiveWithdraw(uint256 assetsNeeded) internal override returns (uint256) {
+        if (assetsNeeded == 0) return 0;
+
+        // Over-estimate wstETH needed by 5% to absorb stable-pool slippage.
+        // `minWethOutPerWsteth` is the MIN WETH per wstETH (worst-case);
+        // dividing assetsNeeded by it yields an upper-bound wstETH input.
+        if (minWethOutPerWsteth == 0) return 0;
+        uint256 wstethNeeded = (assetsNeeded * 1e18 * 105) / (minWethOutPerWsteth * 100);
+
+        // Redeem from Moonwell. `redeemUnderlying` accepts an exact wstETH
+        // amount; returns nonzero on failure.
+        uint256 err = ICToken(mwsteth).redeemUnderlying(wstethNeeded);
+        if (err != 0) return 0;
+        uint256 wstethBal = IERC20(wsteth).balanceOf(address(this));
+        if (wstethBal < wstethNeeded) return 0;
+
+        // Swap wstETH → WETH. `minWethOut = assetsNeeded` so the router
+        // reverts if it can't deliver the deficit; the vault's try/catch
+        // surfaces a queue-fallback.
+        IERC20(wsteth).forceApprove(aeroRouter, wstethBal);
+        IAeroRouter.Route[] memory routes = new IAeroRouter.Route[](1);
+        routes[0] = IAeroRouter.Route({from: wsteth, to: weth, stable: true, factory: aeroFactory});
+        uint256[] memory amounts = IAeroRouter(aeroRouter)
+            .swapExactTokensForTokens(wstethBal, assetsNeeded, routes, address(this), block.timestamp + deadlineOffset);
+        uint256 wethReceived = amounts[amounts.length - 1];
+        if (wethReceived < assetsNeeded) return 0;
+
+        IERC20(weth).safeTransfer(msg.sender, assetsNeeded);
+        return assetsNeeded;
+    }
+
+    /// @notice Sherlock #37 capability flag — `_onLiveWithdraw` implemented.
+    function supportsLiveWithdraw() external pure override returns (bool) {
+        return true;
+    }
 }

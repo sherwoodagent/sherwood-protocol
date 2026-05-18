@@ -120,7 +120,7 @@ contract GuardianRegistryProposalRewardTest is Test {
 
         uint256 before = usdc.balanceOf(approver);
         vm.prank(approver);
-        registry.claimProposalReward(PID);
+        registry.claimProposalReward(approver, PID);
         // Full FEE_AMOUNT — solo approver, no delegators.
         assertEq(usdc.balanceOf(approver) - before, FEE_AMOUNT);
     }
@@ -156,7 +156,7 @@ contract GuardianRegistryProposalRewardTest is Test {
 
         uint256 before = usdc.balanceOf(approver);
         vm.prank(approver);
-        registry.claimProposalReward(PID);
+        registry.claimProposalReward(approver, PID);
         // Full FEE_AMOUNT — grossFromOwn reads stake at openedAt (before the
         // mid-review unstake), not at settledAt.
         assertEq(usdc.balanceOf(approver) - before, FEE_AMOUNT);
@@ -172,7 +172,7 @@ contract GuardianRegistryProposalRewardTest is Test {
 
         uint256 before = usdc.balanceOf(approver);
         vm.prank(approver);
-        registry.claimProposalReward(PID);
+        registry.claimProposalReward(approver, PID);
         assertEq(usdc.balanceOf(approver) - before, FEE_AMOUNT, "solo approver gets full share");
     }
 
@@ -187,9 +187,9 @@ contract GuardianRegistryProposalRewardTest is Test {
         _fundPool();
 
         vm.prank(approver);
-        registry.claimProposalReward(PID);
+        registry.claimProposalReward(approver, PID);
         vm.prank(approver2);
-        registry.claimProposalReward(PID);
+        registry.claimProposalReward(approver2, PID);
         // Each: gross = 500, ownW=w → grossFromOwn=500, grossFromDelegated=0,
         // commission=0, approverPayout=500.
         assertEq(usdc.balanceOf(approver), 500e6);
@@ -203,7 +203,7 @@ contract GuardianRegistryProposalRewardTest is Test {
         _fundPool();
         vm.expectRevert(IGuardianRegistry.NotApprover.selector);
         vm.prank(blocker);
-        registry.claimProposalReward(PID);
+        registry.claimProposalReward(blocker, PID);
     }
 
     function test_claim_nonVoter_reverts() public {
@@ -211,24 +211,24 @@ contract GuardianRegistryProposalRewardTest is Test {
         _fundPool();
         vm.expectRevert(IGuardianRegistry.NotApprover.selector);
         vm.prank(delegator1);
-        registry.claimProposalReward(PID);
+        registry.claimProposalReward(delegator1, PID);
     }
 
     function test_claim_noPool_reverts() public {
         _runReview(approver, address(0), address(0));
         vm.expectRevert(IGuardianRegistry.NoPoolFunded.selector);
         vm.prank(approver);
-        registry.claimProposalReward(PID);
+        registry.claimProposalReward(approver, PID);
     }
 
     function test_claim_double_reverts() public {
         _runReview(approver, address(0), address(0));
         _fundPool();
         vm.prank(approver);
-        registry.claimProposalReward(PID);
+        registry.claimProposalReward(approver, PID);
         vm.expectRevert(IGuardianRegistry.AlreadyClaimed.selector);
         vm.prank(approver);
-        registry.claimProposalReward(PID);
+        registry.claimProposalReward(approver, PID);
     }
 
     /// @notice Regression for PR #260 zero-payout guard. When `pool.amount * w`
@@ -250,7 +250,7 @@ contract GuardianRegistryProposalRewardTest is Test {
 
         uint256 balBefore = usdc.balanceOf(approver);
         vm.prank(approver);
-        registry.claimProposalReward(PID);
+        registry.claimProposalReward(approver, PID);
 
         // Zero-payout guard skipped the transfer.
         assertEq(usdc.balanceOf(approver) - balBefore, 0, "no transfer for dust share");
@@ -258,7 +258,7 @@ contract GuardianRegistryProposalRewardTest is Test {
         // Flag still flipped — second claim reverts.
         vm.expectRevert(IGuardianRegistry.AlreadyClaimed.selector);
         vm.prank(approver);
-        registry.claimProposalReward(PID);
+        registry.claimProposalReward(approver, PID);
     }
 
     // ── Commission-at-settledAt (INV-V1.5-11) ──
@@ -289,7 +289,7 @@ contract GuardianRegistryProposalRewardTest is Test {
         registry.setCommission(1500);
 
         vm.prank(approver);
-        registry.claimProposalReward(PID);
+        registry.claimProposalReward(approver, PID);
         // own 20k + delegated 20k = 40k vote weight.
         // gross = 1000, grossFromOwn = 500, grossFromDelegated = 500.
         // 10% rate frozen at settledAt: commission = 50, approverPayout = 550.
@@ -321,7 +321,7 @@ contract GuardianRegistryProposalRewardTest is Test {
 
         uint256 aBefore = usdc.balanceOf(approver);
         vm.prank(approver);
-        registry.claimProposalReward(PID);
+        registry.claimProposalReward(approver, PID);
         // own 20k + delegated 20k = 40k. gross=1000, fromOwn=500, fromDeleg=500,
         // commission=100, payout=600, remainder=400.
         assertEq(usdc.balanceOf(approver) - aBefore, 600e6);
@@ -348,6 +348,60 @@ contract GuardianRegistryProposalRewardTest is Test {
         registry.claimDelegatorProposalReward(approver, PID);
     }
 
+    /// @notice Sherlock #41 — permissionless seeding via the new
+    ///         `claimProposalReward(approver, pid)` signature. A third party
+    ///         (here: the delegator themselves) can trigger the approver's
+    ///         claim path, seeding the delegator pool so they can claim even
+    ///         if the approver never acts. Funds still flow to the approver
+    ///         (verified by the balance assertion).
+    function test_claim41_delegatorTriggersApproverClaim_thenClaims() public {
+        // Match the splitsProRata scenario for clean math:
+        //   own 20k + delegated 20k = 40k vote weight
+        //   gross = 1000, fromOwn = 500, fromDeleg = 500
+        //   commission @ 20% on delegated = 100
+        //   approverPayout = 600, remainder = 400
+        vm.prank(approver);
+        registry.setCommission(2000);
+        wood.mint(delegator1, 10_000e18);
+        wood.mint(delegator2, 10_000e18);
+        vm.prank(delegator1);
+        wood.approve(address(registry), type(uint256).max);
+        vm.prank(delegator2);
+        wood.approve(address(registry), type(uint256).max);
+        vm.prank(delegator1);
+        registry.delegateStake(approver, 10_000e18);
+        vm.prank(delegator2);
+        registry.delegateStake(approver, 10_000e18);
+        vm.warp(vm.getBlockTimestamp() + 1);
+
+        _runReview(approver, address(0), address(0));
+        _fundPool();
+
+        // Approver does NOT call claimProposalReward themselves.
+        // Delegator1 calls it ON BEHALF — pre-#41 this was impossible.
+        uint256 approverBefore = usdc.balanceOf(approver);
+        vm.prank(delegator1);
+        registry.claimProposalReward(approver, PID);
+
+        // Funds went to the APPROVER (not the caller); third-party can't steal.
+        assertEq(usdc.balanceOf(approver) - approverBefore, 600e6, "approver got their 600");
+        assertEq(usdc.balanceOf(delegator1), 0, "third-party caller got nothing from approver claim");
+
+        // Delegators can now claim their pro-rata share.
+        vm.prank(delegator1);
+        registry.claimDelegatorProposalReward(approver, PID);
+        assertEq(usdc.balanceOf(delegator1), 200e6, "delegator1: 50% of 400 remainder");
+
+        vm.prank(delegator2);
+        registry.claimDelegatorProposalReward(approver, PID);
+        assertEq(usdc.balanceOf(delegator2), 200e6, "delegator2: 50% of 400 remainder");
+
+        // Approver themselves cannot re-claim.
+        vm.expectRevert(IGuardianRegistry.AlreadyClaimed.selector);
+        vm.prank(approver);
+        registry.claimProposalReward(approver, PID);
+    }
+
     function test_claimDelegator_double_reverts() public {
         vm.prank(approver);
         registry.setCommission(2000);
@@ -358,7 +412,7 @@ contract GuardianRegistryProposalRewardTest is Test {
         _runReview(approver, address(0), address(0));
         _fundPool();
         vm.prank(approver);
-        registry.claimProposalReward(PID);
+        registry.claimProposalReward(approver, PID);
         vm.prank(delegator1);
         registry.claimDelegatorProposalReward(approver, PID);
 
@@ -381,7 +435,7 @@ contract GuardianRegistryProposalRewardTest is Test {
         vm.expectEmit(true, true, true, true);
         emit IGuardianRegistry.ApproverFeeEscrowed(PID, approver, address(usdc), FEE_AMOUNT);
         vm.prank(approver);
-        registry.claimProposalReward(PID);
+        registry.claimProposalReward(approver, PID);
 
         assertEq(registry.unclaimedApproverFees(keccak256(abi.encode(PID, approver, address(usdc)))), FEE_AMOUNT);
     }
@@ -393,7 +447,7 @@ contract GuardianRegistryProposalRewardTest is Test {
         _fundPool();
         usdc.setBlacklisted(approver, true);
         vm.prank(approver);
-        registry.claimProposalReward(PID);
+        registry.claimProposalReward(approver, PID);
 
         usdc.setBlacklisted(approver, false);
         uint256 before = usdc.balanceOf(approver);
@@ -416,7 +470,7 @@ contract GuardianRegistryProposalRewardTest is Test {
         _fundPool();
         usdc.setBlacklisted(approver, true);
         vm.prank(approver);
-        registry.claimProposalReward(PID);
+        registry.claimProposalReward(approver, PID);
         usdc.setBlacklisted(approver, false);
 
         // Attempt flush with wrong proposalId → no match in keyed mapping.

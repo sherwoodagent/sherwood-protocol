@@ -56,7 +56,11 @@ contract AerodromeLPIntegrationTest is BaseIntegrationTest {
             amountAMin: (WETH_AMOUNT * 80) / 100, // 80% slippage tolerance
             amountBMin: (USDC_AMOUNT * 80) / 100,
             minAmountAOut: (WETH_AMOUNT * 80) / 100, // 80% on settlement
-            minAmountBOut: (USDC_AMOUNT * 80) / 100
+            minAmountBOut: (USDC_AMOUNT * 80) / 100,
+            // Sherlock #30: no reward-swap target — legacy behaviour.
+            rewardSwapTarget: address(0),
+            rewardSwapStable: false,
+            rewardSwapMinOutPerAero: 0
         });
     }
 

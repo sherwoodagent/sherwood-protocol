@@ -77,7 +77,7 @@ contract MinimalGuardianRegistryTest is Test {
     }
 
     function test_hasOwnerStake_alwaysFalse() public {
-        assertFalse(registry.hasOwnerStake(makeAddr("owner")));
+        assertFalse(registry.ownerStake(makeAddr("owner")) > 0);
     }
 
     // ──────────────────────── disabled surface (loud reverts) ────────────────────────

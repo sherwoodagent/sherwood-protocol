@@ -48,8 +48,10 @@ contract StrategyFactoryTest is Test {
 
     function setUp() public {
         registry = new _MockSyndicateRegistry();
-        factory = new StrategyFactory(address(registry));
+        factory = new StrategyFactory(address(registry), address(this));
         template = new MoonwellSupplyStrategy();
+        // Sherlock #34: allowlist template.
+        factory.setTemplateApproval(address(template), true);
         usdc = new ERC20Mock("USDC", "USDC", 6);
         mUsdc = new MockMToken(address(usdc), "Moonwell USDC", "mUsdc");
         vault = new _MockVault(vaultOwner);

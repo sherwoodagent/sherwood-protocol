@@ -23,13 +23,13 @@ contract GovernorParametersTest is Test {
     uint256 constant VOTING_PERIOD = 1 days;
     uint256 constant EXECUTION_WINDOW = 1 days;
     uint256 constant VETO_THRESHOLD_BPS = 4000;
-    uint256 constant MAX_PERF_FEE_BPS = 3000;
+    uint256 constant MAX_PERF_FEE_BPS = 1500;
     uint256 constant MIN_STRATEGY_DURATION = 1 hours;
     uint256 constant MAX_STRATEGY_DURATION = 30 days;
     uint256 constant COOLDOWN_PERIOD = 1 days;
     uint256 constant COLLAB_WINDOW = 48 hours;
     uint256 constant MAX_CO_PROPOSERS = 5;
-    uint256 constant PROTOCOL_FEE_BPS = 200;
+    uint256 constant PROTOCOL_FEE_BPS = 100;
 
     function setUp() public {
         guardianRegistry = new MockRegistryMinimal();
@@ -141,7 +141,7 @@ contract GovernorParametersTest is Test {
 
     function test_setMaxPerformanceFeeBps_happyPath() public {
         uint256 oldVal = governor.getGovernorParams().maxPerformanceFeeBps;
-        uint256 newVal = 4000;
+        uint256 newVal = 1200;
         vm.expectEmit(true, false, false, true, address(governor));
         emit ISyndicateGovernor.ParameterChangeFinalized(governor.PARAM_MAX_PERF_FEE(), oldVal, newVal);
         vm.prank(owner);
@@ -289,7 +289,7 @@ contract GovernorParametersTest is Test {
 
     function test_setProtocolFeeBps_happyPath() public {
         uint256 oldVal = governor.protocolFeeBps();
-        uint256 newVal = 500;
+        uint256 newVal = 50;
         vm.expectEmit(true, false, false, true, address(governor));
         emit ISyndicateGovernor.ParameterChangeFinalized(governor.PARAM_PROTOCOL_FEE_BPS(), oldVal, newVal);
         vm.prank(owner);

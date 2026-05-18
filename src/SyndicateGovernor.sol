@@ -133,17 +133,30 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
     ///      and the G-H2 near-quorum cancel guard.
     mapping(uint256 proposalId => uint256) private _approvedCount;
 
+    /// @dev Sherlock #14: propose-time snapshot of (`votingPeriod`,
+    ///      `executionWindow`) for COLLABORATIVE proposals only. Packed as
+    ///      `(uint128(executionWindow) << 128) | uint128(votingPeriod)` —
+    ///      single SSTORE at propose, single SLOAD at `approveCollaboration`.
+    ///      Pins timing so a mid-Draft `setVotingPeriod` / `setExecutionWindow`
+    ///      by the owner doesn't move the goalposts for co-proposers who
+    ///      already approved. Single-proposer path is atomic with propose
+    ///      and reads `_params.*` live — no snapshot needed.
+    ///      Storing OUTSIDE `StrategyProposal` avoids growing the struct's
+    ///      memory footprint in `getProposal` (large savings under via_ir).
+    mapping(uint256 proposalId => uint256 packedTiming) private _draftTimingSnap;
+
     /// @dev Reserved storage for future upgrades (shrunk by 1 for _guardianRegistry,
     ///      shrunk by 1 more for openProposalCount,
     ///      shrunk by 1 more for _unclaimedFees,
     ///      shrunk by 1 more for _approvedCount,
+    ///      shrunk by 1 more for _draftTimingSnap (Sherlock #14),
     ///      grew by 1 after P1-1: _guardianFeeRecipient reclaimed,
     ///      grew by 5 after P2-1: _params + _protocolFeeBps +
     ///      _protocolFeeRecipient + _guardianFeeBps + factory moved to
     ///      GovernorParameters,
     ///      grew by 2 after V2: _emergencyCallsHashes + _emergencyCalls moved
     ///      to GuardianRegistry)
-    uint256[35] private __gap;
+    uint256[34] private __gap;
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -285,6 +298,28 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
         p.strategyDuration = strategyDuration;
         if (isCollaborative) {
             p.state = ProposalState.Draft;
+            // Sherlock #14: snapshot timing params for the collaborative Draft.
+            // Pack (executionWindow << 128) | votingPeriod into a single slot
+            // so `approveCollaboration` reads them with one SLOAD when it
+            // transitions Draft → Pending. Pre-fix, the Draft → Pending
+            // transition read `_params.*` LIVE, so an owner mid-Draft
+            // `setVotingPeriod` / `setExecutionWindow` moved the goalposts
+            // for co-proposers who already approved under the original
+            // timing. Single-proposer path is atomic with propose so it
+            // reads `_params.*` live in `_initPendingProposal` — no
+            // snapshot needed.
+            _draftTimingSnap[proposalId] =
+                (uint256(uint128(_params.executionWindow)) << 128) | uint256(uint128(_params.votingPeriod));
+            // Sherlock #8: lock the vault at Draft creation. Pre-fix,
+            // openProposalCount only incremented at Draft→Pending (in
+            // approveCollaboration); the up-to-7-day Draft window stayed
+            // un-locked, so attackers could deposit between propose and
+            // the final approve, then have their fresh balance counted in
+            // the Pending snapshot (`block.timestamp - 1`). Counting the
+            // Draft as a locking proposal closes the late-deposit window.
+            unchecked {
+                ++openProposalCount[vault];
+            }
         } else {
             _initPendingProposal(p, reviewPeriod_);
         }
@@ -326,7 +361,12 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
     }
 
     /// @inheritdoc ISyndicateGovernor
-    function executeProposal(uint256 proposalId) external nonReentrant {
+    /// @dev `nonReentrant` dropped: state writes at lines 362-364
+    ///      (`_activeProposal`, `state=Executed`, `executedAt`) commit BEFORE
+    ///      the external `vault.executeGovernorBatch(...)` at line 370.
+    ///      Reentry hits `StrategyAlreadyActive` (or `ProposalNotApproved`
+    ///      if state-resolved differently). CEI-respected; ~20 bytes saved.
+    function executeProposal(uint256 proposalId) external {
         StrategyProposal storage proposal = _proposals[proposalId];
 
         // Resolve state (may transition Pending->Approved/Rejected/Expired or Approved->Expired)
@@ -390,7 +430,14 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
     ///      `_lastSettledAt` is bumped on every cancel branch that decrements
     ///      the open count, rate-limiting propose-cancel-propose-execute via
     ///      the same cooldown that gates execute after a successful settle.
-    function cancelProposal(uint256 proposalId) external nonReentrant {
+    /// @dev `nonReentrant` dropped: only the GuardianReview branch has an
+    ///      external call (`registry.cancelReview`), and the registry is a
+    ///      trusted protocol contract — reentry from it would require an
+    ///      upgrade vulnerability in the registry itself. Even on reentry,
+    ///      the proposer-only check at line 435 plus the registry's own
+    ///      "already resolved" gate on `cancelReview` reverts double-cancel.
+    ///      The non-GuardianReview branches make zero external calls.
+    function cancelProposal(uint256 proposalId) external {
         StrategyProposal storage proposal = _proposals[proposalId];
         if (msg.sender != proposal.proposer) revert NotProposer();
         ProposalState s = _resolveState(proposal);
@@ -412,12 +459,13 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
             _decOpen(proposal.vault);
             _lastSettledAt[proposal.vault] = block.timestamp;
         } else if (s == ProposalState.Draft) {
-            // G-H2: block lead cancel once all-but-one co-prop has approved,
-            // preventing a front-run of the final approve tx.
             uint256 total = _coProposers[proposalId].length;
-            if (total != 0 && _approvedCount[proposalId] + 1 >= total) {
+            if (total > 1 && _approvedCount[proposalId] + 1 >= total) {
                 revert CancelNotAllowedNearQuorum();
             }
+            // Sherlock #8: Draft now binds the vault — decrement on cancel.
+            _decOpen(proposal.vault);
+            _lastSettledAt[proposal.vault] = block.timestamp;
         } else {
             revert ProposalNotCancellable();
         }
@@ -429,12 +477,23 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
     /// @dev Narrowed to Draft/Pending only (Task 25) — once a proposal reaches
     ///      GuardianReview or later, the guardian cohort and execution window
     ///      drive resolution and the owner loses unilateral cancel authority.
-    function emergencyCancel(uint256 proposalId) external nonReentrant {
+    /// @dev `nonReentrant` dropped: function makes NO external calls. State
+    ///      writes (`_decOpen`, `state=Cancelled`) are local SSTOREs only.
+    ///      ~20 bytes saved.
+    function emergencyCancel(uint256 proposalId) external {
         StrategyProposal storage proposal = _proposals[proposalId];
         if (msg.sender != OwnableUpgradeable(proposal.vault).owner()) revert NotVaultOwner();
         ProposalState s = _resolveState(proposal);
-        if (s == ProposalState.Pending) _decOpen(proposal.vault);
-        else if (s != ProposalState.Draft) revert ProposalNotCancellable();
+        // PR #324 review comment 4454151855: BOTH `Draft` and `Pending`
+        // increment `openProposalCount` (Sherlock #8 binds Draft at propose
+        // time), so BOTH must decrement on cancel. Pre-fix the Draft branch
+        // fell through, soft-locking the vault — every subsequent `propose`
+        // call would revert `VaultHasOpenProposal` because `openProposalCount`
+        // stayed bumped from the cancelled Draft. Mirrors `cancelProposal`'s
+        // Draft branch (line 421-422) and `rejectCollaboration` (line 582)
+        // which already do this.
+        if (s != ProposalState.Pending && s != ProposalState.Draft) revert ProposalNotCancellable();
+        _decOpen(proposal.vault);
         proposal.state = ProposalState.Cancelled;
         emit ProposalCancelled(proposalId, msg.sender);
     }
@@ -446,7 +505,10 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
     /// @inheritdoc ISyndicateGovernor
     /// @dev Narrowed to Pending only (Task 25) — post-vote veto flows through
     ///      the guardian-review path rather than unilateral owner action.
-    function vetoProposal(uint256 proposalId) external nonReentrant {
+    /// @dev `nonReentrant` dropped: function makes NO external calls. State
+    ///      writes (`state=Rejected`, `_decOpen`) are local SSTOREs only.
+    ///      ~20 bytes saved.
+    function vetoProposal(uint256 proposalId) external {
         StrategyProposal storage proposal = _proposals[proposalId];
         if (msg.sender != OwnableUpgradeable(proposal.vault).owner()) revert NotVaultOwner();
         if (_resolveState(proposal) != ProposalState.Pending) revert ProposalNotCancellable();
@@ -482,37 +544,51 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
         emit CollaborationApproved(proposalId, msg.sender);
 
         if (_approvedCount[proposalId] == _coProposers[proposalId].length) {
-            // G-M1: block Draft -> Pending if the vault already has another
+            // G-M1: block Draft -> Pending if the vault already has ANOTHER
             // non-terminal proposal bound to it. The Draft can remain and
             // re-attempt once the blocking proposal terminates.
-            if (openProposalCount[proposal.vault] != 0) revert VaultHasOpenProposal();
+            // Sherlock #8: with Drafts now counting in openProposalCount, the
+            // *own* Draft is always in the count — subtract 1 to keep the
+            // semantics "another (non-self) open proposal blocks transition".
+            if (openProposalCount[proposal.vault] > 1) revert VaultHasOpenProposal();
             // Transition to Pending -- voting begins
             uint256 reviewPeriod_ = IGuardianRegistry(_guardianRegistry).reviewPeriod();
             proposal.state = ProposalState.Pending;
             // -1: see propose() (G-C1).
             proposal.snapshotTimestamp = block.timestamp - 1;
-            proposal.voteEnd = block.timestamp + _params.votingPeriod;
+            // Sherlock #14: timing comes from the propose-time snapshot, not
+            // live `_params.*`. Single SLOAD; bit-shift to unpack.
+            uint256 packed = _draftTimingSnap[proposalId];
+            proposal.voteEnd = block.timestamp + uint128(packed); // low 128 = votingPeriod
             proposal.reviewEnd = proposal.voteEnd + reviewPeriod_;
-            proposal.executeBy = proposal.reviewEnd + _params.executionWindow;
+            proposal.executeBy = proposal.reviewEnd + (packed >> 128); // high 128 = executionWindow
             // G-H6: see propose().
             proposal.vetoThresholdBps = _params.vetoThresholdBps;
-            // Draft -> Pending: this is the first non-terminal state that binds
-            // the vault, so start counting it now.
-            unchecked {
-                ++openProposalCount[proposal.vault];
-            }
+            // Sherlock #8: Draft already incremented openProposalCount at
+            // propose time. Don't re-increment here.
             emit CollaborationTransitionedToPending(proposalId);
         }
     }
 
     /// @inheritdoc ISyndicateGovernor
+    /// @dev Sherlock #9: restrict reject to the lead proposer. Pre-fix, any
+    ///      co-proposer could unilaterally cancel a Draft by calling this,
+    ///      enabling a single hostile co-prop to repeatedly grief the lead.
+    ///      A co-proposer who disagrees with the strategy can simply
+    ///      withhold their `approveCollaboration` — the Draft lapses at the
+    ///      collaboration window without their approval anyway. The explicit
+    ///      reject is a UX shortcut for the LEAD to acknowledge "I'm not
+    ///      going to land this collab", not a co-prop veto.
     function rejectCollaboration(uint256 proposalId) external {
         StrategyProposal storage proposal = _proposals[proposalId];
         if (_resolveState(proposal) != ProposalState.Draft) revert NotDraftState();
 
-        _requireCoProposer(proposalId);
+        if (proposal.proposer != msg.sender) revert NotLeadProposer();
 
         proposal.state = ProposalState.Cancelled;
+        // Sherlock #8: Draft now binds the vault — decrement on reject.
+        _decOpen(proposal.vault);
+        _lastSettledAt[proposal.vault] = block.timestamp;
         emit CollaborationRejected(proposalId, msg.sender);
         emit ProposalCancelled(proposalId, msg.sender);
     }
@@ -829,11 +905,12 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
 
         if (resolved != stored) {
             proposal.state = resolved;
-            // Terminal transitions from a counted state dec the counter; the
-            // only uncounted source (Draft) emits its distinct event instead.
+            // Sherlock #8: Draft now binds the vault — both Draft and
+            // non-Draft terminal transitions must decrement. Draft also
+            // emits its specific event for telemetry.
             if (resolved == ProposalState.Rejected || resolved == ProposalState.Expired) {
-                if (stored != ProposalState.Draft) _decOpen(proposal.vault);
-                else emit CollaborationDeadlineExpired(proposal.id);
+                _decOpen(proposal.vault);
+                if (stored == ProposalState.Draft) emit CollaborationDeadlineExpired(proposal.id);
             }
         }
         return resolved;
@@ -989,16 +1066,18 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
             address recipient = _guardianRegistry;
             if (fee > 0) {
                 try ISyndicateVault(vault).transferPerformanceFee(asset, recipient, fee) {
-                    try IGuardianRegistry(recipient).fundProposalGuardianPool(proposalId, asset, fee) {
-                        guardianFee = fee; // commit waterfall accounting
-                        emit GuardianFeeAccrued(proposalId, asset, recipient, fee, uint64(block.timestamp));
-                    } catch {
-                        // Asset is out of the vault; can't refund. Credit the
-                        // waterfall so fee isn't double-distributed to LPs,
-                        // and emit for ops recovery.
-                        guardianFee = fee;
-                        emit GuardianFeePoolFundingFailed(proposalId, asset, recipient, fee);
-                    }
+                    // Sherlock #36: revert if pool-funding fails. Pre-fix,
+                    // the inner catch silently swallowed `Disabled()` /
+                    // misconfig reverts AFTER the asset had already been
+                    // transferred to the registry — assets accumulated
+                    // un-poolable forever (MinimalGuardianRegistry has no
+                    // withdrawal path). Reverting the inner call rolls back
+                    // the outer transfer too (both calls are in the same
+                    // tx), so the asset stays in the vault and the operator
+                    // can fix the registry config and retry settle.
+                    IGuardianRegistry(recipient).fundProposalGuardianPool(proposalId, asset, fee);
+                    guardianFee = fee;
+                    emit GuardianFeeAccrued(proposalId, asset, recipient, fee, uint64(block.timestamp));
                 } catch {
                     // Transfer failed — fee stays in the vault, LPs benefit.
                     // guardianFee remains 0 so the waterfall reflects reality.

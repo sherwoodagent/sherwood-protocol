@@ -256,6 +256,17 @@ contract HyperliquidPerpStrategy is BaseStrategy {
             );
             hasActiveStopLoss = true;
 
+            // Sherlock #18: legacy single-asset opens must also register in
+            // `tradedAssets` so `_drainHC` force-closes them at settle. Pre-
+            // fix, a sequence of ACTION_OPEN_LONG → ACTION_OPEN_LONG_MULTI on
+            // a different asset stranded the legacy position open on HC
+            // after settle (drainHC only walked tradedAssets, which only
+            // multi-asset paths populated).
+            if (!assetTraded[perpAssetIndex]) {
+                assetTraded[perpAssetIndex] = true;
+                tradedAssets.push(perpAssetIndex);
+            }
+
             emit PositionOpened(perpAssetIndex, true, limitPx, sz, leverage);
             emit StopLossUpdated(stopLossPx);
         } else if (action == ACTION_CLOSE_POSITION) {
@@ -299,6 +310,12 @@ contract HyperliquidPerpStrategy is BaseStrategy {
             // Place GTC stop loss (reduce-only buy to close short) with fixed CLOID
             L1Write.sendLimitOrder(perpAssetIndex, true, stopLossPx, stopLossSz, true, TimeInForce.Gtc, STOP_LOSS_CLOID);
             hasActiveStopLoss = true;
+
+            // Sherlock #18: see ACTION_OPEN_LONG comment.
+            if (!assetTraded[perpAssetIndex]) {
+                assetTraded[perpAssetIndex] = true;
+                tradedAssets.push(perpAssetIndex);
+            }
 
             emit PositionOpened(perpAssetIndex, false, limitPx, sz, leverage);
             emit StopLossUpdated(stopLossPx);
@@ -523,11 +540,18 @@ contract HyperliquidPerpStrategy is BaseStrategy {
             AccountMarginSummary memory s = abi.decode(ret, (AccountMarginSummary));
             preDrainAccountValue = s.accountValue;
             if (s.accountValue > 0) {
-                int64 freeMargin = s.accountValue - int64(s.marginUsed);
-                if (freeMargin > 0) {
-                    perpToSpot = uint64(freeMargin);
-                    L1Write.sendUsdClassTransfer(perpToSpot, false);
-                }
+                // Sherlock #57: transfer the full pre-drain account value to
+                // spot, not just `accountValue - marginUsed`. Pre-fix, the
+                // free-margin subtraction left `marginUsed` worth of equity
+                // on the perp account because the precompile read was
+                // pre-block (force-close orders queue post-block, so
+                // marginUsed is still the open-position lockup). HC processes
+                // force-closes BEFORE the class transfer in the same batch,
+                // so by the time the class transfer fires the margin is
+                // released — moving the full equity recovers the position
+                // correctly. Same fix as the grid's #26.
+                perpToSpot = uint64(s.accountValue);
+                L1Write.sendUsdClassTransfer(perpToSpot, false);
             }
         }
 
@@ -571,10 +595,16 @@ contract HyperliquidPerpStrategy is BaseStrategy {
         uint256 evmBal = IERC20(asset).balanceOf(address(this));
         uint256 observable = perpVal + spotVal + evmBal;
 
-        if (observable + HyperliquidBridge.CORE_ACCOUNT_FEE_TOLERANCE >= inFlightToHc) {
-            return (observable, true);
-        }
-        return (inFlightToHc, true);
+        // Sherlock #22: drop the `inFlightToHc` high-water-mark fallback.
+        // Pre-fix, NAV returned `max(observable, inFlightToHc)`, which never
+        // decremented. Realized trading losses (stop-loss triggers, adverse
+        // funding, liquidations) dropped `observable` but the HWM held NAV at
+        // the pre-loss value — `totalAssets()` stayed inflated and new LP
+        // deposits minted shares against a fictional NAV, diluting existing
+        // holders. Honest observable-only is correct: bridge-in-transit
+        // discrepancy resolves within a few blocks anyway, and lying about
+        // NAV to paper over transient observability gaps is the worse trade.
+        return (observable, true);
     }
 
     /// @notice Move all HC spot USDC to perp margin via class transfer.

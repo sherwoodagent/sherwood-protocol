@@ -36,6 +36,11 @@ interface IGuardianRegistry {
     error OwnerBondInsufficient();
     error EmergencyTooManyCalls();
     error EmergencyHashMismatch();
+    /// @notice Sherlock #15 (collapsed into this revert): `openEmergency`
+    ///         invoked while the existing review is still open OR within
+    ///         `reviewPeriod` of a prior `cancelEmergency` on the same
+    ///         proposal. The cooldown branch blocks cancel-and-replay
+    ///         grinding of guardian block votes.
     error EmergencyAlreadyOpen();
     error ProtocolPaused();
     error AlreadyPaused();
@@ -175,12 +180,12 @@ interface IGuardianRegistry {
     function guardianStake(address guardian) external view returns (uint256);
     function ownerStake(address vault) external view returns (uint256);
     function totalGuardianStake() external view returns (uint256);
+    function minOwnerStake() external view returns (uint256);
+    function delegationOf(address delegator, address delegate) external view returns (uint256);
+    function delegatedInbound(address delegate) external view returns (uint256);
     function isActiveGuardian(address guardian) external view returns (bool);
-    function hasOwnerStake(address vault) external view returns (bool);
     function preparedStakeOf(address owner) external view returns (uint256);
     function canCreateVault(address owner) external view returns (bool);
-    function requiredOwnerBond(address vault) external view returns (uint256);
-    function currentEpoch() external view returns (uint256);
     function governor() external view returns (address);
     function factory() external view returns (address);
 
@@ -190,8 +195,6 @@ interface IGuardianRegistry {
     function cancelUnstakeDelegation(address delegate) external;
     function claimUnstakeDelegation(address delegate) external;
 
-    function delegationOf(address delegator, address delegate) external view returns (uint256);
-    function delegatedInbound(address delegate) external view returns (uint256);
     function totalDelegatedStake() external view returns (uint256);
 
     // Off-chain callers read historical checkpoints via eth_getStorageAt or
@@ -205,7 +208,6 @@ interface IGuardianRegistry {
     // ── DPoS commission ──
     function setCommission(uint256 newBps) external;
     function commissionOf(address delegate) external view returns (uint256);
-    function commissionAt(address delegate, uint256 timestamp) external view returns (uint256);
 
     event CommissionSet(address indexed delegate, uint256 oldBps, uint256 newBps);
 
@@ -216,12 +218,16 @@ interface IGuardianRegistry {
     ///         claim pro-rata. See spec §4.8.
     function fundProposalGuardianPool(uint256 proposalId, address asset, uint256 amount) external;
 
-    /// @notice Approver pulls their pro-rata share; DPoS commission is kept by
-    ///         the approver, remainder is stored for delegator claim.
-    function claimProposalReward(uint256 proposalId) external;
+    /// @notice Sherlock #41 — permissionless approver claim. Funds always go to
+    ///         `approver`; any third party can call to seed the delegator pool
+    ///         even if `approver` never claims themselves. DPoS commission is
+    ///         kept by the approver, remainder is stored for delegator claim.
+    function claimProposalReward(address approver, uint256 proposalId) external;
 
     /// @notice Delegator pulls their share from delegate's remainder pool.
-    ///         Delegate must have claimed first (seeds the pool).
+    ///         Pool is seeded by the first call to `claimProposalReward` (any
+    ///         caller, including third-party — Sherlock #41), so delegators
+    ///         are never stranded by an absent approver.
     function claimDelegatorProposalReward(address delegate, uint256 proposalId) external;
 
     /// @notice Pull previously-escrowed guardian-fee reward after the transfer-

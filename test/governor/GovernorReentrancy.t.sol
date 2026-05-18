@@ -43,7 +43,7 @@ contract GovernorReentrancyTest is Test {
     uint256 constant VOTING_PERIOD = 1 days;
     uint256 constant EXECUTION_WINDOW = 1 days;
     uint256 constant VETO_THRESHOLD_BPS = 4000;
-    uint256 constant MAX_PERF_FEE_BPS = 3000;
+    uint256 constant MAX_PERF_FEE_BPS = 1500;
     uint256 constant COOLDOWN_PERIOD = 1 days;
     uint256 constant REVIEW_PERIOD = 1 hours;
 
@@ -140,7 +140,7 @@ contract GovernorReentrancyTest is Test {
             address(vault),
             address(0),
             "ipfs://reentry",
-            1000,
+            1500,
             7 days,
             _execCalls(),
             _settleCalls(),
@@ -180,6 +180,12 @@ contract GovernorReentrancyTest is Test {
         governor.cancelProposal(pid);
     }
 
+    /// @notice With `nonReentrant` dropped (CEI-safe + bytecode budget for
+    ///         Sherlock #14), reentry into `cancelProposal` from within a
+    ///         registry callback now reverts via the intrinsic `NotProposer`
+    ///         access check (the callback is `address(registry)`, not the
+    ///         original proposer). Defense-in-depth via the proposer-only
+    ///         gate, not a layered reentrancy guard.
     function test_cancelProposal_revertsOnReentry() public {
         uint256 pid = _propose();
         _voteFor(pid);
@@ -187,14 +193,17 @@ contract GovernorReentrancyTest is Test {
         registry.openReviewFlag(true);
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
 
-        // Re-enter `cancelProposal(pid)` from within `resolveReview`.
         registry.arm(address(governor), abi.encodeCall(ISyndicateGovernor.cancelProposal, (pid)));
 
         vm.prank(agent);
-        vm.expectRevert(ISyndicateGovernor.Reentrancy.selector);
+        // Reentry from the registry callback (msg.sender = registry, not agent)
+        // fails the proposer check at the top of `cancelProposal`.
+        vm.expectRevert(ISyndicateGovernor.NotProposer.selector);
         governor.cancelProposal(pid);
     }
 
+    /// @notice See `test_cancelProposal_revertsOnReentry` — reentry from
+    ///         registry callback hits the vault-owner check first.
     function test_vetoProposal_revertsOnReentry() public {
         uint256 pid = _propose();
         _voteFor(pid);
@@ -202,14 +211,15 @@ contract GovernorReentrancyTest is Test {
         registry.openReviewFlag(true);
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
 
-        // Attacker re-enters `vetoProposal` from within `resolveReview`.
         registry.arm(address(governor), abi.encodeCall(ISyndicateGovernor.vetoProposal, (pid)));
 
         vm.prank(owner);
-        vm.expectRevert(ISyndicateGovernor.Reentrancy.selector);
+        vm.expectRevert(ISyndicateGovernor.NotVaultOwner.selector);
         governor.vetoProposal(pid);
     }
 
+    /// @notice See `test_cancelProposal_revertsOnReentry` — reentry from
+    ///         registry callback hits the vault-owner check first.
     function test_emergencyCancel_revertsOnReentry() public {
         uint256 pid = _propose();
         _voteFor(pid);
@@ -217,11 +227,10 @@ contract GovernorReentrancyTest is Test {
         registry.openReviewFlag(true);
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
 
-        // Attacker re-enters `emergencyCancel` from within `resolveReview`.
         registry.arm(address(governor), abi.encodeCall(ISyndicateGovernor.emergencyCancel, (pid)));
 
         vm.prank(owner);
-        vm.expectRevert(ISyndicateGovernor.Reentrancy.selector);
+        vm.expectRevert(ISyndicateGovernor.NotVaultOwner.selector);
         governor.emergencyCancel(pid);
     }
 

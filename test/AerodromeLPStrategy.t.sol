@@ -52,6 +52,27 @@ contract MockAeroRouter {
         ERC20Mock(tokenB).mint(to, amountB);
         return (amountA, amountB);
     }
+
+    /// @notice Sherlock #30 — single-route swap mock. Pulls `amountIn` of
+    ///         the FROM token (first route.from) and mints `amountIn` of
+    ///         the FINAL TO token at 1:1 (no slippage). Tests that need
+    ///         non-trivial rates can override or skip.
+    function swapExactTokensForTokens(
+        uint256 amountIn,
+        uint256, /* amountOutMin */
+        IAeroRouter.Route[] calldata routes,
+        address to,
+        uint256 /* deadline */
+    ) external returns (uint256[] memory amounts) {
+        address from = routes[0].from;
+        address toTok = routes[routes.length - 1].to;
+        IERC20(from).transferFrom(msg.sender, address(this), amountIn);
+        ERC20Mock(toTok).mint(to, amountIn);
+        amounts = new uint256[](routes.length + 1);
+        amounts[0] = amountIn;
+        amounts[amounts.length - 1] = amountIn;
+        return amounts;
+    }
 }
 
 /// @notice Mock Aerodrome Gauge — stake LP, earn AERO rewards
@@ -144,7 +165,11 @@ contract AerodromeLPStrategyTest is Test {
             amountAMin: MIN_A,
             amountBMin: MIN_B,
             minAmountAOut: MIN_A,
-            minAmountBOut: MIN_B
+            minAmountBOut: MIN_B,
+            // Sherlock #30: no reward-swap target — legacy behaviour.
+            rewardSwapTarget: address(0),
+            rewardSwapStable: false,
+            rewardSwapMinOutPerAero: 0
         });
         return abi.encode(p);
     }
@@ -188,7 +213,11 @@ contract AerodromeLPStrategyTest is Test {
             amountAMin: MIN_A,
             amountBMin: MIN_B,
             minAmountAOut: MIN_A,
-            minAmountBOut: MIN_B
+            minAmountBOut: MIN_B,
+            // Sherlock #30: no reward-swap target — legacy behaviour.
+            rewardSwapTarget: address(0),
+            rewardSwapStable: false,
+            rewardSwapMinOutPerAero: 0
         });
         vm.expectRevert(BaseStrategy.ZeroAddress.selector);
         AerodromeLPStrategy(clone).initialize(vault, proposer, abi.encode(p));
@@ -209,7 +238,11 @@ contract AerodromeLPStrategyTest is Test {
             amountAMin: MIN_A,
             amountBMin: MIN_B,
             minAmountAOut: MIN_A,
-            minAmountBOut: MIN_B
+            minAmountBOut: MIN_B,
+            // Sherlock #30: no reward-swap target — legacy behaviour.
+            rewardSwapTarget: address(0),
+            rewardSwapStable: false,
+            rewardSwapMinOutPerAero: 0
         });
         vm.expectRevert(AerodromeLPStrategy.InvalidAmount.selector);
         AerodromeLPStrategy(clone).initialize(vault, proposer, abi.encode(p));
@@ -233,7 +266,11 @@ contract AerodromeLPStrategyTest is Test {
             amountAMin: MIN_A,
             amountBMin: MIN_B,
             minAmountAOut: MIN_A,
-            minAmountBOut: MIN_B
+            minAmountBOut: MIN_B,
+            // Sherlock #30: no reward-swap target — legacy behaviour.
+            rewardSwapTarget: address(0),
+            rewardSwapStable: false,
+            rewardSwapMinOutPerAero: 0
         });
         vm.expectRevert(AerodromeLPStrategy.GaugeMismatch.selector);
         AerodromeLPStrategy(clone).initialize(vault, proposer, abi.encode(p));
@@ -313,6 +350,62 @@ contract AerodromeLPStrategyTest is Test {
         // AERO rewards sent to vault
         assertEq(aero.balanceOf(vault), 100e18);
         assertEq(uint256(strategy.state()), uint256(BaseStrategy.State.Settled));
+    }
+
+    /// @notice Sherlock #30 regression — when `rewardSwapTarget` is set,
+    ///         settle swaps AERO → target (here: tokenA = USDC) via the
+    ///         router. Vault receives USDC instead of AERO, eliminating
+    ///         the "AERO treated as loss" PnL bug.
+    function test_settle_swapsAeroToTargetWhenConfigured() public {
+        // Build a separate clone configured with `rewardSwapTarget = USDC`.
+        AerodromeLPStrategy s = AerodromeLPStrategy(Clones.clone(address(template)));
+        AerodromeLPStrategy.InitParams memory p = AerodromeLPStrategy.InitParams({
+            tokenA: address(usdc),
+            tokenB: address(weth),
+            stable: false,
+            factory: factory_,
+            router: address(router),
+            gauge: address(gauge),
+            lpToken: address(lpToken),
+            amountADesired: AMOUNT_A,
+            amountBDesired: AMOUNT_B,
+            amountAMin: MIN_A,
+            amountBMin: MIN_B,
+            minAmountAOut: MIN_A,
+            minAmountBOut: MIN_B,
+            // Sherlock #30: swap AERO → USDC at 1:1 (mock router rate).
+            rewardSwapTarget: address(usdc),
+            rewardSwapStable: false,
+            rewardSwapMinOutPerAero: 1e18 // 1:1 mock rate
+        });
+        s.initialize(vault, proposer, abi.encode(p));
+
+        // Re-execute under the new clone using the same vault funds.
+        usdc.mint(vault, AMOUNT_A);
+        weth.mint(vault, AMOUNT_B);
+        vm.startPrank(vault);
+        usdc.approve(address(s), AMOUNT_A);
+        weth.approve(address(s), AMOUNT_B);
+        s.execute();
+        vm.stopPrank();
+
+        // Pending reward = 100 AERO.
+        gauge.setPendingReward(100e18);
+
+        uint256 vaultAeroBefore = aero.balanceOf(vault);
+        uint256 vaultUsdcBefore = usdc.balanceOf(vault);
+
+        vm.prank(vault);
+        s.settle();
+
+        // AERO did NOT land on the vault (was swapped); USDC delta absorbed
+        // the 100 AERO at the 1:1 mock rate, on top of the removeLiquidity
+        // amount.
+        assertEq(aero.balanceOf(vault), vaultAeroBefore, "vault received no AERO");
+        // 100e18 from swap + removeLiquidity share. Just assert > the
+        // removeLiquidity-only baseline (gauge mock returns liquidity/2 of
+        // each leg, plus the 100e18 swap output).
+        assertGt(usdc.balanceOf(vault) - vaultUsdcBefore, 100e18, "vault received USDC from AERO swap");
     }
 
     function test_settle_onlyVault() public {
@@ -428,7 +521,11 @@ contract AerodromeLPStrategyTest is Test {
             amountAMin: 99_000e6,
             amountBMin: 49e18,
             minAmountAOut: 99_000e6,
-            minAmountBOut: 49e18
+            minAmountBOut: 49e18,
+            // Sherlock #30: no reward-swap target — legacy behaviour.
+            rewardSwapTarget: address(0),
+            rewardSwapStable: false,
+            rewardSwapMinOutPerAero: 0
         });
         strategy2.initialize(vault, proposer, abi.encode(p));
 

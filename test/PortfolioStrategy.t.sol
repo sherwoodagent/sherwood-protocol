@@ -9,14 +9,16 @@ import {MockSwapAdapter} from "./mocks/MockSwapAdapter.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 
-/// @notice Mock Chainlink Data Streams verifier proxy
+/// @notice Mock Chainlink Data Streams verifier proxy.
+/// @dev Sherlock #56: signed reports now carry a `feedId` so the strategy can
+///      bind each allocation to its expected feed. In tests `signedReport` is
+///      encoded as `(bytes32 feedId, int192 price)`; the mock echoes the
+///      feedId so per-slot binding can be exercised.
 contract MockVerifierProxy {
-    /// @dev Returns abi-encoded ChainlinkReport with the given price
     function verify(bytes calldata signedReport) external payable returns (bytes memory) {
-        // signedReport is just abi.encode(int192 price) in tests
-        int192 price = abi.decode(signedReport, (int192));
+        (bytes32 feedId, int192 price) = abi.decode(signedReport, (bytes32, int192));
         ChainlinkReport memory report = ChainlinkReport({
-            feedId: bytes32(0),
+            feedId: feedId,
             validFromTimestamp: uint32(block.timestamp),
             observationsTimestamp: uint32(block.timestamp),
             nativeFee: 0,
@@ -112,7 +114,8 @@ contract PortfolioStrategyTest is Test {
             TOTAL_AMOUNT,
             MAX_SLIPPAGE,
             extraData,
-            _pd(tokens.length)
+            _pd(tokens.length),
+            _feedIdsFor(tokens.length)
         );
         s.initialize(vault, proposer, initData);
     }
@@ -125,6 +128,29 @@ contract PortfolioStrategyTest is Test {
         for (uint256 i; i < n; ++i) {
             arr[i] = 18;
         }
+    }
+
+    /// @dev Sherlock #56 helper: deterministic per-slot feedIds. The suite's
+    ///      3-token setup uses [TSLA, AMZN, NFLX] feeds; longer baskets pad
+    ///      with `keccak256("portfolio.feed", i)`.
+    function _feedIdsFor(uint256 n) internal pure returns (bytes32[] memory arr) {
+        arr = new bytes32[](n);
+        for (uint256 i; i < n; ++i) {
+            arr[i] = keccak256(abi.encode("portfolio.feed", i));
+        }
+    }
+
+    function _feedIdsForTokens(address[] memory tokens) internal pure returns (bytes32[] memory arr) {
+        arr = new bytes32[](tokens.length);
+        for (uint256 i; i < tokens.length; ++i) {
+            arr[i] = keccak256(abi.encode("portfolio.feed", tokens[i]));
+        }
+    }
+
+    /// @dev Build a signed report matching the per-slot expected feedId
+    ///      (echoed by the MockVerifierProxy back into ChainlinkReport).
+    function _signedReport(uint256 slotIndex, int192 price) internal pure returns (bytes memory) {
+        return abi.encode(keccak256(abi.encode("portfolio.feed", slotIndex)), price);
     }
 
     // ==================== INITIALIZATION ====================
@@ -179,7 +205,8 @@ contract PortfolioStrategyTest is Test {
             TOTAL_AMOUNT,
             MAX_SLIPPAGE,
             extraData,
-            _pd(tokens.length)
+            _pd(tokens.length),
+            _feedIdsFor(tokens.length)
         );
         vm.expectRevert(PortfolioStrategy.InvalidWeights.selector);
         PortfolioStrategy(clone).initialize(vault, proposer, initData);
@@ -207,7 +234,8 @@ contract PortfolioStrategyTest is Test {
             TOTAL_AMOUNT,
             MAX_SLIPPAGE,
             extraData,
-            _pd(tokens.length)
+            _pd(tokens.length),
+            _feedIdsFor(tokens.length)
         );
         vm.expectRevert(PortfolioStrategy.TooManyTokens.selector);
         PortfolioStrategy(clone).initialize(vault, proposer, initData);
@@ -238,7 +266,8 @@ contract PortfolioStrategyTest is Test {
             TOTAL_AMOUNT,
             MAX_SLIPPAGE,
             extraData,
-            _pd(tokens.length)
+            _pd(tokens.length),
+            _feedIdsFor(tokens.length)
         );
         vm.expectRevert(PortfolioStrategy.LengthMismatch.selector);
         PortfolioStrategy(clone).initialize(vault, proposer, initData);
@@ -263,9 +292,45 @@ contract PortfolioStrategyTest is Test {
             TOTAL_AMOUNT,
             MAX_SLIPPAGE,
             extraData,
-            _pd(tokens.length)
+            _pd(tokens.length),
+            _feedIdsFor(tokens.length)
         );
         vm.expectRevert(BaseStrategy.ZeroAddress.selector);
+        PortfolioStrategy(clone).initialize(vault, proposer, initData);
+    }
+
+    /// @notice Sherlock run #1 finding #52 — basket cannot contain duplicate
+    ///         token addresses. Pre-fix, the strategy would aggregate the
+    ///         shared on-chain balance but `_positionValue` would add it
+    ///         once per allocation slot, inflating live NAV proportionally
+    ///         to the duplication count.
+    function test_initialize_duplicateToken_reverts() public {
+        address clone = Clones.clone(address(template));
+
+        // Two slots, both pointing at TSLA.
+        address[] memory tokens = new address[](2);
+        tokens[0] = address(tsla);
+        tokens[1] = address(tsla);
+        uint256[] memory weights = new uint256[](2);
+        weights[0] = 5000;
+        weights[1] = 5000;
+        bytes[] memory extraData = new bytes[](2);
+        extraData[0] = "";
+        extraData[1] = "";
+
+        bytes memory initData = abi.encode(
+            address(weth),
+            address(adapter),
+            address(verifier),
+            tokens,
+            weights,
+            TOTAL_AMOUNT,
+            MAX_SLIPPAGE,
+            extraData,
+            _pd(tokens.length),
+            _feedIdsFor(tokens.length)
+        );
+        vm.expectRevert(abi.encodeWithSelector(PortfolioStrategy.DuplicateToken.selector, address(tsla)));
         PortfolioStrategy(clone).initialize(vault, proposer, initData);
     }
 
@@ -288,7 +353,8 @@ contract PortfolioStrategyTest is Test {
             uint256(0),
             MAX_SLIPPAGE,
             extraData,
-            _pd(tokens.length)
+            _pd(tokens.length),
+            _feedIdsFor(tokens.length)
         );
         vm.expectRevert(PortfolioStrategy.InvalidAmount.selector);
         PortfolioStrategy(clone).initialize(vault, proposer, initData);
@@ -527,9 +593,9 @@ contract PortfolioStrategyTest is Test {
         // Build price reports (prices in 1e18 = price per token in asset terms)
         // TSLA: 0.01 WETH each, AMZN: 0.02 WETH each, NFLX: 0.005 WETH each
         bytes[] memory reports = new bytes[](3);
-        reports[0] = abi.encode(int192(int256(0.01e18))); // TSLA price
-        reports[1] = abi.encode(int192(int256(0.02e18))); // AMZN price
-        reports[2] = abi.encode(int192(int256(0.005e18))); // NFLX price
+        reports[0] = _signedReport(0, int192(int256(0.01e18))); // TSLA price
+        reports[1] = _signedReport(1, int192(int256(0.02e18))); // AMZN price
+        reports[2] = _signedReport(2, int192(int256(0.005e18))); // NFLX price
 
         vm.prank(proposer);
         strategy.rebalanceDelta(reports);
@@ -548,8 +614,8 @@ contract PortfolioStrategyTest is Test {
         _executeStrategy();
 
         bytes[] memory reports = new bytes[](2); // should be 3
-        reports[0] = abi.encode(int192(int256(0.01e18)));
-        reports[1] = abi.encode(int192(int256(0.02e18)));
+        reports[0] = _signedReport(0, int192(int256(0.01e18)));
+        reports[1] = _signedReport(1, int192(int256(0.02e18)));
 
         vm.prank(proposer);
         vm.expectRevert(PortfolioStrategy.LengthMismatch.selector);
@@ -560,9 +626,9 @@ contract PortfolioStrategyTest is Test {
         _executeStrategy();
 
         bytes[] memory reports = new bytes[](3);
-        reports[0] = abi.encode(int192(int256(0.01e18)));
-        reports[1] = abi.encode(int192(int256(0.02e18)));
-        reports[2] = abi.encode(int192(int256(0.005e18)));
+        reports[0] = _signedReport(0, int192(int256(0.01e18)));
+        reports[1] = _signedReport(1, int192(int256(0.02e18)));
+        reports[2] = _signedReport(2, int192(int256(0.005e18)));
 
         vm.prank(makeAddr("attacker"));
         vm.expectRevert(BaseStrategy.NotProposer.selector);
@@ -632,9 +698,9 @@ contract PortfolioStrategyTest is Test {
 
         // Mock prices: TSLA = 0.01 WETH, AMZN = 0.02 WETH, NFLX = 0.005 WETH (all 1e18-scaled).
         bytes[] memory reports = new bytes[](3);
-        reports[0] = abi.encode(int192(int256(0.01e18)));
-        reports[1] = abi.encode(int192(int256(0.02e18)));
-        reports[2] = abi.encode(int192(int256(0.005e18)));
+        reports[0] = _signedReport(0, int192(int256(0.01e18)));
+        reports[1] = _signedReport(1, int192(int256(0.02e18)));
+        reports[2] = _signedReport(2, int192(int256(0.005e18)));
         strategy.refreshPrices(reports);
 
         (uint256 value, bool valid) = strategy.positionValue();
@@ -649,9 +715,9 @@ contract PortfolioStrategyTest is Test {
     function test_positionValue_staleCache_returnsInvalid() public {
         _executeStrategy();
         bytes[] memory reports = new bytes[](3);
-        reports[0] = abi.encode(int192(int256(0.01e18)));
-        reports[1] = abi.encode(int192(int256(0.02e18)));
-        reports[2] = abi.encode(int192(int256(0.005e18)));
+        reports[0] = _signedReport(0, int192(int256(0.01e18)));
+        reports[1] = _signedReport(1, int192(int256(0.02e18)));
+        reports[2] = _signedReport(2, int192(int256(0.005e18)));
         strategy.refreshPrices(reports);
 
         // Warp past MAX_PRICE_AGE (5 minutes).
@@ -668,8 +734,8 @@ contract PortfolioStrategyTest is Test {
         // Mock the verifier mid-call so only 2 of 3 prices land in the cache.
         // Then call refreshPrices for only the 2 that succeed by skipping NFLX.
         bytes[] memory reports = new bytes[](2);
-        reports[0] = abi.encode(int192(int256(0.01e18)));
-        reports[1] = abi.encode(int192(int256(0.02e18)));
+        reports[0] = _signedReport(0, int192(int256(0.01e18)));
+        reports[1] = _signedReport(1, int192(int256(0.02e18)));
         // Length mismatch — should revert. We instead manually warm up only 2 entries
         // by calling rebalanceDelta which atomically populates all 3, then warping.
         // Easier: assert that refreshPrices length-mismatch reverts (covers symmetry).
@@ -680,9 +746,9 @@ contract PortfolioStrategyTest is Test {
     function test_refreshPrices_isPermissionless() public {
         _executeStrategy();
         bytes[] memory reports = new bytes[](3);
-        reports[0] = abi.encode(int192(int256(0.01e18)));
-        reports[1] = abi.encode(int192(int256(0.02e18)));
-        reports[2] = abi.encode(int192(int256(0.005e18)));
+        reports[0] = _signedReport(0, int192(int256(0.01e18)));
+        reports[1] = _signedReport(1, int192(int256(0.02e18)));
+        reports[2] = _signedReport(2, int192(int256(0.005e18)));
 
         // Random caller — no proposer / vault prank — must succeed.
         vm.prank(makeAddr("randomKeeper"));
@@ -690,6 +756,37 @@ contract PortfolioStrategyTest is Test {
 
         assertEq(strategy.cachedPriceUpdatedAt(address(tsla)), vm.getBlockTimestamp());
         assertEq(strategy.cachedPrice(address(tsla)), uint256(0.01e18));
+    }
+
+    /// @notice Sherlock run #1 finding #56 — refreshPrices must reject reports
+    ///         whose feedId doesn't match the slot's expected feed. Pre-fix,
+    ///         any valid signed report could be replayed into any slot, letting
+    ///         an attacker stuff a high WBTC price into the AAPL cache and
+    ///         inflate live NAV.
+    function test_refreshPrices_revertsOnWrongFeedId() public {
+        _executeStrategy();
+        bytes[] memory reports = new bytes[](3);
+        // Swap the order — slot-1's report uses slot-2's feedId. Should revert.
+        reports[0] = _signedReport(0, int192(int256(0.01e18)));
+        reports[1] = _signedReport(2, int192(int256(99_999e18))); // wrong feedId at slot 1
+        reports[2] = _signedReport(2, int192(int256(0.005e18)));
+
+        bytes32 expected = keccak256(abi.encode("portfolio.feed", uint256(1)));
+        bytes32 actual = keccak256(abi.encode("portfolio.feed", uint256(2)));
+        vm.expectRevert(abi.encodeWithSelector(PortfolioStrategy.WrongFeedId.selector, 1, expected, actual));
+        strategy.refreshPrices(reports);
+    }
+
+    function test_refreshPrices_succeedsWhenAllFeedIdsMatch() public {
+        // Sanity (pairs with the negative test above) — same call shape, but
+        // every report's feedId matches its slot.
+        _executeStrategy();
+        bytes[] memory reports = new bytes[](3);
+        reports[0] = _signedReport(0, int192(int256(0.01e18)));
+        reports[1] = _signedReport(1, int192(int256(0.02e18)));
+        reports[2] = _signedReport(2, int192(int256(0.005e18)));
+        strategy.refreshPrices(reports);
+        assertEq(strategy.cachedPrice(address(amzn)), uint256(0.02e18));
     }
 
     function test_rebalanceDelta_alsoRefreshesCache() public {
@@ -706,9 +803,9 @@ contract PortfolioStrategyTest is Test {
         // Use prices that match the adapter's mock rates so the rebalance
         // doesn't trip the slippage floor we configured at init.
         bytes[] memory reports = new bytes[](3);
-        reports[0] = abi.encode(int192(int256(0.01e18)));
-        reports[1] = abi.encode(int192(int256(0.02e18)));
-        reports[2] = abi.encode(int192(int256(0.005e18)));
+        reports[0] = _signedReport(0, int192(int256(0.01e18)));
+        reports[1] = _signedReport(1, int192(int256(0.02e18)));
+        reports[2] = _signedReport(2, int192(int256(0.005e18)));
         vm.prank(proposer);
         strategy.rebalanceDelta(reports);
 
@@ -787,7 +884,8 @@ contract PortfolioStrategyTest is Test {
             5e18,
             MAX_SLIPPAGE,
             extraData,
-            _pd(tokens.length)
+            _pd(tokens.length),
+            _feedIdsFor(tokens.length)
         );
         strategy2.initialize(vault, proposer, initData);
 
@@ -820,7 +918,8 @@ contract PortfolioStrategyTest is Test {
             5e18,
             MAX_SLIPPAGE,
             extraData,
-            _pd(tokens.length)
+            _pd(tokens.length),
+            _feedIdsFor(tokens.length)
         );
         s.initialize(vault, proposer, initData);
 
@@ -888,7 +987,8 @@ contract PortfolioStrategyTest is Test {
             20e18,
             MAX_SLIPPAGE,
             extraData,
-            _pd(tokens.length)
+            _pd(tokens.length),
+            _feedIdsFor(tokens.length)
         );
         s.initialize(vault, proposer, initData);
 
@@ -946,7 +1046,8 @@ contract PortfolioStrategyTest is Test {
             TOTAL_AMOUNT,
             MAX_SLIPPAGE,
             extraData,
-            _pd(tokens.length)
+            _pd(tokens.length),
+            _feedIdsFor(tokens.length)
         );
 
         // 6000 + 4000 + 0 = 10000 → valid init
@@ -1129,9 +1230,9 @@ contract PortfolioStrategyTest is Test {
         s2.updateParams(abi.encode(newWeights, uint256(0), new bytes[](0)));
 
         bytes[] memory reports = new bytes[](3);
-        reports[0] = abi.encode(int192(int256(0.01e18)));
-        reports[1] = abi.encode(int192(int256(0.02e18)));
-        reports[2] = abi.encode(int192(int256(0.005e18)));
+        reports[0] = _signedReport(0, int192(int256(0.01e18)));
+        reports[1] = _signedReport(1, int192(int256(0.02e18)));
+        reports[2] = _signedReport(2, int192(int256(0.005e18)));
 
         vm.prank(proposer);
         uint256 gasBefore2 = gasleft();
@@ -1185,7 +1286,8 @@ contract PortfolioStrategyTest is Test {
             20e18,
             MAX_SLIPPAGE,
             extraData,
-            _pd(tokens.length)
+            _pd(tokens.length),
+            _feedIdsFor(tokens.length)
         );
         s.initialize(vault, proposer, initData);
 
@@ -1222,7 +1324,7 @@ contract PortfolioStrategyTest is Test {
 
         bytes[] memory reports = new bytes[](count);
         for (uint256 i; i < count; ++i) {
-            reports[i] = abi.encode(int192(int256(0.1e18))); // 1 token = 0.1 WETH
+            reports[i] = _signedReport(i, int192(int256(0.1e18))); // 1 token = 0.1 WETH
         }
 
         vm.prank(proposer);
@@ -1240,5 +1342,84 @@ contract PortfolioStrategyTest is Test {
         weth.approve(address(strategy), TOTAL_AMOUNT);
         vm.prank(vault);
         strategy.execute();
+    }
+
+    // ==================== SHERLOCK #21 + #29: 1e8 FEED REGRESSION ====================
+
+    /// @dev Sherlock #21/#29 regression — `rebalanceDelta` previously
+    ///      divided by hard-coded `PRICE_PRECISION = 1e18` regardless of the
+    ///      declared `_priceDecimals[i]`. For tokenized-stock Chainlink feeds
+    ///      (8 decimals), the math under-scaled by 10^10 ×, producing a
+    ///      `currentValue` snapshot that was effectively zero and breaking
+    ///      every downstream weight check. With the per-allocation
+    ///      `_tokensToValue` / `_valueToTokens` helpers, the rebalance
+    ///      succeeds with 8-decimal feeds and lands within slippage of the
+    ///      target weights.
+    function test_rebalanceDelta_handles1e8FeedDecimals() public {
+        // Deploy a fresh clone configured with 8-decimal price feeds. Tokens
+        // (TSLA / AMZN / NFLX) remain 18-decimal — only the feed scale
+        // changes. Asset (WETH) is 18-decimal.
+        address clone = Clones.clone(address(template));
+        PortfolioStrategy s = PortfolioStrategy(clone);
+
+        address[] memory tokens = new address[](3);
+        tokens[0] = address(tsla);
+        tokens[1] = address(amzn);
+        tokens[2] = address(nflx);
+        uint256[] memory weights = new uint256[](3);
+        weights[0] = 4000;
+        weights[1] = 3500;
+        weights[2] = 2500;
+        bytes[] memory extraData = new bytes[](3);
+        uint8[] memory pd = new uint8[](3);
+        pd[0] = 8; // Chainlink tokenized-stock feed
+        pd[1] = 8;
+        pd[2] = 8;
+
+        bytes memory initData = abi.encode(
+            address(weth),
+            address(adapter),
+            address(verifier),
+            tokens,
+            weights,
+            TOTAL_AMOUNT,
+            MAX_SLIPPAGE,
+            extraData,
+            pd,
+            _feedIdsFor(tokens.length)
+        );
+        s.initialize(vault, proposer, initData);
+
+        // Execute under the 8-dec scale. Execute also uses prices — feed
+        // them in 1e8 scale too. Prices echoed by the mock verifier:
+        //   TSLA: 1e6 (= 0.01 × 1e8)   AMZN: 2e6 (= 0.02 × 1e8)   NFLX: 5e5 (= 0.005 × 1e8)
+        vm.prank(vault);
+        weth.approve(address(s), TOTAL_AMOUNT);
+        vm.prank(vault);
+        s.execute();
+
+        // Trigger a rebalance with 1e8-scaled price reports.
+        uint256[] memory newWeights = new uint256[](3);
+        newWeights[0] = 6000; // bump TSLA
+        newWeights[1] = 3000;
+        newWeights[2] = 1000;
+        vm.prank(proposer);
+        s.updateParams(abi.encode(newWeights, uint256(0), new bytes[](0)));
+
+        bytes[] memory reports = new bytes[](3);
+        reports[0] = _signedReport(0, int192(int256(uint256(1e6)))); // TSLA @ 0.01 WETH (1e8 scale)
+        reports[1] = _signedReport(1, int192(int256(uint256(2e6)))); // AMZN @ 0.02 WETH
+        reports[2] = _signedReport(2, int192(int256(uint256(5e5)))); // NFLX @ 0.005 WETH
+
+        vm.prank(proposer);
+        s.rebalanceDelta(reports);
+
+        // Pre-fix this either reverted on division-by-zero / no-op'd / OR
+        // ran swaps with effectively-zero minOuts. With the fix, allocations
+        // adjust toward the new weights.
+        PortfolioStrategy.TokenAllocation[] memory after_ = s.getAllocations();
+        assertGt(after_[0].tokenAmount, 0, "TSLA bought to 60% target");
+        assertGt(after_[1].tokenAmount, 0, "AMZN");
+        assertGt(after_[2].tokenAmount, 0, "NFLX sold toward 10% target");
     }
 }

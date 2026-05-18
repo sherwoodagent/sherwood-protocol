@@ -496,14 +496,20 @@ contract VaultLiveNAVTest is Test {
         assertLe(mrAssets, 1_000e6, "maxRedeem exceeds float+adapter backing");
     }
 
-    // ──────────────────────── I2: onLiveDeposit revert fallback ────────────────────────
+    // Sherlock #37 — DEFERRED to #50 (Moonwell/WstETHMoonwell/Portfolio
+    // _onLiveWithdraw implementations). Adding a `supportsLiveWithdraw`
+    // capability flag at IStrategy + vault-side gate pushed SyndicateVault
+    // over EIP-170. Reverted here; tracking in PR description.
 
-    /// @notice An adapter that reports valid NAV but lacks `onLiveDeposit`
-    ///         (e.g. a bespoke non-BaseStrategy adapter) MUST NOT brick LP
-    ///         deposits. The vault catches the revert, leaves the assets on
-    ///         the adapter, and tracks them under `liveAdapterPrincipal`
-    ///         so they're returned at settle.
-    function test_deposit_succeedsWhenAdapterLacksOnLiveDeposit() public {
+    // ──────────────────────── Sherlock #24: onLiveDeposit failure reverts ────────────────────────
+
+    /// @notice Sherlock run #1 finding #24 — an adapter that reverts on
+    ///         `onLiveDeposit` must hard-revert the LP deposit. Pre-fix,
+    ///         the vault caught the revert and bumped principal anyway,
+    ///         leaving assets stranded on the adapter where `positionValue`
+    ///         couldn't see them; the next depositor minted shares against
+    ///         a deflated NAV (dilution).
+    function test_deposit_revertsWhenAdapterLacksOnLiveDeposit() public {
         address alice = makeAddr("alice");
         usdc.mint(alice, 1_000e6);
         vm.prank(alice);
@@ -514,16 +520,19 @@ contract VaultLiveNAVTest is Test {
         _mockStrategyOnActiveProposal(address(ad));
 
         vm.prank(alice);
-        uint256 shares = vault.deposit(1_000e6, alice);
-        assertGt(shares, 0, "deposit succeeds despite missing onLiveDeposit");
-        assertEq(usdc.balanceOf(address(ad)), 1_000e6, "assets pushed to adapter");
-        assertEq(usdc.balanceOf(address(vault)), 0, "vault float drained");
-        assertEq(vault.liveAdapterPrincipal(MOCK_PID), 1_000e6, "principal tracked under proposal");
+        vm.expectRevert(ISyndicateVault.LiveDepositRejected.selector);
+        vault.deposit(1_000e6, alice);
+        // Reverted atomically — no stranded assets, no principal bump, no shares.
+        assertEq(usdc.balanceOf(address(ad)), 0, "no stranded assets on adapter");
+        assertEq(vault.liveAdapterPrincipal(MOCK_PID), 0, "principal not bumped on failed hook");
+        assertEq(vault.balanceOf(alice), 0, "no shares minted");
     }
 
-    /// @notice Same fallback for an adapter whose `onLiveDeposit` reverts
-    ///         transiently (paused upstream, max-cap, oracle staleness).
-    function test_deposit_succeedsWhenOnLiveDepositReverts() public {
+    /// @notice Same hard-revert for a hook that reverts transiently
+    ///         (paused upstream, max-cap, oracle staleness). The LP must
+    ///         use the queue path or retry later instead of getting
+    ///         silently diluted.
+    function test_deposit_revertsWhenOnLiveDepositReverts() public {
         address alice = makeAddr("alice");
         usdc.mint(alice, 1_000e6);
         vm.prank(alice);
@@ -534,10 +543,9 @@ contract VaultLiveNAVTest is Test {
         _mockStrategyOnActiveProposal(address(ad));
 
         vm.prank(alice);
-        uint256 shares = vault.deposit(1_000e6, alice);
-        assertGt(shares, 0, "deposit succeeds despite reverting hook");
-        assertEq(usdc.balanceOf(address(ad)), 1_000e6, "assets still on adapter");
-        assertEq(vault.liveAdapterPrincipal(MOCK_PID), 1_000e6, "principal tracked under proposal");
+        vm.expectRevert(ISyndicateVault.LiveDepositRejected.selector);
+        vault.deposit(1_000e6, alice);
+        assertEq(vault.liveAdapterPrincipal(MOCK_PID), 0, "no principal bump on failed hook");
     }
 
     /// @notice With float drained AND adapter reporting zero positionValue,

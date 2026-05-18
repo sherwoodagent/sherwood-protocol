@@ -65,6 +65,9 @@ contract VeniceInferenceStrategy is BaseStrategy {
     error InvalidAmount();
     error SwapFailed();
     error NoAgent();
+    /// @notice Sherlock #49 — repaymentAmount cannot drop below the loan's
+    ///         principal (`assetAmount`).
+    error RepaymentBelowPrincipal();
 
     // ── Initialization parameters ──
     struct InitParams {
@@ -199,7 +202,15 @@ contract VeniceInferenceStrategy is BaseStrategy {
     function _updateParams(bytes calldata data) internal override {
         (uint256 newRepayment, uint256 newMinVVV, uint256 newDeadlineOffset) =
             abi.decode(data, (uint256, uint256, uint256));
-        if (newRepayment > 0) repaymentAmount = newRepayment;
+        if (newRepayment > 0) {
+            // Sherlock #49: proposer must not be able to reduce the agent's
+            // obligation below the principal — pre-fix, the agent could
+            // settle with `repaymentAmount = 1`, the vault would accept 1
+            // unit as "settled", and the agent would retain the borrowed
+            // capital + any off-chain profit.
+            if (newRepayment < assetAmount) revert RepaymentBelowPrincipal();
+            repaymentAmount = newRepayment;
+        }
         if (newMinVVV > 0) minVVV = newMinVVV;
         if (newDeadlineOffset > 0) deadlineOffset = newDeadlineOffset;
     }

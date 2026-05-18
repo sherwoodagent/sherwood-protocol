@@ -17,6 +17,9 @@ interface IVaultWithdrawalQueue {
     error ZeroShares();
     error InsufficientShares();
     error TransferFailed();
+    /// @notice Sherlock #27 — claim received fewer assets than the LP's
+    ///         `minAssets` floor (NAV dropped between enqueue and claim).
+    error ClaimSlippage(uint256 received, uint256 minAssets);
 
     // ── Structs ──
     struct Request {
@@ -36,6 +39,11 @@ interface IVaultWithdrawalQueue {
     function vault() external view returns (address);
     function queueRequest(address owner, uint256 shares) external returns (uint256 requestId);
     function claim(uint256 requestId) external returns (uint256 assets);
+    /// @notice Sherlock #27 — claim with a slippage floor. Reverts with
+    ///         `ClaimSlippage` if `assets < minAssets`. Use `claim(requestId)`
+    ///         (no floor) only for batch keepers / off-chain orchestration
+    ///         that has already accepted current NAV.
+    function claim(uint256 requestId, uint256 minAssets) external returns (uint256 assets);
     function cancel(uint256 requestId) external;
 
     // ── Views ──

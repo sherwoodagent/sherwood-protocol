@@ -138,6 +138,36 @@ contract MoonwellSupplyStrategy is BaseStrategy {
         if (err != 0) revert MintFailed();
     }
 
+    /// @notice Sherlock #50 — free `assetsNeeded` of underlying from the
+    ///         Moonwell position and push it to the vault. Returns the
+    ///         amount transferred (or 0 if the redeem failed or returned
+    ///         less than requested — the vault treats partial fill as a
+    ///         queue-fallback signal). Native-ETH markets are not
+    ///         supported here (Moonwell ETH market wraps WETH → native at
+    ///         redeem; vault asset is always ERC-20). All-or-nothing.
+    function _onLiveWithdraw(uint256 assetsNeeded) internal override returns (uint256) {
+        if (assetsNeeded == 0) return 0;
+        // `redeemUnderlying` accepts the exact underlying amount the vault
+        // wants. Returns nonzero on failure (insufficient mTokens, paused
+        // market, etc.).
+        uint256 err = ICToken(mToken).redeemUnderlying(assetsNeeded);
+        if (err != 0) return 0;
+        // Verify the redeem produced at least `assetsNeeded` on this
+        // contract's balance (Moonwell could under-deliver in edge cases).
+        uint256 bal = IERC20(underlying).balanceOf(address(this));
+        if (bal < assetsNeeded) return 0;
+        IERC20(underlying).safeTransfer(msg.sender, assetsNeeded);
+        return assetsNeeded;
+    }
+
+    /// @notice Sherlock #37 capability flag — re-added now that
+    ///         `_onLiveWithdraw` is implemented (#50). Vault gates
+    ///         `maxWithdraw` / `maxRedeem` on this so an adapter without
+    ///         live-withdraw doesn't over-promise.
+    function supportsLiveWithdraw() external pure override returns (bool) {
+        return true;
+    }
+
     // ── positionValue ──
 
     /// @dev Current underlying value of the supplied position. Uses

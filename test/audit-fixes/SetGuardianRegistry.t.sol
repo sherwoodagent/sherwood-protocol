@@ -37,13 +37,13 @@ contract SetGuardianRegistryTest is Test {
                     votingPeriod: 1 hours,
                     executionWindow: 1 days,
                     vetoThresholdBps: 4000,
-                    maxPerformanceFeeBps: 3000,
+                    maxPerformanceFeeBps: 1000,
                     cooldownPeriod: 1 hours,
                     collaborationWindow: 24 hours,
                     maxCoProposers: 5,
                     minStrategyDuration: 1 hours,
                     maxStrategyDuration: 14 days,
-                    protocolFeeBps: 200,
+                    protocolFeeBps: 100,
                     protocolFeeRecipient: owner,
                     guardianFeeBps: 0
                 }),
@@ -115,5 +115,23 @@ contract SetGuardianRegistryTest is Test {
         vm.prank(owner);
         vm.expectRevert(SyndicateFactory.InvalidGuardianRegistry.selector);
         factory.setGuardianRegistry(address(0));
+    }
+
+    /// @notice Sherlock run #1 finding #28 — new registry whose `factory()`
+    ///         returns a different address (misconfig) reverts at swap time
+    ///         instead of bricking subsequent bindOwnerStake calls.
+    function test_factory_setGuardianRegistry_revertsOnFactoryMismatch() public {
+        // Deploy a contract that pretends to be a registry but reports a
+        // different factory address.
+        _BadRegistry bad = new _BadRegistry();
+        vm.prank(owner);
+        vm.expectRevert(SyndicateFactory.RegistryFactoryMismatch.selector);
+        factory.setGuardianRegistry(address(bad));
+    }
+}
+
+contract _BadRegistry {
+    function factory() external pure returns (address) {
+        return address(0xBAD); // not the test factory
     }
 }

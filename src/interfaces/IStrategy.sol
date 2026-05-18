@@ -112,4 +112,15 @@ interface IStrategy {
     ///                        ignores this and uses its own balance delta
     ///                        as the authoritative measure.
     function onLiveWithdraw(uint256 assetsNeeded) external returns (uint256 assetsReturned);
+
+    /// @notice Sherlock #37 capability flag — strategies override to `true`
+    ///         when their `_onLiveWithdraw` can actually free underlying
+    ///         from the live position. The vault reads this on
+    ///         `maxWithdraw` / `maxRedeem` so it doesn't quote a
+    ///         withdraw size that the adapter can't fulfill.
+    ///         Default `false` in `BaseStrategy` — strategies without a
+    ///         partial-unwind path (e.g. Hyperliquid, Mamo) keep the false
+    ///         default and the vault clamps `maxWithdraw` to float-only
+    ///         while a proposal is active.
+    function supportsLiveWithdraw() external view returns (bool);
 }

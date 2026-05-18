@@ -169,6 +169,16 @@ abstract contract BaseStrategy is IStrategy {
         return _onLiveWithdraw(assetsNeeded);
     }
 
+    /// @inheritdoc IStrategy
+    /// @dev Default `false`. Strategies that implement a meaningful
+    ///      `_onLiveWithdraw` override this to `true` so the vault unlocks
+    ///      `maxWithdraw` / `maxRedeem` against the adapter NAV. Strategies
+    ///      without a partial-unwind path keep the default; the vault then
+    ///      clamps to float-only during the active proposal.
+    function supportsLiveWithdraw() external view virtual returns (bool) {
+        return false;
+    }
+
     // ── Internal helpers ──
 
     /// @notice Pull tokens from the vault into this strategy

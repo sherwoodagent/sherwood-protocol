@@ -205,16 +205,33 @@ contract HyperliquidGridStrategyTest is Test {
 
     function test_settle_marksSettled() public {
         _execAndPrep();
+        // Sherlock #23 — settle requires initiateReturn first.
+        vm.prank(proposer);
+        strategy.initiateReturn();
         vm.prank(vault);
         strategy.settle();
         assertTrue(strategy.settled());
     }
 
+    /// @notice Sherlock run #1 finding #23 — settle() MUST revert if
+    ///         returnsInitiated == false. Pre-fix, settle would call
+    ///         _drainHC same-block and push zero balance, recording a phantom
+    ///         total loss while USDC was still in flight on HC.
+    function test_settle_revertsBeforeInitiateReturn() public {
+        _execAndPrep();
+        vm.prank(vault);
+        vm.expectRevert(HyperliquidGridStrategy.ReturnsNotInitiated.selector);
+        strategy.settle();
+        assertFalse(strategy.settled());
+    }
+
     function test_settle_pushesUsdcBack() public {
-        // settle() now does the EVM USDC push directly so the governor's
-        // settle batch sees correct vault.totalAssets() for fee math.
+        // settle() now pushes EVM USDC after initiateReturn has drained HC —
+        // governor's settle batch sees correct vault.totalAssets() for fee math.
         _execAndPrep();
         uint256 vaultBefore = usdc.balanceOf(vault);
+        vm.prank(proposer);
+        strategy.initiateReturn();
         vm.prank(vault);
         strategy.settle();
         assertEq(usdc.balanceOf(vault), vaultBefore + DEPOSIT);
@@ -225,6 +242,8 @@ contract HyperliquidGridStrategyTest is Test {
         // After _settle pushed all EVM USDC, sweepToVault is a no-op (no
         // funds to push — late HC arrivals have not yet landed).
         _execAndPrep();
+        vm.prank(proposer);
+        strategy.initiateReturn();
         vm.prank(vault);
         strategy.settle();
         uint256 vaultBalance = usdc.balanceOf(vault);
@@ -287,30 +306,36 @@ contract HyperliquidGridStrategyTest is Test {
         }
     }
 
-    function test_settle_queuesSpotToEvmBridge() public {
+    function test_initiateReturn_queuesSpotToEvmBridge() public {
         // _initiateReturn must queue a sendAsset (action 13) targeting the
         // USDC system address (0x2000...0000) so HC drains spot back to EVM.
         // Without this, USDC arriving on HC spot from the perp→spot class
         // transfer would strand on HC indefinitely.
+        //
+        // Sherlock #23: pre-fix, this assertion ran on settle() because settle
+        // auto-drained. Post-fix, drain moves to initiateReturn — same event,
+        // different trigger.
         _execAndPrep();
         MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
-        m.setSummary(int64(int256(uint256(8_000e6))), uint64(2_000e6), 0, 0); // freeMargin = 6_000e6
+        // Sherlock #26: full accountValue (8_000e6) is now transferred, not
+        // freeMargin (8000 - 2000 = 6000). marginUsed is released during
+        // the in-batch force-close that precedes the class transfer on HC.
+        m.setSummary(int64(int256(uint256(8_000e6))), uint64(2_000e6), 0, 0);
 
         vm.recordLogs();
-        vm.prank(vault);
-        strategy.settle();
+        vm.prank(proposer);
+        strategy.initiateReturn();
 
         Vm.Log[] memory logs = vm.getRecordedLogs();
         (bool found, SendAssetCall memory call) = _findSendAsset(logs);
-        assertTrue(found, "settle must queue spot->EVM sendAsset bridge");
-        // USDC system address = BASE_SYSTEM_ADDRESS + token_index_0
+        assertTrue(found, "initiateReturn must queue spot->EVM sendAsset bridge");
         assertEq(call.destination, address(0x2000000000000000000000000000000000000000));
         assertEq(call.subAccount, address(0));
         assertEq(call.sourceDex, type(uint32).max); // SPOT_DEX
         assertEq(call.destinationDex, type(uint32).max);
         assertEq(call.token, uint64(0)); // USDC
-        // 6_000e6 perp * 100 = 6_000e8 spot wei. preSpot = 0 in this test.
-        assertEq(call.amount, uint64(6_000e6) * 100);
+        // Sherlock #26: 8_000e6 (full equity) * 100 = 8_000e8 spot wei.
+        assertEq(call.amount, uint64(8_000e6) * 100);
     }
 
     function test_sweepToVault_pullsLateHcArrivals() public {
@@ -318,6 +343,8 @@ contract HyperliquidGridStrategyTest is Test {
         // strategy's EVM USDC later (post-block bridge). sweepToVault()
         // recovers those late arrivals.
         _execAndPrep();
+        vm.prank(proposer);
+        strategy.initiateReturn();
         vm.prank(vault);
         strategy.settle();
         // settle already pushed DEPOSIT — confirm strategy has 0 now.
@@ -389,15 +416,17 @@ contract HyperliquidGridStrategyTest is Test {
         assertEq(strategy.liveCloidsLength(BTC_ASSET), 1);
     }
 
-    function test_settle_selfCancelsTrackedCloids() public {
+    function test_initiateReturn_selfCancelsTrackedCloids() public {
+        // Sherlock #23: cancel-tracked-cloids moved from settle to initiateReturn
+        // along with the rest of _drainHC. Same end-state guarantee.
         _execAndPrep();
         _placeFourBtcOrders();
         // Sanity
         assertEq(strategy.liveCloidsLength(BTC_ASSET), 4);
 
         vm.recordLogs();
-        vm.prank(vault);
-        strategy.settle();
+        vm.prank(proposer);
+        strategy.initiateReturn();
 
         // Tracker drained for all assets
         assertEq(strategy.liveCloidsLength(BTC_ASSET), 0);
@@ -576,6 +605,41 @@ contract HyperliquidGridStrategyTest is Test {
         assertTrue(strategy.returnsInitiated());
     }
 
+    /// @notice PR #324 review R1 — `returnsInitiated` must flip BEFORE
+    ///         `_drainHC()` runs. If the drain reverts (e.g. CoreWriter
+    ///         precompile failure), the revert rolls back the flag write
+    ///         too — but the proposer can retry. Pre-fix order (drain
+    ///         first, flag after) had the same retry behaviour on a clean
+    ///         revert, but offered no protection against a half-success
+    ///         path (orders cancelled, class transfer never reaches the
+    ///         flag flip). The reorder makes the invariant explicit:
+    ///         `returnsInitiated == true` ⟺ caller of this tx intended
+    ///         the drain.
+    function test_initiateReturn_drainRevertLeavesFlagUnset_canRetry() public {
+        _execAndPrep();
+
+        // Mock CoreWriter to revert — any L1Write action inside _drainHC
+        // (cancel + force-close orders) will bubble up.
+        vm.mockCallRevert(
+            address(0x3333333333333333333333333333333333333333),
+            abi.encodeWithSignature("sendRawAction(bytes)"),
+            "core-writer-down"
+        );
+
+        vm.prank(proposer);
+        vm.expectRevert("core-writer-down");
+        strategy.initiateReturn();
+
+        // Flag was rolled back with the revert — proposer can retry.
+        assertFalse(strategy.returnsInitiated(), "flag rolled back on drain revert");
+
+        // Recover CoreWriter and retry — succeeds.
+        vm.clearMockedCalls();
+        vm.prank(proposer);
+        strategy.initiateReturn();
+        assertTrue(strategy.returnsInitiated(), "second attempt flips flag");
+    }
+
     function test_initiateReturn_idempotent() public {
         _execAndPrep();
         MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
@@ -589,26 +653,26 @@ contract HyperliquidGridStrategyTest is Test {
         assertEq(_countClassTransferLogs(vm.getRecordedLogs()), 0, "second initiateReturn must be no-op");
     }
 
-    function test_settle_skipsClassTransferWhenNoPrecompile() public {
+    function test_initiateReturn_skipsClassTransferWhenNoPrecompile() public {
         // No AccountMarginSummary precompile etched → _initiateClassTransfer no-ops.
-        // Settle must still complete and mark settled=true.
+        // initiateReturn must still complete and flip the returnsInitiated flag.
         _execAndPrep();
         vm.recordLogs();
-        vm.prank(vault);
-        strategy.settle();
-        assertTrue(strategy.settled());
+        vm.prank(proposer);
+        strategy.initiateReturn();
+        assertTrue(strategy.returnsInitiated());
         assertEq(_countClassTransferLogs(vm.getRecordedLogs()), 0);
     }
 
-    function test_settle_usesPrecompileAmountForClassTransfer() public {
+    function test_initiateReturn_usesPrecompileAmountForClassTransfer() public {
         _execAndPrep();
         MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
         int64 equity = int64(int256(uint256(9_800e6)));
         m.setSummary(equity, 0, 0, 0); // marginUsed=0 → freeMargin == equity
 
         vm.recordLogs();
-        vm.prank(vault);
-        strategy.settle();
+        vm.prank(proposer);
+        strategy.initiateReturn();
 
         (bool found, uint64 ntl, bool toPerp) = _decodeClassTransfer(vm.getRecordedLogs());
         assertTrue(found, "expected class transfer RawAction");
@@ -616,9 +680,11 @@ contract HyperliquidGridStrategyTest is Test {
         assertFalse(toPerp);
     }
 
-    function test_settle_subtractsMarginUsedFromClassTransfer() public {
-        // If IOC orders partially fill, some marginUsed remains. The class transfer
-        // must use (accountValue - marginUsed) so HC doesn't reject it.
+    /// @notice Sherlock #26: class transfer is now the FULL accountValue,
+    ///         not (accountValue - marginUsed). HC releases marginUsed when
+    ///         it processes the queued force-close orders in the same batch,
+    ///         before the class transfer fires.
+    function test_initiateReturn_transfersFullAccountValue() public {
         _execAndPrep();
         MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
         int64 equity = int64(int256(uint256(9_800e6)));
@@ -626,24 +692,29 @@ contract HyperliquidGridStrategyTest is Test {
         m.setSummary(equity, marginUsed, 0, 0);
 
         vm.recordLogs();
-        vm.prank(vault);
-        strategy.settle();
+        vm.prank(proposer);
+        strategy.initiateReturn();
 
         (bool found, uint64 ntl,) = _decodeClassTransfer(vm.getRecordedLogs());
         assertTrue(found, "expected class transfer");
-        assertEq(ntl, uint64(equity) - marginUsed, "must subtract marginUsed");
+        // Sherlock #26: full equity transferred (was equity - marginUsed).
+        assertEq(ntl, uint64(equity), "Sherlock #26: full accountValue, not freeMargin");
     }
 
-    function test_settle_skipsClassTransferWhenFreeMarginZero() public {
-        // Fully locked account (all equity = marginUsed) → no transfer.
+    /// @notice Sherlock #26: even a fully-locked account fires the class
+    ///         transfer for the full equity — force-closes will release
+    ///         the margin in the same HC batch.
+    function test_initiateReturn_transfersEvenWhenFullyLocked() public {
         _execAndPrep();
         MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
         int64 equity = int64(int256(uint256(9_800e6)));
-        m.setSummary(equity, uint64(equity), 0, 0); // freeMargin == 0
+        m.setSummary(equity, uint64(equity), 0, 0); // marginUsed == equity
         vm.recordLogs();
-        vm.prank(vault);
-        strategy.settle();
-        assertEq(_countClassTransferLogs(vm.getRecordedLogs()), 0, "no transfer when all margin locked");
+        vm.prank(proposer);
+        strategy.initiateReturn();
+        (bool found, uint64 ntl,) = _decodeClassTransfer(vm.getRecordedLogs());
+        assertTrue(found, "transfer fires even when marginUsed == equity");
+        assertEq(ntl, uint64(equity), "transfers full equity");
     }
 
     function test_recoverHcResiduals_revertsBeforeSettle() public {
@@ -661,6 +732,8 @@ contract HyperliquidGridStrategyTest is Test {
         _execAndPrep();
         MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
         m.setSummary(int64(int256(uint256(9_800e6))), uint64(0), 0, 0);
+        vm.prank(proposer);
+        strategy.initiateReturn();
         vm.prank(vault);
         strategy.settle();
         vm.roll(block.number + 1);
@@ -682,6 +755,8 @@ contract HyperliquidGridStrategyTest is Test {
         _execAndPrep();
         MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
         m.setSummary(int64(int256(uint256(1_000e6))), uint64(0), 0, 0);
+        vm.prank(proposer);
+        strategy.initiateReturn();
         vm.prank(vault);
         strategy.settle();
         vm.roll(block.number + 1);
@@ -769,6 +844,8 @@ contract HyperliquidGridStrategyTest is Test {
         _execAndPrep();
         MockAccountMarginSummaryPrecompile m = _etchAccountMarginSummary();
         m.setSummary(int64(int256(uint256(9_800e6))), uint64(0), 0, 0);
+        vm.prank(proposer);
+        strategy.initiateReturn();
         vm.prank(vault);
         strategy.settle();
         vm.roll(block.number + 1);
@@ -798,7 +875,11 @@ contract HyperliquidGridStrategyTest is Test {
         assertEq(value, DEPOSIT - 1e6, "must trust observable when gap <= tolerance");
     }
 
-    function test_positionValue_subsequentDepositInTransitUsesHighWater() public {
+    /// @notice Sherlock #55: HWM fallback removed — _positionValue now
+    ///         always returns `observable`. In-transit windows show a
+    ///         transient NAV drop (correctly), but realized trading losses
+    ///         can no longer be masked by the high-water mark.
+    function test_positionValue_subsequentDepositInTransitObservableOnly() public {
         // Issue #1b regression: a SUBSEQUENT live deposit's in-transit window
         // has HC visible from the prior bridge but observable trails
         // inFlightToHc by the new in-flight amount. The earlier `hcVisible >
@@ -851,10 +932,11 @@ contract HyperliquidGridStrategyTest is Test {
         usdc.burn(address(strategy), usdc.balanceOf(address(strategy)));
         (value, valid) = strategy.positionValue();
         assertTrue(valid);
-        // Old `hcVisible > 0` short-circuit: returns observable = DEPOSIT
-        // (under by `liveAssets`). New tolerance fallback: returns
-        // inFlightToHc = DEPOSIT + liveAssets (correct).
-        assertEq(value, DEPOSIT + liveAssets, "must use high-water when gap exceeds tolerance");
+        // Sherlock #55: HWM fallback dropped. The in-transit window now
+        // shows observable = DEPOSIT (HC visible, EVM emptied) — a
+        // transient NAV dip is the correct disclosure. Realized losses
+        // can no longer hide behind the HWM.
+        assertEq(value, DEPOSIT, "Sherlock #55: observable-only, no HWM mask");
     }
 
     function test_positionValue_outboundInFlightCoversDrainTransitGap() public {
@@ -895,8 +977,11 @@ contract HyperliquidGridStrategyTest is Test {
 
         (uint256 value, bool valid) = strategy.positionValue();
         assertTrue(valid);
-        // observable = 0; gap = 12_500e6 ≫ tolerance → fallback to high-water.
-        assertEq(value, 12_500e6, "in-transit gap must be covered by high-water");
+        // Sherlock #55: HWM fallback removed. observable = 0 wins. The
+        // strategy will briefly report 0 NAV during the in-transit window
+        // — acceptable disclosure cost for not masking realized losses.
+        // `inFlightToHc` is still kept (used by `_drainHC` accounting).
+        assertEq(value, 0, "Sherlock #55: no HWM mask, observable = 0");
     }
 
     function test_initiateReturn_drainsHcOnPath1() public {

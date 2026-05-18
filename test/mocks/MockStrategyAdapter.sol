@@ -79,4 +79,12 @@ contract MockStrategyAdapter is IStrategy {
     function onLiveWithdraw(uint256) external pure returns (uint256) {
         return 0;
     }
+
+    /// @notice Sherlock #37 capability flag mock — default `false` matches
+    ///         the strategy templates that haven't implemented
+    ///         `_onLiveWithdraw`. Tests that need `true` can override via
+    ///         `vm.mockCall`.
+    function supportsLiveWithdraw() external pure returns (bool) {
+        return false;
+    }
 }

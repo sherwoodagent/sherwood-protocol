@@ -36,7 +36,7 @@ contract Governor_proposerSelfSettle_minDuration_Test is Test {
     uint256 constant VOTING_PERIOD = 1 days;
     uint256 constant EXECUTION_WINDOW = 1 days;
     uint256 constant VETO_THRESHOLD_BPS = 4000;
-    uint256 constant MAX_PERF_FEE_BPS = 3000;
+    uint256 constant MAX_PERF_FEE_BPS = 1500;
     uint256 constant COOLDOWN_PERIOD = 1 days;
     uint256 constant MAX_STRATEGY_DURATION = 30 days;
     uint256 constant MIN_SELF_SETTLE = 1 hours;
@@ -131,7 +131,7 @@ contract Governor_proposerSelfSettle_minDuration_Test is Test {
             address(vault),
             address(0),
             "ipfs://self-settle",
-            2000,
+            1500,
             STRATEGY_DURATION,
             _execCalls(),
             _settleCalls(),

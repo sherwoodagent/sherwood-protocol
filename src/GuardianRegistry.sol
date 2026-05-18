@@ -2,10 +2,10 @@
 pragma solidity 0.8.28;
 
 import {IGuardianRegistry} from "./interfaces/IGuardianRegistry.sol";
+import {GuardianRegistryDelegation} from "./GuardianRegistryDelegation.sol";
 import {BatchExecutorLib} from "./BatchExecutorLib.sol";
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
-import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Checkpoints} from "@openzeppelin/contracts/utils/structs/Checkpoints.sol";
@@ -42,15 +42,12 @@ interface IGovernorMinimal {
 ///         epoch rewards, and slash-appeal reserve. Skeleton only — subsequent
 ///         tasks fill in each function body. See
 ///         `docs/superpowers/plans/2026-04-20-guardian-review-lifecycle.md`.
-contract GuardianRegistry is IGuardianRegistry, OwnableUpgradeable, UUPSUpgradeable, ReentrancyGuardTransient {
+contract GuardianRegistry is GuardianRegistryDelegation, OwnableUpgradeable, UUPSUpgradeable {
     using SafeERC20 for IERC20;
 
     // ── Constants ──
-    /// @notice 100% in basis points.
-    /// @dev `internal` to avoid emitting an auto-getter (the registry is at the
-    ///      28-byte EIP-170 ceiling — every byte counts).
-    uint256 internal constant BPS_DENOMINATOR = 10_000;
-    uint256 public constant EPOCH_DURATION = 7 days;
+    // `BPS_DENOMINATOR` + `EPOCH_DURATION` now declared in
+    // `GuardianRegistryDelegation`; inherited.
     uint256 public constant MIN_COHORT_STAKE_AT_OPEN = 50_000 * 1e18;
     uint256 public constant MAX_APPROVERS_PER_PROPOSAL = 100;
     /// @notice Upper bound on blockers per proposal. Caps the O(n)
@@ -130,6 +127,12 @@ contract GuardianRegistry is IGuardianRegistry, OwnableUpgradeable, UUPSUpgradea
         uint8 nonce; // bumped on open/cancel so prior block votes go stale
         uint64 openedAt; // timestamp for checkpoint lookup of vote weight
         uint128 totalDelegatedAtOpen; // delegation half of the quorum denom
+        /// @dev Sherlock #45 — set in `openEmergency` when stake + delegation
+        ///      at open is below MIN_COHORT_STAKE_AT_OPEN. `_resolveEmergency`
+        ///      then short-circuits to `blocked=false` so a single guardian
+        ///      with > blockQuorumBps of the small cohort can't slash the
+        ///      owner. Mirrors the regular review's `Review.cohortTooSmall`.
+        bool cohortTooSmall;
     }
 
     mapping(uint256 => EmergencyReview) internal _emergencyReviews;
@@ -183,64 +186,11 @@ contract GuardianRegistry is IGuardianRegistry, OwnableUpgradeable, UUPSUpgradea
     ///      but indexed by timestamp for historical quorum-denominator lookups.
     Checkpoints.Trace224 internal _totalStakeCheckpoint;
 
-    // ── Delegation ──
-    /// @dev Per-(delegator, delegate) locked balance. WOOD moves from the
-    ///      delegator's wallet into the registry on `delegateStake`.
-    mapping(address delegator => mapping(address delegate => uint256)) internal _delegations;
-
-    /// @dev Per-(delegator, delegate) historical balance. At vote / reward
-    ///      attribution we look up `_delegationCheckpoints[delegator][delegate]
-    ///      .upperLookupRecent(reviewOpenedAt)` to split the delegate's
-    ///      voting pool among their delegators.
-    mapping(address delegator => mapping(address delegate => Checkpoints.Trace224)) internal _delegationCheckpoints;
-
-    /// @dev Per-(delegator, delegate) unstake-request timestamp; 0 = no request.
-    mapping(address delegator => mapping(address delegate => uint64)) internal _unstakeDelegationRequestedAt;
-
-    /// @dev Per-delegate inbound delegation sum (current).
-    mapping(address delegate => uint256) internal _delegatedInbound;
-
-    /// @dev Per-delegate inbound delegation history for `getPastDelegated`.
-    mapping(address delegate => Checkpoints.Trace224) internal _delegatedInboundCheckpoints;
-
-    /// @dev Global sum of all delegations (for quorum denominator at review open).
-    uint256 public totalDelegatedStake;
-
-    /// @dev Global delegation total history for `getPastTotalDelegated`.
-    Checkpoints.Trace224 internal _totalDelegatedCheckpoint;
-
-    // ── DPoS commission ──
-
-    /// @notice Max commission a delegate can charge their delegators (50%).
-    uint256 public constant MAX_COMMISSION_BPS = 5000;
-
-    /// @notice Max bps increase per epoch (5%). Prevents delegates from
-    ///         instant-ramping commission to rug their delegators' share of
-    ///         already-earned rewards. Decreases are unbounded.
-    uint256 public constant MAX_COMMISSION_INCREASE_PER_EPOCH = 500;
-
-    /// @dev Current commission rate per delegate.
-    mapping(address => uint256) internal _commissionBps;
-
-    /// @dev Epoch in which the delegate last raised (or first-set) their
-    ///      commission. Used to detect transition into a new raise-epoch so
-    ///      `_commissionEpochBaseline` can be re-anchored.
-    mapping(address => uint256) internal _lastCommissionRaiseEpoch;
-
-    /// @dev Anchor for the per-epoch cumulative raise cap. Seeded on:
-    ///      - first-ever set: baseline = newBps (rate is being announced)
-    ///      - first raise of a new epoch: baseline = rate at epochStart - 1
-    ///        (last pre-epoch checkpoint)
-    ///      Subsequent raises within the same epoch keep the baseline fixed,
-    ///      so chained raises cannot compound past
-    ///      `baseline + MAX_COMMISSION_INCREASE_PER_EPOCH`.
-    mapping(address => uint256) internal _commissionEpochBaseline;
-
-    /// @dev Per-delegate commission history keyed by timestamp. Consumed by
-    ///      `claimProposalReward` which looks up the rate at `settledAt` —
-    ///      closes the retroactive-raise vector. Also consumed by
-    ///      `setCommission` itself to derive the per-epoch raise baseline.
-    mapping(address => Checkpoints.Trace224) internal _commissionCheckpoints;
+    // ── Delegation + commission storage ──
+    // Moved to `GuardianRegistryDelegation` abstract (PR #324 followup,
+    // bytecode reclaim). Storage layout note: the abstract sits FIRST in
+    // the inheritance chain, so its slots come BEFORE this contract's
+    // remaining state. V1.5 is fresh redeploy; proxies start zeroed.
 
     // ── Per-proposal guardian-fee pool ──
 
@@ -256,10 +206,10 @@ contract GuardianRegistry is IGuardianRegistry, OwnableUpgradeable, UUPSUpgradea
     /// @dev Claim flags for approvers (set in `claimProposalReward`).
     mapping(uint256 => mapping(address => bool)) internal _approverClaimed;
 
-    /// @dev Remainder (approver's net-of-commission pool) stored after the
-    ///      approver claims, to be pulled by their delegators pro-rata.
-    mapping(address => mapping(uint256 => uint256)) internal _delegatorProposalPool;
-    mapping(address => mapping(uint256 => mapping(address => bool))) internal _delegatorProposalClaimed;
+    // `_delegatorProposalPool` + `_delegatorProposalClaimed` moved to
+    // `GuardianRegistryDelegation` so the abstract owns the delegator-pull
+    // path; this contract's `claimProposalReward` writes them via
+    // inheritance.
 
     /// @dev W-1 escrow for guardian-fee reward transfers that fail (e.g. USDC
     ///      blacklist). Keyed by `keccak256(proposalId, recipient, asset)` to
@@ -274,9 +224,12 @@ contract GuardianRegistry is IGuardianRegistry, OwnableUpgradeable, UUPSUpgradea
     ///      -4 (commission), -5 (guardian-fee pool + claim flags + escrow),
     ///      +2 (removed parameter-change timelock),
     ///      +3 (P1-3/4/5: drop activeGuardianCount + _emergencyVoteStake + minter),
-    ///      -1 (V2 _emergencyCalls)
-    ///      = -14 total.
-    uint256[37] private __gap;
+    ///      -1 (V2 _emergencyCalls),
+    ///      +13 (extracted delegation/commission/delegator-pool storage to
+    ///           `GuardianRegistryDelegation` abstract — those slots no longer
+    ///           live here)
+    ///      = -1 total.
+    uint256[50] private __gap;
 
     // ── Initializer ──
     /// @custom:oz-upgrades-unsafe-allow constructor
@@ -409,161 +362,10 @@ contract GuardianRegistry is IGuardianRegistry, OwnableUpgradeable, UUPSUpgradea
     /// @dev After `coolDownPeriod` from `unstakeRequestedAt`, releases WOOD and
     ///      deregisters the guardian entirely (struct deleted — agentId can differ on
     ///      a subsequent re-stake).
-    // ──────────────────────────────────────────────────────────────
-    // Stake-pool delegation
-    // ──────────────────────────────────────────────────────────────
-
-    /// @inheritdoc IGuardianRegistry
-    /// @dev Permissive delegation — any address can be a delegate. To be
-    ///      active-guardian-eligible, the delegate still needs their OWN
-    ///      stake >= minGuardianStake (delegation adds to vote weight but
-    ///      does not bypass activation). Delegating to self is disallowed to
-    ///      keep own-stake and delegated pools strictly disjoint.
-    ///
-    ///      Custody moves into the registry; balance tracked per-(delegator,
-    ///      delegate) pair with a Trace224 checkpoint for historical
-    ///      attribution. If the delegator had a pending unstake request for
-    ///      this delegate, re-delegating implicitly cancels it.
-    function delegateStake(address delegate, uint256 amount) external nonReentrant {
-        if (delegate == msg.sender) revert CannotSelfDelegate();
-        if (delegate == address(0)) revert InvalidDelegate();
-        if (amount == 0) revert AmountZero();
-        // I-5: delegating to a guardian that has 0 active stake (never staked,
-        // fully slashed, or mid-unstake) traps the delegator's WOOD behind the
-        // 7-day cooldown pointing at a vote-inert address. Reject early so the
-        // UX surface + accounting both reflect reality.
-        if (!_isActiveGuardian(delegate)) revert InactiveDelegate();
-
-        // Re-delegation implicitly cancels any in-flight unstake request.
-        _unstakeDelegationRequestedAt[msg.sender][delegate] = 0;
-
-        wood.safeTransferFrom(msg.sender, address(this), amount);
-
-        uint256 newBalance = _delegations[msg.sender][delegate] + amount;
-        _delegations[msg.sender][delegate] = newBalance;
-        _delegatedInbound[delegate] += amount;
-        totalDelegatedStake += amount;
-
-        _delegationCheckpoints[msg.sender][delegate].push(uint32(block.timestamp), uint224(newBalance));
-        _delegatedInboundCheckpoints[delegate].push(uint32(block.timestamp), uint224(_delegatedInbound[delegate]));
-        _totalDelegatedCheckpoint.push(uint32(block.timestamp), uint224(totalDelegatedStake));
-
-        emit DelegationIncreased(msg.sender, delegate, amount);
-    }
-
-    /// @inheritdoc IGuardianRegistry
-    /// @dev Starts the 7-day unstake-delegation cooldown. The delegation slot
-    ///      stays non-zero in `_delegations` (delegate's vote weight at any
-    ///      already-opened review that referenced the delegator's weight at
-    ///      `r.openedAt` is frozen via the Trace224 checkpoint, so requesting
-    ///      unstake now does not retroactively change anything).
-    function requestUnstakeDelegation(address delegate) external {
-        if (_delegations[msg.sender][delegate] == 0) revert NoActiveDelegation();
-        if (_unstakeDelegationRequestedAt[msg.sender][delegate] != 0) revert UnstakeAlreadyRequested();
-        _unstakeDelegationRequestedAt[msg.sender][delegate] = uint64(block.timestamp);
-        emit DelegationUnstakeRequested(msg.sender, delegate, block.timestamp);
-    }
-
-    /// @inheritdoc IGuardianRegistry
-    function cancelUnstakeDelegation(address delegate) external {
-        if (_unstakeDelegationRequestedAt[msg.sender][delegate] == 0) revert NoUnstakeRequest();
-        _unstakeDelegationRequestedAt[msg.sender][delegate] = 0;
-        emit DelegationUnstakeCancelled(msg.sender, delegate);
-    }
-
-    /// @inheritdoc IGuardianRegistry
-    /// @dev After `coolDownPeriod`, zeros the delegation slot, decrements the
-    ///      delegate's inbound totals and global total, pushes zero checkpoints
-    ///      for the delegator + inbound histories, and refunds WOOD.
-    /// @dev nonReentrant dropped — CEI: delegation zeroed + checkpoints
-    ///      pushed before transfer.
-    function claimUnstakeDelegation(address delegate) external {
-        uint64 requestedAt = _unstakeDelegationRequestedAt[msg.sender][delegate];
-        if (requestedAt == 0) revert NoUnstakeRequest();
-        if (block.timestamp < uint256(requestedAt) + coolDownPeriod) revert UnstakeCooldownActive();
-
-        uint256 amount = _delegations[msg.sender][delegate];
-        _delegations[msg.sender][delegate] = 0;
-        _unstakeDelegationRequestedAt[msg.sender][delegate] = 0;
-        _delegatedInbound[delegate] -= amount;
-        totalDelegatedStake -= amount;
-
-        _delegationCheckpoints[msg.sender][delegate].push(uint32(block.timestamp), 0);
-        _delegatedInboundCheckpoints[delegate].push(uint32(block.timestamp), uint224(_delegatedInbound[delegate]));
-        _totalDelegatedCheckpoint.push(uint32(block.timestamp), uint224(totalDelegatedStake));
-
-        wood.safeTransfer(msg.sender, amount);
-        emit DelegationUnstakeClaimed(msg.sender, delegate, amount);
-    }
-
-    // ──────────────────────────────────────────────────────────────
-    // DPoS commission configuration
-    // ──────────────────────────────────────────────────────────────
-
-    /// @inheritdoc IGuardianRegistry
-    /// @dev Sets the caller's commission rate (0 – MAX_COMMISSION_BPS) that
-    ///      applies to their delegators' share of future guardian-fee and WOOD
-    ///      epoch rewards. Raises capped to `MAX_COMMISSION_INCREASE_PER_EPOCH`
-    ///      bps above the rate that held at the start of the current epoch —
-    ///      *cumulative*, so chaining multiple raises within the same epoch
-    ///      can't compound past the cap. Decreases are unbounded. Pushes a
-    ///      checkpoint so historical claims resolve the rate at their
-    ///      `settledAt`.
-    function setCommission(uint256 newBps) external {
-        if (newBps > MAX_COMMISSION_BPS) revert CommissionExceedsMax();
-
-        uint256 old = _commissionBps[msg.sender];
-        if (newBps == old) return;
-
-        if (newBps > old) {
-            uint256 curEpoch = currentEpoch();
-            (bool hasHistory,,) = _commissionCheckpoints[msg.sender].latestCheckpoint();
-            // First-set is exempt from the raise cap ONLY if the delegate
-            // has no delegators yet. An unconditional first-set exemption
-            // would allow a delegate to accept delegations at implied 0%
-            // commission and then JIT-rug to 50% in the same block as
-            // `settledAt` — defeating rug-protection. By gating the
-            // exemption on `_delegatedInbound == 0`, legitimate delegates
-            // can still announce any opening rate before attracting
-            // delegators, but any post-delegation raise is rate-limited.
-            if (!hasHistory && _delegatedInbound[msg.sender] == 0) {
-                // Pure announcement: no delegators at risk, no cap.
-                _commissionEpochBaseline[msg.sender] = newBps;
-                _lastCommissionRaiseEpoch[msg.sender] = curEpoch;
-            } else {
-                if (_lastCommissionRaiseEpoch[msg.sender] != curEpoch) {
-                    // New raise-epoch: re-anchor baseline to previous-epoch
-                    // final state. Lookup at epochStart - 1 excludes any
-                    // checkpoint pushed this epoch. First-set-with-delegators
-                    // (no prior checkpoint) yields baseline = 0.
-                    uint256 epochStart = epochGenesis + curEpoch * EPOCH_DURATION;
-                    uint256 probe = epochStart - 1;
-                    _commissionEpochBaseline[msg.sender] =
-                        _commissionCheckpoints[msg.sender].upperLookupRecent(uint32(probe));
-                    _lastCommissionRaiseEpoch[msg.sender] = curEpoch;
-                }
-                uint256 baseline = _commissionEpochBaseline[msg.sender];
-                if (newBps > baseline + MAX_COMMISSION_INCREASE_PER_EPOCH) {
-                    revert CommissionRaiseExceedsLimit();
-                }
-            }
-        }
-
-        _commissionBps[msg.sender] = newBps;
-        _commissionCheckpoints[msg.sender].push(uint32(block.timestamp), uint224(newBps));
-
-        emit CommissionSet(msg.sender, old, newBps);
-    }
-
-    /// @inheritdoc IGuardianRegistry
-    function commissionOf(address delegate) external view returns (uint256) {
-        return _commissionBps[delegate];
-    }
-
-    /// @inheritdoc IGuardianRegistry
-    function commissionAt(address delegate, uint256 timestamp) external view returns (uint256) {
-        return _commissionCheckpoints[delegate].upperLookupRecent(uint32(timestamp));
-    }
+    // Stake-pool delegation + DPoS commission moved to
+    // `GuardianRegistryDelegation` (PR #324 followup, bytecode reclaim).
+    // `commissionAt` external view dropped earlier — historical lookups go
+    // via the `CommissionSet` event stream.
 
     // ──────────────────────────────────────────────────────────────
     // Guardian-fee pool funding
@@ -598,27 +400,32 @@ contract GuardianRegistry is IGuardianRegistry, OwnableUpgradeable, UUPSUpgradea
     // ──────────────────────────────────────────────────────────────
 
     /// @inheritdoc IGuardianRegistry
-    /// @dev Approve-side-only reward. The approver's gross share is split by
-    ///      source: the portion attributable to their OWN stake is paid
-    ///      directly to them in full; the portion attributable to their
-    ///      delegators is split by DPoS commission rate (commission paid to
-    ///      approver, remainder stored for delegators to claim). A solo
-    ///      approver with no delegators receives their full gross share
-    ///      regardless of commission rate (closes the "solo-approver-loses-
-    ///      remainder" bug).
+    /// @dev Approve-side reward. **Sherlock #41**: permissionless caller; the
+    ///      approver is supplied explicitly so the delegator pool gets
+    ///      seeded even if the approver themselves never invokes the claim
+    ///      path (intentional griefing or absentee). Funds always flow to
+    ///      `approver` (with W-1 escrow fallback on transfer failure), so a
+    ///      third-party caller cannot redirect them.
+    ///
+    ///      The approver's gross share is split by source: the portion
+    ///      attributable to their OWN stake is paid in full; the portion
+    ///      attributable to their delegators is split by DPoS commission rate
+    ///      (commission paid to approver, remainder stored for delegators).
+    ///      A solo approver with no delegators receives their full gross share
+    ///      regardless of commission rate.
     ///      Commission rate is looked up at `settledAt` via
     ///      `_commissionCheckpoints`.
     ///      CEI is respected: `_approverClaimed[...] = true` is set before the
     ///      external transfer, so reentry hits `AlreadyClaimed`. No
     ///      `nonReentrant` needed.
-    function claimProposalReward(uint256 proposalId) external whenNotPaused {
+    function claimProposalReward(address approver, uint256 proposalId) external whenNotPaused {
         ProposalRewardPool memory pool = _proposalGuardianPool[proposalId];
         if (pool.amount == 0) revert NoPoolFunded();
-        if (_approverClaimed[proposalId][msg.sender]) revert AlreadyClaimed();
+        if (_approverClaimed[proposalId][approver]) revert AlreadyClaimed();
 
         // Approve-side only. `_voteStake > 0` is guaranteed whenever
         // `_votes == Approve` (voteOnProposal reverts on zero-weight voters).
-        if (_votes[proposalId][msg.sender] != GuardianVoteType.Approve) revert NotApprover();
+        if (_votes[proposalId][approver] != GuardianVoteType.Approve) revert NotApprover();
 
         // Compute the four payout numbers in a scope block so all the
         // intermediate locals (w, r, ownW, grossFromOwn, grossFromDelegated,
@@ -629,7 +436,7 @@ contract GuardianRegistry is IGuardianRegistry, OwnableUpgradeable, UUPSUpgradea
         uint256 remainder;
         uint256 approverPayout;
         {
-            uint256 w = _voteStake[proposalId][msg.sender];
+            uint256 w = _voteStake[proposalId][approver];
             Review storage r = _reviews[proposalId];
             // approveStakeWeight >= w by construction (w is one of the weights summed into it).
             gross = (uint256(pool.amount) * w) / uint256(r.approveStakeWeight);
@@ -641,13 +448,13 @@ contract GuardianRegistry is IGuardianRegistry, OwnableUpgradeable, UUPSUpgradea
             // own@openedAt + delegated@openedAt). No clamp needed. Reading at
             // `settledAt` instead would strand funds when an approver requests
             // unstake mid-review.
-            uint256 ownW = _stakeCheckpoints[msg.sender].upperLookupRecent(uint32(r.openedAt));
+            uint256 ownW = _stakeCheckpoints[approver].upperLookupRecent(uint32(r.openedAt));
             uint256 grossFromOwn = (gross * ownW) / w;
             uint256 grossFromDelegated = gross - grossFromOwn;
 
             // Commission RATE stays at settledAt — only the vote-weight
             // lookup moves to openedAt.
-            uint256 rate = _commissionCheckpoints[msg.sender].upperLookupRecent(uint32(pool.settledAt));
+            uint256 rate = _commissionCheckpoints[approver].upperLookupRecent(uint32(pool.settledAt));
             commission = (grossFromDelegated * rate) / BPS_DENOMINATOR;
             approverPayout = grossFromOwn + commission;
             remainder = grossFromDelegated - commission;
@@ -657,51 +464,16 @@ contract GuardianRegistry is IGuardianRegistry, OwnableUpgradeable, UUPSUpgradea
         // zero remainder) is cheaper in bytecode than branching; solo
         // approvers pay ~2.1k gas for a zero-write — acceptable vs the
         // EIP-170 pressure on the registry.
-        _approverClaimed[proposalId][msg.sender] = true;
-        _delegatorProposalPool[msg.sender][proposalId] = remainder;
+        _approverClaimed[proposalId][approver] = true;
+        _delegatorProposalPool[approver][proposalId] = remainder;
 
         if (approverPayout > 0) {
-            _safeRewardTransfer(pool.asset, msg.sender, approverPayout, proposalId);
+            _safeRewardTransfer(pool.asset, approver, approverPayout, proposalId);
         }
-        emit ApproverRewardClaimed(proposalId, msg.sender, gross, commission, remainder);
+        emit ApproverRewardClaimed(proposalId, approver, gross, commission, remainder);
     }
 
-    /// @inheritdoc IGuardianRegistry
-    /// @dev Pulls the delegator's pro-rata share of the delegate's remainder
-    ///      pool. Requires the delegate to have already called
-    ///      `claimProposalReward` (otherwise the pool is zero). Attribution
-    ///      timestamp is `openedAt` — same as the approver's vote-weight
-    ///      snapshot — so delegator denominator and `grossFromDelegated`
-    ///      numerator align.
-    /// @dev Not `whenNotPaused` — bytecode reclaim. The delegator pool was
-    ///      already seeded by the approver's claim (which IS paused-gated),
-    ///      so value is already earmarked for delegators; pausing the pull
-    ///      doesn't protect anything. `claimUnstakeGuardian` applies the
-    ///      same reasoning.
-    function claimDelegatorProposalReward(address delegate, uint256 proposalId) external {
-        if (_delegatorProposalClaimed[delegate][proposalId][msg.sender]) revert AlreadyClaimed();
-        uint256 pool = _delegatorProposalPool[delegate][proposalId];
-        if (pool == 0) revert DelegatePoolEmpty();
-
-        ProposalRewardPool memory p = _proposalGuardianPool[proposalId];
-        uint32 openedAt = uint32(_reviews[proposalId].openedAt);
-
-        uint256 my = _delegationCheckpoints[msg.sender][delegate].upperLookupRecent(openedAt);
-        uint256 totalDelegated = _delegatedInboundCheckpoints[delegate].upperLookupRecent(openedAt);
-        // `totalDelegated == 0` would underflow division. `my == 0` would just
-        // compute share = 0; claim flag still flips so no double-claim rot.
-        if (totalDelegated == 0) revert NoDelegationAtSettle();
-
-        uint256 share = (pool * my) / totalDelegated;
-
-        // CEI: flag before transfer.
-        _delegatorProposalClaimed[delegate][proposalId][msg.sender] = true;
-
-        if (share > 0) {
-            _safeRewardTransfer(p.asset, msg.sender, share, proposalId);
-        }
-        emit DelegatorProposalRewardClaimed(msg.sender, delegate, proposalId, share);
-    }
+    // `claimDelegatorProposalReward` moved to `GuardianRegistryDelegation`.
 
     /// @inheritdoc IGuardianRegistry
     /// @dev W-1 retry path. After the transfer-failure condition is lifted
@@ -745,7 +517,10 @@ contract GuardianRegistry is IGuardianRegistry, OwnableUpgradeable, UUPSUpgradea
     ///      keyed by `(proposalId, recipient, asset)` + emits
     ///      `ApproverFeeEscrowed`. Cross-proposal drain is impossible because
     ///      the key includes `proposalId`.
-    function _safeRewardTransfer(address asset, address recipient, uint256 amount, uint256 proposalId) private {
+    function _safeRewardTransfer(address asset, address recipient, uint256 amount, uint256 proposalId)
+        internal
+        override
+    {
         bool ok;
         try IERC20(asset).transfer(recipient, amount) returns (bool r) {
             ok = r;
@@ -807,6 +582,14 @@ contract GuardianRegistry is IGuardianRegistry, OwnableUpgradeable, UUPSUpgradea
         if (existing == support) revert NoVoteChange();
 
         if (existing == GuardianVoteType.None) {
+            // Sherlock #42: apply the late-vote lockout to first-time votes
+            // too. Pre-fix, only vote-changes were lockout-gated, so a
+            // non-voter could time a decisive Block at the last second to
+            // slash early Approvers who couldn't change their vote anymore.
+            uint256 reviewWindow = uint256(p.reviewEnd) - uint256(p.voteEnd);
+            uint256 lockoutStart = p.reviewEnd - (reviewWindow * LATE_VOTE_LOCKOUT_BPS) / BPS_DENOMINATOR;
+            if (block.timestamp >= lockoutStart) revert VoteChangeLockedOut();
+
             // First vote — snapshot own + delegated weight AT `r.openedAt`.
             uint256 own = _stakeCheckpoints[msg.sender].upperLookupRecent(uint32(r.openedAt));
             if (own == 0) revert NotActiveGuardian(); // no active own stake at open time
@@ -914,9 +697,31 @@ contract GuardianRegistry is IGuardianRegistry, OwnableUpgradeable, UUPSUpgradea
         delete _blockerIndex[proposalId][g];
     }
 
-    function _isActiveGuardian(address g) private view returns (bool) {
+    function _isActiveGuardian(address g) internal view override returns (bool) {
         Guardian storage gs = _guardians[g];
         return gs.stakedAmount > 0 && gs.unstakeRequestedAt == 0;
+    }
+
+    // ── Virtual accessors for `GuardianRegistryDelegation` abstract ──
+
+    function _wood() internal view override returns (IERC20) {
+        return wood;
+    }
+
+    function _coolDownPeriod() internal view override returns (uint256) {
+        return coolDownPeriod;
+    }
+
+    function _epochGenesis() internal view override returns (uint256) {
+        return epochGenesis;
+    }
+
+    function _reviewOpenedAt(uint256 proposalId) internal view override returns (uint32) {
+        return uint32(_reviews[proposalId].openedAt);
+    }
+
+    function _proposalRewardAsset(uint256 proposalId) internal view override returns (address) {
+        return _proposalGuardianPool[proposalId].asset;
     }
 
     // ── Owner fns ──
@@ -1015,7 +820,7 @@ contract GuardianRegistry is IGuardianRegistry, OwnableUpgradeable, UUPSUpgradea
     function bindOwnerStake(address owner_, address vault) external onlyFactory {
         PreparedOwnerStake storage p = _prepared[owner_];
         if (p.amount == 0 || p.bound) revert PreparedStakeNotFound();
-        if (p.amount < requiredOwnerBond(vault)) revert OwnerBondInsufficient();
+        if (p.amount < minOwnerStake) revert OwnerBondInsufficient();
 
         _ownerStakes[vault] = OwnerStake({stakedAmount: p.amount, unstakeRequestedAt: 0, owner: owner_});
         p.bound = true;
@@ -1039,7 +844,7 @@ contract GuardianRegistry is IGuardianRegistry, OwnableUpgradeable, UUPSUpgradea
 
         PreparedOwnerStake storage p = _prepared[newOwner];
         if (p.amount == 0 || p.bound) revert PreparedStakeNotFound();
-        if (p.amount < requiredOwnerBond(vault)) revert OwnerBondInsufficient();
+        if (p.amount < minOwnerStake) revert OwnerBondInsufficient();
 
         _ownerStakes[vault] = OwnerStake({stakedAmount: p.amount, unstakeRequestedAt: 0, owner: newOwner});
         p.bound = true;
@@ -1060,16 +865,30 @@ contract GuardianRegistry is IGuardianRegistry, OwnableUpgradeable, UUPSUpgradea
         if (keccak256(abi.encode(calls)) != callsHash) revert EmergencyHashMismatch();
 
         EmergencyReview storage er = _emergencyReviews[proposalId];
-        if (er.reviewEnd > 0 && !er.resolved) revert EmergencyAlreadyOpen();
-        uint64 newReviewEnd = uint64(block.timestamp + reviewPeriod);
+        // Sherlock #15: collapsed gate covers both "review already open" AND
+        // "post-cancel cooldown active". `cancelEmergency` repurposes
+        // `er.reviewEnd` post-cancel to encode `block.timestamp + reviewPeriod`
+        // (cooldown deadline). After `resolveEmergencyReview` runs naturally
+        // (post-window), `reviewEnd` is the original past timestamp, so this
+        // check passes and re-open is allowed. The cancel-and-replay grind on
+        // guardian block votes is gated by the cooldown branch.
+        if (er.reviewEnd > 0 && block.timestamp < er.reviewEnd) revert EmergencyAlreadyOpen();
+        // Sherlock #45: snapshot stake totals + flag cold-start cohort so
+        // `_resolveEmergency` / `cancelEmergency` short-circuit to "no
+        // slash". Bootstrap windows otherwise let a single guardian with >
+        // blockQuorumBps of the small cohort unilaterally slash the owner.
+        uint256 gs = totalGuardianStake;
+        uint256 ds = totalDelegatedStake;
         er.callsHash = callsHash;
-        er.reviewEnd = newReviewEnd;
-        er.totalStakeAtOpen = uint128(totalGuardianStake);
-        er.totalDelegatedAtOpen = uint128(totalDelegatedStake);
+        er.reviewEnd = uint64(block.timestamp + reviewPeriod);
+        er.totalStakeAtOpen = uint128(gs);
+        er.totalDelegatedAtOpen = uint128(ds);
         er.blockStakeWeight = 0;
         er.resolved = false;
         er.blocked = false;
         er.openedAt = uint64(block.timestamp - 1);
+        er.cohortTooSmall = gs + ds < MIN_COHORT_STAKE_AT_OPEN;
+        uint64 newReviewEnd = er.reviewEnd;
         unchecked {
             er.nonce++;
         }
@@ -1103,10 +922,22 @@ contract GuardianRegistry is IGuardianRegistry, OwnableUpgradeable, UUPSUpgradea
     function cancelEmergency(uint256 proposalId) external onlyGovernor {
         EmergencyReview storage er = _emergencyReviews[proposalId];
         if (er.reviewEnd > 0 && block.timestamp >= er.reviewEnd) revert ReviewNotOpen();
+        // Sherlock #44: once block quorum is reached, the owner can't dodge
+        // the slash by cancelling. Reuses `ReviewNotOpen` revert — review
+        // is no longer cancelable; owner must face `resolveEmergencyReview`.
+        if (!er.cohortTooSmall) {
+            uint256 denom = uint256(er.totalStakeAtOpen) + uint256(er.totalDelegatedAtOpen);
+            if (uint256(er.blockStakeWeight) * 10_000 >= blockQuorumBps * denom) revert ReviewNotOpen();
+        }
         er.resolved = true;
         er.blocked = false;
         er.blockStakeWeight = 0;
-        er.reviewEnd = 0;
+        // Sherlock #15: repurpose `reviewEnd` post-cancel to encode the
+        // cooldown deadline. The `er.resolved == true` flag distinguishes
+        // a stamped cooldown from a pre-open `reviewEnd == 0`. Saves a
+        // storage slot vs a separate `lastCancelAt` field. `openEmergency`
+        // reads this in its cooldown check.
+        er.reviewEnd = uint64(block.timestamp + reviewPeriod);
         er.callsHash = bytes32(0);
         unchecked {
             er.nonce++;
@@ -1330,7 +1161,11 @@ contract GuardianRegistry is IGuardianRegistry, OwnableUpgradeable, UUPSUpgradea
         returns (bool, BatchExecutorLib.Call[] memory)
     {
         EmergencyReview storage er = _emergencyReviews[proposalId];
-        if (er.reviewEnd == 0 || block.timestamp < er.reviewEnd) revert ReviewNotReadyForResolve();
+        // Sherlock #15: cancel zeros `callsHash`, so this check rejects both
+        // "never opened" (callsHash == 0 by default) AND "cancelled then
+        // cooldown elapsed" — preventing a cancelled emergency from
+        // silently finalizing as a no-op.
+        if (er.callsHash == bytes32(0) || block.timestamp < er.reviewEnd) revert ReviewNotReadyForResolve();
         if (!er.resolved) _resolveEmergency(proposalId, er);
         BatchExecutorLib.Call[] memory result = _loadEmergencyCalls(proposalId);
         delete _emergencyCalls[proposalId];
@@ -1345,7 +1180,9 @@ contract GuardianRegistry is IGuardianRegistry, OwnableUpgradeable, UUPSUpgradea
     ///      works even if the owner never calls `finalizeEmergencySettle`.
     function resolveEmergencyReview(uint256 proposalId) external whenNotPaused {
         EmergencyReview storage er = _emergencyReviews[proposalId];
-        if (er.reviewEnd == 0 || block.timestamp < er.reviewEnd) revert ReviewNotReadyForResolve();
+        // Sherlock #15: same `callsHash == 0` gate as `finalizeEmergency` —
+        // cancelled reviews don't trigger a resolve no-op.
+        if (er.callsHash == bytes32(0) || block.timestamp < er.reviewEnd) revert ReviewNotReadyForResolve();
         if (er.resolved) return; // idempotent
         _resolveEmergency(proposalId, er);
     }
@@ -1354,10 +1191,13 @@ contract GuardianRegistry is IGuardianRegistry, OwnableUpgradeable, UUPSUpgradea
     ///      `resolveEmergencyReview`. Commits `resolved`/`blocked` flags
     ///      and slashes the vault owner if blocked.
     function _resolveEmergency(uint256 proposalId, EmergencyReview storage er) private {
-        uint256 denomE = uint256(er.totalStakeAtOpen) + uint256(er.totalDelegatedAtOpen);
+        // Sherlock #45: cold-start cohort → blocked=false regardless of votes.
         bool blocked_;
-        if (denomE > 0) {
-            blocked_ = (uint256(er.blockStakeWeight) * 10_000 >= blockQuorumBps * denomE);
+        if (!er.cohortTooSmall) {
+            uint256 denomE = uint256(er.totalStakeAtOpen) + uint256(er.totalDelegatedAtOpen);
+            if (denomE > 0) {
+                blocked_ = (uint256(er.blockStakeWeight) * 10_000 >= blockQuorumBps * denomE);
+            }
         }
         er.resolved = true;
         er.blocked = blocked_;
@@ -1472,7 +1312,7 @@ contract GuardianRegistry is IGuardianRegistry, OwnableUpgradeable, UUPSUpgradea
     function refundSlash(address recipient, uint256 amount) external onlyOwner {
         if (recipient == address(0)) revert ZeroAddress();
 
-        uint256 ep = currentEpoch();
+        uint256 ep = (block.timestamp - epochGenesis) / EPOCH_DURATION;
         uint256 cap = (slashAppealReserve * MAX_REFUND_PER_EPOCH_BPS) / BPS_DENOMINATOR;
         if (refundedInEpoch[ep] + amount > cap) revert RefundCapExceeded();
 
@@ -1576,13 +1416,7 @@ contract GuardianRegistry is IGuardianRegistry, OwnableUpgradeable, UUPSUpgradea
     ///         instead of live stake, closing the top-up-before-vote bias.
     // Off-chain callers read checkpoints via eth_getStorageAt or events.
 
-    function delegationOf(address delegator, address delegate) external view returns (uint256) {
-        return _delegations[delegator][delegate];
-    }
-
-    function delegatedInbound(address delegate) external view returns (uint256) {
-        return _delegatedInbound[delegate];
-    }
+    // `delegationOf` + `delegatedInbound` moved to `GuardianRegistryDelegation`.
 
     function ownerStake(address v) external view returns (uint256) {
         return _ownerStakes[v].stakedAmount;
@@ -1592,9 +1426,8 @@ contract GuardianRegistry is IGuardianRegistry, OwnableUpgradeable, UUPSUpgradea
         return _guardians[g].stakedAmount > 0 && _guardians[g].unstakeRequestedAt == 0;
     }
 
-    function hasOwnerStake(address v) external view returns (bool) {
-        return _ownerStakes[v].stakedAmount > 0;
-    }
+    // `hasOwnerStake` view dropped to fit Sherlock #44 under EIP-170 —
+    // callers inline `ownerStake(vault) > 0`.
 
     function preparedStakeOf(address o) external view returns (uint256) {
         return _prepared[o].amount;
@@ -1604,18 +1437,14 @@ contract GuardianRegistry is IGuardianRegistry, OwnableUpgradeable, UUPSUpgradea
         return _prepared[o].amount >= minOwnerStake && !_prepared[o].bound;
     }
 
-    /// @notice The minimum WOOD bond a vault owner must post.
-    /// @dev Returns the global floor `minOwnerStake`. TVL-scaling was explored
-    ///      and rejected: it mixes decimals (WOOD 18 vs. asset decimals) and
-    ///      doesn't improve deterrence since `finalizeEmergencySettle` reverts
-    ///      when a block quorum is reached (drain + slash are mutually exclusive).
-    function requiredOwnerBond(address) public view returns (uint256) {
-        return minOwnerStake;
-    }
+    // `requiredOwnerBond` dropped to fit Sherlock #44 under EIP-170 — the
+    // registry's implementation was a trivial passthrough to `minOwnerStake`
+    // (`public` auto-getter). Callers (GovernorEmergency) read
+    // `reg.minOwnerStake()` directly.
 
-    function currentEpoch() public view returns (uint256) {
-        return (block.timestamp - epochGenesis) / EPOCH_DURATION;
-    }
+    // `currentEpoch()` external view dropped to make room for Sherlock
+    // #44/#45 fixes. Off-chain (and tests) compute as
+    // `(block.timestamp - epochGenesis) / EPOCH_DURATION`.
 
     // Pending epoch rewards are claimed via Merkl (merkl.xyz).
 }

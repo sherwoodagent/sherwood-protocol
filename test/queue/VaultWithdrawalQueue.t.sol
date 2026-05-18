@@ -68,6 +68,42 @@ contract VaultWithdrawalQueueTest is Test {
         assertEq(queue.pendingShares(), 0);
     }
 
+    /// @notice Sherlock run #1 finding #27 — `claim(requestId, minAssets)`
+    ///         reverts with `ClaimSlippage` when the post-settle NAV drops
+    ///         below the LP's stated floor. Pre-fix, queued LPs were silently
+    ///         absorbing PnL of any strategy that ran between enqueue and
+    ///         claim with no opt-out.
+    function test_claim_withMinAssets_revertsOnSlippage() public {
+        vm.prank(address(vault));
+        queue.queueRequest(alice, 100e18);
+        vault.mint(address(queue), 100e18);
+        vault.setLocked(false);
+        // Mock vault redeems at 1.0 share→asset, but LP wanted ≥ 150 assets.
+        vault.setRedeemRate(1e18);
+
+        vm.expectRevert(abi.encodeWithSelector(IVaultWithdrawalQueue.ClaimSlippage.selector, 100e18, 150e18));
+        queue.claim(1, 150e18);
+
+        // Request is still claimable — slippage check reverts before commit
+        // would normally happen, but the storage mutation ordering matters.
+        // We don't assert on r.claimed here because the implementation may
+        // legitimately mark it claimed before the slippage revert (state
+        // rolls back on revert).
+    }
+
+    function test_claim_withMinAssets_succeedsAboveFloor() public {
+        vm.prank(address(vault));
+        queue.queueRequest(alice, 100e18);
+        vault.mint(address(queue), 100e18);
+        vault.setLocked(false);
+        vault.setRedeemRate(2e18); // 200 assets vs floor 150
+
+        uint256 assets = queue.claim(1, 150e18);
+        assertEq(assets, 200e18);
+        IVaultWithdrawalQueue.Request memory r = queue.getRequest(1);
+        assertTrue(r.claimed);
+    }
+
     function test_claim_anyoneCanCall() public {
         vm.prank(address(vault));
         queue.queueRequest(alice, 100e18);

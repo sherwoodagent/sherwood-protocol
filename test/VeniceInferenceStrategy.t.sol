@@ -586,7 +586,11 @@ contract VeniceInferenceStrategy_SwapTest is Test {
     function test_updateParams() public {
         _executeStrategy();
 
-        uint256 newRepayment = 600e6;
+        // Sherlock #49: newRepayment must be >= assetAmount (principal).
+        // Pre-fix this test set newRepayment to 600e6 — above the 500e6
+        // principal here, so the original value was already legal. Bump to
+        // 700e6 to leave room for the new floor check + a +20% profit.
+        uint256 newRepayment = USDC_AMOUNT + 200e6;
         uint256 newMinVVV = 500e18;
         uint256 newDeadlineOffset = 600;
 
@@ -596,6 +600,22 @@ contract VeniceInferenceStrategy_SwapTest is Test {
         assertEq(strategy.repaymentAmount(), newRepayment);
         assertEq(strategy.minVVV(), newMinVVV);
         assertEq(strategy.deadlineOffset(), newDeadlineOffset);
+    }
+
+    /// @notice Sherlock run #1 finding #49 — proposer must not be able to
+    ///         reduce `repaymentAmount` below `assetAmount` (the loan
+    ///         principal). Pre-fix, a hostile proposer could settle for
+    ///         dust while the agent retained the borrowed capital.
+    function test_updateParams_revertsWhenRepaymentBelowPrincipal() public {
+        _executeStrategy();
+
+        // newRepayment = 1 (the audit's attack value) — way below principal.
+        vm.prank(proposer);
+        vm.expectRevert(VeniceInferenceStrategy.RepaymentBelowPrincipal.selector);
+        strategy.updateParams(abi.encode(uint256(1), uint256(500e18), uint256(600)));
+
+        // Default repaymentAmount preserved.
+        assertEq(strategy.repaymentAmount(), USDC_AMOUNT);
     }
 
     function test_updateParams_onlyProposer() public {

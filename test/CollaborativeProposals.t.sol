@@ -40,7 +40,7 @@ contract CollaborativeProposalsTest is Test {
     uint256 constant VOTING_PERIOD = 1 days;
     uint256 constant EXECUTION_WINDOW = 1 days;
     uint256 constant VETO_THRESHOLD_BPS = 4000;
-    uint256 constant MAX_PERF_FEE_BPS = 3000;
+    uint256 constant MAX_PERF_FEE_BPS = 1500;
     uint256 constant COOLDOWN_PERIOD = 1 days;
 
     function setUp() public {
@@ -157,7 +157,7 @@ contract CollaborativeProposalsTest is Test {
             address(vault),
             address(0),
             "ipfs://collab",
-            2000,
+            1500,
             7 days,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
@@ -322,22 +322,39 @@ contract CollaborativeProposalsTest is Test {
 
     // ==================== REJECTION ====================
 
-    function test_rejection_cancelsProposal() public {
+    /// @notice Sherlock #9: rejection is lead-only post-fix; co-proposers
+    ///         who disagree must withhold their approval. Lead bails the
+    ///         collab early instead of waiting for the collab window to
+    ///         lapse.
+    function test_rejection_byLead_cancelsProposal() public {
         uint256 proposalId = _createCollabProposal();
-        vm.prank(coAgent1);
+        vm.prank(leadAgent);
         governor.rejectCollaboration(proposalId);
         ISyndicateGovernor.StrategyProposal memory p = governor.getProposal(proposalId);
         assertEq(uint256(p.state), uint256(ISyndicateGovernor.ProposalState.Cancelled));
     }
 
-    function test_rejection_afterPartialApproval_cancels() public {
+    function test_rejection_byLead_afterPartialApproval_cancels() public {
         uint256 proposalId = _createCollabProposal();
         vm.prank(coAgent1);
         governor.approveCollaboration(proposalId);
-        vm.prank(coAgent2);
+        vm.prank(leadAgent);
         governor.rejectCollaboration(proposalId);
         ISyndicateGovernor.StrategyProposal memory p = governor.getProposal(proposalId);
         assertEq(uint256(p.state), uint256(ISyndicateGovernor.ProposalState.Cancelled));
+    }
+
+    /// @notice Sherlock run #1 finding #9 — any co-proposer used to be able
+    ///         to unilaterally cancel a Draft by calling `rejectCollaboration`,
+    ///         enabling a single hostile co-prop to grief the lead. Post-fix,
+    ///         co-proposer rejection reverts with `NotLeadProposer`; protest
+    ///         channel is withholding approval (Draft lapses at the collab
+    ///         window).
+    function test_rejection_byCoProposer_revertsAfterFix() public {
+        uint256 proposalId = _createCollabProposal();
+        vm.prank(coAgent1);
+        vm.expectRevert(ISyndicateGovernor.NotLeadProposer.selector);
+        governor.rejectCollaboration(proposalId);
     }
 
     // ==================== EXPIRY ====================
@@ -379,13 +396,13 @@ contract CollaborativeProposalsTest is Test {
         vm.prank(leadAgent);
         governor.settleProposal(proposalId);
 
-        // Performance fee: 20% of 10k = 2000 USDC (no protocol fee)
-        // coAgent1: 30% of 2000 = 600
-        // coAgent2: 10% of 2000 = 200
-        // Lead: remainder = 2000 - 600 - 200 = 1200
-        assertEq(usdc.balanceOf(coAgent1), co1BalBefore + 600e6);
-        assertEq(usdc.balanceOf(coAgent2), co2BalBefore + 200e6);
-        assertEq(usdc.balanceOf(leadAgent), leadBalBefore + 1_200e6);
+        // Performance fee: 15% of 10k = 1500 USDC (no protocol fee)
+        // coAgent1: 30% of 1500 = 450
+        // coAgent2: 10% of 1500 = 150
+        // Lead: remainder = 1500 - 450 - 150 = 900
+        assertEq(usdc.balanceOf(coAgent1), co1BalBefore + 450e6);
+        assertEq(usdc.balanceOf(coAgent2), co2BalBefore + 150e6);
+        assertEq(usdc.balanceOf(leadAgent), leadBalBefore + 900e6);
     }
 
     function test_settlement_feeDistribution_managementFeeUnchanged() public {
@@ -398,8 +415,8 @@ contract CollaborativeProposalsTest is Test {
         vm.prank(leadAgent);
         governor.settleProposal(proposalId);
 
-        // Agent fee: 20% of 10k = 2000. Management fee: 0.5% of (10k - 2000) = 40
-        assertEq(usdc.balanceOf(owner), ownerBalBefore + 40e6);
+        // Agent fee: 15% of 10k = 1500. Management fee: 0.5% of (10k - 1500) = 42.5
+        assertEq(usdc.balanceOf(owner), ownerBalBefore + 42_500000);
     }
 
     function test_settlement_noProfit_noDistribution() public {
@@ -428,7 +445,7 @@ contract CollaborativeProposalsTest is Test {
             address(vault),
             address(0),
             "ipfs://round",
-            2000,
+            1500,
             7 days,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
@@ -459,7 +476,7 @@ contract CollaborativeProposalsTest is Test {
         vm.prank(leadAgent);
         governor.settleProposal(proposalId);
 
-        uint256 agentFee = 1_400_000; // 20% of 7e6
+        uint256 agentFee = 1_050_000; // 15% of 7e6
         uint256 co1Share = (agentFee * 3333) / 10000;
         uint256 co2Share = (agentFee * 3334) / 10000;
         uint256 leadShare = agentFee - co1Share - co2Share;
@@ -499,7 +516,7 @@ contract CollaborativeProposalsTest is Test {
             address(vault),
             address(0),
             "ipfs://tiny",
-            2000,
+            1500,
             7 days,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
@@ -525,9 +542,9 @@ contract CollaborativeProposalsTest is Test {
 
         governor.executeProposal(proposalId);
 
-        // Profit of 49 wei of USDC. perfFeeBps=2000 => agentFee = 9.
-        // 9 * 100 / 10000 = 0 → each active co-prop floored at 1 wei.
-        // 5 co-props * 1 wei = 5 wei distributed; lead gets agentFee - 5 = 4 wei.
+        // Profit of 49 wei of USDC. perfFeeBps=1500 => agentFee = 7.
+        // 7 * 100 / 10000 = 0 → each active co-prop floored at 1 wei.
+        // 5 co-props * 1 wei = 5 wei distributed; lead gets agentFee - 5 = 2 wei.
         usdc.mint(address(vault), 49);
 
         uint256 leadBefore = usdc.balanceOf(leadAgent);
@@ -538,7 +555,7 @@ contract CollaborativeProposalsTest is Test {
         governor.settleProposal(proposalId);
 
         assertEq(usdc.balanceOf(coAgent1), co1Before + 1, "co1 floored at 1 wei");
-        assertEq(usdc.balanceOf(leadAgent) - leadBefore, 4, "lead gets remainder 4 wei");
+        assertEq(usdc.balanceOf(leadAgent) - leadBefore, 2, "lead gets remainder 2 wei");
     }
 
     /// @dev Deregistered co-proposers with splits that round to zero are
@@ -584,7 +601,7 @@ contract CollaborativeProposalsTest is Test {
             address(vault),
             address(0),
             "ipfs://test",
-            2000,
+            1500,
             7 days,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
@@ -602,7 +619,7 @@ contract CollaborativeProposalsTest is Test {
             address(vault),
             address(0),
             "ipfs://test",
-            2000,
+            1500,
             7 days,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
@@ -636,7 +653,7 @@ contract CollaborativeProposalsTest is Test {
             address(vault),
             address(0),
             "ipfs://test",
-            2000,
+            1500,
             7 days,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
@@ -654,7 +671,7 @@ contract CollaborativeProposalsTest is Test {
             address(vault),
             address(0),
             "ipfs://test",
-            2000,
+            1500,
             7 days,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
@@ -673,7 +690,7 @@ contract CollaborativeProposalsTest is Test {
             address(vault),
             address(0),
             "ipfs://test",
-            2000,
+            1500,
             7 days,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),

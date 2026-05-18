@@ -60,7 +60,7 @@ contract GuardianReviewLifecycleTest is Test {
     uint256 constant VOTING_PERIOD = 1 days;
     uint256 constant EXECUTION_WINDOW = 1 days;
     uint256 constant VETO_THRESHOLD_BPS = 4000;
-    uint256 constant MAX_PERF_FEE_BPS = 3000;
+    uint256 constant MAX_PERF_FEE_BPS = 1500;
     uint256 constant COOLDOWN_PERIOD = 1 days;
 
     uint256 constant MIN_GUARDIAN_STAKE = 10_000e18;
@@ -218,7 +218,7 @@ contract GuardianReviewLifecycleTest is Test {
             address(vault),
             address(0),
             "ipfs://review-lifecycle",
-            1000,
+            1500,
             7 days,
             _execCalls(),
             _settleCalls(),

@@ -31,7 +31,7 @@ abstract contract GovernorParameters is ISyndicateGovernor, OwnableUpgradeable {
     uint256 public constant MAX_EXECUTION_WINDOW = 7 days;
     uint256 public constant MIN_VETO_THRESHOLD_BPS = 1000; // 10%
     uint256 public constant MAX_VETO_THRESHOLD_BPS = 5000; // 50%
-    uint256 public constant MAX_PERFORMANCE_FEE_CAP = 5000; // 50%
+    uint256 public constant MAX_PERFORMANCE_FEE_CAP = 1500; // 15%
     uint256 public constant ABSOLUTE_MIN_STRATEGY_DURATION = 1 hours;
     uint256 public constant ABSOLUTE_MAX_STRATEGY_DURATION = 30 days;
     uint256 public constant MIN_COOLDOWN_PERIOD = 1 hours;
@@ -41,7 +41,7 @@ abstract contract GovernorParameters is ISyndicateGovernor, OwnableUpgradeable {
     /// @dev `internal` to avoid emitting an auto-getter (would add ~39 bytes
     ///      to SyndicateGovernor; this constant is for internal arithmetic only).
     uint256 internal constant BPS_DENOMINATOR = 10_000;
-    uint256 public constant MAX_PROTOCOL_FEE_BPS = 1000; // 10%
+    uint256 public constant MAX_PROTOCOL_FEE_BPS = 100; // 1%
     uint256 public constant MAX_GUARDIAN_FEE_BPS = 500; // 5%
 
     // ── Collaborative proposal constants ──

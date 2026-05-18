@@ -44,7 +44,7 @@ contract SyndicateGovernorIntegrationTest is Test {
     uint256 constant VOTING_PERIOD = 1 days;
     uint256 constant EXECUTION_WINDOW = 1 days;
     uint256 constant VETO_THRESHOLD_BPS = 4000;
-    uint256 constant MAX_PERF_FEE_BPS = 3000;
+    uint256 constant MAX_PERF_FEE_BPS = 1500;
     uint256 constant MAX_STRATEGY_DURATION = 30 days;
     uint256 constant COOLDOWN_PERIOD = 1 days;
 
@@ -92,7 +92,7 @@ contract SyndicateGovernorIntegrationTest is Test {
                     maxCoProposers: 5,
                     minStrategyDuration: 1 hours,
                     maxStrategyDuration: MAX_STRATEGY_DURATION,
-                    protocolFeeBps: 200,
+                    protocolFeeBps: 100,
                     protocolFeeRecipient: owner,
                     guardianFeeBps: 0
                 }),
@@ -195,8 +195,8 @@ contract SyndicateGovernorIntegrationTest is Test {
         assertFalse(vault.redemptionsLocked());
         assertEq(governor.getActiveProposal(address(vault)), 0);
 
-        // Protocol fee: 2% of 5k = 100. Agent got 15% of (5k - 100) = 15% of 4,900 = 735 USDC
-        assertEq(usdc.balanceOf(agent), agentBalBefore + 735e6);
+        // Protocol fee: 1% of 5k = 50. Agent got 15% of (5k - 50) = 15% of 4,950 = 742.5 USDC
+        assertEq(usdc.balanceOf(agent), agentBalBefore + 742_500000);
         assertEq(usdc.allowance(address(vault), address(targetToken)), 0);
 
         vm.warp(governor.getCooldownEnd(address(vault)) + 1);
@@ -259,7 +259,7 @@ contract SyndicateGovernorIntegrationTest is Test {
         governor.settleProposal(pid1);
         vm.warp(block.timestamp + COOLDOWN_PERIOD + 1);
 
-        uint256 pid2 = _proposeVoteApprove(execCalls, settleCalls, 2000, 5 days);
+        uint256 pid2 = _proposeVoteApprove(execCalls, settleCalls, 1200, 5 days);
         governor.executeProposal(pid2);
         vm.warp(block.timestamp + 5 days);
         governor.settleProposal(pid2);

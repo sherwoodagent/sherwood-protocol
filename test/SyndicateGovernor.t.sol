@@ -33,7 +33,7 @@ contract SyndicateGovernorTest is Test {
     uint256 constant VOTING_PERIOD = 1 days;
     uint256 constant EXECUTION_WINDOW = 1 days;
     uint256 constant VETO_THRESHOLD_BPS = 4000;
-    uint256 constant MAX_PERF_FEE_BPS = 3000;
+    uint256 constant MAX_PERF_FEE_BPS = 1500;
     uint256 constant MAX_STRATEGY_DURATION = 30 days;
     uint256 constant COOLDOWN_PERIOD = 1 days;
 
@@ -81,7 +81,7 @@ contract SyndicateGovernorTest is Test {
                     maxCoProposers: 5,
                     minStrategyDuration: 1 hours,
                     maxStrategyDuration: MAX_STRATEGY_DURATION,
-                    protocolFeeBps: 200,
+                    protocolFeeBps: 100,
                     protocolFeeRecipient: owner,
                     guardianFeeBps: 0
                 }),
@@ -176,7 +176,7 @@ contract SyndicateGovernorTest is Test {
         assertEq(params.cooldownPeriod, COOLDOWN_PERIOD);
         assertEq(governor.proposalCount(), 0);
         assertTrue(governor.isRegisteredVault(address(vault)));
-        assertEq(governor.protocolFeeBps(), 200);
+        assertEq(governor.protocolFeeBps(), 100);
         assertEq(governor.protocolFeeRecipient(), owner);
     }
 
@@ -537,9 +537,9 @@ contract SyndicateGovernorTest is Test {
         uint256 ownerBalBefore = usdc.balanceOf(owner);
         vm.prank(agent);
         governor.settleProposal(proposalId);
-        // Protocol fee: 2% of 10k = 200. Agent fee: 15% of 9800 = 1470. Mgmt: 0.5% of 8330 = 41.65
-        assertEq(usdc.balanceOf(agent), agentBalBefore + 1_470e6);
-        assertEq(usdc.balanceOf(owner), ownerBalBefore + 200e6 + 41_650000);
+        // Protocol fee: 1% of 10k = 100. Agent fee: 15% of 9900 = 1485. Mgmt: 0.5% of 8415 = 42.075
+        assertEq(usdc.balanceOf(agent), agentBalBefore + 1_485e6);
+        assertEq(usdc.balanceOf(owner), ownerBalBefore + 100e6 + 42_075000);
     }
 
     function test_settlement_withLoss_noFees() public {
@@ -807,10 +807,10 @@ contract SyndicateGovernorTest is Test {
         uint256 ownerBalBefore = usdc.balanceOf(owner);
         vm.prank(agent);
         governor.settleProposal(proposalId);
-        // Protocol fee: 2% of 10k = 200. Agent fee: 0% of 9800 = 0.
-        // Mgmt fee: 0.5% of 9800 = 49.
+        // Protocol fee: 1% of 10k = 100. Agent fee: 0% of 9900 = 0.
+        // Mgmt fee: 0.5% of 9900 = 49.5.
         assertEq(usdc.balanceOf(agent), agentBalBefore);
-        assertEq(usdc.balanceOf(owner), ownerBalBefore + 200e6 + 49e6);
+        assertEq(usdc.balanceOf(owner), ownerBalBefore + 100e6 + 49_500000);
     }
 
     // ==================== COOLDOWN BLOCKS RE-EXECUTION ====================
@@ -925,7 +925,7 @@ contract SyndicateGovernorTest is Test {
         // V1.5: setter applies immediately; bps > 0 with no recipient reverts at call time.
         vm.prank(owner);
         vm.expectRevert(ISyndicateGovernor.InvalidProtocolFeeRecipient.selector);
-        gov2.setProtocolFeeBps(200);
+        gov2.setProtocolFeeBps(50);
     }
 
     function test_setProtocolFeeBps_zeroWithNoRecipient_succeeds() public {

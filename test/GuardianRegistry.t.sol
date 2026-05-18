@@ -301,7 +301,7 @@ contract GuardianRegistryOwnerPrepareTest is Test {
         vm.prank(creator);
         registry.prepareOwnerStake(10_000e18);
 
-        assertEq(registry.preparedStakeOf(creator), 10_000e18);
+        assertTrue(registry.canCreateVault(creator)); // bytecode-dropped preparedStakeOf — canCreateVault is the prod-meaningful state
         assertTrue(registry.canCreateVault(creator));
         assertEq(wood.balanceOf(address(registry)), 10_000e18);
     }
@@ -331,7 +331,7 @@ contract GuardianRegistryOwnerPrepareTest is Test {
         registry.cancelPreparedStake();
 
         assertEq(wood.balanceOf(creator), balBefore);
-        assertEq(registry.preparedStakeOf(creator), 0);
+        assertFalse(registry.canCreateVault(creator)); // prepared stake cleared
         assertFalse(registry.canCreateVault(creator));
     }
 
@@ -397,7 +397,7 @@ contract GuardianRegistryOwnerBindTest is Test {
         // prepareOwnerStake is allowed for this creator).
         assertFalse(registry.canCreateVault(creator));
         assertEq(registry.ownerStake(address(vault)), 10_000e18);
-        assertTrue(registry.hasOwnerStake(address(vault)));
+        assertTrue(registry.ownerStake(address(vault)) > 0);
     }
 
     function test_bindOwnerStake_revertsIfNoPrepared() public {
@@ -561,7 +561,7 @@ contract GuardianRegistryOwnerUnstakeTest is Test {
 
         assertEq(wood.balanceOf(creator), balBefore + 10_000e18);
         assertEq(registry.ownerStake(address(vault)), 0);
-        assertFalse(registry.hasOwnerStake(address(vault)));
+        assertFalse(registry.ownerStake(address(vault)) > 0);
     }
 
     function test_claimUnstakeOwner_revertsBeforeCoolDown() public {
@@ -614,13 +614,14 @@ contract GuardianRegistryBondTest is Test {
         vault = new MockERC4626Vault();
     }
 
-    function test_requiredOwnerBond_returnsFloor() public {
-        // Flat floor regardless of totalAssets.
+    function test_minOwnerStake_returnsFloor() public {
+        // Sherlock registry bytecode trim: `requiredOwnerBond` (trivial
+        // passthrough) was dropped. The underlying `minOwnerStake` is the
+        // load-bearing value; production callers read it directly.
         vault.setTotalAssets(1_000_000e18);
-        assertEq(registry.requiredOwnerBond(address(vault)), 10_000e18);
-
+        assertEq(registry.minOwnerStake(), 10_000e18);
         vault.setTotalAssets(0);
-        assertEq(registry.requiredOwnerBond(address(vault)), 10_000e18);
+        assertEq(registry.minOwnerStake(), 10_000e18);
     }
 }
 
@@ -1028,6 +1029,30 @@ contract GuardianRegistryVoteChangeTest is Test {
 
         vm.prank(g);
         vm.expectRevert(IGuardianRegistry.VoteChangeLockedOut.selector);
+        registry.voteOnProposal(PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Block);
+    }
+
+    /// @notice Sherlock run #1 finding #42 — first-time voters MUST be
+    ///         subject to the same late-vote lockout as vote-changers.
+    ///         Pre-fix, a non-voter could time a decisive Block in the
+    ///         final 10% of the review window to slash early Approvers
+    ///         who could no longer change their vote.
+    function test_firstVote_inLockoutWindow_reverts() public {
+        // _guardian(0) hasn't voted yet; warp into the lockout window
+        // and try to cast a fresh Block — must revert under #42.
+        uint256 lockoutStart = reviewEnd - (REVIEW_PERIOD * 1000) / 10_000;
+        vm.warp(lockoutStart);
+
+        vm.prank(_guardian(0));
+        vm.expectRevert(IGuardianRegistry.VoteChangeLockedOut.selector);
+        registry.voteOnProposal(PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Block);
+    }
+
+    function test_firstVote_justBeforeLockout_succeeds() public {
+        uint256 lockoutStart = reviewEnd - (REVIEW_PERIOD * 1000) / 10_000;
+        vm.warp(lockoutStart - 1);
+
+        vm.prank(_guardian(0));
         registry.voteOnProposal(PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Block);
     }
 
@@ -1801,7 +1826,10 @@ contract GuardianRegistryAppealTest is Test {
         // First refund 1_500e18 — ok.
         vm.prank(owner);
         registry.refundSlash(recipient, 1_500e18);
-        assertEq(registry.refundedInEpoch(registry.currentEpoch()), 1_500e18);
+        assertEq(
+            registry.refundedInEpoch(((block.timestamp - registry.epochGenesis()) / registry.EPOCH_DURATION())),
+            1_500e18
+        );
 
         // Second refund 600e18 same epoch → total 2_100e18 > 2_000e18 cap → revert.
         vm.prank(owner);
@@ -1819,7 +1847,7 @@ contract GuardianRegistryAppealTest is Test {
 
         // Warp to next epoch — cap resets (refundedInEpoch[nextEp] == 0).
         vm.warp(registry.epochGenesis() + registry.EPOCH_DURATION());
-        uint256 nextEp = registry.currentEpoch();
+        uint256 nextEp = ((block.timestamp - registry.epochGenesis()) / registry.EPOCH_DURATION());
         assertEq(registry.refundedInEpoch(nextEp), 0);
 
         // New cap = 20% of 8_500e18 = 1_700e18. Refund 600e18 fits.
@@ -1835,7 +1863,9 @@ contract GuardianRegistryAppealTest is Test {
         uint256 recBalBefore = wood.balanceOf(recipient);
 
         vm.expectEmit(true, false, false, true);
-        emit IGuardianRegistry.SlashAppealRefunded(recipient, 500e18, registry.currentEpoch());
+        emit IGuardianRegistry.SlashAppealRefunded(
+            recipient, 500e18, ((block.timestamp - registry.epochGenesis()) / registry.EPOCH_DURATION())
+        );
         vm.prank(owner);
         registry.refundSlash(recipient, 500e18);
 
