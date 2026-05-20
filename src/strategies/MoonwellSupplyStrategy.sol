@@ -44,6 +44,13 @@ contract MoonwellSupplyStrategy is BaseStrategy {
 
     bool public isNativeEthMarket; // mWETH-style markets that send native ETH on redeem
 
+    /// @notice Sherlock run #2 #17: cumulative underlying drained by
+    ///         `_onLiveWithdraw` over the strategy lifecycle. `_settle`
+    ///         compares `redeemed + liveWithdrawn` against `minRedeemAmount`
+    ///         so live LP exits during the execution window can't push the
+    ///         residual balance below the floor and brick settlement.
+    uint256 public liveWithdrawn;
+
     /// @inheritdoc IStrategy
     function name() external pure returns (string memory) {
         return "Moonwell Supply";
@@ -52,13 +59,8 @@ contract MoonwellSupplyStrategy is BaseStrategy {
     /// @notice Decode: (address underlying, address mToken, uint256 supplyAmount,
     ///         uint256 minRedeemAmount, bool isNativeEthMarket)
     function _initialize(bytes calldata data) internal override {
-        (
-            address underlying_,
-            address mToken_,
-            uint256 supplyAmount_,
-            uint256 minRedeemAmount_,
-            bool isNativeEthMarket_
-        ) = abi.decode(data, (address, address, uint256, uint256, bool));
+        (address underlying_, address mToken_, uint256 supplyAmount_, uint256 minRedeemAmount_, bool isNativeEthMarket_)
+        = abi.decode(data, (address, address, uint256, uint256, bool));
         if (underlying_ == address(0) || mToken_ == address(0)) revert ZeroAddress();
         if (supplyAmount_ == 0) revert InvalidAmount();
 
@@ -101,9 +103,11 @@ contract MoonwellSupplyStrategy is BaseStrategy {
             IWETH(underlying).deposit{value: address(this).balance}();
         }
 
-        // Verify we got enough underlying back
+        // Verify we got enough underlying back. Sherlock run #2 #17: credit
+        // the cumulative live-withdrawn amount so live LP exits during the
+        // execution window don't push the residual balance below the floor.
         uint256 redeemed = IERC20(underlying).balanceOf(address(this));
-        if (redeemed < minRedeemAmount) revert InvalidAmount();
+        if (redeemed + liveWithdrawn < minRedeemAmount) revert InvalidAmount();
 
         // Push everything back to the vault
         _pushAllToVault(underlying);
@@ -157,6 +161,9 @@ contract MoonwellSupplyStrategy is BaseStrategy {
         uint256 bal = IERC20(underlying).balanceOf(address(this));
         if (bal < assetsNeeded) return 0;
         IERC20(underlying).safeTransfer(msg.sender, assetsNeeded);
+        // Sherlock run #2 #17: track cumulative live-withdrawn for the
+        // settle-floor credit.
+        liveWithdrawn += assetsNeeded;
         return assetsNeeded;
     }
 

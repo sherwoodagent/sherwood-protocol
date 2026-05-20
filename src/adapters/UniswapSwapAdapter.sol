@@ -134,6 +134,16 @@ contract UniswapSwapAdapter is ISwapAdapter {
 
     /// @dev Execute a multi-hop swap as sequential exactInputSingle calls.
     ///      Intermediate tokens are held by this contract between hops.
+    /// @dev Sherlock run #2 #11 (DEFERRED — Low/Info): intermediate hops use
+    ///      `amountOutMinimum = 0`. An MEV sandwich on any non-terminal hop
+    ///      can drain value without tripping the terminal `amountOutMin`.
+    ///      Mitigation requires either a per-hop slippage array (interface
+    ///      change) or a pre-loop per-hop quoter call (bytecode-heavy). No
+    ///      production allocation template in `contracts/chains/*.json` uses
+    ///      mode-1 today (PortfolioStrategy's `_quoteMinOut` only produces
+    ///      single-hop routes). DO NOT configure mode-1 routes in
+    ///      production until per-hop enforcement lands. Track as the
+    ///      `UniswapSwapAdapter`-side counterpart to Sherlock #11.
     function _chainedSingleHops(bytes memory path, uint256 amountIn, uint256 amountOutMin)
         internal
         returns (uint256 amountOut)

@@ -476,9 +476,18 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         if (syndicateId == 0) revert VaultNotDeployed();
         if (syndicates[syndicateId].creator != msg.sender) revert NotCreator();
         if (vaultImpl != expectedImpl) revert VaultImplMismatch();
-        // Cannot upgrade while a strategy is active
-        if (governor != address(0) && ISyndicateGovernor(governor).getActiveProposal(vault) != 0) {
-            revert StrategyActive();
+        // Sherlock run #2 #8: `getActiveProposal` is set only on the Executed
+        // transition. Draft / Pending / GuardianReview / Approved keep
+        // `openProposalCount > 0` while `getActiveProposal == 0`. Without the
+        // `openProposalCount` gate, the creator could swap implementations
+        // mid-vote — LPs would have approved strategy X against impl A but
+        // execute under impl B. Mirrors the `rotateOwner` gate above —
+        // split into two distinct errors per ana's PR #350 review so
+        // off-chain tooling decoding the selector can tell which gate fired.
+        if (governor != address(0)) {
+            ISyndicateGovernor gov = ISyndicateGovernor(governor);
+            if (gov.getActiveProposal(vault) != 0) revert StrategyActive();
+            if (gov.openProposalCount(vault) != 0) revert ProposalsOpen();
         }
         UUPSUpgradeable(vault).upgradeToAndCall(vaultImpl, "");
         emit VaultUpgraded(vault, vaultImpl);

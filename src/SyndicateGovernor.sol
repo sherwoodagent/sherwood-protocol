@@ -563,6 +563,14 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
             proposal.reviewEnd = proposal.voteEnd + reviewPeriod_;
             proposal.executeBy = proposal.reviewEnd + (packed >> 128); // high 128 = executionWindow
             // G-H6: see propose().
+            // Sherlock run #2 #5 (INVALID by design — Low/Info): vetoThresholdBps
+            // is intentionally read live at the Draft→Pending transition.
+            // The owner multisig is the same authority that runs
+            // `setVetoThresholdBps`, so a mid-Draft veto-bar shift is part
+            // of the accepted owner trust model. Timing-sensitive params
+            // (votingPeriod, executionWindow) ARE snapshotted via
+            // `_draftTimingSnap` (Sherlock #14) — the asymmetry is
+            // deliberate, not an oversight.
             proposal.vetoThresholdBps = _params.vetoThresholdBps;
             // Sherlock #8: Draft already incremented openProposalCount at
             // propose time. Don't re-increment here.
@@ -1066,15 +1074,23 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
             address recipient = _guardianRegistry;
             if (fee > 0) {
                 try ISyndicateVault(vault).transferPerformanceFee(asset, recipient, fee) {
-                    // Sherlock #36: revert if pool-funding fails. Pre-fix,
-                    // the inner catch silently swallowed `Disabled()` /
-                    // misconfig reverts AFTER the asset had already been
-                    // transferred to the registry — assets accumulated
-                    // un-poolable forever (MinimalGuardianRegistry has no
+                    // Sherlock #36 (Run-1 #19): revert if pool-funding fails.
+                    // Pre-fix, the inner catch silently swallowed `Disabled()`
+                    // / misconfig reverts AFTER the asset had already been
+                    // transferred to the registry — assets accumulated un-
+                    // poolable forever (MinimalGuardianRegistry has no
                     // withdrawal path). Reverting the inner call rolls back
-                    // the outer transfer too (both calls are in the same
-                    // tx), so the asset stays in the vault and the operator
-                    // can fix the registry config and retry settle.
+                    // the outer transfer too (both calls are in the same tx),
+                    // so the asset stays in the vault and the operator can
+                    // fix the registry config and retry settle.
+                    //
+                    // Sherlock run #2 #10 (INVALID — direct conflict with the
+                    // above): asks to wrap the inner call in its own
+                    // try-catch and "swallow" failures to avoid settlement
+                    // DoS. Rejected: silently losing guardian fees on
+                    // registry misconfig hides operator errors and breaks
+                    // the audit trail. Fail-closed is the correct
+                    // resolution — Run-1 #19 stands.
                     IGuardianRegistry(recipient).fundProposalGuardianPool(proposalId, asset, fee);
                     guardianFee = fee;
                     emit GuardianFeeAccrued(proposalId, asset, recipient, fee, uint64(block.timestamp));

@@ -751,9 +751,12 @@ contract PortfolioStrategy is BaseStrategy {
     ///         `cachedPriceUpdatedAt[token]`); same staleness gate as
     ///         `_positionValue`. Returns 0 if (a) any price is stale, (b)
     ///         the post-swap asset balance is below `assetsNeeded` (slippage
-    ///         eats into the floor), or (c) the proportional split rounds
-    ///         to zero for some allocation. Residual asset stays on the
-    ///         strategy for settle accounting.
+    ///         eats into the floor), (c) the proportional split rounds to
+    ///         zero for some allocation, or (d) `nonAssetNav` is below the
+    ///         slippage-grossed-up shortfall (the strategy cannot satisfy
+    ///         the request even under worst-case slippage — see Sherlock
+    ///         run #2 #6). Residual asset stays on the strategy for
+    ///         settle accounting.
     function _onLiveWithdraw(uint256 assetsNeeded) internal override returns (uint256) {
         if (assetsNeeded == 0) return 0;
 
@@ -782,15 +785,25 @@ contract PortfolioStrategy is BaseStrategy {
             legValues[i] = _tokensToValue(bal, price, i, assetDec);
             nonAssetNav += legValues[i];
         }
-        if (nonAssetNav < shortfall) return 0;
+        // Sherlock run #2 #6: gross up the shortfall by the allowed slippage
+        // budget so the aggregate proceeds clear `assetsNeeded` even when
+        // every leg executes at the worst tolerated price. Pre-fix, each
+        // leg respected its own `minOut` but the post-balance check at
+        // assetsNeeded routinely failed under normal market conditions
+        // (e.g. 2-leg sell at 50bps slippage → ~0.5% miss). Comparing
+        // `nonAssetNav` against the grossed-up shortfall also short-circuits
+        // when the strategy genuinely cannot satisfy the request under
+        // worst-case slippage.
+        uint256 grossShortfall = (shortfall * BPS_DENOMINATOR) / (BPS_DENOMINATOR - maxSlippageBps);
+        if (nonAssetNav < grossShortfall) return 0;
 
-        // Sell `(legValue / nonAssetNav) * shortfall` worth of each
+        // Sell `(legValue / nonAssetNav) * grossShortfall` worth of each
         // allocation. Convert that value back into a token count using
         // `_valueToTokens` (handles per-allocation decimals — Sherlock
         // #21/#29 helpers).
         for (uint256 i; i < len; ++i) {
             if (legValues[i] == 0) continue;
-            uint256 sellValue = (legValues[i] * shortfall) / nonAssetNav;
+            uint256 sellValue = (legValues[i] * grossShortfall) / nonAssetNav;
             if (sellValue == 0) continue;
             address token = _allocations[i].token;
             uint256 price = cachedPrice[token];

@@ -352,6 +352,21 @@ contract SyndicateVault is
         _transferOwnership(newOwner);
     }
 
+    /// @notice Sherlock run #2 #3: block direct OwnableUpgradeable owner
+    ///         rotation paths. The factory's `rotateOwner` is the only
+    ///         legal route — it enforces `getActiveProposal == 0`,
+    ///         `openProposalCount == 0`, owner-stake clear, registry
+    ///         alignment, then calls `rotateOwnership` here. Allowing the
+    ///         inherited setters would desync factory / registry records
+    ///         and (via `renounceOwnership`) permanently orphan the vault.
+    function transferOwnership(address) public pure override {
+        revert NotFactory();
+    }
+
+    function renounceOwnership() public pure override {
+        revert NotFactory();
+    }
+
     // ==================== WITHDRAWAL QUEUE BINDING ====================
 
     /// @notice Bind the per-vault `VaultWithdrawalQueue`. Factory-only, set-once.

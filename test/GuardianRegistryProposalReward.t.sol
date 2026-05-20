@@ -130,6 +130,13 @@ contract GuardianRegistryProposalRewardTest is Test {
     ///         The own-stake weight lookup at `r.openedAt` (not `settledAt`)
     ///         means a mid-review unstake — which pushes `_stakeCheckpoints=0`
     ///         at requestUnstake time — does not corrupt the attribution.
+    ///         Sherlock run #2 #4 (per ana's PR #350 review): the
+    ///         `claimProposalReward` gate uses the same `ownW > 0 at
+    ///         openedAt` check as voteOnProposal, so this mid-review
+    ///         unstake path is the legitimate case the fix preserves —
+    ///         the approver carried slashing risk through `resolveReview`
+    ///         (Run-2 #16's `coolDownPeriod >= reviewPeriod` invariant
+    ///         prevents pre-resolution exit) and gets paid.
     function test_claim_soloApprover_unstakesMidReview_stillGetsFullShare() public {
         vm.prank(approver);
         registry.setCommission(2000); // would otherwise strand remainder

@@ -251,6 +251,9 @@ contract GuardianRegistry is GuardianRegistryDelegation, OwnableUpgradeable, UUP
         if (owner_ == address(0) || governor_ == address(0) || factory_ == address(0) || wood_ == address(0)) {
             revert ZeroAddress();
         }
+        // Sherlock run #2 #16 invariant (cooldown >= review) is enforced at
+        // the setters only — the deploy script seeds compatible values, and
+        // skipping the init-time check claws back ~10 bytes under EIP-170.
 
         __Ownable_init(owner_);
 
@@ -427,17 +430,32 @@ contract GuardianRegistry is GuardianRegistryDelegation, OwnableUpgradeable, UUP
         // `_votes == Approve` (voteOnProposal reverts on zero-weight voters).
         if (_votes[proposalId][approver] != GuardianVoteType.Approve) revert NotApprover();
 
-        // Compute the four payout numbers in a scope block so all the
-        // intermediate locals (w, r, ownW, grossFromOwn, grossFromDelegated,
-        // rate) get freed before the `_safeRewardTransfer` call site.
-        // Required for `forge coverage` (no via_ir).
+        // Sherlock run #2 #4 (review fix per PR #350 follow-up): gate reward on
+        // snapshot-time own stake, not live state. Run-2 #16's
+        // `coolDownPeriod >= reviewPeriod` invariant closes the original
+        // "vote, exit during cooldown, claim post-settle" attack
+        // structurally — an approver cannot fully exit before
+        // `resolveReview` runs. This snapshot gate matches the design
+        // signal that the approver held own stake at `r.openedAt` (mirrors
+        // the voteOnProposal first-vote gate at L605-L606). Approvers
+        // in-process of unstaking AND approvers burned to zero by a
+        // concurrent proposal both keep their non-zero checkpoint at
+        // openedAt and are paid correctly.
+        Review storage r = _reviews[proposalId];
+        uint256 ownW = _stakeCheckpoints[approver].upperLookupRecent(uint32(r.openedAt));
+        if (ownW == 0) revert NotActiveGuardian();
+
+        // Compute the four payout numbers in a scope block so the
+        // intermediate locals (w, grossFromOwn, grossFromDelegated, rate)
+        // get freed before the `_safeRewardTransfer` call site. Required
+        // for `forge coverage` (no via_ir). `r` and `ownW` stay in the
+        // outer scope so the gate above can reuse the checkpoint read.
         uint256 gross;
         uint256 commission;
         uint256 remainder;
         uint256 approverPayout;
         {
             uint256 w = _voteStake[proposalId][approver];
-            Review storage r = _reviews[proposalId];
             // approveStakeWeight >= w by construction (w is one of the weights summed into it).
             gross = (uint256(pool.amount) * w) / uint256(r.approveStakeWeight);
 
@@ -448,7 +466,6 @@ contract GuardianRegistry is GuardianRegistryDelegation, OwnableUpgradeable, UUP
             // own@openedAt + delegated@openedAt). No clamp needed. Reading at
             // `settledAt` instead would strand funds when an approver requests
             // unstake mid-review.
-            uint256 ownW = _stakeCheckpoints[approver].upperLookupRecent(uint32(r.openedAt));
             uint256 grossFromOwn = (gross * ownW) / w;
             uint256 grossFromDelegated = gross - grossFromOwn;
 
@@ -1371,15 +1388,22 @@ contract GuardianRegistry is GuardianRegistryDelegation, OwnableUpgradeable, UUP
     }
 
     /// @inheritdoc IGuardianRegistry
+    /// @dev Sherlock run #2 #16: enforce `coolDownPeriod >= reviewPeriod` so
+    ///      an approver cannot `claimUnstakeGuardian` before `resolveReview`
+    ///      runs. Otherwise `_slashOneApprover` sees `stakedAmount == 0` and
+    ///      returns 0, letting the approver evade the slash while their
+    ///      Approve weight still counts in the quorum.
     function setCooldownPeriod(uint256 v) external onlyOwner {
-        if (v < 1 days || v > 30 days) revert InvalidParameter();
+        if (v < 1 days || v > 30 days || v < reviewPeriod) revert InvalidParameter();
         _setParam(PARAM_COOLDOWN, coolDownPeriod, v);
         coolDownPeriod = v;
     }
 
     /// @inheritdoc IGuardianRegistry
+    /// @dev Sherlock run #2 #16: see `setCooldownPeriod`. Reject any review
+    ///      period that exceeds the current cooldown.
     function setReviewPeriod(uint256 v) external onlyOwner {
-        if (v < 6 hours || v > 7 days) revert InvalidParameter();
+        if (v < 6 hours || v > 7 days || v > coolDownPeriod) revert InvalidParameter();
         _setParam(PARAM_REVIEW_PERIOD, reviewPeriod, v);
         reviewPeriod = v;
     }
