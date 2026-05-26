@@ -60,18 +60,19 @@ contract StrategyFactoryTest is Test {
     function test_cloneAndInit_atomic() public {
         bytes memory initData = abi.encode(address(usdc), address(mUsdc), 1_000e6, 990e6, false);
         vm.prank(vaultOwner);
-        address clone = factory.cloneAndInit(address(template), address(vault), proposer, initData);
+        address clone = factory.cloneAndInit(address(template), address(vault), vaultOwner, initData);
 
         MoonwellSupplyStrategy strategy = MoonwellSupplyStrategy(payable(clone));
         assertEq(strategy.vault(), address(vault));
-        assertEq(strategy.proposer(), proposer);
+        // Sherlock run #2 #9 partial: proposer == msg.sender (the prank).
+        assertEq(strategy.proposer(), vaultOwner);
         assertEq(strategy.supplyAmount(), 1_000e6);
     }
 
     function test_cloneAndInit_initializeAgain_reverts() public {
         bytes memory initData = abi.encode(address(usdc), address(mUsdc), 1_000e6, 990e6, false);
         vm.prank(vaultOwner);
-        address clone = factory.cloneAndInit(address(template), address(vault), proposer, initData);
+        address clone = factory.cloneAndInit(address(template), address(vault), vaultOwner, initData);
 
         // Anyone trying to re-initialize the clone (front-run attack post-init)
         // is rejected by the existing _initialized flag.
@@ -85,7 +86,7 @@ contract StrategyFactoryTest is Test {
         bytes memory initData = abi.encode(address(usdc), address(mUsdc), 1_000e6, 990e6, false);
         address predicted = Clones.predictDeterministicAddress(address(template), salt, address(factory));
         vm.prank(vaultOwner);
-        address clone = factory.cloneAndInitDeterministic(address(template), address(vault), proposer, initData, salt);
+        address clone = factory.cloneAndInitDeterministic(address(template), address(vault), vaultOwner, initData, salt);
         assertEq(clone, predicted);
     }
 }

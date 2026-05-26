@@ -31,13 +31,18 @@ interface ISwapRouter {
 }
 
 interface IQuoterV2 {
-    function quoteExactInputSingle(
-        address tokenIn,
-        address tokenOut,
-        uint24 fee,
-        uint256 amountIn,
-        uint160 sqrtPriceLimitX96
-    )
+    /// @dev Uniswap V3 QuoterV2 takes a struct, NOT positional args
+    ///      (V1's signature). Order is: tokenIn, tokenOut, amountIn, fee,
+    ///      sqrtPriceLimitX96 — note `amountIn` comes BEFORE `fee`.
+    struct QuoteExactInputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint256 amountIn;
+        uint24 fee;
+        uint160 sqrtPriceLimitX96;
+    }
+
+    function quoteExactInputSingle(QuoteExactInputSingleParams memory params)
         external
         returns (uint256 amountOut, uint160 sqrtPriceX96After, uint32 initializedTicksCrossed, uint256 gasEstimate);
 
@@ -121,12 +126,24 @@ contract UniswapSwapAdapter is ISwapAdapter {
             // SwapRouter02's exactInput computes wrong pool addresses for certain pairs
             // on Base, so we decompose the path and swap hop-by-hop using exactInputSingle
             // which always resolves pools correctly.
-            bytes memory path = abi.decode(routeData, (bytes));
+            //
+            // Sherlock run #2 #11: extraData v2 — `abi.encode(bytes path,
+            // uint16 perHopSlippageBps)`. Each non-terminal hop's
+            // `amountOutMinimum` is derived AT SWAP TIME from a quoter
+            // pre-call (`expected * (10000 - perHopSlippageBps) / 10000`),
+            // so an MEV sandwich on any intermediate hop reverts at that
+            // hop instead of silently draining value into the next. Stays
+            // STATIC across swaps (template-friendly): the caller sets one
+            // slippage bps and the adapter handles per-swap quoting. The
+            // legacy `amountOutMin` parameter is still enforced on the
+            // terminal hop as a top-level safety check.
+            (bytes memory path, uint16 perHopSlippageBps) = abi.decode(routeData, (bytes, uint16));
+            require(perHopSlippageBps <= 10_000, "slippage > 100%");
             address pathStart = _extractFirstAddress(path);
             if (pathStart != tokenIn) {
                 path = _reversePath(path);
             }
-            amountOut = _chainedSingleHops(path, amountIn, amountOutMin);
+            amountOut = _chainedSingleHops(path, amountIn, amountOutMin, perHopSlippageBps);
         } else {
             revert UnsupportedMode();
         }
@@ -134,17 +151,15 @@ contract UniswapSwapAdapter is ISwapAdapter {
 
     /// @dev Execute a multi-hop swap as sequential exactInputSingle calls.
     ///      Intermediate tokens are held by this contract between hops.
-    /// @dev Sherlock run #2 #11 (DEFERRED — Low/Info): intermediate hops use
-    ///      `amountOutMinimum = 0`. An MEV sandwich on any non-terminal hop
-    ///      can drain value without tripping the terminal `amountOutMin`.
-    ///      Mitigation requires either a per-hop slippage array (interface
-    ///      change) or a pre-loop per-hop quoter call (bytecode-heavy). No
-    ///      production allocation template in `contracts/chains/*.json` uses
-    ///      mode-1 today (PortfolioStrategy's `_quoteMinOut` only produces
-    ///      single-hop routes). DO NOT configure mode-1 routes in
-    ///      production until per-hop enforcement lands. Track as the
-    ///      `UniswapSwapAdapter`-side counterpart to Sherlock #11.
-    function _chainedSingleHops(bytes memory path, uint256 amountIn, uint256 amountOutMin)
+    ///      Sherlock run #2 #11: each hop's `amountOutMinimum` is derived
+    ///      at swap time from `quoter.quoteExactInputSingle` against the
+    ///      hop's input, scaled by `(10_000 - perHopSlippageBps) / 10_000`.
+    ///      The final-hop floor also respects the legacy top-level
+    ///      `amountOutMin` (max of the two) so the existing slippage
+    ///      contract still holds. Adapter does the quoter calls so
+    ///      callers don't need to re-compute per-hop floors at every
+    ///      swap — the extraData stays static (template-friendly).
+    function _chainedSingleHops(bytes memory path, uint256 amountIn, uint256 amountOutMin, uint16 perHopSlippageBps)
         internal
         returns (uint256 amountOut)
     {
@@ -153,6 +168,7 @@ contract UniswapSwapAdapter is ISwapAdapter {
         uint256 numHops = (len - 20) / 23;
 
         uint256 currentAmount = amountIn;
+        uint256 slipDenom = 10_000 - uint256(perHopSlippageBps);
 
         for (uint256 i; i < numHops; ++i) {
             address hopIn = _extractAddressAt(path, i * 23);
@@ -166,6 +182,17 @@ contract UniswapSwapAdapter is ISwapAdapter {
                 IERC20(hopIn).forceApprove(address(v3Router), currentAmount);
             }
 
+            // Per-hop floor from quoter pre-call, scaled by the caller's
+            // slippage budget. Final hop additionally honors the top-level
+            // `amountOutMin` so the legacy contract holds.
+            (uint256 quoted,,,) = quoter.quoteExactInputSingle(
+                IQuoterV2.QuoteExactInputSingleParams({
+                    tokenIn: hopIn, tokenOut: hopOut, amountIn: currentAmount, fee: fee, sqrtPriceLimitX96: 0
+                })
+            );
+            uint256 hopFloor = (quoted * slipDenom) / 10_000;
+            if (lastHop && amountOutMin > hopFloor) hopFloor = amountOutMin;
+
             currentAmount = v3Router.exactInputSingle(
                 ISwapRouter.ExactInputSingleParams({
                     tokenIn: hopIn,
@@ -173,7 +200,7 @@ contract UniswapSwapAdapter is ISwapAdapter {
                     fee: fee,
                     recipient: lastHop ? msg.sender : address(this),
                     amountIn: currentAmount,
-                    amountOutMinimum: lastHop ? amountOutMin : 0,
+                    amountOutMinimum: hopFloor,
                     sqrtPriceLimitX96: 0
                 })
             );
@@ -255,7 +282,11 @@ contract UniswapSwapAdapter is ISwapAdapter {
 
         if (mode == 0) {
             uint24 fee = abi.decode(routeData, (uint24));
-            (amountOut,,,) = quoter.quoteExactInputSingle(tokenIn, tokenOut, fee, amountIn, 0);
+            (amountOut,,,) = quoter.quoteExactInputSingle(
+                IQuoterV2.QuoteExactInputSingleParams({
+                    tokenIn: tokenIn, tokenOut: tokenOut, amountIn: amountIn, fee: fee, sqrtPriceLimitX96: 0
+                })
+            );
         } else if (mode == 1) {
             bytes memory path = abi.decode(routeData, (bytes));
             // Match `swap()`'s path orientation: ensure tokenIn is the head

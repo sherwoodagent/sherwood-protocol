@@ -24,7 +24,7 @@ contract MockGovernorMinimal {
     }
 
     /// @dev Test helper — mirrors `SyndicateGovernor.openProposalCount(vault)`
-    ///      which the registry now consults in `requestUnstakeOwner`.
+    ///      which StakedWood consults in `requestUnstakeOwner`.
     function setOpenProposalCount(address vault, uint256 n) external {
         openProposalCount[vault] = n;
     }

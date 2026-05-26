@@ -54,7 +54,8 @@ contract UniswapAdapterForkTest is Test {
 
         // Path: USDC --(500)--> WETH --(3000)--> AERO
         bytes memory path = abi.encodePacked(USDC, uint24(500), WETH, uint24(3000), AERO);
-        bytes memory extraData = abi.encodePacked(uint8(1), abi.encode(path));
+        // Sherlock run #2 #11: 2 hops, permissive per-hop floors for fork tests.
+        bytes memory extraData = abi.encodePacked(uint8(1), abi.encode(path, uint16(100)));
 
         vm.startPrank(caller);
         IERC20(USDC).approve(address(adapter), amountIn);
@@ -74,7 +75,8 @@ contract UniswapAdapterForkTest is Test {
         deal(USDC, caller, usdcIn);
 
         bytes memory forwardPath = abi.encodePacked(USDC, uint24(500), WETH, uint24(3000), AERO);
-        bytes memory forwardExtra = abi.encodePacked(uint8(1), abi.encode(forwardPath));
+        // Sherlock run #2 #11: 2 hops, permissive floors.
+        bytes memory forwardExtra = abi.encodePacked(uint8(1), abi.encode(forwardPath, uint16(100)));
 
         vm.startPrank(caller);
         IERC20(USDC).approve(address(adapter), usdcIn);
@@ -86,7 +88,8 @@ contract UniswapAdapterForkTest is Test {
 
         // Now sell AERO back to USDC using the SAME path (stored in execute direction).
         // The adapter should detect tokenIn (AERO) != pathStart (USDC) and auto-reverse.
-        bytes memory settleExtra = abi.encodePacked(uint8(1), abi.encode(forwardPath));
+        // Sherlock run #2 #11: 2 hops, permissive floors.
+        bytes memory settleExtra = abi.encodePacked(uint8(1), abi.encode(forwardPath, uint16(100)));
 
         vm.startPrank(caller);
         IERC20(AERO).approve(address(adapter), aeroAmount);
@@ -113,9 +116,10 @@ contract UniswapAdapterForkTest is Test {
         uint256 amountIn = 50e6;
         deal(USDC, caller, amountIn);
 
-        // 1-hop via mode 1 (single hop expressed as multi-hop path)
+        // 1-hop via mode 1 (single hop expressed as multi-hop path).
+        // Sherlock run #2 #11: 1 hop, permissive floor.
         bytes memory path = abi.encodePacked(USDC, uint24(500), WETH);
-        bytes memory extraData = abi.encodePacked(uint8(1), abi.encode(path));
+        bytes memory extraData = abi.encodePacked(uint8(1), abi.encode(path, uint16(100)));
 
         vm.startPrank(caller);
         IERC20(USDC).approve(address(adapter), amountIn);
@@ -133,7 +137,8 @@ contract UniswapAdapterForkTest is Test {
         deal(USDC, caller, amountIn);
 
         bytes memory path = abi.encodePacked(USDC, uint24(500), WETH, uint24(3000), AERO);
-        bytes memory extraData = abi.encodePacked(uint8(1), abi.encode(path));
+        // Sherlock run #2 #11: 2 hops, permissive floors — top-level amountOutMin still enforced.
+        bytes memory extraData = abi.encodePacked(uint8(1), abi.encode(path, uint16(100)));
 
         // Set absurdly high min — should revert
         vm.startPrank(caller);
@@ -150,7 +155,8 @@ contract UniswapAdapterForkTest is Test {
         deal(USDC, caller, amountIn);
 
         bytes memory path = abi.encodePacked(USDC, uint24(500), WETH, uint24(3000), AERO);
-        bytes memory extraData = abi.encodePacked(uint8(1), abi.encode(path));
+        // Sherlock run #2 #11: 2 hops, permissive floors.
+        bytes memory extraData = abi.encodePacked(uint8(1), abi.encode(path, uint16(100)));
 
         vm.startPrank(caller);
         IERC20(USDC).approve(address(adapter), amountIn);

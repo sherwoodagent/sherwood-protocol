@@ -8,6 +8,7 @@ import {BatchExecutorLib} from "../src/BatchExecutorLib.sol";
 import {SyndicateFactory} from "../src/SyndicateFactory.sol";
 import {VaultWithdrawalQueue} from "../src/queue/VaultWithdrawalQueue.sol";
 import {IGuardianRegistry} from "../src/interfaces/IGuardianRegistry.sol";
+import {IStakedWood} from "../src/interfaces/IStakedWood.sol";
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 import {MockL2Registrar} from "./mocks/MockL2Registrar.sol";
 import {MockAgentRegistry} from "./mocks/MockAgentRegistry.sol";
@@ -25,6 +26,9 @@ contract SyndicateFactoryTest is Test {
     address public creator2 = makeAddr("creator2");
     address public governorAddr = makeAddr("governor");
     address public guardianRegistryAddr = makeAddr("guardianRegistry");
+    // Post-split: the factory resolves sWOOD via `registry.swood()` then calls
+    // `canCreateVault` / `bindOwnerStake` on sWOOD. Mock both indirections.
+    address public swoodAddr = makeAddr("swood");
 
     uint256 public creator1AgentId;
     uint256 public creator2AgentId;
@@ -61,11 +65,14 @@ contract SyndicateFactoryTest is Test {
         vm.mockCall(governorAddr, abi.encodeWithSignature("getActiveProposal(address)"), abi.encode(uint256(0)));
         // MS-H4: vault `_deposit` reads `openProposalCount(address)` — mock to 0.
         vm.mockCall(governorAddr, abi.encodeWithSignature("openProposalCount(address)"), abi.encode(uint256(0)));
-        // Task 26: mock registry to pass the prepared-stake gate + bind path during create.
+        // Task 26 + sWOOD split: the factory reads `registry.swood()` then
+        // calls `canCreateVault` / `bindOwnerStake` on sWOOD. Mock the
+        // registry → sWOOD hop plus the two sWOOD calls.
         vm.mockCall(
-            guardianRegistryAddr, abi.encodeWithSelector(IGuardianRegistry.canCreateVault.selector), abi.encode(true)
+            guardianRegistryAddr, abi.encodeWithSelector(IGuardianRegistry.swood.selector), abi.encode(swoodAddr)
         );
-        vm.mockCall(guardianRegistryAddr, abi.encodeWithSelector(IGuardianRegistry.bindOwnerStake.selector), "");
+        vm.mockCall(swoodAddr, abi.encodeWithSelector(IStakedWood.canCreateVault.selector), abi.encode(true));
+        vm.mockCall(swoodAddr, abi.encodeWithSelector(IStakedWood.bindOwnerStake.selector), "");
     }
 
     function _defaultConfig() internal view returns (SyndicateFactory.SyndicateConfig memory) {

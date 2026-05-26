@@ -149,6 +149,16 @@ contract WoodTokenOftMintCapTest is Test {
         assertEq(minted, 0);
     }
 
+    // ── access control — `mint` is owner-only ──
+
+    function test_mint_revertsForNonOwner() public {
+        // `mint` is the only privileged function; `onlyOwner` is its sole guard.
+        // A non-owner caller must be rejected with OZ's OwnableUnauthorizedAccount.
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSignature("OwnableUnauthorizedAccount(address)", alice));
+        wood.mint(bob, 1e18);
+    }
+
     function test_totalEverMinted_tracksAllMintsAndCredits() public {
         vm.startPrank(delegate_);
         wood.mint(alice, 1e18);

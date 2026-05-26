@@ -11,6 +11,7 @@ import {BatchExecutorLib} from "../src/BatchExecutorLib.sol";
 import {SyndicateFactory} from "../src/SyndicateFactory.sol";
 import {SyndicateGovernor} from "../src/SyndicateGovernor.sol";
 import {GuardianRegistry} from "../src/GuardianRegistry.sol";
+import {StakedWood} from "../src/StakedWood.sol";
 import {MinimalGuardianRegistry} from "../src/MinimalGuardianRegistry.sol";
 import {ISyndicateGovernor} from "../src/interfaces/ISyndicateGovernor.sol";
 import {ScriptBase} from "./ScriptBase.sol";
@@ -68,6 +69,8 @@ contract DeploySherwood is ScriptBase {
     bytes32 constant SALT_FACTORY_PROXY = keccak256("sherwood.deploy.factory-proxy.3");
     bytes32 constant SALT_REGISTRY_IMPL = keccak256("sherwood.deploy.guardian-registry-impl.2");
     bytes32 constant SALT_REGISTRY_PROXY = keccak256("sherwood.deploy.guardian-registry-proxy.2");
+    bytes32 constant SALT_SWOOD_IMPL = keccak256("sherwood.deploy.staked-wood-impl.1");
+    bytes32 constant SALT_SWOOD_PROXY = keccak256("sherwood.deploy.staked-wood-proxy.1");
 
     // ── Registry default parameters (spec §3.1; overridable via env) ──
     uint256 constant DEFAULT_MIN_GUARDIAN_STAKE = 10_000e18;
@@ -77,6 +80,12 @@ contract DeploySherwood is ScriptBase {
     uint256 constant DEFAULT_BLOCK_QUORUM_BPS = 3000; // 30%
     uint256 constant DEFAULT_SLASH_APPEAL_SEED = 1_000_000e18;
     uint256 constant DEFAULT_EPOCH_ZERO_SEED = 10_000e18;
+    uint256 constant DEFAULT_MIN_SLASH_BPS = 1000; // 10%
+    // C-2: strict `< 10_000` cap on `maxSlashBps`. A 100% slash zeroes
+    // `poolTokens` while `poolShares` stay nonzero, bricking the delegation
+    // pool (subsequent `delegateStake` reverts in `Math.mulDiv`). 9_999 is
+    // the highest value that keeps at least 1 wei in the pool.
+    uint256 constant DEFAULT_MAX_SLASH_BPS = 9999; // 99.99%
 
     struct Config {
         address ensRegistrar;
@@ -100,6 +109,7 @@ contract DeploySherwood is ScriptBase {
         address governorProxy;
         address factoryProxy;
         address registryProxy;
+        address swoodProxy;
     }
 
     function run() external {
@@ -150,11 +160,11 @@ contract DeploySherwood is ScriptBase {
             _seedRegistry(d.deployer, d.registryProxy, cfg);
         }
 
-        // Multisig handoff: prod hands all three proxies to the multisig.
+        // Multisig handoff: prod hands all proxies to the multisig.
         // Beta keeps the deployer as protocol owner (no multisig yet).
         address effectiveOwner = d.deployer;
         if (!skipHandoff) {
-            _handoffOwnership(d.governorProxy, d.factoryProxy, d.registryProxy, ownerMultisig);
+            _handoffOwnership(d.governorProxy, d.factoryProxy, d.registryProxy, d.swoodProxy, ownerMultisig);
             effectiveOwner = ownerMultisig;
         }
 
@@ -179,6 +189,12 @@ contract DeploySherwood is ScriptBase {
         // ── Persist ──
         _writeAddresses(_chainName(), d.deployer, d.factoryProxy, d.governorProxy, d.executorLib, d.vaultImpl);
         _patchAddress("GUARDIAN_REGISTRY", d.registryProxy);
+        // sWOOD is the sole WOOD custodian — persist it for the CLI / admin
+        // scripts. Beta mode uses a stub registry and never deploys sWOOD, so
+        // the proxy stays address(0) there.
+        if (d.swoodProxy != address(0)) {
+            _patchAddress("STAKED_WOOD", d.swoodProxy);
+        }
 
         console.log("\nDeployment complete on %s (chain %s)", _chainName(), block.chainid);
         console.log("Next: forge script script/DeployTemplates.s.sol --rpc-url <chain> --broadcast");
@@ -213,10 +229,20 @@ contract DeploySherwood is ScriptBase {
 
         address predictedFactoryProxy = c3.addressOf(SALT_FACTORY_PROXY);
         if (!cfg.betaMode) {
+            // sWOOD is the sole WOOD custodian: deploy it before the registry
+            // so the registry's `initialize` can take the sWOOD address. The
+            // registry↔sWOOD circular dependency is resolved by the set-once
+            // `setRegistry` call below (deploy order: sWOOD → registry → wire).
+            d.swoodProxy = _deploySwoodProxy(c3, d.deployer, d.governorProxy, predictedFactoryProxy, cfg);
+
             address registryImpl = c3.deploy(SALT_REGISTRY_IMPL, abi.encodePacked(type(GuardianRegistry).creationCode));
-            d.registryProxy =
-                _deployRegistryProxy(c3, registryImpl, d.deployer, d.governorProxy, predictedFactoryProxy, cfg);
+            d.registryProxy = _deployRegistryProxy(
+                c3, registryImpl, d.deployer, d.governorProxy, predictedFactoryProxy, d.swoodProxy
+            );
             require(d.registryProxy == registryAddr, "registry addr mismatch");
+
+            // Wire the set-once registry reference on sWOOD.
+            StakedWood(d.swoodProxy).setRegistry(d.registryProxy);
         } else {
             d.registryProxy = registryAddr;
         }
@@ -226,6 +252,37 @@ contract DeploySherwood is ScriptBase {
         require(d.factoryProxy == predictedFactoryProxy, "factory addr mismatch");
 
         SyndicateGovernor(d.governorProxy).setFactory(d.factoryProxy);
+    }
+
+    /// @dev Deploys the StakedWood (sWOOD) proxy via CREATE3. The governor +
+    ///      factory proxy addresses are predicted (CREATE3 is address-stable),
+    ///      so sWOOD can be initialized before either is deployed.
+    function _deploySwoodProxy(
+        Create3Factory c3,
+        address deployer,
+        address governorProxy,
+        address predictedFactoryProxy,
+        Config memory cfg
+    ) internal returns (address) {
+        address swoodImpl = c3.deploy(SALT_SWOOD_IMPL, abi.encodePacked(type(StakedWood).creationCode));
+        bytes memory initData = abi.encodeCall(
+            StakedWood.initialize,
+            (StakedWood.InitParams({
+                    owner: deployer,
+                    wood: cfg.woodToken,
+                    governor: governorProxy,
+                    factory: predictedFactoryProxy,
+                    minGuardianStake: DEFAULT_MIN_GUARDIAN_STAKE,
+                    coolDownPeriod: DEFAULT_COOLDOWN,
+                    minOwnerStake: DEFAULT_MIN_OWNER_STAKE,
+                    minSlashBps: DEFAULT_MIN_SLASH_BPS,
+                    maxSlashBps: DEFAULT_MAX_SLASH_BPS
+                }))
+        );
+        return
+            c3.deploy(
+                SALT_SWOOD_PROXY, abi.encodePacked(type(ERC1967Proxy).creationCode, abi.encode(swoodImpl, initData))
+            );
     }
 
     function _deployGovernorProxy(
@@ -289,7 +346,7 @@ contract DeploySherwood is ScriptBase {
         address deployer,
         address governorProxy,
         address predictedFactoryProxy,
-        Config memory cfg
+        address swoodProxy
     ) internal returns (address) {
         bytes memory initData = abi.encodeCall(
             GuardianRegistry.initialize,
@@ -297,10 +354,7 @@ contract DeploySherwood is ScriptBase {
                 deployer,
                 governorProxy,
                 predictedFactoryProxy,
-                cfg.woodToken,
-                DEFAULT_MIN_GUARDIAN_STAKE,
-                DEFAULT_MIN_OWNER_STAKE,
-                DEFAULT_COOLDOWN,
+                swoodProxy,
                 DEFAULT_REVIEW_PERIOD,
                 DEFAULT_BLOCK_QUORUM_BPS
             )
@@ -348,24 +402,33 @@ contract DeploySherwood is ScriptBase {
         return address(0);
     }
 
-    /// @notice Hand off ownership of all three protocol proxies to the
-    ///         configured multisig as the final on-chain action. Called inside
-    ///         the same broadcast as the deploys so a single tx-bundle delivers
-    ///         a fully-multisig-controlled protocol — there is no window where
+    /// @notice Hand off ownership of all protocol proxies to the configured
+    ///         multisig as the final on-chain action. Called inside the same
+    ///         broadcast as the deploys so a single tx-bundle delivers a
+    ///         fully-multisig-controlled protocol — there is no window where
     ///         a single deployer key controls a live deployment.
     /// @dev    Vault is intentionally not transferred here: vaults are owned by
     ///         the syndicate creator (set in `SyndicateFactory.createSyndicate`)
     ///         not by the protocol deployer. The deploy script only stamps out
     ///         the singleton implementation, not a live vault instance.
-    function _handoffOwnership(address governorAddr, address factoryAddr, address registryAddr, address ownerMultisig)
-        internal
-    {
+    ///         `swoodProxy` may be `address(0)` in beta mode (sWOOD is not
+    ///         deployed there); the transfer is skipped in that case.
+    function _handoffOwnership(
+        address governorAddr,
+        address factoryAddr,
+        address registryAddr,
+        address swoodProxy,
+        address ownerMultisig
+    ) internal {
         console.log("\n=== Multisig handoff ===");
         console.log("Transferring ownership to:", ownerMultisig);
         Ownable(governorAddr).transferOwnership(ownerMultisig);
         Ownable(factoryAddr).transferOwnership(ownerMultisig);
         Ownable(registryAddr).transferOwnership(ownerMultisig);
-        console.log("Governor / Factory / Registry now owned by multisig");
+        if (swoodProxy != address(0)) {
+            Ownable(swoodProxy).transferOwnership(ownerMultisig);
+        }
+        console.log("Governor / Factory / Registry / sWOOD now owned by multisig");
     }
 
     function _validateGovernor(
@@ -445,10 +508,11 @@ contract DeploySherwood is ScriptBase {
         _checkAddr("registry.owner", Ownable(registryAddr).owner(), expectedOwner);
         _checkAddr("registry.governor", reg.governor(), governorAddr);
         _checkAddr("registry.factory", reg.factory(), factoryAddr);
-        _checkAddr("registry.wood", address(reg.wood()), wood);
-        _checkUint("registry.minGuardianStake", reg.minGuardianStake(), DEFAULT_MIN_GUARDIAN_STAKE);
-        _checkUint("registry.minOwnerStake", reg.minOwnerStake(), DEFAULT_MIN_OWNER_STAKE);
-        _checkUint("registry.coolDownPeriod", reg.coolDownPeriod(), DEFAULT_COOLDOWN);
+        // sWOOD is the sole WOOD custodian post-split — validate the registry's
+        // sWOOD handle and that sWOOD itself custodies the right WOOD token.
+        address swoodAddr = address(reg.swood());
+        _checkAddr("swood.wood", address(StakedWood(swoodAddr).wood()), wood);
+        _checkAddr("swood.registry", StakedWood(swoodAddr).registry(), registryAddr);
         _checkUint("registry.reviewPeriod", reg.reviewPeriod(), DEFAULT_REVIEW_PERIOD);
         _checkUint("registry.blockQuorumBps", reg.blockQuorumBps(), DEFAULT_BLOCK_QUORUM_BPS);
         // Governor knows about the registry (set at init-time).

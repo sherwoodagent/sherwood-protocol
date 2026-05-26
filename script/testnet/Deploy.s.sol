@@ -9,6 +9,7 @@ import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {SyndicateFactory} from "../../src/SyndicateFactory.sol";
 import {SyndicateGovernor} from "../../src/SyndicateGovernor.sol";
 import {GuardianRegistry} from "../../src/GuardianRegistry.sol";
+import {StakedWood} from "../../src/StakedWood.sol";
 import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 import {ScriptBase} from "../ScriptBase.sol";
 
@@ -50,12 +51,15 @@ contract DeployTestnet is ScriptBase {
         // 3. Deploy SyndicateGovernor (UUPS proxy). Governor init requires the
         //    registry address, but the registry init requires the governor, so
         //    we predict the registry proxy address via `vm.computeCreateAddress`:
-        //    govImpl (+0), govProxy (+1), registryImpl (+2), registryProxy (+3),
-        //    factoryImpl (+4), factoryProxy (+5). The registry is deployed right
-        //    after and `require`-checked to match.
+        //    govImpl (+0), govProxy (+1), swoodImpl (+2), swoodProxy (+3),
+        //    registryImpl (+4), registryProxy (+5), factoryImpl (+6),
+        //    factoryProxy (+7). sWOOD is the sole WOOD custodian and is deployed
+        //    before the registry; the registry↔sWOOD circular dependency is
+        //    resolved by the set-once `setRegistry` call.
         uint256 baseNonce = vm.getNonce(deployer);
-        address predictedRegistryProxy = vm.computeCreateAddress(deployer, baseNonce + 3);
-        address predictedFactoryProxy = vm.computeCreateAddress(deployer, baseNonce + 5);
+        address predictedSwoodProxy = vm.computeCreateAddress(deployer, baseNonce + 3);
+        address predictedRegistryProxy = vm.computeCreateAddress(deployer, baseNonce + 5);
+        address predictedFactoryProxy = vm.computeCreateAddress(deployer, baseNonce + 7);
 
         SyndicateGovernor govImpl = new SyndicateGovernor();
         bytes memory govInitData = abi.encodeCall(
@@ -82,22 +86,40 @@ contract DeployTestnet is ScriptBase {
         address governorProxy = address(new ERC1967Proxy(address(govImpl), govInitData));
         console.log("SyndicateGovernor:", governorProxy);
 
-        // 4. Deploy GuardianRegistry at the predicted address. If WOOD isn't
-        //    deployed yet on testnet, the registry is initialized with
-        //    address(0x1) as a placeholder — override via `WOOD_TOKEN` env var
-        //    when real WOOD exists.
-        GuardianRegistry registryImpl = new GuardianRegistry();
+        // 3b. Deploy StakedWood (sWOOD) — the sole WOOD custodian. Deployed
+        //     before the registry so the registry init can take the sWOOD
+        //     address. If WOOD isn't deployed yet on testnet, sWOOD is
+        //     initialized with address(0x1) as a placeholder — override via
+        //     `WOOD_TOKEN` env var when real WOOD exists.
         address woodToken = vm.envOr("WOOD_TOKEN", address(0x1));
+        StakedWood swoodImpl = new StakedWood();
+        bytes memory swoodInitData = abi.encodeCall(
+            StakedWood.initialize,
+            (StakedWood.InitParams({
+                    owner: deployer,
+                    wood: woodToken,
+                    governor: governorProxy,
+                    factory: predictedFactoryProxy,
+                    minGuardianStake: 10_000e18,
+                    coolDownPeriod: 7 days,
+                    minOwnerStake: 10_000e18,
+                    minSlashBps: 1000,
+                    maxSlashBps: 9999
+                }))
+        );
+        address swoodProxy = address(new ERC1967Proxy(address(swoodImpl), swoodInitData));
+        require(swoodProxy == predictedSwoodProxy, "swood addr mismatch");
+        console.log("StakedWood:", swoodProxy);
+
+        // 4. Deploy GuardianRegistry at the predicted address.
+        GuardianRegistry registryImpl = new GuardianRegistry();
         bytes memory regInitData = abi.encodeCall(
             GuardianRegistry.initialize,
             (
                 deployer,
                 governorProxy,
                 predictedFactoryProxy,
-                woodToken,
-                10_000e18, // minGuardianStake
-                10_000e18, // minOwnerStake
-                7 days, // coolDownPeriod
+                swoodProxy,
                 24 hours, // reviewPeriod
                 3000 // blockQuorumBps (30%)
             )
@@ -105,6 +127,9 @@ contract DeployTestnet is ScriptBase {
         address registryProxy = address(new ERC1967Proxy(address(registryImpl), regInitData));
         require(registryProxy == predictedRegistryProxy, "registry addr mismatch");
         console.log("GuardianRegistry:", registryProxy);
+
+        // Wire the set-once registry reference on sWOOD.
+        StakedWood(swoodProxy).setRegistry(registryProxy);
 
         // 5. Deploy SyndicateFactory (UUPS proxy). Must match predictedFactoryProxy.
         SyndicateFactory factoryImpl = new SyndicateFactory();
@@ -139,6 +164,7 @@ contract DeployTestnet is ScriptBase {
             "Base Sepolia", deployer, address(factory), governorProxy, address(executorLib), address(vaultImpl)
         );
         _patchAddress("GUARDIAN_REGISTRY", registryProxy);
+        _patchAddress("STAKED_WOOD", swoodProxy);
 
         console.log("\nNext steps:");
         console.log("  1. sherwood --testnet identity mint");

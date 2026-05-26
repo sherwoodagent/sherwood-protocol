@@ -3,8 +3,7 @@ pragma solidity 0.8.28;
 
 import "forge-std/Test.sol";
 
-import {GuardianRegistry} from "../../../src/GuardianRegistry.sol";
-import {IGuardianRegistry} from "../../../src/interfaces/IGuardianRegistry.sol";
+import {StakedWood} from "../../../src/StakedWood.sol";
 import {ERC20Mock} from "../../mocks/ERC20Mock.sol";
 
 /// @title DelegationHandler
@@ -14,34 +13,37 @@ import {ERC20Mock} from "../../mocks/ERC20Mock.sol";
 ///         full governor/vote lifecycle (which is covered by targeted unit
 ///         tests instead).
 ///
+///         Post-split (Task 7.1): staking, delegation, and commission live in
+///         `StakedWood` — the handler drives sWOOD directly.
+///
 ///         Actor set: 4 guardians (can also be delegates) + 4 delegators.
 contract DelegationHandler is Test {
-    GuardianRegistry public registry;
+    StakedWood public swood;
     ERC20Mock public wood;
-    address public registryOwner;
+    address public swoodOwner;
 
     // Actor pools — fixed membership, materialized at construction.
     address[] public guardians; // length 4
     address[] public delegators; // length 4
 
-    constructor(GuardianRegistry _registry, ERC20Mock _wood, address _registryOwner) {
-        registry = _registry;
+    constructor(StakedWood _swood, ERC20Mock _wood, address _swoodOwner) {
+        swood = _swood;
         wood = _wood;
-        registryOwner = _registryOwner;
+        swoodOwner = _swoodOwner;
 
         for (uint256 i = 0; i < 4; i++) {
             address g = makeAddr(string(abi.encodePacked("g", vm.toString(i))));
             guardians.push(g);
             wood.mint(g, 10_000_000e18);
             vm.prank(g);
-            wood.approve(address(registry), type(uint256).max);
+            wood.approve(address(swood), type(uint256).max);
         }
         for (uint256 i = 0; i < 4; i++) {
             address d = makeAddr(string(abi.encodePacked("d", vm.toString(i))));
             delegators.push(d);
             wood.mint(d, 10_000_000e18);
             vm.prank(d);
-            wood.approve(address(registry), type(uint256).max);
+            wood.approve(address(swood), type(uint256).max);
         }
     }
 
@@ -49,27 +51,27 @@ contract DelegationHandler is Test {
 
     function stake(uint256 actorSeed, uint256 amtSeed) external {
         address g = guardians[bound(actorSeed, 0, guardians.length - 1)];
-        uint256 amt = bound(amtSeed, registry.minGuardianStake(), 1_000_000e18);
+        uint256 amt = bound(amtSeed, swood.minGuardianStake(), 1_000_000e18);
         vm.prank(g);
-        try registry.stakeAsGuardian(amt, 1) {} catch {}
+        try swood.stakeAsGuardian(amt, 1) {} catch {}
     }
 
     function requestUnstake(uint256 actorSeed) external {
         address g = guardians[bound(actorSeed, 0, guardians.length - 1)];
         vm.prank(g);
-        try registry.requestUnstakeGuardian() {} catch {}
+        try swood.requestUnstakeGuardian() {} catch {}
     }
 
     function cancelUnstake(uint256 actorSeed) external {
         address g = guardians[bound(actorSeed, 0, guardians.length - 1)];
         vm.prank(g);
-        try registry.cancelUnstakeGuardian() {} catch {}
+        try swood.cancelUnstakeGuardian() {} catch {}
     }
 
     function claimUnstake(uint256 actorSeed) external {
         address g = guardians[bound(actorSeed, 0, guardians.length - 1)];
         vm.prank(g);
-        try registry.claimUnstakeGuardian() {} catch {}
+        try swood.claimUnstakeGuardian() {} catch {}
     }
 
     // ── Delegation lifecycle ──
@@ -79,37 +81,37 @@ contract DelegationHandler is Test {
         address delegate_ = guardians[bound(delegateSeed, 0, guardians.length - 1)];
         uint256 amt = bound(amtSeed, 1, 1_000_000e18);
         vm.prank(delegator);
-        try registry.delegateStake(delegate_, amt) {} catch {}
+        try swood.delegateStake(delegate_, amt) {} catch {}
     }
 
     function requestUnstakeDelegation(uint256 delegatorSeed, uint256 delegateSeed) external {
         address delegator = delegators[bound(delegatorSeed, 0, delegators.length - 1)];
         address delegate_ = guardians[bound(delegateSeed, 0, guardians.length - 1)];
         vm.prank(delegator);
-        try registry.requestUnstakeDelegation(delegate_) {} catch {}
+        try swood.requestUnstakeDelegation(delegate_) {} catch {}
     }
 
     function cancelUnstakeDelegation(uint256 delegatorSeed, uint256 delegateSeed) external {
         address delegator = delegators[bound(delegatorSeed, 0, delegators.length - 1)];
         address delegate_ = guardians[bound(delegateSeed, 0, guardians.length - 1)];
         vm.prank(delegator);
-        try registry.cancelUnstakeDelegation(delegate_) {} catch {}
+        try swood.cancelUnstakeDelegation(delegate_) {} catch {}
     }
 
     function claimUnstakeDelegation(uint256 delegatorSeed, uint256 delegateSeed) external {
         address delegator = delegators[bound(delegatorSeed, 0, delegators.length - 1)];
         address delegate_ = guardians[bound(delegateSeed, 0, guardians.length - 1)];
         vm.prank(delegator);
-        try registry.claimUnstakeDelegation(delegate_) {} catch {}
+        try swood.claimUnstakeDelegation(delegate_) {} catch {}
     }
 
     // ── Commission ──
 
     function setCommission(uint256 actorSeed, uint256 bpsSeed) external {
         address g = guardians[bound(actorSeed, 0, guardians.length - 1)];
-        uint256 bps = bound(bpsSeed, 0, registry.MAX_COMMISSION_BPS());
+        uint256 bps = bound(bpsSeed, 0, swood.MAX_COMMISSION_BPS());
         vm.prank(g);
-        try registry.setCommission(bps) {} catch {}
+        try swood.setCommission(bps) {} catch {}
     }
 
     // ── Time ──

@@ -2,7 +2,14 @@
 pragma solidity 0.8.28;
 
 import {BatchExecutorLib} from "../BatchExecutorLib.sol";
+import {IStakedWood} from "./IStakedWood.sol";
 
+/// @title IGuardianRegistry
+/// @notice Interface for the slimmed `GuardianRegistry` — review/emergency
+///         lifecycle + multi-asset reward pools only. WOOD custody, guardian
+///         staking, DPoS delegation, owner bonds, vote checkpoints, and
+///         slashing moved to `StakedWood` (sWOOD); see `IStakedWood`.
+/// @dev See `docs/superpowers/specs/2026-05-21-swood-staking-split-design.md`.
 interface IGuardianRegistry {
     // ── Enums ──
     enum GuardianVoteType {
@@ -13,11 +20,6 @@ interface IGuardianRegistry {
 
     // ── Errors ──
     error ZeroAddress();
-    error InsufficientStake();
-    error NoActiveStake();
-    error CooldownNotElapsed();
-    error UnstakeNotRequested();
-    error UnstakeAlreadyRequested();
     error NotActiveGuardian();
     error AlreadyVoted();
     error NoVoteChange();
@@ -25,15 +27,8 @@ interface IGuardianRegistry {
     error NewSideFull();
     error ReviewNotOpen();
     error ReviewNotReadyForResolve();
-    error NotFactory();
     error NotGovernor();
-    error PreparedStakeNotFound();
-    error PreparedStakeAlreadyExists();
-    error PreparedStakeAlreadyBound();
-    error VaultHasActiveProposal();
-    error PriorStakeNotCleared();
     error PoolAlreadyFunded();
-    error OwnerBondInsufficient();
     error EmergencyTooManyCalls();
     error EmergencyHashMismatch();
     /// @notice Sherlock #15 (collapsed into this revert): `openEmergency`
@@ -46,17 +41,7 @@ interface IGuardianRegistry {
     error AlreadyPaused();
     error NotPausedOrDeadmanNotElapsed();
     error RefundCapExceeded();
-    // Delegation
-    error CannotSelfDelegate();
-    error InvalidDelegate();
-    error InactiveDelegate();
-    error AmountZero();
-    error NoActiveDelegation();
-    error NoUnstakeRequest();
-    error UnstakeCooldownActive();
-    // Commission + claim
-    error CommissionExceedsMax();
-    error CommissionRaiseExceedsLimit();
+    // Reward claims
     error NoPoolFunded();
     error AlreadyClaimed();
     error NotApprover();
@@ -64,18 +49,13 @@ interface IGuardianRegistry {
     error DelegatePoolEmpty();
     error NoEscrowedAmount();
     error InvalidParameter();
+    /// @notice Sherlock #16: `setReviewPeriod` rejected because the new
+    ///         review window exceeds sWOOD's `coolDownPeriod`. A review
+    ///         window longer than the guardian unstake cooldown would let an
+    ///         approver unstake and escape the slash before `resolveReview`.
+    error CooldownBelowReviewPeriod();
 
     // ── Events ──
-    event GuardianStaked(address indexed guardian, uint256 amount, uint256 agentId);
-    event GuardianUnstakeRequested(address indexed guardian, uint256 requestedAt);
-    event GuardianUnstakeCancelled(address indexed guardian);
-    event GuardianUnstakeClaimed(address indexed guardian, uint256 amount);
-    event OwnerStakePrepared(address indexed owner, uint256 amount);
-    event PreparedStakeCancelled(address indexed owner, uint256 amount);
-    event OwnerStakeBound(address indexed owner, address indexed vault, uint256 amount);
-    event OwnerStakeSlotTransferred(address indexed vault, address indexed oldOwner, address indexed newOwner);
-    event OwnerUnstakeRequested(address indexed vault, uint256 requestedAt);
-    event OwnerUnstakeClaimed(address indexed vault, address indexed owner, uint256 amount);
     event ReviewOpened(uint256 indexed proposalId, uint128 totalStakeAtOpen);
     event CohortTooSmallToReview(uint256 indexed proposalId, uint256 totalStakeAtOpen);
     event GuardianVoteCast(
@@ -96,13 +76,9 @@ interface IGuardianRegistry {
     event EmergencyReviewResolved(uint256 indexed proposalId, bool blocked, uint256 slashedAmount);
     // Emitted per blocker when a review resolves blocked = true. Merkl's
     // off-chain bot reads this to build the epoch WOOD campaign's Merkle roots.
-    // (WOOD epoch budgets live in Merkl — the funding tx is a plain ERC20
-    // transfer, no on-chain event needed in this registry.)
     event BlockerAttributed(
         uint256 indexed proposalId, uint256 indexed epochId, address indexed blocker, uint256 weight
     );
-    event PendingBurnRecorded(uint256 amount);
-    event BurnFlushed(uint256 amount);
     event Paused(address indexed by);
     event Unpaused(address indexed by, bool deadman);
     event SlashAppealReserveFunded(address indexed by, uint256 amount);
@@ -110,21 +86,9 @@ interface IGuardianRegistry {
     event ParameterChangeFinalized(bytes32 indexed paramKey, uint256 oldValue, uint256 newValue);
 
     // ── Guardian fns ──
-    function stakeAsGuardian(uint256 amount, uint256 agentId) external;
-    function requestUnstakeGuardian() external;
-    function cancelUnstakeGuardian() external;
-    function claimUnstakeGuardian() external;
-    function voteOnProposal(uint256 proposalId, GuardianVoteType support) external;
-
-    // ── Owner fns ──
-    function prepareOwnerStake(uint256 amount) external;
-    function cancelPreparedStake() external;
-    function requestUnstakeOwner(address vault) external;
-    function claimUnstakeOwner(address vault) external;
-
-    // ── Factory-only ──
-    function bindOwnerStake(address owner, address vault) external;
-    function transferOwnerStakeSlot(address vault, address newOwner) external;
+    /// @notice Cast or change a guardian review vote on a proposal. Vote weight
+    ///         is read from sWOOD's `getPastVotes` at the review's `openedAt`.
+    function voteOnProposal(uint256 proposalId, GuardianVoteType support, uint256 slashBps) external;
 
     // ── Governor-only (emergency) ──
     function openEmergency(uint256 proposalId, bytes32 callsHash, BatchExecutorLib.Call[] calldata calls) external;
@@ -148,7 +112,6 @@ interface IGuardianRegistry {
     function resolveReview(uint256 proposalId) external returns (bool blocked);
     function resolveEmergencyReview(uint256 proposalId) external;
     function voteBlockEmergencySettle(uint256 proposalId) external;
-    function flushBurn() external;
 
     // ── Slash appeal ──
     function fundSlashAppealReserve(uint256 amount) external;
@@ -159,9 +122,6 @@ interface IGuardianRegistry {
     function unpause() external;
 
     // ── Parameter setters (owner-instant; owner is a multisig with external delay) ──
-    function setMinGuardianStake(uint256) external;
-    function setMinOwnerStake(uint256) external;
-    function setCooldownPeriod(uint256) external;
     function setReviewPeriod(uint256) external;
     function setBlockQuorumBps(uint256) external;
 
@@ -177,39 +137,16 @@ interface IGuardianRegistry {
         returns (bool opened, bool resolved, bool blocked, bool cohortTooSmall);
 
     function reviewPeriod() external view returns (uint256);
-    function guardianStake(address guardian) external view returns (uint256);
-    function ownerStake(address vault) external view returns (uint256);
-    function totalGuardianStake() external view returns (uint256);
-    function minOwnerStake() external view returns (uint256);
-    function delegationOf(address delegator, address delegate) external view returns (uint256);
-    function delegatedInbound(address delegate) external view returns (uint256);
-    function isActiveGuardian(address guardian) external view returns (bool);
-    function preparedStakeOf(address owner) external view returns (uint256);
-    function canCreateVault(address owner) external view returns (bool);
     function governor() external view returns (address);
     function factory() external view returns (address);
+    function swood() external view returns (IStakedWood);
 
-    // ── Delegation ──
-    function delegateStake(address delegate, uint256 amount) external;
-    function requestUnstakeDelegation(address delegate) external;
-    function cancelUnstakeDelegation(address delegate) external;
-    function claimUnstakeDelegation(address delegate) external;
+    /// @notice A vault's bound owner stake. Passthrough to sWOOD —
+    ///         `GovernorEmergency` reads it through the registry handle.
+    function ownerStake(address vault) external view returns (uint256);
 
-    function totalDelegatedStake() external view returns (uint256);
-
-    // Off-chain callers read historical checkpoints via eth_getStorageAt or
-    // events.
-
-    event DelegationIncreased(address indexed delegator, address indexed delegate, uint256 amount);
-    event DelegationUnstakeRequested(address indexed delegator, address indexed delegate, uint256 at);
-    event DelegationUnstakeCancelled(address indexed delegator, address indexed delegate);
-    event DelegationUnstakeClaimed(address indexed delegator, address indexed delegate, uint256 amount);
-
-    // ── DPoS commission ──
-    function setCommission(uint256 newBps) external;
-    function commissionOf(address delegate) external view returns (uint256);
-
-    event CommissionSet(address indexed delegate, uint256 oldBps, uint256 newBps);
+    /// @notice The minimum WOOD a vault owner must bond. Passthrough to sWOOD.
+    function minOwnerStake() external view returns (uint256);
 
     // ── On-chain guardian-fee pool (vault assets) ──
     /// @notice Called by governor in `_distributeFees` after transferring the
@@ -235,9 +172,6 @@ interface IGuardianRegistry {
     ///         asset) so cross-proposal drain is impossible.
     function flushUnclaimedApproverFee(uint256 proposalId, address recipient, address asset) external;
 
-    // unclaimedApproverFee view removed — escrow is observable via
-    // ApproverFeeEscrowed event + eth_getStorageAt at keccak256(pid, recipient, asset).
-
     event ProposalGuardianPoolFunded(uint256 indexed proposalId, address indexed asset, uint256 amount);
     event ApproverRewardClaimed(
         uint256 indexed proposalId, address indexed approver, uint256 gross, uint256 commission, uint256 remainder
@@ -248,6 +182,4 @@ interface IGuardianRegistry {
     event ApproverFeeEscrowed(
         uint256 indexed proposalId, address indexed recipient, address indexed asset, uint256 amount
     );
-    // Flush is observable via ERC20 Transfer + unclaimedApproverFee = 0 — no
-    // dedicated event (saves bytecode).
 }

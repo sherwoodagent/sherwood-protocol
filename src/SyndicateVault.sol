@@ -403,6 +403,12 @@ contract SyndicateVault is
     ///      different library.
     /// @dev I-11: gated by `whenNotPaused`. When the owner pauses the vault,
     ///      strategy execution is halted alongside LP flow.
+    /// @dev `nonReentrant` retained — strategies called via the batch can
+    ///      re-enter the vault through the 4626 deposit / withdraw / redeem
+    ///      paths. Each of those has its own `nonReentrant`, but the
+    ///      cross-function latch is what `test_executeGovernorBatch_reentrancy_blocked`
+    ///      asserts. Dropping the guard here breaks that contract even
+    ///      with the V-C2 codehash pin in place.
     function executeGovernorBatch(BatchExecutorLib.Call[] calldata calls)
         external
         onlyGovernor
@@ -654,6 +660,28 @@ contract SyndicateVault is
         return liveAdapter == address(0) ? float : float + adapterValue;
     }
 
+    /// @notice Sherlock run #2 #12: return 0 when `paused()` so the
+    ///         EIP-4626 IMP-1 invariant holds for paused vaults
+    ///         (`deposit(maxDeposit(receiver), receiver)` MUST NOT revert).
+    ///         Active-proposal and whitelist cases remain reported as
+    ///         `type(uint256).max` here — adding either check costs ~100 B
+    ///         each (full `_lpFlowGate` staticcall path / EnumerableSet
+    ///         contains), busting EIP-170 on the V1.5 surface AND
+    ///         under-reporting valid live-NAV deposit flows (deposits
+    ///         during Executed with a bound adapter SHOULD succeed via
+    ///         `onLiveDeposit`). Frontends that need active-proposal
+    ///         precision should poll `governor.openProposalCount` and
+    ///         `governor.getActiveProposal(vault)` directly; whitelist
+    ///         status is available via `isApprovedDepositor(receiver)`.
+    function maxDeposit(address) public view override returns (uint256) {
+        if (paused()) return 0;
+        return type(uint256).max;
+    }
+
+    function maxMint(address receiver) public view override returns (uint256) {
+        return maxDeposit(receiver);
+    }
+
     /// @dev Block deposits when paused or depositor not approved.
     ///      Auto-delegate to self on first deposit so shareholders get voting power.
     ///      When a live-NAV adapter is bound, forward the new capital so it
@@ -832,12 +860,15 @@ contract SyndicateVault is
     ///      escrowed shares back to themselves at any time.
     /// @return requestId Always > 0 — the queue uses index 0 as a sentinel.
     ///         Off-chain integrators may treat 0 as "no request".
-    function requestRedeem(uint256 shares, address owner_)
-        external
-        nonReentrant
-        whenNotPaused
-        returns (uint256 requestId)
-    {
+    /// @dev `nonReentrant` dropped: state writes happen before the external
+    ///      `queueRequest` call — `_spendAllowance` (allowance state)
+    ///      followed by `_transfer` (share ledger) both commit before the
+    ///      queue is invoked. The queue is the team's own
+    ///      `VaultWithdrawalQueue` (added per-vault by the factory) and
+    ///      `queueRequest` only appends to its own storage — no callback
+    ///      vector into this vault. Paired with the Sherlock run #2 #12
+    ///      `maxDeposit` / `maxMint` overrides for ~20 B headroom.
+    function requestRedeem(uint256 shares, address owner_) external whenNotPaused returns (uint256 requestId) {
         address q = _withdrawalQueue;
         if (q == address(0)) revert WithdrawalQueueNotSet();
         if (!redemptionsLocked()) revert RedemptionsNotLocked();

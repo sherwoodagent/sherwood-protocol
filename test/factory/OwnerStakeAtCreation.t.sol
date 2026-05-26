@@ -10,6 +10,7 @@ import {SyndicateGovernor} from "../../src/SyndicateGovernor.sol";
 import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 import {GuardianRegistry} from "../../src/GuardianRegistry.sol";
 import {IGuardianRegistry} from "../../src/interfaces/IGuardianRegistry.sol";
+import {StakedWood} from "../../src/StakedWood.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
@@ -24,6 +25,7 @@ contract OwnerStakeAtCreationTest is Test {
     SyndicateGovernor public governor;
     SyndicateVault public vaultImpl;
     GuardianRegistry public registry;
+    StakedWood public swood;
     BatchExecutorLib public executorLib;
     ERC20Mock public usdc;
     ERC20Mock public wood;
@@ -53,13 +55,33 @@ contract OwnerStakeAtCreationTest is Test {
         creatorAgentId = agentRegistry.mint(creator);
         newOwnerAgentId = agentRegistry.mint(newOwner);
 
-        // Governor + factory + registry triangle — circular init deps resolved
+        // sWOOD + Governor + Factory + Registry — circular init deps resolved
         // by predicting proxy addresses via `vm.computeCreateAddress`.
-        // From this.nonce baseline: govImpl (+0), govProxy (+1), factoryImpl (+2),
-        // regImpl (+3), regProxy (+4), factoryProxy (+5).
+        // From `baseNonce`: swoodImpl (+0), swoodProxy (+1), govImpl (+2),
+        // govProxy (+3), factoryImpl (+4), regImpl (+5), regProxy (+6),
+        // factoryProxy (+7).
         uint256 baseNonce = vm.getNonce(address(this));
-        address predictedRegistryProxy = vm.computeCreateAddress(address(this), baseNonce + 4);
-        address predictedFactoryProxy = vm.computeCreateAddress(address(this), baseNonce + 5);
+        address predictedGovernor = vm.computeCreateAddress(address(this), baseNonce + 3);
+        address predictedRegistryProxy = vm.computeCreateAddress(address(this), baseNonce + 6);
+        address predictedFactoryProxy = vm.computeCreateAddress(address(this), baseNonce + 7);
+
+        // sWOOD — sole WOOD custodian post-split.
+        StakedWood swoodImpl = new StakedWood();
+        bytes memory swoodInit = abi.encodeCall(
+            StakedWood.initialize,
+            (StakedWood.InitParams({
+                    owner: owner,
+                    wood: address(wood),
+                    governor: predictedGovernor,
+                    factory: predictedFactoryProxy,
+                    minGuardianStake: MIN_GUARDIAN_STAKE,
+                    coolDownPeriod: 7 days,
+                    minOwnerStake: MIN_OWNER_STAKE,
+                    minSlashBps: 1000,
+                    maxSlashBps: 9999
+                }))
+        );
+        swood = StakedWood(address(new ERC1967Proxy(address(swoodImpl), swoodInit)));
 
         // Governor
         SyndicateGovernor govImpl = new SyndicateGovernor();
@@ -85,6 +107,7 @@ contract OwnerStakeAtCreationTest is Test {
             )
         );
         governor = SyndicateGovernor(address(new ERC1967Proxy(address(govImpl), govInit)));
+        require(address(governor) == predictedGovernor, "governor address prediction mismatch");
 
         // Factory + registry — registry needs factory address, factory needs
         // registry address. Deploy in order matching the nonce plan above.
@@ -92,20 +115,14 @@ contract OwnerStakeAtCreationTest is Test {
         GuardianRegistry regImpl = new GuardianRegistry();
         bytes memory regInit = abi.encodeCall(
             GuardianRegistry.initialize,
-            (
-                owner,
-                address(governor),
-                predictedFactoryProxy,
-                address(wood),
-                MIN_GUARDIAN_STAKE,
-                MIN_OWNER_STAKE,
-                7 days,
-                REVIEW_PERIOD,
-                BLOCK_QUORUM_BPS
-            )
+            (owner, address(governor), predictedFactoryProxy, address(swood), REVIEW_PERIOD, BLOCK_QUORUM_BPS)
         );
         registry = GuardianRegistry(address(new ERC1967Proxy(address(regImpl), regInit)));
         require(address(registry) == predictedRegistryProxy, "registry address prediction mismatch");
+
+        // Resolve the registry ↔ sWOOD circular dependency.
+        vm.prank(owner);
+        swood.setRegistry(address(registry));
 
         bytes memory factoryInit = abi.encodeCall(
             SyndicateFactory.initialize,
@@ -146,9 +163,9 @@ contract OwnerStakeAtCreationTest is Test {
 
     function _prepareStake(address who) internal {
         vm.prank(who);
-        wood.approve(address(registry), type(uint256).max);
+        wood.approve(address(swood), type(uint256).max);
         vm.prank(who);
-        registry.prepareOwnerStake(MIN_OWNER_STAKE);
+        swood.prepareOwnerStake(MIN_OWNER_STAKE);
     }
 
     // ──────────────────────────────────────────────────────────────
@@ -163,7 +180,7 @@ contract OwnerStakeAtCreationTest is Test {
 
     function test_createSyndicate_bindsPreparedStakeAtomic() public {
         _prepareStake(creator);
-        assertTrue(registry.canCreateVault(creator));
+        assertTrue(swood.canCreateVault(creator));
 
         vm.prank(creator);
         (uint256 id, address vault) = factory.createSyndicate(creatorAgentId, _cfg("my-fund"));
@@ -172,7 +189,7 @@ contract OwnerStakeAtCreationTest is Test {
         assertTrue(vault != address(0));
         assertTrue((registry.ownerStake(vault) > 0), "owner stake bound to vault");
         assertEq(registry.ownerStake(vault), MIN_OWNER_STAKE);
-        assertFalse(registry.canCreateVault(creator), "prepared stake consumed");
+        assertFalse(swood.canCreateVault(creator), "prepared stake consumed");
     }
 
     function test_createSyndicate_bindFailureRevertsEntireTx() public {
@@ -200,11 +217,11 @@ contract OwnerStakeAtCreationTest is Test {
 
         // Creator requests and claims the owner unstake so hasOwnerStake == false.
         vm.prank(creator);
-        registry.requestUnstakeOwner(vault);
+        swood.requestUnstakeOwner(vault);
         vm.warp(block.timestamp + 7 days + 1);
         vm.prank(creator);
-        registry.claimUnstakeOwner(vault);
-        assertFalse((registry.ownerStake(vault) > 0));
+        swood.claimUnstakeOwner(vault);
+        assertFalse((swood.ownerStake(vault) > 0));
     }
 
     /// @notice Sherlock #32: rotateOwner is now gated to vault owner /
@@ -246,20 +263,11 @@ contract OwnerStakeAtCreationTest is Test {
 
         // Swap the governor's registry to a different address → mismatch.
         GuardianRegistry otherImpl = new GuardianRegistry();
-        // Deploy a minimally-initialized second registry.
+        // Deploy a minimally-initialized second registry (slimmed 6-arg init;
+        // shares the same sWOOD — only the registry address matters here).
         bytes memory otherInit = abi.encodeCall(
             GuardianRegistry.initialize,
-            (
-                owner,
-                address(governor),
-                address(factory),
-                address(wood),
-                MIN_GUARDIAN_STAKE,
-                MIN_OWNER_STAKE,
-                7 days,
-                REVIEW_PERIOD,
-                BLOCK_QUORUM_BPS
-            )
+            (owner, address(governor), address(factory), address(swood), REVIEW_PERIOD, BLOCK_QUORUM_BPS)
         );
         address other = address(new ERC1967Proxy(address(otherImpl), otherInit));
 

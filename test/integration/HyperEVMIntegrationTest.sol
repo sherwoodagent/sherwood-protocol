@@ -9,6 +9,7 @@ import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 import {SyndicateVault} from "../../src/SyndicateVault.sol";
 import {SyndicateFactory} from "../../src/SyndicateFactory.sol";
 import {GuardianRegistry} from "../../src/GuardianRegistry.sol";
+import {StakedWood} from "../../src/StakedWood.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {DeploySherwood} from "../../script/Deploy.s.sol";
 import {DeployTemplates} from "../../script/DeployTemplates.s.sol";
@@ -50,6 +51,7 @@ abstract contract HyperEVMIntegrationTest is Test {
     SyndicateGovernor governor;
     SyndicateFactory factory;
     GuardianRegistry registry;
+    StakedWood swood;
     ERC20Mock wood;
     address vaultImpl;
     address executorLib;
@@ -118,6 +120,7 @@ abstract contract HyperEVMIntegrationTest is Test {
         governor = SyndicateGovernor(d.governorProxy);
         factory = SyndicateFactory(d.factoryProxy);
         registry = GuardianRegistry(d.registryProxy);
+        swood = StakedWood(d.swoodProxy);
         vaultImpl = d.vaultImpl;
         executorLib = d.executorLib;
         deployer = d.deployer; // address(deployScript) — owner of factory/governor/registry
@@ -135,10 +138,11 @@ abstract contract HyperEVMIntegrationTest is Test {
     ///      `SyndicateFactory.createSyndicate` can bind it atomically. Without this
     ///      the factory reverts on the missing prepared stake.
     function _bondOwnerStake() internal {
+        // Post-split: owner staking lives in sWOOD.
         wood.mint(owner, MIN_OWNER_STAKE);
         vm.startPrank(owner);
-        wood.approve(address(registry), type(uint256).max);
-        registry.prepareOwnerStake(MIN_OWNER_STAKE);
+        wood.approve(address(swood), type(uint256).max);
+        swood.prepareOwnerStake(MIN_OWNER_STAKE);
         vm.stopPrank();
         // Factory binds the prepared stake atomically when createSyndicate is called.
     }

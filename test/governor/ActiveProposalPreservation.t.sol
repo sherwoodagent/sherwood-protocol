@@ -8,6 +8,7 @@ import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 import {SyndicateVault} from "../../src/SyndicateVault.sol";
 import {ISyndicateVault} from "../../src/interfaces/ISyndicateVault.sol";
 import {GuardianRegistry} from "../../src/GuardianRegistry.sol";
+import {StakedWood} from "../../src/StakedWood.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
@@ -35,6 +36,7 @@ contract ActiveProposalPreservationTest is Test {
     SyndicateGovernor public governor;
     SyndicateVault public vault;
     GuardianRegistry public registry;
+    StakedWood public swood;
     BatchExecutorLib public executorLib;
     ERC20Mock public usdc;
     ERC20Mock public wood;
@@ -96,11 +98,31 @@ contract ActiveProposalPreservationTest is Test {
         vm.prank(owner);
         vault.registerAgent(agentNftId, agent);
 
-        // Governor + registry — circular init dep resolved by predicting the
-        // registry proxy via `vm.computeCreateAddress`: govImpl (+0),
-        // govProxy (+1), regImpl (+2), regProxy (+3).
+        // sWOOD + Governor + Registry — three-way circular init dependency
+        // resolved by predicting proxy addresses. From `baseNonce`:
+        //   swoodImpl (+0), swoodProxy (+1), govImpl (+2), govProxy (+3),
+        //   regImpl (+4), regProxy (+5).
         uint256 baseNonce = vm.getNonce(address(this));
-        address predictedRegistryProxy = vm.computeCreateAddress(address(this), baseNonce + 3);
+        address predictedGovernor = vm.computeCreateAddress(address(this), baseNonce + 3);
+        address predictedRegistryProxy = vm.computeCreateAddress(address(this), baseNonce + 5);
+
+        // sWOOD — sole WOOD custodian post-split.
+        StakedWood swoodImpl = new StakedWood();
+        bytes memory swoodInit = abi.encodeCall(
+            StakedWood.initialize,
+            (StakedWood.InitParams({
+                    owner: owner,
+                    wood: address(wood),
+                    governor: predictedGovernor,
+                    factory: factoryEoa,
+                    minGuardianStake: MIN_GUARDIAN_STAKE,
+                    coolDownPeriod: 7 days,
+                    minOwnerStake: MIN_OWNER_STAKE,
+                    minSlashBps: 1000,
+                    maxSlashBps: 9999
+                }))
+        );
+        swood = StakedWood(address(new ERC1967Proxy(address(swoodImpl), swoodInit)));
 
         SyndicateGovernor govImpl = new SyndicateGovernor();
         bytes memory govInit = abi.encodeCall(
@@ -125,6 +147,7 @@ contract ActiveProposalPreservationTest is Test {
             )
         );
         governor = SyndicateGovernor(address(new ERC1967Proxy(address(govImpl), govInit)));
+        require(address(governor) == predictedGovernor, "governor addr mismatch");
 
         vm.prank(owner);
         governor.addVault(address(vault));
@@ -132,20 +155,14 @@ contract ActiveProposalPreservationTest is Test {
         GuardianRegistry regImpl = new GuardianRegistry();
         bytes memory regInit = abi.encodeCall(
             GuardianRegistry.initialize,
-            (
-                owner,
-                address(governor),
-                factoryEoa,
-                address(wood),
-                MIN_GUARDIAN_STAKE,
-                MIN_OWNER_STAKE,
-                7 days,
-                REVIEW_PERIOD,
-                BLOCK_QUORUM_BPS
-            )
+            (owner, address(governor), factoryEoa, address(swood), REVIEW_PERIOD, BLOCK_QUORUM_BPS)
         );
         registry = GuardianRegistry(address(new ERC1967Proxy(address(regImpl), regInit)));
         require(address(registry) == predictedRegistryProxy, "registry addr mismatch");
+
+        // Resolve the registry ↔ sWOOD circular dependency.
+        vm.prank(owner);
+        swood.setRegistry(address(registry));
 
         usdc.mint(lp1, 100_000e6);
         usdc.mint(lp2, 100_000e6);
@@ -161,11 +178,11 @@ contract ActiveProposalPreservationTest is Test {
 
         wood.mint(owner, 100_000e18);
         vm.prank(owner);
-        wood.approve(address(registry), type(uint256).max);
+        wood.approve(address(swood), type(uint256).max);
         vm.prank(owner);
-        registry.prepareOwnerStake(MIN_OWNER_STAKE);
+        swood.prepareOwnerStake(MIN_OWNER_STAKE);
         vm.prank(factoryEoa);
-        registry.bindOwnerStake(owner, address(vault));
+        swood.bindOwnerStake(owner, address(vault));
 
         _stakeGuardian(g1, GUARDIAN_STAKE, 1);
         _stakeGuardian(g2, GUARDIAN_STAKE, 2);
@@ -177,9 +194,9 @@ contract ActiveProposalPreservationTest is Test {
     function _stakeGuardian(address who, uint256 amount, uint256 agentId) internal {
         wood.mint(who, amount);
         vm.prank(who);
-        wood.approve(address(registry), type(uint256).max);
+        wood.approve(address(swood), type(uint256).max);
         vm.prank(who);
-        registry.stakeAsGuardian(amount, agentId);
+        swood.stakeAsGuardian(amount, agentId);
     }
 
     function _emptyCoProposers() internal pure returns (ISyndicateGovernor.CoProposer[] memory) {

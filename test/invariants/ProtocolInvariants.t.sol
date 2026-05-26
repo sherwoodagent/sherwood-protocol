@@ -9,6 +9,7 @@ import {SyndicateFactory} from "../../src/SyndicateFactory.sol";
 import {SyndicateVault} from "../../src/SyndicateVault.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {GuardianRegistry} from "../../src/GuardianRegistry.sol";
+import {StakedWood} from "../../src/StakedWood.sol";
 import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 import {ISyndicateFactory} from "../../src/interfaces/ISyndicateFactory.sol";
 
@@ -49,6 +50,7 @@ contract ProtocolInvariantsTest is StdInvariant, Test {
     SyndicateGovernor public governor;
     SyndicateFactory public factory;
     GuardianRegistry public registry;
+    StakedWood public swood;
     ERC20Mock public wood;
     SyndicateVault public vaultImpl;
 
@@ -81,6 +83,35 @@ contract ProtocolInvariantsTest is StdInvariant, Test {
     function setUp() public {
         wood = new ERC20Mock("WOOD", "WOOD", 18);
 
+        // ── sWOOD (proxy, real impl) ──
+        // Sole WOOD custodian post-split; the registry's `initialize` takes its
+        // address. The governor placeholder is harmless — sWOOD only reads
+        // `governor` in `requestUnstakeOwner`, which this harness never drives.
+        {
+            StakedWood swoodImpl = new StakedWood();
+            swood = StakedWood(
+                address(
+                    new ERC1967Proxy(
+                        address(swoodImpl),
+                        abi.encodeCall(
+                            StakedWood.initialize,
+                            (StakedWood.InitParams({
+                                    owner: registryOwner,
+                                    wood: address(wood),
+                                    governor: address(0xdead), // unused by this harness
+                                    factory: address(0xbeef),
+                                    minGuardianStake: MIN_GUARDIAN_STAKE,
+                                    coolDownPeriod: COOL_DOWN,
+                                    minOwnerStake: MIN_OWNER_STAKE,
+                                    minSlashBps: 1000,
+                                    maxSlashBps: 9999
+                                }))
+                        )
+                    )
+                )
+            );
+        }
+
         // ── Registry (proxy, real impl) ──
         {
             GuardianRegistry regImpl = new GuardianRegistry();
@@ -99,10 +130,7 @@ contract ProtocolInvariantsTest is StdInvariant, Test {
                                 registryOwner,
                                 address(0xdead), // governor placeholder
                                 address(0xbeef), // factory placeholder
-                                address(wood),
-                                MIN_GUARDIAN_STAKE,
-                                MIN_OWNER_STAKE,
-                                COOL_DOWN,
+                                address(swood),
                                 REVIEW_PERIOD,
                                 BLOCK_QUORUM_BPS
                             )
@@ -110,6 +138,10 @@ contract ProtocolInvariantsTest is StdInvariant, Test {
                     )
                 )
             );
+
+            // Resolve the registry ↔ sWOOD circular dependency.
+            vm.prank(registryOwner);
+            swood.setRegistry(address(registry));
         }
 
         // ── Governor (proxy, real impl) ──
@@ -166,7 +198,8 @@ contract ProtocolInvariantsTest is StdInvariant, Test {
         _repointRegistry(address(governor), address(factory));
 
         // ── Handler + fuzz target bindings ──
-        handler = new ProtocolHandler(governor, factory, registry, wood, governorOwner, factoryOwner, registryOwner);
+        handler =
+            new ProtocolHandler(governor, factory, registry, swood, wood, governorOwner, factoryOwner, registryOwner);
 
         targetContract(address(handler));
 

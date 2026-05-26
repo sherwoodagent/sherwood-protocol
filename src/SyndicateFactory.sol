@@ -13,6 +13,7 @@ import {SyndicateVault} from "./SyndicateVault.sol";
 import {ISyndicateVault} from "./interfaces/ISyndicateVault.sol";
 import {ISyndicateGovernor} from "./interfaces/ISyndicateGovernor.sol";
 import {IGuardianRegistry} from "./interfaces/IGuardianRegistry.sol";
+import {IStakedWood} from "./interfaces/IStakedWood.sol";
 import {IL2Registrar} from "./interfaces/IL2Registrar.sol";
 import {VaultWithdrawalQueue} from "./queue/VaultWithdrawalQueue.sol";
 
@@ -234,8 +235,11 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         if (bytes(config.metadataURI).length == 0) revert InvalidSyndicateConfig();
 
         // Gate on prepared owner stake BEFORE any side effects (Task 26).
+        // Owner bonds live on sWOOD post-split; the registry exposes its sWOOD
+        // handle so the factory does not need a separate stored reference.
         IGuardianRegistry reg = IGuardianRegistry(guardianRegistry);
-        if (!reg.canCreateVault(msg.sender)) revert PreparedStakeNotFound();
+        IStakedWood sw = reg.swood();
+        if (!sw.canCreateVault(msg.sender)) revert PreparedStakeNotFound();
 
         // Collect creation fee (if set)
         if (creationFee > 0) {
@@ -281,7 +285,7 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
 
         // Bind the prepared owner stake to the newly deployed vault (Task 26).
         // Reverts roll back the whole creation tx — atomic.
-        reg.bindOwnerStake(msg.sender, vault);
+        sw.bindOwnerStake(msg.sender, vault);
 
         // Register ENS subname — vault is both address record + NFT owner
         if (address(ensRegistrar) != address(0)) {
@@ -451,7 +455,8 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         if (gov.openProposalCount(vault) != 0) revert ProposalsOpen();
 
         SyndicateVault(payable(vault)).rotateOwnership(newOwner);
-        reg.transferOwnerStakeSlot(vault, newOwner);
+        // Owner-stake slot lives on sWOOD post-split.
+        reg.swood().transferOwnerStakeSlot(vault, newOwner);
 
         // Keep creator record in sync so downstream invariants (e.g. NotCreator
         // gates on updateMetadata / deactivate) follow the active owner.

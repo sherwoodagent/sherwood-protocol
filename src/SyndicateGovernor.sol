@@ -337,6 +337,12 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
     }
 
     /// @inheritdoc ISyndicateGovernor
+    /// @dev `nonReentrant` retained — the shared `_reentrancyStatus` latch
+    ///      crosses functions. `test_vote_hasNonReentrantGuard` exercises
+    ///      a registry-callback reentry path that re-enters `vote()` from
+    ///      within a `cancelProposal → registry.cancelReview` chain; the
+    ///      latch must be set on `vote()` to block this cross-function
+    ///      vector even though `vote()` itself only does staticcalls.
     function vote(uint256 proposalId, VoteType support) external nonReentrant {
         StrategyProposal storage proposal = _proposals[proposalId];
         if (proposal.id == 0) revert ProposalNotFound();
@@ -1136,17 +1142,24 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
         if (coProps.length > 0) {
             uint256 distributed = 0;
             for (uint256 i = 0; i < coProps.length; i++) {
+                // Sherlock run #2 #13: stop once the budget is exhausted —
+                // pre-fix the loop would keep iterating and a later co-
+                // proposer with a non-zero `share` from the splitBps
+                // calculation would push `distributed` past `agentFee`
+                // (the post-loop clamp only fixed bookkeeping, not the
+                // already-executed transfers).
+                if (distributed >= agentFee) break;
                 bool active = ISyndicateVault(vault).isAgent(coProps[i].agent);
                 if (!active) continue;
                 uint256 share = (agentFee * coProps[i].splitBps) / BPS_DENOMINATOR;
-                if (share == 0) {
-                    if (distributed >= agentFee) continue;
-                    share = 1;
-                }
+                if (share == 0) share = 1;
+                // Cap to remaining budget — handles both the rounding-floor
+                // pad (share = 1) and any splitBps overflow.
+                uint256 remaining = agentFee - distributed;
+                if (share > remaining) share = remaining;
                 _payFee(vault, asset, coProps[i].agent, share);
                 distributed += share;
             }
-            if (distributed > agentFee) distributed = agentFee;
             uint256 leadShare = agentFee - distributed;
             if (leadShare > 0) {
                 _payFee(vault, asset, proposer, leadShare);

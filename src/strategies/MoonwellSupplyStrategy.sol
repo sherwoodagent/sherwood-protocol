@@ -59,8 +59,13 @@ contract MoonwellSupplyStrategy is BaseStrategy {
     /// @notice Decode: (address underlying, address mToken, uint256 supplyAmount,
     ///         uint256 minRedeemAmount, bool isNativeEthMarket)
     function _initialize(bytes calldata data) internal override {
-        (address underlying_, address mToken_, uint256 supplyAmount_, uint256 minRedeemAmount_, bool isNativeEthMarket_)
-        = abi.decode(data, (address, address, uint256, uint256, bool));
+        (
+            address underlying_,
+            address mToken_,
+            uint256 supplyAmount_,
+            uint256 minRedeemAmount_,
+            bool isNativeEthMarket_
+        ) = abi.decode(data, (address, address, uint256, uint256, bool));
         if (underlying_ == address(0) || mToken_ == address(0)) revert ZeroAddress();
         if (supplyAmount_ == 0) revert InvalidAmount();
 

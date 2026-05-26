@@ -146,16 +146,42 @@ contract StrategyFactoryAuthTest is Test {
     }
 
     /// @notice Happy path: the vault owner (creator pre-deploy).
+    /// @dev Sherlock run #2 #9 partial: `proposer == msg.sender` constraint
+    ///      means the caller is the proposer.
     function test_cloneAndInit_succeedsForVaultOwner() public {
         vm.prank(vaultOwner);
-        address clone = factory.cloneAndInit(address(template), address(registeredVault), proposer, _initData());
+        address clone = factory.cloneAndInit(address(template), address(registeredVault), vaultOwner, _initData());
         assertTrue(clone != address(0));
     }
 
+    /// @notice Sherlock run #2 #9 partial: an authorized caller (vault
+    ///         owner) passing a DIFFERENT address as `proposer` reverts.
+    ///         Closes the audit's external-X attack vector at the factory:
+    ///         the strategy clone's `_proposer` is guaranteed to be the
+    ///         deployer (the authorized caller), so post-execution
+    ///         `onlyProposer` mutation rights can't land on an arbitrary
+    ///         external address. (Cross-agent mismatch — A deploys, B
+    ///         proposes via governor — is NOT closed here; that needs the
+    ///         deferred governor-side check.)
+    function test_cloneAndInit_revertsWhenProposerIsNotSender() public {
+        vm.prank(vaultOwner);
+        vm.expectRevert(StrategyFactory.ProposerMustBeSender.selector);
+        factory.cloneAndInit(address(template), address(registeredVault), attacker, _initData());
+    }
+
+    function test_cloneAndInitDeterministic_revertsWhenProposerIsNotSender() public {
+        vm.prank(vaultOwner);
+        vm.expectRevert(StrategyFactory.ProposerMustBeSender.selector);
+        factory.cloneAndInitDeterministic(
+            address(template), address(registeredVault), attacker, _initData(), bytes32("salt")
+        );
+    }
+
     /// @notice Happy path: a registered agent (agent pre-deploy).
+    /// @dev Sherlock run #2 #9 partial: `proposer == msg.sender` constraint.
     function test_cloneAndInit_succeedsForRegisteredAgent() public {
         vm.prank(agentAddr);
-        address clone = factory.cloneAndInit(address(template), address(registeredVault), proposer, _initData());
+        address clone = factory.cloneAndInit(address(template), address(registeredVault), agentAddr, _initData());
         assertTrue(clone != address(0));
     }
 
@@ -188,8 +214,10 @@ contract StrategyFactoryAuthTest is Test {
     function test_cloneAndInitDeterministic_succeedsForRegisteredAgent() public {
         bytes32 salt = keccak256("strategy.salt.1");
         vm.prank(agentAddr);
-        address clone =
-            factory.cloneAndInitDeterministic(address(template), address(registeredVault), proposer, _initData(), salt);
+        // Sherlock run #2 #9 partial: `proposer == msg.sender`.
+        address clone = factory.cloneAndInitDeterministic(
+            address(template), address(registeredVault), agentAddr, _initData(), salt
+        );
         assertTrue(clone != address(0));
         assertEq(MoonwellSupplyStrategy(payable(clone)).vault(), address(registeredVault));
     }

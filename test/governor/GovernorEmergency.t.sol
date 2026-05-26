@@ -10,6 +10,7 @@ import {SyndicateVault} from "../../src/SyndicateVault.sol";
 import {ISyndicateVault} from "../../src/interfaces/ISyndicateVault.sol";
 import {GuardianRegistry} from "../../src/GuardianRegistry.sol";
 import {IGuardianRegistry} from "../../src/interfaces/IGuardianRegistry.sol";
+import {StakedWood} from "../../src/StakedWood.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
@@ -30,6 +31,7 @@ contract GovernorEmergencyTest is Test {
     SyndicateGovernor public governor;
     SyndicateVault public vault;
     GuardianRegistry public registry;
+    StakedWood public swood;
     BatchExecutorLib public executorLib;
     ERC20Mock public usdc;
     ERC20Mock public wood;
@@ -93,11 +95,34 @@ contract GovernorEmergencyTest is Test {
         vm.prank(owner);
         vault.registerAgent(agentNftId, agent);
 
-        // Governor + registry — circular init dep resolved by predicting the
-        // registry proxy via `vm.computeCreateAddress`: govImpl (+0),
-        // govProxy (+1), regImpl (+2), regProxy (+3).
+        // sWOOD + Governor + Registry — three-way circular init dependency:
+        //   • sWOOD.initialize needs the governor address (rage-quit gate)
+        //   • Governor.initialize needs the registry address
+        //   • Registry.initialize needs the sWOOD address
+        // Resolved by predicting all proxy addresses. From `baseNonce`:
+        //   swoodImpl (+0), swoodProxy (+1), govImpl (+2), govProxy (+3),
+        //   regImpl (+4), regProxy (+5).
         uint256 baseNonce = vm.getNonce(address(this));
-        address predictedRegistryProxy = vm.computeCreateAddress(address(this), baseNonce + 3);
+        address predictedGovernor = vm.computeCreateAddress(address(this), baseNonce + 3);
+        address predictedRegistryProxy = vm.computeCreateAddress(address(this), baseNonce + 5);
+
+        // sWOOD — sole WOOD custodian post-split.
+        StakedWood swoodImpl = new StakedWood();
+        bytes memory swoodInit = abi.encodeCall(
+            StakedWood.initialize,
+            (StakedWood.InitParams({
+                    owner: owner,
+                    wood: address(wood),
+                    governor: predictedGovernor,
+                    factory: factoryEoa,
+                    minGuardianStake: MIN_GUARDIAN_STAKE,
+                    coolDownPeriod: 7 days,
+                    minOwnerStake: MIN_OWNER_STAKE,
+                    minSlashBps: 1000,
+                    maxSlashBps: 9999
+                }))
+        );
+        swood = StakedWood(address(new ERC1967Proxy(address(swoodImpl), swoodInit)));
 
         SyndicateGovernor govImpl = new SyndicateGovernor();
         bytes memory govInit = abi.encodeCall(
@@ -122,31 +147,27 @@ contract GovernorEmergencyTest is Test {
             )
         );
         governor = SyndicateGovernor(address(new ERC1967Proxy(address(govImpl), govInit)));
+        require(address(governor) == predictedGovernor, "governor addr mismatch");
 
         vm.prank(owner);
         governor.addVault(address(vault));
 
-        // Registry — governor is the real governor so `openEmergency` passes
-        // the onlyGovernor check. The test contract acts as factory so we can bind
-        // owner stake without standing up the full factory. Must land at
-        // predictedRegistryProxy — `require` below catches nonce drift.
+        // Registry — slimmed 6-arg initialize (owner, governor, factory, swood,
+        // reviewPeriod, blockQuorumBps). Governor is the real governor so
+        // `openEmergency` passes the onlyGovernor check; the test contract acts
+        // as factory so we can bind owner stake without the full factory. Must
+        // land at predictedRegistryProxy — `require` below catches nonce drift.
         GuardianRegistry regImpl = new GuardianRegistry();
         bytes memory regInit = abi.encodeCall(
             GuardianRegistry.initialize,
-            (
-                owner,
-                address(governor),
-                factoryEoa,
-                address(wood),
-                MIN_GUARDIAN_STAKE,
-                MIN_OWNER_STAKE,
-                7 days,
-                REVIEW_PERIOD,
-                BLOCK_QUORUM_BPS
-            )
+            (owner, address(governor), factoryEoa, address(swood), REVIEW_PERIOD, BLOCK_QUORUM_BPS)
         );
         registry = GuardianRegistry(address(new ERC1967Proxy(address(regImpl), regInit)));
         require(address(registry) == predictedRegistryProxy, "registry addr mismatch");
+
+        // Resolve the registry ↔ sWOOD circular dependency.
+        vm.prank(owner);
+        swood.setRegistry(address(registry));
 
         // LPs
         usdc.mint(lp1, 100_000e6);
@@ -166,24 +187,25 @@ contract GovernorEmergencyTest is Test {
         wood.mint(guardianA, 100_000e18);
         wood.mint(guardianB, 100_000e18);
 
-        // Owner prepares & binds stake via the factory path.
+        // Owner prepares & binds stake via the factory path — staking lives in
+        // sWOOD post-split.
         vm.prank(owner);
-        wood.approve(address(registry), type(uint256).max);
+        wood.approve(address(swood), type(uint256).max);
         vm.prank(owner);
-        registry.prepareOwnerStake(MIN_OWNER_STAKE);
+        swood.prepareOwnerStake(MIN_OWNER_STAKE);
         vm.prank(factoryEoa);
-        registry.bindOwnerStake(owner, address(vault));
+        swood.bindOwnerStake(owner, address(vault));
 
         // Guardians stake so a cohort exists (≥ MIN_COHORT_STAKE_AT_OPEN = 50k WOOD).
         vm.prank(guardianA);
-        wood.approve(address(registry), type(uint256).max);
+        wood.approve(address(swood), type(uint256).max);
         vm.prank(guardianA);
-        registry.stakeAsGuardian(GUARDIAN_STAKE, 1);
+        swood.stakeAsGuardian(GUARDIAN_STAKE, 1);
 
         vm.prank(guardianB);
-        wood.approve(address(registry), type(uint256).max);
+        wood.approve(address(swood), type(uint256).max);
         vm.prank(guardianB);
-        registry.stakeAsGuardian(GUARDIAN_STAKE, 2);
+        swood.stakeAsGuardian(GUARDIAN_STAKE, 2);
     }
 
     // ──────────────────────────────────────────────────────────────
@@ -248,10 +270,11 @@ contract GovernorEmergencyTest is Test {
     }
 
     /// @dev Zeroes a vault's bound owner stake via stdstore, simulating a slashed
-    ///      or grace-period owner. Touches `_ownerStakes[vault].stakedAmount` (the
-    ///      `OwnerStake.stakedAmount` uint128 lives in slot 0 of the struct).
+    ///      or grace-period owner. Post-split the owner-stake storage lives in
+    ///      sWOOD (`_ownerStakes[vault].stakedAmount`), so stdstore targets
+    ///      sWOOD's `ownerStake(address)` getter.
     function _zeroOwnerStake(address v) internal {
-        stdstore.target(address(registry)).sig("ownerStake(address)").with_key(v).checked_write(uint256(0));
+        stdstore.target(address(swood)).sig("ownerStake(address)").with_key(v).checked_write(uint256(0));
     }
 
     // ──────────────────────────────────────────────────────────────

@@ -7,6 +7,7 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {DeploySherwood} from "../../script/Deploy.s.sol";
 import {Create3Factory} from "../../src/Create3Factory.sol";
 import {GuardianRegistry} from "../../src/GuardianRegistry.sol";
+import {StakedWood} from "../../src/StakedWood.sol";
 import {SyndicateGovernor} from "../../src/SyndicateGovernor.sol";
 import {SyndicateFactory} from "../../src/SyndicateFactory.sol";
 import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
@@ -27,9 +28,10 @@ contract DeploySherwoodHarness is DeploySherwood {
         address governorAddr,
         address factoryAddr,
         address registryAddr,
+        address swoodProxy,
         address ownerMultisig
     ) external {
-        _handoffOwnership(governorAddr, factoryAddr, registryAddr, ownerMultisig);
+        _handoffOwnership(governorAddr, factoryAddr, registryAddr, swoodProxy, ownerMultisig);
     }
 }
 
@@ -81,17 +83,19 @@ contract DeployMultisigHandoffTest is Test {
         vm.setEnv("WOOD_TOKEN", "0x0000000000000000000000000000000000000000");
     }
 
-    /// @notice MS-H5: after `_handoffOwnership`, all three proxies must report
+    /// @notice MS-H5 (C-1): after `_handoffOwnership`, all four proxies
+    ///         (Governor, Factory, GuardianRegistry, sWOOD) must report
     ///         `owner() == multisig`. The deployer EOA must be unable to call
     ///         any `onlyOwner` function.
-    function test_handoffTransfersAllThreeProxies() public {
-        (address governor, address factory, address registry) = _deployTriangle();
+    function test_handoffTransfersAllProxies() public {
+        (address governor, address factory, address registry, address swood) = _deployTriangle();
 
-        // Sanity: pre-handoff, all three are owned by the deployer (the test
+        // Sanity: pre-handoff, all four are owned by the deployer (the test
         // contract itself, since it deployed via this contract's `address(this)`).
         assertEq(Ownable(governor).owner(), deployer, "pre: governor owned by deployer");
         assertEq(Ownable(factory).owner(), deployer, "pre: factory owned by deployer");
         assertEq(Ownable(registry).owner(), deployer, "pre: registry owned by deployer");
+        assertEq(Ownable(swood).owner(), deployer, "pre: swood owned by deployer");
 
         // Stage the harness as the temporary owner so it can exercise the
         // real `_handoffOwnership` implementation (which calls
@@ -101,15 +105,17 @@ contract DeployMultisigHandoffTest is Test {
         Ownable(governor).transferOwnership(address(harness));
         Ownable(factory).transferOwnership(address(harness));
         Ownable(registry).transferOwnership(address(harness));
+        Ownable(swood).transferOwnership(address(harness));
 
         // Hand off via the harness-exposed entrypoint — exercises the real
         // `_handoffOwnership` body in `Deploy.s.sol`.
-        harness.exposed_handoffOwnership(governor, factory, registry, address(multisig));
+        harness.exposed_handoffOwnership(governor, factory, registry, swood, address(multisig));
 
-        // Post-handoff: all three must be owned by the multisig.
+        // Post-handoff: all four must be owned by the multisig.
         assertEq(Ownable(governor).owner(), address(multisig), "post: governor owned by multisig");
         assertEq(Ownable(factory).owner(), address(multisig), "post: factory owned by multisig");
         assertEq(Ownable(registry).owner(), address(multisig), "post: registry owned by multisig");
+        assertEq(Ownable(swood).owner(), address(multisig), "post: swood owned by multisig");
 
         // Deployer EOA must no longer be authorized for any onlyOwner call.
         vm.expectRevert();
@@ -120,6 +126,9 @@ contract DeployMultisigHandoffTest is Test {
 
         vm.expectRevert();
         GuardianRegistry(registry).setReviewPeriod(2 days);
+
+        vm.expectRevert();
+        StakedWood(swood).setCooldownPeriod(14 days);
     }
 
     /// @notice MS-H5: `run()` must reject both `address(0)` and EOA values for
@@ -152,11 +161,12 @@ contract DeployMultisigHandoffTest is Test {
     ///         deploy can't proceed. Confirm that without invoking the handoff
     ///         the deployer remains the owner (i.e. no implicit handoff).
     function test_handoff_skipped_leavesDeployerAsOwner() public {
-        (address governor, address factory, address registry) = _deployTriangle();
+        (address governor, address factory, address registry, address swood) = _deployTriangle();
         // Without calling `_handoffOwnership`, the proxies stay deployer-owned.
         assertEq(Ownable(governor).owner(), deployer);
         assertEq(Ownable(factory).owner(), deployer);
         assertEq(Ownable(registry).owner(), deployer);
+        assertEq(Ownable(swood).owner(), deployer);
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
@@ -165,7 +175,7 @@ contract DeployMultisigHandoffTest is Test {
     ///      `Deploy.s.sol::deployCore`. Skips executor / vault impl / seeding /
     ///      `setFactory` — none of that is relevant to the handoff assertion.
     ///      Mirrors `DeployScript.t.sol` so the two stay in sync.
-    function _deployTriangle() internal returns (address governor, address factory, address registry) {
+    function _deployTriangle() internal returns (address governor, address factory, address registry, address swood) {
         ERC20Mock wood = new ERC20Mock("WOOD", "WOOD", 18);
         Create3Factory c3 = new Create3Factory(deployer);
 
@@ -199,11 +209,30 @@ contract DeployMultisigHandoffTest is Test {
             SALT_GOVERNOR_PROXY, abi.encodePacked(type(ERC1967Proxy).creationCode, abi.encode(govImpl, govInit))
         );
 
-        // Registry (predicted factory address).
+        // sWOOD — sole WOOD custodian post-split. Plain deploy (not part of the
+        // handoff assertion, so no Create3 needed); the registry's slimmed
+        // 6-arg `initialize` takes its address.
+        StakedWood swoodImpl = new StakedWood();
+        bytes memory swoodInit = abi.encodeCall(
+            StakedWood.initialize,
+            (StakedWood.InitParams({
+                    owner: deployer,
+                    wood: address(wood),
+                    governor: governor,
+                    factory: predictedFactoryProxy,
+                    minGuardianStake: 10_000e18,
+                    coolDownPeriod: 7 days,
+                    minOwnerStake: 10_000e18,
+                    minSlashBps: 1000,
+                    maxSlashBps: 9999
+                }))
+        );
+        swood = address(new ERC1967Proxy(address(swoodImpl), swoodInit));
+
+        // Registry (predicted factory address) — slimmed 6-arg initialize.
         address registryImpl = c3.deploy(SALT_REGISTRY_IMPL, abi.encodePacked(type(GuardianRegistry).creationCode));
         bytes memory regInit = abi.encodeCall(
-            GuardianRegistry.initialize,
-            (deployer, governor, predictedFactoryProxy, address(wood), 10_000e18, 10_000e18, 7 days, 24 hours, 3000)
+            GuardianRegistry.initialize, (deployer, governor, predictedFactoryProxy, swood, 24 hours, 3000)
         );
         registry = c3.deploy(
             SALT_REGISTRY_PROXY, abi.encodePacked(type(ERC1967Proxy).creationCode, abi.encode(registryImpl, regInit))

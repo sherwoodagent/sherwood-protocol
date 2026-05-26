@@ -9,6 +9,7 @@ import {SyndicateVault} from "../../src/SyndicateVault.sol";
 import {ISyndicateVault} from "../../src/interfaces/ISyndicateVault.sol";
 import {GuardianRegistry} from "../../src/GuardianRegistry.sol";
 import {IGuardianRegistry} from "../../src/interfaces/IGuardianRegistry.sol";
+import {StakedWood} from "../../src/StakedWood.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
@@ -23,6 +24,7 @@ contract GuardianReviewLifecycleTest is Test {
     SyndicateGovernor public governor;
     SyndicateVault public vault;
     GuardianRegistry public registry;
+    StakedWood public swood;
     BatchExecutorLib public executorLib;
     ERC20Mock public usdc;
     ERC20Mock public wood;
@@ -99,11 +101,31 @@ contract GuardianReviewLifecycleTest is Test {
         vm.prank(owner);
         vault.registerAgent(agentNftId, agent);
 
-        // Governor + registry — circular init dep resolved by predicting the
-        // registry proxy via `vm.computeCreateAddress`: govImpl (+0),
-        // govProxy (+1), regImpl (+2), regProxy (+3).
+        // sWOOD + Governor + Registry — three-way circular init dependency
+        // resolved by predicting proxy addresses. From `baseNonce`:
+        //   swoodImpl (+0), swoodProxy (+1), govImpl (+2), govProxy (+3),
+        //   regImpl (+4), regProxy (+5).
         uint256 baseNonce = vm.getNonce(address(this));
-        address predictedRegistryProxy = vm.computeCreateAddress(address(this), baseNonce + 3);
+        address predictedGovernor = vm.computeCreateAddress(address(this), baseNonce + 3);
+        address predictedRegistryProxy = vm.computeCreateAddress(address(this), baseNonce + 5);
+
+        // sWOOD — sole WOOD custodian post-split.
+        StakedWood swoodImpl = new StakedWood();
+        bytes memory swoodInit = abi.encodeCall(
+            StakedWood.initialize,
+            (StakedWood.InitParams({
+                    owner: owner,
+                    wood: address(wood),
+                    governor: predictedGovernor,
+                    factory: factoryEoa,
+                    minGuardianStake: MIN_GUARDIAN_STAKE,
+                    coolDownPeriod: 7 days,
+                    minOwnerStake: MIN_OWNER_STAKE,
+                    minSlashBps: 1000,
+                    maxSlashBps: 9999
+                }))
+        );
+        swood = StakedWood(address(new ERC1967Proxy(address(swoodImpl), swoodInit)));
 
         SyndicateGovernor govImpl = new SyndicateGovernor();
         bytes memory govInit = abi.encodeCall(
@@ -128,29 +150,25 @@ contract GuardianReviewLifecycleTest is Test {
             )
         );
         governor = SyndicateGovernor(address(new ERC1967Proxy(address(govImpl), govInit)));
+        require(address(governor) == predictedGovernor, "governor addr mismatch");
 
         vm.prank(owner);
         governor.addVault(address(vault));
 
-        // Registry (factoryEoa = test contract so we can bind owner stake).
-        // Must land at predictedRegistryProxy — `require` below catches nonce drift.
+        // Registry — slimmed 6-arg initialize. factoryEoa = test contract so we
+        // can bind owner stake. Must land at predictedRegistryProxy — `require`
+        // below catches nonce drift.
         GuardianRegistry regImpl = new GuardianRegistry();
         bytes memory regInit = abi.encodeCall(
             GuardianRegistry.initialize,
-            (
-                owner,
-                address(governor),
-                factoryEoa,
-                address(wood),
-                MIN_GUARDIAN_STAKE,
-                MIN_OWNER_STAKE,
-                7 days,
-                REVIEW_PERIOD,
-                BLOCK_QUORUM_BPS
-            )
+            (owner, address(governor), factoryEoa, address(swood), REVIEW_PERIOD, BLOCK_QUORUM_BPS)
         );
         registry = GuardianRegistry(address(new ERC1967Proxy(address(regImpl), regInit)));
         require(address(registry) == predictedRegistryProxy, "registry addr mismatch");
+
+        // Resolve the registry ↔ sWOOD circular dependency.
+        vm.prank(owner);
+        swood.setRegistry(address(registry));
 
         // LPs
         usdc.mint(lp1, 100_000e6);
@@ -165,14 +183,14 @@ contract GuardianReviewLifecycleTest is Test {
         vm.stopPrank();
         vm.warp(vm.getBlockTimestamp() + 1);
 
-        // Owner prepares + binds stake.
+        // Owner prepares + binds stake — staking lives in sWOOD post-split.
         wood.mint(owner, 100_000e18);
         vm.prank(owner);
-        wood.approve(address(registry), type(uint256).max);
+        wood.approve(address(swood), type(uint256).max);
         vm.prank(owner);
-        registry.prepareOwnerStake(MIN_OWNER_STAKE);
+        swood.prepareOwnerStake(MIN_OWNER_STAKE);
         vm.prank(factoryEoa);
-        registry.bindOwnerStake(owner, address(vault));
+        swood.bindOwnerStake(owner, address(vault));
 
         // Guardians stake — five × 20k = 100k (well above 50k MIN_COHORT_STAKE_AT_OPEN).
         _stakeGuardian(g1, GUARDIAN_STAKE, 1);
@@ -189,9 +207,9 @@ contract GuardianReviewLifecycleTest is Test {
     function _stakeGuardian(address who, uint256 amount, uint256 agentId) internal {
         wood.mint(who, amount);
         vm.prank(who);
-        wood.approve(address(registry), type(uint256).max);
+        wood.approve(address(swood), type(uint256).max);
         vm.prank(who);
-        registry.stakeAsGuardian(amount, agentId);
+        swood.stakeAsGuardian(amount, agentId);
     }
 
     function _emptyCoProposers() internal pure returns (ISyndicateGovernor.CoProposer[] memory) {
@@ -257,9 +275,9 @@ contract GuardianReviewLifecycleTest is Test {
 
         // Optional Approve votes — don't matter for the outcome, but exercise the path.
         vm.prank(g1);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
         vm.prank(g2);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
 
         // Review ends → state resolves to Approved (no blocks).
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
@@ -278,8 +296,8 @@ contract GuardianReviewLifecycleTest is Test {
         );
 
         // Approvers keep their stake — no slashing on the happy path.
-        assertEq(registry.guardianStake(g1), GUARDIAN_STAKE);
-        assertEq(registry.guardianStake(g2), GUARDIAN_STAKE);
+        assertEq(swood.guardianStake(g1), GUARDIAN_STAKE);
+        assertEq(swood.guardianStake(g2), GUARDIAN_STAKE);
 
         // Settle after duration.
         vm.warp(vm.getBlockTimestamp() + 7 days + 1);
@@ -298,15 +316,15 @@ contract GuardianReviewLifecycleTest is Test {
         // g1, g2 Approve; g3, g4, g5 Block.
         // Total stake at open = 100k. Block weight = 60k → 60% ≥ 30% quorum → BLOCKED.
         vm.prank(g1);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
         vm.prank(g2);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
         vm.prank(g3);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Block, 10_000);
         vm.prank(g4);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Block, 10_000);
         vm.prank(g5);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Block, 10_000);
 
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
 
@@ -315,12 +333,14 @@ contract GuardianReviewLifecycleTest is Test {
         bool blocked = registry.resolveReview(pid);
         assertTrue(blocked, "review resolved as blocked");
 
-        // Approvers were slashed; blockers untouched.
-        assertEq(registry.guardianStake(g1), 0, "g1 slashed");
-        assertEq(registry.guardianStake(g2), 0, "g2 slashed");
-        assertEq(registry.guardianStake(g3), GUARDIAN_STAKE, "g3 untouched");
-        assertEq(registry.guardianStake(g4), GUARDIAN_STAKE, "g4 untouched");
-        assertEq(registry.guardianStake(g5), GUARDIAN_STAKE, "g5 untouched");
+        // Approvers were slashed at maxSlashBps=9999 (C-2 cap, not 10_000).
+        // 20_000e18 × 9999/10_000 = 19_998e18 → 2e18 residue per approver.
+        uint256 residue = GUARDIAN_STAKE - (GUARDIAN_STAKE * 9999) / 10_000; // 2e18
+        assertEq(swood.guardianStake(g1), residue, "g1 slashed at 9999-bps cap");
+        assertEq(swood.guardianStake(g2), residue, "g2 slashed at 9999-bps cap");
+        assertEq(swood.guardianStake(g3), GUARDIAN_STAKE, "g3 untouched");
+        assertEq(swood.guardianStake(g4), GUARDIAN_STAKE, "g4 untouched");
+        assertEq(swood.guardianStake(g5), GUARDIAN_STAKE, "g5 untouched");
 
         // Governor view now maps to Rejected via the cached registry resolution.
         assertEq(
@@ -341,11 +361,11 @@ contract GuardianReviewLifecycleTest is Test {
         // Drain the cohort below 50k: request unstake from 3 guardians so only
         // g1 + g2 remain active (40k < 50k).
         vm.prank(g3);
-        registry.requestUnstakeGuardian();
+        swood.requestUnstakeGuardian();
         vm.prank(g4);
-        registry.requestUnstakeGuardian();
+        swood.requestUnstakeGuardian();
         vm.prank(g5);
-        registry.requestUnstakeGuardian();
+        swood.requestUnstakeGuardian();
 
         uint256 pid = _propose();
         _voteFor(pid);
@@ -361,8 +381,8 @@ contract GuardianReviewLifecycleTest is Test {
         // No slashing — proposal should go straight to Approved then Executed.
         governor.executeProposal(pid);
         assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Executed));
-        assertEq(registry.guardianStake(g1), GUARDIAN_STAKE, "g1 untouched");
-        assertEq(registry.guardianStake(g2), GUARDIAN_STAKE, "g2 untouched");
+        assertEq(swood.guardianStake(g1), GUARDIAN_STAKE, "g1 untouched");
+        assertEq(swood.guardianStake(g2), GUARDIAN_STAKE, "g2 untouched");
     }
 
     /// @notice Owner cannot veto a proposal that has transitioned out of Pending.
@@ -430,21 +450,21 @@ contract GuardianReviewLifecycleTest is Test {
         uint256 burnBefore = wood.balanceOf(BURN_ADDRESS);
 
         vm.prank(g1);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
         vm.prank(g2);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
         vm.prank(g3);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
         vm.prank(g6);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Block, 10_000);
         vm.prank(g7);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Block, 10_000);
         vm.prank(g8);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Block, 10_000);
         vm.prank(g9);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Block, 10_000);
         vm.prank(g10);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Block, 10_000);
 
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
 
@@ -465,19 +485,22 @@ contract GuardianReviewLifecycleTest is Test {
             "proposal rejected after block quorum"
         );
 
-        // All 3 approvers slashed to zero.
-        assertEq(registry.guardianStake(g1), 0, "g1 (approver) slashed");
-        assertEq(registry.guardianStake(g2), 0, "g2 (approver) slashed");
-        assertEq(registry.guardianStake(g3), 0, "g3 (approver) slashed");
+        // All 3 approvers slashed at maxSlashBps=9999 (C-2 cap).
+        // 20_000e18 × 9999/10_000 = 19_998e18 burned, 2e18 residue per approver.
+        uint256 residue = GUARDIAN_STAKE - (GUARDIAN_STAKE * 9999) / 10_000; // 2e18
+        assertEq(swood.guardianStake(g1), residue, "g1 (approver) slashed at 9999-bps cap");
+        assertEq(swood.guardianStake(g2), residue, "g2 (approver) slashed at 9999-bps cap");
+        assertEq(swood.guardianStake(g3), residue, "g3 (approver) slashed at 9999-bps cap");
 
         // Blockers untouched.
-        assertEq(registry.guardianStake(g6), MIN_GUARDIAN_STAKE, "g6 (blocker) untouched");
-        assertEq(registry.guardianStake(g10), MIN_GUARDIAN_STAKE, "g10 (blocker) untouched");
+        assertEq(swood.guardianStake(g6), MIN_GUARDIAN_STAKE, "g6 (blocker) untouched");
+        assertEq(swood.guardianStake(g10), MIN_GUARDIAN_STAKE, "g10 (blocker) untouched");
 
-        // Burn sink received approver WOOD.
+        // Burn sink received approver WOOD (× 9999/10_000).
         uint256 burnAfter = wood.balanceOf(BURN_ADDRESS);
         assertGt(burnAfter, burnBefore, "burn sink received slashed WOOD");
-        assertEq(burnAfter - burnBefore, 3 * GUARDIAN_STAKE, "burn amount == 3 approver stakes");
+        uint256 expectedBurn = 3 * ((GUARDIAN_STAKE * 9999) / 10_000); // 3 × 19_998e18
+        assertEq(burnAfter - burnBefore, expectedBurn, "burn == 3 * (20_000e18 * 9999/10_000)");
 
         // V1.5: blocker epoch attribution is emitted as `BlockerAttributed` and
         // attributed off-chain via Merkl. Event inspection is covered in
@@ -495,23 +518,23 @@ contract GuardianReviewLifecycleTest is Test {
 
         // g1 initially approves.
         vm.prank(g1);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
 
         // Still well before the 10% lockout window — flip to Block.
         vm.warp(vm.getBlockTimestamp() + 1 hours);
         vm.prank(g1);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Block, 0);
 
         // Four more guardians also block so the quorum is hit (5 × 20k = 100k,
         // well above 30% of 100k total).
         vm.prank(g2);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Block, 0);
         vm.prank(g3);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Block, 0);
         vm.prank(g4);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Block, 0);
         vm.prank(g5);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Block, 0);
 
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD);
         bool blocked = registry.resolveReview(pid);
@@ -520,7 +543,7 @@ contract GuardianReviewLifecycleTest is Test {
         // g1's stake was preserved at first-vote value and counted on the
         // Block side at resolve time (no approvers to slash → all guardians
         // keep their stake).
-        assertEq(registry.guardianStake(g1), GUARDIAN_STAKE, "g1 not slashed - ended as blocker");
+        assertEq(swood.guardianStake(g1), GUARDIAN_STAKE, "g1 not slashed - ended as blocker");
 
         // V1.5: blocker attribution emitted via BlockerAttributed event, not
         // queryable on-chain. See Phase 3 event-inspection tests.
@@ -554,7 +577,7 @@ contract GuardianReviewLifecycleTest is Test {
         assertFalse(cohortTooSmall, "cohortTooSmall flag stays unset when !opened");
 
         // No guardian slashing occurred.
-        assertEq(registry.guardianStake(g1), GUARDIAN_STAKE, "g1 stake untouched");
-        assertEq(registry.guardianStake(g5), GUARDIAN_STAKE, "g5 stake untouched");
+        assertEq(swood.guardianStake(g1), GUARDIAN_STAKE, "g1 stake untouched");
+        assertEq(swood.guardianStake(g5), GUARDIAN_STAKE, "g5 stake untouched");
     }
 }

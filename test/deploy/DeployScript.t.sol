@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {Create3Factory} from "../../src/Create3Factory.sol";
 import {GuardianRegistry} from "../../src/GuardianRegistry.sol";
+import {StakedWood} from "../../src/StakedWood.sol";
 import {SyndicateGovernor} from "../../src/SyndicateGovernor.sol";
 import {SyndicateFactory} from "../../src/SyndicateFactory.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
@@ -72,18 +73,48 @@ contract DeployScriptTest is Test {
             SALT_GOVERNOR_PROXY, abi.encodePacked(type(ERC1967Proxy).creationCode, abi.encode(govImpl, govInit))
         );
 
+        // sWOOD — sole WOOD custodian post-split. Plain deploy (CREATE3
+        // prediction not exercised for sWOOD here); the registry's slimmed
+        // 6-arg `initialize` takes its address.
+        StakedWood swoodImpl = new StakedWood();
+        bytes memory swoodInit = abi.encodeCall(
+            StakedWood.initialize,
+            (StakedWood.InitParams({
+                    owner: deployer,
+                    wood: address(wood),
+                    governor: govProxy,
+                    factory: predictedFactoryProxy,
+                    minGuardianStake: 10_000e18,
+                    coolDownPeriod: 7 days,
+                    minOwnerStake: 10_000e18,
+                    minSlashBps: 1000,
+                    maxSlashBps: 9999
+                }))
+        );
+        address swood = address(new ERC1967Proxy(address(swoodImpl), swoodInit));
+
         // Deploy registry at the predicted address. If CREATE3 prediction is
         // off, the factory-bound invariants (e.g. `bindOwnerStake` onlyFactory)
         // would silently point at the wrong address.
         address registryImpl = c3.deploy(SALT_REGISTRY_IMPL, abi.encodePacked(type(GuardianRegistry).creationCode));
         bytes memory regInit = abi.encodeCall(
-            GuardianRegistry.initialize,
-            (deployer, govProxy, predictedFactoryProxy, address(wood), 10_000e18, 10_000e18, 7 days, 24 hours, 3000)
+            GuardianRegistry.initialize, (deployer, govProxy, predictedFactoryProxy, swood, 24 hours, 3000)
         );
         address registryProxy = c3.deploy(
             SALT_REGISTRY_PROXY, abi.encodePacked(type(ERC1967Proxy).creationCode, abi.encode(registryImpl, regInit))
         );
         assertEq(registryProxy, predictedRegistryProxy, "CREATE3 registry prediction mismatch");
+
+        // Wire the set-once registry reference on sWOOD (mirrors the deploy
+        // script's post-registry `setRegistry` call).
+        StakedWood(swood).setRegistry(registryProxy);
+
+        // sWOOD ↔ registry are mutually wired: the registry custodies WOOD via
+        // sWOOD, and sWOOD only accepts registry-gated calls from this address.
+        assertEq(address(GuardianRegistry(registryProxy).swood()), swood, "registry.swood mismatch");
+        assertEq(StakedWood(swood).registry(), registryProxy, "swood.registry mismatch");
+        assertEq(address(StakedWood(swood).wood()), address(wood), "swood.wood mismatch");
+        assertEq(StakedWood(swood).governor(), govProxy, "swood.governor mismatch");
 
         // Now deploy the factory and assert its proxy address matches the
         // prediction. Use a tiny vault impl / executor stub — not validated here.

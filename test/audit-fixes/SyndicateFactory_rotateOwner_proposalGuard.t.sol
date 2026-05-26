@@ -9,6 +9,7 @@ import {SyndicateVault} from "../../src/SyndicateVault.sol";
 import {SyndicateGovernor} from "../../src/SyndicateGovernor.sol";
 import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 import {GuardianRegistry} from "../../src/GuardianRegistry.sol";
+import {StakedWood} from "../../src/StakedWood.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
@@ -35,6 +36,7 @@ contract SyndicateFactory_rotateOwner_proposalGuard is Test {
     SyndicateGovernor public governor;
     SyndicateVault public vaultImpl;
     GuardianRegistry public registry;
+    StakedWood public swood;
     BatchExecutorLib public executorLib;
     ERC20Mock public usdc;
     ERC20Mock public wood;
@@ -63,10 +65,31 @@ contract SyndicateFactory_rotateOwner_proposalGuard is Test {
         creatorAgentId = agentRegistry.mint(creator);
         newOwnerAgentId = agentRegistry.mint(newOwner);
 
-        // Same nonce-prediction triangle as factory/OwnerStakeAtCreation.t.sol
+        // sWOOD + Governor + Registry + Factory nonce-prediction. From
+        // `baseNonce`: swoodImpl(+0), swoodProxy(+1), govImpl(+2), govProxy(+3),
+        // factoryImpl(+4), regImpl(+5), regProxy(+6), factoryProxy(+7).
         uint256 baseNonce = vm.getNonce(address(this));
-        address predictedRegistryProxy = vm.computeCreateAddress(address(this), baseNonce + 4);
-        address predictedFactoryProxy = vm.computeCreateAddress(address(this), baseNonce + 5);
+        address predictedGovernor = vm.computeCreateAddress(address(this), baseNonce + 3);
+        address predictedRegistryProxy = vm.computeCreateAddress(address(this), baseNonce + 6);
+        address predictedFactoryProxy = vm.computeCreateAddress(address(this), baseNonce + 7);
+
+        // sWOOD — sole WOOD custodian post-split.
+        StakedWood swoodImpl = new StakedWood();
+        bytes memory swoodInit = abi.encodeCall(
+            StakedWood.initialize,
+            (StakedWood.InitParams({
+                    owner: owner,
+                    wood: address(wood),
+                    governor: predictedGovernor,
+                    factory: predictedFactoryProxy,
+                    minGuardianStake: MIN_GUARDIAN_STAKE,
+                    coolDownPeriod: 7 days,
+                    minOwnerStake: MIN_OWNER_STAKE,
+                    minSlashBps: 1000,
+                    maxSlashBps: 9999
+                }))
+        );
+        swood = StakedWood(address(new ERC1967Proxy(address(swoodImpl), swoodInit)));
 
         SyndicateGovernor govImpl = new SyndicateGovernor();
         bytes memory govInit = abi.encodeCall(
@@ -91,25 +114,20 @@ contract SyndicateFactory_rotateOwner_proposalGuard is Test {
             )
         );
         governor = SyndicateGovernor(address(new ERC1967Proxy(address(govImpl), govInit)));
+        require(address(governor) == predictedGovernor, "governor address prediction mismatch");
 
         SyndicateFactory factoryImpl = new SyndicateFactory();
         GuardianRegistry regImpl = new GuardianRegistry();
         bytes memory regInit = abi.encodeCall(
             GuardianRegistry.initialize,
-            (
-                owner,
-                address(governor),
-                predictedFactoryProxy,
-                address(wood),
-                MIN_GUARDIAN_STAKE,
-                MIN_OWNER_STAKE,
-                7 days,
-                REVIEW_PERIOD,
-                BLOCK_QUORUM_BPS
-            )
+            (owner, address(governor), predictedFactoryProxy, address(swood), REVIEW_PERIOD, BLOCK_QUORUM_BPS)
         );
         registry = GuardianRegistry(address(new ERC1967Proxy(address(regImpl), regInit)));
         require(address(registry) == predictedRegistryProxy, "registry address prediction mismatch");
+
+        // Resolve the registry ↔ sWOOD circular dependency.
+        vm.prank(owner);
+        swood.setRegistry(address(registry));
 
         bytes memory factoryInit = abi.encodeCall(
             SyndicateFactory.initialize,
@@ -136,9 +154,9 @@ contract SyndicateFactory_rotateOwner_proposalGuard is Test {
 
     function _prepareStake(address who) internal {
         vm.prank(who);
-        wood.approve(address(registry), type(uint256).max);
+        wood.approve(address(swood), type(uint256).max);
         vm.prank(who);
-        registry.prepareOwnerStake(MIN_OWNER_STAKE);
+        swood.prepareOwnerStake(MIN_OWNER_STAKE);
     }
 
     /// @dev Creates a vault, then unstakes so `hasOwnerStake == false` — the
@@ -157,11 +175,11 @@ contract SyndicateFactory_rotateOwner_proposalGuard is Test {
         (, vault) = factory.createSyndicate(creatorAgentId, cfg);
 
         vm.prank(creator);
-        registry.requestUnstakeOwner(vault);
+        swood.requestUnstakeOwner(vault);
         vm.warp(block.timestamp + 7 days + 1);
         vm.prank(creator);
-        registry.claimUnstakeOwner(vault);
-        assertFalse((registry.ownerStake(vault) > 0));
+        swood.claimUnstakeOwner(vault);
+        assertFalse((swood.ownerStake(vault) > 0));
     }
 
     // ──────────────────────────────────────────────────────────────

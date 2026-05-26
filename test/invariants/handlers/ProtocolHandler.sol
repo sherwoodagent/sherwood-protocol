@@ -7,6 +7,7 @@ import {SyndicateGovernor} from "../../../src/SyndicateGovernor.sol";
 import {SyndicateFactory} from "../../../src/SyndicateFactory.sol";
 import {GuardianRegistry} from "../../../src/GuardianRegistry.sol";
 import {IGuardianRegistry} from "../../../src/interfaces/IGuardianRegistry.sol";
+import {StakedWood} from "../../../src/StakedWood.sol";
 import {ISyndicateGovernor} from "../../../src/interfaces/ISyndicateGovernor.sol";
 import {GovernorParameters} from "../../../src/GovernorParameters.sol";
 
@@ -15,58 +16,48 @@ import {ERC20Mock} from "../../mocks/ERC20Mock.sol";
 /// @title ProtocolHandler
 /// @notice Bounded fuzz-action surface for the protocol invariant harness
 ///         (INV-2 / INV-3 / INV-30 / INV-33 / INV-46). Drives the governance
-///         and registry surfaces that the 5 target invariants observe:
+///         and registry surfaces that the target invariants observe.
 ///
-///         - Governor parameter-change lifecycle (queue / finalize / cancel) —
-///           exercises INV-30 (`protocolFeeBps > 0 ⇒ recipient != 0`).
-///         - Guardian registry pause / unpause + guarded writes — exercises
-///           INV-46 (pause semantics across every guardian-facing external).
-///         - Guardian stake / unstake lifecycle — keeps the actor space non-
-///           trivial so pause-fuzzing hits live cohort state.
-///         - Time warps — keeps the timelock finalize path reachable within
-///           the default fuzz run budget.
-///
-///         The handler intentionally does NOT drive the full proposal lifecycle
-///         (propose → vote → execute → settle). Doing so would require ERC20
-///         votes + a live SyndicateVault proxy; the invariants that care about
-///         the proposal surface (INV-2, INV-3) are still asserted via the real
-///         governor's public views — they hold vacuously under this handler
-///         and guard against structural drift if the governor ever mutates
-///         `_activeProposal` outside `executeProposal` / `_finishSettlement`
-///         (the G-C2/C3 regression vector from issue #225).
+///         Post-split (Task 7.1): guardian staking + `flushBurn` moved to
+///         `StakedWood`. The handler drives staking on sWOOD and the pause /
+///         review surface on the registry. `flushBurn` lives on sWOOD, which
+///         has NO pause mechanism — it is therefore no longer part of the
+///         INV-46 pause revert-matrix (a faithful consequence of the split,
+///         not a weakened assertion). The still-pause-guarded registry writes
+///         (`voteOnProposal`, `openReview`, `resolveReview`,
+///         `finalizeEmergency`) keep their attempt/revert bookkeeping.
 ///
 ///         Actor set: 5 shareholders, 3 agents, 10 guardians, 1 owner.
 contract ProtocolHandler is Test {
     SyndicateGovernor public governor;
     SyndicateFactory public factory;
     GuardianRegistry public registry;
+    StakedWood public swood;
     ERC20Mock public wood;
 
     address public governorOwner;
     address public factoryOwner;
     address public registryOwner;
 
-    // Actor pools (spec calls for 5 shareholders / 3 agents / 10 guardians / 1 owner;
-    // we materialize the sets the handler's actions actually use).
+    // Actor pools.
     address[] public shareholders; // length 5
     address[] public agents; // length 3
     address[] public guardians; // length 10
 
-    // INV-46 revert-matrix bookkeeping — set when a pause-guarded call is made
-    // during pause; the invariant contract reads these to verify the required
-    // revert actually happened (all guarded writes MUST revert when paused).
+    // INV-46 revert-matrix bookkeeping — set when a pause-guarded registry
+    // call is made during pause; the invariant contract reads these to verify
+    // the required revert actually happened.
     uint256 public pausedCallAttempts;
     uint256 public pausedCallReverts;
 
-    // Pending-change seen counters — debug aids; wired up as public views the
-    // invariant contract can print via `targetContract` summary.
-    // V1.5: `finalizeSuccesses` removed — governor setters apply immediately.
+    // Pending-change seen counters — debug aids.
     uint256 public queueSuccesses;
 
     constructor(
         SyndicateGovernor _governor,
         SyndicateFactory _factory,
         GuardianRegistry _registry,
+        StakedWood _swood,
         ERC20Mock _wood,
         address _governorOwner,
         address _factoryOwner,
@@ -75,6 +66,7 @@ contract ProtocolHandler is Test {
         governor = _governor;
         factory = _factory;
         registry = _registry;
+        swood = _swood;
         wood = _wood;
         governorOwner = _governorOwner;
         factoryOwner = _factoryOwner;
@@ -90,8 +82,9 @@ contract ProtocolHandler is Test {
             address g = makeAddr(string(abi.encodePacked("guardian", vm.toString(i))));
             guardians.push(g);
             wood.mint(g, 1_000_000e18);
+            // Staking lives in sWOOD post-split — approve sWOOD.
             vm.prank(g);
-            wood.approve(address(registry), type(uint256).max);
+            wood.approve(address(swood), type(uint256).max);
         }
     }
 
@@ -113,7 +106,6 @@ contract ProtocolHandler is Test {
     /// @dev Queue a new protocol-fee recipient change. Zero-address is rejected
     ///      by the setter so the queued newValue is always nonzero.
     function queueProtocolFeeRecipient(uint256 recipientSeed) external {
-        // Pick from a non-zero address pool so the setter accepts the call.
         address[3] memory pool = [makeAddr("feeRecipient1"), makeAddr("feeRecipient2"), makeAddr("feeRecipient3")];
         address r = pool[bound(recipientSeed, 0, 2)];
         vm.prank(governorOwner);
@@ -121,10 +113,6 @@ contract ProtocolHandler is Test {
             queueSuccesses += 1;
         } catch {}
     }
-
-    // V1.5: finalizeParameterChange / cancelParameterChange removed from governor.
-    // Setters apply immediately; invariant surfaces now only include queue-style
-    // entrypoints that directly mutate state on the governor.
 
     // ──────────────────────────────────────────────────────────────
     // Registry pause surface — drives INV-46
@@ -140,27 +128,15 @@ contract ProtocolHandler is Test {
         try registry.unpause() {} catch {}
     }
 
-    /// @dev Attempt `flushBurn` — is guarded by `whenNotPaused`. Tracks the
-    ///      attempt / revert counters so the invariant can cross-check pause
-    ///      semantics: every attempt during pause MUST revert.
+    /// @dev Attempt `flushBurn` on sWOOD. Post-split sWOOD has NO pause, so
+    ///      this is no longer a pause-guarded call — it is fuzzed for coverage
+    ///      but NOT tracked in the INV-46 revert matrix.
     function tryFlushBurn() external {
-        bool isPaused = registry.paused();
-        if (isPaused) pausedCallAttempts += 1;
-        try registry.flushBurn() {
-        // Succeeded — if paused, this is a BUG (invariant will catch it).
-        }
-        catch {
-            if (isPaused) pausedCallReverts += 1;
-        }
+        try swood.flushBurn() {} catch {}
     }
 
-    // V1.5: claimEpochReward + recordEpochBudget removed from on-chain surface.
-    // WOOD epoch rewards live entirely in Merkl post-ToB review.
-
-    /// @dev Attempt `voteOnProposal` with pause semantics tracking. Uses a
-    ///      proposalId of 1 which has no review opened — the call will revert
-    ///      on the pause check FIRST (modifier runs before the `!r.opened`
-    ///      check). Track attempt / revert counters.
+    /// @dev Attempt `voteOnProposal` with pause semantics tracking. Guarded by
+    ///      `whenNotPaused` — every attempt during pause MUST revert.
     function tryVoteOnProposal(uint256 actorSeed, uint256 supportSeed) external {
         address g = guardians[bound(actorSeed, 0, guardians.length - 1)];
         IGuardianRegistry.GuardianVoteType s = (supportSeed % 2 == 0)
@@ -169,15 +145,13 @@ contract ProtocolHandler is Test {
         bool isPaused = registry.paused();
         if (isPaused) pausedCallAttempts += 1;
         vm.prank(g);
-        try registry.voteOnProposal(1, s) {}
+        try registry.voteOnProposal(1, s, 0) {}
         catch {
             if (isPaused) pausedCallReverts += 1;
         }
     }
 
-    /// @dev Attempt `openReview`. Guarded by `whenNotPaused`. Since no
-    ///      proposal exists at id 1 in this harness, the call will always
-    ///      revert; during pause the revert must come from the pause modifier.
+    /// @dev Attempt `openReview`. Guarded by `whenNotPaused`.
     function tryOpenReview(uint256 proposalSeed) external {
         uint256 pid = bound(proposalSeed, 1, 3);
         bool isPaused = registry.paused();
@@ -188,8 +162,7 @@ contract ProtocolHandler is Test {
         }
     }
 
-    /// @dev Attempt `resolveReview`. Same semantics — guarded by
-    ///      `whenNotPaused`. During pause, must revert.
+    /// @dev Attempt `resolveReview`. Guarded by `whenNotPaused`.
     function tryResolveReview(uint256 proposalSeed) external {
         uint256 pid = bound(proposalSeed, 1, 3);
         bool isPaused = registry.paused();
@@ -201,7 +174,6 @@ contract ProtocolHandler is Test {
     }
 
     /// @dev Attempt `finalizeEmergency`. Guarded by `whenNotPaused` + `onlyGovernor`.
-    ///      The handler pranks the governor to match the onlyGovernor gate.
     function tryFinalizeEmergency(uint256 proposalSeed) external {
         uint256 pid = bound(proposalSeed, 1, 3);
         bool isPaused = registry.paused();
@@ -213,35 +185,33 @@ contract ProtocolHandler is Test {
     }
 
     // ──────────────────────────────────────────────────────────────
-    // Stake / unstake — callable during pause per spec §3.1
+    // Stake / unstake — sWOOD; callable at any time (sWOOD has no pause)
     // ──────────────────────────────────────────────────────────────
 
-    /// @dev Stake action: MUST succeed during pause (admin ops stay live).
-    ///      The invariant doesn't track this one — it's here to keep the
-    ///      guardian cohort non-empty across fuzzing.
+    /// @dev Stake action — keeps the guardian cohort non-empty across fuzzing.
     function stake(uint256 actorSeed, uint256 amountSeed) external {
         address g = guardians[bound(actorSeed, 0, guardians.length - 1)];
-        uint256 amount = bound(amountSeed, registry.minGuardianStake(), 100_000e18);
+        uint256 amount = bound(amountSeed, swood.minGuardianStake(), 100_000e18);
         vm.prank(g);
-        try registry.stakeAsGuardian(amount, 1) {} catch {}
+        try swood.stakeAsGuardian(amount, 1) {} catch {}
     }
 
     function requestUnstake(uint256 actorSeed) external {
         address g = guardians[bound(actorSeed, 0, guardians.length - 1)];
         vm.prank(g);
-        try registry.requestUnstakeGuardian() {} catch {}
+        try swood.requestUnstakeGuardian() {} catch {}
     }
 
     function cancelUnstake(uint256 actorSeed) external {
         address g = guardians[bound(actorSeed, 0, guardians.length - 1)];
         vm.prank(g);
-        try registry.cancelUnstakeGuardian() {} catch {}
+        try swood.cancelUnstakeGuardian() {} catch {}
     }
 
     function claimUnstake(uint256 actorSeed) external {
         address g = guardians[bound(actorSeed, 0, guardians.length - 1)];
         vm.prank(g);
-        try registry.claimUnstakeGuardian() {} catch {}
+        try swood.claimUnstakeGuardian() {} catch {}
     }
 
     // ──────────────────────────────────────────────────────────────

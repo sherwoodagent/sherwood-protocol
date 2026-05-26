@@ -79,11 +79,41 @@ contract DeployTemplates is ScriptBase {
 
     function run() external {
         string memory path = string.concat(vm.projectRoot(), "/chains/", vm.toString(block.chainid), ".json");
-        string memory json = vm.readFile(path);
 
         // ── 1. Check which templates are already deployed ──
 
         Templates memory t;
+        _readExisting(t, vm.readFile(path));
+
+        bool isHyperEvm = block.chainid == 999;
+        // Portfolio + UniswapSwapAdapter deploy only where Uniswap V3 is wired.
+        // Currently Base mainnet (8453); extend `_uniswapV3*` per chain to enable.
+        bool hasUniswapV3 = _uniswapV3Router(block.chainid) != address(0);
+
+        console.log("\n=== Strategy Template Deployment ===\n");
+
+        // ── 2. Deploy missing templates ──
+
+        bool anyDeployed = _deployAll(t, isHyperEvm, hasUniswapV3);
+
+        // ── 3. Save addresses ──
+
+        if (anyDeployed) {
+            _save(t, path, isHyperEvm, hasUniswapV3);
+            console.log("\n  Addresses saved to %s", path);
+        } else {
+            console.log("\n  All templates already deployed, nothing to save.");
+        }
+
+        // ── 4. Validate ──
+
+        console.log("\n=== Validation ===\n");
+        _validate(t, isHyperEvm, hasUniswapV3);
+        console.log("\n  All validations passed.\n");
+    }
+
+    /// @notice Read already-deployed template addresses from the chain JSON into `t`.
+    function _readExisting(Templates memory t, string memory json) internal pure {
         t.moonwell = _tryReadAddress(json, MOONWELL_KEY);
         t.aerodrome = _tryReadAddress(json, AERODROME_KEY);
         t.venice = _tryReadAddress(json, VENICE_KEY);
@@ -93,17 +123,28 @@ contract DeployTemplates is ScriptBase {
         t.uniswapSwapAdapter = _tryReadAddress(json, UNISWAP_SWAP_ADAPTER_KEY);
         t.hyperliquid = _tryReadAddress(json, HYPERLIQUID_KEY);
         t.hyperliquidGrid = _tryReadAddress(json, HYPERLIQUID_GRID_KEY);
+    }
 
-        bool isHyperEvm = block.chainid == 999;
-        // Portfolio + UniswapSwapAdapter deploy only where Uniswap V3 is wired.
-        // Currently Base mainnet (8453); extend `_uniswapV3*` per chain to enable.
-        bool hasUniswapV3 = _uniswapV3Router(block.chainid) != address(0);
-        bool anyDeployed = false;
+    /// @notice Persist deployed template addresses back to the chain JSON.
+    function _save(Templates memory t, string memory path, bool isHyperEvm, bool hasUniswapV3) internal {
+        if (isHyperEvm) {
+            vm.writeJson(vm.toString(t.hyperliquid), path, string.concat(".", HYPERLIQUID_KEY));
+            vm.writeJson(vm.toString(t.hyperliquidGrid), path, string.concat(".", HYPERLIQUID_GRID_KEY));
+        } else {
+            vm.writeJson(vm.toString(t.moonwell), path, string.concat(".", MOONWELL_KEY));
+            vm.writeJson(vm.toString(t.aerodrome), path, string.concat(".", AERODROME_KEY));
+            vm.writeJson(vm.toString(t.venice), path, string.concat(".", VENICE_KEY));
+            vm.writeJson(vm.toString(t.wsteth), path, string.concat(".", WSTETH_KEY));
+            vm.writeJson(vm.toString(t.mamo), path, string.concat(".", MAMO_KEY));
+            if (hasUniswapV3) {
+                vm.writeJson(vm.toString(t.uniswapSwapAdapter), path, string.concat(".", UNISWAP_SWAP_ADAPTER_KEY));
+                vm.writeJson(vm.toString(t.portfolio), path, string.concat(".", PORTFOLIO_KEY));
+            }
+        }
+    }
 
-        console.log("\n=== Strategy Template Deployment ===\n");
-
-        // ── 2. Deploy missing templates ──
-
+    /// @notice Deploy every missing template for the active chain. Returns true if anything deployed.
+    function _deployAll(Templates memory t, bool isHyperEvm, bool hasUniswapV3) internal returns (bool anyDeployed) {
         vm.startBroadcast();
 
         // Moonwell/Aerodrome/Venice/wstETH-Moonwell/Mamo are not active on HyperEVM
@@ -255,34 +296,6 @@ contract DeployTemplates is ScriptBase {
         }
 
         vm.stopBroadcast();
-
-        // ── 3. Save addresses ──
-
-        if (anyDeployed) {
-            if (isHyperEvm) {
-                vm.writeJson(vm.toString(t.hyperliquid), path, string.concat(".", HYPERLIQUID_KEY));
-                vm.writeJson(vm.toString(t.hyperliquidGrid), path, string.concat(".", HYPERLIQUID_GRID_KEY));
-            } else {
-                vm.writeJson(vm.toString(t.moonwell), path, string.concat(".", MOONWELL_KEY));
-                vm.writeJson(vm.toString(t.aerodrome), path, string.concat(".", AERODROME_KEY));
-                vm.writeJson(vm.toString(t.venice), path, string.concat(".", VENICE_KEY));
-                vm.writeJson(vm.toString(t.wsteth), path, string.concat(".", WSTETH_KEY));
-                vm.writeJson(vm.toString(t.mamo), path, string.concat(".", MAMO_KEY));
-                if (hasUniswapV3) {
-                    vm.writeJson(vm.toString(t.uniswapSwapAdapter), path, string.concat(".", UNISWAP_SWAP_ADAPTER_KEY));
-                    vm.writeJson(vm.toString(t.portfolio), path, string.concat(".", PORTFOLIO_KEY));
-                }
-            }
-            console.log("\n  Addresses saved to %s", path);
-        } else {
-            console.log("\n  All templates already deployed, nothing to save.");
-        }
-
-        // ── 4. Validate ──
-
-        console.log("\n=== Validation ===\n");
-        _validate(t, isHyperEvm, hasUniswapV3);
-        console.log("\n  All validations passed.\n");
     }
 
     /// @notice Test helper — deploys a fresh `HyperliquidGridStrategy` template.

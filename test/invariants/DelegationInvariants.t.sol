@@ -4,8 +4,7 @@ pragma solidity 0.8.28;
 import "forge-std/Test.sol";
 import {StdInvariant} from "forge-std/StdInvariant.sol";
 
-import {GuardianRegistry} from "../../src/GuardianRegistry.sol";
-import {IGuardianRegistry} from "../../src/interfaces/IGuardianRegistry.sol";
+import {StakedWood} from "../../src/StakedWood.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 
@@ -15,31 +14,24 @@ import {DelegationHandler} from "./handlers/DelegationHandler.sol";
 /// @notice V1.5 Phase 4 — asserts the delegation-side conservation
 ///         invariants under bounded stateful fuzzing.
 ///
+///         Post-split (Task 7.1): guardian staking, delegation, and commission
+///         moved to `StakedWood`. The harness targets a `StakedWood` proxy
+///         directly — the registry no longer custodies WOOD or tracks
+///         delegation accounting.
+///
 ///         Closed invariants:
-///         - INV-V1.5-1  per-delegate accounting: `_delegatedInbound[delegate]`
-///                       exactly equals the sum of `_delegations[d][delegate]`
+///         - INV-V1.5-1  per-delegate accounting: `delegatedInbound(delegate)`
+///                       exactly equals the sum of `delegationOf(d, delegate)`
 ///                       across all delegators.
 ///         - INV-V1.5-1g global accounting: `totalDelegatedStake` equals the
-///                       sum of `_delegatedInbound[g]` across all delegates.
-///         - INV-V1.5-4  WOOD custody: registry's WOOD balance >=
+///                       sum of `delegatedInbound(g)` across all delegates.
+///         - INV-V1.5-4  WOOD custody: sWOOD's WOOD balance >=
 ///                       `totalGuardianStake + totalDelegatedStake +
-///                        slashAppealReserve + pendingBurn + preparedStakes`.
+///                        pendingBurn + preparedStakes`.
 ///         - INV-V1.5-5  commission bounds: for all guardians,
 ///                       `commissionOf(g) <= MAX_COMMISSION_BPS`.
-///
-///         Invariants NOT covered by this harness (deferred to targeted unit
-///         tests or the lifecycle integration test):
-///         - INV-V1.5-2 / -3 (vote-weight sum / denominator parity) — require
-///           active review + vote flow; covered in GuardianRegistryDelegation
-///           and GuardianReviewLifecycle.
-///         - INV-V1.5-7 / -8 (guardian-fee bounds / fee-waterfall ordering) —
-///           governor-side; covered in GuardianRegistryProposalReward.
-///         - INV-V1.5-9 / -10 (guardian-fee conservation / asset custody) —
-///           require the full settlement + claim path; covered in
-///           GuardianRegistryProposalReward.
-///         - INV-V1.5-11 (no retroactive commission) — unit-tested.
 contract DelegationInvariantsTest is StdInvariant, Test {
-    GuardianRegistry public registry;
+    StakedWood public swood;
     ERC20Mock public wood;
     DelegationHandler public handler;
 
@@ -49,30 +41,32 @@ contract DelegationInvariantsTest is StdInvariant, Test {
 
     uint256 constant MIN_STAKE = 10_000e18;
     uint256 constant COOL_DOWN = 7 days;
-    uint256 constant REVIEW_PERIOD = 24 hours;
-    uint256 constant BLOCK_QUORUM_BPS = 3000;
 
     function setUp() public {
         wood = new ERC20Mock("WOOD", "WOOD", 18);
 
-        GuardianRegistry impl = new GuardianRegistry();
+        StakedWood impl = new StakedWood();
         bytes memory initData = abi.encodeCall(
-            GuardianRegistry.initialize,
-            (
-                owner,
-                mockGovernor,
-                mockFactory,
-                address(wood),
-                MIN_STAKE,
-                MIN_STAKE,
-                COOL_DOWN,
-                REVIEW_PERIOD,
-                BLOCK_QUORUM_BPS
-            )
+            StakedWood.initialize,
+            (StakedWood.InitParams({
+                    owner: owner,
+                    wood: address(wood),
+                    governor: mockGovernor,
+                    factory: mockFactory,
+                    minGuardianStake: MIN_STAKE,
+                    coolDownPeriod: COOL_DOWN,
+                    minOwnerStake: MIN_STAKE,
+                    minSlashBps: 1000,
+                    maxSlashBps: 9999
+                }))
         );
-        registry = GuardianRegistry(address(new ERC1967Proxy(address(impl), initData)));
+        swood = StakedWood(address(new ERC1967Proxy(address(impl), initData)));
 
-        handler = new DelegationHandler(registry, wood, owner);
+        // Delegation defaults off at deploy — enable it for the fuzz surface.
+        vm.prank(owner);
+        swood.setDelegationEnabled(true);
+
+        handler = new DelegationHandler(swood, wood, owner);
 
         targetContract(address(handler));
 
@@ -100,9 +94,9 @@ contract DelegationInvariantsTest is StdInvariant, Test {
         for (uint256 i = 0; i < gs.length; i++) {
             uint256 sum;
             for (uint256 j = 0; j < ds.length; j++) {
-                sum += registry.delegationOf(ds[j], gs[i]);
+                sum += swood.delegationOf(ds[j], gs[i]);
             }
-            assertEq(registry.delegatedInbound(gs[i]), sum, "INV-V1.5-1: inbound != sum(delegations) for this delegate");
+            assertEq(swood.delegatedInbound(gs[i]), sum, "INV-V1.5-1: inbound != sum(delegations) for this delegate");
         }
     }
 
@@ -112,43 +106,62 @@ contract DelegationInvariantsTest is StdInvariant, Test {
         address[] memory gs = handler.getGuardians();
         uint256 sum;
         for (uint256 i = 0; i < gs.length; i++) {
-            sum += registry.delegatedInbound(gs[i]);
+            sum += swood.delegatedInbound(gs[i]);
         }
-        assertEq(registry.totalDelegatedStake(), sum, "INV-V1.5-1g: totalDelegatedStake != sum(inbound)");
+        assertEq(swood.totalDelegatedStake(), sum, "INV-V1.5-1g: totalDelegatedStake != sum(inbound)");
     }
 
-    /// @notice INV-V1.5-4 WOOD custody: registry's WOOD balance must cover
-    ///         every obligation it tracks — guardian stake + delegated stake
-    ///         + prepared stakes (owner) + slash-appeal reserve. Donations
-    ///         above this are fine.
+    /// @notice Sherlock #39 / Run-1 #22: `totalActiveDelegatedStake` must
+    ///         equal the sum of `delegatedInbound(g)` (== `poolTokens[g]`)
+    ///         across CURRENTLY-ACTIVE delegates only. Validates that the
+    ///         per-mutation checkpoint maintenance in `StakedWoodDelegation`
+    ///         + `StakedWood` covers every transition site (active↔inactive
+    ///         transitions, pool mutations, slash). If any handler call
+    ///         leaves the active total stale, this invariant trips.
+    function invariant_totalActiveDelegated_equalsSumOfActiveInbound() public view {
+        address[] memory gs = handler.getGuardians();
+        uint256 sum;
+        for (uint256 i = 0; i < gs.length; i++) {
+            if (swood.isActiveGuardian(gs[i])) {
+                sum += swood.delegatedInbound(gs[i]);
+            }
+        }
+        assertEq(
+            swood.totalActiveDelegatedStake(), sum, "INV-Sherlock-39: totalActiveDelegatedStake != sum(active inbound)"
+        );
+    }
+
+    /// @notice INV-V1.5-4 WOOD custody: sWOOD's WOOD balance must cover every
+    ///         obligation it tracks — guardian stake + delegated stake +
+    ///         prepared stakes (owner) + pending burn. Donations above this
+    ///         are fine.
     function invariant_woodCustody_balanceCoversObligations() public view {
         address[] memory gs = handler.getGuardians();
         address[] memory ds = handler.getDelegators();
 
-        uint256 obligations =
-            registry.totalGuardianStake() + registry.totalDelegatedStake() + registry.slashAppealReserve();
+        uint256 obligations = swood.totalGuardianStake() + swood.totalDelegatedStake() + swood.pendingBurn();
 
         // Prepared owner stakes — delegators could in principle have called
         // `prepareOwnerStake`; handler doesn't drive that path, but we include
         // the term defensively.
         for (uint256 i = 0; i < gs.length; i++) {
-            obligations += registry.preparedStakeOf(gs[i]);
+            obligations += swood.preparedStakeOf(gs[i]);
         }
         for (uint256 i = 0; i < ds.length; i++) {
-            obligations += registry.preparedStakeOf(ds[i]);
+            obligations += swood.preparedStakeOf(ds[i]);
         }
 
-        uint256 bal = wood.balanceOf(address(registry));
-        assertGe(bal, obligations, "INV-V1.5-4: registry WOOD balance < obligations");
+        uint256 bal = wood.balanceOf(address(swood));
+        assertGe(bal, obligations, "INV-V1.5-4: sWOOD WOOD balance < obligations");
     }
 
     /// @notice INV-V1.5-5 commission bounds: `commissionOf(g) <= MAX_COMMISSION_BPS`
     ///         for every guardian the handler interacts with.
     function invariant_commission_withinBounds() public view {
         address[] memory gs = handler.getGuardians();
-        uint256 max = registry.MAX_COMMISSION_BPS();
+        uint256 max = swood.MAX_COMMISSION_BPS();
         for (uint256 i = 0; i < gs.length; i++) {
-            assertLe(registry.commissionOf(gs[i]), max, "INV-V1.5-5: commission exceeds max");
+            assertLe(swood.commissionOf(gs[i]), max, "INV-V1.5-5: commission exceeds max");
         }
     }
 }
