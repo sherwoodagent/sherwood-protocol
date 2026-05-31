@@ -226,7 +226,18 @@ contract MockStakedWood is IStakedWood {
     }
 
     // ── Registry-only mutations (no-op stubs that record args) ──
-    function slashGuardians(uint256 proposalId, address[] calldata, uint256 slashBps) external {
+    // Sherlock run #3 #6: signature gained `openedAt` so sWOOD can isolate the
+    // own-stake portion of the combined `voteStake` snapshot via
+    // `getPastDelegatedInbound(approver, openedAt)`. Mock ignores it.
+    function slashGuardians(
+        uint256 proposalId,
+        uint256,
+        /* openedAt */
+        address[] calldata,
+        uint256 slashBps
+    )
+        external
+    {
         slashGuardiansCallCount++;
         lastSlashProposalId = proposalId;
         lastSlashBps = slashBps;

@@ -115,9 +115,16 @@ interface IStakedWood {
     ///         each approver's own stake plus a pro-rata share of their
     ///         delegated pool. Registry-only.
     /// @param proposalId The blocked proposal whose approvers are slashed.
+    /// @param openedAt   Snapshot timestamp the review's vote-weight snapshot
+    ///                   (`recordVoteStake`) was captured at. Used by
+    ///                   `_slashOne` to recover each approver's pure-own-stake
+    ///                   portion via `getPastDelegatedInbound(approver, openedAt)`
+    ///                   so the own-stake slash isn't sized off the combined
+    ///                   weight (Sherlock run #3 #6).
     /// @param approvers  Plain `address[]` of approver addresses to slash.
     /// @param slashBps   Slash fraction in basis points.
-    function slashGuardians(uint256 proposalId, address[] calldata approvers, uint256 slashBps) external;
+    function slashGuardians(uint256 proposalId, uint256 openedAt, address[] calldata approvers, uint256 slashBps)
+        external;
 
     /// @notice Burn the owner bond bound to `vault` (emergency-settle failure).
     ///         Registry-only.

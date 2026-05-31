@@ -2,6 +2,7 @@
 pragma solidity 0.8.28;
 
 import {BatchExecutorLib} from "./BatchExecutorLib.sol";
+import {IStakedWood} from "./interfaces/IStakedWood.sol";
 
 /// @title MinimalGuardianRegistry
 /// @notice Stub registry for beta deploys where WOOD is not yet live and the
@@ -31,6 +32,25 @@ contract MinimalGuardianRegistry {
     ///         actual factory.
     function factory() external pure returns (address) {
         return address(0);
+    }
+
+    /// @notice Sherlock run #3 #7 — `SyndicateFactory.createSyndicate` and
+    ///         `rotateOwner` route their owner-stake calls through
+    ///         `reg.swood().canCreateVault(...)` / `bindOwnerStake(...)` /
+    ///         `transferOwnerStakeSlot(...)`. Pre-fix the stub didn't expose
+    ///         `swood()` and both factory paths reverted with "selector not
+    ///         found" on any BETA_MODE deploy.
+    ///
+    ///         The stub points sWOOD back at ITSELF — `IStakedWood(address(
+    ///         this))`. The three sWOOD methods the factory dispatches to
+    ///         (`canCreateVault`, `bindOwnerStake`, `transferOwnerStakeSlot`)
+    ///         are already implemented on this contract from the pre-split
+    ///         era as no-op stubs, so the indirection collapses cleanly.
+    ///         Any other `IStakedWood` method dispatched here will hit
+    ///         either the no-op stubs below (`ownerStake`) or the `Disabled`
+    ///         loud-revert wall — both desired in beta.
+    function swood() external view returns (IStakedWood) {
+        return IStakedWood(address(this));
     }
 
     /// @notice Lets the governor `IGuardianRegistry(_).reviewPeriod()` cast

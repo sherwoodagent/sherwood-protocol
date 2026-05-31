@@ -391,11 +391,30 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     ///      keyed by `(proposalId, recipient, asset)` + emits
     ///      `ApproverFeeEscrowed`. Cross-proposal drain is impossible because
     ///      the key includes `proposalId`.
+    ///
+    ///      Sherlock run #3 #2: SafeERC20-style success check. The pre-fix
+    ///      `try IERC20(asset).transfer(...) returns (bool r)` shape mis-
+    ///      handled non-standard ERC20s like USDT that don't return a bool —
+    ///      the bool decode reverted on empty returndata, the try block
+    ///      reverted, the catch escrowed the amount, and yet the underlying
+    ///      transfer ACTUALLY succeeded. Recipient then double-claimed via
+    ///      `flushUnclaimedApproverFee` (which uses `SafeERC20.safeTransfer`,
+    ///      tolerates empty returndata). Inlined here rather than reusing
+    ///      `SafeERC20.safeTransfer` because OZ's helper REVERTS on failure
+    ///      and the W-1 escrow path needs a signal (`ok=false`) instead.
     function _safeRewardTransfer(address asset, address recipient, uint256 amount, uint256 proposalId) internal {
         bool ok;
-        try IERC20(asset).transfer(recipient, amount) returns (bool r) {
-            ok = r;
-        } catch {}
+        // forge-lint: disable-next-line(unsafe-cheatcode)
+        (bool success, bytes memory rd) = asset.call(abi.encodeCall(IERC20.transfer, (recipient, amount)));
+        if (success) {
+            if (rd.length == 0) {
+                // Non-standard ERC20 (USDT-style): empty return = success.
+                ok = true;
+            } else if (rd.length >= 32) {
+                ok = abi.decode(rd, (bool));
+            }
+            // else: malformed return data — treat as failure, escrow.
+        }
         if (!ok) {
             unclaimedApproverFees[keccak256(abi.encode(proposalId, recipient, asset))] += amount;
             emit ApproverFeeEscrowed(proposalId, recipient, asset, amount);
@@ -728,7 +747,13 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
             // median of the blockers' proposed severities, clamped to the
             // owner-set `[minSlashBps, maxSlashBps]` band on sWOOD. The burn
             // and re-checkpoint all happen on sWOOD.
-            swood.slashGuardians(proposalId, _approvers[proposalId], _weightedMedianSlashBps(proposalId));
+            //
+            // Sherlock run #3 #6: pass `r.openedAt` so sWOOD's `_slashOne`
+            // can isolate the own-stake portion of each approver's combined
+            // snapshot via `getPastDelegatedInbound(approver, openedAt)`.
+            swood.slashGuardians(
+                proposalId, uint256(r.openedAt), _approvers[proposalId], _weightedMedianSlashBps(proposalId)
+            );
             _emitBlockerAttribution(proposalId);
         }
 

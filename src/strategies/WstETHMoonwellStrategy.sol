@@ -317,14 +317,24 @@ contract WstETHMoonwellStrategy is BaseStrategy {
         uint256 wstethBal = IERC20(wsteth).balanceOf(address(this));
         if (wstethBal < wstethNeeded) return 0;
 
-        // Swap wstETH → WETH. `minWethOut = assetsNeeded` so the router
+        // Swap wstETH -> WETH. `minWethOut = assetsNeeded` so the router
         // reverts if it can't deliver the deficit; the vault's try/catch
         // surfaces a queue-fallback.
-        IERC20(wsteth).forceApprove(aeroRouter, wstethBal);
+        //
+        // Sherlock run #3 #8: swap ONLY `wstethNeeded`, NOT the full balance.
+        // Pre-fix the strategy approved and swapped `wstethBal` which sweeps
+        // any pre-existing wstETH dust (yield-accrued residue, direct
+        // transfers) through the AMM. Excess WETH stayed on the strategy
+        // and was reclaimed at settle, so no permanent loss — but the
+        // over-swap exposed the dust to slippage and accelerated divergence
+        // from the target position.
+        IERC20(wsteth).forceApprove(aeroRouter, wstethNeeded);
         IAeroRouter.Route[] memory routes = new IAeroRouter.Route[](1);
         routes[0] = IAeroRouter.Route({from: wsteth, to: weth, stable: true, factory: aeroFactory});
         uint256[] memory amounts = IAeroRouter(aeroRouter)
-            .swapExactTokensForTokens(wstethBal, assetsNeeded, routes, address(this), block.timestamp + deadlineOffset);
+            .swapExactTokensForTokens(
+                wstethNeeded, assetsNeeded, routes, address(this), block.timestamp + deadlineOffset
+            );
         uint256 wethReceived = amounts[amounts.length - 1];
         if (wethReceived < assetsNeeded) return 0;
 

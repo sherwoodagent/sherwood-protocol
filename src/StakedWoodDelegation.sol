@@ -209,6 +209,12 @@ abstract contract StakedWoodDelegation is ReentrancyGuardTransient {
     /// @notice `claim*` called before `coolDownPeriod` elapsed.
     error CooldownNotElapsed();
 
+    /// @notice Sherlock run #3 #1: an unstake request would burn live shares
+    ///         for zero `amount` (poolTokens × liveShares < poolShares after
+    ///         extreme slashing), creating a permanent fund-trap. Revert
+    ///         instead of corrupting state.
+    error UnstakeAmountZero();
+
     /// @notice `setCommission` argument exceeds `MAX_COMMISSION_BPS`.
     /// @dev Relocated verbatim from `IGuardianRegistry`.
     error CommissionExceedsMax();
@@ -366,6 +372,15 @@ abstract contract StakedWoodDelegation is ReentrancyGuardTransient {
 
         // Redeem the live shares at the current live rate.
         uint256 amount = Math.mulDiv(liveShares, poolTokens[delegate], poolShares[delegate]);
+        // Sherlock run #3 #1: after extreme slashing (poolTokens × liveShares <
+        // poolShares) the redeem amount can round to 0. Proceeding would burn
+        // the delegator's live shares without minting any unbonding shares,
+        // strand `_unstakeDelegationRequestedAt` non-zero, and brick both
+        // `cancelUnstakeDelegation` (reverts `UnstakeNotRequested`) and
+        // `claimUnstakeDelegation` (reverts `NoActiveStake`) — a permanent
+        // fund-trap. Revert here so the delegator can keep their (now-tiny)
+        // live position or wait for the pool to recover.
+        if (amount == 0) revert UnstakeAmountZero();
 
         // Remove from the live pool.
         poolShares[delegate] -= liveShares;

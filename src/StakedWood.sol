@@ -834,16 +834,25 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     ///      loop. The aggregate total-stake checkpoint is pushed once after the
     ///      loop; the slashed WOOD is burned in a single transfer.
     /// @param proposalId The blocked proposal whose approvers are slashed.
+    /// @param openedAt   Sherlock run #3 #6: snapshot timestamp the review's
+    ///                   `recordVoteStake` was captured at. `_slashOne` reads
+    ///                   `getPastDelegatedInbound(approver, openedAt)` to
+    ///                   isolate the own-stake portion of the combined weight
+    ///                   snapshot — without it, an approver whose vote weight
+    ///                   included delegated inbound would lose own stake sized
+    ///                   off the combined weight, AND have their delegated pool
+    ///                   slashed separately (effective double-slash on the
+    ///                   delegated portion contributing to the snapshot).
     /// @param approvers  The approver addresses to slash.
     /// @param slashBps   Slash fraction in basis points out of `10_000`.
     /// @return total     Total WOOD burned across all approvers.
-    function slashGuardians(uint256 proposalId, address[] calldata approvers, uint256 slashBps)
+    function slashGuardians(uint256 proposalId, uint256 openedAt, address[] calldata approvers, uint256 slashBps)
         external
         onlyRegistry
         returns (uint256 total)
     {
         for (uint256 i = 0; i < approvers.length; i++) {
-            total += _slashOne(proposalId, approvers[i], slashBps);
+            total += _slashOne(proposalId, openedAt, approvers[i], slashBps);
         }
         if (total == 0) return 0;
         // Checkpoint the aggregate total-stake drop once after the loop.
@@ -855,7 +864,22 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     ///      snapshot) + delegated-pool portion (single `poolTokens` write).
     ///      Extracted to keep `slashGuardians`'s stack frame shallow.
     ///      Returns the WOOD slashed from `approver` (own + delegated).
-    function _slashOne(uint256 proposalId, address approver, uint256 slashBps) private returns (uint256 amt) {
+    ///
+    ///      Sherlock run #3 #6: `voteStake[proposalId][approver]` mirrors the
+    ///      registry's `getPastVotes(approver, openedAt_)` — own + delegated
+    ///      inbound at the openedAt_ snapshot. Sized by that snapshot, the
+    ///      own-stake slash would over-debit `g.stakedAmount` by the
+    ///      delegated-at-snapshot portion (and the delegated pool was
+    ///      already separately slashed via `delSlash` below — effective
+    ///      double-slash on the delegated contribution). Fix: subtract
+    ///      `getPastDelegatedInbound(approver, openedAt_)` to isolate the
+    ///      pure-own-stake snapshot. The snapshot-inbound is correct even
+    ///      if delegators staked/unstaked between open and slash (live
+    ///      `poolTokens` would diverge from the snapshot).
+    function _slashOne(uint256 proposalId, uint256 openedAt, address approver, uint256 slashBps)
+        private
+        returns (uint256 amt)
+    {
         Guardian storage g = _guardians[approver];
         uint256 live = g.stakedAmount;
         // Sherlock #39 / Run-1 #22: snapshot pre-slash active state + pool
@@ -864,7 +888,14 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
         bool wasActive = live > 0 && g.unstakeRequestedAt == 0;
         uint256 oldPool = poolTokens[approver];
 
-        uint256 snapOwn = uint256(voteStake[proposalId][approver]);
+        // Sherlock run #3 #6: extract own-stake snapshot from the combined
+        // voteStake by subtracting the snapshot-time delegated inbound. If
+        // the snapshot or inbound view ever returns 0 (no vote recorded /
+        // pre-fix proposal / no delegations), this collapses to the raw
+        // snapshot — which is the correct pre-#6 behavior for those cases.
+        uint256 snapTotal = uint256(voteStake[proposalId][approver]);
+        uint256 snapDelegated = getPastDelegatedInbound(approver, openedAt);
+        uint256 snapOwn = snapTotal > snapDelegated ? snapTotal - snapDelegated : 0;
         // Clamp: a concurrent slash may have already reduced live stake below
         // the recorded snapshot — take only what is actually there.
         uint256 ownSlash = Math.mulDiv(snapOwn <= live ? snapOwn : live, slashBps, 10_000);

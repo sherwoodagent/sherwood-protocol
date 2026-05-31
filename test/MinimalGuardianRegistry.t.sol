@@ -4,6 +4,7 @@ pragma solidity 0.8.28;
 import {Test} from "forge-std/Test.sol";
 import {MinimalGuardianRegistry} from "../src/MinimalGuardianRegistry.sol";
 import {BatchExecutorLib} from "../src/BatchExecutorLib.sol";
+import {IStakedWood} from "../src/interfaces/IStakedWood.sol";
 
 /// @title MinimalGuardianRegistry unit tests
 /// @notice Stub registry for beta deploys without WOOD. Verifies the read
@@ -111,5 +112,30 @@ contract MinimalGuardianRegistryTest is Test {
     function test_prepareOwnerStake_revertsDisabled() public {
         vm.expectRevert(MinimalGuardianRegistry.Disabled.selector);
         registry.prepareOwnerStake(0);
+    }
+
+    // ──────────────────────── Sherlock run #3 #7: swood() stub ────────────────────────
+
+    /// @notice `swood()` returns the registry itself, casted as `IStakedWood`.
+    ///         `SyndicateFactory.createSyndicate` and `rotateOwner` dispatch
+    ///         the owner-stake calls through `reg.swood().X(...)` post-split.
+    ///         The stub re-routes those calls back to the registry's existing
+    ///         no-op `canCreateVault` / `bindOwnerStake` / `transferOwnerStakeSlot`
+    ///         implementations.
+    function test_swood_returnsSelf() public view {
+        assertEq(address(registry.swood()), address(registry), "swood points back at registry");
+    }
+
+    /// @notice End-to-end: dispatching the factory's sWOOD calls through the
+    ///         IStakedWood handle returned by `swood()` collapses to the
+    ///         registry's stubs without reverting.
+    function test_swood_dispatchedCallsCollapseToStubs() public {
+        IStakedWood sw = registry.swood();
+        // canCreateVault: factory's gate at createSyndicate.
+        assertTrue(sw.canCreateVault(makeAddr("creator")), "canCreateVault stub via swood()");
+        // bindOwnerStake: factory's post-deploy bind in createSyndicate.
+        sw.bindOwnerStake(makeAddr("creator"), makeAddr("vault"));
+        // transferOwnerStakeSlot: factory's rotateOwner.
+        sw.transferOwnerStakeSlot(makeAddr("vault"), makeAddr("newOwner"));
     }
 }

@@ -60,6 +60,11 @@ contract HyperliquidPerpStrategy is BaseStrategy {
     error PositionTooLarge(uint256 actual, uint256 max);
     error AlreadyFinalized();
     error NotAuthorized();
+    /// @notice Sherlock run #3 #3: `_settle` requires `initiateReturn()` to
+    ///         have been called at least one block prior so HC has time to
+    ///         bridge USDC back to EVM. Without this, the strategy would
+    ///         report a phantom total loss to the vault.
+    error ReturnsNotInitiated();
 
     // ── Action types ──
     // Legacy single-asset actions (use perpAssetIndex from storage):
@@ -378,17 +383,30 @@ contract HyperliquidPerpStrategy is BaseStrategy {
 
     /// @notice TWO-PATH SETTLEMENT — Path 2 (governor-called).
     ///         See `HyperliquidGridStrategy._settle` for the design rationale.
-    /// @dev    If `initiateReturn()` was NOT called pre-settle, fall back to
-    ///         a defensive in-call HC drain. The recommended flow is to call
-    ///         `initiateReturn()` (path 1) at least one block BEFORE
-    ///         `settleProposal` so HC has time to bridge USDC back to EVM
-    ///         and `_pushAllToVault` reports the realized NAV correctly.
+    /// @dev    `initiateReturn()` MUST have been called at least one block
+    ///         BEFORE `settleProposal` so HC has time to bridge USDC back to
+    ///         EVM. The expected flow:
+    ///
+    ///           Block N: proposer (or anyone after duration) calls
+    ///                    `initiateReturn()` — queues HC drain.
+    ///           Block N+1+: HC processes the perp→spot + spot→EVM actions,
+    ///                       USDC arrives on the strategy's EVM address.
+    ///           Block N+1+: governor calls `settleProposal` →
+    ///                       strategy.settle() → `_pushAllToVault` correctly
+    ///                       reports the realized NAV.
+    ///
+    ///         Sherlock run #3 #3: the pre-fix path-2 "defensive in-call HC
+    ///         drain inside `_settle` when path 1 was skipped" caused a
+    ///         phantom total loss whenever the governor settled before HC
+    ///         bridged (drain queued, balance still zero, settle pushed
+    ///         near-nothing, late HC arrivals later credited new depositors).
+    ///         Now if `returnsInitiated == false` at settle-time we revert
+    ///         with `ReturnsNotInitiated` rather than corrupt PnL. Same
+    ///         pattern as `HyperliquidGridStrategy._settle` (Sherlock #23).
+    ///         Late HC arrivals post-settle recoverable via
+    ///         `recoverHcResiduals` / `sweepToVault`.
     function _settle() internal override {
-        if (!returnsInitiated) {
-            _drainHC();
-            returnsInitiated = true;
-            emit ReturnsInitiated();
-        }
+        if (!returnsInitiated) revert ReturnsNotInitiated();
         _pushAllToVault(address(asset));
         settled = true;
         emit Settled();

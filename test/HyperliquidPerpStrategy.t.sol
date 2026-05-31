@@ -307,6 +307,12 @@ contract HyperliquidPerpStrategyTest is Test {
         vm.prank(proposer);
         strategy.updateParams(abi.encode(uint8(1), uint64(3000e6), uint64(1e6), uint64(2800e6), uint64(1e6)));
 
+        // Sherlock run #3 #3: settle requires initiateReturn() to have run
+        // first so HC has time to bridge USDC back to EVM. Mirrors Grid's
+        // _execAndPrep + initiateReturn pattern.
+        vm.prank(proposer);
+        strategy.initiateReturn();
+
         vm.prank(vault);
         strategy.settle();
 
@@ -317,6 +323,9 @@ contract HyperliquidPerpStrategyTest is Test {
 
     function test_settle_withoutOpenPosition() public {
         _executeFirst();
+        // Sherlock run #3 #3: settle requires initiateReturn() first.
+        vm.prank(proposer);
+        strategy.initiateReturn();
         vm.prank(vault);
         strategy.settle();
         assertEq(strategy.settled(), true);
@@ -335,10 +344,28 @@ contract HyperliquidPerpStrategyTest is Test {
         strategy.settle();
     }
 
+    /// @notice Sherlock run #3 #3 — `settle` MUST revert if `returnsInitiated`
+    ///         is false. Pre-fix Perp would call `_drainHC()` same-block (which
+    ///         queues HC actions for post-block processing) and immediately
+    ///         `_pushAllToVault` with EVM balance still ~0 → vault records
+    ///         NAV~0 → phantom total loss → LPs exiting mid-window eat losses,
+    ///         new entrants get windfall. Grid was fixed first (Sherlock #23);
+    ///         this regression closes the same vector on Perp.
+    function test_settle_revertsBeforeInitiateReturn() public {
+        _executeFirst();
+        vm.prank(vault);
+        vm.expectRevert(HyperliquidPerpStrategy.ReturnsNotInitiated.selector);
+        strategy.settle();
+        assertFalse(strategy.settled());
+    }
+
     // ==================== SWEEP TO VAULT ====================
 
     function _settleFirst() internal {
         _executeFirst();
+        // Sherlock run #3 #3: settle requires initiateReturn() first.
+        vm.prank(proposer);
+        strategy.initiateReturn();
         vm.prank(vault);
         strategy.settle();
     }
@@ -476,7 +503,11 @@ contract HyperliquidPerpStrategyTest is Test {
         vm.prank(proposer);
         strategy.updateParams(abi.encode(uint8(2), uint64(3200e6), uint64(1e6)));
 
-        // 5. Settle
+        // 5. Initiate return (Sherlock run #3 #3 — required before settle).
+        vm.prank(proposer);
+        strategy.initiateReturn();
+
+        // 6. Settle
         vm.prank(vault);
         strategy.settle();
 
@@ -517,6 +548,10 @@ contract HyperliquidPerpStrategyTest is Test {
         strategy.updateParams(abi.encode(uint8(1), uint64(3000e6), uint64(1e6), uint64(2800e6), uint64(1e6)));
         assertTrue(strategy.hasActiveStopLoss());
 
+        // Sherlock run #3 #3: settle requires initiateReturn() first
+        // (which itself cancels the active stop-loss).
+        vm.prank(proposer);
+        strategy.initiateReturn();
         vm.prank(vault);
         strategy.settle();
         assertFalse(strategy.hasActiveStopLoss());

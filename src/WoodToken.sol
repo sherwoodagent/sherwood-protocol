@@ -7,7 +7,31 @@ import {ERC20Permit} from "@openzeppelin/contracts/token/ERC20/extensions/ERC20P
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
 /// @title WoodToken — LayerZero OFT + ERC20Permit with hard 1B supply cap
-/// @notice Minting authority is the contract `owner` (the deployer / multisig).
+/// @notice  ⚠️ NON-PRODUCTION — OUT OF SCOPE FOR AUDIT.
+///
+///         Mainnet WOOD is an existing external ERC20 token launch. This
+///         contract is kept in the repo as a reference / test fixture (used
+///         by the local-deploy + Sepolia-deploy scripts so integration tests
+///         and beta deploys have a WOOD-shaped token to wire against). It is
+///         NOT the production WOOD artifact and will NOT be deployed to
+///         mainnet. Bridge / OFT / cross-chain semantics in this file are
+///         likewise out of scope — production uses the external token's
+///         existing bridge infrastructure.
+///
+///         Sherlock run #3 #4 (saturated `_credit` revert burns user tokens)
+///         is acknowledged but DISMISSED on the basis above. Auditors:
+///         please skip findings against this file.
+///
+///         If this contract ever becomes production-bound, the round-trip
+///         saturation issue needs revisiting — options are (a) leave a
+///         headroom buffer in the initial mint, (b) switch `_credit` to a
+///         `totalSupply()`-based cap (safe iff `mint()` authority is
+///         constrained to a single chain), or (c) introduce a refund-escrow
+///         path for failed cross-chain credits.
+///
+///         ── Original natspec (for completeness) ──
+///
+///         Minting authority is the contract `owner` (the deployer / multisig).
 ///         The Minter contract has been removed; the owner mints the initial
 ///         supply once at deploy and is expected to renounce ownership (or hold
 ///         it in a multisig with internal delay). Minting gracefully caps at

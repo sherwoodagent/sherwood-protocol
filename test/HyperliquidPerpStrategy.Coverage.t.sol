@@ -267,6 +267,9 @@ contract HyperliquidPerpStrategyCoverageTest is Test {
         );
 
         // Settle should iterate tradedAssets and force-close orders for both.
+        // Sherlock run #3 #3: settle requires initiateReturn() first.
+        vm.prank(proposer);
+        strategy.initiateReturn();
         vm.prank(vault);
         strategy.settle();
         assertTrue(strategy.settled());
@@ -281,6 +284,9 @@ contract HyperliquidPerpStrategyCoverageTest is Test {
             abi.encode(uint8(6), uint32(7), uint64(60000e6), uint64(1e5), uint64(58000e6), uint64(1e5))
         );
 
+        // Sherlock run #3 #3: settle requires initiateReturn() first.
+        vm.prank(proposer);
+        strategy.initiateReturn();
         vm.prank(vault);
         strategy.settle();
         assertTrue(strategy.settled());

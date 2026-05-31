@@ -320,4 +320,45 @@ contract VaultAsyncRedeemTest is Test {
         vm.expectPartialRevert(ERC4626Upgradeable.ERC4626ExceededMaxRedeem.selector);
         vault.redeem(bigShares, bob, bob);
     }
+
+    // ── Sherlock run #3 #9 (off-report): dust-redeem passthrough ──
+
+    /// @notice Pre-fix `maxRedeem` returned 0 when `backingAssets == 0`,
+    ///         stranding holders of dust shares (whose `convertToAssets`
+    ///         rounds to 0 wei) once the vault's float dropped to the
+    ///         queue reserve. They could never drain those dust shares.
+    ///         Post-fix: when the user's full balance redeems to 0 wei
+    ///         (or any amount <= backingAssets), `maxRedeem` returns
+    ///         their full balance so a single `redeem(balanceOf)` call
+    ///         clears the dust without reverting.
+    function test_redeem_dustShares_passthrough() public {
+        // Alice deposits, gets `aliceShares` (1000e6 * 10^6 = 1e15 shares
+        // under the +6 decimals offset).
+        vm.prank(alice);
+        uint256 aliceShares = vault.deposit(1_000e6, alice);
+
+        // Drain float to the queue reserve via a redeem of MOST shares,
+        // leaving alice with dust. We model the post-drain state by direct
+        // burn — burn 1 share worth less than 10^6 wei (i.e. dust).
+        //
+        // Simpler approach: alice does the redeem in full, then we mint
+        // back a tiny dust amount to simulate yield/rounding residue.
+        vm.prank(alice);
+        vault.redeem(aliceShares - 100, alice, alice);
+
+        // Alice now has exactly 100 dust shares; convertToAssets(100) = 0.
+        assertEq(vault.balanceOf(alice), 100, "100 dust shares");
+        assertEq(vault.convertToAssets(100), 0, "dust shares convert to 0 wei");
+
+        // maxRedeem MUST return at least the dust amount — the user can
+        // redeem(balanceOf) without reverting.
+        uint256 cap = vault.maxRedeem(alice);
+        assertGe(cap, 100, "maxRedeem >= dust balance (pre-fix returned 0)");
+
+        // The dust redeem succeeds, burning 100 shares for 0 wei assets.
+        vm.prank(alice);
+        uint256 assetsOut = vault.redeem(100, alice, alice);
+        assertEq(assetsOut, 0, "dust burn yields 0 assets");
+        assertEq(vault.balanceOf(alice), 0, "dust shares burned cleanly");
+    }
 }

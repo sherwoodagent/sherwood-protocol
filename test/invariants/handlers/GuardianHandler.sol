@@ -261,7 +261,10 @@ contract GuardianHandler is Test {
         approvers[0] = actors[bound(approverSeed, 0, actors.length - 1)];
 
         vm.prank(address(registry));
-        try swood.slashGuardians(pid, approvers, slashBps) {
+        // Sherlock run #3 #6: pass openedAt=0 (handler doesn't recordVoteStake
+        // with combined own+delegated weight so the snapDelegated lookup at 0
+        // returns 0 and snapOwn == snapTotal — collapses to pre-#6 math).
+        try swood.slashGuardians(pid, 0, approvers, slashBps) {
             successfulSlashes += 1;
         } catch {}
     }

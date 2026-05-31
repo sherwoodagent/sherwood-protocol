@@ -186,6 +186,31 @@ contract VeniceInferenceStrategy is BaseStrategy {
     /// @dev The agent must have approved this strategy for `repaymentAmount` of `asset`.
     ///      sVVV stays with the agent — it is their inference license.
     ///      The governor calculates P&L from vault balance diff and distributes fees.
+    ///
+    ///      Sherlock run #3 #5 — AGENT-TRUST BOUNDARY ACKNOWLEDGED.
+    ///      A malicious or unresponsive agent CAN brick settlement by
+    ///      withholding approval, revoking allowance, or letting their
+    ///      asset balance fall below `repaymentAmount`. The strategy has
+    ///      NO internal force-close path. This is by design:
+    ///
+    ///        - The agent is the proposer who deployed this strategy clone
+    ///          via `StrategyFactory.cloneAndInit`. Both clone deployment
+    ///          and governor proposal land within the registered-agent /
+    ///          vault-owner trust boundary, vetted by guardians during
+    ///          GuardianReview. The agent's identity is on-record on-chain.
+    ///        - Vault-owner external recovery: `SyndicateGovernor`'s
+    ///          `emergencySettleWithCalls` lets the owner multisig craft a
+    ///          batch that writes off the loaned principal and transitions
+    ///          `Executed` → `Settled` without agent cooperation. The slot
+    ///          is not permanently stuck.
+    ///        - sVVV is non-transferrable on Base, so the vault has no
+    ///          claim on the staked VVV anyway — recovery for a defaulted
+    ///          agent is necessarily an off-chain / governance action.
+    ///
+    ///      A proper in-contract force-close (slash schedule, sVVV
+    ///      disposition, trigger gate) is tracked as a future design spec.
+    ///      Adding one inline would introduce new attack surface that
+    ///      needs full review.
     function _settle() internal override {
         address _vault = this.vault();
         IERC20(asset).safeTransferFrom(agent, _vault, repaymentAmount);

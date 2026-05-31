@@ -89,7 +89,7 @@ contract StakedWoodSlashingTest is Test {
         approvers[0] = alice;
         vm.prank(alice);
         vm.expectRevert(StakedWood.NotRegistry.selector);
-        swood.slashGuardians(1, approvers, 5000);
+        swood.slashGuardians(1, 0, approvers, 5000);
     }
 
     function test_slashGuardians_ownStake() public {
@@ -112,7 +112,9 @@ contract StakedWoodSlashingTest is Test {
         vm.expectEmit(true, true, true, true, address(swood));
         emit GuardianSlashed(1, alice, 5_000e18, 0);
         vm.prank(registry);
-        uint256 total = swood.slashGuardians(1, approvers, 2500);
+        // openedAt=0 collapses snapDelegated lookup to 0 → snapOwn = snapTotal
+        // (preserves pre-#6 behavior for tests that don't combine own + delegated).
+        uint256 total = swood.slashGuardians(1, 0, approvers, 2500);
         uint256 slashedAt = vm.getBlockTimestamp();
 
         assertEq(total, 5_000e18, "returned total");
@@ -155,7 +157,7 @@ contract StakedWoodSlashingTest is Test {
         approvers[0] = bob;
         uint256 burnBefore = wood.balanceOf(BURN_ADDRESS);
         vm.prank(registry);
-        uint256 total = swood.slashGuardians(2, approvers, 5000);
+        uint256 total = swood.slashGuardians(2, 0, approvers, 5000);
 
         // bob's own stake (10k) also slashed 50% → 5k; pool 400 → 200.
         assertEq(total, 5_000e18 + 200e18, "own + delegated slash");
@@ -183,7 +185,7 @@ contract StakedWoodSlashingTest is Test {
         address[] memory approvers = new address[](1);
         approvers[0] = bob;
         vm.prank(registry);
-        swood.slashGuardians(3, approvers, 5000);
+        swood.slashGuardians(3, 0, approvers, 5000);
         assertEq(swood.poolTokens(bob), 50e18, "pool tokens halved");
         assertEq(swood.poolShares(bob), 100e18, "pool shares unchanged by slash");
 
@@ -228,7 +230,7 @@ contract StakedWoodSlashingTest is Test {
         address[] memory approvers = new address[](1);
         approvers[0] = bob;
         vm.prank(registry);
-        swood.slashGuardians(7, approvers, 5000);
+        swood.slashGuardians(7, 0, approvers, 5000);
         assertEq(swood.unbondingPoolTokens(bob), 200e18, "unbonding pool slashed 50%");
 
         // Cooldown elapses; alice claims — she receives the SLASHED 200, not
@@ -257,7 +259,7 @@ contract StakedWoodSlashingTest is Test {
         address[] memory approvers = new address[](1);
         approvers[0] = bob;
         vm.prank(registry);
-        swood.slashGuardians(8, approvers, 1000);
+        swood.slashGuardians(8, 0, approvers, 1000);
 
         vm.warp(vm.getBlockTimestamp() + 7 days);
         vm.prank(alice);
@@ -296,7 +298,7 @@ contract StakedWoodSlashingTest is Test {
         // ownSlash 5k (bob's 10k @ 50%); delegatedSlash = live 50 + unbonding 150 = 200.
         emit GuardianSlashed(9, bob, 5_000e18, 200e18);
         vm.prank(registry);
-        uint256 total = swood.slashGuardians(9, approvers, 5000);
+        uint256 total = swood.slashGuardians(9, 0, approvers, 5000);
 
         assertEq(swood.poolTokens(bob), 50e18, "live pool halved");
         assertEq(swood.unbondingPoolTokens(bob), 150e18, "unbonding pool halved");
@@ -330,7 +332,7 @@ contract StakedWoodSlashingTest is Test {
         address[] memory approvers = new address[](1);
         approvers[0] = bob;
         vm.prank(registry);
-        swood.slashGuardians(10, approvers, 5000);
+        swood.slashGuardians(10, 0, approvers, 5000);
         assertEq(swood.unbondingPoolTokens(bob), 200e18, "unbonding slashed");
 
         // Cancel re-bonds the SLASHED 200 into the live pool, not 400.
@@ -378,7 +380,7 @@ contract StakedWoodSlashingTest is Test {
 
         address[] memory approvers = new address[](0);
         vm.prank(registry);
-        uint256 total = swood.slashGuardians(1, approvers, 5000);
+        uint256 total = swood.slashGuardians(1, 0, approvers, 5000);
 
         assertEq(total, 0, "empty array returns 0");
         assertEq(wood.balanceOf(BURN_ADDRESS), burnBefore, "nothing burned");
@@ -415,7 +417,7 @@ contract StakedWoodSlashingTest is Test {
         vm.expectEmit(true, true, true, true, address(swood));
         emit GuardianSlashed(1, alice, 3_000e18, 0);
         vm.prank(registry);
-        uint256 total = swood.slashGuardians(1, approvers, 2500);
+        uint256 total = swood.slashGuardians(1, 0, approvers, 2500);
 
         // 50k * 2500 / 10000 = 12.5k would over-slash; clamp caps at 3k.
         assertEq(total, 3_000e18, "slash sized from live stake, not snapshot");
@@ -481,7 +483,7 @@ contract StakedWoodSlashingTest is Test {
         vm.expectEmit(false, false, false, true, address(s));
         emit PendingBurnRecorded(5_000e18);
         vm.prank(registry);
-        uint256 total = s.slashGuardians(1, approvers, 2500);
+        uint256 total = s.slashGuardians(1, 0, approvers, 2500);
 
         assertEq(total, 5_000e18, "slash accounting still applied");
         assertEq(s.guardianStake(alice), 15_000e18, "own stake reduced despite failed burn");
@@ -514,7 +516,7 @@ contract StakedWoodSlashingTest is Test {
         vm.expectEmit(false, false, false, true, address(s));
         emit PendingBurnRecorded(5_000e18);
         vm.prank(registry);
-        uint256 total = s.slashGuardians(1, approvers, 2500);
+        uint256 total = s.slashGuardians(1, 0, approvers, 2500);
 
         assertEq(total, 5_000e18, "slash accounting still applied");
         assertEq(s.guardianStake(alice), 15_000e18, "own stake reduced despite reverting burn");
@@ -543,7 +545,7 @@ contract StakedWoodSlashingTest is Test {
         address[] memory approvers = new address[](1);
         approvers[0] = alice;
         vm.prank(registry);
-        s.slashGuardians(1, approvers, 2500);
+        s.slashGuardians(1, 0, approvers, 2500);
         assertEq(s.pendingBurn(), 5_000e18, "queued before recovery");
 
         // Token recovers; flushBurn is permissionless.
@@ -687,7 +689,7 @@ contract StakedWoodSlashingTest is Test {
         address[] memory approvers = new address[](1);
         approvers[0] = bob;
         vm.prank(registry);
-        s.slashGuardians(1, approvers, 9_999);
+        s.slashGuardians(1, 0, approvers, 9_999);
 
         uint256 ptAfter = s.poolTokens(bob);
         uint256 psAfter = s.poolShares(bob);
@@ -734,7 +736,7 @@ contract StakedWoodSlashingTest is Test {
         address[] memory approvers = new address[](1);
         approvers[0] = bob;
         vm.prank(registry);
-        s.slashGuardians(1, approvers, 9_999);
+        s.slashGuardians(1, 0, approvers, 9_999);
 
         assertGt(s.unbondingPoolTokens(bob), 0, "unbondingPoolTokens > 0 after 9999 slash");
         assertGt(s.poolTokens(bob), 0, "poolTokens > 0 after 9999 slash");
@@ -777,5 +779,142 @@ contract StakedWoodSlashingTest is Test {
         );
         vm.expectRevert(StakedWood.InvalidParameter.selector);
         new ERC1967Proxy(address(impl), bad);
+    }
+
+    // ── Sherlock run #3 #1: zero-amount requestUnstakeDelegation ──
+
+    /// @notice After extreme slashing the live pool can hold dust where a
+    ///         delegator's `liveShares × poolTokens / poolShares` rounds to 0.
+    ///         `requestUnstakeDelegation` MUST revert with `UnstakeAmountZero`
+    ///         instead of burning the delegator's live shares with no
+    ///         compensating unbonding-pool credit (which would strand them
+    ///         permanently — both cancel and claim become unreachable).
+    function test_requestUnstakeDelegation_revertsOnZeroAmount() public {
+        // Bob is already an active guardian via setUp's `_fundAndApprove`
+        // pattern? Slashing fixture doesn't auto-stake him — do it here.
+        vm.prank(bob);
+        swood.stakeAsGuardian(10_000e18, 1);
+
+        // Alice delegates 1 wei → 1 share; carol delegates 999 wei → 999
+        // shares. Live pool: 1000 tok / 1000 sh. Alice owns 1 share.
+        vm.prank(alice);
+        swood.delegateStake(bob, 1);
+        vm.prank(carol);
+        swood.delegateStake(bob, 999);
+
+        assertEq(swood.poolTokens(bob), 1000, "pool tokens before slash");
+        assertEq(swood.poolShares(bob), 1000, "pool shares before slash");
+
+        // Registry snapshots vote stake then slashes bob 99.99% (maxSlashBps).
+        // Live pool: 1000 → 1000 - 999 = 1 token; shares unchanged (slash
+        // dilutes via poolTokens write only).
+        vm.prank(registry);
+        swood.recordVoteStake(99, bob, 10_000e18);
+        address[] memory approvers = new address[](1);
+        approvers[0] = bob;
+        vm.prank(registry);
+        swood.slashGuardians(99, 0, approvers, 9999);
+
+        assertEq(swood.poolTokens(bob), 1, "pool tokens post-slash = 1 (dust)");
+        assertEq(swood.poolShares(bob), 1000, "pool shares unchanged");
+
+        // Alice's redeem would compute mulDiv(1, 1, 1000) = 0. Must revert.
+        vm.prank(alice);
+        vm.expectRevert(StakedWoodDelegation.UnstakeAmountZero.selector);
+        swood.requestUnstakeDelegation(bob);
+
+        // Alice's shares MUST still be live (not burned). Cancel/claim are
+        // never set into the bricked state because the request reverted.
+        assertEq(swood.poolShares(bob), 1000, "shares not burned by reverted request");
+        assertEq(swood.unstakeDelegationRequestedAt(alice, bob), 0, "no stale request stamp");
+    }
+
+    // ── Sherlock run #3 #6: snapshot-aware own-stake slash ──
+
+    /// @notice Pre-fix, `_slashOne` read `voteStake[pid][approver]` as
+    ///         pure own stake. But the registry stores
+    ///         `getPastVotes(approver, openedAt)` there (own + delegated
+    ///         inbound at the openedAt snapshot). If a guardian topped up
+    ///         own stake between open and slash, the clamp
+    ///         `min(snapOwn, live)` picked the combined snapshot - own
+    ///         stake debited for the delegated portion (effective
+    ///         double-slash on the delegated contribution, since
+    ///         `delSlash` also fires on `oldPool`).
+    ///
+    ///         Post-fix: `_slashOne` subtracts `getPastDelegatedInbound`
+    ///         at openedAt from the combined snapshot so the own slash
+    ///         is sized off pure own stake at open. Asserts the numerical
+    ///         decomposition: own=200 at open, delegated=1000 at open,
+    ///         live own (post top-up)=2000, 10% slash - own loses 20
+    ///         (not 120), pool loses 100.
+    function test_slashGuardians_snapshotAwareOwnSlash() public {
+        // Bob is the active guardian and the delegate. Self-stakes the
+        // minimum (10k) so he qualifies. Pool starts empty.
+        vm.prank(bob);
+        swood.stakeAsGuardian(10_000e18, 1);
+
+        // Alice delegates 50k to bob -> pool: 50k tok / 50k sh.
+        vm.prank(alice);
+        swood.delegateStake(bob, 50_000e18);
+
+        // Snapshot the openedAt timestamp BEFORE recording vote weight.
+        // Warp 1 so getPastDelegatedInbound(bob, openedAt) returns the
+        // delegated state at the snap time. Mirrors registry's openReview
+        // `t-1` semantics.
+        vm.warp(vm.getBlockTimestamp() + 1);
+        uint256 openedAt = vm.getBlockTimestamp() - 1;
+        uint256 delegatedAtOpen = swood.getPastDelegatedInbound(bob, openedAt);
+        assertEq(delegatedAtOpen, 50_000e18, "delegated inbound snapshot");
+
+        // Registry mirrors getPastVotes (own 10k + delegated 50k = 60k) to
+        // sWOOD as the combined `voteStake` snapshot for proposal 1.
+        vm.prank(registry);
+        swood.recordVoteStake(1, bob, 60_000e18);
+
+        // Bob tops up own stake 10k -> 20k between open and slash.
+        vm.prank(bob);
+        swood.stakeAsGuardian(10_000e18, 1);
+        assertEq(swood.guardianStake(bob), 20_000e18, "own stake topped up");
+
+        // Slash 10% (1000 bps).
+        address[] memory approvers = new address[](1);
+        approvers[0] = bob;
+        vm.prank(registry);
+        uint256 total = swood.slashGuardians(1, openedAt, approvers, 1000);
+
+        // Post-fix decomposition:
+        //   snapTotal = 60k, snapDelegated = 50k -> snapOwn = 10k.
+        //   ownSlash = mulDiv(min(10k, 20k), 1000, 10000) = 1k.
+        //   delSlash = mulDiv(oldPool=50k, 1000, 10000) = 5k.
+        //   total = 6k.
+        // Pre-fix: snapOwn = 60k -> ownSlash = mulDiv(min(60k, 20k), 1000, 10000) = 2k.
+        //   total = 7k (over-slash on bob's own stake by 1k).
+        assertEq(total, 6_000e18, "total = ownSlash(1k) + delSlash(5k)");
+        assertEq(swood.guardianStake(bob), 19_000e18, "own stake = 20k - 1k (NOT 20k - 2k)");
+        assertEq(swood.poolTokens(bob), 45_000e18, "pool tokens = 50k - 5k (correct)");
+    }
+
+    /// @notice Backward-compatibility: when openedAt is 0 (e.g., a synthetic
+    ///         vote where `recordVoteStake` was called without a registry
+    ///         `openReview` flow), `getPastDelegatedInbound(approver, 0) = 0`
+    ///         and `snapOwn == snapTotal` — slash math collapses to pre-#6
+    ///         behavior. This is the path most existing slashing tests take.
+    function test_slashGuardians_openedAtZero_preservesPreFixBehavior() public {
+        vm.prank(alice);
+        swood.stakeAsGuardian(20_000e18, 1);
+
+        vm.prank(registry);
+        swood.recordVoteStake(1, alice, 20_000e18);
+
+        vm.warp(vm.getBlockTimestamp() + 1);
+
+        address[] memory approvers = new address[](1);
+        approvers[0] = alice;
+        vm.prank(registry);
+        // openedAt = 0: snapDelegated lookup returns 0 → snapOwn = snapTotal.
+        uint256 total = swood.slashGuardians(1, 0, approvers, 2500);
+
+        assertEq(total, 5_000e18, "ownSlash = 20k * 25% = 5k (matches pre-#6)");
+        assertEq(swood.guardianStake(alice), 15_000e18, "own stake reduced");
     }
 }

@@ -4,6 +4,7 @@ pragma solidity 0.8.28;
 import "forge-std/Test.sol";
 import {IGuardianRegistry} from "../src/interfaces/IGuardianRegistry.sol";
 import {BlacklistingERC20Mock} from "./mocks/BlacklistingERC20Mock.sol";
+import {NonReturningERC20Mock} from "./mocks/NonReturningERC20Mock.sol";
 import {RegistryTestHarness} from "./helpers/RegistryTestHarness.sol";
 
 /// @title GuardianRegistryProposalReward — V1.5 Phase 3 Tasks 3.7/3.8/3.9
@@ -374,6 +375,36 @@ contract GuardianRegistryProposalRewardTest is RegistryTestHarness {
     function test_flushUnclaimedApproverFee_noEscrow_reverts() public {
         vm.expectRevert(IGuardianRegistry.NoEscrowedAmount.selector);
         registry.flushUnclaimedApproverFee(PID, approver, address(usdc));
+    }
+
+    // ── Sherlock run #3 #2: SafeERC20-style success check for non-bool tokens ──
+
+    /// @notice A USDT-style ERC20 that doesn't return a bool on transfer MUST
+    ///         NOT be mis-escrowed. Pre-fix: the bool decode reverted on
+    ///         empty returndata → catch → escrow recorded WHILE underlying
+    ///         transfer actually succeeded → recipient could double-claim via
+    ///         `flushUnclaimedApproverFee`. Fix: SafeERC20-style success check
+    ///         (empty returndata = success).
+    function test_claim_nonReturningERC20_paysWithoutEscrow() public {
+        NonReturningERC20Mock usdt = new NonReturningERC20Mock("Tether USD", "USDT", 6);
+        usdt.mint(address(registry), 10 * FEE_AMOUNT);
+
+        _runReview(approver, address(0), address(0));
+
+        // Fund the pool with the non-returning asset.
+        vm.prank(address(governor));
+        registry.fundProposalGuardianPool(PID, address(usdt), FEE_AMOUNT);
+
+        uint256 balBefore = usdt.balanceOf(approver);
+        vm.prank(approver);
+        registry.claimProposalReward(approver, PID);
+
+        // Recipient credited exactly once.
+        assertEq(usdt.balanceOf(approver) - balBefore, FEE_AMOUNT, "single credit");
+
+        // No phantom escrow entry — fix verified.
+        bytes32 key = keccak256(abi.encode(PID, approver, address(usdt)));
+        assertEq(registry.unclaimedApproverFees(key), 0, "no double-credit escrow");
     }
 
     // ── Cross-proposal drain regression (PR #229 review finding class) ──

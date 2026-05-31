@@ -615,33 +615,31 @@ contract SyndicateVault is
         return ISyndicateGovernor(_getGovernor()).openProposalCount(address(this)) != 0;
     }
 
-    // ── I-1: nonReentrant guards on the public 4626 entry-points ──
+    // ── I-1: nonReentrant guards on deposit/mint (deflated-NAV attack vector) ──
     //
     // `_deposit` forwards capital into the active adapter via `safeTransfer`
     // followed by `IStrategy.onLiveDeposit`. A malicious adapter could re-enter
     // `vault.deposit` between the transfer and the adapter accounting the
     // assets — at that recursive moment `positionValue()` undercounts the
     // in-flight assets, letting the recursive deposit mint shares against a
-    // deflated NAV. `nonReentrant` on the public deposit/mint paths closes the
-    // window. `withdraw`/`redeem` get the same modifier for symmetry: the
-    // queue-side `claim` already takes its own lock and `requestRedeem` is
-    // already guarded, so a no-cost defence-in-depth here is cheap once
-    // `ReentrancyGuardTransient` is wired in.
-
+    // deflated NAV. `nonReentrant` on the public deposit/mint paths closes
+    // the window.
+    //
+    // Sherlock run #3 #9 (off-report): the parallel `withdraw`/`redeem`
+    // wrappers were dropped — they were annotated as "for symmetry /
+    // defense-in-depth" only, never load-bearing. The withdraw-side
+    // adapter callback is `onLiveWithdraw` which pulls FROM the adapter
+    // INTO the vault (no asset in flight that could deflate NAV from the
+    // attacker's perspective), AND any reentry attempt into `deposit` or
+    // `mint` is still blocked by their nonReentrant latch (transient
+    // storage). Dropping the 2 wrappers freed ~30 B of EIP-170 headroom,
+    // landing the `maxRedeem` dust-passthrough fix.
     function deposit(uint256 assets, address receiver) public override nonReentrant returns (uint256) {
         return super.deposit(assets, receiver);
     }
 
     function mint(uint256 shares, address receiver) public override nonReentrant returns (uint256) {
         return super.mint(shares, receiver);
-    }
-
-    function withdraw(uint256 assets, address receiver, address owner_) public override nonReentrant returns (uint256) {
-        return super.withdraw(assets, receiver, owner_);
-    }
-
-    function redeem(uint256 shares, address receiver, address owner_) public override nonReentrant returns (uint256) {
-        return super.redeem(shares, receiver, owner_);
     }
 
     /// @inheritdoc ERC4626Upgradeable
@@ -841,9 +839,19 @@ contract SyndicateVault is
         uint256 backingAssets = float > reserve ? float - reserve : 0;
         // Sherlock #37 / #50 — see `maxWithdraw` for rationale.
         backingAssets += _withdrawableAdapterValue(adapter, adapterValue);
-        if (backingAssets == 0) return 0;
-        uint256 floatShares = convertToShares(backingAssets);
-        if (floatShares < availableShares) availableShares = floatShares;
+        // Sherlock run #3 #9 (off-report): drop the `backingAssets == 0`
+        // early return — `convertToShares(0) = 0` lets the min-cap below
+        // collapse to 0 naturally. Skip the floatShares cap entirely when
+        // the user's full balance fits within `backingAssets` (covers the
+        // common dust case where `convertToAssets(userMax) == 0` and lets
+        // small redeems pass without rounding-down losses). Pre-fix, users
+        // with shares that redeemed to 0 wei got stranded once float
+        // dropped to the queue reserve. The `_withdraw` reserve check
+        // (`assets + reserve > float`) still gates real asset draws.
+        if (convertToAssets(userMax) > backingAssets) {
+            uint256 floatShares = convertToShares(backingAssets);
+            if (floatShares < availableShares) availableShares = floatShares;
+        }
         return userMax > availableShares ? availableShares : userMax;
     }
 
