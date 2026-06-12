@@ -208,9 +208,29 @@ contract HyperliquidGridStrategyTest is Test {
         // Sherlock #23 — settle requires initiateReturn first.
         vm.prank(proposer);
         strategy.initiateReturn();
+        vm.roll(block.number + 1);
         vm.prank(vault);
         strategy.settle();
         assertTrue(strategy.settled());
+    }
+
+    /// @notice Campaign finding F2 (HIGH) — `settle()` must revert in the SAME
+    ///         block as `initiateReturn()` (async HC→EVM bridge delivers later;
+    ///         same-block settle books a phantom loss). See the perp equivalent.
+    function test_settle_revertsSameBlockAsInitiateReturn() public {
+        _execAndPrep();
+        vm.prank(proposer);
+        strategy.initiateReturn();
+        assertEq(strategy.returnsInitiatedBlock(), block.number, "init block recorded");
+
+        vm.prank(vault);
+        vm.expectRevert(HyperliquidGridStrategy.SettleTooSoon.selector);
+        strategy.settle();
+
+        vm.roll(block.number + 1);
+        vm.prank(vault);
+        strategy.settle();
+        assertTrue(strategy.settled(), "settles a block after initiateReturn");
     }
 
     /// @notice Sherlock run #1 finding #23 — settle() MUST revert if
@@ -232,6 +252,7 @@ contract HyperliquidGridStrategyTest is Test {
         uint256 vaultBefore = usdc.balanceOf(vault);
         vm.prank(proposer);
         strategy.initiateReturn();
+        vm.roll(block.number + 1);
         vm.prank(vault);
         strategy.settle();
         assertEq(usdc.balanceOf(vault), vaultBefore + DEPOSIT);
@@ -244,6 +265,7 @@ contract HyperliquidGridStrategyTest is Test {
         _execAndPrep();
         vm.prank(proposer);
         strategy.initiateReturn();
+        vm.roll(block.number + 1);
         vm.prank(vault);
         strategy.settle();
         uint256 vaultBalance = usdc.balanceOf(vault);
@@ -325,6 +347,7 @@ contract HyperliquidGridStrategyTest is Test {
         vm.recordLogs();
         vm.prank(proposer);
         strategy.initiateReturn();
+        vm.roll(block.number + 1);
 
         Vm.Log[] memory logs = vm.getRecordedLogs();
         (bool found, SendAssetCall memory call) = _findSendAsset(logs);
@@ -345,6 +368,7 @@ contract HyperliquidGridStrategyTest is Test {
         _execAndPrep();
         vm.prank(proposer);
         strategy.initiateReturn();
+        vm.roll(block.number + 1);
         vm.prank(vault);
         strategy.settle();
         // settle already pushed DEPOSIT — confirm strategy has 0 now.
@@ -427,6 +451,7 @@ contract HyperliquidGridStrategyTest is Test {
         vm.recordLogs();
         vm.prank(proposer);
         strategy.initiateReturn();
+        vm.roll(block.number + 1);
 
         // Tracker drained for all assets
         assertEq(strategy.liveCloidsLength(BTC_ASSET), 0);
@@ -587,6 +612,7 @@ contract HyperliquidGridStrategyTest is Test {
         vm.prank(attacker);
         vm.expectRevert();
         strategy.initiateReturn();
+        vm.roll(block.number + 1);
     }
 
     function test_initiateReturn_revertsBeforeExecute() public {
@@ -594,6 +620,7 @@ contract HyperliquidGridStrategyTest is Test {
         vm.prank(proposer);
         vm.expectRevert(BaseStrategy.NotExecuted.selector);
         strategy.initiateReturn();
+        vm.roll(block.number + 1);
     }
 
     function test_initiateReturn_proposerCanCallAnytime() public {
@@ -602,6 +629,7 @@ contract HyperliquidGridStrategyTest is Test {
         m.setSummary(int64(int256(uint256(8_000e6))), uint64(2_000e6), 0, 0);
         vm.prank(proposer);
         strategy.initiateReturn();
+        vm.roll(block.number + 1);
         assertTrue(strategy.returnsInitiated());
     }
 
@@ -629,6 +657,7 @@ contract HyperliquidGridStrategyTest is Test {
         vm.prank(proposer);
         vm.expectRevert("core-writer-down");
         strategy.initiateReturn();
+        vm.roll(block.number + 1);
 
         // Flag was rolled back with the revert — proposer can retry.
         assertFalse(strategy.returnsInitiated(), "flag rolled back on drain revert");
@@ -637,6 +666,7 @@ contract HyperliquidGridStrategyTest is Test {
         vm.clearMockedCalls();
         vm.prank(proposer);
         strategy.initiateReturn();
+        vm.roll(block.number + 1);
         assertTrue(strategy.returnsInitiated(), "second attempt flips flag");
     }
 
@@ -646,10 +676,12 @@ contract HyperliquidGridStrategyTest is Test {
         m.setSummary(int64(int256(uint256(8_000e6))), uint64(2_000e6), 0, 0);
         vm.prank(proposer);
         strategy.initiateReturn();
+        vm.roll(block.number + 1);
         // Second call: silent no-op (returns) — does NOT re-fire bridge actions.
         vm.recordLogs();
         vm.prank(proposer);
         strategy.initiateReturn();
+        vm.roll(block.number + 1);
         assertEq(_countClassTransferLogs(vm.getRecordedLogs()), 0, "second initiateReturn must be no-op");
     }
 
@@ -660,6 +692,7 @@ contract HyperliquidGridStrategyTest is Test {
         vm.recordLogs();
         vm.prank(proposer);
         strategy.initiateReturn();
+        vm.roll(block.number + 1);
         assertTrue(strategy.returnsInitiated());
         assertEq(_countClassTransferLogs(vm.getRecordedLogs()), 0);
     }
@@ -673,6 +706,7 @@ contract HyperliquidGridStrategyTest is Test {
         vm.recordLogs();
         vm.prank(proposer);
         strategy.initiateReturn();
+        vm.roll(block.number + 1);
 
         (bool found, uint64 ntl, bool toPerp) = _decodeClassTransfer(vm.getRecordedLogs());
         assertTrue(found, "expected class transfer RawAction");
@@ -694,6 +728,7 @@ contract HyperliquidGridStrategyTest is Test {
         vm.recordLogs();
         vm.prank(proposer);
         strategy.initiateReturn();
+        vm.roll(block.number + 1);
 
         (bool found, uint64 ntl,) = _decodeClassTransfer(vm.getRecordedLogs());
         assertTrue(found, "expected class transfer");
@@ -712,6 +747,7 @@ contract HyperliquidGridStrategyTest is Test {
         vm.recordLogs();
         vm.prank(proposer);
         strategy.initiateReturn();
+        vm.roll(block.number + 1);
         (bool found, uint64 ntl,) = _decodeClassTransfer(vm.getRecordedLogs());
         assertTrue(found, "transfer fires even when marginUsed == equity");
         assertEq(ntl, uint64(equity), "transfers full equity");
@@ -734,6 +770,7 @@ contract HyperliquidGridStrategyTest is Test {
         m.setSummary(int64(int256(uint256(9_800e6))), uint64(0), 0, 0);
         vm.prank(proposer);
         strategy.initiateReturn();
+        vm.roll(block.number + 1);
         vm.prank(vault);
         strategy.settle();
         vm.roll(block.number + 1);
@@ -757,6 +794,7 @@ contract HyperliquidGridStrategyTest is Test {
         m.setSummary(int64(int256(uint256(1_000e6))), uint64(0), 0, 0);
         vm.prank(proposer);
         strategy.initiateReturn();
+        vm.roll(block.number + 1);
         vm.prank(vault);
         strategy.settle();
         vm.roll(block.number + 1);
@@ -846,6 +884,7 @@ contract HyperliquidGridStrategyTest is Test {
         m.setSummary(int64(int256(uint256(9_800e6))), uint64(0), 0, 0);
         vm.prank(proposer);
         strategy.initiateReturn();
+        vm.roll(block.number + 1);
         vm.prank(vault);
         strategy.settle();
         vm.roll(block.number + 1);
@@ -964,6 +1003,7 @@ contract HyperliquidGridStrategyTest is Test {
 
         vm.prank(proposer);
         strategy.initiateReturn();
+        vm.roll(block.number + 1);
 
         // Drain captured: max-update must raise high-water to 12_500e6.
         // assertEq is strict — only the new code can produce this value.
@@ -994,6 +1034,7 @@ contract HyperliquidGridStrategyTest is Test {
         vm.recordLogs();
         vm.prank(proposer);
         strategy.initiateReturn();
+        vm.roll(block.number + 1);
         // Class transfer for the full freeMargin emitted.
         (bool found, uint64 ntl,) = _decodeClassTransfer(vm.getRecordedLogs());
         assertTrue(found);

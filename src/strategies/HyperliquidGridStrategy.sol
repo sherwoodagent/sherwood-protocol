@@ -73,6 +73,7 @@ contract HyperliquidGridStrategy is BaseStrategy {
     ///         zero balance and the proposal would record a total loss while
     ///         the actual USDC arrives in N+1 as a windfall for the next LPs.
     error ReturnsNotInitiated();
+    error SettleTooSoon();
 
     // ── Action types ──
     uint8 constant ACTION_PLACE_GRID = 1;
@@ -120,6 +121,11 @@ contract HyperliquidGridStrategy is BaseStrategy {
     ///         twice (`SPOT_BALANCE` returns pre-block state). Cross-block
     ///         retries see freshly-processed state and resume normally.
     uint256 public lastRecoverBlock;
+
+    /// @notice Block in which `initiateReturn()` first ran. `_settle()` requires
+    ///         a strictly later block so the async HC→EVM bridge has had time to
+    ///         deliver (same-block phantom-loss guard).
+    uint256 public returnsInitiatedBlock;
     /// @notice High-water mark of USDC committed to HC but not yet observed
     ///         on HC by the precompile (in 6-decimal USDC units). Incremented
     ///         in `_execute` and `_onLiveDeposit` after each `bridgeUsdcToSpot`,
@@ -374,6 +380,11 @@ contract HyperliquidGridStrategy is BaseStrategy {
     ///         `ReturnsNotInitiated` rather than corrupt PnL.
     function _settle() internal override {
         if (!returnsInitiated) revert ReturnsNotInitiated();
+        // Same-block phantom-loss guard: the async HC→EVM bridge queued by
+        // `initiateReturn()` only delivers on a LATER HC block. Settling the
+        // same block pushes ~0 → phantom near-total loss a depositor could
+        // sandwich. Mirrors `HyperliquidPerpStrategy._settle`.
+        if (block.number <= returnsInitiatedBlock) revert SettleTooSoon();
 
         // Push current EVM USDC balance to the vault. Covers two cases:
         //   - HC registration failed: USDC never bridged, sits on EVM here.
@@ -431,6 +442,7 @@ contract HyperliquidGridStrategy is BaseStrategy {
         // first preserves the idempotency guarantee (re-call after a
         // successful previous call is still a no-op via the early return).
         returnsInitiated = true;
+        returnsInitiatedBlock = block.number;
         emit ReturnsInitiated();
         _drainHC();
     }
