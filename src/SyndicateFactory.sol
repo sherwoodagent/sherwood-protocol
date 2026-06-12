@@ -311,14 +311,24 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         // suggestion): a paused/misconfigured registrar would then brick ALL
         // vault creation, which is worse than shipping ENS-less + an event.
         if (address(ensRegistrar) != address(0)) {
-            if (ensRegistrar.available(config.subdomain)) {
-                try ensRegistrar.register(config.subdomain, vault) {}
-                catch {
+            // F4: the `available()` view is itself an external call into a
+            // possibly-paused / misconfigured / non-conforming registrar. It
+            // MUST be in try/catch too — otherwise a reverting view bricks ALL
+            // vault creation, the exact DoS the `register` catch (and the note
+            // above) is meant to prevent.
+            try ensRegistrar.available(config.subdomain) returns (bool avail) {
+                if (avail) {
+                    try ensRegistrar.register(config.subdomain, vault) {}
+                    catch {
+                        emit EnsRegistrationFailed(vault, config.subdomain);
+                    }
+                } else {
+                    // Label already taken upstream (front-run or prior external
+                    // registration). Skip the doomed call; signal for retry/triage.
                     emit EnsRegistrationFailed(vault, config.subdomain);
                 }
-            } else {
-                // Label already taken upstream (front-run or prior external
-                // registration). Skip the doomed call; signal for retry/triage.
+            } catch {
+                // Registrar `available()` faulted — fail open, stay operational.
                 emit EnsRegistrationFailed(vault, config.subdomain);
             }
         }

@@ -116,6 +116,22 @@ contract SyndicateFactoryTest is Test {
         assertEq(address(uint160(uint256(vm.load(address(vault), bytes32(uint256(3)))))), address(executorLib));
     }
 
+    /// @notice F4 — a reverting registrar `available()` view must NOT brick
+    ///         vault creation. PR #359 #7 wrapped `register()` in try/catch but
+    ///         left the `available()` pre-check unguarded, so a paused / non-
+    ///         conforming registrar still reverted the whole `createSyndicate`.
+    ///         The syndicate must come up ENS-less instead.
+    function test_createSyndicate_succeedsWhenRegistrarAvailableReverts() public {
+        ensRegistrar.setRevertOnAvailable(true);
+
+        vm.prank(creator1);
+        (uint256 id, address vaultAddr) = factory.createSyndicate(creator1AgentId, _configWithSubdomain("ens-fault"));
+
+        assertEq(id, 1, "syndicate still created");
+        assertTrue(vaultAddr != address(0), "vault created despite reverting registrar available()");
+        assertFalse(ensRegistrar.isRegistered("ens-fault"), "ENS skipped when available() faults");
+    }
+
     function test_createSyndicate_notAgentOwner_reverts() public {
         // creator2 tries to use creator1's agent ID
         vm.prank(creator2);
