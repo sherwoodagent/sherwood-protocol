@@ -251,6 +251,7 @@ contract HyperliquidGridForkTest is HyperEVMIntegrationTest {
         MockAccountMarginSummaryPrecompile(precompileAddr).setSummary(int64(int256(uint256(300e6))), 0, 0, 0);
         vm.recordLogs();
         strategy.initiateReturn();
+        vm.roll(block.number + 1);
         (bool found2, uint64 ntl2,) = _decodeClassTransfer(vm.getRecordedLogs());
         assertTrue(found2, "initiateReturn must emit a class transfer");
         assertEq(ntl2, uint64(300e6), "initiateReturn amount must match updated precompile equity");
