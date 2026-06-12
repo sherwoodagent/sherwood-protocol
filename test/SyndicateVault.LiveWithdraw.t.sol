@@ -216,8 +216,17 @@ contract VaultLiveWithdrawTest is Test {
         vm.prank(alice);
         vault.withdraw(500e6, alice, alice);
 
+        // The PULL from the adapter is deficit-only (300) — the vault never asks
+        // for more than it needs.
         assertEq(adapter.lastOnLiveWithdrawArg(), 300e6, "pull is deficit-only, not full withdraw amount");
-        assertEq(vault.liveAdapterWithdrawn(PID), 300e6, "accumulator reflects deficit only");
+        // But the settle accumulator must credit the full LP payout (500), not
+        // just the adapter deficit (300). The 200 float consumed here was part of
+        // the execute-time capital snapshot; crediting only the 300 deficit would
+        // make settle read a 200 phantom LOSS (balanceAdjusted = balanceOf + 300 <
+        // snapshot). Campaign finding F1: `liveAdapterWithdrawn` tracks assets that
+        // leave the vault to LPs, regardless of whether float or the adapter
+        // sourced them.
+        assertEq(vault.liveAdapterWithdrawn(PID), 500e6, "accumulator reflects the full LP payout");
     }
 
     // ──────────────────────── failure modes ────────────────────────

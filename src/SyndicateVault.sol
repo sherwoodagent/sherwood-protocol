@@ -753,7 +753,10 @@ contract SyndicateVault is
             uint256 reserve = reservedQueueAssets();
             uint256 float = IERC20(asset()).balanceOf(address(this));
             if (assets + reserve > float) {
-                if (!_pullFromLiveAdapter(assets + reserve - float)) revert QueueReserveBreached();
+                // Pull enough to cover both the LP payout AND top the float back
+                // up to the queue reserve, but only credit the payout (`assets`)
+                // to the settle accumulator — see `_pullFromLiveAdapter`.
+                if (!_pullFromLiveAdapter(assets + reserve - float, assets)) revert QueueReserveBreached();
             }
         }
         super._withdraw(caller, receiver, _owner, assets, shares);
@@ -764,7 +767,7 @@ contract SyndicateVault is
     ///      delta against the active proposal so settlement PnL stays
     ///      neutral on LP flow. Falls back to false on: not locked, no
     ///      adapter, adapter reverting, partial fill.
-    function _pullFromLiveAdapter(uint256 needed) private returns (bool) {
+    function _pullFromLiveAdapter(uint256 needed, uint256 exitAmount) private returns (bool) {
         (bool blocked, address adapter,) = _lpFlowGate();
         if (blocked || adapter == address(0)) return false;
         uint256 before = IERC20(asset()).balanceOf(address(this));
@@ -775,14 +778,19 @@ contract SyndicateVault is
         uint256 received = IERC20(asset()).balanceOf(address(this)) - before;
         if (received < needed) return false;
         uint256 pid = ISyndicateGovernor(_getGovernor()).getActiveProposal(address(this));
-        // Sherlock #2: credit against the requested `needed`, not the
-        // possibly-larger `received`. Excess (a misbehaving / generous
-        // adapter sending back > needed) stays in the vault's float and is
-        // accounted once at settle via the standard balance diff — crediting
-        // `received` here would double-count it (once in `liveAdapterWithdrawn`,
-        // once in settle's `balanceAdjusted`) and inflate proposal PnL,
-        // overpaying performance/management/protocol fees out of LP funds.
-        liveAdapterWithdrawn[pid] += needed;
+        // Credit ONLY the assets that leave the vault to the LP (`exitAmount`),
+        // never the full `needed` pulled from the adapter. `needed` also covers
+        // the queue-reserve top-up (`reserve - float`), which stays in vault
+        // float and is already counted once at settle via `balanceAdjusted`.
+        // By conservation (adapter + float + paidOut = snapshot + principal) the
+        // settle formula `balanceAdjusted = balanceOf + liveAdapterWithdrawn`
+        // nets to true PnL only when `liveAdapterWithdrawn` equals the total LP
+        // payout. Crediting `needed` double-counts the reserve top-up → phantom
+        // profit → over-paid performance/management/protocol/guardian fees out
+        // of LP funds (campaign finding F1). Sherlock #2: the same reasoning
+        // bounds the credit below `received` — a generous adapter sending back
+        // more than `needed` leaves the excess in float, counted once at settle.
+        liveAdapterWithdrawn[pid] += exitAmount;
         return true;
     }
 
