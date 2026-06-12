@@ -374,9 +374,54 @@ contract OpenProposalCountTest is Test {
         governor.resolveProposalState(pid);
         assertEq(governor.openProposalCount(address(vault)), 0, "counter == 0 after flush");
 
+        // PR #359 review #1: the lazy-resolution `_decOpen` MUST also bump
+        // `_lastSettledAt` so the settle cooldown gates the next execute.
+        // Pre-fix this branch decremented the counter WITHOUT the bump,
+        // letting propose→resolve→propose→execute skip the cooldown.
+        // `getCooldownEnd == now + COOLDOWN_PERIOD` proves the bump landed.
+        assertEq(
+            governor.getCooldownEnd(address(vault)),
+            vm.getBlockTimestamp() + COOLDOWN_PERIOD,
+            "resolveProposalState must bump _lastSettledAt (PR #359 #1)"
+        );
+
         // Owner can now rage-quit.
         vm.prank(owner);
         swood.requestUnstakeOwner(address(vault));
+    }
+
+    /// @notice PR #359 review #1 — the permissionless lazy-resolution path
+    ///         (`resolveProposalState` → `_resolveState` → `_decOpen`) bumps
+    ///         the settle cooldown identically to the explicit cancel/veto
+    ///         paths. Pre-fix it was the lone `_decOpen` site without the
+    ///         `_lastSettledAt` write, so a guardian-blocked / expired
+    ///         proposal left the cooldown un-armed.
+    function test_resolveProposalState_armsCooldownLikeVeto() public {
+        // Path A: explicit veto bumps the cooldown.
+        uint256 pidA = _propose();
+        vm.prank(owner);
+        governor.vetoProposal(pidA);
+        uint256 cooldownAfterVeto = governor.getCooldownEnd(address(vault));
+
+        // Same vault, fresh proposal, drive it to lazy Rejected via vote-veto.
+        uint256 pidB = _propose();
+        vm.warp(vm.getBlockTimestamp() + 1);
+        vm.prank(lp1);
+        governor.vote(pidB, ISyndicateGovernor.VoteType.Against);
+        vm.prank(lp2);
+        governor.vote(pidB, ISyndicateGovernor.VoteType.Against);
+        vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
+
+        // Path B: permissionless flush must arm the cooldown to NOW too.
+        governor.resolveProposalState(pidB);
+        assertEq(
+            governor.getCooldownEnd(address(vault)),
+            vm.getBlockTimestamp() + COOLDOWN_PERIOD,
+            "lazy-resolution path arms cooldown (PR #359 #1)"
+        );
+        assertGt(
+            governor.getCooldownEnd(address(vault)), cooldownAfterVeto, "cooldown advanced past the earlier veto stamp"
+        );
     }
 
     function test_resolveProposalState_flushesExpiredApproved() public {

@@ -316,6 +316,60 @@ contract StakedWoodSlashingTest is Test {
         assertEq(wood.balanceOf(alice) - balBefore, 150e18, "unbonding delegator diluted");
     }
 
+    /// @notice PR #359 review #2 — the unbonding-pool slash is capped by the
+    ///         OPENED-AT delegated budget, not the full live unbonding pool.
+    ///         A delegator who joins AFTER `openedAt` and then unbonds is
+    ///         excluded from `snapDelegated`, so the combined delegated slash
+    ///         (live + unbonding) never exceeds `mulDiv(snapDelegated, slashBps)`.
+    ///         Pre-fix the live pool was snapshot-capped but the unbonding
+    ///         burn was the full pool — the asymmetry this closes.
+    function test_unbonding_postOpenDelegator_cappedBySnapshot() public {
+        vm.prank(bob);
+        swood.stakeAsGuardian(10_000e18, 1);
+
+        // Alice delegates 300 BEFORE open — the at-open delegated exposure.
+        vm.prank(alice);
+        swood.delegateStake(bob, 300e18);
+
+        // Advance a block, then snapshot the open timestamp (only alice counts).
+        vm.warp(vm.getBlockTimestamp() + 1);
+        uint256 openedAt = vm.getBlockTimestamp();
+
+        // Carol delegates 200 AFTER open — excluded from `snapDelegated`.
+        vm.warp(vm.getBlockTimestamp() + 1);
+        vm.prank(carol);
+        swood.delegateStake(bob, 200e18);
+        assertEq(swood.getPastDelegatedInbound(bob, openedAt), 300e18, "snapDelegated = alice only");
+
+        // Both delegators unbond — live pool empties, unbonding pool = 500.
+        vm.prank(alice);
+        swood.requestUnstakeDelegation(bob);
+        vm.prank(carol);
+        swood.requestUnstakeDelegation(bob);
+        assertEq(swood.poolTokens(bob), 0, "live pool empty");
+        assertEq(swood.unbondingPoolTokens(bob), 500e18, "unbonding = alice 300 + carol 200");
+
+        // Registry mirrors bob's combined vote weight at open (own 10k + del 300).
+        vm.prank(registry);
+        swood.recordVoteStake(11, bob, 10_300e18);
+
+        // Slash 10% with the REAL openedAt.
+        address[] memory approvers = new address[](1);
+        approvers[0] = bob;
+        vm.prank(registry);
+        uint256 total = swood.slashGuardians(11, openedAt, approvers, 1000);
+
+        // Budget = 10% of the at-open delegated exposure (300) = 30. Live pool
+        // is empty so the whole budget spills to the unbonding pool. Pre-fix
+        // the unbonding slash was 10% of the FULL 500 = 50 (over by 20).
+        uint256 budget = (300e18 * 1000) / 10_000; // 30e18
+        assertEq(swood.unbondingPoolTokens(bob), 500e18 - budget, "unbonding slashed by at-open budget only");
+
+        // own 10% of 10k = 1k; delegated total = budget (0 live + 30 unbonding).
+        assertEq(total, 1_000e18 + budget, "own 1k + capped delegated budget");
+        assertLe(total - 1_000e18, budget, "combined delegated slash <= snapshot budget (PR #359 #2)");
+    }
+
     /// @notice `cancelUnstakeDelegation` after the unbonding pool was slashed
     ///         re-bonds at the SLASHED unbonding rate — the leaver eats the hit
     ///         even on the re-entry path.

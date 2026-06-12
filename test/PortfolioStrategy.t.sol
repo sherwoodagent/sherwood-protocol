@@ -15,12 +15,22 @@ import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 ///      encoded as `(bytes32 feedId, int192 price)`; the mock echoes the
 ///      feedId so per-slot binding can be exercised.
 contract MockVerifierProxy {
+    /// @dev PR #359 review #3: signed offset applied to `observationsTimestamp`
+    ///      to simulate DON / sequencer clock skew (positive = future-dated).
+    ///      Default 0 → reports observed exactly at `block.timestamp`.
+    int256 public obsSkew;
+
+    function setObsSkew(int256 s) external {
+        obsSkew = s;
+    }
+
     function verify(bytes calldata signedReport) external payable returns (bytes memory) {
         (bytes32 feedId, int192 price) = abi.decode(signedReport, (bytes32, int192));
+        uint256 observedAt = uint256(int256(block.timestamp) + obsSkew);
         ChainlinkReport memory report = ChainlinkReport({
             feedId: feedId,
             validFromTimestamp: uint32(block.timestamp),
-            observationsTimestamp: uint32(block.timestamp),
+            observationsTimestamp: uint32(observedAt),
             nativeFee: 0,
             linkFee: 0,
             expiresAt: uint32(block.timestamp + 300),
@@ -726,6 +736,34 @@ contract PortfolioStrategyTest is Test {
         (uint256 value, bool valid) = strategy.positionValue();
         assertEq(value, 0);
         assertFalse(valid);
+    }
+
+    /// @notice PR #359 review #3 — a future-dated observation timestamp (DON /
+    ///         sequencer clock skew on 2s Base blocks) must NOT underflow-revert
+    ///         the consumer-side `block.timestamp - cachedPriceUpdatedAt`
+    ///         staleness check. The `_cachePrice` clamp stores
+    ///         `min(observedAt, block.timestamp)`, so a slightly-future report
+    ///         caches as "now" and `positionValue` fails closed / stays valid
+    ///         instead of reverting. Pre-fix this was impossible (the cache
+    ///         always wrote `block.timestamp`); the PR #351 #4 observation-
+    ///         timestamp change introduced the regression.
+    function test_positionValue_futureDatedObservation_doesNotRevert() public {
+        _executeStrategy();
+        // Report observed 2s AHEAD of chain time.
+        verifier.setObsSkew(2);
+
+        bytes[] memory reports = new bytes[](3);
+        reports[0] = _signedReport(0, int192(int256(0.01e18)));
+        reports[1] = _signedReport(1, int192(int256(0.02e18)));
+        reports[2] = _signedReport(2, int192(int256(0.005e18)));
+
+        // Pre-fix: cachedPriceUpdatedAt = now+2 > block.timestamp →
+        // `positionValue`'s `nowTs - ts` underflow-reverts. Post-fix: clamped.
+        strategy.refreshPrices(reports);
+
+        (uint256 value, bool valid) = strategy.positionValue();
+        assertTrue(valid, "future-dated obs clamped to now -> still valid (PR #359 #3)");
+        assertApproxEqRel(value, TOTAL_AMOUNT, 0.01e18);
     }
 
     function test_positionValue_partialCache_returnsInvalid() public {

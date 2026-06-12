@@ -306,7 +306,26 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         uint256 totalW = sw.getPastVotes(approver, uint256(r.openedAt));
         uint256 delegatedW = sw.getPastDelegatedInbound(approver, uint256(r.openedAt));
         uint256 ownW = totalW - delegatedW;
-        if (ownW == 0) revert NotActiveGuardian();
+
+        // PR #351 review #3: when `ownW == 0` (reachable via
+        // unstake-then-restake around `openedAt` while inbound delegations
+        // still cover the vote-gate), pre-fix this reverted `NotActiveGuardian`.
+        // The revert bricked the entire claim path AND
+        // `claimDelegatorProposalReward` (since `_delegatorProposalPool` is
+        // only seeded inside this function at the write below). The approver's
+        // gross slice + the delegators' pool were stranded in the registry
+        // forever.
+        //
+        // Fix: drop the revert and route 100% of the slice to the delegator
+        // pool — the approver had no own-stake skin in the game at `openedAt`
+        // and didn't earn DPoS commission for that snapshot. The
+        // `grossFromOwn = (gross * ownW) / w` math below collapses to 0
+        // naturally; the inline `ownW == 0 ? 0 : getPastCommission(...)`
+        // ternary at the commission-rate read forces commission to 0 as well,
+        // so the entire `gross` lands in `remainder` and seeds the delegator
+        // pool at the `_delegatorProposalPool` write below. (PR #359 review #6:
+        // comment was referencing a non-existent `_zeroCommissionIfOwnIsZero`
+        // flag — the impl is the ternary.)
 
         uint256 gross;
         uint256 commission;
@@ -327,7 +346,12 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
             uint256 grossFromOwn = (gross * ownW) / w;
             uint256 grossFromDelegated = gross - grossFromOwn;
 
-            uint256 rate = sw.getPastCommission(approver, uint256(pool.settledAt));
+            // PR #351 review #3: zero commission when there was no own stake
+            // at `openedAt`. Otherwise an approver could game the gate via
+            // unstake-restake and still skim a commission rate they didn't
+            // earn as a validator. The full delegated portion lands in
+            // `remainder` and seeds the delegator pool below.
+            uint256 rate = ownW == 0 ? 0 : sw.getPastCommission(approver, uint256(pool.settledAt));
             commission = (grossFromDelegated * rate) / BPS_DENOMINATOR;
             approverPayout = grossFromOwn + commission;
             remainder = grossFromDelegated - commission;

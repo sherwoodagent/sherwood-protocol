@@ -415,17 +415,15 @@ contract PortfolioStrategy is BaseStrategy {
         // current-value snapshot, propagating into target / overweight /
         // underweight math.
         uint256 totalValue;
-        uint256 nowTs = block.timestamp;
         uint256 assetDec = uint256(_assetDecimals);
         for (uint256 i; i < len; ++i) {
-            snap.prices[i] = _verifyPrice(i, priceReports[i]);
-            snap.currentValues[i] = _tokensToValue(snap.oldBalances[i], snap.prices[i], i, assetDec);
+            (uint256 price, uint32 observedAt) = _verifyPrice(i, priceReports[i]);
+            snap.prices[i] = price;
+            snap.currentValues[i] = _tokensToValue(snap.oldBalances[i], price, i, assetDec);
             totalValue += snap.currentValues[i];
-            address tok = _allocations[i].token;
-            cachedPrice[tok] = snap.prices[i];
-            cachedPriceUpdatedAt[tok] = nowTs;
+            _cachePrice(_allocations[i].token, price, observedAt);
         }
-        emit PricesRefreshed(nowTs);
+        emit PricesRefreshed(block.timestamp);
         // Include any asset balance already held (e.g. from previous partial rebalances).
         totalValue += IERC20(asset).balanceOf(address(this));
 
@@ -599,7 +597,15 @@ contract PortfolioStrategy is BaseStrategy {
     ///      expected id BEFORE returning the price, so a valid-but-mismatched
     ///      report (e.g. WBTC's $80k report into the AAPL slot) cannot
     ///      inflate cached NAV.
-    function _verifyPrice(uint256 i, bytes calldata signedReport) internal returns (uint256 price) {
+    /// @return price                  Raw oracle units (see `_positionValue` scaling).
+    /// @return observationsTimestamp  Source-of-truth timestamp the report was OBSERVED
+    ///                                at by Chainlink (NOT `block.timestamp`). Cached so
+    ///                                downstream `MAX_PRICE_AGE` gates measure true
+    ///                                observation age — PR #351 review #4.
+    function _verifyPrice(uint256 i, bytes calldata signedReport)
+        internal
+        returns (uint256 price, uint32 observationsTimestamp)
+    {
         if (chainlinkVerifier == address(0)) revert ZeroAddress();
 
         bytes memory verifierResponse = IVerifierProxy(chainlinkVerifier).verify(signedReport);
@@ -610,11 +616,22 @@ contract PortfolioStrategy is BaseStrategy {
         if (block.timestamp > report.expiresAt) revert StalePrice();
         if (report.price <= 0) revert InvalidAmount();
 
+        // PR #351 review #4: enforce the documented 5-minute freshness
+        // guarantee against the REPORT'S OBSERVATION TIME — not
+        // `block.timestamp`. Pre-fix a stale-but-unexpired signed report
+        // (`expiresAt` is the report-producer's chosen window, can be hours)
+        // wrote `cachedPriceUpdatedAt = block.timestamp`, so the downstream
+        // `MAX_PRICE_AGE` check passed even when the observation was much
+        // older. Effective staleness collapsed to `MAX_PRICE_AGE + expiresAt
+        // window` — feeding the live-NAV gate.
+        if (block.timestamp > uint256(report.observationsTimestamp) + MAX_PRICE_AGE) revert StalePrice();
+
         // Chainlink prices are int192 with the report's declared decimals (8 for
         // tokenized stocks, 18 for crypto pairs). The raw oracle units are
         // preserved here; decimal-correct scaling happens in `_positionValue`
         // using the per-allocation `_priceDecimals` declared at init.
         price = uint256(uint192(report.price));
+        observationsTimestamp = report.observationsTimestamp;
     }
 
     /// @notice Verify a batch of signed Chainlink Data Streams reports and
@@ -628,14 +645,35 @@ contract PortfolioStrategy is BaseStrategy {
     function refreshPrices(bytes[] calldata reports) external {
         uint256 len = _allocations.length;
         if (reports.length != len) revert LengthMismatch();
-        uint256 nowTs = block.timestamp;
         for (uint256 i; i < len; ++i) {
-            uint256 price = _verifyPrice(i, reports[i]);
-            address tok = _allocations[i].token;
-            cachedPrice[tok] = price;
-            cachedPriceUpdatedAt[tok] = nowTs;
+            (uint256 price, uint32 observedAt) = _verifyPrice(i, reports[i]);
+            _cachePrice(_allocations[i].token, price, observedAt);
         }
-        emit PricesRefreshed(nowTs);
+        emit PricesRefreshed(block.timestamp);
+    }
+
+    /// @dev Single chokepoint for the verify→cache write, shared by
+    ///      `refreshPrices` and the `rebalanceDelta` snapshot loop (PR #359
+    ///      review #7 — the two loops previously wrote `cachedPrice` /
+    ///      `cachedPriceUpdatedAt` byte-identically; the original
+    ///      observation-timestamp bug existed because they wrote
+    ///      `block.timestamp` independently).
+    ///
+    ///      PR #359 review #3: cache the OBSERVATION timestamp (PR #351 review
+    ///      #4) but CLAMP it to `block.timestamp`. A signed report whose
+    ///      `observationsTimestamp` is slightly AHEAD of chain time (DON /
+    ///      sequencer clock skew on 2s Base blocks) would otherwise write
+    ///      `cachedPriceUpdatedAt > block.timestamp`, and the consumer-side
+    ///      `block.timestamp - cachedPriceUpdatedAt` staleness check in
+    ///      `_positionValue` / the rebalance-sell loop would UNDERFLOW-revert
+    ///      (Solidity 0.8) instead of failing closed `(0,false)` / `0` —
+    ///      DoS-ing live NAV / withdraws until block time catches up. A
+    ///      slightly-future report is still fresh; treating it as "now" is the
+    ///      safe direction.
+    function _cachePrice(address tok, uint256 price, uint32 observedAt) private {
+        cachedPrice[tok] = price;
+        uint256 obs = uint256(observedAt);
+        cachedPriceUpdatedAt[tok] = obs > block.timestamp ? block.timestamp : obs;
     }
 
     // ── View functions ──

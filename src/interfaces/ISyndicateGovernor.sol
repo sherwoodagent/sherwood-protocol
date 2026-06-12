@@ -211,7 +211,11 @@ interface ISyndicateGovernor {
 
     event EmergencySettled(uint256 indexed proposalId, address indexed vault, int256 pnl, uint256 customCallCount);
 
-    event GuardianRegistrySet(address indexed oldRegistry, address indexed newRegistry);
+    // PR #351 review #1: GuardianRegistrySet event removed alongside the
+    // `setGuardianRegistry` setter. Repointing mid-proposal silently
+    // auto-Approved blocked reviews — same hazard class as V-H2. The
+    // registry slot is now write-only at `initialize`; migration happens
+    // through a governor UUPS upgrade.
 
     // ── Fee-distribution resilience events (W-1) ──
     /// @notice Emitted when a per-recipient fee transfer in `_distributeFees` /

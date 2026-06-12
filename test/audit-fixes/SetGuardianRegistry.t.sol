@@ -75,25 +75,24 @@ contract SetGuardianRegistryTest is Test {
         governor.setFactory(address(factory));
     }
 
-    function test_governor_setGuardianRegistry_succeedsForOwner() public {
-        assertEq(governor.guardianRegistry(), address(initialRegistry));
+    /// @notice PR #351 review #1: `governor.setGuardianRegistry` was REMOVED.
+    ///         Repointing mid-proposal silently auto-Approved any blocked
+    ///         review (the new registry's `!r.opened` branch in
+    ///         `resolveReview` returned `blocked=false`, discarding every
+    ///         Block vote AND the approver slash). Same hazard class as V-H2
+    ///         (which removed the factory's `setGovernor`). The legitimate
+    ///         beta-stub → real-registry migration path is a governor UUPS
+    ///         upgrade that writes the new address in its initializer, not a
+    ///         setter. The factory's `setGuardianRegistry` is preserved (it
+    ///         only gates new vault creation + `rotateOwner`, not in-flight
+    ///         reviews, and Sherlock #28 added a factory-alignment check).
+    function test_governor_setGuardianRegistry_doesNotExist() public {
+        // The governor proxy has no `setGuardianRegistry(address)` selector.
+        bytes memory data = abi.encodeWithSignature("setGuardianRegistry(address)", address(replacementRegistry));
         vm.prank(owner);
-        vm.expectEmit(true, true, false, false);
-        emit ISyndicateGovernor.GuardianRegistrySet(address(initialRegistry), address(replacementRegistry));
-        governor.setGuardianRegistry(address(replacementRegistry));
-        assertEq(governor.guardianRegistry(), address(replacementRegistry));
-    }
-
-    function test_governor_setGuardianRegistry_revertsForAttacker() public {
-        vm.prank(attacker);
-        vm.expectRevert();
-        governor.setGuardianRegistry(address(replacementRegistry));
-    }
-
-    function test_governor_setGuardianRegistry_revertsOnZero() public {
-        vm.prank(owner);
-        vm.expectRevert(ISyndicateGovernor.ZeroAddress.selector);
-        governor.setGuardianRegistry(address(0));
+        (bool ok,) = address(governor).call(data);
+        assertFalse(ok, "setGuardianRegistry MUST be absent (PR #351 review #1)");
+        assertEq(governor.guardianRegistry(), address(initialRegistry), "registry slot unchanged");
     }
 
     function test_factory_setGuardianRegistry_succeedsForOwner() public {
