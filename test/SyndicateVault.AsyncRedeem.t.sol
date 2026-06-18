@@ -71,6 +71,15 @@ contract VaultAsyncRedeemTest is Test {
         );
     }
 
+    /// @dev Simulate the governor settling proposal 1: clear the lock and stamp
+    ///      the realized frozen price into the queue (Lane B settlement). After
+    ///      this, requests tagged to pid 1 are claimable at the frozen price.
+    function _settle() internal {
+        _setProposalActive(false);
+        vm.prank(MOCK_GOVERNOR);
+        vault.onProposalSettled(1);
+    }
+
     function test_setWithdrawalQueue_onlyFactory() public {
         // Already set by setUp via test contract (factory). A non-factory call must revert.
         VaultWithdrawalQueue q2 = new VaultWithdrawalQueue(address(vault));
@@ -112,7 +121,7 @@ contract VaultAsyncRedeemTest is Test {
 
         IVaultWithdrawalQueue.Request memory r = queue.getRequest(reqId);
         assertEq(r.owner, alice);
-        assertEq(uint256(r.shares), shares / 2);
+        assertEq(r.amount, shares / 2);
     }
 
     function test_requestRedeem_zeroSharesReverts() public {
@@ -224,7 +233,7 @@ contract VaultAsyncRedeemTest is Test {
         vault.requestRedeem(aliceShares / 2, alice);
 
         // Settle (lock cleared)
-        _setProposalActive(false);
+        _settle();
 
         uint256 reserve = vault.reservedQueueAssets();
         uint256 float = usdc.balanceOf(address(vault));
@@ -248,7 +257,7 @@ contract VaultAsyncRedeemTest is Test {
         _setProposalActive(true);
         vm.prank(alice);
         vault.requestRedeem(aliceShares, alice); // queue ALL of alice
-        _setProposalActive(false);
+        _settle();
 
         // Bob tries to withdraw far more than `maxWithdraw(bob)` (which is
         // capped by `float - reserve`). EIP-4626 conformance requires the OZ
@@ -268,7 +277,7 @@ contract VaultAsyncRedeemTest is Test {
         _setProposalActive(true);
         vm.prank(alice);
         uint256 reqId = vault.requestRedeem(aliceShares, alice);
-        _setProposalActive(false);
+        _settle();
 
         // Even though reservedQueueAssets > 0 and float == reserve,
         // the queue MUST be able to claim and drain the reserve to alice.
@@ -285,7 +294,7 @@ contract VaultAsyncRedeemTest is Test {
         _setProposalActive(true);
         vm.prank(alice);
         vault.requestRedeem(aliceShares / 2, alice); // half escrowed
-        _setProposalActive(false);
+        _settle();
 
         uint256 cap = vault.maxRedeem(alice);
         // Alice has aliceShares/2 left; reserve cap shouldn't exceed her balance either
@@ -310,7 +319,7 @@ contract VaultAsyncRedeemTest is Test {
         _setProposalActive(true);
         vm.prank(alice);
         vault.requestRedeem(aliceShares, alice);
-        _setProposalActive(false);
+        _settle();
 
         // Bob requests far more shares than `maxRedeem(bob)` permits.
         uint256 bigShares = aliceShares; // alice's worth of shares

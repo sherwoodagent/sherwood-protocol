@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
+import {Position} from "./IPriceRouter.sol";
+
 /**
  * @title IStrategy
  * @notice Interface for strategy contracts called by the vault via batch calls.
@@ -51,76 +53,11 @@ interface IStrategy {
     /// @notice Human-readable name of the strategy template
     function name() external view returns (string memory);
 
-    /// @notice Best-estimate current value of the strategy's position,
-    ///         denominated in the vault's asset() token.
-    /// @dev    The frontend reads this to display mid-strategy unrealized
-    ///         P&L without hardcoding a detector per strategy type.
-    ///
-    ///         Called as a `view` only — never trust this number as a
-    ///         fee or settlement basis. Pool spot prices (AMM quotes)
-    ///         are sandwichable; the return value may swing across
-    ///         blocks on thin liquidity.
-    ///
-    /// @return value Position value in the vault asset's units
-    ///               (e.g. USDC has 6 decimals, WETH has 18).
-    /// @return valid Whether `value` is computable for this strategy on
-    ///               this chain right now. `false` signals the frontend
-    ///               should hide the live P&L readout rather than
-    ///               render a misleading $0. Returned false before
-    ///               execute, after settle, and for strategies whose
-    ///               current position isn't queryable from this contract
-    ///               (external loans, offchain perps, etc.).
-    function positionValue() external view returns (uint256 value, bool valid);
-
-    /// @notice Vault hook: called from `vault._deposit` when the strategy is the
-    ///         active adapter and reports live NAV. Lets the strategy absorb the
-    ///         new capital into its position so it earns yield immediately
-    ///         instead of sitting as idle vault float.
-    /// @dev    `onlyVault` enforced by `BaseStrategy`. Default impl in
-    ///         `BaseStrategy` is a no-op for strategies that cannot route
-    ///         mid-position capital (Mamo, Venice, off-chain).
-    /// @dev    **MANDATORY for any contract passed as the `strategy` field on
-    ///         a proposal.** The vault calls this unguarded after pushing the
-    ///         deposited assets to the strategy. A strategy whose
-    ///         `positionValue()` returns `valid=true` but that lacks a
-    ///         non-reverting `onLiveDeposit` implementation will revert every
-    ///         LP deposit during its `Executed` window. A no-op override is
-    ///         sufficient if the strategy cannot route the capital — assets
-    ///         then sit idle on the strategy and are reclaimed at settle via
-    ///         the `liveAdapterPrincipal[pid]` accounting on the vault.
-    ///         Inheriting `BaseStrategy` satisfies this requirement by default.
-    /// @param  assets Amount of vault asset just deposited.
-    function onLiveDeposit(uint256 assets) external;
-
-    /// @notice Vault hook: called from `vault._withdraw` when an LP exit
-    ///         during the active proposal exceeds the vault's idle float.
-    ///         Optional — strategies that cannot partial-unwind on demand
-    ///         inherit the `BaseStrategy` default which returns 0.
-    ///
-    ///         All-or-nothing semantics: the vault verifies the asset
-    ///         balance delta and reverts the entire LP withdraw if less
-    ///         than `assetsNeeded` arrived. The LP then falls back to the
-    ///         async-redeem queue, which always works while the vault is
-    ///         locked and pays out at settle.
-    /// @dev    `onlyVault` enforced by `BaseStrategy`. The strategy MUST
-    ///         transfer the underlying asset directly to `msg.sender` (the
-    ///         vault) before returning — the vault does not call
-    ///         `transferFrom`.
-    /// @param  assetsNeeded Shortfall the vault wants pulled back, in
-    ///                      asset units.
-    /// @return assetsReturned Self-reported amount transferred. The vault
-    ///                        ignores this and uses its own balance delta
-    ///                        as the authoritative measure.
-    function onLiveWithdraw(uint256 assetsNeeded) external returns (uint256 assetsReturned);
-
-    /// @notice Sherlock #37 capability flag — strategies override to `true`
-    ///         when their `_onLiveWithdraw` can actually free underlying
-    ///         from the live position. The vault reads this on
-    ///         `maxWithdraw` / `maxRedeem` so it doesn't quote a
-    ///         withdraw size that the adapter can't fulfill.
-    ///         Default `false` in `BaseStrategy` — strategies without a
-    ///         partial-unwind path (e.g. Hyperliquid, Mamo) keep the false
-    ///         default and the vault clamps `maxWithdraw` to float-only
-    ///         while a proposal is active.
-    function supportsLiveWithdraw() external view returns (bool);
+    /// @notice The strategy's on-venue positions, for vault-side pricing (Lane A).
+    /// @dev    Reports WHERE/WHAT the strategy holds (venue + kind + locator) —
+    ///         never a self-reported value. The vault prices these via the
+    ///         PriceRouter; the strategy is never trusted for value. The default
+    ///         (BaseStrategy) returns an empty array (queue-only / Lane B);
+    ///         strategies with on-chain-priceable positions override it.
+    function positions() external view returns (Position[] memory);
 }

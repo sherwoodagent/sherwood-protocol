@@ -65,12 +65,14 @@ contract AsyncRedeemInvariantsTest is StdInvariant, Test {
         handler = new AsyncRedeemHandler(vault, queue, IERC20(address(usdc)), MOCK_GOVERNOR);
         targetContract(address(handler));
 
-        bytes4[] memory selectors = new bytes4[](5);
+        bytes4[] memory selectors = new bytes4[](7);
         selectors[0] = AsyncRedeemHandler.deposit.selector;
         selectors[1] = AsyncRedeemHandler.requestRedeem.selector;
-        selectors[2] = AsyncRedeemHandler.claimRandom.selector;
-        selectors[3] = AsyncRedeemHandler.cancelRandom.selector;
-        selectors[4] = AsyncRedeemHandler.setLocked.selector;
+        selectors[2] = AsyncRedeemHandler.requestDeposit.selector;
+        selectors[3] = AsyncRedeemHandler.claimRandom.selector;
+        selectors[4] = AsyncRedeemHandler.cancelRandom.selector;
+        selectors[5] = AsyncRedeemHandler.lock.selector;
+        selectors[6] = AsyncRedeemHandler.settle.selector;
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
     }
 

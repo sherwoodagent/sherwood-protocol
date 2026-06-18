@@ -116,9 +116,9 @@ contract MamoYieldStrategy is BaseStrategy {
         revert NoTunableParams();
     }
 
-    // ── positionValue ──
-    // Inherits BaseStrategy's (0, false) default. The Mamo strategy
-    // instance only exposes `deposit` / `withdraw` / `withdrawAll` — no
-    // public balance or value getter — so there is no onchain path to
-    // a current position value until Mamo adds one upstream.
+    // ── Lane B only ──
+    // Inherits BaseStrategy's empty `positions()` default (queue-only). The
+    // Mamo instance only exposes `deposit` / `withdraw` / `withdrawAll` — no
+    // public balance getter — so there is no on-chain locator the PriceRouter
+    // could value, until Mamo adds one upstream.
 }

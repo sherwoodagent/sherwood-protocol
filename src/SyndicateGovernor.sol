@@ -1011,16 +1011,12 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
         address vault = proposal.vault;
         address asset = IERC4626(vault).asset();
 
-        // Asset-only measurement (see NatSpec above). Subtract the live-adapter
-        // principal forwarded during the Executed window so live-deposit
-        // principal is not counted as strategy profit; add live-adapter
-        // withdrawals back so a mid-flight LP exit is not counted as a
-        // strategy loss (PnL = balance + withdrawn − (snapshot + principal)).
-        // forge-lint: disable-next-line(unsafe-typecast)
-        uint256 snapshot = _capitalSnapshots[proposalId] + ISyndicateVault(vault).liveAdapterPrincipal(proposalId);
-        // forge-lint: disable-next-line(unsafe-typecast)
-        uint256 balanceAdjusted =
-            IERC20(asset).balanceOf(vault) + ISyndicateVault(vault).liveAdapterWithdrawn(proposalId);
+        // Asset-only measurement (see NatSpec above). V2 live-NAV redesign: no
+        // capital is forwarded to / pulled from the strategy mid-proposal (the
+        // async request queue escrows LP flow off-vault), so PnL is simply the
+        // realized float delta against the execute-time snapshot.
+        uint256 snapshot = _capitalSnapshots[proposalId];
+        uint256 balanceAdjusted = IERC20(asset).balanceOf(vault);
         pnl = int256(balanceAdjusted) - int256(snapshot);
 
         // Finalize state before external transfers to prevent reentrancy on stale state
@@ -1039,6 +1035,11 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
             (agentFee, totalFee) =
                 _distributeFees(proposalId, vault, asset, proposal.proposer, proposal.performanceFeeBps, uint256(pnl));
         }
+
+        // V2 live-NAV: stamp the realized settle price into the request queue so
+        // every deposit/redeem queued during this proposal claims at one frozen,
+        // post-fee, un-front-runnable price. Done after fees leave the vault.
+        ISyndicateVault(vault).onProposalSettled(proposalId);
 
         emit ProposalSettled(proposalId, vault, pnl, totalFee, block.timestamp - proposal.executedAt);
     }

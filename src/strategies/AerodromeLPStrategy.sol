@@ -3,7 +3,9 @@ pragma solidity 0.8.28;
 
 import {BaseStrategy} from "./BaseStrategy.sol";
 import {IStrategy} from "../interfaces/IStrategy.sol";
+import {Position} from "../interfaces/IPriceRouter.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 /// @notice Minimal Aerodrome Router interface (addLiquidity / removeLiquidity /
@@ -130,6 +132,21 @@ contract AerodromeLPStrategy is BaseStrategy {
     /// @inheritdoc IStrategy
     function name() external pure returns (string memory) {
         return "Aerodrome LP";
+    }
+
+    /// @inheritdoc IStrategy
+    /// @dev One Aerodrome LP position, priced by the PriceRouter's
+    ///      AerodromeLPAdapter (native pool TWAP + recency + deviation gates).
+    ///      `ref` carries the staking gauge (or address(0)) and the numeraire =
+    ///      the vault asset, in which the LP is valued. Lane A stays
+    ///      governance-disabled for `AERODROME_LP` until the adapter's gate
+    ///      params are calibrated + audited (spec Q3 / issue #188); until then
+    ///      `valueStrategy` falls through to the async queue.
+    function positions() external view override returns (Position[] memory ps) {
+        ps = new Position[](1);
+        ps[0] = Position({
+            venue: lpToken, kind: keccak256("AERODROME_LP"), ref: abi.encode(gauge, IERC4626(vault()).asset())
+        });
     }
 
     /// @notice Initialization parameters (struct to avoid stack-too-deep)
@@ -323,10 +340,10 @@ contract AerodromeLPStrategy is BaseStrategy {
         if (newMinAmountBOut > 0) minAmountBOut = newMinAmountBOut;
     }
 
-    // ── positionValue ──
-    // Inherits BaseStrategy's (0, false) default. Deferred to a follow-up:
-    // requires decomposing the LP (including any gauge-staked portion) via
-    // pool reserves + totalSupply, converting the non-asset leg through an
-    // Aerodrome quote, and correctly handling the stable vs volatile
-    // pricing curves. See issue #188 for rationale.
+    // ── Lane A ──
+    // `positions()` (above) reports the LP locator so the PriceRouter's
+    // AerodromeLPAdapter can value it vault-side (pool reserves + gauge
+    // balance, non-asset leg via the native quote() TWAP). Lane A stays
+    // governance-disabled for AERODROME_LP until the deviation/recency gate
+    // params are calibrated + audited — see issue #188.
 }

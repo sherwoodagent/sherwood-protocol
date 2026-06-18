@@ -7,9 +7,11 @@ import {VaultWithdrawalQueue} from "../../../src/queue/VaultWithdrawalQueue.sol"
 import {IVaultWithdrawalQueue} from "../../../src/interfaces/IVaultWithdrawalQueue.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
-/// @notice Drives random LP deposit / requestRedeem / claim / cancel sequences
-///         while toggling the lock state. Bound to the AsyncRedeemInvariants
-///         harness via `targetContract`.
+/// @notice Drives random deposit / requestRedeem / requestDeposit / claim /
+///         cancel sequences across lock→settle proposal cycles (frozen Lane B).
+///         Each `lock()` opens a fresh proposal id; `settle()` stamps that
+///         proposal's frozen price (simulating `governor → vault.onProposalSettled`)
+///         and unlocks. Bound to the AsyncRedeemInvariants harness.
 contract AsyncRedeemHandler is Test {
     SyndicateVault public vault;
     VaultWithdrawalQueue public queue;
@@ -17,10 +19,24 @@ contract AsyncRedeemHandler is Test {
     address public mockGovernor;
 
     address[] public actors;
-    uint256[] public openRequestIds;
-    mapping(uint256 => bool) public idIsOpen;
 
-    uint256 public expectedPending; // tracked by handler, matched against queue
+    struct Tracked {
+        uint256 id;
+        address owner;
+        uint256 amount;
+        uint256 pid;
+        bool isRedeem;
+        bool open;
+    }
+
+    Tracked[] public tracked;
+
+    bool public locked;
+    uint256 public activePid;
+    uint256 public pidCounter;
+    mapping(uint256 => bool) public stamped;
+
+    uint256 public expectedPending; // escrowed redeem shares (matches queue.pendingShares)
     uint256 public depositCalls;
     uint256 public requestCalls;
     uint256 public claimCalls;
@@ -32,98 +48,109 @@ contract AsyncRedeemHandler is Test {
         queue = queue_;
         asset = asset_;
         mockGovernor = mockGovernor_;
-        // 4 fixed actors keeps the state space small and bounded
-        actors.push(makeAddr("actor0"));
-        actors.push(makeAddr("actor1"));
-        actors.push(makeAddr("actor2"));
-        actors.push(makeAddr("actor3"));
-        for (uint256 i; i < actors.length; i++) {
-            deal(address(asset), actors[i], 1_000_000e6);
-            vm.prank(actors[i]);
+        for (uint256 i; i < 4; i++) {
+            address a = makeAddr(string.concat("actor", vm.toString(i)));
+            actors.push(a);
+            deal(address(asset), a, 1_000_000e6);
+            vm.prank(a);
             asset.approve(address(vault), type(uint256).max);
         }
+        _mockLock(false, 0);
     }
 
-    function setLocked(bool locked) external {
+    function _mockLock(bool l, uint256 pid) internal {
+        vm.mockCall(
+            mockGovernor, abi.encodeWithSignature("getActiveProposal(address)"), abi.encode(l ? pid : uint256(0))
+        );
+        vm.mockCall(
+            mockGovernor, abi.encodeWithSignature("openProposalCount(address)"), abi.encode(l ? uint256(1) : uint256(0))
+        );
+    }
+
+    function lock() external {
         lockToggleCalls++;
-        vm.mockCall(
-            mockGovernor,
-            abi.encodeWithSignature("getActiveProposal(address)"),
-            abi.encode(locked ? uint256(1) : uint256(0))
-        );
-        // MS-H4: deposits are also gated by `openProposalCount` — mirror lock state.
-        vm.mockCall(
-            mockGovernor,
-            abi.encodeWithSignature("openProposalCount(address)"),
-            abi.encode(locked ? uint256(1) : uint256(0))
-        );
+        if (locked) return;
+        activePid = ++pidCounter;
+        _mockLock(true, activePid);
+        locked = true;
+    }
+
+    function settle() external {
+        lockToggleCalls++;
+        if (!locked) return;
+        _mockLock(false, 0);
+        locked = false;
+        vm.prank(mockGovernor);
+        vault.onProposalSettled(activePid);
+        stamped[activePid] = true;
     }
 
     function deposit(uint256 actorSeed, uint256 amount) external {
         depositCalls++;
-        if (vault.redemptionsLocked()) return; // deposits blocked while locked
-        if (vault.paused()) return;
+        if (locked || vault.paused()) return; // instant deposit blocked while locked
         address a = actors[actorSeed % actors.length];
         amount = bound(amount, 1e6, 100_000e6);
         if (asset.balanceOf(a) < amount) return;
         vm.prank(a);
-        try vault.deposit(amount, a) {}
-            catch {
-            // ignore: e.g. revert from a deposit cap or paused state
-        }
+        try vault.deposit(amount, a) {} catch {}
     }
 
     function requestRedeem(uint256 actorSeed, uint256 sharesSeed) external {
         requestCalls++;
-        if (!vault.redemptionsLocked()) return; // can only queue while locked
+        if (!locked) return;
         address a = actors[actorSeed % actors.length];
         uint256 bal = vault.balanceOf(a);
         if (bal == 0) return;
         uint256 s = bound(sharesSeed, 1, bal);
         vm.prank(a);
         try vault.requestRedeem(s, a) returns (uint256 reqId) {
-            openRequestIds.push(reqId);
-            idIsOpen[reqId] = true;
+            tracked.push(Tracked(reqId, a, s, activePid, true, true));
             expectedPending += s;
-        } catch {
-            // ignore — should not happen given preconditions, but be permissive
-        }
+        } catch {}
+    }
+
+    function requestDeposit(uint256 actorSeed, uint256 amount) external {
+        requestCalls++;
+        if (!locked) return;
+        address a = actors[actorSeed % actors.length];
+        amount = bound(amount, 1e6, 100_000e6);
+        if (asset.balanceOf(a) < amount) return;
+        vm.prank(a);
+        try vault.requestDeposit(amount, a) returns (uint256 reqId) {
+            tracked.push(Tracked(reqId, a, amount, activePid, false, true));
+        } catch {}
     }
 
     function claimRandom(uint256 idSeed) external {
         claimCalls++;
-        if (vault.redemptionsLocked()) return; // queue claim blocked while locked
-        if (openRequestIds.length == 0) return;
-        // pick a random ID
-        uint256 idx = idSeed % openRequestIds.length;
-        uint256 reqId = openRequestIds[idx];
-        if (!idIsOpen[reqId]) return;
-        uint256 shares = uint256(queue.getRequest(reqId).shares);
-        try queue.claim(reqId) returns (uint256) {
-            expectedPending -= shares;
-            idIsOpen[reqId] = false;
-        } catch {
-            // ignore — possible if the float is insufficient (shouldn't happen
-            // because of reserve, but defensive)
+        if (locked) return; // claims only in unlocked windows
+        uint256 n = tracked.length;
+        if (n == 0) return;
+        for (uint256 k; k < n; k++) {
+            Tracked storage t = tracked[(idSeed + k) % n];
+            if (!t.open || !stamped[t.pid]) continue;
+            try queue.claim(t.id) {
+                if (t.isRedeem) expectedPending -= t.amount;
+                t.open = false;
+            } catch {}
+            return;
         }
     }
 
     function cancelRandom(uint256 idSeed) external {
         cancelCalls++;
-        if (openRequestIds.length == 0) return;
-        uint256 idx = idSeed % openRequestIds.length;
-        uint256 reqId = openRequestIds[idx];
-        if (!idIsOpen[reqId]) return;
-        IVaultWithdrawalQueue.Request memory r = queue.getRequest(reqId);
-        if (r.claimed || r.cancelled) {
-            idIsOpen[reqId] = false;
+        uint256 n = tracked.length;
+        if (n == 0) return;
+        for (uint256 k; k < n; k++) {
+            Tracked storage t = tracked[(idSeed + k) % n];
+            if (!t.open || stamped[t.pid]) continue; // G7: cancel only before stamp
+            vm.prank(t.owner);
+            try queue.cancel(t.id) {
+                if (t.isRedeem) expectedPending -= t.amount;
+                t.open = false;
+            } catch {}
             return;
         }
-        vm.prank(r.owner);
-        try queue.cancel(reqId) {
-            expectedPending -= uint256(r.shares);
-            idIsOpen[reqId] = false;
-        } catch {}
     }
 
     // Views for invariant assertions

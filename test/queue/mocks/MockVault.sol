@@ -2,16 +2,23 @@
 pragma solidity 0.8.28;
 
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
-/// @notice Minimal mock implementing just enough surface area for VaultWithdrawalQueue
-///         unit tests: share-token semantics, redemptionsLocked(), and a deterministic
-///         redeem(shares, receiver, owner) hook.
+/// @notice Minimal vault mock for `VaultWithdrawalQueue` (Lane B) unit tests:
+///         share-token (ERC20) semantics plus the queue-callback surface the
+///         frozen queue depends on (asset / redemptionsLocked / settleRedeem /
+///         settleDeposit). The queue computes the frozen amounts; the vault just
+///         mints / burns / pays exactly what it's told.
 contract MockVault is ERC20("MV", "MV") {
     bool public locked;
     address public queue;
-    uint256 public redeemRate = 1e18; // assets per share, 1e18-scaled
-    address public lastRedeemReceiver;
-    address public lastRedeemOwner;
+    IERC20 public immutable assetToken;
+    address public lastRedeemTo;
+    address public lastDepositTo;
+
+    constructor(address asset_) {
+        assetToken = IERC20(asset_);
+    }
 
     function setQueue(address q) external {
         queue = q;
@@ -21,23 +28,28 @@ contract MockVault is ERC20("MV", "MV") {
         locked = l;
     }
 
-    function setRedeemRate(uint256 r) external {
-        redeemRate = r;
-    }
-
     function mint(address to, uint256 amt) external {
         _mint(to, amt);
+    }
+
+    function asset() external view returns (address) {
+        return address(assetToken);
     }
 
     function redemptionsLocked() external view returns (bool) {
         return locked;
     }
 
-    function redeem(uint256 shares, address receiver, address owner) external returns (uint256 assets) {
-        require(msg.sender == queue || msg.sender == owner, "auth");
-        _burn(owner, shares);
-        lastRedeemReceiver = receiver;
-        lastRedeemOwner = owner;
-        assets = shares * redeemRate / 1e18;
+    function settleRedeem(uint256 shares, uint256 assets, address to) external {
+        require(msg.sender == queue, "auth");
+        _burn(queue, shares);
+        lastRedeemTo = to;
+        require(assetToken.transfer(to, assets), "xfer");
+    }
+
+    function settleDeposit(uint256 shares, address to) external {
+        require(msg.sender == queue, "auth");
+        lastDepositTo = to;
+        _mint(to, shares);
     }
 }

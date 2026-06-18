@@ -180,7 +180,6 @@ contract GovernorStrategyOnProposalTest is Test {
 
     function test_vault_activeStrategyAdapter_resolvesAfterExecute() public {
         MockStrategyAdapter adapter = new MockStrategyAdapter();
-        adapter.setValue(0, true);
         uint256 pid = _proposeAndApprove(address(adapter));
         governor.executeProposal(pid);
 
@@ -190,7 +189,6 @@ contract GovernorStrategyOnProposalTest is Test {
 
     function test_vault_activeStrategyAdapter_zeroAfterSettle() public {
         MockStrategyAdapter adapter = new MockStrategyAdapter();
-        adapter.setValue(0, true);
         uint256 pid = _proposeAndApprove(address(adapter));
         governor.executeProposal(pid);
         assertEq(vault.activeStrategyAdapter(), address(adapter));

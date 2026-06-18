@@ -40,10 +40,9 @@ interface ISyndicateVault {
     error InsufficientShares();
     error RedemptionsNotLocked();
     error QueueReserveBreached();
-    /// @notice Sherlock #24 — the live adapter rejected an inbound deposit
-    ///         (e.g. its `onLiveDeposit` hook reverted because the upstream
-    ///         pool is paused or at cap). The deposit unwinds atomically.
-    error LiveDepositRejected();
+    error NotQueue();
+    error ZeroAssets();
+    error SharesLocked();
 
     // ── Init Params ──
     struct InitParams {
@@ -99,19 +98,12 @@ interface ISyndicateVault {
     function setWithdrawalQueue(address queue) external; // factory-only, set-once
     function withdrawalQueue() external view returns (address);
     function requestRedeem(uint256 shares, address owner_) external returns (uint256 requestId);
+    function requestDeposit(uint256 assets, address receiver) external returns (uint256 requestId);
     function pendingQueueShares() external view returns (uint256);
     function reservedQueueAssets() external view returns (uint256);
-    /// @notice Sum of asset principal forwarded to the live-NAV adapter during
-    ///         the given proposal's Executed window. Read by the governor at
-    ///         settle so the principal is not counted as strategy profit.
-    function liveAdapterPrincipal(uint256 proposalId) external view returns (uint256);
-
-    /// @notice Sum of asset principal pulled back from the live-NAV adapter
-    ///         to satisfy LP withdrawals during the given proposal's
-    ///         Executed window. Read by the governor at settle so the
-    ///         out-flow does not register as a strategy loss
-    ///         (PnL = balance + withdrawn - (snapshot + principal)).
-    function liveAdapterWithdrawn(uint256 proposalId) external view returns (uint256);
+    function settleRedeem(uint256 shares, uint256 assets, address to) external; // queue-only
+    function settleDeposit(uint256 shares, address to) external; // queue-only
+    function onProposalSettled(uint256 proposalId) external; // governor-only
 
     // ── Rescue ──
     function rescueEth(address payable to, uint256 amount) external;
@@ -140,12 +132,5 @@ interface ISyndicateVault {
     event GovernorBatchExecuted(address indexed governor, uint256 callCount);
     event WithdrawalQueueSet(address indexed queue);
     event RedeemRequested(uint256 indexed requestId, address indexed owner, uint256 shares);
-    /// @notice Emitted when `vault._deposit` forwarded principal to the live
-    ///         adapter but its `onLiveDeposit` hook reverted (or wasn't
-    ///         implemented). The assets are now held by the adapter and
-    ///         tracked under `liveAdapterPrincipal[proposalId]` so they're
-    ///         reclaimed at settle without counting as strategy profit. This
-    ///         was the runtime backstop in the fail-soft path. Sherlock #24
-    ///         flipped to hard-revert; event retired, `LiveDepositRejected`
-    ///         carries the diagnostic now.
+    event DepositRequested(uint256 indexed requestId, address indexed receiver, uint256 assets);
 }

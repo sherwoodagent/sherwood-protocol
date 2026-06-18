@@ -87,6 +87,8 @@ contract SyndicateVaultTest is Test {
         // getActiveProposal → 0 so deposits/withdrawals stay unlocked by default.
         // `redemptionsLocked()` fails closed on governor == address(0).
         vm.mockCall(address(this), abi.encodeWithSignature("governor()"), abi.encode(MOCK_GOVERNOR));
+        // Lane A off (no PriceRouter) — exercises the async (Lane B) lock behavior.
+        vm.mockCall(address(this), abi.encodeWithSignature("priceRouter()"), abi.encode(address(0)));
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal(address)"), abi.encode(uint256(0)));
         // MS-H4: vault `_deposit` also reads `openProposalCount(address)` —
         // mock to zero so deposits aren't blocked by garbage memory.

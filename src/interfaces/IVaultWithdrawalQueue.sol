@@ -1,11 +1,17 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
-/// @title IVaultWithdrawalQueue
-/// @notice Interface for the async withdrawal queue paired with `SyndicateVault`.
-///         Holders escrow shares into the queue while strategies are unwound off-chain;
-///         once the vault has sufficient idle assets they `claim` to redeem at the
-///         live NAV recorded at claim time, or `cancel` to recover their shares.
+/// @title IVaultRequestQueue
+/// @notice Interface for the async request queue paired with `SyndicateVault`
+///         (Lane B of the V2 live-NAV design). While a strategy proposal is
+///         active (`redemptionsLocked() == true`) LPs escrow exits (shares) and
+///         entries (assets) here instead of transacting against an unrealized
+///         mid-flight NAV. At settlement the vault stamps ONE frozen price per
+///         proposal (`num/den` = realized NAV checkpoint); every request tagged
+///         to that proposal then claims at that single, un-front-runnable price.
+/// @dev    Kept under the legacy file/interface name to avoid churning every
+///         factory/vault reference; functionally this is the "VaultRequestQueue"
+///         from the spec (gains deposit-side + frozen settlement price).
 interface IVaultWithdrawalQueue {
     // ── Errors ──
     error NotVault();
@@ -14,41 +20,62 @@ interface IVaultWithdrawalQueue {
     error AlreadyCancelled();
     error RequestNotFound();
     error VaultLocked();
+    error NotSettled();
+    error AlreadySettled();
     error ZeroShares();
+    error ZeroAssets();
     error InsufficientShares();
-    error TransferFailed();
-    /// @notice Sherlock #27 — claim received fewer assets than the LP's
-    ///         `minAssets` floor (NAV dropped between enqueue and claim).
-    error ClaimSlippage(uint256 received, uint256 minAssets);
+    error WrongKind();
 
-    // ── Structs ──
+    // ── Types ──
+    enum RequestKind {
+        Redeem, // escrow shares, claim assets at frozen price
+        Deposit // escrow assets, claim shares at frozen price
+    }
+
     struct Request {
-        address owner; // owner of the escrowed shares (and recipient on claim)
-        uint128 shares; // shares escrowed in the queue
-        uint40 requestedAt; // block.timestamp when queued
+        address owner; // recipient of proceeds (shares on deposit, assets on redeem)
+        uint256 amount; // Redeem: shares escrowed; Deposit: assets escrowed
+        uint256 pid; // proposal active when queued — frozen-price lookup key
+        RequestKind kind;
         bool claimed;
         bool cancelled;
     }
 
-    // ── Events ──
-    event WithdrawalQueued(uint256 indexed requestId, address indexed owner, uint256 shares);
-    event WithdrawalClaimed(uint256 indexed requestId, address indexed owner, uint256 shares, uint256 assets);
-    event WithdrawalCancelled(uint256 indexed requestId, address indexed owner, uint256 shares);
+    /// @notice Frozen settlement price for a proposal, stamped at settle.
+    ///         `num/den` is the vault's realized assets-per-share at settle,
+    ///         carrying the ERC-4626 virtual offsets (num = totalAssets+1,
+    ///         den = totalSupply + 10**offset) so the queue reproduces the
+    ///         vault's own conversion rounding exactly.
+    struct SettlePrice {
+        uint256 num;
+        uint256 den;
+        bool stamped;
+    }
 
-    // ── External ──
-    function vault() external view returns (address);
-    function queueRequest(address owner, uint256 shares) external returns (uint256 requestId);
-    function claim(uint256 requestId) external returns (uint256 assets);
-    /// @notice Sherlock #27 — claim with a slippage floor. Reverts with
-    ///         `ClaimSlippage` if `assets < minAssets`. Use `claim(requestId)`
-    ///         (no floor) only for batch keepers / off-chain orchestration
-    ///         that has already accepted current NAV.
-    function claim(uint256 requestId, uint256 minAssets) external returns (uint256 assets);
+    // ── Events ──
+    event RedeemQueued(uint256 indexed requestId, address indexed owner, uint256 shares, uint256 indexed pid);
+    event DepositQueued(uint256 indexed requestId, address indexed owner, uint256 assets, uint256 indexed pid);
+    event RequestClaimed(uint256 indexed requestId, address indexed owner, uint256 inAmount, uint256 outAmount);
+    event RequestCancelled(uint256 indexed requestId, address indexed owner);
+    event SettlementStamped(uint256 indexed pid, uint256 num, uint256 den);
+
+    // ── Vault-only mutating ──
+    function queueRedeem(address owner, uint256 shares, uint256 pid) external returns (uint256 requestId);
+    function queueDeposit(address owner, uint256 assets, uint256 pid) external returns (uint256 requestId);
+    function stampSettlement(uint256 pid, uint256 num, uint256 den) external;
+
+    // ── Permissionless / owner ──
+    function claim(uint256 requestId) external returns (uint256 outAmount);
     function cancel(uint256 requestId) external;
 
     // ── Views ──
+    function vault() external view returns (address);
     function getRequest(uint256 requestId) external view returns (Request memory);
+    function getSettlePrice(uint256 pid) external view returns (SettlePrice memory);
     function pendingShares() external view returns (uint256);
+    function pendingDepositAssets() external view returns (uint256);
+    function reservedAssets() external view returns (uint256);
     function getRequestsByOwner(address owner_) external view returns (uint256[] memory);
     function nextRequestId() external view returns (uint256);
 }

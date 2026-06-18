@@ -5,7 +5,7 @@ import {ISyndicateVault} from "./interfaces/ISyndicateVault.sol";
 import {ISyndicateGovernor} from "./interfaces/ISyndicateGovernor.sol";
 import {ISyndicateFactory} from "./interfaces/ISyndicateFactory.sol";
 import {IVaultWithdrawalQueue} from "./interfaces/IVaultWithdrawalQueue.sol";
-import {IStrategy} from "./interfaces/IStrategy.sol";
+import {IPriceRouter} from "./interfaces/IPriceRouter.sol";
 import {BatchExecutorLib} from "./BatchExecutorLib.sol";
 import {ERC4626Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/ERC4626Upgradeable.sol";
 import {
@@ -65,9 +65,8 @@ contract SyndicateVault is
     uint256 public constant MAX_PAGE_LIMIT = 100;
     /// @notice PR #324 review R4: hard cap on agents per vault so the
     ///         `rotateOwnership` deactivation loop (Sherlock #38) has a
-    ///         predictable upper bound and cannot OOG. 32 SSTOREs ≈ 6.4k
-    ///         gas — fits comfortably in any block. Removing an agent
-    ///         frees a slot via `removeAgent`.
+    ///         predictable upper bound and cannot OOG. 32 SSTOREs ~= 6.4k gas —
+    ///         fits comfortably in any block. `removeAgent` frees a slot.
     uint256 public constant MAX_AGENTS_PER_VAULT = 32;
 
     // ==================== STORAGE ====================
@@ -115,20 +114,15 @@ contract SyndicateVault is
     /// @notice Per-vault async withdrawal queue (set-once at deploy by the factory).
     address private _withdrawalQueue;
 
-    /// @notice Per-proposal sum of asset principal forwarded to the live
-    ///         adapter during the proposal's Executed window. Subtracted from
-    ///         PnL at `_finishSettlement` so live-deposit principal is not
-    ///         counted as strategy profit.
-    mapping(uint256 proposalId => uint256) public liveAdapterPrincipal;
-
-    /// @notice Per-proposal sum of asset principal pulled back from the live
-    ///         adapter to fund LP withdrawals during the proposal's Executed
-    ///         window. Added to the PnL snapshot at `_finishSettlement` so a
-    ///         mid-flight LP exit doesn't masquerade as a strategy loss.
-    mapping(uint256 proposalId => uint256) public liveAdapterWithdrawn;
+    /// @notice Lane A (instant) per-holder lockup: the proposal id whose Lane A
+    ///         entry locked this holder's shares. The holder cannot exit (Lane A
+    ///         redeem or Lane B requestRedeem) while that proposal is still the
+    ///         active one — closes the deposit-low / exit-high intra-proposal MEV
+    ///         (G1). Cleared implicitly when the proposal settles (active != pid).
+    mapping(address holder => uint256 pid) private _laneALockPid;
 
     /// @dev Reserved storage for future upgrades.
-    uint256[35] private __gap;
+    uint256[36] private __gap;
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -198,10 +192,9 @@ contract SyndicateVault is
     }
 
     /// @inheritdoc ISyndicateVault
-    /// @dev V-M3: paginated slice of the approved-depositor set. Full-list
-    ///      and count getters were dropped to free EIP-170 budget for the
-    ///      NAV-floor guard in `_lpFlowGate`. Iterate via this paginated
-    ///      path; `limit` is hard-clamped to `MAX_PAGE_LIMIT`.
+    /// @dev V-M3: paginated slice of the approved-depositor set. Full-list and
+    ///      count getters were dropped to free EIP-170 budget. Iterate via this
+    ///      paginated path; `limit` is hard-clamped to `MAX_PAGE_LIMIT`.
     function approvedDepositorsPaginated(uint256 offset, uint256 limit) external view returns (address[] memory) {
         return _pageAddresses(_approvedDepositors, offset, limit);
     }
@@ -219,11 +212,8 @@ contract SyndicateVault is
 
     // ==================== VIEWS ====================
 
-    // `getAgentConfig` external view dropped to make room for R4's
-    // MAX_AGENTS_PER_VAULT cap under EIP-170. Test-only; production callers
-    // use `isAgent(addr)` (the load-bearing auth gate). Off-chain reads via
-    // `eth_getStorageAt` on the `_agents[addr]` slot or the
-    // `AgentRegistered` / `AgentRemoved` event stream.
+    // `getAgentConfig` dropped to fit MAX_AGENTS_PER_VAULT under EIP-170
+    // (PR #324). Use `isAgent(addr)` for the auth check.
 
     /// @inheritdoc ISyndicateVault
     function getAgentCount() external view returns (uint256) {
@@ -268,9 +258,8 @@ contract SyndicateVault is
     function registerAgent(uint256 agentId, address agentAddress) external onlyOwner {
         if (agentAddress == address(0)) revert ZeroAddress();
         if (_agents[agentAddress].active) revert AgentAlreadyRegistered();
-        // PR #324 review R4: bound the `_agentSet` so `rotateOwnership`'s
-        // deactivation loop (Sherlock #38) can't OOG. `removeAgent` frees
-        // a slot.
+        // PR #324 review R4: bound `_agentSet` so `rotateOwnership`'s
+        // deactivation loop (Sherlock #38) can't OOG. `removeAgent` frees a slot.
         if (_agentSet.length() >= MAX_AGENTS_PER_VAULT) revert AgentCapExceeded();
 
         // Verify ERC-8004 identity (skipped on chains without agent registry)
@@ -291,7 +280,7 @@ contract SyndicateVault is
     ///      flip `active = false`). This prevents stale `agentId` /
     ///      `agentAddress` fields from being silently reused if `registerAgent`
     ///      is later called for the same slot. After `removeAgent`,
-    ///      `getAgentConfig(addr)` returns the zero struct, and a subsequent
+    ///      `isAgent(addr)` returns false, and a subsequent
     ///      `registerAgent(newId, addr)` writes a fresh entry.
     function removeAgent(address agentAddress) external onlyOwner {
         if (!_agents[agentAddress].active) revert AgentNotActive();
@@ -322,22 +311,12 @@ contract SyndicateVault is
     ///      registry's `transferOwnerStakeSlot`, so the old owner's slashed /
     ///      unstaked position can be rebound to a fresh operator without
     ///      redeploying the vault.
-    /// @dev Sherlock #38 v2 (PR #324 review comment 4453740618): drain
-    ///      `_agentSet` entirely, not just flip `active = false`. The prior
-    ///      flip-only loop colluded with R4's `MAX_AGENTS_PER_VAULT` cap in
-    ///      `registerAgent` AND the active-only check in `removeAgent` to
-    ///      brick the new owner of an at-cap vault: 32 dead set entries
-    ///      could be neither re-registered (cap blocks before idempotent
-    ///      `_agentSet.add`) nor purged (`AgentNotActive` blocks
-    ///      `removeAgent` on every entry). Snapshot via `.values()` first
-    ///      so the `_agentSet.remove(...)` calls inside the loop don't
-    ///      invalidate iteration (OZ swap-and-pop semantics on `at(i)`
-    ///      would otherwise skip entries). Post-rotation: agent set is
-    ///      empty; new owner registers up to `MAX_AGENTS_PER_VAULT` fresh
-    ///      agents without any pre-cleanup step. Each entry gets a full
-    ///      `delete _agents[a]` (V-M5: no stale struct fields) and emits
-    ///      `AgentRemoved` for indexer parity with the normal `removeAgent`
-    ///      path.
+    /// @dev Sherlock #38 v2 (PR #324 review): drain `_agentSet` entirely (full
+    ///      `delete`, not flip-only) so an at-cap vault doesn't brick the new
+    ///      owner — 32 dead entries could otherwise be neither re-registered
+    ///      (R4 cap blocks) nor purged (`AgentNotActive` blocks `removeAgent`).
+    ///      Snapshot via `.values()` first so the in-loop `remove` doesn't
+    ///      invalidate iteration (OZ swap-and-pop on `at(i)`).
     function rotateOwnership(address newOwner) external {
         if (msg.sender != _factory) revert NotFactory();
         if (newOwner == address(0)) revert ZeroAddress();
@@ -353,12 +332,12 @@ contract SyndicateVault is
     }
 
     /// @notice Sherlock run #2 #3: block direct OwnableUpgradeable owner
-    ///         rotation paths. The factory's `rotateOwner` is the only
-    ///         legal route — it enforces `getActiveProposal == 0`,
-    ///         `openProposalCount == 0`, owner-stake clear, registry
-    ///         alignment, then calls `rotateOwnership` here. Allowing the
-    ///         inherited setters would desync factory / registry records
-    ///         and (via `renounceOwnership`) permanently orphan the vault.
+    ///         rotation. The factory's `rotateOwner` is the only legal route —
+    ///         it enforces `getActiveProposal == 0`, `openProposalCount == 0`,
+    ///         owner-stake clear, registry alignment, then calls
+    ///         `rotateOwnership` here. Allowing the inherited setters would
+    ///         desync factory / registry records and (via `renounceOwnership`)
+    ///         permanently orphan the vault.
     function transferOwnership(address) public pure override {
         revert NotFactory();
     }
@@ -403,12 +382,6 @@ contract SyndicateVault is
     ///      different library.
     /// @dev I-11: gated by `whenNotPaused`. When the owner pauses the vault,
     ///      strategy execution is halted alongside LP flow.
-    /// @dev `nonReentrant` retained — strategies called via the batch can
-    ///      re-enter the vault through the 4626 deposit / withdraw / redeem
-    ///      paths. Each of those has its own `nonReentrant`, but the
-    ///      cross-function latch is what `test_executeGovernorBatch_reentrancy_blocked`
-    ///      asserts. Dropping the guard here breaks that contract even
-    ///      with the V-C2 codehash pin in place.
     function executeGovernorBatch(BatchExecutorLib.Call[] calldata calls)
         external
         onlyGovernor
@@ -426,6 +399,12 @@ contract SyndicateVault is
         // V-M9: first-class vault-level execution marker. Emitted after the
         // delegatecall succeeds so indexers only see confirmed executions.
         emit GovernorBatchExecuted(msg.sender, calls.length);
+
+        // Honor pending redemptions first: a strategy execution may not deploy
+        // float reserved for already-settled, unclaimed redeem claims, so a
+        // later proposal cannot strand them. Settle batches return float and
+        // pass trivially; an execute batch that over-deploys reverts here.
+        if (IERC20(asset()).balanceOf(address(this)) < reservedQueueAssets()) revert QueueReserveBreached();
     }
 
     /// @inheritdoc ISyndicateVault
@@ -538,74 +517,6 @@ contract SyndicateVault is
         return _cachedDecimalsOffset;
     }
 
-    /// @dev Combined LP-flow gate. Returns:
-    ///        - `blocked = true` when LP flow must revert (active proposal AND
-    ///          no valid live-NAV adapter).
-    ///        - `liveAdapter` set to the adapter address whenever LP flow is
-    ///          unlocked *because* a live-NAV adapter is reporting valid NAV.
-    ///          The `_deposit` path uses this to forward the new capital into
-    ///          the adapter so it starts earning yield immediately. Outside
-    ///          the active window or when the adapter is invalid this is
-    ///          `address(0)` so the caller skips the forward.
-    /// @dev I-3: a reverting `positionValue()` (e.g. EOA bound, buggy adapter)
-    ///      is treated as `blocked=true` so a malicious/broken adapter can't
-    ///      brick LP flow with an unhandled revert. Pairs with the `totalAssets`
-    ///      try/catch fallback below.
-    /// @dev Sherlock #37/#50 helper — returns `adapterValue` only when
-    ///      `adapter` implements `_onLiveWithdraw` (i.e.
-    ///      `supportsLiveWithdraw() == true`). Strategies whose hook is the
-    ///      `BaseStrategy` no-op default return 0 here, so the vault clamps
-    ///      `maxWithdraw` / `maxRedeem` to float-only during their active
-    ///      proposal. Factored into a single helper so the staticcall to
-    ///      `supportsLiveWithdraw` is emitted once rather than at both
-    ///      `maxWithdraw` and `maxRedeem`.
-    function _withdrawableAdapterValue(address adapter, uint256 v) private view returns (uint256) {
-        if (adapter == address(0)) return 0;
-        if (!IStrategy(adapter).supportsLiveWithdraw()) return 0;
-        return v;
-    }
-
-    function _lpFlowGate() private view returns (bool blocked, address liveAdapter, uint256 adapterValue) {
-        if (!redemptionsLocked()) return (false, address(0), 0);
-        address adapter = _activeStrategy();
-        if (adapter == address(0)) return (true, address(0), 0);
-        try IStrategy(adapter).positionValue() returns (uint256 v, bool valid) {
-            if (!valid) return (true, address(0), 0);
-            // NAV-floor guard: suspend live NAV when reported value falls below
-            // `principal / 2` (50% floor, hardcoded as `>> 1`). Defeats the
-            // share-inflation attack where an under-reporting strategy
-            // (positionValue ≈ 0 with non-zero supply) lets a new depositor
-            // mint cheap shares against the deflated NAV.
-            //
-            // I-3: the snapshot read uses a low-level staticcall + assembly
-            // decode so a governor without `getCapitalSnapshot` (e.g. UUPS
-            // upgrade misconfig) can't brick LP flow with an unhandled revert.
-            // Fail-closed: a missing / malformed return blocks the live path
-            // (queue still works). Fail-open here would silently zero the
-            // floor and re-enable the share-inflation attack.
-            // Assembly is used over high-level `(bool ok, bytes memory ret)`
-            // tuple to fit under the EIP-170 cap.
-            address gov_ = _getGovernor();
-            uint256 pid = ISyndicateGovernor(gov_).getActiveProposal(address(this));
-            bytes memory cd = abi.encodeCall(ISyndicateGovernor.getCapitalSnapshot, (pid));
-            uint256 snapshot;
-            bool snapOk;
-            assembly {
-                snapOk := and(staticcall(gas(), gov_, add(cd, 0x20), mload(cd), 0, 0x20), eq(returndatasize(), 0x20))
-                if snapOk { snapshot := mload(0) }
-            }
-            if (!snapOk) return (true, address(0), 0);
-            // Sherlock #33: net `liveAdapterWithdrawn` out of principal so
-            // legitimate LP exits don't anchor the floor at execute-time
-            // levels and DoS subsequent flows.
-            uint256 p_ = liveAdapterPrincipal[pid];
-            uint256 w_ = liveAdapterWithdrawn[pid];
-            if (v < (snapshot + (p_ > w_ ? p_ - w_ : 0)) >> 1) return (true, address(0), 0);
-            return (false, adapter, v);
-        } catch {}
-        return (true, address(0), 0);
-    }
-
     /// @dev True while any non-terminal proposal binds the vault
     ///      (Pending..Executed). Used by `_deposit` to close the late-deposit
     ///      window where a depositor mid-vote would be silently pulled into a
@@ -615,62 +526,85 @@ contract SyndicateVault is
         return ISyndicateGovernor(_getGovernor()).openProposalCount(address(this)) != 0;
     }
 
-    // ── I-1: nonReentrant guards on deposit/mint (deflated-NAV attack vector) ──
-    //
-    // `_deposit` forwards capital into the active adapter via `safeTransfer`
-    // followed by `IStrategy.onLiveDeposit`. A malicious adapter could re-enter
-    // `vault.deposit` between the transfer and the adapter accounting the
-    // assets — at that recursive moment `positionValue()` undercounts the
-    // in-flight assets, letting the recursive deposit mint shares against a
-    // deflated NAV. `nonReentrant` on the public deposit/mint paths closes
-    // the window.
-    //
-    // Sherlock run #3 #9 (off-report): the parallel `withdraw`/`redeem`
-    // wrappers were dropped — they were annotated as "for symmetry /
-    // defense-in-depth" only, never load-bearing. The withdraw-side
-    // adapter callback is `onLiveWithdraw` which pulls FROM the adapter
-    // INTO the vault (no asset in flight that could deflate NAV from the
-    // attacker's perspective), AND any reentry attempt into `deposit` or
-    // `mint` is still blocked by their nonReentrant latch (transient
-    // storage). Dropping the 2 wrappers freed ~30 B of EIP-170 headroom,
-    // landing the `maxRedeem` dust-passthrough fix.
-    function deposit(uint256 assets, address receiver) public override nonReentrant returns (uint256) {
-        return super.deposit(assets, receiver);
+    /// @dev Protocol PriceRouter (Lane A live-NAV), read live from the factory.
+    ///      `address(0)` (unset) ⇒ Lane A off — the vault shows float-only NAV
+    ///      and routes mid-proposal flow to the async (Lane B) queue.
+    function _getPriceRouter() internal view returns (address) {
+        return ISyndicateFactory(_factory).priceRouter();
     }
 
-    function mint(uint256 shares, address receiver) public override nonReentrant returns (uint256) {
-        return super.mint(shares, receiver);
+    /// @dev Lane A live valuation of the active strategy's positions, priced
+    ///      vault-side by the PriceRouter (never the strategy's self-report).
+    ///      Returns `(value, true)` only while locked AND the router proves every
+    ///      position instant-eligible (kind enabled, fresh, within cap); every
+    ///      other case is `(0, false)` (fail-closed) so the vault falls back to
+    ///      float-only NAV + the async queue.
+    function _liveNAV() private view returns (uint256 value, bool available) {
+        if (!redemptionsLocked()) return (0, false);
+        address pr = _getPriceRouter();
+        if (pr == address(0)) return (0, false);
+        address strat = _activeStrategy();
+        if (strat == address(0)) return (0, false);
+        try IPriceRouter(pr).valueStrategy(strat) returns (uint256 v, bool ok) {
+            return ok ? (v, true) : (0, false);
+        } catch {
+            return (0, false);
+        }
     }
+
+    /// @dev True while `holder`'s shares are Lane-A-locked — a Lane A entry made
+    ///      during the currently-active proposal. The lock lifts implicitly when
+    ///      that proposal settles (the active proposal id changes / clears), so
+    ///      no timestamp bookkeeping is needed. Bounds the deposit-low / exit-high
+    ///      intra-proposal arb (G1) for both Lane A redeem and Lane B requestRedeem.
+    function _isLaneALocked(address holder) private view returns (bool) {
+        uint256 p = _laneALockPid[holder];
+        return p != 0 && p == ISyndicateGovernor(_getGovernor()).getActiveProposal(address(this));
+    }
+
+    /// @dev Shared instant-exit gate for `maxWithdraw` / `maxRedeem`: an exit
+    ///      must route through the Lane B queue when the vault is locked without
+    ///      a Lane A live-NAV term, or while the holder is under the G1 lockup.
+    function _laneBOnly(address owner_) private view returns (bool) {
+        (, bool laneA) = _liveNAV();
+        return (redemptionsLocked() && !laneA) || _isLaneALocked(owner_);
+    }
+
+    // ── I-1: nonReentrant guard on the deposit / mint path ──
+    //
+    // The guard lives on the internal `_deposit` (both `deposit` and `mint`
+    // route through it), so the public entry-points keep OZ's inherited bodies
+    // and we don't pay for two wrapper overrides (EIP-170 headroom). Defence-in-
+    // depth against cross-function reentrancy on the share-price path: a
+    // reentrant deposit during another mint could mint against a transiently-
+    // deflated NAV. The queue-side `claim` / `settleRedeem` take their own locks
+    // and `requestRedeem` is already guarded.
+    //
+    // Sherlock run #3 #9 (off-report): the `withdraw` / `redeem` paths take no
+    // nonReentrant — they were "for symmetry" only, never load-bearing.
+    // Withdraw transfers the vault asset OUT to the receiver (no asset in flight
+    // that could deflate NAV from the caller's view), the V2 design has no
+    // live-withdraw adapter callback, and any reentry into deposit / mint is
+    // still blocked by `_deposit`'s nonReentrant latch.
 
     /// @inheritdoc ERC4626Upgradeable
-    /// @dev Aggregates the vault's idle float with the active strategy
-    ///      adapter's `positionValue()` when the adapter reports `valid=true`
-    ///      AND clears the NAV floor. Delegates to `_lpFlowGate` so the
-    ///      preview surface (`previewDeposit`/`previewWithdraw`) and the
-    ///      on-chain entry/exit gate agree byte-for-byte: any case that
-    ///      blocks LP flow (unbound adapter, invalid value, sub-floor NAV,
-    ///      governor staticcall failure, reverting `positionValue`) falls
-    ///      back to float-only here, so the quoted NAV is exactly what
-    ///      a deposit/withdraw would mint/burn against.
+    /// @dev V2 live-NAV redesign: the vault never trusts a strategy's
+    ///      self-reported value. NAV is the idle float PLUS, only when Lane A is
+    ///      available, the active strategy's positions priced vault-side by the
+    ///      PriceRouter (`_liveNAV`). When Lane A is unavailable the live term is
+    ///      0, so during a proposal the vault shows float-only and mid-flight LP
+    ///      flow goes through the async queue, settling at the realized price.
     function totalAssets() public view override returns (uint256) {
-        uint256 float = IERC20(asset()).balanceOf(address(this));
-        (, address liveAdapter, uint256 adapterValue) = _lpFlowGate();
-        return liveAdapter == address(0) ? float : float + adapterValue;
+        (uint256 live,) = _liveNAV();
+        return IERC20(asset()).balanceOf(address(this)) + live;
     }
 
-    /// @notice Sherlock run #2 #12: return 0 when `paused()` so the
-    ///         EIP-4626 IMP-1 invariant holds for paused vaults
-    ///         (`deposit(maxDeposit(receiver), receiver)` MUST NOT revert).
-    ///         Active-proposal and whitelist cases remain reported as
-    ///         `type(uint256).max` here — adding either check costs ~100 B
-    ///         each (full `_lpFlowGate` staticcall path / EnumerableSet
-    ///         contains), busting EIP-170 on the V1.5 surface AND
-    ///         under-reporting valid live-NAV deposit flows (deposits
-    ///         during Executed with a bound adapter SHOULD succeed via
-    ///         `onLiveDeposit`). Frontends that need active-proposal
-    ///         precision should poll `governor.openProposalCount` and
-    ///         `governor.getActiveProposal(vault)` directly; whitelist
-    ///         status is available via `isApprovedDepositor(receiver)`.
+    /// @dev Sherlock run #2 #12: return 0 when `paused()` so the EIP-4626 IMP-1
+    ///      invariant holds (`deposit(maxDeposit(x), x)` MUST NOT revert when the
+    ///      action is disabled). Active-proposal / whitelist cases stay reported
+    ///      as `type(uint256).max` here (adding those checks busts EIP-170 and
+    ///      under-reports valid Lane A deposit flows); frontends poll
+    ///      `governor.getActiveProposal(vault)` + `isApprovedDepositor` directly.
     function maxDeposit(address) public view override returns (uint256) {
         if (paused()) return 0;
         return type(uint256).max;
@@ -680,22 +614,23 @@ contract SyndicateVault is
         return maxDeposit(receiver);
     }
 
-    /// @dev Block deposits when paused or depositor not approved.
-    ///      Auto-delegate to self on first deposit so shareholders get voting power.
-    ///      When a live-NAV adapter is bound, forward the new capital so it
-    ///      starts earning yield immediately instead of sitting as idle float.
+    /// @dev Instant deposit is allowed outside any open proposal, OR during an
+    ///      Executed proposal when Lane A live-NAV is available (positions priced
+    ///      vault-side by the PriceRouter). Otherwise it reverts and LPs use the
+    ///      async deposit queue (`requestDeposit`), entering at the realized
+    ///      settle price. Auto-delegate to self so shareholders get voting power.
     function _deposit(address caller, address receiver, uint256 assets, uint256 shares)
         internal
         override
         whenNotPaused
+        nonReentrant
     {
-        // Close the late-deposit window: a depositor during Pending /
-        // GuardianReview / Approved would otherwise be silently pulled into a
-        // strategy they never voted on by the next `executeProposal`. The
-        // `liveAdapter == 0` precondition preserves the live-NAV unlock
-        // during Executed when the adapter accepts inbound deposits.
-        (bool blocked, address liveAdapter,) = _lpFlowGate();
-        if (liveAdapter == address(0) && (blocked || _depositsLocked())) revert DepositsLocked();
+        (, bool laneA) = _liveNAV();
+        // During an open proposal (Pending..Executed) instant deposits are
+        // closed unless Lane A is live — a depositor mid-lifecycle would
+        // otherwise be pulled into a strategy they never voted on, or mint
+        // against an unrealized NAV.
+        if (_depositsLocked() && !laneA) revert DepositsLocked();
         if (!_openDeposits && !_approvedDepositors.contains(receiver)) revert NotApprovedDepositor();
         super._deposit(caller, receiver, assets, shares);
 
@@ -704,150 +639,69 @@ contract SyndicateVault is
             _delegate(receiver, receiver);
         }
 
-        // Forward live deposits to the adapter so capital starts earning
-        // immediately. `_lpFlowGate` already validated `valid=true` when it
-        // returned a non-zero adapter, so no extra positionValue check is
-        // needed here. Push model: transfer the assets to the adapter then
-        // call the hook — avoids needing an approve + transferFrom.
-        // Sherlock #24: forward to live adapter + atomic success-gating.
-        // Pre-fix this was fail-soft (try/catch with principal bumped
-        // regardless), but a failed hook stranded assets on the adapter:
-        // `positionValue()` didn't see them, so `totalAssets()` under-reported
-        // and the next depositor minted too many shares against the deflated
-        // NAV — dilution of existing holders. Hard-revert on hook failure so
-        // the whole deposit unwinds (safeTransfer rolls back with the
-        // outer call); no stranded capital, no silent NAV drift.
-        if (liveAdapter != address(0)) {
-            IERC20(asset()).safeTransfer(liveAdapter, assets);
-            uint256 pid = ISyndicateGovernor(_getGovernor()).getActiveProposal(address(this));
-            try IStrategy(liveAdapter).onLiveDeposit(assets) {
-                liveAdapterPrincipal[pid] += assets;
-            } catch {
-                // Sherlock #24: hard-revert. Parameterless to save bytecode.
-                pid;
-                revert LiveDepositRejected();
-            }
+        // G1: a Lane A entry locks the receiver's shares until this proposal
+        // settles — closes the deposit-low / exit-high intra-proposal MEV.
+        if (laneA) {
+            _laneALockPid[receiver] = ISyndicateGovernor(_getGovernor()).getActiveProposal(address(this));
         }
     }
 
-    /// @dev `maxWithdraw` / `maxRedeem` are the canonical lock gate (OZ
-    ///      ERC4626 invokes them before `_withdraw`). The redundant
-    ///      `redemptionsLocked()` check here was dropped to fit live-NAV
-    ///      logic under the bytecode budget.
-    /// @dev Live-NAV partial-unwind: when float is short and a live adapter
-    ///      is bound + reporting valid NAV, the vault asks the adapter to
-    ///      free `deficit` of underlying via `onLiveWithdraw`. The
-    ///      authoritative measure is the balance delta — strategies cannot
-    ///      lie about how much they returned. All-or-nothing: anything less
-    ///      than `deficit` reverts and the LP must use the async-redeem
-    ///      queue. The pulled amount is recorded per-proposal so the
-    ///      governor's settlement PnL formula can credit it back into the
-    ///      snapshot (see `liveAdapterWithdrawn` natspec).
+    /// @dev `maxWithdraw` / `maxRedeem` are the canonical lock gate (OZ ERC4626
+    ///      invokes them before `_withdraw`) — they return 0 while
+    ///      `redemptionsLocked()`, so instant exits are closed during a proposal
+    ///      and LPs use the async redeem queue (`requestRedeem`). The bound
+    ///      queue (`caller == _withdrawalQueue`) bypasses the reserve guard
+    ///      because the reserved float belongs to it.
     function _withdraw(address caller, address receiver, address _owner, uint256 assets, uint256 shares)
         internal
         override
         whenNotPaused
     {
-        // Queue bypasses the reserve check — it owns the reserved float.
         if (caller != _withdrawalQueue) {
             uint256 reserve = reservedQueueAssets();
             uint256 float = IERC20(asset()).balanceOf(address(this));
-            if (assets + reserve > float) {
-                if (!_pullFromLiveAdapter(assets + reserve - float)) revert QueueReserveBreached();
-            }
+            if (assets + reserve > float) revert QueueReserveBreached();
         }
         super._withdraw(caller, receiver, _owner, assets, shares);
     }
 
-    /// @dev Best-effort pull from the bound live-NAV adapter. Returns true
-    ///      iff exactly `needed` (or more) of asset arrived. Records the
-    ///      delta against the active proposal so settlement PnL stays
-    ///      neutral on LP flow. Falls back to false on: not locked, no
-    ///      adapter, adapter reverting, partial fill.
-    function _pullFromLiveAdapter(uint256 needed) private returns (bool) {
-        (bool blocked, address adapter,) = _lpFlowGate();
-        if (blocked || adapter == address(0)) return false;
-        uint256 before = IERC20(asset()).balanceOf(address(this));
-        try IStrategy(adapter).onLiveWithdraw(needed) returns (uint256) {}
-        catch {
-            return false;
-        }
-        uint256 received = IERC20(asset()).balanceOf(address(this)) - before;
-        if (received < needed) return false;
-        uint256 pid = ISyndicateGovernor(_getGovernor()).getActiveProposal(address(this));
-        // Sherlock #2: credit against the requested `needed`, not the
-        // possibly-larger `received`. Excess (a misbehaving / generous
-        // adapter sending back > needed) stays in the vault's float and is
-        // accounted once at settle via the standard balance diff — crediting
-        // `received` here would double-count it (once in `liveAdapterWithdrawn`,
-        // once in settle's `balanceAdjusted`) and inflate proposal PnL,
-        // overpaying performance/management/protocol fees out of LP funds.
-        liveAdapterWithdrawn[pid] += needed;
-        return true;
-    }
-
     /// @dev Cap visible to integrators so they don't propose withdrawals that
     ///      would breach the queue's reservation. Returns 0 while
-    ///      `redemptionsLocked()` is true (regular withdraw is closed).
-    ///      The bound withdrawal queue bypasses the reserve cap because the
-    ///      reserved float belongs to it — capping the queue would block
-    ///      `claim()` whenever pending shares dominate supply.
+    ///      `redemptionsLocked()` (instant withdraw is closed during a proposal;
+    ///      LPs use `requestRedeem`). The bound queue bypasses the reserve cap
+    ///      because the reserved float belongs to it.
     function maxWithdraw(address owner_) public view override returns (uint256) {
-        (bool blocked, address adapter, uint256 adapterValue) = _lpFlowGate();
-        if (paused() || blocked) return 0;
+        if (paused()) return 0;
         if (owner_ == _withdrawalQueue) return super.maxWithdraw(owner_);
+        if (_laneBOnly(owner_)) return 0;
         uint256 userMax = super.maxWithdraw(owner_);
         uint256 reserve = reservedQueueAssets();
         uint256 float = IERC20(asset()).balanceOf(address(this));
         uint256 available = float > reserve ? float - reserve : 0;
-        // Sherlock #37 (now closed via #50): credit adapter NAV only when
-        // `_onLiveWithdraw` can actually free liquidity (helper consolidates
-        // the staticcall for both `maxWithdraw` and `maxRedeem` to fit
-        // under EIP-170).
-        available += _withdrawableAdapterValue(adapter, adapterValue);
         return userMax > available ? available : userMax;
     }
 
     /// @dev Cap visible to integrators so they don't propose redeems that would
-    ///      breach the queue's reservation. Returns 0 while
-    ///      `redemptionsLocked()` is true (regular redeem is closed).
-    ///      The bound withdrawal queue bypasses the reserve cap (see
-    ///      `maxWithdraw`).
-    /// @dev IMP-2: caps by both the queue-share reserve AND available float.
-    ///      During live-NAV the vault forwards new deposits into the adapter
-    ///      so float can be near-zero while `totalSupply()` is large. Without
-    ///      the float cap, `redeem(maxRedeem(user), ...)` would revert with
-    ///      `QueueReserveBreached` inside `_withdraw` — an EIP-4626 conformance
-    ///      bug. The float-share conversion uses `convertToShares(float - reserve)`
-    ///      so the returned share count corresponds to assets actually backable
-    ///      by float at the current NAV.
+    ///      breach the queue's reservation. Returns 0 while `redemptionsLocked()`.
+    ///      The bound queue bypasses the reserve cap (see `maxWithdraw`).
     function maxRedeem(address owner_) public view override returns (uint256) {
-        (bool blocked, address adapter, uint256 adapterValue) = _lpFlowGate();
-        if (paused() || blocked) return 0;
+        if (paused()) return 0;
         if (owner_ == _withdrawalQueue) return super.maxRedeem(owner_);
+        if (_laneBOnly(owner_)) return 0;
         uint256 userMax = super.maxRedeem(owner_);
         uint256 reserveShares = pendingQueueShares();
         uint256 ts = totalSupply();
         if (ts == 0 || reserveShares >= ts) return 0;
         uint256 availableShares = ts - reserveShares;
-        // EIP-4626 conformance: redeem(maxRedeem(user), ...) must succeed
-        // even when float has been forwarded to the live-NAV adapter. Cap
-        // by float plus the adapter's already-fetched positionValue (reused
-        // from `_lpFlowGate` — no second staticcall).
         uint256 reserve = reservedQueueAssets();
         uint256 float = IERC20(asset()).balanceOf(address(this));
         uint256 backingAssets = float > reserve ? float - reserve : 0;
-        // Sherlock #37 / #50 — see `maxWithdraw` for rationale.
-        backingAssets += _withdrawableAdapterValue(adapter, adapterValue);
-        // Sherlock run #3 #9 (off-report): drop the `backingAssets == 0`
-        // early return — `convertToShares(0) = 0` lets the min-cap below
-        // collapse to 0 naturally. Skip the floatShares cap entirely when
-        // the user's full balance fits within `backingAssets` (covers the
-        // common dust case where `convertToAssets(userMax) == 0` and lets
-        // small redeems pass without rounding-down losses). Pre-fix, users
-        // with shares that redeemed to 0 wei got stranded once float
-        // dropped to the queue reserve. The `_withdraw` reserve check
-        // (`assets + reserve > float`) still gates real asset draws.
+        // Sherlock run #3 #9 (off-report): no `backingAssets == 0` early return —
+        // skip the floatShares cap entirely when the user's full balance fits
+        // within `backingAssets` (covers the dust case where
+        // `convertToAssets(userMax) == 0`, which pre-fix stranded tiny redeems
+        // once float dropped to the queue reserve). `_withdraw`'s reserve check
+        // still gates real asset draws.
         if (convertToAssets(userMax) > backingAssets) {
             uint256 floatShares = convertToShares(backingAssets);
             if (floatShares < availableShares) availableShares = floatShares;
@@ -868,19 +722,19 @@ contract SyndicateVault is
     ///      escrowed shares back to themselves at any time.
     /// @return requestId Always > 0 — the queue uses index 0 as a sentinel.
     ///         Off-chain integrators may treat 0 as "no request".
-    /// @dev `nonReentrant` dropped: state writes happen before the external
-    ///      `queueRequest` call — `_spendAllowance` (allowance state)
-    ///      followed by `_transfer` (share ledger) both commit before the
-    ///      queue is invoked. The queue is the team's own
-    ///      `VaultWithdrawalQueue` (added per-vault by the factory) and
-    ///      `queueRequest` only appends to its own storage — no callback
-    ///      vector into this vault. Paired with the Sherlock run #2 #12
-    ///      `maxDeposit` / `maxMint` overrides for ~20 B headroom.
-    function requestRedeem(uint256 shares, address owner_) external whenNotPaused returns (uint256 requestId) {
+    function requestRedeem(uint256 shares, address owner_)
+        external
+        nonReentrant
+        whenNotPaused
+        returns (uint256 requestId)
+    {
         address q = _withdrawalQueue;
         if (q == address(0)) revert WithdrawalQueueNotSet();
         if (!redemptionsLocked()) revert RedemptionsNotLocked();
         if (shares == 0) revert InsufficientShares();
+        // G1: shares entered via Lane A this proposal are locked until it settles
+        // (blocks the Lane A entry → Lane B exit bypass within one proposal).
+        if (_isLaneALocked(owner_)) revert SharesLocked();
         if (msg.sender != owner_) {
             _spendAllowance(owner_, msg.sender, shares);
         }
@@ -890,9 +744,36 @@ contract SyndicateVault is
         // pre-transfer weight, so vote power is preserved for in-flight proposals.
         // Queued shares forfeit voting power for any proposal opened after escrow.
         // Shares are burned later by `claim`.
+        uint256 pid = ISyndicateGovernor(_getGovernor()).getActiveProposal(address(this));
         _transfer(owner_, q, shares);
-        requestId = IVaultWithdrawalQueue(q).queueRequest(owner_, shares);
+        requestId = IVaultWithdrawalQueue(q).queueRedeem(owner_, shares, pid);
         emit RedeemRequested(requestId, owner_, shares);
+    }
+
+    /// @inheritdoc ISyndicateVault
+    /// @notice Mint-deferred deposit used while a strategy proposal is active.
+    ///         Escrows `assets` in the queue (off-vault, so they never inflate
+    ///         `totalAssets` nor are swept into the strategy) and records a claim
+    ///         that mints shares at the realized settle price once the proposal
+    ///         settles. Standard `deposit`/`mint` is used outside the lock window.
+    /// @return requestId Always > 0 (queue uses index 0 as a sentinel).
+    function requestDeposit(uint256 assets, address receiver)
+        external
+        nonReentrant
+        whenNotPaused
+        returns (uint256 requestId)
+    {
+        address q = _withdrawalQueue;
+        if (q == address(0)) revert WithdrawalQueueNotSet();
+        if (!redemptionsLocked()) revert RedemptionsNotLocked();
+        if (assets == 0) revert ZeroAssets();
+        if (!_openDeposits && !_approvedDepositors.contains(receiver)) revert NotApprovedDepositor();
+        uint256 pid = ISyndicateGovernor(_getGovernor()).getActiveProposal(address(this));
+        // Escrow assets in the queue (off-vault custody — never counted in
+        // totalAssets, never swept into the strategy).
+        IERC20(asset()).safeTransferFrom(msg.sender, q, assets);
+        requestId = IVaultWithdrawalQueue(q).queueDeposit(receiver, assets, pid);
+        emit DepositRequested(requestId, receiver, assets);
     }
 
     /// @inheritdoc ISyndicateVault
@@ -903,8 +784,48 @@ contract SyndicateVault is
     }
 
     /// @inheritdoc ISyndicateVault
+    /// @dev The queue tracks the exact frozen asset amount owed to already-
+    ///      settled, unclaimed redeem requests. Instant withdrawals and strategy
+    ///      executions must leave this float in the vault so queued claims are
+    ///      always honorable.
     function reservedQueueAssets() public view returns (uint256) {
-        return convertToAssets(pendingQueueShares());
+        address q = _withdrawalQueue;
+        if (q == address(0)) return 0;
+        return IVaultWithdrawalQueue(q).reservedAssets();
+    }
+
+    /// @inheritdoc ISyndicateVault
+    /// @notice Queue-only: burn `shares` escrowed in the queue and pay `assets`
+    ///         to `to` at the proposal's frozen settle price. The queue computes
+    ///         `assets` from the stamped price; the vault trusts it (the queue is
+    ///         set-once at deploy by the factory).
+    function settleRedeem(uint256 shares, uint256 assets, address to) external nonReentrant {
+        if (msg.sender != _withdrawalQueue) revert NotQueue();
+        _burn(_withdrawalQueue, shares);
+        IERC20(asset()).safeTransfer(to, assets);
+    }
+
+    /// @inheritdoc ISyndicateVault
+    /// @notice Queue-only: mint `shares` to `to` at the proposal's frozen settle
+    ///         price. The queue pushes the escrowed assets to the vault
+    ///         immediately before this call. Auto-delegates for voting power.
+    function settleDeposit(uint256 shares, address to) external nonReentrant {
+        if (msg.sender != _withdrawalQueue) revert NotQueue();
+        _mint(to, shares);
+        if (delegates(to) == address(0)) _delegate(to, to);
+    }
+
+    /// @inheritdoc ISyndicateVault
+    /// @notice Governor-only: stamp the realized settle price for `proposalId`
+    ///         into the queue so every request tagged to it claims at one frozen
+    ///         price. `num/den` carry the ERC-4626 virtual offsets so the queue
+    ///         reproduces the vault's conversion rounding exactly.
+    function onProposalSettled(uint256 proposalId) external onlyGovernor {
+        address q = _withdrawalQueue;
+        if (q == address(0)) return;
+        uint256 num = totalAssets() + 1;
+        uint256 den = totalSupply() + 10 ** _decimalsOffset();
+        IVaultWithdrawalQueue(q).stampSettlement(proposalId, num, den);
     }
 
     // ==================== RESCUE ====================
@@ -930,17 +851,7 @@ contract SyndicateVault is
     }
 
     /// @notice Rescue ERC-721 tokens accidentally sent to the vault.
-    ///         Blocked during active proposals (protects in-flight strategy
-    ///         position NFTs e.g. Uniswap V3 LP).
-    /// @dev    Sherlock run #1 finding #25 (Medium) — post-settle window
-    ///         lets the owner extract strategy-position NFTs whose value
-    ///         isn't credited by the asset-only settle PnL formula. An
-    ///         allowlist of rescuable token contracts is the recommended
-    ///         long-term fix but exceeds the contract's EIP-170 bytecode
-    ///         budget today (#37 / #38 / #50 added incremental cost).
-    ///         Mitigation until the allowlist lands: the owner multisig
-    ///         should review every strategy-position NFT contract before
-    ///         calling, and the contract is monitored off-chain.
+    ///         Blocked during active proposals to protect strategy position NFTs (e.g., Uniswap V3 LP).
     function rescueERC721(address token, uint256 tokenId, address to) external onlyOwner {
         if (redemptionsLocked()) revert RedemptionsLocked();
         if (to == address(0)) revert ZeroAddress();

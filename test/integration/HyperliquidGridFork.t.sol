@@ -191,29 +191,6 @@ contract HyperliquidGridForkTest is HyperEVMIntegrationTest {
         assertGt(lp1Got, 0, "lp1 redeems non-zero (proportional to remaining)");
     }
 
-    /// @notice Verifies that onLiveDeposit() forwards mid-proposal LP deposits to
-    ///         HyperCore perp via a class transfer RawAction on the real CoreWriter.
-    function test_liveDeposit_routesToHyperCorePerp() public {
-        address clone = _cloneAndInit(hyperliquidGridTemplate, _initData());
-        HyperliquidGridStrategy strategy = HyperliquidGridStrategy(clone);
-        (BatchExecutorLib.Call[] memory exec, BatchExecutorLib.Call[] memory settle) = _execAndSettleCalls(clone);
-        _proposeVoteApprove(exec, settle, 1000, DURATION);
-
-        // Simulate the vault pushing a live deposit to the strategy (vault pre-transfers).
-        uint256 liveDeposit = 10_000e6;
-        deal(USDC, clone, liveDeposit);
-
-        vm.recordLogs();
-        vm.prank(address(vault));
-        strategy.onLiveDeposit(liveDeposit);
-        Vm.Log[] memory logs = vm.getRecordedLogs();
-
-        (bool found, uint64 ntl, bool toPerp) = _decodeClassTransfer(logs);
-        assertTrue(found, "class transfer RawAction not emitted by CoreWriter");
-        assertEq(ntl, uint64(liveDeposit), "class transfer amount must equal live deposit");
-        assertTrue(toPerp, "toPerp must be true for live deposit");
-    }
-
     /// @notice Verifies that _settle() reads the AccountMarginSummary precompile and sends
     ///         a class transfer with that exact amount — not type(uint64).max.
     ///

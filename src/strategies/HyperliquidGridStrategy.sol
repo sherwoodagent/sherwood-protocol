@@ -33,10 +33,6 @@ import {ISyndicateVault} from "../interfaces/ISyndicateVault.sol";
  *   right after, so the EVM push must happen here. sweepToVault() recovers
  *   any late HC arrivals (post-block bridge credits).
  *
- *   Live NAV: _positionValue() reports HyperCore perp account equity via
- *   L1Read.accountMarginSummary, so the vault can mark shares to market and
- *   accept deposits / withdrawals while the proposal is active.
- *
  *   HyperCore note: ERC-1167 clone addresses need explicit HC registration
  *   before ERC-20 USDC transfers auto-credit HC spot. `_initialize()` writes
  *   `address(this)` to slot 0 (`_hcSelf` from BaseStrategy). The CLI then
@@ -122,11 +118,11 @@ contract HyperliquidGridStrategy is BaseStrategy {
     uint256 public lastRecoverBlock;
     /// @notice High-water mark of USDC committed to HC but not yet observed
     ///         on HC by the precompile (in 6-decimal USDC units). Incremented
-    ///         in `_execute` and `_onLiveDeposit` after each `bridgeUsdcToSpot`,
-    ///         and bumped to `max(self, preDrainHcTotal)` inside `_initiateReturn`
-    ///         to cover the outbound HC→EVM transit window. Grows monotonically
-    ///         until the proposal lifecycle ends. `_positionValue` reconciles it
-    ///         against observable HC + EVM via `HyperliquidBridge.CORE_ACCOUNT_FEE_TOLERANCE`.
+    ///         in `_execute` after each `bridgeUsdcToSpot`, and bumped to
+    ///         `max(self, preDrainHcTotal)` inside `_initiateReturn` to cover
+    ///         the outbound HC→EVM transit window. Grows monotonically until
+    ///         the proposal lifecycle ends. Retained as an on-chain accounting
+    ///         marker for off-chain monitoring.
     uint256 public inFlightToHc;
 
     /// @notice CLOIDs of resting GTC grid orders, tracked per asset. Maintained
@@ -237,27 +233,11 @@ contract HyperliquidGridStrategy is BaseStrategy {
         // class-transferring whatever actually landed.
         L1Write.sendUsdClassTransfer(ntl, true);
 
-        // Track the in-flight bridge so vault NAV (`positionValue`) doesn't
-        // under-report during the cross-block window before HC processes.
+        // Track the in-flight bridge for off-chain accounting of the cross-
+        // block window before HC processes.
         inFlightToHc += amountIn;
 
         emit FundsParked(amountIn);
-    }
-
-    /// @dev Routes a mid-proposal LP deposit into the live HC perp account.
-    ///      The vault has already pushed `assets` USDC to this address before
-    ///      calling here. Bridge EVM → HC spot via Circle's CoreDepositWallet,
-    ///      then class-transfer spot → perp. Subsequent deposits don't pay the
-    ///      first-deposit fee (the HC account already exists), so the class
-    ///      transfer for the full `assets` succeeds.
-    function _onLiveDeposit(uint256 assets) internal override {
-        if (assets == 0) return;
-        if (assets > type(uint64).max) revert DepositAmountTooLarge();
-        // Bridge new deposit's EVM USDC → HC spot, then move spot → perp.
-        HyperliquidBridge.bridgeUsdcToSpot(asset, assets);
-        L1Write.sendUsdClassTransfer(uint64(assets), true);
-        inFlightToHc += assets;
-        emit FundsParked(assets);
     }
 
     function _updateParams(bytes calldata data) internal override {
@@ -559,11 +539,9 @@ contract HyperliquidGridStrategy is BaseStrategy {
 
         // Outbound in-transit high-water mark: the spot→EVM bridge is async
         // (HC processes post-block). Between this tx and HC's bridge ack, the
-        // precompiles will report HC = 0 while EVM hasn't received yet. Lock
-        // `inFlightToHc` to the pre-drain HC observable so NAV doesn't drop
-        // to 0 in that gap. Once EVM USDC arrives, `_positionValue`'s
-        // tolerance fallback (observable + HyperliquidBridge.CORE_ACCOUNT_FEE_TOLERANCE
-        // >= inFlightToHc) brings NAV back to live observable.
+        // precompiles report HC = 0 while EVM hasn't received yet. Lock
+        // `inFlightToHc` to the pre-drain HC observable as an off-chain
+        // accounting marker for that gap.
         uint256 preDrainPerpVal = preDrainAccountValue > 0 ? uint256(int256(preDrainAccountValue)) : 0;
         uint256 preDrainSpotVal = uint256(preSpot) / HyperliquidBridge.PERP_TO_SPOT_WEI;
         uint256 preDrainHcTotal = preDrainPerpVal + preDrainSpotVal;
@@ -640,59 +618,6 @@ contract HyperliquidGridStrategy is BaseStrategy {
     ///         decoding the full array off-chain).
     function liveCloidsLength(uint32 assetIndex) external view returns (uint256) {
         return _liveCloids[assetIndex].length;
-    }
-
-    /// @inheritdoc BaseStrategy
-    /// @dev Live NAV = HC perp + HC spot + EVM. Reconciles against
-    ///      `inFlightToHc` via a Circle-fee-sized tolerance:
-    ///
-    ///        observable + tolerance >= inFlightToHc ? observable : inFlightToHc
-    ///
-    ///      Tolerance (1 USDC = `HyperliquidBridge.CORE_ACCOUNT_FEE_TOLERANCE`)
-    ///      absorbs Circle's `DEFAULT_NEW_CORE_ACCOUNT_FEE` permanent strand
-    ///      so the post-fee steady state trusts observable. A genuine cross-
-    ///      block in-transit window (inbound `_execute`/`_onLiveDeposit` or
-    ///      outbound `_initiateReturn`) opens a gap ≫ tolerance, so the
-    ///      fallback returns `inFlightToHc` and NAV stays stable.
-    ///
-    ///      Always `valid=true` in `Executed` state. Vault has already pulled
-    ///      funds in, and `valid=false` would degrade `totalAssets()` to the
-    ///      queue-only path — deposits would revert with `DepositsLocked` and
-    ///      the LP UI would brick. Conservatism (returning live `observable`
-    ///      or the high-water mark) is always preferable to flagging invalid.
-    function _positionValue() internal view override returns (uint256, bool) {
-        // Read HC perp account margin
-        (bool success, bytes memory ret) = L1Read.ACCOUNT_MARGIN_SUMMARY_PRECOMPILE_ADDRESS
-        .staticcall{gas: L1Read.ACCOUNT_MARGIN_SUMMARY_GAS}(
-            abi.encode(uint32(0), address(this))
-        );
-        uint256 perpVal = 0;
-        if (success && ret.length >= 128) {
-            AccountMarginSummary memory s = abi.decode(ret, (AccountMarginSummary));
-            if (s.accountValue > 0) perpVal = uint256(int256(s.accountValue));
-        }
-
-        // Read HC spot balance for USDC (token=0). Convert spot wei (8-dec) →
-        // perp/EVM units (6-dec) via `/ PERP_TO_SPOT_WEI`.
-        (bool spotOk, bytes memory spotRet) = L1Read.SPOT_BALANCE_PRECOMPILE_ADDRESS
-        .staticcall{gas: L1Read.SPOT_BALANCE_GAS}(
-            abi.encode(address(this), uint64(HyperliquidBridge.USDC_TOKEN_INDEX))
-        );
-        uint256 spotVal = 0;
-        if (spotOk && spotRet.length >= 96) {
-            SpotBalance memory sb = abi.decode(spotRet, (SpotBalance));
-            spotVal = uint256(sb.total) / HyperliquidBridge.PERP_TO_SPOT_WEI;
-        }
-
-        uint256 evmBal = IERC20(asset).balanceOf(address(this));
-        uint256 observable = perpVal + spotVal + evmBal;
-
-        // Sherlock #55: drop the `inFlightToHc` high-water-mark fallback.
-        // Same root cause as the perp strategy (#22): the HWM never
-        // decremented, so realized grid losses (adverse fills, funding)
-        // were masked — NAV stayed inflated, new LPs minted cheap shares,
-        // remaining LPs diluted. Honest observable-only is correct.
-        return (observable, true);
     }
 
     /// @notice Move all HC spot USDC to perp margin via class transfer.

@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import {BaseStrategy} from "./BaseStrategy.sol";
 import {IStrategy} from "../interfaces/IStrategy.sol";
+import {Position} from "../interfaces/IPriceRouter.sol";
 import {ICToken} from "../interfaces/ICToken.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -44,16 +45,18 @@ contract MoonwellSupplyStrategy is BaseStrategy {
 
     bool public isNativeEthMarket; // mWETH-style markets that send native ETH on redeem
 
-    /// @notice Sherlock run #2 #17: cumulative underlying drained by
-    ///         `_onLiveWithdraw` over the strategy lifecycle. `_settle`
-    ///         compares `redeemed + liveWithdrawn` against `minRedeemAmount`
-    ///         so live LP exits during the execution window can't push the
-    ///         residual balance below the floor and brick settlement.
-    uint256 public liveWithdrawn;
-
     /// @inheritdoc IStrategy
     function name() external pure returns (string memory) {
         return "Moonwell Supply";
+    }
+
+    /// @inheritdoc IStrategy
+    /// @dev One Moonwell supply position. The vault prices the mToken balance
+    ///      via the PriceRouter's MoonwellSupplyAdapter (venue-read against the
+    ///      Comptroller-listed market) — the strategy is never trusted for value.
+    function positions() external view override returns (Position[] memory ps) {
+        ps = new Position[](1);
+        ps[0] = Position({venue: mToken, kind: keccak256("MOONWELL_SUPPLY"), ref: ""});
     }
 
     /// @notice Decode: (address underlying, address mToken, uint256 supplyAmount,
@@ -108,11 +111,9 @@ contract MoonwellSupplyStrategy is BaseStrategy {
             IWETH(underlying).deposit{value: address(this).balance}();
         }
 
-        // Verify we got enough underlying back. Sherlock run #2 #17: credit
-        // the cumulative live-withdrawn amount so live LP exits during the
-        // execution window don't push the residual balance below the floor.
+        // Verify we got enough underlying back.
         uint256 redeemed = IERC20(underlying).balanceOf(address(this));
-        if (redeemed + liveWithdrawn < minRedeemAmount) revert InvalidAmount();
+        if (redeemed < minRedeemAmount) revert InvalidAmount();
 
         // Push everything back to the vault
         _pushAllToVault(underlying);
@@ -133,63 +134,5 @@ contract MoonwellSupplyStrategy is BaseStrategy {
         (uint256 newSupplyAmount, uint256 newMinRedeemAmount) = abi.decode(data, (uint256, uint256));
         if (newSupplyAmount > 0) supplyAmount = newSupplyAmount;
         if (newMinRedeemAmount > 0) minRedeemAmount = newMinRedeemAmount;
-    }
-
-    /// @notice Mint additional mTokens against `assets` of underlying that
-    ///         the vault has just pushed into this strategy. The vault
-    ///         performs the push via `safeTransfer` immediately before
-    ///         calling `onLiveDeposit`, so the underlying is already on
-    ///         this contract's balance — we only need to approve + mint.
-    function _onLiveDeposit(uint256 assets) internal override {
-        if (assets == 0) return;
-        IERC20(underlying).forceApprove(mToken, assets);
-        uint256 err = ICToken(mToken).mint(assets);
-        if (err != 0) revert MintFailed();
-    }
-
-    /// @notice Sherlock #50 — free `assetsNeeded` of underlying from the
-    ///         Moonwell position and push it to the vault. Returns the
-    ///         amount transferred (or 0 if the redeem failed or returned
-    ///         less than requested — the vault treats partial fill as a
-    ///         queue-fallback signal). Native-ETH markets are not
-    ///         supported here (Moonwell ETH market wraps WETH → native at
-    ///         redeem; vault asset is always ERC-20). All-or-nothing.
-    function _onLiveWithdraw(uint256 assetsNeeded) internal override returns (uint256) {
-        if (assetsNeeded == 0) return 0;
-        // `redeemUnderlying` accepts the exact underlying amount the vault
-        // wants. Returns nonzero on failure (insufficient mTokens, paused
-        // market, etc.).
-        uint256 err = ICToken(mToken).redeemUnderlying(assetsNeeded);
-        if (err != 0) return 0;
-        // Verify the redeem produced at least `assetsNeeded` on this
-        // contract's balance (Moonwell could under-deliver in edge cases).
-        uint256 bal = IERC20(underlying).balanceOf(address(this));
-        if (bal < assetsNeeded) return 0;
-        IERC20(underlying).safeTransfer(msg.sender, assetsNeeded);
-        // Sherlock run #2 #17: track cumulative live-withdrawn for the
-        // settle-floor credit.
-        liveWithdrawn += assetsNeeded;
-        return assetsNeeded;
-    }
-
-    /// @notice Sherlock #37 capability flag — re-added now that
-    ///         `_onLiveWithdraw` is implemented (#50). Vault gates
-    ///         `maxWithdraw` / `maxRedeem` on this so an adapter without
-    ///         live-withdraw doesn't over-promise.
-    function supportsLiveWithdraw() external pure override returns (bool) {
-        return true;
-    }
-
-    // ── positionValue ──
-
-    /// @dev Current underlying value of the supplied position. Uses
-    ///      `exchangeRateStored` (last-accrued) rather than accruing
-    ///      fresh interest — the one-block staleness is acceptable for
-    ///      a display-only readout and keeps this cheap + pure view.
-    function _positionValue() internal view override returns (uint256, bool) {
-        uint256 cBal = ICToken(mToken).balanceOf(address(this));
-        if (cBal == 0) return (0, true);
-        uint256 rate = ICToken(mToken).exchangeRateStored();
-        return ((cBal * rate) / 1e18, true);
     }
 }

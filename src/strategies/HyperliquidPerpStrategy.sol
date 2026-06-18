@@ -7,6 +7,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {L1Write, TimeInForce, NO_CLOID, FinalizeVariant} from "../hyperliquid/L1Write.sol";
 import {L1Read, Position, SpotBalance, AccountMarginSummary} from "../hyperliquid/L1Read.sol";
+import {Position as RouterPosition} from "../interfaces/IPriceRouter.sol";
 import {HyperliquidBridge} from "../hyperliquid/HyperliquidBridge.sol";
 import {ISyndicateGovernor} from "../interfaces/ISyndicateGovernor.sol";
 import {ISyndicateVault} from "../interfaces/ISyndicateVault.sol";
@@ -113,8 +114,8 @@ contract HyperliquidPerpStrategy is BaseStrategy {
     /// @notice High-water mark of USDC committed to HC but not yet observed
     ///         on HC by the precompile (in 6-decimal USDC units). See grid
     ///         for full rationale — covers both inbound and outbound cross-
-    ///         block transit windows. Reconciled in `_positionValue` via
-    ///         `HyperliquidBridge.CORE_ACCOUNT_FEE_TOLERANCE`.
+    ///         block transit windows. Retained as an on-chain accounting
+    ///         marker for off-chain monitoring.
     uint256 public inFlightToHc;
     /// @dev Cumulative USDC pushed back to the vault across all sweepToVault() calls.
     ///      Off-chain accounting only — does not gate withdrawals.
@@ -132,6 +133,21 @@ contract HyperliquidPerpStrategy is BaseStrategy {
     /// @inheritdoc IStrategy
     function name() external pure returns (string memory) {
         return "Hyperliquid Perp";
+    }
+
+    /// @inheritdoc IStrategy
+    /// @dev One HyperCore perp position, priced by the PriceRouter's
+    ///      HyperliquidPerpAdapter (the AccountMarginSummary precompile mark).
+    ///      `ref` carries the perp dex index (0 = main). Lane A stays governance-
+    ///      disabled for `HL_PERP` until the bridge in-transit accounting is
+    ///      audited; until then `valueStrategy` falls through to the async queue.
+    function positions() external view override returns (RouterPosition[] memory ps) {
+        ps = new RouterPosition[](1);
+        ps[0] = RouterPosition({
+            venue: L1Read.ACCOUNT_MARGIN_SUMMARY_PRECOMPILE_ADDRESS,
+            kind: keccak256("HL_PERP"),
+            ref: abi.encode(uint32(0))
+        });
     }
 
     /// @notice Decode: (address asset, uint256 depositAmount, uint32 perpAssetIndex, uint32 leverage, uint256 maxPositionSize, uint32 maxTradesPerDay)
@@ -583,48 +599,6 @@ contract HyperliquidPerpStrategy is BaseStrategy {
         if (preDrainHcTotal > inFlightToHc) inFlightToHc = preDrainHcTotal;
     }
 
-    /// @inheritdoc BaseStrategy
-    /// @dev See `HyperliquidGridStrategy._positionValue` for full design.
-    ///      Live NAV sums HC perp + HC spot + EVM, then chooses between
-    ///      observable and the high-water mark via `CORE_ACCOUNT_FEE_TOLERANCE`:
-    ///      gap ≤ tolerance → trust observable (Circle-fee steady state); gap
-    ///      ≫ tolerance → fall back to `inFlightToHc` (genuine in-transit).
-    function _positionValue() internal view override returns (uint256, bool) {
-        (bool success, bytes memory ret) = L1Read.ACCOUNT_MARGIN_SUMMARY_PRECOMPILE_ADDRESS
-        .staticcall{gas: L1Read.ACCOUNT_MARGIN_SUMMARY_GAS}(
-            abi.encode(uint32(0), address(this))
-        );
-        uint256 perpVal = 0;
-        if (success && ret.length >= 128) {
-            AccountMarginSummary memory s = abi.decode(ret, (AccountMarginSummary));
-            if (s.accountValue > 0) perpVal = uint256(int256(s.accountValue));
-        }
-
-        (bool spotOk, bytes memory spotRet) = L1Read.SPOT_BALANCE_PRECOMPILE_ADDRESS
-        .staticcall{gas: L1Read.SPOT_BALANCE_GAS}(
-            abi.encode(address(this), uint64(HyperliquidBridge.USDC_TOKEN_INDEX))
-        );
-        uint256 spotVal = 0;
-        if (spotOk && spotRet.length >= 96) {
-            SpotBalance memory sb = abi.decode(spotRet, (SpotBalance));
-            spotVal = uint256(sb.total) / HyperliquidBridge.PERP_TO_SPOT_WEI;
-        }
-
-        uint256 evmBal = IERC20(asset).balanceOf(address(this));
-        uint256 observable = perpVal + spotVal + evmBal;
-
-        // Sherlock #22: drop the `inFlightToHc` high-water-mark fallback.
-        // Pre-fix, NAV returned `max(observable, inFlightToHc)`, which never
-        // decremented. Realized trading losses (stop-loss triggers, adverse
-        // funding, liquidations) dropped `observable` but the HWM held NAV at
-        // the pre-loss value — `totalAssets()` stayed inflated and new LP
-        // deposits minted shares against a fictional NAV, diluting existing
-        // holders. Honest observable-only is correct: bridge-in-transit
-        // discrepancy resolves within a few blocks anyway, and lying about
-        // NAV to paper over transient observability gaps is the worse trade.
-        return (observable, true);
-    }
-
     /// @notice Move all HC spot USDC to perp margin via class transfer.
     ///         See grid for full rationale — recovers from Circle's first-
     ///         deposit fee dropping the original class transfer in `_execute`.
@@ -640,22 +614,5 @@ contract HyperliquidPerpStrategy is BaseStrategy {
         uint64 perpAmount = sb.total / HyperliquidBridge.PERP_TO_SPOT_WEI;
         if (perpAmount == 0) return;
         L1Write.sendUsdClassTransfer(perpAmount, true);
-    }
-
-    /// @dev Routes a mid-proposal LP deposit into HC perp margin. Vault has
-    ///      already pushed `assets` USDC to this address before calling here.
-    ///      Mirrors `_execute`: bridge EVM → HC spot via Circle's CoreDepositWallet,
-    ///      then class-transfer spot → perp. The first-deposit fee is only
-    ///      charged on a fresh HC account, so subsequent deposits land at full
-    ///      `assets` on HC. Bumping `inFlightToHc` covers the cross-block
-    ///      window between this tx and HC's post-block credit; `_positionValue`
-    ///      reconciles via the tolerance fallback.
-    function _onLiveDeposit(uint256 assets) internal override {
-        if (assets == 0) return;
-        if (assets > type(uint64).max) revert DepositAmountTooLarge();
-        HyperliquidBridge.bridgeUsdcToSpot(asset, assets);
-        L1Write.sendUsdClassTransfer(uint64(assets), true);
-        inFlightToHc += assets;
-        emit FundsParked(assets);
     }
 }

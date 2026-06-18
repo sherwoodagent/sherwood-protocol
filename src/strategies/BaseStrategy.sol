@@ -2,6 +2,7 @@
 pragma solidity 0.8.28;
 
 import {IStrategy} from "../interfaces/IStrategy.sol";
+import {Position} from "../interfaces/IPriceRouter.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
@@ -143,40 +144,10 @@ abstract contract BaseStrategy is IStrategy {
     }
 
     /// @inheritdoc IStrategy
-    /// @dev State gating is centralized here so concrete strategies only
-    ///      need to override `_positionValue` for the Executed case.
-    function positionValue() external view virtual returns (uint256, bool) {
-        if (_state != State.Executed) return (0, false);
-        return _positionValue();
-    }
-
-    /// @inheritdoc IStrategy
-    /// @dev Default no-op — strategies that can absorb mid-position
-    ///      capital override `_onLiveDeposit`. Only callable by the vault and
-    ///      only while the strategy is `Executed`.
-    function onLiveDeposit(uint256 assets) external virtual onlyVault {
-        if (_state != State.Executed) return;
-        _onLiveDeposit(assets);
-    }
-
-    /// @inheritdoc IStrategy
-    /// @dev Default returns 0 — strategies that can free liquidity on demand
-    ///      override `_onLiveWithdraw`. The vault treats any returned amount
-    ///      less than `assetsNeeded` as "cannot fulfil" and reverts the LP's
-    ///      withdraw (all-or-nothing), falling back to the async-redeem queue.
-    function onLiveWithdraw(uint256 assetsNeeded) external virtual onlyVault returns (uint256) {
-        if (_state != State.Executed) return 0;
-        return _onLiveWithdraw(assetsNeeded);
-    }
-
-    /// @inheritdoc IStrategy
-    /// @dev Default `false`. Strategies that implement a meaningful
-    ///      `_onLiveWithdraw` override this to `true` so the vault unlocks
-    ///      `maxWithdraw` / `maxRedeem` against the adapter NAV. Strategies
-    ///      without a partial-unwind path keep the default; the vault then
-    ///      clamps to float-only during the active proposal.
-    function supportsLiveWithdraw() external view virtual returns (bool) {
-        return false;
+    /// @dev Default: no instant-priceable positions (queue-only / Lane B).
+    ///      Strategies whose positions the PriceRouter can value override this.
+    function positions() external view virtual returns (Position[] memory) {
+        return new Position[](0);
     }
 
     // ── Internal helpers ──
@@ -210,38 +181,4 @@ abstract contract BaseStrategy is IStrategy {
 
     /// @notice Update tunable parameters (decode from data)
     function _updateParams(bytes calldata data) internal virtual;
-
-    /// @notice Executed-state position valuation. Default stub returns
-    ///         (0, false) so strategies without a queryable current
-    ///         value (Mamo, Venice, HyperLiquid on non-HyperEVM) can
-    ///         inherit without overriding. Strategies that can compute
-    ///         an onchain value override this with their implementation.
-    function _positionValue() internal view virtual returns (uint256, bool) {
-        return (0, false);
-    }
-
-    /// @notice Override to route new vault deposits into the live position.
-    ///         Default: no-op. Only invoked while the strategy is `Executed`.
-    function _onLiveDeposit(
-        uint256 /*assets*/
-    )
-        internal
-        virtual {
-        // default: do nothing
-    }
-
-    /// @notice Override to free `assetsNeeded` of underlying from the live
-    ///         position and push it to the vault. Default: returns 0,
-    ///         signalling no partial-unwind capability — LPs use the async
-    ///         queue while the strategy is active. Only invoked while the
-    ///         strategy is `Executed`.
-    function _onLiveWithdraw(
-        uint256 /*assetsNeeded*/
-    )
-        internal
-        virtual
-        returns (uint256 assetsReturned)
-    {
-        return 0;
-    }
 }

@@ -2,42 +2,14 @@
 pragma solidity 0.8.28;
 
 import {IStrategy} from "../../src/interfaces/IStrategy.sol";
+import {Position} from "../../src/interfaces/IPriceRouter.sol";
 
-/// @notice Minimal IStrategy stub for vault NAV tests. Lets a test set
-///         `(value, valid)` returned by `positionValue()` and records
-///         the last `onLiveDeposit` call so the vault's forwarding hook
-///         can be asserted.
+/// @notice Minimal IStrategy stub for vault/governor tests that only need a
+///         strategy *address* on a proposal (e.g. `activeStrategyAdapter`
+///         resolution, redemption-lock semantics). The V2 live-NAV redesign
+///         removed the value/hook surface — the vault never reads value from a
+///         strategy — so this stub implements only the core lifecycle.
 contract MockStrategyAdapter is IStrategy {
-    uint256 public mockValue;
-    bool public mockValid;
-
-    /// @notice Last assets pushed into `onLiveDeposit` by the vault.
-    uint256 public lastLiveDeposit;
-    uint256 public liveDepositCount;
-
-    /// @notice Optional vault-authorization gate for `onLiveDeposit`. When zero
-    ///         (default), the gate is disabled and any caller is allowed —
-    ///         preserves backward compatibility with tests that prank in as
-    ///         the vault without configuring this mock. When non-zero, mirrors
-    ///         the production `BaseStrategy.onLiveDeposit` `onlyVault` check.
-    address public configuredVault;
-
-    function setValue(uint256 v, bool valid_) external {
-        mockValue = v;
-        mockValid = valid_;
-    }
-
-    /// @notice Configure the expected vault caller for `onLiveDeposit`. Pass
-    ///         `address(0)` to disable the gate (default).
-    function setConfiguredVault(address v) external {
-        configuredVault = v;
-    }
-
-    function positionValue() external view returns (uint256, bool) {
-        return (mockValue, mockValid);
-    }
-
-    // Stubs for the rest of IStrategy — vault doesn't call these in NAV tests.
     function initialize(address, address, bytes calldata) external pure {}
 
     function execute() external pure {}
@@ -62,22 +34,8 @@ contract MockStrategyAdapter is IStrategy {
         return "MockStrategyAdapter";
     }
 
-    function onLiveDeposit(uint256 assets) external {
-        // Default-disabled gate: backwards-compatible with existing tests that
-        // call this directly. When `configuredVault` is set, the gate mirrors
-        // production `BaseStrategy.onLiveDeposit` `onlyVault`.
-        if (configuredVault != address(0)) {
-            require(msg.sender == configuredVault, "MockStrategyAdapter: not vault");
-        }
-        lastLiveDeposit = assets;
-        liveDepositCount++;
-    }
-
-    /// @notice Stubbed live-withdraw hook. Returns 0 by default (cannot free
-    ///         on-demand liquidity); tests that need partial-unwind behavior
-    ///         can mock this via `vm.mockCall`.
-    function onLiveWithdraw(uint256) external pure returns (uint256) {
-        return 0;
+    function positions() external pure returns (Position[] memory) {
+        return new Position[](0);
     }
 
     /// @notice Sherlock #37 capability flag mock — default `false` matches

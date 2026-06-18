@@ -5,182 +5,251 @@ import {Test} from "forge-std/Test.sol";
 import {VaultWithdrawalQueue} from "../../src/queue/VaultWithdrawalQueue.sol";
 import {IVaultWithdrawalQueue} from "../../src/interfaces/IVaultWithdrawalQueue.sol";
 import {MockVault} from "./mocks/MockVault.sol";
+import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 
+/// @title VaultWithdrawalQueueTest
+/// @notice Unit tests for the Lane B frozen request queue (deposit + redeem,
+///         one settle price per proposal, G7 cancel-before-settle).
 contract VaultWithdrawalQueueTest is Test {
     MockVault vault;
     VaultWithdrawalQueue queue;
+    ERC20Mock asset;
+
     address alice = makeAddr("alice");
+    address bob = makeAddr("bob");
+
+    uint256 constant PID = 1;
+    // Frozen price = num/den = 2 assets per share.
+    uint256 constant NUM = 2;
+    uint256 constant DEN = 1;
 
     function setUp() public {
-        vault = new MockVault();
+        asset = new ERC20Mock("USD Coin", "USDC", 6);
+        vault = new MockVault(address(asset));
         queue = new VaultWithdrawalQueue(address(vault));
         vault.setQueue(address(queue));
-        vault.mint(alice, 1_000e18);
-        // Simulate the vault transferring escrow shares into the queue when a
-        // request is queued. We do that by minting directly to the queue here
-        // since these unit tests focus on queue logic, not the vault wiring.
+        // Fund the vault so it can pay redeem claims (shares are 1e18-scale in
+        // these unit tests; fund generously in raw units).
+        asset.mint(address(vault), 1_000_000e18);
     }
 
-    function test_queueRequest_recordsRequestAndIncrementsPending() public {
-        vm.prank(address(vault));
-        uint256 id = queue.queueRequest(alice, 100e18);
+    // ── helpers ──
 
+    function _queueRedeem(address owner_, uint256 shares) internal returns (uint256 id) {
+        // Vault escrows shares into the queue, then records the request.
+        vault.mint(address(queue), shares);
+        vm.prank(address(vault));
+        id = queue.queueRedeem(owner_, shares, PID);
+    }
+
+    function _queueDeposit(address owner_, uint256 assets) internal returns (uint256 id) {
+        // Vault escrows assets into the queue, then records the request.
+        asset.mint(address(queue), assets);
+        vm.prank(address(vault));
+        id = queue.queueDeposit(owner_, assets, PID);
+    }
+
+    function _stamp() internal {
+        vm.prank(address(vault));
+        queue.stampSettlement(PID, NUM, DEN);
+    }
+
+    // ── queueing ──
+
+    function test_queueRedeem_recordsRequest() public {
+        uint256 id = _queueRedeem(alice, 100e18);
         assertEq(id, 1);
         IVaultWithdrawalQueue.Request memory r = queue.getRequest(1);
         assertEq(r.owner, alice);
-        assertEq(uint256(r.shares), 100e18);
-        assertFalse(r.claimed);
-        assertFalse(r.cancelled);
+        assertEq(r.amount, 100e18);
+        assertEq(r.pid, PID);
+        assertEq(uint256(r.kind), uint256(IVaultWithdrawalQueue.RequestKind.Redeem));
         assertEq(queue.pendingShares(), 100e18);
-        assertEq(queue.nextRequestId(), 2);
     }
 
-    function test_queueRequest_onlyVaultCanCall() public {
+    function test_queueDeposit_recordsRequest() public {
+        uint256 id = _queueDeposit(alice, 500e6);
+        assertEq(id, 1);
+        IVaultWithdrawalQueue.Request memory r = queue.getRequest(1);
+        assertEq(r.amount, 500e6);
+        assertEq(uint256(r.kind), uint256(IVaultWithdrawalQueue.RequestKind.Deposit));
+        assertEq(queue.pendingDepositAssets(), 500e6);
+    }
+
+    function test_queueRedeem_onlyVault() public {
         vm.expectRevert(IVaultWithdrawalQueue.NotVault.selector);
-        queue.queueRequest(alice, 100e18);
+        queue.queueRedeem(alice, 100e18, PID);
+    }
+
+    function test_queueDeposit_onlyVault() public {
+        vm.expectRevert(IVaultWithdrawalQueue.NotVault.selector);
+        queue.queueDeposit(alice, 100e6, PID);
+    }
+
+    function test_queueRedeem_zeroReverts() public {
+        vm.prank(address(vault));
+        vm.expectRevert(IVaultWithdrawalQueue.ZeroShares.selector);
+        queue.queueRedeem(alice, 0, PID);
+    }
+
+    function test_queueDeposit_zeroReverts() public {
+        vm.prank(address(vault));
+        vm.expectRevert(IVaultWithdrawalQueue.ZeroAssets.selector);
+        queue.queueDeposit(alice, 0, PID);
+    }
+
+    // ── stamp ──
+
+    function test_stampSettlement_onlyVault() public {
+        vm.expectRevert(IVaultWithdrawalQueue.NotVault.selector);
+        queue.stampSettlement(PID, NUM, DEN);
+    }
+
+    function test_stampSettlement_twiceReverts() public {
+        _stamp();
+        vm.prank(address(vault));
+        vm.expectRevert(IVaultWithdrawalQueue.AlreadySettled.selector);
+        queue.stampSettlement(PID, NUM, DEN);
+    }
+
+    function test_stamp_reservesRedeemAssets() public {
+        _queueRedeem(alice, 100e18);
+        assertEq(queue.reservedAssets(), 0, "no reserve before stamp");
+        _stamp();
+        // reserve = 100 shares * 2/1 = 200
+        assertEq(queue.reservedAssets(), 200e18, "reserve = frozen redeem assets");
+    }
+
+    // ── redeem claim (frozen) ──
+
+    function test_claim_redeem_paysFrozenAssets() public {
+        _queueRedeem(alice, 100e18);
+        _stamp();
+        uint256 out = queue.claim(1);
+        assertEq(out, 200e18, "100 shares * 2 = 200 assets");
+        assertEq(asset.balanceOf(alice), 200e18);
+        assertEq(vault.lastRedeemTo(), alice);
+        assertEq(queue.pendingShares(), 0);
+        assertEq(queue.reservedAssets(), 0, "reserve released on claim");
+        assertTrue(queue.getRequest(1).claimed);
+    }
+
+    function test_claim_redeem_revertsBeforeStamp() public {
+        _queueRedeem(alice, 100e18);
+        vm.expectRevert(IVaultWithdrawalQueue.NotSettled.selector);
+        queue.claim(1);
     }
 
     function test_claim_revertsWhileVaultLocked() public {
-        vm.prank(address(vault));
-        queue.queueRequest(alice, 100e18);
+        _queueRedeem(alice, 100e18);
+        _stamp();
         vault.setLocked(true);
         vm.expectRevert(IVaultWithdrawalQueue.VaultLocked.selector);
         queue.claim(1);
     }
 
-    function test_claim_redeemsAtPostSettleNAVAndPaysOwner() public {
-        vm.prank(address(vault));
-        queue.queueRequest(alice, 100e18);
-
-        // Simulate vault having transferred shares into the queue at request time
-        vault.mint(address(queue), 100e18);
-
-        vault.setLocked(false);
-        vault.setRedeemRate(2e18); // 1 share -> 2 underlying
-
-        uint256 assets = queue.claim(1);
-        assertEq(assets, 200e18);
-        assertEq(vault.lastRedeemReceiver(), alice);
-        assertEq(vault.lastRedeemOwner(), address(queue));
-
-        IVaultWithdrawalQueue.Request memory r = queue.getRequest(1);
-        assertTrue(r.claimed);
-        assertEq(queue.pendingShares(), 0);
-    }
-
-    /// @notice Sherlock run #1 finding #27 — `claim(requestId, minAssets)`
-    ///         reverts with `ClaimSlippage` when the post-settle NAV drops
-    ///         below the LP's stated floor. Pre-fix, queued LPs were silently
-    ///         absorbing PnL of any strategy that ran between enqueue and
-    ///         claim with no opt-out.
-    function test_claim_withMinAssets_revertsOnSlippage() public {
-        vm.prank(address(vault));
-        queue.queueRequest(alice, 100e18);
-        vault.mint(address(queue), 100e18);
-        vault.setLocked(false);
-        // Mock vault redeems at 1.0 share→asset, but LP wanted ≥ 150 assets.
-        vault.setRedeemRate(1e18);
-
-        vm.expectRevert(abi.encodeWithSelector(IVaultWithdrawalQueue.ClaimSlippage.selector, 100e18, 150e18));
-        queue.claim(1, 150e18);
-
-        // Request is still claimable — slippage check reverts before commit
-        // would normally happen, but the storage mutation ordering matters.
-        // We don't assert on r.claimed here because the implementation may
-        // legitimately mark it claimed before the slippage revert (state
-        // rolls back on revert).
-    }
-
-    function test_claim_withMinAssets_succeedsAboveFloor() public {
-        vm.prank(address(vault));
-        queue.queueRequest(alice, 100e18);
-        vault.mint(address(queue), 100e18);
-        vault.setLocked(false);
-        vault.setRedeemRate(2e18); // 200 assets vs floor 150
-
-        uint256 assets = queue.claim(1, 150e18);
-        assertEq(assets, 200e18);
-        IVaultWithdrawalQueue.Request memory r = queue.getRequest(1);
-        assertTrue(r.claimed);
-    }
-
-    function test_claim_anyoneCanCall() public {
-        vm.prank(address(vault));
-        queue.queueRequest(alice, 100e18);
-        vault.mint(address(queue), 100e18);
-        vault.setLocked(false);
-
-        address bob = makeAddr("bob");
+    function test_claim_anyoneCanCall_ownerReceives() public {
+        _queueRedeem(alice, 100e18);
+        _stamp();
         vm.prank(bob);
         queue.claim(1);
-        // Alice still receives proceeds
-        assertEq(vault.lastRedeemReceiver(), alice);
-    }
-
-    function test_getRequestsByOwner_listsAllForUser() public {
-        vm.startPrank(address(vault));
-        queue.queueRequest(alice, 10e18);
-        queue.queueRequest(alice, 20e18);
-        vm.stopPrank();
-        uint256[] memory ids = queue.getRequestsByOwner(alice);
-        assertEq(ids.length, 2);
-        assertEq(ids[0], 1);
-        assertEq(ids[1], 2);
-    }
-
-    function test_queueRequest_zeroSharesReverts() public {
-        vm.prank(address(vault));
-        vm.expectRevert(IVaultWithdrawalQueue.ZeroShares.selector);
-        queue.queueRequest(alice, 0);
+        assertEq(asset.balanceOf(alice), 200e18, "owner receives even when bob claims");
     }
 
     function test_claim_twiceReverts() public {
-        vm.prank(address(vault));
-        queue.queueRequest(alice, 100e18);
-        vault.mint(address(queue), 100e18);
-        vault.setLocked(false);
+        _queueRedeem(alice, 100e18);
+        _stamp();
         queue.claim(1);
         vm.expectRevert(IVaultWithdrawalQueue.AlreadyClaimed.selector);
         queue.claim(1);
     }
 
-    function test_cancel_returnsSharesToOwner() public {
-        vm.prank(address(vault));
-        queue.queueRequest(alice, 100e18);
-        // simulate vault transfer of shares into queue
-        vault.mint(address(queue), 100e18);
-        uint256 aliceBalBefore = vault.balanceOf(alice);
+    // ── deposit claim (frozen) ──
+
+    function test_claim_deposit_mintsFrozenShares() public {
+        _queueDeposit(alice, 200e18);
+        _stamp();
+        uint256 out = queue.claim(1);
+        // shares = 200 assets * den/num = 200 * 1/2 = 100
+        assertEq(out, 100e18, "200 assets / price 2 = 100 shares");
+        assertEq(vault.balanceOf(alice), 100e18);
+        assertEq(vault.lastDepositTo(), alice);
+        assertEq(asset.balanceOf(address(vault)), 1_000_000e18 + 200e18, "escrowed assets pushed to vault");
+        assertEq(queue.pendingDepositAssets(), 0);
+    }
+
+    function test_claim_deposit_revertsBeforeStamp() public {
+        _queueDeposit(alice, 200e6);
+        vm.expectRevert(IVaultWithdrawalQueue.NotSettled.selector);
+        queue.claim(1);
+    }
+
+    // ── one frozen price for the whole proposal ──
+
+    function test_batch_allClaimAtOnePrice() public {
+        _queueRedeem(alice, 100e18);
+        _queueRedeem(bob, 50e18);
+        _stamp();
+        assertEq(queue.claim(1), 200e18, "alice 100*2");
+        assertEq(queue.claim(2), 100e18, "bob 50*2");
+    }
+
+    // ── cancel (G7: only before stamp) ──
+
+    function test_cancel_redeem_beforeStamp_returnsShares() public {
+        _queueRedeem(alice, 100e18);
         vm.prank(alice);
         queue.cancel(1);
-        assertEq(vault.balanceOf(alice), aliceBalBefore + 100e18);
+        assertEq(vault.balanceOf(alice), 100e18, "shares returned");
         assertEq(queue.pendingShares(), 0);
-        IVaultWithdrawalQueue.Request memory r = queue.getRequest(1);
-        assertTrue(r.cancelled);
-        assertFalse(r.claimed);
+        assertTrue(queue.getRequest(1).cancelled);
+    }
+
+    function test_cancel_deposit_beforeStamp_returnsAssets() public {
+        _queueDeposit(alice, 200e6);
+        vm.prank(alice);
+        queue.cancel(1);
+        assertEq(asset.balanceOf(alice), 200e6, "assets returned");
+        assertEq(queue.pendingDepositAssets(), 0);
+    }
+
+    function test_cancel_afterStampReverts_G7() public {
+        _queueRedeem(alice, 100e18);
+        _stamp();
+        vm.prank(alice);
+        vm.expectRevert(IVaultWithdrawalQueue.AlreadySettled.selector);
+        queue.cancel(1);
     }
 
     function test_cancel_nonOwnerReverts() public {
-        vm.prank(address(vault));
-        queue.queueRequest(alice, 100e18);
-        address bob = makeAddr("bob");
+        _queueRedeem(alice, 100e18);
         vm.prank(bob);
         vm.expectRevert(IVaultWithdrawalQueue.NotQueueOwner.selector);
         queue.cancel(1);
     }
 
-    function test_claim_unknownRequestReverts() public {
+    function test_cancel_redeem_releasesReserveShareTracking() public {
+        _queueRedeem(alice, 100e18);
+        vm.prank(alice);
+        queue.cancel(1);
+        // After cancel, stamping should reserve nothing (the request is gone).
+        _stamp();
+        assertEq(queue.reservedAssets(), 0, "cancelled redeem not reserved at stamp");
+    }
+
+    // ── misc ──
+
+    function test_claim_unknownReverts() public {
         vm.expectRevert(IVaultWithdrawalQueue.RequestNotFound.selector);
         queue.claim(99);
     }
 
-    function test_cancel_afterClaimReverts() public {
-        vm.prank(address(vault));
-        queue.queueRequest(alice, 100e18);
-        vault.mint(address(queue), 100e18);
-        vault.setLocked(false);
-        queue.claim(1);
-        vm.prank(alice);
-        vm.expectRevert(IVaultWithdrawalQueue.AlreadyClaimed.selector);
-        queue.cancel(1);
+    function test_getRequestsByOwner() public {
+        _queueRedeem(alice, 10e18);
+        _queueDeposit(alice, 20e6);
+        uint256[] memory ids = queue.getRequestsByOwner(alice);
+        assertEq(ids.length, 2);
+        assertEq(ids[0], 1);
+        assertEq(ids[1], 2);
     }
 }

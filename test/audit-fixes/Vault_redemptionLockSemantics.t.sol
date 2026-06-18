@@ -9,7 +9,6 @@ import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
-import {MockStrategyAdapter} from "../mocks/MockStrategyAdapter.sol";
 
 /// @title Vault_redemptionLockSemantics — MS-H4 regression
 /// @notice Verifies the deposit-side lock now covers the full
@@ -61,8 +60,8 @@ contract VaultRedemptionLockSemanticsTest is Test {
 
         // factory.governor() returns the mock governor address.
         vm.mockCall(address(this), abi.encodeWithSignature("governor()"), abi.encode(MOCK_GOVERNOR));
-        // NAV-floor guard reads `getCapitalSnapshot(pid)` — mock to 0 default.
-        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getCapitalSnapshot(uint256)"), abi.encode(uint256(0)));
+        // Lane A off (no PriceRouter) — exercises the async (Lane B) lock behavior.
+        vm.mockCall(address(this), abi.encodeWithSignature("priceRouter()"), abi.encode(address(0)));
         // Default: no active proposal anywhere — deposits/withdraws unlocked.
         _mockState({active: false, openCount: 0});
 
@@ -129,30 +128,15 @@ contract VaultRedemptionLockSemanticsTest is Test {
         vault.deposit(1_000e6, alice);
     }
 
-    /// @notice Executed state without a live-NAV adapter: deposits revert
-    ///         (legacy behaviour preserved by `_lpFlowGate`).
-    function test_deposit_revertsDuringExecutedWithoutAdapter() public {
+    /// @notice Executed state: instant deposits revert. During an active
+    ///         proposal LPs must use the async deposit queue — the vault never
+    ///         mints against an unrealized, strategy-influenced NAV (the V2
+    ///         live-NAV redesign removed the live-deposit-forward path).
+    function test_deposit_revertsDuringExecuted() public {
         _mockState({active: true, openCount: 1});
         vm.prank(alice);
         vm.expectRevert(ISyndicateVault.DepositsLocked.selector);
         vault.deposit(1_000e6, alice);
-    }
-
-    /// @notice Executed state WITH a valid live-NAV adapter: deposits succeed
-    ///         and forward to the adapter (preserves the live-NAV unlock from
-    ///         the `feat/live-nav-async-withdrawals` branch — MS-H4 must NOT
-    ///         regress this).
-    function test_deposit_allowedDuringExecutedWithLiveNAV() public {
-        // Strategy is on the active proposal (governor.getProposal(pid).strategy).
-        MockStrategyAdapter adapter = new MockStrategyAdapter();
-        adapter.setValue(0, true);
-
-        _mockStateWithStrategy({active: true, openCount: 1, strategy: address(adapter)});
-
-        vm.prank(alice);
-        uint256 shares = vault.deposit(1_000e6, alice);
-        assertGt(shares, 0, "live-NAV deposit should succeed");
-        assertEq(adapter.lastLiveDeposit(), 1_000e6, "assets forwarded to adapter");
     }
 
     /// @notice Settled (terminal) — `openProposalCount` decrements to 0,
@@ -195,9 +179,9 @@ contract VaultRedemptionLockSemanticsTest is Test {
         assertGt(redeemed, 0, "redeem succeeds during Pending");
     }
 
-    /// @notice Withdrawals during Executed without a live-NAV adapter MUST
-    ///         revert (legacy lock preserved).
-    function test_withdraw_revertsDuringExecutedWithoutAdapter() public {
+    /// @notice Withdrawals during Executed MUST revert — instant exit is closed
+    ///         during a proposal; LPs use the async redeem queue.
+    function test_withdraw_revertsDuringExecuted() public {
         _mockState({active: false, openCount: 0});
         vm.prank(alice);
         vault.deposit(1_000e6, alice);
