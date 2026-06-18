@@ -809,7 +809,9 @@ contract SyndicateVault is
     /// @notice Queue-only: mint `shares` to `to` at the proposal's frozen settle
     ///         price. The queue pushes the escrowed assets to the vault
     ///         immediately before this call. Auto-delegates for voting power.
-    function settleDeposit(uint256 shares, address to) external nonReentrant {
+    /// @dev No `nonReentrant`: there is no external call (mint + delegate only),
+    ///      and the only caller — the queue's `claim` — is itself `nonReentrant`.
+    function settleDeposit(uint256 shares, address to) external {
         if (msg.sender != _withdrawalQueue) revert NotQueue();
         _mint(to, shares);
         if (delegates(to) == address(0)) _delegate(to, to);
