@@ -28,7 +28,6 @@ interface IGuardianRegistry {
     error ReviewNotOpen();
     error ReviewNotReadyForResolve();
     error NotGovernor();
-    error PoolAlreadyFunded();
     error EmergencyTooManyCalls();
     error EmergencyHashMismatch();
     /// @notice Sherlock #15 (collapsed into this revert): `openEmergency`
@@ -41,13 +40,6 @@ interface IGuardianRegistry {
     error AlreadyPaused();
     error NotPausedOrDeadmanNotElapsed();
     error RefundCapExceeded();
-    // Reward claims
-    error NoPoolFunded();
-    error AlreadyClaimed();
-    error NotApprover();
-    error NoDelegationAtSettle();
-    error DelegatePoolEmpty();
-    error NoEscrowedAmount();
     error InvalidParameter();
     /// @notice Sherlock #16: `setReviewPeriod` rejected because the new
     ///         review window exceeds sWOOD's `coolDownPeriod`. A review
@@ -93,7 +85,9 @@ interface IGuardianRegistry {
     // ── Governor-only (emergency) ──
     function openEmergency(uint256 proposalId, bytes32 callsHash, BatchExecutorLib.Call[] calldata calls) external;
     function cancelEmergency(uint256 proposalId) external;
-    function finalizeEmergency(uint256 proposalId) external returns (bool blocked, BatchExecutorLib.Call[] memory calls);
+    function finalizeEmergency(uint256 proposalId)
+        external
+        returns (bool blocked, BatchExecutorLib.Call[] memory calls);
 
     /// @notice Governor-only: invalidate an open guardian review when the
     ///         proposer cancels the underlying proposal during
@@ -148,38 +142,15 @@ interface IGuardianRegistry {
     /// @notice The minimum WOOD a vault owner must bond. Passthrough to sWOOD.
     function minOwnerStake() external view returns (uint256);
 
-    // ── On-chain guardian-fee pool (vault assets) ──
-    /// @notice Called by governor in `_distributeFees` after transferring the
-    ///         guardian-fee slice to the registry. Stamps the pool with
-    ///         `(asset, amount, settledAt)` so approvers + delegators can
-    ///         claim pro-rata. See spec §4.8.
-    function fundProposalGuardianPool(uint256 proposalId, address asset, uint256 amount) external;
-
-    /// @notice Sherlock #41 — permissionless approver claim. Funds always go to
-    ///         `approver`; any third party can call to seed the delegator pool
-    ///         even if `approver` never claims themselves. DPoS commission is
-    ///         kept by the approver, remainder is stored for delegator claim.
-    function claimProposalReward(address approver, uint256 proposalId) external;
-
-    /// @notice Delegator pulls their share from delegate's remainder pool.
-    ///         Pool is seeded by the first call to `claimProposalReward` (any
-    ///         caller, including third-party — Sherlock #41), so delegators
-    ///         are never stranded by an absent approver.
-    function claimDelegatorProposalReward(address delegate, uint256 proposalId) external;
-
-    /// @notice Pull previously-escrowed guardian-fee reward after the transfer-
-    ///         failure condition has been lifted. Keyed by (proposalId, recipient,
-    ///         asset) so cross-proposal drain is impossible.
-    function flushUnclaimedApproverFee(uint256 proposalId, address recipient, address asset) external;
-
-    event ProposalGuardianPoolFunded(uint256 indexed proposalId, address indexed asset, uint256 amount);
-    event ApproverRewardClaimed(
-        uint256 indexed proposalId, address indexed approver, uint256 gross, uint256 commission, uint256 remainder
-    );
-    event DelegatorProposalRewardClaimed(
-        address indexed delegator, address indexed delegate, uint256 indexed proposalId, uint256 share
-    );
-    event ApproverFeeEscrowed(
-        uint256 indexed proposalId, address indexed recipient, address indexed asset, uint256 amount
-    );
+    // ── Off-chain guardian-fee attribution (read-only) ──
+    /// @notice Per-proposal approver set + their snapshot vote weights + the
+    ///         summed approve-weight denominator. Read by the off-chain Merkl
+    ///         bot to attribute the guardian fee (paid out as WOOD) to
+    ///         approvers. Replaces the deleted on-chain claim machinery.
+    /// @dev    Data persists post-settle (arrays not cleared), so callable for
+    ///         any historical proposal.
+    function getApproverWeights(uint256 proposalId)
+        external
+        view
+        returns (address[] memory approvers, uint128[] memory weights, uint128 totalApproveWeight);
 }

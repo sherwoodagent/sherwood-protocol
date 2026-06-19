@@ -85,7 +85,8 @@ contract GuardianReviewLifecycleTest is Test {
         SyndicateVault vaultImpl = new SyndicateVault();
         bytes memory vaultInit = abi.encodeCall(
             SyndicateVault.initialize,
-            (ISyndicateVault.InitParams({
+            (
+                ISyndicateVault.InitParams({
                     asset: address(usdc),
                     name: "Sherwood Vault",
                     symbol: "swUSDC",
@@ -94,7 +95,8 @@ contract GuardianReviewLifecycleTest is Test {
                     openDeposits: true,
                     agentRegistry: address(agentRegistry),
                     managementFeeBps: 0
-                }))
+                })
+            )
         );
         vault = SyndicateVault(payable(address(new ERC1967Proxy(address(vaultImpl), vaultInit))));
 
@@ -113,7 +115,8 @@ contract GuardianReviewLifecycleTest is Test {
         StakedWood swoodImpl = new StakedWood();
         bytes memory swoodInit = abi.encodeCall(
             StakedWood.initialize,
-            (StakedWood.InitParams({
+            (
+                StakedWood.InitParams({
                     owner: owner,
                     wood: address(wood),
                     governor: predictedGovernor,
@@ -123,7 +126,8 @@ contract GuardianReviewLifecycleTest is Test {
                     minOwnerStake: MIN_OWNER_STAKE,
                     minSlashBps: 1000,
                     maxSlashBps: 9999
-                }))
+                })
+            )
         );
         swood = StakedWood(address(new ERC1967Proxy(address(swoodImpl), swoodInit)));
 
@@ -144,7 +148,8 @@ contract GuardianReviewLifecycleTest is Test {
                     maxStrategyDuration: 30 days,
                     protocolFeeBps: 0,
                     protocolFeeRecipient: address(0),
-                    guardianFeeBps: 0
+                    guardianFeeBps: 0,
+                    guardiansFeeRecipient: address(0)
                 }),
                 predictedRegistryProxy
             )
@@ -219,14 +224,18 @@ contract GuardianReviewLifecycleTest is Test {
     function _execCalls() internal view returns (BatchExecutorLib.Call[] memory calls) {
         calls = new BatchExecutorLib.Call[](1);
         calls[0] = BatchExecutorLib.Call({
-            target: address(usdc), data: abi.encodeCall(usdc.approve, (address(targetToken), 50_000e6)), value: 0
+            target: address(usdc),
+            data: abi.encodeCall(usdc.approve, (address(targetToken), 50_000e6)),
+            value: 0
         });
     }
 
     function _settleCalls() internal view returns (BatchExecutorLib.Call[] memory calls) {
         calls = new BatchExecutorLib.Call[](1);
         calls[0] = BatchExecutorLib.Call({
-            target: address(usdc), data: abi.encodeCall(usdc.approve, (address(targetToken), 0)), value: 0
+            target: address(usdc),
+            data: abi.encodeCall(usdc.approve, (address(targetToken), 0)),
+            value: 0
         });
     }
 

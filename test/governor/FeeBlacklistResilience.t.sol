@@ -53,7 +53,8 @@ contract FeeBlacklistResilienceTest is Test {
         SyndicateVault vaultImpl = new SyndicateVault();
         bytes memory vaultInit = abi.encodeCall(
             SyndicateVault.initialize,
-            (ISyndicateVault.InitParams({
+            (
+                ISyndicateVault.InitParams({
                     asset: address(usdc),
                     name: "Sherwood Vault",
                     symbol: "swUSDC",
@@ -62,7 +63,8 @@ contract FeeBlacklistResilienceTest is Test {
                     openDeposits: true,
                     agentRegistry: address(agentRegistry),
                     managementFeeBps: 50
-                }))
+                })
+            )
         );
         vault = SyndicateVault(payable(address(new ERC1967Proxy(address(vaultImpl), vaultInit))));
 
@@ -88,7 +90,8 @@ contract FeeBlacklistResilienceTest is Test {
                     maxStrategyDuration: 30 days,
                     protocolFeeBps: 100,
                     protocolFeeRecipient: protocolRecipient,
-                    guardianFeeBps: 0
+                    guardianFeeBps: 0,
+                    guardiansFeeRecipient: address(0)
                 }),
                 address(guardianRegistry)
             )
@@ -132,7 +135,9 @@ contract FeeBlacklistResilienceTest is Test {
     function _noopCalls() internal view returns (BatchExecutorLib.Call[] memory calls) {
         calls = new BatchExecutorLib.Call[](1);
         calls[0] = BatchExecutorLib.Call({
-            target: address(usdc), data: abi.encodeCall(usdc.approve, (address(this), 0)), value: 0
+            target: address(usdc),
+            data: abi.encodeCall(usdc.approve, (address(this), 0)),
+            value: 0
         });
     }
 
@@ -286,7 +291,8 @@ contract FeeBlacklistResilienceTest is Test {
         SyndicateVault vaultImplB = new SyndicateVault();
         bytes memory vaultInitB = abi.encodeCall(
             SyndicateVault.initialize,
-            (ISyndicateVault.InitParams({
+            (
+                ISyndicateVault.InitParams({
                     asset: address(usdc),
                     name: "Sherwood Vault B",
                     symbol: "swUSDCB",
@@ -295,7 +301,8 @@ contract FeeBlacklistResilienceTest is Test {
                     openDeposits: true,
                     agentRegistry: address(agentRegistry),
                     managementFeeBps: 50
-                }))
+                })
+            )
         );
         SyndicateVault vaultB = SyndicateVault(payable(address(new ERC1967Proxy(address(vaultImplB), vaultInitB))));
         vm.prank(owner);

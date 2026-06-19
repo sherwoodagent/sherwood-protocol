@@ -51,7 +51,8 @@ contract GovernorParametersTest is Test {
                     maxStrategyDuration: MAX_STRATEGY_DURATION,
                     protocolFeeBps: PROTOCOL_FEE_BPS,
                     protocolFeeRecipient: owner,
-                    guardianFeeBps: 0
+                    guardianFeeBps: 0,
+                    guardiansFeeRecipient: address(0)
                 }),
                 address(guardianRegistry)
             )
@@ -326,6 +327,11 @@ contract GovernorParametersTest is Test {
     // ==================== setGuardianFeeBps ====================
 
     function test_setGuardianFeeBps_happyPath() public {
+        // Raising the guardian fee above 0 now requires a guardians-fee
+        // recipient (coupling mirrors the protocol-fee recipient rule).
+        vm.prank(owner);
+        governor.setGuardiansFeeRecipient(makeAddr("guardiansFeeRecipient"));
+
         uint256 oldVal = governor.guardianFeeBps();
         uint256 newVal = 250;
         vm.expectEmit(true, false, false, true, address(governor));
@@ -382,7 +388,8 @@ contract GovernorParametersTest is Test {
                     maxStrategyDuration: MAX_STRATEGY_DURATION,
                     protocolFeeBps: 0,
                     protocolFeeRecipient: address(0),
-                    guardianFeeBps: 0
+                    guardianFeeBps: 0,
+                    guardiansFeeRecipient: address(0)
                 }),
                 address(guardianRegistry)
             )

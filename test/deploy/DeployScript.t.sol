@@ -64,7 +64,8 @@ contract DeployScriptTest is Test {
                     maxStrategyDuration: 14 days,
                     protocolFeeBps: 100,
                     protocolFeeRecipient: deployer,
-                    guardianFeeBps: 0
+                    guardianFeeBps: 0,
+                    guardiansFeeRecipient: address(0)
                 }),
                 predictedRegistryProxy
             )
@@ -79,7 +80,8 @@ contract DeployScriptTest is Test {
         StakedWood swoodImpl = new StakedWood();
         bytes memory swoodInit = abi.encodeCall(
             StakedWood.initialize,
-            (StakedWood.InitParams({
+            (
+                StakedWood.InitParams({
                     owner: deployer,
                     wood: address(wood),
                     governor: govProxy,
@@ -89,7 +91,8 @@ contract DeployScriptTest is Test {
                     minOwnerStake: 10_000e18,
                     minSlashBps: 1000,
                     maxSlashBps: 9999
-                }))
+                })
+            )
         );
         address swood = address(new ERC1967Proxy(address(swoodImpl), swoodInit));
 
@@ -123,7 +126,8 @@ contract DeployScriptTest is Test {
         address factoryImpl = c3.deploy(SALT_FACTORY_IMPL, abi.encodePacked(type(SyndicateFactory).creationCode));
         bytes memory facInit = abi.encodeCall(
             SyndicateFactory.initialize,
-            (SyndicateFactory.InitParams({
+            (
+                SyndicateFactory.InitParams({
                     owner: deployer,
                     executorImpl: executorLib,
                     vaultImpl: vaultImpl,
@@ -132,7 +136,8 @@ contract DeployScriptTest is Test {
                     governor: govProxy,
                     managementFeeBps: 50,
                     guardianRegistry: registryProxy
-                }))
+                })
+            )
         );
         address factoryProxy = c3.deploy(
             SALT_FACTORY_PROXY, abi.encodePacked(type(ERC1967Proxy).creationCode, abi.encode(factoryImpl, facInit))

@@ -50,7 +50,8 @@ contract SyndicateGovernorTest is Test {
         SyndicateVault vaultImpl = new SyndicateVault();
         bytes memory vaultInit = abi.encodeCall(
             SyndicateVault.initialize,
-            (ISyndicateVault.InitParams({
+            (
+                ISyndicateVault.InitParams({
                     asset: address(usdc),
                     name: "Sherwood Vault",
                     symbol: "swUSDC",
@@ -59,7 +60,8 @@ contract SyndicateGovernorTest is Test {
                     openDeposits: true,
                     agentRegistry: address(agentRegistry),
                     managementFeeBps: 50
-                }))
+                })
+            )
         );
         vault = SyndicateVault(payable(address(new ERC1967Proxy(address(vaultImpl), vaultInit))));
 
@@ -83,7 +85,8 @@ contract SyndicateGovernorTest is Test {
                     maxStrategyDuration: MAX_STRATEGY_DURATION,
                     protocolFeeBps: 100,
                     protocolFeeRecipient: owner,
-                    guardianFeeBps: 0
+                    guardianFeeBps: 0,
+                    guardiansFeeRecipient: address(0)
                 }),
                 address(guardianRegistry)
             )
@@ -120,7 +123,9 @@ contract SyndicateGovernorTest is Test {
     function _simpleExecuteCalls() internal view returns (BatchExecutorLib.Call[] memory) {
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](1);
         calls[0] = BatchExecutorLib.Call({
-            target: address(usdc), data: abi.encodeCall(usdc.approve, (address(targetToken), 50_000e6)), value: 0
+            target: address(usdc),
+            data: abi.encodeCall(usdc.approve, (address(targetToken), 50_000e6)),
+            value: 0
         });
         return calls;
     }
@@ -128,7 +133,9 @@ contract SyndicateGovernorTest is Test {
     function _simpleSettlementCalls() internal view returns (BatchExecutorLib.Call[] memory) {
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](1);
         calls[0] = BatchExecutorLib.Call({
-            target: address(usdc), data: abi.encodeCall(usdc.approve, (address(targetToken), 0)), value: 0
+            target: address(usdc),
+            data: abi.encodeCall(usdc.approve, (address(targetToken), 0)),
+            value: 0
         });
         return calls;
     }
@@ -915,7 +922,8 @@ contract SyndicateGovernorTest is Test {
                     maxStrategyDuration: MAX_STRATEGY_DURATION,
                     protocolFeeBps: 0,
                     protocolFeeRecipient: address(0),
-                    guardianFeeBps: 0
+                    guardianFeeBps: 0,
+                    guardiansFeeRecipient: address(0)
                 }),
                 address(guardianRegistry)
             )
@@ -947,7 +955,8 @@ contract SyndicateGovernorTest is Test {
                     maxStrategyDuration: MAX_STRATEGY_DURATION,
                     protocolFeeBps: 0,
                     protocolFeeRecipient: address(0),
-                    guardianFeeBps: 0
+                    guardianFeeBps: 0,
+                    guardiansFeeRecipient: address(0)
                 }),
                 address(guardianRegistry)
             )

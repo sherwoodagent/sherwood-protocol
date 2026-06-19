@@ -168,8 +168,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
         if (guardianRegistry_ == address(0)) revert ZeroAddress();
         if (
             p.minStrategyDuration < ABSOLUTE_MIN_STRATEGY_DURATION
-                || p.maxStrategyDuration > ABSOLUTE_MAX_STRATEGY_DURATION
-                || p.minStrategyDuration > p.maxStrategyDuration
+                || p.maxStrategyDuration > ABSOLUTE_MAX_STRATEGY_DURATION || p.minStrategyDuration > p.maxStrategyDuration
         ) revert InvalidStrategyDurationBounds();
         if (p.collaborationWindow < MIN_COLLABORATION_WINDOW || p.collaborationWindow > MAX_COLLABORATION_WINDOW) {
             revert InvalidCollaborationWindow();
@@ -178,6 +177,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
         if (p.protocolFeeBps > MAX_PROTOCOL_FEE_BPS) revert InvalidProtocolFeeBps();
         if (p.protocolFeeBps > 0 && p.protocolFeeRecipient == address(0)) revert InvalidProtocolFeeRecipient();
         if (p.guardianFeeBps > MAX_GUARDIAN_FEE_BPS) revert InvalidGuardianFeeBps();
+        if (p.guardianFeeBps > 0 && p.guardiansFeeRecipient == address(0)) revert InvalidGuardiansFeeRecipient();
 
         __Ownable_init(p.owner);
 
@@ -201,6 +201,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
         _protocolFeeBps = p.protocolFeeBps;
         _protocolFeeRecipient = p.protocolFeeRecipient;
         _guardianFeeBps = p.guardianFeeBps;
+        _guardiansFeeRecipient = p.guardiansFeeRecipient;
         _guardianRegistry = guardianRegistry_;
         _reentrancyStatus = _NOT_ENTERED;
     }
@@ -236,7 +237,11 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
 
     // ── V2: emergency-call storage moved to GuardianRegistry ──
 
-    function _finishSettlementHook(uint256 id, StrategyProposal storage p) internal override returns (int256, uint256) {
+    function _finishSettlementHook(uint256 id, StrategyProposal storage p)
+        internal
+        override
+        returns (int256, uint256)
+    {
         return _finishSettlement(id, p);
     }
 
@@ -766,6 +771,11 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
     }
 
     /// @inheritdoc ISyndicateGovernor
+    function guardiansFeeRecipient() external view returns (address) {
+        return _guardiansFeeRecipient;
+    }
+
+    /// @inheritdoc ISyndicateGovernor
     function guardianRegistry() external view returns (address) {
         return _guardianRegistry;
     }
@@ -1095,44 +1105,20 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
             }
         }
 
-        // Guardian fee — slice of settled PnL routed to the registry (funds
-        // per-proposal approver-reward pool). See spec §4.8.
-        // Resilient: if the recipient transfer or pool-funding fails
-        // (blacklist, misconfigured recipient, registry upgrade bug), emit
-        // a diagnostic event and skip the fee so settlement cannot brick.
-        // On transfer failure, the fee stays in the vault (LPs benefit).
-        // On fund-funding failure (post-transfer), the amount is in the
-        // registry but unpooled; ops can recover via the registry owner.
+        // Guardian fee — slice of gross PnL routed to the team guardians-fee
+        // recipient (a multisig). Swapped to WOOD off-chain and airdropped to
+        // approvers/delegators weekly via Merkl. Per-proposal attribution is the
+        // GuardianFeeAccrued event + the registry getApproverWeights getter.
+        // No `_guardiansFeeRecipient == address(0)` recheck here (unlike the
+        // protocol-fee I-3 guard above): the `bps > 0 ⇒ recipient != 0`
+        // invariant is enforced at every write site (initialize +
+        // setGuardianFeeBps + setGuardiansFeeRecipient), so this branch is
+        // unreachable with a zero recipient. Omitted to stay under EIP-170.
         if (_guardianFeeBps > 0) {
-            uint256 fee = (profit * _guardianFeeBps) / BPS_DENOMINATOR;
-            address recipient = _guardianRegistry;
-            if (fee > 0) {
-                try ISyndicateVault(vault).transferPerformanceFee(asset, recipient, fee) {
-                    // Sherlock #36 (Run-1 #19): revert if pool-funding fails.
-                    // Pre-fix, the inner catch silently swallowed `Disabled()`
-                    // / misconfig reverts AFTER the asset had already been
-                    // transferred to the registry — assets accumulated un-
-                    // poolable forever (MinimalGuardianRegistry has no
-                    // withdrawal path). Reverting the inner call rolls back
-                    // the outer transfer too (both calls are in the same tx),
-                    // so the asset stays in the vault and the operator can
-                    // fix the registry config and retry settle.
-                    //
-                    // Sherlock run #2 #10 (INVALID — direct conflict with the
-                    // above): asks to wrap the inner call in its own
-                    // try-catch and "swallow" failures to avoid settlement
-                    // DoS. Rejected: silently losing guardian fees on
-                    // registry misconfig hides operator errors and breaks
-                    // the audit trail. Fail-closed is the correct
-                    // resolution — Run-1 #19 stands.
-                    IGuardianRegistry(recipient).fundProposalGuardianPool(proposalId, asset, fee);
-                    guardianFee = fee;
-                    emit GuardianFeeAccrued(proposalId, asset, recipient, fee, uint64(block.timestamp));
-                } catch {
-                    // Transfer failed — fee stays in the vault, LPs benefit.
-                    // guardianFee remains 0 so the waterfall reflects reality.
-                    emit GuardianFeeDeliveryFailed(proposalId, asset, recipient, fee);
-                }
+            guardianFee = (profit * _guardianFeeBps) / BPS_DENOMINATOR;
+            if (guardianFee > 0) {
+                _payFee(vault, asset, _guardiansFeeRecipient, guardianFee);
+                emit GuardianFeeAccrued(proposalId, asset, _guardiansFeeRecipient, guardianFee, uint64(block.timestamp));
             }
         }
 
@@ -1204,9 +1190,8 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
     function _payFee(address vault, address asset, address recipient, uint256 amount) internal {
         if (amount == 0) return;
         try ISyndicateVault(vault).transferPerformanceFee(asset, recipient, amount) {
-        // ok
-        }
-        catch {
+            // ok
+        } catch {
             _unclaimedFees[_unclaimedKey(vault, recipient, asset)] += amount;
             emit FeeTransferFailed(recipient, asset, amount);
         }

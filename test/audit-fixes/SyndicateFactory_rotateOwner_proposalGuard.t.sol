@@ -77,7 +77,8 @@ contract SyndicateFactory_rotateOwner_proposalGuard is Test {
         StakedWood swoodImpl = new StakedWood();
         bytes memory swoodInit = abi.encodeCall(
             StakedWood.initialize,
-            (StakedWood.InitParams({
+            (
+                StakedWood.InitParams({
                     owner: owner,
                     wood: address(wood),
                     governor: predictedGovernor,
@@ -87,7 +88,8 @@ contract SyndicateFactory_rotateOwner_proposalGuard is Test {
                     minOwnerStake: MIN_OWNER_STAKE,
                     minSlashBps: 1000,
                     maxSlashBps: 9999
-                }))
+                })
+            )
         );
         swood = StakedWood(address(new ERC1967Proxy(address(swoodImpl), swoodInit)));
 
@@ -108,7 +110,8 @@ contract SyndicateFactory_rotateOwner_proposalGuard is Test {
                     maxStrategyDuration: 30 days,
                     protocolFeeBps: 0,
                     protocolFeeRecipient: address(0),
-                    guardianFeeBps: 0
+                    guardianFeeBps: 0,
+                    guardiansFeeRecipient: address(0)
                 }),
                 predictedRegistryProxy
             )
@@ -131,7 +134,8 @@ contract SyndicateFactory_rotateOwner_proposalGuard is Test {
 
         bytes memory factoryInit = abi.encodeCall(
             SyndicateFactory.initialize,
-            (SyndicateFactory.InitParams({
+            (
+                SyndicateFactory.InitParams({
                     owner: owner,
                     executorImpl: address(executorLib),
                     vaultImpl: address(vaultImpl),
@@ -140,7 +144,8 @@ contract SyndicateFactory_rotateOwner_proposalGuard is Test {
                     governor: address(governor),
                     managementFeeBps: 50,
                     guardianRegistry: address(registry)
-                }))
+                })
+            )
         );
         factory = SyndicateFactory(address(new ERC1967Proxy(address(factoryImpl), factoryInit)));
         require(address(factory) == predictedFactoryProxy, "factory address prediction mismatch");

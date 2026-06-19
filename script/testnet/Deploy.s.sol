@@ -78,7 +78,8 @@ contract DeployTestnet is ScriptBase {
                     maxStrategyDuration: 30 days,
                     protocolFeeBps: 200,
                     protocolFeeRecipient: deployer,
-                    guardianFeeBps: 0
+                    guardianFeeBps: 0,
+                    guardiansFeeRecipient: address(0)
                 }),
                 predictedRegistryProxy
             )
@@ -95,7 +96,8 @@ contract DeployTestnet is ScriptBase {
         StakedWood swoodImpl = new StakedWood();
         bytes memory swoodInitData = abi.encodeCall(
             StakedWood.initialize,
-            (StakedWood.InitParams({
+            (
+                StakedWood.InitParams({
                     owner: deployer,
                     wood: woodToken,
                     governor: governorProxy,
@@ -105,7 +107,8 @@ contract DeployTestnet is ScriptBase {
                     minOwnerStake: 10_000e18,
                     minSlashBps: 1000,
                     maxSlashBps: 9999
-                }))
+                })
+            )
         );
         address swoodProxy = address(new ERC1967Proxy(address(swoodImpl), swoodInitData));
         require(swoodProxy == predictedSwoodProxy, "swood addr mismatch");
@@ -135,7 +138,8 @@ contract DeployTestnet is ScriptBase {
         SyndicateFactory factoryImpl = new SyndicateFactory();
         bytes memory factoryInitData = abi.encodeCall(
             SyndicateFactory.initialize,
-            (SyndicateFactory.InitParams({
+            (
+                SyndicateFactory.InitParams({
                     owner: deployer,
                     executorImpl: address(executorLib),
                     vaultImpl: address(vaultImpl),
@@ -144,7 +148,8 @@ contract DeployTestnet is ScriptBase {
                     governor: governorProxy,
                     managementFeeBps: 50,
                     guardianRegistry: registryProxy
-                }))
+                })
+            )
         );
         SyndicateFactory factory = SyndicateFactory(address(new ERC1967Proxy(address(factoryImpl), factoryInitData)));
         require(address(factory) == predictedFactoryProxy, "factory addr mismatch");

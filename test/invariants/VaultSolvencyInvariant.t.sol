@@ -76,7 +76,8 @@ contract VaultSolvencyInvariantTest is StdInvariant, Test {
         SyndicateVault vaultImpl = new SyndicateVault();
         bytes memory vaultInit = abi.encodeCall(
             SyndicateVault.initialize,
-            (ISyndicateVault.InitParams({
+            (
+                ISyndicateVault.InitParams({
                     asset: address(usdc),
                     name: "Sherwood Vault",
                     symbol: "swUSDC",
@@ -85,7 +86,8 @@ contract VaultSolvencyInvariantTest is StdInvariant, Test {
                     openDeposits: true,
                     agentRegistry: address(agentRegistry),
                     managementFeeBps: MGMT_FEE_BPS
-                }))
+                })
+            )
         );
         vault = SyndicateVault(payable(address(new ERC1967Proxy(address(vaultImpl), vaultInit))));
 
@@ -112,7 +114,8 @@ contract VaultSolvencyInvariantTest is StdInvariant, Test {
                     maxStrategyDuration: 30 days,
                     protocolFeeBps: PROTOCOL_FEE_BPS,
                     protocolFeeRecipient: protocolRecipient,
-                    guardianFeeBps: 0
+                    guardianFeeBps: 0,
+                    guardiansFeeRecipient: address(0)
                 }),
                 address(guardianRegistry)
             )
@@ -274,7 +277,8 @@ contract VaultSolvencyColdStartInvariantTest is StdInvariant, Test {
         SyndicateVault vaultImpl = new SyndicateVault();
         bytes memory vaultInit = abi.encodeCall(
             SyndicateVault.initialize,
-            (ISyndicateVault.InitParams({
+            (
+                ISyndicateVault.InitParams({
                     asset: address(usdc),
                     name: "Sherwood Vault",
                     symbol: "swUSDC",
@@ -283,7 +287,8 @@ contract VaultSolvencyColdStartInvariantTest is StdInvariant, Test {
                     openDeposits: true,
                     agentRegistry: address(agentRegistry),
                     managementFeeBps: MGMT_FEE_BPS
-                }))
+                })
+            )
         );
         vault = SyndicateVault(payable(address(new ERC1967Proxy(address(vaultImpl), vaultInit))));
 
@@ -309,7 +314,8 @@ contract VaultSolvencyColdStartInvariantTest is StdInvariant, Test {
                     maxStrategyDuration: 30 days,
                     protocolFeeBps: PROTOCOL_FEE_BPS,
                     protocolFeeRecipient: protocolRecipient,
-                    guardianFeeBps: 0
+                    guardianFeeBps: 0,
+                    guardiansFeeRecipient: address(0)
                 }),
                 address(guardianRegistry)
             )

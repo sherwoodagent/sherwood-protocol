@@ -147,7 +147,8 @@ contract SwoodReviewSlashTest is Test {
         SyndicateVault vaultImpl = new SyndicateVault();
         bytes memory vaultInit = abi.encodeCall(
             SyndicateVault.initialize,
-            (ISyndicateVault.InitParams({
+            (
+                ISyndicateVault.InitParams({
                     asset: address(usdc),
                     name: "Sherwood Vault",
                     symbol: "swUSDC",
@@ -156,7 +157,8 @@ contract SwoodReviewSlashTest is Test {
                     openDeposits: true,
                     agentRegistry: address(agentRegistry),
                     managementFeeBps: 0
-                }))
+                })
+            )
         );
         vault = SyndicateVault(payable(address(new ERC1967Proxy(address(vaultImpl), vaultInit))));
 
@@ -175,7 +177,8 @@ contract SwoodReviewSlashTest is Test {
         StakedWood swoodImpl = new StakedWood();
         bytes memory swoodInit = abi.encodeCall(
             StakedWood.initialize,
-            (StakedWood.InitParams({
+            (
+                StakedWood.InitParams({
                     owner: owner,
                     wood: address(wood),
                     governor: predictedGovernor,
@@ -185,7 +188,8 @@ contract SwoodReviewSlashTest is Test {
                     minOwnerStake: MIN_OWNER_STAKE,
                     minSlashBps: 1000,
                     maxSlashBps: 9999
-                }))
+                })
+            )
         );
         swood = StakedWood(address(new ERC1967Proxy(address(swoodImpl), swoodInit)));
 
@@ -206,7 +210,8 @@ contract SwoodReviewSlashTest is Test {
                     maxStrategyDuration: 30 days,
                     protocolFeeBps: 0,
                     protocolFeeRecipient: address(0),
-                    guardianFeeBps: 0
+                    guardianFeeBps: 0,
+                    guardiansFeeRecipient: address(0)
                 }),
                 predictedRegistryProxy
             )
@@ -294,14 +299,18 @@ contract SwoodReviewSlashTest is Test {
     function _execCalls() internal view returns (BatchExecutorLib.Call[] memory calls) {
         calls = new BatchExecutorLib.Call[](1);
         calls[0] = BatchExecutorLib.Call({
-            target: address(usdc), data: abi.encodeCall(usdc.approve, (address(targetToken), 50_000e6)), value: 0
+            target: address(usdc),
+            data: abi.encodeCall(usdc.approve, (address(targetToken), 50_000e6)),
+            value: 0
         });
     }
 
     function _settleCalls() internal view returns (BatchExecutorLib.Call[] memory calls) {
         calls = new BatchExecutorLib.Call[](1);
         calls[0] = BatchExecutorLib.Call({
-            target: address(usdc), data: abi.encodeCall(usdc.approve, (address(targetToken), 0)), value: 0
+            target: address(usdc),
+            data: abi.encodeCall(usdc.approve, (address(targetToken), 0)),
+            value: 0
         });
     }
 
@@ -444,12 +453,15 @@ contract SwoodReviewSlashTest is Test {
         assertEq(wood.balanceOf(BURN_ADDRESS), burnBefore + 18_360e18, "18k own + 360 pool burned to dead address");
         assertEq(swood.pendingBurn(), 0, "no pending burn - ERC20Mock burn transfer succeeded");
 
-        // ── Assert: reward-pool state untouched by the slash ──
-        // The registry holds no WOOD; the burn happened entirely inside sWOOD.
-        // No `fundProposalGuardianPool` was called, so no proposal reward pool
-        // exists — `claimProposalReward` reverts (nothing was ever funded).
+        // ── Assert: registry holds no assets; fee attribution is off-chain ──
+        // The burn happened entirely inside sWOOD. Guardian-fee rewards are now
+        // paid off-chain (buyback-WOOD via weekly Merkl) — the on-chain reward
+        // pool / claim machinery was deleted. `getApproverWeights` still
+        // exposes the per-proposal approver attribution for the bot.
         assertEq(wood.balanceOf(address(registry)), 0, "registry still holds no WOOD after slash");
-        vm.expectRevert(IGuardianRegistry.NoPoolFunded.selector);
-        registry.claimProposalReward(gApprove, pid);
+        (address[] memory approvers,, uint128 totalApproveWeight) = registry.getApproverWeights(pid);
+        assertEq(approvers.length, 1, "approver attribution persists post-slash");
+        assertEq(approvers[0], gApprove, "approver is gApprove");
+        assertGt(uint256(totalApproveWeight), 0, "approve-weight denominator recorded");
     }
 }

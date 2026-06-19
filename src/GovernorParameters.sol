@@ -66,6 +66,9 @@ abstract contract GovernorParameters is ISyndicateGovernor, OwnableUpgradeable {
     bytes32 public constant PARAM_PROTOCOL_FEE_RECIPIENT = keccak256("protocolFeeRecipient");
     bytes32 public constant PARAM_FACTORY = keccak256("factory");
     bytes32 public constant PARAM_GUARDIAN_FEE_BPS = keccak256("guardianFeeBps");
+    // `internal` (not `public` like the other PARAM_* keys) to skip the
+    // auto-generated getter — saves bytecode on the EIP-170-capped governor.
+    bytes32 internal constant PARAM_GUARDIANS_FEE_RECIPIENT = keccak256("guardiansFeeRecipient");
 
     // ── Storage ──
 
@@ -79,15 +82,22 @@ abstract contract GovernorParameters is ISyndicateGovernor, OwnableUpgradeable {
     /// @notice Recipient of protocol fees.
     address internal _protocolFeeRecipient;
 
-    /// @notice Guardian fee in bps (routed to the bound `_guardianRegistry`).
+    /// @notice Guardian fee in bps (carved from gross PnL at settlement).
     uint256 internal _guardianFeeBps;
+
+    /// @notice Team multisig that receives the guardian-fee slice (vault asset).
+    ///         Swapped to WOOD off-chain and airdropped to approvers/delegators
+    ///         weekly via Merkl. Must be non-zero whenever `_guardianFeeBps > 0`.
+    address internal _guardiansFeeRecipient;
 
     /// @notice Authorized factory that can register vaults.
     address public factory;
 
     /// @dev Reserved storage slots at the `GovernorParameters` layer so future
     ///      param additions here don't shift `SyndicateGovernor`'s layout.
-    uint256[10] private __paramsGap;
+    ///      Shrunk 10 -> 9 when `_guardiansFeeRecipient` was appended (one new
+    ///      slot replaces one gap slot — layout-stable for upgrades).
+    uint256[9] private __paramsGap;
 
     // ── Parameter setters (owner-instant) ──
 
@@ -195,13 +205,27 @@ abstract contract GovernorParameters is ISyndicateGovernor, OwnableUpgradeable {
     }
 
     /// @inheritdoc ISyndicateGovernor
-    /// @dev No recipient check — fees always route to the bound
-    ///      `_guardianRegistry`, which is non-zero by initialize.
+    /// @dev Coupled to `_guardiansFeeRecipient` (mirrors the protocol-fee
+    ///      recipient rule): the fee may not be raised above 0 unless the
+    ///      team guardians-fee recipient is set, since the slice is transferred
+    ///      to it at settlement.
     function setGuardianFeeBps(uint256 newValue) external onlyOwner {
         if (newValue > MAX_GUARDIAN_FEE_BPS) revert InvalidGuardianFeeBps();
+        if (newValue > 0 && _guardiansFeeRecipient == address(0)) revert InvalidGuardiansFeeRecipient();
         uint256 old = _guardianFeeBps;
         _guardianFeeBps = newValue;
         emit ParameterChangeFinalized(PARAM_GUARDIAN_FEE_BPS, old, newValue);
+    }
+
+    /// @inheritdoc ISyndicateGovernor
+    /// @dev Owner-instant. Setting to `address(0)` is allowed ONLY while the
+    ///      guardian fee is off (`_guardianFeeBps == 0`) — otherwise the
+    ///      settlement transfer would have no destination.
+    function setGuardiansFeeRecipient(address newRecipient) external onlyOwner {
+        if (newRecipient == address(0) && _guardianFeeBps > 0) revert InvalidGuardiansFeeRecipient();
+        uint256 old = uint256(uint160(_guardiansFeeRecipient));
+        _guardiansFeeRecipient = newRecipient;
+        emit ParameterChangeFinalized(PARAM_GUARDIANS_FEE_RECIPIENT, old, uint256(uint160(newRecipient)));
     }
 
     /// @inheritdoc ISyndicateGovernor

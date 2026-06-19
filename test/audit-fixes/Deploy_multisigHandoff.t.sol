@@ -200,7 +200,8 @@ contract DeployMultisigHandoffTest is Test {
                     maxStrategyDuration: 14 days,
                     protocolFeeBps: 100,
                     protocolFeeRecipient: deployer,
-                    guardianFeeBps: 0
+                    guardianFeeBps: 0,
+                    guardiansFeeRecipient: address(0)
                 }),
                 predictedRegistryProxy
             )
@@ -215,7 +216,8 @@ contract DeployMultisigHandoffTest is Test {
         StakedWood swoodImpl = new StakedWood();
         bytes memory swoodInit = abi.encodeCall(
             StakedWood.initialize,
-            (StakedWood.InitParams({
+            (
+                StakedWood.InitParams({
                     owner: deployer,
                     wood: address(wood),
                     governor: governor,
@@ -225,7 +227,8 @@ contract DeployMultisigHandoffTest is Test {
                     minOwnerStake: 10_000e18,
                     minSlashBps: 1000,
                     maxSlashBps: 9999
-                }))
+                })
+            )
         );
         swood = address(new ERC1967Proxy(address(swoodImpl), swoodInit));
 
@@ -243,7 +246,8 @@ contract DeployMultisigHandoffTest is Test {
         address factoryImpl = c3.deploy(SALT_FACTORY_IMPL, abi.encodePacked(type(SyndicateFactory).creationCode));
         bytes memory facInit = abi.encodeCall(
             SyndicateFactory.initialize,
-            (SyndicateFactory.InitParams({
+            (
+                SyndicateFactory.InitParams({
                     owner: deployer,
                     executorImpl: address(0xE1), // unused by handoff test
                     vaultImpl: address(0xE2),
@@ -252,7 +256,8 @@ contract DeployMultisigHandoffTest is Test {
                     governor: governor,
                     managementFeeBps: 50,
                     guardianRegistry: registry
-                }))
+                })
+            )
         );
         factory = c3.deploy(
             SALT_FACTORY_PROXY, abi.encodePacked(type(ERC1967Proxy).creationCode, abi.encode(factoryImpl, facInit))

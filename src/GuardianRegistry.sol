@@ -30,8 +30,11 @@ interface IGovernorMinimal {
 
 /// @title GuardianRegistry
 /// @notice UUPS-upgradeable registry for guardian review votes, emergency
-///         review lifecycle, multi-asset reward pools, and the slash-appeal
-///         reserve. Holds **zero WOOD** — guardian stake, owner bonds, DPoS
+///         review lifecycle, and the slash-appeal reserve. Holds **zero
+///         assets** — the guardian fee is paid out off-chain (buyback-WOOD via
+///         weekly Merkl); the on-chain reward pool/claim machinery was deleted
+///         and `getApproverWeights` exposes the per-proposal approver split for
+///         the bot. Guardian stake, owner bonds, DPoS
 ///         delegation, vote checkpoints, and slashing live in `StakedWood`
 ///         (sWOOD). The registry reads vote weight from sWOOD and calls sWOOD
 ///         to slash. See
@@ -80,9 +83,10 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     mapping(uint256 => Review) internal _reviews;
     mapping(uint256 => mapping(address => GuardianVoteType)) internal _votes;
     /// @dev Per-(proposal, voter) snapshot of the voter's vote weight at the
-    ///      instant their review vote was recorded. Drives the reward-split
-    ///      math in `claimProposalReward`. The slash snapshot lives on sWOOD
-    ///      (`recordVoteStake` mirrors it there for slashing).
+    ///      instant their review vote was recorded. Read by the off-chain Merkl
+    ///      bot via `getApproverWeights` to attribute the (off-chain) guardian
+    ///      fee. The slash snapshot lives on sWOOD (`recordVoteStake` mirrors
+    ///      it there for slashing).
     mapping(uint256 => mapping(address => uint128)) internal _voteStake;
     mapping(uint256 => address[]) internal _approvers;
     mapping(uint256 => address[]) internal _blockers;
@@ -152,28 +156,13 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     ///         and calls sWOOD to slash. Set in `initialize`.
     IStakedWood public swood;
 
-    // ── Per-proposal guardian-fee pool ──
-    struct ProposalRewardPool {
-        address asset;
-        uint128 amount;
-        uint64 settledAt;
-    }
-
-    /// @dev Funded by governor in `_distributeFees` when guardianFeeBps > 0.
-    mapping(uint256 => ProposalRewardPool) internal _proposalGuardianPool;
-
-    /// @dev Claim flags for approvers (set in `claimProposalReward`).
-    mapping(uint256 => mapping(address => bool)) internal _approverClaimed;
-
-    /// @dev Remainder (approver's net-of-commission pool) stored after the
-    ///      approver claims, to be pulled by their delegators pro-rata.
-    mapping(address => mapping(uint256 => uint256)) internal _delegatorProposalPool;
-    mapping(address => mapping(uint256 => mapping(address => bool))) internal _delegatorProposalClaimed;
-
-    /// @dev W-1 escrow for guardian-fee reward transfers that fail (e.g. USDC
-    ///      blacklist). Keyed by `keccak256(proposalId, recipient, asset)` to
-    ///      prevent cross-proposal drain.
-    mapping(bytes32 => uint256) public unclaimedApproverFees;
+    // Guardian-fee reward distribution is OFF-CHAIN (buyback-WOOD via weekly
+    // Merkl): the governor sends the fee slice to the team `guardiansFeeRecipient`
+    // multisig and emits `GuardianFeeAccrued`; the bot reads that event +
+    // `getApproverWeights` to attribute WOOD airdrops. The on-chain pool /
+    // claim / escrow machinery was deleted — the registry holds zero assets.
+    // (Slots freed; the __gap below absorbs the layout delta — this is a fresh
+    // V1.5 mainnet redeployment so no live storage to migrate.)
 
     /// @dev Reserved storage for future upgrades.
     uint256[50] private __gap;
@@ -247,202 +236,27 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     }
 
     // ──────────────────────────────────────────────────────────────
-    // Guardian-fee pool funding
+    // Guardian-fee attribution (read-only)
     // ──────────────────────────────────────────────────────────────
 
     /// @inheritdoc IGuardianRegistry
-    /// @dev Called by governor from `_distributeFees` after transferring the
-    ///      guardian-fee slice to this contract.
-    function fundProposalGuardianPool(uint256 proposalId, address asset, uint256 amount) external {
-        if (msg.sender != governor) revert NotGovernor();
-        if (amount == 0) return;
-        if (_proposalGuardianPool[proposalId].settledAt != 0) revert PoolAlreadyFunded();
-        _proposalGuardianPool[proposalId] =
-            ProposalRewardPool({asset: asset, amount: uint128(amount), settledAt: uint64(block.timestamp)});
-        emit ProposalGuardianPoolFunded(proposalId, asset, amount);
-    }
-
-    // ──────────────────────────────────────────────────────────────
-    // Guardian-fee claim paths
-    // ──────────────────────────────────────────────────────────────
-
-    /// @inheritdoc IGuardianRegistry
-    /// @dev Approve-side reward. **Sherlock #41**: permissionless caller; the
-    ///      approver is supplied explicitly so the delegator pool gets seeded
-    ///      even if the approver themselves never invokes the claim path.
-    ///
-    ///      The approver's gross share is split by source: the portion
-    ///      attributable to their OWN stake is paid in full; the portion
-    ///      attributable to their delegators is split by DPoS commission rate
-    ///      (commission paid to approver, remainder stored for delegators).
-    ///      Own-stake weight and commission rate are read from sWOOD —
-    ///      `getPastVotes` at `openedAt` (own + delegated) is the inverse of
-    ///      the split, and `getPastDelegatedInbound` at `openedAt` gives the
-    ///      delegated half; commission is `getPastCommission` at `settledAt`.
-    function claimProposalReward(address approver, uint256 proposalId) external whenNotPaused {
-        ProposalRewardPool memory pool = _proposalGuardianPool[proposalId];
-        if (pool.amount == 0) revert NoPoolFunded();
-        if (_approverClaimed[proposalId][approver]) revert AlreadyClaimed();
-
-        if (_votes[proposalId][approver] != GuardianVoteType.Approve) revert NotApprover();
-
-        // Sherlock run #2 #4 (review fix per PR #350 follow-up): gate reward
-        // on snapshot-time own stake, not live state. Run-2 #16's
-        // `coolDownPeriod >= reviewPeriod` invariant closes the original
-        // "vote, exit during cooldown, claim post-settle" attack
-        // structurally — an approver cannot fully exit before
-        // `resolveReview` runs. This snapshot gate matches the design
-        // signal that the approver held own stake at `r.openedAt` (mirrors
-        // the voteOnProposal first-vote gate). Approvers in-process of
-        // unstaking AND approvers burned to zero by a concurrent proposal
-        // both keep their non-zero checkpoint at openedAt and are paid
-        // correctly.
-        //
-        // Post sWOOD-split: own stake lives on sWOOD. `getPastVotes` returns
-        // own + delegated weight at `openedAt`, so own-stake is
-        // `getPastVotes - getPastDelegatedInbound`.
-        Review storage r = _reviews[proposalId];
-        IStakedWood sw = swood;
-        uint256 totalW = sw.getPastVotes(approver, uint256(r.openedAt));
-        uint256 delegatedW = sw.getPastDelegatedInbound(approver, uint256(r.openedAt));
-        uint256 ownW = totalW - delegatedW;
-
-        // PR #351 review #3: when `ownW == 0` (reachable via
-        // unstake-then-restake around `openedAt` while inbound delegations
-        // still cover the vote-gate), pre-fix this reverted `NotActiveGuardian`.
-        // The revert bricked the entire claim path AND
-        // `claimDelegatorProposalReward` (since `_delegatorProposalPool` is
-        // only seeded inside this function at the write below). The approver's
-        // gross slice + the delegators' pool were stranded in the registry
-        // forever.
-        //
-        // Fix: drop the revert and route 100% of the slice to the delegator
-        // pool — the approver had no own-stake skin in the game at `openedAt`
-        // and didn't earn DPoS commission for that snapshot. The
-        // `grossFromOwn = (gross * ownW) / w` math below collapses to 0
-        // naturally; the inline `ownW == 0 ? 0 : getPastCommission(...)`
-        // ternary at the commission-rate read forces commission to 0 as well,
-        // so the entire `gross` lands in `remainder` and seeds the delegator
-        // pool at the `_delegatorProposalPool` write below. (PR #359 review #6:
-        // comment was referencing a non-existent `_zeroCommissionIfOwnIsZero`
-        // flag — the impl is the ternary.)
-
-        uint256 gross;
-        uint256 commission;
-        uint256 remainder;
-        uint256 approverPayout;
-        {
-            uint256 w = _voteStake[proposalId][approver];
-            // approveStakeWeight >= w by construction (w is one of the weights summed into it).
-            gross = (uint256(pool.amount) * w) / uint256(r.approveStakeWeight);
-
-            // Split the approver's gross share between own-stake portion (fully
-            // to approver) and delegated-stake portion (commission split).
-            // ownW is read at `r.openedAt` — the SAME timestamp used to freeze
-            // `w` in voteOnProposal — so `w >= ownW` holds by construction (w =
-            // own@openedAt + delegated@openedAt). No clamp needed. Reading at
-            // `settledAt` instead would strand funds when an approver requests
-            // unstake mid-review.
-            uint256 grossFromOwn = (gross * ownW) / w;
-            uint256 grossFromDelegated = gross - grossFromOwn;
-
-            // PR #351 review #3: zero commission when there was no own stake
-            // at `openedAt`. Otherwise an approver could game the gate via
-            // unstake-restake and still skim a commission rate they didn't
-            // earn as a validator. The full delegated portion lands in
-            // `remainder` and seeds the delegator pool below.
-            uint256 rate = ownW == 0 ? 0 : sw.getPastCommission(approver, uint256(pool.settledAt));
-            commission = (grossFromDelegated * rate) / BPS_DENOMINATOR;
-            approverPayout = grossFromOwn + commission;
-            remainder = grossFromDelegated - commission;
+    /// @dev Reads the (retained) `_approvers` / `_voteStake` accounting. Data
+    ///      persists after settle (arrays are not cleared), so this is callable
+    ///      for any historical proposal. The off-chain Merkl bot pulls this in
+    ///      a single RPC call to attribute the guardian fee (paid out as WOOD)
+    ///      to approvers — replacing the deleted on-chain claim machinery.
+    function getApproverWeights(uint256 proposalId)
+        external
+        view
+        returns (address[] memory approvers, uint128[] memory weights, uint128 totalApproveWeight)
+    {
+        approvers = _approvers[proposalId];
+        uint256 n = approvers.length;
+        weights = new uint128[](n);
+        for (uint256 i = 0; i < n; i++) {
+            weights[i] = _voteStake[proposalId][approvers[i]];
         }
-
-        // CEI: flag + pool-seed before external transfer.
-        _approverClaimed[proposalId][approver] = true;
-        _delegatorProposalPool[approver][proposalId] = remainder;
-
-        if (approverPayout > 0) {
-            _safeRewardTransfer(pool.asset, approver, approverPayout, proposalId);
-        }
-        emit ApproverRewardClaimed(proposalId, approver, gross, commission, remainder);
-    }
-
-    /// @inheritdoc IGuardianRegistry
-    /// @dev Pulls the delegator's pro-rata share of the delegate's remainder
-    ///      pool. Attribution timestamp is the review's `openedAt` — same as
-    ///      the approver's vote-weight snapshot — so delegator denominator and
-    ///      `grossFromDelegated` numerator align. Delegation history is read
-    ///      from sWOOD (`getPastDelegation` / `getPastDelegatedInbound`).
-    function claimDelegatorProposalReward(address delegate, uint256 proposalId) external {
-        if (_delegatorProposalClaimed[delegate][proposalId][msg.sender]) revert AlreadyClaimed();
-        uint256 pool = _delegatorProposalPool[delegate][proposalId];
-        if (pool == 0) revert DelegatePoolEmpty();
-
-        address asset = _proposalGuardianPool[proposalId].asset;
-        uint256 openedAt = uint256(_reviews[proposalId].openedAt);
-
-        IStakedWood sw = swood;
-        uint256 my = sw.getPastDelegation(msg.sender, delegate, openedAt);
-        uint256 totalDelegated = sw.getPastDelegatedInbound(delegate, openedAt);
-        if (totalDelegated == 0) revert NoDelegationAtSettle();
-
-        uint256 share = (pool * my) / totalDelegated;
-
-        // CEI: flag before transfer.
-        _delegatorProposalClaimed[delegate][proposalId][msg.sender] = true;
-
-        if (share > 0) {
-            _safeRewardTransfer(asset, msg.sender, share, proposalId);
-        }
-        emit DelegatorProposalRewardClaimed(msg.sender, delegate, proposalId, share);
-    }
-
-    /// @inheritdoc IGuardianRegistry
-    /// @dev W-1 retry path. After the transfer-failure condition is lifted,
-    ///      anyone can flush the escrow to the recipient. Keyed by
-    ///      (proposalId, recipient, asset) so a malicious flush cannot redirect.
-    function flushUnclaimedApproverFee(uint256 proposalId, address recipient, address asset) external {
-        bytes32 key = keccak256(abi.encode(proposalId, recipient, asset));
-        uint256 amount = unclaimedApproverFees[key];
-        if (amount == 0) revert NoEscrowedAmount();
-
-        unclaimedApproverFees[key] = 0;
-        IERC20(asset).safeTransfer(recipient, amount);
-    }
-
-    /// @dev Wrapped ERC20 transfer for guardian-fee claims. On failure (e.g.
-    ///      USDC blacklist), records the amount in `unclaimedApproverFees`
-    ///      keyed by `(proposalId, recipient, asset)` + emits
-    ///      `ApproverFeeEscrowed`. Cross-proposal drain is impossible because
-    ///      the key includes `proposalId`.
-    ///
-    ///      Sherlock run #3 #2: SafeERC20-style success check. The pre-fix
-    ///      `try IERC20(asset).transfer(...) returns (bool r)` shape mis-
-    ///      handled non-standard ERC20s like USDT that don't return a bool —
-    ///      the bool decode reverted on empty returndata, the try block
-    ///      reverted, the catch escrowed the amount, and yet the underlying
-    ///      transfer ACTUALLY succeeded. Recipient then double-claimed via
-    ///      `flushUnclaimedApproverFee` (which uses `SafeERC20.safeTransfer`,
-    ///      tolerates empty returndata). Inlined here rather than reusing
-    ///      `SafeERC20.safeTransfer` because OZ's helper REVERTS on failure
-    ///      and the W-1 escrow path needs a signal (`ok=false`) instead.
-    function _safeRewardTransfer(address asset, address recipient, uint256 amount, uint256 proposalId) internal {
-        bool ok;
-        // forge-lint: disable-next-line(unsafe-cheatcode)
-        (bool success, bytes memory rd) = asset.call(abi.encodeCall(IERC20.transfer, (recipient, amount)));
-        if (success) {
-            if (rd.length == 0) {
-                // Non-standard ERC20 (USDT-style): empty return = success.
-                ok = true;
-            } else if (rd.length >= 32) {
-                ok = abi.decode(rd, (bool));
-            }
-            // else: malformed return data — treat as failure, escrow.
-        }
-        if (!ok) {
-            unclaimedApproverFees[keccak256(abi.encode(proposalId, recipient, asset))] += amount;
-            emit ApproverFeeEscrowed(proposalId, recipient, asset, amount);
-        }
+        totalApproveWeight = _reviews[proposalId].approveStakeWeight;
     }
 
     // ──────────────────────────────────────────────────────────────
