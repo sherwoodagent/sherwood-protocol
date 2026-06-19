@@ -1109,16 +1109,25 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
         // recipient (a multisig). Swapped to WOOD off-chain and airdropped to
         // approvers/delegators weekly via Merkl. Per-proposal attribution is the
         // GuardianFeeAccrued event + the registry getApproverWeights getter.
-        // No `_guardiansFeeRecipient == address(0)` recheck here (unlike the
-        // protocol-fee I-3 guard above): the `bps > 0 ⇒ recipient != 0`
-        // invariant is enforced at every write site (initialize +
-        // setGuardianFeeBps + setGuardiansFeeRecipient), so this branch is
-        // unreachable with a zero recipient. Omitted to stay under EIP-170.
         if (_guardianFeeBps > 0) {
             guardianFee = (profit * _guardianFeeBps) / BPS_DENOMINATOR;
             if (guardianFee > 0) {
-                _payFee(vault, asset, _guardiansFeeRecipient, guardianFee);
-                emit GuardianFeeAccrued(proposalId, asset, _guardiansFeeRecipient, guardianFee, uint64(block.timestamp));
+                // NB: no `_guardiansFeeRecipient == address(0)` recheck here
+                // (unlike the protocol-fee I-3 guard above). The
+                // `guardianFeeBps > 0 ⇒ recipient != 0` invariant is enforced at
+                // every write site (initialize + setGuardianFeeBps +
+                // setGuardiansFeeRecipient), so a zero recipient is unreachable;
+                // the guard is omitted to keep the governor under the EIP-170
+                // hard cap. If recipient were ever 0, _payFee would escrow to an
+                // unclaimable (vault, 0, asset) slot rather than lose funds.
+                // Emit the attribution signal ONLY on actual delivery. If the
+                // transfer escrows (recipient blacklisted), the asset stays in
+                // the vault pending `claimUnclaimedFees` — emitting here would
+                // make the off-chain Merkl bot airdrop WOOD for a fee that was
+                // never delivered, then double-pay when the escrow is recovered.
+                if (_payFee(vault, asset, _guardiansFeeRecipient, guardianFee)) {
+                    emit GuardianFeeAccrued(proposalId, asset, _guardiansFeeRecipient, guardianFee);
+                }
             }
         }
 
@@ -1187,10 +1196,10 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
     ///      (e.g. USDC blacklist) the amount is escrowed against `recipient`
     ///      so settlement never bricks. Recipients pull via
     ///      `claimUnclaimedFees` once the failure condition is lifted. (W-1)
-    function _payFee(address vault, address asset, address recipient, uint256 amount) internal {
-        if (amount == 0) return;
+    function _payFee(address vault, address asset, address recipient, uint256 amount) internal returns (bool ok) {
+        if (amount == 0) return false;
         try ISyndicateVault(vault).transferPerformanceFee(asset, recipient, amount) {
-            // ok
+            ok = true;
         } catch {
             _unclaimedFees[_unclaimedKey(vault, recipient, asset)] += amount;
             emit FeeTransferFailed(recipient, asset, amount);

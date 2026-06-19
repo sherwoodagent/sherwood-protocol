@@ -279,8 +279,11 @@ interface ISyndicateGovernor {
     ///         collected asset to WOOD and airdrops to approvers/delegators
     ///         weekly, reading the per-proposal approver split from
     ///         `GuardianRegistry.getApproverWeights`.
+    /// @dev `settledAt` is intentionally NOT a field — it equals the emitting
+    ///      block's timestamp, which the off-chain bot reads from the log
+    ///      metadata. Omitted to keep the EIP-170-capped governor under budget.
     event GuardianFeeAccrued(
-        uint256 indexed proposalId, address indexed asset, address indexed recipient, uint256 amount, uint64 settledAt
+        uint256 indexed proposalId, address indexed asset, address indexed recipient, uint256 amount
     );
 
     // ── Functions ──

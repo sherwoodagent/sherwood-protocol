@@ -85,18 +85,21 @@ abstract contract GovernorParameters is ISyndicateGovernor, OwnableUpgradeable {
     /// @notice Guardian fee in bps (carved from gross PnL at settlement).
     uint256 internal _guardianFeeBps;
 
-    /// @notice Team multisig that receives the guardian-fee slice (vault asset).
-    ///         Swapped to WOOD off-chain and airdropped to approvers/delegators
-    ///         weekly via Merkl. Must be non-zero whenever `_guardianFeeBps > 0`.
-    address internal _guardiansFeeRecipient;
-
     /// @notice Authorized factory that can register vaults.
     address public factory;
 
+    /// @notice Team multisig that receives the guardian-fee slice (vault asset).
+    ///         Swapped to WOOD off-chain and airdropped to approvers/delegators
+    ///         weekly via Merkl. Must be non-zero whenever `_guardianFeeBps > 0`.
+    /// @dev Declared AFTER `factory` (append-only storage discipline — does not
+    ///      shift any pre-existing slot); the new slot is reclaimed from
+    ///      `__paramsGap` below.
+    address internal _guardiansFeeRecipient;
+
     /// @dev Reserved storage slots at the `GovernorParameters` layer so future
     ///      param additions here don't shift `SyndicateGovernor`'s layout.
-    ///      Shrunk 10 -> 9 when `_guardiansFeeRecipient` was appended (one new
-    ///      slot replaces one gap slot — layout-stable for upgrades).
+    ///      Shrunk 10 -> 9 when `_guardiansFeeRecipient` was appended after
+    ///      `factory` — one new slot replaces one gap slot, layout-stable.
     uint256[9] private __paramsGap;
 
     // ── Parameter setters (owner-instant) ──

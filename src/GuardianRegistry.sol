@@ -253,8 +253,11 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         approvers = _approvers[proposalId];
         uint256 n = approvers.length;
         weights = new uint128[](n);
+        // Hoist the inner mapping out of the loop (CLAUDE.md hot-loop rule —
+        // avoids re-deriving `_voteStake[proposalId]` every iteration).
+        mapping(address => uint128) storage stake = _voteStake[proposalId];
         for (uint256 i = 0; i < n; i++) {
-            weights[i] = _voteStake[proposalId][approvers[i]];
+            weights[i] = stake[approvers[i]];
         }
         totalApproveWeight = _reviews[proposalId].approveStakeWeight;
     }

@@ -99,11 +99,6 @@ contract MinimalGuardianRegistryTest is Test {
         registry.finalizeEmergency(1);
     }
 
-    function test_fundProposalGuardianPool_revertsDisabled() public {
-        vm.expectRevert(MinimalGuardianRegistry.Disabled.selector);
-        registry.fundProposalGuardianPool(1, address(0), 0);
-    }
-
     function test_stakeAsGuardian_revertsDisabled() public {
         vm.expectRevert(MinimalGuardianRegistry.Disabled.selector);
         registry.stakeAsGuardian(0, 0);

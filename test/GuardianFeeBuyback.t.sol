@@ -163,9 +163,7 @@ contract GuardianFeeBuybackTest is Test {
         uint256 registryBefore = usdc.balanceOf(address(guardianRegistry));
 
         vm.expectEmit(true, true, true, true, address(governor));
-        emit ISyndicateGovernor.GuardianFeeAccrued(
-            proposalId, address(usdc), guardiansFeeRecipient, expectedFee, uint64(vm.getBlockTimestamp() + 1 hours + 1)
-        );
+        emit ISyndicateGovernor.GuardianFeeAccrued(proposalId, address(usdc), guardiansFeeRecipient, expectedFee);
 
         vm.warp(vm.getBlockTimestamp() + 1 hours + 1);
         vm.prank(agent);
@@ -187,7 +185,7 @@ contract GuardianFeeBuybackTest is Test {
         governor.settleProposal(proposalId);
 
         Vm.Log[] memory logs = vm.getRecordedLogs();
-        bytes32 accrued = keccak256("GuardianFeeAccrued(uint256,address,address,uint256,uint64)");
+        bytes32 accrued = keccak256("GuardianFeeAccrued(uint256,address,address,uint256)");
         for (uint256 i = 0; i < logs.length; i++) {
             assertTrue(logs[i].topics[0] != accrued, "no GuardianFeeAccrued on zero profit");
         }
