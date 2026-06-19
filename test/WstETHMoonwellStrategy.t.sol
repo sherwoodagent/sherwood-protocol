@@ -622,12 +622,17 @@ contract WstETHMoonwellStrategyForkTest is Test {
     uint256 forkId;
 
     function setUp() public {
-        // Try to create fork; skip if RPC unavailable
-        try vm.createSelectFork("https://mainnet.base.org") returns (uint256 id) {
-            forkId = id;
-        } catch {
+        // Fork only when a Base RPC is configured (CI's fork-integration step sets
+        // BASE_RPC_URL; export it locally to run this). Skip cleanly otherwise — the
+        // unit-test CI step has no RPC, and the prior hardcoded public endpoint
+        // (`https://mainnet.base.org`) intermittently failed the whole step with `B0#`
+        // when it rate-limited mid-test (fork instantiates, then a forked call times out).
+        string memory rpc = vm.envOr("BASE_RPC_URL", string(""));
+        if (bytes(rpc).length == 0) {
             vm.skip(true);
+            return;
         }
+        forkId = vm.createSelectFork(rpc);
 
         // Fund vault with WETH via deal
         deal(WETH, vault, 10e18);
