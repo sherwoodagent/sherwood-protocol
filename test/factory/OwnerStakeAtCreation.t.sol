@@ -69,8 +69,7 @@ contract OwnerStakeAtCreationTest is Test {
         StakedWood swoodImpl = new StakedWood();
         bytes memory swoodInit = abi.encodeCall(
             StakedWood.initialize,
-            (
-                StakedWood.InitParams({
+            (StakedWood.InitParams({
                     owner: owner,
                     wood: address(wood),
                     governor: predictedGovernor,
@@ -80,8 +79,7 @@ contract OwnerStakeAtCreationTest is Test {
                     minOwnerStake: MIN_OWNER_STAKE,
                     minSlashBps: 1000,
                     maxSlashBps: 9999
-                })
-            )
+                }))
         );
         swood = StakedWood(address(new ERC1967Proxy(address(swoodImpl), swoodInit)));
 
@@ -129,8 +127,7 @@ contract OwnerStakeAtCreationTest is Test {
 
         bytes memory factoryInit = abi.encodeCall(
             SyndicateFactory.initialize,
-            (
-                SyndicateFactory.InitParams({
+            (SyndicateFactory.InitParams({
                     owner: owner,
                     executorImpl: address(executorLib),
                     vaultImpl: address(vaultImpl),
@@ -139,8 +136,7 @@ contract OwnerStakeAtCreationTest is Test {
                     governor: address(governor),
                     managementFeeBps: 50,
                     guardianRegistry: address(registry)
-                })
-            )
+                }))
         );
         factory = SyndicateFactory(address(new ERC1967Proxy(address(factoryImpl), factoryInit)));
         require(address(factory) == predictedFactoryProxy, "factory address prediction mismatch");

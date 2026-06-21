@@ -168,7 +168,8 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
         if (guardianRegistry_ == address(0)) revert ZeroAddress();
         if (
             p.minStrategyDuration < ABSOLUTE_MIN_STRATEGY_DURATION
-                || p.maxStrategyDuration > ABSOLUTE_MAX_STRATEGY_DURATION || p.minStrategyDuration > p.maxStrategyDuration
+                || p.maxStrategyDuration > ABSOLUTE_MAX_STRATEGY_DURATION
+                || p.minStrategyDuration > p.maxStrategyDuration
         ) revert InvalidStrategyDurationBounds();
         if (p.collaborationWindow < MIN_COLLABORATION_WINDOW || p.collaborationWindow > MAX_COLLABORATION_WINDOW) {
             revert InvalidCollaborationWindow();
@@ -237,11 +238,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
 
     // ── V2: emergency-call storage moved to GuardianRegistry ──
 
-    function _finishSettlementHook(uint256 id, StrategyProposal storage p)
-        internal
-        override
-        returns (int256, uint256)
-    {
+    function _finishSettlementHook(uint256 id, StrategyProposal storage p) internal override returns (int256, uint256) {
         return _finishSettlement(id, p);
     }
 

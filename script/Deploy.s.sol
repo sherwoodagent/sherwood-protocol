@@ -236,8 +236,9 @@ contract DeploySherwood is ScriptBase {
             d.swoodProxy = _deploySwoodProxy(c3, d.deployer, d.governorProxy, predictedFactoryProxy, cfg);
 
             address registryImpl = c3.deploy(SALT_REGISTRY_IMPL, abi.encodePacked(type(GuardianRegistry).creationCode));
-            d.registryProxy =
-                _deployRegistryProxy(c3, registryImpl, d.deployer, d.governorProxy, predictedFactoryProxy, d.swoodProxy);
+            d.registryProxy = _deployRegistryProxy(
+                c3, registryImpl, d.deployer, d.governorProxy, predictedFactoryProxy, d.swoodProxy
+            );
             require(d.registryProxy == registryAddr, "registry addr mismatch");
 
             // Wire the set-once registry reference on sWOOD.
@@ -266,8 +267,7 @@ contract DeploySherwood is ScriptBase {
         address swoodImpl = c3.deploy(SALT_SWOOD_IMPL, abi.encodePacked(type(StakedWood).creationCode));
         bytes memory initData = abi.encodeCall(
             StakedWood.initialize,
-            (
-                StakedWood.InitParams({
+            (StakedWood.InitParams({
                     owner: deployer,
                     wood: cfg.woodToken,
                     governor: governorProxy,
@@ -277,12 +277,12 @@ contract DeploySherwood is ScriptBase {
                     minOwnerStake: DEFAULT_MIN_OWNER_STAKE,
                     minSlashBps: DEFAULT_MIN_SLASH_BPS,
                     maxSlashBps: DEFAULT_MAX_SLASH_BPS
-                })
-            )
+                }))
         );
-        return c3.deploy(
-            SALT_SWOOD_PROXY, abi.encodePacked(type(ERC1967Proxy).creationCode, abi.encode(swoodImpl, initData))
-        );
+        return
+            c3.deploy(
+                SALT_SWOOD_PROXY, abi.encodePacked(type(ERC1967Proxy).creationCode, abi.encode(swoodImpl, initData))
+            );
     }
 
     function _deployGovernorProxy(
@@ -325,8 +325,7 @@ contract DeploySherwood is ScriptBase {
     {
         bytes memory initData = abi.encodeCall(
             SyndicateFactory.initialize,
-            (
-                SyndicateFactory.InitParams({
+            (SyndicateFactory.InitParams({
                     owner: d.deployer,
                     executorImpl: d.executorLib,
                     vaultImpl: d.vaultImpl,
@@ -335,8 +334,7 @@ contract DeploySherwood is ScriptBase {
                     governor: d.governorProxy,
                     managementFeeBps: cfg.managementFeeBps,
                     guardianRegistry: d.registryProxy
-                })
-            )
+                }))
         );
         return c3.deploy(
             SALT_FACTORY_PROXY, abi.encodePacked(type(ERC1967Proxy).creationCode, abi.encode(factoryImpl, initData))

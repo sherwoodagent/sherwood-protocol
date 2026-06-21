@@ -78,8 +78,7 @@ contract FeeBlacklistInvariantTest is StdInvariant, Test {
         SyndicateVault vaultImpl = new SyndicateVault();
         bytes memory vaultInit = abi.encodeCall(
             SyndicateVault.initialize,
-            (
-                ISyndicateVault.InitParams({
+            (ISyndicateVault.InitParams({
                     asset: address(usdc),
                     name: "Sherwood Vault",
                     symbol: "swUSDC",
@@ -88,8 +87,7 @@ contract FeeBlacklistInvariantTest is StdInvariant, Test {
                     openDeposits: true,
                     agentRegistry: address(agentRegistry),
                     managementFeeBps: MGMT_FEE_BPS
-                })
-            )
+                }))
         );
         vault = SyndicateVault(payable(address(new ERC1967Proxy(address(vaultImpl), vaultInit))));
 

@@ -53,8 +53,7 @@ contract GovernorStrategyOnProposalTest is Test {
         SyndicateVault vaultImpl = new SyndicateVault();
         bytes memory vaultInit = abi.encodeCall(
             SyndicateVault.initialize,
-            (
-                ISyndicateVault.InitParams({
+            (ISyndicateVault.InitParams({
                     asset: address(usdc),
                     name: "Sherwood Vault",
                     symbol: "swUSDC",
@@ -63,8 +62,7 @@ contract GovernorStrategyOnProposalTest is Test {
                     openDeposits: true,
                     agentRegistry: address(agentRegistry),
                     managementFeeBps: 50
-                })
-            )
+                }))
         );
         vault = SyndicateVault(payable(address(new ERC1967Proxy(address(vaultImpl), vaultInit))));
 
@@ -126,9 +124,7 @@ contract GovernorStrategyOnProposalTest is Test {
     function _execCalls() internal view returns (BatchExecutorLib.Call[] memory) {
         BatchExecutorLib.Call[] memory cs = new BatchExecutorLib.Call[](1);
         cs[0] = BatchExecutorLib.Call({
-            target: address(usdc),
-            data: abi.encodeCall(usdc.approve, (address(targetToken), 50_000e6)),
-            value: 0
+            target: address(usdc), data: abi.encodeCall(usdc.approve, (address(targetToken), 50_000e6)), value: 0
         });
         return cs;
     }
@@ -136,9 +132,7 @@ contract GovernorStrategyOnProposalTest is Test {
     function _settleCalls() internal view returns (BatchExecutorLib.Call[] memory) {
         BatchExecutorLib.Call[] memory cs = new BatchExecutorLib.Call[](1);
         cs[0] = BatchExecutorLib.Call({
-            target: address(usdc),
-            data: abi.encodeCall(usdc.approve, (address(targetToken), 0)),
-            value: 0
+            target: address(usdc), data: abi.encodeCall(usdc.approve, (address(targetToken), 0)), value: 0
         });
         return cs;
     }

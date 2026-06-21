@@ -59,8 +59,7 @@ contract SetGuardianRegistryTest is Test {
         SyndicateFactory factoryImpl = new SyndicateFactory();
         bytes memory factoryInit = abi.encodeCall(
             SyndicateFactory.initialize,
-            (
-                SyndicateFactory.InitParams({
+            (SyndicateFactory.InitParams({
                     owner: owner,
                     executorImpl: address(executorLib),
                     vaultImpl: address(vaultImpl),
@@ -69,8 +68,7 @@ contract SetGuardianRegistryTest is Test {
                     governor: address(governor),
                     managementFeeBps: 0,
                     guardianRegistry: address(initialRegistry)
-                })
-            )
+                }))
         );
         factory = SyndicateFactory(address(new ERC1967Proxy(address(factoryImpl), factoryInit)));
 

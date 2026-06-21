@@ -85,9 +85,7 @@ interface IGuardianRegistry {
     // ── Governor-only (emergency) ──
     function openEmergency(uint256 proposalId, bytes32 callsHash, BatchExecutorLib.Call[] calldata calls) external;
     function cancelEmergency(uint256 proposalId) external;
-    function finalizeEmergency(uint256 proposalId)
-        external
-        returns (bool blocked, BatchExecutorLib.Call[] memory calls);
+    function finalizeEmergency(uint256 proposalId) external returns (bool blocked, BatchExecutorLib.Call[] memory calls);
 
     /// @notice Governor-only: invalidate an open guardian review when the
     ///         proposer cancels the underlying proposal during

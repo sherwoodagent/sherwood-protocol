@@ -76,8 +76,7 @@ contract VaultSolvencyInvariantTest is StdInvariant, Test {
         SyndicateVault vaultImpl = new SyndicateVault();
         bytes memory vaultInit = abi.encodeCall(
             SyndicateVault.initialize,
-            (
-                ISyndicateVault.InitParams({
+            (ISyndicateVault.InitParams({
                     asset: address(usdc),
                     name: "Sherwood Vault",
                     symbol: "swUSDC",
@@ -86,8 +85,7 @@ contract VaultSolvencyInvariantTest is StdInvariant, Test {
                     openDeposits: true,
                     agentRegistry: address(agentRegistry),
                     managementFeeBps: MGMT_FEE_BPS
-                })
-            )
+                }))
         );
         vault = SyndicateVault(payable(address(new ERC1967Proxy(address(vaultImpl), vaultInit))));
 
@@ -277,8 +275,7 @@ contract VaultSolvencyColdStartInvariantTest is StdInvariant, Test {
         SyndicateVault vaultImpl = new SyndicateVault();
         bytes memory vaultInit = abi.encodeCall(
             SyndicateVault.initialize,
-            (
-                ISyndicateVault.InitParams({
+            (ISyndicateVault.InitParams({
                     asset: address(usdc),
                     name: "Sherwood Vault",
                     symbol: "swUSDC",
@@ -287,8 +284,7 @@ contract VaultSolvencyColdStartInvariantTest is StdInvariant, Test {
                     openDeposits: true,
                     agentRegistry: address(agentRegistry),
                     managementFeeBps: MGMT_FEE_BPS
-                })
-            )
+                }))
         );
         vault = SyndicateVault(payable(address(new ERC1967Proxy(address(vaultImpl), vaultInit))));
 

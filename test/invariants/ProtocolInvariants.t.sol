@@ -95,8 +95,7 @@ contract ProtocolInvariantsTest is StdInvariant, Test {
                         address(swoodImpl),
                         abi.encodeCall(
                             StakedWood.initialize,
-                            (
-                                StakedWood.InitParams({
+                            (StakedWood.InitParams({
                                     owner: registryOwner,
                                     wood: address(wood),
                                     governor: address(0xdead), // unused by this harness
@@ -106,8 +105,7 @@ contract ProtocolInvariantsTest is StdInvariant, Test {
                                     minOwnerStake: MIN_OWNER_STAKE,
                                     minSlashBps: 1000,
                                     maxSlashBps: 9999
-                                })
-                            )
+                                }))
                         )
                     )
                 )
