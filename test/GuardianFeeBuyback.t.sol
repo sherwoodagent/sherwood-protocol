@@ -169,6 +169,57 @@ contract GuardianFeeBuybackTest is Test {
         assertEq(usdc.balanceOf(address(guardianRegistry)) - registryBefore, 0, "registry untouched");
     }
 
+    // ── 1b. Reverting recipient: fee escrows, no GuardianFeeAccrued ──
+
+    /// @notice When the guardians-fee recipient is blacklisted, `_payFee` must
+    ///         escrow the slice (W-1) instead of bricking settlement, and the
+    ///         attribution signal `GuardianFeeAccrued` MUST be suppressed — the
+    ///         off-chain Merkl bot only airdrops WOOD for delivered fees. The
+    ///         recipient recovers the escrow via `claimUnclaimedFees` once
+    ///         un-blacklisted.
+    function test_settle_guardianFee_escrowsOnRevertingRecipient_noEvent() public {
+        uint256 proposalId = _executeThroughSettle(0, 7 days);
+
+        uint256 profit = 10_000e6;
+        usdc.mint(address(vault), profit);
+        uint256 expectedFee = (profit * GUARDIAN_FEE_BPS) / 10_000; // 200e6
+
+        // Recipient becomes blacklisted before settlement — the fee transfer reverts.
+        usdc.setBlacklisted(guardiansFeeRecipient, true);
+
+        vm.recordLogs();
+        vm.warp(vm.getBlockTimestamp() + 1 hours + 1);
+        vm.prank(agent);
+        governor.settleProposal(proposalId);
+
+        // No GuardianFeeAccrued (escrowed, not delivered); FeeTransferFailed instead.
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bytes32 accrued = keccak256("GuardianFeeAccrued(uint256,address,address,uint256)");
+        bytes32 failed = keccak256("FeeTransferFailed(address,address,uint256)");
+        bool sawFailed;
+        for (uint256 i = 0; i < logs.length; i++) {
+            assertTrue(logs[i].topics[0] != accrued, "no GuardianFeeAccrued on escrow");
+            if (logs[i].topics[0] == failed) sawFailed = true;
+        }
+        assertTrue(sawFailed, "FeeTransferFailed emitted on escrow");
+
+        // Fee sits escrowed against the recipient; nothing delivered yet.
+        assertEq(usdc.balanceOf(guardiansFeeRecipient), 0, "nothing delivered while blacklisted");
+        assertEq(
+            governor.unclaimedFees(address(vault), guardiansFeeRecipient, address(usdc)),
+            expectedFee,
+            "fee escrowed against recipient"
+        );
+
+        // Recovery: un-blacklist, recipient pulls the escrow.
+        usdc.setBlacklisted(guardiansFeeRecipient, false);
+        vm.prank(guardiansFeeRecipient);
+        governor.claimUnclaimedFees(address(vault), address(usdc));
+
+        assertEq(usdc.balanceOf(guardiansFeeRecipient), expectedFee, "escrow recovered to recipient");
+        assertEq(governor.unclaimedFees(address(vault), guardiansFeeRecipient, address(usdc)), 0, "escrow slot cleared");
+    }
+
     // ── 2. Zero-profit settle: no guardian fee, no event ──
 
     function test_settle_zeroProfit_noGuardianFee_noEvent() public {
