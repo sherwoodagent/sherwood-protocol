@@ -480,6 +480,47 @@ contract SyndicateVaultTest is Test {
         assertEq(usdc.balanceOf(address(vault)), 500e6);
     }
 
+    // ==================== AGENT FEE ====================
+
+    function test_agentFeeBps_defaultsToFivePercent() public view {
+        assertEq(vault.agentFeeBps(), 500, "fresh vault defaults to 5%");
+    }
+
+    function test_setAgentFeeBps_ownerCanSet() public {
+        vm.expectEmit(false, false, false, true, address(vault));
+        emit ISyndicateVault.AgentFeeUpdated(1200);
+        vm.prank(owner);
+        vault.setAgentFeeBps(1200);
+        assertEq(vault.agentFeeBps(), 1200);
+    }
+
+    function test_setAgentFeeBps_canSetZero() public {
+        vm.prank(owner);
+        vault.setAgentFeeBps(0);
+        assertEq(vault.agentFeeBps(), 0, "0% agent fee is a valid config");
+    }
+
+    function test_setAgentFeeBps_atCapSucceeds() public {
+        uint256 cap = vault.MAX_AGENT_FEE_BPS();
+        vm.prank(owner);
+        vault.setAgentFeeBps(cap);
+        assertEq(vault.agentFeeBps(), cap);
+    }
+
+    function test_setAgentFeeBps_aboveCapReverts() public {
+        // Hoist the view read so it doesn't consume the prank/expectRevert.
+        uint256 tooHigh = vault.MAX_AGENT_FEE_BPS() + 1;
+        vm.prank(owner);
+        vm.expectRevert(ISyndicateVault.AgentFeeTooHigh.selector);
+        vault.setAgentFeeBps(tooHigh);
+    }
+
+    function test_setAgentFeeBps_nonOwnerReverts() public {
+        vm.prank(lp1);
+        vm.expectRevert();
+        vault.setAgentFeeBps(1000);
+    }
+
     // ==================== RESCUE ERC721 ====================
 
     function test_rescueERC721() public {

@@ -125,12 +125,13 @@ contract GuardianFeeBuybackTest is Test {
     }
 
     function _executeThroughSettle(uint256 perfFeeBps, uint256 duration) internal returns (uint256 proposalId) {
+        vm.prank(owner);
+        vault.setAgentFeeBps(perfFeeBps);
         vm.prank(agent);
         proposalId = governor.propose(
             address(vault),
             address(0),
             "ipfs://test",
-            perfFeeBps,
             duration,
             _noopCalls(),
             _noopCalls(),

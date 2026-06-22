@@ -218,7 +218,6 @@ contract Governor_emergencyCancelOnSettle_Test is Test {
             address(vault),
             address(0),
             "ipfs://emergency-cancel",
-            1500,
             duration,
             _execCalls(),
             _settleCalls(),

@@ -205,12 +205,13 @@ contract VaultSolvencyHandler is Test {
         // No try/catch on propose: openProposalCount + cooldown gates
         // above cover the only failure modes (`VaultHasOpenProposal`,
         // `CooldownNotElapsed`). Any other revert is a real regression.
+        vm.prank(vaultOwner);
+        vault.setAgentFeeBps(perfFeeBps);
         vm.prank(leadAgent);
         uint256 proposalId = governor.propose(
             address(vault),
             address(0),
             "ipfs://test",
-            perfFeeBps,
             strategyDuration,
             calls,
             calls,

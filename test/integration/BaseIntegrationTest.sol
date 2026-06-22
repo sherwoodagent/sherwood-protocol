@@ -153,10 +153,14 @@ abstract contract BaseIntegrationTest is Test {
         uint256 feeBps,
         uint256 duration
     ) internal returns (uint256 proposalId) {
+        // Agent performance fee is now a vault property — owner sets it before proposing
+        vm.prank(owner);
+        vault.setAgentFeeBps(feeBps);
+
         // Agent proposes
         vm.prank(agent);
         proposalId = governor.propose(
-            address(vault), address(0), "ipfs://test", feeBps, duration, execCalls, settleCalls, _emptyCoProposers()
+            address(vault), address(0), "ipfs://test", duration, execCalls, settleCalls, _emptyCoProposers()
         );
 
         // Warp 1 second so snapshot timestamp is in the past

@@ -132,7 +132,6 @@ contract Governor_proposerSelfSettle_minDuration_Test is Test {
             address(vault),
             address(0),
             "ipfs://self-settle",
-            1500,
             STRATEGY_DURATION,
             _execCalls(),
             _settleCalls(),

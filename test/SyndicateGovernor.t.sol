@@ -137,12 +137,15 @@ contract SyndicateGovernorTest is Test {
     }
 
     function _createSimpleProposal(uint256 perfFeeBps, uint256 duration) internal returns (uint256 proposalId) {
+        // Agent fee is now a vault-owner property read live at settlement; set
+        // it to the test's intended rate so realized-fee assertions still hold.
+        vm.prank(owner);
+        vault.setAgentFeeBps(perfFeeBps);
         vm.prank(agent);
         proposalId = governor.propose(
             address(vault),
             address(0),
             "ipfs://test",
-            perfFeeBps,
             duration,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
@@ -193,7 +196,7 @@ contract SyndicateGovernorTest is Test {
         ISyndicateGovernor.StrategyProposal memory p = governor.getProposal(proposalId);
         assertEq(p.proposer, agent);
         assertEq(p.vault, address(vault));
-        assertEq(p.performanceFeeBps, 1500);
+        assertEq(vault.agentFeeBps(), 1500);
         assertEq(p.strategyDuration, 7 days);
         assertEq(uint256(p.state), uint256(ISyndicateGovernor.ProposalState.Pending));
 
@@ -210,7 +213,6 @@ contract SyndicateGovernorTest is Test {
             address(vault),
             address(0),
             "ipfs://test",
-            1500,
             7 days,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
@@ -225,22 +227,6 @@ contract SyndicateGovernorTest is Test {
             makeAddr("fakeVault"),
             address(0),
             "ipfs://test",
-            1500,
-            7 days,
-            _simpleExecuteCalls(),
-            _simpleSettlementCalls(),
-            _emptyCoProposers()
-        );
-    }
-
-    function test_propose_performanceFeeTooHigh_reverts() public {
-        vm.prank(agent);
-        vm.expectRevert(ISyndicateGovernor.PerformanceFeeTooHigh.selector);
-        governor.propose(
-            address(vault),
-            address(0),
-            "ipfs://test",
-            MAX_PERF_FEE_BPS + 1,
             7 days,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
@@ -255,7 +241,6 @@ contract SyndicateGovernorTest is Test {
             address(vault),
             address(0),
             "ipfs://test",
-            1500,
             MAX_STRATEGY_DURATION + 1,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
@@ -270,7 +255,6 @@ contract SyndicateGovernorTest is Test {
             address(vault),
             address(0),
             "ipfs://test",
-            1500,
             30 minutes,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
@@ -283,14 +267,7 @@ contract SyndicateGovernorTest is Test {
         vm.prank(agent);
         vm.expectRevert(ISyndicateGovernor.EmptyExecuteCalls.selector);
         governor.propose(
-            address(vault),
-            address(0),
-            "ipfs://test",
-            1500,
-            7 days,
-            empty,
-            _simpleSettlementCalls(),
-            _emptyCoProposers()
+            address(vault), address(0), "ipfs://test", 7 days, empty, _simpleSettlementCalls(), _emptyCoProposers()
         );
     }
 
@@ -299,7 +276,7 @@ contract SyndicateGovernorTest is Test {
         vm.prank(agent);
         vm.expectRevert(ISyndicateGovernor.EmptySettlementCalls.selector);
         governor.propose(
-            address(vault), address(0), "ipfs://test", 1500, 7 days, _simpleExecuteCalls(), empty, _emptyCoProposers()
+            address(vault), address(0), "ipfs://test", 7 days, _simpleExecuteCalls(), empty, _emptyCoProposers()
         );
     }
 
@@ -314,7 +291,6 @@ contract SyndicateGovernorTest is Test {
             address(vault),
             address(0),
             "ipfs://test",
-            1500,
             7 days,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
@@ -347,7 +323,6 @@ contract SyndicateGovernorTest is Test {
             address(vault),
             address(0),
             "ipfs://test",
-            1500,
             7 days,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
@@ -468,7 +443,6 @@ contract SyndicateGovernorTest is Test {
             address(vault),
             address(0),
             "ipfs://dup",
-            1500,
             7 days,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
@@ -543,6 +517,22 @@ contract SyndicateGovernorTest is Test {
         // Protocol fee: 1% of 10k = 100. Agent fee: 15% of 9900 = 1485. Mgmt: 0.5% of 8415 = 42.075
         assertEq(usdc.balanceOf(agent), agentBalBefore + 1_485e6);
         assertEq(usdc.balanceOf(owner), ownerBalBefore + 100e6 + 42_075000);
+    }
+
+    /// @notice The agent fee is read live from the vault at settlement and
+    ///         clamped to the governor's `maxPerformanceFeeBps`. A vault owner
+    ///         who sets a fee above the protocol cap still only realizes the cap.
+    function test_settlement_agentFeeClampedToMax() public {
+        // Vault owner set 30% via the helper — above the 15% cap (MAX_PERF_FEE_BPS).
+        uint256 proposalId = _createAndExecuteProposal(3000, 7 days);
+        assertEq(vault.agentFeeBps(), 3000, "vault stores the owner's 30%");
+        usdc.mint(address(vault), 10_000e6);
+        uint256 agentBalBefore = usdc.balanceOf(agent);
+        vm.prank(agent);
+        governor.settleProposal(proposalId);
+        // Clamped to 15% of net (identical to the 1500 case), not 30%:
+        // protocol 1% of 10k = 100; agent 15% of 9900 = 1485.
+        assertEq(usdc.balanceOf(agent), agentBalBefore + 1_485e6, "agent fee clamped to 15%");
     }
 
     function test_settlement_withLoss_noFees() public {

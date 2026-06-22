@@ -71,7 +71,6 @@ interface ISyndicateGovernor {
         ///         proposal (no instant live-NAV lane).
         address strategy;
         string metadataURI;
-        uint256 performanceFeeBps;
         uint256 strategyDuration;
         uint256 votesFor;
         uint256 votesAgainst;
@@ -100,7 +99,6 @@ interface ISyndicateGovernor {
     error VaultNotRegistered();
     error VaultAlreadyRegistered();
     error NotRegisteredAgent();
-    error PerformanceFeeTooHigh();
     error StrategyDurationTooLong();
     error StrategyDurationTooShort();
     error EmptyExecuteCalls();
@@ -202,7 +200,6 @@ interface ISyndicateGovernor {
         uint256 indexed proposalId,
         address indexed proposer,
         address indexed vault,
-        uint256 performanceFeeBps,
         uint256 strategyDuration,
         uint256 executeCallCount,
         uint256 settlementCallCount,
@@ -300,7 +297,6 @@ interface ISyndicateGovernor {
         address vault,
         address strategy,
         string calldata metadataURI,
-        uint256 performanceFeeBps,
         uint256 strategyDuration,
         BatchExecutorLib.Call[] calldata executeCalls,
         BatchExecutorLib.Call[] calldata settlementCalls,

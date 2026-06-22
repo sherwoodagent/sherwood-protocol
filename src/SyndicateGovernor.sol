@@ -249,7 +249,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
         address vault,
         address strategy,
         string calldata metadataURI,
-        uint256 performanceFeeBps,
         uint256 strategyDuration,
         BatchExecutorLib.Call[] calldata executeCalls,
         BatchExecutorLib.Call[] calldata settlementCalls,
@@ -262,7 +261,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
         // Draft co-proposals do not count toward openProposalCount and are
         // independently gated at their Draft -> Pending transition.
         if (openProposalCount[vault] != 0) revert VaultHasOpenProposal();
-        if (performanceFeeBps > _params.maxPerformanceFeeBps) revert PerformanceFeeTooHigh();
         if (strategyDuration > _params.maxStrategyDuration) revert StrategyDurationTooLong();
         if (strategyDuration < _params.minStrategyDuration) revert StrategyDurationTooShort();
         if (executeCalls.length == 0) revert EmptyExecuteCalls();
@@ -296,7 +294,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
         p.vault = vault;
         p.strategy = strategy;
         p.metadataURI = metadataURI;
-        p.performanceFeeBps = performanceFeeBps;
         p.strategyDuration = strategyDuration;
         if (isCollaborative) {
             p.state = ProposalState.Draft;
@@ -865,14 +862,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
     function _emitProposalCreated(uint256 proposalId, uint256 executeCallCount, uint256 settlementCallCount) internal {
         StrategyProposal storage p = _proposals[proposalId];
         emit ProposalCreated(
-            proposalId,
-            p.proposer,
-            p.vault,
-            p.performanceFeeBps,
-            p.strategyDuration,
-            executeCallCount,
-            settlementCallCount,
-            p.metadataURI
+            proposalId, p.proposer, p.vault, p.strategyDuration, executeCallCount, settlementCallCount, p.metadataURI
         );
     }
 
@@ -1067,8 +1057,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
 
         uint256 totalFee = 0;
         if (pnl > 0) {
-            (agentFee, totalFee) =
-                _distributeFees(proposalId, vault, asset, proposal.proposer, proposal.performanceFeeBps, uint256(pnl));
+            (agentFee, totalFee) = _distributeFees(proposalId, vault, asset, proposal.proposer, uint256(pnl));
         }
 
         // V2 live-NAV: stamp the realized settle price into the request queue so
@@ -1080,14 +1069,10 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
     }
 
     /// @dev Distribute protocol, agent, and management fees. Extracted to avoid stack-too-deep.
-    function _distributeFees(
-        uint256 proposalId,
-        address vault,
-        address asset,
-        address proposer,
-        uint256 perfFeeBps,
-        uint256 profit
-    ) internal returns (uint256 agentFee, uint256 totalFee) {
+    function _distributeFees(uint256 proposalId, address vault, address asset, address proposer, uint256 profit)
+        internal
+        returns (uint256 agentFee, uint256 totalFee)
+    {
         uint256 protocolFee = 0;
         uint256 guardianFee = 0;
 
@@ -1131,7 +1116,13 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
 
         uint256 netProfit = profit - protocolFee - guardianFee;
 
-        // Agent performance fee from net profit
+        // Agent performance fee from net profit. The rate is a vault-owner
+        // property read live at settlement (symmetric with managementFeeBps
+        // below), clamped to the governor's tunable maxPerformanceFeeBps so the
+        // protocol keeps a global ceiling on agent fees.
+        uint256 perfFeeBps = ISyndicateVault(vault).agentFeeBps();
+        uint256 maxPerfBps = _params.maxPerformanceFeeBps;
+        if (perfFeeBps > maxPerfBps) perfFeeBps = maxPerfBps;
         agentFee = (netProfit * perfFeeBps) / BPS_DENOMINATOR;
 
         // Management fee from remainder after agent fee

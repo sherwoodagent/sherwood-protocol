@@ -69,6 +69,12 @@ contract SyndicateVault is
     ///         fits comfortably in any block. `removeAgent` frees a slot.
     uint256 public constant MAX_AGENTS_PER_VAULT = 32;
 
+    /// @notice Hard cap on the vault-owner-set agent performance fee (50%).
+    ///         Mirrors the governor's MAX_PERFORMANCE_FEE_CAP. The governor
+    ///         additionally clamps the realized fee to its tunable
+    ///         `maxPerformanceFeeBps` at settlement, so this is a backstop.
+    uint256 public constant MAX_AGENT_FEE_BPS = 5000;
+
     // ==================== STORAGE ====================
 
     /// @notice Agent address => agent config
@@ -121,8 +127,16 @@ contract SyndicateVault is
     ///         (G1). Cleared implicitly when the proposal settles (active != pid).
     mapping(address holder => uint256 pid) private _laneALockPid;
 
+    /// @notice Vault-owner-set agent performance fee (basis points), charged on
+    ///         strategy profit at settlement. Defaults to 5% at init; the owner
+    ///         adjusts it via `setAgentFeeBps`. Read live by the governor when a
+    ///         proposal settles (clamped there to the governor's tunable
+    ///         `maxPerformanceFeeBps`). Mirrors `_managementFeeBps`, except it
+    ///         is owner-mutable rather than fixed at init.
+    uint256 private _agentFeeBps;
+
     /// @dev Reserved storage for future upgrades.
-    uint256[36] private __gap;
+    uint256[35] private __gap;
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -145,6 +159,7 @@ contract SyndicateVault is
         _openDeposits = p.openDeposits;
         _agentRegistry = IERC721(p.agentRegistry);
         _managementFeeBps = p.managementFeeBps;
+        _agentFeeBps = 500; // 5% default; vault owner adjusts via setAgentFeeBps
         _factory = msg.sender;
         _cachedDecimalsOffset = IERC20Metadata(p.asset).decimals();
     }
@@ -459,6 +474,18 @@ contract SyndicateVault is
     /// @inheritdoc ISyndicateVault
     function managementFeeBps() external view returns (uint256) {
         return _managementFeeBps;
+    }
+
+    /// @inheritdoc ISyndicateVault
+    function agentFeeBps() external view returns (uint256) {
+        return _agentFeeBps;
+    }
+
+    /// @inheritdoc ISyndicateVault
+    function setAgentFeeBps(uint256 bps) external onlyOwner {
+        if (bps > MAX_AGENT_FEE_BPS) revert AgentFeeTooHigh();
+        _agentFeeBps = bps;
+        emit AgentFeeUpdated(bps);
     }
 
     // ==================== PAGINATION ====================

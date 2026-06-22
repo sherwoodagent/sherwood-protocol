@@ -153,12 +153,13 @@ contract CollaborativeProposalsTest is Test {
         coProps[0] = ISyndicateGovernor.CoProposer({agent: coAgent1, splitBps: 3000});
         coProps[1] = ISyndicateGovernor.CoProposer({agent: coAgent2, splitBps: 1000});
 
+        vm.prank(owner);
+        vault.setAgentFeeBps(1500);
         vm.prank(leadAgent);
         proposalId = governor.propose(
             address(vault),
             address(0),
             "ipfs://collab",
-            1500,
             7 days,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
@@ -200,7 +201,6 @@ contract CollaborativeProposalsTest is Test {
             address(vault),
             address(0),
             "ipfs://solo",
-            1500,
             7 days,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
@@ -215,12 +215,13 @@ contract CollaborativeProposalsTest is Test {
     }
 
     function test_soloProposal_settlementGoesToProposer() public {
+        vm.prank(owner);
+        vault.setAgentFeeBps(1500);
         vm.prank(leadAgent);
         uint256 proposalId = governor.propose(
             address(vault),
             address(0),
             "ipfs://solo",
-            1500,
             7 days,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
@@ -441,16 +442,11 @@ contract CollaborativeProposalsTest is Test {
         coProps[0] = ISyndicateGovernor.CoProposer({agent: coAgent1, splitBps: 3333});
         coProps[1] = ISyndicateGovernor.CoProposer({agent: coAgent2, splitBps: 3334});
 
+        vm.prank(owner);
+        vault.setAgentFeeBps(1500);
         vm.prank(leadAgent);
         uint256 proposalId = governor.propose(
-            address(vault),
-            address(0),
-            "ipfs://round",
-            1500,
-            7 days,
-            _simpleExecuteCalls(),
-            _simpleSettlementCalls(),
-            coProps
+            address(vault), address(0), "ipfs://round", 7 days, _simpleExecuteCalls(), _simpleSettlementCalls(), coProps
         );
 
         vm.prank(coAgent1);
@@ -512,16 +508,11 @@ contract CollaborativeProposalsTest is Test {
         coProps[3] = ISyndicateGovernor.CoProposer({agent: co4, splitBps: 100});
         coProps[4] = ISyndicateGovernor.CoProposer({agent: co5, splitBps: 100});
 
+        vm.prank(owner);
+        vault.setAgentFeeBps(1500);
         vm.prank(leadAgent);
         uint256 proposalId = governor.propose(
-            address(vault),
-            address(0),
-            "ipfs://tiny",
-            1500,
-            7 days,
-            _simpleExecuteCalls(),
-            _simpleSettlementCalls(),
-            coProps
+            address(vault), address(0), "ipfs://tiny", 7 days, _simpleExecuteCalls(), _simpleSettlementCalls(), coProps
         );
         vm.prank(coAgent1);
         governor.approveCollaboration(proposalId);
@@ -569,10 +560,10 @@ contract CollaborativeProposalsTest is Test {
         vm.prank(owner);
         vault.removeAgent(coAgent2);
 
-        // Small profit: 49 wei. perfFeeBps=2000 => agentFee=9.
-        //   coAgent1 (3000 bps, still active): 9 * 3000 / 10000 = 2
-        //   coAgent2 (1000 bps, DEREGISTERED): 9 * 1000 / 10000 = 0 → skipped (no revert)
-        //   lead: remainder = 9 - 2 = 7
+        // Small profit: 49 wei. Vault agent fee is 1500 bps => agentFee = 7.
+        //   coAgent1 (3000 bps, still active): 7 * 3000 / 10000 = 2
+        //   coAgent2 (1000 bps, DEREGISTERED): 7 * 1000 / 10000 = 0 → skipped (no revert)
+        //   lead: remainder = 7 - 2 = 5
         usdc.mint(address(vault), 49);
 
         uint256 leadBalBefore = usdc.balanceOf(leadAgent);
@@ -599,14 +590,7 @@ contract CollaborativeProposalsTest is Test {
         vm.prank(leadAgent);
         vm.expectRevert(ISyndicateGovernor.LeadSplitTooLow.selector);
         governor.propose(
-            address(vault),
-            address(0),
-            "ipfs://test",
-            1500,
-            7 days,
-            _simpleExecuteCalls(),
-            _simpleSettlementCalls(),
-            coProps
+            address(vault), address(0), "ipfs://test", 7 days, _simpleExecuteCalls(), _simpleSettlementCalls(), coProps
         );
     }
 
@@ -617,14 +601,7 @@ contract CollaborativeProposalsTest is Test {
         vm.prank(leadAgent);
         vm.expectRevert(ISyndicateGovernor.SplitTooLow.selector);
         governor.propose(
-            address(vault),
-            address(0),
-            "ipfs://test",
-            1500,
-            7 days,
-            _simpleExecuteCalls(),
-            _simpleSettlementCalls(),
-            coProps
+            address(vault), address(0), "ipfs://test", 7 days, _simpleExecuteCalls(), _simpleSettlementCalls(), coProps
         );
     }
 
@@ -651,14 +628,7 @@ contract CollaborativeProposalsTest is Test {
         vm.prank(leadAgent);
         vm.expectRevert(ISyndicateGovernor.TooManyCoProposers.selector);
         governor.propose(
-            address(vault),
-            address(0),
-            "ipfs://test",
-            1500,
-            7 days,
-            _simpleExecuteCalls(),
-            _simpleSettlementCalls(),
-            coProps
+            address(vault), address(0), "ipfs://test", 7 days, _simpleExecuteCalls(), _simpleSettlementCalls(), coProps
         );
     }
 
@@ -669,14 +639,7 @@ contract CollaborativeProposalsTest is Test {
         vm.prank(leadAgent);
         vm.expectRevert(ISyndicateGovernor.NotRegisteredAgent.selector);
         governor.propose(
-            address(vault),
-            address(0),
-            "ipfs://test",
-            1500,
-            7 days,
-            _simpleExecuteCalls(),
-            _simpleSettlementCalls(),
-            coProps
+            address(vault), address(0), "ipfs://test", 7 days, _simpleExecuteCalls(), _simpleSettlementCalls(), coProps
         );
     }
 
@@ -688,14 +651,7 @@ contract CollaborativeProposalsTest is Test {
         vm.prank(leadAgent);
         vm.expectRevert(ISyndicateGovernor.DuplicateCoProposer.selector);
         governor.propose(
-            address(vault),
-            address(0),
-            "ipfs://test",
-            1500,
-            7 days,
-            _simpleExecuteCalls(),
-            _simpleSettlementCalls(),
-            coProps
+            address(vault), address(0), "ipfs://test", 7 days, _simpleExecuteCalls(), _simpleSettlementCalls(), coProps
         );
     }
 }

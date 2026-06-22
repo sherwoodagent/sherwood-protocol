@@ -312,7 +312,6 @@ contract SwoodReviewSlashTest is Test {
             address(vault),
             address(0),
             "ipfs://swood-review-slash",
-            1500,
             7 days,
             _execCalls(),
             _settleCalls(),

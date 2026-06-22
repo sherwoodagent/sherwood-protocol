@@ -247,14 +247,7 @@ contract GovernorEmergencyTest is Test {
     function _createExecutedProposal(uint256 duration) internal returns (uint256 proposalId) {
         vm.prank(agent);
         proposalId = governor.propose(
-            address(vault),
-            address(0),
-            "ipfs://emergency",
-            1500,
-            duration,
-            _execCalls(),
-            _settleCalls(),
-            _emptyCoProposers()
+            address(vault), address(0), "ipfs://emergency", duration, _execCalls(), _settleCalls(), _emptyCoProposers()
         );
         vm.warp(vm.getBlockTimestamp() + 1);
         vm.prank(lp1);
