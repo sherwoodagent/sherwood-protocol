@@ -663,7 +663,9 @@ library L1Read {
     }
 
     /// @notice Non-reverting version of `accountMarginSummary`. Returns success=false if the
-    /// precompile call fails.
+    /// precompile call fails OR returns a short buffer (4 fields x 32 = 128 bytes) —
+    /// the latter guards against a no-code address on non-HyperEVM chains, where a
+    /// staticcall succeeds with empty returndata and `abi.decode` would otherwise revert.
     function tryAccountMarginSummary(uint32 perpDexIndex, address user)
         internal
         view
@@ -674,7 +676,7 @@ library L1Read {
         }(
             abi.encode(perpDexIndex, user)
         );
-        if (!_success) {
+        if (!_success || _result.length < 128) {
             return (result, false);
         }
         return (abi.decode(_result, (AccountMarginSummary)), true);

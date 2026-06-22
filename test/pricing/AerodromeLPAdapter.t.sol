@@ -129,10 +129,14 @@ contract AerodromeLPAdapterTest is Test {
     }
 
     function test_value_deviationGateTrips_returnsZeroFalse() public {
-        pool.setQuotes(100e6, 200e6); // spot 2x the TWAP → >1% deviation
+        // Skew the LIVE reserves so the numeraire leg (`numAmt`, taken from
+        // getReserves) deviates from the other leg's TWAP value — the same-block
+        // reserve-skew the live-reserve gate defends (an observation-only gate
+        // would miss it). 2000 USDC / 1 WETH → numAmt = 200e6 vs TWAP 100e6 (>1%).
+        pool.setup(USDC, WETH, 2_000e6, 1e18, 100e18);
         (uint256 v, bool ok) = adapter.value(_pos(), holder);
         assertEq(v, 0);
-        assertFalse(ok, "spot-vs-TWAP deviation rejected");
+        assertFalse(ok, "live-reserve-vs-TWAP deviation rejected");
     }
 
     function test_value_zeroBalance_returnsZeroTrue() public {

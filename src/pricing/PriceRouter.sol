@@ -80,6 +80,11 @@ contract PriceRouter is Initializable, OwnableUpgradeable, UUPSUpgradeable, IPri
                 if (!ok) return (0, false);
                 total += v;
             }
+            // G3: instant availability requires actually-priced value. A strategy
+            // whose reported positions all price to 0 (e.g. value held only in an
+            // unreported venue) falls back to Lane B rather than letting deposits
+            // mint against a float-only NAV that under-reports the real position.
+            if (total == 0) return (0, false);
             return (total, true);
         } catch {
             return (0, false);

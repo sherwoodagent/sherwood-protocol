@@ -218,6 +218,16 @@ contract PriceRouterTest is Test {
         assertTrue(ok);
     }
 
+    function test_valueStrategy_zeroValueAllPositions_returnsZeroFalse() public {
+        adapter.set(0, true); // priceable but zero value (e.g. an unreported-venue omission)
+        vm.prank(owner);
+        router.setLaneAEnabled(KIND, true);
+        MockPositionStrategy s = _strategyWith(KIND);
+        (uint256 v, bool ok) = router.valueStrategy(address(s));
+        assertEq(v, 0);
+        assertFalse(ok, "G3: instant availability requires actually-priced value");
+    }
+
     function test_valueStrategy_notOkPosition_returnsZeroFalse() public {
         adapter.set(1000, false); // adapter says not priceable
         vm.prank(owner);

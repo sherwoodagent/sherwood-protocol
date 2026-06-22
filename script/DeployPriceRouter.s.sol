@@ -28,6 +28,13 @@ contract DeployPriceRouter is ScriptBase {
     address constant MOONWELL_COMPTROLLER = 0xfBb21d0380beE3312B33c4353c8936a0F13EF26C;
     /// @notice Accrual-lag haircut for Moonwell supply (bps). Monotone-increasing on-chain.
     uint16 constant MOONWELL_HAIRCUT_BPS = 25;
+    /// @notice Initial instant-eligible size cap for Moonwell supply, in the vault
+    ///         asset's smallest unit. Seeds the USDC config (6 decimals -> ~$1M).
+    ///         The cap is per-KIND while a position's value is denominated in the
+    ///         strategy's numeraire, so governance MUST re-tune it for any market
+    ///         whose underlying uses different decimals. A 0 cap means unlimited —
+    ///         the spec forbids that (the Hyperliquid $4M realizability lesson).
+    uint256 constant MOONWELL_INSTANT_CAP = 1_000_000e6;
 
     function run() external {
         bool skipHandoff = vm.envOr("SKIP_MULTISIG_HANDOFF", false);
@@ -51,6 +58,9 @@ contract DeployPriceRouter is ScriptBase {
         bytes32 kind = moonwell.KIND();
         router.registerAdapter(kind, address(moonwell));
         router.setHaircutBps(kind, MOONWELL_HAIRCUT_BPS);
+        // Seed the realizability size cap BEFORE enabling so there is never an
+        // enabled-but-uncapped window (spec: the size cap is mandatory).
+        router.setInstantCap(kind, MOONWELL_INSTANT_CAP);
         // Phase 4: Moonwell supply is the first audited Lane-A-eligible kind.
         router.setLaneAEnabled(kind, true);
 

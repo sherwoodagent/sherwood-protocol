@@ -484,11 +484,19 @@ contract SyndicateVault is
 
     // ==================== OVERRIDES ====================
 
-    /// @dev Resolve diamond between ERC20Upgradeable and ERC20VotesUpgradeable
+    /// @dev Resolve diamond between ERC20Upgradeable and ERC20VotesUpgradeable.
+    ///      G1: a Lane-A-locked holder cannot move shares out until the proposal
+    ///      settles. Without this the per-holder lock is trivially bypassed by
+    ///      transferring to a fresh (unlocked) address that then instant-redeems
+    ///      at the higher mid-proposal NAV (spec #357 invariant 5). Mint
+    ///      (`from == 0`) and burn (`to == 0`) are unaffected — burns are gated by
+    ///      `maxRedeem` / `requestRedeem`. `_isLaneALocked` short-circuits on
+    ///      `_laneALockPid[from] == 0`, so non-Lane-A holders pay only an SLOAD.
     function _update(address from, address to, uint256 value)
         internal
         override(ERC20Upgradeable, ERC20VotesUpgradeable)
     {
+        if (from != address(0) && to != address(0) && _isLaneALocked(from)) revert SharesLocked();
         super._update(from, to, value);
     }
 

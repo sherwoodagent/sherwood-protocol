@@ -50,8 +50,6 @@ interface IAeroGaugeBal {
 ///         Calibration params (Q3) are immutable; retune via a new adapter.
 contract AerodromeLPAdapter is IPriceAdapter {
     bytes32 public constant KIND = keccak256("AERODROME_LP");
-    /// @notice Recent-observation granularity for the spot leg of the deviation gate.
-    uint256 internal constant SPOT_GRANULARITY = 1;
 
     address public immutable factory; // trusted Aerodrome PoolFactory
     uint256 public immutable twapGranularity; // observations averaged for the mark
@@ -114,9 +112,16 @@ contract AerodromeLPAdapter is IPriceAdapter {
 
         uint256 twap = IAeroPool(pool).quote(other, otherAmt, twapGranularity);
         if (twap == 0) return (0, false);
-        uint256 spot = IAeroPool(pool).quote(other, otherAmt, SPOT_GRANULARITY);
-        uint256 diff = spot > twap ? spot - twap : twap - spot;
-        if (diff * 10_000 > twap * maxDeviationBps) return (0, false); // deviation gate
+        // Manipulation gate against LIVE reserve skew. `numAmt` and `otherAmt`
+        // are both derived from live `getReserves()`, which a same-block swap can
+        // skew before the change is written to an observation — so an
+        // observation-only gate (quote granularity 1 vs N) would miss it and the
+        // skew would inflate `numAmt` directly. The two LP legs are equal-valued
+        // at spot by construction, so `numAmt` IS the live spot value of the
+        // other leg; comparing it to that leg's TWAP value (`twap`) detects the
+        // skew and bounds the residual on BOTH legs to `maxDeviationBps`.
+        uint256 diff = numAmt > twap ? numAmt - twap : twap - numAmt;
+        if (diff * 10_000 > twap * maxDeviationBps) return (0, false);
 
         return (numAmt + twap, true);
     }

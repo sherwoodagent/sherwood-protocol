@@ -169,6 +169,32 @@ contract VaultLaneATest is Test {
         assertGt(vault.maxRedeem(alice), 0, "unlocked after settle");
     }
 
+    /// @notice G1 bypass regression (review #380): a Lane-A-locked holder must not
+    ///         be able to escape the lock by transferring shares to a fresh
+    ///         address that then instant-redeems at the higher mid-proposal NAV.
+    ///         `_update` rejects transfers out of a locked holder.
+    function test_laneALock_blocksTransferBypass() public {
+        address charlie = makeAddr("charlie");
+        vm.prank(alice);
+        vault.deposit(1_000e6, alice); // pre-proposal float
+        _lockLaneA(500e6);
+
+        // Bob enters via Lane A → his shares are locked to this proposal.
+        vm.prank(bob);
+        uint256 shares = vault.deposit(300e6, bob);
+
+        // Bypass attempt: move the locked shares to a fresh (unlocked) address.
+        vm.prank(bob);
+        vm.expectRevert(ISyndicateVault.SharesLocked.selector);
+        vault.transfer(charlie, shares);
+
+        // The lock lifts at settle; the transfer then succeeds.
+        _setLocked(false);
+        vm.prank(bob);
+        vault.transfer(charlie, shares);
+        assertEq(vault.balanceOf(charlie), shares, "transfer allowed after settle");
+    }
+
     // ── instant exit during Lane A (existing holder, not locked) ──
 
     function test_instantWithdraw_duringLaneA_existingHolder() public {
