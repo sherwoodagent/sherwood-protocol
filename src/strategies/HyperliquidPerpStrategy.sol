@@ -66,6 +66,7 @@ contract HyperliquidPerpStrategy is BaseStrategy {
     ///         bridge USDC back to EVM. Without this, the strategy would
     ///         report a phantom total loss to the vault.
     error ReturnsNotInitiated();
+    error SettleTooSoon();
 
     // ── Action types ──
     // Legacy single-asset actions (use perpAssetIndex from storage):
@@ -111,6 +112,11 @@ contract HyperliquidPerpStrategy is BaseStrategy {
     bool public returnsInitiated;
     /// @notice Block number of the last `recoverHcResiduals()` call. See grid.
     uint256 public lastRecoverBlock;
+
+    /// @notice Block in which `initiateReturn()` first ran. `_settle()` requires
+    ///         a strictly later block so the async HC→EVM bridge has had time to
+    ///         deliver (same-block phantom-loss guard).
+    uint256 public returnsInitiatedBlock;
     /// @notice High-water mark of USDC committed to HC but not yet observed
     ///         on HC by the precompile (in 6-decimal USDC units). See grid
     ///         for full rationale — covers both inbound and outbound cross-
@@ -423,6 +429,13 @@ contract HyperliquidPerpStrategy is BaseStrategy {
     ///         `recoverHcResiduals` / `sweepToVault`.
     function _settle() internal override {
         if (!returnsInitiated) revert ReturnsNotInitiated();
+        // Same-block phantom-loss guard: `initiateReturn()` queues the async
+        // HC→EVM bridge, which only delivers on a LATER HC block. Settling in
+        // the same block pushes ~0 and records a phantom near-total loss that a
+        // depositor could sandwich (deposit at the deflated NAV, then redeem the
+        // windfall once `recoverHcResiduals`/`sweepToVault` credits the late
+        // arrival). Enforce the natspec "≥1 block after initiateReturn" covenant.
+        if (block.number <= returnsInitiatedBlock) revert SettleTooSoon();
         _pushAllToVault(address(asset));
         settled = true;
         emit Settled();
@@ -448,6 +461,7 @@ contract HyperliquidPerpStrategy is BaseStrategy {
 
         _drainHC();
         returnsInitiated = true;
+        returnsInitiatedBlock = block.number;
         emit ReturnsInitiated();
     }
 

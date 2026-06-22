@@ -64,7 +64,8 @@ contract GovernorHardeningTest is Test {
                     maxStrategyDuration: 30 days,
                     protocolFeeBps: 0,
                     protocolFeeRecipient: address(0),
-                    guardianFeeBps: 0
+                    guardianFeeBps: 0,
+                    guardiansFeeRecipient: address(0)
                 }),
                 address(guardianRegistry)
             )

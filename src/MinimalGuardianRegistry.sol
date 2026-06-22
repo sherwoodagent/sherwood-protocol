@@ -119,10 +119,6 @@ contract MinimalGuardianRegistry {
         revert Disabled();
     }
 
-    function fundProposalGuardianPool(uint256, address, uint256) external pure {
-        revert Disabled();
-    }
-
     function stakeAsGuardian(uint256, uint256) external pure {
         revert Disabled();
     }

@@ -270,6 +270,7 @@ contract HyperliquidPerpStrategyCoverageTest is Test {
         // Sherlock run #3 #3: settle requires initiateReturn() first.
         vm.prank(proposer);
         strategy.initiateReturn();
+        vm.roll(block.number + 1);
         vm.prank(vault);
         strategy.settle();
         assertTrue(strategy.settled());
@@ -287,6 +288,7 @@ contract HyperliquidPerpStrategyCoverageTest is Test {
         // Sherlock run #3 #3: settle requires initiateReturn() first.
         vm.prank(proposer);
         strategy.initiateReturn();
+        vm.roll(block.number + 1);
         vm.prank(vault);
         strategy.settle();
         assertTrue(strategy.settled());

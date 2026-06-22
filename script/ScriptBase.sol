@@ -51,7 +51,11 @@ abstract contract ScriptBase is Script {
     ///         replacing it wholesale.
     function _patchAddress(string memory key, address value) internal {
         string memory path = string.concat(vm.projectRoot(), "/chains/", vm.toString(block.chainid), ".json");
-        vm.writeJson(vm.serializeAddress("", "", value), path, string.concat(".", key));
+        // Write the address as a flat JSON string at `.key`. Using
+        // `vm.serializeAddress("", "", value)` here produces a nested object
+        // `{"": "0x.."}` at the key (malformed) — the path-mode `writeJson`
+        // value must already be valid JSON, so quote the address string.
+        vm.writeJson(string.concat("\"", vm.toString(value), "\""), path, string.concat(".", key));
     }
 
     /// @notice Read a deployed address from chains/{chainId}.json

@@ -115,7 +115,8 @@ contract FeeBlacklistInvariantTest is StdInvariant, Test {
                     maxStrategyDuration: 30 days,
                     protocolFeeBps: PROTOCOL_FEE_BPS,
                     protocolFeeRecipient: protocolRecipient,
-                    guardianFeeBps: 0
+                    guardianFeeBps: 0,
+                    guardiansFeeRecipient: address(0)
                 }),
                 address(guardianRegistry)
             )

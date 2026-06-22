@@ -308,7 +308,8 @@ contract DeploySherwood is ScriptBase {
                     maxStrategyDuration: cfg.maxStrategyDays * 1 days,
                     protocolFeeBps: cfg.protocolFeeBps,
                     protocolFeeRecipient: deployer,
-                    guardianFeeBps: 0
+                    guardianFeeBps: 0,
+                    guardiansFeeRecipient: address(0)
                 }),
                 registryProxy
             )

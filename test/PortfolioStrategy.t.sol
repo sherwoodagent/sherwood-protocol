@@ -15,12 +15,22 @@ import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 ///      encoded as `(bytes32 feedId, int192 price)`; the mock echoes the
 ///      feedId so per-slot binding can be exercised.
 contract MockVerifierProxy {
+    /// @dev PR #359 review #3: signed offset applied to `observationsTimestamp`
+    ///      to simulate DON / sequencer clock skew (positive = future-dated).
+    ///      Default 0 → reports observed exactly at `block.timestamp`.
+    int256 public obsSkew;
+
+    function setObsSkew(int256 s) external {
+        obsSkew = s;
+    }
+
     function verify(bytes calldata signedReport) external payable returns (bytes memory) {
         (bytes32 feedId, int192 price) = abi.decode(signedReport, (bytes32, int192));
+        uint256 observedAt = uint256(int256(block.timestamp) + obsSkew);
         ChainlinkReport memory report = ChainlinkReport({
             feedId: feedId,
             validFromTimestamp: uint32(block.timestamp),
-            observationsTimestamp: uint32(block.timestamp),
+            observationsTimestamp: uint32(observedAt),
             nativeFee: 0,
             linkFee: 0,
             expiresAt: uint32(block.timestamp + 300),

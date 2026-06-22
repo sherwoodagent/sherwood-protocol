@@ -897,8 +897,9 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
         uint256 snapDelegated = getPastDelegatedInbound(approver, openedAt);
         uint256 snapOwn = snapTotal > snapDelegated ? snapTotal - snapDelegated : 0;
         // Clamp: a concurrent slash may have already reduced live stake below
-        // the recorded snapshot — take only what is actually there.
-        uint256 ownSlash = Math.mulDiv(snapOwn <= live ? snapOwn : live, slashBps, 10_000);
+        // the recorded snapshot — take only what is actually there. (PR #359
+        // review #8: `Math.min` over the ternary.)
+        uint256 ownSlash = Math.mulDiv(Math.min(snapOwn, live), slashBps, 10_000);
         if (ownSlash != 0) {
             // forge-lint: disable-next-line(unchecked-cast)
             // Safe-by-construction: `live - ownSlash <= live`, and `live`
@@ -918,10 +919,47 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
                 g.unstakeRequestedAt = 0;
             }
         }
-        // Delegated-pool slash: ONE write dilutes every LIVE delegator
-        // pro-rata. `totalDelegatedStake` only tracks the live pool, so it is
-        // decremented by this portion alone.
-        uint256 delSlash = Math.mulDiv(oldPool, slashBps, 10_000);
+        // PR #351 #2 + PR #359 review #2/#4: bound the TOTAL delegated slash
+        // (live pool + unbonding pool) at the OPENED-AT exposure
+        // `snapDelegated`. The at-open delegated capital is now spread across
+        // both pools — a pre-open delegator who `requestUnstake`d after open
+        // sits in the unbonding pool; a post-open joiner sits in the live
+        // pool. We compute one budget = `mulDiv(snapDelegated, slashBps)` and
+        // spend it live-pool-first, spilling the remainder to the unbonding
+        // pool (`unbondBasis`, computed below). This:
+        //   - keeps the pre-open-unbonded delegator slashed (I-1 evasion stays
+        //     closed: budget flows to the unbonding pool once the live pool is
+        //     exhausted), and
+        //   - bounds the post-open joiner's exposure to the at-open budget
+        //     instead of the prior full-unbonding-pool over-slash (the
+        //     asymmetry PR #359 review #2 flagged: the live cap existed but the
+        //     unbonding burn did not).
+        //
+        // LIMIT (PR #359 review #4): this bounds total slash MAGNITUDE; it does
+        // NOT achieve per-delegator isolation. Burning `poolTokens` /
+        // `unbondingPoolTokens` dilutes every current shareholder of that pool
+        // pro-rata by share count, so a post-open joiner is still diluted (at
+        // reduced magnitude) and a pre-open delegator can be under-slashed.
+        // Per-delegator isolation is unachievable under the O(1) share-factor
+        // (Cosmos validator-shares) model without per-delegator loops.
+        // Delegation ships default-OFF (`delegationEnabled`) pending V1
+        // reconsideration of the slash model (PR #351 design obs D3).
+        //
+        // Backward-compat (mirrors Run-3 #6): `snapDelegated == 0` is an
+        // uninformative snapshot — no `openedAt` passed (tests / pre-snapshot
+        // proposals) OR genuinely no delegations at open. Fall back to the live
+        // pre-#2 behavior: slash the full live pool AND the full unbonding pool.
+        uint256 delSlashBasis;
+        uint256 unbondBasis;
+        if (snapDelegated == 0) {
+            delSlashBasis = oldPool;
+            unbondBasis = unbondingPoolTokens[approver];
+        } else {
+            delSlashBasis = Math.min(snapDelegated, oldPool);
+            // Remaining budget after the live pool spills to the unbonding pool.
+            unbondBasis = Math.min(snapDelegated - delSlashBasis, unbondingPoolTokens[approver]);
+        }
+        uint256 delSlash = Math.mulDiv(delSlashBasis, slashBps, 10_000);
         if (delSlash != 0) {
             poolTokens[approver] -= delSlash;
             totalDelegatedStake -= delSlash;
@@ -941,12 +979,14 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
                 _writeActiveDelegated(totalActiveDelegatedStake - oldPool);
             }
         }
-        // I-1: unbonding-escrow slash. Stake requested-out sits in the
-        // unbonding pool for the full `coolDownPeriod` and is slashable —
-        // ONE write dilutes every unbonding delegator pro-rata. The unbonding
-        // pool is not vote-weighted / not in `totalDelegatedStake`, so no
-        // checkpoint and no `totalDelegatedStake` decrement here.
-        uint256 unbondSlash = Math.mulDiv(unbondingPoolTokens[approver], slashBps, 10_000);
+        // I-1: unbonding-escrow slash, sized by `unbondBasis` — the delegated
+        // budget left after the live pool (PR #359 review #2). ONE write
+        // dilutes every unbonding delegator pro-rata. The unbonding pool is not
+        // vote-weighted / not in `totalDelegatedStake`, so no checkpoint and no
+        // `totalDelegatedStake` decrement here. `unbondBasis <=
+        // unbondingPoolTokens` by construction, so the subtraction can't
+        // underflow.
+        uint256 unbondSlash = Math.mulDiv(unbondBasis, slashBps, 10_000);
         if (unbondSlash != 0) {
             unbondingPoolTokens[approver] -= unbondSlash;
         }

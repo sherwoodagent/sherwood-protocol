@@ -206,7 +206,8 @@ contract SwoodReviewSlashTest is Test {
                     maxStrategyDuration: 30 days,
                     protocolFeeBps: 0,
                     protocolFeeRecipient: address(0),
-                    guardianFeeBps: 0
+                    guardianFeeBps: 0,
+                    guardiansFeeRecipient: address(0)
                 }),
                 predictedRegistryProxy
             )
@@ -444,12 +445,15 @@ contract SwoodReviewSlashTest is Test {
         assertEq(wood.balanceOf(BURN_ADDRESS), burnBefore + 18_360e18, "18k own + 360 pool burned to dead address");
         assertEq(swood.pendingBurn(), 0, "no pending burn - ERC20Mock burn transfer succeeded");
 
-        // ── Assert: reward-pool state untouched by the slash ──
-        // The registry holds no WOOD; the burn happened entirely inside sWOOD.
-        // No `fundProposalGuardianPool` was called, so no proposal reward pool
-        // exists — `claimProposalReward` reverts (nothing was ever funded).
+        // ── Assert: registry holds no assets; fee attribution is off-chain ──
+        // The burn happened entirely inside sWOOD. Guardian-fee rewards are now
+        // paid off-chain (buyback-WOOD via weekly Merkl) — the on-chain reward
+        // pool / claim machinery was deleted. `getApproverWeights` still
+        // exposes the per-proposal approver attribution for the bot.
         assertEq(wood.balanceOf(address(registry)), 0, "registry still holds no WOOD after slash");
-        vm.expectRevert(IGuardianRegistry.NoPoolFunded.selector);
-        registry.claimProposalReward(gApprove, pid);
+        (address[] memory approvers,, uint128 totalApproveWeight) = registry.getApproverWeights(pid);
+        assertEq(approvers.length, 1, "approver attribution persists post-slash");
+        assertEq(approvers[0], gApprove, "approver is gApprove");
+        assertGt(uint256(totalApproveWeight), 0, "approve-weight denominator recorded");
     }
 }

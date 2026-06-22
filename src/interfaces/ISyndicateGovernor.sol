@@ -40,6 +40,11 @@ interface ISyndicateGovernor {
         uint256 protocolFeeBps;
         address protocolFeeRecipient;
         uint256 guardianFeeBps;
+        /// @notice Team multisig that receives the guardian-fee slice (vault
+        ///         asset) at settlement. Swapped to WOOD off-chain and airdropped
+        ///         to approvers/delegators weekly via Merkl. Must be non-zero
+        ///         whenever `guardianFeeBps > 0`.
+        address guardiansFeeRecipient;
     }
 
     struct GovernorParams {
@@ -185,6 +190,11 @@ interface ISyndicateGovernor {
     error CoProposerShareUnderflow();
 
     error InvalidGuardianFeeBps();
+    /// @notice Raised when `guardianFeeBps > 0` would coexist with an unset
+    ///         `guardiansFeeRecipient` — at initialize, on `setGuardianFeeBps`
+    ///         raising the fee, or on `setGuardiansFeeRecipient(address(0))`
+    ///         while the fee is on. Mirrors the protocol-fee recipient coupling.
+    error InvalidGuardiansFeeRecipient();
 
     // ── Events ──
 
@@ -213,7 +223,11 @@ interface ISyndicateGovernor {
 
     event EmergencySettled(uint256 indexed proposalId, address indexed vault, int256 pnl, uint256 customCallCount);
 
-    event GuardianRegistrySet(address indexed oldRegistry, address indexed newRegistry);
+    // PR #351 review #1: GuardianRegistrySet event removed alongside the
+    // `setGuardianRegistry` setter. Repointing mid-proposal silently
+    // auto-Approved blocked reviews — same hazard class as V-H2. The
+    // registry slot is now write-only at `initialize`; migration happens
+    // through a governor UUPS upgrade.
 
     // ── Fee-distribution resilience events (W-1) ──
     /// @notice Emitted when a per-recipient fee transfer in `_distributeFees` /
@@ -261,24 +275,15 @@ interface ISyndicateGovernor {
 
     /// @notice Emitted in `_distributeFees` when `guardianFeeBps > 0`.
     ///         Guardian fee is carved from gross PnL and transferred to
-    ///         `recipient` (the GuardianRegistry).
+    ///         `recipient` (the team `guardiansFeeRecipient` multisig). This is
+    ///         the off-chain Merkl bot's sole attribution signal — it swaps the
+    ///         collected asset to WOOD and airdrops to approvers/delegators
+    ///         weekly, reading the per-proposal approver split from
+    ///         `GuardianRegistry.getApproverWeights`.
+    /// @dev `settledAt` is intentionally NOT a field — it equals the emitting
+    ///      block's timestamp, which the off-chain bot reads from the log
+    ///      metadata. Omitted to keep the EIP-170-capped governor under budget.
     event GuardianFeeAccrued(
-        uint256 indexed proposalId, address indexed asset, address indexed recipient, uint256 amount, uint64 settledAt
-    );
-
-    /// @notice Emitted when the guardian-fee transfer from the vault to the
-    ///         recipient reverts (e.g. recipient blacklisted on USDC). The
-    ///         fee stays in the vault.
-    event GuardianFeeDeliveryFailed(
-        uint256 indexed proposalId, address indexed asset, address indexed recipient, uint256 amount
-    );
-
-    /// @notice Emitted when the transfer succeeds but the recipient's
-    ///         `fundProposalGuardianPool` call reverts (misconfigured
-    ///         recipient, registry upgrade bug). The asset is in the
-    ///         recipient's balance but no pool is stamped — ops can recover
-    ///         via the recipient contract's owner.
-    event GuardianFeePoolFundingFailed(
         uint256 indexed proposalId, address indexed asset, address indexed recipient, uint256 amount
     );
 
@@ -349,7 +354,9 @@ interface ISyndicateGovernor {
     function setProtocolFeeBps(uint256 newProtocolFeeBps) external;
     function setProtocolFeeRecipient(address newRecipient) external;
     function setGuardianFeeBps(uint256 newValue) external;
+    function setGuardiansFeeRecipient(address newRecipient) external;
     function guardianFeeBps() external view returns (uint256);
+    function guardiansFeeRecipient() external view returns (address);
 
     // ── Views ──
 

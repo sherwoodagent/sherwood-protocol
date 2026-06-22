@@ -88,7 +88,8 @@ contract FeeBlacklistResilienceTest is Test {
                     maxStrategyDuration: 30 days,
                     protocolFeeBps: 100,
                     protocolFeeRecipient: protocolRecipient,
-                    guardianFeeBps: 0
+                    guardianFeeBps: 0,
+                    guardiansFeeRecipient: address(0)
                 }),
                 address(guardianRegistry)
             )

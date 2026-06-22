@@ -86,7 +86,8 @@ contract Governor_proposerSelfSettle_minDuration_Test is Test {
                     maxStrategyDuration: MAX_STRATEGY_DURATION,
                     protocolFeeBps: 0,
                     protocolFeeRecipient: address(0),
-                    guardianFeeBps: 0
+                    guardianFeeBps: 0,
+                    guardiansFeeRecipient: address(0)
                 }),
                 address(guardianRegistry)
             )

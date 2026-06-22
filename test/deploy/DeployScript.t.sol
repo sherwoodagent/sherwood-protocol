@@ -64,7 +64,8 @@ contract DeployScriptTest is Test {
                     maxStrategyDuration: 14 days,
                     protocolFeeBps: 100,
                     protocolFeeRecipient: deployer,
-                    guardianFeeBps: 0
+                    guardianFeeBps: 0,
+                    guardiansFeeRecipient: address(0)
                 }),
                 predictedRegistryProxy
             )

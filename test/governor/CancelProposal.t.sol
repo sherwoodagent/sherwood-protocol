@@ -95,7 +95,8 @@ contract CancelProposalTest is Test {
                     maxStrategyDuration: MAX_STRATEGY_DURATION,
                     protocolFeeBps: 0,
                     protocolFeeRecipient: owner,
-                    guardianFeeBps: 0
+                    guardianFeeBps: 0,
+                    guardiansFeeRecipient: address(0)
                 }),
                 address(guardianRegistry)
             )

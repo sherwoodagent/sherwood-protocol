@@ -75,7 +75,8 @@ contract DeployRobinhoodTestnet is ScriptBase {
                     maxStrategyDuration: 7 days,
                     protocolFeeBps: 200,
                     protocolFeeRecipient: deployer,
-                    guardianFeeBps: 0
+                    guardianFeeBps: 0,
+                    guardiansFeeRecipient: address(0)
                 }),
                 predictedRegistryProxy
             )

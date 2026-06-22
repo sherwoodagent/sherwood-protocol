@@ -621,18 +621,24 @@ contract WstETHMoonwellStrategyForkTest is Test {
 
     uint256 forkId;
 
+    // Pinned Base block (~2026-06-12). The fork was previously unpinned
+    // (`latest`), making this test nondeterministic: the WETH→wstETH swap in
+    // execute() routes through a live Aerodrome pool whose spot price drifts,
+    // and the strategy's 0.8e18 min-out floor sits ~0.5% above the real rate.
+    // Latest-block runs began reverting `B0#` (Aerodrome slippage) once spot
+    // crossed the floor. This block is verified: getAmountOut(0.01 WETH) =
+    // 0.008043 wstETH ≥ the 0.008 floor, and beta CI passed the full lifecycle
+    // near here. Pin keeps it deterministic.
+    uint256 constant FORK_BLOCK = 47_255_670;
+
     function setUp() public {
-        // Fork only when a Base RPC is configured (CI's fork-integration step sets
-        // BASE_RPC_URL; export it locally to run this). Skip cleanly otherwise — the
-        // unit-test CI step has no RPC, and the prior hardcoded public endpoint
-        // (`https://mainnet.base.org`) intermittently failed the whole step with `B0#`
-        // when it rate-limited mid-test (fork instantiates, then a forked call times out).
-        string memory rpc = vm.envOr("BASE_RPC_URL", string(""));
-        if (bytes(rpc).length == 0) {
+        // Try to create fork; skip if RPC unavailable
+        try vm.createSelectFork("https://mainnet.base.org", FORK_BLOCK) returns (uint256 id) {
+            forkId = id;
+        } catch {
             vm.skip(true);
             return;
         }
-        forkId = vm.createSelectFork(rpc);
 
         // Fund vault with WETH via deal
         deal(WETH, vault, 10e18);

@@ -9,6 +9,14 @@ contract MockL2Registrar is IL2Registrar {
     mapping(bytes32 => address) private _owners;
     mapping(bytes32 => bool) private _taken;
 
+    /// @notice When true, `available()` reverts — simulates a paused /
+    ///         misconfigured / non-conforming registrar view (F4 regression).
+    bool public revertOnAvailable;
+
+    function setRevertOnAvailable(bool v) external {
+        revertOnAvailable = v;
+    }
+
     /// @notice Register a subdomain label to an owner
     function register(string calldata label, address owner) external override {
         bytes32 key = keccak256(bytes(label));
@@ -20,6 +28,7 @@ contract MockL2Registrar is IL2Registrar {
 
     /// @notice Check if a label is available
     function available(string calldata label) external view override returns (bool) {
+        require(!revertOnAvailable, "registrar available() reverts");
         if (bytes(label).length < 3) return false;
         return !_taken[keccak256(bytes(label))];
     }

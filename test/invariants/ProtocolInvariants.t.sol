@@ -160,7 +160,8 @@ contract ProtocolInvariantsTest is StdInvariant, Test {
                 maxStrategyDuration: MAX_STRATEGY_DURATION,
                 protocolFeeBps: INITIAL_PROTOCOL_FEE_BPS,
                 protocolFeeRecipient: initialFeeRecipient,
-                guardianFeeBps: 0
+                guardianFeeBps: 0,
+                guardiansFeeRecipient: address(0)
             });
             governor = SyndicateGovernor(
                 address(

@@ -178,6 +178,12 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     event UpgradesEnabledUpdated(bool enabled);
     event OwnerRotated(address indexed vault, address indexed newOwner);
     event WithdrawalQueueDeployed(address indexed vault, address indexed queue);
+    /// @notice PR #351 review #7: emitted when the ENS subname registration
+    ///         in `createSyndicate` reverts (e.g. a mempool front-runner
+    ///         registered the same label, or the registrar is paused). The
+    ///         vault + queue + stake bind already landed; off-chain can
+    ///         retry by calling the registrar directly.
+    event EnsRegistrationFailed(address indexed vault, string subdomain);
     event GuardianRegistrySet(address indexed oldRegistry, address indexed newRegistry);
     event EnsRegistrarUpdated(address indexed oldRegistrar, address indexed newRegistrar);
     event PriceRouterUpdated(address indexed router);
@@ -293,9 +299,44 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         // Reverts roll back the whole creation tx — atomic.
         sw.bindOwnerStake(msg.sender, vault);
 
-        // Register ENS subname — vault is both address record + NFT owner
+        // Register ENS subname — vault is both address record + NFT owner.
+        //
+        // PR #351 review #7: an external registrar revert (mempool front-runner
+        // claims the label upstream, or the registrar is paused) must NOT undo
+        // the fee transfer + vault/queue deploy + stake bind already done. The
+        // syndicate is fully operational without ENS — chat discovery falls
+        // back to subdomain name-match — and an operator can `register` later
+        // via the registrar directly (see `setEnsRegistrar` natspec). So we
+        // never revert `createSyndicate` for an ENS failure.
+        //
+        // PR #359 review #5: pre-check `available()` so a genuine label-taken
+        // front-run is distinguished (in telemetry) from an unexpected
+        // registrar fault, and the doomed `register` call is skipped. Either
+        // way we emit `EnsRegistrationFailed` for monitors. We deliberately do
+        // NOT bubble the non-front-run reverts (Ana's "scope + bubble"
+        // suggestion): a paused/misconfigured registrar would then brick ALL
+        // vault creation, which is worse than shipping ENS-less + an event.
         if (address(ensRegistrar) != address(0)) {
-            ensRegistrar.register(config.subdomain, vault);
+            // F4: the `available()` view is itself an external call into a
+            // possibly-paused / misconfigured / non-conforming registrar. It
+            // MUST be in try/catch too — otherwise a reverting view bricks ALL
+            // vault creation, the exact DoS the `register` catch (and the note
+            // above) is meant to prevent.
+            try ensRegistrar.available(config.subdomain) returns (bool avail) {
+                if (avail) {
+                    try ensRegistrar.register(config.subdomain, vault) {}
+                    catch {
+                        emit EnsRegistrationFailed(vault, config.subdomain);
+                    }
+                } else {
+                    // Label already taken upstream (front-run or prior external
+                    // registration). Skip the doomed call; signal for retry/triage.
+                    emit EnsRegistrationFailed(vault, config.subdomain);
+                }
+            } catch {
+                // Registrar `available()` faulted — fail open, stay operational.
+                emit EnsRegistrationFailed(vault, config.subdomain);
+            }
         }
 
         syndicates[syndicateId] = Syndicate({
@@ -309,6 +350,13 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         });
 
         vaultToSyndicate[vault] = syndicateId;
+        // PR #359 review #5: the subdomain → syndicate mapping is written
+        // UNCONDITIONALLY (even if the ENS on-chain registration above failed)
+        // BY DESIGN — the subdomain is the syndicate's logical name used for
+        // chat discovery, and Sherwood reserves it locally regardless of ENS
+        // state. The earlier `SubdomainTaken` guard prevents two syndicates
+        // from claiming the same logical name. ENS is a best-effort on-chain
+        // mirror, retryable out-of-band.
         subdomainToSyndicate[config.subdomain] = syndicateId;
         _activeSyndicateIds.add(syndicateId);
 

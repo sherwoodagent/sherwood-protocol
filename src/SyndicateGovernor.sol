@@ -178,6 +178,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
         if (p.protocolFeeBps > MAX_PROTOCOL_FEE_BPS) revert InvalidProtocolFeeBps();
         if (p.protocolFeeBps > 0 && p.protocolFeeRecipient == address(0)) revert InvalidProtocolFeeRecipient();
         if (p.guardianFeeBps > MAX_GUARDIAN_FEE_BPS) revert InvalidGuardianFeeBps();
+        if (p.guardianFeeBps > 0 && p.guardiansFeeRecipient == address(0)) revert InvalidGuardiansFeeRecipient();
 
         __Ownable_init(p.owner);
 
@@ -201,6 +202,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
         _protocolFeeBps = p.protocolFeeBps;
         _protocolFeeRecipient = p.protocolFeeRecipient;
         _guardianFeeBps = p.guardianFeeBps;
+        _guardiansFeeRecipient = p.guardiansFeeRecipient;
         _guardianRegistry = guardianRegistry_;
         _reentrancyStatus = _NOT_ENTERED;
     }
@@ -447,23 +449,22 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
         StrategyProposal storage proposal = _proposals[proposalId];
         if (msg.sender != proposal.proposer) revert NotProposer();
         ProposalState s = _resolveState(proposal);
+        // PR #359 review #1: `_decOpen` now bumps `_lastSettledAt` internally,
+        // so each branch below only needs the decrement call.
         if (s == ProposalState.Pending) {
             // Pending: only during the voting period.
             if (block.timestamp > proposal.voteEnd) revert ProposalNotCancellable();
             _decOpen(proposal.vault);
-            _lastSettledAt[proposal.vault] = block.timestamp;
         } else if (s == ProposalState.GuardianReview) {
             // Close the registry-side review BEFORE marking the proposal
             // Cancelled. Registry reverts the cancelReview if reviewEnd has
             // already elapsed — bubbles up here as the cancel-window closer.
             IGuardianRegistry(_guardianRegistry).cancelReview(proposalId);
             _decOpen(proposal.vault);
-            _lastSettledAt[proposal.vault] = block.timestamp;
         } else if (s == ProposalState.Approved) {
             // Approved means review already resolved as not-blocked. No
             // registry cleanup needed — slashing path is closed.
             _decOpen(proposal.vault);
-            _lastSettledAt[proposal.vault] = block.timestamp;
         } else if (s == ProposalState.Draft) {
             uint256 total = _coProposers[proposalId].length;
             if (total > 1 && _approvedCount[proposalId] + 1 >= total) {
@@ -471,7 +472,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
             }
             // Sherlock #8: Draft now binds the vault — decrement on cancel.
             _decOpen(proposal.vault);
-            _lastSettledAt[proposal.vault] = block.timestamp;
         } else {
             revert ProposalNotCancellable();
         }
@@ -499,13 +499,29 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
         // Draft branch (line 421-422) and `rejectCollaboration` (line 582)
         // which already do this.
         if (s != ProposalState.Pending && s != ProposalState.Draft) revert ProposalNotCancellable();
+        // PR #351 review #5 / PR #359 review #1: `_decOpen` bumps
+        // `_lastSettledAt` so the cooldown rate-limits
+        // propose→cancel→propose→execute.
         _decOpen(proposal.vault);
         proposal.state = ProposalState.Cancelled;
         emit ProposalCancelled(proposalId, msg.sender);
     }
 
+    /// @dev Decrement the open-proposal counter AND stamp the settle cooldown.
+    ///      PR #359 review #1: `_lastSettledAt` is bumped HERE, the single
+    ///      chokepoint, rather than at each caller. Pre-fix the bump was
+    ///      duplicated across 6 cancel/settle branches but MISSED on the lazy
+    ///      `_resolveState` terminal-transition path (`:944`), which is
+    ///      reachable permissionlessly via `resolveProposalState`. That gap
+    ///      let propose→resolve→propose→execute skip the cooldown that gates
+    ///      execute-after-settle. Folding the bump into `_decOpen` closes all
+    ///      branches and prevents a future `_decOpen` site from reintroducing
+    ///      the omission. Every caller wants the bump: a vault whose only open
+    ///      proposal just terminated (cancel / veto / reject / block-quorum
+    ///      reject / expiry / settle) starts its cooldown from now.
     function _decOpen(address vault) private {
         --openProposalCount[vault];
+        _lastSettledAt[vault] = block.timestamp;
     }
 
     /// @inheritdoc ISyndicateGovernor
@@ -520,6 +536,8 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
         if (_resolveState(proposal) != ProposalState.Pending) revert ProposalNotCancellable();
         proposal.state = ProposalState.Rejected;
         // `_activeProposal` is unset during Pending (only set by execute).
+        // PR #359 review #1: `_decOpen` bumps `_lastSettledAt` (same rate-limit
+        // invariant as the cancel branches).
         _decOpen(proposal.vault);
         emit ProposalVetoed(proposalId, msg.sender);
     }
@@ -601,8 +619,8 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
 
         proposal.state = ProposalState.Cancelled;
         // Sherlock #8: Draft now binds the vault — decrement on reject.
+        // PR #359 review #1: `_decOpen` bumps `_lastSettledAt` internally.
         _decOpen(proposal.vault);
-        _lastSettledAt[proposal.vault] = block.timestamp;
         emit CollaborationRejected(proposalId, msg.sender);
         emit ProposalCancelled(proposalId, msg.sender);
     }
@@ -750,18 +768,34 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
     }
 
     /// @inheritdoc ISyndicateGovernor
+    function guardiansFeeRecipient() external view returns (address) {
+        return _guardiansFeeRecipient;
+    }
+
+    /// @inheritdoc ISyndicateGovernor
     function guardianRegistry() external view returns (address) {
         return _guardianRegistry;
     }
 
-    /// @notice Re-point the governor at a new guardian registry. Used when
-    ///         WOOD ships and the protocol migrates from the beta stub to the
-    ///         real `GuardianRegistry`. Owner-only.
-    function setGuardianRegistry(address newRegistry) external onlyOwner {
-        if (newRegistry == address(0)) revert ZeroAddress();
-        emit GuardianRegistrySet(_guardianRegistry, newRegistry);
-        _guardianRegistry = newRegistry;
-    }
+    /// @dev `setGuardianRegistry` REMOVED — PR #351 review finding #1
+    ///      (anajuliabit, code-traced review of beta @ 7dc275ef).
+    ///
+    ///      Repointing `_guardianRegistry` mid-proposal silently auto-Approved
+    ///      any proposal sitting in `GuardianReview` on the *old* registry: on
+    ///      the new registry's `resolveReview` the `!r.opened` branch (see
+    ///      `GuardianRegistry.sol:725-729`) returns `blocked=false`, discarding
+    ///      every Block vote AND the approver slash. The `reviewEnd` gate still
+    ///      passes because proposal timing lives on the governor.
+    ///
+    ///      Same hazard class as **V-H2** (the factory's `setGovernor` was
+    ///      removed for the symmetric reason). The legitimate migration path
+    ///      (beta stub → real `GuardianRegistry` when WOOD ships) is a
+    ///      governor UUPS upgrade — replace the implementation that hardcodes
+    ///      the new registry address at `initialize`, not a setter.
+    ///
+    ///      `_guardianRegistry` remains a storage slot (not `immutable`) only
+    ///      because the governor is itself UUPS-upgradeable; the new impl
+    ///      writes the new address in its initializer.
 
     /// @notice Narrow proposal view consumed by the guardian registry.
     /// @dev Returns a tuple (`voteEnd`, `reviewEnd`, `vault`) encoded to match
@@ -1021,13 +1055,14 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
 
         // Finalize state before external transfers to prevent reentrancy on stale state
         _activeProposal[vault] = 0;
-        _lastSettledAt[vault] = block.timestamp;
         proposal.state = ProposalState.Settled;
         delete _capitalSnapshots[proposalId];
         // Open emergency reviews are NOT auto-cancelled here — they resolve
         // naturally via `resolveEmergencyReview` at reviewEnd (slashing if the
         // block quorum was met, no-op otherwise) so an owner who opened an
         // adversarial emergency cannot dodge slash by racing a settle.
+        // PR #359 review #1: `_decOpen` stamps `_lastSettledAt[vault]` — still
+        // within the finalize block, before any fee transfer below.
         _decOpen(vault);
 
         uint256 totalFee = 0;
@@ -1068,43 +1103,28 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
             }
         }
 
-        // Guardian fee — slice of settled PnL routed to the registry (funds
-        // per-proposal approver-reward pool). See spec §4.8.
-        // Resilient: if the recipient transfer or pool-funding fails
-        // (blacklist, misconfigured recipient, registry upgrade bug), emit
-        // a diagnostic event and skip the fee so settlement cannot brick.
-        // On transfer failure, the fee stays in the vault (LPs benefit).
-        // On fund-funding failure (post-transfer), the amount is in the
-        // registry but unpooled; ops can recover via the registry owner.
+        // Guardian fee — slice of gross PnL routed to the team guardians-fee
+        // recipient (a multisig). Swapped to WOOD off-chain and airdropped to
+        // approvers/delegators weekly via Merkl. Per-proposal attribution is the
+        // GuardianFeeAccrued event + the registry getApproverWeights getter.
         if (_guardianFeeBps > 0) {
-            uint256 fee = (profit * _guardianFeeBps) / BPS_DENOMINATOR;
-            address recipient = _guardianRegistry;
-            if (fee > 0) {
-                try ISyndicateVault(vault).transferPerformanceFee(asset, recipient, fee) {
-                    // Sherlock #36 (Run-1 #19): revert if pool-funding fails.
-                    // Pre-fix, the inner catch silently swallowed `Disabled()`
-                    // / misconfig reverts AFTER the asset had already been
-                    // transferred to the registry — assets accumulated un-
-                    // poolable forever (MinimalGuardianRegistry has no
-                    // withdrawal path). Reverting the inner call rolls back
-                    // the outer transfer too (both calls are in the same tx),
-                    // so the asset stays in the vault and the operator can
-                    // fix the registry config and retry settle.
-                    //
-                    // Sherlock run #2 #10 (INVALID — direct conflict with the
-                    // above): asks to wrap the inner call in its own
-                    // try-catch and "swallow" failures to avoid settlement
-                    // DoS. Rejected: silently losing guardian fees on
-                    // registry misconfig hides operator errors and breaks
-                    // the audit trail. Fail-closed is the correct
-                    // resolution — Run-1 #19 stands.
-                    IGuardianRegistry(recipient).fundProposalGuardianPool(proposalId, asset, fee);
-                    guardianFee = fee;
-                    emit GuardianFeeAccrued(proposalId, asset, recipient, fee, uint64(block.timestamp));
-                } catch {
-                    // Transfer failed — fee stays in the vault, LPs benefit.
-                    // guardianFee remains 0 so the waterfall reflects reality.
-                    emit GuardianFeeDeliveryFailed(proposalId, asset, recipient, fee);
+            guardianFee = (profit * _guardianFeeBps) / BPS_DENOMINATOR;
+            if (guardianFee > 0) {
+                // NB: no `_guardiansFeeRecipient == address(0)` recheck here
+                // (unlike the protocol-fee I-3 guard above). The
+                // `guardianFeeBps > 0 ⇒ recipient != 0` invariant is enforced at
+                // every write site (initialize + setGuardianFeeBps +
+                // setGuardiansFeeRecipient), so a zero recipient is unreachable;
+                // the guard is omitted to keep the governor under the EIP-170
+                // hard cap. If recipient were ever 0, _payFee would escrow to an
+                // unclaimable (vault, 0, asset) slot rather than lose funds.
+                // Emit the attribution signal ONLY on actual delivery. If the
+                // transfer escrows (recipient blacklisted), the asset stays in
+                // the vault pending `claimUnclaimedFees` — emitting here would
+                // make the off-chain Merkl bot airdrop WOOD for a fee that was
+                // never delivered, then double-pay when the escrow is recovered.
+                if (_payFee(vault, asset, _guardiansFeeRecipient, guardianFee)) {
+                    emit GuardianFeeAccrued(proposalId, asset, _guardiansFeeRecipient, guardianFee);
                 }
             }
         }
@@ -1174,12 +1194,11 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
     ///      (e.g. USDC blacklist) the amount is escrowed against `recipient`
     ///      so settlement never bricks. Recipients pull via
     ///      `claimUnclaimedFees` once the failure condition is lifted. (W-1)
-    function _payFee(address vault, address asset, address recipient, uint256 amount) internal {
-        if (amount == 0) return;
+    function _payFee(address vault, address asset, address recipient, uint256 amount) internal returns (bool ok) {
+        if (amount == 0) return false;
         try ISyndicateVault(vault).transferPerformanceFee(asset, recipient, amount) {
-        // ok
-        }
-        catch {
+            ok = true;
+        } catch {
             _unclaimedFees[_unclaimedKey(vault, recipient, asset)] += amount;
             emit FeeTransferFailed(recipient, asset, amount);
         }

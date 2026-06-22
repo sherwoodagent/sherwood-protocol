@@ -294,6 +294,7 @@ contract HyperliquidPerpStrategyTest is Test {
         // _execAndPrep + initiateReturn pattern.
         vm.prank(proposer);
         strategy.initiateReturn();
+        vm.roll(block.number + 1);
 
         vm.prank(vault);
         strategy.settle();
@@ -303,11 +304,40 @@ contract HyperliquidPerpStrategyTest is Test {
         assertFalse(strategy.hasActiveStopLoss());
     }
 
+    /// @notice Campaign finding F2 (HIGH) — `settle()` MUST revert when called
+    ///         in the SAME block as `initiateReturn()`. The async HC→EVM bridge
+    ///         only delivers on a later block; a same-block settle pushes ~0 and
+    ///         books a phantom near-total loss that a depositor could sandwich
+    ///         (deposit at the deflated NAV, then redeem the windfall once the
+    ///         late HC arrival is swept back). The fix records
+    ///         `returnsInitiatedBlock` and requires a strictly later block.
+    function test_settle_revertsSameBlockAsInitiateReturn() public {
+        _executeFirst();
+        vm.prank(proposer);
+        strategy.updateParams(abi.encode(uint8(1), uint64(3000e6), uint64(1e6), uint64(2800e6), uint64(1e6)));
+
+        vm.prank(proposer);
+        strategy.initiateReturn();
+        assertEq(strategy.returnsInitiatedBlock(), block.number, "init block recorded");
+
+        // Same block as initiateReturn → guard fires.
+        vm.prank(vault);
+        vm.expectRevert(HyperliquidPerpStrategy.SettleTooSoon.selector);
+        strategy.settle();
+
+        // One block later → settle proceeds (bridge had time to deliver).
+        vm.roll(block.number + 1);
+        vm.prank(vault);
+        strategy.settle();
+        assertEq(strategy.settled(), true, "settles a block after initiateReturn");
+    }
+
     function test_settle_withoutOpenPosition() public {
         _executeFirst();
         // Sherlock run #3 #3: settle requires initiateReturn() first.
         vm.prank(proposer);
         strategy.initiateReturn();
+        vm.roll(block.number + 1);
         vm.prank(vault);
         strategy.settle();
         assertEq(strategy.settled(), true);
@@ -348,6 +378,7 @@ contract HyperliquidPerpStrategyTest is Test {
         // Sherlock run #3 #3: settle requires initiateReturn() first.
         vm.prank(proposer);
         strategy.initiateReturn();
+        vm.roll(block.number + 1);
         vm.prank(vault);
         strategy.settle();
     }
@@ -488,6 +519,7 @@ contract HyperliquidPerpStrategyTest is Test {
         // 5. Initiate return (Sherlock run #3 #3 — required before settle).
         vm.prank(proposer);
         strategy.initiateReturn();
+        vm.roll(block.number + 1);
 
         // 6. Settle
         vm.prank(vault);
@@ -534,6 +566,7 @@ contract HyperliquidPerpStrategyTest is Test {
         // (which itself cancels the active stop-loss).
         vm.prank(proposer);
         strategy.initiateReturn();
+        vm.roll(block.number + 1);
         vm.prank(vault);
         strategy.settle();
         assertFalse(strategy.hasActiveStopLoss());
