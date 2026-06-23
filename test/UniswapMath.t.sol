@@ -40,6 +40,19 @@ contract UniswapMathTest is Test {
         assertTrue(neg < TickMath.getSqrtRatioAtTick(0), "tick-60 < tick0");
     }
 
+    // --- TickMath.getTickAtSqrtRatio -- round-trip (inverse) ---
+
+    /// getTickAtSqrtRatio(getSqrtRatioAtTick(t)) == t. Exercises the log2/log_sqrt10001 path
+    /// (the most constant-heavy function). Uses +/-887271, not MIN/MAX_TICK, because
+    /// getTickAtSqrtRatio requires sqrtP strictly inside [MIN_SQRT_RATIO, MAX_SQRT_RATIO).
+    function test_getTickAtSqrtRatio_roundTrip() public pure {
+        int24[5] memory ticks = [int24(0), int24(60), int24(-60), int24(887271), int24(-887271)];
+        for (uint256 i = 0; i < ticks.length; i++) {
+            uint160 sqrtP = TickMath.getSqrtRatioAtTick(ticks[i]);
+            assertEq(TickMath.getTickAtSqrtRatio(sqrtP), ticks[i]);
+        }
+    }
+
     // --- getAmountsForLiquidity -- ground-truth vectors ---
 
     /// Current price at mid-range (tick=0): both legs > 0 and roughly balanced.
@@ -51,8 +64,8 @@ contract UniswapMathTest is Test {
         (uint256 a0, uint256 a1) = LiquidityAmounts.getAmountsForLiquidity(sqrtP, lo, hi, 1e18);
         assertGt(a0, 0, "a0 > 0");
         assertGt(a1, 0, "a1 > 0");
-        // Symmetric range -> amounts should be within 5% of each other
-        assertApproxEqRel(a0, a1, 0.05e18, "a0 approx a1 within 5%");
+        // Symmetric range -> amounts should be within 1% of each other
+        assertApproxEqRel(a0, a1, 0.01e18, "a0 approx a1 within 1%");
     }
 
     /// Current price below range (sqrtP <= sqrtLower): all token0, no token1.

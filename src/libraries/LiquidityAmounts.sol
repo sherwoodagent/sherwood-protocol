@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 pragma solidity 0.8.28;
 
-// Vendored from Uniswap/v3-periphery@0.8 (math identical to velodrome-finance/slipstream), adapted to 0.8.28.
-// Source confirmed against moonwell-fi/mamo-contracts PR #55 (same logic, same 0.8 adaptations).
+// Vendored from Uniswap/v3-periphery (LiquidityAmounts; math bit-identical to velodrome-finance/slipstream),
+// adapted to 0.8.28. Behavior validated by the ground-truth vectors in test/UniswapMath.t.sol.
 //
 // Dependency substitutions (avoids vendoring extra files):
-//   FullMath.mulDiv(a,b,d)  →  Math.mulDiv(a,b,d)  (OpenZeppelin; semantically identical 512-bit mul-div)
-//   FixedPoint96.Q96        →  0x1000000000000000000000000  (2**96 inline constant)
-//   FixedPoint96.RESOLUTION →  96  (inline constant)
+//   FullMath.mulDiv(a,b,d)  ->  Math.mulDiv(a,b,d)  (OpenZeppelin; semantically identical 512-bit mul-div)
+//   FixedPoint96.Q96        ->  0x1000000000000000000000000  (2**96 inline constant)
+//   FixedPoint96.RESOLUTION ->  96  (inline constant)
 
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 

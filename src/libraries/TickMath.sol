@@ -2,8 +2,8 @@
 pragma solidity 0.8.28;
 
 // Vendored from Uniswap/v3-core@fc2107bd5709cdee6742d5164c1eb998566bcb75 (upstream of velodrome-finance/slipstream;
-// math identical), adapted to 0.8.28. Source confirmed against moonwell-fi/mamo-contracts PR #55
-// (same commit hash, same constants — fork-tested in that PR).
+// concentrated-liquidity math is bit-identical), adapted to 0.8.28. All magic constants validated byte-exact
+// against that commit; ground-truth vectors in test/UniswapMath.t.sol.
 
 /// @title Math library for computing sqrt prices from ticks and vice versa
 /// @notice Computes sqrt price for ticks of size 1.0001, i.e. sqrt(1.0001^tick) as fixed point Q64.96 numbers.
