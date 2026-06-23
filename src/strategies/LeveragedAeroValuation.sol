@@ -1,0 +1,240 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.28;
+
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+import {ChainlinkReader} from "../libraries/ChainlinkReader.sol";
+import {TickMath} from "../libraries/TickMath.sol";
+import {LiquidityAmounts} from "../libraries/LiquidityAmounts.sol";
+import {ICLPool} from "../interfaces/ISlipstream.sol";
+import {ICToken} from "../interfaces/ICToken.sol";
+import {IMoonwellMarket} from "../interfaces/IMoonwellMarket.sol";
+
+/// @title  LeveragedAeroValuation
+/// @notice Net-equity **oracle** NAV for the leveraged Aerodrome CL strategy. This is
+///         the single safety-critical computation — it prices DEPOSITS, so a wrong
+///         sign / decimal / overflow silently mis-mints shares. Everything here is
+///         fail-closed: any oracle staleness, sequencer outage, grace window, or a
+///         spot/TWAP deviation reverts, and a non-positive net equity reverts — a
+///         manipulated price can only *deny* a deposit, never mint cheap shares.
+///
+///         ```
+///         NAV = floatVault + idleStrategy + collateral + clLegs − debt   (all in USDC, 6dp)
+///         ```
+///
+///         - `floatVault`    = `USDC.balanceOf(vault)`        (face, 6dp)
+///         - `idleStrategy`  = `USDC.balanceOf(strategy)`     (face, 6dp)
+///         - `collateral`    = Moonwell USDC supply, `mUSDC.balanceOf(strategy) *
+///                             exchangeRateStored / 1e18`     (face, 6dp; scaling copied
+///                             verbatim from `MoonwellSupplyAdapter`)
+///         - `debt`          = `borrowBalanceStored(cbBTC) * P_cbBTC +
+///                             borrowBalanceStored(WETH) * P_WETH`, each priced via
+///                             Chainlink and converted USD→USDC.
+///         - `clLegs`        = the CL position's token0/token1 amounts at an
+///                             **oracle-implied `sqrtP`** (derived from the two Chainlink
+///                             prices, NOT the manipulable pool tick), each leg priced via
+///                             Chainlink.
+///
+///         The CL-leg split uses the oracle sqrtP (the Gamma/Arrakis technique) so the
+///         mint mark cannot be tick-shoved; the same two feeds price the debt, so the
+///         whole net-short book nets on a single Chainlink basis.
+library LeveragedAeroValuation {
+    /// @notice Spot tick deviated from the pool TWAP beyond `calmDeviationTicks`.
+    error CalmGateBreached();
+    /// @notice Net equity is ≤ 0 — minting is fail-closed (no shares at/under water).
+    error NonPositiveEquity();
+
+    /// @dev Chainlink USD feeds on Base are 8-decimal; assumed for the USD→USDC scaling.
+    uint256 private constant USD_FEED_DECIMALS = 8;
+
+    /// @notice Everything `netEquityUsdc` needs — no per-call magic numbers. The caller
+    ///         (`strategy.nav()`, a later task) reads `NPM.positions(tokenId)` and passes
+    ///         the ticks + liquidity; this library never touches the NPM.
+    /// @dev `cbBTCFeed`/`wethFeed` are mapped onto the pool's token0/token1 at call time by
+    ///      reading `pool.token0()`/`token1()`, so leg pricing is robust to pool ordering.
+    struct Config {
+        address usdc; // USDC (6dp) — the NAV unit of account
+        address vault; // SyndicateVault — holds float USDC
+        address mUsdc; // Moonwell USDC market (collateral)
+        address cbBTCMarket; // Moonwell cbBTC borrow market
+        address wethMarket; // Moonwell WETH borrow market
+        address cbBTC; // cbBTC underlying token
+        address weth; // WETH underlying token
+        uint8 cbBTCDecimals; // cbBTC decimals (8 on Base)
+        uint8 wethDecimals; // WETH decimals (18)
+        address pool; // Aerodrome Slipstream CL pool (cbBTC/WETH)
+        address cbBTCFeed; // Chainlink BTC/USD feed (8dp)
+        address wethFeed; // Chainlink ETH/USD feed (8dp)
+        address usdcFeed; // Chainlink USDC/USD feed (8dp)
+        address sequencerFeed; // Chainlink L2 sequencer-uptime feed
+        uint256 maxDelay; // per-feed max staleness (seconds)
+        uint256 gracePeriod; // sequencer grace period (seconds)
+        uint16 calmDeviationTicks; // max |spotTick − twapTick| before fail-closed
+        uint32 twapWindow; // calm-gate TWAP lookback (seconds)
+    }
+
+    /// @notice The net-equity oracle NAV of the whole levered book, in USDC (6dp).
+    /// @param c          Valuation config.
+    /// @param strategy   The strategy clone (holds collateral, debt, idle USDC).
+    /// @param tickLower  Lower tick of the CL position (from `NPM.positions`).
+    /// @param tickUpper  Upper tick of the CL position.
+    /// @param liquidity  CL liquidity (from `NPM.positions`); 0 ⇒ no CL legs.
+    /// @return navUsdc   USDC value of `float + idle + collateral + clLegs − debt`.
+    /// @dev Fail-closed: reverts on any oracle/calm failure (via `ChainlinkReader` and the
+    ///      calm-gate) and on non-positive equity. Used to price deposits only.
+    function netEquityUsdc(Config memory c, address strategy, int24 tickLower, int24 tickUpper, uint128 liquidity)
+        internal
+        view
+        returns (uint256 navUsdc)
+    {
+        // Calm-gate first: if the pool is being shoved, fail closed before pricing anything.
+        _calmGate(c);
+
+        // USDC peg price (8dp) — read once; reused to convert every USD term to USDC face.
+        (uint256 pUsdc,) = ChainlinkReader.readUsd(c.usdcFeed, c.sequencerFeed, c.maxDelay, c.gracePeriod);
+
+        // --- positive face terms ---
+        uint256 assets = IERC20(c.usdc).balanceOf(c.vault); // floatVault (6dp)
+        assets += IERC20(c.usdc).balanceOf(strategy); // idleStrategy (6dp)
+        assets += _collateralUsdc(c, strategy); // Moonwell USDC collateral (6dp)
+
+        // --- CL legs (oracle-implied sqrtP) ---
+        (uint256 pCbBTC, uint256 pWeth) = _legPrices(c);
+        assets += _clLegsUsdc(c, tickLower, tickUpper, liquidity, pCbBTC, pWeth, pUsdc);
+
+        // --- debt (same Chainlink basis) ---
+        uint256 debt = _debtUsdc(c, strategy, pCbBTC, pWeth, pUsdc);
+
+        if (assets <= debt) revert NonPositiveEquity();
+        navUsdc = assets - debt;
+    }
+
+    /// @notice Oracle-implied `sqrtPriceX96` from two USD prices + token decimals — the
+    ///         absolute mark used to split the CL position (NOT the manipulable pool tick).
+    /// @param p0 USD price of token0 (feed answer, any decimals — they cancel against p1).
+    /// @param d0 token0 decimals.
+    /// @param p1 USD price of token1.
+    /// @param d1 token1 decimals.
+    /// @return sqrtPriceX96 `sqrt(rawPrice1per0) * 2^96`, where the raw (smallest-unit) price
+    ///         `token1/token0 = p0 * 10^d1 / (p1 * 10^d0)`.
+    /// @dev Overflow: `Math.mulDiv` carries the 512-bit `p0*10^d1 * 2^192` intermediate, so
+    ///      the only constraints are that `p0*10^d1` and `p1*10^d0` fit uint256 (true for any
+    ///      realistic 8dp USD price and ≤18-decimal token) and that the sqrt fits uint160
+    ///      (true for all real cbBTC/WETH prices — checked by the cast).
+    function oracleSqrtPriceX96(uint256 p0, uint8 d0, uint256 p1, uint8 d1)
+        internal
+        pure
+        returns (uint160 sqrtPriceX96)
+    {
+        uint256 num = p0 * (10 ** uint256(d1));
+        uint256 den = p1 * (10 ** uint256(d0));
+        uint256 ratioX192 = Math.mulDiv(num, 1 << 192, den);
+        sqrtPriceX96 = uint160(Math.sqrt(ratioX192));
+    }
+
+    // ---------------------------------------------------------------------------
+    // Internal terms
+    // ---------------------------------------------------------------------------
+
+    /// @dev Moonwell USDC collateral in USDC face (6dp). Scaling copied verbatim from
+    ///      `MoonwellSupplyAdapter.value`: `underlying = cBal * exchangeRateStored / 1e18`.
+    ///      `exchangeRateStored` (last-accrued, view) is used — never the mutating
+    ///      `balanceOfUnderlying`. USDC is the unit, so the result is already face-valued.
+    function _collateralUsdc(Config memory c, address strategy) private view returns (uint256) {
+        uint256 cBal = ICToken(c.mUsdc).balanceOf(strategy);
+        if (cBal == 0) return 0;
+        uint256 rate = ICToken(c.mUsdc).exchangeRateStored();
+        return (cBal * rate) / 1e18;
+    }
+
+    /// @dev cbBTC + WETH debt valued at the same Chainlink basis, converted to USDC face.
+    function _debtUsdc(Config memory c, address strategy, uint256 pCbBTC, uint256 pWeth, uint256 pUsdc)
+        private
+        view
+        returns (uint256 debt)
+    {
+        uint256 cbDebt = IMoonwellMarket(c.cbBTCMarket).borrowBalanceStored(strategy);
+        uint256 wethDebt = IMoonwellMarket(c.wethMarket).borrowBalanceStored(strategy);
+        debt = _usdcValue(cbDebt, c.cbBTCDecimals, pCbBTC, pUsdc);
+        debt += _usdcValue(wethDebt, c.wethDecimals, pWeth, pUsdc);
+    }
+
+    /// @dev Prices the CL position's two legs at the oracle-implied `sqrtP` and converts to
+    ///      USDC face. token0/token1 are mapped to (cbBTC, WETH) prices by reading the pool
+    ///      ordering, so this is robust regardless of which token sorts lower.
+    function _clLegsUsdc(
+        Config memory c,
+        int24 tickLower,
+        int24 tickUpper,
+        uint128 liquidity,
+        uint256 pCbBTC,
+        uint256 pWeth,
+        uint256 pUsdc
+    ) private view returns (uint256 legsUsdc) {
+        if (liquidity == 0) return 0;
+
+        address t0 = ICLPool(c.pool).token0();
+        // Map (price, decimals) to the pool's token0/token1 ordering.
+        (uint256 p0, uint8 d0, uint256 p1, uint8 d1) = (t0 == c.cbBTC)
+            ? (pCbBTC, c.cbBTCDecimals, pWeth, c.wethDecimals)
+            : (pWeth, c.wethDecimals, pCbBTC, c.cbBTCDecimals);
+
+        uint160 sqrtP = oracleSqrtPriceX96(p0, d0, p1, d1);
+        (uint256 amt0, uint256 amt1) = LiquidityAmounts.getAmountsForLiquidity(
+            sqrtP, TickMath.getSqrtRatioAtTick(tickLower), TickMath.getSqrtRatioAtTick(tickUpper), liquidity
+        );
+
+        legsUsdc = _usdcValue(amt0, d0, p0, pUsdc);
+        legsUsdc += _usdcValue(amt1, d1, p1, pUsdc);
+    }
+
+    /// @dev Reads cbBTC + WETH USD prices through the hardened reader (fail-closed).
+    function _legPrices(Config memory c) private view returns (uint256 pCbBTC, uint256 pWeth) {
+        (pCbBTC,) = ChainlinkReader.readUsd(c.cbBTCFeed, c.sequencerFeed, c.maxDelay, c.gracePeriod);
+        (pWeth,) = ChainlinkReader.readUsd(c.wethFeed, c.sequencerFeed, c.maxDelay, c.gracePeriod);
+    }
+
+    /// @dev Converts a token `amount` (in `tokenDecimals`) at USD price `pToken` (8dp feed)
+    ///      to USDC face (6dp), honoring the USDC peg via the USDC/USD feed `pUsdc` (8dp).
+    ///
+    ///        usdValue (8dp) = amount * pToken / 10^tokenDecimals
+    ///        usdcFace (6dp) = usdValue * 10^6 / pUsdc          (USD-1e8 / USDC-price-1e8)
+    ///
+    ///      Both feeds are 8-decimal, so the 1e8 scales cancel; `pUsdc ≈ 1e8` for a healthy
+    ///      peg. `Math.mulDiv` carries the intermediate so there is no precision loss / overflow
+    ///      for realistic amounts.
+    function _usdcValue(uint256 amount, uint8 tokenDecimals, uint256 pToken, uint256 pUsdc)
+        private
+        pure
+        returns (uint256)
+    {
+        if (amount == 0) return 0;
+        // usdValue at the feed's 8dp: amount * pToken / 10^tokenDecimals
+        uint256 usdValue = Math.mulDiv(amount, pToken, 10 ** uint256(tokenDecimals));
+        // → USDC face (6dp): divide by the USDC price (8dp) and rescale 1e8 → 1e6.
+        return Math.mulDiv(usdValue, 1e6, pUsdc);
+    }
+
+    /// @dev Spot-vs-TWAP calm-gate (fail-closed). Reverts `CalmGateBreached` when the pool
+    ///      spot tick deviates from the `twapWindow` arithmetic-mean tick beyond
+    ///      `calmDeviationTicks`. Pattern: `AerodromeLPAdapter` deviation gate; mechanism:
+    ///      Mamo `LPAutoBalancerV2.reset()` calm-gate.
+    function _calmGate(Config memory c) private view {
+        (, int24 spotTick,,,,) = ICLPool(c.pool).slot0();
+
+        uint32[] memory secondsAgos = new uint32[](2);
+        secondsAgos[0] = c.twapWindow;
+        secondsAgos[1] = 0;
+        (int56[] memory cum,) = ICLPool(c.pool).observe(secondsAgos);
+
+        int56 delta = cum[1] - cum[0];
+        int24 twapTick = int24(delta / int56(uint56(c.twapWindow)));
+        // Round toward negative infinity (Uniswap convention) when the cumulative delta is
+        // negative and does not divide evenly, so the mean matches the TWAP oracle.
+        if (delta < 0 && (delta % int56(uint56(c.twapWindow)) != 0)) twapTick--;
+
+        int24 diff = spotTick > twapTick ? spotTick - twapTick : twapTick - spotTick;
+        if (uint24(diff) > c.calmDeviationTicks) revert CalmGateBreached();
+    }
+}
