@@ -12,7 +12,6 @@ import {GuardianRegistry} from "../../src/GuardianRegistry.sol";
 import {StakedWood} from "../../src/StakedWood.sol";
 import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 import {ISyndicateFactory} from "../../src/interfaces/ISyndicateFactory.sol";
-import {ISyndicateVault} from "../../src/interfaces/ISyndicateVault.sol";
 
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
@@ -274,13 +273,13 @@ contract ProtocolInvariantsTest is StdInvariant, Test {
             if (governor.getProposalState(pid) != ISyndicateGovernor.ProposalState.Settled) continue;
             ISyndicateGovernor.StrategyProposal memory p = governor.getProposal(pid);
 
-            // Structural bound: the agent fee is now a vault-owner property
-            // read live at settlement and clamped to `maxPerformanceFeeBps`
+            // Structural bound: the agent fee is snapshotted on the proposal at
+            // propose time and clamped to `maxPerformanceFeeBps` at settlement
             // (see SyndicateGovernor._distributeFees). Re-derive the realized
             // rate the same way and assert the fee-sum bound. A realized rate
             // above the caps would indicate a rounding / accounting break in
             // `_distributeFees` — exactly the G-C7 vector INV-2 catches.
-            uint256 perfFeeBps = ISyndicateVault(p.vault).agentFeeBps();
+            uint256 perfFeeBps = p.performanceFeeBps;
             uint256 maxPerf = governor.getGovernorParams().maxPerformanceFeeBps;
             if (perfFeeBps > maxPerf) perfFeeBps = maxPerf;
             assertLe(perfFeeBps, MAX_PERF_FEE_BPS, "INV-2: perf fee bps exceeds cap");

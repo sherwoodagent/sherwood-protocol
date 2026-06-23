@@ -69,11 +69,15 @@ contract SyndicateVault is
     ///         fits comfortably in any block. `removeAgent` frees a slot.
     uint256 public constant MAX_AGENTS_PER_VAULT = 32;
 
-    /// @notice Hard cap on the vault-owner-set agent performance fee (50%).
-    ///         Mirrors the governor's MAX_PERFORMANCE_FEE_CAP. The governor
-    ///         additionally clamps the realized fee to its tunable
-    ///         `maxPerformanceFeeBps` at settlement, so this is a backstop.
-    uint256 public constant MAX_AGENT_FEE_BPS = 5000;
+    /// @notice Hard cap on the vault-owner-set agent performance fee (15%),
+    ///         equal to the governor's `MAX_PERFORMANCE_FEE_CAP` — the protocol
+    ///         ceiling on `maxPerformanceFeeBps`. The governor additionally
+    ///         clamps the realized fee to its (lower, tunable) configured
+    ///         `maxPerformanceFeeBps` at settlement, so a stored value above the
+    ///         live param is never charged. Capping here at the same ceiling
+    ///         keeps `agentFeeBps()` from advertising a rate that can never be
+    ///         realized (PR #384 review C4).
+    uint256 public constant MAX_AGENT_FEE_BPS = 1500;
 
     // ==================== STORAGE ====================
 

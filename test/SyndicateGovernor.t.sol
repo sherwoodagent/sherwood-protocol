@@ -196,7 +196,7 @@ contract SyndicateGovernorTest is Test {
         ISyndicateGovernor.StrategyProposal memory p = governor.getProposal(proposalId);
         assertEq(p.proposer, agent);
         assertEq(p.vault, address(vault));
-        assertEq(vault.agentFeeBps(), 1500);
+        assertEq(p.performanceFeeBps, 1500, "snapshotted from vault at propose");
         assertEq(p.strategyDuration, 7 days);
         assertEq(uint256(p.state), uint256(ISyndicateGovernor.ProposalState.Pending));
 
@@ -520,19 +520,41 @@ contract SyndicateGovernorTest is Test {
     }
 
     /// @notice The agent fee is read live from the vault at settlement and
-    ///         clamped to the governor's `maxPerformanceFeeBps`. A vault owner
-    ///         who sets a fee above the protocol cap still only realizes the cap.
+    ///         clamped to the governor's configured `maxPerformanceFeeBps`. A
+    ///         vault fee above the live param still only realizes the param.
     function test_settlement_agentFeeClampedToMax() public {
-        // Vault owner set 30% via the helper — above the 15% cap (MAX_PERF_FEE_BPS).
-        uint256 proposalId = _createAndExecuteProposal(3000, 7 days);
-        assertEq(vault.agentFeeBps(), 3000, "vault stores the owner's 30%");
+        // Protocol owner lowers the configured cap below the vault's fee.
+        vm.prank(owner);
+        governor.setMaxPerformanceFeeBps(1000); // 10%, under the vault's 15%
+        // Vault owner sets the vault hard cap (15%) — above the 10% param.
+        uint256 proposalId = _createAndExecuteProposal(MAX_PERF_FEE_BPS, 7 days);
+        assertEq(vault.agentFeeBps(), MAX_PERF_FEE_BPS, "vault stores the owner's 15%");
         usdc.mint(address(vault), 10_000e6);
         uint256 agentBalBefore = usdc.balanceOf(agent);
         vm.prank(agent);
         governor.settleProposal(proposalId);
-        // Clamped to 15% of net (identical to the 1500 case), not 30%:
-        // protocol 1% of 10k = 100; agent 15% of 9900 = 1485.
-        assertEq(usdc.balanceOf(agent), agentBalBefore + 1_485e6, "agent fee clamped to 15%");
+        // Clamped to 10% of net, not 15%:
+        // protocol 1% of 10k = 100; agent 10% of 9900 = 990.
+        assertEq(usdc.balanceOf(agent), agentBalBefore + 990e6, "agent fee clamped to 10%");
+    }
+
+    /// @notice C1: the fee is snapshotted at propose, so an owner who changes
+    ///         the vault's agentFeeBps after the vote cannot alter what this
+    ///         proposal charges. Settlement uses the snapshot, not the live fee.
+    function test_settlement_usesProposeTimeSnapshot() public {
+        // Snapshot 15% at propose (helper sets the vault fee, then proposes).
+        uint256 proposalId = _createAndExecuteProposal(MAX_PERF_FEE_BPS, 7 days);
+        // Owner drops the live vault fee to 5% AFTER the proposal is created.
+        vm.prank(owner);
+        vault.setAgentFeeBps(500);
+        assertEq(vault.agentFeeBps(), 500, "live vault fee changed post-propose");
+        usdc.mint(address(vault), 10_000e6);
+        uint256 agentBalBefore = usdc.balanceOf(agent);
+        vm.prank(agent);
+        governor.settleProposal(proposalId);
+        // Uses the 15% snapshot, not the live 5%: protocol 1% of 10k = 100;
+        // agent 15% of 9900 = 1485 (a live read would have charged 5% = 495).
+        assertEq(usdc.balanceOf(agent), agentBalBefore + 1_485e6, "uses propose-time snapshot");
     }
 
     function test_settlement_withLoss_noFees() public {

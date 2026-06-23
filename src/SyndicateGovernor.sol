@@ -294,6 +294,9 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
         p.vault = vault;
         p.strategy = strategy;
         p.metadataURI = metadataURI;
+        // Snapshot the vault's agent fee so voters approve a fixed, recorded
+        // rate; an owner change after propose cannot alter this proposal (C1).
+        p.performanceFeeBps = ISyndicateVault(vault).agentFeeBps();
         p.strategyDuration = strategyDuration;
         if (isCollaborative) {
             p.state = ProposalState.Draft;
@@ -862,7 +865,14 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
     function _emitProposalCreated(uint256 proposalId, uint256 executeCallCount, uint256 settlementCallCount) internal {
         StrategyProposal storage p = _proposals[proposalId];
         emit ProposalCreated(
-            proposalId, p.proposer, p.vault, p.strategyDuration, executeCallCount, settlementCallCount, p.metadataURI
+            proposalId,
+            p.proposer,
+            p.vault,
+            p.performanceFeeBps,
+            p.strategyDuration,
+            executeCallCount,
+            settlementCallCount,
+            p.metadataURI
         );
     }
 
@@ -1057,7 +1067,8 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
 
         uint256 totalFee = 0;
         if (pnl > 0) {
-            (agentFee, totalFee) = _distributeFees(proposalId, vault, asset, proposal.proposer, uint256(pnl));
+            (agentFee, totalFee) =
+                _distributeFees(proposalId, vault, asset, proposal.proposer, proposal.performanceFeeBps, uint256(pnl));
         }
 
         // V2 live-NAV: stamp the realized settle price into the request queue so
@@ -1069,10 +1080,14 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
     }
 
     /// @dev Distribute protocol, agent, and management fees. Extracted to avoid stack-too-deep.
-    function _distributeFees(uint256 proposalId, address vault, address asset, address proposer, uint256 profit)
-        internal
-        returns (uint256 agentFee, uint256 totalFee)
-    {
+    function _distributeFees(
+        uint256 proposalId,
+        address vault,
+        address asset,
+        address proposer,
+        uint256 perfFeeBps,
+        uint256 profit
+    ) internal returns (uint256 agentFee, uint256 totalFee) {
         uint256 protocolFee = 0;
         uint256 guardianFee = 0;
 
@@ -1116,11 +1131,10 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
 
         uint256 netProfit = profit - protocolFee - guardianFee;
 
-        // Agent performance fee from net profit. The rate is a vault-owner
-        // property read live at settlement (symmetric with managementFeeBps
-        // below), clamped to the governor's tunable maxPerformanceFeeBps so the
-        // protocol keeps a global ceiling on agent fees.
-        uint256 perfFeeBps = ISyndicateVault(vault).agentFeeBps();
+        // Agent performance fee from net profit. `perfFeeBps` was snapshotted
+        // from the vault at propose time (so it matches what voters approved);
+        // clamp it to the governor's tunable maxPerformanceFeeBps so a later
+        // cap reduction still applies.
         uint256 maxPerfBps = _params.maxPerformanceFeeBps;
         if (perfFeeBps > maxPerfBps) perfFeeBps = maxPerfBps;
         agentFee = (netProfit * perfFeeBps) / BPS_DENOMINATOR;

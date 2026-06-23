@@ -71,6 +71,11 @@ interface ISyndicateGovernor {
         ///         proposal (no instant live-NAV lane).
         address strategy;
         string metadataURI;
+        /// @notice Agent performance fee (bps), snapshotted from the vault's
+        ///         `agentFeeBps()` at propose time so it is immutable for this
+        ///         proposal — an owner change after propose cannot alter what
+        ///         voters approved. Clamped to `maxPerformanceFeeBps` at settle.
+        uint256 performanceFeeBps;
         uint256 strategyDuration;
         uint256 votesFor;
         uint256 votesAgainst;
@@ -200,6 +205,7 @@ interface ISyndicateGovernor {
         uint256 indexed proposalId,
         address indexed proposer,
         address indexed vault,
+        uint256 performanceFeeBps,
         uint256 strategyDuration,
         uint256 executeCallCount,
         uint256 settlementCallCount,
