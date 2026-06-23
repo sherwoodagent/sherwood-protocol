@@ -68,9 +68,25 @@ contract LeveragedAeroValuationTest is Test {
         harness.readUsd(address(feed), address(seq), 26 hours, 3600);
     }
 
+    function test_readUsd_revertsOnNonPositiveAnswer() public {
+        MockAggregatorV3 feed = new MockAggregatorV3(8, 65_000e8);
+        feed.setAnswer(0);
+        MockAggregatorV3 seq = _upSequencer();
+        vm.expectRevert(ChainlinkReader.StaleOracle.selector);
+        harness.readUsd(address(feed), address(seq), 26 hours, 3600);
+    }
+
+    function test_readUsd_revertsOnZeroStartedAt() public {
+        MockAggregatorV3 feed = new MockAggregatorV3(8, 65_000e8);
+        feed.setStartedAt(0);
+        MockAggregatorV3 seq = _upSequencer();
+        vm.expectRevert(ChainlinkReader.StaleOracle.selector);
+        harness.readUsd(address(feed), address(seq), 26 hours, 3600);
+    }
+
     // --- helpers ---
 
-    function _upSequencer() private returns (MockAggregatorV3) {
+    function _upSequencer() internal returns (MockAggregatorV3) {
         MockAggregatorV3 seq = new MockAggregatorV3(0, 0);
         seq.setStartedAt(block.timestamp - 7200); // well past any grace period
         return seq;
