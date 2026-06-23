@@ -91,11 +91,11 @@ interface ISyndicateVault {
     function redemptionsLocked() external view returns (bool);
     function managementFeeBps() external view returns (uint256);
     /// @notice Vault-owner-set agent performance fee (basis points). Defaults
-    ///         to 5% (500) at vault creation. Read live by the governor at
-    ///         settlement and clamped to the governor's `maxPerformanceFeeBps`.
+    ///         to 5% (500) at vault creation. Snapshotted onto a proposal at
+    ///         propose time and clamped to `maxPerformanceFeeBps` at settlement.
     function agentFeeBps() external view returns (uint256);
     /// @notice Set the agent performance fee (owner only). Capped at
-    ///         `MAX_AGENT_FEE_BPS` (50%). Reverts with `AgentFeeTooHigh` above.
+    ///         `MAX_AGENT_FEE_BPS` (15%). Reverts with `AgentFeeTooHigh` above.
     function setAgentFeeBps(uint256 bps) external;
     /// @notice Convenience view that resolves the active strategy through the
     ///         governor (`getProposal(activePid).strategy`). Returns

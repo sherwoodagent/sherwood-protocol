@@ -654,4 +654,18 @@ contract CollaborativeProposalsTest is Test {
             address(vault), address(0), "ipfs://test", 7 days, _simpleExecuteCalls(), _simpleSettlementCalls(), coProps
         );
     }
+
+    /// @notice P1: a collaborative proposal snapshots the fee at Draft creation
+    ///         (propose), so an owner change during the collaboration window
+    ///         cannot alter what the proposal will charge.
+    function test_collaborative_feeSnapshottedAtDraftCreation() public {
+        uint256 proposalId = _createCollabProposal(); // sets vault fee 1500, proposes
+        assertEq(governor.getProposal(proposalId).performanceFeeBps, 1500, "snapshot at Draft creation");
+        // Owner changes the live vault fee during the collaboration window.
+        vm.prank(owner);
+        vault.setAgentFeeBps(500);
+        assertEq(vault.agentFeeBps(), 500, "live vault fee changed mid-window");
+        // The proposal's snapshot is unaffected.
+        assertEq(governor.getProposal(proposalId).performanceFeeBps, 1500, "snapshot immutable through window");
+    }
 }

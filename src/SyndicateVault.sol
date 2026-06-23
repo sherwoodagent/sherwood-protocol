@@ -132,15 +132,17 @@ contract SyndicateVault is
     mapping(address holder => uint256 pid) private _laneALockPid;
 
     /// @notice Vault-owner-set agent performance fee (basis points), charged on
-    ///         strategy profit at settlement. Defaults to 5% at init; the owner
-    ///         adjusts it via `setAgentFeeBps`. Read live by the governor when a
-    ///         proposal settles (clamped there to the governor's tunable
-    ///         `maxPerformanceFeeBps`). Mirrors `_managementFeeBps`, except it
-    ///         is owner-mutable rather than fixed at init.
+    ///         strategy profit. Snapshotted onto a proposal at propose time
+    ///         (clamped to the governor's `maxPerformanceFeeBps`). The owner
+    ///         sets it via `setAgentFeeBps`; `agentFeeBps()` returns the 5%
+    ///         default until then. `_agentFeeSet` distinguishes "never set"
+    ///         (incl. a vault upgraded from a pre-fee impl, where this slot was
+    ///         reserved gap = 0) from an explicit 0% (H1).
     uint256 private _agentFeeBps;
+    bool private _agentFeeSet;
 
     /// @dev Reserved storage for future upgrades.
-    uint256[35] private __gap;
+    uint256[34] private __gap;
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -163,7 +165,8 @@ contract SyndicateVault is
         _openDeposits = p.openDeposits;
         _agentRegistry = IERC721(p.agentRegistry);
         _managementFeeBps = p.managementFeeBps;
-        _agentFeeBps = 500; // 5% default; vault owner adjusts via setAgentFeeBps
+        // _agentFeeBps left unset → agentFeeBps() returns the 5% default until
+        // the owner calls setAgentFeeBps (also covers upgraded vaults, H1).
         _factory = msg.sender;
         _cachedDecimalsOffset = IERC20Metadata(p.asset).decimals();
     }
@@ -482,13 +485,17 @@ contract SyndicateVault is
 
     /// @inheritdoc ISyndicateVault
     function agentFeeBps() external view returns (uint256) {
-        return _agentFeeBps;
+        // Unset (incl. a vault upgraded from a pre-fee impl) falls back to the
+        // 5% default so the agent is never silently unpaid (H1). `_agentFeeSet`
+        // lets an owner still configure an explicit 0%.
+        return _agentFeeSet ? _agentFeeBps : 500;
     }
 
     /// @inheritdoc ISyndicateVault
     function setAgentFeeBps(uint256 bps) external onlyOwner {
         if (bps > MAX_AGENT_FEE_BPS) revert AgentFeeTooHigh();
         _agentFeeBps = bps;
+        _agentFeeSet = true;
         emit AgentFeeUpdated(bps);
     }
 

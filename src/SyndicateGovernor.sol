@@ -294,9 +294,13 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
         p.vault = vault;
         p.strategy = strategy;
         p.metadataURI = metadataURI;
-        // Snapshot the vault's agent fee so voters approve a fixed, recorded
-        // rate; an owner change after propose cannot alter this proposal (C1).
-        p.performanceFeeBps = ISyndicateVault(vault).agentFeeBps();
+        // Snapshot the vault's agent fee, clamped to the protocol cap, so the
+        // recorded + emitted rate is exactly what settlement charges (H2: no
+        // voter-misleading divergence). An owner change after propose cannot
+        // alter this proposal (C1); a later cap reduction re-applies at settle.
+        uint256 snapFee = ISyndicateVault(vault).agentFeeBps();
+        uint256 capFee = _params.maxPerformanceFeeBps;
+        p.performanceFeeBps = snapFee > capFee ? capFee : snapFee;
         p.strategyDuration = strategyDuration;
         if (isCollaborative) {
             p.state = ProposalState.Draft;
