@@ -44,6 +44,10 @@ library LeveragedAeroValuation {
     error CalmGateBreached();
     /// @notice Net equity is ≤ 0 — minting is fail-closed (no shares at/under water).
     error NonPositiveEquity();
+    /// @notice The oracle-implied sqrtP fell outside the valid pool sqrtP range
+    ///         `[MIN_SQRT_RATIO, MAX_SQRT_RATIO)` — fail-closed rather than feed a
+    ///         garbage/out-of-range price into the leg split.
+    error OracleSqrtPriceOutOfRange();
 
     /// @dev Chainlink USD feeds on Base are 8-decimal; assumed for the USD→USDC scaling.
     uint256 private constant USD_FEED_DECIMALS = 8;
@@ -118,10 +122,20 @@ library LeveragedAeroValuation {
     /// @param d1 token1 decimals.
     /// @return sqrtPriceX96 `sqrt(rawPrice1per0) * 2^96`, where the raw (smallest-unit) price
     ///         `token1/token0 = p0 * 10^d1 / (p1 * 10^d0)`.
-    /// @dev Overflow: `Math.mulDiv` carries the 512-bit `p0*10^d1 * 2^192` intermediate, so
-    ///      the only constraints are that `p0*10^d1` and `p1*10^d0` fit uint256 (true for any
-    ///      realistic 8dp USD price and ≤18-decimal token) and that the sqrt fits uint160
-    ///      (true for all real cbBTC/WETH prices — checked by the cast).
+    /// @dev Overflow / range (fail-closed): `Math.mulDiv` carries the 512-bit
+    ///      `p0*10^d1 * 2^192` intermediate. Two range guards make this fail-closed for the
+    ///      generic/reusable case (a wrong sqrtP would let `getAmountsForLiquidity`, which is
+    ///      itself unbounded, mis-split the legs — a fail-OPEN mis-mint):
+    ///        - HIGH out-of-range: for any `raw ≳ 2^128` the `mulDiv` result exceeds
+    ///          `type(uint256).max` and `mulDiv` itself reverts (panic 0x11) — so an absurdly
+    ///          large implied price can never reach the cast.
+    ///        - LOW out-of-range: a tiny-but-nonzero `raw` yields a small `sqrt(ratioX192)`
+    ///          that is `< MIN_SQRT_RATIO` yet nonzero — `uint160(...)` does NOT truncate it,
+    ///          so without the explicit check below it would slip through as a valid-looking
+    ///          out-of-range price. The bound catches it.
+    ///      For all real cbBTC/WETH 8dp prices the result lands well inside the range; this
+    ///      guard only fires for the degenerate/hostile decimal+price combinations a generic
+    ///      caller could pass.
     function oracleSqrtPriceX96(uint256 p0, uint8 d0, uint256 p1, uint8 d1)
         internal
         pure
@@ -130,7 +144,10 @@ library LeveragedAeroValuation {
         uint256 num = p0 * (10 ** uint256(d1));
         uint256 den = p1 * (10 ** uint256(d0));
         uint256 ratioX192 = Math.mulDiv(num, 1 << 192, den);
-        sqrtPriceX96 = uint160(Math.sqrt(ratioX192));
+        uint256 s = Math.sqrt(ratioX192);
+        // Bound to a valid pool sqrtP and revert rather than truncate / pass a garbage price.
+        if (s < TickMath.MIN_SQRT_RATIO || s >= TickMath.MAX_SQRT_RATIO) revert OracleSqrtPriceOutOfRange();
+        sqrtPriceX96 = uint160(s);
     }
 
     // ---------------------------------------------------------------------------

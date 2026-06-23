@@ -34,6 +34,10 @@ contract ValuationHarness {
     ) external view returns (uint256) {
         return LeveragedAeroValuation.netEquityUsdc(c, strategy, tickLower, tickUpper, liquidity);
     }
+
+    function oracleSqrtPriceX96(uint256 p0, uint8 d0, uint256 p1, uint8 d1) external pure returns (uint160) {
+        return LeveragedAeroValuation.oracleSqrtPriceX96(p0, d0, p1, d1);
+    }
 }
 
 /// @notice Settable Moonwell mToken: collateral via `balanceOf`+`exchangeRateStored`,
@@ -363,11 +367,36 @@ contract LeveragedAeroValuationTest is Test {
         assertApproxEqRel(rawScaled, 4_615_384_615_384_615_384, 1e16); // 1% tolerance
     }
 
+    /// @dev Fail-closed on an out-of-range implied sqrtP. The cast `uint160(s)` does NOT revert
+    ///      on truncation (verified: uint160(2**160) == 0), so a bound check is required or an
+    ///      out-of-range price would mis-split the legs (fail-OPEN). LOW side is reachable: a
+    ///      tiny raw price (d0 ≫ d1) yields a nonzero sqrtP `< MIN_SQRT_RATIO`. (HIGH side is
+    ///      already guarded — `Math.mulDiv` overflow-reverts before the cast for raw ≳ 2^128.)
+    ///      Driven through the harness so vm.expectRevert catches the internal-lib revert.
+    function test_oracleSqrtP_revertsOnOutOfRangeLow() public {
+        // raw = 10^-40 → sqrt(ratioX192) = 792281625 (nonzero) < MIN_SQRT_RATIO (4295128739).
+        vm.expectRevert(LeveragedAeroValuation.OracleSqrtPriceOutOfRange.selector);
+        valHarness.oracleSqrtPriceX96(1e8, 40, 1e8, 0);
+    }
+
+    /// @dev HIGH side: an absurdly large implied price overflows the `mulDiv` 512-bit result
+    ///      and reverts (panic) before the cast — documents that the high-range fail-open the
+    ///      review flagged is already unreachable, complementing the explicit LOW-side bound.
+    function test_oracleSqrtP_revertsOnOutOfRangeHigh() public {
+        vm.expectRevert(); // arithmetic overflow inside Math.mulDiv (panic 0x11)
+        valHarness.oracleSqrtPriceX96(1e8, 0, 1e8, 40);
+    }
+
     // --- CL legs ---
 
-    /// @dev With calm pool + nonzero liquidity, both legs contribute and nav rises by ~their
-    ///      oracle value vs the liquidity-0 baseline. Position straddles spot (in-range) so
-    ///      both token0 and token1 are present.
+    /// @dev The live pair (token0=WETH@3000 / token1=cbBTC@65000) has implied tick ≈ −261030,
+    ///      so the position band MUST straddle it for BOTH legs to be nonzero. A band entirely
+    ///      above spot (e.g. [-1000, 1000]) zeroes the cbBTC (token1, 8dp) leg and leaves the
+    ///      8-decimal `_usdcValue` path uncovered. We use [-262000, -260000] (straddles −261030)
+    ///      and assert each leg's amount is nonzero so both the 18dp and 8dp valuation paths run.
+    int24 internal constant LEG_LOWER = -262000;
+    int24 internal constant LEG_UPPER = -260000;
+
     function test_clLegs_bothLegsContribute() public {
         _setCollateralUsdc(100_000e6);
         _setDebt(0, 0);
@@ -375,24 +404,32 @@ contract LeveragedAeroValuationTest is Test {
         _setFloat(0);
         _setCalm();
 
-        uint256 navNoLegs = LeveragedAeroValuation.netEquityUsdc(_cfg(), strat, -1000, 1000, 0);
+        uint256 navNoLegs = LeveragedAeroValuation.netEquityUsdc(_cfg(), strat, LEG_LOWER, LEG_UPPER, 0);
         assertEq(navNoLegs, 100_000e6);
 
-        // In-range position with real liquidity ⇒ both legs valued, nav strictly higher.
+        // In-range position straddling the implied tick ⇒ both legs valued, nav strictly higher.
         uint128 liq = 1e15;
-        uint256 navWithLegs = LeveragedAeroValuation.netEquityUsdc(_cfg(), strat, -1000, 1000, liq);
+        uint256 navWithLegs = LeveragedAeroValuation.netEquityUsdc(_cfg(), strat, LEG_LOWER, LEG_UPPER, liq);
         assertGt(navWithLegs, navNoLegs);
 
-        // The leg value should equal the oracle valuation of (amt0, amt1) at the oracle sqrtP.
+        // Prove BOTH legs are nonzero so the token0/18dp AND token1/8dp valuation paths run.
+        (uint256 amt0, uint256 amt1) = _legAmounts(LEG_LOWER, LEG_UPPER, liq);
+        assertGt(amt0, 0); // WETH (token0, 18dp)
+        assertGt(amt1, 0); // cbBTC (token1, 8dp) — was 0 under the old single-sided band
+
+        // The leg value should equal the oracle valuation of (amt0, amt1) at the oracle sqrtP,
+        // and BOTH per-leg USDC contributions must be nonzero.
         uint256 legValue = navWithLegs - navNoLegs;
-        uint256 expected = _expectedLegValueUsdc(-1000, 1000, liq);
-        assertApproxEqRel(legValue, expected, 1e14); // 0.01%
+        (uint256 v0, uint256 v1) = _expectedLegValuesUsdc(LEG_LOWER, LEG_UPPER, liq);
+        assertGt(v0, 0);
+        assertGt(v1, 0);
+        assertApproxEqRel(legValue, v0 + v1, 1e14); // 0.01%
     }
 
-    /// @dev CL-leg valuation uses the ORACLE sqrtP, not the pool spot. Moving the pool's
-    ///      spot sqrtPriceX96 (without breaching the calm tick gate) must NOT change nav —
-    ///      the split is pinned to the oracle. (slot0.sqrtPriceX96 is read only for display;
-    ///      the library never feeds it to getAmountsForLiquidity.)
+    /// @dev CL-leg valuation uses the ORACLE sqrtP, not the pool spot — proven with a BOTH-legs
+    ///      band. Moving the pool's reported sqrtPriceX96 (without breaching the calm tick gate)
+    ///      must NOT change nav: the split is pinned to the oracle. (slot0.sqrtPriceX96 is read
+    ///      only for the calm-gate tick; the library never feeds it to getAmountsForLiquidity.)
     function test_clLegs_invariantToPoolSqrtPrice() public {
         _setCollateralUsdc(100_000e6);
         _setDebt(0, 0);
@@ -401,11 +438,16 @@ contract LeveragedAeroValuationTest is Test {
         _setCalm();
 
         uint128 liq = 1e15;
-        uint256 navA = LeveragedAeroValuation.netEquityUsdc(_cfg(), strat, -1000, 1000, liq);
+        // Sanity: this band yields both legs, so the invariance proof covers both.
+        (uint256 a0, uint256 a1) = _legAmounts(LEG_LOWER, LEG_UPPER, liq);
+        assertGt(a0, 0);
+        assertGt(a1, 0);
+
+        uint256 navA = LeveragedAeroValuation.netEquityUsdc(_cfg(), strat, LEG_LOWER, LEG_UPPER, liq);
 
         // Shove the pool's reported sqrtPriceX96 wildly; keep spot/twap ticks calm.
         pool.setSqrtPriceX96(type(uint160).max / 2);
-        uint256 navB = LeveragedAeroValuation.netEquityUsdc(_cfg(), strat, -1000, 1000, liq);
+        uint256 navB = LeveragedAeroValuation.netEquityUsdc(_cfg(), strat, LEG_LOWER, LEG_UPPER, liq);
 
         assertEq(navA, navB);
     }
@@ -574,18 +616,32 @@ contract LeveragedAeroValuationTest is Test {
         pool.setTicks(0, 0); // spot == twap
     }
 
-    /// @dev Recompute the expected USDC leg value off the same primitives the lib uses, so the
-    ///      test is an independent oracle of the leg math (oracle sqrtP, not pool sqrtP).
-    function _expectedLegValueUsdc(int24 tickLower, int24 tickUpper, uint128 liq) internal view returns (uint256) {
-        // token0 = WETH (18dp) @ 3000, token1 = cbBTC (8dp) @ 65000, USDC peg $1.
+    /// @dev The raw (amt0, amt1) the lib would compute for a band/liquidity, at the ORACLE
+    ///      sqrtP (token0=WETH 18dp at $3000, token1=cbBTC 8dp at $65000). Lets tests assert
+    ///      each leg is nonzero so both the 18dp and 8dp valuation paths are exercised.
+    function _legAmounts(int24 tickLower, int24 tickUpper, uint128 liq)
+        internal
+        view
+        returns (uint256 amt0, uint256 amt1)
+    {
         uint160 sqrtP = LeveragedAeroValuation.oracleSqrtPriceX96(3_000e8, 18, 65_000e8, 8);
-        (uint256 amt0, uint256 amt1) = LiquidityAmounts.getAmountsForLiquidity(
+        (amt0, amt1) = LiquidityAmounts.getAmountsForLiquidity(
             sqrtP, TickMath.getSqrtRatioAtTick(tickLower), TickMath.getSqrtRatioAtTick(tickUpper), liq
         );
-        // value0 (WETH): amt0 * 3000e8 / 1e18 (USD-1e8) → /1e8 * 1e6 = /1e2 (USDC, peg $1)
-        uint256 v0 = (amt0 * 3_000e8 / 1e18) / 1e2;
-        uint256 v1 = (amt1 * 65_000e8 / 1e8) / 1e2;
-        return v0 + v1;
+    }
+
+    /// @dev Per-leg expected USDC value recomputed off the same primitives the lib uses, so the
+    ///      test is an independent oracle of BOTH leg paths (oracle sqrtP, not pool sqrtP).
+    function _expectedLegValuesUsdc(int24 tickLower, int24 tickUpper, uint128 liq)
+        internal
+        view
+        returns (uint256 v0, uint256 v1)
+    {
+        (uint256 amt0, uint256 amt1) = _legAmounts(tickLower, tickUpper, liq);
+        // USDC peg $1. value0 (WETH 18dp): amt0 * 3000e8 / 1e18 (USD-1e8) → /1e2 (USDC).
+        v0 = (amt0 * 3_000e8 / 1e18) / 1e2;
+        // value1 (cbBTC 8dp): amt1 * 65000e8 / 1e8 (USD-1e8) → /1e2 (USDC).
+        v1 = (amt1 * 65_000e8 / 1e8) / 1e2;
     }
 
     function _assertWithinOneTick(uint160 got, uint160 want) internal pure {
