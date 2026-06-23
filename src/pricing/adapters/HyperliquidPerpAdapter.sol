@@ -41,10 +41,13 @@ contract HyperliquidPerpAdapter is IPriceAdapter {
         // Outbound transit guard: returnsInitiated is set before _drainHC() queues HC
         // actions. HC equity may still be non-zero for one block after the flag flips.
         // Force Lane B during active settlement so no new LPs lock into a settling proposal.
-        // try/catch: holder may not implement IHyperliquidPerpStrategy (other HL_PERP reporters).
-        try IHyperliquidPerpStrategy(holder).returnsInitiated() returns (bool initiated) {
-            if (initiated) return (0, false);
-        } catch {}
+        // Low-level staticcall avoids Solidity ABI-decode failures for holders that don't
+        // implement returnsInitiated() or return unexpected data.
+        (bool success, bytes memory retData) =
+            holder.staticcall(abi.encodeWithSelector(IHyperliquidPerpStrategy.returnsInitiated.selector));
+        if (success && retData.length >= 32 && abi.decode(retData, (bool))) {
+            return (0, false);
+        }
 
         uint32 dex = p.ref.length == 32 ? abi.decode(p.ref, (uint32)) : 0;
         // Centralized precompile read (fail-closed on call failure / short buffer).

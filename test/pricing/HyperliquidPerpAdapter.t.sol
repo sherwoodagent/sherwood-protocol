@@ -57,4 +57,34 @@ contract HyperliquidPerpAdapterTest is Test {
         assertEq(v, 0);
         assertFalse(ok, "fail-closed without the HyperCore precompile");
     }
+
+    // ── Transit guard tests ──
+
+    function test_value_returnsInitiated_true_forcesLaneB() public {
+        // Outbound transit: HC equity is non-zero but drain is queued.
+        // Adapter must return (0, false) to force Lane B.
+        _setEquity(50_000e6);
+        vm.mockCall(holder, abi.encodeWithSignature("returnsInitiated()"), abi.encode(true));
+        (uint256 v, bool ok) = adapter.value(_pos(), holder);
+        assertEq(v, 0, "value must be 0 during outbound transit");
+        assertFalse(ok, "must force Lane B during outbound transit");
+    }
+
+    function test_value_returnsInitiated_false_pricedNormally() public {
+        // Not in transit: normal pricing proceeds.
+        _setEquity(50_000e6);
+        vm.mockCall(holder, abi.encodeWithSignature("returnsInitiated()"), abi.encode(false));
+        (uint256 v, bool ok) = adapter.value(_pos(), holder);
+        assertEq(v, 50_000e6);
+        assertTrue(ok);
+    }
+
+    function test_value_holderWithoutReturnsInitiated_pricedNormally() public {
+        // holder has no returnsInitiated() — try/catch must not block pricing.
+        _setEquity(50_000e6);
+        vm.mockCallRevert(holder, abi.encodeWithSignature("returnsInitiated()"), "no such fn");
+        (uint256 v, bool ok) = adapter.value(_pos(), holder);
+        assertEq(v, 50_000e6, "non-HL holder still priced via precompile");
+        assertTrue(ok);
+    }
 }
