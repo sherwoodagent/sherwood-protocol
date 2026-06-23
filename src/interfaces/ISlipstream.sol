@@ -151,6 +151,9 @@ interface ICLPool {
 
     /// @notice The higher-sorted token of the pair.
     function token1() external view returns (address);
+
+    /// @notice The gauge address associated with this pool (set by the Voter on first epoch).
+    function gauge() external view returns (address);
 }
 
 /// @title Aerodrome Slipstream CL Gauge
@@ -171,4 +174,22 @@ interface ICLGauge {
 
     /// @notice The ERC-20 token distributed as gauge rewards (AERO on Base).
     function rewardToken() external view returns (address);
+}
+
+/// @title Aerodrome Slipstream CL Swap Router
+/// @notice Minimal swap interface — tickSpacing-keyed (NOT fee-keyed, unlike Uniswap V3).
+interface ICLSwapRouter {
+    struct ExactInputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        int24 tickSpacing;
+        address recipient;
+        uint256 deadline;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+        uint160 sqrtPriceLimitX96;
+    }
+
+    /// @notice Swaps `amountIn` of one token for as much as possible of another.
+    function exactInputSingle(ExactInputSingleParams calldata params) external payable returns (uint256 amountOut);
 }
