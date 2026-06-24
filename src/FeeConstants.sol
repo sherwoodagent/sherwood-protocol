@@ -11,4 +11,9 @@ pragma solidity 0.8.28;
 library FeeConstants {
     /// @notice Hard ceiling on the agent performance fee, in basis points (15%).
     uint256 internal constant MAX_PERFORMANCE_FEE_BPS = 1500;
+
+    /// @notice Default agent performance fee a vault charges until its owner
+    ///         sets one, in basis points (5%). Single source of truth for the
+    ///         vault getter's fallback (mirror it in any off-chain default).
+    uint256 internal constant DEFAULT_AGENT_FEE_BPS = 500;
 }

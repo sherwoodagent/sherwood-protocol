@@ -132,18 +132,19 @@ contract SyndicateVault is
     ///         (G1). Cleared implicitly when the proposal settles (active != pid).
     mapping(address holder => uint256 pid) private _laneALockPid;
 
-    /// @notice Vault-owner-set agent performance fee (basis points), charged on
-    ///         strategy profit. Snapshotted onto a proposal at propose time
-    ///         (clamped to the governor's `maxPerformanceFeeBps`). The owner
-    ///         sets it via `setAgentFeeBps`; `agentFeeBps()` returns the 5%
-    ///         default until then. `_agentFeeSet` distinguishes "never set"
-    ///         (incl. a vault upgraded from a pre-fee impl, where this slot was
-    ///         reserved gap = 0) from an explicit 0% (H1).
-    uint256 private _agentFeeBps;
-    bool private _agentFeeSet;
+    /// @notice Vault-owner-set agent performance fee, stored offset-by-one so a
+    ///         single slot doubles as the "is it set?" flag: 0 = never set →
+    ///         `agentFeeBps()` returns `FeeConstants.DEFAULT_AGENT_FEE_BPS` (5%);
+    ///         otherwise the stored value is `fee + 1`, so an explicit 0% (a
+    ///         stored 1) stays distinct from unset. Collapses the former
+    ///         `_agentFeeBps` + `_agentFeeSet` pair into one SLOAD on the propose
+    ///         hot path. Snapshotted onto a proposal at propose (clamped to the
+    ///         governor's `maxPerformanceFeeBps`); set via `setAgentFeeBps`.
+    uint256 private _agentFeeBpsPlusOne;
 
-    /// @dev Reserved storage for future upgrades.
-    uint256[34] private __gap;
+    /// @dev Reserved storage for future upgrades. Grew 34 → 35 when the
+    ///      `_agentFeeSet` bool slot was reclaimed (PR #384 review pass 3).
+    uint256[35] private __gap;
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -166,8 +167,8 @@ contract SyndicateVault is
         _openDeposits = p.openDeposits;
         _agentRegistry = IERC721(p.agentRegistry);
         _managementFeeBps = p.managementFeeBps;
-        // _agentFeeBps left unset → agentFeeBps() returns the 5% default until
-        // the owner calls setAgentFeeBps (also covers upgraded vaults, H1).
+        // _agentFeeBpsPlusOne left 0 (unset) → agentFeeBps() returns the 5%
+        // default until the owner calls setAgentFeeBps (no init SSTORE needed).
         _factory = msg.sender;
         _cachedDecimalsOffset = IERC20Metadata(p.asset).decimals();
     }
@@ -486,17 +487,19 @@ contract SyndicateVault is
 
     /// @inheritdoc ISyndicateVault
     function agentFeeBps() external view returns (uint256) {
-        // Unset (incl. a vault upgraded from a pre-fee impl) falls back to the
-        // 5% default so the agent is never silently unpaid (H1). `_agentFeeSet`
-        // lets an owner still configure an explicit 0%.
-        return _agentFeeSet ? _agentFeeBps : 500;
+        // One SLOAD: 0 = never set → the 5% default (agent never silently
+        // unpaid, H1); otherwise the stored value is fee+1, so an explicit 0%
+        // (stored 1) stays distinct from unset.
+        uint256 stored = _agentFeeBpsPlusOne;
+        return stored == 0 ? FeeConstants.DEFAULT_AGENT_FEE_BPS : stored - 1;
     }
 
     /// @inheritdoc ISyndicateVault
     function setAgentFeeBps(uint256 bps) external onlyOwner {
         if (bps > MAX_AGENT_FEE_BPS) revert AgentFeeTooHigh();
-        _agentFeeBps = bps;
-        _agentFeeSet = true;
+        // Offset-by-one: stored = fee+1 marks "set" and keeps an explicit 0%
+        // distinct from the unset sentinel (0).
+        _agentFeeBpsPlusOne = bps + 1;
         emit AgentFeeUpdated(bps);
     }
 

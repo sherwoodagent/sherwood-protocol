@@ -568,6 +568,10 @@ contract SyndicateGovernorTest is Test {
         governor.setMaxPerformanceFeeBps(1000);
         usdc.mint(address(vault), 10_000e6);
         uint256 agentBalBefore = usdc.balanceOf(agent);
+        // H1 (pass 3): the settle-time re-clamp must EMIT FeeClamped too, not
+        // silently clamp — indexers/voters need the on-chain signal.
+        vm.expectEmit(true, true, true, false, address(governor));
+        emit ISyndicateGovernor.FeeClamped(proposalId, MAX_PERF_FEE_BPS, 1000);
         vm.prank(agent);
         governor.settleProposal(proposalId);
         // Settle re-clamps the 15% snapshot to the new 10% cap: 10% of 9900 = 990.
@@ -589,7 +593,8 @@ contract SyndicateGovernorTest is Test {
         vm.prank(owner);
         vault.setAgentFeeBps(MAX_PERF_FEE_BPS); // vault 15% > cap
         uint256 expectedId = governor.proposalCount() + 1;
-        vm.expectEmit(true, false, false, true, address(governor));
+        // All three params indexed → check topic1/2/3, no data.
+        vm.expectEmit(true, true, true, false, address(governor));
         emit ISyndicateGovernor.FeeClamped(expectedId, MAX_PERF_FEE_BPS, 1000);
         vm.prank(agent);
         governor.propose(

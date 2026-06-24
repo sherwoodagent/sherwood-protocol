@@ -298,13 +298,8 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
         // recorded + emitted rate is exactly what settlement charges (H2: no
         // voter-misleading divergence). An owner change after propose cannot
         // alter this proposal (C1); a later cap reduction re-applies at settle.
-        uint256 snapFee = ISyndicateVault(vault).agentFeeBps();
-        uint256 capFee = _params.maxPerformanceFeeBps;
-        if (snapFee > capFee) {
-            emit FeeClamped(proposalId, snapFee, capFee);
-            snapFee = capFee;
-        }
-        p.performanceFeeBps = snapFee;
+        p.performanceFeeBps =
+            _clampPerformanceFee(proposalId, ISyndicateVault(vault).agentFeeBps(), _params.maxPerformanceFeeBps);
         p.strategyDuration = strategyDuration;
         if (isCollaborative) {
             p.state = ProposalState.Draft;
@@ -1088,6 +1083,18 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
     }
 
     /// @dev Distribute protocol, agent, and management fees. Extracted to avoid stack-too-deep.
+    /// @dev Clamp `fee` to `cap`, emitting FeeClamped(proposalId, fee, cap) when
+    ///      the clamp fires. Shared by propose (snapshot) and _distributeFees
+    ///      (settle re-clamp) so both paths signal an over-cap fee identically
+    ///      (H1) and the event is memory-encoded once for bytecode.
+    function _clampPerformanceFee(uint256 proposalId, uint256 fee, uint256 cap) private returns (uint256) {
+        if (fee > cap) {
+            emit FeeClamped(proposalId, fee, cap);
+            return cap;
+        }
+        return fee;
+    }
+
     function _distributeFees(
         uint256 proposalId,
         address vault,
@@ -1143,8 +1150,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
         // from the vault at propose time (so it matches what voters approved);
         // clamp it to the governor's tunable maxPerformanceFeeBps so a later
         // cap reduction still applies.
-        uint256 maxPerfBps = _params.maxPerformanceFeeBps;
-        if (perfFeeBps > maxPerfBps) perfFeeBps = maxPerfBps;
+        perfFeeBps = _clampPerformanceFee(proposalId, perfFeeBps, _params.maxPerformanceFeeBps);
         agentFee = (netProfit * perfFeeBps) / BPS_DENOMINATOR;
 
         // Management fee from remainder after agent fee
