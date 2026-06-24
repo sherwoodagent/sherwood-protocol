@@ -832,9 +832,12 @@ contract SyndicateVault is
 
     /// @inheritdoc ISyndicateVault
     /// @notice Active-strategy-only: mint `shares` to a depositor whose assets
-    ///         are custodied by the strategy (oracle-priced Lane A entry).
+    ///         are custodied by the strategy (the strategy oracle-prices the entry).
     ///         Auto-delegates for voting power if the recipient has no delegate.
-    /// @dev No `nonReentrant`: there is no external call (mint + delegate only).
+    /// @dev Bypasses the vault depositor whitelist (`_openDeposits` /
+    ///      `_approvedDepositors`): the active strategy is the access-control
+    ///      gateway and mints only for deposits it has already vetted.
+    ///      No `nonReentrant`: there is no external call (mint + delegate only).
     function strategyMint(address to, uint256 shares) external onlyActiveStrategy whenNotPaused {
         _mint(to, shares);
         if (delegates(to) == address(0)) _delegate(to, to);

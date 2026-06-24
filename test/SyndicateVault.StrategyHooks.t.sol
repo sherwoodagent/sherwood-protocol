@@ -126,4 +126,22 @@ contract VaultStrategyHooksTest is Test {
         vm.expectRevert(abi.encodeWithSignature("EnforcedPause()"));
         vault.strategyMint(alice, 1e18);
     }
+
+    // ── Test 6: strategyBurn SUCCEEDS when paused (emergency exit; no whenNotPaused) ──
+
+    function test_strategyBurn_succeedsWhenPaused() public {
+        // Mint to the strategy while unpaused.
+        vm.prank(activeStrategy);
+        vault.strategyMint(address(activeStrategy), 5e18);
+
+        // Pause: deposits (mint) are blocked, but exits (burn) must still work.
+        vm.prank(owner);
+        vault.pause();
+
+        vm.prank(activeStrategy);
+        vault.strategyBurn(2e18);
+
+        assertEq(vault.balanceOf(address(activeStrategy)), 3e18, "burn should succeed when paused");
+        assertEq(vault.totalSupply(), 3e18);
+    }
 }
