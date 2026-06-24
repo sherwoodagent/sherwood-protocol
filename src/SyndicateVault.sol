@@ -370,6 +370,11 @@ contract SyndicateVault is
         _;
     }
 
+    modifier onlyActiveStrategy() {
+        if (msg.sender != _activeStrategy()) revert NotActiveStrategy();
+        _;
+    }
+
     /// @dev Read governor address from factory
     function _getGovernor() internal view returns (address) {
         return ISyndicateFactory(_factory).governor();
@@ -823,6 +828,26 @@ contract SyndicateVault is
         if (msg.sender != _withdrawalQueue) revert NotQueue();
         _mint(to, shares);
         if (delegates(to) == address(0)) _delegate(to, to);
+    }
+
+    /// @inheritdoc ISyndicateVault
+    /// @notice Active-strategy-only: mint `shares` to a depositor whose assets
+    ///         are custodied by the strategy (oracle-priced Lane A entry).
+    ///         Auto-delegates for voting power if the recipient has no delegate.
+    /// @dev No `nonReentrant`: there is no external call (mint + delegate only).
+    function strategyMint(address to, uint256 shares) external onlyActiveStrategy whenNotPaused {
+        _mint(to, shares);
+        if (delegates(to) == address(0)) _delegate(to, to);
+    }
+
+    /// @inheritdoc ISyndicateVault
+    /// @notice Active-strategy-only: burn `shares` that the strategy pulled from
+    ///         a redeemer (oracle-priced Lane A exit). Burns from `msg.sender`
+    ///         (the strategy itself holds the redeemer's shares after transfer).
+    /// @dev Not gated by `whenNotPaused` so emergency unwinding can proceed
+    ///      even when the vault is paused.
+    function strategyBurn(uint256 shares) external onlyActiveStrategy {
+        _burn(msg.sender, shares);
     }
 
     /// @inheritdoc ISyndicateVault

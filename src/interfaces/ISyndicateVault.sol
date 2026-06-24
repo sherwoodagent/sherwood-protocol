@@ -43,6 +43,7 @@ interface ISyndicateVault {
     error NotQueue();
     error ZeroAssets();
     error SharesLocked();
+    error NotActiveStrategy();
 
     // ── Init Params ──
     struct InitParams {
@@ -104,6 +105,8 @@ interface ISyndicateVault {
     function settleRedeem(uint256 shares, uint256 assets, address to) external; // queue-only
     function settleDeposit(uint256 shares, address to) external; // queue-only
     function onProposalSettled(uint256 proposalId) external; // governor-only
+    function strategyMint(address to, uint256 shares) external; // active-strategy-only
+    function strategyBurn(uint256 shares) external; // active-strategy-only
 
     // ── Rescue ──
     function rescueEth(address payable to, uint256 amount) external;
