@@ -276,14 +276,14 @@ contract LeveragedAeroValuationFork is LeveragedAeroForkBase, IERC721Receiver {
         INonfungiblePositionManager(NPM)
             .decreaseLiquidity(
                 INonfungiblePositionManager.DecreaseLiquidityParams({
-                    tokenId: tokenId, liquidity: dLiq, amount0Min: 0, amount1Min: 0, deadline: block.timestamp + 600
-                })
+                tokenId: tokenId, liquidity: dLiq, amount0Min: 0, amount1Min: 0, deadline: block.timestamp + 600
+            })
             );
         INonfungiblePositionManager(NPM)
             .collect(
                 INonfungiblePositionManager.CollectParams({
-                    tokenId: tokenId, recipient: actor, amount0Max: type(uint128).max, amount1Max: type(uint128).max
-                })
+                tokenId: tokenId, recipient: actor, amount0Max: type(uint128).max, amount1Max: type(uint128).max
+            })
             );
 
         // 4. Repay f of each debt, buying the EXACT repay tokens from the freed USDC.
@@ -361,15 +361,15 @@ contract LeveragedAeroValuationFork is LeveragedAeroForkBase, IERC721Receiver {
         ICLSwapRouter(CL_ROUTER)
             .exactInputSingle(
                 ICLSwapRouter.ExactInputSingleParams({
-                    tokenIn: WETH, // token0
-                    tokenOut: CBBTC, // token1
-                    tickSpacing: TICK_SPACING,
-                    recipient: swapper,
-                    deadline: block.timestamp + 600,
-                    amountIn: wethIn,
-                    amountOutMinimum: 0,
-                    sqrtPriceLimitX96: TickMath.getSqrtRatioAtTick(targetTick)
-                })
+                tokenIn: WETH, // token0
+                tokenOut: CBBTC, // token1
+                tickSpacing: TICK_SPACING,
+                recipient: swapper,
+                deadline: block.timestamp + 600,
+                amountIn: wethIn,
+                amountOutMinimum: 0,
+                sqrtPriceLimitX96: TickMath.getSqrtRatioAtTick(targetTick)
+            })
             );
         vm.stopPrank();
 
@@ -413,15 +413,15 @@ contract LeveragedAeroValuationFork is LeveragedAeroForkBase, IERC721Receiver {
             ICLSwapRouter(CL_ROUTER)
                 .exactInputSingle(
                     ICLSwapRouter.ExactInputSingleParams({
-                        tokenIn: USDC,
-                        tokenOut: tokenOut,
-                        tickSpacing: 100,
-                        recipient: who,
-                        deadline: block.timestamp + 600,
-                        amountIn: chunk,
-                        amountOutMinimum: 0,
-                        sqrtPriceLimitX96: 0
-                    })
+                    tokenIn: USDC,
+                    tokenOut: tokenOut,
+                    tickSpacing: 100,
+                    recipient: who,
+                    deadline: block.timestamp + 600,
+                    amountIn: chunk,
+                    amountOutMinimum: 0,
+                    sqrtPriceLimitX96: 0
+                })
                 );
             guard++;
             require(guard < 50, "buy loop stuck");
@@ -437,15 +437,15 @@ contract LeveragedAeroValuationFork is LeveragedAeroForkBase, IERC721Receiver {
         ICLSwapRouter(CL_ROUTER)
             .exactInputSingle(
                 ICLSwapRouter.ExactInputSingleParams({
-                    tokenIn: token,
-                    tokenOut: USDC,
-                    tickSpacing: 100,
-                    recipient: who,
-                    deadline: block.timestamp + 600,
-                    amountIn: bal,
-                    amountOutMinimum: 0,
-                    sqrtPriceLimitX96: 0
-                })
+                tokenIn: token,
+                tokenOut: USDC,
+                tickSpacing: 100,
+                recipient: who,
+                deadline: block.timestamp + 600,
+                amountIn: bal,
+                amountOutMinimum: 0,
+                sqrtPriceLimitX96: 0
+            })
             );
     }
 }
