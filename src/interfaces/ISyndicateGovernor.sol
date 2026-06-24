@@ -212,6 +212,12 @@ interface ISyndicateGovernor {
         string metadataURI
     );
 
+    /// @notice Emitted at propose when the vault's `agentFeeBps` snapshot
+    ///         exceeds `maxPerformanceFeeBps` and is clamped down. Surfaces that
+    ///         the recorded `performanceFeeBps` is the clamped value, not the
+    ///         owner's higher intended rate, so voters can detect the divergence.
+    event FeeClamped(uint256 indexed proposalId, uint256 snapshotted, uint256 clamped);
+
     event VoteCast(uint256 indexed proposalId, address indexed voter, VoteType support, uint256 weight);
 
     event ProposalExecuted(uint256 indexed proposalId, address indexed vault, uint256 capitalSnapshot);

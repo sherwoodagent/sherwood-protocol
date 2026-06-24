@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import {ISyndicateVault} from "./interfaces/ISyndicateVault.sol";
 import {ISyndicateGovernor} from "./interfaces/ISyndicateGovernor.sol";
+import {FeeConstants} from "./FeeConstants.sol";
 import {ISyndicateFactory} from "./interfaces/ISyndicateFactory.sol";
 import {IVaultWithdrawalQueue} from "./interfaces/IVaultWithdrawalQueue.sol";
 import {IPriceRouter} from "./interfaces/IPriceRouter.sol";
@@ -77,7 +78,7 @@ contract SyndicateVault is
     ///         live param is never charged. Capping here at the same ceiling
     ///         keeps `agentFeeBps()` from advertising a rate that can never be
     ///         realized (PR #384 review C4).
-    uint256 public constant MAX_AGENT_FEE_BPS = 1500;
+    uint256 public constant MAX_AGENT_FEE_BPS = FeeConstants.MAX_PERFORMANCE_FEE_BPS;
 
     // ==================== STORAGE ====================
 

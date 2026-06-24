@@ -300,7 +300,11 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
         // alter this proposal (C1); a later cap reduction re-applies at settle.
         uint256 snapFee = ISyndicateVault(vault).agentFeeBps();
         uint256 capFee = _params.maxPerformanceFeeBps;
-        p.performanceFeeBps = snapFee > capFee ? capFee : snapFee;
+        if (snapFee > capFee) {
+            emit FeeClamped(proposalId, snapFee, capFee);
+            snapFee = capFee;
+        }
+        p.performanceFeeBps = snapFee;
         p.strategyDuration = strategyDuration;
         if (isCollaborative) {
             p.state = ProposalState.Draft;

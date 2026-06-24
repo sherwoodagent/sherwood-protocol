@@ -580,6 +580,36 @@ contract SyndicateGovernorTest is Test {
         assertEq(vault.MAX_AGENT_FEE_BPS(), governor.MAX_PERFORMANCE_FEE_CAP(), "vault cap must mirror governor cap");
     }
 
+    /// @notice H1: when the vault's snapshotted fee exceeds maxPerformanceFeeBps,
+    ///         propose emits FeeClamped(pid, snapshotted, clamped) so voters can
+    ///         detect the recorded fee was clamped below the owner's intent.
+    function test_propose_emitsFeeClampedWhenAboveCap() public {
+        vm.prank(owner);
+        governor.setMaxPerformanceFeeBps(1000); // cap 10%
+        vm.prank(owner);
+        vault.setAgentFeeBps(MAX_PERF_FEE_BPS); // vault 15% > cap
+        uint256 expectedId = governor.proposalCount() + 1;
+        vm.expectEmit(true, false, false, true, address(governor));
+        emit ISyndicateGovernor.FeeClamped(expectedId, MAX_PERF_FEE_BPS, 1000);
+        vm.prank(agent);
+        governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://test",
+            7 days,
+            _simpleExecuteCalls(),
+            _simpleSettlementCalls(),
+            _emptyCoProposers()
+        );
+    }
+
+    /// @notice H1: no clamp when the vault fee is at or below the cap — the
+    ///         snapshot equals the set fee (so FeeClamped is not emitted).
+    function test_propose_noClampWhenWithinCap() public {
+        uint256 pid = _createSimpleProposal(500, 7 days); // vault 5% <= cap 15%
+        assertEq(governor.getProposal(pid).performanceFeeBps, 500, "no clamp within cap");
+    }
+
     function test_settlement_withLoss_noFees() public {
         uint256 proposalId = _createAndExecuteProposal(1500, 7 days);
         usdc.burn(address(vault), 5_000e6);
