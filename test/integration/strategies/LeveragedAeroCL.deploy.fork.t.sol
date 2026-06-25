@@ -4,6 +4,7 @@ pragma solidity 0.8.28;
 import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
+import {console2} from "forge-std/Test.sol";
 
 import {LeveragedAeroForkBase} from "./LeveragedAeroForkBase.sol";
 import {BaseAddresses} from "./BaseAddresses.sol";
@@ -12,6 +13,7 @@ import {Position} from "../../../src/interfaces/IPriceRouter.sol";
 import {IAggregatorV3} from "../../../src/interfaces/IAggregatorV3.sol";
 import {IMoonwellMarket} from "../../../src/interfaces/IMoonwellMarket.sol";
 import {ICToken} from "../../../src/interfaces/ICToken.sol";
+import {ICLPool, INonfungiblePositionManager} from "../../../src/interfaces/ISlipstream.sol";
 
 /// @title  LeveragedAeroCLDeployFork
 /// @notice Task 3.1 TDD: deploy the skeleton, initialize with confirmed params,
@@ -283,6 +285,7 @@ contract LeveragedAeroCLDeployFork is LeveragedAeroForkBase {
     ///         Checks:
     ///           - Both Moonwell borrow balances reach 0.
     ///           - tokenId cleared to 0.
+    ///           - On-chain NPM liquidity for the pre-settle tokenId is 0.
     ///           - Vault receives ≥95% and ≤101% of the 50k USDC principal
     ///             (round-trip swap costs + 1% slippage + IL bounded by range).
     ///           - No meaningful WETH or cbBTC residual remains in the strategy.
@@ -298,6 +301,9 @@ contract LeveragedAeroCLDeployFork is LeveragedAeroForkBase {
 
         // Sanity: position is open
         assertGt(strategy.tokenId(), 0, "tokenId should be non-zero after execute");
+
+        // Capture tokenId before settle so we can check NPM state after
+        uint256 tid = strategy.tokenId();
 
         // ── Settle ──
         vm.prank(fakeVault);
@@ -315,8 +321,10 @@ contract LeveragedAeroCLDeployFork is LeveragedAeroForkBase {
             "WETH debt not fully repaid"
         );
 
-        // ── Assert: position cleared ──
+        // ── Assert: position cleared (storage + on-chain NPM liquidity) ──
         assertEq(strategy.tokenId(), 0, "tokenId not cleared after settle");
+        (,,,,,,, uint128 liqAfter,,,,) = INonfungiblePositionManager(BaseAddresses.SLIPSTREAM_NPM).positions(tid);
+        assertEq(liqAfter, 0, "NFT liquidity drained");
 
         // ── Assert: vault received ≈ principal (95%–101%) ──
         uint256 vaultUsdc = IERC20(BaseAddresses.USDC).balanceOf(fakeVault);
@@ -327,6 +335,76 @@ contract LeveragedAeroCLDeployFork is LeveragedAeroForkBase {
         assertLt(IERC20(BaseAddresses.USDC).balanceOf(address(strategy)), 1e6, "USDC residual in strategy");
         assertLt(IERC20(BaseAddresses.WETH).balanceOf(address(strategy)), 1e15, "WETH residual in strategy");
         assertLt(IERC20(BaseAddresses.CBBTC).balanceOf(address(strategy)), 1000, "cbBTC residual in strategy");
+    }
+
+    /// @notice Settle still fully clears both debts even when IL causes a shortfall (one LP
+    ///         leg comes back with less token than the matching debt).  The strategy redeems
+    ///         mUSDC collateral and swaps to cover the gap.
+    ///
+    ///         Method: open the book, shove the pool tick far enough that the LP's collected
+    ///         tokens are heavily weighted toward ONE leg (IL), then settle.  Whether or not
+    ///         the shortfall branch is entered depends on how much the LP over-collects on the
+    ///         shoved side; the invariant that MUST hold regardless is:
+    ///           - cbBTC borrow balance == 0 after settle
+    ///           - WETH borrow balance == 0 after settle
+    ///           - USDC arrives in the vault (strategy is solvent)
+    function test_settle_coversShortfallUnderIL() public {
+        if (_skip) return;
+
+        uint256 principal = 50_000e6;
+
+        // ── Open position ──
+        _fundUSDC(address(strategy), principal);
+        vm.prank(fakeVault);
+        strategy.execute();
+
+        assertGt(strategy.tokenId(), 0, "tokenId should be non-zero after execute");
+
+        // ── Snapshot pre-settle USDC in vault (should be 0) ──
+        uint256 vaultUsdcBefore = IERC20(BaseAddresses.USDC).balanceOf(fakeVault);
+
+        // ── Shove the tick to induce IL ──
+        // Sell a large WETH amount into the pool (zeroForOne=true: token0=WETH → token1=cbBTC).
+        // This pushes the price down (more cbBTC per WETH), concentrating the LP in the WETH
+        // leg and leaving the cbBTC leg under-collected relative to cbBTC debt.
+        // 200 WETH ≈ $500k at ~$2500/ETH — enough to move a 50k principal position out of range.
+        uint256 shoveWeth = 200e18;
+        int24 tickBefore;
+        (, tickBefore,,,,) = ICLPool(BaseAddresses.CBBTC_WETH_POOL).slot0();
+        int24 tickAfter = _shoveTick(shoveWeth, true);
+
+        // Log the tick move for the report
+        console2.log("tick before shove:", int256(tickBefore));
+        console2.log("tick after shove:", int256(tickAfter));
+
+        // ── Check pre-settle borrow balances (both must be non-zero still) ──
+        uint256 cbDebtBefore = IMoonwellMarket(BaseAddresses.MOONWELL_MCBBTC).borrowBalanceStored(address(strategy));
+        uint256 wethDebtBefore = IMoonwellMarket(BaseAddresses.MOONWELL_MWETH).borrowBalanceStored(address(strategy));
+        assertGt(cbDebtBefore, 0, "cbBTC debt should be non-zero before settle");
+        assertGt(wethDebtBefore, 0, "WETH debt should be non-zero before settle");
+
+        // ── Settle ──
+        vm.prank(fakeVault);
+        strategy.settle();
+
+        // ── Assert: both Moonwell debts cleared regardless of shortfall path ──
+        assertEq(
+            IMoonwellMarket(BaseAddresses.MOONWELL_MCBBTC).borrowBalanceStored(address(strategy)),
+            0,
+            "cbBTC debt not fully repaid after shoved settle"
+        );
+        assertEq(
+            IMoonwellMarket(BaseAddresses.MOONWELL_MWETH).borrowBalanceStored(address(strategy)),
+            0,
+            "WETH debt not fully repaid after shoved settle"
+        );
+
+        // ── Assert: USDC reached the vault ──
+        uint256 vaultUsdcAfter = IERC20(BaseAddresses.USDC).balanceOf(fakeVault);
+        assertGt(vaultUsdcAfter, vaultUsdcBefore, "vault received no USDC after shoved settle");
+
+        // ── Assert: tokenId cleared ──
+        assertEq(strategy.tokenId(), 0, "tokenId not cleared after shoved settle");
     }
 
     // ─────────────────────────────────────────────────────────────

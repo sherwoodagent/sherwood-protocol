@@ -696,7 +696,8 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient 
         uint256 totalNeed = cbUsdcNeed + wethUsdcNeed;
         // Redeem USDC collateral to fund the swaps (health elevated after partial repays)
         if (totalNeed > 0) {
-            ICToken(mUsdc).redeemUnderlying(totalNeed);
+            uint256 redeemErr = ICToken(mUsdc).redeemUnderlying(totalNeed);
+            if (redeemErr != 0) revert MoonwellRedeemFailed(redeemErr);
         }
         uint256 slip = uint256(maxSlippageBps);
         // Cover cbBTC shortfall
