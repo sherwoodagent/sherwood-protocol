@@ -237,7 +237,12 @@ library LeveragedAeroValuation {
     ///      spot tick deviates from the `twapWindow` arithmetic-mean tick beyond
     ///      `calmDeviationTicks`. Pattern: `AerodromeLPAdapter` deviation gate; mechanism:
     ///      Mamo `LPAutoBalancerV2.reset()` calm-gate.
-    function _calmGate(Config memory c) private view {
+    ///
+    ///      Visibility is `internal` (not `private`) so `LeveragedAerodromeCLStrategy` can
+    ///      call it before minting to guard tick-band placement and slippage-min computation.
+    ///      Logic is unchanged — do NOT edit this function without also updating the
+    ///      strategy's `_mintAndStake` caller.
+    function _calmGate(Config memory c) internal view {
         (, int24 spotTick,,,,) = ICLPool(c.pool).slot0();
 
         uint32[] memory secondsAgos = new uint32[](2);

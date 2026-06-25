@@ -7,6 +7,8 @@ import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/Reentrancy
 
 import {BaseStrategy} from "./BaseStrategy.sol";
 import {LeveragedAeroValuation} from "./LeveragedAeroValuation.sol";
+import {TickMath} from "../libraries/TickMath.sol";
+import {LiquidityAmounts} from "../libraries/LiquidityAmounts.sol";
 import {ChainlinkReader} from "../libraries/ChainlinkReader.sol";
 import {IMoonwellMarket, IComptroller, ICToken} from "../interfaces/IMoonwellMarket.sol";
 import {ICLPool, ICLGauge, INonfungiblePositionManager} from "../interfaces/ISlipstream.sol";
@@ -502,14 +504,37 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient 
 
     /// @dev Mint the Slipstream CL position and return its tokenId.
     ///      token0 = WETH (18dp), token1 = cbBTC (8dp) — confirmed for ts=100 pool.
-    ///      amountMins are set to 0: the exact split between token0 and token1 in a
-    ///      CL range depends on the current sqrtPrice; per-token min-outs would revert
-    ///      whenever the ratio differs from the desired amounts. Slippage is enforced
-    ///      at the NAV level (nav() fail-closed on oracle) and at settle-time swaps.
+    ///
+    ///      Two-sided slippage mins are derived from the **expected actual** deposit
+    ///      amounts, not from the desired amounts. The approach:
+    ///        1. Read the current pool `sqrtPriceX96` (calm-gated by `_mintAndStake`
+    ///           before this call, so spot ≈ TWAP — not manipulated).
+    ///        2. Compute L = getLiquidityForAmounts(sqrtP, sqrtLower, sqrtUpper,
+    ///                        wethAmt, cbBTCAmt).
+    ///        3. Compute (exp0, exp1) = getAmountsForLiquidity(sqrtP, …, L) — these
+    ///           are the true expected per-leg deposits at the current price.
+    ///        4. amount{0,1}Min = exp{0,1} × (10000 − maxSlippageBps) / 10000.
+    ///
+    ///      Using desired amounts as mins would spuriously revert: a straddle mint's
+    ///      actual deposit of one leg can be far below its desired amount when the
+    ///      current price is near a tick boundary. Using expected actuals is tight +
+    ///      correct; the calm-gate guarantees sqrtP ≈ TWAP so exp0/exp1 reflect
+    ///      genuine price and the mins only absorb in-block drift.
     function _mintPosition(uint256 wethAmt, uint256 cbBTCAmt, int24 tL, int24 tU) private returns (uint256 tid) {
         address npm_ = npm;
         address weth_ = weth;
         address cbBTC_ = cbBTC;
+
+        // Compute expected actual deposits at the calm-gated sqrtP.
+        (uint160 sqrtP,,,,,) = ICLPool(pool).slot0();
+        uint160 sqrtLower = TickMath.getSqrtRatioAtTick(tL);
+        uint160 sqrtUpper = TickMath.getSqrtRatioAtTick(tU);
+        uint128 L = LiquidityAmounts.getLiquidityForAmounts(sqrtP, sqrtLower, sqrtUpper, wethAmt, cbBTCAmt);
+        (uint256 exp0, uint256 exp1) = LiquidityAmounts.getAmountsForLiquidity(sqrtP, sqrtLower, sqrtUpper, L);
+        uint256 slip = uint256(maxSlippageBps);
+        uint256 amt0Min = exp0 * (10000 - slip) / 10000;
+        uint256 amt1Min = exp1 * (10000 - slip) / 10000;
+
         IERC20(weth_).forceApprove(npm_, wethAmt);
         IERC20(cbBTC_).forceApprove(npm_, cbBTCAmt);
         INonfungiblePositionManager.MintParams memory mp = INonfungiblePositionManager.MintParams({
@@ -520,8 +545,8 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient 
             tickUpper: tU,
             amount0Desired: wethAmt,
             amount1Desired: cbBTCAmt,
-            amount0Min: 0,
-            amount1Min: 0,
+            amount0Min: amt0Min,
+            amount1Min: amt1Min,
             recipient: address(this),
             deadline: block.timestamp + 600,
             sqrtPriceX96: 0
@@ -532,6 +557,10 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient 
 
     /// @dev Mint the CL position, stake in gauge, and persist state.
     function _mintAndStake(uint256 cbBTCAmt, uint256 wethAmt) private {
+        // Calm-gate: revert CalmGateBreached if spot tick deviates from TWAP beyond
+        // `calmDeviationTicks`. Must run before _computeTickRange (which reads spot tick)
+        // and before _mintPosition (which anchors slippage mins to the calm sqrtP).
+        LeveragedAeroValuation._calmGate(_cfg());
         (int24 tL, int24 tU) = _computeTickRange();
         uint256 tid = _mintPosition(wethAmt, cbBTCAmt, tL, tU);
         address gauge_ = gauge;

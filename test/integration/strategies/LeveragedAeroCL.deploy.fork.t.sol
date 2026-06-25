@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 
 import {LeveragedAeroForkBase} from "./LeveragedAeroForkBase.sol";
 import {BaseAddresses} from "./BaseAddresses.sol";
@@ -235,6 +236,8 @@ contract LeveragedAeroCLDeployFork is LeveragedAeroForkBase {
         uint256 tid = strategy.tokenId();
         assertGt(tid, 0, "tokenId == 0");
         assertNotEq(strategy.posTickLower(), strategy.posTickUpper(), "ticks equal");
+        // Explicit gauge-custody check: the gauge holds the NFT after deposit().
+        assertEq(IERC721(NPM).ownerOf(tid), GAUGE, "gauge should own minted NFT");
 
         // ── Compute LTV and health from on-chain state ──
         // Collateral: mUSDC balance × exchangeRate / 1e18 → USDC face (6dp)
