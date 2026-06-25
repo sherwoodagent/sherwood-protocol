@@ -4,7 +4,6 @@ pragma solidity 0.8.28;
 import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
-import {console2} from "forge-std/Test.sol";
 
 import {LeveragedAeroForkBase} from "./LeveragedAeroForkBase.sol";
 import {BaseAddresses} from "./BaseAddresses.sol";
@@ -372,10 +371,7 @@ contract LeveragedAeroCLDeployFork is LeveragedAeroForkBase {
         int24 tickBefore;
         (, tickBefore,,,,) = ICLPool(BaseAddresses.CBBTC_WETH_POOL).slot0();
         int24 tickAfter = _shoveTick(shoveWeth, true);
-
-        // Log the tick move for the report
-        console2.log("tick before shove:", int256(tickBefore));
-        console2.log("tick after shove:", int256(tickAfter));
+        assertTrue(tickAfter != tickBefore, "shove should move the pool tick");
 
         // ── Check pre-settle borrow balances (both must be non-zero still) ──
         uint256 cbDebtBefore = IMoonwellMarket(BaseAddresses.MOONWELL_MCBBTC).borrowBalanceStored(address(strategy));
