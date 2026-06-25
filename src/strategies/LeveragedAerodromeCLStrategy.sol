@@ -7,9 +7,16 @@ import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/Reentrancy
 
 import {BaseStrategy} from "./BaseStrategy.sol";
 import {LeveragedAeroValuation} from "./LeveragedAeroValuation.sol";
-import {INonfungiblePositionManager} from "../interfaces/ISlipstream.sol";
+import {ChainlinkReader} from "../libraries/ChainlinkReader.sol";
+import {IMoonwellMarket, IComptroller, ICToken} from "../interfaces/IMoonwellMarket.sol";
+import {ICLPool, ICLGauge, INonfungiblePositionManager} from "../interfaces/ISlipstream.sol";
 import {Position} from "../interfaces/IPriceRouter.sol";
 import {IStrategy} from "../interfaces/IStrategy.sol";
+
+/// @dev Minimal WETH9 interface — deposit wraps native ETH into ERC-20 WETH.
+interface IWETH9 {
+    function deposit() external payable;
+}
 
 /// @title LeveragedAerodromeCLStrategy
 /// @notice Net-short leveraged Aerodrome CL strategy.
@@ -51,6 +58,16 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient 
     error UnhealthyPosition();
     /// @notice Low-level call to `npm.positions(tokenId)` failed or returned short data.
     error InvalidNpmReturn();
+    /// @notice No USDC balance to deploy at execute time.
+    error ExecuteZeroBalance();
+    /// @notice Moonwell `ICToken.mint()` returned a non-zero Compound error code.
+    error MoonwellMintFailed(uint256 errCode);
+    /// @notice Moonwell `IMoonwellMarket.borrow()` returned a non-zero Compound error code.
+    error MoonwellBorrowFailed(uint256 errCode);
+    /// @notice Slipstream NPM returned tokenId == 0.
+    error NpmMintFailed();
+    /// @notice ERC-721 `approve(gauge, tokenId)` low-level call failed.
+    error NpmApproveFailed();
 
     // ─────────────────────────────────────────────────────────────
     // Constants
@@ -64,6 +81,10 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient 
 
     /// @dev Position `kind` tag for the PriceRouter adapter registry.
     bytes32 public constant POSITION_KIND = keccak256("LEVERAGED_AERO_CL");
+
+    /// @dev Number of tick-spacings on each side of the current tick for the initial CL range.
+    ///      Mirrors the harness `_openRealBook` range of ±20 tickSpacings.
+    uint8 private constant RANGE_TICK_SPACINGS = 20;
 
     // ─────────────────────────────────────────────────────────────
     // Initialisation params struct
@@ -404,9 +425,133 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient 
     // BaseStrategy stubs (implemented in Tasks 3.2 / 3.3)
     // ─────────────────────────────────────────────────────────────
 
-    /// @dev Task 3.2: open the levered cbBTC/WETH CL position.
+    /// @notice Open the levered cbBTC/WETH CL position.
+    ///
+    ///         Sequence:
+    ///           1. Supply all USDC at `address(this)` as Moonwell collateral.
+    ///           2. Enter mUSDC market in the Comptroller.
+    ///           3. Read Chainlink prices; borrow cbBTC + WETH at `targetLtvBps / 2` each.
+    ///           4. Moonwell mWETH sends native ETH — wrap it to WETH9.
+    ///           5. Mint a Slipstream CL position straddling current tick (±RANGE_TICK_SPACINGS).
+    ///           6. Stake the NFT in the AERO gauge.
+    ///           7. Store tokenId + ticks.
+    ///
+    ///         `_assertHealthy()` (Task 3.4) is wired in here once implemented.
     function _execute() internal override {
-        revert NotImplemented();
+        uint256 usdcAmt = _supplyCollateral();
+        (uint256 cbBTCAmt, uint256 wethAmt) = _computeAndBorrow(usdcAmt);
+        _wrapNativeEth();
+        _mintAndStake(cbBTCAmt, wethAmt);
+    }
+
+    /// @dev Supply all strategy USDC to Moonwell and enter the mUSDC market.
+    ///      Returns the amount of USDC supplied (needed for borrow sizing).
+    function _supplyCollateral() private returns (uint256 usdcAmt) {
+        address usdc_ = usdc;
+        address mUsdc_ = mUsdc;
+        usdcAmt = IERC20(usdc_).balanceOf(address(this));
+        if (usdcAmt == 0) revert ExecuteZeroBalance();
+        IERC20(usdc_).forceApprove(mUsdc_, usdcAmt);
+        uint256 err = ICToken(mUsdc_).mint(usdcAmt);
+        if (err != 0) revert MoonwellMintFailed(err);
+        address[] memory markets = new address[](1);
+        markets[0] = mUsdc_;
+        IComptroller(comptroller).enterMarkets(markets);
+    }
+
+    /// @dev Read Chainlink prices, compute borrow amounts, and execute both borrows.
+    ///
+    ///      Borrow sizing:
+    ///        halfBorrowUsd8 = collateralUsdc6dp × 100 × targetLtvBps / (2 × 10000)
+    ///        (× 100 converts USDC 6dp to 8dp; ÷ 20000 = ÷ 2 × 10000 = half of LTV%)
+    ///
+    ///      cbBTC amount (8dp) = halfBorrowUsd8 × 1e8 / pBTC_8dp
+    ///      WETH  amount (18dp) = halfBorrowUsd8 × 1e18 / pETH_8dp
+    function _computeAndBorrow(uint256 usdcAmt) private returns (uint256 cbBTCAmt, uint256 wethAmt) {
+        (uint256 pBTC,) = ChainlinkReader.readUsd(cbBTCFeed, sequencerFeed, maxDelay, gracePeriod);
+        (uint256 pETH,) = ChainlinkReader.readUsd(wethFeed, sequencerFeed, maxDelay, gracePeriod);
+        // halfBorrowUsd8: usdcAmt (6dp) → 8dp via ×100, then ×targetLtvBps÷(2×10000)
+        uint256 halfBorrowUsd8 = (usdcAmt * 100 * uint256(targetLtvBps)) / (2 * 10000);
+        cbBTCAmt = (halfBorrowUsd8 * 1e8) / pBTC;
+        wethAmt = (halfBorrowUsd8 * 1e18) / pETH;
+        uint256 cbErr = IMoonwellMarket(mCbBTC).borrow(cbBTCAmt);
+        if (cbErr != 0) revert MoonwellBorrowFailed(cbErr);
+        uint256 wethErr = IMoonwellMarket(mWeth).borrow(wethAmt);
+        if (wethErr != 0) revert MoonwellBorrowFailed(wethErr);
+    }
+
+    /// @dev Wrap all native ETH held by the strategy into ERC-20 WETH9.
+    ///      Moonwell's mWETH market sends native ETH to borrowers; the strategy's
+    ///      `receive()` absorbs it and we wrap it here before calling NPM.mint.
+    function _wrapNativeEth() private {
+        uint256 ethBal = address(this).balance;
+        if (ethBal > 0) {
+            IWETH9(weth).deposit{value: ethBal}();
+        }
+    }
+
+    /// @dev Compute a tickSpacing-aligned range centred on the current pool tick.
+    function _computeTickRange() private view returns (int24 tL, int24 tU) {
+        (, int24 currentTick,,,,) = ICLPool(pool).slot0();
+        int24 ts = tickSpacing;
+        int24 span = int24(uint24(RANGE_TICK_SPACINGS)) * ts;
+        tL = _alignTick(currentTick - span, ts);
+        tU = _alignTick(currentTick + span, ts);
+        if (tU <= tL) tU = tL + ts;
+    }
+
+    /// @dev Mint the Slipstream CL position and return its tokenId.
+    ///      token0 = WETH (18dp), token1 = cbBTC (8dp) — confirmed for ts=100 pool.
+    ///      amountMins are set to 0: the exact split between token0 and token1 in a
+    ///      CL range depends on the current sqrtPrice; per-token min-outs would revert
+    ///      whenever the ratio differs from the desired amounts. Slippage is enforced
+    ///      at the NAV level (nav() fail-closed on oracle) and at settle-time swaps.
+    function _mintPosition(uint256 wethAmt, uint256 cbBTCAmt, int24 tL, int24 tU) private returns (uint256 tid) {
+        address npm_ = npm;
+        address weth_ = weth;
+        address cbBTC_ = cbBTC;
+        IERC20(weth_).forceApprove(npm_, wethAmt);
+        IERC20(cbBTC_).forceApprove(npm_, cbBTCAmt);
+        INonfungiblePositionManager.MintParams memory mp = INonfungiblePositionManager.MintParams({
+            token0: weth_,
+            token1: cbBTC_,
+            tickSpacing: tickSpacing,
+            tickLower: tL,
+            tickUpper: tU,
+            amount0Desired: wethAmt,
+            amount1Desired: cbBTCAmt,
+            amount0Min: 0,
+            amount1Min: 0,
+            recipient: address(this),
+            deadline: block.timestamp + 600,
+            sqrtPriceX96: 0
+        });
+        (tid,,,) = INonfungiblePositionManager(npm_).mint(mp);
+        if (tid == 0) revert NpmMintFailed();
+    }
+
+    /// @dev Mint the CL position, stake in gauge, and persist state.
+    function _mintAndStake(uint256 cbBTCAmt, uint256 wethAmt) private {
+        (int24 tL, int24 tU) = _computeTickRange();
+        uint256 tid = _mintPosition(wethAmt, cbBTCAmt, tL, tU);
+        address gauge_ = gauge;
+        // ERC-721 approve: same function selector as ERC-20 approve (approve(address,uint256))
+        // but operates on the NFT, not a fungible allowance. Low-level call avoids IERC20 cast.
+        (bool ok,) = npm.call(abi.encodeWithSignature("approve(address,uint256)", gauge_, tid));
+        if (!ok) revert NpmApproveFailed();
+        ICLGauge(gauge_).deposit(tid);
+        // Persist position state (so nav()/positions() see the live position)
+        tokenId = tid;
+        posTickLower = tL;
+        posTickUpper = tU;
+    }
+
+    /// @dev Align `tick` down to the nearest multiple of `spacing`.
+    ///      Handles negative ticks correctly (Solidity truncates-toward-zero by default).
+    function _alignTick(int24 tick, int24 spacing) private pure returns (int24) {
+        int24 rem = tick % spacing;
+        if (rem < 0) rem += spacing;
+        return tick - rem;
     }
 
     /// @dev Task 3.3: full proportional unwind to the vault.

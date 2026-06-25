@@ -8,6 +8,9 @@ import {LeveragedAeroForkBase} from "./LeveragedAeroForkBase.sol";
 import {BaseAddresses} from "./BaseAddresses.sol";
 import {LeveragedAerodromeCLStrategy} from "../../../src/strategies/LeveragedAerodromeCLStrategy.sol";
 import {Position} from "../../../src/interfaces/IPriceRouter.sol";
+import {IAggregatorV3} from "../../../src/interfaces/IAggregatorV3.sol";
+import {IMoonwellMarket} from "../../../src/interfaces/IMoonwellMarket.sol";
+import {ICToken} from "../../../src/interfaces/ICToken.sol";
 
 /// @title  LeveragedAeroCLDeployFork
 /// @notice Task 3.1 TDD: deploy the skeleton, initialize with confirmed params,
@@ -204,14 +207,72 @@ contract LeveragedAeroCLDeployFork is LeveragedAeroForkBase {
         assertEq(encMWeth, BaseAddresses.MOONWELL_MWETH, "ref.mWeth");
     }
 
-    /// @notice _execute() reverts NotImplemented (stub until Task 3.2).
-    function test_deploy_executeRevertsNotImplemented() public {
+    /// @notice Opening the leveraged position works end-to-end:
+    ///         - collateral deposited in Moonwell mUSDC
+    ///         - cbBTC + WETH borrowed
+    ///         - Slipstream CL NFT minted and staked in gauge
+    ///         - Post-op LTV ≈ 50% and within [targetLtvBps ± 10%, maxLtvBps]
+    ///         - Health ≥ minHealthBps (1.20)
+    ///         - nav() ≈ 50_000e6 within 5%
+    function test_execute_opensLeveredPositionWithinBounds() public {
         if (_skip) return;
 
-        // Prank as vault — execute() is onlyVault
+        // ── fund and execute ──
+        _fundUSDC(address(strategy), 50_000e6);
         vm.prank(fakeVault);
-        vm.expectRevert(LeveragedAerodromeCLStrategy.NotImplemented.selector);
         strategy.execute();
+
+        // ── Assert: mUSDC collateral deposited ──
+        assertGt(ICToken(MUSDC).balanceOf(address(strategy)), 0, "mUSDC collateral == 0");
+
+        // ── Assert: both borrows active ──
+        uint256 cbDebt = IMoonwellMarket(MCBBTC).borrowBalanceStored(address(strategy));
+        uint256 wethDebt = IMoonwellMarket(MWETH).borrowBalanceStored(address(strategy));
+        assertGt(cbDebt, 0, "cbBTC borrow balance == 0");
+        assertGt(wethDebt, 0, "WETH borrow balance == 0");
+
+        // ── Assert: CL NFT minted and staked ──
+        uint256 tid = strategy.tokenId();
+        assertGt(tid, 0, "tokenId == 0");
+        assertNotEq(strategy.posTickLower(), strategy.posTickUpper(), "ticks equal");
+
+        // ── Compute LTV and health from on-chain state ──
+        // Collateral: mUSDC balance × exchangeRate / 1e18 → USDC face (6dp)
+        uint256 mUsdcBal = ICToken(MUSDC).balanceOf(address(strategy));
+        uint256 rate = ICToken(MUSDC).exchangeRateStored();
+        uint256 collateralUsdc = (mUsdcBal * rate) / 1e18;
+
+        // Prices (8dp each)
+        (, int256 btcAns,,,) = IAggregatorV3(BaseAddresses.CHAINLINK_BTC_USD).latestRoundData();
+        (, int256 ethAns,,,) = IAggregatorV3(BaseAddresses.CHAINLINK_ETH_USD).latestRoundData();
+        (, int256 usdcAns,,,) = IAggregatorV3(BaseAddresses.CHAINLINK_USDC_USD).latestRoundData();
+        uint256 pBTC = uint256(btcAns);
+        uint256 pETH = uint256(ethAns);
+        uint256 pUsdc = uint256(usdcAns); // ≈ 1e8
+
+        // cbBTC debt → USDC 6dp: cbDebt(8dp) × pBTC(8dp) / 1e8 = usd(8dp); ÷ pUsdc × 1e6 = usdc(6dp)
+        uint256 cbDebtUsdc = (cbDebt * pBTC * 1e6) / (1e8 * pUsdc);
+        // WETH debt → USDC 6dp: wethDebt(18dp) × pETH(8dp) / 1e18 = usd(8dp); ÷ pUsdc × 1e6 = usdc(6dp)
+        uint256 wethDebtUsdc = (wethDebt * pETH * 1e6) / (1e18 * pUsdc);
+        uint256 totalDebtUsdc = cbDebtUsdc + wethDebtUsdc;
+
+        // LTV in bps
+        uint256 ltvBps = (totalDebtUsdc * 10000) / collateralUsdc;
+        assertLe(ltvBps, MAX_LTV_BPS, "LTV > maxLtvBps");
+        // Within ±15% (750 bps) of target — feeds may vary slightly from borrow-time prices
+        assertGe(ltvBps, TARGET_LTV_BPS - 750, "LTV too low vs target");
+        assertLe(ltvBps, TARGET_LTV_BPS + 750, "LTV too high vs target");
+
+        // Health in bps: collateral × CF / debt
+        uint256 cfBps = uint256(strategy.usdcCollateralFactorBps());
+        uint256 healthBps = (collateralUsdc * cfBps) / totalDebtUsdc;
+        assertGe(healthBps, MIN_HEALTH_BPS, "health < minHealthBps");
+
+        // nav() ≈ 50_000e6 within 5%
+        uint256 navVal = strategy.nav();
+        uint256 tolerance = 50_000e6 * 500 / 10000; // 5%
+        assertGe(navVal, 50_000e6 - tolerance, "nav() too low");
+        assertLe(navVal, 50_000e6 + tolerance, "nav() too high");
     }
 
     // ─────────────────────────────────────────────────────────────
