@@ -834,11 +834,14 @@ contract SyndicateVault is
     /// @notice Active-strategy-only: mint `shares` to a depositor whose assets
     ///         are custodied by the strategy (the strategy oracle-prices the entry).
     ///         Auto-delegates for voting power if the recipient has no delegate.
-    /// @dev Bypasses the vault depositor whitelist (`_openDeposits` /
-    ///      `_approvedDepositors`): the active strategy is the access-control
-    ///      gateway and mints only for deposits it has already vetted.
-    ///      No `nonReentrant`: there is no external call (mint + delegate only).
+    /// @dev Enforces the same depositor whitelist as `_deposit` (`_openDeposits` /
+    ///      `_approvedDepositors`) so the strategy is not a back door around the
+    ///      vault's access control — a closed-deposit vault stays closed even via
+    ///      the strategy. `whenNotPaused` (above) likewise mirrors `_deposit`, so
+    ///      pausing the vault stops LP inflows during an incident. No `nonReentrant`:
+    ///      there is no external call (mint + delegate only).
     function strategyMint(address to, uint256 shares) external onlyActiveStrategy whenNotPaused {
+        if (!_openDeposits && !_approvedDepositors.contains(to)) revert NotApprovedDepositor();
         _mint(to, shares);
         if (delegates(to) == address(0)) _delegate(to, to);
     }

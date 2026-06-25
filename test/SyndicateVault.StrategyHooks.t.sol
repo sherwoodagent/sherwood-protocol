@@ -144,4 +144,24 @@ contract VaultStrategyHooksTest is Test {
         assertEq(vault.balanceOf(address(activeStrategy)), 3e18, "burn should succeed when paused");
         assertEq(vault.totalSupply(), 3e18);
     }
+
+    // ── Test 7: strategyMint enforces the depositor whitelist (not a back door) ──
+
+    function test_strategyMint_enforcesDepositorWhitelist() public {
+        // Close deposits — now only whitelisted receivers may be minted to.
+        vm.prank(owner);
+        vault.setOpenDeposits(false);
+
+        // Non-whitelisted receiver reverts, even via the strategy.
+        vm.prank(activeStrategy);
+        vm.expectRevert(ISyndicateVault.NotApprovedDepositor.selector);
+        vault.strategyMint(alice, 1e18);
+
+        // Whitelist alice → strategyMint succeeds.
+        vm.prank(owner);
+        vault.approveDepositor(alice);
+        vm.prank(activeStrategy);
+        vault.strategyMint(alice, 5e18);
+        assertEq(vault.balanceOf(alice), 5e18, "whitelisted mint should succeed");
+    }
 }
