@@ -11,7 +11,7 @@ import {TickMath} from "../libraries/TickMath.sol";
 import {LiquidityAmounts} from "../libraries/LiquidityAmounts.sol";
 import {ChainlinkReader} from "../libraries/ChainlinkReader.sol";
 import {IMoonwellMarket, IComptroller, ICToken} from "../interfaces/IMoonwellMarket.sol";
-import {ICLPool, ICLGauge, INonfungiblePositionManager} from "../interfaces/ISlipstream.sol";
+import {ICLPool, ICLGauge, INonfungiblePositionManager, ICLSwapRouter} from "../interfaces/ISlipstream.sol";
 import {Position} from "../interfaces/IPriceRouter.sol";
 import {IStrategy} from "../interfaces/IStrategy.sol";
 
@@ -70,6 +70,10 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient 
     error NpmMintFailed();
     /// @notice ERC-721 `approve(gauge, tokenId)` low-level call failed.
     error NpmApproveFailed();
+    /// @notice Moonwell `IMoonwellMarket.repayBorrow()` returned a non-zero Compound error code.
+    error MoonwellRepayFailed(uint256 errCode);
+    /// @notice Moonwell `ICToken.redeem()` returned a non-zero Compound error code.
+    error MoonwellRedeemFailed(uint256 errCode);
 
     // ─────────────────────────────────────────────────────────────
     // Constants
@@ -583,9 +587,197 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient 
         return tick - rem;
     }
 
-    /// @dev Task 3.3: full proportional unwind to the vault.
+    /// @notice Full proportional unwind to the vault.
+    ///
+    ///         Sequence:
+    ///           1. Unstake NFT from AERO gauge (auto-claims accrued AERO).
+    ///           2. Remove 100% liquidity + collect both tokens.
+    ///           3. Repay both Moonwell borrows; handle any IL/fee shortfall via
+    ///              a Chainlink-priced USDC→token swap funded by partial mUSDC redeem.
+    ///           4. Redeem all remaining mUSDC collateral.
+    ///           5. Sweep residual WETH + cbBTC → USDC via exactInputSingle.
+    ///           6. Clear position state (tokenId = 0 restores flat-book invariant).
+    ///           7. Push all USDC back to vault.
     function _settle() internal override {
-        revert NotImplemented();
+        uint256 tid = tokenId;
+        // 1. Unstake (auto-claims AERO via gauge spec)
+        ICLGauge(gauge).withdraw(tid);
+        // 2. Remove 100% liquidity + collect
+        _settleLiquidity(tid);
+        // 3. Repay both Moonwell borrows (handles shortfall)
+        _settleRepayDebts();
+        // 4. Redeem all remaining mUSDC collateral (debt = 0 now)
+        uint256 mBal = ICToken(mUsdc).balanceOf(address(this));
+        if (mBal > 0) {
+            uint256 err = ICToken(mUsdc).redeem(mBal);
+            if (err != 0) revert MoonwellRedeemFailed(err);
+        }
+        // 5. Sweep residual WETH + cbBTC → USDC
+        _swapTokenToUsdc(weth, WETH_DECIMALS, wethFeed);
+        _swapTokenToUsdc(cbBTC, CBBTC_DECIMALS, cbBTCFeed);
+        // 6. Clear position state (flat-book invariant: nav() reads tokenId==0 branch)
+        tokenId = 0;
+        posTickLower = 0;
+        posTickUpper = 0;
+        // 7. Push all USDC back to vault
+        _pushAllToVault(usdc);
+    }
+
+    /// @dev Decrease 100% of the CL position's liquidity and collect both tokens.
+    ///      Two-sided slippage mins are derived from the expected actual deposits at
+    ///      the current sqrtP (same technique as _mintPosition).
+    function _settleLiquidity(uint256 tid) private {
+        (int24 tL, int24 tU, uint128 liq) = _npmPositionData();
+        if (liq == 0) return;
+        (uint160 sqrtP,,,,,) = ICLPool(pool).slot0();
+        uint160 sqrtLower = TickMath.getSqrtRatioAtTick(tL);
+        uint160 sqrtUpper = TickMath.getSqrtRatioAtTick(tU);
+        (uint256 exp0, uint256 exp1) = LiquidityAmounts.getAmountsForLiquidity(sqrtP, sqrtLower, sqrtUpper, liq);
+        uint256 slip = uint256(maxSlippageBps);
+        INonfungiblePositionManager(npm)
+            .decreaseLiquidity(
+                INonfungiblePositionManager.DecreaseLiquidityParams({
+                tokenId: tid,
+                liquidity: liq,
+                amount0Min: exp0 * (10000 - slip) / 10000,
+                amount1Min: exp1 * (10000 - slip) / 10000,
+                deadline: block.timestamp + 600
+            })
+            );
+        INonfungiblePositionManager(npm)
+            .collect(
+                INonfungiblePositionManager.CollectParams({
+                tokenId: tid, recipient: address(this), amount0Max: type(uint128).max, amount1Max: type(uint128).max
+            })
+            );
+    }
+
+    /// @dev Repay as much of both Moonwell borrows as the current token balances allow,
+    ///      then delegate to _settleShortfall() to cover any remaining debt via USDC swap.
+    function _settleRepayDebts() private {
+        address mCbBTC_ = mCbBTC;
+        address mWeth_ = mWeth;
+        address cbBTC_ = cbBTC;
+        address weth_ = weth;
+        uint256 cbDebt = IMoonwellMarket(mCbBTC_).borrowBalanceStored(address(this));
+        uint256 wethDebt = IMoonwellMarket(mWeth_).borrowBalanceStored(address(this));
+        // Repay cbBTC
+        uint256 cbBal = IERC20(cbBTC_).balanceOf(address(this));
+        if (cbBal > 0 && cbDebt > 0) {
+            IERC20(cbBTC_).forceApprove(mCbBTC_, cbBal);
+            uint256 err = IMoonwellMarket(mCbBTC_).repayBorrow(cbBal >= cbDebt ? type(uint256).max : cbBal);
+            if (err != 0) revert MoonwellRepayFailed(err);
+        }
+        // Repay WETH (ERC-20 — no unwrap; mWETH accepts WETH ERC-20 for repay)
+        uint256 wethBal = IERC20(weth_).balanceOf(address(this));
+        if (wethBal > 0 && wethDebt > 0) {
+            IERC20(weth_).forceApprove(mWeth_, wethBal);
+            uint256 err = IMoonwellMarket(mWeth_).repayBorrow(wethBal >= wethDebt ? type(uint256).max : wethBal);
+            if (err != 0) revert MoonwellRepayFailed(err);
+        }
+        // Handle any remaining shortfall (IL or fees ate into LP value)
+        _settleShortfall();
+    }
+
+    /// @dev If any borrow balance remains after the direct repay attempt (shortfall due to
+    ///      IL or fee accumulation), redeem USDC from mUSDC collateral and swap to cover it.
+    ///      Uses Chainlink prices + 10% buffer for the redeem amount; swaps via exactInputSingle.
+    function _settleShortfall() private {
+        uint256 cbDebtRem = IMoonwellMarket(mCbBTC).borrowBalanceStored(address(this));
+        uint256 wethDebtRem = IMoonwellMarket(mWeth).borrowBalanceStored(address(this));
+        if (cbDebtRem == 0 && wethDebtRem == 0) return;
+        // Read Chainlink prices (8dp each)
+        (uint256 pBTC,) = ChainlinkReader.readUsd(cbBTCFeed, sequencerFeed, maxDelay, gracePeriod);
+        (uint256 pETH,) = ChainlinkReader.readUsd(wethFeed, sequencerFeed, maxDelay, gracePeriod);
+        (uint256 pUsdc,) = ChainlinkReader.readUsd(usdcFeed, sequencerFeed, maxDelay, gracePeriod);
+        // USDC needed for each shortfall leg (+10% buffer)
+        uint256 cbUsdcNeed = _tokenToUsdc(cbDebtRem, 8, pBTC, pUsdc) * 11000 / 10000;
+        uint256 wethUsdcNeed = _tokenToUsdc(wethDebtRem, 18, pETH, pUsdc) * 11000 / 10000;
+        uint256 totalNeed = cbUsdcNeed + wethUsdcNeed;
+        // Redeem USDC collateral to fund the swaps (health elevated after partial repays)
+        if (totalNeed > 0) {
+            ICToken(mUsdc).redeemUnderlying(totalNeed);
+        }
+        uint256 slip = uint256(maxSlippageBps);
+        // Cover cbBTC shortfall
+        if (cbDebtRem > 0) {
+            _swapUsdcExactIn(cbBTC, cbUsdcNeed, cbDebtRem * (10000 - slip) / 10000);
+            uint256 cbBal2 = IERC20(cbBTC).balanceOf(address(this));
+            if (cbBal2 > 0) {
+                IERC20(cbBTC).forceApprove(mCbBTC, cbBal2);
+                uint256 err = IMoonwellMarket(mCbBTC).repayBorrow(type(uint256).max);
+                if (err != 0) revert MoonwellRepayFailed(err);
+            }
+        }
+        // Cover WETH shortfall (spend remaining USDC after cbBTC leg)
+        if (wethDebtRem > 0) {
+            uint256 usdcLeft = IERC20(usdc).balanceOf(address(this));
+            _swapUsdcExactIn(weth, usdcLeft, wethDebtRem * (10000 - slip) / 10000);
+            uint256 wBal2 = IERC20(weth).balanceOf(address(this));
+            if (wBal2 > 0) {
+                IERC20(weth).forceApprove(mWeth, wBal2);
+                uint256 err = IMoonwellMarket(mWeth).repayBorrow(type(uint256).max);
+                if (err != 0) revert MoonwellRepayFailed(err);
+            }
+        }
+    }
+
+    /// @dev Swap a fixed USDC amount in for `tokenOut` via Slipstream exactInputSingle.
+    ///      Caps actualIn at the current USDC balance so a shortfall redeem shortfall
+    ///      cannot cause a revert — we swap whatever USDC we have.
+    ///      USDC/WETH and USDC/cbBTC pools both use tickSpacing=100 (fork-confirmed).
+    function _swapUsdcExactIn(address tokenOut, uint256 amountIn, uint256 minAmtOut) private {
+        uint256 usdcBal = IERC20(usdc).balanceOf(address(this));
+        uint256 actualIn = usdcBal < amountIn ? usdcBal : amountIn;
+        if (actualIn == 0) return;
+        IERC20(usdc).forceApprove(swapRouter, actualIn);
+        ICLSwapRouter(swapRouter)
+            .exactInputSingle(
+                ICLSwapRouter.ExactInputSingleParams({
+                tokenIn: usdc,
+                tokenOut: tokenOut,
+                tickSpacing: int24(100),
+                recipient: address(this),
+                deadline: block.timestamp + 600,
+                amountIn: actualIn,
+                amountOutMinimum: minAmtOut,
+                sqrtPriceLimitX96: 0
+            })
+            );
+    }
+
+    /// @dev Sweep the full balance of `tokenIn` to USDC via Slipstream exactInputSingle.
+    ///      Chainlink price bounds the minimum out; used to sweep residual WETH + cbBTC
+    ///      after debt repayment completes.
+    function _swapTokenToUsdc(address tokenIn, uint8 decimals, address priceFeed) private {
+        uint256 bal = IERC20(tokenIn).balanceOf(address(this));
+        if (bal == 0) return;
+        (uint256 pToken,) = ChainlinkReader.readUsd(priceFeed, sequencerFeed, maxDelay, gracePeriod);
+        (uint256 pUsdc,) = ChainlinkReader.readUsd(usdcFeed, sequencerFeed, maxDelay, gracePeriod);
+        uint256 expectedUsdc = _tokenToUsdc(bal, decimals, pToken, pUsdc);
+        uint256 minOut = expectedUsdc * (10000 - uint256(maxSlippageBps)) / 10000;
+        IERC20(tokenIn).forceApprove(swapRouter, bal);
+        ICLSwapRouter(swapRouter)
+            .exactInputSingle(
+                ICLSwapRouter.ExactInputSingleParams({
+                tokenIn: tokenIn,
+                tokenOut: usdc,
+                tickSpacing: int24(100),
+                recipient: address(this),
+                deadline: block.timestamp + 600,
+                amountIn: bal,
+                amountOutMinimum: minOut,
+                sqrtPriceLimitX96: 0
+            })
+            );
+    }
+
+    /// @dev Convert `amt` (in `dec`-decimal token units) to USDC (6dp) using Chainlink prices.
+    ///      pToken and pUsdc are both 8dp (standard Chainlink USD feeds).
+    ///
+    ///      amt(dec) × pToken(8dp) / 10^dec = USD(8dp); × 1e6 / pUsdc = USDC(6dp)
+    function _tokenToUsdc(uint256 amt, uint8 dec, uint256 pToken, uint256 pUsdc) private pure returns (uint256) {
+        return (amt * pToken * 1e6) / ((10 ** uint256(dec)) * pUsdc);
     }
 
     /// @dev Tunable param updates (Task 3.6+).

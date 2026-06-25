@@ -278,6 +278,57 @@ contract LeveragedAeroCLDeployFork is LeveragedAeroForkBase {
         assertLe(navVal, 50_000e6 + tolerance, "nav() too high");
     }
 
+    /// @notice Full settle unwind returns principal to vault and clears all position state.
+    ///
+    ///         Checks:
+    ///           - Both Moonwell borrow balances reach 0.
+    ///           - tokenId cleared to 0.
+    ///           - Vault receives ≥95% and ≤101% of the 50k USDC principal
+    ///             (round-trip swap costs + 1% slippage + IL bounded by range).
+    ///           - No meaningful WETH or cbBTC residual remains in the strategy.
+    function test_settle_returnsPrincipalAndClears() public {
+        if (_skip) return;
+
+        uint256 principal = 50_000e6;
+
+        // ── Open position ──
+        _fundUSDC(address(strategy), principal);
+        vm.prank(fakeVault);
+        strategy.execute();
+
+        // Sanity: position is open
+        assertGt(strategy.tokenId(), 0, "tokenId should be non-zero after execute");
+
+        // ── Settle ──
+        vm.prank(fakeVault);
+        strategy.settle();
+
+        // ── Assert: both Moonwell debts cleared ──
+        assertEq(
+            IMoonwellMarket(BaseAddresses.MOONWELL_MCBBTC).borrowBalanceStored(address(strategy)),
+            0,
+            "cbBTC debt not fully repaid"
+        );
+        assertEq(
+            IMoonwellMarket(BaseAddresses.MOONWELL_MWETH).borrowBalanceStored(address(strategy)),
+            0,
+            "WETH debt not fully repaid"
+        );
+
+        // ── Assert: position cleared ──
+        assertEq(strategy.tokenId(), 0, "tokenId not cleared after settle");
+
+        // ── Assert: vault received ≈ principal (95%–101%) ──
+        uint256 vaultUsdc = IERC20(BaseAddresses.USDC).balanceOf(fakeVault);
+        assertGe(vaultUsdc, principal * 9500 / 10000, "vault received < 95% of principal");
+        assertLe(vaultUsdc, principal * 10100 / 10000, "vault received > 101% of principal");
+
+        // ── Assert: no meaningful residual in strategy ──
+        assertLt(IERC20(BaseAddresses.USDC).balanceOf(address(strategy)), 1e6, "USDC residual in strategy");
+        assertLt(IERC20(BaseAddresses.WETH).balanceOf(address(strategy)), 1e15, "WETH residual in strategy");
+        assertLt(IERC20(BaseAddresses.CBBTC).balanceOf(address(strategy)), 1000, "cbBTC residual in strategy");
+    }
+
     // ─────────────────────────────────────────────────────────────
     // Internal helpers
     // ─────────────────────────────────────────────────────────────
