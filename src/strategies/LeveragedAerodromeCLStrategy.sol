@@ -56,8 +56,10 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient 
     error MaxLtvExceedsCF();
     /// @notice Low-level call to `Comptroller.markets(mUsdc)` failed or returned short data.
     error ComptrollerCallFailed();
-    /// @notice Post-operation health or LTV is out of bounds.
-    error UnhealthyPosition();
+    /// @notice Post-operation LTV exceeds `maxLtvBps`, or Moonwell reports a shortfall.
+    /// @param ltvBps    Actual LTV in bps at the time of the check.
+    /// @param limitBps  The `maxLtvBps` cap that was exceeded.
+    error UnhealthyPosition(uint256 ltvBps, uint256 limitBps);
     /// @notice Low-level call to `npm.positions(tokenId)` failed or returned short data.
     error InvalidNpmReturn();
     /// @notice No USDC balance to deploy at execute time.
@@ -441,13 +443,13 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient 
     ///           5. Mint a Slipstream CL position straddling current tick (±RANGE_TICK_SPACINGS).
     ///           6. Stake the NFT in the AERO gauge.
     ///           7. Store tokenId + ticks.
-    ///
-    ///         `_assertHealthy()` (Task 3.4) is wired in here once implemented.
+    ///           8. Assert post-op LTV ≤ maxLtvBps and Moonwell reports no shortfall.
     function _execute() internal override {
         uint256 usdcAmt = _supplyCollateral();
         (uint256 cbBTCAmt, uint256 wethAmt) = _computeAndBorrow(usdcAmt);
         _wrapNativeEth();
         _mintAndStake(cbBTCAmt, wethAmt);
+        _assertHealthy();
     }
 
     /// @dev Supply all strategy USDC to Moonwell and enter the mUSDC market.
@@ -779,6 +781,54 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient 
     ///      amt(dec) × pToken(8dp) / 10^dec = USD(8dp); × 1e6 / pUsdc = USDC(6dp)
     function _tokenToUsdc(uint256 amt, uint8 dec, uint256 pToken, uint256 pUsdc) private pure returns (uint256) {
         return (amt * pToken * 1e6) / ((10 ** uint256(dec)) * pUsdc);
+    }
+
+    /// @notice Post-operation LTV + Moonwell-liquidity invariant.
+    ///         Reverts `UnhealthyPosition(ltvBps, limitBps)` if:
+    ///           (a) debtUsd / collateralUsd (Chainlink-priced, both USDC 6dp) exceeds `maxLtvBps`, OR
+    ///           (b) Moonwell `getAccountLiquidity` reports any shortfall (belt check).
+    ///
+    ///         Scaling mirrors `LeveragedAeroValuation` exactly:
+    ///           collateralUsd = mUsdc.balanceOf(this) × exchangeRateStored / 1e18   (USDC 6dp face)
+    ///           debtUsd       = borrowBalanceStored(cbBTC market) × P_cbBTC
+    ///                         + borrowBalanceStored(WETH market)  × P_WETH
+    ///                         each via `_tokenToUsdc` (same helper already in this contract)
+    ///
+    ///         Called at the end of `_execute`.  Later tasks wire it into deployIdle /
+    ///         adjustLeverage / deleverage / redeem's post-unwind as well.
+    function _assertHealthy() internal view {
+        // ── Collateral (USDC face, 6dp) — mirrors LeveragedAeroValuation._collateralUsdc ──
+        address mUsdc_ = mUsdc;
+        uint256 cBal = ICToken(mUsdc_).balanceOf(address(this));
+        uint256 rate = ICToken(mUsdc_).exchangeRateStored();
+        uint256 collateralUsd = (cBal * rate) / 1e18;
+
+        // ── Raw borrow balances ──
+        uint256 cbDebt = IMoonwellMarket(mCbBTC).borrowBalanceStored(address(this));
+        uint256 wethDebt = IMoonwellMarket(mWeth).borrowBalanceStored(address(this));
+        if (cbDebt == 0 && wethDebt == 0) return; // no debt → trivially healthy (skip oracle)
+
+        // ── Price via hardened Chainlink (same feeds + staleness guards as nav()) ──
+        (uint256 pBTC,) = ChainlinkReader.readUsd(cbBTCFeed, sequencerFeed, maxDelay, gracePeriod);
+        (uint256 pETH,) = ChainlinkReader.readUsd(wethFeed, sequencerFeed, maxDelay, gracePeriod);
+        (uint256 pUsdc,) = ChainlinkReader.readUsd(usdcFeed, sequencerFeed, maxDelay, gracePeriod);
+
+        // ── Debt (USDC face, 6dp) ──
+        uint256 debtUsd =
+            _tokenToUsdc(cbDebt, CBBTC_DECIMALS, pBTC, pUsdc) + _tokenToUsdc(wethDebt, WETH_DECIMALS, pETH, pUsdc);
+        if (debtUsd == 0) return; // dust-level debt rounds to 0 → trivially healthy
+
+        // ── LTV check — binding post-op gate ──
+        uint16 maxLtv = maxLtvBps;
+        // Zero collateral with non-zero debt is maximally unhealthy
+        if (collateralUsd == 0) revert UnhealthyPosition(type(uint256).max, uint256(maxLtv));
+        uint256 ltvBps_ = (debtUsd * 10_000) / collateralUsd;
+        if (ltvBps_ > uint256(maxLtv)) revert UnhealthyPosition(ltvBps_, uint256(maxLtv));
+
+        // ── Moonwell belt: authoritative no-liquidation check ──
+        // `getAccountLiquidity` uses Moonwell's own oracle + CF factors → definitive last word.
+        (uint256 err,, uint256 shortfall) = IComptroller(comptroller).getAccountLiquidity(address(this));
+        if (err != 0 || shortfall != 0) revert UnhealthyPosition(ltvBps_, uint256(maxLtv));
     }
 
     /// @dev Tunable param updates (Task 3.6+).

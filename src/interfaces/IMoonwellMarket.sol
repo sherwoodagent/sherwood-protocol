@@ -27,4 +27,14 @@ interface IComptroller {
     /// @param mTokens Array of mToken addresses to enter.
     /// @return Array of Compound error codes (0 = success per market).
     function enterMarkets(address[] calldata mTokens) external returns (uint256[] memory);
+
+    /// @notice Returns the account's excess collateral or shortfall after the virtual borrow.
+    ///         Used by `_assertHealthy` as an authoritative Moonwell liquidation-status check.
+    /// @return err       0 on success; non-zero = Compound error code (treat as unhealthy).
+    /// @return liquidity Excess USDC collateral above requirements (18dp scaled).
+    /// @return shortfall USDC shortfall (18dp scaled); > 0 means the account is liquidatable.
+    function getAccountLiquidity(address account)
+        external
+        view
+        returns (uint256 err, uint256 liquidity, uint256 shortfall);
 }

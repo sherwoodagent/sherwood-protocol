@@ -12,7 +12,8 @@ import {Position} from "../../../src/interfaces/IPriceRouter.sol";
 import {IAggregatorV3} from "../../../src/interfaces/IAggregatorV3.sol";
 import {IMoonwellMarket} from "../../../src/interfaces/IMoonwellMarket.sol";
 import {ICToken} from "../../../src/interfaces/ICToken.sol";
-import {ICLPool, INonfungiblePositionManager} from "../../../src/interfaces/ISlipstream.sol";
+import {ICLPool, ICLSwapRouter, INonfungiblePositionManager} from "../../../src/interfaces/ISlipstream.sol";
+import {TickMath} from "../../../src/libraries/TickMath.sol";
 
 /// @title  LeveragedAeroCLDeployFork
 /// @notice Task 3.1 TDD: deploy the skeleton, initialize with confirmed params,
@@ -401,6 +402,66 @@ contract LeveragedAeroCLDeployFork is LeveragedAeroForkBase {
 
         // ── Assert: tokenId cleared ──
         assertEq(strategy.tokenId(), 0, "tokenId not cleared after shoved settle");
+    }
+
+    /// @notice Oracle NAV is resistant to tick manipulation:
+    ///         after shoving the pool tick 300 ticks down (via sqrtPriceLimitX96),
+    ///         `strategy.nav()` should stay within 1 % of its pre-shove value.
+    ///
+    ///         The oracle-implied sqrtP (derived from Chainlink prices) is used for
+    ///         the CL-leg split — NOT the manipulable pool slot0 sqrtP — so a tick
+    ///         shove cannot change the NAV as long as Chainlink prices are unchanged.
+    ///         A 300-tick shove is within the 500-tick calm gate, so nav() returns
+    ///         normally rather than reverting with CalmGateBreached.
+    function test_nav_invariantUnderTickShove() public {
+        if (_skip) return;
+
+        // ── Open leveraged position ──
+        _fundUSDC(address(strategy), 50_000e6);
+        vm.prank(fakeVault);
+        strategy.execute();
+
+        uint256 navBefore = strategy.nav();
+        assertGt(navBefore, 0, "navBefore should be > 0");
+
+        // ── Shove the pool tick 300 ticks down ──
+        // Use sqrtPriceLimitX96 = getSqrtRatioAtTick(currentTick - 300) so the swap
+        // stops exactly 300 ticks below current rather than running to exhaustion.
+        (, int24 currentTick,,,,) = ICLPool(BaseAddresses.CBBTC_WETH_POOL).slot0();
+        uint160 sqrtPriceLimit = TickMath.getSqrtRatioAtTick(currentTick - 300);
+
+        address shover = makeAddr("tick_shover");
+        uint256 shoveAmt = 1_000e18; // large enough to reach the sqrtP limit
+        _fundWETH(shover, shoveAmt);
+
+        vm.startPrank(shover);
+        IERC20(BaseAddresses.WETH).approve(BaseAddresses.SLIPSTREAM_CL_SWAP_ROUTER, shoveAmt);
+        ICLSwapRouter(BaseAddresses.SLIPSTREAM_CL_SWAP_ROUTER)
+            .exactInputSingle(
+                ICLSwapRouter.ExactInputSingleParams({
+                tokenIn: BaseAddresses.WETH,
+                tokenOut: BaseAddresses.CBBTC,
+                tickSpacing: BaseAddresses.CBBTC_WETH_TICK_SPACING,
+                recipient: shover,
+                deadline: block.timestamp + 600,
+                amountIn: shoveAmt,
+                amountOutMinimum: 0,
+                sqrtPriceLimitX96: sqrtPriceLimit
+            })
+            );
+        vm.stopPrank();
+
+        // Sanity: confirm the tick moved.
+        (, int24 newTick,,,,) = ICLPool(BaseAddresses.CBBTC_WETH_POOL).slot0();
+        assertLt(newTick, currentTick, "pool tick should have moved down after WETH shove");
+
+        // ── Oracle NAV should be stable (within 1 %) ──
+        // The CL-leg split uses Chainlink-derived sqrtP, not the manipulated pool sqrtP,
+        // so a tick shove that doesn't change oracle prices cannot change the NAV.
+        uint256 navAfter = strategy.nav();
+        uint256 tolerance = navBefore / 100; // 1 %
+        assertGe(navAfter, navBefore - tolerance, "NAV dropped > 1 % under 300-tick shove");
+        assertLe(navAfter, navBefore + tolerance, "NAV rose > 1 % under 300-tick shove");
     }
 
     // ─────────────────────────────────────────────────────────────
