@@ -49,6 +49,8 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient 
     error ComptrollerCallFailed();
     /// @notice Post-operation health or LTV is out of bounds.
     error UnhealthyPosition();
+    /// @notice Low-level call to `npm.positions(tokenId)` failed or returned short data.
+    error InvalidNpmReturn();
 
     // ─────────────────────────────────────────────────────────────
     // Constants
@@ -366,13 +368,16 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient 
     ///
     ///      Memory layout of `ret` (bytes): [length @ offset 0][data start @ offset 0x20].
     ///      Field at index N starts at `ret + 0x20 + N * 0x20`.
-    function _npmPositionData() private view returns (int24 tickLower, int24 tickUpper, uint128 liquidity) {
+    function _npmPositionData() internal view returns (int24 tickLower, int24 tickUpper, uint128 liquidity) {
         address npm_ = npm;
         uint256 tokenId_ = tokenId;
         bool ok;
         bytes memory ret;
         (ok, ret) = npm_.staticcall(abi.encodeWithSelector(INonfungiblePositionManager.positions.selector, tokenId_));
-        if (!ok) revert();
+        if (!ok) revert InvalidNpmReturn();
+        // Require at least 9 full words of returndata (0x120 bytes) so the mload
+        // at offset 0x100 (field 7, liquidity) cannot read past the allocated buffer.
+        if (ret.length < 0x120) revert InvalidNpmReturn();
         // solhint-disable-next-line no-inline-assembly
         assembly {
             // ret + 0x20 = start of returndata; field 5 = +0x20+5*0x20 = +0xC0
