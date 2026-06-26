@@ -14,6 +14,9 @@ import {IMoonwellMarket, IComptroller, ICToken} from "../interfaces/IMoonwellMar
 import {ICLPool, ICLGauge, INonfungiblePositionManager, ICLSwapRouter} from "../interfaces/ISlipstream.sol";
 import {Position} from "../interfaces/IPriceRouter.sol";
 import {IStrategy} from "../interfaces/IStrategy.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+import {LeveragedAeroFees} from "./LeveragedAeroFees.sol";
+import {ISyndicateVault} from "../interfaces/ISyndicateVault.sol";
 
 /// @dev Minimal WETH9 interface — deposit wraps native ETH into ERC-20 WETH.
 interface IWETH9 {
@@ -76,6 +79,10 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient 
     error MoonwellRepayFailed(uint256 errCode);
     /// @notice Moonwell `ICToken.redeem()` returned a non-zero Compound error code.
     error MoonwellRedeemFailed(uint256 errCode);
+    /// @notice `deposit` returned fewer shares than `minShares`.
+    error InsufficientShares();
+    /// @notice `deployIdle` produced less liquidity than `minLiquidity`.
+    error InsufficientLiquidity();
 
     // ─────────────────────────────────────────────────────────────
     // Constants
@@ -93,6 +100,11 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient 
     /// @dev Number of tick-spacings on each side of the current tick for the initial CL range.
     ///      Mirrors the harness `_openRealBook` range of ±20 tickSpacings.
     uint8 private constant RANGE_TICK_SPACINGS = 20;
+
+    /// @dev ERC-4626 virtual share offset matching the vault's `_decimalsOffset()`.
+    ///      USDC has 6 decimals → _decimalsOffset = 6 → OFFSET = 1e6.
+    ///      Deposit share formula: shares = mulDiv(assets, supply + OFFSET, nav + 1).
+    uint256 private constant SHARES_VIRTUAL_OFFSET = 1e6;
 
     // ─────────────────────────────────────────────────────────────
     // Initialisation params struct
@@ -450,6 +462,10 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient 
         _wrapNativeEth();
         _mintAndStake(cbBTCAmt, wethAmt);
         _assertHealthy();
+        // Part 0 belt-and-suspenders: ensure the fee accrual clock is running.
+        // _initialize already seeds this; this guard prevents a ~54-year dt on the
+        // first crystallize if (somehow) a clone bypasses _initialize.
+        if (lastFeeAccrualTimestamp == 0) lastFeeAccrualTimestamp = block.timestamp;
     }
 
     /// @dev Supply all strategy USDC to Moonwell and enter the mUSDC market.
@@ -829,6 +845,118 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient 
         // `getAccountLiquidity` uses Moonwell's own oracle + CF factors → definitive last word.
         (uint256 err,, uint256 shortfall) = IComptroller(comptroller).getAccountLiquidity(address(this));
         if (err != 0 || shortfall != 0) revert UnhealthyPosition(ltvBps_, uint256(maxLtv));
+    }
+
+    /// @dev Crystallise management + HWM performance fees on the PRE-ACTION vault state.
+    ///      Must be the FIRST call in deposit/redeem so no incoming capital inflates the HWM.
+    function _crystallizeFees() private {
+        uint256 ts = IERC20(vault()).totalSupply();
+        if (ts == 0) return;
+        if (lastFeeAccrualTimestamp == 0) {
+            lastFeeAccrualTimestamp = block.timestamp;
+            return;
+        }
+        uint256 navPre = nav();
+        (uint256 feeShares, uint256 newHwm, uint256 newLast) = LeveragedAeroFees.crystallize(
+            navPre,
+            ts,
+            hwmPerShare,
+            lastFeeAccrualTimestamp,
+            block.timestamp,
+            uint256(managementFeeBps),
+            uint256(performanceFeeBps)
+        );
+        hwmPerShare = newHwm;
+        lastFeeAccrualTimestamp = newLast;
+        if (feeShares > 0) ISyndicateVault(vault()).strategyMint(feeRecipient, feeShares);
+    }
+
+    /// @notice Oracle-priced deposit: mint vault shares proportional to current NAV.
+    ///
+    ///         Call ordering is load-bearing ([1] phantom-fee fix):
+    ///           1. Crystallise fees on the PRE-deposit NAV, before USDC is pulled.
+    ///           2. Read post-crystallise NAV (fail-closed: reverts on oracle failure).
+    ///           3. Pull USDC from caller.
+    ///           4. Compute shares via ERC-4626 virtual-offset formula.
+    ///           5. Mint shares via vault.strategyMint.
+    ///
+    ///         The deposited USDC sits idle in the strategy until a proposer calls
+    ///         `deployIdle()` to add it to the levered position.
+    ///
+    /// @param assets    USDC to deposit (6 dp).
+    /// @param minShares Minimum vault shares to receive (slippage guard).
+    /// @return shares   Vault shares minted to msg.sender.
+    function deposit(uint256 assets, uint256 minShares) external nonReentrant returns (uint256 shares) {
+        if (_state != State.Executed) revert NotExecuted();
+        _crystallizeFees();
+        uint256 navPre = nav();
+        IERC20(usdc).safeTransferFrom(msg.sender, address(this), assets);
+        address vault_ = vault();
+        uint256 supply = IERC20(vault_).totalSupply();
+        shares = Math.mulDiv(assets, supply + SHARES_VIRTUAL_OFFSET, navPre + 1);
+        if (shares < minShares) revert InsufficientShares();
+        ISyndicateVault(vault_).strategyMint(msg.sender, shares);
+    }
+
+    /// @notice Deploy `amount` of idle strategy USDC into the existing levered position.
+    ///
+    ///         Sequence:
+    ///           1. Supply `amount` USDC to Moonwell mUSDC as additional collateral.
+    ///           2. Borrow cbBTC + WETH at `targetLtvBps` (reuses `_computeAndBorrow`).
+    ///           3. Wrap native ETH from the WETH borrow.
+    ///           4. Add liquidity to the existing CL position via NPM.increaseLiquidity.
+    ///           5. Assert post-op health invariant.
+    ///
+    /// @param amount       USDC to deploy (6 dp). Must be ≤ idle USDC in strategy.
+    /// @param minLiquidity Minimum liquidity units to accept (slippage guard).
+    function deployIdle(uint256 amount, uint256 minLiquidity) external onlyProposer nonReentrant {
+        if (_state != State.Executed) revert NotExecuted();
+        _supplyAmount(amount);
+        (uint256 cbBTCAmt, uint256 wethAmt) = _computeAndBorrow(amount);
+        _wrapNativeEth();
+        _addLiquidity(wethAmt, cbBTCAmt, minLiquidity);
+        _assertHealthy();
+    }
+
+    /// @dev Supply a specific USDC amount to Moonwell mUSDC.
+    ///      Unlike `_supplyCollateral`, this does NOT read the full balance and does
+    ///      NOT call enterMarkets (already called in _execute).
+    function _supplyAmount(uint256 amt) private {
+        IERC20(usdc).forceApprove(mUsdc, amt);
+        uint256 err = ICToken(mUsdc).mint(amt);
+        if (err != 0) revert MoonwellMintFailed(err);
+    }
+
+    /// @dev Add liquidity to the existing tokenId position via NPM.increaseLiquidity.
+    ///      Applies the same calm-gate + expected-actuals two-sided mins as `_mintPosition`.
+    ///      token0 = WETH (18dp), token1 = cbBTC (8dp) — same ordering as the initial mint.
+    ///
+    ///      Note: NPM.increaseLiquidity does NOT require token ownership — it pulls tokens
+    ///      from msg.sender and updates the pool position.  The gauge holding the NFT does
+    ///      not prevent additional liquidity from being added.
+    function _addLiquidity(uint256 wethAmt, uint256 cbBTCAmt, uint256 minLiquidity) private {
+        LeveragedAeroValuation._calmGate(_cfg());
+        uint256 tid = tokenId;
+        (uint160 sqrtP,,,,,) = ICLPool(pool).slot0();
+        uint160 sqrtLower = TickMath.getSqrtRatioAtTick(posTickLower);
+        uint160 sqrtUpper = TickMath.getSqrtRatioAtTick(posTickUpper);
+        uint128 L = LiquidityAmounts.getLiquidityForAmounts(sqrtP, sqrtLower, sqrtUpper, wethAmt, cbBTCAmt);
+        (uint256 exp0, uint256 exp1) = LiquidityAmounts.getAmountsForLiquidity(sqrtP, sqrtLower, sqrtUpper, L);
+        uint256 slip = uint256(maxSlippageBps);
+        IERC20(weth).forceApprove(npm, wethAmt);
+        IERC20(cbBTC).forceApprove(npm, cbBTCAmt);
+        (uint128 liq,,) = INonfungiblePositionManager(npm)
+            .increaseLiquidity(
+                INonfungiblePositionManager.IncreaseLiquidityParams({
+                tokenId: tid,
+                amount0Desired: wethAmt,
+                amount1Desired: cbBTCAmt,
+                amount0Min: exp0 * (10000 - slip) / 10000,
+                amount1Min: exp1 * (10000 - slip) / 10000,
+                deadline: block.timestamp + 600
+            })
+            );
+        if (uint256(liq) < minLiquidity) revert InsufficientLiquidity();
     }
 
     /// @dev Tunable param updates (Task 3.6+).
