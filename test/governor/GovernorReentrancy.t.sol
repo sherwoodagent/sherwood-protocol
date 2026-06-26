@@ -138,14 +138,7 @@ contract GovernorReentrancyTest is Test {
     function _propose() internal returns (uint256 pid) {
         vm.prank(agent);
         pid = governor.propose(
-            address(vault),
-            address(0),
-            "ipfs://reentry",
-            1500,
-            7 days,
-            _execCalls(),
-            _settleCalls(),
-            _emptyCoProposers()
+            address(vault), address(0), "ipfs://reentry", 7 days, _execCalls(), _settleCalls(), _emptyCoProposers()
         );
         vm.warp(vm.getBlockTimestamp() + 1);
     }

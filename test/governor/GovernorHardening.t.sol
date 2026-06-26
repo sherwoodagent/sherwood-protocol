@@ -143,7 +143,7 @@ contract GovernorHardeningTest is Test {
 
         vm.prank(leadAgent);
         proposalId =
-            governor.propose(address(vault), address(0), "ipfs://gh2", 1000, 7 days, _execCalls(), _settleCalls(), cps);
+            governor.propose(address(vault), address(0), "ipfs://gh2", 7 days, _execCalls(), _settleCalls(), cps);
     }
 
     /// @dev Create a 2-party collab: lead + 1 co-prop to land in Draft quickly.
@@ -151,9 +151,8 @@ contract GovernorHardeningTest is Test {
         ISyndicateGovernor.CoProposer[] memory cps = new ISyndicateGovernor.CoProposer[](1);
         cps[0] = ISyndicateGovernor.CoProposer({agent: co1, splitBps: 3000});
         vm.prank(leadAgent);
-        proposalId = governor.propose(
-            address(vault), address(0), "ipfs://draft", 1000, 7 days, _execCalls(), _settleCalls(), cps
-        );
+        proposalId =
+            governor.propose(address(vault), address(0), "ipfs://draft", 7 days, _execCalls(), _settleCalls(), cps);
     }
 
     // ==================== FIX 2 — G-H3 ====================
@@ -212,7 +211,6 @@ contract GovernorHardeningTest is Test {
             address(vault),
             address(0),
             "ipfs://snap",
-            1500,
             7 days,
             _execCalls(),
             _settleCalls(),
@@ -309,7 +307,6 @@ contract GovernorHardeningTest is Test {
             address(vault),
             address(0),
             "ipfs://empty",
-            1500,
             7 days,
             _execCalls(),
             _settleCalls(),
@@ -395,7 +392,6 @@ contract GovernorHardeningTest is Test {
             address(vault),
             address(0),
             "ipfs://term",
-            1500,
             7 days,
             _execCalls(),
             _settleCalls(),
@@ -495,7 +491,6 @@ contract GovernorHardeningTest is Test {
             address(vault),
             address(0),
             "ipfs://big",
-            1500,
             7 days,
             oversized,
             _settleCalls(),
@@ -514,7 +509,6 @@ contract GovernorHardeningTest is Test {
             address(vault),
             address(0),
             "ipfs://big",
-            1500,
             7 days,
             _execCalls(),
             oversized,
@@ -541,7 +535,6 @@ contract GovernorHardeningTest is Test {
             address(vault),
             address(0),
             string(tooLong),
-            1000,
             7 days,
             _execCalls(),
             _settleCalls(),
@@ -566,7 +559,6 @@ contract GovernorHardeningTest is Test {
             address(vault),
             address(0),
             "ipfs://dup",
-            1500,
             7 days,
             _execCalls(),
             _settleCalls(),
@@ -584,7 +576,7 @@ contract GovernorHardeningTest is Test {
         ISyndicateGovernor.CoProposer[] memory cps = new ISyndicateGovernor.CoProposer[](1);
         cps[0] = ISyndicateGovernor.CoProposer({agent: co1, splitBps: 3000});
         vm.prank(leadAgent);
-        governor.propose(address(vault), address(0), "ipfs://draft", 1000, 7 days, _execCalls(), _settleCalls(), cps);
+        governor.propose(address(vault), address(0), "ipfs://draft", 7 days, _execCalls(), _settleCalls(), cps);
 
         // Vault already has a counted Draft — a second propose reverts.
         vm.prank(co2);
@@ -593,7 +585,6 @@ contract GovernorHardeningTest is Test {
             address(vault),
             address(0),
             "ipfs://pending",
-            1500,
             7 days,
             _execCalls(),
             _settleCalls(),

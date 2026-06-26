@@ -190,10 +190,11 @@ contract FeeBlacklistHandler is Test {
         // batch exists.
         BatchExecutorLib.Call[] memory calls = _noopCalls();
 
+        vm.prank(vaultOwner);
+        vault.setAgentFeeBps(perfFeeBps);
         vm.prank(leadAgent);
-        uint256 proposalId = governor.propose(
-            address(vault), address(0), "ipfs://test", perfFeeBps, strategyDuration, calls, calls, coProps
-        );
+        uint256 proposalId =
+            governor.propose(address(vault), address(0), "ipfs://test", strategyDuration, calls, calls, coProps);
 
         // Move past the snapshot block so checkpoints are readable.
         vm.warp(vm.getBlockTimestamp() + 1);

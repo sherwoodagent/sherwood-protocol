@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import {ISyndicateGovernor} from "./interfaces/ISyndicateGovernor.sol";
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import {FeeConstants} from "./FeeConstants.sol";
 
 /**
  * @title GovernorParameters
@@ -31,7 +32,7 @@ abstract contract GovernorParameters is ISyndicateGovernor, OwnableUpgradeable {
     uint256 public constant MAX_EXECUTION_WINDOW = 7 days;
     uint256 public constant MIN_VETO_THRESHOLD_BPS = 1000; // 10%
     uint256 public constant MAX_VETO_THRESHOLD_BPS = 5000; // 50%
-    uint256 public constant MAX_PERFORMANCE_FEE_CAP = 1500; // 15%
+    uint256 public constant MAX_PERFORMANCE_FEE_CAP = FeeConstants.MAX_PERFORMANCE_FEE_BPS; // 15%
     uint256 public constant ABSOLUTE_MIN_STRATEGY_DURATION = 1 hours;
     uint256 public constant ABSOLUTE_MAX_STRATEGY_DURATION = 3650 days; // ~10y: supports indefinitely-lived strategies (e.g. leveraged Aerodrome CL)
     uint256 public constant MIN_COOLDOWN_PERIOD = 1 hours;

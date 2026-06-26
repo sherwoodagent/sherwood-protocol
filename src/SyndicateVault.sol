@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import {ISyndicateVault} from "./interfaces/ISyndicateVault.sol";
 import {ISyndicateGovernor} from "./interfaces/ISyndicateGovernor.sol";
+import {FeeConstants} from "./FeeConstants.sol";
 import {ISyndicateFactory} from "./interfaces/ISyndicateFactory.sol";
 import {IVaultWithdrawalQueue} from "./interfaces/IVaultWithdrawalQueue.sol";
 import {IPriceRouter} from "./interfaces/IPriceRouter.sol";
@@ -69,6 +70,16 @@ contract SyndicateVault is
     ///         fits comfortably in any block. `removeAgent` frees a slot.
     uint256 public constant MAX_AGENTS_PER_VAULT = 32;
 
+    /// @notice Hard cap on the vault-owner-set agent performance fee (15%),
+    ///         equal to the governor's `MAX_PERFORMANCE_FEE_CAP` — the protocol
+    ///         ceiling on `maxPerformanceFeeBps`. The governor additionally
+    ///         clamps the realized fee to its (lower, tunable) configured
+    ///         `maxPerformanceFeeBps` at settlement, so a stored value above the
+    ///         live param is never charged. Capping here at the same ceiling
+    ///         keeps `agentFeeBps()` from advertising a rate that can never be
+    ///         realized (PR #384 review C4).
+    uint256 public constant MAX_AGENT_FEE_BPS = FeeConstants.MAX_PERFORMANCE_FEE_BPS;
+
     // ==================== STORAGE ====================
 
     /// @notice Agent address => agent config
@@ -121,8 +132,19 @@ contract SyndicateVault is
     ///         (G1). Cleared implicitly when the proposal settles (active != pid).
     mapping(address holder => uint256 pid) private _laneALockPid;
 
-    /// @dev Reserved storage for future upgrades.
-    uint256[36] private __gap;
+    /// @notice Vault-owner-set agent performance fee, stored offset-by-one so a
+    ///         single slot doubles as the "is it set?" flag: 0 = never set →
+    ///         `agentFeeBps()` returns `FeeConstants.DEFAULT_AGENT_FEE_BPS` (5%);
+    ///         otherwise the stored value is `fee + 1`, so an explicit 0% (a
+    ///         stored 1) stays distinct from unset. Collapses the former
+    ///         `_agentFeeBps` + `_agentFeeSet` pair into one SLOAD on the propose
+    ///         hot path. Snapshotted onto a proposal at propose (clamped to the
+    ///         governor's `maxPerformanceFeeBps`); set via `setAgentFeeBps`.
+    uint256 private _agentFeeBpsPlusOne;
+
+    /// @dev Reserved storage for future upgrades. Grew 34 → 35 when the
+    ///      `_agentFeeSet` bool slot was reclaimed (PR #384 review pass 3).
+    uint256[35] private __gap;
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -145,6 +167,8 @@ contract SyndicateVault is
         _openDeposits = p.openDeposits;
         _agentRegistry = IERC721(p.agentRegistry);
         _managementFeeBps = p.managementFeeBps;
+        // _agentFeeBpsPlusOne left 0 (unset) → agentFeeBps() returns the 5%
+        // default until the owner calls setAgentFeeBps (no init SSTORE needed).
         _factory = msg.sender;
         _cachedDecimalsOffset = IERC20Metadata(p.asset).decimals();
     }
@@ -464,6 +488,24 @@ contract SyndicateVault is
     /// @inheritdoc ISyndicateVault
     function managementFeeBps() external view returns (uint256) {
         return _managementFeeBps;
+    }
+
+    /// @inheritdoc ISyndicateVault
+    function agentFeeBps() external view returns (uint256) {
+        // One SLOAD: 0 = never set → the 5% default (agent never silently
+        // unpaid, H1); otherwise the stored value is fee+1, so an explicit 0%
+        // (stored 1) stays distinct from unset.
+        uint256 stored = _agentFeeBpsPlusOne;
+        return stored == 0 ? FeeConstants.DEFAULT_AGENT_FEE_BPS : stored - 1;
+    }
+
+    /// @inheritdoc ISyndicateVault
+    function setAgentFeeBps(uint256 bps) external onlyOwner {
+        if (bps > MAX_AGENT_FEE_BPS) revert AgentFeeTooHigh();
+        // Offset-by-one: stored = fee+1 marks "set" and keeps an explicit 0%
+        // distinct from the unset sentinel (0).
+        _agentFeeBpsPlusOne = bps + 1;
+        emit AgentFeeUpdated(bps);
     }
 
     // ==================== PAGINATION ====================

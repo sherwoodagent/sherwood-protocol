@@ -140,7 +140,7 @@ contract GovernorStrategyOnProposalTest is Test {
     function _propose(address strategy) internal returns (uint256 proposalId) {
         vm.prank(agent);
         proposalId = governor.propose(
-            address(vault), strategy, "ipfs://test", 1500, 7 days, _execCalls(), _settleCalls(), _emptyCoProposers()
+            address(vault), strategy, "ipfs://test", 7 days, _execCalls(), _settleCalls(), _emptyCoProposers()
         );
         vm.warp(vm.getBlockTimestamp() + 1);
     }

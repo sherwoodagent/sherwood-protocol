@@ -200,9 +200,12 @@ abstract contract HyperEVMIntegrationTest is Test {
         uint256 feeBps,
         uint256 duration
     ) internal returns (uint256 proposalId) {
+        // Agent performance fee is now a vault property — owner sets it before proposing
+        vm.prank(owner);
+        vault.setAgentFeeBps(feeBps);
         vm.prank(agent);
         proposalId = governor.propose(
-            address(vault), address(0), "ipfs://test", feeBps, duration, execCalls, settleCalls, _emptyCoProposers()
+            address(vault), address(0), "ipfs://test", duration, execCalls, settleCalls, _emptyCoProposers()
         );
 
         vm.warp(block.timestamp + 1);

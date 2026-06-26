@@ -137,12 +137,15 @@ contract SyndicateGovernorTest is Test {
     }
 
     function _createSimpleProposal(uint256 perfFeeBps, uint256 duration) internal returns (uint256 proposalId) {
+        // Agent fee is now a vault-owner property read live at settlement; set
+        // it to the test's intended rate so realized-fee assertions still hold.
+        vm.prank(owner);
+        vault.setAgentFeeBps(perfFeeBps);
         vm.prank(agent);
         proposalId = governor.propose(
             address(vault),
             address(0),
             "ipfs://test",
-            perfFeeBps,
             duration,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
@@ -193,7 +196,7 @@ contract SyndicateGovernorTest is Test {
         ISyndicateGovernor.StrategyProposal memory p = governor.getProposal(proposalId);
         assertEq(p.proposer, agent);
         assertEq(p.vault, address(vault));
-        assertEq(p.performanceFeeBps, 1500);
+        assertEq(p.performanceFeeBps, 1500, "snapshotted from vault at propose");
         assertEq(p.strategyDuration, 7 days);
         assertEq(uint256(p.state), uint256(ISyndicateGovernor.ProposalState.Pending));
 
@@ -210,7 +213,6 @@ contract SyndicateGovernorTest is Test {
             address(vault),
             address(0),
             "ipfs://test",
-            1500,
             7 days,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
@@ -225,22 +227,6 @@ contract SyndicateGovernorTest is Test {
             makeAddr("fakeVault"),
             address(0),
             "ipfs://test",
-            1500,
-            7 days,
-            _simpleExecuteCalls(),
-            _simpleSettlementCalls(),
-            _emptyCoProposers()
-        );
-    }
-
-    function test_propose_performanceFeeTooHigh_reverts() public {
-        vm.prank(agent);
-        vm.expectRevert(ISyndicateGovernor.PerformanceFeeTooHigh.selector);
-        governor.propose(
-            address(vault),
-            address(0),
-            "ipfs://test",
-            MAX_PERF_FEE_BPS + 1,
             7 days,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
@@ -255,7 +241,6 @@ contract SyndicateGovernorTest is Test {
             address(vault),
             address(0),
             "ipfs://test",
-            1500,
             MAX_STRATEGY_DURATION + 1,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
@@ -270,7 +255,6 @@ contract SyndicateGovernorTest is Test {
             address(vault),
             address(0),
             "ipfs://test",
-            1500,
             30 minutes,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
@@ -283,14 +267,7 @@ contract SyndicateGovernorTest is Test {
         vm.prank(agent);
         vm.expectRevert(ISyndicateGovernor.EmptyExecuteCalls.selector);
         governor.propose(
-            address(vault),
-            address(0),
-            "ipfs://test",
-            1500,
-            7 days,
-            empty,
-            _simpleSettlementCalls(),
-            _emptyCoProposers()
+            address(vault), address(0), "ipfs://test", 7 days, empty, _simpleSettlementCalls(), _emptyCoProposers()
         );
     }
 
@@ -299,7 +276,7 @@ contract SyndicateGovernorTest is Test {
         vm.prank(agent);
         vm.expectRevert(ISyndicateGovernor.EmptySettlementCalls.selector);
         governor.propose(
-            address(vault), address(0), "ipfs://test", 1500, 7 days, _simpleExecuteCalls(), empty, _emptyCoProposers()
+            address(vault), address(0), "ipfs://test", 7 days, _simpleExecuteCalls(), empty, _emptyCoProposers()
         );
     }
 
@@ -314,7 +291,6 @@ contract SyndicateGovernorTest is Test {
             address(vault),
             address(0),
             "ipfs://test",
-            1500,
             7 days,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
@@ -347,7 +323,6 @@ contract SyndicateGovernorTest is Test {
             address(vault),
             address(0),
             "ipfs://test",
-            1500,
             7 days,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
@@ -468,7 +443,6 @@ contract SyndicateGovernorTest is Test {
             address(vault),
             address(0),
             "ipfs://dup",
-            1500,
             7 days,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
@@ -543,6 +517,102 @@ contract SyndicateGovernorTest is Test {
         // Protocol fee: 1% of 10k = 100. Agent fee: 15% of 9900 = 1485. Mgmt: 0.5% of 8415 = 42.075
         assertEq(usdc.balanceOf(agent), agentBalBefore + 1_485e6);
         assertEq(usdc.balanceOf(owner), ownerBalBefore + 100e6 + 42_075000);
+    }
+
+    /// @notice H2: the snapshot is clamped to `maxPerformanceFeeBps` at propose,
+    ///         so the recorded/emitted rate equals what settlement charges — a
+    ///         vault fee above the cap is never shown to voters as higher.
+    function test_settlement_agentFeeClampedToMax() public {
+        // Protocol owner lowers the configured cap below the vault's fee.
+        vm.prank(owner);
+        governor.setMaxPerformanceFeeBps(1000); // 10%, under the vault's 15%
+        // Vault owner sets 15% — above the 10% param; the snapshot clamps to 10%.
+        uint256 proposalId = _createAndExecuteProposal(MAX_PERF_FEE_BPS, 7 days);
+        assertEq(vault.agentFeeBps(), MAX_PERF_FEE_BPS, "vault stores the owner's 15%");
+        assertEq(governor.getProposal(proposalId).performanceFeeBps, 1000, "snapshot clamped at propose");
+        usdc.mint(address(vault), 10_000e6);
+        uint256 agentBalBefore = usdc.balanceOf(agent);
+        vm.prank(agent);
+        governor.settleProposal(proposalId);
+        // 10% of net, not 15%: protocol 1% of 10k = 100; agent 10% of 9900 = 990.
+        assertEq(usdc.balanceOf(agent), agentBalBefore + 990e6, "agent fee clamped to 10%");
+    }
+
+    /// @notice C1: the fee is snapshotted at propose, so an owner who changes
+    ///         the vault's agentFeeBps after the vote cannot alter what this
+    ///         proposal charges. Settlement uses the snapshot, not the live fee.
+    function test_settlement_usesProposeTimeSnapshot() public {
+        // Snapshot 15% at propose (helper sets the vault fee, then proposes).
+        uint256 proposalId = _createAndExecuteProposal(MAX_PERF_FEE_BPS, 7 days);
+        // Owner drops the live vault fee to 5% AFTER the proposal is created.
+        vm.prank(owner);
+        vault.setAgentFeeBps(500);
+        assertEq(vault.agentFeeBps(), 500, "live vault fee changed post-propose");
+        usdc.mint(address(vault), 10_000e6);
+        uint256 agentBalBefore = usdc.balanceOf(agent);
+        vm.prank(agent);
+        governor.settleProposal(proposalId);
+        // Uses the 15% snapshot, not the live 5%: protocol 1% of 10k = 100;
+        // agent 15% of 9900 = 1485 (a live read would have charged 5% = 495).
+        assertEq(usdc.balanceOf(agent), agentBalBefore + 1_485e6, "uses propose-time snapshot");
+    }
+
+    /// @notice H2 belt-and-braces: if the protocol lowers maxPerformanceFeeBps
+    ///         AFTER a proposal is created, settlement re-clamps the (higher)
+    ///         snapshot to the new cap.
+    function test_settlement_clampsOnMidFlightCapReduction() public {
+        uint256 proposalId = _createAndExecuteProposal(MAX_PERF_FEE_BPS, 7 days);
+        assertEq(governor.getProposal(proposalId).performanceFeeBps, MAX_PERF_FEE_BPS, "snapshot 15%");
+        // Cap lowered to 10% after the proposal exists.
+        vm.prank(owner);
+        governor.setMaxPerformanceFeeBps(1000);
+        usdc.mint(address(vault), 10_000e6);
+        uint256 agentBalBefore = usdc.balanceOf(agent);
+        // H1 (pass 3): the settle-time re-clamp must EMIT FeeClamped too, not
+        // silently clamp — indexers/voters need the on-chain signal.
+        vm.expectEmit(true, true, true, false, address(governor));
+        emit ISyndicateGovernor.FeeClamped(proposalId, MAX_PERF_FEE_BPS, 1000);
+        vm.prank(agent);
+        governor.settleProposal(proposalId);
+        // Settle re-clamps the 15% snapshot to the new 10% cap: 10% of 9900 = 990.
+        assertEq(usdc.balanceOf(agent), agentBalBefore + 990e6, "settle clamps to lowered cap");
+    }
+
+    /// @notice M5: the vault's hard cap must equal the governor's
+    ///         MAX_PERFORMANCE_FEE_CAP. Catches a divergent hand-edit.
+    function test_maxAgentFeeBps_equalsGovernorCap() public view {
+        assertEq(vault.MAX_AGENT_FEE_BPS(), governor.MAX_PERFORMANCE_FEE_CAP(), "vault cap must mirror governor cap");
+    }
+
+    /// @notice H1: when the vault's snapshotted fee exceeds maxPerformanceFeeBps,
+    ///         propose emits FeeClamped(pid, snapshotted, clamped) so voters can
+    ///         detect the recorded fee was clamped below the owner's intent.
+    function test_propose_emitsFeeClampedWhenAboveCap() public {
+        vm.prank(owner);
+        governor.setMaxPerformanceFeeBps(1000); // cap 10%
+        vm.prank(owner);
+        vault.setAgentFeeBps(MAX_PERF_FEE_BPS); // vault 15% > cap
+        uint256 expectedId = governor.proposalCount() + 1;
+        // All three params indexed → check topic1/2/3, no data.
+        vm.expectEmit(true, true, true, false, address(governor));
+        emit ISyndicateGovernor.FeeClamped(expectedId, MAX_PERF_FEE_BPS, 1000);
+        vm.prank(agent);
+        governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://test",
+            7 days,
+            _simpleExecuteCalls(),
+            _simpleSettlementCalls(),
+            _emptyCoProposers()
+        );
+    }
+
+    /// @notice H1: no clamp when the vault fee is at or below the cap — the
+    ///         snapshot equals the set fee (so FeeClamped is not emitted).
+    function test_propose_noClampWhenWithinCap() public {
+        uint256 pid = _createSimpleProposal(500, 7 days); // vault 5% <= cap 15%
+        assertEq(governor.getProposal(pid).performanceFeeBps, 500, "no clamp within cap");
     }
 
     function test_settlement_withLoss_noFees() public {

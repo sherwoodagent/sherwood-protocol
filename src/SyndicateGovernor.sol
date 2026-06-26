@@ -249,7 +249,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
         address vault,
         address strategy,
         string calldata metadataURI,
-        uint256 performanceFeeBps,
         uint256 strategyDuration,
         BatchExecutorLib.Call[] calldata executeCalls,
         BatchExecutorLib.Call[] calldata settlementCalls,
@@ -262,7 +261,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
         // Draft co-proposals do not count toward openProposalCount and are
         // independently gated at their Draft -> Pending transition.
         if (openProposalCount[vault] != 0) revert VaultHasOpenProposal();
-        if (performanceFeeBps > _params.maxPerformanceFeeBps) revert PerformanceFeeTooHigh();
         if (strategyDuration > _params.maxStrategyDuration) revert StrategyDurationTooLong();
         if (strategyDuration < _params.minStrategyDuration) revert StrategyDurationTooShort();
         if (executeCalls.length == 0) revert EmptyExecuteCalls();
@@ -296,7 +294,12 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
         p.vault = vault;
         p.strategy = strategy;
         p.metadataURI = metadataURI;
-        p.performanceFeeBps = performanceFeeBps;
+        // Snapshot the vault's agent fee, clamped to the protocol cap, so the
+        // recorded + emitted rate is exactly what settlement charges (H2: no
+        // voter-misleading divergence). An owner change after propose cannot
+        // alter this proposal (C1); a later cap reduction re-applies at settle.
+        p.performanceFeeBps =
+            _clampPerformanceFee(proposalId, ISyndicateVault(vault).agentFeeBps(), _params.maxPerformanceFeeBps);
         p.strategyDuration = strategyDuration;
         if (isCollaborative) {
             p.state = ProposalState.Draft;
@@ -1080,6 +1083,18 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
     }
 
     /// @dev Distribute protocol, agent, and management fees. Extracted to avoid stack-too-deep.
+    /// @dev Clamp `fee` to `cap`, emitting FeeClamped(proposalId, fee, cap) when
+    ///      the clamp fires. Shared by propose (snapshot) and _distributeFees
+    ///      (settle re-clamp) so both paths signal an over-cap fee identically
+    ///      (H1) and the event is memory-encoded once for bytecode.
+    function _clampPerformanceFee(uint256 proposalId, uint256 fee, uint256 cap) private returns (uint256) {
+        if (fee > cap) {
+            emit FeeClamped(proposalId, fee, cap);
+            return cap;
+        }
+        return fee;
+    }
+
     function _distributeFees(
         uint256 proposalId,
         address vault,
@@ -1131,7 +1146,11 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
 
         uint256 netProfit = profit - protocolFee - guardianFee;
 
-        // Agent performance fee from net profit
+        // Agent performance fee from net profit. `perfFeeBps` was snapshotted
+        // from the vault at propose time (so it matches what voters approved);
+        // clamp it to the governor's tunable maxPerformanceFeeBps so a later
+        // cap reduction still applies.
+        perfFeeBps = _clampPerformanceFee(proposalId, perfFeeBps, _params.maxPerformanceFeeBps);
         agentFee = (netProfit * perfFeeBps) / BPS_DENOMINATOR;
 
         // Management fee from remainder after agent fee

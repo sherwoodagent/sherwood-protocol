@@ -273,19 +273,20 @@ contract ProtocolInvariantsTest is StdInvariant, Test {
             if (governor.getProposalState(pid) != ISyndicateGovernor.ProposalState.Settled) continue;
             ISyndicateGovernor.StrategyProposal memory p = governor.getProposal(pid);
 
-            // Structural bound: the performanceFeeBps stored on the proposal
-            // is capped at init time + set-time to `maxPerformanceFeeBps`,
-            // which is itself bounded at 10_000 by `MAX_PROTOCOL_FEE_BPS` /
-            // `_validateMaxPerformanceFeeBps`. `protocolFeeBps` is bounded
-            // at 1_000 (`MAX_PROTOCOL_FEE_BPS`). A settled proposal with a
-            // bps above these caps would indicate a rounding / accounting
-            // break in `_distributeFees` — exactly the G-C7 vector that
-            // INV-2 is designed to catch.
-            assertLe(p.performanceFeeBps, MAX_PERF_FEE_BPS, "INV-2: perf fee bps exceeds cap");
+            // Structural bound: the agent fee is snapshotted on the proposal at
+            // propose time and clamped to `maxPerformanceFeeBps` at settlement
+            // (see SyndicateGovernor._distributeFees). Re-derive the realized
+            // rate the same way and assert the fee-sum bound. A realized rate
+            // above the caps would indicate a rounding / accounting break in
+            // `_distributeFees` — exactly the G-C7 vector INV-2 catches.
+            uint256 perfFeeBps = p.performanceFeeBps;
+            uint256 maxPerf = governor.getGovernorParams().maxPerformanceFeeBps;
+            if (perfFeeBps > maxPerf) perfFeeBps = maxPerf;
+            assertLe(perfFeeBps, MAX_PERF_FEE_BPS, "INV-2: perf fee bps exceeds cap");
             assertLe(governor.protocolFeeBps(), 10_000, "INV-2: protocol fee bps out of range");
             // Sum of all bps must not exceed 10_000 (would take >100% of
             // gross profit; nonsense state).
-            uint256 totalBps = uint256(p.performanceFeeBps) + governor.protocolFeeBps();
+            uint256 totalBps = perfFeeBps + governor.protocolFeeBps();
             assertLe(totalBps, 10_000, "INV-2: total fee bps > 100%");
         }
     }
