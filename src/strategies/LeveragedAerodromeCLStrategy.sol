@@ -703,6 +703,14 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     /// @dev If any borrow balance remains after the direct repay attempt (shortfall due to
     ///      IL or fee accumulation), redeem USDC from mUSDC collateral and swap to cover it.
     ///      Uses Chainlink prices + 10% buffer for the redeem amount; swaps via exactInputSingle.
+    ///
+    ///      Dust guard: `_tokenToUsdc` truncates to 0 for sub-USDC debts (e.g. 1 wei WETH at 18 dp
+    ///      = ~$1.7e-15 → rounds to 0). Without the floor, cbBTC consumes all redeemed USDC and
+    ///      the WETH leg receives nothing → 1-wei debt survives → `redeem(mBal)` blocked by
+    ///      Comptroller (any debt against 0 collateral = shortfall, error code 3).
+    ///      A floor of 1e5 USDC (0.1 USDC) per leg is sufficient: at $60k BTC it buys ~150
+    ///      cbBTC units; at $1600 ETH it buys ~6e7 wei WETH.  Any over-purchased token is swept
+    ///      in step 5 of `_settle` and the excess USDC flows to the vault in step 7.
     function _settleShortfall() private {
         uint256 cbDebtRem = IMoonwellMarket(mCbBTC).borrowBalanceStored(address(this));
         uint256 wethDebtRem = IMoonwellMarket(mWeth).borrowBalanceStored(address(this));
@@ -714,6 +722,10 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         // USDC needed for each shortfall leg (+10% buffer)
         uint256 cbUsdcNeed = _tokenToUsdc(cbDebtRem, 8, pBTC, pUsdc) * 11000 / 10000;
         uint256 wethUsdcNeed = _tokenToUsdc(wethDebtRem, 18, pETH, pUsdc) * 11000 / 10000;
+        // Dust floor: if a leg has nonzero debt but the oracle cost rounds to 0 (e.g. 1 wei WETH),
+        // ensure enough USDC is redeemed so the swap can acquire at least 1 unit of that token.
+        if (cbDebtRem > 0 && cbUsdcNeed == 0) cbUsdcNeed = 1e5;
+        if (wethDebtRem > 0 && wethUsdcNeed == 0) wethUsdcNeed = 1e5;
         uint256 totalNeed = cbUsdcNeed + wethUsdcNeed;
         // Redeem USDC collateral to fund the swaps (health elevated after partial repays)
         if (totalNeed > 0) {

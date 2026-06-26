@@ -26,21 +26,34 @@ contract MockVaultUnit {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Harness — overrides nav() to return a caller-supplied fixed value
+// Harness — overrides nav() to reflect a base NAV plus simulated idle USDC
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// @dev `new DepositHarness()` runs BaseStrategy's constructor → sets `_initialized = true`
 ///      on the template instance.  We then write only the storage slots needed for
 ///      `deposit` via `vm.store`, bypassing the full initialisation path.
+///
+///      `nav()` returns `baseNav + idleUsdcSim`.  `idleUsdcSim` represents idle USDC
+///      held by the strategy — in production this would be `IERC20(usdc).balanceOf(this)`.
+///      By setting `idleUsdcSim = deposit_amount` AFTER the crystallize call would run
+///      (i.e. simulating the post-pull state), the test can prove that calling
+///      `_crystallizeFees` AFTER `safeTransferFrom` would inflate navPre and charge a
+///      phantom performance fee.  See `test_deposit_noPhantomFee_unit` for the proof.
 contract DepositHarness is LeveragedAerodromeCLStrategy {
-    uint256 public fixedNav;
+    uint256 public baseNav;
+    /// @dev Simulated idle USDC in strategy — reflects what safeTransferFrom would add.
+    uint256 public idleUsdcSim;
 
-    function setFixedNav(uint256 n) external {
-        fixedNav = n;
+    function setBaseNav(uint256 n) external {
+        baseNav = n;
+    }
+
+    function setIdleUsdc(uint256 u) external {
+        idleUsdcSim = u;
     }
 
     function nav() public view virtual override returns (uint256) {
-        return fixedNav;
+        return baseNav + idleUsdcSim;
     }
 }
 
@@ -142,7 +155,7 @@ contract LeveragedAeroCLDepositUnit is Test {
         uint256 N = 50_000e6; // $50 k NAV (6 dp USDC)
         uint256 a = 1_000e6; // $1 k deposit
 
-        harness.setFixedNav(N);
+        harness.setBaseNav(N);
         _mockUsdcTransfer(a);
 
         uint256 supplyBefore = mockVault.totalSupply(); // INITIAL_SHARES
@@ -160,19 +173,39 @@ contract LeveragedAeroCLDepositUnit is Test {
     // Test 2 — no phantom fee when nav == HWM and dt == 0
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// @notice When hwmPerShare encodes the current nav (no gain) and the same block
-    ///         is used (dt == 0 → management fee = 0), crystallizeFees mints ZERO
-    ///         performance-fee shares to feeRecipient.
+    /// @notice Crystallizing on PRE-deposit NAV charges ZERO performance fee even when
+    ///         performanceFeeBps > 0, because nav == HWM at crystallize time.
+    ///
+    ///         Genuine test: `performanceFeeBps = 1000` (10 %) is active, and `nav()` in the
+    ///         harness returns `baseNav + idleUsdcSim` — explicitly modelling the idle-USDC
+    ///         inflation that would occur if crystallize ran AFTER `safeTransferFrom`.
+    ///
+    ///         Ordering proof:
+    ///           Pre-pull:  idleUsdcSim = 0 → nav() = 50_000e6 = hwm nav → fee = 0  ✓
+    ///           Post-pull: idleUsdcSim = 1_000e6 → nav() = 51_000e6 > hwm nav
+    ///                      → navPerShareX > hwmPerShare → perf fee WOULD be charged
+    ///                      (verify: `harness.setIdleUsdc(1_000e6)` BEFORE this test
+    ///                       and the assertEq below would FAIL with non-zero feeShares).
+    ///
+    ///         The current `deposit` implementation calls `_crystallizeFees` BEFORE
+    ///         `safeTransferFrom`, so `idleUsdcSim = 0` when crystallize runs → 0 fee.
     function test_deposit_noPhantomFee_unit() public {
-        uint256 N = 50_000e6;
-        harness.setFixedNav(N);
+        uint256 N = 50_000e6; // $50 k base NAV — no idle USDC yet (pre-pull)
+        harness.setBaseNav(N);
+        harness.setIdleUsdc(0); // explicit: no idle USDC at crystallize time
 
-        // Set hwmPerShare = N * 1e18 / INITIAL_SHARES  (at-parity: nav == HWM)
+        // Set performanceFeeBps = 1000 (10 %) in slot 22.
+        // slot 22 layout: feeRecipient(addr<<80) | performanceFeeBps(uint16<<64) | managementFeeBps(uint16<<48)
+        uint256 slot22Perf = (uint256(uint160(FEE_RECIPIENT)) << 80) | (uint256(1000) << 64);
+        vm.store(address(harness), bytes32(SLOT_SLOT22), bytes32(slot22Perf));
+
+        // Set hwmPerShare = navPerShareX at N — HWM is exactly at current nav so no gain.
+        // navPerShareX = N × 1e18 / INITIAL_SHARES = 50_000e6 × 1e18 / 100_000e12 = 5e11
         uint256 hwm = Math.mulDiv(N, 1e18, INITIAL_SHARES);
         vm.store(address(harness), bytes32(SLOT_HWM), bytes32(hwm));
 
-        // lastFeeAccrualTimestamp already equals block.timestamp (set in setUp)
-        // → dt = 0 → management fee = 0; nav at HWM → performance fee = 0.
+        // lastFeeAccrualTimestamp already equals block.timestamp (set in setUp) → dt = 0.
+        // With nav == HWM and dt == 0: management fee = 0, performance fee = 0.
 
         _mockUsdcTransfer(1_000e6);
 
@@ -192,7 +225,7 @@ contract LeveragedAeroCLDepositUnit is Test {
     /// @notice If computed shares < minShares, deposit must revert InsufficientShares.
     function test_deposit_minSharesRevert() public {
         uint256 N = 50_000e6;
-        harness.setFixedNav(N);
+        harness.setBaseNav(N);
 
         uint256 a = 1_000e6;
         _mockUsdcTransfer(a);
