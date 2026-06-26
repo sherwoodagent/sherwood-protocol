@@ -18,14 +18,22 @@ library ChainlinkReader {
     {
         (, int256 up, uint256 seqStartedAt,,) = IAggregatorV3(sequencerUptimeFeed).latestRoundData();
         if (up != 0) revert SequencerDown();
-        if (block.timestamp - seqStartedAt <= gracePeriod) revert GracePeriodNotOver();
+        // A future seqStartedAt (misconfigured feed / L2 clock skew) means the sequencer
+        // (re)started "in the future" → grace definitely not over. Guard the subtraction so a
+        // caller catching the named error gets GracePeriodNotOver, not an unhandled underflow panic.
+        if (seqStartedAt > block.timestamp || block.timestamp - seqStartedAt <= gracePeriod) {
+            revert GracePeriodNotOver();
+        }
 
         (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound) =
             IAggregatorV3(feed).latestRoundData();
         if (answer <= 0) revert StaleOracle();
         if (answeredInRound < roundId) revert StaleOracle();
         if (startedAt == 0) revert StaleOracle();
-        if (block.timestamp - updatedAt > maxDelay) revert StaleOracle();
+        // A future updatedAt (feed clock ahead of a lagging L2 block.timestamp, e.g. a Tenderly
+        // vnet) is the freshest possible answer → age 0; never underflow.
+        uint256 age = block.timestamp > updatedAt ? block.timestamp - updatedAt : 0;
+        if (age > maxDelay) revert StaleOracle();
 
         price = uint256(answer);
         decimals = IAggregatorV3(feed).decimals();
