@@ -8,8 +8,8 @@ import {INonfungiblePositionManager} from "../src/interfaces/ISlipstream.sol";
 /// @notice Exposes `_npmPositionData` (internal after the visibility change) for testing.
 ///         Deployed via `new NavHarness()` — the BaseStrategy constructor runs and sets
 ///         `_initialized = true`, locking `initialize()`.  We bypass init entirely and write
-///         only the two storage slots that `_npmPositionData` reads: `npm` (slot 17) and
-///         `tokenId` (slot 21).
+///         only the two diamond-storage slots that `_npmPositionData` reads: `npm`
+///         (STRAT_BASE + 14) and `tokenId` (STRAT_BASE + 18).
 contract NavHarness is LeveragedAerodromeCLStrategy {
     function exposeNpmPositionData() external view returns (int24, int24, uint128) {
         return _npmPositionData();
@@ -24,11 +24,16 @@ contract NavHarness is LeveragedAerodromeCLStrategy {
 ///         We use `vm.store` to write `npm` and `tokenId` into the harness contract's
 ///         storage without calling `initialize` (which would require a full param set).
 contract LeveragedAeroCLNavAssemblyTest is Test {
-    // ── Storage slot constants (from `forge inspect LeveragedAerodromeCLStrategy storageLayout`) ──
-    // slot 17 = npm  (address, offset 0)
-    // slot 21 = tokenId (uint256, full slot)
-    uint256 private constant SLOT_NPM = 17;
-    uint256 private constant SLOT_TOKEN_ID = 21;
+    // ── Storage slot constants ──
+    // Strategy state lives in ERC-7201 diamond storage at STRAT_BASE
+    // (= keccak256(abi.encode(uint256(keccak256("leveraged.aero.cl.storage")) - 1)) & ~0xff).
+    // Field slot = STRAT_BASE + (oldSequentialSlot - 3); packing within the Layout struct
+    // matches the old sequential layout.
+    //   STRAT_BASE + 14 = npm     (address, offset 0)  [was slot 17]
+    //   STRAT_BASE + 18 = tokenId (uint256, full slot) [was slot 21]
+    uint256 private constant STRAT_BASE = uint256(0x405ae0b144079093e970849fdffdcb2a514e44968598c6c5c73444496e844900);
+    uint256 private constant SLOT_NPM = STRAT_BASE + 14;
+    uint256 private constant SLOT_TOKEN_ID = STRAT_BASE + 18;
 
     address private constant NPM_MOCK = address(0xABCD);
 

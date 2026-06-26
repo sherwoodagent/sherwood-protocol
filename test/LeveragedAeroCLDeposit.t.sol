@@ -61,12 +61,18 @@ contract DepositHarness is LeveragedAerodromeCLStrategy {
 // Storage slot constants (from `forge inspect LeveragedAerodromeCLStrategy storage-layout`)
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// slot 1  : _vault        (address, offset 0)
-// slot 2  : _proposer     (address, offset 0) | _state (uint8, offset 20) | _initialized (bool, offset 21)
-// slot 3  : usdc          (address, offset 0)
-// slot 22 : feeRecipient  (address, offset 10) | managementFeeBps (uint16, off 6) | performanceFeeBps (uint16, off 8)
-// slot 23 : hwmPerShare   (uint256)
-// slot 24 : lastFeeAccrualTimestamp (uint256)
+// BaseStrategy state stays in the sequential layout:
+//   slot 1  : _vault        (address, offset 0)
+//   slot 2  : _proposer     (address, offset 0) | _state (uint8, offset 20) | _initialized (bool, offset 21)
+//
+// Strategy state moved into ERC-7201 diamond storage at STRAT_BASE
+// (= keccak256(abi.encode(uint256(keccak256("leveraged.aero.cl.storage")) - 1)) & ~0xff).
+// Within the Layout struct the field packing is identical to the old sequential
+// layout, so each field slot = STRAT_BASE + (oldSequentialSlot - 3):
+//   STRAT_BASE + 0  : usdc          (address, offset 0)            [was slot 3]
+//   STRAT_BASE + 19 : feeRecipient  (address, off 10) | managementFeeBps (uint16, off 6) | performanceFeeBps (uint16, off 8) [was slot 22]
+//   STRAT_BASE + 20 : hwmPerShare   (uint256)                      [was slot 23]
+//   STRAT_BASE + 21 : lastFeeAccrualTimestamp (uint256)            [was slot 24]
 //
 // State enum: Pending=0, Executed=1, Settled=2.
 
@@ -77,12 +83,15 @@ contract DepositHarness is LeveragedAerodromeCLStrategy {
 ///           3. test_deposit_minSharesRevert        — reverts InsufficientShares when slippage too tight.
 contract LeveragedAeroCLDepositUnit is Test {
     // ── slot numbers ──
+    // BaseStrategy sequential slots (unchanged by the diamond-storage refactor):
     uint256 private constant SLOT_VAULT = 1;
     uint256 private constant SLOT_PROPOSER_STATE_INIT = 2;
-    uint256 private constant SLOT_USDC = 3;
-    uint256 private constant SLOT_SLOT22 = 22; // feeRecipient packed slot
-    uint256 private constant SLOT_HWM = 23;
-    uint256 private constant SLOT_LAST_FEE = 24;
+    // ERC-7201 diamond base; strategy field slot = STRAT_BASE + structOffset.
+    uint256 private constant STRAT_BASE = uint256(0x405ae0b144079093e970849fdffdcb2a514e44968598c6c5c73444496e844900);
+    uint256 private constant SLOT_USDC = STRAT_BASE + 0;
+    uint256 private constant SLOT_SLOT22 = STRAT_BASE + 19; // feeRecipient packed slot
+    uint256 private constant SLOT_HWM = STRAT_BASE + 20;
+    uint256 private constant SLOT_LAST_FEE = STRAT_BASE + 21;
 
     // State.Executed = 1, _initialized = true → byte 20 = 0x01, byte 21 = 0x01
     // As uint256: (1 << 168) | (1 << 160)

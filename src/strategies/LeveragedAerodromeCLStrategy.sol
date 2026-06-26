@@ -155,70 +155,73 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     }
 
     // ─────────────────────────────────────────────────────────────
-    // Storage — valuation config fields
+    // Storage — ERC-7201 namespaced (diamond) storage
     // ─────────────────────────────────────────────────────────────
+    //
+    // ALL strategy-specific state lives in one `Layout` struct at a fixed
+    // ERC-7201 slot, NOT in the contract's sequential storage. The sequential
+    // layout therefore holds only BaseStrategy's state (_hcSelf / _vault /
+    // _proposer / _state / _initialized). This is the foundation for moving the
+    // management ops into a deployed delegatecall library.
 
-    address public usdc;
-    address public mUsdc;
-    address public mCbBTC; // maps to LeveragedAeroValuation.Config.cbBTCMarket
-    address public mWeth; // maps to LeveragedAeroValuation.Config.wethMarket
-    address public cbBTC;
-    address public weth;
-    address public pool;
-    address public cbBTCFeed;
-    address public wethFeed;
-    address public usdcFeed;
-    address public sequencerFeed;
-    uint256 public maxDelay;
-    uint256 public gracePeriod;
-    uint16 public calmDeviationTicks;
-    uint32 public twapWindow;
+    /// @custom:storage-location erc7201:leveraged.aero.cl.storage
+    struct Layout {
+        // ── valuation config: token / venue / feed addresses ──
+        address usdc;
+        address mUsdc;
+        address mCbBTC; // maps to LeveragedAeroValuation.Config.cbBTCMarket
+        address mWeth; // maps to LeveragedAeroValuation.Config.wethMarket
+        address cbBTC;
+        address weth;
+        address pool;
+        address cbBTCFeed;
+        address wethFeed;
+        address usdcFeed;
+        address sequencerFeed;
+        uint256 maxDelay;
+        uint256 gracePeriod;
+        uint16 calmDeviationTicks;
+        uint32 twapWindow;
+        // ── venue / protocol addresses (not in Config) ──
+        address comptroller;
+        address npm;
+        address gauge;
+        address swapRouter;
+        int24 tickSpacing;
+        // ── risk params ──
+        uint16 targetLtvBps;
+        uint16 maxLtvBps;
+        uint16 minHealthBps;
+        uint16 maxSlippageBps;
+        uint16 usdcCollateralFactorBps; // USDC collateral factor read from Moonwell at init (e.g. 8800 = 88%)
+        // ── position state (all zero pre-deploy / post-settle) ──
+        uint256 tokenId; // NPM tokenId of the active CL position. 0 when no position is open.
+        int24 posTickLower; // stored ticks of the active CL position
+        int24 posTickUpper;
+        // ── fee params + state ──
+        uint16 managementFeeBps;
+        uint16 performanceFeeBps;
+        address feeRecipient;
+        uint256 hwmPerShare; // HWM NAV per share (USDC 6dp); 0 until first deposit mints shares
+        uint256 lastFeeAccrualTimestamp; // timestamp of the last management-fee accrual
+    }
 
-    // ─────────────────────────────────────────────────────────────
-    // Storage — venue / protocol addresses (not in Config)
-    // ─────────────────────────────────────────────────────────────
+    /// @dev keccak256(abi.encode(uint256(keccak256("leveraged.aero.cl.storage")) - 1)) & ~bytes32(uint256(0xff))
+    bytes32 private constant STORAGE_SLOT = 0x405ae0b144079093e970849fdffdcb2a514e44968598c6c5c73444496e844900;
 
-    address public comptroller;
-    address public npm;
-    address public gauge;
-    address public swapRouter;
-    int24 public tickSpacing;
+    /// @dev Diamond-storage accessor — all strategy-specific state lives in `Layout` at STORAGE_SLOT.
+    function _s() private pure returns (Layout storage l) {
+        // solhint-disable-next-line no-inline-assembly
+        assembly {
+            l.slot := STORAGE_SLOT
+        }
+    }
 
-    // ─────────────────────────────────────────────────────────────
-    // Storage — risk params
-    // ─────────────────────────────────────────────────────────────
-
-    uint16 public targetLtvBps;
-    uint16 public maxLtvBps;
-    uint16 public minHealthBps;
-    uint16 public maxSlippageBps;
-    /// @notice USDC collateral factor read from Moonwell at init (e.g. 8800 = 88%).
-    uint16 public usdcCollateralFactorBps;
-
-    // ─────────────────────────────────────────────────────────────
-    // Storage — position state (all zero pre-deploy / post-settle)
-    // ─────────────────────────────────────────────────────────────
-
-    /// @notice NPM tokenId of the active CL position.  0 when no position is open.
-    uint256 public tokenId;
-    /// @notice Stored ticks of the active CL position.
-    int24 public posTickLower;
-    int24 public posTickUpper;
-
-    // ─────────────────────────────────────────────────────────────
-    // Storage — fee params + state
-    // ─────────────────────────────────────────────────────────────
-
-    uint16 public managementFeeBps;
-    uint16 public performanceFeeBps;
-    address public feeRecipient;
-
-    /// @notice High-water-mark NAV per share in USDC (6dp), updated on fee crystallization.
-    ///         Zero until the first deposit mints shares.
-    uint256 public hwmPerShare;
-
-    /// @notice Timestamp of the last management-fee accrual.
-    uint256 public lastFeeAccrualTimestamp;
+    /// @notice Read the entire strategy storage struct in one call (replaces the ~25
+    ///         individual public getters this contract used to expose — saves bytecode).
+    function s() external view returns (Layout memory) {
+        return _s();
+    }
 
     // ─────────────────────────────────────────────────────────────
     // Native ETH receiver
@@ -263,10 +266,10 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         _initGroupC(data[352:]); // fields 11-14: feed addresses
         _initGroupD(data[480:]); // fields 15-18: oracle params
         // Read CF from Moonwell using addresses already in storage (set by group A).
-        uint16 cfBps = _readCollateralFactor(comptroller, mUsdc);
+        uint16 cfBps = _readCollateralFactor(_s().comptroller, _s().mUsdc);
         _initGroupE(data[608:], cfBps); // fields 19-23: risk params + CF validation
         _initGroupF(data[768:]); // fields 24-26: fee params
-        lastFeeAccrualTimestamp = block.timestamp;
+        _s().lastFeeAccrualTimestamp = block.timestamp;
     }
 
     // ── Group A: usdc, mUsdc, mCbBTC, mWeth, comptroller, cbBTC, weth (fields 0-6) ──
@@ -281,13 +284,14 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         if (comp_ == address(0)) revert ZeroAddress();
         if (cbBTC_ == address(0)) revert ZeroAddress();
         if (weth_ == address(0)) revert ZeroAddress();
-        usdc = usdc_;
-        mUsdc = mUsdc_;
-        mCbBTC = mCbBTC_;
-        mWeth = mWeth_;
-        comptroller = comp_;
-        cbBTC = cbBTC_;
-        weth = weth_;
+        Layout storage $ = _s();
+        $.usdc = usdc_;
+        $.mUsdc = mUsdc_;
+        $.mCbBTC = mCbBTC_;
+        $.mWeth = mWeth_;
+        $.comptroller = comp_;
+        $.cbBTC = cbBTC_;
+        $.weth = weth_;
     }
 
     // ── Group B: pool, npm, gauge, swapRouter (fields 7-10) ──
@@ -299,10 +303,11 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         if (npm_ == address(0)) revert ZeroAddress();
         if (gauge_ == address(0)) revert ZeroAddress();
         if (swapRouter_ == address(0)) revert ZeroAddress();
-        pool = pool_;
-        npm = npm_;
-        gauge = gauge_;
-        swapRouter = swapRouter_;
+        Layout storage $ = _s();
+        $.pool = pool_;
+        $.npm = npm_;
+        $.gauge = gauge_;
+        $.swapRouter = swapRouter_;
     }
 
     // ── Group C: cbBTCFeed, wethFeed, usdcFeed, sequencerFeed (fields 11-14) ──
@@ -314,10 +319,11 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         if (wethFeed_ == address(0)) revert ZeroAddress();
         if (usdcFeed_ == address(0)) revert ZeroAddress();
         if (seqFeed_ == address(0)) revert ZeroAddress();
-        cbBTCFeed = cbBTCFeed_;
-        wethFeed = wethFeed_;
-        usdcFeed = usdcFeed_;
-        sequencerFeed = seqFeed_;
+        Layout storage $ = _s();
+        $.cbBTCFeed = cbBTCFeed_;
+        $.wethFeed = wethFeed_;
+        $.usdcFeed = usdcFeed_;
+        $.sequencerFeed = seqFeed_;
     }
 
     // ── Group D: maxDelay, gracePeriod, calmDeviationTicks, twapWindow (fields 15-18) ──
@@ -325,10 +331,11 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     function _initGroupD(bytes calldata d) private {
         (uint256 maxDelay_, uint256 gracePeriod_, uint16 calm_, uint32 twap_) =
             abi.decode(d, (uint256, uint256, uint16, uint32));
-        maxDelay = maxDelay_;
-        gracePeriod = gracePeriod_;
-        calmDeviationTicks = calm_;
-        twapWindow = twap_;
+        Layout storage $ = _s();
+        $.maxDelay = maxDelay_;
+        $.gracePeriod = gracePeriod_;
+        $.calmDeviationTicks = calm_;
+        $.twapWindow = twap_;
     }
 
     /// @dev Read the USDC collateral factor from `Comptroller.markets(mUsdc)`.
@@ -355,12 +362,13 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         if (target_ > maxLtv_) revert TargetLtvExceedsMax();
         if (minH_ < 10500) revert MinHealthTooLow();
         if (maxLtv_ >= cfBps) revert MaxLtvExceedsCF();
-        tickSpacing = ts_;
-        targetLtvBps = target_;
-        maxLtvBps = maxLtv_;
-        minHealthBps = minH_;
-        maxSlippageBps = slip_;
-        usdcCollateralFactorBps = cfBps;
+        Layout storage $ = _s();
+        $.tickSpacing = ts_;
+        $.targetLtvBps = target_;
+        $.maxLtvBps = maxLtv_;
+        $.minHealthBps = minH_;
+        $.maxSlippageBps = slip_;
+        $.usdcCollateralFactorBps = cfBps;
     }
 
     // ── Group F: managementFeeBps, performanceFeeBps, feeRecipient (fields 24-26) ──
@@ -368,9 +376,10 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     function _initGroupF(bytes calldata d) private {
         (uint16 mgmt_, uint16 perf_, address recipient_) = abi.decode(d, (uint16, uint16, address));
         if ((mgmt_ != 0 || perf_ != 0) && recipient_ == address(0)) revert FeeRecipientRequired();
-        managementFeeBps = mgmt_;
-        performanceFeeBps = perf_;
-        feeRecipient = recipient_;
+        Layout storage $ = _s();
+        $.managementFeeBps = mgmt_;
+        $.performanceFeeBps = perf_;
+        $.feeRecipient = recipient_;
         // hwmPerShare = 0 (default) — set on first deposit.
         // tokenId / posTickLower / posTickUpper = 0 (default) — set in _execute.
     }
@@ -393,9 +402,10 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     ///           `LeveragedAeroValuation.netEquityUsdc` — oracle-implied sqrtP,
     ///           fail-closed (reverts on any oracle/calm failure or non-positive equity).
     function nav() public view virtual returns (uint256) {
-        if (tokenId == 0) {
+        Layout storage $ = _s();
+        if ($.tokenId == 0) {
             // Flat book: sum idle USDC in vault + strategy (face, 6dp, no oracle needed).
-            return IERC20(usdc).balanceOf(vault()) + IERC20(usdc).balanceOf(address(this));
+            return IERC20($.usdc).balanceOf(vault()) + IERC20($.usdc).balanceOf(address(this));
         }
         // Active position: read ticks + liquidity from the NPM and delegate to the valuation lib.
         (int24 tickLower, int24 tickUpper, uint128 liquidity) = _npmPositionData();
@@ -415,8 +425,8 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     ///      Memory layout of `ret` (bytes): [length @ offset 0][data start @ offset 0x20].
     ///      Field at index N starts at `ret + 0x20 + N * 0x20`.
     function _npmPositionData() internal view returns (int24 tickLower, int24 tickUpper, uint128 liquidity) {
-        address npm_ = npm;
-        uint256 tokenId_ = tokenId;
+        address npm_ = _s().npm;
+        uint256 tokenId_ = _s().tokenId;
         bool ok;
         bytes memory ret;
         (ok, ret) = npm_.staticcall(abi.encodeWithSelector(INonfungiblePositionManager.positions.selector, tokenId_));
@@ -442,8 +452,9 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     ///         The `ref` payload encodes the market addresses required by the
     ///         `LEVERAGED_AERO_CL` adapter (once registered) to verify the venues.
     function positions() external view override returns (Position[] memory pos) {
+        Layout storage $ = _s();
         pos = new Position[](1);
-        pos[0] = Position({venue: pool, kind: POSITION_KIND, ref: abi.encode(gauge, mUsdc, mCbBTC, mWeth)});
+        pos[0] = Position({venue: $.pool, kind: POSITION_KIND, ref: abi.encode($.gauge, $.mUsdc, $.mCbBTC, $.mWeth)});
     }
 
     // ─────────────────────────────────────────────────────────────
@@ -470,14 +481,15 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         // Part 0 belt-and-suspenders: ensure the fee accrual clock is running.
         // _initialize already seeds this; this guard prevents a ~54-year dt on the
         // first crystallize if (somehow) a clone bypasses _initialize.
-        if (lastFeeAccrualTimestamp == 0) lastFeeAccrualTimestamp = block.timestamp;
+        if (_s().lastFeeAccrualTimestamp == 0) _s().lastFeeAccrualTimestamp = block.timestamp;
     }
 
     /// @dev Supply all strategy USDC to Moonwell and enter the mUSDC market.
     ///      Returns the amount of USDC supplied (needed for borrow sizing).
     function _supplyCollateral() private returns (uint256 usdcAmt) {
-        address usdc_ = usdc;
-        address mUsdc_ = mUsdc;
+        Layout storage $ = _s();
+        address usdc_ = $.usdc;
+        address mUsdc_ = $.mUsdc;
         usdcAmt = IERC20(usdc_).balanceOf(address(this));
         if (usdcAmt == 0) revert ExecuteZeroBalance();
         IERC20(usdc_).forceApprove(mUsdc_, usdcAmt);
@@ -485,7 +497,7 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         if (err != 0) revert MoonwellMintFailed(err);
         address[] memory markets = new address[](1);
         markets[0] = mUsdc_;
-        IComptroller(comptroller).enterMarkets(markets);
+        IComptroller($.comptroller).enterMarkets(markets);
     }
 
     /// @dev Read Chainlink prices, compute borrow amounts, and execute both borrows.
@@ -497,15 +509,16 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     ///      cbBTC amount (8dp) = halfBorrowUsd8 × 1e8 / pBTC_8dp
     ///      WETH  amount (18dp) = halfBorrowUsd8 × 1e18 / pETH_8dp
     function _computeAndBorrow(uint256 usdcAmt) private returns (uint256 cbBTCAmt, uint256 wethAmt) {
-        (uint256 pBTC,) = ChainlinkReader.readUsd(cbBTCFeed, sequencerFeed, maxDelay, gracePeriod);
-        (uint256 pETH,) = ChainlinkReader.readUsd(wethFeed, sequencerFeed, maxDelay, gracePeriod);
+        Layout storage $ = _s();
+        (uint256 pBTC,) = ChainlinkReader.readUsd($.cbBTCFeed, $.sequencerFeed, $.maxDelay, $.gracePeriod);
+        (uint256 pETH,) = ChainlinkReader.readUsd($.wethFeed, $.sequencerFeed, $.maxDelay, $.gracePeriod);
         // halfBorrowUsd8: usdcAmt (6dp) → 8dp via ×100, then ×targetLtvBps÷(2×10000)
-        uint256 halfBorrowUsd8 = (usdcAmt * 100 * uint256(targetLtvBps)) / (2 * 10000);
+        uint256 halfBorrowUsd8 = (usdcAmt * 100 * uint256($.targetLtvBps)) / (2 * 10000);
         cbBTCAmt = (halfBorrowUsd8 * 1e8) / pBTC;
         wethAmt = (halfBorrowUsd8 * 1e18) / pETH;
-        uint256 cbErr = IMoonwellMarket(mCbBTC).borrow(cbBTCAmt);
+        uint256 cbErr = IMoonwellMarket($.mCbBTC).borrow(cbBTCAmt);
         if (cbErr != 0) revert MoonwellBorrowFailed(cbErr);
-        uint256 wethErr = IMoonwellMarket(mWeth).borrow(wethAmt);
+        uint256 wethErr = IMoonwellMarket($.mWeth).borrow(wethAmt);
         if (wethErr != 0) revert MoonwellBorrowFailed(wethErr);
     }
 
@@ -515,14 +528,15 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     function _wrapNativeEth() private {
         uint256 ethBal = address(this).balance;
         if (ethBal > 0) {
-            IWETH9(weth).deposit{value: ethBal}();
+            IWETH9(_s().weth).deposit{value: ethBal}();
         }
     }
 
     /// @dev Compute a tickSpacing-aligned range centred on the current pool tick.
     function _computeTickRange() private view returns (int24 tL, int24 tU) {
-        (, int24 currentTick,,,,) = ICLPool(pool).slot0();
-        int24 ts = tickSpacing;
+        Layout storage $ = _s();
+        (, int24 currentTick,,,,) = ICLPool($.pool).slot0();
+        int24 ts = $.tickSpacing;
         int24 span = int24(uint24(RANGE_TICK_SPACINGS)) * ts;
         tL = _alignTick(currentTick - span, ts);
         tU = _alignTick(currentTick + span, ts);
@@ -548,17 +562,18 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     ///      correct; the calm-gate guarantees sqrtP ≈ TWAP so exp0/exp1 reflect
     ///      genuine price and the mins only absorb in-block drift.
     function _mintPosition(uint256 wethAmt, uint256 cbBTCAmt, int24 tL, int24 tU) private returns (uint256 tid) {
-        address npm_ = npm;
-        address weth_ = weth;
-        address cbBTC_ = cbBTC;
+        Layout storage $ = _s();
+        address npm_ = $.npm;
+        address weth_ = $.weth;
+        address cbBTC_ = $.cbBTC;
 
         // Compute expected actual deposits at the calm-gated sqrtP.
-        (uint160 sqrtP,,,,,) = ICLPool(pool).slot0();
+        (uint160 sqrtP,,,,,) = ICLPool($.pool).slot0();
         uint160 sqrtLower = TickMath.getSqrtRatioAtTick(tL);
         uint160 sqrtUpper = TickMath.getSqrtRatioAtTick(tU);
         uint128 L = LiquidityAmounts.getLiquidityForAmounts(sqrtP, sqrtLower, sqrtUpper, wethAmt, cbBTCAmt);
         (uint256 exp0, uint256 exp1) = LiquidityAmounts.getAmountsForLiquidity(sqrtP, sqrtLower, sqrtUpper, L);
-        uint256 slip = uint256(maxSlippageBps);
+        uint256 slip = uint256($.maxSlippageBps);
         uint256 amt0Min = exp0 * (10000 - slip) / 10000;
         uint256 amt1Min = exp1 * (10000 - slip) / 10000;
 
@@ -567,7 +582,7 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         INonfungiblePositionManager.MintParams memory mp = INonfungiblePositionManager.MintParams({
             token0: weth_,
             token1: cbBTC_,
-            tickSpacing: tickSpacing,
+            tickSpacing: $.tickSpacing,
             tickLower: tL,
             tickUpper: tU,
             amount0Desired: wethAmt,
@@ -587,19 +602,20 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         // Calm-gate: revert CalmGateBreached if spot tick deviates from TWAP beyond
         // `calmDeviationTicks`. Must run before _computeTickRange (which reads spot tick)
         // and before _mintPosition (which anchors slippage mins to the calm sqrtP).
+        Layout storage $ = _s();
         LeveragedAeroValuation._calmGate(_cfg());
         (int24 tL, int24 tU) = _computeTickRange();
         uint256 tid = _mintPosition(wethAmt, cbBTCAmt, tL, tU);
-        address gauge_ = gauge;
+        address gauge_ = $.gauge;
         // ERC-721 approve: same function selector as ERC-20 approve (approve(address,uint256))
         // but operates on the NFT, not a fungible allowance. Low-level call avoids IERC20 cast.
-        (bool ok,) = npm.call(abi.encodeWithSignature("approve(address,uint256)", gauge_, tid));
+        (bool ok,) = $.npm.call(abi.encodeWithSignature("approve(address,uint256)", gauge_, tid));
         if (!ok) revert NpmApproveFailed();
         ICLGauge(gauge_).deposit(tid);
         // Persist position state (so nav()/positions() see the live position)
-        tokenId = tid;
-        posTickLower = tL;
-        posTickUpper = tU;
+        $.tokenId = tid;
+        $.posTickLower = tL;
+        $.posTickUpper = tU;
     }
 
     /// @dev Align `tick` down to the nearest multiple of `spacing`.
@@ -621,63 +637,67 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     ///           6. Clear position state (tokenId = 0 restores flat-book invariant).
     ///           7. Push all USDC back to vault.
     function _settle() internal override {
+        Layout storage $ = _s();
         // 1+2. Unstake + remove 100% liquidity + collect (num==den → no restake)
         _unwindLiquidity(1, 1);
         // 3. Repay both Moonwell borrows (handles shortfall)
         _settleRepayDebts();
         // 4. Redeem all remaining mUSDC collateral (debt = 0 now)
-        uint256 mBal = ICToken(mUsdc).balanceOf(address(this));
+        uint256 mBal = ICToken($.mUsdc).balanceOf(address(this));
         if (mBal > 0) {
-            uint256 err = ICToken(mUsdc).redeem(mBal);
+            uint256 err = ICToken($.mUsdc).redeem(mBal);
             if (err != 0) revert MoonwellRedeemFailed(err);
         }
         // 5. Sweep residual WETH + cbBTC → USDC (Chainlink-bounded min-out)
         {
-            (uint256 pBTC,) = ChainlinkReader.readUsd(cbBTCFeed, sequencerFeed, maxDelay, gracePeriod);
-            (uint256 pETH,) = ChainlinkReader.readUsd(wethFeed, sequencerFeed, maxDelay, gracePeriod);
-            (uint256 pUsdc,) = ChainlinkReader.readUsd(usdcFeed, sequencerFeed, maxDelay, gracePeriod);
-            uint256 slip = uint256(maxSlippageBps);
+            (uint256 pBTC,) = ChainlinkReader.readUsd($.cbBTCFeed, $.sequencerFeed, $.maxDelay, $.gracePeriod);
+            (uint256 pETH,) = ChainlinkReader.readUsd($.wethFeed, $.sequencerFeed, $.maxDelay, $.gracePeriod);
+            (uint256 pUsdc,) = ChainlinkReader.readUsd($.usdcFeed, $.sequencerFeed, $.maxDelay, $.gracePeriod);
+            uint256 slip = uint256($.maxSlippageBps);
             _swapTokenToUsdc(
-                weth,
-                _tokenToUsdc(IERC20(weth).balanceOf(address(this)), WETH_DECIMALS, pETH, pUsdc) * (10000 - slip) / 10000
+                $.weth,
+                _tokenToUsdc(IERC20($.weth).balanceOf(address(this)), WETH_DECIMALS, pETH, pUsdc) * (10000 - slip)
+                    / 10000
             );
             _swapTokenToUsdc(
-                cbBTC,
-                _tokenToUsdc(IERC20(cbBTC).balanceOf(address(this)), CBBTC_DECIMALS, pBTC, pUsdc) * (10000 - slip)
+                $.cbBTC,
+                _tokenToUsdc(IERC20($.cbBTC).balanceOf(address(this)), CBBTC_DECIMALS, pBTC, pUsdc) * (10000 - slip)
                     / 10000
             );
         }
         // 6. Clear position state (flat-book invariant: nav() reads tokenId==0 branch)
-        tokenId = 0;
-        posTickLower = 0;
-        posTickUpper = 0;
+        $.tokenId = 0;
+        $.posTickLower = 0;
+        $.posTickUpper = 0;
         // 7. Push all USDC back to vault
-        _pushAllToVault(usdc);
+        _pushAllToVault($.usdc);
     }
 
     /// @dev Unstake NFT, remove num/den fraction of liquidity, collect both tokens.
     ///      When num==den (full settle), no restake — remaining liq will be 0.
     ///      When num<den (partial redeem), restakes if remaining liq > 0.
     function _unwindLiquidity(uint256 num, uint256 den) private {
-        uint256 tid = tokenId;
+        Layout storage $ = _s();
+        uint256 tid = $.tokenId;
         if (tid == 0) return; // flat book — no LP to unwind
 
         (int24 tL, int24 tU, uint128 liq) = _npmPositionData();
 
         // Unstake so NPM can modify the position
-        address gauge_ = gauge;
+        address gauge_ = $.gauge;
+        address npm_ = $.npm;
         ICLGauge(gauge_).withdraw(tid);
 
         uint128 liqToRemove = (num == den) ? liq : uint128(Math.mulDiv(uint256(liq), num, den));
 
         if (liqToRemove > 0) {
-            (uint160 sqrtP,,,,,) = ICLPool(pool).slot0();
+            (uint160 sqrtP,,,,,) = ICLPool($.pool).slot0();
             uint160 sqrtLower = TickMath.getSqrtRatioAtTick(tL);
             uint160 sqrtUpper = TickMath.getSqrtRatioAtTick(tU);
             (uint256 exp0, uint256 exp1) =
                 LiquidityAmounts.getAmountsForLiquidity(sqrtP, sqrtLower, sqrtUpper, liqToRemove);
-            uint256 slip = uint256(maxSlippageBps);
-            INonfungiblePositionManager(npm)
+            uint256 slip = uint256($.maxSlippageBps);
+            INonfungiblePositionManager(npm_)
                 .decreaseLiquidity(
                     INonfungiblePositionManager.DecreaseLiquidityParams({
                     tokenId: tid,
@@ -687,7 +707,7 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
                     deadline: block.timestamp + 600
                 })
                 );
-            INonfungiblePositionManager(npm)
+            INonfungiblePositionManager(npm_)
                 .collect(
                     INonfungiblePositionManager.CollectParams({
                     tokenId: tid, recipient: address(this), amount0Max: type(uint128).max, amount1Max: type(uint128).max
@@ -698,7 +718,7 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         // Re-stake only when remaining liquidity is non-zero.
         (,, uint128 remainingLiq) = _npmPositionData();
         if (remainingLiq > 0) {
-            (bool ok,) = npm.call(abi.encodeWithSignature("approve(address,uint256)", gauge_, tid));
+            (bool ok,) = npm_.call(abi.encodeWithSignature("approve(address,uint256)", gauge_, tid));
             if (!ok) revert NpmApproveFailed();
             ICLGauge(gauge_).deposit(tid);
         }
@@ -707,10 +727,11 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     /// @dev Repay as much of both Moonwell borrows as the current token balances allow,
     ///      then delegate to _settleShortfall() to cover any remaining debt via USDC swap.
     function _settleRepayDebts() private {
-        address mCbBTC_ = mCbBTC;
-        address mWeth_ = mWeth;
-        address cbBTC_ = cbBTC;
-        address weth_ = weth;
+        Layout storage $ = _s();
+        address mCbBTC_ = $.mCbBTC;
+        address mWeth_ = $.mWeth;
+        address cbBTC_ = $.cbBTC;
+        address weth_ = $.weth;
         uint256 cbDebt = IMoonwellMarket(mCbBTC_).borrowBalanceStored(address(this));
         uint256 wethDebt = IMoonwellMarket(mWeth_).borrowBalanceStored(address(this));
         // Repay cbBTC
@@ -743,13 +764,14 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     ///      cbBTC units; at $1600 ETH it buys ~6e7 wei WETH.  Any over-purchased token is swept
     ///      in step 5 of `_settle` and the excess USDC flows to the vault in step 7.
     function _settleShortfall() private {
-        uint256 cbDebtRem = IMoonwellMarket(mCbBTC).borrowBalanceStored(address(this));
-        uint256 wethDebtRem = IMoonwellMarket(mWeth).borrowBalanceStored(address(this));
+        Layout storage $ = _s();
+        uint256 cbDebtRem = IMoonwellMarket($.mCbBTC).borrowBalanceStored(address(this));
+        uint256 wethDebtRem = IMoonwellMarket($.mWeth).borrowBalanceStored(address(this));
         if (cbDebtRem == 0 && wethDebtRem == 0) return;
         // Read Chainlink prices (8dp each)
-        (uint256 pBTC,) = ChainlinkReader.readUsd(cbBTCFeed, sequencerFeed, maxDelay, gracePeriod);
-        (uint256 pETH,) = ChainlinkReader.readUsd(wethFeed, sequencerFeed, maxDelay, gracePeriod);
-        (uint256 pUsdc,) = ChainlinkReader.readUsd(usdcFeed, sequencerFeed, maxDelay, gracePeriod);
+        (uint256 pBTC,) = ChainlinkReader.readUsd($.cbBTCFeed, $.sequencerFeed, $.maxDelay, $.gracePeriod);
+        (uint256 pETH,) = ChainlinkReader.readUsd($.wethFeed, $.sequencerFeed, $.maxDelay, $.gracePeriod);
+        (uint256 pUsdc,) = ChainlinkReader.readUsd($.usdcFeed, $.sequencerFeed, $.maxDelay, $.gracePeriod);
         // USDC needed for each shortfall leg (+10% buffer)
         uint256 cbUsdcNeed = _tokenToUsdc(cbDebtRem, 8, pBTC, pUsdc) * 11000 / 10000;
         uint256 wethUsdcNeed = _tokenToUsdc(wethDebtRem, 18, pETH, pUsdc) * 11000 / 10000;
@@ -760,28 +782,28 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         uint256 totalNeed = cbUsdcNeed + wethUsdcNeed;
         // Redeem USDC collateral to fund the swaps (health elevated after partial repays)
         if (totalNeed > 0) {
-            uint256 redeemErr = ICToken(mUsdc).redeemUnderlying(totalNeed);
+            uint256 redeemErr = ICToken($.mUsdc).redeemUnderlying(totalNeed);
             if (redeemErr != 0) revert MoonwellRedeemFailed(redeemErr);
         }
-        uint256 slip = uint256(maxSlippageBps);
+        uint256 slip = uint256($.maxSlippageBps);
         // Cover cbBTC shortfall
         if (cbDebtRem > 0) {
-            _swapUsdcExactIn(cbBTC, cbUsdcNeed, cbDebtRem * (10000 - slip) / 10000);
-            uint256 cbBal2 = IERC20(cbBTC).balanceOf(address(this));
+            _swapUsdcExactIn($.cbBTC, cbUsdcNeed, cbDebtRem * (10000 - slip) / 10000);
+            uint256 cbBal2 = IERC20($.cbBTC).balanceOf(address(this));
             if (cbBal2 > 0) {
-                IERC20(cbBTC).forceApprove(mCbBTC, cbBal2);
-                uint256 err = IMoonwellMarket(mCbBTC).repayBorrow(type(uint256).max);
+                IERC20($.cbBTC).forceApprove($.mCbBTC, cbBal2);
+                uint256 err = IMoonwellMarket($.mCbBTC).repayBorrow(type(uint256).max);
                 if (err != 0) revert MoonwellRepayFailed(err);
             }
         }
         // Cover WETH shortfall (spend remaining USDC after cbBTC leg)
         if (wethDebtRem > 0) {
-            uint256 usdcLeft = IERC20(usdc).balanceOf(address(this));
-            _swapUsdcExactIn(weth, usdcLeft, wethDebtRem * (10000 - slip) / 10000);
-            uint256 wBal2 = IERC20(weth).balanceOf(address(this));
+            uint256 usdcLeft = IERC20($.usdc).balanceOf(address(this));
+            _swapUsdcExactIn($.weth, usdcLeft, wethDebtRem * (10000 - slip) / 10000);
+            uint256 wBal2 = IERC20($.weth).balanceOf(address(this));
             if (wBal2 > 0) {
-                IERC20(weth).forceApprove(mWeth, wBal2);
-                uint256 err = IMoonwellMarket(mWeth).repayBorrow(type(uint256).max);
+                IERC20($.weth).forceApprove($.mWeth, wBal2);
+                uint256 err = IMoonwellMarket($.mWeth).repayBorrow(type(uint256).max);
                 if (err != 0) revert MoonwellRepayFailed(err);
             }
         }
@@ -792,14 +814,15 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     ///      cannot cause a revert — we swap whatever USDC we have.
     ///      USDC/WETH and USDC/cbBTC pools both use tickSpacing=100 (fork-confirmed).
     function _swapUsdcExactIn(address tokenOut, uint256 amountIn, uint256 minAmtOut) private {
-        uint256 usdcBal = IERC20(usdc).balanceOf(address(this));
+        Layout storage $ = _s();
+        uint256 usdcBal = IERC20($.usdc).balanceOf(address(this));
         uint256 actualIn = usdcBal < amountIn ? usdcBal : amountIn;
         if (actualIn == 0) return;
-        IERC20(usdc).forceApprove(swapRouter, actualIn);
-        ICLSwapRouter(swapRouter)
+        IERC20($.usdc).forceApprove($.swapRouter, actualIn);
+        ICLSwapRouter($.swapRouter)
             .exactInputSingle(
                 ICLSwapRouter.ExactInputSingleParams({
-                tokenIn: usdc,
+                tokenIn: $.usdc,
                 tokenOut: tokenOut,
                 tickSpacing: int24(100),
                 recipient: address(this),
@@ -814,14 +837,15 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     /// @dev Sweep the full balance of `tokenIn` to USDC via exactInputSingle.
     ///      minOut=0 is valid (oracle-free redeem path; aggregate guard protects caller).
     function _swapTokenToUsdc(address tokenIn, uint256 minOut) private {
+        Layout storage $ = _s();
         uint256 bal = IERC20(tokenIn).balanceOf(address(this));
         if (bal == 0) return;
-        IERC20(tokenIn).forceApprove(swapRouter, bal);
-        ICLSwapRouter(swapRouter)
+        IERC20(tokenIn).forceApprove($.swapRouter, bal);
+        ICLSwapRouter($.swapRouter)
             .exactInputSingle(
                 ICLSwapRouter.ExactInputSingleParams({
                 tokenIn: tokenIn,
-                tokenOut: usdc,
+                tokenOut: $.usdc,
                 tickSpacing: int24(100),
                 recipient: address(this),
                 deadline: block.timestamp + 600,
@@ -854,21 +878,22 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     ///         Called at the end of `_execute`.  Later tasks wire it into deployIdle /
     ///         adjustLeverage / deleverage / redeem's post-unwind as well.
     function _assertHealthy() internal view {
+        Layout storage $ = _s();
         // ── Collateral (USDC face, 6dp) — mirrors LeveragedAeroValuation._collateralUsdc ──
-        address mUsdc_ = mUsdc;
+        address mUsdc_ = $.mUsdc;
         uint256 cBal = ICToken(mUsdc_).balanceOf(address(this));
         uint256 rate = ICToken(mUsdc_).exchangeRateStored();
         uint256 collateralUsd = (cBal * rate) / 1e18;
 
         // ── Raw borrow balances ──
-        uint256 cbDebt = IMoonwellMarket(mCbBTC).borrowBalanceStored(address(this));
-        uint256 wethDebt = IMoonwellMarket(mWeth).borrowBalanceStored(address(this));
+        uint256 cbDebt = IMoonwellMarket($.mCbBTC).borrowBalanceStored(address(this));
+        uint256 wethDebt = IMoonwellMarket($.mWeth).borrowBalanceStored(address(this));
         if (cbDebt == 0 && wethDebt == 0) return; // no debt → trivially healthy (skip oracle)
 
         // ── Price via hardened Chainlink (same feeds + staleness guards as nav()) ──
-        (uint256 pBTC,) = ChainlinkReader.readUsd(cbBTCFeed, sequencerFeed, maxDelay, gracePeriod);
-        (uint256 pETH,) = ChainlinkReader.readUsd(wethFeed, sequencerFeed, maxDelay, gracePeriod);
-        (uint256 pUsdc,) = ChainlinkReader.readUsd(usdcFeed, sequencerFeed, maxDelay, gracePeriod);
+        (uint256 pBTC,) = ChainlinkReader.readUsd($.cbBTCFeed, $.sequencerFeed, $.maxDelay, $.gracePeriod);
+        (uint256 pETH,) = ChainlinkReader.readUsd($.wethFeed, $.sequencerFeed, $.maxDelay, $.gracePeriod);
+        (uint256 pUsdc,) = ChainlinkReader.readUsd($.usdcFeed, $.sequencerFeed, $.maxDelay, $.gracePeriod);
 
         // ── Debt (USDC face, 6dp) ──
         uint256 debtUsd =
@@ -876,7 +901,7 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         if (debtUsd == 0) return; // dust-level debt rounds to 0 → trivially healthy
 
         // ── LTV check — binding post-op gate ──
-        uint16 maxLtv = maxLtvBps;
+        uint16 maxLtv = $.maxLtvBps;
         // Zero collateral with non-zero debt is maximally unhealthy
         if (collateralUsd == 0) revert UnhealthyPosition(type(uint256).max, uint256(maxLtv));
         uint256 ltvBps_ = (debtUsd * 10_000) / collateralUsd;
@@ -884,7 +909,7 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
 
         // ── Moonwell belt: authoritative no-liquidation check ──
         // `getAccountLiquidity` uses Moonwell's own oracle + CF factors → definitive last word.
-        (uint256 err,, uint256 shortfall) = IComptroller(comptroller).getAccountLiquidity(address(this));
+        (uint256 err,, uint256 shortfall) = IComptroller($.comptroller).getAccountLiquidity(address(this));
         if (err != 0 || shortfall != 0) revert UnhealthyPosition(ltvBps_, uint256(maxLtv));
     }
 
@@ -899,24 +924,25 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     ///
     /// @param navPre  Pre-action NAV (USDC, 6dp).  Pass 0 to skip fees (oracle-free path).
     function _crystallizeFees(uint256 navPre) private {
+        Layout storage $ = _s();
         uint256 ts = IERC20(vault()).totalSupply();
         if (ts == 0) return;
-        if (lastFeeAccrualTimestamp == 0) {
-            lastFeeAccrualTimestamp = block.timestamp;
+        if ($.lastFeeAccrualTimestamp == 0) {
+            $.lastFeeAccrualTimestamp = block.timestamp;
             return;
         }
         (uint256 feeShares, uint256 newHwm, uint256 newLast) = LeveragedAeroFees.crystallize(
             navPre,
             ts,
-            hwmPerShare,
-            lastFeeAccrualTimestamp,
+            $.hwmPerShare,
+            $.lastFeeAccrualTimestamp,
             block.timestamp,
-            uint256(managementFeeBps),
-            uint256(performanceFeeBps)
+            uint256($.managementFeeBps),
+            uint256($.performanceFeeBps)
         );
-        hwmPerShare = newHwm;
-        lastFeeAccrualTimestamp = newLast;
-        if (feeShares > 0) ISyndicateVault(vault()).strategyMint(feeRecipient, feeShares);
+        $.hwmPerShare = newHwm;
+        $.lastFeeAccrualTimestamp = newLast;
+        if (feeShares > 0) ISyndicateVault(vault()).strategyMint($.feeRecipient, feeShares);
     }
 
     /// @notice Oracle-priced deposit: mint vault shares proportional to current NAV.
@@ -939,7 +965,7 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         // Crystallize on pre-deposit NAV (fail-closed: oracle down → correct revert for deposit).
         uint256 navPre = nav();
         _crystallizeFees(navPre);
-        IERC20(usdc).safeTransferFrom(msg.sender, address(this), assets);
+        IERC20(_s().usdc).safeTransferFrom(msg.sender, address(this), assets);
         address vault_ = vault();
         uint256 supply = IERC20(vault_).totalSupply();
         shares = Math.mulDiv(assets, supply + SHARES_VIRTUAL_OFFSET, navPre + 1);
@@ -965,17 +991,18 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     /// @param minLiquidity Minimum liquidity units to accept (slippage guard).
     function deployIdle(uint256 amount, uint256 minLiquidity) external onlyProposer nonReentrant {
         if (_state != State.Executed) revert NotExecuted();
-        if (amount > IERC20(usdc).balanceOf(address(this))) revert InsufficientIdle();
+        Layout storage $ = _s();
+        if (amount > IERC20($.usdc).balanceOf(address(this))) revert InsufficientIdle();
         _supplyAmount(amount);
         (uint256 cbBTCAmt, uint256 wethAmt) = _computeAndBorrow(amount);
         _wrapNativeEth();
         // Unstake the NFT so NPM.increaseLiquidity can update the position (requires ownership).
-        uint256 tid = tokenId;
-        address gauge_ = gauge;
+        uint256 tid = $.tokenId;
+        address gauge_ = $.gauge;
         ICLGauge(gauge_).withdraw(tid);
         _addLiquidity(wethAmt, cbBTCAmt, minLiquidity);
         // Re-stake to resume AERO gauge rewards (mirrors _mintAndStake).
-        (bool ok,) = npm.call(abi.encodeWithSignature("approve(address,uint256)", gauge_, tid));
+        (bool ok,) = $.npm.call(abi.encodeWithSignature("approve(address,uint256)", gauge_, tid));
         if (!ok) revert NpmApproveFailed();
         ICLGauge(gauge_).deposit(tid);
         _assertHealthy();
@@ -985,8 +1012,9 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     ///      Unlike `_supplyCollateral`, this does NOT read the full balance and does
     ///      NOT call enterMarkets (already called in _execute).
     function _supplyAmount(uint256 amt) private {
-        IERC20(usdc).forceApprove(mUsdc, amt);
-        uint256 err = ICToken(mUsdc).mint(amt);
+        Layout storage $ = _s();
+        IERC20($.usdc).forceApprove($.mUsdc, amt);
+        uint256 err = ICToken($.mUsdc).mint(amt);
         if (err != 0) revert MoonwellMintFailed(err);
     }
 
@@ -999,17 +1027,19 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     ///      `require(msg.sender == gauge, "NG")` when the gauge holds the token.
     ///      See `deployIdle` for the unstake → increaseLiquidity → restake sequence.
     function _addLiquidity(uint256 wethAmt, uint256 cbBTCAmt, uint256 minLiquidity) private {
+        Layout storage $ = _s();
         LeveragedAeroValuation._calmGate(_cfg());
-        uint256 tid = tokenId;
-        (uint160 sqrtP,,,,,) = ICLPool(pool).slot0();
-        uint160 sqrtLower = TickMath.getSqrtRatioAtTick(posTickLower);
-        uint160 sqrtUpper = TickMath.getSqrtRatioAtTick(posTickUpper);
+        uint256 tid = $.tokenId;
+        address npm_ = $.npm;
+        (uint160 sqrtP,,,,,) = ICLPool($.pool).slot0();
+        uint160 sqrtLower = TickMath.getSqrtRatioAtTick($.posTickLower);
+        uint160 sqrtUpper = TickMath.getSqrtRatioAtTick($.posTickUpper);
         uint128 L = LiquidityAmounts.getLiquidityForAmounts(sqrtP, sqrtLower, sqrtUpper, wethAmt, cbBTCAmt);
         (uint256 exp0, uint256 exp1) = LiquidityAmounts.getAmountsForLiquidity(sqrtP, sqrtLower, sqrtUpper, L);
-        uint256 slip = uint256(maxSlippageBps);
-        IERC20(weth).forceApprove(npm, wethAmt);
-        IERC20(cbBTC).forceApprove(npm, cbBTCAmt);
-        (uint128 liq,,) = INonfungiblePositionManager(npm)
+        uint256 slip = uint256($.maxSlippageBps);
+        IERC20($.weth).forceApprove(npm_, wethAmt);
+        IERC20($.cbBTC).forceApprove(npm_, cbBTCAmt);
+        (uint128 liq,,) = INonfungiblePositionManager(npm_)
             .increaseLiquidity(
                 INonfungiblePositionManager.IncreaseLiquidityParams({
                 tokenId: tid,
@@ -1067,7 +1097,7 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         if (assetsOut < minAssetsOut) revert InsufficientAssetsOut();
 
         // 6. Pay out USDC.
-        IERC20(usdc).safeTransfer(msg.sender, assetsOut);
+        IERC20(_s().usdc).safeTransfer(msg.sender, assetsOut);
 
         // 7. Burn shares (strategy holds them after safeTransferFrom above).
         ISyndicateVault(vault_).strategyBurn(shares);
@@ -1082,8 +1112,9 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     ///      keep (1-f).  We snapshot `idleUsdcBefore` and subtract `stayersIdle` from the
     ///      final balance so the stayers' portion is never transferred to the redeemer.
     function _redeemUnwind(uint256 shares, uint256 supply) private returns (uint256) {
+        Layout storage $ = _s();
         // Snapshot idle USDC — stayers keep (1-f) of it.
-        uint256 idleUsdcBefore = IERC20(usdc).balanceOf(address(this));
+        uint256 idleUsdcBefore = IERC20($.usdc).balanceOf(address(this));
         uint256 stayersIdle = idleUsdcBefore - Math.mulDiv(idleUsdcBefore, shares, supply);
 
         // A — partial CL unwind (pool-based mins, oracle-free).
@@ -1095,24 +1126,24 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         if (shares == supply) {
             // Full redemption: must clear ALL debt before redeeming 100% of collateral.
             // Cover shortfall from idle USDC first (if any), then redeem all collateral.
-            if (cbShort > 0) _redeemCoverShortfall(cbBTC, mCbBTC, cbShort);
-            if (wethShort > 0) _redeemCoverShortfall(weth, mWeth, wethShort);
+            if (cbShort > 0) _redeemCoverShortfall($.cbBTC, $.mCbBTC, cbShort);
+            if (wethShort > 0) _redeemCoverShortfall($.weth, $.mWeth, wethShort);
             _redeemCollateral(shares, supply);
         } else {
             // Partial redemption: redeem f*collateral first (Finding 1 fix).
             // (1-f)*collateral still backs (1-f)*debt even when shortfall exists,
             // so redeemUnderlying succeeds; the just-redeemed USDC self-funds coverage.
             _redeemCollateral(shares, supply);
-            if (cbShort > 0) _redeemCoverShortfall(cbBTC, mCbBTC, cbShort);
-            if (wethShort > 0) _redeemCoverShortfall(weth, mWeth, wethShort);
+            if (cbShort > 0) _redeemCoverShortfall($.cbBTC, $.mCbBTC, cbShort);
+            if (wethShort > 0) _redeemCoverShortfall($.weth, $.mWeth, wethShort);
         }
 
         // E — sweep any residual cbBTC/WETH → USDC (min-out=0; aggregate guard applies).
-        _swapTokenToUsdc(cbBTC, 0);
-        _swapTokenToUsdc(weth, 0);
+        _swapTokenToUsdc($.cbBTC, 0);
+        _swapTokenToUsdc($.weth, 0);
 
         // assetsOut = total USDC minus the (1-f) idle portion that stays for stayers.
-        uint256 usdcFinal = IERC20(usdc).balanceOf(address(this));
+        uint256 usdcFinal = IERC20($.usdc).balanceOf(address(this));
         return usdcFinal > stayersIdle ? usdcFinal - stayersIdle : 0;
     }
 
@@ -1123,10 +1154,11 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         private
         returns (uint256 cbShort, uint256 wethShort)
     {
-        address mCbBTC_ = mCbBTC;
-        address mWeth_ = mWeth;
-        address cbBTC_ = cbBTC;
-        address weth_ = weth;
+        Layout storage $ = _s();
+        address mCbBTC_ = $.mCbBTC;
+        address mWeth_ = $.mWeth;
+        address cbBTC_ = $.cbBTC;
+        address weth_ = $.weth;
 
         uint256 cbDebtRepay = Math.mulDiv(IMoonwellMarket(mCbBTC_).borrowBalanceStored(address(this)), shares, supply);
         uint256 wethDebtRepay = Math.mulDiv(IMoonwellMarket(mWeth_).borrowBalanceStored(address(this)), shares, supply);
@@ -1160,13 +1192,14 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     ///      exactOutputSingle, then repaying the exact remaining amount.
     ///      Oracle-free: spends at most all available USDC; aggregate minAssetsOut guards caller.
     function _redeemCoverShortfall(address tokenOut, address market, uint256 amountOut) private {
-        uint256 usdcBal = IERC20(usdc).balanceOf(address(this));
+        Layout storage $ = _s();
+        uint256 usdcBal = IERC20($.usdc).balanceOf(address(this));
         if (usdcBal == 0 || amountOut == 0) return;
-        IERC20(usdc).forceApprove(swapRouter, usdcBal);
-        ICLSwapRouter(swapRouter)
+        IERC20($.usdc).forceApprove($.swapRouter, usdcBal);
+        ICLSwapRouter($.swapRouter)
             .exactOutputSingle(
                 ICLSwapRouter.ExactOutputSingleParams({
-                tokenIn: usdc,
+                tokenIn: $.usdc,
                 tokenOut: tokenOut,
                 tickSpacing: int24(100),
                 recipient: address(this),
@@ -1176,7 +1209,7 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
                 sqrtPriceLimitX96: 0
             })
             );
-        IERC20(usdc).forceApprove(swapRouter, 0);
+        IERC20($.usdc).forceApprove($.swapRouter, 0);
         uint256 tokenBal = IERC20(tokenOut).balanceOf(address(this));
         if (tokenBal > 0) {
             IERC20(tokenOut).forceApprove(market, tokenBal);
@@ -1188,7 +1221,7 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     /// @dev Redeem f = shares/supply of the mUSDC underlying collateral.
     ///      Safe to call AFTER repaying f of each debt leg (LTV unchanged: (1-f)D / (1-f)C).
     function _redeemCollateral(uint256 shares, uint256 supply) private {
-        address mUsdc_ = mUsdc;
+        address mUsdc_ = _s().mUsdc;
         uint256 cBal = ICToken(mUsdc_).balanceOf(address(this));
         if (cBal == 0) return;
         uint256 rate = ICToken(mUsdc_).exchangeRateStored();
@@ -1214,23 +1247,24 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     ///      one sload→mstore per field, avoiding the 18-simultaneous-live-variable
     ///      overflow that the struct-literal notation can trigger under via_ir.
     function _cfg() internal view returns (LeveragedAeroValuation.Config memory c) {
-        c.usdc = usdc;
+        Layout storage $ = _s();
+        c.usdc = $.usdc;
         c.vault = vault();
-        c.mUsdc = mUsdc;
-        c.cbBTCMarket = mCbBTC;
-        c.wethMarket = mWeth;
-        c.cbBTC = cbBTC;
-        c.weth = weth;
+        c.mUsdc = $.mUsdc;
+        c.cbBTCMarket = $.mCbBTC;
+        c.wethMarket = $.mWeth;
+        c.cbBTC = $.cbBTC;
+        c.weth = $.weth;
         c.cbBTCDecimals = CBBTC_DECIMALS;
         c.wethDecimals = WETH_DECIMALS;
-        c.pool = pool;
-        c.cbBTCFeed = cbBTCFeed;
-        c.wethFeed = wethFeed;
-        c.usdcFeed = usdcFeed;
-        c.sequencerFeed = sequencerFeed;
-        c.maxDelay = maxDelay;
-        c.gracePeriod = gracePeriod;
-        c.calmDeviationTicks = calmDeviationTicks;
-        c.twapWindow = twapWindow;
+        c.pool = $.pool;
+        c.cbBTCFeed = $.cbBTCFeed;
+        c.wethFeed = $.wethFeed;
+        c.usdcFeed = $.usdcFeed;
+        c.sequencerFeed = $.sequencerFeed;
+        c.maxDelay = $.maxDelay;
+        c.gracePeriod = $.gracePeriod;
+        c.calmDeviationTicks = $.calmDeviationTicks;
+        c.twapWindow = $.twapWindow;
     }
 }
