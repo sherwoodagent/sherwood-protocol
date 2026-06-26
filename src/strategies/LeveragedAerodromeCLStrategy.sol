@@ -82,6 +82,8 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     error MoonwellRedeemFailed(uint256 errCode);
     /// @notice `deposit` returned fewer shares than `minShares`.
     error InsufficientShares();
+    /// @notice `redeem` produced fewer USDC than `minAssetsOut`.
+    error InsufficientAssetsOut();
     /// @notice `deployIdle` produced less liquidity than `minLiquidity`.
     error InsufficientLiquidity();
     /// @notice `deployIdle` called with more USDC than the strategy holds idle.
@@ -863,17 +865,21 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     }
 
     /// @dev Crystallise management + HWM performance fees on the PRE-ACTION vault state.
-    ///      Must be the FIRST call in deposit so no incoming capital inflates the HWM.
-    ///      Returns the navPre it computed so the caller can reuse it (avoids a second
-    ///      oracle read).  Crystallisation only mints shares — it never changes nav() —
-    ///      so the returned value is valid for share-math immediately after this call.
-    function _crystallizeFees() private returns (uint256 navPre) {
-        navPre = nav();
+    ///
+    ///      The caller supplies `navPre` (the NAV before any user funds move) rather than
+    ///      letting this function call `nav()` itself.  This makes crystallisation
+    ///      **oracle-tolerant**: the deposit path passes `nav()` (fail-closed, correct
+    ///      behaviour — a revert on oracle failure is right for deposit); the redeem path
+    ///      passes 0 when `nav()` is unavailable, causing `LeveragedAeroFees.crystallize`
+    ///      to return 0 fee-shares and advance the timestamp — redeem proceeds oracle-free.
+    ///
+    /// @param navPre  Pre-action NAV (USDC, 6dp).  Pass 0 to skip fees (oracle-free path).
+    function _crystallizeFees(uint256 navPre) private {
         uint256 ts = IERC20(vault()).totalSupply();
-        if (ts == 0) return navPre;
+        if (ts == 0) return;
         if (lastFeeAccrualTimestamp == 0) {
             lastFeeAccrualTimestamp = block.timestamp;
-            return navPre;
+            return;
         }
         (uint256 feeShares, uint256 newHwm, uint256 newLast) = LeveragedAeroFees.crystallize(
             navPre,
@@ -906,7 +912,9 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     /// @return shares   Vault shares minted to msg.sender.
     function deposit(uint256 assets, uint256 minShares) external nonReentrant returns (uint256 shares) {
         if (_state != State.Executed) revert NotExecuted();
-        uint256 navPre = _crystallizeFees();
+        // Crystallize on pre-deposit NAV (fail-closed: oracle down → correct revert for deposit).
+        uint256 navPre = nav();
+        _crystallizeFees(navPre);
         IERC20(usdc).safeTransferFrom(msg.sender, address(this), assets);
         address vault_ = vault();
         uint256 supply = IERC20(vault_).totalSupply();
@@ -989,6 +997,253 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
             })
             );
         if (uint256(liq) < minLiquidity) revert InsufficientLiquidity();
+    }
+
+    /// @notice Oracle-free proportional redeem: burn vault shares, receive pro-rata USDC.
+    ///
+    ///         The caller must call `vault.approve(strategy, shares)` first so this
+    ///         function can pull the shares via `safeTransferFrom`.
+    ///
+    ///         Call ordering:
+    ///           1. Best-effort fee crystallise — oracle down → navPre=0 → no fees →
+    ///              redeem proceeds unblocked (oracle-free guarantee).
+    ///           2. Fix fraction denominator ONCE (before burn so supply is stable).
+    ///           3. Pull shares from msg.sender via safeTransferFrom.
+    ///           4. Proportional oracle-free unwind (see _redeemUnwind).
+    ///           5. Revert if assetsOut < minAssetsOut (aggregate slippage guard).
+    ///           6. Transfer USDC to msg.sender.
+    ///           7. vault.strategyBurn(shares) — burns from the strategy's share balance.
+    ///           8. _assertHealthy() — LTV unchanged by proportional unwind; short-circuits
+    ///              when all debt was cleared (cbDebt==0 && wethDebt==0 → no oracle call).
+    ///
+    /// @param shares       Vault shares to redeem (12 dp).
+    /// @param minAssetsOut Minimum USDC to receive (oracle-free aggregate slippage guard).
+    /// @return assetsOut   USDC transferred to msg.sender.
+    function redeem(uint256 shares, uint256 minAssetsOut) external nonReentrant returns (uint256 assetsOut) {
+        if (_state != State.Executed) revert NotExecuted();
+
+        // 1. Best-effort crystallise: oracle outage → navPre=0 → no fees → proceed.
+        uint256 navPre;
+        try this.nav() returns (uint256 n) {
+            navPre = n;
+        } catch {
+            navPre = 0;
+        }
+        _crystallizeFees(navPre);
+
+        // 2. Fix the fraction denominator ONCE before the burn (totalSupply is stable here).
+        address vault_ = vault();
+        uint256 supply = IERC20(vault_).totalSupply();
+
+        // 3. Pull shares from caller (requires prior vault.approve(strategy, shares)).
+        IERC20(vault_).safeTransferFrom(msg.sender, address(this), shares);
+
+        // 4. Oracle-free proportional unwind.
+        assetsOut = _redeemUnwind(shares, supply);
+
+        // 5. Aggregate slippage guard.
+        if (assetsOut < minAssetsOut) revert InsufficientAssetsOut();
+
+        // 6. Pay out USDC.
+        IERC20(usdc).safeTransfer(msg.sender, assetsOut);
+
+        // 7. Burn shares (strategy holds them after safeTransferFrom above).
+        ISyndicateVault(vault_).strategyBurn(shares);
+
+        // 8. Health invariant: proportional unwind leaves LTV unchanged.
+        //    When cbDebt==0 && wethDebt==0 (full redemption), returns early — no oracle needed.
+        _assertHealthy();
+    }
+
+    /// @dev Proportional oracle-free unwind: remove f = shares/supply of every leg.
+    ///      Returns the redeemer's USDC (NOT the entire strategy balance).
+    ///      No Chainlink reads on this path — oracle outage cannot block a redeem.
+    ///
+    ///      Idle USDC accounting: the strategy may hold idle USDC from deposits not yet
+    ///      deployed via deployIdle.  The redeemer receives f of that idle USDC; stayers
+    ///      keep (1-f).  We snapshot `idleUsdcBefore` and subtract `stayersIdle` from the
+    ///      final balance so the stayers' portion is never transferred to the redeemer.
+    function _redeemUnwind(uint256 shares, uint256 supply) private returns (uint256) {
+        // Snapshot idle USDC — stayers keep (1-f) of it.
+        uint256 idleUsdcBefore = IERC20(usdc).balanceOf(address(this));
+        uint256 stayersIdle = idleUsdcBefore - Math.mulDiv(idleUsdcBefore, shares, supply);
+
+        // Step A — partial CL unwind (pool-based mins, oracle-free).
+        _redeemLiquidity(shares, supply);
+
+        // Step B — repay f of each Moonwell debt; cover IL shortfall via idle USDC.
+        _redeemRepayDebts(shares, supply);
+
+        // Step C — redeem f of mUSDC collateral (safe now: f of debt already cleared).
+        _redeemCollateral(shares, supply);
+
+        // Step D — sweep any residual cbBTC/WETH to USDC (min-out=0; aggregate guard applies).
+        _swapTokenToUsdcNoMin(cbBTC);
+        _swapTokenToUsdcNoMin(weth);
+
+        // assetsOut = total USDC minus the (1-f) idle portion that stays for stayers.
+        uint256 usdcFinal = IERC20(usdc).balanceOf(address(this));
+        return usdcFinal > stayersIdle ? usdcFinal - stayersIdle : 0;
+    }
+
+    /// @dev Unstake the NFT, decrease f=shares/supply of liquidity, collect tokens, restake.
+    ///      Two-sided mins use pool sqrtP (oracle-free; aggregate minAssetsOut is the guard).
+    function _redeemLiquidity(uint256 shares, uint256 supply) private {
+        uint256 tid = tokenId;
+        if (tid == 0) return; // flat book — no LP to unwind
+
+        (int24 tL, int24 tU, uint128 liq) = _npmPositionData();
+        uint128 liqToRemove = uint128(Math.mulDiv(uint256(liq), shares, supply));
+
+        // Unstake so NPM.decreaseLiquidity can modify the position.
+        address gauge_ = gauge;
+        ICLGauge(gauge_).withdraw(tid);
+
+        // Decrease exactly f of liquidity.
+        if (liqToRemove > 0) {
+            // Two-sided mins at pool's current sqrtP (oracle-free).
+            (uint160 sqrtP,,,,,) = ICLPool(pool).slot0();
+            uint160 sqrtLower = TickMath.getSqrtRatioAtTick(tL);
+            uint160 sqrtUpper = TickMath.getSqrtRatioAtTick(tU);
+            (uint256 exp0, uint256 exp1) =
+                LiquidityAmounts.getAmountsForLiquidity(sqrtP, sqrtLower, sqrtUpper, liqToRemove);
+            uint256 slip = uint256(maxSlippageBps);
+            INonfungiblePositionManager(npm)
+                .decreaseLiquidity(
+                    INonfungiblePositionManager.DecreaseLiquidityParams({
+                    tokenId: tid,
+                    liquidity: liqToRemove,
+                    amount0Min: exp0 * (10000 - slip) / 10000,
+                    amount1Min: exp1 * (10000 - slip) / 10000,
+                    deadline: block.timestamp + 600
+                })
+                );
+            // Collect both tokens from the position.
+            INonfungiblePositionManager(npm)
+                .collect(
+                    INonfungiblePositionManager.CollectParams({
+                    tokenId: tid, recipient: address(this), amount0Max: type(uint128).max, amount1Max: type(uint128).max
+                })
+                );
+        }
+
+        // Re-stake the NFT only when remaining liquidity is non-zero.
+        // A full redemption (f=1) removes 100% of liquidity; the gauge rejects an
+        // empty position, so we skip the re-stake and leave the 0-liq NFT with the
+        // strategy (subsequent nav() sees liq=0 → LP value = 0, which is correct).
+        (,, uint128 remainingLiq) = _npmPositionData();
+        if (remainingLiq > 0) {
+            (bool ok,) = npm.call(abi.encodeWithSignature("approve(address,uint256)", gauge_, tid));
+            if (!ok) revert NpmApproveFailed();
+            ICLGauge(gauge_).deposit(tid);
+        }
+    }
+
+    /// @dev Repay f = shares/supply of each Moonwell borrow.
+    ///      If collected tokens < f*debt (IL shortfall), cover via oracle-free exactOutputSingle
+    ///      spending idle USDC.  Swap min-out = 0; aggregate minAssetsOut is the guard.
+    function _redeemRepayDebts(uint256 shares, uint256 supply) private {
+        address mCbBTC_ = mCbBTC;
+        address mWeth_ = mWeth;
+        address cbBTC_ = cbBTC;
+        address weth_ = weth;
+
+        uint256 cbDebtRepay = Math.mulDiv(IMoonwellMarket(mCbBTC_).borrowBalanceStored(address(this)), shares, supply);
+        uint256 wethDebtRepay = Math.mulDiv(IMoonwellMarket(mWeth_).borrowBalanceStored(address(this)), shares, supply);
+
+        // ── cbBTC leg ──
+        if (cbDebtRepay > 0) {
+            uint256 cbBal = IERC20(cbBTC_).balanceOf(address(this));
+            uint256 cbRepay = cbBal >= cbDebtRepay ? cbDebtRepay : cbBal;
+            if (cbRepay > 0) {
+                IERC20(cbBTC_).forceApprove(mCbBTC_, cbRepay);
+                uint256 err = IMoonwellMarket(mCbBTC_).repayBorrow(cbRepay);
+                if (err != 0) revert MoonwellRepayFailed(err);
+            }
+            uint256 cbShort = cbDebtRepay > cbBal ? cbDebtRepay - cbBal : 0;
+            if (cbShort > 0) {
+                _redeemCoverShortfall(cbBTC_, mCbBTC_, cbShort);
+            }
+        }
+
+        // ── WETH leg ──
+        if (wethDebtRepay > 0) {
+            uint256 wethBal = IERC20(weth_).balanceOf(address(this));
+            uint256 wethRepay = wethBal >= wethDebtRepay ? wethDebtRepay : wethBal;
+            if (wethRepay > 0) {
+                IERC20(weth_).forceApprove(mWeth_, wethRepay);
+                uint256 err = IMoonwellMarket(mWeth_).repayBorrow(wethRepay);
+                if (err != 0) revert MoonwellRepayFailed(err);
+            }
+            uint256 wethShort = wethDebtRepay > wethBal ? wethDebtRepay - wethBal : 0;
+            if (wethShort > 0) {
+                _redeemCoverShortfall(weth_, mWeth_, wethShort);
+            }
+        }
+    }
+
+    /// @dev Cover a debt shortfall (IL-driven) by swapping idle USDC → `tokenOut` via
+    ///      exactOutputSingle, then repaying the exact remaining amount.
+    ///      Oracle-free: spends at most all available USDC; aggregate minAssetsOut guards caller.
+    function _redeemCoverShortfall(address tokenOut, address market, uint256 amountOut) private {
+        uint256 usdcBal = IERC20(usdc).balanceOf(address(this));
+        if (usdcBal == 0 || amountOut == 0) return;
+        IERC20(usdc).forceApprove(swapRouter, usdcBal);
+        ICLSwapRouter(swapRouter)
+            .exactOutputSingle(
+                ICLSwapRouter.ExactOutputSingleParams({
+                tokenIn: usdc,
+                tokenOut: tokenOut,
+                tickSpacing: int24(100),
+                recipient: address(this),
+                deadline: block.timestamp + 600,
+                amountOut: amountOut,
+                amountInMaximum: usdcBal,
+                sqrtPriceLimitX96: 0
+            })
+            );
+        IERC20(usdc).forceApprove(swapRouter, 0);
+        uint256 tokenBal = IERC20(tokenOut).balanceOf(address(this));
+        if (tokenBal > 0) {
+            IERC20(tokenOut).forceApprove(market, tokenBal);
+            uint256 err = IMoonwellMarket(market).repayBorrow(tokenBal >= amountOut ? amountOut : tokenBal);
+            if (err != 0) revert MoonwellRepayFailed(err);
+        }
+    }
+
+    /// @dev Redeem f = shares/supply of the mUSDC underlying collateral.
+    ///      Safe to call AFTER repaying f of each debt leg (LTV unchanged: (1-f)D / (1-f)C).
+    function _redeemCollateral(uint256 shares, uint256 supply) private {
+        address mUsdc_ = mUsdc;
+        uint256 cBal = ICToken(mUsdc_).balanceOf(address(this));
+        if (cBal == 0) return;
+        uint256 rate = ICToken(mUsdc_).exchangeRateStored();
+        uint256 totalUnderlying = (cBal * rate) / 1e18;
+        uint256 toRedeem = Math.mulDiv(totalUnderlying, shares, supply);
+        if (toRedeem == 0) return;
+        uint256 err = ICToken(mUsdc_).redeemUnderlying(toRedeem);
+        if (err != 0) revert MoonwellRedeemFailed(err);
+    }
+
+    /// @dev Sweep the full balance of `tokenIn` to USDC without a Chainlink min-out.
+    ///      Used in the oracle-free redeem path; aggregate minAssetsOut guards the caller.
+    function _swapTokenToUsdcNoMin(address tokenIn) private {
+        uint256 bal = IERC20(tokenIn).balanceOf(address(this));
+        if (bal == 0) return;
+        IERC20(tokenIn).forceApprove(swapRouter, bal);
+        ICLSwapRouter(swapRouter)
+            .exactInputSingle(
+                ICLSwapRouter.ExactInputSingleParams({
+                tokenIn: tokenIn,
+                tokenOut: usdc,
+                tickSpacing: int24(100),
+                recipient: address(this),
+                deadline: block.timestamp + 600,
+                amountIn: bal,
+                amountOutMinimum: 0,
+                sqrtPriceLimitX96: 0
+            })
+            );
     }
 
     /// @dev Tunable param updates (Task 3.6+).

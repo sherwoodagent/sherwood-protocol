@@ -190,6 +190,21 @@ interface ICLSwapRouter {
         uint160 sqrtPriceLimitX96;
     }
 
+    struct ExactOutputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        int24 tickSpacing;
+        address recipient;
+        uint256 deadline;
+        uint256 amountOut;
+        uint256 amountInMaximum;
+        uint160 sqrtPriceLimitX96;
+    }
+
     /// @notice Swaps `amountIn` of one token for as much as possible of another.
     function exactInputSingle(ExactInputSingleParams calldata params) external payable returns (uint256 amountOut);
+
+    /// @notice Swaps as little as possible of `tokenIn` for exactly `amountOut` of `tokenOut`.
+    ///         Reverts if more than `amountInMaximum` of `tokenIn` would be required.
+    function exactOutputSingle(ExactOutputSingleParams calldata params) external payable returns (uint256 amountIn);
 }
