@@ -88,7 +88,7 @@ library LeveragedAeroValuation {
     /// @dev Fail-closed: reverts on any oracle/calm failure (via `ChainlinkReader` and the
     ///      calm-gate) and on non-positive equity. Used to price deposits only.
     function netEquityUsdc(Config memory c, address strategy, int24 tickLower, int24 tickUpper, uint128 liquidity)
-        internal
+        public
         view
         returns (uint256 navUsdc)
     {
@@ -238,11 +238,12 @@ library LeveragedAeroValuation {
     ///      `calmDeviationTicks`. Pattern: `AerodromeLPAdapter` deviation gate; mechanism:
     ///      Mamo `LPAutoBalancerV2.reset()` calm-gate.
     ///
-    ///      Visibility is `internal` (not `private`) so `LeveragedAerodromeCLStrategy` can
-    ///      call it before minting to guard tick-band placement and slippage-min computation.
+    ///      Visibility is `public` so `LeveragedAerodromeCLStrategy` can call it before
+    ///      minting to guard tick-band placement and slippage-min computation (delegatecall
+    ///      via the deployed library).
     ///      Logic is unchanged — do NOT edit this function without also updating the
     ///      strategy's `_mintAndStake` caller.
-    function _calmGate(Config memory c) internal view {
+    function _calmGate(Config memory c) public view {
         (, int24 spotTick,,,,) = ICLPool(c.pool).slot0();
 
         uint32[] memory secondsAgos = new uint32[](2);

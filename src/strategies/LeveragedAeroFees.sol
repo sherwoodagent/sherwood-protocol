@@ -178,7 +178,7 @@ library LeveragedAeroFees {
         uint256 nowTs,
         uint256 managementFeeBps,
         uint256 performanceFeeBps
-    ) internal pure returns (uint256 feeShares, uint256 newHwmPerShareX, uint256 newLastAccrual) {
+    ) public pure returns (uint256 feeShares, uint256 newHwmPerShareX, uint256 newLastAccrual) {
         // Always advance the accrual timestamp so management fees do not accumulate
         // over periods when the vault held no capital.
         newLastAccrual = nowTs;
