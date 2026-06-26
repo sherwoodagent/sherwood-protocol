@@ -4,6 +4,7 @@ pragma solidity 0.8.28;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
+import {ERC721Holder} from "@openzeppelin/contracts/token/ERC721/utils/ERC721Holder.sol";
 
 import {BaseStrategy} from "./BaseStrategy.sol";
 import {LeveragedAeroValuation} from "./LeveragedAeroValuation.sol";
@@ -40,7 +41,7 @@ interface IWETH9 {
 ///
 ///         `ReentrancyGuardTransient` (EIP-1153 transient storage) guards all
 ///         state-changing external ops.  Base is on Cancun so TSTORE is available.
-contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient {
+contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient, ERC721Holder {
     using SafeERC20 for IERC20;
 
     // ─────────────────────────────────────────────────────────────
