@@ -48,6 +48,12 @@ library LeveragedAeroValuation {
     ///         `[MIN_SQRT_RATIO, MAX_SQRT_RATIO)` — fail-closed rather than feed a
     ///         garbage/out-of-range price into the leg split.
     error OracleSqrtPriceOutOfRange();
+    /// @notice A Config value is invalid (e.g. `twapWindow == 0` would divide-by-zero the
+    ///         calm-gate) — fail-closed with a named error instead of an opaque arithmetic panic.
+    error InvalidConfig();
+    /// @notice A Chainlink feed reported decimals != the assumed 8 — fail-closed rather than
+    ///         silently mis-scale the USD→USDC conversion (a redeployed/misconfigured feed).
+    error FeedDecimalsMismatch();
 
     /// @dev Chainlink USD feeds on Base are 8-decimal; assumed for the USD→USDC scaling.
     uint256 private constant USD_FEED_DECIMALS = 8;
@@ -96,7 +102,7 @@ library LeveragedAeroValuation {
         _calmGate(c);
 
         // USDC peg price (8dp) — read once; reused to convert every USD term to USDC face.
-        (uint256 pUsdc,) = ChainlinkReader.readUsd(c.usdcFeed, c.sequencerFeed, c.maxDelay, c.gracePeriod);
+        uint256 pUsdc = _readUsd8(c, c.usdcFeed);
 
         // --- positive face terms ---
         uint256 assets = IERC20(c.usdc).balanceOf(c.vault); // floatVault (6dp)
@@ -165,7 +171,15 @@ library LeveragedAeroValuation {
         return (cBal * rate) / 1e18;
     }
 
-    /// @dev cbBTC + WETH debt valued at the same Chainlink basis, converted to USDC face.
+    /// @dev cbBTC + WETH debt at the same Chainlink basis, converted to USDC face.
+    ///      Both this term (`borrowBalanceStored`) and the collateral (`exchangeRateStored`) use
+    ///      Moonwell's LAST-ACCRUED, view-safe values — `nav()` is `view` and cannot
+    ///      `accrueInterest`. The inter-accrual staleness is bounded (bps over hours) and
+    ///      conservative-leaning: if the supply market is more current than the borrow markets,
+    ///      debt is the staler/lower term → NAV slightly OVER-stated → a deposit mints FEWER
+    ///      shares (depositor over-pays), which PROTECTS stayers rather than diluting them. A
+    ///      consumer wanting exactness can `accrueInterest` all three markets before a deposit
+    ///      (off the view path).
     function _debtUsdc(Config memory c, address strategy, uint256 pCbBTC, uint256 pWeth, uint256 pUsdc)
         private
         view
@@ -206,10 +220,20 @@ library LeveragedAeroValuation {
         legsUsdc += _usdcValue(amt1, d1, p1, pUsdc);
     }
 
+    /// @dev Hardened USD read that also asserts the feed is 8-decimal (the scaling assumption,
+    ///      §5). `readUsd` already fetches `feed.decimals()`, so validating it costs no extra call;
+    ///      a redeployed feed at a different precision fail-closes with `FeedDecimalsMismatch`
+    ///      instead of silently inflating the term by 10^(d-8).
+    function _readUsd8(Config memory c, address feed) private view returns (uint256 price) {
+        uint8 dec;
+        (price, dec) = ChainlinkReader.readUsd(feed, c.sequencerFeed, c.maxDelay, c.gracePeriod);
+        if (dec != USD_FEED_DECIMALS) revert FeedDecimalsMismatch();
+    }
+
     /// @dev Reads cbBTC + WETH USD prices through the hardened reader (fail-closed).
     function _legPrices(Config memory c) private view returns (uint256 pCbBTC, uint256 pWeth) {
-        (pCbBTC,) = ChainlinkReader.readUsd(c.cbBTCFeed, c.sequencerFeed, c.maxDelay, c.gracePeriod);
-        (pWeth,) = ChainlinkReader.readUsd(c.wethFeed, c.sequencerFeed, c.maxDelay, c.gracePeriod);
+        pCbBTC = _readUsd8(c, c.cbBTCFeed);
+        pWeth = _readUsd8(c, c.wethFeed);
     }
 
     /// @dev Converts a token `amount` (in `tokenDecimals`) at USD price `pToken` (8dp feed)
@@ -244,6 +268,7 @@ library LeveragedAeroValuation {
     ///      Logic is unchanged — do NOT edit this function without also updating the
     ///      strategy's `_mintAndStake` caller.
     function _calmGate(Config memory c) public view {
+        if (c.twapWindow == 0) revert InvalidConfig();
         (, int24 spotTick,,,,) = ICLPool(c.pool).slot0();
 
         uint32[] memory secondsAgos = new uint32[](2);

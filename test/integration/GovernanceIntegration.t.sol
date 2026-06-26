@@ -64,13 +64,16 @@ contract GovernanceIntegrationTest is BaseIntegrationTest {
         (, BatchExecutorLib.Call[] memory execCalls, BatchExecutorLib.Call[] memory settleCalls) =
             _deployMoonwellStrategy(SUPPLY_AMOUNT);
 
+        // Owner sets the agent performance fee on the vault before proposing
+        vm.prank(owner);
+        vault.setAgentFeeBps(PERF_FEE_BPS);
+
         // Agent proposes
         vm.prank(agent);
         uint256 proposalId = governor.propose(
             address(vault),
             address(0),
             "ipfs://veto-test",
-            PERF_FEE_BPS,
             STRATEGY_DURATION,
             execCalls,
             settleCalls,
@@ -103,13 +106,16 @@ contract GovernanceIntegrationTest is BaseIntegrationTest {
         (, BatchExecutorLib.Call[] memory execCalls, BatchExecutorLib.Call[] memory settleCalls) =
             _deployMoonwellStrategy(SUPPLY_AMOUNT);
 
+        // Owner sets the agent performance fee on the vault before proposing
+        vm.prank(owner);
+        vault.setAgentFeeBps(PERF_FEE_BPS);
+
         // Agent proposes
         vm.prank(agent);
         uint256 proposalId = governor.propose(
             address(vault),
             address(0),
             "ipfs://reject-test",
-            PERF_FEE_BPS,
             STRATEGY_DURATION,
             execCalls,
             settleCalls,
@@ -172,16 +178,11 @@ contract GovernanceIntegrationTest is BaseIntegrationTest {
             _deployMoonwellStrategy(SUPPLY_AMOUNT);
 
         // Propose
+        vm.prank(owner);
+        vault.setAgentFeeBps(PERF_FEE_BPS);
         vm.prank(agent);
         uint256 pid2 = governor.propose(
-            address(vault),
-            address(0),
-            "ipfs://cooldown-test",
-            PERF_FEE_BPS,
-            STRATEGY_DURATION,
-            exec2,
-            settle2,
-            _emptyCoProposers()
+            address(vault), address(0), "ipfs://cooldown-test", STRATEGY_DURATION, exec2, settle2, _emptyCoProposers()
         );
 
         // Warp 1 second for snapshot

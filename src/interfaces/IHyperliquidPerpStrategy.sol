@@ -25,7 +25,12 @@ interface IHyperliquidPerpStrategy is IStrategy {
     function leverage() external view returns (uint32);
     function hasActiveStopLoss() external view returns (bool);
     function settled() external view returns (bool);
-    function swept() external view returns (bool);
+    /// @notice True once the HC drain (force-close + perp->spot + spot->EVM bridge)
+    ///         has been triggered. Stamped BEFORE `_drainHC()` queues HC actions,
+    ///         so HC equity may still be non-zero for one block after this flips.
+    ///         HyperliquidPerpAdapter gates on this to force Lane B during the
+    ///         outbound transit window.
+    function returnsInitiated() external view returns (bool);
     function maxPositionSize() external view returns (uint256);
     function maxTradesPerDay() external view returns (uint32);
 

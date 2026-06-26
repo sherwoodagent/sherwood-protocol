@@ -272,6 +272,27 @@ contract LeveragedAeroValuationTest is Test {
         harness.readUsd(address(feed), address(s), 26 hours, 3600);
     }
 
+    /// @dev [5 regression] A future seqStartedAt (feed/clock skew, e.g. a vnet) must revert the
+    ///      NAMED GracePeriodNotOver — not panic 0x11 on `block.timestamp - seqStartedAt`.
+    function test_readUsd_futureSeqStartedAt_revertsGracePeriod() public {
+        MockAggregatorV3 feed = new MockAggregatorV3(8, 65_000e8);
+        MockAggregatorV3 s = new MockAggregatorV3(0, 0); // sequencer up
+        s.setStartedAt(block.timestamp + 100); // (re)started "in the future"
+        vm.expectRevert(ChainlinkReader.GracePeriodNotOver.selector);
+        harness.readUsd(address(feed), address(s), 26 hours, 3600);
+    }
+
+    /// @dev [5 regression] A future feed updatedAt (L2/vnet clock lag) is the freshest possible
+    ///      answer → age 0 → NOT stale; must not panic 0x11 on `block.timestamp - updatedAt`.
+    function test_readUsd_futureUpdatedAt_treatedFresh() public {
+        MockAggregatorV3 feed = new MockAggregatorV3(8, 65_000e8);
+        feed.setUpdatedAt(block.timestamp + 100); // updated "in the future"
+        MockAggregatorV3 s = _upSequencer();
+        (uint256 p, uint8 d) = harness.readUsd(address(feed), address(s), 26 hours, 3600);
+        assertEq(p, 65_000e8);
+        assertEq(d, 8);
+    }
+
     // --- netEquity: face terms only (liquidity = 0) ---
 
     /// @dev Master-plan vector: collateral 100k USDC, debt 0.5 cbBTC@65k + 10 WETH@3k = 62.5k,
@@ -285,6 +306,26 @@ contract LeveragedAeroValuationTest is Test {
 
         uint256 nav = LeveragedAeroValuation.netEquityUsdc(_cfg(), strat, 0, 0, 0);
         assertApproxEqAbs(nav, 43_500e6, 1e6);
+    }
+
+    /// @dev [6 regression] twapWindow == 0 fails closed with the named InvalidConfig — not a
+    ///      0x12 divide-by-zero panic in the calm-gate. The guard fires before any pool read.
+    function test_netEquity_zeroTwapWindow_revertsInvalidConfig() public {
+        _setCalm();
+        LeveragedAeroValuation.Config memory c = _cfg();
+        c.twapWindow = 0;
+        vm.expectRevert(LeveragedAeroValuation.InvalidConfig.selector);
+        valHarness.netEquityUsdc(c, strat, 0, 0, 0);
+    }
+
+    /// @dev [10 regression] A feed reporting decimals != 8 fails closed with the named
+    ///      FeedDecimalsMismatch — not a silent 10^(d-8) mis-scale of the USD→USDC term.
+    function test_netEquity_nonEightDecimalFeed_revertsMismatch() public {
+        _setCalm();
+        LeveragedAeroValuation.Config memory c = _cfg();
+        c.cbBTCFeed = address(new MockAggregatorV3(7, 65_000e7)); // 7-decimal BTC/USD feed
+        vm.expectRevert(LeveragedAeroValuation.FeedDecimalsMismatch.selector);
+        valHarness.netEquityUsdc(c, strat, 0, 0, 0);
     }
 
     /// @dev Collateral scaling: a non-1:1 exchange rate must scale by /1e18 exactly

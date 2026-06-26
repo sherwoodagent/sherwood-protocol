@@ -65,6 +65,12 @@ abstract contract LeveragedAeroForkBase is Test {
             vm.createSelectFork(rpc);
         }
         // NOTE: vnet chainId = 9998453 (virtual), NOT 8453 — do not assert block.chainid == 8453
+        // [9] Sanity: the fixed relative-tolerance assertions (2% / 0.5%) assume the cbBTC/WETH
+        // pool is live at the forked block. If the pinned fork was rejected and the fallback
+        // landed on a wrong/empty state, FAIL LOUDLY here instead of silently producing
+        // nondeterministic comparisons that mask regressions.
+        (uint160 sqrtP,,,,,) = ICLPool(POOL).slot0();
+        require(POOL.code.length != 0 && sqrtP != 0, "fork: cbBTC/WETH pool not live at this block");
     }
 
     // ─────────────────────────────────────────────────────────────
@@ -125,6 +131,19 @@ abstract contract LeveragedAeroForkBase is Test {
                 string.concat("[\"", vm.toString(WETH), "\",\"", vm.toString(addr), "\",\"", hexAmt, "\"]");
             vm.rpc("tenderly_setErc20Balance", params);
             assertGe(IERC20(WETH).balanceOf(addr), amt, "WETH fund: both paths failed");
+        }
+    }
+
+    /// @notice Fund `addr` with `amt` cbBTC (8dp). Tries deal(); falls back to tenderly RPC.
+    ///         Needed for the `_shoveTick(_, false)` (cbBTC→WETH) direction.
+    function _fundCbBTC(address addr, uint256 amt) internal {
+        deal(CBBTC, addr, amt);
+        if (IERC20(CBBTC).balanceOf(addr) != amt) {
+            string memory hexAmt = _toHex(amt);
+            string memory params =
+                string.concat("[\"", vm.toString(CBBTC), "\",\"", vm.toString(addr), "\",\"", hexAmt, "\"]");
+            vm.rpc("tenderly_setErc20Balance", params);
+            assertGe(IERC20(CBBTC).balanceOf(addr), amt, "cbBTC fund: both paths failed");
         }
     }
 
@@ -250,19 +269,22 @@ abstract contract LeveragedAeroForkBase is Test {
     // ─────────────────────────────────────────────────────────────
 
     /// @notice Move the pool tick by swapping a large WETH amount.
-    /// @param wethIn     Amount of WETH to sell (18dp).
+    /// @param amountIn   Amount of the input token to sell (WETH 18dp if zeroForOne, else cbBTC 8dp).
     /// @param zeroForOne True = sell token0 (WETH) for token1 (cbBTC), moving tick down.
     /// @return newTick   The pool tick after the swap.
-    function _shoveTick(uint256 wethIn, bool zeroForOne) internal returns (int24 newTick) {
+    function _shoveTick(uint256 amountIn, bool zeroForOne) internal returns (int24 newTick) {
         address swapper = makeAddr("tick_swapper");
-        _fundWETH(swapper, wethIn);
 
-        vm.startPrank(swapper);
-        IERC20(WETH).approve(CL_ROUTER, wethIn);
-
-        // zeroForOne = true: selling WETH (token0) for cbBTC (token1)
+        // [4] Fund + approve the token actually being SOLD. zeroForOne=true sells token0=WETH;
+        //     false sells token1=cbBTC. Previously this always funded/approved WETH, so the
+        //     `false` direction tried to pull cbBTC from an empty balance and reverted.
         address tokenIn = zeroForOne ? WETH : CBBTC;
         address tokenOut = zeroForOne ? CBBTC : WETH;
+        if (zeroForOne) _fundWETH(swapper, amountIn);
+        else _fundCbBTC(swapper, amountIn);
+
+        vm.startPrank(swapper);
+        IERC20(tokenIn).approve(CL_ROUTER, amountIn);
 
         ICLSwapRouter.ExactInputSingleParams memory sp = ICLSwapRouter.ExactInputSingleParams({
             tokenIn: tokenIn,
@@ -270,7 +292,7 @@ abstract contract LeveragedAeroForkBase is Test {
             tickSpacing: TICK_SPACING,
             recipient: swapper,
             deadline: block.timestamp + 600,
-            amountIn: wethIn,
+            amountIn: amountIn,
             amountOutMinimum: 0,
             sqrtPriceLimitX96: 0
         });

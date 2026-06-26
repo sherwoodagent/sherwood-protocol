@@ -212,14 +212,7 @@ contract OpenProposalCountTest is Test {
     function _propose() internal returns (uint256 proposalId) {
         vm.prank(agent);
         proposalId = governor.propose(
-            address(vault),
-            address(0),
-            "ipfs://open-count",
-            1500,
-            7 days,
-            _execCalls(),
-            _settleCalls(),
-            _emptyCoProposers()
+            address(vault), address(0), "ipfs://open-count", 7 days, _execCalls(), _settleCalls(), _emptyCoProposers()
         );
     }
 
@@ -539,7 +532,7 @@ contract OpenProposalCountTest is Test {
 
         vm.prank(agent);
         uint256 pid = governor.propose(
-            address(vault), address(0), "ipfs://collab", 1000, 7 days, _execCalls(), _settleCalls(), coProps
+            address(vault), address(0), "ipfs://collab", 7 days, _execCalls(), _settleCalls(), coProps
         );
 
         // Sherlock #8: Draft now binds the vault — counter incremented at
@@ -580,7 +573,7 @@ contract OpenProposalCountTest is Test {
 
         vm.prank(agent);
         uint256 pid = governor.propose(
-            address(vault), address(0), "ipfs://collab-reject", 1000, 7 days, _execCalls(), _settleCalls(), coProps
+            address(vault), address(0), "ipfs://collab-reject", 7 days, _execCalls(), _settleCalls(), coProps
         );
         // Sherlock #8: Draft binds the vault.
         assertEq(governor.openProposalCount(address(vault)), 1, "Sherlock #8: Draft counted");
@@ -611,7 +604,7 @@ contract OpenProposalCountTest is Test {
 
         vm.prank(agent);
         uint256 pid = governor.propose(
-            address(vault), address(0), "ipfs://draft-emerg", 1000, 7 days, _execCalls(), _settleCalls(), coProps
+            address(vault), address(0), "ipfs://draft-emerg", 7 days, _execCalls(), _settleCalls(), coProps
         );
         // Sherlock #8: Draft binds the vault.
         assertEq(governor.openProposalCount(address(vault)), 1, "Sherlock #8: Draft counted");
@@ -638,7 +631,6 @@ contract OpenProposalCountTest is Test {
             address(vault),
             address(0),
             "ipfs://draft-emerg-2",
-            1500,
             7 days,
             _execCalls(),
             _settleCalls(),
@@ -664,9 +656,7 @@ contract OpenProposalCountTest is Test {
         coProps[0] = ISyndicateGovernor.CoProposer({agent: agent2, splitBps: 2000});
 
         vm.prank(agent);
-        governor.propose(
-            address(vault), address(0), "ipfs://draft-lock", 1000, 7 days, _execCalls(), _settleCalls(), coProps
-        );
+        governor.propose(address(vault), address(0), "ipfs://draft-lock", 7 days, _execCalls(), _settleCalls(), coProps);
 
         // openProposalCount = 1; vault's _depositsLocked() returns true.
         assertEq(governor.openProposalCount(address(vault)), 1, "Draft bumps openProposalCount");

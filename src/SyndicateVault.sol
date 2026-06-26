@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import {ISyndicateVault} from "./interfaces/ISyndicateVault.sol";
 import {ISyndicateGovernor} from "./interfaces/ISyndicateGovernor.sol";
+import {FeeConstants} from "./FeeConstants.sol";
 import {ISyndicateFactory} from "./interfaces/ISyndicateFactory.sol";
 import {IVaultWithdrawalQueue} from "./interfaces/IVaultWithdrawalQueue.sol";
 import {IPriceRouter} from "./interfaces/IPriceRouter.sol";
@@ -69,6 +70,16 @@ contract SyndicateVault is
     ///         fits comfortably in any block. `removeAgent` frees a slot.
     uint256 public constant MAX_AGENTS_PER_VAULT = 32;
 
+    /// @notice Hard cap on the vault-owner-set agent performance fee (15%),
+    ///         equal to the governor's `MAX_PERFORMANCE_FEE_CAP` — the protocol
+    ///         ceiling on `maxPerformanceFeeBps`. The governor additionally
+    ///         clamps the realized fee to its (lower, tunable) configured
+    ///         `maxPerformanceFeeBps` at settlement, so a stored value above the
+    ///         live param is never charged. Capping here at the same ceiling
+    ///         keeps `agentFeeBps()` from advertising a rate that can never be
+    ///         realized (PR #384 review C4).
+    uint256 public constant MAX_AGENT_FEE_BPS = FeeConstants.MAX_PERFORMANCE_FEE_BPS;
+
     // ==================== STORAGE ====================
 
     /// @notice Agent address => agent config
@@ -121,8 +132,19 @@ contract SyndicateVault is
     ///         (G1). Cleared implicitly when the proposal settles (active != pid).
     mapping(address holder => uint256 pid) private _laneALockPid;
 
-    /// @dev Reserved storage for future upgrades.
-    uint256[36] private __gap;
+    /// @notice Vault-owner-set agent performance fee, stored offset-by-one so a
+    ///         single slot doubles as the "is it set?" flag: 0 = never set →
+    ///         `agentFeeBps()` returns `FeeConstants.DEFAULT_AGENT_FEE_BPS` (5%);
+    ///         otherwise the stored value is `fee + 1`, so an explicit 0% (a
+    ///         stored 1) stays distinct from unset. Collapses the former
+    ///         `_agentFeeBps` + `_agentFeeSet` pair into one SLOAD on the propose
+    ///         hot path. Snapshotted onto a proposal at propose (clamped to the
+    ///         governor's `maxPerformanceFeeBps`); set via `setAgentFeeBps`.
+    uint256 private _agentFeeBpsPlusOne;
+
+    /// @dev Reserved storage for future upgrades. Grew 34 → 35 when the
+    ///      `_agentFeeSet` bool slot was reclaimed (PR #384 review pass 3).
+    uint256[35] private __gap;
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -145,6 +167,8 @@ contract SyndicateVault is
         _openDeposits = p.openDeposits;
         _agentRegistry = IERC721(p.agentRegistry);
         _managementFeeBps = p.managementFeeBps;
+        // _agentFeeBpsPlusOne left 0 (unset) → agentFeeBps() returns the 5%
+        // default until the owner calls setAgentFeeBps (no init SSTORE needed).
         _factory = msg.sender;
         _cachedDecimalsOffset = IERC20Metadata(p.asset).decimals();
     }
@@ -464,6 +488,24 @@ contract SyndicateVault is
     /// @inheritdoc ISyndicateVault
     function managementFeeBps() external view returns (uint256) {
         return _managementFeeBps;
+    }
+
+    /// @inheritdoc ISyndicateVault
+    function agentFeeBps() external view returns (uint256) {
+        // One SLOAD: 0 = never set → the 5% default (agent never silently
+        // unpaid, H1); otherwise the stored value is fee+1, so an explicit 0%
+        // (stored 1) stays distinct from unset.
+        uint256 stored = _agentFeeBpsPlusOne;
+        return stored == 0 ? FeeConstants.DEFAULT_AGENT_FEE_BPS : stored - 1;
+    }
+
+    /// @inheritdoc ISyndicateVault
+    function setAgentFeeBps(uint256 bps) external onlyOwner {
+        if (bps > MAX_AGENT_FEE_BPS) revert AgentFeeTooHigh();
+        // Offset-by-one: stored = fee+1 marks "set" and keeps an explicit 0%
+        // distinct from the unset sentinel (0).
+        _agentFeeBpsPlusOne = bps + 1;
+        emit AgentFeeUpdated(bps);
     }
 
     // ==================== PAGINATION ====================
@@ -840,6 +882,18 @@ contract SyndicateVault is
     ///      the strategy. `whenNotPaused` (above) likewise mirrors `_deposit`, so
     ///      pausing the vault stops LP inflows during an incident. No `nonReentrant`:
     ///      there is no external call (mint + delegate only).
+    ///
+    ///      DELIBERATELY does NOT apply the vault's Lane-A `_laneALockPid` (G1) stamp or
+    ///      the `DepositsLocked` gate that `_deposit` uses — those guard the vault's OWN
+    ///      oracle-priced instant-exit (Lane A). A strategy-hook strategy runs Lane A OFF
+    ///      (its `kind` is unregistered in the PriceRouter → `maxRedeem == 0` during a
+    ///      proposal), so there is no oracle-priced vault redeem to MEV; the active strategy
+    ///      prices each entry at its OWN oracle NAV (not the vault's float-only
+    ///      `totalAssets()`, so no float-NAV dilution) and services exits via an oracle-free
+    ///      proportional redeem. Stamping the G1 lock here would BRICK that redeem: `_update`
+    ///      reverts `SharesLocked` on any transfer from a locked holder, and the lock lifts
+    ///      only at settle — which never happens under the indefinite proposal these
+    ///      strategies run. The active-strategy gate is the trust boundary.
     function strategyMint(address to, uint256 shares) external onlyActiveStrategy whenNotPaused {
         if (!_openDeposits && !_approvedDepositors.contains(to)) revert NotApprovedDepositor();
         _mint(to, shares);
@@ -847,11 +901,14 @@ contract SyndicateVault is
     }
 
     /// @inheritdoc ISyndicateVault
-    /// @notice Active-strategy-only: burn `shares` that the strategy pulled from
-    ///         a redeemer (oracle-priced Lane A exit). Burns from `msg.sender`
-    ///         (the strategy itself holds the redeemer's shares after transfer).
-    /// @dev Not gated by `whenNotPaused` so emergency unwinding can proceed
-    ///      even when the vault is paused.
+    /// @notice Active-strategy-only: burn `shares` that the strategy pulled from a
+    ///         redeemer (the strategy's oracle-free proportional exit). Burns from
+    ///         `msg.sender` (the strategy holds the redeemer's shares after transfer).
+    /// @dev Not gated by `whenNotPaused`, so the DIRECT `strategy.redeem → strategyBurn`
+    ///      user-exit keeps working while the vault is paused. This does NOT mean all
+    ///      unwinding proceeds when paused: governance settlement (`settleProposal →
+    ///      executeGovernorBatch`) carries `whenNotPaused` and is blocked by a pause —
+    ///      only the per-user direct exit is pause-immune.
     function strategyBurn(uint256 shares) external onlyActiveStrategy {
         _burn(msg.sender, shares);
     }

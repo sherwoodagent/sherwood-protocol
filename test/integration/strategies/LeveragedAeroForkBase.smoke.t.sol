@@ -46,4 +46,14 @@ contract LeveragedAeroForkBaseSmoke is LeveragedAeroForkBase {
         int24 newTick = _shoveTick(5e18, true);
         assertFalse(newTick == startTick, "tick did not move after shove");
     }
+
+    /// @dev [PR #388 review-4] `_shoveTick(_, false)` (selling token1=cbBTC for token0=WETH) must
+    ///      work — it previously funded WETH but set `tokenIn = cbBTC`, reverting on an empty
+    ///      cbBTC balance. Confirms the reverse direction now funds/approves cbBTC and moves the tick.
+    function test_shoveTick_reverseDirection() public {
+        if (_skip) return;
+        (, int24 startTick,,,,) = ICLPool(POOL).slot0();
+        int24 afterTick = _shoveTick(1e8, false); // sell 1 cbBTC (8dp) for WETH
+        assertFalse(afterTick == startTick, "reverse-direction shove must move the tick");
+    }
 }

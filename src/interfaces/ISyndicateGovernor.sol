@@ -71,6 +71,10 @@ interface ISyndicateGovernor {
         ///         proposal (no instant live-NAV lane).
         address strategy;
         string metadataURI;
+        /// @notice Agent performance fee (bps), snapshotted from the vault's
+        ///         `agentFeeBps()` at propose time so it is immutable for this
+        ///         proposal — an owner change after propose cannot alter what
+        ///         voters approved. Clamped to `maxPerformanceFeeBps` at settle.
         uint256 performanceFeeBps;
         uint256 strategyDuration;
         uint256 votesFor;
@@ -100,7 +104,6 @@ interface ISyndicateGovernor {
     error VaultNotRegistered();
     error VaultAlreadyRegistered();
     error NotRegisteredAgent();
-    error PerformanceFeeTooHigh();
     error StrategyDurationTooLong();
     error StrategyDurationTooShort();
     error EmptyExecuteCalls();
@@ -209,6 +212,15 @@ interface ISyndicateGovernor {
         string metadataURI
     );
 
+    /// @notice Emitted whenever the agent performance fee is clamped to
+    ///         `maxPerformanceFeeBps` — at propose (the `agentFeeBps` snapshot
+    ///         exceeds the cap) and again at settle if the cap was lowered
+    ///         in-flight. Surfaces that the realized fee is the clamped value,
+    ///         not the owner's higher intended rate, so voters and indexers can
+    ///         detect the divergence. `snapshotted`/`clamped` are indexed (cheap
+    ///         topics, no memory encoding) so the dual emit stays under budget.
+    event FeeClamped(uint256 indexed proposalId, uint256 indexed snapshotted, uint256 indexed clamped);
+
     event VoteCast(uint256 indexed proposalId, address indexed voter, VoteType support, uint256 weight);
 
     event ProposalExecuted(uint256 indexed proposalId, address indexed vault, uint256 capitalSnapshot);
@@ -300,7 +312,6 @@ interface ISyndicateGovernor {
         address vault,
         address strategy,
         string calldata metadataURI,
-        uint256 performanceFeeBps,
         uint256 strategyDuration,
         BatchExecutorLib.Call[] calldata executeCalls,
         BatchExecutorLib.Call[] calldata settlementCalls,

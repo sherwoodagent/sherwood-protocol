@@ -137,16 +137,12 @@ contract SyndicateGovernorIntegrationTest is Test {
         uint256 feeBps,
         uint256 duration
     ) internal returns (uint256 proposalId) {
+        // Agent performance fee is now a vault property — owner sets it before proposing
+        vm.prank(owner);
+        vault.setAgentFeeBps(feeBps);
         vm.prank(agent);
         proposalId = governor.propose(
-            address(vault),
-            address(0),
-            "ipfs://test",
-            feeBps,
-            duration,
-            executeCalls,
-            settlementCalls,
-            _emptyCoProposers()
+            address(vault), address(0), "ipfs://test", duration, executeCalls, settlementCalls, _emptyCoProposers()
         );
         // via_ir-safe: use vm.getBlockTimestamp() so the IR optimizer can't reorder
         // block.timestamp reads across vm.warp cheatcodes
@@ -222,7 +218,7 @@ contract SyndicateGovernorIntegrationTest is Test {
 
         vm.prank(agent);
         uint256 proposalId = governor.propose(
-            address(vault), address(0), "ipfs://test", 1500, 7 days, execCalls, settleCalls, _emptyCoProposers()
+            address(vault), address(0), "ipfs://test", 7 days, execCalls, settleCalls, _emptyCoProposers()
         );
         vm.warp(block.timestamp + 1);
 

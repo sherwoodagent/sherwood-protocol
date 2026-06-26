@@ -164,4 +164,24 @@ contract VaultStrategyHooksTest is Test {
         vault.strategyMint(alice, 5e18);
         assertEq(vault.balanceOf(alice), 5e18, "whitelisted mint should succeed");
     }
+
+    // ── Test 8: strategyMint must NOT stamp the Lane-A G1 lock (PR #388 review finding [1]) ──
+
+    /// @dev An active proposal (PID) is wired in setUp, so the G1 lock WOULD be enforced if
+    ///      `strategyMint` stamped `_laneALockPid[to]`. It must not: this design runs Lane A OFF
+    ///      and services exits via the strategy's own oracle-free redeem (`transferFrom` → burn).
+    ///      Stamping the lock would make `_update` revert `SharesLocked` on that transfer — and the
+    ///      lock never lifts under the indefinite (never-settling) proposal → redeem bricked forever.
+    function test_strategyMint_doesNotLockRecipientForLaneA() public {
+        address bob = makeAddr("bob");
+
+        vm.prank(activeStrategy);
+        vault.strategyMint(alice, 1e18);
+
+        // Recipient is NOT G1-locked → free to transfer (and therefore to redeem via the strategy).
+        // Would revert SharesLocked if strategyMint had stamped the lock.
+        vm.prank(alice);
+        vault.transfer(bob, 1e18);
+        assertEq(vault.balanceOf(bob), 1e18, "strategyMint recipient must not be Lane-A locked");
+    }
 }
