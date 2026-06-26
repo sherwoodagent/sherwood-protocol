@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 import {LeveragedAeroForkBase} from "./LeveragedAeroForkBase.sol";
 import {BaseAddresses} from "./BaseAddresses.sol";
@@ -312,5 +313,68 @@ contract LeveragedAeroCLRedeemFork is LeveragedAeroForkBase {
         vm.prank(depositorA);
         vm.expectRevert();
         strategy.redeem(sharesA, 0);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Test 4: Finding 1 regression — partial redeem with zero idle + IL shortfall
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice Finding 1 regression: partial redeem with zero idle USDC and IL-induced shortfall.
+    ///         OLD code: _redeemCoverShortfall uses idle USDC (=0) → exactOutputSingle amountInMax=0 → MoonwellRedeemFailed(3).
+    ///         NEW code: redeem f·collateral first → USDC available → shortfall covered.
+    function test_redeem_partialUnderILWithZeroIdle() public {
+        if (_skip) return;
+
+        // depositorA holds all initial shares
+        uint256 sharesA = mockVault.balanceOf(depositorA);
+        assertGt(sharesA, 0, "depositorA has no shares");
+
+        // Deploy all idle USDC into the LP (idle → 0)
+        uint256 idle = IERC20(BaseAddresses.USDC).balanceOf(address(strategy));
+        if (idle > 0) {
+            vm.prank(proposer);
+            strategy.deployIdle(idle, 0);
+        }
+        assertEq(IERC20(BaseAddresses.USDC).balanceOf(address(strategy)), 0, "idle not drained");
+
+        // Shove the tick hard to force IL (LP leg collected < debt on one side)
+        _shoveTick(200e18, true); // sell 200 WETH → push price down sharply
+
+        // Partial redeem: depositorA redeems half their shares
+        uint256 redeemShares = sharesA / 2;
+        uint256 supplyBefore = mockVault.totalSupply();
+        uint256 cbDebtBefore = IMoonwellMarket(BaseAddresses.MOONWELL_MCBBTC).borrowBalanceStored(address(strategy));
+        uint256 wethDebtBefore = IMoonwellMarket(BaseAddresses.MOONWELL_MWETH).borrowBalanceStored(address(strategy));
+
+        vm.startPrank(depositorA);
+        mockVault.approve(address(strategy), redeemShares);
+        uint256 assetsOut = strategy.redeem(redeemShares, 0); // must NOT revert
+        vm.stopPrank();
+
+        // Must receive non-zero USDC
+        assertGt(assetsOut, 0, "received 0 USDC");
+        assertEq(IERC20(BaseAddresses.USDC).balanceOf(depositorA), assetsOut, "USDC not transferred");
+
+        // Stayers' borrow balances should be ≈ (1-f)*original debt (within 1% for interest)
+        uint256 f_num = redeemShares;
+        uint256 f_den = supplyBefore;
+        uint256 cbDebtAfter = IMoonwellMarket(BaseAddresses.MOONWELL_MCBBTC).borrowBalanceStored(address(strategy));
+        uint256 wethDebtAfter = IMoonwellMarket(BaseAddresses.MOONWELL_MWETH).borrowBalanceStored(address(strategy));
+        uint256 cbDebtExpected = cbDebtBefore - Math.mulDiv(cbDebtBefore, f_num, f_den);
+        uint256 wethDebtExpected = wethDebtBefore - Math.mulDiv(wethDebtBefore, f_num, f_den);
+        // Allow 1% tolerance for interest accrual
+        assertGe(cbDebtAfter, cbDebtExpected * 9900 / 10000, "cbBTC stayers debt too low");
+        assertLe(cbDebtAfter, cbDebtExpected * 10100 / 10000, "cbBTC stayers debt too high");
+        assertGe(wethDebtAfter, wethDebtExpected * 9900 / 10000, "WETH stayers debt too low");
+        assertLe(wethDebtAfter, wethDebtExpected * 10100 / 10000, "WETH stayers debt too high");
+
+        // NFT must still be staked (remaining liq > 0)
+        uint256 tid = strategy.tokenId();
+        assertGt(tid, 0, "tokenId cleared unexpectedly");
+        assertEq(
+            IERC721Minimal2(BaseAddresses.SLIPSTREAM_NPM).ownerOf(tid),
+            BaseAddresses.CBBTC_WETH_GAUGE,
+            "NFT not re-staked after partial redeem"
+        );
     }
 }
