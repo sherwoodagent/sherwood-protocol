@@ -83,6 +83,8 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient 
     error InsufficientShares();
     /// @notice `deployIdle` produced less liquidity than `minLiquidity`.
     error InsufficientLiquidity();
+    /// @notice `deployIdle` called with more USDC than the strategy holds idle.
+    error InsufficientIdle();
 
     // ─────────────────────────────────────────────────────────────
     // Constants
@@ -387,7 +389,7 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient 
     ///           Reads position ticks + liquidity from the NPM and delegates to
     ///           `LeveragedAeroValuation.netEquityUsdc` — oracle-implied sqrtP,
     ///           fail-closed (reverts on any oracle/calm failure or non-positive equity).
-    function nav() public view returns (uint256) {
+    function nav() public view virtual returns (uint256) {
         if (tokenId == 0) {
             // Flat book: sum idle USDC in vault + strategy (face, 6dp, no oracle needed).
             return IERC20(usdc).balanceOf(vault()) + IERC20(usdc).balanceOf(address(this));
@@ -848,15 +850,18 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient 
     }
 
     /// @dev Crystallise management + HWM performance fees on the PRE-ACTION vault state.
-    ///      Must be the FIRST call in deposit/redeem so no incoming capital inflates the HWM.
-    function _crystallizeFees() private {
+    ///      Must be the FIRST call in deposit so no incoming capital inflates the HWM.
+    ///      Returns the navPre it computed so the caller can reuse it (avoids a second
+    ///      oracle read).  Crystallisation only mints shares — it never changes nav() —
+    ///      so the returned value is valid for share-math immediately after this call.
+    function _crystallizeFees() private returns (uint256 navPre) {
+        navPre = nav();
         uint256 ts = IERC20(vault()).totalSupply();
-        if (ts == 0) return;
+        if (ts == 0) return navPre;
         if (lastFeeAccrualTimestamp == 0) {
             lastFeeAccrualTimestamp = block.timestamp;
-            return;
+            return navPre;
         }
-        uint256 navPre = nav();
         (uint256 feeShares, uint256 newHwm, uint256 newLast) = LeveragedAeroFees.crystallize(
             navPre,
             ts,
@@ -888,8 +893,7 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient 
     /// @return shares   Vault shares minted to msg.sender.
     function deposit(uint256 assets, uint256 minShares) external nonReentrant returns (uint256 shares) {
         if (_state != State.Executed) revert NotExecuted();
-        _crystallizeFees();
-        uint256 navPre = nav();
+        uint256 navPre = _crystallizeFees();
         IERC20(usdc).safeTransferFrom(msg.sender, address(this), assets);
         address vault_ = vault();
         uint256 supply = IERC20(vault_).totalSupply();
@@ -901,20 +905,34 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient 
     /// @notice Deploy `amount` of idle strategy USDC into the existing levered position.
     ///
     ///         Sequence:
-    ///           1. Supply `amount` USDC to Moonwell mUSDC as additional collateral.
-    ///           2. Borrow cbBTC + WETH at `targetLtvBps` (reuses `_computeAndBorrow`).
-    ///           3. Wrap native ETH from the WETH borrow.
-    ///           4. Add liquidity to the existing CL position via NPM.increaseLiquidity.
-    ///           5. Assert post-op health invariant.
+    ///           1. Guard: amount ≤ idle USDC held by the strategy.
+    ///           2. Supply `amount` USDC to Moonwell mUSDC as additional collateral.
+    ///           3. Borrow cbBTC + WETH at `targetLtvBps` (reuses `_computeAndBorrow`).
+    ///           4. Wrap native ETH from the WETH borrow.
+    ///           5. Unstake NFT from the gauge — NPM.increaseLiquidity requires caller
+    ///              to be the position owner.  The gauge auto-collects accrued AERO to
+    ///              this contract on withdraw (sits idle; compounded in a later call).
+    ///           6. Add liquidity to the existing CL position via NPM.increaseLiquidity.
+    ///           7. Re-stake the NFT in the gauge to resume AERO reward accrual.
+    ///           8. Assert post-op health invariant.
     ///
     /// @param amount       USDC to deploy (6 dp). Must be ≤ idle USDC in strategy.
     /// @param minLiquidity Minimum liquidity units to accept (slippage guard).
     function deployIdle(uint256 amount, uint256 minLiquidity) external onlyProposer nonReentrant {
         if (_state != State.Executed) revert NotExecuted();
+        if (amount > IERC20(usdc).balanceOf(address(this))) revert InsufficientIdle();
         _supplyAmount(amount);
         (uint256 cbBTCAmt, uint256 wethAmt) = _computeAndBorrow(amount);
         _wrapNativeEth();
+        // Unstake the NFT so NPM.increaseLiquidity can update the position (requires ownership).
+        uint256 tid = tokenId;
+        address gauge_ = gauge;
+        ICLGauge(gauge_).withdraw(tid);
         _addLiquidity(wethAmt, cbBTCAmt, minLiquidity);
+        // Re-stake to resume AERO gauge rewards (mirrors _mintAndStake).
+        (bool ok,) = npm.call(abi.encodeWithSignature("approve(address,uint256)", gauge_, tid));
+        if (!ok) revert NpmApproveFailed();
+        ICLGauge(gauge_).deposit(tid);
         _assertHealthy();
     }
 
@@ -931,9 +949,10 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient 
     ///      Applies the same calm-gate + expected-actuals two-sided mins as `_mintPosition`.
     ///      token0 = WETH (18dp), token1 = cbBTC (8dp) — same ordering as the initial mint.
     ///
-    ///      Note: NPM.increaseLiquidity does NOT require token ownership — it pulls tokens
-    ///      from msg.sender and updates the pool position.  The gauge holding the NFT does
-    ///      not prevent additional liquidity from being added.
+    ///      Caller responsibility: the strategy MUST own the NFT before calling this
+    ///      (i.e. the position must be unstaked from the gauge).  Slipstream NPM enforces
+    ///      `require(msg.sender == gauge, "NG")` when the gauge holds the token.
+    ///      See `deployIdle` for the unstake → increaseLiquidity → restake sequence.
     function _addLiquidity(uint256 wethAmt, uint256 cbBTCAmt, uint256 minLiquidity) private {
         LeveragedAeroValuation._calmGate(_cfg());
         uint256 tid = tokenId;

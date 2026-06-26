@@ -244,7 +244,16 @@ contract LeveragedAeroCLDepositFork is LeveragedAeroForkBase {
         (,,,,,,, uint128 liqAfter,,,,) =
             INonfungiblePositionManager_Dep(BaseAddresses.SLIPSTREAM_NPM).positions(tokenId_);
         assertGt(uint256(liqAfter), uint256(liqBefore), "liquidity should have increased");
+
+        // NFT must be re-staked in the gauge (restake mirrors _mintAndStake)
+        address ownerAfter = IERC721Minimal(BaseAddresses.SLIPSTREAM_NPM).ownerOf(tokenId_);
+        assertEq(ownerAfter, BaseAddresses.CBBTC_WETH_GAUGE, "NFT not re-staked in gauge");
     }
+}
+
+/// @dev Minimal ERC-721 interface for `ownerOf` checks in fork tests.
+interface IERC721Minimal {
+    function ownerOf(uint256 tokenId) external view returns (address);
 }
 
 /// @dev Minimal INonfungiblePositionManager interface for reading positions in tests.
