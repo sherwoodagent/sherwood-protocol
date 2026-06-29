@@ -620,6 +620,31 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         LeveragedAeroManager.deployIdleImpl(amount, minLiquidity);
     }
 
+    /// @notice Compound AERO gauge rewards: claim AERO → swap to USDC → redeploy at target leverage.
+    ///
+    ///         The claim + synchronous AERO→USDC swap (deepest on-Base venue: the Aerodrome v2
+    ///         volatile pool, bounded by `minUsdcOut`) + redeploy (`deployIdleImpl`) live in
+    ///         `LeveragedAeroManager.compoundImpl()` (delegatecalled). No-op when no AERO is
+    ///         claimable.
+    ///
+    ///         Fee fairness (§10): compounding realizes AERO yield → NAV ↑. We crystallize fees
+    ///         on the PRE-compound NAV first — the SAME model as `deposit` (`_crystallizeFees(nav())`,
+    ///         fail-closed) — which advances the HWM to capture any pre-compound gain. A redeem
+    ///         after compound then crystallizes on the higher POST-compound NAV, so it cannot
+    ///         escape the performance fee on the realized yield. Crystallisation lives here (not in
+    ///         the manager impl) because it mints fee-shares via `vault.strategyMint`. Unlike the
+    ///         oracle-free redeem path, an oracle read is correct here — `compound` is `onlyProposer`
+    ///         and a stale oracle should (fail-closed) defer the compound, not mis-price it.
+    ///
+    /// @param minUsdcOut   Minimum USDC out of the AERO→USDC swap (proposer-supplied slippage guard).
+    /// @param minLiquidity Minimum CL liquidity to accept on the redeploy (slippage guard).
+    function compound(uint256 minUsdcOut, uint256 minLiquidity) external onlyProposer nonReentrant {
+        if (_state != State.Executed) revert NotExecuted();
+        // Crystallize on the pre-compound NAV (fail-closed; mirrors deposit's 3.6 fee model).
+        _crystallizeFees(nav());
+        LeveragedAeroManager.compoundImpl(minUsdcOut, minLiquidity);
+    }
+
     /// @notice Oracle-free proportional redeem: burn vault shares, receive pro-rata USDC.
     ///
     ///         The caller must call `vault.approve(strategy, shares)` first so this

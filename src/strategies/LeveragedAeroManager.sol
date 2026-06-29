@@ -17,6 +17,27 @@ interface IWETH9 {
     function deposit() external payable;
 }
 
+/// @dev Minimal Aerodrome v2 (AMM) Router interface — the deepest AERO/USDC venue on Base
+///      is the v2 volatile pool, so the `compound()` reward swap routes through this router
+///      (mirrors the v2-swap pattern in `WstETHMoonwellStrategy`). The CL SwapRouter
+///      (`$.swapRouter`) only serves Slipstream CL pools, which are far shallower for AERO/USDC.
+interface IAeroRouter {
+    struct Route {
+        address from;
+        address to;
+        bool stable;
+        address factory;
+    }
+
+    function swapExactTokensForTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        Route[] calldata routes,
+        address to,
+        uint256 deadline
+    ) external returns (uint256[] memory amounts);
+}
+
 /// @title  LeveragedAeroManager
 /// @notice DEPLOYED, delegatecalled venue library for `LeveragedAerodromeCLStrategy`.
 ///
@@ -69,6 +90,15 @@ library LeveragedAeroManager {
     uint8 private constant WETH_DECIMALS = 18;
     /// @dev Number of tick-spacings on each side of the current tick for the initial CL range.
     uint8 private constant RANGE_TICK_SPACINGS = 20;
+
+    /// @dev Aerodrome v2 (AMM) Router on Base — the AERO→USDC reward swap in `compoundImpl`
+    ///      routes through its volatile pool, the deepest AERO/USDC liquidity on Base
+    ///      (~$10.4M vs ~$1.2M for the deepest Slipstream CL pool, fork-measured). Canonical
+    ///      immutable Base infra, baked into the deployed manager (like the hardcoded CL
+    ///      `tickSpacing` in the swap helpers).
+    address private constant AERO_V2_ROUTER = 0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43;
+    /// @dev Aerodrome v2 PoolFactory on Base (`router.defaultFactory()`), required by the Route.
+    address private constant AERO_V2_FACTORY = 0x420DD381b31aEf6683db6B902084cB0FFECe40Da;
 
     // ─────────────────────────────────────────────────────────────
     // Diamond storage — MUST match LeveragedAerodromeCLStrategy exactly
@@ -250,6 +280,52 @@ library LeveragedAeroManager {
         if (!ok) revert NpmApproveFailed();
         ICLGauge(gauge_).deposit(tid);
         _assertHealthy();
+    }
+
+    /// @notice Compound AERO gauge rewards back into the levered position (body of the
+    ///         strategy's `compound`): claim AERO → swap ALL of it to USDC synchronously →
+    ///         redeploy the proceeds at target leverage via `deployIdleImpl`.
+    ///
+    ///         The reward swap uses the Aerodrome **v2 (AMM) volatile** AERO/USDC pool — the
+    ///         deepest AERO/USDC liquidity on Base — bounded by the caller-supplied
+    ///         `minUsdcOut` (the swap reverts if the venue can't fill it). `compound` is
+    ///         `onlyProposer`, so a trusted backend supplies a fair `minUsdcOut` (e.g. derived
+    ///         off-chain from the Base AERO/USD Chainlink feed) — consistent with `deployIdle`'s
+    ///         caller-supplied `minLiquidity`.
+    ///
+    ///         No-op (clean return, no revert) when there is no open position or no AERO is
+    ///         claimable. Fee crystallisation lives in the strategy entrypoint (it mints
+    ///         fee-shares via the vault), NOT here.
+    ///
+    /// @param minUsdcOut   Minimum USDC out of the AERO→USDC swap (proposer slippage guard).
+    /// @param minLiquidity Minimum CL liquidity to accept on the redeploy (slippage guard).
+    function compoundImpl(uint256 minUsdcOut, uint256 minLiquidity) public {
+        Layout storage $ = _s();
+        uint256 tid = $.tokenId;
+        if (tid == 0) return; // flat book — nothing staked, nothing to compound
+
+        // 1. Claim AERO for the staked NFT. The reward token is read from the gauge
+        //    (definitionally AERO on this pool — fork-confirmed `rewardToken() == AERO`).
+        address gauge_ = $.gauge;
+        address aero = ICLGauge(gauge_).rewardToken();
+        ICLGauge(gauge_).getReward(tid);
+        uint256 aeroBal = IERC20(aero).balanceOf(address(this));
+        if (aeroBal == 0) return; // no rewards accrued — clean no-op
+
+        // 2. Swap ALL claimed AERO → USDC via the Aerodrome v2 volatile pool, enforcing minUsdcOut.
+        uint256 usdcBefore = IERC20($.usdc).balanceOf(address(this));
+        IERC20(aero).forceApprove(AERO_V2_ROUTER, aeroBal);
+        IAeroRouter.Route[] memory routes = new IAeroRouter.Route[](1);
+        routes[0] = IAeroRouter.Route({from: aero, to: $.usdc, stable: false, factory: AERO_V2_FACTORY});
+        IAeroRouter(AERO_V2_ROUTER)
+            .swapExactTokensForTokens(aeroBal, minUsdcOut, routes, address(this), block.timestamp + 600);
+        uint256 usdcOut = IERC20($.usdc).balanceOf(address(this)) - usdcBefore;
+        if (usdcOut == 0) return;
+
+        // 3. Redeploy ONLY the realized yield (usdcOut) into the position at target leverage
+        //    (supply → borrow → increaseLiquidity → restake → _assertHealthy). Any pre-existing
+        //    idle USDC is left untouched — compound deploys the AERO yield, nothing else.
+        deployIdleImpl(usdcOut, minLiquidity);
     }
 
     // ═════════════════════════════════════════════════════════════
