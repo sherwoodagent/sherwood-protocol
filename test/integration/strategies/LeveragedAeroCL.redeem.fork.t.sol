@@ -8,8 +8,11 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {LeveragedAeroForkBase} from "./LeveragedAeroForkBase.sol";
 import {BaseAddresses} from "./BaseAddresses.sol";
 import {LeveragedAerodromeCLStrategy} from "../../../src/strategies/LeveragedAerodromeCLStrategy.sol";
+import {LeveragedAeroValuation} from "../../../src/strategies/LeveragedAeroValuation.sol";
 import {IMoonwellMarket, IComptroller, ICToken} from "../../../src/interfaces/IMoonwellMarket.sol";
-import {ICLGauge, INonfungiblePositionManager} from "../../../src/interfaces/ISlipstream.sol";
+import {ICLGauge, INonfungiblePositionManager, ICLPool, ICLSwapRouter} from "../../../src/interfaces/ISlipstream.sol";
+import {TickMath} from "../../../src/libraries/TickMath.sol";
+import {LiquidityAmounts} from "../../../src/libraries/LiquidityAmounts.sol";
 
 // ─── Minimal mock vault ───────────────────────────────────────────────────────
 
@@ -162,6 +165,14 @@ contract LeveragedAeroCLRedeemFork is LeveragedAeroForkBase {
             performanceFeeBps: PERF_FEE_BPS,
             feeRecipient: feeRecipient
         });
+    }
+
+    /// @dev Zero-fee variant of `_buildInitParams` — used by the stayer-skim probe so fee
+    ///      crystallisation never confounds the before/after NAV-conservation delta.
+    function _buildInitParamsZeroFee() internal view returns (LeveragedAerodromeCLStrategy.InitParams memory p) {
+        p = _buildInitParams();
+        p.managementFeeBps = 0;
+        p.performanceFeeBps = 0;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -452,5 +463,201 @@ contract LeveragedAeroCLRedeemFork is LeveragedAeroForkBase {
             BaseAddresses.CBBTC_WETH_GAUGE,
             "NFT not re-staked after partial redeem"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Test 6: triple-coincidence stayer-skim probe — rerange remainder + IL
+    //         shortfall on the SAME leg + partial redeem must not skim stayers.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice Spec §7 guarantee: "removing exactly fraction f of every leg leaves stayers with
+    ///         (1-f) of every leg, regardless of price." A no-swap `rerange` leaves an idle
+    ///         remainder of ONE borrowed leg (`I_leg > 0`); `_redeemRepayFromCollected` repays
+    ///         `min(f*debt, totalLegBal)` from the TOTAL balance (collected-from-unwind +
+    ///         pre-existing idle), so a severe IL shortfall on that leg can over-repay the
+    ///         redeemer's debt out of the stayers' reserved `(1-f)*I_leg` — raising no/too-small a
+    ///         `cbShort`/`wethShort`, so the redeemer's own collateral is never tapped for the
+    ///         shortfall. Net: stayers shorted, redeemer over-paid.
+    ///
+    ///         Reachable when (on the SAME leg): a rerange remainder exists (`I_leg > 0`), a hard
+    ///         tick shove drives the LP out of range so it collects ~0 of that leg
+    ///         (`f*debt_leg > L_leg + f*I_leg`), and the redeem is partial (`f < 1`).
+    ///
+    ///         The arbiter is the stayer's per-share ORACLE NAV (oracle-implied sqrtP + Chainlink
+    ///         prices, NO calm-gate → immune to the shove, same prices before/after): it must be
+    ///         NON-DECREASING across the partial redeem.
+    function test_redeem_partialUnderIL_afterRerange_noStayerSkim() public {
+        if (_skip) return;
+        // token0/token1 ordering assumption used by `_oracleNavNoGate` (matches the live pool).
+        require(ICLPool(POOL).token0() == WETH, "fork: expected pool token0 == WETH");
+
+        // Fresh ZERO-FEE book so fee crystallisation never confounds the conservation delta.
+        MockVaultForRedeem v = new MockVaultForRedeem(depositorA, DEPOSITOR_A_SHARES);
+        LeveragedAerodromeCLStrategy strat =
+            LeveragedAerodromeCLStrategy(payable(Clones.clone(address(new LeveragedAerodromeCLStrategy()))));
+        strat.initialize(address(v), proposer, abi.encode(_buildInitParamsZeroFee()));
+        _fundUSDC(address(strat), PRINCIPAL);
+        vm.prank(address(v));
+        strat.execute();
+
+        // Second LP so the partial redeem leaves a stayer (depositorA).
+        uint256 depositB = 10_000e6;
+        _fundUSDC(depositorB, depositB);
+        vm.startPrank(depositorB);
+        IERC20(BaseAddresses.USDC).approve(address(strat), depositB);
+        uint256 sharesB = strat.deposit(depositB, 0);
+        vm.stopPrank();
+        assertGt(sharesB, 0, "B got 0 shares");
+
+        // Drain idle USDC so the ONLY idle asset is the rerange remainder leg.
+        uint256 idle = IERC20(BaseAddresses.USDC).balanceOf(address(strat));
+        vm.prank(proposer);
+        strat.deployIdle(idle, 0);
+        assertEq(IERC20(BaseAddresses.USDC).balanceOf(address(strat)), 0, "idle USDC not drained");
+
+        // (a) Drift ~450 ticks in-band (down), then recenter (no swap) → idle remainder of ONE leg.
+        (, int24 t0,,,,) = ICLPool(POOL).slot0();
+        _shoveToTickDown(t0 - 450);
+        vm.prank(proposer);
+        strat.rerange(0, 0);
+        uint256 idleCb = IERC20(CBBTC).balanceOf(address(strat));
+        uint256 idleWeth = IERC20(WETH).balanceOf(address(strat));
+        assertTrue(idleCb > 0 || idleWeth > 0, "rerange left no idle remainder leg");
+
+        // (b) Hard-shove to drive a real IL shortfall on the SAME leg as the remainder:
+        //       remainder = WETH  → shove UP   (sell cbBTC) → LP all cbBTC → WETH under-collected.
+        //       remainder = cbBTC → shove DOWN (sell WETH)  → LP all WETH  → cbBTC under-collected.
+        bool remainderIsWeth = idleWeth >= idleCb;
+        emit log_named_uint("idleCb (8dp)", idleCb);
+        emit log_named_uint("idleWeth (18dp)", idleWeth);
+        emit log_named_int("posTickLower", strat.posTickLower());
+        emit log_named_int("posTickUpper", strat.posTickUpper());
+        (, int24 tPre,,,,) = ICLPool(POOL).slot0();
+        emit log_named_int("tick pre-hard-shove", tPre);
+        if (remainderIsWeth) _shoveTick(200e8, false); // sell 200 cbBTC → tick UP
+        else _shoveTick(2_000e18, true); // sell 2000 WETH → tick DOWN
+        // Confirm the LP went out of range (collects ~0 of the remainder leg → genuine shortfall).
+        {
+            (, int24 tShoved,,,,) = ICLPool(POOL).slot0();
+            emit log_named_int("tick post-hard-shove", tShoved);
+            int24 pl = strat.posTickLower();
+            int24 pu = strat.posTickUpper();
+            assertTrue(tShoved < pl || tShoved > pu, "shove did not push LP out of range (no real shortfall)");
+        }
+
+        // Snapshot the stayer's per-share oracle NAV right before the redeem.
+        uint256 supplyBefore = v.totalSupply();
+        uint256 navBefore = _oracleNavNoGate(address(strat));
+        uint256 perShareBefore = (navBefore * 1e18) / supplyBefore;
+
+        // (c) PARTIAL redeem: depositorB redeems ALL of B's shares (f = sharesB/supply < 1),
+        //     leaving depositorA as the stayer.
+        vm.startPrank(depositorB);
+        v.approve(address(strat), sharesB);
+        uint256 assetsOut = strat.redeem(sharesB, 0);
+        vm.stopPrank();
+
+        uint256 supplyAfter = v.totalSupply();
+        assertEq(supplyAfter, supplyBefore - sharesB, "supply bookkeeping");
+        uint256 navAfter = _oracleNavNoGate(address(strat));
+        uint256 perShareAfter = (navAfter * 1e18) / supplyAfter;
+
+        emit log_named_uint("perShareBefore (1e18)", perShareBefore);
+        emit log_named_uint("perShareAfter  (1e18)", perShareAfter);
+        emit log_named_uint("navBefore (USDC 6dp)", navBefore);
+        emit log_named_uint("navAfter  (USDC 6dp)", navAfter);
+        emit log_named_uint("assetsOut (USDC 6dp)", assetsOut);
+        emit log_named_uint("fairShare (USDC 6dp)", (navBefore * sharesB) / supplyBefore);
+
+        // PRIMARY (the §7 arbiter): the stayer's per-share NAV must be NON-DECREASING across the
+        // partial redeem. Buggy code consumes the stayers' reserved (1-f)*I_leg to over-repay the
+        // redeemer's debt → perShareAfter drops materially (measured ~3.2% pre-fix). The reserve-cap
+        // fix keeps it flat (measured drop ~1.5e-8, pure mulDiv dust): navAfter == (1-f)*navBefore.
+        assertGe(perShareAfter, perShareBefore * 999 / 1000, "STAYER SKIM: per-share NAV dropped");
+
+        // SECONDARY (gross-overpayment sanity): the redeemer must not receive WILDLY more than its
+        // fair f*navBefore. A small (~1.4%) excess over the oracle mark is benign and NOT a stayer
+        // skim — it is the redeemer realizing ITS OWN f-of-LP at the shoved tick vs the conservative
+        // oracle-implied mark (stayers are exactly whole per the PRIMARY check above). The pre-fix
+        // skim drove assetsOut to ~17.5% over fair, so a 5% bound cleanly separates skim from noise.
+        uint256 fairShare = (navBefore * sharesB) / supplyBefore;
+        assertLe(assetsOut, fairShare * 105 / 100, "redeemer grossly over-paid (skimmed stayers)");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Helpers for the stayer-skim probe
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @dev Bounded in-band DOWN shove (sell WETH, stop at `targetTick` via sqrtPriceLimit) —
+    ///      mirrors the rerange fork test's `_shoveToTick`. Stays inside the calm band so the
+    ///      subsequent `rerange` calm-gate passes.
+    function _shoveToTickDown(int24 targetTick) internal {
+        address shover = makeAddr("redeem_inband_shover");
+        uint256 wethIn = 1_000e18; // the sqrtPrice limit caps how much actually fills
+        _fundWETH(shover, wethIn);
+        vm.startPrank(shover);
+        IERC20(WETH).approve(CL_ROUTER, wethIn);
+        ICLSwapRouter(CL_ROUTER)
+            .exactInputSingle(
+                ICLSwapRouter.ExactInputSingleParams({
+                tokenIn: WETH,
+                tokenOut: CBBTC,
+                tickSpacing: TICK_SPACING,
+                recipient: shover,
+                deadline: block.timestamp + 600,
+                amountIn: wethIn,
+                amountOutMinimum: 0,
+                sqrtPriceLimitX96: TickMath.getSqrtRatioAtTick(targetTick)
+            })
+            );
+        vm.stopPrank();
+    }
+
+    /// @dev Oracle NAV of the whole strategy WITHOUT the calm gate — the manipulation-immune fair
+    ///      mark for stayer-conservation. Mirrors `LeveragedAeroValuation.netEquityUsdc`
+    ///      term-for-term (oracle-implied sqrtP for the CL-leg split + Chainlink leg/debt prices),
+    ///      minus `_calmGate` (so it stays computable at the shoved tick). Pool token0 == WETH.
+    function _oracleNavNoGate(address strat) internal view returns (uint256) {
+        (, int256 btc,,,) = IAggregatorV3Min(BaseAddresses.CHAINLINK_BTC_USD).latestRoundData();
+        (, int256 eth,,,) = IAggregatorV3Min(BaseAddresses.CHAINLINK_ETH_USD).latestRoundData();
+        (, int256 usd,,,) = IAggregatorV3Min(BaseAddresses.CHAINLINK_USDC_USD).latestRoundData();
+        uint256 pBTC = uint256(btc);
+        uint256 pETH = uint256(eth);
+        uint256 pUsdc = uint256(usd);
+
+        // idle USDC + Moonwell USDC collateral (face, 6dp)
+        uint256 assets = IERC20(BaseAddresses.USDC).balanceOf(strat);
+        uint256 cBal = ICToken(BaseAddresses.MOONWELL_MUSDC).balanceOf(strat);
+        if (cBal > 0) assets += (cBal * ICToken(BaseAddresses.MOONWELL_MUSDC).exchangeRateStored()) / 1e18;
+
+        // CL legs at the oracle-implied sqrtP (token0=WETH/18, token1=cbBTC/8)
+        uint256 tid = LeveragedAerodromeCLStrategy(payable(strat)).tokenId();
+        if (tid != 0) {
+            (,,,,, int24 tl, int24 tu, uint128 liq,,,,) = INpmFull(BaseAddresses.SLIPSTREAM_NPM).positions(tid);
+            if (liq > 0) {
+                uint160 sqrtP = LeveragedAeroValuation.oracleSqrtPriceX96(pETH, 18, pBTC, 8);
+                (uint256 a0, uint256 a1) = LiquidityAmounts.getAmountsForLiquidity(
+                    sqrtP, TickMath.getSqrtRatioAtTick(tl), TickMath.getSqrtRatioAtTick(tu), liq
+                );
+                assets += _usdcV(a0, 18, pETH, pUsdc); // WETH leg
+                assets += _usdcV(a1, 8, pBTC, pUsdc); // cbBTC leg
+            }
+        }
+        // idle (out-of-position) borrowed legs — the rerange remainder lives here
+        assets += _usdcV(IERC20(CBBTC).balanceOf(strat), 8, pBTC, pUsdc);
+        assets += _usdcV(IERC20(WETH).balanceOf(strat), 18, pETH, pUsdc);
+
+        // debt (same Chainlink basis)
+        uint256 debt = _usdcV(IMoonwellMarket(BaseAddresses.MOONWELL_MCBBTC).borrowBalanceStored(strat), 8, pBTC, pUsdc)
+            + _usdcV(IMoonwellMarket(BaseAddresses.MOONWELL_MWETH).borrowBalanceStored(strat), 18, pETH, pUsdc);
+
+        return assets > debt ? assets - debt : 0;
+    }
+
+    /// @dev token `amount` (`dec`-decimals) at USD price `pTok` (8dp) → USDC face (6dp), honoring
+    ///      the USDC peg `pUsdc` (8dp). Same scaling as `LeveragedAeroForkBase._usdcValueNaive`.
+    function _usdcV(uint256 amount, uint8 dec, uint256 pTok, uint256 pUsdc) private pure returns (uint256) {
+        if (amount == 0 || pTok == 0 || pUsdc == 0) return 0;
+        return ((amount * pTok / (10 ** uint256(dec))) * 1e6) / pUsdc;
     }
 }

@@ -232,8 +232,13 @@ library LeveragedAeroManager {
         // A — partial CL unwind (pool-based mins, oracle-free).
         _unwindLiquidity(shares, supply);
 
-        // B — repay f of each debt from collected tokens; capture any IL shortfall.
-        (uint256 cbShort, uint256 wethShort) = _redeemRepayFromCollected(shares, supply);
+        // B — repay f of each debt from collected tokens; capture any IL shortfall. The repay is
+        // capped at the REDEEMER's own per-leg budget (`legBal − stayersLeg`) so a severe IL
+        // shortfall can never consume the stayers' reserved `(1-f)` idle-leg share to over-repay
+        // the redeemer's debt. Passing `stayersCb`/`stayersWeth` keeps the genuine shortfall flowing
+        // to `cbShort`/`wethShort` → covered from the redeemer's OWN collateral (step C), upholding
+        // the §7 invariant ("stayers keep (1-f) of every leg, regardless of price").
+        (uint256 cbShort, uint256 wethShort) = _redeemRepayFromCollected(shares, supply, stayersCb, stayersWeth);
 
         if (shares == supply) {
             // Full redemption — two-phase debt clearance before 100 % collateral redeem.
@@ -760,9 +765,16 @@ library LeveragedAeroManager {
     // redeem helpers
     // ═════════════════════════════════════════════════════════════
 
-    /// @dev Repay f = shares/supply of each Moonwell borrow from currently-held tokens.
+    /// @dev Repay f = shares/supply of each Moonwell borrow from currently-held tokens, capping
+    ///      each leg's repay at the REDEEMER's own budget = `legBal − stayersLeg`. `stayersLeg`
+    ///      is the stayers' reserved `(1-f)` share of a PRE-EXISTING idle leg (a rerange
+    ///      remainder), snapshotted before the unwind. Subtracting it makes the budget exactly
+    ///      `f·idleLeg + collectedLeg` — the redeemer's fair share — so an IL over-repay can never
+    ///      eat the stayers' reserve; the genuine shortfall instead flows to `cbShort`/`wethShort`
+    ///      and is covered from the redeemer's own freed collateral. With `stayersLeg == 0` (full
+    ///      redeem f=1, or no rerange remainder) the cap is the full balance — behaviour unchanged.
     ///      Returns the shortfall amounts (0 if fully covered).
-    function _redeemRepayFromCollected(uint256 shares, uint256 supply)
+    function _redeemRepayFromCollected(uint256 shares, uint256 supply, uint256 stayersCb, uint256 stayersWeth)
         private
         returns (uint256 cbShort, uint256 wethShort)
     {
@@ -775,28 +787,30 @@ library LeveragedAeroManager {
         uint256 cbDebtRepay = Math.mulDiv(IMoonwellMarket(mCbBTC_).borrowBalanceStored(address(this)), shares, supply);
         uint256 wethDebtRepay = Math.mulDiv(IMoonwellMarket(mWeth_).borrowBalanceStored(address(this)), shares, supply);
 
-        // ── cbBTC leg ──
+        // ── cbBTC leg ── (budget = balance minus the stayers' reserved idle-leg share)
         if (cbDebtRepay > 0) {
             uint256 cbBal = IERC20(cbBTC_).balanceOf(address(this));
-            uint256 cbRepay = cbBal >= cbDebtRepay ? cbDebtRepay : cbBal;
+            uint256 cbBudget = cbBal > stayersCb ? cbBal - stayersCb : 0;
+            uint256 cbRepay = cbBudget >= cbDebtRepay ? cbDebtRepay : cbBudget;
             if (cbRepay > 0) {
                 IERC20(cbBTC_).forceApprove(mCbBTC_, cbRepay);
                 uint256 err = IMoonwellMarket(mCbBTC_).repayBorrow(cbRepay);
                 if (err != 0) revert MoonwellRepayFailed(err);
             }
-            cbShort = cbDebtRepay > cbBal ? cbDebtRepay - cbBal : 0;
+            cbShort = cbDebtRepay > cbBudget ? cbDebtRepay - cbBudget : 0;
         }
 
-        // ── WETH leg ──
+        // ── WETH leg ── (budget = balance minus the stayers' reserved idle-leg share)
         if (wethDebtRepay > 0) {
             uint256 wethBal = IERC20(weth_).balanceOf(address(this));
-            uint256 wethRepay = wethBal >= wethDebtRepay ? wethDebtRepay : wethBal;
+            uint256 wethBudget = wethBal > stayersWeth ? wethBal - stayersWeth : 0;
+            uint256 wethRepay = wethBudget >= wethDebtRepay ? wethDebtRepay : wethBudget;
             if (wethRepay > 0) {
                 IERC20(weth_).forceApprove(mWeth_, wethRepay);
                 uint256 err = IMoonwellMarket(mWeth_).repayBorrow(wethRepay);
                 if (err != 0) revert MoonwellRepayFailed(err);
             }
-            wethShort = wethDebtRepay > wethBal ? wethDebtRepay - wethBal : 0;
+            wethShort = wethDebtRepay > wethBudget ? wethDebtRepay - wethBudget : 0;
         }
     }
 
