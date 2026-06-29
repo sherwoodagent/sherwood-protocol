@@ -316,10 +316,86 @@ contract LeveragedAeroCLRedeemFork is LeveragedAeroForkBase {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Test 4: Finding 1 regression — partial redeem with zero idle + IL shortfall
+    // Test 4: Finding 2 regression — full redeem with zero idle + IL shortfall
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// @notice Finding 1 regression: partial redeem with zero idle USDC and IL-induced shortfall.
+    /// @notice Finding 2 regression: full redeem with zero idle USDC and IL-induced shortfall.
+    ///         OLD code: _redeemCoverShortfall uses idle USDC (=0) → no-op → residual cbBTC debt
+    ///                   blocks 100 % collateral redeem → MoonwellRedeemFailed(3).
+    ///         NEW code: Phase 2 _settleShortfall() self-funds from mUSDC collateral (oracle path)
+    ///                   → repays residual debt → full collateral redemption succeeds.
+    function test_redeem_fullUnderILWithZeroIdle() public {
+        if (_skip) return;
+
+        // depositorA holds all initial shares.
+        uint256 sharesA = mockVault.balanceOf(depositorA);
+        assertGt(sharesA, 0, "depositorA has no shares");
+
+        // Deploy ALL idle USDC into the LP (idle → 0).
+        uint256 idle = IERC20(BaseAddresses.USDC).balanceOf(address(strategy));
+        if (idle > 0) {
+            vm.prank(proposer);
+            strategy.deployIdle(idle, 0);
+        }
+        assertEq(IERC20(BaseAddresses.USDC).balanceOf(address(strategy)), 0, "idle not drained");
+
+        // Shove the tick hard to push the LP out of range on the cbBTC side.
+        // Selling 200 WETH moves the pool tick down enough that the LP collects
+        // mostly WETH and almost no cbBTC → cbBTC IL shortfall.
+        _shoveTick(200e18, true);
+
+        // Capture tokenId before redeem so we can query NPM state afterward.
+        uint256 tid = strategy.tokenId();
+        assertGt(tid, 0, "tokenId should be set before redeem");
+
+        // Best-effort NAV capture — may revert if the tick shove trips the calm gate
+        // (500-tick threshold). The redeem path itself uses try-this.nav() so it's fine either way.
+        uint256 navBefore;
+        try strategy.nav() returns (uint256 n) {
+            navBefore = n;
+        } catch {
+            navBefore = 0;
+        }
+
+        // FULL redeem: depositorA redeems ALL shares (shares == supply).
+        uint256 supply = mockVault.totalSupply();
+        assertEq(supply, sharesA, "depositorA must own 100% of supply for this test");
+
+        vm.startPrank(depositorA);
+        mockVault.approve(address(strategy), sharesA);
+        uint256 assetsOut = strategy.redeem(sharesA, 0); // must NOT revert
+        vm.stopPrank();
+
+        // Must receive non-zero USDC.
+        assertGt(assetsOut, 0, "received 0 USDC");
+
+        // If the calm gate did not trip, assetsOut should be ≥ 80 % of oracle NAV.
+        if (navBefore > 0) {
+            assertGe(assetsOut, navBefore * 8000 / 10000, "received < 80% of NAV");
+        }
+
+        // Both Moonwell borrow balances must be fully cleared.
+        assertEq(
+            IMoonwellMarket(BaseAddresses.MOONWELL_MCBBTC).borrowBalanceStored(address(strategy)),
+            0,
+            "cbBTC debt not cleared after full redeem under IL"
+        );
+        assertEq(
+            IMoonwellMarket(BaseAddresses.MOONWELL_MWETH).borrowBalanceStored(address(strategy)),
+            0,
+            "WETH debt not cleared after full redeem under IL"
+        );
+
+        // Position fully unwound: the NPM position must have zero liquidity.
+        (,,,,,,, uint128 liqAfter,,,,) = INpmFull(BaseAddresses.SLIPSTREAM_NPM).positions(tid);
+        assertEq(liqAfter, 0, "position not fully unwound after full redeem");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Test 5: Finding 1 regression — partial redeem with zero idle + IL shortfall
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice Finding 1 (partial) regression: partial redeem with zero idle USDC and IL-induced shortfall.
     ///         OLD code: _redeemCoverShortfall uses idle USDC (=0) → exactOutputSingle amountInMax=0 → MoonwellRedeemFailed(3).
     ///         NEW code: redeem f·collateral first → USDC available → shortfall covered.
     function test_redeem_partialUnderILWithZeroIdle() public {

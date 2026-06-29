@@ -199,10 +199,23 @@ library LeveragedAeroManager {
         (uint256 cbShort, uint256 wethShort) = _redeemRepayFromCollected(shares, supply);
 
         if (shares == supply) {
-            // Full redemption: must clear ALL debt before redeeming 100% of collateral.
+            // Full redemption — two-phase debt clearance before 100 % collateral redeem.
+            //
+            // Phase 1 (oracle-free): cover IL shortfall from idle USDC via exact-output swap.
+            //   When idle == 0 the calls are safe no-ops (amountInMaximum = 0 → early return).
             if (cbShort > 0) _redeemCoverShortfall($.cbBTC, $.mCbBTC, cbShort);
             if (wethShort > 0) _redeemCoverShortfall($.weth, $.mWeth, wethShort);
+            // Phase 2 (self-fund fallback): if residual debt remains after Phase 1 (idle == 0 case),
+            //   redeem mUSDC collateral → swap to deficit token → repay (settle-shortfall pattern).
+            //   _settleShortfall reads the oracle only when borrowBalance > 0, so it is a no-op
+            //   (oracle-free) when Phase 1 fully covered the shortfall.
+            _settleShortfall();
+            // Phase 3: all debt cleared — Moonwell now permits 100 % collateral redemption.
             _redeemCollateral(shares, supply);
+            // Clear position state (flat-book invariant: no stayers remain after a full redeem).
+            $.tokenId = 0;
+            $.posTickLower = 0;
+            $.posTickUpper = 0;
         } else {
             // Partial redemption: redeem f*collateral first (Finding 1 fix).
             _redeemCollateral(shares, supply);
