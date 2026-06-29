@@ -137,8 +137,19 @@ contract StrategyFactory is Ownable {
     }
 
     /// @notice Deterministic variant — caller can predict the clone address via
-    ///         `Clones.predictDeterministicAddress`.
+    ///         `Clones.predictDeterministicAddress(template, keccak256(abi.encode(vault, salt)), factory)`.
     /// @dev Sherlock run #2 #9 partial — see `cloneAndInit` for the rationale.
+    /// @dev #387 — the CREATE2 salt is bound to `vault`
+    ///      (`keccak256(abi.encode(vault, salt))`) so each vault gets its own
+    ///      address namespace. `salt` is visible in calldata; without the fold a
+    ///      front-runner could race the deploy and occupy the predicted address
+    ///      with a clone bound to their own vault — a recoverable DoS that would
+    ///      brick a keyless propose referencing it. With the fold, occupying a
+    ///      vault's address requires passing that vault here, which `_authClone`
+    ///      only lets the vault's owner / registered agents do. The off-chain
+    ///      predictor mirrors this fold byte-for-byte (SDK `effectiveStrategySalt`,
+    ///      issue #387 external-signer PR); the two MUST stay in lockstep or
+    ///      predictions diverge from the deployed address.
     function cloneAndInitDeterministic(
         address template,
         address vault,
@@ -149,7 +160,7 @@ contract StrategyFactory is Ownable {
         _authClone(vault);
         _authTemplate(template);
         if (proposer != msg.sender) revert ProposerMustBeSender();
-        clone = Clones.cloneDeterministic(template, salt);
+        clone = Clones.cloneDeterministic(template, keccak256(abi.encode(vault, salt)));
         IStrategy(clone).initialize(vault, proposer, data);
         emit StrategyCloned(template, vault, clone);
     }
