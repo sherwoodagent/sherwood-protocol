@@ -249,16 +249,24 @@ contract LeveragedAeroValuationFork is LeveragedAeroForkBase, IERC721Receiver {
         (,,,,, int24 tl, int24 tu, uint128 liq,,,,) = INonfungiblePositionManager(NPM).positions(tokenId);
         assertGt(liq, 0, "no liquidity");
 
-        LeveragedAeroValuation.Config memory cfg = _cfg();
-        uint256 navBefore = LeveragedAeroValuation.netEquityUsdc(cfg, actor, tl, tu, liq);
-        console2.log("navBefore (oracle, USDC 6dp):", navBefore);
-
         uint256 fBps = 2_500; // 25% exit (Moonwell collateral-factor headroom -- see @dev)
 
-        // 0. Fold the open-time leftover legs into the USDC baseline (excludes the fixed offset).
+        // 0. Fold the open-time leftover legs into the USDC baseline FIRST, then mark. Since
+        //    `netEquityUsdc` now prices idle cbBTC/WETH (task 3.9), convert the leftover legs to
+        //    USDC BEFORE the mark so the mark counts them as idle USDC (not idle legs); the
+        //    f-scaled target then EXCLUDES that baseline USDC (`leveredMark = nav - usdcStart`),
+        //    because the partial unwind only realizes the levered position (LP + collateral -
+        //    debt), not the pre-existing USDC baseline. (Pre-3.9 the leftover legs were invisible
+        //    to nav, so the old code could mark before folding; pricing idle legs requires this.)
         _swapAllToUsdc(WETH, actor);
         _swapAllToUsdc(CBBTC, actor);
         uint256 usdcStart = IERC20(USDC).balanceOf(actor);
+
+        LeveragedAeroValuation.Config memory cfg = _cfg();
+        uint256 navBefore = LeveragedAeroValuation.netEquityUsdc(cfg, actor, tl, tu, liq);
+        uint256 leveredMark = navBefore - usdcStart; // levered position only (idle-USDC baseline excluded)
+        console2.log("navBefore (oracle, USDC 6dp):", navBefore);
+        console2.log("leveredMark (oracle, USDC 6dp):", leveredMark);
 
         // 1. Unstake the NFT from the gauge (actor regains ownership).
         ICLGauge(GAUGE).withdraw(tokenId);
@@ -304,9 +312,9 @@ contract LeveragedAeroValuationFork is LeveragedAeroForkBase, IERC721Receiver {
 
         uint256 usdcEnd = IERC20(USDC).balanceOf(actor);
         uint256 realizedOut = usdcEnd - usdcStart; // net USDC freed by the partial unwind
-        uint256 target = (navBefore * fBps) / 10_000;
+        uint256 target = (leveredMark * fBps) / 10_000; // f * (LP + collateral - debt), idle USDC excluded
         console2.log("realizedOut (USDC 6dp):", realizedOut);
-        console2.log("target f*nav (USDC 6dp):", target);
+        console2.log("target f*leveredMark (USDC 6dp):", target);
 
         // Oracle NAV is a faithful, slightly-conservative mark: realized ~= f*nav within 2%
         // (exit slippage makes realized slightly under).

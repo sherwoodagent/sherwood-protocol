@@ -645,6 +645,36 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         LeveragedAeroManager.compoundImpl(minUsdcOut, minLiquidity);
     }
 
+    /// @notice Recenter the levered CL position on the current pool tick WITHOUT swapping.
+    ///
+    ///         Recentering keeps the position straddling the tick (balanced exposure, in-range
+    ///         for AERO carry) as the pool drifts. The full venue sequence — calm-gate → unstake
+    ///         + remove 100% liquidity + collect → recompute a tickSpacing-aligned range on the
+    ///         current tick → re-add the collected legs (two-sided slippage mins) → restake →
+    ///         `_assertHealthy` — lives in `LeveragedAeroManager.rerangeImpl()` (delegatecalled).
+    ///         The calm-gate runs FIRST, so a recenter can never execute at a manipulated tick.
+    ///
+    ///         No swap → principal is conserved (IL is realized only on a true exit). The
+    ///         collected token ratio cannot match the new range, so a remainder of ONE borrowed
+    ///         leg is left idle; `nav()` prices idle cbBTC/WETH (`LeveragedAeroValuation`) so the
+    ///         recenter is NAV-neutral and the remainder stays redeployable by `compound`/
+    ///         `deployIdle` (and is swept on the next exit). The Moonwell debt + collateral are
+    ///         untouched, so the pre-existing health is preserved. A new tokenId is minted
+    ///         (Slipstream ticks are immutable); the old empty NFT is left owned by the strategy.
+    ///
+    ///         NO fee crystallisation: rerange changes neither supply (no mint/burn) nor NAV (no
+    ///         realized PnL) — unlike `compound`, which realizes AERO yield. The streaming
+    ///         management fee for the interval is accrued at the next crystallize point
+    ///         (deposit/redeem/compound) — deferred, not lost — and the HWM is unaffected by a
+    ///         NAV-neutral op, so omitting crystallisation here charges no one unfairly.
+    ///
+    /// @param minLiq0 Minimum token0 (WETH) the re-add must consume (two-sided slippage guard).
+    /// @param minLiq1 Minimum token1 (cbBTC) the re-add must consume (two-sided slippage guard).
+    function rerange(uint256 minLiq0, uint256 minLiq1) external onlyProposer nonReentrant {
+        if (_state != State.Executed) revert NotExecuted();
+        LeveragedAeroManager.rerangeImpl(minLiq0, minLiq1);
+    }
+
     /// @notice Oracle-free proportional redeem: burn vault shares, receive pro-rata USDC.
     ///
     ///         The caller must call `vault.approve(strategy, shares)` first so this

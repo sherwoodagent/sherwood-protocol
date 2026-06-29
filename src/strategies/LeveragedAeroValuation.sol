@@ -20,7 +20,7 @@ import {IMoonwellMarket} from "../interfaces/IMoonwellMarket.sol";
 ///         manipulated price can only *deny* a deposit, never mint cheap shares.
 ///
 ///         ```
-///         NAV = floatVault + idleStrategy + collateral + clLegs − debt   (all in USDC, 6dp)
+///         NAV = floatVault + idleStrategy + collateral + clLegs + idleLegs − debt  (USDC, 6dp)
 ///         ```
 ///
 ///         - `floatVault`    = `USDC.balanceOf(vault)`        (face, 6dp)
@@ -35,6 +35,10 @@ import {IMoonwellMarket} from "../interfaces/IMoonwellMarket.sol";
 ///                             **oracle-implied `sqrtP`** (derived from the two Chainlink
 ///                             prices, NOT the manipulable pool tick), each leg priced via
 ///                             Chainlink.
+///         - `idleLegs`      = out-of-position cbBTC/WETH held by the strategy (e.g. the
+///                             remainder a no-swap `rerange` recenter leaves), each priced via
+///                             Chainlink on the SAME basis as `debt` — so a borrowed leg is
+///                             never uncounted and a single-position recenter is NAV-neutral.
 ///
 ///         The CL-leg split uses the oracle sqrtP (the Gamma/Arrakis technique) so the
 ///         mint mark cannot be tick-shoved; the same two feeds price the debt, so the
@@ -90,7 +94,7 @@ library LeveragedAeroValuation {
     /// @param tickLower  Lower tick of the CL position (from `NPM.positions`).
     /// @param tickUpper  Upper tick of the CL position.
     /// @param liquidity  CL liquidity (from `NPM.positions`); 0 ⇒ no CL legs.
-    /// @return navUsdc   USDC value of `float + idle + collateral + clLegs − debt`.
+    /// @return navUsdc   USDC value of `float + idle + collateral + clLegs + idleLegs − debt`.
     /// @dev Fail-closed: reverts on any oracle/calm failure (via `ChainlinkReader` and the
     ///      calm-gate) and on non-positive equity. Used to price deposits only.
     function netEquityUsdc(Config memory c, address strategy, int24 tickLower, int24 tickUpper, uint128 liquidity)
@@ -112,6 +116,18 @@ library LeveragedAeroValuation {
         // --- CL legs (oracle-implied sqrtP) ---
         (uint256 pCbBTC, uint256 pWeth) = _legPrices(c);
         assets += _clLegsUsdc(c, tickLower, tickUpper, liquidity, pCbBTC, pWeth, pUsdc);
+
+        // --- idle (out-of-position) borrowed legs ---
+        // A no-swap `rerange` recenter leaves a remainder of ONE borrowed leg in the strategy
+        // wallet (the collected token ratio cannot match the new range's required ratio and
+        // swapping is forbidden). Price that remainder on the SAME Chainlink basis as the CL legs
+        // and the debt (fail-closed via `_legPrices`/`_readUsd8`, behind the calm-gate already run
+        // above) so a borrowed token is never uncounted: this makes a single-position recenter
+        // NAV-neutral (the remainder is redeployable and swept on the next exit, not leaked). In
+        // steady state these balances are ~dust (execute/deploy/compound/settle/redeem leave ~0),
+        // and `_usdcValue` returns 0 for a 0 amount, so this is a clean no-op outside a rerange.
+        assets += _usdcValue(IERC20(c.cbBTC).balanceOf(strategy), c.cbBTCDecimals, pCbBTC, pUsdc);
+        assets += _usdcValue(IERC20(c.weth).balanceOf(strategy), c.wethDecimals, pWeth, pUsdc);
 
         // --- debt (same Chainlink basis) ---
         uint256 debt = _debtUsdc(c, strategy, pCbBTC, pWeth, pUsdc);

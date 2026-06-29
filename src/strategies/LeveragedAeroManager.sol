@@ -221,6 +221,13 @@ library LeveragedAeroManager {
         // Snapshot idle USDC — stayers keep (1-f) of it.
         uint256 idleUsdcBefore = IERC20($.usdc).balanceOf(address(this));
         uint256 stayersIdle = idleUsdcBefore - Math.mulDiv(idleUsdcBefore, shares, supply);
+        // Snapshot the stayers' (1-f) share of any PRE-EXISTING idle leg. A `rerange` recenter
+        // leaves a remainder of one borrowed leg (cbBTC or WETH) idle in the strategy — the leg
+        // sweep at step E would otherwise hand a partial redeemer 100% of it, skimming the stayers'
+        // share. Reserving (1-f) of it keeps redeem oracle-free (stayers' share stays as LEGS, not
+        // oracle-valued). Both are ~0 (clean no-op) outside a post-rerange partial redeem.
+        uint256 stayersCb = _stayerLeg($.cbBTC, shares, supply);
+        uint256 stayersWeth = _stayerLeg($.weth, shares, supply);
 
         // A — partial CL unwind (pool-based mins, oracle-free).
         _unwindLiquidity(shares, supply);
@@ -253,11 +260,15 @@ library LeveragedAeroManager {
             if (wethShort > 0) _redeemCoverShortfall($.weth, $.mWeth, wethShort);
         }
 
-        // E — sweep any residual cbBTC/WETH → USDC (min-out=0; aggregate guard applies).
-        _swapTokenToUsdc($.cbBTC, 0);
-        _swapTokenToUsdc($.weth, 0);
+        // E — sweep residual cbBTC/WETH → USDC, LEAVING the stayers' reserved leg share un-swept
+        // (min-out=0; aggregate guard applies). For a full redeem (f=1) or no rerange remainder,
+        // stayers* == 0 → sweep all (identical to the prior unconditional sweep). In the common
+        // partial case this hands the redeemer exactly f*(idleLeg + LP_leg − debt_leg).
+        _sweepLegToUsdc($.cbBTC, stayersCb, 0);
+        _sweepLegToUsdc($.weth, stayersWeth, 0);
 
-        // assetsOut = total USDC minus the (1-f) idle portion that stays for stayers.
+        // assetsOut = total USDC minus the (1-f) idle-USDC portion that stays for stayers (the
+        // stayers' idle-leg share already stayed un-swept above, as legs).
         uint256 usdcFinal = IERC20($.usdc).balanceOf(address(this));
         return usdcFinal > stayersIdle ? usdcFinal - stayersIdle : 0;
     }
@@ -328,6 +339,64 @@ library LeveragedAeroManager {
         deployIdleImpl(usdcOut, minLiquidity);
     }
 
+    /// @notice Recenter the CL position on the current tick WITHOUT swapping (body of the
+    ///         strategy's `rerange`): calm-gate → unstake + remove 100% liquidity + collect →
+    ///         recompute a tickSpacing-aligned range on the current tick → re-add the collected
+    ///         legs (two-sided slippage mins) → restake → assert health. The Moonwell debt +
+    ///         collateral are untouched.
+    ///
+    ///         **No swap by construction** → principal is conserved (IL is realized only on a
+    ///         true exit). The collected token ratio cannot match the new range's required ratio,
+    ///         so a remainder of ONE borrowed leg is left idle in the strategy — counted by
+    ///         `nav()` (`LeveragedAeroValuation` prices idle cbBTC/WETH on the Chainlink basis),
+    ///         so the recenter is NAV-neutral and the remainder stays redeployable. Slipstream
+    ///         position ticks are immutable, so a recenter MUST mint a NEW tokenId; the old
+    ///         (now-empty, unstaked) NFT is left owned by the strategy — harmless 0-liquidity dust.
+    ///
+    ///         No-op (clean return) on a flat book (tokenId == 0). Health is preserved because
+    ///         debt + collateral are untouched; `_assertHealthy` runs as a belt-and-suspenders gate.
+    ///
+    /// @param minLiq0 Minimum token0 (WETH) the re-add must consume (caller two-sided slippage min).
+    /// @param minLiq1 Minimum token1 (cbBTC) the re-add must consume (caller two-sided slippage min).
+    function rerangeImpl(uint256 minLiq0, uint256 minLiq1) public {
+        Layout storage $ = _s();
+        if ($.tokenId == 0) return; // flat book — nothing to recenter
+
+        // 1. Calm-gate BEFORE touching the pool — never recenter at a manipulated tick.
+        LeveragedAeroValuation._calmGate(_cfg());
+
+        // 2. Unstake + remove 100% liquidity + collect (num==den → no restake). The old NFT is
+        //    left empty + unstaked; a recenter needs a fresh range == fresh tokenId.
+        _unwindLiquidity(1, 1);
+
+        // 3. New tickSpacing-aligned range centered on the current (calm) tick.
+        (int24 tL, int24 tU) = _computeTickRange();
+
+        // 4. Re-add the collected legs (full balances as desired) into the new range. No swap →
+        //    principal conserved. `_mintPosition` enforces the two-sided `maxSlippageBps` mins
+        //    (the §8 always-on floor) and approves the NPM; the caller's `minLiq0/minLiq1` add an
+        //    explicit two-sided guard on the consumed amounts (proposer-tightenable, like
+        //    compound's `minUsdcOut`).
+        uint256 wethBal = IERC20($.weth).balanceOf(address(this));
+        uint256 cbBal = IERC20($.cbBTC).balanceOf(address(this));
+        (uint256 newTid, uint256 used0, uint256 used1) = _mintPosition(wethBal, cbBal, tL, tU);
+        if (used0 < minLiq0 || used1 < minLiq1) revert InsufficientLiquidity();
+
+        // 5. Restake the new NFT to resume AERO gauge rewards (mirrors _mintAndStake).
+        address gauge_ = $.gauge;
+        (bool ok,) = $.npm.call(abi.encodeWithSignature("approve(address,uint256)", gauge_, newTid));
+        if (!ok) revert NpmApproveFailed();
+        ICLGauge(gauge_).deposit(newTid);
+
+        // 6. Persist the recentered position (nav()/positions() now read the new NFT).
+        $.tokenId = newTid;
+        $.posTickLower = tL;
+        $.posTickUpper = tU;
+
+        // 7. Debt + collateral untouched by rerange → health preserved; assert as a belt.
+        _assertHealthy();
+    }
+
     // ═════════════════════════════════════════════════════════════
     // Execute helpers
     // ═════════════════════════════════════════════════════════════
@@ -381,10 +450,15 @@ library LeveragedAeroManager {
         if (tU <= tL) tU = tL + ts;
     }
 
-    /// @dev Mint the Slipstream CL position and return its tokenId.
-    ///      token0 = WETH (18dp), token1 = cbBTC (8dp). Two-sided slippage mins are derived
-    ///      from the expected-actual deposit amounts at the calm-gated sqrtP.
-    function _mintPosition(uint256 wethAmt, uint256 cbBTCAmt, int24 tL, int24 tU) private returns (uint256 tid) {
+    /// @dev Mint the Slipstream CL position and return its tokenId + the amounts actually
+    ///      consumed. token0 = WETH (18dp), token1 = cbBTC (8dp). Two-sided slippage mins are
+    ///      derived from the expected-actual deposit amounts at the calm-gated sqrtP (the §8
+    ///      always-on floor); `rerange` layers an additional caller-supplied two-sided guard on
+    ///      the returned `used0`/`used1`.
+    function _mintPosition(uint256 wethAmt, uint256 cbBTCAmt, int24 tL, int24 tU)
+        private
+        returns (uint256 tid, uint256 used0, uint256 used1)
+    {
         Layout storage $ = _s();
         address npm_ = $.npm;
         address weth_ = $.weth;
@@ -416,7 +490,7 @@ library LeveragedAeroManager {
             deadline: block.timestamp + 600,
             sqrtPriceX96: 0
         });
-        (tid,,,) = INonfungiblePositionManager(npm_).mint(mp);
+        (tid,, used0, used1) = INonfungiblePositionManager(npm_).mint(mp);
         if (tid == 0) revert NpmMintFailed();
     }
 
@@ -426,7 +500,7 @@ library LeveragedAeroManager {
         Layout storage $ = _s();
         LeveragedAeroValuation._calmGate(_cfg());
         (int24 tL, int24 tU) = _computeTickRange();
-        uint256 tid = _mintPosition(wethAmt, cbBTCAmt, tL, tU);
+        (uint256 tid,,) = _mintPosition(wethAmt, cbBTCAmt, tL, tU);
         address gauge_ = $.gauge;
         // ERC-721 approve (approve(address,uint256)) via low-level call.
         (bool ok,) = $.npm.call(abi.encodeWithSignature("approve(address,uint256)", gauge_, tid));
@@ -601,10 +675,17 @@ library LeveragedAeroManager {
 
     /// @dev Sweep the full balance of `tokenIn` to USDC via exactInputSingle (minOut may be 0).
     function _swapTokenToUsdc(address tokenIn, uint256 minOut) private {
+        _sweepLegToUsdc(tokenIn, 0, minOut);
+    }
+
+    /// @dev Sweep (balance − `keep`) of `tokenIn` → USDC via exactInputSingle. `keep` reserves a
+    ///      stayers' idle-leg share on the redeem path; settle / full-sweep callers pass keep == 0.
+    function _sweepLegToUsdc(address tokenIn, uint256 keep, uint256 minOut) private {
         Layout storage $ = _s();
         uint256 bal = IERC20(tokenIn).balanceOf(address(this));
-        if (bal == 0) return;
-        IERC20(tokenIn).forceApprove($.swapRouter, bal);
+        if (bal <= keep) return;
+        uint256 amt = bal - keep;
+        IERC20(tokenIn).forceApprove($.swapRouter, amt);
         ICLSwapRouter($.swapRouter)
             .exactInputSingle(
                 ICLSwapRouter.ExactInputSingleParams({
@@ -613,11 +694,19 @@ library LeveragedAeroManager {
                 tickSpacing: int24(100),
                 recipient: address(this),
                 deadline: block.timestamp + 600,
-                amountIn: bal,
+                amountIn: amt,
                 amountOutMinimum: minOut,
                 sqrtPriceLimitX96: 0
             })
             );
+    }
+
+    /// @dev (1-f) of the strategy's current `token` balance, f = shares/supply. Used by redeem to
+    ///      reserve the stayers' share of a pre-existing idle leg (a rerange remainder) before the
+    ///      residual sweep — keeping the partial-redeem path oracle-free and stayer-fair.
+    function _stayerLeg(address token, uint256 shares, uint256 supply) private view returns (uint256) {
+        uint256 bal = IERC20(token).balanceOf(address(this));
+        return bal - Math.mulDiv(bal, shares, supply);
     }
 
     /// @dev Convert `amt` (in `dec`-decimal token units) to USDC (6dp) using Chainlink prices.
