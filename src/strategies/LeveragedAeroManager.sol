@@ -79,6 +79,8 @@ library LeveragedAeroManager {
     error MoonwellRedeemFailed(uint256 errCode);
     error InsufficientLiquidity();
     error InsufficientIdle();
+    /// @dev `deleverage()` called while the position is at/above `minHealthBps` (no-op when safe).
+    error HealthyNoDeleverage();
 
     // ─────────────────────────────────────────────────────────────
     // Constants (duplicated from the strategy — compile-time literals)
@@ -90,6 +92,9 @@ library LeveragedAeroManager {
     uint8 private constant WETH_DECIMALS = 18;
     /// @dev Number of tick-spacings on each side of the current tick for the initial CL range.
     uint8 private constant RANGE_TICK_SPACINGS = 20;
+    /// @dev `deleverage()` repays down to `minHealthBps × (1 + this/1e4)` — a small buffer above the
+    ///      minimum so a rescue does not land exactly on the threshold and immediately re-trigger.
+    uint16 private constant DELEVERAGE_BUFFER_BPS = 500; // +5% above minHealthBps
 
     /// @dev Aerodrome v2 (AMM) Router on Base — the AERO→USDC reward swap in `compoundImpl`
     ///      routes through its volatile pool, the deepest AERO/USDC liquidity on Base
@@ -285,16 +290,7 @@ library LeveragedAeroManager {
         if (amount > IERC20($.usdc).balanceOf(address(this))) revert InsufficientIdle();
         _supplyAmount(amount);
         (uint256 cbBTCAmt, uint256 wethAmt) = _computeAndBorrow(amount);
-        _wrapNativeEth();
-        // Unstake the NFT so NPM.increaseLiquidity can update the position (requires ownership).
-        uint256 tid = $.tokenId;
-        address gauge_ = $.gauge;
-        ICLGauge(gauge_).withdraw(tid);
-        _addLiquidity(wethAmt, cbBTCAmt, minLiquidity);
-        // Re-stake to resume AERO gauge rewards (mirrors _mintAndStake).
-        (bool ok,) = $.npm.call(abi.encodeWithSignature("approve(address,uint256)", gauge_, tid));
-        if (!ok) revert NpmApproveFailed();
-        ICLGauge(gauge_).deposit(tid);
+        _wrapAddRestake(cbBTCAmt, wethAmt, minLiquidity);
         _assertHealthy();
     }
 
@@ -402,6 +398,141 @@ library LeveragedAeroManager {
         _assertHealthy();
     }
 
+    /// @notice Retarget the position's LTV to `targetLtvBps_` (body of the strategy's
+    ///         `adjustLeverage`). The strategy entrypoint has already enforced
+    ///         `targetLtvBps_ ≤ maxLtvBps` (reverts `TargetLtvExceedsMax` otherwise).
+    ///
+    ///         Collateral is untouched, so LTV moves purely via the debt side:
+    ///         - **Lever UP** (target debt > current): borrow the cbBTC/WETH delta at the target,
+    ///           wrap native ETH, and `increaseLiquidity` the new legs into the existing position
+    ///           (`minLiq` slippage). Mirrors `deployIdleImpl` minus the new-collateral supply.
+    ///         - **Lever DOWN** (target debt < current): unwind the matching fraction of CL
+    ///           liquidity, repay the debt delta from the collected legs, rebalancing any per-leg
+    ///           residual through USDC (caller `minOut` bounds that swap; no-op when balanced).
+    ///
+    ///         Ends with `_assertHealthy()` — reverts if the post-op LTV exceeds `maxLtvBps` or
+    ///         Moonwell reports a shortfall. No share supply change → NO fee crystallisation (that
+    ///         lives in the strategy entrypoints; this op realizes no PnL to the vault).
+    ///
+    /// @param targetLtvBps_ Target loan-to-value in bps (≤ `maxLtvBps`, checked by the entrypoint).
+    /// @param minLiq        Minimum CL liquidity to accept on a lever-UP add (slippage guard).
+    /// @param minOut        Minimum USDC out of a lever-DOWN residual rebalancing swap (slippage guard).
+    function adjustLeverageImpl(uint16 targetLtvBps_, uint256 minLiq, uint256 minOut) public {
+        (uint256 collateralUsdc, uint256 debtUsdc) = _readCollateralDebt();
+        uint256 targetDebt = (uint256(targetLtvBps_) * collateralUsdc) / 10000;
+        if (targetDebt > debtUsdc) {
+            _leverUp(targetDebt - debtUsdc, minLiq);
+        } else if (debtUsdc > targetDebt) {
+            _leverDown(debtUsdc - targetDebt, debtUsdc, minOut);
+        }
+        _assertHealthy();
+    }
+
+    /// @notice Permissionless safety valve (body of the strategy's `deleverage`): when the
+    ///         position's health has fallen below `minHealthBps`, anyone may unwind CL liquidity
+    ///         and repay debt to restore the buffer.
+    ///
+    ///         **Health basis** mirrors `_assertHealthy`: `health = collateralUsdc × 1e4 / debtUsdc`
+    ///         (bps), priced through the SAME hardened Chainlink reads. A position at/above
+    ///         `minHealthBps` reverts `HealthyNoDeleverage` (no-op when safe); zero debt is trivially
+    ///         healthy → also reverts.
+    ///
+    ///         Repays down to `minHealthBps × (1 + DELEVERAGE_BUFFER_BPS/1e4)` (a small buffer above
+    ///         the minimum so the rescue does not immediately re-trigger). As a recovery op it does
+    ///         NOT require the full `_assertHealthy` LTV-≤-max gate (the position may have been pushed
+    ///         past max by the adverse move); instead it asserts health strictly improved and the
+    ///         Moonwell shortfall is cleared or reduced.
+    ///
+    ///         **Oracle-staleness (accepted residual, spec §13):** like `_assertHealthy`, this reads
+    ///         Chainlink, so a stale feed reverts (fail-safe — deleveraging at a stale/manipulated
+    ///         price is worse than waiting). Moonwell liquidation uses Moonwell's OWN oracle, so a
+    ///         window where our feed is stale but Moonwell's is fresh is an accepted residual.
+    ///
+    /// @param minOut Minimum USDC out of any residual rebalancing swap (caller slippage guard).
+    function deleverageImpl(uint256 minOut) public {
+        Layout storage $ = _s();
+        (uint256 c0, uint256 d0) = _readCollateralDebt();
+        if (d0 == 0) revert HealthyNoDeleverage(); // no debt ⇒ infinitely healthy
+        uint256 health0 = (c0 * 10000) / d0;
+        uint256 minHealth = uint256($.minHealthBps);
+        if (health0 >= minHealth) revert HealthyNoDeleverage();
+        (,, uint256 shortfall0) = IComptroller($.comptroller).getAccountLiquidity(address(this));
+
+        // Target debt that lands health at minHealthBps + the re-trigger buffer (collateral is
+        // untouched, so health = c / d ⇒ targetDebt = c × 1e4 / targetHealth).
+        uint256 targetHealth = (minHealth * (10000 + uint256(DELEVERAGE_BUFFER_BPS))) / 10000;
+        uint256 targetDebt = (c0 * 10000) / targetHealth;
+        if (d0 > targetDebt) _leverDown(d0 - targetDebt, d0, minOut);
+
+        // Recovery gate: health strictly improved AND the Moonwell shortfall cleared or reduced.
+        (uint256 c1, uint256 d1) = _readCollateralDebt();
+        uint256 health1 = d1 == 0 ? type(uint256).max : (c1 * 10000) / d1;
+        if (health1 <= health0) revert UnhealthyPosition(health1, minHealth);
+        (uint256 err,, uint256 shortfall1) = IComptroller($.comptroller).getAccountLiquidity(address(this));
+        if (err != 0 || (shortfall1 != 0 && shortfall1 >= shortfall0)) revert UnhealthyPosition(health1, minHealth);
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    // Leverage helpers (adjustLeverage / deleverage)
+    // ═════════════════════════════════════════════════════════════
+
+    /// @dev Lever UP by `borrowDeltaUsd` (USDC face, 6dp): borrow the cbBTC/WETH delta (50/50) and
+    ///      add it to the existing position. No new collateral — mirrors `deployIdleImpl`'s
+    ///      borrow→wrap→add→restake without the supply step.
+    function _leverUp(uint256 borrowDeltaUsd, uint256 minLiq) private {
+        (uint256 cbBTCAmt, uint256 wethAmt) = _borrowHalfEach(borrowDeltaUsd);
+        _wrapAddRestake(cbBTCAmt, wethAmt, minLiq);
+    }
+
+    /// @dev Lever DOWN by `repayUsd` (USDC face, 6dp) of the current `debtUsd`: unwind the matching
+    ///      fraction `f = repayUsd/debtUsd` of CL liquidity, repay `f` of each debt from the
+    ///      collected legs (oracle-free direct repay), then cover any per-leg IL residual by selling
+    ///      the over-collected sibling leg → USDC (caller `minOut` bounds it) and buying the deficit.
+    ///      Balanced legs (the common case) leave no residual → no swap → `minOut` unused.
+    function _leverDown(uint256 repayUsd, uint256 debtUsd, uint256 minOut) private {
+        Layout storage $ = _s();
+        _unwindLiquidity(repayUsd, debtUsd);
+        (uint256 cbShort, uint256 wethShort) = _redeemRepayFromCollected(repayUsd, debtUsd, 0, 0);
+        if (cbShort > 0) {
+            _rebalanceCover($.weth, $.cbBTC, $.mCbBTC, cbShort, minOut);
+        } else if (wethShort > 0) {
+            _rebalanceCover($.cbBTC, $.weth, $.mWeth, wethShort, minOut);
+        }
+    }
+
+    /// @dev Cover an IL-driven debt shortfall on `deficitTok` by selling the over-collected
+    ///      `surplusTok` → USDC (`minUsdcOut` bounds this rebalancing swap), then buying exactly the
+    ///      deficit via exact-output from that USDC and repaying it. Any leftover USDC stays idle
+    ///      (NAV-counted; recoverable via `deployIdle`/`redeem`).
+    function _rebalanceCover(
+        address surplusTok,
+        address deficitTok,
+        address deficitMkt,
+        uint256 shortAmt,
+        uint256 minUsdcOut
+    ) private {
+        _sweepLegToUsdc(surplusTok, 0, minUsdcOut);
+        _redeemCoverShortfall(deficitTok, deficitMkt, shortAmt);
+    }
+
+    /// @dev Collateral + debt in USDC face (6dp) on the SAME hardened-Chainlink basis as
+    ///      `_assertHealthy` (the LTV/health basis) — sizes the adjustLeverage / deleverage targets.
+    ///      Returns `debtUsdc == 0` (skipping the price reads) when both borrows are clear.
+    function _readCollateralDebt() private view returns (uint256 collateralUsdc, uint256 debtUsdc) {
+        Layout storage $ = _s();
+        uint256 cBal = ICToken($.mUsdc).balanceOf(address(this));
+        uint256 rate = ICToken($.mUsdc).exchangeRateStored();
+        collateralUsdc = (cBal * rate) / 1e18;
+        uint256 cbDebt = IMoonwellMarket($.mCbBTC).borrowBalanceStored(address(this));
+        uint256 wethDebt = IMoonwellMarket($.mWeth).borrowBalanceStored(address(this));
+        if (cbDebt == 0 && wethDebt == 0) return (collateralUsdc, 0);
+        (uint256 pBTC,) = ChainlinkReader.readUsd($.cbBTCFeed, $.sequencerFeed, $.maxDelay, $.gracePeriod);
+        (uint256 pETH,) = ChainlinkReader.readUsd($.wethFeed, $.sequencerFeed, $.maxDelay, $.gracePeriod);
+        (uint256 pUsdc,) = ChainlinkReader.readUsd($.usdcFeed, $.sequencerFeed, $.maxDelay, $.gracePeriod);
+        debtUsdc =
+            _tokenToUsdc(cbDebt, CBBTC_DECIMALS, pBTC, pUsdc) + _tokenToUsdc(wethDebt, WETH_DECIMALS, pETH, pUsdc);
+    }
+
     // ═════════════════════════════════════════════════════════════
     // Execute helpers
     // ═════════════════════════════════════════════════════════════
@@ -421,13 +552,21 @@ library LeveragedAeroManager {
         IComptroller($.comptroller).enterMarkets(markets);
     }
 
-    /// @dev Read Chainlink prices, compute borrow amounts, and execute both borrows.
+    /// @dev Borrow against `usdcAmt` of fresh collateral at `targetLtvBps` (execute / deployIdle).
+    ///      The borrow USD = `usdcAmt × targetLtvBps / 1e4`, split 50/50 across cbBTC/WETH.
     function _computeAndBorrow(uint256 usdcAmt) private returns (uint256 cbBTCAmt, uint256 wethAmt) {
+        return _borrowHalfEach((usdcAmt * uint256(_s().targetLtvBps)) / 10000);
+    }
+
+    /// @dev Borrow `borrowUsd6` of debt (USDC face, 6dp) split 50/50 by USD across cbBTC + WETH, at
+    ///      hardened-Chainlink prices, and execute both borrows. Used by `_computeAndBorrow` (fresh
+    ///      collateral at target) and by `_leverUp` (a target-LTV debt delta with no new collateral).
+    function _borrowHalfEach(uint256 borrowUsd6) private returns (uint256 cbBTCAmt, uint256 wethAmt) {
         Layout storage $ = _s();
         (uint256 pBTC,) = ChainlinkReader.readUsd($.cbBTCFeed, $.sequencerFeed, $.maxDelay, $.gracePeriod);
         (uint256 pETH,) = ChainlinkReader.readUsd($.wethFeed, $.sequencerFeed, $.maxDelay, $.gracePeriod);
-        // halfBorrowUsd8: usdcAmt (6dp) → 8dp via ×100, then ×targetLtvBps÷(2×10000)
-        uint256 halfBorrowUsd8 = (usdcAmt * 100 * uint256($.targetLtvBps)) / (2 * 10000);
+        // halfBorrowUsd8: borrowUsd6 (6dp) → 8dp via ×100, then halve for the per-leg USD value.
+        uint256 halfBorrowUsd8 = (borrowUsd6 * 100) / 2;
         cbBTCAmt = (halfBorrowUsd8 * 1e8) / pBTC;
         wethAmt = (halfBorrowUsd8 * 1e18) / pETH;
         uint256 cbErr = IMoonwellMarket($.mCbBTC).borrow(cbBTCAmt);
@@ -759,6 +898,21 @@ library LeveragedAeroManager {
             })
             );
         if (uint256(liq) < minLiquidity) revert InsufficientLiquidity();
+    }
+
+    /// @dev Wrap native ETH from a borrow → WETH, unstake the NFT so the NPM can modify it,
+    ///      `increaseLiquidity` the borrowed legs into the existing position (`minLiquidity`
+    ///      slippage), then restake for AERO rewards. Shared by `deployIdleImpl` and `_leverUp`.
+    function _wrapAddRestake(uint256 cbBTCAmt, uint256 wethAmt, uint256 minLiquidity) private {
+        Layout storage $ = _s();
+        _wrapNativeEth();
+        uint256 tid = $.tokenId;
+        address gauge_ = $.gauge;
+        ICLGauge(gauge_).withdraw(tid);
+        _addLiquidity(wethAmt, cbBTCAmt, minLiquidity);
+        (bool ok,) = $.npm.call(abi.encodeWithSignature("approve(address,uint256)", gauge_, tid));
+        if (!ok) revert NpmApproveFailed();
+        ICLGauge(gauge_).deposit(tid);
     }
 
     // ═════════════════════════════════════════════════════════════

@@ -80,6 +80,8 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     error InsufficientLiquidity();
     /// @notice `deployIdle` called with more USDC than the strategy holds idle.
     error InsufficientIdle();
+    /// @notice `deleverage()` called while the position is at/above `minHealthBps` (no-op when safe).
+    error HealthyNoDeleverage();
 
     // ─────────────────────────────────────────────────────────────
     // Constants
@@ -673,6 +675,51 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     function rerange(uint256 minLiq0, uint256 minLiq1) external onlyProposer nonReentrant {
         if (_state != State.Executed) revert NotExecuted();
         LeveragedAeroManager.rerangeImpl(minLiq0, minLiq1);
+    }
+
+    /// @notice Retarget the levered position's LTV to `targetLtvBps_` (borrow/repay; no new USDC).
+    ///
+    ///         Collateral is untouched, so LTV moves on the debt side via the deployed
+    ///         `LeveragedAeroManager.adjustLeverageImpl` (delegatecalled): lever UP borrows the
+    ///         cbBTC/WETH delta and `increaseLiquidity`s it in (`minLiq` slippage); lever DOWN
+    ///         unwinds the matching CL fraction and repays the debt delta (rebalancing any per-leg
+    ///         residual through USDC, bounded by `minOut`). Ends with `_assertHealthy` (post-op LTV
+    ///         ≤ `maxLtvBps` + no Moonwell shortfall).
+    ///
+    ///         `targetLtvBps_` must be ≤ `maxLtvBps` (reverts `TargetLtvExceedsMax`) — checked here
+    ///         before the delegatecall. NO fee crystallisation: `adjustLeverage` changes neither
+    ///         share supply (no mint/burn) nor realizes PnL to the vault, so — like `rerange` — the
+    ///         streaming fee for the interval is deferred to the next crystallize point and the HWM
+    ///         is unaffected. (Mirrors `rerange`'s no-crystallize rationale.)
+    ///
+    /// @param targetLtvBps_ Target loan-to-value in bps (e.g. 6000 = 60%); must be ≤ `maxLtvBps`.
+    /// @param minLiq        Minimum CL liquidity to accept on a lever-UP add (slippage guard).
+    /// @param minOut        Minimum USDC out of a lever-DOWN residual rebalancing swap (slippage guard).
+    function adjustLeverage(uint16 targetLtvBps_, uint256 minLiq, uint256 minOut) external onlyProposer nonReentrant {
+        if (_state != State.Executed) revert NotExecuted();
+        if (targetLtvBps_ > _s().maxLtvBps) revert TargetLtvExceedsMax();
+        LeveragedAeroManager.adjustLeverageImpl(targetLtvBps_, minLiq, minOut);
+    }
+
+    /// @notice Permissionless safety valve: when position health has fallen below `minHealthBps`,
+    ///         ANYONE may unwind CL liquidity and repay debt to restore the buffer.
+    ///
+    ///         Deliberately NOT `onlyProposer` — a public deleverage is the user-safety backstop for
+    ///         the indefinite proposal (spec §8). The deployed `LeveragedAeroManager.deleverageImpl`
+    ///         (delegatecalled) computes health on the same hardened-Chainlink basis as
+    ///         `_assertHealthy` (`collateralUsdc × 1e4 / debtUsdc`), reverts `HealthyNoDeleverage`
+    ///         when the position is at/above `minHealthBps` (or has no debt), and otherwise repays
+    ///         down to a small buffer above the minimum, asserting health strictly improved and the
+    ///         Moonwell shortfall cleared/reduced (a recovery op, not the full LTV-≤-max gate).
+    ///
+    ///         NO fee crystallisation: no share-supply change, no PnL realized to the vault. A stale
+    ///         our-feed fail-closes the read (deleveraging at a stale/manipulated price is worse than
+    ///         waiting); Moonwell liquidation uses its own oracle, an accepted residual (spec §13).
+    ///
+    /// @param minOut Minimum USDC out of any residual rebalancing swap (caller slippage guard).
+    function deleverage(uint256 minOut) external nonReentrant {
+        if (_state != State.Executed) revert NotExecuted();
+        LeveragedAeroManager.deleverageImpl(minOut);
     }
 
     /// @notice Oracle-free proportional redeem: burn vault shares, receive pro-rata USDC.

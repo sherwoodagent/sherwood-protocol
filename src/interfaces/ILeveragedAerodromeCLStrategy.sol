@@ -28,8 +28,12 @@ interface ILeveragedAerodromeCLStrategy is IStrategy {
     error MaxLtvExceedsCF();
     /// @notice `Comptroller.markets(mUsdc)` call failed or returned short data.
     error ComptrollerCallFailed();
-    /// @notice The health ratio fell below `minHealthBps` after a position change.
-    error UnhealthyPosition();
+    /// @notice Post-operation LTV exceeds `maxLtvBps`, or Moonwell reports a shortfall.
+    /// @param ltvBps    Actual LTV in bps at the time of the check.
+    /// @param limitBps  The `maxLtvBps` cap that was exceeded.
+    error UnhealthyPosition(uint256 ltvBps, uint256 limitBps);
+    /// @notice `deleverage()` called while the position is at/above `minHealthBps` (no-op when safe).
+    error HealthyNoDeleverage();
     /// @notice Deposit / redeem outside the governance window.
     error NotInExecutedState();
     /// @notice Caller is not an authorized depositor.
@@ -93,16 +97,20 @@ interface ILeveragedAerodromeCLStrategy is IStrategy {
     /// @param newTickUpper New upper tick (tickSpacing-aligned).
     function rerange(int24 newTickLower, int24 newTickUpper) external;
 
-    /// @notice Borrow / repay to retarget the LTV to `targetLtvBps`. Proposer-only.
-    function adjustLeverage() external;
+    /// @notice Borrow / repay to retarget the LTV to `targetLtvBps_`. Proposer-only.
+    ///         Collateral is untouched; lever-UP adds the borrowed delta to the CL position
+    ///         (`minLiq` slippage), lever-DOWN unwinds + repays (residual rebalancing bounded by
+    ///         `minOut`). Reverts `TargetLtvExceedsMax` if `targetLtvBps_ > maxLtvBps`.
+    function adjustLeverage(uint16 targetLtvBps_, uint256 minLiq, uint256 minOut) external;
 
     // ─────────────────────────────────────────────────────────────
     // Task 3.7 — Health: deleverage (permissionless)
     // ─────────────────────────────────────────────────────────────
 
     /// @notice Permissionless: partially unwind the position to restore health ≥ `minHealthBps`.
-    ///         Reverts unless current health < minHealthBps.
-    function deleverage() external;
+    ///         Reverts `HealthyNoDeleverage` unless current health < `minHealthBps`. `minOut` bounds
+    ///         any residual rebalancing swap.
+    function deleverage(uint256 minOut) external;
 
     // ─────────────────────────────────────────────────────────────
     // Task 3.8 — Rescue
