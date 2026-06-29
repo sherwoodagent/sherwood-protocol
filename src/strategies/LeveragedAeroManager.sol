@@ -501,9 +501,18 @@ library LeveragedAeroManager {
     }
 
     /// @dev Cover an IL-driven debt shortfall on `deficitTok` by selling the over-collected
-    ///      `surplusTok` → USDC (`minUsdcOut` bounds this rebalancing swap), then buying exactly the
-    ///      deficit via exact-output from that USDC and repaying it. Any leftover USDC stays idle
-    ///      (NAV-counted; recoverable via `deployIdle`/`redeem`).
+    ///      `surplusTok` → USDC, then buying exactly the deficit from that USDC and repaying it.
+    ///      Any leftover USDC stays idle (NAV-counted; recoverable via `deployIdle`/`redeem`).
+    ///
+    ///      **Oracle-floor guard** — the minimum USDC out of the surplus-leg sell is enforced as
+    ///      `max(callerMinUsdcOut, oracleFloor)` where
+    ///      `oracleFloor = _tokenToUsdc(surplusBal) × (1 − maxSlippageBps)`.
+    ///      This prevents a griefer from passing `minOut=0` to the permissionless `deleverage()`
+    ///      and sandwiching the IL-residual swap.  If a Chainlink feed is stale the read reverts —
+    ///      fail-safe and consistent with `_assertHealthy`.
+    ///
+    ///      **Redeem path unaffected** — redeem calls `_sweepLegToUsdc` directly with a
+    ///      stayers' `keep > 0`; it never routes through `_rebalanceCover`.
     function _rebalanceCover(
         address surplusTok,
         address deficitTok,
@@ -511,6 +520,18 @@ library LeveragedAeroManager {
         uint256 shortAmt,
         uint256 minUsdcOut
     ) private {
+        Layout storage $ = _s();
+        uint256 surplusBal = IERC20(surplusTok).balanceOf(address(this));
+        if (surplusBal > 0) {
+            bool isCbBTC = surplusTok == $.cbBTC;
+            uint8 dec = isCbBTC ? CBBTC_DECIMALS : WETH_DECIMALS;
+            address feed = isCbBTC ? $.cbBTCFeed : $.wethFeed;
+            (uint256 pSurplus,) = ChainlinkReader.readUsd(feed, $.sequencerFeed, $.maxDelay, $.gracePeriod);
+            (uint256 pUsdc,) = ChainlinkReader.readUsd($.usdcFeed, $.sequencerFeed, $.maxDelay, $.gracePeriod);
+            uint256 oracleFloor =
+                _tokenToUsdc(surplusBal, dec, pSurplus, pUsdc) * (10000 - uint256($.maxSlippageBps)) / 10000;
+            if (oracleFloor > minUsdcOut) minUsdcOut = oracleFloor;
+        }
         _sweepLegToUsdc(surplusTok, 0, minUsdcOut);
         _redeemCoverShortfall(deficitTok, deficitMkt, shortAmt);
     }

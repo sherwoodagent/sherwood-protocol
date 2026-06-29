@@ -320,6 +320,17 @@ contract LeveragedAeroCLLeverageFork is LeveragedAeroForkBase {
         strategy.adjustLeverage(6000, 0, 0);
     }
 
+    /// @dev Mock the ETH/USD (WETH) feed to `num/den` × its real answer, preserving the real
+    ///      round metadata so the hardened staleness/completeness checks still pass.
+    function _mockEthScaled(uint256 num, uint256 den) internal {
+        address feed = BaseAddresses.CHAINLINK_ETH_USD;
+        (uint80 rid, int256 ans, uint256 startedAt, uint256 updatedAt, uint80 air) = IAggLev(feed).latestRoundData();
+        int256 scaled = (ans * int256(num)) / int256(den);
+        vm.mockCall(
+            feed, abi.encodeWithSignature("latestRoundData()"), abi.encode(rid, scaled, startedAt, updatedAt, air)
+        );
+    }
+
     // ─────────────────────────────────────────────────────────────
     // deleverage — permissionless
     // ─────────────────────────────────────────────────────────────
@@ -374,6 +385,57 @@ contract LeveragedAeroCLLeverageFork is LeveragedAeroForkBase {
         // Now-healthy position: a second deleverage reverts HealthyNoDeleverage.
         vm.prank(stranger);
         vm.expectRevert(LeveragedAerodromeCLStrategy.HealthyNoDeleverage.selector);
+        strategy.deleverage(0);
+
+        vm.clearMockedCalls();
+    }
+
+    /// @notice Oracle floor on the surplus-leg sell blocks a griefing `deleverage(0)` call.
+    ///
+    ///         Setup:
+    ///         (1) Shovel the cbBTC/WETH pool tick DOWN so the LP accumulates WETH and loses
+    ///             cbBTC.  When the LP unwinds during deleverage, `_redeemRepayFromCollected`
+    ///             finds cbShort > 0 (collected WETH cannot directly repay cbBTC debt) and
+    ///             calls `_rebalanceCover(weth, cbBTC, ...)` → `_sweepLegToUsdc(weth, 0, floor)`.
+    ///         (2) Mock BTC/USD AND ETH/USD both 3×.  This simultaneously:
+    ///             - makes the position unhealthy (debt triples → health 6,666 < minHealth 12,000)
+    ///             - drives the oracle floor for the WETH surplus sell to 3× the fair USDC value,
+    ///               far above what the real WETH/USDC swap pool can return at 1× market price.
+    ///             This replicates the economic effect of a sandwiched pool (pool price far below
+    ///             oracle fair value) without needing to directly manipulate the WETH/USDC pool.
+    ///
+    ///         Result: `deleverage(0)` REVERTS because the swap router's `amountOutMinimum`
+    ///         (set to oracleFloor ≈ 3× fair value) is not met by the pool at 1× market price.
+    ///
+    ///         NOTE: `_sweepLegToUsdc` on the redeem path is called DIRECTLY (not via
+    ///         `_rebalanceCover`) so the redeem path is unaffected by this fix.
+    function test_deleverage_oracleFloorBitesUnderManipulation() public {
+        if (_skip) return;
+
+        // ── 1. Create IL residual: push cbBTC/WETH tick DOWN → LP goes WETH-heavy ─────────────
+        // Selling a large WETH amount into the cbBTC/WETH pool moves the tick down (WETH cheaper
+        // vs cbBTC).  Once the tick crosses below the LP's lower tick, the position converts
+        // entirely to WETH — no cbBTC remains.  Even a partial tick move is sufficient; ANY
+        // non-zero cbShort triggers `_rebalanceCover` with a nonzero WETH surplus.
+        // zeroForOne=true: sell token0 (WETH) → tick decreases.
+        _shoveTick(500e18, true);
+
+        // ── 2. Unhealthy + oracle/market divergence ──────────────────────────────────────────
+        // Mock both feeds 3× so:
+        //   debt_USDC = 3 × cbDebtTokens × 3pBTC + 3 × wethDebtTokens × 3pETH >> collateral
+        //   health = c / d ≈ 50,000 / 150,000 × 10000 = 3,333 < minHealth 12,000
+        // Simultaneously: oracleFloor for the WETH surplus sell = surplusBal × 3pETH × 0.99 / pUsdc
+        //                  ≈ 3 × fair_USDC_value  >>>  what the real pool gives at 1× market price.
+        _mockBtcScaled(3, 1);
+        _mockEthScaled(3, 1);
+        assertLt(_healthBps(), MIN_HEALTH_BPS, "3x mock did not push health below minHealth");
+
+        // ── 3. deleverage(0) must REVERT ────────────────────────────────────────────────────
+        // After `_rebalanceCover` computes oracleFloor ≈ 3× fair USDC for the WETH surplus,
+        // `_sweepLegToUsdc` passes that floor to exactInputSingle.  The pool at 1× market price
+        // cannot meet a 3× amountOutMinimum → the swap router reverts → deleverage reverts.
+        vm.prank(stranger);
+        vm.expectRevert();
         strategy.deleverage(0);
 
         vm.clearMockedCalls();
