@@ -9,7 +9,7 @@ import {ERC721Holder} from "@openzeppelin/contracts/token/ERC721/utils/ERC721Hol
 import {BaseStrategy} from "./BaseStrategy.sol";
 import {LeveragedAeroValuation} from "./LeveragedAeroValuation.sol";
 import {LeveragedAeroManager} from "./LeveragedAeroManager.sol";
-import {INonfungiblePositionManager} from "../interfaces/ISlipstream.sol";
+import {INonfungiblePositionManager, ICLGauge} from "../interfaces/ISlipstream.sol";
 import {Position} from "../interfaces/IPriceRouter.sol";
 import {IStrategy} from "../interfaces/IStrategy.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
@@ -82,6 +82,8 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     error InsufficientIdle();
     /// @notice `deleverage()` called while the position is at/above `minHealthBps` (no-op when safe).
     error HealthyNoDeleverage();
+    /// @notice `rescueToVault` called with a token that is part of the strategy's position or accounting.
+    error CannotRescuePositionToken();
 
     // ─────────────────────────────────────────────────────────────
     // Constants
@@ -770,6 +772,35 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
 
         // 7. Burn shares (strategy holds them after safeTransferFrom above).
         ISyndicateVault(vault_).strategyBurn(shares);
+    }
+
+    /// @notice Sweep a STRAY ERC-20 (accidental send / airdrop) out of the strategy back to
+    ///         the vault.  The target is always hardcoded to `vault()` — not caller-supplied —
+    ///         so even the proposer cannot exfil to an arbitrary address (spec §13).
+    ///
+    ///         Reverts `CannotRescuePositionToken` for any token that is part of the strategy's
+    ///         value / position / accounting:
+    ///           • usdc      — idle collateral + unit of account (NAV-counted post-3.9 path-b)
+    ///           • cbBTC     — borrowed LP leg (idle cbBTC is NAV-counted)
+    ///           • weth      — borrowed LP leg (idle WETH is NAV-counted)
+    ///           • mUsdc     — Moonwell collateral receipt (mUSDC shares)
+    ///           • mCbBTC    — Moonwell borrow receipt (mcbBTC)
+    ///           • mWeth     — Moonwell borrow receipt (mWETH)
+    ///           • AERO      — gauge reward; sweeping bypasses `compound()` yield path.
+    ///                         Read live from `ICLGauge(gauge).rewardToken()`.
+    ///
+    ///         ERC-721 is NOT handled.  The Slipstream position NFT must never be swept;
+    ///         this function simply does not accept tokenIds.
+    ///
+    /// @param token ERC-20 contract address to sweep.
+    function rescueToVault(address token) external onlyProposer nonReentrant {
+        Layout storage $ = _s();
+        address aero = ICLGauge($.gauge).rewardToken();
+        if (
+            token == $.usdc || token == $.cbBTC || token == $.weth || token == $.mUsdc || token == $.mCbBTC
+                || token == $.mWeth || token == aero
+        ) revert CannotRescuePositionToken();
+        _pushAllToVault(token);
     }
 
     /// @dev Tunable param updates (Task 3.6+).

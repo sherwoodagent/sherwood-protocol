@@ -34,6 +34,8 @@ interface ILeveragedAerodromeCLStrategy is IStrategy {
     error UnhealthyPosition(uint256 ltvBps, uint256 limitBps);
     /// @notice `deleverage()` called while the position is at/above `minHealthBps` (no-op when safe).
     error HealthyNoDeleverage();
+    /// @notice `rescueToVault` called with a token that is part of the strategy's position or accounting.
+    error CannotRescuePositionToken();
     /// @notice Deposit / redeem outside the governance window.
     error NotInExecutedState();
     /// @notice Caller is not an authorized depositor.
@@ -113,11 +115,13 @@ interface ILeveragedAerodromeCLStrategy is IStrategy {
     function deleverage(uint256 minOut) external;
 
     // ─────────────────────────────────────────────────────────────
-    // Task 3.8 — Rescue
+    // Task 3.11 — Rescue
     // ─────────────────────────────────────────────────────────────
 
-    /// @notice Sweep a stuck token back to the vault. Owner-only; blocked for
-    ///         collateral / borrow tokens while the position is open.
+    /// @notice Sweep a stray ERC-20 back to the vault. Proposer-only.
+    ///         Reverts `CannotRescuePositionToken` for usdc / cbBTC / weth /
+    ///         mUsdc / mCbBTC / mWeth / AERO (gauge reward token).
+    ///         Target is always `vault()` — not caller-supplied — so no exfil surface.
     function rescueToVault(address token) external;
 
     // ─────────────────────────────────────────────────────────────
