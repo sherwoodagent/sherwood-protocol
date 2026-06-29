@@ -258,8 +258,8 @@ contract LeveragedAeroCLConservationAnchors is LeveragedAeroForkBase {
         else _shoveTick(2_000e18, true); // sell WETH → tick DOWN → cbBTC under-collected
         {
             (, int24 tShoved,,,,) = ICLPool(POOL).slot0();
-            int24 pl = strat.posTickLower();
-            int24 pu = strat.posTickUpper();
+            int24 pl = strat.layout().posTickLower;
+            int24 pu = strat.layout().posTickUpper;
             assertTrue(tShoved < pl || tShoved > pu, "shove did not push LP out of range");
         }
 

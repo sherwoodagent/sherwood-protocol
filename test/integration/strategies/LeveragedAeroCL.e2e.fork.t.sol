@@ -211,17 +211,17 @@ contract LeveragedAeroCLE2EFork is LeveragedAeroForkBase {
         strategy = _cloneStrategy();
         assertEq(strategy.vault(), address(vault), "strategy.vault");
         assertEq(strategy.proposer(), agent, "strategy.proposer");
-        assertEq(strategy.tokenId(), 0, "tokenId should be 0 pre-execute");
-        assertEq(strategy.targetLtvBps(), TARGET_LTV_BPS, "targetLtv wired");
-        assertEq(strategy.maxLtvBps(), MAX_LTV_BPS, "maxLtv wired");
-        assertEq(strategy.minHealthBps(), MIN_HEALTH_BPS, "minHealth wired");
+        assertEq(strategy.layout().tokenId, 0, "tokenId should be 0 pre-execute");
+        assertEq(strategy.layout().targetLtvBps, TARGET_LTV_BPS, "targetLtv wired");
+        assertEq(strategy.layout().maxLtvBps, MAX_LTV_BPS, "maxLtv wired");
+        assertEq(strategy.layout().minHealthBps, MIN_HEALTH_BPS, "minHealth wired");
 
         // ── Step 3: propose → vote → execute ──
         _proposeVoteExecute();
 
         // Execute deployed the levered book.
         assertEq(governor.getActiveProposal(address(vault)), proposalId, "proposal not active");
-        assertGt(strategy.tokenId(), 0, "tokenId 0 after execute");
+        assertGt(strategy.layout().tokenId, 0, "tokenId 0 after execute");
         assertGt(ICToken(MUSDC).balanceOf(address(strategy)), 0, "no mUSDC collateral");
         assertGt(IMoonwellMarket(MCBBTC).borrowBalanceStored(address(strategy)), 0, "no cbBTC borrow");
         assertGt(IMoonwellMarket(MWETH).borrowBalanceStored(address(strategy)), 0, "no WETH borrow");
@@ -249,7 +249,7 @@ contract LeveragedAeroCLE2EFork is LeveragedAeroForkBase {
         governor.settleProposal(proposalId);
 
         // Position fully cleared.
-        assertEq(strategy.tokenId(), 0, "tokenId not cleared after settle");
+        assertEq(strategy.layout().tokenId, 0, "tokenId not cleared after settle");
         assertEq(IMoonwellMarket(MCBBTC).borrowBalanceStored(address(strategy)), 0, "cbBTC debt after settle");
         assertEq(IMoonwellMarket(MWETH).borrowBalanceStored(address(strategy)), 0, "WETH debt after settle");
         // Realized USDC returned to the vault.
@@ -407,14 +407,14 @@ contract LeveragedAeroCLE2EFork is LeveragedAeroForkBase {
         (, int24 tickShoved,,,,) = ICLPool(POOL).slot0();
         assertLt(tickShoved, tickStart, "shove did not move tick down");
 
-        uint256 tidBefore = strategy.tokenId();
+        uint256 tidBefore = strategy.layout().tokenId;
         uint256 cbDebtBefore = IMoonwellMarket(MCBBTC).borrowBalanceStored(address(strategy));
         uint256 wethDebtBefore = IMoonwellMarket(MWETH).borrowBalanceStored(address(strategy));
 
         vm.prank(agent);
         strategy.rerange(0, 0);
 
-        uint256 tidAfter = strategy.tokenId();
+        uint256 tidAfter = strategy.layout().tokenId;
         assertTrue(tidAfter != tidBefore && tidAfter != 0, "rerange did not rotate to a recentered NFT");
         assertEq(IERC721(NPM).ownerOf(tidAfter), GAUGE, "recentered NFT not staked in gauge");
         // rerange never touches Moonwell.

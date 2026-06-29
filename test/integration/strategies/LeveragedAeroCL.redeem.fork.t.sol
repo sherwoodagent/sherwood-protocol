@@ -235,7 +235,7 @@ contract LeveragedAeroCLRedeemFork is LeveragedAeroForkBase {
         assertLe(navPerShareAfter, navPerShareBefore + tolerance, "A's per-share NAV rose > 2%");
 
         // NFT must still be staked in the gauge after restake.
-        uint256 tid = strategy.tokenId();
+        uint256 tid = strategy.layout().tokenId;
         assertGt(tid, 0, "tokenId should still be set");
         assertEq(
             IERC721Minimal2(BaseAddresses.SLIPSTREAM_NPM).ownerOf(tid),
@@ -356,7 +356,7 @@ contract LeveragedAeroCLRedeemFork is LeveragedAeroForkBase {
         _shoveTick(200e18, true);
 
         // Capture tokenId before redeem so we can query NPM state afterward.
-        uint256 tid = strategy.tokenId();
+        uint256 tid = strategy.layout().tokenId;
         assertGt(tid, 0, "tokenId should be set before redeem");
 
         // Best-effort NAV capture — may revert if the tick shove trips the calm gate
@@ -456,7 +456,7 @@ contract LeveragedAeroCLRedeemFork is LeveragedAeroForkBase {
         assertLe(wethDebtAfter, wethDebtExpected * 10100 / 10000, "WETH stayers debt too high");
 
         // NFT must still be staked (remaining liq > 0)
-        uint256 tid = strategy.tokenId();
+        uint256 tid = strategy.layout().tokenId;
         assertGt(tid, 0, "tokenId cleared unexpectedly");
         assertEq(
             IERC721Minimal2(BaseAddresses.SLIPSTREAM_NPM).ownerOf(tid),
@@ -530,8 +530,8 @@ contract LeveragedAeroCLRedeemFork is LeveragedAeroForkBase {
         bool remainderIsWeth = idleWeth >= idleCb;
         emit log_named_uint("idleCb (8dp)", idleCb);
         emit log_named_uint("idleWeth (18dp)", idleWeth);
-        emit log_named_int("posTickLower", strat.posTickLower());
-        emit log_named_int("posTickUpper", strat.posTickUpper());
+        emit log_named_int("posTickLower", strat.layout().posTickLower);
+        emit log_named_int("posTickUpper", strat.layout().posTickUpper);
         (, int24 tPre,,,,) = ICLPool(POOL).slot0();
         emit log_named_int("tick pre-hard-shove", tPre);
         if (remainderIsWeth) _shoveTick(200e8, false); // sell 200 cbBTC → tick UP
@@ -540,8 +540,8 @@ contract LeveragedAeroCLRedeemFork is LeveragedAeroForkBase {
         {
             (, int24 tShoved,,,,) = ICLPool(POOL).slot0();
             emit log_named_int("tick post-hard-shove", tShoved);
-            int24 pl = strat.posTickLower();
-            int24 pu = strat.posTickUpper();
+            int24 pl = strat.layout().posTickLower;
+            int24 pu = strat.layout().posTickUpper;
             assertTrue(tShoved < pl || tShoved > pu, "shove did not push LP out of range (no real shortfall)");
         }
 
@@ -631,7 +631,7 @@ contract LeveragedAeroCLRedeemFork is LeveragedAeroForkBase {
         if (cBal > 0) assets += (cBal * ICToken(BaseAddresses.MOONWELL_MUSDC).exchangeRateStored()) / 1e18;
 
         // CL legs at the oracle-implied sqrtP (token0=WETH/18, token1=cbBTC/8)
-        uint256 tid = LeveragedAerodromeCLStrategy(payable(strat)).tokenId();
+        uint256 tid = LeveragedAerodromeCLStrategy(payable(strat)).layout().tokenId;
         if (tid != 0) {
             (,,,,, int24 tl, int24 tu, uint128 liq,,,,) = INpmFull(BaseAddresses.SLIPSTREAM_NPM).positions(tid);
             if (liq > 0) {

@@ -17,98 +17,50 @@ import {LeveragedAeroFees} from "./LeveragedAeroFees.sol";
 import {ISyndicateVault} from "../interfaces/ISyndicateVault.sol";
 
 /// @title LeveragedAerodromeCLStrategy
-/// @notice Net-short leveraged Aerodrome CL strategy.
+/// @notice Net-short leveraged Aerodrome CL strategy: USDC collateral → Moonwell (mUSDC)
+///         → borrow cbBTC + WETH → Slipstream CL position → AERO gauge.
 ///
-///         USDC collateral → Moonwell (mUSDC) → borrow cbBTC + WETH
-///         → Slipstream CL position → AERO gauge
-///
-///         Designed as an ERC-1167 clone deployed per proposal.  The template
-///         constructor sets `_initialized = true` (via BaseStrategy) so the
-///         template itself is permanently locked.  Clones start with
-///         `_initialized = false` and are initialised via `initialize()`.
-///
-///         NAV is oracle-priced via `LeveragedAeroValuation.netEquityUsdc` (fail-closed).
-///         Deposit / Redeem / Manage / Deleverage / Rescue are implemented in later tasks;
-///         `_execute` and `_settle` revert `NotImplemented` until Task 3.2 / 3.3.
-///
-///         `ReentrancyGuardTransient` (EIP-1153 transient storage) guards all
-///         state-changing external ops.  Base is on Cancun so TSTORE is available.
+///         ERC-1167 clone, one per proposal (BaseStrategy's constructor locks the template).
+///         NAV is oracle-priced via `LeveragedAeroValuation.netEquityUsdc`, fail-closed.
+///         `ReentrancyGuardTransient` guards every state-changing external op.
 contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient, ERC721Holder {
     using SafeERC20 for IERC20;
 
-    // ─────────────────────────────────────────────────────────────
-    // Errors
-    // ─────────────────────────────────────────────────────────────
-
-    /// @notice Callable in later tasks — stubs revert with this until implemented.
+    // ── Errors ──
     error NotImplemented();
-    /// @notice `targetLtvBps > maxLtvBps`.
     error TargetLtvExceedsMax();
-    /// @notice `minHealthBps < 10500`.
-    error MinHealthTooLow();
-    /// @notice Fee recipient is zero-address while a fee bps is non-zero.
+    error MinHealthTooLow(); // minHealthBps < 10500 (1.05x floor)
     error FeeRecipientRequired();
-    /// @notice `maxLtvBps` ≥ Moonwell USDC collateral factor.
-    error MaxLtvExceedsCF();
-    /// @notice Low-level call to `Comptroller.markets(mUsdc)` failed or returned short data.
+    error MaxLtvExceedsCF(); // maxLtvBps >= Moonwell USDC collateral factor
     error ComptrollerCallFailed();
-    /// @notice Post-operation LTV exceeds `maxLtvBps`, or Moonwell reports a shortfall.
-    /// @param ltvBps    Actual LTV in bps at the time of the check.
-    /// @param limitBps  The `maxLtvBps` cap that was exceeded.
     error UnhealthyPosition(uint256 ltvBps, uint256 limitBps);
-    /// @notice Low-level call to `npm.positions(tokenId)` failed or returned short data.
     error InvalidNpmReturn();
-    /// @notice No USDC balance to deploy at execute time.
     error ExecuteZeroBalance();
-    /// @notice Moonwell `ICToken.mint()` returned a non-zero Compound error code.
     error MoonwellMintFailed(uint256 errCode);
-    /// @notice Moonwell `IMoonwellMarket.borrow()` returned a non-zero Compound error code.
     error MoonwellBorrowFailed(uint256 errCode);
-    /// @notice Slipstream NPM returned tokenId == 0.
     error NpmMintFailed();
-    /// @notice ERC-721 `approve(gauge, tokenId)` low-level call failed.
     error NpmApproveFailed();
-    /// @notice Moonwell `IMoonwellMarket.repayBorrow()` returned a non-zero Compound error code.
     error MoonwellRepayFailed(uint256 errCode);
-    /// @notice Moonwell `ICToken.redeem()` returned a non-zero Compound error code.
     error MoonwellRedeemFailed(uint256 errCode);
-    /// @notice `deposit` returned fewer shares than `minShares`.
     error InsufficientShares();
-    /// @notice `redeem` produced fewer USDC than `minAssetsOut`.
     error InsufficientAssetsOut();
-    /// @notice `deployIdle` produced less liquidity than `minLiquidity`.
     error InsufficientLiquidity();
-    /// @notice `deployIdle` called with more USDC than the strategy holds idle.
     error InsufficientIdle();
-    /// @notice `deleverage()` called while the position is at/above `minHealthBps` (no-op when safe).
     error HealthyNoDeleverage();
-    /// @notice `rescueToVault` called with a token that is part of the strategy's position or accounting.
     error CannotRescuePositionToken();
 
-    // ─────────────────────────────────────────────────────────────
-    // Constants
-    // ─────────────────────────────────────────────────────────────
-
-    /// @dev cbBTC is always 8-decimal wrapped Bitcoin.
-    uint8 private constant CBBTC_DECIMALS = 8;
-
-    /// @dev WETH is always 18-decimal (WETH9 on Base).
-    uint8 private constant WETH_DECIMALS = 18;
+    // ── Constants ──
+    uint8 private constant CBBTC_DECIMALS = 8; // cbBTC is 8dp wrapped Bitcoin
+    uint8 private constant WETH_DECIMALS = 18; // WETH9 on Base is 18dp
 
     /// @dev Position `kind` tag for the PriceRouter adapter registry.
     bytes32 public constant POSITION_KIND = keccak256("LEVERAGED_AERO_CL");
 
-    /// @dev ERC-4626 virtual share offset matching the vault's `_decimalsOffset()`.
-    ///      USDC has 6 decimals → _decimalsOffset = 6 → OFFSET = 1e6.
-    ///      Deposit share formula: shares = mulDiv(assets, supply + OFFSET, nav + 1).
+    /// @dev ERC-4626 virtual share offset matching the vault's `_decimalsOffset()` (USDC 6dp → 1e6).
     uint256 private constant SHARES_VIRTUAL_OFFSET = 1e6;
 
-    // ─────────────────────────────────────────────────────────────
-    // Initialisation params struct
-    // ─────────────────────────────────────────────────────────────
+    // ── Initialisation params (ABI-encoded → BaseStrategy.initialize → _initialize) ──
 
-    /// @notice Strategy initialisation parameters — ABI-encoded and passed to
-    ///         `StrategyFactory.cloneAndInit` → `BaseStrategy.initialize` → `_initialize`.
     struct InitParams {
         // ── Token addresses ──
         address usdc; // USDC (6dp) — unit of account + collateral asset
@@ -146,23 +98,23 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         address feeRecipient; // Address that receives fee-shares (must be non-zero if any fee > 0)
     }
 
-    // ─────────────────────────────────────────────────────────────
-    // Storage — ERC-7201 namespaced (diamond) storage
-    // ─────────────────────────────────────────────────────────────
+    // ── ERC-7201 namespaced (diamond) storage ──
     //
-    // ALL strategy-specific state lives in one `Layout` struct at a fixed
-    // ERC-7201 slot, NOT in the contract's sequential storage. The sequential
-    // layout therefore holds only BaseStrategy's state (_hcSelf / _vault /
-    // _proposer / _state / _initialized). This is the foundation for moving the
-    // management ops into a deployed delegatecall library.
+    // All strategy-specific state lives in one `Layout` struct at a fixed ERC-7201 slot, NOT in
+    // sequential storage (which holds only BaseStrategy's state). This lets the venue ops run from
+    // the deployed `LeveragedAeroManager` library via delegatecall.
+    //
+    // CORRUPTION-CRITICAL: `Layout`, `STORAGE_SLOT`, and `_layout()` are byte-identical in
+    // `LeveragedAeroManager` — they MUST stay in lockstep or a delegatecall reads/writes the wrong
+    // slots. Do not reorder `Layout` fields in one file without the other.
 
     /// @custom:storage-location erc7201:leveraged.aero.cl.storage
     struct Layout {
-        // ── valuation config: token / venue / feed addresses ──
+        // valuation config: token / venue / feed addresses
         address usdc;
         address mUsdc;
-        address mCbBTC; // maps to LeveragedAeroValuation.Config.cbBTCMarket
-        address mWeth; // maps to LeveragedAeroValuation.Config.wethMarket
+        address mCbBTC; // LeveragedAeroValuation.Config.cbBTCMarket
+        address mWeth; // LeveragedAeroValuation.Config.wethMarket
         address cbBTC;
         address weth;
         address pool;
@@ -174,239 +126,122 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         uint256 gracePeriod;
         uint16 calmDeviationTicks;
         uint32 twapWindow;
-        // ── venue / protocol addresses (not in Config) ──
+        // venue / protocol addresses (not in Config)
         address comptroller;
         address npm;
         address gauge;
         address swapRouter;
         int24 tickSpacing;
-        // ── risk params ──
+        // risk params
         uint16 targetLtvBps;
         uint16 maxLtvBps;
         uint16 minHealthBps;
         uint16 maxSlippageBps;
-        uint16 usdcCollateralFactorBps; // USDC collateral factor read from Moonwell at init (e.g. 8800 = 88%)
-        // ── position state (all zero pre-deploy / post-settle) ──
-        uint256 tokenId; // NPM tokenId of the active CL position. 0 when no position is open.
-        int24 posTickLower; // stored ticks of the active CL position
+        uint16 usdcCollateralFactorBps; // USDC collateral factor from Moonwell at init (8800 = 88%)
+        // position state (all zero pre-deploy / post-settle)
+        uint256 tokenId; // active CL position; 0 == flat book
+        int24 posTickLower;
         int24 posTickUpper;
-        // ── fee params + state ──
+        // fee params + state
         uint16 managementFeeBps;
         uint16 performanceFeeBps;
         address feeRecipient;
-        uint256 hwmPerShare; // HWM NAV per share (USDC 6dp); 0 until first deposit mints shares
-        uint256 lastFeeAccrualTimestamp; // timestamp of the last management-fee accrual
+        uint256 hwmPerShare; // HWM NAV per share (USDC 6dp); 0 until first deposit
+        uint256 lastFeeAccrualTimestamp;
     }
 
     /// @dev keccak256(abi.encode(uint256(keccak256("leveraged.aero.cl.storage")) - 1)) & ~bytes32(uint256(0xff))
     bytes32 private constant STORAGE_SLOT = 0x405ae0b144079093e970849fdffdcb2a514e44968598c6c5c73444496e844900;
 
-    /// @dev Diamond-storage accessor — all strategy-specific state lives in `Layout` at STORAGE_SLOT.
-    function _s() private pure returns (Layout storage l) {
+    /// @dev ERC-7201 diamond-storage accessor (byte-identical across strategy + manager).
+    function _layout() private pure returns (Layout storage $) {
         // solhint-disable-next-line no-inline-assembly
         assembly {
-            l.slot := STORAGE_SLOT
+            $.slot := STORAGE_SLOT
         }
     }
 
-    // ── Minimal field getters (only the fields read by the test suite). Replaces the
-    //    whole-struct `s()` ABI encoder, which cost ~1.9 KB of clone bytecode. ──
-
-    function usdc() external view returns (address) {
-        return _s().usdc;
+    /// @notice Full strategy storage layout (single accessor for tests / off-chain reads).
+    function layout() external view returns (Layout memory) {
+        return _layout();
     }
 
-    function mUsdc() external view returns (address) {
-        return _s().mUsdc;
-    }
-
-    function mCbBTC() external view returns (address) {
-        return _s().mCbBTC;
-    }
-
-    function mWeth() external view returns (address) {
-        return _s().mWeth;
-    }
-
-    function pool() external view returns (address) {
-        return _s().pool;
-    }
-
-    function npm() external view returns (address) {
-        return _s().npm;
-    }
-
-    function gauge() external view returns (address) {
-        return _s().gauge;
-    }
-
-    function tickSpacing() external view returns (int24) {
-        return _s().tickSpacing;
-    }
-
-    function targetLtvBps() external view returns (uint16) {
-        return _s().targetLtvBps;
-    }
-
-    function maxLtvBps() external view returns (uint16) {
-        return _s().maxLtvBps;
-    }
-
-    function minHealthBps() external view returns (uint16) {
-        return _s().minHealthBps;
-    }
-
-    function maxSlippageBps() external view returns (uint16) {
-        return _s().maxSlippageBps;
-    }
-
-    function usdcCollateralFactorBps() external view returns (uint16) {
-        return _s().usdcCollateralFactorBps;
-    }
-
-    function tokenId() external view returns (uint256) {
-        return _s().tokenId;
-    }
-
-    function posTickLower() external view returns (int24) {
-        return _s().posTickLower;
-    }
-
-    function posTickUpper() external view returns (int24) {
-        return _s().posTickUpper;
-    }
-
-    function managementFeeBps() external view returns (uint16) {
-        return _s().managementFeeBps;
-    }
-
-    function performanceFeeBps() external view returns (uint16) {
-        return _s().performanceFeeBps;
-    }
-
-    function feeRecipient() external view returns (address) {
-        return _s().feeRecipient;
-    }
-
-    // ─────────────────────────────────────────────────────────────
-    // Native ETH receiver
-    // ─────────────────────────────────────────────────────────────
-
-    /// @dev Moonwell's mWETH market delivers native ETH to the borrower on `borrow()`.
-    ///      Without this the strategy rejects the ETH transfer and the borrow call
-    ///      reverts.  We immediately wrap to WETH (WETH9.deposit) before using it.
+    /// @dev Moonwell's mWETH market delivers native ETH on `borrow()`; the strategy wraps it to
+    ///      WETH9 before use. Without this receiver the borrow's ETH transfer reverts.
     receive() external payable {}
-
-    // ─────────────────────────────────────────────────────────────
-    // IStrategy — name
-    // ─────────────────────────────────────────────────────────────
 
     /// @inheritdoc IStrategy
     function name() external pure returns (string memory) {
         return "Leveraged Aerodrome CL";
     }
 
-    // ─────────────────────────────────────────────────────────────
-    // Initialization
-    // ─────────────────────────────────────────────────────────────
+    // ── Initialization ──
 
-    /// @notice Strategy-specific initialisation.  Validates InitParams and stores everything
-    ///         to clone storage.  Also reads the USDC collateral factor from Moonwell on-chain.
-    ///
-    /// @dev All `InitParams` fields are fixed-size.  ABI encoding is a straight 27×32-byte
-    ///      sequence.  We decode field groups directly from calldata slices (no in-memory
-    ///      struct decode) to stay under the Yul IR's 16-slot stack limit.  Each helper
-    ///      decodes ≤7 fields from a slice of `data`, so no helper exceeds ~10 live slots.
-    ///
-    ///      Field byte offsets (each field = 32 bytes):
-    ///       0-6  : usdc, mUsdc, mCbBTC, mWeth, comptroller, cbBTC, weth
-    ///       7-10 : pool, npm, gauge, swapRouter
-    ///       11-14: cbBTCFeed, wethFeed, usdcFeed, sequencerFeed
-    ///       15-18: maxDelay, gracePeriod, calmDeviationTicks, twapWindow
-    ///       19-23: tickSpacing, targetLtvBps, maxLtvBps, minHealthBps, maxSlippageBps
-    ///       24-26: managementFeeBps, performanceFeeBps, feeRecipient
+    /// @notice Validate `InitParams`, read the USDC collateral factor from Moonwell, and persist
+    ///         everything to diamond storage. Validation order matches the per-field checks below
+    ///         so the same input reverts with the same error.
     function _initialize(bytes calldata data) internal override {
-        _initGroupA(data); // fields 0-6: token addresses
-        _initGroupB(data[224:]); // fields 7-10: venue addresses
-        _initGroupC(data[352:]); // fields 11-14: feed addresses
-        _initGroupD(data[480:]); // fields 15-18: oracle params
-        // Read CF from Moonwell using addresses already in storage (set by group A).
-        uint16 cfBps = _readCollateralFactor(_s().comptroller, _s().mUsdc);
-        _initGroupE(data[608:], cfBps); // fields 19-23: risk params + CF validation
-        _initGroupF(data[768:]); // fields 24-26: fee params
-        _s().lastFeeAccrualTimestamp = block.timestamp;
+        InitParams memory p = abi.decode(data, (InitParams));
+
+        if (p.usdc == address(0)) revert ZeroAddress();
+        if (p.mUsdc == address(0)) revert ZeroAddress();
+        if (p.mCbBTC == address(0)) revert ZeroAddress();
+        if (p.mWeth == address(0)) revert ZeroAddress();
+        if (p.comptroller == address(0)) revert ZeroAddress();
+        if (p.cbBTC == address(0)) revert ZeroAddress();
+        if (p.weth == address(0)) revert ZeroAddress();
+        if (p.pool == address(0)) revert ZeroAddress();
+        if (p.npm == address(0)) revert ZeroAddress();
+        if (p.gauge == address(0)) revert ZeroAddress();
+        if (p.swapRouter == address(0)) revert ZeroAddress();
+        if (p.cbBTCFeed == address(0)) revert ZeroAddress();
+        if (p.wethFeed == address(0)) revert ZeroAddress();
+        if (p.usdcFeed == address(0)) revert ZeroAddress();
+        if (p.sequencerFeed == address(0)) revert ZeroAddress();
+
+        uint16 cfBps = _readCollateralFactor(p.comptroller, p.mUsdc);
+        if (p.targetLtvBps > p.maxLtvBps) revert TargetLtvExceedsMax();
+        if (p.minHealthBps < 10500) revert MinHealthTooLow();
+        if (p.maxLtvBps >= cfBps) revert MaxLtvExceedsCF();
+        if ((p.managementFeeBps != 0 || p.performanceFeeBps != 0) && p.feeRecipient == address(0)) {
+            revert FeeRecipientRequired();
+        }
+
+        Layout storage $ = _layout();
+        $.usdc = p.usdc;
+        $.mUsdc = p.mUsdc;
+        $.mCbBTC = p.mCbBTC;
+        $.mWeth = p.mWeth;
+        $.comptroller = p.comptroller;
+        $.cbBTC = p.cbBTC;
+        $.weth = p.weth;
+        $.pool = p.pool;
+        $.npm = p.npm;
+        $.gauge = p.gauge;
+        $.swapRouter = p.swapRouter;
+        $.cbBTCFeed = p.cbBTCFeed;
+        $.wethFeed = p.wethFeed;
+        $.usdcFeed = p.usdcFeed;
+        $.sequencerFeed = p.sequencerFeed;
+        $.maxDelay = p.maxDelay;
+        $.gracePeriod = p.gracePeriod;
+        $.calmDeviationTicks = p.calmDeviationTicks;
+        $.twapWindow = p.twapWindow;
+        $.tickSpacing = p.tickSpacing;
+        $.targetLtvBps = p.targetLtvBps;
+        $.maxLtvBps = p.maxLtvBps;
+        $.minHealthBps = p.minHealthBps;
+        $.maxSlippageBps = p.maxSlippageBps;
+        $.usdcCollateralFactorBps = cfBps;
+        $.managementFeeBps = p.managementFeeBps;
+        $.performanceFeeBps = p.performanceFeeBps;
+        $.feeRecipient = p.feeRecipient;
+        $.lastFeeAccrualTimestamp = block.timestamp;
+        // tokenId / posTickLower / posTickUpper / hwmPerShare default to 0 (set in _execute / on first deposit).
     }
 
-    // ── Group A: usdc, mUsdc, mCbBTC, mWeth, comptroller, cbBTC, weth (fields 0-6) ──
-
-    function _initGroupA(bytes calldata d) private {
-        (address usdc_, address mUsdc_, address mCbBTC_, address mWeth_, address comp_, address cbBTC_, address weth_) =
-            abi.decode(d, (address, address, address, address, address, address, address));
-        if (usdc_ == address(0)) revert ZeroAddress();
-        if (mUsdc_ == address(0)) revert ZeroAddress();
-        if (mCbBTC_ == address(0)) revert ZeroAddress();
-        if (mWeth_ == address(0)) revert ZeroAddress();
-        if (comp_ == address(0)) revert ZeroAddress();
-        if (cbBTC_ == address(0)) revert ZeroAddress();
-        if (weth_ == address(0)) revert ZeroAddress();
-        Layout storage $ = _s();
-        $.usdc = usdc_;
-        $.mUsdc = mUsdc_;
-        $.mCbBTC = mCbBTC_;
-        $.mWeth = mWeth_;
-        $.comptroller = comp_;
-        $.cbBTC = cbBTC_;
-        $.weth = weth_;
-    }
-
-    // ── Group B: pool, npm, gauge, swapRouter (fields 7-10) ──
-
-    function _initGroupB(bytes calldata d) private {
-        (address pool_, address npm_, address gauge_, address swapRouter_) =
-            abi.decode(d, (address, address, address, address));
-        if (pool_ == address(0)) revert ZeroAddress();
-        if (npm_ == address(0)) revert ZeroAddress();
-        if (gauge_ == address(0)) revert ZeroAddress();
-        if (swapRouter_ == address(0)) revert ZeroAddress();
-        Layout storage $ = _s();
-        $.pool = pool_;
-        $.npm = npm_;
-        $.gauge = gauge_;
-        $.swapRouter = swapRouter_;
-    }
-
-    // ── Group C: cbBTCFeed, wethFeed, usdcFeed, sequencerFeed (fields 11-14) ──
-
-    function _initGroupC(bytes calldata d) private {
-        (address cbBTCFeed_, address wethFeed_, address usdcFeed_, address seqFeed_) =
-            abi.decode(d, (address, address, address, address));
-        if (cbBTCFeed_ == address(0)) revert ZeroAddress();
-        if (wethFeed_ == address(0)) revert ZeroAddress();
-        if (usdcFeed_ == address(0)) revert ZeroAddress();
-        if (seqFeed_ == address(0)) revert ZeroAddress();
-        Layout storage $ = _s();
-        $.cbBTCFeed = cbBTCFeed_;
-        $.wethFeed = wethFeed_;
-        $.usdcFeed = usdcFeed_;
-        $.sequencerFeed = seqFeed_;
-    }
-
-    // ── Group D: maxDelay, gracePeriod, calmDeviationTicks, twapWindow (fields 15-18) ──
-
-    function _initGroupD(bytes calldata d) private {
-        (uint256 maxDelay_, uint256 gracePeriod_, uint16 calm_, uint32 twap_) =
-            abi.decode(d, (uint256, uint256, uint16, uint32));
-        Layout storage $ = _s();
-        $.maxDelay = maxDelay_;
-        $.gracePeriod = gracePeriod_;
-        $.calmDeviationTicks = calm_;
-        $.twapWindow = twap_;
-    }
-
-    /// @dev Read the USDC collateral factor from `Comptroller.markets(mUsdc)`.
-    ///      Returns CF in bps (e.g. 8800 = 88%).
-    ///      markets(address) ABI encodes as (bool isListed, uint256 collateralFactorMantissa, ...).
-    ///      We skip the first 32-byte word (bool) and read the second (the CF mantissa, 1e18-scaled).
+    /// @dev USDC collateral factor (bps) from `Comptroller.markets(mUsdc)`. ABI is
+    ///      `(bool isListed, uint256 collateralFactorMantissa, ...)`; read the 2nd word (1e18-scaled).
     function _readCollateralFactor(address comptroller_, address mUsdc_) private view returns (uint16 cfBps) {
         (bool ok, bytes memory ret) = comptroller_.staticcall(abi.encodeWithSignature("markets(address)", mUsdc_));
         if (!ok || ret.length < 64) revert ComptrollerCallFailed();
@@ -419,79 +254,30 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         if (cfBps == 0) revert ComptrollerCallFailed();
     }
 
-    // ── Group E: tickSpacing, targetLtvBps, maxLtvBps, minHealthBps, maxSlippageBps (fields 19-23) ──
+    // ── NAV ──
 
-    function _initGroupE(bytes calldata d, uint16 cfBps) private {
-        (int24 ts_, uint16 target_, uint16 maxLtv_, uint16 minH_, uint16 slip_) =
-            abi.decode(d, (int24, uint16, uint16, uint16, uint16));
-        if (target_ > maxLtv_) revert TargetLtvExceedsMax();
-        if (minH_ < 10500) revert MinHealthTooLow();
-        if (maxLtv_ >= cfBps) revert MaxLtvExceedsCF();
-        Layout storage $ = _s();
-        $.tickSpacing = ts_;
-        $.targetLtvBps = target_;
-        $.maxLtvBps = maxLtv_;
-        $.minHealthBps = minH_;
-        $.maxSlippageBps = slip_;
-        $.usdcCollateralFactorBps = cfBps;
-    }
-
-    // ── Group F: managementFeeBps, performanceFeeBps, feeRecipient (fields 24-26) ──
-
-    function _initGroupF(bytes calldata d) private {
-        (uint16 mgmt_, uint16 perf_, address recipient_) = abi.decode(d, (uint16, uint16, address));
-        if ((mgmt_ != 0 || perf_ != 0) && recipient_ == address(0)) revert FeeRecipientRequired();
-        Layout storage $ = _s();
-        $.managementFeeBps = mgmt_;
-        $.performanceFeeBps = perf_;
-        $.feeRecipient = recipient_;
-        // hwmPerShare = 0 (default) — set on first deposit.
-        // tokenId / posTickLower / posTickUpper = 0 (default) — set in _execute.
-    }
-
-    // ─────────────────────────────────────────────────────────────
-    // NAV
-    // ─────────────────────────────────────────────────────────────
-
-    /// @notice Oracle NAV of the entire levered book, in USDC (6dp).
-    ///
-    ///         Pre-deploy / post-settle (tokenId == 0):
-    ///           Returns the face value of any idle USDC held by the vault + strategy.
-    ///           No oracle call needed — no levered position exists.
-    ///           `tokenId == 0` is the invariant for a "flat book"; both `_execute`
-    ///           (Task 3.2) and `_settle` (Task 3.3) maintain it: execute sets tokenId
-    ///           to the minted NPM token, settle clears it back to 0.
-    ///
-    ///         Active position (tokenId > 0):
-    ///           Reads position ticks + liquidity from the NPM and delegates to
-    ///           `LeveragedAeroValuation.netEquityUsdc` — oracle-implied sqrtP,
-    ///           fail-closed (reverts on any oracle/calm failure or non-positive equity).
+    /// @notice Oracle NAV of the levered book, in USDC (6dp). `tokenId == 0` (the flat-book
+    ///         invariant, maintained by `_execute`/`_settle`) → face value of idle USDC in vault +
+    ///         strategy, no oracle. Active position → `LeveragedAeroValuation.netEquityUsdc`
+    ///         (oracle-implied sqrtP, fail-closed: reverts on any oracle/calm failure or ≤0 equity).
     function nav() public view virtual returns (uint256) {
-        Layout storage $ = _s();
+        Layout storage $ = _layout();
         if ($.tokenId == 0) {
             // Flat book: sum idle USDC in vault + strategy (face, 6dp, no oracle needed).
             return IERC20($.usdc).balanceOf(vault()) + IERC20($.usdc).balanceOf(address(this));
         }
         // Active position: read ticks + liquidity from the NPM and delegate to the valuation lib.
         (int24 tickLower, int24 tickUpper, uint128 liquidity) = _npmPositionData();
-        return LeveragedAeroValuation.netEquityUsdc(_cfg(), address(this), tickLower, tickUpper, liquidity);
+        return LeveragedAeroValuation.netEquityUsdc(_config(), address(this), tickLower, tickUpper, liquidity);
     }
 
-    /// @dev Reads only the 3 fields we need from the NPM positions() 12-tuple.
-    ///      Using a low-level staticcall + assembly avoids placing all 12 return values on
-    ///      the EVM stack simultaneously, which would overflow the Yul IR's 16-slot limit
-    ///      when combined with the surrounding `nav()` stack frame.
-    ///
-    ///      NPM.positions(tokenId) return layout (12 × 32-byte words, all static):
-    ///        [0] nonce     [1] operator  [2] token0    [3] token1    [4] tickSpacing
-    ///        [5] tickLower [6] tickUpper [7] liquidity  [8] fgRow0   [9] fgRow1
-    ///        [10] owed0    [11] owed1
-    ///
-    ///      Memory layout of `ret` (bytes): [length @ offset 0][data start @ offset 0x20].
-    ///      Field at index N starts at `ret + 0x20 + N * 0x20`.
+    /// @dev Reads only ticks + liquidity (fields 5-7) from the NPM `positions()` 12-tuple via
+    ///      staticcall + assembly — avoids putting all 12 returns on the stack (Yul IR 16-slot limit).
+    ///      Each is a 32-byte word at `ret + 0x20 + N*0x20`: [5] tickLower=0xC0, [6] tickUpper=0xE0,
+    ///      [7] liquidity=0x100.
     function _npmPositionData() internal view returns (int24 tickLower, int24 tickUpper, uint128 liquidity) {
-        address npm_ = _s().npm;
-        uint256 tokenId_ = _s().tokenId;
+        address npm_ = _layout().npm;
+        uint256 tokenId_ = _layout().tokenId;
         bool ok;
         bytes memory ret;
         (ok, ret) = npm_.staticcall(abi.encodeWithSelector(INonfungiblePositionManager.positions.selector, tokenId_));
@@ -508,71 +294,56 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         }
     }
 
-    // ─────────────────────────────────────────────────────────────
-    // Positions (Lane A reporting for the PriceRouter)
-    // ─────────────────────────────────────────────────────────────
+    // ── Positions (Lane A reporting for the PriceRouter) ──
 
     /// @inheritdoc IStrategy
-    /// @notice Reports the single levered-CL position to the vault's PriceRouter.
-    ///         The `ref` payload encodes the market addresses required by the
-    ///         `LEVERAGED_AERO_CL` adapter (once registered) to verify the venues.
+    /// @notice Reports the single levered-CL position. `ref` encodes the market addresses the
+    ///         `LEVERAGED_AERO_CL` adapter needs to verify the venues.
     function positions() external view override returns (Position[] memory pos) {
-        Layout storage $ = _s();
+        Layout storage $ = _layout();
         pos = new Position[](1);
         pos[0] = Position({venue: $.pool, kind: POSITION_KIND, ref: abi.encode($.gauge, $.mUsdc, $.mCbBTC, $.mWeth)});
     }
 
-    // ─────────────────────────────────────────────────────────────
-    // BaseStrategy stubs (implemented in Tasks 3.2 / 3.3)
-    // ─────────────────────────────────────────────────────────────
+    // ── Execute / settle ──
 
-    /// @notice Open the levered cbBTC/WETH CL position.
-    ///
-    ///         The full venue sequence — supply USDC → enterMarkets → borrow cbBTC+WETH →
-    ///         wrap native ETH → mint Slipstream CL → stake gauge → assert post-op health —
-    ///         lives in the deployed `LeveragedAeroManager` library and runs here via
-    ///         delegatecall (so `address(this)` / `_s()` are this clone's).
+    /// @notice Open the levered cbBTC/WETH CL position: supply USDC → enterMarkets → borrow
+    ///         cbBTC+WETH → wrap ETH → mint Slipstream CL → stake gauge → assert health. The venue
+    ///         sequence lives in `LeveragedAeroManager.executeImpl()` (delegatecalled, so
+    ///         `address(this)` / `_layout()` resolve to this clone).
     function _execute() internal override {
         LeveragedAeroManager.executeImpl();
-        // Belt-and-suspenders: ensure the fee accrual clock is running. _initialize already
-        // seeds it; this guard prevents a ~54-year dt on the first crystallize if a clone
-        // (somehow) bypassed _initialize.
-        if (_s().lastFeeAccrualTimestamp == 0) _s().lastFeeAccrualTimestamp = block.timestamp;
+        // Belt-and-suspenders: keep the fee-accrual clock running even if a clone bypassed
+        // _initialize (guards against a ~54-year dt on the first crystallize).
+        if (_layout().lastFeeAccrualTimestamp == 0) _layout().lastFeeAccrualTimestamp = block.timestamp;
     }
 
-    /// @notice Full proportional unwind to the vault.
-    ///
-    ///         The full unwind — unstake + remove 100% liquidity + collect, repay both
-    ///         Moonwell borrows (self-funding any IL/fee shortfall), redeem all collateral,
-    ///         sweep residual cbBTC/WETH → USDC, clear position state — lives in
-    ///         `LeveragedAeroManager.settleImpl()` (delegatecalled). The realized USDC is then
-    ///         pushed to the vault here (the manager never touches `vault()`).
+    /// @notice Full proportional unwind to the vault. The unwind — remove 100% liquidity, repay both
+    ///         Moonwell borrows (self-funding any IL/fee shortfall), redeem collateral, sweep residual
+    ///         cbBTC/WETH → USDC, clear state — lives in `LeveragedAeroManager.settleImpl()`; the
+    ///         realized USDC is pushed to the vault here (the manager never touches `vault()`).
     function _settle() internal override {
         LeveragedAeroManager.settleImpl();
-        _pushAllToVault(_s().usdc);
+        _pushAllToVault(_layout().usdc);
     }
 
-    /// @dev Crystallise management + HWM performance fees on the PRE-ACTION vault state.
-    ///
-    ///      The caller supplies `navPre` (the NAV before any user funds move) rather than
-    ///      letting this function call `nav()` itself.  This makes crystallisation
-    ///      **oracle-tolerant**: the deposit path passes `nav()` (fail-closed, correct
-    ///      behaviour — a revert on oracle failure is right for deposit); the redeem path
-    ///      passes 0 when `nav()` is unavailable, causing `LeveragedAeroFees.crystallize`
-    ///      to return 0 fee-shares and advance the timestamp — redeem proceeds oracle-free.
-    ///
-    /// @param navPre  Pre-action NAV (USDC, 6dp).  Pass 0 to skip fees (oracle-free path).
+    /// @dev Crystallise management + HWM performance fees on the PRE-ACTION vault state. The caller
+    ///      supplies `navPre` (not a self-call to `nav()`) so the caller controls oracle behaviour:
+    ///      deposit passes `nav()` (fail-closed — correct to revert on oracle failure); redeem passes
+    ///      0 when `nav()` is unavailable → `crystallize` returns 0 fee-shares and just advances the
+    ///      timestamp, keeping redeem oracle-free (§7).
+    /// @param navPre Pre-action NAV (USDC 6dp). Pass 0 to skip fees (oracle-free path).
     function _crystallizeFees(uint256 navPre) private {
-        Layout storage $ = _s();
-        uint256 ts = IERC20(vault()).totalSupply();
-        if (ts == 0) return;
+        Layout storage $ = _layout();
+        uint256 supply = IERC20(vault()).totalSupply();
+        if (supply == 0) return;
         if ($.lastFeeAccrualTimestamp == 0) {
             $.lastFeeAccrualTimestamp = block.timestamp;
             return;
         }
         (uint256 feeShares, uint256 newHwm, uint256 newLast) = LeveragedAeroFees.crystallize(
             navPre,
-            ts,
+            supply,
             $.hwmPerShare,
             $.lastFeeAccrualTimestamp,
             block.timestamp,
@@ -584,27 +355,18 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         if (feeShares > 0) ISyndicateVault(vault()).strategyMint($.feeRecipient, feeShares);
     }
 
-    /// @notice Oracle-priced deposit: mint vault shares proportional to current NAV.
-    ///
-    ///         Call ordering is load-bearing ([1] phantom-fee fix):
-    ///           1. Crystallise fees on the PRE-deposit NAV, before USDC is pulled.
-    ///           2. Read post-crystallise NAV (fail-closed: reverts on oracle failure).
-    ///           3. Pull USDC from caller.
-    ///           4. Compute shares via ERC-4626 virtual-offset formula.
-    ///           5. Mint shares via vault.strategyMint.
-    ///
-    ///         The deposited USDC sits idle in the strategy until a proposer calls
-    ///         `deployIdle()` to add it to the levered position.
-    ///
-    /// @param assets    USDC to deposit (6 dp).
-    /// @param minShares Minimum vault shares to receive (slippage guard).
-    /// @return shares   Vault shares minted to msg.sender.
+    /// @notice Oracle-priced deposit: mint vault shares proportional to current NAV. Ordering is
+    ///         load-bearing (phantom-fee fix): crystallise fees on the PRE-deposit NAV (fail-closed)
+    ///         BEFORE pulling USDC, then mint via the ERC-4626 virtual-offset formula. Deposited USDC
+    ///         sits idle until a proposer calls `deployIdle()`.
+    /// @param assets    USDC to deposit (6dp).
+    /// @param minShares Minimum vault shares to accept (slippage guard).
     function deposit(uint256 assets, uint256 minShares) external nonReentrant returns (uint256 shares) {
         if (_state != State.Executed) revert NotExecuted();
         // Crystallize on pre-deposit NAV (fail-closed: oracle down → correct revert for deposit).
         uint256 navPre = nav();
         _crystallizeFees(navPre);
-        IERC20(_s().usdc).safeTransferFrom(msg.sender, address(this), assets);
+        IERC20(_layout().usdc).safeTransferFrom(msg.sender, address(this), assets);
         address vault_ = vault();
         uint256 supply = IERC20(vault_).totalSupply();
         shares = Math.mulDiv(assets, supply + SHARES_VIRTUAL_OFFSET, navPre + 1);
@@ -612,36 +374,25 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         ISyndicateVault(vault_).strategyMint(msg.sender, shares);
     }
 
-    /// @notice Deploy `amount` of idle strategy USDC into the existing levered position.
-    ///
-    ///         The supply + borrow + (unstake → increaseLiquidity → restake) + health-assert
-    ///         sequence lives in `LeveragedAeroManager.deployIdleImpl()` (delegatecalled).
-    ///
-    /// @param amount       USDC to deploy (6 dp). Must be ≤ idle USDC in strategy.
-    /// @param minLiquidity Minimum liquidity units to accept (slippage guard).
+    /// @notice Deploy `amount` of idle strategy USDC into the levered position (supply + borrow +
+    ///         increaseLiquidity + health-assert) via `LeveragedAeroManager.deployIdleImpl()`.
+    /// @param amount       USDC to deploy (6dp); must be ≤ idle USDC held.
+    /// @param minLiquidity Minimum liquidity to accept (slippage guard).
     function deployIdle(uint256 amount, uint256 minLiquidity) external onlyProposer nonReentrant {
         if (_state != State.Executed) revert NotExecuted();
         LeveragedAeroManager.deployIdleImpl(amount, minLiquidity);
     }
 
-    /// @notice Compound AERO gauge rewards: claim AERO → swap to USDC → redeploy at target leverage.
+    /// @notice Compound AERO rewards: claim → swap to USDC (Aerodrome v2 volatile pool, the deepest
+    ///         AERO/USDC venue on Base, bounded by `minUsdcOut`) → redeploy at target leverage, via
+    ///         `LeveragedAeroManager.compoundImpl()`. No-op when no AERO is claimable.
     ///
-    ///         The claim + synchronous AERO→USDC swap (deepest on-Base venue: the Aerodrome v2
-    ///         volatile pool, bounded by `minUsdcOut`) + redeploy (`deployIdleImpl`) live in
-    ///         `LeveragedAeroManager.compoundImpl()` (delegatecalled). No-op when no AERO is
-    ///         claimable.
-    ///
-    ///         Fee fairness (§10): compounding realizes AERO yield → NAV ↑. We crystallize fees
-    ///         on the PRE-compound NAV first — the SAME model as `deposit` (`_crystallizeFees(nav())`,
-    ///         fail-closed) — which advances the HWM to capture any pre-compound gain. A redeem
-    ///         after compound then crystallizes on the higher POST-compound NAV, so it cannot
-    ///         escape the performance fee on the realized yield. Crystallisation lives here (not in
-    ///         the manager impl) because it mints fee-shares via `vault.strategyMint`. Unlike the
-    ///         oracle-free redeem path, an oracle read is correct here — `compound` is `onlyProposer`
-    ///         and a stale oracle should (fail-closed) defer the compound, not mis-price it.
-    ///
-    /// @param minUsdcOut   Minimum USDC out of the AERO→USDC swap (proposer-supplied slippage guard).
-    /// @param minLiquidity Minimum CL liquidity to accept on the redeploy (slippage guard).
+    ///         Fee fairness (§10): crystallise on the PRE-compound NAV first (same fail-closed model
+    ///         as `deposit`) so the realized yield can't escape the performance fee. Crystallisation
+    ///         lives here (it mints fee-shares); unlike the redeem path an oracle read is correct —
+    ///         `compound` is `onlyProposer`, so a stale oracle should defer, not mis-price.
+    /// @param minUsdcOut   Minimum USDC out of the AERO→USDC swap (slippage guard).
+    /// @param minLiquidity Minimum CL liquidity on the redeploy (slippage guard).
     function compound(uint256 minUsdcOut, uint256 minLiquidity) external onlyProposer nonReentrant {
         if (_state != State.Executed) revert NotExecuted();
         // Crystallize on the pre-compound NAV (fail-closed; mirrors deposit's 3.6 fee model).
@@ -649,29 +400,16 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         LeveragedAeroManager.compoundImpl(minUsdcOut, minLiquidity);
     }
 
-    /// @notice Recenter the levered CL position on the current pool tick WITHOUT swapping.
+    /// @notice Recenter the CL position on the current pool tick WITHOUT swapping, via
+    ///         `LeveragedAeroManager.rerangeImpl()`. The calm-gate runs FIRST, so a recenter can never
+    ///         execute at a manipulated tick. No swap → principal conserved (IL is realized only on a
+    ///         true exit); the collected ratio can't match the new range, so a remainder of ONE
+    ///         borrowed leg is left idle — `nav()` prices it, so the recenter is NAV-neutral and the
+    ///         remainder stays redeployable. Debt + collateral are untouched (health preserved); a new
+    ///         tokenId is minted (Slipstream ticks are immutable), the old empty NFT is harmless dust.
     ///
-    ///         Recentering keeps the position straddling the tick (balanced exposure, in-range
-    ///         for AERO carry) as the pool drifts. The full venue sequence — calm-gate → unstake
-    ///         + remove 100% liquidity + collect → recompute a tickSpacing-aligned range on the
-    ///         current tick → re-add the collected legs (two-sided slippage mins) → restake →
-    ///         `_assertHealthy` — lives in `LeveragedAeroManager.rerangeImpl()` (delegatecalled).
-    ///         The calm-gate runs FIRST, so a recenter can never execute at a manipulated tick.
-    ///
-    ///         No swap → principal is conserved (IL is realized only on a true exit). The
-    ///         collected token ratio cannot match the new range, so a remainder of ONE borrowed
-    ///         leg is left idle; `nav()` prices idle cbBTC/WETH (`LeveragedAeroValuation`) so the
-    ///         recenter is NAV-neutral and the remainder stays redeployable by `compound`/
-    ///         `deployIdle` (and is swept on the next exit). The Moonwell debt + collateral are
-    ///         untouched, so the pre-existing health is preserved. A new tokenId is minted
-    ///         (Slipstream ticks are immutable); the old empty NFT is left owned by the strategy.
-    ///
-    ///         NO fee crystallisation: rerange changes neither supply (no mint/burn) nor NAV (no
-    ///         realized PnL) — unlike `compound`, which realizes AERO yield. The streaming
-    ///         management fee for the interval is accrued at the next crystallize point
-    ///         (deposit/redeem/compound) — deferred, not lost — and the HWM is unaffected by a
-    ///         NAV-neutral op, so omitting crystallisation here charges no one unfairly.
-    ///
+    ///         NO fee crystallisation: rerange changes neither supply nor NAV, so the streaming fee is
+    ///         deferred to the next crystallize point (not lost) and the HWM is unaffected.
     /// @param minLiq0 Minimum token0 (WETH) the re-add must consume (two-sided slippage guard).
     /// @param minLiq1 Minimum token1 (cbBTC) the re-add must consume (two-sided slippage guard).
     function rerange(uint256 minLiq0, uint256 minLiq1) external onlyProposer nonReentrant {
@@ -679,76 +417,51 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         LeveragedAeroManager.rerangeImpl(minLiq0, minLiq1);
     }
 
-    /// @notice Retarget the levered position's LTV to `targetLtvBps_` (borrow/repay; no new USDC).
+    /// @notice Retarget the position's LTV to `targetLtvBps_` (borrow/repay; no new USDC). Collateral
+    ///         is untouched, so LTV moves on the debt side via `LeveragedAeroManager.adjustLeverageImpl`:
+    ///         lever UP borrows the cbBTC/WETH delta and adds it (`minLiq`); lever DOWN unwinds the
+    ///         matching CL fraction and repays (per-leg residual rebalanced through USDC, bounded by
+    ///         `minOut`). Ends with `_assertHealthy`. `targetLtvBps_ ≤ maxLtvBps` is checked here.
     ///
-    ///         Collateral is untouched, so LTV moves on the debt side via the deployed
-    ///         `LeveragedAeroManager.adjustLeverageImpl` (delegatecalled): lever UP borrows the
-    ///         cbBTC/WETH delta and `increaseLiquidity`s it in (`minLiq` slippage); lever DOWN
-    ///         unwinds the matching CL fraction and repays the debt delta (rebalancing any per-leg
-    ///         residual through USDC, bounded by `minOut`). Ends with `_assertHealthy` (post-op LTV
-    ///         ≤ `maxLtvBps` + no Moonwell shortfall).
-    ///
-    ///         `targetLtvBps_` must be ≤ `maxLtvBps` (reverts `TargetLtvExceedsMax`) — checked here
-    ///         before the delegatecall. NO fee crystallisation: `adjustLeverage` changes neither
-    ///         share supply (no mint/burn) nor realizes PnL to the vault, so — like `rerange` — the
-    ///         streaming fee for the interval is deferred to the next crystallize point and the HWM
-    ///         is unaffected. (Mirrors `rerange`'s no-crystallize rationale.)
-    ///
-    /// @param targetLtvBps_ Target loan-to-value in bps (e.g. 6000 = 60%); must be ≤ `maxLtvBps`.
-    /// @param minLiq        Minimum CL liquidity to accept on a lever-UP add (slippage guard).
-    /// @param minOut        Minimum USDC out of a lever-DOWN residual rebalancing swap (slippage guard).
+    ///         NO fee crystallisation (like `rerange`): no supply change, no PnL realized; the
+    ///         streaming fee is deferred and the HWM is unaffected.
+    /// @param targetLtvBps_ Target LTV in bps (must be ≤ `maxLtvBps`).
+    /// @param minLiq        Minimum CL liquidity on a lever-UP add (slippage guard).
+    /// @param minOut        Minimum USDC out of a lever-DOWN residual swap (slippage guard).
     function adjustLeverage(uint16 targetLtvBps_, uint256 minLiq, uint256 minOut) external onlyProposer nonReentrant {
         if (_state != State.Executed) revert NotExecuted();
-        if (targetLtvBps_ > _s().maxLtvBps) revert TargetLtvExceedsMax();
+        if (targetLtvBps_ > _layout().maxLtvBps) revert TargetLtvExceedsMax();
         LeveragedAeroManager.adjustLeverageImpl(targetLtvBps_, minLiq, minOut);
     }
 
-    /// @notice Permissionless safety valve: when position health has fallen below `minHealthBps`,
-    ///         ANYONE may unwind CL liquidity and repay debt to restore the buffer.
+    /// @notice Permissionless safety valve: when health falls below `minHealthBps`, ANYONE may unwind
+    ///         CL liquidity and repay debt to restore the buffer. Deliberately NOT `onlyProposer` — a
+    ///         public deleverage is the user-safety backstop for the indefinite proposal (§8). Logic in
+    ///         `LeveragedAeroManager.deleverageImpl`: same hardened-Chainlink health basis as
+    ///         `_assertHealthy`, reverts `HealthyNoDeleverage` when safe / no debt, else repays down to
+    ///         a small buffer above the minimum (a recovery op, not the full LTV-≤-max gate).
     ///
-    ///         Deliberately NOT `onlyProposer` — a public deleverage is the user-safety backstop for
-    ///         the indefinite proposal (spec §8). The deployed `LeveragedAeroManager.deleverageImpl`
-    ///         (delegatecalled) computes health on the same hardened-Chainlink basis as
-    ///         `_assertHealthy` (`collateralUsdc × 1e4 / debtUsdc`), reverts `HealthyNoDeleverage`
-    ///         when the position is at/above `minHealthBps` (or has no debt), and otherwise repays
-    ///         down to a small buffer above the minimum, asserting health strictly improved and the
-    ///         Moonwell shortfall cleared/reduced (a recovery op, not the full LTV-≤-max gate).
-    ///
-    ///         NO fee crystallisation: no share-supply change, no PnL realized to the vault. A stale
-    ///         our-feed fail-closes the read (deleveraging at a stale/manipulated price is worse than
-    ///         waiting); Moonwell liquidation uses its own oracle, an accepted residual (spec §13).
-    ///
-    /// @param minOut Minimum USDC out of any residual rebalancing swap (caller slippage guard).
+    ///         A stale our-feed fail-closes the read (deleveraging at a stale/manipulated price is
+    ///         worse than waiting); Moonwell liquidation uses its own oracle, an accepted residual (§13).
+    /// @param minOut Minimum USDC out of any residual rebalancing swap (slippage guard).
     function deleverage(uint256 minOut) external nonReentrant {
         if (_state != State.Executed) revert NotExecuted();
         LeveragedAeroManager.deleverageImpl(minOut);
     }
 
-    /// @notice Oracle-free proportional redeem: burn vault shares, receive pro-rata USDC.
-    ///
-    ///         The caller must call `vault.approve(strategy, shares)` first so this
-    ///         function can pull the shares via `safeTransferFrom`.
-    ///
-    ///         Call ordering:
-    ///           1. Best-effort fee crystallise — oracle down → navPre=0 → no fees →
-    ///              redeem proceeds unblocked (oracle-free guarantee).
-    ///           2. Fix fraction denominator ONCE (before burn so supply is stable).
-    ///           3. Pull shares from msg.sender via safeTransferFrom.
-    ///           4. Proportional oracle-free unwind (LeveragedAeroManager.redeemUnwindImpl).
-    ///           5. Revert if assetsOut < minAssetsOut (aggregate slippage guard).
-    ///           6. Transfer USDC to msg.sender.
-    ///           7. vault.strategyBurn(shares) — burns from the strategy's share balance.
-    ///
-    /// @param shares       Vault shares to redeem (12 dp).
-    /// @param minAssetsOut Minimum USDC to receive (oracle-free aggregate slippage guard).
-    /// @return assetsOut   USDC transferred to msg.sender.
+    /// @notice Oracle-free proportional redeem: burn vault shares, receive pro-rata USDC. Caller must
+    ///         `vault.approve(strategy, shares)` first (shares are pulled via `safeTransferFrom`).
+    ///         Oracle-free guarantee (§7): a best-effort crystallise passes navPre=0 on oracle outage
+    ///         (no fees, redeem unblocked); the fraction denominator is fixed once before the burn.
+    /// @param shares       Vault shares to redeem (12dp).
+    /// @param minAssetsOut Minimum USDC out (aggregate slippage guard).
     function redeem(uint256 shares, uint256 minAssetsOut) external nonReentrant returns (uint256 assetsOut) {
         if (_state != State.Executed) revert NotExecuted();
 
         // 1. Best-effort crystallise: oracle outage → navPre=0 → no fees → proceed.
         uint256 navPre;
-        try this.nav() returns (uint256 n) {
-            navPre = n;
+        try this.nav() returns (uint256 navNow) {
+            navPre = navNow;
         } catch {
             navPre = 0;
         }
@@ -768,33 +481,19 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         if (assetsOut < minAssetsOut) revert InsufficientAssetsOut();
 
         // 6. Pay out USDC.
-        IERC20(_s().usdc).safeTransfer(msg.sender, assetsOut);
+        IERC20(_layout().usdc).safeTransfer(msg.sender, assetsOut);
 
         // 7. Burn shares (strategy holds them after safeTransferFrom above).
         ISyndicateVault(vault_).strategyBurn(shares);
     }
 
-    /// @notice Sweep a STRAY ERC-20 (accidental send / airdrop) out of the strategy back to
-    ///         the vault.  The target is always hardcoded to `vault()` — not caller-supplied —
-    ///         so even the proposer cannot exfil to an arbitrary address (spec §13).
-    ///
-    ///         Reverts `CannotRescuePositionToken` for any token that is part of the strategy's
-    ///         value / position / accounting:
-    ///           • usdc      — idle collateral + unit of account (NAV-counted post-3.9 path-b)
-    ///           • cbBTC     — borrowed LP leg (idle cbBTC is NAV-counted)
-    ///           • weth      — borrowed LP leg (idle WETH is NAV-counted)
-    ///           • mUsdc     — Moonwell collateral receipt (mUSDC shares)
-    ///           • mCbBTC    — Moonwell borrow receipt (mcbBTC)
-    ///           • mWeth     — Moonwell borrow receipt (mWETH)
-    ///           • AERO      — gauge reward; sweeping bypasses `compound()` yield path.
-    ///                         Read live from `ICLGauge(gauge).rewardToken()`.
-    ///
-    ///         ERC-721 is NOT handled.  The Slipstream position NFT must never be swept;
-    ///         this function simply does not accept tokenIds.
-    ///
-    /// @param token ERC-20 contract address to sweep.
+    /// @notice Sweep a STRAY ERC-20 (airdrop / accidental send) back to the vault. Target is always
+    ///         `vault()`, never caller-supplied, so even the proposer cannot exfil (§13). Reverts
+    ///         `CannotRescuePositionToken` for any position/accounting token — usdc / cbBTC / weth
+    ///         (all NAV-counted) / mUsdc / mCbBTC / mWeth, and AERO (read live from the gauge so a
+    ///         sweep can't bypass `compound()`). The position NFT is never swept (no ERC-721 path).
     function rescueToVault(address token) external onlyProposer nonReentrant {
-        Layout storage $ = _s();
+        Layout storage $ = _layout();
         address aero = ICLGauge($.gauge).rewardToken();
         if (
             token == $.usdc || token == $.cbBTC || token == $.weth || token == $.mUsdc || token == $.mCbBTC
@@ -803,22 +502,16 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         _pushAllToVault(token);
     }
 
-    /// @dev Tunable param updates (Task 3.6+).
+    /// @dev No tunable params.
     function _updateParams(bytes calldata) internal override {}
 
-    // ─────────────────────────────────────────────────────────────
-    // Internal: Config builder for LeveragedAeroValuation
-    // ─────────────────────────────────────────────────────────────
+    // ── Config builder for LeveragedAeroValuation ──
 
-    /// @notice Build the `LeveragedAeroValuation.Config` from stored state.
-    ///         `cbBTCDecimals` and `wethDecimals` are compile-time constants
-    ///         (cbBTC is always 8dp, WETH9 is always 18dp).
-    ///
-    /// @dev Field-by-field assignment (not struct-literal) forces the Yul IR to emit
-    ///      one sload→mstore per field, avoiding the 18-simultaneous-live-variable
-    ///      overflow that the struct-literal notation can trigger under via_ir.
-    function _cfg() internal view returns (LeveragedAeroValuation.Config memory c) {
-        Layout storage $ = _s();
+    /// @dev Build the valuation `Config` from stored state (cbBTC 8dp / WETH 18dp are compile-time
+    ///      constants). Field-by-field (not struct-literal) so the Yul IR emits one sload→mstore per
+    ///      field, avoiding the 18-live-variable overflow struct-literals trigger under via_ir.
+    function _config() internal view returns (LeveragedAeroValuation.Config memory c) {
+        Layout storage $ = _layout();
         c.usdc = $.usdc;
         c.vault = vault();
         c.mUsdc = $.mUsdc;

@@ -107,10 +107,10 @@ contract LeveragedAeroCLDeployFork is LeveragedAeroForkBase {
     function test_deploy_riskParamsStored() public {
         if (_skip) return;
 
-        assertEq(strategy.targetLtvBps(), TARGET_LTV_BPS, "targetLtvBps");
-        assertEq(strategy.maxLtvBps(), MAX_LTV_BPS, "maxLtvBps");
-        assertEq(strategy.minHealthBps(), MIN_HEALTH_BPS, "minHealthBps");
-        assertEq(strategy.maxSlippageBps(), MAX_SLIPPAGE_BPS, "maxSlippageBps");
+        assertEq(strategy.layout().targetLtvBps, TARGET_LTV_BPS, "targetLtvBps");
+        assertEq(strategy.layout().maxLtvBps, MAX_LTV_BPS, "maxLtvBps");
+        assertEq(strategy.layout().minHealthBps, MIN_HEALTH_BPS, "minHealthBps");
+        assertEq(strategy.layout().maxSlippageBps, MAX_SLIPPAGE_BPS, "maxSlippageBps");
     }
 
     /// @notice USDC collateral factor was read from Moonwell and stored as bps.
@@ -118,7 +118,7 @@ contract LeveragedAeroCLDeployFork is LeveragedAeroForkBase {
     function test_deploy_usdcCollateralFactorRead() public {
         if (_skip) return;
 
-        uint16 cfBps = strategy.usdcCollateralFactorBps();
+        uint16 cfBps = strategy.layout().usdcCollateralFactorBps;
         // CF must be > maxLtvBps (65%) and ≤ 100% (10000 bps).
         assertGt(cfBps, MAX_LTV_BPS, "CF must exceed maxLtvBps");
         assertLe(cfBps, 10000, "CF cannot exceed 100%");
@@ -130,23 +130,23 @@ contract LeveragedAeroCLDeployFork is LeveragedAeroForkBase {
     function test_deploy_addressesWired() public {
         if (_skip) return;
 
-        assertEq(strategy.usdc(), BaseAddresses.USDC, "usdc");
-        assertEq(strategy.mUsdc(), BaseAddresses.MOONWELL_MUSDC, "mUsdc");
-        assertEq(strategy.mCbBTC(), BaseAddresses.MOONWELL_MCBBTC, "mCbBTC");
-        assertEq(strategy.mWeth(), BaseAddresses.MOONWELL_MWETH, "mWeth");
-        assertEq(strategy.pool(), BaseAddresses.CBBTC_WETH_POOL, "pool");
-        assertEq(strategy.gauge(), BaseAddresses.CBBTC_WETH_GAUGE, "gauge");
-        assertEq(strategy.npm(), BaseAddresses.SLIPSTREAM_NPM, "npm");
-        assertEq(strategy.tickSpacing(), BaseAddresses.CBBTC_WETH_TICK_SPACING, "tickSpacing");
+        assertEq(strategy.layout().usdc, BaseAddresses.USDC, "usdc");
+        assertEq(strategy.layout().mUsdc, BaseAddresses.MOONWELL_MUSDC, "mUsdc");
+        assertEq(strategy.layout().mCbBTC, BaseAddresses.MOONWELL_MCBBTC, "mCbBTC");
+        assertEq(strategy.layout().mWeth, BaseAddresses.MOONWELL_MWETH, "mWeth");
+        assertEq(strategy.layout().pool, BaseAddresses.CBBTC_WETH_POOL, "pool");
+        assertEq(strategy.layout().gauge, BaseAddresses.CBBTC_WETH_GAUGE, "gauge");
+        assertEq(strategy.layout().npm, BaseAddresses.SLIPSTREAM_NPM, "npm");
+        assertEq(strategy.layout().tickSpacing, BaseAddresses.CBBTC_WETH_TICK_SPACING, "tickSpacing");
     }
 
     /// @notice Fee params wired correctly.
     function test_deploy_feeParamsWired() public {
         if (_skip) return;
 
-        assertEq(strategy.managementFeeBps(), MGMT_FEE_BPS, "managementFeeBps");
-        assertEq(strategy.performanceFeeBps(), PERF_FEE_BPS, "performanceFeeBps");
-        assertEq(strategy.feeRecipient(), feeRecipient, "feeRecipient");
+        assertEq(strategy.layout().managementFeeBps, MGMT_FEE_BPS, "managementFeeBps");
+        assertEq(strategy.layout().performanceFeeBps, PERF_FEE_BPS, "performanceFeeBps");
+        assertEq(strategy.layout().feeRecipient, feeRecipient, "feeRecipient");
     }
 
     /// @notice vault() and proposer() are correctly set by BaseStrategy.initialize.
@@ -161,7 +161,7 @@ contract LeveragedAeroCLDeployFork is LeveragedAeroForkBase {
     function test_deploy_tokenIdZero() public {
         if (_skip) return;
 
-        assertEq(strategy.tokenId(), 0, "tokenId should be 0 pre-deploy");
+        assertEq(strategy.layout().tokenId, 0, "tokenId should be 0 pre-deploy");
     }
 
     /// @notice nav() returns 0 pre-deploy: no position, no idle USDC in vault or strategy.
@@ -235,9 +235,9 @@ contract LeveragedAeroCLDeployFork is LeveragedAeroForkBase {
         assertGt(wethDebt, 0, "WETH borrow balance == 0");
 
         // ── Assert: CL NFT minted and staked ──
-        uint256 tid = strategy.tokenId();
+        uint256 tid = strategy.layout().tokenId;
         assertGt(tid, 0, "tokenId == 0");
-        assertNotEq(strategy.posTickLower(), strategy.posTickUpper(), "ticks equal");
+        assertNotEq(strategy.layout().posTickLower, strategy.layout().posTickUpper, "ticks equal");
         // Explicit gauge-custody check: the gauge holds the NFT after deposit().
         assertEq(IERC721(NPM).ownerOf(tid), GAUGE, "gauge should own minted NFT");
 
@@ -269,7 +269,7 @@ contract LeveragedAeroCLDeployFork is LeveragedAeroForkBase {
         assertLe(ltvBps, TARGET_LTV_BPS + 750, "LTV too high vs target");
 
         // Health in bps: collateral × CF / debt
-        uint256 cfBps = uint256(strategy.usdcCollateralFactorBps());
+        uint256 cfBps = uint256(strategy.layout().usdcCollateralFactorBps);
         uint256 healthBps = (collateralUsdc * cfBps) / totalDebtUsdc;
         assertGe(healthBps, MIN_HEALTH_BPS, "health < minHealthBps");
 
@@ -300,10 +300,10 @@ contract LeveragedAeroCLDeployFork is LeveragedAeroForkBase {
         strategy.execute();
 
         // Sanity: position is open
-        assertGt(strategy.tokenId(), 0, "tokenId should be non-zero after execute");
+        assertGt(strategy.layout().tokenId, 0, "tokenId should be non-zero after execute");
 
         // Capture tokenId before settle so we can check NPM state after
-        uint256 tid = strategy.tokenId();
+        uint256 tid = strategy.layout().tokenId;
 
         // ── Settle ──
         vm.prank(fakeVault);
@@ -322,7 +322,7 @@ contract LeveragedAeroCLDeployFork is LeveragedAeroForkBase {
         );
 
         // ── Assert: position cleared (storage + on-chain NPM liquidity) ──
-        assertEq(strategy.tokenId(), 0, "tokenId not cleared after settle");
+        assertEq(strategy.layout().tokenId, 0, "tokenId not cleared after settle");
         (,,,,,,, uint128 liqAfter,,,,) = INonfungiblePositionManager(BaseAddresses.SLIPSTREAM_NPM).positions(tid);
         assertEq(liqAfter, 0, "NFT liquidity drained");
 
@@ -358,7 +358,7 @@ contract LeveragedAeroCLDeployFork is LeveragedAeroForkBase {
         vm.prank(fakeVault);
         strategy.execute();
 
-        assertGt(strategy.tokenId(), 0, "tokenId should be non-zero after execute");
+        assertGt(strategy.layout().tokenId, 0, "tokenId should be non-zero after execute");
 
         // ── Snapshot pre-settle USDC in vault (should be 0) ──
         uint256 vaultUsdcBefore = IERC20(BaseAddresses.USDC).balanceOf(fakeVault);
@@ -401,7 +401,7 @@ contract LeveragedAeroCLDeployFork is LeveragedAeroForkBase {
         assertGt(vaultUsdcAfter, vaultUsdcBefore, "vault received no USDC after shoved settle");
 
         // ── Assert: tokenId cleared ──
-        assertEq(strategy.tokenId(), 0, "tokenId not cleared after shoved settle");
+        assertEq(strategy.layout().tokenId, 0, "tokenId not cleared after shoved settle");
     }
 
     /// @notice Oracle NAV is resistant to tick manipulation:

@@ -206,9 +206,9 @@ contract LeveragedAeroCLRerangeFork is LeveragedAeroForkBase {
         assertLt(tickShoved, tickStart, "pool tick did not move down");
         assertGe(tickShoved, tickStart - 500, "shove left the calm band");
 
-        uint256 tidBefore = strategy.tokenId();
-        int24 oldLower = strategy.posTickLower();
-        int24 oldUpper = strategy.posTickUpper();
+        uint256 tidBefore = strategy.layout().tokenId;
+        int24 oldLower = strategy.layout().posTickLower;
+        int24 oldUpper = strategy.layout().posTickUpper;
         uint256 navBefore = strategy.nav();
         assertGt(navBefore, 0, "navBefore should be > 0");
 
@@ -230,8 +230,8 @@ contract LeveragedAeroCLRerangeFork is LeveragedAeroForkBase {
         // (2) The new range is RECENTERED: it straddles the current tick and differs from the old
         //     off-center range.
         (, int24 tickNow,,,,) = ICLPool(POOL).slot0();
-        int24 newLower = strategy.posTickLower();
-        int24 newUpper = strategy.posTickUpper();
+        int24 newLower = strategy.layout().posTickLower;
+        int24 newUpper = strategy.layout().posTickUpper;
         assertLt(newLower, tickNow, "new lower tick !< current tick");
         assertLt(tickNow, newUpper, "current tick !< new upper tick");
         assertTrue(newLower != oldLower || newUpper != oldUpper, "range was not recentered");
@@ -256,7 +256,7 @@ contract LeveragedAeroCLRerangeFork is LeveragedAeroForkBase {
         assertLe(_ltvBps(), MAX_LTV_BPS, "post-rerange LTV exceeds maxLtvBps");
 
         // (4) A NEW tokenId was minted and staked in the gauge (Slipstream ticks are immutable).
-        uint256 tidAfter = strategy.tokenId();
+        uint256 tidAfter = strategy.layout().tokenId;
         assertTrue(tidAfter != tidBefore && tidAfter != 0, "tokenId was not rotated to a recentered NFT");
         assertEq(IERC721OwnerR(NPM).ownerOf(tidAfter), GAUGE, "new NFT is not staked in the gauge");
 

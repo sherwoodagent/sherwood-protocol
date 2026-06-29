@@ -195,7 +195,7 @@ contract LeveragedAeroCLLeverageFork is LeveragedAeroForkBase {
     }
 
     function _liquidity() internal view returns (uint128 liq) {
-        (,,,,,,, liq,,,,) = INpmPosLev(BaseAddresses.SLIPSTREAM_NPM).positions(strategy.tokenId());
+        (,,,,,,, liq,,,,) = INpmPosLev(BaseAddresses.SLIPSTREAM_NPM).positions(strategy.layout().tokenId);
     }
 
     /// @dev Mock the cbBTC (BTC/USD) feed to `num/den` × its real answer, preserving the real
@@ -224,7 +224,7 @@ contract LeveragedAeroCLLeverageFork is LeveragedAeroForkBase {
         uint256 cbDebtBefore = IMoonwellMarket(BaseAddresses.MOONWELL_MCBBTC).borrowBalanceStored(address(strategy));
         uint256 wethDebtBefore = IMoonwellMarket(BaseAddresses.MOONWELL_MWETH).borrowBalanceStored(address(strategy));
         uint128 liqBefore = _liquidity();
-        uint256 tid = strategy.tokenId();
+        uint256 tid = strategy.layout().tokenId;
 
         vm.prank(proposer);
         strategy.adjustLeverage(6000, 0, 0);
@@ -246,7 +246,7 @@ contract LeveragedAeroCLLeverageFork is LeveragedAeroForkBase {
         assertGt(_liquidity(), liqBefore, "CL liquidity did not grow on lever-up");
 
         // Same NFT, still staked, still healthy (≤ maxLtv).
-        assertEq(strategy.tokenId(), tid, "tokenId changed");
+        assertEq(strategy.layout().tokenId, tid, "tokenId changed");
         assertEq(
             IERC20Owner(BaseAddresses.SLIPSTREAM_NPM).ownerOf(tid), BaseAddresses.CBBTC_WETH_GAUGE, "NFT not staked"
         );
@@ -265,7 +265,7 @@ contract LeveragedAeroCLLeverageFork is LeveragedAeroForkBase {
         uint256 cbDebtBefore = IMoonwellMarket(BaseAddresses.MOONWELL_MCBBTC).borrowBalanceStored(address(strategy));
         uint256 wethDebtBefore = IMoonwellMarket(BaseAddresses.MOONWELL_MWETH).borrowBalanceStored(address(strategy));
         uint256 collatBefore = ICToken(BaseAddresses.MOONWELL_MUSDC).balanceOf(address(strategy));
-        uint256 tid = strategy.tokenId();
+        uint256 tid = strategy.layout().tokenId;
 
         vm.prank(proposer);
         strategy.adjustLeverage(4000, 0, 0);
@@ -292,7 +292,7 @@ contract LeveragedAeroCLLeverageFork is LeveragedAeroForkBase {
         );
 
         // Position remains open + staked + healthy.
-        assertEq(strategy.tokenId(), tid, "tokenId changed");
+        assertEq(strategy.layout().tokenId, tid, "tokenId changed");
         assertEq(
             IERC20Owner(BaseAddresses.SLIPSTREAM_NPM).ownerOf(tid), BaseAddresses.CBBTC_WETH_GAUGE, "NFT not staked"
         );

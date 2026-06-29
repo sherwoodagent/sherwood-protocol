@@ -187,7 +187,7 @@ contract LeveragedAeroCLCompoundFork is LeveragedAeroForkBase {
     }
 
     function _liquidity() internal view returns (uint128 liq) {
-        (,,,,,,, liq,,,,) = INpmPos(BaseAddresses.SLIPSTREAM_NPM).positions(strategy.tokenId());
+        (,,,,,,, liq,,,,) = INpmPos(BaseAddresses.SLIPSTREAM_NPM).positions(strategy.layout().tokenId);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -207,7 +207,7 @@ contract LeveragedAeroCLCompoundFork is LeveragedAeroForkBase {
         uint128 liqBefore = _liquidity();
         uint256 cbDebtBefore = IMoonwellMarket(BaseAddresses.MOONWELL_MCBBTC).borrowBalanceStored(address(strategy));
         uint256 wethDebtBefore = IMoonwellMarket(BaseAddresses.MOONWELL_MWETH).borrowBalanceStored(address(strategy));
-        uint256 tid = strategy.tokenId();
+        uint256 tid = strategy.layout().tokenId;
 
         // Compound: claim → swap ≈$7.1k AERO → USDC (minUsdcOut 6000e6) → redeploy at target LTV.
         vm.prank(proposer);
@@ -238,7 +238,7 @@ contract LeveragedAeroCLCompoundFork is LeveragedAeroForkBase {
         assertLe(_ltvBps(), MAX_LTV_BPS, "post-compound LTV exceeds maxLtvBps");
 
         // Same NFT, still staked in the gauge after the redeploy's unstake→restake.
-        assertEq(strategy.tokenId(), tid, "tokenId changed");
+        assertEq(strategy.layout().tokenId, tid, "tokenId changed");
         assertEq(
             IERC721Owner(BaseAddresses.SLIPSTREAM_NPM).ownerOf(tid), BaseAddresses.CBBTC_WETH_GAUGE, "NFT not staked"
         );
@@ -278,7 +278,7 @@ contract LeveragedAeroCLCompoundFork is LeveragedAeroForkBase {
         // No AERO funded; no warp → gauge has emitted nothing → getReward yields 0.
         assertEq(IERC20(BaseAddresses.AERO).balanceOf(address(strategy)), 0, "unexpected AERO");
 
-        uint256 tid = strategy.tokenId();
+        uint256 tid = strategy.layout().tokenId;
         uint128 liqBefore = _liquidity();
         uint256 cbDebtBefore = IMoonwellMarket(BaseAddresses.MOONWELL_MCBBTC).borrowBalanceStored(address(strategy));
         uint256 wethDebtBefore = IMoonwellMarket(BaseAddresses.MOONWELL_MWETH).borrowBalanceStored(address(strategy));
@@ -288,7 +288,7 @@ contract LeveragedAeroCLCompoundFork is LeveragedAeroForkBase {
         strategy.compound(0, 0); // must NOT revert
 
         // Position + supply unchanged (no fee-shares: dt==0 and first-ever crystallize seeds HWM).
-        assertEq(strategy.tokenId(), tid, "tokenId changed on no-op");
+        assertEq(strategy.layout().tokenId, tid, "tokenId changed on no-op");
         assertEq(_liquidity(), liqBefore, "liquidity changed on no-op");
         assertEq(
             IMoonwellMarket(BaseAddresses.MOONWELL_MCBBTC).borrowBalanceStored(address(strategy)),

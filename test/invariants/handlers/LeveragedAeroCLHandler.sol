@@ -143,7 +143,7 @@ contract LeveragedAeroCLHandler is LeveragedAeroForkBase {
         actors.push(makeAddr("aero_lp_1"));
 
         if (live_) {
-            minHealth = uint256(strategy_.minHealthBps());
+            minHealth = uint256(strategy_.layout().minHealthBps);
             for (uint256 i; i < actors.length; i++) {
                 _fundUSDC(actors[i], ACTOR_FUNDING);
                 vm.prank(actors[i]);
@@ -239,7 +239,7 @@ contract LeveragedAeroCLHandler is LeveragedAeroForkBase {
     function adjustLeverage(uint256 ltvSeed) external {
         if (!live) return;
         opCount++;
-        uint16 maxLtv = strategy.maxLtvBps();
+        uint16 maxLtv = strategy.layout().maxLtvBps;
         uint16 target = uint16(bound(ltvSeed, 3000, uint256(maxLtv)));
         uint256 pre = _safePerShare();
         vm.prank(proposer);
@@ -301,7 +301,7 @@ contract LeveragedAeroCLHandler is LeveragedAeroForkBase {
         // (b) health on the Chainlink basis (== _assertHealthy). Skip when flat-book (no debt) or
         // when excluded (deleverage). No price is mocked in the mixed fuzz, so a successful op must
         // leave health >= minHealthBps.
-        if (checkHealth && !healthViolated && strategy.tokenId() != 0) {
+        if (checkHealth && !healthViolated && strategy.layout().tokenId != 0) {
             uint256 h = _safeHealth();
             if (h < minHealth) {
                 healthViolated = true;
@@ -338,7 +338,7 @@ contract LeveragedAeroCLHandler is LeveragedAeroForkBase {
         uint256 cBal = ICToken(MUSDC).balanceOf(strat);
         if (cBal > 0) assets += (cBal * ICToken(MUSDC).exchangeRateStored()) / 1e18;
 
-        uint256 tid = strategy.tokenId();
+        uint256 tid = strategy.layout().tokenId;
         if (tid != 0) {
             (,,,,, int24 tl, int24 tu, uint128 liq,,,,) = INonfungiblePositionManager(NPM).positions(tid);
             if (liq > 0) {

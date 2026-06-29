@@ -223,7 +223,7 @@ contract LeveragedAeroCLDepositFork is LeveragedAeroForkBase {
         uint256 navBefore = strategy.nav();
 
         // Read tokenId to read liquidity before
-        uint256 tokenId_ = strategy.tokenId();
+        uint256 tokenId_ = strategy.layout().tokenId;
         (,,,,,,, uint128 liqBefore,,,,) =
             INonfungiblePositionManager_Dep(BaseAddresses.SLIPSTREAM_NPM).positions(tokenId_);
 
