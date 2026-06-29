@@ -4,15 +4,18 @@ pragma solidity 0.8.28;
 import {Test} from "forge-std/Test.sol";
 
 import {LeveragedAerodromeCLStrategy} from "../src/strategies/LeveragedAerodromeCLStrategy.sol";
+import {LeveragedAeroManager} from "../src/strategies/LeveragedAeroManager.sol";
 
-/// @notice Exposes `_assertHealthy` (internal) for offline unit testing.
-///         Deployed via `new HealthHarness()` — the BaseStrategy constructor sets
-///         `_initialized = true` on the template, locking `initialize()`.
-///         We bypass init entirely and write only the storage slots that
-///         `_assertHealthy` reads.
+/// @notice Exposes the post-op health invariant for offline unit testing.
+///         The venue logic now lives in the deployed `LeveragedAeroManager` library;
+///         `assertHealthyImpl()` is delegatecalled so `_s()` / `address(this)` resolve to
+///         this harness's diamond storage (written below via `vm.store`), exactly as they
+///         would for a strategy clone. Deployed via `new HealthHarness()` — the BaseStrategy
+///         constructor sets `_initialized = true`, so we bypass init and write only the
+///         storage slots the health check reads.
 contract HealthHarness is LeveragedAerodromeCLStrategy {
     function callAssertHealthy() external view {
-        _assertHealthy();
+        LeveragedAeroManager.assertHealthyImpl();
     }
 }
 

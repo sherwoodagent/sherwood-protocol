@@ -224,7 +224,7 @@ contract LeveragedAeroCLRedeemFork is LeveragedAeroForkBase {
         assertLe(navPerShareAfter, navPerShareBefore + tolerance, "A's per-share NAV rose > 2%");
 
         // NFT must still be staked in the gauge after restake.
-        uint256 tid = strategy.s().tokenId;
+        uint256 tid = strategy.tokenId();
         assertGt(tid, 0, "tokenId should still be set");
         assertEq(
             IERC721Minimal2(BaseAddresses.SLIPSTREAM_NPM).ownerOf(tid),
@@ -369,7 +369,7 @@ contract LeveragedAeroCLRedeemFork is LeveragedAeroForkBase {
         assertLe(wethDebtAfter, wethDebtExpected * 10100 / 10000, "WETH stayers debt too high");
 
         // NFT must still be staked (remaining liq > 0)
-        uint256 tid = strategy.s().tokenId;
+        uint256 tid = strategy.tokenId();
         assertGt(tid, 0, "tokenId cleared unexpectedly");
         assertEq(
             IERC721Minimal2(BaseAddresses.SLIPSTREAM_NPM).ownerOf(tid),
