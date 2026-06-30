@@ -404,6 +404,14 @@ contract SyndicateVault is
         return ISyndicateFactory(_factory).governor();
     }
 
+    /// @dev Active proposal id binding this vault, read through the governor (0
+    ///      when none active). Shared body for the Lane-A lock + async request
+    ///      paths. Distinct from `redemptionsLocked` / `_activeStrategy`, which
+    ///      additionally guard a zero governor — those keep their own reads.
+    function _activePid() private view returns (uint256) {
+        return ISyndicateGovernor(_getGovernor()).getActiveProposal(address(this));
+    }
+
     /// @inheritdoc ISyndicateVault
     /// @dev V-C2: every delegatecall re-verifies that `_executorImpl`'s bytecode
     ///      still matches the hash stamped at init. A factory misconfig or a
@@ -614,7 +622,7 @@ contract SyndicateVault is
     ///      intra-proposal arb (G1) for both Lane A redeem and Lane B requestRedeem.
     function _isLaneALocked(address holder) private view returns (bool) {
         uint256 p = _laneALockPid[holder];
-        return p != 0 && p == ISyndicateGovernor(_getGovernor()).getActiveProposal(address(this));
+        return p != 0 && p == _activePid();
     }
 
     /// @dev Shared instant-exit gate for `maxWithdraw` / `maxRedeem`: an exit
@@ -623,6 +631,21 @@ contract SyndicateVault is
     function _laneBOnly(address owner_) private view returns (bool) {
         (, bool laneA) = _liveNAV();
         return (redemptionsLocked() && !laneA) || _isLaneALocked(owner_);
+    }
+
+    /// @dev Float available for instant exits = vault asset balance minus the
+    ///      queue's reserved (already-settled, unclaimed) redeem float. Shared by
+    ///      `maxWithdraw` / `maxRedeem`. Floors at 0 when float < reserve.
+    function _availableFloat() private view returns (uint256) {
+        uint256 reserve = reservedQueueAssets();
+        uint256 float = IERC20(asset()).balanceOf(address(this));
+        return float > reserve ? float - reserve : 0;
+    }
+
+    /// @dev Closed-deposit gate: reverts unless deposits are open OR `who` is
+    ///      whitelisted. Shared by `_deposit` / `requestDeposit` / `strategyMint`.
+    function _requireApprovedDepositor(address who) private view {
+        if (!_openDeposits && !_approvedDepositors.contains(who)) revert NotApprovedDepositor();
     }
 
     // ── I-1: nonReentrant guard on the deposit / mint path ──
@@ -686,7 +709,7 @@ contract SyndicateVault is
         // otherwise be pulled into a strategy they never voted on, or mint
         // against an unrealized NAV.
         if (_depositsLocked() && !laneA) revert DepositsLocked();
-        if (!_openDeposits && !_approvedDepositors.contains(receiver)) revert NotApprovedDepositor();
+        _requireApprovedDepositor(receiver);
         super._deposit(caller, receiver, assets, shares);
 
         // Auto-delegate: if receiver has no delegate, delegate to self
@@ -697,7 +720,7 @@ contract SyndicateVault is
         // G1: a Lane A entry locks the receiver's shares until this proposal
         // settles — closes the deposit-low / exit-high intra-proposal MEV.
         if (laneA) {
-            _laneALockPid[receiver] = ISyndicateGovernor(_getGovernor()).getActiveProposal(address(this));
+            _laneALockPid[receiver] = _activePid();
         }
     }
 
@@ -730,9 +753,7 @@ contract SyndicateVault is
         if (owner_ == _withdrawalQueue) return super.maxWithdraw(owner_);
         if (_laneBOnly(owner_)) return 0;
         uint256 userMax = super.maxWithdraw(owner_);
-        uint256 reserve = reservedQueueAssets();
-        uint256 float = IERC20(asset()).balanceOf(address(this));
-        uint256 available = float > reserve ? float - reserve : 0;
+        uint256 available = _availableFloat();
         return userMax > available ? available : userMax;
     }
 
@@ -748,9 +769,7 @@ contract SyndicateVault is
         uint256 ts = totalSupply();
         if (ts == 0 || reserveShares >= ts) return 0;
         uint256 availableShares = ts - reserveShares;
-        uint256 reserve = reservedQueueAssets();
-        uint256 float = IERC20(asset()).balanceOf(address(this));
-        uint256 backingAssets = float > reserve ? float - reserve : 0;
+        uint256 backingAssets = _availableFloat();
         // Sherlock run #3 #9 (off-report): no `backingAssets == 0` early return —
         // skip the floatShares cap entirely when the user's full balance fits
         // within `backingAssets` (covers the dust case where
@@ -799,7 +818,7 @@ contract SyndicateVault is
         // pre-transfer weight, so vote power is preserved for in-flight proposals.
         // Queued shares forfeit voting power for any proposal opened after escrow.
         // Shares are burned later by `claim`.
-        uint256 pid = ISyndicateGovernor(_getGovernor()).getActiveProposal(address(this));
+        uint256 pid = _activePid();
         _transfer(owner_, q, shares);
         requestId = IVaultWithdrawalQueue(q).queueRedeem(owner_, shares, pid);
         emit RedeemRequested(requestId, owner_, shares);
@@ -822,8 +841,8 @@ contract SyndicateVault is
         if (q == address(0)) revert WithdrawalQueueNotSet();
         if (!redemptionsLocked()) revert RedemptionsNotLocked();
         if (assets == 0) revert ZeroAssets();
-        if (!_openDeposits && !_approvedDepositors.contains(receiver)) revert NotApprovedDepositor();
-        uint256 pid = ISyndicateGovernor(_getGovernor()).getActiveProposal(address(this));
+        _requireApprovedDepositor(receiver);
+        uint256 pid = _activePid();
         // Escrow assets in the queue (off-vault custody — never counted in
         // totalAssets, never swept into the strategy).
         IERC20(asset()).safeTransferFrom(msg.sender, q, assets);
@@ -895,7 +914,7 @@ contract SyndicateVault is
     ///      only at settle — which never happens under the indefinite proposal these
     ///      strategies run. The active-strategy gate is the trust boundary.
     function strategyMint(address to, uint256 shares) external onlyActiveStrategy whenNotPaused {
-        if (!_openDeposits && !_approvedDepositors.contains(to)) revert NotApprovedDepositor();
+        _requireApprovedDepositor(to);
         _mint(to, shares);
         if (delegates(to) == address(0)) _delegate(to, to);
     }
