@@ -274,6 +274,12 @@ contract GuardianNetworkForkTest is Test {
 
         assertTrue(vault.redemptionsLocked(), "C: vault locked after execute");
 
+        // Emergency settle is a post-duration path: GovernorEmergency requires
+        // block.timestamp >= executedAt + strategyDuration (7 days, set in
+        // _proposeAndVote), else StrategyDurationNotElapsed. Scenarios A/B warp
+        // this before settling; scenario C must too.
+        vm.warp(vm.getBlockTimestamp() + 7 days);
+
         // Owner triggers emergency settle with the precommitted calls.
         vm.prank(owner);
         governor.emergencySettleWithCalls(pid, settleCalls);
@@ -366,16 +372,12 @@ contract GuardianNetworkForkTest is Test {
 
         execCalls = new BatchExecutorLib.Call[](2);
         execCalls[0] = BatchExecutorLib.Call({
-            target: USDC,
-            data: abi.encodeCall(IERC20.approve, (strategy, supplyAmount)),
-            value: 0
+            target: USDC, data: abi.encodeCall(IERC20.approve, (strategy, supplyAmount)), value: 0
         });
-        execCalls[1] =
-            BatchExecutorLib.Call({target: strategy, data: abi.encodeWithSignature("execute()"), value: 0});
+        execCalls[1] = BatchExecutorLib.Call({target: strategy, data: abi.encodeWithSignature("execute()"), value: 0});
 
         settleCalls = new BatchExecutorLib.Call[](1);
-        settleCalls[0] =
-            BatchExecutorLib.Call({target: strategy, data: abi.encodeWithSignature("settle()"), value: 0});
+        settleCalls[0] = BatchExecutorLib.Call({target: strategy, data: abi.encodeWithSignature("settle()"), value: 0});
     }
 
     function _proposeAndVote(
@@ -441,8 +443,7 @@ contract GuardianNetworkForkTest is Test {
                     address(swoodImpl),
                     abi.encodeCall(
                         StakedWood.initialize,
-                        (
-                            StakedWood.InitParams({
+                        (StakedWood.InitParams({
                                 owner: owner,
                                 wood: address(wood),
                                 governor: predictedGovernor,
@@ -452,8 +453,7 @@ contract GuardianNetworkForkTest is Test {
                                 minOwnerStake: MIN_OWNER_STAKE,
                                 minSlashBps: 1000,
                                 maxSlashBps: 9999
-                            })
-                        )
+                            }))
                     )
                 )
             )
@@ -517,8 +517,7 @@ contract GuardianNetworkForkTest is Test {
                     address(factImpl),
                     abi.encodeCall(
                         SyndicateFactory.initialize,
-                        (
-                            SyndicateFactory.InitParams({
+                        (SyndicateFactory.InitParams({
                                 owner: owner,
                                 executorImpl: address(executorLib),
                                 vaultImpl: address(vaultImpl),
@@ -527,8 +526,7 @@ contract GuardianNetworkForkTest is Test {
                                 governor: address(governor),
                                 managementFeeBps: 0,
                                 guardianRegistry: address(registry)
-                            })
-                        )
+                            }))
                     )
                 )
             )
