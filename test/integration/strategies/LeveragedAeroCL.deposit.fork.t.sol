@@ -18,6 +18,11 @@ contract MockVaultForDeposit {
         totalSupply = initialShares;
     }
 
+    /// @dev L7: strategy reads vault().asset() at init — must equal the configured USDC.
+    function asset() external pure returns (address) {
+        return BaseAddresses.USDC;
+    }
+
     function strategyMint(address to, uint256 shares) external {
         balanceOf[to] += shares;
         totalSupply += shares;

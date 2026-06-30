@@ -83,6 +83,10 @@ contract LeveragedAeroCLRescueFork is LeveragedAeroForkBase {
         fakeProposer = address(this); // test contract is the proposer
         feeRecipient = makeAddr("feeRecipient");
 
+        // L7: _initialize now reads vault().asset(); the bare fakeVault has no code, so make it
+        // answer asset() == USDC to satisfy the new asset-wiring check.
+        vm.mockCall(fakeVault, abi.encodeWithSignature("asset()"), abi.encode(USDC));
+
         // Deploy template + clone (mirrors deploy fork test pattern).
         address template = address(new LeveragedAerodromeCLStrategy());
         address clone = Clones.clone(template);

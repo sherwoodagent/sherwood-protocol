@@ -24,6 +24,11 @@ contract MockVaultForCompound {
         totalSupply = initialShares;
     }
 
+    /// @dev L7: strategy reads vault().asset() at init — must equal the configured USDC.
+    function asset() external pure returns (address) {
+        return BaseAddresses.USDC;
+    }
+
     function approve(address spender, uint256 amount) external returns (bool) {
         allowance[msg.sender][spender] = amount;
         return true;

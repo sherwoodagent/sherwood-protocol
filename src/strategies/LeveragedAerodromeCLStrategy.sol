@@ -2,9 +2,11 @@
 pragma solidity 0.8.28;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 import {ERC721Holder} from "@openzeppelin/contracts/token/ERC721/utils/ERC721Holder.sol";
+import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 
 import {BaseStrategy} from "./BaseStrategy.sol";
 import {LeveragedAeroValuation} from "./LeveragedAeroValuation.sol";
@@ -14,6 +16,7 @@ import {Position} from "../interfaces/IPriceRouter.sol";
 import {IStrategy} from "../interfaces/IStrategy.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {LeveragedAeroFees} from "./LeveragedAeroFees.sol";
+import {FeeConstants} from "../FeeConstants.sol";
 import {ISyndicateVault} from "../interfaces/ISyndicateVault.sol";
 
 /// @title LeveragedAerodromeCLStrategy
@@ -48,6 +51,13 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     error InsufficientIdle();
     error HealthyNoDeleverage();
     error CannotRescuePositionToken();
+    error OnlySelf();
+    error PerformanceFeeTooHigh();
+    error ManagementFeeTooHigh();
+    error MinHealthMaxLtvConflict();
+    error AssetMismatch();
+    error UnexpectedAssetDecimals();
+    error OracleParamOutOfRange();
 
     // ── Constants ──
     uint8 private constant CBBTC_DECIMALS = 8; // cbBTC is 8dp wrapped Bitcoin
@@ -58,6 +68,9 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
 
     /// @dev ERC-4626 virtual share offset matching the vault's `_decimalsOffset()` (USDC 6dp → 1e6).
     uint256 private constant SHARES_VIRTUAL_OFFSET = 1e6;
+
+    /// @dev Annual management-fee ceiling (bps); mirrors `SyndicateFactory.MAX_MANAGEMENT_FEE_BPS` (5%/yr).
+    uint16 private constant MAX_MANAGEMENT_FEE_BPS = 500;
 
     // ── Initialisation params (ABI-encoded → BaseStrategy.initialize → _initialize) ──
 
@@ -146,7 +159,7 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         uint16 managementFeeBps;
         uint16 performanceFeeBps;
         address feeRecipient;
-        uint256 hwmPerShare; // HWM NAV per share (USDC 6dp); 0 until first deposit
+        uint256 hwmPerShare; // HWM nav-per-share (1e18 WAD), 0 until first deposit
         uint256 lastFeeAccrualTimestamp;
     }
 
@@ -199,13 +212,37 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         if (p.usdcFeed == address(0)) revert ZeroAddress();
         if (p.sequencerFeed == address(0)) revert ZeroAddress();
 
+        // L7: the strategy's unit of account MUST be the vault's ERC-4626 asset, and the
+        // SHARES_VIRTUAL_OFFSET (1e6) hardcodes a 6-decimal asset — reject any other wiring.
+        if (p.usdc != IERC4626(vault()).asset()) revert AssetMismatch();
+        if (IERC20Metadata(p.usdc).decimals() != 6) revert UnexpectedAssetDecimals();
+
         uint16 cfBps = _readCollateralFactor(p.comptroller, p.mUsdc);
         if (p.targetLtvBps > p.maxLtvBps) revert TargetLtvExceedsMax();
         if (p.minHealthBps < 10500) revert MinHealthTooLow();
         if (p.maxLtvBps >= cfBps) revert MaxLtvExceedsCF();
+        // L4: permissionless deleverage triggers at LTV = 1e8 / minHealthBps; that trigger LTV MUST
+        // sit strictly above maxLtvBps, else there is an in-band range anyone can grief-deleverage.
+        // Cross-multiplied (overflow-free): require minHealthBps * maxLtvBps < 1e8.
+        if (uint256(p.minHealthBps) * uint256(p.maxLtvBps) >= 1e8) revert MinHealthMaxLtvConflict();
+        // L3 (+L5): bound the oracle / calm-gate params so a misconfig can't silently disable a guard.
+        // Bounds admit the confirmed config yet block degenerate values:
+        //   maxDelay           ∈ (0, 7 days] — a huge value disables staleness detection
+        //   gracePeriod        ∈ [0, 1 days] — sequencer-restart grace
+        //   twapWindow         ∈ (0, 1 days] — 0 disables the TWAP / calm-gate
+        //   calmDeviationTicks ∈ (0, 5000]   — a huge value disables the calm-gate
+        //   maxSlippageBps     ∈ (0, 1000]   — 0 or huge disables swap-slippage protection (10% cap)
+        if (p.maxDelay == 0 || p.maxDelay > 7 days) revert OracleParamOutOfRange();
+        if (p.gracePeriod > 1 days) revert OracleParamOutOfRange();
+        if (p.twapWindow == 0 || p.twapWindow > 1 days) revert OracleParamOutOfRange();
+        if (p.calmDeviationTicks == 0 || p.calmDeviationTicks > 5000) revert OracleParamOutOfRange();
+        if (p.maxSlippageBps == 0 || p.maxSlippageBps > 1000) revert OracleParamOutOfRange();
         if ((p.managementFeeBps != 0 || p.performanceFeeBps != 0) && p.feeRecipient == address(0)) {
             revert FeeRecipientRequired();
         }
+        // M3: hard ceilings on both fee rates (perf mirrors the protocol-wide cap; mgmt the factory's).
+        if (p.performanceFeeBps > FeeConstants.MAX_PERFORMANCE_FEE_BPS) revert PerformanceFeeTooHigh();
+        if (p.managementFeeBps > MAX_MANAGEMENT_FEE_BPS) revert ManagementFeeTooHigh();
 
         Layout storage $ = _layout();
         $.usdc = p.usdc;
@@ -355,6 +392,17 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         if (feeShares > 0) ISyndicateVault(vault()).strategyMint($.feeRecipient, feeShares);
     }
 
+    /// @dev Self-only external wrapper so `redeem` can crystallise fees best-effort via `try/catch`
+    ///      (H3). A fee-mint can revert on the vault's `whenNotPaused` / depositor-whitelist gates;
+    ///      isolating it in an external call lets a failure roll back ONLY the crystallise (HWM +
+    ///      `lastFeeAccrualTimestamp` unchanged → fee defers) while redeem proceeds. Gated to
+    ///      `address(this)`; runs inside redeem's `nonReentrant` scope (not itself guarded), so it
+    ///      adds no reentrancy surface.
+    function crystallizeFeesSelf(uint256 navPre) external {
+        if (msg.sender != address(this)) revert OnlySelf();
+        _crystallizeFees(navPre);
+    }
+
     /// @notice Oracle-priced deposit: mint vault shares proportional to current NAV. Ordering is
     ///         load-bearing (phantom-fee fix): crystallise fees on the PRE-deposit NAV (fail-closed)
     ///         BEFORE pulling USDC, then mint via the ERC-4626 virtual-offset formula. Deposited USDC
@@ -453,19 +501,28 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     ///         `vault.approve(strategy, shares)` first (shares are pulled via `safeTransferFrom`).
     ///         Oracle-free guarantee (§7): a best-effort crystallise passes navPre=0 on oracle outage
     ///         (no fees, redeem unblocked); the fraction denominator is fixed once before the burn.
+    ///
+    ///         The crystallise is FULLY best-effort (H3): it runs through the self-only
+    ///         `crystallizeFeesSelf` wrapper under `try/catch`, so even a fee-share MINT failure
+    ///         (vault paused, or `feeRecipient` un-whitelisted on a closed-deposit config) rolls back
+    ///         only the crystallise — HWM + `lastFeeAccrualTimestamp` are unchanged, the fee DEFERS to
+    ///         the next successful crystallise, and redeem ALWAYS proceeds. This preserves the
+    ///         pause-immune-redeem + §7 always-available-exit invariants (the sole exit of an
+    ///         indefinite proposal can never be bricked by a fee-mint gate).
     /// @param shares       Vault shares to redeem (12dp).
     /// @param minAssetsOut Minimum USDC out (aggregate slippage guard).
     function redeem(uint256 shares, uint256 minAssetsOut) external nonReentrant returns (uint256 assetsOut) {
         if (_state != State.Executed) revert NotExecuted();
 
-        // 1. Best-effort crystallise: oracle outage → navPre=0 → no fees → proceed.
+        // 1. Best-effort crystallise: oracle outage → navPre=0 → no fees; a fee-mint revert is
+        //    swallowed (fee defers) so redeem is never bricked by the vault's mint gates (H3).
         uint256 navPre;
         try this.nav() returns (uint256 navNow) {
             navPre = navNow;
         } catch {
             navPre = 0;
         }
-        _crystallizeFees(navPre);
+        try this.crystallizeFeesSelf(navPre) {} catch {}
 
         // 2. Fix the fraction denominator ONCE before the burn (totalSupply is stable here).
         address vault_ = vault();

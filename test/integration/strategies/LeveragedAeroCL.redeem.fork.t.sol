@@ -27,6 +27,11 @@ contract MockVaultForRedeem {
         totalSupply = initialShares;
     }
 
+    /// @dev L7: strategy reads vault().asset() at init — must equal the configured USDC.
+    function asset() external pure returns (address) {
+        return BaseAddresses.USDC;
+    }
+
     function approve(address spender, uint256 amount) external returns (bool) {
         allowance[msg.sender][spender] = amount;
         return true;
@@ -44,6 +49,49 @@ contract MockVaultForRedeem {
     function strategyMint(address to, uint256 shares) external {
         balanceOf[to] += shares;
         totalSupply += shares;
+    }
+
+    function strategyBurn(uint256 shares) external {
+        require(balanceOf[msg.sender] >= shares, "insufficient balance");
+        balanceOf[msg.sender] -= shares;
+        totalSupply -= shares;
+    }
+}
+
+/// @dev H3 harness: identical to MockVaultForRedeem but every `strategyMint` REVERTS — models a
+///      paused SyndicateVault (or an un-whitelisted feeRecipient on a closed-deposit config). The
+///      redeem path (transferFrom / strategyBurn) still works, so a redeem must succeed despite the
+///      fee-share mint being rejected.
+contract MockVaultMintReverts {
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+    uint256 public totalSupply;
+
+    constructor(address initialHolder, uint256 initialShares) {
+        balanceOf[initialHolder] = initialShares;
+        totalSupply = initialShares;
+    }
+
+    function asset() external pure returns (address) {
+        return BaseAddresses.USDC;
+    }
+
+    function approve(address spender, uint256 amount) external returns (bool) {
+        allowance[msg.sender][spender] = amount;
+        return true;
+    }
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        require(allowance[from][msg.sender] >= amount, "ERC20InsufficientAllowance");
+        allowance[from][msg.sender] -= amount;
+        require(balanceOf[from] >= amount, "ERC20InsufficientBalance");
+        balanceOf[from] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+
+    function strategyMint(address, uint256) external pure {
+        revert("EnforcedPause"); // models whenNotPaused / depositor-whitelist gate on strategyMint
     }
 
     function strategyBurn(uint256 shares) external {
@@ -305,6 +353,74 @@ contract LeveragedAeroCLRedeemFork is LeveragedAeroForkBase {
             0,
             "WETH debt not cleared"
         );
+
+        vm.clearMockedCalls();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Test 2b: H3 — redeem survives a fee-mint failure (paused / un-whitelisted vault)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @dev Re-mock the 3 Chainlink price feeds with a fresh `updatedAt == block.timestamp` (keeping
+    ///      their real answers) so nav() stays oracle-valid after a forward warp — lets the
+    ///      crystallise compute a nonzero fee whose MINT is the thing we want to fail.
+    function _refreshPriceFeeds() internal {
+        address[3] memory feeds =
+            [BaseAddresses.CHAINLINK_BTC_USD, BaseAddresses.CHAINLINK_ETH_USD, BaseAddresses.CHAINLINK_USDC_USD];
+        uint256 ts = vm.getBlockTimestamp();
+        for (uint256 i; i < feeds.length; i++) {
+            (uint80 rid, int256 answer,,,) = IAggregatorV3Min(feeds[i]).latestRoundData();
+            vm.mockCall(feeds[i], abi.encodeWithSignature("latestRoundData()"), abi.encode(rid, answer, ts, ts, rid));
+        }
+    }
+
+    /// @notice H3 (fund-trap fix): redeem MUST succeed even when the vault rejects the fee-share mint
+    ///         (paused vault / un-whitelisted feeRecipient) with a management fee owed. The
+    ///         crystallise runs best-effort via `try this.crystallizeFeesSelf() {} catch {}`, so the
+    ///         mint revert is swallowed, the fee defers (HWM + lastFeeAccrualTimestamp unchanged), and
+    ///         the sole exit of an indefinite proposal stays open. Pre-H3 this redeem reverted.
+    function test_redeem_succeedsWhenFeeMintReverts_paused() public {
+        if (_skip) return;
+
+        // Fresh strategy whose vault rejects every strategyMint (models whenNotPaused / whitelist).
+        MockVaultMintReverts pausedVault = new MockVaultMintReverts(depositorA, DEPOSITOR_A_SHARES);
+        address template = address(new LeveragedAerodromeCLStrategy());
+        LeveragedAerodromeCLStrategy strat = LeveragedAerodromeCLStrategy(payable(Clones.clone(template)));
+        strat.initialize(address(pausedVault), proposer, abi.encode(_buildInitParams()));
+        _fundUSDC(address(strat), PRINCIPAL);
+        vm.prank(address(pausedVault));
+        strat.execute();
+
+        // Accrue a nonzero management fee, then refresh feeds so nav() (hence navPre) is valid → the
+        // crystallise computes feeShares > 0 → strategyMint(feeRecipient) is called → reverts.
+        vm.warp(vm.getBlockTimestamp() + 7 days);
+        _refreshPriceFeeds();
+
+        // The vault really does reject fee-share mints (the gate under test).
+        vm.expectRevert();
+        pausedVault.strategyMint(feeRecipient, 1);
+
+        uint256 lastAccrualBefore = strat.layout().lastFeeAccrualTimestamp;
+        uint256 hwmBefore = strat.layout().hwmPerShare;
+
+        // depositorA redeems ALL shares — must SUCCEED despite the mint gate.
+        uint256 sharesA = pausedVault.balanceOf(depositorA);
+        _fundUSDC(address(strat), 2_000e6); // IL / interest buffer for the full unwind
+        vm.startPrank(depositorA);
+        pausedVault.approve(address(strat), sharesA);
+        uint256 assetsOut = strat.redeem(sharesA, 0);
+        vm.stopPrank();
+
+        assertGt(assetsOut, 0, "redeem returned 0 - bricked by fee-mint gate (H3 regression)");
+        assertEq(IERC20(BaseAddresses.USDC).balanceOf(depositorA), assetsOut, "A USDC mismatch");
+        // Fee DEFERRED: feeRecipient minted nothing and the whole crystallise rolled back.
+        assertEq(pausedVault.balanceOf(feeRecipient), 0, "fee minted despite paused vault");
+        assertEq(
+            strat.layout().lastFeeAccrualTimestamp,
+            lastAccrualBefore,
+            "accrual clock advanced - crystallise not rolled back"
+        );
+        assertEq(strat.layout().hwmPerShare, hwmBefore, "HWM advanced - crystallise not rolled back");
 
         vm.clearMockedCalls();
     }

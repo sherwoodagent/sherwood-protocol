@@ -51,6 +51,10 @@ contract LeveragedAeroCLDeployFork is LeveragedAeroForkBase {
         fakeProposer = address(this);
         feeRecipient = makeAddr("feeRecipient");
 
+        // L7: _initialize now reads vault().asset(); the bare fakeVault has no code, so make it
+        // answer asset() == USDC to satisfy the new asset-wiring check.
+        vm.mockCall(fakeVault, abi.encodeWithSignature("asset()"), abi.encode(USDC));
+
         // Deploy the strategy template (constructor locks _initialized on the template itself).
         address template = address(new LeveragedAerodromeCLStrategy());
 
