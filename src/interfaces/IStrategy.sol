@@ -60,4 +60,8 @@ interface IStrategy {
     ///         (BaseStrategy) returns an empty array (queue-only / Lane B);
     ///         strategies with on-chain-priceable positions override it.
     function positions() external view returns (Position[] memory);
+
+    /// @notice true ⇒ the strategy self-manages fees; the governor skips settle-fee
+    ///         distribution for its proposals.
+    function selfManagesFees() external view returns (bool);
 }

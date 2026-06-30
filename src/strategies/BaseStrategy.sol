@@ -150,6 +150,12 @@ abstract contract BaseStrategy is IStrategy {
         return new Position[](0);
     }
 
+    /// @inheritdoc IStrategy
+    /// @dev Default: governor distributes settle-fees. Self-fee'd strategies override.
+    function selfManagesFees() external view virtual returns (bool) {
+        return false;
+    }
+
     // ── Internal helpers ──
 
     /// @notice Pull tokens from the vault into this strategy

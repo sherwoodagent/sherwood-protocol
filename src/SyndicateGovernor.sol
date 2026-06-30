@@ -4,6 +4,7 @@ pragma solidity 0.8.28;
 import {ISyndicateGovernor} from "./interfaces/ISyndicateGovernor.sol";
 import {ISyndicateVault} from "./interfaces/ISyndicateVault.sol";
 import {IGuardianRegistry} from "./interfaces/IGuardianRegistry.sol";
+import {IStrategy} from "./interfaces/IStrategy.sol";
 import {GovernorParameters} from "./GovernorParameters.sol";
 import {GovernorEmergency} from "./GovernorEmergency.sol";
 import {BatchExecutorLib} from "./BatchExecutorLib.sol";
@@ -63,10 +64,13 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
     mapping(uint256 => CoProposer[]) private _coProposers;
 
     /// @notice Proposal ID -> co-proposer address -> approved
-    mapping(uint256 => mapping(address => bool)) public coProposerApprovals;
+    /// @dev `internal` (no auto-getter): read only within the governor; not in
+    ///      ISyndicateGovernor / cli / app / subgraph / tests. Bytecode lever.
+    mapping(uint256 => mapping(address => bool)) internal coProposerApprovals;
 
     /// @notice Proposal ID -> deadline for co-proposer consent
-    mapping(uint256 => uint256) public collaborationDeadline;
+    /// @dev `internal` (no auto-getter): governor-only read. Bytecode lever.
+    mapping(uint256 => uint256) internal collaborationDeadline;
 
     /// @notice Simple reentrancy lock for execute/settle entrypoints
     uint256 private _reentrancyStatus;
@@ -491,7 +495,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
     ///      ~20 bytes saved.
     function emergencyCancel(uint256 proposalId) external {
         StrategyProposal storage proposal = _proposals[proposalId];
-        if (msg.sender != OwnableUpgradeable(proposal.vault).owner()) revert NotVaultOwner();
+        _requireVaultOwner(proposal.vault);
         ProposalState s = _resolveState(proposal);
         // PR #324 review comment 4454151855: BOTH `Draft` and `Pending`
         // increment `openProposalCount` (Sherlock #8 binds Draft at propose
@@ -535,7 +539,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
     ///      ~20 bytes saved.
     function vetoProposal(uint256 proposalId) external {
         StrategyProposal storage proposal = _proposals[proposalId];
-        if (msg.sender != OwnableUpgradeable(proposal.vault).owner()) revert NotVaultOwner();
+        _requireVaultOwner(proposal.vault);
         if (_resolveState(proposal) != ProposalState.Pending) revert ProposalNotCancellable();
         proposal.state = ProposalState.Rejected;
         // `_activeProposal` is unset during Pending (only set by execute).
@@ -1070,8 +1074,18 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
 
         uint256 totalFee = 0;
         if (pnl > 0) {
-            (agentFee, totalFee) =
-                _distributeFees(proposalId, vault, asset, proposal.proposer, proposal.performanceFeeBps, uint256(pnl));
+            // H2/M4: a self-fee'd strategy (custody model — LPs deposit/redeem into the
+            // strategy, shares minted/burned on the vault) crystallises its own fees; the
+            // governor's float-delta PnL would misread net deposits as profit and double-
+            // charge. Such strategies opt out of ALL governor settle-fees. The
+            // `strat != address(0)` guard covers Lane-B-only proposals.
+            address strat = proposal.strategy;
+            bool selfFee = strat != address(0) && IStrategy(strat).selfManagesFees();
+            if (!selfFee) {
+                (agentFee, totalFee) = _distributeFees(
+                    proposalId, vault, asset, proposal.proposer, proposal.performanceFeeBps, uint256(pnl)
+                );
+            }
         }
 
         // V2 live-NAV: stamp the realized settle price into the request queue so

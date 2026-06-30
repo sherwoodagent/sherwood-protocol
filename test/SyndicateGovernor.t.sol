@@ -12,6 +12,8 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "./mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "./mocks/MockRegistryMinimal.sol";
+import {MockStrategyAdapter} from "./mocks/MockStrategyAdapter.sol";
+import {IStrategy} from "../src/interfaces/IStrategy.sol";
 
 contract SyndicateGovernorTest is Test {
     SyndicateGovernor public governor;
@@ -167,6 +169,35 @@ contract SyndicateGovernorTest is Test {
         proposalId = _createApprovedProposal(perfFeeBps, duration);
         governor.executeProposal(proposalId);
         // MS-H3: proposer self-settle requires `MIN_STRATEGY_DURATION_BEFORE_SELF_SETTLE` (1h) elapsed.
+        vm.warp(vm.getBlockTimestamp() + 1 hours + 1);
+    }
+
+    /// @dev As `_createAndExecuteProposal` but pins a concrete `strategy` address on the proposal
+    ///      (the default helpers use address(0) = Lane-B-only). Used by the H2/M4 opt-out tests,
+    ///      which need a non-zero strategy whose `selfManagesFees()` the governor reads at settle.
+    function _createAndExecuteProposalWithStrategy(uint256 perfFeeBps, uint256 duration, address strategy)
+        internal
+        returns (uint256 proposalId)
+    {
+        vm.prank(owner);
+        vault.setAgentFeeBps(perfFeeBps);
+        vm.prank(agent);
+        proposalId = governor.propose(
+            address(vault),
+            strategy,
+            "ipfs://test",
+            duration,
+            _simpleExecuteCalls(),
+            _simpleSettlementCalls(),
+            _emptyCoProposers()
+        );
+        vm.warp(block.timestamp + 1);
+        vm.prank(lp1);
+        governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
+        vm.prank(lp2);
+        governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
+        vm.warp(block.timestamp + VOTING_PERIOD + 1);
+        governor.executeProposal(proposalId);
         vm.warp(vm.getBlockTimestamp() + 1 hours + 1);
     }
 
@@ -517,6 +548,51 @@ contract SyndicateGovernorTest is Test {
         // Protocol fee: 1% of 10k = 100. Agent fee: 15% of 9900 = 1485. Mgmt: 0.5% of 8415 = 42.075
         assertEq(usdc.balanceOf(agent), agentBalBefore + 1_485e6);
         assertEq(usdc.balanceOf(owner), ownerBalBefore + 100e6 + 42_075000);
+    }
+
+    // ==================== H2/M4: self-managed-fee opt-out ====================
+
+    /// @notice H2/M4: a strategy whose `selfManagesFees()` returns true opts out of ALL governor
+    ///         settle-fees. Despite nonzero protocol (1%), performance (15%), and management (0.5%)
+    ///         fees and a 10k profit, settle pays ZERO to protocol/agent/owner — the strategy already
+    ///         crystallised its own fees. Prevents the custody-model double-charge where the governor's
+    ///         float-delta PnL misreads net deposits as profit.
+    function test_settlement_selfManagedStrategy_chargesZeroGovernorFees() public {
+        MockStrategyAdapter strat = new MockStrategyAdapter();
+        vm.mockCall(address(strat), abi.encodeWithSelector(IStrategy.selfManagesFees.selector), abi.encode(true));
+
+        uint256 proposalId = _createAndExecuteProposalWithStrategy(1500, 7 days, address(strat));
+        usdc.mint(address(vault), 10_000e6); // simulate profit (float delta)
+
+        uint256 agentBalBefore = usdc.balanceOf(agent);
+        uint256 ownerBalBefore = usdc.balanceOf(owner);
+
+        vm.prank(agent);
+        governor.settleProposal(proposalId);
+
+        // Opt-out: agent (proposer perf fee) AND owner (protocol + mgmt fee) are unchanged by settle.
+        assertEq(usdc.balanceOf(agent), agentBalBefore, "self-fee'd: agent perf fee skipped");
+        assertEq(usdc.balanceOf(owner), ownerBalBefore, "self-fee'd: protocol + mgmt fee skipped");
+    }
+
+    /// @notice Control: a strategy with `selfManagesFees()==false` (the BaseStrategy default) still
+    ///         has governor fees distributed normally — proving the opt-out is driven by the FLAG,
+    ///         not merely by a non-zero `strategy` on the proposal. Same fee math as the address(0)
+    ///         baseline `test_settlement_withProfit_agentAndManagementFee`.
+    function test_settlement_nonSelfManagedStrategy_chargesNormalFees() public {
+        MockStrategyAdapter strat = new MockStrategyAdapter(); // selfManagesFees() == false
+        uint256 proposalId = _createAndExecuteProposalWithStrategy(1500, 7 days, address(strat));
+        usdc.mint(address(vault), 10_000e6);
+
+        uint256 agentBalBefore = usdc.balanceOf(agent);
+        uint256 ownerBalBefore = usdc.balanceOf(owner);
+
+        vm.prank(agent);
+        governor.settleProposal(proposalId);
+
+        // Identical to the baseline: protocol 1% of 10k = 100; agent 15% of 9900 = 1485; mgmt 42.075.
+        assertEq(usdc.balanceOf(agent), agentBalBefore + 1_485e6, "non-self-fee'd: agent fee charged");
+        assertEq(usdc.balanceOf(owner), ownerBalBefore + 100e6 + 42_075000, "non-self-fee'd: protocol + mgmt charged");
     }
 
     /// @notice H2: the snapshot is clamped to `maxPerformanceFeeBps` at propose,

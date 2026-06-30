@@ -43,6 +43,12 @@ abstract contract GovernorEmergency is ISyndicateGovernor {
         _emergencyReentrancyLeave();
     }
 
+    /// @dev Shared vault-owner gate. Reachable from SyndicateGovernor (which inherits
+    ///      this abstract). Bytecode lever: folds 6 identical inline copies into one.
+    function _requireVaultOwner(address vault) internal view {
+        if (msg.sender != OwnableUpgradeable(vault).owner()) revert NotVaultOwner();
+    }
+
     // ── Emergency settle lifecycle ──
 
     /// @notice Rescues a proposal stuck in Executed state past its duration by
@@ -50,7 +56,7 @@ abstract contract GovernorEmergency is ISyndicateGovernor {
     /// @dev Does NOT require active owner stake — the calls were already voted on.
     function unstick(uint256 proposalId) external emergencyNonReentrant {
         StrategyProposal storage p = _getProposal(proposalId);
-        if (msg.sender != OwnableUpgradeable(p.vault).owner()) revert NotVaultOwner();
+        _requireVaultOwner(p.vault);
         if (p.state != ProposalState.Executed) revert ProposalNotExecuted();
         if (block.timestamp < p.executedAt + p.strategyDuration) revert StrategyDurationNotElapsed();
         ISyndicateVault(p.vault).executeGovernorBatch(_getSettlementCalls(proposalId));
@@ -67,7 +73,7 @@ abstract contract GovernorEmergency is ISyndicateGovernor {
     ///      those checks. ~20 bytes saved.
     function emergencySettleWithCalls(uint256 proposalId, BatchExecutorLib.Call[] calldata calls) external {
         StrategyProposal storage p = _getProposal(proposalId);
-        if (msg.sender != OwnableUpgradeable(p.vault).owner()) revert NotVaultOwner();
+        _requireVaultOwner(p.vault);
         if (p.state != ProposalState.Executed) revert ProposalNotExecuted();
         if (block.timestamp < p.executedAt + p.strategyDuration) revert StrategyDurationNotElapsed();
 
@@ -88,7 +94,7 @@ abstract contract GovernorEmergency is ISyndicateGovernor {
     ///      own state machine guards against ill-timed reentry. ~20 bytes saved.
     function cancelEmergencySettle(uint256 proposalId) external {
         StrategyProposal storage p = _getProposal(proposalId);
-        if (msg.sender != OwnableUpgradeable(p.vault).owner()) revert NotVaultOwner();
+        _requireVaultOwner(p.vault);
         if (p.state != ProposalState.Executed) revert ProposalNotExecuted();
         IGuardianRegistry reg = _getRegistry();
         if (!reg.isEmergencyOpen(proposalId)) revert EmergencyNotProposed();
@@ -100,7 +106,7 @@ abstract contract GovernorEmergency is ISyndicateGovernor {
     ///         Registry returns the stored calls; governor executes them on the vault.
     function finalizeEmergencySettle(uint256 proposalId) external emergencyNonReentrant {
         StrategyProposal storage p = _getProposal(proposalId);
-        if (msg.sender != OwnableUpgradeable(p.vault).owner()) revert NotVaultOwner();
+        _requireVaultOwner(p.vault);
         if (p.state != ProposalState.Executed) revert ProposalNotExecuted();
 
         IGuardianRegistry reg = _getRegistry();

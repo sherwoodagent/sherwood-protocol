@@ -342,6 +342,15 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         pos[0] = Position({venue: $.pool, kind: POSITION_KIND, ref: abi.encode($.gauge, $.mUsdc, $.mCbBTC, $.mWeth)});
     }
 
+    /// @inheritdoc IStrategy
+    /// @dev Self-fee'd: this strategy crystallises management + HWM performance fees against its
+    ///      own NAV (custody model: LPs deposit/redeem into the strategy, shares minted/burned on
+    ///      the vault). The governor MUST skip settle-fee distribution — its float-delta PnL would
+    ///      misread net deposits as profit and double-charge fees already taken via crystallize.
+    function selfManagesFees() external pure override returns (bool) {
+        return true;
+    }
+
     // ── Execute / settle ──
 
     /// @notice Open the levered cbBTC/WETH CL position: supply USDC → enterMarkets → borrow

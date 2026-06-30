@@ -38,6 +38,12 @@ contract MockStrategyAdapter is IStrategy {
         return new Position[](0);
     }
 
+    /// @notice H2/M4 capability flag mock — default `false` (governor distributes
+    ///         settle-fees). Tests that need `true` can override via `vm.mockCall`.
+    function selfManagesFees() external pure returns (bool) {
+        return false;
+    }
+
     /// @notice Sherlock #37 capability flag mock — default `false` matches
     ///         the strategy templates that haven't implemented
     ///         `_onLiveWithdraw`. Tests that need `true` can override via
