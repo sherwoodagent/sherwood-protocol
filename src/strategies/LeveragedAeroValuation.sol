@@ -20,10 +20,15 @@ import {IMoonwellMarket} from "../interfaces/IMoonwellMarket.sol";
 ///         manipulated price can only *deny* a deposit, never mint cheap shares.
 ///
 ///         ```
-///         NAV = floatVault + idleStrategy + collateral + clLegs + idleLegs − debt  (USDC, 6dp)
+///         NAV = idleStrategy + collateral + clLegs + idleLegs − debt  (USDC, 6dp)
 ///         ```
 ///
-///         - `floatVault`    = `USDC.balanceOf(vault)`        (face, 6dp)
+///         The strategy prices/redeems against strategy-controlled value only; any vault float
+///         (normally 0 — `execute` sends the vault's USDC to the strategy, so float is reachable
+///         only via a direct donation) is EXCLUDED from NAV and distributed to all shares at
+///         settle. This keeps deposit pricing and redeem consistent: both see the same
+///         strategy-controlled book (M2).
+///
 ///         - `idleStrategy`  = `USDC.balanceOf(strategy)`     (face, 6dp)
 ///         - `collateral`    = Moonwell USDC supply, `mUSDC.balanceOf(strategy) *
 ///                             exchangeRateStored / 1e18`     (face, 6dp; scaling copied
@@ -48,9 +53,10 @@ library LeveragedAeroValuation {
     error CalmGateBreached();
     /// @notice Net equity is ≤ 0 — minting is fail-closed (no shares at/under water).
     error NonPositiveEquity();
-    /// @notice The oracle-implied sqrtP fell outside the valid pool sqrtP range
-    ///         `[MIN_SQRT_RATIO, MAX_SQRT_RATIO)` — fail-closed rather than feed a
-    ///         garbage/out-of-range price into the leg split.
+    /// @notice The oracle-implied sqrtP fell below the valid pool sqrtP range (`< MIN_SQRT_RATIO`)
+    ///         — fail-closed rather than feed a sub-range price into the leg split. The upper end
+    ///         of the range needs no explicit check: `Math.mulDiv` overflow-reverts before an
+    ///         above-range sqrtP can be produced (see `oracleSqrtPriceX96`).
     error OracleSqrtPriceOutOfRange();
     /// @notice A Config value is invalid (e.g. `twapWindow == 0` would divide-by-zero the
     ///         calm-gate) — fail-closed with a named error instead of an opaque arithmetic panic.
@@ -69,7 +75,7 @@ library LeveragedAeroValuation {
     ///      reading `pool.token0()`/`token1()`, so leg pricing is robust to pool ordering.
     struct Config {
         address usdc; // USDC (6dp) — the NAV unit of account
-        address vault; // SyndicateVault — holds float USDC
+        address vault; // SyndicateVault (set by the strategy/manager Config builders; NAV excludes vault float — M2)
         address mUsdc; // Moonwell USDC market (collateral)
         address cbBTCMarket; // Moonwell cbBTC borrow market
         address wethMarket; // Moonwell WETH borrow market
@@ -108,9 +114,8 @@ library LeveragedAeroValuation {
         // USDC peg price (8dp) — read once; reused to convert every USD term to USDC face.
         uint256 pUsdc = _readUsd8(c, c.usdcFeed);
 
-        // --- positive face terms ---
-        uint256 assets = IERC20(c.usdc).balanceOf(c.vault); // floatVault (6dp)
-        assets += IERC20(c.usdc).balanceOf(strategy); // idleStrategy (6dp)
+        // --- positive face terms (strategy-controlled only; vault float excluded — M2) ---
+        uint256 assets = IERC20(c.usdc).balanceOf(strategy); // idleStrategy (6dp)
         assets += _collateralUsdc(c, strategy); // Moonwell USDC collateral (6dp)
 
         // --- CL legs (oracle-implied sqrtP) ---
@@ -145,13 +150,16 @@ library LeveragedAeroValuation {
     /// @return sqrtPriceX96 `sqrt(rawPrice1per0) * 2^96`, where the raw (smallest-unit) price
     ///         `token1/token0 = p0 * 10^d1 / (p1 * 10^d0)`.
     /// @dev Overflow / range (fail-closed): `Math.mulDiv` carries the 512-bit
-    ///      `p0*10^d1 * 2^192` intermediate. Two range guards make this fail-closed for the
-    ///      generic/reusable case (a wrong sqrtP would let `getAmountsForLiquidity`, which is
-    ///      itself unbounded, mis-split the legs — a fail-OPEN mis-mint):
-    ///        - HIGH out-of-range: for any `raw ≳ 2^128` the `mulDiv` result exceeds
-    ///          `type(uint256).max` and `mulDiv` itself reverts (panic 0x11) — so an absurdly
-    ///          large implied price can never reach the cast.
-    ///        - LOW out-of-range: a tiny-but-nonzero `raw` yields a small `sqrt(ratioX192)`
+    ///      `p0*10^d1 * 2^192` intermediate. Only ONE bound is load-bearing — the LOW one —
+    ///      because the HIGH bound is unreachable by construction (a wrong sqrtP would let
+    ///      `getAmountsForLiquidity`, which is itself unbounded, mis-split the legs — a fail-OPEN
+    ///      mis-mint, so the reachable bound must still fail closed):
+    ///        - HIGH bound is UNREACHABLE, so there is no high-side guard: `Math.mulDiv(num, 2^192,
+    ///          den)` itself reverts (panic 0x11) once `raw = num/den ≳ 2^64`, since `raw * 2^192`
+    ///          then exceeds `type(uint256).max`. The largest representable `ratioX192 ≈ 2^256`
+    ///          therefore yields `s = sqrt(ratioX192) ≤ 2^128`, far below `MAX_SQRT_RATIO (~2^160)`
+    ///          — `s >= MAX_SQRT_RATIO` can never hold, so a high-side check would be dead code.
+    ///        - LOW bound is LOAD-BEARING: a tiny-but-nonzero `raw` yields a small `sqrt(ratioX192)`
     ///          that is `< MIN_SQRT_RATIO` yet nonzero — `uint160(...)` does NOT truncate it,
     ///          so without the explicit check below it would slip through as a valid-looking
     ///          out-of-range price. The bound catches it.
@@ -167,8 +175,9 @@ library LeveragedAeroValuation {
         uint256 den = p1 * (10 ** uint256(d0));
         uint256 ratioX192 = Math.mulDiv(num, 1 << 192, den);
         uint256 s = Math.sqrt(ratioX192);
-        // Bound to a valid pool sqrtP and revert rather than truncate / pass a garbage price.
-        if (s < TickMath.MIN_SQRT_RATIO || s >= TickMath.MAX_SQRT_RATIO) revert OracleSqrtPriceOutOfRange();
+        // LOW-bound guard only — the HIGH bound is unreachable (mulDiv overflow-reverts first; see
+        // @dev). Revert rather than pass a nonzero sub-range price that `uint160(...)` won't truncate.
+        if (s < TickMath.MIN_SQRT_RATIO) revert OracleSqrtPriceOutOfRange();
         sqrtPriceX96 = uint160(s);
     }
 

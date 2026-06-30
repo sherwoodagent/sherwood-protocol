@@ -94,6 +94,11 @@ contract LeveragedAeroCLHealthTest is Test {
     function setUp() public {
         harness = new HealthHarness();
 
+        // Warp off genesis (block.timestamp would otherwise be 1) so a NONZERO, past seqStartedAt
+        // can clear the sequencer grace gate — L2 now fail-closes seqStartedAt==0, so the old
+        // genesis-timestamp + zero-startedAt setup is no longer valid.
+        vm.warp(block.timestamp + 7 days);
+
         // ── simple address slots ──
         _storeAddr(SLOT_MUSDC, MUSDC_MOCK);
         _storeAddr(SLOT_MCBBTC, MCBBTC_MOCK);
@@ -105,7 +110,7 @@ contract LeveragedAeroCLHealthTest is Test {
 
         // maxDelay = type(uint256).max — feed staleness check never fires in tests.
         vm.store(address(harness), bytes32(SLOT_MAX_DELAY), bytes32(type(uint256).max));
-        // gracePeriod = 0 — seqStartedAt=0, block.timestamp(1)-0=1 > 0 passes the gate.
+        // gracePeriod = 0 — with seqStartedAt=1 (nonzero, past), block.timestamp-1 > 0 passes the gate.
         vm.store(address(harness), bytes32(SLOT_GRACE_PERIOD), bytes32(uint256(0)));
 
         // slot 16: comptroller at byte-offset 6 (bit-offset 48).
@@ -129,11 +134,12 @@ contract LeveragedAeroCLHealthTest is Test {
         );
 
         // ── default mocks (Chainlink) ──
-        // Sequencer uptime feed: answer=0 (up), seqStartedAt=0 (old enough for gracePeriod=0).
+        // Sequencer uptime feed: answer=0 (up), seqStartedAt=1 (nonzero + past → clears gracePeriod=0;
+        // L2 fail-closes a zero/invalid sequencer round).
         vm.mockCall(
             SEQFEED_MOCK,
             abi.encodeWithSelector(bytes4(keccak256("latestRoundData()"))),
-            abi.encode(uint80(1), int256(0), uint256(0), uint256(block.timestamp), uint80(1))
+            abi.encode(uint80(1), int256(0), uint256(1), uint256(block.timestamp), uint80(1))
         );
         // BTC/USD: $100 k
         vm.mockCall(

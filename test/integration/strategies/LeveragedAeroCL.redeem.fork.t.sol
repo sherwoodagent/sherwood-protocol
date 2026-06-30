@@ -293,6 +293,54 @@ contract LeveragedAeroCLRedeemFork is LeveragedAeroForkBase {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // Test 1b: M2 — NAV excludes vault float (donation must not move nav / short redeemer)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice M2: `netEquityUsdc` values strategy-controlled assets only — it no longer adds
+    ///         `USDC.balanceOf(vault)`. So a USDC donation straight to the vault must NOT move
+    ///         `nav()`, the strategy redeem path must never pull that float, and a partial redeem
+    ///         still pays exactly f·nav — the redeemer isn't shorted the donation and a would-be
+    ///         depositor isn't overcharged for it. Pre-M2 the float term inflated NAV → redeemers
+    ///         underpaid / depositors overcharged whenever float > 0.
+    function test_nav_excludesVaultFloat() public {
+        if (_skip) return;
+
+        // Second LP so the partial redeem leaves a stayer (depositorA holds the initial shares).
+        uint256 depositB = 10_000e6;
+        _fundUSDC(depositorB, depositB);
+        vm.startPrank(depositorB);
+        IERC20(BaseAddresses.USDC).approve(address(strategy), depositB);
+        uint256 sharesB = strategy.deposit(depositB, 0);
+        vm.stopPrank();
+        assertGt(sharesB, 0, "B got 0 shares");
+
+        uint256 navBefore = strategy.nav();
+        uint256 supplyBefore = mockVault.totalSupply();
+        assertGt(navBefore, 0, "nav should be positive");
+
+        // Donate USDC straight to the vault (float > 0). Pre-M2 this inflated nav; post-M2 nav is
+        // strategy-controlled only, so the donation must leave nav() bit-for-bit unchanged.
+        uint256 donation = 5_000e6;
+        _fundUSDC(address(mockVault), donation);
+        assertEq(IERC20(BaseAddresses.USDC).balanceOf(address(mockVault)), donation, "vault not funded");
+        assertEq(strategy.nav(), navBefore, "nav moved on vault-float donation (M2: float must be excluded)");
+
+        // A partial redeem still pays ~f·nav (strategy-controlled), and never taps the vault float.
+        uint256 fairShare = (navBefore * sharesB) / supplyBefore;
+        vm.startPrank(depositorB);
+        mockVault.approve(address(strategy), sharesB);
+        uint256 assetsOut = strategy.redeem(sharesB, 0);
+        vm.stopPrank();
+
+        // Redeemer paid f·nav within realized-exit slippage (not shorted the float, not over-paid by it).
+        assertApproxEqRel(assetsOut, fairShare, 0.03e18, "redeem != f*nav (float-exclusion broken)");
+        // The donated float is untouched by the strategy redeem path — it stays in the vault.
+        assertEq(
+            IERC20(BaseAddresses.USDC).balanceOf(address(mockVault)), donation, "vault float was touched by redeem"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // Test 2: redeem succeeds while oracle is stale
     // ─────────────────────────────────────────────────────────────────────────
 

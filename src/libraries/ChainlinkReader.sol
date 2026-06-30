@@ -18,10 +18,13 @@ library ChainlinkReader {
     {
         (, int256 up, uint256 seqStartedAt,,) = IAggregatorV3(sequencerUptimeFeed).latestRoundData();
         if (up != 0) revert SequencerDown();
-        // A future seqStartedAt (misconfigured feed / L2 clock skew) means the sequencer
-        // (re)started "in the future" → grace definitely not over. Guard the subtraction so a
-        // caller catching the named error gets GracePeriodNotOver, not an unhandled underflow panic.
-        if (seqStartedAt > block.timestamp || block.timestamp - seqStartedAt <= gracePeriod) {
+        // `seqStartedAt == 0` is an uninitialized / invalid sequencer round — fail closed (mirrors
+        // the price feed's `startedAt == 0` guard below) instead of treating round-0 as a valid
+        // restart time that `block.timestamp - 0 > gracePeriod` would otherwise wave through as a
+        // healthy sequencer. A future seqStartedAt (misconfigured feed / L2 clock skew) means the
+        // sequencer (re)started "in the future" → grace definitely not over. Guard the subtraction
+        // so a caller catching the named error gets GracePeriodNotOver, not an underflow panic.
+        if (seqStartedAt == 0 || seqStartedAt > block.timestamp || block.timestamp - seqStartedAt <= gracePeriod) {
             revert GracePeriodNotOver();
         }
 

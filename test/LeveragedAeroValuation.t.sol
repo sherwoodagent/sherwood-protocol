@@ -282,6 +282,18 @@ contract LeveragedAeroValuationTest is Test {
         harness.readUsd(address(feed), address(s), 26 hours, 3600);
     }
 
+    /// @dev [L2 regression] seqStartedAt == 0 (uninitialized / invalid sequencer round) must fail
+    ///      closed with the NAMED GracePeriodNotOver — mirroring the price feed's startedAt==0
+    ///      guard. Pre-fix this slipped through as fail-OPEN: `block.timestamp - 0` is a huge age
+    ///      > gracePeriod, so neither old condition fired and an invalid round priced as healthy.
+    function test_readUsd_zeroSeqStartedAt_revertsGracePeriod() public {
+        MockAggregatorV3 feed = new MockAggregatorV3(8, 65_000e8);
+        MockAggregatorV3 s = new MockAggregatorV3(0, 0); // sequencer up (answer 0)
+        s.setStartedAt(0); // uninitialized / invalid round
+        vm.expectRevert(ChainlinkReader.GracePeriodNotOver.selector);
+        harness.readUsd(address(feed), address(s), 26 hours, 3600);
+    }
+
     /// @dev [5 regression] A future feed updatedAt (L2/vnet clock lag) is the freshest possible
     ///      answer → age 0 → NOT stale; must not panic 0x11 on `block.timestamp - updatedAt`.
     function test_readUsd_futureUpdatedAt_treatedFresh() public {
@@ -296,16 +308,17 @@ contract LeveragedAeroValuationTest is Test {
     // --- netEquity: face terms only (liquidity = 0) ---
 
     /// @dev Master-plan vector: collateral 100k USDC, debt 0.5 cbBTC@65k + 10 WETH@3k = 62.5k,
-    ///      idle 5k, float 1k, liquidity 0 ⇒ nav = 1k + 5k + 100k − 62.5k = 43.5k USDC.
+    ///      idle 5k, liquidity 0 ⇒ nav = 5k + 100k − 62.5k = 42.5k USDC. The 1k vault float set
+    ///      below is EXCLUDED from NAV (M2): the strategy values strategy-controlled assets only.
     function test_netEquity_faceTermsOnly() public {
         _setCollateralUsdc(100_000e6);
         _setDebt(0.5e8, 10e18);
         _setIdle(5_000e6);
-        _setFloat(1_000e6);
+        _setFloat(1_000e6); // donated to the vault — must NOT count toward NAV (M2)
         _setCalm();
 
         uint256 nav = LeveragedAeroValuation.netEquityUsdc(_cfg(), strat, 0, 0, 0);
-        assertApproxEqAbs(nav, 43_500e6, 1e6);
+        assertApproxEqAbs(nav, 42_500e6, 1e6);
     }
 
     /// @dev [6 regression] twapWindow == 0 fails closed with the named InvalidConfig — not a
@@ -411,9 +424,10 @@ contract LeveragedAeroValuationTest is Test {
     /// @dev Fail-closed on an out-of-range implied sqrtP. The cast `uint160(s)` does NOT revert
     ///      on truncation (verified: uint160(2**160) == 0), so a bound check is required or an
     ///      out-of-range price would mis-split the legs (fail-OPEN). LOW side is reachable: a
-    ///      tiny raw price (d0 ≫ d1) yields a nonzero sqrtP `< MIN_SQRT_RATIO`. (HIGH side is
-    ///      already guarded — `Math.mulDiv` overflow-reverts before the cast for raw ≳ 2^128.)
-    ///      Driven through the harness so vm.expectRevert catches the internal-lib revert.
+    ///      tiny raw price (d0 ≫ d1) yields a nonzero sqrtP `< MIN_SQRT_RATIO`. (HIGH side needs
+    ///      NO guard — `Math.mulDiv` overflow-reverts before the cast for raw ≳ 2^64, so the dead
+    ///      high-side bound was removed in L10.) Driven through the harness so vm.expectRevert
+    ///      catches the internal-lib revert.
     function test_oracleSqrtP_revertsOnOutOfRangeLow() public {
         // raw = 10^-40 → sqrt(ratioX192) = 792281625 (nonzero) < MIN_SQRT_RATIO (4295128739).
         vm.expectRevert(LeveragedAeroValuation.OracleSqrtPriceOutOfRange.selector);
@@ -422,7 +436,8 @@ contract LeveragedAeroValuationTest is Test {
 
     /// @dev HIGH side: an absurdly large implied price overflows the `mulDiv` 512-bit result
     ///      and reverts (panic) before the cast — documents that the high-range fail-open the
-    ///      review flagged is already unreachable, complementing the explicit LOW-side bound.
+    ///      review flagged is UNREACHABLE (overflow at raw ≳ 2^64), which is why L10 dropped the
+    ///      dead high-side bound; the explicit LOW-side bound remains the only load-bearing guard.
     function test_oracleSqrtP_revertsOnOutOfRangeHigh() public {
         vm.expectRevert(); // arithmetic overflow inside Math.mulDiv (panic 0x11)
         valHarness.oracleSqrtPriceX96(1e8, 0, 1e8, 40);
