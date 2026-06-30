@@ -219,7 +219,9 @@ contract LeveragedAeroCLHandler is LeveragedAeroForkBase {
         deal(aeroTok, address(strategy), aero);
         uint256 pre = _safePerShare();
         vm.prank(proposer);
-        try strategy.compound(0, 0) {
+        // L8: minUsdcOut must be nonzero (ZeroMinOut floor); 1 is a near-zero floor the seeded
+        // AERO swap clears, keeping the compound→swap→redeploy path live in the invariant.
+        try strategy.compound(1, 0) {
             compoundOk++;
             _postOp("compound", pre, SLACK_COMPOUND, true);
         } catch {}

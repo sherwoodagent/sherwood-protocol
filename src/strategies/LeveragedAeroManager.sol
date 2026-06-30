@@ -66,6 +66,8 @@ library LeveragedAeroManager {
     error InsufficientLiquidity();
     error InsufficientIdle();
     error HealthyNoDeleverage();
+    error FeedDecimalsMismatch();
+    error ZeroMinOut();
 
     // ── Constants (compile-time literals, duplicated from the strategy) ──
     uint8 private constant CBBTC_DECIMALS = 8; // cbBTC is 8dp wrapped Bitcoin
@@ -122,7 +124,7 @@ library LeveragedAeroManager {
         uint16 managementFeeBps;
         uint16 performanceFeeBps;
         address feeRecipient;
-        uint256 hwmPerShare; // HWM NAV per share (USDC 6dp); 0 until first deposit
+        uint256 hwmPerShare; // HWM nav-per-share (1e18 WAD), 0 until first deposit
         uint256 lastFeeAccrualTimestamp;
     }
 
@@ -166,9 +168,9 @@ library LeveragedAeroManager {
         }
         // 5. Sweep residual WETH + cbBTC → USDC (Chainlink-bounded min-out)
         {
-            (uint256 pBTC,) = ChainlinkReader.readUsd($.cbBTCFeed, $.sequencerFeed, $.maxDelay, $.gracePeriod);
-            (uint256 pETH,) = ChainlinkReader.readUsd($.wethFeed, $.sequencerFeed, $.maxDelay, $.gracePeriod);
-            (uint256 pUsdc,) = ChainlinkReader.readUsd($.usdcFeed, $.sequencerFeed, $.maxDelay, $.gracePeriod);
+            uint256 pBTC = _readUsd8($.cbBTCFeed);
+            uint256 pETH = _readUsd8($.wethFeed);
+            uint256 pUsdc = _readUsd8($.usdcFeed);
             uint256 slip = uint256($.maxSlippageBps);
             _swapTokenToUsdc(
                 $.weth,
@@ -221,8 +223,8 @@ library LeveragedAeroManager {
             //
             // Phase 1 (oracle-free): cover IL shortfall from idle USDC via exact-output swap.
             //   When idle == 0 the calls are safe no-ops (amountInMaximum = 0 → early return).
-            if (cbShort > 0) _redeemCoverShortfall($.cbBTC, $.mCbBTC, cbShort);
-            if (wethShort > 0) _redeemCoverShortfall($.weth, $.mWeth, wethShort);
+            if (cbShort > 0) _redeemCoverShortfall($.cbBTC, $.mCbBTC, cbShort, type(uint256).max);
+            if (wethShort > 0) _redeemCoverShortfall($.weth, $.mWeth, wethShort, type(uint256).max);
             // Phase 2 (self-fund fallback): if residual debt remains after Phase 1 (idle == 0 case),
             //   redeem mUSDC collateral → swap to deficit token → repay (settle-shortfall pattern).
             //   _settleShortfall reads the oracle only when borrowBalance > 0, so it is a no-op
@@ -237,8 +239,8 @@ library LeveragedAeroManager {
         } else {
             // Partial redemption: redeem f*collateral first (Finding 1 fix).
             _redeemCollateral(shares, supply);
-            if (cbShort > 0) _redeemCoverShortfall($.cbBTC, $.mCbBTC, cbShort);
-            if (wethShort > 0) _redeemCoverShortfall($.weth, $.mWeth, wethShort);
+            if (cbShort > 0) _redeemCoverShortfall($.cbBTC, $.mCbBTC, cbShort, type(uint256).max);
+            if (wethShort > 0) _redeemCoverShortfall($.weth, $.mWeth, wethShort, type(uint256).max);
         }
 
         // E — sweep residual cbBTC/WETH → USDC, LEAVING the stayers' reserved leg share un-swept
@@ -276,6 +278,7 @@ library LeveragedAeroManager {
         Layout storage $ = _layout();
         uint256 tokenId_ = $.tokenId;
         if (tokenId_ == 0) return; // flat book — nothing staked, nothing to compound
+        if (minUsdcOut == 0) revert ZeroMinOut(); // cheap floor (onlyProposer-gated); full oracle floor deferred
 
         // 1. Claim AERO for the staked NFT. The reward token is read from the gauge
         //    (definitionally AERO on this pool — fork-confirmed `rewardToken() == AERO`).
@@ -425,9 +428,12 @@ library LeveragedAeroManager {
         Layout storage $ = _layout();
         _unwindLiquidity(repayUsd, debtUsd);
         (uint256 cbShort, uint256 wethShort) = _redeemRepayFromCollected(repayUsd, debtUsd, 0, 0);
+        // Two independent `if`s (NOT else-if): a dual-leg IL shortfall covers BOTH legs (L6), mirroring
+        // the redeem path. An `else if` would silently skip the WETH leg when both are short.
         if (cbShort > 0) {
             _rebalanceCover($.weth, $.cbBTC, $.mCbBTC, cbShort, minOut);
-        } else if (wethShort > 0) {
+        }
+        if (wethShort > 0) {
             _rebalanceCover($.cbBTC, $.weth, $.mWeth, wethShort, minOut);
         }
     }
@@ -453,19 +459,24 @@ library LeveragedAeroManager {
         uint256 minUsdcOut
     ) private {
         Layout storage $ = _layout();
+        uint256 pUsdc = _readUsd8($.usdcFeed); // hoisted: floors the surplus sell AND ceils the deficit buy
         uint256 surplusBal = IERC20(surplusTok).balanceOf(address(this));
         if (surplusBal > 0) {
             bool isCbBTC = surplusTok == $.cbBTC;
             uint8 dec = isCbBTC ? CBBTC_DECIMALS : WETH_DECIMALS;
-            address feed = isCbBTC ? $.cbBTCFeed : $.wethFeed;
-            (uint256 pSurplus,) = ChainlinkReader.readUsd(feed, $.sequencerFeed, $.maxDelay, $.gracePeriod);
-            (uint256 pUsdc,) = ChainlinkReader.readUsd($.usdcFeed, $.sequencerFeed, $.maxDelay, $.gracePeriod);
+            uint256 pSurplus = _readUsd8(isCbBTC ? $.cbBTCFeed : $.wethFeed);
             uint256 oracleFloor =
                 _tokenToUsdc(surplusBal, dec, pSurplus, pUsdc) * (10000 - uint256($.maxSlippageBps)) / 10000;
             if (oracleFloor > minUsdcOut) minUsdcOut = oracleFloor;
         }
         _sweepLegToUsdc(surplusTok, 0, minUsdcOut);
-        _redeemCoverShortfall(deficitTok, deficitMkt, shortAmt);
+        // Oracle-ceiling the deficit BUY (H1): a sandwiched/manipulated permissionless `deleverage`
+        // can't overpay past the oracle+slippage bound. The redeem path passes max (oracle-free).
+        bool deficitIsCb = deficitTok == $.cbBTC;
+        uint256 pDeficit = _readUsd8(deficitIsCb ? $.cbBTCFeed : $.wethFeed);
+        uint256 buyMax = _tokenToUsdc(shortAmt, deficitIsCb ? CBBTC_DECIMALS : WETH_DECIMALS, pDeficit, pUsdc)
+            * (10000 + uint256($.maxSlippageBps)) / 10000;
+        _redeemCoverShortfall(deficitTok, deficitMkt, shortAmt, buyMax);
     }
 
     /// @dev Collateral + debt in USDC face (6dp) on the SAME hardened-Chainlink basis as
@@ -479,9 +490,9 @@ library LeveragedAeroManager {
         uint256 cbDebt = IMoonwellMarket($.mCbBTC).borrowBalanceStored(address(this));
         uint256 wethDebt = IMoonwellMarket($.mWeth).borrowBalanceStored(address(this));
         if (cbDebt == 0 && wethDebt == 0) return (collateralUsdc, 0);
-        (uint256 pBTC,) = ChainlinkReader.readUsd($.cbBTCFeed, $.sequencerFeed, $.maxDelay, $.gracePeriod);
-        (uint256 pETH,) = ChainlinkReader.readUsd($.wethFeed, $.sequencerFeed, $.maxDelay, $.gracePeriod);
-        (uint256 pUsdc,) = ChainlinkReader.readUsd($.usdcFeed, $.sequencerFeed, $.maxDelay, $.gracePeriod);
+        uint256 pBTC = _readUsd8($.cbBTCFeed);
+        uint256 pETH = _readUsd8($.wethFeed);
+        uint256 pUsdc = _readUsd8($.usdcFeed);
         debtUsdc =
             _tokenToUsdc(cbDebt, CBBTC_DECIMALS, pBTC, pUsdc) + _tokenToUsdc(wethDebt, WETH_DECIMALS, pETH, pUsdc);
     }
@@ -514,8 +525,8 @@ library LeveragedAeroManager {
     ///      collateral at target) and by `_leverUp` (a target-LTV debt delta with no new collateral).
     function _borrowHalfEach(uint256 borrowUsd6) private returns (uint256 cbBTCAmt, uint256 wethAmt) {
         Layout storage $ = _layout();
-        (uint256 pBTC,) = ChainlinkReader.readUsd($.cbBTCFeed, $.sequencerFeed, $.maxDelay, $.gracePeriod);
-        (uint256 pETH,) = ChainlinkReader.readUsd($.wethFeed, $.sequencerFeed, $.maxDelay, $.gracePeriod);
+        uint256 pBTC = _readUsd8($.cbBTCFeed);
+        uint256 pETH = _readUsd8($.wethFeed);
         // halfBorrowUsd8: borrowUsd6 (6dp) → 8dp via ×100, then halve for the per-leg USD value.
         uint256 halfBorrowUsd8 = (borrowUsd6 * 100) / 2;
         cbBTCAmt = (halfBorrowUsd8 * 1e8) / pBTC;
@@ -706,9 +717,9 @@ library LeveragedAeroManager {
         uint256 wethDebtRem = IMoonwellMarket($.mWeth).borrowBalanceStored(address(this));
         if (cbDebtRem == 0 && wethDebtRem == 0) return;
         // Read Chainlink prices (8dp each)
-        (uint256 pBTC,) = ChainlinkReader.readUsd($.cbBTCFeed, $.sequencerFeed, $.maxDelay, $.gracePeriod);
-        (uint256 pETH,) = ChainlinkReader.readUsd($.wethFeed, $.sequencerFeed, $.maxDelay, $.gracePeriod);
-        (uint256 pUsdc,) = ChainlinkReader.readUsd($.usdcFeed, $.sequencerFeed, $.maxDelay, $.gracePeriod);
+        uint256 pBTC = _readUsd8($.cbBTCFeed);
+        uint256 pETH = _readUsd8($.wethFeed);
+        uint256 pUsdc = _readUsd8($.usdcFeed);
         // USDC needed for each shortfall leg (+10% buffer)
         uint256 cbUsdcNeed = _tokenToUsdc(cbDebtRem, 8, pBTC, pUsdc) * 11000 / 10000;
         uint256 wethUsdcNeed = _tokenToUsdc(wethDebtRem, 18, pETH, pUsdc) * 11000 / 10000;
@@ -733,10 +744,10 @@ library LeveragedAeroManager {
                 if (err != 0) revert MoonwellRepayFailed(err);
             }
         }
-        // Cover WETH shortfall (spend remaining USDC after cbBTC leg)
+        // Cover WETH shortfall (bounded by its own oracle budget, not the full idle balance — M1;
+        // `_swapUsdcExactIn` still caps at the live USDC balance).
         if (wethDebtRem > 0) {
-            uint256 usdcLeft = IERC20($.usdc).balanceOf(address(this));
-            _swapUsdcExactIn($.weth, usdcLeft, wethDebtRem * (10000 - slip) / 10000);
+            _swapUsdcExactIn($.weth, wethUsdcNeed, wethDebtRem * (10000 - slip) / 10000);
             uint256 wBal2 = IERC20($.weth).balanceOf(address(this));
             if (wBal2 > 0) {
                 IERC20($.weth).forceApprove($.mWeth, wBal2);
@@ -809,6 +820,17 @@ library LeveragedAeroManager {
     ///      pToken and pUsdc are both 8dp.
     function _tokenToUsdc(uint256 amt, uint8 dec, uint256 pToken, uint256 pUsdc) private pure returns (uint256) {
         return (amt * pToken * 1e6) / ((10 ** uint256(dec)) * pUsdc);
+    }
+
+    /// @dev Hardened USD read that also asserts the feed is 8-decimal (the scaling assumption),
+    ///      mirroring `LeveragedAeroValuation._readUsd8`. The execution-path price reads previously
+    ///      trusted `decimals()` implicitly; consolidating them here closes that gap (L1) — a
+    ///      redeployed feed at a different precision fail-closes instead of mis-scaling the term.
+    function _readUsd8(address feed) private view returns (uint256 price) {
+        Layout storage $ = _layout();
+        (uint256 p, uint8 dec) = ChainlinkReader.readUsd(feed, $.sequencerFeed, $.maxDelay, $.gracePeriod);
+        if (dec != 8) revert FeedDecimalsMismatch();
+        return p;
     }
 
     // ── deployIdle helpers ──
@@ -917,12 +939,17 @@ library LeveragedAeroManager {
     }
 
     /// @dev Cover a debt shortfall (IL-driven) by swapping idle USDC → `tokenOut` via
-    ///      exactOutputSingle, then repaying the exact remaining amount.
-    function _redeemCoverShortfall(address tokenOut, address market, uint256 amountOut) private {
+    ///      exactOutputSingle, then repaying the exact remaining amount. `amountInMax` caps the
+    ///      USDC spent: redeem callers pass `type(uint256).max` (→ bounded only by idle USDC,
+    ///      oracle-free; the redeemer is bounded by `minAssetsOut` at the entrypoint), while the
+    ///      permissionless deleverage path passes an oracle+slippage ceiling so a sandwiched buy
+    ///      reverts instead of overpaying (H1).
+    function _redeemCoverShortfall(address tokenOut, address market, uint256 amountOut, uint256 amountInMax) private {
         Layout storage $ = _layout();
         uint256 usdcBal = IERC20($.usdc).balanceOf(address(this));
         if (usdcBal == 0 || amountOut == 0) return;
-        IERC20($.usdc).forceApprove($.swapRouter, usdcBal);
+        uint256 maxIn = usdcBal < amountInMax ? usdcBal : amountInMax;
+        IERC20($.usdc).forceApprove($.swapRouter, maxIn);
         ICLSwapRouter($.swapRouter)
             .exactOutputSingle(
                 ICLSwapRouter.ExactOutputSingleParams({
@@ -932,7 +959,7 @@ library LeveragedAeroManager {
                 recipient: address(this),
                 deadline: block.timestamp + 600,
                 amountOut: amountOut,
-                amountInMaximum: usdcBal,
+                amountInMaximum: maxIn,
                 sqrtPriceLimitX96: 0
             })
             );
@@ -985,9 +1012,9 @@ library LeveragedAeroManager {
         if (cbDebt == 0 && wethDebt == 0) return; // no debt → trivially healthy (skip oracle)
 
         // ── Price via hardened Chainlink (same feeds + staleness guards as nav()) ──
-        (uint256 pBTC,) = ChainlinkReader.readUsd($.cbBTCFeed, $.sequencerFeed, $.maxDelay, $.gracePeriod);
-        (uint256 pETH,) = ChainlinkReader.readUsd($.wethFeed, $.sequencerFeed, $.maxDelay, $.gracePeriod);
-        (uint256 pUsdc,) = ChainlinkReader.readUsd($.usdcFeed, $.sequencerFeed, $.maxDelay, $.gracePeriod);
+        uint256 pBTC = _readUsd8($.cbBTCFeed);
+        uint256 pETH = _readUsd8($.wethFeed);
+        uint256 pUsdc = _readUsd8($.usdcFeed);
 
         // ── Debt (USDC face, 6dp) ──
         uint256 debtUsd =

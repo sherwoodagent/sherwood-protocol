@@ -285,7 +285,9 @@ contract LeveragedAeroCLCompoundFork is LeveragedAeroForkBase {
         uint256 supplyBefore = mockVault.totalSupply();
 
         vm.prank(proposer);
-        strategy.compound(0, 0); // must NOT revert
+        // L8: minUsdcOut must be nonzero (ZeroMinOut floor). With no rewards the impl early-returns
+        // at `aeroBal == 0` before any swap, so the floor never binds — still a clean no-op.
+        strategy.compound(1, 0); // must NOT revert
 
         // Position + supply unchanged (no fee-shares: dt==0 and first-ever crystallize seeds HWM).
         assertEq(strategy.layout().tokenId, tid, "tokenId changed on no-op");
