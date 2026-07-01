@@ -23,6 +23,12 @@ import {MoonwellSupplyAdapter} from "../src/pricing/adapters/MoonwellSupplyAdapt
 ///         Production:
 ///           OWNER_MULTISIG=0xSafe... forge script script/DeployPriceRouter.s.sol \
 ///             --rpc-url $BASE_RPC_URL --broadcast --account deployer
+/// @notice Minimal factory surface for wiring the router post-deploy.
+interface IFactoryWire {
+    function owner() external view returns (address);
+    function setPriceRouter(address newRouter) external;
+}
+
 contract DeployPriceRouter is ScriptBase {
     /// @notice Moonwell Comptroller (Base mainnet) — the canonical market registry.
     address constant MOONWELL_COMPTROLLER = 0xfBb21d0380beE3312B33c4353c8936a0F13EF26C;
@@ -63,6 +69,21 @@ contract DeployPriceRouter is ScriptBase {
         router.setInstantCap(kind, MOONWELL_INSTANT_CAP);
         // Phase 4: Moonwell supply is the first audited Lane-A-eligible kind.
         router.setLaneAEnabled(kind, true);
+
+        // Wire the router onto the factory so vaults read it live via
+        // factory.priceRouter(). Owner-gated: on a fork the deployer still owns
+        // the factory and we set it now; in prod the multisig owns it, so emit
+        // the Safe calldata instead of reverting. Requires Deploy.s.sol first
+        // (SYNDICATE_FACTORY must already be in chains.json).
+        address factory = _readAddress("SYNDICATE_FACTORY");
+        if (IFactoryWire(factory).owner() == deployer) {
+            IFactoryWire(factory).setPriceRouter(address(router));
+            console.log("factory.setPriceRouter wired");
+        } else {
+            console.log("Factory owned by multisig - queue setPriceRouter on the Safe:");
+            console.log("  target:", factory);
+            console.logBytes(abi.encodeCall(IFactoryWire.setPriceRouter, (address(router))));
+        }
 
         // Hand ownership to the multisig in prod; beta/local keeps the deployer.
         if (!skipHandoff) {
