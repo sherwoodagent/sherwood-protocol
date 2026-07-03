@@ -7,6 +7,7 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 import {ERC721Holder} from "@openzeppelin/contracts/token/ERC721/utils/ERC721Holder.sol";
 import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
 import {BaseStrategy} from "./BaseStrategy.sol";
 import {LeveragedAeroValuation} from "./LeveragedAeroValuation.sol";
@@ -51,6 +52,7 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     error InsufficientIdle();
     error HealthyNoDeleverage();
     error CannotRescuePositionToken();
+    error NotProposerOrOwner();
     error OnlySelf();
     error PerformanceFeeTooHigh();
     error ManagementFeeTooHigh();
@@ -560,12 +562,16 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         ISyndicateVault(vault_).strategyBurn(shares);
     }
 
-    /// @notice Sweep a STRAY ERC-20 (airdrop / accidental send) back to the vault. Target is always
-    ///         `vault()`, never caller-supplied, so even the proposer cannot exfil (§13). Reverts
+    /// @notice Sweep a STRAY ERC-20 (airdrop / accidental send) back to the vault. Callable by the
+    ///         proposer OR the vault owner (§8): the strategy runs under an indefinite proposal, so
+    ///         `vault.rescueERC20/721/Eth` are dormant (they revert while `redemptionsLocked()`) — this
+    ///         is the only recovery path, and it must survive a dead proposer key. Target is always
+    ///         `vault()`, never caller-supplied, so neither caller can exfil (§13). Reverts
     ///         `CannotRescuePositionToken` for any position/accounting token — usdc / cbBTC / weth
     ///         (all NAV-counted) / mUsdc / mCbBTC / mWeth, and AERO (read live from the gauge so a
     ///         sweep can't bypass `compound()`). The position NFT is never swept (no ERC-721 path).
-    function rescueToVault(address token) external onlyProposer nonReentrant {
+    function rescueToVault(address token) external nonReentrant {
+        if (msg.sender != proposer() && msg.sender != Ownable(vault()).owner()) revert NotProposerOrOwner();
         Layout storage $ = _layout();
         address aero = ICLGauge($.gauge).rewardToken();
         if (

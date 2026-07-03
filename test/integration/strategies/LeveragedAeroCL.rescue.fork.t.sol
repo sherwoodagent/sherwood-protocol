@@ -7,7 +7,6 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {LeveragedAeroForkBase} from "./LeveragedAeroForkBase.sol";
 import {BaseAddresses} from "./BaseAddresses.sol";
 import {LeveragedAerodromeCLStrategy} from "../../../src/strategies/LeveragedAerodromeCLStrategy.sol";
-import {BaseStrategy} from "../../../src/strategies/BaseStrategy.sol";
 import {ICLGauge} from "../../../src/interfaces/ISlipstream.sol";
 
 // ─── Minimal mock ERC-20 ───────────────────────────────────────────────────────
@@ -170,8 +169,8 @@ contract LeveragedAeroCLRescueFork is LeveragedAeroForkBase {
         }
     }
 
-    /// @notice A non-proposer cannot call rescueToVault.
-    function test_rescue_onlyProposer() public {
+    /// @notice A non-proposer / non-owner cannot call rescueToVault (D5).
+    function test_rescue_strangerReverts() public {
         if (_skip) return;
 
         MockERC20 mock = new MockERC20();
@@ -179,7 +178,26 @@ contract LeveragedAeroCLRescueFork is LeveragedAeroForkBase {
 
         address stranger = makeAddr("stranger");
         vm.prank(stranger);
-        vm.expectRevert(abi.encodeWithSelector(BaseStrategy.NotProposer.selector));
+        vm.expectRevert(abi.encodeWithSelector(LeveragedAerodromeCLStrategy.NotProposerOrOwner.selector));
         strategy.rescueToVault(address(mock));
+    }
+
+    /// @notice D5: the vault owner may also sweep a stray token — the dead-proposer-key recovery
+    ///         path §8 built rescueToVault for. `fakeVault` has no code, so mock its `owner()`.
+    function test_rescue_vaultOwnerCanSweep() public {
+        if (_skip) return;
+
+        address vaultOwner = makeAddr("vaultOwner");
+        vm.mockCall(fakeVault, abi.encodeWithSignature("owner()"), abi.encode(vaultOwner));
+
+        MockERC20 mock = new MockERC20();
+        uint256 amount = 500e18;
+        mock.mint(address(strategy), amount);
+
+        vm.prank(vaultOwner);
+        strategy.rescueToVault(address(mock));
+
+        assertEq(mock.balanceOf(address(strategy)), 0, "strategy balance not zero after owner rescue");
+        assertEq(mock.balanceOf(fakeVault), amount, "vault did not receive owner-rescued tokens");
     }
 }
