@@ -217,14 +217,52 @@ contract LeveragedAeroFeesTest is Test {
         assertEq(ts, 100);
     }
 
-    /// @dev navPre == 0 → all outputs zero / unchanged, lastAccrual advances.
-    function test_crystallize_navPreZero() public pure {
+    /// @dev navPre == 0 (oracle down / calm-gate shut): the price-free MANAGEMENT fee still
+    ///      crystallises for the elapsed dt (D6 — it must not be forfeited on an unpriced
+    ///      cycle), while the PERFORMANCE fee defers (HWM unchanged). lastAccrual advances.
+    function test_crystallize_navPreZero_managementStillAccrues() public pure {
         uint256 storedHwm = HWM_1TO1;
+        uint256 mgmtBps = 100; // 1 %/yr
+
         (uint256 f, uint256 hwm, uint256 ts) =
-            LeveragedAeroFees.crystallize(0, SUPPLY_100k, storedHwm, 0, 100, 100, 1_000);
-        assertEq(f, 0, "zero navPre must yield zero fee");
-        assertEq(hwm, storedHwm, "HWM must not change with zero navPre");
-        assertEq(ts, 100, "lastAccrual must advance to nowTs");
+            LeveragedAeroFees.crystallize(0, SUPPLY_100k, storedHwm, 0, SECONDS_PER_YEAR, mgmtBps, 1_000);
+
+        // Management leg is price-free → full accrual equals the standalone mgmt calc.
+        uint256 mExpected = LeveragedAeroFees.managementFeeShares(SUPPLY_100k, mgmtBps, SECONDS_PER_YEAR);
+        assertGt(mExpected, 0, "sanity: mgmt fee should be nonzero over 1 year");
+        assertEq(f, mExpected, "mgmt fee must crystallise even with navPre == 0 (no forfeit)");
+
+        // Performance leg defers: HWM unchanged so the next priced cycle re-measures the gain.
+        assertEq(hwm, storedHwm, "HWM must NOT advance on an unpriced cycle (perf defers)");
+        assertEq(ts, SECONDS_PER_YEAR, "lastAccrual must advance to nowTs");
+
+        // dt == 0 with navPre == 0 → no fee at all (nothing to accrue).
+        (uint256 f0, uint256 hwm0,) = LeveragedAeroFees.crystallize(0, SUPPLY_100k, storedHwm, 100, 100, mgmtBps, 1_000);
+        assertEq(f0, 0, "navPre==0 & dt==0 must yield zero fee");
+        assertEq(hwm0, storedHwm, "HWM unchanged");
+    }
+
+    /// @dev D6 escape-analysis: an unpriced crystallize (navPre == 0) that accrues only the mgmt
+    ///      fee must NOT let a performance gain escape. Because the HWM is left unchanged, the very
+    ///      next priced crystallize still charges the full perf fee on the gain above the ORIGINAL
+    ///      HWM — identical to what a single priced cycle over the same gain would have charged.
+    function test_crystallize_navPreZero_perfDefersNothingEscapes() public pure {
+        uint256 totalSupply = SUPPLY_100k;
+        uint256 hwm0 = HWM_1TO1; // starting HWM at 1:1
+        uint256 perfBps = 1_000; // 10 %
+
+        // Cycle 1 (unpriced, mid-outage): navPre == 0 → perf defers, HWM must stay at hwm0.
+        (, uint256 hwmAfterOutage,) = LeveragedAeroFees.crystallize(0, totalSupply, hwm0, 0, 1, 0, perfBps);
+        assertEq(hwmAfterOutage, hwm0, "outage cycle must not advance HWM");
+
+        // Cycle 2 (priced, oracle back at 110k = +10 % gain): full perf fee charged vs hwm0.
+        (uint256 pDeferred,) = LeveragedAeroFees.performanceFeeShares(NAV_110k, totalSupply, hwmAfterOutage, perfBps);
+
+        // Baseline: the same gain charged in a single priced cycle (no intervening outage).
+        (uint256 pBaseline,) = LeveragedAeroFees.performanceFeeShares(NAV_110k, totalSupply, hwm0, perfBps);
+
+        assertGt(pDeferred, 0, "deferred perf fee must still fire on the next priced cycle");
+        assertEq(pDeferred, pBaseline, "no gain escaped: deferred perf fee == single-cycle baseline");
     }
 
     /// @dev Two crystallize calls in the same block (nowTs == lastAccrual) → dt == 0 → no mgmt fee.

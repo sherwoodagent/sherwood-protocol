@@ -183,8 +183,12 @@ library LeveragedAeroFees {
         // over periods when the vault held no capital.
         newLastAccrual = nowTs;
 
-        // No capital: zero fees, HWM unchanged.
-        if (totalSupply == 0 || navPre == 0) {
+        // No capital: zero fees, HWM unchanged. `navPre == 0` (oracle down / calm-gate
+        // shut) is NOT short-circuited here — the management leg is price-free (D6): it
+        // still crystallises the elapsed `dt`, and `performanceFeeShares` defers on
+        // `navPre == 0` by returning the HWM unchanged, so no gain escapes the perf fee
+        // (the next priced cycle still measures gain vs the same HWM).
+        if (totalSupply == 0) {
             newHwmPerShareX = hwmPerShareX;
             return (0, newHwmPerShareX, newLastAccrual);
         }
@@ -192,7 +196,9 @@ library LeveragedAeroFees {
         // dt is 0 when called in the same block as the last accrual (e.g. two deposits).
         uint256 dt = nowTs > lastAccrual ? nowTs - lastAccrual : 0;
 
+        // Management fee is price-free (supply × rate × dt) — accrues regardless of navPre.
         uint256 mShares = managementFeeShares(totalSupply, managementFeeBps, dt);
+        // Performance fee needs a price: navPre == 0 ⇒ (0 shares, HWM unchanged) ⇒ defers.
         (uint256 pShares, uint256 newHwm) = performanceFeeShares(navPre, totalSupply, hwmPerShareX, performanceFeeBps);
 
         // feeShares = mShares + pShares; overflow impossible (both << totalSupply).

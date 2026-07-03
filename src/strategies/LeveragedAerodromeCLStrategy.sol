@@ -379,9 +379,11 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     /// @dev Crystallise management + HWM performance fees on the PRE-ACTION vault state. The caller
     ///      supplies `navPre` (not a self-call to `nav()`) so the caller controls oracle behaviour:
     ///      deposit passes `nav()` (fail-closed — correct to revert on oracle failure); redeem passes
-    ///      0 when `nav()` is unavailable → `crystallize` returns 0 fee-shares and just advances the
-    ///      timestamp, keeping redeem oracle-free (§7).
-    /// @param navPre Pre-action NAV (USDC 6dp). Pass 0 to skip fees (oracle-free path).
+    ///      0 when `nav()` is unavailable → `crystallize` still accrues the price-free MANAGEMENT fee
+    ///      for the elapsed `dt` (D6) and defers only the performance fee (HWM unchanged), keeping
+    ///      redeem oracle-free (§7).
+    /// @param navPre Pre-action NAV (USDC 6dp). Pass 0 on oracle outage → performance fee defers, but
+    ///      the price-free management fee still crystallises.
     function _crystallizeFees(uint256 navPre) private {
         Layout storage $ = _layout();
         uint256 supply = IERC20(vault()).totalSupply();
@@ -512,7 +514,8 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     /// @notice Oracle-free proportional redeem: burn vault shares, receive pro-rata USDC. Caller must
     ///         `vault.approve(strategy, shares)` first (shares are pulled via `safeTransferFrom`).
     ///         Oracle-free guarantee (§7): a best-effort crystallise passes navPre=0 on oracle outage
-    ///         (no fees, redeem unblocked); the fraction denominator is fixed once before the burn.
+    ///         (price-free management fee still accrues, performance fee defers — D6; redeem unblocked);
+    ///         the fraction denominator is fixed once before the burn.
     ///
     ///         The crystallise is FULLY best-effort (H3): it runs through the self-only
     ///         `crystallizeFeesSelf` wrapper under `try/catch`, so even a fee-share MINT failure
@@ -526,8 +529,9 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     function redeem(uint256 shares, uint256 minAssetsOut) external nonReentrant returns (uint256 assetsOut) {
         if (_state != State.Executed) revert NotExecuted();
 
-        // 1. Best-effort crystallise: oracle outage → navPre=0 → no fees; a fee-mint revert is
-        //    swallowed (fee defers) so redeem is never bricked by the vault's mint gates (H3).
+        // 1. Best-effort crystallise: oracle outage → navPre=0 → mgmt fee still accrues (price-free,
+        //    D6), perf fee defers; a fee-mint revert is swallowed (whole crystallise defers) so redeem
+        //    is never bricked by the vault's mint gates (H3).
         uint256 navPre;
         try this.nav() returns (uint256 navNow) {
             navPre = navNow;
