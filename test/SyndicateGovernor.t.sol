@@ -595,6 +595,71 @@ contract SyndicateGovernorTest is Test {
         assertEq(usdc.balanceOf(owner), ownerBalBefore + 100e6 + 42_075000, "non-self-fee'd: protocol + mgmt charged");
     }
 
+    // ── PR #388 #2: selfManagesFees snapshotted at propose, read from storage at settle ──
+
+    /// @notice Regression A (brick closed): the flag is snapshotted at propose, so a
+    ///         strategy whose `selfManagesFees()` REVERTS after propose no longer bricks
+    ///         settlement. Pre-fix `_finishSettlement` did a live call with `pnl > 0`,
+    ///         so a settle-time revert stranded normal AND emergency settlement.
+    function test_settlement_selfManagesFeesSnapshot_revertAfterProposeDoesNotBrickSettle() public {
+        MockStrategyAdapter strat = new MockStrategyAdapter(); // selfFee=false at propose
+        uint256 proposalId = _createAndExecuteProposalWithStrategy(1500, 7 days, address(strat));
+        usdc.mint(address(vault), 10_000e6); // positive PnL (float delta)
+
+        // Strategy breaks after propose — a live settle-time read would revert here.
+        strat.setRevertOnSelfManagesFees(true);
+
+        uint256 agentBalBefore = usdc.balanceOf(agent);
+        uint256 ownerBalBefore = usdc.balanceOf(owner);
+        vm.prank(agent);
+        governor.settleProposal(proposalId); // must NOT revert
+
+        // Snapshot was false ⇒ normal fee distribution still runs.
+        assertEq(usdc.balanceOf(agent), agentBalBefore + 1_485e6, "settle used snapshot; fees charged");
+        assertEq(usdc.balanceOf(owner), ownerBalBefore + 100e6 + 42_075000, "protocol + mgmt charged");
+    }
+
+    /// @notice Regression B (TOCTOU closed): a non-pure strategy that reports `false` at
+    ///         propose then flips to `true` before settle must not change the outcome —
+    ///         settle reads the storage snapshot (`false`), so `_distributeFees` runs.
+    function test_settlement_selfManagesFeesSnapshot_toctouFlipIgnored() public {
+        MockStrategyAdapter strat = new MockStrategyAdapter(); // selfFee=false at propose
+        uint256 proposalId = _createAndExecuteProposalWithStrategy(1500, 7 days, address(strat));
+        assertEq(governor.getProposal(proposalId).selfManagesFees, false, "snapshot false at propose");
+        usdc.mint(address(vault), 10_000e6);
+
+        // Attacker flips the live value AFTER propose; a live read would skip all fees.
+        strat.setSelfFee(true);
+        assertTrue(strat.selfManagesFees(), "live value flipped to true");
+
+        uint256 agentBalBefore = usdc.balanceOf(agent);
+        uint256 ownerBalBefore = usdc.balanceOf(owner);
+        vm.prank(agent);
+        governor.settleProposal(proposalId);
+
+        // Uses the false snapshot ⇒ normal fees, not the flipped opt-out.
+        assertEq(usdc.balanceOf(agent), agentBalBefore + 1_485e6, "flip ignored; agent fee charged");
+        assertEq(usdc.balanceOf(owner), ownerBalBefore + 100e6 + 42_075000, "flip ignored; protocol + mgmt charged");
+    }
+
+    /// @notice Regression C (fail-fast): proposing with an EOA / non-strategy address now
+    ///         reverts at propose (the snapshot call has no code to return a bool), instead
+    ///         of storing a junk address that would brick settle later.
+    function test_propose_eoaStrategyRevertsAtPropose() public {
+        ISyndicateGovernor.CoProposer[] memory empty = _emptyCoProposers();
+        vm.prank(agent);
+        vm.expectRevert();
+        governor.propose(
+            address(vault),
+            address(0xBEEF), // EOA, no selfManagesFees()
+            "ipfs://eoa",
+            7 days,
+            _simpleExecuteCalls(),
+            _simpleSettlementCalls(),
+            empty
+        );
+    }
+
     /// @notice H2: the snapshot is clamped to `maxPerformanceFeeBps` at propose,
     ///         so the recorded/emitted rate equals what settlement charges — a
     ///         vault fee above the cap is never shown to voters as higher.

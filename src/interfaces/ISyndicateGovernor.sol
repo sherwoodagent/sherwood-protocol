@@ -90,6 +90,11 @@ interface ISyndicateGovernor {
         ///      Prevents mid-vote timelock finalizes from retroactively
         ///      moving the rejection threshold.
         uint256 vetoThresholdBps;
+        /// @notice `IStrategy.selfManagesFees()` snapshotted at propose time (like
+        ///         performanceFeeBps). Read from storage at settle so a non-pure
+        ///         implementation can't flip it between review and settle (TOCTOU),
+        ///         and a broken/EOA strategy can't brick settle via a revert.
+        bool selfManagesFees;
     }
 
     struct CoProposer {

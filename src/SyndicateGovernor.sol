@@ -297,6 +297,12 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
         p.proposer = msg.sender;
         p.vault = vault;
         p.strategy = strategy;
+        // Snapshot the strategy's self-fee flag at propose (like performanceFeeBps)
+        // so settle reads storage, not a live call: closes the TOCTOU flip between
+        // review and settle and the brick vector where a settle-time revert would
+        // strand normal AND emergency settlement. No try/catch — a revert here is
+        // the intended fail-fast (an EOA / broken strategy fails at propose).
+        p.selfManagesFees = strategy != address(0) && IStrategy(strategy).selfManagesFees();
         p.metadataURI = metadataURI;
         // Snapshot the vault's agent fee, clamped to the protocol cap, so the
         // recorded + emitted rate is exactly what settlement charges (H2: no
@@ -1077,11 +1083,9 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, UUPSUpgrade
             // H2/M4: a self-fee'd strategy (custody model — LPs deposit/redeem into the
             // strategy, shares minted/burned on the vault) crystallises its own fees; the
             // governor's float-delta PnL would misread net deposits as profit and double-
-            // charge. Such strategies opt out of ALL governor settle-fees. The
-            // `strat != address(0)` guard covers Lane-B-only proposals.
-            address strat = proposal.strategy;
-            bool selfFee = strat != address(0) && IStrategy(strat).selfManagesFees();
-            if (!selfFee) {
+            // charge. Such strategies opt out of ALL governor settle-fees. Read the
+            // propose-time snapshot, never a live call (TOCTOU + brick-on-revert).
+            if (!proposal.selfManagesFees) {
                 (agentFee, totalFee) = _distributeFees(
                     proposalId, vault, asset, proposal.proposer, proposal.performanceFeeBps, uint256(pnl)
                 );
