@@ -349,10 +349,7 @@ library LeveragedAeroManager {
         if (used0 < minLiq0 || used1 < minLiq1) revert InsufficientLiquidity();
 
         // 5. Restake the new NFT to resume AERO gauge rewards (mirrors _mintAndStake).
-        address gauge_ = $.gauge;
-        (bool ok,) = $.npm.call(abi.encodeWithSignature("approve(address,uint256)", gauge_, newTokenId));
-        if (!ok) revert NpmApproveFailed();
-        ICLGauge(gauge_).deposit(newTokenId);
+        _approveAndStake($.gauge, newTokenId);
 
         // 6. Persist the recentered position (nav()/positions() now read the new NFT).
         $.tokenId = newTokenId;
@@ -617,15 +614,20 @@ library LeveragedAeroManager {
         LeveragedAeroValuation._calmGate(_config());
         (int24 tickLower, int24 tickUpper) = _computeTickRange();
         (uint256 tokenId_,,) = _mintPosition(wethAmt, cbBTCAmt, tickLower, tickUpper);
-        address gauge_ = $.gauge;
-        // ERC-721 approve (approve(address,uint256)) via low-level call.
-        (bool ok,) = $.npm.call(abi.encodeWithSignature("approve(address,uint256)", gauge_, tokenId_));
-        if (!ok) revert NpmApproveFailed();
-        ICLGauge(gauge_).deposit(tokenId_);
+        _approveAndStake($.gauge, tokenId_);
         // Persist position state (so nav()/positions() see the live position)
         $.tokenId = tokenId_;
         $.posTickLower = tickLower;
         $.posTickUpper = tickUpper;
+    }
+
+    /// @dev ERC-721 approve `tokenId_` to `gauge_` (low-level `approve(address,uint256)`), then stake
+    ///      it in the gauge. Shared by every mint/restake site (`_mintAndStake`, `rerangeImpl`,
+    ///      `_unwindLiquidity`, `_wrapAddRestake`).
+    function _approveAndStake(address gauge_, uint256 tokenId_) private {
+        (bool ok,) = _layout().npm.call(abi.encodeWithSignature("approve(address,uint256)", gauge_, tokenId_));
+        if (!ok) revert NpmApproveFailed();
+        ICLGauge(gauge_).deposit(tokenId_);
     }
 
     /// @dev Align `tick` down to the nearest multiple of `spacing` (handles negatives).
@@ -684,11 +686,7 @@ library LeveragedAeroManager {
 
         // Re-stake only when remaining liquidity is non-zero.
         (,, uint128 remainingLiq) = _npmPositionData();
-        if (remainingLiq > 0) {
-            (bool ok,) = npm_.call(abi.encodeWithSignature("approve(address,uint256)", gauge_, tokenId_));
-            if (!ok) revert NpmApproveFailed();
-            ICLGauge(gauge_).deposit(tokenId_);
-        }
+        if (remainingLiq > 0) _approveAndStake(gauge_, tokenId_);
     }
 
     /// @dev Repay as much of both Moonwell borrows as current balances allow, then cover
@@ -892,9 +890,7 @@ library LeveragedAeroManager {
         address gauge_ = $.gauge;
         ICLGauge(gauge_).withdraw(tokenId_);
         _addLiquidity(wethAmt, cbBTCAmt, minLiquidity);
-        (bool ok,) = $.npm.call(abi.encodeWithSignature("approve(address,uint256)", gauge_, tokenId_));
-        if (!ok) revert NpmApproveFailed();
-        ICLGauge(gauge_).deposit(tokenId_);
+        _approveAndStake(gauge_, tokenId_);
     }
 
     // ── redeem helpers ──
