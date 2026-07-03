@@ -195,6 +195,11 @@ contract DeploySherwood is ScriptBase {
         if (d.swoodProxy != address(0)) {
             _patchAddress("STAKED_WOOD", d.swoodProxy);
         }
+        // Persist WOOD — Deploy only reads it as an input, so without this it
+        // never lands in chains.json (audit gap). Beta mode has no WOOD.
+        if (cfg.woodToken != address(0)) {
+            _patchAddress("WOOD_TOKEN", cfg.woodToken);
+        }
 
         console.log("\nDeployment complete on %s (chain %s)", _chainName(), block.chainid);
         console.log("Next: forge script script/DeployTemplates.s.sol --rpc-url <chain> --broadcast");

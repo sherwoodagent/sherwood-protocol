@@ -84,9 +84,46 @@ contract StrategyFactoryTest is Test {
     function test_cloneAndInitDeterministic_predictableAddress() public {
         bytes32 salt = keccak256("strategy.salt.1");
         bytes memory initData = abi.encode(address(usdc), address(mUsdc), 1_000e6, 990e6, false);
-        address predicted = Clones.predictDeterministicAddress(address(template), salt, address(factory));
+        // #387 — the factory binds the salt to the vault; the predictor must fold
+        // the same way (keccak256(abi.encode(vault, salt))).
+        bytes32 effSalt = keccak256(abi.encode(address(vault), salt));
+        address predicted = Clones.predictDeterministicAddress(address(template), effSalt, address(factory));
         vm.prank(vaultOwner);
         address clone = factory.cloneAndInitDeterministic(address(template), address(vault), vaultOwner, initData, salt);
         assertEq(clone, predicted);
+    }
+
+    /// @dev #387 front-running defense — the SAME raw salt + template on two
+    ///      different vaults yields two DIFFERENT clone addresses (the salt is
+    ///      folded with the vault). Without the fold the second deploy would
+    ///      collide and revert; with it, an attacker can't precompute (or, via
+    ///      `_authClone`, even deploy at) a victim vault's address from a shared
+    ///      salt observed in the mempool.
+    function test_cloneAndInitDeterministic_saltBoundToVault() public {
+        bytes32 salt = keccak256("shared.salt");
+        bytes memory initData = abi.encode(address(usdc), address(mUsdc), 1_000e6, 990e6, false);
+
+        _MockVault vaultB = new _MockVault(vaultOwner);
+
+        vm.prank(vaultOwner);
+        address cloneA =
+            factory.cloneAndInitDeterministic(address(template), address(vault), vaultOwner, initData, salt);
+        vm.prank(vaultOwner);
+        address cloneB =
+            factory.cloneAndInitDeterministic(address(template), address(vaultB), vaultOwner, initData, salt);
+
+        assertTrue(cloneA != cloneB, "same salt must map to distinct addresses per vault");
+        assertEq(
+            cloneA,
+            Clones.predictDeterministicAddress(
+                address(template), keccak256(abi.encode(address(vault), salt)), address(factory)
+            )
+        );
+        assertEq(
+            cloneB,
+            Clones.predictDeterministicAddress(
+                address(template), keccak256(abi.encode(address(vaultB), salt)), address(factory)
+            )
+        );
     }
 }

@@ -37,7 +37,7 @@ base_sepolia = "${BASE_SEPOLIA_RPC_URL}"
 robinhood_testnet = "${ROBINHOOD_TESTNET_RPC_URL}"
 hyperevm = "${HYPEREVM_RPC_URL}"
 hyperevm_testnet = "${HYPEREVM_TESTNET_RPC_URL}"
-tenderly = "${TENDERLY_FORK_RPC_URL}"
+tenderly = "${TENDERLY_RPC_URL}"
 
 [etherscan]
 hyperevm = { key = "${ETHERSCAN_API_KEY}", url = "https://api.etherscan.io/v2/api?chainid=999" }

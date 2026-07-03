@@ -22,7 +22,26 @@ abstract contract ScriptBase is Script {
 
     // ── JSON address persistence ──
 
-    /// @notice Write deployed addresses to chains/{chainId}.json
+    /// @notice Path to this chain's address book.
+    function _chainsPath() internal view returns (string memory) {
+        return string.concat(vm.projectRoot(), "/chains/", vm.toString(block.chainid), ".json");
+    }
+
+    function _fileExists(string memory path) internal view returns (bool) {
+        try vm.readFile(path) returns (string memory) {
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    /// @notice Write core deployed addresses to chains/{chainId}.json.
+    /// @dev When the file already exists, patches the core keys IN PLACE so
+    ///      pre-existing keys (templates, ENS, PRICE_ROUTER, WOOD_TOKEN written
+    ///      by other phases) survive — the deploy phases are order-independent
+    ///      and re-runnable. Only a first-ever deploy on a novel chain serializes
+    ///      a fresh object. (Previously this overwrote the whole file, silently
+    ///      dropping every key it didn't own.)
     function _writeAddresses(
         string memory name,
         address deployer,
@@ -31,38 +50,40 @@ abstract contract ScriptBase is Script {
         address executorLib,
         address vaultImpl
     ) internal {
-        string memory obj = "deploy";
-        vm.serializeAddress(obj, "BATCH_EXECUTOR_LIB", executorLib);
-        vm.serializeAddress(obj, "DEPLOYER", deployer);
-        vm.serializeAddress(obj, "SYNDICATE_FACTORY", factory);
-        vm.serializeAddress(obj, "SYNDICATE_GOVERNOR", governor);
-        vm.serializeAddress(obj, "SYNDICATE_VAULT_IMPL", vaultImpl);
-        vm.serializeUint(obj, "chainId", block.chainid);
-        string memory json = vm.serializeString(obj, "name", name);
-
-        string memory path = string.concat(vm.projectRoot(), "/chains/", vm.toString(block.chainid), ".json");
-        vm.writeJson(json, path);
+        string memory path = _chainsPath();
+        if (_fileExists(path)) {
+            _patchAddress("BATCH_EXECUTOR_LIB", executorLib);
+            _patchAddress("DEPLOYER", deployer);
+            _patchAddress("SYNDICATE_FACTORY", factory);
+            _patchAddress("SYNDICATE_GOVERNOR", governor);
+            _patchAddress("SYNDICATE_VAULT_IMPL", vaultImpl);
+            vm.writeJson(vm.toString(block.chainid), path, ".chainId");
+            vm.writeJson(string.concat("\"", name, "\""), path, ".name");
+        } else {
+            string memory obj = "deploy";
+            vm.serializeAddress(obj, "BATCH_EXECUTOR_LIB", executorLib);
+            vm.serializeAddress(obj, "DEPLOYER", deployer);
+            vm.serializeAddress(obj, "SYNDICATE_FACTORY", factory);
+            vm.serializeAddress(obj, "SYNDICATE_GOVERNOR", governor);
+            vm.serializeAddress(obj, "SYNDICATE_VAULT_IMPL", vaultImpl);
+            vm.serializeUint(obj, "chainId", block.chainid);
+            string memory json = vm.serializeString(obj, "name", name);
+            vm.writeJson(json, path);
+        }
         console.log("Addresses written to %s", path);
     }
 
     /// @notice Patch a single address into chains/{chainId}.json at a top-level
     ///         key, preserving any existing keys (uses `vm.writeJson` path mode).
-    ///         Used by deploy scripts that add to an existing JSON rather than
-    ///         replacing it wholesale.
+    /// @dev Writes the address as a flat JSON string at `.key`. The path-mode
+    ///      `writeJson` value must already be valid JSON, so quote the address.
     function _patchAddress(string memory key, address value) internal {
-        string memory path = string.concat(vm.projectRoot(), "/chains/", vm.toString(block.chainid), ".json");
-        // Write the address as a flat JSON string at `.key`. Using
-        // `vm.serializeAddress("", "", value)` here produces a nested object
-        // `{"": "0x.."}` at the key (malformed) — the path-mode `writeJson`
-        // value must already be valid JSON, so quote the address string.
-        vm.writeJson(string.concat("\"", vm.toString(value), "\""), path, string.concat(".", key));
+        vm.writeJson(string.concat("\"", vm.toString(value), "\""), _chainsPath(), string.concat(".", key));
     }
 
     /// @notice Read a deployed address from chains/{chainId}.json
     function _readAddress(string memory key) internal view returns (address) {
-        string memory path = string.concat(vm.projectRoot(), "/chains/", vm.toString(block.chainid), ".json");
-        string memory json = vm.readFile(path);
-        return vm.parseJsonAddress(json, string.concat(".", key));
+        return vm.parseJsonAddress(vm.readFile(_chainsPath()), string.concat(".", key));
     }
 
     /// @notice Write tokenomics addresses to chains/{chainId}.json (appends to existing)
