@@ -63,6 +63,10 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     error UnexpectedAssetDecimals();
     error UnexpectedFeedDecimals(); // AERO/USD aggregator not 8dp (L9 oracle-floor scaling assumption)
     error OracleParamOutOfRange();
+    error FastRedeemExceedsLtv(uint256 ltvBps, uint256 maxLtvBps); // fast-path breaches maxLtvBps → use requestRedeem
+    error NotRequestOwner();
+    error RequestSettled();
+    error FulfillWindowOpen(); // emergencyRedeem before FULFILL_WINDOW elapsed
 
     // ── Constants ──
     uint8 private constant CBBTC_DECIMALS = 8; // cbBTC is 8dp wrapped Bitcoin
@@ -76,6 +80,17 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
 
     /// @dev Annual management-fee ceiling (bps); mirrors `SyndicateFactory.MAX_MANAGEMENT_FEE_BPS` (5%/yr).
     uint16 private constant MAX_MANAGEMENT_FEE_BPS = 500;
+
+    /// @dev Deadman window: after this elapses on an unfulfilled `requestRedeem`, its owner can
+    ///      `emergencyRedeem` trustlessly (oracle-free). The backend fulfills in minutes; 2 days
+    ///      tolerates a weekend outage while keeping the trustless exit reachable.
+    uint256 private constant FULFILL_WINDOW = 2 days;
+
+    // ── Async-redeem queue events ──
+    event RedeemRequested(uint256 indexed id, address indexed owner, uint256 shares);
+    event RedeemFulfilled(uint256 indexed id, address indexed owner, uint256 assetsOut);
+    event RedeemCancelled(uint256 indexed id, address indexed owner, uint256 shares);
+    event RedeemEmergency(uint256 indexed id, address indexed owner, uint256 assetsOut);
 
     // ── Initialisation params (ABI-encoded → BaseStrategy.initialize → _initialize) ──
 
@@ -123,9 +138,20 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     // sequential storage (which holds only BaseStrategy's state). This lets the venue ops run from
     // the deployed `LeveragedAeroManager` library via delegatecall.
     //
-    // CORRUPTION-CRITICAL: `Layout`, `STORAGE_SLOT`, and `_layout()` are byte-identical in
-    // `LeveragedAeroManager` — they MUST stay in lockstep or a delegatecall reads/writes the wrong
-    // slots. Do not reorder `Layout` fields in one file without the other.
+    // CORRUPTION-CRITICAL: `Layout`, `STORAGE_SLOT`, `_layout()`, and `RedeemRequest` are
+    // byte-identical in `LeveragedAeroManager` — they MUST stay in lockstep or a delegatecall
+    // reads/writes the wrong slots. Do not reorder `Layout` fields in one file without the other.
+
+    /// @dev Escrowed async-redeem request (Lane-B-style, but NO price freeze — shares keep bearing
+    ///      PnL until execution, so `cancelRedeem` is not a free look-back option). Byte-identical
+    ///      to the manager's `RedeemRequest`.
+    struct RedeemRequest {
+        address owner; // request creator; the only address that can cancel / emergency-redeem it
+        uint256 shares; // vault shares escrowed in the strategy at request time
+        uint256 minAssetsOut; // slippage floor enforced at fulfill (fresh arg at emergencyRedeem)
+        uint40 requestedAt; // request timestamp; FULFILL_WINDOW deadman clock anchor
+        bool settled; // set once fulfilled / cancelled / emergency-redeemed (double-spend guard)
+    }
 
     /// @custom:storage-location erc7201:leveraged.aero.cl.storage
     struct Layout {
@@ -168,8 +194,11 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         uint256 hwmPerShare; // HWM nav-per-share (1e18 WAD), 0 until first deposit
         uint256 lastFeeAccrualTimestamp;
         uint256 protocolFeeOwed; // accrued protocol-fee USDC liability (6dp); discharged in redeem/compound/settle
-        // ── LAST field: appended for the L9 compound oracle floor (keep byte-identical in the manager) ──
+        // ── appended for the L9 compound oracle floor (keep byte-identical in the manager) ──
         address aeroUsdFeed; // AERO/USD aggregator (8dp) — floors compound()'s AERO→USDC swap
+        // ── LAST fields: appended for the escrowed async-redeem queue (keep byte-identical) ──
+        uint256 nextRedeemRequestId; // monotonic id cursor for `redeemRequests`
+        mapping(uint256 => RedeemRequest) redeemRequests; // id → escrowed async redeem
     }
 
     /// @dev keccak256(abi.encode(uint256(keccak256("leveraged.aero.cl.storage")) - 1)) & ~bytes32(uint256(0xff))
@@ -183,9 +212,95 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         }
     }
 
-    /// @notice Full strategy storage layout (single accessor for tests / off-chain reads).
-    function layout() external view returns (Layout memory) {
-        return _layout();
+    /// @dev Memory-returnable mirror of `Layout` minus the trailing `redeemRequests` mapping
+    ///      (a struct with a nested mapping can't be an external return). Field names match
+    ///      `Layout` 1:1 so `layout().field` accessors are unchanged.
+    struct LayoutView {
+        address usdc;
+        address mUsdc;
+        address mCbBTC;
+        address mWeth;
+        address cbBTC;
+        address weth;
+        address pool;
+        address cbBTCFeed;
+        address wethFeed;
+        address usdcFeed;
+        address sequencerFeed;
+        uint256 maxDelay;
+        uint256 gracePeriod;
+        uint16 calmDeviationTicks;
+        uint32 twapWindow;
+        address comptroller;
+        address npm;
+        address gauge;
+        address swapRouter;
+        int24 tickSpacing;
+        uint16 targetLtvBps;
+        uint16 maxLtvBps;
+        uint16 minHealthBps;
+        uint16 maxSlippageBps;
+        uint16 usdcCollateralFactorBps;
+        uint256 tokenId;
+        int24 posTickLower;
+        int24 posTickUpper;
+        uint16 managementFeeBps;
+        uint16 performanceFeeBps;
+        address feeRecipient;
+        uint256 hwmPerShare;
+        uint256 lastFeeAccrualTimestamp;
+        uint256 protocolFeeOwed;
+        address aeroUsdFeed;
+        uint256 nextRedeemRequestId;
+    }
+
+    /// @notice Full strategy storage layout (single accessor for tests / off-chain reads), minus the
+    ///         `redeemRequests` mapping (queried via `redeemRequest(id)`). Field-by-field (not a
+    ///         struct-literal) so the Yul IR emits one sload→mstore per field — avoids the
+    ///         >16-live-variable overflow a struct-literal trips under via_ir.
+    function layout() external view returns (LayoutView memory v) {
+        Layout storage $ = _layout();
+        v.usdc = $.usdc;
+        v.mUsdc = $.mUsdc;
+        v.mCbBTC = $.mCbBTC;
+        v.mWeth = $.mWeth;
+        v.cbBTC = $.cbBTC;
+        v.weth = $.weth;
+        v.pool = $.pool;
+        v.cbBTCFeed = $.cbBTCFeed;
+        v.wethFeed = $.wethFeed;
+        v.usdcFeed = $.usdcFeed;
+        v.sequencerFeed = $.sequencerFeed;
+        v.maxDelay = $.maxDelay;
+        v.gracePeriod = $.gracePeriod;
+        v.calmDeviationTicks = $.calmDeviationTicks;
+        v.twapWindow = $.twapWindow;
+        v.comptroller = $.comptroller;
+        v.npm = $.npm;
+        v.gauge = $.gauge;
+        v.swapRouter = $.swapRouter;
+        v.tickSpacing = $.tickSpacing;
+        v.targetLtvBps = $.targetLtvBps;
+        v.maxLtvBps = $.maxLtvBps;
+        v.minHealthBps = $.minHealthBps;
+        v.maxSlippageBps = $.maxSlippageBps;
+        v.usdcCollateralFactorBps = $.usdcCollateralFactorBps;
+        v.tokenId = $.tokenId;
+        v.posTickLower = $.posTickLower;
+        v.posTickUpper = $.posTickUpper;
+        v.managementFeeBps = $.managementFeeBps;
+        v.performanceFeeBps = $.performanceFeeBps;
+        v.feeRecipient = $.feeRecipient;
+        v.hwmPerShare = $.hwmPerShare;
+        v.lastFeeAccrualTimestamp = $.lastFeeAccrualTimestamp;
+        v.protocolFeeOwed = $.protocolFeeOwed;
+        v.aeroUsdFeed = $.aeroUsdFeed;
+        v.nextRedeemRequestId = $.nextRedeemRequestId;
+    }
+
+    /// @notice A single escrowed async-redeem request by id (queue introspection for tests / UI).
+    function redeemRequest(uint256 id) external view returns (RedeemRequest memory) {
+        return _layout().redeemRequests[id];
     }
 
     /// @dev Moonwell's mWETH market delivers native ETH on `borrow()`; the strategy wraps it to
@@ -579,27 +694,170 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         LeveragedAeroManager.deleverageImpl(minOut);
     }
 
-    /// @notice Oracle-free proportional redeem: burn vault shares, receive pro-rata USDC. Caller must
+    /// @notice Oracle-priced FAST-PATH redeem (the everyday exit): pay `shares × nav() / supply`,
+    ///         funded from the Moonwell USDC collateral ONLY — no LP touch, no debt repay. Caller must
     ///         `vault.approve(strategy, shares)` first (shares are pulled via `safeTransferFrom`).
-    ///         Oracle-free guarantee (§7): a best-effort crystallise passes navPre=0 on oracle outage
-    ///         (price-free management fee still accrues, performance fee defers — D6; redeem unblocked);
-    ///         the fraction denominator is fixed once before the burn.
     ///
-    ///         The crystallise is FULLY best-effort (H3): it runs through the self-only
-    ///         `crystallizeFeesSelf` wrapper under `try/catch`, so even a fee-share MINT failure
-    ///         (vault paused, or `feeRecipient` un-whitelisted on a closed-deposit config) rolls back
-    ///         only the crystallise — HWM + `lastFeeAccrualTimestamp` are unchanged, the fee DEFERS to
-    ///         the next successful crystallise, and redeem ALWAYS proceeds. This preserves the
-    ///         pause-immune-redeem + §7 always-available-exit invariants (the sole exit of an
-    ///         indefinite proposal can never be bricked by a fee-mint gate).
+    ///         Oracle-dependent by design (fail-closed, exactly like `deposit`): `navPre = nav()`
+    ///         reverts on a down oracle — the caller then routes to `requestRedeem`. **No protocol-fee
+    ///         skim on this path**: `nav()` is ALREADY net of `protocolFeeOwed`, so pricing at
+    ///         `f × navNet` provably preserves stayers' per-share (a skim would double-charge).
+    ///
+    ///         The LTV gate is authoritative in the manager (`fastRedeemImpl` computes the post-withdraw
+    ///         LTV on the pre-withdraw prices and reverts `FastRedeemExceedsLtv` if it breaches
+    ///         `maxLtvBps`, plus a belt `_assertHealthy()`); a breach means the collateral can't fund
+    ///         this size without a deleverage → the frontend routes to `requestRedeem`.
     /// @param shares       Vault shares to redeem (12dp).
-    /// @param minAssetsOut Minimum USDC out (aggregate slippage guard).
+    /// @param minAssetsOut Minimum USDC out (slippage guard on the payout).
     function redeem(uint256 shares, uint256 minAssetsOut) external nonReentrant returns (uint256 assetsOut) {
         if (_state != State.Executed) revert NotExecuted();
 
-        // 1. Best-effort crystallise: oracle outage → navPre=0 → mgmt fee still accrues (price-free,
-        //    D6), perf fee defers; a fee-mint revert is swallowed (whole crystallise defers) so redeem
-        //    is never bricked by the vault's mint gates (H3).
+        // 1. Crystallise on the pre-redeem NAV (fail-closed: a down oracle reverts — correct, the fast
+        //    path is inherently oracle-dependent). Same 3.6 fee model as deposit.
+        uint256 navPre = nav();
+        uint256 owedBefore = _layout().protocolFeeOwed;
+        _crystallizeFees(navPre);
+
+        // 2. Price against the POST-crystallize book, both effects consistently: `supply` is read
+        //    after the crystallize (includes the perf-fee mint dilution) and the FRESH protocol slice
+        //    it just accrued is netted out of navPre (prior owed is already net inside nav()). Without
+        //    the netting the redeemer would capture f×slice from stayers. No underflow: the fees lib
+        //    caps the slice at navPre.
+        uint256 navNet = navPre - (_layout().protocolFeeOwed - owedBefore);
+        address vault_ = vault();
+        uint256 supply = IERC20(vault_).totalSupply();
+        assetsOut = Math.mulDiv(shares, navNet, supply); // rounds down, LP-favourable
+        if (assetsOut < minAssetsOut) revert InsufficientAssetsOut();
+
+        // 3. Pull shares from caller (requires prior vault.approve(strategy, shares)).
+        IERC20(vault_).safeTransferFrom(msg.sender, address(this), shares);
+
+        // 4. Free exactly `assetsOut` from the Moonwell collateral (LTV-gated in the manager).
+        LeveragedAeroManager.fastRedeemImpl(assetsOut);
+
+        // 5. Pay out + burn.
+        IERC20(_layout().usdc).safeTransfer(msg.sender, assetsOut);
+        ISyndicateVault(vault_).strategyBurn(shares);
+    }
+
+    /// @notice Advisory preview of the fast-path exit — same math as `redeem` (`f × nav`) plus the LTV
+    ///         gate prediction. Returns `(0, false)` instead of reverting when the oracle is down
+    ///         (try/catch on the nav + collateral/debt reads). ADVISORY ONLY — the on-chain gate in
+    ///         `fastRedeemImpl` is authoritative; a frontend uses `fastOk` to pre-route to
+    ///         `requestRedeem` without a bounced transaction.
+    /// @param shares Vault shares to preview (12dp).
+    /// @return assetsOut Predicted USDC out (0 when unpriceable).
+    /// @return fastOk    True iff the fast path would price AND clear the LTV gate.
+    function previewRedeem(uint256 shares) external view returns (uint256 assetsOut, bool fastOk) {
+        uint256 supply = IERC20(vault()).totalSupply();
+        if (supply == 0) return (0, false);
+        uint256 navNet;
+        try this.nav() returns (uint256 n) {
+            navNet = n;
+        } catch {
+            return (0, false);
+        }
+        assetsOut = Math.mulDiv(shares, navNet, supply);
+        // Predict the LTV gate on the same pre-withdraw basis as `fastRedeemImpl`.
+        try this.previewCollateralDebt() returns (uint256 collateralUsdc, uint256 debtUsdc) {
+            if (assetsOut >= collateralUsdc) return (assetsOut, false);
+            uint256 maxLtv = uint256(_layout().maxLtvBps);
+            fastOk = debtUsdc == 0 || (debtUsdc * 10_000) / (collateralUsdc - assetsOut) <= maxLtv;
+        } catch {
+            return (assetsOut, false); // collateral/debt oracle read failed → advise the async path
+        }
+    }
+
+    /// @dev Self-only external view so `previewRedeem` can try/catch the manager's oracle reads
+    ///      (a down feed reverts inside `_readCollateralDebt`). Runs under staticcall; no state change.
+    function previewCollateralDebt() external view returns (uint256 collateralUsdc, uint256 debtUsdc) {
+        if (msg.sender != address(this)) revert OnlySelf();
+        return LeveragedAeroManager.readCollateralDebtImpl();
+    }
+
+    // ── Escrowed async redeem (Lane-B-style, no price freeze) ──
+
+    /// @notice Escrow `shares` for an async proportional redeem — the exit for holders the LTV-gated
+    ///         fast path can't serve (or when the oracle is down). Shares are pulled NOW
+    ///         (`vault.approve(strategy, shares)` required) and held in the strategy; NO price is
+    ///         stamped (shares keep bearing PnL until `fulfillRedeem`), so `cancelRedeem` is not a free
+    ///         look-back option. The backend deleverages (via `adjustLeverage`) then `fulfillRedeem`s.
+    /// @param shares       Vault shares to escrow (12dp).
+    /// @param minAssetsOut Slippage floor enforced (on the net amount) at fulfill.
+    /// @return id          The request id (also emitted).
+    function requestRedeem(uint256 shares, uint256 minAssetsOut) external nonReentrant returns (uint256 id) {
+        if (_state != State.Executed) revert NotExecuted();
+        IERC20(vault()).safeTransferFrom(msg.sender, address(this), shares);
+        Layout storage $ = _layout();
+        id = $.nextRedeemRequestId++;
+        $.redeemRequests[id] = RedeemRequest({
+            owner: msg.sender,
+            shares: shares,
+            minAssetsOut: minAssetsOut,
+            requestedAt: uint40(block.timestamp),
+            settled: false
+        });
+        emit RedeemRequested(id, msg.sender, shares);
+    }
+
+    /// @notice Fulfill an escrowed request via the oracle-free proportional unwind (the demoted
+    ///         everyday path, now reachable ONLY here and via `emergencyRedeem`). `onlyProposer`: the
+    ///         backend deleverages first (`adjustLeverage`) so the unwind's IL self-funds, then fulfills
+    ///         paying `request.owner`. NOT owner-callable — an owner-callable fulfill would resurrect
+    ///         the demoted oracle-free path through the side door.
+    /// @param id Request id to fulfill.
+    function fulfillRedeem(uint256 id) external onlyProposer nonReentrant {
+        if (_state != State.Executed) revert NotExecuted();
+        Layout storage $ = _layout();
+        RedeemRequest storage r = $.redeemRequests[id];
+        if (r.settled) revert RequestSettled();
+        uint256 assetsOut = _proportionalRedeem(r.owner, r.shares, r.minAssetsOut);
+        r.settled = true;
+        emit RedeemFulfilled(id, r.owner, assetsOut);
+    }
+
+    /// @notice Cancel an unsettled request and return the escrowed shares to its owner. Request owner
+    ///         only, callable in ANY strategy state (no `State.Executed` gate): a request outstanding
+    ///         when the proposal settles must stay cancellable so the owner can exit via the vault
+    ///         normally.
+    /// @param id Request id to cancel.
+    function cancelRedeem(uint256 id) external nonReentrant {
+        RedeemRequest storage r = _layout().redeemRequests[id];
+        if (msg.sender != r.owner) revert NotRequestOwner();
+        if (r.settled) revert RequestSettled();
+        r.settled = true;
+        IERC20(vault()).safeTransfer(r.owner, r.shares);
+        emit RedeemCancelled(id, r.owner, r.shares);
+    }
+
+    /// @notice Deadman trustless backstop: after `FULFILL_WINDOW` elapses on an unfulfilled request,
+    ///         its owner may self-fulfill via the same oracle-free proportional unwind. This single
+    ///         gate covers the whole deadman matrix — fulfill is oracle-free, so "oracle down + backend
+    ///         alive" resolves via normal `fulfillRedeem`; the only stuck case (oracle down AND backend
+    ///         dead) self-resolves here. `minAssetsOut` is a FRESH arg (the stored one may be stale
+    ///         after 2 days).
+    /// @param id           Request id (owner-gated).
+    /// @param minAssetsOut Fresh slippage floor on the net payout.
+    function emergencyRedeem(uint256 id, uint256 minAssetsOut) external nonReentrant returns (uint256 assetsOut) {
+        if (_state != State.Executed) revert NotExecuted();
+        RedeemRequest storage r = _layout().redeemRequests[id];
+        if (msg.sender != r.owner) revert NotRequestOwner();
+        if (r.settled) revert RequestSettled();
+        if (block.timestamp <= uint256(r.requestedAt) + FULFILL_WINDOW) revert FulfillWindowOpen();
+        assetsOut = _proportionalRedeem(r.owner, r.shares, minAssetsOut);
+        r.settled = true;
+        emit RedeemEmergency(id, r.owner, assetsOut);
+    }
+
+    /// @dev Shared body of `fulfillRedeem` / `emergencyRedeem`: oracle-free proportional unwind of
+    ///      `shares` for `recipient`, paying net of the Item-3 protocol skim, enforcing `minOut`,
+    ///      burning the escrowed shares. Best-effort crystallise (H3 pattern: navPre=0 on oracle
+    ///      outage → price-free mgmt fee accrues, perf fee defers; a fee-mint revert defers the whole
+    ///      crystallise) keeps the exit oracle-free (§7). `supply` is fixed once before the burn.
+    function _proportionalRedeem(address recipient, uint256 shares, uint256 minOut)
+        private
+        returns (uint256 assetsOut)
+    {
         uint256 navPre;
         try this.nav() returns (uint256 navNow) {
             navPre = navNow;
@@ -608,31 +866,15 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         }
         try this.crystallizeFeesSelf(navPre) {} catch {}
 
-        // 2. Fix the fraction denominator ONCE before the burn (totalSupply is stable here).
-        address vault_ = vault();
-        uint256 supply = IERC20(vault_).totalSupply();
-
-        // 3. Pull shares from caller (requires prior vault.approve(strategy, shares)).
-        IERC20(vault_).safeTransferFrom(msg.sender, address(this), shares);
-
-        // 4. Oracle-free proportional unwind (venue logic in the deployed manager library).
+        uint256 supply = IERC20(vault()).totalSupply();
         assetsOut = LeveragedAeroManager.redeemUnwindImpl(shares, supply);
-
-        // 5. Protocol-fee skim: the redeemer bears their pro-rata slice of the accrued liability.
-        //    `nav()` nets `protocolFeeOwed` but the proportional unwind pays the GROSS book, so
-        //    without this skim the redeemer would over-collect by f×owed. Pure arithmetic on stored
-        //    state (same fixed `supply` denominator captured pre-burn) — NO oracle read, preserving
-        //    the §7 oracle-free redeem. Skips silently if recipient == 0 or owed == 0.
+        // Item-3 skim: the redeemer bears their pro-rata slice of the accrued protocol liability (the
+        // proportional unwind pays the GROSS book; nav() is net → skim rebalances). Pure arithmetic,
+        // no oracle. Skips silently when recipient == 0 or owed == 0.
         assetsOut -= _dischargeRedeemSkim(shares, supply, assetsOut);
-
-        // 6. Aggregate slippage guard — applies to the NET (user-facing) amount.
-        if (assetsOut < minAssetsOut) revert InsufficientAssetsOut();
-
-        // 7. Pay out USDC.
-        IERC20(_layout().usdc).safeTransfer(msg.sender, assetsOut);
-
-        // 8. Burn shares (strategy holds them after safeTransferFrom above).
-        ISyndicateVault(vault_).strategyBurn(shares);
+        if (assetsOut < minOut) revert InsufficientAssetsOut();
+        IERC20(_layout().usdc).safeTransfer(recipient, assetsOut);
+        ISyndicateVault(vault()).strategyBurn(shares);
     }
 
     /// @dev Skim the redeemer's pro-rata protocol-fee slice from `assetsOut` and pay it to the live

@@ -51,6 +51,13 @@ contract MockVaultForRedeem {
         return true;
     }
 
+    function transfer(address to, uint256 amount) external returns (bool) {
+        require(balanceOf[msg.sender] >= amount, "ERC20InsufficientBalance");
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+
     function strategyMint(address to, uint256 shares) external {
         balanceOf[to] += shares;
         totalSupply += shares;
@@ -91,6 +98,13 @@ contract MockVaultMintReverts {
         allowance[from][msg.sender] -= amount;
         require(balanceOf[from] >= amount, "ERC20InsufficientBalance");
         balanceOf[from] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+
+    function transfer(address to, uint256 amount) external returns (bool) {
+        require(balanceOf[msg.sender] >= amount, "ERC20InsufficientBalance");
+        balanceOf[msg.sender] -= amount;
         balanceOf[to] += amount;
         return true;
     }
@@ -260,11 +274,17 @@ contract LeveragedAeroCLRedeemFork is LeveragedAeroForkBase {
         // Shove the tick (manipulate spot price) to confirm oracle-priced NAV is immune.
         _shoveTick(5 ether, true); // sell WETH, move tick down
 
-        // DepositorB redeems all their shares.
+        // DepositorB redeems all their shares via the escrowed async path (the proportional-unwind
+        // mechanic was demoted off the everyday `redeem`): request (B) → fulfill (proposer). Payout
+        // measured via B's USDC-balance delta.
+        uint256 bUsdcBefore = IERC20(BaseAddresses.USDC).balanceOf(depositorB);
         vm.startPrank(depositorB);
         mockVault.approve(address(strategy), sharesB);
-        uint256 assetsOut = strategy.redeem(sharesB, 0);
+        uint256 reqId = strategy.requestRedeem(sharesB, 0);
         vm.stopPrank();
+        vm.prank(proposer);
+        strategy.fulfillRedeem(reqId);
+        uint256 assetsOut = IERC20(BaseAddresses.USDC).balanceOf(depositorB) - bUsdcBefore;
 
         // B should receive ≈ f·NAV.
         // expectedOut is based on oracle-implied NAV; assetsOut reflects actual AMM execution
@@ -331,15 +351,16 @@ contract LeveragedAeroCLRedeemFork is LeveragedAeroForkBase {
         assertEq(IERC20(BaseAddresses.USDC).balanceOf(address(mockVault)), donation, "vault not funded");
         assertEq(strategy.nav(), navBefore, "nav moved on vault-float donation (M2: float must be excluded)");
 
-        // A partial redeem still pays ~f·nav (strategy-controlled), and never taps the vault float.
+        // A partial FAST-PATH redeem pays exactly f·nav (strategy-controlled), and never taps the vault
+        // float. (The fast path prices f × navNet and funds it from the Moonwell collateral.)
         uint256 fairShare = (navBefore * sharesB) / supplyBefore;
         vm.startPrank(depositorB);
         mockVault.approve(address(strategy), sharesB);
         uint256 assetsOut = strategy.redeem(sharesB, 0);
         vm.stopPrank();
 
-        // Redeemer paid f·nav within realized-exit slippage (not shorted the float, not over-paid by it).
-        assertApproxEqRel(assetsOut, fairShare, 0.03e18, "redeem != f*nav (float-exclusion broken)");
+        // Fast path pays exactly f·nav (collateral-funded, no LP touch → no realized-exit slippage).
+        assertApproxEqRel(assetsOut, fairShare, 0.001e18, "redeem != f*nav (float-exclusion broken)");
         // The donated float is untouched by the strategy redeem path — it stays in the vault.
         assertEq(
             IERC20(BaseAddresses.USDC).balanceOf(address(mockVault)), donation, "vault float was touched by redeem"
@@ -350,8 +371,9 @@ contract LeveragedAeroCLRedeemFork is LeveragedAeroForkBase {
     // Test 2: redeem succeeds while oracle is stale
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// @notice When the BTC feed returns a stale answer (so nav() reverts), redeem still
-    ///         succeeds (oracle-free path, navPre=0 → no fees minted) while deposit reverts.
+    /// @notice When the BTC feed returns a stale answer (so nav() reverts), the ORACLE-FREE async exit
+    ///         (requestRedeem → fulfillRedeem) still succeeds (navPre=0 → no fees minted) while both the
+    ///         oracle-dependent fast-path `redeem` and `deposit` revert (fail-closed).
     function test_redeem_worksWhileOracleStale() public {
         if (_skip) return;
 
@@ -367,6 +389,13 @@ contract LeveragedAeroCLRedeemFork is LeveragedAeroForkBase {
         // residual debt that causes Moonwell to reject the full collateral redemption.
         _fundUSDC(address(strategy), 2_000e6);
 
+        // Escrow the shares BEFORE the feed goes stale (requestRedeem never reads the oracle, but this
+        // mirrors the real flow: a user requests, then the feed dies, then the backend fulfills).
+        vm.startPrank(depositorA);
+        mockVault.approve(address(strategy), sharesA);
+        uint256 reqId = strategy.requestRedeem(sharesA, 0);
+        vm.stopPrank();
+
         // Mock the BTC/USD feed to return a stale timestamp (age > maxDelay=48h).
         address btcFeed = BaseAddresses.CHAINLINK_BTC_USD;
         (, int256 answer,,, uint80 answeredIn) = IAggregatorV3Min(btcFeed).latestRoundData();
@@ -380,6 +409,12 @@ contract LeveragedAeroCLRedeemFork is LeveragedAeroForkBase {
         vm.expectRevert();
         strategy.nav();
 
+        // The oracle-dependent fast-path redeem also reverts under the stale feed (fail-closed):
+        // `redeem` prices `nav()` FIRST (before any share pull), so the stale feed reverts it.
+        vm.prank(depositorB);
+        vm.expectRevert();
+        strategy.redeem(1, 0);
+
         // deposit() should also revert under the same stale feed.
         uint256 depositAmt = 1000e6;
         _fundUSDC(depositorB, depositAmt);
@@ -389,11 +424,11 @@ contract LeveragedAeroCLRedeemFork is LeveragedAeroForkBase {
         strategy.deposit(depositAmt, 0);
         vm.stopPrank();
 
-        // redeem (full redemption, f=1) should SUCCEED despite stale oracle.
-        vm.startPrank(depositorA);
-        mockVault.approve(address(strategy), sharesA);
-        uint256 assetsOut = strategy.redeem(sharesA, 0);
-        vm.stopPrank();
+        // fulfillRedeem (full redemption, f=1) SUCCEEDS despite the stale oracle (oracle-free path).
+        uint256 aUsdcBefore = IERC20(BaseAddresses.USDC).balanceOf(depositorA);
+        vm.prank(proposer);
+        strategy.fulfillRedeem(reqId);
+        uint256 assetsOut = IERC20(BaseAddresses.USDC).balanceOf(depositorA) - aUsdcBefore;
         assertGt(assetsOut, 0, "redeem returned 0 USDC");
 
         // Verify debts are fully cleared after full redemption.
@@ -428,11 +463,12 @@ contract LeveragedAeroCLRedeemFork is LeveragedAeroForkBase {
         }
     }
 
-    /// @notice H3 (fund-trap fix): redeem MUST succeed even when the vault rejects the fee-share mint
-    ///         (paused vault / un-whitelisted feeRecipient) with a management fee owed. The
-    ///         crystallise runs best-effort via `try this.crystallizeFeesSelf() {} catch {}`, so the
-    ///         mint revert is swallowed, the fee defers (HWM + lastFeeAccrualTimestamp unchanged), and
-    ///         the sole exit of an indefinite proposal stays open. Pre-H3 this redeem reverted.
+    /// @notice H3 (fund-trap fix): the async proportional exit (requestRedeem → fulfillRedeem) MUST
+    ///         succeed even when the vault rejects the fee-share mint (paused vault / un-whitelisted
+    ///         feeRecipient) with a management fee owed. The crystallise runs best-effort via
+    ///         `try this.crystallizeFeesSelf() {} catch {}` inside `_proportionalRedeem`, so the mint
+    ///         revert is swallowed, the fee defers (HWM + lastFeeAccrualTimestamp unchanged), and the
+    ///         sole exit of an indefinite proposal stays open. Pre-H3 this reverted.
     function test_redeem_succeedsWhenFeeMintReverts_paused() public {
         if (_skip) return;
 
@@ -457,13 +493,17 @@ contract LeveragedAeroCLRedeemFork is LeveragedAeroForkBase {
         uint256 lastAccrualBefore = strat.layout().lastFeeAccrualTimestamp;
         uint256 hwmBefore = strat.layout().hwmPerShare;
 
-        // depositorA redeems ALL shares — must SUCCEED despite the mint gate.
+        // depositorA redeems ALL shares via the async path — must SUCCEED despite the mint gate.
         uint256 sharesA = pausedVault.balanceOf(depositorA);
         _fundUSDC(address(strat), 2_000e6); // IL / interest buffer for the full unwind
+        uint256 aUsdcBefore = IERC20(BaseAddresses.USDC).balanceOf(depositorA);
         vm.startPrank(depositorA);
         pausedVault.approve(address(strat), sharesA);
-        uint256 assetsOut = strat.redeem(sharesA, 0);
+        uint256 reqId = strat.requestRedeem(sharesA, 0);
         vm.stopPrank();
+        vm.prank(proposer);
+        strat.fulfillRedeem(reqId);
+        uint256 assetsOut = IERC20(BaseAddresses.USDC).balanceOf(depositorA) - aUsdcBefore;
 
         assertGt(assetsOut, 0, "redeem returned 0 - bricked by fee-mint gate (H3 regression)");
         assertEq(IERC20(BaseAddresses.USDC).balanceOf(depositorA), assetsOut, "A USDC mismatch");
@@ -542,10 +582,15 @@ contract LeveragedAeroCLRedeemFork is LeveragedAeroForkBase {
         uint256 supply = mockVault.totalSupply();
         assertEq(supply, sharesA, "depositorA must own 100% of supply for this test");
 
+        // Full redeem via the async proportional path (the IL-self-funding mechanic lives there now).
+        uint256 aUsdcBefore = IERC20(BaseAddresses.USDC).balanceOf(depositorA);
         vm.startPrank(depositorA);
         mockVault.approve(address(strategy), sharesA);
-        uint256 assetsOut = strategy.redeem(sharesA, 0); // must NOT revert
+        uint256 reqId = strategy.requestRedeem(sharesA, 0);
         vm.stopPrank();
+        vm.prank(proposer);
+        strategy.fulfillRedeem(reqId); // must NOT revert
+        uint256 assetsOut = IERC20(BaseAddresses.USDC).balanceOf(depositorA) - aUsdcBefore;
 
         // Must receive non-zero USDC.
         assertGt(assetsOut, 0, "received 0 USDC");
@@ -603,14 +648,19 @@ contract LeveragedAeroCLRedeemFork is LeveragedAeroForkBase {
         uint256 cbDebtBefore = IMoonwellMarket(BaseAddresses.MOONWELL_MCBBTC).borrowBalanceStored(address(strategy));
         uint256 wethDebtBefore = IMoonwellMarket(BaseAddresses.MOONWELL_MWETH).borrowBalanceStored(address(strategy));
 
+        // Partial redeem via the async proportional path (IL self-funding + Finding-1 collateral-first).
+        uint256 aUsdcBefore = IERC20(BaseAddresses.USDC).balanceOf(depositorA);
         vm.startPrank(depositorA);
         mockVault.approve(address(strategy), redeemShares);
-        uint256 assetsOut = strategy.redeem(redeemShares, 0); // must NOT revert
+        uint256 reqId = strategy.requestRedeem(redeemShares, 0);
         vm.stopPrank();
+        vm.prank(proposer);
+        strategy.fulfillRedeem(reqId); // must NOT revert
+        uint256 assetsOut = IERC20(BaseAddresses.USDC).balanceOf(depositorA) - aUsdcBefore;
 
         // Must receive non-zero USDC
         assertGt(assetsOut, 0, "received 0 USDC");
-        assertEq(IERC20(BaseAddresses.USDC).balanceOf(depositorA), assetsOut, "USDC not transferred");
+        assertEq(IERC20(BaseAddresses.USDC).balanceOf(depositorA), aUsdcBefore + assetsOut, "USDC not transferred");
 
         // Stayers' borrow balances should be ≈ (1-f)*original debt (within 1% for interest)
         uint256 f_num = redeemShares;
@@ -720,12 +770,16 @@ contract LeveragedAeroCLRedeemFork is LeveragedAeroForkBase {
         uint256 navBefore = _oracleNavNoGate(address(strat));
         uint256 perShareBefore = (navBefore * 1e18) / supplyBefore;
 
-        // (c) PARTIAL redeem: depositorB redeems ALL of B's shares (f = sharesB/supply < 1),
-        //     leaving depositorA as the stayer.
+        // (c) PARTIAL redeem via the async proportional path (the stayer-safety mechanic lives there):
+        //     depositorB requests ALL of B's shares (f = sharesB/supply < 1), proposer fulfills,
+        //     leaving depositorA as the stayer. Payout via B's USDC-balance delta.
+        uint256 bUsdcBefore = IERC20(BaseAddresses.USDC).balanceOf(depositorB);
         vm.startPrank(depositorB);
         v.approve(address(strat), sharesB);
-        uint256 assetsOut = strat.redeem(sharesB, 0);
+        uint256 reqId = strat.requestRedeem(sharesB, 0);
         vm.stopPrank();
+        strat.fulfillRedeem(reqId); // proposer == address(this)
+        uint256 assetsOut = IERC20(BaseAddresses.USDC).balanceOf(depositorB) - bUsdcBefore;
 
         uint256 supplyAfter = v.totalSupply();
         assertEq(supplyAfter, supplyBefore - sharesB, "supply bookkeeping");
@@ -752,6 +806,314 @@ contract LeveragedAeroCLRedeemFork is LeveragedAeroForkBase {
         // skim drove assetsOut to ~17.5% over fair, so a 5% bound cleanly separates skim from noise.
         uint256 fairShare = (navBefore * sharesB) / supplyBefore;
         assertLe(assetsOut, fairShare * 105 / 100, "redeemer grossly over-paid (skimmed stayers)");
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // NEW: fast-path redeem (oracle-priced, collateral-funded, LTV-gated)
+    // ═════════════════════════════════════════════════════════════════════════
+
+    /// @notice Test 1 — the fast path pays exactly `shares × nav / supply`, funded from the Moonwell
+    ///         collateral ONLY: LP liquidity + both borrows are UNCHANGED, mUSDC collateral drops by
+    ///         ~assetsOut, and post-LTV stays ≤ max.
+    function test_fastRedeem_paysFxNav_collateralOnly() public {
+        if (_skip) return;
+
+        // Second LP so a partial fast redeem leaves depositorA as a stayer.
+        uint256 sharesB = _depositB(10_000e6);
+
+        uint256 navBefore = strategy.nav();
+        uint256 supplyBefore = mockVault.totalSupply();
+        uint256 fair = Math.mulDiv(sharesB, navBefore, supplyBefore);
+
+        uint256 tid = strategy.layout().tokenId;
+        (,,,,,,, uint128 liqBefore,,,,) = INpmFull(BaseAddresses.SLIPSTREAM_NPM).positions(tid);
+        uint256 cbDebtBefore = IMoonwellMarket(BaseAddresses.MOONWELL_MCBBTC).borrowBalanceStored(address(strategy));
+        uint256 wethDebtBefore = IMoonwellMarket(BaseAddresses.MOONWELL_MWETH).borrowBalanceStored(address(strategy));
+        uint256 collatBefore = ICToken(BaseAddresses.MOONWELL_MUSDC).balanceOf(address(strategy));
+
+        vm.startPrank(depositorB);
+        mockVault.approve(address(strategy), sharesB);
+        uint256 out = strategy.redeem(sharesB, 0);
+        vm.stopPrank();
+
+        // Pays exactly f × nav (collateral-funded → no LP/pool slippage).
+        assertApproxEqRel(out, fair, 0.001e18, "fast path != f * nav");
+        assertEq(IERC20(BaseAddresses.USDC).balanceOf(depositorB), out, "B USDC mismatch");
+
+        // LP liquidity + both borrows UNCHANGED (no LP touch, no debt repay).
+        (,,,,,,, uint128 liqAfter,,,,) = INpmFull(BaseAddresses.SLIPSTREAM_NPM).positions(tid);
+        assertEq(liqAfter, liqBefore, "LP liquidity moved on the fast path");
+        assertEq(
+            IMoonwellMarket(BaseAddresses.MOONWELL_MCBBTC).borrowBalanceStored(address(strategy)),
+            cbDebtBefore,
+            "cbBTC debt moved on the fast path"
+        );
+        assertEq(
+            IMoonwellMarket(BaseAddresses.MOONWELL_MWETH).borrowBalanceStored(address(strategy)),
+            wethDebtBefore,
+            "WETH debt moved on the fast path"
+        );
+
+        // Collateral reduced by ~assetsOut.
+        uint256 collatAfter = ICToken(BaseAddresses.MOONWELL_MUSDC).balanceOf(address(strategy));
+        assertLt(collatAfter, collatBefore, "collateral not drawn down");
+        assertApproxEqRel((collatBefore - collatAfter), out, 0.001e18, "collateral drawdown != assetsOut");
+    }
+
+    /// @notice Test 2 — a fast redeem sized so the post-withdraw LTV breaches `maxLtvBps` reverts
+    ///         `FastRedeemExceedsLtv`, and `previewRedeem` flags `fastOk == false` for that size while
+    ///         reporting the priced `assetsOut`.
+    function test_fastRedeem_ltvGate_revertsAndPreviewFlags() public {
+        if (_skip) return;
+
+        // depositorA holds ALL supply; a large-enough fast redeem shrinks collateral until the
+        // fixed debt breaches maxLtvBps. Redeem ~90% of nav → collateral shrinks hard → LTV spikes.
+        uint256 supply = mockVault.totalSupply();
+        uint256 shares = (supply * 90) / 100;
+
+        (uint256 pv, bool fastOk) = strategy.previewRedeem(shares);
+        assertGt(pv, 0, "preview priced 0");
+        assertFalse(fastOk, "preview must flag the LTV breach for a 90% fast redeem");
+
+        // On-chain fast path reverts FastRedeemExceedsLtv (args are runtime-dependent → loose match).
+        vm.startPrank(depositorA);
+        mockVault.approve(address(strategy), shares);
+        vm.expectRevert();
+        strategy.redeem(shares, 0);
+        vm.stopPrank();
+    }
+
+    /// @notice Test 2 (preview) — a small fast redeem clears the gate: `previewRedeem.fastOk == true`
+    ///         and the on-chain fast path succeeds.
+    function test_fastRedeem_smallSize_previewOkAndSucceeds() public {
+        if (_skip) return;
+        uint256 sharesB = _depositB(5_000e6);
+        (uint256 pv, bool fastOk) = strategy.previewRedeem(sharesB);
+        assertGt(pv, 0, "preview priced 0");
+        assertTrue(fastOk, "small fast redeem should clear the LTV gate");
+
+        vm.startPrank(depositorB);
+        mockVault.approve(address(strategy), sharesB);
+        uint256 out = strategy.redeem(sharesB, 0);
+        vm.stopPrank();
+        assertApproxEqRel(out, pv, 0.001e18, "fast redeem payout != preview");
+    }
+
+    /// @notice Test 3 — the fast path fails closed on a down oracle (reverts), and `previewRedeem`
+    ///         returns `(0, false)` instead of reverting.
+    function test_fastRedeem_oracleDown_revertsAndPreviewZero() public {
+        if (_skip) return;
+        uint256 sharesA = mockVault.balanceOf(depositorA);
+
+        // Stale the BTC feed → nav() reverts.
+        address btcFeed = BaseAddresses.CHAINLINK_BTC_USD;
+        (, int256 answer,,, uint80 answeredIn) = IAggregatorV3Min(btcFeed).latestRoundData();
+        vm.mockCall(
+            btcFeed,
+            abi.encodeWithSignature("latestRoundData()"),
+            abi.encode(uint80(1), answer, uint256(1), uint256(1), answeredIn)
+        );
+
+        (uint256 pv, bool fastOk) = strategy.previewRedeem(sharesA);
+        assertEq(pv, 0, "preview must return 0 on a down oracle");
+        assertFalse(fastOk, "preview must return fastOk=false on a down oracle");
+
+        vm.startPrank(depositorA);
+        mockVault.approve(address(strategy), sharesA);
+        vm.expectRevert(); // nav() reverts (stale)
+        strategy.redeem(sharesA, 0);
+        vm.stopPrank();
+
+        vm.clearMockedCalls();
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // NEW: escrowed async request lifecycle + deadman emergencyRedeem
+    // ═════════════════════════════════════════════════════════════════════════
+
+    /// @notice Test 5 — request lifecycle: escrow moves shares to the strategy; cancel returns them
+    ///         (including AFTER _settle — no Executed gate); double-settle is prevented; fulfill is
+    ///         onlyProposer; fulfill pays owner net of skim and enforces the STORED minAssetsOut.
+    function test_asyncRedeem_lifecycle() public {
+        if (_skip) return;
+        uint256 sharesB = _depositB(10_000e6);
+
+        // (a) escrow moves shares into the strategy.
+        vm.startPrank(depositorB);
+        mockVault.approve(address(strategy), sharesB);
+        uint256 id = strategy.requestRedeem(sharesB, 0);
+        vm.stopPrank();
+        assertEq(mockVault.balanceOf(depositorB), 0, "shares not escrowed");
+        assertEq(mockVault.balanceOf(address(strategy)), sharesB, "strategy did not receive escrow");
+
+        // (b) fulfill is onlyProposer.
+        vm.prank(makeAddr("notProposer"));
+        vm.expectRevert(); // NotProposer
+        strategy.fulfillRedeem(id);
+
+        // (c) cancel returns the escrowed shares (a fresh request).
+        vm.startPrank(depositorB);
+        mockVault.approve(address(strategy), sharesB);
+        uint256 id2 = strategy.requestRedeem(sharesB, 0);
+        vm.stopPrank();
+        vm.prank(depositorB);
+        strategy.cancelRedeem(id2);
+        assertEq(mockVault.balanceOf(depositorB), sharesB, "cancel did not return shares");
+
+        // (d) double-settle prevented: cancel again on the same id reverts.
+        vm.prank(depositorB);
+        vm.expectRevert(LeveragedAerodromeCLStrategy.RequestSettled.selector);
+        strategy.cancelRedeem(id2);
+
+        // (e) fulfill the FIRST request (id) — pays owner; enforce a stored minAssetsOut that passes.
+        uint256 bUsdcBefore = IERC20(BaseAddresses.USDC).balanceOf(depositorB);
+        vm.prank(proposer);
+        strategy.fulfillRedeem(id);
+        assertGt(IERC20(BaseAddresses.USDC).balanceOf(depositorB) - bUsdcBefore, 0, "fulfill paid nothing");
+
+        // (f) re-fulfilling a settled request reverts.
+        vm.prank(proposer);
+        vm.expectRevert(LeveragedAerodromeCLStrategy.RequestSettled.selector);
+        strategy.fulfillRedeem(id);
+    }
+
+    /// @notice Test 5 (cancel-after-settle) — a request outstanding when the proposal settles stays
+    ///         cancellable (no Executed gate), so the owner can exit via the vault normally.
+    function test_asyncRedeem_cancelWorksAfterSettle() public {
+        if (_skip) return;
+        uint256 sharesB = _depositB(10_000e6);
+        vm.startPrank(depositorB);
+        mockVault.approve(address(strategy), sharesB);
+        uint256 id = strategy.requestRedeem(sharesB, 0);
+        vm.stopPrank();
+
+        // Settle the strategy (state → Settled). requestRedeem/fulfill would now revert (NotExecuted),
+        // but cancel must still work.
+        vm.prank(address(mockVault));
+        strategy.settle();
+
+        vm.prank(depositorB);
+        strategy.cancelRedeem(id);
+        assertEq(mockVault.balanceOf(depositorB), sharesB, "cancel-after-settle did not return shares");
+    }
+
+    /// @notice Test 6 (HEADLINE deadman) — request → warp past FULFILL_WINDOW → BOTH feeds stale
+    ///         (oracle down) AND backend silent → `emergencyRedeem` still pays the proportional unwind
+    ///         (price-free mgmt-fee crystallize path), burns, marks settled. Before-window reverts;
+    ///         non-owner reverts.
+    function test_asyncRedeem_deadmanEmergency() public {
+        if (_skip) return;
+
+        // depositorA holds ALL supply → a full emergency redeem (f=1).
+        uint256 sharesA = mockVault.balanceOf(depositorA);
+        _fundUSDC(address(strategy), 2_000e6); // IL/interest buffer for the full unwind
+
+        vm.startPrank(depositorA);
+        mockVault.approve(address(strategy), sharesA);
+        uint256 id = strategy.requestRedeem(sharesA, 0);
+        vm.stopPrank();
+
+        // Before the window elapses → reverts.
+        vm.prank(depositorA);
+        vm.expectRevert(LeveragedAerodromeCLStrategy.FulfillWindowOpen.selector);
+        strategy.emergencyRedeem(id, 0);
+
+        // Warp past FULFILL_WINDOW (2 days) and stale BOTH feeds (oracle fully down).
+        vm.warp(vm.getBlockTimestamp() + 2 days + 1);
+        _staleAllFeeds();
+
+        // nav() reverts (oracle down) — the fast path would be unusable here.
+        vm.expectRevert();
+        strategy.nav();
+
+        // Non-owner cannot emergency-redeem.
+        vm.prank(makeAddr("notOwner"));
+        vm.expectRevert(LeveragedAerodromeCLStrategy.NotRequestOwner.selector);
+        strategy.emergencyRedeem(id, 0);
+
+        // Owner emergency-redeems → succeeds oracle-free.
+        uint256 aUsdcBefore = IERC20(BaseAddresses.USDC).balanceOf(depositorA);
+        vm.prank(depositorA);
+        uint256 out = strategy.emergencyRedeem(id, 0);
+        assertGt(out, 0, "emergencyRedeem paid nothing");
+        assertEq(IERC20(BaseAddresses.USDC).balanceOf(depositorA) - aUsdcBefore, out, "A USDC mismatch");
+
+        // Re-emergency on the settled request reverts.
+        vm.prank(depositorA);
+        vm.expectRevert(LeveragedAerodromeCLStrategy.RequestSettled.selector);
+        strategy.emergencyRedeem(id, 0);
+
+        vm.clearMockedCalls();
+    }
+
+    /// @notice Test 7 (cheap fuzz) — a request/cancel/fulfill sequence never strands shares: the
+    ///         strategy's escrowed share balance always equals the sum of OPEN (unsettled) request
+    ///         shares at every step.
+    function testFuzz_asyncRedeem_escrowConservation(uint256 seed) public {
+        if (_skip) return;
+        uint256 sharesB = _depositB(20_000e6);
+        // Split B's shares into 3 equal escrow-able chunks (small so fulfills clear).
+        uint256 chunk = sharesB / 3;
+
+        uint256 openShares; // ghost: Σ shares of open requests
+        uint256[] memory ids = new uint256[](3);
+        bool[] memory open = new bool[](3);
+
+        // Open 3 requests.
+        for (uint256 i; i < 3; i++) {
+            vm.startPrank(depositorB);
+            mockVault.approve(address(strategy), chunk);
+            ids[i] = strategy.requestRedeem(chunk, 0);
+            vm.stopPrank();
+            open[i] = true;
+            openShares += chunk;
+            assertEq(mockVault.balanceOf(address(strategy)), openShares, "escrow != open-sum after request");
+        }
+
+        // Randomly cancel/fulfill each, asserting escrow conservation after every op.
+        for (uint256 i; i < 3; i++) {
+            if (!open[i]) continue;
+            bool doCancel = (uint256(keccak256(abi.encode(seed, i))) % 2) == 0;
+            if (doCancel) {
+                vm.prank(depositorB);
+                strategy.cancelRedeem(ids[i]);
+            } else {
+                vm.prank(proposer);
+                strategy.fulfillRedeem(ids[i]);
+            }
+            open[i] = false;
+            openShares -= chunk;
+            assertEq(mockVault.balanceOf(address(strategy)), openShares, "escrow != open-sum after settle");
+        }
+        assertEq(openShares, 0, "ghost open-sum not drained");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // New-test helpers
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @dev Mint shares for depositorB via a deposit and return the shares.
+    function _depositB(uint256 amt) internal returns (uint256 sharesB) {
+        _fundUSDC(depositorB, amt);
+        vm.startPrank(depositorB);
+        IERC20(BaseAddresses.USDC).approve(address(strategy), amt);
+        sharesB = strategy.deposit(amt, 0);
+        vm.stopPrank();
+        assertGt(sharesB, 0, "B got 0 shares");
+    }
+
+    /// @dev Stale ALL THREE Chainlink price feeds (updatedAt in the deep past) → nav()/deposit revert.
+    function _staleAllFeeds() internal {
+        address[3] memory feeds =
+            [BaseAddresses.CHAINLINK_BTC_USD, BaseAddresses.CHAINLINK_ETH_USD, BaseAddresses.CHAINLINK_USDC_USD];
+        for (uint256 i; i < feeds.length; i++) {
+            (uint80 rid, int256 answer,,,) = IAggregatorV3Min(feeds[i]).latestRoundData();
+            vm.mockCall(
+                feeds[i],
+                abi.encodeWithSignature("latestRoundData()"),
+                abi.encode(rid, answer, uint256(1), uint256(1), rid)
+            );
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────

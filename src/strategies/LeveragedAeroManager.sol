@@ -69,6 +69,7 @@ library LeveragedAeroManager {
     error FeedDecimalsMismatch();
     error ZeroMinOut();
     error BelowOracleFloor(); // compound swap fill < AERO/USD oracle floor (L9)
+    error FastRedeemExceedsLtv(uint256 ltvBps, uint256 maxLtvBps); // fast-path redeem would breach maxLtvBps
 
     // ── Constants (compile-time literals, duplicated from the strategy) ──
     uint8 private constant CBBTC_DECIMALS = 8; // cbBTC is 8dp wrapped Bitcoin
@@ -85,7 +86,18 @@ library LeveragedAeroManager {
     /// @dev Aerodrome v2 PoolFactory on Base (`router.defaultFactory()`), required by the Route.
     address private constant AERO_V2_FACTORY = 0x420DD381b31aEf6683db6B902084cB0FFECe40Da;
 
-    // ── Diamond storage — Layout/STORAGE_SLOT/_layout() byte-identical to LeveragedAerodromeCLStrategy ──
+    // ── Diamond storage — Layout/STORAGE_SLOT/_layout()/RedeemRequest byte-identical to
+    //    LeveragedAerodromeCLStrategy (delegatecall slot discipline) ──
+
+    /// @dev Escrowed async-redeem request (Lane-B-style, but NO price freeze — shares keep bearing
+    ///      PnL until execution, so `cancelRedeem` is not a free look-back option).
+    struct RedeemRequest {
+        address owner; // request creator; the only address that can cancel / emergency-redeem it
+        uint256 shares; // vault shares escrowed in the strategy at request time
+        uint256 minAssetsOut; // slippage floor enforced at fulfill (fresh arg at emergencyRedeem)
+        uint40 requestedAt; // request timestamp; FULFILL_WINDOW deadman clock anchor
+        bool settled; // set once fulfilled / cancelled / emergency-redeemed (double-spend guard)
+    }
 
     /// @custom:storage-location erc7201:leveraged.aero.cl.storage
     struct Layout {
@@ -128,8 +140,11 @@ library LeveragedAeroManager {
         uint256 hwmPerShare; // HWM nav-per-share (1e18 WAD), 0 until first deposit
         uint256 lastFeeAccrualTimestamp;
         uint256 protocolFeeOwed; // accrued protocol-fee USDC liability (6dp); discharged in redeem/compound/settle
-        // ── LAST field: appended for the L9 compound oracle floor (keep byte-identical in the strategy) ──
+        // ── appended for the L9 compound oracle floor (keep byte-identical in the strategy) ──
         address aeroUsdFeed; // AERO/USD aggregator (8dp) — floors compound()'s AERO→USDC swap
+        // ── LAST fields: appended for the escrowed async-redeem queue (keep byte-identical) ──
+        uint256 nextRedeemRequestId; // monotonic id cursor for `redeemRequests`
+        mapping(uint256 => RedeemRequest) redeemRequests; // id → escrowed async redeem
     }
 
     /// @dev keccak256(abi.encode(uint256(keccak256("leveraged.aero.cl.storage")) - 1)) & ~bytes32(uint256(0xff))
@@ -266,6 +281,35 @@ library LeveragedAeroManager {
         // stayers' idle-leg share already stayed un-swept above, as legs).
         uint256 usdcFinal = IERC20($.usdc).balanceOf(address(this));
         return usdcFinal > stayersIdle ? usdcFinal - stayersIdle : 0;
+    }
+
+    /// @notice Oracle-priced fast-redeem funding (body of the strategy's `redeem`): free `assetsOut`
+    ///         USDC from the Moonwell mUSDC collateral ONLY — no LP touch, no debt repay. The LTV gate
+    ///         is computed BEFORE the withdraw on the same `_readCollateralDebt` basis as
+    ///         `_assertHealthy`: a redeem that would push post-withdraw LTV above `maxLtvBps` reverts
+    ///         `FastRedeemExceedsLtv` (a typed, frontend-routable error — send the user to
+    ///         `requestRedeem`), and `_assertHealthy()` runs after as belt. The strategy pays the
+    ///         redeemer + burns shares; this only frees the USDC.
+    function fastRedeemImpl(uint256 assetsOut) public {
+        (uint256 collateralUsdc, uint256 debtUsdc) = _readCollateralDebt();
+        uint256 maxLtv = uint256(_layout().maxLtvBps);
+        // Predict the post-withdraw LTV on the pre-withdraw prices (collateral shrinks by assetsOut,
+        // debt unchanged). `assetsOut >= collateralUsdc` would zero/negate the denominator → reject.
+        if (assetsOut >= collateralUsdc) revert FastRedeemExceedsLtv(type(uint256).max, maxLtv);
+        if (debtUsdc > 0) {
+            uint256 postLtv = (debtUsdc * 10_000) / (collateralUsdc - assetsOut);
+            if (postLtv > maxLtv) revert FastRedeemExceedsLtv(postLtv, maxLtv);
+        }
+        _redeemUnderlying(_layout().mUsdc, assetsOut);
+        _assertHealthy(); // authoritative post-op gate (belt over the pre-withdraw prediction)
+    }
+
+    /// @notice Public view wrapper over `_readCollateralDebt` for the strategy's `previewRedeem`
+    ///         (advisory fast-path gate prediction). Delegatecalled under staticcall — the oracle
+    ///         reads inside `_readCollateralDebt` fail-closed (revert) on a down feed, which the
+    ///         strategy's `previewRedeem` catches to return `(0,false)`.
+    function readCollateralDebtImpl() public view returns (uint256 collateralUsdc, uint256 debtUsdc) {
+        return _readCollateralDebt();
     }
 
     /// @notice Deploy `amount` of idle strategy USDC into the existing levered position
@@ -522,6 +566,20 @@ library LeveragedAeroManager {
             _tokenToUsdc(cbDebt, CBBTC_DECIMALS, pBTC, pUsdc) + _tokenToUsdc(wethDebt, WETH_DECIMALS, pETH, pUsdc);
     }
 
+    // ── Moonwell call+check helpers (bytecode offset: 7 repay sites, 3 redeem sites) ──
+
+    /// @dev `market.repayBorrow(amt)` with the uniform error-check. Approve the underlying first.
+    function _repay(address market, uint256 amt) private {
+        uint256 err = IMoonwellMarket(market).repayBorrow(amt);
+        if (err != 0) revert MoonwellRepayFailed(err);
+    }
+
+    /// @dev `mUsdc.redeemUnderlying(amt)` with the uniform error-check.
+    function _redeemUnderlying(address cToken, uint256 amt) private {
+        uint256 err = ICToken(cToken).redeemUnderlying(amt);
+        if (err != 0) revert MoonwellRedeemFailed(err);
+    }
+
     // ── Execute helpers ──
 
     /// @dev Supply all strategy USDC to Moonwell and enter the mUSDC market.
@@ -721,15 +779,13 @@ library LeveragedAeroManager {
         uint256 cbBal = IERC20(cbBTC_).balanceOf(address(this));
         if (cbBal > 0 && cbDebt > 0) {
             IERC20(cbBTC_).forceApprove(mCbBTC_, cbBal);
-            uint256 err = IMoonwellMarket(mCbBTC_).repayBorrow(cbBal >= cbDebt ? type(uint256).max : cbBal);
-            if (err != 0) revert MoonwellRepayFailed(err);
+            _repay(mCbBTC_, cbBal >= cbDebt ? type(uint256).max : cbBal);
         }
         // Repay WETH (ERC-20 — no unwrap; mWETH accepts WETH ERC-20 for repay)
         uint256 wethBal = IERC20(weth_).balanceOf(address(this));
         if (wethBal > 0 && wethDebt > 0) {
             IERC20(weth_).forceApprove(mWeth_, wethBal);
-            uint256 err = IMoonwellMarket(mWeth_).repayBorrow(wethBal >= wethDebt ? type(uint256).max : wethBal);
-            if (err != 0) revert MoonwellRepayFailed(err);
+            _repay(mWeth_, wethBal >= wethDebt ? type(uint256).max : wethBal);
         }
         // Handle any remaining shortfall (IL or fees ate into LP value)
         _settleShortfall();
@@ -753,10 +809,7 @@ library LeveragedAeroManager {
         if (wethDebtRem > 0 && wethUsdcNeed == 0) wethUsdcNeed = 1e5;
         uint256 totalNeed = cbUsdcNeed + wethUsdcNeed;
         // Redeem USDC collateral to fund the swaps (health elevated after partial repays)
-        if (totalNeed > 0) {
-            uint256 redeemErr = ICToken($.mUsdc).redeemUnderlying(totalNeed);
-            if (redeemErr != 0) revert MoonwellRedeemFailed(redeemErr);
-        }
+        if (totalNeed > 0) _redeemUnderlying($.mUsdc, totalNeed);
         uint256 slip = uint256($.maxSlippageBps);
         // Cover cbBTC shortfall
         if (cbDebtRem > 0) {
@@ -764,8 +817,7 @@ library LeveragedAeroManager {
             uint256 cbBal2 = IERC20($.cbBTC).balanceOf(address(this));
             if (cbBal2 > 0) {
                 IERC20($.cbBTC).forceApprove($.mCbBTC, cbBal2);
-                uint256 err = IMoonwellMarket($.mCbBTC).repayBorrow(type(uint256).max);
-                if (err != 0) revert MoonwellRepayFailed(err);
+                _repay($.mCbBTC, type(uint256).max);
             }
         }
         // Cover WETH shortfall (bounded by its own oracle budget, not the full idle balance — M1;
@@ -775,8 +827,7 @@ library LeveragedAeroManager {
             uint256 wBal2 = IERC20($.weth).balanceOf(address(this));
             if (wBal2 > 0) {
                 IERC20($.weth).forceApprove($.mWeth, wBal2);
-                uint256 err = IMoonwellMarket($.mWeth).repayBorrow(type(uint256).max);
-                if (err != 0) revert MoonwellRepayFailed(err);
+                _repay($.mWeth, type(uint256).max);
             }
         }
     }
@@ -951,8 +1002,7 @@ library LeveragedAeroManager {
             uint256 cbRepay = cbBudget >= cbDebtRepay ? cbDebtRepay : cbBudget;
             if (cbRepay > 0) {
                 IERC20(cbBTC_).forceApprove(mCbBTC_, cbRepay);
-                uint256 err = IMoonwellMarket(mCbBTC_).repayBorrow(cbRepay);
-                if (err != 0) revert MoonwellRepayFailed(err);
+                _repay(mCbBTC_, cbRepay);
             }
             cbShort = cbDebtRepay > cbBudget ? cbDebtRepay - cbBudget : 0;
         }
@@ -964,8 +1014,7 @@ library LeveragedAeroManager {
             uint256 wethRepay = wethBudget >= wethDebtRepay ? wethDebtRepay : wethBudget;
             if (wethRepay > 0) {
                 IERC20(weth_).forceApprove(mWeth_, wethRepay);
-                uint256 err = IMoonwellMarket(mWeth_).repayBorrow(wethRepay);
-                if (err != 0) revert MoonwellRepayFailed(err);
+                _repay(mWeth_, wethRepay);
             }
             wethShort = wethDebtRepay > wethBudget ? wethDebtRepay - wethBudget : 0;
         }
@@ -1001,8 +1050,7 @@ library LeveragedAeroManager {
         uint256 tokenBal = IERC20(tokenOut).balanceOf(address(this));
         if (tokenBal > 0) {
             IERC20(tokenOut).forceApprove(market, tokenBal);
-            uint256 err = IMoonwellMarket(market).repayBorrow(tokenBal >= amountOut ? amountOut : tokenBal);
-            if (err != 0) revert MoonwellRepayFailed(err);
+            _repay(market, tokenBal >= amountOut ? amountOut : tokenBal);
         }
     }
 
@@ -1015,8 +1063,7 @@ library LeveragedAeroManager {
         uint256 totalUnderlying = (cBal * rate) / 1e18;
         uint256 toRedeem = Math.mulDiv(totalUnderlying, shares, supply);
         if (toRedeem == 0) return;
-        uint256 err = ICToken(mUsdc_).redeemUnderlying(toRedeem);
-        if (err != 0) revert MoonwellRedeemFailed(err);
+        _redeemUnderlying(mUsdc_, toRedeem);
     }
 
     // ── Shared helpers (health, NPM read, config build) ──

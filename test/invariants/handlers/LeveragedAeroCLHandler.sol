@@ -44,6 +44,13 @@ contract MockVaultShares {
         return true;
     }
 
+    function transfer(address to, uint256 amount) external returns (bool) {
+        require(balanceOf[msg.sender] >= amount, "ERC20InsufficientBalance");
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+
     function strategyMint(address to, uint256 shares) external {
         balanceOf[to] += shares;
         totalSupply += shares;
@@ -176,6 +183,11 @@ contract LeveragedAeroCLHandler is LeveragedAeroForkBase {
         } catch {}
     }
 
+    /// @dev Exercises the oracle-free proportional-unwind mechanics (IL self-funding, stayer-safety)
+    ///      through the ESCROWED async path — `requestRedeem` (actor) → `fulfillRedeem` (proposer) —
+    ///      since the everyday `redeem` was demoted to the LTV-gated oracle-priced fast path. The
+    ///      conservation/health brackets and ghost accounting are unchanged; the redeemer's payout is
+    ///      measured via its USDC-balance delta (fulfill returns the amount only via event).
     function redeem(uint256 actorSeed, uint256 shareSeed) external {
         if (!live) return;
         opCount++;
@@ -187,16 +199,25 @@ contract LeveragedAeroCLHandler is LeveragedAeroForkBase {
         uint256 supply = vaultShares.totalSupply();
         uint256 pre = _safePerShare();
         uint256 fair = _safeFair(s, supply);
+        uint256 usdcBefore = IERC20(USDC).balanceOf(a);
 
         vm.prank(a);
         vaultShares.approve(address(strategy), s);
         vm.prank(a);
-        try strategy.redeem(s, 0) returns (uint256 assetsOut) {
-            ghostBurned += s;
-            ghostPaidOut += assetsOut;
-            ghostFairOut += fair;
-            redeemOk++;
-            _postOp("redeem", pre, SLACK_REDEEM, true);
+        try strategy.requestRedeem(s, 0) returns (uint256 id) {
+            vm.prank(proposer);
+            try strategy.fulfillRedeem(id) {
+                ghostBurned += s;
+                ghostPaidOut += IERC20(USDC).balanceOf(a) - usdcBefore;
+                ghostFairOut += fair;
+                redeemOk++;
+                _postOp("redeem", pre, SLACK_REDEEM, true);
+            } catch {
+                // Fulfill failed (e.g. IL under a shove) — return the escrowed shares so the escrow
+                // never strands them (keeps the totalSupply/holder-sum invariant intact).
+                vm.prank(a);
+                strategy.cancelRedeem(id);
+            }
         } catch {}
     }
 

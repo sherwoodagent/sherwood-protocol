@@ -445,8 +445,9 @@ contract LeveragedAeroCLE2EFork is LeveragedAeroForkBase {
         vm.clearMockedCalls();
     }
 
-    /// @dev Approval-gated, oracle-free partial redeem: an LP burns half their shares for
-    ///      pro-rata USDC. Without the prior `vault.approve(strategy, shares)` it reverts.
+    /// @dev Approval-gated fast-path partial redeem: an LP burns half their shares for f·nav USDC
+    ///      (collateral-funded). Without the prior `vault.approve(strategy, shares)` it reverts (the
+    ///      fast path prices nav() first, then pulls the shares — the pull reverts unapproved).
     function _exercisePartialRedeem() internal {
         uint256 lp1Shares = vault.balanceOf(lp1);
         assertGt(lp1Shares, 0, "lp1 holds no shares");

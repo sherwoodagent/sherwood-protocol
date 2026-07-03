@@ -6,6 +6,7 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 import {LeveragedAerodromeCLStrategy} from "../src/strategies/LeveragedAerodromeCLStrategy.sol";
 import {LeveragedAeroManager} from "../src/strategies/LeveragedAeroManager.sol";
+import {LeveragedAeroFees} from "../src/strategies/LeveragedAeroFees.sol";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Minimal ERC-20 with test-only mint / burn.
@@ -75,6 +76,12 @@ contract MockVault {
         return true;
     }
 
+    function transfer(address to, uint256 amt) external returns (bool) {
+        balanceOf[msg.sender] -= amt;
+        balanceOf[to] += amt;
+        return true;
+    }
+
     function strategyMint(address to, uint256 shares) external {
         balanceOf[to] += shares;
         totalSupply += shares;
@@ -113,6 +120,10 @@ contract MockMarket {
 contract MockCUsdc {
     uint256 public cBal;
 
+    function setCBal(uint256 b) external {
+        cBal = b;
+    }
+
     function balanceOf(address) external view returns (uint256) {
         return cBal;
     }
@@ -122,6 +133,34 @@ contract MockCUsdc {
     }
 
     function redeemUnderlying(uint256) external pure returns (uint256) {
+        return 0;
+    }
+}
+
+/// @dev Funded mUSDC for the fast-path test: `redeemUnderlying(amt)` burns `amt` mUSDC face and
+///      delivers `amt` USDC to the strategy (the fast-path payout source). `cBal` = collateral face.
+contract MockCUsdcFunded {
+    MockToken public usdc;
+    address public strategy;
+    uint256 public cBal;
+
+    constructor(MockToken u, address s, uint256 c) {
+        usdc = u;
+        strategy = s;
+        cBal = c;
+    }
+
+    function balanceOf(address) external view returns (uint256) {
+        return cBal;
+    }
+
+    function exchangeRateStored() external pure returns (uint256) {
+        return 1e18;
+    }
+
+    function redeemUnderlying(uint256 amt) external returns (uint256) {
+        cBal -= amt; // 1:1 at rate 1e18
+        usdc.mint(strategy, amt);
         return 0;
     }
 }
@@ -226,9 +265,11 @@ contract LeveragedAeroCLProtocolFeeTest is Test {
     // BaseStrategy sequential slots.
     uint256 private constant SLOT_VAULT = 1;
     uint256 private constant SLOT_PROPOSER_STATE_INIT = 2;
-    // _state = Executed(1), _initialized(true) → (1<<168)|(1<<160)
+    // _proposer (bits 0-159) + _state = Executed(1) (bit 160) + _initialized(true) (bit 168) share slot 2.
     uint256 private constant STATE_EXECUTED_INIT = (uint256(1) << 168) | (uint256(1) << 160);
     uint256 private constant SHARES_VIRTUAL_OFFSET = 1e6;
+    // Proposer for the fulfill path (fulfillRedeem is onlyProposer). Packed into slot 2 alongside state.
+    address private constant PROPOSER = address(0xB0B);
 
     // Chainlink prices (8dp) for the settle no-op feed reads.
     uint256 private constant P_BTC = 10_000_000_000_000; // $100k
@@ -289,7 +330,9 @@ contract LeveragedAeroCLProtocolFeeTest is Test {
     // Test 3 — redeem skim (oracle-independent)
     // ═════════════════════════════════════════════════════════════════════════
 
-    /// @dev Flat-book redeem skims f×owed to the recipient, nets the payout, decrements owed.
+    /// @dev MIGRATED (fast path demoted): the Item-3 skim now lives on the escrowed async path
+    ///      (`requestRedeem → fulfillRedeem`), so the flat-book proportional-unwind + skim mechanics
+    ///      are exercised there. Skims f×owed to the recipient, nets the payout, decrements owed.
     function test_redeem_skimsProtocolFee_netPayout() public {
         (NavHarness h, MockToken usdc, MockVault vault, MockGovernor gov) = _redeemFixture();
         gov.setFee(100, RECIPIENT);
@@ -298,16 +341,15 @@ contract LeveragedAeroCLProtocolFeeTest is Test {
         _storeUint(address(h), SLOT_OWED, 400e6); // skim = f×owed = 200e6
 
         (address redeemer, uint256 shares) = _fundRedeemer(vault, h, "redeemer");
-        vm.prank(redeemer);
-        uint256 out = h.redeem(shares, 0);
+        _requestAndFulfill(h, redeemer, shares, 0);
 
-        assertEq(out, 5_000e6 - 200e6, "net payout = f*idle - f*owed");
+        assertEq(usdc.balanceOf(redeemer), 4_800e6, "redeemer receives net = f*idle - f*owed");
         assertEq(usdc.balanceOf(RECIPIENT), 200e6, "recipient receives f*owed");
-        assertEq(usdc.balanceOf(redeemer), 4_800e6, "redeemer receives net");
         assertEq(h.layout().protocolFeeOwed, 200e6, "owed decremented by the skim");
     }
 
-    /// @dev minAssetsOut applies to the NET amount: a bound above net but below gross reverts.
+    /// @dev MIGRATED: the STORED `minAssetsOut` applies to the NET amount at fulfill — a bound above net
+    ///      but below gross reverts. (requestRedeem escrows minOut; fulfillRedeem enforces it net.)
     function test_redeem_minAssetsOut_appliesToNet() public {
         (NavHarness h, MockToken usdc, MockVault vault, MockGovernor gov) = _redeemFixture();
         gov.setFee(100, RECIPIENT);
@@ -316,14 +358,15 @@ contract LeveragedAeroCLProtocolFeeTest is Test {
 
         (address redeemer, uint256 shares) = _fundRedeemer(vault, h, "redeemer2");
         vm.prank(redeemer);
+        uint256 id = h.requestRedeem(shares, 4_900e6); // net 4_800 < 4_900 < gross 5_000
+        vm.prank(PROPOSER);
         vm.expectRevert(LeveragedAerodromeCLStrategy.InsufficientAssetsOut.selector);
-        h.redeem(shares, 4_900e6); // net 4_800 < 4_900 < gross 5_000 → revert
+        h.fulfillRedeem(id);
     }
 
-    /// @dev The skim is pure arithmetic on stored state — no oracle read anywhere in redeem. We prove
-    ///      oracle-independence by NOT wiring any Chainlink mock (a flat book needs none) and asserting
-    ///      the same net payout as the priced fixture. `nav()` in redeem's try/catch returns idle−owed
-    ///      cleanly (flat book), and the skim math is identical regardless.
+    /// @dev MIGRATED: the skim is pure arithmetic on stored state — no oracle read anywhere in the
+    ///      proportional-unwind (fulfill) path. We prove oracle-independence by NOT wiring any Chainlink
+    ///      mock (a flat book needs none) and asserting the same net payout as the priced fixture.
     function test_redeem_oracleIndependentSkim() public {
         (NavHarness h, MockToken usdc, MockVault vault, MockGovernor gov) = _redeemFixture();
         gov.setFee(100, RECIPIENT);
@@ -331,10 +374,215 @@ contract LeveragedAeroCLProtocolFeeTest is Test {
         _storeUint(address(h), SLOT_OWED, 400e6);
 
         (address redeemer, uint256 shares) = _fundRedeemer(vault, h, "redeemer3");
+        _requestAndFulfill(h, redeemer, shares, 0);
+        assertEq(usdc.balanceOf(redeemer), 4_800e6, "oracle-independent net payout");
+        assertEq(usdc.balanceOf(RECIPIENT), 200e6, "recipient paid without any oracle");
+    }
+
+    /// @dev NEW (fast-path fee-neutrality): the fast path prices `f × nav` and takes NO protocol skim
+    ///      — `nav()` is already net of `protocolFeeOwed`, so a skim would double-charge. Assert the
+    ///      redeemer gets exactly `f × nav`, `protocolFeeOwed` is UNCHANGED, and the recipient is NOT
+    ///      paid. (Debt = 0 → the LTV gate passes; collateral funds the payout.) The per-share
+    ///      preservation under an ACTIVE position is proven in the redeem fork suite.
+    function test_fastRedeem_feeNeutral_noSkim() public {
+        (NavHarness h, MockToken usdc, MockVault vault, MockGovernor gov) = _redeemFixture();
+        gov.setFee(100, RECIPIENT);
+
+        // Flat book: nav = idle USDC = 10_000e6. owed = 400e6 → navNet = 9_600e6. f = 1/2.
+        uint256 idle = 10_000e6;
+        usdc.mint(address(h), idle);
+        _storeUint(address(h), SLOT_OWED, 400e6);
+        // Funded mUSDC collateral (debt already 0 in the fixture) so fastRedeemImpl can free the payout.
+        MockCUsdcFunded mUsdc = new MockCUsdcFunded(usdc, address(h), 1_000_000e6);
+        _store(address(h), SLOT_MUSDC, address(mUsdc));
+
+        uint256 navNet = h.nav(); // 9_600e6
+        assertEq(navNet, idle - 400e6, "nav must be net of owed");
+
+        (address redeemer, uint256 shares) = _fundRedeemer(vault, h, "fast");
+        uint256 supply = vault.totalSupply();
+        uint256 expected = Math.mulDiv(shares, navNet, supply); // f × navNet = 4_800e6
+
         vm.prank(redeemer);
         uint256 out = h.redeem(shares, 0);
-        assertEq(out, 4_800e6, "oracle-independent net payout");
-        assertEq(usdc.balanceOf(RECIPIENT), 200e6, "recipient paid without any oracle");
+
+        assertEq(out, expected, "fast path pays exactly f * navNet");
+        assertEq(usdc.balanceOf(redeemer), expected, "redeemer received f * navNet");
+        assertEq(h.layout().protocolFeeOwed, 400e6, "NO skim: owed unchanged on the fast path");
+        assertEq(usdc.balanceOf(RECIPIENT), 0, "NO skim: recipient not paid on the fast path");
+    }
+
+    // Fast-path LTV gate + previewRedeem (fastOk / (0,false) on oracle-down) are exercised against a
+    // REAL levered Moonwell book in test/integration/strategies/LeveragedAeroCL.redeem.fork.t.sol
+    // (they need collateral+debt priced through the actual markets, not a flat-book mock).
+
+    /// @dev NEW (fast-path fresh-slice netting): with an uncrystallized gain above the HWM and
+    ///      protocolFeeBps > 0, the fast path's crystallize accrues a FRESH protocol slice p AND mints
+    ///      perf-fee shares. Pricing must use (navPre − p) over the POST-MINT supply — otherwise the
+    ///      redeemer captures f×p from stayers. Expected values recomputed via the pure fees lib.
+    ///      Payout is funded from idle (no-op redeemUnderlying) so the flat-book model is
+    ///      self-consistent: nav drops by exactly assetsOut → stayers' per-share must be preserved.
+    function test_fastRedeem_freshProtocolSlice_notCapturedByRedeemer() public {
+        (NavHarness h, MockToken usdc, MockVault vault, MockGovernor gov) = _redeemFixture();
+        gov.setFee(1000, RECIPIENT); // 10% protocol slice on gross gain
+        address perfRec = address(0xFEE5);
+        _setPerfFeeAndRecipient(address(h), 1000, perfRec); // 10% perf fee → a real mint occurs
+
+        // Uncrystallized gain: nav 110k vs HWM seeded at the 100k-per-share basis.
+        uint256 idle = 110_000e6;
+        usdc.mint(address(h), idle);
+        uint256 supply0 = vault.totalSupply();
+        uint256 hwm = Math.mulDiv(100_000e6, 1e18, supply0);
+        _storeUint(address(h), SLOT_HWM, hwm);
+        // Collateral gate: large cBal, zero debt; MockCUsdc.redeemUnderlying is a no-op, so the payout
+        // is funded from idle (nav-consistent).
+        MockCUsdc(_addr(address(h), SLOT_MUSDC)).setCBal(1_000_000e6);
+
+        uint256 navPre = h.nav(); // 110_000e6 (owed 0)
+        // Mirror the crystallize with the pure lib: same inputs the strategy will use (dt = 0).
+        uint256 ts = vm.getBlockTimestamp();
+        (uint256 feeShares,,, uint256 freshSlice) =
+            LeveragedAeroFees.crystallize(navPre, supply0, hwm, ts, ts, 0, 1000, 1000);
+        assertGt(freshSlice, 0, "fixture must accrue a fresh protocol slice");
+        assertGt(feeShares, 0, "fixture must mint perf-fee shares");
+
+        (address redeemer, uint256 shares) = _fundRedeemer(vault, h, "slice");
+        uint256 expected = Math.mulDiv(shares, navPre - freshSlice, supply0 + feeShares);
+
+        vm.prank(redeemer);
+        uint256 out = h.redeem(shares, 0);
+
+        // Redeemer does NOT capture f×slice: paid exactly f × (navPre − slice) at the post-mint supply.
+        assertEq(out, expected, "fast path must net the fresh slice + use post-mint supply");
+        assertEq(usdc.balanceOf(redeemer), expected, "redeemer balance mismatch");
+        assertEq(h.layout().protocolFeeOwed, freshSlice, "fresh slice persists as owed (no skim/discharge)");
+        assertEq(usdc.balanceOf(RECIPIENT), 0, "no discharge on the fast path");
+
+        // Stayers' per-share preserved (payout funded from idle → nav drops by exactly `out`).
+        uint256 perShareBefore = Math.mulDiv(navPre - freshSlice, 1e18, supply0 + feeShares);
+        uint256 perShareAfter = Math.mulDiv(h.nav(), 1e18, vault.totalSupply());
+        assertGe(perShareAfter, perShareBefore, "stayers diluted by the fast redeem");
+        assertApproxEqRel(perShareAfter, perShareBefore, 0.0001e18, "stayers per-share moved > dust");
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // Test 3b — emergencyRedeem deadman gate + cancelRedeem (unit; fork covers the live book)
+    // ═════════════════════════════════════════════════════════════════════════
+
+    /// @dev Window boundary: at exactly `requestedAt + FULFILL_WINDOW` (2 days) the gate is still
+    ///      closed (strictly-greater required); one second later it opens.
+    function test_emergencyRedeem_beforeWindow_reverts() public {
+        (NavHarness h, MockToken usdc, MockVault vault,) = _redeemFixture();
+        usdc.mint(address(h), 10_000e6);
+        (address redeemer, uint256 shares) = _fundRedeemer(vault, h, "em1");
+        vm.prank(redeemer);
+        uint256 id = h.requestRedeem(shares, 0);
+
+        vm.warp(vm.getBlockTimestamp() + 2 days); // == requestedAt + FULFILL_WINDOW → still closed
+        vm.prank(redeemer);
+        vm.expectRevert(LeveragedAerodromeCLStrategy.FulfillWindowOpen.selector);
+        h.emergencyRedeem(id, 0);
+
+        vm.warp(vm.getBlockTimestamp() + 1); // strictly past → open
+        vm.prank(redeemer);
+        uint256 out = h.emergencyRedeem(id, 0);
+        assertEq(out, 5_000e6, "f*idle payout after the window");
+        assertEq(usdc.balanceOf(redeemer), 5_000e6, "redeemer not paid");
+    }
+
+    /// @dev Only the request owner can emergency-redeem, even after the window.
+    function test_emergencyRedeem_nonOwner_reverts() public {
+        (NavHarness h, MockToken usdc, MockVault vault,) = _redeemFixture();
+        usdc.mint(address(h), 10_000e6);
+        (address redeemer, uint256 shares) = _fundRedeemer(vault, h, "em2");
+        vm.prank(redeemer);
+        uint256 id = h.requestRedeem(shares, 0);
+
+        vm.warp(vm.getBlockTimestamp() + 2 days + 1);
+        vm.prank(makeAddr("mallory"));
+        vm.expectRevert(LeveragedAerodromeCLStrategy.NotRequestOwner.selector);
+        h.emergencyRedeem(id, 0);
+    }
+
+    /// @dev Pays the owner the proportional out NET of the Item-3 skim, burns the escrowed shares,
+    ///      marks the request settled; a second call reverts.
+    function test_emergencyRedeem_paysAndSettles() public {
+        (NavHarness h, MockToken usdc, MockVault vault, MockGovernor gov) = _redeemFixture();
+        gov.setFee(100, RECIPIENT);
+        usdc.mint(address(h), 10_000e6);
+        _storeUint(address(h), SLOT_OWED, 400e6); // skim = f×owed = 200e6
+
+        (address redeemer, uint256 shares) = _fundRedeemer(vault, h, "em3");
+        uint256 supplyBefore = vault.totalSupply();
+        vm.prank(redeemer);
+        uint256 id = h.requestRedeem(shares, 0);
+
+        vm.warp(vm.getBlockTimestamp() + 2 days + 1);
+        vm.prank(redeemer);
+        uint256 out = h.emergencyRedeem(id, 0);
+
+        assertEq(out, 4_800e6, "net payout = f*idle - f*owed");
+        assertEq(usdc.balanceOf(redeemer), 4_800e6, "owner receives net-of-skim");
+        assertEq(usdc.balanceOf(RECIPIENT), 200e6, "recipient receives f*owed");
+        assertEq(vault.totalSupply(), supplyBefore - shares, "escrowed shares not burned");
+        assertEq(vault.balanceOf(address(h)), 0, "strategy still holds escrow");
+        assertTrue(h.redeemRequest(id).settled, "request not marked settled");
+
+        vm.prank(redeemer);
+        vm.expectRevert(LeveragedAerodromeCLStrategy.RequestSettled.selector);
+        h.emergencyRedeem(id, 0); // double-settle prevented
+    }
+
+    /// @dev The FRESH caller-passed minAssetsOut is what's enforced — the stored one is ignored:
+    ///      an impossible stored floor doesn't block, and an impossible fresh floor does.
+    function test_emergencyRedeem_freshMinAssetsOut_enforced() public {
+        (NavHarness h, MockToken usdc, MockVault vault,) = _redeemFixture();
+        usdc.mint(address(h), 10_000e6); // net f*idle = 5_000e6
+        (address redeemer, uint256 shares) = _fundRedeemer(vault, h, "em4");
+        vm.prank(redeemer);
+        uint256 id = h.requestRedeem(shares, 9_999e6); // stored floor is impossible (> 5_000e6)
+
+        vm.warp(vm.getBlockTimestamp() + 2 days + 1);
+        // Impossible FRESH floor → reverts (even though a passing path exists at floor 0).
+        vm.prank(redeemer);
+        vm.expectRevert(LeveragedAerodromeCLStrategy.InsufficientAssetsOut.selector);
+        h.emergencyRedeem(id, 6_000e6);
+        // Passing FRESH floor → succeeds DESPITE the impossible stored floor (stored is ignored).
+        vm.prank(redeemer);
+        uint256 out = h.emergencyRedeem(id, 0);
+        assertEq(out, 5_000e6, "fresh-floor payout");
+    }
+
+    /// @dev cancelRedeem returns the exact escrowed shares, settles the request, and blocks a
+    ///      subsequent fulfill. (The cancel-after-_settle variant stays fork-side.)
+    function test_cancelRedeem_returnsEscrow_unit() public {
+        (NavHarness h,, MockVault vault,) = _redeemFixture();
+        (address redeemer, uint256 shares) = _fundRedeemer(vault, h, "em5");
+        vm.prank(redeemer);
+        uint256 id = h.requestRedeem(shares, 0);
+        assertEq(vault.balanceOf(redeemer), 0, "shares not escrowed");
+        assertEq(vault.balanceOf(address(h)), shares, "strategy did not receive escrow");
+
+        vm.prank(redeemer);
+        h.cancelRedeem(id);
+        assertEq(vault.balanceOf(redeemer), shares, "cancel did not return the exact shares");
+        assertEq(vault.balanceOf(address(h)), 0, "escrow left behind");
+        assertTrue(h.redeemRequest(id).settled, "request not settled by cancel");
+
+        vm.prank(PROPOSER);
+        vm.expectRevert(LeveragedAerodromeCLStrategy.RequestSettled.selector);
+        h.fulfillRedeem(id);
+    }
+
+    /// @dev Pack performanceFeeBps + feeRecipient into diamond slot 19 (posTickLower 0-23 |
+    ///      posTickUpper 24-47 | mgmtBps 48-63 | perfBps 64-79 | feeRecipient 80-239).
+    function _setPerfFeeAndRecipient(address t, uint16 perfBps, address rec) private {
+        vm.store(t, bytes32(STRAT_BASE + 19), bytes32((uint256(perfBps) << 64) | (uint256(uint160(rec)) << 80)));
+    }
+
+    /// @dev Read an address field back out of a diamond slot (low 160 bits).
+    function _addr(address t, uint256 slot) private view returns (address) {
+        return address(uint160(uint256(vm.load(t, bytes32(slot)))));
     }
 
     // ═════════════════════════════════════════════════════════════════════════
@@ -416,8 +664,8 @@ contract LeveragedAeroCLProtocolFeeTest is Test {
     // Test 6 — zero cases
     // ═════════════════════════════════════════════════════════════════════════
 
-    /// @dev protocolFeeBps == 0 → a crystallize (via redeem's best-effort path) accrues nothing even
-    ///      when there IS a gain above the HWM.
+    /// @dev MIGRATED: protocolFeeBps == 0 → the fulfill-path crystallize accrues nothing even when there
+    ///      IS a gain above the HWM. (Same best-effort crystallize as the pre-redesign redeem.)
     function test_zeroBps_noAccrual() public {
         (NavHarness h, MockToken usdc, MockVault vault, MockGovernor gov) = _redeemFixture();
         gov.setFee(0, RECIPIENT); // rate 0
@@ -427,14 +675,13 @@ contract LeveragedAeroCLProtocolFeeTest is Test {
         _storeUint(address(h), SLOT_LAST_FEE, block.timestamp > 1 ? block.timestamp - 1 : 1);
 
         (address redeemer, uint256 shares) = _fundRedeemer(vault, h, "r0");
-        vm.prank(redeemer);
-        h.redeem(shares, 0);
+        _requestAndFulfill(h, redeemer, shares, 0);
 
         assertEq(h.layout().protocolFeeOwed, 0, "bps=0 must accrue no protocol fee");
     }
 
-    /// @dev recipient == address(0) → the liability still holds (nav stays net) but discharge skips,
-    ///      so a redeem pays the full gross and owed is unchanged.
+    /// @dev MIGRATED: recipient == address(0) → the liability still holds (nav stays net) but discharge
+    ///      skips, so the fulfill pays the full gross and owed is unchanged.
     function test_zeroRecipient_accruesButNoDischarge() public {
         (NavHarness h, MockToken usdc, MockVault vault, MockGovernor gov) = _redeemFixture();
         gov.setFee(100, address(0)); // rate set, recipient unset
@@ -442,10 +689,9 @@ contract LeveragedAeroCLProtocolFeeTest is Test {
         _storeUint(address(h), SLOT_OWED, 400e6);
 
         (address redeemer, uint256 shares) = _fundRedeemer(vault, h, "rz");
-        vm.prank(redeemer);
-        uint256 out = h.redeem(shares, 0);
+        _requestAndFulfill(h, redeemer, shares, 0);
 
-        assertEq(out, 5_000e6, "no discharge when recipient == 0 -> full gross");
+        assertEq(usdc.balanceOf(redeemer), 5_000e6, "no discharge when recipient == 0 -> full gross");
         assertEq(h.layout().protocolFeeOwed, 400e6, "liability persists when recipient == 0");
     }
 
@@ -465,7 +711,10 @@ contract LeveragedAeroCLProtocolFeeTest is Test {
         MockToken weth = new MockToken("WETH");
 
         _store(address(h), SLOT_VAULT, address(vault));
-        vm.store(address(h), bytes32(SLOT_PROPOSER_STATE_INIT), bytes32(STATE_EXECUTED_INIT));
+        // Pack proposer + Executed state + initialized into slot 2 (fulfillRedeem is onlyProposer).
+        vm.store(
+            address(h), bytes32(SLOT_PROPOSER_STATE_INIT), bytes32(STATE_EXECUTED_INIT | uint256(uint160(PROPOSER)))
+        );
         _store(address(h), SLOT_USDC, address(usdc));
         _store(address(h), SLOT_MUSDC, address(mUsdc));
         _store(address(h), SLOT_MCBBTC, address(mCbBTC));
@@ -474,6 +723,19 @@ contract LeveragedAeroCLProtocolFeeTest is Test {
         _store(address(h), SLOT_WETH, address(weth));
         _storeUint(address(h), SLOT_LAST_FEE, block.timestamp);
         // tokenId=0 (flat book) → redeem unwind reduces to f×idle, oracle-free.
+    }
+
+    /// @dev Migration helper (fast path demoted `redeem` → escrowed async path): the redeemer escrows
+    ///      `shares` via `requestRedeem`, then the proposer `fulfillRedeem`s — the SAME oracle-free
+    ///      proportional-unwind + Item-3 skim that the pre-redesign `redeem` ran. Returns the net out.
+    function _requestAndFulfill(NavHarness h, address redeemer, uint256 shares, uint256 minOut)
+        private
+        returns (uint256 id)
+    {
+        vm.prank(redeemer);
+        id = h.requestRedeem(shares, minOut);
+        vm.prank(PROPOSER);
+        h.fulfillRedeem(id);
     }
 
     /// @dev Give the redeemer HALF the existing supply WITHOUT changing totalSupply (so f = 1/2):

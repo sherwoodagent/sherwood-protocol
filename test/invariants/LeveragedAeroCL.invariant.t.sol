@@ -269,11 +269,17 @@ contract LeveragedAeroCLConservationAnchors is LeveragedAeroForkBase {
         uint256 navBefore = h.oracleNavNoGate();
         uint256 perShareBefore = h.perShareNoGate();
 
-        // (c) PARTIAL redeem: depositorB redeems ALL of B's shares (f < 1), leaving the stayer.
+        // (c) PARTIAL redeem via the escrowed async path (the proportional-unwind mechanic was
+        //     demoted off the everyday `redeem`): depositorB requests + the proposer fulfills ALL of
+        //     B's shares (f < 1), leaving the stayer. Payout measured via B's USDC-balance delta.
+        uint256 bUsdcBefore = IERC20(USDC).balanceOf(depositorB);
         vm.prank(depositorB);
         v.approve(address(strat), sharesB);
         vm.prank(depositorB);
-        uint256 assetsOut = strat.redeem(sharesB, 0);
+        uint256 reqId = strat.requestRedeem(sharesB, 0);
+        vm.prank(proposer);
+        strat.fulfillRedeem(reqId);
+        uint256 assetsOut = IERC20(USDC).balanceOf(depositorB) - bUsdcBefore;
 
         uint256 supplyAfter = v.totalSupply();
         assertEq(supplyAfter, supplyBefore - sharesB, "supply bookkeeping");

@@ -347,7 +347,8 @@ contract LeveragedAeroCLCompoundFork is LeveragedAeroForkBase {
         uint256 frAfterCompound = mockVault.balanceOf(feeRecipient);
         assertEq(frAfterCompound, 0, "compound should mint no perf fee on the first (seeding) crystallize");
 
-        // Redeem 10% of supply → crystallizes on the post-compound NAV (> HWM) → perf fee minted.
+        // Fast-path redeem 10% of supply → the fast path crystallizes on the post-compound NAV (> HWM)
+        // → perf fee minted. (Small size → the LTV gate passes; fast path is fine here.)
         uint256 redeemShares = mockVault.balanceOf(depositorA) / 10;
         vm.prank(depositorA);
         mockVault.approve(address(strategy), redeemShares);

@@ -334,10 +334,15 @@ contract LeveragedAeroCLRerangeFork is LeveragedAeroForkBase {
         // skim the stayers' (1-f) share of that remainder via the residual leg sweep.
         uint256 fairShare = (navBeforeRedeem * redeemShares) / supplyBefore;
 
+        // Redeem via the async proportional path (the idle-leg-reservation mechanic lives there now):
+        // request (depositor) → fulfill (proposer). Payout via depositor's USDC-balance delta.
+        uint256 dUsdcBefore = IERC20(USDC).balanceOf(depositor);
         vm.prank(depositor);
         mockVault.approve(address(strategy), redeemShares);
         vm.prank(depositor);
-        uint256 out = strategy.redeem(redeemShares, 0);
+        uint256 reqId = strategy.requestRedeem(redeemShares, 0);
+        strategy.fulfillRedeem(reqId); // proposer == address(this)
+        uint256 out = IERC20(USDC).balanceOf(depositor) - dUsdcBefore;
 
         // (1) Redeemer got ~f*nav (oracle-free exit slippage keeps it slightly under), NOT
         //     f*nav + (1-f)*remainder. Without the idle-leg reservation `out` would be ~2x fairShare
