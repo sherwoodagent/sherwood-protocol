@@ -19,6 +19,11 @@ contract MockVaultUnit {
         totalSupply = initialShares;
     }
 
+    /// @dev Strategy reads vault().governor() for the live protocol-fee rate; 0 ⇒ no protocol fee.
+    function governor() external pure returns (address) {
+        return address(0);
+    }
+
     function strategyMint(address to, uint256 shares) external {
         balanceOf[to] += shares;
         totalSupply += shares;

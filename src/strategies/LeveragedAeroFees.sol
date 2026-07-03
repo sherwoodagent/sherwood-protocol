@@ -23,6 +23,15 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 ///         the performance computation — LP-favourable: avoids double-counting that
 ///         dilution in the HWM basis.
 ///
+///         The **protocol** slice is taken off the GROSS gain above the HWM *first*
+///         (`protocol = gain × protocolFeeBps / 10 000`), then the performance fee accrues
+///         on the reduced `gain − protocol` — mirroring the governor's "protocol before agent"
+///         ordering in `_distributeFees`. The protocol slice is a USDC LIABILITY the strategy
+///         discharges where USDC flows (redeem / compound / settle), NOT a fee-share mint.
+///         The **HWM still advances to the gross-peak `navPerShareX`** (computed on `navPre`),
+///         so no gain is ever charged twice and the next cycle measures from the gross peak
+///         (LP-favourable, consistent with the dilution approximation).
+///
 ///         ## [1] review fix (phantom-fee guard)
 ///         `crystallize` must be called with the *pre-deposit* NAV, before the vault
 ///         pulls any USDC.  Calling it on the post-deposit NAV would let idle incoming
@@ -91,53 +100,68 @@ library LeveragedAeroFees {
     ///         - If `navPerShareX ≤ hwmPerShareX`: no fee, HWM unchanged.
     ///         - Else:
     ///
-    ///             gain = (navPerShareX − hwmPerShareX) × totalSupply / 1e18  (USDC 6 dp)
-    ///             fee  = gain × performanceFeeBps / 10 000                    (USDC 6 dp)
-    ///             feeShares = fee × totalSupply / (navPre − fee)              (12 dp shares)
+    ///             gain      = (navPerShareX − hwmPerShareX) × totalSupply / 1e18  (USDC 6 dp)
+    ///             protocol  = gain × protocolFeeBps / 10 000                       (off GROSS gain first)
+    ///             fee       = (gain − protocol) × performanceFeeBps / 10 000       (USDC 6 dp)
+    ///             feeShares = fee × totalSupply / (navPre − fee)                   (12 dp shares)
     ///
-    ///           After mint the recipient holds value ≈ `fee` USDC and the HWM resets to
-    ///           `navPerShareX` so future fees accrue only on NEW gains.
+    ///           After mint the recipient holds value ≈ `fee` USDC; the HWM resets to the
+    ///           GROSS-peak `navPerShareX` (protocol slice NOT deducted from the basis) so future
+    ///           fees accrue only on NEW gains. The protocol slice is returned as a USDC LIABILITY
+    ///           the strategy discharges where USDC flows — never minted as shares.
     ///
-    ///         If `performanceFeeBps == 0` but there is a gain, the HWM still advances
-    ///         (no retroactive back-charge when the rate is later set non-zero).
+    ///         If both fee rates are 0 but there is a gain, the HWM still advances
+    ///         (no retroactive back-charge when a rate is later set non-zero).
     ///
-    ///         Rounds **down** (LP-favourable).
+    ///         Rounds **down** (LP-favourable) on both slices.
     ///
     /// @param navPre            Pre-action strategy NAV (USDC, 6 dp).
     /// @param totalSupply       Current vault share supply (12 dp).
     /// @param hwmPerShareX      Stored HWM per share (1e18-scaled); 0 ⇒ first cycle.
     /// @param performanceFeeBps Performance fee in bps (e.g. 1000 = 10 %).
-    /// @return feeShares        Shares to mint (0 if at/below HWM or unset).
+    /// @param protocolFeeBps    Protocol fee in bps, taken off the gross gain FIRST.
+    /// @return feeShares        Perf-fee shares to mint (0 if at/below HWM or unset).
     /// @return newHwmPerShareX  Updated HWM (unchanged if no gain).
-    function performanceFeeShares(uint256 navPre, uint256 totalSupply, uint256 hwmPerShareX, uint256 performanceFeeBps)
-        internal
-        pure
-        returns (uint256 feeShares, uint256 newHwmPerShareX)
-    {
+    /// @return protocolUsdc     Protocol slice in USDC (6 dp) to accrue as a liability.
+    function performanceFeeShares(
+        uint256 navPre,
+        uint256 totalSupply,
+        uint256 hwmPerShareX,
+        uint256 performanceFeeBps,
+        uint256 protocolFeeBps
+    ) internal pure returns (uint256 feeShares, uint256 newHwmPerShareX, uint256 protocolUsdc) {
         // No capital — nothing to charge or update.
-        if (totalSupply == 0 || navPre == 0) return (0, hwmPerShareX);
+        if (totalSupply == 0 || navPre == 0) return (0, hwmPerShareX, 0);
 
         uint256 navPerShareX = Math.mulDiv(navPre, WAD, totalSupply);
 
         // First-time seeding: HWM was 0 (unset). Record current level, no fee charged —
         // avoids a phantom performance fee on the first crystallize after deployment.
-        if (hwmPerShareX == 0) return (0, navPerShareX);
+        if (hwmPerShareX == 0) return (0, navPerShareX, 0);
 
         // At or below the high-water mark → no fee, mark unchanged.
-        if (navPerShareX <= hwmPerShareX) return (0, hwmPerShareX);
+        if (navPerShareX <= hwmPerShareX) return (0, hwmPerShareX, 0);
 
-        // Gain above the HWM is recognised; HWM always advances to the new peak, even if
-        // the fee rate is zero, so future non-zero rates don't back-charge this gain.
-        if (performanceFeeBps == 0) return (0, navPerShareX);
-
+        // Gain above the HWM is recognised; HWM always advances to the GROSS peak, even if both
+        // rates are zero, so future non-zero rates don't back-charge this gain.
         // Gain in USDC 6 dp: (navPerShareX − hwmPerShareX) × totalSupply / WAD.
         uint256 gainPerShareX = navPerShareX - hwmPerShareX;
         uint256 totalGainUsdc = Math.mulDiv(gainPerShareX, totalSupply, WAD);
-        uint256 feeValueUsdc = Math.mulDiv(totalGainUsdc, performanceFeeBps, 10_000);
+
+        // Protocol slice off the GROSS gain FIRST (rounds down, LP-favourable). USDC liability,
+        // never minted; `min(., navPre)` is defensive against a malformed bps.
+        protocolUsdc = Math.mulDiv(totalGainUsdc, protocolFeeBps, 10_000);
+        if (protocolUsdc > navPre) protocolUsdc = navPre;
+
+        // HWM advances to the gross peak regardless of the perf rate.
+        if (performanceFeeBps == 0) return (0, navPerShareX, protocolUsdc);
+
+        // Perf fee accrues on the gain NET of the protocol slice.
+        uint256 feeValueUsdc = Math.mulDiv(totalGainUsdc - protocolUsdc, performanceFeeBps, 10_000);
 
         // Degenerate guard: fee must be strictly less than NAV (else denominator ≤ 0).
         // This can only trigger for extreme/malformed fee rates — fail safe, LP-favourable.
-        if (feeValueUsdc >= navPre) return (0, navPerShareX);
+        if (feeValueUsdc >= navPre) return (0, navPerShareX, protocolUsdc);
 
         // Dilution: mint enough shares so the recipient's value ≈ feeValueUsdc.
         // feeShares × navPre / (totalSupply + feeShares) = feeValueUsdc  (exact by algebra).
@@ -167,9 +191,11 @@ library LeveragedAeroFees {
     /// @param nowTs             Current `block.timestamp`.
     /// @param managementFeeBps  Annual management fee in bps.
     /// @param performanceFeeBps Performance fee in bps.
+    /// @param protocolFeeBps    Protocol fee in bps, taken off the gross gain FIRST (before perf).
     /// @return feeShares        Total shares to mint (management + performance).
     /// @return newHwmPerShareX  Updated HWM to store.
     /// @return newLastAccrual   Updated accrual timestamp (= `nowTs`).
+    /// @return protocolUsdc     Protocol slice in USDC (6 dp) to accrue as a liability.
     function crystallize(
         uint256 navPre,
         uint256 totalSupply,
@@ -177,8 +203,9 @@ library LeveragedAeroFees {
         uint256 lastAccrual,
         uint256 nowTs,
         uint256 managementFeeBps,
-        uint256 performanceFeeBps
-    ) public pure returns (uint256 feeShares, uint256 newHwmPerShareX, uint256 newLastAccrual) {
+        uint256 performanceFeeBps,
+        uint256 protocolFeeBps
+    ) public pure returns (uint256 feeShares, uint256 newHwmPerShareX, uint256 newLastAccrual, uint256 protocolUsdc) {
         // Always advance the accrual timestamp so management fees do not accumulate
         // over periods when the vault held no capital.
         newLastAccrual = nowTs;
@@ -190,7 +217,7 @@ library LeveragedAeroFees {
         // (the next priced cycle still measures gain vs the same HWM).
         if (totalSupply == 0) {
             newHwmPerShareX = hwmPerShareX;
-            return (0, newHwmPerShareX, newLastAccrual);
+            return (0, newHwmPerShareX, newLastAccrual, 0);
         }
 
         // dt is 0 when called in the same block as the last accrual (e.g. two deposits).
@@ -198,11 +225,13 @@ library LeveragedAeroFees {
 
         // Management fee is price-free (supply × rate × dt) — accrues regardless of navPre.
         uint256 mShares = managementFeeShares(totalSupply, managementFeeBps, dt);
-        // Performance fee needs a price: navPre == 0 ⇒ (0 shares, HWM unchanged) ⇒ defers.
-        (uint256 pShares, uint256 newHwm) = performanceFeeShares(navPre, totalSupply, hwmPerShareX, performanceFeeBps);
+        // Performance + protocol need a price: navPre == 0 ⇒ (0 shares, HWM unchanged, 0 protocol) ⇒ defers.
+        (uint256 pShares, uint256 newHwm, uint256 protoUsdc) =
+            performanceFeeShares(navPre, totalSupply, hwmPerShareX, performanceFeeBps, protocolFeeBps);
 
         // feeShares = mShares + pShares; overflow impossible (both << totalSupply).
         feeShares = mShares + pShares;
         newHwmPerShareX = newHwm;
+        protocolUsdc = protoUsdc;
     }
 }

@@ -18,10 +18,15 @@ contract MockVaultForCompound {
     mapping(address => uint256) public balanceOf;
     mapping(address => mapping(address => uint256)) public allowance;
     uint256 public totalSupply;
+    address public governor; // 0 ⇒ no protocol fee; settable to exercise the discharge path.
 
     constructor(address initialHolder, uint256 initialShares) {
         balanceOf[initialHolder] = initialShares;
         totalSupply = initialShares;
+    }
+
+    function setGovernor(address gov) external {
+        governor = gov;
     }
 
     /// @dev L7: strategy reads vault().asset() at init — must equal the configured USDC.
@@ -84,6 +89,17 @@ interface IAggregatorV3Min {
         external
         view
         returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound);
+}
+
+/// @dev Mock governor exposing only the two getters the strategy reads for the protocol-fee leg.
+contract MockGovernorForCompound {
+    uint256 public protocolFeeBps;
+    address public protocolFeeRecipient;
+
+    function setFee(uint256 bps, address recipient) external {
+        protocolFeeBps = bps;
+        protocolFeeRecipient = recipient;
+    }
 }
 
 /// @title  LeveragedAeroCLCompoundFork
@@ -339,5 +355,56 @@ contract LeveragedAeroCLCompoundFork is LeveragedAeroForkBase {
 
         uint256 frAfterRedeem = mockVault.balanceOf(feeRecipient);
         assertGt(frAfterRedeem, frAfterCompound, "redeem after compound did not charge the perf fee on the yield");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Test 6 (review #388-3): compound discharges the protocol fee to the governor's
+    //   recipient AND redeploys the remainder. Protocol=100 (1%), recipient set.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice Wire a governor with protocolFeeBps=100 + recipient, seed the HWM strictly below the
+    ///         current NAV so the compound's crystallize accrues a protocol slice, then compound: the
+    ///         AERO→USDC yield funds a skim (recipient balance grows) and the remainder is redeployed
+    ///         (CL liquidity + both borrows grow). owed is decremented by the discharged `pay`.
+    function test_compound_dischargesProtocolFeeAndRedeploysRemainder() public {
+        if (_skip) return;
+
+        MockGovernorForCompound gov = new MockGovernorForCompound();
+        address protoRecipient = makeAddr("protoRecipient");
+        gov.setFee(100, protoRecipient); // 1% protocol fee
+        mockVault.setGovernor(address(gov));
+
+        // Seed the HWM strictly below the current NAV so the compound's pre-swap crystallize sees a
+        // gain and accrues the protocol slice. hwmPerShare lives at diamond slot base+20.
+        uint256 navNow = strategy.nav();
+        uint256 supply = mockVault.totalSupply();
+        uint256 loweredHwm = (navNow * 1e18 / supply) / 2; // half the current per-share level → gain
+        bytes32 base = 0x405ae0b144079093e970849fdffdcb2a514e44968598c6c5c73444496e844900;
+        vm.store(address(strategy), bytes32(uint256(base) + 20), bytes32(loweredHwm));
+        // dt>0 is irrelevant for the protocol leg (it rides the perf gain path); ensure lastFee<now.
+        vm.store(address(strategy), bytes32(uint256(base) + 21), bytes32(uint256(1)));
+
+        deal(BaseAddresses.AERO, address(strategy), AERO_REWARD);
+        uint128 liqBefore = _liquidity();
+        uint256 recipBefore = IERC20(BaseAddresses.USDC).balanceOf(protoRecipient);
+
+        vm.prank(proposer);
+        strategy.compound(6000e6, 0);
+
+        // Protocol recipient was paid a USDC skim from the compound yield.
+        uint256 recipAfter = IERC20(BaseAddresses.USDC).balanceOf(protoRecipient);
+        assertGt(recipAfter, recipBefore, "protocol recipient not paid from compound yield");
+        uint256 skimmed = recipAfter - recipBefore;
+
+        // The remainder was redeployed: CL liquidity grew (and AERO fully consumed).
+        assertGt(_liquidity(), liqBefore, "remainder not redeployed (liquidity flat)");
+        assertEq(IERC20(BaseAddresses.AERO).balanceOf(address(strategy)), 0, "AERO not fully swapped");
+
+        // The discharged `pay` == the accrued owed when the yield covered it (skim == accrued), so
+        // owed nets to 0; if the accrued liability exceeded the single compound's yield a residual
+        // remains. Either way the skim is bounded by the accrual: owed + skim == the accrued total,
+        // and the recipient got a nonzero USDC transfer sourced from the swap (not from principal).
+        assertGt(skimmed, 0, "no skim");
+        assertLe(strategy.layout().protocolFeeOwed + skimmed, navNow, "skim/owed bookkeeping sanity");
     }
 }

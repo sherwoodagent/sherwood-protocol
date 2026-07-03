@@ -126,6 +126,7 @@ library LeveragedAeroManager {
         address feeRecipient;
         uint256 hwmPerShare; // HWM nav-per-share (1e18 WAD), 0 until first deposit
         uint256 lastFeeAccrualTimestamp;
+        uint256 protocolFeeOwed; // accrued protocol-fee USDC liability (6dp); discharged in redeem/compound/settle
     }
 
     /// @dev keccak256(abi.encode(uint256(keccak256("leveraged.aero.cl.storage")) - 1)) & ~bytes32(uint256(0xff))
@@ -279,15 +280,19 @@ library LeveragedAeroManager {
 
     /// @notice Compound AERO rewards (body of the strategy's `compound`): claim AERO → swap ALL to
     ///         USDC via the Aerodrome v2 volatile pool (deepest AERO/USDC on Base, bounded by
-    ///         `minUsdcOut`) → redeploy the proceeds at target leverage via `deployIdleImpl`. No-op
-    ///         when there's no position or no AERO. Fee crystallisation lives in the strategy
-    ///         entrypoint, NOT here.
-    /// @param minUsdcOut   Minimum USDC out of the AERO→USDC swap (slippage guard).
+    ///         `minUsdcOut`) → skim up to `skimCap` of the realized USDC for the protocol fee →
+    ///         redeploy the remainder at target leverage via `deployIdleImpl`. No-op when there's no
+    ///         position or no AERO. Fee crystallisation + the external skim transfer live in the
+    ///         strategy entrypoint, NOT here — this only sets aside `pay` so it isn't redeployed.
+    /// @param minUsdcOut   Minimum USDC out of the AERO→USDC swap (slippage guard, on GROSS usdcOut).
     /// @param minLiquidity Minimum CL liquidity on the redeploy (slippage guard).
-    function compoundImpl(uint256 minUsdcOut, uint256 minLiquidity) public {
+    /// @param skimCap      Max USDC to withhold from redeploy for the protocol fee (owed, or 0).
+    /// @return pay         USDC withheld = `min(skimCap, usdcOut)` (0 when no yield). The strategy
+    ///                     transfers this to the protocol-fee recipient and decrements owed.
+    function compoundImpl(uint256 minUsdcOut, uint256 minLiquidity, uint256 skimCap) public returns (uint256 pay) {
         Layout storage $ = _layout();
         uint256 tokenId_ = $.tokenId;
-        if (tokenId_ == 0) return; // flat book — nothing staked, nothing to compound
+        if (tokenId_ == 0) return 0; // flat book — nothing staked, nothing to compound
         if (minUsdcOut == 0) revert ZeroMinOut(); // cheap floor (onlyProposer-gated); full oracle floor deferred
 
         // 1. Claim AERO for the staked NFT. The reward token is read from the gauge
@@ -296,9 +301,10 @@ library LeveragedAeroManager {
         address aero = ICLGauge(gauge_).rewardToken();
         ICLGauge(gauge_).getReward(tokenId_);
         uint256 aeroBal = IERC20(aero).balanceOf(address(this));
-        if (aeroBal == 0) return; // no rewards accrued — clean no-op
+        if (aeroBal == 0) return 0; // no rewards accrued — clean no-op
 
-        // 2. Swap ALL claimed AERO → USDC via the Aerodrome v2 volatile pool, enforcing minUsdcOut.
+        // 2. Swap ALL claimed AERO → USDC via the Aerodrome v2 volatile pool, enforcing minUsdcOut
+        //    against the GROSS swap output (the fee skim below does not relax the swap floor).
         uint256 usdcBefore = IERC20($.usdc).balanceOf(address(this));
         IERC20(aero).forceApprove(AERO_V2_ROUTER, aeroBal);
         IAeroRouter.Route[] memory routes = new IAeroRouter.Route[](1);
@@ -306,12 +312,17 @@ library LeveragedAeroManager {
         IAeroRouter(AERO_V2_ROUTER)
             .swapExactTokensForTokens(aeroBal, minUsdcOut, routes, address(this), block.timestamp + 600);
         uint256 usdcOut = IERC20($.usdc).balanceOf(address(this)) - usdcBefore;
-        if (usdcOut == 0) return;
+        if (usdcOut == 0) return 0;
 
-        // 3. Redeploy ONLY the realized yield (usdcOut) into the position at target leverage
-        //    (supply → borrow → increaseLiquidity → restake → _assertHealthy). Any pre-existing
-        //    idle USDC is left untouched — compound deploys the AERO yield, nothing else.
-        deployIdleImpl(usdcOut, minLiquidity);
+        // 3. Withhold up to `skimCap` of the realized yield for the protocol fee (the strategy pays
+        //    it out); redeploy only the remainder.
+        pay = skimCap < usdcOut ? skimCap : usdcOut;
+        uint256 redeploy = usdcOut - pay;
+
+        // 4. Redeploy the net yield into the position at target leverage (supply → borrow →
+        //    increaseLiquidity → restake → _assertHealthy). Any pre-existing idle USDC is left
+        //    untouched — compound deploys the AERO yield, nothing else. Skip if all was skimmed.
+        if (redeploy > 0) deployIdleImpl(redeploy, minLiquidity);
     }
 
     /// @notice Recenter the CL position on the current tick WITHOUT swapping (body of the strategy's

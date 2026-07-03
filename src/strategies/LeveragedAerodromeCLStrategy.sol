@@ -19,6 +19,7 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {LeveragedAeroFees} from "./LeveragedAeroFees.sol";
 import {FeeConstants} from "../FeeConstants.sol";
 import {ISyndicateVault} from "../interfaces/ISyndicateVault.sol";
+import {ISyndicateGovernor} from "../interfaces/ISyndicateGovernor.sol";
 
 /// @title LeveragedAerodromeCLStrategy
 /// @notice Net-short leveraged Aerodrome CL strategy: USDC collateral → Moonwell (mUSDC)
@@ -163,6 +164,7 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         address feeRecipient;
         uint256 hwmPerShare; // HWM nav-per-share (1e18 WAD), 0 until first deposit
         uint256 lastFeeAccrualTimestamp;
+        uint256 protocolFeeOwed; // accrued protocol-fee USDC liability (6dp); discharged in redeem/compound/settle
     }
 
     /// @dev keccak256(abi.encode(uint256(keccak256("leveraged.aero.cl.storage")) - 1)) & ~bytes32(uint256(0xff))
@@ -295,22 +297,29 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
 
     // ── NAV ──
 
-    /// @notice Oracle NAV of the levered book, in USDC (6dp). `tokenId == 0` (the flat-book
-    ///         invariant, maintained by `_execute`/`_settle`) → face value of strategy-controlled
-    ///         idle USDC only (vault float excluded — M2 deposit/redeem symmetry), no oracle. Active
-    ///         position → `LeveragedAeroValuation.netEquityUsdc` (oracle-implied sqrtP, fail-closed:
-    ///         reverts on any oracle/calm failure or ≤0 equity).
+    /// @notice Oracle NAV of the levered book, in USDC (6dp), NET of the accrued protocol-fee
+    ///         liability (`protocolFeeOwed`). `tokenId == 0` (the flat-book invariant, maintained by
+    ///         `_execute`/`_settle`) → face value of strategy-controlled idle USDC only (vault float
+    ///         excluded — M2 deposit/redeem symmetry), no oracle. Active position →
+    ///         `LeveragedAeroValuation.netEquityUsdc` (oracle-implied sqrtP, fail-closed: reverts on
+    ///         any oracle/calm failure or ≤0 equity). `protocolFeeOwed` is subtracted here (floored at
+    ///         0, never reverts on owed > gross) — this is the fairness mechanism that replaces
+    ///         share-dilution: deposit share-pricing + the next HWM basis both see the net NAV.
     function nav() public view virtual returns (uint256) {
         Layout storage $ = _layout();
+        uint256 gross;
         if ($.tokenId == 0) {
             // Flat book: strategy-controlled idle USDC only (face, 6dp, no oracle). Vault float is
             // excluded — `strategy.redeem` never pays it out, so counting it here would re-introduce
             // the M2 deposit/redeem asymmetry the active-position branch already avoids.
-            return IERC20($.usdc).balanceOf(address(this));
+            gross = IERC20($.usdc).balanceOf(address(this));
+        } else {
+            // Active position: read ticks + liquidity from the NPM and delegate to the valuation lib.
+            (int24 tickLower, int24 tickUpper, uint128 liquidity) = _npmPositionData();
+            gross = LeveragedAeroValuation.netEquityUsdc(_config(), address(this), tickLower, tickUpper, liquidity);
         }
-        // Active position: read ticks + liquidity from the NPM and delegate to the valuation lib.
-        (int24 tickLower, int24 tickUpper, uint128 liquidity) = _npmPositionData();
-        return LeveragedAeroValuation.netEquityUsdc(_config(), address(this), tickLower, tickUpper, liquidity);
+        uint256 owed = $.protocolFeeOwed;
+        return gross > owed ? gross - owed : 0;
     }
 
     /// @dev Reads only ticks + liquidity (fields 5-7) from the NPM `positions()` 12-tuple via
@@ -375,7 +384,21 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     ///         realized USDC is pushed to the vault here (the manager never touches `vault()`).
     function _settle() internal override {
         LeveragedAeroManager.settleImpl();
-        _pushAllToVault(_layout().usdc);
+        // Discharge the accrued protocol fee from realized USDC BEFORE pushing the rest to the
+        // vault. Pays `min(owed, balance)` to the live recipient; skips silently when recipient == 0
+        // or owed == 0 (liability persists until a recipient exists — see edge note on `redeem`).
+        Layout storage $ = _layout();
+        uint256 owed = $.protocolFeeOwed;
+        address recipient = _protocolFeeRecipient();
+        if (owed > 0 && recipient != address(0)) {
+            uint256 bal = IERC20($.usdc).balanceOf(address(this));
+            uint256 pay = owed < bal ? owed : bal;
+            if (pay > 0) {
+                $.protocolFeeOwed = owed - pay;
+                IERC20($.usdc).safeTransfer(recipient, pay);
+            }
+        }
+        _pushAllToVault($.usdc);
     }
 
     /// @dev Crystallise management + HWM performance fees on the PRE-ACTION vault state. The caller
@@ -394,18 +417,35 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
             $.lastFeeAccrualTimestamp = block.timestamp;
             return;
         }
-        (uint256 feeShares, uint256 newHwm, uint256 newLast) = LeveragedAeroFees.crystallize(
+        // Protocol fee is read LIVE from the governor (a self-fee'd strategy is skipped by the
+        // governor's settle-fee path, so the protocol leg is collected here instead). Treat a
+        // missing governor as 0 bps.
+        (uint256 feeShares, uint256 newHwm, uint256 newLast, uint256 protocolUsdc) = LeveragedAeroFees.crystallize(
             navPre,
             supply,
             $.hwmPerShare,
             $.lastFeeAccrualTimestamp,
             block.timestamp,
             uint256($.managementFeeBps),
-            uint256($.performanceFeeBps)
+            uint256($.performanceFeeBps),
+            _protocolFeeBps()
         );
         $.hwmPerShare = newHwm;
         $.lastFeeAccrualTimestamp = newLast;
+        if (protocolUsdc > 0) $.protocolFeeOwed += protocolUsdc;
         if (feeShares > 0) ISyndicateVault(vault()).strategyMint($.feeRecipient, feeShares);
+    }
+
+    /// @dev Live protocol-fee rate (bps) from the governor; 0 if the governor is unset.
+    function _protocolFeeBps() private view returns (uint256) {
+        address gov = ISyndicateVault(vault()).governor();
+        return gov == address(0) ? 0 : ISyndicateGovernor(gov).protocolFeeBps();
+    }
+
+    /// @dev Live protocol-fee recipient from the governor; `address(0)` when unset (skips discharge).
+    function _protocolFeeRecipient() private view returns (address) {
+        address gov = ISyndicateVault(vault()).governor();
+        return gov == address(0) ? address(0) : ISyndicateGovernor(gov).protocolFeeRecipient();
     }
 
     /// @dev Self-only external wrapper so `redeem` can crystallise fees best-effort via `try/catch`
@@ -461,7 +501,18 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         if (_state != State.Executed) revert NotExecuted();
         // Crystallize on the pre-compound NAV (fail-closed; mirrors deposit's 3.6 fee model).
         _crystallizeFees(nav());
-        LeveragedAeroManager.compoundImpl(minUsdcOut, minLiquidity);
+        // Discharge the protocol fee from the swapped-out USDC BEFORE it's redeployed. `skimCap`
+        // is 0 when there's no recipient (accrual persists; discharge defers). The manager pays
+        // `min(skimCap, usdcOut)` internally, redeploys the remainder, and returns the amount paid;
+        // the STRATEGY transfers it out + decrements owed (governor read + external transfer stay
+        // out of the manager).
+        address recipient = _protocolFeeRecipient();
+        uint256 skimCap = recipient == address(0) ? 0 : _layout().protocolFeeOwed;
+        uint256 pay = LeveragedAeroManager.compoundImpl(minUsdcOut, minLiquidity, skimCap);
+        if (pay > 0) {
+            _layout().protocolFeeOwed -= pay;
+            IERC20(_layout().usdc).safeTransfer(recipient, pay);
+        }
     }
 
     /// @notice Recenter the CL position on the current pool tick WITHOUT swapping, via
@@ -552,14 +603,40 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         // 4. Oracle-free proportional unwind (venue logic in the deployed manager library).
         assetsOut = LeveragedAeroManager.redeemUnwindImpl(shares, supply);
 
-        // 5. Aggregate slippage guard.
+        // 5. Protocol-fee skim: the redeemer bears their pro-rata slice of the accrued liability.
+        //    `nav()` nets `protocolFeeOwed` but the proportional unwind pays the GROSS book, so
+        //    without this skim the redeemer would over-collect by f×owed. Pure arithmetic on stored
+        //    state (same fixed `supply` denominator captured pre-burn) — NO oracle read, preserving
+        //    the §7 oracle-free redeem. Skips silently if recipient == 0 or owed == 0.
+        assetsOut -= _dischargeRedeemSkim(shares, supply, assetsOut);
+
+        // 6. Aggregate slippage guard — applies to the NET (user-facing) amount.
         if (assetsOut < minAssetsOut) revert InsufficientAssetsOut();
 
-        // 6. Pay out USDC.
+        // 7. Pay out USDC.
         IERC20(_layout().usdc).safeTransfer(msg.sender, assetsOut);
 
-        // 7. Burn shares (strategy holds them after safeTransferFrom above).
+        // 8. Burn shares (strategy holds them after safeTransferFrom above).
         ISyndicateVault(vault_).strategyBurn(shares);
+    }
+
+    /// @dev Skim the redeemer's pro-rata protocol-fee slice from `assetsOut` and pay it to the live
+    ///      recipient. Returns the amount skimmed (0 when recipient unset or nothing owed) so the
+    ///      caller nets it out of the payout. `fee = owed × shares / supply` (rounds down,
+    ///      LP-favourable) capped at `assetsOut`; `owed` decremented by the skim. No oracle.
+    ///      Edge: if the recipient is later zeroed while `owed > 0`, discharge skips here (and in
+    ///      compound/settle) and the liability persists — `nav()` stays net — until a recipient exists.
+    function _dischargeRedeemSkim(uint256 shares, uint256 supply, uint256 assetsOut) private returns (uint256 fee) {
+        Layout storage $ = _layout();
+        uint256 owed = $.protocolFeeOwed;
+        if (owed == 0) return 0;
+        address recipient = _protocolFeeRecipient();
+        if (recipient == address(0)) return 0;
+        fee = Math.mulDiv(owed, shares, supply);
+        if (fee > assetsOut) fee = assetsOut;
+        if (fee == 0) return 0;
+        $.protocolFeeOwed = owed - fee;
+        IERC20($.usdc).safeTransfer(recipient, fee);
     }
 
     /// @notice Sweep a STRAY ERC-20 (airdrop / accidental send) back to the vault. Callable by the

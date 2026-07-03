@@ -41,6 +41,11 @@ contract MockVault {
         return BaseAddresses.USDC;
     }
 
+    /// @dev Strategy reads vault().governor() for the live protocol-fee rate; 0 ⇒ no protocol fee.
+    function governor() external pure returns (address) {
+        return address(0);
+    }
+
     function approve(address spender, uint256 amount) external returns (bool) {
         allowance[msg.sender][spender] = amount;
         return true;
