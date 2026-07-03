@@ -100,7 +100,8 @@ library LeveragedAeroValuation {
     /// @param tickLower  Lower tick of the CL position (from `NPM.positions`).
     /// @param tickUpper  Upper tick of the CL position.
     /// @param liquidity  CL liquidity (from `NPM.positions`); 0 ⇒ no CL legs.
-    /// @return navUsdc   USDC value of `float + idle + collateral + clLegs + idleLegs − debt`.
+    /// @return navUsdc   USDC value of `idle + collateral + clLegs + idleLegs − debt` (vault float
+    ///                   excluded — M2 deposit/redeem symmetry; strategy-controlled terms only).
     /// @dev Fail-closed: reverts on any oracle/calm failure (via `ChainlinkReader` and the
     ///      calm-gate) and on non-positive equity. Used to price deposits only.
     function netEquityUsdc(Config memory c, address strategy, int24 tickLower, int24 tickUpper, uint128 liquidity)

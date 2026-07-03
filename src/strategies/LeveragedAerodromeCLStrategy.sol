@@ -294,14 +294,17 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     // ── NAV ──
 
     /// @notice Oracle NAV of the levered book, in USDC (6dp). `tokenId == 0` (the flat-book
-    ///         invariant, maintained by `_execute`/`_settle`) → face value of idle USDC in vault +
-    ///         strategy, no oracle. Active position → `LeveragedAeroValuation.netEquityUsdc`
-    ///         (oracle-implied sqrtP, fail-closed: reverts on any oracle/calm failure or ≤0 equity).
+    ///         invariant, maintained by `_execute`/`_settle`) → face value of strategy-controlled
+    ///         idle USDC only (vault float excluded — M2 deposit/redeem symmetry), no oracle. Active
+    ///         position → `LeveragedAeroValuation.netEquityUsdc` (oracle-implied sqrtP, fail-closed:
+    ///         reverts on any oracle/calm failure or ≤0 equity).
     function nav() public view virtual returns (uint256) {
         Layout storage $ = _layout();
         if ($.tokenId == 0) {
-            // Flat book: sum idle USDC in vault + strategy (face, 6dp, no oracle needed).
-            return IERC20($.usdc).balanceOf(vault()) + IERC20($.usdc).balanceOf(address(this));
+            // Flat book: strategy-controlled idle USDC only (face, 6dp, no oracle). Vault float is
+            // excluded — `strategy.redeem` never pays it out, so counting it here would re-introduce
+            // the M2 deposit/redeem asymmetry the active-position branch already avoids.
+            return IERC20($.usdc).balanceOf(address(this));
         }
         // Active position: read ticks + liquidity from the NPM and delegate to the valuation lib.
         (int24 tickLower, int24 tickUpper, uint128 liquidity) = _npmPositionData();

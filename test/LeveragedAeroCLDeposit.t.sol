@@ -57,6 +57,9 @@ contract DepositHarness is LeveragedAerodromeCLStrategy {
     }
 }
 
+/// @dev Real-`nav()` harness (no override) — exercises the on-chain flat-book branch.
+contract NavHarness is LeveragedAerodromeCLStrategy {}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Storage slot constants (from `forge inspect LeveragedAerodromeCLStrategy storage-layout`)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -247,5 +250,40 @@ contract LeveragedAeroCLDepositUnit is Test {
         vm.prank(depositor);
         vm.expectRevert(abi.encodeWithSelector(LeveragedAerodromeCLStrategy.InsufficientShares.selector));
         harness.deposit(a, tooMany);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Test 4 — M2: flat-book nav() excludes vault float
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice M2 (flat-book sibling of the active-branch `test_nav_excludesVaultFloat`):
+    ///         with `tokenId == 0` and `_state == Executed`, `nav()` counts strategy-controlled
+    ///         idle USDC ONLY. A USDC donation straight to the vault must leave `nav()` unchanged —
+    ///         `strategy.redeem` never pays vault float out, so counting it here would re-introduce
+    ///         the deposit/redeem asymmetry the active-position branch already avoids.
+    function test_nav_flatBook_excludesVaultFloat() public {
+        NavHarness nav = new NavHarness();
+
+        // Wire only the slots the flat-book branch reads: _vault, _state=Executed, usdc.
+        // tokenId defaults to 0 (never written) → flat-book branch.
+        vm.store(address(nav), bytes32(SLOT_VAULT), bytes32(uint256(uint160(address(mockVault)))));
+        vm.store(address(nav), bytes32(SLOT_PROPOSER_STATE_INIT), bytes32(STATE_EXECUTED_INIT));
+        vm.store(address(nav), bytes32(SLOT_USDC), bytes32(uint256(uint160(MOCK_USDC))));
+
+        uint256 strategyIdle = 5_000e6;
+
+        // Mock USDC.balanceOf for both the strategy and the vault.
+        vm.mockCall(MOCK_USDC, abi.encodeWithSignature("balanceOf(address)", address(nav)), abi.encode(strategyIdle));
+        vm.mockCall(
+            MOCK_USDC, abi.encodeWithSignature("balanceOf(address)", address(mockVault)), abi.encode(uint256(0))
+        );
+
+        assertEq(nav.nav(), strategyIdle, "flat-book nav != strategy-controlled idle USDC");
+
+        // Donate USDC straight to the vault (float > 0). nav() must be bit-for-bit unchanged.
+        vm.mockCall(
+            MOCK_USDC, abi.encodeWithSignature("balanceOf(address)", address(mockVault)), abi.encode(uint256(9_999e6))
+        );
+        assertEq(nav.nav(), strategyIdle, "flat-book nav moved on vault-float donation (M2: float must be excluded)");
     }
 }
