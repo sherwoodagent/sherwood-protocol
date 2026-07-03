@@ -43,6 +43,9 @@ library BaseAddresses {
     /// @dev Chainlink USDC/USD aggregator on Base
     address internal constant CHAINLINK_USDC_USD = 0x7e860098F58bBFC8648a4311b374B1D669a2bc6B;
 
+    /// @dev Chainlink AERO/USD aggregator on Base — "AERO / USD", 8dp (floors compound's reward swap)
+    address internal constant CHAINLINK_AERO_USD = 0x4EC5970fC728C5f65ba413992CD5fF6FD70fcfF0;
+
     /// @dev Chainlink L2 Sequencer Uptime feed (Base)
     address internal constant SEQUENCER_UPTIME_FEED = 0xBCF85224fc0756B9Fa45aA7892530B47e10b6433;
 

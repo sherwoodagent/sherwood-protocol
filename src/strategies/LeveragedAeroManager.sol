@@ -68,6 +68,7 @@ library LeveragedAeroManager {
     error HealthyNoDeleverage();
     error FeedDecimalsMismatch();
     error ZeroMinOut();
+    error BelowOracleFloor(); // compound swap fill < AERO/USD oracle floor (L9)
 
     // ── Constants (compile-time literals, duplicated from the strategy) ──
     uint8 private constant CBBTC_DECIMALS = 8; // cbBTC is 8dp wrapped Bitcoin
@@ -127,6 +128,8 @@ library LeveragedAeroManager {
         uint256 hwmPerShare; // HWM nav-per-share (1e18 WAD), 0 until first deposit
         uint256 lastFeeAccrualTimestamp;
         uint256 protocolFeeOwed; // accrued protocol-fee USDC liability (6dp); discharged in redeem/compound/settle
+        // ── LAST field: appended for the L9 compound oracle floor (keep byte-identical in the strategy) ──
+        address aeroUsdFeed; // AERO/USD aggregator (8dp) — floors compound()'s AERO→USDC swap
     }
 
     /// @dev keccak256(abi.encode(uint256(keccak256("leveraged.aero.cl.storage")) - 1)) & ~bytes32(uint256(0xff))
@@ -169,9 +172,7 @@ library LeveragedAeroManager {
         }
         // 5. Sweep residual WETH + cbBTC → USDC (Chainlink-bounded min-out)
         {
-            uint256 pBTC = _readUsd8($.cbBTCFeed);
-            uint256 pETH = _readUsd8($.wethFeed);
-            uint256 pUsdc = _readUsd8($.usdcFeed);
+            (uint256 pBTC, uint256 pETH, uint256 pUsdc) = _readAllPrices();
             uint256 slip = uint256($.maxSlippageBps);
             _swapTokenToUsdc(
                 $.weth,
@@ -293,7 +294,7 @@ library LeveragedAeroManager {
         Layout storage $ = _layout();
         uint256 tokenId_ = $.tokenId;
         if (tokenId_ == 0) return 0; // flat book — nothing staked, nothing to compound
-        if (minUsdcOut == 0) revert ZeroMinOut(); // cheap floor (onlyProposer-gated); full oracle floor deferred
+        if (minUsdcOut == 0) revert ZeroMinOut(); // belt: caller must pass a nonzero floor (see BelowOracleFloor)
 
         // 1. Claim AERO for the staked NFT. The reward token is read from the gauge
         //    (definitionally AERO on this pool — fork-confirmed `rewardToken() == AERO`).
@@ -303,8 +304,15 @@ library LeveragedAeroManager {
         uint256 aeroBal = IERC20(aero).balanceOf(address(this));
         if (aeroBal == 0) return 0; // no rewards accrued — clean no-op
 
-        // 2. Swap ALL claimed AERO → USDC via the Aerodrome v2 volatile pool, enforcing minUsdcOut
-        //    against the GROSS swap output (the fee skim below does not relax the swap floor).
+        // 2. Derive the on-chain oracle floor from a hardened AERO/USD read (8dp, fail-closed): a
+        //    stale/broken feed reverts the whole compound (defer the harvest, intended posture).
+        //    fair6 = aeroBal(18dp) × price(8dp) / 1e20 → USDC 6dp; floor haircuts by maxSlippageBps.
+        uint256 floor =
+            Math.mulDiv(aeroBal, _readUsd8($.aeroUsdFeed), 1e20) * (10000 - uint256($.maxSlippageBps)) / 10000;
+
+        // 3. Swap ALL claimed AERO → USDC via the Aerodrome v2 volatile pool, passing the caller's
+        //    minUsdcOut to the router. The measured-fill floor below is the robust guard (router-honesty
+        //    independent); the effective bound is max(minUsdcOut, floor), enforced independently.
         uint256 usdcBefore = IERC20($.usdc).balanceOf(address(this));
         IERC20(aero).forceApprove(AERO_V2_ROUTER, aeroBal);
         IAeroRouter.Route[] memory routes = new IAeroRouter.Route[](1);
@@ -312,14 +320,15 @@ library LeveragedAeroManager {
         IAeroRouter(AERO_V2_ROUTER)
             .swapExactTokensForTokens(aeroBal, minUsdcOut, routes, address(this), block.timestamp + 600);
         uint256 usdcOut = IERC20($.usdc).balanceOf(address(this)) - usdcBefore;
-        if (usdcOut == 0) return 0;
+        if (usdcOut < floor) revert BelowOracleFloor(); // post-check on the measured fill (L9)
+        if (usdcOut == 0) return 0; // unreachable when floor > 0 (aeroBal > 0), kept as defence
 
-        // 3. Withhold up to `skimCap` of the realized yield for the protocol fee (the strategy pays
+        // 4. Withhold up to `skimCap` of the realized yield for the protocol fee (the strategy pays
         //    it out); redeploy only the remainder.
         pay = skimCap < usdcOut ? skimCap : usdcOut;
         uint256 redeploy = usdcOut - pay;
 
-        // 4. Redeploy the net yield into the position at target leverage (supply → borrow →
+        // 5. Redeploy the net yield into the position at target leverage (supply → borrow →
         //    increaseLiquidity → restake → _assertHealthy). Any pre-existing idle USDC is left
         //    untouched — compound deploys the AERO yield, nothing else. Skip if all was skimmed.
         if (redeploy > 0) deployIdleImpl(redeploy, minLiquidity);
@@ -508,9 +517,7 @@ library LeveragedAeroManager {
         uint256 cbDebt = IMoonwellMarket($.mCbBTC).borrowBalanceStored(address(this));
         uint256 wethDebt = IMoonwellMarket($.mWeth).borrowBalanceStored(address(this));
         if (cbDebt == 0 && wethDebt == 0) return (collateralUsdc, 0);
-        uint256 pBTC = _readUsd8($.cbBTCFeed);
-        uint256 pETH = _readUsd8($.wethFeed);
-        uint256 pUsdc = _readUsd8($.usdcFeed);
+        (uint256 pBTC, uint256 pETH, uint256 pUsdc) = _readAllPrices();
         debtUsdc =
             _tokenToUsdc(cbDebt, CBBTC_DECIMALS, pBTC, pUsdc) + _tokenToUsdc(wethDebt, WETH_DECIMALS, pETH, pUsdc);
     }
@@ -736,9 +743,7 @@ library LeveragedAeroManager {
         uint256 wethDebtRem = IMoonwellMarket($.mWeth).borrowBalanceStored(address(this));
         if (cbDebtRem == 0 && wethDebtRem == 0) return;
         // Read Chainlink prices (8dp each)
-        uint256 pBTC = _readUsd8($.cbBTCFeed);
-        uint256 pETH = _readUsd8($.wethFeed);
-        uint256 pUsdc = _readUsd8($.usdcFeed);
+        (uint256 pBTC, uint256 pETH, uint256 pUsdc) = _readAllPrices();
         // USDC needed for each shortfall leg (+10% buffer)
         uint256 cbUsdcNeed = _tokenToUsdc(cbDebtRem, 8, pBTC, pUsdc) * 11000 / 10000;
         uint256 wethUsdcNeed = _tokenToUsdc(wethDebtRem, 18, pETH, pUsdc) * 11000 / 10000;
@@ -850,6 +855,17 @@ library LeveragedAeroManager {
         (uint256 p, uint8 dec) = ChainlinkReader.readUsd(feed, $.sequencerFeed, $.maxDelay, $.gracePeriod);
         if (dec != 8) revert FeedDecimalsMismatch();
         return p;
+    }
+
+    /// @dev The 3-price bundle (cbBTC / WETH / USDC, all 8dp) read on the debt/health/sweep basis.
+    ///      Hoisted so the four debt-sizing sites (settle sweep, _readCollateralDebt, _settleShortfall,
+    ///      _assertHealthy) share one call instead of inlining three `_readUsd8`s each (bytecode offset
+    ///      for the L9 floor).
+    function _readAllPrices() private view returns (uint256 pBTC, uint256 pETH, uint256 pUsdc) {
+        Layout storage $ = _layout();
+        pBTC = _readUsd8($.cbBTCFeed);
+        pETH = _readUsd8($.wethFeed);
+        pUsdc = _readUsd8($.usdcFeed);
     }
 
     // ── deployIdle helpers ──
@@ -1030,9 +1046,7 @@ library LeveragedAeroManager {
         if (cbDebt == 0 && wethDebt == 0) return; // no debt → trivially healthy (skip oracle)
 
         // ── Price via hardened Chainlink (same feeds + staleness guards as nav()) ──
-        uint256 pBTC = _readUsd8($.cbBTCFeed);
-        uint256 pETH = _readUsd8($.wethFeed);
-        uint256 pUsdc = _readUsd8($.usdcFeed);
+        (uint256 pBTC, uint256 pETH, uint256 pUsdc) = _readAllPrices();
 
         // ── Debt (USDC face, 6dp) ──
         uint256 debtUsd =

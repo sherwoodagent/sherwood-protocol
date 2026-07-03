@@ -221,6 +221,7 @@ contract LeveragedAeroCLProtocolFeeTest is Test {
     uint256 private constant SLOT_HWM = STRAT_BASE + 20;
     uint256 private constant SLOT_LAST_FEE = STRAT_BASE + 21;
     uint256 private constant SLOT_OWED = STRAT_BASE + 22;
+    uint256 private constant SLOT_AERO_FEED = STRAT_BASE + 23; // L9: AERO/USD feed (compound floor)
 
     // BaseStrategy sequential slots.
     uint256 private constant SLOT_VAULT = 1;
@@ -525,6 +526,7 @@ contract LeveragedAeroCLProtocolFeeTest is Test {
         private
         returns (CompoundHarness h, MockToken usdc, MockGauge gauge, MockAeroRouter router)
     {
+        vm.warp(block.timestamp + 7 days); // clear the sequencer grace window for the L9 AERO feed read
         h = new CompoundHarness();
         usdc = new MockToken("USDC");
         MockToken aero = new MockToken("AERO");
@@ -541,6 +543,22 @@ contract LeveragedAeroCLProtocolFeeTest is Test {
         _store(address(h), SLOT_USDC, address(usdc));
         _store(address(h), SLOT_GAUGE, address(gauge));
         _storeUint(address(h), SLOT_TOKENID, 42); // nonzero → not flat book
+
+        // L9: compound now derives an AERO/USD oracle floor and post-checks the fill. Wire a fresh
+        // 8dp AERO feed + sequencer + maxSlippageBps=300 so the skim tests (50 AERO @ $0.90 →
+        // floor ≈ 43.65e6) clear their 300e6 fills — proving the floor composes with the skim split.
+        _store(address(h), SLOT_SEQFEED, address(0xF000));
+        _store(address(h), SLOT_AERO_FEED, address(0xFEED));
+        _storeUint(address(h), SLOT_MAX_DELAY, type(uint256).max);
+        _storeUint(address(h), SLOT_GRACE, 0);
+        // maxSlippageBps (byte offset 29 within packed slot 16; swapRouter@0..19 stays 0 here) = 300.
+        vm.store(address(h), bytes32(STRAT_BASE + 16), bytes32(uint256(300) << (29 * 8)));
+        vm.mockCall(
+            address(0xF000),
+            abi.encodeWithSelector(bytes4(keccak256("latestRoundData()"))),
+            abi.encode(uint80(1), int256(0), uint256(1), block.timestamp, uint80(1))
+        );
+        _mockFeed(address(0xFEED), 0.9e8); // AERO/USD = $0.90 (8dp)
     }
 
     function _mockFeeds(address strat) private {

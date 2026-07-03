@@ -20,6 +20,7 @@ import {LeveragedAeroFees} from "./LeveragedAeroFees.sol";
 import {FeeConstants} from "../FeeConstants.sol";
 import {ISyndicateVault} from "../interfaces/ISyndicateVault.sol";
 import {ISyndicateGovernor} from "../interfaces/ISyndicateGovernor.sol";
+import {IAggregatorV3} from "../interfaces/IAggregatorV3.sol";
 
 /// @title LeveragedAerodromeCLStrategy
 /// @notice Net-short leveraged Aerodrome CL strategy: USDC collateral → Moonwell (mUSDC)
@@ -60,6 +61,7 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     error MinHealthMaxLtvConflict();
     error AssetMismatch();
     error UnexpectedAssetDecimals();
+    error UnexpectedFeedDecimals(); // AERO/USD aggregator not 8dp (L9 oracle-floor scaling assumption)
     error OracleParamOutOfRange();
 
     // ── Constants ──
@@ -96,6 +98,7 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         address wethFeed; // ETH/USD aggregator (8dp)
         address usdcFeed; // USDC/USD aggregator (8dp)
         address sequencerFeed; // L2 Sequencer Uptime feed (Base)
+        address aeroUsdFeed; // AERO/USD aggregator (8dp) — floors the compound reward swap (L9)
         // ── Oracle config ──
         uint256 maxDelay; // Max feed staleness (seconds)
         uint256 gracePeriod; // Sequencer grace period after restart (seconds)
@@ -165,6 +168,8 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         uint256 hwmPerShare; // HWM nav-per-share (1e18 WAD), 0 until first deposit
         uint256 lastFeeAccrualTimestamp;
         uint256 protocolFeeOwed; // accrued protocol-fee USDC liability (6dp); discharged in redeem/compound/settle
+        // ── LAST field: appended for the L9 compound oracle floor (keep byte-identical in the manager) ──
+        address aeroUsdFeed; // AERO/USD aggregator (8dp) — floors compound()'s AERO→USDC swap
     }
 
     /// @dev keccak256(abi.encode(uint256(keccak256("leveraged.aero.cl.storage")) - 1)) & ~bytes32(uint256(0xff))
@@ -215,6 +220,11 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         if (p.wethFeed == address(0)) revert ZeroAddress();
         if (p.usdcFeed == address(0)) revert ZeroAddress();
         if (p.sequencerFeed == address(0)) revert ZeroAddress();
+        if (p.aeroUsdFeed == address(0)) revert ZeroAddress();
+        // L9: the AERO/USD floor scales an 8dp price (mulDiv by 1e20); a non-8dp aggregator would
+        // silently mis-scale the floor. Assert it here (the other feeds check dec at read time via
+        // _readUsd8; this one is checked once at init since the manager reads it raw for the floor).
+        if (IAggregatorV3(p.aeroUsdFeed).decimals() != 8) revert UnexpectedFeedDecimals();
 
         // L7: the strategy's unit of account MUST be the vault's ERC-4626 asset, and the
         // SHARES_VIRTUAL_OFFSET (1e6) hardcodes a 6-decimal asset — reject any other wiring.
@@ -264,6 +274,7 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         $.wethFeed = p.wethFeed;
         $.usdcFeed = p.usdcFeed;
         $.sequencerFeed = p.sequencerFeed;
+        $.aeroUsdFeed = p.aeroUsdFeed;
         $.maxDelay = p.maxDelay;
         $.gracePeriod = p.gracePeriod;
         $.calmDeviationTicks = p.calmDeviationTicks;
@@ -488,8 +499,12 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     }
 
     /// @notice Compound AERO rewards: claim → swap to USDC (Aerodrome v2 volatile pool, the deepest
-    ///         AERO/USDC venue on Base, bounded by `minUsdcOut`) → redeploy at target leverage, via
-    ///         `LeveragedAeroManager.compoundImpl()`. No-op when no AERO is claimable.
+    ///         AERO/USDC venue on Base) → redeploy at target leverage, via
+    ///         `LeveragedAeroManager.compoundImpl()`. No-op when no AERO is claimable. The swap fill is
+    ///         floored by `max(minUsdcOut, oracleFloor)`: the manager derives `oracleFloor` from a
+    ///         hardened AERO/USD Chainlink read and post-checks the measured fill (L9), so a thin-pool
+    ///         sandwich or a careless/compromised proposer can't realise emissions below the bound. A
+    ///         stale AERO feed fail-closes → `compound` reverts (defer the harvest, intended posture).
     ///
     ///         Fee fairness (§10): crystallise on the PRE-compound NAV first (same fail-closed model
     ///         as `deposit`) so the realized yield can't escape the performance fee. Crystallisation

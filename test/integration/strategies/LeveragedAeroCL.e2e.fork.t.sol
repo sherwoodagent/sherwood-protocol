@@ -513,6 +513,7 @@ contract LeveragedAeroCLE2EFork is LeveragedAeroForkBase {
             wethFeed: BaseAddresses.CHAINLINK_ETH_USD,
             usdcFeed: BaseAddresses.CHAINLINK_USDC_USD,
             sequencerFeed: BaseAddresses.SEQUENCER_UPTIME_FEED,
+            aeroUsdFeed: BaseAddresses.CHAINLINK_AERO_USD,
             maxDelay: 48 hours, // generous: covers the ~2h lifecycle without per-step feed mocks
             gracePeriod: 1 hours,
             calmDeviationTicks: 500,

@@ -159,6 +159,7 @@ contract LeveragedAeroCLLeverageFork is LeveragedAeroForkBase {
             wethFeed: BaseAddresses.CHAINLINK_ETH_USD,
             usdcFeed: BaseAddresses.CHAINLINK_USDC_USD,
             sequencerFeed: BaseAddresses.SEQUENCER_UPTIME_FEED,
+            aeroUsdFeed: BaseAddresses.CHAINLINK_AERO_USD,
             maxDelay: 48 hours,
             gracePeriod: 1 hours,
             calmDeviationTicks: 500,

@@ -78,6 +78,7 @@ contract LeveragedAeroCLRescueUnit is Test {
     address internal weth = makeAddr("weth");
     address internal comptroller = makeAddr("comptroller");
     address internal aero = makeAddr("aero");
+    address internal aeroUsdFeed = makeAddr("aeroUsdFeed");
     MockGauge internal gauge;
 
     function setUp() public {
@@ -92,6 +93,8 @@ contract LeveragedAeroCLRescueUnit is Test {
         vm.mockCall(
             comptroller, abi.encodeWithSignature("markets(address)", mUsdc), abi.encode(true, uint256(0.88e18), false)
         );
+        // L9: init asserts the AERO/USD aggregator is 8dp — mock the one `decimals()` read.
+        vm.mockCall(aeroUsdFeed, abi.encodeWithSignature("decimals()"), abi.encode(uint8(8)));
 
         address template = address(new LeveragedAerodromeCLStrategy());
         strategy = LeveragedAerodromeCLStrategy(payable(Clones.clone(template)));
@@ -115,6 +118,7 @@ contract LeveragedAeroCLRescueUnit is Test {
             wethFeed: makeAddr("wethFeed"),
             usdcFeed: makeAddr("usdcFeed"),
             sequencerFeed: makeAddr("sequencerFeed"),
+            aeroUsdFeed: aeroUsdFeed,
             maxDelay: 48 hours,
             gracePeriod: 1 hours,
             calmDeviationTicks: 500,
