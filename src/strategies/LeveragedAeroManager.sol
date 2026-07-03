@@ -237,10 +237,20 @@ library LeveragedAeroManager {
             $.posTickLower = 0;
             $.posTickUpper = 0;
         } else {
-            // Partial redemption: redeem f*collateral first (Finding 1 fix).
+            // Partial redemption: redeem f*collateral first (Finding 1 fix). Each cover buy is
+            // capped at the redeemer's OWN budget (`balance − stayersIdle`), recomputed before each
+            // call since the first spends USDC. A shortfall (or sandwiched buy) that would need more
+            // than the redeemer's slice reverts the whole redeem — fail-safe, never touches stayer idle.
             _redeemCollateral(shares, supply);
-            if (cbShort > 0) _redeemCoverShortfall($.cbBTC, $.mCbBTC, cbShort, type(uint256).max);
-            if (wethShort > 0) _redeemCoverShortfall($.weth, $.mWeth, wethShort, type(uint256).max);
+            IERC20 usdc = IERC20($.usdc);
+            if (cbShort > 0) {
+                uint256 bal = usdc.balanceOf(address(this));
+                _redeemCoverShortfall($.cbBTC, $.mCbBTC, cbShort, bal > stayersIdle ? bal - stayersIdle : 0);
+            }
+            if (wethShort > 0) {
+                uint256 bal = usdc.balanceOf(address(this));
+                _redeemCoverShortfall($.weth, $.mWeth, wethShort, bal > stayersIdle ? bal - stayersIdle : 0);
+            }
         }
 
         // E — sweep residual cbBTC/WETH → USDC, LEAVING the stayers' reserved leg share un-swept
@@ -940,10 +950,11 @@ library LeveragedAeroManager {
 
     /// @dev Cover a debt shortfall (IL-driven) by swapping idle USDC → `tokenOut` via
     ///      exactOutputSingle, then repaying the exact remaining amount. `amountInMax` caps the
-    ///      USDC spent: redeem callers pass `type(uint256).max` (→ bounded only by idle USDC,
-    ///      oracle-free; the redeemer is bounded by `minAssetsOut` at the entrypoint), while the
-    ///      permissionless deleverage path passes an oracle+slippage ceiling so a sandwiched buy
-    ///      reverts instead of overpaying (H1).
+    ///      USDC spent: the FULL-redeem path passes `type(uint256).max` (→ bounded only by idle USDC,
+    ///      oracle-free — no stayers exist, Phase 2 `_settleShortfall` handles any residue); the
+    ///      PARTIAL-redeem path passes the redeemer's own budget (`balance − stayersIdle`) so a cover
+    ///      that would dip into stayer idle reverts. The permissionless deleverage path passes an
+    ///      oracle+slippage ceiling so a sandwiched buy reverts instead of overpaying (H1).
     function _redeemCoverShortfall(address tokenOut, address market, uint256 amountOut, uint256 amountInMax) private {
         Layout storage $ = _layout();
         uint256 usdcBal = IERC20($.usdc).balanceOf(address(this));
