@@ -830,6 +830,7 @@ contract LeveragedAeroCLRedeemFork is LeveragedAeroForkBase {
         uint256 cbDebtBefore = IMoonwellMarket(BaseAddresses.MOONWELL_MCBBTC).borrowBalanceStored(address(strategy));
         uint256 wethDebtBefore = IMoonwellMarket(BaseAddresses.MOONWELL_MWETH).borrowBalanceStored(address(strategy));
         uint256 collatBefore = ICToken(BaseAddresses.MOONWELL_MUSDC).balanceOf(address(strategy));
+        uint256 idleBefore = IERC20(BaseAddresses.USDC).balanceOf(address(strategy));
 
         vm.startPrank(depositorB);
         mockVault.approve(address(strategy), sharesB);
@@ -854,10 +855,19 @@ contract LeveragedAeroCLRedeemFork is LeveragedAeroForkBase {
             "WETH debt moved on the fast path"
         );
 
-        // Collateral reduced by ~assetsOut.
+        // Collateral reduced by ~(assetsOut − fromIdle). Two subtleties this assertion must track:
+        //   • mUSDC balanceOf is denominated in cToken SHARES (8dp), not underlying USDC — convert
+        //     the drawdown via exchangeRateStored (underlying = shares × rate / 1e18);
+        //   • the fast path sources the redeemer's pro-rata idle USDC FIRST (0ecea00b, re-review
+        //     f2) and draws only the remainder from collateral, mirroring fastRedeemImpl's
+        //     fromIdle = min(assetsOut, idleShare).
         uint256 collatAfter = ICToken(BaseAddresses.MOONWELL_MUSDC).balanceOf(address(strategy));
         assertLt(collatAfter, collatBefore, "collateral not drawn down");
-        assertApproxEqRel((collatBefore - collatAfter), out, 0.001e18, "collateral drawdown != assetsOut");
+        uint256 drawdownUsdc =
+            Math.mulDiv(collatBefore - collatAfter, ICToken(BaseAddresses.MOONWELL_MUSDC).exchangeRateStored(), 1e18);
+        uint256 idleShare = Math.mulDiv(idleBefore, sharesB, supplyBefore);
+        uint256 fromIdle = Math.min(out, idleShare);
+        assertApproxEqRel(drawdownUsdc, out - fromIdle, 0.001e18, "collateral drawdown != assetsOut - fromIdle");
     }
 
     /// @notice Test 2 — a fast redeem sized so the post-withdraw LTV breaches `maxLtvBps` reverts
@@ -951,14 +961,17 @@ contract LeveragedAeroCLRedeemFork is LeveragedAeroForkBase {
         vm.expectRevert(); // NotProposer
         strategy.fulfillRedeem(id);
 
-        // (c) cancel returns the escrowed shares (a fresh request).
+        // (c) cancel returns the escrowed shares (a fresh request). B's first tranche is already
+        //     escrowed under `id` (kept for the fulfill in (e)) — B's balance is 0 here, per the
+        //     assert in (a) — so fund a SECOND independent tranche to exercise cancel.
+        uint256 sharesB2 = _depositB(10_000e6);
         vm.startPrank(depositorB);
-        mockVault.approve(address(strategy), sharesB);
-        uint256 id2 = strategy.requestRedeem(sharesB, 0);
+        mockVault.approve(address(strategy), sharesB2);
+        uint256 id2 = strategy.requestRedeem(sharesB2, 0);
         vm.stopPrank();
         vm.prank(depositorB);
         strategy.cancelRedeem(id2);
-        assertEq(mockVault.balanceOf(depositorB), sharesB, "cancel did not return shares");
+        assertEq(mockVault.balanceOf(depositorB), sharesB2, "cancel did not return shares");
 
         // (d) double-settle prevented: cancel again on the same id reverts.
         vm.prank(depositorB);

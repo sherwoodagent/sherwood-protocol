@@ -55,6 +55,13 @@ contract LeveragedAeroCLDeployFork is LeveragedAeroForkBase {
         // answer asset() == USDC to satisfy the new asset-wiring check.
         vm.mockCall(fakeVault, abi.encodeWithSignature("asset()"), abi.encode(USDC));
 
+        // Protocol-fee wiring (43356e2a): settle/crystallize now read vault().governor() for the
+        // self-fee'd protocol leg. The bare fakeVault has no code — a call to it returns EMPTY
+        // returndata and the address decode reverts before the contract's own missing-governor
+        // branch can run. Answer address(0): the documented "no governor → 0 bps, skip discharge"
+        // state (_protocolFeeBps / _protocolFeeRecipient).
+        vm.mockCall(fakeVault, abi.encodeWithSignature("governor()"), abi.encode(address(0)));
+
         // Deploy the strategy template (constructor locks _initialized on the template itself).
         address template = address(new LeveragedAerodromeCLStrategy());
 
@@ -188,12 +195,15 @@ contract LeveragedAeroCLDeployFork is LeveragedAeroForkBase {
     function test_deploy_navIncludesIdleUsdc() public {
         if (_skip) return;
 
-        // Deal idle USDC to the fake vault
+        // Deal idle USDC to the STRATEGY. Flat-book nav() deliberately excludes vault float
+        // (d780090e, review #388 finding 3 — strategy.redeem never pays vault float out, so
+        // counting it would reintroduce the M2 deposit/redeem asymmetry; the vault-float
+        // exclusion itself is asserted by test_nav_excludesVaultFloat in the redeem fork suite).
         uint256 idleAmt = 1_000e6;
-        _fundUSDC(fakeVault, idleAmt);
+        _fundUSDC(address(strategy), idleAmt);
 
         uint256 n = strategy.nav();
-        assertEq(n, idleAmt, "nav() should reflect vault idle USDC");
+        assertEq(n, idleAmt, "nav() should reflect strategy-controlled idle USDC");
     }
 
     /// @notice positions() returns one entry with the correct venue, kind, and ref.

@@ -86,6 +86,14 @@ contract LeveragedAeroCLRescueFork is LeveragedAeroForkBase {
         // answer asset() == USDC to satisfy the new asset-wiring check.
         vm.mockCall(fakeVault, abi.encodeWithSignature("asset()"), abi.encode(USDC));
 
+        // D5 (9590e6ab): rescueToVault's auth gate reads Ownable(vault()).owner() on the
+        // non-proposer branch. The bare fakeVault has no code, so an unmocked owner() call
+        // bare-reverts (empty returndata) BEFORE the NotProposerOrOwner custom error can surface.
+        // Mock a default owner so the stranger path reaches the intended revert; proposer-caller
+        // tests short-circuit and never read owner(), and test_rescue_vaultOwnerCanSweep's local
+        // re-mock still overrides this default for its own case.
+        vm.mockCall(fakeVault, abi.encodeWithSignature("owner()"), abi.encode(makeAddr("defaultVaultOwner")));
+
         // Deploy template + clone (mirrors deploy fork test pattern).
         address template = address(new LeveragedAerodromeCLStrategy());
         address clone = Clones.clone(template);
