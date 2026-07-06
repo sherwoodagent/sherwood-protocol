@@ -283,24 +283,38 @@ library LeveragedAeroManager {
         return usdcFinal > stayersIdle ? usdcFinal - stayersIdle : 0;
     }
 
-    /// @notice Oracle-priced fast-redeem funding (body of the strategy's `redeem`): free `assetsOut`
-    ///         USDC from the Moonwell mUSDC collateral ONLY — no LP touch, no debt repay. The LTV gate
-    ///         is computed BEFORE the withdraw on the same `_readCollateralDebt` basis as
-    ///         `_assertHealthy`: a redeem that would push post-withdraw LTV above `maxLtvBps` reverts
-    ///         `FastRedeemExceedsLtv` (a typed, frontend-routable error — send the user to
-    ///         `requestRedeem`), and `_assertHealthy()` runs after as belt. The strategy pays the
-    ///         redeemer + burns shares; this only frees the USDC.
-    function fastRedeemImpl(uint256 assetsOut) public {
+    /// @notice Oracle-priced fast-redeem funding (body of the strategy's `redeem`): source `assetsOut`
+    ///         USDC from the redeemer's pro-rata idle share FIRST, then free only the remainder from the
+    ///         Moonwell mUSDC collateral — no LP touch, no debt repay. `idleShare = f×idle` (f =
+    ///         shares/supply, computed by the strategy) caps the idle draw so a partial redeem never
+    ///         dips into a stayer's `(1-f)×idle` (the same reservation `redeemUnwindImpl` makes). The
+    ///         LTV gate is computed BEFORE the withdraw on the same `_readCollateralDebt` basis as
+    ///         `_assertHealthy`, but against the collateral-funded REMAINDER only: a redeem that would
+    ///         push post-withdraw LTV above `maxLtvBps` reverts `FastRedeemExceedsLtv` (a typed,
+    ///         frontend-routable error — send the user to `requestRedeem`), and `_assertHealthy()` runs
+    ///         after as belt. When idle alone covers `assetsOut` (e.g. a flat book), no collateral is
+    ///         touched and the LTV gate is skipped. The strategy pays the redeemer + burns shares; the
+    ///         idle already held plus the freed collateral cover the payout.
+    function fastRedeemImpl(uint256 assetsOut, uint256 idleShare) public {
+        Layout storage $ = _layout();
+        // Idle-first: draw at most the redeemer's `f×idle` share (also clamped to the live balance);
+        // the strategy's payout transfer consumes it implicitly, leaving `(1-f)×idle` for stayers.
+        uint256 idle = IERC20($.usdc).balanceOf(address(this));
+        uint256 fromIdle = assetsOut < idleShare ? assetsOut : idleShare;
+        if (fromIdle > idle) fromIdle = idle;
+        uint256 fromCollateral = assetsOut - fromIdle;
+        if (fromCollateral == 0) return; // idle fully funds the redeem — collateral + LTV gate untouched
+
         (uint256 collateralUsdc, uint256 debtUsdc) = _readCollateralDebt();
-        uint256 maxLtv = uint256(_layout().maxLtvBps);
-        // Predict the post-withdraw LTV on the pre-withdraw prices (collateral shrinks by assetsOut,
-        // debt unchanged). `assetsOut >= collateralUsdc` would zero/negate the denominator → reject.
-        if (assetsOut >= collateralUsdc) revert FastRedeemExceedsLtv(type(uint256).max, maxLtv);
+        uint256 maxLtv = uint256($.maxLtvBps);
+        // Predict the post-withdraw LTV on the pre-withdraw prices (collateral shrinks by the collateral-
+        // funded remainder, debt unchanged). `>= collateralUsdc` would zero/negate the denominator.
+        if (fromCollateral >= collateralUsdc) revert FastRedeemExceedsLtv(type(uint256).max, maxLtv);
         if (debtUsdc > 0) {
-            uint256 postLtv = (debtUsdc * 10_000) / (collateralUsdc - assetsOut);
+            uint256 postLtv = (debtUsdc * 10_000) / (collateralUsdc - fromCollateral);
             if (postLtv > maxLtv) revert FastRedeemExceedsLtv(postLtv, maxLtv);
         }
-        _redeemUnderlying(_layout().mUsdc, assetsOut);
+        _redeemUnderlying($.mUsdc, fromCollateral);
         _assertHealthy(); // authoritative post-op gate (belt over the pre-withdraw prediction)
     }
 

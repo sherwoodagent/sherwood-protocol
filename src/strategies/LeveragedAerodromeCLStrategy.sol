@@ -739,8 +739,11 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         // 3. Pull shares from caller (requires prior vault.approve(strategy, shares)).
         IERC20(vault_).safeTransferFrom(msg.sender, address(this), shares);
 
-        // 4. Free exactly `assetsOut` from the Moonwell collateral (LTV-gated in the manager).
-        LeveragedAeroManager.fastRedeemImpl(assetsOut);
+        // 4. Fund `assetsOut`: idle USDC first (up to the redeemer's pro-rata `f×idle` share, so a
+        //    partial redeem never dips into a stayer's `(1-f)×idle`), remainder from collateral
+        //    (LTV-gated in the manager on that remainder only).
+        uint256 idleShare = Math.mulDiv(IERC20(_layout().usdc).balanceOf(address(this)), shares, supply);
+        LeveragedAeroManager.fastRedeemImpl(assetsOut, idleShare);
 
         // 5. Pay out + burn.
         IERC20(_layout().usdc).safeTransfer(msg.sender, assetsOut);
@@ -765,11 +768,16 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
             return (0, false);
         }
         assetsOut = Math.mulDiv(shares, navNet, supply);
+        // Idle-first (mirror `fastRedeemImpl`): the redeemer's `f×idle` share funds part of `assetsOut`,
+        // so the LTV gate only sees the collateral-funded remainder.
+        uint256 idleShare = Math.mulDiv(IERC20(_layout().usdc).balanceOf(address(this)), shares, supply);
+        uint256 fromCollateral = assetsOut > idleShare ? assetsOut - idleShare : 0;
+        if (fromCollateral == 0) return (assetsOut, true); // idle alone covers it — no LTV constraint
         // Predict the LTV gate on the same pre-withdraw basis as `fastRedeemImpl`.
         try this.previewCollateralDebt() returns (uint256 collateralUsdc, uint256 debtUsdc) {
-            if (assetsOut >= collateralUsdc) return (assetsOut, false);
+            if (fromCollateral >= collateralUsdc) return (assetsOut, false);
             uint256 maxLtv = uint256(_layout().maxLtvBps);
-            fastOk = debtUsdc == 0 || (debtUsdc * 10_000) / (collateralUsdc - assetsOut) <= maxLtv;
+            fastOk = debtUsdc == 0 || (debtUsdc * 10_000) / (collateralUsdc - fromCollateral) <= maxLtv;
         } catch {
             return (assetsOut, false); // collateral/debt oracle read failed → advise the async path
         }
