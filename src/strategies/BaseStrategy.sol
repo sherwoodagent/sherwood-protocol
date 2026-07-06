@@ -151,7 +151,10 @@ abstract contract BaseStrategy is IStrategy {
     }
 
     /// @inheritdoc IStrategy
-    /// @dev Default: governor distributes settle-fees. Self-fee'd strategies override.
+    /// @dev Default: governor distributes settle-fees. Self-fee'd strategies override to `true`.
+    ///      NOTE: `true` makes the governor skip ALL settle-fees (protocol + guardian + agent +
+    ///      management) — a self-fee'd strategy MUST self-collect the protocol fee itself (see
+    ///      LeveragedAerodromeCLStrategy's `protocolFeeOwed` leg) or the protocol earns nothing.
     function selfManagesFees() external view virtual returns (bool) {
         return false;
     }
