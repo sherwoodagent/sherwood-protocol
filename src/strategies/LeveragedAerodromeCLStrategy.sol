@@ -49,6 +49,7 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     error MoonwellRepayFailed(uint256 errCode);
     error MoonwellRedeemFailed(uint256 errCode);
     error InsufficientShares();
+    error NavUnpriceable(); // deposit while nav()==0 with supply>0 (worthless book, holders present)
     error InsufficientAssetsOut();
     error InsufficientLiquidity();
     error InsufficientIdle();
@@ -599,6 +600,10 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         IERC20(_layout().usdc).safeTransferFrom(msg.sender, address(this), assets);
         address vault_ = vault();
         uint256 supply = IERC20(vault_).totalSupply();
+        // Guard the navPre==0 share-inflation case: with holders present and a worthless book the
+        // mulDiv denominator collapses to 1, minting ~assets×(supply+offset) shares (dilutes stayers).
+        // First deposit (supply==0) legitimately has navPre==0 (empty book) → must stay allowed.
+        if (navPre == 0 && supply > 0) revert NavUnpriceable();
         shares = Math.mulDiv(assets, supply + SHARES_VIRTUAL_OFFSET, navPre + 1);
         if (shares < minShares) revert InsufficientShares();
         ISyndicateVault(vault_).strategyMint(msg.sender, shares);
@@ -713,10 +718,12 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         if (_state != State.Executed) revert NotExecuted();
 
         // 1. Crystallise on the pre-redeem NAV (fail-closed: a down oracle reverts — correct, the fast
-        //    path is inherently oracle-dependent). Same 3.6 fee model as deposit.
+        //    path is inherently oracle-dependent). Best-effort (H3, §7): a fee-mint revert (vault paused
+        //    / feeRecipient de-whitelisted) rolls back ONLY the crystallise — owed + supply unchanged,
+        //    so the netting below sees a 0 fresh slice — and the exit still proceeds.
         uint256 navPre = nav();
         uint256 owedBefore = _layout().protocolFeeOwed;
-        _crystallizeFees(navPre);
+        try this.crystallizeFeesSelf(navPre) {} catch {}
 
         // 2. Price against the POST-crystallize book, both effects consistently: `supply` is read
         //    after the crystallize (includes the perf-fee mint dilution) and the FRESH protocol slice
