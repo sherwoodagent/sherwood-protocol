@@ -787,12 +787,15 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     ///         would over-quote whenever fees are pending (real gain above the HWM, or accrued mgmt `dt`).
     ///         Here we SIMULATE that crystallise with the current storage — same pure `LeveragedAeroFees`
     ///         inputs `_crystallizeFees` uses — and price on `navNet = navPre − freshSlice` over the
-    ///         post-mint `supply + feeShares`, so the quote equals the executed payout to the wei and a
-    ///         frontend can pass it as `minAssetsOut` without a bounce.
+    ///         post-mint `supply + feeShares`, so the quote equals the executed payout to the wei *when
+    ///         executed at the same `block.timestamp`*. A frontend passing it as `minAssetsOut` should
+    ///         still apply a small slippage tolerance: the streaming management fee accrues with `dt`, so
+    ///         a redeem landing a few blocks later pays marginally LESS than this quote (and the NAV may
+    ///         drift), which would otherwise bounce an exact-quote `minAssetsOut`.
     ///
-    ///         Safe-direction edge: if the executed crystallise DEFERS (fee-mint reverts on a paused /
-    ///         un-whitelisted vault, H3), the actual pays MORE than this fee-adjusted quote (no dilution,
-    ///         no slice) — `actual ≥ preview` never bounces a preview-derived `minAssetsOut`.
+    ///         Safe-direction edge (opposite sign): if the executed crystallise DEFERS (fee-mint reverts
+    ///         on a paused / un-whitelisted vault, H3), the actual pays MORE than this fee-adjusted quote
+    ///         (no dilution, no slice) — that case never bounces a preview-derived `minAssetsOut`.
     ///
     ///         Returns `(0, false)` instead of reverting when the oracle is down (try/catch on the nav +
     ///         collateral/debt reads), and `(0, false)` when the simulated payout floors to 0 (mirrors
