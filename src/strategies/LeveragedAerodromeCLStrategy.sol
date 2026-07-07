@@ -781,27 +781,62 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         ISyndicateVault(vault_).strategyBurn(shares);
     }
 
-    /// @notice Advisory preview of the fast-path exit — same math as `redeem` (`f × nav`) plus the LTV
-    ///         gate prediction. Returns `(0, false)` instead of reverting when the oracle is down
-    ///         (try/catch on the nav + collateral/debt reads). ADVISORY ONLY — the on-chain gate in
-    ///         `fastRedeemImpl` is authoritative; a frontend uses `fastOk` to pre-route to
-    ///         `requestRedeem` without a bounced transaction.
+    /// @notice Advisory preview of the fast-path exit — mirrors `redeem` EXACTLY, including the pending
+    ///         fee crystallise. The executed `redeem` crystallises first (perf-fee mint dilutes supply,
+    ///         a fresh protocol slice nets out of `nav()`), so pricing against the LIVE `nav()`/`supply`
+    ///         would over-quote whenever fees are pending (real gain above the HWM, or accrued mgmt `dt`).
+    ///         Here we SIMULATE that crystallise with the current storage — same pure `LeveragedAeroFees`
+    ///         inputs `_crystallizeFees` uses — and price on `navNet = navPre − freshSlice` over the
+    ///         post-mint `supply + feeShares`, so the quote equals the executed payout to the wei and a
+    ///         frontend can pass it as `minAssetsOut` without a bounce.
+    ///
+    ///         Safe-direction edge: if the executed crystallise DEFERS (fee-mint reverts on a paused /
+    ///         un-whitelisted vault, H3), the actual pays MORE than this fee-adjusted quote (no dilution,
+    ///         no slice) — `actual ≥ preview` never bounces a preview-derived `minAssetsOut`.
+    ///
+    ///         Returns `(0, false)` instead of reverting when the oracle is down (try/catch on the nav +
+    ///         collateral/debt reads), and `(0, false)` when the simulated payout floors to 0 (mirrors
+    ///         `redeem`'s `ZeroAssetsOut` guard) so a preview-`minAssetsOut` never quotes a payout the
+    ///         executed path would revert on. ADVISORY ONLY — the on-chain gate in `fastRedeemImpl` is
+    ///         authoritative; a frontend uses `fastOk` to pre-route to `requestRedeem` without a bounce.
     /// @param shares Vault shares to preview (12dp).
-    /// @return assetsOut Predicted USDC out (0 when unpriceable).
+    /// @return assetsOut Predicted USDC out (0 when unpriceable or the payout floors to 0).
     /// @return fastOk    True iff the fast path would price AND clear the LTV gate.
     function previewRedeem(uint256 shares) external view returns (uint256 assetsOut, bool fastOk) {
         uint256 supply = IERC20(vault()).totalSupply();
         if (supply == 0) return (0, false);
-        uint256 navNet;
+        uint256 navPre;
         try this.nav() returns (uint256 n) {
-            navNet = n;
+            navPre = n;
         } catch {
             return (0, false);
         }
-        assetsOut = Math.mulDiv(shares, navNet, supply);
+        // Simulate the pending crystallise the executed `redeem` performs, mirroring `_crystallizeFees`'s
+        // inputs 1:1. Skip when it would seed on first accrual (`lastFeeAccrualTimestamp == 0` → no fee),
+        // matching the strategy's own early-return so the quote stays in lock-step with execution.
+        Layout storage $ = _layout();
+        uint256 navNet = navPre;
+        uint256 supplyPost = supply;
+        if ($.lastFeeAccrualTimestamp != 0) {
+            (uint256 feeShares,,, uint256 freshSlice) = LeveragedAeroFees.crystallize(
+                navPre,
+                supply,
+                $.hwmPerShare,
+                $.lastFeeAccrualTimestamp,
+                block.timestamp,
+                uint256($.managementFeeBps),
+                uint256($.performanceFeeBps),
+                _protocolFeeBps()
+            );
+            navNet = navPre - freshSlice; // freshSlice ≤ navPre (lib caps at navPre) → no underflow
+            supplyPost = supply + feeShares;
+        }
+        assetsOut = Math.mulDiv(shares, navNet, supplyPost);
+        // Mirror `redeem`'s `ZeroAssetsOut` guard: never quote a payout the executed path would revert on.
+        if (assetsOut == 0) return (0, false);
         // Idle-first (mirror `fastRedeemImpl`): the redeemer's `f×idle` share funds part of `assetsOut`,
         // so the LTV gate only sees the collateral-funded remainder.
-        uint256 idleShare = Math.mulDiv(IERC20(_layout().usdc).balanceOf(address(this)), shares, supply);
+        uint256 idleShare = Math.mulDiv(IERC20($.usdc).balanceOf(address(this)), shares, supplyPost);
         uint256 fromCollateral = assetsOut > idleShare ? assetsOut - idleShare : 0;
         if (fromCollateral == 0) return (assetsOut, true); // idle alone covers it — no LTV constraint
         // Predict the LTV gate on the same pre-withdraw basis as `fastRedeemImpl`.

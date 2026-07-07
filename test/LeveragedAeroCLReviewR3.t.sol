@@ -343,6 +343,113 @@ contract LeveragedAeroCLReviewR3 is Test {
     }
 
     // ═════════════════════════════════════════════════════════════════════════
+    // FINDING 4 — previewRedeem simulates the pending crystallise (== executed payout to the wei)
+    // ═════════════════════════════════════════════════════════════════════════
+
+    /// @dev MONEY ASSERT: with a pending perf + protocol fee (real gain above the HWM), `previewRedeem`
+    ///      must equal the EXACT `assetsOut` the subsequent `redeem(shares, preview)` pays — the executed
+    ///      path crystallises first (perf-fee mint dilutes supply, fresh protocol slice nets out of nav),
+    ///      so a preview priced on the LIVE nav/supply would over-quote and the preview-as-`minAssetsOut`
+    ///      would `InsufficientAssetsOut`. Post-fix the preview simulates that crystallise → exact equality
+    ///      → the redeem clears its own preview as the floor. Idle-covered (idle > navNet) so no LTV read.
+    function test_previewRedeem_matchesExecuted_pendingFee() public {
+        (NavHarness h, MockToken usdc, MockVaultPausableMint vault) = _redeemFixture();
+        _setPerfMgmtRecipient(address(h), 1000, 100, RECIPIENT); // 10% perf + 1%/yr mgmt
+
+        uint256 idle = 10_000e6;
+        usdc.mint(address(h), idle); // navPre == 10_000e6 (owed 0), idle > navNet → fully idle-funded
+        uint256 supply = vault.totalSupply();
+        _storeUint(address(h), SLOT_HWM, Math.mulDiv(5_000e6, 1e18, supply)); // HWM below nav → gain
+        uint256 lastFee = block.timestamp > 1 ? block.timestamp - 1 : 1;
+        _storeUint(address(h), SLOT_LAST_FEE, lastFee); // dt > 0 → mgmt fee too
+
+        // Sanity: a fee is genuinely pending (else this test would trivially pass).
+        (uint256 feeShares,,, uint256 freshSlice) = LeveragedAeroFees.crystallize(
+            h.nav(), supply, Math.mulDiv(5_000e6, 1e18, supply), lastFee, vm.getBlockTimestamp(), 100, 1000, 1000
+        );
+        assertGt(feeShares, 0, "fixture must have a pending perf-fee mint");
+        assertGt(freshSlice, 0, "fixture must have a pending protocol slice");
+
+        (address redeemer, uint256 shares) = _fundRedeemer(vault, h, "f4");
+        (uint256 preview, bool fastOk) = h.previewRedeem(shares);
+        assertGt(preview, 0, "preview must quote a payout");
+        assertTrue(fastOk, "idle-covered redeem clears the gate");
+
+        // The preview used AS minAssetsOut must NOT bounce, and the payout must equal it to the wei.
+        vm.prank(redeemer);
+        uint256 out = h.redeem(shares, preview);
+        assertEq(out, preview, "executed payout != preview (view/exec drift)");
+    }
+
+    /// @dev Safe-direction edge: when the executed crystallise DEFERS (feeRecipient un-whitelisted → the
+    ///      fee mint reverts, H3), the actual payout is MORE than the fee-adjusted preview (no dilution,
+    ///      no fresh slice) — so a preview-derived `minAssetsOut` still clears. `actual ≥ preview`.
+    function test_previewRedeem_executedDefers_paysAtLeastPreview() public {
+        (NavHarness h, MockToken usdc, MockVaultPausableMint vault) = _redeemFixture();
+        _setPerfMgmtRecipient(address(h), 1000, 100, RECIPIENT);
+
+        uint256 idle = 10_000e6;
+        usdc.mint(address(h), idle);
+        uint256 supply = vault.totalSupply();
+        _storeUint(address(h), SLOT_HWM, Math.mulDiv(5_000e6, 1e18, supply));
+        _storeUint(address(h), SLOT_LAST_FEE, block.timestamp > 1 ? block.timestamp - 1 : 1);
+
+        (address redeemer, uint256 shares) = _fundRedeemer(vault, h, "f4d");
+        (uint256 preview,) = h.previewRedeem(shares); // simulates the crystallise (fee-adjusted)
+
+        vault.blockMintTo(RECIPIENT); // executed crystallise's fee mint reverts → defers → no dilution/slice
+        vm.prank(redeemer);
+        uint256 out = h.redeem(shares, preview); // preview as floor must still clear
+        assertGe(out, preview, "deferred crystallise must pay >= the fee-adjusted preview");
+        // And strictly more here (the deferral drops the dilution + slice that the preview priced in).
+        assertGt(out, preview, "deferral pays strictly more than the fee-adjusted preview");
+    }
+
+    /// @dev navNet == 0 (owed >= gross book) → `previewRedeem` returns `(0, false)`, matching the executed
+    ///      `redeem`'s `ZeroAssetsOut` revert — the preview never quotes a payout the exec path rejects.
+    function test_previewRedeem_navZero_returnsZeroFalse() public {
+        (NavHarness h, MockToken usdc, MockVaultPausableMint vault) = _redeemFixture();
+        uint256 idle = 1_000e6;
+        usdc.mint(address(h), idle);
+        _storeUint(address(h), SLOT_OWED, idle + 1); // owed > idle → nav()/navNet floor to 0
+        assertEq(h.nav(), 0, "fixture must drive nav() to 0");
+
+        (address redeemer, uint256 shares) = _fundRedeemer(vault, h, "f4z");
+        (uint256 preview, bool fastOk) = h.previewRedeem(shares);
+        assertEq(preview, 0, "navZero preview must be 0");
+        assertFalse(fastOk, "navZero preview must flag fastOk == false");
+
+        // The executed path reverts ZeroAssetsOut on the same state → the preview correctly pre-routes away.
+        vm.prank(redeemer);
+        vm.expectRevert(LeveragedAerodromeCLStrategy.ZeroAssetsOut.selector);
+        h.redeem(shares, 0);
+    }
+
+    /// @dev No pending fee (`dt == 0` at the last accrual AND nav at the HWM) → the simulated crystallise
+    ///      is a no-op, so the preview equals the plain `f × nav` (pre-fix behaviour) AND the executed
+    ///      payout — proving the fee simulation adds nothing when there's nothing to crystallise.
+    function test_previewRedeem_noPendingFee_unchanged() public {
+        (NavHarness h, MockToken usdc, MockVaultPausableMint vault) = _redeemFixture();
+        _setPerfMgmtRecipient(address(h), 1000, 100, RECIPIENT);
+
+        uint256 idle = 10_000e6;
+        usdc.mint(address(h), idle);
+        uint256 supply = vault.totalSupply();
+        _storeUint(address(h), SLOT_HWM, Math.mulDiv(idle, 1e18, supply)); // HWM == nav-per-share → no gain
+        _storeUint(address(h), SLOT_LAST_FEE, block.timestamp); // dt == 0 → no mgmt fee
+
+        (address redeemer, uint256 shares) = _fundRedeemer(vault, h, "f4n");
+        (uint256 preview, bool fastOk) = h.previewRedeem(shares);
+        assertTrue(fastOk, "idle-covered redeem clears the gate");
+        // Plain f × nav (no fee adjustment).
+        assertEq(preview, Math.mulDiv(shares, h.nav(), supply), "no-fee preview must equal plain f * nav");
+
+        vm.prank(redeemer);
+        uint256 out = h.redeem(shares, preview);
+        assertEq(out, preview, "no-fee executed payout != preview");
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
     // Control — normal deposit + fast-redeem round-trip unchanged
     // ═════════════════════════════════════════════════════════════════════════
 
