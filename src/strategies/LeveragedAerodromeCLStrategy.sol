@@ -647,6 +647,30 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         _crystallizeFees(navPre);
     }
 
+    /// @dev Best-effort crystallise (H3 pattern), single-site: isolates the fee-MINT / near-unreachable
+    ///      governor-read revert inside the external `crystallizeFeesSelf` self-call so a failure rolls back
+    ///      ONLY the crystallise (HWM + `lastFeeAccrualTimestamp` unchanged → fee defers) while the calling
+    ///      op proceeds. `navPre` stays computed by the CALLER so fail-closed pricing (a down oracle) reverts
+    ///      there, outside this try. Not narrowed by selector; the asymmetric un-try'd governor reads
+    ///      (compound/settle/skim) hard-revert on the same failure.
+    function _crystallizeBestEffort(uint256 navPre, uint8 op) private {
+        try this.crystallizeFeesSelf(navPre) {}
+        catch {
+            emit FeeCrystallizeDeferred(op, navPre);
+        }
+    }
+
+    /// @dev `_crystallizeBestEffort` + net the FRESH protocol slice the crystallise accrued out of `navPre`
+    ///      (`navNet = navPre − (owedNow − owedBefore)`; prior owed already net inside `nav()`). No underflow
+    ///      — the fees lib caps the slice at navPre. On a caught crystallise owed is unchanged → `navNet ==
+    ///      navPre` (self-consistent). Shared by `deposit` and the fast `redeem` (both price at `f × navNet`
+    ///      against a POST-crystallise `supply` read by the caller).
+    function _crystallizeAndNet(uint256 navPre, uint8 op) private returns (uint256 navNet) {
+        uint256 owedBefore = _layout().protocolFeeOwed;
+        _crystallizeBestEffort(navPre, op);
+        navNet = navPre - (_layout().protocolFeeOwed - owedBefore);
+    }
+
     /// @notice Oracle-priced deposit: mint vault shares proportional to current NAV. Ordering is
     ///         load-bearing (phantom-fee fix): crystallise fees on the PRE-deposit NAV (fail-closed on
     ///         the PRICE) BEFORE pulling USDC, then mint via the ERC-4626 virtual-offset formula.
@@ -673,15 +697,7 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         // Crystallize on pre-deposit NAV. `nav()` OUTSIDE try/catch → a down oracle reverts the deposit
         // (fail-closed pricing is load-bearing). Only the fee-MINT failure is swallowed (fee defers).
         uint256 navPre = nav();
-        uint256 owedBefore = _layout().protocolFeeOwed;
-        try this.crystallizeFeesSelf(navPre) {}
-        catch {
-            emit FeeCrystallizeDeferred(OP_DEPOSIT, navPre);
-        }
-        // Net the fresh protocol slice the crystallise accrued (prior owed already net inside nav()); no
-        // underflow — the fees lib caps the slice at navPre. On a caught crystallise owed is unchanged
-        // → navNet == navPre.
-        uint256 navNet = navPre - (_layout().protocolFeeOwed - owedBefore);
+        uint256 navNet = _crystallizeAndNet(navPre, OP_DEPOSIT);
         IERC20(_layout().usdc).safeTransferFrom(msg.sender, address(this), assets);
         address vault_ = vault();
         uint256 supply = IERC20(vault_).totalSupply(); // POST-crystallize (includes any perf-fee mint)
@@ -809,18 +825,12 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         //    sees a 0 fresh slice) and the exit still proceeds. Not narrowed by selector; the asymmetric
         //    un-try'd governor reads (compound/settle/skim) hard-revert on that same failure.
         uint256 navPre = nav();
-        uint256 owedBefore = _layout().protocolFeeOwed;
-        try this.crystallizeFeesSelf(navPre) {}
-        catch {
-            emit FeeCrystallizeDeferred(OP_REDEEM, navPre);
-        }
+        uint256 navNet = _crystallizeAndNet(navPre, OP_REDEEM);
 
         // 2. Price against the POST-crystallize book, both effects consistently: `supply` is read
         //    after the crystallize (includes the perf-fee mint dilution) and the FRESH protocol slice
-        //    it just accrued is netted out of navPre (prior owed is already net inside nav()). Without
-        //    the netting the redeemer would capture f×slice from stayers. No underflow: the fees lib
-        //    caps the slice at navPre.
-        uint256 navNet = navPre - (_layout().protocolFeeOwed - owedBefore);
+        //    it just accrued is netted out of navPre inside `_crystallizeAndNet`. Without the netting
+        //    the redeemer would capture f×slice from stayers.
         address vault_ = vault();
         uint256 supply = IERC20(vault_).totalSupply();
         assetsOut = Math.mulDiv(shares, navNet, supply); // rounds down, LP-favourable
@@ -1013,10 +1023,7 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         } catch {
             navPre = 0;
         }
-        try this.crystallizeFeesSelf(navPre) {}
-        catch {
-            emit FeeCrystallizeDeferred(OP_FULFILL, navPre); // navPre == 0 here on an oracle-out redeem
-        }
+        _crystallizeBestEffort(navPre, OP_FULFILL); // navPre == 0 here on an oracle-out redeem → fee defers
 
         uint256 supply = IERC20(vault()).totalSupply();
         assetsOut = LeveragedAeroManager.redeemUnwindImpl(shares, supply);
