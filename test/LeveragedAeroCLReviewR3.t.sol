@@ -232,11 +232,13 @@ contract LeveragedAeroCLReviewR3 is Test {
             abi.encode(true)
         );
 
-        // Deposit must proceed and emit the deferral signal (fee rolled back).
-        vm.expectEmit(false, false, false, false, address(h));
-        emit LeveragedAerodromeCLStrategy.FeeCrystallizeDeferred();
+        // Deposit must proceed and emit the deferral signal (fee rolled back) with op=OP_DEPOSIT (0) and
+        // the at-risk navPre. Check-data on so the op code + navPre payload are asserted, not just the topic.
+        vm.expectEmit(false, false, false, true, address(h));
+        emit LeveragedAerodromeCLStrategy.FeeCrystallizeDeferred(0, navPre);
         vm.prank(dep);
         uint256 shares = h.deposit(a, 0);
+        assertGt(navPre, 0, "deferred-op navPre must be nonzero (NAV at risk in the event payload)");
 
         // navNet == navPre (crystallise rolled back → owed unchanged), supply unchanged (no fee mint).
         uint256 expected = Math.mulDiv(a, supply0 + SHARES_VIRTUAL_OFFSET, navPre + 1);
@@ -386,6 +388,41 @@ contract LeveragedAeroCLReviewR3 is Test {
         vm.prank(redeemer);
         uint256 out = h.redeem(shares, preview);
         assertEq(out, preview, "executed payout != preview (view/exec drift)");
+    }
+
+    /// @dev STRUCTURAL DEDUP (Part A): after `previewRedeem` was rewired through the shared
+    ///      `_simulateCrystallize` marshalling (the F4-desync killer), the quote must still equal a
+    ///      payout independently reconstructed from the pure fees lib — i.e. the refactor is
+    ///      behaviour-preserving, deriving `(navNet, supplyPost)` from the SAME 8-arg call as
+    ///      `_crystallizeFees`. Idle-covered so the LTV branch is a clean pass.
+    function test_previewRedeem_simulateCrystallize_matchesLibDerivation() public {
+        (NavHarness h, MockToken usdc, MockVaultPausableMint vault) = _redeemFixture();
+        _setPerfMgmtRecipient(address(h), 1000, 100, RECIPIENT); // 10% perf + 1%/yr mgmt
+
+        uint256 idle = 10_000e6;
+        usdc.mint(address(h), idle);
+        uint256 supply = vault.totalSupply();
+        uint256 hwm = Math.mulDiv(5_000e6, 1e18, supply); // HWM below nav → gain
+        _storeUint(address(h), SLOT_HWM, hwm);
+        uint256 lastFee = block.timestamp > 1 ? block.timestamp - 1 : 1;
+        _storeUint(address(h), SLOT_LAST_FEE, lastFee);
+
+        uint256 navPre = h.nav();
+        // Independent (navNet, supplyPost) from the pure lib — the contract's `_simulateCrystallize`
+        // MUST marshal the identical inputs (protocol rate 1000 from the fixture governor).
+        (uint256 feeShares,,, uint256 freshSlice) =
+            LeveragedAeroFees.crystallize(navPre, supply, hwm, lastFee, vm.getBlockTimestamp(), 100, 1000, 1000);
+        assertGt(feeShares, 0, "fixture must mint perf-fee shares");
+        assertGt(freshSlice, 0, "fixture must accrue a fresh protocol slice");
+
+        (address redeemer, uint256 shares) = _fundRedeemer(vault, h, "f4sim");
+        (uint256 preview,) = h.previewRedeem(shares);
+
+        uint256 expected = Math.mulDiv(shares, navPre - freshSlice, supply + feeShares);
+        assertEq(preview, expected, "preview must equal the shared-marshalling lib derivation");
+        // And it clears execution to the wei (the dedup didn't drift the money path).
+        vm.prank(redeemer);
+        assertEq(h.redeem(shares, preview), preview, "executed payout != refactored preview");
     }
 
     /// @dev Safe-direction edge: when the executed crystallise DEFERS (feeRecipient un-whitelisted → the

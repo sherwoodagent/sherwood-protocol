@@ -94,9 +94,17 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     event RedeemCancelled(uint256 indexed id, address indexed owner, uint256 shares);
     event RedeemEmergency(uint256 indexed id, address indexed owner, uint256 assetsOut);
 
-    /// @dev A best-effort fee crystallise (deposit / fast redeem / proportional redeem) reverted in its
-    ///      fee-MINT (vault paused / feeRecipient de-whitelisted) and was deferred; the op proceeded.
-    event FeeCrystallizeDeferred();
+    /// @dev A best-effort fee crystallise (deposit / fast redeem / proportional redeem) reverted and was
+    ///      deferred; the op proceeded. Reverts on the fee-MINT (vault paused / feeRecipient
+    ///      de-whitelisted) — or, near-unreachably, on the governor read inside the crystallise (see the
+    ///      per-op docstrings). `op` (see `OP_*`) tells a monitor which entrypoint deferred; `navPre` is
+    ///      the NAV at risk (0 on an oracle-out proportional redeem).
+    event FeeCrystallizeDeferred(uint8 op, uint256 navPre);
+
+    // ── `FeeCrystallizeDeferred.op` codes ──
+    uint8 private constant OP_DEPOSIT = 0;
+    uint8 private constant OP_REDEEM = 1; // fast redeem
+    uint8 private constant OP_FULFILL = 2; // proportional redeem (fulfill / emergency)
 
     // ── Initialisation params (ABI-encoded → BaseStrategy.initialize → _initialize) ──
 
@@ -552,6 +560,13 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         // Protocol fee is read LIVE from the governor (a self-fee'd strategy is skipped by the
         // governor's settle-fee path, so the protocol leg is collected here instead). Treat a
         // missing governor as 0 bps.
+        //
+        // SHARED ARG-LIST CONTRACT: the 8-arg `LeveragedAeroFees.crystallize(...)` call below is the
+        // EXECUTED crystallise; `_simulateCrystallize` (just below `_protocolFeeBps`) re-marshals the
+        // SAME 8 inputs read-only for `previewRedeem`. Any arg change here MUST be mirrored there —
+        // F4 was a desync between the two. This site applies state (mint / owed / hwm / timestamp);
+        // the simulate site only derives `(navNet, supplyPost)`, so they can't collapse into one
+        // helper without either losing these raw returns or breaking the try/catch atomicity.
         (uint256 feeShares, uint256 newHwm, uint256 newLast, uint256 protocolUsdc) = LeveragedAeroFees.crystallize(
             navPre,
             supply,
@@ -566,6 +581,47 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         $.lastFeeAccrualTimestamp = newLast;
         if (protocolUsdc > 0) $.protocolFeeOwed += protocolUsdc;
         if (feeShares > 0) ISyndicateVault(vault()).strategyMint($.feeRecipient, feeShares);
+    }
+
+    /// @dev READ-ONLY twin of `_crystallizeFees`'s compute: derives the `(navNet, supplyPost)` the
+    ///      EXECUTED crystallise would produce, without applying any state. `previewRedeem` uses it so
+    ///      its quote tracks execution to the wei. Marshals the SAME 8 `LeveragedAeroFees.crystallize`
+    ///      args as `_crystallizeFees` — see the "SHARED ARG-LIST CONTRACT" note there; keep the two
+    ///      lists in lock-step (F4 was a desync). Honours the same `lastFeeAccrualTimestamp == 0`
+    ///      seed-guard early-return (no fee on first accrual). `_protocolFeeBps()` reads the governor;
+    ///      the caller wraps this in a try/catch so a reverting governor read degrades to `(0, false)`.
+    function _simulateCrystallize(uint256 navPre, uint256 supply)
+        private
+        view
+        returns (uint256 navNet, uint256 supplyPost)
+    {
+        Layout storage $ = _layout();
+        if ($.lastFeeAccrualTimestamp == 0) return (navPre, supply);
+        (uint256 feeShares,,, uint256 freshSlice) = LeveragedAeroFees.crystallize(
+            navPre,
+            supply,
+            $.hwmPerShare,
+            $.lastFeeAccrualTimestamp,
+            block.timestamp,
+            uint256($.managementFeeBps),
+            uint256($.performanceFeeBps),
+            _protocolFeeBps()
+        );
+        navNet = navPre - freshSlice; // freshSlice ≤ navPre (lib caps at navPre) → no underflow
+        supplyPost = supply + feeShares;
+    }
+
+    /// @dev Self-only external view wrapper so `previewRedeem` can `try/catch` `_simulateCrystallize`
+    ///      (its `_protocolFeeBps()` does an external governor staticcall — near-unreachable to revert on
+    ///      a set-once UUPS proxy, but the advisory view must degrade to `(0, false)` symmetrically with
+    ///      its other failure modes rather than revert while executed `redeem` swallows the same).
+    function simulateCrystallizeSelf(uint256 navPre, uint256 supply)
+        external
+        view
+        returns (uint256 navNet, uint256 supplyPost)
+    {
+        if (msg.sender != address(this)) revert OnlySelf();
+        return _simulateCrystallize(navPre, supply);
     }
 
     /// @dev Live protocol-fee rate (bps) from the governor; 0 if the governor is unset.
@@ -599,7 +655,12 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     ///         The crystallise is best-effort (H3, mirrors `redeem`): `navPre = nav()` stays OUTSIDE
     ///         the try/catch so a down oracle still reverts the deposit (fail-closed pricing), but a
     ///         fee-MINT revert (vault paused / feeRecipient de-whitelisted on a whitelist vault) rolls
-    ///         back ONLY the crystallise (fee defers) — deposits must not brick once a fee accrues.
+    ///         back ONLY the crystallise (fee defers) — deposits must not brick once a fee accrues. The
+    ///         catch ALSO swallows a reverting governor read (`_protocolFeeBps`/`_protocolFeeRecipient`
+    ///         staticcall inside the crystallise) — near-unreachable on a set-once UUPS proxy, so the
+    ///         intended target is the fee-MINT; it is NOT narrowed by selector (fee-mint reverts are
+    ///         hard to enumerate). Note the asymmetry: `compound()` / `_settle()` / `_dischargeRedeemSkim`
+    ///         read the governor UN-try'd and hard-revert on the same failure.
     ///         Pricing mirrors `redeem`: snapshot `owedBefore`, then net the FRESH protocol slice the
     ///         crystallise accrued out of `navPre` (`navNet = navPre − (owedNow − owedBefore)`); `supply`
     ///         is read POST-crystallise (includes the perf-fee mint). Without the netting the depositor
@@ -615,7 +676,7 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         uint256 owedBefore = _layout().protocolFeeOwed;
         try this.crystallizeFeesSelf(navPre) {}
         catch {
-            emit FeeCrystallizeDeferred();
+            emit FeeCrystallizeDeferred(OP_DEPOSIT, navPre);
         }
         // Net the fresh protocol slice the crystallise accrued (prior owed already net inside nav()); no
         // underflow — the fees lib caps the slice at navPre. On a caught crystallise owed is unchanged
@@ -743,13 +804,15 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
 
         // 1. Crystallise on the pre-redeem NAV (fail-closed: a down oracle reverts — correct, the fast
         //    path is inherently oracle-dependent). Best-effort (H3, §7): a fee-mint revert (vault paused
-        //    / feeRecipient de-whitelisted) rolls back ONLY the crystallise — owed + supply unchanged,
-        //    so the netting below sees a 0 fresh slice — and the exit still proceeds.
+        //    / feeRecipient de-whitelisted) — or a near-unreachable governor-read revert inside the
+        //    crystallise — rolls back ONLY the crystallise (owed + supply unchanged, so the netting below
+        //    sees a 0 fresh slice) and the exit still proceeds. Not narrowed by selector; the asymmetric
+        //    un-try'd governor reads (compound/settle/skim) hard-revert on that same failure.
         uint256 navPre = nav();
         uint256 owedBefore = _layout().protocolFeeOwed;
         try this.crystallizeFeesSelf(navPre) {}
         catch {
-            emit FeeCrystallizeDeferred();
+            emit FeeCrystallizeDeferred(OP_REDEEM, navPre);
         }
 
         // 2. Price against the POST-crystallize book, both effects consistently: `supply` is read
@@ -793,18 +856,26 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     ///         a redeem landing a few blocks later pays marginally LESS than this quote (and the NAV may
     ///         drift), which would otherwise bounce an exact-quote `minAssetsOut`.
     ///
-    ///         Safe-direction edge (opposite sign): if the executed crystallise DEFERS (fee-mint reverts
-    ///         on a paused / un-whitelisted vault, H3), the actual pays MORE than this fee-adjusted quote
-    ///         (no dilution, no slice) — that case never bounces a preview-derived `minAssetsOut`.
+    ///         Safe-direction edge for the PAYOUT (opposite sign): if the executed crystallise DEFERS
+    ///         (fee-mint reverts on a paused / un-whitelisted vault, H3), the actual pays MORE than this
+    ///         fee-adjusted quote (no dilution, no slice) — that case never bounces a preview-derived
+    ///         `minAssetsOut`. NOTE `fastOk` is the OPPOSITE sign: on a deferred crystallise the executed
+    ///         `assetsOut = shares × navPre / supply` is LARGER than this fee-adjusted quote (`strategyBurn`
+    ///         is not `whenNotPaused`, so redeem proceeds while the crystallise defers), so its larger
+    ///         `fromCollateral` yields a higher `postLtv` — the on-chain `fastRedeemImpl` gate can revert
+    ///         `FastRedeemExceedsLtv` even though this preview optimistically returned `fastOk == true`.
+    ///         `fastOk` is ADVISORY; the manager's LTV gate is authoritative.
     ///
     ///         Returns `(0, false)` instead of reverting when the oracle is down (try/catch on the nav +
-    ///         collateral/debt reads), and `(0, false)` when the simulated payout floors to 0 (mirrors
-    ///         `redeem`'s `ZeroAssetsOut` guard) so a preview-`minAssetsOut` never quotes a payout the
-    ///         executed path would revert on. ADVISORY ONLY — the on-chain gate in `fastRedeemImpl` is
-    ///         authoritative; a frontend uses `fastOk` to pre-route to `requestRedeem` without a bounce.
+    ///         collateral/debt reads), when the fee simulation's governor read reverts (try/catch on
+    ///         `simulateCrystallizeSelf` — symmetric with the other degrade-to-`(0,false)` modes rather
+    ///         than reverting while executed `redeem` swallows the same), and when the simulated payout
+    ///         floors to 0 (mirrors `redeem`'s `ZeroAssetsOut` guard) so a preview-`minAssetsOut` never
+    ///         quotes a payout the executed path would revert on. ADVISORY ONLY — the on-chain gate in
+    ///         `fastRedeemImpl` is authoritative; a frontend uses `fastOk` to pre-route to `requestRedeem`.
     /// @param shares Vault shares to preview (12dp).
     /// @return assetsOut Predicted USDC out (0 when unpriceable or the payout floors to 0).
-    /// @return fastOk    True iff the fast path would price AND clear the LTV gate.
+    /// @return fastOk    True iff the fast path would price AND clear the LTV gate (advisory — see above).
     function previewRedeem(uint256 shares) external view returns (uint256 assetsOut, bool fastOk) {
         uint256 supply = IERC20(vault()).totalSupply();
         if (supply == 0) return (0, false);
@@ -814,32 +885,24 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         } catch {
             return (0, false);
         }
-        // Simulate the pending crystallise the executed `redeem` performs, mirroring `_crystallizeFees`'s
-        // inputs 1:1. Skip when it would seed on first accrual (`lastFeeAccrualTimestamp == 0` → no fee),
-        // matching the strategy's own early-return so the quote stays in lock-step with execution.
-        Layout storage $ = _layout();
-        uint256 navNet = navPre;
-        uint256 supplyPost = supply;
-        if ($.lastFeeAccrualTimestamp != 0) {
-            (uint256 feeShares,,, uint256 freshSlice) = LeveragedAeroFees.crystallize(
-                navPre,
-                supply,
-                $.hwmPerShare,
-                $.lastFeeAccrualTimestamp,
-                block.timestamp,
-                uint256($.managementFeeBps),
-                uint256($.performanceFeeBps),
-                _protocolFeeBps()
-            );
-            navNet = navPre - freshSlice; // freshSlice ≤ navPre (lib caps at navPre) → no underflow
-            supplyPost = supply + feeShares;
+        // Simulate the pending crystallise the executed `redeem` performs — the SAME arg-marshalling as
+        // `_crystallizeFees` (via `_simulateCrystallize`, F4 dedup). Wrapped in a try/catch so a reverting
+        // governor read inside `_protocolFeeBps()` degrades to `(0, false)` symmetrically with the other
+        // preview failure modes (executed `redeem` swallows the same via its own crystallise try/catch).
+        uint256 navNet;
+        uint256 supplyPost;
+        try this.simulateCrystallizeSelf(navPre, supply) returns (uint256 nn, uint256 sp) {
+            navNet = nn;
+            supplyPost = sp;
+        } catch {
+            return (0, false);
         }
         assetsOut = Math.mulDiv(shares, navNet, supplyPost);
         // Mirror `redeem`'s `ZeroAssetsOut` guard: never quote a payout the executed path would revert on.
         if (assetsOut == 0) return (0, false);
         // Idle-first (mirror `fastRedeemImpl`): the redeemer's `f×idle` share funds part of `assetsOut`,
         // so the LTV gate only sees the collateral-funded remainder.
-        uint256 idleShare = Math.mulDiv(IERC20($.usdc).balanceOf(address(this)), shares, supplyPost);
+        uint256 idleShare = Math.mulDiv(IERC20(_layout().usdc).balanceOf(address(this)), shares, supplyPost);
         uint256 fromCollateral = assetsOut > idleShare ? assetsOut - idleShare : 0;
         if (fromCollateral == 0) return (assetsOut, true); // idle alone covers it — no LTV constraint
         // Predict the LTV gate on the same pre-withdraw basis as `fastRedeemImpl`.
@@ -936,8 +999,10 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     /// @dev Shared body of `fulfillRedeem` / `emergencyRedeem`: oracle-free proportional unwind of
     ///      `shares` for `recipient`, paying net of the Item-3 protocol skim, enforcing `minOut`,
     ///      burning the escrowed shares. Best-effort crystallise (H3 pattern: navPre=0 on oracle
-    ///      outage → price-free mgmt fee accrues, perf fee defers; a fee-mint revert defers the whole
-    ///      crystallise) keeps the exit oracle-free (§7). `supply` is fixed once before the burn.
+    ///      outage → price-free mgmt fee accrues, perf fee defers; a fee-mint revert — or the
+    ///      near-unreachable governor-read revert inside the crystallise — defers the whole crystallise)
+    ///      keeps the exit oracle-free (§7). Not narrowed by selector; note `_dischargeRedeemSkim` below
+    ///      reads the governor UN-try'd and hard-reverts on that same failure. `supply` fixed once before burn.
     function _proportionalRedeem(address recipient, uint256 shares, uint256 minOut)
         private
         returns (uint256 assetsOut)
@@ -950,7 +1015,7 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         }
         try this.crystallizeFeesSelf(navPre) {}
         catch {
-            emit FeeCrystallizeDeferred();
+            emit FeeCrystallizeDeferred(OP_FULFILL, navPre); // navPre == 0 here on an oracle-out redeem
         }
 
         uint256 supply = IERC20(vault()).totalSupply();
