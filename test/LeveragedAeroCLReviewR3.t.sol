@@ -158,12 +158,19 @@ contract NavHarness is LeveragedAerodromeCLStrategy {}
 ///                not under-minted (the OLD ÷(navPre+1) formula minted strictly fewer shares).
 ///           F2 — fast `redeem` reverts `ZeroAssetsOut` (before pulling shares) when the payout floors
 ///                to 0 (navNet==0 with supply>0, OR a dust-share redeem) — no burn-for-zero.
+///           F2-async — the async proportional redeem (`fulfillRedeem` / `emergencyRedeem`, both via
+///                `_proportionalRedeem`) applies the SAME `ZeroAssetsOut` guard AFTER the protocol skim:
+///                at navNet==0 (owed ≥ gross) the skim nets the payout to 0 with a stored `minOut == 0`,
+///                so pre-fix the escrowed shares were burned for a 0 transfer. Post-fix it reverts, the
+///                escrow stays intact, and the request is still recoverable via `cancelRedeem`.
 contract LeveragedAeroCLReviewR3 is Test {
     uint256 private constant STRAT_BASE = uint256(0x405ae0b144079093e970849fdffdcb2a514e44968598c6c5c73444496e844900);
     uint256 private constant SLOT_USDC = STRAT_BASE + 0;
     uint256 private constant SLOT_MUSDC = STRAT_BASE + 1;
     uint256 private constant SLOT_MCBBTC = STRAT_BASE + 2;
     uint256 private constant SLOT_MWETH = STRAT_BASE + 3;
+    uint256 private constant SLOT_CBBTC = STRAT_BASE + 4;
+    uint256 private constant SLOT_WETH = STRAT_BASE + 5;
     uint256 private constant SLOT_HWM = STRAT_BASE + 20;
     uint256 private constant SLOT_LAST_FEE = STRAT_BASE + 21;
     uint256 private constant SLOT_OWED = STRAT_BASE + 22;
@@ -450,6 +457,99 @@ contract LeveragedAeroCLReviewR3 is Test {
     }
 
     // ═════════════════════════════════════════════════════════════════════════
+    // FINDING 2-async — async proportional redeem rejects a burn-for-zero (navNet==0)
+    // ═════════════════════════════════════════════════════════════════════════
+
+    /// @dev `protocolFeeOwed ≥ gross book` → the async unwind pays f×idle GROSS, then the Item-3 skim
+    ///      (`f×owed` capped at assetsOut) nets the payout to exactly 0. With the request's stored
+    ///      `minAssetsOut == 0` the pre-fix `< minOut` check fell through → burn-for-zero. Post-fix
+    ///      `fulfillRedeem` reverts `ZeroAssetsOut`, the escrowed shares are NOT burned, and the owner
+    ///      recovers them via `cancelRedeem`.
+    function test_asyncFulfill_navZero_revertsZeroAssetsOut_recoverable() public {
+        (NavHarness h, MockToken usdc, MockVaultPausableMint vault) = _asyncRedeemFixture();
+
+        uint256 idle = 1_000e6;
+        usdc.mint(address(h), idle);
+        _storeUint(address(h), SLOT_OWED, idle + 1); // owed > idle → gross ≤ owed → skim nets payout to 0
+        assertEq(h.nav(), 0, "fixture must drive nav() to 0 with supply > 0");
+
+        (address owner, uint256 shares) = _fundRedeemer(vault, h, "af0");
+        vm.prank(owner);
+        uint256 id = h.requestRedeem(shares, 0); // stored minAssetsOut == 0 (the burn-for-zero trigger)
+        assertEq(vault.balanceOf(address(h)), shares, "shares escrowed in the strategy");
+
+        uint256 supplyBefore = vault.totalSupply();
+        vm.prank(address(this)); // proposer == deployer (STATE_EXECUTED_INIT stores this)
+        vm.expectRevert(LeveragedAerodromeCLStrategy.ZeroAssetsOut.selector);
+        h.fulfillRedeem(id);
+
+        // Escrow intact — nothing burned, request not settled.
+        assertEq(vault.totalSupply(), supplyBefore, "no shares burned on the reverted fulfill");
+        assertEq(vault.balanceOf(address(h)), shares, "escrow untouched");
+        assertFalse(h.redeemRequest(id).settled, "request must remain unsettled");
+
+        // Owner recovers the escrow via cancelRedeem (no State/navNet gate).
+        vm.prank(owner);
+        h.cancelRedeem(id);
+        assertEq(vault.balanceOf(owner), shares, "owner recovers the escrowed shares");
+        assertEq(vault.balanceOf(address(h)), 0, "strategy holds no escrow after cancel");
+        assertTrue(h.redeemRequest(id).settled, "request settled after cancel");
+    }
+
+    /// @dev `emergencyRedeem` (the permissionless deadman, owner-gated) routes through the same
+    ///      `_proportionalRedeem` — so it reverts `ZeroAssetsOut` at navNet==0 too, leaving the escrow
+    ///      intact. Reverting is NOT a stuck state: the shares stay escrowed and `cancelRedeem` recovers
+    ///      them (asserted in the fulfill test above).
+    function test_asyncEmergency_navZero_revertsZeroAssetsOut_escrowIntact() public {
+        (NavHarness h, MockToken usdc, MockVaultPausableMint vault) = _asyncRedeemFixture();
+
+        uint256 idle = 1_000e6;
+        usdc.mint(address(h), idle);
+        _storeUint(address(h), SLOT_OWED, idle + 1);
+
+        (address owner, uint256 shares) = _fundRedeemer(vault, h, "ae0");
+        vm.prank(owner);
+        uint256 id = h.requestRedeem(shares, 0);
+
+        vm.warp(vm.getBlockTimestamp() + 2 days + 1); // past FULFILL_WINDOW → deadman reachable
+        uint256 supplyBefore = vault.totalSupply();
+        vm.prank(owner);
+        vm.expectRevert(LeveragedAerodromeCLStrategy.ZeroAssetsOut.selector);
+        h.emergencyRedeem(id, 0);
+
+        assertEq(vault.totalSupply(), supplyBefore, "no shares burned on the reverted emergencyRedeem");
+        assertEq(vault.balanceOf(address(h)), shares, "escrow untouched");
+        assertFalse(h.redeemRequest(id).settled, "request must remain unsettled");
+    }
+
+    /// @dev Control: a normal async fulfill at a NONZERO navNet still pays out and burns the escrow —
+    ///      the new guard only fires on an exact-0 payout. navNet == idle (owed 0), f = 1/2 → pays f×idle.
+    function test_asyncFulfill_nonzeroNav_succeeds() public {
+        (NavHarness h, MockToken usdc, MockVaultPausableMint vault) = _asyncRedeemFixture();
+
+        uint256 idle = 1_000e6;
+        usdc.mint(address(h), idle); // navNet == 1_000e6 (owed 0)
+        assertEq(h.nav(), idle, "fixture must have a nonzero nav");
+
+        (address owner, uint256 shares) = _fundRedeemer(vault, h, "an0"); // f = shares/supply = 1/2
+        uint256 supply = vault.totalSupply();
+        uint256 expected = Math.mulDiv(idle, shares, supply); // f × idle, oracle-free unwind
+        assertGt(expected, 0, "control must pay out");
+
+        vm.prank(owner);
+        uint256 id = h.requestRedeem(shares, 0);
+        uint256 supplyBefore = vault.totalSupply();
+
+        vm.prank(address(this)); // proposer
+        h.fulfillRedeem(id);
+
+        assertEq(usdc.balanceOf(owner), expected, "owner paid f * idle");
+        assertEq(vault.totalSupply(), supplyBefore - shares, "escrowed shares burned on fulfill");
+        assertEq(vault.balanceOf(address(h)), 0, "no escrow remains");
+        assertTrue(h.redeemRequest(id).settled, "request settled after fulfill");
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
     // Control — normal deposit + fast-redeem round-trip unchanged
     // ═════════════════════════════════════════════════════════════════════════
 
@@ -530,6 +630,28 @@ contract LeveragedAeroCLReviewR3 is Test {
         _store(address(h), SLOT_MWETH, address(mWeth));
         _storeUint(address(h), SLOT_LAST_FEE, block.timestamp);
         // tokenId=0 (flat book) → fast path prices f×nav, funded from mUSDC collateral.
+    }
+
+    /// @dev Async-redeem fixture: the flat-book redeem wiring PLUS zero-balance cbBTC / WETH tokens and a
+    ///      zero-collateral mUSDC — so `redeemUnwindImpl`'s leg reservation (`_stayerLeg`), residual sweep
+    ///      (`_sweepLegToUsdc`) and collateral redeem (`_redeemCollateral`) are clean no-ops on the flat
+    ///      book (they'd otherwise `balanceOf` an unset address(0) slot and revert). The unwind then
+    ///      returns the redeemer's f×idle share, which the Item-3 skim nets against `protocolFeeOwed`.
+    function _asyncRedeemFixture() private returns (NavHarness h, MockToken usdc, MockVaultPausableMint vault) {
+        (h, usdc, vault) = _redeemFixture();
+        MockToken cbBTC = new MockToken("cbBTC");
+        MockToken weth = new MockToken("WETH");
+        MockCUsdcFunded mUsdc = new MockCUsdcFunded(usdc, address(h), 0); // zero collateral → redeem no-op
+        _store(address(h), SLOT_CBBTC, address(cbBTC));
+        _store(address(h), SLOT_WETH, address(weth));
+        _store(address(h), SLOT_MUSDC, address(mUsdc));
+        // Set `_proposer` to this test (slot 2 low 160 bits) while keeping `_state == Executed`
+        // (bit 160) + `_initialized` (bit 168) — so `fulfillRedeem`'s `onlyProposer` accepts it.
+        vm.store(
+            address(h),
+            bytes32(SLOT_PROPOSER_STATE_INIT),
+            bytes32(uint256(uint160(address(this))) | STATE_EXECUTED_INIT)
+        );
     }
 
     /// @dev Give the redeemer HALF the supply (f = 1/2) without changing totalSupply, then approve.

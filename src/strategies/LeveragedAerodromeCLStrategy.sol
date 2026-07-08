@@ -764,7 +764,7 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         if (assetsOut < minAssetsOut) revert InsufficientAssetsOut();
         // Reject a burn-for-zero: at navNet==0 (owed ≥ gross book) or a dust-share redeem that floors to
         // 0, `assetsOut == 0` with the common `minAssetsOut == 0` would pull + burn shares for no payout.
-        // (The async path is immune — it gates minOut pre-burn.)
+        // (The async path guards the same case in `_proportionalRedeem`, after its skim.)
         if (assetsOut == 0) revert ZeroAssetsOut();
 
         // 3. Pull shares from caller (requires prior vault.approve(strategy, shares)).
@@ -959,6 +959,12 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         // proportional unwind pays the GROSS book; nav() is net → skim rebalances). Pure arithmetic,
         // no oracle. Skips silently when recipient == 0 or owed == 0.
         assetsOut -= _dischargeRedeemSkim(shares, supply, assetsOut);
+        // Reject a burn-for-zero (mirrors the fast path's guard): at navNet==0 (owed ≥ gross book) the
+        // skim nets the payout to exactly 0; with a stored `minOut == 0` the `< minOut` check below
+        // would fall through and burn the escrowed shares for no payout. Reverting keeps the shares
+        // escrowed (no price is stamped at request time → they keep bearing PnL and pay out later) and
+        // `cancelRedeem` (no State/navNet gate) always lets the owner recover them.
+        if (assetsOut == 0) revert ZeroAssetsOut();
         if (assetsOut < minOut) revert InsufficientAssetsOut();
         IERC20(_layout().usdc).safeTransfer(recipient, assetsOut);
         ISyndicateVault(vault()).strategyBurn(shares);
