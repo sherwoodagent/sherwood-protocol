@@ -112,7 +112,7 @@ contract DeploySherwood is ScriptBase {
         address swoodProxy;
     }
 
-    function run() external {
+    function run() external virtual {
         bool betaMode = vm.envOr("BETA_MODE", false);
         Config memory cfg = Config({
             ensRegistrar: vm.envOr("ENS_REGISTRAR", address(0)),

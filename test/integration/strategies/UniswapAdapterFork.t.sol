@@ -25,7 +25,7 @@ contract UniswapAdapterForkTest is Test {
     address caller = makeAddr("caller");
 
     function setUp() public {
-        adapter = new UniswapSwapAdapter(UNISWAP_ROUTER, UNISWAP_QUOTER);
+        adapter = new UniswapSwapAdapter(UNISWAP_ROUTER, UNISWAP_QUOTER, address(0), address(0));
     }
 
     // ── Mode 0: single-hop baseline ──

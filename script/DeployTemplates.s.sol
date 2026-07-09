@@ -223,7 +223,9 @@ contract DeployTemplates is ScriptBase {
                         );
                     }
                     t.uniswapSwapAdapter = address(
-                        new UniswapSwapAdapter(_uniswapV3Router(block.chainid), _uniswapV3Quoter(block.chainid))
+                        new UniswapSwapAdapter(
+                            _uniswapV3Router(block.chainid), _uniswapV3Quoter(block.chainid), address(0), address(0)
+                        )
                     );
                     console.log("  Deployed UniswapSwapAdapter:        %s", t.uniswapSwapAdapter);
                     anyDeployed = true;

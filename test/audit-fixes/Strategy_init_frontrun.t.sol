@@ -160,8 +160,11 @@ contract StrategyInitFrontrunTest is Test {
         extra[0] = "";
         uint8[] memory priceDecs = new uint8[](1);
         priceDecs[0] = 18;
+        // chainlinkVerifier == address(0) selects push-feed mode, so the feedId
+        // must encode an AggregatorV3 whose live decimals() matches priceDecs.
+        // Reuse the mocked tokenA address (decimals() = 18).
         bytes32[] memory feedIds = new bytes32[](1);
-        feedIds[0] = keccak256("test.feed.tokenA");
+        feedIds[0] = bytes32(uint256(uint160(tokenA)));
         bytes memory initData = abi.encode(
             stubToken,
             makeAddr("adapter"),

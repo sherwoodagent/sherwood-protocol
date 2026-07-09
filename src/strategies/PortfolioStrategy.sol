@@ -13,6 +13,18 @@ interface IVerifierProxy {
     function verify(bytes calldata signedReport) external payable returns (bytes memory verifierResponse);
 }
 
+/// @notice Minimal Chainlink push-feed (AggregatorV3) interface. Used in
+///         push-feed mode (`chainlinkVerifier == address(0)`) where each
+///         `_feedIds[i]` encodes an AggregatorV3 proxy address rather than a
+///         Data Streams feed id.
+interface AggregatorV3Interface {
+    function decimals() external view returns (uint8);
+    function latestRoundData()
+        external
+        view
+        returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound);
+}
+
 /// @notice Decoded Chainlink Data Streams V3 report
 struct ChainlinkReport {
     bytes32 feedId;
@@ -67,6 +79,9 @@ contract PortfolioStrategy is BaseStrategy {
     ///         doesn't match the slot's declared `_feedIds[i]`.
     error InvalidFeedId();
     error WrongFeedId(uint256 index, bytes32 expected, bytes32 actual);
+    /// @notice Push-mode per-slot max-age (upper 96 bits of `_feedIds[i]`) is
+    ///         outside `[MIN_PUSH_PRICE_AGE, MAX_PUSH_PRICE_AGE_CAP]`.
+    error InvalidPriceAge();
     /// @notice Sherlock #52 — basket cannot contain the same token address
     ///         twice; double-counted balances inflate live NAV.
     error DuplicateToken(address token);
@@ -75,6 +90,16 @@ contract PortfolioStrategy is BaseStrategy {
     uint256 public constant MAX_BASKET_SIZE = 20;
     uint256 public constant BPS_DENOMINATOR = 10_000;
     uint256 public constant PRICE_PRECISION = 1e18;
+    /// @notice Default max staleness for a push-feed `latestRoundData` when a
+    ///         slot declares no per-slot age. Robinhood Chainlink push feeds
+    ///         heartbeat at 86400s (24h); 2h of grace absorbs sequencer/DON
+    ///         jitter → 26h. Equity feeds stop heartbeating outside US market
+    ///         hours (observed 77h gaps over holiday weekends) — such slots
+    ///         override this via the per-slot packed age (see `_decodePushFeed`).
+    uint256 public constant MAX_PUSH_PRICE_AGE = 26 hours;
+    /// @notice Bounds for a per-slot push-feed max age packed into `_feedIds[i]`.
+    uint256 public constant MIN_PUSH_PRICE_AGE = 1 hours;
+    uint256 public constant MAX_PUSH_PRICE_AGE_CAP = 30 days;
 
     // ── Storage (per-clone) ──
 
@@ -110,12 +135,20 @@ contract PortfolioStrategy is BaseStrategy {
     ///      may use 1e8 while crypto pairs use 1e18 — we must not hard-code 1e18.
     uint8[] internal _priceDecimals;
 
-    /// @dev Per-allocation expected Chainlink Data Streams `feedId`. The
-    ///      verifier-decoded report must match `_feedIds[i]` exactly or
-    ///      `_verifyPrice` reverts. Closes Sherlock run #1 finding #56 —
-    ///      pre-fix, any valid signed report could be replayed into any
-    ///      basket slot, letting an attacker inflate NAV with mismatched
-    ///      prices (e.g. WBTC's $80k report shoved into the AAPL slot).
+    /// @dev Per-allocation feed identifier. Two modes:
+    ///        Data Streams (chainlinkVerifier != 0): the full 32 bytes are the
+    ///          expected Data Streams `feedId`; the verifier-decoded report must
+    ///          match exactly or `_verifyPrice` reverts (Sherlock #56 — pre-fix
+    ///          any valid signed report could be replayed into any slot,
+    ///          e.g. WBTC's $80k report shoved into the AAPL slot).
+    ///        Push (chainlinkVerifier == 0): packed as
+    ///          `bytes32(uint256(maxAgeSeconds) << 160 | uint160(feedAddress))`.
+    ///          The low 160 bits are the AggregatorV3 proxy; the upper 96 bits
+    ///          are an OPTIONAL per-slot max staleness in seconds. `0` → default
+    ///          `MAX_PUSH_PRICE_AGE`; nonzero must be within
+    ///          `[MIN_PUSH_PRICE_AGE, MAX_PUSH_PRICE_AGE_CAP]`. Equity feeds
+    ///          don't heartbeat outside market hours, so their slots pack a
+    ///          longer age (e.g. 96h) while crypto slots use the default.
     bytes32[] internal _feedIds;
 
     // ── Events ──
@@ -160,6 +193,14 @@ contract PortfolioStrategy is BaseStrategy {
     ///         `feedId` doesn't match the per-slot value reverts in
     ///         `_verifyPrice`. Required to be non-zero — the contract cannot
     ///         enforce binding against a zero sentinel.
+    ///
+    ///         Push mode (`chainlinkVerifier == 0`): `feedIds[i]` packs an
+    ///         AggregatorV3 proxy in the low 160 bits and an OPTIONAL per-slot
+    ///         max staleness (seconds) in the upper 96 bits —
+    ///         `bytes32(uint256(maxAgeSeconds) << 160 | uint160(feed))`. Age 0
+    ///         → default `MAX_PUSH_PRICE_AGE`; nonzero must be within
+    ///         `[MIN_PUSH_PRICE_AGE, MAX_PUSH_PRICE_AGE_CAP]` (equity feeds go
+    ///         stale outside market hours and need a longer bound than crypto).
     function _initialize(bytes calldata data) internal override {
         (
             address asset_,
@@ -183,6 +224,10 @@ contract PortfolioStrategy is BaseStrategy {
         if (totalAmount_ == 0) revert InvalidAmount();
         if (maxSlippageBps_ == 0 || maxSlippageBps_ >= BPS_DENOMINATOR) revert InvalidSlippage();
 
+        // Push-feed mode when no Data Streams verifier is wired: each
+        // `feedIds[i]` encodes an AggregatorV3 proxy as bytes32(uint160(feed)).
+        bool pushMode = chainlinkVerifier_ == address(0);
+
         uint256 weightSum;
         for (uint256 i; i < tokens.length; ++i) {
             if (tokens[i] == address(0)) revert ZeroAddress();
@@ -190,6 +235,17 @@ contract PortfolioStrategy is BaseStrategy {
             // against bogus calldata that would overflow `10 ** denom` math.
             if (priceDecimals_[i] > 36) revert InvalidPriceDecimals();
             if (feedIds_[i] == bytes32(0)) revert InvalidFeedId();
+            if (pushMode) {
+                // Decode the aggregator + optional per-slot age, validate the
+                // age bounds, and assert the feed's live `decimals()` matches
+                // the declared `priceDecimals[i]` — a mismatch would silently
+                // mis-scale every value in `rebalanceDelta`.
+                (address feed, uint256 age) = _decodePushFeed(feedIds_[i]);
+                if (age != MAX_PUSH_PRICE_AGE && (age < MIN_PUSH_PRICE_AGE || age > MAX_PUSH_PRICE_AGE_CAP)) {
+                    revert InvalidPriceAge();
+                }
+                if (AggregatorV3Interface(feed).decimals() != priceDecimals_[i]) revert InvalidPriceDecimals();
+            }
             // Sherlock #52: reject duplicate token addresses. A basket like
             // [TSLA, TSLA] aggregates into a single TSLA balance on the
             // strategy while the rebalance math treats each slot as a distinct
@@ -567,6 +623,16 @@ contract PortfolioStrategy is BaseStrategy {
         }
     }
 
+    /// @dev Decode a push-mode packed feed id into its AggregatorV3 proxy and
+    ///      resolved max staleness. Packing:
+    ///        `bytes32(uint256(maxAgeSeconds) << 160 | uint160(feedAddress))`.
+    ///      A packed age of 0 resolves to the default `MAX_PUSH_PRICE_AGE`.
+    function _decodePushFeed(bytes32 packed) private pure returns (address feed, uint256 maxAge) {
+        feed = address(uint160(uint256(packed)));
+        uint256 age = uint256(packed) >> 160;
+        maxAge = age == 0 ? MAX_PUSH_PRICE_AGE : age;
+    }
+
     // ── Chainlink price verification ──
 
     /// @param i             Allocation index — used to check `report.feedId`
@@ -577,7 +643,22 @@ contract PortfolioStrategy is BaseStrategy {
     ///      report (e.g. WBTC's $80k report into the AAPL slot) cannot
     ///      inflate cached NAV.
     function _verifyPrice(uint256 i, bytes calldata signedReport) internal returns (uint256 price) {
-        if (chainlinkVerifier == address(0)) revert ZeroAddress();
+        // Push-feed mode: `_feedIds[i]` packs an AggregatorV3 proxy (low 160
+        // bits) + an optional per-slot max age (upper 96 bits). No signed
+        // report is consumed, so callers must pass empty bytes (a nonempty
+        // report would imply a Data Streams path that isn't taken).
+        if (chainlinkVerifier == address(0)) {
+            if (signedReport.length != 0) revert InvalidFeedId();
+            (address feed, uint256 maxAge) = _decodePushFeed(_feedIds[i]);
+            // Re-check decimals live every call: a proxy upgrade to a different
+            // scale would otherwise silently mis-scale NAV against the init
+            // snapshot (mirrors the Data Streams path's per-call feedId bind).
+            if (AggregatorV3Interface(feed).decimals() != _priceDecimals[i]) revert InvalidPriceDecimals();
+            (, int256 answer,, uint256 updatedAt,) = AggregatorV3Interface(feed).latestRoundData();
+            if (answer <= 0) revert InvalidAmount();
+            if (updatedAt == 0 || block.timestamp - updatedAt > maxAge) revert StalePrice();
+            return uint256(answer);
+        }
 
         bytes memory verifierResponse = IVerifierProxy(chainlinkVerifier).verify(signedReport);
         ChainlinkReport memory report = abi.decode(verifierResponse, (ChainlinkReport));

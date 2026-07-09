@@ -42,6 +42,40 @@ contract MockVerifierProxy {
     }
 }
 
+/// @notice Minimal Chainlink AggregatorV3 push-feed mock for push-mode tests.
+///         Push mode is selected when `chainlinkVerifier == address(0)`; each
+///         `feedId` slot then encodes an aggregator address as
+///         `bytes32(uint256(uint160(feed)))`.
+contract MockAggregatorV3 {
+    uint8 public decimals;
+    int256 internal _answer;
+    uint256 internal _updatedAt;
+
+    constructor(uint8 decimals_, int256 answer_, uint256 updatedAt_) {
+        decimals = decimals_;
+        _answer = answer_;
+        _updatedAt = updatedAt_;
+    }
+
+    function set(int256 answer_, uint256 updatedAt_) external {
+        _answer = answer_;
+        _updatedAt = updatedAt_;
+    }
+
+    /// @dev Simulate a proxy upgrade that changes the reported decimals.
+    function setDecimals(uint8 decimals_) external {
+        decimals = decimals_;
+    }
+
+    function latestRoundData()
+        external
+        view
+        returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound)
+    {
+        return (1, _answer, _updatedAt, _updatedAt, 1);
+    }
+}
+
 contract PortfolioStrategyTest is Test {
     PortfolioStrategy public template;
     PortfolioStrategy public strategy;
@@ -1242,5 +1276,375 @@ contract PortfolioStrategyTest is Test {
         assertGt(after_[0].tokenAmount, 0, "TSLA bought to 60% target");
         assertGt(after_[1].tokenAmount, 0, "AMZN");
         assertGt(after_[2].tokenAmount, 0, "NFLX sold toward 10% target");
+    }
+
+    // ==================== PUSH-FEED MODE (AggregatorV3) ====================
+    //
+    // Push mode is selected at init when `chainlinkVerifier == address(0)`.
+    // Each `_feedIds[i]` then encodes an AggregatorV3 proxy address as
+    // `bytes32(uint256(uint160(feed)))`. `_verifyPrice` reads `latestRoundData`
+    // instead of verifying a signed Data Streams report.
+
+    /// @dev feedId encoding used by push mode (no per-slot age → default).
+    function _feedId(address feed) internal pure returns (bytes32) {
+        return bytes32(uint256(uint160(feed)));
+    }
+
+    /// @dev feedId encoding with a packed per-slot max age in the upper 96 bits.
+    function _feedIdAged(address feed, uint256 ageSeconds) internal pure returns (bytes32) {
+        return bytes32((ageSeconds << 160) | uint256(uint160(feed)));
+    }
+
+    /// @dev Deploy a fresh push-mode clone with 8-decimal aggregator feeds
+    ///      (matching Robinhood's live push feeds). Tokens are 18-dec, asset
+    ///      (WETH) 18-dec. Returns the strategy plus its three aggregators so
+    ///      tests can mutate prices / staleness.
+    function _initPushStrategy()
+        internal
+        returns (PortfolioStrategy s, MockAggregatorV3 fTsla, MockAggregatorV3 fAmzn, MockAggregatorV3 fNflx)
+    {
+        // Prices in 8-dec scale: TSLA 0.01, AMZN 0.02, NFLX 0.005 WETH.
+        fTsla = new MockAggregatorV3(8, int256(1e6), block.timestamp);
+        fAmzn = new MockAggregatorV3(8, int256(2e6), block.timestamp);
+        fNflx = new MockAggregatorV3(8, int256(5e5), block.timestamp);
+
+        address clone = Clones.clone(address(template));
+        s = PortfolioStrategy(clone);
+
+        address[] memory tokens = new address[](3);
+        tokens[0] = address(tsla);
+        tokens[1] = address(amzn);
+        tokens[2] = address(nflx);
+        uint256[] memory weights = new uint256[](3);
+        weights[0] = 4000;
+        weights[1] = 3500;
+        weights[2] = 2500;
+        bytes[] memory extraData = new bytes[](3);
+        uint8[] memory pd = new uint8[](3);
+        pd[0] = 8;
+        pd[1] = 8;
+        pd[2] = 8;
+        bytes32[] memory feedIds = new bytes32[](3);
+        feedIds[0] = _feedId(address(fTsla));
+        feedIds[1] = _feedId(address(fAmzn));
+        feedIds[2] = _feedId(address(fNflx));
+
+        bytes memory initData = abi.encode(
+            address(weth),
+            address(adapter),
+            address(0), // push mode
+            tokens,
+            weights,
+            TOTAL_AMOUNT,
+            MAX_SLIPPAGE,
+            extraData,
+            pd,
+            feedIds
+        );
+        s.initialize(vault, proposer, initData);
+    }
+
+    function test_pushMode_initialize() public {
+        (PortfolioStrategy s,,,) = _initPushStrategy();
+        assertEq(s.chainlinkVerifier(), address(0));
+        assertEq(s.allocationCount(), 3);
+    }
+
+    /// @dev Init must fail loud if an aggregator's live `decimals()` disagrees
+    ///      with the declared `priceDecimals[i]`.
+    function test_pushMode_init_decimalsMismatch_reverts() public {
+        // Aggregator reports 18 decimals but init declares 8.
+        MockAggregatorV3 feed = new MockAggregatorV3(18, int256(1e6), block.timestamp);
+
+        address clone = Clones.clone(address(template));
+        address[] memory tokens = new address[](1);
+        tokens[0] = address(tsla);
+        uint256[] memory weights = new uint256[](1);
+        weights[0] = 10000;
+        bytes[] memory extraData = new bytes[](1);
+        uint8[] memory pd = new uint8[](1);
+        pd[0] = 8; // mismatch: feed is 18
+        bytes32[] memory feedIds = new bytes32[](1);
+        feedIds[0] = _feedId(address(feed));
+
+        bytes memory initData = abi.encode(
+            address(weth),
+            address(adapter),
+            address(0),
+            tokens,
+            weights,
+            TOTAL_AMOUNT,
+            MAX_SLIPPAGE,
+            extraData,
+            pd,
+            feedIds
+        );
+        vm.expectRevert(PortfolioStrategy.InvalidPriceDecimals.selector);
+        PortfolioStrategy(clone).initialize(vault, proposer, initData);
+    }
+
+    /// @dev Zero feed address still trips the nonzero-feedId guard.
+    function test_pushMode_init_zeroFeed_reverts() public {
+        address clone = Clones.clone(address(template));
+        address[] memory tokens = new address[](1);
+        tokens[0] = address(tsla);
+        uint256[] memory weights = new uint256[](1);
+        weights[0] = 10000;
+        bytes[] memory extraData = new bytes[](1);
+        uint8[] memory pd = new uint8[](1);
+        pd[0] = 8;
+        bytes32[] memory feedIds = new bytes32[](1);
+        feedIds[0] = bytes32(0); // zero feed
+
+        bytes memory initData = abi.encode(
+            address(weth),
+            address(adapter),
+            address(0),
+            tokens,
+            weights,
+            TOTAL_AMOUNT,
+            MAX_SLIPPAGE,
+            extraData,
+            pd,
+            feedIds
+        );
+        vm.expectRevert(PortfolioStrategy.InvalidFeedId.selector);
+        PortfolioStrategy(clone).initialize(vault, proposer, initData);
+    }
+
+    /// @dev Happy path: rebalanceDelta prices via push feeds, empty reports.
+    function test_pushMode_rebalanceDelta_happyPath() public {
+        (PortfolioStrategy s,,,) = _initPushStrategy();
+
+        vm.prank(vault);
+        weth.approve(address(s), TOTAL_AMOUNT);
+        vm.prank(vault);
+        s.execute();
+
+        uint256[] memory newWeights = new uint256[](3);
+        newWeights[0] = 6000;
+        newWeights[1] = 3000;
+        newWeights[2] = 1000;
+        vm.prank(proposer);
+        s.updateParams(abi.encode(newWeights, uint256(0), new bytes[](0)));
+
+        // Empty reports — push mode reads latestRoundData instead.
+        bytes[] memory reports = new bytes[](3);
+        reports[0] = "";
+        reports[1] = "";
+        reports[2] = "";
+
+        vm.prank(proposer);
+        s.rebalanceDelta(reports);
+
+        PortfolioStrategy.TokenAllocation[] memory after_ = s.getAllocations();
+        assertGt(after_[0].tokenAmount, 0, "TSLA bought toward 60%");
+        assertGt(after_[1].tokenAmount, 0, "AMZN");
+        assertGt(after_[2].tokenAmount, 0, "NFLX sold toward 10%");
+    }
+
+    /// @dev A stale feed (updatedAt older than MAX_PUSH_PRICE_AGE) reverts.
+    function test_pushMode_rebalanceDelta_stalePrice_reverts() public {
+        (PortfolioStrategy s, MockAggregatorV3 fTsla,,) = _initPushStrategy();
+
+        vm.prank(vault);
+        weth.approve(address(s), TOTAL_AMOUNT);
+        vm.prank(vault);
+        s.execute();
+
+        // Age the TSLA feed past the 26h staleness bound.
+        fTsla.set(int256(1e6), vm.getBlockTimestamp());
+        vm.warp(vm.getBlockTimestamp() + 26 hours + 1);
+
+        bytes[] memory reports = new bytes[](3);
+
+        vm.prank(proposer);
+        vm.expectRevert(PortfolioStrategy.StalePrice.selector);
+        s.rebalanceDelta(reports);
+    }
+
+    /// @dev In push mode a nonempty report is rejected — callers must not think
+    ///      a signed Data Streams report was consumed.
+    function test_pushMode_rebalanceDelta_nonemptyReport_reverts() public {
+        (PortfolioStrategy s,,,) = _initPushStrategy();
+
+        vm.prank(vault);
+        weth.approve(address(s), TOTAL_AMOUNT);
+        vm.prank(vault);
+        s.execute();
+
+        bytes[] memory reports = new bytes[](3);
+        reports[0] = abi.encode(uint256(1)); // nonempty
+        reports[1] = "";
+        reports[2] = "";
+
+        vm.prank(proposer);
+        vm.expectRevert(PortfolioStrategy.InvalidFeedId.selector);
+        s.rebalanceDelta(reports);
+    }
+
+    /// @dev A non-positive answer reverts.
+    function test_pushMode_rebalanceDelta_zeroAnswer_reverts() public {
+        (PortfolioStrategy s, MockAggregatorV3 fTsla,,) = _initPushStrategy();
+
+        vm.prank(vault);
+        weth.approve(address(s), TOTAL_AMOUNT);
+        vm.prank(vault);
+        s.execute();
+
+        fTsla.set(int256(0), vm.getBlockTimestamp());
+
+        bytes[] memory reports = new bytes[](3);
+
+        vm.prank(proposer);
+        vm.expectRevert(PortfolioStrategy.InvalidAmount.selector);
+        s.rebalanceDelta(reports);
+    }
+
+    // ── Per-slot packed max age (Fix A) ──
+
+    /// @dev Deploy a fresh single-slot (100% TSLA) push-mode clone whose one
+    ///      feed id is `packedFeedId` (may or may not carry a packed age).
+    /// @dev Build push-mode single-slot (100% TSLA) init calldata.
+    function _pushSingleInitData(bytes32 packedFeedId) internal view returns (bytes memory) {
+        address[] memory tokens = new address[](1);
+        tokens[0] = address(tsla);
+        uint256[] memory weights = new uint256[](1);
+        weights[0] = 10_000;
+        bytes[] memory extraData = new bytes[](1);
+        uint8[] memory pd = new uint8[](1);
+        pd[0] = 8;
+        bytes32[] memory feedIds = new bytes32[](1);
+        feedIds[0] = packedFeedId;
+        return abi.encode(
+            address(weth),
+            address(adapter),
+            address(0),
+            tokens,
+            weights,
+            TOTAL_AMOUNT,
+            MAX_SLIPPAGE,
+            extraData,
+            pd,
+            feedIds
+        );
+    }
+
+    /// @dev Deploy + init a single-slot push-mode clone (init expected to pass).
+    function _initPushSingle(bytes32 packedFeedId) internal returns (PortfolioStrategy s) {
+        s = PortfolioStrategy(Clones.clone(address(template)));
+        s.initialize(vault, proposer, _pushSingleInitData(packedFeedId));
+    }
+
+    /// @dev Round-trip: a packed (feed, age) survives init and prices via the
+    ///      slot's declared age. TSLA slot at 96h survives a +48h warp that
+    ///      would kill the 26h default.
+    function test_pushMode_packedAge_survivesWarpBeyondDefault() public {
+        MockAggregatorV3 feed = new MockAggregatorV3(8, int256(1e6), block.timestamp);
+        PortfolioStrategy s = _initPushSingle(_feedIdAged(address(feed), 96 hours));
+
+        vm.prank(vault);
+        weth.approve(address(s), TOTAL_AMOUNT);
+        vm.prank(vault);
+        s.execute();
+
+        // +48h: past the 26h default but within the packed 96h age. No revert.
+        feed.set(int256(1e6), vm.getBlockTimestamp());
+        vm.warp(vm.getBlockTimestamp() + 48 hours);
+
+        bytes[] memory reports = new bytes[](1);
+        vm.prank(proposer);
+        s.rebalanceDelta(reports);
+        assertGt(s.getAllocations()[0].tokenAmount, 0, "TSLA priced via packed age");
+    }
+
+    /// @dev A default-age (0 → 26h) slot at +48h still reverts StalePrice — the
+    ///      mirror of the packed-age survival case.
+    function test_pushMode_defaultAge_stillStalesAtWarp() public {
+        MockAggregatorV3 feed = new MockAggregatorV3(8, int256(1e6), block.timestamp);
+        PortfolioStrategy s = _initPushSingle(_feedId(address(feed)));
+
+        vm.prank(vault);
+        weth.approve(address(s), TOTAL_AMOUNT);
+        vm.prank(vault);
+        s.execute();
+
+        feed.set(int256(1e6), vm.getBlockTimestamp());
+        vm.warp(vm.getBlockTimestamp() + 48 hours);
+
+        bytes[] memory reports = new bytes[](1);
+        vm.prank(proposer);
+        vm.expectRevert(PortfolioStrategy.StalePrice.selector);
+        s.rebalanceDelta(reports);
+    }
+
+    /// @dev A packed age just past its own bound reverts StalePrice.
+    function test_pushMode_packedAge_stalesAtOwnBound() public {
+        MockAggregatorV3 feed = new MockAggregatorV3(8, int256(1e6), block.timestamp);
+        PortfolioStrategy s = _initPushSingle(_feedIdAged(address(feed), 96 hours));
+
+        vm.prank(vault);
+        weth.approve(address(s), TOTAL_AMOUNT);
+        vm.prank(vault);
+        s.execute();
+
+        feed.set(int256(1e6), vm.getBlockTimestamp());
+        vm.warp(vm.getBlockTimestamp() + 96 hours + 1);
+
+        bytes[] memory reports = new bytes[](1);
+        vm.prank(proposer);
+        vm.expectRevert(PortfolioStrategy.StalePrice.selector);
+        s.rebalanceDelta(reports);
+    }
+
+    /// @dev Packed age below MIN_PUSH_PRICE_AGE (1h) reverts at init.
+    function test_pushMode_init_ageTooSmall_reverts() public {
+        MockAggregatorV3 feed = new MockAggregatorV3(8, int256(1e6), block.timestamp);
+        bytes memory initData = _pushSingleInitData(_feedIdAged(address(feed), 1 hours - 1));
+        PortfolioStrategy s = PortfolioStrategy(Clones.clone(address(template)));
+        vm.expectRevert(PortfolioStrategy.InvalidPriceAge.selector);
+        s.initialize(vault, proposer, initData);
+    }
+
+    /// @dev Packed age above MAX_PUSH_PRICE_AGE_CAP (30d) reverts at init.
+    function test_pushMode_init_ageTooLarge_reverts() public {
+        MockAggregatorV3 feed = new MockAggregatorV3(8, int256(1e6), block.timestamp);
+        bytes memory initData = _pushSingleInitData(_feedIdAged(address(feed), 30 days + 1));
+        PortfolioStrategy s = PortfolioStrategy(Clones.clone(address(template)));
+        vm.expectRevert(PortfolioStrategy.InvalidPriceAge.selector);
+        s.initialize(vault, proposer, initData);
+    }
+
+    /// @dev Exact bounds are accepted at init.
+    function test_pushMode_init_ageBounds_accepted() public {
+        MockAggregatorV3 fMin = new MockAggregatorV3(8, int256(1e6), block.timestamp);
+        MockAggregatorV3 fMax = new MockAggregatorV3(8, int256(1e6), block.timestamp);
+        // 1h and 30d both init cleanly.
+        _initPushSingle(_feedIdAged(address(fMin), 1 hours));
+        _initPushSingle(_feedIdAged(address(fMax), 30 days));
+    }
+
+    // ── Per-call decimals re-check (Fix B) ──
+
+    /// @dev A proxy upgrade that changes the feed's decimals after init must
+    ///      revert `rebalanceDelta` — the push path re-checks live decimals
+    ///      against the init snapshot every call.
+    function test_pushMode_rebalanceDelta_decimalsDrift_reverts() public {
+        MockAggregatorV3 feed = new MockAggregatorV3(8, int256(1e6), block.timestamp);
+        PortfolioStrategy s = _initPushSingle(_feedId(address(feed)));
+
+        vm.prank(vault);
+        weth.approve(address(s), TOTAL_AMOUNT);
+        vm.prank(vault);
+        s.execute();
+
+        // Simulate a proxy upgrade to a different scale.
+        feed.setDecimals(18);
+        feed.set(int256(1e6), vm.getBlockTimestamp());
+
+        bytes[] memory reports = new bytes[](1);
+        vm.prank(proposer);
+        vm.expectRevert(PortfolioStrategy.InvalidPriceDecimals.selector);
+        s.rebalanceDelta(reports);
     }
 }

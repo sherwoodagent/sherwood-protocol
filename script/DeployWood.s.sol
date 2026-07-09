@@ -5,6 +5,13 @@ import {console} from "forge-std/Script.sol";
 import {ScriptBase} from "./ScriptBase.sol";
 import {WoodToken} from "../src/WoodToken.sol";
 
+/// @notice Minimal LayerZero endpoint stub — only `setDelegate`, called by the
+///         OApp constructor. Used on fork/testnet chains that have no LZ
+///         endpoint; the fixture WOOD is non-production (see WoodToken natspec).
+contract StubLzEndpoint {
+    function setDelegate(address) external {}
+}
+
 /// @title  DeployWood
 /// @notice Fork / beta WOOD bootstrap. Deploys the in-repo WoodToken FIXTURE
 ///         (explicitly non-production — see WoodToken natspec), mints a supply to
@@ -36,6 +43,13 @@ contract DeployWood is ScriptBase {
 
         vm.startBroadcast();
         address deployer = msg.sender;
+        // OApp's constructor calls `endpoint.setDelegate` — a code-less endpoint
+        // reverts the deploy. On fork/testnet chains with no LZ endpoint, stand
+        // up a stub (fixture WOOD is non-production anyway).
+        if (lzEndpoint.code.length == 0) {
+            lzEndpoint = address(new StubLzEndpoint());
+            console.log("LZ endpoint had no code; deployed StubLzEndpoint:", lzEndpoint);
+        }
         WoodToken wood = new WoodToken(lzEndpoint, deployer);
         uint256 minted = wood.mint(deployer, mintAmount);
         vm.stopBroadcast();

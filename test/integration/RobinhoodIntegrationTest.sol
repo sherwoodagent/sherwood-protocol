@@ -2,49 +2,65 @@
 pragma solidity 0.8.28;
 
 import {Test, console2} from "forge-std/Test.sol";
-import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SyndicateGovernor} from "../../src/SyndicateGovernor.sol";
 import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 import {SyndicateVault} from "../../src/SyndicateVault.sol";
 import {SyndicateFactory} from "../../src/SyndicateFactory.sol";
+import {GuardianRegistry} from "../../src/GuardianRegistry.sol";
+import {StakedWood} from "../../src/StakedWood.sol";
+import {StrategyFactory} from "../../src/StrategyFactory.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
+
+// Pinned Robinhood L2 testnet fork block. Chosen AFTER today's V2 redeployment
+// (2026-07-08) — the full core + strategy stack in chains/46630.json has code
+// from ~block 88,751,000, so this pin sits comfortably above the deploy and
+// below the chain head at fix time (88,751,996). Pinning keeps Synthra pool
+// state + guardian/owner-stake reads deterministic across runs. File-level so
+// derived suites can pin identically.
+uint256 constant ROBINHOOD_TESTNET_FORK_BLOCK = 88_767_205;
 
 /**
  * @title RobinhoodIntegrationTest
- * @notice Abstract base for fork-based integration tests against Robinhood L2 testnet.
- *         Reads deployed Sherwood addresses from chains/46630.json and creates a test
- *         syndicate with funded LPs for each test.
+ * @notice Abstract base for fork-based integration tests that drive the LIVE,
+ *         freshly deployed V2 Sherwood stack on Robinhood L2 testnet (chain
+ *         46630). Unlike the mainnet-fork harness (which deploys the stack
+ *         in-test), this harness reads every protocol address from
+ *         chains/46630.json and exercises the on-chain deployment directly —
+ *         the whole point is to prove the live deployment is sound end-to-end.
  *
- *         Key differences from BaseIntegrationTest (Base mainnet):
- *           - WETH is the vault asset (no USDC on Robinhood)
- *           - No ENS or ERC-8004 mocking needed — deployed factory has address(0) for both
- *           - Stock tokens (TSLA, AMZN, etc.) available via Synthra DEX
+ *         Robinhood testnet facts baked in here:
+ *           - Vault asset is SYNTHRA_WETH (0x33e4…200B94), the token the Synthra
+ *             DEX pools denominate stock pairs in — distinct from the canonical
+ *             WETH (0x7943…852Fa), which has almost no Synthra pool liquidity.
+ *             Verified live at the pinned block: SYNTHRA_WETH/TSLA pools exist
+ *             at fee 500/3000/10000 with liquidity; WETH/TSLA is mostly absent.
+ *           - WOOD is a non-production fixture (18 dec) minted 100M to the
+ *             deployer at deploy. On the fork we `deal` WOOD to the test owner
+ *             for the V2 owner-bond flow.
+ *           - PriceRouter is zero-adapter → PortfolioStrategy is Lane-B-only
+ *             (deposits/withdraws never consult a strategy price).
+ *           - No ENS / ERC-8004 (factory has address(0) for both) → identity
+ *             checks are skipped.
  *
- * @dev Run with: forge test --fork-url https://rpc.testnet.chain.robinhood.com --match-path test/integration/**
+ * @dev Env-guarded: skips cleanly when ROBINHOOD_TESTNET_RPC_URL is unset
+ *      (mirrors HyperEVMIntegrationTest / RobinhoodMainnetIntegrationTest). Run:
+ *        set -a; source .env; set +a
+ *        forge test --match-path \
+ *          "test/integration/strategies/PortfolioIntegration.t.sol" -vv
  */
 abstract contract RobinhoodIntegrationTest is Test {
-    // ── Robinhood L2 token addresses ──
+    // ── Robinhood L2 tokens (verified live) ──
 
-    address constant WETH = 0x7943e237c7F95DA44E0301572D358911207852Fa;
-    // Synthra uses its own WETH — pools are denominated in this token
+    // Synthra pools denominate in this WETH — the vault asset.
     address constant SYNTHRA_WETH = 0x33e4191705c386532ba27cBF171Db86919200B94;
+    // Canonical WETH — kept for reference only; NOT the pool numeraire.
+    address constant WETH = 0x7943e237c7F95DA44E0301572D358911207852Fa;
     address constant TSLA = 0xC9f9c86933092BbbfFF3CCb4b105A4A94bf3Bd4E;
     address constant AMZN = 0x5884aD2f920c162CFBbACc88C9C51AA75eC09E02;
-    address constant PLTR = 0x1FBE1a0e43594b3455993B5dE5Fd0A7A266298d0;
-    address constant NFLX = 0x3b8262A63d25f0477c4DDE23F83cfe22Cb768C93;
     address constant AMD = 0x71178BAc73cBeb415514eB542a8995b82669778d;
-
-    // ── Synthra DEX ──
-
-    address constant SYNTHRA_ROUTER = 0x3Ce954107b1A675826B33bF23060Dd655e3758fE;
-    address constant SYNTHRA_QUOTER = 0x231606c321A99DE81e28fE48B07a93F1ba49e713;
-
-    // ── Sherwood infrastructure ──
-
-    address constant SYNTHRA_SWAP_ADAPTER = 0xD875EF9467DbC8B30Dcad38C46bB863EC6a74b43;
-    address constant PORTFOLIO_TEMPLATE = 0x5C3F9F1498f86Ac148dF95bAA69C6c1EB1a5bF5F;
-    address constant CHAINLINK_VERIFIER = 0x72790f9eB82db492a7DDb6d2af22A270Dcc3Db64;
+    address constant NFLX = 0x3b8262A63d25f0477c4DDE23F83cfe22Cb768C93;
+    address constant PLTR = 0x1FBE1a0e43594b3455993B5dE5Fd0A7A266298d0;
 
     // ── Test actors ──
 
@@ -53,32 +69,49 @@ abstract contract RobinhoodIntegrationTest is Test {
     address lp1 = makeAddr("lp1");
     address lp2 = makeAddr("lp2");
 
-    // ── State ──
+    // ── Live deployed protocol (read from chains/46630.json) ──
 
     SyndicateGovernor governor;
     SyndicateFactory factory;
+    GuardianRegistry registry;
+    StakedWood swood;
+    StrategyFactory strategyFactory;
+    address swapAdapter;
+    address portfolioTemplate;
+    address chainlinkVerifier;
+
+    // ── Per-test syndicate ──
+
     SyndicateVault vault;
 
-    // ── Setup ──
-
     function setUp() public virtual {
+        string memory rpc = vm.envOr("ROBINHOOD_TESTNET_RPC_URL", string(""));
+        if (bytes(rpc).length == 0) {
+            vm.skip(true);
+            return;
+        }
+        vm.createSelectFork(rpc, ROBINHOOD_TESTNET_FORK_BLOCK);
+        require(block.chainid == 46630, "not on Robinhood L2 testnet fork");
+
         factory = SyndicateFactory(_readAddress("SYNDICATE_FACTORY"));
         governor = SyndicateGovernor(_readAddress("SYNDICATE_GOVERNOR"));
+        registry = GuardianRegistry(_readAddress("GUARDIAN_REGISTRY"));
+        swood = StakedWood(_readAddress("STAKED_WOOD"));
+        strategyFactory = StrategyFactory(_readAddress("STRATEGY_FACTORY"));
+        swapAdapter = _readAddress("UNISWAP_SWAP_ADAPTER");
+        portfolioTemplate = _readAddress("PORTFOLIO_TEMPLATE");
+        chainlinkVerifier = _readAddress("CHAINLINK_VERIFIER");
 
-        // Governor needs factory authorized to call addVault().
-        // On a fresh deployment this may not be set yet — set it via the
-        // deployer/owner. V1.5: setFactory applies immediately.
-        address govOwner = governor.owner();
-        if (governor.factory() != address(factory)) {
-            vm.prank(govOwner);
-            governor.setFactory(address(factory));
-        }
+        // The deployed factory is already wired to the governor at init; assert
+        // it rather than mutate the live deployment.
+        assertEq(governor.factory(), address(factory), "governor.factory not wired to deployed factory");
 
+        _bondOwnerStake();
         _createTestSyndicate();
-        _fundAndDeposit(10e18, 10e18); // 10 WETH each
+        _fundAndDeposit(10e18, 10e18); // 10 SYNTHRA_WETH each
 
-        // Warp 1 second so snapshot block is in the past for voting
-        vm.warp(block.timestamp + 1);
+        // Warp 1s so the deposit snapshot is strictly in the past for voting.
+        vm.warp(vm.getBlockTimestamp() + 1);
     }
 
     // ── Address reader ──
@@ -89,30 +122,43 @@ abstract contract RobinhoodIntegrationTest is Test {
         return vm.parseJsonAddress(json, string.concat(".", key));
     }
 
-    // ── Test syndicate creation ──
-    // The deployed factory on Robinhood has the modified bytecode that skips
-    // ENS and ERC-8004 checks when those are address(0).
+    // ── V2 owner-bond flow: deal fixture WOOD → prepareOwnerStake ──
+
+    function _bondOwnerStake() internal {
+        uint256 minStake = swood.minOwnerStake();
+        address wood = address(swood.wood());
+        deal(wood, owner, minStake);
+
+        vm.startPrank(owner);
+        IERC20(wood).approve(address(swood), minStake);
+        swood.prepareOwnerStake(minStake);
+        vm.stopPrank();
+
+        assertTrue(swood.canCreateVault(owner), "owner not eligible to create vault after prepareOwnerStake");
+    }
+
+    // ── Create a test syndicate against the LIVE factory (V2 signature) ──
 
     function _createTestSyndicate() internal {
         SyndicateFactory.SyndicateConfig memory config = SyndicateFactory.SyndicateConfig({
-            metadataURI: "ipfs://robinhood-integration-test",
+            metadataURI: "ipfs://robinhood-testnet-integration",
             asset: IERC20(SYNTHRA_WETH),
-            name: "Robinhood Test Vault",
+            name: "Robinhood Testnet Vault",
             symbol: "rtWETH",
             openDeposits: true,
-            subdomain: "rh-integration-test"
+            subdomain: "rh-testnet-integration"
         });
 
         vm.prank(owner);
         (, address vaultAddr) = factory.createSyndicate(0, config);
         vault = SyndicateVault(payable(vaultAddr));
 
-        // Register agent on the vault (identity check skipped when agentRegistry == address(0))
+        // Identity check skipped when agentRegistry == address(0).
         vm.prank(owner);
         vault.registerAgent(0, agent);
     }
 
-    // ── Fund LPs and deposit ──
+    // ── Fund LPs with the vault asset and deposit ──
 
     function _fundAndDeposit(uint256 lp1Amount, uint256 lp2Amount) internal {
         deal(SYNTHRA_WETH, lp1, lp1Amount);
@@ -129,16 +175,19 @@ abstract contract RobinhoodIntegrationTest is Test {
         vm.stopPrank();
     }
 
-    // ── Clone and initialize a strategy template ──
+    // ── Clone + initialize a strategy template via the DEPLOYED StrategyFactory ──
+    // Keyless path: the registered agent clones (proposer == msg.sender), the
+    // factory gates on the template allowlist + vault membership.
 
     function _cloneAndInit(address template, bytes memory initData) internal returns (address clone) {
-        clone = Clones.clone(template);
-        (bool success,) =
-            clone.call(abi.encodeWithSignature("initialize(address,address,bytes)", address(vault), agent, initData));
-        require(success, "Strategy initialization failed");
+        vm.prank(agent);
+        clone = strategyFactory.cloneAndInit(template, address(vault), agent, initData);
     }
 
-    // ── Propose, vote, and execute in one call ──
+    // ── Propose → vote → guardian review (cold-start) → execute ──
+    // No guardians are staked on the fresh deployment, so `resolveReview`
+    // short-circuits via the cold-start (cohort-too-small) path and the
+    // proposal executes without a block.
 
     function _proposeVoteExecute(
         BatchExecutorLib.Call[] memory execCalls,
@@ -146,23 +195,27 @@ abstract contract RobinhoodIntegrationTest is Test {
         uint256 feeBps,
         uint256 duration
     ) internal returns (uint256 proposalId) {
-        // Agent performance fee is now a vault property — owner sets it before proposing
         vm.prank(owner);
         vault.setAgentFeeBps(feeBps);
+
         vm.prank(agent);
         proposalId = governor.propose(
-            address(vault), address(0), "ipfs://rh-test", duration, execCalls, settleCalls, _emptyCoProposers()
+            address(vault), address(0), "ipfs://rh-testnet-test", duration, execCalls, settleCalls, _emptyCoProposers()
         );
 
-        vm.warp(block.timestamp + 1);
-
+        vm.warp(vm.getBlockTimestamp() + 1);
         vm.prank(lp1);
         governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
         vm.prank(lp2);
         governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
 
         ISyndicateGovernor.GovernorParams memory params = governor.getGovernorParams();
-        vm.warp(block.timestamp + params.votingPeriod + 1);
+        vm.warp(vm.getBlockTimestamp() + params.votingPeriod + 1);
+
+        registry.openReview(proposalId);
+        uint256 reviewPeriod = registry.reviewPeriod();
+        vm.warp(vm.getBlockTimestamp() + reviewPeriod + 1);
+        registry.resolveReview(proposalId);
 
         governor.executeProposal(proposalId);
     }
