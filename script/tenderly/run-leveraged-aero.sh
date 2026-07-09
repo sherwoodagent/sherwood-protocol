@@ -9,11 +9,11 @@
 # `LeveragedAeroCL.e2e.fork.t.sol` (deploy governor+factory → create vault → clone+init
 # strategy → propose/vote/execute → deposit/deployIdle/compound/rerange/deleverage/redeem
 # → settle). So the "vnet harness" here is: stand up a clean Base-fork vnet and run
-# that suite against it — the same empirical "does the deployed protocol behave on infra that
-# mirrors mainnet" signal the mamo LPV2 broadcast harness gives, reusing the PR's own tests.
+# that suite against it — the empirical "does the deployed protocol behave on infra that
+# mirrors mainnet" signal, reusing the PR's own tests.
 #
-# This mirrors mamo-contracts/script/tenderly: a fresh vnet by default (deterministic — fresh
-# feeds, no clock drift), torn down at the end; `--reuse` uses TENDERLY_FORK_RPC_URL from .env.
+# A fresh vnet by default (deterministic — fresh feeds, no clock drift), torn down at
+# the end; `--reuse` uses TENDERLY_FORK_RPC_URL from .env.
 #
 # Usage (from anywhere):
 #   ./contracts/script/tenderly/run-leveraged-aero.sh                # fresh vnet if creds present, else reuse

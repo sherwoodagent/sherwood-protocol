@@ -14,11 +14,6 @@ deleverage / redeem → settle). So the "vnet harness" here is simply: point tha
 and run it. This reuses the PR's own comprehensive tests instead of re-deriving the governor-gated
 lifecycle as broadcast transactions.
 
-It is the sibling of `mamo-contracts/script/tenderly` (the LPAutoBalancerV2 broadcast harness): same
-fresh-vnet-by-default lifecycle, same account/project-slug derivation from the RPC URL, same teardown.
-The difference is deliberate — the mamo LPV2 harness broadcasts real txs (there were no fork tests for
-the deployed artifact); this repo already ships vnet fork tests, so we run those.
-
 ## Usage
 
 ```bash
@@ -37,8 +32,7 @@ Requires `forge`, `cast`, `jq`, `curl`.
   creates a fresh Base-fork vnet (account/project slugs derived from `TENDERLY_FORK_RPC_URL`), runs the
   suite, and deletes the vnet on exit (`--keep` to retain). Deterministic: fresh feeds, no clock drift.
 - **Reuse** — needs only `TENDERLY_FORK_RPC_URL`. Runs against the existing vnet. This is the automatic
-  fallback when `TENDERLY_ACCESS_KEY` is absent. Add the access key (the same one the
-  `moonwell/moonwell-automations` project uses) to enable fresh-vnet mode.
+  fallback when `TENDERLY_ACCESS_KEY` is absent. Add the access key to enable fresh-vnet mode.
 
 ## What it covers (52 tests, all green as of this branch)
 

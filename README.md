@@ -1,199 +1,118 @@
-# Sherwood Contracts
+# Sherwood Protocol
 
-Solidity smart contracts for agent-managed investment syndicates on Base. Built with Foundry and OpenZeppelin (UUPS upgradeable).
+Solidity contracts for agent-managed investment funds (syndicates). Depositors pool
+capital into an ERC-4626 vault; a registered agent proposes strategies; shareholders
+vote under optimistic governance; staked WOOD guardians review calldata before
+execution. Contracts enforce the rules — agents manage, humans watch.
+
+Built with Foundry and OpenZeppelin (UUPS upgradeable), Solidity `0.8.28`, `via_ir`
+compilation. Full protocol docs: **https://docs.sherwood.sh/**
 
 ## Contracts
 
+### Core
+
 | Contract | Description |
 |----------|-------------|
-| **SyndicateVault** | ERC-4626 vault with two-layer permission model. Holds all positions via delegatecall. ERC721Holder (receives ENS subname NFTs). Depositor whitelist, agent management, syndicate-level + per-agent caps, daily spend tracking, ragequit. |
-| **SyndicateFactory** | Deploys vault proxies in one tx. Registers ENS subnames. Verifies ERC-8004 agent identity on creation. Tracks active/inactive state. |
-| **BatchExecutorLib** | Shared stateless library. Vault delegatecalls into it to execute batches of protocol calls (supply, borrow, swap, etc). Target allowlist enforced. |
-| **StrategyRegistry** | On-chain registry of strategies. Permissionless registration with creator tracking (for future carry fees). |
+| `src/SyndicateVault.sol` | ERC-4626 vault + `ERC20Votes` for governance snapshots. The onchain identity — holds every position. Two-lane liquidity while a proposal is live (Lane A oracle-instant, Lane B async queue), instant against float otherwise. Strategy execution runs only through the governor via `executeGovernorBatch` (delegatecall to the executor lib); no arbitrary-calldata owner entrypoint. Active-strategy share hooks `strategyMint` / `strategyBurn` let a custody strategy service its own deposits/redeems. |
+| `src/SyndicateGovernor.sol` | Proposal lifecycle: propose → vote → guardian review → execute → settle. Optimistic voting, collaborative (multi-agent) proposals, permissionless settlement, P&L from balance-snapshot diffs, protocol/agent/management/guardian fees. Inherits `GovernorParameters` + `GovernorEmergency`. |
+| `src/GovernorParameters.sol` | Abstract. Owner-instant parameter setters with hardcoded bounds; emits a uniform `ParameterChangeFinalized(key, old, new)`. No onchain timelock — owner is a multisig that enforces its own delay. |
+| `src/GovernorEmergency.sol` | Abstract. Emergency-settle entrypoints: `unstick`, `emergencySettleWithCalls`, `cancelEmergencySettle`, `finalizeEmergencySettle`. Emergency review state lives in the registry. |
+| `src/GuardianRegistry.sol` | UUPS. Guardian review / emergency-review lifecycle and the slash-appeal reserve. Holds zero assets — reads vote weight from sWOOD and calls sWOOD to slash. Computes the graduated (stake-weighted-median) voted slash severity. |
+| `src/StakedWood.sol` | UUPS. Sole WOOD custodian for the guardian layer: guardian stake, owner bonds, checkpointed vote weight, DPoS delegation, commission, slashing + burn. Non-transferable vote-escrow — no ERC-20 transfer surface. |
+| `src/StakedWoodDelegation.sol` | Abstract inherited by `StakedWood`. Share-factor (ERC-4626-style) delegation pools — one write slashes every delegator pro-rata — plus unstake cooldown and DPoS commission with a per-epoch raise cap. |
+| `src/SyndicateFactory.sol` | UUPS. Deploys each vault as an immutable ERC-1967 proxy in one tx, registers its ENS subname and withdrawal queue, and binds the owner stake. `governor` and staking contract are set-once at init. |
+| `src/BatchExecutorLib.sol` | Stateless 63-line batch executor. Vaults delegatecall it to run protocol calls as themselves. The vault pins the executor codehash at init and reverts on drift. |
+| `src/StrategyFactory.sol` | Atomic clone + initialize for strategy templates — closes the front-run window on separate `clone` / `initialize` txs. Templates gated by an owner allowlist; callers gated to the vault owner / registered agents. |
+| `src/WoodToken.sol` | WOOD — LayerZero OFT + `ERC20Permit`, hard 1B supply cap. Pure value token; vote weight lives in `StakedWood`. (Reference fixture — production WOOD is an external token.) |
 
-### Interfaces
+### Pricing (Lane A) & queue (Lane B)
 
-- `ISyndicateVault.sol` — Full vault interface including events
-- `IStrategyRegistry.sol` — Strategy registration and lookup
+| Contract | Description |
+|----------|-------------|
+| `src/pricing/PriceRouter.sol` | UUPS, governance-owned. Prices a strategy's reported `positions()` per position `kind` via registered adapters, with a monotone haircut, an instant-size cap, and a per-kind `laneAEnabled` flag. Fail-closed → `(0, false)` → Lane B. |
+| `src/pricing/adapters/` | `MoonwellSupplyAdapter`, `HyperliquidPerpAdapter`, `AerodromeLPAdapter` — per-kind instant-pricing adapters that validate the venue before pricing. |
+| `src/queue/VaultWithdrawalQueue.sol` | Per-vault async request queue. Escrows redeem shares / deposit assets while a proposal is live; at settlement the vault stamps one frozen price per proposal and every request claims at that single realized price. |
 
-### Architecture
+### Strategy templates (`src/strategies/`)
+
+ERC-1167 clonable. The vault calls `execute()` / `settle()` via batch; `positions()`
+reports on-venue holdings for vault-side pricing (empty array = Lane B only).
+
+| Template | Venue |
+|----------|-------|
+| `BaseStrategy.sol` | Abstract base (custody, state machine, proposer-tunable params) |
+| `MoonwellSupplyStrategy.sol` | Supply to Moonwell (mToken) for yield |
+| `WstETHMoonwellStrategy.sol` | wstETH supply on Moonwell |
+| `AerodromeLPStrategy.sol` | Aerodrome liquidity provision |
+| `HyperliquidPerpStrategy.sol` | Hyperliquid perpetuals |
+| `HyperliquidGridStrategy.sol` | Hyperliquid ATR grid |
+| `PortfolioStrategy.sol` | Multi-asset portfolio with rebalancing |
+| `MamoYieldStrategy.sol` | Mamo optimized yield (Moonwell core + Morpho) |
+| `VeniceInferenceStrategy.sol` | Venice inference funding |
+| `LeveragedAerodromeCLStrategy.sol` | Net-short leveraged Slipstream CL (Moonwell collateral, borrow, AERO gauge). Strategy-serviced custody via the vault share hooks; helpers in `LeveragedAeroManager` / `LeveragedAeroValuation` / `LeveragedAeroFees`. Spec & integration guide: [`docs/LeveragedAerodromeCLStrategy.md`](docs/LeveragedAerodromeCLStrategy.md). |
+
+## Key concepts
+
+- **Optimistic governance** — proposals pass by default when voting ends; only rejected
+  if AGAINST votes reach `vetoThresholdBps`. Vote weight comes from `ERC20Votes`
+  timestamp checkpoints. One strategy live per vault at a time.
+- **Guardian review** — a `GuardianReview` window (default 24h) sits between `Pending`
+  and `Approved`. Guardians stake WOOD (in sWOOD) and review calldata; a block quorum
+  rejects the proposal and slashes approvers (WOOD burned). Slash severity is a
+  stake-weighted median of blockers' proposed `slashBps`.
+- **Two-lane liquidity** — while a proposal is live the vault is not instant against
+  float. **Lane A** is oracle-instant entry/exit, available only when the
+  `PriceRouter` prices the active strategy's positions within its gates (per-share
+  lockup until settle). **Lane B** is the universal async queue with one frozen
+  per-proposal settle price. Everything fails closed to Lane B.
+- **First-depositor / inflation protection** — dynamic `_decimalsOffset()` = the
+  asset's decimals, scaling the ERC-4626 virtual-shares defense to any denomination.
+- **Transient reentrancy guards** — `ReentrancyGuardTransient` (EIP-1153) across the
+  vault, registry, queue, and strategies.
+- **Delegatecall containment** — the vault only delegatecalls `BatchExecutorLib`,
+  enforced by a codehash pin stamped at init (`ExecutorCodehashMismatch` on drift).
+- **UUPS upgradeable** — vault / governor / factory / registry / sWOOD / router are
+  proxies. Never reorder storage slots; append only and shrink the `__gap`.
+
+## Directory layout
 
 ```
-                   ┌──────────────┐
-                   │   Factory    │ ── creates vault proxies
-                   └──────┬───────┘
-                          │
-              ┌───────────▼───────────┐
-              │    SyndicateVault     │ ── ERC-4626, holds all positions
-              │  (ERC1967 Proxy)      │
-              │                       │
-              │  delegatecall ───────►│── BatchExecutorLib (stateless)
-              │                       │     target.call(data)
-              └───────────────────────┘
+src/            Contracts (core, strategies/, pricing/, queue/, adapters/, interfaces/, libraries/)
+test/           Foundry tests (unit + fork/integration under test/integration/)
+script/         Deploy + admin scripts (inherit script/ScriptBase.sol)
+chains/         Per-chain deployed addresses, {chainId}.json (auto-written by deploy scripts)
+lib/            Vendored deps (forge-std, OpenZeppelin, OpenZeppelin-upgradeable, LayerZero-v2)
 ```
-
-- **Vault is the identity** — all DeFi positions (Moonwell supply/borrow, Uniswap LP, etc.) live on the vault address.
-- **Delegatecall pattern** — vault calls the shared `BatchExecutorLib` via delegatecall. The lib is stateless; execution context is the vault.
-- **Two-layer permissions** — on-chain caps (vault enforces maxPerTx, maxDailyTotal, maxBorrowRatio) + off-chain policies (Lit Actions).
-- **UUPS upgradeable** — vault implementation can be upgraded. Never reorder storage slots.
 
 ## Quick Start
 
-### Prerequisites
-
-- [Foundry](https://book.getfoundry.sh/getting-started/installation) (`curl -L https://foundry.paradigm.xyz | bash && foundryup`)
-
-### Build
-
-```bash
-cd contracts
-forge build
-```
-
-### Test
-
-```bash
-forge test           # Run all tests (66 tests)
-forge test -vvv      # Verbose output with traces
-forge test --match-test test_deposit   # Run specific tests
-```
-
-### Format
-
-```bash
-forge fmt            # Format all Solidity files
-forge fmt --check    # Check formatting without modifying
-```
-
-### Deploy
-
-Deploy to Base Sepolia (testnet):
-
-```bash
-forge script script/testnet/Deploy.s.sol:DeployTestnet \
-  --rpc-url base_sepolia \
-  --account sherwood-agent \
-  --broadcast
-```
-
-The deploy script:
-1. Deploys `BatchExecutorLib` (shared, stateless)
-2. Deploys `SyndicateVault` implementation
-3. Deploys `SyndicateGovernor` (UUPS proxy)
-4. Deploys `SyndicateFactory` (UUPS proxy)
-5. Validates all on-chain state matches expected init params
-6. Writes addresses to `chains/{chainId}.json`
-
-### Gas Snapshots
-
-```bash
-forge snapshot
-```
-
-## Deployed Addresses
-
-Sherwood contract addresses are written automatically by deploy scripts to `chains/{chainId}.json`:
-
-- **Base** — `chains/8453.json`
-- **Base Sepolia** — `chains/84532.json`
-- **Robinhood L2 Testnet** — `chains/46630.json`
-
-V1.5: the on-chain parameter timelock was removed from both SyndicateGovernor
-and GuardianRegistry. Parameter setters now apply immediately on owner call;
-the owner is expected to be a multisig that enforces its own off-chain delay
-(Gnosis Safe + Zodiac Delay). Consequently `QueueParams` and `FinalizeParams`
-admin scripts were deleted — point the multisig directly at
-`setProtocolFeeBps(...)`, `setGuardianFeeBps(...)`, etc.
-
-After redeployment, also update: `cli/src/lib/addresses.ts`, `mintlify-docs/reference/deployments.mdx`.
-
-### External Contracts (Base Mainnet)
-
-| Contract | Address |
-|----------|---------|
-| USDC | `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` (6 decimals) |
-| WETH | `0x4200000000000000000000000000000000000006` |
-| Moonwell Comptroller | `0xfBb21d0380beE3312B33c4353c8936a0F13EF26C` |
-| Moonwell mUSDC | `0xEdc817A28E8B93B03976FBd4a3dDBc9f7D176c22` |
-| Uniswap V3 SwapRouter | `0x2626664c2603336E57B271c5C0b26F421741e481` |
-| Multicall3 | `0xcA11bde05977b3631167028862bE2a173976CA11` |
-
-## Tests
-
-66 tests across 2 test suites:
-
-### SyndicateVault (49 tests)
-
-- ERC-4626 deposits and withdrawals
-- Agent registration (with ERC-8004 identity verification), removal, and cap enforcement
-- Batch execution via delegatecall with target allowlist
-- Syndicate-level and per-agent daily spend tracking
-- Ragequit (pro-rata exit)
-- Depositor whitelist (approve, remove, batch approve, open deposits toggle)
-- Total deposited tracking (increments on deposit, decrements on withdraw/ragequit)
-- Pause/unpause
-- Simulation (dry-run via eth_call)
-- Fuzz testing (cap enforcement)
-
-### SyndicateFactory (17 tests)
-
-- Syndicate creation with full config + ENS subname registration
-- ERC-8004 agent identity verification on create
-- Metadata updates
-- Syndicate deactivation
-- Vault functionality through factory-created proxies
-- Depositor gating on factory-created vaults
-- Storage isolation between syndicates
-- Subdomain availability checks
-
-## Subgraph
-
-The Graph subgraph for indexed queries lives at `contracts/subgraph/`. See [docs/subgraph.md](../docs/subgraph.md) for available queries and schema reference.
-
-### Build
-
-```bash
-cd contracts/subgraph
-npm install
-npx graph codegen && npx graph build
-```
-
-### Deploy
-
-1. Create a subgraph at [The Graph Studio](https://thegraph.com/studio/) (network: Base)
-2. Auth: `npx graph auth --studio <DEPLOY_KEY>`
-3. Update `subgraph.yaml` with your factory address and deployment block
-4. Deploy: `npx graph deploy --studio sherwood-syndicates`
-5. Set `SUBGRAPH_URL` in `cli/.env` to the query endpoint from Studio
-
-### Updating ABIs
-
-The subgraph reads ABIs directly from Foundry output artifacts (`../out/SyndicateFactory.sol/SyndicateFactory.json`). After changing contracts:
+Requires [Foundry](https://book.getfoundry.sh/getting-started/installation)
+(`curl -L https://foundry.paradigm.xyz | bash && foundryup`).
 
 ```bash
 forge build
-cd subgraph && npx graph codegen && npx graph build
+
+# Unit tests. --no-match-path skips fork/integration tests that need an RPC URL.
+forge test --no-match-path "test/integration/**"
+
+forge test                 # everything, including fork tests (needs RPC endpoints)
+forge fmt                  # format (CI runs forge fmt --check)
+forge build --sizes        # runtime bytecode sizes (some contracts sit near the EIP-170 limit)
 ```
 
-## Storage Layout (UUPS Safety)
+`via_ir = true` in `foundry.toml` makes compilation ~2× slower than the legacy
+pipeline — it is required to fit the governor under the bytecode limit.
 
-When modifying `SyndicateVault`, always append new storage variables at the end. Never reorder or remove existing slots.
+## Deployment
 
-Current layout:
-```
-Slot  Variable
-───── ─────────────────────────
-inherited  ERC4626Upgradeable storage
-inherited  OwnableUpgradeable storage
-inherited  PausableUpgradeable storage
-inherited  UUPSUpgradeable storage
-1     _executorImpl (address)
-2     _syndicateCaps (SyndicateCaps struct)
-3     _agents (mapping)
-4     _agentAddresses (address[])
-5     _dailySpendTotal (uint256)
-6     _lastResetDay (uint256)
-7     _allowedTargets (EnumerableSet)
-8     _approvedDepositors (EnumerableSet)
-9     _openDeposits (bool)
-```
+Sherwood currently deploys on **Robinhood testnet (chain 46630)**. Deploy scripts
+write resolved addresses to `chains/{chainId}.json` (CAPS_SNAKE_CASE keys —
+`SYNDICATE_FACTORY`, `SYNDICATE_GOVERNOR`, `GUARDIAN_REGISTRY`, `STAKED_WOOD`,
+`PRICE_ROUTER`, …); admin scripts read the same JSON. Setters are owner-instant, so
+the owning multisig points directly at `setProtocolFeeBps(...)`, `setGuardianFeeBps(...)`,
+etc.
+
+## Docs
+
+Full protocol, governance, and integration documentation: **https://docs.sherwood.sh/**
