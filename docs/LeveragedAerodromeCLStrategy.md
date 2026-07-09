@@ -205,7 +205,7 @@ DEPOSIT
 
 EXIT A — fast redeem (everyday, oracle-priced, LTV-gated)
   user --approve shares--> strategy --redeem(shares,minOut)-->
-     price shares×nav/supply → fund from idle then Moonwell collateral (NO LP touch, NO debt repay)
+     price shares×nav/supply → fund from the redeemer's f×idle share then Moonwell collateral for the remainder (NO LP touch, NO debt repay)
      → if post-withdraw LTV > maxLtv: revert FastRedeemExceedsLtv → route user to EXIT B
      → else pay USDC + vault.strategyBurn(shares)
 
@@ -251,6 +251,11 @@ function deposit(uint256 assets, uint256 minShares) external nonReentrant return
 are crystallized on the *pre-deposit* NAV first (phantom-fee guard). First deposit (`supply == 0`) is allowed
 at `navNet == 0`; a `navNet == 0` with `supply > 0` reverts `NavUnpriceable` (worthless book, holders present).
 
+**Voting power (self-delegation)** — on a depositor's **first** mint `strategyMint` auto-delegates them to
+themselves (`if (delegates(to) == 0) _delegate(to, to)`, `SyndicateVault.sol` `strategyMint` body), so a
+deposit silently activates the holder's vault ERC20Votes voting power. Subsequent mints don't re-delegate;
+a holder who has already delegated elsewhere is left as-is.
+
 **Events** — no strategy-specific deposit event. The mint emits ERC-20 `Transfer(address(0), user, shares)`
 from the **vault**. A perf/mgmt fee mint (if any) emits a second `Transfer(0, feeRecipient, feeShares)`; a
 deferred crystallize emits `FeeCrystallizeDeferred(0, navPre)`.
@@ -291,8 +296,10 @@ function redeem(uint256 shares, uint256 minAssetsOut) external nonReentrant retu
 ```
 `src/strategies/LeveragedAerodromeCLStrategy.sol:818`
 
-The everyday exit. Pays `shares × navNet / supply` (rounds down), funded from **idle USDC first, then
-Moonwell mUSDC collateral only — no LP touch, no debt repay** (`fastRedeemImpl`, manager `:298`). Requires
+The everyday exit. Pays `shares × navNet / supply` (rounds down), funded from **the redeemer's proportional
+`f×idle` share of idle USDC first (`f = shares/supply`), then Moonwell mUSDC collateral for the remainder —
+no LP touch, no debt repay** (`fastRedeemImpl`, manager `:298`). Only `f×idle` is drawable, NOT the whole
+idle balance — the stayers' `(1−f)×idle` is reserved, mirroring the proportional async path. Requires
 `vault.approve(strategy, shares)` (shares pulled via `safeTransferFrom`, then `strategyBurn`).
 
 **Oracle-dependent, fail-closed** — `nav()` reverts on a down oracle; the caller then routes to `requestRedeem`.
@@ -300,8 +307,9 @@ Moonwell mUSDC collateral only — no LP touch, no debt repay** (`fastRedeemImpl
 **LTV gate** — because collateral shrinks while debt is unchanged, the withdraw *raises* LTV. The manager
 predicts post-withdraw LTV on pre-withdraw prices; if it breaches `maxLtvBps` it reverts
 `FastRedeemExceedsLtv(ltvBps, maxLtvBps)` (`:315`). This means "collateral can't fund this size without a
-deleverage" → **route the user to `requestRedeem`**. A belt `_assertHealthy()` runs after. If idle alone
-covers the payout, collateral + the LTV gate are skipped.
+deleverage" → **route the user to `requestRedeem`**. A belt `_assertHealthy()` runs after. Only if the
+redeemer's `f×idle` share alone covers the payout are collateral + the LTV gate skipped; because that share
+is a small fraction of idle, even a modestly-sized redeem usually reaches collateral and the LTV gate.
 
 **Fees** — none skimmed on this path: `nav()` is already net of `protocolFeeOwed`, so pricing at `navNet`
 provably preserves stayers' per-share. A pending mgmt/perf crystallize still mints fee-shares first.
@@ -310,7 +318,10 @@ provably preserves stayers' per-share. A pending mgmt/perf crystallize still min
 floors to 0 — dust shares or `navNet == 0`; shares are NOT burned), `FastRedeemExceedsLtv`, `UnhealthyPosition`
 (belt), oracle fail-closed reverts, ERC-20 revert if unapproved.
 
-**Events**: vault `Transfer(user, 0, shares)` (burn); optional `FeeCrystallizeDeferred(1, navPre)`.
+**Events**: on the vault, **two** ERC-20 transfers — `Transfer(user, strategy, shares)` (the `safeTransferFrom`
+pull) then `Transfer(strategy, 0, shares)` (the `strategyBurn`; the burn's `from` is the **strategy**, which
+holds the pulled shares, **never** the user). There is **no** `Transfer(user → 0)` and — on the fast path — **no
+strategy-side event at all**; only these two vault Transfers. Optional `FeeCrystallizeDeferred(1, navPre)`.
 
 **Preview first** (`:889`):
 ```solidity
@@ -406,7 +417,7 @@ than 2 days. Before the window: `FulfillWindowOpen`.
 
 | Event | Source | Topics (indexed) | Emitted when | Index to reconcile balances? |
 |---|---|---|---|---|
-| `Transfer(from, to, value)` | **vault** ERC-20 | from, to | `strategyMint` (from `0`) on deposit + fee mint; `strategyBurn` (to `0`) on any exit | **Yes — authoritative for user share balances.** Deposits/burns have no strategy-specific event. |
+| `Transfer(from, to, value)` | **vault** ERC-20 | from, to | `strategyMint` (from `0`) on deposit + fee mint; every user exit emits **two** — `Transfer(user, strategy, shares)` (the share pull) then `Transfer(strategy, 0, shares)` (`strategyBurn`), so the burn's `from` is the **strategy**, never the user | **Yes — authoritative for user share balances.** Deposits/burns have no strategy-specific event; the fast path fires **only** these two vault Transfers (no strategy event). |
 | `RedeemRequested(id, owner, shares)` | strategy `:92` | id, owner | `requestRedeem` | Yes — open async requests / escrow. |
 | `RedeemFulfilled(id, owner, assetsOut)` | strategy `:93` | id, owner | `fulfillRedeem` | Yes — request paid + shares burned. |
 | `RedeemCancelled(id, owner, shares)` | strategy `:94` | id, owner | `cancelRedeem` | Yes — escrow returned. |
@@ -414,8 +425,12 @@ than 2 days. Before the window: `FulfillWindowOpen`.
 | `FeeCrystallizeDeferred(op, navPre)` | strategy `:102` | (none) | best-effort crystallize reverted (`op`: 0 deposit, 1 fast redeem, 2 fulfill/emergency) | Monitoring only — fee deferred, op proceeded. |
 
 Reconciliation: a deposit is a vault `Transfer(0, user, shares)` with **no** matching strategy event — pair
-it with the strategy `deposit` call trace or just trust the vault `Transfer`. Async exits fire both a strategy
-`Redeem*` event **and** (on fulfill/emergency) a vault `Transfer(strategy, 0, shares)` burn.
+it with the strategy `deposit` call trace or just trust the vault `Transfer`. Every exit burns via
+`strategyBurn`, so the burn is always `Transfer(strategy, 0, shares)` — an indexer keyed on `Transfer(from=user,
+to=0)` will **miss every redeem** (the burn's `from` is the strategy, not the user). Key on `Transfer(from=user,
+to=strategy)` (the share pull) or `Transfer(from=strategy, to=0)` (the burn) instead. Async exits **also** fire
+a strategy `Redeem*` event (on fulfill/emergency), but the fast `redeem` fires **no** strategy event — only the
+two vault Transfers.
 
 ---
 
@@ -451,16 +466,35 @@ it with the strategy `deposit` call trace or just trust the vault `Transfer`. As
 - **Do not read `vault.totalAssets()` / `vault.previewRedeem`.** The vault is permanently locked under the
   indefinite proposal; Lane A is off for `kind = keccak256("LEVERAGED_AERO_CL")`, so `totalAssets()` is
   vault-float-only (≈ 0) and `maxRedeem == 0`. Use `strategy.nav()` + `vault.totalSupply()`.
+- **Do not read `vault.maxDeposit` / `vault.maxMint` either.** Both report `type(uint256).max` while the vault
+  is locked (active proposal) or the caller isn't whitelisted — only `paused()` makes them return 0 (a
+  deliberate EIP-170 trade-off from Sherlock run #2 #12; adding the lock/whitelist checks busts the code cap,
+  `src/SyndicateVault.sol:686`). A 4626-generic frontend that gates on `maxDeposit > 0` would wrongly show
+  deposits open; poll `governor.getActiveProposal(vault)` + `vault.isApprovedDepositor(addr)` instead (and
+  route deposits through `strategy.deposit`, never `vault.deposit`).
 - **Oracle staleness reverts deposits and the fast redeem.** Both call `nav()` fail-closed. Always offer
   `requestRedeem` (oracle-free) as the fallback and try/catch `nav()`/`previewRedeem` off-chain.
 - **LTV gate routing.** `redeem` is collateral-funded and *raises* LTV; large exits revert
   `FastRedeemExceedsLtv`. Check `previewRedeem(shares).fastOk` before offering the instant path.
+- **Two ERC-20 revert dialects + two distinct approvals.** Deposit and redeem approve *different* tokens to
+  the strategy: `usdc.approve(strategy, assets)` for a deposit (USDC → strategy) and `vault.approve(strategy,
+  shares)` for any redeem (vault-shares → strategy) — one approval never covers the other. The two tokens
+  also revert in **different dialects**: the fork USDC (FiatToken) reverts with **string** errors
+  (`"ERC20: transfer amount exceeds allowance"`) while the vault-share ERC-20 is OZ v5 and reverts with
+  **custom** errors (`ERC20InsufficientAllowance(spender, allowance, needed)`). A client that only decodes
+  one style will mis-surface a missing approval on the other leg — decode both.
 - **Rounding favors stayers.** `deposit` shares and `redeem` payout both round **down** (`mulDiv`), so a
   round-trip in one block returns slightly less than deposited.
-- **Fee-share dilution is visible between deposit and redeem.** Mgmt fee streams with `dt` and a perf fee
-  mints fee-shares on gains above the HWM — `vault.totalSupply()` grows without a matching deposit, so a
-  user's implied per-share value drifts down between actions even with no NAV change. Quote exits with
-  `previewRedeem` (it simulates the pending crystallize) and keep a slippage cushion on `minAssetsOut`.
+- **Fee-share dilution is visible between deposit and redeem — and crystallizes inside your own tx.** Mgmt
+  fee streams with `dt` and a perf fee mints fee-shares on gains above the HWM — `vault.totalSupply()` grows
+  without a matching deposit, so a user's implied per-share value drifts down between actions even with no NAV
+  change. The crystallize fires the fee-mint **inside the same tx** as your deposit/redeem, on the **pre-action**
+  NAV (before your USDC is pulled / your shares priced), so client-side share math from a **pre-tx**
+  `totalSupply` is off by that pending fee mint — read the mint from the tx's own `Transfer(0, feeRecipient,
+  feeShares)` log, or quote with `previewRedeem` (it simulates the pending crystallize) and keep a slippage
+  cushion on `minAssetsOut`. Note also that a `compound`'s **own** realized gain is charged into
+  `protocolFeeOwed` only by the **next** crystallizing op (deposit/redeem/compound), not within the `compound`
+  itself — so a single `compound` can leave `protocolFeeOwed` unchanged until a trailing crystallize.
 - **Async request does NOT freeze a price.** Escrowed shares keep bearing PnL until `fulfillRedeem`; the
   payout is whatever `f × NAV` is at fulfill time, not at request time. `cancelRedeem` returns the same shares.
 - **`ZeroAssetsOut` does not burn.** A dust-share or underwater redeem reverts without consuming shares —

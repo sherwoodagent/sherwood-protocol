@@ -38,7 +38,7 @@ import {ScriptBase} from "./ScriptBase.sol";
  *     ENS_REGISTRAR     — L2 Registrar address (default: 0x0 = no ENS)
  *     AGENT_REGISTRY    — ERC-8004 Identity Registry (default: 0x0 = no identity)
  *     MANAGEMENT_FEE    — Management fee in bps (default: 50 = 0.5%)
- *     PROTOCOL_FEE      — Protocol fee in bps (default: 200 = 2%)
+ *     PROTOCOL_FEE      — Protocol fee in bps (default: 100 = 1%, max 1%)
  *     MAX_STRATEGY_DAYS — Max strategy duration in days (default: 14)
  *
  *   Usage:
