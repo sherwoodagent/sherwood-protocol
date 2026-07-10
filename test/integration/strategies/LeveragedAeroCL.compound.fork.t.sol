@@ -10,6 +10,9 @@ import {LeveragedAerodromeCLStrategy} from "../../../src/strategies/LeveragedAer
 import {BaseStrategy} from "../../../src/strategies/BaseStrategy.sol";
 import {IMoonwellMarket, ICToken} from "../../../src/interfaces/IMoonwellMarket.sol";
 import {ICLGauge, INonfungiblePositionManager} from "../../../src/interfaces/ISlipstream.sol";
+// #421: reuse the unit-suite MockFactory (protocolConfig()-only) rather than re-declaring it — the
+// strategy now reads vault().factory().protocolConfig() for the protocol-fee leg.
+import {MockFactory} from "../../mocks/LeveragedAeroCLMocks.sol";
 
 // ─── Minimal mock vault (share ledger only; holds no USDC) ──────────────────────
 
@@ -18,15 +21,23 @@ contract MockVaultForCompound {
     mapping(address => uint256) public balanceOf;
     mapping(address => mapping(address => uint256)) public allowance;
     uint256 public totalSupply;
-    address public governor; // 0 ⇒ no protocol fee; settable to exercise the discharge path.
+    address public governor; // legacy; unused by the strategy post-#421 (kept only for the setGovernor call-site).
+    // #421: the strategy resolves protocol-fee params via vault().factory().protocolConfig(), NOT
+    // vault().governor(). factory()==0 ⇒ no protocol fee. This mock MUST track ISyndicateVault's read
+    // surface (CLAUDE.md MockRegistryMinimal lesson).
+    address public factory;
 
     constructor(address initialHolder, uint256 initialShares) {
         balanceOf[initialHolder] = initialShares;
         totalSupply = initialShares;
     }
 
+    /// @dev Wire the protocol-fee chain factory().protocolConfig() → `gov`, where `gov` is a
+    ///      MockGovernorForCompound exposing protocolFeeBps()/protocolFeeRecipient() (the IProtocolConfig
+    ///      read surface). gov==0 ⇒ factory==0 ⇒ no protocol fee (the strategy short-circuits on factory==0).
     function setGovernor(address gov) external {
         governor = gov;
+        factory = gov == address(0) ? address(0) : address(new MockFactory(gov));
     }
 
     /// @dev L7: strategy reads vault().asset() at init — must equal the configured USDC.

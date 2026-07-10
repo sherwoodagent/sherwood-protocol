@@ -55,12 +55,13 @@ contract LeveragedAeroCLDeployFork is LeveragedAeroForkBase {
         // answer asset() == USDC to satisfy the new asset-wiring check.
         vm.mockCall(fakeVault, abi.encodeWithSignature("asset()"), abi.encode(USDC));
 
-        // Protocol-fee wiring (43356e2a): settle/crystallize now read vault().governor() for the
-        // self-fee'd protocol leg. The bare fakeVault has no code — a call to it returns EMPTY
-        // returndata and the address decode reverts before the contract's own missing-governor
-        // branch can run. Answer address(0): the documented "no governor → 0 bps, skip discharge"
-        // state (_protocolFeeBps / _protocolFeeRecipient).
-        vm.mockCall(fakeVault, abi.encodeWithSignature("governor()"), abi.encode(address(0)));
+        // Protocol-fee wiring (#421): settle/crystallize now resolve the protocol-fee params via
+        // vault().factory().protocolConfig() (moved off vault().governor()). The bare fakeVault has
+        // no code — a call to it returns EMPTY returndata and the address decode reverts before the
+        // strategy's own factory()==0 short-circuit can run. Answer address(0): the documented
+        // "no factory → no ProtocolConfig → 0 bps, skip discharge" state (_protocolFeeBps /
+        // _protocolFeeRecipient). Mock must track ISyndicateVault (CLAUDE.md MockRegistryMinimal lesson).
+        vm.mockCall(fakeVault, abi.encodeWithSignature("factory()"), abi.encode(address(0)));
 
         // Deploy the strategy template (constructor locks _initialized on the template itself).
         address template = address(new LeveragedAerodromeCLStrategy());

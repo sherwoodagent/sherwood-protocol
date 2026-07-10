@@ -42,7 +42,11 @@ import {ScriptBase} from "./ScriptBase.sol";
  *     AGENT_REGISTRY    — ERC-8004 Identity Registry (default: 0x0 = no identity)
  *     MANAGEMENT_FEE    — Management fee in bps (default: 50 = 0.5%)
  *     PROTOCOL_FEE      — Protocol fee in bps (default: 100 = 1%, max 1%)
- *     MAX_STRATEGY_DAYS — Max strategy duration in days (default: 14)
+ *     MAX_STRATEGY_DAYS — Max strategy duration in days (default: 14). NOTE (#421):
+ *                         per-vault governors initialize from the factory's
+ *                         `_defaultGovernorParams()` (votingPeriod 24h, maxStrategyDuration
+ *                         30d); this env and VOTING_PERIOD no longer reach them — the vault
+ *                         owner raises limits post-create via `setMaxStrategyDuration` etc.
  *
  *   Usage:
  *     forge script script/Deploy.s.sol:DeploySherwood \

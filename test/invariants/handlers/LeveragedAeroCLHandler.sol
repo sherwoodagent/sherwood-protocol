@@ -25,8 +25,14 @@ contract MockVaultShares {
         totalSupply = initialShares;
     }
 
-    /// @dev Strategy reads vault().governor() for the live protocol-fee rate; 0 ⇒ no protocol fee.
-    function governor() external pure returns (address) {
+    /// @dev L7: strategy reads vault().asset() at init — must equal the configured USDC.
+    function asset() external pure returns (address) {
+        return BaseAddresses.USDC;
+    }
+
+    /// @dev #421: strategy resolves protocol-fee params via vault().factory().protocolConfig();
+    ///      factory()==0 ⇒ no protocol fee. Mock must track ISyndicateVault (CLAUDE.md MockRegistryMinimal lesson).
+    function factory() external pure returns (address) {
         return address(0);
     }
 

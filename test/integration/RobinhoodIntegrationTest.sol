@@ -11,6 +11,8 @@ import {GuardianRegistry} from "../../src/GuardianRegistry.sol";
 import {StakedWood} from "../../src/StakedWood.sol";
 import {StrategyFactory} from "../../src/StrategyFactory.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
+import {DeploySherwood} from "../../script/Deploy.s.sol";
+import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 
 // Pinned Robinhood L2 testnet fork block. Chosen AFTER today's V2 redeployment
 // (2026-07-08) — the full core + strategy stack in chains/46630.json has code
@@ -22,12 +24,22 @@ uint256 constant ROBINHOOD_TESTNET_FORK_BLOCK = 88_767_205;
 
 /**
  * @title RobinhoodIntegrationTest
- * @notice Abstract base for fork-based integration tests that drive the LIVE,
- *         freshly deployed V2 Sherwood stack on Robinhood L2 testnet (chain
- *         46630). Unlike the mainnet-fork harness (which deploys the stack
- *         in-test), this harness reads every protocol address from
- *         chains/46630.json and exercises the on-chain deployment directly —
- *         the whole point is to prove the live deployment is sound end-to-end.
+ * @notice Abstract base for fork-based integration tests on Robinhood L2
+ *         testnet (chain 46630): a FRESH post-#421 Sherwood core deployed
+ *         in-test, driving the LIVE periphery (Synthra pools, the deployed
+ *         UniswapSwapAdapter + quoter shim, the deployed strategy templates)
+ *         read from chains/46630.json.
+ *
+ *         #421 (per-vault governors): the LIVE 46630 core in chains/46630.json
+ *         predates the per-vault BeaconProxy governor (singleton
+ *         SYNDICATE_GOVERNOR, one-arg registry reviews) — head-compiled tests
+ *         can no longer drive it, so the core is deployed fresh on the fork
+ *         (mirrors HyperEVMIntegrationTest) until the testnet core is
+ *         redeployed post-#421. `governor` is resolved per-vault AFTER
+ *         createSyndicate; the live STRATEGY_FACTORY is likewise replaced by a
+ *         fresh one because its `_authClone` checks `vaultToSyndicate` on the
+ *         OLD core factory. This harness must track the live deploy + factory
+ *         wiring (CLAUDE.md MockRegistryMinimal lesson).
  *
  *         Robinhood testnet facts baked in here:
  *           - Vault asset is SYNTHRA_WETH (0x33e4…200B94), the token the Synthra
@@ -69,7 +81,7 @@ abstract contract RobinhoodIntegrationTest is Test {
     address lp1 = makeAddr("lp1");
     address lp2 = makeAddr("lp2");
 
-    // ── Live deployed protocol (read from chains/46630.json) ──
+    // ── Protocol under test: fresh post-#421 core + LIVE periphery (chains/46630.json) ──
 
     SyndicateGovernor governor;
     SyndicateFactory factory;
@@ -93,18 +105,23 @@ abstract contract RobinhoodIntegrationTest is Test {
         vm.createSelectFork(rpc, ROBINHOOD_TESTNET_FORK_BLOCK);
         require(block.chainid == 46630, "not on Robinhood L2 testnet fork");
 
-        factory = SyndicateFactory(_readAddress("SYNDICATE_FACTORY"));
-        governor = SyndicateGovernor(_readAddress("SYNDICATE_GOVERNOR"));
-        registry = GuardianRegistry(_readAddress("GUARDIAN_REGISTRY"));
-        swood = StakedWood(_readAddress("STAKED_WOOD"));
-        strategyFactory = StrategyFactory(_readAddress("STRATEGY_FACTORY"));
+        // Fresh post-#421 core (see the contract-level natspec for why the LIVE
+        // pre-#421 core in chains/46630.json can't be driven by head tests).
+        _deployStack();
+
+        // LIVE periphery stays under test: the deployed Synthra-wired swap
+        // adapter (+ quoter shim) and the deployed strategy template bytecode.
         swapAdapter = _readAddress("UNISWAP_SWAP_ADAPTER");
         portfolioTemplate = _readAddress("PORTFOLIO_TEMPLATE");
         chainlinkVerifier = _readAddress("CHAINLINK_VERIFIER");
 
-        // The deployed factory is already wired to the governor at init; assert
-        // it rather than mutate the live deployment.
-        assertEq(governor.factory(), address(factory), "governor.factory not wired to deployed factory");
+        // The LIVE StrategyFactory gates `_authClone` on `vaultToSyndicate` of
+        // the OLD core factory, so a fresh vault would revert VaultNotRegistered.
+        // Deploy a fresh keyless factory against the fresh core and approve the
+        // LIVE template on it — the keyless clone path + live template bytecode
+        // stay exercised.
+        strategyFactory = new StrategyFactory(address(factory), address(this));
+        strategyFactory.setTemplateApproval(portfolioTemplate, true);
 
         _bondOwnerStake();
         _createTestSyndicate();
@@ -112,6 +129,38 @@ abstract contract RobinhoodIntegrationTest is Test {
 
         // Warp 1s so the deposit snapshot is strictly in the past for voting.
         vm.warp(vm.getBlockTimestamp() + 1);
+    }
+
+    // ── Fresh core deployment (mirrors HyperEVMIntegrationTest) ──
+
+    function _deployStack() internal {
+        // Non-production WOOD fixture for the V2 owner-bond flow (post-split:
+        // owner staking lives in sWOOD).
+        ERC20Mock wood = new ERC20Mock("Wood", "WOOD", 18);
+
+        DeploySherwood deployScript = new DeploySherwood();
+        DeploySherwood.Config memory cfg = DeploySherwood.Config({
+            ensRegistrar: address(0), // no ENS on Robinhood testnet
+            agentRegistry: address(0), // no ERC-8004 on Robinhood testnet
+            managementFeeBps: 50, // deploy-script defaults (mirrors the live-deploy config)
+            protocolFeeBps: 100,
+            maxStrategyDays: 14,
+            votingPeriod: 1 days,
+            woodToken: address(wood),
+            slashAppealSeed: 0,
+            epochZeroSeed: 0,
+            betaMode: false // real GuardianRegistry + sWOOD — owner-bond + review ceremony under test
+        });
+        // deployCore runs nested CREATE3 calls AS the script address; prank as the
+        // script so the Create3Factory owner is consistent (mirrors HyperEVMIntegrationTest).
+        vm.prank(address(deployScript));
+        DeploySherwood.Deployed memory d = deployScript.deployCore(cfg);
+
+        // Per-vault governors (#421): no singleton governor exists at deploy.
+        // `governor` is resolved from the factory after createSyndicate below.
+        factory = SyndicateFactory(d.factoryProxy);
+        registry = GuardianRegistry(d.registryProxy);
+        swood = StakedWood(d.swoodProxy);
     }
 
     // ── Address reader ──
@@ -152,6 +201,8 @@ abstract contract RobinhoodIntegrationTest is Test {
         vm.prank(owner);
         (, address vaultAddr) = factory.createSyndicate(0, config);
         vault = SyndicateVault(payable(vaultAddr));
+        // Per-vault governor (#421): resolve the vault's own governor proxy.
+        governor = SyndicateGovernor(factory.governorOf(vaultAddr));
 
         // Identity check skipped when agentRegistry == address(0).
         vm.prank(owner);

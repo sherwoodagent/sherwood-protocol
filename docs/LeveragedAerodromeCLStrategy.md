@@ -470,7 +470,8 @@ two vault Transfers.
   is locked (active proposal) or the caller isn't whitelisted — only `paused()` makes them return 0 (a
   deliberate EIP-170 trade-off from Sherlock run #2 #12; adding the lock/whitelist checks busts the code cap,
   `src/SyndicateVault.sol:686`). A 4626-generic frontend that gates on `maxDeposit > 0` would wrongly show
-  deposits open; poll `governor.getActiveProposal(vault)` + `vault.isApprovedDepositor(addr)` instead (and
+  deposits open; poll the vault's own governor — resolve it via `factory.governorOf(vault)`, then call the
+  no-arg `governor.getActiveProposal()` — plus `vault.isApprovedDepositor(addr)` instead (and
   route deposits through `strategy.deposit`, never `vault.deposit`).
 - **Oracle staleness reverts deposits and the fast redeem.** Both call `nav()` fail-closed. Always offer
   `requestRedeem` (oracle-free) as the fallback and try/catch `nav()`/`previewRedeem` off-chain.

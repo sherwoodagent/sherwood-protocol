@@ -7,6 +7,10 @@ import {ISyndicateGovernor} from "../../../src/interfaces/ISyndicateGovernor.sol
 import {BatchExecutorLib} from "../../../src/BatchExecutorLib.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
+interface IAeroPoolReserves {
+    function getReserves() external view returns (uint256 reserve0, uint256 reserve1, uint256 blockTimestampLast);
+}
+
 /**
  * @title AerodromeLPIntegrationTest
  * @notice Fork tests for AerodromeLPStrategy against real Aerodrome on Base mainnet.
@@ -27,7 +31,11 @@ contract AerodromeLPIntegrationTest is BaseIntegrationTest {
 
     // ── Strategy amounts ──
     uint256 constant WETH_AMOUNT = 0.1e18; // 0.1 WETH
-    uint256 constant USDC_AMOUNT = 250e6; // 250 USDC
+    // USDC leg derived from the LIVE pool ratio in setUp. A hardcoded 250e6
+    // assumed ETH ~= $2.5k; when the forked pool prices ETH lower, the router's
+    // optimal amountB falls below the 80% amountBMin and addLiquidity reverts
+    // InsufficientAmountB. Deriving keeps the 80% mins meaningful at any price.
+    uint256 usdcAmount;
     uint256 constant STRATEGY_DURATION = 7 days;
     uint256 constant PERF_FEE_BPS = 1500; // 15%
 
@@ -37,12 +45,16 @@ contract AerodromeLPIntegrationTest is BaseIntegrationTest {
 
         // Deal WETH to vault so it has both tokens for LP
         deal(WETH, address(vault), WETH_AMOUNT);
+
+        // Match the pool's live WETH:USDC ratio (token0=WETH, token1=USDC).
+        (uint256 r0, uint256 r1,) = IAeroPoolReserves(AERO_POOL).getReserves();
+        usdcAmount = (WETH_AMOUNT * r1) / r0;
     }
 
     // ==================== HELPERS ====================
 
     /// @dev Build InitParams for AerodromeLPStrategy
-    function _buildInitParams(address gauge) internal pure returns (AerodromeLPStrategy.InitParams memory) {
+    function _buildInitParams(address gauge) internal view returns (AerodromeLPStrategy.InitParams memory) {
         return AerodromeLPStrategy.InitParams({
             tokenA: WETH, // token0 in pool
             tokenB: USDC, // token1 in pool
@@ -52,11 +64,11 @@ contract AerodromeLPIntegrationTest is BaseIntegrationTest {
             gauge: gauge,
             lpToken: AERO_POOL, // on Aerodrome, LP token == pool address
             amountADesired: WETH_AMOUNT,
-            amountBDesired: USDC_AMOUNT,
+            amountBDesired: usdcAmount,
             amountAMin: (WETH_AMOUNT * 80) / 100, // 80% slippage tolerance
-            amountBMin: (USDC_AMOUNT * 80) / 100,
+            amountBMin: (usdcAmount * 80) / 100,
             minAmountAOut: (WETH_AMOUNT * 80) / 100, // 80% on settlement
-            minAmountBOut: (USDC_AMOUNT * 80) / 100,
+            minAmountBOut: (usdcAmount * 80) / 100,
             // Sherlock #30: no reward-swap target — legacy behaviour.
             rewardSwapTarget: address(0),
             rewardSwapStable: false,
@@ -66,13 +78,13 @@ contract AerodromeLPIntegrationTest is BaseIntegrationTest {
 
     /// @dev Build execution batch calls:
     ///      [WETH.approve(strategy, amount), USDC.approve(strategy, amount), strategy.execute()]
-    function _buildExecCalls(address strategy) internal pure returns (BatchExecutorLib.Call[] memory calls) {
+    function _buildExecCalls(address strategy) internal view returns (BatchExecutorLib.Call[] memory calls) {
         calls = new BatchExecutorLib.Call[](3);
         calls[0] = BatchExecutorLib.Call({
             target: WETH, data: abi.encodeCall(IERC20.approve, (strategy, WETH_AMOUNT)), value: 0
         });
         calls[1] = BatchExecutorLib.Call({
-            target: USDC, data: abi.encodeCall(IERC20.approve, (strategy, USDC_AMOUNT)), value: 0
+            target: USDC, data: abi.encodeCall(IERC20.approve, (strategy, usdcAmount)), value: 0
         });
         calls[2] = BatchExecutorLib.Call({target: strategy, data: abi.encodeWithSignature("execute()"), value: 0});
     }
@@ -140,7 +152,7 @@ contract AerodromeLPIntegrationTest is BaseIntegrationTest {
         // Should recover roughly what was deposited (within slippage tolerance)
         assertGe(vaultWethAfterSettle, (WETH_AMOUNT * 80) / 100, "vault WETH should be within slippage tolerance");
         assertGe(
-            vaultUsdcAfterSettle + USDC_AMOUNT, // add back the amount to compare total
+            vaultUsdcAfterSettle + usdcAmount, // add back the amount to compare total
             vaultUsdcBefore,
             "vault USDC should recover most funds"
         );
@@ -181,7 +193,7 @@ contract AerodromeLPIntegrationTest is BaseIntegrationTest {
         uint256 vaultUsdcAfterSettle = IERC20(USDC).balanceOf(address(vault));
         assertGe(vaultWethAfterSettle, (WETH_AMOUNT * 80) / 100, "vault should recover WETH within slippage");
         // USDC: vault started with 100k, spent 250, should get ~250 back
-        assertGt(vaultUsdcAfterSettle, vaultUsdcBefore - USDC_AMOUNT, "vault should recover USDC");
+        assertGt(vaultUsdcAfterSettle, vaultUsdcBefore - usdcAmount, "vault should recover USDC");
     }
 
     /// @notice Full lifecycle with gauge staking, verifying AERO reward accrual.

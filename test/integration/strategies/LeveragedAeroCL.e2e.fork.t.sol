@@ -38,8 +38,9 @@ interface IAggE2E {
 ///         directly — this test:
 ///
 ///           1. Deploys a FRESH Sherwood core on the Tenderly Base vnet via
-///              `DeploySherwood.deployCore(betaMode: true)` with a HIGH `maxStrategyDays`
-///              (3650 — the `ABSOLUTE_MAX_STRATEGY_DURATION` cap), so the indefinite-lived
+///              `DeploySherwood.deployCore(betaMode: true)`; the vault owner then raises
+///              `maxStrategyDuration` to the 3650d `ABSOLUTE_MAX_STRATEGY_DURATION` cap
+///              (#421: per-vault governors deploy at the 30d default), so the indefinite-lived
 ///              strategy can be proposed with a 3650-day duration.
 ///           2. Creates a real `SyndicateVault` via the real `SyndicateFactory`
 ///              (openDeposits) and funds two LPs.
@@ -163,6 +164,11 @@ contract LeveragedAeroCLE2EFork is LeveragedAeroForkBase {
         // Per-vault governor: resolve the vault's own governor proxy.
         governor = SyndicateGovernor(vault.governor());
 
+        // #421: per-vault governors deploy with the 30d default; the indefinite strategy
+        // needs the vault owner to raise it to the 3650d absolute cap before propose.
+        vm.prank(vaultOwner);
+        governor.setMaxStrategyDuration(3650 days);
+
         vm.prank(vaultOwner);
         vault.registerAgent(43, agent);
 
@@ -195,7 +201,7 @@ contract LeveragedAeroCLE2EFork is LeveragedAeroForkBase {
         if (_skip) return;
         assertEq(governor.ABSOLUTE_MAX_STRATEGY_DURATION(), 3650 days, "governor impl missing 3650d cap");
         ISyndicateGovernor.GovernorParams memory gp = governor.getGovernorParams();
-        assertEq(gp.maxStrategyDuration, 3650 days, "deployed maxStrategyDuration != 3650d");
+        assertEq(gp.maxStrategyDuration, 3650 days, "owner-raised maxStrategyDuration != 3650d");
     }
 
     // ─────────────────────────────────────────────────────────────
@@ -208,7 +214,7 @@ contract LeveragedAeroCLE2EFork is LeveragedAeroForkBase {
         // ── Step 1: governor 3650d confirmation (also asserted standalone above) ──
         ISyndicateGovernor.GovernorParams memory gp = governor.getGovernorParams();
         assertEq(governor.ABSOLUTE_MAX_STRATEGY_DURATION(), 3650 days, "governor impl missing 3650d cap");
-        assertEq(gp.maxStrategyDuration, 3650 days, "deployed maxStrategyDuration != 3650d");
+        assertEq(gp.maxStrategyDuration, 3650 days, "owner-raised maxStrategyDuration != 3650d");
 
         // ── Step 2: clone + init the template (real propose path: no StrategyFactory) ──
         strategy = _cloneStrategy();

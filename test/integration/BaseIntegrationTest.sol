@@ -9,12 +9,23 @@ import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 import {SyndicateVault} from "../../src/SyndicateVault.sol";
 import {SyndicateFactory} from "../../src/SyndicateFactory.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
+import {DeploySherwood} from "../../script/Deploy.s.sol";
 
 /**
  * @title BaseIntegrationTest
  * @notice Abstract base for fork-based integration tests against real Base mainnet
- *         contracts. Reads deployed Sherwood addresses from chains/8453.json and
- *         creates a test syndicate with funded LPs for each test.
+ *         protocols (Moonwell, Aerodrome, Venice). Deploys a FRESH Sherwood core on
+ *         the fork via the real deploy script and creates a test syndicate with
+ *         funded LPs for each test.
+ *
+ * @dev #421 (per-vault governors): this harness previously read the deployed core
+ *      from chains/8453.json. That production deployment predates the per-vault
+ *      BeaconProxy governor (singleton SYNDICATE_GOVERNOR, no `setAgentFeeBps`,
+ *      one-arg registry reviews) — head-compiled tests can no longer drive it.
+ *      Deploying fresh mirrors HyperEVMIntegrationTest / LeveragedAeroCL.e2e.fork;
+ *      `governor` is resolved per-vault AFTER createSyndicate (there is no
+ *      singleton). This harness must track the live deploy + factory wiring
+ *      (CLAUDE.md MockRegistryMinimal lesson).
  *
  * @dev Run with: forge test --fork-url $BASE_RPC_URL --match-path test/integration/**
  */
@@ -61,10 +72,17 @@ abstract contract BaseIntegrationTest is Test {
     // ── Setup ──
 
     function setUp() public virtual {
-        // Read deployed Sherwood addresses from chains/8453.json
-        factory = SyndicateFactory(_readAddress("SYNDICATE_FACTORY"));
-        governor = SyndicateGovernor(_readAddress("SYNDICATE_GOVERNOR"));
-        deployer = _readAddress("DEPLOYER");
+        // Fork-gated: these suites need Base-mainnet protocol state (USDC,
+        // Moonwell, Aerodrome, Venice). Skip cleanly when run without a Base
+        // fork (mirrors the env-gated skips in RobinhoodIntegrationTest /
+        // LeveragedAeroForkBase) instead of dying inside deal()/venue calls.
+        if (USDC.code.length == 0) {
+            vm.skip(true);
+            return;
+        }
+
+        // Fresh post-#421 core on the fork (see the contract-level natspec).
+        _deployStack();
 
         // Create a test syndicate (vault + agent registration)
         _createTestSyndicate();
@@ -76,12 +94,31 @@ abstract contract BaseIntegrationTest is Test {
         vm.warp(block.timestamp + 1);
     }
 
-    // ── Address reader ──
+    // ── Fresh core deployment (mirrors LeveragedAeroCL.e2e.fork / HyperEVMIntegrationTest) ──
 
-    function _readAddress(string memory key) internal view returns (address) {
-        string memory path = string.concat(vm.projectRoot(), "/chains/8453.json");
-        string memory json = vm.readFile(path);
-        return vm.parseJsonAddress(json, string.concat(".", key));
+    function _deployStack() internal {
+        DeploySherwood deployScript = new DeploySherwood();
+        DeploySherwood.Config memory cfg = DeploySherwood.Config({
+            ensRegistrar: address(0), // ENS identity is not under test here
+            agentRegistry: AGENT_REGISTRY, // real Base ERC-8004 registry; ownerOf mocked below
+            managementFeeBps: 0, // keep settle PnL asserts exact (Venice equality asserts)
+            protocolFeeBps: 0, // keep settle PnL math clean (e2e convention)
+            maxStrategyDays: 30,
+            votingPeriod: 1 hours,
+            woodToken: address(0), // beta: no WOOD
+            slashAppealSeed: 0,
+            epochZeroSeed: 0,
+            betaMode: true // MinimalGuardianRegistry — cold-start auto-pass, no owner stake
+        });
+        // deployCore runs nested CREATE3 calls AS the script address; prank as the
+        // script so the Create3Factory owner is consistent (mirrors HyperEVMIntegrationTest).
+        vm.prank(address(deployScript));
+        DeploySherwood.Deployed memory d = deployScript.deployCore(cfg);
+
+        // Per-vault governors (#421): no singleton governor exists at deploy.
+        // `governor` is resolved from the vault after createSyndicate below.
+        factory = SyndicateFactory(d.factoryProxy);
+        deployer = d.deployer; // address(deployScript) — owner of factory/registry
     }
 
     // ── Test syndicate creation ──
@@ -89,12 +126,6 @@ abstract contract BaseIntegrationTest is Test {
     function _createTestSyndicate() internal {
         // Mock the agent registry ownerOf call so owner passes the ERC-8004 check
         vm.mockCall(AGENT_REGISTRY, abi.encodeWithSignature("ownerOf(uint256)", agentNftId), abi.encode(owner));
-
-        // Mock the ENS registrar so register() doesn't revert
-        vm.mockCall(ENS_REGISTRAR, abi.encodeWithSignature("register(string,address)"), abi.encode());
-
-        // Also mock available() in case factory checks it
-        vm.mockCall(ENS_REGISTRAR, abi.encodeWithSignature("available(string)"), abi.encode(true));
 
         // Create syndicate via factory as owner
         SyndicateFactory.SyndicateConfig memory config = SyndicateFactory.SyndicateConfig({
@@ -109,6 +140,8 @@ abstract contract BaseIntegrationTest is Test {
         vm.prank(owner);
         (, address vaultAddr) = factory.createSyndicate(agentNftId, config);
         vault = SyndicateVault(payable(vaultAddr));
+        // Per-vault governor (#421): resolve the vault's own governor proxy.
+        governor = SyndicateGovernor(vault.governor());
 
         // Register agent on the vault
         uint256 agentNftId2 = 43;

@@ -11,6 +11,14 @@ import {SyndicateVault} from "../../../src/SyndicateVault.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ICToken} from "../../../src/interfaces/ICToken.sol";
 
+interface IAeroPoolFactory {
+    function getPool(address tokenA, address tokenB, bool stable) external view returns (address);
+}
+
+interface IAeroPoolQuote {
+    function getAmountOut(uint256 amountIn, address tokenIn) external view returns (uint256);
+}
+
 /**
  * @title WstETHMoonwellIntegrationTest
  * @notice Fork tests for WstETHMoonwellStrategy against real Moonwell + Aerodrome on Base mainnet.
@@ -36,10 +44,18 @@ contract WstETHMoonwellIntegrationTest is BaseIntegrationTest {
     // ── Setup: WETH vault instead of USDC ──
 
     function setUp() public override {
-        // Read deployed Sherwood addresses from chains/8453.json
-        factory = SyndicateFactory(_readAddress("SYNDICATE_FACTORY"));
-        governor = SyndicateGovernor(_readAddress("SYNDICATE_GOVERNOR"));
-        deployer = _readAddress("DEPLOYER");
+        // Fork-gated: skip cleanly when run without a Base fork (mirrors the
+        // BaseIntegrationTest gate — this override does not call super.setUp).
+        if (USDC.code.length == 0) {
+            vm.skip(true);
+            return;
+        }
+
+        // #421 (per-vault governors): deploy a fresh core on the fork instead of
+        // reading the stale pre-#421 chains/8453.json deployment (see the
+        // BaseIntegrationTest natspec). `governor` resolves per-vault after
+        // createSyndicate inside `_createWethSyndicate`.
+        _deployStack();
 
         // Create a WETH vault (not USDC)
         _createWethSyndicate();
@@ -74,10 +90,6 @@ contract WstETHMoonwellIntegrationTest is BaseIntegrationTest {
         // Mock the agent registry ownerOf call so owner passes the ERC-8004 check
         vm.mockCall(AGENT_REGISTRY, abi.encodeWithSignature("ownerOf(uint256)", agentNftId), abi.encode(owner));
 
-        // Mock the ENS registrar so register() doesn't revert
-        vm.mockCall(ENS_REGISTRAR, abi.encodeWithSignature("register(string,address)"), abi.encode());
-        vm.mockCall(ENS_REGISTRAR, abi.encodeWithSignature("available(string)"), abi.encode(true));
-
         // Create syndicate with WETH as asset
         SyndicateFactory.SyndicateConfig memory config = SyndicateFactory.SyndicateConfig({
             metadataURI: "ipfs://test-wsteth-integration",
@@ -91,6 +103,8 @@ contract WstETHMoonwellIntegrationTest is BaseIntegrationTest {
         vm.prank(owner);
         (, address vaultAddr) = factory.createSyndicate(agentNftId, config);
         vault = SyndicateVault(payable(vaultAddr));
+        // Per-vault governor (#421): resolve the vault's own governor proxy.
+        governor = SyndicateGovernor(vault.governor());
 
         // Register agent on the vault
         uint256 agentNftId2 = 43;
@@ -102,8 +116,17 @@ contract WstETHMoonwellIntegrationTest is BaseIntegrationTest {
 
     // ==================== HELPERS ====================
 
-    /// @dev Build InitParams for WstETHMoonwellStrategy
-    function _buildInitParams(uint256 supplyAmount) internal pure returns (WstETHMoonwellStrategy.InitParams memory) {
+    /// @dev Build InitParams for WstETHMoonwellStrategy.
+    ///
+    ///      The per-unit swap floors are derived from the LIVE wstETH/WETH
+    ///      stable-pool quote (2% headroom) rather than hardcoded: wstETH
+    ///      appreciates vs WETH over time (staking yield), so a fixed 0.8e18
+    ///      floor rots as the live rate approaches it (observed on the fork:
+    ///      pool quoted 0.7838 wstETH per WETH < 0.8 floor → router revert).
+    function _buildInitParams(uint256 supplyAmount) internal view returns (WstETHMoonwellStrategy.InitParams memory) {
+        address pool = IAeroPoolFactory(AERO_FACTORY).getPool(WETH, WSTETH, true);
+        uint256 wstethPerWeth = IAeroPoolQuote(pool).getAmountOut(1e18, WETH);
+        uint256 wethPerWsteth = IAeroPoolQuote(pool).getAmountOut(1e18, WSTETH);
         return WstETHMoonwellStrategy.InitParams({
             weth: WETH,
             wsteth: WSTETH,
@@ -112,8 +135,8 @@ contract WstETHMoonwellIntegrationTest is BaseIntegrationTest {
             aeroFactory: AERO_FACTORY,
             chainlinkWstethEthFeed: CHAINLINK_WSTETH_ETH,
             supplyAmount: supplyAmount,
-            minWstethOutPerWeth: 0.8e18, // 20% slippage tolerance (per-unit 1e18 rate)
-            minWethOutPerWsteth: 0.8e18, // 20% slippage tolerance
+            minWstethOutPerWeth: (wstethPerWeth * 98) / 100, // live quote − 2% (per-unit 1e18 rate)
+            minWethOutPerWsteth: (wethPerWsteth * 98) / 100, // live quote − 2%
             deadlineOffset: 300
         });
     }

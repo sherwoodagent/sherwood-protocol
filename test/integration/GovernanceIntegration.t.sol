@@ -82,7 +82,7 @@ contract GovernanceIntegrationTest is BaseIntegrationTest {
         );
 
         // Warp 1 second so proposal is in Pending state
-        vm.warp(block.timestamp + 1);
+        vm.warp(vm.getBlockTimestamp() + 1);
 
         // Owner vetoes
         vm.prank(owner);
@@ -124,7 +124,7 @@ contract GovernanceIntegrationTest is BaseIntegrationTest {
         );
 
         // Warp 1 second so snapshot timestamp is in the past
-        vm.warp(block.timestamp + 1);
+        vm.warp(vm.getBlockTimestamp() + 1);
 
         // Both LPs vote Against
         vm.prank(lp1);
@@ -134,7 +134,7 @@ contract GovernanceIntegrationTest is BaseIntegrationTest {
 
         // Warp past voting period
         ISyndicateGovernor.GovernorParams memory params = governor.getGovernorParams();
-        vm.warp(block.timestamp + params.votingPeriod + 1);
+        vm.warp(vm.getBlockTimestamp() + params.votingPeriod + 1);
 
         // Assert: state is Rejected (100% against exceeds any veto threshold)
         assertEq(
@@ -164,7 +164,10 @@ contract GovernanceIntegrationTest is BaseIntegrationTest {
 
         uint256 pid1 = _proposeVoteExecute(exec1, settle1, PERF_FEE_BPS, STRATEGY_DURATION);
 
-        // Proposer settles early (agent can settle anytime)
+        // Proposer settles early — but self-settle still requires
+        // MIN_STRATEGY_DURATION_BEFORE_SELF_SETTLE (1h) after execute; "settle
+        // anytime" was pre-audit-fix behavior.
+        vm.warp(vm.getBlockTimestamp() + 1 hours + 1);
         vm.prank(agent);
         governor.settleProposal(pid1);
 
@@ -173,6 +176,16 @@ contract GovernanceIntegrationTest is BaseIntegrationTest {
             uint256(ISyndicateGovernor.ProposalState.Settled),
             "strategy #1 should be settled"
         );
+
+        // #421 per-vault defaults invert this test's original premise: votingPeriod
+        // (24h) now exceeds cooldownPeriod (1h), so voting can no longer end INSIDE
+        // the cooldown window. Re-establish it — cooldown longer than the vote
+        // window, execution window long enough that the proposal is still
+        // executable once the cooldown lapses (owner-instant setters, V1.5).
+        vm.prank(owner);
+        governor.setCooldownPeriod(48 hours);
+        vm.prank(owner);
+        governor.setExecutionWindow(72 hours);
 
         // --- Strategy #2: propose and vote, but execution should fail due to cooldown ---
         (, BatchExecutorLib.Call[] memory exec2, BatchExecutorLib.Call[] memory settle2) =
@@ -187,7 +200,7 @@ contract GovernanceIntegrationTest is BaseIntegrationTest {
         );
 
         // Warp 1 second for snapshot
-        vm.warp(block.timestamp + 1);
+        vm.warp(vm.getBlockTimestamp() + 1);
 
         // LPs vote For
         vm.prank(lp1);
@@ -197,11 +210,11 @@ contract GovernanceIntegrationTest is BaseIntegrationTest {
 
         // Warp past voting period but NOT past cooldown
         ISyndicateGovernor.GovernorParams memory params = governor.getGovernorParams();
-        vm.warp(block.timestamp + params.votingPeriod + 1);
+        vm.warp(vm.getBlockTimestamp() + params.votingPeriod + 1);
 
         // Execution should revert because cooldown has not elapsed
         uint256 cooldownEnd = governor.getCooldownEnd();
-        if (block.timestamp < cooldownEnd) {
+        if (vm.getBlockTimestamp() < cooldownEnd) {
             vm.expectRevert(ISyndicateGovernor.CooldownNotElapsed.selector);
             governor.executeProposal(pid2);
         }
@@ -259,7 +272,7 @@ contract GovernanceIntegrationTest is BaseIntegrationTest {
             protocolFeeRecipient != address(0) ? IERC20(USDC).balanceOf(protocolFeeRecipient) : 0;
 
         // Warp past duration and settle
-        vm.warp(block.timestamp + STRATEGY_DURATION);
+        vm.warp(vm.getBlockTimestamp() + STRATEGY_DURATION);
         vm.prank(random);
         governor.settleProposal(proposalId);
 
@@ -315,7 +328,7 @@ contract GovernanceIntegrationTest is BaseIntegrationTest {
         uint256 pid1 = _proposeVoteExecute(exec1, settle1, PERF_FEE_BPS, STRATEGY_DURATION);
 
         // Warp past duration and settle
-        vm.warp(block.timestamp + STRATEGY_DURATION);
+        vm.warp(vm.getBlockTimestamp() + STRATEGY_DURATION);
         vm.prank(random);
         governor.settleProposal(pid1);
 
@@ -337,7 +350,7 @@ contract GovernanceIntegrationTest is BaseIntegrationTest {
         uint256 pid2 = _proposeVoteExecute(exec2, settle2, PERF_FEE_BPS, STRATEGY_DURATION);
 
         // Warp past duration and settle
-        vm.warp(block.timestamp + STRATEGY_DURATION);
+        vm.warp(vm.getBlockTimestamp() + STRATEGY_DURATION);
         vm.prank(random);
         governor.settleProposal(pid2);
 
