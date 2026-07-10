@@ -11,6 +11,7 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
+import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 
 /// @notice G-H5 boundary regression. `executeBy` is the INCLUSIVE last timestamp
 ///         at which `executeProposal` may land; one second later the proposal
@@ -60,8 +61,11 @@ contract ExecuteByBoundaryTest is Test {
         bytes memory govInit = abi.encodeCall(
             SyndicateGovernor.initialize,
             (
-                ISyndicateGovernor.InitParams({
-                    owner: owner,
+                address(vault), // vault_: this test's vault (per-vault governor)
+                address(guardianRegistry),
+                address(new ProtocolConfig(owner)),
+                address(this), // factory (test contract)
+                ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,
                     vetoThresholdBps: 4000,
@@ -70,22 +74,16 @@ contract ExecuteByBoundaryTest is Test {
                     collaborationWindow: 48 hours,
                     maxCoProposers: 5,
                     minStrategyDuration: 1 hours,
-                    maxStrategyDuration: 30 days,
-                    protocolFeeBps: 0,
-                    protocolFeeRecipient: address(0),
-                    guardianFeeBps: 0,
-                    guardiansFeeRecipient: address(0)
-                }),
-                address(guardianRegistry)
+                    maxStrategyDuration: 30 days
+                })
             )
         );
         governor = SyndicateGovernor(address(new ERC1967Proxy(address(govImpl), govInit)));
 
-        vm.mockCall(address(this), abi.encodeWithSignature("governor()"), abi.encode(address(governor)));
+        vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
 
         vm.startPrank(owner);
         vault.registerAgent(agentRegistry.mint(agent), agent);
-        governor.addVault(address(vault));
         vm.stopPrank();
 
         usdc.mint(lp1, 100_000e6);

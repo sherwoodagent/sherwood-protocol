@@ -24,13 +24,15 @@ contract StakedWoodTest is Test {
     function setUp() public {
         wood = new ERC20Mock("WOOD", "WOOD", 18);
         gov = new MockGovernorMinimal();
+        // StakedWood resolves the per-vault governor via factory.governorOf(vault);
+        // route the codeless mock factory to the mock governor.
+        vm.mockCall(factory, abi.encodeWithSignature("governorOf(address)"), abi.encode(address(gov)));
         StakedWood impl = new StakedWood();
         bytes memory initData = abi.encodeCall(
             StakedWood.initialize,
             (StakedWood.InitParams({
                     owner: owner,
                     wood: address(wood),
-                    governor: address(gov),
                     factory: factory,
                     minGuardianStake: 10_000e18,
                     coolDownPeriod: 7 days,
@@ -355,7 +357,6 @@ contract StakedWoodTest is Test {
             (StakedWood.InitParams({
                     owner: owner,
                     wood: address(wood),
-                    governor: address(gov),
                     factory: factory,
                     minGuardianStake: 10_000e18,
                     coolDownPeriod: 7 days,
@@ -375,7 +376,6 @@ contract StakedWoodTest is Test {
             (StakedWood.InitParams({
                     owner: owner,
                     wood: address(wood),
-                    governor: address(gov),
                     factory: factory,
                     minGuardianStake: 10_000e18,
                     coolDownPeriod: 7 days,
@@ -396,7 +396,6 @@ contract StakedWoodTest is Test {
             (StakedWood.InitParams({
                     owner: owner,
                     wood: address(wood),
-                    governor: address(gov),
                     factory: factory,
                     minGuardianStake: 10_000e18,
                     coolDownPeriod: 7 days,

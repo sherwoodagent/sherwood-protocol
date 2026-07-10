@@ -86,13 +86,13 @@ contract SyndicateVaultTest is Test {
         // Mock factory.governor() to return a non-zero placeholder, with
         // getActiveProposal → 0 so deposits/withdrawals stay unlocked by default.
         // `redemptionsLocked()` fails closed on governor == address(0).
-        vm.mockCall(address(this), abi.encodeWithSignature("governor()"), abi.encode(MOCK_GOVERNOR));
+        vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(MOCK_GOVERNOR));
         // Lane A off (no PriceRouter) — exercises the async (Lane B) lock behavior.
         vm.mockCall(address(this), abi.encodeWithSignature("priceRouter()"), abi.encode(address(0)));
-        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal(address)"), abi.encode(uint256(0)));
+        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal()"), abi.encode(uint256(0)));
         // MS-H4: vault `_deposit` also reads `openProposalCount(address)` —
         // mock to zero so deposits aren't blocked by garbage memory.
-        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("openProposalCount(address)"), abi.encode(uint256(0)));
+        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("openProposalCount()"), abi.encode(uint256(0)));
     }
 
     /// @dev Deterministic placeholder for factory.governor() in tests.
@@ -259,7 +259,7 @@ contract SyndicateVaultTest is Test {
     ///      withdrawals / rescues instead of silently unlocking them.
     function test_redemptionsLocked_revertsIfGovernorZero() public {
         // Re-mock the factory to return address(0) as governor.
-        vm.mockCall(address(this), abi.encodeWithSignature("governor()"), abi.encode(address(0)));
+        vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(0)));
 
         vm.expectRevert(ISyndicateVault.GovernorNotSet.selector);
         vault.redemptionsLocked();
@@ -416,11 +416,7 @@ contract SyndicateVaultTest is Test {
         vm.deal(address(vault), 1 ether);
 
         // Simulate an active proposal for this vault.
-        vm.mockCall(
-            MOCK_GOVERNOR,
-            abi.encodeWithSignature("getActiveProposal(address)", address(vault)),
-            abi.encode(uint256(42))
-        );
+        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal()"), abi.encode(uint256(42)));
 
         vm.prank(owner);
         vm.expectRevert(ISyndicateVault.RedemptionsLocked.selector);
@@ -1041,9 +1037,9 @@ contract SyndicateVaultTest is Test {
         ReentrantTarget target = new ReentrantTarget(vault);
 
         // Route the vault's `onlyGovernor` through the reentrant target.
-        vm.mockCall(address(this), abi.encodeWithSignature("governor()"), abi.encode(address(target)));
-        vm.mockCall(address(target), abi.encodeWithSignature("getActiveProposal(address)"), abi.encode(uint256(0)));
-        vm.mockCall(address(target), abi.encodeWithSignature("openProposalCount(address)"), abi.encode(uint256(0)));
+        vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(target)));
+        vm.mockCall(address(target), abi.encodeWithSignature("getActiveProposal()"), abi.encode(uint256(0)));
+        vm.mockCall(address(target), abi.encodeWithSignature("openProposalCount()"), abi.encode(uint256(0)));
 
         // Outer batch: one call into `target.ping()`, which re-enters the vault.
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](1);

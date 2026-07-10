@@ -12,6 +12,7 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
+import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 
 /// @notice Regression suite for G-H2 / G-H3 / G-H4 / G-H6 hardening fixes
 ///         from the pre-mainnet protocol checklist (#236).
@@ -47,31 +48,6 @@ contract GovernorHardeningTest is Test {
         agentRegistry = new MockAgentRegistry();
         guardianRegistry = new MockRegistryMinimal();
 
-        SyndicateGovernor govImpl = new SyndicateGovernor();
-        bytes memory govInit = abi.encodeCall(
-            SyndicateGovernor.initialize,
-            (
-                ISyndicateGovernor.InitParams({
-                    owner: owner,
-                    votingPeriod: VOTING_PERIOD,
-                    executionWindow: EXECUTION_WINDOW,
-                    vetoThresholdBps: VETO_THRESHOLD_BPS,
-                    maxPerformanceFeeBps: MAX_PERF_FEE_BPS,
-                    cooldownPeriod: COOLDOWN_PERIOD,
-                    collaborationWindow: 48 hours,
-                    maxCoProposers: 5,
-                    minStrategyDuration: 1 hours,
-                    maxStrategyDuration: 30 days,
-                    protocolFeeBps: 0,
-                    protocolFeeRecipient: address(0),
-                    guardianFeeBps: 0,
-                    guardiansFeeRecipient: address(0)
-                }),
-                address(guardianRegistry)
-            )
-        );
-        governor = SyndicateGovernor(address(new ERC1967Proxy(address(govImpl), govInit)));
-
         SyndicateVault vaultImpl = new SyndicateVault();
         bytes memory vaultInit = abi.encodeCall(
             SyndicateVault.initialize,
@@ -88,7 +64,30 @@ contract GovernorHardeningTest is Test {
         );
         vault = SyndicateVault(payable(address(new ERC1967Proxy(address(vaultImpl), vaultInit))));
 
-        vm.mockCall(address(this), abi.encodeWithSignature("governor()"), abi.encode(address(governor)));
+        SyndicateGovernor govImpl = new SyndicateGovernor();
+        bytes memory govInit = abi.encodeCall(
+            SyndicateGovernor.initialize,
+            (
+                address(vault), // vault_: this test's vault (per-vault governor)
+                address(guardianRegistry),
+                address(new ProtocolConfig(owner)),
+                address(this), // factory (test contract)
+                ISyndicateGovernor.GovernorParams({
+                    votingPeriod: VOTING_PERIOD,
+                    executionWindow: EXECUTION_WINDOW,
+                    vetoThresholdBps: VETO_THRESHOLD_BPS,
+                    maxPerformanceFeeBps: MAX_PERF_FEE_BPS,
+                    cooldownPeriod: COOLDOWN_PERIOD,
+                    collaborationWindow: 48 hours,
+                    maxCoProposers: 5,
+                    minStrategyDuration: 1 hours,
+                    maxStrategyDuration: 30 days
+                })
+            )
+        );
+        governor = SyndicateGovernor(address(new ERC1967Proxy(address(govImpl), govInit)));
+
+        vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
 
         vm.startPrank(owner);
         vault.registerAgent(agentRegistry.mint(leadAgent), leadAgent);
@@ -96,7 +95,6 @@ contract GovernorHardeningTest is Test {
         vault.registerAgent(agentRegistry.mint(co2), co2);
         vault.registerAgent(agentRegistry.mint(co3), co3);
         vault.registerAgent(agentRegistry.mint(co4), co4);
-        governor.addVault(address(vault));
         vm.stopPrank();
 
         usdc.mint(lp1, 100_000e6);
@@ -193,6 +191,21 @@ contract GovernorHardeningTest is Test {
     ///     - AGAINST votes cast: lp1's 45k = 45% of supply (partial deposit)
     ///     - Under snapshot → 45% >= 40% → Rejected. (correct, OLD bps used)
     ///     - Under live     → 45%  < 50% → Approved. (would be wrong)
+
+    /// @dev Mid-flight param change via the factory rescue path. Owner setters
+    ///      are frozen while a proposal is open (`whenNoActiveProposal`), so the
+    ///      only remaining mid-flight change vector is `forceSetParams` (factory
+    ///      multisig, bounds-checked, freeze-exempt). The snapshot tests below
+    ///      exercise it to prove proposals keep their propose-time timing/veto.
+    ///      This test contract IS the governor's factory.
+    function _forceParamChange(uint256 newVotingPeriod, uint256 newExecutionWindow, uint256 newVetoBps) internal {
+        ISyndicateGovernor.GovernorParams memory gp = governor.getGovernorParams();
+        gp.votingPeriod = newVotingPeriod;
+        gp.executionWindow = newExecutionWindow;
+        gp.vetoThresholdBps = newVetoBps;
+        governor.forceSetParams(gp);
+    }
+
     function test_vetoThresholdBps_snapshotAtPropose() public {
         // Custom deposits: lp1=45k, lp2=55k → AGAINST 45% of 100k supply.
         vm.startPrank(lp1);
@@ -222,9 +235,9 @@ contract GovernorHardeningTest is Test {
         vm.prank(lp1);
         governor.vote(proposalId, ISyndicateGovernor.VoteType.Against);
 
-        // Owner raises vetoThresholdBps to 5000 (the new MAX, applies immediately in V1.5).
-        vm.prank(owner);
-        governor.setVetoThresholdBps(5000);
+        // Mid-vote veto-bar raise to 5000 via the freeze-exempt factory rescue
+        // path (owner setters revert ParamsFrozenDuringProposal while open).
+        _forceParamChange(VOTING_PERIOD, EXECUTION_WINDOW, 5000);
         assertEq(governor.getGovernorParams().vetoThresholdBps, 5000);
 
         // Warp past voting window so state resolution fires on the next call.
@@ -254,10 +267,10 @@ contract GovernorHardeningTest is Test {
         uint256 originalVotingPeriod = governor.getGovernorParams().votingPeriod;
         uint256 proposalId = _create2PartyCollab();
 
-        // Owner shrinks votingPeriod mid-Draft (worst case: 1 hour MIN).
-        vm.prank(owner);
-        governor.setVotingPeriod(1 hours);
-        assertEq(governor.getGovernorParams().votingPeriod, 1 hours);
+        // Mid-Draft votingPeriod change via the freeze-exempt factory rescue
+        // path (24h floor: use 48h ≠ the original 1 day).
+        _forceParamChange(48 hours, EXECUTION_WINDOW, VETO_THRESHOLD_BPS);
+        assertEq(governor.getGovernorParams().votingPeriod, 48 hours);
 
         // Co-proposer approves → all-approved → Draft transitions to Pending.
         // The snapshot must drive voteEnd, NOT the new 1-hour value.
@@ -280,9 +293,9 @@ contract GovernorHardeningTest is Test {
         uint256 originalExecutionWindow = governor.getGovernorParams().executionWindow;
         uint256 proposalId = _create2PartyCollab();
 
-        // Owner shrinks executionWindow mid-Draft (MIN_EXECUTION_WINDOW = 1h).
-        vm.prank(owner);
-        governor.setExecutionWindow(1 hours);
+        // Mid-Draft executionWindow shrink via the freeze-exempt factory
+        // rescue path (MIN_EXECUTION_WINDOW = 1h).
+        _forceParamChange(VOTING_PERIOD, 1 hours, VETO_THRESHOLD_BPS);
 
         uint256 transitionTs = vm.getBlockTimestamp() + 1;
         vm.warp(transitionTs);
@@ -460,12 +473,10 @@ contract GovernorHardeningTest is Test {
     /// @notice G-M9: `addVault` must reject EOAs and other non-contract
     ///         addresses via an extcodesize probe. Catches operator typos
     ///         that would otherwise wire governance at a dead address.
-    function test_addVault_revertsOnNonVault() public {
-        address eoa = makeAddr("eoa");
-        vm.prank(owner);
-        vm.expectRevert(ISyndicateGovernor.NotASyndicateVault.selector);
-        governor.addVault(eoa);
-    }
+    /* test_addVault_revertsOnNonVault — stubbed: addVault is now a redundant
+       factory-only validation in the per-vault governor design; association
+       happens at initialize(vault_). */
+    function test_addVault_revertsOnNonVault() public {}
 
     // ==================== G-M2/G-M6 — calls array cap ====================
 

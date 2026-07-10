@@ -15,6 +15,7 @@ import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
+import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 
 /// @title OpenProposalCount.t
 /// @notice Regression tests for Fix 2 — track open proposals per vault to plug
@@ -93,6 +94,7 @@ contract OpenProposalCountTest is Test {
         // resolved by predicting proxy addresses. From `baseNonce`:
         //   swoodImpl (+0), swoodProxy (+1), govImpl (+2), govProxy (+3),
         //   regImpl (+4), regProxy (+5).
+        ProtocolConfig _hoistedPC = new ProtocolConfig(owner);
         uint256 baseNonce = vm.getNonce(address(this));
         address predictedGovernor = vm.computeCreateAddress(address(this), baseNonce + 3);
         address predictedRegistryProxy = vm.computeCreateAddress(address(this), baseNonce + 5);
@@ -104,7 +106,6 @@ contract OpenProposalCountTest is Test {
             (StakedWood.InitParams({
                     owner: owner,
                     wood: address(wood),
-                    governor: predictedGovernor,
                     factory: factoryEoa,
                     minGuardianStake: MIN_GUARDIAN_STAKE,
                     coolDownPeriod: 7 days,
@@ -119,8 +120,11 @@ contract OpenProposalCountTest is Test {
         bytes memory govInit = abi.encodeCall(
             SyndicateGovernor.initialize,
             (
-                ISyndicateGovernor.InitParams({
-                    owner: owner,
+                address(vault), // vault_: this test's vault (per-vault governor)
+                predictedRegistryProxy,
+                address(_hoistedPC),
+                address(this), // factory (test contract)
+                ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,
                     vetoThresholdBps: VETO_THRESHOLD_BPS,
@@ -129,27 +133,25 @@ contract OpenProposalCountTest is Test {
                     collaborationWindow: 48 hours,
                     maxCoProposers: 5,
                     minStrategyDuration: 1 hours,
-                    maxStrategyDuration: 30 days,
-                    protocolFeeBps: 0,
-                    protocolFeeRecipient: address(0),
-                    guardianFeeBps: 0,
-                    guardiansFeeRecipient: address(0)
-                }),
-                predictedRegistryProxy
+                    maxStrategyDuration: 30 days
+                })
             )
         );
         governor = SyndicateGovernor(address(new ERC1967Proxy(address(govImpl), govInit)));
+        // Per-vault governor: the vault resolves its governor via its factory
+        // (this test contract). Mock governorOf(vault) -> the deployed governor.
+        vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
         require(address(governor) == predictedGovernor, "governor addr mismatch");
-
-        vm.prank(owner);
-        governor.addVault(address(vault));
 
         GuardianRegistry regImpl = new GuardianRegistry();
         bytes memory regInit = abi.encodeCall(
-            GuardianRegistry.initialize,
-            (owner, address(governor), factoryEoa, address(swood), REVIEW_PERIOD, BLOCK_QUORUM_BPS)
+            GuardianRegistry.initialize, (owner, factoryEoa, address(swood), REVIEW_PERIOD, BLOCK_QUORUM_BPS)
         );
         registry = GuardianRegistry(address(new ERC1967Proxy(address(regImpl), regInit)));
+        // Authorize the per-vault governor on the composite-key registry
+        // (replaces the removed governor.addVault wiring).
+        vm.prank(registry.factory());
+        registry.addGovernor(address(governor));
         require(address(registry) == predictedRegistryProxy, "registry addr mismatch");
 
         // Resolve the registry ↔ sWOOD circular dependency.
@@ -230,7 +232,7 @@ contract OpenProposalCountTest is Test {
 
     function test_requestUnstakeOwner_revertsDuringPending() public {
         _propose();
-        assertEq(governor.openProposalCount(address(vault)), 1, "counter == 1 in Pending");
+        assertEq(governor.openProposalCount(), 1, "counter == 1 in Pending");
 
         vm.prank(owner);
         vm.expectRevert(StakedWood.VaultHasActiveProposal.selector);
@@ -247,7 +249,7 @@ contract OpenProposalCountTest is Test {
             uint256(ISyndicateGovernor.ProposalState.GuardianReview),
             "state is GuardianReview"
         );
-        assertEq(governor.openProposalCount(address(vault)), 1, "counter still 1 in GuardianReview");
+        assertEq(governor.openProposalCount(), 1, "counter still 1 in GuardianReview");
 
         vm.prank(owner);
         vm.expectRevert(StakedWood.VaultHasActiveProposal.selector);
@@ -259,11 +261,11 @@ contract OpenProposalCountTest is Test {
         _voteFor(pid);
 
         vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
-        registry.openReview(pid);
+        registry.openReview(address(governor), pid);
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
 
         // Drive registry resolution without executing so we land in Approved.
-        registry.resolveReview(pid);
+        registry.resolveReview(address(governor), pid);
         // Sync governor-side state via a mutating path.
         governor.getProposal(pid); // view
         // Force a mutating _resolveState via a path that transitions — we
@@ -272,7 +274,7 @@ contract OpenProposalCountTest is Test {
         // equivalence. Pull cached state via resolveReview then check counter.
         // Approved is brief here; the counter should still be 1 at this moment
         // because no terminal transition has fired yet.
-        assertEq(governor.openProposalCount(address(vault)), 1, "counter still 1 in Approved");
+        assertEq(governor.openProposalCount(), 1, "counter still 1 in Approved");
 
         vm.prank(owner);
         vm.expectRevert(StakedWood.VaultHasActiveProposal.selector);
@@ -286,12 +288,12 @@ contract OpenProposalCountTest is Test {
         uint256 pid = _propose();
         _voteFor(pid);
         vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
-        registry.openReview(pid);
+        registry.openReview(address(governor), pid);
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
 
         governor.executeProposal(pid);
-        assertEq(governor.openProposalCount(address(vault)), 1, "counter still 1 in Executed");
-        assertEq(governor.getActiveProposal(address(vault)), pid, "_activeProposal also set");
+        assertEq(governor.openProposalCount(), 1, "counter still 1 in Executed");
+        assertEq(governor.getActiveProposal(), pid, "_activeProposal also set");
 
         vm.prank(owner);
         vm.expectRevert(StakedWood.VaultHasActiveProposal.selector);
@@ -303,18 +305,18 @@ contract OpenProposalCountTest is Test {
         _voteFor(pid);
 
         vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
-        registry.openReview(pid);
+        registry.openReview(address(governor), pid);
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
 
         governor.executeProposal(pid);
         // Counter stays 1 through Executed; cleared on Settled.
-        assertEq(governor.openProposalCount(address(vault)), 1, "counter stays 1 through Executed");
-        assertEq(governor.getActiveProposal(address(vault)), pid, "_activeProposal non-zero");
+        assertEq(governor.openProposalCount(), 1, "counter stays 1 through Executed");
+        assertEq(governor.getActiveProposal(), pid, "_activeProposal non-zero");
 
         vm.warp(vm.getBlockTimestamp() + 7 days + 1);
         governor.settleProposal(pid);
-        assertEq(governor.openProposalCount(address(vault)), 0, "counter == 0 after Settled");
-        assertEq(governor.getActiveProposal(address(vault)), 0, "_activeProposal cleared on Settled");
+        assertEq(governor.openProposalCount(), 0, "counter == 0 after Settled");
+        assertEq(governor.getActiveProposal(), 0, "_activeProposal cleared on Settled");
 
         vm.prank(owner);
         swood.requestUnstakeOwner(address(vault)); // must not revert
@@ -322,11 +324,11 @@ contract OpenProposalCountTest is Test {
 
     function test_requestUnstakeOwner_succeedsAfterCancel() public {
         uint256 pid = _propose();
-        assertEq(governor.openProposalCount(address(vault)), 1, "counter == 1 after propose");
+        assertEq(governor.openProposalCount(), 1, "counter == 1 after propose");
 
         vm.prank(agent);
         governor.cancelProposal(pid);
-        assertEq(governor.openProposalCount(address(vault)), 0, "counter == 0 after cancel");
+        assertEq(governor.openProposalCount(), 0, "counter == 0 after cancel");
 
         vm.prank(owner);
         swood.requestUnstakeOwner(address(vault)); // must not revert
@@ -344,7 +346,7 @@ contract OpenProposalCountTest is Test {
 
     function test_resolveProposalState_flushesVetoRejection() public {
         uint256 pid = _propose();
-        assertEq(governor.openProposalCount(address(vault)), 1, "counter == 1 in Pending");
+        assertEq(governor.openProposalCount(), 1, "counter == 1 in Pending");
 
         // Both LPs vote Against → crosses 40% vetoThresholdBps with 100%.
         vm.warp(vm.getBlockTimestamp() + 1);
@@ -362,11 +364,11 @@ contract OpenProposalCountTest is Test {
             uint256(ISyndicateGovernor.ProposalState.Rejected),
             "state is lazily Rejected"
         );
-        assertEq(governor.openProposalCount(address(vault)), 1, "counter still stuck at 1 pre-flush");
+        assertEq(governor.openProposalCount(), 1, "counter still stuck at 1 pre-flush");
 
         // Permissionless flush — anyone can call.
         governor.resolveProposalState(pid);
-        assertEq(governor.openProposalCount(address(vault)), 0, "counter == 0 after flush");
+        assertEq(governor.openProposalCount(), 0, "counter == 0 after flush");
 
         // PR #359 review #1: the lazy-resolution `_decOpen` MUST also bump
         // `_lastSettledAt` so the settle cooldown gates the next execute.
@@ -374,7 +376,7 @@ contract OpenProposalCountTest is Test {
         // letting propose→resolve→propose→execute skip the cooldown.
         // `getCooldownEnd == now + COOLDOWN_PERIOD` proves the bump landed.
         assertEq(
-            governor.getCooldownEnd(address(vault)),
+            governor.getCooldownEnd(),
             vm.getBlockTimestamp() + COOLDOWN_PERIOD,
             "resolveProposalState must bump _lastSettledAt (PR #359 #1)"
         );
@@ -395,7 +397,7 @@ contract OpenProposalCountTest is Test {
         uint256 pidA = _propose();
         vm.prank(owner);
         governor.vetoProposal(pidA);
-        uint256 cooldownAfterVeto = governor.getCooldownEnd(address(vault));
+        uint256 cooldownAfterVeto = governor.getCooldownEnd();
 
         // Same vault, fresh proposal, drive it to lazy Rejected via vote-veto.
         uint256 pidB = _propose();
@@ -409,13 +411,11 @@ contract OpenProposalCountTest is Test {
         // Path B: permissionless flush must arm the cooldown to NOW too.
         governor.resolveProposalState(pidB);
         assertEq(
-            governor.getCooldownEnd(address(vault)),
+            governor.getCooldownEnd(),
             vm.getBlockTimestamp() + COOLDOWN_PERIOD,
             "lazy-resolution path arms cooldown (PR #359 #1)"
         );
-        assertGt(
-            governor.getCooldownEnd(address(vault)), cooldownAfterVeto, "cooldown advanced past the earlier veto stamp"
-        );
+        assertGt(governor.getCooldownEnd(), cooldownAfterVeto, "cooldown advanced past the earlier veto stamp");
     }
 
     function test_resolveProposalState_flushesExpiredApproved() public {
@@ -432,7 +432,7 @@ contract OpenProposalCountTest is Test {
             uint256(ISyndicateGovernor.ProposalState.GuardianReview),
             "view pins at GuardianReview until registry resolves"
         );
-        assertEq(governor.openProposalCount(address(vault)), 1, "counter stuck at 1 pre-flush");
+        assertEq(governor.openProposalCount(), 1, "counter stuck at 1 pre-flush");
 
         // Permissionless flush resolves the registry review AND commits the
         // state transition, decrementing the counter.
@@ -442,7 +442,7 @@ contract OpenProposalCountTest is Test {
             uint256(ISyndicateGovernor.ProposalState.Expired),
             "state is Expired after flush"
         );
-        assertEq(governor.openProposalCount(address(vault)), 0, "counter == 0 after flush");
+        assertEq(governor.openProposalCount(), 0, "counter == 0 after flush");
 
         vm.prank(owner);
         swood.requestUnstakeOwner(address(vault));
@@ -452,11 +452,11 @@ contract OpenProposalCountTest is Test {
         uint256 pid = _propose();
         vm.prank(owner);
         governor.vetoProposal(pid); // already flushes counter via non-reverting path
-        assertEq(governor.openProposalCount(address(vault)), 0);
+        assertEq(governor.openProposalCount(), 0);
 
         // Re-calling resolve is a no-op.
         governor.resolveProposalState(pid);
-        assertEq(governor.openProposalCount(address(vault)), 0, "counter remains 0 on re-resolve");
+        assertEq(governor.openProposalCount(), 0, "counter remains 0 on re-resolve");
     }
 
     function test_resolveProposalState_revertsIfProposalDoesNotExist() public {
@@ -466,11 +466,11 @@ contract OpenProposalCountTest is Test {
 
     function test_requestUnstakeOwner_succeedsAfterVeto() public {
         uint256 pid = _propose();
-        assertEq(governor.openProposalCount(address(vault)), 1);
+        assertEq(governor.openProposalCount(), 1);
 
         vm.prank(owner);
         governor.vetoProposal(pid);
-        assertEq(governor.openProposalCount(address(vault)), 0, "counter == 0 after veto");
+        assertEq(governor.openProposalCount(), 0, "counter == 0 after veto");
 
         vm.prank(owner);
         swood.requestUnstakeOwner(address(vault));
@@ -478,11 +478,11 @@ contract OpenProposalCountTest is Test {
 
     function test_requestUnstakeOwner_succeedsAfterEmergencyCancel() public {
         uint256 pid = _propose();
-        assertEq(governor.openProposalCount(address(vault)), 1);
+        assertEq(governor.openProposalCount(), 1);
 
         vm.prank(owner);
         governor.emergencyCancel(pid);
-        assertEq(governor.openProposalCount(address(vault)), 0, "counter == 0 after emergencyCancel");
+        assertEq(governor.openProposalCount(), 0, "counter == 0 after emergencyCancel");
 
         vm.prank(owner);
         swood.requestUnstakeOwner(address(vault));
@@ -490,34 +490,34 @@ contract OpenProposalCountTest is Test {
 
     function test_openProposalCount_trackedAcrossLifecycle() public {
         // Start at 0.
-        assertEq(governor.openProposalCount(address(vault)), 0, "start at 0");
+        assertEq(governor.openProposalCount(), 0, "start at 0");
 
         uint256 pid1 = _propose();
-        assertEq(governor.openProposalCount(address(vault)), 1, "inc on propose");
+        assertEq(governor.openProposalCount(), 1, "inc on propose");
 
         // Cancel pid1 → back to 0.
         vm.prank(agent);
         governor.cancelProposal(pid1);
-        assertEq(governor.openProposalCount(address(vault)), 0, "dec on cancel");
+        assertEq(governor.openProposalCount(), 0, "dec on cancel");
 
         // New proposal, settle through the full happy path.
         uint256 pid2 = _propose();
-        assertEq(governor.openProposalCount(address(vault)), 1, "inc on second propose");
+        assertEq(governor.openProposalCount(), 1, "inc on second propose");
 
         _voteFor(pid2);
         vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
-        registry.openReview(pid2);
+        registry.openReview(address(governor), pid2);
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
 
         governor.executeProposal(pid2);
         // Counter stays through Executed; dec on the Settled edge.
-        assertEq(governor.openProposalCount(address(vault)), 1, "counter stays 1 through Executed");
-        assertEq(governor.getActiveProposal(address(vault)), pid2, "_activeProposal also set");
+        assertEq(governor.openProposalCount(), 1, "counter stays 1 through Executed");
+        assertEq(governor.getActiveProposal(), pid2, "_activeProposal also set");
 
         vm.warp(vm.getBlockTimestamp() + 7 days + 1);
         governor.settleProposal(pid2);
-        assertEq(governor.openProposalCount(address(vault)), 0, "counter cleared on Settled");
-        assertEq(governor.getActiveProposal(address(vault)), 0, "_activeProposal zeroed on Settled");
+        assertEq(governor.openProposalCount(), 0, "counter cleared on Settled");
+        assertEq(governor.getActiveProposal(), 0, "_activeProposal zeroed on Settled");
     }
 
     function test_openProposalCount_collaborativeLifecycle() public {
@@ -542,7 +542,7 @@ contract OpenProposalCountTest is Test {
             uint256(ISyndicateGovernor.ProposalState.Draft),
             "in Draft until co-proposers approve"
         );
-        assertEq(governor.openProposalCount(address(vault)), 1, "Sherlock #8: Draft binds the vault");
+        assertEq(governor.openProposalCount(), 1, "Sherlock #8: Draft binds the vault");
 
         // Co-proposer approves → transitions to Pending → counter stays at 1
         // (already counted from propose time).
@@ -553,12 +553,12 @@ contract OpenProposalCountTest is Test {
             uint256(ISyndicateGovernor.ProposalState.Pending),
             "collab -> Pending"
         );
-        assertEq(governor.openProposalCount(address(vault)), 1, "still 1 after Draft -> Pending (no double-count)");
+        assertEq(governor.openProposalCount(), 1, "still 1 after Draft -> Pending (no double-count)");
 
         // Cancel.
         vm.prank(agent);
         governor.cancelProposal(pid);
-        assertEq(governor.openProposalCount(address(vault)), 0, "dec on cancel");
+        assertEq(governor.openProposalCount(), 0, "dec on cancel");
     }
 
     function test_openProposalCount_rejectCollaboration_noDecrement() public {
@@ -576,13 +576,13 @@ contract OpenProposalCountTest is Test {
             address(vault), address(0), "ipfs://collab-reject", 7 days, _execCalls(), _settleCalls(), coProps
         );
         // Sherlock #8: Draft binds the vault.
-        assertEq(governor.openProposalCount(address(vault)), 1, "Sherlock #8: Draft counted");
+        assertEq(governor.openProposalCount(), 1, "Sherlock #8: Draft counted");
 
         // Reject collaboration — Draft → Cancelled, counter decrements to 0.
         // Sherlock #9: must be called by the lead, not the co-proposer.
         vm.prank(agent);
         governor.rejectCollaboration(pid);
-        assertEq(governor.openProposalCount(address(vault)), 0, "decremented on rejectCollaboration");
+        assertEq(governor.openProposalCount(), 0, "decremented on rejectCollaboration");
     }
 
     /// @notice PR #324 review comment 4454151855 — owner-`emergencyCancel`
@@ -607,7 +607,7 @@ contract OpenProposalCountTest is Test {
             address(vault), address(0), "ipfs://draft-emerg", 7 days, _execCalls(), _settleCalls(), coProps
         );
         // Sherlock #8: Draft binds the vault.
-        assertEq(governor.openProposalCount(address(vault)), 1, "Sherlock #8: Draft counted");
+        assertEq(governor.openProposalCount(), 1, "Sherlock #8: Draft counted");
         assertEq(
             uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Draft), "in Draft state"
         );
@@ -617,7 +617,7 @@ contract OpenProposalCountTest is Test {
         governor.emergencyCancel(pid);
 
         // R9 fix: counter must drop back to 0.
-        assertEq(governor.openProposalCount(address(vault)), 0, "R9: emergencyCancel decremented Draft");
+        assertEq(governor.openProposalCount(), 0, "R9: emergencyCancel decremented Draft");
         assertEq(
             uint256(governor.getProposalState(pid)),
             uint256(ISyndicateGovernor.ProposalState.Cancelled),
@@ -637,7 +637,7 @@ contract OpenProposalCountTest is Test {
             _emptyCoProposers()
         );
         assertGt(pid2, pid, "new proposal created post-emergencyCancel");
-        assertEq(governor.openProposalCount(address(vault)), 1, "counter at 1 after fresh propose");
+        assertEq(governor.openProposalCount(), 1, "counter at 1 after fresh propose");
     }
 
     /// @notice Sherlock run #1 finding #8 — once a Draft exists, the vault
@@ -659,7 +659,7 @@ contract OpenProposalCountTest is Test {
         governor.propose(address(vault), address(0), "ipfs://draft-lock", 7 days, _execCalls(), _settleCalls(), coProps);
 
         // openProposalCount = 1; vault's _depositsLocked() returns true.
-        assertEq(governor.openProposalCount(address(vault)), 1, "Draft bumps openProposalCount");
+        assertEq(governor.openProposalCount(), 1, "Draft bumps openProposalCount");
 
         // Attempt to deposit during the Draft window — must revert.
         address depositor = makeAddr("depositor");

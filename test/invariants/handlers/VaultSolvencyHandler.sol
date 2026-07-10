@@ -97,7 +97,7 @@ contract VaultSolvencyHandler is Test {
         // (active proposal at vote/execute) AND the broader `Pending`
         // window where deposits are still blocked. `openProposalCount` is
         // a strict superset of `getActiveProposal != 0`.
-        if (governor.openProposalCount(address(vault)) != 0) return;
+        if (governor.openProposalCount() != 0) return;
 
         address[3] memory lps = [lp1, lp2, lp3];
         address depositor = lps[seed % 3];
@@ -122,7 +122,7 @@ contract VaultSolvencyHandler is Test {
     function redeemRandom(uint256 seed) external {
         // Same gate semantics as `depositRandom` — `openProposalCount`
         // is a strict superset of the vault's `redemptionsLocked()`.
-        if (governor.openProposalCount(address(vault)) != 0) return;
+        if (governor.openProposalCount() != 0) return;
 
         address[3] memory lps = [lp1, lp2, lp3];
         address redeemer = lps[seed % 3];
@@ -184,10 +184,10 @@ contract VaultSolvencyHandler is Test {
 
     function _runLifecycle(uint256 seed, int256 pnlSigned) private returns (bool) {
         // Cooldown / one-active-proposal gate.
-        if (governor.openProposalCount(address(vault)) != 0) return false;
+        if (governor.openProposalCount() != 0) return false;
 
         uint256 nowTs = vm.getBlockTimestamp();
-        uint256 readyAt = governor.getCooldownEnd(address(vault));
+        uint256 readyAt = governor.getCooldownEnd();
         if (nowTs < readyAt) {
             vm.warp(readyAt + 1);
         }

@@ -27,7 +27,6 @@ interface IGuardianRegistry {
     error NewSideFull();
     error ReviewNotOpen();
     error ReviewNotReadyForResolve();
-    error NotGovernor();
     error EmergencyTooManyCalls();
     error EmergencyHashMismatch();
     /// @notice Sherlock #15 (collapsed into this revert): `openEmergency`
@@ -46,8 +45,10 @@ interface IGuardianRegistry {
     ///         window longer than the guardian unstake cooldown would let an
     ///         approver unstake and escape the slash before `resolveReview`.
     error CooldownBelowReviewPeriod();
+    error UnauthorizedGovernor();
 
     // ── Events ──
+    event GovernorAdded(address indexed governor);
     event ReviewOpened(uint256 indexed proposalId, uint128 totalStakeAtOpen);
     event CohortTooSmallToReview(uint256 indexed proposalId, uint256 totalStakeAtOpen);
     event GuardianVoteCast(
@@ -69,7 +70,7 @@ interface IGuardianRegistry {
     // Emitted per blocker when a review resolves blocked = true. Merkl's
     // off-chain bot reads this to build the epoch WOOD campaign's Merkle roots.
     event BlockerAttributed(
-        uint256 indexed proposalId, uint256 indexed epochId, address indexed blocker, uint256 weight
+        address indexed governor, uint256 indexed proposalId, uint256 epochId, address indexed blocker, uint256 weight
     );
     event Paused(address indexed by);
     event Unpaused(address indexed by, bool deadman);
@@ -80,7 +81,10 @@ interface IGuardianRegistry {
     // ── Guardian fns ──
     /// @notice Cast or change a guardian review vote on a proposal. Vote weight
     ///         is read from sWOOD's `getPastVotes` at the review's `openedAt`.
-    function voteOnProposal(uint256 proposalId, GuardianVoteType support, uint256 slashBps) external;
+    function voteOnProposal(address governor, uint256 proposalId, GuardianVoteType support, uint256 slashBps) external;
+
+    // ── Multi-governor management ──
+    function addGovernor(address governor) external;
 
     // ── Governor-only (emergency) ──
     function openEmergency(uint256 proposalId, bytes32 callsHash, BatchExecutorLib.Call[] calldata calls) external;
@@ -97,13 +101,13 @@ interface IGuardianRegistry {
     function cancelReview(uint256 proposalId) external;
 
     // ── Views (emergency) ──
-    function isEmergencyOpen(uint256 proposalId) external view returns (bool);
+    function isEmergencyOpen(address governor, uint256 proposalId) external view returns (bool);
 
     // ── Permissionless ──
-    function openReview(uint256 proposalId) external;
-    function resolveReview(uint256 proposalId) external returns (bool blocked);
-    function resolveEmergencyReview(uint256 proposalId) external;
-    function voteBlockEmergencySettle(uint256 proposalId) external;
+    function openReview(address governor, uint256 proposalId) external;
+    function resolveReview(address governor, uint256 proposalId) external returns (bool blocked);
+    function resolveEmergencyReview(address governor, uint256 proposalId) external;
+    function voteBlockEmergencySettle(address governor, uint256 proposalId) external;
 
     // ── Slash appeal ──
     function fundSlashAppealReserve(uint256 amount) external;
@@ -118,18 +122,24 @@ interface IGuardianRegistry {
     function setBlockQuorumBps(uint256) external;
 
     // ── Views ──
-    /// @notice Returns the cached review state for a proposal (Task 25).
+    /// @notice Returns the cached review state for a proposal.
     /// @return opened Whether `openReview` was called
     /// @return resolved Whether `resolveReview` has finalized the review
     /// @return blocked Whether guardians reached the block quorum (requires resolved)
     /// @return cohortTooSmall Whether the cohort at open was below MIN_COHORT_STAKE_AT_OPEN
-    function getReviewState(uint256 proposalId)
+    function getReviewState(address governor, uint256 proposalId)
         external
         view
         returns (bool opened, bool resolved, bool blocked, bool cohortTooSmall);
 
+    /// @notice Per-proposal approver set + their snapshot vote weights + the
+    ///         summed approve-weight denominator. Read by the off-chain Merkl bot.
+    function getApproverWeights(address governor, uint256 proposalId)
+        external
+        view
+        returns (address[] memory approvers, uint128[] memory weights, uint128 totalApproveWeight);
+
     function reviewPeriod() external view returns (uint256);
-    function governor() external view returns (address);
     function factory() external view returns (address);
     function swood() external view returns (IStakedWood);
 
@@ -139,16 +149,5 @@ interface IGuardianRegistry {
 
     /// @notice The minimum WOOD a vault owner must bond. Passthrough to sWOOD.
     function minOwnerStake() external view returns (uint256);
-
-    // ── Off-chain guardian-fee attribution (read-only) ──
-    /// @notice Per-proposal approver set + their snapshot vote weights + the
-    ///         summed approve-weight denominator. Read by the off-chain Merkl
-    ///         bot to attribute the guardian fee (paid out as WOOD) to
-    ///         approvers. Replaces the deleted on-chain claim machinery.
-    /// @dev    Data persists post-settle (arrays not cleared), so callable for
-    ///         any historical proposal.
-    function getApproverWeights(uint256 proposalId)
-        external
-        view
-        returns (address[] memory approvers, uint128[] memory weights, uint128 totalApproveWeight);
+    function requiredOwnerBond(address vault) external view returns (uint256);
 }

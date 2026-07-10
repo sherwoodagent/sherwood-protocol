@@ -15,6 +15,7 @@ import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
+import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 
 /// @title SwoodReviewSlash.t
 /// @notice End-to-end integration test for the sWOOD staking-split (Task 11.1).
@@ -133,6 +134,13 @@ contract SwoodReviewSlashTest is Test {
     // slash factor the contract MUST apply — NOT the 5000 bps unweighted mean.
     uint256 constant EXPECTED_MEDIAN_BPS = 9000;
 
+    // This test contract impersonates the factory. Per-vault (#421) the vault
+    // resolves its governor via `factory.governorOf(vault)`, so expose it here
+    // (single vault → single governor).
+    function governorOf(address) external view returns (address) {
+        return address(governor);
+    }
+
     function setUp() public {
         factoryEoa = address(this);
 
@@ -167,6 +175,7 @@ contract SwoodReviewSlashTest is Test {
         // resolved by predicting proxy addresses. From `baseNonce`:
         //   swoodImpl (+0), swoodProxy (+1), govImpl (+2), govProxy (+3),
         //   regImpl (+4), regProxy (+5).
+        ProtocolConfig _hoistedPC = new ProtocolConfig(owner);
         uint256 baseNonce = vm.getNonce(address(this));
         address predictedGovernor = vm.computeCreateAddress(address(this), baseNonce + 3);
         address predictedRegistryProxy = vm.computeCreateAddress(address(this), baseNonce + 5);
@@ -178,7 +187,6 @@ contract SwoodReviewSlashTest is Test {
             (StakedWood.InitParams({
                     owner: owner,
                     wood: address(wood),
-                    governor: predictedGovernor,
                     factory: factoryEoa,
                     minGuardianStake: MIN_GUARDIAN_STAKE,
                     coolDownPeriod: 7 days,
@@ -193,8 +201,11 @@ contract SwoodReviewSlashTest is Test {
         bytes memory govInit = abi.encodeCall(
             SyndicateGovernor.initialize,
             (
-                ISyndicateGovernor.InitParams({
-                    owner: owner,
+                address(vault), // vault_: this test's vault (per-vault governor)
+                predictedRegistryProxy,
+                address(_hoistedPC),
+                address(this), // factory (test contract)
+                ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,
                     vetoThresholdBps: VETO_THRESHOLD_BPS,
@@ -203,29 +214,25 @@ contract SwoodReviewSlashTest is Test {
                     collaborationWindow: 48 hours,
                     maxCoProposers: 5,
                     minStrategyDuration: 1 hours,
-                    maxStrategyDuration: 30 days,
-                    protocolFeeBps: 0,
-                    protocolFeeRecipient: address(0),
-                    guardianFeeBps: 0,
-                    guardiansFeeRecipient: address(0)
-                }),
-                predictedRegistryProxy
+                    maxStrategyDuration: 30 days
+                })
             )
         );
         governor = SyndicateGovernor(address(new ERC1967Proxy(address(govImpl), govInit)));
         require(address(governor) == predictedGovernor, "governor addr mismatch");
 
-        vm.prank(owner);
-        governor.addVault(address(vault));
-
         // Registry — slimmed 6-arg initialize.
         GuardianRegistry regImpl = new GuardianRegistry();
         bytes memory regInit = abi.encodeCall(
-            GuardianRegistry.initialize,
-            (owner, address(governor), factoryEoa, address(swood), REVIEW_PERIOD, BLOCK_QUORUM_BPS)
+            GuardianRegistry.initialize, (owner, factoryEoa, address(swood), REVIEW_PERIOD, BLOCK_QUORUM_BPS)
         );
         registry = GuardianRegistry(address(new ERC1967Proxy(address(regImpl), regInit)));
         require(address(registry) == predictedRegistryProxy, "registry addr mismatch");
+
+        // Authorize the per-vault governor with the registry (factory-only;
+        // this test impersonates the factory). Required for openReview /
+        // resolveReview to pass the registry's authorized-governor guard (P2).
+        registry.addGovernor(address(governor));
 
         // Resolve the registry ↔ sWOOD circular dependency.
         vm.prank(owner);
@@ -367,25 +374,25 @@ contract SwoodReviewSlashTest is Test {
             uint256(ISyndicateGovernor.ProposalState.GuardianReview),
             "state is GuardianReview after voteEnd"
         );
-        registry.openReview(pid);
+        registry.openReview(address(governor), pid);
 
         // ── 3. guardian votes: 1 Approve, 3 Block with varying slashBps ──
         vm.prank(gApprove);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
         vm.prank(gBlock1);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Block, SLASH_BPS_LOW); // 2000 @ 10k
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, SLASH_BPS_LOW); // 2000 @ 10k
         vm.prank(gBlock2);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Block, SLASH_BPS_MID); // 4000 @ 20k
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, SLASH_BPS_MID); // 4000 @ 20k
         vm.prank(gBlock3);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Block, SLASH_BPS_HIGH); // 9000 @ 50k
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, SLASH_BPS_HIGH); // 9000 @ 50k
 
         // ── 4. review window ends → resolveReview ──
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
-        bool blocked = registry.resolveReview(pid);
+        bool blocked = registry.resolveReview(address(governor), pid);
 
         // ── Assert: proposal rejected/blocked ──
         assertTrue(blocked, "review resolved as blocked");
-        (, bool resolved, bool blockedFlag,) = registry.getReviewState(pid);
+        (, bool resolved, bool blockedFlag,) = registry.getReviewState(address(governor), pid);
         assertTrue(resolved, "review resolved");
         assertTrue(blockedFlag, "review blocked flag set");
         assertEq(
@@ -450,7 +457,7 @@ contract SwoodReviewSlashTest is Test {
         // pool / claim machinery was deleted. `getApproverWeights` still
         // exposes the per-proposal approver attribution for the bot.
         assertEq(wood.balanceOf(address(registry)), 0, "registry still holds no WOOD after slash");
-        (address[] memory approvers,, uint128 totalApproveWeight) = registry.getApproverWeights(pid);
+        (address[] memory approvers,, uint128 totalApproveWeight) = registry.getApproverWeights(address(governor), pid);
         assertEq(approvers.length, 1, "approver attribution persists post-slash");
         assertEq(approvers[0], gApprove, "approver is gApprove");
         assertGt(uint256(totalApproveWeight), 0, "approve-weight denominator recorded");

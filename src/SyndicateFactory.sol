@@ -2,6 +2,7 @@
 pragma solidity 0.8.28;
 
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import {BeaconProxy} from "@openzeppelin/contracts/proxy/beacon/BeaconProxy.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -48,7 +49,8 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     error SubdomainTooShort();
     error SubdomainTaken();
     error NotCreator();
-    error InvalidGovernor();
+    error InvalidBeacon();
+    error InvalidProtocolConfig();
     error InsufficientCreationFee();
     error InvalidFeeToken();
     error ManagementFeeTooHigh();
@@ -60,7 +62,6 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     error InvalidGuardianRegistry();
     error PreparedStakeNotFound();
     error VaultStillStaked();
-    error RegistryMismatch();
     error ZeroAddress();
     error ProposalActive();
     error ProposalsOpen();
@@ -99,16 +100,21 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     /// @notice ERC-8004 agent identity registry (ERC-721)
     IERC721 public agentRegistry;
 
-    /// @notice Shared governor contract.
-    /// @dev Set once at `initialize` and never rewired. There is no setter —
-    ///      `setGovernor` was removed to close V-H2, a factory-owner instant
-    ///      global retroactive switch that would have orphaned in-flight
-    ///      proposals across every registered vault (vaults read the governor
-    ///      live via `_getGovernor()`, so a rewire would leave the old
-    ///      governor unable to call `onlyGovernor` fns and the new governor
-    ///      with no knowledge of the proposal). Governor upgrades must go
-    ///      through a UUPS upgrade of the governor itself.
-    address public governor;
+    /// @notice GovernorBeacon — every per-vault governor proxy reads its
+    ///         implementation from this beacon. A protocol-wide governor upgrade
+    ///         is a single `beacon.upgradeTo(newImpl)` by the beacon owner (a
+    ///         multisig), atomically re-pointing all live governors.
+    /// @dev Owner-settable via `setBeacon` (for a future beacon migration).
+    address public beacon;
+
+    /// @notice ProtocolConfig — global fee parameters (protocol/guardian fee bps
+    ///         + recipients). Each governor reads it at propose time to snapshot
+    ///         the fees onto the proposal. Owner-settable via `setProtocolConfig`.
+    address public protocolConfig;
+
+    /// @notice Per-vault governor proxy address, deployed at `createSyndicate`.
+    ///         `vault → governor`. Read externally via `governorOf(vault)`.
+    mapping(address vault => address governor) private _governorOf;
 
     /// @notice Protocol PriceRouter for Lane A live-NAV pricing (governance-owned).
     ///         Vaults read it live via `_getPriceRouter`; `address(0)` ⇒ Lane A
@@ -159,10 +165,11 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     /// @notice Maximum management fee a vault owner may charge (5% of post-strategy net).
     uint256 public constant MAX_MANAGEMENT_FEE_BPS = 500;
 
-    /// @dev Reserved for future storage — reduced by 1 for `guardianRegistry`,
-    ///      reduced by 1 for `_activeSyndicateIds` (EnumerableSet.UintSet uses
-    ///      a single storage slot for the Set struct).
-    uint256[48] private __gap;
+    /// @dev Reserved for future storage. Per-vault-governor refactor: replaced
+    ///      the single `governor` slot (1) with `beacon` (1) + `protocolConfig`
+    ///      (1) + `_governorOf` mapping (1) = net +2 slots, so the gap drops
+    ///      50 → 48 → 46 across this and prior reductions.
+    uint256[46] private __gap;
 
     // ── Events ──
 
@@ -185,6 +192,9 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     ///         retry by calling the registrar directly.
     event EnsRegistrationFailed(address indexed vault, string subdomain);
     event GuardianRegistrySet(address indexed oldRegistry, address indexed newRegistry);
+    event GovernorDeployed(address indexed vault, address indexed governor);
+    event BeaconUpdated(address indexed oldBeacon, address indexed newBeacon);
+    event ProtocolConfigUpdated(address indexed oldConfig, address indexed newConfig);
     event EnsRegistrarUpdated(address indexed oldRegistrar, address indexed newRegistrar);
     event PriceRouterUpdated(address indexed router);
 
@@ -194,7 +204,8 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         address vaultImpl;
         address ensRegistrar;
         address agentRegistry;
-        address governor;
+        address beacon;
+        address protocolConfig;
         uint256 managementFeeBps;
         address guardianRegistry;
     }
@@ -208,7 +219,8 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         if (p.executorImpl == address(0)) revert InvalidExecutorImpl();
         if (p.vaultImpl == address(0)) revert InvalidVaultImpl();
         // NOTE: ensRegistrar and agentRegistry can be address(0) on chains without ENS/ERC-8004
-        if (p.governor == address(0)) revert InvalidGovernor();
+        if (p.beacon == address(0)) revert InvalidBeacon();
+        if (p.protocolConfig == address(0)) revert InvalidProtocolConfig();
         if (p.guardianRegistry == address(0)) revert InvalidGuardianRegistry();
 
         __Ownable_init(p.owner);
@@ -217,7 +229,8 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         vaultImpl = p.vaultImpl;
         ensRegistrar = IL2Registrar(p.ensRegistrar);
         agentRegistry = IERC721(p.agentRegistry);
-        governor = p.governor;
+        beacon = p.beacon;
+        protocolConfig = p.protocolConfig;
         guardianRegistry = p.guardianRegistry;
         if (p.managementFeeBps > MAX_MANAGEMENT_FEE_BPS) revert ManagementFeeTooHigh();
         managementFeeBps = p.managementFeeBps;
@@ -292,8 +305,20 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         ISyndicateVault(vault).setWithdrawalQueue(address(queue));
         emit WithdrawalQueueDeployed(vault, address(queue));
 
-        // Register vault with the governor so it can receive proposals
-        ISyndicateGovernor(governor).addVault(vault);
+        // Deploy the per-vault governor as a BeaconProxy. The governor's
+        // `onlyVaultOwner` resolves the owner live from the vault, and the vault
+        // resolves its governor back through `factory.governorOf(vault)` (read
+        // from `_governorOf` below) — so recording the mapping here is what wires
+        // the vault ↔ governor link (no separate vault setter needed).
+        // `addGovernor` authorizes the new governor on the shared registry.
+        bytes memory govInitData = abi.encodeCall(
+            ISyndicateGovernor.initialize,
+            (vault, guardianRegistry, protocolConfig, address(this), _defaultGovernorParams())
+        );
+        address govProxy = address(new BeaconProxy(beacon, govInitData));
+        _governorOf[vault] = govProxy;
+        IGuardianRegistry(guardianRegistry).addGovernor(govProxy);
+        emit GovernorDeployed(vault, govProxy);
 
         // Bind the prepared owner stake to the newly deployed vault (Task 26).
         // Reverts roll back the whole creation tx — atomic.
@@ -361,6 +386,25 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         _activeSyndicateIds.add(syndicateId);
 
         emit SyndicateCreated(syndicateId, vault, msg.sender, config.metadataURI, config.subdomain);
+    }
+
+    /// @dev Default governance parameters stamped onto each new per-vault governor
+    ///      at deploy. Vault owners tune them post-creation via the governor's
+    ///      owner-instant setters (frozen while a proposal is open). All values
+    ///      sit within `GovernorParameters` bounds so the governor's
+    ///      `_validateParamBounds` at `initialize` accepts them.
+    function _defaultGovernorParams() private pure returns (ISyndicateGovernor.GovernorParams memory) {
+        return ISyndicateGovernor.GovernorParams({
+            votingPeriod: 24 hours,
+            executionWindow: 24 hours,
+            vetoThresholdBps: 2000,
+            maxPerformanceFeeBps: 1500,
+            cooldownPeriod: 1 hours,
+            collaborationWindow: 24 hours,
+            maxCoProposers: 10,
+            minStrategyDuration: 1 hours,
+            maxStrategyDuration: 30 days
+        });
     }
 
     // ==================== CREATOR FUNCTIONS ====================
@@ -439,6 +483,38 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         emit PriceRouterUpdated(newRouter);
     }
 
+    /// @notice Re-point the beacon that new governor proxies read their impl from.
+    /// @dev Does NOT touch already-deployed proxies' target (they read the beacon
+    ///      live) — this only matters if the whole beacon contract is swapped.
+    ///      A routine governor-impl upgrade is `beacon.upgradeTo(newImpl)`.
+    function setBeacon(address newBeacon) external onlyOwner {
+        if (newBeacon == address(0)) revert InvalidBeacon();
+        address old = beacon;
+        beacon = newBeacon;
+        emit BeaconUpdated(old, newBeacon);
+    }
+
+    /// @notice Re-point the ProtocolConfig that new governors snapshot fees from.
+    /// @dev Existing governors keep their own `protocolConfig` reference set at
+    ///      their `initialize`; this only affects governors deployed afterwards.
+    function setProtocolConfig(address newConfig) external onlyOwner {
+        if (newConfig == address(0)) revert InvalidProtocolConfig();
+        address old = protocolConfig;
+        protocolConfig = newConfig;
+        emit ProtocolConfigUpdated(old, newConfig);
+    }
+
+    /// @notice Factory-owner rescue: overwrite a vault's governor params,
+    ///         bypassing the governor's `whenNoActiveProposal` freeze. Still
+    ///         subject to the governor's bounds validation (`forceSetParams`
+    ///         calls `_validateParamBounds`). For unsticking a vault whose owner
+    ///         key is lost or whose params trap it mid-lifecycle.
+    function setParamsOverride(address vault, ISyndicateGovernor.GovernorParams calldata params) external onlyOwner {
+        address gov = _governorOf[vault];
+        if (gov == address(0)) revert VaultNotDeployed();
+        ISyndicateGovernor(gov).forceSetParams(params);
+    }
+
     /// @notice Re-point the factory at a new guardian registry. Used when WOOD
     ///         ships and the protocol migrates from the beta stub to the real
     ///         `GuardianRegistry`. The governor and factory MUST share the same
@@ -508,13 +584,13 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         // Sherlock registry bytecode trim: `hasOwnerStake` (`ownerStake > 0`)
         // view dropped on the registry; inline the equivalent check here.
         if (reg.ownerStake(vault) > 0) revert VaultStillStaked();
-        // Registry-consistency invariant: governor and factory must share one registry.
-        ISyndicateGovernor gov = ISyndicateGovernor(governor);
-        if (gov.guardianRegistry() != guardianRegistry) revert RegistryMismatch();
+        // Per-vault governor: each proxy is deployed by the factory pointing at
+        // `guardianRegistry`, so the old cross-registry consistency check is moot.
+        ISyndicateGovernor gov = ISyndicateGovernor(_governorOf[vault]);
         // Forbid rotation while any proposal binds the vault — otherwise the
         // new owner inherits `pause()` and other owner-only powers mid-flight.
-        if (gov.getActiveProposal(vault) != 0) revert ProposalActive();
-        if (gov.openProposalCount(vault) != 0) revert ProposalsOpen();
+        if (gov.getActiveProposal() != 0) revert ProposalActive();
+        if (gov.openProposalCount() != 0) revert ProposalsOpen();
 
         SyndicateVault(payable(vault)).rotateOwnership(newOwner);
         // Owner-stake slot lives on sWOOD post-split.
@@ -551,16 +627,24 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         // execute under impl B. Mirrors the `rotateOwner` gate above —
         // split into two distinct errors per ana's PR #350 review so
         // off-chain tooling decoding the selector can tell which gate fired.
-        if (governor != address(0)) {
-            ISyndicateGovernor gov = ISyndicateGovernor(governor);
-            if (gov.getActiveProposal(vault) != 0) revert StrategyActive();
-            if (gov.openProposalCount(vault) != 0) revert ProposalsOpen();
+        address gov_ = _governorOf[vault];
+        if (gov_ != address(0)) {
+            ISyndicateGovernor gov = ISyndicateGovernor(gov_);
+            if (gov.getActiveProposal() != 0) revert StrategyActive();
+            if (gov.openProposalCount() != 0) revert ProposalsOpen();
         }
         UUPSUpgradeable(vault).upgradeToAndCall(vaultImpl, "");
         emit VaultUpgraded(vault, vaultImpl);
     }
 
     // ==================== VIEWS ====================
+
+    /// @notice The per-vault governor proxy for `vault` (address(0) if none).
+    ///         The vault resolves its own governor through this view; sWOOD and
+    ///         off-chain tooling do the same.
+    function governorOf(address vault) external view returns (address) {
+        return _governorOf[vault];
+    }
 
     /// @notice Check if a subdomain is available for registration
     function isSubdomainAvailable(string calldata subdomain) external view returns (bool) {

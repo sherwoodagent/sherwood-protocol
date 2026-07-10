@@ -17,6 +17,7 @@ import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 
 import {VaultSolvencyHandler} from "./handlers/VaultSolvencyHandler.sol";
+import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 
 /// @title VaultSolvencyInvariantTest
 /// @notice INV-15 fuzz harness — vault solvency.
@@ -99,8 +100,11 @@ contract VaultSolvencyInvariantTest is StdInvariant, Test {
         bytes memory govInit = abi.encodeCall(
             SyndicateGovernor.initialize,
             (
-                ISyndicateGovernor.InitParams({
-                    owner: owner,
+                address(vault), // vault_: this test's vault (per-vault governor)
+                address(guardianRegistry),
+                address(new ProtocolConfig(owner)),
+                address(this), // factory (test contract)
+                ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,
                     vetoThresholdBps: VETO_THRESHOLD_BPS,
@@ -109,19 +113,14 @@ contract VaultSolvencyInvariantTest is StdInvariant, Test {
                     collaborationWindow: 48 hours,
                     maxCoProposers: 5,
                     minStrategyDuration: 1 hours,
-                    maxStrategyDuration: 30 days,
-                    protocolFeeBps: PROTOCOL_FEE_BPS,
-                    protocolFeeRecipient: protocolRecipient,
-                    guardianFeeBps: 0,
-                    guardiansFeeRecipient: address(0)
-                }),
-                address(guardianRegistry)
+                    maxStrategyDuration: 30 days
+                })
             )
         );
         governor = SyndicateGovernor(address(new ERC1967Proxy(address(govImpl), govInit)));
-
-        vm.prank(owner);
-        governor.addVault(address(vault));
+        // Per-vault governor: the vault resolves its governor via its factory
+        // (this test contract). Mock governorOf(vault) -> the deployed governor.
+        vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
 
         // ── Seed deposits — pre-fund two LPs so the fuzzer always has a
         //    non-zero `totalSupply` to operate against (the rich-state
@@ -297,8 +296,11 @@ contract VaultSolvencyColdStartInvariantTest is StdInvariant, Test {
         bytes memory govInit = abi.encodeCall(
             SyndicateGovernor.initialize,
             (
-                ISyndicateGovernor.InitParams({
-                    owner: owner,
+                address(vault), // vault_: this test's vault (per-vault governor)
+                address(guardianRegistry),
+                address(new ProtocolConfig(owner)),
+                address(this), // factory (test contract)
+                ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,
                     vetoThresholdBps: VETO_THRESHOLD_BPS,
@@ -307,19 +309,14 @@ contract VaultSolvencyColdStartInvariantTest is StdInvariant, Test {
                     collaborationWindow: 48 hours,
                     maxCoProposers: 5,
                     minStrategyDuration: 1 hours,
-                    maxStrategyDuration: 30 days,
-                    protocolFeeBps: PROTOCOL_FEE_BPS,
-                    protocolFeeRecipient: protocolRecipient,
-                    guardianFeeBps: 0,
-                    guardiansFeeRecipient: address(0)
-                }),
-                address(guardianRegistry)
+                    maxStrategyDuration: 30 days
+                })
             )
         );
         governor = SyndicateGovernor(address(new ERC1967Proxy(address(govImpl), govInit)));
-
-        vm.prank(owner);
-        governor.addVault(address(vault));
+        // Per-vault governor: the vault resolves its governor via its factory
+        // (this test contract). Mock governorOf(vault) -> the deployed governor.
+        vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
 
         // No seed deposits — totalSupply starts at 0.
 

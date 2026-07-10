@@ -5,7 +5,7 @@ import {console} from "forge-std/Script.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {SyndicateFactory} from "../../src/SyndicateFactory.sol";
-import {SyndicateGovernor} from "../../src/SyndicateGovernor.sol";
+import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {StakedWood} from "../../src/StakedWood.sol";
 import {PriceRouter} from "../../src/pricing/PriceRouter.sol";
 import {WoodToken} from "../../src/WoodToken.sol";
@@ -120,7 +120,10 @@ contract DeployRobinhoodTestnetV2 is DeploySherwood {
         // Multisig handoff (skipped on testnet).
         address effectiveOwner = deployer;
         if (!skipHandoff) {
-            Ownable(d.governorProxy).transferOwnership(ownerMultisig);
+            // Per-vault governors: hand off the beacon + ProtocolConfig, not a
+            // singleton governor proxy (there isn't one).
+            Ownable(d.beacon).transferOwnership(ownerMultisig);
+            Ownable(d.protocolConfig).transferOwnership(ownerMultisig);
             Ownable(d.factoryProxy).transferOwnership(ownerMultisig);
             Ownable(d.registryProxy).transferOwnership(ownerMultisig);
             Ownable(d.swoodProxy).transferOwnership(ownerMultisig);
@@ -158,7 +161,11 @@ contract DeployRobinhoodTestnetV2 is DeploySherwood {
 
     function _persistAndLog(Deployed memory d, address wood, address priceRouter, Extras memory e) internal {
         // ── Persist (patch-mode preserves the Synthra externals) ──
-        _writeAddresses("Robinhood L2 Testnet", d.deployer, d.factoryProxy, d.governorProxy, d.executorLib, d.vaultImpl);
+        // SYNDICATE_GOVERNOR stays zero: governors are per-vault, resolved via
+        // `factory.governorOf(vault)`.
+        _writeAddresses("Robinhood L2 Testnet", d.deployer, d.factoryProxy, address(0), d.executorLib, d.vaultImpl);
+        _patchAddress("GOVERNOR_BEACON", d.beacon);
+        _patchAddress("PROTOCOL_CONFIG", d.protocolConfig);
         _patchAddress("GUARDIAN_REGISTRY", d.registryProxy);
         _patchAddress("STAKED_WOOD", d.swoodProxy);
         _patchAddress("WOOD_TOKEN", wood);
@@ -169,7 +176,8 @@ contract DeployRobinhoodTestnetV2 is DeploySherwood {
         _patchAddress("STRATEGY_FACTORY", e.strategyFactory);
 
         console.log("SyndicateFactory:", d.factoryProxy);
-        console.log("SyndicateGovernor:", d.governorProxy);
+        console.log("GovernorBeacon:", d.beacon);
+        console.log("ProtocolConfig:", d.protocolConfig);
         console.log("GuardianRegistry:", d.registryProxy);
         console.log("StakedWood:", d.swoodProxy);
         console.log("PriceRouter:", priceRouter);
@@ -183,16 +191,18 @@ contract DeployRobinhoodTestnetV2 is DeploySherwood {
         internal
         view
     {
-        SyndicateGovernor governor = SyndicateGovernor(d.governorProxy);
         SyndicateFactory factory = SyndicateFactory(d.factoryProxy);
+        ProtocolConfig protocolConfig = ProtocolConfig(d.protocolConfig);
 
-        _checkAddr("gov.owner", Ownable(d.governorProxy).owner(), expectedOwner);
-        _checkAddr("gov.factory", governor.factory(), d.factoryProxy);
-        _checkUint("gov.protocolFeeBps", governor.protocolFeeBps(), PROTOCOL_FEE_BPS);
-        _checkAddr("gov.protocolFeeRecipient", governor.protocolFeeRecipient(), d.deployer);
+        // Per-vault governors are minted at `createSyndicate`; at deploy time the
+        // checkable surface is the beacon + ProtocolConfig.
+        _checkAddr("beacon.owner", Ownable(d.beacon).owner(), expectedOwner);
+        _checkAddr("protocolConfig.owner", Ownable(d.protocolConfig).owner(), expectedOwner);
+        _checkUint("protocolConfig.protocolFeeBps", protocolConfig.protocolFeeBps(), PROTOCOL_FEE_BPS);
+        _checkAddr("protocolConfig.protocolFeeRecipient", protocolConfig.protocolFeeRecipient(), d.deployer);
 
         _checkAddr("factory.owner", Ownable(d.factoryProxy).owner(), expectedOwner);
-        _checkAddr("factory.governor", factory.governor(), d.governorProxy);
+        _checkAddr("factory.beacon", factory.beacon(), d.beacon);
         _checkAddr("factory.ensRegistrar", address(factory.ensRegistrar()), address(0));
         _checkAddr("factory.agentRegistry", address(factory.agentRegistry()), address(0));
 

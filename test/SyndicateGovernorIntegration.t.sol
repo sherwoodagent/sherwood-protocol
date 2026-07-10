@@ -14,6 +14,7 @@ import {MockAgentRegistry} from "./mocks/MockAgentRegistry.sol";
 import {MockMToken} from "./mocks/MockMToken.sol";
 import {MockComptroller} from "./mocks/MockComptroller.sol";
 import {MockRegistryMinimal} from "./mocks/MockRegistryMinimal.sol";
+import {ProtocolConfig} from "../src/ProtocolConfig.sol";
 
 /**
  * @title SyndicateGovernorIntegrationTest
@@ -23,6 +24,7 @@ import {MockRegistryMinimal} from "./mocks/MockRegistryMinimal.sol";
  */
 contract SyndicateGovernorIntegrationTest is Test {
     SyndicateGovernor public governor;
+    ProtocolConfig public protocolConfig;
     SyndicateVault public vault;
     BatchExecutorLib public executorLib;
     ERC20Mock public usdc;
@@ -49,6 +51,13 @@ contract SyndicateGovernorIntegrationTest is Test {
     uint256 constant COOLDOWN_PERIOD = 1 days;
 
     function setUp() public {
+        protocolConfig = new ProtocolConfig(owner);
+        // 1% protocol fee — the settlement expectations below (742.5 of 5k
+        // profit) assume it. Snapshotted onto proposals at propose time.
+        vm.startPrank(owner);
+        protocolConfig.setProtocolFeeRecipient(owner);
+        protocolConfig.setProtocolFeeBps(100);
+        vm.stopPrank();
         usdc = new ERC20Mock("USD Coin", "USDC", 6);
         targetToken = new ERC20Mock("Target", "TGT", 18);
         mUsdc = new MockMToken(address(usdc), "Moonwell USDC", "mUSDC");
@@ -81,8 +90,11 @@ contract SyndicateGovernorIntegrationTest is Test {
         bytes memory govInit = abi.encodeCall(
             SyndicateGovernor.initialize,
             (
-                ISyndicateGovernor.InitParams({
-                    owner: owner,
+                address(vault), // vault_: this test's vault (per-vault governor)
+                address(guardianRegistry),
+                address(protocolConfig),
+                address(this), // factory (test contract)
+                ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,
                     vetoThresholdBps: VETO_THRESHOLD_BPS,
@@ -91,22 +103,15 @@ contract SyndicateGovernorIntegrationTest is Test {
                     collaborationWindow: 48 hours,
                     maxCoProposers: 5,
                     minStrategyDuration: 1 hours,
-                    maxStrategyDuration: MAX_STRATEGY_DURATION,
-                    protocolFeeBps: 100,
-                    protocolFeeRecipient: owner,
-                    guardianFeeBps: 0,
-                    guardiansFeeRecipient: address(0)
-                }),
-                address(guardianRegistry)
+                    maxStrategyDuration: MAX_STRATEGY_DURATION
+                })
             )
         );
         governor = SyndicateGovernor(address(new ERC1967Proxy(address(govImpl), govInit)));
 
-        vm.mockCall(address(this), abi.encodeWithSignature("governor()"), abi.encode(address(governor)));
+        vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
         // Lane A off (no PriceRouter wired) — exercises the async (Lane B) paths.
         vm.mockCall(address(this), abi.encodeWithSignature("priceRouter()"), abi.encode(address(0)));
-        vm.prank(owner);
-        governor.addVault(address(vault));
 
         usdc.mint(lp1, 100_000e6);
         usdc.mint(lp2, 100_000e6);
@@ -192,13 +197,13 @@ contract SyndicateGovernorIntegrationTest is Test {
 
         assertEq(uint256(governor.getProposalState(proposalId)), uint256(ISyndicateGovernor.ProposalState.Settled));
         assertFalse(vault.redemptionsLocked());
-        assertEq(governor.getActiveProposal(address(vault)), 0);
+        assertEq(governor.getActiveProposal(), 0);
 
         // Protocol fee: 1% of 5k = 50. Agent got 15% of (5k - 50) = 15% of 4,950 = 742.5 USDC
         assertEq(usdc.balanceOf(agent), agentBalBefore + 742_500000);
         assertEq(usdc.allowance(address(vault), address(targetToken)), 0);
 
-        vm.warp(governor.getCooldownEnd(address(vault)) + 1);
+        vm.warp(governor.getCooldownEnd() + 1);
         vm.prank(lp1);
         vault.withdraw(10_000e6, lp1, lp1);
     }
@@ -265,7 +270,7 @@ contract SyndicateGovernorIntegrationTest is Test {
 
         assertEq(uint256(governor.getProposal(pid1).state), uint256(ISyndicateGovernor.ProposalState.Settled));
         assertEq(uint256(governor.getProposal(pid2).state), uint256(ISyndicateGovernor.ProposalState.Settled));
-        assertEq(governor.getActiveProposal(address(vault)), 0);
+        assertEq(governor.getActiveProposal(), 0);
         assertFalse(vault.redemptionsLocked());
     }
 
@@ -324,7 +329,7 @@ contract SyndicateGovernorIntegrationTest is Test {
         assertEq(mUsdc.balanceOf(address(vault)), 0);
         assertEq(uint256(governor.getProposalState(proposalId)), uint256(ISyndicateGovernor.ProposalState.Settled));
         assertFalse(vault.redemptionsLocked());
-        assertEq(governor.getActiveProposal(address(vault)), 0);
+        assertEq(governor.getActiveProposal(), 0);
         assertEq(usdc.balanceOf(agent), 0);
     }
 }

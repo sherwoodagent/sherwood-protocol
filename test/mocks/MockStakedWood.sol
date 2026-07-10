@@ -50,11 +50,11 @@ contract MockStakedWood is IStakedWood {
 
     // ── Recorded mutation args (for assertions) ──
     uint256 public slashGuardiansCallCount;
-    uint256 public lastSlashProposalId;
+    bytes32 public lastSlashReviewKey;
     uint256 public lastSlashBps;
     uint256 public slashOwnerBondCallCount;
     address public lastSlashedVault;
-    mapping(uint256 => mapping(address => uint128)) public recordedVoteStake;
+    mapping(bytes32 => mapping(address => uint128)) public recordedVoteStake;
 
     // ── Setters ──
     function setWood(address w) external {
@@ -230,7 +230,7 @@ contract MockStakedWood is IStakedWood {
     // own-stake portion of the combined `voteStake` snapshot via
     // `getPastDelegatedInbound(approver, openedAt)`. Mock ignores it.
     function slashGuardians(
-        uint256 proposalId,
+        bytes32 reviewKey,
         uint256,
         /* openedAt */
         address[] calldata,
@@ -239,7 +239,7 @@ contract MockStakedWood is IStakedWood {
         external
     {
         slashGuardiansCallCount++;
-        lastSlashProposalId = proposalId;
+        lastSlashReviewKey = reviewKey;
         lastSlashBps = slashBps;
     }
 
@@ -249,8 +249,8 @@ contract MockStakedWood is IStakedWood {
         _ownerStake[vault] = 0;
     }
 
-    function recordVoteStake(uint256 proposalId, address voter, uint128 weight) external {
-        recordedVoteStake[proposalId][voter] = weight;
+    function recordVoteStake(bytes32 reviewKey, address voter, uint128 weight) external {
+        recordedVoteStake[reviewKey][voter] = weight;
     }
 
     // ── Unused interface methods (revert if a test exercises a path the mock

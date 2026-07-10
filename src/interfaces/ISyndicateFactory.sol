@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
+import {ISyndicateGovernor} from "./ISyndicateGovernor.sol";
+
 interface ISyndicateFactory {
     // ── Events (Task 26) ──
     event OwnerRotated(address indexed vault, address indexed newOwner);
@@ -16,7 +18,9 @@ interface ISyndicateFactory {
     error InvalidSyndicateConfig();
 
     // ── Views ──
-    function governor() external view returns (address);
+    function governorOf(address vault) external view returns (address);
+    function beacon() external view returns (address);
+    function protocolConfig() external view returns (address);
     function priceRouter() external view returns (address);
     function vaultImpl() external view returns (address);
     function vaultToSyndicate(address vault) external view returns (uint256);
@@ -24,4 +28,5 @@ interface ISyndicateFactory {
 
     // ── Admin ──
     function rotateOwner(address vault, address newOwner) external;
+    function setParamsOverride(address vault, ISyndicateGovernor.GovernorParams calldata params) external;
 }

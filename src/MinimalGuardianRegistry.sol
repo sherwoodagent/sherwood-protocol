@@ -60,22 +60,28 @@ contract MinimalGuardianRegistry {
     }
 
     /// @notice Always returns `blocked == false`.
-    function resolveReview(uint256) external pure returns (bool) {
+    function resolveReview(address, uint256) external pure returns (bool) {
         return false;
     }
 
     /// @notice (opened, resolved, blocked, cohortTooSmall) — review is
     ///         pre-resolved as not-blocked.
-    function getReviewState(uint256) external pure returns (bool, bool, bool, bool) {
+    function getReviewState(address, uint256) external pure returns (bool, bool, bool, bool) {
         return (true, true, false, false);
     }
 
-    function isEmergencyOpen(uint256) external pure returns (bool) {
+    function isEmergencyOpen(address, uint256) external pure returns (bool) {
         return false;
     }
 
     /// @notice Permissionless review opener — no-op in beta.
-    function openReview(uint256) external pure {}
+    function openReview(address, uint256) external pure {}
+
+    /// @notice Factory-only governor authorization. In the per-vault governor
+    ///         model the factory calls this in `createSyndicate` for every new
+    ///         governor proxy. No-op in beta (the stub authorizes nothing since
+    ///         reviews never open).
+    function addGovernor(address) external pure {}
 
     /// @notice Governor-only cancel during GuardianReview — no-op in beta
     ///         because reviews never open. Mirrors the IGuardianRegistry

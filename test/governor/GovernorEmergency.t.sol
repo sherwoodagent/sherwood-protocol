@@ -16,6 +16,7 @@ import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
+import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 
 /// @title GovernorEmergency.t
 /// @notice Tests for the Task 24 guardian-review emergency settle lifecycle.
@@ -102,6 +103,7 @@ contract GovernorEmergencyTest is Test {
         // Resolved by predicting all proxy addresses. From `baseNonce`:
         //   swoodImpl (+0), swoodProxy (+1), govImpl (+2), govProxy (+3),
         //   regImpl (+4), regProxy (+5).
+        ProtocolConfig _hoistedPC = new ProtocolConfig(owner);
         uint256 baseNonce = vm.getNonce(address(this));
         address predictedGovernor = vm.computeCreateAddress(address(this), baseNonce + 3);
         address predictedRegistryProxy = vm.computeCreateAddress(address(this), baseNonce + 5);
@@ -113,7 +115,6 @@ contract GovernorEmergencyTest is Test {
             (StakedWood.InitParams({
                     owner: owner,
                     wood: address(wood),
-                    governor: predictedGovernor,
                     factory: factoryEoa,
                     minGuardianStake: MIN_GUARDIAN_STAKE,
                     coolDownPeriod: 7 days,
@@ -128,8 +129,11 @@ contract GovernorEmergencyTest is Test {
         bytes memory govInit = abi.encodeCall(
             SyndicateGovernor.initialize,
             (
-                ISyndicateGovernor.InitParams({
-                    owner: owner,
+                address(vault), // vault_: this test's vault (per-vault governor)
+                predictedRegistryProxy,
+                address(_hoistedPC),
+                address(this), // factory (test contract)
+                ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,
                     vetoThresholdBps: VETO_THRESHOLD_BPS,
@@ -138,20 +142,15 @@ contract GovernorEmergencyTest is Test {
                     collaborationWindow: 48 hours,
                     maxCoProposers: 5,
                     minStrategyDuration: 1 hours,
-                    maxStrategyDuration: 30 days,
-                    protocolFeeBps: 0,
-                    protocolFeeRecipient: address(0),
-                    guardianFeeBps: 0,
-                    guardiansFeeRecipient: address(0)
-                }),
-                predictedRegistryProxy
+                    maxStrategyDuration: 30 days
+                })
             )
         );
         governor = SyndicateGovernor(address(new ERC1967Proxy(address(govImpl), govInit)));
+        // Per-vault governor: the vault resolves its governor via its factory
+        // (this test contract). Mock governorOf(vault) -> the deployed governor.
+        vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
         require(address(governor) == predictedGovernor, "governor addr mismatch");
-
-        vm.prank(owner);
-        governor.addVault(address(vault));
 
         // Registry — slimmed 6-arg initialize (owner, governor, factory, swood,
         // reviewPeriod, blockQuorumBps). Governor is the real governor so
@@ -160,10 +159,13 @@ contract GovernorEmergencyTest is Test {
         // land at predictedRegistryProxy — `require` below catches nonce drift.
         GuardianRegistry regImpl = new GuardianRegistry();
         bytes memory regInit = abi.encodeCall(
-            GuardianRegistry.initialize,
-            (owner, address(governor), factoryEoa, address(swood), REVIEW_PERIOD, BLOCK_QUORUM_BPS)
+            GuardianRegistry.initialize, (owner, factoryEoa, address(swood), REVIEW_PERIOD, BLOCK_QUORUM_BPS)
         );
         registry = GuardianRegistry(address(new ERC1967Proxy(address(regImpl), regInit)));
+        // Authorize the per-vault governor on the composite-key registry
+        // (replaces the removed governor.addVault wiring).
+        vm.prank(registry.factory());
+        registry.addGovernor(address(governor));
         require(address(registry) == predictedRegistryProxy, "registry addr mismatch");
 
         // Resolve the registry ↔ sWOOD circular dependency.
@@ -258,7 +260,7 @@ contract GovernorEmergencyTest is Test {
         // could vote if they wanted; skip the review window and resolve with no
         // blocks → Approved. Then execute.
         vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
-        registry.openReview(proposalId);
+        registry.openReview(address(governor), proposalId);
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
         governor.executeProposal(proposalId);
     }
@@ -362,7 +364,7 @@ contract GovernorEmergencyTest is Test {
         vm.prank(owner);
         governor.cancelEmergencySettle(pid);
 
-        assertFalse(registry.isEmergencyOpen(pid), "emergency review closed after cancel");
+        assertFalse(registry.isEmergencyOpen(address(governor), pid), "emergency review closed after cancel");
 
         // finalizeEmergencySettle reverts because the review was resolved by cancel.
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
@@ -396,7 +398,7 @@ contract GovernorEmergencyTest is Test {
         governor.cancelEmergencySettle(pid);
 
         // Emergency review closed, owner stake preserved.
-        assertFalse(registry.isEmergencyOpen(pid), "emergency closed after cancel");
+        assertFalse(registry.isEmergencyOpen(address(governor), pid), "emergency closed after cancel");
         assertEq(registry.ownerStake(address(vault)), MIN_OWNER_STAKE, "owner stake NOT slashed");
     }
 
@@ -411,9 +413,9 @@ contract GovernorEmergencyTest is Test {
         governor.emergencySettleWithCalls(pid, _customCalls());
 
         vm.prank(guardianA);
-        registry.voteBlockEmergencySettle(pid);
+        registry.voteBlockEmergencySettle(address(governor), pid);
         vm.prank(guardianB);
-        registry.voteBlockEmergencySettle(pid);
+        registry.voteBlockEmergencySettle(address(governor), pid);
 
         // Now at 60k/60k = 100% block weight — well above 30% quorum.
         vm.prank(owner);
@@ -448,7 +450,7 @@ contract GovernorEmergencyTest is Test {
         vm.prank(owner);
         governor.emergencySettleWithCalls(pid, _customCalls());
         vm.prank(guardianA);
-        registry.voteBlockEmergencySettle(pid); // must NOT revert AlreadyVoted
+        registry.voteBlockEmergencySettle(address(governor), pid); // must NOT revert AlreadyVoted
 
         // Only guardianA has voted this round → 30k/60k = 50% ≥ 30% block quorum.
         // Finalize via governor — blocked because guardianA voted block.
@@ -490,7 +492,7 @@ contract GovernorEmergencyTest is Test {
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD / 2 + 1);
         vm.prank(owner);
         governor.emergencySettleWithCalls(pid, _customCalls());
-        assertTrue(registry.isEmergencyOpen(pid), "re-open succeeds past cooldown");
+        assertTrue(registry.isEmergencyOpen(address(governor), pid), "re-open succeeds past cooldown");
     }
 
     // ──────────────────────────────────────────────────────────────
@@ -525,9 +527,9 @@ contract GovernorEmergencyTest is Test {
 
         // Guardian A + B both vote block (each 30k/60k = 50% → above 30% quorum).
         vm.prank(guardianA);
-        registry.voteBlockEmergencySettle(pid);
+        registry.voteBlockEmergencySettle(address(governor), pid);
         vm.prank(guardianB);
-        registry.voteBlockEmergencySettle(pid);
+        registry.voteBlockEmergencySettle(address(governor), pid);
 
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
 
@@ -555,9 +557,9 @@ contract GovernorEmergencyTest is Test {
 
         // guardianA + guardianB both block — total 60k / 60k = 100% ≥ 30%.
         vm.prank(guardianA);
-        registry.voteBlockEmergencySettle(pid);
+        registry.voteBlockEmergencySettle(address(governor), pid);
         vm.prank(guardianB);
-        registry.voteBlockEmergencySettle(pid);
+        registry.voteBlockEmergencySettle(address(governor), pid);
 
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
 
@@ -617,13 +619,13 @@ contract GovernorEmergencyTest is Test {
 
         governor.settleProposal(pid);
         assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
-        assertEq(governor.openProposalCount(address(vault)), 0);
+        assertEq(governor.openProposalCount(), 0);
 
         vm.prank(owner);
         vm.expectRevert(ISyndicateGovernor.ProposalNotExecuted.selector);
         governor.finalizeEmergencySettle(pid);
 
-        assertEq(governor.openProposalCount(address(vault)), 0);
+        assertEq(governor.openProposalCount(), 0);
     }
 
     /// @notice MS-H2 regression: if `settleProposal` races ahead of an open
@@ -641,9 +643,9 @@ contract GovernorEmergencyTest is Test {
 
         // Both guardians vote block (60k/60k = 100% — slashes if resolved).
         vm.prank(guardianA);
-        registry.voteBlockEmergencySettle(pid);
+        registry.voteBlockEmergencySettle(address(governor), pid);
         vm.prank(guardianB);
-        registry.voteBlockEmergencySettle(pid);
+        registry.voteBlockEmergencySettle(address(governor), pid);
 
         uint256 stakeBefore = registry.ownerStake(address(vault));
         assertEq(stakeBefore, MIN_OWNER_STAKE, "precondition: owner stake bonded");
@@ -654,7 +656,7 @@ contract GovernorEmergencyTest is Test {
 
         // MS-H2: emergency review must STAY open — owner cannot dodge slash by
         // racing a standard settle. `_finishSettlement` no longer auto-cancels.
-        assertTrue(registry.isEmergencyOpen(pid), "emergency stays open after standard settle");
+        assertTrue(registry.isEmergencyOpen(address(governor), pid), "emergency stays open after standard settle");
 
         // Owner stake still bonded pre-resolution.
         assertEq(registry.ownerStake(address(vault)), stakeBefore, "owner stake bonded pre-resolve");
@@ -662,9 +664,9 @@ contract GovernorEmergencyTest is Test {
         // Anyone can resolve the emergency review at reviewEnd → block-quorum
         // slash applies, owner stake is burned.
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
-        registry.resolveEmergencyReview(pid);
+        registry.resolveEmergencyReview(address(governor), pid);
 
-        assertFalse(registry.isEmergencyOpen(pid), "emergency closed after resolveEmergencyReview");
+        assertFalse(registry.isEmergencyOpen(address(governor), pid), "emergency closed after resolveEmergencyReview");
         assertEq(registry.ownerStake(address(vault)), 0, "owner stake slashed by block quorum");
     }
 
@@ -721,28 +723,28 @@ contract GovernorEmergencyTest is Test {
         uint256 pid = _createExecutedProposal(7 days);
         vm.warp(vm.getBlockTimestamp() + 7 days);
 
-        assertFalse(registry.isEmergencyOpen(pid), "before open");
+        assertFalse(registry.isEmergencyOpen(address(governor), pid), "before open");
 
         vm.prank(owner);
         governor.emergencySettleWithCalls(pid, _customCalls());
-        assertTrue(registry.isEmergencyOpen(pid), "after open");
+        assertTrue(registry.isEmergencyOpen(address(governor), pid), "after open");
 
         vm.prank(owner);
         governor.cancelEmergencySettle(pid);
-        assertFalse(registry.isEmergencyOpen(pid), "after cancel");
+        assertFalse(registry.isEmergencyOpen(address(governor), pid), "after cancel");
 
         // Sherlock #15: cancel sets a `reviewPeriod` cooldown — wait it out.
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
 
         vm.prank(owner);
         governor.emergencySettleWithCalls(pid, _customCalls());
-        assertTrue(registry.isEmergencyOpen(pid), "after re-open");
+        assertTrue(registry.isEmergencyOpen(address(governor), pid), "after re-open");
 
         // Finalize (no blocks → not blocked → settles).
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
         vm.prank(owner);
         governor.finalizeEmergencySettle(pid);
-        assertFalse(registry.isEmergencyOpen(pid), "after finalize");
+        assertFalse(registry.isEmergencyOpen(address(governor), pid), "after finalize");
     }
 
     /// @notice Open emergency, cancel, verify state cleared, re-open with
@@ -754,11 +756,11 @@ contract GovernorEmergencyTest is Test {
 
         vm.prank(owner);
         governor.emergencySettleWithCalls(pid, _customCalls());
-        assertFalse(!registry.isEmergencyOpen(pid));
+        assertFalse(!registry.isEmergencyOpen(address(governor), pid));
 
         vm.prank(owner);
         governor.cancelEmergencySettle(pid);
-        assertFalse(registry.isEmergencyOpen(pid), "closed after cancel");
+        assertFalse(registry.isEmergencyOpen(address(governor), pid), "closed after cancel");
 
         // Sherlock #15: post-cancel cooldown — wait `reviewPeriod` before re-open.
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
@@ -770,7 +772,7 @@ contract GovernorEmergencyTest is Test {
         });
         vm.prank(owner);
         governor.emergencySettleWithCalls(pid, newCalls);
-        assertTrue(registry.isEmergencyOpen(pid), "open after re-open");
+        assertTrue(registry.isEmergencyOpen(address(governor), pid), "open after re-open");
 
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
         vm.prank(owner);
@@ -789,16 +791,16 @@ contract GovernorEmergencyTest is Test {
 
         vm.prank(owner);
         governor.emergencySettleWithCalls(pid, _customCalls());
-        assertTrue(registry.isEmergencyOpen(pid));
+        assertTrue(registry.isEmergencyOpen(address(governor), pid));
 
         governor.settleProposal(pid);
         assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
-        assertTrue(registry.isEmergencyOpen(pid), "emergency stays open after standard settle");
+        assertTrue(registry.isEmergencyOpen(address(governor), pid), "emergency stays open after standard settle");
 
         // Review resolves naturally at reviewEnd via permissionless call.
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
-        registry.resolveEmergencyReview(pid);
-        assertFalse(registry.isEmergencyOpen(pid), "closed after permissionless resolve");
+        registry.resolveEmergencyReview(address(governor), pid);
+        assertFalse(registry.isEmergencyOpen(address(governor), pid), "closed after permissionless resolve");
     }
 
     /// @notice Open emergency with no blocks, finalize — calls returned from

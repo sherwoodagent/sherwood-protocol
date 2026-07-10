@@ -51,7 +51,6 @@ contract DelegationInvariantsTest is StdInvariant, Test {
             (StakedWood.InitParams({
                     owner: owner,
                     wood: address(wood),
-                    governor: mockGovernor,
                     factory: mockFactory,
                     minGuardianStake: MIN_STAKE,
                     coolDownPeriod: COOL_DOWN,

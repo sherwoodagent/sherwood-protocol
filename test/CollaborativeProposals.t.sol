@@ -11,6 +11,7 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "./mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "./mocks/MockRegistryMinimal.sol";
+import {ProtocolConfig} from "../src/ProtocolConfig.sol";
 
 contract CollaborativeProposalsTest is Test {
     SyndicateGovernor public governor;
@@ -54,33 +55,8 @@ contract CollaborativeProposalsTest is Test {
         coNftId1 = agentRegistry.mint(coAgent1);
         coNftId2 = agentRegistry.mint(coAgent2);
 
-        // Deploy governor first
-        SyndicateGovernor govImpl = new SyndicateGovernor();
-        bytes memory govInit = abi.encodeCall(
-            SyndicateGovernor.initialize,
-            (
-                ISyndicateGovernor.InitParams({
-                    owner: owner,
-                    votingPeriod: VOTING_PERIOD,
-                    executionWindow: EXECUTION_WINDOW,
-                    vetoThresholdBps: VETO_THRESHOLD_BPS,
-                    maxPerformanceFeeBps: MAX_PERF_FEE_BPS,
-                    cooldownPeriod: COOLDOWN_PERIOD,
-                    collaborationWindow: 48 hours,
-                    maxCoProposers: 5,
-                    minStrategyDuration: 1 days,
-                    maxStrategyDuration: 7 days,
-                    protocolFeeBps: 0,
-                    protocolFeeRecipient: address(0),
-                    guardianFeeBps: 0,
-                    guardiansFeeRecipient: address(0)
-                }),
-                address(guardianRegistry)
-            )
-        );
-        governor = SyndicateGovernor(address(new ERC1967Proxy(address(govImpl), govInit)));
-
-        // Deploy vault with governor set
+        // Deploy the vault first — the per-vault governor is initialized with the
+        // vault address, so the vault proxy must exist before the governor.
         SyndicateVault vaultImpl = new SyndicateVault();
         bytes memory vaultInit = abi.encodeCall(
             SyndicateVault.initialize,
@@ -97,15 +73,39 @@ contract CollaborativeProposalsTest is Test {
         );
         vault = SyndicateVault(payable(address(new ERC1967Proxy(address(vaultImpl), vaultInit))));
 
-        // Mock factory.governor() on the test contract (which is the deployer / factory stand-in)
-        vm.mockCall(address(this), abi.encodeWithSignature("governor()"), abi.encode(address(governor)));
+        // Deploy the per-vault governor bound to this vault.
+        SyndicateGovernor govImpl = new SyndicateGovernor();
+        bytes memory govInit = abi.encodeCall(
+            SyndicateGovernor.initialize,
+            (
+                address(vault), // vault_: this test's vault (per-vault governor)
+                address(guardianRegistry),
+                address(new ProtocolConfig(owner)),
+                address(this), // factory (test contract)
+                ISyndicateGovernor.GovernorParams({
+                    votingPeriod: VOTING_PERIOD,
+                    executionWindow: EXECUTION_WINDOW,
+                    vetoThresholdBps: VETO_THRESHOLD_BPS,
+                    maxPerformanceFeeBps: MAX_PERF_FEE_BPS,
+                    cooldownPeriod: COOLDOWN_PERIOD,
+                    collaborationWindow: 48 hours,
+                    maxCoProposers: 5,
+                    minStrategyDuration: 1 days,
+                    maxStrategyDuration: 7 days
+                })
+            )
+        );
+        governor = SyndicateGovernor(address(new ERC1967Proxy(address(govImpl), govInit)));
+
+        // The vault resolves its governor via factory.governorOf(vault); this test
+        // contract is the vault's factory, so mock the lookup.
+        vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
 
         // Register agents
         vm.startPrank(owner);
         vault.registerAgent(leadNftId, leadAgent);
         vault.registerAgent(coNftId1, coAgent1);
         vault.registerAgent(coNftId2, coAgent2);
-        governor.addVault(address(vault));
         vm.stopPrank();
 
         // Fund LPs

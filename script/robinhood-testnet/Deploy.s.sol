@@ -8,8 +8,10 @@ import {SyndicateVault} from "../../src/SyndicateVault.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {SyndicateFactory} from "../../src/SyndicateFactory.sol";
 import {SyndicateGovernor} from "../../src/SyndicateGovernor.sol";
+import {GovernorBeacon} from "../../src/GovernorBeacon.sol";
 import {GuardianRegistry} from "../../src/GuardianRegistry.sol";
 import {StakedWood} from "../../src/StakedWood.sol";
+import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 import {ScriptBase} from "../ScriptBase.sol";
 
@@ -54,35 +56,23 @@ contract DeployRobinhoodTestnet is ScriptBase {
         //    the sole WOOD custodian, deployed before the registry; the
         //    registry↔sWOOD circular dependency is resolved by `setRegistry`.
         uint256 baseNonce = vm.getNonce(deployer);
-        address predictedSwoodProxy = vm.computeCreateAddress(deployer, baseNonce + 3);
-        address predictedRegistryProxy = vm.computeCreateAddress(deployer, baseNonce + 5);
-        address predictedFactoryProxy = vm.computeCreateAddress(deployer, baseNonce + 7);
+        // ProtocolConfig at +0, govImpl +1, govProxy +2, swoodImpl +3, swoodProxy +4,
+        // registryImpl +5, registryProxy +6, factoryImpl +7, factoryProxy +8.
+        address predictedSwoodProxy = vm.computeCreateAddress(deployer, baseNonce + 4);
+        address predictedRegistryProxy = vm.computeCreateAddress(deployer, baseNonce + 6);
+        address predictedFactoryProxy = vm.computeCreateAddress(deployer, baseNonce + 8);
+
+        // 3a. Deploy ProtocolConfig (plain Ownable)
+        ProtocolConfig protocolConfig = new ProtocolConfig(deployer);
+        protocolConfig.setProtocolFeeRecipient(deployer);
+        protocolConfig.setProtocolFeeBps(200);
 
         SyndicateGovernor govImpl = new SyndicateGovernor();
-        bytes memory govInitData = abi.encodeCall(
-            SyndicateGovernor.initialize,
-            (
-                ISyndicateGovernor.InitParams({
-                    owner: deployer,
-                    votingPeriod: 1 hours,
-                    executionWindow: 1 days,
-                    vetoThresholdBps: 4000,
-                    maxPerformanceFeeBps: 3000,
-                    cooldownPeriod: 1 hours,
-                    collaborationWindow: 48 hours,
-                    maxCoProposers: 5,
-                    minStrategyDuration: 1 hours,
-                    maxStrategyDuration: 7 days,
-                    protocolFeeBps: 200,
-                    protocolFeeRecipient: deployer,
-                    guardianFeeBps: 0,
-                    guardiansFeeRecipient: address(0)
-                }),
-                predictedRegistryProxy
-            )
-        );
-        address governorProxy = address(new ERC1967Proxy(address(govImpl), govInitData));
-        console.log("SyndicateGovernor:", governorProxy);
+        // Per-vault governor: deploy a GovernorBeacon over the impl (nonce+2,
+        // preserving the CREATE-nonce address predictions below). Per-vault
+        // governor proxies are cloned by the factory at createSyndicate.
+        address beacon = address(new GovernorBeacon(address(govImpl), deployer));
+        console.log("GovernorBeacon:", beacon);
 
         // 3b. Deploy StakedWood (sWOOD) — the sole WOOD custodian.
         address woodToken = vm.envOr("WOOD_TOKEN", address(0x1));
@@ -92,7 +82,6 @@ contract DeployRobinhoodTestnet is ScriptBase {
             (StakedWood.InitParams({
                     owner: deployer,
                     wood: woodToken,
-                    governor: governorProxy,
                     factory: predictedFactoryProxy,
                     minGuardianStake: 10_000e18,
                     coolDownPeriod: 7 days,
@@ -107,9 +96,8 @@ contract DeployRobinhoodTestnet is ScriptBase {
 
         // 4. Deploy GuardianRegistry at the predicted address.
         GuardianRegistry registryImpl = new GuardianRegistry();
-        bytes memory regInitData = abi.encodeCall(
-            GuardianRegistry.initialize, (deployer, governorProxy, predictedFactoryProxy, swoodProxy, 24 hours, 3000)
-        );
+        bytes memory regInitData =
+            abi.encodeCall(GuardianRegistry.initialize, (deployer, predictedFactoryProxy, swoodProxy, 24 hours, 3000));
         address registryProxy = address(new ERC1967Proxy(address(registryImpl), regInitData));
         require(registryProxy == predictedRegistryProxy, "registry addr mismatch");
         console.log("GuardianRegistry:", registryProxy);
@@ -127,7 +115,8 @@ contract DeployRobinhoodTestnet is ScriptBase {
                     vaultImpl: address(vaultImpl),
                     ensRegistrar: L2_REGISTRAR,
                     agentRegistry: AGENT_REGISTRY,
-                    governor: governorProxy,
+                    beacon: beacon,
+                    protocolConfig: address(protocolConfig),
                     managementFeeBps: 50,
                     guardianRegistry: registryProxy
                 }))
@@ -136,20 +125,20 @@ contract DeployRobinhoodTestnet is ScriptBase {
         require(address(factory) == predictedFactoryProxy, "factory addr mismatch");
         console.log("SyndicateFactory:", address(factory));
 
-        // 6. Register factory on governor. Setters apply immediately.
-        //    Guardian fee recipient pinned at init — no separate wiring.
-        SyndicateGovernor(governorProxy).setFactory(address(factory));
-        console.log("Governor.setFactory applied:", address(factory));
+        // 6. Per-vault governors are deployed by the factory at createSyndicate
+        //    and authorized on the registry via addGovernor — no singleton wiring.
 
         vm.stopBroadcast();
 
         // ── Validate on-chain state matches expected values ──
-        _validate(deployer, governorProxy, address(factory), address(executorLib), address(vaultImpl));
+        _validate(deployer, beacon, address(factory), address(executorLib), address(vaultImpl));
 
         // ── Persist addresses to chains/{chainId}.json ──
         _writeAddresses(
-            "Robinhood L2 Testnet", deployer, address(factory), governorProxy, address(executorLib), address(vaultImpl)
+            "Robinhood L2 Testnet", deployer, address(factory), address(0), address(executorLib), address(vaultImpl)
         );
+        _patchAddress("GOVERNOR_BEACON", beacon);
+        _patchAddress("PROTOCOL_CONFIG", address(protocolConfig));
         _patchAddress("GUARDIAN_REGISTRY", registryProxy);
         _patchAddress("STAKED_WOOD", swoodProxy);
 
@@ -186,12 +175,11 @@ contract DeployRobinhoodTestnet is ScriptBase {
         _checkUint("gov.minStrategyDuration", p.minStrategyDuration, 1 hours);
         // Note: Robinhood uses 7 days max (not 30 days like Base)
         _checkUint("gov.maxStrategyDuration", p.maxStrategyDuration, 7 days);
-        _checkUint("gov.protocolFeeBps", governor.protocolFeeBps(), 200);
-        _checkAddr("gov.protocolFeeRecipient", governor.protocolFeeRecipient(), deployer);
+        // protocolFeeBps / protocolFeeRecipient moved to ProtocolConfig.
 
         // ── Factory ──
         _checkAddr("factory.owner", Ownable(factoryAddr).owner(), deployer);
-        _checkAddr("factory.governor", factory.governor(), governorAddr);
+        _checkAddr("factory.beacon", factory.beacon(), governorAddr);
         _checkAddr("factory.executorImpl", factory.executorImpl(), executorLibAddr);
         _checkAddr("factory.vaultImpl", factory.vaultImpl(), vaultImplAddr);
         // No ENS or agent registry on Robinhood L2 — expect address(0)

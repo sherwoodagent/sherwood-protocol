@@ -25,12 +25,12 @@ contract MinimalGuardianRegistryTest is Test {
     }
 
     function test_resolveReview_returnsNotBlocked() public view {
-        assertFalse(registry.resolveReview(1));
-        assertFalse(registry.resolveReview(type(uint256).max));
+        assertFalse(registry.resolveReview(address(1), 1));
+        assertFalse(registry.resolveReview(address(1), type(uint256).max));
     }
 
     function test_getReviewState_preResolvedNotBlocked() public view {
-        (bool opened, bool resolved, bool blocked, bool cohortTooSmall) = registry.getReviewState(1);
+        (bool opened, bool resolved, bool blocked, bool cohortTooSmall) = registry.getReviewState(address(1), 1);
         assertTrue(opened, "stub reports opened so view paths skip cold-start branch");
         assertTrue(resolved, "stub reports resolved so _resolveAfterVote skips waiting");
         assertFalse(blocked, "blocked=false so vote outcome sticks");
@@ -38,18 +38,18 @@ contract MinimalGuardianRegistryTest is Test {
     }
 
     function test_isEmergencyOpen_alwaysFalse() public view {
-        assertFalse(registry.isEmergencyOpen(0));
-        assertFalse(registry.isEmergencyOpen(42));
+        assertFalse(registry.isEmergencyOpen(address(1), 0));
+        assertFalse(registry.isEmergencyOpen(address(1), 42));
     }
 
     // ──────────────────────── governor-side no-ops ────────────────────────
 
     function test_openReview_isNoOp() public {
         // Should not revert; should not change any observable state.
-        registry.openReview(1);
-        registry.openReview(2);
+        registry.openReview(address(1), 1);
+        registry.openReview(address(1), 2);
         // Re-querying still returns the stub default.
-        (bool opened,,,) = registry.getReviewState(1);
+        (bool opened,,,) = registry.getReviewState(address(1), 1);
         assertTrue(opened);
     }
 

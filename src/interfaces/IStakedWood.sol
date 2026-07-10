@@ -114,7 +114,7 @@ interface IStakedWood {
     /// @notice Slash `approvers` by `slashBps` for a blocked proposal. Burns
     ///         each approver's own stake plus a pro-rata share of their
     ///         delegated pool. Registry-only.
-    /// @param proposalId The blocked proposal whose approvers are slashed.
+    /// @param reviewKey  Composite review key keccak256(abi.encode(governor, proposalId)) whose approvers are slashed.
     /// @param openedAt   Snapshot timestamp the review's vote-weight snapshot
     ///                   (`recordVoteStake`) was captured at. Used by
     ///                   `_slashOne` to recover each approver's pure-own-stake
@@ -123,7 +123,7 @@ interface IStakedWood {
     ///                   weight (Sherlock run #3 #6).
     /// @param approvers  Plain `address[]` of approver addresses to slash.
     /// @param slashBps   Slash fraction in basis points.
-    function slashGuardians(uint256 proposalId, uint256 openedAt, address[] calldata approvers, uint256 slashBps)
+    function slashGuardians(bytes32 reviewKey, uint256 openedAt, address[] calldata approvers, uint256 slashBps)
         external;
 
     /// @notice Burn the owner bond bound to `vault` (emergency-settle failure).
@@ -133,7 +133,7 @@ interface IStakedWood {
     /// @notice Snapshot a voter's vote weight for a proposal so a later
     ///         `slashGuardians` can slash the exact amount voted with.
     ///         Registry-only.
-    function recordVoteStake(uint256 proposalId, address voter, uint128 weight) external;
+    function recordVoteStake(bytes32 reviewKey, address voter, uint128 weight) external;
 
     // ── Admin (owner-instant; owner is a multisig with external delay) ──
     function setMinGuardianStake(uint256 newMin) external;

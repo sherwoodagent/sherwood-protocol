@@ -454,7 +454,7 @@ contract HyperliquidPerpStrategy is BaseStrategy {
 
         if (msg.sender != proposer()) {
             ISyndicateGovernor gov = ISyndicateGovernor(ISyndicateVault(vault()).governor());
-            uint256 pid = gov.getActiveProposal(vault());
+            uint256 pid = gov.getActiveProposal();
             ISyndicateGovernor.StrategyProposal memory p = gov.getProposal(pid);
             if (block.timestamp < p.executedAt + p.strategyDuration) revert NotAuthorized();
         }

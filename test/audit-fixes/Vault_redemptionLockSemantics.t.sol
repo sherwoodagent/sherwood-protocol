@@ -59,7 +59,7 @@ contract VaultRedemptionLockSemanticsTest is Test {
         vault = SyndicateVault(payable(address(proxy)));
 
         // factory.governor() returns the mock governor address.
-        vm.mockCall(address(this), abi.encodeWithSignature("governor()"), abi.encode(MOCK_GOVERNOR));
+        vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(MOCK_GOVERNOR));
         // Lane A off (no PriceRouter) — exercises the async (Lane B) lock behavior.
         vm.mockCall(address(this), abi.encodeWithSignature("priceRouter()"), abi.encode(address(0)));
         // Default: no active proposal anywhere — deposits/withdraws unlocked.
@@ -82,10 +82,8 @@ contract VaultRedemptionLockSemanticsTest is Test {
 
     function _mockStateWithStrategy(bool active, uint256 openCount, address strategy) internal {
         uint256 pid = active ? uint256(1) : uint256(0);
-        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal(address)"), abi.encode(pid));
-        vm.mockCall(
-            MOCK_GOVERNOR, abi.encodeWithSignature("openProposalCount(address)", address(vault)), abi.encode(openCount)
-        );
+        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal()"), abi.encode(pid));
+        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("openProposalCount()"), abi.encode(openCount));
         if (active) {
             ISyndicateGovernor.StrategyProposal memory p;
             p.id = pid;

@@ -57,22 +57,21 @@ contract VaultStrategyHooksTest is Test {
         ERC1967Proxy proxy = new ERC1967Proxy(address(impl), initData);
         vault = SyndicateVault(payable(address(proxy)));
 
-        // Test contract is the factory; wire governor() and priceRouter() via mockCall.
-        vm.mockCall(address(this), abi.encodeWithSignature("governor()"), abi.encode(address(mockGov)));
+        // Test contract is the factory; the vault resolves its per-vault governor
+        // via factory.governorOf(address(this)) (#421). Wire that + priceRouter().
+        vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(mockGov)));
         vm.mockCall(address(this), abi.encodeWithSignature("priceRouter()"), abi.encode(address(0)));
 
         // Default: no active proposal (unlocked), to satisfy the deposit/withdraw gates.
-        vm.mockCall(address(mockGov), abi.encodeWithSignature("getActiveProposal(address)"), abi.encode(uint256(0)));
+        vm.mockCall(address(mockGov), abi.encodeWithSignature("getActiveProposal()"), abi.encode(uint256(0)));
         vm.mockCall(address(mockGov), abi.encodeWithSignature("openProposalCount(address)"), abi.encode(uint256(0)));
 
         // Now wire an active proposal so _activeStrategy() returns activeStrategy.
         mockGov.setActiveProposal(address(vault), PID);
         mockGov.setStrategy(PID, activeStrategy);
 
-        // Override the blanket mockCall for getActiveProposal to return PID for this vault.
-        vm.mockCall(
-            address(mockGov), abi.encodeWithSignature("getActiveProposal(address)", address(vault)), abi.encode(PID)
-        );
+        // Override the blanket mockCall for getActiveProposal to return PID.
+        vm.mockCall(address(mockGov), abi.encodeWithSignature("getActiveProposal()"), abi.encode(PID));
     }
 
     // ── Test 1: strategyMint reverts for a non-strategy caller ──

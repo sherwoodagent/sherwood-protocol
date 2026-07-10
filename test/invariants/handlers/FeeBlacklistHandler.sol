@@ -162,11 +162,11 @@ contract FeeBlacklistHandler is Test {
         lifecycleAttempts += 1;
 
         // Cooldown gate — skip if the previous settle is too recent.
-        if (governor.openProposalCount(address(vault)) != 0) return;
+        if (governor.openProposalCount() != 0) return;
         // Read live block.timestamp at every site; via_ir reorders these
         // around vm.warp.
         uint256 nowTs = vm.getBlockTimestamp();
-        uint256 readyAt = governor.getCooldownEnd(address(vault));
+        uint256 readyAt = governor.getCooldownEnd();
         if (nowTs < readyAt) {
             vm.warp(readyAt + 1);
         }

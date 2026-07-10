@@ -140,7 +140,8 @@ contract LeveragedAeroCLE2EFork is LeveragedAeroForkBase {
         vm.prank(address(deployScript));
         DeploySherwood.Deployed memory d = deployScript.deployCore(cfg);
 
-        governor = SyndicateGovernor(d.governorProxy);
+        // Per-vault governors (#421): no singleton governor exists at deploy.
+        // `governor` is resolved from the vault after createSyndicate below.
         factory = SyndicateFactory(d.factoryProxy);
         deployer = d.deployer;
     }
@@ -159,6 +160,8 @@ contract LeveragedAeroCLE2EFork is LeveragedAeroForkBase {
         vm.prank(vaultOwner);
         (, address vaultAddr) = factory.createSyndicate(42, config);
         vault = SyndicateVault(payable(vaultAddr));
+        // Per-vault governor: resolve the vault's own governor proxy.
+        governor = SyndicateGovernor(vault.governor());
 
         vm.prank(vaultOwner);
         vault.registerAgent(43, agent);
@@ -220,7 +223,7 @@ contract LeveragedAeroCLE2EFork is LeveragedAeroForkBase {
         _proposeVoteExecute();
 
         // Execute deployed the levered book.
-        assertEq(governor.getActiveProposal(address(vault)), proposalId, "proposal not active");
+        assertEq(governor.getActiveProposal(), proposalId, "proposal not active");
         assertGt(strategy.layout().tokenId, 0, "tokenId 0 after execute");
         assertGt(ICToken(MUSDC).balanceOf(address(strategy)), 0, "no mUSDC collateral");
         assertGt(IMoonwellMarket(MCBBTC).borrowBalanceStored(address(strategy)), 0, "no cbBTC borrow");
@@ -255,7 +258,7 @@ contract LeveragedAeroCLE2EFork is LeveragedAeroForkBase {
         // Realized USDC returned to the vault.
         assertGt(IERC20(USDC).balanceOf(address(vault)), vaultUsdcBeforeSettle, "vault not refilled at settle");
         // Lock released.
-        assertEq(governor.getActiveProposal(address(vault)), 0, "active proposal not cleared");
+        assertEq(governor.getActiveProposal(), 0, "active proposal not cleared");
         assertFalse(vault.redemptionsLocked(), "vault still locked after settle");
 
         // Vault-native deposit/redeem work again.

@@ -68,6 +68,10 @@ contract GuardianHandler is Test {
 
     uint256 public currentProposalId;
 
+    /// @dev Per-proposal snapshot of approvers taken just before resolveReview.
+    ///      INV-2 uses this to verify slashed approvers had stake at resolve time.
+    mapping(uint256 => address[]) public _approversSnapshot;
+
     // Stats for debugging / logs.
     uint256 public successfulStakes;
     uint256 public successfulResolves;
@@ -264,7 +268,7 @@ contract GuardianHandler is Test {
         // Sherlock run #3 #6: pass openedAt=0 (handler doesn't recordVoteStake
         // with combined own+delegated weight so the snapDelegated lookup at 0
         // returns 0 and snapOwn == snapTotal — collapses to pre-#6 math).
-        try swood.slashGuardians(pid, 0, approvers, slashBps) {
+        try swood.slashGuardians(bytes32(uint256(pid)), 0, approvers, slashBps) {
             successfulSlashes += 1;
         } catch {}
     }
@@ -288,20 +292,28 @@ contract GuardianHandler is Test {
             ? IGuardianRegistry.GuardianVoteType.Approve
             : IGuardianRegistry.GuardianVoteType.Block;
         vm.prank(a);
-        try registry.voteOnProposal(pid, s, 0) {} catch {}
+        try registry.voteOnProposal(address(governor), pid, s, 0) {} catch {}
     }
 
     function openReview(uint256 proposalSeed) external {
         if (proposalIds.length == 0) return;
         uint256 pid = proposalIds[bound(proposalSeed, 0, proposalIds.length - 1)];
-        try registry.openReview(pid) {} catch {}
+        try registry.openReview(address(governor), pid) {} catch {}
     }
 
     function resolveReview(uint256 proposalSeed) external {
         if (proposalIds.length == 0) return;
         uint256 pid = proposalIds[bound(proposalSeed, 0, proposalIds.length - 1)];
 
-        try registry.resolveReview(pid) returns (bool blocked) {
+        // Snapshot approvers BEFORE the registry zeroes their stake on a
+        // blocked resolve (INV-2 needs to see the slashed set).
+        (bool opened, bool alreadyResolved,, bool cohortTooSmall) = registry.getReviewState(address(governor), pid);
+        if (opened && !alreadyResolved && !cohortTooSmall) {
+            address[] memory snapshot = _snapshotApprovers(pid);
+            _approversSnapshot[pid] = snapshot;
+        }
+
+        try registry.resolveReview(address(governor), pid) returns (bool blocked) {
             successfulResolves += 1;
             if (blocked) blockedProposalIds.push(pid);
         } catch {}
@@ -370,5 +382,16 @@ contract GuardianHandler is Test {
 
     function actorCount() external view returns (uint256) {
         return actors.length;
+    }
+
+    /// @dev Returns the approver list for a proposal by reading the registry's
+    ///      `getApproverWeights` view. Used to snapshot before resolve.
+    function _snapshotApprovers(uint256 pid) internal view returns (address[] memory) {
+        (address[] memory approvers,,) = registry.getApproverWeights(address(governor), pid);
+        return approvers;
+    }
+
+    function getApproversSnapshot(uint256 pid) external view returns (address[] memory) {
+        return _approversSnapshot[pid];
     }
 }

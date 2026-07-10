@@ -13,6 +13,7 @@ import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 import {MockStrategyAdapter} from "../mocks/MockStrategyAdapter.sol";
+import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 
 /// @title GovernorStrategyOnProposalTest
 /// @notice Coverage for the strategy-on-proposal model: the proposer passes
@@ -73,8 +74,11 @@ contract GovernorStrategyOnProposalTest is Test {
         bytes memory govInit = abi.encodeCall(
             SyndicateGovernor.initialize,
             (
-                ISyndicateGovernor.InitParams({
-                    owner: owner,
+                address(vault), // vault_: this test's vault (per-vault governor)
+                address(guardianRegistry),
+                address(new ProtocolConfig(owner)),
+                address(this), // factory (test contract)
+                ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,
                     vetoThresholdBps: VETO_THRESHOLD_BPS,
@@ -83,21 +87,13 @@ contract GovernorStrategyOnProposalTest is Test {
                     collaborationWindow: 48 hours,
                     maxCoProposers: 5,
                     minStrategyDuration: 1 hours,
-                    maxStrategyDuration: MAX_STRATEGY_DURATION,
-                    protocolFeeBps: 100,
-                    protocolFeeRecipient: owner,
-                    guardianFeeBps: 0,
-                    guardiansFeeRecipient: address(0)
-                }),
-                address(guardianRegistry)
+                    maxStrategyDuration: MAX_STRATEGY_DURATION
+                })
             )
         );
         governor = SyndicateGovernor(address(new ERC1967Proxy(address(govImpl), govInit)));
 
-        vm.mockCall(address(this), abi.encodeWithSignature("governor()"), abi.encode(address(governor)));
-
-        vm.prank(owner);
-        governor.addVault(address(vault));
+        vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
 
         usdc.mint(lp1, 100_000e6);
         usdc.mint(lp2, 100_000e6);

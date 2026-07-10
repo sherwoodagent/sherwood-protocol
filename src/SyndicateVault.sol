@@ -401,7 +401,7 @@ contract SyndicateVault is
 
     /// @dev Read governor address from factory
     function _getGovernor() internal view returns (address) {
-        return ISyndicateFactory(_factory).governor();
+        return ISyndicateFactory(_factory).governorOf(address(this));
     }
 
     /// @dev Active proposal id binding this vault, read through the governor (0
@@ -409,7 +409,7 @@ contract SyndicateVault is
     ///      paths. Distinct from `redemptionsLocked` / `_activeStrategy`, which
     ///      additionally guard a zero governor — those keep their own reads.
     function _activePid() private view returns (uint256) {
-        return ISyndicateGovernor(_getGovernor()).getActiveProposal(address(this));
+        return ISyndicateGovernor(_getGovernor()).getActiveProposal();
     }
 
     /// @inheritdoc ISyndicateVault
@@ -458,13 +458,18 @@ contract SyndicateVault is
     }
 
     /// @inheritdoc ISyndicateVault
+    function owner() public view override(OwnableUpgradeable, ISyndicateVault) returns (address) {
+        return super.owner();
+    }
+
+    /// @inheritdoc ISyndicateVault
     /// @dev Fail-closed on missing governor: if the factory is misconfigured
     ///      and `governor() == address(0)`, deposits / withdrawals / rescues
     ///      must NOT silently unlock. Revert instead.
     function redemptionsLocked() public view returns (bool) {
         address gov = _getGovernor();
         if (gov == address(0)) revert GovernorNotSet();
-        return ISyndicateGovernor(gov).getActiveProposal(address(this)) != 0;
+        return ISyndicateGovernor(gov).getActiveProposal() != 0;
     }
 
     /// @inheritdoc ISyndicateVault
@@ -484,7 +489,7 @@ contract SyndicateVault is
     function _activeStrategy() internal view returns (address) {
         address gov = _getGovernor();
         if (gov == address(0)) return address(0);
-        uint256 pid = ISyndicateGovernor(gov).getActiveProposal(address(this));
+        uint256 pid = ISyndicateGovernor(gov).getActiveProposal();
         if (pid == 0) return address(0);
         try ISyndicateGovernor(gov).getProposal(pid) returns (ISyndicateGovernor.StrategyProposal memory p) {
             return p.strategy;
@@ -586,7 +591,7 @@ contract SyndicateVault is
     ///      strategy by `executeProposal`. Off-chain readers can call
     ///      `governor.openProposalCount(vault)` directly.
     function _depositsLocked() private view returns (bool) {
-        return ISyndicateGovernor(_getGovernor()).openProposalCount(address(this)) != 0;
+        return ISyndicateGovernor(_getGovernor()).openProposalCount() != 0;
     }
 
     /// @dev Protocol PriceRouter (Lane A live-NAV), read live from the factory.
@@ -682,7 +687,7 @@ contract SyndicateVault is
     ///      action is disabled). Active-proposal / whitelist cases stay reported
     ///      as `type(uint256).max` here (adding those checks busts EIP-170 and
     ///      under-reports valid Lane A deposit flows); frontends poll
-    ///      `governor.getActiveProposal(vault)` + `isApprovedDepositor` directly.
+    ///      the per-vault governor's `getActiveProposal()` + `isApprovedDepositor` directly.
     function maxDeposit(address) public view override returns (uint256) {
         if (paused()) return 0;
         return type(uint256).max;

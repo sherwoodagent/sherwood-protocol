@@ -52,7 +52,6 @@ contract GuardianInvariantsTest is StdInvariant, Test {
             (StakedWood.InitParams({
                     owner: owner,
                     wood: address(wood),
-                    governor: address(governor),
                     factory: factory,
                     minGuardianStake: MIN_GUARDIAN_STAKE,
                     coolDownPeriod: COOL_DOWN,
@@ -65,8 +64,7 @@ contract GuardianInvariantsTest is StdInvariant, Test {
 
         GuardianRegistry impl = new GuardianRegistry();
         bytes memory initData = abi.encodeCall(
-            GuardianRegistry.initialize,
-            (owner, address(governor), factory, address(swood), REVIEW_PERIOD, BLOCK_QUORUM_BPS)
+            GuardianRegistry.initialize, (owner, factory, address(swood), REVIEW_PERIOD, BLOCK_QUORUM_BPS)
         );
         registry = GuardianRegistry(address(new ERC1967Proxy(address(impl), initData)));
 
@@ -242,7 +240,7 @@ contract GuardianInvariantsTest is StdInvariant, Test {
     function invariant_blockedImpliesEpochAccounting() public view {
         uint256[] memory bids = handler.getBlockedProposalIds();
         for (uint256 i = 0; i < bids.length; i++) {
-            (, bool resolved, bool blocked, bool cohortTooSmall) = registry.getReviewState(bids[i]);
+            (, bool resolved, bool blocked, bool cohortTooSmall) = registry.getReviewState(address(governor), bids[i]);
             if (!resolved || !blocked || cohortTooSmall) continue;
             assertTrue(resolved, "INV-2: resolved flag missing for blocked proposal");
             assertTrue(blocked, "INV-2: blocked flag missing after resolveReview returned true");

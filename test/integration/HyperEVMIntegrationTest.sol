@@ -117,7 +117,8 @@ abstract contract HyperEVMIntegrationTest is Test {
         vm.prank(address(deployScript));
         DeploySherwood.Deployed memory d = deployScript.deployCore(cfg);
 
-        governor = SyndicateGovernor(d.governorProxy);
+        // Per-vault governor: `governor` is resolved from the factory after a
+        // vault is created (see `_createSyndicate`); there is no singleton.
         factory = SyndicateFactory(d.factoryProxy);
         registry = GuardianRegistry(d.registryProxy);
         swood = StakedWood(d.swoodProxy);
@@ -162,6 +163,7 @@ abstract contract HyperEVMIntegrationTest is Test {
         vm.prank(owner);
         (, address vaultAddr) = factory.createSyndicate(agentNftId, config);
         SyndicateVault v = SyndicateVault(payable(vaultAddr));
+        governor = SyndicateGovernor(factory.governorOf(vaultAddr));
 
         vm.prank(owner);
         v.registerAgent(43, agent);
@@ -219,14 +221,14 @@ abstract contract HyperEVMIntegrationTest is Test {
         vm.warp(block.timestamp + params.votingPeriod + 1);
 
         // Open guardian review (permissionless)
-        registry.openReview(proposalId);
+        registry.openReview(address(governor), proposalId);
 
         // Warp past review period
         uint256 reviewPeriod = registry.reviewPeriod();
         vm.warp(block.timestamp + reviewPeriod + 1);
 
         // Resolve review (cohortTooSmall short-circuit if no guardians staked)
-        registry.resolveReview(proposalId);
+        registry.resolveReview(address(governor), proposalId);
 
         // Now executable
         governor.executeProposal(proposalId);

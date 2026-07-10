@@ -130,7 +130,8 @@ abstract contract RobinhoodMainnetIntegrationTest is Test {
         vm.prank(address(deployScript));
         DeploySherwood.Deployed memory d = deployScript.deployCore(cfg);
 
-        governor = SyndicateGovernor(d.governorProxy);
+        // `governor` is per-vault — bound in `_createSyndicate` once the factory
+        // has minted this vault's BeaconProxy governor.
         factory = SyndicateFactory(d.factoryProxy);
         registry = GuardianRegistry(d.registryProxy);
         swood = StakedWood(d.swoodProxy);
@@ -160,6 +161,7 @@ abstract contract RobinhoodMainnetIntegrationTest is Test {
         vm.prank(owner);
         (, address vaultAddr) = factory.createSyndicate(agentNftId, config);
         vault = SyndicateVault(payable(vaultAddr));
+        governor = SyndicateGovernor(factory.governorOf(vaultAddr));
 
         vm.prank(owner);
         vault.registerAgent(43, agent);
@@ -218,10 +220,10 @@ abstract contract RobinhoodMainnetIntegrationTest is Test {
         ISyndicateGovernor.GovernorParams memory params = governor.getGovernorParams();
         vm.warp(vm.getBlockTimestamp() + params.votingPeriod + 1);
 
-        registry.openReview(proposalId);
+        registry.openReview(address(governor), proposalId);
         uint256 reviewPeriod = registry.reviewPeriod();
         vm.warp(vm.getBlockTimestamp() + reviewPeriod + 1);
-        registry.resolveReview(proposalId);
+        registry.resolveReview(address(governor), proposalId);
 
         governor.executeProposal(proposalId);
     }

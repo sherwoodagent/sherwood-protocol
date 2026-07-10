@@ -145,7 +145,7 @@ contract MoonwellSupplyIntegrationTest is BaseIntegrationTest {
         governor.settleProposal(proposalId);
 
         // Wait for cooldown to elapse
-        uint256 cooldownEnd = governor.getCooldownEnd(address(vault));
+        uint256 cooldownEnd = governor.getCooldownEnd();
         vm.warp(cooldownEnd + 1);
 
         // Withdrawals should work now

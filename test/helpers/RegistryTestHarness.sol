@@ -40,7 +40,6 @@ abstract contract RegistryTestHarness is Test {
             (StakedWood.InitParams({
                     owner: regOwner,
                     wood: address(wood),
-                    governor: address(governor),
                     factory: regFactory,
                     minGuardianStake: 10_000e18,
                     coolDownPeriod: 7 days,
@@ -53,14 +52,18 @@ abstract contract RegistryTestHarness is Test {
 
         GuardianRegistry regImpl = new GuardianRegistry();
         bytes memory regInit = abi.encodeCall(
-            GuardianRegistry.initialize,
-            (regOwner, address(governor), regFactory, address(swood), reviewPeriod, blockQuorumBps)
+            GuardianRegistry.initialize, (regOwner, regFactory, address(swood), reviewPeriod, blockQuorumBps)
         );
         registry = GuardianRegistry(address(new ERC1967Proxy(address(regImpl), regInit)));
 
         // Resolve the registry ↔ sWOOD circular dependency.
         vm.prank(regOwner);
         swood.setRegistry(address(registry));
+
+        // Authorize the mock governor on the composite-key registry (the factory
+        // does this in production via createSyndicate).
+        vm.prank(regFactory);
+        registry.addGovernor(address(governor));
     }
 
     /// @dev Mints WOOD to `g`, approves sWOOD, and stakes `amount` as a

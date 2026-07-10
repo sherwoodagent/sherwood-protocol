@@ -59,11 +59,9 @@ contract AsyncRedeemHandler is Test {
     }
 
     function _mockLock(bool l, uint256 pid) internal {
+        vm.mockCall(mockGovernor, abi.encodeWithSignature("getActiveProposal()"), abi.encode(l ? pid : uint256(0)));
         vm.mockCall(
-            mockGovernor, abi.encodeWithSignature("getActiveProposal(address)"), abi.encode(l ? pid : uint256(0))
-        );
-        vm.mockCall(
-            mockGovernor, abi.encodeWithSignature("openProposalCount(address)"), abi.encode(l ? uint256(1) : uint256(0))
+            mockGovernor, abi.encodeWithSignature("openProposalCount()"), abi.encode(l ? uint256(1) : uint256(0))
         );
     }
 

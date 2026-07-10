@@ -14,6 +14,9 @@ import {GuardianRegistry} from "../src/GuardianRegistry.sol";
 import {StakedWood} from "../src/StakedWood.sol";
 import {MinimalGuardianRegistry} from "../src/MinimalGuardianRegistry.sol";
 import {ISyndicateGovernor} from "../src/interfaces/ISyndicateGovernor.sol";
+import {ProtocolConfig} from "../src/ProtocolConfig.sol";
+import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import {GovernorBeacon} from "../src/GovernorBeacon.sol";
 import {ScriptBase} from "./ScriptBase.sol";
 
 /**
@@ -106,7 +109,8 @@ contract DeploySherwood is ScriptBase {
         address deployer;
         address executorLib;
         address vaultImpl;
-        address governorProxy;
+        address beacon; // GovernorBeacon — per-vault governor proxies read impl from here
+        address protocolConfig; // global fee config; each governor snapshots from it
         address factoryProxy;
         address registryProxy;
         address swoodProxy;
@@ -147,10 +151,9 @@ contract DeploySherwood is ScriptBase {
         console.log("Chain ID:", block.chainid);
         console.log("BatchExecutorLib:", d.executorLib);
         console.log("VaultImpl:", d.vaultImpl);
-        console.log("GovernorProxy:", d.governorProxy);
+        console.log("GovernorBeacon:", d.beacon);
         console.log("GuardianRegistryProxy:", d.registryProxy);
         console.log("FactoryProxy:", d.factoryProxy);
-        console.log("Governor.setFactory applied");
 
         // Seed slash appeal reserve + epoch 0 rewards (prod only — beta uses a
         // stub registry with no `fundSlashAppealReserve`). Best-effort: skipped
@@ -164,17 +167,24 @@ contract DeploySherwood is ScriptBase {
         // Beta keeps the deployer as protocol owner (no multisig yet).
         address effectiveOwner = d.deployer;
         if (!skipHandoff) {
-            _handoffOwnership(d.governorProxy, d.factoryProxy, d.registryProxy, d.swoodProxy, ownerMultisig);
+            _handoffOwnership(d.beacon, d.factoryProxy, d.registryProxy, d.swoodProxy, d.protocolConfig, ownerMultisig);
             effectiveOwner = ownerMultisig;
         }
 
         vm.stopBroadcast();
 
         // ── Validate ──
-        _validateGovernor(effectiveOwner, d.deployer, d.governorProxy, d.factoryProxy, cfg);
+        _validateBeacon(effectiveOwner, d.beacon);
+        // C1: after handoff, ProtocolConfig ownership is PENDING the multisig
+        // (Ownable2Step) — assert the two-step transfer was initiated so a
+        // deployer that forgot the acceptOwnership runbook step is caught.
+        if (!skipHandoff) {
+            _checkAddr("protocolConfig.pendingOwner", Ownable2Step(d.protocolConfig).pendingOwner(), ownerMultisig);
+        }
         _validateFactory(
             effectiveOwner,
-            d.governorProxy,
+            d.beacon,
+            d.protocolConfig,
             d.factoryProxy,
             d.executorLib,
             d.vaultImpl,
@@ -183,11 +193,17 @@ contract DeploySherwood is ScriptBase {
             cfg.managementFeeBps
         );
         if (!cfg.betaMode) {
-            _validateRegistry(effectiveOwner, d.registryProxy, d.governorProxy, d.factoryProxy, cfg.woodToken);
+            _validateRegistry(effectiveOwner, d.registryProxy, d.factoryProxy, cfg.woodToken);
         }
 
         // ── Persist ──
-        _writeAddresses(_chainName(), d.deployer, d.factoryProxy, d.governorProxy, d.executorLib, d.vaultImpl);
+        // Per-vault governor: there is NO singleton governor — zero the
+        // SYNDICATE_GOVERNOR slot (a beacon address there would make admin
+        // scripts revert calling governor ABIs on it) and persist the beacon +
+        // ProtocolConfig under explicit keys.
+        _writeAddresses(_chainName(), d.deployer, d.factoryProxy, address(0), d.executorLib, d.vaultImpl);
+        _patchAddress("GOVERNOR_BEACON", d.beacon);
+        _patchAddress("PROTOCOL_CONFIG", d.protocolConfig);
         _patchAddress("GUARDIAN_REGISTRY", d.registryProxy);
         // sWOOD is the sole WOOD custodian — persist it for the CLI / admin
         // scripts. Beta mode uses a stub registry and never deploys sWOOD, so
@@ -229,21 +245,31 @@ contract DeploySherwood is ScriptBase {
             registryAddr = c3.addressOf(SALT_REGISTRY_PROXY);
         }
 
-        address govImpl = c3.deploy(SALT_GOVERNOR_IMPL, abi.encodePacked(type(SyndicateGovernor).creationCode));
-        d.governorProxy = _deployGovernorProxy(c3, govImpl, d.deployer, registryAddr, cfg);
-
         address predictedFactoryProxy = c3.addressOf(SALT_FACTORY_PROXY);
+
+        // Deploy ProtocolConfig (plain Ownable — no proxy needed).
+        ProtocolConfig protocolConfig = new ProtocolConfig(d.deployer);
+        if (cfg.protocolFeeBps > 0) {
+            protocolConfig.setProtocolFeeRecipient(d.deployer);
+            protocolConfig.setProtocolFeeBps(cfg.protocolFeeBps);
+        }
+        d.protocolConfig = address(protocolConfig);
+
+        // Per-vault governor model: deploy the governor implementation once and
+        // wrap it in a GovernorBeacon. The factory clones a BeaconProxy per vault
+        // at `createSyndicate`; a protocol-wide governor upgrade is a single
+        // `beacon.upgradeTo(newImpl)`. No singleton governor proxy is deployed.
+        address govImpl = c3.deploy(SALT_GOVERNOR_IMPL, abi.encodePacked(type(SyndicateGovernor).creationCode));
+        d.beacon = address(new GovernorBeacon(govImpl, d.deployer));
         if (!cfg.betaMode) {
             // sWOOD is the sole WOOD custodian: deploy it before the registry
             // so the registry's `initialize` can take the sWOOD address. The
             // registry↔sWOOD circular dependency is resolved by the set-once
             // `setRegistry` call below (deploy order: sWOOD → registry → wire).
-            d.swoodProxy = _deploySwoodProxy(c3, d.deployer, d.governorProxy, predictedFactoryProxy, cfg);
+            d.swoodProxy = _deploySwoodProxy(c3, d.deployer, predictedFactoryProxy, cfg);
 
             address registryImpl = c3.deploy(SALT_REGISTRY_IMPL, abi.encodePacked(type(GuardianRegistry).creationCode));
-            d.registryProxy = _deployRegistryProxy(
-                c3, registryImpl, d.deployer, d.governorProxy, predictedFactoryProxy, d.swoodProxy
-            );
+            d.registryProxy = _deployRegistryProxy(c3, registryImpl, d.deployer, predictedFactoryProxy, d.swoodProxy);
             require(d.registryProxy == registryAddr, "registry addr mismatch");
 
             // Wire the set-once registry reference on sWOOD.
@@ -255,27 +281,21 @@ contract DeploySherwood is ScriptBase {
         address factoryImpl = c3.deploy(SALT_FACTORY_IMPL, abi.encodePacked(type(SyndicateFactory).creationCode));
         d.factoryProxy = _deployFactoryProxy(c3, factoryImpl, d, cfg);
         require(d.factoryProxy == predictedFactoryProxy, "factory addr mismatch");
-
-        SyndicateGovernor(d.governorProxy).setFactory(d.factoryProxy);
     }
 
     /// @dev Deploys the StakedWood (sWOOD) proxy via CREATE3. The governor +
     ///      factory proxy addresses are predicted (CREATE3 is address-stable),
     ///      so sWOOD can be initialized before either is deployed.
-    function _deploySwoodProxy(
-        Create3Factory c3,
-        address deployer,
-        address governorProxy,
-        address predictedFactoryProxy,
-        Config memory cfg
-    ) internal returns (address) {
+    function _deploySwoodProxy(Create3Factory c3, address deployer, address predictedFactoryProxy, Config memory cfg)
+        internal
+        returns (address)
+    {
         address swoodImpl = c3.deploy(SALT_SWOOD_IMPL, abi.encodePacked(type(StakedWood).creationCode));
         bytes memory initData = abi.encodeCall(
             StakedWood.initialize,
             (StakedWood.InitParams({
                     owner: deployer,
                     wood: cfg.woodToken,
-                    governor: governorProxy,
                     factory: predictedFactoryProxy,
                     minGuardianStake: DEFAULT_MIN_GUARDIAN_STAKE,
                     coolDownPeriod: DEFAULT_COOLDOWN,
@@ -290,40 +310,6 @@ contract DeploySherwood is ScriptBase {
             );
     }
 
-    function _deployGovernorProxy(
-        Create3Factory c3,
-        address govImpl,
-        address deployer,
-        address registryProxy,
-        Config memory cfg
-    ) internal returns (address) {
-        bytes memory initData = abi.encodeCall(
-            SyndicateGovernor.initialize,
-            (
-                ISyndicateGovernor.InitParams({
-                    owner: deployer,
-                    votingPeriod: cfg.votingPeriod,
-                    executionWindow: 1 days,
-                    vetoThresholdBps: 4000,
-                    maxPerformanceFeeBps: 1000,
-                    cooldownPeriod: cfg.betaMode ? 1 hours : 1 days,
-                    collaborationWindow: cfg.betaMode ? 24 hours : 48 hours,
-                    maxCoProposers: 5,
-                    minStrategyDuration: 1 hours,
-                    maxStrategyDuration: cfg.maxStrategyDays * 1 days,
-                    protocolFeeBps: cfg.protocolFeeBps,
-                    protocolFeeRecipient: deployer,
-                    guardianFeeBps: 0,
-                    guardiansFeeRecipient: address(0)
-                }),
-                registryProxy
-            )
-        );
-        return c3.deploy(
-            SALT_GOVERNOR_PROXY, abi.encodePacked(type(ERC1967Proxy).creationCode, abi.encode(govImpl, initData))
-        );
-    }
-
     function _deployFactoryProxy(Create3Factory c3, address factoryImpl, Deployed memory d, Config memory cfg)
         internal
         returns (address)
@@ -336,7 +322,8 @@ contract DeploySherwood is ScriptBase {
                     vaultImpl: d.vaultImpl,
                     ensRegistrar: cfg.ensRegistrar,
                     agentRegistry: cfg.agentRegistry,
-                    governor: d.governorProxy,
+                    beacon: d.beacon,
+                    protocolConfig: d.protocolConfig,
                     managementFeeBps: cfg.managementFeeBps,
                     guardianRegistry: d.registryProxy
                 }))
@@ -350,20 +337,12 @@ contract DeploySherwood is ScriptBase {
         Create3Factory c3,
         address registryImpl,
         address deployer,
-        address governorProxy,
         address predictedFactoryProxy,
         address swoodProxy
     ) internal returns (address) {
         bytes memory initData = abi.encodeCall(
             GuardianRegistry.initialize,
-            (
-                deployer,
-                governorProxy,
-                predictedFactoryProxy,
-                swoodProxy,
-                DEFAULT_REVIEW_PERIOD,
-                DEFAULT_BLOCK_QUORUM_BPS
-            )
+            (deployer, predictedFactoryProxy, swoodProxy, DEFAULT_REVIEW_PERIOD, DEFAULT_BLOCK_QUORUM_BPS)
         );
         return c3.deploy(
             SALT_REGISTRY_PROXY, abi.encodePacked(type(ERC1967Proxy).creationCode, abi.encode(registryImpl, initData))
@@ -424,6 +403,7 @@ contract DeploySherwood is ScriptBase {
         address factoryAddr,
         address registryAddr,
         address swoodProxy,
+        address protocolConfig,
         address ownerMultisig
     ) internal {
         console.log("\n=== Multisig handoff ===");
@@ -434,51 +414,29 @@ contract DeploySherwood is ScriptBase {
         if (swoodProxy != address(0)) {
             Ownable(swoodProxy).transferOwnership(ownerMultisig);
         }
-        console.log("Governor / Factory / Registry / sWOOD now owned by multisig");
+        // C1 (review): ProtocolConfig owns protocol-wide fee bps + recipients
+        // (up to 10%/5% of every vault's gross profit). It is Ownable2Step, so
+        // this starts a two-step transfer — the multisig MUST call
+        // `ProtocolConfig.acceptOwnership()` to complete it. Until then the
+        // deployer retains control; the validation below asserts pendingOwner.
+        Ownable2Step(protocolConfig).transferOwnership(ownerMultisig);
+        console.log("Governor / Factory / Registry / sWOOD -> multisig (single-step)");
+        console.log("ProtocolConfig pending -> multisig; RUNBOOK: multisig must call acceptOwnership()");
     }
 
-    function _validateGovernor(
-        address expectedOwner,
-        address deployer,
-        address governorAddr,
-        address factoryAddr,
-        Config memory cfg
-    ) internal view {
-        console.log("\n=== Validating Governor ===");
-        SyndicateGovernor governor = SyndicateGovernor(governorAddr);
-        ISyndicateGovernor.GovernorParams memory p = governor.getGovernorParams();
-
-        // Post-handoff `owner()` must match the multisig (or deployer
-        // when handoff was skipped via SKIP_MULTISIG_HANDOFF).
-        _checkAddr("gov.owner", Ownable(governorAddr).owner(), expectedOwner);
-        _checkUint("gov.votingPeriod", p.votingPeriod, cfg.votingPeriod);
-        _checkUint("gov.executionWindow", p.executionWindow, 1 days);
-        _checkUint("gov.vetoThresholdBps", p.vetoThresholdBps, 4000);
-        _checkUint("gov.maxPerformanceFeeBps", p.maxPerformanceFeeBps, 1000);
-        _checkUint("gov.cooldownPeriod", p.cooldownPeriod, cfg.betaMode ? 1 hours : 1 days);
-        _checkUint("gov.collaborationWindow", p.collaborationWindow, cfg.betaMode ? 24 hours : 48 hours);
-        _checkUint("gov.maxCoProposers", p.maxCoProposers, 5);
-        _checkUint("gov.minStrategyDuration", p.minStrategyDuration, 1 hours);
-        _checkUint("gov.maxStrategyDuration", p.maxStrategyDuration, cfg.maxStrategyDays * 1 days);
-        _checkUint("gov.protocolFeeBps", governor.protocolFeeBps(), cfg.protocolFeeBps);
-        // protocolFeeRecipient stays at deployer at init time. Out of scope
-        // for the multisig handoff (owner-only); the new multisig owner can rotate
-        // it post-handoff via `setProtocolFeeRecipient`.
-        _checkAddr("gov.protocolFeeRecipient", governor.protocolFeeRecipient(), deployer);
-        // Factory + guardian-fee recipient are set directly in step 6.
-        // Validate the live values.
-        _checkAddr("gov.factory", governor.factory(), factoryAddr);
-        // guardianFeeBps defaults to 0 at init (fee stream disabled until the
-        // multisig is ready); recipient is wired to the registry immediately
-        // so we can flip bps > 0 later with a single set call.
-        _checkUint("gov.guardianFeeBps", governor.guardianFeeBps(), 0);
-        // Recipient is pinned to `_guardianRegistry` — no separate field to
-        // validate (registry validation below asserts the pointer).
+    function _validateBeacon(address expectedOwner, address beaconAddr) internal view {
+        console.log("\n=== Validating GovernorBeacon ===");
+        // Beacon owner must be the multisig post-handoff (or deployer when
+        // handoff was skipped). Per-vault governors are deployed lazily at
+        // `createSyndicate`, so there is no singleton governor to validate here.
+        _checkAddr("beacon.owner", GovernorBeacon(beaconAddr).owner(), expectedOwner);
+        require(GovernorBeacon(beaconAddr).implementation() != address(0), "beacon impl unset");
     }
 
     function _validateFactory(
         address expectedOwner,
-        address governorAddr,
+        address beaconAddr,
+        address protocolConfigAddr,
         address factoryAddr,
         address executorLibAddr,
         address vaultImplAddr,
@@ -491,7 +449,8 @@ contract DeploySherwood is ScriptBase {
 
         // Post-handoff factory owner must be the multisig.
         _checkAddr("factory.owner", Ownable(factoryAddr).owner(), expectedOwner);
-        _checkAddr("factory.governor", factory.governor(), governorAddr);
+        _checkAddr("factory.beacon", factory.beacon(), beaconAddr);
+        _checkAddr("factory.protocolConfig", factory.protocolConfig(), protocolConfigAddr);
         _checkAddr("factory.executorImpl", factory.executorImpl(), executorLibAddr);
         _checkAddr("factory.vaultImpl", factory.vaultImpl(), vaultImplAddr);
         _checkAddr("factory.ensRegistrar", address(factory.ensRegistrar()), ensRegistrar);
@@ -501,18 +460,15 @@ contract DeploySherwood is ScriptBase {
         console.log("=== All checks passed ===");
     }
 
-    function _validateRegistry(
-        address expectedOwner,
-        address registryAddr,
-        address governorAddr,
-        address factoryAddr,
-        address wood
-    ) internal view {
+    function _validateRegistry(address expectedOwner, address registryAddr, address factoryAddr, address wood)
+        internal
+        view
+    {
         console.log("=== Validating GuardianRegistry ===");
         GuardianRegistry reg = GuardianRegistry(registryAddr);
         // Post-handoff registry owner must be the multisig.
         _checkAddr("registry.owner", Ownable(registryAddr).owner(), expectedOwner);
-        _checkAddr("registry.governor", reg.governor(), governorAddr);
+        // registry.governor removed — multi-governor set; governors added via addGovernor post-deploy.
         _checkAddr("registry.factory", reg.factory(), factoryAddr);
         // sWOOD is the sole WOOD custodian post-split — validate the registry's
         // sWOOD handle and that sWOOD itself custodies the right WOOD token.
@@ -521,9 +477,9 @@ contract DeploySherwood is ScriptBase {
         _checkAddr("swood.registry", StakedWood(swoodAddr).registry(), registryAddr);
         _checkUint("registry.reviewPeriod", reg.reviewPeriod(), DEFAULT_REVIEW_PERIOD);
         _checkUint("registry.blockQuorumBps", reg.blockQuorumBps(), DEFAULT_BLOCK_QUORUM_BPS);
-        // Governor knows about the registry (set at init-time).
-        // P1-1: recipient is pinned to this same pointer — fees route here.
-        _checkAddr("gov.guardianRegistry", SyndicateGovernor(governorAddr).guardianRegistry(), registryAddr);
+        // Per-vault governors are deployed at createSyndicate and authorized on
+        // the registry via addGovernor; there is no singleton governor to check
+        // registry linkage against at deploy time.
     }
 
     function _chainName() internal view returns (string memory) {

@@ -58,6 +58,19 @@ contract MockGovernor {
     }
 }
 
+/// @dev Per-vault migration (#421): the strategy now resolves the protocol-fee params via
+///      `vault.factory().protocolConfig()` instead of `vault.governor()`. This factory points
+///      `protocolConfig()` back at the existing `MockGovernor` (which already exposes the
+///      `protocolFeeBps()` / `protocolFeeRecipient()` IProtocolConfig read surface), so the
+///      chain resolves without changing the fee mock's ctor or `setFee` call-sites.
+contract MockFactory {
+    address public protocolConfig;
+
+    constructor(address pc) {
+        protocolConfig = pc;
+    }
+}
+
 /// @dev Vault whose `strategyMint` can be toggled to revert — modelling a PAUSED vault / de-whitelisted
 ///      feeRecipient (both make the fee-share mint revert). Two independent triggers, both honoured:
 ///        - `setMintReverts(true)`  → GLOBAL revert on every `strategyMint` (models a paused vault).
@@ -71,10 +84,14 @@ contract MockVaultPausableMint {
     mapping(address => bool) public mintBlocked; // to => fee-mint reverts (un-whitelisted recipient)
     uint256 public totalSupply;
     address public governor;
+    address public factory; // #421: strategy resolves protocol-fee params via factory().protocolConfig()
     bool public mintReverts; // global paused-vault flag
 
     constructor(address gov, address holder, uint256 shares) {
         governor = gov;
+        // Wire the new resolution chain: factory().protocolConfig() → the same MockGovernor.
+        // gov == address(0) → factory == address(0) preserves the "no protocol fee" case.
+        factory = gov == address(0) ? address(0) : address(new MockFactory(gov));
         balanceOf[holder] = shares;
         totalSupply = shares;
     }

@@ -88,7 +88,7 @@ contract UpgradeFactory is ScriptBase {
         s.vaultImpl = factory.vaultImpl();
         s.ensRegistrar = address(factory.ensRegistrar());
         s.agentRegistry = address(factory.agentRegistry());
-        s.governor = factory.governor();
+        s.governor = factory.beacon();
         s.managementFeeBps = factory.managementFeeBps();
         s.syndicateCount = factory.syndicateCount();
         s.upgradesEnabled = factory.upgradesEnabled();
@@ -126,7 +126,7 @@ contract UpgradeFactory is ScriptBase {
         require(address(factory.agentRegistry()) == snap.agentRegistry, "agentRegistry changed");
         console.log("  agentRegistry: OK");
 
-        require(factory.governor() == snap.governor, "governor changed");
+        require(factory.beacon() == snap.governor, "beacon changed");
         console.log("  governor: OK");
 
         require(factory.managementFeeBps() == snap.managementFeeBps, "managementFeeBps changed");

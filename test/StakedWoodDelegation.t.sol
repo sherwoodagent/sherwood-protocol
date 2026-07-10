@@ -30,7 +30,6 @@ contract StakedWoodDelegationTest is Test {
             (StakedWood.InitParams({
                     owner: owner,
                     wood: address(wood),
-                    governor: address(gov),
                     factory: factory,
                     minGuardianStake: 10_000e18,
                     coolDownPeriod: 7 days,

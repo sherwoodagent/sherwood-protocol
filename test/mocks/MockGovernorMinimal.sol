@@ -14,23 +14,27 @@ contract MockGovernorMinimal {
         address vault;
     }
 
-    mapping(address => uint256) public activeProposal;
+    uint256 public _activeProposal;
     mapping(uint256 => ProposalView) internal _proposals;
-    /// @dev Mirrors the per-vault open-proposal counter added in PR #229 Fix 2.
-    mapping(address => uint256) public openProposalCount;
+    /// @dev Per-vault governor: single vault, single open-proposal counter.
+    uint256 public _openProposalCount;
 
-    function setActiveProposal(address vault, uint256 proposalId) external {
-        activeProposal[vault] = proposalId;
+    function setActiveProposal(address, uint256 proposalId) external {
+        _activeProposal = proposalId;
     }
 
-    /// @dev Test helper — mirrors `SyndicateGovernor.openProposalCount(vault)`
+    /// @dev Test helper — mirrors `SyndicateGovernor.openProposalCount()`
     ///      which StakedWood consults in `requestUnstakeOwner`.
-    function setOpenProposalCount(address vault, uint256 n) external {
-        openProposalCount[vault] = n;
+    function setOpenProposalCount(address, uint256 n) external {
+        _openProposalCount = n;
     }
 
-    function getActiveProposal(address vault) external view returns (uint256) {
-        return activeProposal[vault];
+    function getActiveProposal() external view returns (uint256) {
+        return _activeProposal;
+    }
+
+    function openProposalCount() external view returns (uint256) {
+        return _openProposalCount;
     }
 
     /// @dev Sets a proposal with no associated vault. Used by tests that only

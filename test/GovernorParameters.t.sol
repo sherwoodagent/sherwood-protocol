@@ -8,6 +8,8 @@ import {ISyndicateGovernor} from "../src/interfaces/ISyndicateGovernor.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import {MockRegistryMinimal} from "./mocks/MockRegistryMinimal.sol";
+import {ProtocolConfig} from "../src/ProtocolConfig.sol";
+import {IProtocolConfig} from "../src/interfaces/IProtocolConfig.sol";
 
 /// @notice Unit tests targeting the abstract `GovernorParameters` surface
 ///         through a deployed `SyndicateGovernor` proxy. Covers happy path,
@@ -15,6 +17,7 @@ import {MockRegistryMinimal} from "./mocks/MockRegistryMinimal.sol";
 ///         the `ParameterChangeFinalized` event topic / payload contract.
 contract GovernorParametersTest is Test {
     SyndicateGovernor public governor;
+    ProtocolConfig public protocolConfig;
     MockRegistryMinimal public guardianRegistry;
 
     address public owner = makeAddr("owner");
@@ -33,13 +36,21 @@ contract GovernorParametersTest is Test {
 
     function setUp() public {
         guardianRegistry = new MockRegistryMinimal();
+        protocolConfig = new ProtocolConfig(owner);
+        vm.prank(owner);
+        protocolConfig.setProtocolFeeRecipient(owner);
+        vm.prank(owner);
+        protocolConfig.setProtocolFeeBps(PROTOCOL_FEE_BPS);
 
         SyndicateGovernor govImpl = new SyndicateGovernor();
         bytes memory govInit = abi.encodeCall(
             SyndicateGovernor.initialize,
             (
-                ISyndicateGovernor.InitParams({
-                    owner: owner,
+                address(0), // vault_: bootstrap governor; factory acts as bootstrap owner
+                address(guardianRegistry),
+                address(protocolConfig),
+                owner, // factory == bootstrap owner: param setters are onlyVaultOwner → _bootstrapOwner
+                ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,
                     vetoThresholdBps: VETO_THRESHOLD_BPS,
@@ -48,16 +59,14 @@ contract GovernorParametersTest is Test {
                     collaborationWindow: COLLAB_WINDOW,
                     maxCoProposers: MAX_CO_PROPOSERS,
                     minStrategyDuration: MIN_STRATEGY_DURATION,
-                    maxStrategyDuration: MAX_STRATEGY_DURATION,
-                    protocolFeeBps: PROTOCOL_FEE_BPS,
-                    protocolFeeRecipient: owner,
-                    guardianFeeBps: 0,
-                    guardiansFeeRecipient: address(0)
-                }),
-                address(guardianRegistry)
+                    maxStrategyDuration: MAX_STRATEGY_DURATION
+                })
             )
         );
         governor = SyndicateGovernor(address(new ERC1967Proxy(address(govImpl), govInit)));
+        // Per-vault governor: the vault resolves its governor via its factory
+        // (this test contract). Mock governorOf(vault) -> the deployed governor.
+        vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
     }
 
     // ==================== setVotingPeriod ====================
@@ -299,39 +308,39 @@ contract GovernorParametersTest is Test {
     // ==================== setProtocolFeeBps ====================
 
     function test_setProtocolFeeBps_happyPath() public {
-        uint256 oldVal = governor.protocolFeeBps();
+        uint256 oldVal = protocolConfig.protocolFeeBps();
         uint256 newVal = 50;
-        vm.expectEmit(true, false, false, true, address(governor));
-        emit ISyndicateGovernor.ParameterChangeFinalized(governor.PARAM_PROTOCOL_FEE_BPS(), oldVal, newVal);
+        vm.expectEmit(true, false, false, true, address(protocolConfig));
+        emit IProtocolConfig.ParameterChangeFinalized(keccak256("protocolFeeBps"), oldVal, newVal);
         vm.prank(owner);
-        governor.setProtocolFeeBps(newVal);
-        assertEq(governor.protocolFeeBps(), newVal);
+        protocolConfig.setProtocolFeeBps(newVal);
+        assertEq(protocolConfig.protocolFeeBps(), newVal);
     }
 
     function test_setProtocolFeeBps_aboveMax_reverts() public {
-        uint256 aboveMax = governor.MAX_PROTOCOL_FEE_BPS() + 1;
+        uint256 aboveMax = protocolConfig.MAX_PROTOCOL_FEE_BPS() + 1;
         vm.prank(owner);
-        vm.expectRevert(ISyndicateGovernor.InvalidProtocolFeeBps.selector);
-        governor.setProtocolFeeBps(aboveMax);
+        vm.expectRevert(IProtocolConfig.InvalidProtocolFeeBps.selector);
+        protocolConfig.setProtocolFeeBps(aboveMax);
     }
 
     // ==================== setProtocolFeeRecipient ====================
 
     function test_setProtocolFeeRecipient_happyPath() public {
         address newRecipient = makeAddr("newRecipient");
-        uint256 oldVal = uint256(uint160(governor.protocolFeeRecipient()));
+        uint256 oldVal = uint256(uint160(protocolConfig.protocolFeeRecipient()));
         uint256 newVal = uint256(uint160(newRecipient));
-        vm.expectEmit(true, false, false, true, address(governor));
-        emit ISyndicateGovernor.ParameterChangeFinalized(governor.PARAM_PROTOCOL_FEE_RECIPIENT(), oldVal, newVal);
+        vm.expectEmit(true, false, false, true, address(protocolConfig));
+        emit IProtocolConfig.ProtocolFeeRecipientSet(protocolConfig.protocolFeeRecipient(), newRecipient);
         vm.prank(owner);
-        governor.setProtocolFeeRecipient(newRecipient);
-        assertEq(governor.protocolFeeRecipient(), newRecipient);
+        protocolConfig.setProtocolFeeRecipient(newRecipient);
+        assertEq(protocolConfig.protocolFeeRecipient(), newRecipient);
     }
 
     function test_setProtocolFeeRecipient_zero_reverts() public {
         vm.prank(owner);
-        vm.expectRevert(ISyndicateGovernor.InvalidProtocolFeeRecipient.selector);
-        governor.setProtocolFeeRecipient(address(0));
+        vm.expectRevert(IProtocolConfig.InvalidProtocolFeeRecipient.selector);
+        protocolConfig.setProtocolFeeRecipient(address(0));
     }
 
     // ==================== setGuardianFeeBps ====================
@@ -340,75 +349,34 @@ contract GovernorParametersTest is Test {
         // Raising the guardian fee above 0 now requires a guardians-fee
         // recipient (coupling mirrors the protocol-fee recipient rule).
         vm.prank(owner);
-        governor.setGuardiansFeeRecipient(makeAddr("guardiansFeeRecipient"));
+        protocolConfig.setGuardiansFeeRecipient(makeAddr("guardiansFeeRecipient"));
 
-        uint256 oldVal = governor.guardianFeeBps();
+        uint256 oldVal = protocolConfig.guardianFeeBps();
         uint256 newVal = 250;
-        vm.expectEmit(true, false, false, true, address(governor));
-        emit ISyndicateGovernor.ParameterChangeFinalized(governor.PARAM_GUARDIAN_FEE_BPS(), oldVal, newVal);
+        vm.expectEmit(true, false, false, true, address(protocolConfig));
+        emit IProtocolConfig.ParameterChangeFinalized(keccak256("guardianFeeBps"), oldVal, newVal);
         vm.prank(owner);
-        governor.setGuardianFeeBps(newVal);
-        assertEq(governor.guardianFeeBps(), newVal);
+        protocolConfig.setGuardianFeeBps(newVal);
+        assertEq(protocolConfig.guardianFeeBps(), newVal);
     }
 
     function test_setGuardianFeeBps_aboveMax_reverts() public {
-        uint256 aboveMax = governor.MAX_GUARDIAN_FEE_BPS() + 1;
+        uint256 aboveMax = protocolConfig.MAX_GUARDIAN_FEE_BPS() + 1;
         vm.prank(owner);
-        vm.expectRevert(ISyndicateGovernor.InvalidGuardianFeeBps.selector);
-        governor.setGuardianFeeBps(aboveMax);
+        vm.expectRevert(IProtocolConfig.InvalidGuardianFeeBps.selector);
+        protocolConfig.setGuardianFeeBps(aboveMax);
     }
 
-    // ==================== setFactory ====================
-
-    function test_setFactory_happyPath() public {
-        address newFactory = makeAddr("newFactory");
-        uint256 oldVal = uint256(uint160(governor.factory()));
-        uint256 newVal = uint256(uint160(newFactory));
-        vm.expectEmit(true, false, false, true, address(governor));
-        emit ISyndicateGovernor.ParameterChangeFinalized(governor.PARAM_FACTORY(), oldVal, newVal);
-        vm.prank(owner);
-        governor.setFactory(newFactory);
-        assertEq(governor.factory(), newFactory);
-    }
-
-    function test_setFactory_zero_reverts() public {
-        vm.prank(owner);
-        vm.expectRevert(ISyndicateGovernor.ZeroAddress.selector);
-        governor.setFactory(address(0));
-    }
+    // setFactory removed in per-vault governor design — factory is set-once at initialize.
 
     // ==================== Cross-setter: protocolFeeBps requires recipient ====================
 
     function test_setProtocolFeeBps_noRecipient_reverts() public {
-        // Deploy a fresh governor with recipient=address(0).
-        SyndicateGovernor govImpl2 = new SyndicateGovernor();
-        bytes memory govInit2 = abi.encodeCall(
-            SyndicateGovernor.initialize,
-            (
-                ISyndicateGovernor.InitParams({
-                    owner: owner,
-                    votingPeriod: VOTING_PERIOD,
-                    executionWindow: EXECUTION_WINDOW,
-                    vetoThresholdBps: VETO_THRESHOLD_BPS,
-                    maxPerformanceFeeBps: MAX_PERF_FEE_BPS,
-                    cooldownPeriod: COOLDOWN_PERIOD,
-                    collaborationWindow: COLLAB_WINDOW,
-                    maxCoProposers: MAX_CO_PROPOSERS,
-                    minStrategyDuration: MIN_STRATEGY_DURATION,
-                    maxStrategyDuration: MAX_STRATEGY_DURATION,
-                    protocolFeeBps: 0,
-                    protocolFeeRecipient: address(0),
-                    guardianFeeBps: 0,
-                    guardiansFeeRecipient: address(0)
-                }),
-                address(guardianRegistry)
-            )
-        );
-        SyndicateGovernor gov2 = SyndicateGovernor(address(new ERC1967Proxy(address(govImpl2), govInit2)));
-
+        // Deploy a fresh ProtocolConfig with no recipient set.
+        ProtocolConfig pc2 = new ProtocolConfig(owner);
         vm.prank(owner);
-        vm.expectRevert(ISyndicateGovernor.InvalidProtocolFeeRecipient.selector);
-        gov2.setProtocolFeeBps(100);
+        vm.expectRevert(IProtocolConfig.InvalidProtocolFeeRecipient.selector);
+        pc2.setProtocolFeeBps(100);
     }
 
     // ==================== onlyOwner blanket coverage ====================
@@ -417,7 +385,7 @@ contract GovernorParametersTest is Test {
     ///         OZ unauthorized error. Batched into one test to avoid 13 near-
     ///         identical bodies; each setter is exercised once.
     function test_allSetters_notOwner_revert() public {
-        bytes memory expected = abi.encodeWithSelector(OwnableUpgradeable.OwnableUnauthorizedAccount.selector, random);
+        bytes memory expected = abi.encodeWithSelector(ISyndicateGovernor.NotVaultOwner.selector);
         vm.startPrank(random);
         vm.expectRevert(expected);
         governor.setVotingPeriod(2 days);
@@ -437,14 +405,16 @@ contract GovernorParametersTest is Test {
         governor.setCollaborationWindow(24 hours);
         vm.expectRevert(expected);
         governor.setMaxCoProposers(7);
-        vm.expectRevert(expected);
-        governor.setProtocolFeeBps(500);
-        vm.expectRevert(expected);
-        governor.setProtocolFeeRecipient(makeAddr("r"));
-        vm.expectRevert(expected);
-        governor.setGuardianFeeBps(250);
-        vm.expectRevert(expected);
-        governor.setFactory(makeAddr("f"));
+        // ProtocolConfig setters are plain Ownable2Step — different error.
+        bytes memory expectedOwnable =
+            abi.encodeWithSelector(OwnableUpgradeable.OwnableUnauthorizedAccount.selector, random);
+        vm.expectRevert(expectedOwnable);
+        protocolConfig.setProtocolFeeBps(500);
+        vm.expectRevert(expectedOwnable);
+        protocolConfig.setProtocolFeeRecipient(makeAddr("r"));
+        vm.expectRevert(expectedOwnable);
+        protocolConfig.setGuardianFeeBps(250);
+        // governor.setFactory removed in per-vault design — factory is set-once at initialize.
         vm.stopPrank();
     }
 
@@ -456,7 +426,8 @@ contract GovernorParametersTest is Test {
     function test_paramKeys_matchKeccak() public view {
         assertEq(governor.PARAM_VOTING_PERIOD(), keccak256("votingPeriod"));
         assertEq(governor.PARAM_EXECUTION_WINDOW(), keccak256("executionWindow"));
-        assertEq(governor.PARAM_PROTOCOL_FEE_BPS(), keccak256("protocolFeeBps"));
+        // PARAM_PROTOCOL_FEE_BPS moved to ProtocolConfig.
+        // assertEq(governor.PARAM_PROTOCOL_FEE_BPS(), keccak256("protocolFeeBps"));
     }
 
     // ==================== Pre-init guard ====================
@@ -466,13 +437,9 @@ contract GovernorParametersTest is Test {
     function test_setters_beforeInit_revertOwnable() public {
         SyndicateGovernor bareImpl = new SyndicateGovernor();
 
-        vm.expectRevert(abi.encodeWithSelector(OwnableUpgradeable.OwnableUnauthorizedAccount.selector, address(this)));
+        vm.expectRevert(abi.encodeWithSelector(ISyndicateGovernor.NotVaultOwner.selector));
         bareImpl.setVotingPeriod(2 days);
 
-        vm.expectRevert(abi.encodeWithSelector(OwnableUpgradeable.OwnableUnauthorizedAccount.selector, address(this)));
-        bareImpl.setFactory(makeAddr("factory"));
-
-        vm.expectRevert(abi.encodeWithSelector(OwnableUpgradeable.OwnableUnauthorizedAccount.selector, address(this)));
-        bareImpl.setProtocolFeeRecipient(makeAddr("recipient"));
+        // setFactory and setProtocolFeeRecipient removed from governor in per-vault design.
     }
 }

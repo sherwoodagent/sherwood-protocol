@@ -7,6 +7,7 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {SyndicateFactory} from "../../src/SyndicateFactory.sol";
 import {SyndicateVault} from "../../src/SyndicateVault.sol";
 import {SyndicateGovernor} from "../../src/SyndicateGovernor.sol";
+import {GovernorBeacon} from "../../src/GovernorBeacon.sol";
 import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 import {GuardianRegistry} from "../../src/GuardianRegistry.sol";
 import {StakedWood} from "../../src/StakedWood.sol";
@@ -15,6 +16,7 @@ import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockL2Registrar} from "../mocks/MockL2Registrar.sol";
+import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 
 /// @title SyndicateFactory_rotateOwner_proposalGuard — MS-H8 regression
 /// @notice Confirms that `SyndicateFactory.rotateOwner` reverts while a
@@ -33,7 +35,6 @@ import {MockL2Registrar} from "../mocks/MockL2Registrar.sol";
 ///         hold even under those conditions.
 contract SyndicateFactory_rotateOwner_proposalGuard is Test {
     SyndicateFactory public factory;
-    SyndicateGovernor public governor;
     SyndicateVault public vaultImpl;
     GuardianRegistry public registry;
     StakedWood public swood;
@@ -66,10 +67,10 @@ contract SyndicateFactory_rotateOwner_proposalGuard is Test {
         newOwnerAgentId = agentRegistry.mint(newOwner);
 
         // sWOOD + Governor + Registry + Factory nonce-prediction. From
-        // `baseNonce`: swoodImpl(+0), swoodProxy(+1), govImpl(+2), govProxy(+3),
+        // `baseNonce`: swoodImpl(+0), swoodProxy(+1), govImpl(+2), beacon(+3),
         // factoryImpl(+4), regImpl(+5), regProxy(+6), factoryProxy(+7).
+        ProtocolConfig _hoistedPC = new ProtocolConfig(owner);
         uint256 baseNonce = vm.getNonce(address(this));
-        address predictedGovernor = vm.computeCreateAddress(address(this), baseNonce + 3);
         address predictedRegistryProxy = vm.computeCreateAddress(address(this), baseNonce + 6);
         address predictedFactoryProxy = vm.computeCreateAddress(address(this), baseNonce + 7);
 
@@ -80,7 +81,6 @@ contract SyndicateFactory_rotateOwner_proposalGuard is Test {
             (StakedWood.InitParams({
                     owner: owner,
                     wood: address(wood),
-                    governor: predictedGovernor,
                     factory: predictedFactoryProxy,
                     minGuardianStake: MIN_GUARDIAN_STAKE,
                     coolDownPeriod: 7 days,
@@ -91,37 +91,16 @@ contract SyndicateFactory_rotateOwner_proposalGuard is Test {
         );
         swood = StakedWood(address(new ERC1967Proxy(address(swoodImpl), swoodInit)));
 
+        // GovernorBeacon at nonce +3 (impl at +2) — preserves the prediction
+        // plan. The factory clones + authorizes a per-vault BeaconProxy governor
+        // itself at createSyndicate; no standalone governor.
         SyndicateGovernor govImpl = new SyndicateGovernor();
-        bytes memory govInit = abi.encodeCall(
-            SyndicateGovernor.initialize,
-            (
-                ISyndicateGovernor.InitParams({
-                    owner: owner,
-                    votingPeriod: 1 days,
-                    executionWindow: 1 days,
-                    vetoThresholdBps: 4000,
-                    maxPerformanceFeeBps: 1000,
-                    cooldownPeriod: 1 days,
-                    collaborationWindow: 48 hours,
-                    maxCoProposers: 5,
-                    minStrategyDuration: 1 hours,
-                    maxStrategyDuration: 30 days,
-                    protocolFeeBps: 0,
-                    protocolFeeRecipient: address(0),
-                    guardianFeeBps: 0,
-                    guardiansFeeRecipient: address(0)
-                }),
-                predictedRegistryProxy
-            )
-        );
-        governor = SyndicateGovernor(address(new ERC1967Proxy(address(govImpl), govInit)));
-        require(address(governor) == predictedGovernor, "governor address prediction mismatch");
+        GovernorBeacon beacon = new GovernorBeacon(address(govImpl), owner);
 
         SyndicateFactory factoryImpl = new SyndicateFactory();
         GuardianRegistry regImpl = new GuardianRegistry();
         bytes memory regInit = abi.encodeCall(
-            GuardianRegistry.initialize,
-            (owner, address(governor), predictedFactoryProxy, address(swood), REVIEW_PERIOD, BLOCK_QUORUM_BPS)
+            GuardianRegistry.initialize, (owner, predictedFactoryProxy, address(swood), REVIEW_PERIOD, BLOCK_QUORUM_BPS)
         );
         registry = GuardianRegistry(address(new ERC1967Proxy(address(regImpl), regInit)));
         require(address(registry) == predictedRegistryProxy, "registry address prediction mismatch");
@@ -138,7 +117,8 @@ contract SyndicateFactory_rotateOwner_proposalGuard is Test {
                     vaultImpl: address(vaultImpl),
                     ensRegistrar: address(ensRegistrar),
                     agentRegistry: address(agentRegistry),
-                    governor: address(governor),
+                    beacon: address(beacon),
+                    protocolConfig: address(_hoistedPC),
                     managementFeeBps: 50,
                     guardianRegistry: address(registry)
                 }))
@@ -146,8 +126,7 @@ contract SyndicateFactory_rotateOwner_proposalGuard is Test {
         factory = SyndicateFactory(address(new ERC1967Proxy(address(factoryImpl), factoryInit)));
         require(address(factory) == predictedFactoryProxy, "factory address prediction mismatch");
 
-        vm.prank(owner);
-        governor.setFactory(address(factory));
+        // governor.setFactory removed in per-vault design
 
         wood.mint(creator, 100_000e18);
         wood.mint(newOwner, 100_000e18);
@@ -194,9 +173,10 @@ contract SyndicateFactory_rotateOwner_proposalGuard is Test {
         address vault = _createAndUnstake();
         _prepareStake(newOwner);
 
-        // Sanity: governor reports no live or open proposals.
-        assertEq(governor.getActiveProposal(vault), 0);
-        assertEq(governor.openProposalCount(vault), 0);
+        // Sanity: this vault's per-vault governor reports no live/open proposals.
+        SyndicateGovernor gov = SyndicateGovernor(factory.governorOf(vault));
+        assertEq(gov.getActiveProposal(), 0);
+        assertEq(gov.openProposalCount(), 0);
 
         // Sherlock #32: rotateOwner is now called by the vault owner (creator)
         // not the factory owner.
@@ -215,18 +195,11 @@ contract SyndicateFactory_rotateOwner_proposalGuard is Test {
         address vault = _createAndUnstake();
         _prepareStake(newOwner);
 
-        // Force the governor to report an active proposal on this vault.
-        vm.mockCall(
-            address(governor),
-            abi.encodeWithSelector(ISyndicateGovernor.getActiveProposal.selector, vault),
-            abi.encode(uint256(42))
-        );
+        // Force this vault's per-vault governor to report an active proposal.
+        address gov = factory.governorOf(vault);
+        vm.mockCall(gov, abi.encodeWithSelector(ISyndicateGovernor.getActiveProposal.selector), abi.encode(uint256(42)));
         // openProposalCount stays zero so we hit the ProposalActive branch first.
-        vm.mockCall(
-            address(governor),
-            abi.encodeWithSelector(ISyndicateGovernor.openProposalCount.selector, vault),
-            abi.encode(uint256(0))
-        );
+        vm.mockCall(gov, abi.encodeWithSelector(ISyndicateGovernor.openProposalCount.selector), abi.encode(uint256(0)));
 
         vm.prank(creator);
         vm.expectRevert(SyndicateFactory.ProposalActive.selector);
@@ -244,16 +217,9 @@ contract SyndicateFactory_rotateOwner_proposalGuard is Test {
         _prepareStake(newOwner);
 
         // No live execution, but a Pending / GuardianReview proposal exists.
-        vm.mockCall(
-            address(governor),
-            abi.encodeWithSelector(ISyndicateGovernor.getActiveProposal.selector, vault),
-            abi.encode(uint256(0))
-        );
-        vm.mockCall(
-            address(governor),
-            abi.encodeWithSelector(ISyndicateGovernor.openProposalCount.selector, vault),
-            abi.encode(uint256(1))
-        );
+        address gov = factory.governorOf(vault);
+        vm.mockCall(gov, abi.encodeWithSelector(ISyndicateGovernor.getActiveProposal.selector), abi.encode(uint256(0)));
+        vm.mockCall(gov, abi.encodeWithSelector(ISyndicateGovernor.openProposalCount.selector), abi.encode(uint256(1)));
 
         vm.prank(creator);
         vm.expectRevert(SyndicateFactory.ProposalsOpen.selector);
@@ -282,8 +248,8 @@ contract SyndicateFactory_rotateOwner_proposalGuard is Test {
         // Mock an active proposal as well — the VaultStillStaked check fires
         // first, so neither ProposalActive nor ProposalsOpen should surface.
         vm.mockCall(
-            address(governor),
-            abi.encodeWithSelector(ISyndicateGovernor.getActiveProposal.selector, vault),
+            factory.governorOf(vault),
+            abi.encodeWithSelector(ISyndicateGovernor.getActiveProposal.selector),
             abi.encode(uint256(99))
         );
 

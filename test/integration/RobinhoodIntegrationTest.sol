@@ -212,10 +212,10 @@ abstract contract RobinhoodIntegrationTest is Test {
         ISyndicateGovernor.GovernorParams memory params = governor.getGovernorParams();
         vm.warp(vm.getBlockTimestamp() + params.votingPeriod + 1);
 
-        registry.openReview(proposalId);
+        registry.openReview(address(governor), proposalId);
         uint256 reviewPeriod = registry.reviewPeriod();
         vm.warp(vm.getBlockTimestamp() + reviewPeriod + 1);
-        registry.resolveReview(proposalId);
+        registry.resolveReview(address(governor), proposalId);
 
         governor.executeProposal(proposalId);
     }

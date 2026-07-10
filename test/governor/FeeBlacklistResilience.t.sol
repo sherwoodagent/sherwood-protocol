@@ -11,6 +11,7 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {BlacklistingERC20Mock} from "../mocks/BlacklistingERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
+import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 
 /// @title FeeBlacklistResilience
 /// @notice Covers W-1: USDC blacklist on any fee recipient (lead / co-proposer
@@ -71,12 +72,21 @@ contract FeeBlacklistResilienceTest is Test {
         vm.prank(owner);
         vault.registerAgent(coAgentNftId, coAgent);
 
+        ProtocolConfig protocolConfig = new ProtocolConfig(owner);
+        vm.startPrank(owner);
+        protocolConfig.setProtocolFeeRecipient(protocolRecipient);
+        protocolConfig.setProtocolFeeBps(100);
+        vm.stopPrank();
+
         SyndicateGovernor govImpl = new SyndicateGovernor();
         bytes memory govInit = abi.encodeCall(
             SyndicateGovernor.initialize,
             (
-                ISyndicateGovernor.InitParams({
-                    owner: owner,
+                address(vault), // vault_: this test's vault (per-vault governor)
+                address(guardianRegistry),
+                address(protocolConfig),
+                address(this), // factory (test contract)
+                ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,
                     vetoThresholdBps: VETO_THRESHOLD_BPS,
@@ -85,19 +95,14 @@ contract FeeBlacklistResilienceTest is Test {
                     collaborationWindow: 48 hours,
                     maxCoProposers: 5,
                     minStrategyDuration: 1 hours,
-                    maxStrategyDuration: 30 days,
-                    protocolFeeBps: 100,
-                    protocolFeeRecipient: protocolRecipient,
-                    guardianFeeBps: 0,
-                    guardiansFeeRecipient: address(0)
-                }),
-                address(guardianRegistry)
+                    maxStrategyDuration: 30 days
+                })
             )
         );
         governor = SyndicateGovernor(address(new ERC1967Proxy(address(govImpl), govInit)));
-
-        vm.prank(owner);
-        governor.addVault(address(vault));
+        // Per-vault governor: the vault resolves its governor via its factory
+        // (this test contract). Mock governorOf(vault) -> the deployed governor.
+        vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
 
         usdc.mint(lp1, 100_000e6);
         usdc.mint(lp2, 100_000e6);
@@ -300,8 +305,6 @@ contract FeeBlacklistResilienceTest is Test {
                 }))
         );
         SyndicateVault vaultB = SyndicateVault(payable(address(new ERC1967Proxy(address(vaultImplB), vaultInitB))));
-        vm.prank(owner);
-        governor.addVault(address(vaultB));
         usdc.mint(address(vaultB), 50_000e6);
         uint256 vaultBBalBefore = usdc.balanceOf(address(vaultB));
         uint256 recipientBalBefore = usdc.balanceOf(protocolRecipient);

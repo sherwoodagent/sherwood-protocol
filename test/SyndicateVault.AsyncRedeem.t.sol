@@ -50,10 +50,10 @@ contract VaultAsyncRedeemTest is Test {
         vault.setWithdrawalQueue(address(queue));
 
         // Mock governor + active proposal to false by default
-        vm.mockCall(address(this), abi.encodeWithSignature("governor()"), abi.encode(MOCK_GOVERNOR));
-        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal(address)"), abi.encode(uint256(0)));
+        vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(MOCK_GOVERNOR));
+        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal()"), abi.encode(uint256(0)));
         // MS-H4: vault `_deposit` reads `openProposalCount(address)` — mock to 0.
-        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("openProposalCount(address)"), abi.encode(uint256(0)));
+        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("openProposalCount()"), abi.encode(uint256(0)));
         // NAV-floor guard reads `getCapitalSnapshot(pid)` — mock to 0 default.
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getCapitalSnapshot(uint256)"), abi.encode(uint256(0)));
 
@@ -65,9 +65,7 @@ contract VaultAsyncRedeemTest is Test {
 
     function _setProposalActive(bool active) internal {
         vm.mockCall(
-            MOCK_GOVERNOR,
-            abi.encodeWithSignature("getActiveProposal(address)"),
-            abi.encode(active ? uint256(1) : uint256(0))
+            MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal()"), abi.encode(active ? uint256(1) : uint256(0))
         );
     }
 

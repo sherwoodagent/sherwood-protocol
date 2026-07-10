@@ -7,11 +7,13 @@ import {Create3Factory} from "../../src/Create3Factory.sol";
 import {GuardianRegistry} from "../../src/GuardianRegistry.sol";
 import {StakedWood} from "../../src/StakedWood.sol";
 import {SyndicateGovernor} from "../../src/SyndicateGovernor.sol";
+import {GovernorBeacon} from "../../src/GovernorBeacon.sol";
 import {SyndicateFactory} from "../../src/SyndicateFactory.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {SyndicateVault} from "../../src/SyndicateVault.sol";
 import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
+import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 
 /// @notice Simulates the Deploy.s.sol sequence (without `forge script`) to
 ///         confirm the circular dep between GuardianRegistry + SyndicateFactory
@@ -47,32 +49,12 @@ contract DeployScriptTest is Test {
         address predictedFactoryProxy = c3.addressOf(SALT_FACTORY_PROXY);
         assertTrue(predictedFactoryProxy != address(0));
 
+        // Per-vault design mirror of Deploy.s.sol: governor impl via CREATE3,
+        // wrapped in a GovernorBeacon. No singleton governor proxy exists —
+        // the factory clones per-vault BeaconProxies at createSyndicate.
         address govImpl = c3.deploy(SALT_GOVERNOR_IMPL, abi.encodePacked(type(SyndicateGovernor).creationCode));
-        bytes memory govInit = abi.encodeCall(
-            SyndicateGovernor.initialize,
-            (
-                ISyndicateGovernor.InitParams({
-                    owner: deployer,
-                    votingPeriod: 1 days,
-                    executionWindow: 1 days,
-                    vetoThresholdBps: 4000,
-                    maxPerformanceFeeBps: 1000,
-                    cooldownPeriod: 1 days,
-                    collaborationWindow: 48 hours,
-                    maxCoProposers: 5,
-                    minStrategyDuration: 1 hours,
-                    maxStrategyDuration: 14 days,
-                    protocolFeeBps: 100,
-                    protocolFeeRecipient: deployer,
-                    guardianFeeBps: 0,
-                    guardiansFeeRecipient: address(0)
-                }),
-                predictedRegistryProxy
-            )
-        );
-        address govProxy = c3.deploy(
-            SALT_GOVERNOR_PROXY, abi.encodePacked(type(ERC1967Proxy).creationCode, abi.encode(govImpl, govInit))
-        );
+        address beacon = address(new GovernorBeacon(govImpl, deployer));
+        ProtocolConfig protocolConfig = new ProtocolConfig(deployer);
 
         // sWOOD — sole WOOD custodian post-split. Plain deploy (CREATE3
         // prediction not exercised for sWOOD here); the registry's slimmed
@@ -83,7 +65,6 @@ contract DeployScriptTest is Test {
             (StakedWood.InitParams({
                     owner: deployer,
                     wood: address(wood),
-                    governor: govProxy,
                     factory: predictedFactoryProxy,
                     minGuardianStake: 10_000e18,
                     coolDownPeriod: 7 days,
@@ -98,9 +79,8 @@ contract DeployScriptTest is Test {
         // off, the factory-bound invariants (e.g. `bindOwnerStake` onlyFactory)
         // would silently point at the wrong address.
         address registryImpl = c3.deploy(SALT_REGISTRY_IMPL, abi.encodePacked(type(GuardianRegistry).creationCode));
-        bytes memory regInit = abi.encodeCall(
-            GuardianRegistry.initialize, (deployer, govProxy, predictedFactoryProxy, swood, 24 hours, 3000)
-        );
+        bytes memory regInit =
+            abi.encodeCall(GuardianRegistry.initialize, (deployer, predictedFactoryProxy, swood, 24 hours, 3000));
         address registryProxy = c3.deploy(
             SALT_REGISTRY_PROXY, abi.encodePacked(type(ERC1967Proxy).creationCode, abi.encode(registryImpl, regInit))
         );
@@ -115,7 +95,6 @@ contract DeployScriptTest is Test {
         assertEq(address(GuardianRegistry(registryProxy).swood()), swood, "registry.swood mismatch");
         assertEq(StakedWood(swood).registry(), registryProxy, "swood.registry mismatch");
         assertEq(address(StakedWood(swood).wood()), address(wood), "swood.wood mismatch");
-        assertEq(StakedWood(swood).governor(), govProxy, "swood.governor mismatch");
 
         // Now deploy the factory and assert its proxy address matches the
         // prediction. Use a tiny vault impl / executor stub — not validated here.
@@ -130,7 +109,8 @@ contract DeployScriptTest is Test {
                     vaultImpl: vaultImpl,
                     ensRegistrar: address(0),
                     agentRegistry: address(0),
-                    governor: govProxy,
+                    beacon: beacon,
+                    protocolConfig: address(protocolConfig),
                     managementFeeBps: 50,
                     guardianRegistry: registryProxy
                 }))
@@ -141,11 +121,13 @@ contract DeployScriptTest is Test {
 
         assertEq(factoryProxy, predictedFactoryProxy, "CREATE3 factory prediction mismatch");
 
-        // Governor was wired to the registry at init-time via CREATE3 prediction.
-        assertEq(SyndicateGovernor(govProxy).guardianRegistry(), registryProxy);
+        // Factory wired to the beacon + config; the beacon points at the impl.
+        assertEq(SyndicateFactory(factoryProxy).beacon(), beacon, "factory.beacon mismatch");
+        assertEq(SyndicateFactory(factoryProxy).protocolConfig(), address(protocolConfig), "factory.pc mismatch");
+        assertEq(GovernorBeacon(beacon).implementation(), govImpl, "beacon impl mismatch");
 
-        // Registry sees the real factory (not deployer placeholder).
+        // Registry sees the real factory (not deployer placeholder). Per-vault
+        // governors are authorized lazily via addGovernor at createSyndicate.
         assertEq(GuardianRegistry(registryProxy).factory(), factoryProxy);
-        assertEq(GuardianRegistry(registryProxy).governor(), govProxy);
     }
 }

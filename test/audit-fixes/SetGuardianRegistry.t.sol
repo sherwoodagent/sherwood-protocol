@@ -9,6 +9,7 @@ import {SyndicateVault} from "../../src/SyndicateVault.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {MinimalGuardianRegistry} from "../../src/MinimalGuardianRegistry.sol";
 import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
+import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 
 /// @title SetGuardianRegistry — owner-only registry repointing
 /// @notice Lets the protocol upgrade from the beta `MinimalGuardianRegistry`
@@ -32,9 +33,12 @@ contract SetGuardianRegistryTest is Test {
         bytes memory govInit = abi.encodeCall(
             SyndicateGovernor.initialize,
             (
-                ISyndicateGovernor.InitParams({
-                    owner: owner,
-                    votingPeriod: 1 hours,
+                address(0), // vault_: bootstrap (factory auto-deploys per-vault governors)
+                address(initialRegistry),
+                address(new ProtocolConfig(owner)),
+                address(this), // factory (test contract)
+                ISyndicateGovernor.GovernorParams({
+                    votingPeriod: 24 hours,
                     executionWindow: 1 days,
                     vetoThresholdBps: 4000,
                     maxPerformanceFeeBps: 1000,
@@ -42,16 +46,14 @@ contract SetGuardianRegistryTest is Test {
                     collaborationWindow: 24 hours,
                     maxCoProposers: 5,
                     minStrategyDuration: 1 hours,
-                    maxStrategyDuration: 14 days,
-                    protocolFeeBps: 100,
-                    protocolFeeRecipient: owner,
-                    guardianFeeBps: 0,
-                    guardiansFeeRecipient: address(0)
-                }),
-                address(initialRegistry)
+                    maxStrategyDuration: 14 days
+                })
             )
         );
         governor = SyndicateGovernor(address(new ERC1967Proxy(address(govImpl), govInit)));
+        // Per-vault governor: the vault resolves its governor via its factory
+        // (this test contract). Mock governorOf(vault) -> the deployed governor.
+        vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
 
         // Factory proxy (wired with governor + initial registry)
         BatchExecutorLib executorLib = new BatchExecutorLib();
@@ -65,15 +67,15 @@ contract SetGuardianRegistryTest is Test {
                     vaultImpl: address(vaultImpl),
                     ensRegistrar: address(0),
                     agentRegistry: address(0),
-                    governor: address(governor),
+                    beacon: address(governor),
+                    protocolConfig: address(governor),
                     managementFeeBps: 0,
                     guardianRegistry: address(initialRegistry)
                 }))
         );
         factory = SyndicateFactory(address(new ERC1967Proxy(address(factoryImpl), factoryInit)));
 
-        vm.prank(owner);
-        governor.setFactory(address(factory));
+        // governor.setFactory removed in per-vault design — factory set at initialize time
     }
 
     /// @notice PR #351 review #1: `governor.setGuardianRegistry` was REMOVED.

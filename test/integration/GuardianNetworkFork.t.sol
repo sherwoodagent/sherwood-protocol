@@ -11,6 +11,7 @@ import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 import {SyndicateVault} from "../../src/SyndicateVault.sol";
 import {ISyndicateVault} from "../../src/interfaces/ISyndicateVault.sol";
 import {SyndicateFactory} from "../../src/SyndicateFactory.sol";
+import {GovernorBeacon} from "../../src/GovernorBeacon.sol";
 import {GuardianRegistry} from "../../src/GuardianRegistry.sol";
 import {IGuardianRegistry} from "../../src/interfaces/IGuardianRegistry.sol";
 import {StakedWood} from "../../src/StakedWood.sol";
@@ -19,6 +20,7 @@ import {MoonwellSupplyStrategy} from "../../src/strategies/MoonwellSupplyStrateg
 
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
+import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 
 /**
  * @title GuardianNetworkForkTest
@@ -53,7 +55,7 @@ contract GuardianNetworkForkTest is Test {
     uint256 constant BLOCK_QUORUM_BPS = 3000; // 30%
 
     // ── Governor / vault parameters ──
-    uint256 constant VOTING_PERIOD = 1 hours;
+    uint256 constant VOTING_PERIOD = 24 hours;
     uint256 constant EXECUTION_WINDOW = 24 hours;
     uint256 constant VETO_THRESHOLD_BPS = 4000; // 40% AGAINST to reject
     uint256 constant COOLDOWN_PERIOD = 1 hours;
@@ -132,17 +134,17 @@ contract GuardianNetworkForkTest is Test {
         vm.expectEmit(true, false, false, false, address(registry));
         emit IGuardianRegistry.ReviewOpened(pid, 0);
         vm.prank(keeper);
-        registry.openReview(pid);
+        registry.openReview(address(governor), pid);
 
-        (bool opened,, bool blocked, bool cohortTooSmall) = registry.getReviewState(pid);
+        (bool opened,, bool blocked, bool cohortTooSmall) = registry.getReviewState(address(governor), pid);
         assertTrue(opened, "A: review opened");
         assertFalse(cohortTooSmall, "A: cohort above MIN_COHORT_STAKE_AT_OPEN - enforcement live");
         assertFalse(blocked, "A: not blocked yet");
 
         vm.prank(g1);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
         vm.prank(g2);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
 
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
         governor.executeProposal(pid);
@@ -195,9 +197,9 @@ contract GuardianNetworkForkTest is Test {
 
         vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
         vm.prank(keeper);
-        registry.openReview(pid);
+        registry.openReview(address(governor), pid);
 
-        (,,, bool cohortTooSmall) = registry.getReviewState(pid);
+        (,,, bool cohortTooSmall) = registry.getReviewState(address(governor), pid);
         assertFalse(cohortTooSmall, "B: cohort sufficient - enforcement is live");
 
         uint256 burnBefore = wood.balanceOf(BURN_ADDRESS);
@@ -206,16 +208,16 @@ contract GuardianNetworkForkTest is Test {
         // g1 approves; g2+g3 block.
         // Block weight = 60k / 90k total = 66.7% >= 30% quorum -> BLOCKED.
         vm.prank(g1);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
         vm.prank(g2);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Block, 10_000);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, 10_000);
         vm.prank(g3);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Block, 10_000);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, 10_000);
 
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
 
         vm.prank(keeper);
-        bool blocked = registry.resolveReview(pid);
+        bool blocked = registry.resolveReview(address(governor), pid);
         assertTrue(blocked, "B: review resolved as blocked");
 
         assertEq(
@@ -266,9 +268,9 @@ contract GuardianNetworkForkTest is Test {
         uint256 pid = _proposeAndVote(strategy, execCalls, settleCalls);
         vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
         vm.prank(keeper);
-        registry.openReview(pid);
+        registry.openReview(address(governor), pid);
         vm.prank(g1);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
         governor.executeProposal(pid);
 
@@ -284,7 +286,7 @@ contract GuardianNetworkForkTest is Test {
         vm.prank(owner);
         governor.emergencySettleWithCalls(pid, settleCalls);
 
-        assertTrue(registry.isEmergencyOpen(pid), "C: emergency review open");
+        assertTrue(registry.isEmergencyOpen(address(governor), pid), "C: emergency review open");
 
         // No guardians block - warp past emergency review period.
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
@@ -336,15 +338,15 @@ contract GuardianNetworkForkTest is Test {
         // openReview emits CohortTooSmallToReview - cold-start path.
         vm.expectEmit(true, false, false, false, address(registry));
         emit IGuardianRegistry.CohortTooSmallToReview(pid, 0);
-        registry.openReview(pid);
+        registry.openReview(address(governor), pid);
 
-        (,,, bool cohortTooSmall) = registry.getReviewState(pid);
+        (,,, bool cohortTooSmall) = registry.getReviewState(address(governor), pid);
         assertTrue(cohortTooSmall, "D: cold-start flag set");
 
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
 
         // resolveReview short-circuits to false - no enforcement, no slashing.
-        bool blocked = registry.resolveReview(pid);
+        bool blocked = registry.resolveReview(address(governor), pid);
         assertFalse(blocked, "D: cold-start -> always unblocked");
 
         governor.executeProposal(pid);
@@ -410,24 +412,34 @@ contract GuardianNetworkForkTest is Test {
     /**
      * @dev Deploys a fresh Sherwood stack on the fork.
      *
+     *      Per-vault governor model: no singleton governor proxy is deployed
+     *      here. The factory clones a BeaconProxy governor per vault at
+     *      `createSyndicate` and auto-registers it via `addGovernor`, so the
+     *      test reads its governor back through `factory.governorOf(vault)`
+     *      after vault creation (see `_createVaultAndFundLPs`).
+     *
      *      Nonce layout from address(this) at call time:
      *        +0  wood (ERC20Mock)
      *        +1  agentRegistry
      *        +2  swoodImpl
-     *        +3  swoodProxy       <- predictedSwood (passed to govImpl)
+     *        +3  swoodProxy
      *        +4  govImpl
-     *        +5  govProxy         <- predictedGovernor
+     *        +5  govBeacon        (GovernorBeacon wrapping govImpl)
      *        +6  regImpl
-     *        +7  regProxy         <- predictedRegistry
+     *        +7  regProxy
      *        +8  vaultImpl
      *        +9  executorLib
      *        +10 factImpl
      *        +11 factProxy        <- predictedFactory
+     *
+     *      Only the factory proxy address must be predicted: sWOOD and the
+     *      registry both take it at init, before the factory is deployed.
+     *      `_hoistedPC` is created before `baseNonce` is captured, so it does
+     *      not shift these offsets.
      */
     function _deployFreshStack() internal {
+        ProtocolConfig _hoistedPC = new ProtocolConfig(owner);
         uint256 baseNonce = vm.getNonce(address(this));
-        address predictedGovernor = vm.computeCreateAddress(address(this), baseNonce + 5);
-        address predictedRegistry = vm.computeCreateAddress(address(this), baseNonce + 7);
         address predictedFactory = vm.computeCreateAddress(address(this), baseNonce + 11);
 
         wood = new ERC20Mock("WOOD", "WOOD", 18);
@@ -446,7 +458,6 @@ contract GuardianNetworkForkTest is Test {
                         (StakedWood.InitParams({
                                 owner: owner,
                                 wood: address(wood),
-                                governor: predictedGovernor,
                                 factory: predictedFactory,
                                 minGuardianStake: MIN_GUARDIAN_STAKE,
                                 coolDownPeriod: 7 days,
@@ -459,38 +470,12 @@ contract GuardianNetworkForkTest is Test {
             )
         );
 
-        // Governor
+        // Governor: deploy the implementation once and wrap it in a
+        // GovernorBeacon (canonical per-vault model, mirrors Deploy.s.sol).
+        // The factory clones a BeaconProxy governor per vault at
+        // `createSyndicate`; no singleton governor proxy is deployed here.
         SyndicateGovernor govImpl = new SyndicateGovernor();
-        governor = SyndicateGovernor(
-            address(
-                new ERC1967Proxy(
-                    address(govImpl),
-                    abi.encodeCall(
-                        SyndicateGovernor.initialize,
-                        (
-                            ISyndicateGovernor.InitParams({
-                                owner: owner,
-                                votingPeriod: VOTING_PERIOD,
-                                executionWindow: EXECUTION_WINDOW,
-                                vetoThresholdBps: VETO_THRESHOLD_BPS,
-                                maxPerformanceFeeBps: 1500,
-                                cooldownPeriod: COOLDOWN_PERIOD,
-                                collaborationWindow: 48 hours,
-                                maxCoProposers: 5,
-                                minStrategyDuration: 1 hours,
-                                maxStrategyDuration: 30 days,
-                                protocolFeeBps: 0,
-                                protocolFeeRecipient: address(0),
-                                guardianFeeBps: GUARDIAN_FEE_BPS,
-                                guardiansFeeRecipient: predictedRegistry
-                            }),
-                            predictedRegistry
-                        )
-                    )
-                )
-            )
-        );
-        require(address(governor) == predictedGovernor, "governor addr mismatch - nonce drift");
+        GovernorBeacon govBeacon = new GovernorBeacon(address(govImpl), owner);
 
         // GuardianRegistry
         GuardianRegistry regImpl = new GuardianRegistry();
@@ -500,12 +485,11 @@ contract GuardianNetworkForkTest is Test {
                     address(regImpl),
                     abi.encodeCall(
                         GuardianRegistry.initialize,
-                        (owner, address(governor), predictedFactory, address(swood), REVIEW_PERIOD, BLOCK_QUORUM_BPS)
+                        (owner, predictedFactory, address(swood), REVIEW_PERIOD, BLOCK_QUORUM_BPS)
                     )
                 )
             )
         );
-        require(address(registry) == predictedRegistry, "registry addr mismatch - nonce drift");
 
         // Factory + vault impl + executor
         SyndicateVault vaultImpl = new SyndicateVault();
@@ -523,7 +507,8 @@ contract GuardianNetworkForkTest is Test {
                                 vaultImpl: address(vaultImpl),
                                 ensRegistrar: address(0),
                                 agentRegistry: address(agentRegistry),
-                                governor: address(governor),
+                                beacon: address(govBeacon),
+                                protocolConfig: address(_hoistedPC),
                                 managementFeeBps: 0,
                                 guardianRegistry: address(registry)
                             }))
@@ -537,8 +522,7 @@ contract GuardianNetworkForkTest is Test {
         vm.prank(owner);
         swood.setRegistry(address(registry));
 
-        vm.prank(owner);
-        governor.setFactory(address(factory));
+        // governor.setFactory removed in per-vault design
     }
 
     function _seedGuardians() internal {
@@ -578,6 +562,12 @@ contract GuardianNetworkForkTest is Test {
             })
         );
         vault = SyndicateVault(payable(vaultAddr));
+
+        // Per-vault governor: the factory deployed a BeaconProxy governor bound
+        // to this vault (init'd with vault=vaultAddr) and authorized it on the
+        // registry via addGovernor. Read it back — the scenarios propose /
+        // review / settle through this governor, not a singleton proxy.
+        governor = SyndicateGovernor(factory.governorOf(vaultAddr));
 
         vm.prank(owner);
         vault.registerAgent(agentNftId, agent);

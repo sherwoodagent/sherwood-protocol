@@ -15,6 +15,7 @@ import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
+import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 
 /// @title GuardianReviewLifecycle.t
 /// @notice End-to-end tests for the Task 25 guardian-review proposal lifecycle.
@@ -105,6 +106,7 @@ contract GuardianReviewLifecycleTest is Test {
         // resolved by predicting proxy addresses. From `baseNonce`:
         //   swoodImpl (+0), swoodProxy (+1), govImpl (+2), govProxy (+3),
         //   regImpl (+4), regProxy (+5).
+        ProtocolConfig _hoistedPC = new ProtocolConfig(owner);
         uint256 baseNonce = vm.getNonce(address(this));
         address predictedGovernor = vm.computeCreateAddress(address(this), baseNonce + 3);
         address predictedRegistryProxy = vm.computeCreateAddress(address(this), baseNonce + 5);
@@ -116,7 +118,6 @@ contract GuardianReviewLifecycleTest is Test {
             (StakedWood.InitParams({
                     owner: owner,
                     wood: address(wood),
-                    governor: predictedGovernor,
                     factory: factoryEoa,
                     minGuardianStake: MIN_GUARDIAN_STAKE,
                     coolDownPeriod: 7 days,
@@ -131,8 +132,11 @@ contract GuardianReviewLifecycleTest is Test {
         bytes memory govInit = abi.encodeCall(
             SyndicateGovernor.initialize,
             (
-                ISyndicateGovernor.InitParams({
-                    owner: owner,
+                address(vault), // vault_: this test's vault (per-vault governor)
+                predictedRegistryProxy,
+                address(_hoistedPC),
+                address(this), // factory (test contract)
+                ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,
                     vetoThresholdBps: VETO_THRESHOLD_BPS,
@@ -141,30 +145,28 @@ contract GuardianReviewLifecycleTest is Test {
                     collaborationWindow: 48 hours,
                     maxCoProposers: 5,
                     minStrategyDuration: 1 hours,
-                    maxStrategyDuration: 30 days,
-                    protocolFeeBps: 0,
-                    protocolFeeRecipient: address(0),
-                    guardianFeeBps: 0,
-                    guardiansFeeRecipient: address(0)
-                }),
-                predictedRegistryProxy
+                    maxStrategyDuration: 30 days
+                })
             )
         );
         governor = SyndicateGovernor(address(new ERC1967Proxy(address(govImpl), govInit)));
+        // Per-vault governor: the vault resolves its governor via its factory
+        // (this test contract). Mock governorOf(vault) -> the deployed governor.
+        vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
         require(address(governor) == predictedGovernor, "governor addr mismatch");
-
-        vm.prank(owner);
-        governor.addVault(address(vault));
 
         // Registry — slimmed 6-arg initialize. factoryEoa = test contract so we
         // can bind owner stake. Must land at predictedRegistryProxy — `require`
         // below catches nonce drift.
         GuardianRegistry regImpl = new GuardianRegistry();
         bytes memory regInit = abi.encodeCall(
-            GuardianRegistry.initialize,
-            (owner, address(governor), factoryEoa, address(swood), REVIEW_PERIOD, BLOCK_QUORUM_BPS)
+            GuardianRegistry.initialize, (owner, factoryEoa, address(swood), REVIEW_PERIOD, BLOCK_QUORUM_BPS)
         );
         registry = GuardianRegistry(address(new ERC1967Proxy(address(regImpl), regInit)));
+        // Authorize the per-vault governor on the composite-key registry
+        // (replaces the removed governor.addVault wiring).
+        vm.prank(registry.factory());
+        registry.addGovernor(address(governor));
         require(address(registry) == predictedRegistryProxy, "registry addr mismatch");
 
         // Resolve the registry ↔ sWOOD circular dependency.
@@ -271,13 +273,13 @@ contract GuardianReviewLifecycleTest is Test {
         );
 
         // Keeper opens the review.
-        registry.openReview(pid);
+        registry.openReview(address(governor), pid);
 
         // Optional Approve votes — don't matter for the outcome, but exercise the path.
         vm.prank(g1);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
         vm.prank(g2);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
 
         // Review ends → state resolves to Approved (no blocks).
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
@@ -311,26 +313,26 @@ contract GuardianReviewLifecycleTest is Test {
         _voteFor(pid);
 
         vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
-        registry.openReview(pid);
+        registry.openReview(address(governor), pid);
 
         // g1, g2 Approve; g3, g4, g5 Block.
         // Total stake at open = 100k. Block weight = 60k → 60% ≥ 30% quorum → BLOCKED.
         vm.prank(g1);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
         vm.prank(g2);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
         vm.prank(g3);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Block, 10_000);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, 10_000);
         vm.prank(g4);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Block, 10_000);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, 10_000);
         vm.prank(g5);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Block, 10_000);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, 10_000);
 
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
 
         // Resolve review directly on the registry (permissionless). This slashes
         // approvers and caches `blocked = true`.
-        bool blocked = registry.resolveReview(pid);
+        bool blocked = registry.resolveReview(address(governor), pid);
         assertTrue(blocked, "review resolved as blocked");
 
         // Approvers were slashed at maxSlashBps=9999 (C-2 cap, not 10_000).
@@ -371,9 +373,9 @@ contract GuardianReviewLifecycleTest is Test {
         _voteFor(pid);
 
         vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
-        registry.openReview(pid);
+        registry.openReview(address(governor), pid);
 
-        (,,, bool cohortTooSmall) = registry.getReviewState(pid);
+        (,,, bool cohortTooSmall) = registry.getReviewState(address(governor), pid);
         assertTrue(cohortTooSmall, "cohort flagged as too small");
 
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
@@ -406,7 +408,7 @@ contract GuardianReviewLifecycleTest is Test {
 
         // Move past review → Approved.
         vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
-        registry.openReview(pid);
+        registry.openReview(address(governor), pid);
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
         // Drive the registry resolution via the mutating resolver on the governor
         // by calling a state-changing path. `vetoProposal` is cheap — attempt it
@@ -440,7 +442,7 @@ contract GuardianReviewLifecycleTest is Test {
         _voteFor(pid);
 
         vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
-        registry.openReview(pid);
+        registry.openReview(address(governor), pid);
 
         // 3 approvers × 10k + 5 blockers × 10k = 30k approve / 50k block out of
         // 100k + 50k = 150k... but g1..g5 staked 20k each above. Let me account
@@ -450,28 +452,28 @@ contract GuardianReviewLifecycleTest is Test {
         uint256 burnBefore = wood.balanceOf(BURN_ADDRESS);
 
         vm.prank(g1);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
         vm.prank(g2);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
         vm.prank(g3);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
         vm.prank(g6);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Block, 10_000);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, 10_000);
         vm.prank(g7);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Block, 10_000);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, 10_000);
         vm.prank(g8);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Block, 10_000);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, 10_000);
         vm.prank(g9);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Block, 10_000);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, 10_000);
         vm.prank(g10);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Block, 10_000);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, 10_000);
 
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
 
         // Drive the registry resolution first so state transitions commit
         // (slashing + epoch attribution). The executeProposal call below then
         // reads the cached Rejected state via `_resolveStateView`.
-        bool blocked = registry.resolveReview(pid);
+        bool blocked = registry.resolveReview(address(governor), pid);
         assertTrue(blocked, "review resolved as blocked");
 
         // executeProposal reads `_resolveStateView` → Rejected → reverts.
@@ -514,30 +516,30 @@ contract GuardianReviewLifecycleTest is Test {
         _voteFor(pid);
 
         vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
-        registry.openReview(pid);
+        registry.openReview(address(governor), pid);
 
         // g1 initially approves.
         vm.prank(g1);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
 
         // Still well before the 10% lockout window — flip to Block.
         vm.warp(vm.getBlockTimestamp() + 1 hours);
         vm.prank(g1);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Block, 0);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, 0);
 
         // Four more guardians also block so the quorum is hit (5 × 20k = 100k,
         // well above 30% of 100k total).
         vm.prank(g2);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Block, 0);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, 0);
         vm.prank(g3);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Block, 0);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, 0);
         vm.prank(g4);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Block, 0);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, 0);
         vm.prank(g5);
-        registry.voteOnProposal(pid, IGuardianRegistry.GuardianVoteType.Block, 0);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, 0);
 
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD);
-        bool blocked = registry.resolveReview(pid);
+        bool blocked = registry.resolveReview(address(governor), pid);
         assertTrue(blocked, "review resolved as blocked");
 
         // g1's stake was preserved at first-vote value and counted on the
@@ -570,7 +572,8 @@ contract GuardianReviewLifecycleTest is Test {
         );
 
         // Registry review is now cached as resolved=true, blocked=false, opened=false.
-        (bool opened, bool resolved, bool blocked, bool cohortTooSmall) = registry.getReviewState(pid);
+        (bool opened, bool resolved, bool blocked, bool cohortTooSmall) =
+            registry.getReviewState(address(governor), pid);
         assertFalse(opened, "review never opened");
         assertTrue(resolved, "review cached resolved");
         assertFalse(blocked, "review not blocked");

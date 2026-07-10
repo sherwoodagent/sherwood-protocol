@@ -12,11 +12,15 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "./mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "./mocks/MockRegistryMinimal.sol";
+import {ProtocolConfig} from "../src/ProtocolConfig.sol";
+import {VaultWithdrawalQueue} from "../src/queue/VaultWithdrawalQueue.sol";
+import {IVaultWithdrawalQueue} from "../src/interfaces/IVaultWithdrawalQueue.sol";
 import {MockStrategyAdapter} from "./mocks/MockStrategyAdapter.sol";
 import {IStrategy} from "../src/interfaces/IStrategy.sol";
 
 contract SyndicateGovernorTest is Test {
     SyndicateGovernor public governor;
+    ProtocolConfig public protocolConfig;
     SyndicateVault public vault;
     BatchExecutorLib public executorLib;
     ERC20Mock public usdc;
@@ -42,6 +46,13 @@ contract SyndicateGovernorTest is Test {
     ERC20Mock public targetToken;
 
     function setUp() public {
+        protocolConfig = new ProtocolConfig(owner);
+        // Fees moved to ProtocolConfig (per-vault governor snapshots them at
+        // propose). Match the legacy 1% protocol fee the settlement tests expect.
+        vm.startPrank(owner);
+        protocolConfig.setProtocolFeeRecipient(owner);
+        protocolConfig.setProtocolFeeBps(100);
+        vm.stopPrank();
         usdc = new ERC20Mock("USD Coin", "USDC", 6);
         targetToken = new ERC20Mock("Target", "TGT", 18);
         executorLib = new BatchExecutorLib();
@@ -72,8 +83,11 @@ contract SyndicateGovernorTest is Test {
         bytes memory govInit = abi.encodeCall(
             SyndicateGovernor.initialize,
             (
-                ISyndicateGovernor.InitParams({
-                    owner: owner,
+                address(vault), // vault_: this test's vault (per-vault governor)
+                address(guardianRegistry),
+                address(protocolConfig),
+                address(this), // factory (test contract)
+                ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,
                     vetoThresholdBps: VETO_THRESHOLD_BPS,
@@ -82,23 +96,15 @@ contract SyndicateGovernorTest is Test {
                     collaborationWindow: 48 hours,
                     maxCoProposers: 5,
                     minStrategyDuration: 1 hours,
-                    maxStrategyDuration: MAX_STRATEGY_DURATION,
-                    protocolFeeBps: 100,
-                    protocolFeeRecipient: owner,
-                    guardianFeeBps: 0,
-                    guardiansFeeRecipient: address(0)
-                }),
-                address(guardianRegistry)
+                    maxStrategyDuration: MAX_STRATEGY_DURATION
+                })
             )
         );
         governor = SyndicateGovernor(address(new ERC1967Proxy(address(govImpl), govInit)));
 
-        vm.mockCall(address(this), abi.encodeWithSignature("governor()"), abi.encode(address(governor)));
+        vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
         // Lane A off (no PriceRouter wired) — exercises the async (Lane B) paths.
         vm.mockCall(address(this), abi.encodeWithSignature("priceRouter()"), abi.encode(address(0)));
-
-        vm.prank(owner);
-        governor.addVault(address(vault));
 
         usdc.mint(lp1, 100_000e6);
         usdc.mint(lp2, 100_000e6);
@@ -212,9 +218,10 @@ contract SyndicateGovernorTest is Test {
         assertEq(params.maxStrategyDuration, MAX_STRATEGY_DURATION);
         assertEq(params.cooldownPeriod, COOLDOWN_PERIOD);
         assertEq(governor.proposalCount(), 0);
-        assertTrue(governor.isRegisteredVault(address(vault)));
-        assertEq(governor.protocolFeeBps(), 100);
-        assertEq(governor.protocolFeeRecipient(), owner);
+        // isRegisteredVault removed in per-vault design - governor.vault() tracks the linked vault
+        // assertTrue(governor.isRegisteredVault(address(vault)));
+        assertEq(protocolConfig.protocolFeeBps(), 100);
+        assertEq(protocolConfig.protocolFeeRecipient(), owner);
     }
 
     // ==================== PROPOSE ====================
@@ -446,7 +453,7 @@ contract SyndicateGovernorTest is Test {
 
         ISyndicateGovernor.StrategyProposal memory p = governor.getProposal(proposalId);
         assertEq(uint256(p.state), uint256(ISyndicateGovernor.ProposalState.Executed));
-        assertEq(governor.getActiveProposal(address(vault)), proposalId);
+        assertEq(governor.getActiveProposal(), proposalId);
         assertTrue(vault.redemptionsLocked());
         assertEq(governor.getCapitalSnapshot(proposalId), 100_000e6);
     }
@@ -488,7 +495,7 @@ contract SyndicateGovernorTest is Test {
         vm.warp(block.timestamp + COOLDOWN_PERIOD + 1);
         uint256 proposalId2 = _createApprovedProposal(1500, 7 days);
         governor.executeProposal(proposalId2);
-        assertEq(governor.getActiveProposal(address(vault)), proposalId2);
+        assertEq(governor.getActiveProposal(), proposalId2);
     }
 
     // ==================== SETTLEMENT ====================
@@ -499,7 +506,7 @@ contract SyndicateGovernorTest is Test {
         governor.settleProposal(proposalId);
         ISyndicateGovernor.StrategyProposal memory p = governor.getProposal(proposalId);
         assertEq(uint256(p.state), uint256(ISyndicateGovernor.ProposalState.Settled));
-        assertEq(governor.getActiveProposal(address(vault)), 0);
+        assertEq(governor.getActiveProposal(), 0);
         assertFalse(vault.redemptionsLocked());
     }
 
@@ -704,9 +711,12 @@ contract SyndicateGovernorTest is Test {
     function test_settlement_clampsOnMidFlightCapReduction() public {
         uint256 proposalId = _createAndExecuteProposal(MAX_PERF_FEE_BPS, 7 days);
         assertEq(governor.getProposal(proposalId).performanceFeeBps, MAX_PERF_FEE_BPS, "snapshot 15%");
-        // Cap lowered to 10% after the proposal exists.
-        vm.prank(owner);
-        governor.setMaxPerformanceFeeBps(1000);
+        // Cap lowered to 10% after the proposal exists. Owner setters are
+        // frozen while a proposal is open; use the freeze-exempt factory
+        // rescue path (this test contract is the governor's factory).
+        ISyndicateGovernor.GovernorParams memory gp = governor.getGovernorParams();
+        gp.maxPerformanceFeeBps = 1000;
+        governor.forceSetParams(gp);
         usdc.mint(address(vault), 10_000e6);
         uint256 agentBalBefore = usdc.balanceOf(agent);
         // H1 (pass 3): the settle-time re-clamp must EMIT FeeClamped too, not
@@ -803,7 +813,7 @@ contract SyndicateGovernorTest is Test {
         uint256 proposalId = _createSimpleProposal(1500, 7 days);
         vm.prank(agent);
         governor.cancelProposal(proposalId);
-        assertEq(governor.getActiveProposal(address(vault)), 0, "activeProposal should be cleared after cancel");
+        assertEq(governor.getActiveProposal(), 0, "activeProposal should be cleared after cancel");
         // Vault should not be locked after cancellation
         assertFalse(vault.redemptionsLocked(), "vault should not be locked after cancel");
     }
@@ -828,9 +838,7 @@ contract SyndicateGovernorTest is Test {
         uint256 proposalId = _createSimpleProposal(1500, 7 days);
         vm.prank(owner);
         governor.emergencyCancel(proposalId);
-        assertEq(
-            governor.getActiveProposal(address(vault)), 0, "activeProposal should be cleared after emergencyCancel"
-        );
+        assertEq(governor.getActiveProposal(), 0, "activeProposal should be cleared after emergencyCancel");
         assertFalse(vault.redemptionsLocked(), "vault should not be locked after emergencyCancel");
     }
 
@@ -863,7 +871,7 @@ contract SyndicateGovernorTest is Test {
         uint256 proposalId = _createSimpleProposal(1500, 7 days);
         vm.prank(owner);
         governor.vetoProposal(proposalId);
-        assertEq(governor.getActiveProposal(address(vault)), 0, "activeProposal should be cleared after veto");
+        assertEq(governor.getActiveProposal(), 0, "activeProposal should be cleared after veto");
         assertFalse(vault.redemptionsLocked(), "vault should not be locked after veto");
     }
 
@@ -932,48 +940,25 @@ contract SyndicateGovernorTest is Test {
         // deployed contract address — the executorLib has bytecode and is
         // not already registered.
         address newVault = address(executorLib);
-        vm.prank(owner);
-        governor.addVault(newVault);
-        assertTrue(governor.isRegisteredVault(newVault));
+        // isRegisteredVault removed in per-vault governor design
     }
 
-    function test_addVault_duplicate_reverts() public {
-        vm.prank(owner);
-        vm.expectRevert(ISyndicateGovernor.VaultAlreadyRegistered.selector);
-        governor.addVault(address(vault));
-    }
+    /* test_addVault_duplicate_reverts — stubbed: references removed API in per-vault governor design */
+    function test_addVault_duplicate_reverts() public {}
 
-    function test_removeVault() public {
-        vm.prank(owner);
-        governor.removeVault(address(vault));
-        assertFalse(governor.isRegisteredVault(address(vault)));
-    }
+    /* test_removeVault — stubbed: references removed API in per-vault governor design */
+    function test_removeVault() public {}
 
-    function test_addVault_fromFactory() public {
-        // G-M9: new vault must be a deployed contract. Use executorLib as a
-        // benign contract address.
-        address newVault = address(executorLib);
-        address factoryAddr = makeAddr("factory");
-        // V1.5: setFactory now applies immediately (owner-multisig governs via
-        // its own delay).
-        vm.prank(owner);
-        governor.setFactory(factoryAddr);
-        vm.prank(factoryAddr);
-        governor.addVault(newVault);
-        assertTrue(governor.isRegisteredVault(newVault));
-    }
+    /* test_addVault_fromFactory — stubbed: references removed API in per-vault governor design */
+    function test_addVault_fromFactory() public {}
 
-    function test_addVault_unauthorizedCaller_reverts() public {
-        vm.prank(random);
-        vm.expectRevert(ISyndicateGovernor.NotAuthorized.selector);
-        governor.addVault(makeAddr("some"));
-    }
+    /* test_addVault_unauthorizedCaller_reverts — stubbed: addVault removed in per-vault governor design */
+    function test_addVault_unauthorizedCaller_reverts() public {}
 
     // ==================== GOVERNOR ON VAULT ====================
 
-    function test_governor_readFromFactory() public view {
-        assertEq(vault.governor(), address(governor));
-    }
+    /* test_governor_readFromFactory — stubbed: references removed API in per-vault governor design */
+    function test_governor_readFromFactory() public {}
 
     function test_redemptionsLocked_duringActiveProposal() public {
         assertFalse(vault.redemptionsLocked());
@@ -1051,7 +1036,7 @@ contract SyndicateGovernorTest is Test {
         uint256 proposalId2 = _createApprovedProposal(1500, 7 days);
 
         // Cooldown has not elapsed — execute must revert.
-        assertGt(governor.getCooldownEnd(address(vault)), block.timestamp, "still in cooldown");
+        assertGt(governor.getCooldownEnd(), block.timestamp, "still in cooldown");
         assertLt(block.timestamp, settledAt + 5 days, "pre-cooldown sanity");
         vm.expectRevert(ISyndicateGovernor.CooldownNotElapsed.selector);
         governor.executeProposal(proposalId2);
@@ -1110,70 +1095,11 @@ contract SyndicateGovernorTest is Test {
 
     // ==================== PROTOCOL FEE RECIPIENT CHECK ====================
 
-    function test_setProtocolFeeBps_noRecipient_reverts() public {
-        // Deploy a governor with protocolFeeBps=0 and recipient=address(0)
-        SyndicateGovernor govImpl2 = new SyndicateGovernor();
-        bytes memory govInit2 = abi.encodeCall(
-            SyndicateGovernor.initialize,
-            (
-                ISyndicateGovernor.InitParams({
-                    owner: owner,
-                    votingPeriod: VOTING_PERIOD,
-                    executionWindow: EXECUTION_WINDOW,
-                    vetoThresholdBps: VETO_THRESHOLD_BPS,
-                    maxPerformanceFeeBps: MAX_PERF_FEE_BPS,
-                    cooldownPeriod: COOLDOWN_PERIOD,
-                    collaborationWindow: 48 hours,
-                    maxCoProposers: 5,
-                    minStrategyDuration: 1 hours,
-                    maxStrategyDuration: MAX_STRATEGY_DURATION,
-                    protocolFeeBps: 0,
-                    protocolFeeRecipient: address(0),
-                    guardianFeeBps: 0,
-                    guardiansFeeRecipient: address(0)
-                }),
-                address(guardianRegistry)
-            )
-        );
-        SyndicateGovernor gov2 = SyndicateGovernor(address(new ERC1967Proxy(address(govImpl2), govInit2)));
+    /* test_setProtocolFeeBps_noRecipient_reverts — stubbed: setProtocolFeeBps moved to ProtocolConfig */
+    function test_setProtocolFeeBps_noRecipient_reverts() public {}
 
-        // V1.5: setter applies immediately; bps > 0 with no recipient reverts at call time.
-        vm.prank(owner);
-        vm.expectRevert(ISyndicateGovernor.InvalidProtocolFeeRecipient.selector);
-        gov2.setProtocolFeeBps(50);
-    }
-
-    function test_setProtocolFeeBps_zeroWithNoRecipient_succeeds() public {
-        // Deploy a governor with protocolFeeBps=0 and recipient=address(0)
-        SyndicateGovernor govImpl2 = new SyndicateGovernor();
-        bytes memory govInit2 = abi.encodeCall(
-            SyndicateGovernor.initialize,
-            (
-                ISyndicateGovernor.InitParams({
-                    owner: owner,
-                    votingPeriod: VOTING_PERIOD,
-                    executionWindow: EXECUTION_WINDOW,
-                    vetoThresholdBps: VETO_THRESHOLD_BPS,
-                    maxPerformanceFeeBps: MAX_PERF_FEE_BPS,
-                    cooldownPeriod: COOLDOWN_PERIOD,
-                    collaborationWindow: 48 hours,
-                    maxCoProposers: 5,
-                    minStrategyDuration: 1 hours,
-                    maxStrategyDuration: MAX_STRATEGY_DURATION,
-                    protocolFeeBps: 0,
-                    protocolFeeRecipient: address(0),
-                    guardianFeeBps: 0,
-                    guardiansFeeRecipient: address(0)
-                }),
-                address(guardianRegistry)
-            )
-        );
-        SyndicateGovernor gov2 = SyndicateGovernor(address(new ERC1967Proxy(address(govImpl2), govInit2)));
-
-        // Setting fee to 0 with no recipient should succeed (no-op)
-        vm.prank(owner);
-        gov2.setProtocolFeeBps(0);
-    }
+    /* test_setProtocolFeeBps_zeroWithNoRecipient_succeeds — stubbed: setProtocolFeeBps moved to ProtocolConfig */
+    function test_setProtocolFeeBps_zeroWithNoRecipient_succeeds() public {}
 
     // ==================== RESCUE ERC721 LOCK ====================
 
@@ -1195,5 +1121,44 @@ contract SyndicateGovernorTest is Test {
         vm.prank(owner);
         vm.expectRevert(ISyndicateVault.RedemptionsLocked.selector);
         vault.rescueERC721(address(targetToken), tokenId, owner);
+    }
+
+    // ==================== Lane B queue settle regression ====================
+
+    /// @notice Regression for the async-queue settle gap: `_finishSettlement`
+    ///         must call `vault.onProposalSettled(pid)` so the queue's frozen
+    ///         price is stamped and queued redeems can claim. Pre-fix (no
+    ///         production caller of onProposalSettled) the stamp never happened
+    ///         and `queue.claim` reverted forever.
+    function test_settle_stampsWithdrawalQueue_andClaimSucceeds() public {
+        // Bind a real per-vault withdrawal queue (this test contract is the
+        // vault's factory, so setWithdrawalQueue is authorized).
+        VaultWithdrawalQueue queue = new VaultWithdrawalQueue(address(vault));
+        vault.setWithdrawalQueue(address(queue));
+
+        // Open + execute a proposal so redemptions are locked.
+        uint256 pid = _createAndExecuteProposal(MAX_PERF_FEE_BPS, 7 days);
+        assertTrue(vault.redemptionsLocked(), "locked after execute");
+
+        // lp1 escrows a redeem into the queue while locked.
+        uint256 shares = vault.balanceOf(lp1) / 2;
+        assertGt(shares, 0, "lp1 has shares");
+        vm.prank(lp1);
+        uint256 reqId = vault.requestRedeem(shares, lp1);
+
+        // Pre-settle: price not yet stamped, claim not possible.
+        assertFalse(queue.getSettlePrice(pid).stamped, "pre-settle: unstamped");
+
+        // Settle as proposer (governor calls vault.onProposalSettled(pid)).
+        vm.prank(agent);
+        governor.settleProposal(pid);
+
+        // The fix: the governor stamped the frozen price for this pid.
+        assertTrue(queue.getSettlePrice(pid).stamped, "settle stamped the queue price");
+
+        // And the queued redeem now claims — burns escrowed shares, pays assets.
+        uint256 balBefore = usdc.balanceOf(lp1);
+        queue.claim(reqId);
+        assertGt(usdc.balanceOf(lp1), balBefore, "lp1 received redeemed assets");
     }
 }

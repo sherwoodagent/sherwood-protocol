@@ -14,6 +14,7 @@ import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
+import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 
 /// @title ActiveProposalPreservation.t
 /// @notice Regression tests for **G-C2 / G-C3** — the historical bug where
@@ -102,6 +103,7 @@ contract ActiveProposalPreservationTest is Test {
         // resolved by predicting proxy addresses. From `baseNonce`:
         //   swoodImpl (+0), swoodProxy (+1), govImpl (+2), govProxy (+3),
         //   regImpl (+4), regProxy (+5).
+        ProtocolConfig _hoistedPC = new ProtocolConfig(owner);
         uint256 baseNonce = vm.getNonce(address(this));
         address predictedGovernor = vm.computeCreateAddress(address(this), baseNonce + 3);
         address predictedRegistryProxy = vm.computeCreateAddress(address(this), baseNonce + 5);
@@ -113,7 +115,6 @@ contract ActiveProposalPreservationTest is Test {
             (StakedWood.InitParams({
                     owner: owner,
                     wood: address(wood),
-                    governor: predictedGovernor,
                     factory: factoryEoa,
                     minGuardianStake: MIN_GUARDIAN_STAKE,
                     coolDownPeriod: 7 days,
@@ -128,8 +129,11 @@ contract ActiveProposalPreservationTest is Test {
         bytes memory govInit = abi.encodeCall(
             SyndicateGovernor.initialize,
             (
-                ISyndicateGovernor.InitParams({
-                    owner: owner,
+                address(vault), // vault_: this test's vault (per-vault governor)
+                predictedRegistryProxy,
+                address(_hoistedPC),
+                address(this), // factory (test contract)
+                ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,
                     vetoThresholdBps: VETO_THRESHOLD_BPS,
@@ -138,27 +142,25 @@ contract ActiveProposalPreservationTest is Test {
                     collaborationWindow: 48 hours,
                     maxCoProposers: 5,
                     minStrategyDuration: 1 hours,
-                    maxStrategyDuration: 30 days,
-                    protocolFeeBps: 0,
-                    protocolFeeRecipient: address(0),
-                    guardianFeeBps: 0,
-                    guardiansFeeRecipient: address(0)
-                }),
-                predictedRegistryProxy
+                    maxStrategyDuration: 30 days
+                })
             )
         );
         governor = SyndicateGovernor(address(new ERC1967Proxy(address(govImpl), govInit)));
+        // Per-vault governor: the vault resolves its governor via its factory
+        // (this test contract). Mock governorOf(vault) -> the deployed governor.
+        vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
         require(address(governor) == predictedGovernor, "governor addr mismatch");
-
-        vm.prank(owner);
-        governor.addVault(address(vault));
 
         GuardianRegistry regImpl = new GuardianRegistry();
         bytes memory regInit = abi.encodeCall(
-            GuardianRegistry.initialize,
-            (owner, address(governor), factoryEoa, address(swood), REVIEW_PERIOD, BLOCK_QUORUM_BPS)
+            GuardianRegistry.initialize, (owner, factoryEoa, address(swood), REVIEW_PERIOD, BLOCK_QUORUM_BPS)
         );
         registry = GuardianRegistry(address(new ERC1967Proxy(address(regImpl), regInit)));
+        // Authorize the per-vault governor on the composite-key registry
+        // (replaces the removed governor.addVault wiring).
+        vm.prank(registry.factory());
+        registry.addGovernor(address(governor));
         require(address(registry) == predictedRegistryProxy, "registry addr mismatch");
 
         // Resolve the registry ↔ sWOOD circular dependency.
@@ -235,14 +237,14 @@ contract ActiveProposalPreservationTest is Test {
 
     /// @dev Drives proposal A all the way to `Executed`. After this returns:
     ///      - `governor.getProposal(A).state == Executed`
-    ///      - `governor.getActiveProposal(V) == A`
+    ///      - `governor.getActiveProposal() == A`
     ///      - `vault.redemptionsLocked() == true`
     function _driveToExecuted() internal returns (uint256 pidA) {
         pidA = _propose("ipfs://A");
         _voteFor(pidA);
 
         vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
-        registry.openReview(pidA);
+        registry.openReview(address(governor), pidA);
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
 
         governor.executeProposal(pidA);
@@ -253,13 +255,13 @@ contract ActiveProposalPreservationTest is Test {
             uint256(ISyndicateGovernor.ProposalState.Executed),
             "A should be Executed"
         );
-        assertEq(governor.getActiveProposal(address(vault)), pidA, "_activeProposal[V] == A");
+        assertEq(governor.getActiveProposal(), pidA, "_activeProposal[V] == A");
         assertTrue(vault.redemptionsLocked(), "vault locked by A");
     }
 
     /// @dev Shared post-condition: A still tracked, Executed, vault still locked.
     function _assertAStillLive(uint256 pidA) internal view {
-        assertEq(governor.getActiveProposal(address(vault)), pidA, "_activeProposal[V] still == A after cancelling B");
+        assertEq(governor.getActiveProposal(), pidA, "_activeProposal[V] still == A after cancelling B");
         assertEq(
             uint256(governor.getProposal(pidA).state),
             uint256(ISyndicateGovernor.ProposalState.Executed),

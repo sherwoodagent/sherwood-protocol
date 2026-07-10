@@ -12,6 +12,7 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
+import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 
 /// @title CancelProposal — regression suite for proposer cancel branches
 /// @notice Covers the V1.5 extension that lets the proposer cancel during
@@ -82,8 +83,11 @@ contract CancelProposalTest is Test {
         bytes memory govInit = abi.encodeCall(
             SyndicateGovernor.initialize,
             (
-                ISyndicateGovernor.InitParams({
-                    owner: owner,
+                address(vault), // vault_: this test's vault (per-vault governor)
+                address(guardianRegistry),
+                address(new ProtocolConfig(owner)),
+                address(this), // factory (test contract)
+                ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,
                     vetoThresholdBps: VETO_THRESHOLD_BPS,
@@ -92,20 +96,12 @@ contract CancelProposalTest is Test {
                     collaborationWindow: 48 hours,
                     maxCoProposers: 5,
                     minStrategyDuration: 1 hours,
-                    maxStrategyDuration: MAX_STRATEGY_DURATION,
-                    protocolFeeBps: 0,
-                    protocolFeeRecipient: owner,
-                    guardianFeeBps: 0,
-                    guardiansFeeRecipient: address(0)
-                }),
-                address(guardianRegistry)
+                    maxStrategyDuration: MAX_STRATEGY_DURATION
+                })
             )
         );
         governor = SyndicateGovernor(address(new ERC1967Proxy(address(govImpl), govInit)));
-        vm.mockCall(address(this), abi.encodeWithSignature("governor()"), abi.encode(address(governor)));
-
-        vm.prank(owner);
-        governor.addVault(address(vault));
+        vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
 
         usdc.mint(lp1, 100_000e6);
         usdc.mint(lp2, 100_000e6);
@@ -192,12 +188,12 @@ contract CancelProposalTest is Test {
 
     function test_cancelProposal_fromApproved_decrementsOpenCount() public {
         uint256 pid = _proposeAndApprove();
-        assertEq(governor.openProposalCount(address(vault)), 1, "open count after propose");
+        assertEq(governor.openProposalCount(), 1, "open count after propose");
 
         vm.prank(agent);
         governor.cancelProposal(pid);
 
-        assertEq(governor.openProposalCount(address(vault)), 0, "open count after cancel");
+        assertEq(governor.openProposalCount(), 0, "open count after cancel");
     }
 
     function test_cancelProposal_fromApproved_unlocksFutureProposals() public {
@@ -253,12 +249,12 @@ contract CancelProposalTest is Test {
 
     function test_cancelProposal_fromGuardianReview_decrementsOpenCount() public {
         uint256 pid = _proposeAndDriveToGuardianReview();
-        assertEq(governor.openProposalCount(address(vault)), 1);
+        assertEq(governor.openProposalCount(), 1);
 
         vm.prank(agent);
         governor.cancelProposal(pid);
 
-        assertEq(governor.openProposalCount(address(vault)), 0);
+        assertEq(governor.openProposalCount(), 0);
     }
 
     function test_cancelProposal_fromGuardianReview_byNonProposerReverts() public {
@@ -282,11 +278,7 @@ contract CancelProposalTest is Test {
         vm.prank(agent);
         governor.cancelProposal(pid);
 
-        assertEq(
-            governor.getCooldownEnd(address(vault)),
-            cancelTime + COOLDOWN_PERIOD,
-            "cooldown end = cancelTime + cooldownPeriod"
-        );
+        assertEq(governor.getCooldownEnd(), cancelTime + COOLDOWN_PERIOD, "cooldown end = cancelTime + cooldownPeriod");
     }
 
     function test_cancelProposal_fromGuardianReview_bumpsCooldown() public {
@@ -296,10 +288,6 @@ contract CancelProposalTest is Test {
         vm.prank(agent);
         governor.cancelProposal(pid);
 
-        assertEq(
-            governor.getCooldownEnd(address(vault)),
-            cancelTime + COOLDOWN_PERIOD,
-            "cooldown end = cancelTime + cooldownPeriod"
-        );
+        assertEq(governor.getCooldownEnd(), cancelTime + COOLDOWN_PERIOD, "cooldown end = cancelTime + cooldownPeriod");
     }
 }

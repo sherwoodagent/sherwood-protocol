@@ -5,7 +5,6 @@ import {ISyndicateGovernor} from "./interfaces/ISyndicateGovernor.sol";
 import {ISyndicateVault} from "./interfaces/ISyndicateVault.sol";
 import {IGuardianRegistry} from "./interfaces/IGuardianRegistry.sol";
 import {BatchExecutorLib} from "./BatchExecutorLib.sol";
-import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 
 /// @title GovernorEmergency
 /// @notice Abstract — emergency settlement paths extracted for bytecode headroom.
@@ -46,7 +45,7 @@ abstract contract GovernorEmergency is ISyndicateGovernor {
     /// @dev Shared vault-owner gate. Reachable from SyndicateGovernor (which inherits
     ///      this abstract). Bytecode lever: folds 6 identical inline copies into one.
     function _requireVaultOwner(address vault) internal view {
-        if (msg.sender != OwnableUpgradeable(vault).owner()) revert NotVaultOwner();
+        if (msg.sender != ISyndicateVault(vault).owner()) revert NotVaultOwner();
     }
 
     // ── Emergency settle lifecycle ──
@@ -66,22 +65,17 @@ abstract contract GovernorEmergency is ISyndicateGovernor {
     /// @notice Vault owner opens an emergency review on a stuck proposal with
     ///         owner-supplied unwind calls. Requires bonded owner stake.
     ///         All call storage is delegated to the registry.
-    /// @dev `emergencyNonReentrant` dropped: this function makes NO governor
-    ///      state writes — it's a thin delegation to `registry.openEmergency`.
-    ///      The registry has its own `EmergencyAlreadyOpen` / cooldown gates
-    ///      (#15) so reentry from the registry back into this entrypoint hits
-    ///      those checks. ~20 bytes saved.
-    function emergencySettleWithCalls(uint256 proposalId, BatchExecutorLib.Call[] calldata calls) external {
+    function emergencySettleWithCalls(uint256 proposalId, BatchExecutorLib.Call[] calldata calls)
+        external
+        emergencyNonReentrant
+    {
         StrategyProposal storage p = _getProposal(proposalId);
         _requireVaultOwner(p.vault);
         if (p.state != ProposalState.Executed) revert ProposalNotExecuted();
         if (block.timestamp < p.executedAt + p.strategyDuration) revert StrategyDurationNotElapsed();
 
         IGuardianRegistry reg = _getRegistry();
-        // `requiredOwnerBond` was dropped on the registry (bytecode budget);
-        // read `minOwnerStake` directly — the registry implementation
-        // returned exactly that value anyway.
-        if (reg.ownerStake(p.vault) < reg.minOwnerStake()) revert OwnerBondInsufficient();
+        if (reg.ownerStake(p.vault) < reg.requiredOwnerBond(p.vault)) revert OwnerBondInsufficient();
 
         bytes32 h = keccak256(abi.encode(calls));
         reg.openEmergency(proposalId, h, calls);
@@ -89,15 +83,12 @@ abstract contract GovernorEmergency is ISyndicateGovernor {
     }
 
     /// @notice Vault owner withdraws their open emergency review before resolution.
-    /// @dev `emergencyNonReentrant` dropped: pure delegation to
-    ///      `registry.cancelEmergency`. No governor state writes; registry's
-    ///      own state machine guards against ill-timed reentry. ~20 bytes saved.
-    function cancelEmergencySettle(uint256 proposalId) external {
+    function cancelEmergencySettle(uint256 proposalId) external emergencyNonReentrant {
         StrategyProposal storage p = _getProposal(proposalId);
         _requireVaultOwner(p.vault);
         if (p.state != ProposalState.Executed) revert ProposalNotExecuted();
         IGuardianRegistry reg = _getRegistry();
-        if (!reg.isEmergencyOpen(proposalId)) revert EmergencyNotProposed();
+        if (!reg.isEmergencyOpen(address(this), proposalId)) revert EmergencyNotProposed();
         reg.cancelEmergency(proposalId);
         emit EmergencySettleCancelled(proposalId, msg.sender);
     }

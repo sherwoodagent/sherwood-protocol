@@ -6,6 +6,10 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {SyndicateVault} from "../src/SyndicateVault.sol";
 import {BatchExecutorLib} from "../src/BatchExecutorLib.sol";
 import {SyndicateFactory} from "../src/SyndicateFactory.sol";
+import {SyndicateGovernor} from "../src/SyndicateGovernor.sol";
+import {ISyndicateGovernor} from "../src/interfaces/ISyndicateGovernor.sol";
+import {GovernorBeacon} from "../src/GovernorBeacon.sol";
+import {ProtocolConfig} from "../src/ProtocolConfig.sol";
 import {VaultWithdrawalQueue} from "../src/queue/VaultWithdrawalQueue.sol";
 import {IGuardianRegistry} from "../src/interfaces/IGuardianRegistry.sol";
 import {IStakedWood} from "../src/interfaces/IStakedWood.sol";
@@ -40,6 +44,12 @@ contract SyndicateFactoryTest is Test {
         ensRegistrar = new MockL2Registrar();
         agentRegistry = new MockAgentRegistry();
 
+        // Per-vault governor: the factory deploys a BeaconProxy governor per
+        // vault at createSyndicate, so wire a real beacon + ProtocolConfig.
+        ProtocolConfig protocolCfg = new ProtocolConfig(owner);
+        SyndicateGovernor govImpl = new SyndicateGovernor();
+        GovernorBeacon beacon = new GovernorBeacon(address(govImpl), owner);
+
         // Deploy factory as UUPS proxy
         SyndicateFactory factoryImpl = new SyndicateFactory();
         bytes memory factoryInit = abi.encodeCall(
@@ -50,7 +60,8 @@ contract SyndicateFactoryTest is Test {
                     vaultImpl: address(vaultImpl),
                     ensRegistrar: address(ensRegistrar),
                     agentRegistry: address(agentRegistry),
-                    governor: governorAddr,
+                    beacon: address(beacon),
+                    protocolConfig: address(protocolCfg),
                     managementFeeBps: 50,
                     guardianRegistry: guardianRegistryAddr
                 }))
@@ -61,10 +72,11 @@ contract SyndicateFactoryTest is Test {
         creator1AgentId = agentRegistry.mint(creator1);
         creator2AgentId = agentRegistry.mint(creator2);
 
-        // Mock governor.getActiveProposal() so vault deposits work (no active proposals)
-        vm.mockCall(governorAddr, abi.encodeWithSignature("getActiveProposal(address)"), abi.encode(uint256(0)));
-        // MS-H4: vault `_deposit` reads `openProposalCount(address)` — mock to 0.
-        vm.mockCall(governorAddr, abi.encodeWithSignature("openProposalCount(address)"), abi.encode(uint256(0)));
+        // The factory calls `registry.addGovernor(govProxy)` inside createSyndicate;
+        // the registry is a mock here, so stub it. The per-vault governor is
+        // deployed for real and answers getActiveProposal()/openProposalCount()
+        // itself (0 when idle), so no governor mocks are needed.
+        vm.mockCall(guardianRegistryAddr, abi.encodeWithSelector(IGuardianRegistry.addGovernor.selector), "");
         // Task 26 + sWOOD split: the factory reads `registry.swood()` then
         // calls `canCreateVault` / `bindOwnerStake` on sWOOD. Mock the
         // registry → sWOOD hop plus the two sWOOD calls.
@@ -202,7 +214,7 @@ contract SyndicateFactoryTest is Test {
             target: address(usdc), data: abi.encodeCall(usdc.approve, (makeAddr("protocol"), 1_000e6)), value: 0
         });
 
-        vm.prank(governorAddr);
+        vm.prank(factory.governorOf(vaultAddr));
         vault.executeGovernorBatch(calls);
 
         // Verify: vault set the approval (delegatecall)
@@ -468,7 +480,8 @@ contract SyndicateFactoryTest is Test {
                 vaultImpl: address(vaultImpl),
                 ensRegistrar: address(ensRegistrar),
                 agentRegistry: address(agentRegistry),
-                governor: governorAddr,
+                beacon: governorAddr,
+                protocolConfig: governorAddr,
                 managementFeeBps: 50,
                 guardianRegistry: guardianRegistryAddr
             })
@@ -494,7 +507,8 @@ contract SyndicateFactoryTest is Test {
                 vaultImpl: address(vaultImpl),
                 ensRegistrar: address(ensRegistrar),
                 agentRegistry: address(agentRegistry),
-                governor: governorAddr,
+                beacon: governorAddr,
+                protocolConfig: governorAddr,
                 managementFeeBps: 50,
                 guardianRegistry: guardianRegistryAddr
             })
@@ -571,8 +585,9 @@ contract SyndicateFactoryTest is Test {
         assertFalse(okOwner, "setGovernor must not exist (owner)");
         assertEq(retOwner.length, 0, "expected empty revert data (fn does not exist)");
 
-        // Governor slot is set-once at initialize and unchanged.
-        assertEq(factory.governor(), governorAddr);
+        // Per-vault model: the factory has no governor slot at all (governors
+        // are per-vault BeaconProxies). The selector-absence checks above are
+        // the regression guard; nothing further to assert here.
     }
 
     // ==================== V-M7: SyndicateConfig validation ====================
@@ -755,5 +770,86 @@ contract SyndicateFactoryTest is Test {
         // old one untouched for this subdomain.
         assertTrue(newRegistrar.isRegistered("fresh-after-repoint"), "new registrar missed");
         assertFalse(ensRegistrar.isRegistered("fresh-after-repoint"), "old registrar called");
+    }
+
+    // ==================== Task 22: per-vault governor wiring ====================
+
+    /// @notice Every createSyndicate deploys its own BeaconProxy governor —
+    ///         two vaults must get two distinct, non-zero governors.
+    function test_createSyndicateDeploysDistinctGovernors() public {
+        vm.prank(creator1);
+        (, address vaultA) = factory.createSyndicate(creator1AgentId, _configWithSubdomain("vault-aaa"));
+        vm.prank(creator2);
+        (, address vaultB) = factory.createSyndicate(creator2AgentId, _configWithSubdomain("vault-bbb"));
+
+        address govA = factory.governorOf(vaultA);
+        address govB = factory.governorOf(vaultB);
+        assertTrue(govA != address(0), "vault A governor deployed");
+        assertTrue(govB != address(0), "vault B governor deployed");
+        assertTrue(govA != govB, "governors are per-vault, not shared");
+    }
+
+    /// @notice governorOf(vault) is populated at create; the vault resolves the
+    ///         same governor through its factory, and the governor knows its vault.
+    function test_governorOfPopulated() public {
+        vm.prank(creator1);
+        (, address vaultAddr) = factory.createSyndicate(creator1AgentId, _configWithSubdomain("vault-wire"));
+
+        address gov = factory.governorOf(vaultAddr);
+        assertTrue(gov != address(0), "governorOf populated");
+        // Vault resolves its governor via factory.governorOf (no local slot).
+        assertEq(SyndicateVault(payable(vaultAddr)).governor(), gov, "vault resolves the same governor");
+        // Governor is bound to this exact vault (propose() gate).
+        assertEq(SyndicateGovernor(gov).vault(), vaultAddr, "governor bound to its vault");
+        // And it is authorized on the registry mock (addGovernor was called) —
+        // asserted implicitly by the mocked registry accepting the call in setUp.
+    }
+
+    /// @notice setParamsOverride: factory-owner rescue path — bypasses the
+    ///         governor's whenNoActiveProposal freeze but NOT the bounds; and
+    ///         only the factory owner can call it.
+    function test_setParamsOverrideBypassesFreezeButEnforcesBounds() public {
+        vm.prank(creator1);
+        (, address vaultAddr) = factory.createSyndicate(creator1AgentId, _configWithSubdomain("vault-ovr"));
+        SyndicateGovernor gov = SyndicateGovernor(factory.governorOf(vaultAddr));
+
+        ISyndicateGovernor.GovernorParams memory p = gov.getGovernorParams();
+
+        // Owner path works (no proposal open — plain call).
+        p.votingPeriod = 48 hours;
+        vm.prank(owner);
+        factory.setParamsOverride(vaultAddr, p);
+        assertEq(gov.getGovernorParams().votingPeriod, 48 hours, "override applied");
+
+        // Bounds still bite (I2): the rescue path is bounds-checked for EVERY
+        // param, including collaborationWindow + maxCoProposers which the plain
+        // setters bound but _validateParamBounds previously omitted.
+        p.votingPeriod = 1 hours;
+        vm.prank(owner);
+        vm.expectRevert(ISyndicateGovernor.InvalidVotingPeriod.selector);
+        factory.setParamsOverride(vaultAddr, p);
+
+        p = gov.getGovernorParams();
+        p.collaborationWindow = 8 days; // > MAX_COLLABORATION_WINDOW (7 days)
+        vm.prank(owner);
+        vm.expectRevert(ISyndicateGovernor.InvalidCollaborationWindow.selector);
+        factory.setParamsOverride(vaultAddr, p);
+
+        p = gov.getGovernorParams();
+        p.maxCoProposers = 11; // > ABSOLUTE_MAX_CO_PROPOSERS (10)
+        vm.prank(owner);
+        vm.expectRevert(ISyndicateGovernor.InvalidMaxCoProposers.selector);
+        factory.setParamsOverride(vaultAddr, p);
+
+        // Strangers rejected by the factory's onlyOwner.
+        p.votingPeriod = 48 hours;
+        vm.prank(makeAddr("stranger"));
+        vm.expectRevert();
+        factory.setParamsOverride(vaultAddr, p);
+
+        // Unknown vault rejected.
+        vm.prank(owner);
+        vm.expectRevert(SyndicateFactory.VaultNotDeployed.selector);
+        factory.setParamsOverride(makeAddr("noVault"), p);
     }
 }

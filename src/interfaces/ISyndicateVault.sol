@@ -87,6 +87,7 @@ interface ISyndicateVault {
 
     // ── Governor ──
     function executeGovernorBatch(BatchExecutorLib.Call[] calldata calls) external;
+    function owner() external view returns (address);
     function transferPerformanceFee(address asset, address to, uint256 amount) external;
     function governor() external view returns (address);
     function redemptionsLocked() external view returns (bool);

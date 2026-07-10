@@ -2,6 +2,7 @@
 pragma solidity 0.8.28;
 
 import {BaseIntegrationTest} from "./BaseIntegrationTest.sol";
+import {IProtocolConfig} from "../../src/interfaces/IProtocolConfig.sol";
 import {MoonwellSupplyStrategy} from "../../src/strategies/MoonwellSupplyStrategy.sol";
 import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
@@ -199,7 +200,7 @@ contract GovernanceIntegrationTest is BaseIntegrationTest {
         vm.warp(block.timestamp + params.votingPeriod + 1);
 
         // Execution should revert because cooldown has not elapsed
-        uint256 cooldownEnd = governor.getCooldownEnd(address(vault));
+        uint256 cooldownEnd = governor.getCooldownEnd();
         if (block.timestamp < cooldownEnd) {
             vm.expectRevert(ISyndicateGovernor.CooldownNotElapsed.selector);
             governor.executeProposal(pid2);
@@ -244,8 +245,8 @@ contract GovernanceIntegrationTest is BaseIntegrationTest {
         uint256 proposalId = _proposeVoteExecute(execCalls, settleCalls, PERF_FEE_BPS, STRATEGY_DURATION);
 
         // Read protocol fee config from governor
-        uint256 protocolFeeBps = governor.protocolFeeBps();
-        address protocolFeeRecipient = governor.protocolFeeRecipient();
+        uint256 protocolFeeBps = IProtocolConfig(governor.protocolConfig()).protocolFeeBps();
+        address protocolFeeRecipient = IProtocolConfig(governor.protocolConfig()).protocolFeeRecipient();
 
         // Simulate profit by dealing extra USDC to vault
         uint256 profit = 5_000e6;
@@ -326,7 +327,7 @@ contract GovernanceIntegrationTest is BaseIntegrationTest {
         assertFalse(vault.redemptionsLocked(), "redemptions should be unlocked after strategy #1");
 
         // Warp past cooldown
-        uint256 cooldownEnd = governor.getCooldownEnd(address(vault));
+        uint256 cooldownEnd = governor.getCooldownEnd();
         vm.warp(cooldownEnd + 1);
 
         // --- Strategy #2 ---
@@ -347,7 +348,7 @@ contract GovernanceIntegrationTest is BaseIntegrationTest {
         );
 
         // Verify clean state
-        assertEq(governor.getActiveProposal(address(vault)), 0, "no active proposal after both strategies");
+        assertEq(governor.getActiveProposal(), 0, "no active proposal after both strategies");
         assertFalse(vault.redemptionsLocked(), "redemptions should be unlocked after strategy #2");
 
         // Vault should have recovered funds (minus rounding from Moonwell exchange rate)

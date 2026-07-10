@@ -2,7 +2,7 @@
 pragma solidity 0.8.28;
 
 import {ISyndicateGovernor} from "./interfaces/ISyndicateGovernor.sol";
-import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import {ISyndicateVault} from "./interfaces/ISyndicateVault.sol";
 import {FeeConstants} from "./FeeConstants.sol";
 
 /**
@@ -11,30 +11,32 @@ import {FeeConstants} from "./FeeConstants.sol";
  *         validation. Extracted from SyndicateGovernor to keep separation of
  *         concerns and relieve bytecode pressure.
  *
- *         Setters are **owner-instant** (no on-chain timelock). The owner is
- *         expected to be a multisig with its own delay/approval workflow
- *         (e.g., Gnosis Safe + Zodiac Delay module). Enforcing a timelock
- *         on-chain in addition to the multisig's is redundant — the multisig
- *         is the governance unit, and a compromised multisig already
- *         dominates whatever on-chain delay exists.
+ *         Per-vault governor (beacon): each vault owns a governor instance.
+ *         Setters are **vault-owner-instant** and gated behind
+ *         `whenNoActiveProposal` so parameters cannot shift under in-flight
+ *         proposals. The vault owner is expected to be a multisig.
  *
  *         All setters validate bounds at call time, apply immediately, and
  *         emit a uniform `ParameterChangeFinalized(paramKey, old, new)` event
  *         so indexers can subscribe to a single topic regardless of which
  *         parameter changed.
  */
-abstract contract GovernorParameters is ISyndicateGovernor, OwnableUpgradeable {
+abstract contract GovernorParameters is ISyndicateGovernor {
     // ── Safety bounds (hardcoded) ──
 
-    uint256 public constant MIN_VOTING_PERIOD = 1 hours;
+    uint256 public constant MIN_VOTING_PERIOD = 24 hours;
     uint256 public constant MAX_VOTING_PERIOD = 30 days;
     uint256 public constant MIN_EXECUTION_WINDOW = 1 hours;
     uint256 public constant MAX_EXECUTION_WINDOW = 7 days;
-    uint256 public constant MIN_VETO_THRESHOLD_BPS = 1000; // 10%
+    uint256 public constant MIN_VETO_THRESHOLD_BPS = 2000; // 20%
     uint256 public constant MAX_VETO_THRESHOLD_BPS = 5000; // 50%
     uint256 public constant MAX_PERFORMANCE_FEE_CAP = FeeConstants.MAX_PERFORMANCE_FEE_BPS; // 15%
     uint256 public constant ABSOLUTE_MIN_STRATEGY_DURATION = 1 hours;
-    uint256 public constant ABSOLUTE_MAX_STRATEGY_DURATION = 3650 days; // ~10y: supports indefinitely-lived strategies (e.g. leveraged Aerodrome CL)
+    // ~10y: supports indefinitely-lived strategies (e.g. leveraged Aerodrome CL). Params freeze and
+    // the owner bond stays locked only WHILE a proposal is open — the proposer can self-settle 1h
+    // after execute (MIN_STRATEGY_DURATION_BEFORE_SELF_SETTLE); only a non-proposer settle waits the
+    // full duration, so the long tail binds only an abandoned proposal on a vault whose owner ≠ proposer.
+    uint256 public constant ABSOLUTE_MAX_STRATEGY_DURATION = 3650 days;
     uint256 public constant MIN_COOLDOWN_PERIOD = 1 hours;
     uint256 public constant MAX_COOLDOWN_PERIOD = 30 days;
     /// @notice 100% in basis points. Centralized so SyndicateGovernor and
@@ -42,8 +44,6 @@ abstract contract GovernorParameters is ISyndicateGovernor, OwnableUpgradeable {
     /// @dev `internal` to avoid emitting an auto-getter (would add ~39 bytes
     ///      to SyndicateGovernor; this constant is for internal arithmetic only).
     uint256 internal constant BPS_DENOMINATOR = 10_000;
-    uint256 public constant MAX_PROTOCOL_FEE_BPS = 100; // 1%
-    uint256 public constant MAX_GUARDIAN_FEE_BPS = 500; // 5%
 
     // ── Collaborative proposal constants ──
 
@@ -63,50 +63,84 @@ abstract contract GovernorParameters is ISyndicateGovernor, OwnableUpgradeable {
     bytes32 public constant PARAM_COOLDOWN = keccak256("cooldownPeriod");
     bytes32 public constant PARAM_COLLAB_WINDOW = keccak256("collaborationWindow");
     bytes32 public constant PARAM_MAX_CO_PROPOSERS = keccak256("maxCoProposers");
-    bytes32 public constant PARAM_PROTOCOL_FEE_BPS = keccak256("protocolFeeBps");
-    bytes32 public constant PARAM_PROTOCOL_FEE_RECIPIENT = keccak256("protocolFeeRecipient");
-    bytes32 public constant PARAM_FACTORY = keccak256("factory");
-    bytes32 public constant PARAM_GUARDIAN_FEE_BPS = keccak256("guardianFeeBps");
-    // `internal` (not `public` like the other PARAM_* keys) to skip the
-    // auto-generated getter — saves bytecode on the EIP-170-capped governor.
-    bytes32 internal constant PARAM_GUARDIANS_FEE_RECIPIENT = keccak256("guardiansFeeRecipient");
 
     // ── Storage ──
+
+    /// @notice The one vault this governor serves (set at initialize).
+    address public vault;
+
+    /// @notice ProtocolConfig reference — read at propose time for fee snapshots.
+    address public protocolConfig;
+
+    /// @notice Authorized factory that can call `forceSetParams` and `setProtocolConfig`.
+    address public factory;
 
     /// @notice Packed governance parameters (voting/execution windows, veto,
     ///         fee caps, strategy duration bounds, collaboration window).
     GovernorParams internal _params;
 
-    /// @notice Protocol fee in bps (taken from profit before agent/mgmt fees).
-    uint256 internal _protocolFeeBps;
-
-    /// @notice Recipient of protocol fees.
-    address internal _protocolFeeRecipient;
-
-    /// @notice Guardian fee in bps (carved from gross PnL at settlement).
-    uint256 internal _guardianFeeBps;
-
-    /// @notice Authorized factory that can register vaults.
-    address public factory;
-
-    /// @notice Team multisig that receives the guardian-fee slice (vault asset).
-    ///         Swapped to WOOD off-chain and airdropped to approvers/delegators
-    ///         weekly via Merkl. Must be non-zero whenever `_guardianFeeBps > 0`.
-    /// @dev Declared AFTER `factory` (append-only storage discipline — does not
-    ///      shift any pre-existing slot); the new slot is reclaimed from
-    ///      `__paramsGap` below.
-    address internal _guardiansFeeRecipient;
+    /// @notice Bootstrap owner used when `vault == address(0)` (protocol-level governor
+    ///         that has not yet been assigned a vault). Set at initialize time.
+    /// @dev    Allows `onlyVaultOwner` to function before the vault association is wired,
+    ///         enabling deploy-script and test setups that follow the predict-then-deploy
+    ///         pattern. In production, `vault` is always non-zero and `_bootstrapOwner`
+    ///         is the deployer multisig until the factory wires the vault via `addVault`.
+    address internal _bootstrapOwner;
 
     /// @dev Reserved storage slots at the `GovernorParameters` layer so future
     ///      param additions here don't shift `SyndicateGovernor`'s layout.
-    ///      Shrunk 10 -> 9 when `_guardiansFeeRecipient` was appended after
-    ///      `factory` — one new slot replaces one gap slot, layout-stable.
-    uint256[9] private __paramsGap;
+    uint256[8] private __paramsGap;
 
-    // ── Parameter setters (owner-instant) ──
+    // ── Access control modifiers ──
+
+    modifier onlyVaultOwner() {
+        address _owner = vault != address(0) ? ISyndicateVault(vault).owner() : _bootstrapOwner;
+        if (msg.sender != _owner) revert NotVaultOwner();
+        _;
+    }
+
+    modifier onlyFactory() {
+        if (msg.sender != factory) revert NotFactory();
+        _;
+    }
+
+    modifier whenNoActiveProposal() {
+        if (openProposalCount() > 0) revert ParamsFrozenDuringProposal();
+        _;
+    }
+
+    // ── Bounds validator ──
+
+    function _validateParamBounds(GovernorParams memory p) internal pure {
+        if (p.votingPeriod < MIN_VOTING_PERIOD || p.votingPeriod > MAX_VOTING_PERIOD) revert InvalidVotingPeriod();
+        if (p.executionWindow < MIN_EXECUTION_WINDOW || p.executionWindow > MAX_EXECUTION_WINDOW) {
+            revert InvalidExecutionWindow();
+        }
+        if (p.vetoThresholdBps < MIN_VETO_THRESHOLD_BPS || p.vetoThresholdBps > MAX_VETO_THRESHOLD_BPS) {
+            revert InvalidVetoThresholdBps();
+        }
+        if (p.maxPerformanceFeeBps > MAX_PERFORMANCE_FEE_CAP) revert InvalidMaxPerformanceFeeBps();
+        if (p.cooldownPeriod < MIN_COOLDOWN_PERIOD || p.cooldownPeriod > MAX_COOLDOWN_PERIOD) {
+            revert InvalidCooldownPeriod();
+        }
+        if (
+            p.minStrategyDuration < ABSOLUTE_MIN_STRATEGY_DURATION
+                || p.maxStrategyDuration > ABSOLUTE_MAX_STRATEGY_DURATION
+                || p.minStrategyDuration > p.maxStrategyDuration
+        ) revert InvalidStrategyDurationBounds();
+        // I2 (review): the individual setters bound these, so the rescue path
+        // (initialize / forceSetParams) must too, or setParamsOverride could
+        // seat an out-of-range value the setters would reject.
+        if (p.collaborationWindow < MIN_COLLABORATION_WINDOW || p.collaborationWindow > MAX_COLLABORATION_WINDOW) {
+            revert InvalidCollaborationWindow();
+        }
+        if (p.maxCoProposers == 0 || p.maxCoProposers > ABSOLUTE_MAX_CO_PROPOSERS) revert InvalidMaxCoProposers();
+    }
+
+    // ── Parameter setters (vault-owner-instant, frozen during proposals) ──
 
     /// @inheritdoc ISyndicateGovernor
-    function setVotingPeriod(uint256 newValue) external onlyOwner {
+    function setVotingPeriod(uint256 newValue) external onlyVaultOwner whenNoActiveProposal {
         _validateVotingPeriod(newValue);
         uint256 old = _params.votingPeriod;
         _params.votingPeriod = newValue;
@@ -114,7 +148,7 @@ abstract contract GovernorParameters is ISyndicateGovernor, OwnableUpgradeable {
     }
 
     /// @inheritdoc ISyndicateGovernor
-    function setExecutionWindow(uint256 newValue) external onlyOwner {
+    function setExecutionWindow(uint256 newValue) external onlyVaultOwner whenNoActiveProposal {
         _validateExecutionWindow(newValue);
         uint256 old = _params.executionWindow;
         _params.executionWindow = newValue;
@@ -122,7 +156,7 @@ abstract contract GovernorParameters is ISyndicateGovernor, OwnableUpgradeable {
     }
 
     /// @inheritdoc ISyndicateGovernor
-    function setVetoThresholdBps(uint256 newValue) external onlyOwner {
+    function setVetoThresholdBps(uint256 newValue) external onlyVaultOwner whenNoActiveProposal {
         _validateVetoThresholdBps(newValue);
         uint256 old = _params.vetoThresholdBps;
         _params.vetoThresholdBps = newValue;
@@ -130,7 +164,7 @@ abstract contract GovernorParameters is ISyndicateGovernor, OwnableUpgradeable {
     }
 
     /// @inheritdoc ISyndicateGovernor
-    function setMaxPerformanceFeeBps(uint256 newValue) external onlyOwner {
+    function setMaxPerformanceFeeBps(uint256 newValue) external onlyVaultOwner whenNoActiveProposal {
         _validateMaxPerformanceFeeBps(newValue);
         uint256 old = _params.maxPerformanceFeeBps;
         _params.maxPerformanceFeeBps = newValue;
@@ -138,7 +172,7 @@ abstract contract GovernorParameters is ISyndicateGovernor, OwnableUpgradeable {
     }
 
     /// @inheritdoc ISyndicateGovernor
-    function setMinStrategyDuration(uint256 newValue) external onlyOwner {
+    function setMinStrategyDuration(uint256 newValue) external onlyVaultOwner whenNoActiveProposal {
         if (newValue < ABSOLUTE_MIN_STRATEGY_DURATION || newValue > _params.maxStrategyDuration) {
             revert InvalidStrategyDurationBounds();
         }
@@ -148,7 +182,7 @@ abstract contract GovernorParameters is ISyndicateGovernor, OwnableUpgradeable {
     }
 
     /// @inheritdoc ISyndicateGovernor
-    function setMaxStrategyDuration(uint256 newValue) external onlyOwner {
+    function setMaxStrategyDuration(uint256 newValue) external onlyVaultOwner whenNoActiveProposal {
         if (newValue > ABSOLUTE_MAX_STRATEGY_DURATION || newValue < _params.minStrategyDuration) {
             revert InvalidStrategyDurationBounds();
         }
@@ -158,7 +192,7 @@ abstract contract GovernorParameters is ISyndicateGovernor, OwnableUpgradeable {
     }
 
     /// @inheritdoc ISyndicateGovernor
-    function setCooldownPeriod(uint256 newValue) external onlyOwner {
+    function setCooldownPeriod(uint256 newValue) external onlyVaultOwner whenNoActiveProposal {
         _validateCooldownPeriod(newValue);
         uint256 old = _params.cooldownPeriod;
         _params.cooldownPeriod = newValue;
@@ -166,7 +200,7 @@ abstract contract GovernorParameters is ISyndicateGovernor, OwnableUpgradeable {
     }
 
     /// @inheritdoc ISyndicateGovernor
-    function setCollaborationWindow(uint256 newValue) external onlyOwner {
+    function setCollaborationWindow(uint256 newValue) external onlyVaultOwner whenNoActiveProposal {
         if (newValue < MIN_COLLABORATION_WINDOW || newValue > MAX_COLLABORATION_WINDOW) {
             revert InvalidCollaborationWindow();
         }
@@ -176,7 +210,7 @@ abstract contract GovernorParameters is ISyndicateGovernor, OwnableUpgradeable {
     }
 
     /// @inheritdoc ISyndicateGovernor
-    function setMaxCoProposers(uint256 newValue) external onlyOwner {
+    function setMaxCoProposers(uint256 newValue) external onlyVaultOwner whenNoActiveProposal {
         if (newValue == 0 || newValue > ABSOLUTE_MAX_CO_PROPOSERS) revert InvalidMaxCoProposers();
         uint256 old = _params.maxCoProposers;
         _params.maxCoProposers = newValue;
@@ -184,58 +218,13 @@ abstract contract GovernorParameters is ISyndicateGovernor, OwnableUpgradeable {
     }
 
     /// @inheritdoc ISyndicateGovernor
-    function setProtocolFeeBps(uint256 newValue) external onlyOwner {
-        if (newValue > MAX_PROTOCOL_FEE_BPS) revert InvalidProtocolFeeBps();
-        if (newValue > 0 && _protocolFeeRecipient == address(0)) revert InvalidProtocolFeeRecipient();
-        uint256 old = _protocolFeeBps;
-        _protocolFeeBps = newValue;
-        emit ParameterChangeFinalized(PARAM_PROTOCOL_FEE_BPS, old, newValue);
-    }
-
-    /// @inheritdoc ISyndicateGovernor
-    function setProtocolFeeRecipient(address newRecipient) external onlyOwner {
-        if (newRecipient == address(0)) revert InvalidProtocolFeeRecipient();
-        uint256 old = uint256(uint160(_protocolFeeRecipient));
-        _protocolFeeRecipient = newRecipient;
-        emit ParameterChangeFinalized(PARAM_PROTOCOL_FEE_RECIPIENT, old, uint256(uint160(newRecipient)));
-    }
-
-    /// @inheritdoc ISyndicateGovernor
-    function setFactory(address newFactory) external onlyOwner {
-        if (newFactory == address(0)) revert ZeroAddress();
-        uint256 old = uint256(uint160(factory));
-        factory = newFactory;
-        emit ParameterChangeFinalized(PARAM_FACTORY, old, uint256(uint160(newFactory)));
-    }
-
-    /// @inheritdoc ISyndicateGovernor
-    /// @dev Coupled to `_guardiansFeeRecipient` (mirrors the protocol-fee
-    ///      recipient rule): the fee may not be raised above 0 unless the
-    ///      team guardians-fee recipient is set, since the slice is transferred
-    ///      to it at settlement.
-    function setGuardianFeeBps(uint256 newValue) external onlyOwner {
-        if (newValue > MAX_GUARDIAN_FEE_BPS) revert InvalidGuardianFeeBps();
-        if (newValue > 0 && _guardiansFeeRecipient == address(0)) revert InvalidGuardiansFeeRecipient();
-        uint256 old = _guardianFeeBps;
-        _guardianFeeBps = newValue;
-        emit ParameterChangeFinalized(PARAM_GUARDIAN_FEE_BPS, old, newValue);
-    }
-
-    /// @inheritdoc ISyndicateGovernor
-    /// @dev Owner-instant. Setting to `address(0)` is allowed ONLY while the
-    ///      guardian fee is off (`_guardianFeeBps == 0`) — otherwise the
-    ///      settlement transfer would have no destination.
-    function setGuardiansFeeRecipient(address newRecipient) external onlyOwner {
-        if (newRecipient == address(0) && _guardianFeeBps > 0) revert InvalidGuardiansFeeRecipient();
-        uint256 old = uint256(uint160(_guardiansFeeRecipient));
-        _guardiansFeeRecipient = newRecipient;
-        emit ParameterChangeFinalized(PARAM_GUARDIANS_FEE_RECIPIENT, old, uint256(uint160(newRecipient)));
-    }
-
-    /// @inheritdoc ISyndicateGovernor
     function getGovernorParams() external view returns (GovernorParams memory) {
         return _params;
     }
+
+    // ── Abstract view (implemented by SyndicateGovernor) ──
+
+    function openProposalCount() public view virtual returns (uint256);
 
     // ── Validation helpers ──
 

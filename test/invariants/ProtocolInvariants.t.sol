@@ -16,6 +16,8 @@ import {ISyndicateFactory} from "../../src/interfaces/ISyndicateFactory.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
+import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
+import {IProtocolConfig} from "../../src/interfaces/IProtocolConfig.sol";
 
 import {ProtocolHandler} from "./handlers/ProtocolHandler.sol";
 
@@ -48,6 +50,7 @@ import {ProtocolHandler} from "./handlers/ProtocolHandler.sol";
 ///           parameter-change fuzz sequence.
 contract ProtocolInvariantsTest is StdInvariant, Test {
     SyndicateGovernor public governor;
+    ProtocolConfig public protocolConfig;
     SyndicateFactory public factory;
     GuardianRegistry public registry;
     StakedWood public swood;
@@ -98,7 +101,6 @@ contract ProtocolInvariantsTest is StdInvariant, Test {
                             (StakedWood.InitParams({
                                     owner: registryOwner,
                                     wood: address(wood),
-                                    governor: address(0xdead), // unused by this harness
                                     factory: address(0xbeef),
                                     minGuardianStake: MIN_GUARDIAN_STAKE,
                                     coolDownPeriod: COOL_DOWN,
@@ -128,8 +130,7 @@ contract ProtocolInvariantsTest is StdInvariant, Test {
                             GuardianRegistry.initialize,
                             (
                                 registryOwner,
-                                address(0xdead), // governor placeholder
-                                address(0xbeef), // factory placeholder
+                                address(0xbeef), // factory placeholder; rewired via vm.store
                                 address(swood),
                                 REVIEW_PERIOD,
                                 BLOCK_QUORUM_BPS
@@ -144,11 +145,19 @@ contract ProtocolInvariantsTest is StdInvariant, Test {
             swood.setRegistry(address(registry));
         }
 
-        // ── Governor (proxy, real impl) ──
+        // ── ProtocolConfig (plain ownable, shared by all per-vault governors) ──
+        {
+            protocolConfig = new ProtocolConfig(governorOwner);
+            vm.startPrank(governorOwner);
+            protocolConfig.setProtocolFeeRecipient(initialFeeRecipient);
+            protocolConfig.setProtocolFeeBps(INITIAL_PROTOCOL_FEE_BPS);
+            vm.stopPrank();
+        }
+
+        // ── Governor (proxy, real impl) — per-vault; use a placeholder vault ──
         {
             SyndicateGovernor govImpl = new SyndicateGovernor();
-            ISyndicateGovernor.InitParams memory p = ISyndicateGovernor.InitParams({
-                owner: governorOwner,
+            ISyndicateGovernor.GovernorParams memory p = ISyndicateGovernor.GovernorParams({
                 votingPeriod: VOTING_PERIOD,
                 executionWindow: EXECUTION_WINDOW,
                 vetoThresholdBps: VETO_THRESHOLD_BPS,
@@ -157,16 +166,20 @@ contract ProtocolInvariantsTest is StdInvariant, Test {
                 collaborationWindow: COLLAB_WINDOW,
                 maxCoProposers: MAX_CO_PROPOSERS,
                 minStrategyDuration: MIN_STRATEGY_DURATION,
-                maxStrategyDuration: MAX_STRATEGY_DURATION,
-                protocolFeeBps: INITIAL_PROTOCOL_FEE_BPS,
-                protocolFeeRecipient: initialFeeRecipient,
-                guardianFeeBps: 0,
-                guardiansFeeRecipient: address(0)
+                maxStrategyDuration: MAX_STRATEGY_DURATION
             });
+            // Per-vault design: governor is tied to a vault and factory.
+            // Use placeholder vault=address(0xbeef2) and factory=address(0xbeef)
+            // placeholders; _repointRegistry wires up the real factory below.
+            address placeholderVault = address(0xbeef2);
             governor = SyndicateGovernor(
                 address(
                     new ERC1967Proxy(
-                        address(govImpl), abi.encodeCall(SyndicateGovernor.initialize, (p, address(registry)))
+                        address(govImpl),
+                        abi.encodeCall(
+                            SyndicateGovernor.initialize,
+                            (placeholderVault, address(registry), address(protocolConfig), address(0xbeef), p)
+                        )
                     )
                 )
             );
@@ -182,7 +195,8 @@ contract ProtocolInvariantsTest is StdInvariant, Test {
                 vaultImpl: address(vaultImpl),
                 ensRegistrar: address(0), // optional — chains without ENS
                 agentRegistry: address(0), // optional — chains without ERC-8004
-                governor: address(governor),
+                beacon: address(governor),
+                protocolConfig: address(governor),
                 managementFeeBps: 200,
                 guardianRegistry: address(registry)
             });
@@ -231,27 +245,27 @@ contract ProtocolInvariantsTest is StdInvariant, Test {
     ///      numerically via `vm.load` probing. The test asserts the probe
     ///      result before using it.
     function _repointRegistry(address newGovernor, address newFactory) internal {
-        // Probe each slot for the two 0xdead / 0xbeef placeholders and rewrite.
-        // Max probe depth bounded to 200 slots to avoid runaway on future
-        // storage-layout shifts — the current layout puts them well under 100.
-        bytes32 dead = bytes32(uint256(uint160(0xdead)));
+        // Factory: probe for the 0xbeef placeholder and overwrite with the
+        // real factory address via vm.store (no setter exposed on the registry).
+        // Done first so we can call addGovernor as the factory below.
         bytes32 beef = bytes32(uint256(uint160(0xbeef)));
-        bool foundGov;
         bool foundFac;
         for (uint256 i = 0; i < 200; i++) {
             bytes32 v = vm.load(address(registry), bytes32(i));
-            if (!foundGov && v == dead) {
-                vm.store(address(registry), bytes32(i), bytes32(uint256(uint160(newGovernor))));
-                foundGov = true;
-            } else if (!foundFac && v == beef) {
+            if (v == beef) {
                 vm.store(address(registry), bytes32(i), bytes32(uint256(uint160(newFactory))));
                 foundFac = true;
+                break;
             }
-            if (foundGov && foundFac) break;
         }
-        require(foundGov && foundFac, "repoint: placeholder slot not found");
-        assertEq(registry.governor(), newGovernor, "repoint: governor mismatch");
+        require(foundFac, "repoint: factory placeholder not found");
         assertEq(registry.factory(), newFactory, "repoint: factory mismatch");
+
+        // Governor: addGovernor is factory-only (I3) — call as the newly-set
+        // factory to register the real governor. The registry was initialized
+        // with governor_=address(0) so the authorized set starts empty.
+        vm.prank(newFactory);
+        registry.addGovernor(newGovernor);
     }
 
     // ──────────────────────────────────────────────────────────────
@@ -283,10 +297,10 @@ contract ProtocolInvariantsTest is StdInvariant, Test {
             uint256 maxPerf = governor.getGovernorParams().maxPerformanceFeeBps;
             if (perfFeeBps > maxPerf) perfFeeBps = maxPerf;
             assertLe(perfFeeBps, MAX_PERF_FEE_BPS, "INV-2: perf fee bps exceeds cap");
-            assertLe(governor.protocolFeeBps(), 10_000, "INV-2: protocol fee bps out of range");
+            assertLe(protocolConfig.protocolFeeBps(), 10_000, "INV-2: protocol fee bps out of range");
             // Sum of all bps must not exceed 10_000 (would take >100% of
             // gross profit; nonsense state).
-            uint256 totalBps = perfFeeBps + governor.protocolFeeBps();
+            uint256 totalBps = perfFeeBps + protocolConfig.protocolFeeBps();
             assertLe(totalBps, 10_000, "INV-2: total fee bps > 100%");
         }
     }
@@ -306,9 +320,11 @@ contract ProtocolInvariantsTest is StdInvariant, Test {
     ///         structural break. Under the current handler the set is empty,
     ///         so the check passes vacuously.
     function invariant_oneActiveProposalPerVault() public view {
-        address[] memory vaults = governor.getRegisteredVaults();
+        // getRegisteredVaults removed in per-vault design — governor has single vault
+        address[] memory vaults = governor.vault() != address(0) ? new address[](1) : new address[](0);
+        if (vaults.length > 0) vaults[0] = governor.vault();
         for (uint256 i = 0; i < vaults.length; i++) {
-            uint256 pid = governor.getActiveProposal(vaults[i]);
+            uint256 pid = governor.getActiveProposal();
             if (pid == 0) continue;
             ISyndicateGovernor.ProposalState st = governor.getProposalState(pid);
             assertTrue(
@@ -342,10 +358,12 @@ contract ProtocolInvariantsTest is StdInvariant, Test {
     ///         empty, so the check is vacuous and guards against structural
     ///         drift.
     function invariant_activeProposalPointerConsistent() public view {
-        address[] memory vaults = governor.getRegisteredVaults();
+        // getRegisteredVaults removed in per-vault design — governor has single vault
+        address[] memory vaults = governor.vault() != address(0) ? new address[](1) : new address[](0);
+        if (vaults.length > 0) vaults[0] = governor.vault();
         uint256 total = governor.proposalCount();
         for (uint256 i = 0; i < vaults.length; i++) {
-            uint256 activeId = governor.getActiveProposal(vaults[i]);
+            uint256 activeId = governor.getActiveProposal();
             if (activeId == 0) {
                 // No active pointer: no Executed proposal may exist for this vault.
                 for (uint256 pid = 1; pid <= total; pid++) {
@@ -417,9 +435,9 @@ contract ProtocolInvariantsTest is StdInvariant, Test {
     ///         adversarial ordering (queue bps → queue recipient-zero
     ///         attempt → finalize, etc.).
     function invariant_protocolFeeRecipientNonZero() public view {
-        if (governor.protocolFeeBps() > 0) {
+        if (protocolConfig.protocolFeeBps() > 0) {
             assertTrue(
-                governor.protocolFeeRecipient() != address(0), "INV-30: protocolFeeBps > 0 but recipient is zero"
+                protocolConfig.protocolFeeRecipient() != address(0), "INV-30: protocolFeeBps > 0 but recipient is zero"
             );
         }
     }

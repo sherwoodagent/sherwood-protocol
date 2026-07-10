@@ -47,7 +47,7 @@ contract UpgradeFactorySetEnsRegistrar is ScriptBase {
         // ── 1. Pre-upgrade snapshot ──
         address oldEnsRegistrar = address(factory.ensRegistrar());
         address preOwner = factory.owner();
-        address preGovernor = factory.governor();
+        address preGovernor = factory.beacon();
         uint256 preCount = factory.syndicateCount();
         address preVaultImpl = factory.vaultImpl();
         console.log("\n--- Pre-upgrade state ---");
@@ -73,7 +73,7 @@ contract UpgradeFactorySetEnsRegistrar is ScriptBase {
         console.log("\n--- Post-upgrade validation ---");
         require(factory.owner() == preOwner, "owner changed");
         console.log("  owner: OK");
-        require(factory.governor() == preGovernor, "governor changed");
+        require(factory.beacon() == preGovernor, "beacon changed");
         console.log("  governor: OK");
         require(factory.syndicateCount() == preCount, "syndicateCount changed");
         console.log("  syndicateCount: OK");

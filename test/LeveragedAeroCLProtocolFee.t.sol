@@ -57,9 +57,13 @@ contract MockVault {
     mapping(address => mapping(address => uint256)) public allowance;
     uint256 public totalSupply;
     address public governor;
+    address public factory; // #421: strategy resolves protocol-fee params via factory().protocolConfig()
 
     constructor(address gov, address holder, uint256 shares) {
         governor = gov;
+        // Wire the new resolution chain: factory().protocolConfig() → the same MockGovernor.
+        // gov == address(0) → factory == address(0) preserves the "no protocol fee" case.
+        factory = gov == address(0) ? address(0) : address(new MockFactory(gov));
         balanceOf[holder] = shares;
         totalSupply = shares;
     }
@@ -103,6 +107,20 @@ contract MockGovernor {
     function setFee(uint256 bps, address recipient) external {
         protocolFeeBps = bps;
         protocolFeeRecipient = recipient;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Mock factory — per-vault migration (#421). The strategy resolves the protocol-fee
+// params via `vault.factory().protocolConfig()`; `protocolConfig()` points back at the
+// existing MockGovernor (which exposes the IProtocolConfig read surface), so the chain
+// resolves without touching MockGovernor's ctor or the `setFee` call-sites.
+// ─────────────────────────────────────────────────────────────────────────────
+contract MockFactory {
+    address public protocolConfig;
+
+    constructor(address pc) {
+        protocolConfig = pc;
     }
 }
 

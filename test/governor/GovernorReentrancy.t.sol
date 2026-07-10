@@ -11,6 +11,7 @@ import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
+import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 
 /// @title GovernorReentrancy.t
 /// @notice Regression for G-C6 — `vote` / `cancelProposal` / `vetoProposal` /
@@ -79,8 +80,11 @@ contract GovernorReentrancyTest is Test {
         bytes memory govInit = abi.encodeCall(
             SyndicateGovernor.initialize,
             (
-                ISyndicateGovernor.InitParams({
-                    owner: owner,
+                address(vault), // vault_: this test's vault (per-vault governor)
+                address(registry),
+                address(new ProtocolConfig(owner)),
+                address(this), // factory (test contract)
+                ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,
                     vetoThresholdBps: VETO_THRESHOLD_BPS,
@@ -89,20 +93,15 @@ contract GovernorReentrancyTest is Test {
                     collaborationWindow: 48 hours,
                     maxCoProposers: 5,
                     minStrategyDuration: 1 hours,
-                    maxStrategyDuration: 30 days,
-                    protocolFeeBps: 0,
-                    protocolFeeRecipient: address(0),
-                    guardianFeeBps: 0,
-                    guardiansFeeRecipient: address(0)
-                }),
-                address(registry)
+                    maxStrategyDuration: 30 days
+                })
             )
         );
         governor = SyndicateGovernor(address(new ERC1967Proxy(address(govImpl), govInit)));
+        // Per-vault governor: the vault resolves its governor via its factory
+        // (this test contract). Mock governorOf(vault) -> the deployed governor.
+        vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
         registry.setGovernor(address(governor));
-
-        vm.prank(owner);
-        governor.addVault(address(vault));
 
         usdc.mint(lp1, 100_000e6);
         usdc.mint(lp2, 100_000e6);
@@ -192,7 +191,9 @@ contract GovernorReentrancyTest is Test {
         vm.prank(agent);
         // Reentry from the registry callback (msg.sender = registry, not agent)
         // fails the proposer check at the top of `cancelProposal`.
-        vm.expectRevert(ISyndicateGovernor.NotProposer.selector);
+        // Refactor added nonReentrant to cancelProposal — the transient guard
+        // fires before the proposer check on reentry (strictly stronger).
+        vm.expectRevert(ISyndicateGovernor.Reentrancy.selector);
         governor.cancelProposal(pid);
     }
 
@@ -208,7 +209,8 @@ contract GovernorReentrancyTest is Test {
         registry.arm(address(governor), abi.encodeCall(ISyndicateGovernor.vetoProposal, (pid)));
 
         vm.prank(owner);
-        vm.expectRevert(ISyndicateGovernor.NotVaultOwner.selector);
+        // nonReentrant on vetoProposal — guard fires before the owner check.
+        vm.expectRevert(ISyndicateGovernor.Reentrancy.selector);
         governor.vetoProposal(pid);
     }
 
@@ -224,7 +226,8 @@ contract GovernorReentrancyTest is Test {
         registry.arm(address(governor), abi.encodeCall(ISyndicateGovernor.emergencyCancel, (pid)));
 
         vm.prank(owner);
-        vm.expectRevert(ISyndicateGovernor.NotVaultOwner.selector);
+        // nonReentrant on emergencyCancel — guard fires before the owner check.
+        vm.expectRevert(ISyndicateGovernor.Reentrancy.selector);
         governor.emergencyCancel(pid);
     }
 
@@ -267,7 +270,7 @@ contract ReentrantRegistry {
         reviewOpened = true;
     }
 
-    function resolveReview(uint256) external returns (bool blocked) {
+    function resolveReview(address, uint256) external returns (bool blocked) {
         if (reentryTarget != address(0)) {
             // Best-effort re-entry. Bubble up the revert so the outer test can
             // match on `Reentrancy()`.
@@ -281,7 +284,7 @@ contract ReentrantRegistry {
         return false;
     }
 
-    function getReviewState(uint256)
+    function getReviewState(address, uint256)
         external
         view
         returns (bool opened, bool resolved, bool blocked, bool cohortTooSmall)

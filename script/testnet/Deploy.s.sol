@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
+import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {console} from "forge-std/Script.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
@@ -8,6 +9,7 @@ import {SyndicateVault} from "../../src/SyndicateVault.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {SyndicateFactory} from "../../src/SyndicateFactory.sol";
 import {SyndicateGovernor} from "../../src/SyndicateGovernor.sol";
+import {GovernorBeacon} from "../../src/GovernorBeacon.sol";
 import {GuardianRegistry} from "../../src/GuardianRegistry.sol";
 import {StakedWood} from "../../src/StakedWood.sol";
 import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
@@ -57,35 +59,23 @@ contract DeployTestnet is ScriptBase {
         //    before the registry; the registry↔sWOOD circular dependency is
         //    resolved by the set-once `setRegistry` call.
         uint256 baseNonce = vm.getNonce(deployer);
-        address predictedSwoodProxy = vm.computeCreateAddress(deployer, baseNonce + 3);
-        address predictedRegistryProxy = vm.computeCreateAddress(deployer, baseNonce + 5);
-        address predictedFactoryProxy = vm.computeCreateAddress(deployer, baseNonce + 7);
+        // ProtocolConfig at +0, govImpl +1, govProxy +2, swoodImpl +3, swoodProxy +4,
+        // registryImpl +5, registryProxy +6, factoryImpl +7, factoryProxy +8.
+        address predictedSwoodProxy = vm.computeCreateAddress(deployer, baseNonce + 4);
+        address predictedRegistryProxy = vm.computeCreateAddress(deployer, baseNonce + 6);
+        address predictedFactoryProxy = vm.computeCreateAddress(deployer, baseNonce + 8);
+
+        // Deploy ProtocolConfig (plain Ownable)
+        ProtocolConfig protocolConfig = new ProtocolConfig(deployer);
+        protocolConfig.setProtocolFeeRecipient(deployer);
+        protocolConfig.setProtocolFeeBps(200);
 
         SyndicateGovernor govImpl = new SyndicateGovernor();
-        bytes memory govInitData = abi.encodeCall(
-            SyndicateGovernor.initialize,
-            (
-                ISyndicateGovernor.InitParams({
-                    owner: deployer,
-                    votingPeriod: 1 hours,
-                    executionWindow: 1 days,
-                    vetoThresholdBps: 4000,
-                    maxPerformanceFeeBps: 3000,
-                    cooldownPeriod: 1 hours,
-                    collaborationWindow: 48 hours,
-                    maxCoProposers: 5,
-                    minStrategyDuration: 1 hours,
-                    maxStrategyDuration: 30 days,
-                    protocolFeeBps: 200,
-                    protocolFeeRecipient: deployer,
-                    guardianFeeBps: 0,
-                    guardiansFeeRecipient: address(0)
-                }),
-                predictedRegistryProxy
-            )
-        );
-        address governorProxy = address(new ERC1967Proxy(address(govImpl), govInitData));
-        console.log("SyndicateGovernor:", governorProxy);
+        // Per-vault governor: deploy a GovernorBeacon over the impl (keeps the
+        // CREATE-nonce address predictions aligned). Governor proxies are cloned
+        // per vault by the factory at createSyndicate.
+        address beacon = address(new GovernorBeacon(address(govImpl), deployer));
+        console.log("GovernorBeacon:", beacon);
 
         // 3b. Deploy StakedWood (sWOOD) — the sole WOOD custodian. Deployed
         //     before the registry so the registry init can take the sWOOD
@@ -99,7 +89,6 @@ contract DeployTestnet is ScriptBase {
             (StakedWood.InitParams({
                     owner: deployer,
                     wood: woodToken,
-                    governor: governorProxy,
                     factory: predictedFactoryProxy,
                     minGuardianStake: 10_000e18,
                     coolDownPeriod: 7 days,
@@ -118,7 +107,6 @@ contract DeployTestnet is ScriptBase {
             GuardianRegistry.initialize,
             (
                 deployer,
-                governorProxy,
                 predictedFactoryProxy,
                 swoodProxy,
                 24 hours, // reviewPeriod
@@ -142,7 +130,8 @@ contract DeployTestnet is ScriptBase {
                     vaultImpl: address(vaultImpl),
                     ensRegistrar: L2_REGISTRAR,
                     agentRegistry: AGENT_REGISTRY,
-                    governor: governorProxy,
+                    beacon: beacon,
+                    protocolConfig: address(protocolConfig),
                     managementFeeBps: 50,
                     guardianRegistry: registryProxy
                 }))
@@ -153,17 +142,19 @@ contract DeployTestnet is ScriptBase {
 
         // 6. Wire governor → factory. Setters apply immediately.
         //    Guardian fee recipient pinned at init — no separate wiring.
-        SyndicateGovernor(governorProxy).setFactory(address(factory));
+        // factory set at governor initialize time (per-vault design)
 
         vm.stopBroadcast();
 
         // ── Validate on-chain state matches expected values ──
-        _validate(deployer, governorProxy, address(factory), address(executorLib), address(vaultImpl));
+        _validate(deployer, beacon, address(factory), address(executorLib), address(vaultImpl));
 
         // ── Persist addresses to chains/{chainId}.json ──
         _writeAddresses(
-            "Base Sepolia", deployer, address(factory), governorProxy, address(executorLib), address(vaultImpl)
+            "Base Sepolia", deployer, address(factory), address(0), address(executorLib), address(vaultImpl)
         );
+        _patchAddress("GOVERNOR_BEACON", beacon);
+        _patchAddress("PROTOCOL_CONFIG", address(protocolConfig));
         _patchAddress("GUARDIAN_REGISTRY", registryProxy);
         _patchAddress("STAKED_WOOD", swoodProxy);
 
@@ -198,12 +189,11 @@ contract DeployTestnet is ScriptBase {
         _checkUint("gov.maxCoProposers", p.maxCoProposers, 5);
         _checkUint("gov.minStrategyDuration", p.minStrategyDuration, 1 hours);
         _checkUint("gov.maxStrategyDuration", p.maxStrategyDuration, 30 days);
-        _checkUint("gov.protocolFeeBps", governor.protocolFeeBps(), 200);
-        _checkAddr("gov.protocolFeeRecipient", governor.protocolFeeRecipient(), deployer);
+        // protocolFeeBps / protocolFeeRecipient moved to ProtocolConfig.
 
         // ── Factory ──
         _checkAddr("factory.owner", Ownable(factoryAddr).owner(), deployer);
-        _checkAddr("factory.governor", factory.governor(), governorAddr);
+        _checkAddr("factory.beacon", factory.beacon(), governorAddr);
         _checkAddr("factory.executorImpl", factory.executorImpl(), executorLibAddr);
         _checkAddr("factory.vaultImpl", factory.vaultImpl(), vaultImplAddr);
         _checkAddr("factory.ensRegistrar", address(factory.ensRegistrar()), L2_REGISTRAR);

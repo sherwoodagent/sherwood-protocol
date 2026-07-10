@@ -19,7 +19,8 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {LeveragedAeroFees} from "./LeveragedAeroFees.sol";
 import {FeeConstants} from "../FeeConstants.sol";
 import {ISyndicateVault} from "../interfaces/ISyndicateVault.sol";
-import {ISyndicateGovernor} from "../interfaces/ISyndicateGovernor.sol";
+import {ISyndicateFactory} from "../interfaces/ISyndicateFactory.sol";
+import {IProtocolConfig} from "../interfaces/IProtocolConfig.sol";
 import {IAggregatorV3} from "../interfaces/IAggregatorV3.sol";
 
 /// @title LeveragedAerodromeCLStrategy
@@ -96,7 +97,7 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
 
     /// @dev A best-effort fee crystallise (deposit / fast redeem / proportional redeem) reverted and was
     ///      deferred; the op proceeded. Reverts on the fee-MINT (vault paused / feeRecipient
-    ///      de-whitelisted) — or, near-unreachably, on the governor read inside the crystallise (see the
+    ///      de-whitelisted) — or, near-unreachably, on the config read inside the crystallise (see the
     ///      per-op docstrings). `op` (see `OP_*`) tells a monitor which entrypoint deferred; `navPre` is
     ///      the NAV at risk (0 on an oracle-out proportional redeem).
     event FeeCrystallizeDeferred(uint8 op, uint256 navPre);
@@ -557,9 +558,9 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
             $.lastFeeAccrualTimestamp = block.timestamp;
             return;
         }
-        // Protocol fee is read LIVE from the governor (a self-fee'd strategy is skipped by the
-        // governor's settle-fee path, so the protocol leg is collected here instead). Treat a
-        // missing governor as 0 bps.
+        // Protocol fee is read LIVE from ProtocolConfig via `factory.protocolConfig()` (a
+        // self-fee'd strategy is skipped by the governor's settle-fee path, so the protocol
+        // leg is collected here instead). Treat a missing factory/config as 0 bps.
         //
         // SHARED ARG-LIST CONTRACT: the 8-arg `LeveragedAeroFees.crystallize(...)` call below is the
         // EXECUTED crystallise; `_simulateCrystallize` (just below `_protocolFeeBps`) re-marshals the
@@ -588,8 +589,8 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     ///      its quote tracks execution to the wei. Marshals the SAME 8 `LeveragedAeroFees.crystallize`
     ///      args as `_crystallizeFees` — see the "SHARED ARG-LIST CONTRACT" note there; keep the two
     ///      lists in lock-step (F4 was a desync). Honours the same `lastFeeAccrualTimestamp == 0`
-    ///      seed-guard early-return (no fee on first accrual). `_protocolFeeBps()` reads the governor;
-    ///      the caller wraps this in a try/catch so a reverting governor read degrades to `(0, false)`.
+    ///      seed-guard early-return (no fee on first accrual). `_protocolFeeBps()` reads ProtocolConfig;
+    ///      the caller wraps this in a try/catch so a reverting config read degrades to `(0, false)`.
     function _simulateCrystallize(uint256 navPre, uint256 supply)
         private
         view
@@ -612,8 +613,8 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     }
 
     /// @dev Self-only external view wrapper so `previewRedeem` can `try/catch` `_simulateCrystallize`
-    ///      (its `_protocolFeeBps()` does an external governor staticcall — near-unreachable to revert on
-    ///      a set-once UUPS proxy, but the advisory view must degrade to `(0, false)` symmetrically with
+    ///      (its `_protocolFeeBps()` does an external ProtocolConfig staticcall — near-unreachable to revert
+    ///      on a set-once UUPS proxy, but the advisory view must degrade to `(0, false)` symmetrically with
     ///      its other failure modes rather than revert while executed `redeem` swallows the same).
     function simulateCrystallizeSelf(uint256 navPre, uint256 supply)
         external
@@ -624,16 +625,25 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         return _simulateCrystallize(navPre, supply);
     }
 
-    /// @dev Live protocol-fee rate (bps) from the governor; 0 if the governor is unset.
-    function _protocolFeeBps() private view returns (uint256) {
-        address gov = ISyndicateVault(vault()).governor();
-        return gov == address(0) ? 0 : ISyndicateGovernor(gov).protocolFeeBps();
+    /// @dev The protocol-wide ProtocolConfig, resolved via the vault's factory.
+    ///      Per-vault migration (#421) moved the protocol-fee params off the
+    ///      governor onto this shared config; `address(0)` if the factory is
+    ///      unset (treated as no protocol fee by callers).
+    function _protocolConfig() private view returns (address) {
+        address factory_ = ISyndicateVault(vault()).factory();
+        return factory_ == address(0) ? address(0) : ISyndicateFactory(factory_).protocolConfig();
     }
 
-    /// @dev Live protocol-fee recipient from the governor; `address(0)` when unset (skips discharge).
+    /// @dev Live protocol-fee rate (bps) from ProtocolConfig; 0 if unset.
+    function _protocolFeeBps() private view returns (uint256) {
+        address cfg = _protocolConfig();
+        return cfg == address(0) ? 0 : IProtocolConfig(cfg).protocolFeeBps();
+    }
+
+    /// @dev Live protocol-fee recipient from ProtocolConfig; `address(0)` when unset (skips discharge).
     function _protocolFeeRecipient() private view returns (address) {
-        address gov = ISyndicateVault(vault()).governor();
-        return gov == address(0) ? address(0) : ISyndicateGovernor(gov).protocolFeeRecipient();
+        address cfg = _protocolConfig();
+        return cfg == address(0) ? address(0) : IProtocolConfig(cfg).protocolFeeRecipient();
     }
 
     /// @dev Self-only external wrapper so `redeem` can crystallise fees best-effort via `try/catch`
@@ -648,10 +658,10 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     }
 
     /// @dev Best-effort crystallise (H3 pattern), single-site: isolates the fee-MINT / near-unreachable
-    ///      governor-read revert inside the external `crystallizeFeesSelf` self-call so a failure rolls back
+    ///      config-read revert inside the external `crystallizeFeesSelf` self-call so a failure rolls back
     ///      ONLY the crystallise (HWM + `lastFeeAccrualTimestamp` unchanged → fee defers) while the calling
     ///      op proceeds. `navPre` stays computed by the CALLER so fail-closed pricing (a down oracle) reverts
-    ///      there, outside this try. Not narrowed by selector; the asymmetric un-try'd governor reads
+    ///      there, outside this try. Not narrowed by selector; the asymmetric un-try'd config reads
     ///      (compound/settle/skim) hard-revert on the same failure.
     function _crystallizeBestEffort(uint256 navPre, uint8 op) private {
         try this.crystallizeFeesSelf(navPre) {}
@@ -680,11 +690,11 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     ///         the try/catch so a down oracle still reverts the deposit (fail-closed pricing), but a
     ///         fee-MINT revert (vault paused / feeRecipient de-whitelisted on a whitelist vault) rolls
     ///         back ONLY the crystallise (fee defers) — deposits must not brick once a fee accrues. The
-    ///         catch ALSO swallows a reverting governor read (`_protocolFeeBps`/`_protocolFeeRecipient`
+    ///         catch ALSO swallows a reverting ProtocolConfig read (`_protocolFeeBps`/`_protocolFeeRecipient`
     ///         staticcall inside the crystallise) — near-unreachable on a set-once UUPS proxy, so the
     ///         intended target is the fee-MINT; it is NOT narrowed by selector (fee-mint reverts are
     ///         hard to enumerate). Note the asymmetry: `compound()` / `_settle()` / `_dischargeRedeemSkim`
-    ///         read the governor UN-try'd and hard-revert on the same failure.
+    ///         read ProtocolConfig UN-try'd and hard-revert on the same failure.
     ///         Pricing mirrors `redeem`: snapshot `owedBefore`, then net the FRESH protocol slice the
     ///         crystallise accrued out of `navPre` (`navNet = navPre − (owedNow − owedBefore)`); `supply`
     ///         is read POST-crystallise (includes the perf-fee mint). Without the netting the depositor
@@ -740,7 +750,7 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         // Discharge the protocol fee from the swapped-out USDC BEFORE it's redeployed. `skimCap`
         // is 0 when there's no recipient (accrual persists; discharge defers). The manager pays
         // `min(skimCap, usdcOut)` internally, redeploys the remainder, and returns the amount paid;
-        // the STRATEGY transfers it out + decrements owed (governor read + external transfer stay
+        // the STRATEGY transfers it out + decrements owed (config read + external transfer stay
         // out of the manager).
         address recipient = _protocolFeeRecipient();
         uint256 skimCap = recipient == address(0) ? 0 : _layout().protocolFeeOwed;
@@ -820,10 +830,10 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
 
         // 1. Crystallise on the pre-redeem NAV (fail-closed: a down oracle reverts — correct, the fast
         //    path is inherently oracle-dependent). Best-effort (H3, §7): a fee-mint revert (vault paused
-        //    / feeRecipient de-whitelisted) — or a near-unreachable governor-read revert inside the
+        //    / feeRecipient de-whitelisted) — or a near-unreachable config-read revert inside the
         //    crystallise — rolls back ONLY the crystallise (owed + supply unchanged, so the netting below
         //    sees a 0 fresh slice) and the exit still proceeds. Not narrowed by selector; the asymmetric
-        //    un-try'd governor reads (compound/settle/skim) hard-revert on that same failure.
+        //    un-try'd config reads (compound/settle/skim) hard-revert on that same failure.
         uint256 navPre = nav();
         uint256 navNet = _crystallizeAndNet(navPre, OP_REDEEM);
 
@@ -877,7 +887,7 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     ///         `fastOk` is ADVISORY; the manager's LTV gate is authoritative.
     ///
     ///         Returns `(0, false)` instead of reverting when the oracle is down (try/catch on the nav +
-    ///         collateral/debt reads), when the fee simulation's governor read reverts (try/catch on
+    ///         collateral/debt reads), when the fee simulation's config read reverts (try/catch on
     ///         `simulateCrystallizeSelf` — symmetric with the other degrade-to-`(0,false)` modes rather
     ///         than reverting while executed `redeem` swallows the same), and when the simulated payout
     ///         floors to 0 (mirrors `redeem`'s `ZeroAssetsOut` guard) so a preview-`minAssetsOut` never
@@ -897,7 +907,7 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         }
         // Simulate the pending crystallise the executed `redeem` performs — the SAME arg-marshalling as
         // `_crystallizeFees` (via `_simulateCrystallize`, F4 dedup). Wrapped in a try/catch so a reverting
-        // governor read inside `_protocolFeeBps()` degrades to `(0, false)` symmetrically with the other
+        // ProtocolConfig read inside `_protocolFeeBps()` degrades to `(0, false)` symmetrically with the other
         // preview failure modes (executed `redeem` swallows the same via its own crystallise try/catch).
         uint256 navNet;
         uint256 supplyPost;
@@ -1010,9 +1020,9 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     ///      `shares` for `recipient`, paying net of the Item-3 protocol skim, enforcing `minOut`,
     ///      burning the escrowed shares. Best-effort crystallise (H3 pattern: navPre=0 on oracle
     ///      outage → price-free mgmt fee accrues, perf fee defers; a fee-mint revert — or the
-    ///      near-unreachable governor-read revert inside the crystallise — defers the whole crystallise)
+    ///      near-unreachable ProtocolConfig-read revert inside the crystallise — defers the whole crystallise)
     ///      keeps the exit oracle-free (§7). Not narrowed by selector; note `_dischargeRedeemSkim` below
-    ///      reads the governor UN-try'd and hard-reverts on that same failure. `supply` fixed once before burn.
+    ///      reads ProtocolConfig UN-try'd and hard-reverts on that same failure. `supply` fixed once before burn.
     function _proportionalRedeem(address recipient, uint256 shares, uint256 minOut)
         private
         returns (uint256 assetsOut)

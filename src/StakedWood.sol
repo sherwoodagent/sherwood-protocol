@@ -11,15 +11,14 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 /// @notice Minimal `SyndicateGovernor` surface consumed by sWOOD: the
 ///         open-proposal signals used by the rage-quit gate in
-///         `requestUnstakeOwner`. Relocated verbatim from `GuardianRegistry`.
+///         `requestUnstakeOwner`. Per-vault governor — no vault arg needed.
 interface IGovernorMinimal {
-    function getActiveProposal(address vault) external view returns (uint256);
-    /// @notice Count of proposals for a vault in any non-terminal state
-    ///         (Pending / GuardianReview / Approved / Executed). Consumed
-    ///         by the rage-quit gate in `requestUnstakeOwner`. The OR check
-    ///         against `getActiveProposal` is belt-and-braces — any real
-    ///         open proposal must trip at least one of the two signals.
-    function openProposalCount(address vault) external view returns (uint256);
+    function getActiveProposal() external view returns (uint256);
+    function openProposalCount() external view returns (uint256);
+}
+
+interface IFactoryGovernorLookup {
+    function governorOf(address vault) external view returns (address);
 }
 
 /// @notice Minimal `GuardianRegistry` surface consumed by sWOOD: the
@@ -155,7 +154,7 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     ///      `delegatedSlash` is the COMBINED delegated hit — the live
     ///      delegation pool plus the I-1 unbonding-escrow pool.
     event GuardianSlashed(
-        uint256 indexed proposalId, address indexed approver, uint256 ownSlash, uint256 delegatedSlash
+        bytes32 indexed reviewKey, address indexed approver, uint256 ownSlash, uint256 delegatedSlash
     );
 
     /// @notice Emitted when a burn transfer fails and the amount is queued for
@@ -180,7 +179,10 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     ///      cannot be passed to `initialize`; `_registrySet` guards re-assignment.
     address public registry;
 
-    address public governor;
+    /// @notice SyndicateFactory — resolves the per-vault governor via
+    ///         `factory.governorOf(vault)` in the owner-unstake proposal gate.
+    ///         (The old singleton `governor` slot was removed with the per-vault
+    ///         governor beacon refactor — there is no protocol-wide governor.)
     address public factory;
 
     bool private _registrySet;
@@ -272,7 +274,7 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     /// @dev Relocated from `GuardianRegistry._voteStake`. The clamp in
     ///      `_slashOne` guards against a concurrent slash having already
     ///      reduced live stake below the snapshot.
-    mapping(uint256 proposalId => mapping(address voter => uint128)) public voteStake;
+    mapping(bytes32 reviewKey => mapping(address voter => uint128)) public voteStake;
 
     /// @notice Slashed WOOD whose burn transfer failed, queued for retry.
     /// @dev Keyed by `address(this)` — relocated verbatim from
@@ -303,9 +305,8 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
         address owner;
         /// @dev WOOD ERC20 token custodied for staking and bonds.
         address wood;
-        /// @dev SyndicateGovernor — coordinates reviews and proposal lifecycle.
-        address governor;
-        /// @dev SyndicateFactory — sole caller authorized to `bindOwnerStake`.
+        /// @dev SyndicateFactory — sole caller authorized to `bindOwnerStake`
+        ///      and the source for per-vault governor lookups (`governorOf`).
         address factory;
         /// @dev Minimum WOOD for an active guardian stake.
         uint256 minGuardianStake;
@@ -325,12 +326,11 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     }
 
     function initialize(InitParams calldata p) external initializer {
-        if (p.owner == address(0) || p.wood == address(0) || p.governor == address(0) || p.factory == address(0)) {
+        if (p.owner == address(0) || p.wood == address(0) || p.factory == address(0)) {
             revert ZeroAddress();
         }
         __Ownable_init(p.owner);
         wood = IERC20(p.wood);
-        governor = p.governor;
         factory = p.factory;
         minGuardianStake = p.minGuardianStake;
         coolDownPeriod = p.coolDownPeriod;
@@ -704,9 +704,12 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
         OwnerStake storage s = _ownerStakes[vault];
         if (s.owner != msg.sender || s.stakedAmount == 0) revert NoActiveStake();
         if (s.unstakeRequestedAt != 0) revert UnstakeAlreadyRequested();
-        IGovernorMinimal gov = IGovernorMinimal(governor);
-        if (gov.openProposalCount(vault) != 0 || gov.getActiveProposal(vault) != 0) {
-            revert VaultHasActiveProposal();
+        address vaultGov = IFactoryGovernorLookup(factory).governorOf(vault);
+        if (vaultGov != address(0)) {
+            IGovernorMinimal gov = IGovernorMinimal(vaultGov);
+            if (gov.openProposalCount() != 0 || gov.getActiveProposal() != 0) {
+                revert VaultHasActiveProposal();
+            }
         }
 
         s.unstakeRequestedAt = uint64(block.timestamp);
@@ -739,7 +742,10 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
         // a single transaction `propose` a draining strategy + claim their
         // bond. Slash would then find `stakedAmount == 0` and burn nothing.
         // Symmetric with the request-time gate.
-        if (IGovernorMinimal(governor).openProposalCount(vault) != 0) revert VaultHasActiveProposal();
+        address vaultGov2 = IFactoryGovernorLookup(factory).governorOf(vault);
+        if (vaultGov2 != address(0) && IGovernorMinimal(vaultGov2).openProposalCount() != 0) {
+            revert VaultHasActiveProposal();
+        }
 
         uint256 amount = s.stakedAmount;
         address recipient = s.owner;
@@ -821,8 +827,8 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     ///      `slashGuardians` later reads this (clamped to live stake) to size
     ///      the own-stake portion of the slash. Relocated from
     ///      `GuardianRegistry._voteStake`.
-    function recordVoteStake(uint256 proposalId, address voter, uint128 weight) external onlyRegistry {
-        voteStake[proposalId][voter] = weight;
+    function recordVoteStake(bytes32 reviewKey, address voter, uint128 weight) external onlyRegistry {
+        voteStake[reviewKey][voter] = weight;
     }
 
     /// @notice Slash a set of approvers for a blocked proposal.
@@ -833,7 +839,7 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     ///      that pool pro-rata via the ERC-4626 share model — no per-delegator
     ///      loop. The aggregate total-stake checkpoint is pushed once after the
     ///      loop; the slashed WOOD is burned in a single transfer.
-    /// @param proposalId The blocked proposal whose approvers are slashed.
+    /// @param reviewKey  Composite review key keccak256(abi.encode(governor, proposalId)).
     /// @param openedAt   Sherlock run #3 #6: snapshot timestamp the review's
     ///                   `recordVoteStake` was captured at. `_slashOne` reads
     ///                   `getPastDelegatedInbound(approver, openedAt)` to
@@ -846,13 +852,13 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     /// @param approvers  The approver addresses to slash.
     /// @param slashBps   Slash fraction in basis points out of `10_000`.
     /// @return total     Total WOOD burned across all approvers.
-    function slashGuardians(uint256 proposalId, uint256 openedAt, address[] calldata approvers, uint256 slashBps)
+    function slashGuardians(bytes32 reviewKey, uint256 openedAt, address[] calldata approvers, uint256 slashBps)
         external
         onlyRegistry
         returns (uint256 total)
     {
         for (uint256 i = 0; i < approvers.length; i++) {
-            total += _slashOne(proposalId, openedAt, approvers[i], slashBps);
+            total += _slashOne(reviewKey, openedAt, approvers[i], slashBps);
         }
         if (total == 0) return 0;
         // Checkpoint the aggregate total-stake drop once after the loop.
@@ -876,7 +882,7 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     ///      pure-own-stake snapshot. The snapshot-inbound is correct even
     ///      if delegators staked/unstaked between open and slash (live
     ///      `poolTokens` would diverge from the snapshot).
-    function _slashOne(uint256 proposalId, uint256 openedAt, address approver, uint256 slashBps)
+    function _slashOne(bytes32 reviewKey, uint256 openedAt, address approver, uint256 slashBps)
         private
         returns (uint256 amt)
     {
@@ -893,7 +899,7 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
         // the snapshot or inbound view ever returns 0 (no vote recorded /
         // pre-fix proposal / no delegations), this collapses to the raw
         // snapshot — which is the correct pre-#6 behavior for those cases.
-        uint256 snapTotal = uint256(voteStake[proposalId][approver]);
+        uint256 snapTotal = uint256(voteStake[reviewKey][approver]);
         uint256 snapDelegated = getPastDelegatedInbound(approver, openedAt);
         uint256 snapOwn = snapTotal > snapDelegated ? snapTotal - snapDelegated : 0;
         // Clamp: a concurrent slash may have already reduced live stake below
@@ -997,7 +1003,7 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
         // (live pool + unbonding-escrow pool) so indexers and the appeal flow
         // see the full delegated hit.
         if (amt != 0) {
-            emit GuardianSlashed(proposalId, approver, ownSlash, delSlash + unbondSlash);
+            emit GuardianSlashed(reviewKey, approver, ownSlash, delSlash + unbondSlash);
         }
     }
 

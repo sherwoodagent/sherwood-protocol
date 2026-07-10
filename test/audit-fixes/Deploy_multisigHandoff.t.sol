@@ -9,9 +9,11 @@ import {Create3Factory} from "../../src/Create3Factory.sol";
 import {GuardianRegistry} from "../../src/GuardianRegistry.sol";
 import {StakedWood} from "../../src/StakedWood.sol";
 import {SyndicateGovernor} from "../../src/SyndicateGovernor.sol";
+import {GovernorBeacon} from "../../src/GovernorBeacon.sol";
 import {SyndicateFactory} from "../../src/SyndicateFactory.sol";
 import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
+import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 
 /// @notice Trivial contract used as a stand-in for a Gnosis Safe in tests.
 ///         The deploy script's only check is `code.length > 0` — anything with
@@ -29,9 +31,10 @@ contract DeploySherwoodHarness is DeploySherwood {
         address factoryAddr,
         address registryAddr,
         address swoodProxy,
+        address protocolConfig,
         address ownerMultisig
     ) external {
-        _handoffOwnership(governorAddr, factoryAddr, registryAddr, swoodProxy, ownerMultisig);
+        _handoffOwnership(governorAddr, factoryAddr, registryAddr, swoodProxy, protocolConfig, ownerMultisig);
     }
 }
 
@@ -107,19 +110,36 @@ contract DeployMultisigHandoffTest is Test {
         Ownable(registry).transferOwnership(address(harness));
         Ownable(swood).transferOwnership(address(harness));
 
+        // C1: ProtocolConfig (Ownable2Step) is part of the handoff — stage the
+        // harness as its owner too so the two-step transfer starts from it.
+        ProtocolConfig protocolConfig = new ProtocolConfig(address(this));
+        protocolConfig.transferOwnership(address(harness));
+        vm.prank(address(harness));
+        protocolConfig.acceptOwnership();
+
         // Hand off via the harness-exposed entrypoint — exercises the real
         // `_handoffOwnership` body in `Deploy.s.sol`.
-        harness.exposed_handoffOwnership(governor, factory, registry, swood, address(multisig));
+        harness.exposed_handoffOwnership(governor, factory, registry, swood, address(protocolConfig), address(multisig));
 
-        // Post-handoff: all four must be owned by the multisig.
+        // Post-handoff: all four single-step proxies owned by the multisig.
         assertEq(Ownable(governor).owner(), address(multisig), "post: governor owned by multisig");
         assertEq(Ownable(factory).owner(), address(multisig), "post: factory owned by multisig");
         assertEq(Ownable(registry).owner(), address(multisig), "post: registry owned by multisig");
         assertEq(Ownable(swood).owner(), address(multisig), "post: swood owned by multisig");
 
+        // C1: ProtocolConfig ownership is PENDING the multisig (Ownable2Step) —
+        // deployer/harness still owns it until the multisig accepts.
+        assertEq(protocolConfig.pendingOwner(), address(multisig), "protocolConfig pending -> multisig");
+        assertEq(protocolConfig.owner(), address(harness), "protocolConfig still harness-owned pre-accept");
+        // After the multisig accepts, control fully transfers.
+        vm.prank(address(multisig));
+        protocolConfig.acceptOwnership();
+        assertEq(protocolConfig.owner(), address(multisig), "protocolConfig owned by multisig post-accept");
+
         // Deployer EOA must no longer be authorized for any onlyOwner call.
+        // (governor == the beacon here; its owner-gated surface is upgradeTo.)
         vm.expectRevert();
-        SyndicateGovernor(governor).setVotingPeriod(2 days);
+        GovernorBeacon(governor).upgradeTo(address(0xdead));
 
         vm.expectRevert();
         SyndicateFactory(factory).setManagementFeeBps(100);
@@ -182,33 +202,11 @@ contract DeployMultisigHandoffTest is Test {
         address predictedRegistryProxy = c3.addressOf(SALT_REGISTRY_PROXY);
         address predictedFactoryProxy = c3.addressOf(SALT_FACTORY_PROXY);
 
-        // Governor.
+        // Per-vault design: the handoff unit is the GovernorBeacon (Ownable),
+        // not a governor proxy — governors are per-vault BeaconProxies with no
+        // Ownable surface (owner resolves live from the vault).
         address govImpl = c3.deploy(SALT_GOVERNOR_IMPL, abi.encodePacked(type(SyndicateGovernor).creationCode));
-        bytes memory govInit = abi.encodeCall(
-            SyndicateGovernor.initialize,
-            (
-                ISyndicateGovernor.InitParams({
-                    owner: deployer,
-                    votingPeriod: 1 days,
-                    executionWindow: 1 days,
-                    vetoThresholdBps: 4000,
-                    maxPerformanceFeeBps: 1000,
-                    cooldownPeriod: 1 days,
-                    collaborationWindow: 48 hours,
-                    maxCoProposers: 5,
-                    minStrategyDuration: 1 hours,
-                    maxStrategyDuration: 14 days,
-                    protocolFeeBps: 100,
-                    protocolFeeRecipient: deployer,
-                    guardianFeeBps: 0,
-                    guardiansFeeRecipient: address(0)
-                }),
-                predictedRegistryProxy
-            )
-        );
-        governor = c3.deploy(
-            SALT_GOVERNOR_PROXY, abi.encodePacked(type(ERC1967Proxy).creationCode, abi.encode(govImpl, govInit))
-        );
+        governor = address(new GovernorBeacon(govImpl, deployer));
 
         // sWOOD — sole WOOD custodian post-split. Plain deploy (not part of the
         // handoff assertion, so no Create3 needed); the registry's slimmed
@@ -219,7 +217,6 @@ contract DeployMultisigHandoffTest is Test {
             (StakedWood.InitParams({
                     owner: deployer,
                     wood: address(wood),
-                    governor: governor,
                     factory: predictedFactoryProxy,
                     minGuardianStake: 10_000e18,
                     coolDownPeriod: 7 days,
@@ -232,9 +229,8 @@ contract DeployMultisigHandoffTest is Test {
 
         // Registry (predicted factory address) — slimmed 6-arg initialize.
         address registryImpl = c3.deploy(SALT_REGISTRY_IMPL, abi.encodePacked(type(GuardianRegistry).creationCode));
-        bytes memory regInit = abi.encodeCall(
-            GuardianRegistry.initialize, (deployer, governor, predictedFactoryProxy, swood, 24 hours, 3000)
-        );
+        bytes memory regInit =
+            abi.encodeCall(GuardianRegistry.initialize, (deployer, predictedFactoryProxy, swood, 24 hours, 3000));
         registry = c3.deploy(
             SALT_REGISTRY_PROXY, abi.encodePacked(type(ERC1967Proxy).creationCode, abi.encode(registryImpl, regInit))
         );
@@ -250,7 +246,8 @@ contract DeployMultisigHandoffTest is Test {
                     vaultImpl: address(0xE2),
                     ensRegistrar: address(0),
                     agentRegistry: address(0),
-                    governor: governor,
+                    beacon: governor, // the GovernorBeacon deployed above
+                    protocolConfig: address(new ProtocolConfig(deployer)),
                     managementFeeBps: 50,
                     guardianRegistry: registry
                 }))

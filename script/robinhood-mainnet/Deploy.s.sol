@@ -5,10 +5,9 @@ import {console} from "forge-std/Script.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {SyndicateFactory} from "../../src/SyndicateFactory.sol";
-import {SyndicateGovernor} from "../../src/SyndicateGovernor.sol";
+import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {StakedWood} from "../../src/StakedWood.sol";
 import {PriceRouter} from "../../src/pricing/PriceRouter.sol";
-import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 import {DeploySherwood} from "../Deploy.s.sol";
 
 /**
@@ -107,7 +106,11 @@ contract DeployRobinhoodMainnet is DeploySherwood {
         // Multisig handoff (final action inside the broadcast).
         address effectiveOwner = deployer;
         if (!skipHandoff) {
-            Ownable(d.governorProxy).transferOwnership(ownerMultisig);
+            // Per-vault governors: the beacon (shared impl) and ProtocolConfig
+            // (global fee params) are the governance handles — there is no
+            // singleton governor proxy to hand off.
+            Ownable(d.beacon).transferOwnership(ownerMultisig);
+            Ownable(d.protocolConfig).transferOwnership(ownerMultisig);
             Ownable(d.factoryProxy).transferOwnership(ownerMultisig);
             Ownable(d.registryProxy).transferOwnership(ownerMultisig);
             Ownable(d.swoodProxy).transferOwnership(ownerMultisig);
@@ -120,7 +123,8 @@ contract DeployRobinhoodMainnet is DeploySherwood {
         _validateMainnet(
             effectiveOwner,
             deployer,
-            d.governorProxy,
+            d.beacon,
+            d.protocolConfig,
             d.factoryProxy,
             d.registryProxy,
             d.swoodProxy,
@@ -130,15 +134,19 @@ contract DeployRobinhoodMainnet is DeploySherwood {
 
         // Persist. `_writeAddresses` patches the core keys in place, so the
         // external addresses (WETH / USDG / Uniswap / Chainlink feeds) that were
-        // committed into chains/4663.json survive.
-        _writeAddresses("Robinhood Chain", deployer, d.factoryProxy, d.governorProxy, d.executorLib, d.vaultImpl);
+        // committed into chains/4663.json survive. SYNDICATE_GOVERNOR stays zero:
+        // governors are per-vault, resolved via `factory.governorOf(vault)`.
+        _writeAddresses("Robinhood Chain", deployer, d.factoryProxy, address(0), d.executorLib, d.vaultImpl);
+        _patchAddress("GOVERNOR_BEACON", d.beacon);
+        _patchAddress("PROTOCOL_CONFIG", d.protocolConfig);
         _patchAddress("GUARDIAN_REGISTRY", d.registryProxy);
         _patchAddress("STAKED_WOOD", d.swoodProxy);
         _patchAddress("WOOD_TOKEN", woodToken);
         _patchAddress("PRICE_ROUTER", address(priceRouter));
 
         console.log("SyndicateFactory:", d.factoryProxy);
-        console.log("SyndicateGovernor:", d.governorProxy);
+        console.log("GovernorBeacon:", d.beacon);
+        console.log("ProtocolConfig:", d.protocolConfig);
         console.log("GuardianRegistry:", d.registryProxy);
         console.log("StakedWood:", d.swoodProxy);
         console.log("PriceRouter:", address(priceRouter));
@@ -150,26 +158,27 @@ contract DeployRobinhoodMainnet is DeploySherwood {
     function _validateMainnet(
         address expectedOwner,
         address deployer,
-        address governorAddr,
+        address beaconAddr,
+        address protocolConfigAddr,
         address factoryAddr,
         address registryAddr,
         address swoodAddr,
         address wood,
         address priceRouter
     ) internal view {
-        SyndicateGovernor governor = SyndicateGovernor(governorAddr);
         SyndicateFactory factory = SyndicateFactory(factoryAddr);
-        ISyndicateGovernor.GovernorParams memory p = governor.getGovernorParams();
+        ProtocolConfig protocolConfig = ProtocolConfig(protocolConfigAddr);
 
-        _checkAddr("gov.owner", Ownable(governorAddr).owner(), expectedOwner);
-        _checkUint("gov.votingPeriod", p.votingPeriod, VOTING_PERIOD);
-        _checkUint("gov.maxStrategyDuration", p.maxStrategyDuration, MAX_STRATEGY_DAYS * 1 days);
-        _checkUint("gov.protocolFeeBps", governor.protocolFeeBps(), PROTOCOL_FEE_BPS);
-        _checkAddr("gov.protocolFeeRecipient", governor.protocolFeeRecipient(), deployer);
-        _checkAddr("gov.factory", governor.factory(), factoryAddr);
+        // Per-vault governors are minted at `createSyndicate`, so there is no
+        // governor instance to inspect here. What's checkable at deploy time is
+        // the beacon (shared impl + upgrade authority) and ProtocolConfig.
+        _checkAddr("beacon.owner", Ownable(beaconAddr).owner(), expectedOwner);
+        _checkAddr("protocolConfig.owner", Ownable(protocolConfigAddr).owner(), expectedOwner);
+        _checkUint("protocolConfig.protocolFeeBps", protocolConfig.protocolFeeBps(), PROTOCOL_FEE_BPS);
+        _checkAddr("protocolConfig.protocolFeeRecipient", protocolConfig.protocolFeeRecipient(), deployer);
 
         _checkAddr("factory.owner", Ownable(factoryAddr).owner(), expectedOwner);
-        _checkAddr("factory.governor", factory.governor(), governorAddr);
+        _checkAddr("factory.beacon", factory.beacon(), beaconAddr);
         _checkAddr("factory.ensRegistrar", address(factory.ensRegistrar()), address(0));
         _checkAddr("factory.agentRegistry", address(factory.agentRegistry()), address(0));
 

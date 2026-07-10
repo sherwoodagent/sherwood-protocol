@@ -25,11 +25,11 @@ contract MockRegistryMinimal {
         reviewPeriod = r;
     }
 
-    function resolveReview(uint256) external pure returns (bool blocked) {
+    function resolveReview(address, uint256) external pure returns (bool blocked) {
         return false;
     }
 
-    function getReviewState(uint256)
+    function getReviewState(address, uint256)
         external
         pure
         returns (bool opened, bool resolved, bool blocked, bool cohortTooSmall)
@@ -42,7 +42,7 @@ contract MockRegistryMinimal {
     /// @dev V2: `_finishSettlement` calls `isEmergencyOpen` to decide whether
     ///      to cancel a dangling emergency review. Returns false so the cancel
     ///      branch is skipped in governor unit tests.
-    function isEmergencyOpen(uint256) external pure returns (bool) {
+    function isEmergencyOpen(address, uint256) external pure returns (bool) {
         return false;
     }
 

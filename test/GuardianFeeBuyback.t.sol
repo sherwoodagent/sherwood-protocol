@@ -14,6 +14,8 @@ import {BlacklistingERC20Mock} from "./mocks/BlacklistingERC20Mock.sol";
 import {MockAgentRegistry} from "./mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "./mocks/MockRegistryMinimal.sol";
 import {RegistryTestHarness} from "./helpers/RegistryTestHarness.sol";
+import {ProtocolConfig} from "../src/ProtocolConfig.sol";
+import {IProtocolConfig} from "../src/interfaces/IProtocolConfig.sol";
 
 /// @title GuardianFeeBuyback (governor-level)
 /// @notice Covers the buyback-WOOD redesign: the guardian-fee slice now routes
@@ -24,6 +26,7 @@ import {RegistryTestHarness} from "./helpers/RegistryTestHarness.sol";
 ///         `registry.getApproverWeights`.
 contract GuardianFeeBuybackTest is Test {
     SyndicateGovernor public governor;
+    ProtocolConfig public protocolConfig;
     SyndicateVault public vault;
     BatchExecutorLib public executorLib;
     BlacklistingERC20Mock public usdc;
@@ -46,6 +49,13 @@ contract GuardianFeeBuybackTest is Test {
     uint256 constant GUARDIAN_FEE_BPS = 200; // 2%
 
     function setUp() public {
+        protocolConfig = new ProtocolConfig(owner);
+        // Guardian fee lives on ProtocolConfig now; the governor snapshots it
+        // at propose. Recipient-first coupling: set recipient, then bps.
+        vm.startPrank(owner);
+        protocolConfig.setGuardiansFeeRecipient(guardiansFeeRecipient);
+        protocolConfig.setGuardianFeeBps(GUARDIAN_FEE_BPS);
+        vm.stopPrank();
         usdc = new BlacklistingERC20Mock("USD Coin", "USDC", 6);
         executorLib = new BatchExecutorLib();
         agentRegistry = new MockAgentRegistry();
@@ -75,8 +85,11 @@ contract GuardianFeeBuybackTest is Test {
         bytes memory govInit = abi.encodeCall(
             SyndicateGovernor.initialize,
             (
-                ISyndicateGovernor.InitParams({
-                    owner: owner,
+                address(vault), // vault_: this test's vault (per-vault governor)
+                address(guardianRegistry),
+                address(protocolConfig),
+                address(this), // factory (test contract)
+                ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,
                     vetoThresholdBps: VETO_THRESHOLD_BPS,
@@ -85,19 +98,14 @@ contract GuardianFeeBuybackTest is Test {
                     collaborationWindow: 48 hours,
                     maxCoProposers: 5,
                     minStrategyDuration: 1 hours,
-                    maxStrategyDuration: 30 days,
-                    protocolFeeBps: 0,
-                    protocolFeeRecipient: address(0),
-                    guardianFeeBps: GUARDIAN_FEE_BPS,
-                    guardiansFeeRecipient: guardiansFeeRecipient
-                }),
-                address(guardianRegistry)
+                    maxStrategyDuration: 30 days
+                })
             )
         );
         governor = SyndicateGovernor(address(new ERC1967Proxy(address(govImpl), govInit)));
-
-        vm.prank(owner);
-        governor.addVault(address(vault));
+        // Per-vault governor: the vault resolves its governor via its factory
+        // (this test contract). Mock governorOf(vault) -> the deployed governor.
+        vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
 
         usdc.mint(lp1, 100_000e6);
         usdc.mint(lp2, 100_000e6);
@@ -245,23 +253,23 @@ contract GuardianFeeBuybackTest is Test {
     function test_setGuardianFeeBps_revertsWhenRecipientUnset() public {
         // Turn off the fee, then clear the recipient (allowed while off).
         vm.startPrank(owner);
-        governor.setGuardianFeeBps(0);
-        governor.setGuardiansFeeRecipient(address(0));
+        protocolConfig.setGuardianFeeBps(0);
+        protocolConfig.setGuardiansFeeRecipient(address(0));
         // Now raising the fee with no recipient must revert.
         vm.expectRevert(ISyndicateGovernor.InvalidGuardiansFeeRecipient.selector);
-        governor.setGuardianFeeBps(100);
+        protocolConfig.setGuardianFeeBps(100);
         vm.stopPrank();
     }
 
     function test_setGuardianFeeBps_succeedsAfterRecipientSet() public {
         vm.startPrank(owner);
-        governor.setGuardianFeeBps(0);
-        governor.setGuardiansFeeRecipient(address(0));
+        protocolConfig.setGuardianFeeBps(0);
+        protocolConfig.setGuardiansFeeRecipient(address(0));
         // Re-set a recipient, then raising the fee succeeds.
-        governor.setGuardiansFeeRecipient(guardiansFeeRecipient);
-        governor.setGuardianFeeBps(150);
+        protocolConfig.setGuardiansFeeRecipient(guardiansFeeRecipient);
+        protocolConfig.setGuardianFeeBps(150);
         vm.stopPrank();
-        assertEq(governor.guardianFeeBps(), 150);
+        assertEq(protocolConfig.guardianFeeBps(), 150);
     }
 
     // ── 4. setGuardiansFeeRecipient(0) coupling + event ──
@@ -270,57 +278,35 @@ contract GuardianFeeBuybackTest is Test {
         // Fee is on (GUARDIAN_FEE_BPS) from setUp.
         vm.prank(owner);
         vm.expectRevert(ISyndicateGovernor.InvalidGuardiansFeeRecipient.selector);
-        governor.setGuardiansFeeRecipient(address(0));
+        protocolConfig.setGuardiansFeeRecipient(address(0));
     }
 
     function test_setGuardiansFeeRecipient_zeroAllowed_whenFeeOff() public {
         vm.startPrank(owner);
-        governor.setGuardianFeeBps(0);
-        governor.setGuardiansFeeRecipient(address(0));
+        protocolConfig.setGuardianFeeBps(0);
+        protocolConfig.setGuardiansFeeRecipient(address(0));
         vm.stopPrank();
-        assertEq(governor.guardiansFeeRecipient(), address(0));
+        assertEq(protocolConfig.guardiansFeeRecipient(), address(0));
     }
 
-    function test_setGuardiansFeeRecipient_emitsParameterChangeFinalized() public {
+    function test_setGuardiansFeeRecipient_emitsRecipientSet() public {
+        // Fee setters moved to ProtocolConfig — it emits its own typed event
+        // (GuardiansFeeRecipientSet) rather than the governor's uniform
+        // ParameterChangeFinalized topic.
         address newRecipient = makeAddr("newRecipient");
-        uint256 oldVal = uint256(uint160(guardiansFeeRecipient));
-        uint256 newVal = uint256(uint160(newRecipient));
-        vm.expectEmit(true, false, false, true, address(governor));
-        emit ISyndicateGovernor.ParameterChangeFinalized(keccak256("guardiansFeeRecipient"), oldVal, newVal);
+        vm.expectEmit(true, true, false, false, address(protocolConfig));
+        emit IProtocolConfig.GuardiansFeeRecipientSet(guardiansFeeRecipient, newRecipient);
         vm.prank(owner);
-        governor.setGuardiansFeeRecipient(newRecipient);
-        assertEq(governor.guardiansFeeRecipient(), newRecipient);
+        protocolConfig.setGuardiansFeeRecipient(newRecipient);
+        assertEq(protocolConfig.guardiansFeeRecipient(), newRecipient);
     }
 
     // ── 5. initialize coupling ──
 
-    function test_initialize_revertsWhenFeeOnButRecipientUnset() public {
-        SyndicateGovernor govImpl = new SyndicateGovernor();
-        bytes memory badInit = abi.encodeCall(
-            SyndicateGovernor.initialize,
-            (
-                ISyndicateGovernor.InitParams({
-                    owner: owner,
-                    votingPeriod: VOTING_PERIOD,
-                    executionWindow: EXECUTION_WINDOW,
-                    vetoThresholdBps: VETO_THRESHOLD_BPS,
-                    maxPerformanceFeeBps: MAX_PERF_FEE_BPS,
-                    cooldownPeriod: COOLDOWN_PERIOD,
-                    collaborationWindow: 48 hours,
-                    maxCoProposers: 5,
-                    minStrategyDuration: 1 hours,
-                    maxStrategyDuration: 30 days,
-                    protocolFeeBps: 0,
-                    protocolFeeRecipient: address(0),
-                    guardianFeeBps: GUARDIAN_FEE_BPS,
-                    guardiansFeeRecipient: address(0)
-                }),
-                address(guardianRegistry)
-            )
-        );
-        vm.expectRevert(ISyndicateGovernor.InvalidGuardiansFeeRecipient.selector);
-        new ERC1967Proxy(address(govImpl), badInit);
-    }
+    /* test_initialize_revertsWhenFeeOnButRecipientUnset — removed: the fee/
+       recipient coupling is enforced by ProtocolConfig's setters (see
+       test_setGuardianFeeBps_revertsWhenRecipientUnset above); governor
+       initialize no longer stores fees at all. */
 }
 
 /// @title GuardianFeeBuyback_RegistryWeights
@@ -348,7 +334,7 @@ contract GuardianFeeBuyback_RegistryWeightsTest is RegistryTestHarness {
         reviewEnd = voteEnd + 24 hours + 1;
         governor.setProposal(PID, voteEnd, reviewEnd);
         vm.warp(voteEnd);
-        registry.openReview(PID);
+        registry.openReview(address(governor), PID);
         vm.warp(voteEnd + 1);
     }
 
@@ -356,14 +342,14 @@ contract GuardianFeeBuyback_RegistryWeightsTest is RegistryTestHarness {
         _openReview();
 
         vm.prank(approver);
-        registry.voteOnProposal(PID, IGuardianRegistry.GuardianVoteType.Approve, 0);
+        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Approve, 0);
         vm.prank(approver2);
-        registry.voteOnProposal(PID, IGuardianRegistry.GuardianVoteType.Approve, 0);
+        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Approve, 0);
         vm.prank(blocker);
-        registry.voteOnProposal(PID, IGuardianRegistry.GuardianVoteType.Block, 0);
+        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Block, 0);
 
         (address[] memory approvers, uint128[] memory weights, uint128 totalApproveWeight) =
-            registry.getApproverWeights(PID);
+            registry.getApproverWeights(address(governor), PID);
 
         assertEq(approvers.length, 2, "two approvers");
         assertEq(weights.length, 2, "weights match approvers");
@@ -381,16 +367,16 @@ contract GuardianFeeBuyback_RegistryWeightsTest is RegistryTestHarness {
         _openReview();
 
         vm.prank(approver);
-        registry.voteOnProposal(PID, IGuardianRegistry.GuardianVoteType.Approve, 0);
+        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Approve, 0);
         vm.prank(approver2);
-        registry.voteOnProposal(PID, IGuardianRegistry.GuardianVoteType.Approve, 0);
+        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Approve, 0);
 
         // approver2 flips Approve -> Block, leaving only `approver`.
         vm.prank(approver2);
-        registry.voteOnProposal(PID, IGuardianRegistry.GuardianVoteType.Block, 0);
+        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Block, 0);
 
         (address[] memory approvers, uint128[] memory weights, uint128 totalApproveWeight) =
-            registry.getApproverWeights(PID);
+            registry.getApproverWeights(address(governor), PID);
 
         assertEq(approvers.length, 1, "only one approver after flip");
         assertEq(approvers[0], approver, "remaining approver is `approver`");
@@ -402,15 +388,15 @@ contract GuardianFeeBuyback_RegistryWeightsTest is RegistryTestHarness {
         (, uint256 reviewEnd) = _openReview();
 
         vm.prank(approver);
-        registry.voteOnProposal(PID, IGuardianRegistry.GuardianVoteType.Approve, 0);
+        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Approve, 0);
         vm.prank(approver2);
-        registry.voteOnProposal(PID, IGuardianRegistry.GuardianVoteType.Approve, 0);
+        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Approve, 0);
 
         vm.warp(reviewEnd);
-        registry.resolveReview(PID);
+        registry.resolveReview(address(governor), PID);
 
         // Arrays are not cleared at resolve — getter still works for the bot.
-        (address[] memory approvers,, uint128 totalApproveWeight) = registry.getApproverWeights(PID);
+        (address[] memory approvers,, uint128 totalApproveWeight) = registry.getApproverWeights(address(governor), PID);
         assertEq(approvers.length, 2, "approver set persists post-settle");
         assertEq(uint256(totalApproveWeight), 50_000e18, "denominator persists post-settle");
     }

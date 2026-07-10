@@ -71,7 +71,7 @@ contract VaultLaneATest is Test {
         vault.setWithdrawalQueue(address(queue));
 
         // Test contract is the factory: expose governor() + priceRouter().
-        vm.mockCall(address(this), abi.encodeWithSignature("governor()"), abi.encode(MOCK_GOVERNOR));
+        vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(MOCK_GOVERNOR));
         vm.mockCall(address(this), abi.encodeWithSignature("priceRouter()"), abi.encode(address(router)));
         _setLocked(false);
 
@@ -85,11 +85,9 @@ contract VaultLaneATest is Test {
 
     function _setLocked(bool locked) internal {
         vm.mockCall(
-            MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal(address)"), abi.encode(locked ? PID : uint256(0))
+            MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal()"), abi.encode(locked ? PID : uint256(0))
         );
-        vm.mockCall(
-            MOCK_GOVERNOR, abi.encodeWithSignature("openProposalCount(address)"), abi.encode(locked ? uint256(1) : 0)
-        );
+        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("openProposalCount()"), abi.encode(locked ? uint256(1) : 0));
         if (locked) {
             ISyndicateGovernor.StrategyProposal memory p;
             p.id = PID;

@@ -7,6 +7,7 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {SyndicateFactory} from "../../src/SyndicateFactory.sol";
 import {SyndicateVault} from "../../src/SyndicateVault.sol";
 import {SyndicateGovernor} from "../../src/SyndicateGovernor.sol";
+import {GovernorBeacon} from "../../src/GovernorBeacon.sol";
 import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 import {GuardianRegistry} from "../../src/GuardianRegistry.sol";
 import {IGuardianRegistry} from "../../src/interfaces/IGuardianRegistry.sol";
@@ -16,13 +17,13 @@ import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockL2Registrar} from "../mocks/MockL2Registrar.sol";
+import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 
 /// @title OwnerStakeAtCreation.t
 /// @notice Tests for Task 26: factory creation gates on prepared owner stake,
 ///         binds the stake atomically, and rotateOwner retransfers the slot.
 contract OwnerStakeAtCreationTest is Test {
     SyndicateFactory public factory;
-    SyndicateGovernor public governor;
     SyndicateVault public vaultImpl;
     GuardianRegistry public registry;
     StakedWood public swood;
@@ -58,10 +59,10 @@ contract OwnerStakeAtCreationTest is Test {
         // sWOOD + Governor + Factory + Registry — circular init deps resolved
         // by predicting proxy addresses via `vm.computeCreateAddress`.
         // From `baseNonce`: swoodImpl (+0), swoodProxy (+1), govImpl (+2),
-        // govProxy (+3), factoryImpl (+4), regImpl (+5), regProxy (+6),
+        // beacon (+3), factoryImpl (+4), regImpl (+5), regProxy (+6),
         // factoryProxy (+7).
+        ProtocolConfig _hoistedPC = new ProtocolConfig(owner);
         uint256 baseNonce = vm.getNonce(address(this));
-        address predictedGovernor = vm.computeCreateAddress(address(this), baseNonce + 3);
         address predictedRegistryProxy = vm.computeCreateAddress(address(this), baseNonce + 6);
         address predictedFactoryProxy = vm.computeCreateAddress(address(this), baseNonce + 7);
 
@@ -72,7 +73,6 @@ contract OwnerStakeAtCreationTest is Test {
             (StakedWood.InitParams({
                     owner: owner,
                     wood: address(wood),
-                    governor: predictedGovernor,
                     factory: predictedFactoryProxy,
                     minGuardianStake: MIN_GUARDIAN_STAKE,
                     coolDownPeriod: 7 days,
@@ -83,40 +83,18 @@ contract OwnerStakeAtCreationTest is Test {
         );
         swood = StakedWood(address(new ERC1967Proxy(address(swoodImpl), swoodInit)));
 
-        // Governor
+        // GovernorBeacon (nonce +3, preserving the prediction plan). The factory
+        // clones a per-vault BeaconProxy governor at createSyndicate and
+        // authorizes it on the registry itself — no standalone governor here.
         SyndicateGovernor govImpl = new SyndicateGovernor();
-        bytes memory govInit = abi.encodeCall(
-            SyndicateGovernor.initialize,
-            (
-                ISyndicateGovernor.InitParams({
-                    owner: owner,
-                    votingPeriod: 1 days,
-                    executionWindow: 1 days,
-                    vetoThresholdBps: 4000,
-                    maxPerformanceFeeBps: 1000,
-                    cooldownPeriod: 1 days,
-                    collaborationWindow: 48 hours,
-                    maxCoProposers: 5,
-                    minStrategyDuration: 1 hours,
-                    maxStrategyDuration: 30 days,
-                    protocolFeeBps: 0,
-                    protocolFeeRecipient: address(0),
-                    guardianFeeBps: 0,
-                    guardiansFeeRecipient: address(0)
-                }),
-                predictedRegistryProxy
-            )
-        );
-        governor = SyndicateGovernor(address(new ERC1967Proxy(address(govImpl), govInit)));
-        require(address(governor) == predictedGovernor, "governor address prediction mismatch");
+        GovernorBeacon beacon = new GovernorBeacon(address(govImpl), owner);
 
         // Factory + registry — registry needs factory address, factory needs
         // registry address. Deploy in order matching the nonce plan above.
         SyndicateFactory factoryImpl = new SyndicateFactory();
         GuardianRegistry regImpl = new GuardianRegistry();
         bytes memory regInit = abi.encodeCall(
-            GuardianRegistry.initialize,
-            (owner, address(governor), predictedFactoryProxy, address(swood), REVIEW_PERIOD, BLOCK_QUORUM_BPS)
+            GuardianRegistry.initialize, (owner, predictedFactoryProxy, address(swood), REVIEW_PERIOD, BLOCK_QUORUM_BPS)
         );
         registry = GuardianRegistry(address(new ERC1967Proxy(address(regImpl), regInit)));
         require(address(registry) == predictedRegistryProxy, "registry address prediction mismatch");
@@ -133,7 +111,8 @@ contract OwnerStakeAtCreationTest is Test {
                     vaultImpl: address(vaultImpl),
                     ensRegistrar: address(ensRegistrar),
                     agentRegistry: address(agentRegistry),
-                    governor: address(governor),
+                    beacon: address(beacon),
+                    protocolConfig: address(_hoistedPC),
                     managementFeeBps: 50,
                     guardianRegistry: address(registry)
                 }))
@@ -143,8 +122,7 @@ contract OwnerStakeAtCreationTest is Test {
 
         // Hand the governor's addVault gate to the factory.
         // V1.5: setFactory applies immediately.
-        vm.prank(owner);
-        governor.setFactory(address(factory));
+        // governor.setFactory removed in per-vault design
 
         // Fund creator with WOOD so they can prepare owner stake.
         wood.mint(creator, 100_000e18);
@@ -258,34 +236,11 @@ contract OwnerStakeAtCreationTest is Test {
         factory.rotateOwner(vault, newOwner);
     }
 
-    function test_rotateOwner_revertsOnRegistryMismatch() public {
-        address vault = _createAndUnstake();
-        _prepareStake(newOwner);
-
-        // Swap the governor's registry to a different address → mismatch.
-        GuardianRegistry otherImpl = new GuardianRegistry();
-        // Deploy a minimally-initialized second registry (slimmed 6-arg init;
-        // shares the same sWOOD — only the registry address matters here).
-        bytes memory otherInit = abi.encodeCall(
-            GuardianRegistry.initialize,
-            (owner, address(governor), address(factory), address(swood), REVIEW_PERIOD, BLOCK_QUORUM_BPS)
-        );
-        address other = address(new ERC1967Proxy(address(otherImpl), otherInit));
-
-        // Overwrite `_guardianRegistry` on the governor via stdstore. This
-        // simulates a deployer misconfiguration where factory and governor
-        // ended up pointing at different registries.
-        // The slot for `_guardianRegistry` is not exposed via a public getter
-        // until Task 25 added `guardianRegistry()`, so we use `vm.store` with a
-        // computed slot derived from a canonical anchor.
-        bytes32 slot = _guardianRegistrySlot();
-        vm.store(address(governor), slot, bytes32(uint256(uint160(other))));
-        assertEq(governor.guardianRegistry(), other, "governor now points at other registry");
-
-        vm.prank(creator);
-        vm.expectRevert(SyndicateFactory.RegistryMismatch.selector);
-        factory.rotateOwner(vault, newOwner);
-    }
+    // Removed: `test_rotateOwner_revertsOnRegistryMismatch`. In the per-vault
+    // governor model the factory deploys each vault's governor pointing at its
+    // own `guardianRegistry`, so a factory↔governor registry mismatch cannot
+    // occur — the `RegistryMismatch` guard (and error) were removed from
+    // `rotateOwner`. There is no longer a scenario to exercise.
 
     function test_rotateOwner_happyPath_transfersVaultAndSlot() public {
         address vault = _createAndUnstake();
@@ -300,19 +255,5 @@ contract OwnerStakeAtCreationTest is Test {
         // Creator record updated so downstream NotCreator gates follow the new owner.
         (,, address recordedCreator,,,,) = factory.syndicates(factory.vaultToSyndicate(vault));
         assertEq(recordedCreator, newOwner);
-    }
-
-    /// @dev Locates the governor's `_guardianRegistry` storage slot by reading
-    ///      the public view and searching a small slot window. Avoids hard-coding
-    ///      a magic slot number that would silently drift.
-    function _guardianRegistrySlot() internal view returns (bytes32) {
-        address target = governor.guardianRegistry();
-        for (uint256 i = 0; i < 200; i++) {
-            bytes32 s = bytes32(i);
-            if (address(uint160(uint256(vm.load(address(governor), s)))) == target) {
-                return s;
-            }
-        }
-        revert("slot not found");
     }
 }

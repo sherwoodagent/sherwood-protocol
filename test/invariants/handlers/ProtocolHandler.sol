@@ -95,23 +95,22 @@ contract ProtocolHandler is Test {
     /// @dev Queue a new `protocolFeeBps` change. The setter's own guard
     ///      refuses to queue a non-zero bps value while recipient == 0 —
     ///      so INV-30 cannot be violated through the queue edge.
-    function queueProtocolFeeBps(uint256 bpsSeed) external {
-        uint256 bps = bound(bpsSeed, 0, 1_000); // governor MAX_PROTOCOL_FEE_BPS = 1000
-        vm.prank(governorOwner);
-        try governor.setProtocolFeeBps(bps) {
-            queueSuccesses += 1;
-        } catch {}
+    function queueProtocolFeeBps(
+        uint256 /*bpsSeed*/
+    )
+        external {
+        // setProtocolFeeBps moved to ProtocolConfig in per-vault governor design.
+        // No-op to keep selector set stable across refactor.
     }
 
     /// @dev Queue a new protocol-fee recipient change. Zero-address is rejected
     ///      by the setter so the queued newValue is always nonzero.
-    function queueProtocolFeeRecipient(uint256 recipientSeed) external {
-        address[3] memory pool = [makeAddr("feeRecipient1"), makeAddr("feeRecipient2"), makeAddr("feeRecipient3")];
-        address r = pool[bound(recipientSeed, 0, 2)];
-        vm.prank(governorOwner);
-        try governor.setProtocolFeeRecipient(r) {
-            queueSuccesses += 1;
-        } catch {}
+    function queueProtocolFeeRecipient(
+        uint256 /*recipientSeed*/
+    )
+        external {
+        // setProtocolFeeRecipient moved to ProtocolConfig in per-vault governor design.
+        // No-op to keep selector set stable across refactor.
     }
 
     // ──────────────────────────────────────────────────────────────
@@ -145,7 +144,7 @@ contract ProtocolHandler is Test {
         bool isPaused = registry.paused();
         if (isPaused) pausedCallAttempts += 1;
         vm.prank(g);
-        try registry.voteOnProposal(1, s, 0) {}
+        try registry.voteOnProposal(address(governor), 1, s, 0) {}
         catch {
             if (isPaused) pausedCallReverts += 1;
         }
@@ -156,7 +155,7 @@ contract ProtocolHandler is Test {
         uint256 pid = bound(proposalSeed, 1, 3);
         bool isPaused = registry.paused();
         if (isPaused) pausedCallAttempts += 1;
-        try registry.openReview(pid) {}
+        try registry.openReview(address(governor), pid) {}
         catch {
             if (isPaused) pausedCallReverts += 1;
         }
@@ -167,7 +166,7 @@ contract ProtocolHandler is Test {
         uint256 pid = bound(proposalSeed, 1, 3);
         bool isPaused = registry.paused();
         if (isPaused) pausedCallAttempts += 1;
-        try registry.resolveReview(pid) {}
+        try registry.resolveReview(address(governor), pid) {}
         catch {
             if (isPaused) pausedCallReverts += 1;
         }

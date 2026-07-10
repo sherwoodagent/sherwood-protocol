@@ -15,7 +15,7 @@ import {MockGovernorMinimal} from "./mocks/MockGovernorMinimal.sol";
 contract StakedWoodSlashingTest is Test {
     /// @dev Mirror of `StakedWood.GuardianSlashed` for `vm.expectEmit`.
     event GuardianSlashed(
-        uint256 indexed proposalId, address indexed approver, uint256 ownSlash, uint256 delegatedSlash
+        bytes32 indexed reviewKey, address indexed approver, uint256 ownSlash, uint256 delegatedSlash
     );
 
     StakedWood swood;
@@ -40,7 +40,6 @@ contract StakedWoodSlashingTest is Test {
             (StakedWood.InitParams({
                     owner: owner,
                     wood: address(wood),
-                    governor: address(gov),
                     factory: factory,
                     minGuardianStake: 10_000e18,
                     coolDownPeriod: 7 days,
@@ -73,13 +72,13 @@ contract StakedWoodSlashingTest is Test {
     function test_recordVoteStake_onlyRegistry() public {
         vm.prank(alice);
         vm.expectRevert(StakedWood.NotRegistry.selector);
-        swood.recordVoteStake(1, alice, 100e18);
+        swood.recordVoteStake(bytes32(uint256(1)), alice, 100e18);
     }
 
     function test_recordVoteStake_storesSnapshot() public {
         vm.prank(registry);
-        swood.recordVoteStake(1, alice, 123e18);
-        assertEq(swood.voteStake(1, alice), 123e18);
+        swood.recordVoteStake(bytes32(uint256(1)), alice, 123e18);
+        assertEq(swood.voteStake(bytes32(uint256(1)), alice), 123e18);
     }
 
     // ── slashGuardians: own stake ──
@@ -89,7 +88,7 @@ contract StakedWoodSlashingTest is Test {
         approvers[0] = alice;
         vm.prank(alice);
         vm.expectRevert(StakedWood.NotRegistry.selector);
-        swood.slashGuardians(1, 0, approvers, 5000);
+        swood.slashGuardians(bytes32(uint256(1)), 0, approvers, 5000);
     }
 
     function test_slashGuardians_ownStake() public {
@@ -100,7 +99,7 @@ contract StakedWoodSlashingTest is Test {
 
         // Registry snapshots alice's vote stake at 20k for proposal 1.
         vm.prank(registry);
-        swood.recordVoteStake(1, alice, 20_000e18);
+        swood.recordVoteStake(bytes32(uint256(1)), alice, 20_000e18);
 
         vm.warp(vm.getBlockTimestamp() + 1);
 
@@ -110,11 +109,11 @@ contract StakedWoodSlashingTest is Test {
         uint256 burnBefore = wood.balanceOf(BURN_ADDRESS);
         // GuardianSlashed fires with own slash 5k, delegated slash 0.
         vm.expectEmit(true, true, true, true, address(swood));
-        emit GuardianSlashed(1, alice, 5_000e18, 0);
+        emit GuardianSlashed(bytes32(uint256(1)), alice, 5_000e18, 0);
         vm.prank(registry);
         // openedAt=0 collapses snapDelegated lookup to 0 → snapOwn = snapTotal
         // (preserves pre-#6 behavior for tests that don't combine own + delegated).
-        uint256 total = swood.slashGuardians(1, 0, approvers, 2500);
+        uint256 total = swood.slashGuardians(bytes32(uint256(1)), 0, approvers, 2500);
         uint256 slashedAt = vm.getBlockTimestamp();
 
         assertEq(total, 5_000e18, "returned total");
@@ -139,7 +138,7 @@ contract StakedWoodSlashingTest is Test {
         // Registry snapshots bob's own vote stake at 10k for proposal 2 — so
         // the own-stake portion of the slash is exercised alongside the pool.
         vm.prank(registry);
-        swood.recordVoteStake(2, bob, 10_000e18);
+        swood.recordVoteStake(bytes32(uint256(2)), bob, 10_000e18);
 
         // alice delegates 300, carol delegates 100 → pool: 400 tok / 400 sh.
         vm.prank(alice);
@@ -157,7 +156,7 @@ contract StakedWoodSlashingTest is Test {
         approvers[0] = bob;
         uint256 burnBefore = wood.balanceOf(BURN_ADDRESS);
         vm.prank(registry);
-        uint256 total = swood.slashGuardians(2, 0, approvers, 5000);
+        uint256 total = swood.slashGuardians(bytes32(uint256(2)), 0, approvers, 5000);
 
         // bob's own stake (10k) also slashed 50% → 5k; pool 400 → 200.
         assertEq(total, 5_000e18 + 200e18, "own + delegated slash");
@@ -185,7 +184,7 @@ contract StakedWoodSlashingTest is Test {
         address[] memory approvers = new address[](1);
         approvers[0] = bob;
         vm.prank(registry);
-        swood.slashGuardians(3, 0, approvers, 5000);
+        swood.slashGuardians(bytes32(uint256(3)), 0, approvers, 5000);
         assertEq(swood.poolTokens(bob), 50e18, "pool tokens halved");
         assertEq(swood.poolShares(bob), 100e18, "pool shares unchanged by slash");
 
@@ -230,7 +229,7 @@ contract StakedWoodSlashingTest is Test {
         address[] memory approvers = new address[](1);
         approvers[0] = bob;
         vm.prank(registry);
-        swood.slashGuardians(7, 0, approvers, 5000);
+        swood.slashGuardians(bytes32(uint256(7)), 0, approvers, 5000);
         assertEq(swood.unbondingPoolTokens(bob), 200e18, "unbonding pool slashed 50%");
 
         // Cooldown elapses; alice claims — she receives the SLASHED 200, not
@@ -259,7 +258,7 @@ contract StakedWoodSlashingTest is Test {
         address[] memory approvers = new address[](1);
         approvers[0] = bob;
         vm.prank(registry);
-        swood.slashGuardians(8, 0, approvers, 1000);
+        swood.slashGuardians(bytes32(uint256(8)), 0, approvers, 1000);
 
         vm.warp(vm.getBlockTimestamp() + 7 days);
         vm.prank(alice);
@@ -276,7 +275,7 @@ contract StakedWoodSlashingTest is Test {
         // Registry snapshots bob's own vote stake so the own-stake portion of
         // the slash is exercised alongside both delegation pools.
         vm.prank(registry);
-        swood.recordVoteStake(9, bob, 10_000e18);
+        swood.recordVoteStake(bytes32(uint256(9)), bob, 10_000e18);
 
         // Alice delegates 300 (will unbond), carol delegates 100 (stays live).
         vm.prank(alice);
@@ -296,9 +295,9 @@ contract StakedWoodSlashingTest is Test {
         uint256 burnBefore = wood.balanceOf(BURN_ADDRESS);
         vm.expectEmit(true, true, true, true, address(swood));
         // ownSlash 5k (bob's 10k @ 50%); delegatedSlash = live 50 + unbonding 150 = 200.
-        emit GuardianSlashed(9, bob, 5_000e18, 200e18);
+        emit GuardianSlashed(bytes32(uint256(9)), bob, 5_000e18, 200e18);
         vm.prank(registry);
-        uint256 total = swood.slashGuardians(9, 0, approvers, 5000);
+        uint256 total = swood.slashGuardians(bytes32(uint256(9)), 0, approvers, 5000);
 
         assertEq(swood.poolTokens(bob), 50e18, "live pool halved");
         assertEq(swood.unbondingPoolTokens(bob), 150e18, "unbonding pool halved");
@@ -351,13 +350,13 @@ contract StakedWoodSlashingTest is Test {
 
         // Registry mirrors bob's combined vote weight at open (own 10k + del 300).
         vm.prank(registry);
-        swood.recordVoteStake(11, bob, 10_300e18);
+        swood.recordVoteStake(bytes32(uint256(11)), bob, 10_300e18);
 
         // Slash 10% with the REAL openedAt.
         address[] memory approvers = new address[](1);
         approvers[0] = bob;
         vm.prank(registry);
-        uint256 total = swood.slashGuardians(11, openedAt, approvers, 1000);
+        uint256 total = swood.slashGuardians(bytes32(uint256(11)), openedAt, approvers, 1000);
 
         // Budget = 10% of the at-open delegated exposure (300) = 30. Live pool
         // is empty so the whole budget spills to the unbonding pool. Pre-fix
@@ -386,7 +385,7 @@ contract StakedWoodSlashingTest is Test {
         address[] memory approvers = new address[](1);
         approvers[0] = bob;
         vm.prank(registry);
-        swood.slashGuardians(10, 0, approvers, 5000);
+        swood.slashGuardians(bytes32(uint256(10)), 0, approvers, 5000);
         assertEq(swood.unbondingPoolTokens(bob), 200e18, "unbonding slashed");
 
         // Cancel re-bonds the SLASHED 200 into the live pool, not 400.
@@ -434,7 +433,7 @@ contract StakedWoodSlashingTest is Test {
 
         address[] memory approvers = new address[](0);
         vm.prank(registry);
-        uint256 total = swood.slashGuardians(1, 0, approvers, 5000);
+        uint256 total = swood.slashGuardians(bytes32(uint256(1)), 0, approvers, 5000);
 
         assertEq(total, 0, "empty array returns 0");
         assertEq(wood.balanceOf(BURN_ADDRESS), burnBefore, "nothing burned");
@@ -459,7 +458,7 @@ contract StakedWoodSlashingTest is Test {
         // larger than alice's 12k live stake (simulates a concurrent slash
         // having reduced live stake below the recorded vote weight).
         vm.prank(registry);
-        swood.recordVoteStake(1, alice, 50_000e18);
+        swood.recordVoteStake(bytes32(uint256(1)), alice, 50_000e18);
 
         vm.warp(vm.getBlockTimestamp() + 1);
 
@@ -469,9 +468,9 @@ contract StakedWoodSlashingTest is Test {
         approvers[0] = alice;
         uint256 burnBefore = wood.balanceOf(BURN_ADDRESS);
         vm.expectEmit(true, true, true, true, address(swood));
-        emit GuardianSlashed(1, alice, 3_000e18, 0);
+        emit GuardianSlashed(bytes32(uint256(1)), alice, 3_000e18, 0);
         vm.prank(registry);
-        uint256 total = swood.slashGuardians(1, 0, approvers, 2500);
+        uint256 total = swood.slashGuardians(bytes32(uint256(1)), 0, approvers, 2500);
 
         // 50k * 2500 / 10000 = 12.5k would over-slash; clamp caps at 3k.
         assertEq(total, 3_000e18, "slash sized from live stake, not snapshot");
@@ -496,7 +495,6 @@ contract StakedWoodSlashingTest is Test {
             (StakedWood.InitParams({
                     owner: owner,
                     wood: address(brokenWood),
-                    governor: address(gov),
                     factory: factory,
                     minGuardianStake: 10_000e18,
                     coolDownPeriod: 7 days,
@@ -524,7 +522,7 @@ contract StakedWoodSlashingTest is Test {
         vm.prank(alice);
         s.stakeAsGuardian(20_000e18, 1);
         vm.prank(registry);
-        s.recordVoteStake(1, alice, 20_000e18);
+        s.recordVoteStake(bytes32(uint256(1)), alice, 20_000e18);
         vm.warp(vm.getBlockTimestamp() + 1);
 
         // Burn transfer to BURN_ADDRESS returns false (no revert).
@@ -537,7 +535,7 @@ contract StakedWoodSlashingTest is Test {
         vm.expectEmit(false, false, false, true, address(s));
         emit PendingBurnRecorded(5_000e18);
         vm.prank(registry);
-        uint256 total = s.slashGuardians(1, 0, approvers, 2500);
+        uint256 total = s.slashGuardians(bytes32(uint256(1)), 0, approvers, 2500);
 
         assertEq(total, 5_000e18, "slash accounting still applied");
         assertEq(s.guardianStake(alice), 15_000e18, "own stake reduced despite failed burn");
@@ -558,7 +556,7 @@ contract StakedWoodSlashingTest is Test {
         vm.prank(alice);
         s.stakeAsGuardian(20_000e18, 1);
         vm.prank(registry);
-        s.recordVoteStake(1, alice, 20_000e18);
+        s.recordVoteStake(bytes32(uint256(1)), alice, 20_000e18);
         vm.warp(vm.getBlockTimestamp() + 1);
 
         // Burn transfer to BURN_ADDRESS reverts.
@@ -570,7 +568,7 @@ contract StakedWoodSlashingTest is Test {
         vm.expectEmit(false, false, false, true, address(s));
         emit PendingBurnRecorded(5_000e18);
         vm.prank(registry);
-        uint256 total = s.slashGuardians(1, 0, approvers, 2500);
+        uint256 total = s.slashGuardians(bytes32(uint256(1)), 0, approvers, 2500);
 
         assertEq(total, 5_000e18, "slash accounting still applied");
         assertEq(s.guardianStake(alice), 15_000e18, "own stake reduced despite reverting burn");
@@ -591,7 +589,7 @@ contract StakedWoodSlashingTest is Test {
         vm.prank(alice);
         s.stakeAsGuardian(20_000e18, 1);
         vm.prank(registry);
-        s.recordVoteStake(1, alice, 20_000e18);
+        s.recordVoteStake(bytes32(uint256(1)), alice, 20_000e18);
         vm.warp(vm.getBlockTimestamp() + 1);
 
         // Burn fails → queued.
@@ -599,7 +597,7 @@ contract StakedWoodSlashingTest is Test {
         address[] memory approvers = new address[](1);
         approvers[0] = alice;
         vm.prank(registry);
-        s.slashGuardians(1, 0, approvers, 2500);
+        s.slashGuardians(bytes32(uint256(1)), 0, approvers, 2500);
         assertEq(s.pendingBurn(), 5_000e18, "queued before recovery");
 
         // Token recovers; flushBurn is permissionless.
@@ -699,7 +697,6 @@ contract StakedWoodSlashingTest is Test {
             (StakedWood.InitParams({
                     owner: owner,
                     wood: address(wood),
-                    governor: address(gov),
                     factory: factory,
                     minGuardianStake: 10_000e18,
                     coolDownPeriod: 7 days,
@@ -743,7 +740,7 @@ contract StakedWoodSlashingTest is Test {
         address[] memory approvers = new address[](1);
         approvers[0] = bob;
         vm.prank(registry);
-        s.slashGuardians(1, 0, approvers, 9_999);
+        s.slashGuardians(bytes32(uint256(1)), 0, approvers, 9_999);
 
         uint256 ptAfter = s.poolTokens(bob);
         uint256 psAfter = s.poolShares(bob);
@@ -790,7 +787,7 @@ contract StakedWoodSlashingTest is Test {
         address[] memory approvers = new address[](1);
         approvers[0] = bob;
         vm.prank(registry);
-        s.slashGuardians(1, 0, approvers, 9_999);
+        s.slashGuardians(bytes32(uint256(1)), 0, approvers, 9_999);
 
         assertGt(s.unbondingPoolTokens(bob), 0, "unbondingPoolTokens > 0 after 9999 slash");
         assertGt(s.poolTokens(bob), 0, "poolTokens > 0 after 9999 slash");
@@ -822,7 +819,6 @@ contract StakedWoodSlashingTest is Test {
             (StakedWood.InitParams({
                     owner: owner,
                     wood: address(wood),
-                    governor: address(gov),
                     factory: factory,
                     minGuardianStake: 10_000e18,
                     coolDownPeriod: 7 days,
@@ -863,11 +859,11 @@ contract StakedWoodSlashingTest is Test {
         // Live pool: 1000 → 1000 - 999 = 1 token; shares unchanged (slash
         // dilutes via poolTokens write only).
         vm.prank(registry);
-        swood.recordVoteStake(99, bob, 10_000e18);
+        swood.recordVoteStake(bytes32(uint256(99)), bob, 10_000e18);
         address[] memory approvers = new address[](1);
         approvers[0] = bob;
         vm.prank(registry);
-        swood.slashGuardians(99, 0, approvers, 9999);
+        swood.slashGuardians(bytes32(uint256(99)), 0, approvers, 9999);
 
         assertEq(swood.poolTokens(bob), 1, "pool tokens post-slash = 1 (dust)");
         assertEq(swood.poolShares(bob), 1000, "pool shares unchanged");
@@ -923,7 +919,7 @@ contract StakedWoodSlashingTest is Test {
         // Registry mirrors getPastVotes (own 10k + delegated 50k = 60k) to
         // sWOOD as the combined `voteStake` snapshot for proposal 1.
         vm.prank(registry);
-        swood.recordVoteStake(1, bob, 60_000e18);
+        swood.recordVoteStake(bytes32(uint256(1)), bob, 60_000e18);
 
         // Bob tops up own stake 10k -> 20k between open and slash.
         vm.prank(bob);
@@ -934,7 +930,7 @@ contract StakedWoodSlashingTest is Test {
         address[] memory approvers = new address[](1);
         approvers[0] = bob;
         vm.prank(registry);
-        uint256 total = swood.slashGuardians(1, openedAt, approvers, 1000);
+        uint256 total = swood.slashGuardians(bytes32(uint256(1)), openedAt, approvers, 1000);
 
         // Post-fix decomposition:
         //   snapTotal = 60k, snapDelegated = 50k -> snapOwn = 10k.
@@ -958,7 +954,7 @@ contract StakedWoodSlashingTest is Test {
         swood.stakeAsGuardian(20_000e18, 1);
 
         vm.prank(registry);
-        swood.recordVoteStake(1, alice, 20_000e18);
+        swood.recordVoteStake(bytes32(uint256(1)), alice, 20_000e18);
 
         vm.warp(vm.getBlockTimestamp() + 1);
 
@@ -966,7 +962,7 @@ contract StakedWoodSlashingTest is Test {
         approvers[0] = alice;
         vm.prank(registry);
         // openedAt = 0: snapDelegated lookup returns 0 → snapOwn = snapTotal.
-        uint256 total = swood.slashGuardians(1, 0, approvers, 2500);
+        uint256 total = swood.slashGuardians(bytes32(uint256(1)), 0, approvers, 2500);
 
         assertEq(total, 5_000e18, "ownSlash = 20k * 25% = 5k (matches pre-#6)");
         assertEq(swood.guardianStake(alice), 15_000e18, "own stake reduced");

@@ -26,27 +26,6 @@ interface ISyndicateGovernor {
 
     // ── Structs ──
 
-    struct InitParams {
-        address owner;
-        uint256 votingPeriod;
-        uint256 executionWindow;
-        uint256 vetoThresholdBps;
-        uint256 maxPerformanceFeeBps;
-        uint256 cooldownPeriod;
-        uint256 collaborationWindow;
-        uint256 maxCoProposers;
-        uint256 minStrategyDuration;
-        uint256 maxStrategyDuration;
-        uint256 protocolFeeBps;
-        address protocolFeeRecipient;
-        uint256 guardianFeeBps;
-        /// @notice Team multisig that receives the guardian-fee slice (vault
-        ///         asset) at settlement. Swapped to WOOD off-chain and airdropped
-        ///         to approvers/delegators weekly via Merkl. Must be non-zero
-        ///         whenever `guardianFeeBps > 0`.
-        address guardiansFeeRecipient;
-    }
-
     struct GovernorParams {
         uint256 votingPeriod;
         uint256 executionWindow;
@@ -90,6 +69,11 @@ interface ISyndicateGovernor {
         ///      Prevents mid-vote timelock finalizes from retroactively
         ///      moving the rejection threshold.
         uint256 vetoThresholdBps;
+        // ── Fee snapshot (read from ProtocolConfig at propose time) ──
+        uint256 snapshotProtocolFeeBps;
+        address snapshotProtocolFeeRecipient;
+        uint256 snapshotGuardianFeeBps;
+        address snapshotGuardiansFeeRecipient;
         /// @notice `IStrategy.selfManagesFees()` snapshotted at propose time (like
         ///         performanceFeeBps). Read from storage at settle so a non-pure
         ///         implementation can't flip it between review and settle (TOCTOU),
@@ -133,6 +117,7 @@ interface ISyndicateGovernor {
     error InvalidVault();
     error ZeroAddress();
     error NotVaultOwner();
+    error NotFactory();
     error StrategyDurationNotElapsed();
     error InvalidProtocolFeeBps();
     error InvalidProtocolFeeRecipient();
@@ -151,11 +136,6 @@ interface ISyndicateGovernor {
     ///         calldata-unbounded arrays that otherwise let a proposer grief
     ///         gas when the batch is executed.
     error TooManyCalls();
-    /// @notice G-M9: Revert if `addVault(address)` is passed an address that
-    ///         does not implement the ISyndicateVault interface (e.g. an EOA
-    ///         or an unrelated contract). Catches operator typos that would
-    ///         otherwise wire governance at a dead address.
-    error NotASyndicateVault();
 
     // ── Guardian-review emergency settle errors ──
     error OwnerBondInsufficient();
@@ -203,6 +183,7 @@ interface ISyndicateGovernor {
     ///         raising the fee, or on `setGuardiansFeeRecipient(address(0))`
     ///         while the fee is on. Mirrors the protocol-fee recipient coupling.
     error InvalidGuardiansFeeRecipient();
+    error ParamsFrozenDuringProposal();
 
     // ── Events ──
 
@@ -355,9 +336,6 @@ interface ISyndicateGovernor {
 
     // ── Setters (owner-instant; owner is a multisig with external delay) ──
 
-    function addVault(address vault) external;
-    function removeVault(address vault) external;
-    function setFactory(address factory_) external;
     function setVotingPeriod(uint256 newVotingPeriod) external;
     function setExecutionWindow(uint256 newExecutionWindow) external;
     function setVetoThresholdBps(uint256 newVetoThresholdBps) external;
@@ -367,12 +345,21 @@ interface ISyndicateGovernor {
     function setCooldownPeriod(uint256 newCooldownPeriod) external;
     function setCollaborationWindow(uint256 newCollaborationWindow) external;
     function setMaxCoProposers(uint256 newMaxCoProposers) external;
-    function setProtocolFeeBps(uint256 newProtocolFeeBps) external;
-    function setProtocolFeeRecipient(address newRecipient) external;
-    function setGuardianFeeBps(uint256 newValue) external;
-    function setGuardiansFeeRecipient(address newRecipient) external;
-    function guardianFeeBps() external view returns (uint256);
-    function guardiansFeeRecipient() external view returns (address);
+    function setProtocolConfig(address newConfig) external;
+
+    // ── Init ──
+    /// @notice Initialize a freshly deployed per-vault governor proxy.
+    ///         Called once by the factory inside the `BeaconProxy` constructor.
+    function initialize(
+        address vault_,
+        address guardianRegistry_,
+        address protocolConfig_,
+        address factory_,
+        GovernorParams calldata params_
+    ) external;
+
+    // ── Factory-only ──
+    function forceSetParams(GovernorParams calldata params) external;
 
     // ── Views ──
 
@@ -384,9 +371,8 @@ interface ISyndicateGovernor {
     function hasVoted(uint256 proposalId, address voter) external view returns (bool);
     function proposalCount() external view returns (uint256);
     function getGovernorParams() external view returns (GovernorParams memory);
-    function getRegisteredVaults() external view returns (address[] memory);
-    function getActiveProposal(address vault) external view returns (uint256);
-    /// @notice Count of proposals for a vault in any non-terminal state
+    function getActiveProposal() external view returns (uint256);
+    /// @notice Count of proposals for this vault in any non-terminal state
     ///         (Pending / GuardianReview / Approved / Executed).
     /// @dev Incremented on Draft -> Pending, decremented on the terminal edge
     ///      (Rejected / Expired / Cancelled / Settled). Consumed by
@@ -394,13 +380,12 @@ interface ISyndicateGovernor {
     ///      to block rage-quit while any proposal binds the vault — the OR
     ///      check is belt-and-braces so stale-cache transitions can't slip
     ///      through.
-    function openProposalCount(address vault) external view returns (uint256);
-    function getCooldownEnd(address vault) external view returns (uint256);
+    function openProposalCount() external view returns (uint256);
+    function getCooldownEnd() external view returns (uint256);
     function getCapitalSnapshot(uint256 proposalId) external view returns (uint256);
-    function isRegisteredVault(address vault) external view returns (bool);
     function getCoProposers(uint256 proposalId) external view returns (CoProposer[] memory);
-    function protocolFeeBps() external view returns (uint256);
-    function protocolFeeRecipient() external view returns (address);
+    function vault() external view returns (address);
+    function protocolConfig() external view returns (address);
 
     /// @notice Address of the guardian registry (zero if not yet wired).
     function guardianRegistry() external view returns (address);
