@@ -205,7 +205,10 @@ contract DeployMultisigHandoffTest is Test {
         // Per-vault design: the handoff unit is the GovernorBeacon (Ownable),
         // not a governor proxy — governors are per-vault BeaconProxies with no
         // Ownable surface (owner resolves live from the vault).
-        address govImpl = c3.deploy(SALT_GOVERNOR_IMPL, abi.encodePacked(type(SyndicateGovernor).creationCode));
+        address govImpl = c3.deploy(
+            SALT_GOVERNOR_IMPL,
+            abi.encodePacked(type(SyndicateGovernor).creationCode, abi.encode(uint256(24 hours), uint256(1 hours)))
+        );
         governor = address(new GovernorBeacon(govImpl, deployer));
 
         // sWOOD — sole WOOD custodian post-split. Plain deploy (not part of the
@@ -228,7 +231,9 @@ contract DeployMultisigHandoffTest is Test {
         swood = address(new ERC1967Proxy(address(swoodImpl), swoodInit));
 
         // Registry (predicted factory address) — slimmed 6-arg initialize.
-        address registryImpl = c3.deploy(SALT_REGISTRY_IMPL, abi.encodePacked(type(GuardianRegistry).creationCode));
+        address registryImpl = c3.deploy(
+            SALT_REGISTRY_IMPL, abi.encodePacked(type(GuardianRegistry).creationCode, abi.encode(uint256(6 hours)))
+        );
         bytes memory regInit =
             abi.encodeCall(GuardianRegistry.initialize, (deployer, predictedFactoryProxy, swood, 24 hours, 3000));
         registry = c3.deploy(

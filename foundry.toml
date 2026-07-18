@@ -7,6 +7,10 @@ optimizer = true
 optimizer_runs = 50
 via_ir = true
 ffi = false
+# storageLayout in every artifact: script/check-storage-parity.sh runs `forge inspect
+# <probe> storageLayout` after incremental builds — without this, a partial rebuild
+# drops the layout from cached artifacts and inspect fails spuriously.
+extra_output = ["storageLayout"]
 fs_permissions = [
   { access = "read-write", path = "chains" },
 ]

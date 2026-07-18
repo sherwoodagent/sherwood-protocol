@@ -62,7 +62,7 @@ contract GuardianRegistryCompositeKeyTest is Test {
         );
         swood = StakedWood(address(new ERC1967Proxy(address(swoodImpl), swoodInit)));
 
-        GuardianRegistry regImpl = new GuardianRegistry();
+        GuardianRegistry regImpl = new GuardianRegistry(6 hours);
         bytes memory regInit = abi.encodeCall(
             GuardianRegistry.initialize, (regOwner, regFactory, address(swood), REVIEW_PERIOD, BLOCK_QUORUM_BPS)
         );

@@ -6,6 +6,7 @@ import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 import {LeveragedAerodromeCLStrategy} from "../src/strategies/LeveragedAerodromeCLStrategy.sol";
+import {LeveragedAeroStorage} from "../src/strategies/LeveragedAeroStorage.sol";
 import {LeveragedAeroManager} from "../src/strategies/LeveragedAeroManager.sol";
 import {BaseStrategy} from "../src/strategies/BaseStrategy.sol";
 
@@ -138,7 +139,7 @@ contract MockAggregator {
 ///         read and POST-checks the measured swap fill (`usdcOut < floor → BelowOracleFloor`). A
 ///         sandwiched/thin-pool fill below the floor reverts even with `minUsdcOut = 1`.
 contract LeveragedAeroCLCompoundFloorTest is Test {
-    uint256 private constant STRAT_BASE = uint256(0x405ae0b144079093e970849fdffdcb2a514e44968598c6c5c73444496e844900);
+    uint256 private constant STRAT_BASE = uint256(LeveragedAeroStorage.STORAGE_SLOT);
 
     // Diamond field slots (packing-verified; see LeveragedAeroCLProtocolFee.t.sol).
     uint256 private constant SLOT_USDC = STRAT_BASE + 0;
@@ -154,8 +155,8 @@ contract LeveragedAeroCLCompoundFloorTest is Test {
     uint256 private constant SLOT_AERO_FEED = STRAT_BASE + 23; // new LAST field (L9)
 
     // BaseStrategy sequential slots.
-    uint256 private constant SLOT_VAULT = 1;
-    uint256 private constant SLOT_PROPOSER_STATE_INIT = 2;
+    uint256 private constant SLOT_VAULT = 0;
+    uint256 private constant SLOT_PROPOSER_STATE_INIT = 1;
     uint256 private constant STATE_EXECUTED_INIT = (uint256(1) << 168) | (uint256(1) << 160);
 
     // Chainlink AERO/USD price (8dp).

@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 import {LeveragedAerodromeCLStrategy} from "../src/strategies/LeveragedAerodromeCLStrategy.sol";
+import {LeveragedAeroStorage} from "../src/strategies/LeveragedAeroStorage.sol";
 import {LeveragedAeroManager} from "../src/strategies/LeveragedAeroManager.sol";
 import {LeveragedAeroFees} from "../src/strategies/LeveragedAeroFees.sol";
 
@@ -256,7 +257,7 @@ contract NavHarness is LeveragedAerodromeCLStrategy {}
 ///         nav() netting, redeem skim (incl. oracle-independence), compound skim, settle
 ///         discharge, and the zero-cases (bps=0 → no accrual; recipient=0 → persists).
 contract LeveragedAeroCLProtocolFeeTest is Test {
-    uint256 private constant STRAT_BASE = uint256(0x405ae0b144079093e970849fdffdcb2a514e44968598c6c5c73444496e844900);
+    uint256 private constant STRAT_BASE = uint256(LeveragedAeroStorage.STORAGE_SLOT);
     // Diamond field slots (probe-verified): usdc+0, mUsdc+1, mCbBTC+2, mWeth+3, cbBTC+4,
     // weth+5, cbBTCFeed+7, wethFeed+8, usdcFeed+9, seqFeed+10, maxDelay+11, gracePeriod+12,
     // gauge+15, swapRouter+16, tokenId+18, feeRecipient-packed+19, hwm+20, lastFee+21, owed+22.
@@ -281,9 +282,9 @@ contract LeveragedAeroCLProtocolFeeTest is Test {
     uint256 private constant SLOT_AERO_FEED = STRAT_BASE + 23; // L9: AERO/USD feed (compound floor)
 
     // BaseStrategy sequential slots.
-    uint256 private constant SLOT_VAULT = 1;
-    uint256 private constant SLOT_PROPOSER_STATE_INIT = 2;
-    // _proposer (bits 0-159) + _state = Executed(1) (bit 160) + _initialized(true) (bit 168) share slot 2.
+    uint256 private constant SLOT_VAULT = 0;
+    uint256 private constant SLOT_PROPOSER_STATE_INIT = 1;
+    // _proposer (bits 0-159) + _state = Executed(1) (bit 160) + _initialized(true) (bit 168) share slot 1.
     uint256 private constant STATE_EXECUTED_INIT = (uint256(1) << 168) | (uint256(1) << 160);
     uint256 private constant SHARES_VIRTUAL_OFFSET = 1e6;
     // Proposer for the fulfill path (fulfillRedeem is onlyProposer). Packed into slot 2 alongside state.

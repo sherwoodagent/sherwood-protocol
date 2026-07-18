@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
+import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
+import {IGuardianRegistry} from "../../src/interfaces/IGuardianRegistry.sol";
+import {IStakedWood} from "../../src/interfaces/IStakedWood.sol";
+
 /// @notice Minimal guardian-registry mock exposing the read surface consumed by
 ///         SyndicateGovernor: `reviewPeriod()` (called during `propose` /
 ///         `settleProposal` to compute `reviewEnd`), `resolveReview()` (called
@@ -18,7 +22,18 @@ pragma solidity 0.8.28;
 ///         don't need a full `GuardianRegistry` + WOOD + staking setup. Tests
 ///         that drive the guardian-review lifecycle (open/resolve/slash) must
 ///         use a real `GuardianRegistry` proxy.
-contract MockRegistryMinimal {
+///
+///         Declares `is IGuardianRegistry` so the compiler enforces interface
+///         conformance: any interface change that isn't mirrored here fails
+///         `forge build` instead of silently breaking ~27 consumer test files
+///         with `unrecognized function selector`. Every interface member the
+///         governor's mocked happy path never touches reverts with
+///         `NotImplemented()` — a loud failure if a test wanders onto it.
+contract MockRegistryMinimal is IGuardianRegistry {
+    /// @notice Raised by every interface member this mock deliberately does
+    ///         not model. Use a real `GuardianRegistry` proxy for those paths.
+    error NotImplemented();
+
     uint256 public reviewPeriod;
 
     function setReviewPeriod(uint256 r) external {
@@ -61,5 +76,81 @@ contract MockRegistryMinimal {
     function cancelReview(uint256 proposalId) external {
         cancelReviewCallCount++;
         lastCancelledProposalId = proposalId;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Not modeled — revert loudly. Interface conformance stubs only.
+    // ─────────────────────────────────────────────────────────────────────
+
+    function voteOnProposal(address, uint256, GuardianVoteType, uint256) external pure {
+        revert NotImplemented();
+    }
+
+    function addGovernor(address) external pure {
+        revert NotImplemented();
+    }
+
+    function openEmergency(uint256, bytes32, BatchExecutorLib.Call[] calldata) external pure {
+        revert NotImplemented();
+    }
+
+    function finalizeEmergency(uint256) external pure returns (bool, BatchExecutorLib.Call[] memory) {
+        revert NotImplemented();
+    }
+
+    function openReview(address, uint256) external pure {
+        revert NotImplemented();
+    }
+
+    function resolveEmergencyReview(address, uint256) external pure {
+        revert NotImplemented();
+    }
+
+    function voteBlockEmergencySettle(address, uint256) external pure {
+        revert NotImplemented();
+    }
+
+    function fundSlashAppealReserve(uint256) external pure {
+        revert NotImplemented();
+    }
+
+    function refundSlash(address, uint256) external pure {
+        revert NotImplemented();
+    }
+
+    function pause() external pure {
+        revert NotImplemented();
+    }
+
+    function unpause() external pure {
+        revert NotImplemented();
+    }
+
+    function setBlockQuorumBps(uint256) external pure {
+        revert NotImplemented();
+    }
+
+    function getApproverWeights(address, uint256) external pure returns (address[] memory, uint128[] memory, uint128) {
+        revert NotImplemented();
+    }
+
+    function factory() external pure returns (address) {
+        revert NotImplemented();
+    }
+
+    function swood() external pure returns (IStakedWood) {
+        revert NotImplemented();
+    }
+
+    function ownerStake(address) external pure returns (uint256) {
+        revert NotImplemented();
+    }
+
+    function minOwnerStake() external pure returns (uint256) {
+        revert NotImplemented();
+    }
+
+    function requiredOwnerBond(address) external pure returns (uint256) {
+        revert NotImplemented();
     }
 }

@@ -96,7 +96,7 @@ contract VaultSolvencyInvariantTest is StdInvariant, Test {
         vault.registerAgent(coAgentNftId, coAgent);
 
         // ── Governor ──
-        SyndicateGovernor govImpl = new SyndicateGovernor();
+        SyndicateGovernor govImpl = new SyndicateGovernor(24 hours, 1 hours);
         bytes memory govInit = abi.encodeCall(
             SyndicateGovernor.initialize,
             (
@@ -292,7 +292,7 @@ contract VaultSolvencyColdStartInvariantTest is StdInvariant, Test {
         vm.prank(owner);
         vault.registerAgent(coAgentNftId, coAgent);
 
-        SyndicateGovernor govImpl = new SyndicateGovernor();
+        SyndicateGovernor govImpl = new SyndicateGovernor(24 hours, 1 hours);
         bytes memory govInit = abi.encodeCall(
             SyndicateGovernor.initialize,
             (

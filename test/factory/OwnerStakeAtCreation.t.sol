@@ -86,13 +86,13 @@ contract OwnerStakeAtCreationTest is Test {
         // GovernorBeacon (nonce +3, preserving the prediction plan). The factory
         // clones a per-vault BeaconProxy governor at createSyndicate and
         // authorizes it on the registry itself — no standalone governor here.
-        SyndicateGovernor govImpl = new SyndicateGovernor();
+        SyndicateGovernor govImpl = new SyndicateGovernor(24 hours, 1 hours);
         GovernorBeacon beacon = new GovernorBeacon(address(govImpl), owner);
 
         // Factory + registry — registry needs factory address, factory needs
         // registry address. Deploy in order matching the nonce plan above.
         SyndicateFactory factoryImpl = new SyndicateFactory();
-        GuardianRegistry regImpl = new GuardianRegistry();
+        GuardianRegistry regImpl = new GuardianRegistry(6 hours);
         bytes memory regInit = abi.encodeCall(
             GuardianRegistry.initialize, (owner, predictedFactoryProxy, address(swood), REVIEW_PERIOD, BLOCK_QUORUM_BPS)
         );

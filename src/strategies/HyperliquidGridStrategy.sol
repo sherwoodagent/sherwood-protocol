@@ -34,11 +34,11 @@ import {ISyndicateVault} from "../interfaces/ISyndicateVault.sol";
  *   any late HC arrivals (post-block bridge credits).
  *
  *   HyperCore note: ERC-1167 clone addresses need explicit HC registration
- *   before ERC-20 USDC transfers auto-credit HC spot. `_initialize()` writes
- *   `address(this)` to slot 0 (`_hcSelf` from BaseStrategy). The CLI then
- *   calls `finalizeForHyperCore(0, FinalizeVariant.FirstStorageSlot, 0)` as
- *   a separate tx. HC reads slot 0 post-block, confirms it equals the
- *   contract address, and completes registration.
+ *   before ERC-20 USDC transfers auto-credit HC spot. BaseStrategy no longer
+ *   stamps `address(this)` into slot 0, so the FirstStorageSlot finalize
+ *   variant does NOT work for clones of this template — Sherwood is not
+ *   deploying on Hyperliquid. Restore the slot-0 stamp (or use the
+ *   CustomStorageSlot variant) before any future HC deployment.
  */
 contract HyperliquidGridStrategy is BaseStrategy {
     using SafeERC20 for IERC20;
@@ -181,8 +181,6 @@ contract HyperliquidGridStrategy is BaseStrategy {
             assetIndices.push(ai);
             isAssetWhitelisted[ai] = true;
         }
-        // Slot 0 (`_hcSelf = address(this)`) is stamped by BaseStrategy.initialize
-        // before this hook runs. HC's FirstStorageSlot finalize reads it post-block.
     }
 
     /**
@@ -190,16 +188,14 @@ contract HyperliquidGridStrategy is BaseStrategy {
      *         auto-credit the HC spot account. MUST be called once after
      *         `initialize()` and before the proposal that triggers `_execute()`.
      *
-     *         Standard call for SyndicateFactory CLI clones:
-     *           finalizeForHyperCore(0, FinalizeVariant.FirstStorageSlot, 0)
-     *         `_initialize()` already wrote `address(this)` to slot 0 (`_hcSelf`).
-     *         HC reads slot 0 post-block, confirms it equals the contract address,
-     *         and completes registration — no nonce math required.
+     *         NOTE: BaseStrategy no longer stamps `address(this)` into slot 0,
+     *         so the FirstStorageSlot variant will NOT verify for clones of
+     *         this template — Sherwood is not deploying on Hyperliquid.
      *
      * @param token        HyperCore token index (USDC = 0).
      * @param variant      Deployment-method variant:
      *                       Create (0)            — plain CREATE, pass deployer nonce
-     *                       FirstStorageSlot (1)  — slot 0 == address(this) (use this)
+     *                       FirstStorageSlot (1)  — slot 0 == address(this)
      *                       CustomStorageSlot (2) — UUPS / custom proxy
      * @param createNonce  Deployer nonce (only used for the Create variant; pass 0 otherwise).
      */

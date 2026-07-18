@@ -1,0 +1,6 @@
+out/
+cache/
+lcov.info
+broadcast/
+script/tenderly/*.log
+node_modules/

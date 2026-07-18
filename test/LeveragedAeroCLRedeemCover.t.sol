@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 import {LeveragedAerodromeCLStrategy} from "../src/strategies/LeveragedAerodromeCLStrategy.sol";
+import {LeveragedAeroStorage} from "../src/strategies/LeveragedAeroStorage.sol";
 import {LeveragedAeroManager} from "../src/strategies/LeveragedAeroManager.sol";
 import {ICLSwapRouter} from "../src/interfaces/ISlipstream.sol";
 
@@ -173,7 +174,7 @@ contract RedeemHarness is LeveragedAerodromeCLStrategy {
 /// @notice Offline unit tests for the partial-redeem IL-cover budget cap
 ///         (stayer-idle protection). Flat book (tokenId==0) isolates the cover step.
 contract LeveragedAeroCLRedeemCoverTest is Test {
-    uint256 private constant STRAT_BASE = uint256(0x405ae0b144079093e970849fdffdcb2a514e44968598c6c5c73444496e844900);
+    uint256 private constant STRAT_BASE = uint256(LeveragedAeroStorage.STORAGE_SLOT);
     // Diamond field slots (verified by storage probe): usdc+0, mUsdc+1, mCbBTC+2,
     // mWeth+3, cbBTC+4, weth+5, swapRouter+16, tokenId+18.
     uint256 private constant SLOT_USDC = STRAT_BASE + 0;

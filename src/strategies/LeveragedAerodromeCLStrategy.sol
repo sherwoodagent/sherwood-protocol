@@ -12,6 +12,7 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {BaseStrategy} from "./BaseStrategy.sol";
 import {LeveragedAeroValuation} from "./LeveragedAeroValuation.sol";
 import {LeveragedAeroManager} from "./LeveragedAeroManager.sol";
+import {LeveragedAeroStorage} from "./LeveragedAeroStorage.sol";
 import {INonfungiblePositionManager, ICLGauge} from "../interfaces/ISlipstream.sol";
 import {Position} from "../interfaces/IPriceRouter.sol";
 import {IStrategy} from "../interfaces/IStrategy.sol";
@@ -72,8 +73,6 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     error ZeroAssetsOut(); // fast redeem would pay 0 (navNet==0 or dust shares floor to 0) — burn-for-zero
 
     // ── Constants ──
-    uint8 private constant CBBTC_DECIMALS = 8; // cbBTC is 8dp wrapped Bitcoin
-    uint8 private constant WETH_DECIMALS = 18; // WETH9 on Base is 18dp
 
     /// @dev Position `kind` tag for the PriceRouter adapter registry.
     bytes32 public constant POSITION_KIND = keccak256("LEVERAGED_AERO_CL");
@@ -153,78 +152,17 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     // sequential storage (which holds only BaseStrategy's state). This lets the venue ops run from
     // the deployed `LeveragedAeroManager` library via delegatecall.
     //
-    // CORRUPTION-CRITICAL: `Layout`, `STORAGE_SLOT`, `_layout()`, and `RedeemRequest` are
-    // byte-identical in `LeveragedAeroManager` — they MUST stay in lockstep or a delegatecall
-    // reads/writes the wrong slots. Do not reorder `Layout` fields in one file without the other.
+    // `Layout`, `RedeemRequest`, `STORAGE_SLOT`, and the slot accessor are owned by
+    // `LeveragedAeroStorage` — the single shared definition the manager also imports. The
+    // compiler enforces strategy↔manager identity only; compatibility with already-deployed
+    // clone lineages (no field reorder/insert/retype in the shared struct) is enforced by the
+    // golden snapshot in `script/check-storage-parity.sh` step 1b +
+    // `test/LeveragedAeroLayoutParity.t.sol`, and local re-declarations here are rejected by
+    // the script's step-4 backstops.
 
-    /// @dev Escrowed async-redeem request (Lane-B-style, but NO price freeze — shares keep bearing
-    ///      PnL until execution, so `cancelRedeem` is not a free look-back option). Byte-identical
-    ///      to the manager's `RedeemRequest`.
-    struct RedeemRequest {
-        address owner; // request creator; the only address that can cancel / emergency-redeem it
-        uint256 shares; // vault shares escrowed in the strategy at request time
-        uint256 minAssetsOut; // slippage floor enforced at fulfill (fresh arg at emergencyRedeem)
-        uint40 requestedAt; // request timestamp; FULFILL_WINDOW deadman clock anchor
-        bool settled; // set once fulfilled / cancelled / emergency-redeemed (double-spend guard)
-    }
-
-    /// @custom:storage-location erc7201:leveraged.aero.cl.storage
-    struct Layout {
-        // valuation config: token / venue / feed addresses
-        address usdc;
-        address mUsdc;
-        address mCbBTC; // LeveragedAeroValuation.Config.cbBTCMarket
-        address mWeth; // LeveragedAeroValuation.Config.wethMarket
-        address cbBTC;
-        address weth;
-        address pool;
-        address cbBTCFeed;
-        address wethFeed;
-        address usdcFeed;
-        address sequencerFeed;
-        uint256 maxDelay;
-        uint256 gracePeriod;
-        uint16 calmDeviationTicks;
-        uint32 twapWindow;
-        // venue / protocol addresses (not in Config)
-        address comptroller;
-        address npm;
-        address gauge;
-        address swapRouter;
-        int24 tickSpacing;
-        // risk params
-        uint16 targetLtvBps;
-        uint16 maxLtvBps;
-        uint16 minHealthBps;
-        uint16 maxSlippageBps;
-        uint16 usdcCollateralFactorBps; // USDC collateral factor from Moonwell at init (8800 = 88%)
-        // position state (all zero pre-deploy / post-settle)
-        uint256 tokenId; // active CL position; 0 == flat book
-        int24 posTickLower;
-        int24 posTickUpper;
-        // fee params + state
-        uint16 managementFeeBps;
-        uint16 performanceFeeBps;
-        address feeRecipient;
-        uint256 hwmPerShare; // HWM nav-per-share (1e18 WAD), 0 until first deposit
-        uint256 lastFeeAccrualTimestamp;
-        uint256 protocolFeeOwed; // accrued protocol-fee USDC liability (6dp); discharged in redeem/compound/settle
-        // ── appended for the L9 compound oracle floor (keep byte-identical in the manager) ──
-        address aeroUsdFeed; // AERO/USD aggregator (8dp) — floors compound()'s AERO→USDC swap
-        // ── LAST fields: appended for the escrowed async-redeem queue (keep byte-identical) ──
-        uint256 nextRedeemRequestId; // monotonic id cursor for `redeemRequests`
-        mapping(uint256 => RedeemRequest) redeemRequests; // id → escrowed async redeem
-    }
-
-    /// @dev keccak256(abi.encode(uint256(keccak256("leveraged.aero.cl.storage")) - 1)) & ~bytes32(uint256(0xff))
-    bytes32 private constant STORAGE_SLOT = 0x405ae0b144079093e970849fdffdcb2a514e44968598c6c5c73444496e844900;
-
-    /// @dev ERC-7201 diamond-storage accessor (byte-identical across strategy + manager).
-    function _layout() private pure returns (Layout storage $) {
-        // solhint-disable-next-line no-inline-assembly
-        assembly {
-            $.slot := STORAGE_SLOT
-        }
+    /// @dev ERC-7201 diamond-storage accessor (shared with the manager via `LeveragedAeroStorage`).
+    function _layout() private pure returns (LeveragedAeroStorage.Layout storage) {
+        return LeveragedAeroStorage.layout();
     }
 
     /// @dev Memory-returnable mirror of `Layout` minus the trailing `redeemRequests` mapping
@@ -274,7 +212,7 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     ///         struct-literal) so the Yul IR emits one sload→mstore per field — avoids the
     ///         >16-live-variable overflow a struct-literal trips under via_ir.
     function layout() external view returns (LayoutView memory v) {
-        Layout storage $ = _layout();
+        LeveragedAeroStorage.Layout storage $ = _layout();
         v.usdc = $.usdc;
         v.mUsdc = $.mUsdc;
         v.mCbBTC = $.mCbBTC;
@@ -314,7 +252,7 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     }
 
     /// @notice A single escrowed async-redeem request by id (queue introspection for tests / UI).
-    function redeemRequest(uint256 id) external view returns (RedeemRequest memory) {
+    function redeemRequest(uint256 id) external view returns (LeveragedAeroStorage.RedeemRequest memory) {
         return _layout().redeemRequests[id];
     }
 
@@ -388,7 +326,7 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         if (p.performanceFeeBps > FeeConstants.MAX_PERFORMANCE_FEE_BPS) revert PerformanceFeeTooHigh();
         if (p.managementFeeBps > MAX_MANAGEMENT_FEE_BPS) revert ManagementFeeTooHigh();
 
-        Layout storage $ = _layout();
+        LeveragedAeroStorage.Layout storage $ = _layout();
         $.usdc = p.usdc;
         $.mUsdc = p.mUsdc;
         $.mCbBTC = p.mCbBTC;
@@ -447,7 +385,7 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     ///         0, never reverts on owed > gross) — this is the fairness mechanism that replaces
     ///         share-dilution: deposit share-pricing + the next HWM basis both see the net NAV.
     function nav() public view virtual returns (uint256) {
-        Layout storage $ = _layout();
+        LeveragedAeroStorage.Layout storage $ = _layout();
         uint256 gross;
         if ($.tokenId == 0) {
             // Flat book: strategy-controlled idle USDC only (face, 6dp, no oracle). Vault float is
@@ -492,7 +430,7 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     /// @notice Reports the single levered-CL position. `ref` encodes the market addresses the
     ///         `LEVERAGED_AERO_CL` adapter needs to verify the venues.
     function positions() external view override returns (Position[] memory pos) {
-        Layout storage $ = _layout();
+        LeveragedAeroStorage.Layout storage $ = _layout();
         pos = new Position[](1);
         pos[0] = Position({venue: $.pool, kind: POSITION_KIND, ref: abi.encode($.gauge, $.mUsdc, $.mCbBTC, $.mWeth)});
     }
@@ -528,7 +466,7 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         // Discharge the accrued protocol fee from realized USDC BEFORE pushing the rest to the
         // vault. Pays `min(owed, balance)` to the live recipient; skips silently when recipient == 0
         // or owed == 0 (liability persists until a recipient exists — see edge note on `redeem`).
-        Layout storage $ = _layout();
+        LeveragedAeroStorage.Layout storage $ = _layout();
         uint256 owed = $.protocolFeeOwed;
         address recipient = _protocolFeeRecipient();
         if (owed > 0 && recipient != address(0)) {
@@ -551,7 +489,7 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     /// @param navPre Pre-action NAV (USDC 6dp). Pass 0 on oracle outage → performance fee defers, but
     ///      the price-free management fee still crystallises.
     function _crystallizeFees(uint256 navPre) private {
-        Layout storage $ = _layout();
+        LeveragedAeroStorage.Layout storage $ = _layout();
         uint256 supply = IERC20(vault()).totalSupply();
         if (supply == 0) return;
         if ($.lastFeeAccrualTimestamp == 0) {
@@ -596,7 +534,7 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         view
         returns (uint256 navNet, uint256 supplyPost)
     {
-        Layout storage $ = _layout();
+        LeveragedAeroStorage.Layout storage $ = _layout();
         if ($.lastFeeAccrualTimestamp == 0) return (navPre, supply);
         (uint256 feeShares,,, uint256 freshSlice) = LeveragedAeroFees.crystallize(
             navPre,
@@ -955,9 +893,9 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     function requestRedeem(uint256 shares, uint256 minAssetsOut) external nonReentrant returns (uint256 id) {
         if (_state != State.Executed) revert NotExecuted();
         IERC20(vault()).safeTransferFrom(msg.sender, address(this), shares);
-        Layout storage $ = _layout();
+        LeveragedAeroStorage.Layout storage $ = _layout();
         id = $.nextRedeemRequestId++;
-        $.redeemRequests[id] = RedeemRequest({
+        $.redeemRequests[id] = LeveragedAeroStorage.RedeemRequest({
             owner: msg.sender,
             shares: shares,
             minAssetsOut: minAssetsOut,
@@ -975,8 +913,8 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     /// @param id Request id to fulfill.
     function fulfillRedeem(uint256 id) external onlyProposer nonReentrant {
         if (_state != State.Executed) revert NotExecuted();
-        Layout storage $ = _layout();
-        RedeemRequest storage r = $.redeemRequests[id];
+        LeveragedAeroStorage.Layout storage $ = _layout();
+        LeveragedAeroStorage.RedeemRequest storage r = $.redeemRequests[id];
         if (r.settled) revert RequestSettled();
         uint256 assetsOut = _proportionalRedeem(r.owner, r.shares, r.minAssetsOut);
         r.settled = true;
@@ -989,7 +927,7 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     ///         normally.
     /// @param id Request id to cancel.
     function cancelRedeem(uint256 id) external nonReentrant {
-        RedeemRequest storage r = _layout().redeemRequests[id];
+        LeveragedAeroStorage.RedeemRequest storage r = _layout().redeemRequests[id];
         if (msg.sender != r.owner) revert NotRequestOwner();
         if (r.settled) revert RequestSettled();
         r.settled = true;
@@ -1007,7 +945,7 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     /// @param minAssetsOut Fresh slippage floor on the net payout.
     function emergencyRedeem(uint256 id, uint256 minAssetsOut) external nonReentrant returns (uint256 assetsOut) {
         if (_state != State.Executed) revert NotExecuted();
-        RedeemRequest storage r = _layout().redeemRequests[id];
+        LeveragedAeroStorage.RedeemRequest storage r = _layout().redeemRequests[id];
         if (msg.sender != r.owner) revert NotRequestOwner();
         if (r.settled) revert RequestSettled();
         if (block.timestamp <= uint256(r.requestedAt) + FULFILL_WINDOW) revert FulfillWindowOpen();
@@ -1059,7 +997,7 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     ///      Edge: if the recipient is later zeroed while `owed > 0`, discharge skips here (and in
     ///      compound/settle) and the liability persists — `nav()` stays net — until a recipient exists.
     function _dischargeRedeemSkim(uint256 shares, uint256 supply, uint256 assetsOut) private returns (uint256 fee) {
-        Layout storage $ = _layout();
+        LeveragedAeroStorage.Layout storage $ = _layout();
         uint256 owed = $.protocolFeeOwed;
         if (owed == 0) return 0;
         address recipient = _protocolFeeRecipient();
@@ -1081,7 +1019,7 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     ///         sweep can't bypass `compound()`). The position NFT is never swept (no ERC-721 path).
     function rescueToVault(address token) external nonReentrant {
         if (msg.sender != proposer() && msg.sender != Ownable(vault()).owner()) revert NotProposerOrOwner();
-        Layout storage $ = _layout();
+        LeveragedAeroStorage.Layout storage $ = _layout();
         address aero = ICLGauge($.gauge).rewardToken();
         if (
             token == $.usdc || token == $.cbBTC || token == $.weth || token == $.mUsdc || token == $.mCbBTC
@@ -1095,28 +1033,10 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
 
     // ── Config builder for LeveragedAeroValuation ──
 
-    /// @dev Build the valuation `Config` from stored state (cbBTC 8dp / WETH 18dp are compile-time
-    ///      constants). Field-by-field (not struct-literal) so the Yul IR emits one sload→mstore per
-    ///      field, avoiding the 18-live-variable overflow struct-literals trigger under via_ir.
-    function _config() internal view returns (LeveragedAeroValuation.Config memory c) {
-        Layout storage $ = _layout();
-        c.usdc = $.usdc;
-        c.vault = vault();
-        c.mUsdc = $.mUsdc;
-        c.cbBTCMarket = $.mCbBTC;
-        c.wethMarket = $.mWeth;
-        c.cbBTC = $.cbBTC;
-        c.weth = $.weth;
-        c.cbBTCDecimals = CBBTC_DECIMALS;
-        c.wethDecimals = WETH_DECIMALS;
-        c.pool = $.pool;
-        c.cbBTCFeed = $.cbBTCFeed;
-        c.wethFeed = $.wethFeed;
-        c.usdcFeed = $.usdcFeed;
-        c.sequencerFeed = $.sequencerFeed;
-        c.maxDelay = $.maxDelay;
-        c.gracePeriod = $.gracePeriod;
-        c.calmDeviationTicks = $.calmDeviationTicks;
-        c.twapWindow = $.twapWindow;
+    /// @dev Build the valuation `Config` from stored state via the shared
+    ///      `LeveragedAeroStorage.buildConfig` (single source of truth with the manager);
+    ///      the strategy contributes its `vault()` so NAV excludes vault float (M2).
+    function _config() internal view returns (LeveragedAeroValuation.Config memory) {
+        return LeveragedAeroStorage.buildConfig(vault());
     }
 }

@@ -8,6 +8,7 @@ import {LeveragedAeroForkBase} from "./LeveragedAeroForkBase.sol";
 import {BaseAddresses} from "./BaseAddresses.sol";
 import {LeveragedAerodromeCLStrategy} from "../../../src/strategies/LeveragedAerodromeCLStrategy.sol";
 import {BaseStrategy} from "../../../src/strategies/BaseStrategy.sol";
+import {LeveragedAeroStorage} from "../../../src/strategies/LeveragedAeroStorage.sol";
 import {IMoonwellMarket, ICToken} from "../../../src/interfaces/IMoonwellMarket.sol";
 import {ICLGauge, INonfungiblePositionManager} from "../../../src/interfaces/ISlipstream.sol";
 // #421: reuse the unit-suite MockFactory (protocolConfig()-only) rather than re-declaring it — the
@@ -392,7 +393,7 @@ contract LeveragedAeroCLCompoundFork is LeveragedAeroForkBase {
         uint256 navNow = strategy.nav();
         uint256 supply = mockVault.totalSupply();
         uint256 loweredHwm = (navNow * 1e18 / supply) / 2; // half the current per-share level → gain
-        bytes32 base = 0x405ae0b144079093e970849fdffdcb2a514e44968598c6c5c73444496e844900;
+        bytes32 base = LeveragedAeroStorage.STORAGE_SLOT;
         vm.store(address(strategy), bytes32(uint256(base) + 20), bytes32(loweredHwm));
         // dt>0 is irrelevant for the protocol leg (it rides the perf gain path); ensure lastFee<now.
         vm.store(address(strategy), bytes32(uint256(base) + 21), bytes32(uint256(1)));

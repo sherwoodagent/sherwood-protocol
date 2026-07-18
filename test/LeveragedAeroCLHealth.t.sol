@@ -4,6 +4,7 @@ pragma solidity 0.8.28;
 import {Test} from "forge-std/Test.sol";
 
 import {LeveragedAerodromeCLStrategy} from "../src/strategies/LeveragedAerodromeCLStrategy.sol";
+import {LeveragedAeroStorage} from "../src/strategies/LeveragedAeroStorage.sol";
 import {LeveragedAeroManager} from "../src/strategies/LeveragedAeroManager.sol";
 
 /// @notice Exposes the post-op health invariant for offline unit testing.
@@ -37,7 +38,7 @@ contract LeveragedAeroCLHealthTest is Test {
     // (= keccak256(abi.encode(uint256(keccak256("leveraged.aero.cl.storage")) - 1)) & ~0xff).
     // The Layout struct packs fields identically to the old sequential layout, so each
     // field slot = STRAT_BASE + (oldSequentialSlot - 3). Within-slot byte offsets are unchanged.
-    uint256 private constant STRAT_BASE = uint256(0x405ae0b144079093e970849fdffdcb2a514e44968598c6c5c73444496e844900);
+    uint256 private constant STRAT_BASE = uint256(LeveragedAeroStorage.STORAGE_SLOT);
     //
     // Simple full-slot address fields:
     uint256 private constant SLOT_MUSDC = STRAT_BASE + 1; // address, offset 0     [was slot 4]

@@ -177,9 +177,27 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     /// @dev Reserved storage for future upgrades.
     uint256[50] private __gap;
 
+    /// @notice Per-deployment hard floor for `reviewPeriod` (impl-time immutable;
+    ///         mainnet 6h). Lives in bytecode, not storage — the layout above is
+    ///         unchanged and the value resolves through the UUPS proxy. A testnet
+    ///         impl may deploy a lower floor so `setReviewPeriod` can compress the
+    ///         guardian-review window; the 7-day ceiling and the
+    ///         `reviewPeriod <= sWOOD.coolDownPeriod()` cross-invariant still hold.
+    /// @custom:oz-upgrades-unsafe-allow state-variable-immutable
+    uint256 public immutable minReviewPeriod;
+
+    /// @notice Absolute floor-of-floors: no deploy may seat a review floor below this.
+    uint256 internal constant ABSOLUTE_MIN_REVIEW_FLOOR = 1 minutes;
+
     // ── Initializer ──
+    /// @param minReviewPeriod_ Per-deployment `reviewPeriod` floor (mainnet 6h).
+    /// @dev Bounded `[1 minutes, 7 days]` so an arg-less deploy reverts rather than
+    ///      silently seating a 0 floor (which would let `setReviewPeriod(0)` disable
+    ///      the review window).
     /// @custom:oz-upgrades-unsafe-allow constructor
-    constructor() {
+    constructor(uint256 minReviewPeriod_) {
+        if (minReviewPeriod_ < ABSOLUTE_MIN_REVIEW_FLOOR || minReviewPeriod_ > 7 days) revert InvalidParameter();
+        minReviewPeriod = minReviewPeriod_;
         _disableInitializers();
     }
 
@@ -914,7 +932,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     ///      Other staking params (`minGuardianStake`, `minOwnerStake`,
     ///      `coolDownPeriod`) moved to sWOOD with their own setters there.
     function setReviewPeriod(uint256 v) external onlyOwner {
-        if (v < 6 hours || v > 7 days) revert InvalidParameter();
+        if (v < minReviewPeriod || v > 7 days) revert InvalidParameter();
         IStakedWood sw = swood;
         if (address(sw) != address(0) && v > sw.coolDownPeriod()) {
             revert CooldownBelowReviewPeriod();

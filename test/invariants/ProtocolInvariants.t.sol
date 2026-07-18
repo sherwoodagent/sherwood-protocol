@@ -116,7 +116,7 @@ contract ProtocolInvariantsTest is StdInvariant, Test {
 
         // ── Registry (proxy, real impl) ──
         {
-            GuardianRegistry regImpl = new GuardianRegistry();
+            GuardianRegistry regImpl = new GuardianRegistry(6 hours);
             // Governor / factory unknown at this point; they're initialized
             // below. Use placeholder non-zero addresses and rewire the
             // factory/governor pointers via storage slot overrides after
@@ -156,7 +156,7 @@ contract ProtocolInvariantsTest is StdInvariant, Test {
 
         // ── Governor (proxy, real impl) — per-vault; use a placeholder vault ──
         {
-            SyndicateGovernor govImpl = new SyndicateGovernor();
+            SyndicateGovernor govImpl = new SyndicateGovernor(24 hours, 1 hours);
             ISyndicateGovernor.GovernorParams memory p = ISyndicateGovernor.GovernorParams({
                 votingPeriod: VOTING_PERIOD,
                 executionWindow: EXECUTION_WINDOW,

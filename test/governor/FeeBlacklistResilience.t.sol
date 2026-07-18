@@ -78,7 +78,7 @@ contract FeeBlacklistResilienceTest is Test {
         protocolConfig.setProtocolFeeBps(100);
         vm.stopPrank();
 
-        SyndicateGovernor govImpl = new SyndicateGovernor();
+        SyndicateGovernor govImpl = new SyndicateGovernor(24 hours, 1 hours);
         bytes memory govInit = abi.encodeCall(
             SyndicateGovernor.initialize,
             (
