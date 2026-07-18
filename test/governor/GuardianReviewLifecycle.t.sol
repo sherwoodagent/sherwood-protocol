@@ -128,7 +128,7 @@ contract GuardianReviewLifecycleTest is Test {
         );
         swood = StakedWood(address(new ERC1967Proxy(address(swoodImpl), swoodInit)));
 
-        SyndicateGovernor govImpl = new SyndicateGovernor();
+        SyndicateGovernor govImpl = new SyndicateGovernor(24 hours, 1 hours);
         bytes memory govInit = abi.encodeCall(
             SyndicateGovernor.initialize,
             (
@@ -158,7 +158,7 @@ contract GuardianReviewLifecycleTest is Test {
         // Registry — slimmed 6-arg initialize. factoryEoa = test contract so we
         // can bind owner stake. Must land at predictedRegistryProxy — `require`
         // below catches nonce drift.
-        GuardianRegistry regImpl = new GuardianRegistry();
+        GuardianRegistry regImpl = new GuardianRegistry(6 hours);
         bytes memory regInit = abi.encodeCall(
             GuardianRegistry.initialize, (owner, factoryEoa, address(swood), REVIEW_PERIOD, BLOCK_QUORUM_BPS)
         );

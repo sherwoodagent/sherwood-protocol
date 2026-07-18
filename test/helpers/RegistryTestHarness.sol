@@ -50,7 +50,7 @@ abstract contract RegistryTestHarness is Test {
         );
         swood = StakedWood(address(new ERC1967Proxy(address(swoodImpl), swoodInit)));
 
-        GuardianRegistry regImpl = new GuardianRegistry();
+        GuardianRegistry regImpl = new GuardianRegistry(6 hours);
         bytes memory regInit = abi.encodeCall(
             GuardianRegistry.initialize, (regOwner, regFactory, address(swood), reviewPeriod, blockQuorumBps)
         );

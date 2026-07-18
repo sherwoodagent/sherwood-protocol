@@ -75,7 +75,7 @@ contract PerVaultParamsTest is Test {
         vault.registerAgent(agentNftId, agent);
 
         // Governor rides a real beacon — exactly the factory's deploy path.
-        SyndicateGovernor govImpl = new SyndicateGovernor();
+        SyndicateGovernor govImpl = new SyndicateGovernor(24 hours, 1 hours);
         beacon = new GovernorBeacon(address(govImpl), owner);
         bytes memory govInit = abi.encodeCall(
             SyndicateGovernor.initialize,

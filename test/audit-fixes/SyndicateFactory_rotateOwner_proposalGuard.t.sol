@@ -94,11 +94,11 @@ contract SyndicateFactory_rotateOwner_proposalGuard is Test {
         // GovernorBeacon at nonce +3 (impl at +2) — preserves the prediction
         // plan. The factory clones + authorizes a per-vault BeaconProxy governor
         // itself at createSyndicate; no standalone governor.
-        SyndicateGovernor govImpl = new SyndicateGovernor();
+        SyndicateGovernor govImpl = new SyndicateGovernor(24 hours, 1 hours);
         GovernorBeacon beacon = new GovernorBeacon(address(govImpl), owner);
 
         SyndicateFactory factoryImpl = new SyndicateFactory();
-        GuardianRegistry regImpl = new GuardianRegistry();
+        GuardianRegistry regImpl = new GuardianRegistry(6 hours);
         bytes memory regInit = abi.encodeCall(
             GuardianRegistry.initialize, (owner, predictedFactoryProxy, address(swood), REVIEW_PERIOD, BLOCK_QUORUM_BPS)
         );

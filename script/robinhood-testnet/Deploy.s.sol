@@ -67,7 +67,7 @@ contract DeployRobinhoodTestnet is ScriptBase {
         protocolConfig.setProtocolFeeRecipient(deployer);
         protocolConfig.setProtocolFeeBps(200);
 
-        SyndicateGovernor govImpl = new SyndicateGovernor();
+        SyndicateGovernor govImpl = new SyndicateGovernor(24 hours, 1 hours);
         // Per-vault governor: deploy a GovernorBeacon over the impl (nonce+2,
         // preserving the CREATE-nonce address predictions below). Per-vault
         // governor proxies are cloned by the factory at createSyndicate.
@@ -95,7 +95,7 @@ contract DeployRobinhoodTestnet is ScriptBase {
         console.log("StakedWood:", swoodProxy);
 
         // 4. Deploy GuardianRegistry at the predicted address.
-        GuardianRegistry registryImpl = new GuardianRegistry();
+        GuardianRegistry registryImpl = new GuardianRegistry(6 hours);
         bytes memory regInitData =
             abi.encodeCall(GuardianRegistry.initialize, (deployer, predictedFactoryProxy, swoodProxy, 24 hours, 3000));
         address registryProxy = address(new ERC1967Proxy(address(registryImpl), regInitData));

@@ -145,8 +145,15 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      shrunk by 1 for _draftTimingSnap — Sherlock #14 restored)
     uint256[34] private __gap;
 
+    /// @param minVotingPeriod_   Per-deployment floor for `votingPeriod` (mainnet 24h).
+    /// @param minCooldownPeriod_ Per-deployment floor for `cooldownPeriod` (mainnet 1h).
+    /// @dev Floors are impl-time immutables (bytecode, not storage) forwarded to
+    ///      `GovernorParameters`; a testnet impl may deploy lower floors and be
+    ///      wired in via `GovernorBeacon.upgradeTo` without any storage migration.
     /// @custom:oz-upgrades-unsafe-allow constructor
-    constructor() {
+    constructor(uint256 minVotingPeriod_, uint256 minCooldownPeriod_)
+        GovernorParameters(minVotingPeriod_, minCooldownPeriod_)
+    {
         _disableInitializers();
     }
 

@@ -125,7 +125,7 @@ contract InvariantNoProposalBleed is StdInvariant, Test {
         );
         swood = StakedWood(address(new ERC1967Proxy(address(swoodImpl), swoodInit)));
 
-        GuardianRegistry regImpl = new GuardianRegistry();
+        GuardianRegistry regImpl = new GuardianRegistry(6 hours);
         bytes memory regInit =
             abi.encodeCall(GuardianRegistry.initialize, (regOwner, regFactory, address(swood), 24 hours, 3000));
         registry = GuardianRegistry(address(new ERC1967Proxy(address(regImpl), regInit)));

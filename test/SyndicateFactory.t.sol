@@ -47,7 +47,7 @@ contract SyndicateFactoryTest is Test {
         // Per-vault governor: the factory deploys a BeaconProxy governor per
         // vault at createSyndicate, so wire a real beacon + ProtocolConfig.
         ProtocolConfig protocolCfg = new ProtocolConfig(owner);
-        SyndicateGovernor govImpl = new SyndicateGovernor();
+        SyndicateGovernor govImpl = new SyndicateGovernor(24 hours, 1 hours);
         GovernorBeacon beacon = new GovernorBeacon(address(govImpl), owner);
 
         // Deploy factory as UUPS proxy
@@ -148,6 +148,20 @@ contract SyndicateFactoryTest is Test {
         // creator2 tries to use creator1's agent ID
         vm.prank(creator2);
         vm.expectRevert(SyndicateFactory.NotAgentOwner.selector);
+        factory.createSyndicate(creator1AgentId, _defaultConfig());
+    }
+
+    /// @notice The factory's `canCreateVault` gate reverts `PreparedStakeNotFound`
+    ///         when sWOOD reports the creator is ineligible (e.g. `minOwnerStake
+    ///         > 0` and they never prepared). This fires BEFORE `bindOwnerStake`,
+    ///         so the zero-bond relaxation inside `bindOwnerStake` does not weaken
+    ///         the bonded-onboarding path.
+    function test_createSyndicate_revertsWhenNoPreparedStake() public {
+        // Override the setUp mock: sWOOD says this creator cannot create.
+        vm.mockCall(swoodAddr, abi.encodeWithSelector(IStakedWood.canCreateVault.selector), abi.encode(false));
+
+        vm.prank(creator1);
+        vm.expectRevert(SyndicateFactory.PreparedStakeNotFound.selector);
         factory.createSyndicate(creator1AgentId, _defaultConfig());
     }
 

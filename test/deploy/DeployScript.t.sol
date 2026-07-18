@@ -52,7 +52,10 @@ contract DeployScriptTest is Test {
         // Per-vault design mirror of Deploy.s.sol: governor impl via CREATE3,
         // wrapped in a GovernorBeacon. No singleton governor proxy exists —
         // the factory clones per-vault BeaconProxies at createSyndicate.
-        address govImpl = c3.deploy(SALT_GOVERNOR_IMPL, abi.encodePacked(type(SyndicateGovernor).creationCode));
+        address govImpl = c3.deploy(
+            SALT_GOVERNOR_IMPL,
+            abi.encodePacked(type(SyndicateGovernor).creationCode, abi.encode(uint256(24 hours), uint256(1 hours)))
+        );
         address beacon = address(new GovernorBeacon(govImpl, deployer));
         ProtocolConfig protocolConfig = new ProtocolConfig(deployer);
 
@@ -78,7 +81,9 @@ contract DeployScriptTest is Test {
         // Deploy registry at the predicted address. If CREATE3 prediction is
         // off, the factory-bound invariants (e.g. `bindOwnerStake` onlyFactory)
         // would silently point at the wrong address.
-        address registryImpl = c3.deploy(SALT_REGISTRY_IMPL, abi.encodePacked(type(GuardianRegistry).creationCode));
+        address registryImpl = c3.deploy(
+            SALT_REGISTRY_IMPL, abi.encodePacked(type(GuardianRegistry).creationCode, abi.encode(uint256(6 hours)))
+        );
         bytes memory regInit =
             abi.encodeCall(GuardianRegistry.initialize, (deployer, predictedFactoryProxy, swood, 24 hours, 3000));
         address registryProxy = c3.deploy(

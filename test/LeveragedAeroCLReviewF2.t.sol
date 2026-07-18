@@ -6,6 +6,7 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 import {LeveragedAerodromeCLStrategy} from "../src/strategies/LeveragedAerodromeCLStrategy.sol";
 import {LeveragedAeroManager} from "../src/strategies/LeveragedAeroManager.sol";
+import {LeveragedAeroStorage} from "../src/strategies/LeveragedAeroStorage.sol";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Review finding #2 — fast redeem now sources the redeemer's pro-rata `f×idle`
@@ -137,7 +138,7 @@ contract FastRedeemHarness is LeveragedAerodromeCLStrategy {
     }
 
     function setTokens(address usdc_, address mUsdc_, address mCbBTC_, address mWeth_) external {
-        Layout storage $ = _lay();
+        LeveragedAeroStorage.Layout storage $ = _lay();
         $.usdc = usdc_;
         $.mUsdc = mUsdc_;
         $.mCbBTC = mCbBTC_;
@@ -145,7 +146,7 @@ contract FastRedeemHarness is LeveragedAerodromeCLStrategy {
     }
 
     function setFeeds(address cbBTCFeed_, address wethFeed_, address usdcFeed_, address sequencerFeed_) external {
-        Layout storage $ = _lay();
+        LeveragedAeroStorage.Layout storage $ = _lay();
         $.cbBTCFeed = cbBTCFeed_;
         $.wethFeed = wethFeed_;
         $.usdcFeed = usdcFeed_;
@@ -162,14 +163,9 @@ contract FastRedeemHarness is LeveragedAerodromeCLStrategy {
         _lay().maxLtvBps = v;
     }
 
-    // Same diamond slot + accessor as the strategy/manager (byte-identical discipline).
-    bytes32 private constant STORAGE_SLOT = 0x405ae0b144079093e970849fdffdcb2a514e44968598c6c5c73444496e844900;
-
-    function _lay() private pure returns (Layout storage $) {
-        // solhint-disable-next-line no-inline-assembly
-        assembly {
-            $.slot := STORAGE_SLOT
-        }
+    // Same diamond slot + accessor as the strategy/manager (shared via LeveragedAeroStorage).
+    function _lay() private pure returns (LeveragedAeroStorage.Layout storage) {
+        return LeveragedAeroStorage.layout();
     }
 }
 

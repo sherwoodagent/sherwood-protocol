@@ -100,8 +100,9 @@ State lives in one **ERC-7201 namespaced** struct `Layout` at `STORAGE_SLOT` (`k
 per-vault governor ships with `maxStrategyDuration = 30 days` (factory default). Before `propose`, the
 **vault owner must call `governor.setMaxStrategyDuration(3650 days)`** — the `ABSOLUTE_MAX_STRATEGY_DURATION`
 ceiling; `onlyVaultOwner`, frozen once a proposal is open — or the long-lived `strategyDuration` fails
-bounds validation. The proposal then clears the standard **24h voting window** (`MIN_VOTING_PERIOD`, a hard
-floor) plus the guardian-review window before `execute()`. The governor is **per-vault** — resolve it via
+bounds validation. The proposal then clears the voting window — floored by `MIN_VOTING_PERIOD`, a
+constructor-set `immutable` (24 hours on mainnet; accelerated testnet deployments may set it lower) — plus
+the guardian-review window before `execute()`. The governor is **per-vault** — resolve it via
 `factory.governorOf(vault)`.
 
 ## Roles & authorization matrix
@@ -181,7 +182,7 @@ Properties an auditor should try to break (invariant suite: `test/invariants/Lev
 - **`selfManagesFees()` trust (accepted, beta).** Snapshotted at propose (closes TOCTOU) but `propose` has no on-chain strategy allowlist — a strategy returning `true` to dodge governor fees is stopped only by guardian review + owner veto. For this template it's `pure→true` and self-collects protocol fee. Hardening (governor self-fee registry) deferred.
 - **Deferred crystallize = fee-shifting, not fee-delaying (accepted, §13 r5-3).** On a fee-mint revert the whole crystallize rolls back; exits during the window escape their share of pending fees (borne by fee recipient + window depositors, stayers neutral). Trigger is owner-controlled (pause / de-whitelist recipient) — a trusted-owner misconfig leak, not permissionless theft. `FeeCrystallizeDeferred` is the signal.
 - **Pending AERO not in NAV (accepted).** Depositing while emissions are unclaimed slightly under-prices the deposit (dilutes stayers by pro-rata pending AERO). Operator mitigates by `compound`-before-open.
-- **Governance blast radius (acknowledged).** `ABSOLUTE_MAX_STRATEGY_DURATION` is a governor `public constant` (3650 days, `src/GovernorParameters.sol:39`) shared by every per-vault governor (they share one implementation behind `GovernorBeacon`). Each vault's owner sets *that vault's* `maxStrategyDuration` (default 30 days) up to this ceiling; a multi-year value keeps that vault's owner emergency exits dormant for the position's life. Per-vault duration cap is the deferred mainnet hardening.
+- **Governance blast radius (acknowledged).** `ABSOLUTE_MAX_STRATEGY_DURATION` is a governor `public constant` (3650 days, `src/GovernorParameters.sol:50`) shared by every per-vault governor (they share one implementation behind `GovernorBeacon`). Each vault's owner sets *that vault's* `maxStrategyDuration` (default 30 days) up to this ceiling; a multi-year value keeps that vault's owner emergency exits dormant for the position's life. Per-vault duration cap is the deferred mainnet hardening.
 - **Rescue dormancy.** `vault.rescueERC20/721/Eth` revert while `redemptionsLocked()` (forever true under the indefinite proposal); tokens sent directly to the **vault** address are recoverable only by settling or a vault UUPS upgrade. `strategy.rescueToVault` covers stray tokens sent to the **strategy**.
 
 ---

@@ -57,7 +57,7 @@ contract ExecuteByBoundaryTest is Test {
         );
         vault = SyndicateVault(payable(address(new ERC1967Proxy(address(vaultImpl), vaultInit))));
 
-        SyndicateGovernor govImpl = new SyndicateGovernor();
+        SyndicateGovernor govImpl = new SyndicateGovernor(24 hours, 1 hours);
         bytes memory govInit = abi.encodeCall(
             SyndicateGovernor.initialize,
             (

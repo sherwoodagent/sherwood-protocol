@@ -474,11 +474,11 @@ contract GuardianNetworkForkTest is Test {
         // GovernorBeacon (canonical per-vault model, mirrors Deploy.s.sol).
         // The factory clones a BeaconProxy governor per vault at
         // `createSyndicate`; no singleton governor proxy is deployed here.
-        SyndicateGovernor govImpl = new SyndicateGovernor();
+        SyndicateGovernor govImpl = new SyndicateGovernor(24 hours, 1 hours);
         GovernorBeacon govBeacon = new GovernorBeacon(address(govImpl), owner);
 
         // GuardianRegistry
-        GuardianRegistry regImpl = new GuardianRegistry();
+        GuardianRegistry regImpl = new GuardianRegistry(6 hours);
         registry = GuardianRegistry(
             address(
                 new ERC1967Proxy(

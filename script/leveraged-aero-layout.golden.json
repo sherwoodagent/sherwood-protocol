@@ -1,0 +1,264 @@
+{
+  "struct Layout": {
+    "members": [
+      {
+        "label": "usdc",
+        "offset": 0,
+        "slot": "0",
+        "type": "t_address"
+      },
+      {
+        "label": "mUsdc",
+        "offset": 0,
+        "slot": "1",
+        "type": "t_address"
+      },
+      {
+        "label": "mCbBTC",
+        "offset": 0,
+        "slot": "2",
+        "type": "t_address"
+      },
+      {
+        "label": "mWeth",
+        "offset": 0,
+        "slot": "3",
+        "type": "t_address"
+      },
+      {
+        "label": "cbBTC",
+        "offset": 0,
+        "slot": "4",
+        "type": "t_address"
+      },
+      {
+        "label": "weth",
+        "offset": 0,
+        "slot": "5",
+        "type": "t_address"
+      },
+      {
+        "label": "pool",
+        "offset": 0,
+        "slot": "6",
+        "type": "t_address"
+      },
+      {
+        "label": "cbBTCFeed",
+        "offset": 0,
+        "slot": "7",
+        "type": "t_address"
+      },
+      {
+        "label": "wethFeed",
+        "offset": 0,
+        "slot": "8",
+        "type": "t_address"
+      },
+      {
+        "label": "usdcFeed",
+        "offset": 0,
+        "slot": "9",
+        "type": "t_address"
+      },
+      {
+        "label": "sequencerFeed",
+        "offset": 0,
+        "slot": "10",
+        "type": "t_address"
+      },
+      {
+        "label": "maxDelay",
+        "offset": 0,
+        "slot": "11",
+        "type": "t_uint256"
+      },
+      {
+        "label": "gracePeriod",
+        "offset": 0,
+        "slot": "12",
+        "type": "t_uint256"
+      },
+      {
+        "label": "calmDeviationTicks",
+        "offset": 0,
+        "slot": "13",
+        "type": "t_uint16"
+      },
+      {
+        "label": "twapWindow",
+        "offset": 2,
+        "slot": "13",
+        "type": "t_uint32"
+      },
+      {
+        "label": "comptroller",
+        "offset": 6,
+        "slot": "13",
+        "type": "t_address"
+      },
+      {
+        "label": "npm",
+        "offset": 0,
+        "slot": "14",
+        "type": "t_address"
+      },
+      {
+        "label": "gauge",
+        "offset": 0,
+        "slot": "15",
+        "type": "t_address"
+      },
+      {
+        "label": "swapRouter",
+        "offset": 0,
+        "slot": "16",
+        "type": "t_address"
+      },
+      {
+        "label": "tickSpacing",
+        "offset": 20,
+        "slot": "16",
+        "type": "t_int24"
+      },
+      {
+        "label": "targetLtvBps",
+        "offset": 23,
+        "slot": "16",
+        "type": "t_uint16"
+      },
+      {
+        "label": "maxLtvBps",
+        "offset": 25,
+        "slot": "16",
+        "type": "t_uint16"
+      },
+      {
+        "label": "minHealthBps",
+        "offset": 27,
+        "slot": "16",
+        "type": "t_uint16"
+      },
+      {
+        "label": "maxSlippageBps",
+        "offset": 29,
+        "slot": "16",
+        "type": "t_uint16"
+      },
+      {
+        "label": "usdcCollateralFactorBps",
+        "offset": 0,
+        "slot": "17",
+        "type": "t_uint16"
+      },
+      {
+        "label": "tokenId",
+        "offset": 0,
+        "slot": "18",
+        "type": "t_uint256"
+      },
+      {
+        "label": "posTickLower",
+        "offset": 0,
+        "slot": "19",
+        "type": "t_int24"
+      },
+      {
+        "label": "posTickUpper",
+        "offset": 3,
+        "slot": "19",
+        "type": "t_int24"
+      },
+      {
+        "label": "managementFeeBps",
+        "offset": 6,
+        "slot": "19",
+        "type": "t_uint16"
+      },
+      {
+        "label": "performanceFeeBps",
+        "offset": 8,
+        "slot": "19",
+        "type": "t_uint16"
+      },
+      {
+        "label": "feeRecipient",
+        "offset": 10,
+        "slot": "19",
+        "type": "t_address"
+      },
+      {
+        "label": "hwmPerShare",
+        "offset": 0,
+        "slot": "20",
+        "type": "t_uint256"
+      },
+      {
+        "label": "lastFeeAccrualTimestamp",
+        "offset": 0,
+        "slot": "21",
+        "type": "t_uint256"
+      },
+      {
+        "label": "protocolFeeOwed",
+        "offset": 0,
+        "slot": "22",
+        "type": "t_uint256"
+      },
+      {
+        "label": "aeroUsdFeed",
+        "offset": 0,
+        "slot": "23",
+        "type": "t_address"
+      },
+      {
+        "label": "nextRedeemRequestId",
+        "offset": 0,
+        "slot": "24",
+        "type": "t_uint256"
+      },
+      {
+        "label": "redeemRequests",
+        "offset": 0,
+        "slot": "25",
+        "type": "t_mapping(t_uint256,t_struct(RedeemRequest)_storage)"
+      }
+    ],
+    "numberOfBytes": "832"
+  },
+  "struct RedeemRequest": {
+    "members": [
+      {
+        "label": "owner",
+        "offset": 0,
+        "slot": "0",
+        "type": "t_address"
+      },
+      {
+        "label": "shares",
+        "offset": 0,
+        "slot": "1",
+        "type": "t_uint256"
+      },
+      {
+        "label": "minAssetsOut",
+        "offset": 0,
+        "slot": "2",
+        "type": "t_uint256"
+      },
+      {
+        "label": "requestedAt",
+        "offset": 0,
+        "slot": "3",
+        "type": "t_uint40"
+      },
+      {
+        "label": "settled",
+        "offset": 5,
+        "slot": "3",
+        "type": "t_bool"
+      }
+    ],
+    "numberOfBytes": "128"
+  }
+}

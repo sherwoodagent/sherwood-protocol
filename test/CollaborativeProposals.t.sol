@@ -74,7 +74,7 @@ contract CollaborativeProposalsTest is Test {
         vault = SyndicateVault(payable(address(new ERC1967Proxy(address(vaultImpl), vaultInit))));
 
         // Deploy the per-vault governor bound to this vault.
-        SyndicateGovernor govImpl = new SyndicateGovernor();
+        SyndicateGovernor govImpl = new SyndicateGovernor(24 hours, 1 hours);
         bytes memory govInit = abi.encodeCall(
             SyndicateGovernor.initialize,
             (

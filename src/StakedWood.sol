@@ -520,9 +520,13 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     }
 
     /// @notice Set the minimum WOOD a vault owner must bond at vault creation.
-    /// @dev Owner-only. Relocated verbatim from `GuardianRegistry.setMinOwnerStake`.
+    /// @dev Owner-only. Relocated from `GuardianRegistry.setMinOwnerStake`.
+    ///      `v == 0` is the deliberate open-onboarding sentinel — a 0-WOOD
+    ///      creator can then open a vault (`bindOwnerStake` binds a zero bond).
+    ///      Any nonzero value still floors at 1_000 WOOD so a token-dust bond
+    ///      can't be set by mistake.
     function setMinOwnerStake(uint256 v) external onlyOwner {
-        if (v < 1_000 * 1e18) revert InvalidParameter();
+        if (v != 0 && v < 1_000 * 1e18) revert InvalidParameter();
         emit ParameterChangeFinalized(PARAM_MIN_OWNER_STAKE, minOwnerStake, v);
         minOwnerStake = v;
     }
@@ -675,15 +679,24 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     ///      Called by `SyndicateFactory.createSyndicate` after the vault address
     ///      is known. Reverts if the prepared amount is below `minOwnerStake` —
     ///      at factory-creation time `totalAssets()` is 0, so only the floor applies.
+    /// @dev Zero-bond onboarding: the amount==0 guard is folded into the floor
+    ///      check below. At `minOwnerStake > 0` a zero (or short) prepared stake
+    ///      still reverts `OwnerBondInsufficient` — and `p.amount == 0` is
+    ///      unreachable anyway (`prepareOwnerStake` requires `amount >=
+    ///      minOwnerStake`), so this is behavior-preserving for any real bond.
+    ///      At `minOwnerStake == 0` a 0-WOOD creator who never prepared binds a
+    ///      zero bond (owner recorded; the empty prepared slot is NOT consumed,
+    ///      so they can open more vaults). `canCreateVault` already passes at
+    ///      floor 0, so the factory reaches this path.
     /// @dev nonReentrant dropped — no external calls after state write.
     function bindOwnerStake(address owner_, address vault) external onlyFactory {
         PreparedOwnerStake storage p = _prepared[owner_];
-        if (p.amount == 0 || p.bound) revert PreparedStakeNotFound();
+        if (p.bound) revert PreparedStakeNotFound();
         if (p.amount < minOwnerStake) revert OwnerBondInsufficient();
 
         _ownerStakes[vault] =
             OwnerStake({stakedAmount: p.amount, unstakeRequestedAt: 0, owner: owner_, cooldownAtRequest: 0});
-        p.bound = true;
+        if (p.amount != 0) p.bound = true;
 
         emit OwnerStakeBound(owner_, vault, p.amount);
     }

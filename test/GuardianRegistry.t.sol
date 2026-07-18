@@ -48,7 +48,7 @@ contract GuardianRegistryInitTest is RegistryTestHarness {
     }
 
     function test_initialize_revertsOnZeroSwood() public {
-        GuardianRegistry impl = new GuardianRegistry();
+        GuardianRegistry impl = new GuardianRegistry(6 hours);
         bytes memory initData =
             abi.encodeCall(GuardianRegistry.initialize, (regOwner, regFactory, address(0), 24 hours, 3000));
         vm.expectRevert(IGuardianRegistry.ZeroAddress.selector);

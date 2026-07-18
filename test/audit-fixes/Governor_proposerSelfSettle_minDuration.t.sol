@@ -70,7 +70,7 @@ contract Governor_proposerSelfSettle_minDuration_Test is Test {
         vm.prank(owner);
         vault.registerAgent(agentNftId, agent);
 
-        SyndicateGovernor govImpl = new SyndicateGovernor();
+        SyndicateGovernor govImpl = new SyndicateGovernor(24 hours, 1 hours);
         bytes memory govInit = abi.encodeCall(
             SyndicateGovernor.initialize,
             (

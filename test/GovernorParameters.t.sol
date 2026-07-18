@@ -42,7 +42,7 @@ contract GovernorParametersTest is Test {
         vm.prank(owner);
         protocolConfig.setProtocolFeeBps(PROTOCOL_FEE_BPS);
 
-        SyndicateGovernor govImpl = new SyndicateGovernor();
+        SyndicateGovernor govImpl = new SyndicateGovernor(24 hours, 1 hours);
         bytes memory govInit = abi.encodeCall(
             SyndicateGovernor.initialize,
             (
@@ -435,7 +435,7 @@ contract GovernorParametersTest is Test {
     /// @notice A bare implementation deploy (never initialized) has owner == 0.
     ///         Any setter call must revert with the OZ unauthorized error.
     function test_setters_beforeInit_revertOwnable() public {
-        SyndicateGovernor bareImpl = new SyndicateGovernor();
+        SyndicateGovernor bareImpl = new SyndicateGovernor(24 hours, 1 hours);
 
         vm.expectRevert(abi.encodeWithSelector(ISyndicateGovernor.NotVaultOwner.selector));
         bareImpl.setVotingPeriod(2 days);

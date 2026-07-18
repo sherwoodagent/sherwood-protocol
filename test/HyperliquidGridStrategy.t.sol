@@ -66,23 +66,6 @@ contract HyperliquidGridStrategyTest is Test {
         assertFalse(strategy.isAssetWhitelisted(99));
         // hyperCoreFinalized is set by finalizeForHyperCore(), not by initialize().
         assertFalse(strategy.hyperCoreFinalized());
-        // _hcSelf (slot 0) is written to address(this) during initialize() so HC
-        // FirstStorageSlot registration reads the correct value post-block.
-        assertEq(address(uint160(uint256(vm.load(address(strategy), bytes32(0))))), address(strategy));
-    }
-
-    function test_initialize_setsHcSelfSlot() public {
-        address payable rawClone = payable(Clones.clone(address(template)));
-        HyperliquidGridStrategy s = HyperliquidGridStrategy(rawClone);
-
-        uint32[] memory assets = new uint32[](1);
-        assets[0] = BTC_ASSET;
-        bytes memory initData = abi.encode(address(usdc), DEPOSIT, LEVERAGE, MAX_ORDER_SIZE, MAX_ORDERS, assets);
-        s.initialize(vault, proposer, initData);
-
-        assertFalse(s.hyperCoreFinalized());
-        // Slot 0 (_hcSelf) must equal the clone's own address after init.
-        assertEq(address(uint160(uint256(vm.load(address(s), bytes32(0))))), address(s));
     }
 
     function test_finalizeForHyperCore_setsFlag() public {

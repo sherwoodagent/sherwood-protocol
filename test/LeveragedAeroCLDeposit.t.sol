@@ -4,6 +4,7 @@ pragma solidity 0.8.28;
 import {Test} from "forge-std/Test.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {LeveragedAerodromeCLStrategy} from "../src/strategies/LeveragedAerodromeCLStrategy.sol";
+import {LeveragedAeroStorage} from "../src/strategies/LeveragedAeroStorage.sol";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Minimal mock vault — satisfies ISyndicateVault(strategyMint) + IERC20(totalSupply)
@@ -71,8 +72,8 @@ contract NavHarness is LeveragedAerodromeCLStrategy {}
 // ─────────────────────────────────────────────────────────────────────────────
 //
 // BaseStrategy state stays in the sequential layout:
-//   slot 1  : _vault        (address, offset 0)
-//   slot 2  : _proposer     (address, offset 0) | _state (uint8, offset 20) | _initialized (bool, offset 21)
+//   slot 0  : _vault        (address, offset 0)
+//   slot 1  : _proposer     (address, offset 0) | _state (uint8, offset 20) | _initialized (bool, offset 21)
 //
 // Strategy state moved into ERC-7201 diamond storage at STRAT_BASE
 // (= keccak256(abi.encode(uint256(keccak256("leveraged.aero.cl.storage")) - 1)) & ~0xff).
@@ -93,10 +94,10 @@ contract NavHarness is LeveragedAerodromeCLStrategy {}
 contract LeveragedAeroCLDepositUnit is Test {
     // ── slot numbers ──
     // BaseStrategy sequential slots (unchanged by the diamond-storage refactor):
-    uint256 private constant SLOT_VAULT = 1;
-    uint256 private constant SLOT_PROPOSER_STATE_INIT = 2;
+    uint256 private constant SLOT_VAULT = 0;
+    uint256 private constant SLOT_PROPOSER_STATE_INIT = 1;
     // ERC-7201 diamond base; strategy field slot = STRAT_BASE + structOffset.
-    uint256 private constant STRAT_BASE = uint256(0x405ae0b144079093e970849fdffdcb2a514e44968598c6c5c73444496e844900);
+    uint256 private constant STRAT_BASE = uint256(LeveragedAeroStorage.STORAGE_SLOT);
     uint256 private constant SLOT_USDC = STRAT_BASE + 0;
     uint256 private constant SLOT_SLOT22 = STRAT_BASE + 19; // feeRecipient packed slot
     uint256 private constant SLOT_HWM = STRAT_BASE + 20;
@@ -131,10 +132,10 @@ contract LeveragedAeroCLDepositUnit is Test {
         harness = new DepositHarness();
 
         // ── Wire storage ──
-        // slot 1: _vault
+        // slot 0: _vault
         vm.store(address(harness), bytes32(SLOT_VAULT), bytes32(uint256(uint160(address(mockVault)))));
 
-        // slot 2: _state = Executed (1), _initialized = true
+        // slot 1: _state = Executed (1), _initialized = true
         // After `new`, _initialized is already true (constructor). Re-write to also set _state.
         vm.store(address(harness), bytes32(SLOT_PROPOSER_STATE_INIT), bytes32(STATE_EXECUTED_INIT));
 

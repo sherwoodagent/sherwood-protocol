@@ -24,7 +24,18 @@ import {FeeConstants} from "./FeeConstants.sol";
 abstract contract GovernorParameters is ISyndicateGovernor {
     // ── Safety bounds (hardcoded) ──
 
-    uint256 public constant MIN_VOTING_PERIOD = 24 hours;
+    // Per-deployment timing floors are constructor-set immutables (see constructor).
+    // Mainnet impls deploy with the historical values (`votingPeriod` >= 24h,
+    // `cooldownPeriod` >= 1h); a testnet impl can deploy with lower floors to
+    // compress fund lifecycles. Immutables live in bytecode (not storage), so the
+    // storage layout is UNCHANGED vs. the prior `constant` form and reads resolve
+    // correctly through the beacon proxy. The absolute floor-of-floors below caps
+    // how low a deploy may set them, so a misconfigured impl fails loudly.
+    uint256 internal constant ABSOLUTE_MIN_TIMING_FLOOR = 1 minutes;
+
+    /// @notice Hard floor for `votingPeriod` (per-deployment; mainnet 24h).
+    /// @custom:oz-upgrades-unsafe-allow state-variable-immutable
+    uint256 public immutable MIN_VOTING_PERIOD;
     uint256 public constant MAX_VOTING_PERIOD = 30 days;
     uint256 public constant MIN_EXECUTION_WINDOW = 1 hours;
     uint256 public constant MAX_EXECUTION_WINDOW = 7 days;
@@ -37,7 +48,9 @@ abstract contract GovernorParameters is ISyndicateGovernor {
     // after execute (MIN_STRATEGY_DURATION_BEFORE_SELF_SETTLE); only a non-proposer settle waits the
     // full duration, so the long tail binds only an abandoned proposal on a vault whose owner ≠ proposer.
     uint256 public constant ABSOLUTE_MAX_STRATEGY_DURATION = 3650 days;
-    uint256 public constant MIN_COOLDOWN_PERIOD = 1 hours;
+    /// @notice Hard floor for `cooldownPeriod` (per-deployment; mainnet 1h).
+    /// @custom:oz-upgrades-unsafe-allow state-variable-immutable
+    uint256 public immutable MIN_COOLDOWN_PERIOD;
     uint256 public constant MAX_COOLDOWN_PERIOD = 30 days;
     /// @notice 100% in basis points. Centralized so SyndicateGovernor and
     ///         GuardianRegistry both reference one constant.
@@ -91,6 +104,26 @@ abstract contract GovernorParameters is ISyndicateGovernor {
     ///      param additions here don't shift `SyndicateGovernor`'s layout.
     uint256[8] private __paramsGap;
 
+    // ── Constructor (impl-time; sets per-deployment timing floors) ──
+
+    /// @param minVotingPeriod_   Hard floor for `votingPeriod` (mainnet 24h; a
+    ///                           testnet impl may deploy lower to compress cycles).
+    /// @param minCooldownPeriod_ Hard floor for `cooldownPeriod` (mainnet 1h).
+    /// @dev Runs at implementation-deploy time; the values bake into bytecode and
+    ///      are read through every per-vault BeaconProxy. Bounded so a fat-fingered
+    ///      or arg-less deploy reverts rather than silently seating a 0 floor.
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor(uint256 minVotingPeriod_, uint256 minCooldownPeriod_) {
+        if (minVotingPeriod_ < ABSOLUTE_MIN_TIMING_FLOOR || minVotingPeriod_ > MAX_VOTING_PERIOD) {
+            revert InvalidVotingPeriod();
+        }
+        if (minCooldownPeriod_ < ABSOLUTE_MIN_TIMING_FLOOR || minCooldownPeriod_ > MAX_COOLDOWN_PERIOD) {
+            revert InvalidCooldownPeriod();
+        }
+        MIN_VOTING_PERIOD = minVotingPeriod_;
+        MIN_COOLDOWN_PERIOD = minCooldownPeriod_;
+    }
+
     // ── Access control modifiers ──
 
     modifier onlyVaultOwner() {
@@ -111,7 +144,7 @@ abstract contract GovernorParameters is ISyndicateGovernor {
 
     // ── Bounds validator ──
 
-    function _validateParamBounds(GovernorParams memory p) internal pure {
+    function _validateParamBounds(GovernorParams memory p) internal view {
         if (p.votingPeriod < MIN_VOTING_PERIOD || p.votingPeriod > MAX_VOTING_PERIOD) revert InvalidVotingPeriod();
         if (p.executionWindow < MIN_EXECUTION_WINDOW || p.executionWindow > MAX_EXECUTION_WINDOW) {
             revert InvalidExecutionWindow();
@@ -228,7 +261,7 @@ abstract contract GovernorParameters is ISyndicateGovernor {
 
     // ── Validation helpers ──
 
-    function _validateVotingPeriod(uint256 value) internal pure {
+    function _validateVotingPeriod(uint256 value) internal view {
         if (value < MIN_VOTING_PERIOD || value > MAX_VOTING_PERIOD) revert InvalidVotingPeriod();
     }
 
@@ -244,7 +277,7 @@ abstract contract GovernorParameters is ISyndicateGovernor {
         if (value > MAX_PERFORMANCE_FEE_CAP) revert InvalidMaxPerformanceFeeBps();
     }
 
-    function _validateCooldownPeriod(uint256 value) internal pure {
+    function _validateCooldownPeriod(uint256 value) internal view {
         if (value < MIN_COOLDOWN_PERIOD || value > MAX_COOLDOWN_PERIOD) revert InvalidCooldownPeriod();
     }
 }

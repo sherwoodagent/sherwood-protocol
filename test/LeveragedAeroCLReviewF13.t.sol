@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 import {LeveragedAerodromeCLStrategy} from "../src/strategies/LeveragedAerodromeCLStrategy.sol";
+import {LeveragedAeroStorage} from "../src/strategies/LeveragedAeroStorage.sol";
 import {
     MockToken,
     MockGovernor,
@@ -21,7 +22,7 @@ import {
 ///           F3 — the fast-path `redeem` crystallise is best-effort (try/catch): a paused-vault /
 ///                de-whitelisted-recipient fee-mint revert must NOT brick the exit (fee simply defers).
 contract LeveragedAeroCLReviewF13 is Test {
-    uint256 private constant STRAT_BASE = uint256(0x405ae0b144079093e970849fdffdcb2a514e44968598c6c5c73444496e844900);
+    uint256 private constant STRAT_BASE = uint256(LeveragedAeroStorage.STORAGE_SLOT);
     uint256 private constant SLOT_USDC = STRAT_BASE + 0;
     uint256 private constant SLOT_MUSDC = STRAT_BASE + 1;
     uint256 private constant SLOT_MCBBTC = STRAT_BASE + 2;
@@ -29,8 +30,8 @@ contract LeveragedAeroCLReviewF13 is Test {
     uint256 private constant SLOT_LAST_FEE = STRAT_BASE + 21;
     uint256 private constant SLOT_OWED = STRAT_BASE + 22;
 
-    uint256 private constant SLOT_VAULT = 1;
-    uint256 private constant SLOT_PROPOSER_STATE_INIT = 2;
+    uint256 private constant SLOT_VAULT = 0;
+    uint256 private constant SLOT_PROPOSER_STATE_INIT = 1;
     uint256 private constant STATE_EXECUTED_INIT = (uint256(1) << 168) | (uint256(1) << 160);
     uint256 private constant SHARES_VIRTUAL_OFFSET = 1e6;
 

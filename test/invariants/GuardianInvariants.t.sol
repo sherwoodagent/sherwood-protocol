@@ -62,7 +62,7 @@ contract GuardianInvariantsTest is StdInvariant, Test {
         );
         swood = StakedWood(address(new ERC1967Proxy(address(swoodImpl), swoodInit)));
 
-        GuardianRegistry impl = new GuardianRegistry();
+        GuardianRegistry impl = new GuardianRegistry(6 hours);
         bytes memory initData = abi.encodeCall(
             GuardianRegistry.initialize, (owner, factory, address(swood), REVIEW_PERIOD, BLOCK_QUORUM_BPS)
         );

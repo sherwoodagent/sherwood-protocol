@@ -29,7 +29,7 @@ contract SetGuardianRegistryTest is Test {
         replacementRegistry = new MinimalGuardianRegistry();
 
         // Governor proxy
-        SyndicateGovernor govImpl = new SyndicateGovernor();
+        SyndicateGovernor govImpl = new SyndicateGovernor(24 hours, 1 hours);
         bytes memory govInit = abi.encodeCall(
             SyndicateGovernor.initialize,
             (

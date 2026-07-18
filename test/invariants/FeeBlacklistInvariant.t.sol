@@ -105,7 +105,7 @@ contract FeeBlacklistInvariantTest is StdInvariant, Test {
         protocolConfig.setProtocolFeeBps(PROTOCOL_FEE_BPS);
         vm.stopPrank();
 
-        SyndicateGovernor govImpl = new SyndicateGovernor();
+        SyndicateGovernor govImpl = new SyndicateGovernor(24 hours, 1 hours);
         bytes memory govInit = abi.encodeCall(
             SyndicateGovernor.initialize,
             (

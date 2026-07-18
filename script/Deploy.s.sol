@@ -84,6 +84,13 @@ contract DeploySherwood is ScriptBase {
     uint256 constant DEFAULT_MIN_OWNER_STAKE = 10_000e18;
     uint256 constant DEFAULT_COOLDOWN = 7 days;
     uint256 constant DEFAULT_REVIEW_PERIOD = 24 hours;
+    // ── Per-deployment governance timing floors (constructor immutables) ──
+    // Mainnet/default impls bake in the historical hard floors. A testnet
+    // acceleration deploy overrides these via a dedicated upgrade script
+    // (see script/robinhood-testnet/UpgradeGovernorFloors.s.sol).
+    uint256 constant DEFAULT_MIN_VOTING_PERIOD = 24 hours;
+    uint256 constant DEFAULT_MIN_COOLDOWN_PERIOD = 1 hours;
+    uint256 constant DEFAULT_MIN_REVIEW_PERIOD = 6 hours;
     uint256 constant DEFAULT_BLOCK_QUORUM_BPS = 3000; // 30%
     uint256 constant DEFAULT_SLASH_APPEAL_SEED = 1_000_000e18;
     uint256 constant DEFAULT_EPOCH_ZERO_SEED = 10_000e18;
@@ -263,7 +270,12 @@ contract DeploySherwood is ScriptBase {
         // wrap it in a GovernorBeacon. The factory clones a BeaconProxy per vault
         // at `createSyndicate`; a protocol-wide governor upgrade is a single
         // `beacon.upgradeTo(newImpl)`. No singleton governor proxy is deployed.
-        address govImpl = c3.deploy(SALT_GOVERNOR_IMPL, abi.encodePacked(type(SyndicateGovernor).creationCode));
+        address govImpl = c3.deploy(
+            SALT_GOVERNOR_IMPL,
+            abi.encodePacked(
+                type(SyndicateGovernor).creationCode, abi.encode(DEFAULT_MIN_VOTING_PERIOD, DEFAULT_MIN_COOLDOWN_PERIOD)
+            )
+        );
         d.beacon = address(new GovernorBeacon(govImpl, d.deployer));
         if (!cfg.betaMode) {
             // sWOOD is the sole WOOD custodian: deploy it before the registry
@@ -272,7 +284,10 @@ contract DeploySherwood is ScriptBase {
             // `setRegistry` call below (deploy order: sWOOD → registry → wire).
             d.swoodProxy = _deploySwoodProxy(c3, d.deployer, predictedFactoryProxy, cfg);
 
-            address registryImpl = c3.deploy(SALT_REGISTRY_IMPL, abi.encodePacked(type(GuardianRegistry).creationCode));
+            address registryImpl = c3.deploy(
+                SALT_REGISTRY_IMPL,
+                abi.encodePacked(type(GuardianRegistry).creationCode, abi.encode(DEFAULT_MIN_REVIEW_PERIOD))
+            );
             d.registryProxy = _deployRegistryProxy(c3, registryImpl, d.deployer, predictedFactoryProxy, d.swoodProxy);
             require(d.registryProxy == registryAddr, "registry addr mismatch");
 

@@ -29,10 +29,10 @@ import {ISyndicateVault} from "../interfaces/ISyndicateVault.sol";
  *   vault.totalAssets() right after, so the EVM push must happen here.
  *   sweepToVault() recovers any late HC arrivals (post-block bridge credits).
  *
- *   HyperCore registration: `_initialize()` writes `address(this)` to slot 0
- *   (`_hcSelf` from BaseStrategy). The CLI then calls
- *   `finalizeForHyperCore(0, FinalizeVariant.FirstStorageSlot, 0)` as a
- *   separate tx so HC reads slot 0 post-block and confirms the registration.
+ *   HyperCore registration: BaseStrategy no longer stamps `address(this)`
+ *   into slot 0, so the FirstStorageSlot finalize variant does NOT work for
+ *   clones of this template — Sherwood is not deploying on Hyperliquid.
+ *   Restore the slot-0 stamp before any future HC deployment.
  *
  *   Position state is NOT tracked on-chain — L1Read.position2() is the source
  *   of truth. The proposer must check actual HyperCore state before acting.
@@ -222,11 +222,9 @@ contract HyperliquidPerpStrategy is BaseStrategy {
      *         after `initialize()` and before the proposal that triggers
      *         `_execute()`.
      *
-     *         Standard call for SyndicateFactory CLI clones:
-     *           finalizeForHyperCore(0, FinalizeVariant.FirstStorageSlot, 0)
-     *         BaseStrategy.initialize() writes `address(this)` to slot 0
-     *         (`_hcSelf`). HC reads slot 0 post-block, confirms it equals
-     *         the contract address, and completes registration.
+     *         NOTE: BaseStrategy no longer stamps `address(this)` into slot 0,
+     *         so the FirstStorageSlot variant will NOT verify for clones of
+     *         this template — Sherwood is not deploying on Hyperliquid.
      *
      * @param token        HyperCore token index (USDC = 0).
      * @param variant      FinalizeVariant enum (Create / FirstStorageSlot / CustomStorageSlot).

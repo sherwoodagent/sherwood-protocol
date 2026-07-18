@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import {Test} from "forge-std/Test.sol";
 import {LeveragedAerodromeCLStrategy} from "../src/strategies/LeveragedAerodromeCLStrategy.sol";
+import {LeveragedAeroStorage} from "../src/strategies/LeveragedAeroStorage.sol";
 import {INonfungiblePositionManager} from "../src/interfaces/ISlipstream.sol";
 
 /// @notice Exposes `_npmPositionData` (internal after the visibility change) for testing.
@@ -31,7 +32,7 @@ contract LeveragedAeroCLNavAssemblyTest is Test {
     // matches the old sequential layout.
     //   STRAT_BASE + 14 = npm     (address, offset 0)  [was slot 17]
     //   STRAT_BASE + 18 = tokenId (uint256, full slot) [was slot 21]
-    uint256 private constant STRAT_BASE = uint256(0x405ae0b144079093e970849fdffdcb2a514e44968598c6c5c73444496e844900);
+    uint256 private constant STRAT_BASE = uint256(LeveragedAeroStorage.STORAGE_SLOT);
     uint256 private constant SLOT_NPM = STRAT_BASE + 14;
     uint256 private constant SLOT_TOKEN_ID = STRAT_BASE + 18;
 

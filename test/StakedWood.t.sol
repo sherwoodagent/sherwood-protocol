@@ -858,6 +858,137 @@ contract StakedWoodTest is Test {
         vm.warp(vm.getBlockTimestamp() + 1);
         assertEq(swood.getPastTotalSupply(ts), 0);
     }
+
+    // ── Zero owner-bond onboarding (minOwnerStake == 0) ──
+
+    /// @notice `setMinOwnerStake(0)` is the deliberate open-onboarding sentinel
+    ///         and must be settable on a live proxy; any NONZERO value below the
+    ///         1_000 WOOD floor is still rejected.
+    function test_setMinOwnerStake_permitsZeroButFloorsNonzero() public {
+        vm.expectEmit(true, false, false, true);
+        emit StakedWood.ParameterChangeFinalized(swood.PARAM_MIN_OWNER_STAKE(), 1_000e18, 0);
+        vm.prank(owner);
+        swood.setMinOwnerStake(0);
+        assertEq(swood.minOwnerStake(), 0);
+
+        // A nonzero dust value below the floor is still rejected.
+        vm.prank(owner);
+        vm.expectRevert(StakedWood.InvalidParameter.selector);
+        swood.setMinOwnerStake(999e18);
+    }
+
+    /// @notice Test 1: with `minOwnerStake == 0`, a creator holding 0 WOOD who
+    ///         never prepared can be bound to a vault. `canCreateVault` (the
+    ///         factory's gate) passes and `bindOwnerStake` records a zero bond
+    ///         with the creator as owner — the sole blocker was `bindOwnerStake`.
+    function test_bindOwnerStake_zeroBond_neverPreparedCreator() public {
+        address vault = address(0xBEEF);
+        address poorCreator = address(0xDEAD0);
+
+        vm.prank(owner);
+        swood.setMinOwnerStake(0);
+
+        // Never prepared, holds no WOOD — the factory gate still passes at floor 0.
+        assertEq(swood.preparedStakeOf(poorCreator), 0);
+        assertTrue(swood.canCreateVault(poorCreator));
+
+        // Bind via the factory-authorized path; owner topic proves the creator
+        // was recorded as the vault owner.
+        vm.expectEmit(true, true, false, true);
+        emit StakedWood.OwnerStakeBound(poorCreator, vault, 0);
+        vm.prank(factory);
+        swood.bindOwnerStake(poorCreator, vault);
+
+        assertEq(swood.ownerStake(vault), 0);
+    }
+
+    /// @notice Test 1 (cont.): one 0-WOOD creator can open MULTIPLE zero-bond
+    ///         vaults — the prepared slot stays {0, unbound}, so `canCreateVault`
+    ///         remains true. Accepted / expected behavior at floor 0.
+    function test_bindOwnerStake_zeroBond_creatorCanOpenMultipleVaults() public {
+        vm.prank(owner);
+        swood.setMinOwnerStake(0);
+
+        vm.prank(factory);
+        swood.bindOwnerStake(alice, address(0xBEE1));
+        vm.prank(factory);
+        swood.bindOwnerStake(alice, address(0xBEE2));
+
+        assertEq(swood.ownerStake(address(0xBEE1)), 0);
+        assertEq(swood.ownerStake(address(0xBEE2)), 0);
+        assertTrue(swood.canCreateVault(alice));
+    }
+
+    /// @notice Test 2: at a zero bond the emergency-settle bond re-check in
+    ///         `GovernorEmergency.emergencySettleWithCalls` — `ownerStake(vault)
+    ///         < requiredOwnerBond(vault)` (GovernorEmergency.sol:78) — evaluates
+    ///         `0 < 0`, i.e. FALSE, so the guard passes (does not revert).
+    function test_zeroBond_emergencySettleBondRecheckPasses() public {
+        address vault = address(0xBEEF);
+
+        vm.prank(owner);
+        swood.setMinOwnerStake(0);
+        vm.prank(factory);
+        swood.bindOwnerStake(alice, vault);
+
+        assertEq(swood.ownerStake(vault), 0);
+        assertEq(swood.requiredOwnerBond(vault), 0);
+        // The exact boolean the guard evaluates — must be false at zero bond.
+        assertFalse(swood.ownerStake(vault) < swood.requiredOwnerBond(vault));
+    }
+
+    /// @notice Test 3: `slashOwnerBond` on a zero-bond vault is a no-op — early
+    ///         return on `amount == 0`, no revert, nothing burned.
+    function test_zeroBond_slashOwnerBondIsNoop() public {
+        address vault = address(0xBEEF);
+        address regMock = address(0x9E515);
+
+        vm.prank(owner);
+        swood.setMinOwnerStake(0);
+        vm.prank(factory);
+        swood.bindOwnerStake(alice, vault);
+
+        // Wire a registry so the onlyRegistry gate resolves, then slash as it.
+        vm.prank(owner);
+        swood.setRegistry(regMock);
+
+        uint256 swoodBalBefore = wood.balanceOf(address(swood));
+        vm.prank(regMock);
+        swood.slashOwnerBond(vault); // must not revert
+
+        assertEq(swood.ownerStake(vault), 0);
+        assertEq(swood.pendingBurn(), 0, "nothing queued for burn");
+        assertEq(wood.balanceOf(address(swood)), swoodBalBefore, "no WOOD moved");
+    }
+
+    /// @notice Test 4: with `minOwnerStake == 0` a creator who DID prepare a
+    ///         nonzero stake binds that exact amount and consumes the slot —
+    ///         the nonzero path is preserved even at floor 0.
+    function test_bindOwnerStake_zeroFloor_honorsNonzeroPreparedStake() public {
+        address vault = address(0xBEEF);
+
+        // Alice prepares 1_000 WOOD at the current (nonzero) floor.
+        vm.prank(alice);
+        swood.prepareOwnerStake(1_000e18);
+
+        // Owner then drops the floor to 0 (open onboarding) BEFORE the bind.
+        vm.prank(owner);
+        swood.setMinOwnerStake(0);
+
+        vm.expectEmit(true, true, false, true);
+        emit StakedWood.OwnerStakeBound(alice, vault, 1_000e18);
+        vm.prank(factory);
+        swood.bindOwnerStake(alice, vault);
+
+        // Prepared amount honored; slot marked bound (canCreateVault false).
+        assertEq(swood.ownerStake(vault), 1_000e18);
+        assertFalse(swood.canCreateVault(alice));
+
+        // Owner field recorded correctly: alice (not a stranger) can start the
+        // owner-unstake flow on her nonzero bond.
+        vm.prank(alice);
+        swood.requestUnstakeOwner(vault);
+    }
 }
 
 /// @notice Sherlock #16 — `coolDownPeriod >= reviewPeriod` cross-contract

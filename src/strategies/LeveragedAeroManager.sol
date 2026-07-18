@@ -6,6 +6,7 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 import {LeveragedAeroValuation} from "./LeveragedAeroValuation.sol";
+import {LeveragedAeroStorage} from "./LeveragedAeroStorage.sol";
 import {TickMath} from "../libraries/TickMath.sol";
 import {LiquidityAmounts} from "../libraries/LiquidityAmounts.sol";
 import {ChainlinkReader} from "../libraries/ChainlinkReader.sol";
@@ -86,76 +87,17 @@ library LeveragedAeroManager {
     /// @dev Aerodrome v2 PoolFactory on Base (`router.defaultFactory()`), required by the Route.
     address private constant AERO_V2_FACTORY = 0x420DD381b31aEf6683db6B902084cB0FFECe40Da;
 
-    // ── Diamond storage — Layout/STORAGE_SLOT/_layout()/RedeemRequest byte-identical to
-    //    LeveragedAerodromeCLStrategy (delegatecall slot discipline) ──
+    // ── Diamond storage — `Layout`, `RedeemRequest`, `STORAGE_SLOT`, and the slot accessor are
+    //    owned by `LeveragedAeroStorage` (the single shared definition the strategy also imports).
+    //    The compiler enforces strategy↔manager identity only; deployed-lineage compatibility
+    //    (no reorder/insert/retype in the shared struct) is enforced by the golden snapshot in
+    //    `script/check-storage-parity.sh` step 1b + `test/LeveragedAeroLayoutParity.t.sol`, and
+    //    local re-declarations here are rejected by the script's step-4 backstops. ──
 
-    /// @dev Escrowed async-redeem request (Lane-B-style, but NO price freeze — shares keep bearing
-    ///      PnL until execution, so `cancelRedeem` is not a free look-back option).
-    struct RedeemRequest {
-        address owner; // request creator; the only address that can cancel / emergency-redeem it
-        uint256 shares; // vault shares escrowed in the strategy at request time
-        uint256 minAssetsOut; // slippage floor enforced at fulfill (fresh arg at emergencyRedeem)
-        uint40 requestedAt; // request timestamp; FULFILL_WINDOW deadman clock anchor
-        bool settled; // set once fulfilled / cancelled / emergency-redeemed (double-spend guard)
-    }
-
-    /// @custom:storage-location erc7201:leveraged.aero.cl.storage
-    struct Layout {
-        // valuation config: token / venue / feed addresses
-        address usdc;
-        address mUsdc;
-        address mCbBTC; // LeveragedAeroValuation.Config.cbBTCMarket
-        address mWeth; // LeveragedAeroValuation.Config.wethMarket
-        address cbBTC;
-        address weth;
-        address pool;
-        address cbBTCFeed;
-        address wethFeed;
-        address usdcFeed;
-        address sequencerFeed;
-        uint256 maxDelay;
-        uint256 gracePeriod;
-        uint16 calmDeviationTicks;
-        uint32 twapWindow;
-        // venue / protocol addresses (not in Config)
-        address comptroller;
-        address npm;
-        address gauge;
-        address swapRouter;
-        int24 tickSpacing;
-        // risk params
-        uint16 targetLtvBps;
-        uint16 maxLtvBps;
-        uint16 minHealthBps;
-        uint16 maxSlippageBps;
-        uint16 usdcCollateralFactorBps; // USDC collateral factor from Moonwell at init (8800 = 88%)
-        // position state (all zero pre-deploy / post-settle)
-        uint256 tokenId; // active CL position; 0 == flat book
-        int24 posTickLower;
-        int24 posTickUpper;
-        // fee params + state
-        uint16 managementFeeBps;
-        uint16 performanceFeeBps;
-        address feeRecipient;
-        uint256 hwmPerShare; // HWM nav-per-share (1e18 WAD), 0 until first deposit
-        uint256 lastFeeAccrualTimestamp;
-        uint256 protocolFeeOwed; // accrued protocol-fee USDC liability (6dp); discharged in redeem/compound/settle
-        // ── appended for the L9 compound oracle floor (keep byte-identical in the strategy) ──
-        address aeroUsdFeed; // AERO/USD aggregator (8dp) — floors compound()'s AERO→USDC swap
-        // ── LAST fields: appended for the escrowed async-redeem queue (keep byte-identical) ──
-        uint256 nextRedeemRequestId; // monotonic id cursor for `redeemRequests`
-        mapping(uint256 => RedeemRequest) redeemRequests; // id → escrowed async redeem
-    }
-
-    /// @dev keccak256(abi.encode(uint256(keccak256("leveraged.aero.cl.storage")) - 1)) & ~bytes32(uint256(0xff))
-    bytes32 private constant STORAGE_SLOT = 0x405ae0b144079093e970849fdffdcb2a514e44968598c6c5c73444496e844900;
-
-    /// @dev ERC-7201 diamond-storage accessor (byte-identical across strategy + manager).
-    function _layout() private pure returns (Layout storage $) {
-        // solhint-disable-next-line no-inline-assembly
-        assembly {
-            $.slot := STORAGE_SLOT
-        }
+    /// @dev ERC-7201 diamond-storage accessor (shared with the strategy via `LeveragedAeroStorage`).
+    ///      Runs in the clone's context under delegatecall — resolves the CLONE's storage.
+    function _layout() private pure returns (LeveragedAeroStorage.Layout storage) {
+        return LeveragedAeroStorage.layout();
     }
 
     // ── PUBLIC IMPLS (delegatecalled by the strategy entrypoints) ──
@@ -174,7 +116,7 @@ library LeveragedAeroManager {
     ///         strategy forwards the realized USDC to the vault afterward.
     /// @return realizedUsdc USDC held by the strategy after the unwind.
     function settleImpl() public returns (uint256 realizedUsdc) {
-        Layout storage $ = _layout();
+        LeveragedAeroStorage.Layout storage $ = _layout();
         // 1+2. Unstake + remove 100% liquidity + collect (num==den → no restake)
         _unwindLiquidity(1, 1);
         // 3. Repay both Moonwell borrows (handles shortfall)
@@ -212,7 +154,7 @@ library LeveragedAeroManager {
     /// @dev Idle USDC: the strategy may hold idle USDC from undeployed deposits — the redeemer gets f
     ///      of it, stayers keep (1-f). We snapshot `idleUsdcBefore` and subtract `stayersIdle` at the end.
     function redeemUnwindImpl(uint256 shares, uint256 supply) public returns (uint256) {
-        Layout storage $ = _layout();
+        LeveragedAeroStorage.Layout storage $ = _layout();
         // Snapshot idle USDC — stayers keep (1-f) of it.
         uint256 idleUsdcBefore = IERC20($.usdc).balanceOf(address(this));
         uint256 stayersIdle = idleUsdcBefore - Math.mulDiv(idleUsdcBefore, shares, supply);
@@ -296,7 +238,7 @@ library LeveragedAeroManager {
     ///         touched and the LTV gate is skipped. The strategy pays the redeemer + burns shares; the
     ///         idle already held plus the freed collateral cover the payout.
     function fastRedeemImpl(uint256 assetsOut, uint256 idleShare) public {
-        Layout storage $ = _layout();
+        LeveragedAeroStorage.Layout storage $ = _layout();
         // Idle-first: draw at most the redeemer's `f×idle` share (also clamped to the live balance);
         // the strategy's payout transfer consumes it implicitly, leaving `(1-f)×idle` for stayers.
         uint256 idle = IERC20($.usdc).balanceOf(address(this));
@@ -329,7 +271,7 @@ library LeveragedAeroManager {
     /// @notice Deploy `amount` of idle strategy USDC into the existing levered position
     ///         (body of the strategy's `deployIdle`): supply + borrow + increaseLiquidity.
     function deployIdleImpl(uint256 amount, uint256 minLiquidity) public {
-        Layout storage $ = _layout();
+        LeveragedAeroStorage.Layout storage $ = _layout();
         if (amount > IERC20($.usdc).balanceOf(address(this))) revert InsufficientIdle();
         _supplyAmount(amount);
         (uint256 cbBTCAmt, uint256 wethAmt) = _computeAndBorrow(amount);
@@ -349,7 +291,7 @@ library LeveragedAeroManager {
     /// @return pay         USDC withheld = `min(skimCap, usdcOut)` (0 when no yield). The strategy
     ///                     transfers this to the protocol-fee recipient and decrements owed.
     function compoundImpl(uint256 minUsdcOut, uint256 minLiquidity, uint256 skimCap) public returns (uint256 pay) {
-        Layout storage $ = _layout();
+        LeveragedAeroStorage.Layout storage $ = _layout();
         uint256 tokenId_ = $.tokenId;
         if (tokenId_ == 0) return 0; // flat book — nothing staked, nothing to compound
         if (minUsdcOut == 0) revert ZeroMinOut(); // belt: caller must pass a nonzero floor (see BelowOracleFloor)
@@ -403,7 +345,7 @@ library LeveragedAeroManager {
     /// @param minLiq0 Minimum token0 (WETH) the re-add must consume (two-sided slippage guard).
     /// @param minLiq1 Minimum token1 (cbBTC) the re-add must consume (two-sided slippage guard).
     function rerangeImpl(uint256 minLiq0, uint256 minLiq1) public {
-        Layout storage $ = _layout();
+        LeveragedAeroStorage.Layout storage $ = _layout();
         if ($.tokenId == 0) return; // flat book — nothing to recenter
 
         // 1. Calm-gate BEFORE touching the pool — never recenter at a manipulated tick.
@@ -470,7 +412,7 @@ library LeveragedAeroManager {
     ///         an accepted residual.
     /// @param minOut Minimum USDC out of any residual rebalancing swap (slippage guard).
     function deleverageImpl(uint256 minOut) public {
-        Layout storage $ = _layout();
+        LeveragedAeroStorage.Layout storage $ = _layout();
         (uint256 collateralBefore, uint256 debtBefore) = _readCollateralDebt();
         if (debtBefore == 0) revert HealthyNoDeleverage(); // no debt ⇒ infinitely healthy
         uint256 healthBefore = (collateralBefore * 10000) / debtBefore;
@@ -510,7 +452,7 @@ library LeveragedAeroManager {
     ///      the over-collected sibling leg → USDC (caller `minOut` bounds it) and buying the deficit.
     ///      Balanced legs (the common case) leave no residual → no swap → `minOut` unused.
     function _leverDown(uint256 repayUsd, uint256 debtUsd, uint256 minOut) private {
-        Layout storage $ = _layout();
+        LeveragedAeroStorage.Layout storage $ = _layout();
         _unwindLiquidity(repayUsd, debtUsd);
         (uint256 cbShort, uint256 wethShort) = _redeemRepayFromCollected(repayUsd, debtUsd, 0, 0);
         // Two independent `if`s (NOT else-if): a dual-leg IL shortfall covers BOTH legs (L6), mirroring
@@ -543,7 +485,7 @@ library LeveragedAeroManager {
         uint256 shortAmt,
         uint256 minUsdcOut
     ) private {
-        Layout storage $ = _layout();
+        LeveragedAeroStorage.Layout storage $ = _layout();
         uint256 pUsdc = _readUsd8($.usdcFeed); // hoisted: floors the surplus sell AND ceils the deficit buy
         uint256 surplusBal = IERC20(surplusTok).balanceOf(address(this));
         if (surplusBal > 0) {
@@ -568,7 +510,7 @@ library LeveragedAeroManager {
     ///      `_assertHealthy` (the LTV/health basis) — sizes the adjustLeverage / deleverage targets.
     ///      Returns `debtUsdc == 0` (skipping the price reads) when both borrows are clear.
     function _readCollateralDebt() private view returns (uint256 collateralUsdc, uint256 debtUsdc) {
-        Layout storage $ = _layout();
+        LeveragedAeroStorage.Layout storage $ = _layout();
         uint256 cBal = ICToken($.mUsdc).balanceOf(address(this));
         uint256 rate = ICToken($.mUsdc).exchangeRateStored();
         collateralUsdc = (cBal * rate) / 1e18;
@@ -598,7 +540,7 @@ library LeveragedAeroManager {
 
     /// @dev Supply all strategy USDC to Moonwell and enter the mUSDC market.
     function _supplyCollateral() private returns (uint256 usdcAmt) {
-        Layout storage $ = _layout();
+        LeveragedAeroStorage.Layout storage $ = _layout();
         address usdc_ = $.usdc;
         address mUsdc_ = $.mUsdc;
         usdcAmt = IERC20(usdc_).balanceOf(address(this));
@@ -621,7 +563,7 @@ library LeveragedAeroManager {
     ///      hardened-Chainlink prices, and execute both borrows. Used by `_computeAndBorrow` (fresh
     ///      collateral at target) and by `_leverUp` (a target-LTV debt delta with no new collateral).
     function _borrowHalfEach(uint256 borrowUsd6) private returns (uint256 cbBTCAmt, uint256 wethAmt) {
-        Layout storage $ = _layout();
+        LeveragedAeroStorage.Layout storage $ = _layout();
         uint256 pBTC = _readUsd8($.cbBTCFeed);
         uint256 pETH = _readUsd8($.wethFeed);
         // halfBorrowUsd8: borrowUsd6 (6dp) → 8dp via ×100, then halve for the per-leg USD value.
@@ -644,7 +586,7 @@ library LeveragedAeroManager {
 
     /// @dev Compute a tickSpacing-aligned range centred on the current pool tick.
     function _computeTickRange() private view returns (int24 tickLower, int24 tickUpper) {
-        Layout storage $ = _layout();
+        LeveragedAeroStorage.Layout storage $ = _layout();
         (, int24 currentTick,,,,) = ICLPool($.pool).slot0();
         int24 tickSpacing_ = $.tickSpacing;
         int24 span = int24(uint24(RANGE_TICK_SPACINGS)) * tickSpacing_;
@@ -662,7 +604,7 @@ library LeveragedAeroManager {
         private
         returns (uint256 tokenId_, uint256 used0, uint256 used1)
     {
-        Layout storage $ = _layout();
+        LeveragedAeroStorage.Layout storage $ = _layout();
         address npm_ = $.npm;
         address weth_ = $.weth;
         address cbBTC_ = $.cbBTC;
@@ -700,7 +642,7 @@ library LeveragedAeroManager {
     /// @dev Mint the CL position, stake in gauge, and persist state.
     function _mintAndStake(uint256 cbBTCAmt, uint256 wethAmt) private {
         // Calm-gate before reading spot tick / anchoring slippage mins.
-        Layout storage $ = _layout();
+        LeveragedAeroStorage.Layout storage $ = _layout();
         LeveragedAeroValuation._calmGate(_config());
         (int24 tickLower, int24 tickUpper) = _computeTickRange();
         (uint256 tokenId_,,) = _mintPosition(wethAmt, cbBTCAmt, tickLower, tickUpper);
@@ -733,7 +675,7 @@ library LeveragedAeroManager {
     ///      When num==den (full settle), no restake. When num<den (partial redeem),
     ///      restakes if remaining liq > 0.
     function _unwindLiquidity(uint256 num, uint256 den) private {
-        Layout storage $ = _layout();
+        LeveragedAeroStorage.Layout storage $ = _layout();
         uint256 tokenId_ = $.tokenId;
         if (tokenId_ == 0) return; // flat book — no LP to unwind
 
@@ -782,7 +724,7 @@ library LeveragedAeroManager {
     /// @dev Repay as much of both Moonwell borrows as current balances allow, then cover
     ///      any remaining debt via _settleShortfall().
     function _settleRepayDebts() private {
-        Layout storage $ = _layout();
+        LeveragedAeroStorage.Layout storage $ = _layout();
         address mCbBTC_ = $.mCbBTC;
         address mWeth_ = $.mWeth;
         address cbBTC_ = $.cbBTC;
@@ -808,7 +750,7 @@ library LeveragedAeroManager {
     /// @dev If any borrow balance remains after the direct repay attempt, redeem USDC from
     ///      mUSDC collateral and swap to cover it. Chainlink prices + 10% buffer; dust floor.
     function _settleShortfall() private {
-        Layout storage $ = _layout();
+        LeveragedAeroStorage.Layout storage $ = _layout();
         uint256 cbDebtRem = IMoonwellMarket($.mCbBTC).borrowBalanceStored(address(this));
         uint256 wethDebtRem = IMoonwellMarket($.mWeth).borrowBalanceStored(address(this));
         if (cbDebtRem == 0 && wethDebtRem == 0) return;
@@ -849,7 +791,7 @@ library LeveragedAeroManager {
     /// @dev Swap a fixed USDC amount in for `tokenOut` via Slipstream exactInputSingle.
     ///      Caps actualIn at the current USDC balance.
     function _swapUsdcExactIn(address tokenOut, uint256 amountIn, uint256 minAmtOut) private {
-        Layout storage $ = _layout();
+        LeveragedAeroStorage.Layout storage $ = _layout();
         uint256 usdcBal = IERC20($.usdc).balanceOf(address(this));
         uint256 actualIn = usdcBal < amountIn ? usdcBal : amountIn;
         if (actualIn == 0) return;
@@ -877,7 +819,7 @@ library LeveragedAeroManager {
     /// @dev Sweep (balance − `keep`) of `tokenIn` → USDC via exactInputSingle. `keep` reserves a
     ///      stayers' idle-leg share on the redeem path; settle / full-sweep callers pass keep == 0.
     function _sweepLegToUsdc(address tokenIn, uint256 keep, uint256 minOut) private {
-        Layout storage $ = _layout();
+        LeveragedAeroStorage.Layout storage $ = _layout();
         uint256 bal = IERC20(tokenIn).balanceOf(address(this));
         if (bal <= keep) return;
         uint256 amt = bal - keep;
@@ -916,7 +858,7 @@ library LeveragedAeroManager {
     ///      trusted `decimals()` implicitly; consolidating them here closes that gap (L1) — a
     ///      redeployed feed at a different precision fail-closes instead of mis-scaling the term.
     function _readUsd8(address feed) private view returns (uint256 price) {
-        Layout storage $ = _layout();
+        LeveragedAeroStorage.Layout storage $ = _layout();
         (uint256 p, uint8 dec) = ChainlinkReader.readUsd(feed, $.sequencerFeed, $.maxDelay, $.gracePeriod);
         if (dec != 8) revert FeedDecimalsMismatch();
         return p;
@@ -927,7 +869,7 @@ library LeveragedAeroManager {
     ///      _assertHealthy) share one call instead of inlining three `_readUsd8`s each (bytecode offset
     ///      for the L9 floor).
     function _readAllPrices() private view returns (uint256 pBTC, uint256 pETH, uint256 pUsdc) {
-        Layout storage $ = _layout();
+        LeveragedAeroStorage.Layout storage $ = _layout();
         pBTC = _readUsd8($.cbBTCFeed);
         pETH = _readUsd8($.wethFeed);
         pUsdc = _readUsd8($.usdcFeed);
@@ -937,7 +879,7 @@ library LeveragedAeroManager {
 
     /// @dev Supply a specific USDC amount to Moonwell mUSDC (no enterMarkets — already entered).
     function _supplyAmount(uint256 amt) private {
-        Layout storage $ = _layout();
+        LeveragedAeroStorage.Layout storage $ = _layout();
         IERC20($.usdc).forceApprove($.mUsdc, amt);
         uint256 err = ICToken($.mUsdc).mint(amt);
         if (err != 0) revert MoonwellMintFailed(err);
@@ -946,7 +888,7 @@ library LeveragedAeroManager {
     /// @dev Add liquidity to the existing tokenId position via NPM.increaseLiquidity.
     ///      Caller must own the NFT (position unstaked from the gauge).
     function _addLiquidity(uint256 wethAmt, uint256 cbBTCAmt, uint256 minLiquidity) private {
-        Layout storage $ = _layout();
+        LeveragedAeroStorage.Layout storage $ = _layout();
         LeveragedAeroValuation._calmGate(_config());
         uint256 tokenId_ = $.tokenId;
         address npm_ = $.npm;
@@ -976,7 +918,7 @@ library LeveragedAeroManager {
     ///      `increaseLiquidity` the borrowed legs into the existing position (`minLiquidity`
     ///      slippage), then restake for AERO rewards. Shared by `deployIdleImpl` and `_leverUp`.
     function _wrapAddRestake(uint256 cbBTCAmt, uint256 wethAmt, uint256 minLiquidity) private {
-        Layout storage $ = _layout();
+        LeveragedAeroStorage.Layout storage $ = _layout();
         _wrapNativeEth();
         uint256 tokenId_ = $.tokenId;
         address gauge_ = $.gauge;
@@ -1000,7 +942,7 @@ library LeveragedAeroManager {
         private
         returns (uint256 cbShort, uint256 wethShort)
     {
-        Layout storage $ = _layout();
+        LeveragedAeroStorage.Layout storage $ = _layout();
         address mCbBTC_ = $.mCbBTC;
         address mWeth_ = $.mWeth;
         address cbBTC_ = $.cbBTC;
@@ -1042,7 +984,7 @@ library LeveragedAeroManager {
     ///      that would dip into stayer idle reverts. The permissionless deleverage path passes an
     ///      oracle+slippage ceiling so a sandwiched buy reverts instead of overpaying (H1).
     function _redeemCoverShortfall(address tokenOut, address market, uint256 amountOut, uint256 amountInMax) private {
-        Layout storage $ = _layout();
+        LeveragedAeroStorage.Layout storage $ = _layout();
         uint256 usdcBal = IERC20($.usdc).balanceOf(address(this));
         if (usdcBal == 0 || amountOut == 0) return;
         uint256 maxIn = usdcBal < amountInMax ? usdcBal : amountInMax;
@@ -1094,7 +1036,7 @@ library LeveragedAeroManager {
     ///         Reverts `UnhealthyPosition` if Chainlink-priced LTV exceeds `maxLtvBps` or
     ///         Moonwell reports a shortfall. Scaling mirrors `LeveragedAeroValuation`.
     function _assertHealthy() private view {
-        Layout storage $ = _layout();
+        LeveragedAeroStorage.Layout storage $ = _layout();
         // ── Collateral (USDC face, 6dp) ──
         address mUsdc_ = $.mUsdc;
         uint256 cBal = ICToken(mUsdc_).balanceOf(address(this));
@@ -1144,26 +1086,10 @@ library LeveragedAeroManager {
         }
     }
 
-    /// @dev Build the `LeveragedAeroValuation.Config` from stored state (for the calm-gate).
-    function _config() private view returns (LeveragedAeroValuation.Config memory c) {
-        Layout storage $ = _layout();
-        c.usdc = $.usdc;
-        c.vault = address(0); // calm-gate ignores vault; only the strategy's nav() needs the float term
-        c.mUsdc = $.mUsdc;
-        c.cbBTCMarket = $.mCbBTC;
-        c.wethMarket = $.mWeth;
-        c.cbBTC = $.cbBTC;
-        c.weth = $.weth;
-        c.cbBTCDecimals = CBBTC_DECIMALS;
-        c.wethDecimals = WETH_DECIMALS;
-        c.pool = $.pool;
-        c.cbBTCFeed = $.cbBTCFeed;
-        c.wethFeed = $.wethFeed;
-        c.usdcFeed = $.usdcFeed;
-        c.sequencerFeed = $.sequencerFeed;
-        c.maxDelay = $.maxDelay;
-        c.gracePeriod = $.gracePeriod;
-        c.calmDeviationTicks = $.calmDeviationTicks;
-        c.twapWindow = $.twapWindow;
+    /// @dev Build the `LeveragedAeroValuation.Config` from stored state (for the calm-gate) via the
+    ///      shared `LeveragedAeroStorage.buildConfig`. `vault = address(0)`: the calm-gate ignores
+    ///      the vault term; only the strategy's `nav()` needs the float exclusion.
+    function _config() private view returns (LeveragedAeroValuation.Config memory) {
+        return LeveragedAeroStorage.buildConfig(address(0));
     }
 }
