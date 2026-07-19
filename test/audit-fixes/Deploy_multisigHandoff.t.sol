@@ -225,7 +225,11 @@ contract DeployMultisigHandoffTest is Test {
                     coolDownPeriod: 7 days,
                     minOwnerStake: 10_000e18,
                     minSlashBps: 1000,
-                    maxSlashBps: 9999
+                    maxSlashBps: 9999,
+                    maxDelegatedSlashBps: 2000,
+                    ageFloorBps: 2500,
+                    maturationPeriod: 30 days,
+                    delegatedWeightCapX: 4
                 }))
         );
         swood = address(new ERC1967Proxy(address(swoodImpl), swoodInit));

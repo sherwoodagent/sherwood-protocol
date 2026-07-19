@@ -144,6 +144,18 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     /// @dev Graduated slash severity — upper clamp bound for the voted median.
     bytes32 public constant PARAM_MAX_SLASH_BPS = keccak256("maxSlashBps");
 
+    /// @notice Parameter key for `maxDelegatedSlashBps`.
+    bytes32 public constant PARAM_MAX_DELEGATED_SLASH_BPS = keccak256("maxDelegatedSlashBps");
+
+    /// @notice Parameter key for `ageFloorBps`.
+    bytes32 public constant PARAM_AGE_FLOOR_BPS = keccak256("ageFloorBps");
+
+    /// @notice Parameter key for `maturationPeriod`.
+    bytes32 public constant PARAM_MATURATION_PERIOD = keccak256("maturationPeriod");
+
+    /// @notice Parameter key for `delegatedWeightCapX`.
+    bytes32 public constant PARAM_DELEGATED_WEIGHT_CAP_X = keccak256("delegatedWeightCapX");
+
     /// @notice Emitted when the owner toggles the delegation feature flag.
     event DelegationEnabledSet(bool enabled);
 
@@ -257,15 +269,33 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     ///      A non-zero floor preserves the deterrent. See spec §6/§7.
     uint256 public minSlashBps;
 
-    /// @notice Upper clamp bound (bps, strictly `< 10_000`) for the graduated
-    ///         slash severity.
-    /// @dev Strictly less than `10_000` (i.e. max `9_999`) — a 100% slash
-    ///      zeroes `poolTokens` while `poolShares` stay nonzero, bricking the
-    ///      delegation pool (subsequent `delegateStake` reverts with
-    ///      `Math.mulDiv` divide-by-zero). Same applies to the unbonding pool.
-    ///      Capping at `9_999` keeps `mulDiv(poolTokens, slashBps, 10_000)`
-    ///      strictly less than `poolTokens` — at least 1 wei remains. (C-2)
+    /// @notice Upper clamp bound (bps) for the graduated slash severity.
+    /// @dev May be a full `10_000` (100%) — the ceiling only sizes the
+    ///      approver's OWN-stake slash, which is a plain integer subtraction
+    ///      with no share math to brick. The C-2 pool-bricking guard that used
+    ///      to cap this at `9_999` now lives on `maxDelegatedSlashBps` (the
+    ///      pool legs' ceiling) below.
     uint256 public maxSlashBps;
+
+    /// @notice Per-incident ceiling (bps) on the delegated + unbonding pool
+    ///         slash. The pool legs of `_slashOne` are sized by
+    ///         `min(slashBps, maxDelegatedSlashBps)`; the uncovered remainder
+    ///         spills onto the approver's own stake (first-loss bond).
+    /// @dev Strictly `< 10_000` — this is where the C-2 pool-bricking guard
+    ///      lives now: a 100% pool slash zeroes `poolTokens` while
+    ///      `poolShares` stay nonzero, bricking `delegateStake` with a
+    ///      `Math.mulDiv` divide-by-zero. `maxSlashBps` itself may be 10_000
+    ///      (own stake is a plain integer, no share math).
+    uint256 public maxDelegatedSlashBps;
+
+    /// @notice Vote-weight fraction (bps) of raw own stake at age 0.
+    uint256 public ageFloorBps;
+
+    /// @notice Stake age at which own-stake weight reaches par (100%).
+    uint256 public maturationPeriod;
+
+    /// @notice Max delegated vote weight as a multiple of AGED own weight.
+    uint256 public delegatedWeightCapX;
 
     /// @notice Per-(proposal, voter) snapshot of the voter's stake at the
     ///         instant their review vote was recorded. The registry calls
@@ -290,7 +320,9 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     ///      Decremented 16 → 15 in Task 5.1: `voteStake` consumes one slot.
     ///      Decremented 15 → 14 in Task 5.2: `_pendingBurn` consumes one slot.
     ///      Decremented 14 → 12 in Task 6.2: `minSlashBps` + `maxSlashBps`.
-    uint256[12] private __gap;
+    ///      Decremented 12 → 8 (spec 2026-07-19): maxDelegatedSlashBps,
+    ///      ageFloorBps, maturationPeriod, delegatedWeightCapX.
+    uint256[8] private __gap;
 
     /// @notice Slashed WOOD is sent here — permanently out of circulation.
     /// @dev Burning via a transfer to a known-dead address keeps WOOD's
@@ -318,6 +350,14 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
         uint256 minSlashBps;
         /// @dev Upper clamp bound (bps, ≤ 10_000) for graduated slash severity.
         uint256 maxSlashBps;
+        /// @dev Per-incident delegated-slash ceiling (bps, < 10_000).
+        uint256 maxDelegatedSlashBps;
+        /// @dev Own-stake weight fraction at age 0 (bps, [1, 10_000]).
+        uint256 ageFloorBps;
+        /// @dev Age at which own-stake weight reaches par ([7, 90] days).
+        uint256 maturationPeriod;
+        /// @dev Delegated-weight cap multiple over aged own weight ([1, 20]).
+        uint256 delegatedWeightCapX;
     }
 
     /// @custom:oz-upgrades-unsafe-allow constructor
@@ -335,16 +375,25 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
         minGuardianStake = p.minGuardianStake;
         coolDownPeriod = p.coolDownPeriod;
         minOwnerStake = p.minOwnerStake;
-        // Graduated slash severity: enforce `minSlashBps <= maxSlashBps < 10_000`.
-        // Strict `<` defends against pool-bricking: a 100% (10_000 bps) slash
-        // zeroes `poolTokens` while `poolShares` stay nonzero, after which
-        // `delegateStake`'s `Math.mulDiv(amount, sh, ts=0)` panics with
-        // divide-by-zero. Capping at 9_999 keeps at least 1 wei in the pool.
-        if (p.minSlashBps > p.maxSlashBps || p.maxSlashBps >= 10_000) {
+        // Severity ceiling may be a full 100% (own stake is a plain integer).
+        // The C-2 pool-bricking guard lives on `maxDelegatedSlashBps` below.
+        if (p.minSlashBps > p.maxSlashBps || p.maxSlashBps > 10_000) {
             revert InvalidParameter();
         }
         minSlashBps = p.minSlashBps;
         maxSlashBps = p.maxSlashBps;
+        // C-2 guard: pool legs are sized by `min(S, C)`, so C < 10_000 keeps
+        // at least 1 wei in every slashed pool.
+        if (p.maxDelegatedSlashBps > p.maxSlashBps || p.maxDelegatedSlashBps >= 10_000) {
+            revert InvalidParameter();
+        }
+        maxDelegatedSlashBps = p.maxDelegatedSlashBps;
+        if (p.ageFloorBps == 0 || p.ageFloorBps > 10_000) revert InvalidParameter();
+        ageFloorBps = p.ageFloorBps;
+        if (p.maturationPeriod < 7 days || p.maturationPeriod > 90 days) revert InvalidParameter();
+        maturationPeriod = p.maturationPeriod;
+        if (p.delegatedWeightCapX == 0 || p.delegatedWeightCapX > 20) revert InvalidParameter();
+        delegatedWeightCapX = p.delegatedWeightCapX;
         _initEpochGenesis();
     }
 
@@ -542,13 +591,46 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
         minSlashBps = v;
     }
 
-    /// @notice Set the upper clamp bound for the graduated slash severity.
-    /// @dev Owner-only. Must keep `minSlashBps <= maxSlashBps < 10_000`.
-    ///      Strict `<` defends against pool-bricking — see `maxSlashBps`.
+    /// @notice Set the upper clamp bound for the slash severity.
+    /// @dev Owner-only. `10_000` (100%) is legal for the OWN-stake ceiling;
+    ///      the pool-bricking guard lives on `maxDelegatedSlashBps`. Must
+    ///      keep `minSlashBps <= maxSlashBps` and `maxDelegatedSlashBps <=
+    ///      maxSlashBps`.
     function setMaxSlashBps(uint256 v) external onlyOwner {
-        if (v < minSlashBps || v >= 10_000) revert InvalidParameter();
+        if (v < minSlashBps || v > 10_000 || v < maxDelegatedSlashBps) revert InvalidParameter();
         emit ParameterChangeFinalized(PARAM_MAX_SLASH_BPS, maxSlashBps, v);
         maxSlashBps = v;
+    }
+
+    /// @notice Set the per-incident delegated-slash ceiling.
+    /// @dev Owner-only. Strict `< 10_000` is the relocated C-2 pool-bricking
+    ///      guard; also bounded by `maxSlashBps` so the spill term
+    ///      `S - min(S, C)` is never negative-by-config.
+    function setMaxDelegatedSlashBps(uint256 v) external onlyOwner {
+        if (v >= 10_000 || v > maxSlashBps) revert InvalidParameter();
+        emit ParameterChangeFinalized(PARAM_MAX_DELEGATED_SLASH_BPS, maxDelegatedSlashBps, v);
+        maxDelegatedSlashBps = v;
+    }
+
+    /// @notice Set the age-0 weight floor.
+    function setAgeFloorBps(uint256 v) external onlyOwner {
+        if (v == 0 || v > 10_000) revert InvalidParameter();
+        emit ParameterChangeFinalized(PARAM_AGE_FLOOR_BPS, ageFloorBps, v);
+        ageFloorBps = v;
+    }
+
+    /// @notice Set the age at which own-stake weight reaches par.
+    function setMaturationPeriod(uint256 v) external onlyOwner {
+        if (v < 7 days || v > 90 days) revert InvalidParameter();
+        emit ParameterChangeFinalized(PARAM_MATURATION_PERIOD, maturationPeriod, v);
+        maturationPeriod = v;
+    }
+
+    /// @notice Set the delegated-weight cap multiple.
+    function setDelegatedWeightCapX(uint256 v) external onlyOwner {
+        if (v == 0 || v > 20) revert InvalidParameter();
+        emit ParameterChangeFinalized(PARAM_DELEGATED_WEIGHT_CAP_X, delegatedWeightCapX, v);
+        delegatedWeightCapX = v;
     }
 
     // ── Guardian unstake cooldown (relocated verbatim from GuardianRegistry) ──

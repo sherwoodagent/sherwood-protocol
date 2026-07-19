@@ -45,7 +45,11 @@ contract StakedWoodSlashingTest is Test {
                     coolDownPeriod: 7 days,
                     minOwnerStake: 1_000e18,
                     minSlashBps: 1000,
-                    maxSlashBps: 9999
+                    maxSlashBps: 9999,
+                    maxDelegatedSlashBps: 2000,
+                    ageFloorBps: 2500,
+                    maturationPeriod: 30 days,
+                    delegatedWeightCapX: 4
                 }))
         );
         swood = StakedWood(address(new ERC1967Proxy(address(impl), initData)));
@@ -500,7 +504,11 @@ contract StakedWoodSlashingTest is Test {
                     coolDownPeriod: 7 days,
                     minOwnerStake: 1_000e18,
                     minSlashBps: 1000,
-                    maxSlashBps: 9999
+                    maxSlashBps: 9999,
+                    maxDelegatedSlashBps: 2000,
+                    ageFloorBps: 2500,
+                    maturationPeriod: 30 days,
+                    delegatedWeightCapX: 4
                 }))
         );
         s = StakedWood(address(new ERC1967Proxy(address(impl), initData)));
@@ -685,11 +693,16 @@ contract StakedWoodSlashingTest is Test {
         assertEq(s.pendingBurn(), 5_000e18, "bond queued for retry");
     }
 
-    // ── C-2: maxSlashBps < 10_000 prevents pool-bricking on full slash ──
+    // ── C-2: a sub-10_000 pool slash prevents pool-bricking on full slash.
+    //    The param-level guard has RELOCATED: `maxSlashBps` (own-stake
+    //    ceiling) may now be a full 10_000; the strict `< 10_000` cap lives
+    //    on `maxDelegatedSlashBps`, which sizes the pool legs of `_slashOne`
+    //    (spec 2026-07-19). ──
 
-    /// @dev Deploys a fresh sWOOD proxy with `maxSlashBps = 9_999` (the new
-    ///      strict cap) so the regression tests don't depend on the setUp
-    ///      defaults. Returns the proxy fully wired (registry + delegation on).
+    /// @dev Deploys a fresh sWOOD proxy with `maxSlashBps = 9_999` (the
+    ///      highest pool-safe severity) so the regression tests don't depend
+    ///      on the setUp defaults. Returns the proxy fully wired (registry +
+    ///      delegation on).
     function _deploySwoodWithMaxSlash9999() internal returns (StakedWood s) {
         StakedWood impl = new StakedWood();
         bytes memory initData = abi.encodeCall(
@@ -702,7 +715,11 @@ contract StakedWoodSlashingTest is Test {
                     coolDownPeriod: 7 days,
                     minOwnerStake: 1_000e18,
                     minSlashBps: 1000,
-                    maxSlashBps: 9999
+                    maxSlashBps: 9999,
+                    maxDelegatedSlashBps: 2000,
+                    ageFloorBps: 2500,
+                    maturationPeriod: 30 days,
+                    delegatedWeightCapX: 4
                 }))
         );
         s = StakedWood(address(new ERC1967Proxy(address(impl), initData)));
@@ -800,19 +817,53 @@ contract StakedWoodSlashingTest is Test {
         s.requestUnstakeDelegation(bob);
     }
 
-    /// @notice C-2: `setMaxSlashBps(10_000)` must revert with
-    ///         `InvalidParameter` under the new strict cap (was accepted
-    ///         previously when the check was `v > 10_000`).
-    function test_C2_setMaxSlashBps_reverts_at10000() public {
+    /// @notice C-2 (relocated): `setMaxSlashBps(10_000)` is now ACCEPTED —
+    ///         the own-stake ceiling has no share math to brick. The strict
+    ///         `< 10_000` guard moved to `setMaxDelegatedSlashBps`.
+    function test_C2_setMaxSlashBps_accepts_at10000() public {
         StakedWood s = _deploySwoodWithMaxSlash9999();
         vm.prank(owner);
-        vm.expectRevert(StakedWood.InvalidParameter.selector);
         s.setMaxSlashBps(10_000);
+        assertEq(s.maxSlashBps(), 10_000, "full own-stake ceiling accepted");
+
+        // The relocated guard: the delegated (pool) ceiling still rejects
+        // 10_000 — a 100% pool slash would zero `poolTokens` and brick
+        // `delegateStake` in `Math.mulDiv`.
+        vm.prank(owner);
+        vm.expectRevert(StakedWood.InvalidParameter.selector);
+        s.setMaxDelegatedSlashBps(10_000);
     }
 
-    /// @notice C-2: `initialize` with `maxSlashBps = 10_000` must revert with
-    ///         `InvalidParameter` under the new strict cap.
-    function test_C2_initialize_reverts_maxSlashAt10000() public {
+    /// @notice C-2 (relocated): `initialize` with `maxSlashBps = 10_000` now
+    ///         SUCCEEDS — the pool-bricking guard lives on
+    ///         `maxDelegatedSlashBps` instead.
+    function test_C2_initialize_accepts_maxSlashAt10000() public {
+        StakedWood impl = new StakedWood();
+        bytes memory initData = abi.encodeCall(
+            StakedWood.initialize,
+            (StakedWood.InitParams({
+                    owner: owner,
+                    wood: address(wood),
+                    factory: factory,
+                    minGuardianStake: 10_000e18,
+                    coolDownPeriod: 7 days,
+                    minOwnerStake: 1_000e18,
+                    minSlashBps: 1000,
+                    maxSlashBps: 10_000,
+                    maxDelegatedSlashBps: 2000,
+                    ageFloorBps: 2500,
+                    maturationPeriod: 30 days,
+                    delegatedWeightCapX: 4
+                }))
+        );
+        StakedWood s = StakedWood(address(new ERC1967Proxy(address(impl), initData)));
+        assertEq(s.maxSlashBps(), 10_000, "full own-stake ceiling accepted at init");
+    }
+
+    /// @notice C-2 (relocated): `initialize` with `maxDelegatedSlashBps =
+    ///         10_000` must revert with `InvalidParameter` — the strict cap
+    ///         now guards the pool legs.
+    function test_C2_initialize_reverts_delegatedCapAt10000() public {
         StakedWood impl = new StakedWood();
         bytes memory bad = abi.encodeCall(
             StakedWood.initialize,
@@ -824,7 +875,11 @@ contract StakedWoodSlashingTest is Test {
                     coolDownPeriod: 7 days,
                     minOwnerStake: 1_000e18,
                     minSlashBps: 1000,
-                    maxSlashBps: 10_000
+                    maxSlashBps: 10_000,
+                    maxDelegatedSlashBps: 10_000,
+                    ageFloorBps: 2500,
+                    maturationPeriod: 30 days,
+                    delegatedWeightCapX: 4
                 }))
         );
         vm.expectRevert(StakedWood.InvalidParameter.selector);

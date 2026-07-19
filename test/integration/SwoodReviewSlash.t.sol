@@ -192,7 +192,11 @@ contract SwoodReviewSlashTest is Test {
                     coolDownPeriod: 7 days,
                     minOwnerStake: MIN_OWNER_STAKE,
                     minSlashBps: 1000,
-                    maxSlashBps: 9999
+                    maxSlashBps: 9999,
+                    maxDelegatedSlashBps: 2000,
+                    ageFloorBps: 2500,
+                    maturationPeriod: 30 days,
+                    delegatedWeightCapX: 4
                 }))
         );
         swood = StakedWood(address(new ERC1967Proxy(address(swoodImpl), swoodInit)));
