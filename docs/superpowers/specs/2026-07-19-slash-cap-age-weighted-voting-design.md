@@ -1,13 +1,13 @@
-# Delegated-Slash Cap, First-Loss Spill, and Age-Weighted Voting
+# Delegated-Slash Cap, First-Loss Spill, Age-Weighted Voting, and Deterministic Slash Severity
 
 **Date:** 2026-07-19
 **Status:** Approved (design), pending implementation plan
-**Contracts:** `StakedWood.sol` (all changes); `StakedWoodDelegation.sol` untouched
-**Related:** issue #4 (deterministic slash severity — deferred V2)
+**Contracts:** `StakedWood.sol`, `GuardianRegistry.sol` (Part D); `StakedWoodDelegation.sol` untouched
+**Related:** issue #4 (deterministic slash severity — **implemented here as Part D**, decisiveness variant)
 
 ## 1. Motivation
 
-Two problems, one weight formula:
+Three problems in the staking/slashing surface:
 
 1. **Delegator over-exposure.** Delegators are slashed at the same blocker-voted
    severity as their guardian — up to `maxSlashBps` (deployed 9_999 = 99.99%).
@@ -26,6 +26,15 @@ Two problems, one weight formula:
    we need to fix this. Original issue framing: "lock period is 7 days for
    everyone, but make voting weight increase based on current lock time."
 
+3. **Adversarially-voted severity.** Slash severity is the stake-weighted
+   median of the BLOCKERS' proposed `slashBps` — the winning side of the
+   dispute picks the losers' penalty per-incident. The survey found no
+   precedent: severity elsewhere is fixed constants (Cosmos, Chainlink),
+   deterministic formulas (Polkadot `min((3x/n)², 1)`), or capped-plus-vetoed
+   middleware choice (Symbiotic). A whale blocker can dominate the median and
+   impose near-max severity on rivals. Part D replaces the median with a
+   deterministic function of block-side decisiveness.
+
 A naive delegated-slash cap alone opens a sybil hole (Livepeer LIP-10's
 documented rationale): a guardian stakes `minGuardianStake` from wallet A and
 delegates the rest from wallet B, keeping full vote weight while capping most
@@ -37,13 +46,26 @@ guardian's own stake plus a delegated-weight cap keyed to the guardian's
 
 | Parameter | Meaning | Proposed default | Bounds | Setter |
 |---|---|---|---|---|
-| `maxDelegatedSlashBps` (**C**) | Max bps a delegation/unbonding pool can lose per slash event | 2_000 (20%) | `[0, maxSlashBps]` | protocol owner |
+| `maxDelegatedSlashBps` (**C**) | Max bps a delegation/unbonding pool can lose per slash event | 2_000 (20%) | `[0, min(maxSlashBps, 9_999)]` | protocol owner |
 | `ageFloorBps` | Weight fraction of raw stake at age 0 | 2_500 (25%) | `[1, 10_000]` | protocol owner |
 | `maturationPeriod` | Age at which own stake reaches full (par) weight | 30 days | `[7 days, 90 days]` | protocol owner |
 | `delegatedWeightCapX` (**k**) | Max delegated weight as a multiple of aged own weight | 4 | `[1, 20]` | protocol owner |
+| `maxSlashBps` (existing) | Severity ceiling (own stake) | **10_000 (100%)** | `(minSlashBps, 10_000]` — **relaxed from < 10_000** | protocol owner |
+| `SUPERMAJORITY_BPS` | Block decisiveness at which severity hits the ceiling (Part D) | 6_667 (2/3), constant | — | — |
 
-All four are protocol-global and owner-set (the parameter-setter multisig),
-matching the existing `setMinSlashBps`/`setMaxSlashBps` pattern. Vault owners
+**Ceiling relaxation.** The strict `maxSlashBps < 10_000` bound existed solely
+as the C-2 pool-bricking guard (a 100% slash zeroes `poolTokens` while
+`poolShares` stays nonzero → `Math.mulDiv` divide-by-zero bricks
+`delegateStake`). Under this design the pools are only ever slashed through
+`min(S, C)`, so the 1-wei guard **moves to `maxDelegatedSlashBps < 10_000`**
+and the own-stake ceiling may be a full 100%: `stakedAmount` is a plain
+integer (no share math), and a full wipe is the existing deregistration path.
+`initialize` / `setMaxSlashBps` / `setMinSlashBps` bounds change accordingly;
+the C-2 comments move to the `maxDelegatedSlashBps` setter.
+
+All settable parameters are protocol-global and owner-set (the
+parameter-setter multisig), matching the existing
+`setMinSlashBps`/`setMaxSlashBps` pattern. Vault owners
 have no influence: guardian stakes and delegation pools are protocol-global,
 and a vault owner is an adversary in the emergency-settle flow — per-vault
 slash parameters would let the vault under review dictate how much of a
@@ -53,8 +75,8 @@ global pool burns.
 
 Location: `StakedWood._slashOne`.
 
-Let `S = slashBps` (blocker-voted median, clamped to
-`[minSlashBps, maxSlashBps]` — unchanged) and `C = maxDelegatedSlashBps`.
+Let `S = slashBps` (the deterministic severity from Part D, always within
+`[minSlashBps, maxSlashBps]`) and `C = maxDelegatedSlashBps`.
 
 Per approver:
 
@@ -81,7 +103,7 @@ hit); `delegatedSlash` continues to report the combined pool hit.
 
 Properties:
 
-- Genuine delegator worst case per incident: `C` (20%), regardless of voted
+- Genuine delegator worst case per incident: `C` (20%), regardless of
   severity. In line with Cosmos (5%) / EigenLayer-style bounded exposure.
 - Guardian own stake becomes a first-loss bond backing their delegated book
   (Rocket Pool pattern: operator bond absorbs losses before rETH holders).
@@ -170,11 +192,86 @@ getPastVotes(g, ts) = agedOwn(g, ts) + min(getPastDelegatedInbound(g, ts), k × 
   `getPastDelegatedInbound(openedAt)` snapshot as its basis, NOT the k-capped
   weight — the cap limits *voting power*, not the pool's slashable base.
 
-## 6. What is deliberately NOT changing
+## 6. Part D — deterministic slash severity (replaces the blocker-voted median)
 
-- Blocker-voted median severity for the guardian's own stake (10%–99.99%).
-  Deterministic severity (Polkadot power-formula / Cosmos ADR-014 S-curve) is
-  tracked in issue #4 as a V2 redesign.
+### Why the median goes
+
+Blockers currently attach a proposed `slashBps` to their Block vote; the
+registry takes the stake-weighted median over blockers and clamps it
+(`_weightedMedianSlashBps`). The blockers are adversarial parties to the
+review — slashing approvers removes rival guardians and their weight — and a
+whale blocker dominates a stake-weighted median. No surveyed protocol lets
+the winning side of a dispute choose the losers' penalty per-incident.
+
+### Why the input is block-side decisiveness (not approver weight)
+
+Slashing fires **only** when the block side reaches quorum
+(`resolveReview`: `blockStakeWeight ≥ blockQuorumBpsAtOpen × totalAtOpen`) —
+the "offense" is approving a proposal that the system then formally blocked.
+This rules out both Polkadot-style inputs:
+
+- **Severity increasing in approver weight** (Polkadot's `x` = objectively
+  proven offenders) transplants badly: here approvers are offenders only
+  because blockers won, and block quorum is a threshold of TOTAL stake — a
+  30%-quorum block can defeat a 50%-approval proposal, so the formula would
+  slash a majority at maximum severity on a minority's trigger. A
+  blocker-griefing amplifier.
+- **Severity decreasing in approver weight** (ambiguity discount) lets an
+  attacker self-discount: pile approve weight on a draining proposal and
+  either defeat the block quorum (no slash at all) or fail into a milder
+  slash. Rewards larger attacks.
+
+The manipulation-resistant input is how overwhelmingly the system condemned
+the proposal: attackers cannot reduce honest blockers' weight, adding their
+own approve weight does not enter the function, and slashed WOOD is burned
+(not redistributed), so blockers gain no direct profit from inflating it.
+Obvious malice attracts pile-on blocking → high decisiveness → harsh; a
+genuinely contested call barely scrapes quorum → floor.
+
+### Formula
+
+Evaluated in `resolveReview` only when `blocked_` is true; O(1) from fields
+already in the `Review` struct:
+
+```
+bBps      = blockStakeWeight × 10_000 / (totalStakeAtOpen + totalDelegatedAtOpen)
+t         = (bBps − blockQuorumBpsAtOpen) / (SUPERMAJORITY_BPS − blockQuorumBpsAtOpen)   // clamped to [0, 1]
+severity  = minSlashBps + (maxSlashBps − minSlashBps) × t²
+```
+
+- `SUPERMAJORITY_BPS = 6_667` (2/3), a constant — the decisiveness at which
+  severity hits the ceiling.
+- Degenerate guard: if `blockQuorumBpsAtOpen ≥ SUPERMAJORITY_BPS`, `t = 1`
+  (any successful block at such a quorum is already supermajority-condemned).
+- Quadratic in `t`: forgiving just above quorum, steep near supermajority.
+
+Worked examples (quorum 30%, min 10%, max 100%):
+
+| Block weight / total | t | severity |
+|---|---|---|
+| 30% (scraped quorum) | 0 | 10% (floor) |
+| 42% | 0.33 | ~20% |
+| 55% | 0.68 | ~52% |
+| ≥ 66.7% | 1 | 100% (ceiling) |
+
+### Registry changes
+
+- `voteOnProposal` drops the `slashBps` argument (ABI change — acceptable,
+  V1.5 is a fresh pre-mainnet deployment; CLI/app updated in lockstep).
+- `blockerSlashBps` mapping and `_weightedMedianSlashBps` (collection,
+  O(n²) insertion sort, median walk) are deleted; replaced by a pure
+  `_severityBps(Review storage)` helper.
+- `swood.slashGuardians(key, openedAt, approvers, _severityBps(r))` — call
+  shape unchanged.
+
+Severity legitimacy now comes from being fixed BEFORE the offense (formula +
+owner-set clamp band), matching the Cosmos/Polkadot pattern. A future
+S-curve (ADR-014) or a deferral/veto layer (Symbiotic resolver, Polkadot
+27-day unapplied-slash window) can swap in behind `_severityBps` without
+touching the slash plumbing; issue #4 stays open for that follow-up only.
+
+## 7. What is deliberately NOT changing
+
 - 7-day `coolDownPeriod` and the slashable unbonding escrow.
 - Delegation share math, commission, unbonding pools
   (`StakedWoodDelegation.sol` has zero diffs).
@@ -184,27 +281,38 @@ getPastVotes(g, ts) = agedOwn(g, ts) + min(getPastDelegatedInbound(g, ts), k × 
   aggregation machinery and early-whale plutocracy creep. Post-maturation,
   stake is stake.
 
-## 7. Storage & upgrade
+## 8. Storage & upgrade
 
 New storage in `StakedWood` (leaf contract): `maxDelegatedSlashBps`,
 `ageFloorBps`, `maturationPeriod`, `delegatedWeightCapX` — 4 slots from the
 existing `__gap` (12 → 8), with the gap comment updated per convention.
 `Guardian.stakedAt` already exists (uint64, currently write-only).
+`GuardianRegistry`: `blockerSlashBps` mapping deleted (gap re-baselined per
+convention); `voteOnProposal` ABI changes (drops `slashBps`).
 V1.5 is a fresh pre-mainnet deployment; no live-proxy migration concerns.
 
 New errors/events: bounds-violation reuses `InvalidParameter`; each setter
 emits `ParameterChangeFinalized` with a new `PARAM_*` key, matching the
 existing setter pattern.
 
-## 8. Security considerations
+## 9. Security considerations
 
 - **Sybil self-delegation** (Livepeer LIP-10 vector): bounded by spill
   (Part A) + aged-base weight cap (Part C). Residual: a sybil still caps the
   bulk of exposure at C once own stake is wiped; the cost is guardian death
   + delegators (self) stranded through a 7-day slashable escrow at rate C.
-- **Blocker collusion**: unchanged for guardian own stake (issue #4);
-  delegator damage now bounded by C — the mass-delegator-wipeout outcome is
-  removed.
+- **Blocker collusion**: severity is no longer votable (Part D) — a whale
+  blocker can still push a block over quorum, but the resulting severity is
+  the formula's floor-side value unless broad honest weight joins the
+  condemnation. Reaching the 100% ceiling requires ≥ `SUPERMAJORITY_BPS` of
+  total at-open weight voting Block — a supermajority attack, out of scope
+  for slash-parameter defenses. Delegator damage stays bounded by C in all
+  cases.
+- **Blocker pile-on**: severity increasing in block weight means honest
+  guardians joining an obvious-malice block raise the penalty — intended.
+  Blockers gain no direct payoff (slashed WOOD burns; attribution rewards are
+  epoch-level, not slash-proportional), so inflating severity is costly
+  griefing with no revenue.
 - **Flash-stake / snapshot sniping**: fresh stake gets `ageFloorBps` weight;
   full weight requires 30 days of custody with slash exposure.
 - **Quorum bootstrap**: an all-young cohort faces raw-denominator quorum with
@@ -215,7 +323,18 @@ existing setter pattern.
   average rounds toward `now` (against free age); slash math keeps existing
   round-down-in-burn direction.
 
-## 9. Test plan (high level)
+## 10. Test plan (high level)
+
+- Severity formula: at exactly quorum (floor), between quorum and
+  supermajority (quadratic points), at/above supermajority (ceiling = 100%),
+  degenerate `quorum ≥ SUPERMAJORITY_BPS` guard, `minSlashBps == maxSlashBps`
+  collapse.
+- 100%-severity end-to-end: own stake fully wiped (active and
+  unstake-requested branches), pools clamped at C, spill absorbs the rest,
+  pool share math stays live (no divide-by-zero) — the C-2 regression test
+  moves to the `maxDelegatedSlashBps` bound.
+- `voteOnProposal` ABI: Block votes carry no severity; median-era tests
+  deleted/rewritten.
 
 - `_slashOne` matrix: S ≤ C (no cap engage, no spill), S > C with own stake
   covering excess, S > C with own stake partially covering (clamp), fully
@@ -233,7 +352,7 @@ existing setter pattern.
 - Invariant: existing delegation invariants unchanged; new invariant
   `agedOwn ≤ rawOwn` and `delegatedWeight ≤ k × agedOwn`.
 
-## 10. References
+## 11. References
 
 - Cosmos SDK staking state transitions (slashFactor, unbonding slashability):
   https://docs.cosmos.network/v0.46/modules/staking/02_state_transitions.html
