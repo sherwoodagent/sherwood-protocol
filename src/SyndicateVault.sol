@@ -80,6 +80,9 @@ contract SyndicateVault is
     ///         realized (PR #384 review C4).
     uint256 public constant MAX_AGENT_FEE_BPS = FeeConstants.MAX_PERFORMANCE_FEE_BPS;
 
+    /// @notice Cap on the owner-set idle-liquidity floor (50%).
+    uint256 private constant MAX_MIN_BUFFER_BPS = 5_000;
+
     // ==================== STORAGE ====================
 
     /// @notice Agent address => agent config
@@ -142,9 +145,34 @@ contract SyndicateVault is
     ///         governor's `maxPerformanceFeeBps`); set via `setAgentFeeBps`.
     uint256 private _agentFeeBpsPlusOne;
 
-    /// @dev Reserved storage for future upgrades. Grew 34 → 35 when the
-    ///      `_agentFeeSet` bool slot was reclaimed (PR #384 review pass 3).
-    uint256[35] private __gap;
+    /// @notice Idle-liquidity floor (bps of pre-batch float) enforced against
+    ///         governor batches. 0 = off. Packed with `minHoldingPeriod`.
+    uint16 public minBufferBps;
+
+    /// @notice Seconds an account must hold after a deposit before instant
+    ///         exit (anti flash-arb, GLP-cooldown pattern). Lane B is exempt.
+    /// @dev Not yet exposed via ISyndicateVault (no consumer until the task
+    ///      that wires instant-exit logic); kept non-public for now to stay
+    ///      under the EIP-170 runtime size limit. Storage slot/type reserved.
+    uint32 internal minHoldingPeriod;
+
+    /// @notice Net LP asset flow (deposits − instant exits) accumulated while
+    ///         the current proposal is active. Read by the governor at
+    ///         settlement so mid-proposal flows don't corrupt strategy PnL;
+    ///         reset in `onProposalSettled`.
+    int256 private _interimNetFlow;
+
+    /// @notice Timestamp of each account's most recent instant deposit
+    ///         (receiver-side). Gates instant exit via `minHoldingPeriod`.
+    /// @dev Not yet exposed via ISyndicateVault (no consumer until the task
+    ///      that wires instant-exit logic); kept non-public for now to stay
+    ///      under the EIP-170 runtime size limit. Storage slot/type reserved.
+    mapping(address => uint40) internal lastDepositAt;
+
+    /// @dev Reserved storage for future upgrades. Shrunk 35 → 32: one packed
+    ///      slot (minBufferBps + minHoldingPeriod), _interimNetFlow,
+    ///      lastDepositAt (spec 2026-07-19 instant-withdrawal-liquidity).
+    uint256[32] private __gap;
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -519,6 +547,13 @@ contract SyndicateVault is
         // distinct from the unset sentinel (0).
         _agentFeeBpsPlusOne = bps + 1;
         emit AgentFeeUpdated(bps);
+    }
+
+    /// @inheritdoc ISyndicateVault
+    function setMinBufferBps(uint16 bps) external onlyOwner {
+        if (bps > MAX_MIN_BUFFER_BPS) revert BufferTooHigh();
+        minBufferBps = bps;
+        emit MinBufferUpdated(bps);
     }
 
     // ==================== PAGINATION ====================

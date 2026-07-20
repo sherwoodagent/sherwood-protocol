@@ -46,6 +46,8 @@ interface ISyndicateVault {
     error NotActiveStrategy();
     /// @notice `setAgentFeeBps` was called with `bps > MAX_AGENT_FEE_BPS`.
     error AgentFeeTooHigh();
+    /// @notice `setMinBufferBps` was called with `bps > 5_000` (50%).
+    error BufferTooHigh();
 
     // ── Init Params ──
     struct InitParams {
@@ -99,6 +101,12 @@ interface ISyndicateVault {
     /// @notice Set the agent performance fee (owner only). Capped at
     ///         `MAX_AGENT_FEE_BPS` (15%). Reverts with `AgentFeeTooHigh` above.
     function setAgentFeeBps(uint256 bps) external;
+    /// @notice Idle-liquidity floor in basis points of the pre-batch float.
+    ///         `executeGovernorBatch` reverts if a batch would leave less than
+    ///         this fraction (plus the queue reserve) in the vault. 0 = off.
+    function minBufferBps() external view returns (uint16);
+    /// @notice Set the idle-liquidity floor (owner only, max 5_000 = 50%).
+    function setMinBufferBps(uint16 bps) external;
     /// @notice Convenience view that resolves the active strategy through the
     ///         governor (`getProposal(activePid).strategy`). Returns
     ///         `address(0)` when no proposal is active or when the active
@@ -137,6 +145,8 @@ interface ISyndicateVault {
     event OpenDepositsUpdated(bool open);
     /// @notice Emitted when the vault owner updates the agent performance fee.
     event AgentFeeUpdated(uint256 bps);
+    /// @notice Emitted when the vault owner updates the idle-liquidity floor.
+    event MinBufferUpdated(uint16 bps);
     /// @notice Emitted whenever the governor drives a strategy batch into the
     ///         vault via `executeGovernorBatch`. `callCount` is the number of
     ///         sub-calls fanned out by `BatchExecutorLib.executeBatch`.
