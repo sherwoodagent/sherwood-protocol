@@ -260,4 +260,58 @@ contract VaultInstantLiquidityTest is Test {
         vm.expectRevert(BaseStrategy.NotVault.selector);
         s.withdrawTo(1);
     }
+
+    // ── Task 4: instant exit spanning float + strategy pull ──
+
+    function _enterAndLock(uint256 depositAmt, uint256 deployAmt, uint256 liveVal) internal {
+        vm.prank(alice);
+        vault.deposit(depositAmt, alice);
+        vm.prank(MOCK_GOVERNOR);
+        vault.executeGovernorBatch(_deployBatch(address(strat), deployAmt));
+        strat.setLiquidity(deployAmt);
+        _setLocked(true);
+        router.set(liveVal, true); // Lane A on
+    }
+
+    function test_maxWithdraw_includesStrategyLiquidity() public {
+        _enterAndLock(1_000e6, 900e6, 900e6); // float 100e6, strategy 900e6
+        // Alice owns 100% of shares → maxWithdraw = min(1_000e6, 100e6 + 900e6).
+        assertApproxEqAbs(vault.maxWithdraw(alice), 1_000e6, 1, "capacity = float + strategy liquidity");
+    }
+
+    function test_withdraw_pullsShortfallFromStrategy() public {
+        _enterAndLock(1_000e6, 900e6, 900e6);
+        uint256 before = usdc.balanceOf(alice);
+        vm.prank(alice);
+        vault.withdraw(500e6, alice, alice); // float only covers 100e6
+        assertEq(usdc.balanceOf(alice) - before, 500e6, "full amount paid");
+        assertEq(usdc.balanceOf(address(strat)), 500e6, "400e6 pulled from strategy");
+    }
+
+    function test_withdraw_floatOnly_noStrategyCall() public {
+        _enterAndLock(1_000e6, 900e6, 900e6);
+        vm.prank(alice);
+        vault.withdraw(50e6, alice, alice); // fits in the 100e6 float
+        assertEq(usdc.balanceOf(address(strat)), 900e6, "strategy untouched");
+    }
+
+    function test_withdraw_revertsOnUnderDelivery() public {
+        _enterAndLock(1_000e6, 900e6, 900e6);
+        strat.setLie(true);
+        vm.prank(alice);
+        vm.expectRevert(ISyndicateVault.UnwindShortfall.selector);
+        vault.withdraw(500e6, alice, alice);
+    }
+
+    function test_maxWithdraw_zeroStrategyCapacity_whenLaneAOff() public {
+        _enterAndLock(1_000e6, 900e6, 900e6);
+        router.set(0, false); // Lane A off → no instant exit at all (float-only NAV)
+        assertEq(vault.maxWithdraw(alice), 0, "no pricing, no instant exit");
+    }
+
+    function test_maxWithdraw_floatOnly_whenStrategyHasNoLiquidity() public {
+        _enterAndLock(1_000e6, 900e6, 900e6);
+        strat.setLiquidity(0); // default-strategy behavior
+        assertEq(vault.maxWithdraw(alice), 100e6, "capped at float");
+    }
 }

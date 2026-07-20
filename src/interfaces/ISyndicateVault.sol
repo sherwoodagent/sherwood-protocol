@@ -51,6 +51,9 @@ interface ISyndicateVault {
     /// @notice A governor batch left the vault below the idle floor
     ///         (`reservedQueueAssets + minBufferBps%` of the pre-batch float).
     error BufferBreached();
+    /// @notice The active strategy's `withdrawTo` delivered fewer assets than
+    ///         requested (balance-diff verified vault-side).
+    error UnwindShortfall();
 
     // ── Init Params ──
     struct InitParams {

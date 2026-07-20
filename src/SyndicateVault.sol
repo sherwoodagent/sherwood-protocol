@@ -7,6 +7,7 @@ import {FeeConstants} from "./FeeConstants.sol";
 import {ISyndicateFactory} from "./interfaces/ISyndicateFactory.sol";
 import {IVaultWithdrawalQueue} from "./interfaces/IVaultWithdrawalQueue.sol";
 import {IPriceRouter} from "./interfaces/IPriceRouter.sol";
+import {IStrategy} from "./interfaces/IStrategy.sol";
 import {BatchExecutorLib} from "./BatchExecutorLib.sol";
 import {SyndicateVaultAdminLib} from "./SyndicateVaultAdminLib.sol";
 import {ERC4626Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/ERC4626Upgradeable.sol";
@@ -635,6 +636,39 @@ contract SyndicateVault is
         return float > reserve ? float - reserve : 0;
     }
 
+    /// @dev On-demand liquidity the active strategy can return mid-lifecycle,
+    ///      counted toward instant-exit capacity ONLY while Lane A is available
+    ///      (no pricing ⇒ no instant exit, regardless of serviceability).
+    ///      try/catch + fail-to-0 so a strategy without the interface can never
+    ///      brick `maxWithdraw` / `maxRedeem`.
+    function _strategyLiquidity() private view returns (uint256) {
+        (, bool laneA) = _liveNAV();
+        if (!laneA) return 0;
+        address strat = _activeStrategy();
+        if (strat == address(0)) return 0;
+        try IStrategy(strat).availableLiquidity() returns (uint256 l) {
+            return l;
+        } catch {
+            return 0;
+        }
+    }
+
+    /// @dev Pull `shortfall` of the vault asset from the active strategy for an
+    ///      in-flight instant exit. All-or-revert: delivery is verified by
+    ///      balance-diff so a lying `availableLiquidity` cannot under-fund the
+    ///      exit. Reverts `QueueReserveBreached` when there is no pullable
+    ///      strategy (preserves the pre-existing error surface for float-only
+    ///      exits).
+    function _pullFromStrategy(uint256 shortfall) private {
+        (, bool laneA) = _liveNAV();
+        address strat = _activeStrategy();
+        if (strat == address(0) || !laneA) revert QueueReserveBreached();
+        IERC20 asset_ = IERC20(asset());
+        uint256 balBefore = asset_.balanceOf(address(this));
+        IStrategy(strat).withdrawTo(shortfall);
+        if (asset_.balanceOf(address(this)) < balBefore + shortfall) revert UnwindShortfall();
+    }
+
     /// @dev Closed-deposit gate: reverts unless deposits are open OR `who` is
     ///      whitelisted. Shared by `_deposit` / `requestDeposit` / `strategyMint`.
     function _requireApprovedDepositor(address who) private view {
@@ -727,11 +761,21 @@ contract SyndicateVault is
         internal
         override
         whenNotPaused
+        nonReentrant
     {
         if (caller != _withdrawalQueue) {
             uint256 reserve = reservedQueueAssets();
             uint256 float = IERC20(asset()).balanceOf(address(this));
-            if (assets + reserve > float) revert QueueReserveBreached();
+            // Shortfall beyond idle float is pulled from the active strategy in
+            // the same tx (Yearn default_queue pattern, queue length 1). The
+            // pull happens BEFORE the burn/transfer; value moves position →
+            // float, so live NAV (and thus this exit's share pricing) is
+            // unchanged. `nonReentrant` added alongside the new external call —
+            // the prior "no guard needed" rationale (no external calls on this
+            // path) no longer holds.
+            if (assets + reserve > float) {
+                _pullFromStrategy(assets + reserve - float);
+            }
         }
         super._withdraw(caller, receiver, _owner, assets, shares);
     }
@@ -746,7 +790,7 @@ contract SyndicateVault is
         if (owner_ == _withdrawalQueue) return super.maxWithdraw(owner_);
         if (_laneBOnly(owner_)) return 0;
         uint256 userMax = super.maxWithdraw(owner_);
-        uint256 available = _availableFloat();
+        uint256 available = _availableFloat() + _strategyLiquidity();
         return userMax > available ? available : userMax;
     }
 
@@ -762,7 +806,7 @@ contract SyndicateVault is
         uint256 ts = totalSupply();
         if (ts == 0 || reserveShares >= ts) return 0;
         uint256 availableShares = ts - reserveShares;
-        uint256 backingAssets = _availableFloat();
+        uint256 backingAssets = _availableFloat() + _strategyLiquidity();
         // Sherlock run #3 #9 (off-report): no `backingAssets == 0` early return —
         // skip the floatShares cap entirely when the user's full balance fits
         // within `backingAssets` (covers the dust case where
