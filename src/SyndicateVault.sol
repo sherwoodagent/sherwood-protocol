@@ -7,7 +7,9 @@ import {FeeConstants} from "./FeeConstants.sol";
 import {ISyndicateFactory} from "./interfaces/ISyndicateFactory.sol";
 import {IVaultWithdrawalQueue} from "./interfaces/IVaultWithdrawalQueue.sol";
 import {IPriceRouter} from "./interfaces/IPriceRouter.sol";
+import {IStrategy} from "./interfaces/IStrategy.sol";
 import {BatchExecutorLib} from "./BatchExecutorLib.sol";
+import {SyndicateVaultAdminLib} from "./SyndicateVaultAdminLib.sol";
 import {ERC4626Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/ERC4626Upgradeable.sol";
 import {
     ERC20VotesUpgradeable
@@ -80,6 +82,9 @@ contract SyndicateVault is
     ///         realized (PR #384 review C4).
     uint256 public constant MAX_AGENT_FEE_BPS = FeeConstants.MAX_PERFORMANCE_FEE_BPS;
 
+    /// @notice Cap on the owner-set idle-liquidity floor (50%).
+    uint256 private constant MAX_MIN_BUFFER_BPS = 5_000;
+
     // ==================== STORAGE ====================
 
     /// @notice Agent address => agent config
@@ -142,9 +147,34 @@ contract SyndicateVault is
     ///         governor's `maxPerformanceFeeBps`); set via `setAgentFeeBps`.
     uint256 private _agentFeeBpsPlusOne;
 
-    /// @dev Reserved storage for future upgrades. Grew 34 → 35 when the
-    ///      `_agentFeeSet` bool slot was reclaimed (PR #384 review pass 3).
-    uint256[35] private __gap;
+    /// @notice Idle-liquidity floor (bps of pre-batch float) enforced against
+    ///         governor batches. 0 = off. Packed with `minHoldingPeriod`.
+    uint16 public minBufferBps;
+
+    /// @notice Seconds an account must hold after a deposit before instant
+    ///         exit (anti flash-arb, GLP-cooldown pattern). Lane B is exempt.
+    /// @dev Not yet exposed via ISyndicateVault (no consumer until the task
+    ///      that wires instant-exit logic); kept non-public for now to stay
+    ///      under the EIP-170 runtime size limit. Storage slot/type reserved.
+    uint32 internal minHoldingPeriod;
+
+    /// @notice Net LP asset flow (deposits − instant exits) accumulated while
+    ///         the current proposal is active. Read by the governor at
+    ///         settlement so mid-proposal flows don't corrupt strategy PnL;
+    ///         reset in `onProposalSettled`.
+    int256 private _interimNetFlow;
+
+    /// @notice Timestamp of each account's most recent instant deposit
+    ///         (receiver-side). Gates instant exit via `minHoldingPeriod`.
+    /// @dev Not yet exposed via ISyndicateVault (no consumer until the task
+    ///      that wires instant-exit logic); kept non-public for now to stay
+    ///      under the EIP-170 runtime size limit. Storage slot/type reserved.
+    mapping(address => uint40) internal lastDepositAt;
+
+    /// @dev Reserved storage for future upgrades. Shrunk 35 → 32: one packed
+    ///      slot (minBufferBps + minHoldingPeriod), _interimNetFlow,
+    ///      lastDepositAt (spec 2026-07-19 instant-withdrawal-liquidity).
+    uint256[32] private __gap;
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -176,25 +206,20 @@ contract SyndicateVault is
     // ==================== DEPOSITOR WHITELIST ====================
 
     /// @inheritdoc ISyndicateVault
+    /// @dev Body delegatecalled to `SyndicateVaultAdminLib` for EIP-170 headroom;
+    ///      `onlyOwner` stays on the wrapper so access control is unchanged.
     function approveDepositor(address depositor) external onlyOwner {
-        if (depositor == address(0)) revert InvalidDepositor();
-        if (!_approvedDepositors.add(depositor)) revert DepositorAlreadyApproved();
-        emit DepositorApproved(depositor);
+        SyndicateVaultAdminLib.approveDepositor(_approvedDepositors, depositor);
     }
 
     /// @inheritdoc ISyndicateVault
     function removeDepositor(address depositor) external onlyOwner {
-        if (!_approvedDepositors.remove(depositor)) revert DepositorNotApproved();
-        emit DepositorRemoved(depositor);
+        SyndicateVaultAdminLib.removeDepositor(_approvedDepositors, depositor);
     }
 
     /// @inheritdoc ISyndicateVault
     function approveDepositors(address[] calldata depositors) external onlyOwner {
-        for (uint256 i = 0; i < depositors.length; i++) {
-            if (depositors[i] == address(0)) revert InvalidDepositor();
-            _approvedDepositors.add(depositors[i]);
-            emit DepositorApproved(depositors[i]);
-        }
+        SyndicateVaultAdminLib.approveDepositors(_approvedDepositors, depositors);
     }
 
     /// @inheritdoc ISyndicateVault
@@ -220,7 +245,7 @@ contract SyndicateVault is
     ///      count getters were dropped to free EIP-170 budget. Iterate via this
     ///      paginated path; `limit` is hard-clamped to `MAX_PAGE_LIMIT`.
     function approvedDepositorsPaginated(uint256 offset, uint256 limit) external view returns (address[] memory) {
-        return _pageAddresses(_approvedDepositors, offset, limit);
+        return SyndicateVaultAdminLib.pageAddresses(_approvedDepositors, offset, limit);
     }
 
     /// @inheritdoc ISyndicateVault
@@ -251,7 +276,7 @@ contract SyndicateVault is
     ///      iterate: start at `offset = 0`, advance by `limit` each call
     ///      until the returned array is shorter than `limit`.
     function agentsPaginated(uint256 offset, uint256 limit) external view returns (address[] memory) {
-        return _pageAddresses(_agentSet, offset, limit);
+        return SyndicateVaultAdminLib.pageAddresses(_agentSet, offset, limit);
     }
 
     /// @inheritdoc ISyndicateVault
@@ -280,23 +305,7 @@ contract SyndicateVault is
     ///      the owner when an identity moves. See CLAUDE.md "Agent Identity
     ///      (ERC-8004)" for the full model.
     function registerAgent(uint256 agentId, address agentAddress) external onlyOwner {
-        if (agentAddress == address(0)) revert ZeroAddress();
-        if (_agents[agentAddress].active) revert AgentAlreadyRegistered();
-        // PR #324 review R4: bound `_agentSet` so `rotateOwnership`'s
-        // deactivation loop (Sherlock #38) can't OOG. `removeAgent` frees a slot.
-        if (_agentSet.length() >= MAX_AGENTS_PER_VAULT) revert AgentCapExceeded();
-
-        // Verify ERC-8004 identity (skipped on chains without agent registry)
-        if (address(_agentRegistry) != address(0)) {
-            address nftOwner = _agentRegistry.ownerOf(agentId);
-            if (nftOwner != agentAddress && nftOwner != owner()) revert NotAgentOwner();
-        }
-
-        _agents[agentAddress] = AgentConfig({agentId: agentId, agentAddress: agentAddress, active: true});
-
-        _agentSet.add(agentAddress);
-
-        emit AgentRegistered(agentId, agentAddress);
+        SyndicateVaultAdminLib.registerAgent(_agents, _agentSet, agentId, agentAddress, _agentRegistry, owner());
     }
 
     /// @inheritdoc ISyndicateVault
@@ -307,12 +316,7 @@ contract SyndicateVault is
     ///      `isAgent(addr)` returns false, and a subsequent
     ///      `registerAgent(newId, addr)` writes a fresh entry.
     function removeAgent(address agentAddress) external onlyOwner {
-        if (!_agents[agentAddress].active) revert AgentNotActive();
-
-        delete _agents[agentAddress];
-        _agentSet.remove(agentAddress);
-
-        emit AgentRemoved(agentAddress);
+        SyndicateVaultAdminLib.removeAgent(_agents, _agentSet, agentAddress);
     }
 
     /// @inheritdoc ISyndicateVault
@@ -344,14 +348,7 @@ contract SyndicateVault is
     function rotateOwnership(address newOwner) external {
         if (msg.sender != _factory) revert NotFactory();
         if (newOwner == address(0)) revert ZeroAddress();
-        address[] memory snap = _agentSet.values();
-        uint256 n = snap.length;
-        for (uint256 i; i < n; ++i) {
-            address a = snap[i];
-            delete _agents[a];
-            _agentSet.remove(a);
-            emit AgentRemoved(a);
-        }
+        SyndicateVaultAdminLib.drainAgents(_agents, _agentSet);
         _transferOwnership(newOwner);
     }
 
@@ -426,6 +423,7 @@ contract SyndicateVault is
         whenNotPaused
     {
         if (_executorImpl.codehash != _expectedExecutorCodehash) revert ExecutorCodehashMismatch();
+        uint256 balanceBefore = IERC20(asset()).balanceOf(address(this));
         (bool success, bytes memory returnData) =
             _executorImpl.delegatecall(abi.encodeCall(BatchExecutorLib.executeBatch, (calls)));
         if (!success) {
@@ -441,7 +439,12 @@ contract SyndicateVault is
         // float reserved for already-settled, unclaimed redeem claims, so a
         // later proposal cannot strand them. Settle batches return float and
         // pass trivially; an execute batch that over-deploys reverts here.
-        if (IERC20(asset()).balanceOf(address(this)) < reservedQueueAssets()) revert QueueReserveBreached();
+        uint256 balanceAfter = IERC20(asset()).balanceOf(address(this));
+        uint256 reserve = reservedQueueAssets();
+        if (balanceAfter < reserve) revert QueueReserveBreached();
+        // Idle-liquidity floor: a batch may deploy at most (1 − minBufferBps)
+        // of the pre-batch float. Inflow (settle) batches pass trivially.
+        if (balanceAfter < reserve + (balanceBefore * minBufferBps) / 10_000) revert BufferBreached();
     }
 
     /// @inheritdoc ISyndicateVault
@@ -521,25 +524,11 @@ contract SyndicateVault is
         emit AgentFeeUpdated(bps);
     }
 
-    // ==================== PAGINATION ====================
-
-    /// @dev V-M3: shared pager for `EnumerableSet.AddressSet`. Returns a
-    ///      slice `[offset, offset + min(limit, MAX_PAGE_LIMIT))` clipped to
-    ///      the set's length. Returns an empty array when `offset >= length`.
-    function _pageAddresses(EnumerableSet.AddressSet storage set, uint256 offset, uint256 limit)
-        private
-        view
-        returns (address[] memory out)
-    {
-        uint256 total = set.length();
-        if (offset >= total) return new address[](0);
-        if (limit > MAX_PAGE_LIMIT) limit = MAX_PAGE_LIMIT;
-        uint256 end = offset + limit;
-        if (end > total) end = total;
-        out = new address[](end - offset);
-        for (uint256 i = offset; i < end; i++) {
-            out[i - offset] = set.at(i);
-        }
+    /// @inheritdoc ISyndicateVault
+    function setMinBufferBps(uint16 bps) external onlyOwner {
+        if (bps > MAX_MIN_BUFFER_BPS) revert BufferTooHigh();
+        minBufferBps = bps;
+        emit MinBufferUpdated(bps);
     }
 
     // ==================== OVERRIDES ====================
@@ -647,6 +636,48 @@ contract SyndicateVault is
         return float > reserve ? float - reserve : 0;
     }
 
+    /// @dev On-demand liquidity the active strategy can return mid-lifecycle,
+    ///      counted toward instant-exit capacity ONLY while Lane A is available
+    ///      (no pricing ⇒ no instant exit, regardless of serviceability).
+    ///      try/catch + fail-to-0 so a strategy without the interface can never
+    ///      brick `maxWithdraw` / `maxRedeem`.
+    function _strategyLiquidity() private view returns (uint256) {
+        (, bool laneA) = _liveNAV();
+        if (!laneA) return 0;
+        address strat = _activeStrategy();
+        // `strat == 0` OR a codeless strat ⇒ 0. The code-length guard is load-
+        // bearing: a high-level call to a codeless address reverts on Solidity's
+        // extcodesize check *before* try/catch can trap it, which would brick
+        // `maxWithdraw`/`maxRedeem`. try/catch still guards a coded strat that
+        // reverts or lacks the selector.
+        if (strat == address(0) || strat.code.length == 0) return 0;
+        try IStrategy(strat).availableLiquidity() returns (uint256 l) {
+            return l;
+        } catch {
+            return 0;
+        }
+    }
+
+    /// @dev Pull `shortfall` of the vault asset from the active strategy for an
+    ///      in-flight instant exit. All-or-revert: delivery is verified by
+    ///      balance-diff so a lying `availableLiquidity` cannot under-fund the
+    ///      exit. Reverts `QueueReserveBreached` when there is no pullable
+    ///      strategy (preserves the pre-existing error surface for float-only
+    ///      exits).
+    function _pullFromStrategy(uint256 shortfall) private {
+        (, bool laneA) = _liveNAV();
+        address strat = _activeStrategy();
+        // Defense-in-depth: also reject a codeless strat (mirrors
+        // `_strategyLiquidity`). Unreachable in the honest path — `maxWithdraw`
+        // caps `assets` at float when strategy liquidity is 0 — but removes the
+        // reliance on that upstream invariant for a fund-moving call.
+        if (strat == address(0) || strat.code.length == 0 || !laneA) revert QueueReserveBreached();
+        IERC20 asset_ = IERC20(asset());
+        uint256 balBefore = asset_.balanceOf(address(this));
+        IStrategy(strat).withdrawTo(shortfall);
+        if (asset_.balanceOf(address(this)) < balBefore + shortfall) revert UnwindShortfall();
+    }
+
     /// @dev Closed-deposit gate: reverts unless deposits are open OR `who` is
     ///      whitelisted. Shared by `_deposit` / `requestDeposit` / `strategyMint`.
     function _requireApprovedDepositor(address who) private view {
@@ -726,6 +757,9 @@ contract SyndicateVault is
         // settles — closes the deposit-low / exit-high intra-proposal MEV.
         if (laneA) {
             _laneALockPid[receiver] = _activePid();
+            // Mid-proposal principal in — excluded from settlement PnL so
+            // performance fees are never charged on depositor principal.
+            _interimNetFlow += int256(assets);
         }
     }
 
@@ -739,13 +773,37 @@ contract SyndicateVault is
         internal
         override
         whenNotPaused
+        nonReentrant
     {
         if (caller != _withdrawalQueue) {
             uint256 reserve = reservedQueueAssets();
             uint256 float = IERC20(asset()).balanceOf(address(this));
-            if (assets + reserve > float) revert QueueReserveBreached();
+            // Shortfall beyond idle float is pulled from the active strategy in
+            // the same tx (Yearn default_queue pattern, queue length 1). The
+            // pull happens BEFORE the burn/transfer; value moves position →
+            // float, so live NAV (and thus this exit's share pricing) is
+            // unchanged. `nonReentrant` added alongside the new external call —
+            // the prior "no guard needed" rationale (no external calls on this
+            // path) no longer holds.
+            if (assets + reserve > float) {
+                _pullFromStrategy(assets + reserve - float);
+            }
         }
         super._withdraw(caller, receiver, _owner, assets, shares);
+        // Mid-proposal principal out — excluded from settlement PnL. Queue
+        // settlements post-date the PnL read, so only live instant exits count.
+        //
+        // Fee incidence (spec Q3, explicit decision — PR #6 review note): the
+        // departing LP's share price includes their pro-rata slice of any
+        // UNREALIZED strategy gain, taken fee-free; the settlement fee is
+        // later computed on the FULL realized PnL and borne by remaining
+        // holders. This small leak is ACCEPTED for V1 — exact pro-rata fee
+        // skimming on instant exits would cost EIP-4626 preview-exactness and
+        // EIP-170 bytecode budget. Partially offset when `instantExitFeeBps`
+        // lands (deferred, spec §6).
+        if (caller != _withdrawalQueue && redemptionsLocked()) {
+            _interimNetFlow -= int256(assets);
+        }
     }
 
     /// @dev Cap visible to integrators so they don't propose withdrawals that
@@ -758,7 +816,7 @@ contract SyndicateVault is
         if (owner_ == _withdrawalQueue) return super.maxWithdraw(owner_);
         if (_laneBOnly(owner_)) return 0;
         uint256 userMax = super.maxWithdraw(owner_);
-        uint256 available = _availableFloat();
+        uint256 available = _availableFloat() + _strategyLiquidity();
         return userMax > available ? available : userMax;
     }
 
@@ -774,7 +832,7 @@ contract SyndicateVault is
         uint256 ts = totalSupply();
         if (ts == 0 || reserveShares >= ts) return 0;
         uint256 availableShares = ts - reserveShares;
-        uint256 backingAssets = _availableFloat();
+        uint256 backingAssets = _availableFloat() + _strategyLiquidity();
         // Sherlock run #3 #9 (off-report): no `backingAssets == 0` early return —
         // skip the floatShares cap entirely when the user's full balance fits
         // within `backingAssets` (covers the dust case where
@@ -943,11 +1001,19 @@ contract SyndicateVault is
     ///         price. `num/den` carry the ERC-4626 virtual offsets so the queue
     ///         reproduces the vault's conversion rounding exactly.
     function onProposalSettled(uint256 proposalId) external onlyGovernor {
+        // Reset the interim-flow accumulator for the next proposal. MUST precede
+        // the no-queue early-return below so a queueless vault still resets.
+        delete _interimNetFlow;
         address q = _withdrawalQueue;
         if (q == address(0)) return;
         uint256 num = totalAssets() + 1;
         uint256 den = totalSupply() + 10 ** _decimalsOffset();
         IVaultWithdrawalQueue(q).stampSettlement(proposalId, num, den);
+    }
+
+    /// @inheritdoc ISyndicateVault
+    function interimNetFlow() external view returns (int256) {
+        return _interimNetFlow;
     }
 
     // ==================== RESCUE ====================

@@ -56,6 +56,15 @@ contract MockMToken is ERC20 {
         return borrowBalance;
     }
 
+    /// @notice Underlying held by the market (Compound `getCash`).
+    function getCash() external view returns (uint256) {
+        return IERC20(underlyingAsset).balanceOf(address(this));
+    }
+
+    function exchangeRateStored() external view returns (uint256) {
+        return exchangeRateStored_;
+    }
+
     function getAccountSnapshot(address account)
         external
         view

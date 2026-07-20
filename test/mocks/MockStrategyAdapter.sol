@@ -59,4 +59,10 @@ contract MockStrategyAdapter is IStrategy {
         require(!revertOnSelfManagesFees, "selfManagesFees: revert");
         return selfFee;
     }
+
+    function availableLiquidity() external pure returns (uint256) {
+        return 0;
+    }
+
+    function withdrawTo(uint256) external pure {}
 }
