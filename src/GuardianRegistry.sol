@@ -87,8 +87,8 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     /// @dev Per-(key, voter) snapshot of the voter's vote weight at the
     ///      instant their review vote was recorded. Read by the off-chain Merkl
     ///      bot via `getApproverWeights` to attribute the (off-chain) guardian
-    ///      fee. The slash snapshot lives on sWOOD (`recordVoteStake` mirrors
-    ///      it there for slashing).
+    ///      fee. Vote accounting only — slashing is sized on sWOOD from its
+    ///      own raw own-stake checkpoint at `openedAt` (spec 2026-07-19 §5).
     mapping(bytes32 => mapping(address => uint128)) internal _voteStake;
     mapping(bytes32 => address[]) internal _approvers;
     mapping(bytes32 => address[]) internal _blockers;
@@ -328,9 +328,6 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     ///      vote weight at `r.openedAt` (read from sWOOD's `getPastVotes`) into
     ///      `_voteStake[key][caller]` and adds it to the chosen side's
     ///      tally. Approvers and Blockers are each capped.
-    ///
-    ///      For Approve votes the snapshot is mirrored to sWOOD via
-    ///      `recordVoteStake` so a later `slashGuardians` can size the slash.
     /// @param slashBps Proposed slash severity for a Block vote. Stored in
     ///        `blockerSlashBps` and median-aggregated + clamped at
     ///        `resolveReview` (Task 6.2). Ignored for Approve votes — NOT
@@ -369,9 +366,6 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
             if (support == GuardianVoteType.Approve) {
                 _pushApprover(key, proposalId, msg.sender);
                 r.approveStakeWeight += weight;
-                // Mirror the snapshot to sWOOD so `slashGuardians` can size
-                // the slash against the exact weight voted with.
-                swood.recordVoteStake(key, msg.sender, weight);
             } else {
                 _pushBlocker(key, proposalId, msg.sender);
                 r.blockStakeWeight += weight;
@@ -396,8 +390,6 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
                 _pushBlocker(key, proposalId, msg.sender); // cap pre-checked above -- must succeed
                 r.blockStakeWeight += weight;
                 blockerSlashBps[key][msg.sender] = slashBps;
-                // No longer an approver — drop the sWOOD slash snapshot.
-                swood.recordVoteStake(key, msg.sender, 0);
             } else {
                 // Block -> Approve.
                 if (_approvers[key].length >= MAX_APPROVERS_PER_PROPOSAL) revert NewSideFull();
@@ -405,8 +397,6 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
                 r.blockStakeWeight -= weight;
                 _pushApprover(key, proposalId, msg.sender); // cap pre-checked above -- must succeed
                 r.approveStakeWeight += weight;
-                // Now an approver — record the slash snapshot on sWOOD.
-                swood.recordVoteStake(key, msg.sender, weight);
             }
             _votes[key][msg.sender] = support;
             emit GuardianVoteChanged(proposalId, msg.sender, existing, support);

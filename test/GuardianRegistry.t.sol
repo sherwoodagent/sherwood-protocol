@@ -649,12 +649,12 @@ contract GuardianRegistryResolveTest is RegistryTestHarness {
         assertEq(wood.balanceOf(BURN_ADDRESS), 0);
     }
 
-    /// @notice Regression for PR #229 fix: the slash targets the `voteStake`
-    ///         snapshot captured at vote time, NOT the live `stakedAmount`. A
-    ///         guardian that tops up between voting and resolution should only
-    ///         lose the snapshot weight. Post-split the snapshot is mirrored
-    ///         into sWOOD via `recordVoteStake` and consumed by
-    ///         `swood.slashGuardians`.
+    /// @notice Regression for PR #229 fix: the slash targets the approver's
+    ///         at-open stake, NOT the live `stakedAmount`. A guardian that
+    ///         tops up between voting and resolution should only lose the
+    ///         at-open amount. Sized on sWOOD by the raw own-stake checkpoint
+    ///         at `r.openedAt` (spec 2026-07-19 §5), which `resolveReview`
+    ///         passes to `swood.slashGuardians`.
     function test_resolveReview_slashesOnlyVoteSnapshot_notTopUp() public {
         address approver = _guardian(0);
         registry.openReview(address(governor), PROPOSAL_ID);

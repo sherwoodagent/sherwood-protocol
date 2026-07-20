@@ -349,10 +349,14 @@ contract SwoodReviewSlashTest is Test {
     ///   - the proposal resolves Rejected/blocked;
     ///   - the stake-weighted median (9000 bps) — and not the 5000 bps
     ///     arithmetic mean — was the slash factor applied;
-    ///   - the approver's OWN stake was slashed pro-rata to the median;
-    ///   - the approver's DELEGATED pool was slashed pro-rata, each delegator's
-    ///     `delegationOf` diluted by the same share-factor;
-    ///   - the slashed WOOD (18k own + 360 pool) was burned to BURN_ADDRESS;
+    ///   - the approver's OWN stake was slashed pro-rata to the median, plus
+    ///     the first-loss spill of the delegated damage the
+    ///     `maxDelegatedSlashBps` cap absorbed (spec 2026-07-19 Part A);
+    ///   - the approver's DELEGATED pool was slashed pro-rata at
+    ///     min(median, C = 2000), each delegator's `delegationOf` diluted by
+    ///     the same share-factor;
+    ///   - the slashed WOOD (18k own + 280 spill + 80 pool) was burned to
+    ///     BURN_ADDRESS;
     ///   - the GuardianRegistry holds no WOOD and no reward pool was funded —
     ///     the slash path does not touch reward-pool state.
     function test_review_blockQuorum_graduatedMedianSlash_endToEnd() public {
@@ -419,44 +423,53 @@ contract SwoodReviewSlashTest is Test {
         // so a contract-side formula or rounding bug cannot be silently
         // absorbed by a mirrored expression on the expected side.
         //
-        // Arithmetic rationale (slash factor = stake-weighted median 9000 bps):
-        //   own slash      = 20_000e18 * 9000 / 10_000 = 18_000e18  → 2_000e18 remains
-        //   pool slash     =    400e18 * 9000 / 10_000 =    360e18  →    40e18 remains
-        //   del1 remains   =    300e18 - (300e18 * 9000 / 10_000)   =    30e18
-        //   del2 remains   =    100e18 - (100e18 * 9000 / 10_000)   =    10e18
-        //   total burned   = 18_000e18 + 360e18                     = 18_360e18
-        //   totalGuardianStake post = 100_000e18 - 18_000e18        = 82_000e18
+        // Arithmetic rationale (slash factor = stake-weighted median 9000 bps;
+        // delegated legs capped at C = maxDelegatedSlashBps = 2000 with the
+        // absorbed excess spilling onto the approver's own stake — spec
+        // 2026-07-19 Part A):
+        //   own base slash = 20_000e18 * 9000 / 10_000 = 18_000e18
+        //   pool slash     =    400e18 * 2000 / 10_000 =     80e18  →   320e18 remains
+        //   spill          =    400e18 * (9000 - 2000) / 10_000 = 280e18
+        //   own remains    = 20_000e18 - 18_000e18 - 280e18         = 1_720e18
+        //   del1 remains   =    300e18 - (300e18 * 2000 / 10_000)   =   240e18
+        //   del2 remains   =    100e18 - (100e18 * 2000 / 10_000)   =    80e18
+        //   total burned   = 18_000e18 + 280e18 + 80e18             = 18_360e18
+        //   totalGuardianStake post = 100_000e18 - 18_280e18        = 81_720e18
         //
         // If the contract had (incorrectly) used the 5000 bps arithmetic mean,
-        // own stake would be 10_000e18 and every literal below would mismatch —
-        // that is the property this fixture proves.
-        assertEq(swood.guardianStake(gApprove), 2_000e18, "approver own stake = 2k post-slash (90% of 20k burned)");
+        // own stake would be 9_880e18 (10k base-remainder - 120 spill) and
+        // every literal below would mismatch — that is the property this
+        // fixture proves.
+        assertEq(swood.guardianStake(gApprove), 1_720e18, "approver own = 20k - 18k base - 280 spill");
         // Self-documenting median≠mean guard: the slash factor actually applied
         // is the stake-weighted median (EXPECTED_MEDIAN_BPS = 9000), NOT the
-        // 5000 bps arithmetic mean. Under the mean, own stake would be 10k.
+        // 5000 bps arithmetic mean. Under the mean, own stake would be 9_880e18.
         assertEq(EXPECTED_MEDIAN_BPS, 9000, "stake-weighted median is 9000 bps, not the 5000 bps mean");
-        assertTrue(swood.guardianStake(gApprove) != 10_000e18, "slash used median (9000), not mean (5000)");
-        // Cohort total stake dropped by exactly the approver's own 18k slash.
-        assertEq(swood.totalGuardianStake(), 82_000e18, "totalGuardianStake = 100k - 18k own slash");
+        assertTrue(swood.guardianStake(gApprove) != 9_880e18, "slash used median (9000), not mean (5000)");
+        // Cohort total stake dropped by exactly the approver's own debit
+        // (18k base + 280 spill).
+        assertEq(swood.totalGuardianStake(), 81_720e18, "totalGuardianStake = 100k - 18.28k own debit");
 
         // ── Assert: blockers untouched ──
         assertEq(swood.guardianStake(gBlock1), BLOCKER1_STAKE, "blocker1 untouched");
         assertEq(swood.guardianStake(gBlock2), BLOCKER2_STAKE, "blocker2 untouched");
         assertEq(swood.guardianStake(gBlock3), BLOCKER3_STAKE, "blocker3 untouched");
 
-        // ── Assert: delegated pool slashed at the same median share-factor ──
-        // pool 400 − (400 × 9000 / 10000) = 400 − 360 = 40.
-        assertEq(swood.poolTokens(gApprove), 40e18, "pool slashed 90% -> 40");
-        assertEq(swood.totalDelegatedStake(), 40e18, "totalDelegatedStake -> 40");
+        // ── Assert: delegated pool slashed at min(median, C) = 20% ──
+        // pool 400 − (400 × 2000 / 10000) = 400 − 80 = 320.
+        assertEq(swood.poolTokens(gApprove), 320e18, "pool slashed at C (20%) -> 320");
+        assertEq(swood.totalDelegatedStake(), 320e18, "totalDelegatedStake -> 320");
 
-        // Each delegator's token-equivalent diluted by the SAME 90% share-factor
+        // Each delegator's token-equivalent diluted by the SAME 20% share-factor
         // (no per-delegator loop — one poolTokens write dilutes the share rate).
-        assertEq(swood.delegationOf(del1, gApprove), 30e18, "del1 diluted 90% -> 30");
-        assertEq(swood.delegationOf(del2, gApprove), 10e18, "del2 diluted 90% -> 10");
+        assertEq(swood.delegationOf(del1, gApprove), 240e18, "del1 diluted 20% -> 240");
+        assertEq(swood.delegationOf(del2, gApprove), 80e18, "del2 diluted 20% -> 80");
 
-        // ── Assert: slashed WOOD burned (own + delegated) ──
-        // 18_000e18 own + 360e18 pool = 18_360e18 burned to the dead address.
-        assertEq(wood.balanceOf(BURN_ADDRESS), burnBefore + 18_360e18, "18k own + 360 pool burned to dead address");
+        // ── Assert: slashed WOOD burned (own incl. spill + delegated) ──
+        // 18_000e18 own + 280e18 spill + 80e18 pool = 18_360e18 burned.
+        assertEq(
+            wood.balanceOf(BURN_ADDRESS), burnBefore + 18_360e18, "18k own + 280 spill + 80 pool burned to dead address"
+        );
         assertEq(swood.pendingBurn(), 0, "no pending burn - ERC20Mock burn transfer succeeded");
 
         // ── Assert: registry holds no assets; fee attribution is off-chain ──
