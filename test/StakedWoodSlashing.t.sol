@@ -1025,7 +1025,11 @@ contract StakedWoodSlashingTest is Test {
     }
 
     /// @dev Registry-pranked single-approver slash at `bps` with review-open
-    ///      snapshot `openedAt`.
+    ///      snapshot `openedAt`. Same-second `openedAt` lookups are
+    ///      intentional: `upperLookupRecent` has no future-lookup guard, and a
+    ///      checkpoint keyed `now` is visible at `now`. Repaired tests that
+    ///      warp +1 before slashing do so to mirror the registry's
+    ///      `openReview` t-1 semantics, not out of necessity.
     function _slash(address guardian, uint256 openedAt, uint256 bps) internal returns (uint256 total) {
         address[] memory approvers = new address[](1);
         approvers[0] = guardian;
@@ -1058,16 +1062,29 @@ contract StakedWoodSlashingTest is Test {
 
     /// @notice Sybil shape (tiny own bond, huge delegated book): the spill is
     ///         clamped at the remaining own stake — the guardian is wiped, the
-    ///         delegators never lose more than C.
+    ///         delegators never lose more than C. Also pins the clamp branch's
+    ///         aggregate accounting: event, return value, totalGuardianStake.
     function test_slash_spillClampedAtRemainingOwnStake() public {
         // alice: 10k own (fixture minimum); bob delegates 1M. S = 9000.
         _stakeAndDelegate(alice, 10_000e18, bob, 1_000_000e18);
         uint256 openedAt = vm.getBlockTimestamp();
-        _slash(alice, openedAt, 9000);
-        // own base = 9k, remaining 1k; excess = 70% of 1M = 700k
-        // -> clamped to 1k. Own stake fully wiped; pool pays 20%.
+        assertEq(swood.totalGuardianStake(), 10_000e18, "alice is the whole cohort");
+
+        // Hand-derivation (S = 9000, C = 2000):
+        //   own base  = 10k * 9000 / 10_000 = 9k; remaining own = 1k.
+        //   pool leg  = 1M * 2000 / 10_000 = 200k -> pool 800k.
+        //   spill     = 1M * (9000 - 2000) / 10_000 = 700k -> clamped to 1k.
+        //   ownDebit  = 9k + 1k = 10k (event ownSlash; own stake wiped).
+        //   total     = 10k own + 200k pool = 210k.
+        vm.expectEmit(true, true, true, true, address(swood));
+        emit GuardianSlashed(bytes32(uint256(0x5EED)), alice, 10_000e18, 200_000e18);
+        uint256 total = _slash(alice, openedAt, 9000);
+
+        assertEq(total, 210_000e18, "returned total = 10k own + 200k pool");
         assertEq(swood.guardianStake(alice), 0, "own wiped by clamped spill");
         assertEq(swood.poolTokens(alice), 800_000e18, "pool pays C only");
+        // Aggregate follows the full own debit (base + clamped spill).
+        assertEq(swood.totalGuardianStake(), 0, "totalGuardianStake drops by ownDebit");
     }
 
     /// @notice slashBps = 10_000 end-to-end: own wiped, pools clamped at C,

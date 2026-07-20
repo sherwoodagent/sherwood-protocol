@@ -1067,15 +1067,19 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
         // proposals) OR genuinely no delegations at open. Fall back to slashing
         // the full live pool AND the full unbonding pool, at the capped rate.
         uint256 poolBps = Math.min(slashBps, maxDelegatedSlashBps);
+        uint256 unbondPool = unbondingPoolTokens[approver];
         uint256 delSlashBasis;
         uint256 unbondBasis;
+        uint256 spillBasis;
         if (snapDelegated == 0) {
             delSlashBasis = oldPool;
-            unbondBasis = unbondingPoolTokens[approver];
+            unbondBasis = unbondPool;
+            spillBasis = oldPool + unbondPool;
         } else {
             delSlashBasis = Math.min(snapDelegated, oldPool);
             // Remaining budget after the live pool spills to the unbonding pool.
-            unbondBasis = Math.min(snapDelegated - delSlashBasis, unbondingPoolTokens[approver]);
+            unbondBasis = Math.min(snapDelegated - delSlashBasis, unbondPool);
+            spillBasis = snapDelegated;
         }
         uint256 delSlash = Math.mulDiv(delSlashBasis, poolBps, 10_000);
         uint256 unbondSlash = Math.mulDiv(unbondBasis, poolBps, 10_000);
@@ -1086,8 +1090,11 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
         // operator bond absorbs losses before the pooled stakers). Also
         // closes the LIP-10 self-delegation shield: a sybil routing their own
         // stake through delegation eats the shielded excess out of their own
-        // bond until it is wiped.
-        uint256 spillBasis = snapDelegated == 0 ? oldPool + unbondingPoolTokens[approver] : snapDelegated;
+        // bond until it is wiped. Deliberate: the spill is sized on the
+        // AT-OPEN exposure (`spillBasis`), NOT on what the pools actually
+        // paid (`delSlashBasis + unbondBasis`) — liability is the exposure
+        // that backed the vote, even if pool churn since open means the
+        // pools themselves cover less.
         uint256 spill = Math.mulDiv(spillBasis, slashBps - poolBps, 10_000);
         uint256 ownRemaining = live - ownSlash;
         if (spill > ownRemaining) spill = ownRemaining;

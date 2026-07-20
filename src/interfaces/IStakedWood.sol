@@ -113,9 +113,12 @@ interface IStakedWood {
     function maxSlashBps() external view returns (uint256);
 
     // ── Registry-only mutations ──
-    /// @notice Slash `approvers` by `slashBps` for a blocked proposal. Burns
-    ///         each approver's own stake plus a pro-rata share of their
-    ///         delegated pool. Registry-only.
+    /// @notice Slash `approvers` for a blocked proposal. Burns `slashBps` of
+    ///         each approver's own stake plus `min(slashBps,
+    ///         maxDelegatedSlashBps)` of their delegated pools (pro-rata via
+    ///         the share model); the uncovered delegated remainder spills onto
+    ///         the approver's own remaining stake (first-loss bond, spec
+    ///         2026-07-19 Part A). Registry-only.
     /// @param reviewKey  Composite review key keccak256(abi.encode(governor, proposalId)) whose approvers are slashed.
     /// @param openedAt   The review's open timestamp. `_slashOne` sizes each
     ///                   approver's own slash off their raw own-stake
