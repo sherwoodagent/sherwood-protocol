@@ -544,8 +544,11 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
 
     /// @notice Total system vote weight at a past timestamp — the denominator a
     ///         Snapshot quorum/total would use.
-    /// @dev Delegates to `getPastTotalVotes(timestamp) + getPastTotalDelegated(timestamp)`,
-    ///      consistent with per-account `getPastVotes` = own + delegated.
+    /// @dev Delegates to `getPastTotalVotes(timestamp) + getPastTotalDelegated(timestamp)`
+    ///      — the RAW (conservative) counterpart of the per-account reads: the
+    ///      age-weighted `getPastVotes` values sum to AT MOST this total, so it
+    ///      remains a valid quorum denominator (spec §5 of
+    ///      2026-07-19-slash-cap-age-weighted-voting-design.md).
     function getPastTotalSupply(uint256 timestamp) external view returns (uint256) {
         return getPastTotalVotes(timestamp) + getPastTotalDelegated(timestamp);
     }

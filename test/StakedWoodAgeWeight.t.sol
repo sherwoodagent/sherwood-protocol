@@ -18,6 +18,7 @@ contract StakedWoodAgeWeightTest is Test {
     address owner = address(0xA11CE);
     address factory = address(0xFAC10);
     address alice = address(0xA11CE5);
+    address bob = address(0xB0B);
 
     function setUp() public {
         wood = new ERC20Mock("WOOD", "WOOD", 18);
@@ -86,5 +87,40 @@ contract StakedWoodAgeWeightTest is Test {
         swood.stakeAsGuardian(100e18, 1);
         // Quorum denominator is deliberately un-aged (spec Part C).
         assertEq(swood.getPastTotalVotes(block.timestamp), 100e18);
+    }
+
+    /// @notice Task-2 baseline the Task-4 k-cap will flip: the delegated
+    ///         inbound term is FLAT (100%) even while the guardian's own
+    ///         stake is discounted to the age floor. Task 4 changes this to
+    ///         min(delegated, delegatedWeightCapX × agedOwn).
+    function test_ageWeight_delegatedTermFlatWhileOwnDiscounted() public {
+        vm.prank(alice);
+        swood.stakeAsGuardian(100e18, 1);
+
+        vm.prank(owner);
+        swood.setDelegationEnabled(true);
+        wood.mint(bob, 200e18);
+        vm.startPrank(bob);
+        wood.approve(address(swood), type(uint256).max);
+        swood.delegateStake(alice, 200e18);
+        vm.stopPrank();
+
+        // Same-block read: own term at the 25% floor (age 0), delegated
+        // term un-aged at 100%.
+        assertEq(swood.getVotes(alice), 25e18 + 200e18);
+    }
+
+    /// @notice Boundary one second before maturation: the ramp stays
+    ///         strictly below par (floor division), pinning rounding.
+    function test_ageWeight_oneSecondBeforeMaturation() public {
+        vm.prank(alice);
+        swood.stakeAsGuardian(100e18, 1);
+        uint256 age = 30 days - 1;
+        skip(age);
+        // factor = 2500 + (7500 × (30d − 1)) / 30d = 2500 + 7499 (floored,
+        // since 7500 × 2_591_999 / 2_592_000 = 7499.997…) = 9999 bps.
+        uint256 factor = 2500 + (7500 * age) / 30 days;
+        assertEq(factor, 9999, "ramp strictly below par pre-maturation");
+        assertEq(swood.getVotes(alice), (100e18 * factor) / 10_000); // 99.99e18
     }
 }

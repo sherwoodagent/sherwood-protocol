@@ -103,7 +103,7 @@ contract StakedWoodSlashingTest is Test {
         // Age-weighted voting: mature to par so the pre-slash checkpoint read
         // below returns raw stake.
         skip(30 days);
-        uint256 stakedAt = vm.getBlockTimestamp();
+        uint256 maturedAt = vm.getBlockTimestamp();
 
         // Registry snapshots alice's vote stake at 20k for proposal 1.
         vm.prank(registry);
@@ -131,7 +131,7 @@ contract StakedWoodSlashingTest is Test {
 
         // getPastVotes re-checkpointed: pre-slash 20k, post-slash 15k.
         vm.warp(vm.getBlockTimestamp() + 1);
-        assertEq(swood.getPastVotes(alice, stakedAt), 20_000e18, "pre-slash checkpoint");
+        assertEq(swood.getPastVotes(alice, maturedAt), 20_000e18, "pre-slash checkpoint");
         assertEq(swood.getPastVotes(alice, slashedAt), 15_000e18, "post-slash checkpoint");
         assertEq(swood.getPastTotalVotes(slashedAt), 15_000e18, "total checkpoint re-pushed");
     }
