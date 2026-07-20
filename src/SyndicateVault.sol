@@ -8,6 +8,7 @@ import {ISyndicateFactory} from "./interfaces/ISyndicateFactory.sol";
 import {IVaultWithdrawalQueue} from "./interfaces/IVaultWithdrawalQueue.sol";
 import {IPriceRouter} from "./interfaces/IPriceRouter.sol";
 import {BatchExecutorLib} from "./BatchExecutorLib.sol";
+import {SyndicateVaultAdminLib} from "./SyndicateVaultAdminLib.sol";
 import {ERC4626Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/ERC4626Upgradeable.sol";
 import {
     ERC20VotesUpgradeable
@@ -204,25 +205,20 @@ contract SyndicateVault is
     // ==================== DEPOSITOR WHITELIST ====================
 
     /// @inheritdoc ISyndicateVault
+    /// @dev Body delegatecalled to `SyndicateVaultAdminLib` for EIP-170 headroom;
+    ///      `onlyOwner` stays on the wrapper so access control is unchanged.
     function approveDepositor(address depositor) external onlyOwner {
-        if (depositor == address(0)) revert InvalidDepositor();
-        if (!_approvedDepositors.add(depositor)) revert DepositorAlreadyApproved();
-        emit DepositorApproved(depositor);
+        SyndicateVaultAdminLib.approveDepositor(_approvedDepositors, depositor);
     }
 
     /// @inheritdoc ISyndicateVault
     function removeDepositor(address depositor) external onlyOwner {
-        if (!_approvedDepositors.remove(depositor)) revert DepositorNotApproved();
-        emit DepositorRemoved(depositor);
+        SyndicateVaultAdminLib.removeDepositor(_approvedDepositors, depositor);
     }
 
     /// @inheritdoc ISyndicateVault
     function approveDepositors(address[] calldata depositors) external onlyOwner {
-        for (uint256 i = 0; i < depositors.length; i++) {
-            if (depositors[i] == address(0)) revert InvalidDepositor();
-            _approvedDepositors.add(depositors[i]);
-            emit DepositorApproved(depositors[i]);
-        }
+        SyndicateVaultAdminLib.approveDepositors(_approvedDepositors, depositors);
     }
 
     /// @inheritdoc ISyndicateVault
@@ -248,7 +244,7 @@ contract SyndicateVault is
     ///      count getters were dropped to free EIP-170 budget. Iterate via this
     ///      paginated path; `limit` is hard-clamped to `MAX_PAGE_LIMIT`.
     function approvedDepositorsPaginated(uint256 offset, uint256 limit) external view returns (address[] memory) {
-        return _pageAddresses(_approvedDepositors, offset, limit);
+        return SyndicateVaultAdminLib.pageAddresses(_approvedDepositors, offset, limit);
     }
 
     /// @inheritdoc ISyndicateVault
@@ -279,7 +275,7 @@ contract SyndicateVault is
     ///      iterate: start at `offset = 0`, advance by `limit` each call
     ///      until the returned array is shorter than `limit`.
     function agentsPaginated(uint256 offset, uint256 limit) external view returns (address[] memory) {
-        return _pageAddresses(_agentSet, offset, limit);
+        return SyndicateVaultAdminLib.pageAddresses(_agentSet, offset, limit);
     }
 
     /// @inheritdoc ISyndicateVault
@@ -308,23 +304,7 @@ contract SyndicateVault is
     ///      the owner when an identity moves. See CLAUDE.md "Agent Identity
     ///      (ERC-8004)" for the full model.
     function registerAgent(uint256 agentId, address agentAddress) external onlyOwner {
-        if (agentAddress == address(0)) revert ZeroAddress();
-        if (_agents[agentAddress].active) revert AgentAlreadyRegistered();
-        // PR #324 review R4: bound `_agentSet` so `rotateOwnership`'s
-        // deactivation loop (Sherlock #38) can't OOG. `removeAgent` frees a slot.
-        if (_agentSet.length() >= MAX_AGENTS_PER_VAULT) revert AgentCapExceeded();
-
-        // Verify ERC-8004 identity (skipped on chains without agent registry)
-        if (address(_agentRegistry) != address(0)) {
-            address nftOwner = _agentRegistry.ownerOf(agentId);
-            if (nftOwner != agentAddress && nftOwner != owner()) revert NotAgentOwner();
-        }
-
-        _agents[agentAddress] = AgentConfig({agentId: agentId, agentAddress: agentAddress, active: true});
-
-        _agentSet.add(agentAddress);
-
-        emit AgentRegistered(agentId, agentAddress);
+        SyndicateVaultAdminLib.registerAgent(_agents, _agentSet, agentId, agentAddress, _agentRegistry, owner());
     }
 
     /// @inheritdoc ISyndicateVault
@@ -335,12 +315,7 @@ contract SyndicateVault is
     ///      `isAgent(addr)` returns false, and a subsequent
     ///      `registerAgent(newId, addr)` writes a fresh entry.
     function removeAgent(address agentAddress) external onlyOwner {
-        if (!_agents[agentAddress].active) revert AgentNotActive();
-
-        delete _agents[agentAddress];
-        _agentSet.remove(agentAddress);
-
-        emit AgentRemoved(agentAddress);
+        SyndicateVaultAdminLib.removeAgent(_agents, _agentSet, agentAddress);
     }
 
     /// @inheritdoc ISyndicateVault
@@ -372,14 +347,7 @@ contract SyndicateVault is
     function rotateOwnership(address newOwner) external {
         if (msg.sender != _factory) revert NotFactory();
         if (newOwner == address(0)) revert ZeroAddress();
-        address[] memory snap = _agentSet.values();
-        uint256 n = snap.length;
-        for (uint256 i; i < n; ++i) {
-            address a = snap[i];
-            delete _agents[a];
-            _agentSet.remove(a);
-            emit AgentRemoved(a);
-        }
+        SyndicateVaultAdminLib.drainAgents(_agents, _agentSet);
         _transferOwnership(newOwner);
     }
 
@@ -554,27 +522,6 @@ contract SyndicateVault is
         if (bps > MAX_MIN_BUFFER_BPS) revert BufferTooHigh();
         minBufferBps = bps;
         emit MinBufferUpdated(bps);
-    }
-
-    // ==================== PAGINATION ====================
-
-    /// @dev V-M3: shared pager for `EnumerableSet.AddressSet`. Returns a
-    ///      slice `[offset, offset + min(limit, MAX_PAGE_LIMIT))` clipped to
-    ///      the set's length. Returns an empty array when `offset >= length`.
-    function _pageAddresses(EnumerableSet.AddressSet storage set, uint256 offset, uint256 limit)
-        private
-        view
-        returns (address[] memory out)
-    {
-        uint256 total = set.length();
-        if (offset >= total) return new address[](0);
-        if (limit > MAX_PAGE_LIMIT) limit = MAX_PAGE_LIMIT;
-        uint256 end = offset + limit;
-        if (end > total) end = total;
-        out = new address[](end - offset);
-        for (uint256 i = offset; i < end; i++) {
-            out[i - offset] = set.at(i);
-        }
     }
 
     // ==================== OVERRIDES ====================
