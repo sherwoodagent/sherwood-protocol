@@ -667,7 +667,11 @@ contract SyndicateVault is
     function _pullFromStrategy(uint256 shortfall) private {
         (, bool laneA) = _liveNAV();
         address strat = _activeStrategy();
-        if (strat == address(0) || !laneA) revert QueueReserveBreached();
+        // Defense-in-depth: also reject a codeless strat (mirrors
+        // `_strategyLiquidity`). Unreachable in the honest path — `maxWithdraw`
+        // caps `assets` at float when strategy liquidity is 0 — but removes the
+        // reliance on that upstream invariant for a fund-moving call.
+        if (strat == address(0) || strat.code.length == 0 || !laneA) revert QueueReserveBreached();
         IERC20 asset_ = IERC20(asset());
         uint256 balBefore = asset_.balanceOf(address(this));
         IStrategy(strat).withdrawTo(shortfall);
