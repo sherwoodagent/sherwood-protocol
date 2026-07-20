@@ -250,4 +250,58 @@ contract GuardianInvariantsTest is StdInvariant, Test {
             assertTrue(blocked, "INV-2: blocked flag missing after resolveReview returned true");
         }
     }
+
+    // ──────────────────────────────────────────────────────────────
+    // INV-3: aged + k-capped vote weight bounds (spec Parts B/C)
+    // ──────────────────────────────────────────────────────────────
+
+    /// @notice Aged + k-capped vote weight never exceeds raw own stake ×
+    ///         (1 + k), and a zero-stake guardian carries zero weight.
+    ///
+    ///         Bound derivation (spec §4-§5): `getVotes = agedOwn +
+    ///         min(delegated, k · agedOwn)` where `agedOwn = rawCheckpoint ·
+    ///         factor/10_000` and `factor <= 10_000`, so `agedOwn <=
+    ///         rawCheckpoint`. The stake checkpoint is re-pushed to
+    ///         `stakedAmount` on every mutation (stake/cancel/slash) and to 0
+    ///         on unstake-request, so `rawCheckpoint <= guardianStake` always.
+    ///         Hence `getVotes <= raw + k·raw`.
+    ///
+    ///         Zero-stake leg: a guardian slashed to zero own stake re-pushes
+    ///         a 0 checkpoint (active leg) or already carries one (unstake-
+    ///         requested leg), so both `agedOwn` and the cap `k · agedOwn`
+    ///         collapse to 0 — delegation cannot resurrect weight for a
+    ///         zero-own guardian. The `slash` + `delegate` handler selectors
+    ///         exercise both legs, so this is non-vacuous.
+    function invariant_agedWeightBounds() public view {
+        address[] memory gs = handler.getActors();
+        uint256 k = swood.delegatedWeightCapX();
+        for (uint256 i = 0; i < gs.length; i++) {
+            uint256 raw = swood.guardianStake(gs[i]);
+            uint256 votes = swood.getVotes(gs[i]);
+            assertLe(votes, raw + k * raw, "INV-3: vote weight exceeds raw stake x (1+k)");
+            if (raw == 0) assertEq(votes, 0, "INV-3: zero-stake guardian carries nonzero weight");
+        }
+    }
+
+    /// @notice Relocated C-2: a slashed pool with outstanding shares retains
+    ///         >= 1 wei of backing tokens. `maxDelegatedSlashBps < 10_000`
+    ///         (enforced at init/setter) sizes the pool leg at `min(S, C)`, so
+    ///         a slash can never zero `poolTokens` while `poolShares` remain —
+    ///         the divide-by-zero that would brick `delegateStake` /
+    ///         `claimUnstakeDelegation` share math is impossible.
+    ///
+    ///         Non-vacuous: the handler drives `delegate` (mints shares +
+    ///         tokens) and `slash` (which invokes `_slashOne`'s pool legs),
+    ///         so live-share pools are actually slashed under fuzzing.
+    function invariant_poolsNeverZeroWithLiveShares() public view {
+        address[] memory gs = handler.getActors();
+        for (uint256 i = 0; i < gs.length; i++) {
+            if (swood.poolShares(gs[i]) != 0) {
+                assertGt(swood.poolTokens(gs[i]), 0, "INV-C2: live pool shares with zero backing tokens");
+            }
+            if (swood.unbondingPoolShares(gs[i]) != 0) {
+                assertGt(swood.unbondingPoolTokens(gs[i]), 0, "INV-C2: live unbonding shares with zero backing tokens");
+            }
+        }
+    }
 }

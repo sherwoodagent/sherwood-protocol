@@ -538,6 +538,83 @@ contract StakedWoodTest is Test {
         vm.stopPrank();
     }
 
+    /// @notice `initialize` stores the age-weight + delegated-slash params
+    ///         (Task 1 review M-3): the setUp proxy pins the constructor args.
+    function test_initialize_setsAgeWeightParams() public view {
+        assertEq(swood.ageFloorBps(), 2500);
+        assertEq(swood.maturationPeriod(), 30 days);
+        assertEq(swood.delegatedWeightCapX(), 4);
+        assertEq(swood.maxDelegatedSlashBps(), 2000);
+    }
+
+    /// @notice `setAgeFloorBps` emits `ParameterChangeFinalized` keyed by
+    ///         `PARAM_AGE_FLOOR_BPS` (Task 1 review M-3).
+    function test_setAgeFloorBps_emitsKey() public {
+        vm.expectEmit(true, false, false, true);
+        emit StakedWood.ParameterChangeFinalized(swood.PARAM_AGE_FLOOR_BPS(), 2500, 5000);
+        vm.prank(owner);
+        swood.setAgeFloorBps(5000);
+    }
+
+    /// @notice `setMaturationPeriod` emits keyed by `PARAM_MATURATION_PERIOD`.
+    function test_setMaturationPeriod_emitsKey() public {
+        vm.expectEmit(true, false, false, true);
+        emit StakedWood.ParameterChangeFinalized(swood.PARAM_MATURATION_PERIOD(), 30 days, 60 days);
+        vm.prank(owner);
+        swood.setMaturationPeriod(60 days);
+    }
+
+    /// @notice `setDelegatedWeightCapX` emits keyed by
+    ///         `PARAM_DELEGATED_WEIGHT_CAP_X`.
+    function test_setDelegatedWeightCapX_emitsKey() public {
+        vm.expectEmit(true, false, false, true);
+        emit StakedWood.ParameterChangeFinalized(swood.PARAM_DELEGATED_WEIGHT_CAP_X(), 4, 10);
+        vm.prank(owner);
+        swood.setDelegatedWeightCapX(10);
+    }
+
+    /// @notice Accept-side boundaries (Task 1 review M-2): every setter takes
+    ///         its extreme legal value without reverting. `maxDelegatedSlashBps
+    ///         = 9_999` is legal against the default `maxSlashBps = 9_999`.
+    function test_setters_acceptBoundaryValues() public {
+        vm.startPrank(owner);
+
+        swood.setAgeFloorBps(1);
+        assertEq(swood.ageFloorBps(), 1);
+        swood.setAgeFloorBps(10_000);
+        assertEq(swood.ageFloorBps(), 10_000);
+
+        swood.setMaturationPeriod(7 days);
+        assertEq(swood.maturationPeriod(), 7 days);
+        swood.setMaturationPeriod(90 days);
+        assertEq(swood.maturationPeriod(), 90 days);
+
+        swood.setDelegatedWeightCapX(1);
+        assertEq(swood.delegatedWeightCapX(), 1);
+        swood.setDelegatedWeightCapX(20);
+        assertEq(swood.delegatedWeightCapX(), 20);
+
+        swood.setMaxDelegatedSlashBps(9_999); // < 10_000 and <= maxSlashBps (9_999)
+        assertEq(swood.maxDelegatedSlashBps(), 9_999);
+
+        vm.stopPrank();
+    }
+
+    /// @notice Bug A guard (Task 3 review M-3): topping up a stake while an
+    ///         unstake request is pending reverts `UnstakeAlreadyRequested` —
+    ///         a mid-cooldown top-up would grow `totalGuardianStake` without
+    ///         creating votable weight, so it is forced to cancel first.
+    function test_stakeAsGuardian_revertsWhenUnstakeRequested() public {
+        vm.prank(alice);
+        swood.stakeAsGuardian(10_000e18, 42);
+        vm.prank(alice);
+        swood.requestUnstakeGuardian();
+
+        vm.prank(alice);
+        vm.expectRevert(StakedWoodDelegation.UnstakeAlreadyRequested.selector);
+        swood.stakeAsGuardian(10_000e18, 42);
+    }
+
     // ── Owner-bond prepare/bind (relocated from GuardianRegistry, Task 3.1) ──
 
     function test_prepareOwnerStake_escrowsWood() public {

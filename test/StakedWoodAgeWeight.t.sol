@@ -235,4 +235,28 @@ contract StakedWoodAgeWeightTest is Test {
         assertEq(factor, 9999, "ramp strictly below par pre-maturation");
         assertEq(swood.getVotes(alice), (100e18 * factor) / 10_000); // 99.99e18
     }
+
+    /// @notice Companion to `test_requestUnstake_resetsAgeClock` (Task 3
+    ///         review): age accrues FROM the request timestamp THROUGH the
+    ///         cooldown — waiting one full maturation period inside the
+    ///         cooldown before cancelling returns a stake already at par.
+    ///         Proves the reset re-anchors age (pre-request age forfeited) but
+    ///         does NOT freeze it: the request → wait → cancel round-trip is
+    ///         not penalized for the time spent on cooldown.
+    function test_requestUnstake_ageAccruesThroughCooldownToPar() public {
+        vm.prank(alice);
+        swood.stakeAsGuardian(100e18, 1);
+        skip(10 days); // partial maturity — forfeited by the request below
+        vm.prank(alice);
+        swood.requestUnstakeGuardian();
+
+        // Wait a full maturation window WHILE on cooldown, then cancel.
+        skip(30 days);
+        vm.prank(alice);
+        swood.cancelUnstakeGuardian();
+
+        // Age since the request == 30 days == maturationPeriod → par, despite
+        // the pre-request 10 days being dropped.
+        assertEq(swood.getVotes(alice), 100e18);
+    }
 }

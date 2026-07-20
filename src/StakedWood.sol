@@ -464,10 +464,16 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
             // age — closes the "stake dust early, top up the whale position
             // later, inherit full maturity" hole. Ceil-divide so rounding
             // moves toward `now`: never grants free age. Overflow-safe:
-            // the old term is uint128 × uint64 < 2^192 and the new term is
-            // bounded by the uint128 stake width × uint64 timestamp — the
-            // sum fits uint256 with headroom.
+            // `amount` is a raw uint256 arg (not a bounded field), but the
+            // checked `*` reverts on overflow rather than wrapping, and for
+            // any realistic WOOD supply (< 2^128) both `stakedAmount *
+            // stakedAt` and `amount * block.timestamp` stay < 2^192, so the
+            // checked add cannot overflow uint256.
             uint256 num = uint256(g.stakedAmount) * uint256(g.stakedAt) + amount * block.timestamp;
+            // Lossless cast: `num` is a stake-weighted average of two
+            // timestamps (`stakedAt <= now` and `block.timestamp`), and the
+            // ceil-divide by `newTotal` keeps the result <= block.timestamp,
+            // which fits uint64 (as does every timestamp this contract sees).
             // forge-lint: disable-next-line(unchecked-cast)
             g.stakedAt = uint64((num + newTotal - 1) / newTotal);
         }
@@ -696,9 +702,12 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
         // owner can't extend lockup retroactively.
         // forge-lint: disable-next-line(unchecked-cast)
         g.cooldownAtRequest = uint64(coolDownPeriod);
-        // Age clock resets at exit-signal time (spec 2026-07-19 §4): a
-        // request → cancel round-trip restarts maturation; no free
-        // age-parking while the stake is unvotable.
+        // Age clock re-anchors to the request timestamp (spec 2026-07-19 §4):
+        // pre-request age is forfeited, but maturation DOES keep accruing from
+        // this instant onward — including through the cooldown. So a request →
+        // (wait) → cancel round-trip returns a stake aged from the request,
+        // not from the original stake and not from the cancel: waiting out the
+        // cooldown is not penalized, only the pre-request age is dropped.
         g.stakedAt = uint64(block.timestamp);
         totalGuardianStake -= g.stakedAmount;
 
