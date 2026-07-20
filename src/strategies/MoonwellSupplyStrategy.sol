@@ -75,6 +75,16 @@ contract MoonwellSupplyStrategy is BaseStrategy {
     /// @dev Mid-lifecycle partial redeem for the vault's instant-exit path.
     ///      Redeems exactly `assets` underlying and pushes it back; the rest of
     ///      the position keeps earning until `settle()`. Vault-only.
+    ///
+    ///      PR #6 review (blocking): the slippage floor is decremented 1:1 by
+    ///      the amount pulled. `minRedeemAmount` was sized against the FULL
+    ///      position; every `withdrawTo` shrinks the expected settle-time
+    ///      redemption by exactly `assets`, so the floor must shrink with it —
+    ///      the slippage TOLERANCE (expected − floor) is preserved. Without
+    ///      this, a material instant exit leaves `_settle` reverting
+    ///      `InvalidAmount` against the stale full-position floor, bricking
+    ///      permissionless `settleProposal` until the proposer manually
+    ///      relaxes the floor via `updateParams` (defeating the protection).
     function withdrawTo(uint256 assets) external override onlyVault {
         if (_state != State.Executed) revert NotExecuted();
         uint256 err = ICToken(mToken).redeemUnderlying(assets);
@@ -82,6 +92,10 @@ contract MoonwellSupplyStrategy is BaseStrategy {
         if (address(this).balance > 0) {
             if (!isNativeEthMarket) revert EthWrapFailed();
             IWETH(underlying).deposit{value: address(this).balance}();
+        }
+        uint256 floor_ = minRedeemAmount;
+        if (floor_ != 0) {
+            minRedeemAmount = floor_ > assets ? floor_ - assets : 0;
         }
         _pushToVault(underlying, assets);
     }

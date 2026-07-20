@@ -792,6 +792,15 @@ contract SyndicateVault is
         super._withdraw(caller, receiver, _owner, assets, shares);
         // Mid-proposal principal out — excluded from settlement PnL. Queue
         // settlements post-date the PnL read, so only live instant exits count.
+        //
+        // Fee incidence (spec Q3, explicit decision — PR #6 review note): the
+        // departing LP's share price includes their pro-rata slice of any
+        // UNREALIZED strategy gain, taken fee-free; the settlement fee is
+        // later computed on the FULL realized PnL and borne by remaining
+        // holders. This small leak is ACCEPTED for V1 — exact pro-rata fee
+        // skimming on instant exits would cost EIP-4626 preview-exactness and
+        // EIP-170 bytecode budget. Partially offset when `instantExitFeeBps`
+        // lands (deferred, spec §6).
         if (caller != _withdrawalQueue && redemptionsLocked()) {
             _interimNetFlow -= int256(assets);
         }
