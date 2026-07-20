@@ -169,4 +169,60 @@ contract VaultInstantLiquidityTest is Test {
         vault.setMinBufferBps(0);
         assertEq(vault.minBufferBps(), 0);
     }
+
+    /// @dev Build a single-call batch that sends `amount` of vault float to `to`
+    ///      (stands in for a strategy deployment pulling capital).
+    function _deployBatch(address to, uint256 amount) internal view returns (BatchExecutorLib.Call[] memory calls) {
+        calls = new BatchExecutorLib.Call[](1);
+        calls[0] = BatchExecutorLib.Call({
+            target: address(usdc),
+            data: abi.encodeCall(usdc.transfer, (to, amount)),
+            value: 0
+        });
+    }
+
+    // ── Task 2: buffer enforcement ──
+
+    function test_governorBatch_respectsBuffer() public {
+        vm.prank(alice);
+        vault.deposit(1_000e6, alice);
+        vm.prank(owner);
+        vault.setMinBufferBps(1_000); // 10% of 1_000e6 = 100e6 must stay
+
+        vm.prank(MOCK_GOVERNOR);
+        vault.executeGovernorBatch(_deployBatch(address(strat), 900e6));
+        assertEq(usdc.balanceOf(address(vault)), 100e6);
+    }
+
+    function test_governorBatch_revertsOnBufferBreach() public {
+        vm.prank(alice);
+        vault.deposit(1_000e6, alice);
+        vm.prank(owner);
+        vault.setMinBufferBps(1_000);
+
+        vm.prank(MOCK_GOVERNOR);
+        vm.expectRevert(ISyndicateVault.BufferBreached.selector);
+        vault.executeGovernorBatch(_deployBatch(address(strat), 900e6 + 1));
+    }
+
+    function test_governorBatch_bufferOff_allowsFullDeploy() public {
+        vm.prank(alice);
+        vault.deposit(1_000e6, alice);
+        vm.prank(MOCK_GOVERNOR);
+        vault.executeGovernorBatch(_deployBatch(address(strat), 1_000e6));
+        assertEq(usdc.balanceOf(address(vault)), 0);
+    }
+
+    function test_governorBatch_settleBatch_passesTrivially() public {
+        vm.prank(alice);
+        vault.deposit(1_000e6, alice);
+        vm.prank(owner);
+        vault.setMinBufferBps(1_000);
+        vm.prank(MOCK_GOVERNOR);
+        vault.executeGovernorBatch(_deployBatch(address(strat), 900e6));
+
+        strat.pushBack(900e6);
+        vm.prank(MOCK_GOVERNOR);
+        vault.executeGovernorBatch(new BatchExecutorLib.Call[](0));
+    }
 }

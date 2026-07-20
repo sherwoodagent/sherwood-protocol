@@ -422,6 +422,7 @@ contract SyndicateVault is
         whenNotPaused
     {
         if (_executorImpl.codehash != _expectedExecutorCodehash) revert ExecutorCodehashMismatch();
+        uint256 balanceBefore = IERC20(asset()).balanceOf(address(this));
         (bool success, bytes memory returnData) =
             _executorImpl.delegatecall(abi.encodeCall(BatchExecutorLib.executeBatch, (calls)));
         if (!success) {
@@ -437,7 +438,12 @@ contract SyndicateVault is
         // float reserved for already-settled, unclaimed redeem claims, so a
         // later proposal cannot strand them. Settle batches return float and
         // pass trivially; an execute batch that over-deploys reverts here.
-        if (IERC20(asset()).balanceOf(address(this)) < reservedQueueAssets()) revert QueueReserveBreached();
+        uint256 balanceAfter = IERC20(asset()).balanceOf(address(this));
+        uint256 reserve = reservedQueueAssets();
+        if (balanceAfter < reserve) revert QueueReserveBreached();
+        // Idle-liquidity floor: a batch may deploy at most (1 − minBufferBps)
+        // of the pre-batch float. Inflow (settle) batches pass trivially.
+        if (balanceAfter < reserve + (balanceBefore * minBufferBps) / 10_000) revert BufferBreached();
     }
 
     /// @inheritdoc ISyndicateVault

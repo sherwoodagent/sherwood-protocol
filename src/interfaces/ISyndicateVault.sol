@@ -48,6 +48,9 @@ interface ISyndicateVault {
     error AgentFeeTooHigh();
     /// @notice `setMinBufferBps` was called with `bps > 5_000` (50%).
     error BufferTooHigh();
+    /// @notice A governor batch left the vault below the idle floor
+    ///         (`reservedQueueAssets + minBufferBps%` of the pre-batch float).
+    error BufferBreached();
 
     // ── Init Params ──
     struct InitParams {
