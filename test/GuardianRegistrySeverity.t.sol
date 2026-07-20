@@ -115,19 +115,42 @@ contract GuardianRegistrySeverityTest is RegistryTestHarness {
     }
 
     function test_severity_quadraticMidpoint() public {
-        // mid = 3000 + (6667 − 3000) / 2 = 4833 → t = 1833e18 / 3667
-        // ≈ 0.49986e18 (just under exactly 1/2 from integer floor of the odd
-        // span). severity = 1000 + 9000 × (t²/1e18)/1e18 = 3248 vs the ideal
-        // t = 0.5 → 1000 + 9000 × 0.25 = 3250. Remaining stake differs by
-        // ~0.03%, well inside the 1% tolerance.
+        // Fully deterministic — exact stake sizing, no delegation — so assert
+        // the contract's integer-floored result EXACTLY (no relative slack).
+        //   mid = 3000 + (6667 − 3000) / 2 = 4833  → bBps = 4833 exactly
+        //   t   = (4833 − 3000)·1e18 / (6667 − 3000) = 1833e18 / 3667
+        //         = 499863648758…e0 ≈ 0.499864e18 (odd-span floor, just under ½)
+        //   t²  = t·t/1e18 ≈ 0.249864e18
+        //   sev = 1000 + ⌊9000 · t²/1e18⌋ = 1000 + 2248 = 3248 bps
+        //   (ideal t = ½ would give 1000 + 9000·0.25 = 3250; the 2-bps gap is
+        //    the integer-floor of the odd 3667 span.)
+        //   initial = 100_000e18 − 100_000e18·4833/10_000 = 51_670e18
+        //   remaining = ⌊51_670e18 · (10_000 − 3248) / 10_000⌋ = 34_887.584e18
         uint256 mid = Q + (SUPERMAJORITY_BPS - Q) / 2;
         _runReviewWithBlockFraction(mid);
-        uint256 expectedBps = 1000 + (10_000 - 1000) * 25 / 100;
-        assertApproxEqRel(
-            swood.guardianStake(approver1),
-            _initialStake * (10_000 - expectedBps) / 10_000,
-            0.01e18 // 1% tolerance for the integer-floored t
-        );
+        assertEq(swood.guardianStake(approver1), 34_887_584 * 1e15);
+    }
+
+    /// @notice Spec §10 collapse case: with minSlashBps == maxSlashBps the
+    ///         (hi − lo) ramp term is exactly zero, so ANY successful block —
+    ///         at any decisiveness between quorum and supermajority — resolves
+    ///         to that single shared value. Pins that the quadratic term
+    ///         vanishes cleanly rather than leaving rounding dust.
+    function test_severity_collapsedBandSingleValue() public {
+        // Squeeze the band to a point at 5000/5000. Order matters: lower the
+        // ceiling first (5000 ≥ minSlashBps 1000, ≥ maxDelegatedSlashBps 2000),
+        // then raise the floor to meet it (5000 ≤ maxSlashBps 5000).
+        vm.startPrank(regOwner);
+        swood.setMaxSlashBps(5000);
+        swood.setMinSlashBps(5000);
+        vm.stopPrank();
+
+        // Mid fraction strictly between quorum (3000) and supermajority (6667):
+        // exercises the ramp branch, which must still collapse to lo == hi.
+        uint256 mid = Q + (SUPERMAJORITY_BPS - Q) / 2; // 4833
+        _runReviewWithBlockFraction(mid);
+        // severity == 5000 regardless of t → exactly half the stake remains.
+        assertEq(swood.guardianStake(approver1), _initialStake * 5000 / 10_000);
     }
 
     function test_severity_degenerateQuorumAboveSupermajority() public {

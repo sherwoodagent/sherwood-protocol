@@ -696,6 +696,10 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         if (qBps >= SUPERMAJORITY_BPS || bBps >= SUPERMAJORITY_BPS) return hi;
         if (bBps <= qBps) return lo;
         // t in 1e18 fixed point; severity = lo + (hi - lo) * t^2.
+        // Two de-scalings: the inner `t * t / 1e18` yields t^2 still in 1e18
+        // fixed point; the outer `* (hi - lo) / 1e18` then applies that t^2 as
+        // a fraction of the (hi - lo) span, landing back in plain bps. When
+        // hi == lo the span is 0 and the ramp term vanishes to a clean `lo`.
         uint256 t = (bBps - qBps) * 1e18 / (SUPERMAJORITY_BPS - qBps);
         return lo + (hi - lo) * (t * t / 1e18) / 1e18;
     }
