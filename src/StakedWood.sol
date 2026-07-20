@@ -515,14 +515,20 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     ///      discounted by `_ageFactorBps` (linear ramp from `ageFloorBps` at
     ///      stake time to par at `maturationPeriod` — spec §4 of
     ///      2026-07-19-slash-cap-age-weighted-voting-design.md); it drops to 0
-    ///      once the guardian requests unstake. The delegated term is
-    ///      independent and flat. Totals (`getPastTotalVotes`,
-    ///      `getPastTotalSupply`) deliberately stay RAW — aging only shrinks
-    ///      numerators, so the raw denominator is conservative (spec §5).
+    ///      once the guardian requests unstake. The delegated term is capped
+    ///      at `delegatedWeightCapX × agedOwn`: the cap base being AGED means
+    ///      delegation cannot bypass maturation, and a zero-own (or
+    ///      unstake-requested → 0-checkpoint) guardian carries no delegated
+    ///      weight. The cap bounds VOTING POWER only — the pool's slashable
+    ///      base stays the raw inbound snapshot. Totals (`getPastTotalVotes`,
+    ///      `getPastTotalSupply`) deliberately stay RAW — aging and the k-cap
+    ///      only shrink numerators, so the raw denominator is conservative
+    ///      (spec §5).
     function getPastVotes(address guardian, uint256 timestamp) public view returns (uint256) {
         uint256 rawOwn = _stakeCheckpoints[guardian].upperLookupRecent(uint32(timestamp));
         uint256 agedOwn = rawOwn * _ageFactorBps(_guardians[guardian].stakedAt, timestamp) / 10_000;
-        return agedOwn + getPastDelegatedInbound(guardian, timestamp);
+        uint256 delegated = getPastDelegatedInbound(guardian, timestamp);
+        return agedOwn + Math.min(delegated, delegatedWeightCapX * agedOwn);
     }
 
     /// @notice Total guardian vote weight (quorum denominator) at a past timestamp.

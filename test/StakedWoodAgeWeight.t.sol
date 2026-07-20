@@ -89,25 +89,77 @@ contract StakedWoodAgeWeightTest is Test {
         assertEq(swood.getPastTotalVotes(block.timestamp), 100e18);
     }
 
-    /// @notice Task-2 baseline the Task-4 k-cap will flip: the delegated
-    ///         inbound term is FLAT (100%) even while the guardian's own
-    ///         stake is discounted to the age floor. Task 4 changes this to
-    ///         min(delegated, delegatedWeightCapX × agedOwn).
-    function test_ageWeight_delegatedTermFlatWhileOwnDiscounted() public {
-        vm.prank(alice);
-        swood.stakeAsGuardian(100e18, 1);
-
+    /// @dev Enables delegation (owner), funds bob, and delegates `amount` to
+    ///      `to` — shared fixture for the k-cap tests below.
+    function _delegateFromBob(address to, uint256 amount) internal {
         vm.prank(owner);
         swood.setDelegationEnabled(true);
-        wood.mint(bob, 200e18);
+        wood.mint(bob, amount);
         vm.startPrank(bob);
         wood.approve(address(swood), type(uint256).max);
-        swood.delegateStake(alice, 200e18);
+        swood.delegateStake(to, amount);
         vm.stopPrank();
+    }
 
-        // Same-block read: own term at the 25% floor (age 0), delegated
-        // term un-aged at 100%.
-        assertEq(swood.getVotes(alice), 25e18 + 200e18);
+    /// @notice Own-discount + delegated-term interaction (Task-4 flip of the
+    ///         Task-2 flat baseline): the delegated inbound term is capped at
+    ///         min(delegated, delegatedWeightCapX × agedOwn), with the AGED
+    ///         own weight as the cap base — so an age-0 guardian's cap is
+    ///         floored along with their own weight (spec §5).
+    function test_ageWeight_delegatedTermCappedByAgedOwn() public {
+        vm.prank(alice);
+        swood.stakeAsGuardian(100e18, 1);
+        _delegateFromBob(alice, 200e18);
+        // Same-block read: own term at the 25% floor (age 0) → agedOwn =
+        // 25e18, cap = 4 × 25e18 = 100e18 < 200e18 raw inbound.
+        assertEq(swood.getVotes(alice), 25e18 + 100e18);
+    }
+
+    // ── delegated-weight k-cap (spec §5, Task 4) ──
+
+    /// @notice Delegated inbound above `delegatedWeightCapX × agedOwn` is
+    ///         clipped to the cap: 1000e18 raw inbound counts as only
+    ///         4 × 100e18 for a fully matured 100e18 own stake.
+    function test_delegatedWeight_cappedAtKTimesAgedOwn() public {
+        vm.prank(alice);
+        swood.stakeAsGuardian(100e18, 1);
+        skip(30 days); // alice at par: agedOwn = 100e18
+        _delegateFromBob(alice, 1000e18); // raw inbound 1000e18
+        // cap = 4 × 100e18 = 400e18 → total = 100 + 400.
+        assertEq(swood.getVotes(alice), 500e18);
+    }
+
+    /// @notice Delegated inbound under the cap counts flat (no discount).
+    function test_delegatedWeight_underCapCountsFlat() public {
+        vm.prank(alice);
+        swood.stakeAsGuardian(100e18, 1);
+        skip(30 days);
+        _delegateFromBob(alice, 300e18); // under the 400e18 cap
+        assertEq(swood.getVotes(alice), 400e18);
+    }
+
+    /// @notice The cap base is AGED own weight, so the cap itself matures
+    ///         with the guardian — aging is NOT bypassable via delegation
+    ///         (spec Part C, aged cap base).
+    function test_delegatedWeight_capScalesWithAge() public {
+        vm.prank(alice);
+        swood.stakeAsGuardian(100e18, 1); // age 0: agedOwn = 25e18
+        _delegateFromBob(alice, 1000e18);
+        // cap = 4 × 25e18 = 100e18 → total = 125e18.
+        assertEq(swood.getVotes(alice), 125e18);
+    }
+
+    /// @notice Zero own votable weight ⇒ zero cap ⇒ zero total: a guardian
+    ///         with a pending unstake request (own checkpoint 0) carries NO
+    ///         delegated weight, however large the pool.
+    function test_delegatedWeight_zeroOwnZeroesDelegated() public {
+        vm.prank(alice);
+        swood.stakeAsGuardian(100e18, 1);
+        skip(30 days);
+        _delegateFromBob(alice, 1000e18);
+        vm.prank(alice);
+        swood.requestUnstakeGuardian();
+        assertEq(swood.getVotes(alice), 0);
     }
 
     // ── stakedAt lifecycle (spec §4): top-up re-anchor + request reset ──

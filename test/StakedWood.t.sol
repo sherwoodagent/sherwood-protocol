@@ -822,7 +822,7 @@ contract StakedWoodTest is Test {
         swood.delegateStake(bob, 300e18);
 
         // Age-weighted voting: mature bob's own stake to par (the delegated
-        // term is flat and unaffected by age).
+        // 300 is far under the k-cap of 4 × 10_000e18, so it counts flat).
         skip(30 days);
         uint256 ts = vm.getBlockTimestamp();
 
@@ -849,7 +849,7 @@ contract StakedWoodTest is Test {
         assertEq(swood.getPastVotes(alice, ts), 10_000e18);
     }
 
-    function test_getPastVotes_afterUnstakeRequest_returnsDelegatedOnly() public {
+    function test_getPastVotes_afterUnstakeRequest_returnsZero() public {
         // Bob self-stakes 10k as an active guardian (so he can be a delegate).
         wood.mint(bob, 100_000e18);
         vm.prank(bob);
@@ -872,9 +872,10 @@ contract StakedWoodTest is Test {
         uint256 ts = vm.getBlockTimestamp();
         vm.warp(vm.getBlockTimestamp() + 1);
 
-        // Own-stake term is 0 after the unstake request; delegated inbound
-        // (300) is independent and survives.
-        assertEq(swood.getPastVotes(bob, ts), 300e18);
+        // Own-stake term is 0 after the unstake request, and the delegated
+        // term is capped at delegatedWeightCapX × agedOwn = 0 — so the whole
+        // vote weight drops to zero (spec §5: zero own ⇒ zero cap).
+        assertEq(swood.getPastVotes(bob, ts), 0);
     }
 
     // ── getVotes: current vote weight (Snapshot-compatible read surface) ──
@@ -894,7 +895,7 @@ contract StakedWoodTest is Test {
         swood.delegateStake(bob, 300e18);
 
         // Age-weighted voting: mature bob's own stake to par (the delegated
-        // term is flat and unaffected by age).
+        // 300 is far under the k-cap of 4 × 10_000e18, so it counts flat).
         skip(30 days);
 
         // Current votes = own stake (10k) + delegated inbound (300).
@@ -925,8 +926,9 @@ contract StakedWoodTest is Test {
         swood.requestUnstakeGuardian();
         uint256 ts = vm.getBlockTimestamp();
 
-        // Own term is 0; delegated inbound (300) is independent and survives.
-        assertEq(swood.getVotes(bob), 300e18);
+        // Own term is 0, so the k-cap zeroes the delegated term too — total
+        // vote weight is 0 (spec §5: zero own ⇒ zero cap).
+        assertEq(swood.getVotes(bob), 0);
 
         // Consistent with the historical read at the same instant.
         vm.warp(vm.getBlockTimestamp() + 1);
