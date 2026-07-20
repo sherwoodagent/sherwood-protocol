@@ -1009,6 +1009,44 @@ contract StakedWoodSlashingTest is Test {
         assertEq(swood.guardianStake(alice), 20_000e18, "own stake untouched");
     }
 
+    /// @notice Regression (PR #5 review, imthatcarlos): a delegation that
+    ///         arrives AFTER review-open must not inflate the approver's
+    ///         own-bond spill. With no at-open delegated exposure
+    ///         (`snapDelegated == 0`), the spill basis is 0 — the guardian
+    ///         bond owes nothing, even though a post-open pool now exists.
+    ///         Pre-fix the fallback sized the spill off the CURRENT pool
+    ///         (`oldPool + unbondPool`), letting a third party grief an
+    ///         about-to-be-slashed approver by delegating to them after open
+    ///         (`delegateStake` is permissionless), paying only the capped
+    ///         pool loss themselves while destroying extra own bond.
+    function test_slash_postOpenDelegation_doesNotInflateOwnSpill() public {
+        vm.prank(bob);
+        swood.stakeAsGuardian(10_000e18, 1);
+
+        // Open with NO delegations → snapDelegated at openedAt is 0.
+        vm.warp(vm.getBlockTimestamp() + 1);
+        uint256 openedAt = vm.getBlockTimestamp();
+        assertEq(swood.getPastDelegatedInbound(bob, openedAt), 0, "no at-open exposure");
+
+        // A third party delegates AFTER open — the griefing vector.
+        vm.warp(vm.getBlockTimestamp() + 1);
+        vm.prank(carol);
+        swood.delegateStake(bob, 1_000e18);
+
+        // Slash at S = 5000 (> C = 2000): under the old fallback the bond
+        // would eat spill = 1_000 × (5000 − 2000)/10_000 = 300e18.
+        address[] memory approvers = new address[](1);
+        approvers[0] = bob;
+        vm.prank(registry);
+        uint256 total = swood.slashGuardians(bytes32(uint256(42)), openedAt, approvers, 5000);
+
+        // Own stake: ONLY the base own slash (50% of 10k), NO spill.
+        assertEq(swood.guardianStake(bob), 5_000e18, "own stake: base slash only, no post-open spill");
+        // Carol's pool IS still slashed — at the capped rate (her capital).
+        assertEq(swood.poolTokens(bob), 800e18, "pool slashed at capped 20%");
+        assertEq(total, 5_200e18, "own 5k + capped pool 200; zero spill");
+    }
+
     // ── Delegated-slash cap C + first-loss spill (spec 2026-07-19 Part A) ──
     //    C = maxDelegatedSlashBps = 2000 (20%) in the setUp fixture. The
     //    delegated legs (live + unbonding pools) are slashed at min(S, C);

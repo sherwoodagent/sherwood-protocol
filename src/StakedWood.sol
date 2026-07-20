@@ -633,11 +633,12 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
         minOwnerStake = v;
     }
 
-    /// @notice Set the lower clamp bound for the graduated slash severity.
-    /// @dev Owner-only. Must keep `minSlashBps <= maxSlashBps < 10_000`.
-    ///      The implicit ceiling is `maxSlashBps < 10_000` (enforced by
-    ///      `setMaxSlashBps` / `initialize`), so this only needs to gate
-    ///      against `v > maxSlashBps`.
+    /// @notice Set the floor of the deterministic slash severity.
+    /// @dev Owner-only. Must keep `minSlashBps <= maxSlashBps`, where
+    ///      `maxSlashBps <= 10_000` (a full-100% own-stake ceiling is legal;
+    ///      the C-2 pool-bricking guard lives on `maxDelegatedSlashBps`,
+    ///      enforced by `setMaxSlashBps` / `initialize`). So this only needs
+    ///      to gate against `v > maxSlashBps`.
     function setMinSlashBps(uint256 v) external onlyOwner {
         if (v > maxSlashBps) revert InvalidParameter();
         emit ParameterChangeFinalized(PARAM_MIN_SLASH_BPS, minSlashBps, v);
@@ -1078,6 +1079,17 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
         // uninformative snapshot — no `openedAt` passed (tests / pre-snapshot
         // proposals) OR genuinely no delegations at open. Fall back to slashing
         // the full live pool AND the full unbonding pool, at the capped rate.
+        //
+        // The SPILL basis is 0 in this branch, NOT `oldPool + unbondPool`.
+        // The spill charges the guardian's OWN bond for delegated damage the
+        // cap absorbed, sized on AT-OPEN exposure. With `snapDelegated == 0`
+        // there was no at-open exposure, so the design-doc formula
+        // `excess = snapDelegated × (S − min(S,C)) / 10_000` is 0. Sizing the
+        // spill off the current pools instead would let a third party inflate
+        // an about-to-be-slashed approver's own-bond loss by delegating to
+        // them AFTER review-open (`delegateStake` is permissionless), paying
+        // only the capped pool loss themselves. The delegators' pools are
+        // still slashed below (their capital); the bond simply owes no spill.
         uint256 poolBps = Math.min(slashBps, maxDelegatedSlashBps);
         uint256 unbondPool = unbondingPoolTokens[approver];
         uint256 delSlashBasis;
@@ -1086,7 +1098,7 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
         if (snapDelegated == 0) {
             delSlashBasis = oldPool;
             unbondBasis = unbondPool;
-            spillBasis = oldPool + unbondPool;
+            spillBasis = 0;
         } else {
             delSlashBasis = Math.min(snapDelegated, oldPool);
             // Remaining budget after the live pool spills to the unbonding pool.
