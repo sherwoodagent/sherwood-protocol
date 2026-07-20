@@ -45,10 +45,12 @@ interface IStakedWood {
     // Snapshot's `erc20-votes` strategy consumes. sWOOD intentionally does NOT
     // implement the full OZ `IVotes` (no `delegate` / `delegates` /
     // `delegateBySig`) — sWOOD delegation is the custodial DPoS mechanism, a
-    // different concept. Vote weight = own staked + delegated-inbound.
+    // different concept. Vote weight = AGE-WEIGHTED own staked +
+    // delegated-inbound capped at `delegatedWeightCapX ×` aged own.
 
-    /// @notice An account's CURRENT vote weight: own votable stake + delegated
-    ///         inbound. Live counterpart of `getPastVotes`.
+    /// @notice An account's CURRENT vote weight: age-weighted own votable
+    ///         stake + k-capped delegated inbound. Live counterpart of
+    ///         `getPastVotes`.
     function getVotes(address account) external view returns (uint256);
 
     /// @notice Guardian's own + delegated vote weight at a past timestamp.

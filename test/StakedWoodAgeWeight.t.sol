@@ -138,6 +138,16 @@ contract StakedWoodAgeWeightTest is Test {
         assertEq(swood.getVotes(alice), 400e18);
     }
 
+    /// @notice Exactly AT the cap counts in full — pins the `min()` boundary
+    ///         (inclusive) against future `<`/`<=` refactors.
+    function test_delegatedWeight_exactlyAtCapCountsFlat() public {
+        vm.prank(alice);
+        swood.stakeAsGuardian(100e18, 1);
+        skip(30 days); // par: agedOwn = 100e18, cap = 4 × 100e18
+        _delegateFromBob(alice, 400e18); // == cap
+        assertEq(swood.getVotes(alice), 500e18);
+    }
+
     /// @notice The cap base is AGED own weight, so the cap itself matures
     ///         with the guardian — aging is NOT bypassable via delegation
     ///         (spec Part C, aged cap base).

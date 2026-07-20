@@ -548,7 +548,8 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     // which is a different mechanism (stake-pool shares, not vote re-pointing).
     // Vote weight = AGE-WEIGHTED own staked WOOD (linear discount-to-par via
     // `_ageFactorBps`; votable — zero once unstake is requested) +
-    // delegated-inbound WOOD. Totals stay raw (conservative denominator).
+    // delegated-inbound WOOD capped at `delegatedWeightCapX ×` aged own.
+    // Totals stay raw (conservative denominator).
 
     /// @notice An account's CURRENT vote weight: own votable stake + delegated
     ///         inbound. The live counterpart of `getPastVotes`.
@@ -557,8 +558,8 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     ///      key `uint32(block.timestamp)`, and `upperLookupRecent` includes a
     ///      checkpoint written in the current block — so a same-block lookup
     ///      returns the live value. A guardian with a pending unstake request
-    ///      has a 0 own-stake checkpoint, so the own term is 0; the
-    ///      delegated-inbound term is independent.
+    ///      has a 0 own-stake checkpoint, so BOTH the own term and the
+    ///      k-capped delegated term are 0 (cap = `delegatedWeightCapX × 0`).
     function getVotes(address account) external view returns (uint256) {
         return getPastVotes(account, block.timestamp);
     }
