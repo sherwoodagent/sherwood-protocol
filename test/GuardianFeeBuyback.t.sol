@@ -346,11 +346,11 @@ contract GuardianFeeBuyback_RegistryWeightsTest is RegistryTestHarness {
         _openReview();
 
         vm.prank(approver);
-        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Approve, 0);
+        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Approve);
         vm.prank(approver2);
-        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Approve, 0);
+        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Approve);
         vm.prank(blocker);
-        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Block, 0);
+        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Block);
 
         (address[] memory approvers, uint128[] memory weights, uint128 totalApproveWeight) =
             registry.getApproverWeights(address(governor), PID);
@@ -371,13 +371,13 @@ contract GuardianFeeBuyback_RegistryWeightsTest is RegistryTestHarness {
         _openReview();
 
         vm.prank(approver);
-        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Approve, 0);
+        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Approve);
         vm.prank(approver2);
-        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Approve, 0);
+        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Approve);
 
         // approver2 flips Approve -> Block, leaving only `approver`.
         vm.prank(approver2);
-        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Block, 0);
+        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Block);
 
         (address[] memory approvers, uint128[] memory weights, uint128 totalApproveWeight) =
             registry.getApproverWeights(address(governor), PID);
@@ -392,9 +392,9 @@ contract GuardianFeeBuyback_RegistryWeightsTest is RegistryTestHarness {
         (, uint256 reviewEnd) = _openReview();
 
         vm.prank(approver);
-        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Approve, 0);
+        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Approve);
         vm.prank(approver2);
-        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Approve, 0);
+        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Approve);
 
         vm.warp(reviewEnd);
         registry.resolveReview(address(governor), PID);

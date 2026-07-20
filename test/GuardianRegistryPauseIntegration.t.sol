@@ -108,7 +108,7 @@ contract GuardianRegistryPauseIntegrationTest is RegistryTestHarness {
         // voteOnProposal frozen.
         vm.prank(guardian);
         vm.expectRevert(IGuardianRegistry.ProtocolPaused.selector);
-        registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Approve, 0);
+        registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Approve);
 
         // A new guardian can still stake via sWOOD during the registry pause.
         address guardian2 = makeAddr("guardian2");

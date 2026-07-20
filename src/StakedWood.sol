@@ -137,11 +137,13 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     bytes32 public constant PARAM_MIN_OWNER_STAKE = keccak256("minOwnerStake");
 
     /// @notice Parameter key for `minSlashBps`.
-    /// @dev Graduated slash severity — lower clamp bound for the voted median.
+    /// @dev Deterministic slash severity — floor of the registry's
+    ///      decisiveness ramp (spec 2026-07-19 Part D).
     bytes32 public constant PARAM_MIN_SLASH_BPS = keccak256("minSlashBps");
 
     /// @notice Parameter key for `maxSlashBps`.
-    /// @dev Graduated slash severity — upper clamp bound for the voted median.
+    /// @dev Deterministic slash severity — ceiling of the registry's
+    ///      decisiveness ramp (spec 2026-07-19 Part D).
     bytes32 public constant PARAM_MAX_SLASH_BPS = keccak256("maxSlashBps");
 
     /// @notice Parameter key for `maxDelegatedSlashBps`.
@@ -266,13 +268,14 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     /// @dev Relocated verbatim from `GuardianRegistry` (set in `initialize`).
     uint256 public minOwnerStake;
 
-    /// @notice Lower clamp bound (bps) for the graduated slash severity.
-    /// @dev The registry computes the stake-weighted median of blockers'
-    ///      proposed `slashBps` and clamps it to `[minSlashBps, maxSlashBps]`.
+    /// @notice Floor (bps) of the deterministic slash severity.
+    /// @dev The registry's `_severityBps` ramps quadratically with block-side
+    ///      decisiveness from this floor (at a scraped block quorum) to
+    ///      `maxSlashBps` (at 2/3 supermajority) — spec 2026-07-19 Part D.
     ///      A non-zero floor preserves the deterrent. See spec §6/§7.
     uint256 public minSlashBps;
 
-    /// @notice Upper clamp bound (bps) for the graduated slash severity.
+    /// @notice Ceiling (bps) of the deterministic slash severity.
     /// @dev May be a full `10_000` (100%) — the ceiling only sizes the
     ///      approver's OWN-stake slash, which is a plain integer subtraction
     ///      with no share math to brick. The C-2 pool-bricking guard that used

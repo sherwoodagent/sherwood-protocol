@@ -293,7 +293,7 @@ contract GuardianHandler is Test {
             ? IGuardianRegistry.GuardianVoteType.Approve
             : IGuardianRegistry.GuardianVoteType.Block;
         vm.prank(a);
-        try registry.voteOnProposal(address(governor), pid, s, 0) {} catch {}
+        try registry.voteOnProposal(address(governor), pid, s) {} catch {}
     }
 
     function openReview(uint256 proposalSeed) external {

@@ -142,9 +142,9 @@ contract GuardianNetworkForkTest is Test {
         assertFalse(blocked, "A: not blocked yet");
 
         vm.prank(g1);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve);
         vm.prank(g2);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve);
 
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
         governor.executeProposal(pid);
@@ -208,11 +208,11 @@ contract GuardianNetworkForkTest is Test {
         // g1 approves; g2+g3 block.
         // Block weight = 60k / 90k total = 66.7% >= 30% quorum -> BLOCKED.
         vm.prank(g1);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve);
         vm.prank(g2);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, 10_000);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block);
         vm.prank(g3);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, 10_000);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block);
 
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
 
@@ -230,16 +230,19 @@ contract GuardianNetworkForkTest is Test {
         vm.expectRevert(ISyndicateGovernor.ProposalNotApproved.selector);
         governor.executeProposal(pid);
 
-        // Approver (g1) slashed at maxSlashBps (9999).
+        // Approver (g1) slashed at the deterministic Part D severity:
+        //   bBps = 60_000/90_000 = 6666 (floor); q = 3000; lo = 1000; hi = 9999
+        //   t = 3666e18/3667 ≈ 0.999727e18 → t² ≈ 0.999455e18
+        //   severity = 1000 + ⌊8999 × t²/1e36⌋ = 9994 bps
         assertLt(swood.guardianStake(g1), g1StakeBefore, "B: g1 stake slashed");
 
         // Slashed WOOD burned to 0xdEaD.
         assertGt(wood.balanceOf(BURN_ADDRESS), burnBefore, "B: WOOD burned");
         assertApproxEqAbs(
             wood.balanceOf(BURN_ADDRESS) - burnBefore,
-            (g1StakeBefore * 9999) / 10_000,
+            (g1StakeBefore * 9994) / 10_000,
             1e18,
-            "B: burn amount matches 9999-bps slash"
+            "B: burn amount matches deterministic 9994-bps slash"
         );
 
         // Blockers untouched.
@@ -270,7 +273,7 @@ contract GuardianNetworkForkTest is Test {
         vm.prank(keeper);
         registry.openReview(address(governor), pid);
         vm.prank(g1);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve);
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
         governor.executeProposal(pid);
 
