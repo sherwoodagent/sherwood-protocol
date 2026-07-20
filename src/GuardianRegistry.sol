@@ -56,6 +56,9 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     ///         `resolveReview` cannot be gas-DoS'd.
     uint256 public constant MAX_BLOCKERS_PER_PROPOSAL = 100;
     uint256 public constant LATE_VOTE_LOCKOUT_BPS = 1000;
+    /// @notice Block decisiveness (bps of at-open total weight) at which the
+    ///         deterministic severity hits `maxSlashBps`. 2/3 supermajority.
+    uint256 public constant SUPERMAJORITY_BPS = 6_667;
     uint256 public constant MAX_REFUND_PER_EPOCH_BPS = 2000;
     uint256 public constant DEADMAN_UNPAUSE_DELAY = 7 days;
     uint256 public constant MAX_CALLS_PER_PROPOSAL = 64;
@@ -87,20 +90,13 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     /// @dev Per-(key, voter) snapshot of the voter's vote weight at the
     ///      instant their review vote was recorded. Read by the off-chain Merkl
     ///      bot via `getApproverWeights` to attribute the (off-chain) guardian
-    ///      fee. The slash snapshot lives on sWOOD (`recordVoteStake` mirrors
-    ///      it there for slashing).
+    ///      fee. Vote accounting only — slashing is sized on sWOOD from its
+    ///      own raw own-stake checkpoint at `openedAt` (spec 2026-07-19 §5).
     mapping(bytes32 => mapping(address => uint128)) internal _voteStake;
     mapping(bytes32 => address[]) internal _approvers;
     mapping(bytes32 => address[]) internal _blockers;
     mapping(bytes32 => mapping(address => uint256)) internal _approverIndex;
     mapping(bytes32 => mapping(address => uint256)) internal _blockerIndex;
-    /// @dev Per-(key, blocker) proposed slash severity in bps, set when a
-    ///      guardian casts a Block vote. Task 6.2 takes the stake-weighted
-    ///      median of these (over `_blockers[key]`) and clamps it at
-    ///      `resolveReview`. Only meaningful for current Block voters — a
-    ///      vote-change away from Block prunes the address from `_blockers`
-    ///      via `_removeBlocker`, so the median never reads a stale entry.
-    mapping(bytes32 => mapping(address => uint256)) public blockerSlashBps;
 
     struct EmergencyReview {
         bytes32 callsHash;
@@ -327,18 +323,11 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     ///      called and `voteEnd <= now < reviewEnd`. Snapshots the caller's
     ///      vote weight at `r.openedAt` (read from sWOOD's `getPastVotes`) into
     ///      `_voteStake[key][caller]` and adds it to the chosen side's
-    ///      tally. Approvers and Blockers are each capped.
-    ///
-    ///      For Approve votes the snapshot is mirrored to sWOOD via
-    ///      `recordVoteStake` so a later `slashGuardians` can size the slash.
-    /// @param slashBps Proposed slash severity for a Block vote. Stored in
-    ///        `blockerSlashBps` and median-aggregated + clamped at
-    ///        `resolveReview` (Task 6.2). Ignored for Approve votes — NOT
-    ///        bounds-checked here: clamping happens on the median.
-    function voteOnProposal(address governor, uint256 proposalId, GuardianVoteType support, uint256 slashBps)
-        external
-        whenNotPaused
-    {
+    ///      tally. Approvers and Blockers are each capped. Block votes carry
+    ///      no proposed severity: the slash severity is not voted — it is a
+    ///      deterministic function of block-side decisiveness computed at
+    ///      `resolveReview` (see `_severityBps`, spec 2026-07-19 Part D).
+    function voteOnProposal(address governor, uint256 proposalId, GuardianVoteType support) external whenNotPaused {
         if (support == GuardianVoteType.None) revert();
         if (!_authorizedGovernors.contains(governor)) revert UnauthorizedGovernor();
 
@@ -369,13 +358,9 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
             if (support == GuardianVoteType.Approve) {
                 _pushApprover(key, proposalId, msg.sender);
                 r.approveStakeWeight += weight;
-                // Mirror the snapshot to sWOOD so `slashGuardians` can size
-                // the slash against the exact weight voted with.
-                swood.recordVoteStake(key, msg.sender, weight);
             } else {
                 _pushBlocker(key, proposalId, msg.sender);
                 r.blockStakeWeight += weight;
-                blockerSlashBps[key][msg.sender] = slashBps;
             }
             _votes[key][msg.sender] = support;
             emit GuardianVoteCast(proposalId, msg.sender, support, weight);
@@ -395,9 +380,6 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
                 r.approveStakeWeight -= weight;
                 _pushBlocker(key, proposalId, msg.sender); // cap pre-checked above -- must succeed
                 r.blockStakeWeight += weight;
-                blockerSlashBps[key][msg.sender] = slashBps;
-                // No longer an approver — drop the sWOOD slash snapshot.
-                swood.recordVoteStake(key, msg.sender, 0);
             } else {
                 // Block -> Approve.
                 if (_approvers[key].length >= MAX_APPROVERS_PER_PROPOSAL) revert NewSideFull();
@@ -405,8 +387,6 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
                 r.blockStakeWeight -= weight;
                 _pushApprover(key, proposalId, msg.sender); // cap pre-checked above -- must succeed
                 r.approveStakeWeight += weight;
-                // Now an approver — record the slash snapshot on sWOOD.
-                swood.recordVoteStake(key, msg.sender, weight);
             }
             _votes[key][msg.sender] = support;
             emit GuardianVoteChanged(proposalId, msg.sender, existing, support);
@@ -675,15 +655,18 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         r.blocked = blocked_;
 
         if (blocked_) {
-            // Slash every approver. The slash factor is the stake-weighted
-            // median of the blockers' proposed severities, clamped to the
-            // owner-set `[minSlashBps, maxSlashBps]` band on sWOOD. The burn
-            // and re-checkpoint all happen on sWOOD.
+            // Slash every approver. The slash factor is DETERMINISTIC — a
+            // quadratic ramp of block-side decisiveness from the at-open
+            // block quorum (floor: `minSlashBps`) to SUPERMAJORITY_BPS
+            // (ceiling: `maxSlashBps`), computed by `_severityBps` from the
+            // Review's at-open snapshots. Severity is not voted (spec
+            // 2026-07-19 Part D). The burn and re-checkpoint all happen on
+            // sWOOD.
             //
             // Sherlock run #3 #6: pass `r.openedAt` so sWOOD's `_slashOne`
             // can isolate the own-stake portion of each approver's combined
             // snapshot via `getPastDelegatedInbound(approver, openedAt)`.
-            swood.slashGuardians(key, uint256(r.openedAt), _approvers[key], _weightedMedianSlashBps(key));
+            swood.slashGuardians(key, uint256(r.openedAt), _approvers[key], _severityBps(r));
             _emitBlockerAttribution(key, governor, proposalId);
         }
 
@@ -691,70 +674,34 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         return blocked_;
     }
 
-    /// @dev Stake-weighted median of the current Block voters' proposed
-    ///      `slashBps`, clamped to sWOOD's `[minSlashBps, maxSlashBps]` band
-    ///      (where `maxSlashBps < 10_000` — C-2 pool-bricking defense, so a
-    ///      blocker voting `slashBps == 10_000` is clamped DOWN to
-    ///      `maxSlashBps`). Each blocker's weight is
-    ///      `_voteStake[key][blocker]` — the exact per-blocker weight
-    ///      that fed the block-quorum tally, so the median weighting matches
-    ///      the quorum weighting. `_blockers` is capped at
-    ///      `MAX_BLOCKERS_PER_PROPOSAL`, so the O(n^2) insertion sort is
-    ///      bounded. The median is the `slashBps` of the first pair (sorted
-    ///      ascending by `slashBps`) whose cumulative weight reaches >= 50% of
-    ///      total blocker weight. Fallback: if total weight is 0 (cannot occur
-    ///      once quorum is reached, but defensive), return `minSlashBps`.
-    function _weightedMedianSlashBps(bytes32 key) private view returns (uint256) {
+    /// @dev Deterministic slash severity from block-side decisiveness
+    ///      (spec 2026-07-19 Part D). Replaces the blocker-voted
+    ///      stake-weighted median: the winning side of a review must not
+    ///      choose the losers' penalty. Quadratic ramp from the at-open
+    ///      block quorum (floor — a scraped quorum is a genuinely contested
+    ///      call) to SUPERMAJORITY_BPS (ceiling — overwhelming condemnation).
+    ///      Approvers cannot lower it (honest blockers' weight is not theirs
+    ///      to remove) and blockers gain nothing by inflating it (slashed
+    ///      WOOD burns; blocker rewards are epoch-level, not
+    ///      slash-proportional). Only called when the block quorum was
+    ///      reached, so bBps >= qBps up to rounding; the bBps <= qBps branch
+    ///      floors defensively.
+    function _severityBps(Review storage r) private view returns (uint256) {
         uint256 lo = swood.minSlashBps();
         uint256 hi = swood.maxSlashBps();
-
-        address[] storage blockers = _blockers[key];
-        uint256 n = blockers.length;
-        if (n == 0) return lo;
-
-        // Collect (slashBps, weight) pairs.
-        uint256[] memory bps = new uint256[](n);
-        uint256[] memory wts = new uint256[](n);
-        uint256 totalWeight;
-        for (uint256 i = 0; i < n; i++) {
-            address b = blockers[i];
-            bps[i] = blockerSlashBps[key][b];
-            uint256 w = _voteStake[key][b];
-            wts[i] = w;
-            totalWeight += w;
-        }
-        if (totalWeight == 0) return lo;
-
-        // Insertion sort by `slashBps` ascending (n <= MAX_BLOCKERS_PER_PROPOSAL).
-        for (uint256 i = 1; i < n; i++) {
-            uint256 keyBps = bps[i];
-            uint256 keyWt = wts[i];
-            uint256 j = i;
-            while (j > 0 && bps[j - 1] > keyBps) {
-                bps[j] = bps[j - 1];
-                wts[j] = wts[j - 1];
-                j--;
-            }
-            bps[j] = keyBps;
-            wts[j] = keyWt;
-        }
-
-        // Walk cumulative weight; median = first pair reaching >= 50%.
-        // `* 2 >=` avoids a rounding-down division of an odd `totalWeight`.
-        uint256 cumulative;
-        uint256 median = bps[n - 1];
-        for (uint256 i = 0; i < n; i++) {
-            cumulative += wts[i];
-            if (cumulative * 2 >= totalWeight) {
-                median = bps[i];
-                break;
-            }
-        }
-
-        // Clamp to the owner-set band.
-        if (median < lo) return lo;
-        if (median > hi) return hi;
-        return median;
+        uint256 denom = uint256(r.totalStakeAtOpen) + uint256(r.totalDelegatedAtOpen);
+        if (denom == 0) return lo; // defensive: a reached quorum implies denom > 0
+        uint256 bBps = uint256(r.blockStakeWeight) * 10_000 / denom;
+        uint256 qBps = uint256(r.blockQuorumBpsAtOpen);
+        if (qBps >= SUPERMAJORITY_BPS || bBps >= SUPERMAJORITY_BPS) return hi;
+        if (bBps <= qBps) return lo;
+        // t in 1e18 fixed point; severity = lo + (hi - lo) * t^2.
+        // Two de-scalings: the inner `t * t / 1e18` yields t^2 still in 1e18
+        // fixed point; the outer `* (hi - lo) / 1e18` then applies that t^2 as
+        // a fraction of the (hi - lo) span, landing back in plain bps. When
+        // hi == lo the span is 0 and the ramp term vanishes to a clean `lo`.
+        uint256 t = (bBps - qBps) * 1e18 / (SUPERMAJORITY_BPS - qBps);
+        return lo + (hi - lo) * (t * t / 1e18) / 1e18;
     }
 
     /// @dev Emits `BlockerAttributed(governor, proposalId, epochId, blocker, weight)`

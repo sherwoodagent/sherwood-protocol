@@ -82,7 +82,7 @@ contract MockRegistryMinimal is IGuardianRegistry {
     // Not modeled — revert loudly. Interface conformance stubs only.
     // ─────────────────────────────────────────────────────────────────────
 
-    function voteOnProposal(address, uint256, GuardianVoteType, uint256) external pure {
+    function voteOnProposal(address, uint256, GuardianVoteType) external pure {
         revert NotImplemented();
     }
 

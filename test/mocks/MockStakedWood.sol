@@ -10,7 +10,7 @@ import {IStakedWood} from "../../src/interfaces/IStakedWood.sol";
 ///         `GuardianRegistry` / `SyndicateGovernor` surfaces without needing a
 ///         full `StakedWood` proxy + WOOD-staking setup. Every read is a
 ///         settable storage slot; the registry-only mutations
-///         (`slashGuardians`, `slashOwnerBond`, `recordVoteStake`) are no-ops
+///         (`slashGuardians`, `slashOwnerBond`) are no-ops
 ///         that record their last arguments so emergency-flow tests can assert
 ///         the governor/registry called sWOOD.
 ///
@@ -54,7 +54,6 @@ contract MockStakedWood is IStakedWood {
     uint256 public lastSlashBps;
     uint256 public slashOwnerBondCallCount;
     address public lastSlashedVault;
-    mapping(bytes32 => mapping(address => uint128)) public recordedVoteStake;
 
     // ── Setters ──
     function setWood(address w) external {
@@ -226,9 +225,9 @@ contract MockStakedWood is IStakedWood {
     }
 
     // ── Registry-only mutations (no-op stubs that record args) ──
-    // Sherlock run #3 #6: signature gained `openedAt` so sWOOD can isolate the
-    // own-stake portion of the combined `voteStake` snapshot via
-    // `getPastDelegatedInbound(approver, openedAt)`. Mock ignores it.
+    // Sherlock run #3 #6: signature carries `openedAt` — sWOOD sizes the own
+    // and delegated slash legs off disjoint at-open snapshots (raw own-stake
+    // checkpoint + `getPastDelegatedInbound`). Mock ignores it.
     function slashGuardians(
         bytes32 reviewKey,
         uint256,
@@ -247,10 +246,6 @@ contract MockStakedWood is IStakedWood {
         slashOwnerBondCallCount++;
         lastSlashedVault = vault;
         _ownerStake[vault] = 0;
-    }
-
-    function recordVoteStake(bytes32 reviewKey, address voter, uint128 weight) external {
-        recordedVoteStake[reviewKey][voter] = weight;
     }
 
     // ── Unused interface methods (revert if a test exercises a path the mock

@@ -44,7 +44,7 @@ contract MockRegistryMinimalTest is Test {
 
     function test_stubbedFunction_revertsNotImplemented() public {
         vm.expectRevert(MockRegistryMinimal.NotImplemented.selector);
-        mock.voteOnProposal(address(this), 1, IGuardianRegistry.GuardianVoteType.Approve, 0);
+        mock.voteOnProposal(address(this), 1, IGuardianRegistry.GuardianVoteType.Approve);
 
         vm.expectRevert(MockRegistryMinimal.NotImplemented.selector);
         mock.openReview(address(this), 1);

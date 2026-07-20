@@ -45,10 +45,12 @@ interface IStakedWood {
     // Snapshot's `erc20-votes` strategy consumes. sWOOD intentionally does NOT
     // implement the full OZ `IVotes` (no `delegate` / `delegates` /
     // `delegateBySig`) — sWOOD delegation is the custodial DPoS mechanism, a
-    // different concept. Vote weight = own staked + delegated-inbound.
+    // different concept. Vote weight = AGE-WEIGHTED own staked +
+    // delegated-inbound capped at `delegatedWeightCapX ×` aged own.
 
-    /// @notice An account's CURRENT vote weight: own votable stake + delegated
-    ///         inbound. Live counterpart of `getPastVotes`.
+    /// @notice An account's CURRENT vote weight: age-weighted own votable
+    ///         stake + k-capped delegated inbound. Live counterpart of
+    ///         `getPastVotes`.
     function getVotes(address account) external view returns (uint256);
 
     /// @notice Guardian's own + delegated vote weight at a past timestamp.
@@ -111,16 +113,19 @@ interface IStakedWood {
     function maxSlashBps() external view returns (uint256);
 
     // ── Registry-only mutations ──
-    /// @notice Slash `approvers` by `slashBps` for a blocked proposal. Burns
-    ///         each approver's own stake plus a pro-rata share of their
-    ///         delegated pool. Registry-only.
+    /// @notice Slash `approvers` for a blocked proposal. Burns `slashBps` of
+    ///         each approver's own stake plus `min(slashBps,
+    ///         maxDelegatedSlashBps)` of their delegated pools (pro-rata via
+    ///         the share model); the uncovered delegated remainder spills onto
+    ///         the approver's own remaining stake (first-loss bond, spec
+    ///         2026-07-19 Part A). Registry-only.
     /// @param reviewKey  Composite review key keccak256(abi.encode(governor, proposalId)) whose approvers are slashed.
-    /// @param openedAt   Snapshot timestamp the review's vote-weight snapshot
-    ///                   (`recordVoteStake`) was captured at. Used by
-    ///                   `_slashOne` to recover each approver's pure-own-stake
-    ///                   portion via `getPastDelegatedInbound(approver, openedAt)`
-    ///                   so the own-stake slash isn't sized off the combined
-    ///                   weight (Sherlock run #3 #6).
+    /// @param openedAt   The review's open timestamp. `_slashOne` sizes each
+    ///                   approver's own slash off their raw own-stake
+    ///                   checkpoint at this instant and the delegated legs off
+    ///                   `getPastDelegatedInbound(approver, openedAt)` — two
+    ///                   disjoint at-open snapshots (Sherlock run #3 #6: no
+    ///                   double-slash of the delegated contribution).
     /// @param approvers  Plain `address[]` of approver addresses to slash.
     /// @param slashBps   Slash fraction in basis points.
     function slashGuardians(bytes32 reviewKey, uint256 openedAt, address[] calldata approvers, uint256 slashBps)
@@ -129,11 +134,6 @@ interface IStakedWood {
     /// @notice Burn the owner bond bound to `vault` (emergency-settle failure).
     ///         Registry-only.
     function slashOwnerBond(address vault) external;
-
-    /// @notice Snapshot a voter's vote weight for a proposal so a later
-    ///         `slashGuardians` can slash the exact amount voted with.
-    ///         Registry-only.
-    function recordVoteStake(bytes32 reviewKey, address voter, uint128 weight) external;
 
     // ── Admin (owner-instant; owner is a multisig with external delay) ──
     function setMinGuardianStake(uint256 newMin) external;

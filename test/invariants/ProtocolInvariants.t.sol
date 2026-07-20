@@ -106,7 +106,11 @@ contract ProtocolInvariantsTest is StdInvariant, Test {
                                     coolDownPeriod: COOL_DOWN,
                                     minOwnerStake: MIN_OWNER_STAKE,
                                     minSlashBps: 1000,
-                                    maxSlashBps: 9999
+                                    maxSlashBps: 9999,
+                                    maxDelegatedSlashBps: 2000,
+                                    ageFloorBps: 2500,
+                                    maturationPeriod: 30 days,
+                                    delegatedWeightCapX: 4
                                 }))
                         )
                     )
