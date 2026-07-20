@@ -480,14 +480,34 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
         return _guardians[guardian].stakedAmount;
     }
 
+    /// @dev Linear discount-to-par age factor (bps of raw stake). Weight
+    ///      ramps from `ageFloorBps` at age 0 to 10_000 (par) at
+    ///      `maturationPeriod`, then plateaus — never exceeds raw stake, so
+    ///      the raw checkpointed totals remain a valid (conservative) quorum
+    ///      denominator. `ts < stakedAt_` (a past read after a forward
+    ///      re-anchor) saturates to age 0 — drift is deflation-only.
+    function _ageFactorBps(uint64 stakedAt_, uint256 ts) internal view returns (uint256) {
+        if (stakedAt_ == 0) return ageFloorBps; // never staked in this era
+        uint256 age = ts > stakedAt_ ? ts - uint256(stakedAt_) : 0;
+        uint256 m = maturationPeriod;
+        if (age >= m) return 10_000;
+        return ageFloorBps + ((10_000 - ageFloorBps) * age) / m;
+    }
+
     /// @notice A guardian's total votable weight at a past timestamp.
-    /// @dev Votes = own checkpointed stake + delegated inbound (`poolTokens`)
-    ///      at `timestamp`. The own-stake checkpoint drops to 0 once the
-    ///      guardian requests unstake; the delegated term is independent.
+    /// @dev Votes = AGE-WEIGHTED own checkpointed stake + delegated inbound
+    ///      (`poolTokens`) at `timestamp`. The own term is the raw checkpoint
+    ///      discounted by `_ageFactorBps` (linear ramp from `ageFloorBps` at
+    ///      stake time to par at `maturationPeriod` — spec §4 of
+    ///      2026-07-19-slash-cap-age-weighted-voting-design.md); it drops to 0
+    ///      once the guardian requests unstake. The delegated term is
+    ///      independent and flat. Totals (`getPastTotalVotes`,
+    ///      `getPastTotalSupply`) deliberately stay RAW — aging only shrinks
+    ///      numerators, so the raw denominator is conservative (spec §5).
     function getPastVotes(address guardian, uint256 timestamp) public view returns (uint256) {
-        return
-            _stakeCheckpoints[guardian].upperLookupRecent(uint32(timestamp))
-                + getPastDelegatedInbound(guardian, timestamp);
+        uint256 rawOwn = _stakeCheckpoints[guardian].upperLookupRecent(uint32(timestamp));
+        uint256 agedOwn = rawOwn * _ageFactorBps(_guardians[guardian].stakedAt, timestamp) / 10_000;
+        return agedOwn + getPastDelegatedInbound(guardian, timestamp);
     }
 
     /// @notice Total guardian vote weight (quorum denominator) at a past timestamp.
@@ -505,8 +525,9 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     // implement the full OZ `IVotes` interface: `delegate` / `delegates` /
     // `delegateBySig` would collide with sWOOD's custodial DPoS delegation,
     // which is a different mechanism (stake-pool shares, not vote re-pointing).
-    // Vote weight = own staked WOOD (votable — zero once unstake is requested)
-    // + delegated-inbound WOOD.
+    // Vote weight = AGE-WEIGHTED own staked WOOD (linear discount-to-par via
+    // `_ageFactorBps`; votable — zero once unstake is requested) +
+    // delegated-inbound WOOD. Totals stay raw (conservative denominator).
 
     /// @notice An account's CURRENT vote weight: own votable stake + delegated
     ///         inbound. The live counterpart of `getPastVotes`.

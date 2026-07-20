@@ -99,6 +99,10 @@ contract StakedWoodSlashingTest is Test {
         // Alice stakes 20k as a guardian.
         vm.prank(alice);
         swood.stakeAsGuardian(20_000e18, 1);
+
+        // Age-weighted voting: mature to par so the pre-slash checkpoint read
+        // below returns raw stake.
+        skip(30 days);
         uint256 stakedAt = vm.getBlockTimestamp();
 
         // Registry snapshots alice's vote stake at 20k for proposal 1.
@@ -408,6 +412,10 @@ contract StakedWoodSlashingTest is Test {
     function test_unbonding_excludedFromVotesAndQuorum() public {
         vm.prank(bob);
         swood.stakeAsGuardian(10_000e18, 1);
+
+        // Age-weighted voting: mature bob's own stake to par.
+        skip(30 days);
+
         vm.prank(alice);
         swood.delegateStake(bob, 400e18);
 

@@ -147,6 +147,10 @@ contract GuardianRegistryVoteTest is RegistryTestHarness {
             _stakeGuardian(_guardian(i), 10_000e18, 1 + i);
         }
 
+        // Age-weighted voting: mature the cohort to par so vote-weight
+        // assertions below read the full staked amount.
+        skip(30 days);
+
         // ToB C-1: openReview snapshots at `block.timestamp - 1`.
         vm.warp(vm.getBlockTimestamp() + 1);
 
@@ -497,6 +501,10 @@ contract GuardianRegistryResolveTest is RegistryTestHarness {
             _stakeGuardian(_guardian(i), 10_000e18, 1 + i);
         }
 
+        // Age-weighted voting: mature the cohort to par so quorum/slash math
+        // below runs on full stake weight.
+        skip(30 days);
+
         // ToB C-1: warp past stake checkpoints so openReview can see them.
         vm.warp(vm.getBlockTimestamp() + 1);
 
@@ -768,6 +776,10 @@ contract GuardianRegistryEmergencyTest is RegistryTestHarness {
         for (uint256 i = 0; i < 5; i++) {
             _stakeGuardian(_guardian(i), 10_000e18, 1 + i);
         }
+
+        // Age-weighted voting: mature the cohort to par so emergency block
+        // votes carry full stake weight against the raw snapshot denominator.
+        skip(30 days);
 
         // ToB C-1: warp past stake checkpoints so openEmergency can see them.
         vm.warp(vm.getBlockTimestamp() + 1);
@@ -1250,6 +1262,9 @@ contract GuardianRegistryMedianSlashTest is RegistryTestHarness {
         for (uint256 i = 0; i < 5; i++) {
             _stakeGuardian(_guardian(i), 10_000e18, 1 + i);
         }
+        // Age-weighted voting: mature to par — median weights and slash bases
+        // below assume full stake weight.
+        skip(30 days);
         vm.warp(vm.getBlockTimestamp() + 1); // ToB C-1
         voteEnd = vm.getBlockTimestamp();
         reviewEnd = voteEnd + REVIEW_PERIOD;

@@ -327,6 +327,10 @@ contract GuardianFeeBuyback_RegistryWeightsTest is RegistryTestHarness {
         _stakeGuardian(approver, 30_000e18, 1);
         _stakeGuardian(approver2, 20_000e18, 2);
         _stakeGuardian(blocker, 20_000e18, 3);
+
+        // Age-weighted voting: mature the cohort to par so recorded approver
+        // weights equal raw stake.
+        skip(30 days);
     }
 
     function _openReview() internal returns (uint256 voteEnd, uint256 reviewEnd) {

@@ -88,12 +88,14 @@ contract StakedWoodTest is Test {
     function test_stakeAsGuardian_checkpointsPastVotes() public {
         vm.prank(alice);
         swood.stakeAsGuardian(10_000e18, 42);
-        uint256 stakedAt = vm.getBlockTimestamp();
 
-        // Checkpoints at t-1 are 0; warp forward so the stake checkpoint is in
-        // the past relative to the read site.
+        // Age-weighted voting: mature the stake to par, then read the
+        // checkpoint at a matured timestamp in the past relative to the
+        // read site (checkpoints before the stake are 0).
+        skip(30 days);
+        uint256 maturedAt = vm.getBlockTimestamp();
         vm.warp(vm.getBlockTimestamp() + 1);
-        assertEq(swood.getPastVotes(alice, stakedAt), 10_000e18);
+        assertEq(swood.getPastVotes(alice, maturedAt), 10_000e18);
     }
 
     // ── Guardian unstake cooldown (relocated from GuardianRegistry) ──
@@ -118,6 +120,9 @@ contract StakedWoodTest is Test {
     function test_cancelUnstakeGuardian_restoresVotingPower() public {
         vm.prank(alice);
         swood.stakeAsGuardian(10_000e18, 42);
+
+        // Age-weighted voting: mature to par before the request/cancel cycle.
+        skip(30 days);
 
         vm.warp(vm.getBlockTimestamp() + 1);
         vm.prank(alice);
@@ -811,6 +816,10 @@ contract StakedWoodTest is Test {
         swood.setDelegationEnabled(true);
         vm.prank(alice);
         swood.delegateStake(bob, 300e18);
+
+        // Age-weighted voting: mature bob's own stake to par (the delegated
+        // term is flat and unaffected by age).
+        skip(30 days);
         uint256 ts = vm.getBlockTimestamp();
 
         // Warp forward so the checkpoints are in the past relative to the read.
@@ -824,6 +833,9 @@ contract StakedWoodTest is Test {
     function test_getPastVotes_ownStakeOnlyWhenNoInboundDelegation() public {
         vm.prank(alice);
         swood.stakeAsGuardian(10_000e18, 42);
+
+        // Age-weighted voting: mature to par so votes equal raw stake.
+        skip(30 days);
         uint256 ts = vm.getBlockTimestamp();
 
         vm.warp(vm.getBlockTimestamp() + 1);
@@ -876,6 +888,10 @@ contract StakedWoodTest is Test {
         swood.setDelegationEnabled(true);
         vm.prank(alice);
         swood.delegateStake(bob, 300e18);
+
+        // Age-weighted voting: mature bob's own stake to par (the delegated
+        // term is flat and unaffected by age).
+        skip(30 days);
 
         // Current votes = own stake (10k) + delegated inbound (300).
         assertEq(swood.getVotes(bob), 10_000e18 + 300e18);
@@ -963,6 +979,9 @@ contract StakedWoodTest is Test {
         // Alice self-stakes 10k with no inbound delegation.
         vm.prank(alice);
         swood.stakeAsGuardian(10_000e18, 42);
+
+        // Age-weighted voting: mature to par so votes equal raw stake.
+        skip(30 days);
 
         // Votes = own stake only; the delegated term is 0 (not a revert).
         assertEq(swood.getVotes(alice), 10_000e18);

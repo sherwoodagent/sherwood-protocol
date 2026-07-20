@@ -213,6 +213,10 @@ contract GovernorEmergencyTest is Test {
         wood.approve(address(swood), type(uint256).max);
         vm.prank(guardianB);
         swood.stakeAsGuardian(GUARDIAN_STAKE, 2);
+
+        // Age-weighted voting: mature both guardians to par so emergency
+        // block votes carry full stake weight.
+        skip(30 days);
     }
 
     // ──────────────────────────────────────────────────────────────

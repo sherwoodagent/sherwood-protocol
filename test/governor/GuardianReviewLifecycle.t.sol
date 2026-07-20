@@ -205,6 +205,10 @@ contract GuardianReviewLifecycleTest is Test {
         _stakeGuardian(g3, GUARDIAN_STAKE, 3);
         _stakeGuardian(g4, GUARDIAN_STAKE, 4);
         _stakeGuardian(g5, GUARDIAN_STAKE, 5);
+
+        // Age-weighted voting: mature the cohort to par so block-quorum math
+        // below runs on full stake weight.
+        skip(30 days);
     }
 
     // ──────────────────────────────────────────────────────────────
@@ -441,6 +445,10 @@ contract GuardianReviewLifecycleTest is Test {
         _stakeGuardian(g8, MIN_GUARDIAN_STAKE, 8);
         _stakeGuardian(g9, MIN_GUARDIAN_STAKE, 9);
         _stakeGuardian(g10, MIN_GUARDIAN_STAKE, 10);
+
+        // Age-weighted voting: mature the freshly staked blockers to par so
+        // their block votes carry full weight against the raw denominator.
+        skip(30 days);
 
         uint256 pid = _propose();
         _voteFor(pid);

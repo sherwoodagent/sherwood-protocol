@@ -86,6 +86,10 @@ contract GuardianRegistryCompositeKeyTest is Test {
         _stake(guardian2, 2);
         _stake(guardian3, 3);
 
+        // Age-weighted voting: mature the cohort to par so vote weights equal
+        // raw stake.
+        skip(30 days);
+
         // C-1: reviews snapshot votable stake at t-1 — advance past staking.
         vm.warp(vm.getBlockTimestamp() + 1);
     }

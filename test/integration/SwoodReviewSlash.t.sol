@@ -279,6 +279,10 @@ contract SwoodReviewSlashTest is Test {
         // Delegators delegate into the approver guardian's DPoS pool.
         _delegate(del1, gApprove, DEL1_AMOUNT);
         _delegate(del2, gApprove, DEL2_AMOUNT);
+
+        // Age-weighted voting: mature the cohort to par so median weights and
+        // slash bases below run on full stake weight.
+        skip(30 days);
     }
 
     // ── Helpers ──
