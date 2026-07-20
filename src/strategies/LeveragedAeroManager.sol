@@ -45,8 +45,11 @@ interface IAeroRouter {
 ///         the clone's diamond storage.
 ///
 ///         CORRUPTION-CRITICAL slot discipline: `Layout`, `STORAGE_SLOT`, and `_layout()` are
-///         byte-identical to the strategy's — they MUST stay in lockstep or a delegatecall reads/
-///         writes the wrong slots. Do not reorder `Layout` fields in one file without the other.
+///         shared with the strategy via the single `LeveragedAeroStorage` definition — the
+///         COMPILER enforces strategy↔manager identity (no hand-maintained lockstep remains).
+///         Field order stays frozen for the already-deployed clone lineages: append-only,
+///         guarded by the golden snapshot in `script/check-storage-parity.sh` (CI) and the
+///         raw-slot pins in `test/LeveragedAeroLayoutParity.t.sol`.
 ///
 ///         Never touches `vault()` / `proposer()` / shares / fees (those stay in the strategy
 ///         entrypoints); it only reads config + position state and performs venue calls.
