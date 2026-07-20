@@ -129,6 +129,11 @@ interface ISyndicateVault {
     function settleRedeem(uint256 shares, uint256 assets, address to) external; // queue-only
     function settleDeposit(uint256 shares, address to) external; // queue-only
     function onProposalSettled(uint256 proposalId) external; // governor-only
+    /// @notice Signed LP asset flow (Lane A deposits − instant exits) accrued
+    ///         while the current proposal is active. The governor subtracts this
+    ///         from the settlement float delta so mid-proposal flows don't
+    ///         corrupt strategy PnL (and fees aren't charged on principal).
+    function interimNetFlow() external view returns (int256);
     function strategyMint(address to, uint256 shares) external; // active-strategy-only
     function strategyBurn(uint256 shares) external; // active-strategy-only
 

@@ -645,7 +645,12 @@ contract SyndicateVault is
         (, bool laneA) = _liveNAV();
         if (!laneA) return 0;
         address strat = _activeStrategy();
-        if (strat == address(0)) return 0;
+        // `strat == 0` OR a codeless strat ⇒ 0. The code-length guard is load-
+        // bearing: a high-level call to a codeless address reverts on Solidity's
+        // extcodesize check *before* try/catch can trap it, which would brick
+        // `maxWithdraw`/`maxRedeem`. try/catch still guards a coded strat that
+        // reverts or lacks the selector.
+        if (strat == address(0) || strat.code.length == 0) return 0;
         try IStrategy(strat).availableLiquidity() returns (uint256 l) {
             return l;
         } catch {
@@ -748,6 +753,9 @@ contract SyndicateVault is
         // settles — closes the deposit-low / exit-high intra-proposal MEV.
         if (laneA) {
             _laneALockPid[receiver] = _activePid();
+            // Mid-proposal principal in — excluded from settlement PnL so
+            // performance fees are never charged on depositor principal.
+            _interimNetFlow += int256(assets);
         }
     }
 
@@ -778,6 +786,11 @@ contract SyndicateVault is
             }
         }
         super._withdraw(caller, receiver, _owner, assets, shares);
+        // Mid-proposal principal out — excluded from settlement PnL. Queue
+        // settlements post-date the PnL read, so only live instant exits count.
+        if (caller != _withdrawalQueue && redemptionsLocked()) {
+            _interimNetFlow -= int256(assets);
+        }
     }
 
     /// @dev Cap visible to integrators so they don't propose withdrawals that
@@ -975,11 +988,19 @@ contract SyndicateVault is
     ///         price. `num/den` carry the ERC-4626 virtual offsets so the queue
     ///         reproduces the vault's conversion rounding exactly.
     function onProposalSettled(uint256 proposalId) external onlyGovernor {
+        // Reset the interim-flow accumulator for the next proposal. MUST precede
+        // the no-queue early-return below so a queueless vault still resets.
+        delete _interimNetFlow;
         address q = _withdrawalQueue;
         if (q == address(0)) return;
         uint256 num = totalAssets() + 1;
         uint256 den = totalSupply() + 10 ** _decimalsOffset();
         IVaultWithdrawalQueue(q).stampSettlement(proposalId, num, den);
+    }
+
+    /// @inheritdoc ISyndicateVault
+    function interimNetFlow() external view returns (int256) {
+        return _interimNetFlow;
     }
 
     // ==================== RESCUE ====================

@@ -314,4 +314,58 @@ contract VaultInstantLiquidityTest is Test {
         strat.setLiquidity(0); // default-strategy behavior
         assertEq(vault.maxWithdraw(alice), 100e6, "capped at float");
     }
+
+    // ── Task 5: interim net-flow tracking ──
+
+    function test_interimNetFlow_tracksLaneADeposit() public {
+        _enterAndLock(1_000e6, 900e6, 900e6);
+        vm.prank(bob);
+        vault.deposit(300e6, bob);
+        assertEq(vault.interimNetFlow(), int256(300e6), "deposit tracked");
+    }
+
+    function test_interimNetFlow_tracksInstantExit() public {
+        _enterAndLock(1_000e6, 900e6, 900e6);
+        vm.prank(alice);
+        vault.withdraw(500e6, alice, alice);
+        assertEq(vault.interimNetFlow(), -int256(500e6), "exit tracked");
+    }
+
+    function test_interimNetFlow_notTrackedOutsideProposal() public {
+        vm.prank(alice);
+        vault.deposit(1_000e6, alice);
+        vm.prank(alice);
+        vault.withdraw(400e6, alice, alice);
+        assertEq(vault.interimNetFlow(), 0, "no proposal, no tracking");
+    }
+
+    function test_interimNetFlow_resetOnSettle() public {
+        _enterAndLock(1_000e6, 900e6, 900e6);
+        vm.prank(bob);
+        vault.deposit(300e6, bob);
+        _setLocked(false); // proposal cleared
+        vm.prank(MOCK_GOVERNOR);
+        vault.onProposalSettled(PID);
+        assertEq(vault.interimNetFlow(), 0, "reset at settlement stamp");
+    }
+
+    /// @notice The governor-side formula: float delta minus netflow == true
+    ///         strategy PnL. Break-even strategy + 300e6 mid-proposal deposit
+    ///         + 200e6 instant exit → formula must yield exactly 0.
+    function test_settlementPnl_excludesLaneAFlows() public {
+        _enterAndLock(1_000e6, 900e6, 900e6);
+        uint256 snapshot = 1_000e6; // governor's pre-execute capital snapshot
+
+        vm.prank(bob);
+        vault.deposit(300e6, bob); // principal in — not strategy performance
+
+        vm.prank(alice);
+        vault.withdraw(200e6, alice, alice); // principal out (float covers it)
+
+        // Strategy breaks even: return everything it still holds.
+        strat.pushBack(usdc.balanceOf(address(strat)));
+
+        int256 pnl = int256(usdc.balanceOf(address(vault))) - int256(snapshot) - vault.interimNetFlow();
+        assertEq(pnl, 0, "flows excluded: break-even strategy shows zero pnl");
+    }
 }

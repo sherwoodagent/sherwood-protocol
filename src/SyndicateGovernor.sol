@@ -904,14 +904,17 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         address vault = proposal.vault;
         address asset = IERC4626(vault).asset();
 
-        // Asset-only measurement (see NatSpec above). Subtract the live-adapter
-        // V2 live-NAV: liveAdapterPrincipal / liveAdapterWithdrawn deleted.
-        // PnL is the plain realized float delta (vault balance minus snapshot).
+        // Asset-only measurement (see NatSpec above). PnL is the realized float
+        // delta minus the interim LP net flow: Lane A deposits and instant
+        // exits during the proposal move the vault's float but are principal,
+        // not strategy performance, so charging fees on them would be wrong.
+        // The vault resets the accumulator in `onProposalSettled` (called below,
+        // after fees).
         // forge-lint: disable-next-line(unsafe-typecast)
         uint256 snapshot = _capitalSnapshots[proposalId];
         // forge-lint: disable-next-line(unsafe-typecast)
         uint256 balanceAdjusted = IERC20(asset).balanceOf(vault);
-        pnl = int256(balanceAdjusted) - int256(snapshot);
+        pnl = int256(balanceAdjusted) - int256(snapshot) - ISyndicateVault(vault).interimNetFlow();
 
         // Finalize state before external transfers to prevent reentrancy on stale state
         _activeProposal = 0;
