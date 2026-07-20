@@ -59,6 +59,33 @@ contract MoonwellSupplyStrategy is BaseStrategy {
         ps[0] = Position({venue: mToken, kind: keccak256("MOONWELL_SUPPLY"), ref: ""});
     }
 
+    /// @inheritdoc IStrategy
+    /// @dev On-demand liquidity = our redeemable underlying, capped by the
+    ///      market's available cash. `exchangeRateStored` (no accrual) slightly
+    ///      understates — fine for a serviceability signal; the vault verifies
+    ///      actual delivery by balance-diff. 0 unless Executed.
+    function availableLiquidity() external view override returns (uint256) {
+        if (_state != State.Executed) return 0;
+        uint256 held = (ICToken(mToken).balanceOf(address(this)) * ICToken(mToken).exchangeRateStored()) / 1e18;
+        uint256 cash = ICToken(mToken).getCash();
+        return held < cash ? held : cash;
+    }
+
+    /// @inheritdoc IStrategy
+    /// @dev Mid-lifecycle partial redeem for the vault's instant-exit path.
+    ///      Redeems exactly `assets` underlying and pushes it back; the rest of
+    ///      the position keeps earning until `settle()`. Vault-only.
+    function withdrawTo(uint256 assets) external override onlyVault {
+        if (_state != State.Executed) revert NotExecuted();
+        uint256 err = ICToken(mToken).redeemUnderlying(assets);
+        if (err != 0) revert RedeemFailed();
+        if (address(this).balance > 0) {
+            if (!isNativeEthMarket) revert EthWrapFailed();
+            IWETH(underlying).deposit{value: address(this).balance}();
+        }
+        _pushToVault(underlying, assets);
+    }
+
     /// @notice Decode: (address underlying, address mToken, uint256 supplyAmount,
     ///         uint256 minRedeemAmount, bool isNativeEthMarket)
     function _initialize(bytes calldata data) internal override {

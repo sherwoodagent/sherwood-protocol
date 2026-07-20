@@ -52,6 +52,10 @@ contract MockCToken {
         underlying.transfer(msg.sender, redeemAmount);
         return 0;
     }
+
+    function getCash() external view returns (uint256) {
+        return underlying.balanceOf(address(this));
+    }
 }
 
 contract MoonwellSupplyStrategyTest is Test {
@@ -337,5 +341,66 @@ contract MoonwellSupplyStrategyTest is Test {
         usdc.approve(address(strategy), SUPPLY_AMOUNT);
         vm.prank(vault);
         strategy.execute();
+    }
+
+    // ==================== ON-DEMAND EXIT (withdrawTo / availableLiquidity) ====================
+
+    function test_availableLiquidity_zeroBeforeExecute() public view {
+        assertEq(strategy.availableLiquidity(), 0, "no liquidity while Pending");
+    }
+
+    function test_availableLiquidity_afterExecute() public {
+        _executeStrategy();
+        // 50_000 mTokens at 1:1, market cash (200k seed + 50k supplied) far exceeds it.
+        assertEq(strategy.availableLiquidity(), SUPPLY_AMOUNT, "redeemable underlying");
+    }
+
+    function test_availableLiquidity_cappedByMarketCash() public {
+        _executeStrategy();
+        // Drain the market's cash below our position so liquidity is cash-capped.
+        // Compute the amount BEFORE the prank (vm.prank applies to the next call).
+        uint256 drain = usdc.balanceOf(address(mUsdc)) - 10_000e6;
+        vm.prank(address(mUsdc));
+        usdc.transfer(address(0xdead), drain);
+        assertEq(strategy.availableLiquidity(), 10_000e6, "capped by market cash");
+    }
+
+    function test_withdrawTo_deliversExactAssets_andKeepsPosition() public {
+        _executeStrategy();
+        uint256 vaultBefore = usdc.balanceOf(vault);
+        vm.prank(vault);
+        strategy.withdrawTo(20_000e6);
+        assertEq(usdc.balanceOf(vault) - vaultBefore, 20_000e6, "exact delivery to vault");
+        assertEq(mUsdc.balanceOf(address(strategy)), SUPPLY_AMOUNT - 20_000e6, "position reduced by 20k");
+    }
+
+    function test_withdrawTo_thenSettle_returnsRemainder() public {
+        _executeStrategy();
+        vm.prank(vault);
+        strategy.withdrawTo(20_000e6);
+
+        // Remaining 30k is below the 49_900e6 minRedeem floor — relax it so the
+        // post-partial settle can complete (proposer tunes minRedeem in practice).
+        vm.prank(proposer);
+        strategy.updateParams(abi.encode(0, 1));
+
+        uint256 vaultBefore = usdc.balanceOf(vault);
+        vm.prank(vault);
+        strategy.settle();
+        assertEq(usdc.balanceOf(vault) - vaultBefore, SUPPLY_AMOUNT - 20_000e6, "remainder returned");
+        assertEq(uint256(strategy.state()), uint256(BaseStrategy.State.Settled));
+    }
+
+    function test_withdrawTo_onlyVault() public {
+        _executeStrategy();
+        vm.prank(proposer);
+        vm.expectRevert(BaseStrategy.NotVault.selector);
+        strategy.withdrawTo(1e6);
+    }
+
+    function test_withdrawTo_beforeExecute_reverts() public {
+        vm.prank(vault);
+        vm.expectRevert(BaseStrategy.NotExecuted.selector);
+        strategy.withdrawTo(1e6);
     }
 }
