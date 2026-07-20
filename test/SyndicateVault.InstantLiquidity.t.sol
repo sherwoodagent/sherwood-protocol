@@ -62,6 +62,18 @@ contract MockLiquidStrategy {
     }
 }
 
+/// @notice Minimal concrete BaseStrategy that overrides nothing liquidity-related.
+contract MockDefaultStrategy is BaseStrategy {
+    function name() external pure returns (string memory) {
+        return "Default";
+    }
+
+    function _initialize(bytes calldata) internal override {}
+    function _execute() internal override {}
+    function _settle() internal override {}
+    function _updateParams(bytes calldata) internal override {}
+}
+
 contract VaultInstantLiquidityTest is Test {
     SyndicateVault vault;
     VaultWithdrawalQueue queue;
@@ -224,5 +236,28 @@ contract VaultInstantLiquidityTest is Test {
         strat.pushBack(900e6);
         vm.prank(MOCK_GOVERNOR);
         vault.executeGovernorBatch(new BatchExecutorLib.Call[](0));
+    }
+
+    // ── Task 3: BaseStrategy defaults ──
+
+    function test_baseStrategy_defaults_noOnDemandExit() public {
+        MockDefaultStrategy tmpl = new MockDefaultStrategy();
+        MockDefaultStrategy s = MockDefaultStrategy(payable(Clones.clone(address(tmpl))));
+        s.initialize(address(vault), alice, "");
+
+        assertEq(s.availableLiquidity(), 0, "default: no on-demand liquidity");
+        vm.prank(address(vault));
+        vm.expectRevert(BaseStrategy.OnDemandExitUnsupported.selector);
+        s.withdrawTo(1);
+    }
+
+    function test_baseStrategy_withdrawTo_onlyVault() public {
+        MockDefaultStrategy tmpl = new MockDefaultStrategy();
+        MockDefaultStrategy s = MockDefaultStrategy(payable(Clones.clone(address(tmpl))));
+        s.initialize(address(vault), alice, "");
+
+        vm.prank(alice);
+        vm.expectRevert(BaseStrategy.NotVault.selector);
+        s.withdrawTo(1);
     }
 }
