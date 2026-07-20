@@ -252,4 +252,49 @@ contract VaultWithdrawalQueueTest is Test {
         assertEq(ids[0], 1);
         assertEq(ids[1], 2);
     }
+
+    // ── reserve rounding (phantom-dust regression) ──
+
+    /// @notice `stampSettlement` reserves `floor(Σshares·num/den)` (one aggregate
+    ///         floor) while `claim` pays `floor(shareᵢ·num/den)` per request.
+    ///         Since `floor(Σ) ≥ Σfloor`, a fully-claimed proposal must not
+    ///         strand phantom reserve — else `reservedAssets` drifts above the
+    ///         float that backs the true claimable and accumulates across
+    ///         proposals (INV-Q2: `reserve ≤ float`). Pre-fix this left 1 wei.
+    function test_reserve_noPhantomAfterFullClaim() public {
+        // Price 10/9 ≈ 1.111. Three 3-share requests: each pays floor(30/9)=3
+        // (Σ payout = 9), aggregate reserve floor(90/9)=10 → 1 wei of dust.
+        address carol = makeAddr("carol");
+        _queueRedeem(alice, 3);
+        _queueRedeem(bob, 3);
+        _queueRedeem(carol, 3);
+        vm.prank(address(vault));
+        queue.stampSettlement(PID, 10, 9);
+        assertEq(queue.reservedAssets(), 10, "aggregate reserved at stamp");
+
+        assertEq(queue.claim(1), 3, "per-request payout floors to 3");
+        assertEq(queue.reservedAssets(), 7, "partial release tracks payout");
+        assertEq(queue.claim(2), 3);
+        assertEq(queue.reservedAssets(), 4);
+        assertEq(queue.claim(3), 3);
+        // Final claim frees the whole remainder (incl. the 1-wei dust).
+        assertEq(queue.reservedAssets(), 0, "no phantom reserve after full claim");
+    }
+
+    /// @notice Reserve during partial claims always covers the still-unclaimed
+    ///         obligations (never under-reserves); dust is released only on the
+    ///         emptying claim.
+    function test_reserve_partialClaim_staysCovered() public {
+        address carol = makeAddr("carol");
+        _queueRedeem(alice, 3);
+        _queueRedeem(bob, 3);
+        _queueRedeem(carol, 3);
+        vm.prank(address(vault));
+        queue.stampSettlement(PID, 10, 9);
+
+        queue.claim(1);
+        // Two requests still owed 3 each = 6; reserve holds 7 (≥ 6, dust retained
+        // until the proposal is emptied). Never below the true remaining owed.
+        assertGe(queue.reservedAssets(), 6, "reserve covers remaining owed");
+    }
 }
