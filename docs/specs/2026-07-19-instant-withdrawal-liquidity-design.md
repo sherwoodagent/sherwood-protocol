@@ -1,8 +1,32 @@
 # Instant-Withdrawal Liquidity Design
 
 **Date:** 2026-07-19
-**Status:** Draft for review
+**Status:** Implemented (core) — branch `feat/instant-withdrawal-liquidity`. See `docs/superpowers/plans/2026-07-19-instant-withdrawal-liquidity.md`.
 **Scope:** `SyndicateVault`, `SyndicateGovernor`, `BaseStrategy`/`IStrategy`, `VaultWithdrawalQueue`
+
+---
+
+## 0. Implementation status (2026-07-20)
+
+**Delivered and tested** (both user asks + correct accounting):
+
+- **Part A — enforced idle buffer.** `minBufferBps` (owner-set, ≤50%, default 0) enforced in `executeGovernorBatch` against the pre-batch float. Commits `8bddd57`, `c914fa2`.
+- **Part B — strategy-level liquidity.** `IStrategy.availableLiquidity()`/`withdrawTo()` with inert `BaseStrategy` defaults; `SyndicateVault._withdraw` pulls the shortfall from the active strategy in-tx (balance-diff verified, `UnwindShortfall` on under-delivery), gated on Lane A live-NAV. `maxWithdraw`/`maxRedeem` capacity = float + strategy liquidity. Commits `95cdcce`, `ebb3dba`.
+- **Settlement PnL correction.** `_interimNetFlow` accumulator on the vault; `SyndicateGovernor._finishSettlement` subtracts it so mid-proposal LP flows are never charged fees / misread as strategy loss (also fixes a **pre-existing** fee-on-principal bug). Commit `93354d0`.
+- **Concrete strategy.** `MoonwellSupplyStrategy.availableLiquidity()`/`withdrawTo()` via `redeemUnderlying`, `getCash`-capped. Commit `bea6f6c`.
+- **EIP-170.** Vault was at the 24,576-byte ceiling; cold-path admin logic was extracted to `SyndicateVaultAdminLib` (delegatecall, storage-ref) to free ~1.2 KB (commit `74ffaa7`). A later rescue-function extraction was tried and reverted — small functions cost more in delegatecall dispatch than their inlined bodies save.
+
+**Deferred** (documented, not built):
+
+- **`minHoldingPeriod` anti-flash-arb cooldown (§6).** The vault sits at the EIP-170 ceiling and a lean implementation still needs ~150 B over the ~50 B margin; further library extraction of small functions is counter-productive. The G1 Lane-A per-holder lock (`_laneALockPid`) already blocks the primary intra-proposal deposit→exit MEV, so this is belt-and-suspenders. Storage slots (`minHoldingPeriod`, `lastDepositAt`) remain reserved for a future dedicated size pass.
+- **`instantExitFeeBps` and `maxUnwindSlippageBps` (§6).** As already noted below — G1 covers cycling; slippage is a per-strategy concern (Moonwell `redeemUnderlying` has none).
+
+**Follow-ups for CI (need a Base RPC endpoint unavailable in the dev sandbox):**
+
+- Pinned-block Base fork test for `MoonwellSupplyStrategy.withdrawTo` against the live mUSDC market (mock-based coverage exists and passes).
+- Property-based invariant suite (reserve-seniority, settlement-PnL integrity under interleaved flows, no-exit-without-pricing). The full 1378-test non-fork suite passes; a fuzz harness would further harden the `_interimNetFlow` invariant.
+
+**Known pre-existing bug (out of scope):** `invariant_reservedAssetsLeFloatWhenUnlocked` fails with a 1-wei `reserve > float` off-by-one in the async-redeem queue accounting — reproduced identically on the pre-branch commit. Worth a separate fix.
 
 ---
 
