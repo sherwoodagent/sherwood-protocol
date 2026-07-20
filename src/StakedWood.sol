@@ -434,7 +434,10 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     /// @notice Stake WOOD as a guardian (or top up an existing stake).
     /// @dev Idempotent top-up: on first stake records `agentId` and activates
     ///      the guardian; on subsequent calls the `agentId` arg is ignored.
-    ///      Relocated verbatim from `GuardianRegistry.stakeAsGuardian`.
+    ///      A top-up re-anchors `stakedAt` to the stake-weighted average
+    ///      timestamp (spec 2026-07-19 §4) — new WOOD matures pro-rata rather
+    ///      than inheriting the position's age. Relocated from
+    ///      `GuardianRegistry.stakeAsGuardian`.
     function stakeAsGuardian(uint256 amount, uint256 agentId) external nonReentrant {
         // Stake intentionally not gated by pause: guardians must be able to
         // manage their position (stake/unstake/claim) even during an incident.
@@ -451,11 +454,23 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
         wood.safeTransferFrom(msg.sender, address(this), amount);
 
         bool wasInactive = g.stakedAmount == 0;
-        g.stakedAmount = uint128(newTotal);
         if (wasInactive) {
             g.stakedAt = uint64(block.timestamp);
             g.agentId = agentId; // recorded once; ignored on top-ups
+        } else {
+            // Weighted-average age re-anchor (spec 2026-07-19 §4): a top-up
+            // ages in pro-rata instead of inheriting the old tranche's full
+            // age — closes the "stake dust early, top up the whale position
+            // later, inherit full maturity" hole. Ceil-divide so rounding
+            // moves toward `now`: never grants free age. Overflow-safe:
+            // the old term is uint128 × uint64 < 2^192 and the new term is
+            // bounded by the uint128 stake width × uint64 timestamp — the
+            // sum fits uint256 with headroom.
+            uint256 num = uint256(g.stakedAmount) * uint256(g.stakedAt) + amount * block.timestamp;
+            // forge-lint: disable-next-line(unchecked-cast)
+            g.stakedAt = uint64((num + newTotal - 1) / newTotal);
         }
+        g.stakedAmount = uint128(newTotal);
         totalGuardianStake += amount;
 
         // Checkpoint votable stake for historical quorum lookups.
@@ -673,6 +688,10 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
         // owner can't extend lockup retroactively.
         // forge-lint: disable-next-line(unchecked-cast)
         g.cooldownAtRequest = uint64(coolDownPeriod);
+        // Age clock resets at exit-signal time (spec 2026-07-19 §4): a
+        // request → cancel round-trip restarts maturation; no free
+        // age-parking while the stake is unvotable.
+        g.stakedAt = uint64(block.timestamp);
         totalGuardianStake -= g.stakedAmount;
 
         // Unstake-requested stake is not votable. Push 0 so getPastStake

@@ -263,18 +263,26 @@ contract GuardianRegistryVoteTest is RegistryTestHarness {
         registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Approve, 0);
     }
 
-    function test_voteOnProposal_snapshotsStake() public {
+    function test_voteOnProposal_snapshotsStake_topUpDeflatesNotInflates() public {
         _openReview();
         address g = _guardian(0);
 
-        // Top up AFTER openReview: snapshot weight is frozen at `r.openedAt`,
-        // so the post-open top-up is NOT reflected in vote weight.
+        // Top up AFTER openReview: the RAW checkpoint is frozen at
+        // `r.openedAt`, so the extra 5_000e18 can never inflate vote weight.
+        // But the top-up re-anchors the live `stakedAt` forward (weighted
+        // average, spec 2026-07-19 §4), and `_ageFactorBps` reads the live
+        // anchor — so the past snapshot DEFLATES (drift is deflation-only,
+        // never inflation).
         _stakeGuardian(g, 5_000e18, 42);
         assertEq(swood.guardianStake(g), 15_000e18);
 
-        // First vote snapshots the pre-open weight = 10_000e18.
+        // Vote weight = raw pre-open checkpoint (10_000e18) × re-anchored age
+        // factor. Top-up at openedAt+1 shifts stakedAt forward by
+        // ceil(5_000·(30d+1)/15_000) = 864_001s → age at openedAt =
+        // 2_592_000 − 864_001 = 1_727_999s → factor = 2500 +
+        // ⌊7500·1_727_999/2_592_000⌋ = 7499 bps → 7_499e18.
         vm.expectEmit(true, true, false, true);
-        emit IGuardianRegistry.GuardianVoteCast(PROPOSAL_ID, g, IGuardianRegistry.GuardianVoteType.Block, 10_000e18);
+        emit IGuardianRegistry.GuardianVoteCast(PROPOSAL_ID, g, IGuardianRegistry.GuardianVoteType.Block, 7_499e18);
         vm.prank(g);
         registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Block, 0);
     }

@@ -110,6 +110,56 @@ contract StakedWoodAgeWeightTest is Test {
         assertEq(swood.getVotes(alice), 25e18 + 200e18);
     }
 
+    // ── stakedAt lifecycle (spec §4): top-up re-anchor + request reset ──
+
+    /// @notice A top-up re-anchors `stakedAt` to the stake-weighted average
+    ///         timestamp instead of inheriting the old tranche's full age.
+    ///         100 fully matured + 300 fresh → avg stakedAt = t0 + 22.5d,
+    ///         i.e. age 7.5d at top-up: factor = 2500 + 7500·7.5/30 = 4375.
+    ///         Integer math is exact here: with t0 = 1, t30 = t0 + 30d the
+    ///         numerator 100e18·t0 + 300e18·t30 divides 400e18 evenly.
+    function test_topUp_weightedAverageAge() public {
+        vm.prank(alice);
+        swood.stakeAsGuardian(100e18, 1);
+        skip(30 days); // fully matured
+        vm.prank(alice);
+        swood.stakeAsGuardian(300e18, 1); // top-up 3x at age 0
+        assertEq(swood.getVotes(alice), 400e18 * 4375 / 10_000); // 175e18
+    }
+
+    /// @notice The dust-then-whale exploit: a minimum stake aged to full
+    ///         maturity must NOT lend its age to a 10_000x top-up. The
+    ///         weighted average lands ~259s before `now` (100e18·30d /
+    ///         1_000_100e18), below the 345.6s-per-bps ramp granularity —
+    ///         so the combined position votes at exactly the age floor.
+    function test_topUp_roundsTowardNow() public {
+        vm.prank(alice);
+        swood.stakeAsGuardian(100e18, 1); // minGuardianStake tranche, aged
+        skip(30 days);
+        wood.mint(alice, 1_000_000e18);
+        vm.prank(alice);
+        swood.stakeAsGuardian(1_000_000e18, 1); // whale top-up at age 0
+        uint256 floorW = (1_000_000e18 + 100e18) * 2500 / 10_000;
+        assertEq(swood.getVotes(alice), floorW);
+    }
+
+    /// @notice `requestUnstakeGuardian` resets the age clock: a request →
+    ///         cancel round-trip restarts maturation at request time (no
+    ///         free age-parking while the stake is unvotable). Age at read
+    ///         is 1 day (since the request), not 31 days (since stake).
+    function test_requestUnstake_resetsAgeClock() public {
+        vm.prank(alice);
+        swood.stakeAsGuardian(100e18, 1);
+        skip(30 days);
+        vm.prank(alice);
+        swood.requestUnstakeGuardian();
+        skip(1 days);
+        vm.prank(alice);
+        swood.cancelUnstakeGuardian();
+        // factor = 2500 + 7500 · 1d/30d = 2750.
+        assertEq(swood.getVotes(alice), 100e18 * 2750 / 10_000); // 27.5e18
+    }
+
     /// @notice Boundary one second before maturation: the ramp stays
     ///         strictly below par (floor division), pinning rounding.
     function test_ageWeight_oneSecondBeforeMaturation() public {

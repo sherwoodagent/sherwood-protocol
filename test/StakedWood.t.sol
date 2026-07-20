@@ -117,7 +117,7 @@ contract StakedWoodTest is Test {
         assertEq(swood.getPastVotes(alice, requestedAt), 0);
     }
 
-    function test_cancelUnstakeGuardian_restoresVotingPower() public {
+    function test_cancelUnstakeGuardian_restoresVotingPowerAtResetAge() public {
         vm.prank(alice);
         swood.stakeAsGuardian(10_000e18, 42);
 
@@ -135,8 +135,12 @@ contract StakedWoodTest is Test {
 
         assertEq(swood.totalGuardianStake(), 10_000e18);
 
+        // The stake is votable again, but `requestUnstakeGuardian` reset the
+        // age clock (spec 2026-07-19 §4) — a request → cancel round-trip may
+        // not park age. Age at read = 1s since the request → floor weight
+        // (2500 + 7500·1/30d floors to 2500 bps), NOT the pre-request par.
         vm.warp(vm.getBlockTimestamp() + 1);
-        assertEq(swood.getPastVotes(alice, cancelledAt), 10_000e18);
+        assertEq(swood.getPastVotes(alice, cancelledAt), 10_000e18 * 2500 / 10_000);
     }
 
     function test_claimUnstakeGuardian_afterCooldown_returnsWood() public {
