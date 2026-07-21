@@ -14,11 +14,16 @@ interface ISyndicateGovernor {
     ///      in `GuardianRegistry` (reached via the thin `GovernorEmergency` shims).
     ///
     ///        Draft          → Pending         approveCollaboration (all co-proposers)
+    ///        Draft          → Expired         time (collaborationDeadline passes;
+    ///                                         CollaborationDeadlineExpired + _decOpen)
     ///        Pending        → GuardianReview  time (voteEnd passes, veto not met)
     ///        Pending        → Rejected        time (veto threshold reached)
     ///        GuardianReview → Approved        REGISTRY resolveReview: no block quorum
     ///        GuardianReview → Rejected        REGISTRY resolveReview: blocked
-    ///        Approved       → Executed        executeProposal (anyone, once quorate)
+    ///        Approved       → Executed        executeProposal (anyone; gate is Approved
+    ///                                         state + no other active proposal + cooldown
+    ///                                         elapsed — no for-vote quorum exists in
+    ///                                         this optimistic model)
     ///        Approved       → Expired         time (executeBy passes)
     ///        Executed       → Settled         settleProposal (proposer any time after
     ///                                         1h; anyone after strategyDuration) — or

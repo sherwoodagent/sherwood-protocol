@@ -48,7 +48,8 @@ interface IAeroRouter {
 ///         shared with the strategy via the single `LeveragedAeroStorage` definition — the
 ///         COMPILER enforces strategy↔manager identity (no hand-maintained lockstep remains).
 ///         Field order stays frozen for the already-deployed clone lineages: append-only,
-///         guarded by the golden snapshot in `script/check-storage-parity.sh` (CI) and the
+///         guarded by the golden snapshot in `script/check-storage-parity.sh` (manual /
+///         `forge test`-time invocation; this repo has no CI workflows) and the
 ///         raw-slot pins in `test/LeveragedAeroLayoutParity.t.sol`.
 ///
 ///         Never touches `vault()` / `proposer()` / shares / fees (those stay in the strategy

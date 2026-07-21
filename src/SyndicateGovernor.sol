@@ -963,7 +963,8 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      recipients that voters actually approved, not any post-vote change.
     ///
     ///      ── THE FEE MAP ─ every bps source, its owner, its cap, its snapshot point ──
-    ///      Waterfall order (each stage computed on what the previous left):
+    ///      Stage order (1–2 are parallel slices of gross profit; only 3–4 waterfall,
+    ///      each computed on what the previous left):
     ///        1. protocolFee  = grossPnl · protocolFeeBps
     ///             source: ProtocolConfig.protocolFeeBps (owner: protocol multisig)
     ///             snapshot: propose time → prop.snapshotProtocolFeeBps/-Recipient

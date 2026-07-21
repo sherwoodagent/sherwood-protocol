@@ -9,8 +9,9 @@ import {SyndicateVaultAdminLib} from "../src/SyndicateVaultAdminLib.sol";
 /// @notice Pins the hand-synced mirror constants between the vault and its
 ///         delegatecall admin library. The library duplicates the values
 ///         ("kept in sync by hand" — SyndicateVaultAdminLib.sol) because it
-///         must compile standalone; this test turns silent drift into a CI
-///         failure instead of a behavioral divergence between the vault's
+///         must compile standalone; this test turns silent drift into a
+///         `forge test` failure (this repo has no CI workflows — the guard
+///         fires on any manual run) instead of a behavioral divergence between the vault's
 ///         advertised caps and the library's enforced ones. Same hazard
 ///         family as the LeveragedAero storage-layout lockstep.
 contract SyndicateVaultAdminLibParityTest is Test {
