@@ -26,7 +26,8 @@ import {LeveragedAeroValuation} from "./LeveragedAeroValuation.sol";
 ///         previous cannot: the COMPILER enforces strategy↔manager identity (both import
 ///         this one struct); the GOLDEN SNAPSHOT (`script/leveraged-aero-layout.golden.json`,
 ///         diffed field-by-field, order-significant, by `script/check-storage-parity.sh`
-///         step 1b in CI, mirrored by the raw-slot pins in
+///         step 1b — run manually or alongside `forge test`; this repo has no
+///         CI workflows — mirrored by the raw-slot pins in
 ///         `test/LeveragedAeroLayoutParity.t.sol`) enforces compatibility with the
 ///         already-deployed clone lineages — i.e. it is what catches a reorder/insert in
 ///         THIS struct; and the script's step-4 backstops reject a local re-declaration

@@ -4,7 +4,6 @@ pragma solidity 0.8.28;
 import {Test} from "forge-std/Test.sol";
 import {SyndicateVault} from "../src/SyndicateVault.sol";
 import {ISyndicateVault} from "../src/interfaces/ISyndicateVault.sol";
-import {ISyndicateGovernor} from "../src/interfaces/ISyndicateGovernor.sol";
 import {VaultWithdrawalQueue} from "../src/queue/VaultWithdrawalQueue.sol";
 import {BatchExecutorLib} from "../src/BatchExecutorLib.sol";
 import {BaseStrategy} from "../src/strategies/BaseStrategy.sol";
@@ -12,6 +11,7 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "./mocks/MockAgentRegistry.sol";
+import {MockProposalStatus} from "./mocks/MockProposalStatus.sol";
 
 /// @notice Mock PriceRouter returning a configurable strategy valuation.
 contract MockRouter {
@@ -86,7 +86,9 @@ contract VaultInstantLiquidityTest is Test {
     address owner = makeAddr("owner");
     address alice = makeAddr("alice");
     address bob = makeAddr("bob");
-    address constant MOCK_GOVERNOR = address(0xF00D);
+    /// @dev The canonical seam adapter (IProposalStatus) — replaces the old
+    ///      per-selector vm.mockCall wiring of a phantom governor address.
+    MockProposalStatus governor;
     uint256 constant PID = 1;
 
     function setUp() public {
@@ -114,7 +116,8 @@ contract VaultInstantLiquidityTest is Test {
         vault.setWithdrawalQueue(address(queue));
         strat = new MockLiquidStrategy(usdc, address(vault));
 
-        vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(MOCK_GOVERNOR));
+        governor = new MockProposalStatus();
+        vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
         vm.mockCall(address(this), abi.encodeWithSignature("priceRouter()"), abi.encode(address(router)));
         _setLocked(false);
 
@@ -127,19 +130,8 @@ contract VaultInstantLiquidityTest is Test {
     }
 
     function _setLocked(bool locked) internal {
-        vm.mockCall(
-            MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal()"), abi.encode(locked ? PID : uint256(0))
-        );
-        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("openProposalCount()"), abi.encode(locked ? uint256(1) : 0));
-        if (locked) {
-            ISyndicateGovernor.StrategyProposal memory p;
-            p.id = PID;
-            p.vault = address(vault);
-            p.strategy = address(strat);
-            vm.mockCall(
-                MOCK_GOVERNOR, abi.encodeWithSelector(ISyndicateGovernor.getProposal.selector, PID), abi.encode(p)
-            );
-        }
+        // One adapter call replaces 3 per-selector mockCalls (IProposalStatus seam).
+        governor.set(locked ? PID : 0, locked ? 1 : 0, locked ? address(strat) : address(0));
     }
 
     // ── Task 1: minBufferBps setter ──
@@ -186,11 +178,8 @@ contract VaultInstantLiquidityTest is Test {
     ///      (stands in for a strategy deployment pulling capital).
     function _deployBatch(address to, uint256 amount) internal view returns (BatchExecutorLib.Call[] memory calls) {
         calls = new BatchExecutorLib.Call[](1);
-        calls[0] = BatchExecutorLib.Call({
-            target: address(usdc),
-            data: abi.encodeCall(usdc.transfer, (to, amount)),
-            value: 0
-        });
+        calls[0] =
+            BatchExecutorLib.Call({target: address(usdc), data: abi.encodeCall(usdc.transfer, (to, amount)), value: 0});
     }
 
     // ── Task 2: buffer enforcement ──
@@ -201,7 +190,7 @@ contract VaultInstantLiquidityTest is Test {
         vm.prank(owner);
         vault.setMinBufferBps(1_000); // 10% of 1_000e6 = 100e6 must stay
 
-        vm.prank(MOCK_GOVERNOR);
+        vm.prank(address(governor));
         vault.executeGovernorBatch(_deployBatch(address(strat), 900e6));
         assertEq(usdc.balanceOf(address(vault)), 100e6);
     }
@@ -212,7 +201,7 @@ contract VaultInstantLiquidityTest is Test {
         vm.prank(owner);
         vault.setMinBufferBps(1_000);
 
-        vm.prank(MOCK_GOVERNOR);
+        vm.prank(address(governor));
         vm.expectRevert(ISyndicateVault.BufferBreached.selector);
         vault.executeGovernorBatch(_deployBatch(address(strat), 900e6 + 1));
     }
@@ -220,7 +209,7 @@ contract VaultInstantLiquidityTest is Test {
     function test_governorBatch_bufferOff_allowsFullDeploy() public {
         vm.prank(alice);
         vault.deposit(1_000e6, alice);
-        vm.prank(MOCK_GOVERNOR);
+        vm.prank(address(governor));
         vault.executeGovernorBatch(_deployBatch(address(strat), 1_000e6));
         assertEq(usdc.balanceOf(address(vault)), 0);
     }
@@ -230,11 +219,11 @@ contract VaultInstantLiquidityTest is Test {
         vault.deposit(1_000e6, alice);
         vm.prank(owner);
         vault.setMinBufferBps(1_000);
-        vm.prank(MOCK_GOVERNOR);
+        vm.prank(address(governor));
         vault.executeGovernorBatch(_deployBatch(address(strat), 900e6));
 
         strat.pushBack(900e6);
-        vm.prank(MOCK_GOVERNOR);
+        vm.prank(address(governor));
         vault.executeGovernorBatch(new BatchExecutorLib.Call[](0));
     }
 
@@ -266,7 +255,7 @@ contract VaultInstantLiquidityTest is Test {
     function _enterAndLock(uint256 depositAmt, uint256 deployAmt, uint256 liveVal) internal {
         vm.prank(alice);
         vault.deposit(depositAmt, alice);
-        vm.prank(MOCK_GOVERNOR);
+        vm.prank(address(governor));
         vault.executeGovernorBatch(_deployBatch(address(strat), deployAmt));
         strat.setLiquidity(deployAmt);
         _setLocked(true);
@@ -344,7 +333,7 @@ contract VaultInstantLiquidityTest is Test {
         vm.prank(bob);
         vault.deposit(300e6, bob);
         _setLocked(false); // proposal cleared
-        vm.prank(MOCK_GOVERNOR);
+        vm.prank(address(governor));
         vault.onProposalSettled(PID);
         assertEq(vault.interimNetFlow(), 0, "reset at settlement stamp");
     }

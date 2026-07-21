@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import {ISyndicateVault} from "./interfaces/ISyndicateVault.sol";
 import {ISyndicateGovernor} from "./interfaces/ISyndicateGovernor.sol";
+import {IProposalStatus} from "./interfaces/IProposalStatus.sol";
 import {FeeConstants} from "./FeeConstants.sol";
 import {ISyndicateFactory} from "./interfaces/ISyndicateFactory.sol";
 import {IVaultWithdrawalQueue} from "./interfaces/IVaultWithdrawalQueue.sol";
@@ -406,7 +407,7 @@ contract SyndicateVault is
     ///      paths. Distinct from `redemptionsLocked` / `_activeStrategy`, which
     ///      additionally guard a zero governor — those keep their own reads.
     function _activePid() private view returns (uint256) {
-        return ISyndicateGovernor(_getGovernor()).getActiveProposal();
+        return IProposalStatus(_getGovernor()).getActiveProposal();
     }
 
     /// @inheritdoc ISyndicateVault
@@ -472,7 +473,7 @@ contract SyndicateVault is
     function redemptionsLocked() public view returns (bool) {
         address gov = _getGovernor();
         if (gov == address(0)) revert GovernorNotSet();
-        return ISyndicateGovernor(gov).getActiveProposal() != 0;
+        return IProposalStatus(gov).getActiveProposal() != 0;
     }
 
     /// @inheritdoc ISyndicateVault
@@ -492,9 +493,9 @@ contract SyndicateVault is
     function _activeStrategy() internal view returns (address) {
         address gov = _getGovernor();
         if (gov == address(0)) return address(0);
-        uint256 pid = ISyndicateGovernor(gov).getActiveProposal();
+        uint256 pid = IProposalStatus(gov).getActiveProposal();
         if (pid == 0) return address(0);
-        try ISyndicateGovernor(gov).getProposal(pid) returns (ISyndicateGovernor.StrategyProposal memory p) {
+        try IProposalStatus(gov).getProposal(pid) returns (ISyndicateGovernor.StrategyProposal memory p) {
             return p.strategy;
         } catch {
             return address(0);
@@ -580,7 +581,7 @@ contract SyndicateVault is
     ///      strategy by `executeProposal`. Off-chain readers can call
     ///      `governor.openProposalCount(vault)` directly.
     function _depositsLocked() private view returns (bool) {
-        return ISyndicateGovernor(_getGovernor()).openProposalCount() != 0;
+        return IProposalStatus(_getGovernor()).openProposalCount() != 0;
     }
 
     /// @dev Protocol PriceRouter (Lane A live-NAV), read live from the factory.
@@ -590,23 +591,42 @@ contract SyndicateVault is
         return ISyndicateFactory(_factory).priceRouter();
     }
 
-    /// @dev Lane A live valuation of the active strategy's positions, priced
-    ///      vault-side by the PriceRouter (never the strategy's self-report).
-    ///      Returns `(value, true)` only while locked AND the router proves every
-    ///      position instant-eligible (kind enabled, fresh, within cap); every
-    ///      other case is `(0, false)` (fail-closed) so the vault falls back to
-    ///      float-only NAV + the async queue.
-    function _liveNAV() private view returns (uint256 value, bool available) {
-        if (!redemptionsLocked()) return (0, false);
+    /// @dev The single home of the lane-eligibility rule: everything the
+    ///      instant lane needs to decide "can LPs enter/exit at live NAV right
+    ///      now" in one derivation.
+    ///        locked  — an active proposal binds the vault (Executed window)
+    ///        strat   — the active strategy IF pullable: nonzero AND has code.
+    ///                  Codeless is zeroed here because a high-level call to a
+    ///                  codeless address reverts on the extcodesize check
+    ///                  BEFORE try/catch can trap it (would brick maxWithdraw).
+    ///        liveNav — the strategy's positions priced vault-side by the
+    ///                  PriceRouter (never the strategy's self-report)
+    ///        laneA   — instant lane open: locked AND the router proves every
+    ///                  position instant-eligible. Fail-closed: any missing
+    ///                  precondition or router failure ⇒ laneA=false, liveNav=0.
+    ///      Every lane predicate (`_laneBOnly`, `totalAssets`, `_deposit`,
+    ///      `_strategyLiquidity`, `_pullFromStrategy`) consumes this — a new
+    ///      gating condition (e.g. issue #7's minHoldingPeriod) lands here
+    ///      once, not threaded through five predicates. Stack tuple (not a
+    ///      struct) deliberately: a memory struct costs ~130 bytes of zero-init
+    ///      + copies across the call sites — over the EIP-170 budget.
+    function _laneState() private view returns (bool locked, address strat, uint256 liveNav, bool laneA) {
+        locked = redemptionsLocked();
+        if (!locked) return (locked, strat, liveNav, laneA);
+        address active = _activeStrategy();
+        if (active == address(0)) return (locked, strat, liveNav, laneA);
+        // Pullable only with code (extcodesize revert on a codeless address
+        // escapes try/catch and would brick maxWithdraw/maxRedeem); Lane A
+        // pricing itself is the router's call.
+        if (active.code.length != 0) strat = active;
         address pr = _getPriceRouter();
-        if (pr == address(0)) return (0, false);
-        address strat = _activeStrategy();
-        if (strat == address(0)) return (0, false);
-        try IPriceRouter(pr).valueStrategy(strat) returns (uint256 v, bool ok) {
-            return ok ? (v, true) : (0, false);
-        } catch {
-            return (0, false);
-        }
+        if (pr == address(0)) return (locked, strat, liveNav, laneA);
+        try IPriceRouter(pr).valueStrategy(active) returns (uint256 v, bool ok) {
+            if (ok) {
+                liveNav = v;
+                laneA = true;
+            }
+        } catch {} // fail-closed: laneA stays false
     }
 
     /// @dev True while `holder`'s shares are Lane-A-locked — a Lane A entry made
@@ -623,8 +643,8 @@ contract SyndicateVault is
     ///      must route through the Lane B queue when the vault is locked without
     ///      a Lane A live-NAV term, or while the holder is under the G1 lockup.
     function _laneBOnly(address owner_) private view returns (bool) {
-        (, bool laneA) = _liveNAV();
-        return (redemptionsLocked() && !laneA) || _isLaneALocked(owner_);
+        (bool locked,,, bool laneA) = _laneState();
+        return (locked && !laneA) || _isLaneALocked(owner_);
     }
 
     /// @dev Float available for instant exits = vault asset balance minus the
@@ -642,15 +662,10 @@ contract SyndicateVault is
     ///      try/catch + fail-to-0 so a strategy without the interface can never
     ///      brick `maxWithdraw` / `maxRedeem`.
     function _strategyLiquidity() private view returns (uint256) {
-        (, bool laneA) = _liveNAV();
-        if (!laneA) return 0;
-        address strat = _activeStrategy();
-        // `strat == 0` OR a codeless strat ⇒ 0. The code-length guard is load-
-        // bearing: a high-level call to a codeless address reverts on Solidity's
-        // extcodesize check *before* try/catch can trap it, which would brick
-        // `maxWithdraw`/`maxRedeem`. try/catch still guards a coded strat that
-        // reverts or lacks the selector.
-        if (strat == address(0) || strat.code.length == 0) return 0;
+        // `strat` is already zeroed for a codeless strategy (see _laneState);
+        // try/catch still guards a coded strat that reverts or lacks the selector.
+        (, address strat,, bool laneA) = _laneState();
+        if (!laneA || strat == address(0)) return 0;
         try IStrategy(strat).availableLiquidity() returns (uint256 l) {
             return l;
         } catch {
@@ -665,13 +680,11 @@ contract SyndicateVault is
     ///      strategy (preserves the pre-existing error surface for float-only
     ///      exits).
     function _pullFromStrategy(uint256 shortfall) private {
-        (, bool laneA) = _liveNAV();
-        address strat = _activeStrategy();
-        // Defense-in-depth: also reject a codeless strat (mirrors
-        // `_strategyLiquidity`). Unreachable in the honest path — `maxWithdraw`
-        // caps `assets` at float when strategy liquidity is 0 — but removes the
-        // reliance on that upstream invariant for a fund-moving call.
-        if (strat == address(0) || strat.code.length == 0 || !laneA) revert QueueReserveBreached();
+        // `strat` is zeroed for a codeless strategy (defense-in-depth on this
+        // fund-moving path; unreachable honestly — maxWithdraw caps at float
+        // when strategy liquidity is 0).
+        (, address strat,, bool laneA) = _laneState();
+        if (strat == address(0) || !laneA) revert QueueReserveBreached();
         IERC20 asset_ = IERC20(asset());
         uint256 balBefore = asset_.balanceOf(address(this));
         IStrategy(strat).withdrawTo(shortfall);
@@ -705,12 +718,12 @@ contract SyndicateVault is
     /// @dev V2 live-NAV redesign: the vault never trusts a strategy's
     ///      self-reported value. NAV is the idle float PLUS, only when Lane A is
     ///      available, the active strategy's positions priced vault-side by the
-    ///      PriceRouter (`_liveNAV`). When Lane A is unavailable the live term is
+    ///      PriceRouter (`_laneState`). When Lane A is unavailable the live term is
     ///      0, so during a proposal the vault shows float-only and mid-flight LP
     ///      flow goes through the async queue, settling at the realized price.
     function totalAssets() public view override returns (uint256) {
-        (uint256 live,) = _liveNAV();
-        return IERC20(asset()).balanceOf(address(this)) + live;
+        (,, uint256 liveNav,) = _laneState();
+        return IERC20(asset()).balanceOf(address(this)) + liveNav;
     }
 
     /// @dev Sherlock run #2 #12: return 0 when `paused()` so the EIP-4626 IMP-1
@@ -739,7 +752,7 @@ contract SyndicateVault is
         whenNotPaused
         nonReentrant
     {
-        (, bool laneA) = _liveNAV();
+        (,,, bool laneA) = _laneState();
         // During an open proposal (Pending..Executed) instant deposits are
         // closed unless Lane A is live — a depositor mid-lifecycle would
         // otherwise be pulled into a strategy they never voted on, or mint
