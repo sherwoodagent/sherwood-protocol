@@ -148,13 +148,40 @@ adjudication (weeks, contested cases only).
   dispute is taken from stake/balances snapshotted **before the challenged
   proposal's execution block**, and restricted to pre-exploit-staked WOOD.
   Drain proceeds cannot finance an acquittal; flash-loaned WOOD cannot vote.
-- **Narrow bonded adjudication panel** with mandatory appeal-to-token-vote:
-  a small panel of bonded, slashable members rules first on disputed forensic
-  cases (they can read traces; a dispersed token vote demonstrably cannot);
-  any ruling is appealable to the full WOOD vote within a window, and a ruling
-  overturned on appeal slashes the panel members who signed it. The token vote
-  remains sovereign; the panel exists because plutocratic spot-voting as the
-  *sole* judge of forensic questions is capturable at current mcap.
+- **Two-layer court: bonded adjudication panel + token-vote appeal.**
+
+  *Why one layer is not enough.* A WOOD token vote as the sole judge fails two
+  ways: (1) **competence** — a dispute is a forensic question ("does this trace
+  show funds routing to a proposer-linked address, or a legitimate trade that
+  got sandwiched?"); answering requires reading execution traces, and dispersed
+  token votes get single-digit turnout deciding on narrative, not evidence;
+  (2) **capture** — at ~$15M WOOD mcap, an attacker who drained a vault can
+  spend part of the proceeds buying/borrowing WOOD to vote their own case
+  innocent. A standalone expert panel fails differently: 5 trusted humans,
+  capturable by bribing 3, with no check above them. The two layers cover each
+  other's failure mode.
+
+  *Layer 1 — the panel (trial court).* A small panel (~5 members, elected by
+  WOOD governance) of parties competent to read forensic evidence. Each member
+  posts a slashable bond. Disputed challenges go to the panel first; it reviews
+  the trace and rules within days. This is where competence and speed live.
+
+  *Layer 2 — the appeal (supreme court).* Any panel ruling is appealable to the
+  full WOOD token vote within the appeal window (§5). The token vote is
+  sovereign: it can overturn any panel ruling. The panel therefore holds no
+  final authority — it is a first-instance court whose every decision token
+  holders can veto.
+
+  *The binding incentive.* If an appealed ruling is overturned by the token
+  vote, the panel members who signed it **lose their bonds**. A corrupt ruling
+  is not merely reversible — it is personally expensive for the signers. The
+  only ruling that reliably survives appeal is the one the public evidence
+  supports, so bonded panelists are paid to rule with the evidence.
+
+  *Capture resistance, combined:* an attacker must corrupt a majority of the
+  panel AND win the public appeal vote AND do so against a voting snapshot
+  taken before the exploit (below) — three independent barriers instead of one
+  buyable poll.
 - Guilty verdict → `slashGuardians` at `maxSlashBps` (100%; ground truth
   established, no severity ramp), delegated-slash caps and first-loss spill
   preserved, proceeds → drained vault.
