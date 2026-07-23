@@ -46,4 +46,47 @@ contract TierRegistry is Ownable2Step {
         }
         return (c.tier, c.extractableBoundBps);
     }
+
+    event TierCertified(
+        address indexed target, bytes4 indexed selector, uint8 tier, uint16 extractableBoundBps, bytes32 codehash
+    );
+    event TierDemoted(address indexed target, bytes4 indexed selector);
+
+    error InvalidTier();
+    error BoundRequired();
+    error NotAContract();
+    error CodehashMatches();
+    error NotCertified();
+
+    /// @notice Certify (target, selector) at tier 0/1 with its extractable bound.
+    ///         Snapshots EXTCODEHASH — upgradeable/proxied targets will trip the
+    ///         lazy demotion on their first post-upgrade read, by design.
+    function certify(address target, bytes4 selector, uint8 tier, uint16 extractableBoundBps) external onlyOwner {
+        if (tier >= TIER_ARBITRARY) revert InvalidTier();
+        if (extractableBoundBps == 0 || extractableBoundBps >= FULL_NOTIONAL_BPS) revert BoundRequired();
+        bytes32 ch = target.codehash;
+        if (ch == bytes32(0)) revert NotAContract();
+        _configs[key(target, selector)] =
+            TierConfig({tier: tier, extractableBoundBps: extractableBoundBps, certifiedCodehash: ch});
+        emit TierCertified(target, selector, tier, extractableBoundBps, ch);
+    }
+
+    /// @notice Owner demotion (revoke certification).
+    function demote(address target, bytes4 selector) external onlyOwner {
+        _demote(target, selector);
+    }
+
+    /// @notice Permissionless demotion when the live codehash no longer matches
+    ///         the certified hash. Persists what `tierOf` already reports lazily.
+    function poke(address target, bytes4 selector) external {
+        TierConfig storage c = _configs[key(target, selector)];
+        if (c.certifiedCodehash == bytes32(0)) revert NotCertified();
+        if (target.codehash == c.certifiedCodehash) revert CodehashMatches();
+        _demote(target, selector);
+    }
+
+    function _demote(address target, bytes4 selector) private {
+        delete _configs[key(target, selector)];
+        emit TierDemoted(target, selector);
+    }
 }
