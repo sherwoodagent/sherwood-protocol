@@ -93,6 +93,16 @@ contract OutflowMeteringTest is Test {
         assertEq(usdc.balanceOf(address(sink)), 500e6, "capital deployed");
     }
 
+    function test_batchAtExactCapExecutes() public {
+        vm.prank(alice);
+        vault.deposit(2_000e6, alice);
+
+        // Boundary: netOutflow == cap must pass (comparison is strict >).
+        vm.prank(address(governor));
+        vault.executeGovernorBatch(_outflowBatch(1_000e6), 1_000e6);
+        assertEq(usdc.balanceOf(address(sink)), 1_000e6, "exact-cap deploy executes");
+    }
+
     function test_batchExceedingCapReverts() public {
         vm.prank(alice);
         vault.deposit(2_000e6, alice);

@@ -444,6 +444,12 @@ contract SyndicateVault is
         // Spec 2026-07-22 §3.1: custody-level net-outflow ceiling. Inflow
         // batches (settle) pass trivially; the governor passes the proposal's
         // maxCapital on execute and type(uint256).max on settle paths.
+        // NOTE: this is a COARSE custody cap — it meters the vault's own
+        // asset() balance delta, so capital deployed INTO a whitelisted
+        // adapter counts as outflow the same as an extraction (conservative
+        // over-count). The precise extractable bound is the tier system's
+        // per-target coverage (Tasks 5/6); this check only guarantees a
+        // single batch can never move more than maxCapital out of custody.
         uint256 netOutflow = balanceBefore > balanceAfter ? balanceBefore - balanceAfter : 0;
         if (netOutflow > maxNetOutflow) revert MaxNetOutflowExceeded(netOutflow, maxNetOutflow);
         uint256 reserve = reservedQueueAssets();
