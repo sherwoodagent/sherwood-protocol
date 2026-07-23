@@ -140,33 +140,25 @@ contract GovernorHardeningTest is Test {
         cps[2] = ISyndicateGovernor.CoProposer({agent: co3, splitBps: 1000});
         cps[3] = ISyndicateGovernor.CoProposer({agent: co4, splitBps: 1000});
 
+        // Finding 3: propose needs nonzero TVL (ceiling = bps of totalAssets).
+        // Env is hoisted above the prank so its staticcall can't consume it.
+        if (vault.totalAssets() == 0) _depositLps();
+        ISyndicateGovernor.RiskEnvelope memory env = GovEnvelope.permissive(address(vault));
         vm.prank(leadAgent);
-        proposalId = governor.propose(
-            address(vault),
-            address(0),
-            "ipfs://gh2",
-            7 days,
-            GovEnvelope.permissive(address(vault)),
-            _execCalls(),
-            _settleCalls(),
-            cps
-        );
+        proposalId =
+            governor.propose(address(vault), address(0), "ipfs://gh2", 7 days, env, _execCalls(), _settleCalls(), cps);
     }
 
     /// @dev Create a 2-party collab: lead + 1 co-prop to land in Draft quickly.
     function _create2PartyCollab() internal returns (uint256 proposalId) {
         ISyndicateGovernor.CoProposer[] memory cps = new ISyndicateGovernor.CoProposer[](1);
         cps[0] = ISyndicateGovernor.CoProposer({agent: co1, splitBps: 3000});
+        // Finding 3: propose needs nonzero TVL; env hoisted above the prank.
+        if (vault.totalAssets() == 0) _depositLps();
+        ISyndicateGovernor.RiskEnvelope memory env = GovEnvelope.permissive(address(vault));
         vm.prank(leadAgent);
         proposalId = governor.propose(
-            address(vault),
-            address(0),
-            "ipfs://draft",
-            7 days,
-            GovEnvelope.permissive(address(vault)),
-            _execCalls(),
-            _settleCalls(),
-            cps
+            address(vault), address(0), "ipfs://draft", 7 days, env, _execCalls(), _settleCalls(), cps
         );
     }
 
@@ -236,13 +228,14 @@ contract GovernorHardeningTest is Test {
         vm.warp(vm.getBlockTimestamp() + 1);
 
         // Propose under the current VETO_THRESHOLD_BPS = 4000.
+        ISyndicateGovernor.RiskEnvelope memory env = GovEnvelope.permissive(address(vault));
         vm.prank(leadAgent);
         uint256 proposalId = governor.propose(
             address(vault),
             address(0),
             "ipfs://snap",
             7 days,
-            GovEnvelope.permissive(address(vault)),
+            env,
             _execCalls(),
             _settleCalls(),
             new ISyndicateGovernor.CoProposer[](0)
@@ -332,14 +325,22 @@ contract GovernorHardeningTest is Test {
     ///         guard must skip the veto check so the proposal transitions to
     ///         Approved (via GuardianReview).
     function test_veto_emptySupply_doesNotAutoReject() public {
-        // Propose without any LP deposits — totalSupply stays 0.
+        // Finding 3 requires nonzero TVL at propose (ceiling = bps of
+        // totalAssets), so deposit in the SAME block as propose: the vote
+        // snapshot is block.timestamp - 1, so pastTotalSupply at the snapshot
+        // is still 0 — exactly the G-H4 empty-supply condition under test.
+        vm.startPrank(lp1);
+        usdc.approve(address(vault), 1_000e6);
+        vault.deposit(1_000e6, lp1);
+        vm.stopPrank();
+        ISyndicateGovernor.RiskEnvelope memory env = GovEnvelope.permissive(address(vault));
         vm.prank(leadAgent);
         uint256 proposalId = governor.propose(
             address(vault),
             address(0),
             "ipfs://empty",
             7 days,
-            GovEnvelope.permissive(address(vault)),
+            env,
             _execCalls(),
             _settleCalls(),
             new ISyndicateGovernor.CoProposer[](0)
@@ -419,13 +420,16 @@ contract GovernorHardeningTest is Test {
 
     /// @dev Helper: create a Pending solo proposal.
     function _createSoloPending() internal returns (uint256 proposalId) {
+        // Finding 3: propose needs nonzero TVL; env hoisted above the prank.
+        if (vault.totalAssets() == 0) _depositLps();
+        ISyndicateGovernor.RiskEnvelope memory env = GovEnvelope.permissive(address(vault));
         vm.prank(leadAgent);
         proposalId = governor.propose(
             address(vault),
             address(0),
             "ipfs://term",
             7 days,
-            GovEnvelope.permissive(address(vault)),
+            env,
             _execCalls(),
             _settleCalls(),
             new ISyndicateGovernor.CoProposer[](0)
@@ -516,6 +520,7 @@ contract GovernorHardeningTest is Test {
         uint256 cap = 64; // mirror of SyndicateGovernor.MAX_CALLS_PER_PROPOSAL
         BatchExecutorLib.Call[] memory oversized = _buildOversizedCalls(cap + 1);
 
+        ISyndicateGovernor.RiskEnvelope memory env = GovEnvelope.permissive(address(vault));
         vm.prank(leadAgent);
         vm.expectRevert(ISyndicateGovernor.TooManyCalls.selector);
         governor.propose(
@@ -523,7 +528,7 @@ contract GovernorHardeningTest is Test {
             address(0),
             "ipfs://big",
             7 days,
-            GovEnvelope.permissive(address(vault)),
+            env,
             oversized,
             _settleCalls(),
             new ISyndicateGovernor.CoProposer[](0)
@@ -535,6 +540,7 @@ contract GovernorHardeningTest is Test {
         uint256 cap = 64; // mirror of SyndicateGovernor.MAX_CALLS_PER_PROPOSAL
         BatchExecutorLib.Call[] memory oversized = _buildOversizedCalls(cap + 1);
 
+        ISyndicateGovernor.RiskEnvelope memory env = GovEnvelope.permissive(address(vault));
         vm.prank(leadAgent);
         vm.expectRevert(ISyndicateGovernor.TooManyCalls.selector);
         governor.propose(
@@ -542,7 +548,7 @@ contract GovernorHardeningTest is Test {
             address(0),
             "ipfs://big",
             7 days,
-            GovEnvelope.permissive(address(vault)),
+            env,
             _execCalls(),
             oversized,
             new ISyndicateGovernor.CoProposer[](0)
@@ -562,6 +568,7 @@ contract GovernorHardeningTest is Test {
             tooLong[i] = "a";
         }
 
+        ISyndicateGovernor.RiskEnvelope memory env = GovEnvelope.permissive(address(vault));
         vm.prank(leadAgent);
         vm.expectRevert(ISyndicateGovernor.MetadataURITooLong.selector);
         governor.propose(
@@ -569,7 +576,7 @@ contract GovernorHardeningTest is Test {
             address(0),
             string(tooLong),
             7 days,
-            GovEnvelope.permissive(address(vault)),
+            env,
             _execCalls(),
             _settleCalls(),
             new ISyndicateGovernor.CoProposer[](0)
@@ -587,6 +594,7 @@ contract GovernorHardeningTest is Test {
         _createSoloPending();
 
         // Second propose from a different agent must now revert.
+        ISyndicateGovernor.RiskEnvelope memory env = GovEnvelope.permissive(address(vault));
         vm.prank(co1);
         vm.expectRevert(ISyndicateGovernor.VaultHasOpenProposal.selector);
         governor.propose(
@@ -594,7 +602,7 @@ contract GovernorHardeningTest is Test {
             address(0),
             "ipfs://dup",
             7 days,
-            GovEnvelope.permissive(address(vault)),
+            env,
             _execCalls(),
             _settleCalls(),
             new ISyndicateGovernor.CoProposer[](0)
@@ -610,17 +618,9 @@ contract GovernorHardeningTest is Test {
 
         ISyndicateGovernor.CoProposer[] memory cps = new ISyndicateGovernor.CoProposer[](1);
         cps[0] = ISyndicateGovernor.CoProposer({agent: co1, splitBps: 3000});
+        ISyndicateGovernor.RiskEnvelope memory env = GovEnvelope.permissive(address(vault));
         vm.prank(leadAgent);
-        governor.propose(
-            address(vault),
-            address(0),
-            "ipfs://draft",
-            7 days,
-            GovEnvelope.permissive(address(vault)),
-            _execCalls(),
-            _settleCalls(),
-            cps
-        );
+        governor.propose(address(vault), address(0), "ipfs://draft", 7 days, env, _execCalls(), _settleCalls(), cps);
 
         // Vault already has a counted Draft — a second propose reverts.
         vm.prank(co2);
@@ -630,7 +630,7 @@ contract GovernorHardeningTest is Test {
             address(0),
             "ipfs://pending",
             7 days,
-            GovEnvelope.permissive(address(vault)),
+            env,
             _execCalls(),
             _settleCalls(),
             new ISyndicateGovernor.CoProposer[](0)

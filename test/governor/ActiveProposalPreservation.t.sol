@@ -36,6 +36,9 @@ import {GovEnvelope} from "../helpers/GovEnvelope.sol";
 ///         three paths must leave `_activeProposal[V] == A` untouched.
 contract ActiveProposalPreservationTest is Test {
     SyndicateGovernor public governor;
+
+    /// @dev Widest legal risk envelope, computed once in setUp (see there).
+    ISyndicateGovernor.RiskEnvelope internal permissiveEnv;
     SyndicateVault public vault;
     GuardianRegistry public registry;
     StakedWood public swood;
@@ -184,6 +187,11 @@ contract ActiveProposalPreservationTest is Test {
         vm.stopPrank();
         vm.warp(vm.getBlockTimestamp() + 1);
 
+        // Widest legal envelope at setUp TVL (finding 3 ceiling). Hoisted to a
+        // state var: computing it inline made an external staticcall between
+        // vm.prank/vm.expectRevert and propose(), consuming the cheatcode.
+        permissiveEnv = GovEnvelope.permissive(address(vault));
+
         wood.mint(owner, 100_000e18);
         vm.prank(owner);
         wood.approve(address(swood), type(uint256).max);
@@ -228,14 +236,7 @@ contract ActiveProposalPreservationTest is Test {
     function _propose(string memory uri) internal returns (uint256 proposalId) {
         vm.prank(agent);
         proposalId = governor.propose(
-            address(vault),
-            address(0),
-            uri,
-            7 days,
-            GovEnvelope.permissive(address(vault)),
-            _execCalls(),
-            _settleCalls(),
-            _emptyCoProposers()
+            address(vault), address(0), uri, 7 days, permissiveEnv, _execCalls(), _settleCalls(), _emptyCoProposers()
         );
     }
 
@@ -303,7 +304,7 @@ contract ActiveProposalPreservationTest is Test {
             address(0),
             "ipfs://B",
             7 days,
-            GovEnvelope.permissive(address(vault)),
+            permissiveEnv,
             _execCalls(),
             _settleCalls(),
             _emptyCoProposers()
@@ -327,7 +328,7 @@ contract ActiveProposalPreservationTest is Test {
             address(0),
             "ipfs://B",
             7 days,
-            GovEnvelope.permissive(address(vault)),
+            permissiveEnv,
             _execCalls(),
             _settleCalls(),
             _emptyCoProposers()
@@ -349,7 +350,7 @@ contract ActiveProposalPreservationTest is Test {
             address(0),
             "ipfs://B",
             7 days,
-            GovEnvelope.permissive(address(vault)),
+            permissiveEnv,
             _execCalls(),
             _settleCalls(),
             _emptyCoProposers()

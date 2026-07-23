@@ -16,6 +16,9 @@ import {GovEnvelope} from "./helpers/GovEnvelope.sol";
 
 contract CollaborativeProposalsTest is Test {
     SyndicateGovernor public governor;
+
+    /// @dev Widest legal risk envelope, computed once in setUp (see there).
+    ISyndicateGovernor.RiskEnvelope internal permissiveEnv;
     SyndicateVault public vault;
     BatchExecutorLib public executorLib;
     ERC20Mock public usdc;
@@ -124,6 +127,11 @@ contract CollaborativeProposalsTest is Test {
         vm.stopPrank();
 
         vm.warp(block.timestamp + 1);
+
+        // Widest legal envelope at setUp TVL (finding 3 ceiling). Hoisted to a
+        // state var: computing it inline made an external staticcall between
+        // vm.prank/vm.expectRevert and propose(), consuming the cheatcode.
+        permissiveEnv = GovEnvelope.permissive(address(vault));
     }
 
     // ==================== HELPERS ====================
@@ -162,7 +170,7 @@ contract CollaborativeProposalsTest is Test {
             address(0),
             "ipfs://collab",
             7 days,
-            GovEnvelope.permissive(address(vault)),
+            permissiveEnv,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             coProps
@@ -204,7 +212,7 @@ contract CollaborativeProposalsTest is Test {
             address(0),
             "ipfs://solo",
             7 days,
-            GovEnvelope.permissive(address(vault)),
+            permissiveEnv,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             _emptyCoProposers()
@@ -226,7 +234,7 @@ contract CollaborativeProposalsTest is Test {
             address(0),
             "ipfs://solo",
             7 days,
-            GovEnvelope.permissive(address(vault)),
+            permissiveEnv,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             _emptyCoProposers()
@@ -454,7 +462,7 @@ contract CollaborativeProposalsTest is Test {
             address(0),
             "ipfs://round",
             7 days,
-            GovEnvelope.permissive(address(vault)),
+            permissiveEnv,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             coProps
@@ -527,7 +535,7 @@ contract CollaborativeProposalsTest is Test {
             address(0),
             "ipfs://tiny",
             7 days,
-            GovEnvelope.permissive(address(vault)),
+            permissiveEnv,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             coProps
@@ -612,7 +620,7 @@ contract CollaborativeProposalsTest is Test {
             address(0),
             "ipfs://test",
             7 days,
-            GovEnvelope.permissive(address(vault)),
+            permissiveEnv,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             coProps
@@ -630,7 +638,7 @@ contract CollaborativeProposalsTest is Test {
             address(0),
             "ipfs://test",
             7 days,
-            GovEnvelope.permissive(address(vault)),
+            permissiveEnv,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             coProps
@@ -664,7 +672,7 @@ contract CollaborativeProposalsTest is Test {
             address(0),
             "ipfs://test",
             7 days,
-            GovEnvelope.permissive(address(vault)),
+            permissiveEnv,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             coProps
@@ -682,7 +690,7 @@ contract CollaborativeProposalsTest is Test {
             address(0),
             "ipfs://test",
             7 days,
-            GovEnvelope.permissive(address(vault)),
+            permissiveEnv,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             coProps
@@ -701,7 +709,7 @@ contract CollaborativeProposalsTest is Test {
             address(0),
             "ipfs://test",
             7 days,
-            GovEnvelope.permissive(address(vault)),
+            permissiveEnv,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             coProps

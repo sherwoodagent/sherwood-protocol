@@ -21,6 +21,9 @@ import {GovEnvelope} from "./helpers/GovEnvelope.sol";
 
 contract SyndicateGovernorTest is Test {
     SyndicateGovernor public governor;
+
+    /// @dev Widest legal risk envelope, computed once in setUp (see there).
+    ISyndicateGovernor.RiskEnvelope internal permissiveEnv;
     ProtocolConfig public protocolConfig;
     SyndicateVault public vault;
     BatchExecutorLib public executorLib;
@@ -121,6 +124,11 @@ contract SyndicateGovernorTest is Test {
         vm.stopPrank();
 
         vm.warp(block.timestamp + 1);
+
+        // Widest legal envelope at setUp TVL (finding 3 ceiling). Hoisted to a
+        // state var: computing it inline made an external staticcall between
+        // vm.prank/vm.expectRevert and propose(), consuming the cheatcode.
+        permissiveEnv = GovEnvelope.permissive(address(vault));
     }
 
     // ==================== HELPERS ====================
@@ -156,7 +164,7 @@ contract SyndicateGovernorTest is Test {
             address(0),
             "ipfs://test",
             duration,
-            GovEnvelope.permissive(address(vault)),
+            permissiveEnv,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             _emptyCoProposers()
@@ -195,7 +203,7 @@ contract SyndicateGovernorTest is Test {
             strategy,
             "ipfs://test",
             duration,
-            GovEnvelope.permissive(address(vault)),
+            permissiveEnv,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             _emptyCoProposers()
@@ -255,7 +263,7 @@ contract SyndicateGovernorTest is Test {
             address(0),
             "ipfs://test",
             7 days,
-            GovEnvelope.permissive(address(vault)),
+            permissiveEnv,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             _emptyCoProposers()
@@ -270,7 +278,7 @@ contract SyndicateGovernorTest is Test {
             address(0),
             "ipfs://test",
             7 days,
-            GovEnvelope.permissive(address(vault)),
+            permissiveEnv,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             _emptyCoProposers()
@@ -285,7 +293,7 @@ contract SyndicateGovernorTest is Test {
             address(0),
             "ipfs://test",
             MAX_STRATEGY_DURATION + 1,
-            GovEnvelope.permissive(address(vault)),
+            permissiveEnv,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             _emptyCoProposers()
@@ -300,7 +308,7 @@ contract SyndicateGovernorTest is Test {
             address(0),
             "ipfs://test",
             30 minutes,
-            GovEnvelope.permissive(address(vault)),
+            permissiveEnv,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             _emptyCoProposers()
@@ -316,7 +324,7 @@ contract SyndicateGovernorTest is Test {
             address(0),
             "ipfs://test",
             7 days,
-            GovEnvelope.permissive(address(vault)),
+            permissiveEnv,
             empty,
             _simpleSettlementCalls(),
             _emptyCoProposers()
@@ -332,7 +340,7 @@ contract SyndicateGovernorTest is Test {
             address(0),
             "ipfs://test",
             7 days,
-            GovEnvelope.permissive(address(vault)),
+            permissiveEnv,
             _simpleExecuteCalls(),
             empty,
             _emptyCoProposers()
@@ -351,7 +359,7 @@ contract SyndicateGovernorTest is Test {
             address(0),
             "ipfs://test",
             7 days,
-            GovEnvelope.permissive(address(vault)),
+            permissiveEnv,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             _emptyCoProposers()
@@ -384,7 +392,7 @@ contract SyndicateGovernorTest is Test {
             address(0),
             "ipfs://test",
             7 days,
-            GovEnvelope.permissive(address(vault)),
+            permissiveEnv,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             _emptyCoProposers()
@@ -505,7 +513,7 @@ contract SyndicateGovernorTest is Test {
             address(0),
             "ipfs://dup",
             7 days,
-            GovEnvelope.permissive(address(vault)),
+            permissiveEnv,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             _emptyCoProposers()
@@ -685,7 +693,7 @@ contract SyndicateGovernorTest is Test {
             address(0xBEEF), // EOA, no selfManagesFees()
             "ipfs://eoa",
             7 days,
-            GovEnvelope.permissive(address(vault)),
+            permissiveEnv,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             empty
@@ -778,7 +786,7 @@ contract SyndicateGovernorTest is Test {
             address(0),
             "ipfs://test",
             7 days,
-            GovEnvelope.permissive(address(vault)),
+            permissiveEnv,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             _emptyCoProposers()
