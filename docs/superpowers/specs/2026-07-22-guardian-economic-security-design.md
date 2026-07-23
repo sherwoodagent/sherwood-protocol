@@ -15,7 +15,7 @@ remediates all of them:
 - **F2** WOOD-denominated inequality → dollar-denominated coverage via a hard covered-TVL cap (§2, §3.7). Multi-collateral bonds (the ceiling-lifting fix) **deferred to v2 by decision 2026-07-22**; v1 launches WOOD-only, small-vault-only, cap binding hard.
 - **F3** retroactive liability presupposes a signer → explicit bond-encumbered approve quorum replaces pure optimistic passage for coverage-consuming proposals; cold-start addressed; risk-scaled proposer bond added (§3.3a, §3.9).
 - **F4** honest-guardian economics mispriced → coverage-weighted approver reward (§3.10).
-- **F5** temporal netting → unstake delay covers the challenge window (§3.3). ALL the salami/drawdown machinery this finding prompted — rolling-drawdown predicate, cross-vault accumulators, 30d lock, AND the per-vault per-epoch outflow cap — was **removed by decision** (2026-07-22). Slow-bleed has no on-chain protection in v1; it is an accepted, monitoring-only residual (§7, §8).
+- **F5** temporal netting → unstake delay covers the challenge window (§3.3). ALL the salami/drawdown machinery this finding prompted — rolling-drawdown predicate, cross-vault accumulators, 30d lock, AND the per-vault per-epoch outflow cap — was **removed by decision** (2026-07-22). Slow-bleed has no onchain protection in v1; it is an accepted, monitoring-only residual (§7, §8).
 - **F6** court capture / non-independent layers → pre-accumulation defense + panel-bond restructure (§3.5).
 - **Precision:** `slashableBond` defined (§3.3); §1 "equally" corrected; "reuses slash rails" framing corrected and authorized-slasher entrypoint made explicit (§4); `refundSlash` fate stated (§4).
 - **2026-07-23 — epoch-based renewable coverage (§3.4a).** Long-duration strategies exposed a timing gap: predicate 5 needs settlement PnL, but guardian stake recycled at the challenge window, so strategies longer than ~2 weeks structurally escaped the drawdown predicate — and locking stake to settlement was a non-starter. Resolved via per-epoch NAV mark-to-market + claims-made attribution + renew-or-wind-down (deep-research-backed: PFMI variation margin, IRMI claims-made chaining, Nexus Mutual pooled cover, reinsurance LPT). Guardian commitment now bounded at one epoch + challenge window regardless of strategy duration. Plan B's exposure ledger must build epoch semantics from day one.
@@ -69,7 +69,7 @@ destination, rogue allowance, or a single proposal breaching its own declared
 envelope. That covers one-shot and fast multi-proposal drains. It does **not**
 cover the *patient slow-bleed*: a coalition extracting value through many trades
 that each stay inside their per-proposal envelope and trip no predicate. v1 ships
-no on-chain accumulator for that vector (removed by decision — §7); it is an
+no onchain accumulator for that vector (removed by decision — §7); it is an
 accepted, monitored residual (§8), caught by the §6 dashboard and watchtower
 reaction, not by the inequality. The doc title's "infeasible" is therefore a
 claim about *detectable coordinated collusion*, not about every conceivable
@@ -86,13 +86,13 @@ recoupment      =  0        (compensation is snapshot-gated to pre-drain holders
 net             ≤  0  −  bribes  −  gas  −  proposer bond forfeited
 ```
 
-The slow-bleed residual is not bounded by this inequality and has **no on-chain
+The slow-bleed residual is not bounded by this inequality and has **no onchain
 protection in v1** (decision 2026-07-22 — see §7/§8): the per-proposal envelope
 and single-proposal predicate bound each proposal, but a patient bleed spread
 across many in-envelope proposals is caught only by the §6 monitoring dashboard
-and watchtower reaction, not by any automatic on-chain mechanism.
+and watchtower reaction, not by any automatic onchain mechanism.
 
-Three properties make each line hold and are the load-bearing changes from the
+Three properties make each line hold and are the decisive changes from the
 first draft:
 
 1. **Coverage is dollar-denominated (F2).** The exposure cap (§3.3) measures
@@ -569,7 +569,7 @@ the pieces that bound loss *before* the court:
 **v2:** multi-collateral bonds (lifts the per-vault TVL ceiling — §3.7); adapter
 probation/downgrade automation; threshold-calibrated auto-demote circuit breakers
 (need live traffic to set thresholds without a DoS lever); dynamic k by risk
-class; any on-chain slow-drain protection (a cumulative-drawdown predicate or an
+class; any onchain slow-drain protection (a cumulative-drawdown predicate or an
 outflow-rate cap) only if monitoring shows real slow-bleed attempts (§8) — none
 ships in v1.
 
@@ -618,7 +618,7 @@ before v1a ships:
   tier-0/1 execution (valuation manipulation).
 - Per-vault realized alpha vs benchmark: variance, venue Herfindahl,
   guardian-approval overlap. **This is v1's ONLY defense against the slow-bleed
-  salami attack** (§8): all on-chain slow-drain protection was cut, so a patient
+  salami attack** (§8): all onchain slow-drain protection was cut, so a patient
   in-envelope bleed is caught solely by this dashboard + watchtower reaction and
   human intervention (pause, challenge a clip that breaches its own envelope,
   deregister the guardian set), not by any automatic mechanism or rate bound.
@@ -653,7 +653,7 @@ before v1a ships:
 - **Panel bond slashed only on merits overturn:** lets control of a cheap appeal
   immunize a corrupt panel; replaced by the separate bad-faith track + flat
   panelist reward + participation floor (§3.5, F6).
-- **ALL on-chain slow-drain protection removed (decision 2026-07-22).** Earlier
+- **ALL onchain slow-drain protection removed (decision 2026-07-22).** Earlier
   drafts carried, then trimmed to, then finally dropped entirely: an aggregate
   rolling-drawdown predicate, cross-vault proposer/guardian accumulators, a 30-day
   exposure lock, and (the last piece cut) the per-vault per-epoch outflow cap.
@@ -661,8 +661,8 @@ before v1a ships:
   slow-bleed attack is materially slower and harder than the one-shot rug the
   mechanical guards + per-proposal envelope already stop (it needs a controlled
   counterparty and sustained deniability), and its detection is inherently a
-  malice-vs-bad-trading judgment that on-chain code can't make anyway. v1 ships
-  no on-chain slow-drain mechanism; the residual is monitoring-only (§8). The
+  malice-vs-bad-trading judgment that onchain code can't make anyway. v1 ships
+  no onchain slow-drain mechanism; the residual is monitoring-only (§8). The
   per-proposal single-proposal-drawdown-breach predicate (§3.4 #5) is retained —
   it bounds one bad proposal, which is not slow-bleed.
 
@@ -700,11 +700,11 @@ before v1a ships:
   improves *measurement* but does not remove `priceHaircut` or the F2 economics —
   an accurate low price is still a low price. Track feed availability as a gate on
   the tier-0/1 valuation design.
-- **Slow-bleed / salami (accepted risk, decided 2026-07-22; NO on-chain
-  protection).** v1 ships no on-chain slow-drain mechanism at all — no
+- **Slow-bleed / salami (accepted risk, decided 2026-07-22; NO onchain
+  protection).** v1 ships no onchain slow-drain mechanism at all — no
   cumulative-drawdown predicate and no outflow-rate cap. A coalition bleeding a
   vault via many individually-in-envelope losing trades trips no malice predicate
-  and no one is slashed for the bleed as such, and there is no on-chain bound on
+  and no one is slashed for the bleed as such, and there is no onchain bound on
   how fast it proceeds. Accepted because: (a) it is materially slower/harder than
   a one-shot rug (needs a controlled counterparty and sustained deniability),
   (b) the mechanical guards + per-proposal envelope + single-proposal predicate
@@ -713,7 +713,7 @@ before v1a ships:
   envelope-breaching clip, deregister the guardian set). Residual: detection and
   response are monitoring-plus-human — a patient attacker staying inside every
   per-proposal envelope can extract, unbounded in rate, until humans react.
-  Revisit an on-chain slow-drain mechanism only if monitoring shows real attempts.
+  Revisit an onchain slow-drain mechanism only if monitoring shows real attempts.
 - **F4 is now priced-but-possibly-unaffordable at scale, not unpriced.** The
   §3.10 worked example shows the premium clears for bounded tiers and does not
   clear for large tier-2 exposure at the default fee share. This is a viability
