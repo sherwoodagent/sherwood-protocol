@@ -112,6 +112,14 @@ interface ISyndicateGovernor {
         // ── APPENDED FIELDS ONLY BELOW (beacon-upgraded governors; storage parity) ──
         uint256 maxCapital; // risk envelope: net-outflow ceiling (spec §3.1)
         uint16 maxDrawdownBps; // risk envelope: declared drawdown bound
+        /// @notice MAX tier across the proposal's execute calls, resolved via
+        ///         the TierRegistry at propose time (spec §3.2). 2 whenever no
+        ///         registry is wired — the safe default.
+        uint8 envelopeTier;
+        /// @notice Extractable-value figure the aggregate exposure cap consumes
+        ///         (Plan B). Full `maxCapital` at tier 2; `maxCapital` scaled by
+        ///         the max certified extractable bound at tier 0/1.
+        uint256 requiredCoverage;
     }
 
     struct CoProposer {
@@ -325,6 +333,9 @@ interface ISyndicateGovernor {
     // ── Parameter change event (owner-instant, no queue/cancel) ──
     event ParameterChangeFinalized(bytes32 indexed paramKey, uint256 oldValue, uint256 newValue);
 
+    /// @notice Tier registry wired (or un-wired, newRegistry == address(0)).
+    event TierRegistrySet(address indexed oldRegistry, address indexed newRegistry);
+
     /// @notice Emitted in `_distributeFees` when `guardianFeeBps > 0`.
     ///         Guardian fee is carved from gross PnL and transferred to
     ///         `recipient` (the team `guardiansFeeRecipient` multisig). This is
@@ -401,6 +412,10 @@ interface ISyndicateGovernor {
     function setCollaborationWindow(uint256 newCollaborationWindow) external;
     function setMaxCoProposers(uint256 newMaxCoProposers) external;
     function setProtocolConfig(address newConfig) external;
+    /// @notice Wire the tier registry (spec §3.2). Factory-only, like
+    ///         `setProtocolConfig`. address(0) un-wires: every proposal then
+    ///         resolves to tier 2 / full notional — the safe default.
+    function setTierRegistry(address newRegistry) external;
 
     // ── Init ──
     /// @notice Initialize a freshly deployed per-vault governor proxy.
@@ -451,6 +466,20 @@ interface ISyndicateGovernor {
 
     /// @notice Address of the guardian registry (zero if not yet wired).
     function guardianRegistry() external view returns (address);
+
+    /// @notice Address of the tier registry (zero if not wired — tier 2 default).
+    function tierRegistry() external view returns (address);
+
+    /// @notice MAX tier across the proposal's execute calls, resolved at
+    ///         propose time (spec §3.2). Returns 0 for a nonexistent
+    ///         proposalId — pair with `getRiskEnvelope` (maxCapital == 0 means
+    ///         "no such proposal") when disambiguation matters.
+    function getProposalTier(uint256 proposalId) external view returns (uint8);
+
+    /// @notice Extractable-value coverage the proposal demands from the
+    ///         aggregate exposure cap (Plan B). Snapshotted at propose time:
+    ///         full `maxCapital` at tier 2, bound-scaled at tier 0/1.
+    function getRequiredCoverage(uint256 proposalId) external view returns (uint256);
 
     // ── Fee-escrow (W-1) ──
 

@@ -5,6 +5,7 @@ import {ISyndicateGovernor} from "./interfaces/ISyndicateGovernor.sol";
 import {ISyndicateVault} from "./interfaces/ISyndicateVault.sol";
 import {IProtocolConfig} from "./interfaces/IProtocolConfig.sol";
 import {IGuardianRegistry} from "./interfaces/IGuardianRegistry.sol";
+import {ITierRegistry} from "./interfaces/ITierRegistry.sol";
 import {IStrategy} from "./interfaces/IStrategy.sol";
 import {GovernorParameters} from "./GovernorParameters.sol";
 import {GovernorEmergency} from "./GovernorEmergency.sol";
@@ -132,6 +133,12 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      goalposts for co-proposers who already approved.
     mapping(uint256 proposalId => uint256 packedTiming) private _draftTimingSnap;
 
+    /// @notice Tier registry (spec 2026-07-22 §3.2). Optional: address(0) means
+    ///         every proposal resolves to tier 2 / full notional — the safe
+    ///         default. Wired post-init via `setTierRegistry` (factory-only,
+    ///         like `setProtocolConfig`).
+    address internal _tierRegistry;
+
     /// @dev Reserved storage for future upgrades (shrunk by 1 for _guardianRegistry,
     ///      shrunk by 1 more for openProposalCount,
     ///      shrunk by 1 more for _unclaimedFees,
@@ -142,8 +149,9 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      GovernorParameters,
     ///      grew by 2 after V2: _emergencyCallsHashes + _emergencyCalls moved
     ///      to GuardianRegistry,
-    ///      shrunk by 1 for _draftTimingSnap — Sherlock #14 restored)
-    uint256[34] private __gap;
+    ///      shrunk by 1 for _draftTimingSnap — Sherlock #14 restored,
+    ///      shrunk by 1 for _tierRegistry — Task 5)
+    uint256[33] private __gap;
 
     /// @param minVotingPeriod_   Per-deployment floor for `votingPeriod` (mainnet 24h).
     /// @param minCooldownPeriod_ Per-deployment floor for `cooldownPeriod` (mainnet 1h).
@@ -321,6 +329,14 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // Store calls separately
         _storeCalls(_executeCalls, proposalId, executeCalls);
         _storeCalls(_settlementCalls, proposalId, settlementCalls);
+
+        // Tier resolution (spec §3.2): proposal tier = MAX tier across execute
+        // calls; requiredCoverage feeds the aggregate exposure cap (Plan B).
+        // Resolved from the STORED calls (via _loadCalls) rather than the
+        // calldata array so the `envelope`/`executeCalls` calldata refs are dead
+        // by this point — keeps propose() under Yul's stack budget. Reads the
+        // same storage array Task 6 re-resolves at execute time.
+        _snapshotTier(p, _loadCalls(_executeCalls, proposalId));
 
         // Store co-proposers and set collaboration deadline
         if (coProposers.length > 0) {
@@ -674,6 +690,21 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         return _guardianRegistry;
     }
 
+    /// @inheritdoc ISyndicateGovernor
+    function tierRegistry() external view returns (address) {
+        return _tierRegistry;
+    }
+
+    /// @inheritdoc ISyndicateGovernor
+    function getProposalTier(uint256 proposalId) external view returns (uint8) {
+        return _proposals[proposalId].envelopeTier;
+    }
+
+    /// @inheritdoc ISyndicateGovernor
+    function getRequiredCoverage(uint256 proposalId) external view returns (uint256) {
+        return _proposals[proposalId].requiredCoverage;
+    }
+
     /// @notice Narrow proposal view consumed by the guardian registry.
     /// @dev Returns a tuple (`voteEnd`, `reviewEnd`, `vault`) encoded to match
     ///      `GuardianRegistry.IGovernorMinimal.ProposalView`. Keeps the registry
@@ -712,6 +743,46 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         unchecked {
             ++_openProposalCount;
         }
+    }
+
+    /// @dev Thin store-wrapper around `_resolveTier`, hoisted out of `propose`
+    ///      to keep that function under Yul's stack budget (see
+    ///      `_initPendingProposal`). Implicit calldata→memory copy of `calls`.
+    function _snapshotTier(StrategyProposal storage p, BatchExecutorLib.Call[] memory calls) private {
+        // Reads p.maxCapital from storage (written immediately before this call
+        // in `propose`) rather than taking it as a stack argument — keeps the
+        // propose() call site 1 slot under Yul's stack budget.
+        (uint8 tier_, uint256 coverage_) = _resolveTier(calls, p.maxCapital);
+        p.envelopeTier = tier_;
+        p.requiredCoverage = coverage_;
+    }
+
+    /// @dev Proposal tier = max tier across execute calls; coverage = the
+    ///      extractable-weighted demand the aggregate exposure cap will consume.
+    ///      With no registry wired every proposal is tier 2 / full notional —
+    ///      strictly the safe default. `memory` params (not calldata) so Task 6
+    ///      can reuse it on storage-loaded calls at execute time.
+    function _resolveTier(BatchExecutorLib.Call[] memory calls, uint256 maxCapital)
+        private
+        view
+        returns (uint8 tier, uint256 coverage)
+    {
+        address registry = _tierRegistry;
+        if (registry == address(0)) return (2, maxCapital);
+        uint16 maxBoundBps = 0;
+        for (uint256 i = 0; i < calls.length; i++) {
+            bytes memory d = calls[i].data;
+            bytes4 sel;
+            if (d.length >= 4) {
+                assembly {
+                    sel := mload(add(d, 32))
+                }
+            }
+            (uint8 t, uint16 boundBps) = ITierRegistry(registry).tierOf(calls[i].target, sel);
+            if (t > tier) tier = t;
+            if (boundBps > maxBoundBps) maxBoundBps = boundBps;
+        }
+        coverage = tier == 2 ? maxCapital : (maxCapital * maxBoundBps) / 10_000;
     }
 
     /// @dev Push calldata calls into a storage mapping slot
@@ -1163,6 +1234,16 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     function setProtocolConfig(address newConfig) external onlyFactory {
         if (newConfig == address(0)) revert ZeroAddress();
         protocolConfig = newConfig;
+    }
+
+    /// @inheritdoc ISyndicateGovernor
+    /// @dev address(0) is legal: it un-wires the registry and every subsequent
+    ///      proposal resolves to tier 2 / full notional — the safe default, so
+    ///      no zero-check (unlike `setProtocolConfig`, where zero would brick
+    ///      fee snapshots).
+    function setTierRegistry(address newRegistry) external onlyFactory {
+        emit TierRegistrySet(_tierRegistry, newRegistry);
+        _tierRegistry = newRegistry;
     }
 
     /// @inheritdoc ISyndicateGovernor
