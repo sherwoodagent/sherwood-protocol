@@ -29,6 +29,10 @@ contract TierRegistry is Ownable2Step {
     uint8 public constant TIER_ARBITRARY = 2;
     uint16 public constant FULL_NOTIONAL_BPS = 10_000;
 
+    /// @dev EXTCODEHASH of an EXISTING account with no code (EIP-1052). A funded
+    ///      EOA hashes to this, not bytes32(0) — `certify` rejects both.
+    bytes32 private constant _EMPTY_CODEHASH = keccak256("");
+
     mapping(bytes32 configKey => TierConfig) private _configs;
 
     constructor(address initialOwner) Ownable(initialOwner) {}
@@ -65,7 +69,7 @@ contract TierRegistry is Ownable2Step {
         if (tier >= TIER_ARBITRARY) revert InvalidTier();
         if (extractableBoundBps == 0 || extractableBoundBps >= FULL_NOTIONAL_BPS) revert BoundRequired();
         bytes32 ch = target.codehash;
-        if (ch == bytes32(0)) revert NotAContract();
+        if (ch == bytes32(0) || ch == _EMPTY_CODEHASH) revert NotAContract();
         _configs[key(target, selector)] =
             TierConfig({tier: tier, extractableBoundBps: extractableBoundBps, certifiedCodehash: ch});
         emit TierCertified(target, selector, tier, extractableBoundBps, ch);
