@@ -18,6 +18,17 @@ import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step
  *      EXTCODEHASH against the certified hash on every read and reports tier 2
  *      on mismatch — no state write in the hot path, nothing to grief. `poke`
  *      persists the demotion and emits for indexers.
+ *
+ *      SCOPE OF THE CODEHASH CHECK (finding 4): EXTCODEHASH identity catches
+ *      ONLY same-address bytecode mutation — i.e. metamorphic redeploys
+ *      (CREATE2 + SELFDESTRUCT). It does NOT catch proxy implementation swaps:
+ *      for EIP-1967 / UUPS / transparent / beacon proxies the PROXY's runtime
+ *      bytecode is static across upgrades, so the certified hash keeps
+ *      matching while the behavior behind it changes arbitrarily. Governance
+ *      MUST NOT certify proxied adapters at tier 0/1 — certification is a
+ *      governance judgment (per spec), and an upgradeable target can never be
+ *      "closed-loop" or "oracle-bounded" by inspection of frozen code. Leave
+ *      proxies at the tier-2 default.
  */
 contract TierRegistry is Ownable2Step {
     struct TierConfig {
@@ -72,8 +83,16 @@ contract TierRegistry is Ownable2Step {
     error NotCertified();
 
     /// @notice Certify (target, selector) at tier 0/1 with its extractable bound.
-    ///         Snapshots EXTCODEHASH — upgradeable/proxied targets will trip the
-    ///         lazy demotion on their first post-upgrade read, by design.
+    ///         Snapshots EXTCODEHASH so a metamorphic self-redeploy (CREATE2 +
+    ///         SELFDESTRUCT: new bytecode at the same address) trips the lazy
+    ///         demotion on its first post-mutation read.
+    /// @dev    The snapshot does NOT protect against proxy implementation
+    ///         swaps — an EIP-1967/UUPS/transparent/beacon proxy's runtime
+    ///         bytecode (and hence its EXTCODEHASH) never changes when the
+    ///         implementation is upgraded. There is no reliable on-chain proxy
+    ///         detector (a contract cannot read another contract's storage
+    ///         slots), so this is a GOVERNANCE obligation: do not certify
+    ///         proxied targets at tier 0/1 (see contract-level note).
     function certify(address target, bytes4 selector, uint8 tier, uint16 extractableBoundBps) external onlyOwner {
         if (tier >= TIER_ARBITRARY) revert InvalidTier();
         if (extractableBoundBps == 0 || extractableBoundBps >= FULL_NOTIONAL_BPS) revert BoundRequired();
