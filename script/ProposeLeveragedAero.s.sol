@@ -49,9 +49,14 @@ contract ProposeLeveragedAero is ScriptBase {
 
         ISyndicateGovernor.CoProposer[] memory none = new ISyndicateGovernor.CoProposer[](0);
 
+        // Permissive envelope: vault-level metering lands in Task 4; the e2e
+        // proposal declares the widest legal bounds.
+        ISyndicateGovernor.RiskEnvelope memory envelope =
+            ISyndicateGovernor.RiskEnvelope({maxCapital: type(uint256).max, maxDrawdownBps: 10_000});
+
         vm.startBroadcast();
         uint256 proposalId = ISyndicateGovernor(governor)
-            .propose(vault, strategy, "ipfs://e2e", durationDays * 1 days, exec, settle, none);
+            .propose(vault, strategy, "ipfs://e2e", durationDays * 1 days, envelope, exec, settle, none);
         vm.stopBroadcast();
 
         console.log("PROPOSAL_ID", proposalId);

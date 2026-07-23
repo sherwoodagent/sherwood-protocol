@@ -21,6 +21,7 @@ import {MoonwellSupplyStrategy} from "../../src/strategies/MoonwellSupplyStrateg
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
+import {GovEnvelope} from "../helpers/GovEnvelope.sol";
 
 /**
  * @title GuardianNetworkForkTest
@@ -399,6 +400,7 @@ contract GuardianNetworkForkTest is Test {
             strategy,
             "ipfs://guardian-network-fork-test",
             7 days,
+            GovEnvelope.permissive(),
             execCalls,
             settleCalls,
             new ISyndicateGovernor.CoProposer[](0)

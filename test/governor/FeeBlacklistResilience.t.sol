@@ -12,6 +12,7 @@ import {BlacklistingERC20Mock} from "../mocks/BlacklistingERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
+import {GovEnvelope} from "../helpers/GovEnvelope.sol";
 
 /// @title FeeBlacklistResilience
 /// @notice Covers W-1: USDC blacklist on any fee recipient (lead / co-proposer
@@ -149,8 +150,16 @@ contract FeeBlacklistResilienceTest is Test {
         vm.prank(owner);
         vault.setAgentFeeBps(perfFeeBps);
         vm.prank(agent);
-        proposalId =
-            governor.propose(address(vault), address(0), "ipfs://test", duration, _noopCalls(), _noopCalls(), coProps);
+        proposalId = governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://test",
+            duration,
+            GovEnvelope.permissive(),
+            _noopCalls(),
+            _noopCalls(),
+            coProps
+        );
         vm.warp(block.timestamp + 1);
 
         if (coProps.length > 0) {

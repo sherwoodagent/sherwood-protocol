@@ -10,6 +10,7 @@ import {SyndicateVault} from "../../src/SyndicateVault.sol";
 import {SyndicateFactory} from "../../src/SyndicateFactory.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {DeploySherwood} from "../../script/Deploy.s.sol";
+import {GovEnvelope} from "../helpers/GovEnvelope.sol";
 
 /**
  * @title BaseIntegrationTest
@@ -193,7 +194,14 @@ abstract contract BaseIntegrationTest is Test {
         // Agent proposes
         vm.prank(agent);
         proposalId = governor.propose(
-            address(vault), address(0), "ipfs://test", duration, execCalls, settleCalls, _emptyCoProposers()
+            address(vault),
+            address(0),
+            "ipfs://test",
+            duration,
+            GovEnvelope.permissive(),
+            execCalls,
+            settleCalls,
+            _emptyCoProposers()
         );
 
         // Warp 1 second so snapshot timestamp is in the past

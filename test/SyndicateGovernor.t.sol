@@ -17,6 +17,7 @@ import {VaultWithdrawalQueue} from "../src/queue/VaultWithdrawalQueue.sol";
 import {IVaultWithdrawalQueue} from "../src/interfaces/IVaultWithdrawalQueue.sol";
 import {MockStrategyAdapter} from "./mocks/MockStrategyAdapter.sol";
 import {IStrategy} from "../src/interfaces/IStrategy.sol";
+import {GovEnvelope} from "./helpers/GovEnvelope.sol";
 
 contract SyndicateGovernorTest is Test {
     SyndicateGovernor public governor;
@@ -155,6 +156,7 @@ contract SyndicateGovernorTest is Test {
             address(0),
             "ipfs://test",
             duration,
+            GovEnvelope.permissive(),
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             _emptyCoProposers()
@@ -193,6 +195,7 @@ contract SyndicateGovernorTest is Test {
             strategy,
             "ipfs://test",
             duration,
+            GovEnvelope.permissive(),
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             _emptyCoProposers()
@@ -252,6 +255,7 @@ contract SyndicateGovernorTest is Test {
             address(0),
             "ipfs://test",
             7 days,
+            GovEnvelope.permissive(),
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             _emptyCoProposers()
@@ -266,6 +270,7 @@ contract SyndicateGovernorTest is Test {
             address(0),
             "ipfs://test",
             7 days,
+            GovEnvelope.permissive(),
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             _emptyCoProposers()
@@ -280,6 +285,7 @@ contract SyndicateGovernorTest is Test {
             address(0),
             "ipfs://test",
             MAX_STRATEGY_DURATION + 1,
+            GovEnvelope.permissive(),
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             _emptyCoProposers()
@@ -294,6 +300,7 @@ contract SyndicateGovernorTest is Test {
             address(0),
             "ipfs://test",
             30 minutes,
+            GovEnvelope.permissive(),
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             _emptyCoProposers()
@@ -305,7 +312,14 @@ contract SyndicateGovernorTest is Test {
         vm.prank(agent);
         vm.expectRevert(ISyndicateGovernor.EmptyExecuteCalls.selector);
         governor.propose(
-            address(vault), address(0), "ipfs://test", 7 days, empty, _simpleSettlementCalls(), _emptyCoProposers()
+            address(vault),
+            address(0),
+            "ipfs://test",
+            7 days,
+            GovEnvelope.permissive(),
+            empty,
+            _simpleSettlementCalls(),
+            _emptyCoProposers()
         );
     }
 
@@ -314,7 +328,14 @@ contract SyndicateGovernorTest is Test {
         vm.prank(agent);
         vm.expectRevert(ISyndicateGovernor.EmptySettlementCalls.selector);
         governor.propose(
-            address(vault), address(0), "ipfs://test", 7 days, _simpleExecuteCalls(), empty, _emptyCoProposers()
+            address(vault),
+            address(0),
+            "ipfs://test",
+            7 days,
+            GovEnvelope.permissive(),
+            _simpleExecuteCalls(),
+            empty,
+            _emptyCoProposers()
         );
     }
 
@@ -330,6 +351,7 @@ contract SyndicateGovernorTest is Test {
             address(0),
             "ipfs://test",
             7 days,
+            GovEnvelope.permissive(),
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             _emptyCoProposers()
@@ -362,6 +384,7 @@ contract SyndicateGovernorTest is Test {
             address(0),
             "ipfs://test",
             7 days,
+            GovEnvelope.permissive(),
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             _emptyCoProposers()
@@ -482,6 +505,7 @@ contract SyndicateGovernorTest is Test {
             address(0),
             "ipfs://dup",
             7 days,
+            GovEnvelope.permissive(),
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             _emptyCoProposers()
@@ -661,6 +685,7 @@ contract SyndicateGovernorTest is Test {
             address(0xBEEF), // EOA, no selfManagesFees()
             "ipfs://eoa",
             7 days,
+            GovEnvelope.permissive(),
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             empty
@@ -753,6 +778,7 @@ contract SyndicateGovernorTest is Test {
             address(0),
             "ipfs://test",
             7 days,
+            GovEnvelope.permissive(),
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             _emptyCoProposers()

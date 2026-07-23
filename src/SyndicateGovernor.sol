@@ -229,6 +229,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         address strategy,
         string calldata metadataURI,
         uint256 strategyDuration,
+        RiskEnvelope calldata envelope,
         BatchExecutorLib.Call[] calldata executeCalls,
         BatchExecutorLib.Call[] calldata settlementCalls,
         CoProposer[] calldata coProposers
@@ -250,6 +251,10 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         }
         // G-M11: cap metadata URI length.
         if (bytes(metadataURI).length > MAX_METADATA_URI_LENGTH) revert MetadataURITooLong();
+        // Risk envelope (spec 2026-07-22 §3.1): nonzero outflow ceiling,
+        // drawdown declaration capped at 100%.
+        if (envelope.maxCapital == 0) revert ZeroMaxCapital();
+        if (envelope.maxDrawdownBps > 10_000) revert InvalidDrawdown();
 
         // Validate co-proposers if present
         if (coProposers.length > 0) {
@@ -282,6 +287,10 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         p.performanceFeeBps =
             _clampPerformanceFee(proposalId, ISyndicateVault(vault).agentFeeBps(), _params.maxPerformanceFeeBps);
         p.strategyDuration = strategyDuration;
+        // Risk envelope snapshot — immutable for this proposal's lifetime.
+        // Sequential writes (not struct literal) per the stack-too-deep note above.
+        p.maxCapital = envelope.maxCapital;
+        p.maxDrawdownBps = envelope.maxDrawdownBps;
         // Snapshot protocol and guardian fee config at propose time so settlement
         // uses rates/recipients that voters actually saw, not a post-vote change.
         {
@@ -649,6 +658,12 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     /// @inheritdoc ISyndicateGovernor
     function getCoProposers(uint256 proposalId) external view returns (CoProposer[] memory) {
         return _coProposers[proposalId];
+    }
+
+    /// @inheritdoc ISyndicateGovernor
+    function getRiskEnvelope(uint256 proposalId) external view returns (uint256 maxCapital, uint16 maxDrawdownBps) {
+        StrategyProposal storage p = _proposals[proposalId];
+        return (p.maxCapital, p.maxDrawdownBps);
     }
 
     /// @inheritdoc ISyndicateGovernor

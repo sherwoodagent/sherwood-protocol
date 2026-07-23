@@ -16,6 +16,7 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
+import {GovEnvelope} from "../helpers/GovEnvelope.sol";
 
 /// @title SwoodReviewSlash.t
 /// @notice End-to-end integration test for the sWOOD staking-split (Task 11.1).
@@ -306,6 +307,7 @@ contract SwoodReviewSlashTest is Test {
             address(0),
             "ipfs://swood-review-slash",
             7 days,
+            GovEnvelope.permissive(),
             _execCalls(),
             _settleCalls(),
             _emptyCoProposers()

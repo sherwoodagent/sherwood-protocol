@@ -16,6 +16,7 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
+import {GovEnvelope} from "../helpers/GovEnvelope.sol";
 
 /// @title GuardianReviewLifecycle.t
 /// @notice End-to-end tests for the Task 25 guardian-review proposal lifecycle.
@@ -248,6 +249,7 @@ contract GuardianReviewLifecycleTest is Test {
             address(0),
             "ipfs://review-lifecycle",
             7 days,
+            GovEnvelope.permissive(),
             _execCalls(),
             _settleCalls(),
             _emptyCoProposers()

@@ -9,6 +9,7 @@ import {ISyndicateGovernor} from "../../../src/interfaces/ISyndicateGovernor.sol
 import {BatchExecutorLib} from "../../../src/BatchExecutorLib.sol";
 
 import {ERC20Mock} from "../../mocks/ERC20Mock.sol";
+import {GovEnvelope} from "../../helpers/GovEnvelope.sol";
 
 /// @title VaultSolvencyHandler
 /// @notice Bounded fuzz-action driver for INV-15 (vault solvency).
@@ -213,6 +214,7 @@ contract VaultSolvencyHandler is Test {
             address(0),
             "ipfs://test",
             strategyDuration,
+            GovEnvelope.permissive(),
             calls,
             calls,
             new ISyndicateGovernor.CoProposer[](0)

@@ -14,6 +14,7 @@ import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
+import {GovEnvelope} from "../helpers/GovEnvelope.sol";
 
 /// @title PerVaultParams.t
 /// @notice Task 21 — per-vault governance parameters:
@@ -120,6 +121,7 @@ contract PerVaultParamsTest is Test {
             address(0),
             "ipfs://test",
             7 days,
+            GovEnvelope.permissive(),
             _noopCalls(),
             _noopCalls(),
             new ISyndicateGovernor.CoProposer[](0)

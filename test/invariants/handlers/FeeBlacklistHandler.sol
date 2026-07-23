@@ -9,6 +9,7 @@ import {ISyndicateGovernor} from "../../../src/interfaces/ISyndicateGovernor.sol
 import {BatchExecutorLib} from "../../../src/BatchExecutorLib.sol";
 
 import {BlacklistingERC20Mock} from "../../mocks/BlacklistingERC20Mock.sol";
+import {GovEnvelope} from "../../helpers/GovEnvelope.sol";
 
 /// @title FeeBlacklistHandler
 /// @notice Bounded fuzz-action driver for INV-47 (W-1 fee-blacklist resilience).
@@ -193,8 +194,9 @@ contract FeeBlacklistHandler is Test {
         vm.prank(vaultOwner);
         vault.setAgentFeeBps(perfFeeBps);
         vm.prank(leadAgent);
-        uint256 proposalId =
-            governor.propose(address(vault), address(0), "ipfs://test", strategyDuration, calls, calls, coProps);
+        uint256 proposalId = governor.propose(
+            address(vault), address(0), "ipfs://test", strategyDuration, GovEnvelope.permissive(), calls, calls, coProps
+        );
 
         // Move past the snapshot block so checkpoints are readable.
         vm.warp(vm.getBlockTimestamp() + 1);

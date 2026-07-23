@@ -12,13 +12,12 @@ import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
-import {GovEnvelope} from "../helpers/GovEnvelope.sol";
 
-/// @notice G-H5 boundary regression. `executeBy` is the INCLUSIVE last timestamp
-///         at which `executeProposal` may land; one second later the proposal
-///         must resolve to `Expired` and `executeProposal` must revert with
-///         `ProposalNotApproved` (since resolution moves Approved -> Expired).
-contract ExecuteByBoundaryTest is Test {
+/// @notice Task 3 — per-proposal risk envelope (spec 2026-07-22 §3.1). The
+///         proposer declares `maxCapital` (net-outflow ceiling, vault-enforced
+///         in Task 4) and `maxDrawdownBps` (declared loss envelope; losses
+///         beyond it are challengeable in a later plan) at propose time.
+contract RiskEnvelopeTest is Test {
     SyndicateGovernor public governor;
     SyndicateVault public vault;
     BatchExecutorLib public executorLib;
@@ -30,7 +29,6 @@ contract ExecuteByBoundaryTest is Test {
     address public owner = makeAddr("owner");
     address public agent = makeAddr("agent");
     address public lp1 = makeAddr("lp1");
-    address public lp2 = makeAddr("lp2");
 
     uint256 constant VOTING_PERIOD = 1 days;
     uint256 constant EXECUTION_WINDOW = 1 days;
@@ -62,7 +60,7 @@ contract ExecuteByBoundaryTest is Test {
         bytes memory govInit = abi.encodeCall(
             SyndicateGovernor.initialize,
             (
-                address(vault), // vault_: this test's vault (per-vault governor)
+                address(vault),
                 address(guardianRegistry),
                 address(new ProtocolConfig(owner)),
                 address(this), // factory (test contract)
@@ -88,16 +86,9 @@ contract ExecuteByBoundaryTest is Test {
         vm.stopPrank();
 
         usdc.mint(lp1, 100_000e6);
-        usdc.mint(lp2, 100_000e6);
-
         vm.startPrank(lp1);
         usdc.approve(address(vault), 60_000e6);
         vault.deposit(60_000e6, lp1);
-        vm.stopPrank();
-
-        vm.startPrank(lp2);
-        usdc.approve(address(vault), 40_000e6);
-        vault.deposit(40_000e6, lp2);
         vm.stopPrank();
 
         vm.warp(vm.getBlockTimestamp() + 1);
@@ -117,69 +108,42 @@ contract ExecuteByBoundaryTest is Test {
         });
     }
 
-    /// @dev Creates an Approved proposal (Pending -> voting ends -> Approved)
-    ///      and returns the proposalId plus its `executeBy` timestamp.
-    function _createApproved() internal returns (uint256 proposalId, uint256 executeBy) {
+    /// @dev Builds a normal single-proposer proposal carrying the given envelope.
+    function _proposeWithEnvelope(uint256 maxCapital, uint16 maxDrawdownBps) internal returns (uint256 proposalId) {
         vm.prank(agent);
         proposalId = governor.propose(
             address(vault),
             address(0),
-            "ipfs://boundary",
+            "ipfs://risk-envelope",
             7 days,
-            GovEnvelope.permissive(),
+            ISyndicateGovernor.RiskEnvelope({maxCapital: maxCapital, maxDrawdownBps: maxDrawdownBps}),
             _execCalls(),
             _settleCalls(),
             new ISyndicateGovernor.CoProposer[](0)
         );
-        vm.warp(vm.getBlockTimestamp() + 1);
-
-        vm.prank(lp1);
-        governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
-        vm.prank(lp2);
-        governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
-
-        ISyndicateGovernor.StrategyProposal memory p = governor.getProposal(proposalId);
-        executeBy = p.executeBy;
-
-        vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
     }
 
-    /// @notice G-H5: `executeBy` is inclusive — executing exactly at that
-    ///         timestamp must succeed.
-    function test_executeProposal_exactlyAtExecuteBy_succeeds() public {
-        (uint256 proposalId, uint256 executeBy) = _createApproved();
-
-        vm.warp(executeBy);
-        governor.executeProposal(proposalId);
-
-        ISyndicateGovernor.StrategyProposal memory p = governor.getProposal(proposalId);
-        assertEq(uint256(p.state), uint256(ISyndicateGovernor.ProposalState.Executed));
+    function test_proposeStoresEnvelope() public {
+        uint256 pid = _proposeWithEnvelope(1_000e6, 400); // maxCapital 1000 USDC, 4% drawdown
+        (uint256 maxCapital, uint16 maxDrawdownBps) = governor.getRiskEnvelope(pid);
+        assertEq(maxCapital, 1_000e6);
+        assertEq(maxDrawdownBps, 400);
     }
 
-    /// @notice G-H5: one second past `executeBy` the proposal is Expired and
-    ///         `executeProposal` reverts with `ProposalNotApproved` (state
-    ///         resolver maps Approved -> Expired before the state check).
-    function test_executeProposal_oneSecondAfterExecuteBy_reverts_Expired() public {
-        (uint256 proposalId, uint256 executeBy) = _createApproved();
-
-        vm.warp(executeBy + 1);
-
-        ISyndicateGovernor.ProposalState resolved = governor.getProposalState(proposalId);
-        assertEq(uint256(resolved), uint256(ISyndicateGovernor.ProposalState.Expired));
-
-        vm.expectRevert(ISyndicateGovernor.ProposalNotApproved.selector);
-        governor.executeProposal(proposalId);
+    function test_proposeRevertsOnZeroMaxCapital() public {
+        vm.expectRevert(ISyndicateGovernor.ZeroMaxCapital.selector);
+        _proposeWithEnvelope(0, 400);
     }
 
-    /// @notice G-H5 sanity: one second before `executeBy` execution is
-    ///         unambiguously inside the window and must succeed.
-    function test_executeProposal_oneSecondBeforeExecuteBy_succeeds() public {
-        (uint256 proposalId, uint256 executeBy) = _createApproved();
+    function test_proposeRevertsOnDrawdownOver100Pct() public {
+        vm.expectRevert(ISyndicateGovernor.InvalidDrawdown.selector);
+        _proposeWithEnvelope(1_000e6, 10_001);
+    }
 
-        vm.warp(executeBy - 1);
-        governor.executeProposal(proposalId);
-
-        ISyndicateGovernor.StrategyProposal memory p = governor.getProposal(proposalId);
-        assertEq(uint256(p.state), uint256(ISyndicateGovernor.ProposalState.Executed));
+    /// @notice Boundary: exactly 100% drawdown is the maximum legal declaration.
+    function test_proposeAcceptsDrawdownAtExactly100Pct() public {
+        uint256 pid = _proposeWithEnvelope(1_000e6, 10_000);
+        (, uint16 maxDrawdownBps) = governor.getRiskEnvelope(pid);
+        assertEq(maxDrawdownBps, 10_000);
     }
 }

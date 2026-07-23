@@ -109,11 +109,24 @@ interface ISyndicateGovernor {
         ///         implementation can't flip it between review and settle (TOCTOU),
         ///         and a broken/EOA strategy can't brick settle via a revert.
         bool selfManagesFees;
+        // ── APPENDED FIELDS ONLY BELOW (beacon-upgraded governors; storage parity) ──
+        uint256 maxCapital; // risk envelope: net-outflow ceiling (spec §3.1)
+        uint16 maxDrawdownBps; // risk envelope: declared drawdown bound
     }
 
     struct CoProposer {
         address agent;
         uint256 splitBps;
+    }
+
+    /// @notice Per-proposal risk envelope (spec 2026-07-22 §3.1).
+    /// @param maxCapital   Net-outflow ceiling for the execute batch, enforced
+    ///                     by the vault at custody level. Nonzero.
+    /// @param maxDrawdownBps Declared drawdown envelope; losses beyond it are
+    ///                     challengeable (challenge game, later plan). <= 10_000.
+    struct RiskEnvelope {
+        uint256 maxCapital;
+        uint16 maxDrawdownBps;
     }
 
     // Owner-multisig governs parameter changes via its own delay.
@@ -161,6 +174,12 @@ interface ISyndicateGovernor {
     ///         MAX_METADATA_URI_LENGTH. Bounds a calldata-unbounded string
     ///         that would otherwise let a proposer grief gas / event storage.
     error MetadataURITooLong();
+    /// @notice Revert if `envelope.maxCapital == 0` at propose — a zero
+    ///         net-outflow ceiling would make every execute batch unfundable.
+    error ZeroMaxCapital();
+    /// @notice Revert if `envelope.maxDrawdownBps > 10_000` at propose — a
+    ///         drawdown declaration cannot exceed 100% of committed capital.
+    error InvalidDrawdown();
     /// @notice G-M2/G-M6: Revert if `executeCalls.length` or
     ///         `settlementCalls.length` exceeds MAX_CALLS_PER_PROPOSAL. Bounds
     ///         calldata-unbounded arrays that otherwise let a proposer grief
@@ -329,6 +348,7 @@ interface ISyndicateGovernor {
         address strategy,
         string calldata metadataURI,
         uint256 strategyDuration,
+        RiskEnvelope calldata envelope,
         BatchExecutorLib.Call[] calldata executeCalls,
         BatchExecutorLib.Call[] calldata settlementCalls,
         CoProposer[] calldata coProposers
@@ -414,6 +434,9 @@ interface ISyndicateGovernor {
     function getCooldownEnd() external view returns (uint256);
     function getCapitalSnapshot(uint256 proposalId) external view returns (uint256);
     function getCoProposers(uint256 proposalId) external view returns (CoProposer[] memory);
+    /// @notice Risk envelope declared by the proposer at propose time
+    ///         (spec 2026-07-22 §3.1). Immutable for the proposal's lifetime.
+    function getRiskEnvelope(uint256 proposalId) external view returns (uint256 maxCapital, uint16 maxDrawdownBps);
     function vault() external view returns (address);
     function protocolConfig() external view returns (address);
 

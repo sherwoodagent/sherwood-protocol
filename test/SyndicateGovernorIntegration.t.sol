@@ -15,6 +15,7 @@ import {MockMToken} from "./mocks/MockMToken.sol";
 import {MockComptroller} from "./mocks/MockComptroller.sol";
 import {MockRegistryMinimal} from "./mocks/MockRegistryMinimal.sol";
 import {ProtocolConfig} from "../src/ProtocolConfig.sol";
+import {GovEnvelope} from "./helpers/GovEnvelope.sol";
 
 /**
  * @title SyndicateGovernorIntegrationTest
@@ -147,7 +148,14 @@ contract SyndicateGovernorIntegrationTest is Test {
         vault.setAgentFeeBps(feeBps);
         vm.prank(agent);
         proposalId = governor.propose(
-            address(vault), address(0), "ipfs://test", duration, executeCalls, settlementCalls, _emptyCoProposers()
+            address(vault),
+            address(0),
+            "ipfs://test",
+            duration,
+            GovEnvelope.permissive(),
+            executeCalls,
+            settlementCalls,
+            _emptyCoProposers()
         );
         // via_ir-safe: use vm.getBlockTimestamp() so the IR optimizer can't reorder
         // block.timestamp reads across vm.warp cheatcodes
@@ -223,7 +231,14 @@ contract SyndicateGovernorIntegrationTest is Test {
 
         vm.prank(agent);
         uint256 proposalId = governor.propose(
-            address(vault), address(0), "ipfs://test", 7 days, execCalls, settleCalls, _emptyCoProposers()
+            address(vault),
+            address(0),
+            "ipfs://test",
+            7 days,
+            GovEnvelope.permissive(),
+            execCalls,
+            settleCalls,
+            _emptyCoProposers()
         );
         vm.warp(block.timestamp + 1);
 

@@ -7,6 +7,7 @@ import {MoonwellSupplyStrategy} from "../../src/strategies/MoonwellSupplyStrateg
 import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {GovEnvelope} from "../helpers/GovEnvelope.sol";
 
 /**
  * @title GovernanceIntegrationTest
@@ -76,6 +77,7 @@ contract GovernanceIntegrationTest is BaseIntegrationTest {
             address(0),
             "ipfs://veto-test",
             STRATEGY_DURATION,
+            GovEnvelope.permissive(),
             execCalls,
             settleCalls,
             _emptyCoProposers()
@@ -118,6 +120,7 @@ contract GovernanceIntegrationTest is BaseIntegrationTest {
             address(0),
             "ipfs://reject-test",
             STRATEGY_DURATION,
+            GovEnvelope.permissive(),
             execCalls,
             settleCalls,
             _emptyCoProposers()
@@ -196,7 +199,14 @@ contract GovernanceIntegrationTest is BaseIntegrationTest {
         vault.setAgentFeeBps(PERF_FEE_BPS);
         vm.prank(agent);
         uint256 pid2 = governor.propose(
-            address(vault), address(0), "ipfs://cooldown-test", STRATEGY_DURATION, exec2, settle2, _emptyCoProposers()
+            address(vault),
+            address(0),
+            "ipfs://cooldown-test",
+            STRATEGY_DURATION,
+            GovEnvelope.permissive(),
+            exec2,
+            settle2,
+            _emptyCoProposers()
         );
 
         // Warp 1 second for snapshot

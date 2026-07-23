@@ -20,6 +20,7 @@ import {DeploySherwood} from "../../../script/Deploy.s.sol";
 import {IMoonwellMarket, ICToken} from "../../../src/interfaces/IMoonwellMarket.sol";
 import {ICLPool, ICLSwapRouter} from "../../../src/interfaces/ISlipstream.sol";
 import {TickMath} from "../../../src/libraries/TickMath.sol";
+import {GovEnvelope} from "../../helpers/GovEnvelope.sol";
 
 /// @dev Minimal Chainlink aggregator interface for the deleverage feed-mock.
 interface IAggE2E {
@@ -286,7 +287,14 @@ contract LeveragedAeroCLE2EFork is LeveragedAeroForkBase {
 
         vm.prank(agent);
         proposalId = governor.propose(
-            address(vault), address(strategy), "ipfs://e2e", STRATEGY_DURATION, exec, settle, _noCoProposers()
+            address(vault),
+            address(strategy),
+            "ipfs://e2e",
+            STRATEGY_DURATION,
+            GovEnvelope.permissive(),
+            exec,
+            settle,
+            _noCoProposers()
         );
 
         // Not active yet (still Pending) — vault not locked.
