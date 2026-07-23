@@ -588,6 +588,16 @@ before v1a ships:
 - Settlement/valuation oracles are load-bearing for guards, PnL, AND the
   pre-drain compensation snapshot; inherits and extends the frozen-settle-price
   work.
+- **WOOD price source is a pre-launch external dependency (no feed today).**
+  There is currently no Chainlink WOOD feed on Robinhood Chain. Both the tier-0/1
+  runtime guards (§3.2 manipulation-resistant valuation) and `priceHaircut` (§5,
+  WOOD→USD for `slashableBond`) require a manipulation-resistant WOOD price.
+  Options: stand up a Chainlink feed (being pursued by the team), or a
+  protocol-run TWAP over the main WOOD pool as fallback. Note either source is
+  only as robust as WOOD's underlying liquidity (~$500k pool today), so the feed
+  improves *measurement* but does not remove `priceHaircut` or the F2 economics —
+  an accurate low price is still a low price. Track feed availability as a gate on
+  the tier-0/1 valuation design.
 - **Slow-bleed / salami (accepted risk, decided 2026-07-22).** v1 ships no
   on-chain cumulative-drawdown predicate (single-vault or cross-vault) and no
   per-epoch outflow cap. A coalition that controls a counterparty and bleeds a
