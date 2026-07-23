@@ -1,7 +1,7 @@
 # Guardian Economic Security: Making Coordinated Collusion Infeasible
 
 **Date:** 2026-07-22
-**Status:** Draft for review — revised after review #4759928193 (F1–F6 + precision items remediated)
+**Status:** Design of record (per re-review #4760018146) — F1–F6 + precision items remediated; R1/R2/R3 + F4-viability + scope tracked as pre-launch gates (§3.4, §3.8, §3.10, §4, §8)
 **Scope:** GuardianRegistry, StakedWood, SyndicateVault (custody guards + compensation escrow), SyndicateGovernor (approve quorum, proposer bond, hooks)
 
 ## 0. Revision log
@@ -217,7 +217,20 @@ Post-execution challenge window. Anyone may post a bonded challenge citing
      bucket. Approver liability for a drawdown breach attaches to every guardian
      who approved any clip contributing to the windowed loss, pro-rata by the
      extractable value they signed.
-   - The per-epoch per-vault outflow cap complements it but is not relied on
+   - **Cross-vault dimension (R3, re-review).** Vault-only keying kills the
+     Sybil-proposer and set-swap resets but still lets a coalition spread thin
+     slices across N vaults, each vault under its own 30-day bound. The exposure
+     cap (§3.3) bounds a guardian's *simultaneous* cross-vault exposure but not
+     *cumulative realized drawdown over time*. Closing this needs a second
+     accumulator keyed on the **proposer** and on the **guardian** — cumulative
+     realized loss attributable to a given proposer (or approver) across *all
+     vaults they touched* in the trailing window, breaching an aggregate bound
+     independently of any single vault. The proposer axis is the primary one (the
+     proposer is the attacker and cannot rotate without abandoning its agent
+     identity/registration); the guardian axis catches a colluding approver set
+     that rents itself out across vaults. Both are additional challengeable
+     predicates, not new execution gates.
+   - The per-epoch per-vault outflow cap complements these but is not relied on
      alone (it is per-vault and set generously for real trading).
 
 Flow:
@@ -310,6 +323,26 @@ Instead:
   pre-drain claim on stake it did not hold pre-drain, and claims cannot be bought
   from exiting honest holders because they are non-transferable.
 
+**Snapshot block for each conviction path (R1, re-review).** A single-proposal
+conviction has one execution block, so "pre-drain block" is unambiguous. A
+**drawdown-predicate conviction** (§3.4 #5) spans a trailing window with no single
+execution block and holders entering/exiting throughout. Rule: the compensation
+snapshot for a drawdown conviction is **time-weighted over the drawdown window** —
+each address's claim is proportional to its share-seconds held during the window,
+so a mid-window exiter is compensated for the period it was exposed and a
+mid-window enter-to-farm-the-payout accumulator earns only its (small) exposed
+share. The window-open block is the fallback if time-weighting proves too costly
+on-chain (weaker but still snapshot-gated, so still recoupment-free).
+
+**WOOD-only payout boundary (R1×F2 coupling, re-review).** Compensation is funded
+from slash proceeds, which are WOOD unless multi-collateral backs the bond. So a
+WOOD-only vault's *payout* re-inherits the F2 denomination gap even though its
+*cap* was fixed: victims are made whole only to the dollar value the slashed WOOD
+fetches at slash-time. This is the explicit boundary of the WOOD-only regime — it
+is acceptable only for vaults inside the WOOD budget (§3.7); any vault large
+enough for the gap to matter is already required to hold multi-collateral, whose
+non-WOOD legs fund the payout in stable value.
+
 This mirrors the voting-snapshot primitive already in the design; the omission in
 the first draft was applying it to the payout as well as the vote.
 
@@ -346,6 +379,35 @@ collapse, which is the likelier failure than collusion.
 - This also repairs the two §1 problems the first draft named but did not solve:
   pay becomes tied to underwriting work, and correct approval of risky-but-sound
   proposals is rewarded rather than merely un-penalized.
+
+**Worked ROE example (F4 viability gate, re-review — illustrative inputs).** The
+open question is whether the premium can clear a guardian's tail-risk hurdle at
+the target k=1 capacity. Concrete instance, assumed numbers labeled as such:
+
+```
+Vault TVL                         $2,000,000
+Strategy gross yield (annual)     12%  → $240,000 gross profit/yr
+Guardian fee share (default)      5% of gross profit  → $12,000/yr fee pool
+Tier-2 exposure a guardian carries (k=1)   $2,000,000 (worst case, full notional)
+Adjudication false-conviction rate p_e (assumed)   0.5%/yr
+Expected tail loss  = p_e · 100% · exposure = 0.005 · $2,000,000 = $10,000/yr
+```
+
+At these numbers the entire $12,000 fee pool barely exceeds the $10,000 expected
+tail loss of a *single* guardian carrying the full exposure — leaving ~$2,000 to
+split across the cohort as actual return on $2M of at-risk capital, an ROE far
+below any rational hurdle. The arithmetic only closes when exposure is
+**tier-0/1** (extractable is basis points of notional, so expected tail loss
+falls by the same 10⁴/boundBps factor coverage does): at a 50 bps bound the
+$2M notional carries ~$10,000 extractable, expected tail loss ~$50/yr, and the
+$12,000 pool is ample. **Implication, stated as a launch constraint:** at the
+default 5% fee share and a nonzero conviction-error rate, k=1 *tier-2* capacity
+is affordable only at small TVL; sustained large-TVL tier-2 flow requires either
+a higher guardian fee share (LP-return tradeoff, §8), a lower conviction-error
+rate (better adjudication), or accepting that large vaults run predominantly
+tier-0/1. The premium clears comfortably for the bounded tiers that should
+carry most real flow; it does not clear for large unbounded exposure, and the
+design does not pretend otherwise.
 
 ### 3.6 Adapter listing pipeline
 
@@ -429,6 +491,24 @@ the pieces that bound loss *before* the court:
 circuit breakers (need live traffic to set thresholds without a DoS lever),
 dynamic k by risk class.
 
+**Scope + liveness gate (re-review).** Fixing F2 pulled multi-collateral bonds
+(a genuinely new accounting subsystem: per-leg haircuts, per-collateral oracle
+pricing) into v1, and the F3 fail-open→fail-closed switch means liveness now
+*depends on* the F4 reward economics recruiting enough covering bond — an
+underfunded premium means legitimate proposals fail to reach approve quorum and
+flow halts, a coupling the optimistic-passage design did not have. Two hard gates
+before v1a ships:
+
+1. Confirm multi-collateral + approve quorum + compensation escrow + dollar cap
+   can ship *jointly correct*, each with the one-sentence invariant + fuzz test
+   this section already requires. If they cannot, cut multi-collateral from the
+   first release and launch **WOOD-only, small-vault-only** (covered-TVL cap
+   binds hard), adding multi-collateral before any large vault onboards.
+2. Validate the §3.10 ROE arithmetic at the intended launch TVL/tier mix before
+   flipping passage to fail-closed; if the premium underfunds at target scale,
+   either lower the capacity target or keep optimistic passage for the
+   bounded-tier flow that doesn't need a covering signer to be safe.
+
 ## 5. Parameters (initial)
 
 | Parameter | Initial value | Notes |
@@ -505,3 +585,12 @@ dynamic k by risk class.
 - Settlement/valuation oracles are load-bearing for guards, PnL, AND the
   pre-drain compensation snapshot; inherits and extends the frozen-settle-price
   work.
+- **Cross-vault cumulative salami (R3):** the proposer/guardian-axis drawdown
+  predicates (§3.4) close it in principle but are new accumulators; until built,
+  cross-vault spreading is a bounded residual whose only backstop is the
+  per-vault outflow cap. Track as a pre-launch gate.
+- **F4 is now priced-but-possibly-unaffordable at scale, not unpriced.** The
+  §3.10 worked example shows the premium clears for bounded tiers and does not
+  clear for large tier-2 exposure at the default fee share. This is a viability
+  constraint on *capacity*, not a soundness hole; the launch TVL/tier target must
+  be set where the ROE arithmetic closes.
