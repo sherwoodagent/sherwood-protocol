@@ -124,6 +124,11 @@ interface ISyndicateGovernor {
     ///                     by the vault at custody level. Nonzero.
     /// @param maxDrawdownBps Declared drawdown envelope; losses beyond it are
     ///                     challengeable (challenge game, later plan). <= 10_000.
+    ///                     10_000 (100%) is a legal declaration and means any
+    ///                     loss up to the full committed capital is inside the
+    ///                     envelope — no drawdown challenge can ever fire. It is
+    ///                     the permissive default for pre-envelope flows, not a
+    ///                     recommended production value.
     struct RiskEnvelope {
         uint256 maxCapital;
         uint16 maxDrawdownBps;
@@ -436,6 +441,10 @@ interface ISyndicateGovernor {
     function getCoProposers(uint256 proposalId) external view returns (CoProposer[] memory);
     /// @notice Risk envelope declared by the proposer at propose time
     ///         (spec 2026-07-22 §3.1). Immutable for the proposal's lifetime.
+    /// @dev    Returns (0, 0) for a nonexistent proposalId — the zero-value
+    ///         convention shared with getCapitalSnapshot / getCoProposers.
+    ///         Unambiguous here: `maxCapital == 0` is rejected at propose, so a
+    ///         zero `maxCapital` reliably means "no such proposal".
     function getRiskEnvelope(uint256 proposalId) external view returns (uint256 maxCapital, uint16 maxDrawdownBps);
     function vault() external view returns (address);
     function protocolConfig() external view returns (address);

@@ -146,4 +146,76 @@ contract RiskEnvelopeTest is Test {
         (, uint16 maxDrawdownBps) = governor.getRiskEnvelope(pid);
         assertEq(maxDrawdownBps, 10_000);
     }
+
+    /// @notice Nonexistent proposalId returns (0, 0) — the zero-value getter
+    ///         convention (see getCapitalSnapshot / getCoProposers). Since
+    ///         `maxCapital == 0` is rejected at propose, a zero maxCapital
+    ///         unambiguously means "no such proposal".
+    function test_getRiskEnvelope_nonexistentIdReturnsZero() public view {
+        (uint256 maxCapital, uint16 maxDrawdownBps) = governor.getRiskEnvelope(999);
+        assertEq(maxCapital, 0);
+        assertEq(maxDrawdownBps, 0);
+    }
+
+    /// @notice The envelope written at propose survives the vote and the
+    ///         Pending → GuardianReview → Approved → Executed transitions
+    ///         untouched — no lifecycle step rewrites it.
+    function test_envelopePersistsThroughVoteAndExecute() public {
+        uint256 pid = _proposeWithEnvelope(5_000e6, 1200);
+
+        vm.warp(vm.getBlockTimestamp() + 1);
+        vm.prank(lp1);
+        governor.vote(pid, ISyndicateGovernor.VoteType.For);
+
+        (uint256 maxCapital, uint16 maxDrawdownBps) = governor.getRiskEnvelope(pid);
+        assertEq(maxCapital, 5_000e6);
+        assertEq(maxDrawdownBps, 1200);
+
+        vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
+        governor.executeProposal(pid);
+        assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Executed));
+
+        (maxCapital, maxDrawdownBps) = governor.getRiskEnvelope(pid);
+        assertEq(maxCapital, 5_000e6);
+        assertEq(maxDrawdownBps, 1200);
+    }
+
+    /// @notice Collaborative regression: `approveCollaboration`'s Draft → Pending
+    ///         transition rewrites the timing fields (snapshotTimestamp, voteEnd,
+    ///         reviewEnd, executeBy, vetoThresholdBps) of the same struct — the
+    ///         envelope, written once at propose, must come through unchanged.
+    function test_envelopeImmutableAcrossCollaborativeApprove() public {
+        address coAgent = makeAddr("coAgent");
+        vm.startPrank(owner);
+        vault.registerAgent(agentRegistry.mint(coAgent), coAgent);
+        vm.stopPrank();
+
+        ISyndicateGovernor.CoProposer[] memory coProps = new ISyndicateGovernor.CoProposer[](1);
+        coProps[0] = ISyndicateGovernor.CoProposer({agent: coAgent, splitBps: 3000});
+
+        vm.prank(agent);
+        uint256 pid = governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://collab-envelope",
+            7 days,
+            ISyndicateGovernor.RiskEnvelope({maxCapital: 2_000e6, maxDrawdownBps: 750}),
+            _execCalls(),
+            _settleCalls(),
+            coProps
+        );
+        assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Draft));
+
+        (uint256 maxCapital, uint16 maxDrawdownBps) = governor.getRiskEnvelope(pid);
+        assertEq(maxCapital, 2_000e6);
+        assertEq(maxDrawdownBps, 750);
+
+        vm.prank(coAgent);
+        governor.approveCollaboration(pid);
+        assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Pending));
+
+        (maxCapital, maxDrawdownBps) = governor.getRiskEnvelope(pid);
+        assertEq(maxCapital, 2_000e6);
+        assertEq(maxDrawdownBps, 750);
+    }
 }
