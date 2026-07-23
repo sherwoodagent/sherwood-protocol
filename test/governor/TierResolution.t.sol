@@ -194,4 +194,25 @@ contract TierResolutionTest is Test {
         assertEq(governor.getProposalTier(pid), 2);
         assertEq(governor.getRequiredCoverage(pid), MAX_CAPITAL);
     }
+
+    /// @notice Mixed tier-0 (50 bps) + tier-1 (200 bps) calls → proposal tier is
+    ///         the MAX (1, not 2), and coverage uses the MAX extractable bound
+    ///         across both calls (200 bps), not the tier-0 call's 50 bps. This is
+    ///         the only case that exercises non-trivial `maxBoundBps` selection:
+    ///         the single-bound and tier-2 short-circuit paths never do.
+    function test_mixedTier0AndTier1UsesMaxBoundForCoverage() public {
+        _wireTierRegistry();
+        tierRegistry.certify(address(mockAdapter), mockAdapter.approve.selector, 0, 50);
+        tierRegistry.certify(address(mockAdapter), mockAdapter.transfer.selector, 1, 200);
+
+        BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](2);
+        calls[0] = _certifiedCall(); // tier 0, 50 bps
+        calls[1] = BatchExecutorLib.Call({
+            target: address(mockAdapter), data: abi.encodeCall(mockAdapter.transfer, (address(usdc), 1)), value: 0
+        }); // tier 1, 200 bps
+        uint256 pid = _propose(calls);
+
+        assertEq(governor.getProposalTier(pid), 1); // max(0, 1)
+        assertEq(governor.getRequiredCoverage(pid), 20e6); // 200 bps of 1_000e6, not 50 bps
+    }
 }
