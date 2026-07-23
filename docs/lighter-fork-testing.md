@@ -1,5 +1,18 @@
 # Lighter integration — testing on the Robinhood fork (chain 9994663)
 
+> **Proven 2026-07-22.** The full lifecycle ran green on the fork against real
+> Sherwood core + real ZkLighter: template deployed + approved
+> (`0x7ffBd8D5…901AD4`), fund created + 50k USDG deposited, `lighter-perp` clone
+> proposed → voted → executed (**deposited 40k USDG into ZkLighter, registered
+> real account 843**) → `registerAgentKey` → `initiateReturn` (cancel +
+> both-side closes + withdraw enqueued) → two-phase settle (**USDG round-tripped
+> to the vault, ~0 PnL, proposal Settled**). Withdrawal maturity was simulated by
+> crediting the clone's USDG (the `withdrawPendingBalance` claim itself is
+> covered by unit tests + the real-4663 canary); a faithful
+> `tenderly_setStorageAt` on `pendingAssetBalances` is the higher-fidelity option
+> (§2). This closed the deposit-side of D4 (tick/decimal math against the real
+> venue).
+
 How to exercise the Lighter (zkLighter) integration against the **real** venue
 contract on the Tenderly Robinhood-mainnet fork, before anything ships to 4663.
 Companion to `robinhood-fork-deployment.md` (same vnet, same RPC aliases, same

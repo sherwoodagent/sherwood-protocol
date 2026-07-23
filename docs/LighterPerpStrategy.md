@@ -236,3 +236,9 @@ full loop — deposit USDG → contract-owned account **623** → register agent
 close → withdraw USDG back to the contract. This strategy generalizes that canary into a
 Sherwood strategy template: same custody boundary and on-chain kill switch, wrapped in the
 vault/proposer lifecycle with the two-phase async settle.
+
+The **full strategy lifecycle** was then proven on the Robinhood-mainnet fork (chain 9994663)
+against real deployed Sherwood core + real ZkLighter: propose → vote → execute (deposited into
+ZkLighter, registered real account **843**) → `registerAgentKey` → `initiateReturn` → two-phase
+settle (USDG round-tripped to the vault, ~0 PnL, proposal Settled). See
+[`lighter-fork-testing.md`](./lighter-fork-testing.md).
