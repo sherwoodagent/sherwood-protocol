@@ -11,6 +11,7 @@ import {BatchExecutorLib} from "../src/BatchExecutorLib.sol";
 import {SyndicateFactory} from "../src/SyndicateFactory.sol";
 import {SyndicateGovernor} from "../src/SyndicateGovernor.sol";
 import {GuardianRegistry} from "../src/GuardianRegistry.sol";
+import {TierRegistry} from "../src/TierRegistry.sol";
 import {StakedWood} from "../src/StakedWood.sol";
 import {MinimalGuardianRegistry} from "../src/MinimalGuardianRegistry.sol";
 import {ISyndicateGovernor} from "../src/interfaces/ISyndicateGovernor.sol";
@@ -130,6 +131,7 @@ contract DeploySherwood is ScriptBase {
         address factoryProxy;
         address registryProxy;
         address swoodProxy;
+        address tierRegistry; // adapter-selector tier certification (spec §3.2)
     }
 
     function run() external virtual {
@@ -170,6 +172,7 @@ contract DeploySherwood is ScriptBase {
         console.log("GovernorBeacon:", d.beacon);
         console.log("GuardianRegistryProxy:", d.registryProxy);
         console.log("FactoryProxy:", d.factoryProxy);
+        console.log("TierRegistry:", d.tierRegistry);
 
         // Seed slash appeal reserve + epoch 0 rewards (prod only — beta uses a
         // stub registry with no `fundSlashAppealReserve`). Best-effort: skipped
@@ -184,6 +187,12 @@ contract DeploySherwood is ScriptBase {
         address effectiveOwner = d.deployer;
         if (!skipHandoff) {
             _handoffOwnership(d.beacon, d.factoryProxy, d.registryProxy, d.swoodProxy, d.protocolConfig, ownerMultisig);
+            // TierRegistry is Ownable2Step (like ProtocolConfig): transferOwnership
+            // starts a two-step transfer — the multisig MUST call acceptOwnership()
+            // to complete it. Kept out of `_handoffOwnership` so that helper's
+            // signature (asserted by Deploy_multisigHandoff.t.sol) stays fixed.
+            Ownable2Step(d.tierRegistry).transferOwnership(ownerMultisig);
+            console.log("TierRegistry pending -> multisig; RUNBOOK: multisig must call acceptOwnership()");
             effectiveOwner = ownerMultisig;
         }
 
@@ -221,6 +230,7 @@ contract DeploySherwood is ScriptBase {
         _patchAddress("GOVERNOR_BEACON", d.beacon);
         _patchAddress("PROTOCOL_CONFIG", d.protocolConfig);
         _patchAddress("GUARDIAN_REGISTRY", d.registryProxy);
+        _patchAddress("TIER_REGISTRY", d.tierRegistry);
         // sWOOD is the sole WOOD custodian — persist it for the CLI / admin
         // scripts. Beta mode uses a stub registry and never deploys sWOOD, so
         // the proxy stays address(0) there.
@@ -305,6 +315,15 @@ contract DeploySherwood is ScriptBase {
         address factoryImpl = c3.deploy(SALT_FACTORY_IMPL, abi.encodePacked(type(SyndicateFactory).creationCode));
         d.factoryProxy = _deployFactoryProxy(c3, factoryImpl, d, cfg);
         require(d.factoryProxy == predictedFactoryProxy, "factory addr mismatch");
+
+        // Adapter-selector tier registry (spec §3.2). Owned by the deployer at
+        // birth so `certify`/`demote` listing can run before the multisig
+        // handoff; wired into the factory now (deployer still owns it) so every
+        // governor `createSyndicate` stamps out picks it up via the
+        // factory-only `setTierRegistry`. A plain Ownable2Step contract — no
+        // proxy needed (certifications are re-issuable, not upgrade-state).
+        d.tierRegistry = address(new TierRegistry(d.deployer));
+        SyndicateFactory(d.factoryProxy).setTierRegistry(d.tierRegistry);
     }
 
     /// @dev Deploys the StakedWood (sWOOD) proxy via CREATE3. The governor +
