@@ -159,6 +159,14 @@ interface ISyndicateGovernor {
     error ProposalNotFound();
     error ProposalNotApproved();
     error ExecutionWindowExpired();
+    /// @notice Spec §3.2 fail-safe: revert at execute if the proposal's live
+    ///         tier (re-resolved from its stored execute calls) is WORSE than
+    ///         the `envelopeTier` snapshotted at propose. A certified tier-0/1
+    ///         adapter that demoted since propose (codehash change or
+    ///         governance revocation) leaves the proposal under-covered — block
+    ///         execution rather than run a possibly-unbounded batch against a
+    ///         bounded-tier coverage price.
+    error TierRegressed();
     error StrategyAlreadyActive();
     error CooldownNotElapsed();
     error ProposalNotExecuted();

@@ -215,4 +215,57 @@ contract TierResolutionTest is Test {
         assertEq(governor.getProposalTier(pid), 1); // max(0, 1)
         assertEq(governor.getRequiredCoverage(pid), 20e6); // 200 bps of 1_000e6, not 50 bps
     }
+
+    // ── Task 6: execute-time tier regression fail-safe (spec §3.2) ──
+
+    /// @dev Advance a freshly proposed single-proposer proposal past its voting
+    ///      window. With `reviewPeriod == 0` (MockRegistryMinimal), the vote
+    ///      window closing maps straight to Approved — the executable state.
+    function _advancePastVoting() internal {
+        vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
+    }
+
+    /// @notice A proposal priced at tier 0 whose adapter demotes (codehash
+    ///         change) between propose and execute is now under-covered. The
+    ///         execute-time re-resolve sees liveTier 2 > envelopeTier 0 and
+    ///         reverts TierRegressed rather than running the batch at the
+    ///         stale bounded-tier coverage price.
+    function test_executeRevertsWhenTierRegressedSincePropose() public {
+        _wireTierRegistry();
+        tierRegistry.certify(address(mockAdapter), mockAdapter.approve.selector, 0, 50);
+
+        BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](1);
+        calls[0] = _certifiedCall();
+        uint256 pid = _propose(calls);
+        assertEq(governor.getProposalTier(pid), 0); // envelopeTier snapshotted at propose
+
+        _advancePastVoting();
+
+        // Adapter's live codehash changes (proxy upgrade / etch) → the lazy
+        // fail-safe in TierRegistry.tierOf now reports tier 2 for the call.
+        vm.etch(address(mockAdapter), address(executorLib).code);
+        (uint8 liveTier,) = tierRegistry.tierOf(address(mockAdapter), mockAdapter.approve.selector);
+        assertEq(liveTier, 2); // demoted since propose
+
+        vm.expectRevert(ISyndicateGovernor.TierRegressed.selector);
+        governor.executeProposal(pid);
+    }
+
+    /// @notice Same tier-0 proposal, adapter untouched between propose and
+    ///         execute: the live tier still resolves to 0 (== envelopeTier), so
+    ///         execution proceeds normally to Executed.
+    function test_executeSucceedsWhenTierUnchanged() public {
+        _wireTierRegistry();
+        tierRegistry.certify(address(mockAdapter), mockAdapter.approve.selector, 0, 50);
+
+        BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](1);
+        calls[0] = _certifiedCall();
+        uint256 pid = _propose(calls);
+        assertEq(governor.getProposalTier(pid), 0);
+
+        _advancePastVoting();
+
+        governor.executeProposal(pid);
+        assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Executed));
+    }
 }

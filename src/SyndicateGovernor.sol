@@ -398,9 +398,20 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // Executed -> Settled edge in `_finishSettlement`. `_activeProposal`
         // also guards the Executed window (see `requestUnstakeOwner`).
 
+        // Load the stored execute calls once — reused by the tier re-resolve
+        // and the vault batch below (single SLOAD-loop; cold path, no stack risk).
+        BatchExecutorLib.Call[] memory calls = _loadCalls(_executeCalls, proposalId);
+
+        // Spec §3.2: fail-safe on stale certification. A proposal priced at
+        // tier 0/1 whose adapter demoted (codehash change, revocation) since
+        // propose is under-covered — block execution rather than run a
+        // possibly-unbounded batch against a bounded-tier coverage price.
+        (uint8 liveTier,) = _resolveTier(calls, proposal.maxCapital);
+        if (liveTier > proposal.envelopeTier) revert TierRegressed();
+
         // Execute the opening calls via the vault. The risk envelope's
         // maxCapital caps the batch's net asset outflow (spec 2026-07-22 §3.1).
-        ISyndicateVault(vault).executeGovernorBatch(_loadCalls(_executeCalls, proposalId), proposal.maxCapital);
+        ISyndicateVault(vault).executeGovernorBatch(calls, proposal.maxCapital);
 
         emit ProposalExecuted(proposalId, vault, balanceBefore);
     }
