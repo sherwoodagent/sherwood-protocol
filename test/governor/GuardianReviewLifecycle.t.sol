@@ -123,7 +123,11 @@ contract GuardianReviewLifecycleTest is Test {
                     coolDownPeriod: 7 days,
                     minOwnerStake: MIN_OWNER_STAKE,
                     minSlashBps: 1000,
-                    maxSlashBps: 9999
+                    maxSlashBps: 9999,
+                    maxDelegatedSlashBps: 2000,
+                    ageFloorBps: 2500,
+                    maturationPeriod: 30 days,
+                    delegatedWeightCapX: 4
                 }))
         );
         swood = StakedWood(address(new ERC1967Proxy(address(swoodImpl), swoodInit)));
@@ -201,6 +205,10 @@ contract GuardianReviewLifecycleTest is Test {
         _stakeGuardian(g3, GUARDIAN_STAKE, 3);
         _stakeGuardian(g4, GUARDIAN_STAKE, 4);
         _stakeGuardian(g5, GUARDIAN_STAKE, 5);
+
+        // Age-weighted voting: mature the cohort to par so block-quorum math
+        // below runs on full stake weight.
+        skip(30 days);
     }
 
     // ──────────────────────────────────────────────────────────────
@@ -277,9 +285,9 @@ contract GuardianReviewLifecycleTest is Test {
 
         // Optional Approve votes — don't matter for the outcome, but exercise the path.
         vm.prank(g1);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve);
         vm.prank(g2);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve);
 
         // Review ends → state resolves to Approved (no blocks).
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
@@ -318,15 +326,15 @@ contract GuardianReviewLifecycleTest is Test {
         // g1, g2 Approve; g3, g4, g5 Block.
         // Total stake at open = 100k. Block weight = 60k → 60% ≥ 30% quorum → BLOCKED.
         vm.prank(g1);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve);
         vm.prank(g2);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve);
         vm.prank(g3);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, 10_000);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block);
         vm.prank(g4);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, 10_000);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block);
         vm.prank(g5);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, 10_000);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block);
 
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
 
@@ -335,11 +343,14 @@ contract GuardianReviewLifecycleTest is Test {
         bool blocked = registry.resolveReview(address(governor), pid);
         assertTrue(blocked, "review resolved as blocked");
 
-        // Approvers were slashed at maxSlashBps=9999 (C-2 cap, not 10_000).
-        // 20_000e18 × 9999/10_000 = 19_998e18 → 2e18 residue per approver.
-        uint256 residue = GUARDIAN_STAKE - (GUARDIAN_STAKE * 9999) / 10_000; // 2e18
-        assertEq(swood.guardianStake(g1), residue, "g1 slashed at 9999-bps cap");
-        assertEq(swood.guardianStake(g2), residue, "g2 slashed at 9999-bps cap");
+        // Deterministic severity (Part D) at 60% decisiveness:
+        //   bBps = 60_000/100_000 = 6000; q = 3000; lo = 1000; hi = 9999
+        //   t = 3000e18/3667 ≈ 0.818107e18 → t² ≈ 0.669299e18
+        //   severity = 1000 + ⌊8999 × 0.669299⌋ = 7023 bps
+        // 20_000e18 × 7023/10_000 = 14_046e18 → 5_954e18 residue per approver.
+        uint256 residue = GUARDIAN_STAKE - (GUARDIAN_STAKE * 7023) / 10_000; // 5_954e18
+        assertEq(swood.guardianStake(g1), residue, "g1 slashed at deterministic 7023 bps");
+        assertEq(swood.guardianStake(g2), residue, "g2 slashed at deterministic 7023 bps");
         assertEq(swood.guardianStake(g3), GUARDIAN_STAKE, "g3 untouched");
         assertEq(swood.guardianStake(g4), GUARDIAN_STAKE, "g4 untouched");
         assertEq(swood.guardianStake(g5), GUARDIAN_STAKE, "g5 untouched");
@@ -438,6 +449,10 @@ contract GuardianReviewLifecycleTest is Test {
         _stakeGuardian(g9, MIN_GUARDIAN_STAKE, 9);
         _stakeGuardian(g10, MIN_GUARDIAN_STAKE, 10);
 
+        // Age-weighted voting: mature the freshly staked blockers to par so
+        // their block votes carry full weight against the raw denominator.
+        skip(30 days);
+
         uint256 pid = _propose();
         _voteFor(pid);
 
@@ -452,21 +467,21 @@ contract GuardianReviewLifecycleTest is Test {
         uint256 burnBefore = wood.balanceOf(BURN_ADDRESS);
 
         vm.prank(g1);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve);
         vm.prank(g2);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve);
         vm.prank(g3);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve);
         vm.prank(g6);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, 10_000);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block);
         vm.prank(g7);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, 10_000);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block);
         vm.prank(g8);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, 10_000);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block);
         vm.prank(g9);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, 10_000);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block);
         vm.prank(g10);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, 10_000);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block);
 
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
 
@@ -487,22 +502,25 @@ contract GuardianReviewLifecycleTest is Test {
             "proposal rejected after block quorum"
         );
 
-        // All 3 approvers slashed at maxSlashBps=9999 (C-2 cap).
-        // 20_000e18 × 9999/10_000 = 19_998e18 burned, 2e18 residue per approver.
-        uint256 residue = GUARDIAN_STAKE - (GUARDIAN_STAKE * 9999) / 10_000; // 2e18
-        assertEq(swood.guardianStake(g1), residue, "g1 (approver) slashed at 9999-bps cap");
-        assertEq(swood.guardianStake(g2), residue, "g2 (approver) slashed at 9999-bps cap");
-        assertEq(swood.guardianStake(g3), residue, "g3 (approver) slashed at 9999-bps cap");
+        // Deterministic severity (Part D) at 33.33% decisiveness:
+        //   bBps = 50_000/150_000 = 3333; q = 3000; lo = 1000; hi = 9999
+        //   t = 333e18/3667 ≈ 0.090810e18 → t² ≈ 0.008246e18
+        //   severity = 1000 + ⌊8999 × 0.008246⌋ = 1074 bps
+        // 20_000e18 × 1074/10_000 = 2_148e18 burned, 17_852e18 residue each.
+        uint256 residue = GUARDIAN_STAKE - (GUARDIAN_STAKE * 1074) / 10_000; // 17_852e18
+        assertEq(swood.guardianStake(g1), residue, "g1 (approver) slashed at deterministic 1074 bps");
+        assertEq(swood.guardianStake(g2), residue, "g2 (approver) slashed at deterministic 1074 bps");
+        assertEq(swood.guardianStake(g3), residue, "g3 (approver) slashed at deterministic 1074 bps");
 
         // Blockers untouched.
         assertEq(swood.guardianStake(g6), MIN_GUARDIAN_STAKE, "g6 (blocker) untouched");
         assertEq(swood.guardianStake(g10), MIN_GUARDIAN_STAKE, "g10 (blocker) untouched");
 
-        // Burn sink received approver WOOD (× 9999/10_000).
+        // Burn sink received approver WOOD (× deterministic 1074/10_000).
         uint256 burnAfter = wood.balanceOf(BURN_ADDRESS);
         assertGt(burnAfter, burnBefore, "burn sink received slashed WOOD");
-        uint256 expectedBurn = 3 * ((GUARDIAN_STAKE * 9999) / 10_000); // 3 × 19_998e18
-        assertEq(burnAfter - burnBefore, expectedBurn, "burn == 3 * (20_000e18 * 9999/10_000)");
+        uint256 expectedBurn = 3 * ((GUARDIAN_STAKE * 1074) / 10_000); // 3 × 2_148e18
+        assertEq(burnAfter - burnBefore, expectedBurn, "burn == 3 * (20_000e18 * 1074/10_000)");
 
         // V1.5: blocker epoch attribution is emitted as `BlockerAttributed` and
         // attributed off-chain via Merkl. Event inspection is covered in
@@ -520,23 +538,23 @@ contract GuardianReviewLifecycleTest is Test {
 
         // g1 initially approves.
         vm.prank(g1);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve);
 
         // Still well before the 10% lockout window — flip to Block.
         vm.warp(vm.getBlockTimestamp() + 1 hours);
         vm.prank(g1);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, 0);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block);
 
         // Four more guardians also block so the quorum is hit (5 × 20k = 100k,
         // well above 30% of 100k total).
         vm.prank(g2);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, 0);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block);
         vm.prank(g3);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, 0);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block);
         vm.prank(g4);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, 0);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block);
         vm.prank(g5);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, 0);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block);
 
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD);
         bool blocked = registry.resolveReview(address(governor), pid);

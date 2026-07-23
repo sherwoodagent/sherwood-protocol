@@ -64,4 +64,18 @@ interface IStrategy {
     /// @notice true ⇒ the strategy self-manages fees; the governor skips settle-fee
     ///         distribution for its proposals.
     function selfManagesFees() external view returns (bool);
+
+    /// @notice Assets (vault-asset units) the strategy can return to the vault
+    ///         on demand, mid-lifecycle, net of unwind costs. 0 when the
+    ///         strategy does not support on-demand exit (the default) or is not
+    ///         in the Executed state. A serviceability signal only — the vault
+    ///         verifies actual delivery by balance-diff, never trusts this for
+    ///         pricing.
+    function availableLiquidity() external view returns (uint256);
+
+    /// @notice Unwind and transfer exactly `assets` of the vault asset back to
+    ///         the vault, mid-lifecycle. MUST deliver at least `assets` or
+    ///         revert (all-or-revert; the vault reverts `UnwindShortfall` on a
+    ///         lying strategy). Vault-only.
+    function withdrawTo(uint256 assets) external;
 }

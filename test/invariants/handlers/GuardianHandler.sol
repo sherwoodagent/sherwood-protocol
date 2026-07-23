@@ -265,10 +265,11 @@ contract GuardianHandler is Test {
         approvers[0] = actors[bound(approverSeed, 0, actors.length - 1)];
 
         vm.prank(address(registry));
-        // Sherlock run #3 #6: pass openedAt=0 (handler doesn't recordVoteStake
-        // with combined own+delegated weight so the snapDelegated lookup at 0
-        // returns 0 and snapOwn == snapTotal — collapses to pre-#6 math).
-        try swood.slashGuardians(bytes32(uint256(pid)), 0, approvers, slashBps) {
+        // Pass openedAt = now: the own-slash basis is the raw own-stake
+        // checkpoint at openedAt (spec 2026-07-19 §5), so `now` sizes the
+        // slash off the approver's current stake and keeps the own-stake
+        // leg exercised. (openedAt=0 would find no checkpoint → own basis 0.)
+        try swood.slashGuardians(bytes32(uint256(pid)), block.timestamp, approvers, slashBps) {
             successfulSlashes += 1;
         } catch {}
     }
@@ -292,7 +293,7 @@ contract GuardianHandler is Test {
             ? IGuardianRegistry.GuardianVoteType.Approve
             : IGuardianRegistry.GuardianVoteType.Block;
         vm.prank(a);
-        try registry.voteOnProposal(address(governor), pid, s, 0) {} catch {}
+        try registry.voteOnProposal(address(governor), pid, s) {} catch {}
     }
 
     function openReview(uint256 proposalSeed) external {

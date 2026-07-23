@@ -904,14 +904,17 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         address vault = proposal.vault;
         address asset = IERC4626(vault).asset();
 
-        // Asset-only measurement (see NatSpec above). Subtract the live-adapter
-        // V2 live-NAV: liveAdapterPrincipal / liveAdapterWithdrawn deleted.
-        // PnL is the plain realized float delta (vault balance minus snapshot).
+        // Asset-only measurement (see NatSpec above). PnL is the realized float
+        // delta minus the interim LP net flow: Lane A deposits and instant
+        // exits during the proposal move the vault's float but are principal,
+        // not strategy performance, so charging fees on them would be wrong.
+        // The vault resets the accumulator in `onProposalSettled` (called below,
+        // after fees).
         // forge-lint: disable-next-line(unsafe-typecast)
         uint256 snapshot = _capitalSnapshots[proposalId];
         // forge-lint: disable-next-line(unsafe-typecast)
         uint256 balanceAdjusted = IERC20(asset).balanceOf(vault);
-        pnl = int256(balanceAdjusted) - int256(snapshot);
+        pnl = int256(balanceAdjusted) - int256(snapshot) - ISyndicateVault(vault).interimNetFlow();
 
         // Finalize state before external transfers to prevent reentrancy on stale state
         _activeProposal = 0;
@@ -958,6 +961,33 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     /// @dev Distribute protocol, agent, and management fees. Extracted to avoid stack-too-deep.
     ///      Reads fee config from the propose-time snapshot so settlement uses rates and
     ///      recipients that voters actually approved, not any post-vote change.
+    ///
+    ///      ── THE FEE MAP ─ every bps source, its owner, its cap, its snapshot point ──
+    ///      Stage order (1–2 are parallel slices of gross profit; only 3–4 waterfall,
+    ///      each computed on what the previous left):
+    ///        1. protocolFee  = grossPnl · protocolFeeBps
+    ///             source: ProtocolConfig.protocolFeeBps (owner: protocol multisig)
+    ///             snapshot: propose time → prop.snapshotProtocolFeeBps/-Recipient
+    ///        2. guardianFee  = grossPnl · guardianFeeBps
+    ///             source: ProtocolConfig.guardianFeeBps (owner: protocol multisig)
+    ///             snapshot: propose time → prop.snapshotGuardianFeeBps/-Recipient
+    ///             delivery: WOOD airdrop via Merkl, attributed by GuardianFeeAccrued
+    ///        3. agentFee     = netPnl · perfFeeBps
+    ///             source: vault.agentFeeBps() (owner: VAULT owner; offset-by-one
+    ///             sentinel, default FeeConstants.DEFAULT_AGENT_FEE_BPS = 5%)
+    ///             caps: vault-side FeeConstants.MAX_PERFORMANCE_FEE_BPS (15%) at set;
+    ///             clamped AGAIN here to the governor's live _params.maxPerformanceFeeBps
+    ///             (owner: governor params; the cap-of-caps lives in GovernorParameters)
+    ///             snapshot: propose time → prop.performanceFeeBps; split across
+    ///             co-proposers by _distributeAgentFee
+    ///        4. mgmtFee      = (netPnl − agentFee) · managementFeeBps
+    ///             source: vault.managementFeeBps() (owner: vault owner, set at init;
+    ///             read LIVE at settle — the one non-snapshotted rate)
+    ///      Escape hatch: IStrategy.selfManagesFees() == true (snapshotted at propose)
+    ///      skips this ENTIRE waterfall — the strategy must self-collect including the
+    ///      protocol's cut (e.g. LeveragedAeroFees.protocolFeeOwed).
+    ///      Failure mode: any recipient transfer that reverts escrows in _unclaimedFees
+    ///      (pull via claimUnclaimedFees) so settlement never bricks.
     function _distributeFees(
         uint256 proposalId,
         address vault,

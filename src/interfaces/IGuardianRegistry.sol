@@ -81,7 +81,10 @@ interface IGuardianRegistry {
     // ── Guardian fns ──
     /// @notice Cast or change a guardian review vote on a proposal. Vote weight
     ///         is read from sWOOD's `getPastVotes` at the review's `openedAt`.
-    function voteOnProposal(address governor, uint256 proposalId, GuardianVoteType support, uint256 slashBps) external;
+    ///         Block votes carry no proposed severity — the slash severity is
+    ///         a deterministic function of block-side decisiveness, computed
+    ///         at `resolveReview` (spec 2026-07-19 Part D).
+    function voteOnProposal(address governor, uint256 proposalId, GuardianVoteType support) external;
 
     // ── Multi-governor management ──
     function addGovernor(address governor) external;

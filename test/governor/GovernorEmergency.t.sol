@@ -120,7 +120,11 @@ contract GovernorEmergencyTest is Test {
                     coolDownPeriod: 7 days,
                     minOwnerStake: MIN_OWNER_STAKE,
                     minSlashBps: 1000,
-                    maxSlashBps: 9999
+                    maxSlashBps: 9999,
+                    maxDelegatedSlashBps: 2000,
+                    ageFloorBps: 2500,
+                    maturationPeriod: 30 days,
+                    delegatedWeightCapX: 4
                 }))
         );
         swood = StakedWood(address(new ERC1967Proxy(address(swoodImpl), swoodInit)));
@@ -209,6 +213,10 @@ contract GovernorEmergencyTest is Test {
         wood.approve(address(swood), type(uint256).max);
         vm.prank(guardianB);
         swood.stakeAsGuardian(GUARDIAN_STAKE, 2);
+
+        // Age-weighted voting: mature both guardians to par so emergency
+        // block votes carry full stake weight.
+        skip(30 days);
     }
 
     // ──────────────────────────────────────────────────────────────

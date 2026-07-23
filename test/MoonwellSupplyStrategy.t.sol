@@ -52,6 +52,10 @@ contract MockCToken {
         underlying.transfer(msg.sender, redeemAmount);
         return 0;
     }
+
+    function getCash() external view returns (uint256) {
+        return underlying.balanceOf(address(this));
+    }
 }
 
 contract MoonwellSupplyStrategyTest is Test {
@@ -337,5 +341,103 @@ contract MoonwellSupplyStrategyTest is Test {
         usdc.approve(address(strategy), SUPPLY_AMOUNT);
         vm.prank(vault);
         strategy.execute();
+    }
+
+    // ==================== ON-DEMAND EXIT (withdrawTo / availableLiquidity) ====================
+
+    function test_availableLiquidity_zeroBeforeExecute() public view {
+        assertEq(strategy.availableLiquidity(), 0, "no liquidity while Pending");
+    }
+
+    function test_availableLiquidity_afterExecute() public {
+        _executeStrategy();
+        // 50_000 mTokens at 1:1, market cash (200k seed + 50k supplied) far exceeds it.
+        assertEq(strategy.availableLiquidity(), SUPPLY_AMOUNT, "redeemable underlying");
+    }
+
+    function test_availableLiquidity_cappedByMarketCash() public {
+        _executeStrategy();
+        // Drain the market's cash below our position so liquidity is cash-capped.
+        // Compute the amount BEFORE the prank (vm.prank applies to the next call).
+        uint256 drain = usdc.balanceOf(address(mUsdc)) - 10_000e6;
+        vm.prank(address(mUsdc));
+        usdc.transfer(address(0xdead), drain);
+        assertEq(strategy.availableLiquidity(), 10_000e6, "capped by market cash");
+    }
+
+    function test_withdrawTo_deliversExactAssets_andKeepsPosition() public {
+        _executeStrategy();
+        uint256 vaultBefore = usdc.balanceOf(vault);
+        vm.prank(vault);
+        strategy.withdrawTo(20_000e6);
+        assertEq(usdc.balanceOf(vault) - vaultBefore, 20_000e6, "exact delivery to vault");
+        assertEq(mUsdc.balanceOf(address(strategy)), SUPPLY_AMOUNT - 20_000e6, "position reduced by 20k");
+    }
+
+    function test_withdrawTo_thenSettle_returnsRemainder() public {
+        _executeStrategy();
+        vm.prank(vault);
+        strategy.withdrawTo(20_000e6);
+
+        // PR #6 review (blocking): NO proposer intervention needed. withdrawTo
+        // auto-decrements the floor (49_900e6 - 20_000e6 = 29_900e6), so the
+        // 30_000e6 remainder clears it and permissionless settle just works.
+        uint256 vaultBefore = usdc.balanceOf(vault);
+        vm.prank(vault);
+        strategy.settle();
+        assertEq(usdc.balanceOf(vault) - vaultBefore, SUPPLY_AMOUNT - 20_000e6, "remainder returned");
+        assertEq(uint256(strategy.state()), uint256(BaseStrategy.State.Settled));
+    }
+
+    /// @notice PR #6 review (blocking): withdrawTo decrements the slippage
+    ///         floor 1:1 — the tolerance (expected − floor) is preserved, and
+    ///         a material instant exit can no longer brick permissionless
+    ///         settlement against the stale full-position floor.
+    function test_withdrawTo_decrementsMinRedeemFloor() public {
+        _executeStrategy();
+        assertEq(strategy.minRedeemAmount(), MIN_REDEEM);
+
+        vm.prank(vault);
+        strategy.withdrawTo(20_000e6);
+        assertEq(strategy.minRedeemAmount(), MIN_REDEEM - 20_000e6, "floor shrinks 1:1");
+
+        // A second pull larger than the remaining floor clamps to 0 (never
+        // underflows); the settle slippage check is then vacuous by design —
+        // most of the position already exited at par.
+        vm.prank(vault);
+        strategy.withdrawTo(29_990e6);
+        assertEq(strategy.minRedeemAmount(), 0, "floor clamps at zero");
+    }
+
+    /// @notice The slippage check still bites after a partial withdraw: the
+    ///         proposer can re-anchor the floor via updateParams, and a settle
+    ///         redeeming below it reverts exactly as before.
+    function test_withdrawTo_settleSlippageStillEnforced() public {
+        _executeStrategy();
+        vm.prank(vault);
+        strategy.withdrawTo(20_000e6);
+
+        // Floor auto-decremented to 29_900e6; remaining position redeems
+        // 30_000e6. Raise the floor just above the remainder — settle must
+        // still enforce it.
+        vm.prank(proposer);
+        strategy.updateParams(abi.encode(0, 30_000e6 + 1));
+
+        vm.prank(vault);
+        vm.expectRevert(MoonwellSupplyStrategy.InvalidAmount.selector);
+        strategy.settle();
+    }
+
+    function test_withdrawTo_onlyVault() public {
+        _executeStrategy();
+        vm.prank(proposer);
+        vm.expectRevert(BaseStrategy.NotVault.selector);
+        strategy.withdrawTo(1e6);
+    }
+
+    function test_withdrawTo_beforeExecute_reverts() public {
+        vm.prank(vault);
+        vm.expectRevert(BaseStrategy.NotExecuted.selector);
+        strategy.withdrawTo(1e6);
     }
 }

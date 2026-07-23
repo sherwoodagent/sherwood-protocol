@@ -57,7 +57,11 @@ contract GuardianRegistryCompositeKeyTest is Test {
                     coolDownPeriod: 7 days,
                     minOwnerStake: OWNER_BOND,
                     minSlashBps: 1000,
-                    maxSlashBps: 9999
+                    maxSlashBps: 9999,
+                    maxDelegatedSlashBps: 2000,
+                    ageFloorBps: 2500,
+                    maturationPeriod: 30 days,
+                    delegatedWeightCapX: 4
                 }))
         );
         swood = StakedWood(address(new ERC1967Proxy(address(swoodImpl), swoodInit)));
@@ -81,6 +85,10 @@ contract GuardianRegistryCompositeKeyTest is Test {
         _stake(guardian1, 1);
         _stake(guardian2, 2);
         _stake(guardian3, 3);
+
+        // Age-weighted voting: mature the cohort to par so vote weights equal
+        // raw stake.
+        skip(30 days);
 
         // C-1: reviews snapshot votable stake at t-1 — advance past staking.
         vm.warp(vm.getBlockTimestamp() + 1);
@@ -117,7 +125,7 @@ contract GuardianRegistryCompositeKeyTest is Test {
 
         // Approve under A only.
         vm.prank(guardian1);
-        registry.voteOnProposal(address(governorA), PID, IGuardianRegistry.GuardianVoteType.Approve, 0);
+        registry.voteOnProposal(address(governorA), PID, IGuardianRegistry.GuardianVoteType.Approve);
 
         // A: opened, approver recorded with weight.
         (bool openedA,,,) = registry.getReviewState(address(governorA), PID);
@@ -139,7 +147,7 @@ contract GuardianRegistryCompositeKeyTest is Test {
         // Block under B: 20k / 60k = 33% >= the 30% quorum. Resolutions must
         // diverge — A (no A-side blocks) unblocked, B blocked.
         vm.prank(guardian2);
-        registry.voteOnProposal(address(governorB), PID, IGuardianRegistry.GuardianVoteType.Block, 5000);
+        registry.voteOnProposal(address(governorB), PID, IGuardianRegistry.GuardianVoteType.Block);
 
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
         vm.prank(address(governorA));

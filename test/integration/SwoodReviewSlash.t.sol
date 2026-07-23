@@ -25,18 +25,19 @@ import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 ///
 ///           SyndicateGovernor → propose / vote / GuardianReview
 ///           GuardianRegistry  → openReview / voteOnProposal / resolveReview
-///                               → _weightedMedianSlashBps → swood.slashGuardians
+///                               → _severityBps → swood.slashGuardians
 ///           StakedWood (sWOOD)→ stakeAsGuardian / delegateStake
 ///                               → _slashOne (own stake + delegated pool)
 ///                               → _burnWood
 ///
 ///         A blocked proposal slashes the approver guardian at the
-///         stake-weighted MEDIAN of the blockers' proposed `slashBps`. The
-///         test deliberately picks UNEQUAL blocker stake weights so the
-///         stake-weighted median is provably DISTINCT from the arithmetic
-///         mean — a buggy mean implementation would compute a different
-///         number and the assertions would fail. See the fixture comment
-///         block for the hand-computed median derivation.
+///         DETERMINISTIC severity derived from block-side decisiveness
+///         (spec 2026-07-19 Part D) — severity is NOT voted. This fixture's
+///         block side is overwhelming (79.68% of the at-open total, past the
+///         2/3 SUPERMAJORITY_BPS ceiling), so the severity is maxSlashBps =
+///         9999 and the first-loss spill is clamped by the approver's
+///         remaining own stake. See the fixture comment block for the
+///         hand-computed derivation.
 contract SwoodReviewSlashTest is Test {
     // `governor` MUST be public: the vault reads its governor via
     // `factory.governor()`, and this test contract impersonates the factory —
@@ -58,7 +59,7 @@ contract SwoodReviewSlashTest is Test {
 
     // Approver guardian — the one who gets slashed.
     address internal gApprove = makeAddr("guardianApprove");
-    // Three blocker guardians with VARYING stake weight AND proposed slashBps.
+    // Three blocker guardians with varying stake weight.
     address internal gBlock1 = makeAddr("guardianBlock1");
     address internal gBlock2 = makeAddr("guardianBlock2");
     address internal gBlock3 = makeAddr("guardianBlock3");
@@ -84,41 +85,21 @@ contract SwoodReviewSlashTest is Test {
     uint256 constant REVIEW_PERIOD = 24 hours;
     uint256 constant BLOCK_QUORUM_BPS = 3000; // 30%
 
-    // ── Fixture: stake-weighted MEDIAN must be provably ≠ arithmetic MEAN ──
+    // ── Fixture: deterministic severity from block-side decisiveness ──
     //
-    // Blockers have UNEQUAL stake so the stake-weighted median diverges from
-    // the (unweighted) arithmetic mean of the proposed slashBps. A buggy mean
-    // implementation would compute 5000 bps and every assertion below would
-    // fail — the test now genuinely distinguishes median from mean.
+    // Severity is no longer voted (spec 2026-07-19 Part D): `_severityBps`
+    // ramps quadratically with block decisiveness from the at-open block
+    // quorum (floor `minSlashBps`) to SUPERMAJORITY_BPS = 6667 (ceiling
+    // `maxSlashBps`).
     //
-    //   Blocker stake / proposed slashBps:
-    //     gBlock1 = 10k stake, proposes 2000 bps
-    //     gBlock2 = 20k stake, proposes 4000 bps
-    //     gBlock3 = 50k stake, proposes 9000 bps
-    //   Total blocker weight = 10k + 20k + 50k = 80k.
-    //
-    //   `_weightedMedianSlashBps` sorts ascending by slashBps then walks
-    //   cumulative weight, picking the first pair where `cumulative*2 >=
-    //   totalWeight`:
-    //     sorted: (2000,10k) (4000,20k) (9000,50k)
-    //     cumulative: 10k → 30k → 80k
-    //     2*10k=20k  ≥ 80k? no
-    //     2*30k=60k  ≥ 80k? no
-    //     2*80k=160k ≥ 80k? yes  → MEDIAN = 9000 bps (90%)
-    //
-    //   Arithmetic MEAN of {2000,4000,9000} = 15000/3 = 5000 bps.
-    //   MEDIAN (9000) ≠ MEAN (5000) — the key property of this fixture.
-    //   9000 is inside the [minSlashBps=1000, maxSlashBps=9999] band so no
-    //   clamp muddies the result.
-    //
+    //   Blocker stake: gBlock1 = 10k, gBlock2 = 20k, gBlock3 = 50k → 80k.
     //   Cohort own stake at open = 20k (approver) + 80k (blockers) = 100k.
-    //   Denominator = 100k own + 400 delegated. Block weight = 80k.
-    //   80k*10000 = 8e8  ≥  3000 * 100_400  = 3.012e8  → BLOCKED.
+    //   Denominator = 100k own + 400 delegated = 100_400.
     //
-    //   Slash @ median 9000 bps (90%):
-    //     Approver own stake 20k → 90% = 18k burned, 2k remains.
-    //     Approver delegated pool = 300 + 100 = 400 → 90% = 360 burned,
-    //       40 remains. del1 300 → 30 remains, del2 100 → 10 remains.
+    //   Block quorum: 80k*10000 = 8e8 ≥ 3000 * 100_400 = 3.012e8 → BLOCKED.
+    //
+    //   Decisiveness: bBps = 80_000e18 × 10_000 / 100_400e18 = 7968 (floor).
+    //   7968 ≥ SUPERMAJORITY_BPS (6667) → severity = maxSlashBps = 9999.
     uint256 constant APPROVER_STAKE = 20_000e18;
     uint256 constant BLOCKER1_STAKE = 10_000e18;
     uint256 constant BLOCKER2_STAKE = 20_000e18;
@@ -126,13 +107,9 @@ contract SwoodReviewSlashTest is Test {
     uint256 constant DEL1_AMOUNT = 300e18;
     uint256 constant DEL2_AMOUNT = 100e18;
 
-    uint256 constant SLASH_BPS_LOW = 2000; // gBlock1 (10k weight)
-    uint256 constant SLASH_BPS_MID = 4000; // gBlock2 (20k weight)
-    uint256 constant SLASH_BPS_HIGH = 9000; // gBlock3 (50k weight)
-
-    // Hand-computed stake-weighted median (see derivation above). This is the
-    // slash factor the contract MUST apply — NOT the 5000 bps unweighted mean.
-    uint256 constant EXPECTED_MEDIAN_BPS = 9000;
+    // Hand-computed deterministic severity (see derivation above). This is
+    // the slash factor the contract MUST apply.
+    uint256 constant EXPECTED_SEVERITY_BPS = 9999;
 
     // This test contract impersonates the factory. Per-vault (#421) the vault
     // resolves its governor via `factory.governorOf(vault)`, so expose it here
@@ -192,7 +169,11 @@ contract SwoodReviewSlashTest is Test {
                     coolDownPeriod: 7 days,
                     minOwnerStake: MIN_OWNER_STAKE,
                     minSlashBps: 1000,
-                    maxSlashBps: 9999
+                    maxSlashBps: 9999,
+                    maxDelegatedSlashBps: 2000,
+                    ageFloorBps: 2500,
+                    maturationPeriod: 30 days,
+                    delegatedWeightCapX: 4
                 }))
         );
         swood = StakedWood(address(new ERC1967Proxy(address(swoodImpl), swoodInit)));
@@ -265,8 +246,9 @@ contract SwoodReviewSlashTest is Test {
         swood.bindOwnerStake(owner, address(vault));
 
         // Guardian cohort: 1 approver (20k) + 3 blockers (10k/20k/50k) →
-        // 100k own stake total. Unequal blocker weights make the stake-weighted
-        // median (9000) provably distinct from the arithmetic mean (5000).
+        // 100k own stake total. The 80k block side is 79.68% of the at-open
+        // total — past the 2/3 supermajority ceiling of the deterministic
+        // severity ramp (Part D).
         _stakeGuardian(gApprove, APPROVER_STAKE, 1);
         _stakeGuardian(gBlock1, BLOCKER1_STAKE, 2);
         _stakeGuardian(gBlock2, BLOCKER2_STAKE, 3);
@@ -275,6 +257,10 @@ contract SwoodReviewSlashTest is Test {
         // Delegators delegate into the approver guardian's DPoS pool.
         _delegate(del1, gApprove, DEL1_AMOUNT);
         _delegate(del2, gApprove, DEL2_AMOUNT);
+
+        // Age-weighted voting: mature the cohort to par so vote weights and
+        // slash bases below run on full stake weight.
+        skip(30 days);
     }
 
     // ── Helpers ──
@@ -328,26 +314,34 @@ contract SwoodReviewSlashTest is Test {
 
     // ── The end-to-end test ──
 
-    /// @notice Full sWOOD review→block→graduated-slash flow.
+    /// @notice Full sWOOD review→block→deterministic-severity-slash flow.
     ///
     ///   1. propose → vote For → GuardianReview window.
     ///   2. openReview on the registry (snapshots votable stake at openedAt-1).
-    ///   3. gApprove votes Approve; gBlock1/2/3 vote Block with 2000/4000/9000
-    ///      at UNEQUAL stake weights 10k/20k/50k.
-    ///   4. resolveReview → block quorum hit → stake-weighted median 9000 bps
-    ///      (NOT the 5000 bps mean) → slashGuardians.
+    ///   3. gApprove votes Approve; gBlock1/2/3 vote Block at stake weights
+    ///      10k/20k/50k (no severity argument — Part D).
+    ///   4. resolveReview → block quorum hit → deterministic severity from
+    ///      block decisiveness (79.68% ≥ 2/3 supermajority → maxSlashBps =
+    ///      9999) → slashGuardians.
     ///
     /// Asserts:
     ///   - the proposal resolves Rejected/blocked;
-    ///   - the stake-weighted median (9000 bps) — and not the 5000 bps
-    ///     arithmetic mean — was the slash factor applied;
-    ///   - the approver's OWN stake was slashed pro-rata to the median;
-    ///   - the approver's DELEGATED pool was slashed pro-rata, each delegator's
-    ///     `delegationOf` diluted by the same share-factor;
-    ///   - the slashed WOOD (18k own + 360 pool) was burned to BURN_ADDRESS;
+    ///   - the deterministic ceiling severity (9999 bps) was the slash factor
+    ///     applied — severity is a function of decisiveness, not of anything
+    ///     the blockers propose;
+    ///   - the approver's OWN stake was slashed pro-rata to the severity,
+    ///     plus the first-loss spill of the delegated damage the
+    ///     `maxDelegatedSlashBps` cap absorbed (spec 2026-07-19 Part A) —
+    ///     here the spill is clamped by the tiny own-stake remainder, wiping
+    ///     the approver;
+    ///   - the approver's DELEGATED pool was slashed pro-rata at
+    ///     min(severity, C = 2000), each delegator's `delegationOf` diluted
+    ///     by the same share-factor;
+    ///   - the slashed WOOD (20k own incl. clamped spill + 80 pool) was
+    ///     burned to BURN_ADDRESS;
     ///   - the GuardianRegistry holds no WOOD and no reward pool was funded —
     ///     the slash path does not touch reward-pool state.
-    function test_review_blockQuorum_graduatedMedianSlash_endToEnd() public {
+    function test_review_blockQuorum_deterministicSeveritySlash_endToEnd() public {
         // ── Pre-conditions: pool wired correctly before the review ──
         assertEq(swood.guardianStake(gApprove), APPROVER_STAKE, "approver own stake pre-slash");
         assertEq(swood.poolTokens(gApprove), DEL1_AMOUNT + DEL2_AMOUNT, "pool tokens pre-slash");
@@ -376,15 +370,15 @@ contract SwoodReviewSlashTest is Test {
         );
         registry.openReview(address(governor), pid);
 
-        // ── 3. guardian votes: 1 Approve, 3 Block with varying slashBps ──
+        // ── 3. guardian votes: 1 Approve, 3 Block (no severity arg) ──
         vm.prank(gApprove);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve);
         vm.prank(gBlock1);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, SLASH_BPS_LOW); // 2000 @ 10k
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block); // 10k weight
         vm.prank(gBlock2);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, SLASH_BPS_MID); // 4000 @ 20k
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block); // 20k weight
         vm.prank(gBlock3);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, SLASH_BPS_HIGH); // 9000 @ 50k
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block); // 50k weight
 
         // ── 4. review window ends → resolveReview ──
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
@@ -404,51 +398,62 @@ contract SwoodReviewSlashTest is Test {
         vm.expectRevert(ISyndicateGovernor.ProposalNotApproved.selector);
         governor.executeProposal(pid);
 
-        // ── Assert: own stake slashed at the stake-weighted MEDIAN ──
+        // ── Assert: own stake slashed at the DETERMINISTIC severity ──
         //
         // EXPECTED values below are HARDCODED LITERALS — deliberately NOT
         // re-derived from the contract's own `stake * bps / 10_000` formula —
         // so a contract-side formula or rounding bug cannot be silently
         // absorbed by a mirrored expression on the expected side.
         //
-        // Arithmetic rationale (slash factor = stake-weighted median 9000 bps):
-        //   own slash      = 20_000e18 * 9000 / 10_000 = 18_000e18  → 2_000e18 remains
-        //   pool slash     =    400e18 * 9000 / 10_000 =    360e18  →    40e18 remains
-        //   del1 remains   =    300e18 - (300e18 * 9000 / 10_000)   =    30e18
-        //   del2 remains   =    100e18 - (100e18 * 9000 / 10_000)   =    10e18
-        //   total burned   = 18_000e18 + 360e18                     = 18_360e18
-        //   totalGuardianStake post = 100_000e18 - 18_000e18        = 82_000e18
+        // Arithmetic rationale (slash factor = deterministic severity, spec
+        // 2026-07-19 Part D: decisiveness 7968 bps ≥ SUPERMAJORITY_BPS 6667 →
+        // severity = maxSlashBps = 9999; delegated legs capped at C =
+        // maxDelegatedSlashBps = 2000 with the absorbed excess spilling onto
+        // the approver's own stake, clamped to what remains — spec Part A):
+        //   own base slash = 20_000e18 * 9999 / 10_000 = 19_998e18
+        //   pool slash     =    400e18 * 2000 / 10_000 =     80e18  →  320e18 remains
+        //   spill (raw)    =    400e18 * (9999 - 2000) / 10_000 = 319.96e18
+        //   spill (clamped)= min(319.96e18, 20_000e18 - 19_998e18) = 2e18
+        //   own remains    = 20_000e18 - 19_998e18 - 2e18           = 0
+        //   del1 remains   =    300e18 - (300e18 * 2000 / 10_000)   = 240e18
+        //   del2 remains   =    100e18 - (100e18 * 2000 / 10_000)   =  80e18
+        //   total burned   = 19_998e18 + 2e18 + 80e18               = 20_080e18
+        //   totalGuardianStake post = 100_000e18 - 20_000e18        = 80_000e18
         //
-        // If the contract had (incorrectly) used the 5000 bps arithmetic mean,
-        // own stake would be 10_000e18 and every literal below would mismatch —
-        // that is the property this fixture proves.
-        assertEq(swood.guardianStake(gApprove), 2_000e18, "approver own stake = 2k post-slash (90% of 20k burned)");
-        // Self-documenting median≠mean guard: the slash factor actually applied
-        // is the stake-weighted median (EXPECTED_MEDIAN_BPS = 9000), NOT the
-        // 5000 bps arithmetic mean. Under the mean, own stake would be 10k.
-        assertEq(EXPECTED_MEDIAN_BPS, 9000, "stake-weighted median is 9000 bps, not the 5000 bps mean");
-        assertTrue(swood.guardianStake(gApprove) != 10_000e18, "slash used median (9000), not mean (5000)");
-        // Cohort total stake dropped by exactly the approver's own 18k slash.
-        assertEq(swood.totalGuardianStake(), 82_000e18, "totalGuardianStake = 100k - 18k own slash");
+        // If the contract had (incorrectly) kept e.g. a sub-ceiling severity,
+        // the approver would retain own stake and every literal below would
+        // mismatch — the ceiling wipe is the property this fixture proves.
+        assertEq(swood.guardianStake(gApprove), 0, "approver own wiped: 19_998 base + 2 clamped spill");
+        // Self-documenting Part D guard: the slash factor actually applied is
+        // the deterministic ceiling (EXPECTED_SEVERITY_BPS = 9999) because
+        // block decisiveness (7968 bps) exceeds the 2/3 supermajority.
+        assertEq(EXPECTED_SEVERITY_BPS, 9999, "deterministic ceiling severity = maxSlashBps");
+        // Cohort total stake dropped by exactly the approver's own debit
+        // (19_998 base + 2 clamped spill = full 20k bond).
+        assertEq(swood.totalGuardianStake(), 80_000e18, "totalGuardianStake = 100k - 20k own debit");
 
         // ── Assert: blockers untouched ──
         assertEq(swood.guardianStake(gBlock1), BLOCKER1_STAKE, "blocker1 untouched");
         assertEq(swood.guardianStake(gBlock2), BLOCKER2_STAKE, "blocker2 untouched");
         assertEq(swood.guardianStake(gBlock3), BLOCKER3_STAKE, "blocker3 untouched");
 
-        // ── Assert: delegated pool slashed at the same median share-factor ──
-        // pool 400 − (400 × 9000 / 10000) = 400 − 360 = 40.
-        assertEq(swood.poolTokens(gApprove), 40e18, "pool slashed 90% -> 40");
-        assertEq(swood.totalDelegatedStake(), 40e18, "totalDelegatedStake -> 40");
+        // ── Assert: delegated pool slashed at min(severity, C) = 20% ──
+        // pool 400 − (400 × 2000 / 10000) = 400 − 80 = 320.
+        assertEq(swood.poolTokens(gApprove), 320e18, "pool slashed at C (20%) -> 320");
+        assertEq(swood.totalDelegatedStake(), 320e18, "totalDelegatedStake -> 320");
 
-        // Each delegator's token-equivalent diluted by the SAME 90% share-factor
+        // Each delegator's token-equivalent diluted by the SAME 20% share-factor
         // (no per-delegator loop — one poolTokens write dilutes the share rate).
-        assertEq(swood.delegationOf(del1, gApprove), 30e18, "del1 diluted 90% -> 30");
-        assertEq(swood.delegationOf(del2, gApprove), 10e18, "del2 diluted 90% -> 10");
+        assertEq(swood.delegationOf(del1, gApprove), 240e18, "del1 diluted 20% -> 240");
+        assertEq(swood.delegationOf(del2, gApprove), 80e18, "del2 diluted 20% -> 80");
 
-        // ── Assert: slashed WOOD burned (own + delegated) ──
-        // 18_000e18 own + 360e18 pool = 18_360e18 burned to the dead address.
-        assertEq(wood.balanceOf(BURN_ADDRESS), burnBefore + 18_360e18, "18k own + 360 pool burned to dead address");
+        // ── Assert: slashed WOOD burned (own incl. spill + delegated) ──
+        // 19_998e18 own + 2e18 clamped spill + 80e18 pool = 20_080e18 burned.
+        assertEq(
+            wood.balanceOf(BURN_ADDRESS),
+            burnBefore + 20_080e18,
+            "20k own (incl. spill) + 80 pool burned to dead address"
+        );
         assertEq(swood.pendingBurn(), 0, "no pending burn - ERC20Mock burn transfer succeeded");
 
         // ── Assert: registry holds no assets; fee attribution is off-chain ──

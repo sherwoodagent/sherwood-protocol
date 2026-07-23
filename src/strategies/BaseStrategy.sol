@@ -35,6 +35,7 @@ abstract contract BaseStrategy is IStrategy {
     error AlreadyExecuted();
     error AlreadySettled();
     error ZeroAddress();
+    error OnDemandExitUnsupported();
 
     // ── State ──
     enum State {
@@ -137,6 +138,20 @@ abstract contract BaseStrategy is IStrategy {
     ///      LeveragedAerodromeCLStrategy's `protocolFeeOwed` leg) or the protocol earns nothing.
     function selfManagesFees() external view virtual returns (bool) {
         return false;
+    }
+
+    /// @inheritdoc IStrategy
+    /// @dev Default: no on-demand exit — instant withdrawals are served from
+    ///      vault float only; excess routes to the Lane B queue. Strategies
+    ///      with venue-liquid positions (e.g. Moonwell supply) override both
+    ///      this and `withdrawTo`.
+    function availableLiquidity() external view virtual returns (uint256) {
+        return 0;
+    }
+
+    /// @inheritdoc IStrategy
+    function withdrawTo(uint256) external virtual onlyVault {
+        revert OnDemandExitUnsupported();
     }
 
     // ── Internal helpers ──

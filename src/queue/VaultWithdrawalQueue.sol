@@ -42,8 +42,19 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
     Request[] private _requests; // index 0 unused (sentinel)
     mapping(address => uint256[]) private _byOwner;
     mapping(uint256 pid => SettlePrice) private _settlePrice;
-    /// @notice Total redeem shares queued per proposal (for reserve accounting).
+    /// @notice Redeem shares still queued per proposal. Incremented at
+    ///         `queueRedeem`, decremented at `cancel` (pre-stamp) and at `claim`
+    ///         (post-stamp). Reaching 0 after stamp means the proposal is fully
+    ///         claimed → its remaining `_pidReserved` dust is released.
     mapping(uint256 pid => uint256) private _pidRedeemShares;
+    /// @notice Assets reserved for a proposal at stamp time
+    ///         (`mulDiv(totalRedeemShares, num, den)`). Decremented as that
+    ///         proposal's redeems are claimed; the claim that empties the
+    ///         proposal's shares releases whatever remains, so the aggregate
+    ///         reserve (`floor(Σ·num/den)`) is released in full and never leaves
+    ///         phantom dust — `floor(Σ) ≥ Σfloor`, so per-request payouts alone
+    ///         would strand `floor(Σ)−Σfloor` wei of reserve forever.
+    mapping(uint256 pid => uint256) private _pidReserved;
 
     uint256 private _pendingShares; // escrowed redeem shares (not yet claimed/cancelled)
     uint256 private _pendingDepositAssets; // escrowed deposit assets
@@ -106,7 +117,9 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
         sp.stamped = true;
         uint256 redeemShares = _pidRedeemShares[pid];
         if (redeemShares != 0 && den != 0) {
-            _reservedAssets += Math.mulDiv(redeemShares, num, den);
+            uint256 reservedForPid = Math.mulDiv(redeemShares, num, den);
+            _pidReserved[pid] = reservedForPid;
+            _reservedAssets += reservedForPid;
         }
         emit SettlementStamped(pid, num, den);
     }
@@ -133,8 +146,25 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
             // assets = shares * num / den (matches ERC-4626 convertToAssets at settle)
             outAmount = Math.mulDiv(amount, sp.num, sp.den);
             _pendingShares -= amount;
+            // Release reserve against the proposal's stamped aggregate, not the
+            // per-request payout, so the claim that empties the proposal's shares
+            // frees the whole remainder (incl. the floor(Σ)−Σfloor rounding dust).
+            // Otherwise that dust accumulates across proposals until
+            // `reservedAssets` exceeds the vault float that backs the true
+            // claimable, over-restricting flows and eventually bricking
+            // `executeGovernorBatch`.
+            uint256 remainingShares = _pidRedeemShares[r.pid] - amount;
+            _pidRedeemShares[r.pid] = remainingShares;
+            uint256 release;
+            if (remainingShares == 0) {
+                release = _pidReserved[r.pid]; // final claim: free the entire remainder
+                _pidReserved[r.pid] = 0;
+            } else {
+                release = outAmount; // partial floors always sum below the aggregate → no underflow
+                _pidReserved[r.pid] -= outAmount;
+            }
             uint256 reserved = _reservedAssets;
-            _reservedAssets = reserved > outAmount ? reserved - outAmount : 0;
+            _reservedAssets = reserved > release ? reserved - release : 0;
             IRequestableVault(vault).settleRedeem(amount, outAmount, r.owner);
         } else {
             // shares = assets * den / num (matches ERC-4626 convertToShares at settle)

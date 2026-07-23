@@ -38,7 +38,11 @@ contract StakedWoodTest is Test {
                     coolDownPeriod: 7 days,
                     minOwnerStake: 1_000e18,
                     minSlashBps: 1000,
-                    maxSlashBps: 9999
+                    maxSlashBps: 9999,
+                    maxDelegatedSlashBps: 2000,
+                    ageFloorBps: 2500,
+                    maturationPeriod: 30 days,
+                    delegatedWeightCapX: 4
                 }))
         );
         swood = StakedWood(address(new ERC1967Proxy(address(impl), initData)));
@@ -84,12 +88,14 @@ contract StakedWoodTest is Test {
     function test_stakeAsGuardian_checkpointsPastVotes() public {
         vm.prank(alice);
         swood.stakeAsGuardian(10_000e18, 42);
-        uint256 stakedAt = vm.getBlockTimestamp();
 
-        // Checkpoints at t-1 are 0; warp forward so the stake checkpoint is in
-        // the past relative to the read site.
+        // Age-weighted voting: mature the stake to par, then read the
+        // checkpoint at a matured timestamp in the past relative to the
+        // read site (checkpoints before the stake are 0).
+        skip(30 days);
+        uint256 maturedAt = vm.getBlockTimestamp();
         vm.warp(vm.getBlockTimestamp() + 1);
-        assertEq(swood.getPastVotes(alice, stakedAt), 10_000e18);
+        assertEq(swood.getPastVotes(alice, maturedAt), 10_000e18);
     }
 
     // ── Guardian unstake cooldown (relocated from GuardianRegistry) ──
@@ -111,9 +117,12 @@ contract StakedWoodTest is Test {
         assertEq(swood.getPastVotes(alice, requestedAt), 0);
     }
 
-    function test_cancelUnstakeGuardian_restoresVotingPower() public {
+    function test_cancelUnstakeGuardian_restoresVotingPowerAtResetAge() public {
         vm.prank(alice);
         swood.stakeAsGuardian(10_000e18, 42);
+
+        // Age-weighted voting: mature to par before the request/cancel cycle.
+        skip(30 days);
 
         vm.warp(vm.getBlockTimestamp() + 1);
         vm.prank(alice);
@@ -126,8 +135,12 @@ contract StakedWoodTest is Test {
 
         assertEq(swood.totalGuardianStake(), 10_000e18);
 
+        // The stake is votable again, but `requestUnstakeGuardian` reset the
+        // age clock (spec 2026-07-19 §4) — a request → cancel round-trip may
+        // not park age. Age at read = 1s since the request → floor weight
+        // (2500 + 7500·1/30d floors to 2500 bps), NOT the pre-request par.
         vm.warp(vm.getBlockTimestamp() + 1);
-        assertEq(swood.getPastVotes(alice, cancelledAt), 10_000e18);
+        assertEq(swood.getPastVotes(alice, cancelledAt), 10_000e18 * 2500 / 10_000);
     }
 
     function test_claimUnstakeGuardian_afterCooldown_returnsWood() public {
@@ -336,12 +349,12 @@ contract StakedWoodTest is Test {
         swood.setMaxSlashBps(10001);
     }
 
-    /// @notice C-2: the strict cap rejects `10_000` exactly — a 100% slash
-    ///         would zero `poolTokens` and brick subsequent `delegateStake`.
-    function test_setMaxSlashBps_revertsAt10000() public {
+    /// @notice `10_000` (100%) is now a legal own-stake ceiling — the C-2
+    ///         pool-bricking guard relocated to `maxDelegatedSlashBps`.
+    function test_setMaxSlashBps_acceptsAt10000() public {
         vm.prank(owner);
-        vm.expectRevert(StakedWood.InvalidParameter.selector);
         swood.setMaxSlashBps(10000);
+        assertEq(swood.maxSlashBps(), 10000);
     }
 
     function test_setMaxSlashBps_revertsIfNotOwner() public {
@@ -362,7 +375,11 @@ contract StakedWoodTest is Test {
                     coolDownPeriod: 7 days,
                     minOwnerStake: 1_000e18,
                     minSlashBps: 6000,
-                    maxSlashBps: 5000
+                    maxSlashBps: 5000,
+                    maxDelegatedSlashBps: 2000,
+                    ageFloorBps: 2500,
+                    maturationPeriod: 30 days,
+                    delegatedWeightCapX: 4
                 }))
         );
         vm.expectRevert(StakedWood.InvalidParameter.selector);
@@ -381,17 +398,22 @@ contract StakedWoodTest is Test {
                     coolDownPeriod: 7 days,
                     minOwnerStake: 1_000e18,
                     minSlashBps: 1000,
-                    maxSlashBps: 10001
+                    maxSlashBps: 10001,
+                    maxDelegatedSlashBps: 2000,
+                    ageFloorBps: 2500,
+                    maturationPeriod: 30 days,
+                    delegatedWeightCapX: 4
                 }))
         );
         vm.expectRevert(StakedWood.InvalidParameter.selector);
         new ERC1967Proxy(address(impl), bad);
     }
 
-    /// @notice C-2: strict cap rejects `maxSlashBps == 10_000` at init.
-    function test_initialize_revertsIfMaxSlashEquals10000() public {
+    /// @notice `maxSlashBps == 10_000` is now accepted at init — the C-2
+    ///         pool-bricking guard relocated to `maxDelegatedSlashBps`.
+    function test_initialize_acceptsMaxSlashEquals10000() public {
         StakedWood impl = new StakedWood();
-        bytes memory bad = abi.encodeCall(
+        bytes memory initData = abi.encodeCall(
             StakedWood.initialize,
             (StakedWood.InitParams({
                     owner: owner,
@@ -401,11 +423,196 @@ contract StakedWoodTest is Test {
                     coolDownPeriod: 7 days,
                     minOwnerStake: 1_000e18,
                     minSlashBps: 1000,
-                    maxSlashBps: 10000
+                    maxSlashBps: 10000,
+                    maxDelegatedSlashBps: 2000,
+                    ageFloorBps: 2500,
+                    maturationPeriod: 30 days,
+                    delegatedWeightCapX: 4
                 }))
         );
+        StakedWood w = StakedWood(address(new ERC1967Proxy(address(impl), initData)));
+        assertEq(w.maxSlashBps(), 10000);
+    }
+
+    // ── Slash-cap + age-weight params (spec 2026-07-19) ──
+
+    /// @dev Clones the setUp proxy-deploy, overriding the three slash bounds.
+    ///      Lets the init-validation tests exercise the relocated C-2 guard
+    ///      (`maxDelegatedSlashBps < 10_000`) without touching setUp defaults.
+    ///      Public so revert tests can call it via `this.` — `vm.expectRevert`
+    ///      then covers the whole external call and the proxy-init revert
+    ///      surfaces (the helper's internal impl CREATE would otherwise
+    ///      consume the expectation).
+    function _deploySWoodWithSlashBounds(uint256 lo, uint256 hi, uint256 cap) public returns (StakedWood) {
+        StakedWood impl = new StakedWood();
+        bytes memory initData = abi.encodeCall(
+            StakedWood.initialize,
+            (StakedWood.InitParams({
+                    owner: owner,
+                    wood: address(wood),
+                    factory: factory,
+                    minGuardianStake: 10_000e18,
+                    coolDownPeriod: 7 days,
+                    minOwnerStake: 1_000e18,
+                    minSlashBps: lo,
+                    maxSlashBps: hi,
+                    maxDelegatedSlashBps: cap,
+                    ageFloorBps: 2500,
+                    maturationPeriod: 30 days,
+                    delegatedWeightCapX: 4
+                }))
+        );
+        return StakedWood(address(new ERC1967Proxy(address(impl), initData)));
+    }
+
+    function test_initialize_acceptsFullMaxSlash() public {
+        // maxSlashBps = 10_000 is now valid (C-2 guard moved to maxDelegatedSlashBps).
+        StakedWood w = _deploySWoodWithSlashBounds(1000, 10_000, 2000);
+        assertEq(w.maxSlashBps(), 10_000);
+    }
+
+    function test_initialize_revertsDelegatedCapAtFullSlash() public {
+        // maxDelegatedSlashBps must stay < 10_000 (pool-brick guard lives here now).
         vm.expectRevert(StakedWood.InvalidParameter.selector);
-        new ERC1967Proxy(address(impl), bad);
+        this._deploySWoodWithSlashBounds(1000, 10_000, 10_000);
+    }
+
+    function test_initialize_revertsDelegatedCapAboveMaxSlash() public {
+        vm.expectRevert(StakedWood.InvalidParameter.selector);
+        this._deploySWoodWithSlashBounds(1000, 5000, 6000); // C > maxSlashBps
+    }
+
+    function test_setMaxDelegatedSlashBps_boundsAndEvent() public {
+        // expectEmit BEFORE the prank: the `swood.PARAM_...()` staticcall in
+        // the emit args would otherwise consume the prank (file convention).
+        vm.expectEmit(true, false, false, true);
+        emit StakedWood.ParameterChangeFinalized(swood.PARAM_MAX_DELEGATED_SLASH_BPS(), 2000, 1500);
+        vm.prank(owner);
+        swood.setMaxDelegatedSlashBps(1500);
+        assertEq(swood.maxDelegatedSlashBps(), 1500);
+
+        vm.prank(owner);
+        vm.expectRevert(StakedWood.InvalidParameter.selector);
+        swood.setMaxDelegatedSlashBps(10_000); // >= 10_000 rejected
+
+        vm.prank(owner);
+        swood.setMaxSlashBps(5000);
+        vm.prank(owner);
+        vm.expectRevert(StakedWood.InvalidParameter.selector);
+        swood.setMaxDelegatedSlashBps(5001); // > maxSlashBps rejected
+    }
+
+    function test_setAgeParams_bounds() public {
+        vm.startPrank(owner);
+        swood.setAgeFloorBps(5000);
+        assertEq(swood.ageFloorBps(), 5000);
+        vm.expectRevert(StakedWood.InvalidParameter.selector);
+        swood.setAgeFloorBps(0);
+        vm.expectRevert(StakedWood.InvalidParameter.selector);
+        swood.setAgeFloorBps(10_001);
+
+        swood.setMaturationPeriod(60 days);
+        assertEq(swood.maturationPeriod(), 60 days);
+        vm.expectRevert(StakedWood.InvalidParameter.selector);
+        swood.setMaturationPeriod(6 days);
+        vm.expectRevert(StakedWood.InvalidParameter.selector);
+        swood.setMaturationPeriod(91 days);
+
+        swood.setDelegatedWeightCapX(10);
+        assertEq(swood.delegatedWeightCapX(), 10);
+        vm.expectRevert(StakedWood.InvalidParameter.selector);
+        swood.setDelegatedWeightCapX(0);
+        vm.expectRevert(StakedWood.InvalidParameter.selector);
+        swood.setDelegatedWeightCapX(21);
+        vm.stopPrank();
+    }
+
+    function test_setMaxSlashBps_allowsFullAndGuardsDelegatedCap() public {
+        vm.startPrank(owner);
+        swood.setMaxSlashBps(10_000); // now legal
+        assertEq(swood.maxSlashBps(), 10_000);
+        // Lowering maxSlashBps below current C must revert (keeps C <= maxSlashBps).
+        swood.setMaxDelegatedSlashBps(3000);
+        vm.expectRevert(StakedWood.InvalidParameter.selector);
+        swood.setMaxSlashBps(2999);
+        vm.stopPrank();
+    }
+
+    /// @notice `initialize` stores the age-weight + delegated-slash params
+    ///         (Task 1 review M-3): the setUp proxy pins the constructor args.
+    function test_initialize_setsAgeWeightParams() public view {
+        assertEq(swood.ageFloorBps(), 2500);
+        assertEq(swood.maturationPeriod(), 30 days);
+        assertEq(swood.delegatedWeightCapX(), 4);
+        assertEq(swood.maxDelegatedSlashBps(), 2000);
+    }
+
+    /// @notice `setAgeFloorBps` emits `ParameterChangeFinalized` keyed by
+    ///         `PARAM_AGE_FLOOR_BPS` (Task 1 review M-3).
+    function test_setAgeFloorBps_emitsKey() public {
+        vm.expectEmit(true, false, false, true);
+        emit StakedWood.ParameterChangeFinalized(swood.PARAM_AGE_FLOOR_BPS(), 2500, 5000);
+        vm.prank(owner);
+        swood.setAgeFloorBps(5000);
+    }
+
+    /// @notice `setMaturationPeriod` emits keyed by `PARAM_MATURATION_PERIOD`.
+    function test_setMaturationPeriod_emitsKey() public {
+        vm.expectEmit(true, false, false, true);
+        emit StakedWood.ParameterChangeFinalized(swood.PARAM_MATURATION_PERIOD(), 30 days, 60 days);
+        vm.prank(owner);
+        swood.setMaturationPeriod(60 days);
+    }
+
+    /// @notice `setDelegatedWeightCapX` emits keyed by
+    ///         `PARAM_DELEGATED_WEIGHT_CAP_X`.
+    function test_setDelegatedWeightCapX_emitsKey() public {
+        vm.expectEmit(true, false, false, true);
+        emit StakedWood.ParameterChangeFinalized(swood.PARAM_DELEGATED_WEIGHT_CAP_X(), 4, 10);
+        vm.prank(owner);
+        swood.setDelegatedWeightCapX(10);
+    }
+
+    /// @notice Accept-side boundaries (Task 1 review M-2): every setter takes
+    ///         its extreme legal value without reverting. `maxDelegatedSlashBps
+    ///         = 9_999` is legal against the default `maxSlashBps = 9_999`.
+    function test_setters_acceptBoundaryValues() public {
+        vm.startPrank(owner);
+
+        swood.setAgeFloorBps(1);
+        assertEq(swood.ageFloorBps(), 1);
+        swood.setAgeFloorBps(10_000);
+        assertEq(swood.ageFloorBps(), 10_000);
+
+        swood.setMaturationPeriod(7 days);
+        assertEq(swood.maturationPeriod(), 7 days);
+        swood.setMaturationPeriod(90 days);
+        assertEq(swood.maturationPeriod(), 90 days);
+
+        swood.setDelegatedWeightCapX(1);
+        assertEq(swood.delegatedWeightCapX(), 1);
+        swood.setDelegatedWeightCapX(20);
+        assertEq(swood.delegatedWeightCapX(), 20);
+
+        swood.setMaxDelegatedSlashBps(9_999); // < 10_000 and <= maxSlashBps (9_999)
+        assertEq(swood.maxDelegatedSlashBps(), 9_999);
+
+        vm.stopPrank();
+    }
+
+    /// @notice Bug A guard (Task 3 review M-3): topping up a stake while an
+    ///         unstake request is pending reverts `UnstakeAlreadyRequested` —
+    ///         a mid-cooldown top-up would grow `totalGuardianStake` without
+    ///         creating votable weight, so it is forced to cancel first.
+    function test_stakeAsGuardian_revertsWhenUnstakeRequested() public {
+        vm.prank(alice);
+        swood.stakeAsGuardian(10_000e18, 42);
+        vm.prank(alice);
+        swood.requestUnstakeGuardian();
+
+        vm.prank(alice);
+        vm.expectRevert(StakedWoodDelegation.UnstakeAlreadyRequested.selector);
+        swood.stakeAsGuardian(10_000e18, 42);
     }
 
     // ── Owner-bond prepare/bind (relocated from GuardianRegistry, Task 3.1) ──
@@ -690,6 +897,10 @@ contract StakedWoodTest is Test {
         swood.setDelegationEnabled(true);
         vm.prank(alice);
         swood.delegateStake(bob, 300e18);
+
+        // Age-weighted voting: mature bob's own stake to par (the delegated
+        // 300 is far under the k-cap of 4 × 10_000e18, so it counts flat).
+        skip(30 days);
         uint256 ts = vm.getBlockTimestamp();
 
         // Warp forward so the checkpoints are in the past relative to the read.
@@ -703,6 +914,9 @@ contract StakedWoodTest is Test {
     function test_getPastVotes_ownStakeOnlyWhenNoInboundDelegation() public {
         vm.prank(alice);
         swood.stakeAsGuardian(10_000e18, 42);
+
+        // Age-weighted voting: mature to par so votes equal raw stake.
+        skip(30 days);
         uint256 ts = vm.getBlockTimestamp();
 
         vm.warp(vm.getBlockTimestamp() + 1);
@@ -712,7 +926,7 @@ contract StakedWoodTest is Test {
         assertEq(swood.getPastVotes(alice, ts), 10_000e18);
     }
 
-    function test_getPastVotes_afterUnstakeRequest_returnsDelegatedOnly() public {
+    function test_getPastVotes_afterUnstakeRequest_returnsZero() public {
         // Bob self-stakes 10k as an active guardian (so he can be a delegate).
         wood.mint(bob, 100_000e18);
         vm.prank(bob);
@@ -735,9 +949,10 @@ contract StakedWoodTest is Test {
         uint256 ts = vm.getBlockTimestamp();
         vm.warp(vm.getBlockTimestamp() + 1);
 
-        // Own-stake term is 0 after the unstake request; delegated inbound
-        // (300) is independent and survives.
-        assertEq(swood.getPastVotes(bob, ts), 300e18);
+        // Own-stake term is 0 after the unstake request, and the delegated
+        // term is capped at delegatedWeightCapX × agedOwn = 0 — so the whole
+        // vote weight drops to zero (spec §5: zero own ⇒ zero cap).
+        assertEq(swood.getPastVotes(bob, ts), 0);
     }
 
     // ── getVotes: current vote weight (Snapshot-compatible read surface) ──
@@ -755,6 +970,10 @@ contract StakedWoodTest is Test {
         swood.setDelegationEnabled(true);
         vm.prank(alice);
         swood.delegateStake(bob, 300e18);
+
+        // Age-weighted voting: mature bob's own stake to par (the delegated
+        // 300 is far under the k-cap of 4 × 10_000e18, so it counts flat).
+        skip(30 days);
 
         // Current votes = own stake (10k) + delegated inbound (300).
         assertEq(swood.getVotes(bob), 10_000e18 + 300e18);
@@ -784,8 +1003,9 @@ contract StakedWoodTest is Test {
         swood.requestUnstakeGuardian();
         uint256 ts = vm.getBlockTimestamp();
 
-        // Own term is 0; delegated inbound (300) is independent and survives.
-        assertEq(swood.getVotes(bob), 300e18);
+        // Own term is 0, so the k-cap zeroes the delegated term too — total
+        // vote weight is 0 (spec §5: zero own ⇒ zero cap).
+        assertEq(swood.getVotes(bob), 0);
 
         // Consistent with the historical read at the same instant.
         vm.warp(vm.getBlockTimestamp() + 1);
@@ -842,6 +1062,9 @@ contract StakedWoodTest is Test {
         // Alice self-stakes 10k with no inbound delegation.
         vm.prank(alice);
         swood.stakeAsGuardian(10_000e18, 42);
+
+        // Age-weighted voting: mature to par so votes equal raw stake.
+        skip(30 days);
 
         // Votes = own stake only; the delegated term is 0 (not a revert).
         assertEq(swood.getVotes(alice), 10_000e18);

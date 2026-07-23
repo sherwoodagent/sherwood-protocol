@@ -67,7 +67,7 @@ contract ProposalBleedHandler is Test {
         // Skip if this guardian already voted under (gov, pid) or the window closed.
         if (approvedUnder[address(gov)][pid][g]) return;
         vm.prank(g);
-        try registry.voteOnProposal(address(gov), pid, IGuardianRegistry.GuardianVoteType.Approve, 0) {
+        try registry.voteOnProposal(address(gov), pid, IGuardianRegistry.GuardianVoteType.Approve) {
             approvedUnder[address(gov)][pid][g] = true;
         } catch {}
     }
@@ -120,7 +120,11 @@ contract InvariantNoProposalBleed is StdInvariant, Test {
                     coolDownPeriod: 7 days,
                     minOwnerStake: 10_000e18,
                     minSlashBps: 1000,
-                    maxSlashBps: 9999
+                    maxSlashBps: 9999,
+                    maxDelegatedSlashBps: 2000,
+                    ageFloorBps: 2500,
+                    maturationPeriod: 30 days,
+                    delegatedWeightCapX: 4
                 }))
         );
         swood = StakedWood(address(new ERC1967Proxy(address(swoodImpl), swoodInit)));

@@ -6,6 +6,36 @@ import {BatchExecutorLib} from "../BatchExecutorLib.sol";
 interface ISyndicateGovernor {
     // ── Enums ──
 
+    /// @dev ── THE LIFECYCLE MAP ─ state × transition owner × where the state lives ──
+    ///      One conceptual state machine, physically split across two contracts
+    ///      (EIP-170): the enum + most transitions live in `SyndicateGovernor`
+    ///      (`_resolveState`), but the GuardianReview verdict, emergency-review
+    ///      state, quorum bookkeeping, and stored emergency settlement calls live
+    ///      in `GuardianRegistry` (reached via the thin `GovernorEmergency` shims).
+    ///
+    ///        Draft          → Pending         approveCollaboration (all co-proposers)
+    ///        Draft          → Expired         time (collaborationDeadline passes;
+    ///                                         CollaborationDeadlineExpired + _decOpen)
+    ///        Pending        → GuardianReview  time (voteEnd passes, veto not met)
+    ///        Pending        → Rejected        time (veto threshold reached)
+    ///        GuardianReview → Approved        REGISTRY resolveReview: no block quorum
+    ///        GuardianReview → Rejected        REGISTRY resolveReview: blocked
+    ///        Approved       → Executed        executeProposal (anyone; gate is Approved
+    ///                                         state + no other active proposal + cooldown
+    ///                                         elapsed — no for-vote quorum exists in
+    ///                                         this optimistic model)
+    ///        Approved       → Expired         time (executeBy passes)
+    ///        Executed       → Settled         settleProposal (proposer any time after
+    ///                                         1h; anyone after strategyDuration) — or
+    ///                                         the REGISTRY-driven emergency-settle path
+    ///                                         (unstick → finalizeEmergencySettle)
+    ///        Draft/Pending/GuardianReview/Approved → Cancelled
+    ///                                         cancelProposal (proposer; G-H2 near-quorum
+    ///                                         guard) or emergencyCancel (vault owner,
+    ///                                         Draft/Pending only)
+    ///
+    ///      Reader's rule of thumb: transitions marked REGISTRY cannot be understood
+    ///      from the governor alone — read `GuardianRegistry`'s review bookkeeping.
     enum ProposalState {
         Draft, // collaborative proposal awaiting co-proposer consent
         Pending, // voting active
