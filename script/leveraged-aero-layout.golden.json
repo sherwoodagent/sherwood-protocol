@@ -222,9 +222,27 @@
         "offset": 0,
         "slot": "25",
         "type": "t_mapping(t_uint256,t_struct(RedeemRequest)_storage)"
+      },
+      {
+        "label": "width",
+        "offset": 0,
+        "slot": "26",
+        "type": "t_uint24"
+      },
+      {
+        "label": "minWidth",
+        "offset": 3,
+        "slot": "26",
+        "type": "t_uint24"
+      },
+      {
+        "label": "maxWidth",
+        "offset": 6,
+        "slot": "26",
+        "type": "t_uint24"
       }
     ],
-    "numberOfBytes": "832"
+    "numberOfBytes": "864"
   },
   "struct RedeemRequest": {
     "members": [

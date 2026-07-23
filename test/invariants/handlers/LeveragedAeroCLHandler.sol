@@ -264,7 +264,7 @@ contract LeveragedAeroCLHandler is LeveragedAeroForkBase {
         opCount++;
         uint256 pre = _safePerShare();
         vm.prank(proposer);
-        try strategy.rerange(0, 0) {
+        try strategy.rerange(4000, 0, 0) {
             rerangeOk++;
             _postOp("rerange", pre, SLACK_RERANGE, true);
         } catch {}
