@@ -232,6 +232,9 @@ contract LeveragedAeroCLRedeemFork is LeveragedAeroForkBase {
             calmDeviationTicks: 500,
             twapWindow: 1800,
             tickSpacing: BaseAddresses.CBBTC_WETH_TICK_SPACING,
+            width: 4000, // full width (raw ticks) = 40·tickSpacing (preserves the pre-param 20-spacing/side range)
+            minWidth: 200, // 2·tickSpacing
+            maxWidth: 20000,
             targetLtvBps: TARGET_LTV_BPS,
             maxLtvBps: MAX_LTV_BPS,
             minHealthBps: MIN_HEALTH_BPS,
@@ -746,7 +749,7 @@ contract LeveragedAeroCLRedeemFork is LeveragedAeroForkBase {
         (, int24 t0,,,,) = ICLPool(POOL).slot0();
         _shoveToTickDown(t0 - 450);
         vm.prank(proposer);
-        strat.rerange(0, 0);
+        strat.rerange(4000, 0, 0);
         uint256 idleCb = IERC20(CBBTC).balanceOf(address(strat));
         uint256 idleWeth = IERC20(WETH).balanceOf(address(strat));
         assertTrue(idleCb > 0 || idleWeth > 0, "rerange left no idle remainder leg");

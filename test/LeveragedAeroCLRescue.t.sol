@@ -124,6 +124,9 @@ contract LeveragedAeroCLRescueUnit is Test {
             calmDeviationTicks: 500,
             twapWindow: 1800,
             tickSpacing: 100,
+            width: 4000, // full width (raw ticks) = 40·tickSpacing (preserves the pre-param 20-spacing/side range)
+            minWidth: 200, // 2·tickSpacing
+            maxWidth: 20000,
             targetLtvBps: 5000,
             maxLtvBps: 6500,
             minHealthBps: 12000,
@@ -181,5 +184,46 @@ contract LeveragedAeroCLRescueUnit is Test {
             vm.expectRevert(LeveragedAerodromeCLStrategy.CannotRescuePositionToken.selector);
             strategy.rescueToVault(blocked[i]);
         }
+    }
+
+    // ── Width band validation in _initialize (Mamo rerange param; tickSpacing = 100) ──
+
+    /// @dev Fresh clone + initialize with an overridden width band; expects `WidthOutOfBounds`.
+    function _expectInitWidthRevert(uint24 width, uint24 minWidth, uint24 maxWidth) internal {
+        LeveragedAerodromeCLStrategy.InitParams memory p = _initParams();
+        p.width = width;
+        p.minWidth = minWidth;
+        p.maxWidth = maxWidth;
+        LeveragedAerodromeCLStrategy s =
+            LeveragedAerodromeCLStrategy(payable(Clones.clone(address(new LeveragedAerodromeCLStrategy()))));
+        vm.expectRevert(LeveragedAerodromeCLStrategy.WidthOutOfBounds.selector);
+        s.initialize(address(vault), proposer, abi.encode(p));
+    }
+
+    function test_init_storesWidthBand() public view {
+        LeveragedAerodromeCLStrategy.LayoutView memory v = strategy.layout();
+        assertEq(uint256(v.width), 4000, "width not stored");
+        assertEq(uint256(v.minWidth), 200, "minWidth not stored");
+        assertEq(uint256(v.maxWidth), 20000, "maxWidth not stored");
+    }
+
+    function test_init_revertsWidth_aboveMax() public {
+        _expectInitWidthRevert(20100, 200, 20000); // width (aligned) > maxWidth
+    }
+
+    function test_init_revertsWidth_belowMin() public {
+        _expectInitWidthRevert(100, 200, 20000); // width (aligned) < minWidth
+    }
+
+    function test_init_revertsWidth_misaligned() public {
+        _expectInitWidthRevert(4050, 200, 20000); // width % tickSpacing(100) != 0, in band
+    }
+
+    function test_init_revertsWidth_minBelowTwoSpacings() public {
+        _expectInitWidthRevert(4000, 100, 20000); // minWidth = 1·tickSpacing < 2·tickSpacing
+    }
+
+    function test_init_revertsWidth_bandBoundMisaligned() public {
+        _expectInitWidthRevert(4000, 250, 20000); // minWidth not a multiple of tickSpacing
     }
 }

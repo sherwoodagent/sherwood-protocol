@@ -103,6 +103,10 @@ contract LeveragedAeroLayoutParityTest is Test {
         $.redeemRequests[7] = LeveragedAeroStorage.RedeemRequest({
             owner: address(0xB3), shares: 1101, minAssetsOut: 1102, requestedAt: 1103, settled: true
         });
+        // ── appended: rerange width band ──
+        $.width = 1201;
+        $.minWidth = 1202;
+        $.maxWidth = 1203;
 
         // Full-word slots (one field each).
         assertEq(_raw(0), bytes32(uint256(uint160(address(0xA1)))), "slot 0: usdc");
@@ -174,6 +178,13 @@ contract LeveragedAeroLayoutParityTest is Test {
             vm.load(address(this), bytes32(entry + 3)),
             bytes32(uint256(1103) | (uint256(1) << 40)),
             "redeemRequests[7] +3: requestedAt|settled"
+        );
+
+        // Packed slot 26 (appended, post-mapping): width(u24 @0) | minWidth(u24 @3) | maxWidth(u24 @6).
+        assertEq(
+            _raw(26),
+            bytes32(uint256(1201) | (uint256(1202) << 24) | (uint256(1203) << 48)),
+            "slot 26: width|minWidth|maxWidth"
         );
     }
 }
