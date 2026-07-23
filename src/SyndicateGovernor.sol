@@ -260,8 +260,11 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // G-M11: cap metadata URI length.
         if (bytes(metadataURI).length > MAX_METADATA_URI_LENGTH) revert MetadataURITooLong();
         // Risk envelope (spec 2026-07-22 §3.1): nonzero outflow ceiling,
-        // drawdown declaration capped at 100%.
+        // clamped to the maxCapitalBps ceiling (finding 3), drawdown
+        // declaration capped at 100%.
         if (envelope.maxCapital == 0) revert ZeroMaxCapital();
+        // maxCapital ceiling (finding 3) is enforced in `_snapshotTier` below —
+        // same tx, hoisted off this frame for Yul stack budget.
         if (envelope.maxDrawdownBps > 10_000) revert InvalidDrawdown();
 
         // Validate co-proposers if present
@@ -759,13 +762,29 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         }
     }
 
+    /// @dev Finding 3: without a ceiling, a proposer declares
+    ///      maxCapital = uint256.max and the net-outflow cap (vault-enforced on
+    ///      execute AND settlement batches) never binds. Ceiling =
+    ///      `maxCapitalBps` (governor param, default 100%) of the vault's
+    ///      totalAssets() at propose time. Hoisted out of `propose` to stay
+    ///      under Yul's stack budget (see `_initPendingProposal`); reads the
+    ///      vault from storage (validated == the propose arg at the top of
+    ///      `propose`) for the same reason — one fewer stack slot.
+    function _checkMaxCapitalCeiling(uint256 maxCapital) private view {
+        uint256 ceiling = (IERC4626(GovernorParameters.vault).totalAssets() * maxCapitalBps()) / BPS_DENOMINATOR;
+        if (maxCapital > ceiling) revert MaxCapitalExceedsCeiling();
+    }
+
     /// @dev Thin store-wrapper around `_resolveTier`, hoisted out of `propose`
     ///      to keep that function under Yul's stack budget (see
     ///      `_initPendingProposal`). Implicit calldata→memory copy of `calls`.
     function _snapshotTier(StrategyProposal storage p, BatchExecutorLib.Call[] memory calls) private {
+        // Finding 3: envelope ceiling check. Lives here (not in propose's
+        // validation block) purely for Yul stack budget — an extra call frame
+        // in propose() tips "too deep by 1 slot". Same-tx revert either way.
         // Reads p.maxCapital from storage (written immediately before this call
-        // in `propose`) rather than taking it as a stack argument — keeps the
-        // propose() call site 1 slot under Yul's stack budget.
+        // in `propose`) rather than taking it as a stack argument.
+        _checkMaxCapitalCeiling(p.maxCapital);
         (uint8 tier_, uint256 coverage_) = _resolveTier(calls, p.maxCapital);
         p.envelopeTier = tier_;
         p.requiredCoverage = coverage_;

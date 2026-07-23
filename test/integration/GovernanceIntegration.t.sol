@@ -77,7 +77,7 @@ contract GovernanceIntegrationTest is BaseIntegrationTest {
             address(0),
             "ipfs://veto-test",
             STRATEGY_DURATION,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             execCalls,
             settleCalls,
             _emptyCoProposers()
@@ -120,7 +120,7 @@ contract GovernanceIntegrationTest is BaseIntegrationTest {
             address(0),
             "ipfs://reject-test",
             STRATEGY_DURATION,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             execCalls,
             settleCalls,
             _emptyCoProposers()
@@ -203,7 +203,7 @@ contract GovernanceIntegrationTest is BaseIntegrationTest {
             address(0),
             "ipfs://cooldown-test",
             STRATEGY_DURATION,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             exec2,
             settle2,
             _emptyCoProposers()

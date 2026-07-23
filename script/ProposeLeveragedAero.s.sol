@@ -6,6 +6,7 @@ import {console} from "forge-std/console.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {BatchExecutorLib} from "../src/BatchExecutorLib.sol";
 import {ISyndicateGovernor} from "../src/interfaces/ISyndicateGovernor.sol";
+import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 
 /**
  * @notice Propose the LeveragedAerodromeCLStrategy through the real SyndicateGovernor. Must be
@@ -49,10 +50,13 @@ contract ProposeLeveragedAero is ScriptBase {
 
         ISyndicateGovernor.CoProposer[] memory none = new ISyndicateGovernor.CoProposer[](0);
 
-        // Permissive envelope: vault-level metering lands in Task 4; the e2e
-        // proposal declares the widest legal bounds.
-        ISyndicateGovernor.RiskEnvelope memory envelope =
-            ISyndicateGovernor.RiskEnvelope({maxCapital: type(uint256).max, maxDrawdownBps: 10_000});
+        // Permissive envelope = the widest LEGAL bounds. Finding 3 caps
+        // maxCapital at maxCapitalBps (default 100%) of the vault's
+        // totalAssets() at propose time, so uint256.max would revert
+        // MaxCapitalExceedsCeiling.
+        ISyndicateGovernor.RiskEnvelope memory envelope = ISyndicateGovernor.RiskEnvelope({
+            maxCapital: IERC4626(vault).totalAssets(), maxDrawdownBps: 10_000
+        });
 
         vm.startBroadcast();
         uint256 proposalId = ISyndicateGovernor(governor)

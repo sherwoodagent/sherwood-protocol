@@ -156,7 +156,7 @@ contract SyndicateGovernorTest is Test {
             address(0),
             "ipfs://test",
             duration,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             _emptyCoProposers()
@@ -195,7 +195,7 @@ contract SyndicateGovernorTest is Test {
             strategy,
             "ipfs://test",
             duration,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             _emptyCoProposers()
@@ -255,7 +255,7 @@ contract SyndicateGovernorTest is Test {
             address(0),
             "ipfs://test",
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             _emptyCoProposers()
@@ -270,7 +270,7 @@ contract SyndicateGovernorTest is Test {
             address(0),
             "ipfs://test",
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             _emptyCoProposers()
@@ -285,7 +285,7 @@ contract SyndicateGovernorTest is Test {
             address(0),
             "ipfs://test",
             MAX_STRATEGY_DURATION + 1,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             _emptyCoProposers()
@@ -300,7 +300,7 @@ contract SyndicateGovernorTest is Test {
             address(0),
             "ipfs://test",
             30 minutes,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             _emptyCoProposers()
@@ -316,7 +316,7 @@ contract SyndicateGovernorTest is Test {
             address(0),
             "ipfs://test",
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             empty,
             _simpleSettlementCalls(),
             _emptyCoProposers()
@@ -332,7 +332,7 @@ contract SyndicateGovernorTest is Test {
             address(0),
             "ipfs://test",
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _simpleExecuteCalls(),
             empty,
             _emptyCoProposers()
@@ -351,7 +351,7 @@ contract SyndicateGovernorTest is Test {
             address(0),
             "ipfs://test",
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             _emptyCoProposers()
@@ -384,7 +384,7 @@ contract SyndicateGovernorTest is Test {
             address(0),
             "ipfs://test",
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             _emptyCoProposers()
@@ -505,7 +505,7 @@ contract SyndicateGovernorTest is Test {
             address(0),
             "ipfs://dup",
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             _emptyCoProposers()
@@ -685,7 +685,7 @@ contract SyndicateGovernorTest is Test {
             address(0xBEEF), // EOA, no selfManagesFees()
             "ipfs://eoa",
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             empty
@@ -778,7 +778,7 @@ contract SyndicateGovernorTest is Test {
             address(0),
             "ipfs://test",
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             _emptyCoProposers()

@@ -180,6 +180,55 @@ contract RiskEnvelopeTest is Test {
         assertEq(maxDrawdownBps, 1200);
     }
 
+    // ── Finding 3: maxCapital ceiling (maxCapitalBps of TVL at propose) ──
+
+    function test_maxCapitalBpsDefaultsTo100Pct() public view {
+        assertEq(governor.maxCapitalBps(), 10_000);
+    }
+
+    /// @notice Vault holds 60_000e6; the default 100% ceiling rejects anything
+    ///         above totalAssets — closing the maxCapital = uint256.max hole.
+    function test_proposeRevertsAboveMaxCapitalCeiling() public {
+        vm.expectRevert(ISyndicateGovernor.MaxCapitalExceedsCeiling.selector);
+        _proposeWithEnvelope(60_000e6 + 1, 400);
+    }
+
+    /// @notice Boundary: exactly at the ceiling passes (comparison is strict >).
+    function test_proposeAcceptsMaxCapitalAtCeiling() public {
+        uint256 pid = _proposeWithEnvelope(60_000e6, 400);
+        (uint256 maxCapital,) = governor.getRiskEnvelope(pid);
+        assertEq(maxCapital, 60_000e6);
+    }
+
+    /// @notice A lowered maxCapitalBps binds at propose time.
+    function test_loweredMaxCapitalBpsBindsProposals() public {
+        vm.prank(owner);
+        governor.setMaxCapitalBps(5_000); // 50% of 60_000e6 = 30_000e6
+        assertEq(governor.maxCapitalBps(), 5_000);
+
+        vm.expectRevert(ISyndicateGovernor.MaxCapitalExceedsCeiling.selector);
+        _proposeWithEnvelope(30_000e6 + 1, 400);
+
+        uint256 pid = _proposeWithEnvelope(30_000e6, 400);
+        (uint256 maxCapital,) = governor.getRiskEnvelope(pid);
+        assertEq(maxCapital, 30_000e6);
+    }
+
+    function test_setMaxCapitalBpsRejectsOutOfBounds() public {
+        vm.startPrank(owner);
+        vm.expectRevert(ISyndicateGovernor.InvalidMaxCapitalBps.selector);
+        governor.setMaxCapitalBps(0);
+        vm.expectRevert(ISyndicateGovernor.InvalidMaxCapitalBps.selector);
+        governor.setMaxCapitalBps(10_001);
+        vm.stopPrank();
+    }
+
+    function test_setMaxCapitalBpsOnlyVaultOwner() public {
+        vm.prank(agent);
+        vm.expectRevert(ISyndicateGovernor.NotVaultOwner.selector);
+        governor.setMaxCapitalBps(5_000);
+    }
+
     /// @notice Finding 2: settlement runs under the SAME maxCapital cap as
     ///         execute. A malicious proposer who parks extraction in the
     ///         pre-committed settlementCalls (execute is benign, then

@@ -146,7 +146,7 @@ contract GovernorHardeningTest is Test {
             address(0),
             "ipfs://gh2",
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _execCalls(),
             _settleCalls(),
             cps
@@ -163,7 +163,7 @@ contract GovernorHardeningTest is Test {
             address(0),
             "ipfs://draft",
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _execCalls(),
             _settleCalls(),
             cps
@@ -242,7 +242,7 @@ contract GovernorHardeningTest is Test {
             address(0),
             "ipfs://snap",
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _execCalls(),
             _settleCalls(),
             new ISyndicateGovernor.CoProposer[](0)
@@ -339,7 +339,7 @@ contract GovernorHardeningTest is Test {
             address(0),
             "ipfs://empty",
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _execCalls(),
             _settleCalls(),
             new ISyndicateGovernor.CoProposer[](0)
@@ -425,7 +425,7 @@ contract GovernorHardeningTest is Test {
             address(0),
             "ipfs://term",
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _execCalls(),
             _settleCalls(),
             new ISyndicateGovernor.CoProposer[](0)
@@ -523,7 +523,7 @@ contract GovernorHardeningTest is Test {
             address(0),
             "ipfs://big",
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             oversized,
             _settleCalls(),
             new ISyndicateGovernor.CoProposer[](0)
@@ -542,7 +542,7 @@ contract GovernorHardeningTest is Test {
             address(0),
             "ipfs://big",
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _execCalls(),
             oversized,
             new ISyndicateGovernor.CoProposer[](0)
@@ -569,7 +569,7 @@ contract GovernorHardeningTest is Test {
             address(0),
             string(tooLong),
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _execCalls(),
             _settleCalls(),
             new ISyndicateGovernor.CoProposer[](0)
@@ -594,7 +594,7 @@ contract GovernorHardeningTest is Test {
             address(0),
             "ipfs://dup",
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _execCalls(),
             _settleCalls(),
             new ISyndicateGovernor.CoProposer[](0)
@@ -616,7 +616,7 @@ contract GovernorHardeningTest is Test {
             address(0),
             "ipfs://draft",
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _execCalls(),
             _settleCalls(),
             cps
@@ -630,7 +630,7 @@ contract GovernorHardeningTest is Test {
             address(0),
             "ipfs://pending",
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _execCalls(),
             _settleCalls(),
             new ISyndicateGovernor.CoProposer[](0)

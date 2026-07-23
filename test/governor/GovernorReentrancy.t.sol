@@ -142,7 +142,7 @@ contract GovernorReentrancyTest is Test {
             address(0),
             "ipfs://reentry",
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _execCalls(),
             _settleCalls(),
             _emptyCoProposers()

@@ -249,7 +249,7 @@ contract GuardianReviewLifecycleTest is Test {
             address(0),
             "ipfs://review-lifecycle",
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _execCalls(),
             _settleCalls(),
             _emptyCoProposers()

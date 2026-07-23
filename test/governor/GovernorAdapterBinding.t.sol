@@ -141,7 +141,7 @@ contract GovernorStrategyOnProposalTest is Test {
             strategy,
             "ipfs://test",
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _execCalls(),
             _settleCalls(),
             _emptyCoProposers()

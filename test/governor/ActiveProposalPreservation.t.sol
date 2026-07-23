@@ -232,7 +232,7 @@ contract ActiveProposalPreservationTest is Test {
             address(0),
             uri,
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _execCalls(),
             _settleCalls(),
             _emptyCoProposers()
@@ -303,7 +303,7 @@ contract ActiveProposalPreservationTest is Test {
             address(0),
             "ipfs://B",
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _execCalls(),
             _settleCalls(),
             _emptyCoProposers()
@@ -327,7 +327,7 @@ contract ActiveProposalPreservationTest is Test {
             address(0),
             "ipfs://B",
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _execCalls(),
             _settleCalls(),
             _emptyCoProposers()
@@ -349,7 +349,7 @@ contract ActiveProposalPreservationTest is Test {
             address(0),
             "ipfs://B",
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _execCalls(),
             _settleCalls(),
             _emptyCoProposers()

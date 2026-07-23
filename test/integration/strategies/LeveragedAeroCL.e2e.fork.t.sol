@@ -291,7 +291,7 @@ contract LeveragedAeroCLE2EFork is LeveragedAeroForkBase {
             address(strategy),
             "ipfs://e2e",
             STRATEGY_DURATION,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             exec,
             settle,
             _noCoProposers()

@@ -155,7 +155,7 @@ contract FeeBlacklistResilienceTest is Test {
             address(0),
             "ipfs://test",
             duration,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _noopCalls(),
             _noopCalls(),
             coProps

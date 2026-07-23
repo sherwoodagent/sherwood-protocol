@@ -223,7 +223,7 @@ contract OpenProposalCountTest is Test {
             address(0),
             "ipfs://open-count",
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _execCalls(),
             _settleCalls(),
             _emptyCoProposers()
@@ -548,7 +548,7 @@ contract OpenProposalCountTest is Test {
             address(0),
             "ipfs://collab",
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _execCalls(),
             _settleCalls(),
             coProps
@@ -596,7 +596,7 @@ contract OpenProposalCountTest is Test {
             address(0),
             "ipfs://collab-reject",
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _execCalls(),
             _settleCalls(),
             coProps
@@ -634,7 +634,7 @@ contract OpenProposalCountTest is Test {
             address(0),
             "ipfs://draft-emerg",
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _execCalls(),
             _settleCalls(),
             coProps
@@ -665,7 +665,7 @@ contract OpenProposalCountTest is Test {
             address(0),
             "ipfs://draft-emerg-2",
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _execCalls(),
             _settleCalls(),
             _emptyCoProposers()
@@ -695,7 +695,7 @@ contract OpenProposalCountTest is Test {
             address(0),
             "ipfs://draft-lock",
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _execCalls(),
             _settleCalls(),
             coProps

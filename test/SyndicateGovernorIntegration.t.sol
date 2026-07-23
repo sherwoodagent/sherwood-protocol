@@ -152,7 +152,7 @@ contract SyndicateGovernorIntegrationTest is Test {
             address(0),
             "ipfs://test",
             duration,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             executeCalls,
             settlementCalls,
             _emptyCoProposers()
@@ -235,7 +235,7 @@ contract SyndicateGovernorIntegrationTest is Test {
             address(0),
             "ipfs://test",
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             execCalls,
             settleCalls,
             _emptyCoProposers()

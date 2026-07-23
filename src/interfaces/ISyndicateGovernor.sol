@@ -198,6 +198,13 @@ interface ISyndicateGovernor {
     /// @notice Revert if `envelope.maxCapital == 0` at propose — a zero
     ///         net-outflow ceiling would make every execute batch unfundable.
     error ZeroMaxCapital();
+    /// @notice Revert if `envelope.maxCapital` exceeds the governor's ceiling
+    ///         (`totalAssets() * maxCapitalBps / 10_000` at propose time).
+    ///         Without this, a proposer declares maxCapital = uint256.max and
+    ///         the net-outflow cap never binds (finding 3).
+    error MaxCapitalExceedsCeiling();
+    /// @notice `setMaxCapitalBps` called with 0 or a value above 10_000.
+    error InvalidMaxCapitalBps();
     /// @notice Revert if `envelope.maxDrawdownBps > 10_000` at propose — a
     ///         drawdown declaration cannot exceed 100% of committed capital.
     error InvalidDrawdown();
@@ -419,6 +426,12 @@ interface ISyndicateGovernor {
     function setCooldownPeriod(uint256 newCooldownPeriod) external;
     function setCollaborationWindow(uint256 newCollaborationWindow) external;
     function setMaxCoProposers(uint256 newMaxCoProposers) external;
+    /// @notice Set the ceiling on `envelope.maxCapital`, in bps of the vault's
+    ///         `totalAssets()` at propose time. Bounds: 1..10_000.
+    function setMaxCapitalBps(uint256 newMaxCapitalBps) external;
+    /// @notice Effective maxCapital ceiling in bps of TVL (10_000 = 100%, the
+    ///         default when never set).
+    function maxCapitalBps() external view returns (uint256);
     function setProtocolConfig(address newConfig) external;
     /// @notice Wire the tier registry (spec §3.2). Factory-only, like
     ///         `setProtocolConfig`. address(0) un-wires: every proposal then

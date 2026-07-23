@@ -147,7 +147,7 @@ contract CancelProposalTest is Test {
             address(0),
             "ipfs://test",
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _execCalls(),
             _settleCalls(),
             _emptyCoProposers()
@@ -219,7 +219,7 @@ contract CancelProposalTest is Test {
             address(0),
             "ipfs://retry",
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _execCalls(),
             _settleCalls(),
             _emptyCoProposers()

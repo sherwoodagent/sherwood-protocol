@@ -256,7 +256,7 @@ abstract contract RobinhoodIntegrationTest is Test {
             address(0),
             "ipfs://rh-testnet-test",
             duration,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             execCalls,
             settleCalls,
             _emptyCoProposers()

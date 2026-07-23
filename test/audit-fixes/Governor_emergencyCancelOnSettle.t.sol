@@ -226,7 +226,7 @@ contract Governor_emergencyCancelOnSettle_Test is Test {
             address(0),
             "ipfs://emergency-cancel",
             duration,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _execCalls(),
             _settleCalls(),
             _emptyCoProposers()

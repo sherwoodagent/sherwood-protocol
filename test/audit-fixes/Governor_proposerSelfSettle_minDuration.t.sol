@@ -133,7 +133,7 @@ contract Governor_proposerSelfSettle_minDuration_Test is Test {
             address(0),
             "ipfs://self-settle",
             STRATEGY_DURATION,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _execCalls(),
             _settleCalls(),
             _emptyCoProposers()

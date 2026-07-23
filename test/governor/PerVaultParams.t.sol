@@ -121,7 +121,7 @@ contract PerVaultParamsTest is Test {
             address(0),
             "ipfs://test",
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _noopCalls(),
             _noopCalls(),
             new ISyndicateGovernor.CoProposer[](0)

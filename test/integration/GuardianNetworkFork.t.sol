@@ -400,7 +400,7 @@ contract GuardianNetworkForkTest is Test {
             strategy,
             "ipfs://guardian-network-fork-test",
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             execCalls,
             settleCalls,
             new ISyndicateGovernor.CoProposer[](0)

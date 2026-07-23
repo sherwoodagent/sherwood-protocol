@@ -162,7 +162,7 @@ contract CollaborativeProposalsTest is Test {
             address(0),
             "ipfs://collab",
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             coProps
@@ -204,7 +204,7 @@ contract CollaborativeProposalsTest is Test {
             address(0),
             "ipfs://solo",
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             _emptyCoProposers()
@@ -226,7 +226,7 @@ contract CollaborativeProposalsTest is Test {
             address(0),
             "ipfs://solo",
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             _emptyCoProposers()
@@ -454,7 +454,7 @@ contract CollaborativeProposalsTest is Test {
             address(0),
             "ipfs://round",
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             coProps
@@ -527,7 +527,7 @@ contract CollaborativeProposalsTest is Test {
             address(0),
             "ipfs://tiny",
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             coProps
@@ -612,7 +612,7 @@ contract CollaborativeProposalsTest is Test {
             address(0),
             "ipfs://test",
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             coProps
@@ -630,7 +630,7 @@ contract CollaborativeProposalsTest is Test {
             address(0),
             "ipfs://test",
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             coProps
@@ -664,7 +664,7 @@ contract CollaborativeProposalsTest is Test {
             address(0),
             "ipfs://test",
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             coProps
@@ -682,7 +682,7 @@ contract CollaborativeProposalsTest is Test {
             address(0),
             "ipfs://test",
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             coProps
@@ -701,7 +701,7 @@ contract CollaborativeProposalsTest is Test {
             address(0),
             "ipfs://test",
             7 days,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             coProps

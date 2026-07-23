@@ -214,7 +214,7 @@ contract VaultSolvencyHandler is Test {
             address(0),
             "ipfs://test",
             strategyDuration,
-            GovEnvelope.permissive(),
+            GovEnvelope.permissive(address(vault)),
             calls,
             calls,
             new ISyndicateGovernor.CoProposer[](0)
