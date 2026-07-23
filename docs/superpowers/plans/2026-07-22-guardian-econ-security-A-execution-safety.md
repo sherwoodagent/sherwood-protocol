@@ -8,7 +8,9 @@
 
 **Tech Stack:** Solidity 0.8.28, Foundry (forge test/fmt), OpenZeppelin Ownable2Step. Repo conventions: custom errors, extensive natspec with finding-tags, tests in `test/*.t.sol`.
 
-**Sequencing:** This is Plan A of three. Plan B (aggregate exposure cap in GuardianRegistry/StakedWood, consumes `requiredCoverage` stored here) and Plan C (challenge game + adjudication + submitter bond escrow) follow after A lands. A is independently shippable: it hard-bounds what any proposal can move, before any liability machinery exists.
+**Sequencing:** This is Plan A, covering the spec's **v1a** phase (execution-side loss bounds, no new trust). It hard-bounds what any proposal can move before any liability machinery exists. Plan B covers the rest of v1a + v1b (dollar-denominated aggregate exposure cap with `slashableBond` as defined in spec §3.3, explicit approve quorum §3.3a, risk-scaled proposer bond §3.9, covered-TVL cap + multi-collateral §3.7, then the authorized-slasher entrypoint + compensation escrow §3.8 + challenge game §3.4 + approver reward §3.10). Plan C covers v1c (pre-exploit/pre-accumulation voting snapshot + two-layer court §3.5).
+
+**Post-review note (review #4759928193):** the spec was revised after review; the two findings that touch Plan A's surface are (a) "reuses existing slash rails" was corrected — the per-proposal outflow meter and tier resolution here ARE new subsystems, not reuse, and this plan already treats them as such; (b) `requiredCoverage` produced here is consumed by Plan B's cap, which measures it in DOLLARS at a price haircut, not WOOD — this plan only stores the extractable-value figure, unit conversion lives in Plan B.
 
 **Storage caution:** `StrategyProposal` gains fields — append at the END of the struct only. Governors are beacon-upgraded; run the repo's storage-parity check after every struct change. If the parity check fails the layout, stop and surface — do not reorder existing fields.
 
@@ -675,8 +677,8 @@ git commit -m "feat: e2e tier lifecycle test + TierRegistry deploy wiring"
 
 ## Explicitly OUT of Plan A (comes next)
 
-- **Plan B:** aggregate exposure cap — GuardianRegistry consumes `getRequiredCoverage` at `voteOnProposal` (approve side), per-tier `k` params, unstake-queue earmark of open exposure in StakedWood.
-- **Plan C:** challenge game (predicates, bonds, per-proposal freeze), two-layer adjudication (panel + WOOD-vote appeal with pre-exploit snapshot), submitter bond escrow, slash-to-victims routing.
+- **Plan B (rest of v1a + v1b):** dollar-denominated aggregate exposure cap — GuardianRegistry consumes `getRequiredCoverage` at `voteOnProposal` (approve side), `slashableBond(g)` = own + delegated-at-`maxDelegatedSlashBps`-haircut, all × `priceHaircut` (spec §3.3); explicit bond-encumbered approve quorum replacing optimistic passage for coverage-consuming proposals + cold-start expiry (spec §3.3a); risk-scaled proposer bond (spec §3.9); covered-TVL cap + multi-collateral bond legs for over-budget vaults (spec §3.7); authorized-slasher entrypoint on StakedWood routing to the compensation escrow (spec §4); compensation escrow with pre-drain holder snapshot (spec §3.8, the F1 fix); challenge game with rotation-resistant drawdown key (spec §3.4); coverage-weighted approver reward (spec §3.10).
+- **Plan C (v1c):** two-layer adjudication — panel + WOOD-vote appeal with pre-exploit AND pre-accumulation-hardened snapshot, restructured panel bond (bad-faith track, participation floor) (spec §3.5).
 - Per-adapter valuation guards beyond codehash (balance-delta invariant with manipulation-resistant TWAP, oracle staleness, `paused()` probes) — per-adapter engineering; the first concrete instance ships with the first real tier-0 certification.
 
 ## Self-review notes
