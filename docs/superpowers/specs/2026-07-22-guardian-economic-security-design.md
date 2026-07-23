@@ -18,6 +18,7 @@ remediates all of them:
 - **F5** temporal netting → unstake delay covers the challenge window (§3.3). ALL the salami/drawdown machinery this finding prompted — rolling-drawdown predicate, cross-vault accumulators, 30d lock, AND the per-vault per-epoch outflow cap — was **removed by decision** (2026-07-22). Slow-bleed has no on-chain protection in v1; it is an accepted, monitoring-only residual (§7, §8).
 - **F6** court capture / non-independent layers → pre-accumulation defense + panel-bond restructure (§3.5).
 - **Precision:** `slashableBond` defined (§3.3); §1 "equally" corrected; "reuses slash rails" framing corrected and authorized-slasher entrypoint made explicit (§4); `refundSlash` fate stated (§4).
+- **2026-07-23 — epoch-based renewable coverage (§3.4a).** Long-duration strategies exposed a timing gap: predicate 5 needs settlement PnL, but guardian stake recycled at the challenge window, so strategies longer than ~2 weeks structurally escaped the drawdown predicate — and locking stake to settlement was a non-starter. Resolved via per-epoch NAV mark-to-market + claims-made attribution + renew-or-wind-down (deep-research-backed: PFMI variation margin, IRMI claims-made chaining, Nexus Mutual pooled cover, reinsurance LPT). Guardian commitment now bounded at one epoch + challenge window regardless of strategy duration. Plan B's exposure ledger must build epoch semantics from day one.
 
 ## 1. Problem
 
@@ -197,10 +198,14 @@ Guardian-level invariant, checked at `voteOnProposal` (approve side):
   covers sequential proposals across many vaults; it blocks *simultaneous*
   over-exposure — the batching attack (approve N drains in one window, lose one
   bond once).
-- **Temporal exposure.** "Open" = until the challenge window (§3.4) has elapsed.
-  Unstake delay ≥ the challenge window (§5), so a guardian cannot approve and
-  unstake before its approvals can be challenged. (v1 does not track cumulative
-  cross-proposal drawdown — see the accepted salami risk in §8.)
+- **Temporal exposure — epoch-bounded.** A guardian's commitment per approval
+  is bounded by ONE coverage epoch plus its challenge window (~5–6 weeks at
+  initial parameters), **regardless of strategy duration** — never the
+  strategy's lifetime (mechanism: §3.4a). "Open" exposure = the current epoch's
+  coverage until that epoch's challenge window (§3.4) has elapsed. Unstake
+  delay ≥ epoch + challenge window (§5), so a guardian cannot approve and
+  unstake before that epoch's approvals can be challenged. (v1 does not track
+  cumulative cross-proposal drawdown — see the accepted salami risk in §8.)
 
 ### 3.3a Explicit approve quorum (F3)
 
@@ -231,9 +236,15 @@ Post-execution challenge window. Anyone may post a bonded challenge citing
 2. Execution price deviation beyond bound vs manipulation-resistant oracle.
 3. Outflow destination linkable to the proposer (funding-graph predicate).
 4. Allowance/ownership granted to a non-protocol address.
-5. **Single-proposal drawdown breach:** a proposal whose realized loss exceeds
-   its own declared `maxDrawdownBps` (§3.1). This gives the per-proposal envelope
-   teeth for one bad proposal; it is NOT an aggregate/rolling accumulator. v1
+5. **Single-proposal drawdown breach, evaluated per epoch:** a proposal whose
+   NAV-checkpointed loss (§3.4a) exceeds its declared `maxDrawdownBps` (§3.1).
+   Short strategies (settling within one epoch) are evaluated once at
+   settlement; long strategies are evaluated at every epoch checkpoint against
+   the cumulative loss to date, so a breach surfaces in the epoch where it
+   happens rather than at final settlement — and the liability lands on that
+   epoch's covering guardians (claims-made attribution, §3.4a). Void when the
+   envelope is 10_000 (passive-beta mandate). This gives the per-proposal
+   envelope teeth; it is NOT an aggregate cross-proposal accumulator. v1
    deliberately ships no cumulative cross-proposal or cross-vault drawdown
    predicate (the slow-bleed "salami" attack is an accepted risk — §8).
 
@@ -253,6 +264,62 @@ Flow:
   Sherwood forensic agents run the predicate monitor as a funded protocol role
   (feeding SGRD reputation), plus a first-detector bounty sized to cover forensic
   cost. Health metric: a live challenge game shows filings, not silence.
+
+### 3.4a Epoch-based renewable coverage (long-duration strategies)
+
+**The problem.** Predicate 5 needs realized PnL, which for a long strategy only
+exists at settlement — months after the approving guardians' challenge window
+closed and their stake recycled. Locking stake until settlement is a
+non-starter (no guardian locks a year per approval; recycling is the capacity
+model). Freeing it at the challenge window makes predicate 5 unenforceable for
+any strategy longer than that window.
+
+**The mechanism** (prior art: CCP variation margin / PFMI Principle 6 — daily
+mark-to-market collapses multi-year exposure into daily windows; insurance
+claims-made triggers with a preserved retroactive date — a chain of short
+policies is equivalent to one continuous policy; Nexus Mutual's pooled
+burn-at-claim-time cover; reinsurance loss-portfolio transfer):
+
+- **Coverage epochs.** A strategy whose duration exceeds one epoch runs in
+  consecutive coverage epochs (initial length §5). At each epoch boundary the
+  vault's NAV for the strategy is **checkpointed** using the same
+  manipulation-resistant valuation the guards and settlement already require.
+- **Per-epoch evaluation.** The drawdown envelope is evaluated at every
+  checkpoint against cumulative loss to date (predicate 5). A breach surfaces
+  in the epoch it occurs — the liability no longer waits for settlement.
+- **Claims-made attribution.** Liability for a breach surfacing in epoch N
+  attaches to the guardians **covering epoch N** — not to the original
+  approvers of epoch 1 (who may have exited). The chain of epoch covers,
+  each answering for what surfaces on its watch, provides continuous coverage
+  of the whole strategy with no individual commitment longer than one epoch +
+  challenge window.
+- **Renewal.** Before each boundary, coverage for the next epoch must be
+  committed: incumbent guardians roll over, or new guardians take over at a
+  freshly priced premium (§3.10 prices per epoch, so risk that emerged
+  mid-strategy is repriced rather than hidden behind the original approval).
+  **Renewal commits BEFORE the boundary checkpoint's NAV is revealed** — the
+  exit-run failure mode (dump coverage the moment bad news is visible) is
+  closed by sequencing, not trust.
+- **No renewal → forced wind-down.** If no guardian set commits coverage for
+  the next epoch, the strategy must settle/unwind at the checkpoint — the
+  clearinghouse close-out rule. An uninsurable strategy does not continue
+  uncovered; expiring coverage converts to an orderly exit, never a gap.
+- **Mid-epoch exit (v2).** A guardian may transfer an open epoch position to a
+  successor whose bond genuinely bears the risk (the loss-portfolio-transfer
+  rule: real risk transfer required, no wash-transfers to empty shells).
+  Deferred to v2 — v1 guardians simply hold to the epoch boundary, which the
+  short epoch makes tolerable.
+
+**Consequences.** (a) Guardian commitment is bounded at epoch + challenge
+window regardless of strategy duration — the 1-year-lock objection is
+structural, not parametric. (b) Declaring a real envelope becomes cheap to
+underwrite (one epoch of drawdown risk, not a strategy-lifetime tail), removing
+the incentive for every proposer to declare 10_000. (c) Passive-mandate
+strategies (envelope 10_000, §3.1) skip per-epoch envelope evaluation entirely —
+their epochs still checkpoint NAV (feeds §6 monitoring) but carry no
+predicate-5 liability, so their renewal is a formality priced near zero.
+(d) Adverse-selection repricing at renewal is a feature: a strategy that got
+riskier pays more mid-life.
 
 ### 3.5 Adjudication
 
@@ -536,7 +603,8 @@ before v1a ships:
 | `priceHaircut` (WOOD→USD) | conservative, ≤ 30-day-low | robust to a coordinated WOOD drawdown |
 | Covered-TVL cap per vault | Σ slashableBond · priceHaircut | hard ceiling in v1 (WOOD-only); v2 multi-collateral lifts it |
 | Challenge window | 14d tier-2, 7d tier-0/1 | shorter window recycles coverage faster |
-| Unstake / exposure-open delay | ≥ challenge window | guardian can't unstake before its approvals can be challenged |
+| Coverage epoch (long strategies) | 28d | NAV checkpoint + envelope evaluation + renewal each boundary (§3.4a) |
+| Unstake / exposure-open delay | ≥ epoch + challenge window | guardian can't unstake before its epoch's approvals can be challenged |
 | Challenger bond | scales with frozen exposure | griefing deterrent |
 | Proposer bond | fraction of `maxExtractable` | first-loss, → compensation escrow |
 | Approver reward | coverage-weighted premium | target ROE clears tail-risk hurdle |
