@@ -132,9 +132,13 @@ contract TierEndToEndTest is Test {
 
     // ── Helpers (mirroring test/governor/TierResolution.t.sol) ──
 
-    /// @dev Wires the TierRegistry into the governor (test contract is factory).
+    /// @dev Wires the TierRegistry into the governor (test contract is factory)
+    ///      and allowlists the adapter so the vault's value-moving-selector
+    ///      guard (findings 1+7) passes the batch's approve — with a wired
+    ///      registry, onboarding an adapter now means certify + allowlist.
     function _wireTierRegistry() internal {
         governor.setTierRegistry(address(tierRegistry));
+        tierRegistry.setAdapterAllowed(address(adapter), true);
     }
 
     function _settleCalls() internal view returns (BatchExecutorLib.Call[] memory calls) {

@@ -35,6 +35,14 @@ contract TierRegistry is Ownable2Step {
 
     mapping(bytes32 configKey => TierConfig) private _configs;
 
+    /// @notice Owner-managed allowlist of adapter addresses that may appear as
+    ///         the spender/recipient of value-moving ERC20 calls inside a
+    ///         governor batch (see `SyndicateVault._guardBatchCalls`). A
+    ///         separate axis from (target, selector) tier certification: tiers
+    ///         PRICE extractable value for coverage; this list bounds WHERE
+    ///         vault funds may be approved or sent at all.
+    mapping(address adapter => bool) private _adapterAllowed;
+
     constructor(address initialOwner) Ownable(initialOwner) {}
 
     function key(address target, bytes4 selector) public pure returns (bytes32) {
@@ -55,6 +63,7 @@ contract TierRegistry is Ownable2Step {
         address indexed target, bytes4 indexed selector, uint8 tier, uint16 extractableBoundBps, bytes32 codehash
     );
     event TierDemoted(address indexed target, bytes4 indexed selector);
+    event AdapterAllowedSet(address indexed adapter, bool allowed);
 
     error InvalidTier();
     error BoundRequired();
@@ -92,5 +101,21 @@ contract TierRegistry is Ownable2Step {
     function _demote(address target, bytes4 selector) private {
         delete _configs[key(target, selector)];
         emit TierDemoted(target, selector);
+    }
+
+    // ── Adapter allowlist (spender/recipient gate for value-moving selectors) ──
+
+    /// @notice Allow or disallow `adapter` as the spender/recipient of
+    ///         value-moving ERC20 calls (approve / increaseAllowance /
+    ///         transfer / transferFrom-out) inside governor batches.
+    function setAdapterAllowed(address adapter, bool allowed) external onlyOwner {
+        _adapterAllowed[adapter] = allowed;
+        emit AdapterAllowedSet(adapter, allowed);
+    }
+
+    /// @notice True when `adapter` may receive approvals/transfers of vault
+    ///         funds through a governor batch.
+    function isAdapterAllowed(address adapter) external view returns (bool) {
+        return _adapterAllowed[adapter];
     }
 }

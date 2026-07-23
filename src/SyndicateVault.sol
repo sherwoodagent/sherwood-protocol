@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import {ISyndicateVault} from "./interfaces/ISyndicateVault.sol";
 import {ISyndicateGovernor} from "./interfaces/ISyndicateGovernor.sol";
+import {ITierRegistry} from "./interfaces/ITierRegistry.sol";
 import {IProposalStatus} from "./interfaces/IProposalStatus.sol";
 import {FeeConstants} from "./FeeConstants.sol";
 import {ISyndicateFactory} from "./interfaces/ISyndicateFactory.sol";
@@ -85,6 +86,13 @@ contract SyndicateVault is
 
     /// @notice Cap on the owner-set idle-liquidity floor (50%).
     uint256 private constant MAX_MIN_BUFFER_BPS = 5_000;
+
+    // ── Value-moving ERC20 selectors guarded in governor batches ──
+    // (see `_guardBatchCalls`; findings 1+7 of the economic-security review)
+    bytes4 private constant _SEL_APPROVE = 0x095ea7b3; // approve(address,uint256)
+    bytes4 private constant _SEL_INCREASE_ALLOWANCE = 0x39509351; // increaseAllowance(address,uint256)
+    bytes4 private constant _SEL_TRANSFER = 0xa9059cbb; // transfer(address,uint256)
+    bytes4 private constant _SEL_TRANSFER_FROM = 0x23b872dd; // transferFrom(address,address,uint256)
 
     // ==================== STORAGE ====================
 
@@ -424,6 +432,7 @@ contract SyndicateVault is
         whenNotPaused
     {
         if (_executorImpl.codehash != _expectedExecutorCodehash) revert ExecutorCodehashMismatch();
+        _guardBatchCalls(calls);
         uint256 balanceBefore = IERC20(asset()).balanceOf(address(this));
         (bool success, bytes memory returnData) =
             _executorImpl.delegatecall(abi.encodeCall(BatchExecutorLib.executeBatch, (calls)));
@@ -457,6 +466,69 @@ contract SyndicateVault is
         // Idle-liquidity floor: a batch may deploy at most (1 − minBufferBps)
         // of the pre-batch float. Inflow (settle) batches pass trivially.
         if (balanceAfter < reserve + (balanceBefore * minBufferBps) / 10_000) revert BufferBreached();
+    }
+
+    /// @dev Value-moving-selector allowlist gate (economic-security findings 1+7).
+    ///
+    ///      WHY: the net-outflow meter above only sees the vault's own asset()
+    ///      balance delta. `token.approve(attacker, max)` moves no balance, so
+    ///      it metered zero and the attacker drained via `transferFrom` in a
+    ///      later tx — for the vault asset AND any other ERC20 the vault holds.
+    ///
+    ///      WHAT: the batch runs via delegatecall, so external targets see
+    ///      msg.sender == vault; a plain call to an arbitrary target cannot
+    ///      exfiltrate ERC20 funds UNLESS the vault approves it or transfers to
+    ///      it. Gating the spender/recipient of the four value-moving ERC20
+    ///      selectors is therefore a complete bound on ERC20 exfiltration
+    ///      without a full target allowlist: for approve / increaseAllowance /
+    ///      transfer the guarded address is arg 1 (calldata bytes 4..36); for
+    ///      transferFrom it is `to`, arg 2 (bytes 36..68) — pulling INTO the
+    ///      vault (to == vault) is an inflow and always passes. The address
+    ///      must be the vault itself or an adapter allowlisted in the
+    ///      TierRegistry (resolved through the calling governor). Runs on EVERY
+    ///      governor batch — execute, settlement, and both emergency paths —
+    ///      since settlement calls are arbitrary, pre-committed calldata too.
+    ///
+    ///      RESIDUAL (honest limits): exotic assets are NOT yet guarded —
+    ///      ERC721 `setApprovalForAll` (0xa22cb465) / `approve`, ERC1155, and
+    ///      LP-position NFTs. Add their selectors to this guarded set as those
+    ///      adapters are onboarded; until then such holdings rely on tier-2
+    ///      full-notional pricing + Plan B's approve quorum. A selector-
+    ///      colliding non-ERC20 function on some adapter is gated (or reverts
+    ///      `MalformedCall`) conservatively.
+    ///
+    ///      UNSET REGISTRY: if the governor has no tier registry wired (or
+    ///      predates the getter), the guard cannot run and the batch is
+    ///      UNguarded by design — the v1 default is tier-2 / full-notional
+    ///      pricing anyway, and hard-reverting would brick vaults deployed
+    ///      without a registry.
+    function _guardBatchCalls(BatchExecutorLib.Call[] calldata calls) private view {
+        // onlyGovernor holds, so msg.sender IS the governor. staticcall (not a
+        // typed call) so a governor without the getter degrades to "unset".
+        (bool ok, bytes memory ret) = msg.sender.staticcall(abi.encodeCall(ISyndicateGovernor.tierRegistry, ()));
+        if (!ok || ret.length != 32) return;
+        address registry = abi.decode(ret, (address));
+        if (registry == address(0)) return;
+
+        for (uint256 i = 0; i < calls.length; i++) {
+            bytes calldata data = calls[i].data;
+            if (data.length < 4) continue;
+            bytes4 sel = bytes4(data[0:4]);
+            address recipient;
+            if (sel == _SEL_APPROVE || sel == _SEL_INCREASE_ALLOWANCE || sel == _SEL_TRANSFER) {
+                if (data.length < 36) revert MalformedCall();
+                recipient = address(uint160(uint256(bytes32(data[4:36]))));
+            } else if (sel == _SEL_TRANSFER_FROM) {
+                if (data.length < 68) revert MalformedCall();
+                recipient = address(uint160(uint256(bytes32(data[36:68]))));
+            } else {
+                continue;
+            }
+            if (recipient == address(this)) continue;
+            if (!ITierRegistry(registry).isAdapterAllowed(recipient)) {
+                revert DisallowedTransferTarget(calls[i].target, sel, recipient);
+            }
+        }
     }
 
     /// @inheritdoc ISyndicateVault

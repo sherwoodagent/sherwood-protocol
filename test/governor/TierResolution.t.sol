@@ -102,9 +102,14 @@ contract TierResolutionTest is Test {
         vm.warp(vm.getBlockTimestamp() + 1);
     }
 
-    /// @dev Wires the TierRegistry into the governor (test contract is factory).
+    /// @dev Wires the TierRegistry into the governor (test contract is factory)
+    ///      and allowlists the harness targets so the vault's value-moving-
+    ///      selector guard (findings 1+7) passes their approve calls — with a
+    ///      wired registry, onboarding an adapter now means certify + allowlist.
     function _wireTierRegistry() internal {
         governor.setTierRegistry(address(tierRegistry));
+        tierRegistry.setAdapterAllowed(address(mockAdapter), true);
+        tierRegistry.setAdapterAllowed(address(usdc), true);
     }
 
     function _settleCalls() internal view returns (BatchExecutorLib.Call[] memory calls) {

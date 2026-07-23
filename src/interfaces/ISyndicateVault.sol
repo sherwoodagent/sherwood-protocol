@@ -57,6 +57,14 @@ interface ISyndicateVault {
     /// @notice The batch's net asset outflow exceeded the proposal's declared
     ///         maxCapital (risk envelope, spec 2026-07-22 §3.1).
     error MaxNetOutflowExceeded(uint256 netOutflow, uint256 cap);
+    /// @notice A governor-batch call carries a value-moving ERC20 selector
+    ///         (approve / increaseAllowance / transfer / transferFrom) whose
+    ///         spender/recipient is neither the vault itself nor an adapter
+    ///         allowlisted in the TierRegistry.
+    error DisallowedTransferTarget(address target, bytes4 selector, address recipient);
+    /// @notice A governor-batch call carries a guarded value-moving selector but
+    ///         its calldata is too short to hold the spender/recipient argument.
+    error MalformedCall();
 
     // ── Init Params ──
     struct InitParams {
