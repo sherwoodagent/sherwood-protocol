@@ -417,7 +417,7 @@ contract SyndicateVault is
     ///      different library.
     /// @dev I-11: gated by `whenNotPaused`. When the owner pauses the vault,
     ///      strategy execution is halted alongside LP flow.
-    function executeGovernorBatch(BatchExecutorLib.Call[] calldata calls)
+    function executeGovernorBatch(BatchExecutorLib.Call[] calldata calls, uint256 maxNetOutflow)
         external
         onlyGovernor
         nonReentrant
@@ -441,6 +441,11 @@ contract SyndicateVault is
         // later proposal cannot strand them. Settle batches return float and
         // pass trivially; an execute batch that over-deploys reverts here.
         uint256 balanceAfter = IERC20(asset()).balanceOf(address(this));
+        // Spec 2026-07-22 §3.1: custody-level net-outflow ceiling. Inflow
+        // batches (settle) pass trivially; the governor passes the proposal's
+        // maxCapital on execute and type(uint256).max on settle paths.
+        uint256 netOutflow = balanceBefore > balanceAfter ? balanceBefore - balanceAfter : 0;
+        if (netOutflow > maxNetOutflow) revert MaxNetOutflowExceeded(netOutflow, maxNetOutflow);
         uint256 reserve = reservedQueueAssets();
         if (balanceAfter < reserve) revert QueueReserveBreached();
         // Idle-liquidity floor: a batch may deploy at most (1 − minBufferBps)

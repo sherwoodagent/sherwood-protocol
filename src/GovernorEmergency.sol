@@ -58,7 +58,8 @@ abstract contract GovernorEmergency is ISyndicateGovernor {
         _requireVaultOwner(p.vault);
         if (p.state != ProposalState.Executed) revert ProposalNotExecuted();
         if (block.timestamp < p.executedAt + p.strategyDuration) revert StrategyDurationNotElapsed();
-        ISyndicateVault(p.vault).executeGovernorBatch(_getSettlementCalls(proposalId));
+        // Settlement returns funds — the outflow cap is disabled on unwind paths.
+        ISyndicateVault(p.vault).executeGovernorBatch(_getSettlementCalls(proposalId), type(uint256).max);
         _finishSettlementHook(proposalId, p);
     }
 
@@ -104,7 +105,8 @@ abstract contract GovernorEmergency is ISyndicateGovernor {
         (bool blocked, BatchExecutorLib.Call[] memory calls) = reg.finalizeEmergency(proposalId);
         if (blocked) revert EmergencySettleBlocked();
 
-        ISyndicateVault(p.vault).executeGovernorBatch(calls);
+        // Emergency settlement returns funds — the outflow cap is disabled.
+        ISyndicateVault(p.vault).executeGovernorBatch(calls, type(uint256).max);
         (int256 pnl,) = _finishSettlementHook(proposalId, p);
         emit EmergencySettleFinalized(proposalId, pnl);
     }

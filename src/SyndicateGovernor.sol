@@ -382,8 +382,9 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // Executed -> Settled edge in `_finishSettlement`. `_activeProposal`
         // also guards the Executed window (see `requestUnstakeOwner`).
 
-        // Execute the opening calls via the vault
-        ISyndicateVault(vault).executeGovernorBatch(_loadCalls(_executeCalls, proposalId));
+        // Execute the opening calls via the vault. The risk envelope's
+        // maxCapital caps the batch's net asset outflow (spec 2026-07-22 §3.1).
+        ISyndicateVault(vault).executeGovernorBatch(_loadCalls(_executeCalls, proposalId), proposal.maxCapital);
 
         emit ProposalExecuted(proposalId, vault, balanceBefore);
     }
@@ -400,8 +401,10 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             revert StrategyDurationNotElapsed();
         }
 
-        // Run the pre-committed settlement calls
-        ISyndicateVault(proposal.vault).executeGovernorBatch(_loadCalls(_settlementCalls, proposalId));
+        // Run the pre-committed settlement calls. Settlement returns funds —
+        // capping it would brick unwinding, so the outflow cap is disabled.
+        ISyndicateVault(proposal.vault)
+            .executeGovernorBatch(_loadCalls(_settlementCalls, proposalId), type(uint256).max);
 
         _finishSettlement(proposalId, proposal);
     }

@@ -54,6 +54,9 @@ interface ISyndicateVault {
     /// @notice The active strategy's `withdrawTo` delivered fewer assets than
     ///         requested (balance-diff verified vault-side).
     error UnwindShortfall();
+    /// @notice The batch's net asset outflow exceeded the proposal's declared
+    ///         maxCapital (risk envelope, spec 2026-07-22 §3.1).
+    error MaxNetOutflowExceeded(uint256 netOutflow, uint256 cap);
 
     // ── Init Params ──
     struct InitParams {
@@ -94,7 +97,7 @@ interface ISyndicateVault {
     function factory() external view returns (address);
 
     // ── Governor ──
-    function executeGovernorBatch(BatchExecutorLib.Call[] calldata calls) external;
+    function executeGovernorBatch(BatchExecutorLib.Call[] calldata calls, uint256 maxNetOutflow) external;
     function owner() external view returns (address);
     function transferPerformanceFee(address asset, address to, uint256 amount) external;
     function governor() external view returns (address);

@@ -229,7 +229,7 @@ contract SyndicateFactoryTest is Test {
         });
 
         vm.prank(factory.governorOf(vaultAddr));
-        vault.executeGovernorBatch(calls);
+        vault.executeGovernorBatch(calls, type(uint256).max);
 
         // Verify: vault set the approval (delegatecall)
         assertEq(usdc.allowance(vaultAddr, makeAddr("protocol")), 1_000e6);
