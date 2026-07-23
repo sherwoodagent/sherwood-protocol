@@ -10,6 +10,7 @@ import {SyndicateGovernor} from "../src/SyndicateGovernor.sol";
 import {ISyndicateGovernor} from "../src/interfaces/ISyndicateGovernor.sol";
 import {GovernorBeacon} from "../src/GovernorBeacon.sol";
 import {ProtocolConfig} from "../src/ProtocolConfig.sol";
+import {TierRegistry} from "../src/TierRegistry.sol";
 import {VaultWithdrawalQueue} from "../src/queue/VaultWithdrawalQueue.sol";
 import {IGuardianRegistry} from "../src/interfaces/IGuardianRegistry.sol";
 import {IStakedWood} from "../src/interfaces/IStakedWood.sol";
@@ -229,7 +230,7 @@ contract SyndicateFactoryTest is Test {
         });
 
         vm.prank(factory.governorOf(vaultAddr));
-        vault.executeGovernorBatch(calls);
+        vault.executeGovernorBatch(calls, type(uint256).max);
 
         // Verify: vault set the approval (delegatecall)
         assertEq(usdc.allowance(vaultAddr, makeAddr("protocol")), 1_000e6);
@@ -817,6 +818,38 @@ contract SyndicateFactoryTest is Test {
         assertEq(SyndicateGovernor(gov).vault(), vaultAddr, "governor bound to its vault");
         // And it is authorized on the registry mock (addGovernor was called) —
         // asserted implicitly by the mocked registry accepting the call in setUp.
+    }
+
+    /// @notice Task 7 wiring: when the factory owner sets a non-zero
+    ///         tierRegistry, `createSyndicate` must push it into the fresh
+    ///         per-vault governor (the onlyFactory `setTierRegistry` path). All
+    ///         other factory tests run with `tierRegistry == address(0)` (governor
+    ///         keeps the tier-2 default), so this is the only end-to-end proof of
+    ///         the non-zero push.
+    function test_createSyndicate_pushesTierRegistryToGovernor() public {
+        TierRegistry tierRegistry = new TierRegistry(owner);
+
+        // Baseline: with no registry wired, a governor comes up tier-registry-less.
+        vm.prank(creator1);
+        (, address vaultDefault) = factory.createSyndicate(creator1AgentId, _configWithSubdomain("tier-default"));
+        assertEq(
+            SyndicateGovernor(factory.governorOf(vaultDefault)).tierRegistry(),
+            address(0),
+            "unset factory registry => governor keeps tier-2 default"
+        );
+
+        // Owner wires the registry; only governors created AFTER pick it up.
+        vm.prank(owner);
+        factory.setTierRegistry(address(tierRegistry));
+        assertEq(factory.tierRegistry(), address(tierRegistry), "factory stored the registry");
+
+        vm.prank(creator2);
+        (, address vaultWired) = factory.createSyndicate(creator2AgentId, _configWithSubdomain("tier-wired"));
+        assertEq(
+            SyndicateGovernor(factory.governorOf(vaultWired)).tierRegistry(),
+            address(tierRegistry),
+            "createSyndicate pushed the registry into the new governor"
+        );
     }
 
     /// @notice setParamsOverride: factory-owner rescue path — bypasses the

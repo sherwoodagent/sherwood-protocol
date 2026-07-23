@@ -15,6 +15,7 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
+import {GovEnvelope} from "../helpers/GovEnvelope.sol";
 
 /// @title ActiveProposalPreservation.t
 /// @notice Regression tests for **G-C2 / G-C3** — the historical bug where
@@ -35,6 +36,9 @@ import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 ///         three paths must leave `_activeProposal[V] == A` untouched.
 contract ActiveProposalPreservationTest is Test {
     SyndicateGovernor public governor;
+
+    /// @dev Widest legal risk envelope, computed once in setUp (see there).
+    ISyndicateGovernor.RiskEnvelope internal permissiveEnv;
     SyndicateVault public vault;
     GuardianRegistry public registry;
     StakedWood public swood;
@@ -183,6 +187,11 @@ contract ActiveProposalPreservationTest is Test {
         vm.stopPrank();
         vm.warp(vm.getBlockTimestamp() + 1);
 
+        // Widest legal envelope at setUp TVL (finding 3 ceiling). Hoisted to a
+        // state var: computing it inline made an external staticcall between
+        // vm.prank/vm.expectRevert and propose(), consuming the cheatcode.
+        permissiveEnv = GovEnvelope.permissive(address(vault));
+
         wood.mint(owner, 100_000e18);
         vm.prank(owner);
         wood.approve(address(swood), type(uint256).max);
@@ -227,7 +236,7 @@ contract ActiveProposalPreservationTest is Test {
     function _propose(string memory uri) internal returns (uint256 proposalId) {
         vm.prank(agent);
         proposalId = governor.propose(
-            address(vault), address(0), uri, 7 days, _execCalls(), _settleCalls(), _emptyCoProposers()
+            address(vault), address(0), uri, 7 days, permissiveEnv, _execCalls(), _settleCalls(), _emptyCoProposers()
         );
     }
 
@@ -291,7 +300,14 @@ contract ActiveProposalPreservationTest is Test {
         vm.prank(agent);
         vm.expectRevert(ISyndicateGovernor.VaultHasOpenProposal.selector);
         governor.propose(
-            address(vault), address(0), "ipfs://B", 7 days, _execCalls(), _settleCalls(), _emptyCoProposers()
+            address(vault),
+            address(0),
+            "ipfs://B",
+            7 days,
+            permissiveEnv,
+            _execCalls(),
+            _settleCalls(),
+            _emptyCoProposers()
         );
 
         // A remains live, pointer untouched.
@@ -308,7 +324,14 @@ contract ActiveProposalPreservationTest is Test {
         vm.prank(agent);
         vm.expectRevert(ISyndicateGovernor.VaultHasOpenProposal.selector);
         governor.propose(
-            address(vault), address(0), "ipfs://B", 7 days, _execCalls(), _settleCalls(), _emptyCoProposers()
+            address(vault),
+            address(0),
+            "ipfs://B",
+            7 days,
+            permissiveEnv,
+            _execCalls(),
+            _settleCalls(),
+            _emptyCoProposers()
         );
 
         _assertAStillLive(pidA);
@@ -323,7 +346,14 @@ contract ActiveProposalPreservationTest is Test {
         vm.prank(agent);
         vm.expectRevert(ISyndicateGovernor.VaultHasOpenProposal.selector);
         governor.propose(
-            address(vault), address(0), "ipfs://B", 7 days, _execCalls(), _settleCalls(), _emptyCoProposers()
+            address(vault),
+            address(0),
+            "ipfs://B",
+            7 days,
+            permissiveEnv,
+            _execCalls(),
+            _settleCalls(),
+            _emptyCoProposers()
         );
 
         _assertAStillLive(pidA);

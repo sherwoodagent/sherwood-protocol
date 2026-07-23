@@ -14,6 +14,7 @@ import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 import {MockStrategyAdapter} from "../mocks/MockStrategyAdapter.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
+import {GovEnvelope} from "../helpers/GovEnvelope.sol";
 
 /// @title GovernorStrategyOnProposalTest
 /// @notice Coverage for the strategy-on-proposal model: the proposer passes
@@ -136,7 +137,14 @@ contract GovernorStrategyOnProposalTest is Test {
     function _propose(address strategy) internal returns (uint256 proposalId) {
         vm.prank(agent);
         proposalId = governor.propose(
-            address(vault), strategy, "ipfs://test", 7 days, _execCalls(), _settleCalls(), _emptyCoProposers()
+            address(vault),
+            strategy,
+            "ipfs://test",
+            7 days,
+            GovEnvelope.permissive(address(vault)),
+            _execCalls(),
+            _settleCalls(),
+            _emptyCoProposers()
         );
         vm.warp(vm.getBlockTimestamp() + 1);
     }

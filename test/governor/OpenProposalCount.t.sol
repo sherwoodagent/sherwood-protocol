@@ -16,6 +16,7 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
+import {GovEnvelope} from "../helpers/GovEnvelope.sol";
 
 /// @title OpenProposalCount.t
 /// @notice Regression tests for Fix 2 — track open proposals per vault to plug
@@ -218,7 +219,14 @@ contract OpenProposalCountTest is Test {
     function _propose() internal returns (uint256 proposalId) {
         vm.prank(agent);
         proposalId = governor.propose(
-            address(vault), address(0), "ipfs://open-count", 7 days, _execCalls(), _settleCalls(), _emptyCoProposers()
+            address(vault),
+            address(0),
+            "ipfs://open-count",
+            7 days,
+            GovEnvelope.permissive(address(vault)),
+            _execCalls(),
+            _settleCalls(),
+            _emptyCoProposers()
         );
     }
 
@@ -536,7 +544,14 @@ contract OpenProposalCountTest is Test {
 
         vm.prank(agent);
         uint256 pid = governor.propose(
-            address(vault), address(0), "ipfs://collab", 7 days, _execCalls(), _settleCalls(), coProps
+            address(vault),
+            address(0),
+            "ipfs://collab",
+            7 days,
+            GovEnvelope.permissive(address(vault)),
+            _execCalls(),
+            _settleCalls(),
+            coProps
         );
 
         // Sherlock #8: Draft now binds the vault — counter incremented at
@@ -577,7 +592,14 @@ contract OpenProposalCountTest is Test {
 
         vm.prank(agent);
         uint256 pid = governor.propose(
-            address(vault), address(0), "ipfs://collab-reject", 7 days, _execCalls(), _settleCalls(), coProps
+            address(vault),
+            address(0),
+            "ipfs://collab-reject",
+            7 days,
+            GovEnvelope.permissive(address(vault)),
+            _execCalls(),
+            _settleCalls(),
+            coProps
         );
         // Sherlock #8: Draft binds the vault.
         assertEq(governor.openProposalCount(), 1, "Sherlock #8: Draft counted");
@@ -608,7 +630,14 @@ contract OpenProposalCountTest is Test {
 
         vm.prank(agent);
         uint256 pid = governor.propose(
-            address(vault), address(0), "ipfs://draft-emerg", 7 days, _execCalls(), _settleCalls(), coProps
+            address(vault),
+            address(0),
+            "ipfs://draft-emerg",
+            7 days,
+            GovEnvelope.permissive(address(vault)),
+            _execCalls(),
+            _settleCalls(),
+            coProps
         );
         // Sherlock #8: Draft binds the vault.
         assertEq(governor.openProposalCount(), 1, "Sherlock #8: Draft counted");
@@ -636,6 +665,7 @@ contract OpenProposalCountTest is Test {
             address(0),
             "ipfs://draft-emerg-2",
             7 days,
+            GovEnvelope.permissive(address(vault)),
             _execCalls(),
             _settleCalls(),
             _emptyCoProposers()
@@ -660,7 +690,16 @@ contract OpenProposalCountTest is Test {
         coProps[0] = ISyndicateGovernor.CoProposer({agent: agent2, splitBps: 2000});
 
         vm.prank(agent);
-        governor.propose(address(vault), address(0), "ipfs://draft-lock", 7 days, _execCalls(), _settleCalls(), coProps);
+        governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://draft-lock",
+            7 days,
+            GovEnvelope.permissive(address(vault)),
+            _execCalls(),
+            _settleCalls(),
+            coProps
+        );
 
         // openProposalCount = 1; vault's _depositsLocked() returns true.
         assertEq(governor.openProposalCount(), 1, "Draft bumps openProposalCount");

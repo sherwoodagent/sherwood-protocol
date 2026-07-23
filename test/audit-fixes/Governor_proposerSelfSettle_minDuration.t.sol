@@ -12,6 +12,7 @@ import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
+import {GovEnvelope} from "../helpers/GovEnvelope.sol";
 
 /// @title Governor_proposerSelfSettle_minDuration — MS-H3 regression
 /// @notice Confirms the proposer's self-settle fast-path requires at least
@@ -132,6 +133,7 @@ contract Governor_proposerSelfSettle_minDuration_Test is Test {
             address(0),
             "ipfs://self-settle",
             STRATEGY_DURATION,
+            GovEnvelope.permissive(address(vault)),
             _execCalls(),
             _settleCalls(),
             _emptyCoProposers()

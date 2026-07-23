@@ -17,9 +17,13 @@ import {VaultWithdrawalQueue} from "../src/queue/VaultWithdrawalQueue.sol";
 import {IVaultWithdrawalQueue} from "../src/interfaces/IVaultWithdrawalQueue.sol";
 import {MockStrategyAdapter} from "./mocks/MockStrategyAdapter.sol";
 import {IStrategy} from "../src/interfaces/IStrategy.sol";
+import {GovEnvelope} from "./helpers/GovEnvelope.sol";
 
 contract SyndicateGovernorTest is Test {
     SyndicateGovernor public governor;
+
+    /// @dev Widest legal risk envelope, computed once in setUp (see there).
+    ISyndicateGovernor.RiskEnvelope internal permissiveEnv;
     ProtocolConfig public protocolConfig;
     SyndicateVault public vault;
     BatchExecutorLib public executorLib;
@@ -120,6 +124,11 @@ contract SyndicateGovernorTest is Test {
         vm.stopPrank();
 
         vm.warp(block.timestamp + 1);
+
+        // Widest legal envelope at setUp TVL (finding 3 ceiling). Hoisted to a
+        // state var: computing it inline made an external staticcall between
+        // vm.prank/vm.expectRevert and propose(), consuming the cheatcode.
+        permissiveEnv = GovEnvelope.permissive(address(vault));
     }
 
     // ==================== HELPERS ====================
@@ -155,6 +164,7 @@ contract SyndicateGovernorTest is Test {
             address(0),
             "ipfs://test",
             duration,
+            permissiveEnv,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             _emptyCoProposers()
@@ -193,6 +203,7 @@ contract SyndicateGovernorTest is Test {
             strategy,
             "ipfs://test",
             duration,
+            permissiveEnv,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             _emptyCoProposers()
@@ -252,6 +263,7 @@ contract SyndicateGovernorTest is Test {
             address(0),
             "ipfs://test",
             7 days,
+            permissiveEnv,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             _emptyCoProposers()
@@ -266,6 +278,7 @@ contract SyndicateGovernorTest is Test {
             address(0),
             "ipfs://test",
             7 days,
+            permissiveEnv,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             _emptyCoProposers()
@@ -280,6 +293,7 @@ contract SyndicateGovernorTest is Test {
             address(0),
             "ipfs://test",
             MAX_STRATEGY_DURATION + 1,
+            permissiveEnv,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             _emptyCoProposers()
@@ -294,6 +308,7 @@ contract SyndicateGovernorTest is Test {
             address(0),
             "ipfs://test",
             30 minutes,
+            permissiveEnv,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             _emptyCoProposers()
@@ -305,7 +320,14 @@ contract SyndicateGovernorTest is Test {
         vm.prank(agent);
         vm.expectRevert(ISyndicateGovernor.EmptyExecuteCalls.selector);
         governor.propose(
-            address(vault), address(0), "ipfs://test", 7 days, empty, _simpleSettlementCalls(), _emptyCoProposers()
+            address(vault),
+            address(0),
+            "ipfs://test",
+            7 days,
+            permissiveEnv,
+            empty,
+            _simpleSettlementCalls(),
+            _emptyCoProposers()
         );
     }
 
@@ -314,7 +336,14 @@ contract SyndicateGovernorTest is Test {
         vm.prank(agent);
         vm.expectRevert(ISyndicateGovernor.EmptySettlementCalls.selector);
         governor.propose(
-            address(vault), address(0), "ipfs://test", 7 days, _simpleExecuteCalls(), empty, _emptyCoProposers()
+            address(vault),
+            address(0),
+            "ipfs://test",
+            7 days,
+            permissiveEnv,
+            _simpleExecuteCalls(),
+            empty,
+            _emptyCoProposers()
         );
     }
 
@@ -330,6 +359,7 @@ contract SyndicateGovernorTest is Test {
             address(0),
             "ipfs://test",
             7 days,
+            permissiveEnv,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             _emptyCoProposers()
@@ -362,6 +392,7 @@ contract SyndicateGovernorTest is Test {
             address(0),
             "ipfs://test",
             7 days,
+            permissiveEnv,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             _emptyCoProposers()
@@ -482,6 +513,7 @@ contract SyndicateGovernorTest is Test {
             address(0),
             "ipfs://dup",
             7 days,
+            permissiveEnv,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             _emptyCoProposers()
@@ -661,6 +693,7 @@ contract SyndicateGovernorTest is Test {
             address(0xBEEF), // EOA, no selfManagesFees()
             "ipfs://eoa",
             7 days,
+            permissiveEnv,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             empty
@@ -753,6 +786,7 @@ contract SyndicateGovernorTest is Test {
             address(0),
             "ipfs://test",
             7 days,
+            permissiveEnv,
             _simpleExecuteCalls(),
             _simpleSettlementCalls(),
             _emptyCoProposers()
@@ -970,7 +1004,7 @@ contract SyndicateGovernorTest is Test {
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](0);
         vm.prank(random);
         vm.expectRevert(ISyndicateVault.NotGovernor.selector);
-        vault.executeGovernorBatch(calls);
+        vault.executeGovernorBatch(calls, type(uint256).max);
     }
 
     // ==================== VETO ON EXECUTED PROPOSAL ====================

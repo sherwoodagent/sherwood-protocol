@@ -12,6 +12,7 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
+import {GovEnvelope} from "../helpers/GovEnvelope.sol";
 
 /// @title GovernorReentrancy.t
 /// @notice Regression for G-C6 — `vote` / `cancelProposal` / `vetoProposal` /
@@ -137,7 +138,14 @@ contract GovernorReentrancyTest is Test {
     function _propose() internal returns (uint256 pid) {
         vm.prank(agent);
         pid = governor.propose(
-            address(vault), address(0), "ipfs://reentry", 7 days, _execCalls(), _settleCalls(), _emptyCoProposers()
+            address(vault),
+            address(0),
+            "ipfs://reentry",
+            7 days,
+            GovEnvelope.permissive(address(vault)),
+            _execCalls(),
+            _settleCalls(),
+            _emptyCoProposers()
         );
         vm.warp(vm.getBlockTimestamp() + 1);
     }
