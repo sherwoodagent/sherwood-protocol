@@ -687,7 +687,7 @@ before v1a ships:
   competitive returns, the k=1 tier-2 capacity target may need to fall (fewer,
   better-paid guardians underwriting less) — an explicit economic tradeoff to
   validate before launch.
-- Settlement/valuation oracles are load-bearing for guards, PnL, AND the
+- Settlement/valuation oracles underpin guards, PnL, AND the
   pre-drain compensation snapshot; inherits and extends the frozen-settle-price
   work.
 - **WOOD price source is a pre-launch external dependency (no feed today).**
