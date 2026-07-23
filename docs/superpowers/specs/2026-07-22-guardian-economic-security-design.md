@@ -1,7 +1,7 @@
 # Guardian Economic Security: Making Coordinated Collusion Infeasible
 
 **Date:** 2026-07-22
-**Status:** Design of record (per re-review #4760018146) — F1–F6 + precision items remediated; F4-viability + scope tracked as pre-launch gates. **Scope cuts 2026-07-22:** salami/drawdown machinery removed (slow-bleed accepted as a monitored risk, §7/§8); multi-collateral bonds deferred to v2 (v1 is WOOD-only with a hard covered-TVL ceiling, §3.7).
+**Status:** Design of record, signed off (re-reviews #4760018146, #5053349247) — F1–F6 + precision items remediated; §2 guarantee scoped to detectable extraction and reconciled with §8; F4-viability + ROE-before-fail-closed tracked as (blocking) pre-launch gates. **Scope cuts 2026-07-22:** salami drawdown predicates + cross-vault accumulators + 30d lock removed (slow-bleed accepted, §7/§8) but the per-vault per-epoch outflow cap kept as a trustless bleed-rate bound (§3.1a); multi-collateral bonds deferred to v2 (v1 WOOD-only, hard covered-TVL ceiling, §3.7).
 **Scope:** GuardianRegistry, StakedWood, SyndicateVault (custody guards + compensation escrow), SyndicateGovernor (approve quorum, proposer bond, hooks)
 
 ## 0. Revision log
@@ -15,7 +15,7 @@ remediates all of them:
 - **F2** WOOD-denominated inequality → dollar-denominated coverage via a hard covered-TVL cap (§2, §3.7). Multi-collateral bonds (the ceiling-lifting fix) **deferred to v2 by decision 2026-07-22**; v1 launches WOOD-only, small-vault-only, cap binding hard.
 - **F3** retroactive liability presupposes a signer → explicit bond-encumbered approve quorum replaces pure optimistic passage for coverage-consuming proposals; cold-start addressed; risk-scaled proposer bond added (§3.3a, §3.9).
 - **F4** honest-guardian economics mispriced → coverage-weighted approver reward (§3.10).
-- **F5** temporal netting → unstake delay covers the challenge window (§3.3). The salami/drawdown machinery this finding prompted (rolling-drawdown predicate, cross-vault accumulators, per-epoch cap, 30d lock) was subsequently **removed by decision** (2026-07-22); slow-bleed is now an accepted, monitoring-backstopped risk (§7, §8).
+- **F5** temporal netting → unstake delay covers the challenge window (§3.3). Most of the salami/drawdown machinery this finding prompted (rolling-drawdown predicate, cross-vault accumulators, 30d lock) was **removed by decision** (2026-07-22); the **per-vault per-epoch outflow cap was kept** (§3.1a, re-review #5053349247) as a trustless bleed-rate bound. Slow-bleed is an accepted risk (§7, §8) but rate-bounded on-chain.
 - **F6** court capture / non-independent layers → pre-accumulation defense + panel-bond restructure (§3.5).
 - **Precision:** `slashableBond` defined (§3.3); §1 "equally" corrected; "reuses slash rails" framing corrected and authorized-slasher entrypoint made explicit (§4); `refundSlash` fate stated (§4).
 
@@ -61,8 +61,21 @@ Economic infeasibility requires exactly two properties:
 
 **Adjudicated retroactive slashing + tiered max-extractable coverage.**
 
-Coalition arithmetic the design enforces (all quantities in the drain's unit of
-account, i.e. vault assets / USD):
+**Scope of the guarantee (reconciled with §8).** The coalition inequality below
+holds for **detectable extraction** — any drain that trips an objective challenge
+predicate (§3.4): out-of-adapter outflow, oracle-deviation, proposer-linked
+destination, rogue allowance, or a single proposal breaching its own declared
+envelope. That covers one-shot and fast multi-proposal drains. It does **not**
+cover the *patient slow-bleed*: a coalition extracting value through many trades
+that each stay inside their per-proposal envelope and trip no predicate. v1 ships
+no on-chain accumulator for that vector (removed by decision — §7); it is an
+accepted, monitored residual (§8), caught by the §6 dashboard and watchtower
+reaction, not by the inequality. The doc title's "infeasible" is therefore a
+claim about *detectable coordinated collusion*, not about every conceivable
+patient bleed.
+
+Coalition arithmetic the design enforces **for detectable extraction** (all
+quantities in the drain's unit of account, i.e. vault assets / USD):
 
 ```
 coalition gain  ≤  Σ certified max-extractable value of approved proposals
@@ -71,6 +84,12 @@ coalition loss  ≥  Σ dollar value of slashable approver stake at slash-time
 recoupment      =  0        (compensation is snapshot-gated to pre-drain holders)
 net             ≤  0  −  bribes  −  gas  −  proposer bond forfeited
 ```
+
+The slow-bleed residual is not bounded by this inequality (§8), but its *rate* is
+bounded trustlessly by the per-vault per-epoch outflow cap (§3.1a) — so a patient
+bleed is capped per epoch, giving the §6 dashboard and watchtower time to react.
+The residual is thus "monitoring latency within a bounded per-epoch rate," not
+"unbounded extraction."
 
 Three properties make each line hold and are the load-bearing changes from the
 first draft:
@@ -110,6 +129,19 @@ Every proposal declares:
   meter, and `StrategyProposal` gains an extractable-value field).
 - `maxDrawdownBps` — declared risk envelope. Realized losses inside it are market
   risk (no slash); losses beyond it are challengeable (§3.4).
+
+### 3.1a Per-vault per-epoch outflow cap (trustless bleed-rate bound)
+
+A single per-vault accumulator: cumulative net outflow across all of a vault's
+proposals within an epoch cannot exceed a per-vault cap. Enforced at execution
+(custody layer), no cross-vault tracking, no stake lock — the cheapest piece of
+the removed salami set (§7), kept because it is the only *trustless* bound on the
+slow-bleed vector. It does not detect malice; it caps how fast a vault can lose
+value regardless of how the loss is sliced, converting "unbounded-rate patient
+extraction" into "bounded-rate extraction the §6 dashboard has time to catch."
+Set generously enough not to throttle real trading (a legitimate vault rarely
+moves a large fraction of its assets net-out per epoch); the cap is a rate limit
+on bleeding, not a limit on activity.
 
 ### 3.2 Adapter tiering with runtime guards
 
@@ -423,6 +455,12 @@ TVL**, not by adding collateral:
   until v2 multi-collateral exists. This is a **capacity ceiling accepted as a
   scope decision**, not a security relaxation: inside the cap, R2 holds in
   dollars; the cap is what keeps it holding.
+- **Small ≠ unconditionally safe.** The deliberate-WOOD-short vector (§1 threat
+  model) is *bounded but not closed* even for capped vaults: short size is limited
+  by WOOD borrow liquidity, not vault size, so a capped vault is protected mainly
+  because thin borrow at a low mcap plus the haircut headroom make a large short
+  expensive — not because the cap itself neutralizes shorting. Keep this labeled;
+  as borrow liquidity for WOOD grows, revisit the haircut.
 - **v2 — multi-collateral bonds.** Guardian bonds may hold sWOOD + blue-chip
   collateral (USDC/ETH, or restaked ETH), each leg entering `slashableBond` at
   its own haircut, lifting the per-vault ceiling. Required before any vault above
@@ -492,10 +530,14 @@ before v1a ships:
    *jointly correct*, each with the one-sentence invariant + fuzz test this
    section requires. Launch **WOOD-only, small-vault-only** with the covered-TVL
    cap binding hard; no large vault onboards until v2 multi-collateral exists.
-2. Validate the §3.10 ROE arithmetic at the intended launch TVL/tier mix before
-   flipping passage to fail-closed; if the premium underfunds at target scale,
-   either lower the capacity target or keep optimistic passage for the
-   bounded-tier flow that doesn't need a covering signer to be safe.
+2. **BLOCKING:** validate the §3.10 ROE arithmetic at the intended launch
+   TVL/tier mix *before* flipping passage to fail-closed. Because liveness now
+   depends on the premium recruiting covering bond, launching fail-closed with an
+   underfunded premium halts legitimate flow. Set the launch TVL/tier target
+   where the ROE arithmetic actually closes; if it doesn't close at the desired
+   scale, lower the capacity target or keep optimistic passage for the
+   bounded-tier flow that doesn't need a covering signer to be safe. This gate is
+   blocking, not merely tracked.
 
 ## 5. Parameters (initial)
 
@@ -506,6 +548,7 @@ before v1a ships:
 | Covered-TVL cap per vault | Σ slashableBond · priceHaircut | hard ceiling in v1 (WOOD-only); v2 multi-collateral lifts it |
 | Challenge window | 14d tier-2, 7d tier-0/1 | shorter window recycles coverage faster |
 | Unstake / exposure-open delay | ≥ challenge window | guardian can't unstake before its approvals can be challenged |
+| Per-vault per-epoch outflow cap | generous (won't throttle real trading) | trustless bleed-rate bound (§3.1a); kept from the salami set |
 | Challenger bond | scales with frozen exposure | griefing deterrent |
 | Proposer bond | fraction of `maxExtractable` | first-loss, → compensation escrow |
 | Approver reward | coverage-weighted premium | target ROE clears tail-risk hurdle |
@@ -518,9 +561,11 @@ before v1a ships:
 - Intra-block divergence between guard valuation and independent TWAP on any
   tier-0/1 execution (valuation manipulation).
 - Per-vault realized alpha vs benchmark: variance, venue Herfindahl,
-  guardian-approval overlap. **This is v1's primary (and only) defense against the
-  slow-bleed salami attack** — see §8; on-chain salami predicates were cut, so a
-  bleed is caught by this dashboard + human/watchtower reaction, not automatically.
+  guardian-approval overlap. **This is v1's primary *detection* of the slow-bleed
+  salami attack** (§8); on-chain drawdown predicates were cut, so malice is caught
+  by this dashboard + watchtower reaction, not auto-slashed. The per-vault
+  per-epoch outflow cap (§3.1a) trustlessly bounds the *rate*, guaranteeing this
+  dashboard has at least one epoch to react.
 - Challenge activity: filings, challenger loss rate, frozen-exposure ratio
   (silence = no watchtower; high-loss-rate-with-rising-filings = griefing).
 - Tier-2 exposure utilization vs queued proposals (throughput strangulation).
@@ -552,17 +597,19 @@ before v1a ships:
 - **Panel bond slashed only on merits overturn:** lets control of a cheap appeal
   immunize a corrupt panel; replaced by the separate bad-faith track + flat
   panelist reward + participation floor (§3.5, F6).
-- **On-chain anti-salami machinery (removed by decision, 2026-07-22).** The
-  earlier draft carried an aggregate rolling-drawdown predicate, cross-vault
-  proposer/guardian drawdown accumulators, a per-epoch per-vault outflow cap, and
-  a 30-day exposure lock to back them. Removed as disproportionate for v1: three
-  new accumulators plus cross-vault forensic tracking plus a long guardian stake
-  lock, for an attack that is slower, harder, and easier to catch by monitoring
-  than the one-shot rug the mechanical guards already stop. The slow-bleed is now
-  an **accepted risk** (§8), backstopped by the §6 alpha-vs-benchmark dashboard
-  and the watchtower, not by an on-chain predicate. The per-proposal
-  drawdown-breach predicate (§3.4 #5) is retained — it bounds a single bad
-  proposal, which is not salami.
+- **Most on-chain anti-salami machinery removed (decision 2026-07-22), one piece
+  kept.** The earlier draft carried an aggregate rolling-drawdown predicate,
+  cross-vault proposer/guardian drawdown accumulators, a per-vault per-epoch
+  outflow cap, and a 30-day exposure lock. **Removed:** the rolling-drawdown
+  predicate, the cross-vault accumulators, and the 30-day lock — disproportionate
+  for v1 (multiple accumulators + cross-vault forensics + a long stake lock, for
+  an attack slower and harder than the one-shot rug the guards already stop).
+  **Retained (per re-review #5053349247):** the per-vault per-epoch outflow cap
+  (§3.1a) — one accumulator, no cross-vault tracking, no lock — because it is the
+  only *trustless* bound on bleed rate and is nearly free. The per-proposal
+  drawdown-breach predicate (§3.4 #5) is also retained (bounds a single bad
+  proposal, not salami). Net: slow-bleed is an accepted risk (§8) but rate-bounded
+  on-chain, not monitoring-plus-human alone.
 
 ## 8. Accepted risks / open questions
 
@@ -598,21 +645,21 @@ before v1a ships:
   improves *measurement* but does not remove `priceHaircut` or the F2 economics —
   an accurate low price is still a low price. Track feed availability as a gate on
   the tier-0/1 valuation design.
-- **Slow-bleed / salami (accepted risk, decided 2026-07-22).** v1 ships no
-  on-chain cumulative-drawdown predicate (single-vault or cross-vault) and no
-  per-epoch outflow cap. A coalition that controls a counterparty and bleeds a
-  vault via many individually-in-envelope losing trades will not trip an
-  automatic predicate. This is a **deliberate scope decision**, accepted because:
-  (a) the attack is materially slower and harder than a one-shot rug (needs a
-  controlled counterparty and sustained plausible-deniability), (b) the mechanical
-  guards + single-proposal predicates already stop the fast rug, and (c) the §6
-  alpha-vs-benchmark + venue-concentration dashboard surfaces a sustained bleed
-  for watchtower/human intervention (pause, challenge the clip that breaches its
-  own envelope, deregister the guardian set). The residual: detection is
-  monitoring-plus-human, not automatic-plus-trustless, and a patient attacker
-  staying just inside every per-proposal envelope can extract more before
-  intervention than an automatic predicate would have allowed. Revisit in v2 if
-  monitoring shows real slow-bleed attempts.
+- **Slow-bleed / salami (accepted risk, decided 2026-07-22; rate-bounded).** v1
+  ships no on-chain cumulative-*drawdown* predicate (single- or cross-vault), so a
+  coalition bleeding a vault via many individually-in-envelope losing trades trips
+  no malice predicate and no one is slashed for the bleed as such. Accepted
+  because: (a) it is materially slower/harder than a one-shot rug (needs a
+  controlled counterparty and sustained deniability), (b) the mechanical guards +
+  single-proposal predicates stop the fast rug, (c) the §6 dashboard surfaces a
+  sustained bleed for intervention, and — the piece added back on re-review —
+  (d) the **per-vault per-epoch outflow cap (§3.1a) trustlessly bounds the bleed
+  rate**, so the attacker cannot extract faster than one epoch's cap and the
+  dashboard/watchtower always has at least that long to react. Residual: within
+  the per-epoch rate and the per-proposal envelopes, a patient bleed is not
+  auto-slashed — detection of *malice* (vs bad trading) is still
+  monitoring-plus-human. Revisit a full drawdown predicate in v2 if monitoring
+  shows real attempts.
 - **F4 is now priced-but-possibly-unaffordable at scale, not unpriced.** The
   §3.10 worked example shows the premium clears for bounded tiers and does not
   clear for large tier-2 exposure at the default fee share. This is a viability
