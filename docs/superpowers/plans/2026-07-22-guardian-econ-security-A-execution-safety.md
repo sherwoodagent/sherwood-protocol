@@ -681,6 +681,10 @@ git commit -m "feat: e2e tier lifecycle test + TierRegistry deploy wiring"
 - **Plan C (v1c):** two-layer adjudication — panel + WOOD-vote appeal with pre-exploit AND pre-accumulation-hardened snapshot, restructured panel bond (bad-faith track, participation floor) (spec §3.5).
 - Per-adapter valuation guards beyond codehash (balance-delta invariant with manipulation-resistant TWAP, oracle staleness, `paused()` probes) — per-adapter engineering; the first concrete instance ships with the first real tier-0 certification.
 
+## Removed — do NOT build (decision 2026-07-22)
+
+ALL silent/slow-drain protection is cut from v1 and must not be built in Plan B/C: no aggregate rolling-drawdown predicate, no cross-vault proposer/guardian accumulators, no 30-day exposure lock, and **no per-vault per-epoch outflow cap**. Nothing here was ever implemented in Plan A (Task 4's meter is the per-*proposal* `maxCapital` net-outflow cap, which is core and stays — it is not slow-drain protection), so there is no shipped code to remove; this note exists so the cut isn't silently reintroduced. Slow-bleed is an accepted, monitoring-only residual (spec §7/§8). The single-proposal drawdown-breach predicate (spec §3.4 #5) and the `maxDrawdownBps` envelope field stay — they bound one bad proposal, which is not slow-bleed. Revisit an on-chain slow-drain mechanism only if live monitoring shows real attempts.
+
 ## Self-review notes
 
 - Spec coverage: §3.1 → Tasks 3–4; §3.2 tier table + codehash + default-deny → Tasks 1–2, 5–6; §3.2 oracle-health/divergence checks → deferred to first tier-0 certification (documented above); spec §4 v1 items 1–2 → this plan; items 3–5 → Plans B/C.
