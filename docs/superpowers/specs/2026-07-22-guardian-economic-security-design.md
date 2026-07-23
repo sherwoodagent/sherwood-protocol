@@ -86,6 +86,14 @@ Hardening (premortem findings #1, #2 — the two top-ranked failure modes):
   selector to tier 2. Upgradeable/proxied targets and adapters with mid-call
   external callbacks (reentrancy, delegatecall, hooks) are ineligible for
   tier 0/1 as a listing predicate.
+- **Oracle-health and divergence checks.** The guard requires the valuation
+  oracle to be live (heartbeat/staleness bound) and probes the target protocol's
+  `paused()` where exposed; a stale oracle or paused target reverts the
+  execution — a tier bound evaluated against a dead oracle is unsound. The guard
+  also reverts if its valuation deviates from an independent reference (TWAP)
+  beyond a generous static multiple of the certified bound (e.g. 5×). These are
+  binary, stateless, per-execution checks — they block the transaction; they do
+  not demote the adapter (threshold-calibrated auto-demote triggers are v2).
 
 ### 3.3 Aggregate exposure cap
 
@@ -216,14 +224,30 @@ path requires a one-sentence invariant + fuzz test before merge.
 
 **v1 (MVP — reuses existing slash rails):**
 1. Risk envelopes + custody outflow metering.
-2. Tiering with manipulation-resistant valuation + codehash guards (small initial
-   adapter set, tiers assigned by governance directly — no probation pipeline yet).
-3. Aggregate exposure cap.
-4. Challenge game with predicates 1–5, per-proposal freeze, watchtower funding.
-5. Adjudication: pre-exploit snapshot + panel with appeal.
+2. Tiering with manipulation-resistant valuation + codehash guards, plus the
+   binary per-execution checks from §3.2: oracle health (staleness/heartbeat,
+   target `paused()`) and valuation-divergence revert vs an independent
+   reference. Small initial adapter set, tiers assigned by governance directly —
+   no probation pipeline yet.
+3. Adapter-submitter bond escrow: governance still hand-certifies tiers, but the
+   submitter posts the bond underwriting the certified bound, so the §3.6
+   liability layering (submitter bond slashes first on guard bypass) holds from
+   day one. Escrow + slash hook only; probation automation stays v2.
+4. Aggregate exposure cap, with k stored per tier (initialized to constants —
+   parameterization only, no dynamic logic; avoids a later storage migration).
+5. Challenge game with predicates 1–5, per-proposal freeze, watchtower funding;
+   adjudication via pre-exploit snapshot + panel with appeal.
 
-**v2:** adapter probation/downgrade pipeline, auto-demote circuit breakers beyond
-codehash mismatch, multi-collateral bonds, dynamic k by risk class.
+Inclusion criterion for these pull-forwards: binary triggers (no threshold to
+calibrate → no griefing lever), no new accounting subsystem, each closes a
+ranked premortem risk. They add requires, one small escrow, and a config
+refactor — checks, not accounting.
+
+**v2:** adapter probation/downgrade pipeline automation, threshold-calibrated
+auto-demote circuit breakers (bound-probing, guard-revert-rate, cumulative-loss,
+full dependency-health) — these need live traffic distributions to set
+thresholds without creating a DoS lever, multi-collateral bonds, dynamic k by
+risk class.
 
 ## 5. Parameters (initial)
 
