@@ -452,13 +452,21 @@ contract SyndicateVault is
         uint256 balanceAfter = IERC20(asset()).balanceOf(address(this));
         // Spec 2026-07-22 §3.1: custody-level net-outflow ceiling. Inflow
         // batches (settle) pass trivially; the governor passes the proposal's
-        // maxCapital on execute and type(uint256).max on settle paths.
+        // maxCapital on execute, settlement, AND emergency paths (finding 2 —
+        // honest unwinds are net-inflow, so the finite cap never binds them).
         // NOTE: this is a COARSE custody cap — it meters the vault's own
-        // asset() balance delta, so capital deployed INTO a whitelisted
+        // asset() balance delta, so capital deployed INTO an allowlisted
         // adapter counts as outflow the same as an extraction (conservative
-        // over-count). The precise extractable bound is the tier system's
-        // per-target coverage (Tasks 5/6); this check only guarantees a
-        // single batch can never move more than maxCapital out of custody.
+        // over-count). What the meter GUARANTEES holds only TOGETHER with the
+        // selector guard above (`_guardBatchCalls`): the meter bounds the
+        // asset() a single batch moves out of custody to maxCapital, and the
+        // guard closes the balance-invisible exfiltration routes (approve /
+        // transfer of ANY ERC20 to a non-allowlisted address). What they do
+        // NOT cover: exotic assets — ERC721/ERC1155 approvals and LP-position
+        // NFTs — which rely on tier-2 full-notional pricing until their
+        // selectors join the guarded set (see `_guardBatchCalls` RESIDUAL).
+        // The precise extractable bound remains the tier system's per-call
+        // coverage (requiredCoverage, consumed by Plan B).
         uint256 netOutflow = balanceBefore > balanceAfter ? balanceBefore - balanceAfter : 0;
         if (netOutflow > maxNetOutflow) revert MaxNetOutflowExceeded(netOutflow, maxNetOutflow);
         uint256 reserve = reservedQueueAssets();
