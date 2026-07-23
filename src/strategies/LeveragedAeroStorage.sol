@@ -26,7 +26,8 @@ import {LeveragedAeroValuation} from "./LeveragedAeroValuation.sol";
 ///         previous cannot: the COMPILER enforces strategy↔manager identity (both import
 ///         this one struct); the GOLDEN SNAPSHOT (`script/leveraged-aero-layout.golden.json`,
 ///         diffed field-by-field, order-significant, by `script/check-storage-parity.sh`
-///         step 1b in CI, mirrored by the raw-slot pins in
+///         step 1b — run manually or alongside `forge test`; this repo has no
+///         CI workflows — mirrored by the raw-slot pins in
 ///         `test/LeveragedAeroLayoutParity.t.sol`) enforces compatibility with the
 ///         already-deployed clone lineages — i.e. it is what catches a reorder/insert in
 ///         THIS struct; and the script's step-4 backstops reject a local re-declaration
@@ -91,9 +92,13 @@ library LeveragedAeroStorage {
         uint256 protocolFeeOwed; // accrued protocol-fee USDC liability (6dp); discharged in redeem/compound/settle
         // ── appended for the L9 compound oracle floor ──
         address aeroUsdFeed; // AERO/USD aggregator (8dp) — floors compound()'s AERO→USDC swap
-        // ── LAST fields: appended for the escrowed async-redeem queue ──
+        // ── appended for the escrowed async-redeem queue ──
         uint256 nextRedeemRequestId; // monotonic id cursor for `redeemRequests`
         mapping(uint256 => RedeemRequest) redeemRequests; // id → escrowed async redeem
+        // ── LAST fields: appended for the Mamo-driven rerange width param (append-only) ──
+        uint24 width; // current full position width (raw ticks, multiple of tickSpacing)
+        uint24 minWidth; // immutable-after-init lower bound on width (≥ 2·tickSpacing)
+        uint24 maxWidth; // immutable-after-init upper bound on width
     }
 
     /// @dev keccak256(abi.encode(uint256(keccak256("leveraged.aero.cl.storage")) - 1)) & ~bytes32(uint256(0xff))

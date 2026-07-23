@@ -45,8 +45,12 @@ interface IAeroRouter {
 ///         the clone's diamond storage.
 ///
 ///         CORRUPTION-CRITICAL slot discipline: `Layout`, `STORAGE_SLOT`, and `_layout()` are
-///         byte-identical to the strategy's — they MUST stay in lockstep or a delegatecall reads/
-///         writes the wrong slots. Do not reorder `Layout` fields in one file without the other.
+///         shared with the strategy via the single `LeveragedAeroStorage` definition — the
+///         COMPILER enforces strategy↔manager identity (no hand-maintained lockstep remains).
+///         Field order stays frozen for the already-deployed clone lineages: append-only,
+///         guarded by the golden snapshot in `script/check-storage-parity.sh` (manual /
+///         `forge test`-time invocation; this repo has no CI workflows) and the
+///         raw-slot pins in `test/LeveragedAeroLayoutParity.t.sol`.
 ///
 ///         Never touches `vault()` / `proposer()` / shares / fees (those stay in the strategy
 ///         entrypoints); it only reads config + position state and performs venue calls.
@@ -75,7 +79,6 @@ library LeveragedAeroManager {
     // ── Constants (compile-time literals, duplicated from the strategy) ──
     uint8 private constant CBBTC_DECIMALS = 8; // cbBTC is 8dp wrapped Bitcoin
     uint8 private constant WETH_DECIMALS = 18; // WETH9 on Base is 18dp
-    uint8 private constant RANGE_TICK_SPACINGS = 20; // tick-spacings each side of tick for the initial range
     /// @dev `deleverage()` repays down to `minHealthBps × (1 + this/1e4)` — a small buffer above the
     ///      minimum so a rescue doesn't land on the threshold and immediately re-trigger.
     uint16 private constant DELEVERAGE_BUFFER_BPS = 500; // +5% above minHealthBps
@@ -341,12 +344,15 @@ library LeveragedAeroManager {
     ///         No swap → principal conserved; the collected ratio can't match the new range, so a
     ///         remainder of ONE borrowed leg is left idle (NAV-counted, stays redeployable). A new
     ///         tokenId is minted (Slipstream ticks are immutable); the old empty NFT is harmless dust.
-    ///         No-op on a flat book.
+    ///         No-op on a flat book. `width` (validated in the strategy entrypoint) is persisted and
+    ///         drives `_computeTickRange`'s new span.
+    /// @param width   Full position width in raw ticks (persisted; `_computeTickRange` uses width/2/side).
     /// @param minLiq0 Minimum token0 (WETH) the re-add must consume (two-sided slippage guard).
     /// @param minLiq1 Minimum token1 (cbBTC) the re-add must consume (two-sided slippage guard).
-    function rerangeImpl(uint256 minLiq0, uint256 minLiq1) public {
+    function rerangeImpl(uint24 width, uint256 minLiq0, uint256 minLiq1) public {
         LeveragedAeroStorage.Layout storage $ = _layout();
         if ($.tokenId == 0) return; // flat book — nothing to recenter
+        $.width = width; // persist the new width (bounds already checked strategy-side)
 
         // 1. Calm-gate BEFORE touching the pool — never recenter at a manipulated tick.
         LeveragedAeroValuation._calmGate(_config());
@@ -584,12 +590,13 @@ library LeveragedAeroManager {
         }
     }
 
-    /// @dev Compute a tickSpacing-aligned range centred on the current pool tick.
+    /// @dev Compute a tickSpacing-aligned range centred on the current pool tick, spanning `width/2`
+    ///      raw ticks each side of it (`$.width` = full width, validated strategy-side).
     function _computeTickRange() private view returns (int24 tickLower, int24 tickUpper) {
         LeveragedAeroStorage.Layout storage $ = _layout();
         (, int24 currentTick,,,,) = ICLPool($.pool).slot0();
         int24 tickSpacing_ = $.tickSpacing;
-        int24 span = int24(uint24(RANGE_TICK_SPACINGS)) * tickSpacing_;
+        int24 span = int24(uint24($.width / 2)); // width ≤ uint24 max ⇒ width/2 ≤ int24 max, no overflow
         tickLower = _alignTick(currentTick - span, tickSpacing_);
         tickUpper = _alignTick(currentTick + span, tickSpacing_);
         if (tickUpper <= tickLower) tickUpper = tickLower + tickSpacing_;
