@@ -180,6 +180,56 @@ contract RiskEnvelopeTest is Test {
         assertEq(maxDrawdownBps, 1200);
     }
 
+    /// @notice Finding 2: settlement runs under the SAME maxCapital cap as
+    ///         execute. A malicious proposer who parks extraction in the
+    ///         pre-committed settlementCalls (execute is benign, then
+    ///         self-settle after 1h) must trip MaxNetOutflowExceeded instead of
+    ///         draining uncapped.
+    function test_settlementBatchExceedingMaxCapitalReverts() public {
+        address sinkAddr = makeAddr("extractionSink");
+        uint256 maxCapital = 1_000e6;
+        uint256 drain = 2_000e6; // > maxCapital, < 60_000e6 vault balance
+
+        BatchExecutorLib.Call[] memory settleCalls = new BatchExecutorLib.Call[](1);
+        settleCalls[0] = BatchExecutorLib.Call({
+            target: address(usdc), data: abi.encodeCall(usdc.transfer, (sinkAddr, drain)), value: 0
+        });
+
+        vm.prank(agent);
+        uint256 pid = governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://settle-drain",
+            7 days,
+            ISyndicateGovernor.RiskEnvelope({maxCapital: maxCapital, maxDrawdownBps: 10_000}),
+            _execCalls(), // benign approve — zero net outflow at execute
+            settleCalls,
+            new ISyndicateGovernor.CoProposer[](0)
+        );
+
+        vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
+        governor.executeProposal(pid);
+
+        // Proposer self-settles at the 1h minimum — the drain moment.
+        vm.warp(vm.getBlockTimestamp() + 1 hours + 1);
+        vm.prank(agent);
+        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.MaxNetOutflowExceeded.selector, drain, maxCapital));
+        governor.settleProposal(pid);
+    }
+
+    /// @notice Honest settles are net-inflow (or zero-flow) — the finite
+    ///         settlement cap must pass them trivially.
+    function test_honestZeroOutflowSettlementPassesUnderCap() public {
+        uint256 pid = _proposeWithEnvelope(1_000e6, 10_000); // settle calls: approve(_, 0)
+
+        vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
+        governor.executeProposal(pid);
+
+        vm.warp(vm.getBlockTimestamp() + 7 days + 1);
+        governor.settleProposal(pid);
+        assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Settled));
+    }
+
     /// @notice Collaborative regression: `approveCollaboration`'s Draft → Pending
     ///         transition rewrites the timing fields (snapshotTimestamp, voteEnd,
     ///         reviewEnd, executeBy, vetoThresholdBps) of the same struct — the

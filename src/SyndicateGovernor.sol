@@ -428,10 +428,13 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             revert StrategyDurationNotElapsed();
         }
 
-        // Run the pre-committed settlement calls. Settlement returns funds —
-        // capping it would brick unwinding, so the outflow cap is disabled.
+        // Run the pre-committed settlement calls under the SAME maxCapital cap
+        // as execute. An honest unwind is net-INFLOW (netOutflow == 0), so any
+        // finite cap passes it trivially — the cap only binds a malicious
+        // proposer who parked extraction in settlementCalls to self-settle
+        // after 1h and drain uncapped.
         ISyndicateVault(proposal.vault)
-            .executeGovernorBatch(_loadCalls(_settlementCalls, proposalId), type(uint256).max);
+            .executeGovernorBatch(_loadCalls(_settlementCalls, proposalId), proposal.maxCapital);
 
         _finishSettlement(proposalId, proposal);
     }
