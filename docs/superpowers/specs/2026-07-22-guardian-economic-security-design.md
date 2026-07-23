@@ -394,11 +394,16 @@ Instead:
   pre-drain claim on stake it did not hold pre-drain, and claims cannot be bought
   from exiting honest holders because they are non-transferable.
 
-**Snapshot block (R1, re-review).** Every conviction in v1 is tied to a single
-proposal's execution (predicates 1–5 all key on one proposal), so "pre-drain
-block" is unambiguous — the block before that proposal executed. (The trailing-
-window drawdown predicate that would have needed a time-weighted snapshot was
-removed with the rest of the salami machinery — §8.)
+**Snapshot block (R1, re-review; epoch-aware per §3.4a).** Every conviction in
+v1 keys on a single proposal. For predicates 1–4 (and predicate 5 on a strategy
+settling within one epoch) the conviction ties to the proposal's execution, so
+"pre-drain block" is the block before that proposal executed. For a **per-epoch
+drawdown conviction** (predicate 5 on a long strategy, §3.4a) the drain
+materialized during epoch N, so the compensation snapshot is the **epoch-N
+opening checkpoint block**: the holders of record when the breaching epoch
+began are the ones exposed to its loss. Still a single well-defined block — no
+time-weighting needed. (The trailing-window drawdown predicate that would have
+required time-weighted snapshots was removed with the salami machinery — §8.)
 
 **WOOD-only payout boundary (R1×F2 coupling, re-review).** Compensation is funded
 from slash proceeds, which in v1 are WOOD. So a victim payout is worth only what
@@ -472,7 +477,11 @@ a higher guardian fee share (LP-return tradeoff, §8), a lower conviction-error
 rate (better adjudication), or accepting that large vaults run predominantly
 tier-0/1. The premium clears comfortably for the bounded tiers that should
 carry most real flow; it does not clear for large unbounded exposure, and the
-design does not pretend otherwise.
+design does not pretend otherwise. (Under epoch-based coverage — §3.4a — the
+guardian carries this exposure one epoch at a time and the premium prices per
+epoch; the annualized figures above describe a guardian who renews
+continuously, so the conclusion is unchanged while the *commitment* per
+decision shrinks to one epoch.)
 
 ### 3.6 Adapter listing pipeline
 
