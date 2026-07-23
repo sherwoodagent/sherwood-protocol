@@ -117,8 +117,13 @@ interface ISyndicateGovernor {
         ///         registry is wired — the safe default.
         uint8 envelopeTier;
         /// @notice Extractable-value figure the aggregate exposure cap consumes
-        ///         (Plan B). Full `maxCapital` at tier 2; `maxCapital` scaled by
-        ///         the max certified extractable bound at tier 0/1.
+        ///         (Plan B). Finding 5: the SUM of per-call contributions across
+        ///         execute AND settlement calls — `maxCapital * Σ boundBps /
+        ///         10_000`, where each tier-0/1 call contributes its certified
+        ///         bound and each tier-2/uncertified call contributes 10_000
+        ///         (full notional). Conservative (over-counting) since per-call
+        ///         notional isn't threaded through in Plan A. `maxCapital` flat
+        ///         when no registry is wired.
         uint256 requiredCoverage;
     }
 
@@ -167,6 +172,13 @@ interface ISyndicateGovernor {
     ///         execution rather than run a possibly-unbounded batch against a
     ///         bounded-tier coverage price.
     error TierRegressed();
+    /// @notice Finding 5(b) companion to `TierRegressed`: revert at execute if
+    ///         the live re-resolved `requiredCoverage` exceeds the propose-time
+    ///         snapshot. Catches a same-tier RE-certification with a HIGHER
+    ///         extractableBoundBps (tier unchanged, coverage regressed) that
+    ///         the tier-only check waves through while Plan B's aggregate cap
+    ///         would still trust the stale, lower snapshot.
+    error CoverageRegressed();
     error StrategyAlreadyActive();
     error CooldownNotElapsed();
     error ProposalNotExecuted();
@@ -498,8 +510,10 @@ interface ISyndicateGovernor {
     function getProposalTier(uint256 proposalId) external view returns (uint8);
 
     /// @notice Extractable-value coverage the proposal demands from the
-    ///         aggregate exposure cap (Plan B). Snapshotted at propose time:
-    ///         full `maxCapital` at tier 2, bound-scaled at tier 0/1.
+    ///         aggregate exposure cap (Plan B). Snapshotted at propose time as
+    ///         the per-call SUM across execute and settlement calls (see
+    ///         `StrategyProposal.requiredCoverage`); re-checked at execute
+    ///         (`CoverageRegressed`).
     function getRequiredCoverage(uint256 proposalId) external view returns (uint256);
 
     // ── Fee-escrow (W-1) ──

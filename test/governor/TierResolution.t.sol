@@ -140,11 +140,13 @@ contract TierResolutionTest is Test {
         });
     }
 
-    /// @notice Every execute call certified at tier 0 with a 50 bps extractable
-    ///         bound → proposal tier 0, coverage = 50 bps of maxCapital.
+    /// @notice Every call (execute AND settlement — finding 5 counts both)
+    ///         certified at tier 0 with a 50 bps bound → proposal tier 0,
+    ///         coverage = Σ per-call bounds = 150 bps of maxCapital.
     function test_allCertifiedTier0CallsYieldTier0Coverage() public {
         _wireTierRegistry();
         tierRegistry.certify(address(mockAdapter), mockAdapter.approve.selector, 0, 50);
+        tierRegistry.certify(address(usdc), usdc.approve.selector, 0, 50); // the settle call
 
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](2);
         calls[0] = _certifiedCall();
@@ -152,11 +154,13 @@ contract TierResolutionTest is Test {
         uint256 pid = _propose(calls);
 
         assertEq(governor.getProposalTier(pid), 0);
-        assertEq(governor.getRequiredCoverage(pid), 5e6); // 50 bps of 1_000e6
+        // (50 + 50 exec) + (50 settle) = 150 bps of 1_000e6
+        assertEq(governor.getRequiredCoverage(pid), 15e6);
     }
 
     /// @notice One certified tier-0 call plus one uncertified selector → the MAX
-    ///         tier wins: proposal is tier 2 and coverage is full notional.
+    ///         tier wins: proposal is tier 2, and the uncertified calls each
+    ///         contribute full notional (10_000 bps) to the coverage sum.
     function test_oneUncertifiedCallMakesProposalTier2() public {
         _wireTierRegistry();
         tierRegistry.certify(address(mockAdapter), mockAdapter.approve.selector, 0, 50);
@@ -169,7 +173,9 @@ contract TierResolutionTest is Test {
         uint256 pid = _propose(calls);
 
         assertEq(governor.getProposalTier(pid), 2);
-        assertEq(governor.getRequiredCoverage(pid), MAX_CAPITAL);
+        // 50 (certified exec) + 10_000 (uncertified exec) + 10_000 (uncertified
+        // settle) = 20_050 bps of 1_000e6
+        assertEq(governor.getRequiredCoverage(pid), 2_005e6);
     }
 
     /// @notice Registry unset (address(0)) → everything defaults to tier 2 /
@@ -197,18 +203,20 @@ contract TierResolutionTest is Test {
         uint256 pid = _propose(calls);
 
         assertEq(governor.getProposalTier(pid), 2);
-        assertEq(governor.getRequiredCoverage(pid), MAX_CAPITAL);
+        // 10_000 (short-calldata exec) + 10_000 (uncertified settle) bps
+        assertEq(governor.getRequiredCoverage(pid), 2 * MAX_CAPITAL);
     }
 
-    /// @notice Mixed tier-0 (50 bps) + tier-1 (200 bps) calls → proposal tier is
-    ///         the MAX (1, not 2), and coverage uses the MAX extractable bound
-    ///         across both calls (200 bps), not the tier-0 call's 50 bps. This is
-    ///         the only case that exercises non-trivial `maxBoundBps` selection:
-    ///         the single-bound and tier-2 short-circuit paths never do.
-    function test_mixedTier0AndTier1UsesMaxBoundForCoverage() public {
+    /// @notice Finding 5(a): mixed tier-0 (50 bps) + tier-1 (200 bps) calls →
+    ///         proposal tier is the MAX (1, not 2), and coverage is the SUM of
+    ///         per-call bounds — 50 + 200 + 50 (settle) = 300 bps — NOT the
+    ///         single max bound (200 bps). Two adapters can each extract their
+    ///         own bound; a max under-counts multi-adapter batches.
+    function test_mixedTier0AndTier1CoverageIsSumNotMax() public {
         _wireTierRegistry();
         tierRegistry.certify(address(mockAdapter), mockAdapter.approve.selector, 0, 50);
         tierRegistry.certify(address(mockAdapter), mockAdapter.transfer.selector, 1, 200);
+        tierRegistry.certify(address(usdc), usdc.approve.selector, 0, 50); // the settle call
 
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](2);
         calls[0] = _certifiedCall(); // tier 0, 50 bps
@@ -218,7 +226,7 @@ contract TierResolutionTest is Test {
         uint256 pid = _propose(calls);
 
         assertEq(governor.getProposalTier(pid), 1); // max(0, 1)
-        assertEq(governor.getRequiredCoverage(pid), 20e6); // 200 bps of 1_000e6, not 50 bps
+        assertEq(governor.getRequiredCoverage(pid), 30e6); // Σ = 300 bps of 1_000e6, not max(200)
     }
 
     // ── Task 6: execute-time tier regression fail-safe (spec §3.2) ──
@@ -253,6 +261,34 @@ contract TierResolutionTest is Test {
         assertEq(liveTier, 2); // demoted since propose
 
         vm.expectRevert(ISyndicateGovernor.TierRegressed.selector);
+        governor.executeProposal(pid);
+    }
+
+    /// @notice Finding 5(b): a demoted-then-RE-certified adapter at the SAME
+    ///         tier but with a HIGHER extractableBoundBps passes the tier-only
+    ///         check (liveTier == envelopeTier) while the stored
+    ///         requiredCoverage is stale-low. The execute-time re-resolve must
+    ///         catch the coverage regression.
+    function test_executeRevertsWhenCoverageRegressedAtSameTier() public {
+        _wireTierRegistry();
+        tierRegistry.certify(address(mockAdapter), mockAdapter.approve.selector, 0, 50);
+        tierRegistry.certify(address(usdc), usdc.approve.selector, 0, 50); // the settle call
+
+        BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](1);
+        calls[0] = _certifiedCall();
+        uint256 pid = _propose(calls);
+        assertEq(governor.getProposalTier(pid), 0);
+        assertEq(governor.getRequiredCoverage(pid), 10e6); // (50 + 50) bps of 1_000e6
+
+        _advancePastVoting();
+
+        // Same tier 0, 10x the extractable bound → tier check passes, the
+        // coverage check must not.
+        tierRegistry.certify(address(mockAdapter), mockAdapter.approve.selector, 0, 500);
+        (uint8 liveTier,) = tierRegistry.tierOf(address(mockAdapter), mockAdapter.approve.selector);
+        assertEq(liveTier, 0); // NOT a tier regression
+
+        vm.expectRevert(ISyndicateGovernor.CoverageRegressed.selector);
         governor.executeProposal(pid);
     }
 

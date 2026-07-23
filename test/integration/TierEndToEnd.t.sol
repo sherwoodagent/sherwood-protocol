@@ -205,7 +205,9 @@ contract TierEndToEndTest is Test {
         uint256 amountOver = MAX_CAPITAL * 2; // 2_000e6 > 1_000e6 cap, < 60_000e6 balance
         uint256 pidOver = _propose(_deployCalls(amountOver));
         assertEq(governor.getProposalTier(pidOver), 2, "uncertified => tier 2");
-        assertEq(governor.getRequiredCoverage(pidOver), MAX_CAPITAL, "tier 2 => full-notional coverage");
+        // Finding 5: coverage = per-call SUM over execute AND settlement calls;
+        // each uncertified call contributes full notional (2 exec + 1 settle).
+        assertEq(governor.getRequiredCoverage(pidOver), 3 * MAX_CAPITAL, "tier 2 => full notional per call");
 
         _advancePastVoting();
         // MaxNetOutflowExceeded carries (netOutflow, cap) — full encode so the
@@ -222,7 +224,7 @@ contract TierEndToEndTest is Test {
         uint256 amountOk = MAX_CAPITAL / 2; // 500e6 <= cap
         uint256 pidOk = _propose(_deployCalls(amountOk));
         assertEq(governor.getProposalTier(pidOk), 2);
-        assertEq(governor.getRequiredCoverage(pidOk), MAX_CAPITAL);
+        assertEq(governor.getRequiredCoverage(pidOk), 3 * MAX_CAPITAL); // 2 exec + 1 settle, all uncertified
 
         // Same warp clears both the voting window AND the cancel-stamped cooldown.
         _advancePastVoting();
@@ -250,13 +252,16 @@ contract TierEndToEndTest is Test {
     function test_e2e_certifiedAdapterReducedCoverage() public {
         _wireTierRegistry();
         tierRegistry.certify(address(adapter), adapter.deploy.selector, 0, 100); // tier 0, 1%
+        // Finding 5: settlement calls count toward coverage too — certify the
+        // settle call's (usdc, approve) pair so the whole proposal is bounded.
+        tierRegistry.certify(address(usdc), usdc.approve.selector, 0, 100);
 
         uint256 pid = _propose(_singleDeployCall(MAX_CAPITAL));
         assertEq(governor.getProposalTier(pid), 0, "certified tier 0 snapshotted at propose");
         assertEq(
             governor.getRequiredCoverage(pid),
-            (MAX_CAPITAL * 100) / 10_000, // 1% of 1_000e6 = 10e6
-            "coverage = 100 bps of maxCapital"
+            (MAX_CAPITAL * (100 + 100)) / 10_000, // Σ(exec 100 + settle 100) bps = 20e6
+            "coverage = summed per-call bounds"
         );
 
         _advancePastVoting();

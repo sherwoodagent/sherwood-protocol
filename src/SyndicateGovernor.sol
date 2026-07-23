@@ -334,11 +334,12 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         _storeCalls(_settlementCalls, proposalId, settlementCalls);
 
         // Tier resolution (spec §3.2): proposal tier = MAX tier across execute
-        // calls; requiredCoverage feeds the aggregate exposure cap (Plan B).
+        // calls; requiredCoverage (finding 5: per-call SUM over execute AND
+        // settlement calls) feeds the aggregate exposure cap (Plan B).
         // Resolved from the STORED calls (via _loadCalls) rather than the
-        // calldata array so the `envelope`/`executeCalls` calldata refs are dead
-        // by this point — keeps propose() under Yul's stack budget. Reads the
-        // same storage array Task 6 re-resolves at execute time.
+        // calldata arrays so the `envelope`/`executeCalls` calldata refs are
+        // dead by this point — keeps propose() under Yul's stack budget. Reads
+        // the same storage arrays Task 6 re-resolves at execute time.
         _snapshotTier(p, _loadCalls(_executeCalls, proposalId));
 
         // Store co-proposers and set collaboration deadline
@@ -409,8 +410,13 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // tier 0/1 whose adapter demoted (codehash change, revocation) since
         // propose is under-covered — block execution rather than run a
         // possibly-unbounded batch against a bounded-tier coverage price.
-        (uint8 liveTier,) = _resolveTier(calls, proposal.maxCapital);
+        // Finding 5(b): tier alone misses a same-tier RE-certification with a
+        // HIGHER extractableBoundBps — also revert when the re-resolved
+        // coverage exceeds the propose-time snapshot Plan B will consume.
+        (uint8 liveTier, uint256 liveCoverage) =
+            _resolveTierAndCoverage(calls, _loadCalls(_settlementCalls, proposalId), proposal.maxCapital);
         if (liveTier > proposal.envelopeTier) revert TierRegressed();
+        if (liveCoverage > proposal.requiredCoverage) revert CoverageRegressed();
 
         // Execute the opening calls via the vault. The risk envelope's
         // maxCapital caps the batch's net asset outflow (spec 2026-07-22 §3.1).
@@ -775,34 +781,69 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         if (maxCapital > ceiling) revert MaxCapitalExceedsCeiling();
     }
 
-    /// @dev Thin store-wrapper around `_resolveTier`, hoisted out of `propose`
-    ///      to keep that function under Yul's stack budget (see
-    ///      `_initPendingProposal`). Implicit calldata→memory copy of `calls`.
-    function _snapshotTier(StrategyProposal storage p, BatchExecutorLib.Call[] memory calls) private {
+    /// @dev Thin store-wrapper around `_resolveTierAndCoverage`, hoisted out of
+    ///      `propose` to keep that function under Yul's stack budget (see
+    ///      `_initPendingProposal`). Reads p.maxCapital / p.id from storage
+    ///      (written before this call in `propose`) rather than taking them as
+    ///      stack arguments — the propose() call site must stay exactly
+    ///      `(p, _loadCalls(...))`-shaped or Yul goes "too deep by 1 slot".
+    function _snapshotTier(StrategyProposal storage p, BatchExecutorLib.Call[] memory execCalls) private {
         // Finding 3: envelope ceiling check. Lives here (not in propose's
-        // validation block) purely for Yul stack budget — an extra call frame
-        // in propose() tips "too deep by 1 slot". Same-tx revert either way.
-        // Reads p.maxCapital from storage (written immediately before this call
-        // in `propose`) rather than taking it as a stack argument.
+        // validation block) purely for the same stack-budget reason — an extra
+        // call frame in propose() tips it over. Same-tx revert either way.
         _checkMaxCapitalCeiling(p.maxCapital);
-        (uint8 tier_, uint256 coverage_) = _resolveTier(calls, p.maxCapital);
+        (uint8 tier_, uint256 coverage_) =
+            _resolveTierAndCoverage(execCalls, _loadCalls(_settlementCalls, p.id), p.maxCapital);
         p.envelopeTier = tier_;
         p.requiredCoverage = coverage_;
     }
 
-    /// @dev Proposal tier = max tier across execute calls; coverage = the
+    /// @dev Proposal tier = max tier across EXECUTE calls; coverage = the
     ///      extractable-weighted demand the aggregate exposure cap will consume.
-    ///      With no registry wired every proposal is tier 2 / full notional —
-    ///      strictly the safe default. `memory` params (not calldata) so Task 6
-    ///      can reuse it on storage-loaded calls at execute time.
-    function _resolveTier(BatchExecutorLib.Call[] memory calls, uint256 maxCapital)
-        private
-        view
-        returns (uint8 tier, uint256 coverage)
-    {
+    ///
+    ///      Finding 5(a): coverage is the SUM of per-call contributions across
+    ///      BOTH execute and settlement calls — a single MAX bound under-counted
+    ///      multi-adapter batches (two 50%-bound adapters can each extract
+    ///      their bound) and ignored settlement-routed extraction entirely
+    ///      (settlement calls are arbitrary, pre-committed calldata). Per-call
+    ///      notional is not threaded through in Plan A, so each call
+    ///      conservatively uses maxCapital as its notional:
+    ///        coverage = maxCapital * Σ(boundBps_i) / 10_000,
+    ///      boundBps_i = the certified bound for tier-0/1 calls, 10_000 (full
+    ///      notional) for tier-2/uncertified calls. Monotonic and
+    ///      never-under-counting; deliberately OVER-counts multi-call batches
+    ///      (n tier-2 calls price n×maxCapital). Plan B should thread a
+    ///      per-call notional through to tighten this — requiredCoverage is
+    ///      inert in Plan A (never consumed), so over-counting costs nothing
+    ///      today and can only make Plan B's aggregate cap conservative.
+    ///
+    ///      With no registry wired every proposal is tier 2 / full notional
+    ///      (coverage = maxCapital) — the pre-registry safe default; Plan B's
+    ///      cap cannot operate without a registry anyway. `memory` params (not
+    ///      calldata) so Task 6 can reuse it on storage-loaded calls at
+    ///      execute time.
+    function _resolveTierAndCoverage(
+        BatchExecutorLib.Call[] memory execCalls,
+        BatchExecutorLib.Call[] memory settleCalls,
+        uint256 maxCapital
+    ) private view returns (uint8 tier, uint256 coverage) {
         address registry = _tierRegistry;
         if (registry == address(0)) return (2, maxCapital);
-        uint16 maxBoundBps = 0;
+        (uint8 execTier, uint256 execBps) = _scanCalls(registry, execCalls);
+        (, uint256 settleBps) = _scanCalls(registry, settleCalls);
+        tier = execTier;
+        // Σ boundBps ≤ 10_000 * 2 * MAX_CALLS_PER_PROPOSAL and maxCapital ≤
+        // totalAssets (propose ceiling) — no realistic overflow.
+        coverage = (maxCapital * (execBps + settleBps)) / 10_000;
+    }
+
+    /// @dev Max tier and Σ extractable-bound bps (10_000 per tier-2 call)
+    ///      across `calls`, resolved through the TierRegistry.
+    function _scanCalls(address registry, BatchExecutorLib.Call[] memory calls)
+        private
+        view
+        returns (uint8 tier, uint256 sumBps)
+    {
         for (uint256 i = 0; i < calls.length; i++) {
             bytes memory d = calls[i].data;
             bytes4 sel;
@@ -813,9 +854,8 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             }
             (uint8 t, uint16 boundBps) = ITierRegistry(registry).tierOf(calls[i].target, sel);
             if (t > tier) tier = t;
-            if (boundBps > maxBoundBps) maxBoundBps = boundBps;
+            sumBps += boundBps;
         }
-        coverage = tier == 2 ? maxCapital : (maxCapital * maxBoundBps) / 10_000;
     }
 
     /// @dev Push calldata calls into a storage mapping slot
