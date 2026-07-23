@@ -195,7 +195,14 @@ contract FeeBlacklistHandler is Test {
         vault.setAgentFeeBps(perfFeeBps);
         vm.prank(leadAgent);
         uint256 proposalId = governor.propose(
-            address(vault), address(0), "ipfs://test", strategyDuration, GovEnvelope.permissive(address(vault)), calls, calls, coProps
+            address(vault),
+            address(0),
+            "ipfs://test",
+            strategyDuration,
+            GovEnvelope.permissive(address(vault)),
+            calls,
+            calls,
+            coProps
         );
 
         // Move past the snapshot block so checkpoints are readable.

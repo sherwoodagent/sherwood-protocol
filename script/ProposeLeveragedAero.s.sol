@@ -54,9 +54,8 @@ contract ProposeLeveragedAero is ScriptBase {
         // maxCapital at maxCapitalBps (default 100%) of the vault's
         // totalAssets() at propose time, so uint256.max would revert
         // MaxCapitalExceedsCeiling.
-        ISyndicateGovernor.RiskEnvelope memory envelope = ISyndicateGovernor.RiskEnvelope({
-            maxCapital: IERC4626(vault).totalAssets(), maxDrawdownBps: 10_000
-        });
+        ISyndicateGovernor.RiskEnvelope memory envelope =
+            ISyndicateGovernor.RiskEnvelope({maxCapital: IERC4626(vault).totalAssets(), maxDrawdownBps: 10_000});
 
         vm.startBroadcast();
         uint256 proposalId = ISyndicateGovernor(governor)
