@@ -1,7 +1,7 @@
 # Guardian Economic Security: Making Coordinated Collusion Infeasible
 
 **Date:** 2026-07-22
-**Status:** Design of record (per re-review #4760018146) — F1–F6 + precision items remediated; R1/R2/R3 + F4-viability + scope tracked as pre-launch gates (§3.4, §3.8, §3.10, §4, §8)
+**Status:** Design of record (per re-review #4760018146) — F1–F6 + precision items remediated; F4-viability + scope tracked as pre-launch gates. **Scope cuts 2026-07-22:** salami/drawdown machinery removed (slow-bleed accepted as a monitored risk, §7/§8); multi-collateral bonds deferred to v2 (v1 is WOOD-only with a hard covered-TVL ceiling, §3.7).
 **Scope:** GuardianRegistry, StakedWood, SyndicateVault (custody guards + compensation escrow), SyndicateGovernor (approve quorum, proposer bond, hooks)
 
 ## 0. Revision log
@@ -12,10 +12,10 @@ central inequality leaks in the regime v1 actually ships. This revision
 remediates all of them:
 
 - **F1** slash-to-victim recoupment → compensation snapshot (§3.5, §3.8).
-- **F2** WOOD-denominated inequality → dollar-denominated coverage cap + multi-collateral pulled into v1 for over-budget vaults (§2, §3.7).
+- **F2** WOOD-denominated inequality → dollar-denominated coverage via a hard covered-TVL cap (§2, §3.7). Multi-collateral bonds (the ceiling-lifting fix) **deferred to v2 by decision 2026-07-22**; v1 launches WOOD-only, small-vault-only, cap binding hard.
 - **F3** retroactive liability presupposes a signer → explicit bond-encumbered approve quorum replaces pure optimistic passage for coverage-consuming proposals; cold-start addressed; risk-scaled proposer bond added (§3.3a, §3.9).
 - **F4** honest-guardian economics mispriced → coverage-weighted approver reward (§3.10).
-- **F5** temporal netting / salami → unstake delay covers the drawdown window; rotation-resistant drawdown key (§3.3, §3.4).
+- **F5** temporal netting → unstake delay covers the challenge window (§3.3). The salami/drawdown machinery this finding prompted (rolling-drawdown predicate, cross-vault accumulators, per-epoch cap, 30d lock) was subsequently **removed by decision** (2026-07-22); slow-bleed is now an accepted, monitoring-backstopped risk (§7, §8).
 - **F6** court capture / non-independent layers → pre-accumulation defense + panel-bond restructure (§3.5).
 - **Precision:** `slashableBond` defined (§3.3); §1 "equally" corrected; "reuses slash rails" framing corrected and authorized-slasher entrypoint made explicit (§4); `refundSlash` fate stated (§4).
 
@@ -78,8 +78,10 @@ first draft:
 1. **Coverage is dollar-denominated (F2).** The exposure cap (§3.3) measures
    `slashableBond(g)` at a conservative dollar haircut, and covered TVL per
    vault is capped so that total slashable dollars ≥ extractable dollars *even
-   under a WOOD drawdown*. Vaults whose TVL exceeds the WOOD-only budget must use
-   multi-collateral bonds (§3.7), which are therefore **in v1**, not deferred.
+   under a WOOD drawdown*. v1 enforces this by **capping covered TVL to the
+   WOOD-only budget** (§3.7) — a hard per-vault ceiling; multi-collateral bonds
+   (which would lift the ceiling) are deferred to v2. Large vaults do not launch
+   until then.
 2. **Recoupment is zero (F1).** Slash proceeds compensate **pre-drain-block
    shareholders** via a non-transferable claim snapshot, not the live ERC4626
    NAV. A coalition that drains, self-challenges, and accumulates shares from
@@ -167,17 +169,18 @@ Guardian-level invariant, checked at `voteOnProposal` (approve side):
   spills onto own stake). Counting full vote weight (own + full delegations)
   would violate the inequality at the accounting layer before any attack.
   `priceHaircut` (§5) converts WOOD to a conservative dollar value robust to a
-  WOOD drawdown; multi-collateral bond legs (§3.7) enter at their own haircuts.
+  WOOD drawdown. (v1 bonds are WOOD-only; multi-collateral legs at their own
+  haircuts are a v2 extension — §3.7.)
 - `k = 1` for tier-2 exposure (hard infeasibility where rugs live); tier-0/1
   exposure is weighted by certified extractable bound, not notional.
 - **No per-proposal earmark locks.** The cap nets across time: the same stake
   covers sequential proposals across many vaults; it blocks *simultaneous*
   over-exposure — the batching attack (approve N drains in one window, lose one
   bond once).
-- **Temporal exposure (F5).** "Open" = until the LONGER of the challenge window
-  and the trailing drawdown-predicate window (§3.4 predicate 5) has elapsed.
-  Unstake delay ≥ that same maximum (§5). A guardian cannot approve salami clips
-  and unstake before the aggregate-drawdown predicate can fire against them.
+- **Temporal exposure.** "Open" = until the challenge window (§3.4) has elapsed.
+  Unstake delay ≥ the challenge window (§5), so a guardian cannot approve and
+  unstake before its approvals can be challenged. (v1 does not track cumulative
+  cross-proposal drawdown — see the accepted salami risk in §8.)
 
 ### 3.3a Explicit approve quorum (F3)
 
@@ -208,30 +211,11 @@ Post-execution challenge window. Anyone may post a bonded challenge citing
 2. Execution price deviation beyond bound vs manipulation-resistant oracle.
 3. Outflow destination linkable to the proposer (funding-graph predicate).
 4. Allowance/ownership granted to a non-protocol address.
-5. **Aggregate rolling drawdown** (anti-salami): cumulative realized loss over a
-   trailing window exceeding an aggregate bound, challengeable independently of
-   any single proposal.
-   - **Rotation-resistant key (F5).** The drawdown bucket keys on the **vault**
-     alone (plus time window), not `(vault, proposer, guardian-set)`. Rotating
-     Sybil proposers or swapping one guardian out of the set no longer resets the
-     bucket. Approver liability for a drawdown breach attaches to every guardian
-     who approved any clip contributing to the windowed loss, pro-rata by the
-     extractable value they signed.
-   - **Cross-vault dimension (R3, re-review).** Vault-only keying kills the
-     Sybil-proposer and set-swap resets but still lets a coalition spread thin
-     slices across N vaults, each vault under its own 30-day bound. The exposure
-     cap (§3.3) bounds a guardian's *simultaneous* cross-vault exposure but not
-     *cumulative realized drawdown over time*. Closing this needs a second
-     accumulator keyed on the **proposer** and on the **guardian** — cumulative
-     realized loss attributable to a given proposer (or approver) across *all
-     vaults they touched* in the trailing window, breaching an aggregate bound
-     independently of any single vault. The proposer axis is the primary one (the
-     proposer is the attacker and cannot rotate without abandoning its agent
-     identity/registration); the guardian axis catches a colluding approver set
-     that rents itself out across vaults. Both are additional challengeable
-     predicates, not new execution gates.
-   - The per-epoch per-vault outflow cap complements these but is not relied on
-     alone (it is per-vault and set generously for real trading).
+5. **Single-proposal drawdown breach:** a proposal whose realized loss exceeds
+   its own declared `maxDrawdownBps` (§3.1). This gives the per-proposal envelope
+   teeth for one bad proposal; it is NOT an aggregate/rolling accumulator. v1
+   deliberately ships no cumulative cross-proposal or cross-vault drawdown
+   predicate (the slow-bleed "salami" attack is an accepted risk — §8).
 
 Flow:
 
@@ -323,25 +307,19 @@ Instead:
   pre-drain claim on stake it did not hold pre-drain, and claims cannot be bought
   from exiting honest holders because they are non-transferable.
 
-**Snapshot block for each conviction path (R1, re-review).** A single-proposal
-conviction has one execution block, so "pre-drain block" is unambiguous. A
-**drawdown-predicate conviction** (§3.4 #5) spans a trailing window with no single
-execution block and holders entering/exiting throughout. Rule: the compensation
-snapshot for a drawdown conviction is **time-weighted over the drawdown window** —
-each address's claim is proportional to its share-seconds held during the window,
-so a mid-window exiter is compensated for the period it was exposed and a
-mid-window enter-to-farm-the-payout accumulator earns only its (small) exposed
-share. The window-open block is the fallback if time-weighting proves too costly
-on-chain (weaker but still snapshot-gated, so still recoupment-free).
+**Snapshot block (R1, re-review).** Every conviction in v1 is tied to a single
+proposal's execution (predicates 1–5 all key on one proposal), so "pre-drain
+block" is unambiguous — the block before that proposal executed. (The trailing-
+window drawdown predicate that would have needed a time-weighted snapshot was
+removed with the rest of the salami machinery — §8.)
 
 **WOOD-only payout boundary (R1×F2 coupling, re-review).** Compensation is funded
-from slash proceeds, which are WOOD unless multi-collateral backs the bond. So a
-WOOD-only vault's *payout* re-inherits the F2 denomination gap even though its
-*cap* was fixed: victims are made whole only to the dollar value the slashed WOOD
-fetches at slash-time. This is the explicit boundary of the WOOD-only regime — it
-is acceptable only for vaults inside the WOOD budget (§3.7); any vault large
-enough for the gap to matter is already required to hold multi-collateral, whose
-non-WOOD legs fund the payout in stable value.
+from slash proceeds, which in v1 are WOOD. So a victim payout is worth only what
+the slashed WOOD fetches at slash-time — the same denomination gap the covered-TVL
+cap bounds on the coverage side. The cap is what keeps this acceptable: because
+covered TVL is held below the WOOD budget (§3.7), the dollars recoverable stay
+proportionate to the dollars at risk. v2 multi-collateral funds payouts partly in
+stable legs and lifts the ceiling.
 
 This mirrors the voting-snapshot primitive already in the design; the omission in
 the first draft was applying it to the payout as well as the vote.
@@ -425,22 +403,30 @@ design does not pretend otherwise.
 - **Demotion:** instant and permissionless on a passed challenge; codehash
   mismatch auto-demotes (§3.2).
 
-### 3.7 Multi-collateral bonds (now v1 for over-budget vaults — F2)
+### 3.7 Covered-TVL cap (WOOD-only in v1; multi-collateral deferred to v2)
 
 WOOD mcap (~$15M) cannot underwrite large TVL alone, and a colluding guardian can
 short WOOD (or the rug itself craters the token), so a WOOD-only bond's
-slash-time dollar value can fall far below the drain. Therefore:
+slash-time dollar value can fall below the drain. Multi-collateral bonds are the
+full fix, but they are a genuinely new accounting subsystem (per-leg haircuts,
+per-collateral oracle pricing) and were judged disproportionate for v1
+(decision 2026-07-22). Instead v1 makes R2 hold in dollars by **capping covered
+TVL**, not by adding collateral:
 
-- Covered TVL per vault is capped at the dollar value of the slashable bonds
-  behind it at the conservative `priceHaircut`. A vault whose TVL exceeds the
-  WOOD-only budget **cannot open coverage-consuming proposals** until backed by
-  multi-collateral bonds.
-- Guardian bonds may hold sWOOD + blue-chip collateral (USDC/ETH, or restaked
-  ETH), with a required WOOD skin-in-game slice. Each leg enters `slashableBond`
-  at its own haircut.
-- This is the piece that makes R2 true in dollars; it is **in v1** for any vault
-  above the WOOD budget, not deferred. Small vaults within the WOOD budget can
-  launch on WOOD-only bonds.
+- Covered TVL per vault is capped at the dollar value of the slashable WOOD bonds
+  behind it at the conservative `priceHaircut`. A vault **cannot open
+  coverage-consuming proposals beyond that cap** — the cap is a hard per-vault
+  TVL ceiling, not a trigger to add collateral.
+- Consequence, stated plainly: with WOOD-only bonds the per-vault safe-coverage
+  ceiling is low (a fraction of a ~$15M-mcap token at a conservative haircut —
+  plausibly low-single-digit millions per vault). Large vaults do not launch
+  until v2 multi-collateral exists. This is a **capacity ceiling accepted as a
+  scope decision**, not a security relaxation: inside the cap, R2 holds in
+  dollars; the cap is what keeps it holding.
+- **v2 — multi-collateral bonds.** Guardian bonds may hold sWOOD + blue-chip
+  collateral (USDC/ETH, or restaked ETH), each leg entering `slashableBond` at
+  its own haircut, lifting the per-vault ceiling. Required before any vault above
+  the WOOD-only budget onboards.
 
 ## 4. Phasing
 
@@ -476,34 +462,36 @@ the pieces that bound loss *before* the court:
 
 - **v1a — bound what moves (no new trust):** risk envelopes + per-proposal
   outflow metering; tiering with all §3.2 guards; adapter-submitter bond escrow;
-  dollar-denominated exposure cap with `slashableBond` as defined; covered-TVL
-  cap + multi-collateral for over-budget vaults; explicit approve quorum (§3.3a);
+  dollar-denominated exposure cap with `slashableBond` as defined; hard covered-TVL
+  cap (WOOD-only; multi-collateral is v2, §3.7); explicit approve quorum (§3.3a);
   risk-scaled proposer bond. This alone hard-caps extractable value and
   guarantees a covering signer — it degrades safely to "value-moving proposals
   need covering approvers or they don't execute" with no court yet.
 - **v1b — retroactive liability:** authorized-slasher entrypoint + compensation
-  escrow; challenge game (predicates 1–5, rotation-resistant drawdown key,
-  per-proposal freeze); watchtower funding; approver reward (§3.10).
+  escrow; challenge game (predicates 1–5, all single-proposal, per-proposal
+  freeze); watchtower funding; approver reward (§3.10).
 - **v1c — adjudication:** pre-exploit + pre-accumulation-hardened voting snapshot;
   two-layer court with the restructured panel bond.
 
-**v2:** adapter probation/downgrade automation, threshold-calibrated auto-demote
-circuit breakers (need live traffic to set thresholds without a DoS lever),
-dynamic k by risk class.
+**v2:** multi-collateral bonds (lifts the per-vault TVL ceiling — §3.7); adapter
+probation/downgrade automation; threshold-calibrated auto-demote circuit breakers
+(need live traffic to set thresholds without a DoS lever); dynamic k by risk
+class; on-chain cumulative-drawdown predicates if monitoring shows real
+slow-bleed attempts (§8).
 
-**Scope + liveness gate (re-review).** Fixing F2 pulled multi-collateral bonds
-(a genuinely new accounting subsystem: per-leg haircuts, per-collateral oracle
-pricing) into v1, and the F3 fail-open→fail-closed switch means liveness now
-*depends on* the F4 reward economics recruiting enough covering bond — an
-underfunded premium means legitimate proposals fail to reach approve quorum and
-flow halts, a coupling the optimistic-passage design did not have. Two hard gates
+**Scope + liveness gate (re-review, updated after 2026-07-22 scope cuts).**
+Multi-collateral bonds and the salami machinery were both cut from v1 as
+disproportionate, which shrinks the v1 surface back toward the "reuses existing
+rails" spirit. The remaining coupling to watch: the F3 fail-open→fail-closed
+switch means liveness now *depends on* the F4 reward economics recruiting enough
+covering bond — an underfunded premium means legitimate proposals fail to reach
+approve quorum and flow halts, a coupling optimistic passage did not have. Gates
 before v1a ships:
 
-1. Confirm multi-collateral + approve quorum + compensation escrow + dollar cap
-   can ship *jointly correct*, each with the one-sentence invariant + fuzz test
-   this section already requires. If they cannot, cut multi-collateral from the
-   first release and launch **WOOD-only, small-vault-only** (covered-TVL cap
-   binds hard), adding multi-collateral before any large vault onboards.
+1. Confirm the WOOD-only cap + approve quorum + compensation escrow ship
+   *jointly correct*, each with the one-sentence invariant + fuzz test this
+   section requires. Launch **WOOD-only, small-vault-only** with the covered-TVL
+   cap binding hard; no large vault onboards until v2 multi-collateral exists.
 2. Validate the §3.10 ROE arithmetic at the intended launch TVL/tier mix before
    flipping passage to fail-closed; if the premium underfunds at target scale,
    either lower the capacity target or keep optimistic passage for the
@@ -515,10 +503,9 @@ before v1a ships:
 |---|---|---|
 | k (tier-2 aggregate cap) | 1 | hard infeasibility for arbitrary calldata |
 | `priceHaircut` (WOOD→USD) | conservative, ≤ 30-day-low | robust to a coordinated WOOD drawdown |
-| Covered-TVL cap per vault | Σ slashableBond · priceHaircut | over-budget vaults require multi-collateral |
+| Covered-TVL cap per vault | Σ slashableBond · priceHaircut | hard ceiling in v1 (WOOD-only); v2 multi-collateral lifts it |
 | Challenge window | 14d tier-2, 7d tier-0/1 | shorter window recycles coverage faster |
-| Drawdown predicate window | 30d rolling, keyed on vault | rotation-resistant |
-| **Unstake / exposure-open delay** | **≥ 30d (max of challenge + drawdown windows)** | fixes F5 salami-then-unstake |
+| Unstake / exposure-open delay | ≥ challenge window | guardian can't unstake before its approvals can be challenged |
 | Challenger bond | scales with frozen exposure | griefing deterrent |
 | Proposer bond | fraction of `maxExtractable` | first-loss, → compensation escrow |
 | Approver reward | coverage-weighted premium | target ROE clears tail-risk hurdle |
@@ -531,7 +518,9 @@ before v1a ships:
 - Intra-block divergence between guard valuation and independent TWAP on any
   tier-0/1 execution (valuation manipulation).
 - Per-vault realized alpha vs benchmark: variance, venue Herfindahl,
-  guardian-approval overlap (slow drain).
+  guardian-approval overlap. **This is v1's primary (and only) defense against the
+  slow-bleed salami attack** — see §8; on-chain salami predicates were cut, so a
+  bleed is caught by this dashboard + human/watchtower reaction, not automatically.
 - Challenge activity: filings, challenger loss rate, frozen-exposure ratio
   (silence = no watchtower; high-loss-rate-with-rising-filings = griefing).
 - Tier-2 exposure utilization vs queued proposals (throughput strangulation).
@@ -563,12 +552,26 @@ before v1a ships:
 - **Panel bond slashed only on merits overturn:** lets control of a cheap appeal
   immunize a corrupt panel; replaced by the separate bad-faith track + flat
   panelist reward + participation floor (§3.5, F6).
+- **On-chain anti-salami machinery (removed by decision, 2026-07-22).** The
+  earlier draft carried an aggregate rolling-drawdown predicate, cross-vault
+  proposer/guardian drawdown accumulators, a per-epoch per-vault outflow cap, and
+  a 30-day exposure lock to back them. Removed as disproportionate for v1: three
+  new accumulators plus cross-vault forensic tracking plus a long guardian stake
+  lock, for an attack that is slower, harder, and easier to catch by monitoring
+  than the one-shot rug the mechanical guards already stop. The slow-bleed is now
+  an **accepted risk** (§8), backstopped by the §6 alpha-vs-benchmark dashboard
+  and the watchtower, not by an on-chain predicate. The per-proposal
+  drawdown-breach predicate (§3.4 #5) is retained — it bounds a single bad
+  proposal, which is not salami.
 
 ## 8. Accepted risks / open questions
 
 - `priceHaircut` calibration is a live tension: too conservative starves
   throughput, too loose reopens F2. Tuned by governance against observed WOOD
-  volatility; monitored (§6).
+  volatility; monitored (§6). In v1 (WOOD-only, §3.7) it can't beat a forward
+  shock that pushes WOOD below any trailing low, which is precisely why the
+  covered-TVL cap is a hard ceiling and large vaults wait for v2 multi-collateral
+  — the cap, not the haircut, is what bounds the residual.
 - Pre-accumulation (F6) is *mitigated, not eliminated* — a patient, well-capitalized
   attacker who buys aged WOOD long before an exploit and clears the participation
   floor can still contest an appeal. The panel bad-faith track and the mechanical
@@ -585,10 +588,21 @@ before v1a ships:
 - Settlement/valuation oracles are load-bearing for guards, PnL, AND the
   pre-drain compensation snapshot; inherits and extends the frozen-settle-price
   work.
-- **Cross-vault cumulative salami (R3):** the proposer/guardian-axis drawdown
-  predicates (§3.4) close it in principle but are new accumulators; until built,
-  cross-vault spreading is a bounded residual whose only backstop is the
-  per-vault outflow cap. Track as a pre-launch gate.
+- **Slow-bleed / salami (accepted risk, decided 2026-07-22).** v1 ships no
+  on-chain cumulative-drawdown predicate (single-vault or cross-vault) and no
+  per-epoch outflow cap. A coalition that controls a counterparty and bleeds a
+  vault via many individually-in-envelope losing trades will not trip an
+  automatic predicate. This is a **deliberate scope decision**, accepted because:
+  (a) the attack is materially slower and harder than a one-shot rug (needs a
+  controlled counterparty and sustained plausible-deniability), (b) the mechanical
+  guards + single-proposal predicates already stop the fast rug, and (c) the §6
+  alpha-vs-benchmark + venue-concentration dashboard surfaces a sustained bleed
+  for watchtower/human intervention (pause, challenge the clip that breaches its
+  own envelope, deregister the guardian set). The residual: detection is
+  monitoring-plus-human, not automatic-plus-trustless, and a patient attacker
+  staying just inside every per-proposal envelope can extract more before
+  intervention than an automatic predicate would have allowed. Revisit in v2 if
+  monitoring shows real slow-bleed attempts.
 - **F4 is now priced-but-possibly-unaffordable at scale, not unpriced.** The
   §3.10 worked example shows the premium clears for bounded tiers and does not
   clear for large tier-2 exposure at the default fee share. This is a viability
