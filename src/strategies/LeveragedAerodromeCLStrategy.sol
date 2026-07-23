@@ -66,6 +66,7 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     error UnexpectedAssetDecimals();
     error UnexpectedFeedDecimals(); // AERO/USD aggregator not 8dp (L9 oracle-floor scaling assumption)
     error OracleParamOutOfRange();
+    error WidthOutOfBounds(); // width not a multiple of tickSpacing / outside [minWidth, maxWidth] band
     error FastRedeemExceedsLtv(uint256 ltvBps, uint256 maxLtvBps); // fast-path breaches maxLtvBps → use requestRedeem
     error NotRequestOwner();
     error RequestSettled();
@@ -135,6 +136,9 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         uint32 twapWindow; // TWAP lookback for the calm-gate (seconds)
         // ── Pool config ──
         int24 tickSpacing; // Slipstream pool tickSpacing (100 for primary pool)
+        uint24 width; // initial full position width (raw ticks, multiple of tickSpacing, in [minWidth,maxWidth])
+        uint24 minWidth; // immutable lower bound on width (≥ 2·tickSpacing)
+        uint24 maxWidth; // immutable upper bound on width
         // ── Risk params ──
         uint16 targetLtvBps; // Target LTV in bps (e.g. 5000 = 50%)
         uint16 maxLtvBps; // Maximum LTV cap in bps (e.g. 6500 = 65%)
@@ -205,6 +209,9 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         uint256 protocolFeeOwed;
         address aeroUsdFeed;
         uint256 nextRedeemRequestId;
+        uint24 width;
+        uint24 minWidth;
+        uint24 maxWidth;
     }
 
     /// @notice Full strategy storage layout (single accessor for tests / off-chain reads), minus the
@@ -249,6 +256,9 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         v.protocolFeeOwed = $.protocolFeeOwed;
         v.aeroUsdFeed = $.aeroUsdFeed;
         v.nextRedeemRequestId = $.nextRedeemRequestId;
+        v.width = $.width;
+        v.minWidth = $.minWidth;
+        v.maxWidth = $.maxWidth;
     }
 
     /// @notice A single escrowed async-redeem request by id (queue introspection for tests / UI).
@@ -319,6 +329,15 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         if (p.twapWindow == 0 || p.twapWindow > 1 days) revert OracleParamOutOfRange();
         if (p.calmDeviationTicks == 0 || p.calmDeviationTicks > 5000) revert OracleParamOutOfRange();
         if (p.maxSlippageBps == 0 || p.maxSlippageBps > 1000) revert OracleParamOutOfRange();
+        // Width band (Mamo rerange param): full width in raw ticks, each of {width,min,max} a multiple
+        // of the (positive) tickSpacing, minWidth ≥ 2·tickSpacing (one spacing/side), minWidth ≤ width
+        // ≤ maxWidth. The band is immutable after init; only `width` moves (per-rerange, in-band).
+        if (p.tickSpacing <= 0) revert WidthOutOfBounds();
+        uint24 tsU = uint24(p.tickSpacing);
+        if (p.minWidth == 0 || p.maxWidth == 0) revert WidthOutOfBounds();
+        if (p.minWidth % tsU != 0 || p.maxWidth % tsU != 0) revert WidthOutOfBounds();
+        if (uint256(p.minWidth) < 2 * uint256(tsU)) revert WidthOutOfBounds();
+        _requireWidthInBand(p.width, p.minWidth, p.maxWidth, p.tickSpacing);
         if ((p.managementFeeBps != 0 || p.performanceFeeBps != 0) && p.feeRecipient == address(0)) {
             revert FeeRecipientRequired();
         }
@@ -348,6 +367,9 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         $.calmDeviationTicks = p.calmDeviationTicks;
         $.twapWindow = p.twapWindow;
         $.tickSpacing = p.tickSpacing;
+        $.width = p.width;
+        $.minWidth = p.minWidth;
+        $.maxWidth = p.maxWidth;
         $.targetLtvBps = p.targetLtvBps;
         $.maxLtvBps = p.maxLtvBps;
         $.minHealthBps = p.minHealthBps;
@@ -372,6 +394,15 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
         }
         cfBps = uint16(cfMantissa / 1e14); // 0.88e18 / 1e14 = 8800
         if (cfBps == 0) revert ComptrollerCallFailed();
+    }
+
+    /// @dev Revert `WidthOutOfBounds` unless `width` (full width, raw ticks) is a multiple of the
+    ///      positive `tickSpacing` and within [minWidth, maxWidth]. Shared by `_initialize` (init
+    ///      band) and `rerange` (stored band). The `tickSpacing <= 0` short-circuit guards the modulo.
+    function _requireWidthInBand(uint24 width, uint24 minWidth, uint24 maxWidth, int24 tickSpacing) private pure {
+        if (tickSpacing <= 0 || width % uint24(tickSpacing) != 0 || width < minWidth || width > maxWidth) {
+            revert WidthOutOfBounds();
+        }
     }
 
     // ── NAV ──
@@ -709,11 +740,21 @@ contract LeveragedAerodromeCLStrategy is BaseStrategy, ReentrancyGuardTransient,
     ///
     ///         NO fee crystallisation: rerange changes neither supply nor NAV, so the streaming fee is
     ///         deferred to the next crystallize point (not lost) and the HWM is unaffected.
+    ///
+    ///         `width` is the new FULL position width in raw ticks: it must be a multiple of the pool
+    ///         `tickSpacing` and lie within the immutable [minWidth, maxWidth] band (else
+    ///         `WidthOutOfBounds`). It is validated HERE (a pure input check) before the delegatecall
+    ///         and PERSISTED (`layout().width`), so the Mamo rebalancer picks a width each cycle and the
+    ///         recenter straddles the current tick with `width/2` ticks each side (± one spacing from
+    ///         alignment).
+    /// @param width   New full position width in raw ticks (multiple of tickSpacing, in [minWidth,maxWidth]).
     /// @param minLiq0 Minimum token0 (WETH) the re-add must consume (two-sided slippage guard).
     /// @param minLiq1 Minimum token1 (cbBTC) the re-add must consume (two-sided slippage guard).
-    function rerange(uint256 minLiq0, uint256 minLiq1) external onlyProposer nonReentrant {
+    function rerange(uint24 width, uint256 minLiq0, uint256 minLiq1) external onlyProposer nonReentrant {
         if (_state != State.Executed) revert NotExecuted();
-        LeveragedAeroManager.rerangeImpl(minLiq0, minLiq1);
+        LeveragedAeroStorage.Layout storage $ = _layout();
+        _requireWidthInBand(width, $.minWidth, $.maxWidth, $.tickSpacing);
+        LeveragedAeroManager.rerangeImpl(width, minLiq0, minLiq1);
     }
 
     /// @notice Retarget the position's LTV to `targetLtvBps_` (borrow/repay; no new USDC). Collateral

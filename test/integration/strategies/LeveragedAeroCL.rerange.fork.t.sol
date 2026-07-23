@@ -154,6 +154,9 @@ contract LeveragedAeroCLRerangeFork is LeveragedAeroForkBase {
             calmDeviationTicks: 500,
             twapWindow: 1800,
             tickSpacing: BaseAddresses.CBBTC_WETH_TICK_SPACING,
+            width: 4000, // full width (raw ticks) = 40·tickSpacing (preserves the pre-param 20-spacing/side range)
+            minWidth: 200, // 2·tickSpacing
+            maxWidth: 20000,
             targetLtvBps: TARGET_LTV_BPS,
             maxLtvBps: MAX_LTV_BPS,
             minHealthBps: MIN_HEALTH_BPS,
@@ -232,7 +235,7 @@ contract LeveragedAeroCLRerangeFork is LeveragedAeroForkBase {
         // Recenter (NO swap). minLiq0/minLiq1 = 0: the always-on maxSlippageBps mins + the
         // calm-gate are the real protection; the caller two-sided mins are an additional belt.
         vm.prank(proposer);
-        strategy.rerange(0, 0);
+        strategy.rerange(4000, 0, 0);
 
         // (1) NAV conserved — no swap-loss; principal preserved. Tolerance covers the collected LP
         //     fees + the oracle-vs-pool split convexity realized on removal + dust (NO swap loss).
@@ -292,7 +295,7 @@ contract LeveragedAeroCLRerangeFork is LeveragedAeroForkBase {
 
         vm.prank(proposer);
         vm.expectRevert(LeveragedAeroValuation.CalmGateBreached.selector);
-        strategy.rerange(0, 0);
+        strategy.rerange(4000, 0, 0);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -303,7 +306,7 @@ contract LeveragedAeroCLRerangeFork is LeveragedAeroForkBase {
         if (_skip) return;
         vm.prank(stranger);
         vm.expectRevert(BaseStrategy.NotProposer.selector);
-        strategy.rerange(0, 0);
+        strategy.rerange(4000, 0, 0);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -322,7 +325,7 @@ contract LeveragedAeroCLRerangeFork is LeveragedAeroForkBase {
         (, int24 tickStart,,,,) = ICLPool(POOL).slot0();
         _shoveToTick(tickStart - 300);
         vm.prank(proposer);
-        strategy.rerange(0, 0);
+        strategy.rerange(4000, 0, 0);
 
         uint256 idleCb = IERC20(CBBTC).balanceOf(address(strategy));
         uint256 idleWeth = IERC20(WETH).balanceOf(address(strategy));
@@ -355,5 +358,73 @@ contract LeveragedAeroCLRerangeFork is LeveragedAeroForkBase {
         assertApproxEqRel(
             strategy.nav(), navBeforeRedeem - fairShare, 0.03e18, "stayer NAV not preserved after partial redeem"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Test 5: the genesis mint (setUp's execute) honors the init-configured width.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice The opening position spans the init `width` (4000 raw ticks). Both range ends are
+    ///         tickSpacing-aligned, so the realized full width is width ± one spacing.
+    function test_genesisMint_honorsInitWidth() public view {
+        if (_skip) return;
+        assertEq(uint256(strategy.layout().width), 4000, "init width not stored");
+        int24 span = strategy.layout().posTickUpper - strategy.layout().posTickLower;
+        assertApproxEqAbs(uint256(int256(span)), 4000, uint256(int256(TICK_SPACING)), "genesis width != init width");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Test 6: rerange with a different in-band width recenters at the new span AND persists it.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    function test_rerange_appliesAndPersistsNewWidth() public {
+        if (_skip) return;
+        assertEq(uint256(strategy.layout().width), 4000, "precondition: init width");
+
+        uint24 newWidth = 8000; // in [minWidth 200, maxWidth 20000], multiple of tickSpacing 100
+        vm.prank(proposer);
+        strategy.rerange(newWidth, 0, 0);
+
+        // (1) Persisted: layout() reflects the new width (the rebalancer reads it on-chain).
+        assertEq(uint256(strategy.layout().width), newWidth, "new width not persisted");
+
+        // (2) Recentered at the new span: the realized full width tracks newWidth (± one spacing),
+        //     roughly double the genesis 4000, and straddles the current tick.
+        (, int24 tickNow,,,,) = ICLPool(POOL).slot0();
+        int24 newLower = strategy.layout().posTickLower;
+        int24 newUpper = strategy.layout().posTickUpper;
+        assertApproxEqAbs(
+            uint256(int256(newUpper - newLower)), newWidth, uint256(int256(TICK_SPACING)), "range width != newWidth"
+        );
+        assertLt(newLower, tickNow, "new lower !< current tick");
+        assertLt(tickNow, newUpper, "current tick !< new upper");
+
+        // (3) Still healthy (rerange would revert in _assertHealthy otherwise).
+        assertLe(_ltvBps(), MAX_LTV_BPS, "post-rerange LTV exceeds maxLtvBps");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Test 7: rerange rejects an out-of-band / misaligned width (strategy-side, pre-delegatecall).
+    // ─────────────────────────────────────────────────────────────────────────
+
+    function test_rerange_revertsWidthBelowMin() public {
+        if (_skip) return;
+        vm.prank(proposer);
+        vm.expectRevert(LeveragedAerodromeCLStrategy.WidthOutOfBounds.selector);
+        strategy.rerange(100, 0, 0); // < minWidth 200 (aligned)
+    }
+
+    function test_rerange_revertsWidthAboveMax() public {
+        if (_skip) return;
+        vm.prank(proposer);
+        vm.expectRevert(LeveragedAerodromeCLStrategy.WidthOutOfBounds.selector);
+        strategy.rerange(20100, 0, 0); // > maxWidth 20000 (aligned)
+    }
+
+    function test_rerange_revertsWidthMisaligned() public {
+        if (_skip) return;
+        vm.prank(proposer);
+        vm.expectRevert(LeveragedAerodromeCLStrategy.WidthOutOfBounds.selector);
+        strategy.rerange(4050, 0, 0); // in band but not a multiple of tickSpacing 100
     }
 }
