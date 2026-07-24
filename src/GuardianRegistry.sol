@@ -140,11 +140,6 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     ///      `address public governor` singleton is repurposed as the EnumerableSet
     ///      internal storage; callers must use `addGovernor` after deploy.
     EnumerableSet.AddressSet private _authorizedGovernors;
-    /// @dev Vault served by each authorized governor (1:1, factory-wired at
-    ///      `addGovernor`); the slash path resolves the vault from this trusted
-    ///      mapping so a compromised governor cannot misdirect `slashOwnerBond`
-    ///      to an arbitrary vault.
-    mapping(address => address) public vaultOf;
     /// @dev Retained post-slim purely as an alignment beacon: the slimmed
     ///      registry no longer gates any logic on `factory` (factory-gated
     ///      staking moved to sWOOD), but `SyndicateFactory.setGuardianRegistry`
@@ -157,6 +152,15 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     ///         and calls sWOOD to slash. Set in `initialize`.
     IStakedWood public swood;
 
+    /// @dev Vault served by each authorized governor (1:1, factory-wired at
+    ///      `addGovernor`); the slash path resolves the vault from this trusted
+    ///      mapping so a compromised governor cannot misdirect `slashOwnerBond`
+    ///      to an arbitrary vault.
+    /// @dev APPENDED here (not next to `_authorizedGovernors`) so no
+    ///      pre-existing field moves: new fields go immediately before `__gap`
+    ///      and consume one gap slot.
+    mapping(address => address) public vaultOf;
+
     // Guardian-fee reward distribution is OFF-CHAIN (buyback-WOOD via weekly
     // Merkl): the governor sends the fee slice to the team `guardiansFeeRecipient`
     // multisig and emits `GuardianFeeAccrued`; the bot reads that event +
@@ -165,8 +169,11 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     // (Slots freed; the __gap below absorbs the layout delta — this is a fresh
     // V1.5 mainnet redeployment so no live storage to migrate.)
 
-    /// @dev Reserved storage for future upgrades.
-    uint256[50] private __gap;
+    /// @dev Reserved storage for future upgrades. Reduced 50 -> 49 when
+    ///      `vaultOf` was appended above, so the total slot count is conserved.
+    ///      Expect a further 49 -> 48 reduction when `exposureLedger` is
+    ///      appended; every new field takes one slot from here.
+    uint256[49] private __gap;
 
     /// @notice Per-deployment hard floor for `reviewPeriod` (impl-time immutable;
     ///         mainnet 6h). Lives in bytecode, not storage — the layout above is
