@@ -18,6 +18,16 @@ interface IGuardianRegistry {
         Block
     }
 
+    /// @notice Review outcome — the guardian review's verdict on a proposal.
+    ///         Deterministic from stored review state once the window ends.
+    ///         Unresolved before reviewEnd (or when unregistered); a never-opened
+    ///         or cohort-too-small review Clears.
+    enum ReviewOutcome {
+        Unresolved,
+        Cleared,
+        Blocked
+    }
+
     // ── Errors ──
     error ZeroAddress();
     error NotActiveGuardian();
@@ -148,6 +158,14 @@ interface IGuardianRegistry {
         external
         view
         returns (bool opened, bool resolved, bool blocked, bool cohortTooSmall);
+
+    /// @notice The guardian review's verdict on a proposal, as a pure view.
+    ///         Mirrors `resolveReview`'s committed result WITHOUT mutating or
+    ///         slashing: `Unresolved` before `reviewEnd` (or when unregistered),
+    ///         `Blocked`/`Cleared` once the window has elapsed, and the cached
+    ///         flag once resolved. Shares the `_isBlocked` predicate with
+    ///         `resolveReview` so the view can never drift from the commit.
+    function outcomeOf(address governor, uint256 proposalId) external view returns (ReviewOutcome);
 
     /// @notice Per-proposal approver set + their snapshot vote weights + the
     ///         summed approve-weight denominator. Read by the off-chain Merkl bot.

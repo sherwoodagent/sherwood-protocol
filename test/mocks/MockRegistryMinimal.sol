@@ -146,6 +146,10 @@ contract MockRegistryMinimal is IGuardianRegistry {
         revert NotImplemented();
     }
 
+    function outcomeOf(address, uint256) external pure returns (ReviewOutcome) {
+        revert NotImplemented();
+    }
+
     function factory() external pure returns (address) {
         revert NotImplemented();
     }

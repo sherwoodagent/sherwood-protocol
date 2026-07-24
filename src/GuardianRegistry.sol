@@ -288,6 +288,16 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         return keccak256(abi.encode(gov, proposalId));
     }
 
+    /// @dev Single block-quorum predicate shared by `outcomeOf` (view) and
+    ///      `resolveReview` (economic commit) so the view can never drift from
+    ///      the committed result. Callers must apply the `!opened` /
+    ///      `cohortTooSmall` short-circuits (both mean not-blocked) BEFORE this;
+    ///      it evaluates only the at-open block-quorum comparison.
+    function _isBlocked(Review storage r) private view returns (bool) {
+        uint256 denom = uint256(r.totalStakeAtOpen) + uint256(r.totalDelegatedAtOpen);
+        return uint256(r.blockStakeWeight) * 10_000 >= uint256(r.blockQuorumBpsAtOpen) * denom;
+    }
+
     // ── sWOOD passthrough views (so `GovernorEmergency` can read the owner
     //    bond through the registry handle without a separate sWOOD reference) ──
 
@@ -590,10 +600,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         // the check — quorum is not meaningful when `totalStakeAtOpen` is
         // below the floor. Sherlock run #2 #15: use the at-open snapshot.
         if (!r.cohortTooSmall) {
-            uint256 denom = uint256(r.totalStakeAtOpen) + uint256(r.totalDelegatedAtOpen);
-            if (uint256(r.blockStakeWeight) * 10_000 >= uint256(r.blockQuorumBpsAtOpen) * denom) {
-                revert ReviewNotOpen();
-            }
+            if (_isBlocked(r)) revert ReviewNotOpen();
         }
         r.resolved = true;
         r.blocked = false;
@@ -671,10 +678,10 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
             return false;
         }
 
-        // Denominator is own stake + delegated stake at review open.
-        // Sherlock run #2 #15: use the at-open block-quorum snapshot.
-        uint256 denom = uint256(r.totalStakeAtOpen) + uint256(r.totalDelegatedAtOpen);
-        bool blocked_ = (uint256(r.blockStakeWeight) * 10_000 >= uint256(r.blockQuorumBpsAtOpen) * denom);
+        // Block-quorum decision: own stake + delegated stake at review open vs
+        // the at-open quorum snapshot (Sherlock run #2 #15). Shared with the
+        // `outcomeOf` view via `_isBlocked` so the two can never disagree.
+        bool blocked_ = _isBlocked(r);
 
         // CEI: commit state BEFORE the external slash call.
         r.resolved = true;
@@ -931,5 +938,29 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     {
         Review storage r = _reviews[_reviewKey(governor, proposalId)];
         return (r.opened, r.resolved, r.blocked, r.cohortTooSmall);
+    }
+
+    /// @inheritdoc IGuardianRegistry
+    /// @dev Pure mirror of `resolveReview`'s committed result. Branch order:
+    ///      (1) resolved → cached `blocked` flag (the commit already happened);
+    ///      (2) before `reviewEnd` (or unregistered, `reviewEnd == 0`) →
+    ///      `Unresolved` (not yet determinable);
+    ///      (3) window elapsed but not committed → `Cleared` when the review was
+    ///      never opened or the cohort was too small, else the shared
+    ///      `_isBlocked` predicate decides. The `!opened` / `cohortTooSmall`
+    ///      short-circuits stay OUTSIDE `_isBlocked`, exactly as `resolveReview`
+    ///      applies them before its own `_isBlocked` call.
+    function outcomeOf(address governor, uint256 proposalId) external view returns (ReviewOutcome) {
+        Review storage r = _reviews[_reviewKey(governor, proposalId)];
+        if (r.resolved) {
+            return r.blocked ? ReviewOutcome.Blocked : ReviewOutcome.Cleared;
+        }
+        if (r.reviewEnd == 0 || block.timestamp < r.reviewEnd) {
+            return ReviewOutcome.Unresolved;
+        }
+        if (!r.opened || r.cohortTooSmall) {
+            return ReviewOutcome.Cleared;
+        }
+        return _isBlocked(r) ? ReviewOutcome.Blocked : ReviewOutcome.Cleared;
     }
 }
