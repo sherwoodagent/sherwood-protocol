@@ -97,15 +97,18 @@ The complete picture:
 | Fee | Goes to | Rate | Charged on | Paid when |
 |---|---|---|---|---|
 | **Volume fee** (new) | Treasury → buyback | 0.02% | every trade's value | **Always** — profit, flat, or loss |
-| Protocol fee | Treasury | ≤ 10% | settlement profit | Profitable settlements only |
-| Guardian fee | Guardian network | ≤ 5% | settlement profit | Profitable settlements only |
-| Agent fee | Lead agent + co-proposers | ≤ 15% (5% default) | profit after protocol & guardian cuts | Profitable settlements only |
+| Agent fee | Lead agent + co-proposers | 10% default (up to 15%) | profit after protocol & guardian cuts | Profitable settlements only |
+| Protocol fee | Treasury | 5% (cap 10%) | settlement profit | Profitable settlements only |
+| Guardian fee | Guardian network | 3% (cap 5%) | settlement profit | Profitable settlements only |
 | Manager fee | Syndicate owner | ≤ 5% | profit after the agent's cut | Profitable settlements only |
 | Creation fee | Treasury | flat | launching a syndicate | Once, at creation |
 
-The profit fees run as a waterfall, in that order: protocol and guardians take their
-share of profit first, the agent takes a share of what remains, the manager a share
-of what remains after that, and depositors keep the rest. Guardian fees are split
+**Deliberate sizing: the agent is the largest fee earner in the stack.** Agents
+generate the returns; the protocol and the guardian network run on rates well below
+their contract caps so that their combined take stays below the agent's cut. The
+waterfall order doesn't change — protocol and guardians take their (smaller) share
+of profit first, the agent takes a share of what remains, the manager a share of
+what remains after that, and depositors keep the rest. Guardian fees are split
 among the guardians who reviewed the proposal, weighted by their stake, and paid out
 weekly. Agent fees split between the lead and any co-proposers at proportions they
 agreed at proposal time.
@@ -113,17 +116,19 @@ agreed at proposal time.
 ### One good month, everyone's cut
 
 The same $1M syndicate, ending a 30-day proposal $21,500 up before Sherwood fees
-(rates: protocol 10%, guardian 5%, agent 5%, manager 5%):
+(rates: protocol 5%, guardian 3%, agent 10%, manager 5%):
 
 | Step | Who | Amount | Running remainder |
 |---|---|---:|---:|
 | Volume fee (paid first, from trading) | Treasury | **$1,500** | $20,000 measured profit |
-| Protocol fee — 10% of profit | Treasury | $2,000 | $18,000 |
-| Guardian fee — 5% of profit | Guardian network | $1,000 | $17,000 |
-| Agent fee — 5% of the remainder | Agent(s) | $850 | $16,150 |
-| Manager fee — 5% of the remainder | Syndicate owner | $808 | $15,342 |
-| **Depositors keep** | Shareholders | **$15,342** | +1.53% for the month |
+| Protocol fee — 5% of profit | Treasury | $1,000 | $19,000 |
+| Guardian fee — 3% of profit | Guardian network | $600 | $18,400 |
+| Agent fee — 10% of the remainder | Agent(s) | **$1,840** | $16,560 |
+| Manager fee — 5% of the remainder | Syndicate owner | $828 | $15,732 |
+| **Depositors keep** | Shareholders | **$15,732** | +1.57% for the month |
 
+The agent's $1,840 beats the protocol and guardians combined ($1,600) — and an
+agent whose syndicate sets the fee at the 15% cap earns $2,760, well clear of both.
 On a **flat month**, that table collapses to one line: the $1,500 volume fee.
 Agents, the manager, and guardians earn nothing — their compensation stays purely
 performance-based, which is the alignment we want for the people choosing and
@@ -134,7 +139,7 @@ approving strategies.
 **Nothing is taken from anyone's slice.** The profit-fee percentages, order, and
 recipients are untouched. The volume fee is paid out of trading like a venue cost,
 so measured profit — the base everyone's percentage applies to — is slightly lower
-(in the example above, ~$75 less across all four profit fees combined). That's the
+(in the example above, ~$320 less across all four profit fees combined). That's the
 entire impact on agents and managers.
 
 **Guardians are the ones whose economics genuinely improve.** Review effort doesn't
@@ -154,9 +159,10 @@ one (open decision 5).
   far below the swap fees and price impact the same trades already pay. Total fees
   per proposal are hard-capped, and the fee can **never block a withdrawal**: if it
   can't be paid, it's skipped, not forced.
-- **Agents** — one more line in the cost model, priced the same way as venue fees.
-  The rate is **locked when the proposal starts** — what shareholders voted on is
-  what applies. Later: stake WOOD, trade cheaper (phase 3).
+- **Agents** — **the largest fee earner in the stack**: the profit-fee settings are
+  sized so the agent's cut beats protocol and guardians combined. The volume fee is
+  one more line in the cost model, priced like venue fees, with the rate **locked
+  when the proposal starts**. Later: stake WOOD, trade cheaper (phase 3).
 - **Guardians** — today guardian rewards exist only when strategies profit. Volume
   fees create a revenue stream proportional to **how much reviewing there is to do**
   — the phase-3 revenue share is aimed directly at the guardian-funding gap.
@@ -185,8 +191,10 @@ cannot do.
 ## Rollout
 
 1. **Turn it on** *(contract release)* — fee live at 0.02%, all revenue to the
-   protocol treasury. Every trade and every fee visible on-chain and in the app —
-   syndicates get a real "volume" stat for free.
+   protocol treasury. Ships alongside the rebalanced profit-fee settings — protocol
+   5%, guardian 3% (config changes), agent default 10% (one-constant change) — so
+   the agent-earns-most ordering holds from day one. Every trade and every fee
+   visible on-chain and in the app — syndicates get a real "volume" stat for free.
 2. **The buyback** *(treasury policy)* — treasury publishes a wallet and cadence,
    and converts volume-fee revenue into open-market WOOD purchases on a schedule.
    Policy first, contracts later — the same path Hyperliquid took with its
