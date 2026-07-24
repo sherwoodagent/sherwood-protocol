@@ -8,20 +8,12 @@ import {SyndicateFactory} from "../../src/SyndicateFactory.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {StakedWood} from "../../src/StakedWood.sol";
 import {PriceRouter} from "../../src/pricing/PriceRouter.sol";
-import {WoodToken} from "../../src/WoodToken.sol";
+import {WOOD} from "../../test/mocks/WoodToken.sol";
 import {UniswapSwapAdapter} from "../../src/adapters/UniswapSwapAdapter.sol";
 import {SynthraQuoterV2Shim} from "./SynthraQuoterV2Shim.sol";
 import {PortfolioStrategy} from "../../src/strategies/PortfolioStrategy.sol";
 import {StrategyFactory} from "../../src/StrategyFactory.sol";
 import {DeploySherwood} from "../Deploy.s.sol";
-
-/// @notice Minimal LayerZero endpoint stub — only `setDelegate`, called by the
-///         OApp constructor. Robinhood testnet has no LZ endpoint, and WOOD
-///         there is a non-production fixture (see WoodToken natspec), so a stub
-///         is sufficient to stand the token up for guardian staking.
-contract StubLzEndpoint {
-    function setDelegate(address) external {}
-}
 
 /**
  * @notice V2 Sherwood core + Portfolio-strategy ceremony for Robinhood L2
@@ -37,8 +29,8 @@ contract StubLzEndpoint {
  *
  *   Environment:
  *     WOOD_TOKEN            — Optional. If unset/zero, deploys a fixture WOOD
- *                             (StubLzEndpoint) and mints WOOD_MINT (default 100M)
- *                             to the deployer for guardian/owner staking.
+ *                             that mints WOOD_MINT (default 100M) to the
+ *                             deployer for guardian/owner staking.
  *     WOOD_MINT             — Optional fixture mint amount (default 100M).
  *     SKIP_MULTISIG_HANDOFF — "true"/"1" keeps the deployer as owner. Always true
  *                             on testnet (no multisig).
@@ -78,9 +70,8 @@ contract DeployRobinhoodTestnetV2 is DeploySherwood {
         // ── WOOD (fixture if unset) ──
         address woodToken = vm.envOr("WOOD_TOKEN", address(0));
         if (woodToken == address(0)) {
-            address stubEndpoint = address(new StubLzEndpoint());
-            WoodToken wood = new WoodToken(stubEndpoint, deployer);
-            wood.mint(deployer, vm.envOr("WOOD_MINT", DEFAULT_WOOD_MINT));
+            // Fixture WOOD mints its full supply to the deployer in the constructor.
+            WOOD wood = new WOOD("Wood Token", "WOOD", vm.envOr("WOOD_MINT", DEFAULT_WOOD_MINT));
             woodToken = address(wood);
             console.log("WoodToken (FIXTURE):", woodToken);
         }
