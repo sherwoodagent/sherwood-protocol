@@ -145,6 +145,17 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
         (resolved, reviewConcluded) = _computeState(p);
 
         if (reviewConcluded && stored != resolved) {
+            // Economic commit. `resolveReview` is idempotent on the registry
+            // (slash + attribution happen at most once, guarded by its
+            // `resolved` flag), so calling it here when the review was already
+            // resolved out-of-band (via the permissionless registry
+            // `resolveReview`) is a harmless no-op that returns the cached
+            // verdict. Consequence: the governor emits GuardianReviewResolved
+            // exactly once per proposal, on its terminal review transition,
+            // whether the resolution was driven here or out-of-band. This is a
+            // deliberate, benign divergence from the pre-refactor path, which
+            // emitted no governor-side event when the registry was resolved
+            // out-of-band first.
             bool blocked = IGuardianRegistry(_guardianRegistry).resolveReview(address(this), p.id);
             emit GuardianReviewResolved(p.id, blocked);
         }
