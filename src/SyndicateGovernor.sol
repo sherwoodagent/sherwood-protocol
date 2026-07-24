@@ -264,7 +264,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // clamped to the maxCapitalBps ceiling (finding 3), drawdown
         // declaration capped at 100%.
         if (envelope.maxCapital == 0) revert ZeroMaxCapital();
-        // maxCapital ceiling (finding 3) is enforced in `_snapshotTier` below —
+        // maxCapital ceiling (finding 3) is enforced in `_snapshotTierAndGate` below —
         // same tx, hoisted off this frame for Yul stack budget.
         if (envelope.maxDrawdownBps > 10_000) revert InvalidDrawdown();
 
@@ -314,6 +314,15 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         }
         if (isCollaborative) {
             _transition(p, ProposalState.Draft);
+            // Written HERE, not in `_storeCoProposers` (which runs after
+            // `_snapshotTierAndGate`): `lockBond` is a state-changing external
+            // call, and a WOOD with a transfer hook can re-enter the governor
+            // mid-propose. A Draft observed with `collaborationDeadline == 0`
+            // resolves to Expired (the base's `_computeState` Draft -> Expired
+            // edge), which permissionless `resolveProposalState` would commit —
+            // bricking the proposal (`approveCollaboration` then reverts
+            // `NotDraftState` forever).
+            collaborationDeadline[proposalId] = block.timestamp + _params.collaborationWindow;
             // Sherlock #14: snapshot timing params for the collaborative Draft
             // so the Draft → Pending transition can't be moved by a mid-Draft
             // owner param change. Packed (executionWindow << 128 | votingPeriod).
@@ -341,7 +350,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // calldata arrays so the `envelope`/`executeCalls` calldata refs are
         // dead by this point — keeps propose() under Yul's stack budget. Reads
         // the same storage arrays Task 6 re-resolves at execute time.
-        _snapshotTier(p, _loadCalls(_executeCalls, proposalId));
+        _snapshotTierAndGate(p, _loadCalls(_executeCalls, proposalId));
 
         // Store co-proposers and set collaboration deadline
         if (coProposers.length > 0) {
@@ -811,13 +820,17 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         if (maxCapital > ceiling) revert MaxCapitalExceedsCeiling();
     }
 
-    /// @dev Thin store-wrapper around `_resolveTierAndCoverage`, hoisted out of
-    ///      `propose` to keep that function under Yul's stack budget (see
-    ///      `_initPendingProposal`). Reads p.maxCapital / p.id from storage
-    ///      (written before this call in `propose`) rather than taking them as
-    ///      stack arguments — the propose() call site must stay exactly
+    /// @dev Resolves and stores the proposal's tier + required coverage, then
+    ///      runs the Plan B propose-time gates: the maxCapital ceiling check,
+    ///      the exposure ledger's covered-TVL cap, and the risk-scaled proposer
+    ///      bond (which PULLS WOOD from the proposer — a state-changing
+    ///      external call, see the CEI note at the `lockBond` site below).
+    ///      Hoisted out of `propose` to keep that function under Yul's stack
+    ///      budget (see `_initPendingProposal`). Reads p.maxCapital / p.id from
+    ///      storage (written before this call in `propose`) rather than taking
+    ///      them as stack arguments — the propose() call site must stay exactly
     ///      `(p, _loadCalls(...))`-shaped or Yul goes "too deep by 1 slot".
-    function _snapshotTier(StrategyProposal storage p, BatchExecutorLib.Call[] memory execCalls) private {
+    function _snapshotTierAndGate(StrategyProposal storage p, BatchExecutorLib.Call[] memory execCalls) private {
         // Finding 3: envelope ceiling check. Lives here (not in propose's
         // validation block) purely for the same stack-budget reason — an extra
         // call frame in propose() tips it over. Same-tx revert either way.
@@ -836,7 +849,22 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             if (escrow != address(0)) {
                 uint256 bondWood = IExposureLedger(ledger).proposerBondWood(asset, coverage_);
                 if (bondWood != 0) {
+                    // Bind the bond to THIS escrow: `reclaimProposerBond`
+                    // releases against the stored address, so re-pointing
+                    // `_bondEscrow` later cannot strand it (the escrow has no
+                    // owner and no discretionary exit; its bond key is
+                    // (governor, proposalId), so nobody else can address it).
+                    // Both writes precede the external call (CEI).
                     p.proposerBondWood = bondWood;
+                    p.proposerBondEscrow = escrow;
+                    // STATE-CHANGING external call: `lockBond` pulls WOOD via
+                    // `transferFrom`, so a WOOD with a transfer hook can
+                    // re-enter this governor here. INVARIANT: every
+                    // proposal-state field the lifecycle reads must ALREADY be
+                    // written by this point (including
+                    // `collaborationDeadline`, hoisted into `propose`'s
+                    // isCollaborative branch for exactly this reason). Do not
+                    // move a state write below this call.
                     IProposerBondEscrow(escrow).lockBond(p.id, p.proposer, bondWood);
                 }
             }
@@ -951,12 +979,15 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         revert NotCoProposer();
     }
 
-    /// @dev Store co-proposers, set deadline, emit event
+    /// @dev Store co-proposers, emit event. `collaborationDeadline` is NOT set
+    ///      here — `propose` writes it in the `isCollaborative` branch, before
+    ///      any external call, so the Draft is never observable with a zero
+    ///      deadline (which `_resolveStateView` maps to Expired). See the
+    ///      ordering comment at the `lockBond` call site.
     function _storeCoProposers(uint256 proposalId, CoProposer[] calldata coProposers) internal {
         for (uint256 i = 0; i < coProposers.length; i++) {
             _coProposers[proposalId].push(coProposers[i]);
         }
-        collaborationDeadline[proposalId] = block.timestamp + _params.collaborationWindow;
 
         address[] memory coAddrs = new address[](coProposers.length);
         uint256[] memory splits = new uint256[](coProposers.length);
@@ -1280,6 +1311,15 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     /// @dev address(0) is legal: it un-wires the ledger and the covered-TVL cap
     ///      + proposer-bond gates are then skipped — the pre-ledger safe
     ///      default (mirrors `setTierRegistry`).
+    ///
+    ///      WIRING ORDER (precondition): seed `setAssetFeed(vaultAsset, ...)`
+    ///      AND `setCoveredTvlCapUsd(...)` on the ledger BEFORE wiring it here.
+    ///      The gates are fail-closed by design, so a wired ledger with an
+    ///      unpriceable vault asset (`FeedNotConfigured` / `StalePrice`) or a
+    ///      zero cap (`CoveredTvlCapExceeded`) halts ALL proposal creation for
+    ///      this vault. Note the two fixes sit with different owners: the escape
+    ///      hatch here (`setExposureLedger(address(0))`) is factory-owned, while
+    ///      the feed/cap fixes are ledger-owner-owned.
     function setExposureLedger(address newLedger) external onlyFactory {
         emit ExposureLedgerSet(_exposureLedger, newLedger);
         _exposureLedger = newLedger;
@@ -1287,7 +1327,15 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
 
     /// @inheritdoc ISyndicateGovernor
     /// @dev address(0) is legal: it un-wires the escrow and no bond is locked at
-    ///      propose (mirrors `setTierRegistry`).
+    ///      propose.
+    ///
+    ///      Unlike `setTierRegistry`, this slot has CUSTODIAL meaning: the
+    ///      escrow holds real WOOD for already-created proposals. Re-point it
+    ///      only at ZERO outstanding bonds. Bonds already locked are released
+    ///      against the escrow stored per proposal
+    ///      (`StrategyProposal.proposerBondEscrow`), never this live slot — so
+    ///      re-pointing is safe for existing proposals, and a new escrow applies
+    ///      only to proposals created after the change.
     function setBondEscrow(address newEscrow) external onlyFactory {
         emit BondEscrowSet(_bondEscrow, newEscrow);
         _bondEscrow = newEscrow;

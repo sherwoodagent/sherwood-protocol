@@ -11,6 +11,7 @@ import {ExposureLedger} from "../src/ExposureLedger.sol";
 import {IExposureLedger} from "../src/interfaces/IExposureLedger.sol";
 import {ProposerBondEscrow} from "../src/ProposerBondEscrow.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import {IERC20Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "./mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "./mocks/MockRegistryMinimal.sol";
@@ -86,6 +87,7 @@ contract GovernorCoverageGatesTest is Test {
     address public ledgerOwner = makeAddr("ledgerOwner");
     address public agent = makeAddr("agent");
     address public agent2 = makeAddr("agent2");
+    address public coAgent = makeAddr("coAgent");
     address public lp1 = makeAddr("lp1");
 
     uint256 constant VOTING_PERIOD = 1 days;
@@ -138,6 +140,7 @@ contract GovernorCoverageGatesTest is Test {
         // ── Register agents on their vaults.
         vm.startPrank(owner);
         vault.registerAgent(agentRegistry.mint(agent), agent);
+        vault.registerAgent(agentRegistry.mint(coAgent), coAgent);
         unwiredVault.registerAgent(agentRegistry.mint(agent2), agent2);
         vm.stopPrank();
 
@@ -217,6 +220,26 @@ contract GovernorCoverageGatesTest is Test {
         });
     }
 
+    /// @dev One co-proposer at 30% — lead keeps 70% (>= the 10% floor).
+    function _coProposers() internal view returns (ISyndicateGovernor.CoProposer[] memory cps) {
+        cps = new ISyndicateGovernor.CoProposer[](1);
+        cps[0] = ISyndicateGovernor.CoProposer({agent: coAgent, splitBps: 3000});
+    }
+
+    function _proposeSolo(SyndicateGovernor gov, address v, address as_, uint256 cap) internal returns (uint256) {
+        vm.prank(as_);
+        return gov.propose(
+            v,
+            address(0),
+            "uri",
+            7 days,
+            _envelope(cap),
+            _execCalls(),
+            _settleCalls(),
+            new ISyndicateGovernor.CoProposer[](0)
+        );
+    }
+
     // ── Tests ──
 
     /// @notice Coverage above the covered-TVL cap fails closed at propose. $1,000
@@ -263,11 +286,17 @@ contract GovernorCoverageGatesTest is Test {
 
     /// @notice With no WOOD allowance the escrow's transferFrom reverts, aborting
     ///         propose (fail-closed: no bond, no proposal).
+    /// @dev OZ 5.x `SafeERC20._safeTransferFrom` runs with `bubble = true`, so it
+    ///      re-raises the token's OWN revert data rather than wrapping it in
+    ///      `SafeERC20FailedOperation` — the surfaced error is therefore
+    ///      `ERC20InsufficientAllowance(escrow, 0, 200e18)`.
     function test_propose_insufficientWoodAllowanceReverts() public {
         vm.prank(agent);
         wood.approve(address(escrow), 0);
         vm.prank(agent);
-        vm.expectRevert(); // SafeERC20 transferFrom failure inside lockBond
+        vm.expectRevert(
+            abi.encodeWithSelector(IERC20Errors.ERC20InsufficientAllowance.selector, address(escrow), 0, 200e18)
+        );
         governor.propose(
             address(vault),
             address(0),
@@ -295,5 +324,168 @@ contract GovernorCoverageGatesTest is Test {
             new ISyndicateGovernor.CoProposer[](0)
         );
         assertEq(unwiredGovernor.getProposal(pid).proposerBondWood, 0);
+    }
+
+    // ── Review fixes: collaborative Drafts, escrow binding, gate branches ──
+
+    /// @notice (a) A COLLABORATIVE proposal bonds like a solo one AND is still a
+    ///         Draft afterwards. `_snapshotTierAndGate` (which locks the bond)
+    ///         runs before `_storeCoProposers`, so the Draft's lifecycle fields
+    ///         must already be complete by then — otherwise `_resolveStateView`
+    ///         maps the zero `collaborationDeadline` to Expired.
+    function test_propose_collaborativeDraft_bondsAndStaysDraft() public {
+        vm.prank(agent);
+        uint256 pid = governor.propose(
+            address(vault), address(0), "uri", 7 days, _envelope(1_000e6), _execCalls(), _settleCalls(), _coProposers()
+        );
+
+        // Bond locked against the collaborative Draft.
+        (address p, uint256 amt) = escrow.bondOf(address(governor), pid);
+        assertEq(p, agent);
+        assertEq(amt, 200e18);
+        assertEq(governor.getProposal(pid).proposerBondWood, 200e18);
+
+        // `getProposal` returns the RESOLVED state — Draft, not Expired.
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Draft));
+        // Committing the resolution permissionlessly keeps it a Draft.
+        governor.resolveProposalState(pid);
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Draft));
+        // And the collaboration path is live: the co-proposer can approve, which
+        // flips the Draft to Pending (it is the only co-proposer).
+        vm.prank(coAgent);
+        governor.approveCollaboration(pid);
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Pending));
+    }
+
+    /// @notice (b) Propose-reentrancy regression. `lockBond` pulls WOOD, so a WOOD
+    ///         with a transfer hook re-enters the governor mid-`propose`. Before
+    ///         the fix, `collaborationDeadline` was written by
+    ///         `_storeCoProposers` AFTER the bond call, so the re-entrant
+    ///         `resolveProposalState` saw `state == Draft` with a ZERO deadline,
+    ///         committed Expired, and permanently bricked the proposal
+    ///         (`approveCollaboration` → `NotDraftState` forever, bond stranded).
+    ///         The deadline write is now hoisted into `propose`'s isCollaborative
+    ///         branch, ahead of every external call.
+    function test_propose_collaborative_reentrantWoodCannotExpireDraft() public {
+        // Escrow bound to a hostile WOOD (immutable), authorized for `governor`.
+        ReentrantWood rwood = new ReentrantWood();
+        ProposerBondEscrow rEscrow = new ProposerBondEscrow(address(rwood), address(escrowAuth));
+        governor.setBondEscrow(address(rEscrow));
+
+        rwood.mint(agent, 1_000_000e18);
+        vm.prank(agent);
+        rwood.approve(address(rEscrow), type(uint256).max);
+
+        uint256 pid = governor.proposalCount() + 1;
+        rwood.arm(address(governor), pid);
+
+        vm.prank(agent);
+        uint256 got = governor.propose(
+            address(vault), address(0), "uri", 7 days, _envelope(1_000e6), _execCalls(), _settleCalls(), _coProposers()
+        );
+        assertEq(got, pid);
+        // The hook really did re-enter (otherwise this test proves nothing).
+        assertTrue(rwood.reentered(), "reentry did not fire");
+        assertTrue(rwood.reentryOk(), "reentrant resolveProposalState reverted");
+
+        // The Draft survived: NOT committed to Expired.
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Draft));
+        vm.prank(coAgent);
+        governor.approveCollaboration(pid);
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Pending));
+    }
+
+    /// @notice (c) Ledger wired, escrow UNwired: the covered-TVL cap still binds,
+    ///         but no bond is locked and `proposerBondWood` stays zero.
+    function test_propose_escrowUnwired_capEnforcedNoBond() public {
+        governor.setBondEscrow(address(0));
+
+        // Cap still enforced.
+        vm.prank(ledgerOwner);
+        ledger.setCoveredTvlCapUsd(100e18);
+        vm.prank(agent);
+        vm.expectRevert(IExposureLedger.CoveredTvlCapExceeded.selector);
+        governor.propose(
+            address(vault),
+            address(0),
+            "uri",
+            7 days,
+            _envelope(1_000e6),
+            _execCalls(),
+            _settleCalls(),
+            new ISyndicateGovernor.CoProposer[](0)
+        );
+
+        // Under the cap: proposal goes through with no bond.
+        vm.prank(ledgerOwner);
+        ledger.setCoveredTvlCapUsd(10_000_000e18);
+        uint256 pid = _proposeSolo(governor, address(vault), agent, 1_000e6);
+        assertEq(governor.getProposal(pid).proposerBondWood, 0);
+        assertEq(governor.getProposal(pid).proposerBondEscrow, address(0));
+        assertEq(wood.balanceOf(address(escrow)), 0);
+    }
+
+    /// @notice (d) `proposerBondBps == 0` → zero bond: no `lockBond` call at all
+    ///         (the escrow has no record) and the stored fields stay zero.
+    function test_propose_zeroBondBps_noLockBond() public {
+        vm.prank(ledgerOwner);
+        ledger.setProposerBondBps(0);
+
+        uint256 pid = _proposeSolo(governor, address(vault), agent, 1_000e6);
+
+        assertEq(governor.getProposal(pid).proposerBondWood, 0);
+        assertEq(governor.getProposal(pid).proposerBondEscrow, address(0));
+        (address p, uint256 amt) = escrow.bondOf(address(governor), pid);
+        assertEq(p, address(0));
+        assertEq(amt, 0);
+        assertEq(wood.balanceOf(address(escrow)), 0);
+    }
+
+    /// @notice (e) The bond binds to the escrow that HOLDS it. Re-pointing the
+    ///         governor's live `_bondEscrow` must not rewrite the stored address
+    ///         — Task 9's `reclaimProposerBond` releases against the stored one,
+    ///         so an outstanding bond can never be stranded by a re-point.
+    function test_propose_bondBindsToEscrowAtProposeTime() public {
+        uint256 pid = _proposeSolo(governor, address(vault), agent, 1_000e6);
+        assertEq(governor.getProposal(pid).proposerBondEscrow, address(escrow));
+
+        ProposerBondEscrow escrow2 = new ProposerBondEscrow(address(wood), address(escrowAuth));
+        governor.setBondEscrow(address(escrow2));
+
+        assertEq(governor.bondEscrow(), address(escrow2));
+        // The existing proposal still points at the escrow holding its WOOD.
+        assertEq(governor.getProposal(pid).proposerBondEscrow, address(escrow));
+        (, uint256 amt) = escrow.bondOf(address(governor), pid);
+        assertEq(amt, 200e18);
+        assertEq(wood.balanceOf(address(escrow)), 200e18);
+        assertEq(wood.balanceOf(address(escrow2)), 0);
+    }
+}
+
+/// @notice Hostile WOOD: `transferFrom` re-enters the governor's permissionless
+///         `resolveProposalState` before moving the tokens, exactly as a
+///         transfer-hook token would. Mirrors the PoC from review.
+contract ReentrantWood is ERC20Mock {
+    address public governor;
+    uint256 public pid;
+    bool public reentered;
+    bool public reentryOk;
+
+    constructor() ERC20Mock("Reentrant Sherwood", "rWOOD", 18) {}
+
+    function arm(address governor_, uint256 pid_) external {
+        governor = governor_;
+        pid = pid_;
+    }
+
+    function transferFrom(address from, address to, uint256 value) public override returns (bool) {
+        if (governor != address(0) && !reentered) {
+            reentered = true;
+            // Best-effort: swallow a revert so the outer propose still completes
+            // and the test can assert on the resulting proposal state. `reentryOk`
+            // records whether the callback itself succeeded.
+            (reentryOk,) = governor.call(abi.encodeWithSignature("resolveProposalState(uint256)", pid));
+        }
+        return super.transferFrom(from, to, value);
     }
 }

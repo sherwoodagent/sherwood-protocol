@@ -242,8 +242,11 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     /// @dev USD-18 value of `amount` of `asset`. Fail-closed on unconfigured
     ///      asset or stale feed — a proposal in an unpriceable asset cannot be
     ///      coverage-checked and therefore cannot proceed.
-    ///      All conversions FLOOR (sub-wei dust, accepted); Task 8's
-    ///      proposerBondWood must round UP instead.
+    ///      All conversions FLOOR (sub-wei dust, accepted), and so does
+    ///      `proposerBondWood`, which floors twice on top of this. Floor is
+    ///      accepted there too: a coverage small enough to floor the bond to
+    ///      zero (below ~1e-14 USD at the shipped bps/price scales) has
+    ///      negligible extractable value, so nothing meaningful goes unbonded.
     ///      Accepted v1 risks: Chainlink aggregators clamp at min/maxAnswer,
     ///      so a clamped price understates coverage (anti-conservative); and
     ///      Robinhood 4663 has no L2 sequencer-uptime feed to gate reads.

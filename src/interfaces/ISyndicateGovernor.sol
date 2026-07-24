@@ -130,6 +130,16 @@ interface ISyndicateGovernor {
         ///         ProposerBondEscrow at propose time (Plan B, spec §3.9). Zero
         ///         when no escrow/ledger is wired or the bond bps is zero.
         uint256 proposerBondWood;
+        /// @notice The ProposerBondEscrow that actually HOLDS this proposal's
+        ///         bond, bound at propose time. The bond is custodial and the
+        ///         escrow has no owner and no discretionary exit, and keys bonds
+        ///         by `(governor, proposalId)` — so a release must target this
+        ///         address, never the governor's live `_bondEscrow` slot.
+        ///         Re-pointing that slot is therefore safe for existing
+        ///         proposals (they keep releasing against the old escrow); a new
+        ///         escrow only applies to proposals created after the change.
+        ///         Zero when no bond was locked.
+        address proposerBondEscrow;
     }
 
     struct CoProposer {
@@ -463,9 +473,19 @@ interface ISyndicateGovernor {
     /// @notice Wire the exposure ledger (Plan B, spec §3.7/§3.9). Factory-only.
     ///         address(0) un-wires: the covered-TVL cap and proposer bond gates
     ///         are then skipped — the pre-ledger safe default.
+    /// @dev Precondition: seed the ledger's `setAssetFeed(vaultAsset, ...)` and
+    ///      `setCoveredTvlCapUsd(...)` BEFORE wiring it. The gates fail closed,
+    ///      so a wired ledger with an unpriceable vault asset or a zero cap
+    ///      halts all proposal creation for this vault. The escape hatch
+    ///      (`setExposureLedger(0)`) is factory-owned; the feed/cap fixes are
+    ///      ledger-owner-owned.
     function setExposureLedger(address newLedger) external;
     /// @notice Wire the proposer bond escrow (Plan B, spec §3.9). Factory-only.
     ///         address(0) un-wires: the bond is not locked at propose.
+    /// @dev CUSTODIAL slot — re-point only at zero outstanding bonds. Bonds
+    ///      already locked are released against the per-proposal stored escrow
+    ///      (`StrategyProposal.proposerBondEscrow`), so re-pointing is safe for
+    ///      existing proposals; a new escrow applies only to future ones.
     function setBondEscrow(address newEscrow) external;
 
     // ── Init ──
