@@ -1,8 +1,10 @@
 # Volume-Based Fee Mechanism Design
 
-**Date:** 2026-07-24
+**Date:** 2026-07-24 (rev. 2 — Hyperliquid strategies removed from scope)
 **Status:** Design — not implemented
 **Scope:** `ProtocolConfig`, `BaseStrategy`/`IStrategy`, strategy templates, (optionally) `SyndicateGovernor`
+**Out of scope:** `HyperliquidPerpStrategy` / `HyperliquidGridStrategy` — these templates
+are not moving forward and are excluded from the design.
 
 ---
 
@@ -24,9 +26,9 @@ Consequences:
 
 - **Flat or losing proposals generate zero protocol revenue** — the vault traded,
   guardians reviewed, infrastructure ran, and the protocol earned nothing.
-- Revenue is proportional to *realized P&L per proposal*, not to *activity*. A grid
-  strategy that turns its book over 50× and nets +0.5% pays the same as a buy-and-hold
-  that nets +0.5% on one trade.
+- Revenue is proportional to *realized P&L per proposal*, not to *activity*. A
+  portfolio strategy that rebalances daily and nets +0.5% pays the same as a
+  buy-and-hold that nets +0.5% on one trade.
 - `docs/superpowers/specs/2026-07-22-guardian-economic-security-design.md` (§ worked
   economics, lines 460–476) already flags the profit-only fee base as **insufficient to
   fund guardian ROE** at realistic vault sizes.
@@ -69,39 +71,20 @@ the structure, not the exact numbers, is what matters here.)
 - The flywheel: tiny take rate × enormous volume × mechanical buyback. Fee revenue is
   a function of *activity*, fully decoupled from whether any individual trader profits.
 
-### 2.4 Builder codes — the venue-native "fee on every trade" rail
+### 2.4 Builder codes — the conceptual template
 
-Hyperliquid lets third-party apps ("builders") that route orders attach a per-order
-fee: the user signs a one-time `ApproveBuilderFee(maxFeeRate, builder)`, and the
-builder includes `{b: builderAddress, f: feeTenthsBps}` on each order. The venue
-deducts the fee from the fill's USDC leg and credits the builder natively. Caps:
-**10 bps on perps, 100 bps on spot**.
-
-### 2.5 Why builder codes do NOT solve this for Sherwood today
-
-Sherwood's Hyperliquid strategies place orders **onchain via CoreWriter**, not through
-the exchange API: `L1Write.sendLimitOrder(asset, isBuy, limitPx, sz, reduceOnly, tif,
-cloid)` → `ICoreWriter(0x3333…3333).sendRawAction` (`src/hyperliquid/L1Write.sol:101`).
-
-- The CoreWriter **limit-order action has no builder field**. Builder attribution is
-  per-order and only exists on the exchange-API path.
-- `L1Write.sendApproveBuilderFee(maxFeeRate, builder)` (`src/hyperliquid/L1Write.sol:275`,
-  action `0x0100000c`) is already vendored in the repo (currently zero call sites),
-  but approving a builder is useless when no order can carry the builder code.
-- Fills are not observable from the EVM at all — orders leave as intents and the
-  filled size/price never comes back. The only onchain-readable notional is
-  `accountMarginSummary.ntlPos` (a position *stock*, not traded *flow*).
-
-**Conclusion:** the venue-native rail is closed to us for CoreWriter-placed orders
-(worth revisiting if Hyperliquid ever adds a builder field to the CoreWriter order
-action). Sherwood must meter and charge volume itself, at the protocol layer. If
-Sherwood ever routes orders through an API agent wallet operated by offchain infra,
-builder codes become the drop-in monetization for that path — keep
-`sendApproveBuilderFee` vendored.
+Hyperliquid also lets third-party apps that route orders attach a per-order fee
+(`ApproveBuilderFee` + per-order `{builder, fee}`, capped at **10 bps on perps**);
+the venue deducts it from each fill and credits the builder natively. Sherwood sits in
+exactly that "builder" position relative to the venues its strategies trade on — the
+protocol routes managed flow — so the builder-fee cap is a useful market anchor for
+what rent on routed flow is considered acceptable. Since the Hyperliquid strategy
+templates are not moving forward, Sherwood implements this at the protocol layer over
+its DEX venues rather than using any venue-native rail.
 
 ---
 
-## 3. What Sherwood can meter today — and what it cannot
+## 3. What Sherwood can meter today
 
 Findings from the codebase survey:
 
@@ -110,16 +93,24 @@ Findings from the codebase survey:
   and never touch the vault. The governor sees only the asset-balance snapshot at
   execute (`src/SyndicateGovernor.sol:393`), the balance at settle, and
   `interimNetFlow`.
-- **Per-order notional is already computed at every Hyperliquid call site — then
-  thrown away.** `approxUsd = sz × limitPx / 1e6` exists purely as a bounds check:
-  `HyperliquidPerpStrategy.sol:270, 327, 365`; `HyperliquidGridStrategy.sol:274`.
-- `PortfolioStrategy` knows swap `amountIn` at each `swapAdapter.swap(...)` call
-  (`:289, 311, 386, 400, 537, 559`); `AerodromeLPStrategy` knows amounts at
-  `addLiquidity`/`removeLiquidity`/reward swaps.
-- Existing per-trade machinery is caps-only: `tradesToday`/`maxTradesPerDay` (count),
-  `maxPositionSize`/`maxOrderSize` (per-order bound), `maxOrdersPerTick`.
-- **Fee base must be *submitted* notional, not filled notional** (fills invisible
-  onchain, §2.5). This is the one place we diverge from Hyperliquid by necessity.
+- **Traded notional is already known at every venue call site:**
+  - `PortfolioStrategy` knows swap `amountIn` at each `swapAdapter.swap(...)` call
+    (`:289, 311, 386, 400, 537, 559`), including `rebalance()` / `rebalanceDelta`.
+  - `AerodromeLPStrategy` knows amounts at `addLiquidity` (`:232`),
+    `removeLiquidity` (`:278`), and reward-conversion swaps (`:309`).
+  - `LeveragedAerodromeCLStrategy` knows notional at its borrow/supply/rebalance and
+    swap sites (self-managed fee path, §4.6).
+  - Moonwell supply templates (`MoonwellSupplyStrategy`, `WstETHMoonwellStrategy`,
+    `MamoYieldStrategy`) have essentially one deploy and one unwind per proposal —
+    near-zero volume, near-zero volume fee, which is the intended outcome for
+    passive strategies.
+- Because the remaining venues are **atomic AMM/lending interactions, executed
+  notional is exactly observable onchain** at the moment of the call — there is no
+  submitted-vs-filled gap and no need for oracles or fill attestations. (This is
+  cleaner than metering an offchain orderbook venue, where only submitted intents are
+  visible to the EVM.)
+- Existing per-trade machinery is caps-only (trade counts, per-order size bounds) —
+  nothing accumulates notional today.
 
 ---
 
@@ -128,9 +119,8 @@ Findings from the codebase survey:
 ### 4.1 Shape: accrue per trade, collect at settlement
 
 The fee is **earned per trade** (that is what makes revenue scale with volume) but
-**paid once per proposal at settlement**. Real-time payment is impossible anyway for
-the Hyperliquid strategies — their capital lives on HyperCore mid-run and only returns
-to the EVM through the Circle bridge at sweep. Batching payment changes cash timing,
+**paid once per proposal at settlement**. Batching the payment avoids an extra ERC-20
+transfer per swap and keeps the strategy's hot path cheap; it changes cash timing,
 not economics.
 
 ```
@@ -149,10 +139,10 @@ uint16 public constant MAX_VOLUME_FEE_BPS = 10;   // hard cap: 0.10% of notional
 uint16 public volumeFeeBps;                        // default 2 (0.02%)
 ```
 
-- The 10 bps cap deliberately mirrors Hyperliquid's own builder-fee cap on perps —
-  it is the ceiling the venue itself considers acceptable rent on routed flow.
-- Default 2 bps sits below Hyperliquid's taker rate, so the drag on strategy returns
-  stays small relative to venue fees the strategy already pays.
+- The 10 bps cap mirrors Hyperliquid's builder-fee cap on perps — the ceiling the
+  largest venue considers acceptable rent on routed flow (§2.4).
+- Default 2 bps keeps the drag small relative to the venue costs (swap fees, price
+  impact) the strategy already pays on the same flow.
 - Recipient: reuse `protocolFeeRecipient`. No new trust assumptions.
 - Add the getter to `IProtocolConfig` (5th getter, same pattern).
 
@@ -177,28 +167,28 @@ function _accrueVolume(uint256 notionalAsset) internal {
   `vault → factory → protocolConfig`) when the run starts, clamped to
   `MAX_VOLUME_FEE_BPS`. This preserves the existing snapshot discipline — the rate a
   proposal voted on cannot be raised mid-run — without touching the governor.
-- Call sites are exactly where notional is already computed:
-  - `HyperliquidPerpStrategy`: after each `approxUsd` check (`:270, 327, 365`) and at
-    the force-close path (`:478-485`, using `ntlPos` for the close notional).
-  - `HyperliquidGridStrategy`: in `_placeOrders` (`:274`). **Do not** accrue on
-    `_cancelOrders` — cancels are not volume, and grid strategies cancel/replace
-    constantly.
-  - `PortfolioStrategy`: `amountIn` (asset-denominated leg) at each swap call site.
-  - `AerodromeLPStrategy`: swap legs and liquidity adds count once at entry; reward
-    conversions count at swap. Removes do not double-count.
-- One honest limitation, stated openly: for GTC orders this meters **submitted**
-  notional, and a cancel-heavy strategy could accrue fees on orders that never fill.
-  For the grid strategy, accrue on placement and refund on clean cancel-by-cloid
-  (`_volumeFeeOwed -= min(owed, orderNotional × rate)`) so only resting-or-filled
-  exposure pays. IOC orders (the perp strategy's default) have no such gap.
+- **What counts as volume** (asset-denominated notional at execution):
+  - `PortfolioStrategy`: `amountIn` of every swap (all 6 call sites, including
+    rebalances). Both directions count — a round trip is 2× notional, as on any venue.
+  - `AerodromeLPStrategy`: swap legs and liquidity **adds** count; removes do not
+    (entry and exit of the same LP would double-count the same capital). Reward
+    conversions count at swap.
+  - Moonwell supply/withdraw: **not** volume — lending deposits are custody moves,
+    not trades. Passive strategies should pay ~nothing; that is the point of an
+    activity-priced fee.
+- Notional is measured in the vault asset. For non-asset legs (e.g. AERO rewards,
+  volatile-token legs), value at the strategy's existing pricing path
+  (`positions()` adapters / router) or, where unavailable, at the swap's realized
+  asset-side amount — the conservative choice is whichever leg is already
+  asset-denominated.
 
 ### 4.4 Collection — inside `BaseStrategy` settle path, not the governor
 
 Two candidate collection points were considered:
 
-**Option A (recommended): strategy pays at `settle()`/final sweep.**
-When the strategy's settle path has swept funds back to the EVM and is about to return
-capital to the vault, it first transfers the fee:
+**Option A (recommended): strategy pays at `settle()`/final unwind.**
+When the strategy has unwound and is about to return capital to the vault, it first
+transfers the fee:
 
 ```solidity
 uint256 fee = _cappedVolumeFee();               // §4.5
@@ -220,7 +210,7 @@ if (fee != 0) {
 - Because the fee leaves the strategy **before** the vault balance is read at
   `_finishSettlement`, the volume fee is naturally senior to the P&L waterfall and
   the profit-fee math needs no changes: `pnl` is simply computed net of volume fees,
-  exactly like venue fees the strategy already pays.
+  exactly like the swap fees the strategy already pays.
 
 **Option B (rejected for v1): governor reads `IStrategy.volumeFeeOwed()` at
 `_finishSettlement` and pays via the `_payFee` escrow rail.** Cleaner audit trail and
@@ -250,10 +240,10 @@ function _cappedVolumeFee() internal view returns (uint256) {
 ```
 
 At 2 bps this caps total volume fees at 0.1% of funded capital per 1× of turnover,
-worst case 10 bps × 50× = 0.5%… per proposal — visible, bounded, and small next to the
-existing per-order caps (`maxPositionSize`, `maxTradesPerDay`, `maxOrdersPerTick`)
-that already bound churn. Guardians reviewing calldata see the strategy params that
-determine realistic turnover.
+worst case 10 bps × 50× = 0.5% per proposal — visible, bounded, and small next to the
+existing per-strategy caps (trade counts, per-order size bounds) that already bound
+churn. Guardians reviewing calldata see the strategy params that determine realistic
+turnover.
 
 ### 4.6 Self-managed strategies
 
@@ -290,27 +280,36 @@ This also gives the frontend a true "volume" stat per syndicate for free.
 
 ## 5. Worked economics — why this matters
 
-$1M vault, Hyperliquid grid strategy, 1× book turnover/day, 30-day proposal, +2% net:
+$1M vault, `PortfolioStrategy` with daily rebalancing that turns over an average 25%
+of the book per day, 30-day proposal, +2% net:
 
 | Fee stream | Formula | Revenue |
 |---|---|---|
 | **Today**: protocol fee (10% of profit) | $1M × 2% × 10% | **$2,000** |
 | **Today**: guardian fee (5% of profit) | $1M × 2% × 5% | $1,000 |
-| **Volume fee @ 2 bps** | $1M × 1×/day × 30d × 0.02% | **$6,000** |
-| Same, flat month (0% P&L) | — | $6,000 vs **$0** today |
+| **Volume fee @ 2 bps** | $1M × 0.25/day × 30d × 0.02% | **$1,500** |
+| Same, flat month (0% P&L) | — | $1,500 vs **$0** today |
 
-At 2 bps the volume fee **triples** protocol revenue on a profitable month and is the
-*only* revenue on a flat month — while costing the strategy less than half of what it
-already pays Hyperliquid in taker fees (4.5 bps) on the same flow. The drag on
-depositors is 0.6%/month at 1×/day turnover; proposers price that into strategy
-selection exactly as they price venue fees, and low-turnover strategies
-(Moonwell supply, LP holds) pay almost nothing — which is correct: they consume the
-least protocol attention per dollar.
+At 2 bps an actively rebalanced portfolio pays roughly as much in volume fees as in
+profit fees on a good month — and it is the **only** revenue on a flat month, which is
+the case the current model earns nothing on. A more aggressive strategy (1×/day
+turnover) pays $6,000/month; a passive Moonwell supply pays ~$0. The fee prices
+protocol attention by activity, which is exactly what the profit-only model fails to
+do. Depositor drag at 25%/day turnover is 0.15%/month — well under the venue swap
+fees and price impact the same flow already incurs, and proposers price it into
+strategy selection the same way.
 
 ---
 
 ## 6. What is explicitly out of scope
 
+- **Hyperliquid strategy templates** (`HyperliquidPerpStrategy`,
+  `HyperliquidGridStrategy`) — not moving forward; no metering call sites are
+  specified for them. (For the record: had they shipped, per-trade metering there
+  would have had to price *submitted* rather than *filled* notional, because CoreWriter
+  order fills are not observable from the EVM, and Hyperliquid's builder-code rail is
+  unavailable to CoreWriter-placed orders. None of that complexity applies to the
+  AMM-only scope.)
 - **Entry/exit fees** — `instantExitFeeBps` was specced and deferred
   (`docs/specs/2026-07-19-instant-withdrawal-liquidity-design.md` §6); orthogonal to
   this design and still blocked on vault bytecode headroom.
@@ -327,12 +326,13 @@ least protocol attention per dollar.
 2. `BaseStrategy`: `_volumeFeeOwed` / `_volumeFeeBpsCached` / `_volumeFeeBase`
    (append into `__gap`), `_accrueVolume`, `_cappedVolumeFee`, settle-path payment,
    events. Rate snapshot in the `execute()` path.
-3. Per-strategy `_accrueVolume` call sites: Perp (4 sites incl. force-close), Grid
-   (place + cancel-refund), Portfolio (6 swap sites), AerodromeLP (3 sites),
-   LeveragedAerodromeCL (fold into `protocolFeeOwed`).
+3. Per-strategy `_accrueVolume` call sites: Portfolio (6 swap sites),
+   AerodromeLP (adds + swaps, 3 sites), LeveragedAerodromeCL (fold into
+   `protocolFeeOwed`). Moonwell/Mamo/Venice templates: none (passive).
 4. Tests: accrual math per strategy; cap binding; snapshot-at-execute (rate hike
    mid-run doesn't apply); payment senior to P&L (governor `pnl` reflects fee);
-   fail-open on recipient revert; grid cancel-refund; zero-rate short-circuit.
+   fail-open on recipient revert; zero-rate short-circuit; no double-count on
+   LP add/remove round trip.
 5. Subgraph: `VolumeFee` entity + handlers.
 6. Docs: README fee table + this spec's status flip.
 
@@ -346,5 +346,3 @@ least protocol attention per dollar.
 - Mint Ventures, "A Quick Overview of Hyperliquid" — fee → Assistance Fund / HLP split
 - CoinShares/etfdb, "Inside Hyperliquid: How the Fee Engine Works" — ~97% of fees to
   AF buybacks; ≈$1M/day cadence
-- Chainstack / Ambit Labs — CoreWriter action encodings (limit order carries
-  `asset,isBuy,limitPx,sz,reduceOnly,tif,cloid`; no builder field)
