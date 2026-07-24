@@ -2,6 +2,8 @@
 pragma solidity 0.8.28;
 
 import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 /**
  * @title TierRegistry
@@ -31,10 +33,23 @@ import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step
  *      proxies at the tier-2 default.
  */
 contract TierRegistry is Ownable2Step {
+    using SafeERC20 for IERC20;
+
     struct TierConfig {
         uint8 tier; // 0 or 1 when certified; entry absent => tier 2
         uint16 extractableBoundBps; // certified extractable bound, bps of notional
         bytes32 certifiedCodehash; // EXTCODEHASH of target at certification
+    }
+
+    /// @dev Submitter bond per certification (spec §3.6: "tier downgrade = bonded
+    ///      claim"). Held while certified; demotion starts `bondReleaseDelay`,
+    ///      then the submitter claims. The delay is the seam Plan C's
+    ///      guard-bypass slash attaches to (slash-first layering: submitter bond
+    ///      before protocol backstop).
+    struct SubmitterBond {
+        address submitter;
+        uint96 amount;
+        uint64 releasableAt; // 0 while certified; set on demotion
     }
 
     uint8 public constant TIER_ARBITRARY = 2;
@@ -53,6 +68,11 @@ contract TierRegistry is Ownable2Step {
     ///         PRICE extractable value for coverage; this list bounds WHERE
     ///         vault funds may be approved or sent at all.
     mapping(address adapter => bool) private _adapterAllowed;
+
+    IERC20 public wood;
+    uint256 public submitterBondWood;
+    uint256 public bondReleaseDelay = 14 days;
+    mapping(bytes32 configKey => SubmitterBond) internal _bonds;
 
     constructor(address initialOwner) Ownable(initialOwner) {}
 
@@ -75,12 +95,44 @@ contract TierRegistry is Ownable2Step {
     );
     event TierDemoted(address indexed target, bytes4 indexed selector);
     event AdapterAllowedSet(address indexed adapter, bool allowed);
+    event SubmitterBondLocked(
+        address indexed target, bytes4 indexed selector, address indexed submitter, uint256 amount
+    );
+    event SubmitterBondClaimed(
+        address indexed target, bytes4 indexed selector, address indexed submitter, uint256 amount
+    );
+    event SubmitterBondConfigSet(address wood, uint256 bondWood, uint256 releaseDelay);
 
     error InvalidTier();
     error BoundRequired();
     error NotAContract();
     error CodehashMatches();
     error NotCertified();
+    error BondNotReleasable();
+    error BondPendingRelease();
+    error NotSubmitter();
+    error BondConfigUnset();
+    error ZeroAddressSubmitter();
+
+    /// @notice Set the WOOD token used for submitter bonds.
+    function setWood(address wood_) external onlyOwner {
+        wood = IERC20(wood_);
+        emit SubmitterBondConfigSet(wood_, submitterBondWood, bondReleaseDelay);
+    }
+
+    /// @notice Set the submitter bond amount pulled on `certify`. Zero disables
+    ///         the bond requirement (Plan A no-bond passthrough).
+    function setSubmitterBondWood(uint256 amount) external onlyOwner {
+        if (amount != 0 && address(wood) == address(0)) revert BondConfigUnset();
+        submitterBondWood = amount;
+        emit SubmitterBondConfigSet(address(wood), amount, bondReleaseDelay);
+    }
+
+    /// @notice Set the timelock delay between demotion and submitter bond claim.
+    function setBondReleaseDelay(uint256 delay) external onlyOwner {
+        bondReleaseDelay = delay;
+        emit SubmitterBondConfigSet(address(wood), submitterBondWood, delay);
+    }
 
     /// @notice Certify (target, selector) at tier 0/1 with its extractable bound.
     ///         Snapshots EXTCODEHASH so a metamorphic self-redeploy (CREATE2 +
@@ -93,13 +145,28 @@ contract TierRegistry is Ownable2Step {
     ///         detector (a contract cannot read another contract's storage
     ///         slots), so this is a GOVERNANCE obligation: do not certify
     ///         proxied targets at tier 0/1 (see contract-level note).
-    function certify(address target, bytes4 selector, uint8 tier, uint16 extractableBoundBps) external onlyOwner {
+    function certify(address target, bytes4 selector, uint8 tier, uint16 extractableBoundBps, address submitter)
+        external
+        onlyOwner
+    {
         if (tier >= TIER_ARBITRARY) revert InvalidTier();
         if (extractableBoundBps == 0 || extractableBoundBps >= FULL_NOTIONAL_BPS) revert BoundRequired();
         bytes32 ch = target.codehash;
         if (ch == bytes32(0) || ch == _EMPTY_CODEHASH) revert NotAContract();
-        _configs[key(target, selector)] =
-            TierConfig({tier: tier, extractableBoundBps: extractableBoundBps, certifiedCodehash: ch});
+        bytes32 k = key(target, selector);
+        // A bond pending release blocks re-certification — one bond per key.
+        if (_bonds[k].releasableAt != 0) revert BondPendingRelease();
+        // Pull the submitter bond when configured (spec §3.6). Zero-config
+        // (bond amount 0) preserves the Plan A no-bond path for the governance-
+        // assigned initial adapter set.
+        uint256 bondAmount = submitterBondWood;
+        if (bondAmount != 0) {
+            if (submitter == address(0)) revert ZeroAddressSubmitter();
+            _bonds[k] = SubmitterBond({submitter: submitter, amount: uint96(bondAmount), releasableAt: 0});
+            wood.safeTransferFrom(submitter, address(this), bondAmount);
+            emit SubmitterBondLocked(target, selector, submitter, bondAmount);
+        }
+        _configs[k] = TierConfig({tier: tier, extractableBoundBps: extractableBoundBps, certifiedCodehash: ch});
         emit TierCertified(target, selector, tier, extractableBoundBps, ch);
     }
 
@@ -118,8 +185,25 @@ contract TierRegistry is Ownable2Step {
     }
 
     function _demote(address target, bytes4 selector) private {
-        delete _configs[key(target, selector)];
+        bytes32 k = key(target, selector);
+        delete _configs[k];
+        SubmitterBond storage b = _bonds[k];
+        if (b.amount != 0 && b.releasableAt == 0) {
+            b.releasableAt = uint64(block.timestamp + bondReleaseDelay);
+        }
         emit TierDemoted(target, selector);
+    }
+
+    /// @notice Submitter claims its bond back, `bondReleaseDelay` after demotion.
+    ///         The delay is the window Plan C's guard-bypass slash will act in.
+    function claimSubmitterBond(address target, bytes4 selector) external {
+        bytes32 k = key(target, selector);
+        SubmitterBond memory b = _bonds[k];
+        if (b.submitter != msg.sender) revert NotSubmitter();
+        if (b.releasableAt == 0 || block.timestamp < b.releasableAt) revert BondNotReleasable();
+        delete _bonds[k];
+        wood.safeTransfer(b.submitter, b.amount);
+        emit SubmitterBondClaimed(target, selector, b.submitter, b.amount);
     }
 
     // ── Adapter allowlist (spender/recipient gate for value-moving selectors) ──

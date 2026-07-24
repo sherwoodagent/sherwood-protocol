@@ -145,8 +145,8 @@ contract TierResolutionTest is Test {
     ///         coverage = Σ per-call bounds = 150 bps of maxCapital.
     function test_allCertifiedTier0CallsYieldTier0Coverage() public {
         _wireTierRegistry();
-        tierRegistry.certify(address(mockAdapter), mockAdapter.approve.selector, 0, 50);
-        tierRegistry.certify(address(usdc), usdc.approve.selector, 0, 50); // the settle call
+        tierRegistry.certify(address(mockAdapter), mockAdapter.approve.selector, 0, 50, address(0));
+        tierRegistry.certify(address(usdc), usdc.approve.selector, 0, 50, address(0)); // the settle call
 
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](2);
         calls[0] = _certifiedCall();
@@ -163,7 +163,7 @@ contract TierResolutionTest is Test {
     ///         contribute full notional (10_000 bps) to the coverage sum.
     function test_oneUncertifiedCallMakesProposalTier2() public {
         _wireTierRegistry();
-        tierRegistry.certify(address(mockAdapter), mockAdapter.approve.selector, 0, 50);
+        tierRegistry.certify(address(mockAdapter), mockAdapter.approve.selector, 0, 50, address(0));
 
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](2);
         calls[0] = _certifiedCall();
@@ -182,7 +182,7 @@ contract TierResolutionTest is Test {
     ///         full notional, even for calls a registry would have certified.
     function test_zeroTierRegistryAddressDefaultsAllToTier2() public {
         // Deliberately NOT wired; certification alone must not matter.
-        tierRegistry.certify(address(mockAdapter), mockAdapter.approve.selector, 0, 50);
+        tierRegistry.certify(address(mockAdapter), mockAdapter.approve.selector, 0, 50, address(0));
 
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](1);
         calls[0] = _certifiedCall();
@@ -196,7 +196,7 @@ contract TierResolutionTest is Test {
     ///         resolves as selector 0, which is uncertified → tier 2.
     function test_shortCalldataResolvesAsUncertifiedTier2() public {
         _wireTierRegistry();
-        tierRegistry.certify(address(mockAdapter), mockAdapter.approve.selector, 0, 50);
+        tierRegistry.certify(address(mockAdapter), mockAdapter.approve.selector, 0, 50, address(0));
 
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](1);
         calls[0] = BatchExecutorLib.Call({target: address(mockAdapter), data: hex"aabb", value: 0});
@@ -214,9 +214,9 @@ contract TierResolutionTest is Test {
     ///         own bound; a max under-counts multi-adapter batches.
     function test_mixedTier0AndTier1CoverageIsSumNotMax() public {
         _wireTierRegistry();
-        tierRegistry.certify(address(mockAdapter), mockAdapter.approve.selector, 0, 50);
-        tierRegistry.certify(address(mockAdapter), mockAdapter.transfer.selector, 1, 200);
-        tierRegistry.certify(address(usdc), usdc.approve.selector, 0, 50); // the settle call
+        tierRegistry.certify(address(mockAdapter), mockAdapter.approve.selector, 0, 50, address(0));
+        tierRegistry.certify(address(mockAdapter), mockAdapter.transfer.selector, 1, 200, address(0));
+        tierRegistry.certify(address(usdc), usdc.approve.selector, 0, 50, address(0)); // the settle call
 
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](2);
         calls[0] = _certifiedCall(); // tier 0, 50 bps
@@ -245,7 +245,7 @@ contract TierResolutionTest is Test {
     ///         stale bounded-tier coverage price.
     function test_executeRevertsWhenTierRegressedSincePropose() public {
         _wireTierRegistry();
-        tierRegistry.certify(address(mockAdapter), mockAdapter.approve.selector, 0, 50);
+        tierRegistry.certify(address(mockAdapter), mockAdapter.approve.selector, 0, 50, address(0));
 
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](1);
         calls[0] = _certifiedCall();
@@ -271,8 +271,8 @@ contract TierResolutionTest is Test {
     ///         catch the coverage regression.
     function test_executeRevertsWhenCoverageRegressedAtSameTier() public {
         _wireTierRegistry();
-        tierRegistry.certify(address(mockAdapter), mockAdapter.approve.selector, 0, 50);
-        tierRegistry.certify(address(usdc), usdc.approve.selector, 0, 50); // the settle call
+        tierRegistry.certify(address(mockAdapter), mockAdapter.approve.selector, 0, 50, address(0));
+        tierRegistry.certify(address(usdc), usdc.approve.selector, 0, 50, address(0)); // the settle call
 
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](1);
         calls[0] = _certifiedCall();
@@ -284,7 +284,7 @@ contract TierResolutionTest is Test {
 
         // Same tier 0, 10x the extractable bound → tier check passes, the
         // coverage check must not.
-        tierRegistry.certify(address(mockAdapter), mockAdapter.approve.selector, 0, 500);
+        tierRegistry.certify(address(mockAdapter), mockAdapter.approve.selector, 0, 500, address(0));
         (uint8 liveTier,) = tierRegistry.tierOf(address(mockAdapter), mockAdapter.approve.selector);
         assertEq(liveTier, 0); // NOT a tier regression
 
@@ -297,7 +297,7 @@ contract TierResolutionTest is Test {
     ///         execution proceeds normally to Executed.
     function test_executeSucceedsWhenTierUnchanged() public {
         _wireTierRegistry();
-        tierRegistry.certify(address(mockAdapter), mockAdapter.approve.selector, 0, 50);
+        tierRegistry.certify(address(mockAdapter), mockAdapter.approve.selector, 0, 50, address(0));
 
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](1);
         calls[0] = _certifiedCall();
