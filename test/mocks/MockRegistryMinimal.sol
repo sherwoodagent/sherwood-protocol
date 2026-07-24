@@ -86,7 +86,19 @@ contract MockRegistryMinimal is IGuardianRegistry {
         revert NotImplemented();
     }
 
-    function addGovernor(address) external pure {
+    function addGovernor(address, address) external pure {
+        revert NotImplemented();
+    }
+
+    function registerReview(uint256, uint256, uint256) external pure {
+        revert NotImplemented();
+    }
+
+    function reviewWindow(address, uint256) external pure returns (uint64, uint64) {
+        revert NotImplemented();
+    }
+
+    function vaultOf(address) external pure returns (address) {
         revert NotImplemented();
     }
 

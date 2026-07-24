@@ -46,9 +46,17 @@ interface IGuardianRegistry {
     ///         approver unstake and escape the slash before `resolveReview`.
     error CooldownBelowReviewPeriod();
     error UnauthorizedGovernor();
+    /// @notice `registerReview` rejected a window with `voteEnd == 0` (the
+    ///         unregistered sentinel) or `reviewEnd < voteEnd`.
+    error InvalidReviewWindow();
+    /// @notice `registerReview` called twice for the same `(governor, proposalId)`.
+    ///         The pushed window is immutable once set.
+    error ReviewAlreadyRegistered();
 
     // ── Events ──
     event GovernorAdded(address indexed governor);
+    /// @notice Governor pushed a proposal's review window at propose time.
+    event ReviewRegistered(address indexed governor, uint256 indexed proposalId, uint64 voteEnd, uint64 reviewEnd);
     event ReviewOpened(uint256 indexed proposalId, uint128 totalStakeAtOpen);
     event CohortTooSmallToReview(uint256 indexed proposalId, uint256 totalStakeAtOpen);
     event GuardianVoteCast(
@@ -87,7 +95,11 @@ interface IGuardianRegistry {
     function voteOnProposal(address governor, uint256 proposalId, GuardianVoteType support) external;
 
     // ── Multi-governor management ──
-    function addGovernor(address governor) external;
+    function addGovernor(address governor, address vault) external;
+
+    /// @notice Governor push of a proposal's review-window timestamps at propose
+    ///         time. Replaces the registry's `getProposalView(pid)` call-back.
+    function registerReview(uint256 proposalId, uint256 voteEnd, uint256 reviewEnd) external;
 
     // ── Governor-only (emergency) ──
     function openEmergency(uint256 proposalId, bytes32 callsHash, BatchExecutorLib.Call[] calldata calls) external;
@@ -141,6 +153,14 @@ interface IGuardianRegistry {
         external
         view
         returns (address[] memory approvers, uint128[] memory weights, uint128 totalApproveWeight);
+
+    /// @notice The review window pushed by a governor via `registerReview`.
+    ///         `(0, 0)` if never registered.
+    function reviewWindow(address governor, uint256 proposalId) external view returns (uint64 voteEnd, uint64 reviewEnd);
+
+    /// @notice The vault served by an authorized governor (factory-wired at
+    ///         `addGovernor`). `address(0)` if the governor is not authorized.
+    function vaultOf(address governor) external view returns (address);
 
     function reviewPeriod() external view returns (uint256);
     function factory() external view returns (address);

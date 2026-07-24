@@ -269,7 +269,7 @@ contract ProtocolInvariantsTest is StdInvariant, Test {
         // factory to register the real governor. The registry was initialized
         // with governor_=address(0) so the authorized set starts empty.
         vm.prank(newFactory);
-        registry.addGovernor(newGovernor);
+        registry.addGovernor(newGovernor, address(this));
     }
 
     // ──────────────────────────────────────────────────────────────

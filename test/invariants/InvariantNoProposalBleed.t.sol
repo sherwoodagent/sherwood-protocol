@@ -138,8 +138,8 @@ contract InvariantNoProposalBleed is StdInvariant, Test {
         swood.setRegistry(address(registry));
 
         vm.startPrank(regFactory);
-        registry.addGovernor(address(governorA));
-        registry.addGovernor(address(governorB));
+        registry.addGovernor(address(governorA), address(this));
+        registry.addGovernor(address(governorB), address(this));
         vm.stopPrank();
 
         for (uint256 i = 0; i < 3; i++) {

@@ -67,7 +67,9 @@ abstract contract RegistryTestHarness is Test {
         // Authorize the mock governor on the composite-key registry (the factory
         // does this in production via createSyndicate).
         vm.prank(regFactory);
-        registry.addGovernor(address(governor));
+        // Two-arg push wiring: the mock governor's vault is inert in these tests
+        // (vaultOf is not yet consumed), so any non-zero address suffices.
+        registry.addGovernor(address(governor), address(this));
     }
 
     /// @dev Mints WOOD to `g`, approves sWOOD, and stakes `amount` as a

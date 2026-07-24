@@ -156,7 +156,7 @@ contract OpenProposalCountTest is Test {
         // Authorize the per-vault governor on the composite-key registry
         // (replaces the removed governor.addVault wiring).
         vm.prank(registry.factory());
-        registry.addGovernor(address(governor));
+        registry.addGovernor(address(governor), address(this));
         require(address(registry) == predictedRegistryProxy, "registry addr mismatch");
 
         // Resolve the registry ↔ sWOOD circular dependency.

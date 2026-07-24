@@ -83,6 +83,12 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         ///      flip the resolution outcome. Read by `resolveReview` +
         ///      `cancelReview` instead of the live `blockQuorumBps` slot.
         uint16 blockQuorumBpsAtOpen;
+        /// @dev Review-window timestamps PUSHED by the governor at propose time
+        ///      via `registerReview` (ProposalLifecycle Task 1). Replaces the
+        ///      registry's `getProposalView(pid)` call-back into the governor;
+        ///      `voteEnd != 0` doubles as the "already registered" sentinel.
+        uint64 voteEnd;
+        uint64 reviewEnd;
     }
 
     mapping(bytes32 => Review) internal _reviews;
@@ -150,6 +156,10 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     ///      `address public governor` singleton is repurposed as the EnumerableSet
     ///      internal storage; callers must use `addGovernor` after deploy.
     EnumerableSet.AddressSet private _authorizedGovernors;
+    /// @dev Vault served by each authorized governor (1:1, factory-wired at
+    ///      `addGovernor`); replaces `getProposalView().vault` so a compromised
+    ///      governor cannot misdirect `slashOwnerBond` to an arbitrary vault.
+    mapping(address => address) public vaultOf;
     /// @dev Retained post-slim purely as an alignment beacon: the slimmed
     ///      registry no longer gates any logic on `factory` (factory-gated
     ///      staking moved to sWOOD), but `SyndicateFactory.setGuardianRegistry`
@@ -242,16 +252,50 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
 
     // ── Multi-governor management ──
 
-    /// @notice Register an additional governor. Factory-only — called immediately
-    ///         after a new per-vault governor is deployed.
-    function addGovernor(address gov) external {
+    /// @notice Register an additional governor and the vault it serves.
+    ///         Factory-only — called immediately after a new per-vault governor
+    ///         is deployed.
+    /// @param gov The per-vault governor being authorized.
+    /// @param vault The vault `gov` serves; recorded in `vaultOf` so the slash
+    ///        path resolves the vault from trusted factory-wired state instead
+    ///        of a governor-supplied `getProposalView().vault`.
+    function addGovernor(address gov, address vault) external {
         // I3 (review) + spec §7: factory-only. The registry owner authorizing an
         // arbitrary governor would let an attacker-controlled getProposalView().vault
         // reach slashOwnerBond(anyVault) — restore the spec's onlyFactory gate.
         if (msg.sender != factory) revert UnauthorizedGovernor();
-        if (gov == address(0)) revert ZeroAddress();
+        if (gov == address(0) || vault == address(0)) revert ZeroAddress();
         _authorizedGovernors.add(gov);
+        vaultOf[gov] = vault;
         emit GovernorAdded(gov);
+    }
+
+    /// @notice Governor push of a proposal's review-window timestamps at propose
+    ///         time. Replaces the registry's `getProposalView(pid)` call-back —
+    ///         the governor is the single source of the window and pushes it
+    ///         once, on `propose`, so the registry never calls back.
+    /// @dev Keyed by `(msg.sender, proposalId)` so each governor owns its own
+    ///      window namespace. `voteEnd == 0` is the unregistered sentinel, so a
+    ///      zero `voteEnd` is rejected; re-registration is rejected to keep the
+    ///      window immutable once set.
+    function registerReview(uint256 proposalId, uint256 voteEnd, uint256 reviewEnd) external onlyGovernor {
+        if (voteEnd == 0 || reviewEnd <= voteEnd) revert InvalidReviewWindow();
+        Review storage r = _reviews[_reviewKey(msg.sender, proposalId)];
+        if (r.voteEnd != 0) revert ReviewAlreadyRegistered();
+        r.voteEnd = uint64(voteEnd);
+        r.reviewEnd = uint64(reviewEnd);
+        emit ReviewRegistered(msg.sender, proposalId, uint64(voteEnd), uint64(reviewEnd));
+    }
+
+    /// @notice The pushed review window for a `(governor, proposalId)` pair.
+    ///         `(0, 0)` if never registered.
+    function reviewWindow(address governor, uint256 proposalId)
+        external
+        view
+        returns (uint64 voteEnd, uint64 reviewEnd)
+    {
+        Review storage r = _reviews[_reviewKey(governor, proposalId)];
+        return (r.voteEnd, r.reviewEnd);
     }
 
     /// @dev Composite key isolating per-(governor, proposalId) review state.
@@ -345,8 +389,8 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
 
         if (existing == GuardianVoteType.None) {
             // Sherlock #42: apply the late-vote lockout to first-time votes too.
-            uint256 reviewWindow = uint256(p.reviewEnd) - uint256(p.voteEnd);
-            uint256 lockoutStart = p.reviewEnd - (reviewWindow * LATE_VOTE_LOCKOUT_BPS) / BPS_DENOMINATOR;
+            uint256 reviewWindowDuration = uint256(p.reviewEnd) - uint256(p.voteEnd);
+            uint256 lockoutStart = p.reviewEnd - (reviewWindowDuration * LATE_VOTE_LOCKOUT_BPS) / BPS_DENOMINATOR;
             if (block.timestamp >= lockoutStart) revert VoteChangeLockedOut();
 
             // First vote — snapshot own + delegated weight AT `r.openedAt`.
@@ -366,8 +410,8 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
             emit GuardianVoteCast(proposalId, msg.sender, support, weight);
         } else {
             // Vote-change: must be before the late lockout window.
-            uint256 reviewWindow = uint256(p.reviewEnd) - uint256(p.voteEnd);
-            uint256 lockoutStart = p.reviewEnd - (reviewWindow * LATE_VOTE_LOCKOUT_BPS) / BPS_DENOMINATOR;
+            uint256 reviewWindowDuration = uint256(p.reviewEnd) - uint256(p.voteEnd);
+            uint256 lockoutStart = p.reviewEnd - (reviewWindowDuration * LATE_VOTE_LOCKOUT_BPS) / BPS_DENOMINATOR;
             if (block.timestamp >= lockoutStart) revert VoteChangeLockedOut();
 
             uint128 weight = _voteStake[key][msg.sender]; // preserved snapshot

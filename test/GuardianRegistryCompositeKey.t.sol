@@ -77,8 +77,8 @@ contract GuardianRegistryCompositeKeyTest is Test {
 
         // Authorize BOTH governors (the factory does this per createSyndicate).
         vm.startPrank(regFactory);
-        registry.addGovernor(address(governorA));
-        registry.addGovernor(address(governorB));
+        registry.addGovernor(address(governorA), address(this));
+        registry.addGovernor(address(governorB), address(this));
         vm.stopPrank();
 
         // Cohort: 3 guardians × 20k = 60k total (≥ MIN_COHORT_STAKE_AT_OPEN).
