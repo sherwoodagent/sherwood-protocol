@@ -17,6 +17,15 @@ interface ISyndicateFactory {
     // ── Errors (V-M7) ──
     error InvalidSyndicateConfig();
 
+    // ── Errors (guardian economic-security Plan B, LOW-1 / issue #19) ──
+    /// @dev `pushWiring` target is not a governor this factory deployed.
+    error NotFactoryGovernor();
+
+    // ── Events (guardian economic-security Plan B) ──
+    event ExposureLedgerSet(address indexed oldLedger, address indexed newLedger);
+    event BondEscrowSet(address indexed oldEscrow, address indexed newEscrow);
+    event WiringPushed(address indexed governor);
+
     // ── Views ──
     function governorOf(address vault) external view returns (address);
     function beacon() external view returns (address);
@@ -25,8 +34,21 @@ interface ISyndicateFactory {
     function vaultImpl() external view returns (address);
     function vaultToSyndicate(address vault) external view returns (uint256);
     function guardianRegistry() external view returns (address);
+    function tierRegistry() external view returns (address);
+    /// @notice Exposure ledger pushed into governors at `createSyndicate` / `pushWiring`.
+    function exposureLedger() external view returns (address);
+    /// @notice Proposer-bond escrow pushed into governors at `createSyndicate` / `pushWiring`.
+    function bondEscrow() external view returns (address);
+    /// @notice Whether `governor` is a per-vault governor deployed by this factory.
+    function isFactoryGovernor(address governor) external view returns (bool);
 
     // ── Admin ──
     function rotateOwner(address vault, address newOwner) external;
     function setParamsOverride(address vault, ISyndicateGovernor.GovernorParams calldata params) external;
+    function setTierRegistry(address newRegistry) external;
+    function setExposureLedger(address newLedger) external;
+    function setBondEscrow(address newEscrow) external;
+    /// @notice Push the factory's current tierRegistry / exposureLedger / bondEscrow
+    ///         into an EXISTING factory-deployed governor (closes LOW-1 / issue #19).
+    function pushWiring(address governor) external;
 }
