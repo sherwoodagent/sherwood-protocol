@@ -532,7 +532,7 @@ git commit -m "feat(ledger): asset-to-USD conversion with fail-closed Chainlink 
 The accounting model, stated once (this is the spec §3.3 + §3.4a core):
 
 - `recordApproval` books `coverageUsd(asset, requiredCoverage)` into `_buckets[guardian][currentEpoch()]` and remembers `(usd, epoch)` per `(reviewKey, guardian)` so a vote-change can release exactly what was recorded.
-- `openExposureUsd(g)` sums buckets `[cur - lookback, cur]` where `lookback = ceil(challengeWindow / epochLength)` (= 1 at defaults). Buckets older than that have cleared their challenge window — the budget has recycled (spec §3.3 "recycles every challenge window"). Conservative by up to one epoch of slack, by design.
+- `openExposureUsd(g)` sums exactly the buckets whose challenge window has not elapsed: bucket `e` covers `[genesis + e·L, genesis + (e+1)·L)` and stays open until `genesis + (e+1)·L + W` (L = epochLength, W = challengeWindow). Equivalently, the first counted bucket is `from = elapsed > W ? (elapsed - W) / L : 0` with `elapsed = now - genesis`. A bucket drops at exactly `end(e) + W` — the budget recycles every challenge window (spec §3.3), no epoch-granularity slack.
 - The cap check is `openExposureUsd(g) + newUsd <= kNumerator * slashableBondUsd(g)`, revert `ExposureCapExceeded`.
 - **Invariant (one sentence, spec §4):** at every instant, `openExposureUsd(g)` equals the sum of USD amounts recorded for `g` in unexpired epochs minus amounts released from them, and never exceeded `k * slashableBondUsd(g)` at any record time.
 
@@ -727,19 +727,19 @@ function _reviewKey(address governor, uint256 proposalId) internal pure returns 
     return keccak256(abi.encode(governor, proposalId)); // same derivation as GuardianRegistry
 }
 
-/// @dev Buckets still inside their challenge window. ceil-div so a window
-///      that only partially overlaps the previous epoch still counts it.
-function _lookbackEpochs() internal view returns (uint256) {
-    return (challengeWindow + epochLength - 1) / epochLength;
-}
-
 // ── replace stubs ──
 
 /// @inheritdoc IExposureLedger
+/// @dev Bucket `e` (covering [genesis + e·L, genesis + (e+1)·L)) counts until
+///      its challenge window elapses at `genesis + (e+1)·L + W` — exact
+///      expiry, so the coverage budget recycles every challenge window
+///      (spec §3.3). First counted bucket: e such that (e+1)·L + W > elapsed,
+///      i.e. from = (elapsed - W) / L when elapsed > W. from <= cur always
+///      (W > 0), so the loop is bounded by ceil(W/L) + 1 iterations.
 function openExposureUsd(address guardian) public view returns (uint256 total) {
     uint256 cur = currentEpoch();
-    uint256 lookback = _lookbackEpochs();
-    uint256 from = cur > lookback ? cur - lookback : 0;
+    uint256 elapsed = block.timestamp - epochGenesis;
+    uint256 from = elapsed > challengeWindow ? (elapsed - challengeWindow) / epochLength : 0;
     for (uint256 e = from; e <= cur; e++) {
         total += _buckets[guardian][e];
     }
