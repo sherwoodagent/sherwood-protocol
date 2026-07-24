@@ -6,6 +6,8 @@ import {ISyndicateVault} from "./interfaces/ISyndicateVault.sol";
 import {IProtocolConfig} from "./interfaces/IProtocolConfig.sol";
 import {IGuardianRegistry} from "./interfaces/IGuardianRegistry.sol";
 import {ITierRegistry} from "./interfaces/ITierRegistry.sol";
+import {IExposureLedger} from "./interfaces/IExposureLedger.sol";
+import {IProposerBondEscrow} from "./interfaces/IProposerBondEscrow.sol";
 import {IStrategy} from "./interfaces/IStrategy.sol";
 import {GovernorParameters} from "./GovernorParameters.sol";
 import {GovernorEmergency} from "./GovernorEmergency.sol";
@@ -135,6 +137,16 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///         like `setProtocolConfig`).
     address internal _tierRegistry;
 
+    /// @notice Exposure ledger (Plan B, spec §3.7/§3.9). Optional: address(0)
+    ///         skips the covered-TVL cap + proposer-bond gates at propose — the
+    ///         pre-ledger safe default. Wired post-init via `setExposureLedger`
+    ///         (factory-only, like `setTierRegistry`).
+    address internal _exposureLedger;
+
+    /// @notice Proposer bond escrow (Plan B, spec §3.9). Optional: address(0)
+    ///         skips bond locking. Wired via `setBondEscrow` (factory-only).
+    address internal _bondEscrow;
+
     /// @dev Reserved storage for future upgrades (shrunk by 1 for _guardianRegistry,
     ///      shrunk by 1 more for openProposalCount,
     ///      shrunk by 1 more for _unclaimedFees,
@@ -146,8 +158,9 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      grew by 2 after V2: _emergencyCallsHashes + _emergencyCalls moved
     ///      to GuardianRegistry,
     ///      shrunk by 1 for _draftTimingSnap — Sherlock #14 restored,
-    ///      shrunk by 1 for _tierRegistry — Task 5)
-    uint256[33] private __gap;
+    ///      shrunk by 1 for _tierRegistry — Task 5,
+    ///      shrunk by 2 for _exposureLedger + _bondEscrow — Plan B Task 8)
+    uint256[31] private __gap;
 
     /// @param minVotingPeriod_   Per-deployment floor for `votingPeriod` (mainnet 24h).
     /// @param minCooldownPeriod_ Per-deployment floor for `cooldownPeriod` (mainnet 1h).
@@ -710,6 +723,16 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     }
 
     /// @inheritdoc ISyndicateGovernor
+    function exposureLedger() external view returns (address) {
+        return _exposureLedger;
+    }
+
+    /// @inheritdoc ISyndicateGovernor
+    function bondEscrow() external view returns (address) {
+        return _bondEscrow;
+    }
+
+    /// @inheritdoc ISyndicateGovernor
     function getProposalTier(uint256 proposalId) external view returns (uint8) {
         return _proposals[proposalId].envelopeTier;
     }
@@ -803,6 +826,21 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             _resolveTierAndCoverage(execCalls, _loadCalls(_settlementCalls, p.id), p.maxCapital);
         p.envelopeTier = tier_;
         p.requiredCoverage = coverage_;
+        // Plan B gates (spec §3.7 + §3.9). Skipped when unwired — the
+        // pre-ledger safe default matches the tierRegistry pattern.
+        address ledger = _exposureLedger;
+        if (ledger != address(0)) {
+            address asset = IERC4626(GovernorParameters.vault).asset();
+            IExposureLedger(ledger).requireWithinCoveredTvlCap(asset, coverage_);
+            address escrow = _bondEscrow;
+            if (escrow != address(0)) {
+                uint256 bondWood = IExposureLedger(ledger).proposerBondWood(asset, coverage_);
+                if (bondWood != 0) {
+                    p.proposerBondWood = bondWood;
+                    IProposerBondEscrow(escrow).lockBond(p.id, p.proposer, bondWood);
+                }
+            }
+        }
     }
 
     /// @dev Proposal tier = max tier across EXECUTE calls; coverage = the
@@ -1236,6 +1274,23 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     function setTierRegistry(address newRegistry) external onlyFactory {
         emit TierRegistrySet(_tierRegistry, newRegistry);
         _tierRegistry = newRegistry;
+    }
+
+    /// @inheritdoc ISyndicateGovernor
+    /// @dev address(0) is legal: it un-wires the ledger and the covered-TVL cap
+    ///      + proposer-bond gates are then skipped — the pre-ledger safe
+    ///      default (mirrors `setTierRegistry`).
+    function setExposureLedger(address newLedger) external onlyFactory {
+        emit ExposureLedgerSet(_exposureLedger, newLedger);
+        _exposureLedger = newLedger;
+    }
+
+    /// @inheritdoc ISyndicateGovernor
+    /// @dev address(0) is legal: it un-wires the escrow and no bond is locked at
+    ///      propose (mirrors `setTierRegistry`).
+    function setBondEscrow(address newEscrow) external onlyFactory {
+        emit BondEscrowSet(_bondEscrow, newEscrow);
+        _bondEscrow = newEscrow;
     }
 
     /// @inheritdoc ISyndicateGovernor

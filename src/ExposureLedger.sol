@@ -260,12 +260,17 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         return (amount * uint256(answer) * 1e18) / (10 ** f.assetDecimals) / (10 ** f.feedDecimals);
     }
 
-    // ── Stub replaced in Task 8. Reverts InvalidParameter ("not implemented"),
-    //    distinct from FeedNotConfigured, so callers can diagnose the difference
-    //    from a genuinely unconfigured feed. ──
-
-    function proposerBondWood(address, uint256) external view virtual returns (uint256) {
-        revert InvalidParameter();
+    /// @inheritdoc IExposureLedger
+    /// @notice WOOD amount of the risk-scaled proposer bond for a proposal with
+    ///         `requiredCoverage` in `asset` (spec §3.9/§5: "fraction of
+    ///         maxExtractable — honest proposers not priced out, a rug forfeits
+    ///         meaningfully"). Zero when the bond bps is zero; reverts
+    ///         (fail-closed) when the WOOD price is unset.
+    function proposerBondWood(address asset, uint256 requiredCoverage) external view returns (uint256) {
+        uint256 usd = (coverageUsd(asset, requiredCoverage) * proposerBondBps) / BPS_DENOMINATOR;
+        if (usd == 0) return 0;
+        if (woodUsdPriceX8 == 0) revert InvalidParameter();
+        return (usd * 1e8) / woodUsdPriceX8;
     }
 
     /// @inheritdoc IExposureLedger

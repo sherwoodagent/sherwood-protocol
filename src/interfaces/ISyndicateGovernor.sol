@@ -126,6 +126,10 @@ interface ISyndicateGovernor {
         ///         notional isn't threaded through in Plan A. `maxCapital` flat
         ///         when no registry is wired.
         uint256 requiredCoverage;
+        /// @notice WOOD amount of the risk-scaled proposer bond locked in the
+        ///         ProposerBondEscrow at propose time (Plan B, spec §3.9). Zero
+        ///         when no escrow/ledger is wired or the bond bps is zero.
+        uint256 proposerBondWood;
     }
 
     struct CoProposer {
@@ -364,6 +368,12 @@ interface ISyndicateGovernor {
     /// @notice Tier registry wired (or un-wired, newRegistry == address(0)).
     event TierRegistrySet(address indexed oldRegistry, address indexed newRegistry);
 
+    /// @notice Exposure ledger wired (or un-wired, newLedger == address(0)) — Plan B.
+    event ExposureLedgerSet(address indexed oldLedger, address indexed newLedger);
+
+    /// @notice Proposer bond escrow wired (or un-wired, newEscrow == address(0)) — Plan B.
+    event BondEscrowSet(address indexed oldEscrow, address indexed newEscrow);
+
     /// @notice Emitted in `_distributeFees` when `guardianFeeBps > 0`.
     ///         Guardian fee is carved from gross PnL and transferred to
     ///         `recipient` (the team `guardiansFeeRecipient` multisig). This is
@@ -450,6 +460,13 @@ interface ISyndicateGovernor {
     ///         `setProtocolConfig`. address(0) un-wires: every proposal then
     ///         resolves to tier 2 / full notional — the safe default.
     function setTierRegistry(address newRegistry) external;
+    /// @notice Wire the exposure ledger (Plan B, spec §3.7/§3.9). Factory-only.
+    ///         address(0) un-wires: the covered-TVL cap and proposer bond gates
+    ///         are then skipped — the pre-ledger safe default.
+    function setExposureLedger(address newLedger) external;
+    /// @notice Wire the proposer bond escrow (Plan B, spec §3.9). Factory-only.
+    ///         address(0) un-wires: the bond is not locked at propose.
+    function setBondEscrow(address newEscrow) external;
 
     // ── Init ──
     /// @notice Initialize a freshly deployed per-vault governor proxy.
@@ -503,6 +520,12 @@ interface ISyndicateGovernor {
 
     /// @notice Address of the tier registry (zero if not wired — tier 2 default).
     function tierRegistry() external view returns (address);
+
+    /// @notice Address of the exposure ledger (zero if not wired — gates skipped).
+    function exposureLedger() external view returns (address);
+
+    /// @notice Address of the proposer bond escrow (zero if not wired — no bond).
+    function bondEscrow() external view returns (address);
 
     /// @notice MAX tier across the proposal's execute calls, resolved at
     ///         propose time (spec §3.2). Returns 0 for a nonexistent
