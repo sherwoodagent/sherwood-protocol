@@ -346,10 +346,17 @@ strategy selection the same way.
   2026-07-24: Sherwood follows the hedge-fund template, "2 and 10" for agents). An
   agent-owned management fee of 2%/yr on funded capital (proposed cap 3%/yr),
   pro-rated to actual proposal duration and paid **regardless of P&L**. It can ride
-  the exact rails this spec builds: strategy-side, computed at settle as
-  `_volumeFeeBase × mgmtFeeBps × elapsed / 365 days`, paid to the agent-fee
-  recipients (same split as carry) before capital returns to the vault — senior to
-  the profit waterfall, zero governor bytecode, same fail-open rules. The existing
+  the exact rails this spec builds: strategy-side, paid to the agent-fee recipients
+  (same split as carry) before capital returns to the vault — senior to the profit
+  waterfall, zero governor bytecode, same fail-open rules. The base must be
+  **time-weighted deployed capital**, not a flat snapshot: mid-proposal Lane A
+  exits shrink the strategy's book via `withdrawTo` (and custody strategies via the
+  `strategyMint`/`strategyBurn` share hooks), so the strategy keeps a TWA
+  accumulator — `twa += base × (now − lastUpdate)` on every base-changing event
+  (execute, `withdrawTo`, share hooks), fee at settle = `twa × mgmtFeeBps / (10_000
+  × 365 days)`. Mid-proposal deposits sit in the vault, not the strategy, and pay
+  nothing until deployed under a later proposal — `interimNetFlow`
+  (`src/SyndicateVault.sol:174`) already keeps them out of the profit-fee base. The existing
   profit-gated vault `managementFeeBps` is renamed **owner fee** at the docs/product
   level (contract storage name unchanged). Detailed spec to follow; the product spec
   (`docs/product/`) carries the decided economics.

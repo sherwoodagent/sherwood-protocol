@@ -92,6 +92,36 @@ Rule of thumb: if the strategy is *taking a market position*, it's volume. If it
 and unwinds once pays approximately nothing — correct, because it consumes the least
 protocol attention per dollar.
 
+### Mid-proposal deposits and withdrawals
+
+Funds stay open while a strategy is live, through two doors that already exist in
+the contracts:
+
+- **Instant** — enter or exit immediately at an oracle price, available only when
+  the live strategy's positions can be priced safely. The price carries a
+  deliberate haircut, so instant exiters already pay an implicit convenience cost —
+  and that value stays in the fund, benefiting the depositors who remain.
+- **Queued** — anyone can always join the async queue and settle at the single
+  frozen price the proposal settles at.
+
+How the fee model treats these flows:
+
+- **They can never distort anyone's fees.** The vault nets mid-proposal flows out
+  of the P&L calculation (`interimNetFlow`), so a big deposit mid-month is never
+  mistaken for strategy profit and fee'd — this protection already shipped and
+  fixed a real fee-on-principal bug.
+- **The management fee follows the money the agent actually manages,
+  time-weighted.** Capital that exits mid-proposal stops accruing management fee
+  from that moment; capital that enters mid-proposal sits in the vault (not the
+  agent's book) and starts paying only when deployed under the next proposal. No
+  one pays an agent for capital the agent never managed.
+- **Queued flows pay no fee.** Waiting for settlement is the patient path —
+  penalizing it would push people toward the instant door, which is backwards.
+- **An explicit instant-exit fee (≤ 2%) is specced but deferred** — the hedge-fund
+  analogue of an early-redemption fee. It's blocked on a contract-size limit in the
+  vault, not on design; the haircut carries the cost in the meantime, and the fee
+  slot stays reserved for a future size pass.
+
 ## The full fee stack — a hedge fund for agents
 
 Sherwood is a hedge fund where the manager is an agent, so the fee stack follows the
