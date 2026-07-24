@@ -23,6 +23,21 @@ interface IERC20DecimalsMinimal {
     function decimals() external view returns (uint8);
 }
 
+interface ILedgerGovernorMinimal {
+    struct ProposalViewLite {
+        uint256 voteEnd;
+        uint256 reviewEnd;
+        address vault;
+    }
+
+    function getProposalView(uint256 proposalId) external view returns (ProposalViewLite memory);
+    function getRequiredCoverage(uint256 proposalId) external view returns (uint256);
+}
+
+interface IVaultAssetMinimal {
+    function asset() external view returns (address);
+}
+
 /**
  * @title ExposureLedger
  * @notice Dollar-denominated coverage accounting for the guardian
@@ -92,6 +107,25 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     }
 
     mapping(address asset => AssetFeed) internal _assetFeeds;
+
+    struct RecordedExposure {
+        uint192 usd;
+        uint64 epoch;
+    }
+
+    mapping(address guardian => mapping(uint256 epoch => uint256 usd)) internal _buckets;
+    mapping(bytes32 reviewKey => mapping(address guardian => RecordedExposure)) internal _recorded;
+
+    // ── Modifiers / helpers ──
+
+    modifier onlyRegistry() {
+        if (msg.sender != guardianRegistry) revert NotGuardianRegistry();
+        _;
+    }
+
+    function _reviewKey(address governor, uint256 proposalId) internal pure returns (bytes32) {
+        return keccak256(abi.encode(governor, proposalId)); // same derivation as GuardianRegistry
+    }
 
     constructor(address initialOwner, address swood_, uint256 epochLength_) Ownable(initialOwner) {
         if (swood_ == address(0)) revert ZeroAddress();
@@ -197,12 +231,37 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         revert FeedNotConfigured();
     }
 
-    function recordApproval(address, uint256, address) external virtual {
-        revert NotGuardianRegistry();
+    /// @inheritdoc IExposureLedger
+    /// @dev Called by GuardianRegistry.voteOnProposal on the approve side (spec
+    ///      §3.3: the cap is checked at vote time). Reverting here reverts the
+    ///      guardian's vote — an over-exposed guardian simply cannot approve.
+    function recordApproval(address governor, uint256 proposalId, address guardian) external onlyRegistry {
+        bytes32 key = _reviewKey(governor, proposalId);
+        if (_recorded[key][guardian].usd != 0) return; // idempotent (vote-change round trip)
+        ILedgerGovernorMinimal gov = ILedgerGovernorMinimal(governor);
+        address asset = IVaultAssetMinimal(gov.getProposalView(proposalId).vault).asset();
+        uint256 usd = coverageUsd(asset, gov.getRequiredCoverage(proposalId));
+        if (usd == 0) return; // zero-coverage: nothing to book
+        uint256 epoch = currentEpoch();
+        if (openExposureUsd(guardian) + usd > kNumerator * slashableBondUsd(guardian)) {
+            revert ExposureCapExceeded();
+        }
+        _buckets[guardian][epoch] += usd;
+        _recorded[key][guardian] = RecordedExposure({usd: uint192(usd), epoch: uint64(epoch)});
+        emit ExposureRecorded(guardian, key, usd, epoch);
     }
 
-    function releaseApproval(address, uint256, address) external virtual {
-        revert NotGuardianRegistry();
+    /// @inheritdoc IExposureLedger
+    /// @dev Vote-change Approve→Block (or any registry-side unwind). Releases
+    ///      exactly what was recorded, from the bucket it was recorded into.
+    ///      No-op when nothing is recorded — never underflows.
+    function releaseApproval(address governor, uint256 proposalId, address guardian) external onlyRegistry {
+        bytes32 key = _reviewKey(governor, proposalId);
+        RecordedExposure memory r = _recorded[key][guardian];
+        if (r.usd == 0) return;
+        delete _recorded[key][guardian];
+        _buckets[guardian][r.epoch] -= r.usd;
+        emit ExposureReleased(guardian, key, r.usd, r.epoch);
     }
 
     function requireWithinCoveredTvlCap(address, uint256) external view virtual {
@@ -213,7 +272,19 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         revert InsufficientApproveCoverage();
     }
 
-    function openExposureUsd(address) public view virtual returns (uint256) {
-        return 0;
+    /// @inheritdoc IExposureLedger
+    /// @dev Bucket `e` (covering [genesis + e·L, genesis + (e+1)·L)) counts until
+    ///      its challenge window elapses at `genesis + (e+1)·L + W` — exact
+    ///      expiry, so the coverage budget recycles every challenge window
+    ///      (spec §3.3). First counted bucket: e such that (e+1)·L + W > elapsed,
+    ///      i.e. from = (elapsed - W) / L when elapsed > W. from <= cur always
+    ///      (W > 0), so the loop is bounded by ceil(W/L) + 1 iterations.
+    function openExposureUsd(address guardian) public view returns (uint256 total) {
+        uint256 cur = currentEpoch();
+        uint256 elapsed = block.timestamp - epochGenesis;
+        uint256 from = elapsed > challengeWindow ? (elapsed - challengeWindow) / epochLength : 0;
+        for (uint256 e = from; e <= cur; e++) {
+            total += _buckets[guardian][e];
+        }
     }
 }

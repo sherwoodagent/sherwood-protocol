@@ -43,11 +43,49 @@ contract MockFeed {
     }
 }
 
+contract MockGovernorForLedger {
+    address public vaultAddr;
+    uint256 public coverage;
+
+    constructor(address vault_) {
+        vaultAddr = vault_;
+    }
+
+    function set(uint256 coverage_) external {
+        coverage = coverage_;
+    }
+
+    function getRequiredCoverage(uint256) external view returns (uint256) {
+        return coverage;
+    }
+
+    struct ProposalViewLite {
+        uint256 voteEnd;
+        uint256 reviewEnd;
+        address vault;
+    }
+
+    function getProposalView(uint256) external view returns (ProposalViewLite memory v) {
+        v.vault = vaultAddr;
+    }
+}
+
+contract MockVaultForLedger {
+    address public asset;
+
+    constructor(address asset_) {
+        asset = asset_;
+    }
+}
+
 contract ExposureLedgerTest is Test {
     ExposureLedger internal ledger;
     MockSwood internal swood;
     address internal owner = makeAddr("owner");
     address internal guardian = makeAddr("guardian");
+    address internal registry = makeAddr("registry");
+    MockGovernorForLedger internal mgov;
+    address internal usdgAsset;
 
     function setUp() public {
         swood = new MockSwood();
@@ -115,5 +153,106 @@ contract ExposureLedgerTest is Test {
         vm.warp(block.timestamp + 2 days);
         vm.expectRevert(IExposureLedger.StalePrice.selector);
         ledger.coverageUsd(usdg, 1e6);
+    }
+
+    function _wireRecording() internal {
+        usdgAsset = makeAddr("usdgAsset");
+        vm.mockCall(usdgAsset, abi.encodeWithSignature("decimals()"), abi.encode(uint8(6)));
+        MockFeed feed = new MockFeed(1e8, 8);
+        MockVaultForLedger vault = new MockVaultForLedger(usdgAsset);
+        mgov = new MockGovernorForLedger(address(vault));
+        vm.startPrank(owner);
+        ledger.setAssetFeed(usdgAsset, address(feed), 365 days);
+        ledger.setGuardianRegistry(registry);
+        vm.stopPrank();
+        swood.setStake(guardian, 100_000e18, 0); // slashableBondUsd = $5,000 at $0.05
+    }
+
+    function test_recordApproval_registryOnly() public {
+        _wireRecording();
+        mgov.set(1_000e6);
+        vm.expectRevert(IExposureLedger.NotGuardianRegistry.selector);
+        ledger.recordApproval(address(mgov), 1, guardian);
+    }
+
+    function test_recordApproval_booksExposure() public {
+        _wireRecording();
+        mgov.set(1_000e6); // $1,000
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        assertEq(ledger.openExposureUsd(guardian), 1_000e18);
+    }
+
+    function test_recordApproval_capExceededReverts() public {
+        _wireRecording();
+        mgov.set(6_000e6); // $6,000 > $5,000 bond
+        vm.prank(registry);
+        vm.expectRevert(IExposureLedger.ExposureCapExceeded.selector);
+        ledger.recordApproval(address(mgov), 1, guardian);
+    }
+
+    function test_recordApproval_netsAcrossSequentialEpochs() public {
+        _wireRecording();
+        mgov.set(4_000e6);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        // same guardian, next epoch + challenge window fully elapsed: budget recycled
+        vm.warp(block.timestamp + 28 days + 14 days + 1);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 2, guardian); // would exceed the cap if netted with #1
+        assertEq(ledger.openExposureUsd(guardian), 4_000e18); // only the live epoch counts
+    }
+
+    function test_recordApproval_blocksSimultaneousOverExposure() public {
+        _wireRecording();
+        mgov.set(3_000e6);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        vm.prank(registry);
+        vm.expectRevert(IExposureLedger.ExposureCapExceeded.selector);
+        ledger.recordApproval(address(mgov), 2, guardian); // $3k + $3k > $5k — the batching attack
+    }
+
+    function test_releaseApproval_freesExactRecordedAmount() public {
+        _wireRecording();
+        mgov.set(3_000e6);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        vm.prank(registry);
+        ledger.releaseApproval(address(mgov), 1, guardian);
+        assertEq(ledger.openExposureUsd(guardian), 0);
+    }
+
+    function test_releaseApproval_idempotentNoUnderflow() public {
+        _wireRecording();
+        vm.prank(registry);
+        ledger.releaseApproval(address(mgov), 99, guardian); // never recorded: no-op
+        assertEq(ledger.openExposureUsd(guardian), 0);
+    }
+
+    /// Fuzz the stated invariant: any record/release interleaving leaves
+    /// openExposureUsd == sum recorded-minus-released in unexpired buckets.
+    function testFuzz_exposureAccountingConserved(uint96 c1, uint96 c2, bool releaseFirst) public {
+        _wireRecording();
+        swood.setStake(guardian, type(uint96).max, 0); // cap never binds in this fuzz
+        vm.prank(owner);
+        ledger.setWoodUsdPrice(1e8);
+        uint256 u1 = uint256(c1) % 1_000_000e6 + 1;
+        uint256 u2 = uint256(c2) % 1_000_000e6 + 1;
+        mgov.set(u1);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        mgov.set(u2);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 2, guardian);
+        if (releaseFirst) {
+            vm.prank(registry);
+            ledger.releaseApproval(address(mgov), 1, guardian);
+            assertEq(ledger.openExposureUsd(guardian), u2 * 1e12); // 6-dec asset at $1 → USD-18
+        } else {
+            vm.prank(registry);
+            ledger.releaseApproval(address(mgov), 2, guardian);
+            assertEq(ledger.openExposureUsd(guardian), u1 * 1e12);
+        }
     }
 }
