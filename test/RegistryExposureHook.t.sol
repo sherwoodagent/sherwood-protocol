@@ -2,6 +2,7 @@
 pragma solidity 0.8.28;
 
 import "forge-std/Test.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {GuardianRegistry} from "../src/GuardianRegistry.sol";
 import {StakedWood} from "../src/StakedWood.sol";
 import {ExposureLedger} from "../src/ExposureLedger.sol";
@@ -224,5 +225,45 @@ contract RegistryExposureHookTest is Test {
         unwired.registry.voteOnProposal(address(unwired.gov), PID2, IGuardianRegistry.GuardianVoteType.Approve);
         // no revert, no recording anywhere
         assertEq(ledger.openExposureUsd(g1), 0);
+    }
+
+    function test_voteChange_approveBlockApprove_rebooks() public {
+        // Approve → Block → Approve: record, release, re-record (cap re-checked
+        // on the final approve). Exposure returns to the originally booked amount.
+        vm.prank(g1);
+        wired.registry.voteOnProposal(address(wired.gov), PID, IGuardianRegistry.GuardianVoteType.Approve);
+        uint256 booked = ledger.openExposureUsd(g1);
+        assertGt(booked, 0);
+
+        vm.prank(g1);
+        wired.registry.voteOnProposal(address(wired.gov), PID, IGuardianRegistry.GuardianVoteType.Block);
+        assertEq(ledger.openExposureUsd(g1), 0);
+
+        vm.prank(g1);
+        wired.registry.voteOnProposal(address(wired.gov), PID, IGuardianRegistry.GuardianVoteType.Approve);
+        assertEq(ledger.openExposureUsd(g1), booked);
+    }
+
+    function test_voteChange_blockToApprove_booksFresh() public {
+        // Block records nothing; changing to Approve books fresh exposure.
+        vm.prank(g1);
+        wired.registry.voteOnProposal(address(wired.gov), PID, IGuardianRegistry.GuardianVoteType.Block);
+        assertEq(ledger.openExposureUsd(g1), 0);
+
+        vm.prank(g1);
+        wired.registry.voteOnProposal(address(wired.gov), PID, IGuardianRegistry.GuardianVoteType.Approve);
+        assertGt(ledger.openExposureUsd(g1), 0);
+    }
+
+    function test_setExposureLedger_accessControl() public {
+        // Non-owner cannot wire the ledger.
+        vm.prank(g1);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, g1));
+        wired.registry.setExposureLedger(address(ledger));
+
+        // Owner cannot wire the zero address.
+        vm.prank(regOwner);
+        vm.expectRevert(IGuardianRegistry.ZeroAddress.selector);
+        wired.registry.setExposureLedger(address(0));
     }
 }

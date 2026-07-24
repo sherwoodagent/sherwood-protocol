@@ -424,6 +424,10 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
                 r.blockStakeWeight += weight;
             }
             _votes[key][msg.sender] = support;
+            // CEI: the external ledger call runs AFTER every state write above
+            // (`_votes`, tallies, approver/blocker push) so a re-entrant
+            // voteOnProposal observes committed state — do NOT move any state
+            // write below this hook. Same discipline as resolveReview (~L646).
             if (support == GuardianVoteType.Approve && address(exposureLedger) != address(0)) {
                 // Spec §3.3: the aggregate exposure cap is checked HERE, at
                 // the approve vote. A revert (ExposureCapExceeded) reverts
@@ -456,6 +460,8 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
                 r.approveStakeWeight += weight;
             }
             _votes[key][msg.sender] = support;
+            // CEI (see first-vote branch above): ledger call is intentionally
+            // after all state writes; do not move a state write below it.
             if (address(exposureLedger) != address(0)) {
                 if (support == GuardianVoteType.Block) {
                     exposureLedger.releaseApproval(governor, proposalId, msg.sender);
