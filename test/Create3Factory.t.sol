@@ -2,7 +2,7 @@
 pragma solidity 0.8.28;
 
 import {Test} from "forge-std/Test.sol";
-import {Create3Factory} from "../src/Create3Factory.sol";
+import {Create3Factory} from "../script/utils/Create3Factory.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
 /// @dev Minimal contract used as a deployment payload — has no constructor side-effects

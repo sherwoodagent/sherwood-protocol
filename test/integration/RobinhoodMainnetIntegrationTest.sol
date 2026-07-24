@@ -36,7 +36,7 @@ uint256 constant ROBINHOOD_FORK_BLOCK = 4_453_020;
  *           - Chainlink push feeds (AggregatorV3, 8 dec, 24h heartbeat).
  *           - No ENS / ERC-8004 → factory gets address(0) for both.
  *
- * @dev Skips if ROBINHOOD_RPC_URL is not set (mirrors the HyperEVM harness). The
+ * @dev Skips if ROBINHOOD_RPC_URL is not set (shared fork-test convention). The
  *      fork is PINNED to a fixed block so live equity/ETH feed values and pool
  *      state stay deterministic across runs. Run explicitly:
  *        forge test --fork-url $ROBINHOOD_RPC_URL \
@@ -123,8 +123,7 @@ abstract contract RobinhoodMainnetIntegrationTest is Test {
             votingPeriod: 1 days,
             woodToken: address(wood),
             slashAppealSeed: 0,
-            epochZeroSeed: 0,
-            betaMode: false
+            epochZeroSeed: 0
         });
         // deployCore's internal c3.deploy calls run as the script address, so
         // prank as the script to keep the Create3Factory owner consistent.
