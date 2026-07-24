@@ -1023,7 +1023,7 @@ contract SyndicateVaultTest is Test {
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](0);
         vm.prank(MOCK_GOVERNOR);
         vm.expectRevert(ISyndicateVault.ExecutorCodehashMismatch.selector);
-        vault.executeGovernorBatch(calls);
+        vault.executeGovernorBatch(calls, type(uint256).max);
     }
 
     /// @dev V-C2 reentrancy guard: if a target re-enters `executeGovernorBatch`
@@ -1051,7 +1051,7 @@ contract SyndicateVaultTest is Test {
         // The re-entrant inner call reverts with OZ's ReentrancyGuardReentrantCall,
         // and that revert bubbles up as the outer batch failure.
         vm.expectRevert();
-        vault.executeGovernorBatch(calls);
+        vault.executeGovernorBatch(calls, type(uint256).max);
     }
 
     // ==================== EXECUTE EVENT (V-M9) ====================
@@ -1069,7 +1069,7 @@ contract SyndicateVaultTest is Test {
         emit ISyndicateVault.GovernorBatchExecuted(MOCK_GOVERNOR, 0);
 
         vm.prank(MOCK_GOVERNOR);
-        vault.executeGovernorBatch(calls);
+        vault.executeGovernorBatch(calls, type(uint256).max);
     }
 
     // ==================== PAUSE GATES GOVERNOR BATCH (I-11) ====================
@@ -1086,7 +1086,7 @@ contract SyndicateVaultTest is Test {
         vm.prank(MOCK_GOVERNOR);
         // OZ v5 PausableUpgradeable reverts with `EnforcedPause()`.
         vm.expectRevert();
-        vault.executeGovernorBatch(calls);
+        vault.executeGovernorBatch(calls, type(uint256).max);
     }
 }
 
@@ -1115,6 +1115,6 @@ contract ReentrantTarget {
 
     function ping() external {
         BatchExecutorLib.Call[] memory inner = new BatchExecutorLib.Call[](0);
-        vault.executeGovernorBatch(inner);
+        vault.executeGovernorBatch(inner, type(uint256).max);
     }
 }

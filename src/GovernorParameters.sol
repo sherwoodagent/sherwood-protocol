@@ -76,6 +76,7 @@ abstract contract GovernorParameters is ISyndicateGovernor {
     bytes32 public constant PARAM_COOLDOWN = keccak256("cooldownPeriod");
     bytes32 public constant PARAM_COLLAB_WINDOW = keccak256("collaborationWindow");
     bytes32 public constant PARAM_MAX_CO_PROPOSERS = keccak256("maxCoProposers");
+    bytes32 public constant PARAM_MAX_CAPITAL_BPS = keccak256("maxCapitalBps");
 
     // ── Storage ──
 
@@ -100,9 +101,18 @@ abstract contract GovernorParameters is ISyndicateGovernor {
     ///         is the deployer multisig until the factory wires the vault via `addVault`.
     address internal _bootstrapOwner;
 
+    /// @notice Ceiling on a proposal's `envelope.maxCapital`, in bps of the
+    ///         vault's `totalAssets()` at propose time (finding 3: without a
+    ///         ceiling a proposer sets maxCapital = uint256.max and the
+    ///         net-outflow cap never binds). Stored 0 means "unset" and reads
+    ///         as the 10_000 (100% of TVL) default via `maxCapitalBps()` — no
+    ///         initialize change needed, existing governors keep working.
+    uint256 internal _maxCapitalBps;
+
     /// @dev Reserved storage slots at the `GovernorParameters` layer so future
     ///      param additions here don't shift `SyndicateGovernor`'s layout.
-    uint256[8] private __paramsGap;
+    ///      (Shrunk 8 → 7 for `_maxCapitalBps` — append-only.)
+    uint256[7] private __paramsGap;
 
     // ── Constructor (impl-time; sets per-deployment timing floors) ──
 
@@ -248,6 +258,20 @@ abstract contract GovernorParameters is ISyndicateGovernor {
         uint256 old = _params.maxCoProposers;
         _params.maxCoProposers = newValue;
         emit ParameterChangeFinalized(PARAM_MAX_CO_PROPOSERS, old, newValue);
+    }
+
+    /// @inheritdoc ISyndicateGovernor
+    function setMaxCapitalBps(uint256 newValue) external onlyVaultOwner whenNoActiveProposal {
+        if (newValue == 0 || newValue > BPS_DENOMINATOR) revert InvalidMaxCapitalBps();
+        uint256 old = maxCapitalBps();
+        _maxCapitalBps = newValue;
+        emit ParameterChangeFinalized(PARAM_MAX_CAPITAL_BPS, old, newValue);
+    }
+
+    /// @inheritdoc ISyndicateGovernor
+    function maxCapitalBps() public view returns (uint256) {
+        uint256 v = _maxCapitalBps;
+        return v == 0 ? BPS_DENOMINATOR : v; // 0 sentinel = unset = 100% of TVL
     }
 
     /// @inheritdoc ISyndicateGovernor

@@ -14,6 +14,7 @@ import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {DeploySherwood} from "../../script/Deploy.s.sol";
 import {DeployTemplates} from "../../script/DeployTemplates.s.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
+import {GovEnvelope} from "../helpers/GovEnvelope.sol";
 
 /**
  * @title HyperEVMIntegrationTest
@@ -207,7 +208,14 @@ abstract contract HyperEVMIntegrationTest is Test {
         vault.setAgentFeeBps(feeBps);
         vm.prank(agent);
         proposalId = governor.propose(
-            address(vault), address(0), "ipfs://test", duration, execCalls, settleCalls, _emptyCoProposers()
+            address(vault),
+            address(0),
+            "ipfs://test",
+            duration,
+            GovEnvelope.permissive(address(vault)),
+            execCalls,
+            settleCalls,
+            _emptyCoProposers()
         );
 
         vm.warp(block.timestamp + 1);

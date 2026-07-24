@@ -13,6 +13,7 @@ import {StakedWood} from "../../src/StakedWood.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {DeploySherwood} from "../../script/Deploy.s.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
+import {GovEnvelope} from "../helpers/GovEnvelope.sol";
 
 // Pinned Robinhood mainnet fork block (US market hours, 2026-07-08 ~15:10 UTC).
 // Chosen so the Chainlink TSLA/ETH/USDG push feeds are fresh (updatedAt within
@@ -208,7 +209,14 @@ abstract contract RobinhoodMainnetIntegrationTest is Test {
         vault.setAgentFeeBps(feeBps);
         vm.prank(agent);
         proposalId = governor.propose(
-            address(vault), address(0), "ipfs://rh-mainnet-test", duration, execCalls, settleCalls, _emptyCoProposers()
+            address(vault),
+            address(0),
+            "ipfs://rh-mainnet-test",
+            duration,
+            GovEnvelope.permissive(address(vault)),
+            execCalls,
+            settleCalls,
+            _emptyCoProposers()
         );
 
         vm.warp(vm.getBlockTimestamp() + 1);

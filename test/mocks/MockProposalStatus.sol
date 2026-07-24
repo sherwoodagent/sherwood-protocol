@@ -14,6 +14,16 @@ contract MockProposalStatus is IProposalStatus {
     uint256 public openCount;
     address public strategy;
 
+    /// @dev Mirrors `SyndicateGovernor.tierRegistry()` — the vault resolves the
+    ///      TierRegistry through its governor for the value-moving-selector
+    ///      guard in `executeGovernorBatch`. address(0) (the default) means the
+    ///      guard is off, matching the unset-registry safe-default posture.
+    address public tierRegistry;
+
+    function setTierRegistry(address registry) external {
+        tierRegistry = registry;
+    }
+
     /// @dev One call drives the whole seam: pid=0 ⇒ unlocked; pid!=0 locks the
     ///      vault with `strategy_` as the active proposal's strategy.
     function set(uint256 pid, uint256 openCount_, address strategy_) external {

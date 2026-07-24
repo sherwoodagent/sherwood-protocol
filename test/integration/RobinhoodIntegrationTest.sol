@@ -13,6 +13,7 @@ import {StrategyFactory} from "../../src/StrategyFactory.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {DeploySherwood} from "../../script/Deploy.s.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
+import {GovEnvelope} from "../helpers/GovEnvelope.sol";
 
 // Pinned Robinhood L2 testnet fork block. Chosen AFTER today's V2 redeployment
 // (2026-07-08) — the full core + strategy stack in chains/46630.json has code
@@ -251,7 +252,14 @@ abstract contract RobinhoodIntegrationTest is Test {
 
         vm.prank(agent);
         proposalId = governor.propose(
-            address(vault), address(0), "ipfs://rh-testnet-test", duration, execCalls, settleCalls, _emptyCoProposers()
+            address(vault),
+            address(0),
+            "ipfs://rh-testnet-test",
+            duration,
+            GovEnvelope.permissive(address(vault)),
+            execCalls,
+            settleCalls,
+            _emptyCoProposers()
         );
 
         vm.warp(vm.getBlockTimestamp() + 1);

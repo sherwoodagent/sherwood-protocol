@@ -109,11 +109,42 @@ interface ISyndicateGovernor {
         ///         implementation can't flip it between review and settle (TOCTOU),
         ///         and a broken/EOA strategy can't brick settle via a revert.
         bool selfManagesFees;
+        // ── APPENDED FIELDS ONLY BELOW (beacon-upgraded governors; storage parity) ──
+        uint256 maxCapital; // risk envelope: net-outflow ceiling (spec §3.1)
+        uint16 maxDrawdownBps; // risk envelope: declared drawdown bound
+        /// @notice MAX tier across the proposal's execute calls, resolved via
+        ///         the TierRegistry at propose time (spec §3.2). 2 whenever no
+        ///         registry is wired — the safe default.
+        uint8 envelopeTier;
+        /// @notice Extractable-value figure the aggregate exposure cap consumes
+        ///         (Plan B). Finding 5: the SUM of per-call contributions across
+        ///         execute AND settlement calls — `maxCapital * Σ boundBps /
+        ///         10_000`, where each tier-0/1 call contributes its certified
+        ///         bound and each tier-2/uncertified call contributes 10_000
+        ///         (full notional). Conservative (over-counting) since per-call
+        ///         notional isn't threaded through in Plan A. `maxCapital` flat
+        ///         when no registry is wired.
+        uint256 requiredCoverage;
     }
 
     struct CoProposer {
         address agent;
         uint256 splitBps;
+    }
+
+    /// @notice Per-proposal risk envelope (spec 2026-07-22 §3.1).
+    /// @param maxCapital   Net-outflow ceiling for the execute batch, enforced
+    ///                     by the vault at custody level. Nonzero.
+    /// @param maxDrawdownBps Declared drawdown envelope; losses beyond it are
+    ///                     challengeable (challenge game, later plan). <= 10_000.
+    ///                     10_000 (100%) is a legal declaration and means any
+    ///                     loss up to the full committed capital is inside the
+    ///                     envelope — no drawdown challenge can ever fire. It is
+    ///                     the permissive default for pre-envelope flows, not a
+    ///                     recommended production value.
+    struct RiskEnvelope {
+        uint256 maxCapital;
+        uint16 maxDrawdownBps;
     }
 
     // Owner-multisig governs parameter changes via its own delay.
@@ -133,6 +164,21 @@ interface ISyndicateGovernor {
     error ProposalNotFound();
     error ProposalNotApproved();
     error ExecutionWindowExpired();
+    /// @notice Spec §3.2 fail-safe: revert at execute if the proposal's live
+    ///         tier (re-resolved from its stored execute calls) is WORSE than
+    ///         the `envelopeTier` snapshotted at propose. A certified tier-0/1
+    ///         adapter that demoted since propose (codehash change or
+    ///         governance revocation) leaves the proposal under-covered — block
+    ///         execution rather than run a possibly-unbounded batch against a
+    ///         bounded-tier coverage price.
+    error TierRegressed();
+    /// @notice Finding 5(b) companion to `TierRegressed`: revert at execute if
+    ///         the live re-resolved `requiredCoverage` exceeds the propose-time
+    ///         snapshot. Catches a same-tier RE-certification with a HIGHER
+    ///         extractableBoundBps (tier unchanged, coverage regressed) that
+    ///         the tier-only check waves through while Plan B's aggregate cap
+    ///         would still trust the stale, lower snapshot.
+    error CoverageRegressed();
     error StrategyAlreadyActive();
     error CooldownNotElapsed();
     error ProposalNotExecuted();
@@ -161,6 +207,19 @@ interface ISyndicateGovernor {
     ///         MAX_METADATA_URI_LENGTH. Bounds a calldata-unbounded string
     ///         that would otherwise let a proposer grief gas / event storage.
     error MetadataURITooLong();
+    /// @notice Revert if `envelope.maxCapital == 0` at propose — a zero
+    ///         net-outflow ceiling would make every execute batch unfundable.
+    error ZeroMaxCapital();
+    /// @notice Revert if `envelope.maxCapital` exceeds the governor's ceiling
+    ///         (`totalAssets() * maxCapitalBps / 10_000` at propose time).
+    ///         Without this, a proposer declares maxCapital = uint256.max and
+    ///         the net-outflow cap never binds (finding 3).
+    error MaxCapitalExceedsCeiling();
+    /// @notice `setMaxCapitalBps` called with 0 or a value above 10_000.
+    error InvalidMaxCapitalBps();
+    /// @notice Revert if `envelope.maxDrawdownBps > 10_000` at propose — a
+    ///         drawdown declaration cannot exceed 100% of committed capital.
+    error InvalidDrawdown();
     /// @notice G-M2/G-M6: Revert if `executeCalls.length` or
     ///         `settlementCalls.length` exceeds MAX_CALLS_PER_PROPOSAL. Bounds
     ///         calldata-unbounded arrays that otherwise let a proposer grief
@@ -301,6 +360,9 @@ interface ISyndicateGovernor {
     // ── Parameter change event (owner-instant, no queue/cancel) ──
     event ParameterChangeFinalized(bytes32 indexed paramKey, uint256 oldValue, uint256 newValue);
 
+    /// @notice Tier registry wired (or un-wired, newRegistry == address(0)).
+    event TierRegistrySet(address indexed oldRegistry, address indexed newRegistry);
+
     /// @notice Emitted in `_distributeFees` when `guardianFeeBps > 0`.
     ///         Guardian fee is carved from gross PnL and transferred to
     ///         `recipient` (the team `guardiansFeeRecipient` multisig). This is
@@ -329,6 +391,7 @@ interface ISyndicateGovernor {
         address strategy,
         string calldata metadataURI,
         uint256 strategyDuration,
+        RiskEnvelope calldata envelope,
         BatchExecutorLib.Call[] calldata executeCalls,
         BatchExecutorLib.Call[] calldata settlementCalls,
         CoProposer[] calldata coProposers
@@ -375,7 +438,17 @@ interface ISyndicateGovernor {
     function setCooldownPeriod(uint256 newCooldownPeriod) external;
     function setCollaborationWindow(uint256 newCollaborationWindow) external;
     function setMaxCoProposers(uint256 newMaxCoProposers) external;
+    /// @notice Set the ceiling on `envelope.maxCapital`, in bps of the vault's
+    ///         `totalAssets()` at propose time. Bounds: 1..10_000.
+    function setMaxCapitalBps(uint256 newMaxCapitalBps) external;
+    /// @notice Effective maxCapital ceiling in bps of TVL (10_000 = 100%, the
+    ///         default when never set).
+    function maxCapitalBps() external view returns (uint256);
     function setProtocolConfig(address newConfig) external;
+    /// @notice Wire the tier registry (spec §3.2). Factory-only, like
+    ///         `setProtocolConfig`. address(0) un-wires: every proposal then
+    ///         resolves to tier 2 / full notional — the safe default.
+    function setTierRegistry(address newRegistry) external;
 
     // ── Init ──
     /// @notice Initialize a freshly deployed per-vault governor proxy.
@@ -414,11 +487,34 @@ interface ISyndicateGovernor {
     function getCooldownEnd() external view returns (uint256);
     function getCapitalSnapshot(uint256 proposalId) external view returns (uint256);
     function getCoProposers(uint256 proposalId) external view returns (CoProposer[] memory);
+    /// @notice Risk envelope declared by the proposer at propose time
+    ///         (spec 2026-07-22 §3.1). Immutable for the proposal's lifetime.
+    /// @dev    Returns (0, 0) for a nonexistent proposalId — the zero-value
+    ///         convention shared with getCapitalSnapshot / getCoProposers.
+    ///         Unambiguous here: `maxCapital == 0` is rejected at propose, so a
+    ///         zero `maxCapital` reliably means "no such proposal".
+    function getRiskEnvelope(uint256 proposalId) external view returns (uint256 maxCapital, uint16 maxDrawdownBps);
     function vault() external view returns (address);
     function protocolConfig() external view returns (address);
 
     /// @notice Address of the guardian registry (zero if not yet wired).
     function guardianRegistry() external view returns (address);
+
+    /// @notice Address of the tier registry (zero if not wired — tier 2 default).
+    function tierRegistry() external view returns (address);
+
+    /// @notice MAX tier across the proposal's execute calls, resolved at
+    ///         propose time (spec §3.2). Returns 0 for a nonexistent
+    ///         proposalId — pair with `getRiskEnvelope` (maxCapital == 0 means
+    ///         "no such proposal") when disambiguation matters.
+    function getProposalTier(uint256 proposalId) external view returns (uint8);
+
+    /// @notice Extractable-value coverage the proposal demands from the
+    ///         aggregate exposure cap (Plan B). Snapshotted at propose time as
+    ///         the per-call SUM across execute and settlement calls (see
+    ///         `StrategyProposal.requiredCoverage`); re-checked at execute
+    ///         (`CoverageRegressed`).
+    function getRequiredCoverage(uint256 proposalId) external view returns (uint256);
 
     // ── Fee-escrow (W-1) ──
 

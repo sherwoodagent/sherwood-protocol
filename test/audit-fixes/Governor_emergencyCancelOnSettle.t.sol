@@ -14,6 +14,7 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
+import {GovEnvelope} from "../helpers/GovEnvelope.sol";
 
 /// @title Governor_emergencyCancelOnSettle — MS-H2 regression
 /// @notice Confirms `_finishSettlement` no longer auto-cancels an open
@@ -225,6 +226,7 @@ contract Governor_emergencyCancelOnSettle_Test is Test {
             address(0),
             "ipfs://emergency-cancel",
             duration,
+            GovEnvelope.permissive(address(vault)),
             _execCalls(),
             _settleCalls(),
             _emptyCoProposers()
