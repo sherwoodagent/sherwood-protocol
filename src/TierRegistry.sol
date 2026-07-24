@@ -110,6 +110,7 @@ contract TierRegistry is Ownable2Step {
     error NotCertified();
     error BondNotReleasable();
     error BondPendingRelease();
+    error BondActive();
     error NotSubmitter();
     error BondConfigUnset();
     error ZeroAddressSubmitter();
@@ -145,6 +146,13 @@ contract TierRegistry is Ownable2Step {
     ///         detector (a contract cannot read another contract's storage
     ///         slots), so this is a GOVERNANCE obligation: do not certify
     ///         proxied targets at tier 0/1 (see contract-level note).
+    ///
+    ///         A bonded certification cannot be replaced in place: while ANY
+    ///         bond exists for the key — active (`BondActive`) or pending
+    ///         release (`BondPendingRelease`) — `certify` reverts. Replacing
+    ///         it goes demote → timelock → claim → fresh certify, so the old
+    ///         bond must traverse its release timelock (slash-first layering)
+    ///         before the key can carry a new bond.
     function certify(address target, bytes4 selector, uint8 tier, uint16 extractableBoundBps, address submitter)
         external
         onlyOwner
@@ -154,8 +162,14 @@ contract TierRegistry is Ownable2Step {
         bytes32 ch = target.codehash;
         if (ch == bytes32(0) || ch == _EMPTY_CODEHASH) revert NotAContract();
         bytes32 k = key(target, selector);
-        // A bond pending release blocks re-certification — one bond per key.
-        if (_bonds[k].releasableAt != 0) revert BondPendingRelease();
+        // ANY existing bond blocks re-certification — one bond per key, and a
+        // live bond must never be overwritten (that would strand the old
+        // submitter's WOOD in the registry with no claim path).
+        SubmitterBond storage existing = _bonds[k];
+        if (existing.amount != 0) {
+            if (existing.releasableAt != 0) revert BondPendingRelease();
+            revert BondActive();
+        }
         // Pull the submitter bond when configured (spec §3.6). Zero-config
         // (bond amount 0) preserves the Plan A no-bond path for the governance-
         // assigned initial adapter set.

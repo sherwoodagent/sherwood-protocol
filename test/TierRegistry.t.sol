@@ -254,4 +254,58 @@ contract TierRegistryTest is Test {
         reg.certify(target, bytes4(0x44444444), 1, 500, submitter);
         vm.stopPrank();
     }
+
+    function test_recertify_whileBondActiveReverts() public {
+        (ERC20Mock wood, address submitter) = _bondSetup();
+        address otherSubmitter = makeAddr("otherSubmitter");
+        wood.mint(otherSubmitter, 100_000e18);
+        vm.prank(otherSubmitter);
+        wood.approve(address(reg), type(uint256).max);
+
+        vm.startPrank(owner);
+        reg.certify(target, bytes4(0x55555555), 1, 500, submitter);
+        // re-certify with a DIFFERENT submitter: reverts, must not overwrite the live bond
+        vm.expectRevert(TierRegistry.BondActive.selector);
+        reg.certify(target, bytes4(0x55555555), 0, 100, otherSubmitter);
+        // re-certify with the SAME submitter: also reverts
+        vm.expectRevert(TierRegistry.BondActive.selector);
+        reg.certify(target, bytes4(0x55555555), 0, 100, submitter);
+        vm.stopPrank();
+
+        // old bond record intact: registry still holds exactly one bond, and the
+        // original submitter can still traverse demote -> timelock -> claim in full
+        assertEq(wood.balanceOf(address(reg)), 10_000e18);
+        vm.prank(owner);
+        reg.demote(target, bytes4(0x55555555));
+        vm.warp(block.timestamp + 14 days + 1);
+        vm.prank(submitter);
+        reg.claimSubmitterBond(target, bytes4(0x55555555));
+        assertEq(wood.balanceOf(submitter), 100_000e18);
+        assertEq(wood.balanceOf(address(reg)), 0);
+    }
+
+    function test_recertify_afterClaimSucceeds() public {
+        (ERC20Mock wood, address submitter) = _bondSetup();
+        address newSubmitter = makeAddr("newSubmitter");
+        wood.mint(newSubmitter, 100_000e18);
+        vm.prank(newSubmitter);
+        wood.approve(address(reg), type(uint256).max);
+
+        vm.startPrank(owner);
+        reg.certify(target, bytes4(0x66666666), 1, 500, submitter);
+        reg.demote(target, bytes4(0x66666666));
+        vm.stopPrank();
+        vm.warp(block.timestamp + 14 days + 1);
+        vm.prank(submitter);
+        reg.claimSubmitterBond(target, bytes4(0x66666666));
+
+        // key is clear: a fresh certify with a new submitter succeeds and pulls the new bond
+        vm.prank(owner);
+        reg.certify(target, bytes4(0x66666666), 0, 100, newSubmitter);
+        (uint8 tier, uint16 boundBps) = reg.tierOf(target, bytes4(0x66666666));
+        assertEq(tier, 0);
+        assertEq(boundBps, 100);
+        assertEq(wood.balanceOf(newSubmitter), 90_000e18);
+        assertEq(wood.balanceOf(address(reg)), 10_000e18);
+    }
 }
