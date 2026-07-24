@@ -2,6 +2,7 @@
 pragma solidity 0.8.28;
 
 import {IGuardianRegistry} from "./interfaces/IGuardianRegistry.sol";
+import {IExposureLedger} from "./interfaces/IExposureLedger.sol";
 import {IStakedWood} from "./interfaces/IStakedWood.sol";
 import {BatchExecutorLib} from "./BatchExecutorLib.sol";
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
@@ -169,11 +170,20 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     // (Slots freed; the __gap below absorbs the layout delta — this is a fresh
     // V1.5 mainnet redeployment so no live storage to migrate.)
 
+    /// @notice Plan B (spec 2026-07-22 §3.3): exposure ledger consulted on every
+    ///         approve-side review vote. address(0) = not wired = hooks skipped.
+    ///         Owner-set via `setExposureLedger` (a setter, not init: the registry
+    ///         proxy is already live).
+    /// @dev APPENDED here for the same reason as `vaultOf` above — new fields go
+    ///      immediately before `__gap` and consume one gap slot, so no
+    ///      pre-existing field moves.
+    IExposureLedger public exposureLedger;
+
     /// @dev Reserved storage for future upgrades. Reduced 50 -> 49 when
-    ///      `vaultOf` was appended above, so the total slot count is conserved.
-    ///      Expect a further 49 -> 48 reduction when `exposureLedger` is
-    ///      appended; every new field takes one slot from here.
-    uint256[49] private __gap;
+    ///      `vaultOf` was appended (lifecycle), then 49 -> 48 for
+    ///      `exposureLedger` (Plan B). Total slot count is conserved: every new
+    ///      field takes one slot from here.
+    uint256[48] private __gap;
 
     /// @notice Per-deployment hard floor for `reviewPeriod` (impl-time immutable;
     ///         mainnet 6h). Lives in bytecode, not storage — the layout above is
@@ -414,6 +424,12 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
                 r.blockStakeWeight += weight;
             }
             _votes[key][msg.sender] = support;
+            if (support == GuardianVoteType.Approve && address(exposureLedger) != address(0)) {
+                // Spec §3.3: the aggregate exposure cap is checked HERE, at
+                // the approve vote. A revert (ExposureCapExceeded) reverts
+                // the vote — an over-exposed guardian cannot approve.
+                exposureLedger.recordApproval(governor, proposalId, msg.sender);
+            }
             emit GuardianVoteCast(proposalId, msg.sender, support, weight);
         } else {
             // Vote-change: must be before the late lockout window.
@@ -440,6 +456,13 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
                 r.approveStakeWeight += weight;
             }
             _votes[key][msg.sender] = support;
+            if (address(exposureLedger) != address(0)) {
+                if (support == GuardianVoteType.Block) {
+                    exposureLedger.releaseApproval(governor, proposalId, msg.sender);
+                } else {
+                    exposureLedger.recordApproval(governor, proposalId, msg.sender);
+                }
+            }
             emit GuardianVoteChanged(proposalId, msg.sender, existing, support);
         }
     }
@@ -952,6 +975,14 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         if (v < 1_000 || v > 10_000) revert InvalidParameter();
         emit ParameterChangeFinalized(PARAM_BLOCK_QUORUM_BPS, blockQuorumBps, v);
         blockQuorumBps = v;
+    }
+
+    /// @inheritdoc IGuardianRegistry
+    /// @notice Wire the exposure ledger (owner-instant; owner is a multisig with
+    ///         external delay).
+    function setExposureLedger(address ledger) external onlyOwner {
+        if (ledger == address(0)) revert ZeroAddress();
+        exposureLedger = IExposureLedger(ledger);
     }
 
     // ── Views ──
