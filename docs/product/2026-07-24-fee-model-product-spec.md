@@ -115,19 +115,19 @@ terms, not headline fees:**
 
 - **No deposit fee.** Entry friction kills fund growth; nothing is charged on the
   way in.
-- **Instant exits can carry an early-redemption fee (≤ 2%, proposed 0.5%).** Leaving
-  immediately at an oracle price — instead of waiting for the settlement queue —
-  can cost a small fee that **accrues to the fund** (the depositors who stay), not
-  the protocol. It's the hedge-fund early-redemption analogue, and it exists to
-  discourage mercenary in-and-out flows, not to make money.
-- **The queue is always free.** Waiting for settlement — the patient path — never
-  costs the *early-redemption* fee.
-- **Exit timing is fee-neutral — you pay your fee share either way.** Queue
-  withdrawers claim at the settlement price, which is struck *after* fees, so their
-  share is already deducted. Instant withdrawers have their management and
-  performance fees crystallized and deducted *at the moment they exit* (the way a
-  Hyperliquid vault charges its profit share at withdrawal). Neither can leave their
-  fee burden on the depositors who stay.
+- **The queue is always free.** Waiting for settlement — the patient path — costs
+  nothing beyond your normal share of fees.
+- **An instant exit is charged twice, for two different reasons.** Leaving
+  immediately at an oracle price instead of waiting for the queue means:
+  1. **Your fair share of fees is crystallized** — the management and performance
+     fees you'd have paid anyway are computed and deducted *at the moment you exit*
+     (the way a Hyperliquid vault charges profit share at withdrawal), so you can't
+     dodge them by leaving early. These go to the fee recipients, and they're the
+     same fees a hold-to-settlement depositor pays.
+  2. **Plus an early-exit fee on top (≤ 2%, proposed 0.5%)** — an *additional*
+     penalty that **accrues to the fund** (the depositors who stay), compensating
+     them for the cost of unwinding early and discouraging mercenary in-and-out
+     flows. Queue exiters never pay this.
 - **Mid-proposal deposits are never mistaken for profit.** The vault nets flows out
   of the profit calculation and the management fee is time-weighted, so you only pay
   on capital that was actually in the fund, for the time it was there — a late
@@ -166,7 +166,8 @@ above.)
    depositors ask — ~half of TradFi allocators now want one.
 4. **Fee collection via share dilution.** The onchain standard; deferred as a
    mechanic change. Current asset-based collection stands for launch.
-5. **Instant-exit fee rate.** 0.5% proposed, capped 2%, accruing to the fund.
+5. **Early-exit fee rate.** 0.5% proposed, capped 2%, accruing to the fund — charged
+   *on top of* the exiter's crystallized fee share, as an early-unwind penalty.
 
 ## What success looks like
 

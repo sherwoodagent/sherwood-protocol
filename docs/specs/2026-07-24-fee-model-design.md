@@ -183,7 +183,21 @@ automatically — crystallize-on-exit is the asset-based equivalent.)
 
 ---
 
-## 5. Instant-exit fee (redemption term)
+## 5. Instant-exit fee (early-exit penalty, on top of §4.1)
+
+This is a **second, independent charge** that stacks on the fee crystallization of
+§4.1 — do not conflate them. §4.1 makes an instant exiter pay the fees they *already
+owe* (fair share, to the fee recipients); the instant-exit fee is an **additional
+penalty** for the *privilege* of leaving early — jumping the settlement queue and
+forcing the strategy to source liquidity or unwind ahead of schedule. Different
+purpose, different destination:
+
+| | §4.1 fee crystallization | §5 instant-exit fee |
+|---|---|---|
+| What | your accrued management + performance fees | an extra early-exit penalty |
+| Why | you can't dodge fees you owe by leaving early | compensate remaining depositors for the early unwind |
+| Goes to | fee recipients (agent/protocol/guardian/owner) | the **vault** (remaining depositors) |
+| Applies to | the exiting shares' NAV | the net proceeds after §4.1 |
 
 `instantExitFeeBps` was specced and deferred in the instant-withdrawal design
 (`docs/specs/2026-07-19-instant-withdrawal-liquidity-design.md` §6) on vault
@@ -191,10 +205,13 @@ bytecode headroom. Robinhood Chain lifts the EIP-170 24 KB ceiling, so it ships 
 designed:
 
 - ≤ 200 bps (proposed 50), charged only on the `withdrawTo`-sourced portion of a
-  **Lane A instant** exit; the Lane B queue is always free.
-- **Accrues to the vault** (remaining depositors), not the protocol — it's an
+  **Lane A instant** exit; the Lane B queue never pays it.
+- **Accrues to the vault** (remaining depositors), not the protocol — an
   anti-mercenary redemption term, not revenue. Precedent: Enzyme's "burn"-type exit
   fee that benefits remaining holders.
+- **Order at exit:** crystallize §4.1 fees to recipients first, then apply this
+  penalty to the net, then release proceeds. So an instant exiter bears *both* — the
+  fees they'd owe anyway, plus the early-exit penalty on top.
 - No deposit fee.
 
 Storage slots were already reserved. This is independent of the management/performance
