@@ -20,6 +20,7 @@ interface IExposureLedger {
 
     // ── Events ──
     event WoodUsdPriceSet(uint256 oldPriceX8, uint256 newPriceX8);
+    event GuardianRegistrySet(address indexed oldRegistry, address indexed newRegistry);
     event AssetFeedSet(address indexed asset, address feed, uint256 maxDelay, uint8 assetDecimals);
     event ExposureRecorded(address indexed guardian, bytes32 indexed reviewKey, uint256 usd, uint256 epoch);
     event ExposureReleased(address indexed guardian, bytes32 indexed reviewKey, uint256 usd, uint256 epoch);

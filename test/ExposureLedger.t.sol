@@ -2,6 +2,7 @@
 pragma solidity 0.8.28;
 
 import {Test} from "forge-std/Test.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {ExposureLedger} from "src/ExposureLedger.sol";
 import {IExposureLedger} from "src/interfaces/IExposureLedger.sol";
 
@@ -129,7 +130,7 @@ contract ExposureLedgerTest is Test {
     }
 
     function test_setWoodUsdPrice_onlyOwner() public {
-        vm.expectRevert();
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(this)));
         ledger.setWoodUsdPrice(1e8);
     }
 
@@ -318,5 +319,78 @@ contract ExposureLedgerTest is Test {
         // cannot execute — it expires instead of executing unreviewed.
         vm.expectRevert(IExposureLedger.InsufficientApproveCoverage.selector);
         ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 1e6);
+    }
+
+    function test_setChallengeWindow_bounds() public {
+        vm.startPrank(owner);
+        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
+        ledger.setChallengeWindow(0);
+        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
+        ledger.setChallengeWindow(28 days + 1); // > epochLength
+        // epochLength + newWindow > coolDownPeriod: 28d + 18d = 46d > 45d
+        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
+        ledger.setChallengeWindow(18 days);
+        ledger.setChallengeWindow(7 days); // 28d + 7d = 35d <= 45d: valid
+        vm.stopPrank();
+        assertEq(ledger.challengeWindow(), 7 days);
+    }
+
+    function test_openExposure_exactExpiryBoundary() public {
+        _wireRecording();
+        uint256 genesis = block.timestamp; // no warp since deploy
+        mgov.set(1_000e6);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        // bucket 0 stays open until exactly genesis + epochLength + challengeWindow
+        vm.warp(genesis + 28 days + 14 days - 1);
+        assertEq(ledger.openExposureUsd(guardian), 1_000e18);
+        vm.warp(genesis + 28 days + 14 days);
+        assertEq(ledger.openExposureUsd(guardian), 0);
+    }
+
+    function test_openExposure_carriesIntoNextEpochWithinWindow() public {
+        _wireRecording();
+        mgov.set(3_000e6);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        // into epoch 1, but epoch 0's challenge window (open until 28d + 14d) has not elapsed
+        vm.warp(block.timestamp + 28 days + 1);
+        assertEq(ledger.openExposureUsd(guardian), 3_000e18);
+        // a second approval that would overflow the cap still reverts: $3k + $3k > $5k
+        vm.prank(registry);
+        vm.expectRevert(IExposureLedger.ExposureCapExceeded.selector);
+        ledger.recordApproval(address(mgov), 2, guardian);
+    }
+
+    function test_constructor_enforcesDefaultWindowInvariants() public {
+        // epochLength 10d < default challengeWindow 14d: violates W <= L
+        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
+        new ExposureLedger(owner, address(swood), 10 days);
+        // epochLength 40d: 40d + 14d = 54d > coolDownPeriod 45d
+        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
+        new ExposureLedger(owner, address(swood), 40 days);
+    }
+
+    function test_kNumerator_doublesHeadroom() public {
+        _wireRecording();
+        vm.prank(owner);
+        ledger.setKNumerator(2);
+        mgov.set(9_000e6); // $9,000 > $5,000 bond but <= 2 x $5,000
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        assertEq(ledger.openExposureUsd(guardian), 9_000e18);
+    }
+
+    function test_recordApproval_uint192OverflowGuardReverts() public {
+        _wireRecording();
+        // re-point the asset's feed to an absurd price so coverageUsd overflows uint192:
+        // usd = 1e25 * 1e30 * 1e18 / 1e14 = 1e59 > type(uint192).max (~6.28e57)
+        MockFeed hugeFeed = new MockFeed(1e30, 8);
+        vm.prank(owner);
+        ledger.setAssetFeed(usdgAsset, address(hugeFeed), 365 days);
+        mgov.set(1e25);
+        vm.prank(registry);
+        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
+        ledger.recordApproval(address(mgov), 1, guardian);
     }
 }

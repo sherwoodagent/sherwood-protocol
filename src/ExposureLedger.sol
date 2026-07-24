@@ -137,6 +137,13 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     constructor(address initialOwner, address swood_, uint256 epochLength_) Ownable(initialOwner) {
         if (swood_ == address(0)) revert ZeroAddress();
         if (epochLength_ == 0) revert InvalidParameter();
+        // Deploy-time invariants on the DEFAULT challenge window — the same
+        // bounds setChallengeWindow enforces: W <= L, and the unstake delay
+        // must cover epoch + challenge window (spec §5). A tiny epochLength
+        // would violate W <= L, a huge one the unstake-escape invariant,
+        // from genesis.
+        if (challengeWindow > epochLength_) revert InvalidParameter();
+        if (epochLength_ + challengeWindow > ISwoodMinimal(swood_).coolDownPeriod()) revert InvalidParameter();
         swood = ISwoodMinimal(swood_);
         epochLength = epochLength_;
         epochGenesis = block.timestamp;
@@ -163,11 +170,22 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         woodUsdPriceX8 = newPriceX8;
     }
 
+    /// @dev Re-pointing the registry ORPHANS exposures booked under the old
+    ///      registry: releaseApproval is registry-gated, so entries recorded
+    ///      by the old registry become unreleasable and only self-heal when
+    ///      their buckets expire (end of epoch + challenge window). Re-point
+    ///      only at low open exposure.
     function setGuardianRegistry(address registry) external onlyOwner {
         if (registry == address(0)) revert ZeroAddress();
+        emit GuardianRegistrySet(guardianRegistry, registry);
         guardianRegistry = registry;
     }
 
+    /// @dev The window applies RETROACTIVELY to already-booked buckets:
+    ///      shrinking it instantly expires buckets recorded under the longer
+    ///      window (frees coverage early); growing it re-counts buckets that
+    ///      had already expired (conservative). Governance should change it
+    ///      between epochs or at low open exposure.
     function setChallengeWindow(uint256 newWindow) external onlyOwner {
         // Bounded (0, epochLength]: zero would free coverage instantly;
         // beyond one epoch the lookback in openExposureUsd grows unbounded.
@@ -209,11 +227,14 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///         (governance haircut price instead, spec §8).
     function setAssetFeed(address asset, address feed, uint256 maxDelay) external onlyOwner {
         if (asset == address(0) || feed == address(0)) revert ZeroAddress();
-        if (maxDelay == 0) revert InvalidParameter();
+        if (maxDelay == 0 || maxDelay > type(uint64).max) revert InvalidParameter();
         uint8 assetDec = IERC20DecimalsMinimal(asset).decimals();
         uint8 feedDec = IAggregatorMinimal(feed).decimals();
+        // maxDelay bounded to type(uint64).max above; cast cannot truncate.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint64 maxDelay64 = uint64(maxDelay);
         _assetFeeds[asset] =
-            AssetFeed({feed: feed, maxDelay: uint64(maxDelay), assetDecimals: assetDec, feedDecimals: feedDec});
+            AssetFeed({feed: feed, maxDelay: maxDelay64, assetDecimals: assetDec, feedDecimals: feedDec});
         emit AssetFeedSet(asset, feed, maxDelay, assetDec);
     }
 
@@ -221,6 +242,12 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     /// @dev USD-18 value of `amount` of `asset`. Fail-closed on unconfigured
     ///      asset or stale feed — a proposal in an unpriceable asset cannot be
     ///      coverage-checked and therefore cannot proceed.
+    ///      All conversions FLOOR (sub-wei dust, accepted); Task 8's
+    ///      proposerBondWood must round UP instead.
+    ///      Accepted v1 risks: Chainlink aggregators clamp at min/maxAnswer,
+    ///      so a clamped price understates coverage (anti-conservative); and
+    ///      Robinhood 4663 has no L2 sequencer-uptime feed to gate reads.
+    ///      Both accepted for v1 — revisit when a sequencer feed exists.
     function coverageUsd(address asset, uint256 amount) public view returns (uint256) {
         AssetFeed storage f = _assetFeeds[asset];
         if (f.feed == address(0)) revert FeedNotConfigured();
@@ -228,14 +255,17 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         if (answer <= 0) revert StalePrice();
         uint256 age = block.timestamp > updatedAt ? block.timestamp - updatedAt : 0;
         if (age > f.maxDelay) revert StalePrice();
+        // answer > 0 checked above; int256 -> uint256 cannot change the value.
+        // forge-lint: disable-next-line(unsafe-typecast)
         return (amount * uint256(answer) * 1e18) / (10 ** f.assetDecimals) / (10 ** f.feedDecimals);
     }
 
-    // ── Stubs replaced in Tasks 2–4 and 8 (placeholders so each task
-    //    compiles and goes green before the next starts — NOT deferred work) ──
+    // ── Stub replaced in Task 8. Reverts InvalidParameter ("not implemented"),
+    //    distinct from FeedNotConfigured, so callers can diagnose the difference
+    //    from a genuinely unconfigured feed. ──
 
     function proposerBondWood(address, uint256) external view virtual returns (uint256) {
-        revert FeedNotConfigured();
+        revert InvalidParameter();
     }
 
     /// @inheritdoc IExposureLedger
@@ -249,11 +279,17 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         address asset = IVaultAssetMinimal(gov.getProposalView(proposalId).vault).asset();
         uint256 usd = coverageUsd(asset, gov.getRequiredCoverage(proposalId));
         if (usd == 0) return; // zero-coverage: nothing to book
+        // Truncation in the uint192 store below would book phantom (smaller)
+        // exposure — fail loudly instead.
+        if (usd > type(uint192).max) revert InvalidParameter();
         uint256 epoch = currentEpoch();
         if (openExposureUsd(guardian) + usd > kNumerator * slashableBondUsd(guardian)) {
             revert ExposureCapExceeded();
         }
         _buckets[guardian][epoch] += usd;
+        // usd bounded to uint192 above; epoch = elapsed / epochLength cannot
+        // approach 2^64 on any realistic timescale.
+        // forge-lint: disable-next-line(unsafe-typecast)
         _recorded[key][guardian] = RecordedExposure({usd: uint192(usd), epoch: uint64(epoch)});
         emit ExposureRecorded(guardian, key, usd, epoch);
     }
@@ -302,7 +338,9 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
             haveUsd += slashableBondUsd(approvers[i]);
             if (haveUsd >= needUsd) return; // early exit
         }
-        if (haveUsd < needUsd) revert InsufficientApproveCoverage();
+        // The loop early-returns on success — reaching here means the
+        // approvers' aggregate bond never met the required coverage.
+        revert InsufficientApproveCoverage();
     }
 
     /// @inheritdoc IExposureLedger
