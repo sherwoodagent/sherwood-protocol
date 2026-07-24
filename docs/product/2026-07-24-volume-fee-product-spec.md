@@ -58,18 +58,22 @@ Follow one proposal from the fee's point of view:
 
 1. **Strategy starts → rate locks.** The current fee rate is stamped onto the run.
    It cannot rise mid-flight.
-2. **Each trade → fee accrues.** Every swap adds 0.02% of its value to a running
-   tab. No transfer yet.
-3. **Settlement → the tab is paid.** Before capital returns to the vault, the tab
-   (capped) goes to the treasury.
+2. **Each trade → fee is taken.** 0.02% of the trade is skimmed from its cash leg
+   and sent straight to the treasury.
+3. **Settlement → remainder clears.** Trades with no cash leg ran a tab; it's paid
+   before capital returns to the vault.
 4. **Ongoing → WOOD buyback.** Treasury converts volume-fee revenue into open-market
    WOOD purchases.
 
-Accruing per trade but paying once at settlement is deliberate: it keeps every trade
-cheap (no extra token transfer per swap) while the economics still scale with volume
-— which is the entire point. And because the tab is paid *before* profit is measured,
-the volume fee simply looks like one more trading cost, the same as DEX swap fees.
-The existing profit-fee waterfall doesn't change at all.
+The fee is paid **per trade, in real time** — exactly how Hyperliquid deducts fees
+from each fill's cash leg. Gas on Base is negligible, so there's no reason to batch;
+the treasury (and eventually the buyback) sees revenue continuously, not once a
+month. The only exception is a trade that doesn't touch the vault's cash asset at
+all (say, rebalancing straight from ETH into AERO) — there's no cash leg to skim, so
+that trade's fee goes on a tab that clears at settlement. Either way every fee is
+paid *before* profit is measured, so the volume fee simply looks like one more
+trading cost, the same as DEX swap fees, and the profit-fee waterfall doesn't change
+at all.
 
 ### What counts as a trade
 
@@ -120,7 +124,7 @@ The same $1M syndicate, ending a 30-day proposal $21,500 up before Sherwood fees
 
 | Step | Who | Amount | Running remainder |
 |---|---|---:|---:|
-| Volume fee (paid first, from trading) | Treasury | **$1,500** | $20,000 measured profit |
+| Volume fee (paid trade by trade, during the month) | Treasury | **$1,500** | $20,000 measured profit |
 | Protocol fee — 5% of profit | Treasury | $1,000 | $19,000 |
 | Guardian fee — 3% of profit | Guardian network | $600 | $18,400 |
 | Agent fee — 10% of the remainder | Agent(s) | **$1,840** | $16,560 |

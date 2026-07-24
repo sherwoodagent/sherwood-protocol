@@ -116,17 +116,27 @@ Findings from the codebase survey:
 
 ## 4. Design
 
-### 4.1 Shape: accrue per trade, collect at settlement
+### 4.1 Shape: pay per trade, settle the remainder
 
-The fee is **earned per trade** (that is what makes revenue scale with volume) but
-**paid once per proposal at settlement**. Batching the payment avoids an extra ERC-20
-transfer per swap and keeps the strategy's hot path cheap; it changes cash timing,
-not economics.
+The fee is **charged and paid per trade, in real time** — the Hyperliquid model,
+where each fill's fee is deducted from its cash (USDC) leg immediately. Gas on Base
+is negligible, so there is no batching argument; paying live also gives the treasury
+(and the eventual buyback) a continuous revenue stream instead of a lump at settle.
+
+The one genuine constraint is denomination: the fee is owed in the vault asset, and
+a strategy mid-run may hold none of it at trade time (fully deployed; token→token
+rebalances have no asset leg). So:
 
 ```
-per trade:      feeOwed += tradedNotional × volumeFeeBps / 10_000   (in asset units)
-at settle:      pay min(feeOwed, cap, availableBalance) → protocolFeeRecipient
+per trade:   fee = tradedNotional × volumeFeeBps / 10_000          (asset units)
+             if asset.balanceOf(strategy) >= fee → transfer fee → protocolFeeRecipient
+             else                               → feeOwed += fee   (tab)
+at settle:   pay min(feeOwed, remaining cap, availableBalance) → protocolFeeRecipient
 ```
+
+In practice most Portfolio/Aerodrome trades have an asset leg (or leave the strategy
+holding float), so the tab is the fallback, not the norm. The turnover cap (§4.5) is
+enforced against the running total of paid + owed, so live payment never exceeds it.
 
 ### 4.2 New protocol parameter — `ProtocolConfig.volumeFeeBps`
 
@@ -152,16 +162,28 @@ Trades are invisible outside the strategy, so the strategy must self-meter. Appe
 `BaseStrategy` (storage appended to its `__gap`):
 
 ```solidity
-uint256 internal _volumeFeeOwed;      // asset units, accumulated
+uint256 internal _volumeFeePaid;      // asset units, transferred so far this run
+uint256 internal _volumeFeeOwed;      // asset units, tab for trades with no asset leg
 uint16  internal _volumeFeeBpsCached; // snapshotted at execute()
 uint256 internal _volumeFeeBase;      // funded capital at execute(), for the cap
 
-function _accrueVolume(uint256 notionalAsset) internal {
+function _chargeVolume(uint256 notionalAsset) internal {
     if (_volumeFeeBpsCached == 0) return;
-    _volumeFeeOwed += notionalAsset * _volumeFeeBpsCached / 10_000;
-    emit VolumeAccrued(notionalAsset, _volumeFeeOwed);
+    uint256 fee = notionalAsset * _volumeFeeBpsCached / 10_000;
+    fee = _capRemaining(fee);                       // running cap, §4.5
+    if (fee == 0) return;
+    if (asset.balanceOf(address(this)) >= fee && _tryPayFee(fee)) {
+        _volumeFeePaid += fee;                      // paid live — the normal path
+        emit VolumeFeePaid(notionalAsset, fee);
+    } else {
+        _volumeFeeOwed += fee;                      // tab — cleared at settle
+        emit VolumeAccrued(notionalAsset, _volumeFeeOwed);
+    }
 }
 ```
+
+`_tryPayFee` is a non-reverting transfer (try/catch) so a paused/blocklisted
+recipient degrades to the tab instead of bricking the trade path.
 
 - **Rate snapshot at `execute()`**: the strategy caches `volumeFeeBps` (read via
   `vault → factory → protocolConfig`) when the run starts, clamped to
@@ -184,19 +206,20 @@ function _accrueVolume(uint256 notionalAsset) internal {
 
 ### 4.4 Collection — inside `BaseStrategy` settle path, not the governor
 
-Two candidate collection points were considered:
+Most of the fee is paid live per trade (§4.1); what needs a collection point is the
+**tab** — fees from trades that had no asset leg. Two candidates were considered:
 
-**Option A (recommended): strategy pays at `settle()`/final unwind.**
+**Option A (recommended): strategy clears the tab at `settle()`/final unwind.**
 When the strategy has unwound and is about to return capital to the vault, it first
-transfers the fee:
+pays the outstanding tab:
 
 ```solidity
-uint256 fee = _cappedVolumeFee();               // §4.5
+uint256 fee = _volumeFeeOwed;                   // already cap-limited at charge time
 if (fee != 0) {
     uint256 pay = Math.min(fee, asset.balanceOf(address(this)));
     if (pay != 0) {
         asset.safeTransfer(protocolFeeRecipient, pay);
-        emit VolumeFeePaid(pay, fee - pay);      // second arg = shortfall
+        emit VolumeTabCleared(pay, fee - pay);   // second arg = shortfall
     }
 }
 ```
@@ -232,12 +255,17 @@ or buggy proposer churning the book to bleed depositors into fees. Bound it:
 ```solidity
 uint16 public constant VOLUME_FEE_TURNOVER_CAP = 50;   // max fee base = 50× funded capital
 
-function _cappedVolumeFee() internal view returns (uint256) {
+// running cap: how much of `fee` may still be charged this run (§4.1 calls this)
+function _capRemaining(uint256 fee) internal view returns (uint256) {
     uint256 maxFee = _volumeFeeBase * VOLUME_FEE_TURNOVER_CAP
                      * _volumeFeeBpsCached / 10_000;
-    return Math.min(_volumeFeeOwed, maxFee);
+    uint256 charged = _volumeFeePaid + _volumeFeeOwed;
+    return charged >= maxFee ? 0 : Math.min(fee, maxFee - charged);
 }
 ```
+
+Because fees are paid live (§4.1), the cap is enforced as a running limit at charge
+time — once `paid + owed` reaches the cap, further trades charge nothing.
 
 At 2 bps this caps total volume fees at 0.1% of funded capital per 1× of turnover,
 worst case 10 bps × 50× = 0.5% per proposal — visible, bounded, and small next to the
@@ -250,7 +278,7 @@ turnover.
 `selfManagesFees == true` strategies (`LeveragedAerodromeCLStrategy`) bypass the
 governor waterfall entirely (`src/SyndicateGovernor.sol:1098`) but the volume-fee
 leg doesn't live in the waterfall — it lives in the strategy. Add the same
-`_accrueVolume` calls to its swap/rebalance sites and fold payment into its existing
+`_chargeVolume` calls to its swap/rebalance sites and fold any tab into its existing
 `protocolFeeOwed` settlement, keeping one payment path per strategy.
 
 ### 4.7 Distribution — the Hyperliquid analogue, phased
@@ -270,8 +298,9 @@ the buyback demand from the revenue side.
 
 ### 4.8 Events + subgraph
 
-New events on `BaseStrategy`: `VolumeAccrued(uint256 notional, uint256 owedTotal)`,
-`VolumeFeePaid(uint256 paid, uint256 shortfall)`. Subgraph gains a `VolumeFee` entity
+New events on `BaseStrategy`: `VolumeFeePaid(uint256 notional, uint256 fee)` (live,
+per trade), `VolumeAccrued(uint256 notional, uint256 owedTotal)` (tab fallback), and
+`VolumeTabCleared(uint256 paid, uint256 shortfall)`. Subgraph gains a `VolumeFee` entity
 per proposal and a running `notionalTraded` on the strategy/vault entities — today the
 subgraph tracks only `performanceFeeBps`/`performanceFee` (`subgraph/schema.graphql:100,107`).
 This also gives the frontend a true "volume" stat per syndicate for free.
@@ -323,13 +352,14 @@ strategy selection the same way.
 
 1. `ProtocolConfig`: `volumeFeeBps` + `MAX_VOLUME_FEE_BPS` + setter + getter in
    `IProtocolConfig`. (Small, isolated, no proxy-layout risk — plain Ownable contract.)
-2. `BaseStrategy`: `_volumeFeeOwed` / `_volumeFeeBpsCached` / `_volumeFeeBase`
-   (append into `__gap`), `_accrueVolume`, `_cappedVolumeFee`, settle-path payment,
-   events. Rate snapshot in the `execute()` path.
-3. Per-strategy `_accrueVolume` call sites: Portfolio (6 swap sites),
+2. `BaseStrategy`: `_volumeFeePaid` / `_volumeFeeOwed` / `_volumeFeeBpsCached` / `_volumeFeeBase`
+   (append into `__gap`), `_chargeVolume` (live pay + tab fallback), `_capRemaining`,
+   settle-path tab clearing, events. Rate snapshot in the `execute()` path.
+3. Per-strategy `_chargeVolume` call sites: Portfolio (6 swap sites),
    AerodromeLP (adds + swaps, 3 sites), LeveragedAerodromeCL (fold into
    `protocolFeeOwed`). Moonwell/Mamo/Venice templates: none (passive).
-4. Tests: accrual math per strategy; cap binding; snapshot-at-execute (rate hike
+4. Tests: charge math per strategy (live pay + tab fallback); cap binding as a
+   running limit; snapshot-at-execute (rate hike
    mid-run doesn't apply); payment senior to P&L (governor `pnl` reflects fee);
    fail-open on recipient revert; zero-rate short-circuit; no double-count on
    LP add/remove round trip.
