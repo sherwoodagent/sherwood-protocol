@@ -78,6 +78,9 @@ contract CloneAndInitLeveragedAero is ScriptBase {
             calmDeviationTicks: 500,
             twapWindow: 1800,
             tickSpacing: TICK_SPACING,
+            width: 4000, // full width (raw ticks) = 40·tickSpacing (preserves the pre-param 20-spacing/side range)
+            minWidth: 200, // 2·tickSpacing
+            maxWidth: 20000,
             targetLtvBps: 5000,
             maxLtvBps: 6500,
             minHealthBps: 12000,
