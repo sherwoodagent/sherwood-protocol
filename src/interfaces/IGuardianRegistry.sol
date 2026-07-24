@@ -98,7 +98,9 @@ interface IGuardianRegistry {
     function addGovernor(address governor, address vault) external;
 
     /// @notice Governor push of a proposal's review-window timestamps at propose
-    ///         time. Replaces the registry's `getProposalView(pid)` call-back.
+    ///         time. The governor is the single source of the window and pushes
+    ///         it once, on `propose`; the registry stores it and reads the
+    ///         stored fields directly.
     function registerReview(uint256 proposalId, uint256 voteEnd, uint256 reviewEnd) external;
 
     // ── Governor-only (emergency) ──

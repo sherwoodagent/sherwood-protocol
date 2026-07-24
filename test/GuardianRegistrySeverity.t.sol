@@ -85,7 +85,7 @@ contract GuardianRegistrySeverityTest is RegistryTestHarness {
 
         uint256 voteEnd = vm.getBlockTimestamp();
         reviewEnd = voteEnd + REVIEW_PERIOD;
-        governor.setProposal(PID, voteEnd, reviewEnd);
+        _registerReview(PID, voteEnd, reviewEnd);
         registry.openReview(address(governor), PID);
 
         vm.prank(approver1);
@@ -182,7 +182,7 @@ contract GuardianRegistrySeverityTest is RegistryTestHarness {
 
         uint256 voteEnd = vm.getBlockTimestamp();
         reviewEnd = voteEnd + REVIEW_PERIOD;
-        governor.setProposal(PID, voteEnd, reviewEnd);
+        _registerReview(PID, voteEnd, reviewEnd);
         registry.openReview(address(governor), PID);
 
         vm.prank(blocker1);

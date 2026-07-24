@@ -54,7 +54,8 @@ contract ProposalBleedHandler is Test {
         (bool opened,,,) = registry.getReviewState(address(gov), pid);
         if (opened) return;
         uint256 ve = vm.getBlockTimestamp();
-        gov.setProposal(pid, ve, ve + REVIEW_PERIOD);
+        vm.prank(address(gov));
+        registry.registerReview(pid, ve, ve + REVIEW_PERIOD);
         registry.openReview(address(gov), pid);
     }
 

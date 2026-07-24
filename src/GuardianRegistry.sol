@@ -11,24 +11,6 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {EnumerableSet} from "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 
-/// @dev Minimal governor surface consumed by the registry. Intentionally a
-///      narrow stub so that GuardianRegistry does not depend on the full
-///      ISyndicateGovernor ABI (which would pull in the entire StrategyProposal
-///      struct along with the rest of the governor's types).
-///
-///      `ProposalView` carries only the review-window timestamps and vault; the
-///      governor exposes a dedicated `getProposalView(uint256)` that returns a
-///      matching-shape struct.
-interface IGovernorMinimal {
-    struct ProposalView {
-        uint256 voteEnd;
-        uint256 reviewEnd;
-        address vault;
-    }
-
-    function getProposalView(uint256 proposalId) external view returns (ProposalView memory);
-}
-
 /// @title GuardianRegistry
 /// @notice UUPS-upgradeable registry for guardian review votes, emergency
 ///         review lifecycle, and the slash-appeal reserve. Holds **zero
@@ -84,9 +66,10 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         ///      `cancelReview` instead of the live `blockQuorumBps` slot.
         uint16 blockQuorumBpsAtOpen;
         /// @dev Review-window timestamps PUSHED by the governor at propose time
-        ///      via `registerReview` (ProposalLifecycle Task 1). Replaces the
-        ///      registry's `getProposalView(pid)` call-back into the governor;
-        ///      `voteEnd != 0` doubles as the "already registered" sentinel.
+        ///      via `registerReview` (ProposalLifecycle Task 1). The registry
+        ///      reads these stored fields directly instead of calling back into
+        ///      the governor; `voteEnd != 0` doubles as the "already registered"
+        ///      sentinel.
         uint64 voteEnd;
         uint64 reviewEnd;
     }
@@ -120,7 +103,8 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         ///      mid-review. Read by `cancelEmergency` + `_resolveEmergency`.
         uint16 blockQuorumBpsAtOpen;
         /// @dev Set to msg.sender at openEmergency; read by _resolveEmergency
-        ///      for the owner-bond slash via governor.getProposalView().vault.
+        ///      to resolve the vault from `vaultOf[governor]` for the owner-bond
+        ///      slash.
         address governor;
     }
 
@@ -157,8 +141,9 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     ///      internal storage; callers must use `addGovernor` after deploy.
     EnumerableSet.AddressSet private _authorizedGovernors;
     /// @dev Vault served by each authorized governor (1:1, factory-wired at
-    ///      `addGovernor`); replaces `getProposalView().vault` so a compromised
-    ///      governor cannot misdirect `slashOwnerBond` to an arbitrary vault.
+    ///      `addGovernor`); the slash path resolves the vault from this trusted
+    ///      mapping so a compromised governor cannot misdirect `slashOwnerBond`
+    ///      to an arbitrary vault.
     mapping(address => address) public vaultOf;
     /// @dev Retained post-slim purely as an alignment beacon: the slimmed
     ///      registry no longer gates any logic on `factory` (factory-gated
@@ -257,11 +242,10 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     ///         is deployed.
     /// @param gov The per-vault governor being authorized.
     /// @param vault The vault `gov` serves; recorded in `vaultOf` so the slash
-    ///        path resolves the vault from trusted factory-wired state instead
-    ///        of a governor-supplied `getProposalView().vault`.
+    ///        path resolves the vault from trusted factory-wired state.
     function addGovernor(address gov, address vault) external {
         // I3 (review) + spec §7: factory-only. The registry owner authorizing an
-        // arbitrary governor would let an attacker-controlled getProposalView().vault
+        // arbitrary governor would let an attacker-controlled vault
         // reach slashOwnerBond(anyVault) — restore the spec's onlyFactory gate.
         if (msg.sender != factory) revert UnauthorizedGovernor();
         if (gov == address(0) || vault == address(0)) revert ZeroAddress();
@@ -271,9 +255,9 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     }
 
     /// @notice Governor push of a proposal's review-window timestamps at propose
-    ///         time. Replaces the registry's `getProposalView(pid)` call-back —
-    ///         the governor is the single source of the window and pushes it
-    ///         once, on `propose`, so the registry never calls back.
+    ///         time. The governor is the single source of the window and pushes
+    ///         it once, on `propose`; the registry then reads the stored fields
+    ///         directly and never calls back.
     /// @dev Keyed by `(msg.sender, proposalId)` so each governor owns its own
     ///      window namespace. `voteEnd == 0` is the unregistered sentinel, so a
     ///      zero `voteEnd` is rejected; re-registration is rejected to keep the
@@ -379,8 +363,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         Review storage r = _reviews[key];
         if (!r.opened) revert ReviewNotOpen();
 
-        IGovernorMinimal.ProposalView memory p = IGovernorMinimal(governor).getProposalView(proposalId);
-        if (block.timestamp < p.voteEnd || block.timestamp >= p.reviewEnd) revert ReviewNotOpen();
+        if (r.voteEnd == 0 || block.timestamp < r.voteEnd || block.timestamp >= r.reviewEnd) revert ReviewNotOpen();
 
         if (!swood.isActiveGuardian(msg.sender)) revert NotActiveGuardian();
 
@@ -389,8 +372,8 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
 
         if (existing == GuardianVoteType.None) {
             // Sherlock #42: apply the late-vote lockout to first-time votes too.
-            uint256 reviewWindowDuration = uint256(p.reviewEnd) - uint256(p.voteEnd);
-            uint256 lockoutStart = p.reviewEnd - (reviewWindowDuration * LATE_VOTE_LOCKOUT_BPS) / BPS_DENOMINATOR;
+            uint256 reviewWindowDuration = uint256(r.reviewEnd) - uint256(r.voteEnd);
+            uint256 lockoutStart = r.reviewEnd - (reviewWindowDuration * LATE_VOTE_LOCKOUT_BPS) / BPS_DENOMINATOR;
             if (block.timestamp >= lockoutStart) revert VoteChangeLockedOut();
 
             // First vote — snapshot own + delegated weight AT `r.openedAt`.
@@ -410,8 +393,8 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
             emit GuardianVoteCast(proposalId, msg.sender, support, weight);
         } else {
             // Vote-change: must be before the late lockout window.
-            uint256 reviewWindowDuration = uint256(p.reviewEnd) - uint256(p.voteEnd);
-            uint256 lockoutStart = p.reviewEnd - (reviewWindowDuration * LATE_VOTE_LOCKOUT_BPS) / BPS_DENOMINATOR;
+            uint256 reviewWindowDuration = uint256(r.reviewEnd) - uint256(r.voteEnd);
+            uint256 lockoutStart = r.reviewEnd - (reviewWindowDuration * LATE_VOTE_LOCKOUT_BPS) / BPS_DENOMINATOR;
             if (block.timestamp >= lockoutStart) revert VoteChangeLockedOut();
 
             uint128 weight = _voteStake[key][msg.sender]; // preserved snapshot
@@ -599,7 +582,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         // Reject after the review window has closed: the proposer has had the
         // entire window to bail out; permitting cancel after `reviewEnd` would
         // let the proposer race a pending `resolveReview` slash.
-        uint256 ve = IGovernorMinimal(msg.sender).getProposalView(proposalId).reviewEnd;
+        uint256 ve = r.reviewEnd;
         if (ve > 0 && block.timestamp >= ve) revert ReviewNotOpen();
         // Sherlock run #2 #2: once block quorum is reached, the proposer
         // can't dodge approver slashing by cancelling. Mirrors
@@ -629,7 +612,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         Review storage r = _reviews[key];
         if (r.opened) return; // idempotent
 
-        uint256 ve = IGovernorMinimal(governor).getProposalView(proposalId).voteEnd;
+        uint256 ve = r.voteEnd;
         if (ve == 0 || block.timestamp < ve) revert ReviewNotOpen();
 
         IStakedWood sw = swood;
@@ -672,11 +655,10 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     ///      into `resolveReview` hits `if (r.resolved) return r.blocked` early.
     function resolveReview(address governor, uint256 proposalId) external whenNotPaused returns (bool) {
         if (!_authorizedGovernors.contains(governor)) revert UnauthorizedGovernor();
-        IGovernorMinimal.ProposalView memory p = IGovernorMinimal(governor).getProposalView(proposalId);
-        if (p.reviewEnd == 0 || block.timestamp < p.reviewEnd) revert ReviewNotReadyForResolve();
-
         bytes32 key = _reviewKey(governor, proposalId);
         Review storage r = _reviews[key];
+        if (r.reviewEnd == 0 || block.timestamp < r.reviewEnd) revert ReviewNotReadyForResolve();
+
         if (r.resolved) return r.blocked; // idempotent
         if (!r.opened) {
             r.resolved = true;
@@ -816,7 +798,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         er.resolved = true;
         er.blocked = blocked_;
         if (blocked_) {
-            address vault = IGovernorMinimal(er.governor).getProposalView(proposalId).vault;
+            address vault = vaultOf[er.governor];
             // The owner-bond burn + slot clearing happen on sWOOD.
             swood.slashOwnerBond(vault);
         }

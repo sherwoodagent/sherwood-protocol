@@ -338,7 +338,7 @@ contract GuardianFeeBuyback_RegistryWeightsTest is RegistryTestHarness {
     function _openReview() internal returns (uint256 voteEnd, uint256 reviewEnd) {
         voteEnd = vm.getBlockTimestamp() + 1;
         reviewEnd = voteEnd + 24 hours + 1;
-        governor.setProposal(PID, voteEnd, reviewEnd);
+        _registerReview(PID, voteEnd, reviewEnd);
         vm.warp(voteEnd);
         registry.openReview(address(governor), PID);
         vm.warp(voteEnd + 1);

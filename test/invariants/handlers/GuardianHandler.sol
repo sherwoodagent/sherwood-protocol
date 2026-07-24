@@ -330,7 +330,13 @@ contract GuardianHandler is Test {
         currentProposalId += 1;
         uint256 ve = block.timestamp + voteEndOffset;
         uint256 re = ve + reviewPeriodOffset;
-        governor.setProposalWithVault(currentProposalId, ve, re, address(vault));
+        // registerReview is onlyGovernor; this handler's governor is never added
+        // via addGovernor, so the call reverts UnauthorizedGovernor and is
+        // swallowed by the catch — matching the prior mock where reviews never
+        // actually opened. The slash bucket is exercised via a direct registry
+        // prank in `slash`.
+        vm.prank(address(governor));
+        try registry.registerReview(currentProposalId, ve, re) {} catch {}
         proposalIds.push(currentProposalId);
     }
 

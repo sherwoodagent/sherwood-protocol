@@ -72,6 +72,15 @@ abstract contract RegistryTestHarness is Test {
         registry.addGovernor(address(governor), address(this));
     }
 
+    /// @dev Pushes a proposal's review window into the registry AS the mock
+    ///      governor. Post-refactor the registry reads the window from this
+    ///      stored registration (via `registerReview`) instead of calling back
+    ///      into the governor's removed `getProposalView`.
+    function _registerReview(uint256 proposalId, uint256 voteEnd, uint256 reviewEnd) internal {
+        vm.prank(address(governor));
+        registry.registerReview(proposalId, voteEnd, reviewEnd);
+    }
+
     /// @dev Mints WOOD to `g`, approves sWOOD, and stakes `amount` as a
     ///      guardian. Guardian is active afterwards.
     function _stakeGuardian(address g, uint256 amount, uint256 agentId) internal {
