@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import {Test} from "forge-std/Test.sol";
 import {ExposureLedger} from "src/ExposureLedger.sol";
+import {IExposureLedger} from "src/interfaces/IExposureLedger.sol";
 
 /// @dev Minimal sWOOD stub exposing exactly the reads the ledger consumes.
 contract MockSwood {
@@ -18,6 +19,27 @@ contract MockSwood {
 
     function setMaxDelegatedSlashBps(uint256 v) external {
         maxDelegatedSlashBps = v;
+    }
+}
+
+contract MockFeed {
+    int256 public answer;
+    uint8 public immutable decimals;
+    uint256 public updatedAt;
+
+    constructor(int256 answer_, uint8 decimals_) {
+        answer = answer_;
+        decimals = decimals_;
+        updatedAt = block.timestamp;
+    }
+
+    function set(int256 answer_) external {
+        answer = answer_;
+        updatedAt = block.timestamp;
+    }
+
+    function latestRoundData() external view returns (uint80, int256, uint256, uint256, uint80) {
+        return (1, answer, updatedAt, updatedAt, 1);
     }
 }
 
@@ -58,5 +80,40 @@ contract ExposureLedgerTest is Test {
         uint256 e0 = ledger.currentEpoch();
         vm.warp(block.timestamp + 28 days);
         assertEq(ledger.currentEpoch(), e0 + 1);
+    }
+
+    function test_coverageUsd_6decAsset() public {
+        MockFeed feed = new MockFeed(1e8, 8); // $1.00, 8-dec feed
+        address usdg = makeAddr("usdg");
+        vm.mockCall(usdg, abi.encodeWithSignature("decimals()"), abi.encode(uint8(6)));
+        vm.prank(owner);
+        ledger.setAssetFeed(usdg, address(feed), 1 days);
+        // 2,000,000 USDG (6 dec) at $1 => $2,000,000 in USD-18
+        assertEq(ledger.coverageUsd(usdg, 2_000_000e6), 2_000_000e18);
+    }
+
+    function test_coverageUsd_18decAssetNonUnitPrice() public {
+        MockFeed feed = new MockFeed(2500e8, 8); // $2,500 (e.g. WETH)
+        address weth = makeAddr("weth");
+        vm.mockCall(weth, abi.encodeWithSignature("decimals()"), abi.encode(uint8(18)));
+        vm.prank(owner);
+        ledger.setAssetFeed(weth, address(feed), 1 days);
+        assertEq(ledger.coverageUsd(weth, 2e18), 5_000e18);
+    }
+
+    function test_coverageUsd_revertsUnconfigured() public {
+        vm.expectRevert(IExposureLedger.FeedNotConfigured.selector);
+        ledger.coverageUsd(makeAddr("unknown"), 1e18);
+    }
+
+    function test_coverageUsd_revertsStale() public {
+        MockFeed feed = new MockFeed(1e8, 8);
+        address usdg = makeAddr("usdg2");
+        vm.mockCall(usdg, abi.encodeWithSignature("decimals()"), abi.encode(uint8(6)));
+        vm.prank(owner);
+        ledger.setAssetFeed(usdg, address(feed), 1 days);
+        vm.warp(block.timestamp + 2 days);
+        vm.expectRevert(IExposureLedger.StalePrice.selector);
+        ledger.coverageUsd(usdg, 1e6);
     }
 }

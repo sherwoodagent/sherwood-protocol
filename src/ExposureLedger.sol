@@ -14,6 +14,15 @@ interface ISwoodMinimal {
     function coolDownPeriod() external view returns (uint256);
 }
 
+interface IAggregatorMinimal {
+    function latestRoundData() external view returns (uint80, int256, uint256, uint256, uint80);
+    function decimals() external view returns (uint8);
+}
+
+interface IERC20DecimalsMinimal {
+    function decimals() external view returns (uint8);
+}
+
 /**
  * @title ExposureLedger
  * @notice Dollar-denominated coverage accounting for the guardian
@@ -72,6 +81,17 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     uint256 public proposerBondBps = 100;
 
     address public guardianRegistry;
+
+    /// @dev Per-asset USD feed config. `assetDecimals` cached at registration so
+    ///      the hot path makes no external metadata call.
+    struct AssetFeed {
+        address feed;
+        uint64 maxDelay;
+        uint8 assetDecimals;
+        uint8 feedDecimals;
+    }
+
+    mapping(address asset => AssetFeed) internal _assetFeeds;
 
     constructor(address initialOwner, address swood_, uint256 epochLength_) Ownable(initialOwner) {
         if (swood_ == address(0)) revert ZeroAddress();
@@ -142,16 +162,36 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         proposerBondBps = newBps;
     }
 
+    /// @notice Register the Chainlink USD feed for a vault asset. Vault assets on
+    ///         Robinhood have live feeds (USDG/USD, USDC/USD, ETH/USD —
+    ///         chains/4663.json); WOOD deliberately does NOT go through this path
+    ///         (governance haircut price instead, spec §8).
+    function setAssetFeed(address asset, address feed, uint256 maxDelay) external onlyOwner {
+        if (asset == address(0) || feed == address(0)) revert ZeroAddress();
+        if (maxDelay == 0) revert InvalidParameter();
+        uint8 assetDec = IERC20DecimalsMinimal(asset).decimals();
+        uint8 feedDec = IAggregatorMinimal(feed).decimals();
+        _assetFeeds[asset] =
+            AssetFeed({feed: feed, maxDelay: uint64(maxDelay), assetDecimals: assetDec, feedDecimals: feedDec});
+        emit AssetFeedSet(asset, feed, maxDelay, assetDec);
+    }
+
+    /// @inheritdoc IExposureLedger
+    /// @dev USD-18 value of `amount` of `asset`. Fail-closed on unconfigured
+    ///      asset or stale feed — a proposal in an unpriceable asset cannot be
+    ///      coverage-checked and therefore cannot proceed.
+    function coverageUsd(address asset, uint256 amount) public view returns (uint256) {
+        AssetFeed storage f = _assetFeeds[asset];
+        if (f.feed == address(0)) revert FeedNotConfigured();
+        (, int256 answer,, uint256 updatedAt,) = IAggregatorMinimal(f.feed).latestRoundData();
+        if (answer <= 0) revert StalePrice();
+        uint256 age = block.timestamp > updatedAt ? block.timestamp - updatedAt : 0;
+        if (age > f.maxDelay) revert StalePrice();
+        return (amount * uint256(answer) * 1e18) / (10 ** f.assetDecimals) / (10 ** f.feedDecimals);
+    }
+
     // ── Stubs replaced in Tasks 2–4 and 8 (placeholders so each task
     //    compiles and goes green before the next starts — NOT deferred work) ──
-
-    function setAssetFeed(address, address, uint256) external virtual onlyOwner {
-        revert InvalidParameter();
-    }
-
-    function coverageUsd(address, uint256) public view virtual returns (uint256) {
-        revert FeedNotConfigured();
-    }
 
     function proposerBondWood(address, uint256) external view virtual returns (uint256) {
         revert FeedNotConfigured();
