@@ -88,6 +88,66 @@ Rule of thumb: if the strategy is *taking a market position*, it's volume. If it
 and unwinds once pays approximately nothing — correct, because it consumes the least
 protocol attention per dollar.
 
+## The full fee stack
+
+The volume fee doesn't replace anyone's economics — it joins a stack where every
+other fee is a share of *profit*, paid only when a strategy settles in the green.
+The complete picture:
+
+| Fee | Goes to | Rate | Charged on | Paid when |
+|---|---|---|---|---|
+| **Volume fee** (new) | Treasury → buyback | 0.02% | every trade's value | **Always** — profit, flat, or loss |
+| Protocol fee | Treasury | ≤ 10% | settlement profit | Profitable settlements only |
+| Guardian fee | Guardian network | ≤ 5% | settlement profit | Profitable settlements only |
+| Agent fee | Lead agent + co-proposers | ≤ 15% (5% default) | profit after protocol & guardian cuts | Profitable settlements only |
+| Manager fee | Syndicate owner | ≤ 5% | profit after the agent's cut | Profitable settlements only |
+| Creation fee | Treasury | flat | launching a syndicate | Once, at creation |
+
+The profit fees run as a waterfall, in that order: protocol and guardians take their
+share of profit first, the agent takes a share of what remains, the manager a share
+of what remains after that, and depositors keep the rest. Guardian fees are split
+among the guardians who reviewed the proposal, weighted by their stake, and paid out
+weekly. Agent fees split between the lead and any co-proposers at proportions they
+agreed at proposal time.
+
+### One good month, everyone's cut
+
+The same $1M syndicate, ending a 30-day proposal $21,500 up before Sherwood fees
+(rates: protocol 10%, guardian 5%, agent 5%, manager 5%):
+
+| Step | Who | Amount | Running remainder |
+|---|---|---:|---:|
+| Volume fee (paid first, from trading) | Treasury | **$1,500** | $20,000 measured profit |
+| Protocol fee — 10% of profit | Treasury | $2,000 | $18,000 |
+| Guardian fee — 5% of profit | Guardian network | $1,000 | $17,000 |
+| Agent fee — 5% of the remainder | Agent(s) | $850 | $16,150 |
+| Manager fee — 5% of the remainder | Syndicate owner | $808 | $15,342 |
+| **Depositors keep** | Shareholders | **$15,342** | +1.53% for the month |
+
+On a **flat month**, that table collapses to one line: the $1,500 volume fee.
+Agents, the manager, and guardians earn nothing — their compensation stays purely
+performance-based, which is the alignment we want for the people choosing and
+approving strategies.
+
+### What the volume fee changes for each of them
+
+**Nothing is taken from anyone's slice.** The profit-fee percentages, order, and
+recipients are untouched. The volume fee is paid out of trading like a venue cost,
+so measured profit — the base everyone's percentage applies to — is slightly lower
+(in the example above, ~$75 less across all four profit fees combined). That's the
+entire impact on agents and managers.
+
+**Guardians are the ones whose economics genuinely improve.** Review effort doesn't
+depend on the market going up — a flat month takes as much guardian attention as a
+good one, but today it pays $0. The phase-3 revenue share gives the guardian network
+income proportional to activity reviewed, which is what our economic-security
+analysis says the network needs to stay honestly staffed.
+
+One honest footnote: the "manager fee" is charged on profit, not on assets — so
+despite the name, the syndicate owner also earns nothing on flat months. Whether it
+should become a true assets-under-management fee is a real question, but a separate
+one (open decision 5).
+
 ## Who feels what
 
 - **Depositors** — a small, visible, **bounded** cost: 0.02% per unit of turnover,
@@ -176,6 +236,9 @@ cannot do.
    strategy; exists purely to bound the pathological case.
 4. **Phase-3 split between guardians and buyback.** Needs the guardian-economics
    model finished first.
+5. **Should the manager fee become a true AUM-based fee?** Today it's profit-gated
+   despite the name. Separate design if pursued — the volume fee covers the activity
+   axis, not the time-on-capital axis.
 
 ## What success looks like
 
