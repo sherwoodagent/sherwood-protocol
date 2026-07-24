@@ -7,7 +7,7 @@ pragma solidity 0.8.28;
 ///         is the "trust inversion" at the heart of the live-NAV redesign:
 ///         the strategy reports quantities/locators, the vault prices them.
 struct Position {
-    address venue; // Moonwell mToken / Aerodrome pool / HyperCore precompile
+    address venue; // Moonwell mToken / Aerodrome pool / venue-specific handle
     bytes32 kind; // keccak256("MOONWELL_SUPPLY") | "AERODROME_LP" | "HL_PERP"
     bytes ref; // venue-specific locator (empty for single-venue kinds like Moonwell)
 }

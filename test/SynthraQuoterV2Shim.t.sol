@@ -2,7 +2,7 @@
 pragma solidity 0.8.28;
 
 import {Test} from "forge-std/Test.sol";
-import {SynthraQuoterV2Shim, ISynthraQuoterV2} from "../src/adapters/SynthraQuoterV2Shim.sol";
+import {SynthraQuoterV2Shim, ISynthraQuoterV2} from "../script/robinhood-testnet/SynthraQuoterV2Shim.sol";
 
 /// @title SynthraQuoterV2Shim unit tests
 /// @notice Drives the shim against a mock struct-based QuoterV2 (which is what

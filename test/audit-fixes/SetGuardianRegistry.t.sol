@@ -7,26 +7,26 @@ import {SyndicateGovernor} from "../../src/SyndicateGovernor.sol";
 import {SyndicateFactory} from "../../src/SyndicateFactory.sol";
 import {SyndicateVault} from "../../src/SyndicateVault.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
-import {MinimalGuardianRegistry} from "../../src/MinimalGuardianRegistry.sol";
+import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 
 /// @title SetGuardianRegistry — owner-only registry repointing
-/// @notice Lets the protocol upgrade from the beta `MinimalGuardianRegistry`
+/// @notice Lets the protocol upgrade from a stub registry
 ///         to the real `GuardianRegistry` once WOOD is live without redeploying
 ///         the governor + factory proxies.
 contract SetGuardianRegistryTest is Test {
     SyndicateGovernor governor;
     SyndicateFactory factory;
-    MinimalGuardianRegistry initialRegistry;
-    MinimalGuardianRegistry replacementRegistry;
+    MockRegistryMinimal initialRegistry;
+    MockRegistryMinimal replacementRegistry;
 
     address owner = makeAddr("owner");
     address attacker = makeAddr("attacker");
 
     function setUp() public {
-        initialRegistry = new MinimalGuardianRegistry();
-        replacementRegistry = new MinimalGuardianRegistry();
+        initialRegistry = new MockRegistryMinimal();
+        replacementRegistry = new MockRegistryMinimal();
 
         // Governor proxy
         SyndicateGovernor govImpl = new SyndicateGovernor(24 hours, 1 hours);

@@ -29,8 +29,7 @@ import {GovEnvelope} from "../helpers/GovEnvelope.sol";
  *         staking, proposal review, approval with reward claims, block quorum
  *         with approver slashing, and emergency settle under guardian review.
  *
- *         WOOD is not yet live on Base mainnet (MinimalGuardianRegistry is the
- *         beta stub). This test deploys a fresh Sherwood stack on a Base fork
+ *          *         beta stub). This test deploys a fresh Sherwood stack on a Base fork
  *         so we get real Moonwell/USDC DeFi interactions while controlling the
  *         full guardian network.
  *
@@ -317,8 +316,8 @@ contract GuardianNetworkForkTest is Test {
      *         CohortTooSmallToReview and resolveReview returns false regardless
      *         of any votes. Documents the exact cold-start condition.
      *
-     *         On the live beta deployment:
-     *         - MinimalGuardianRegistry.reviewPeriod() = 0 (collapses window)
+     *         On the live beta deployment (stub registry, since removed):
+     *         - reviewPeriod() = 0 (collapses window)
      *         - totalGuardianStake = 0 (WOOD not live)
      *         -> Every proposal auto-passed, no enforcement possible.
      *

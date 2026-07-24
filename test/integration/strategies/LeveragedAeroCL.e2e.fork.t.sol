@@ -14,8 +14,11 @@ import {SyndicateGovernor} from "../../../src/SyndicateGovernor.sol";
 import {ISyndicateGovernor} from "../../../src/interfaces/ISyndicateGovernor.sol";
 import {SyndicateVault} from "../../../src/SyndicateVault.sol";
 import {SyndicateFactory} from "../../../src/SyndicateFactory.sol";
+import {GuardianRegistry} from "../../../src/GuardianRegistry.sol";
+import {StakedWood} from "../../../src/StakedWood.sol";
 import {BatchExecutorLib} from "../../../src/BatchExecutorLib.sol";
 import {DeploySherwood} from "../../../script/Deploy.s.sol";
+import {ERC20Mock} from "../../mocks/ERC20Mock.sol";
 
 import {IMoonwellMarket, ICToken} from "../../../src/interfaces/IMoonwellMarket.sol";
 import {ICLPool, ICLSwapRouter} from "../../../src/interfaces/ISlipstream.sol";
@@ -39,7 +42,8 @@ interface IAggE2E {
 ///         directly — this test:
 ///
 ///           1. Deploys a FRESH Sherwood core on the Tenderly Base vnet via
-///              `DeploySherwood.deployCore(betaMode: true)`; the vault owner then raises
+///              `DeploySherwood.deployCore` (full GuardianRegistry + sWOOD, fixture
+///              WOOD backs the owner bond); the vault owner then raises
 ///              `maxStrategyDuration` to the 3650d `ABSOLUTE_MAX_STRATEGY_DURATION` cap
 ///              (#421: per-vault governors deploy at the 30d default), so the indefinite-lived
 ///              strategy can be proposed with a 3650-day duration.
@@ -51,12 +55,10 @@ interface IAggE2E {
 ///              revert while a proposal is active; the strategy's own deposit/redeem WORK)
 ///              and that the lock releases at settle.
 ///
-///         Registry note: betaMode `deployCore` wires `MinimalGuardianRegistry`
-///         (`reviewPeriod()==0`, `getReviewState()==(resolved,not-blocked)`) — the
-///         deploy-path equivalent of the test-only `MockRegistryMinimal` the task names.
-///         Both give a cold-start guardian AUTO-PASS: a proposal advances Pending→Approved
-///         the instant the vote window closes, with no openReview/resolveReview ceremony and
-///         no WOOD / owner-stake setup.
+///         Registry note: `deployCore` wires the real `GuardianRegistry`. No guardians
+///         are staked on the fresh deployment, so the openReview → warp reviewPeriod →
+///         resolveReview ceremony resolves via the cold-start (cohort-too-small) path
+///         and the proposal executes without a block.
 ///
 ///         Template-approval note: `StrategyFactory.setTemplateApproval` is NOT part of the
 ///         propose→execute path. `deployCore` deploys no `StrategyFactory`, and the
@@ -89,6 +91,8 @@ contract LeveragedAeroCLE2EFork is LeveragedAeroForkBase {
     SyndicateGovernor internal governor;
     SyndicateFactory internal factory;
     SyndicateVault internal vault;
+    GuardianRegistry internal registry;
+    StakedWood internal swood;
     address internal deployer;
 
     // ── Strategy under test ──
@@ -119,11 +123,16 @@ contract LeveragedAeroCLE2EFork is LeveragedAeroForkBase {
         super.setUp(); // Tenderly fork-or-skip
         if (_skip) return;
         _deployStack();
+        _bondOwnerStake();
         _createVaultAndFund();
     }
 
-    /// @dev Deploy a fresh Sherwood core via the real deploy script, betaMode (stub registry).
+    /// @dev Deploy a fresh Sherwood core via the real deploy script (full
+    ///      GuardianRegistry + sWOOD; fixture WOOD backs the owner bond).
     function _deployStack() internal {
+        // Non-production WOOD fixture for the V2 owner-bond flow.
+        ERC20Mock wood = new ERC20Mock("Wood", "WOOD", 18);
+
         DeploySherwood deployScript = new DeploySherwood();
         DeploySherwood.Config memory cfg = DeploySherwood.Config({
             ensRegistrar: address(0),
@@ -132,23 +141,39 @@ contract LeveragedAeroCLE2EFork is LeveragedAeroForkBase {
             protocolFeeBps: 0, // keep settle PnL math clean
             maxStrategyDays: 3650, // HIGH — relies on ABSOLUTE_MAX_STRATEGY_DURATION = 3650 days
             votingPeriod: 1 hours,
-            woodToken: address(0), // beta: no WOOD
+            woodToken: address(wood),
             slashAppealSeed: 0,
-            epochZeroSeed: 0,
-            betaMode: true // MinimalGuardianRegistry — cold-start auto-pass
+            epochZeroSeed: 0
         });
         // deployCore runs nested CREATE3 calls AS the script address; prank as the
-        // script so the Create3Factory owner is consistent (mirrors HyperEVMIntegrationTest).
+        // script so the Create3Factory owner is consistent (shared fork-test convention).
         vm.prank(address(deployScript));
         DeploySherwood.Deployed memory d = deployScript.deployCore(cfg);
 
         // Per-vault governors (#421): no singleton governor exists at deploy.
         // `governor` is resolved from the vault after createSyndicate below.
         factory = SyndicateFactory(d.factoryProxy);
+        registry = GuardianRegistry(d.registryProxy);
+        swood = StakedWood(d.swoodProxy);
         deployer = d.deployer;
     }
 
-    /// @dev Create the syndicate vault (openDeposits, beta needs no owner stake) + register
+    /// @dev V2 owner-bond flow: mint fixture WOOD → prepareOwnerStake so the
+    ///      vault owner is eligible for createSyndicate.
+    function _bondOwnerStake() internal {
+        uint256 minStake = swood.minOwnerStake();
+        ERC20Mock wood = ERC20Mock(address(swood.wood()));
+        wood.mint(vaultOwner, minStake);
+
+        vm.startPrank(vaultOwner);
+        wood.approve(address(swood), minStake);
+        swood.prepareOwnerStake(minStake);
+        vm.stopPrank();
+
+        assertTrue(swood.canCreateVault(vaultOwner), "owner not eligible to create vault after prepareOwnerStake");
+    }
+
+    /// @dev Create the syndicate vault (openDeposits) + register
     ///      the agent, then fund + deposit two LPs.
     function _createVaultAndFund() internal {
         SyndicateFactory.SyndicateConfig memory config = SyndicateFactory.SyndicateConfig({
@@ -307,8 +332,13 @@ contract LeveragedAeroCLE2EFork is LeveragedAeroForkBase {
         vm.prank(lp2);
         governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
 
-        // Close the vote window → cold-start auto-pass (reviewPeriod==0) → Approved.
+        // Close the vote window, then run the guardian review ceremony. No
+        // guardians are staked on the fresh deployment, so `resolveReview`
+        // short-circuits via the cold-start (cohort-too-small) path.
         vm.warp(vm.getBlockTimestamp() + gp.votingPeriod + 1);
+        registry.openReview(address(governor), proposalId);
+        vm.warp(vm.getBlockTimestamp() + registry.reviewPeriod() + 1);
+        registry.resolveReview(address(governor), proposalId);
         governor.executeProposal(proposalId);
     }
 

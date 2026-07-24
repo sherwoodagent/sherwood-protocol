@@ -10,7 +10,7 @@ import {StakedWood} from "../../src/StakedWood.sol";
 import {PriceRouter} from "../../src/pricing/PriceRouter.sol";
 import {WoodToken} from "../../src/WoodToken.sol";
 import {UniswapSwapAdapter} from "../../src/adapters/UniswapSwapAdapter.sol";
-import {SynthraQuoterV2Shim} from "../../src/adapters/SynthraQuoterV2Shim.sol";
+import {SynthraQuoterV2Shim} from "./SynthraQuoterV2Shim.sol";
 import {PortfolioStrategy} from "../../src/strategies/PortfolioStrategy.sol";
 import {StrategyFactory} from "../../src/StrategyFactory.sol";
 import {DeploySherwood} from "../Deploy.s.sol";
@@ -94,8 +94,7 @@ contract DeployRobinhoodTestnetV2 is DeploySherwood {
             votingPeriod: VOTING_PERIOD,
             woodToken: woodToken,
             slashAppealSeed: 0,
-            epochZeroSeed: 0,
-            betaMode: false
+            epochZeroSeed: 0
         });
 
         // Canonical core ceremony (CREATE3, order-independent + setFactory).
