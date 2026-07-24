@@ -1285,6 +1285,7 @@ event SubmitterBondConfigSet(address wood, uint256 bondWood, uint256 releaseDela
 
 error BondNotReleasable();
 error BondPendingRelease();
+error BondActive();
 error NotSubmitter();
 error BondConfigUnset();
 error ZeroAddressSubmitter();
@@ -1319,8 +1320,16 @@ function certify(address target, bytes4 selector, uint8 tier, uint16 extractable
     bytes32 ch = target.codehash;
     if (ch == bytes32(0) || ch == _EMPTY_CODEHASH) revert NotAContract();
     bytes32 k = key(target, selector);
-    // NEW: a bond pending release blocks re-certification — one bond per key.
-    if (_bonds[k].releasableAt != 0) revert BondPendingRelease();
+    // NEW: ANY existing bond blocks re-certification — one bond per key, and a
+    // bonded certification cannot be replaced in place (the old bond would be
+    // overwritten and stranded). Replace via demote → timelock → claim →
+    // fresh certify, so the old bond traverses its release window
+    // (slash-first layering).
+    SubmitterBond storage existing = _bonds[k];
+    if (existing.amount != 0) {
+        if (existing.releasableAt != 0) revert BondPendingRelease();
+        revert BondActive();
+    }
     // NEW: pull the submitter bond when configured (spec §3.6). Zero-config
     // (bond amount 0) preserves the Plan A no-bond path for the governance-
     // assigned initial adapter set.
