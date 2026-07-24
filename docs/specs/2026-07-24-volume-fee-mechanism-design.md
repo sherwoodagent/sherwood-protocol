@@ -119,8 +119,8 @@ Findings from the codebase survey:
 ### 4.1 Shape: pay per trade, settle the remainder
 
 The fee is **charged and paid per trade, in real time** — the Hyperliquid model,
-where each fill's fee is deducted from its cash (USDC) leg immediately. Gas on Base
-is negligible, so there is no batching argument; paying live also gives the treasury
+where each fill's fee is deducted from its cash (USDC) leg immediately. Gas on
+Robinhood Chain is negligible, so there is no batching argument; paying live also gives the treasury
 (and the eventual buyback) a continuous revenue stream instead of a lump at settle.
 
 The one genuine constraint is denomination: the fee is owed in the vault asset, and
@@ -303,7 +303,7 @@ per trade), `VolumeAccrued(uint256 notional, uint256 owedTotal)` (tab fallback),
 `VolumeTabCleared(uint256 paid, uint256 shortfall)`. Subgraph gains a `VolumeFee` entity
 per proposal and a running `notionalTraded` on the strategy/vault entities — today the
 subgraph tracks only `performanceFeeBps`/`performanceFee` (`subgraph/schema.graphql:100,107`).
-This also gives the frontend a true "volume" stat per syndicate for free.
+This also gives the frontend a true "volume" stat per fund for free.
 
 ---
 

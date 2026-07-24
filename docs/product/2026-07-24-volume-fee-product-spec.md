@@ -4,7 +4,7 @@
 **Date:** 2026-07-24
 **Companion:** technical design in `docs/specs/2026-07-24-volume-fee-mechanism-design.md`
 
-A small protocol fee on each trade a syndicate makes — so Sherwood's revenue grows
+A small protocol fee on each trade a fund makes — so Sherwood's revenue grows
 with activity, the way Hyperliquid's does, instead of depending entirely on
 strategies ending in profit.
 
@@ -14,7 +14,7 @@ strategies ending in profit.
 |---|---|
 | **Rate** | 0.02% of each trade's value (2 bps) |
 | **Hard ceiling** | 0.10% — can never be set higher, by contract |
-| **Charged** | Per trade — counted as trades happen, paid at wrap-up |
+| **Charged** | Per trade — skimmed from each trade's cash leg, in real time |
 | **Who pays** | Active strategies; passive lending strategies pay ~nothing |
 | **Goes to** | Protocol treasury → WOOD buybacks (phase 2) |
 | **Rate lock** | Fixed when a strategy starts; no mid-run changes |
@@ -66,7 +66,7 @@ Follow one proposal from the fee's point of view:
    WOOD purchases.
 
 The fee is paid **per trade, in real time** — exactly how Hyperliquid deducts fees
-from each fill's cash leg. Gas on Base is negligible, so there's no reason to batch;
+from each fill's cash leg. Gas on Robinhood Chain is negligible, so there's no reason to batch;
 the treasury (and eventually the buyback) sees revenue continuously, not once a
 month. The only exception is a trade that doesn't touch the vault's cash asset at
 all (say, rebalancing straight from ETH into AERO) — there's no cash leg to skim, so
@@ -104,8 +104,8 @@ The complete picture:
 | Agent fee | Lead agent + co-proposers | 10% default (up to 15%) | profit after protocol & guardian cuts | Profitable settlements only |
 | Protocol fee | Treasury | 5% (cap 10%) | settlement profit | Profitable settlements only |
 | Guardian fee | Guardian network | 3% (cap 5%) | settlement profit | Profitable settlements only |
-| Manager fee | Syndicate owner | ≤ 5% | profit after the agent's cut | Profitable settlements only |
-| Creation fee | Treasury | flat | launching a syndicate | Once, at creation |
+| Manager fee | Fund owner | ≤ 5% | profit after the agent's cut | Profitable settlements only |
+| Creation fee | Treasury | flat | launching a fund | Once, at creation |
 
 **Deliberate sizing: the agent is the largest fee earner in the stack.** Agents
 generate the returns; the protocol and the guardian network run on rates well below
@@ -119,7 +119,7 @@ agreed at proposal time.
 
 ### One good month, everyone's cut
 
-The same $1M syndicate, ending a 30-day proposal $21,500 up before Sherwood fees
+The same $1M fund, ending a 30-day proposal $21,500 up before Sherwood fees
 (rates: protocol 5%, guardian 3%, agent 10%, manager 5%):
 
 | Step | Who | Amount | Running remainder |
@@ -128,11 +128,11 @@ The same $1M syndicate, ending a 30-day proposal $21,500 up before Sherwood fees
 | Protocol fee — 5% of profit | Treasury | $1,000 | $19,000 |
 | Guardian fee — 3% of profit | Guardian network | $600 | $18,400 |
 | Agent fee — 10% of the remainder | Agent(s) | **$1,840** | $16,560 |
-| Manager fee — 5% of the remainder | Syndicate owner | $828 | $15,732 |
+| Manager fee — 5% of the remainder | Fund owner | $828 | $15,732 |
 | **Depositors keep** | Shareholders | **$15,732** | +1.57% for the month |
 
 The agent's $1,840 beats the protocol and guardians combined ($1,600) — and an
-agent whose syndicate sets the fee at the 15% cap earns $2,760, well clear of both.
+agent whose fund sets the fee at the 15% cap earns $2,760, well clear of both.
 On a **flat month**, that table collapses to one line: the $1,500 volume fee.
 Agents, the manager, and guardians earn nothing — their compensation stays purely
 performance-based, which is the alignment we want for the people choosing and
@@ -153,7 +153,7 @@ income proportional to activity reviewed, which is what our economic-security
 analysis says the network needs to stay honestly staffed.
 
 One honest footnote: the "manager fee" is charged on profit, not on assets — so
-despite the name, the syndicate owner also earns nothing on flat months. Whether it
+despite the name, the fund owner also earns nothing on flat months. Whether it
 should become a true assets-under-management fee is a real question, but a separate
 one (open decision 5).
 
@@ -176,7 +176,7 @@ one (open decision 5).
 
 ## The numbers
 
-A $1M syndicate running a portfolio strategy that rebalances about a quarter of the
+A $1M fund running a portfolio strategy that rebalances about a quarter of the
 book daily, over a 30-day proposal:
 
 | Scenario | Protocol revenue today | With volume fee |
@@ -192,13 +192,28 @@ the book daily would pay ~$6,000/month; a passive one pays nothing. **The fee pr
 protocol attention by activity**, which is precisely what the profit-only model
 cannot do.
 
+### Four funds, four fee profiles
+
+What the fee actually costs across the real strategy lineup, per month at 0.02%:
+
+| Fund | Capital | What it does | Monthly volume | Volume fee |
+|---|---:|---|---:|---:|
+| Stable yield (Moonwell USDC lending) | $500k | Deploys once, earns interest, unwinds at settle | $0 — lending isn't volume | **$0** |
+| LP yield (Aerodrome USDC/ETH) | $250k | Enters the pool once, sells AERO rewards weekly (~$1.5k/wk) | ~$256k first month, then ~$6k | **~$51**, then ~$1 |
+| Leveraged LP (Leveraged Aerodrome CL) | $500k | Re-ranges ~2×/week, rotating ~40% of the book each time | ~$1.7M | **~$350** |
+| Active portfolio (BTC/ETH/SOL basket) | $1M | Rebalances ~25% of the book daily | ~$7.5M | **~$1,500** |
+
+Most funds pay a few dollars to a few hundred a month; only genuinely active
+trading reaches four figures — and that's exactly the flow that consumes the most
+guardian review, pricing infrastructure, and risk surface.
+
 ## Rollout
 
 1. **Turn it on** *(contract release)* — fee live at 0.02%, all revenue to the
    protocol treasury. Ships alongside the rebalanced profit-fee settings — protocol
    5%, guardian 3% (config changes), agent default 10% (one-constant change) — so
    the agent-earns-most ordering holds from day one. Every trade and every fee
-   visible on-chain and in the app — syndicates get a real "volume" stat for free.
+   visible on-chain and in the app — funds get a real "volume" stat for free.
 2. **The buyback** *(treasury policy)* — treasury publishes a wallet and cadence,
    and converts volume-fee revenue into open-market WOOD purchases on a schedule.
    Policy first, contracts later — the same path Hyperliquid took with its
@@ -222,7 +237,7 @@ cannot do.
   — inflating volume only costs the strategy money. The cap bounds the griefing
   case too.
 - **Everything is visible.** Accruals and payments are on-chain events, indexed and
-  shown per syndicate. Depositors can see exactly what activity cost before they
+  shown per fund. Depositors can see exactly what activity cost before they
   deposit.
 
 ## Not in scope
