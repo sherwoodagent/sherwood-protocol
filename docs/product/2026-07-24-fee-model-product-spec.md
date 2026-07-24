@@ -121,10 +121,17 @@ terms, not headline fees:**
   the protocol. It's the hedge-fund early-redemption analogue, and it exists to
   discourage mercenary in-and-out flows, not to make money.
 - **The queue is always free.** Waiting for settlement — the patient path — never
-  costs anything.
-- **Mid-proposal flows never distort fees.** The vault nets them out of the profit
-  calculation, and the management fee is time-weighted, so you only ever pay on
-  capital that was actually in the fund, for the time it was there.
+  costs the *early-redemption* fee.
+- **Exit timing is fee-neutral — you pay your fee share either way.** Queue
+  withdrawers claim at the settlement price, which is struck *after* fees, so their
+  share is already deducted. Instant withdrawers have their management and
+  performance fees crystallized and deducted *at the moment they exit* (the way a
+  Hyperliquid vault charges its profit share at withdrawal). Neither can leave their
+  fee burden on the depositors who stay.
+- **Mid-proposal deposits are never mistaken for profit.** The vault nets flows out
+  of the profit calculation and the management fee is time-weighted, so you only pay
+  on capital that was actually in the fund, for the time it was there — a late
+  deposit is never charged a performance fee on money it didn't earn.
 
 ## How fees are collected
 

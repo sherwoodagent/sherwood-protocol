@@ -19,7 +19,9 @@ deliberately small:
 1. A **management fee** (AUM, time-weighted, always-on), split agent/protocol/guardian.
 2. A **performance fee** (profit above a **high-water mark**), split
    agent/protocol/guardian/owner.
-3. An **instant-exit fee** (redemption term, accrues to the vault).
+3. **Crystallize-on-instant-exit** so Lane A withdrawers pay their fee share at exit
+   instead of leaking it onto remaining depositors.
+4. An **instant-exit fee** (redemption term, accrues to the vault).
 
 The net effect on the codebase is *less* than the volume-fee design: no per-trade
 metering, no strategy hot-path changes. The work is concentrated in the settlement
@@ -140,6 +142,45 @@ inflation-attack defenses (`_decimalsOffset`) — so it's out of scope for v1 pe
 product decision. Asset-based collection ships first; dilution is a clean follow-up
 that changes *how* fees are paid, not *what* is owed.
 
+### 4.1 Crystallize fees on instant exit
+
+Fees crystallize at settlement, but a **Lane A instant exit** happens mid-proposal at
+a live oracle price with no fee deducted — so without special handling the exiter
+escapes their share of both fees and leaks it onto the depositors who stay (the
+crystallization / free-ride problem). **Lane B queue exits are already correct:** they
+claim at the frozen settle price, stamped *after* `_distributeFees`, so they bear
+their share automatically. The fix is only needed on the instant path.
+
+**Charge the exiting shares their pro-rata accrued fees at exit** — the
+Hyperliquid-vault model (profit share collected per depositor at withdrawal). For an
+instant exit of `s` shares out of supply `S` at price-per-share `pps`:
+
+```
+perfFeeExit = max(pps - highWaterPricePerShare, 0) * s * performanceFeeBps / 10_000
+mgmtFeeExit = (s / S) * mgmtFeeAccruedUncollected          // pro-rata of fund-level accrual to now
+netProceeds = pps * s - perfFeeExit - mgmtFeeExit          // instant-exit fee (Sec. 5) then applies to the net
+```
+
+- `perfFeeExit` / `mgmtFeeExit` route to the split recipients immediately via
+  `_payFee` (or escrow to settle); the **instant-exit fee** (Sec. 5) then applies to
+  the net and goes to the vault. The two are independent and stack in that order.
+- **No double-count at settlement, by construction:** the exiting shares are *burned*
+  at exit, so they leave `totalSupply` and are absent from the settlement
+  performance-fee base. For the management fee, track a running
+  `mgmtFeeCrystallized` (sum collected via exits) and charge only
+  `mgmtFeeDue_total - mgmtFeeCrystallized` at settle.
+- **HWM is not ratcheted on a partial exit** — it advances only at settlement
+  crystallization. Charging `perfFeeExit` against the current (un-advanced) mark is
+  correct and conservative; remaining holders keep measuring from the same mark.
+- Consistent with the global per-share HWM (Sec. 3): the exiter pays exactly the
+  per-share performance fee the fund would charge at settle, just early, on the
+  shares that are leaving.
+
+Net effect: **exit timing is fee-neutral.** Instant exiters pay at exit, queue
+exiters pay via the post-fee settle price, and neither shifts fee burden onto the
+depositors who stay. (Share-dilution collection, Sec. 4, would achieve this
+automatically — crystallize-on-exit is the asset-based equivalent.)
+
 ---
 
 ## 5. Instant-exit fee (redemption term)
@@ -191,11 +232,16 @@ high-water-mark series. The `VolumeFee` entity from the prior draft is dropped.
    (updated on execute / `withdrawTo` / share hooks). No per-trade code.
 4. Governor `_finishSettlement` / `_distributeFees`: management fee always; HWM gate;
    performance fee on above-HWM profit; two split-distributions via `_payFee`.
-5. Instant-exit fee: revive `instantExitFeeBps` (Lane A only, accrues to vault).
-6. Tests: management accrual (flat/loss months still charge it; time-weighting under
+5. Crystallize-on-instant-exit (Sec. 4.1): charge exiting shares their pro-rata
+   management + performance fees at Lane A exit; track `mgmtFeeCrystallized`;
+   share burn keeps settlement from double-charging.
+6. Instant-exit fee: revive `instantExitFeeBps` (Lane A only, accrues to vault).
+7. Tests: management accrual (flat/loss months still charge it; time-weighting under
    mid-proposal exits); HWM (no double-charge across a loss-then-recover; ratchet);
-   split sums = 10_000; agent-earns-most invariant; fail-open payment; self-managed
-   path parity.
+   crystallize-on-exit (instant exiter pays management + performance at exit; no
+   double-count at settle; queue exiter pays via settle price; exit timing is
+   fee-neutral vs an equivalent hold-to-settle depositor); split sums = 10_000;
+   agent-earns-most invariant; fail-open payment; self-managed path parity.
 7. Docs: README fee table; flip this spec + the product spec to "implemented".
 
 ---
