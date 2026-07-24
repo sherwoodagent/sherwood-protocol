@@ -308,4 +308,139 @@ contract TierRegistryTest is Test {
         assertEq(wood.balanceOf(newSubmitter), 90_000e18);
         assertEq(wood.balanceOf(address(reg)), 10_000e18);
     }
+
+    // ── Review hardening: conservation, setter bounds, permissionless claim ──
+
+    function test_pokePath_bondLifecycle() public {
+        (ERC20Mock wood, address submitter) = _bondSetup();
+        vm.prank(owner);
+        reg.certify(target, bytes4(0x77777777), 1, 500, submitter);
+        // mutate the target's code so the certified codehash no longer matches
+        vm.etch(target, hex"6001600101");
+        // permissionless poke from a rando starts the release timelock
+        vm.prank(makeAddr("rando"));
+        reg.poke(target, bytes4(0x77777777));
+        TierRegistry.SubmitterBond memory b = reg.bondOf(target, bytes4(0x77777777));
+        assertEq(b.submitter, submitter);
+        assertEq(b.amount, 10_000e18);
+        assertEq(b.releasableAt, uint64(block.timestamp + 14 days));
+        // permissionless claim after the delay pays the SUBMITTER, not the caller
+        vm.warp(block.timestamp + 14 days);
+        vm.prank(makeAddr("anotherRando"));
+        reg.claimSubmitterBond(target, bytes4(0x77777777));
+        assertEq(wood.balanceOf(submitter), 100_000e18);
+        assertEq(wood.balanceOf(makeAddr("anotherRando")), 0);
+        assertEq(reg.totalBondedWood(), 0);
+    }
+
+    function test_doubleClaimReverts() public {
+        (, address submitter) = _bondSetup();
+        vm.startPrank(owner);
+        reg.certify(target, bytes4(0x88888888), 1, 500, submitter);
+        reg.demote(target, bytes4(0x88888888));
+        vm.stopPrank();
+        vm.warp(block.timestamp + 14 days + 1);
+        reg.claimSubmitterBond(target, bytes4(0x88888888));
+        // record deleted: second claim reverts BondNotReleasable (releasableAt back to 0)
+        vm.expectRevert(TierRegistry.BondNotReleasable.selector);
+        reg.claimSubmitterBond(target, bytes4(0x88888888));
+    }
+
+    function test_certify_zeroAddressSubmitterRevertsWhenBonded() public {
+        _bondSetup();
+        vm.prank(owner);
+        vm.expectRevert(TierRegistry.ZeroAddressSubmitter.selector);
+        reg.certify(target, bytes4(0x99999999), 1, 500, address(0));
+    }
+
+    function test_certify_noApprovalReverts() public {
+        (ERC20Mock wood,) = _bondSetup();
+        address broke = makeAddr("noApproval");
+        wood.mint(broke, 100_000e18); // funded but never approved the registry
+        vm.prank(owner);
+        vm.expectRevert();
+        reg.certify(target, bytes4(0xaaaaaaaa), 1, 500, broke);
+    }
+
+    function test_bondEventsEmitted() public {
+        (, address submitter) = _bondSetup();
+        vm.prank(owner);
+        vm.expectEmit(true, true, true, true);
+        emit TierRegistry.SubmitterBondLocked(target, bytes4(0xbbbbbbbb), submitter, 10_000e18);
+        reg.certify(target, bytes4(0xbbbbbbbb), 1, 500, submitter);
+        vm.prank(owner);
+        vm.expectEmit(true, true, true, true);
+        emit TierRegistry.SubmitterBondReleaseStarted(
+            target, bytes4(0xbbbbbbbb), submitter, uint64(block.timestamp + 14 days)
+        );
+        reg.demote(target, bytes4(0xbbbbbbbb));
+        vm.warp(block.timestamp + 14 days);
+        vm.expectEmit(true, true, true, true);
+        emit TierRegistry.SubmitterBondClaimed(target, bytes4(0xbbbbbbbb), submitter, 10_000e18);
+        reg.claimSubmitterBond(target, bytes4(0xbbbbbbbb));
+    }
+
+    function test_setSubmitterBondWood_tooLargeReverts() public {
+        _bondSetup();
+        vm.prank(owner);
+        vm.expectRevert(TierRegistry.BondTooLarge.selector);
+        reg.setSubmitterBondWood(uint256(type(uint96).max) + 1);
+    }
+
+    function test_setBondReleaseDelay_boundsEnforced() public {
+        vm.startPrank(owner);
+        vm.expectRevert(TierRegistry.InvalidDelay.selector);
+        reg.setBondReleaseDelay(1 days - 1);
+        vm.expectRevert(TierRegistry.InvalidDelay.selector);
+        reg.setBondReleaseDelay(365 days + 1);
+        reg.setBondReleaseDelay(1 days); // boundaries legal
+        reg.setBondReleaseDelay(365 days);
+        vm.stopPrank();
+        assertEq(reg.bondReleaseDelay(), 365 days);
+    }
+
+    function test_setWood_revertsWhileBondsOutstanding() public {
+        (, address submitter) = _bondSetup();
+        vm.prank(owner);
+        reg.certify(target, bytes4(0xcccccccc), 1, 500, submitter);
+        address newWood = address(new ERC20Mock());
+        vm.prank(owner);
+        vm.expectRevert(TierRegistry.BondsOutstanding.selector);
+        reg.setWood(newWood);
+    }
+
+    function test_setWood_zeroWhileArmedReverts() public {
+        _bondSetup(); // arms submitterBondWood = 10_000e18
+        vm.prank(owner);
+        vm.expectRevert(TierRegistry.BondConfigUnset.selector);
+        reg.setWood(address(0));
+    }
+
+    /// Conservation invariant (spec §4): WOOD held == sum of active +
+    /// pending-release bonds, across random certify/demote/warp/claim
+    /// interleavings on 3 keys.
+    function testFuzz_woodBalanceMatchesBonds(uint8 certifyMask, uint8 demoteMask, uint8 claimMask, uint32 warpSeed)
+        public
+    {
+        (ERC20Mock wood,) = _bondSetup();
+        bytes4[3] memory sels = [bytes4(0xf0000001), bytes4(0xf0000002), bytes4(0xf0000003)];
+        for (uint256 i = 0; i < 3; i++) {
+            address sub = makeAddr(string(abi.encodePacked("fuzzSub", i)));
+            wood.mint(sub, 100_000e18);
+            vm.prank(sub);
+            wood.approve(address(reg), type(uint256).max);
+            if (certifyMask & (1 << i) == 0) continue;
+            vm.prank(owner);
+            reg.certify(target, sels[i], 1, 500, sub);
+            if (demoteMask & (1 << i) != 0) {
+                vm.prank(owner);
+                reg.demote(target, sels[i]);
+                if (claimMask & (1 << i) != 0) {
+                    vm.warp(block.timestamp + 14 days + 1 + (uint256(warpSeed) % 30 days));
+                    reg.claimSubmitterBond(target, sels[i]); // permissionless
+                }
+            }
+        }
+        assertEq(wood.balanceOf(address(reg)), reg.totalBondedWood());
+    }
 }

@@ -55,6 +55,12 @@ contract TierRegistry is Ownable2Step {
     uint8 public constant TIER_ARBITRARY = 2;
     uint16 public constant FULL_NOTIONAL_BPS = 10_000;
 
+    /// @dev Floor preserves Plan C's slash window: a demoted bond must stay
+    ///      claimable-not-yet-claimed long enough for the guard-bypass slash
+    ///      machinery to act. Ceiling bounds governance error.
+    uint256 public constant MIN_BOND_RELEASE_DELAY = 1 days;
+    uint256 public constant MAX_BOND_RELEASE_DELAY = 365 days;
+
     /// @dev EXTCODEHASH of an EXISTING account with no code (EIP-1052). A funded
     ///      EOA hashes to this, not bytes32(0) — `certify` rejects both.
     bytes32 private constant _EMPTY_CODEHASH = keccak256("");
@@ -73,6 +79,10 @@ contract TierRegistry is Ownable2Step {
     uint256 public submitterBondWood;
     uint256 public bondReleaseDelay = 14 days;
     mapping(bytes32 configKey => SubmitterBond) internal _bonds;
+
+    /// @notice Sum of all bonds held (active + pending release). Invariant
+    ///         (spec §4): `wood.balanceOf(address(this)) == totalBondedWood`.
+    uint256 public totalBondedWood;
 
     constructor(address initialOwner) Ownable(initialOwner) {}
 
@@ -102,6 +112,9 @@ contract TierRegistry is Ownable2Step {
         address indexed target, bytes4 indexed selector, address indexed submitter, uint256 amount
     );
     event SubmitterBondConfigSet(address wood, uint256 bondWood, uint256 releaseDelay);
+    event SubmitterBondReleaseStarted(
+        address indexed target, bytes4 indexed selector, address indexed submitter, uint64 releasableAt
+    );
 
     error InvalidTier();
     error BoundRequired();
@@ -111,26 +124,45 @@ contract TierRegistry is Ownable2Step {
     error BondNotReleasable();
     error BondPendingRelease();
     error BondActive();
-    error NotSubmitter();
     error BondConfigUnset();
     error ZeroAddressSubmitter();
+    error BondTooLarge();
+    error InvalidDelay();
+    error BondsOutstanding();
 
     /// @notice Set the WOOD token used for submitter bonds.
+    /// @dev    Token-swap constraint: the bond token cannot change while ANY
+    ///         bond is held (`BondsOutstanding`) — outstanding bonds are
+    ///         denominated in the OLD token and a swap would strand them (the
+    ///         claim path pays out in the new token, whose balance is zero).
+    ///         Drain all bonds (demote → timelock → claim) before swapping.
+    ///         Clearing the token to address(0) while the bond amount is still
+    ///         armed is also rejected — zero the amount first.
     function setWood(address wood_) external onlyOwner {
+        if (totalBondedWood != 0) revert BondsOutstanding();
+        if (wood_ == address(0) && submitterBondWood != 0) revert BondConfigUnset();
         wood = IERC20(wood_);
         emit SubmitterBondConfigSet(wood_, submitterBondWood, bondReleaseDelay);
     }
 
     /// @notice Set the submitter bond amount pulled on `certify`. Zero disables
     ///         the bond requirement (Plan A no-bond passthrough).
+    /// @dev    Bounded to uint96 so the `SubmitterBond.amount` narrowing cast
+    ///         in `certify` is provably lossless.
     function setSubmitterBondWood(uint256 amount) external onlyOwner {
         if (amount != 0 && address(wood) == address(0)) revert BondConfigUnset();
+        if (amount > type(uint96).max) revert BondTooLarge();
         submitterBondWood = amount;
         emit SubmitterBondConfigSet(address(wood), amount, bondReleaseDelay);
     }
 
     /// @notice Set the timelock delay between demotion and submitter bond claim.
+    /// @dev    Bounded to [MIN_BOND_RELEASE_DELAY, MAX_BOND_RELEASE_DELAY]. The
+    ///         floor preserves Plan C's slash window — a zero/near-zero delay
+    ///         would let a mis-certifying submitter exit before the guard-bypass
+    ///         slash can attach.
     function setBondReleaseDelay(uint256 delay) external onlyOwner {
+        if (delay < MIN_BOND_RELEASE_DELAY || delay > MAX_BOND_RELEASE_DELAY) revert InvalidDelay();
         bondReleaseDelay = delay;
         emit SubmitterBondConfigSet(address(wood), submitterBondWood, delay);
     }
@@ -176,7 +208,11 @@ contract TierRegistry is Ownable2Step {
         uint256 bondAmount = submitterBondWood;
         if (bondAmount != 0) {
             if (submitter == address(0)) revert ZeroAddressSubmitter();
+            // casting to 'uint96' is safe because setSubmitterBondWood rejects
+            // amounts above type(uint96).max (BondTooLarge)
+            // forge-lint: disable-next-line(unsafe-typecast)
             _bonds[k] = SubmitterBond({submitter: submitter, amount: uint96(bondAmount), releasableAt: 0});
+            totalBondedWood += bondAmount;
             wood.safeTransferFrom(submitter, address(this), bondAmount);
             emit SubmitterBondLocked(target, selector, submitter, bondAmount);
         }
@@ -203,21 +239,35 @@ contract TierRegistry is Ownable2Step {
         delete _configs[k];
         SubmitterBond storage b = _bonds[k];
         if (b.amount != 0 && b.releasableAt == 0) {
-            b.releasableAt = uint64(block.timestamp + bondReleaseDelay);
+            uint64 releasableAt = uint64(block.timestamp + bondReleaseDelay);
+            b.releasableAt = releasableAt;
+            emit SubmitterBondReleaseStarted(target, selector, b.submitter, releasableAt);
         }
         emit TierDemoted(target, selector);
     }
 
-    /// @notice Submitter claims its bond back, `bondReleaseDelay` after demotion.
-    ///         The delay is the window Plan C's guard-bypass slash will act in.
+    /// @notice Release a demoted bond to its submitter, `bondReleaseDelay` after
+    ///         demotion. PERMISSIONLESS: the payout address is fixed to the
+    ///         recorded submitter, so a caller gate would protect nothing —
+    ///         and it would let a lost-key submitter permanently retire a
+    ///         (target, selector) key, since `certify` blocks while any bond
+    ///         exists. The delay is the window Plan C's guard-bypass slash
+    ///         will act in.
     function claimSubmitterBond(address target, bytes4 selector) external {
         bytes32 k = key(target, selector);
         SubmitterBond memory b = _bonds[k];
-        if (b.submitter != msg.sender) revert NotSubmitter();
         if (b.releasableAt == 0 || block.timestamp < b.releasableAt) revert BondNotReleasable();
         delete _bonds[k];
+        totalBondedWood -= b.amount;
         wood.safeTransfer(b.submitter, b.amount);
         emit SubmitterBondClaimed(target, selector, b.submitter, b.amount);
+    }
+
+    /// @notice Full bond record for (target, selector) — Plan C's slash
+    ///         contract and UIs need `releasableAt` to time the challenge
+    ///         window. Zeroed struct when no bond exists.
+    function bondOf(address target, bytes4 selector) external view returns (SubmitterBond memory) {
+        return _bonds[key(target, selector)];
     }
 
     // ── Adapter allowlist (spender/recipient gate for value-moving selectors) ──
