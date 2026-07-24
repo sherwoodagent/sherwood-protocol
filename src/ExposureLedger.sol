@@ -38,6 +38,13 @@ interface IVaultAssetMinimal {
     function asset() external view returns (address);
 }
 
+interface IRegistryApproversMinimal {
+    function getApproverWeights(address governor, uint256 proposalId)
+        external
+        view
+        returns (address[] memory approvers, uint128[] memory weights, uint128 totalApproveWeight);
+}
+
 /**
  * @title ExposureLedger
  * @notice Dollar-denominated coverage accounting for the guardian
@@ -264,12 +271,38 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         emit ExposureReleased(guardian, key, r.usd, r.epoch);
     }
 
-    function requireWithinCoveredTvlCap(address, uint256) external view virtual {
-        revert CoveredTvlCapExceeded();
+    /// @inheritdoc IExposureLedger
+    /// @dev Spec §3.7: hard per-vault ceiling on coverage-consuming proposals,
+    ///      denominated in dollars. Zero cap fails closed (nothing proposable)
+    ///      until governance seeds it. Called by SyndicateGovernor.propose.
+    function requireWithinCoveredTvlCap(address asset, uint256 requiredCoverage) external view {
+        if (coverageUsd(asset, requiredCoverage) > coveredTvlCapUsd) revert CoveredTvlCapExceeded();
     }
 
-    function requireApproveQuorum(address, uint256, address, uint256) external view virtual {
-        revert InsufficientApproveCoverage();
+    /// @inheritdoc IExposureLedger
+    /// @dev Spec §3.3a: execution requires the covering approvers' aggregate
+    ///      slashableBond (LIVE read, dollars) to meet the proposal's coverage.
+    ///      Live rather than at-vote: sWOOD's coolDownPeriod >= epoch + challenge
+    ///      window prevents full escape, and a live read is strictly conservative
+    ///      (a bond that shrank since the vote counts at its shrunken value).
+    ///      Zero approvers ALWAYS reverts, even at zero coverage — R1 requires an
+    ///      identified signer for anything tier-gated into this check.
+    ///      Called by SyndicateGovernor.executeProposal for proposals with
+    ///      envelopeTier >= quorumTierThreshold.
+    function requireApproveQuorum(address governor, uint256 proposalId, address asset, uint256 requiredCoverage)
+        external
+        view
+    {
+        uint256 needUsd = coverageUsd(asset, requiredCoverage);
+        (address[] memory approvers,,) =
+            IRegistryApproversMinimal(guardianRegistry).getApproverWeights(governor, proposalId);
+        if (approvers.length == 0) revert InsufficientApproveCoverage();
+        uint256 haveUsd;
+        for (uint256 i = 0; i < approvers.length; i++) {
+            haveUsd += slashableBondUsd(approvers[i]);
+            if (haveUsd >= needUsd) return; // early exit
+        }
+        if (haveUsd < needUsd) revert InsufficientApproveCoverage();
     }
 
     /// @inheritdoc IExposureLedger

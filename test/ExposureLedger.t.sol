@@ -78,6 +78,25 @@ contract MockVaultForLedger {
     }
 }
 
+/// @dev Registry stub returning a canned approver set for quorum tests.
+contract MockRegistryForLedger {
+    address[] internal _approvers;
+
+    function setApprovers(address[] memory a) external {
+        _approvers = a;
+    }
+
+    function getApproverWeights(address, uint256)
+        external
+        view
+        returns (address[] memory approvers, uint128[] memory weights, uint128 total)
+    {
+        approvers = _approvers;
+        weights = new uint128[](approvers.length);
+        total = 0;
+    }
+}
+
 contract ExposureLedgerTest is Test {
     ExposureLedger internal ledger;
     MockSwood internal swood;
@@ -254,5 +273,50 @@ contract ExposureLedgerTest is Test {
             ledger.releaseApproval(address(mgov), 2, guardian);
             assertEq(ledger.openExposureUsd(guardian), u1 * 1e12);
         }
+    }
+
+    function test_coveredTvlCap_enforced() public {
+        _wireRecording();
+        vm.prank(owner);
+        ledger.setCoveredTvlCapUsd(2_000e18);
+        ledger.requireWithinCoveredTvlCap(usdgAsset, 1_500e6); // $1,500 <= $2,000: fine
+        vm.expectRevert(IExposureLedger.CoveredTvlCapExceeded.selector);
+        ledger.requireWithinCoveredTvlCap(usdgAsset, 2_500e6);
+    }
+
+    function test_coveredTvlCap_zeroCapFailsClosed() public {
+        _wireRecording(); // cap never set => 0
+        vm.expectRevert(IExposureLedger.CoveredTvlCapExceeded.selector);
+        ledger.requireWithinCoveredTvlCap(usdgAsset, 1e6);
+    }
+
+    function test_approveQuorum_sumOfApproverBondsCoversCoverage() public {
+        _wireRecording();
+        MockRegistryForLedger mockReg = new MockRegistryForLedger();
+        vm.prank(owner);
+        ledger.setGuardianRegistry(address(mockReg));
+        address g2 = makeAddr("g2");
+        swood.setStake(guardian, 60_000e18, 0); // $3,000
+        swood.setStake(g2, 60_000e18, 0); // $3,000
+        address[] memory a = new address[](2);
+        a[0] = guardian;
+        a[1] = g2;
+        mockReg.setApprovers(a);
+        // $5,000 coverage vs $6,000 combined bonds: passes
+        ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 5_000e6);
+        // $7,000 coverage: fails
+        vm.expectRevert(IExposureLedger.InsufficientApproveCoverage.selector);
+        ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 7_000e6);
+    }
+
+    function test_approveQuorum_zeroApproversFailsClosed() public {
+        _wireRecording();
+        MockRegistryForLedger mockReg = new MockRegistryForLedger();
+        vm.prank(owner);
+        ledger.setGuardianRegistry(address(mockReg));
+        // spec §3.3a cold-start: no covering signer => coverage-consuming proposal
+        // cannot execute — it expires instead of executing unreviewed.
+        vm.expectRevert(IExposureLedger.InsufficientApproveCoverage.selector);
+        ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 1e6);
     }
 }
