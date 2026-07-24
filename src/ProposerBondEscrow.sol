@@ -27,7 +27,7 @@ contract ProposerBondEscrow is IProposerBondEscrow {
 
     struct Bond {
         address proposer;
-        uint96 amount; // WOOD fits: total supply << 2^96
+        uint96 amount; // WOOD fits in uint96 (total supply << 2^96) — enforced by lockBond's AmountTooLarge guard, not assumed
     }
 
     IERC20 public immutable wood;
@@ -53,6 +53,7 @@ contract ProposerBondEscrow is IProposerBondEscrow {
     /// @inheritdoc IProposerBondEscrow
     function lockBond(uint256 proposalId, address proposer, uint256 amount) external onlyGovernor {
         if (proposer == address(0)) revert ZeroAddress();
+        if (amount > type(uint96).max) revert AmountTooLarge();
         bytes32 key = _key(msg.sender, proposalId);
         if (_bonds[key].proposer != address(0)) revert BondAlreadyLocked();
         _bonds[key] = Bond({proposer: proposer, amount: uint96(amount)});

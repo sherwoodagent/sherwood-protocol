@@ -10,6 +10,7 @@ interface IProposerBondEscrow {
     error BondAlreadyLocked();
     error NoBond();
     error ZeroAddress();
+    error AmountTooLarge();
 
     event BondLocked(address indexed governor, uint256 indexed proposalId, address indexed proposer, uint256 amount);
     event BondReleased(address indexed governor, uint256 indexed proposalId, address indexed proposer, uint256 amount);

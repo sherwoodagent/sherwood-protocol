@@ -54,6 +54,17 @@ contract ProposerBondEscrowTest is Test {
         vm.stopPrank();
     }
 
+    function test_lockBond_amountOverUint96Reverts() public {
+        // Guard fires BEFORE safeTransferFrom, so no mint/approve of 2^96 WOOD
+        // is needed and no funds move.
+        vm.prank(governor);
+        vm.expectRevert(IProposerBondEscrow.AmountTooLarge.selector);
+        escrow.lockBond(1, proposer, uint256(type(uint96).max) + 1);
+        assertEq(wood.balanceOf(address(escrow)), 0);
+        (address p,) = escrow.bondOf(governor, 1);
+        assertEq(p, address(0));
+    }
+
     function test_releaseBond_returnsToProposer() public {
         vm.prank(governor);
         escrow.lockBond(1, proposer, 100e18);
