@@ -224,9 +224,12 @@ if (fee != 0) {
 }
 ```
 
-- Self-contained per strategy; **zero governor/vault bytecode** — decisive, because
-  the governor runtime is at 24,550 of the 24,576-byte EIP-170 ceiling and the vault
-  had to extract an admin lib to fit (see instant-withdrawal spec §0).
+- Correct on the merits, not just size: the trades themselves never touch the vault
+  (they run through proposer-only `updateParams`), so the meter has to live where
+  the trade is — in the strategy. Since it's already there, collecting there too is
+  the natural home. (Robinhood Chain lifts the 24 KB EIP-170 code-size ceiling, so
+  bytecode headroom is *not* the deciding factor here — this choice would be right
+  even on a size-constrained chain.)
 - Mirrors the established precedent: `LeveragedAerodromeCLStrategy` already
   self-collects a `protocolFeeOwed` USDC liability and pays
   `factory.protocolConfig().protocolFeeRecipient` directly (`:601-614`).
@@ -237,10 +240,12 @@ if (fee != 0) {
 
 **Option B (rejected for v1): governor reads `IStrategy.volumeFeeOwed()` at
 `_finishSettlement` and pays via the `_payFee` escrow rail.** Cleaner audit trail and
-uses the existing brick-resistant try/catch escrow, but: (a) no governor bytecode
-headroom; (b) a live settle-time strategy call is exactly the TOCTOU/brick surface the
-`selfManagesFees` snapshot discipline was built to avoid; (c) the strategy holds the
-cash anyway — routing it strategy→vault→recipient adds a hop for nothing.
+uses the existing brick-resistant try/catch escrow, but: (a) a live settle-time
+strategy call is exactly the TOCTOU/brick surface the `selfManagesFees` snapshot
+discipline was built to avoid; (b) the strategy holds the cash and does the trade
+anyway — routing collection strategy→vault→recipient adds a hop and a trust edge for
+nothing. (Governor bytecode headroom is no longer a factor on Robinhood Chain, so
+this is a design call, not a size workaround.)
 
 **Fail-open, never brick settle:** wrap the transfer in try/catch (or pre-check); on
 failure emit `VolumeFeeShortfall` and continue. A fee must never block depositor
@@ -339,16 +344,20 @@ strategy selection the same way.
   order fills are not observable from the EVM, and Hyperliquid's builder-code rail is
   unavailable to CoreWriter-placed orders. None of that complexity applies to the
   AMM-only scope.)
-- **Entry/exit fees** — `instantExitFeeBps` was specced and deferred
-  (`docs/specs/2026-07-19-instant-withdrawal-liquidity-design.md` §6); orthogonal to
-  this design and still blocked on vault bytecode headroom.
+- **Instant-exit fee** — *unblocked, companion change.* `instantExitFeeBps` was
+  specced and deferred (`docs/specs/2026-07-19-instant-withdrawal-liquidity-design.md`
+  §6) solely on vault bytecode headroom; Robinhood Chain lifts the EIP-170 ceiling,
+  so it can ship as originally designed — ≤ 200 bps, charged only on the
+  `withdrawTo`-sourced portion of a Lane A exit, **accruing to the vault** (remaining
+  depositors), not the protocol. Storage slots were already reserved. No deposit
+  fee — entry friction is not worth the growth cost. Detailed spec to follow.
 - **AUM-based management fee** — *promoted to a companion change* (product decision
   2026-07-24: Sherwood follows the hedge-fund template, "2 and 10" for agents). An
   agent-owned management fee of 2%/yr on funded capital (proposed cap 3%/yr),
   pro-rated to actual proposal duration and paid **regardless of P&L**. It can ride
   the exact rails this spec builds: strategy-side, paid to the agent-fee recipients
   (same split as carry) before capital returns to the vault — senior to the profit
-  waterfall, zero governor bytecode, same fail-open rules. The base must be
+  waterfall, same fail-open rules. The base must be
   **time-weighted deployed capital**, not a flat snapshot: mid-proposal Lane A
   exits shrink the strategy's book via `withdrawTo` (and custody strategies via the
   `strategyMint`/`strategyBurn` share hooks), so the strategy keeps a TWA

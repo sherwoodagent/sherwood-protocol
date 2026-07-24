@@ -117,10 +117,12 @@ How the fee model treats these flows:
   one pays an agent for capital the agent never managed.
 - **Queued flows pay no fee.** Waiting for settlement is the patient path —
   penalizing it would push people toward the instant door, which is backwards.
-- **An explicit instant-exit fee (≤ 2%) is specced but deferred** — the hedge-fund
-  analogue of an early-redemption fee. It's blocked on a contract-size limit in the
-  vault, not on design; the haircut carries the cost in the meantime, and the fee
-  slot stays reserved for a future size pass.
+- **An explicit instant-exit fee (≤ 2%) is back on the table** — the hedge-fund
+  analogue of an early-redemption fee. It was previously deferred over an EVM
+  contract-size ceiling that doesn't apply on Robinhood Chain, so it can now ship
+  as designed: charged only on the instant door, never the queue, and it **accrues
+  to the fund** — leaving early pays the depositors who stay, on top of the
+  haircut.
 
 ## The full fee stack — a hedge fund for agents
 
@@ -286,7 +288,9 @@ guardian review, pricing infrastructure, and risk surface.
   forward; this design covers DEX and lending strategies only. (Convenient side
   effect: on DEXs, executed trade size is exactly knowable on-chain at the moment of
   the trade — no oracles or estimates needed.)
-- **Deposit/withdrawal fees.** Separately specced, separately deferred. Orthogonal.
+- **Deposit fees.** Nothing on the way in — entry friction kills fund growth. The
+  exit side is covered above: instant exits can carry an early-redemption fee, the
+  queued path stays free.
 - **Volume-tier discounts.** Hyperliquid discounts high-volume traders; Sherwood's
   per-vault flow is nowhere near the regime where that matters. Staking discounts
   (phase 3) are the differentiator that fits our token instead.
@@ -306,6 +310,9 @@ guardian review, pricing infrastructure, and risk surface.
 5. **Management fee rate and cap.** 2%/yr proposed (the hedge-fund standard), with
    a 3%/yr contract cap. Decide whether the fund owner shares it or it goes to the
    agent alone (proposed: agent alone; the owner keeps their profit-gated fee).
+6. **Instant-exit fee rate.** Now unblocked (no contract-size constraint on
+   Robinhood Chain). Proposed: 0.5%, capped at 2%, accruing to the fund rather
+   than the protocol — it compensates remaining depositors, not the treasury.
 
 ## What success looks like
 
