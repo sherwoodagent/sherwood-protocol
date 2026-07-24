@@ -8,7 +8,7 @@ owner — the strategy itself.
 
 This document serves two audiences:
 
-- **Auditors** — architecture, trust model, storage, authorization, the two-phase settle,
+- **Auditors** — architecture, trust model, storage, authorization, the three-step settle,
   and known risks.
 - **Frontend / backend integrators** — the lifecycle, guardrail actions, state reads,
   events, and errors.
@@ -27,10 +27,10 @@ A single ERC-1167 clone per proposal. It:
 2. Registers a **trade-only** agent L2 key so an off-chain agent can trade the account via
    Lighter's API — the key can place/cancel orders but can **never** move funds out.
 3. Lets the proposer run on-chain **guardrails** (cancel all, market-close a position,
-   rotate the key, queue a withdrawal) at any time between execute and settle.
-4. Unwinds via a **two-phase settle**: `initiateReturn` closes positions and queues the
-   (async, slow) USDG withdrawal; a later `_settle` claims the matured balance and returns
-   it to the vault.
+   rotate the key) at any time between execute and settle.
+4. Unwinds via a **three-step settle**: `initiateReturn()` closes positions,
+   `queueWithdraw(ticks)` queues the (async, slow) USDG drain once the closes have
+   filled, and a later `_settle` claims the matured balance and returns it to the vault.
 
 It is **Lane-B only** — `positions()` is empty (inherited from `BaseStrategy`), so the
 vault never prices an in-flight Lighter position; deposits and redeems settle at the frozen
@@ -42,8 +42,9 @@ per-proposal queue price.
 |---|---|
 | **Custody boundary (D1)** | The Lighter account is owned by the **strategy contract**. Every mutating venue call is authed by `msg.sender` = the account owner. Funds can only leave the account to the account owner (this contract), and this contract only ever pushes USDG to `vault()`. |
 | **Agent key is trade-only** | `changePubKey(acct, apiKeyIndex, pubKey)` registers an L2 key that can place/cancel orders through the API. It **cannot** withdraw — `withdraw` / `withdrawPendingBalance` are venue-authed to the account owner, never the API key. A compromised agent key can churn/lose the position but cannot exfiltrate principal. |
-| **On-chain kill switch** | The proposer can `CANCEL_ALL`, `CLOSE_MARKET`, `WITHDRAW`, or `ROTATE_KEY` at any time via `updateParams`, and `initiateReturn` force-closes every configured market both directions and queues the drain — all without the agent's cooperation. |
+| **On-chain kill switch** | The proposer can `CANCEL_ALL`, `CLOSE_MARKET` or `ROTATE_KEY` at any time via `updateParams`, `initiateReturn()` force-closes every configured market both directions, and `queueWithdraw(ticks)` drains the account — all without the agent's cooperation. |
 | **Value is never self-reported** | `positions()` returns empty; the venue exposes no on-chain mark the PriceRouter can trust for an in-flight perp. The vault reads float only while the proposal is open; realized PnL is the USDG that actually round-trips back at settle. |
+| **Residual trust: `markets` ≠ the agent's reach** | The registered L2 key can trade **any** Lighter market — the venue enforces no per-key whitelist. `markets` is only the list `initiateReturn()` auto-closes, so a position the agent opens outside it is **not** closed by the automatic unwind and its margin stays locked. See "Residual trust" below. |
 
 ## Lifecycle
 
@@ -62,10 +63,21 @@ registerAgentKey()       proposer registers the 40-byte trade-only L2 key
   agent trades via Lighter API (off-chain)  ──  proposer trims risk on-chain
         │                                        via updateParams guardrails
         ▼
-initiateReturn(ticks)    cancel all → both-side market-close every market →
-  (proposer anytime;     queue withdraw(ticks) → record returnsInitiatedAt
-   anyone after          [ticks = observed L2 balance, supplied off-chain]
-   strategyDuration)
+initiateReturn()         cancel all → both-side market-close every market →
+  (proposer anytime;     record returnsInitiatedAt. Queues NOTHING.
+   anyone once
+   strategyDuration
+   has elapsed)
+        │
+        ▼
+  ⏳ closes fill          the closing trades' PnL only exists now — this is why
+                          the drain amount cannot be chosen a step earlier
+        │
+        ▼
+queueWithdraw(ticks)     queue withdraw(ticks) → queuedTicks += ticks
+  (proposer OR           [ticks = observed L2 balance, read off-chain AFTER
+   vault owner)           the closes filled]. Repeatable, and callable in the
+                          Settled state so an under-withdraw is correctable.
         │
         ▼
   ⏳ async maturity       Lighter's sequencer matures the withdrawal into
@@ -73,12 +85,13 @@ initiateReturn(ticks)    cancel all → both-side market-close every market →
         │
         ▼
 settle()                 requires returnsInitiatedAt != 0, a strictly later
-  (onlyVault)            block, and funds present → claim pending → push all
-                        USDG to the vault → governor stamps the Lane-B price
+  (onlyVault)            block, and that everything queued has arrived →
+                        claim pending → push all USDG to the vault →
+                        governor stamps the Lane-B price
         │
         ▼
-recoverResiduals() / sweepToVault()   post-settle recovery of late-maturing
-  (permissionless)                    withdrawals or third-party-claimed dust
+recoverResiduals() / sweepToVault()   recovery of late-maturing withdrawals or
+  (permissionless, any state)         third-party-claimed dust
 ```
 
 ## Configuration (init data)
@@ -90,8 +103,23 @@ recoverResiduals() / sweepToVault()   post-settle recovery of late-maturing
 |---|---|---|
 | `apiKeyPubKey` | length **exactly 40** (`InvalidPubKey`) | Goldilocks-canonical L2 trading key |
 | `apiKeyIndex` | `2..254` (`InvalidApiKeyIndex`) | API key slot (0/1 reserved by the web app, 255 out of range) |
-| `markets` | nonempty (`NoMarkets`), each `≤ 254` (`InvalidMarket`) | perp markets this clone may trade / must close at unwind |
-| `depositAmount` | — | fixed USDG amount, or **`0` = dynamic-all** (pull the vault's full USDG balance at execute) |
+| `markets` | nonempty (`NoMarkets`), at most **16** (`TooManyMarkets`), each `≤ 254` (`InvalidMarket`), no duplicates (`DuplicateMarket`) | perp markets `initiateReturn()` auto-closes. **Not** a venue-enforced trading whitelist — see "Residual trust" |
+| `depositAmount` | `≤ type(uint64).max` (`DepositTooLarge`) | fixed USDG amount, or **`0` = dynamic-all** (pull the vault's full USDG balance at execute) |
+
+`MAX_MARKETS = 16` and the duplicate rejection exist because `initiateReturn()` makes
+**2 venue calls per market in one transaction**. An unbounded or padded list could push
+that past the block gas limit, which would make `returnsInitiatedAt` unreachable and
+therefore `_settle` permanently unreachable — locking vault redemptions.
+
+`depositAmount` is bounded by `type(uint64).max` (checked at init **and** for the
+dynamic-all path at execute) because `IZkLighter.withdraw` takes `uint64` ticks: a larger
+deposit could never be drained in a single request.
+
+The **template** constructor pins `block.chainid` to `4663` (Robinhood mainnet) or
+`9994663` (the fork), reverting `UnsupportedChain` otherwise — the venue and asset
+addresses below are `constant`, so a template deployed on any other chain would point at
+whatever code happens to live at those addresses. ERC-1167 clones skip constructors, so
+this guards the template deploy only, which is exactly the right place.
 
 Venue addresses are `constant` (both chain 4663 mainnet and the 9994663 fork share them,
 since the fork replays mainnet state):
@@ -111,76 +139,180 @@ Proposer-only, `Executed` state only. Encoding: `abi.encode(uint8 action, bytes 
 | `CANCEL_ALL` | 1 | `""` | `cancelAllOrders(acct)` |
 | `CLOSE_MARKET` | 2 | `(uint16 market, uint32 price, uint8 isAsk)` | `createOrder(acct, market, 0, price, isAsk, Market)` — single-side full-position close; side chosen off-chain (cheaper than the both-side close) |
 | `ROTATE_KEY` | 3 | `(bytes newPubKey40)` | update the **stored** key, then `changePubKey` — reverts `InvalidPubKey` if not 40 bytes |
-| `WITHDRAW` | 4 | `(uint64 ticks)` | `withdraw(acct, 3, Perps, ticks)` — queue an async withdrawal (1 USDG = 1e6 ticks) |
+| ~~`WITHDRAW`~~ | ~~4~~ | — | **RETIRED.** Superseded by the top-level `queueWithdraw(ticks)`, which must also work in the `Settled` state and therefore cannot route through `updateParams` (Executed-only). Action `4` now reverts `InvalidAction`; `1`/`2`/`3`/`5` keep their meaning |
 | `REGISTER_KEY` | 5 | `""` | (re)register the stored key — reverts `AccountNotRegistered` before the first deposit |
 
 `baseAmount = 0` on a close order closes the **full** position on whichever side opposes it.
 Any unrecognized action reverts `InvalidAction`.
 
+`CLOSE_MARKET` deliberately does **not** validate `market` against the configured `markets`
+list. That is not an oversight: the agent key can trade any Lighter market, so this is the
+operator's only remedy for a position opened outside the list (see "Residual trust").
+Impact is bounded — `baseAmount = 0` can only *close* a position, never open one.
+
 ## Roles & authorization matrix
 
 `proposer` = the agent that cloned/initialized the strategy (`BaseStrategy._proposer`).
 
-| Function | vault | proposer | anyone | State gate | Auth site |
-|---|:---:|:---:|:---:|---|---|
-| `execute()` / `settle()` | ✅ | | | `onlyVault` + state | `BaseStrategy.sol:88/95` |
-| `registerAgentKey()` | | ✅ | | `onlyProposer`; account must exist | `LighterPerpStrategy.sol:137` |
-| `updateParams(...)` | | ✅ | | `onlyProposer`, `Executed` | `BaseStrategy.sol:102`, `LighterPerpStrategy.sol:150` |
-| `initiateReturn(ticks)` | | ✅ (anytime) | ✅ (after `strategyDuration`) | `Executed`; idempotent | `LighterPerpStrategy.sol:187` |
-| `recoverResiduals()` | | | ✅ | `settled` only | `LighterPerpStrategy.sol:238` |
-| `sweepToVault()` | | | ✅ | `settled` only | `LighterPerpStrategy.sol:248` |
+| Function | vault | proposer | vault owner | anyone | State gate |
+|---|:---:|:---:|:---:|:---:|---|
+| `execute()` / `settle()` | ✅ | | | | `onlyVault` + state |
+| `registerAgentKey()` | | ✅ | | | `onlyProposer`; account must exist |
+| `updateParams(...)` | | ✅ | | | `onlyProposer`, `Executed` |
+| `initiateReturn()` | | ✅ (anytime) | | ✅ (once `strategyDuration` has elapsed) | `Executed` |
+| `queueWithdraw(ticks)` | | ✅ | ✅ | | `Executed` **or** `Settled` |
+| `acknowledgeShortfall()` | | ✅ | ✅ | | any |
+| `recoverResiduals()` | | | | ✅ | any |
+| `sweepToVault()` | | | | ✅ | any |
 
-The permissionless paths are safe because funds only ever flow to `vault()`:
-`initiateReturn`'s drain, `_settle`'s claim+push, and `recoverResiduals`/`sweepToVault`
-all push USDG to the vault; none accept a caller-supplied destination.
+The permissionless paths are safe because funds only ever flow to `vault()`: `_settle`'s
+claim+push and `recoverResiduals`/`sweepToVault` all push USDG to the vault, and none
+accept a caller-supplied destination.
 
-## Two-phase settle (G-H1)
+Three auth details are load-bearing:
+
+- **`queueWithdraw` is NOT permissionless**, even after `strategyDuration`. The amount is
+  un-correctable once the request is queued, so letting an anonymous caller choose it
+  would let them book the entire principal as an LP loss for the price of two
+  transactions. Only the drain *trigger* (`initiateReturn`) is permissionless; the drain
+  *amount* never is.
+- **`initiateReturn()`'s permissionless branch validates the proposal identity, not just
+  the clock.** `getActiveProposal()` returns `0` when nothing is active and
+  `getProposal(0)` returns a **zeroed struct rather than reverting**, so a bare
+  `block.timestamp < p.executedAt + p.strategyDuration` check is fail-**open** for
+  everyone. That state is reachable: every emergency-settle path clears
+  `_activeProposal` while the strategy may still be `Executed`. The gate therefore
+  rejects `pid == 0` and `p.strategy != address(this)` first.
+- **The permissionless branch may only *kick off* the unwind.** The proposer can
+  re-invoke `initiateReturn()` freely (e.g. the agent re-opened after the first close),
+  but a repeat from an anonymous caller reverts `AlreadyInitiated` so a griefer cannot
+  spam venue priority requests block after block. `returnsInitiatedAt` latches on the
+  first call only — re-latching would reset the async-maturity clock and hold `_settle`
+  in `SettleTooSoon` indefinitely.
+
+## Three-step settle (G-H1 + the close/withdraw split)
 
 Lighter withdrawals are **async priority requests**. A `withdraw` only becomes claimable
 once the off-chain sequencer's batch executes — proven to take **minutes to days**, never the
 same block. Settling naively (drain + push in one call) would push ~0 and book a **phantom
 total loss** that a depositor could sandwich (deposit at the deflated NAV, redeem the windfall
-once the late arrival is swept). This mirrors the fix on `HyperliquidPerpStrategy` /
-`HyperliquidGridStrategy`.
+once the late arrival is swept).
 
-**Phase 1 — `initiateReturn(uint64 ticks)`** (`LighterPerpStrategy.sol:187`):
+**Why close and withdraw are separate steps.** Both legs used to live in one
+`initiateReturn(ticks)` call, which meant `ticks` was read off-chain *before* the closing
+trades executed — so it structurally could not include those trades' PnL. Under-stating
+stranded the remainder permanently: `_settle` succeeded on any pending balance, flipped the
+state to `Settled`, and `updateParams` (the only route to `ZK_LIGHTER.withdraw`) is gated on
+`Executed`. `recoverResiduals()` can only *claim* an already-queued pending balance, never
+*queue* a new withdrawal. The two legs are therefore split, and the withdraw leg is
+reachable **after** settlement.
+
+**Step 1 — `initiateReturn()`**:
 - `cancelAllOrders`, then for **every** configured market emit **both** a market SELL-close
   (`price = 1`, `isAsk = 1`) and a market BUY-close (`price = 2^32-1`, `isAsk = 0`). The
   contract can't read a position's sign on-chain, so it closes both directions — the side
   opposing the open position fills, the other no-ops against a flat/absent position.
-- `withdraw(ticks)` if `ticks > 0`. `ticks` is the **observed L2 balance** supplied off-chain
-  from the API (the contract can't read its own L2 balance). A too-large value reverts
-  venue-side; a too-small value leaves residue recoverable via the `WITHDRAW` guardrail +
-  `recoverResiduals`.
-- Records `returnsInitiatedAt = block.number`. Idempotent (a second call is a no-op).
+- Queues **nothing**. Records `returnsInitiatedAt = block.number` on the first call.
 
-**Phase 2 — `_settle()`** (`LighterPerpStrategy.sol:220`), governor-called:
-- Reverts `ReturnsNotInitiated` if phase 1 never ran.
+> **MEV surface.** Those price bounds (`1` for a SELL, `2^32-1` for a BUY) are the widest
+> legal values — i.e. the unwind carries **zero slippage protection**. This is deliberate:
+> an unwind that silently no-fills is strictly worse than a bad fill, because the margin
+> then never leaves the venue and the whole settlement stalls. The cost is that a searcher
+> who can see the pending priority request may fill it at a punitive price. If tighter
+> bounds are wanted for a given position, use `CLOSE_MARKET` (which takes an explicit
+> `price`) *before* `initiateReturn()`; the both-side sweep then no-ops on a flat book.
+
+**Step 2 — `queueWithdraw(uint64 ticks)`**, proposer or vault owner:
+- `withdraw(acct, 3, Perps, ticks)`, accumulating into `queuedTicks`. `ticks` is the
+  **observed L2 balance** read off-chain from the API *after* the closes filled (the
+  contract can't read its own L2 balance). A too-large value reverts venue-side.
+- Repeatable, and callable in **both** `Executed` and `Settled`, so an under-withdraw is
+  always correctable — including after settlement.
+
+**Step 3 — `_settle()`**, governor-called:
+- Reverts `ReturnsNotInitiated` if step 1 never ran.
 - Reverts `SettleTooSoon` unless `block.number > returnsInitiatedAt` (async maturity guard).
-- Reverts `NothingToSettle` if **both** `getPendingBalance` and the strategy's USDG balance
-  are zero — funds are still in flight; do not book a loss.
+- Reverts `NothingQueued` if `queuedTicks == 0` — no drain was ever requested, so settling
+  would book the whole principal as a loss while it still sits on the venue.
+- Reverts `WithdrawalInFlight(queued, accounted)` if
+  `returnedAssets + getPendingBalance() + USDG.balanceOf(this) < queuedTicks` — what was
+  asked for has not fully arrived. This replaces the old
+  `pending == 0 && bal == 0` check, which **anyone could satisfy by donating 1 wei of USDG
+  to the clone**. `returnedAssets` (cumulative pushed-to-vault) keeps the sum monotone, so
+  a permissionless `sweepToVault()` immediately before settle moves value to the vault
+  without ever bricking settlement.
 - Otherwise: claim the matured pending balance (skipped if a third party already claimed it
   here — `withdrawPendingBalance` is permissionless), then push the **entire** USDG balance
   to the vault.
 
+### The settle guard cannot brick the vault
+
+The contract can never *know* the account is empty — it can only verify that what it
+**asked** for has come back. When the venue under-fills (partial batch, forced liquidation,
+a write-off), `accounted` can never reach `queuedTicks` and the guard would hold `_settle`
+shut. Three independent releases exist, in increasing order of cost:
+
+1. **`acknowledgeShortfall()`** — proposer *or* vault owner asserts the shortfall is real.
+   It only relaxes a timing gate: it cannot redirect funds, and anything that matures later
+   is still recoverable via `queueWithdraw` + `recoverResiduals` **after** settle. This is
+   the normal path.
+2. **`SyndicateGovernor.unstick(pid)`** — vault owner runs the pre-committed settlement
+   calls. (Only helps if those calls don't include a reverting `strategy.settle()`.)
+3. **`emergencySettleWithCalls` → `finalizeEmergencySettle`** — the vault owner supplies
+   arbitrary unwind calls; `_finishSettlementHook` completes the proposal in the *governor*
+   whether or not `strategy.settle()` was ever called. This is the structural guarantee: a
+   reverting `_settle` can never permanently lock vault redemptions.
+
+Because (3) resolves a proposal without touching the strategy, `recoverResiduals()` and
+`sweepToVault()` are **not** gated on `settled` — gating them there would strand every
+emergency-settled position. Both are permissionless with a fixed destination (the vault),
+so racing the unwind is harmless.
+
+### Residual trust: `markets` is not a trading whitelist
+
+The registered L2 key can trade **any** Lighter market. The venue enforces no per-key market
+restriction, and the contract has no way to impose one. `markets` is only the list that
+`initiateReturn()` automatically closes.
+
+**Consequence:** if the agent opens a position in a market outside `markets`, the automatic
+unwind never closes it. Its margin stays locked on the venue, so the post-close L2 balance
+is lower than expected and `queueWithdraw` under-fills — the loss shows up as a settlement
+shortfall, not as a revert.
+
+**Operator remedy:** `CLOSE_MARKET` (action `2`) on the unlisted market — this is exactly
+why that action does not validate against `markets` — then `queueWithdraw(ticks)` for the
+freed margin.
+
+**Ordering constraint:** `CLOSE_MARKET` routes through `updateParams`, which is
+`Executed`-only. `queueWithdraw` survives into `Settled`, but *closing* does not. Discover
+and close stray positions **before** settlement; monitoring the account's open positions
+off-chain (they are not readable on-chain) is an operational requirement, not an optional
+extra.
+
 ## The slow-secure-withdraw reality & the LP-lock window
 
 Because the withdrawal leg is asynchronous and slow, the proposal's Lane-B redeem queue does
-**not** settle the instant `initiateReturn` is called. LPs who requested a redeem for this
+**not** settle the instant the unwind starts. LPs who requested a redeem for this
 proposal are paid at the frozen per-proposal price only **after** `_settle` returns the USDG —
 which cannot happen until the sequencer matures the withdrawal (minutes to days). Integrators
 and depositors must expect this **lock window**: an in-flight Lighter proposal ties up
 redeems until maturity + settle, and there is no instant (Lane A) exit for this strategy.
 
 Late-maturing tranches (a `withdraw` that matured after settle, or a partial fill) are
-recovered permissionlessly post-settle:
+recovered post-settle:
 
+- **`queueWithdraw(ticks)`** — proposer/owner queues the residue. Works in the `Settled`
+  state; this is what makes an under-withdraw recoverable rather than terminal.
 - **`recoverResiduals()`** — claims any newly matured pending balance and pushes it to the
   vault. Repeatable.
 - **`sweepToVault()`** — pushes any USDG the contract already holds (e.g. a balance a third
   party claimed here) to the vault. No-op on zero balance.
 
-Both are gated to `settled == true` so they cannot race phase 1.
+The last two are **ungated** (any state, any caller) — see "The settle guard cannot brick
+the vault". Note that value arriving *after* settlement accrues to whoever holds shares at
+that moment, not to the LPs who redeemed at the frozen settle price: recovering residue is
+strictly better than stranding it, but it is not neutral. Queue the true balance before
+settling whenever possible.
 
 ## Lane-B-only rationale
 
@@ -196,14 +328,22 @@ or `availableLiquidity`/`withdrawTo` (inherit the inert no-on-demand-exit defaul
 ## Events & errors
 
 **Events:** `Deposited(amount, accountIndex)`, `AgentKeyRegistered(accountIndex, apiKeyIndex)`,
-`OrdersCancelled(accountIndex)`, `MarketClosed(market, isAsk)`, `WithdrawQueued(ticks)`,
-`ReturnsInitiated(ticks)`, `Settled()`, `FundsSwept(amount)`.
+`OrdersCancelled(accountIndex)`, `MarketClosed(market, isAsk)`,
+`WithdrawQueued(ticks, cumulativeTicks)`, `ReturnsInitiated(address indexed caller)`,
+`ShortfallAcknowledged(address indexed caller)`, `Settled()`, `FundsSwept(amount)`.
 
 **Errors:** `InvalidPubKey`, `InvalidApiKeyIndex`, `NoMarkets`, `InvalidMarket`,
-`DepositTooSmall`, `AccountNotRegistered`, `InvalidAction`, `NotAuthorized`,
-`ReturnsNotInitiated`, `SettleTooSoon`, `NothingToSettle`, `NotSweepable`
+`DuplicateMarket`, `TooManyMarkets`, `DepositTooSmall`, `DepositTooLarge`,
+`AccountNotRegistered`, `InvalidAction`, `NotAuthorized`, `ReturnsNotInitiated`,
+`AlreadyInitiated`, `SettleTooSoon`, `ZeroTicks`, `NothingQueued`,
+`WithdrawalInFlight(queued, accounted)`, `UnsupportedChain`
 (plus `BaseStrategy`'s `NotProposer` / `NotVault` / `NotExecuted` / `AlreadyExecuted` /
 `AlreadyInitialized` / `ZeroAddress`).
+
+`AccountNotRegistered` is raised by a single shared `_acct()` helper that every
+venue-calling path goes through — including `_execute`, which fails the whole deposit
+rather than custodying capital in an account this contract cannot address. Account index
+`0` is a *different* account, not "no account", so no path may pass it through.
 
 ## State reads (frontend data needs)
 
@@ -214,7 +354,13 @@ or `availableLiquidity`/`withdrawTo` (inherit the inert no-on-demand-exit defaul
 | Configured markets | `strategy.markets(i)` |
 | Stored agent key / key slot | `strategy.apiKeyPubKey()` / `strategy.apiKeyIndex()` |
 | Unwind progress | `strategy.returnsInitiatedAt()` (block; 0 = not initiated), `strategy.settled()` |
-| Cumulative post-settle recovery (off-chain accounting) | `strategy.cumulativeSwept()` |
+| Ticks requested from the venue (cumulative) | `strategy.queuedTicks()` |
+| USDG delivered to the vault by this clone (cumulative — settle push **and** every sweep) | `strategy.returnedAssets()` |
+| Shortfall waived by proposer/owner | `strategy.shortfallAcknowledged()` |
+
+`returnedAssets` replaces the old `cumulativeSwept`, which counted only `_sweep()` and
+silently omitted `_settle`'s push — the name over-promised. `returnedAssets` counts every
+push, which is also what makes the settle guard monotone.
 
 ## Fork testing
 
@@ -235,10 +381,13 @@ the `LighterAccountOwner` canary harness (`test/harness/LighterAccountOwner.sol`
 full loop — deposit USDG → contract-owned account **623** → register agent key → trade → force-
 close → withdraw USDG back to the contract. This strategy generalizes that canary into a
 Sherwood strategy template: same custody boundary and on-chain kill switch, wrapped in the
-vault/proposer lifecycle with the two-phase async settle.
+vault/proposer lifecycle with the async settle.
 
 The **full strategy lifecycle** was then proven on the Robinhood-mainnet fork (chain 9994663)
 against real deployed Sherwood core + real ZkLighter: propose → vote → execute (deposited into
-ZkLighter, registered real account **843**) → `registerAgentKey` → `initiateReturn` → two-phase
-settle (USDG round-tripped to the vault, ~0 PnL, proposal Settled). See
-[`lighter-fork-testing.md`](./lighter-fork-testing.md).
+ZkLighter, registered real account **843**) → `registerAgentKey` → `initiateReturn` → settle
+(USDG round-tripped to the vault, ~0 PnL, proposal Settled). That run predates the
+close/withdraw split, so it exercised the old single-call `initiateReturn(ticks)`; the
+withdraw leg is now the separate `queueWithdraw(ticks)` step and the bench in
+[`lighter-fork-testing.md`](./lighter-fork-testing.md) §5 has been updated to match.
+**Re-running §5 against the current API is still outstanding.**

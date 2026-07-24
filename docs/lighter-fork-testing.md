@@ -5,7 +5,8 @@
 > (`0x7ffBd8D5…901AD4`), fund created + 50k USDG deposited, `lighter-perp` clone
 > proposed → voted → executed (**deposited 40k USDG into ZkLighter, registered
 > real account 843**) → `registerAgentKey` → `initiateReturn` (cancel +
-> both-side closes + withdraw enqueued) → two-phase settle (**USDG round-tripped
+> both-side closes + withdraw enqueued — that run predates the C1/C2 split, so
+> the withdraw leg is now the separate `queueWithdraw(ticks)` step) → settle (**USDG round-tripped
 > to the vault, ~0 PnL, proposal Settled**). Withdrawal maturity was simulated by
 > crediting the clone's USDG (the `withdrawPendingBalance` claim itself is
 > covered by unit tests + the real-4663 canary); a faithful
@@ -123,9 +124,16 @@ The end-to-end bench, all against real deployed Sherwood core + real ZkLighter:
 4. `registerAgentKey()`; assert the `changePubKey` priority event.
 5. Exercise guardrails (`CANCEL_ALL`, `CLOSE_MARKET`, `ROTATE_KEY`) — assert
    priority-queue events (no fills on a fork; encoding + auth is what's tested).
-6. `initiateReturn()` → simulate maturity (§2) → settle: the strategy claims,
-   pushes USDG to the vault, governor stamps the Lane-B price, queue claims pay.
-7. Assert G-H1 accounting: PnL == vault USDG delta (fork round-trip is ~0).
+6. `initiateReturn()` — cancel + both-side closes only, nothing queued.
+7. Read the post-close L2 balance from the API, then `queueWithdraw(ticks)`.
+   Assert `queuedTicks()` and that a non-proposer cannot call it.
+8. Simulate maturity (§2) → settle: the strategy claims, pushes USDG to the
+   vault, governor stamps the Lane-B price, queue claims pay. Assert that a
+   settle attempted before maturity reverts `WithdrawalInFlight`.
+9. Assert G-H1 accounting: PnL == vault USDG delta (fork round-trip is ~0).
+10. Under-withdraw regression: repeat with `queueWithdraw(1)`, settle, then
+    prove the residue still drains via `queueWithdraw(rest)` + `recoverResiduals()`
+    **after** the proposal is Settled.
 
 What this bench cannot prove — real fills, funding, API-leg behavior — is
 covered by the rh-testnet API loop and a small-notional 4663 canary at ship
