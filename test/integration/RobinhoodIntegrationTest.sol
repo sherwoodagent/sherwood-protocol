@@ -13,6 +13,7 @@ import {StrategyFactory} from "../../src/StrategyFactory.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {DeploySherwood} from "../../script/Deploy.s.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
+import {GovEnvelope} from "../helpers/GovEnvelope.sol";
 
 // Pinned Robinhood L2 testnet fork block. Chosen AFTER today's V2 redeployment
 // (2026-07-08) — the full core + strategy stack in chains/46630.json has code
@@ -34,7 +35,7 @@ uint256 constant ROBINHOOD_TESTNET_FORK_BLOCK = 88_767_205;
  *         predates the per-vault BeaconProxy governor (singleton
  *         SYNDICATE_GOVERNOR, one-arg registry reviews) — head-compiled tests
  *         can no longer drive it, so the core is deployed fresh on the fork
- *         (mirrors HyperEVMIntegrationTest) until the testnet core is
+ *         until the testnet core is
  *         redeployed post-#421. `governor` is resolved per-vault AFTER
  *         createSyndicate; the live STRATEGY_FACTORY is likewise replaced by a
  *         fresh one because its `_authClone` checks `vaultToSyndicate` on the
@@ -56,7 +57,7 @@ uint256 constant ROBINHOOD_TESTNET_FORK_BLOCK = 88_767_205;
  *             checks are skipped.
  *
  * @dev Env-guarded: skips cleanly when ROBINHOOD_TESTNET_RPC_URL is unset
- *      (mirrors HyperEVMIntegrationTest / RobinhoodMainnetIntegrationTest). Run:
+ *      (mirrors RobinhoodMainnetIntegrationTest). Run:
  *        set -a; source .env; set +a
  *        forge test --match-path \
  *          "test/integration/strategies/PortfolioIntegration.t.sol" -vv
@@ -131,7 +132,7 @@ abstract contract RobinhoodIntegrationTest is Test {
         vm.warp(vm.getBlockTimestamp() + 1);
     }
 
-    // ── Fresh core deployment (mirrors HyperEVMIntegrationTest) ──
+    // ── Fresh core deployment ──
 
     function _deployStack() internal {
         // Non-production WOOD fixture for the V2 owner-bond flow (post-split:
@@ -148,11 +149,10 @@ abstract contract RobinhoodIntegrationTest is Test {
             votingPeriod: 1 days,
             woodToken: address(wood),
             slashAppealSeed: 0,
-            epochZeroSeed: 0,
-            betaMode: false // real GuardianRegistry + sWOOD — owner-bond + review ceremony under test
+            epochZeroSeed: 0
         });
         // deployCore runs nested CREATE3 calls AS the script address; prank as the
-        // script so the Create3Factory owner is consistent (mirrors HyperEVMIntegrationTest).
+        // script so the Create3Factory owner is consistent (shared fork-test convention).
         vm.prank(address(deployScript));
         DeploySherwood.Deployed memory d = deployScript.deployCore(cfg);
 
@@ -251,7 +251,14 @@ abstract contract RobinhoodIntegrationTest is Test {
 
         vm.prank(agent);
         proposalId = governor.propose(
-            address(vault), address(0), "ipfs://rh-testnet-test", duration, execCalls, settleCalls, _emptyCoProposers()
+            address(vault),
+            address(0),
+            "ipfs://rh-testnet-test",
+            duration,
+            GovEnvelope.permissive(address(vault)),
+            execCalls,
+            settleCalls,
+            _emptyCoProposers()
         );
 
         vm.warp(vm.getBlockTimestamp() + 1);

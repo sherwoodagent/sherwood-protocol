@@ -92,9 +92,13 @@ library LeveragedAeroStorage {
         uint256 protocolFeeOwed; // accrued protocol-fee USDC liability (6dp); discharged in redeem/compound/settle
         // ── appended for the L9 compound oracle floor ──
         address aeroUsdFeed; // AERO/USD aggregator (8dp) — floors compound()'s AERO→USDC swap
-        // ── LAST fields: appended for the escrowed async-redeem queue ──
+        // ── appended for the escrowed async-redeem queue ──
         uint256 nextRedeemRequestId; // monotonic id cursor for `redeemRequests`
         mapping(uint256 => RedeemRequest) redeemRequests; // id → escrowed async redeem
+        // ── LAST fields: appended for the Mamo-driven rerange width param (append-only) ──
+        uint24 width; // current full position width (raw ticks, multiple of tickSpacing)
+        uint24 minWidth; // immutable-after-init lower bound on width (≥ 2·tickSpacing)
+        uint24 maxWidth; // immutable-after-init upper bound on width
     }
 
     /// @dev keccak256(abi.encode(uint256(keccak256("leveraged.aero.cl.storage")) - 1)) & ~bytes32(uint256(0xff))

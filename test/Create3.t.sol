@@ -2,7 +2,7 @@
 pragma solidity 0.8.28;
 
 import {Test} from "forge-std/Test.sol";
-import {Create3} from "../src/Create3.sol";
+import {Create3} from "../script/utils/Create3.sol";
 
 /// @notice External wrapper that exposes the internal library so `vm.expectRevert`
 ///         catches reverts that bubble out of assembly / inline CREATE2 paths.

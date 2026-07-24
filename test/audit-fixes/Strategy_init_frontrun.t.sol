@@ -11,8 +11,6 @@ import {PortfolioStrategy} from "../../src/strategies/PortfolioStrategy.sol";
 import {WstETHMoonwellStrategy} from "../../src/strategies/WstETHMoonwellStrategy.sol";
 import {MamoYieldStrategy} from "../../src/strategies/MamoYieldStrategy.sol";
 import {VeniceInferenceStrategy} from "../../src/strategies/VeniceInferenceStrategy.sol";
-import {HyperliquidGridStrategy} from "../../src/strategies/HyperliquidGridStrategy.sol";
-import {HyperliquidPerpStrategy} from "../../src/strategies/HyperliquidPerpStrategy.sol";
 
 /// @title Strategy_init_frontrun — MS-C3 regression
 /// @notice Verifies that every concrete strategy template is *uninitializable*
@@ -246,22 +244,6 @@ contract StrategyInitFrontrunTest is Test {
 
     function test_venice_template_is_locked() public {
         VeniceInferenceStrategy template = new VeniceInferenceStrategy();
-
-        vm.prank(attacker);
-        vm.expectRevert(BaseStrategy.AlreadyInitialized.selector);
-        template.initialize(vault, proposer, "");
-    }
-
-    function test_hlGrid_template_is_locked() public {
-        HyperliquidGridStrategy template = new HyperliquidGridStrategy();
-
-        vm.prank(attacker);
-        vm.expectRevert(BaseStrategy.AlreadyInitialized.selector);
-        template.initialize(vault, proposer, "");
-    }
-
-    function test_hlPerp_template_is_locked() public {
-        HyperliquidPerpStrategy template = new HyperliquidPerpStrategy();
 
         vm.prank(attacker);
         vm.expectRevert(BaseStrategy.AlreadyInitialized.selector);

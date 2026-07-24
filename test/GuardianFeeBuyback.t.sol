@@ -16,6 +16,7 @@ import {MockRegistryMinimal} from "./mocks/MockRegistryMinimal.sol";
 import {RegistryTestHarness} from "./helpers/RegistryTestHarness.sol";
 import {ProtocolConfig} from "../src/ProtocolConfig.sol";
 import {IProtocolConfig} from "../src/interfaces/IProtocolConfig.sol";
+import {GovEnvelope} from "./helpers/GovEnvelope.sol";
 
 /// @title GuardianFeeBuyback (governor-level)
 /// @notice Covers the buyback-WOOD redesign: the guardian-fee slice now routes
@@ -141,6 +142,7 @@ contract GuardianFeeBuybackTest is Test {
             address(0),
             "ipfs://test",
             duration,
+            GovEnvelope.permissive(address(vault)),
             _noopCalls(),
             _noopCalls(),
             new ISyndicateGovernor.CoProposer[](0)

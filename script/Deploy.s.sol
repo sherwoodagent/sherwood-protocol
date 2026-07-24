@@ -5,14 +5,14 @@ import {console} from "forge-std/Script.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
-import {Create3Factory} from "../src/Create3Factory.sol";
+import {Create3Factory} from "./utils/Create3Factory.sol";
 import {SyndicateVault} from "../src/SyndicateVault.sol";
 import {BatchExecutorLib} from "../src/BatchExecutorLib.sol";
 import {SyndicateFactory} from "../src/SyndicateFactory.sol";
 import {SyndicateGovernor} from "../src/SyndicateGovernor.sol";
 import {GuardianRegistry} from "../src/GuardianRegistry.sol";
+import {TierRegistry} from "../src/TierRegistry.sol";
 import {StakedWood} from "../src/StakedWood.sol";
-import {MinimalGuardianRegistry} from "../src/MinimalGuardianRegistry.sol";
 import {ISyndicateGovernor} from "../src/interfaces/ISyndicateGovernor.sol";
 import {ProtocolConfig} from "../src/ProtocolConfig.sol";
 import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
@@ -116,9 +116,6 @@ contract DeploySherwood is ScriptBase {
         address woodToken;
         uint256 slashAppealSeed;
         uint256 epochZeroSeed;
-        // Beta mode: stub guardian registry, no WOOD, no multisig handoff,
-        // 1h votingPeriod default. Toggled via the BETA_MODE env.
-        bool betaMode;
     }
 
     struct Deployed {
@@ -130,31 +127,26 @@ contract DeploySherwood is ScriptBase {
         address factoryProxy;
         address registryProxy;
         address swoodProxy;
+        address tierRegistry; // adapter-selector tier certification (spec §3.2)
     }
 
     function run() external virtual {
-        bool betaMode = vm.envOr("BETA_MODE", false);
         Config memory cfg = Config({
             ensRegistrar: vm.envOr("ENS_REGISTRAR", address(0)),
             agentRegistry: vm.envOr("AGENT_REGISTRY", address(0)),
             managementFeeBps: vm.envOr("MANAGEMENT_FEE", uint256(50)),
             protocolFeeBps: vm.envOr("PROTOCOL_FEE", uint256(100)),
             maxStrategyDays: vm.envOr("MAX_STRATEGY_DAYS", uint256(14)),
-            votingPeriod: vm.envOr("VOTING_PERIOD", betaMode ? uint256(1 hours) : uint256(1 days)),
-            // WOOD_TOKEN is required for prod (full GuardianRegistry).
-            // Beta mode uses a stub registry (no WOOD), so WOOD_TOKEN is ignored.
+            votingPeriod: vm.envOr("VOTING_PERIOD", uint256(1 days)),
+            // WOOD_TOKEN is required — the full GuardianRegistry stakes it.
             woodToken: vm.envOr("WOOD_TOKEN", _tryReadAddress("WOOD_TOKEN")),
             slashAppealSeed: vm.envOr("SLASH_APPEAL_SEED", DEFAULT_SLASH_APPEAL_SEED),
-            epochZeroSeed: vm.envOr("EPOCH_ZERO_SEED", DEFAULT_EPOCH_ZERO_SEED),
-            betaMode: betaMode
+            epochZeroSeed: vm.envOr("EPOCH_ZERO_SEED", DEFAULT_EPOCH_ZERO_SEED)
         });
-        if (!cfg.betaMode) {
-            require(cfg.woodToken != address(0), "WOOD_TOKEN not set (env or chains.json)");
-        }
+        require(cfg.woodToken != address(0), "WOOD_TOKEN not set (env or chains.json)");
 
-        // Multisig handoff is mandatory in prod. Beta mode keeps the deployer
-        // as protocol owner because the multisig is not yet stood up.
-        bool skipHandoff = cfg.betaMode || vm.envOr("SKIP_MULTISIG_HANDOFF", false);
+        // Multisig handoff is mandatory in prod.
+        bool skipHandoff = vm.envOr("SKIP_MULTISIG_HANDOFF", false);
         address ownerMultisig = vm.envOr("OWNER_MULTISIG", address(0));
         if (!skipHandoff) {
             require(ownerMultisig != address(0), "OWNER_MULTISIG required (or set SKIP_MULTISIG_HANDOFF=true)");
@@ -170,20 +162,23 @@ contract DeploySherwood is ScriptBase {
         console.log("GovernorBeacon:", d.beacon);
         console.log("GuardianRegistryProxy:", d.registryProxy);
         console.log("FactoryProxy:", d.factoryProxy);
+        console.log("TierRegistry:", d.tierRegistry);
 
-        // Seed slash appeal reserve + epoch 0 rewards (prod only — beta uses a
-        // stub registry with no `fundSlashAppealReserve`). Best-effort: skipped
+        // Seed slash appeal reserve + epoch 0 rewards. Best-effort: skipped
         // on zero amounts. MUST run before the multisig handoff while the
         // deployer is still the owner.
-        if (!cfg.betaMode) {
-            _seedRegistry(d.deployer, d.registryProxy, cfg);
-        }
+        _seedRegistry(d.deployer, d.registryProxy, cfg);
 
         // Multisig handoff: prod hands all proxies to the multisig.
-        // Beta keeps the deployer as protocol owner (no multisig yet).
         address effectiveOwner = d.deployer;
         if (!skipHandoff) {
             _handoffOwnership(d.beacon, d.factoryProxy, d.registryProxy, d.swoodProxy, d.protocolConfig, ownerMultisig);
+            // TierRegistry is Ownable2Step (like ProtocolConfig): transferOwnership
+            // starts a two-step transfer — the multisig MUST call acceptOwnership()
+            // to complete it. Kept out of `_handoffOwnership` so that helper's
+            // signature (asserted by Deploy_multisigHandoff.t.sol) stays fixed.
+            Ownable2Step(d.tierRegistry).transferOwnership(ownerMultisig);
+            console.log("TierRegistry pending -> multisig; RUNBOOK: multisig must call acceptOwnership()");
             effectiveOwner = ownerMultisig;
         }
 
@@ -208,9 +203,7 @@ contract DeploySherwood is ScriptBase {
             cfg.agentRegistry,
             cfg.managementFeeBps
         );
-        if (!cfg.betaMode) {
-            _validateRegistry(effectiveOwner, d.registryProxy, d.factoryProxy, cfg.woodToken);
-        }
+        _validateRegistry(effectiveOwner, d.registryProxy, d.factoryProxy, cfg.woodToken);
 
         // ── Persist ──
         // Per-vault governor: there is NO singleton governor — zero the
@@ -221,17 +214,13 @@ contract DeploySherwood is ScriptBase {
         _patchAddress("GOVERNOR_BEACON", d.beacon);
         _patchAddress("PROTOCOL_CONFIG", d.protocolConfig);
         _patchAddress("GUARDIAN_REGISTRY", d.registryProxy);
+        _patchAddress("TIER_REGISTRY", d.tierRegistry);
         // sWOOD is the sole WOOD custodian — persist it for the CLI / admin
-        // scripts. Beta mode uses a stub registry and never deploys sWOOD, so
-        // the proxy stays address(0) there.
-        if (d.swoodProxy != address(0)) {
-            _patchAddress("STAKED_WOOD", d.swoodProxy);
-        }
+        // scripts.
+        _patchAddress("STAKED_WOOD", d.swoodProxy);
         // Persist WOOD — Deploy only reads it as an input, so without this it
-        // never lands in chains.json (audit gap). Beta mode has no WOOD.
-        if (cfg.woodToken != address(0)) {
-            _patchAddress("WOOD_TOKEN", cfg.woodToken);
-        }
+        // never lands in chains.json (audit gap).
+        _patchAddress("WOOD_TOKEN", cfg.woodToken);
 
         console.log("\nDeployment complete on %s (chain %s)", _chainName(), block.chainid);
         console.log("Next: forge script script/DeployTemplates.s.sol --rpc-url <chain> --broadcast");
@@ -242,8 +231,8 @@ contract DeploySherwood is ScriptBase {
     ///           - call `vm.startBroadcast()` / `vm.stopBroadcast()` (caller's responsibility)
     ///           - persist addresses to chains/{chainId}.json
     ///           - validate (callers can if they want)
-    /// @dev Used by `HyperEVMIntegrationTest.setUp()` to deploy on a fork without
-    ///      writing to disk. Production deploys keep using `run()`.
+    /// @dev Used by fork integration tests to deploy without writing to disk.
+    ///      Production deploys keep using `run()`.
     function deployCore(Config memory cfg) public returns (Deployed memory d) {
         d.deployer = msg.sender;
 
@@ -252,14 +241,7 @@ contract DeploySherwood is ScriptBase {
         d.executorLib = c3.deploy(SALT_EXECUTOR, abi.encodePacked(type(BatchExecutorLib).creationCode));
         d.vaultImpl = c3.deploy(SALT_VAULT_IMPL, abi.encodePacked(type(SyndicateVault).creationCode));
 
-        address registryAddr;
-        if (cfg.betaMode) {
-            // Beta: stub registry, no proxy, no WOOD. Deployed BEFORE governor
-            // so we can pass it directly into governor init.
-            registryAddr = address(new MinimalGuardianRegistry());
-        } else {
-            registryAddr = c3.addressOf(SALT_REGISTRY_PROXY);
-        }
+        address registryAddr = c3.addressOf(SALT_REGISTRY_PROXY);
 
         address predictedFactoryProxy = c3.addressOf(SALT_FACTORY_PROXY);
 
@@ -282,29 +264,34 @@ contract DeploySherwood is ScriptBase {
             )
         );
         d.beacon = address(new GovernorBeacon(govImpl, d.deployer));
-        if (!cfg.betaMode) {
-            // sWOOD is the sole WOOD custodian: deploy it before the registry
-            // so the registry's `initialize` can take the sWOOD address. The
-            // registry↔sWOOD circular dependency is resolved by the set-once
-            // `setRegistry` call below (deploy order: sWOOD → registry → wire).
-            d.swoodProxy = _deploySwoodProxy(c3, d.deployer, predictedFactoryProxy, cfg);
+        // sWOOD is the sole WOOD custodian: deploy it before the registry
+        // so the registry's `initialize` can take the sWOOD address. The
+        // registry↔sWOOD circular dependency is resolved by the set-once
+        // `setRegistry` call below (deploy order: sWOOD → registry → wire).
+        d.swoodProxy = _deploySwoodProxy(c3, d.deployer, predictedFactoryProxy, cfg);
 
-            address registryImpl = c3.deploy(
-                SALT_REGISTRY_IMPL,
-                abi.encodePacked(type(GuardianRegistry).creationCode, abi.encode(DEFAULT_MIN_REVIEW_PERIOD))
-            );
-            d.registryProxy = _deployRegistryProxy(c3, registryImpl, d.deployer, predictedFactoryProxy, d.swoodProxy);
-            require(d.registryProxy == registryAddr, "registry addr mismatch");
+        address registryImpl = c3.deploy(
+            SALT_REGISTRY_IMPL,
+            abi.encodePacked(type(GuardianRegistry).creationCode, abi.encode(DEFAULT_MIN_REVIEW_PERIOD))
+        );
+        d.registryProxy = _deployRegistryProxy(c3, registryImpl, d.deployer, predictedFactoryProxy, d.swoodProxy);
+        require(d.registryProxy == registryAddr, "registry addr mismatch");
 
-            // Wire the set-once registry reference on sWOOD.
-            StakedWood(d.swoodProxy).setRegistry(d.registryProxy);
-        } else {
-            d.registryProxy = registryAddr;
-        }
+        // Wire the set-once registry reference on sWOOD.
+        StakedWood(d.swoodProxy).setRegistry(d.registryProxy);
 
         address factoryImpl = c3.deploy(SALT_FACTORY_IMPL, abi.encodePacked(type(SyndicateFactory).creationCode));
         d.factoryProxy = _deployFactoryProxy(c3, factoryImpl, d, cfg);
         require(d.factoryProxy == predictedFactoryProxy, "factory addr mismatch");
+
+        // Adapter-selector tier registry (spec §3.2). Owned by the deployer at
+        // birth so `certify`/`demote` listing can run before the multisig
+        // handoff; wired into the factory now (deployer still owns it) so every
+        // governor `createSyndicate` stamps out picks it up via the
+        // factory-only `setTierRegistry`. A plain Ownable2Step contract — no
+        // proxy needed (certifications are re-issuable, not upgrade-state).
+        d.tierRegistry = address(new TierRegistry(d.deployer));
+        SyndicateFactory(d.factoryProxy).setTierRegistry(d.tierRegistry);
     }
 
     /// @dev Deploys the StakedWood (sWOOD) proxy via CREATE3. The governor +
@@ -513,8 +500,6 @@ contract DeploySherwood is ScriptBase {
     function _chainName() internal view returns (string memory) {
         if (block.chainid == 8453) return "Base";
         if (block.chainid == 84532) return "Base Sepolia";
-        if (block.chainid == 999) return "HyperEVM";
-        if (block.chainid == 998) return "HyperEVM Testnet";
         if (block.chainid == 46630) return "Robinhood L2 Testnet";
         if (block.chainid == 42161) return "Arbitrum";
         return "Unknown";

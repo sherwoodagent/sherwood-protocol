@@ -165,11 +165,21 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     /// @notice Maximum management fee a vault owner may charge (5% of post-strategy net).
     uint256 public constant MAX_MANAGEMENT_FEE_BPS = 500;
 
+    /// @notice Adapter-selector tier registry (guardian economic-security model,
+    ///         spec 2026-07-22 §3.2). Optional — `address(0)` means governors
+    ///         created by this factory keep the safe tier-2 default (full-notional
+    ///         coverage). Set post-deploy by the owner via `setTierRegistry`, then
+    ///         pushed into each per-vault governor at `createSyndicate`.
+    /// @dev Appended before `__gap` (gap shrunk 46 → 45) — upgrade-safe: existing
+    ///      slots are untouched, this var claims the first reserved slot.
+    address public tierRegistry;
+
     /// @dev Reserved for future storage. Per-vault-governor refactor: replaced
     ///      the single `governor` slot (1) with `beacon` (1) + `protocolConfig`
     ///      (1) + `_governorOf` mapping (1) = net +2 slots, so the gap drops
-    ///      50 → 48 → 46 across this and prior reductions.
-    uint256[46] private __gap;
+    ///      50 → 48 → 46 across this and prior reductions; then 46 → 45 for
+    ///      `tierRegistry` (Task 7).
+    uint256[45] private __gap;
 
     // ── Events ──
 
@@ -192,6 +202,7 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     ///         retry by calling the registrar directly.
     event EnsRegistrationFailed(address indexed vault, string subdomain);
     event GuardianRegistrySet(address indexed oldRegistry, address indexed newRegistry);
+    event TierRegistrySet(address indexed oldRegistry, address indexed newRegistry);
     event GovernorDeployed(address indexed vault, address indexed governor);
     event BeaconUpdated(address indexed oldBeacon, address indexed newBeacon);
     event ProtocolConfigUpdated(address indexed oldConfig, address indexed newConfig);
@@ -318,6 +329,13 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         address govProxy = address(new BeaconProxy(beacon, govInitData));
         _governorOf[vault] = govProxy;
         IGuardianRegistry(guardianRegistry).addGovernor(govProxy);
+        // Push the adapter-selector tier registry into the fresh governor
+        // (spec §3.2). `setTierRegistry` is onlyFactory, so this is the sole
+        // wiring point. When `tierRegistry` is unset the governor keeps its
+        // safe tier-2 default — skip the call rather than write address(0).
+        if (tierRegistry != address(0)) {
+            ISyndicateGovernor(govProxy).setTierRegistry(tierRegistry);
+        }
         emit GovernorDeployed(vault, govProxy);
 
         // Bind the prepared owner stake to the newly deployed vault (Task 26).
@@ -543,6 +561,19 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         address old = guardianRegistry;
         guardianRegistry = newRegistry;
         emit GuardianRegistrySet(old, newRegistry);
+    }
+
+    /// @notice Set the adapter-selector tier registry pushed into governors at
+    ///         `createSyndicate` (spec §3.2). `address(0)` is tolerated — it
+    ///         disables tier pricing for governors created afterward (they keep
+    ///         the safe tier-2 full-notional default). Only affects governors
+    ///         created AFTER this call; existing per-vault governors are rewired
+    ///         individually via `SyndicateGovernor.setTierRegistry` (onlyFactory)
+    ///         if needed.
+    function setTierRegistry(address newRegistry) external onlyOwner {
+        address old = tierRegistry;
+        tierRegistry = newRegistry;
+        emit TierRegistrySet(old, newRegistry);
     }
 
     /// @notice Transfer a vault's ownership to `newOwner` and rebind the owner-stake

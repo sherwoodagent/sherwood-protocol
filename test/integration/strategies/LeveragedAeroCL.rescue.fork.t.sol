@@ -124,6 +124,9 @@ contract LeveragedAeroCLRescueFork is LeveragedAeroForkBase {
             calmDeviationTicks: 500,
             twapWindow: 1800,
             tickSpacing: BaseAddresses.CBBTC_WETH_TICK_SPACING,
+            width: 4000, // full width (raw ticks) = 40·tickSpacing (preserves the pre-param 20-spacing/side range)
+            minWidth: 200, // 2·tickSpacing
+            maxWidth: 20000,
             targetLtvBps: TARGET_LTV_BPS,
             maxLtvBps: MAX_LTV_BPS,
             minHealthBps: MIN_HEALTH_BPS,

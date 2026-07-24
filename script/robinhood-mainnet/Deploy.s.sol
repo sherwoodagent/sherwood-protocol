@@ -80,8 +80,7 @@ contract DeployRobinhoodMainnet is DeploySherwood {
             votingPeriod: VOTING_PERIOD,
             woodToken: woodToken,
             slashAppealSeed: 0,
-            epochZeroSeed: 0,
-            betaMode: false
+            epochZeroSeed: 0
         });
 
         vm.startBroadcast();

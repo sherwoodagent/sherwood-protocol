@@ -3,7 +3,7 @@ pragma solidity 0.8.28;
 
 import {console} from "forge-std/Script.sol";
 import {ScriptBase} from "../ScriptBase.sol";
-import {SynthraQuoterV2Shim} from "../../src/adapters/SynthraQuoterV2Shim.sol";
+import {SynthraQuoterV2Shim} from "./SynthraQuoterV2Shim.sol";
 import {UniswapSwapAdapter} from "../../src/adapters/UniswapSwapAdapter.sol";
 
 /**

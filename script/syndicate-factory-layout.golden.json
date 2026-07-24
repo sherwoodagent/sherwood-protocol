@@ -1,0 +1,128 @@
+[
+  {
+    "label": "executorImpl",
+    "slot": "0",
+    "offset": 0,
+    "type": "t_address"
+  },
+  {
+    "label": "vaultImpl",
+    "slot": "1",
+    "offset": 0,
+    "type": "t_address"
+  },
+  {
+    "label": "ensRegistrar",
+    "slot": "2",
+    "offset": 0,
+    "type": "t_contract(IL2Registrar)"
+  },
+  {
+    "label": "agentRegistry",
+    "slot": "3",
+    "offset": 0,
+    "type": "t_contract(IERC721)"
+  },
+  {
+    "label": "beacon",
+    "slot": "4",
+    "offset": 0,
+    "type": "t_address"
+  },
+  {
+    "label": "protocolConfig",
+    "slot": "5",
+    "offset": 0,
+    "type": "t_address"
+  },
+  {
+    "label": "_governorOf",
+    "slot": "6",
+    "offset": 0,
+    "type": "t_mapping(t_address,t_address)"
+  },
+  {
+    "label": "priceRouter",
+    "slot": "7",
+    "offset": 0,
+    "type": "t_address"
+  },
+  {
+    "label": "managementFeeBps",
+    "slot": "8",
+    "offset": 0,
+    "type": "t_uint256"
+  },
+  {
+    "label": "syndicates",
+    "slot": "9",
+    "offset": 0,
+    "type": "t_mapping(t_uint256,t_struct(Syndicate)_storage)"
+  },
+  {
+    "label": "syndicateCount",
+    "slot": "10",
+    "offset": 0,
+    "type": "t_uint256"
+  },
+  {
+    "label": "vaultToSyndicate",
+    "slot": "11",
+    "offset": 0,
+    "type": "t_mapping(t_address,t_uint256)"
+  },
+  {
+    "label": "subdomainToSyndicate",
+    "slot": "12",
+    "offset": 0,
+    "type": "t_mapping(t_string_memory_ptr,t_uint256)"
+  },
+  {
+    "label": "creationFeeToken",
+    "slot": "13",
+    "offset": 0,
+    "type": "t_contract(IERC20)"
+  },
+  {
+    "label": "creationFee",
+    "slot": "14",
+    "offset": 0,
+    "type": "t_uint256"
+  },
+  {
+    "label": "creationFeeRecipient",
+    "slot": "15",
+    "offset": 0,
+    "type": "t_address"
+  },
+  {
+    "label": "upgradesEnabled",
+    "slot": "15",
+    "offset": 20,
+    "type": "t_bool"
+  },
+  {
+    "label": "guardianRegistry",
+    "slot": "16",
+    "offset": 0,
+    "type": "t_address"
+  },
+  {
+    "label": "_activeSyndicateIds",
+    "slot": "17",
+    "offset": 0,
+    "type": "t_struct(UintSet)_storage"
+  },
+  {
+    "label": "tierRegistry",
+    "slot": "19",
+    "offset": 0,
+    "type": "t_address"
+  },
+  {
+    "label": "__gap",
+    "slot": "20",
+    "offset": 0,
+    "type": "t_array(t_uint256)_storage"
+  }
+]

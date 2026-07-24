@@ -8,8 +8,12 @@ import {SyndicateGovernor} from "../../src/SyndicateGovernor.sol";
 import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 import {SyndicateVault} from "../../src/SyndicateVault.sol";
 import {SyndicateFactory} from "../../src/SyndicateFactory.sol";
+import {GuardianRegistry} from "../../src/GuardianRegistry.sol";
+import {StakedWood} from "../../src/StakedWood.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {DeploySherwood} from "../../script/Deploy.s.sol";
+import {ERC20Mock} from "../mocks/ERC20Mock.sol";
+import {GovEnvelope} from "../helpers/GovEnvelope.sol";
 
 /**
  * @title BaseIntegrationTest
@@ -22,7 +26,7 @@ import {DeploySherwood} from "../../script/Deploy.s.sol";
  *      from chains/8453.json. That production deployment predates the per-vault
  *      BeaconProxy governor (singleton SYNDICATE_GOVERNOR, no `setAgentFeeBps`,
  *      one-arg registry reviews) — head-compiled tests can no longer drive it.
- *      Deploying fresh mirrors HyperEVMIntegrationTest / LeveragedAeroCL.e2e.fork;
+ *      Deploying fresh mirrors LeveragedAeroCL.e2e.fork;
  *      `governor` is resolved per-vault AFTER createSyndicate (there is no
  *      singleton). This harness must track the live deploy + factory wiring
  *      (CLAUDE.md MockRegistryMinimal lesson).
@@ -66,6 +70,8 @@ abstract contract BaseIntegrationTest is Test {
     SyndicateGovernor governor;
     SyndicateFactory factory;
     SyndicateVault vault;
+    GuardianRegistry registry;
+    StakedWood swood;
     address deployer;
     uint256 agentNftId = 42;
 
@@ -84,6 +90,9 @@ abstract contract BaseIntegrationTest is Test {
         // Fresh post-#421 core on the fork (see the contract-level natspec).
         _deployStack();
 
+        // V2 owner-bond flow: owner must stake WOOD in sWOOD before creating a vault.
+        _bondOwnerStake();
+
         // Create a test syndicate (vault + agent registration)
         _createTestSyndicate();
 
@@ -94,9 +103,13 @@ abstract contract BaseIntegrationTest is Test {
         vm.warp(block.timestamp + 1);
     }
 
-    // ── Fresh core deployment (mirrors LeveragedAeroCL.e2e.fork / HyperEVMIntegrationTest) ──
+    // ── Fresh core deployment (mirrors LeveragedAeroCL.e2e.fork) ──
 
     function _deployStack() internal {
+        // Non-production WOOD fixture for the V2 owner-bond flow (owner staking
+        // lives in sWOOD; mirrors RobinhoodIntegrationTest).
+        ERC20Mock wood = new ERC20Mock("Wood", "WOOD", 18);
+
         DeploySherwood deployScript = new DeploySherwood();
         DeploySherwood.Config memory cfg = DeploySherwood.Config({
             ensRegistrar: address(0), // ENS identity is not under test here
@@ -105,20 +118,36 @@ abstract contract BaseIntegrationTest is Test {
             protocolFeeBps: 0, // keep settle PnL math clean (e2e convention)
             maxStrategyDays: 30,
             votingPeriod: 1 hours,
-            woodToken: address(0), // beta: no WOOD
+            woodToken: address(wood),
             slashAppealSeed: 0,
-            epochZeroSeed: 0,
-            betaMode: true // MinimalGuardianRegistry — cold-start auto-pass, no owner stake
+            epochZeroSeed: 0
         });
         // deployCore runs nested CREATE3 calls AS the script address; prank as the
-        // script so the Create3Factory owner is consistent (mirrors HyperEVMIntegrationTest).
+        // script so the Create3Factory owner is consistent (shared fork-test convention).
         vm.prank(address(deployScript));
         DeploySherwood.Deployed memory d = deployScript.deployCore(cfg);
 
         // Per-vault governors (#421): no singleton governor exists at deploy.
         // `governor` is resolved from the vault after createSyndicate below.
         factory = SyndicateFactory(d.factoryProxy);
+        registry = GuardianRegistry(d.registryProxy);
+        swood = StakedWood(d.swoodProxy);
         deployer = d.deployer; // address(deployScript) — owner of factory/registry
+    }
+
+    // ── V2 owner-bond flow: mint fixture WOOD → prepareOwnerStake ──
+
+    function _bondOwnerStake() internal {
+        uint256 minStake = swood.minOwnerStake();
+        ERC20Mock wood = ERC20Mock(address(swood.wood()));
+        wood.mint(owner, minStake);
+
+        vm.startPrank(owner);
+        wood.approve(address(swood), minStake);
+        swood.prepareOwnerStake(minStake);
+        vm.stopPrank();
+
+        assertTrue(swood.canCreateVault(owner), "owner not eligible to create vault after prepareOwnerStake");
     }
 
     // ── Test syndicate creation ──
@@ -193,7 +222,14 @@ abstract contract BaseIntegrationTest is Test {
         // Agent proposes
         vm.prank(agent);
         proposalId = governor.propose(
-            address(vault), address(0), "ipfs://test", duration, execCalls, settleCalls, _emptyCoProposers()
+            address(vault),
+            address(0),
+            "ipfs://test",
+            duration,
+            GovEnvelope.permissive(address(vault)),
+            execCalls,
+            settleCalls,
+            _emptyCoProposers()
         );
 
         // Warp 1 second so snapshot timestamp is in the past
@@ -208,6 +244,13 @@ abstract contract BaseIntegrationTest is Test {
         // Warp past voting period
         ISyndicateGovernor.GovernorParams memory params = governor.getGovernorParams();
         vm.warp(block.timestamp + params.votingPeriod + 1);
+
+        // Guardian review (cold-start): no guardians are staked on the fresh
+        // deployment, so `resolveReview` short-circuits via the cohort-too-small
+        // path and the proposal executes without a block.
+        registry.openReview(address(governor), proposalId);
+        vm.warp(block.timestamp + registry.reviewPeriod() + 1);
+        registry.resolveReview(address(governor), proposalId);
 
         // Execute
         governor.executeProposal(proposalId);

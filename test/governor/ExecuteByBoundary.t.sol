@@ -12,6 +12,7 @@ import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
+import {GovEnvelope} from "../helpers/GovEnvelope.sol";
 
 /// @notice G-H5 boundary regression. `executeBy` is the INCLUSIVE last timestamp
 ///         at which `executeProposal` may land; one second later the proposal
@@ -125,6 +126,7 @@ contract ExecuteByBoundaryTest is Test {
             address(0),
             "ipfs://boundary",
             7 days,
+            GovEnvelope.permissive(address(vault)),
             _execCalls(),
             _settleCalls(),
             new ISyndicateGovernor.CoProposer[](0)

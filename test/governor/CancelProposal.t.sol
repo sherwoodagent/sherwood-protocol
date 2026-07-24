@@ -13,6 +13,7 @@ import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
+import {GovEnvelope} from "../helpers/GovEnvelope.sol";
 
 /// @title CancelProposal — regression suite for proposer cancel branches
 /// @notice Covers the V1.5 extension that lets the proposer cancel during
@@ -142,7 +143,14 @@ contract CancelProposalTest is Test {
     function _propose() internal returns (uint256 pid) {
         vm.prank(agent);
         pid = governor.propose(
-            address(vault), address(0), "ipfs://test", 7 days, _execCalls(), _settleCalls(), _emptyCoProposers()
+            address(vault),
+            address(0),
+            "ipfs://test",
+            7 days,
+            GovEnvelope.permissive(address(vault)),
+            _execCalls(),
+            _settleCalls(),
+            _emptyCoProposers()
         );
         vm.warp(vm.getBlockTimestamp() + 1);
     }
@@ -207,7 +215,14 @@ contract CancelProposalTest is Test {
 
         vm.prank(agent);
         uint256 pid2 = governor.propose(
-            address(vault), address(0), "ipfs://retry", 7 days, _execCalls(), _settleCalls(), _emptyCoProposers()
+            address(vault),
+            address(0),
+            "ipfs://retry",
+            7 days,
+            GovEnvelope.permissive(address(vault)),
+            _execCalls(),
+            _settleCalls(),
+            _emptyCoProposers()
         );
         assertGt(pid2, pid);
     }
