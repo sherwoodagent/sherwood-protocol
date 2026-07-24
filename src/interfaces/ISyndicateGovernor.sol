@@ -230,6 +230,14 @@ interface ISyndicateGovernor {
     ///         Without this, a proposer declares maxCapital = uint256.max and
     ///         the net-outflow cap never binds (finding 3).
     error MaxCapitalExceedsCeiling();
+    /// @notice `reclaimProposerBond` called while the proposal can still reach
+    ///         execution. The bond is only returned from a TERMINAL state
+    ///         (Rejected / Expired / Cancelled / Settled) — spec §3.9.
+    error ProposalNotTerminal();
+    /// @notice `reclaimProposerBond` called for a proposal that never locked a
+    ///         bond, or whose bond was already reclaimed (the reclaim zeroes
+    ///         the stored amount, so a second call lands here — idempotence).
+    error NoBondToReclaim();
     /// @notice `setMaxCapitalBps` called with 0 or a value above 10_000.
     error InvalidMaxCapitalBps();
     /// @notice Revert if `envelope.maxDrawdownBps > 10_000` at propose — a
@@ -487,6 +495,16 @@ interface ISyndicateGovernor {
     ///      (`StrategyProposal.proposerBondEscrow`), so re-pointing is safe for
     ///      existing proposals; a new escrow applies only to future ones.
     function setBondEscrow(address newEscrow) external;
+
+    /// @notice Permissionless: return the proposer bond once the proposal has
+    ///         reached a terminal state (spec §3.9).
+    /// @dev Rejection, expiry, and cancellation all RETURN the bond —
+    ///      forfeiture is exclusively a passed-challenge outcome (Plan C); a
+    ///      guardian block is not a conviction. Safe to leave permissionless:
+    ///      the escrow pays only the proposer it recorded at lock time, so a
+    ///      third-party caller can accelerate the refund but never redirect it.
+    ///      Idempotent — a second call reverts `NoBondToReclaim`.
+    function reclaimProposerBond(uint256 proposalId) external;
 
     // ── Init ──
     /// @notice Initialize a freshly deployed per-vault governor proxy.

@@ -24,6 +24,33 @@ contract MockSwood {
     mapping(address => uint256) public delegatedInbound;
     uint256 public maxDelegatedSlashBps = 2000;
     uint256 public coolDownPeriod = 45 days;
+
+    function setStake(address g, uint256 own, uint256 inbound) external {
+        guardianStake[g] = own;
+        delegatedInbound[g] = inbound;
+    }
+}
+
+/// @dev Approver source for the approve-quorum check (spec §3.3a). The ledger
+///      reads `getApproverWeights` off its configured guardian registry; only
+///      the address list matters here — the ledger re-reads each approver's
+///      bond LIVE from sWOOD rather than trusting the recorded vote weight.
+contract MockApproverRegistry {
+    address[] internal _approvers;
+
+    function setApprovers(address[] memory a) external {
+        _approvers = a;
+    }
+
+    function getApproverWeights(address, uint256)
+        external
+        view
+        returns (address[] memory approvers, uint128[] memory weights, uint128 total)
+    {
+        approvers = _approvers;
+        weights = new uint128[](approvers.length);
+        total = 0;
+    }
 }
 
 /// @dev Chainlink-shaped feed: fixed answer, `decimals`, fresh `updatedAt`.
@@ -107,8 +134,18 @@ contract GovernorCoverageGatesTest is Test {
         feed = new MockFeed(1e8, 8); // $1.00, 8-dec
         vm.startPrank(ledgerOwner);
         ledger.setWoodUsdPrice(0.05e8); // $0.05, conservative haircut
-        ledger.setAssetFeed(address(usdg), address(feed), 1 days);
+        // Generous staleness bound: the §3.3a quorum re-reads this feed at
+        // EXECUTE time, which is a voting period (+ review window) after
+        // propose. A `maxDelay` shorter than that lifecycle would make every
+        // execution fail `StalePrice` regardless of coverage — see
+        // `test_execute_staleFeedBlocksQuorum`, which pins that coupling
+        // deliberately. Feed staleness itself is covered in ExposureLedger.t.sol.
+        ledger.setAssetFeed(address(usdg), address(feed), 365 days);
         ledger.setCoveredTvlCapUsd(10_000_000e18); // $10M — generous
+        // Approver source for the §3.3a quorum. Defaults to an EMPTY approver
+        // set — the cold-start case the quorum must fail closed on. Tests that
+        // need covering approvers re-point it via `_seatApprovers`.
+        ledger.setGuardianRegistry(address(new MockApproverRegistry()));
         vm.stopPrank();
 
         // ── The wired syndicate (governor + vault). Test contract is factory.
@@ -459,6 +496,198 @@ contract GovernorCoverageGatesTest is Test {
         assertEq(amt, 200e18);
         assertEq(wood.balanceOf(address(escrow)), 200e18);
         assertEq(wood.balanceOf(address(escrow2)), 0);
+    }
+
+    // ── Task 9: approve quorum at execute + bond reclaim ──────────────────
+
+    /// @dev Drive a proposal to Approved. `MockRegistryMinimal.reviewPeriod` is
+    ///      0, so `reviewEnd == voteEnd` and the (unblocked) review resolves the
+    ///      moment voting closes. Nobody votes — optimistic passage is exactly
+    ///      what the quorum gate is meant to override for tier-2.
+    function _toApproved(uint256 pid) internal {
+        vm.warp(governor.getProposal(pid).voteEnd + 1);
+        governor.resolveProposalState(pid);
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Approved));
+    }
+
+    /// @dev Point the ledger at an approver set whose LIVE sWOOD bonds cover
+    ///      `neededUsd`. At $0.05/WOOD, 20,000 WOOD == $1,000.
+    function _seatApprovers(address[] memory gs, uint256 ownStakeEach) internal {
+        MockApproverRegistry approverReg = new MockApproverRegistry();
+        approverReg.setApprovers(gs);
+        vm.prank(ledgerOwner);
+        ledger.setGuardianRegistry(address(approverReg));
+        for (uint256 i = 0; i < gs.length; i++) {
+            swood.setStake(gs[i], ownStakeEach, 0);
+        }
+    }
+
+    /// @notice §3.3a: a tier-2 proposal cannot execute on silence. The cohort
+    ///         produced ZERO approvers, so there is no identified, stake-backed
+    ///         signer to hold liable (R1) — execution fails closed and the
+    ///         proposal simply expires instead of executing unreviewed.
+    function test_execute_tier2NoApprovers_reverts() public {
+        uint256 pid = _proposeSolo(governor, address(vault), agent, 1_000e6);
+        _toApproved(pid);
+        vm.expectRevert(IExposureLedger.InsufficientApproveCoverage.selector);
+        governor.executeProposal(pid);
+    }
+
+    /// @notice §3.3a happy path: approvers whose aggregate slashableBond covers
+    ///         the proposal's coverage let it through. $1,000 coverage vs one
+    ///         guardian holding 20,000 WOOD ($1,000 at the haircut price).
+    function test_execute_coveredByApprovers_succeeds() public {
+        uint256 pid = _proposeSolo(governor, address(vault), agent, 1_000e6);
+        address[] memory gs = new address[](1);
+        gs[0] = makeAddr("g1");
+        _seatApprovers(gs, 20_000e18);
+        _toApproved(pid);
+        governor.executeProposal(pid);
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Executed));
+    }
+
+    /// @notice Under-covering approvers are as good as none: the quorum is a
+    ///         DOLLAR test, not a headcount. One guardian at 10,000 WOOD ($500)
+    ///         cannot cover $1,000 of extractable value.
+    function test_execute_underCoveredApprovers_reverts() public {
+        uint256 pid = _proposeSolo(governor, address(vault), agent, 1_000e6);
+        address[] memory gs = new address[](1);
+        gs[0] = makeAddr("g1");
+        _seatApprovers(gs, 10_000e18); // $500 — half the needed coverage
+        _toApproved(pid);
+        vm.expectRevert(IExposureLedger.InsufficientApproveCoverage.selector);
+        governor.executeProposal(pid);
+    }
+
+    /// @notice Below the tier threshold, optimistic passage is preserved — the
+    ///         lane the §3.10 ROE gate depends on (spec §4 gate 2). Threshold 3
+    ///         puts every tier below it, which is the same branch a tier-0/1
+    ///         proposal takes at the launch threshold of 2.
+    function test_execute_tierBelowThreshold_skipsQuorum() public {
+        uint256 pid = _proposeSolo(governor, address(vault), agent, 1_000e6);
+        vm.prank(ledgerOwner);
+        ledger.setQuorumTierThreshold(3); // no tier qualifies
+        _toApproved(pid);
+        governor.executeProposal(pid); // zero approvers, still executes
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Executed));
+    }
+
+    /// @notice OPERATIONAL COUPLING, pinned deliberately: the quorum re-reads
+    ///         the asset feed at EXECUTE time, so a feed that goes stale between
+    ///         propose and execute blocks execution — even for a fully covered
+    ///         proposal. Fail-closed is the intended direction (an unpriceable
+    ///         asset cannot be coverage-checked), but it means feed liveness is
+    ///         a prerequisite for the whole proposal lifecycle, not just for
+    ///         propose. The proposal stays Approved and can execute once the
+    ///         feed recovers, provided `executeBy` has not passed.
+    function test_execute_staleFeedBlocksQuorum() public {
+        uint256 pid = _proposeSolo(governor, address(vault), agent, 1_000e6);
+        address[] memory gs = new address[](1);
+        gs[0] = makeAddr("g1");
+        _seatApprovers(gs, 20_000e18); // fully covered
+        vm.prank(ledgerOwner);
+        ledger.setAssetFeed(address(usdg), address(feed), 1 hours); // tight bound
+        _toApproved(pid); // warps a full voting period ahead
+        vm.expectRevert(IExposureLedger.StalePrice.selector);
+        governor.executeProposal(pid);
+    }
+
+    /// @notice An unwired governor keeps Plan A behaviour — no quorum at all.
+    function test_execute_ledgerUnwired_skipsQuorum() public {
+        uint256 pid = _proposeSolo(unwiredGovernor, address(unwiredVault), agent2, 1_000e6);
+        vm.warp(unwiredGovernor.getProposal(pid).voteEnd + 1);
+        unwiredGovernor.executeProposal(pid);
+        assertEq(uint256(unwiredGovernor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Executed));
+    }
+
+    /// @notice §3.9: an EXPIRED proposal returns its bond. Expiry moved no
+    ///         funds and is not a conviction — forfeiture belongs to the
+    ///         challenge game (Plan C), not to the lifecycle.
+    function test_reclaimBond_afterExpiry() public {
+        uint256 pid = _proposeSolo(governor, address(vault), agent, 1_000e6);
+        uint256 balBefore = wood.balanceOf(agent);
+        vm.warp(governor.getProposal(pid).executeBy + 1); // Approved -> Expired (lazy)
+        governor.reclaimProposerBond(pid);
+        assertEq(wood.balanceOf(agent), balBefore + 200e18);
+        (, uint256 amt) = escrow.bondOf(address(governor), pid);
+        assertEq(amt, 0);
+        assertEq(governor.getProposal(pid).proposerBondWood, 0);
+    }
+
+    /// @notice A guardian block is not a conviction either — a Cancelled
+    ///         proposal returns its bond in full.
+    function test_reclaimBond_afterCancel() public {
+        uint256 pid = _proposeSolo(governor, address(vault), agent, 1_000e6);
+        uint256 balBefore = wood.balanceOf(agent);
+        vm.prank(agent);
+        governor.cancelProposal(pid);
+        governor.reclaimProposerBond(pid);
+        assertEq(wood.balanceOf(agent), balBefore + 200e18);
+    }
+
+    /// @notice The bond stays locked while the proposal can still execute.
+    function test_reclaimBond_activeProposalReverts() public {
+        uint256 pid = _proposeSolo(governor, address(vault), agent, 1_000e6);
+        vm.expectRevert(ISyndicateGovernor.ProposalNotTerminal.selector);
+        governor.reclaimProposerBond(pid);
+    }
+
+    /// @notice Reclaim is idempotent: zeroing the stored amount before the
+    ///         external release makes a second call revert rather than
+    ///         double-pay (and closes a re-entrant double-release).
+    function test_reclaimBond_idempotent() public {
+        uint256 pid = _proposeSolo(governor, address(vault), agent, 1_000e6);
+        vm.prank(agent);
+        governor.cancelProposal(pid);
+        governor.reclaimProposerBond(pid);
+        vm.expectRevert(ISyndicateGovernor.NoBondToReclaim.selector);
+        governor.reclaimProposerBond(pid);
+    }
+
+    /// @notice Permissionless: a third party may accelerate the refund, but the
+    ///         escrow pays the proposer it recorded — never the caller.
+    function test_reclaimBond_permissionlessPaysProposer() public {
+        uint256 pid = _proposeSolo(governor, address(vault), agent, 1_000e6);
+        vm.prank(agent);
+        governor.cancelProposal(pid);
+        address stranger = makeAddr("stranger");
+        uint256 agentBefore = wood.balanceOf(agent);
+        vm.prank(stranger);
+        governor.reclaimProposerBond(pid);
+        assertEq(wood.balanceOf(agent), agentBefore + 200e18);
+        assertEq(wood.balanceOf(stranger), 0);
+    }
+
+    /// @notice The Task 8 escrow binding pays off here: after the governor is
+    ///         re-pointed at a NEW escrow, the old proposal still reclaims from
+    ///         the escrow that actually holds its WOOD. Releasing against the
+    ///         live slot would strand it forever (no owner, no discretionary
+    ///         exit, bond keyed by (governor, proposalId)).
+    function test_reclaimBond_releasesAgainstStoredEscrow() public {
+        uint256 pid = _proposeSolo(governor, address(vault), agent, 1_000e6);
+        ProposerBondEscrow escrow2 = new ProposerBondEscrow(address(wood), address(escrowAuth));
+        governor.setBondEscrow(address(escrow2));
+
+        uint256 balBefore = wood.balanceOf(agent);
+        vm.prank(agent);
+        governor.cancelProposal(pid);
+        governor.reclaimProposerBond(pid);
+
+        assertEq(wood.balanceOf(agent), balBefore + 200e18);
+        assertEq(wood.balanceOf(address(escrow)), 0); // drained from the ORIGINAL escrow
+    }
+
+    /// @notice A proposal that never locked a bond (zero bond bps) has nothing
+    ///         to reclaim — the terminal check passes, the amount check doesn't.
+    function test_reclaimBond_noBondReverts() public {
+        vm.prank(ledgerOwner);
+        ledger.setProposerBondBps(0);
+        uint256 pid = _proposeSolo(governor, address(vault), agent, 1_000e6);
+        assertEq(governor.getProposal(pid).proposerBondWood, 0);
+        vm.prank(agent);
+        governor.cancelProposal(pid);
+        vm.expectRevert(ISyndicateGovernor.NoBondToReclaim.selector);
+        governor.reclaimProposerBond(pid);
     }
 }
 

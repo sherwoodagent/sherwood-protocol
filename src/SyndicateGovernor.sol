@@ -428,6 +428,23 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         if (liveTier > proposal.envelopeTier) revert TierRegressed();
         if (liveCoverage > proposal.requiredCoverage) revert CoverageRegressed();
 
+        // Plan B (spec §3.3a): a coverage-consuming proposal at/above the tier
+        // threshold cannot execute without a bond-encumbered approve quorum —
+        // silence no longer passes it, so R1 always has an identified,
+        // stake-backed approver to hold liable. Below-threshold tiers keep
+        // optimistic passage until the §3.10 ROE arithmetic is validated
+        // (spec §4 gate 2, BLOCKING — launch threshold is 2, i.e. tier-2 only).
+        // A revert here leaves the proposal Approved: it expires at `executeBy`
+        // unless covering approvals arrive first (the cold-start behaviour
+        // §3.3a wants — suppressing the cohort blocks execution, never forces it).
+        {
+            address ledger = _exposureLedger;
+            if (ledger != address(0) && proposal.envelopeTier >= IExposureLedger(ledger).quorumTierThreshold()) {
+                IExposureLedger(ledger)
+                    .requireApproveQuorum(address(this), proposalId, asset, proposal.requiredCoverage);
+            }
+        }
+
         // Execute the opening calls via the vault. The risk envelope's
         // maxCapital caps the batch's net asset outflow (spec 2026-07-22 §3.1).
         ISyndicateVault(vault).executeGovernorBatch(calls, proposal.maxCapital);
@@ -529,6 +546,42 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     // ProposalLifecycle (single chokepoint: `_decOpen` decrements the counter
     // AND stamps `_lastSettledAt` so the permissionless lazy terminal path via
     // `resolveProposalState` can't dodge the settle cooldown).
+
+    /// @inheritdoc ISyndicateGovernor
+    /// @dev Spec §3.9. ONE reclaim entrypoint rather than hooks in the settle /
+    ///      cancel / expiry / emergency paths — fewer seams to keep in sync,
+    ///      and the lazy terminal resolution means expiry has no hook to attach
+    ///      to anyway. Permissionless is safe because `releaseBond` pays the
+    ///      proposer the ESCROW recorded at lock time, so an arbitrary caller
+    ///      can only accelerate the refund, never redirect it.
+    ///
+    ///      Rejected / Expired / Cancelled all return the bond: forfeiture is
+    ///      exclusively a passed-challenge outcome (Plan C) — a guardian block
+    ///      is not a conviction, and an expired proposal moved no funds.
+    ///
+    ///      Releases against `proposal.proposerBondEscrow` (bound at propose),
+    ///      NOT the live `_bondEscrow` slot: the escrow has no owner and no
+    ///      discretionary exit, and its bond key is (governor, proposalId), so
+    ///      releasing against a re-pointed slot would strand the WOOD forever.
+    function reclaimProposerBond(uint256 proposalId) external nonReentrant {
+        StrategyProposal storage proposal = _proposals[proposalId];
+        if (proposal.id == 0) revert ProposalNotFound();
+        ProposalState s = _commitState(proposal);
+        if (
+            s != ProposalState.Rejected && s != ProposalState.Expired && s != ProposalState.Cancelled
+                && s != ProposalState.Settled
+        ) {
+            revert ProposalNotTerminal();
+        }
+        uint256 bond = proposal.proposerBondWood;
+        if (bond == 0) revert NoBondToReclaim();
+        address escrow = proposal.proposerBondEscrow;
+        // Effects before interaction: zeroing first makes the reclaim
+        // idempotent (a second call reverts NoBondToReclaim) and closes any
+        // re-entrant double-release through a hooked WOOD.
+        proposal.proposerBondWood = 0;
+        IProposerBondEscrow(escrow).releaseBond(proposalId);
+    }
 
     /// @inheritdoc ISyndicateGovernor
     /// @dev Narrowed to Pending only (Task 25) — post-vote veto flows through
@@ -982,7 +1035,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     /// @dev Store co-proposers, emit event. `collaborationDeadline` is NOT set
     ///      here — `propose` writes it in the `isCollaborative` branch, before
     ///      any external call, so the Draft is never observable with a zero
-    ///      deadline (which `_resolveStateView` maps to Expired). See the
+    ///      deadline (which the base's `_computeState` maps to Expired). See the
     ///      ordering comment at the `lockBond` call site.
     function _storeCoProposers(uint256 proposalId, CoProposer[] calldata coProposers) internal {
         for (uint256 i = 0; i < coProposers.length; i++) {
