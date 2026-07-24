@@ -19,8 +19,10 @@ interface IRegistryAuthMinimal {
  *         gates WHEN — see `SyndicateGovernor.reclaimProposerBond`).
  *         Forfeiture to the compensation escrow arrives with the challenge
  *         game (Plan C); this contract deliberately has no owner and no
- *         discretionary exit — the invariant `wood.balanceOf(this) ==
- *         sum of locked-unreleased bonds` holds by construction.
+ *         discretionary exit — the invariant `wood.balanceOf(this) >=
+ *         sum of locked-unreleased bonds` holds by construction (equality
+ *         absent direct transfers; surplus from donations is permanently
+ *         stuck, accepted for v1a).
  */
 contract ProposerBondEscrow is IProposerBondEscrow {
     using SafeERC20 for IERC20;
@@ -30,6 +32,9 @@ contract ProposerBondEscrow is IProposerBondEscrow {
         uint96 amount; // WOOD fits in uint96 (total supply << 2^96) — enforced by lockBond's AmountTooLarge guard, not assumed
     }
 
+    /// @dev Integration requirement: WOOD must be a standard ERC20 — no
+    ///      transfer fee, no rebasing, no hooks. A fee-on-transfer token would
+    ///      make the escrow insolvent (recorded amounts exceed held balance).
     IERC20 public immutable wood;
     IRegistryAuthMinimal public immutable registry;
 
@@ -56,16 +61,24 @@ contract ProposerBondEscrow is IProposerBondEscrow {
         if (amount > type(uint96).max) revert AmountTooLarge();
         bytes32 key = _key(msg.sender, proposalId);
         if (_bonds[key].proposer != address(0)) revert BondAlreadyLocked();
+        // casting to 'uint96' is safe: the AmountTooLarge guard above bounds amount <= type(uint96).max
+        // forge-lint: disable-next-line(unsafe-typecast)
         _bonds[key] = Bond({proposer: proposer, amount: uint96(amount)});
         wood.safeTransferFrom(proposer, address(this), amount);
         emit BondLocked(msg.sender, proposalId, proposer, amount);
     }
 
     /// @inheritdoc IProposerBondEscrow
-    /// @dev Governor-only: the governor's `reclaimProposerBond` resolves the
-    ///      proposal to a TERMINAL state before calling — the escrow does not
-    ///      re-derive lifecycle state.
-    function releaseBond(uint256 proposalId) external onlyGovernor {
+    /// @dev The governor's `reclaimProposerBond` resolves the proposal to a
+    ///      TERMINAL state before calling — the escrow does not re-derive
+    ///      lifecycle state. Deliberately NOT gated on the live registry
+    ///      check: the bond key binds to msg.sender, so only the governor
+    ///      that locked a bond can ever address it — a random caller computes
+    ///      key(caller, proposalId) and hits NoBond. Skipping the live check
+    ///      means a later-deauthorized governor can still release open bonds
+    ///      to the recorded proposer instead of stranding them forever.
+    ///      `lockBond` keeps onlyGovernor — that is where trust matters.
+    function releaseBond(uint256 proposalId) external {
         bytes32 key = _key(msg.sender, proposalId);
         Bond memory b = _bonds[key];
         if (b.proposer == address(0)) revert NoBond();
