@@ -342,8 +342,17 @@ strategy selection the same way.
 - **Entry/exit fees** — `instantExitFeeBps` was specced and deferred
   (`docs/specs/2026-07-19-instant-withdrawal-liquidity-design.md` §6); orthogonal to
   this design and still blocked on vault bytecode headroom.
-- **AUM-based management fee** — a genuine time-on-capital fee is a separate design
-  (today's "management fee" is profit-gated); volume fees cover the activity axis.
+- **AUM-based management fee** — *promoted to a companion change* (product decision
+  2026-07-24: Sherwood follows the hedge-fund template, "2 and 10" for agents). An
+  agent-owned management fee of 2%/yr on funded capital (proposed cap 3%/yr),
+  pro-rated to actual proposal duration and paid **regardless of P&L**. It can ride
+  the exact rails this spec builds: strategy-side, computed at settle as
+  `_volumeFeeBase × mgmtFeeBps × elapsed / 365 days`, paid to the agent-fee
+  recipients (same split as carry) before capital returns to the vault — senior to
+  the profit waterfall, zero governor bytecode, same fail-open rules. The existing
+  profit-gated vault `managementFeeBps` is renamed **owner fee** at the docs/product
+  level (contract storage name unchanged). Detailed spec to follow; the product spec
+  (`docs/product/`) carries the decided economics.
 - **Onchain-enforced buyback** — like Hyperliquid, buyback is treasury policy in v1;
   contract enforcement (v3) needs a WOOD price feed the protocol doesn't have yet
   (flagged in the guardian economic-security spec, lines 702–710).

@@ -92,51 +92,58 @@ Rule of thumb: if the strategy is *taking a market position*, it's volume. If it
 and unwinds once pays approximately nothing — correct, because it consumes the least
 protocol attention per dollar.
 
-## The full fee stack
+## The full fee stack — a hedge fund for agents
 
-The volume fee doesn't replace anyone's economics — it joins a stack where every
-other fee is a share of *profit*, paid only when a strategy settles in the green.
-The complete picture:
+Sherwood is a hedge fund where the manager is an agent, so the fee stack follows the
+hedge-fund template: the classic **"2 and 20"**, sized for our stack as **"2 and
+10"**. A hedge fund manager gets paid whether or not the fund made money — the
+management fee on assets covers the cost of running the book, and the carry rewards
+performance on top. Sherwood's agents get the same deal:
 
 | Fee | Goes to | Rate | Charged on | Paid when |
 |---|---|---|---|---|
+| **Management fee** | Agent(s) | 2%/yr, pro-rated per proposal | fund capital (AUM) | **Always** — profit, flat, or loss |
 | **Volume fee** (new) | Treasury → buyback | 0.02% | every trade's value | **Always** — profit, flat, or loss |
-| Agent fee | Lead agent + co-proposers | 10% default (up to 15%) | profit after protocol & guardian cuts | Profitable settlements only |
+| Performance fee (carry) | Lead agent + co-proposers | 10% default (up to 15%) | profit after protocol & guardian cuts | Profitable settlements only |
 | Protocol fee | Treasury | 5% (cap 10%) | settlement profit | Profitable settlements only |
 | Guardian fee | Guardian network | 3% (cap 5%) | settlement profit | Profitable settlements only |
-| Manager fee | Fund owner | ≤ 5% | profit after the agent's cut | Profitable settlements only |
+| Owner fee | Fund owner | ≤ 5% | profit after the agent's carry | Profitable settlements only |
 | Creation fee | Treasury | flat | launching a fund | Once, at creation |
 
-**Deliberate sizing: the agent is the largest fee earner in the stack.** Agents
-generate the returns; the protocol and the guardian network run on rates well below
-their contract caps so that their combined take stays below the agent's cut. The
-waterfall order doesn't change — protocol and guardians take their (smaller) share
-of profit first, the agent takes a share of what remains, the manager a share of
-what remains after that, and depositors keep the rest. Guardian fees are split
-among the guardians who reviewed the proposal, weighted by their stake, and paid out
-weekly. Agent fees split between the lead and any co-proposers at proportions they
-agreed at proposal time.
+(The owner fee is today's contract "management fee," renamed — it was always
+profit-gated, so the name was misleading. The true AUM-based management fee is new,
+and it belongs to the agent who runs the money.)
+
+**Deliberate sizing: the agent is the largest fee earner in the stack — in every
+market.** The management fee means an agent earns on flat and losing months, like
+any fund manager; the carry makes good months much better; and the protocol and
+guardian network run well below their contract caps so their combined take stays
+below the agent's. Guardian fees are split among the guardians who reviewed the
+proposal, weighted by their stake, and paid out weekly. Agent fees (management and
+carry both) split between the lead and any co-proposers at proportions they agreed
+at proposal time.
 
 ### One good month, everyone's cut
 
 The same $1M fund, ending a 30-day proposal $21,500 up before Sherwood fees
-(rates: protocol 5%, guardian 3%, agent 10%, manager 5%):
+(rates: management 2%/yr, protocol 5%, guardian 3%, carry 10%, owner 5%):
 
 | Step | Who | Amount | Running remainder |
 |---|---|---:|---:|
-| Volume fee (paid trade by trade, during the month) | Treasury | **$1,500** | $20,000 measured profit |
-| Protocol fee — 5% of profit | Treasury | $1,000 | $19,000 |
-| Guardian fee — 3% of profit | Guardian network | $600 | $18,400 |
-| Agent fee — 10% of the remainder | Agent(s) | **$1,840** | $16,560 |
-| Manager fee — 5% of the remainder | Fund owner | $828 | $15,732 |
-| **Depositors keep** | Shareholders | **$15,732** | +1.57% for the month |
+| Volume fee (paid trade by trade, during the month) | Treasury | $1,500 | $20,000 measured profit |
+| Management fee — 2%/yr × 30 days on $1M | Agent(s) | **$1,644** | $18,356 |
+| Protocol fee — 5% of profit | Treasury | $918 | $17,438 |
+| Guardian fee — 3% of profit | Guardian network | $551 | $16,887 |
+| Performance fee — 10% of the remainder | Agent(s) | **$1,689** | $15,198 |
+| Owner fee — 5% of the remainder | Fund owner | $760 | $14,438 |
+| **Depositors keep** | Shareholders | **$14,438** | +1.44% for the month |
 
-The agent's $1,840 beats the protocol and guardians combined ($1,600) — and an
-agent whose fund sets the fee at the 15% cap earns $2,760, well clear of both.
-On a **flat month**, that table collapses to one line: the $1,500 volume fee.
-Agents, the manager, and guardians earn nothing — their compensation stays purely
-performance-based, which is the alignment we want for the people choosing and
-approving strategies.
+The agent's total is **$3,333** ($1,644 management + $1,689 carry) — more than
+double the protocol and guardians combined ($1,469). On a **flat month** the table
+becomes two lines: the treasury's $1,500 volume fee and the agent's $1,644
+management fee. The agent gets paid for managing, hedge-fund style; guardians stay
+profit-gated until their phase-3 volume share; and the carry is still where the real
+upside lives, so the incentive to perform is intact.
 
 ### What the volume fee changes for each of them
 
@@ -152,10 +159,10 @@ good one, but today it pays $0. The phase-3 revenue share gives the guardian net
 income proportional to activity reviewed, which is what our economic-security
 analysis says the network needs to stay honestly staffed.
 
-One honest footnote: the "manager fee" is charged on profit, not on assets — so
-despite the name, the fund owner also earns nothing on flat months. Whether it
-should become a true assets-under-management fee is a real question, but a separate
-one (open decision 5).
+The fund owner's fee stays profit-gated (renamed "owner fee" to say what it is).
+The people paid regardless of markets are the ones doing work regardless of
+markets: the agent managing the book (management fee), the protocol running the
+rails (volume fee), and — from phase 3 — the guardians reviewing proposals.
 
 ## Who feels what
 
@@ -163,10 +170,12 @@ one (open decision 5).
   far below the swap fees and price impact the same trades already pay. Total fees
   per proposal are hard-capped, and the fee can **never block a withdrawal**: if it
   can't be paid, it's skipped, not forced.
-- **Agents** — **the largest fee earner in the stack**: the profit-fee settings are
-  sized so the agent's cut beats protocol and guardians combined. The volume fee is
-  one more line in the cost model, priced like venue fees, with the rate **locked
-  when the proposal starts**. Later: stake WOOD, trade cheaper (phase 3).
+- **Agents** — **the largest fee earner in the stack, in every market**: a
+  hedge-fund-style deal of 2%/yr management fee on capital (paid profit or not)
+  plus 10–15% carry on profits, together sized to beat protocol and guardians
+  combined. The volume fee is one more line in the cost model, priced like venue
+  fees, with the rate **locked when the proposal starts**. Later: stake WOOD,
+  trade cheaper (phase 3).
 - **Guardians** — today guardian rewards exist only when strategies profit. Volume
   fees create a revenue stream proportional to **how much reviewing there is to do**
   — the phase-3 revenue share is aimed directly at the guardian-funding gap.
@@ -209,11 +218,12 @@ guardian review, pricing infrastructure, and risk surface.
 
 ## Rollout
 
-1. **Turn it on** *(contract release)* — fee live at 0.02%, all revenue to the
-   protocol treasury. Ships alongside the rebalanced profit-fee settings — protocol
-   5%, guardian 3% (config changes), agent default 10% (one-constant change) — so
-   the agent-earns-most ordering holds from day one. Every trade and every fee
-   visible on-chain and in the app — funds get a real "volume" stat for free.
+1. **Turn it on** *(contract release)* — volume fee live at 0.02%, all revenue to
+   the protocol treasury, and the agent's hedge-fund deal in place: 2%/yr AUM
+   management fee (new) plus the carry default raised to 10%, with protocol at 5%
+   and guardian at 3% (config changes) so the agent-earns-most ordering holds from
+   day one. Every trade and every fee visible on-chain and in the app — funds get a
+   real "volume" stat for free.
 2. **The buyback** *(treasury policy)* — treasury publishes a wallet and cadence,
    and converts volume-fee revenue into open-market WOOD purchases on a schedule.
    Policy first, contracts later — the same path Hyperliquid took with its
@@ -263,9 +273,9 @@ guardian review, pricing infrastructure, and risk surface.
    strategy; exists purely to bound the pathological case.
 4. **Phase-3 split between guardians and buyback.** Needs the guardian-economics
    model finished first.
-5. **Should the manager fee become a true AUM-based fee?** Today it's profit-gated
-   despite the name. Separate design if pursued — the volume fee covers the activity
-   axis, not the time-on-capital axis.
+5. **Management fee rate and cap.** 2%/yr proposed (the hedge-fund standard), with
+   a 3%/yr contract cap. Decide whether the fund owner shares it or it goes to the
+   agent alone (proposed: agent alone; the owner keeps their profit-gated fee).
 
 ## What success looks like
 
