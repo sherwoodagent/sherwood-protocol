@@ -20,7 +20,7 @@
 - Asset→USD: `usd18 = amount * feedPrice * 1e18 / (10^assetDecimals * 10^feedDecimals)`; asset decimals cached at feed registration.
 
 **Storage cautions:**
-- `StrategyProposal` gains ONE appended field (`proposerBondWood`). Append at the END only.
+- `StrategyProposal` gains TWO appended fields (`proposerBondWood`, then `proposerBondEscrow`). Append at the END only. The escrow ADDRESS is stored per proposal because the bond is custodial: `reclaimProposerBond` (Task 9) must release against the escrow that actually holds the bond, not the governor's live `_bondEscrow` slot — otherwise re-pointing or un-wiring that slot strands every outstanding bond permanently (the escrow has no owner and no discretionary exit, and its bond key is `(governor, proposalId)`, so only this governor can ever address them).
 - `SyndicateGovernor` gains two address slots (`_exposureLedger`, `_bondEscrow`): decrement `__gap` 33 → 31.
 - `GuardianRegistry` gains one address slot (`exposureLedger`): decrement `__gap` 50 → 49.
 - `SyndicateFactory` gains two address slots (`exposureLedger`, `bondEscrow`).
@@ -1534,8 +1534,9 @@ git commit -m "feat(registry): exposure-ledger hooks on approve-side review vote
 
 Wiring rules, stated once:
 - Two new governor storage slots after `_tierRegistry`: `address internal _exposureLedger;` and `address internal _bondEscrow;` — decrement `__gap` 33 → 31. Both factory-wired via `setExposureLedger` / `setBondEscrow` (onlyFactory, mirroring `setTierRegistry` at `src/SyndicateGovernor.sol:1315-1319` — copy its exact gate idiom), pushed at `createSyndicate` (Task 10).
-- `StrategyProposal` appends ONE field at the very end: `uint256 proposerBondWood;` (with an APPENDED-FIELDS comment matching the Plan A ones).
+- `StrategyProposal` appends TWO fields at the very end: `uint256 proposerBondWood;` then `address proposerBondEscrow;` (with an APPENDED-FIELDS comment matching the Plan A ones). Task 9 releases against the stored escrow, never the live slot — see the header's storage-cautions note.
 - In `propose`, the gates run inside `_snapshotTier` (it already runs after coverage is computed, and it is the established stack-budget hoist point): when `_exposureLedger != 0`, call `requireWithinCoveredTvlCap(asset, coverage_)`; then compute and lock the bond.
+- **ORDERING REQUIREMENT (reentrancy, found in review):** `lockBond` is a STATE-CHANGING external call that pulls WOOD via `transferFrom`, so a WOOD with a transfer hook can re-enter the governor mid-`propose`. Every field the proposal's state machine reads must therefore be written BEFORE `_snapshotTier` runs. `collaborationDeadline[proposalId]` is written inside `_storeCoProposers`, which runs AFTER `_snapshotTier` — so a collaborative Draft is observable mid-`lockBond` with `state == Draft` and `collaborationDeadline == 0`, which `_resolveStateView` maps to **Expired**, permanently bricking the proposal (permissionless `resolveProposalState` commits it; `approveCollaboration` then reverts `NotDraftState` forever). Fix: hoist the `collaborationDeadline[proposalId] = block.timestamp + _params.collaborationWindow` write out of `_storeCoProposers` into the `isCollaborative` branch, so it lands before any external call. Keep a comment at the `lockBond` site stating the invariant: no proposal-state write may move below this call.
 - Bond formula (spec §3.9 + §5): `bondWood = coverageUsd * proposerBondBps / 10_000 * 1e8 / woodUsdPriceX8`, computed ledger-side by `proposerBondWood(asset, requiredCoverage)` so the governor makes ONE call.
 - Ledger or escrow unset → skip the respective gate (pre-wiring compat, tierRegistry pattern).
 
@@ -1666,7 +1667,14 @@ At the end of `_snapshotTier` (after `p.requiredCoverage = coverage_;`):
             if (escrow != address(0)) {
                 uint256 bondWood = IExposureLedger(ledger).proposerBondWood(asset, coverage_);
                 if (bondWood != 0) {
+                    // Bind the bond to THIS escrow: Task 9 releases against the
+                    // stored address so re-pointing `_bondEscrow` later cannot
+                    // strand it. Both writes precede the external call (CEI).
                     p.proposerBondWood = bondWood;
+                    p.proposerBondEscrow = escrow;
+                    // STATE-CHANGING external call (pulls WOOD). Every proposal-state
+                    // field the lifecycle reads MUST already be written — see the
+                    // ordering requirement above. Do not move a state write below this.
                     IProposerBondEscrow(escrow).lockBond(p.id, p.proposer, bondWood);
                 }
             }
@@ -1793,8 +1801,11 @@ New function (near `cancelProposal`):
         ) revert ProposalNotTerminal();
         uint256 bond = proposal.proposerBondWood;
         if (bond == 0) revert NoBondToReclaim();
+        // Release against the escrow that HOLDS the bond (stored at propose), not
+        // the live `_bondEscrow` slot — re-pointing that slot must not strand it.
+        address escrow = proposal.proposerBondEscrow;
         proposal.proposerBondWood = 0; // effects before interaction; makes reclaim idempotent
-        IProposerBondEscrow(_bondEscrow).releaseBond(proposalId);
+        IProposerBondEscrow(escrow).releaseBond(proposalId);
     }
 ```
 
