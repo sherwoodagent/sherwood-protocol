@@ -351,8 +351,13 @@ library LeveragedAeroManager {
     /// @param minLiq1 Minimum token1 (cbBTC) the re-add must consume (two-sided slippage guard).
     function rerangeImpl(uint24 width, uint256 minLiq0, uint256 minLiq1) public {
         LeveragedAeroStorage.Layout storage $ = _layout();
-        if ($.tokenId == 0) return; // flat book — nothing to recenter
-        $.width = width; // persist the new width (bounds already checked strategy-side)
+        // Persist the new width FIRST (bounds already checked strategy-side) so it survives the
+        // flat-book bail: the Mamo rebalancer reads `layout().width` back, so an accepted `rerange`
+        // must never leave its choice silently dropped. (No on-chain path re-mints from a flat
+        // Executed book — genesis `executeImpl` is one-shot and pre-rerange — so this is for the
+        // off-chain reader, not a future mint.)
+        $.width = width;
+        if ($.tokenId == 0) return; // flat book — width persisted above; nothing to recenter
 
         // 1. Calm-gate BEFORE touching the pool — never recenter at a manipulated tick.
         LeveragedAeroValuation._calmGate(_config());

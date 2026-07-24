@@ -226,4 +226,65 @@ contract LeveragedAeroCLRescueUnit is Test {
     function test_init_revertsWidth_bandBoundMisaligned() public {
         _expectInitWidthRevert(4000, 250, 20000); // minWidth not a multiple of tickSpacing
     }
+
+    // ── rerange width-band validation (Mamo per-cycle width; strategy-side, pre-delegatecall) ──
+    //
+    // `rerange` (onlyProposer nonReentrant) validates `width` with the same pure `_requireWidthInBand`
+    // as init, BEFORE the manager delegatecall — so the guard is fork-free. Its entrypoint gates on
+    // `State.Executed` FIRST, though, and a freshly-initialized clone is `State.Pending`; flip the
+    // packed `_state` byte to Executed (leaving tokenId == 0, a flat book) so the guard is reachable
+    // without opening a venue position. The revert cases mirror the RPC-gated
+    // `test_rerange_revertsWidth*` fork tests in-gate; the flat-book persist test is new (the fork
+    // suite only exercises rerange on a live position).
+
+    /// @dev `_state` lives in BaseStrategy slot 1, byte 20, packed alongside `_proposer` (bytes 0-19)
+    ///      and `_initialized` (byte 21). Set it to `State.Executed` (== 1) without clobbering the
+    ///      neighbours; tokenId stays 0 so the book is flat and no venue call is made.
+    function _forceExecutedState() internal {
+        bytes32 slot = bytes32(uint256(1));
+        uint256 raw = uint256(vm.load(address(strategy), slot));
+        raw &= ~(uint256(0xff) << 160); // clear the _state byte
+        raw |= uint256(1) << 160; // State.Executed
+        vm.store(address(strategy), slot, bytes32(raw));
+    }
+
+    function test_rerange_revertsWidth_belowMin() public {
+        _forceExecutedState();
+        vm.prank(proposer);
+        vm.expectRevert(LeveragedAerodromeCLStrategy.WidthOutOfBounds.selector);
+        strategy.rerange(100, 0, 0); // < minWidth 200 (aligned)
+    }
+
+    function test_rerange_revertsWidth_aboveMax() public {
+        _forceExecutedState();
+        vm.prank(proposer);
+        vm.expectRevert(LeveragedAerodromeCLStrategy.WidthOutOfBounds.selector);
+        strategy.rerange(20100, 0, 0); // > maxWidth 20000 (aligned)
+    }
+
+    function test_rerange_revertsWidth_misaligned() public {
+        _forceExecutedState();
+        vm.prank(proposer);
+        vm.expectRevert(LeveragedAerodromeCLStrategy.WidthOutOfBounds.selector);
+        strategy.rerange(4050, 0, 0); // in band but not a multiple of tickSpacing 100
+    }
+
+    /// @notice Flat book (tokenId == 0): a valid in-band width persists (the rebalancer reads
+    ///         `layout().width` back) and the recenter is skipped (no venue touch). The persist must
+    ///         happen even on the flat-book bail so the Mamo rebalancer's choice is not silently
+    ///         dropped.
+    function test_rerange_flatBook_persistsWidthNoVenue() public {
+        _forceExecutedState();
+        assertEq(uint256(strategy.layout().width), 4000, "precondition: init width");
+        assertEq(uint256(strategy.layout().tokenId), 0, "precondition: flat book (tokenId == 0)");
+
+        uint24 newWidth = 8000; // in [minWidth 200, maxWidth 20000], multiple of tickSpacing 100
+        vm.prank(proposer);
+        strategy.rerange(newWidth, 0, 0);
+
+        // Persisted — layout().width reflects the accepted choice.
+        assertEq(uint256(strategy.layout().width), newWidth, "flat-book rerange did not persist width");
+        // Venue untouched: still a flat book, no NFT minted.
+        assertEq(uint256(strategy.layout().tokenId), 0, "flat-book rerange must not open a position");
+    }
 }
