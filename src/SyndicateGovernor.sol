@@ -198,16 +198,8 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
 
     // ── GovernorEmergency virtual accessor overrides ──
 
-    function _getProposal(uint256 id) internal view override returns (StrategyProposal storage) {
-        return _proposals[id];
-    }
-
     function _getSettlementCalls(uint256 id) internal view override returns (BatchExecutorLib.Call[] storage) {
         return _settlementCalls[id];
-    }
-
-    function _getRegistry() internal view override returns (IGuardianRegistry) {
-        return IGuardianRegistry(_guardianRegistry);
     }
 
     function _emergencyReentrancyEnter() internal override {
