@@ -2010,39 +2010,284 @@ contract CourtTest is Test {
 
     // ─────────────────────── forfeited WOOD (Task 5's sink) ───────────────────────
 
-    function test_sweepForfeited_onlyOwnerAndMovesOnlyForfeited() public {
+    /// @dev The dead address `burnForfeited` sends to. Mirrors the private
+    ///      constant in `Court`, and `StakedWood` burns to the same one.
+    address internal constant BURN_ADDRESS = 0x000000000000000000000000000000000000dEaD;
+
+    /// @notice **THE OWNER HAS NO PATH TO FORFEITED FUNDS, AND NEEDS NO
+    ///         PERMISSION TO BE ROUTED AROUND.** `alice` is not the owner and
+    ///         holds no privileged role, and she can still destroy the pot. This
+    ///         is the whole point of the change: `forfeitedWood` is fed by failed
+    ///         appeals and slashed panel bonds, so an owner who could direct it
+    ///         was an owner who profited from the court failing. Burning removes
+    ///         the beneficiary; permissionless removes the ability to sit on the
+    ///         pot instead, which would be the same discretion by inaction.
+    function test_burnForfeited_isPermissionlessAndBurnsTheUnreservedSurplus() public {
+        uint256 caseId = _panelRuled(true);
+        _appeal(caseId);
+        vm.prank(minnow);
+        court.voteAppeal(caseId, false); // below the floor: the bond is forfeited
+        _finalizeAppeal(caseId);
+        assertEq(court.forfeitedWood(), BOND);
+        assertEq(court.reservedRewards(), 0, "rewards are off, so nothing is spoken for");
+        assertEq(wood.balanceOf(BURN_ADDRESS), 0);
+
+        vm.expectEmit(true, false, false, true);
+        emit ICourt.ForfeitedWoodBurned(alice, BOND);
+        vm.prank(alice); // NOT the owner
+        uint256 amount = court.burnForfeited();
+
+        assertEq(amount, BOND, "exactly the unreserved surplus");
+        assertEq(wood.balanceOf(BURN_ADDRESS), BOND, "and it went to the dead address");
+        assertEq(court.forfeitedWood(), 0);
+        assertEq(wood.balanceOf(backstop), 0, "no beneficiary anywhere");
+        _assertWoodBalances();
+    }
+
+    /// @notice The owner is not special here — it may call the burn like anybody
+    ///         else, but it gains nothing by doing so: the WOOD goes to the dead
+    ///         address, not to it.
+    function test_burnForfeited_givesTheOwnerNothing() public {
         uint256 caseId = _panelRuled(true);
         _appeal(caseId);
         vm.prank(minnow);
         court.voteAppeal(caseId, false);
         _finalizeAppeal(caseId);
-        assertEq(court.forfeitedWood(), BOND);
 
-        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
-        vm.prank(alice);
-        court.sweepForfeited(backstop);
-
-        vm.expectRevert(ICourt.ZeroAddress.selector);
         vm.prank(owner);
-        court.sweepForfeited(address(0));
+        court.burnForfeited();
 
-        vm.expectEmit(true, false, false, true);
-        emit ICourt.ForfeitedWoodSwept(backstop, BOND);
-        vm.prank(owner);
-        uint256 amount = court.sweepForfeited(backstop);
-
-        assertEq(amount, BOND);
-        assertEq(wood.balanceOf(backstop), BOND);
-        assertEq(court.forfeitedWood(), 0);
-        // The panel bonds are untouched: a sweep can never reach a live position.
-        assertEq(court.bondedWood(), BOND * 3);
-        assertEq(wood.balanceOf(address(court)), BOND * 3);
+        assertEq(wood.balanceOf(owner), 0, "the owner cannot profit from a forfeit");
+        assertEq(wood.balanceOf(BURN_ADDRESS), BOND);
+        _assertWoodBalances();
     }
 
-    function test_sweepForfeited_revertsWithNothingToSweep() public {
-        vm.expectRevert(ICourt.InvalidParameter.selector);
+    /// @notice **NO LIVE BOND IS EVER BURNABLE.** Three posted panel bonds and an
+    ///         OPEN appeal bond sit in the court alongside a forfeited one from
+    ///         an earlier case; the burn takes the forfeited one and leaves all
+    ///         four positions whole. `burnForfeited` never reads `bondedWood`,
+    ///         and the §4 equality is what makes that checkable.
+    function test_burnForfeited_cannotTouchBondedWood() public {
+        // Case 1 forfeits a bond into the pot.
+        uint256 first = _panelRuled(true);
+        _appeal(first);
+        vm.prank(minnow);
+        court.voteAppeal(first, false);
+        _finalizeAppeal(first);
+        assertEq(court.forfeitedWood(), BOND);
+
+        // Case 2 is left with a LIVE appeal bond posted and unresolved.
+        uint256 second = _panelRuledOn(11, true);
+        _appeal(second);
+        uint256 bondedBefore = court.bondedWood();
+        assertEq(bondedBefore, BOND * 4, "three panel bonds + one open appeal bond");
+        _assertWoodBalances();
+
+        vm.prank(dave);
+        uint256 burned = court.burnForfeited();
+
+        assertEq(burned, BOND, "only the forfeited bond, never a live one");
+        assertEq(court.bondedWood(), bondedBefore, "every posted bond survives untouched");
+        assertEq(court.panelBondOf(alice), BOND);
+        assertEq(court.panelBondOf(bob), BOND);
+        assertEq(court.panelBondOf(carol), BOND);
+        assertEq(court.caseOf(second).appealBond, BOND, "the open appeal bond is still posted");
+        _assertWoodBalances();
+
+        // ...and the appellant still gets it back when the appeal clears the floor.
+        vm.prank(whale);
+        court.voteAppeal(second, false);
+        uint256 appellantBefore = wood.balanceOf(appellant);
+        _finalizeAppeal(second);
+        assertEq(wood.balanceOf(appellant), appellantBefore + BOND, "refunded in full after the burn");
+        _assertWoodBalances();
+    }
+
+    /// @notice An empty surplus REVERTS rather than no-opping, matching
+    ///         `claimPanelReward`'s `NothingToClaim` treatment of the same
+    ///         situation. A no-op would emit a zero-amount burn event that
+    ///         indexers would have to filter.
+    function test_burnForfeited_revertsWhenThereIsNoSurplus() public {
+        vm.expectRevert(ICourt.NothingToBurn.selector);
+        vm.prank(alice);
+        court.burnForfeited();
+    }
+
+    /// @notice Reverts the same way when the pot is non-empty but ENTIRELY
+    ///         reserved — there is no unreserved surplus, so there is nothing
+    ///         this function is allowed to take.
+    function test_burnForfeited_revertsWhenThePotIsFullyReserved() public {
         vm.prank(owner);
-        court.sweepForfeited(backstop);
+        court.setPanelRewardWood(REWARD);
+        uint256 caseId = _panelRuled(true);
+        _appeal(caseId);
+        vm.prank(minnow);
+        court.voteAppeal(caseId, false);
+        _finalizeAppeal(caseId);
+
+        // Burn the surplus away, leaving a pot that is non-empty but entirely
+        // reserved for the panel that already earned it.
+        vm.prank(dave);
+        court.burnForfeited();
+        assertEq(court.forfeitedWood(), REWARD * 3, "the pot still holds real WOOD");
+        assertEq(court.reservedRewards(), REWARD * 3, "every unit of it is spoken for");
+
+        vm.expectRevert(ICourt.NothingToBurn.selector);
+        vm.prank(alice);
+        court.burnForfeited();
+
+        assertEq(court.forfeitedWood(), REWARD * 3, "and the reserve is still there");
+        _assertWoodBalances();
+    }
+
+    /// @notice **THE REGRESSION THE OLD SWEEP WOULD HAVE FAILED.** A case
+    ///         resolves and accrues rewards for all three panelists; then the pot
+    ///         is burned. Every panelist can still claim IN FULL. Under the old
+    ///         `sweepForfeited` the owner could have taken the pot and the
+    ///         panel's pay would simply not have happened — which is not just a
+    ///         bookkeeping defect, because an unpaid panel is an absent panel and
+    ///         a panel that does not rule inside `panelWindow` acquits by
+    ///         default. Reward funding is a liveness property of layer 1.
+    function test_burnForfeited_cannotTakeRewardsAlreadyAccrued() public {
+        vm.prank(owner);
+        court.setPanelRewardWood(REWARD);
+        uint256 caseId = _panelRuled(true);
+        _appeal(caseId);
+        vm.prank(minnow);
+        court.voteAppeal(caseId, false); // forfeits BOND into the pot
+        _finalizeAppeal(caseId);
+
+        assertEq(court.forfeitedWood(), BOND, "the pot still HOLDS the rewards");
+        assertEq(court.reservedRewards(), REWARD * 3, "...but three of them are reserved");
+        assertEq(_outstandingRewards(), REWARD * 3, "the accumulator matches the credits");
+        _assertWoodBalances();
+
+        vm.prank(dave);
+        uint256 burned = court.burnForfeited();
+        assertEq(burned, BOND - REWARD * 3, "the surplus only");
+        assertEq(wood.balanceOf(BURN_ADDRESS), BOND - REWARD * 3);
+        assertEq(court.forfeitedWood(), REWARD * 3, "exactly the reserve is left standing");
+        assertEq(court.reservedRewards(), REWARD * 3);
+        _assertWoodBalances();
+
+        // The whole panel claims IN FULL, after the burn.
+        address[3] memory panel = [alice, bob, carol];
+        for (uint256 i; i < panel.length; ++i) {
+            uint256 before = wood.balanceOf(panel[i]);
+            vm.prank(panel[i]);
+            assertEq(court.claimPanelReward(), REWARD, "reserved pay survived the burn");
+            assertEq(wood.balanceOf(panel[i]), before + REWARD);
+            _assertWoodBalances();
+        }
+
+        assertEq(court.forfeitedWood(), 0, "the reserve is exactly drained, no dust");
+        assertEq(court.reservedRewards(), 0);
+        assertEq(court.bondedWood(), BOND * 3, "and the panel bonds were never involved");
+    }
+
+    /// @notice A second burn after the panel has claimed finds nothing left —
+    ///         the reserve was spent by its payees, not left burnable.
+    function test_burnForfeited_isIdempotentOnceTheSurplusIsGone() public {
+        uint256 caseId = _panelRuled(true);
+        _appeal(caseId);
+        vm.prank(minnow);
+        court.voteAppeal(caseId, false);
+        _finalizeAppeal(caseId);
+
+        vm.prank(alice);
+        court.burnForfeited();
+
+        vm.expectRevert(ICourt.NothingToBurn.selector);
+        vm.prank(alice);
+        court.burnForfeited();
+        _assertWoodBalances();
+    }
+
+    /// @notice **THE FULL LIFECYCLE: credit → reserve → burn → claim**, with the
+    ///         §4 identity and the `forfeitedWood >= reservedRewards`
+    ///         containment asserted at every single step.
+    function test_invariant_holdsAcrossCreditReserveBurnAndClaim() public {
+        vm.prank(owner);
+        court.setPanelRewardWood(REWARD);
+        _assertWoodBalances();
+
+        // CREDIT: a below-floor appeal forfeits its bond into the pot.
+        uint256 caseId = _panelRuled(true);
+        _assertWoodBalances();
+        _appeal(caseId);
+        _assertWoodBalances();
+        vm.prank(minnow);
+        court.voteAppeal(caseId, false);
+        _assertWoodBalances();
+
+        // RESERVE: resolution accrues three rewards out of that pot.
+        _finalizeAppeal(caseId);
+        _assertWoodBalances();
+        assertEq(court.forfeitedWood(), BOND);
+        assertEq(court.reservedRewards(), REWARD * 3);
+
+        // BURN: the unreserved surplus, and only that.
+        vm.prank(dave);
+        court.burnForfeited();
+        _assertWoodBalances();
+        assertEq(court.forfeitedWood(), REWARD * 3);
+
+        // CLAIM: the reserve draws down in lockstep with the pot.
+        vm.prank(alice);
+        court.claimPanelReward();
+        _assertWoodBalances();
+        assertEq(court.reservedRewards(), REWARD * 2);
+        assertEq(court.forfeitedWood(), REWARD * 2, "pot and reserve move together");
+
+        vm.prank(bob);
+        court.claimPanelReward();
+        _assertWoodBalances();
+        vm.prank(carol);
+        court.claimPanelReward();
+        _assertWoodBalances();
+
+        assertEq(court.forfeitedWood(), 0);
+        assertEq(court.reservedRewards(), 0);
+        assertEq(_outstandingRewards(), 0);
+        assertEq(wood.balanceOf(address(court)), court.bondedWood(), "only posted bonds remain");
+    }
+
+    /// @notice A reserve made by case 1 is NOT available to fund case 2. Counting
+    ///         it would let the second panel be credited against the first
+    ///         panel's money and leave whichever claimed second unable to
+    ///         withdraw.
+    function test_panelReward_doesNotFundOneCaseOutOfAnotherCasesReserve() public {
+        vm.prank(owner);
+        court.setPanelRewardWood(REWARD);
+        _seatBonded(_three());
+
+        // Case 1 forfeits exactly enough to reserve one panel's rewards.
+        uint256 first = _panelRuledOn(11, true);
+        _appeal(first);
+        vm.prank(minnow);
+        court.voteAppeal(first, false);
+        _finalizeAppeal(first);
+        assertEq(court.reservedRewards(), REWARD * 3);
+
+        // Drain the surplus so ONLY the reserve is left in the pot.
+        vm.prank(dave);
+        court.burnForfeited();
+        assertEq(court.forfeitedWood(), REWARD * 3, "the pot is now entirely reserved");
+
+        // Case 2 resolves against an empty SURPLUS, so it pays nobody.
+        uint256 second = _panelRuledOn(12, true);
+        vm.expectEmit(true, false, false, true);
+        emit ICourt.PanelRewardUnfunded(second, REWARD * 3, 0);
+        _resolveUnappealed(second);
+
+        assertEq(court.reservedRewards(), REWARD * 3, "case 1's reserve is untouched");
+        assertEq(_outstandingRewards(), REWARD * 3, "no second credit was invented");
+        _assertWoodBalances();
+
+        // Case 1's panel is still paid in full.
+        vm.prank(alice);
+        assertEq(court.claimPanelReward(), REWARD);
+        _assertWoodBalances();
     }
 
     // ────────────────── §4 invariant across the whole two-layer flow ──────────────────
@@ -2068,13 +2313,29 @@ contract CourtTest is Test {
         assertEq(court.bondedWood(), BOND * 3);
         assertEq(court.forfeitedWood(), BOND);
 
-        vm.prank(owner);
-        court.sweepForfeited(backstop);
+        vm.prank(dave); // permissionless: no owner path to forfeited funds exists
+        court.burnForfeited();
         _assertWoodBalances();
     }
 
+    /// @dev The §4 identity, plus the containment that keeps it a TWO-term
+    ///      identity. `reservedRewards` is a subset of `forfeitedWood`, so it
+    ///      must never exceed it — if it ever did, reserved rewards would be
+    ///      backed by WOOD the court does not hold and the burn's
+    ///      `forfeitedWood - reservedRewards` would underflow.
     function _assertWoodBalances() internal view {
         assertEq(wood.balanceOf(address(court)), court.bondedWood() + court.forfeitedWood());
+        assertLe(court.reservedRewards(), court.forfeitedWood(), "reserved rewards must stay inside the pot");
+    }
+
+    /// @dev Every outstanding credit, summed. `reservedRewards` is supposed to
+    ///      equal exactly this — it is the accumulator behind the per-member
+    ///      mapping, and drift between the two is either a reward the court
+    ///      cannot pay or WOOD stranded forever.
+    function _outstandingRewards() internal view returns (uint256) {
+        return
+            court.panelRewardOf(alice) + court.panelRewardOf(bob) + court.panelRewardOf(carol)
+                + court.panelRewardOf(dave);
     }
 
     // ═════════════ Task 5: the bad-faith track (D4, finding F6) ═════════════
@@ -2550,10 +2811,11 @@ contract CourtTest is Test {
         assertEq(court.bondedWood(), BOND * 2, "bob's and carol's");
         assertEq(court.forfeitedWood(), BOND, "alice's is the protocol's now");
 
-        vm.prank(owner);
-        court.sweepForfeited(backstop);
+        vm.prank(dave);
+        court.burnForfeited();
         _assertWoodBalances();
-        assertEq(wood.balanceOf(backstop), BOND, "one sink, swept where governance points it");
+        assertEq(wood.balanceOf(BURN_ADDRESS), BOND, "one sink, and its only exit has no beneficiary");
+        assertEq(wood.balanceOf(backstop), 0, "nobody collects a slashed bond, governance included");
     }
 
     // ─────────────────── the flat panelist reward (D5) ───────────────────
@@ -2591,7 +2853,10 @@ contract CourtTest is Test {
         assertEq(court.panelRewardOf(alice), REWARD, "ruled with the majority");
         assertEq(court.panelRewardOf(bob), REWARD, "ruled AGAINST it - identical pay (D5)");
         assertEq(court.panelRewardOf(carol), REWARD);
-        assertEq(court.forfeitedWood(), BOND - REWARD * 3, "paid out of the protocol-owned pot");
+        // Reserved, not moved: the WOOD stays in the protocol-owned pot and is
+        // merely fenced off there until it is claimed.
+        assertEq(court.forfeitedWood(), BOND, "still in the pot");
+        assertEq(court.reservedRewards(), REWARD * 3, "...but spoken for");
         _assertWoodBalances();
     }
 
@@ -2691,6 +2956,8 @@ contract CourtTest is Test {
         _finalizeAppeal(caseId);
 
         uint256 bondedBefore = court.bondedWood();
+        uint256 forfeitedBefore = court.forfeitedWood();
+        uint256 reservedBefore = court.reservedRewards();
         uint256 balanceBefore = wood.balanceOf(alice);
 
         vm.expectEmit(true, false, false, true);
@@ -2699,7 +2966,11 @@ contract CourtTest is Test {
         assertEq(court.claimPanelReward(), REWARD);
 
         assertEq(wood.balanceOf(alice), balanceBefore + REWARD);
-        assertEq(court.bondedWood(), bondedBefore - REWARD);
+        // The claim is paid out of the RESERVE inside the protocol-owned pot,
+        // not out of `bondedWood` — the reward was never a posted bond.
+        assertEq(court.bondedWood(), bondedBefore, "posted bonds are not the source");
+        assertEq(court.forfeitedWood(), forfeitedBefore - REWARD);
+        assertEq(court.reservedRewards(), reservedBefore - REWARD, "pot and reserve draw down together");
         assertEq(court.panelRewardOf(alice), 0);
         _assertWoodBalances();
 
