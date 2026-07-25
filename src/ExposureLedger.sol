@@ -335,12 +335,25 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         uint256 needUsd = coverageUsd(asset, gov.getRequiredCoverage(proposalId));
         if (needUsd == 0) return; // zero-coverage: nothing to book
 
-        // Already fully covered by earlier approvers: this guardian still adds
-        // slashable weight on conviction, but consumes none of its own budget.
-        uint256 already = _committedUsd[key];
-        if (already >= needUsd) return;
-        uint256 stillNeeded = needUsd - already;
-
+        // RESERVATION, NOT ALLOCATION. This books the MOST this guardian could
+        // ever end up carrying — the whole proposal, if every other approver
+        // walks away — and the final split is computed at read time by
+        // `allocatedUsd`. Two properties fall out, and both are the point:
+        //
+        //   1. Nobody can squat the book. The old code let the first approver
+        //      absorb the entire coverage, after which later approvers booked
+        //      zero and were not even listed. Front-running the first approve
+        //      and then flipping to Block released the whole commitment, while
+        //      the late-vote lockout stopped the free-ridden approver from
+        //      re-registering: a costless, permanent veto by a guardian holding
+        //      less than block quorum. Reserving per approver removes the thing
+        //      there was to squat.
+        //   2. The batching cap gets STRICTER, not looser. Every approval now
+        //      consumes budget up to the full coverage rather than whatever was
+        //      left over, so a guardian can back fewer concurrent drains, not
+        //      more. The excess is not stranded: it clears when the epoch bucket
+        //      expires, and a vote change releases it immediately.
+        //
         // Free budget = k * bond - open exposure. Zero free budget is the
         // batching attack's boundary: this guardian's bond is already fully
         // spoken for by its other open approvals, so it cannot back another drain.
@@ -349,7 +362,7 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         if (open >= capUsd) revert ExposureCapExceeded();
         uint256 free = capUsd - open;
 
-        uint256 share = free < stillNeeded ? free : stillNeeded;
+        uint256 share = free < needUsd ? free : needUsd;
         // Truncation in the uint192 store below would book phantom (smaller)
         // exposure — fail loudly instead.
         if (share > type(uint192).max) revert InvalidParameter();
@@ -433,13 +446,19 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         uint256 bps = swood.maxDelegatedSlashBps();
         uint256 priceX8 = woodUsdPriceX8;
 
+        // Summed over RESERVATIONS, not allocations. The question here is
+        // "can the approvers who are still committed cover this?", and a
+        // reservation is exactly each one's answer. Summing allocations instead
+        // would be circular AND wrong: they are scaled to total `needUsd` and
+        // round down, so a fully-subscribed proposal would fail its own quorum
+        // by the truncation dust.
         uint256 haveUsd;
         for (uint256 i = 0; i < n; i++) {
             address g = approvers[i];
-            uint256 committed = _recorded[key][g].usd;
-            if (committed == 0) continue; // released via a vote change
+            uint256 reserved = _recorded[key][g].usd;
+            if (reserved == 0) continue; // released via a vote change
             uint256 live = _slashableBondUsd(g, bps, priceX8);
-            haveUsd += live < committed ? live : committed;
+            haveUsd += live < reserved ? live : reserved;
             if (haveUsd >= needUsd) return; // early exit
         }
         // The loop early-returns on success — reaching here means the covering
@@ -493,19 +512,81 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         uint256 maxDelegated = swood.maxDelegatedSlashBps();
         uint256 priceX8 = woodUsdPriceX8;
 
+        // Prices against the ALLOCATION, never the reservation. `recordApproval`
+        // deliberately over-reserves — each approver books up to the full
+        // coverage so there is no leftover to squat — so the reservation is an
+        // upper bound on liability, not the liability. Slashing it would take
+        // the whole coverage from EVERY approver: two approvers on a $8,000
+        // proposal each carry $4,000 but each reserved $5,000.
+        //
+        // Read once here rather than calling `allocatedUsd` per guardian: that
+        // would repeat two external calls (`getProposalView`, then the vault's
+        // `asset()`) and a feed read on every iteration.
+        ILedgerGovernorMinimal gov = ILedgerGovernorMinimal(governor);
+        uint256 needUsd = coverageUsd(
+            IVaultAssetMinimal(gov.getProposalView(proposalId).vault).asset(), gov.getRequiredCoverage(proposalId)
+        );
+        uint256 reservedTotal = _committedUsd[key];
+
         for (uint256 i = 0; i < n; i++) {
             address g = listed[i];
             approvers[i] = g;
-            uint256 committed = _recorded[key][g].usd;
-            if (committed == 0) continue; // booked nothing -> owes nothing
+            uint256 reserved = _recorded[key][g].usd;
+            if (reserved == 0) continue; // released -> owes nothing
+            uint256 owed = _allocate(reserved, reservedTotal, needUsd);
+            if (owed == 0) continue; // scaled to dust -> nothing to collect
             uint256 live = _slashableBondUsd(g, maxDelegated, priceX8);
-            if (live == 0 || committed >= live) {
+            if (live == 0 || owed >= live) {
                 bps[i] = BPS_DENOMINATOR;
                 continue;
             }
-            // `committed` is a uint192, so the numerator cannot overflow.
-            bps[i] = (committed * BPS_DENOMINATOR + live - 1) / live;
+            // `owed <= reserved`, itself a uint192, so this cannot overflow.
+            bps[i] = (owed * BPS_DENOMINATOR + live - 1) / live;
         }
+    }
+
+    /// @inheritdoc IExposureLedger
+    /// @dev What `guardian` actually carries on this proposal, as opposed to
+    ///      what `recordApproval` reserved. Reservations are deliberately
+    ///      over-sized (each approver reserves up to the FULL coverage), so the
+    ///      real split is this pro-rata scale-back, computed at read time from
+    ///      whoever is still an approver right now.
+    ///
+    ///      Computing it lazily rather than writing it down is what closes the
+    ///      squat-then-release veto: there is no stored allocation for an
+    ///      attacker to capture early and hand back late. Flipping to Block
+    ///      deletes the reservation, `_committedUsd` drops, and every remaining
+    ///      approver's allocation scales UP on the next read — so a departing
+    ///      approver hands their share to the others instead of voiding the
+    ///      proposal.
+    ///
+    ///      It also means no keeper is required: execution reads the allocation
+    ///      directly, so a settlement transaction can never be withheld to
+    ///      strand a proposal.
+    function allocatedUsd(address governor, uint256 proposalId, address guardian) public view returns (uint256) {
+        bytes32 key = _reviewKey(governor, proposalId);
+        uint256 reserved = _recorded[key][guardian].usd;
+        if (reserved == 0) return 0;
+        ILedgerGovernorMinimal gov = ILedgerGovernorMinimal(governor);
+        address asset = IVaultAssetMinimal(gov.getProposalView(proposalId).vault).asset();
+        uint256 needUsd = coverageUsd(asset, gov.getRequiredCoverage(proposalId));
+        return _allocate(reserved, _committedUsd[key], needUsd);
+    }
+
+    /// @dev Pro-rata scale-back of one reservation. Under-subscribed
+    ///      (`reservedTotal <= needUsd`) every approver carries its whole
+    ///      reservation and the quorum fails on the aggregate — scaling UP to
+    ///      cover a shortfall would invent collateral nobody pledged.
+    ///
+    ///      Rounds DOWN, and the residue is deliberate: allocations must never
+    ///      sum above `needUsd`, or approvers would jointly owe more than the
+    ///      loss and the surplus would have no claimant. The truncated dust
+    ///      leaves the aggregate a few wei short of `needUsd`, which the caller
+    ///      absorbs — `requireApproveQuorum` compares against the same rounded
+    ///      sum it just built, so the comparison stays self-consistent.
+    function _allocate(uint256 reserved, uint256 reservedTotal, uint256 needUsd) internal pure returns (uint256) {
+        if (reservedTotal <= needUsd) return reserved;
+        return (reserved * needUsd) / reservedTotal;
     }
 
     /// @inheritdoc IExposureLedger
