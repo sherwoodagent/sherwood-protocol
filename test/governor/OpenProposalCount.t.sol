@@ -437,17 +437,22 @@ contract OpenProposalCountTest is Test {
         uint256 pid = _propose();
         _voteFor(pid);
 
-        // Past voteEnd → GuardianReview, past reviewEnd with no blockers
-        // would be Approved, past executeBy with no executeProposal call
-        // would be Expired. The VIEW remains at GuardianReview until a
-        // mutating `_resolveState` calls `resolveReview` on the registry.
+        // Past voteEnd → GuardianReview; past reviewEnd with no blockers →
+        // Approved; past executeBy with no executeProposal call → Expired.
+        // `stateOf` is a true view, so it reports Expired straight away rather
+        // than pinning at GuardianReview until someone pokes the registry.
+        //
+        // The COUNTER, however, is storage: it can only move in a transaction.
+        // That gap — view already resolved, bookkeeping not yet committed — is
+        // precisely why the permissionless `resolveProposalState` flush still
+        // exists after the refactor.
         vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + REVIEW_PERIOD + EXECUTION_WINDOW + 1);
         assertEq(
             uint256(governor.getProposalState(pid)),
-            uint256(ISyndicateGovernor.ProposalState.GuardianReview),
-            "view pins at GuardianReview until registry resolves"
+            uint256(ISyndicateGovernor.ProposalState.Expired),
+            "true view: Expired once executeBy passes, no poke required"
         );
-        assertEq(governor.openProposalCount(), 1, "counter stuck at 1 pre-flush");
+        assertEq(governor.openProposalCount(), 1, "counter stuck at 1 until the flush commits");
 
         // Permissionless flush resolves the registry review AND commits the
         // state transition, decrementing the counter.
