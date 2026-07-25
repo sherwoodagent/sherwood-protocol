@@ -2,50 +2,53 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build the challenge game of spec §3.4 — the *trigger* above Plan C's payout rails. Anyone may post a bonded challenge against an executed proposal citing an objective violation predicate; a mechanically-provable predicate auto-proves on-chain and, after a delay with no dispute, slashes the covering approvers straight into the `CompensationEscrow`; a disputed or assertion-only challenge parks for the court (v1c).
+**Goal:** Build the challenge game of spec §3.4 — the *trigger* above Plan C's payout rails. Anyone may post a bonded challenge against an executed proposal, citing a predicate and an evidence pointer, which freezes the accused coverage. If nobody disputes within the delay, the covering approvers are slashed straight into the `CompensationEscrow`. If an accused approver posts a counter-bond, the challenge escalates to the court (v1c) and, absent a ruling, times out in favour of the accused.
 
-**Architecture:** One new contract, `ChallengeGame` (Ownable2Step, not upgradeable — same shape as `TierRegistry`/`ExposureLedger`). It reads proposal facts from `SyndicateGovernor` (stored calls, envelope, capital snapshot, executedAt) and the covering approver set from `ExposureLedger`, freezes that proposal's committed coverage while a challenge is live, and on a passed challenge calls `StakedWood.slashToEscrow` — which Plan C already built and tested. `ExposureLedger` gains a coverage freeze and a public approver getter; `TierRegistry` gains an authorized-demoter role so a passed challenge can demote the offending adapter.
+**Architecture:** One new contract, `ChallengeGame` (Ownable2Step, not upgradeable — same shape as `TierRegistry`/`ExposureLedger`). It reads `executedAt` and the vault from `SyndicateGovernor` and the covering approver set from `ExposureLedger`, freezes that proposal's committed coverage while a challenge is live, and on a passed challenge calls `StakedWood.slashToEscrow` — which Plan C already built and tested. `ExposureLedger` gains a coverage freeze and a public approver getter; `TierRegistry` gains an authorized-demoter role so a passed challenge can demote the offending adapter.
 
 **Tech Stack:** Solidity 0.8.28, Foundry (forge test/fmt), OpenZeppelin Ownable2Step / SafeERC20. Repo conventions: custom errors declared in the interface, natspec with spec-section tags, tests in `test/*.t.sol`, storage goldens via `script/check-layout-goldens.sh`.
 
 **Sequencing:** Plan A (§3.1–3.2) → Plan B (v1a: coverage ledger, quorum, bonds) → Plan C (v1b part 1: slash rails + compensation escrow, PR #24) → **this**. After it, v1b still needs:
-- **Plan E — §3.4a epoch NAV checkpointing** (per-epoch mark-to-market, renewal-before-reveal, forced wind-down). Required before predicate 5 can bind on strategies longer than one epoch; this plan implements predicate 5 only for strategies that settle within one epoch.
+- **Plan E — §3.4a epoch NAV checkpointing** (per-epoch mark-to-market, renewal-before-reveal, forced wind-down), which gives predicate 5 its per-epoch attribution for strategies longer than one epoch.
 - **Plan F — approver premium (§3.10) + watchtower funding**, gated on the §4 **blocking** ROE validation.
 - v1c — the two-layer court (§3.5), which is what a disputed challenge parks for.
 
 ---
 
-## The decisive scoping fact: only three of the five predicates are on-chain checkable
+## The decisive design fact: adjudication is silence, not on-chain proof
 
-§3.4 lists five predicates and calls them all "objective violation predicates checkable from public calldata + trace". Two of them are not checkable *on-chain*:
+§3.4's flow is **assertion + silence**, not verification:
 
-| # | Predicate | On-chain? | Handling in this plan |
-|---|---|---|---|
-| 1 | Net outflow to addresses outside the whitelisted adapter set | **Yes** — re-derive from the governor's stored `_executeCalls` + `TierRegistry.isAdapterAllowed` | `prove()` verifies, auto-passes |
-| 2 | Execution price deviation vs a manipulation-resistant oracle | **No** — needs the oracle round at the execution block plus a venue-specific fair-value model | Assertion only → parks for the court |
-| 3 | Outflow destination linkable to the proposer (funding graph) | **No** — §8 itself says this "needs a consistent evidentiary standard" | Assertion only → parks for the court |
-| 4 | Allowance/ownership granted to a non-protocol address | **Yes** — the same selector/target analysis the vault's `_guardBatchCalls` already performs | `prove()` verifies, auto-passes |
-| 5 | Single-proposal drawdown breach vs declared `maxDrawdownBps` | **Yes, for a strategy settling within one epoch** — `getCapitalSnapshot(pid)` vs realized assets at settle | `prove()` verifies, auto-passes; long strategies need Plan E |
+> **Undisputed** challenge → slash auto-executes after a delay.
+> **Disputed** (accused post a counter-bond) → escalates to adjudication (§3.5).
 
-**This is the plan's central design decision (D1).** A challenge carries a predicate id. Predicates 1/4/5 are *provable*: `prove()` re-derives the violation from chain state and, if it holds, moves the challenge to `Proven` with no human in the loop. Predicates 2/3 are *assertions*: they can be filed and they freeze coverage, but they can only ever reach `Disputed` and wait for the court. Pretending 2/3 were auto-verifiable would be the dangerous outcome — it would let a bonded filing slash on an unproven claim.
+Nothing in the spec asks the chain to *verify* a predicate. The accused is given a window and a cheap way to contest; not contesting IS the adjudication. An earlier draft of this plan added an on-chain `prove()` that re-derived predicates 1/4/5 from stored calldata. That is dropped, for three reasons:
 
-**Consequence to state in the PR:** until v1c exists, a predicate-2 or -3 challenge can freeze coverage and forfeit bonds but can never slash. Only 1/4/5 close the loop end-to-end.
+1. **It was never required.** It is an addition beyond §3.4, and it bought real risk — calldata parsing with the exact `transferFrom` arg-2 offset bug PR #13's review caught, historical oracle round lookups, and a duplicate of logic the vault's `_guardBatchCalls` already implements. Two copies of a parser is a divergence waiting to happen.
+2. **Only three of five predicates could ever be proven on-chain anyway.** Predicate 2 (oracle price deviation) needs a venue-specific fair-value model; predicate 3 (proposer-linked destination) is a funding-graph question §8 itself says "needs a consistent evidentiary standard." A design where 1/4/5 are code-enforced and 2/3 are judge-enforced runs **two different security models** in one mechanism.
+3. **Judges are already the trust root for the hard cases.** Extending them to the easy cases adds no new trust assumption; it removes a bifurcation.
+
+**So a challenge is an assertion with an evidence pointer.** All five predicates are handled identically: file with a bond and an `evidenceURI`, freeze the accused coverage, and let silence or a counter-bond decide.
+
+**The consequence, which must be named in the PR:** vigilance cost moves to guardians. A guardian who sleeps through the dispute window is slashed on an unproven assertion. That is defensible — they are staked professionals, the challenger posts a bond scaled to the coverage it freezes, and a bad-faith challenger forfeits that bond — but it is a genuine shift in who bears the watching burden, and it is why the dispute window must be generous relative to the auto-slash delay.
 
 ---
 
 ## Design decisions pinned before any code
 
-**D1 — Provable vs assertion-only predicates.** As above. `prove()` reverts `PredicateNotProvable` for 2/3.
+**D1 — A challenge is a bonded assertion; adjudication is silence.** No on-chain predicate verification. All five predicates take the same path. The `Predicate` enum is retained purely as a **classification carried in the event** so watchtowers, indexers and (later) judges can filter and route — it does not branch any logic.
 
 **D2 — Who gets slashed: the ledger's committed approvers.** `ExposureLedger._approversOf[reviewKey]` is the covering set, and each entry's committed share is what that guardian actually backed. It is currently `internal` with no getter — this plan adds `approversOf(governor, proposalId)`. Slashing that exact set is what makes §2's inequality hold: recovery is the sum of *their* bonds.
 
-**D3 — Freeze is per-proposal, never whole-stake** (§3.4 "Freeze scope"). A live challenge marks the proposal's committed coverage frozen in the ledger so `releaseApproval` cannot free it and the guardian cannot recycle that budget into a fresh approval while under challenge. It does **not** touch the guardian's stake or its other open approvals.
+**D3 — Freeze is per-proposal, never whole-stake** (§3.4 "Freeze scope"). A live challenge pins the proposal's committed coverage so `releaseApproval` cannot free it and the guardian cannot recycle that budget while under challenge. It does **not** touch the guardian's stake or its other open approvals.
 
-**D4 — Challenger bond scales with frozen exposure** (§3.4). `bond = frozenCoverageUsd * challengerBondBps / 10_000`, converted to WOOD at the ledger's haircut price. A failed challenge forfeits it to the accused approvers pro-rata to their committed shares; a passed challenge returns it and pays the §3.4 first-detector bounty.
+**D4 — Challenger bond scales with frozen exposure** (§3.4). `bond = frozenCoverageUsd * challengerBondBps / 10_000`, converted to WOOD at the ledger's haircut price. This is the ONLY thing deterring frivolous filings now that no proof is required, so it is load-bearing — a failed challenge forfeits it to the accused approvers pro-rata to their committed shares.
 
-**D5 — Disputed parks, it does not resolve.** An accused approver posts a counter-bond to dispute. That moves the challenge to `Disputed` and stops the auto-slash clock **permanently until v1c**. This plan ships no adjudication. `Disputed` is a terminal state here, and the PR must say so plainly rather than implying a court exists.
+**D5 — A disputed challenge times out in favour of the accused.** An accused approver posts a counter-bond to dispute, which stops the auto-slash clock and escalates to the court. **The court (v1c) does not exist yet**, so without a fallback both bonds and the frozen coverage would sit stuck forever — anyone could freeze a guardian's coverage indefinitely just by filing. Therefore: if no ruling lands within `disputeTimeout`, the challenge **fails** — the challenger's bond forfeits to the accused and the coverage unfreezes. Fail-safe toward *not* slashing, which is the right default when the adjudicator is missing.
 
-**D6 — The compensation snapshot is the block before execution.** Per §3.8, for predicates 1–4 and predicate 5 on a short strategy, "pre-drain block" is the block before the challenged proposal executed. `ChallengeGame` passes `executedAt - 1` to `slashToEscrow`. Plan C's `snapshotTimestamp <= openedAt` guard is satisfied because the verdict opens after execution.
+**Accepted consequence:** until v1c ships, a genuinely guilty party can dispute and run out the clock. That is the honest cost of shipping the game before the court, and it must be stated in the PR rather than discovered. It is strictly better than the alternative (indefinite freeze), because it keeps the mechanism live and bounded.
+
+**D6 — The compensation snapshot is the block before execution.** Per §3.8, "pre-drain block" is the block before the challenged proposal executed. `ChallengeGame` passes `executedAt - 1` to `slashToEscrow`. Plan C's `snapshotTimestamp <= openedAt` guard is satisfied because the challenge opens after execution.
 
 **D7 — Adapter demotion needs a new role.** §3.4: "Adapters demote only on a **passed** challenge." `TierRegistry.demote` is `onlyOwner`, so this plan adds an `authorizedDemoter` role (owner-set, pointed at `ChallengeGame`) rather than making the game the registry owner — the game can revoke a certification, never grant one.
 
@@ -390,21 +393,22 @@ Cover: `file` pulls the bond and freezes coverage, and the challenge lands in `F
 
 ```solidity
     enum Predicate {
-        OutOfAdapterOutflow,   // 1 — provable
-        OraclePriceDeviation,  // 2 — assertion only
-        ProposerLinkedOutflow, // 3 — assertion only
-        RogueAllowance,        // 4 — provable
-        DrawdownBreach         // 5 — provable (single-epoch strategies)
+        // Classification only (D1): carried in the event so watchtowers,
+        // indexers and judges can filter and route. Branches no logic — every
+        // predicate takes the same assertion path.
+        OutOfAdapterOutflow,   // §3.4 #1
+        OraclePriceDeviation,  // §3.4 #2
+        ProposerLinkedOutflow, // §3.4 #3
+        RogueAllowance,        // §3.4 #4
+        DrawdownBreach         // §3.4 #5
     }
 
-    enum Status { None, Filed, Proven, Disputed, Failed, Settled }
+    enum Status { None, Filed, Disputed, Failed, Settled }
 
     error NotExecuted();
     error WindowClosed();
     error AlreadyChallenged();
     error NothingToFreeze();
-    error PredicateNotProvable();
-    error PredicateNotViolated();
     error WrongStatus();
     error DelayNotElapsed();
     error NotAccusedApprover();
@@ -420,7 +424,6 @@ Cover: `file` pulls the bond and freezes coverage, and the challenge lands in `F
         uint256 bondWood,
         string evidenceURI
     );
-    event ChallengeProven(uint256 indexed challengeId);
     event ChallengeDisputed(uint256 indexed challengeId, address indexed disputer, uint256 counterBondWood);
     event ChallengeSettled(uint256 indexed challengeId, uint256 slashedWood, uint256 caseId);
     event ChallengeFailed(uint256 indexed challengeId, uint256 forfeitedWood);
@@ -443,44 +446,26 @@ git commit -m "feat(challenge): bonded filing with per-proposal coverage freeze 
 
 ---
 
-### Task 4: The three provable predicates
+### Task 4: Dispute, timeout, resolve, slash, demote
 
 **Files:**
 - Modify: `src/ChallengeGame.sol`
 - Test: `test/ChallengeGame.t.sol` (append)
 
-`prove(challengeId)` is permissionless and re-derives the violation from chain state. It reverts `PredicateNotProvable` for predicates 2/3 and `PredicateNotViolated` when the check does not hold.
+- **`dispute(challengeId)`** — callable only by an accused approver of that proposal (checked against the ledger's approver list, `NotAccusedApprover` otherwise), only from `Filed`, and only before `filedAt + autoSlashDelay` elapses. Pulls a counter-bond equal to the challenger's and moves to `Disputed`, stopping the auto-slash clock.
+- **`resolve(challengeId)`** — permissionless, and what it does depends on the state it finds:
+  - **`Filed` and `filedAt + autoSlashDelay` elapsed → SLASH.** Nobody contested, so silence is the verdict (§3.4). Read the approver set and committed shares from the ledger, call `StakedWood.slashToEscrow(caseKey, filedAt, approvers, maxSlashBps, vault, executedAt - 1)`, demote the offending adapter via `TierRegistry.demoteByChallenge`, return the challenger's bond plus the first-detector bounty, unfreeze, status `Settled`, emit `ChallengeSettled` with the escrow's `caseId`.
+  - **`Disputed` and `filedAt + disputeTimeout` elapsed → FAIL (D5).** No court exists to rule, so the challenge fails safe: the challenger's bond forfeits to the accused approvers pro-rata to committed shares, the counter-bond returns to whoever posted it, coverage unfreezes, status `Failed`.
+  - Neither deadline reached → revert `DelayNotElapsed`.
+- **Owner setters:** `challengeWindow`, `autoSlashDelay`, `disputeTimeout`, `challengerBondBps`, `detectorBountyWood`, plus the wired addresses (ledger, tier registry, sWOOD, escrow). Bound `autoSlashDelay` to a sane floor — it is the guardian's entire window to notice and contest, and D1 moved the vigilance burden onto them.
 
-- **Predicate 1 — out-of-adapter outflow.** Walk the governor's stored execute calls; for each value-moving ERC20 selector (`approve` `0x095ea7b3`, `increaseAllowance` `0x39509351`, `transfer` `0xa9059cbb`, `transferFrom` `0x23b872dd` — the same four the vault's `_guardBatchCalls` gates) decode the spender/recipient and assert `TierRegistry.isAdapterAllowed(dest) == false && dest != vault`. Any such call proves the predicate.
-  **Reuse the vault's argument offsets exactly:** `approve`/`increaseAllowance`/`transfer` read arg 1 at `data[4:36]`; **`transferFrom` reads `to` at `data[36:68]` (arg 2), NOT `from`.** That is the classic parser bug and PR #13's review called it out by name. Mask to 160 bits. Treat calldata shorter than the read as non-proving rather than reverting.
-- **Predicate 4 — rogue allowance.** The `approve`/`increaseAllowance` subset of the same walk — strictly narrower than 1, kept distinct because §3.4 lists them separately and they carry different evidentiary weight.
-- **Predicate 5 — drawdown breach (single-epoch strategies only).** `capital = governor.getCapitalSnapshot(pid)`; `realized = ISyndicateVault(vault).totalAssets()`; violation iff `capital - realized > capital * maxDrawdownBps / 10_000`. **Guard it:** revert `PredicateNotProvable` when the proposal is not yet `Settled` (nothing realized to compare against), when `maxDrawdownBps == 10_000` (§3.4: "void when the envelope is 10_000 — passive-beta mandate"), and when the strategy spanned more than one coverage epoch (needs Plan E's NAV checkpoints).
+Tests must include: undisputed `Filed` past the delay → slash lands in the escrow as a case pinned to `executedAt - 1`, and the adapter is demoted; `resolve` before the delay reverts `DelayNotElapsed`; `dispute` by a non-approver reverts `NotAccusedApprover`; `dispute` after the delay reverts (the window closed); a disputed challenge cannot be resolved before `disputeTimeout`; a disputed challenge past `disputeTimeout` fails, forfeits the challenger's bond to the accused pro-rata, and returns the counter-bond; coverage is unfrozen on **both** terminal paths, and the guardian can then actually `releaseApproval` again. Plus the §4-mandated fuzz: **the game's WOOD balance always equals the bonds held for live (`Filed`/`Disputed`) challenges**, across fuzzed bond sizes and resolution orders over several concurrent challenges.
 
-Tests must include: each provable predicate proving on a genuine violation; each *failing* to prove on a clean proposal (`PredicateNotViolated`); predicates 2/3 reverting `PredicateNotProvable`; the `maxDrawdownBps == 10_000` void case; an unsettled proposal reverting for predicate 5; and **a `transferFrom`-to-vault call NOT proving predicate 1** — pulling INTO the vault is inflow, the exact case the vault's own guard also allows, and the offsets must be right for this to pass.
-
-- [ ] Commit: `feat(challenge): on-chain proof for the three mechanically-checkable predicates (spec 3.4)`
-
----
-
-### Task 5: Dispute, resolve, slash, demote
-
-**Files:**
-- Modify: `src/ChallengeGame.sol`
-- Test: `test/ChallengeGame.t.sol` (append)
-
-- **`dispute(challengeId)`** — callable only by an accused approver of that proposal (checked against the ledger's approver list, `NotAccusedApprover` otherwise), only from `Filed` or `Proven`, and only before the auto-slash delay elapses. Pulls a counter-bond equal to the challenger's and moves to `Disputed`. **`Disputed` is terminal in this plan (D5)** — it awaits v1c, and both bonds stay escrowed.
-- **`resolve(challengeId)`** — permissionless, callable once `filedAt + autoSlashDelay` has elapsed:
-  - from `Proven` → **slash**: read the approver set and committed shares from the ledger, call `StakedWood.slashToEscrow(caseKey, filedAt, approvers, maxSlashBps, vault, executedAt - 1)`, demote the offending adapter via `TierRegistry.demoteByChallenge`, return the challenger's bond plus the first-detector bounty, unfreeze the coverage, status `Settled`, emit `ChallengeSettled` with the escrow's `caseId`.
-  - from `Filed` (never proven, never disputed) → **fail**: forfeit the challenger's bond to the accused approvers pro-rata to committed shares, unfreeze, status `Failed`.
-- Owner setters: `challengeWindow`, `autoSlashDelay`, `challengerBondBps`, `detectorBountyWood`, plus the wired addresses (governor-agnostic: ledger, tier registry, sWOOD, escrow).
-
-Tests must include: undisputed `Proven` → slash lands in the escrow as a case pinned to `executedAt - 1` and the adapter is demoted; unproven `Filed` → challenger bond goes to the accused pro-rata; `Disputed` cannot be resolved (stays parked, both bonds held); `resolve` before the delay reverts `DelayNotElapsed`; a non-approver cannot `dispute`; coverage is unfrozen on **both** terminal paths. Plus the §4-mandated fuzz: **the game's WOOD balance always equals the bonds held for live (`Filed`/`Disputed`) challenges**, across fuzzed bond sizes and resolution orders over several concurrent challenges.
-
-- [ ] Commit: `feat(challenge): dispute, auto-slash on undisputed proof, bond forfeiture (spec 3.4)`
+- [ ] Commit: `feat(challenge): dispute, silence-verdict auto-slash, timeout-to-accused (spec 3.4)`
 
 ---
 
-### Task 6: End-to-end — real drain, real slash, real compensation
+### Task 5: End-to-end — real drain, real slash, real compensation
 
 **Files:**
 - Create: `test/ChallengeEndToEnd.t.sol`
@@ -496,7 +481,7 @@ Two arcs, both substantive:
 
 ---
 
-### Task 7: Deploy wiring, goldens, full suite, PR
+### Task 6: Deploy wiring, goldens, full suite, PR
 
 - [ ] **Deploy script.** Add `script/DeployPlanD.s.sol` following `script/DeployPlanB.s.sol`'s conventions (env-var address book, pre-flight asserts, no `--broadcast` in testing): deploy `ChallengeGame`, then wire all four roles — `ledger.setCoverageFreezer`, `tierRegistry.setAuthorizedDemoter`, `swood.setAuthorizedSlasher`, and confirm `escrow.authorizedFunder == swood`. Pre-flight assert each role is unset before wiring, and print the manual follow-ups.
 - [ ] **Goldens.** `ExposureLedger` and `TierRegistry` are NOT upgradeable, so their layouts are unconstrained — but run `./script/check-layout-goldens.sh` anyway and confirm the four pinned contracts are untouched. **Inspect `git diff` and confirm no pre-existing slot moved.**
@@ -509,7 +494,7 @@ Two arcs, both substantive:
 
 ## Self-review checklist
 
-1. **Spec coverage:** §3.4 bonded filing → Task 3. Five predicates → Task 4 (three provable) + D1 (two assertion-only, with the reason stated). Freeze scope → Task 1 + D3. Undisputed auto-slash → Task 5. Disputed → escalation → Task 5 + D5 (parks; v1c does not exist). Failed challenge forfeits to the accused → Task 5. Adapters demote only on a passed challenge → Tasks 2 + 5. §4 invariant + fuzz → Task 5.
-2. **Deliberately NOT in this plan (state in the PR):** adjudication of a disputed challenge (v1c); §3.4a epoch NAV checkpointing, so predicate 5 binds only on strategies settling within one epoch (Plan E); the watchtower's funded monitoring role and §3.10's approver premium (Plan F). The first-detector bounty is *paid* here, but its funding source is Plan F's.
-3. **Known gaps carried forward — name these in the PR:** predicates 2 and 3 can freeze coverage and forfeit bonds but can never slash until v1c, which is a griefing vector bounded only by the challenger bond; and because `Disputed` is terminal, a determined accused party can park a valid challenge indefinitely by posting a counter-bond. Both are direct consequences of shipping the game before the court, and neither should be discovered by a reader rather than told.
-4. **Type consistency:** `approversOf(address,uint256) → (address[], uint256[])` is used identically in Tasks 1, 5, 6. `slashToEscrow`'s real arity is Plan C's post-review **six**-parameter form `(bytes32 caseKey, uint256 openedAt, address[] approvers, uint256 slashBps, address vault, uint256 snapshotTimestamp)` — the escrow address is owner-set state on `StakedWood`, NOT a parameter. `demoteByChallenge(address,bytes4)` matches Tasks 2 and 5. `Predicate` / `Status` enum member names are identical in Tasks 3, 4, 5, 6.
+1. **Spec coverage:** §3.4 bonded filing → Task 3. All five predicates → Task 3 (uniform assertion path) + D1. Freeze scope → Task 1 + D3. Undisputed auto-slash → Task 4. Disputed → escalation → Task 4 + D5 (escalates, then times out to the accused because v1c does not exist). Failed challenge forfeits to the accused → Task 4. Adapters demote only on a passed challenge → Tasks 2 + 4. §4 invariant + fuzz → Task 4.
+2. **Deliberately NOT in this plan (state in the PR):** adjudication of a disputed challenge (v1c); §3.4a epoch NAV checkpointing and its per-epoch attribution (Plan E); the watchtower's funded monitoring role and §3.10's approver premium (Plan F). The first-detector bounty is *paid* here, but its funding source is Plan F's. **No on-chain predicate verification** — see D1 for why that is a deliberate simplification rather than a gap.
+3. **Known gaps carried forward — name these in the PR:** (a) a genuinely guilty approver can dispute and run out `disputeTimeout`, escaping the slash until v1c exists (D5) — the accepted cost of failing safe when the adjudicator is missing; (b) vigilance moves to guardians, who are slashed on an unproven assertion if they sleep through `autoSlashDelay` (D1); (c) a bad-faith challenger can freeze a guardian's coverage for the duration of a challenge at the cost of its bond. All three are direct consequences of shipping the game before the court, and none should be discovered by a reader rather than told.
+4. **Type consistency:** `approversOf(address,uint256) → (address[], uint256[])` is used identically in Tasks 1, 4, 5. `slashToEscrow`'s real arity is Plan C's post-review **six**-parameter form `(bytes32 caseKey, uint256 openedAt, address[] approvers, uint256 slashBps, address vault, uint256 snapshotTimestamp)` — the escrow address is owner-set state on `StakedWood`, NOT a parameter. `demoteByChallenge(address,bytes4)` matches Tasks 2 and 4. `Predicate` / `Status` enum member names are identical in Tasks 3, 4, 5.
