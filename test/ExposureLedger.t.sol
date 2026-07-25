@@ -104,6 +104,7 @@ contract ExposureLedgerTest is Test {
     address internal owner = makeAddr("owner");
     address internal guardian = makeAddr("guardian");
     address internal registry = makeAddr("registry");
+    address internal freezer = makeAddr("freezer");
     MockGovernorForLedger internal mgov;
     address internal usdgAsset;
 
@@ -184,6 +185,7 @@ contract ExposureLedgerTest is Test {
         vm.startPrank(owner);
         ledger.setAssetFeed(usdgAsset, address(feed), 365 days);
         ledger.setGuardianRegistry(registry);
+        ledger.setCoverageFreezer(freezer);
         vm.stopPrank();
         swood.setStake(guardian, 100_000e18, 0); // slashableBondUsd = $5,000 at $0.05
     }
@@ -489,5 +491,95 @@ contract ExposureLedgerTest is Test {
         vm.prank(registry);
         vm.expectRevert(IExposureLedger.InvalidParameter.selector);
         ledger.recordApproval(address(mgov), 1, guardian);
+    }
+
+    function test_approversOf_listsCommittedApprovers() public {
+        _wireRecording();
+        address g2 = makeAddr("g2");
+        swood.setStake(g2, 100_000e18, 0);
+        mgov.set(8_000e6);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, g2);
+
+        (address[] memory gs, uint256[] memory shares) = ledger.approversOf(address(mgov), 1);
+        assertEq(gs.length, 2);
+        assertEq(gs[0], guardian);
+        assertEq(gs[1], g2);
+        assertEq(shares[0], 5_000e18); // its whole budget
+        assertEq(shares[1], 3_000e18); // the remainder
+    }
+
+    /// @notice A released commitment reports a zero share rather than being
+    ///         dropped — a caller must see the full historical set.
+    function test_approversOf_reportsReleasedAsZero() public {
+        _wireRecording();
+        mgov.set(3_000e6);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        vm.prank(registry);
+        ledger.releaseApproval(address(mgov), 1, guardian);
+        (address[] memory gs, uint256[] memory shares) = ledger.approversOf(address(mgov), 1);
+        assertEq(gs.length, 1);
+        assertEq(shares[0], 0);
+    }
+
+    function test_freeze_onlyFreezer() public {
+        _wireRecording();
+        vm.expectRevert(IExposureLedger.NotCoverageFreezer.selector);
+        ledger.freezeCoverage(address(mgov), 1);
+    }
+
+    /// @notice §3.4: a live challenge pins the proposal's coverage. The guardian
+    ///         cannot vote-change out of it and recycle the budget elsewhere while
+    ///         it is under challenge.
+    function test_freeze_blocksRelease() public {
+        _wireRecording();
+        mgov.set(3_000e6);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+
+        vm.prank(freezer);
+        ledger.freezeCoverage(address(mgov), 1);
+
+        vm.prank(registry);
+        vm.expectRevert(IExposureLedger.CoverageFrozen.selector);
+        ledger.releaseApproval(address(mgov), 1, guardian);
+        assertEq(ledger.openExposureUsd(guardian), 3_000e18, "still committed");
+    }
+
+    function test_unfreeze_restoresRelease() public {
+        _wireRecording();
+        mgov.set(3_000e6);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        vm.prank(freezer);
+        ledger.freezeCoverage(address(mgov), 1);
+        vm.prank(freezer);
+        ledger.unfreezeCoverage(address(mgov), 1);
+        vm.prank(registry);
+        ledger.releaseApproval(address(mgov), 1, guardian);
+        assertEq(ledger.openExposureUsd(guardian), 0);
+    }
+
+    /// @notice The freeze is per-proposal, NOT whole-stake (§3.4 freeze scope):
+    ///         the guardian's other open approvals are untouched.
+    function test_freeze_doesNotTouchOtherApprovals() public {
+        _wireRecording();
+        swood.setStake(guardian, 200_000e18, 0); // $10,000 of budget
+        mgov.set(3_000e6);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 2, guardian);
+
+        vm.prank(freezer);
+        ledger.freezeCoverage(address(mgov), 1);
+
+        // Proposal 2's commitment still releases normally.
+        vm.prank(registry);
+        ledger.releaseApproval(address(mgov), 2, guardian);
+        assertEq(ledger.openExposureUsd(guardian), 3_000e18, "only the frozen one remains");
     }
 }

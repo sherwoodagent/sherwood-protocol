@@ -138,10 +138,22 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     mapping(bytes32 reviewKey => address[]) internal _approversOf;
     mapping(bytes32 reviewKey => mapping(address guardian => bool)) internal _listed;
 
+    /// @notice The one address permitted to freeze a proposal's coverage — the
+    ///         ChallengeGame (spec §3.4). Owner-set.
+    address public coverageFreezer;
+
+    /// @dev Proposals whose committed coverage is pinned by a live challenge.
+    mapping(bytes32 reviewKey => bool) internal _frozen;
+
     // ── Modifiers / helpers ──
 
     modifier onlyRegistry() {
         if (msg.sender != guardianRegistry) revert NotGuardianRegistry();
+        _;
+    }
+
+    modifier onlyFreezer() {
+        if (msg.sender != coverageFreezer) revert NotCoverageFreezer();
         _;
     }
 
@@ -222,6 +234,11 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         if (epochLength + newWindow > swood.coolDownPeriod()) revert InvalidParameter();
         emit ParameterChangeFinalized(PARAM_CHALLENGE_WINDOW, challengeWindow, newWindow);
         challengeWindow = newWindow;
+    }
+
+    function setCoverageFreezer(address freezer) external onlyOwner {
+        emit CoverageFreezerSet(coverageFreezer, freezer);
+        coverageFreezer = freezer;
     }
 
     function setKNumerator(uint256 newK) external onlyOwner {
@@ -377,12 +394,50 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      in `_approversOf` with a zeroed commitment; the quorum skips it.
     function releaseApproval(address governor, uint256 proposalId, address guardian) external onlyRegistry {
         bytes32 key = _reviewKey(governor, proposalId);
+        // A live challenge pins this coverage (§3.4): the guardian may not
+        // release it and recycle the budget while under challenge.
+        if (_frozen[key]) revert CoverageFrozen();
         RecordedExposure memory r = _recorded[key][guardian];
         if (r.usd == 0) return;
         delete _recorded[key][guardian];
         _buckets[guardian][r.epoch] -= r.usd;
         _committedUsd[key] -= r.usd;
         emit ExposureReleased(guardian, key, r.usd, r.epoch);
+    }
+
+    /// @inheritdoc IExposureLedger
+    function approversOf(address governor, uint256 proposalId)
+        external
+        view
+        returns (address[] memory approvers, uint256[] memory committedUsd)
+    {
+        bytes32 key = _reviewKey(governor, proposalId);
+        approvers = _approversOf[key];
+        committedUsd = new uint256[](approvers.length);
+        for (uint256 i = 0; i < approvers.length; i++) {
+            committedUsd[i] = _recorded[key][approvers[i]].usd;
+        }
+    }
+
+    /// @inheritdoc IExposureLedger
+    /// @dev Spec §3.4 freeze scope: this pins ONE proposal's committed
+    ///      coverage. It deliberately does not touch the guardian's stake or
+    ///      its other open approvals — a challenge freezes the coverage it
+    ///      accuses, not the guardian.
+    function freezeCoverage(address governor, uint256 proposalId) external onlyFreezer {
+        _frozen[_reviewKey(governor, proposalId)] = true;
+        emit CoverageFrozenSet(governor, proposalId, true);
+    }
+
+    /// @inheritdoc IExposureLedger
+    function unfreezeCoverage(address governor, uint256 proposalId) external onlyFreezer {
+        _frozen[_reviewKey(governor, proposalId)] = false;
+        emit CoverageFrozenSet(governor, proposalId, false);
+    }
+
+    /// @inheritdoc IExposureLedger
+    function isCoverageFrozen(address governor, uint256 proposalId) external view returns (bool) {
+        return _frozen[_reviewKey(governor, proposalId)];
     }
 
     /// @inheritdoc IExposureLedger

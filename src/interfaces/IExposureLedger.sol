@@ -17,6 +17,8 @@ interface IExposureLedger {
     error StalePrice();
     error InvalidParameter();
     error ZeroAddress();
+    error NotCoverageFreezer();
+    error CoverageFrozen();
 
     // ── Events ──
     event WoodUsdPriceSet(uint256 oldPriceX8, uint256 newPriceX8);
@@ -25,6 +27,8 @@ interface IExposureLedger {
     event ExposureRecorded(address indexed guardian, bytes32 indexed reviewKey, uint256 usd, uint256 epoch);
     event ExposureReleased(address indexed guardian, bytes32 indexed reviewKey, uint256 usd, uint256 epoch);
     event ParameterChangeFinalized(bytes32 indexed paramKey, uint256 oldValue, uint256 newValue);
+    event CoverageFreezerSet(address indexed oldFreezer, address indexed newFreezer);
+    event CoverageFrozenSet(address indexed governor, uint256 indexed proposalId, bool frozen);
 
     // ── Registry-only mutations ──
     function recordApproval(address governor, uint256 proposalId, address guardian) external;
@@ -36,7 +40,22 @@ interface IExposureLedger {
         external
         view;
 
+    // ── Coverage freeze (challenge game, spec §3.4) ──
+    function freezeCoverage(address governor, uint256 proposalId) external;
+    function unfreezeCoverage(address governor, uint256 proposalId) external;
+    function isCoverageFrozen(address governor, uint256 proposalId) external view returns (bool);
+    function setCoverageFreezer(address freezer) external;
+    function coverageFreezer() external view returns (address);
+
     // ── Views ──
+    /// @notice The covering approvers of a proposal and the USD each committed.
+    ///         A released commitment reports a zero share rather than being
+    ///         dropped, so a caller sees the full historical set.
+    function approversOf(address governor, uint256 proposalId)
+        external
+        view
+        returns (address[] memory approvers, uint256[] memory committedUsd);
+
     function slashableBondUsd(address guardian) external view returns (uint256);
     function openExposureUsd(address guardian) external view returns (uint256);
     function coverageUsd(address asset, uint256 amount) external view returns (uint256);
