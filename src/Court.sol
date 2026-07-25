@@ -891,11 +891,21 @@ contract Court is Ownable2Step, ICourt {
     /// @dev THE RE-LOCK IS F6's DEFENCE, NOT BOOKKEEPING. `panelRule` could only
     ///      lock to `referredAt + panelWindow + badFaithWindow`, because the
     ///      instant the CASE finalizes did not exist yet. Task 5's bad-faith
-    ///      window opens HERE, which is later whenever an appeal ran, so without
-    ///      this extension a panelist could make a corrupt ruling, wait out a
-    ///      long appeal, withdraw its bond the moment the panel-phase lock
-    ///      expired and leave the bad-faith track with nothing to slash. The
-    ///      entire binding incentive on panel behaviour would be decorative.
+    ///      window opens HERE, and the two locks run on DIFFERENT CLOCKS:
+    ///      `panelRule`'s from `referredAt`, this one from whenever the case
+    ///      actually resolved. Which one dominates depends on how the case ran,
+    ///      not merely on whether an appeal happened — at the defaults a panel
+    ///      that burns its full 7-day window and then takes a 3-day appeal
+    ///      filing plus a 5-day vote resolves at day 15 and locks to day 29,
+    ///      past `panelRule`'s day 21; a panel that closes early on day 0 and
+    ///      takes the same appeal resolves at day 8 and locks to day 22, so
+    ///      `panelRule`'s floor still wins. `_lockPanelBond` only ever EXTENDS,
+    ///      which is what makes it safe to apply both without reasoning about
+    ///      which is later. Without this second lock the long-appeal case would
+    ///      let a panelist make a corrupt ruling, sit out the appeal, withdraw
+    ///      its bond the moment the panel-phase lock expired and leave the
+    ///      bad-faith track with nothing to slash — the entire binding
+    ///      incentive on panel behaviour would be decorative.
     /// @dev The verdict is a SINGLE BIT by the time it leaves here (D7): §3.5
     ///      treats a guilty finding as ground truth and Plan D's `_settle`
     ///      slashes at `maxSlashBps` with no severity ramp, so there is nothing
