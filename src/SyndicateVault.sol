@@ -579,14 +579,25 @@ contract SyndicateVault is
     /// @dev Reads the active proposal's strategy through the governor's scalar
     ///      `strategyOf` getter. Returns `address(0)` when no proposal is active
     ///      OR when the active proposal opted out of live NAV (proposer passed
-    ///      `strategy=0`). No defensive catch: an `address` return cannot drift
-    ///      in shape the way the old full-struct `getProposal` read could.
+    ///      `strategy=0`). Still wrapped in try/catch: the shape argument (an
+    ///      `address` return cannot drift the way the old full-struct
+    ///      `getProposal` read could) says nothing about EXISTENCE. The vault is
+    ///      a UUPS proxy and the governor is a BEACON proxy — they upgrade on
+    ///      independent paths, so a vault impl that calls `strategyOf` can go
+    ///      live before the governor beacon carries it, and the call then reverts
+    ///      with no data. `_activeStrategy` feeds `_laneState`, hence
+    ///      `maxWithdraw`/`maxRedeem`, so an uncaught revert here is a vault-wide
+    ///      brick rather than a degradation.
     function _activeStrategy() internal view returns (address) {
         address gov = _getGovernor();
         if (gov == address(0)) return address(0);
         uint256 pid = IProposalStatus(gov).getActiveProposal();
         if (pid == 0) return address(0);
-        return IProposalStatus(gov).strategyOf(pid);
+        try IProposalStatus(gov).strategyOf(pid) returns (address strategy) {
+            return strategy;
+        } catch {
+            return address(0);
+        }
     }
 
     /// @inheritdoc ISyndicateVault

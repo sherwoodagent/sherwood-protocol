@@ -290,7 +290,9 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         if (voteEnd == 0 || reviewEnd <= voteEnd) revert InvalidReviewWindow();
         Review storage r = _reviews[_reviewKey(msg.sender, proposalId)];
         if (r.voteEnd != 0) revert ReviewAlreadyRegistered();
+        // forge-lint: disable-next-line(unchecked-cast)
         r.voteEnd = uint64(voteEnd);
+        // forge-lint: disable-next-line(unchecked-cast)
         r.reviewEnd = uint64(reviewEnd);
         emit ReviewRegistered(msg.sender, proposalId, uint64(voteEnd), uint64(reviewEnd));
     }
@@ -396,6 +398,12 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         bytes32 key = _reviewKey(governor, proposalId);
         Review storage r = _reviews[key];
         if (!r.opened) revert ReviewNotOpen();
+        // Defence in depth alongside `openReview`'s resolved guard: a resolved
+        // review (cancelled, or already committed) accepts no further votes,
+        // so no approve weight can accrue on a proposal that carries no slash
+        // risk. Unreachable while `openReview` refuses to re-open — kept so a
+        // future edit to either guard cannot silently arm the other.
+        if (r.resolved) revert ReviewNotOpen();
 
         if (r.voteEnd == 0 || block.timestamp < r.voteEnd || block.timestamp >= r.reviewEnd) revert ReviewNotOpen();
 
@@ -668,11 +676,19 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     ///      `block.timestamp >= proposal.voteEnd`. Snapshots sWOOD's
     ///      `totalGuardianStake` / `totalDelegatedStake` into the review.
     ///      Idempotent: subsequent calls are no-ops.
+    /// @dev A RESOLVED review never re-opens. `cancelReview`'s never-opened
+    ///      short-circuit makes `(opened == false, resolved == true)` reachable
+    ///      BEFORE `reviewEnd`, i.e. while the vote window is still open. Without
+    ///      this guard a keeper could re-open a cancelled review and guardians
+    ///      could then mint reward-eligible approve weight (`getApproverWeights`,
+    ///      the documented input to off-chain reward attribution) on a proposal
+    ///      that is already Cancelled — at zero slash risk, since `resolveReview`
+    ///      returns the cached `blocked == false` without ever slashing.
     function openReview(address governor, uint256 proposalId) external whenNotPaused {
         if (!_authorizedGovernors.contains(governor)) revert UnauthorizedGovernor();
         bytes32 key = _reviewKey(governor, proposalId);
         Review storage r = _reviews[key];
-        if (r.opened) return; // idempotent
+        if (r.opened || r.resolved) return; // idempotent
 
         uint256 ve = r.voteEnd;
         if (ve == 0 || block.timestamp < ve) revert ReviewNotOpen();

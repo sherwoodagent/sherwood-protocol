@@ -181,7 +181,7 @@
       "type": "t_array(t_uint256)_storage"
     }
   ],
-  "structs": {
+  "types": {
     "t_struct(Call)_storage": [
       {
         "label": "target",
