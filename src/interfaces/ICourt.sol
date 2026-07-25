@@ -109,6 +109,31 @@ interface ICourt {
         uint256 finalizedAt;
     }
 
+    /// @notice One bad-faith proceeding: a vote about ONE panelist's ruling on
+    ///         ONE case, and never about the merits (decision D4).
+    /// @param opener        Who opened it and posted `bond`. The bond returns to
+    ///        this address on EVERY branch — see `openBadFaith` for why the
+    ///        bad-faith track prices escalation differently from the appeal.
+    /// @param bond          The WOOD posted, captured at open time so a later
+    ///        `setBadFaithBondWood` cannot change what an open vote is owed.
+    /// @param openedAt      When the vote opened; `appealVoteWindow` runs from it.
+    /// @param badFaithVotes STAKE that says the ruling was made in bad faith,
+    ///        weighted by `getPastVotes` at the CASE's stored `snapshotTs` — the
+    ///        same electorate the merits appeal used, so neither vote can be run
+    ///        against a different set of holders.
+    /// @param resolved      Set by `finalizeBadFaith`. One proceeding per
+    ///        (case, panelist) pair, ever, so this is also the terminal flag.
+    /// @param slashed       Whether that finalization slashed the panel bond.
+    struct BadFaithVote {
+        address opener;
+        uint256 bond;
+        uint256 openedAt;
+        uint256 badFaithVotes;
+        uint256 goodFaithVotes;
+        bool resolved;
+        bool slashed;
+    }
+
     // ── Errors ──
     // Roster and bonds (Task 2).
     error NotPanelist();
@@ -142,6 +167,22 @@ interface ICourt {
     error ParticipationFloorNotMet();
     error AlreadyVoted();
     error NoVotingPower();
+
+    // The bad-faith track (Task 5, F6).
+    /// @notice A bad-faith vote was opened against a member that did not rule on
+    ///         that case. The track answers for RULINGS, so the target set is
+    ///         `panelVoters(caseId)` and nothing else — not the live roster, and
+    ///         not a member that abstained.
+    error PanelistDidNotRule();
+    /// @notice One bad-faith proceeding per (case, panelist) pair, ever. Without
+    ///         this an attacker could re-open a vote it lost, and — because an
+    ///         open vote escrows the bond — could pin an honest panelist's bond
+    ///         indefinitely by opening a fresh one each time the last resolved.
+    error BadFaithAlreadyOpened();
+    /// @notice No bad-faith vote is open for that (case, panelist) pair, either
+    ///         because none was opened or because it already resolved.
+    error BadFaithNotOpen();
+    error NothingToClaim();
 
     // Shared.
     error ZeroAddress();
@@ -214,6 +255,54 @@ interface ICourt {
     event AppealBondWoodSet(uint256 oldAmount, uint256 newAmount);
     event ParticipationFloorBpsSet(uint256 oldBps, uint256 newBps);
     event ForfeitedWoodSwept(address indexed to, uint256 amount);
+
+    // The bad-faith track (Task 5, F6).
+    /// @param voteDeadline When `voteBadFaith` closes and `finalizeBadFaith`
+    ///        opens. The proceeding is separate from the merits appeal (D4) but
+    ///        reuses `appealVoteWindow` for its length — one knob, and the two
+    ///        votes are the same kind of thing: a stake-weighted vote of the
+    ///        case's stored electorate.
+    event BadFaithOpened(
+        uint256 indexed caseId, address indexed panelist, address indexed opener, uint256 bond, uint256 voteDeadline
+    );
+    /// @param badFaith True = "this ruling was made in bad faith". NOT a vote on
+    ///        the merits: the electorate may believe the ruling was wrong and
+    ///        still vote false here, and that distinction is the whole of D4.
+    event BadFaithVoteCast(
+        uint256 indexed caseId, address indexed panelist, address indexed voter, bool badFaith, uint256 weight
+    );
+    /// @notice THE F6 EVENT. Carries the tally and the floor as well as the
+    ///         outcome, because "the electorate cleared the floor and said good
+    ///         faith" and "not enough of it turned out to decide" are different
+    ///         facts about a panelist that both leave its bond whole.
+    event BadFaithFinalized(
+        uint256 indexed caseId,
+        address indexed panelist,
+        bool slashed,
+        uint256 badFaithVotes,
+        uint256 goodFaithVotes,
+        uint256 floor
+    );
+    /// @notice The panelist's bond moved from `bondedWood` to `forfeitedWood`.
+    ///         Emitted separately from `BadFaithFinalized` so the slash is a
+    ///         first-class log line and not a boolean inside a tally.
+    event PanelBondSlashed(uint256 indexed caseId, address indexed panelist, uint256 amount);
+    event BadFaithBondReturned(
+        uint256 indexed caseId, address indexed panelist, address indexed opener, uint256 amount
+    );
+    event BadFaithBondWoodSet(uint256 oldAmount, uint256 newAmount);
+    event PanelRewardWoodSet(uint256 oldAmount, uint256 newAmount);
+    /// @notice A FLAT reward, credited to every member that ruled on the case
+    ///         (D5). The amount does not depend on how the member voted, nor on
+    ///         which way the case came out.
+    event PanelRewardAccrued(uint256 indexed caseId, address indexed member, uint256 amount);
+    event PanelRewardClaimed(address indexed member, uint256 amount);
+    /// @notice The case resolved with rewards configured but the protocol-owned
+    ///         pot too thin to pay EVERY ruling member, so it paid NONE of them.
+    ///         All-or-nothing is deliberate: paying the pot down in vote order
+    ///         would make the reward depend on when a member ruled, which is a
+    ///         bias on panel behaviour of exactly the kind D5 exists to remove.
+    event PanelRewardUnfunded(uint256 indexed caseId, uint256 required, uint256 available);
 
     // ── Roster (D1) ──
     /// @notice Replace the seated panel with `members`.
@@ -319,6 +408,86 @@ interface ICourt {
     ///         has not.
     function appealVoteOf(uint256 caseId, address voter) external view returns (Ruling);
 
+    // ── The bad-faith track (Task 5, F6) ──
+    /// @notice Open a vote on whether `panelist` ruled on `caseId` in BAD FAITH,
+    ///         posting `badFaithBondWood`. Permissionless, and open for
+    ///         `badFaithWindow` after the case resolved.
+    /// @dev    THIS IS THE ONLY THING THAT CAN SLASH A PANEL BOND, AND IT IS NOT
+    ///         THE MERITS APPEAL (decision D4, finding F6). The first draft of
+    ///         §3.5 slashed the panel bond on a merits overturn, which hands an
+    ///         attacker who controls the cheap appeal layer BOTH halves of the
+    ///         prize: a corrupt ruling made safe AND the honest panelists who
+    ///         voted against it punished. It also gives every panelist a
+    ///         beauty-contest incentive to predict the token vote rather than
+    ///         read the evidence. So the two tracks are independent in BOTH
+    ///         directions — being overturned on the merits never slashes, and
+    ///         winning the merits appeal never immunizes.
+    /// @dev    THE BOND RETURNS ON EVERY BRANCH, unlike the appeal's, which
+    ///         forfeits below the floor. The asymmetry is deliberate: a
+    ///         below-floor APPEAL asked the electorate to override the panel and
+    ///         failed to raise one, whereas the bad-faith track is the only
+    ///         check that exists on a bribable panel, and pricing a failed
+    ///         accusation would deter exactly the check F6 asks for. Spam is
+    ///         bounded instead by `BadFaithAlreadyOpened` plus the finite
+    ///         `badFaithWindow`.
+    function openBadFaith(uint256 caseId, address panelist) external;
+
+    /// @notice Vote on whether the ruling was made in bad faith.
+    /// @dev    SAME ELECTORATE, SAME STORED SNAPSHOT, SAME PARTICIPATION FLOOR as
+    ///         the merits appeal — read from `case.snapshotTs`, never recomputed,
+    ///         so the two votes cannot be run against different holders.
+    function voteBadFaith(uint256 caseId, address panelist, bool badFaith) external;
+
+    /// @notice Close the proceeding: slash `panelist`'s bond if the floor was
+    ///         cleared and the majority said bad faith, and return the opener's
+    ///         bond either way.
+    /// @dev    SLASHED BONDS GO TO `forfeitedWood`, NOT TO THE COMPENSATION
+    ///         ESCROW'S PER-CASE CLAIMS. A corrupt panelist's bond is not the
+    ///         drained value: `CompensationEscrow.openCase` fixes a case's
+    ///         `proceeds` at open time precisely so per-case funds stay isolated
+    ///         (a critical Plan C fix), and crediting an unrelated slash into a
+    ///         victim case would inflate its proceeds and pay claimants out of
+    ///         money that was never theirs. One sink, governance-directed
+    ///         through `sweepForfeited`.
+    function finalizeBadFaith(uint256 caseId, address panelist) external;
+
+    /// @notice The bad-faith proceeding against `panelist`'s ruling on `caseId`.
+    ///         `openedAt == 0` means none was ever opened.
+    function badFaithOf(uint256 caseId, address panelist) external view returns (BadFaithVote memory);
+
+    /// @notice How `voter` voted in that proceeding; `Ruling.Guilty` means "bad
+    ///         faith", `Ruling.NotGuilty` "good faith", `None` "has not voted".
+    function badFaithVoteOf(uint256 caseId, address panelist, address voter) external view returns (Ruling);
+
+    /// @notice How many bad-faith proceedings against `member` are still open.
+    /// @dev    A COUNTER HERE, where `panelBondLockedUntil` is a deadline, and
+    ///         the difference is load-bearing. A ruling's bad-faith window may
+    ///         simply never be used, so a counter incremented at ruling time
+    ///         would strand the bond forever — hence the deadline there. An
+    ///         OPENED proceeding, by contrast, can always be closed by anyone
+    ///         once its vote window elapses, including by the panelist itself,
+    ///         so a counter cannot strand anything and it removes the race a
+    ///         pure deadline would leave: a panelist front-running
+    ///         `finalizeBadFaith` to withdraw the instant its lock expired.
+    function openBadFaithVotes(address member) external view returns (uint256);
+
+    /// @notice The WOOD an opener posts. Returned on every branch.
+    function badFaithBondWood() external view returns (uint256);
+
+    /// @notice The FLAT per-ruling reward (D5). Zero disables rewards.
+    /// @dev    Flat is the point: §3.5 requires the panelist's pay to be
+    ///         independent of which way it rules, or the reward itself becomes
+    ///         an incentive to track the expected verdict rather than the
+    ///         evidence.
+    function panelRewardWood() external view returns (uint256);
+
+    /// @notice Reward credited to `member` and not yet claimed. Counted inside
+    ///         `bondedWood`, because it is WOOD somebody can still claim.
+    function panelRewardOf(address member) external view returns (uint256);
+
+    /// @notice Withdraw accrued panel rewards.
+    function claimPanelReward() external returns (uint256 amount);
+
     /// @notice The members that recorded a ruling on `caseId`, in vote order.
     ///         The set whose bonds the case's resolution locks, and the set
     ///         Task 5's bad-faith track can be opened against.
@@ -387,6 +556,11 @@ interface ICourt {
     function setAppealVoteWindow(uint256 newWindow) external;
     function setAppealBondWood(uint256 newBond) external;
     function setParticipationFloorBps(uint256 newBps) external;
+    function setBadFaithBondWood(uint256 newBond) external;
+    /// @notice Set the flat per-ruling panel reward. Zero is legal and turns
+    ///         rewards off; the only shape this setter refuses is a non-flat one,
+    ///         which it does by having no per-verdict argument to give.
+    function setPanelRewardWood(uint256 newReward) external;
     /// @notice Move forfeited WOOD out of the court. Never touches `bondedWood`,
     ///         so no open position can be swept out from under its owner.
     function sweepForfeited(address to) external returns (uint256 amount);

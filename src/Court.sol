@@ -18,10 +18,18 @@ import {IStakedWood} from "./interfaces/IStakedWood.sol";
  *         appealable to a full WOOD vote, and the outcome drives
  *         `ChallengeGame.rule`.
  *
- * @dev    THIS REVISION IS THE ROSTER, THE MEMBER BONDS AND BOTH LAYERS (Plan E
- *         Tasks 2-4). The bad-faith track (Task 5) builds on it. `ICourt`
- *         already declares its errors, so that task adds functions rather than
- *         churning the ABI.
+ * @dev    THIS REVISION IS THE WHOLE MECHANISM (Plan E Tasks 2-5): the roster
+ *         and member bonds, layer 1's panel, layer 2's token-vote appeal, and
+ *         the bad-faith track that is the only thing able to slash a panel bond.
+ *
+ * @dev    THE BAD-FAITH TRACK IS A SEPARATE VOTE FROM THE MERITS APPEAL (D4,
+ *         finding F6), and that separation is the security core of this
+ *         contract. If bad faith were decided by the merits appeal, an attacker
+ *         who controls the cheap appeal layer would collect BOTH prizes at once:
+ *         a corrupt ruling made safe, and the honest panelists who voted against
+ *         it slashed for it. The independence runs in both directions — being
+ *         overturned on the merits never slashes a panelist, and winning the
+ *         merits appeal never immunizes one.
  *
  * @dev    NEITHER HALF IS SAFE ALONE. §3.5: a token vote is incompetent for
  *         forensic questions and capturable at ~$15M mcap; a standalone panel
@@ -37,12 +45,14 @@ import {IStakedWood} from "./interfaces/IStakedWood.sol";
  *
  * @dev    §4 INVARIANT: `wood.balanceOf(this) == bondedWood + forfeitedWood`.
  *         `bondedWood` is every WOOD position somebody can still claim — posted
- *         panel bonds plus the bonds of appeals still open — and
- *         `forfeitedWood` is what the protocol now owns, from appeal bonds that
- *         missed the participation floor. Task 5 adds bad-faith bonds to the
- *         first and slashed panel bonds to the second. The equality is exact
- *         except for WOOD somebody donated here by mistake, which no path ever
- *         spends.
+ *         panel bonds, the bonds of appeals and bad-faith votes still open, and
+ *         accrued-but-unclaimed panel rewards — and `forfeitedWood` is what the
+ *         protocol now owns: appeal bonds that missed the participation floor
+ *         and panel bonds slashed for bad faith. TWO TERMS, NOT THREE: every
+ *         transfer between the buckets moves the same amount out of one and into
+ *         the other in a single statement, so the equality holds at every
+ *         intermediate step and not merely at rest. The equality is exact except
+ *         for WOOD somebody donated here by mistake, which no path ever spends.
  */
 contract Court is Ownable2Step, ICourt {
     using SafeERC20 for IERC20;
@@ -112,7 +122,9 @@ contract Court is Ownable2Step, ICourt {
     ///      `_lockPanelBond`. A deadline rather than an open-ruling COUNTER on
     ///      purpose: a bad-faith vote that is never opened has nothing to
     ///      decrement it, so a counter would strand the bond forever, whereas a
-    ///      deadline simply expires.
+    ///      deadline simply expires. `openBadFaithVotes` is the counterpart for
+    ///      proceedings that WERE opened, where the reverse holds — see its
+    ///      declaration for why the two guards are different shapes.
     mapping(address member => uint256) public panelBondLockedUntil;
 
     /// @inheritdoc ICourt
@@ -122,9 +134,17 @@ contract Court is Ownable2Step, ICourt {
     uint256 public bondedWood;
 
     /// @inheritdoc ICourt
-    /// @dev Grows only in `finalizeAppeal`'s below-floor branch. Never overlaps
-    ///      `bondedWood`: a bond moves from one to the other in the same
-    ///      statement, so the §4 equality holds across the transition.
+    /// @dev Grows in exactly two places — `finalizeAppeal`'s below-floor branch
+    ///      and `finalizeBadFaith`'s slash — and shrinks in exactly two:
+    ///      `sweepForfeited` and the flat panel reward. Never overlaps
+    ///      `bondedWood`: value moves from one to the other in the same
+    ///      statement, so the §4 equality holds across every transition.
+    /// @dev ONE SINK, AND DELIBERATELY NOT `CompensationEscrow`. A slashed panel
+    ///      bond is not the value that was drained, and `openCase` fixes a case's
+    ///      `proceeds` at open time precisely to keep per-case funds isolated (a
+    ///      critical Plan C fix) — crediting an unrelated slash into a victim
+    ///      case would inflate its proceeds and pay claimants out of money that
+    ///      was never theirs.
     uint256 public forfeitedWood;
 
     // ─────────────────────── Adjudication state (Task 3) ───────────────────────
@@ -190,6 +210,30 @@ contract Court is Ownable2Step, ICourt {
     /// @inheritdoc ICourt
     mapping(uint256 caseId => mapping(address voter => Ruling)) public appealVoteOf;
 
+    // ───────────── The bad-faith track: F6's defence (Task 5) ─────────────
+
+    /// @inheritdoc ICourt
+    uint256 public badFaithBondWood;
+
+    /// @inheritdoc ICourt
+    /// @dev Starts at zero — rewards are opt-in, because a court deployed with
+    ///      an empty forfeited pot has nothing to pay them from.
+    uint256 public panelRewardWood;
+
+    mapping(uint256 caseId => mapping(address panelist => BadFaithVote)) internal _badFaith;
+
+    /// @inheritdoc ICourt
+    mapping(uint256 caseId => mapping(address panelist => mapping(address voter => Ruling))) public badFaithVoteOf;
+
+    /// @inheritdoc ICourt
+    /// @dev The second half of the bond lock, alongside `panelBondLockedUntil`.
+    ///      See the interface for why this one is a counter where that one is a
+    ///      deadline.
+    mapping(address member => uint256) public openBadFaithVotes;
+
+    /// @inheritdoc ICourt
+    mapping(address member => uint256) public panelRewardOf;
+
     /// @param initialOwner   The governance multisig that executes the off-chain
     ///                       panel election (D1).
     /// @param wood_          The WOOD token every bond here is denominated in.
@@ -210,6 +254,14 @@ contract Court is Ownable2Step, ICourt {
         // tunes it with `setAppealBondWood`, which also refuses zero.
         appealBondWood = panelBondWood_;
         emit AppealBondWoodSet(0, panelBondWood_);
+
+        // Same reasoning for the bad-faith bond, in the other direction: it is
+        // never zero so opening a proceeding is never entirely free, and
+        // `setBadFaithBondWood` refuses zero for the same reason. It is not a
+        // price on being wrong — it returns on every branch — only a floor under
+        // the cost of opening one.
+        badFaithBondWood = panelBondWood_;
+        emit BadFaithBondWoodSet(0, panelBondWood_);
     }
 
     // ─────────────────────────── Roster (D1) ───────────────────────────
@@ -604,6 +656,168 @@ contract Court is Ownable2Step, ICourt {
         _resolve(caseId, c, c.panelRuling);
     }
 
+    // ────────────── The bad-faith track: F6's defence (D4) ──────────────
+
+    /// @inheritdoc ICourt
+    /// @dev THE TARGET SET IS `_panelVoters[caseId]`, checked here through
+    ///      `panelVoteOf`. It is stored per case rather than read off the live
+    ///      roster because a member can be rotated off once its lock expires,
+    ///      and the track must still be able to answer for what it did while it
+    ///      sat. For the same reason nothing here requires the target to still
+    ///      be seated.
+    /// @dev THE OPEN COUNTER IS WHAT KEEPS THE BOND IN REACH. Incrementing it
+    ///      re-locks the bond for as long as this proceeding runs, on top of
+    ///      whatever `panelBondLockedUntil` already says. Without it a panelist
+    ///      could withdraw in the same block the deadline lock expired, front-
+    ///      running the `finalizeBadFaith` that was about to slash it — the
+    ///      deadline alone leaves exactly that race, because a vote opened near
+    ///      the end of `badFaithWindow` outlives it.
+    /// @dev REQUIRES `stakedWood` WIRED, refused at the door for the same reason
+    ///      `appeal` refuses it: a proceeding opened with no electorate to read
+    ///      could never be finalized, and its bond and the panelist's lock would
+    ///      both be stranded permanently.
+    function openBadFaith(uint256 caseId, address panelist) external {
+        Case storage c = _cases[caseId];
+        // The window opens at the CASE's resolution, not at the panel phase:
+        // until the court has actually spoken there is no ruling to answer for,
+        // and an appeal can still change what the ruling meant.
+        if (c.phase != Phase.Resolved) revert WrongPhase();
+        if (block.timestamp >= c.finalizedAt + badFaithWindow) revert WindowClosed();
+        if (panelVoteOf[caseId][panelist] == Ruling.None) revert PanelistDidNotRule();
+        if (stakedWood == address(0)) revert ZeroAddress();
+
+        BadFaithVote storage bf = _badFaith[caseId][panelist];
+        if (bf.openedAt != 0) revert BadFaithAlreadyOpened();
+
+        uint256 bond = badFaithBondWood;
+        bf.opener = msg.sender;
+        bf.bond = bond;
+        bf.openedAt = block.timestamp;
+        bondedWood += bond;
+        openBadFaithVotes[panelist] += 1;
+
+        wood.safeTransferFrom(msg.sender, address(this), bond);
+        emit BadFaithOpened(caseId, panelist, msg.sender, bond, block.timestamp + appealVoteWindow);
+    }
+
+    /// @inheritdoc ICourt
+    /// @dev THE QUESTION IS CONDUCT, NOT THE MERITS (D4). A voter may believe the
+    ///      panel got the answer wrong and still vote `false` here; that is the
+    ///      normal case, and it is why the merits appeal exists separately. What
+    ///      this vote decides is whether the ruling was made in bad faith, which
+    ///      is the only thing §3.5 lets anyone take a panelist's bond for.
+    /// @dev THE ELECTORATE IS THE CASE'S, READ FROM STORAGE. `c.snapshotTs` was
+    ///      fixed in `refer` at `executedAt - 1` (D2) and is never recomputed, so
+    ///      this vote and the merits appeal are decided by exactly the same
+    ///      holders at exactly the same instant — nobody who bought in after the
+    ///      drain can vote to protect the panelist that acquitted them, and no
+    ///      later reorganisation of the governor's records can move the roll.
+    ///      `getPastVotes` has ALREADY applied the age curve (D3); do not
+    ///      re-weight.
+    function voteBadFaith(uint256 caseId, address panelist, bool badFaith) external {
+        BadFaithVote storage bf = _badFaith[caseId][panelist];
+        if (bf.openedAt == 0 || bf.resolved) revert BadFaithNotOpen();
+        if (block.timestamp >= bf.openedAt + appealVoteWindow) revert WindowClosed();
+        if (badFaithVoteOf[caseId][panelist][msg.sender] != Ruling.None) revert AlreadyVoted();
+
+        uint256 weight = IStakedWood(stakedWood).getPastVotes(msg.sender, _cases[caseId].snapshotTs);
+        if (weight == 0) revert NoVotingPower();
+
+        badFaithVoteOf[caseId][panelist][msg.sender] = badFaith ? Ruling.Guilty : Ruling.NotGuilty;
+        if (badFaith) {
+            bf.badFaithVotes += weight;
+        } else {
+            bf.goodFaithVotes += weight;
+        }
+
+        emit BadFaithVoteCast(caseId, panelist, msg.sender, badFaith, weight);
+    }
+
+    /// @inheritdoc ICourt
+    /// @dev SAME PARTICIPATION FLOOR AS THE APPEAL, and for the same anti-capture
+    ///      reason (D6): a handful of tokens bought for the purpose must not be
+    ///      able to take an honest panelist's bond any more than they can
+    ///      overturn a ruling. Below the floor the proceeding decides nothing and
+    ///      the panelist is left whole — that branch is a NON-EVENT, not an
+    ///      acquittal, and it is why `ParticipationFloorNotMet` is not raised
+    ///      here: failing to reach the floor is an outcome, not an error.
+    /// @dev THE SLASH IS THE POSTED BOND, NOT THE CURRENT REQUIREMENT, mirroring
+    ///      `withdrawPanelBond`: whatever the member actually has at stake is
+    ///      what answers for the ruling, whichever way `panelBondWood` moved
+    ///      since. A member already slashed by another case simply has nothing
+    ///      left to take, which is a no-op rather than a revert — the proceeding
+    ///      still concludes and the opener still gets its bond back.
+    /// @dev SLASHED BONDS LAND IN `forfeitedWood`, THE EXISTING SINK, and never
+    ///      in `CompensationEscrow`'s per-case claims. A corrupt panelist's bond
+    ///      is not the value that was drained: `openCase` fixes a case's
+    ///      `proceeds` at open time precisely to keep per-case funds isolated (a
+    ///      critical Plan C fix), so crediting an unrelated slash into a victim
+    ///      case would inflate its proceeds and pay claimants out of money that
+    ///      was never theirs. One sink, governance-directed via `sweepForfeited`.
+    /// @dev THE PANELIST KEEPS ITS SEAT AND ITS ACCRUED REWARD; it loses its
+    ///      bond, which drops it below `panelBondWood` and so out of
+    ///      `isReadyToRule` until it posts again. Removing it from the roster is
+    ///      the owner's call (D1) — the contract does not silently re-run the
+    ///      election.
+    function finalizeBadFaith(uint256 caseId, address panelist) external {
+        BadFaithVote storage bf = _badFaith[caseId][panelist];
+        if (bf.openedAt == 0 || bf.resolved) revert BadFaithNotOpen();
+        if (block.timestamp < bf.openedAt + appealVoteWindow) revert WindowOpen();
+
+        uint256 badFaithVotes = bf.badFaithVotes;
+        uint256 goodFaithVotes = bf.goodFaithVotes;
+        uint256 turnout = badFaithVotes + goodFaithVotes;
+        uint256 floor = participationFloorBps * IStakedWood(stakedWood).getPastTotalVotes(_cases[caseId].snapshotTs)
+            / BPS_DENOMINATOR;
+
+        // Terminal before either transfer, and the open counter is released
+        // here: a re-entrant call finds `resolved` set and hits BadFaithNotOpen.
+        bf.resolved = true;
+        openBadFaithVotes[panelist] -= 1;
+
+        uint256 bond = bf.bond;
+        bf.bond = 0;
+        bondedWood -= bond;
+
+        // A tie leaves the bond whole, the same fail-safe direction every other
+        // verdict in this contract takes: an electorate split down the middle
+        // has not established that the ruling was corrupt.
+        bool slash = turnout != 0 && turnout >= floor && badFaithVotes > goodFaithVotes;
+        if (slash) {
+            bf.slashed = true;
+            uint256 slashed = panelBondOf[panelist];
+            if (slashed != 0) {
+                panelBondOf[panelist] = 0;
+                bondedWood -= slashed;
+                forfeitedWood += slashed;
+            }
+            emit PanelBondSlashed(caseId, panelist, slashed);
+        }
+
+        address opener = bf.opener;
+        emit BadFaithFinalized(caseId, panelist, slash, badFaithVotes, goodFaithVotes, floor);
+        wood.safeTransfer(opener, bond);
+        emit BadFaithBondReturned(caseId, panelist, opener, bond);
+    }
+
+    /// @inheritdoc ICourt
+    function badFaithOf(uint256 caseId, address panelist) external view returns (BadFaithVote memory) {
+        return _badFaith[caseId][panelist];
+    }
+
+    /// @inheritdoc ICourt
+    /// @dev Paid from `bondedWood`, which is where `_resolve` moved it when the
+    ///      reward accrued, so the §4 equality holds across the claim.
+    function claimPanelReward() external returns (uint256 amount) {
+        amount = panelRewardOf[msg.sender];
+        if (amount == 0) revert NothingToClaim();
+
+        panelRewardOf[msg.sender] = 0;
+        bondedWood -= amount;
+        wood.safeTransfer(msg.sender, amount);
+        emit PanelRewardClaimed(msg.sender, amount);
+    }
+
     /// @inheritdoc ICourt
     function panelVoters(uint256 caseId) external view returns (address[] memory) {
         return _panelVoters[caseId];
@@ -642,6 +856,7 @@ contract Court is Ownable2Step, ICourt {
         for (uint256 i; i < n; ++i) {
             _lockPanelBond(voters[i], until);
         }
+        _accruePanelRewards(caseId, voters, n);
 
         emit CaseResolved(caseId, c.challengeId, ruling);
         IChallengeGame(challengeGame).rule(c.challengeId, ruling == Ruling.Guilty);
@@ -657,15 +872,61 @@ contract Court is Ownable2Step, ICourt {
         if (panelBondOf[member] < panelBondWood) revert PanelBondNotPosted();
     }
 
+    /// @dev THE REWARD IS FLAT (D5): every member that ruled is credited the
+    ///      SAME `panelRewardWood`, whichever way it voted and whichever way the
+    ///      case came out. §3.5 asks for this explicitly, and the reason is
+    ///      narrow — a reward that paid more for agreeing with the eventual
+    ///      verdict would pay panelists to predict the token vote instead of
+    ///      reading the evidence, which is the same beauty-contest failure D4
+    ///      removes from the slashing side. There is deliberately no argument
+    ///      here that could make it depend on `ruling`.
+    /// @dev PAID FROM `forfeitedWood` — the protocol-owned pot fed by below-floor
+    ///      appeal bonds and by bad-faith slashes. Bad conduct funds the honest
+    ///      panel's sitting fee, and no new WOOD sink is invented for it.
+    /// @dev ALL OR NOTHING. If the pot cannot cover every ruling member, none is
+    ///      paid and `PanelRewardUnfunded` says so. Paying down the pot in vote
+    ///      order would make the reward depend on WHEN a member ruled — a race to
+    ///      vote first, which is a bias on panel behaviour of exactly the kind
+    ///      D5 exists to remove — and it would put the court's accounting in the
+    ///      position of underpaying a member it had already credited.
+    function _accruePanelRewards(uint256 caseId, address[] storage voters, uint256 n) internal {
+        uint256 reward = panelRewardWood;
+        if (reward == 0 || n == 0) return;
+
+        uint256 required = reward * n;
+        uint256 available = forfeitedWood;
+        if (available < required) {
+            emit PanelRewardUnfunded(caseId, required, available);
+            return;
+        }
+
+        // Straight from the protocol-owned bucket into the claimable one, in one
+        // statement, so the §4 equality never has an intermediate state.
+        forfeitedWood = available - required;
+        bondedWood += required;
+        for (uint256 i; i < n; ++i) {
+            address member = voters[i];
+            panelRewardOf[member] += reward;
+            emit PanelRewardAccrued(caseId, member, reward);
+        }
+    }
+
     /// @dev Whether `member`'s bond is still needed by the bad-faith track.
     ///      `panelRule` is what makes this live: a member that records a ruling
     ///      is locked to `referredAt + panelWindow + badFaithWindow`, so the
     ///      roster and withdraw guards above genuinely bite from the moment it
-    ///      votes. TASK 4 extends the lock to the case's actual finalization
-    ///      plus `badFaithWindow`, and TASK 5 extends it again for as long as a
-    ///      bad-faith vote against that ruling stays open.
+    ///      votes. `_resolve` extends the lock to the case's actual finalization
+    ///      plus `badFaithWindow`, and an OPEN BAD-FAITH VOTE holds it open for
+    ///      as long as that vote runs, however far past the deadline that is.
+    /// @dev THE SECOND CLAUSE IS NOT REDUNDANT WITH THE FIRST. A proceeding
+    ///      opened in the last moments of `badFaithWindow` runs a further
+    ///      `appealVoteWindow` past the deadline lock, and governance can
+    ///      lengthen `badFaithWindow` after a case resolved without moving the
+    ///      already-stored lock. Either way the deadline can expire with a live
+    ///      vote still running, and without this clause the panelist could
+    ///      withdraw the bond that vote is about.
     function _hasOpenRuling(address member) internal view returns (bool) {
-        return block.timestamp < panelBondLockedUntil[member];
+        return block.timestamp < panelBondLockedUntil[member] || openBadFaithVotes[member] != 0;
     }
 
     /// @dev Extends `member`'s bond lock to `until`. NEVER shortens it: two
@@ -786,6 +1047,29 @@ contract Court is Ownable2Step, ICourt {
         if (newBps == 0 || newBps > BPS_DENOMINATOR) revert InvalidParameter();
         emit ParticipationFloorBpsSet(participationFloorBps, newBps);
         participationFloorBps = newBps;
+    }
+
+    /// @inheritdoc ICourt
+    /// @dev Zero refused, like the appeal bond: opening a bad-faith proceeding
+    ///      escrows a panelist's bond for a full vote window, and a free way to
+    ///      do that is a free way to grief an honest panel. Governs FUTURE
+    ///      proceedings only — an open one is owed the bond it actually posted.
+    function setBadFaithBondWood(uint256 newBond) external onlyOwner {
+        if (newBond == 0) revert InvalidParameter();
+        emit BadFaithBondWoodSet(badFaithBondWood, newBond);
+        badFaithBondWood = newBond;
+    }
+
+    /// @inheritdoc ICourt
+    /// @dev ZERO IS LEGAL HERE, unlike every other amount on this contract: it
+    ///      turns rewards off, which is the state the court is deployed in. The
+    ///      thing this setter cannot express is a reward that varies with the
+    ///      verdict (D5) — there is no argument for one.
+    /// @dev Governs FUTURE resolutions only. A member is credited at the instant
+    ///      its case resolves, and what it was credited is already claimable.
+    function setPanelRewardWood(uint256 newReward) external onlyOwner {
+        emit PanelRewardWoodSet(panelRewardWood, newReward);
+        panelRewardWood = newReward;
     }
 
     /// @inheritdoc ICourt

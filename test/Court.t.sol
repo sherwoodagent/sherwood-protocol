@@ -2076,4 +2076,701 @@ contract CourtTest is Test {
     function _assertWoodBalances() internal view {
         assertEq(wood.balanceOf(address(court)), court.bondedWood() + court.forfeitedWood());
     }
+
+    // ═════════════ Task 5: the bad-faith track (D4, finding F6) ═════════════
+
+    /// @dev The flat per-ruling reward these tests configure. Small enough that
+    ///      one forfeited appeal bond covers a three-member panel.
+    uint256 internal constant REWARD = 100e18;
+
+    // ── helpers ──
+
+    /// @dev A second, third, … case on an ALREADY-BONDED panel. `_panelRuled`
+    ///      seats and bonds, and `postPanelBond` may only be called once, so
+    ///      every multi-case test comes through here instead.
+    function _referOn(uint256 challengeId) internal returns (uint256 caseId) {
+        uint256 proposalId = PROPOSAL_ID + challengeId;
+        governor.setExecuted(proposalId, vm.getBlockTimestamp() - 1 days);
+        game.setChallenge(challengeId, address(governor), proposalId, IChallengeGame.Status.Disputed);
+        caseId = court.refer(challengeId);
+        _setElectorate(caseId);
+    }
+
+    function _panelRuledOn(uint256 challengeId, bool guilty) internal returns (uint256 caseId) {
+        caseId = _referOn(challengeId);
+        vm.prank(alice);
+        court.panelRule(caseId, guilty);
+        vm.prank(bob);
+        court.panelRule(caseId, guilty);
+        vm.prank(carol);
+        court.panelRule(caseId, guilty);
+        court.finalizePanel(caseId);
+    }
+
+    /// @dev Let the appeal window lapse and resolve on the panel's ruling.
+    function _resolveUnappealed(uint256 caseId) internal {
+        vm.warp(court.caseOf(caseId).panelFinalizedAt + court.appealWindow());
+        court.finalizeUnappealed(caseId);
+    }
+
+    /// @dev A RESOLVED conviction: the panel convicted unanimously and nobody
+    ///      appealed. The starting point for most of this section, because the
+    ///      bad-faith track only opens once the CASE itself is terminal.
+    function _resolvedConviction() internal returns (uint256 caseId) {
+        caseId = _panelRuled(true);
+        _resolveUnappealed(caseId);
+    }
+
+    function _openBadFaith(uint256 caseId, address panelist, address opener) internal {
+        vm.prank(opener);
+        court.openBadFaith(caseId, panelist);
+    }
+
+    function _voteBadFaith(uint256 caseId, address panelist, address voter, bool badFaith) internal {
+        vm.prank(voter);
+        court.voteBadFaith(caseId, panelist, badFaith);
+    }
+
+    /// @dev Burn the vote window down and close the proceeding.
+    function _finalizeBadFaith(uint256 caseId, address panelist) internal {
+        uint256 openedAt = court.badFaithOf(caseId, panelist).openedAt;
+        vm.warp(openedAt + court.appealVoteWindow());
+        court.finalizeBadFaith(caseId, panelist);
+    }
+
+    // ───── the two directions of independence: THE POINT OF THIS TASK ─────
+
+    /// @notice **DIRECTION 1 (D4/F6): OVERTURNING THE MERITS DOES NOT SLASH.**
+    ///         The whole panel convicted and the whole panel was reversed by a
+    ///         quorate appeal, and not one member loses a wei. This is the
+    ///         property the first draft of §3.5 got wrong: if the merits appeal
+    ///         slashed, an attacker who controls the cheap appeal layer would
+    ///         collect twice — a corrupt ruling made safe AND the honest
+    ///         panelists who voted against it punished for it — and every
+    ///         panelist would have a beauty-contest incentive to predict the
+    ///         token vote rather than read the evidence. WITHOUT THIS TEST THE
+    ///         F6 FIX IS UNVERIFIED.
+    function test_badFaith_meritsOverturnNeverSlashesThePanelBond() public {
+        uint256 caseId = _panelRuled(true);
+        _appeal(caseId);
+        vm.prank(whale);
+        court.voteAppeal(caseId, false); // 20% of the electorate: quorate, and it overturns
+        _finalizeAppeal(caseId);
+
+        assertEq(uint256(court.caseOf(caseId).finalRuling), uint256(ICourt.Ruling.NotGuilty), "the appeal overturned");
+        assertEq(court.panelBondOf(alice), BOND, "the merits vote has no slashing power");
+        assertEq(court.panelBondOf(bob), BOND);
+        assertEq(court.panelBondOf(carol), BOND);
+        assertEq(court.bondedWood(), BOND * 3);
+        assertEq(court.forfeitedWood(), 0, "being overturned forfeits nothing");
+        // Nor does an overturn implicitly open the other track: the bad-faith
+        // proceeding is something a human must file, on its own question.
+        assertEq(court.badFaithOf(caseId, alice).openedAt, 0);
+        assertEq(court.openBadFaithVotes(alice), 0);
+        _assertWoodBalances();
+    }
+
+    /// @notice **DIRECTION 2 (D4/F6): WINNING THE MERITS APPEAL DOES NOT
+    ///         IMMUNIZE.** The appeal reached quorum and UPHELD alice's ruling —
+    ///         on the merits she was vindicated — and the separate bad-faith vote
+    ///         still takes her bond. An attacker who captures the cheap appeal
+    ///         layer therefore buys a safe verdict and nothing else; the conduct
+    ///         of the panelists who delivered it is still answerable to a vote it
+    ///         did not win. The mirror image of the test above, and the half that
+    ///         stops "control the appeal" from being a complete defence.
+    function test_badFaith_slashesEvenWhenTheMeritsAppealUpheldTheRuling() public {
+        uint256 caseId = _panelRuled(true);
+        _appeal(caseId);
+        vm.prank(whale);
+        court.voteAppeal(caseId, true); // quorate, and it UPHOLDS the conviction
+        _finalizeAppeal(caseId);
+        assertEq(uint256(court.caseOf(caseId).finalRuling), uint256(ICourt.Ruling.Guilty), "the panel was upheld");
+
+        _openBadFaith(caseId, alice, dave);
+        _voteBadFaith(caseId, alice, whale, true);
+        _finalizeBadFaith(caseId, alice);
+
+        assertEq(court.panelBondOf(alice), 0, "winning on the merits must not immunize");
+        assertTrue(court.badFaithOf(caseId, alice).slashed);
+        assertEq(court.forfeitedWood(), BOND, "the slashed bond is the protocol's");
+        // Per-panelist conduct, not collective punishment: her colleagues ruled
+        // exactly the same way and are untouched.
+        assertEq(court.panelBondOf(bob), BOND);
+        assertEq(court.panelBondOf(carol), BOND);
+        assertEq(court.bondedWood(), BOND * 2);
+        assertFalse(court.isReadyToRule(alice), "a stripped member must re-post before it can rule again");
+        _assertWoodBalances();
+    }
+
+    /// @notice The same independence from the other end of the case: an
+    ///         UNAPPEALED conviction is not a shield either. Nothing about the
+    ///         merits — appealed, unappealed, upheld, overturned — enters this
+    ///         proceeding's arithmetic.
+    function test_badFaith_slashesAnUnappealedRulingToo() public {
+        uint256 caseId = _resolvedConviction();
+        _openBadFaith(caseId, alice, dave);
+        _voteBadFaith(caseId, alice, whale, true);
+        _finalizeBadFaith(caseId, alice);
+
+        assertEq(court.panelBondOf(alice), 0);
+        assertEq(court.forfeitedWood(), BOND);
+        _assertWoodBalances();
+    }
+
+    // ───────────── the participation floor, on this track too ─────────────
+
+    /// @notice A BELOW-FLOOR PROCEEDING DOES NOT SLASH. The bad-faith track
+    ///         reads the SAME floor against the SAME stored `snapshotTs` as the
+    ///         appeal (D6): a handful of tokens must not be able to take an
+    ///         honest panelist's bond any more than they can overturn a ruling.
+    ///         The floor in the log is computed from the case's stored snapshot,
+    ///         never recomputed at finalization time.
+    function test_badFaith_belowTheFloorDoesNotSlash() public {
+        uint256 caseId = _resolvedConviction();
+        _openBadFaith(caseId, alice, dave);
+        uint256 openerBalance = wood.balanceOf(dave);
+        _voteBadFaith(caseId, alice, minnow, true); // 1% against a 10% floor
+
+        uint256 expectedFloor = TOTAL_VOTES * court.participationFloorBps() / 10_000;
+        vm.warp(court.badFaithOf(caseId, alice).openedAt + court.appealVoteWindow());
+        vm.expectEmit(true, true, false, true);
+        emit ICourt.BadFaithFinalized(caseId, alice, false, 10_000e18, 0, expectedFloor);
+        court.finalizeBadFaith(caseId, alice);
+
+        assertEq(court.panelBondOf(alice), BOND, "below the floor the proceeding decides nothing");
+        assertFalse(court.badFaithOf(caseId, alice).slashed);
+        assertEq(court.forfeitedWood(), 0);
+        assertEq(wood.balanceOf(dave), openerBalance + BOND, "the opener's bond returns on every branch");
+        _assertWoodBalances();
+    }
+
+    /// @notice A quorate electorate that says GOOD faith leaves the bond whole —
+    ///         a real vindication, distinguishable in the log from the
+    ///         below-floor non-event above by its tally.
+    function test_badFaith_quorateGoodFaithMajorityLeavesTheBondWhole() public {
+        uint256 caseId = _resolvedConviction();
+        _openBadFaith(caseId, alice, dave);
+        _voteBadFaith(caseId, alice, whale, false); // 20% says good faith
+        _voteBadFaith(caseId, alice, minnow, true);
+        _finalizeBadFaith(caseId, alice);
+
+        assertEq(court.panelBondOf(alice), BOND);
+        assertFalse(court.badFaithOf(caseId, alice).slashed);
+        assertEq(court.badFaithOf(caseId, alice).goodFaithVotes, 200_000e18);
+        assertEq(court.badFaithOf(caseId, alice).badFaithVotes, 10_000e18);
+    }
+
+    /// @notice A TIE ABOVE THE FLOOR LEAVES THE BOND WHOLE — the same fail-safe
+    ///         direction every other verdict in this contract takes. An
+    ///         electorate split down the middle has not established that a
+    ///         ruling was corrupt.
+    function test_badFaith_tieAboveTheFloorLeavesTheBondWhole() public {
+        uint256 caseId = _resolvedConviction();
+        _openBadFaith(caseId, alice, appellant);
+        _voteBadFaith(caseId, alice, whale, true); // 200_000e18
+        _voteBadFaith(caseId, alice, dave, false); // 200_000e18 — a dead heat
+        _finalizeBadFaith(caseId, alice);
+
+        assertEq(court.panelBondOf(alice), BOND, "a split electorate has not established bad faith");
+    }
+
+    /// @notice THE SAME ELECTORATE AS THE MERITS APPEAL, from the same stored
+    ///         snapshot (D2/D3). `newbie` bought in after the drain, so it has no
+    ///         weight in EITHER vote — nobody who accumulated WOOD once the
+    ///         exploit was visible can vote to punish, or to protect, the panel
+    ///         that judged it.
+    function test_voteBadFaith_postSnapshotStakerHasNoVotingPower() public {
+        uint256 caseId = _resolvedConviction();
+        _openBadFaith(caseId, alice, dave);
+
+        vm.expectRevert(ICourt.NoVotingPower.selector);
+        vm.prank(newbie);
+        court.voteBadFaith(caseId, alice, true);
+
+        vm.expectRevert(ICourt.NoVotingPower.selector);
+        vm.prank(makeAddr("stranger"));
+        court.voteBadFaith(caseId, alice, true);
+    }
+
+    // ───────── the bond stays in reach for the whole proceeding ─────────
+
+    /// @notice **THE BOND MUST NOT ESCAPE MID-VOTE.** `panelBondLockedUntil` is a
+    ///         deadline, and a deadline can expire while a proceeding is still
+    ///         running: governance may lengthen `badFaithWindow` after a case
+    ///         resolved (the stored lock does not move with it), and a vote
+    ///         opened near the end of the window outlives it by a full
+    ///         `appealVoteWindow` regardless. The open-proceeding counter is what
+    ///         covers that gap — without it a panelist front-runs the
+    ///         `finalizeBadFaith` that was about to slash it and walks away with
+    ///         the bond.
+    function test_withdrawPanelBond_revertsWhileABadFaithVoteIsOpen() public {
+        uint256 caseId = _resolvedConviction();
+        uint256 deadlineLock = court.panelBondLockedUntil(alice);
+
+        vm.prank(owner);
+        court.setBadFaithWindow(60 days);
+        vm.warp(deadlineLock + 1);
+
+        // The deadline has expired, so alice can be rotated off and would
+        // otherwise be free to take her bond straight back.
+        address[] memory rest = new address[](2);
+        rest[0] = bob;
+        rest[1] = carol;
+        _seat(rest);
+        assertFalse(court.isPanelist(alice));
+
+        _openBadFaith(caseId, alice, dave);
+        vm.expectRevert(ICourt.PanelistHasOpenRuling.selector);
+        vm.prank(alice);
+        court.withdrawPanelBond();
+
+        // And waiting does not release it either: what holds the bond now is the
+        // live proceeding, not the clock.
+        vm.warp(vm.getBlockTimestamp() + 365 days);
+        vm.expectRevert(ICourt.PanelistHasOpenRuling.selector);
+        vm.prank(alice);
+        court.withdrawPanelBond();
+
+        court.finalizeBadFaith(caseId, alice); // nobody voted: no slash
+        assertEq(court.openBadFaithVotes(alice), 0);
+        vm.prank(alice);
+        assertEq(court.withdrawPanelBond(), BOND, "vindicated and unseated, the bond is hers again");
+        _assertWoodBalances();
+    }
+
+    /// @notice The same guard on the roster side: the owner cannot rotate a
+    ///         panelist out from under a live proceeding, which would make its
+    ///         bond withdrawable before the vote could take it.
+    function test_setPanel_cannotUnseatAPanelistWithAnOpenBadFaithVote() public {
+        uint256 caseId = _resolvedConviction();
+        uint256 deadlineLock = court.panelBondLockedUntil(alice);
+        vm.prank(owner);
+        court.setBadFaithWindow(60 days);
+        vm.warp(deadlineLock + 1);
+        _openBadFaith(caseId, alice, dave);
+
+        address[] memory rest = new address[](2);
+        rest[0] = bob;
+        rest[1] = carol;
+        vm.expectRevert(ICourt.PanelistHasOpenRuling.selector);
+        vm.prank(owner);
+        court.setPanel(rest);
+    }
+
+    // ─────────────────────── opening a proceeding ───────────────────────
+
+    function test_openBadFaith_pullsTheBondAndLocksTheTarget() public {
+        uint256 caseId = _resolvedConviction();
+        uint256 bondedBefore = court.bondedWood();
+        uint256 openerBefore = wood.balanceOf(dave);
+        uint256 bond = court.badFaithBondWood();
+        uint256 deadline = vm.getBlockTimestamp() + court.appealVoteWindow();
+
+        vm.expectEmit(true, true, true, true);
+        emit ICourt.BadFaithOpened(caseId, alice, dave, bond, deadline);
+        vm.prank(dave);
+        court.openBadFaith(caseId, alice);
+
+        assertEq(court.bondedWood(), bondedBefore + bond);
+        assertEq(wood.balanceOf(dave), openerBefore - bond);
+        assertEq(court.openBadFaithVotes(alice), 1);
+        assertEq(court.badFaithOf(caseId, alice).opener, dave);
+        assertEq(court.badFaithOf(caseId, alice).bond, bond);
+        _assertWoodBalances();
+    }
+
+    /// @notice There is no ruling to answer for until the COURT has spoken: an
+    ///         appeal can still change what the panel's ruling meant, and a
+    ///         panelist must not be put on trial for a case still in flight.
+    function test_openBadFaith_beforeTheCaseResolvesReverts() public {
+        uint256 caseId = _panelRuled(true); // still sitting in AppealWindow
+        vm.expectRevert(ICourt.WrongPhase.selector);
+        vm.prank(dave);
+        court.openBadFaith(caseId, alice);
+    }
+
+    function test_openBadFaith_afterTheWindowReverts() public {
+        uint256 caseId = _resolvedConviction();
+        vm.warp(court.caseOf(caseId).finalizedAt + court.badFaithWindow());
+        vm.expectRevert(ICourt.WindowClosed.selector);
+        vm.prank(dave);
+        court.openBadFaith(caseId, alice);
+    }
+
+    /// @notice THE TARGET SET IS `panelVoters`, NOT THE ROSTER. Carol sat on the
+    ///         panel for this case and abstained, so she has no ruling to answer
+    ///         for and no bond at risk.
+    function test_openBadFaith_againstAMemberThatDidNotRuleReverts() public {
+        uint256 caseId = _panelRuledWithAbstention(true);
+        _resolveUnappealed(caseId);
+
+        vm.expectRevert(ICourt.PanelistDidNotRule.selector);
+        vm.prank(dave);
+        court.openBadFaith(caseId, carol);
+
+        // ...and neither has a bystander who never sat at all.
+        vm.expectRevert(ICourt.PanelistDidNotRule.selector);
+        vm.prank(dave);
+        court.openBadFaith(caseId, appellant);
+    }
+
+    /// @notice ONE PROCEEDING PER (CASE, PANELIST) PAIR, EVER — including after
+    ///         the first one resolved. Re-running a lost accusation would let an
+    ///         attacker keep an honest panelist's bond escrowed indefinitely, one
+    ///         vote at a time, since every open proceeding re-locks it.
+    function test_openBadFaith_cannotBeOpenedTwice() public {
+        uint256 caseId = _resolvedConviction();
+        _openBadFaith(caseId, alice, dave);
+
+        vm.expectRevert(ICourt.BadFaithAlreadyOpened.selector);
+        vm.prank(appellant);
+        court.openBadFaith(caseId, alice);
+
+        _finalizeBadFaith(caseId, alice);
+        vm.expectRevert(ICourt.BadFaithAlreadyOpened.selector);
+        vm.prank(dave);
+        court.openBadFaith(caseId, alice);
+    }
+
+    // ──────────────────────── voting and finalizing ────────────────────────
+
+    function test_voteBadFaith_tallyIsStakeWeighted() public {
+        uint256 caseId = _resolvedConviction();
+        _openBadFaith(caseId, alice, dave);
+
+        vm.expectEmit(true, true, true, true);
+        emit ICourt.BadFaithVoteCast(caseId, alice, whale, true, 200_000e18);
+        vm.prank(whale);
+        court.voteBadFaith(caseId, alice, true);
+
+        assertEq(court.badFaithOf(caseId, alice).badFaithVotes, 200_000e18);
+        assertEq(uint256(court.badFaithVoteOf(caseId, alice, whale)), uint256(ICourt.Ruling.Guilty));
+    }
+
+    function test_voteBadFaith_doubleVoteReverts() public {
+        uint256 caseId = _resolvedConviction();
+        _openBadFaith(caseId, alice, dave);
+        _voteBadFaith(caseId, alice, whale, true);
+
+        vm.expectRevert(ICourt.AlreadyVoted.selector);
+        vm.prank(whale);
+        court.voteBadFaith(caseId, alice, false);
+        assertEq(court.badFaithOf(caseId, alice).badFaithVotes, 200_000e18, "and no double-count");
+    }
+
+    function test_voteBadFaith_beforeOpeningReverts() public {
+        uint256 caseId = _resolvedConviction();
+        vm.expectRevert(ICourt.BadFaithNotOpen.selector);
+        vm.prank(whale);
+        court.voteBadFaith(caseId, alice, true);
+    }
+
+    function test_voteBadFaith_afterTheWindowReverts() public {
+        uint256 caseId = _resolvedConviction();
+        _openBadFaith(caseId, alice, dave);
+        vm.warp(court.badFaithOf(caseId, alice).openedAt + court.appealVoteWindow());
+
+        vm.expectRevert(ICourt.WindowClosed.selector);
+        vm.prank(whale);
+        court.voteBadFaith(caseId, alice, true);
+    }
+
+    function test_finalizeBadFaith_beforeTheWindowClosesReverts() public {
+        uint256 caseId = _resolvedConviction();
+        _openBadFaith(caseId, alice, dave);
+        vm.warp(court.badFaithOf(caseId, alice).openedAt + court.appealVoteWindow() - 1);
+
+        vm.expectRevert(ICourt.WindowOpen.selector);
+        court.finalizeBadFaith(caseId, alice);
+    }
+
+    function test_finalizeBadFaith_twiceReverts() public {
+        uint256 caseId = _resolvedConviction();
+        _openBadFaith(caseId, alice, dave);
+        _finalizeBadFaith(caseId, alice);
+
+        vm.expectRevert(ICourt.BadFaithNotOpen.selector);
+        court.finalizeBadFaith(caseId, alice);
+    }
+
+    function test_finalizeBadFaith_onAProceedingThatWasNeverOpenedReverts() public {
+        uint256 caseId = _resolvedConviction();
+        vm.expectRevert(ICourt.BadFaithNotOpen.selector);
+        court.finalizeBadFaith(caseId, alice);
+    }
+
+    /// @notice A member already stripped of its bond has nothing left to take.
+    ///         The second proceeding still CONCLUDES and still returns its
+    ///         opener's bond — a no-op slash rather than a revert, which would
+    ///         strand both that bond and the member's lock forever.
+    function test_finalizeBadFaith_slashingAStrippedMemberIsANoOp() public {
+        _seatBonded(_three());
+        uint256 first = _panelRuledOn(11, true);
+        _resolveUnappealed(first);
+        uint256 second = _panelRuledOn(12, true);
+        _resolveUnappealed(second);
+
+        _openBadFaith(first, alice, dave);
+        _voteBadFaith(first, alice, whale, true);
+        _finalizeBadFaith(first, alice);
+        assertEq(court.panelBondOf(alice), 0);
+        assertEq(court.forfeitedWood(), BOND);
+
+        uint256 openerBefore = wood.balanceOf(appellant);
+        _openBadFaith(second, alice, appellant);
+        _voteBadFaith(second, alice, whale, true);
+        _finalizeBadFaith(second, alice);
+
+        assertTrue(court.badFaithOf(second, alice).slashed);
+        assertEq(court.forfeitedWood(), BOND, "nothing left to take, and nothing conjured");
+        assertEq(wood.balanceOf(appellant), openerBefore, "the second opener is still made whole");
+        _assertWoodBalances();
+    }
+
+    // ───────────────── §4 invariant across the new path ─────────────────
+
+    /// @notice Spec §4's accounting identity across a bad-faith slash, at every
+    ///         step: `balance == bondedWood + forfeitedWood`. The slashed bond
+    ///         crosses from the claimable bucket to the protocol-owned one in a
+    ///         single statement, so the equality never has an intermediate state,
+    ///         and it lands in the EXISTING sink rather than a second one.
+    function test_invariant_balanceEqualsBondedPlusForfeitedAcrossABadFaithSlash() public {
+        uint256 caseId = _resolvedConviction();
+        _assertWoodBalances();
+
+        _openBadFaith(caseId, alice, dave);
+        _assertWoodBalances();
+        assertEq(court.bondedWood(), BOND * 4, "three panel bonds + the bad-faith bond");
+
+        _voteBadFaith(caseId, alice, whale, true);
+        _assertWoodBalances();
+
+        _finalizeBadFaith(caseId, alice);
+        _assertWoodBalances();
+        assertEq(court.bondedWood(), BOND * 2, "bob's and carol's");
+        assertEq(court.forfeitedWood(), BOND, "alice's is the protocol's now");
+
+        vm.prank(owner);
+        court.sweepForfeited(backstop);
+        _assertWoodBalances();
+        assertEq(wood.balanceOf(backstop), BOND, "one sink, swept where governance points it");
+    }
+
+    // ─────────────────── the flat panelist reward (D5) ───────────────────
+
+    /// @notice **D5: THE REWARD IS FLAT ACROSS VERDICTS.** One case, a SPLIT
+    ///         panel: alice and carol convict, bob acquits, and all three are
+    ///         paid exactly the same. This is what stops the reward itself from
+    ///         biasing verdicts — a reward that paid more for landing on the
+    ///         winning side would pay panelists to predict the eventual vote
+    ///         instead of reading the evidence, which is the same beauty-contest
+    ///         failure D4 removes from the slashing side.
+    function test_panelReward_isIdenticalWhicheverWayAMemberRuled() public {
+        vm.prank(owner);
+        court.setPanelRewardWood(REWARD);
+        _seatBonded(_three());
+        uint256 caseId = _refer();
+        _setElectorate(caseId);
+
+        vm.prank(alice);
+        court.panelRule(caseId, true);
+        vm.prank(bob);
+        court.panelRule(caseId, false);
+        vm.prank(carol);
+        court.panelRule(caseId, true);
+        court.finalizePanel(caseId);
+
+        // A below-floor appeal forfeits its bond, which is what funds the pot:
+        // bad conduct pays the honest panel's sitting fee.
+        _appeal(caseId);
+        vm.prank(minnow);
+        court.voteAppeal(caseId, false);
+        _finalizeAppeal(caseId);
+
+        assertEq(uint256(court.caseOf(caseId).finalRuling), uint256(ICourt.Ruling.Guilty));
+        assertEq(court.panelRewardOf(alice), REWARD, "ruled with the majority");
+        assertEq(court.panelRewardOf(bob), REWARD, "ruled AGAINST it - identical pay (D5)");
+        assertEq(court.panelRewardOf(carol), REWARD);
+        assertEq(court.forfeitedWood(), BOND - REWARD * 3, "paid out of the protocol-owned pot");
+        _assertWoodBalances();
+    }
+
+    /// @notice ...and it does not depend on which way the CASE came out either.
+    ///         Alice earns the same for a conviction and for an acquittal, so
+    ///         there is no verdict she is paid to prefer.
+    function test_panelReward_doesNotDependOnHowTheCaseCameOut() public {
+        vm.prank(owner);
+        court.setPanelRewardWood(REWARD);
+        _seatBonded(_three());
+
+        uint256 convicted = _panelRuledOn(11, true);
+        _appeal(convicted);
+        vm.prank(minnow);
+        court.voteAppeal(convicted, false); // below the floor: funds the pot
+        _finalizeAppeal(convicted);
+        uint256 afterConviction = court.panelRewardOf(alice);
+
+        uint256 acquitted = _panelRuledOn(12, false);
+        _appeal(acquitted);
+        vm.prank(minnow);
+        court.voteAppeal(acquitted, true);
+        _finalizeAppeal(acquitted);
+
+        assertEq(afterConviction, REWARD);
+        assertEq(court.panelRewardOf(alice) - afterConviction, REWARD, "the same pay for an acquittal");
+        _assertWoodBalances();
+    }
+
+    /// @notice A member that ABSTAINED earns nothing: the reward is for ruling,
+    ///         which is what makes it a fee for the work rather than a stipend
+    ///         for the seat.
+    function test_panelReward_onlyAccruesToTheMembersThatRuled() public {
+        vm.prank(owner);
+        court.setPanelRewardWood(REWARD);
+        _seatBonded(_three());
+        uint256 caseId = _refer();
+        _setElectorate(caseId);
+        vm.prank(alice);
+        court.panelRule(caseId, true);
+        vm.prank(bob);
+        court.panelRule(caseId, true);
+        vm.warp(court.caseOf(caseId).referredAt + court.panelWindow());
+        court.finalizePanel(caseId);
+
+        _appeal(caseId);
+        vm.prank(minnow);
+        court.voteAppeal(caseId, false);
+        _finalizeAppeal(caseId);
+
+        assertEq(court.panelRewardOf(alice), REWARD);
+        assertEq(court.panelRewardOf(bob), REWARD);
+        assertEq(court.panelRewardOf(carol), 0, "carol abstained");
+    }
+
+    /// @notice ALL OR NOTHING when the pot is short. Paying it down in vote order
+    ///         would make the reward depend on WHEN a member ruled — a race to
+    ///         vote first, which is a bias on panel behaviour of exactly the kind
+    ///         D5 exists to remove.
+    function test_panelReward_paysNoneWhenThePotCannotPayEveryMember() public {
+        vm.prank(owner);
+        court.setPanelRewardWood(BOND); // three members => 3 * BOND required
+        uint256 caseId = _panelRuled(true);
+        _appeal(caseId);
+        vm.prank(minnow);
+        court.voteAppeal(caseId, false); // forfeits ONE bond into the pot
+
+        vm.warp(court.caseOf(caseId).appealedAt + court.appealVoteWindow());
+        vm.expectEmit(true, false, false, true);
+        emit ICourt.PanelRewardUnfunded(caseId, BOND * 3, BOND);
+        court.finalizeAppeal(caseId);
+
+        assertEq(court.panelRewardOf(alice), 0);
+        assertEq(court.panelRewardOf(bob), 0);
+        assertEq(court.forfeitedWood(), BOND, "the pot is left exactly as it was");
+        _assertWoodBalances();
+    }
+
+    /// @notice Rewards are off by default, so a court deployed with an empty pot
+    ///         accrues nothing and the §4 equality is untouched.
+    function test_panelReward_isOffByDefault() public {
+        assertEq(court.panelRewardWood(), 0);
+        uint256 caseId = _resolvedConviction();
+        assertEq(court.panelRewardOf(alice), 0);
+        assertEq(caseId, 1);
+        _assertWoodBalances();
+    }
+
+    function test_claimPanelReward_paysTheMemberAndKeepsTheInvariant() public {
+        vm.prank(owner);
+        court.setPanelRewardWood(REWARD);
+        _seatBonded(_three());
+        uint256 caseId = _panelRuledOn(11, true);
+        _appeal(caseId);
+        vm.prank(minnow);
+        court.voteAppeal(caseId, false);
+        _finalizeAppeal(caseId);
+
+        uint256 bondedBefore = court.bondedWood();
+        uint256 balanceBefore = wood.balanceOf(alice);
+
+        vm.expectEmit(true, false, false, true);
+        emit ICourt.PanelRewardClaimed(alice, REWARD);
+        vm.prank(alice);
+        assertEq(court.claimPanelReward(), REWARD);
+
+        assertEq(wood.balanceOf(alice), balanceBefore + REWARD);
+        assertEq(court.bondedWood(), bondedBefore - REWARD);
+        assertEq(court.panelRewardOf(alice), 0);
+        _assertWoodBalances();
+
+        // The reward is not the bond: claiming it does not touch what answers to
+        // the bad-faith track.
+        assertEq(court.panelBondOf(alice), BOND);
+        vm.expectRevert(ICourt.NothingToClaim.selector);
+        vm.prank(alice);
+        court.claimPanelReward();
+    }
+
+    function test_claimPanelReward_revertsWithNothingAccrued() public {
+        vm.expectRevert(ICourt.NothingToClaim.selector);
+        vm.prank(alice);
+        court.claimPanelReward();
+    }
+
+    // ─────────────────────────── owner parameters ───────────────────────────
+
+    /// @notice A free proceeding is a free way to escrow an honest panelist's
+    ///         bond for a full vote window, so zero is refused here even though
+    ///         the bond returns on every branch.
+    function test_setBadFaithBondWood_onlyOwnerAndRejectsZero() public {
+        assertEq(court.badFaithBondWood(), BOND, "seeded from the panel bond, never zero");
+
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        vm.prank(alice);
+        court.setBadFaithBondWood(1);
+
+        vm.expectRevert(ICourt.InvalidParameter.selector);
+        vm.prank(owner);
+        court.setBadFaithBondWood(0);
+
+        vm.expectEmit(false, false, false, true);
+        emit ICourt.BadFaithBondWoodSet(BOND, 5e18);
+        vm.prank(owner);
+        court.setBadFaithBondWood(5e18);
+        assertEq(court.badFaithBondWood(), 5e18);
+    }
+
+    /// @notice An open proceeding is owed the bond it ACTUALLY posted, whatever
+    ///         governance re-prices it to afterwards.
+    function test_setBadFaithBondWood_doesNotRepriceAnOpenProceeding() public {
+        uint256 caseId = _resolvedConviction();
+        _openBadFaith(caseId, alice, dave);
+        uint256 openerBalance = wood.balanceOf(dave);
+
+        vm.prank(owner);
+        court.setBadFaithBondWood(1e18);
+
+        _finalizeBadFaith(caseId, alice);
+        assertEq(wood.balanceOf(dave), openerBalance + BOND, "returned at the posted price");
+        _assertWoodBalances();
+    }
+
+    /// @notice Zero is legal here — it turns rewards off. The shape this setter
+    ///         cannot express is a reward that varies with the verdict (D5):
+    ///         there is no argument for one.
+    function test_setPanelRewardWood_onlyOwnerAndZeroDisables() public {
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        vm.prank(alice);
+        court.setPanelRewardWood(REWARD);
+
+        vm.expectEmit(false, false, false, true);
+        emit ICourt.PanelRewardWoodSet(0, REWARD);
+        vm.prank(owner);
+        court.setPanelRewardWood(REWARD);
+        assertEq(court.panelRewardWood(), REWARD);
+
+        vm.prank(owner);
+        court.setPanelRewardWood(0);
+        assertEq(court.panelRewardWood(), 0);
+    }
 }
