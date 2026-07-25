@@ -2,6 +2,8 @@
 pragma solidity 0.8.28;
 
 import {IGuardianRegistry} from "../src/interfaces/IGuardianRegistry.sol";
+import {GuardianRegistry} from "../src/GuardianRegistry.sol";
+import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {RegistryTestHarness} from "./helpers/RegistryTestHarness.sol";
 
 /// @notice Task 1 of the ProposalLifecycle refactor: the governor now PUSHES the
@@ -49,6 +51,38 @@ contract GuardianRegistryRegisterReviewTest is RegistryTestHarness {
         vm.prank(address(governor));
         vm.expectRevert(IGuardianRegistry.InvalidReviewWindow.selector);
         registry.registerReview(1, block.timestamp + 1, block.timestamp + 1); // reviewEnd == voteEnd
+    }
+
+    /// @notice `initialize` must reject a `reviewPeriod` below the deployment
+    ///         floor, the same bound `setReviewPeriod` enforces.
+    /// @dev Regression: `reviewPeriod == 0` used to be accepted here. The
+    ///      governor then skips `registerReview` (the window collapses to
+    ///      `reviewEnd == voteEnd`), so the registry never learns the proposal
+    ///      exists, `outcomeOf` answers Unresolved forever, and the proposal —
+    ///      plus the vault it binds — can never terminate: execute, settle,
+    ///      cancel, veto and emergency-cancel all revert, `openProposalCount`
+    ///      stays pinned, and the owner's bond is locked. Only a beacon upgrade
+    ///      recovers it. The floor turns that silent brick into a loud deploy
+    ///      revert; `ProposalLifecycle._afterVote` handles the collapsed window
+    ///      as defence in depth for a stub registry.
+    function test_initialize_revertsOnReviewPeriodBelowFloor() public {
+        GuardianRegistry impl = new GuardianRegistry(6 hours); // minReviewPeriod
+        bytes memory badInit =
+            abi.encodeCall(GuardianRegistry.initialize, (regOwner, regFactory, address(swood), 0, 3000));
+        vm.expectRevert(IGuardianRegistry.InvalidParameter.selector);
+        new ERC1967Proxy(address(impl), badInit);
+
+        // Just under the floor is rejected too — not only the zero sentinel.
+        bytes memory nearMiss =
+            abi.encodeCall(GuardianRegistry.initialize, (regOwner, regFactory, address(swood), 6 hours - 1, 3000));
+        vm.expectRevert(IGuardianRegistry.InvalidParameter.selector);
+        new ERC1967Proxy(address(impl), nearMiss);
+
+        // At the floor it succeeds.
+        bytes memory okInit =
+            abi.encodeCall(GuardianRegistry.initialize, (regOwner, regFactory, address(swood), 6 hours, 3000));
+        GuardianRegistry ok = GuardianRegistry(address(new ERC1967Proxy(address(impl), okInit)));
+        assertEq(ok.reviewPeriod(), 6 hours);
     }
 
     function test_addGovernor_recordsVault() public {

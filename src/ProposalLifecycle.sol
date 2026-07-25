@@ -119,6 +119,20 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
     ///      determinable (Blocked or Cleared) past reviewEnd.
     function _afterVote(StrategyProposal storage p) private view returns (ProposalState, bool) {
         if (block.timestamp <= p.reviewEnd) return (ProposalState.GuardianReview, false);
+        // Collapsed review window (`reviewPeriod == 0` at propose time): no
+        // review was registered — `propose` skips the push on exactly this
+        // condition — so the registry holds no record and `outcomeOf` would
+        // answer Unresolved forever, stranding the proposal AND the vault that
+        // it binds. Treat "no review configured" as cleared, matching the
+        // pre-refactor path where the registry resolved a never-opened review
+        // to not-blocked. `reviewConcluded` is FALSE: there is no registry
+        // review to commit, and calling `resolveReview` here would revert.
+        // The `initialize` floor in GuardianRegistry makes this unreachable for
+        // a sanctioned deploy; kept as defence in depth for a stub registry
+        // wired through `setGuardianRegistry`.
+        if (p.reviewEnd <= p.voteEnd) {
+            return (block.timestamp > p.executeBy ? ProposalState.Expired : ProposalState.Approved, false);
+        }
         IGuardianRegistry.ReviewOutcome o = IGuardianRegistry(_guardianRegistry).outcomeOf(address(this), p.id);
         if (o == IGuardianRegistry.ReviewOutcome.Blocked) return (ProposalState.Rejected, true);
         if (o == IGuardianRegistry.ReviewOutcome.Cleared) {

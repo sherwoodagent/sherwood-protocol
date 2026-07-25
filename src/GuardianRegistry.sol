@@ -216,6 +216,13 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         if (owner_ == address(0) || factory_ == address(0) || swood_ == address(0)) {
             revert ZeroAddress();
         }
+        // Mirror `setReviewPeriod`'s bounds. Without this a deploy could seat
+        // `reviewPeriod == 0` — a value `setReviewPeriod` can never produce —
+        // and the governor would then skip `registerReview` (the window
+        // collapses to `reviewEnd == voteEnd`), leaving every proposal
+        // unresolvable and the vault permanently bound by a proposal that can
+        // never terminate. Fail loudly at deploy instead.
+        if (reviewPeriod_ < minReviewPeriod || reviewPeriod_ > 7 days) revert InvalidParameter();
         // Sherlock run #2 #16 invariant (cooldown >= review) is enforced at
         // the setters only — the deploy script seeds compatible values, and
         // skipping the init-time check claws back ~10 bytes under EIP-170.
