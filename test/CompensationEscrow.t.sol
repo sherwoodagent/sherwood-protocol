@@ -188,4 +188,43 @@ contract CompensationEscrowTest is Test {
         }
         assertGe(wood.balanceOf(address(escrow)), escrow.totalEscrowed());
     }
+
+    function test_sweepResidue_beforeWindowReverts() public {
+        uint256 caseId = _open(10_000e18);
+        vm.expectRevert(ICompensationEscrow.ResidueWindowOpen.selector);
+        escrow.sweepResidue(caseId);
+    }
+
+    function test_sweepResidue_afterWindowPaysBackstop() public {
+        uint256 caseId = _open(10_000e18);
+        vm.prank(alice);
+        escrow.redeem(caseId); // 7,000 claimed; 3,000 left unredeemed
+
+        vm.warp(vm.getBlockTimestamp() + 180 days + 1);
+        uint256 swept = escrow.sweepResidue(caseId);
+
+        assertEq(swept, 3_000e18);
+        assertEq(wood.balanceOf(backstop), 3_000e18, "residue goes to the backstop, never live NAV");
+        assertEq(escrow.totalEscrowed(), 0);
+    }
+
+    function test_sweepResidue_isPermissionlessAndOnce() public {
+        uint256 caseId = _open(10_000e18);
+        vm.warp(vm.getBlockTimestamp() + 180 days + 1);
+        vm.prank(makeAddr("keeper")); // anyone may trigger it; funds go to the backstop
+        escrow.sweepResidue(caseId);
+        vm.expectRevert(ICompensationEscrow.NothingToCompensate.selector);
+        escrow.sweepResidue(caseId);
+    }
+
+    /// @notice A holder that sat on its claim past the window loses it — the sweep
+    ///         is what bounds the escrow's liability, so redemption must fail after.
+    function test_redeem_afterSweepReverts() public {
+        uint256 caseId = _open(10_000e18);
+        vm.warp(vm.getBlockTimestamp() + 180 days + 1);
+        escrow.sweepResidue(caseId);
+        vm.prank(alice);
+        vm.expectRevert(ICompensationEscrow.NoClaim.selector);
+        escrow.redeem(caseId);
+    }
 }

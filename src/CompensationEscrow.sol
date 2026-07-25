@@ -170,10 +170,24 @@ contract CompensationEscrow is Ownable2Step, ICompensationEscrow {
         emit ClaimRedeemed(caseId, msg.sender, amount);
     }
 
-    // `sweepResidue` lands in Task 3. Reverting stub so this task compiles.
+    /// @inheritdoc ICompensationEscrow
+    /// @dev Permissionless: the destination is the owner-set backstop, so an
+    ///      arbitrary caller can only accelerate a fixed transfer, never
+    ///      redirect it. Residue goes to the protocol insurance backstop and
+    ///      NEVER to the vault's live NAV — paying live NAV is precisely the F1
+    ///      recoupment channel this contract exists to close (§3.8).
+    function sweepResidue(uint256 caseId) external returns (uint256 amount) {
+        Case storage c = _cases[caseId];
+        if (c.proceeds == 0) revert CaseNotFound();
+        if (block.timestamp < c.openedAt + residueWindow) revert ResidueWindowOpen();
+        if (c.swept) revert NothingToCompensate();
+        amount = c.proceeds - c.redeemed;
+        if (amount == 0) revert NothingToCompensate();
 
-    function sweepResidue(uint256) external virtual returns (uint256) {
-        revert ResidueWindowOpen();
+        c.swept = true;
+        totalEscrowed -= amount;
+        wood.safeTransfer(backstop, amount);
+        emit ResidueSwept(caseId, backstop, amount);
     }
 
     // ── Owner setters ──
