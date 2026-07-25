@@ -13,6 +13,11 @@ pragma solidity 0.8.28;
 ///      pre-split `IGuardianRegistry`. Checkpoint reads are timestamp-keyed
 ///      (EIP-6372 timestamp-mode clock).
 interface IStakedWood {
+    /// @notice Reverts when a non-slasher calls the verdict slash path.
+    error NotAuthorizedSlasher();
+
+    event AuthorizedSlasherSet(address indexed slasher);
+
     // ── Guardian stake ──
     function stakeAsGuardian(uint256 amount, uint256 agentId) external;
     function requestUnstakeGuardian() external;
@@ -134,6 +139,22 @@ interface IStakedWood {
     /// @notice Burn the owner bond bound to `vault` (emergency-settle failure).
     ///         Registry-only.
     function slashOwnerBond(address vault) external;
+
+    // ── Slasher-only mutations (verdict path) ──
+    /// @notice Verdict-driven slash whose proceeds fund victim compensation
+    ///         instead of burning (spec §3.8 + §4 authorized-slasher entrypoint).
+    function slashToEscrow(
+        bytes32 caseKey,
+        uint256 openedAt,
+        address[] calldata approvers,
+        uint256 slashBps,
+        address escrow,
+        address vault,
+        uint256 snapshotTimestamp
+    ) external returns (uint256 total);
+
+    function setAuthorizedSlasher(address slasher) external;
+    function authorizedSlasher() external view returns (address);
 
     // ── Admin (owner-instant; owner is a multisig with external delay) ──
     function setMinGuardianStake(uint256 newMin) external;

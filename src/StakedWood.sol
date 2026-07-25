@@ -8,6 +8,7 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Checkpoints} from "@openzeppelin/contracts/utils/structs/Checkpoints.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+import {ICompensationEscrow} from "./interfaces/ICompensationEscrow.sol";
 
 /// @notice Minimal `SyndicateGovernor` surface consumed by sWOOD: the
 ///         open-proposal signals used by the rage-quit gate in
@@ -41,6 +42,11 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     error RegistryAlreadySet();
     error NotRegistry();
     error NotFactory();
+
+    /// @notice Reverts when a non-slasher calls the verdict slash path.
+    /// @dev Mirrors `IStakedWood.NotAuthorizedSlasher` (same selector) — sWOOD
+    ///      declares its own errors rather than inheriting the interface.
+    error NotAuthorizedSlasher();
 
     /// @notice Insufficient WOOD to satisfy a stake minimum.
     /// @dev Relocated from `IGuardianRegistry` alongside `stakeAsGuardian`.
@@ -160,6 +166,10 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
 
     /// @notice Emitted when the owner toggles the delegation feature flag.
     event DelegationEnabledSet(bool enabled);
+
+    /// @notice Emitted when the owner rewires the verdict-slash role.
+    /// @dev Mirrors `IStakedWood.AuthorizedSlasherSet`.
+    event AuthorizedSlasherSet(address indexed slasher);
 
     /// @notice Emitted once per approver actually slashed for a blocked proposal.
     /// @dev A slash is a significant value-destroying change; the appeal flow
@@ -323,7 +333,21 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     ///      `_slashOne` sizes the own slash off the raw own-stake checkpoint
     ///      at `openedAt`, so the per-vote mirror is dead. Pre-mainnet layout
     ///      re-baseline; the slot returns to the gap to keep total size stable.
-    uint256[9] private __gap;
+    ///      Decremented 9 → 8 (spec 2026-07-22 §4, Plan C Task 4):
+    ///      `authorizedSlasher` consumes one slot. APPEND-ONLY — sWOOD is UUPS
+    ///      and live, so the new field is carved off the FRONT of the gap and
+    ///      no existing field moves.
+    /// @notice The one address permitted to drive the VERDICT slash path
+    ///         (`slashToEscrow`). Deliberately distinct from `onlyRegistry`,
+    ///         which drives the block-quorum review slash: the paths must stay
+    ///         separate so the registry's `refundSlash` reserve can never refund
+    ///         a proven-malice verdict (spec §4). Set to Plan D's challenge game
+    ///         once it exists; owner-set meanwhile, which means a verdict is a
+    ///         governance action until then.
+    address public authorizedSlasher;
+
+    /// @dev Reserved storage for future upgrades (was 9; -1 authorizedSlasher).
+    uint256[8] private __gap;
 
     /// @notice Slashed WOOD is sent here — permanently out of circulation.
     /// @dev Burning via a transfer to a known-dead address keeps WOOD's
@@ -427,6 +451,15 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
 
     modifier onlyFactory() {
         if (msg.sender != factory) revert NotFactory();
+        _;
+    }
+
+    /// @dev Gate on the VERDICT slash path. Distinct from `onlyRegistry` by
+    ///      design (spec §4, decision D4) — the review slash and the verdict
+    ///      slash must never share a caller role, so the registry's appeal
+    ///      reserve can never refund a proven-malice verdict.
+    modifier onlyAuthorizedSlasher() {
+        if (msg.sender != authorizedSlasher) revert NotAuthorizedSlasher();
         _;
     }
 
@@ -976,6 +1009,15 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
         emit DelegationEnabledSet(enabled);
     }
 
+    /// @notice Set the address permitted to drive `slashToEscrow`.
+    /// @dev Owner-only, and deliberately NOT `setRegistry`'s set-once shape:
+    ///      the role is handed to Plan D's challenge game once it deploys.
+    ///      Zero is a valid value — it disables the verdict path entirely.
+    function setAuthorizedSlasher(address slasher) external onlyOwner {
+        authorizedSlasher = slasher;
+        emit AuthorizedSlasherSet(slasher);
+    }
+
     // ── Slashing (registry-gated) ──
 
     /// @notice Slash a set of approvers for a blocked proposal.
@@ -1012,6 +1054,48 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
         // Checkpoint the aggregate total-stake drop once after the loop.
         _totalStakeCheckpoint.push(uint32(block.timestamp), uint224(totalGuardianStake));
         _burnWood(total);
+    }
+
+    /// @notice Verdict-driven slash whose proceeds fund victim compensation
+    ///         instead of burning (spec §3.8 + §4 authorized-slasher entrypoint).
+    /// @dev Reuses the SAME per-approver legs as the review path (`_slashOne`:
+    ///      own stake at `slashBps`, delegated pools at
+    ///      `min(slashBps, maxDelegatedSlashBps)`, uncovered remainder spilling
+    ///      onto own stake as first loss) — only the SINK differs. Proceeds are
+    ///      approved to the escrow and booked as a compensation case pinned to
+    ///      `snapshotTimestamp`, so pre-drain holders redeem them (§3.8) instead
+    ///      of the WOOD burning.
+    /// @param caseKey  Composite verdict key; feeds the `GuardianSlashed` topic.
+    /// @param openedAt The verdict's open timestamp — the at-open anchor the own
+    ///        and delegated legs are sized against (see `_slashOne`).
+    /// @param approvers The approver addresses to slash.
+    /// @param slashBps Slash fraction in basis points out of `10_000`.
+    /// @param escrow The `CompensationEscrow` receiving the proceeds.
+    /// @param vault The vault whose pre-drain holders are compensated. Supplied
+    ///        by the caller because a `caseKey` cannot yield it.
+    /// @param snapshotTimestamp The pre-drain snapshot the escrow apportions
+    ///        against. Chosen by the CALLER (§3.8): the block before the drain
+    ///        proposal executed for predicates 1-4, the epoch-N opening
+    ///        checkpoint for a per-epoch drawdown conviction.
+    /// @return total Total WOOD routed to the escrow across all approvers.
+    function slashToEscrow(
+        bytes32 caseKey,
+        uint256 openedAt,
+        address[] calldata approvers,
+        uint256 slashBps,
+        address escrow,
+        address vault,
+        uint256 snapshotTimestamp
+    ) external onlyAuthorizedSlasher returns (uint256 total) {
+        for (uint256 i = 0; i < approvers.length; i++) {
+            total += _slashOne(caseKey, openedAt, approvers[i], slashBps);
+        }
+        // Nothing recovered: no case to open (the escrow rejects zero proceeds).
+        if (total == 0) return 0;
+        _totalStakeCheckpoint.push(uint32(block.timestamp), uint224(totalGuardianStake));
+        // Effects are complete; hand the proceeds over and open the case.
+        IERC20(wood).approve(escrow, total);
+        ICompensationEscrow(escrow).openCase(vault, snapshotTimestamp, total);
     }
 
     /// @dev Per-approver slash. Extracted to keep `slashGuardians`'s stack

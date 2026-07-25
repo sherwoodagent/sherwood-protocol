@@ -250,6 +250,25 @@ contract MockStakedWood is IStakedWood {
 
     // ── Unused interface methods (revert if a test exercises a path the mock
     //    intentionally does not model — fail loud, never silently no-op) ──
+
+    // Verdict slash path (spec §4). Not modeled: the escrow hand-off needs a
+    // real WOOD balance, so `StakedWoodSlashToEscrow.t.sol` drives a real proxy.
+    function slashToEscrow(bytes32, uint256, address[] calldata, uint256, address, address, uint256)
+        external
+        pure
+        returns (uint256)
+    {
+        revert("MockStakedWood: slashToEscrow not modeled");
+    }
+
+    function setAuthorizedSlasher(address) external pure {
+        revert("MockStakedWood: setAuthorizedSlasher not modeled");
+    }
+
+    function authorizedSlasher() external pure returns (address) {
+        revert("MockStakedWood: authorizedSlasher not modeled");
+    }
+
     function stakeAsGuardian(uint256, uint256) external pure {
         revert("MockStakedWood: stakeAsGuardian not modeled");
     }
