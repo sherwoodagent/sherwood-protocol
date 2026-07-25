@@ -923,3 +923,21 @@ PR body must state: what landed (escrow + slasher entrypoint), the F1 property i
 2. **Deliberately NOT in this plan (state in the PR):** the challenge game (§3.4) that will *call* `slashToEscrow` — Plan D; the approver premium (§3.10) and watchtower funding — Plan E; the two-layer court (§3.5) — v1c. Until Plan D lands, `authorizedSlasher` is owner-set, so a verdict is a governance action, not an adjudicated one. Say it plainly rather than implying the court exists.
 3. **Known gaps carried forward:** D1's delegation edge (compensation follows delegated votes, not raw balances); residue is lost to holders after `residueWindow` by design; a case whose vault had zero supply at the snapshot is rejected rather than parked.
 4. **Type consistency:** `openCase(address vault, uint256 snapshotTimestamp, uint256 proceeds) returns (uint256 caseId)` is identical in Tasks 1, 2, 4, 5. `slashToEscrow(bytes32, uint256, address[], uint256, address escrow, address vault, uint256 snapshotTimestamp)` carries the explicit `vault` parameter in the interface, the implementation AND every test. `claimable(uint256, address)` and `redeem(uint256)` agree across Tasks 2, 3, 5.
+
+---
+
+## Post-implementation amendments (2026-07-25, from code review)
+
+The shipped code intentionally diverges from the task snippets above. Review found a **critical fund-mixing bug** and several hardening gaps; the fixes landed in `e7fcc24` and this section is the record of record where they disagree with the tasks:
+
+1. **Per-case fund isolation (critical).** `claimable` caps at the case's own remaining balance: `min(proceeds * votes / snapshotSupply, proceeds - redeemed)`. Without the cap a `vault` reporting votes > its own supply let one case pay out of a sibling case's funds — demonstrated as a 1-WOOD case paying 50 WOOD — and larger skews underflowed `totalEscrowed`, bricking redemption.
+2. **`slashBps` is clamped** in `slashToEscrow` to `[minSlashBps, maxSlashBps]`, the same envelope `GuardianRegistry._severityBps` applies on the review path. Note `slashBps = 0` now floors to `minSlashBps` rather than being a no-op.
+3. **`escrow` is owner-set state, not a call parameter.** `StakedWood` gained `compensationEscrow` (slot 46, gap `8 → 7`) + `setCompensationEscrow`. **`slashToEscrow`'s real arity is `(bytes32 caseKey, uint256 openedAt, address[] approvers, uint256 slashBps, address vault, uint256 snapshotTimestamp)`** — the Task 4 snippets above show the older 7-arg form. Uses `forceApprove` and zeroes the allowance after `openCase`.
+4. **The residue window is frozen per case** (`Case.residueWindowAtOpen`), so the owner cannot lower it and sweep funds from cases opened under longer terms.
+5. **`snapshotTimestamp <= openedAt`** is enforced in `slashToEscrow` (`SnapshotAfterVerdict`). This shrinks what a compromised `authorizedSlasher` can do before Plan D: it cannot pick a POST-drain snapshot at which the coalition holds everything and hand the attacker back its own slash.
+6. **`caseOf` returns `swept`**, and `slashToEscrow` returns `(total, caseId)` and emits `VerdictSlashRouted`.
+
+Two observations worth carrying into Plan D:
+
+- **The golden layout guard cannot see gap length.** Its canonicalizer strips the digits after `)`, so `t_array(t_uint256)7_storage` and `...)8_storage` compare equal. A wrong-sized `__gap` alone would pass the guard; only a *shifted* field is caught. Gap arithmetic still needs a human check on every append.
+- **FIX 5 exposed a fixture bug rather than just adding a constraint:** the e2e suite had been setting `openedAt` BEFORE the LP deposits — i.e. the verdict opened before the drain it convicts. The ordering is now realistic.
