@@ -36,18 +36,37 @@ contract MockFeed {
 }
 
 /// @dev Governor mock: the shared `MockGovernorMinimal` surface (consumed by
-///      the registry) PLUS `getRequiredCoverage` (consumed by the ledger's
-///      `recordApproval`). `getProposalView().vault` is set via the inherited
-///      `setProposalWithVault`.
+///      the registry) PLUS the two reads the ledger's `recordApproval` makes —
+///      `getRequiredCoverage` and `getProposalView().vault`.
+/// @dev The lifecycle refactor removed the review-window/vault plumbing from the
+///      shared mock: the REGISTRY now takes its window from `registerReview` and
+///      the vault from `vaultOf`. The LEDGER still calls back into the governor
+///      for the proposal's vault (integration plan C5), so that surface is
+///      re-provided here rather than restored on the shared mock.
 contract MockGovernorWithCoverage is MockGovernorMinimal {
+    struct ProposalViewLite {
+        uint256 voteEnd;
+        uint256 reviewEnd;
+        address vault;
+    }
+
     uint256 public requiredCoverage;
+    address public proposalVault;
 
     function setRequiredCoverage(uint256 c) external {
         requiredCoverage = c;
     }
 
+    function setProposalVault(address v) external {
+        proposalVault = v;
+    }
+
     function getRequiredCoverage(uint256) external view returns (uint256) {
         return requiredCoverage;
+    }
+
+    function getProposalView(uint256) external view returns (ProposalViewLite memory v) {
+        v.vault = proposalVault;
     }
 }
 
@@ -129,11 +148,15 @@ contract RegistryExposureHookTest is Test {
         uint256 voteEnd = vm.getBlockTimestamp();
         uint256 reviewEnd = voteEnd + REVIEW_PERIOD;
 
-        wired.gov.setProposalWithVault(PID, voteEnd, reviewEnd, address(wired.vault));
+        wired.gov.setProposalVault(address(wired.vault));
+        vm.prank(address(wired.gov));
+        wired.registry.registerReview(PID, voteEnd, reviewEnd);
         wired.gov.setRequiredCoverage(1_000e6); // 1,000 USDG (6 dec) => $1,000
         wired.registry.openReview(address(wired.gov), PID);
 
-        unwired.gov.setProposalWithVault(PID2, voteEnd, reviewEnd, address(unwired.vault));
+        unwired.gov.setProposalVault(address(unwired.vault));
+        vm.prank(address(unwired.gov));
+        unwired.registry.registerReview(PID2, voteEnd, reviewEnd);
         unwired.gov.setRequiredCoverage(1_000e6);
         unwired.registry.openReview(address(unwired.gov), PID2);
     }
@@ -174,7 +197,7 @@ contract RegistryExposureHookTest is Test {
         vm.prank(regOwner);
         s.swood.setRegistry(address(s.registry));
         vm.prank(regFactory);
-        s.registry.addGovernor(address(s.gov));
+        s.registry.addGovernor(address(s.gov), address(s.vault));
     }
 
     function _stakeGuardian(Sys memory s, address g, uint256 amount, uint256 agentId) internal {

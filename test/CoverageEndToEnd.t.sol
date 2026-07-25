@@ -173,8 +173,8 @@ contract CoverageEndToEndTest is Test {
         // ── Two syndicates on the shared registry.
         (govA, vaultA) = _deploySyndicate();
         (govB, vaultB) = _deploySyndicate();
-        registry.addGovernor(address(govA)); // test contract IS the registry factory
-        registry.addGovernor(address(govB));
+        registry.addGovernor(address(govA), address(vaultA)); // test contract IS the registry factory
+        registry.addGovernor(address(govB), address(vaultB));
 
         // Each vault resolves its governor through the factory (this contract).
         vm.mockCall(

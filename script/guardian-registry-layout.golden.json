@@ -121,14 +121,20 @@
       "type": "t_contract(IStakedWood)"
     },
     {
-      "label": "exposureLedger",
+      "label": "vaultOf",
       "slot": "20",
+      "offset": 0,
+      "type": "t_mapping(t_address,t_address)"
+    },
+    {
+      "label": "exposureLedger",
+      "slot": "21",
       "offset": 0,
       "type": "t_contract(IExposureLedger)"
     },
     {
       "label": "__gap",
-      "slot": "21",
+      "slot": "22",
       "offset": 0,
       "type": "t_array(t_uint256)_storage"
     }
@@ -296,6 +302,18 @@
         "slot": "2",
         "offset": 24,
         "type": "t_uint16"
+      },
+      {
+        "label": "voteEnd",
+        "slot": "3",
+        "offset": 0,
+        "type": "t_uint64"
+      },
+      {
+        "label": "reviewEnd",
+        "slot": "3",
+        "offset": 8,
+        "type": "t_uint64"
       }
     ],
     "t_struct(Set)_storage": [
