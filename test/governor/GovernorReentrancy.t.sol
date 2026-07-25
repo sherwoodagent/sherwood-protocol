@@ -263,6 +263,14 @@ contract ReentrantRegistry {
         reviewPeriod = r;
     }
 
+    /// @dev The governor consults `paused()` before concluding a review, so the
+    ///      hostile stub must answer it — a missing selector reverts with empty
+    ///      data and would mask the `Reentrancy()` these tests match on. Always
+    ///      live: pausing would short-circuit the reentry path under test.
+    function paused() external pure returns (bool) {
+        return false;
+    }
+
     function setGovernor(address g) external {
         governor = g;
     }
