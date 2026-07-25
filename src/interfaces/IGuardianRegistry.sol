@@ -58,7 +58,8 @@ interface IGuardianRegistry {
     error CooldownBelowReviewPeriod();
     error UnauthorizedGovernor();
     /// @notice `registerReview` rejected a window with `voteEnd == 0` (the
-    ///         unregistered sentinel) or `reviewEnd < voteEnd`.
+    ///         unregistered sentinel) or `reviewEnd <= voteEnd` — a collapsed
+    ///         window (`reviewEnd == voteEnd`) must not register either.
     error InvalidReviewWindow();
     /// @notice `registerReview` called twice for the same `(governor, proposalId)`.
     ///         The pushed window is immutable once set.
@@ -144,6 +145,11 @@ interface IGuardianRegistry {
     // ── Pause ──
     function pause() external;
     function unpause() external;
+    /// @notice True while the registry is paused. Every mutating review
+    ///         entrypoint (`openReview`, `voteOnProposal`, `resolveReview`) is
+    ///         `whenNotPaused`, so callers that need the economic commit must
+    ///         consult this before reporting a proposal as actionable.
+    function paused() external view returns (bool);
 
     // ── Parameter setters (owner-instant; owner is a multisig with external delay) ──
     function setReviewPeriod(uint256) external;

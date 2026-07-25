@@ -123,7 +123,10 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
     ///      Expired using the review window and the registry's determinable
     ///      outcome (`outcomeOf`, a pure view sharing one predicate with
     ///      `resolveReview`). reviewConcluded is true exactly when the outcome is
-    ///      determinable (Blocked or Cleared) past reviewEnd.
+    ///      determinable (Blocked or Cleared) past reviewEnd AND the registry can
+    ///      still accept the commit — it is false for an unregistered window and
+    ///      while the registry is paused, so the reported state never promises an
+    ///      economic commit the caller cannot make.
     function _afterVote(StrategyProposal storage p) private view returns (ProposalState, bool) {
         if (block.timestamp <= p.reviewEnd) return (ProposalState.GuardianReview, false);
         // Collapsed review window (`reviewPeriod == 0` at propose time): no
@@ -140,13 +143,33 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
         if (p.reviewEnd <= p.voteEnd) {
             return (block.timestamp > p.executeBy ? ProposalState.Expired : ProposalState.Approved, false);
         }
-        IGuardianRegistry.ReviewOutcome o = IGuardianRegistry(_guardianRegistry).outcomeOf(address(this), p.id);
-        if (o == IGuardianRegistry.ReviewOutcome.Blocked) return (ProposalState.Rejected, true);
-        if (o == IGuardianRegistry.ReviewOutcome.Cleared) {
-            return (block.timestamp > p.executeBy ? ProposalState.Expired : ProposalState.Approved, true);
+        IGuardianRegistry reg = IGuardianRegistry(_guardianRegistry);
+        IGuardianRegistry.ReviewOutcome o = reg.outcomeOf(address(this), p.id);
+        // Unresolved past `reviewEnd` is the SAME underlying condition as the
+        // collapsed window above: `outcomeOf` can only answer Unresolved here
+        // when the registry holds no window (`reviewEnd == 0`), i.e. no review
+        // was ever registered. Treat it identically — "no review configured =>
+        // cleared" — instead of fail-closing into a state with no exit
+        // (`resolveReview` reverts ReviewNotReadyForResolve, `_openProposalCount`
+        // stays pinned, and `emergencyCancel` is Draft/Pending-only).
+        // `reviewConcluded` is FALSE: there is no registry review to commit.
+        if (o == IGuardianRegistry.ReviewOutcome.Unresolved) {
+            return (block.timestamp > p.executeBy ? ProposalState.Expired : ProposalState.Approved, false);
         }
-        // Unresolved past reviewEnd: fail-closed, stay in review (no economic commit).
-        return (ProposalState.GuardianReview, false);
+        // A paused registry cannot accept the economic commit: `resolveReview`
+        // is `whenNotPaused` while `outcomeOf` is not. Reporting Approved here
+        // would hand callers a state every path to act on reverts against
+        // (`ProtocolPaused` from a contract they never called). Report the
+        // honest "still in review" for the duration, which also keeps
+        // `cancelProposal` usable — `cancelReview` is not pause-gated. Skipped
+        // when the registry already cached the resolution: the commit is then a
+        // no-op, so the pause cannot strand it.
+        if (reg.paused()) {
+            (, bool alreadyResolved,,) = reg.getReviewState(address(this), p.id);
+            if (!alreadyResolved) return (ProposalState.GuardianReview, false);
+        }
+        if (o == IGuardianRegistry.ReviewOutcome.Blocked) return (ProposalState.Rejected, true);
+        return (block.timestamp > p.executeBy ? ProposalState.Expired : ProposalState.Approved, true);
     }
 
     /// @dev The ONLY place `p.state` is assigned.

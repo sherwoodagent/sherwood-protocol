@@ -503,6 +503,67 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     }
 
     /// @inheritdoc IExposureLedger
+    /// @dev The bridge between what a guardian UNDERWROTE and what the verdict
+    ///      path can actually take. `slashToEscrow` speaks in bps of stake; the
+    ///      ledger books liability in USD. Dividing one USD quantity by the
+    ///      other cancels the unit, so this conversion needs no price read of
+    ///      its own — which matters, because an oracle in the slash path would
+    ///      let a stale or compromised feed resize a conviction.
+    ///
+    ///      Approvers come from the ledger's OWN `_approversOf`, exactly as
+    ///      `requireApproveQuorum` does and for the same reason (review finding
+    ///      I-1). A guardian holding a zero commitment — released by a vote
+    ///      change, or an approval that landed after coverage was already met —
+    ///      yields 0 bps and is slashed nothing. That is the intended
+    ///      semantics, not an omission: liability follows the commitment, and an
+    ///      approver who consumed none of their budget underwrote none of the
+    ///      loss.
+    ///
+    ///      Two saturating cases, both deliberate:
+    ///        - `committed >= live` — the bond shrank since the vote (unstake,
+    ///          or a WOOD price crash) — pins the rate at 100%. The case then
+    ///          under-recovers by the shortfall, which is unavoidable: the
+    ///          guardian does not have it. `requireApproveQuorum` already
+    ///          re-checks coverage in LIVE dollars at execution, so this is the
+    ///          residual after that gate, not a hole in front of it.
+    ///        - `live == 0` likewise yields 100%, keeping the division defined.
+    ///          Nothing is recoverable either way — `_slashOne` clamps to live
+    ///          stake — so the value is inert.
+    ///
+    ///      Rounds UP. Truncating would shave every approver's rate and the
+    ///      residue compounds across a cohort; rounding toward the protocol
+    ///      keeps `sum(slashed) >= loss` intact at the wei level.
+    function slashBpsFor(address governor, uint256 proposalId)
+        external
+        view
+        returns (address[] memory approvers, uint256[] memory bps)
+    {
+        bytes32 key = _reviewKey(governor, proposalId);
+        address[] storage listed = _approversOf[key];
+        uint256 n = listed.length;
+        approvers = new address[](n);
+        bps = new uint256[](n);
+
+        // Hoisted for the reason `requireApproveQuorum` hoists them (M-4).
+        uint256 maxDelegated = swood.maxDelegatedSlashBps();
+        uint256 priceX8 = woodUsdPriceX8;
+
+        for (uint256 i = 0; i < n; i++) {
+            address g = listed[i];
+            approvers[i] = g;
+            uint256 committed = _recorded[key][g].usd;
+            if (committed == 0) continue; // booked nothing -> owes nothing
+            uint256 live = _slashableBondUsd(g, maxDelegated, priceX8);
+            if (live == 0 || committed >= live) {
+                bps[i] = BPS_DENOMINATOR;
+                continue;
+            }
+            // `committed` is a uint192, so the numerator cannot overflow.
+            bps[i] = (committed * BPS_DENOMINATOR + live - 1) / live;
+        }
+    }
+
+    /// @inheritdoc IExposureLedger
     /// @dev Bucket `e` (covering [genesis + e·L, genesis + (e+1)·L)) counts until
     ///      its challenge window elapses at `genesis + (e+1)·L + W` — exact
     ///      expiry, so the coverage budget recycles every challenge window

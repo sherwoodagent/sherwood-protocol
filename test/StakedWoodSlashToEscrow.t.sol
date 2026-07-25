@@ -156,7 +156,7 @@ contract StakedWoodSlashToEscrowTest is Test {
         gs[0] = g1;
         vm.prank(slasher);
         vm.expectRevert(IStakedWood.CompensationEscrowNotSet.selector);
-        swood.slashToEscrow(bytes32("case"), openedAt, gs, 10_000, address(vault), snapTs);
+        swood.slashToEscrow(bytes32("case"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs);
     }
 
     /// @notice sWOOD must not leave a standing allowance behind: the escrow's
@@ -169,7 +169,7 @@ contract StakedWoodSlashToEscrowTest is Test {
         gs[0] = g1;
 
         vm.prank(slasher);
-        swood.slashToEscrow(bytes32("case"), openedAt, gs, 10_000, address(vault), snapTs);
+        swood.slashToEscrow(bytes32("case"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs);
 
         assertEq(wood.allowance(address(swood), address(escrow)), 0, "allowance zeroed after the hand-off");
     }
@@ -178,7 +178,7 @@ contract StakedWoodSlashToEscrowTest is Test {
         address[] memory gs = new address[](1);
         gs[0] = g1;
         vm.expectRevert(IStakedWood.NotAuthorizedSlasher.selector);
-        swood.slashToEscrow(bytes32("case"), openedAt, gs, 10_000, address(vault), snapTs);
+        swood.slashToEscrow(bytes32("case"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs);
     }
 
     /// @notice The registry cannot drive the verdict path either — the roles are
@@ -190,7 +190,7 @@ contract StakedWoodSlashToEscrowTest is Test {
         gs[0] = g1;
         vm.prank(registry);
         vm.expectRevert(IStakedWood.NotAuthorizedSlasher.selector);
-        swood.slashToEscrow(bytes32("case"), openedAt, gs, 10_000, address(vault), snapTs);
+        swood.slashToEscrow(bytes32("case"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs);
     }
 
     function test_slashToEscrow_routesProceedsToEscrowNotBurn() public {
@@ -203,7 +203,7 @@ contract StakedWoodSlashToEscrowTest is Test {
 
         vm.prank(slasher);
         (uint256 total, uint256 caseId) =
-            swood.slashToEscrow(bytes32("case"), openedAt, gs, 10_000, address(vault), snapTs);
+            swood.slashToEscrow(bytes32("case"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs);
 
         assertGt(total, 0, "something was actually slashed");
         assertEq(caseId, 1, "the funded case id is returned, not scraped");
@@ -228,7 +228,7 @@ contract StakedWoodSlashToEscrowTest is Test {
         vm.expectEmit(true, true, false, true, address(swood));
         emit IStakedWood.VerdictSlashRouted(bytes32("case"), address(vault), 20_000e18, 1);
         vm.prank(slasher);
-        swood.slashToEscrow(bytes32("case"), openedAt, gs, 10_000, address(vault), snapTs);
+        swood.slashToEscrow(bytes32("case"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs);
     }
 
     /// @notice FIX 5 / spec §3.8: the compensation snapshot must be at or before
@@ -249,7 +249,7 @@ contract StakedWoodSlashToEscrowTest is Test {
 
         vm.prank(slasher);
         vm.expectRevert(IStakedWood.SnapshotAfterVerdict.selector);
-        swood.slashToEscrow(bytes32("case"), openedAt, gs, 10_000, address(vault), postVerdictTs);
+        swood.slashToEscrow(bytes32("case"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), postVerdictTs);
     }
 
     /// @notice A snapshot exactly AT the verdict open is allowed — the bound is
@@ -264,7 +264,8 @@ contract StakedWoodSlashToEscrowTest is Test {
         gs[0] = g1;
 
         vm.prank(slasher);
-        (, uint256 caseId) = swood.slashToEscrow(bytes32("case"), openedAt, gs, 10_000, address(vault), openedAt);
+        (, uint256 caseId) =
+            swood.slashToEscrow(bytes32("case"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), openedAt);
         (, uint256 ts,,,,) = escrow.caseOf(caseId);
         assertEq(ts, openedAt);
     }
@@ -281,7 +282,8 @@ contract StakedWoodSlashToEscrowTest is Test {
         gs[0] = g1;
 
         vm.prank(slasher);
-        (uint256 total,) = swood.slashToEscrow(bytes32("case"), openedAt, gs, 1, address(vault), snapTs);
+        (uint256 total,) =
+            swood.slashToEscrow(bytes32("case"), openedAt, gs, _bpsArr(gs.length, 1), address(vault), snapTs);
         assertEq(total, 2_000e18, "1 bps floored to minSlashBps (1000) = 10% of 20k");
     }
 
@@ -295,7 +297,8 @@ contract StakedWoodSlashToEscrowTest is Test {
         address[] memory gs = new address[](1);
         gs[0] = g1;
         vm.prank(slasher);
-        (uint256 total,) = swood.slashToEscrow(bytes32("case"), openedAt, gs, 10_000, address(vault), snapTs);
+        (uint256 total,) =
+            swood.slashToEscrow(bytes32("case"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs);
         assertEq(total, 10_000e18, "10_000 bps capped to maxSlashBps (5000) = 50% of 20k");
         assertEq(swood.guardianStake(g1), 10_000e18, "the guardian kept the half the ceiling protects");
     }
@@ -310,7 +313,8 @@ contract StakedWoodSlashToEscrowTest is Test {
         address[] memory gs = new address[](1);
         gs[0] = g1;
         vm.prank(slasher);
-        (uint256 total,) = swood.slashToEscrow(bytes32("case"), openedAt, gs, 2500, address(vault), snapTs);
+        (uint256 total,) =
+            swood.slashToEscrow(bytes32("case"), openedAt, gs, _bpsArr(gs.length, 2500), address(vault), snapTs);
         uint256 slashedAt = vm.getBlockTimestamp();
 
         assertEq(total, 5_000e18, "25% of the 20k own stake");
@@ -344,9 +348,20 @@ contract StakedWoodSlashToEscrowTest is Test {
         gs[0] = makeAddr("neverStaked");
         vm.prank(slasher);
         (uint256 total, uint256 caseId) =
-            swood.slashToEscrow(bytes32("c"), openedAt, gs, 10_000, address(vault), snapTs);
+            swood.slashToEscrow(bytes32("c"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs);
         assertEq(total, 0);
         assertEq(caseId, 0, "no case id when nothing was recovered");
         assertEq(escrow.caseCount(), 0, "no empty case opened");
+    }
+
+    /// @dev `slashToEscrow` now takes one rate per approver. These suites all
+    ///      exercise the uniform case, so this fills an aligned array with a
+    ///      single rate — the per-approver spread is covered in
+    ///      `SlashToEscrowProportional.t.sol`.
+    function _bpsArr(uint256 n, uint256 bps) internal pure returns (uint256[] memory a) {
+        a = new uint256[](n);
+        for (uint256 i = 0; i < n; i++) {
+            a[i] = bps;
+        }
     }
 }

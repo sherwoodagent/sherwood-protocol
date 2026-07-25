@@ -163,9 +163,17 @@ contract ChallengeEndToEndTest is Test {
     uint256 constant PROPOSER_BOND = 200e18; // $1,000 × 1% ÷ $0.05
     uint256 constant CHALLENGER_BOND = 1_000e18; // $1,000 × 5% ÷ $0.05
 
-    uint256 constant PROCEEDS = G1_STAKE; // a 10,000 bps verdict takes the lot
-    uint256 constant LP1_CLAIM = 21_000e18; // 70% of PROCEEDS
-    uint256 constant LP2_CLAIM = 9_000e18; // 30% of PROCEEDS
+    /// @dev The verdict no longer takes the lot. g1 committed $1,000 of
+    ///      coverage against a $1,500 slashable bond (G1_STAKE at $0.05), so the
+    ///      ledger prices its liability at `ceil(1_000 * 10_000 / 1_500)` = 6667
+    ///      bps of its own stake — what it underwrote, rounded toward the
+    ///      protocol. The remainder stays staked and is still available to a
+    ///      second, concurrent conviction, which is the point of per-approver
+    ///      rates.
+    uint256 constant VERDICT_BPS = 6667;
+    uint256 constant PROCEEDS = (G1_STAKE * VERDICT_BPS) / 10_000;
+    uint256 constant LP1_CLAIM = (PROCEEDS * 70) / 100; // pre-drain cohort, 70%
+    uint256 constant LP2_CLAIM = PROCEEDS - LP1_CLAIM; // ...and 30%, exhausting the case
 
     uint16 constant CERTIFIED_BOUND_BPS = 5_000;
 
@@ -501,7 +509,11 @@ contract ChallengeEndToEndTest is Test {
         // ── The verdict landed: the approver paid, and the whole of it reached
         //    the escrow as a case pinned to the block BEFORE the drain (D6).
         assertEq(uint256(game.challengeOf(cid).status), uint256(IChallengeGame.Status.Settled), "Settled");
-        assertEq(swood.guardianStake(g1), 0, "the covering approver was slashed in full");
+        assertEq(
+            swood.guardianStake(g1),
+            G1_STAKE - PROCEEDS,
+            "the approver paid exactly what it underwrote -- and no more, so the residue can still answer a second case"
+        );
         assertEq(escrow.caseCount(), 1, "one compensation case");
         uint256 caseId = escrow.caseCount();
         (address caseVault, uint256 snapTs, uint256 proceeds, uint256 redeemed,, bool swept) = escrow.caseOf(caseId);

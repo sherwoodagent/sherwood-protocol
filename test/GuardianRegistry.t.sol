@@ -128,6 +128,49 @@ contract GuardianRegistryOpenReviewTest is RegistryTestHarness {
         Vm.Log[] memory logs = vm.getRecordedLogs();
         assertEq(logs.length, 0);
     }
+
+    // ── A cancelled (never-opened) review never re-opens ──
+    //
+    // `cancelReview`'s never-opened short-circuit writes `(opened = false,
+    // resolved = true)` BEFORE `reviewEnd`, i.e. while the vote window is still
+    // open. `openReview` and `voteOnProposal` gate on `opened` alone, so without
+    // the `resolved` guards a keeper could re-open a cancelled review and every
+    // active guardian could then mint reward-eligible approve weight on an
+    // already-Cancelled proposal at zero slash risk — `resolveReview` returns the
+    // cached `blocked == false` and never slashes. `getApproverWeights` is the
+    // documented input to off-chain reward attribution, so that weight is real
+    // money. Regression pins all three legs.
+    function test_openReview_neverReopensACancelledReview() public {
+        _stakeN(5);
+        uint256 ve = vm.getBlockTimestamp();
+        _registerReview(PROPOSAL_ID, ve, ve + REVIEW_PERIOD);
+
+        // Cancel inside the window, before any keeper called openReview.
+        vm.prank(address(governor));
+        registry.cancelReview(PROPOSAL_ID);
+
+        (bool opened, bool resolved,,) = registry.getReviewState(address(governor), PROPOSAL_ID);
+        assertFalse(opened, "cancel must not open the review");
+        assertTrue(resolved, "never-opened cancel resolves the review");
+
+        // Leg 1: openReview is an idempotent no-op, not a re-open.
+        vm.recordLogs();
+        registry.openReview(address(governor), PROPOSAL_ID);
+        assertEq(vm.getRecordedLogs().length, 0, "re-open must emit nothing");
+        (opened,,,) = registry.getReviewState(address(governor), PROPOSAL_ID);
+        assertFalse(opened, "a resolved review must never re-open");
+
+        // Leg 2: no guardian can vote on it.
+        vm.prank(guardians[0]);
+        vm.expectRevert(IGuardianRegistry.ReviewNotOpen.selector);
+        registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Approve);
+
+        // Leg 3: the reward-attribution surface stays empty.
+        (address[] memory approvers,, uint128 totalApproveWeight) =
+            registry.getApproverWeights(address(governor), PROPOSAL_ID);
+        assertEq(approvers.length, 0, "no approver may accrue on a cancelled proposal");
+        assertEq(totalApproveWeight, 0, "no reward-eligible weight may be minted");
+    }
 }
 
 contract GuardianRegistryVoteTest is RegistryTestHarness {

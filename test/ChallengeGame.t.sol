@@ -34,6 +34,7 @@ contract MockChallengeLedger {
     mapping(bytes32 reviewKey => address[]) internal _approvers;
     mapping(bytes32 reviewKey => mapping(address guardian => uint256)) internal _committed;
     mapping(bytes32 reviewKey => bool) internal _frozen;
+    mapping(address guardian => uint256) internal _slashableBondUsd;
 
     constructor(uint256 priceX8) {
         woodUsdPriceX8 = priceX8;
@@ -65,6 +66,39 @@ contract MockChallengeLedger {
         for (uint256 i = 0; i < guardians.length; i++) {
             committedUsd[i] = _committed[k][guardians[i]];
         }
+    }
+
+    /// @dev Per-approver slash rates, mirroring the real ledger's arithmetic:
+    ///      `ceil(committed * 10_000 / slashableBondUsd)`, saturating at 100%
+    ///      when the bond is gone or has fallen below what was committed.
+    ///
+    ///      An UNSET bond means zero slashable capital, which the real ledger
+    ///      also prices at 10_000 — so a suite that never calls
+    ///      `setSlashableBondUsd` sees the full-severity behaviour it did before
+    ///      per-approver rates existed. That is a faithful mirror of the
+    ///      `live == 0` branch, not a convenience default.
+    function slashBpsFor(address governor, uint256 proposalId)
+        external
+        view
+        returns (address[] memory guardians, uint256[] memory bps)
+    {
+        bytes32 k = _key(governor, proposalId);
+        guardians = _approvers[k];
+        bps = new uint256[](guardians.length);
+        for (uint256 i = 0; i < guardians.length; i++) {
+            uint256 committed = _committed[k][guardians[i]];
+            if (committed == 0) continue; // released -> owes nothing
+            uint256 live = _slashableBondUsd[guardians[i]];
+            if (live == 0 || committed >= live) {
+                bps[i] = 10_000;
+                continue;
+            }
+            bps[i] = (committed * 10_000 + live - 1) / live;
+        }
+    }
+
+    function setSlashableBondUsd(address guardian, uint256 usd) external {
+        _slashableBondUsd[guardian] = usd;
     }
 
     /// @dev Mirrors the real ledger's freeze check, so a test can prove the
@@ -118,7 +152,11 @@ contract MockChallengeStakedWood {
     bytes32 public lastCaseKey;
     uint256 public lastOpenedAt;
     address[] internal _lastApprovers;
-    uint256 public lastSlashBps;
+    uint256[] internal _lastSlashBpsPer;
+
+    function lastSlashBpsPer() external view returns (uint256[] memory) {
+        return _lastSlashBpsPer;
+    }
     address public lastVault;
     uint256 public lastSnapshotTimestamp;
 
@@ -142,7 +180,7 @@ contract MockChallengeStakedWood {
         bytes32 caseKey,
         uint256 openedAt,
         address[] calldata approvers,
-        uint256 slashBps,
+        uint256[] calldata slashBpsPer,
         address vault,
         uint256 snapshotTimestamp
     ) external returns (uint256, uint256) {
@@ -150,7 +188,7 @@ contract MockChallengeStakedWood {
         lastCaseKey = caseKey;
         lastOpenedAt = openedAt;
         _lastApprovers = approvers;
-        lastSlashBps = slashBps;
+        _lastSlashBpsPer = slashBpsPer;
         lastVault = vault;
         lastSnapshotTimestamp = snapshotTimestamp;
         return (_nextTotal, _nextCaseId);
@@ -489,7 +527,16 @@ contract ChallengeGameTest is Test {
         assertEq(swood.callCount(), 1, "slashed exactly once");
         assertEq(swood.lastCaseKey(), keccak256(abi.encode(address(gov), PROPOSAL)), "case key is the review key");
         assertEq(swood.lastOpenedAt(), filedAt, "verdict anchored at the filing");
-        assertEq(swood.lastSlashBps(), swood.maxSlashBps(), "verdict severity is the ceiling");
+        // Severity is now PER APPROVER, sourced from the ledger rather than
+        // from one protocol-wide ceiling. The game must pass through exactly
+        // what `slashBpsFor` derived — anything else would let the challenge
+        // path invent a liability the ledger never booked.
+        (, uint256[] memory expectedBps) = ledger.slashBpsFor(address(gov), PROPOSAL);
+        uint256[] memory sentBps = swood.lastSlashBpsPer();
+        assertEq(sentBps.length, expectedBps.length, "one rate per approver");
+        for (uint256 i = 0; i < expectedBps.length; i++) {
+            assertEq(sentBps[i], expectedBps[i], "rate passed through unmodified");
+        }
         assertEq(swood.lastVault(), vault, "vault re-read from the proposal");
         assertEq(swood.lastSnapshotTimestamp(), executedAt - 1, "case pinned to the pre-drain block (D6)");
         address[] memory slashed = swood.lastApprovers();

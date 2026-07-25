@@ -60,6 +60,12 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     /// @dev Mirrors `IStakedWood.SnapshotAfterVerdict`.
     error SnapshotAfterVerdict();
 
+    /// @notice `slashToEscrow` rejected because the per-approver rate array is
+    ///         not the same length as `approvers`. Positional alignment is the
+    ///         only thing tying a guardian to their own rate.
+    /// @dev Mirrors `IStakedWood.SlashBpsLengthMismatch`.
+    error SlashBpsLengthMismatch();
+
     /// @notice Insufficient WOOD to satisfy a stake minimum.
     /// @dev Relocated from `IGuardianRegistry` alongside `stakeAsGuardian`.
     error InsufficientStake();
@@ -1117,7 +1123,7 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     ///      approved to the escrow and booked as a compensation case pinned to
     ///      `snapshotTimestamp`, so pre-drain holders redeem them (§3.8) instead
     ///      of the WOOD burning.
-    /// @dev SEVERITY ENVELOPE. `slashBps` is clamped to
+    /// @dev SEVERITY ENVELOPE. Every element of `slashBpsPer` is clamped to
     ///      `[minSlashBps, maxSlashBps]` here, so the verdict path enforces the
     ///      SAME envelope as the review path — where `GuardianRegistry`'s
     ///      `_severityBps` clamps to those exact bounds before calling
@@ -1141,8 +1147,16 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     ///        and delegated legs are sized against (see `_slashOne`), and the
     ///        latest snapshot the case may be pinned to.
     /// @param approvers The approver addresses to slash.
-    /// @param slashBps Requested slash fraction in bps, clamped to
-    ///        `[minSlashBps, maxSlashBps]`.
+    /// @param slashBpsPer Per-approver slash fractions in bps, positionally
+    ///        aligned with `approvers` and each clamped to
+    ///        `[minSlashBps, maxSlashBps]` independently. One rate per approver
+    ///        rather than one for the batch: an approver's liability is what
+    ///        they UNDERWROTE, and `ExposureLedger` books that per guardian
+    ///        (`slashBpsFor` derives this array). A single batch-wide rate
+    ///        forced the ledger to assume any one approver might carry the whole
+    ///        loss, which is what made coverage un-nettable — a flat 100% takes
+    ///        the entire bond once, so a second concurrent conviction against
+    ///        the same guardian recovers nothing.
     /// @param vault The vault whose pre-drain holders are compensated. Supplied
     ///        by the caller because a `caseKey` cannot yield it.
     /// @param snapshotTimestamp The pre-drain snapshot the escrow apportions
@@ -1155,16 +1169,33 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
         bytes32 caseKey,
         uint256 openedAt,
         address[] calldata approvers,
-        uint256 slashBps,
+        uint256[] calldata slashBpsPer,
         address vault,
         uint256 snapshotTimestamp
     ) external onlyAuthorizedSlasher returns (uint256 total, uint256 caseId) {
         address escrow = compensationEscrow;
         if (escrow == address(0)) revert CompensationEscrowNotSet();
         if (snapshotTimestamp > openedAt) revert SnapshotAfterVerdict();
+        // Positional alignment is the only thing tying a guardian to their rate,
+        // so a mismatch is a caller bug, not something to absorb.
+        if (slashBpsPer.length != approvers.length) revert SlashBpsLengthMismatch();
 
-        uint256 bps = Math.min(Math.max(slashBps, minSlashBps), maxSlashBps);
         for (uint256 i = 0; i < approvers.length; i++) {
+            // ZERO IS NOT A SEVERITY — it is the absence of liability, so it
+            // skips the envelope entirely. `minSlashBps` is a floor on how hard
+            // a guilty approver is hit, NOT a statement that everyone named in
+            // the batch owes something. Running 0 through the clamp would floor
+            // it to `minSlashBps` and slash a guardian who underwrote nothing:
+            // `ExposureLedger.slashBpsFor` returns 0 for an approver whose
+            // commitment was released by a vote change, or whose approval landed
+            // after coverage was already met.
+            uint256 requested = slashBpsPer[i];
+            if (requested == 0) continue;
+            // Clamped per element, not once for the batch: the envelope is a
+            // per-guardian ceiling/floor on severity, so it has to bind each
+            // approver's own rate. Hoisting it would let one approver's rate set
+            // the envelope for everyone.
+            uint256 bps = Math.min(Math.max(requested, minSlashBps), maxSlashBps);
             total += _slashOne(caseKey, openedAt, approvers[i], bps);
         }
         // Nothing recovered: no case to open (the escrow rejects zero proceeds).

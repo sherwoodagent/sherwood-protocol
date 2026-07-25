@@ -335,7 +335,12 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
 
         address governor = c.governor;
         uint256 proposalId = c.proposalId;
-        (address[] memory approvers,,) = _accused(governor, proposalId);
+        // Rates come from the LEDGER, not from one protocol-wide severity: each
+        // approver is slashed for what they underwrote. Read before
+        // `unfreezeCoverage` below only for readability — unfreezing flips a
+        // `_frozen` flag and leaves the bookings intact, so the order is not
+        // load-bearing.
+        (address[] memory approvers, uint256[] memory slashBpsPer) = _accusedWithRates(governor, proposalId);
 
         // D6: the vault and the pre-drain instant are re-read from the proposal
         // rather than carried on the challenge — `executedAt - 1` is §3.8's
@@ -350,7 +355,7 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         exposureLedger.unfreezeCoverage(governor, proposalId);
 
         (uint256 slashedWood, uint256 caseId) = swood.slashToEscrow(
-            _reviewKey(governor, proposalId), c.filedAt, approvers, swood.maxSlashBps(), p.vault, p.executedAt - 1
+            _reviewKey(governor, proposalId), c.filedAt, approvers, slashBpsPer, p.vault, p.executedAt - 1
         );
 
         // §3.4: "adapters demote only on a passed challenge" — and only the one
@@ -417,6 +422,41 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      released commitment as zero rather than dropping it, and a guardian
     ///      that released before the filing backed nothing on this proposal —
     ///      it is neither slashed nor paid out of a failed challenge.
+    /// @dev The accused and the rate each is slashed at, in one ledger read.
+    ///
+    ///      Mirrors `_accused`'s filtering rather than passing the ledger's raw
+    ///      output straight through: `slashBpsFor` returns the full HISTORICAL
+    ///      approver set (matching `approversOf`), pricing a released commitment
+    ///      at 0 bps. `slashToEscrow` would skip those zeros, so the amounts
+    ///      would be identical either way — but the approver array is what names
+    ///      people in the `GuardianSlashed` topics and the escrow case. A
+    ///      guardian who withdrew their approval before the drain owes nothing
+    ///      and should not appear in a conviction at all.
+    ///
+    ///      Both returned arrays come from the same call and are positionally
+    ///      aligned by construction, so no cross-call ordering assumption is
+    ///      made.
+    function _accusedWithRates(address governor, uint256 proposalId)
+        private
+        view
+        returns (address[] memory accused, uint256[] memory bps)
+    {
+        (address[] memory all, uint256[] memory allBps) = exposureLedger.slashBpsFor(governor, proposalId);
+        uint256 n;
+        for (uint256 i = 0; i < allBps.length; i++) {
+            if (allBps[i] != 0) n++;
+        }
+        accused = new address[](n);
+        bps = new uint256[](n);
+        uint256 j;
+        for (uint256 i = 0; i < allBps.length; i++) {
+            if (allBps[i] == 0) continue;
+            accused[j] = all[i];
+            bps[j] = allBps[i];
+            j++;
+        }
+    }
+
     function _accused(address governor, uint256 proposalId)
         internal
         view
