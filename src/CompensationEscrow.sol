@@ -136,16 +136,41 @@ contract CompensationEscrow is Ownable2Step, ICompensationEscrow {
         return (c.vault, c.snapshotTimestamp, c.proceeds, c.redeemed, c.openedAt);
     }
 
-    // `claimable`, `redeem` and `sweepResidue` land in Tasks 2 and 3. Reverting
-    // stubs so this task compiles and its tests go green first.
-
-    function claimable(uint256, address) public view virtual returns (uint256) {
-        revert NoClaim();
+    /// @inheritdoc ICompensationEscrow
+    /// @dev Pro-rata against the snapshot: `proceeds * votes(h, snap) / supply(snap)`.
+    ///      Returns 0 once redeemed or swept, so one call serves both
+    ///      "what am I owed" and "what is left". Rounds DOWN, so the sum of
+    ///      claims can never exceed `proceeds`; the dust stays in the case and
+    ///      leaves with the residue.
+    function claimable(uint256 caseId, address holder) public view returns (uint256) {
+        Case storage c = _cases[caseId];
+        if (c.proceeds == 0) return 0;
+        if (c.swept) return 0; // residue returned to the backstop; claims closed
+        if (_redeemed[caseId][holder]) return 0;
+        uint256 votes = IVaultVotesMinimal(c.vault).getPastVotes(holder, c.snapshotTimestamp);
+        if (votes == 0) return 0;
+        return (c.proceeds * votes) / c.snapshotSupply;
     }
 
-    function redeem(uint256) external virtual returns (uint256) {
-        revert NoClaim();
+    /// @inheritdoc ICompensationEscrow
+    /// @dev Pull-based: each holder redeems its own claim. Effects before
+    ///      interaction — the per-holder flag is set BEFORE the transfer, so a
+    ///      hooked WOOD cannot re-enter for a second payout.
+    function redeem(uint256 caseId) external returns (uint256 amount) {
+        Case storage c = _cases[caseId];
+        if (c.proceeds == 0) revert CaseNotFound();
+        if (_redeemed[caseId][msg.sender]) revert AlreadyRedeemed();
+        amount = claimable(caseId, msg.sender);
+        if (amount == 0) revert NoClaim();
+
+        _redeemed[caseId][msg.sender] = true;
+        c.redeemed += amount;
+        totalEscrowed -= amount;
+        wood.safeTransfer(msg.sender, amount);
+        emit ClaimRedeemed(caseId, msg.sender, amount);
     }
+
+    // `sweepResidue` lands in Task 3. Reverting stub so this task compiles.
 
     function sweepResidue(uint256) external virtual returns (uint256) {
         revert ResidueWindowOpen();

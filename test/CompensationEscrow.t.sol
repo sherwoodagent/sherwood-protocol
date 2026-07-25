@@ -102,4 +102,90 @@ contract CompensationEscrowTest is Test {
         vm.expectRevert(ICompensationEscrow.EmptySnapshot.selector);
         escrow.openCase(address(vault), emptyTs, 10_000e18);
     }
+
+    function _open(uint256 proceeds) internal returns (uint256) {
+        vm.prank(slasher);
+        return escrow.openCase(address(vault), snapTs, proceeds);
+    }
+
+    function test_claimable_isProRataAtSnapshot() public {
+        uint256 caseId = _open(10_000e18);
+        assertEq(escrow.claimable(caseId, alice), 7_000e18); // 70%
+        assertEq(escrow.claimable(caseId, bob), 3_000e18); // 30%
+    }
+
+    function test_redeem_paysHolderAndMarksRedeemed() public {
+        uint256 caseId = _open(10_000e18);
+        vm.prank(alice);
+        uint256 got = escrow.redeem(caseId);
+        assertEq(got, 7_000e18);
+        assertEq(wood.balanceOf(alice), 7_000e18);
+        assertEq(escrow.claimable(caseId, alice), 0, "claim consumed");
+        assertEq(escrow.totalEscrowed(), 3_000e18, "only bob's share still owed");
+    }
+
+    function test_redeem_twiceReverts() public {
+        uint256 caseId = _open(10_000e18);
+        vm.prank(alice);
+        escrow.redeem(caseId);
+        vm.prank(alice);
+        vm.expectRevert(ICompensationEscrow.AlreadyRedeemed.selector);
+        escrow.redeem(caseId);
+    }
+
+    function test_redeem_nonHolderReverts() public {
+        uint256 caseId = _open(10_000e18);
+        vm.prank(makeAddr("stranger"));
+        vm.expectRevert(ICompensationEscrow.NoClaim.selector);
+        escrow.redeem(caseId);
+    }
+
+    /// @notice THE F1 PROPERTY. A coalition that drains, lets honest holders exit
+    ///         at the depressed NAV, and accumulates their shares AFTERWARDS gets
+    ///         nothing: the claim is pinned to the pre-drain snapshot, where the
+    ///         coalition held zero. Paying the live NAV instead would have refunded
+    ///         the attacker its own slash.
+    function test_postDrainAccumulatorGetsNothing() public {
+        address coalition = makeAddr("coalition");
+        // Coalition held NOTHING at the snapshot...
+        vault.setVotes(coalition, snapTs, 0);
+        uint256 caseId = _open(10_000e18);
+
+        // ...and buys up the whole supply afterwards (a LATER timestamp).
+        uint256 nowTs = vm.getBlockTimestamp();
+        vault.setTotal(nowTs, 1_000e18);
+        vault.setVotes(coalition, nowTs, 1_000e18);
+
+        assertEq(escrow.claimable(caseId, coalition), 0, "no pre-drain claim");
+        vm.prank(coalition);
+        vm.expectRevert(ICompensationEscrow.NoClaim.selector);
+        escrow.redeem(caseId);
+
+        // The pre-drain holders still hold the entire entitlement.
+        assertEq(escrow.claimable(caseId, alice) + escrow.claimable(caseId, bob), 10_000e18);
+    }
+
+    /// @notice Claims are a mapping, not a token — there is no transfer surface, so
+    ///         a claim cannot be bought from an exiting honest holder.
+    function test_claimsHaveNoTransferSurface() public {
+        uint256 caseId = _open(10_000e18);
+        (bool ok,) =
+            address(escrow).call(abi.encodeWithSignature("transferFrom(address,address,uint256)", alice, bob, caseId));
+        assertFalse(ok, "escrow must expose no claim-transfer surface");
+    }
+
+    /// Fuzz the stated invariant: escrow WOOD balance >= sum of unredeemed claims.
+    function testFuzz_balanceCoversOutstanding(uint96 p, bool aliceRedeems, bool bobRedeems) public {
+        uint256 proceeds = uint256(p) % 1_000_000e18 + 1e18;
+        uint256 caseId = _open(proceeds);
+        if (aliceRedeems) {
+            vm.prank(alice);
+            escrow.redeem(caseId);
+        }
+        if (bobRedeems) {
+            vm.prank(bob);
+            escrow.redeem(caseId);
+        }
+        assertGe(wood.balanceOf(address(escrow)), escrow.totalEscrowed());
+    }
 }
