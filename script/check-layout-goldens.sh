@@ -35,9 +35,23 @@ inspect_layout() {
 }
 
 canonical_layout() {
-  # Canonical, ORDER-SIGNIFICANT JSON of the contract's top-level storage: every
-  # variable in slot order with (label, slot, offset, type). Ast ids and the declaring
-  # contract qualifier are stripped so only genuine layout drift diffs.
+  # Canonical, ORDER-SIGNIFICANT JSON of the contract's storage:
+  #
+  #   "storage" — every top-level variable in slot order with (label, slot, offset,
+  #               type).
+  #   "types"   — the INTERNAL layout of every struct reachable from those variables
+  #               (transitively, through mapping values and array bases), each with its
+  #               members in slot order.
+  #
+  # The `types` half is not optional. Top-level slots alone cannot see inside a struct:
+  # appending a member to a struct held in a mapping is a safe, invisible-to-`storage`
+  # change, but REORDERING two members of that same struct silently retypes every live
+  # record on the next upgrade and would pass a storage-only gate. (Concretely: the
+  # proposal-lifecycle branch grew `Review` from 3 slots to 4; safe as an append, and
+  # the gate could not have told the difference had it been a reorder.)
+  #
+  # Ast ids and the declaring contract qualifier are stripped so only genuine layout
+  # drift diffs.
   inspect_layout "$1" | python3 -c '
 import json, re, sys
 
@@ -45,10 +59,40 @@ def norm(s):
     return re.sub(r"\)\d+", ")", s)  # strip ast ids in type names
 
 d = json.load(sys.stdin)
-out = [
-    {"label": v["label"], "slot": v["slot"], "offset": v["offset"], "type": norm(v["type"])}
-    for v in d["storage"]
-]
+types = d.get("types") or {}
+
+# Transitive closure over the type graph, starting from the top-level variables.
+# Structs contribute their members; mappings their key/value; arrays their base.
+seen, stack = set(), [v["type"] for v in d["storage"]]
+while stack:
+    t = stack.pop()
+    if t in seen or t not in types:
+        continue
+    seen.add(t)
+    info = types[t]
+    for m in info.get("members") or []:
+        stack.append(m["type"])
+    for edge in ("key", "value", "base"):
+        if info.get(edge):
+            stack.append(info[edge])
+
+structs = {}
+for t in seen:
+    members = types[t].get("members")
+    if not members:  # only structs carry an internal slot assignment
+        continue
+    structs[norm(t)] = [
+        {"label": m["label"], "slot": m["slot"], "offset": m["offset"], "type": norm(m["type"])}
+        for m in members
+    ]
+
+out = {
+    "storage": [
+        {"label": v["label"], "slot": v["slot"], "offset": v["offset"], "type": norm(v["type"])}
+        for v in d["storage"]
+    ],
+    "types": dict(sorted(structs.items())),
+}
 print(json.dumps(out, indent=2))
 '
 }
