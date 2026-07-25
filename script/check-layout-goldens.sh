@@ -79,6 +79,11 @@ check_contract() {
 
 check_contract SyndicateGovernor script/syndicate-governor-layout.golden.json
 check_contract SyndicateFactory script/syndicate-factory-layout.golden.json
+# GuardianRegistry is UUPS-upgradeable and had no gate until the proposal-lifecycle
+# branch — which shipped a real collision (a `vaultOf` insert ahead of `factory`/`swood`
+# with no __gap decrement) caught only by manual diff, never by CI. Its slots move again
+# the moment an exposure ledger or similar is appended; gate it like the other two.
+check_contract GuardianRegistry script/guardian-registry-layout.golden.json
 
 [ "${UPDATE_GOLDEN:-0}" = "1" ] ||
-  echo "layout-goldens: OK — SyndicateGovernor + SyndicateFactory layouts match their goldens"
+  echo "layout-goldens: OK — SyndicateGovernor + SyndicateFactory + GuardianRegistry layouts match their goldens"

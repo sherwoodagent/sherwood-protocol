@@ -30,6 +30,13 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
     mapping(uint256 => StrategyProposal) internal _proposals;
     uint256 internal _openProposalCount;
     uint256 internal _lastSettledAt;
+    /// @notice Draft collaboration deadline per proposal.
+    /// @dev Deliberately `public` here, where the pre-fold governor kept it
+    ///      `internal` with a "no auto-getter — bytecode lever" note. That
+    ///      rationale was an EIP-170 concession; this stack targets Robinhood's
+    ///      98,304-byte limit, where the getter's cost is immaterial, and
+    ///      `_computeState` reads this for the Draft -> Expired edge so an
+    ///      external reader (and the lifecycle harness) legitimately wants it.
     mapping(uint256 => uint256) public collaborationDeadline;
     uint256[10] private __lifecycleGap;
 
@@ -158,22 +165,11 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
         bool reviewConcluded;
         (resolved, reviewConcluded) = _computeState(p);
 
-        if (reviewConcluded && stored != resolved) {
-            // Economic commit. `resolveReview` is idempotent on the registry
-            // (slash + attribution happen at most once, guarded by its
-            // `resolved` flag), so calling it here when the review was already
-            // resolved out-of-band (via the permissionless registry
-            // `resolveReview`) is a harmless no-op that returns the cached
-            // verdict. Consequence: the governor emits GuardianReviewResolved
-            // exactly once per proposal, on its terminal review transition,
-            // whether the resolution was driven here or out-of-band. This is a
-            // deliberate, benign divergence from the pre-refactor path, which
-            // emitted no governor-side event when the registry was resolved
-            // out-of-band first.
-            bool blocked = IGuardianRegistry(_guardianRegistry).resolveReview(address(this), p.id);
-            emit GuardianReviewResolved(p.id, blocked);
-        }
-
+        // EFFECTS first. The economic commit below is an external call that
+        // reaches sWOOD's slash path, so every local write lands before it.
+        // Callers all hold the shared `_reentrancyStatus` lock today, but CEI
+        // here makes that safety structural instead of a property every future
+        // caller has to remember.
         if (resolved != stored) {
             _transition(p, resolved);
             // Sherlock #8: Draft binds the vault — both Draft and non-Draft
@@ -181,6 +177,23 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
             if (resolved == ProposalState.Rejected || resolved == ProposalState.Expired) {
                 _decOpen();
                 if (stored == ProposalState.Draft) emit CollaborationDeadlineExpired(p.id);
+            }
+        }
+
+        // INTERACTION. Fire the registry's economic commit only when this call
+        // is what concluded the review AND the registry has not committed it
+        // already. Skipping the redundant call matters for more than gas:
+        // `resolveReview` is `whenNotPaused` while `outcomeOf` is not, so a
+        // review resolved out-of-band before a pause would otherwise make every
+        // mutating entrypoint for this proposal revert until unpause — and if
+        // `executeBy` elapsed meanwhile, strand it as Expired. Skipping also
+        // restores exact parity with the pre-refactor path, which emitted no
+        // governor-side event when the registry resolved the review first.
+        if (reviewConcluded && stored != resolved) {
+            (, bool alreadyResolved,,) = IGuardianRegistry(_guardianRegistry).getReviewState(address(this), p.id);
+            if (!alreadyResolved) {
+                bool blocked = IGuardianRegistry(_guardianRegistry).resolveReview(address(this), p.id);
+                emit GuardianReviewResolved(p.id, blocked);
             }
         }
     }

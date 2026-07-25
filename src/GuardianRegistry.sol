@@ -608,6 +608,18 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         // let the proposer race a pending `resolveReview` slash.
         uint256 ve = r.reviewEnd;
         if (ve > 0 && block.timestamp >= ve) revert ReviewNotOpen();
+        // A never-opened review has nothing to block, and `_isBlocked` must not
+        // be asked: on a zero-valued Review it evaluates `0 >= 0` and reports
+        // "blocked" vacuously, which would reject a perfectly legitimate cancel
+        // in the ordinary window between `voteEnd` and a keeper's `openReview`.
+        // `resolveReview` and `outcomeOf` both short-circuit on `!opened`
+        // before reaching the predicate — mirror them here.
+        if (!r.opened) {
+            r.resolved = true;
+            r.blocked = false;
+            emit ReviewResolved(proposalId, false, 0);
+            return;
+        }
         // Sherlock run #2 #2: once block quorum is reached, the proposer
         // can't dodge approver slashing by cancelling. Mirrors
         // `cancelEmergency`'s Sherlock #44 gate. Cold-start cohorts skip
