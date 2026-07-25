@@ -35,9 +35,19 @@ inspect_layout() {
 }
 
 canonical_layout() {
-  # Canonical, ORDER-SIGNIFICANT JSON of the contract's top-level storage: every
-  # variable in slot order with (label, slot, offset, type). Ast ids and the declaring
-  # contract qualifier are stripped so only genuine layout drift diffs.
+  # Canonical, ORDER-SIGNIFICANT JSON of the contract's storage, in two parts:
+  #
+  #   "storage" — every top-level variable in slot order with (label, slot, offset, type).
+  #   "structs" — the member layout of every struct type in the layout, keyed by type.
+  #
+  # The "structs" half matters because top-level pins alone are BLIND to struct-internal
+  # drift: `StrategyProposal` lives behind `mapping(uint256 => StrategyProposal)`, so its
+  # fields occupy no top-level slot and a reorder/insert/retype inside it is invisible
+  # above — yet it would corrupt every live proposal on upgrade. Struct fields are
+  # append-only for the same reason top-level ones are.
+  #
+  # Ast ids and the declaring contract qualifier are stripped so only genuine layout
+  # drift diffs.
   inspect_layout "$1" | python3 -c '
 import json, re, sys
 
@@ -45,11 +55,24 @@ def norm(s):
     return re.sub(r"\)\d+", ")", s)  # strip ast ids in type names
 
 d = json.load(sys.stdin)
-out = [
+storage = [
     {"label": v["label"], "slot": v["slot"], "offset": v["offset"], "type": norm(v["type"])}
     for v in d["storage"]
 ]
-print(json.dumps(out, indent=2))
+
+# Every struct type the layout mentions, member-by-member. Any struct present in
+# `types` is by construction reachable from `storage`, so no graph walk is needed.
+structs = {}
+for tname, tinfo in (d.get("types") or {}).items():
+    members = tinfo.get("members")
+    if not members:
+        continue
+    structs[norm(tname)] = [
+        {"label": m["label"], "slot": m["slot"], "offset": m["offset"], "type": norm(m["type"])}
+        for m in members
+    ]
+
+print(json.dumps({"storage": storage, "structs": dict(sorted(structs.items()))}, indent=2))
 '
 }
 

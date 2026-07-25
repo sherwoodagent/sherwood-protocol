@@ -609,8 +609,9 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     ///         disables tier pricing for governors created afterward (they keep
     ///         the safe tier-2 full-notional default). Only affects governors
     ///         created AFTER this call; existing per-vault governors are rewired
-    ///         individually via `SyndicateGovernor.setTierRegistry` (onlyFactory)
-    ///         if needed.
+    ///         via `pushWiring(governor)`. (The governor's own `setTierRegistry`
+    ///         is `onlyFactory`, so it is NOT callable directly — that dead end
+    ///         was the LOW-1 gap `pushWiring` exists to close.)
     function setTierRegistry(address newRegistry) external onlyOwner {
         address old = tierRegistry;
         tierRegistry = newRegistry;

@@ -184,6 +184,36 @@ contract FactoryCoverageWiringTest is Test {
         assertEq(SyndicateGovernor(gov).bondEscrow(), address(escrow), "escrow rewired");
     }
 
+    /// @notice `pushWiring` can only ADD wiring, never remove it: unset factory
+    ///         slots are SKIPPED, not written as zero. Documented at the
+    ///         implementation but previously unpinned (review M-5). This is also
+    ///         what makes the governor's `address(0)` branch unreachable from
+    ///         the factory — see the RECOVERY note on
+    ///         `SyndicateGovernor.setExposureLedger`.
+    function test_pushWiring_cannotUnwire() public {
+        vm.startPrank(owner);
+        factory.setTierRegistry(address(tierReg));
+        factory.setExposureLedger(address(ledger));
+        factory.setBondEscrow(address(escrow));
+        vm.stopPrank();
+
+        (address gov,) = _createSyndicate(); // born fully wired
+        assertEq(SyndicateGovernor(gov).exposureLedger(), address(ledger));
+        assertEq(SyndicateGovernor(gov).bondEscrow(), address(escrow));
+
+        // Clear the factory's slots, then re-push: the governor must KEEP its
+        // existing wiring rather than be silently un-wired.
+        vm.startPrank(owner);
+        factory.setExposureLedger(address(0));
+        factory.setBondEscrow(address(0));
+        factory.pushWiring(gov);
+        vm.stopPrank();
+
+        assertEq(SyndicateGovernor(gov).exposureLedger(), address(ledger), "ledger must survive a zero push");
+        assertEq(SyndicateGovernor(gov).bondEscrow(), address(escrow), "escrow must survive a zero push");
+        assertEq(SyndicateGovernor(gov).tierRegistry(), address(tierReg), "tier registry untouched");
+    }
+
     /// @notice Membership is mandatory: an address this factory never deployed
     ///         cannot be rewired, so the owner cannot drive arbitrary
     ///         `setTierRegistry` / `setExposureLedger` calls into foreign

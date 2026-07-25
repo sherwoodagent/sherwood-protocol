@@ -40,7 +40,9 @@ import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 ///                                        29..35 __paramsGap[7]
 ///                                        36..45 __emergencyGap[10]
 ///                                        46 _proposalCount ... 58 _tierRegistry
-///                                        59..91 __gap[33]
+///                                        59 _exposureLedger (Plan B)
+///                                        60 _bondEscrow (Plan B)
+///                                        61..91 __gap[31]
 contract GovernorLayoutPinsTest is Test {
     SyndicateGovernor governor;
     MockRegistryMinimal guardianRegistry;
@@ -48,6 +50,8 @@ contract GovernorLayoutPinsTest is Test {
     address constant VAULT_SENTINEL = address(0xA1);
     address constant PROTOCOL_CONFIG_SENTINEL = address(0xA2);
     address constant TIER_REGISTRY_SENTINEL = address(0xB1);
+    address constant EXPOSURE_LEDGER_SENTINEL = address(0xB2);
+    address constant BOND_ESCROW_SENTINEL = address(0xB3);
     address owner = makeAddr("owner");
 
     uint256 constant VOTING_PERIOD = 1 days;
@@ -126,5 +130,28 @@ contract GovernorLayoutPinsTest is Test {
         governor.setTierRegistry(TIER_REGISTRY_SENTINEL); // this test is the factory
         assertEq(_slot(58), bytes32(uint256(uint160(TIER_REGISTRY_SENTINEL))), "slot 58: _tierRegistry");
         assertEq(governor.tierRegistry(), TIER_REGISTRY_SENTINEL);
+    }
+
+    /// @notice Plan B appends: `_exposureLedger` (49) and `_bondEscrow` (50)
+    ///         were carved from the FRONT of `__gap` (33 → 31), so they must
+    ///         land immediately after `_tierRegistry` (48) and leave every
+    ///         pre-existing slot untouched. Pinned here as well as in the JSON
+    ///         golden because this layer runs under plain `forge test` — a
+    ///         reorder that slipped past an un-run shell script still fails here.
+    function test_layout_planBFieldsPinned() public {
+        assertEq(_slot(59), bytes32(0), "slot 59 starts unset");
+        assertEq(_slot(60), bytes32(0), "slot 60 starts unset");
+
+        // This test is the factory, so it may call the onlyFactory setters.
+        governor.setExposureLedger(EXPOSURE_LEDGER_SENTINEL);
+        governor.setBondEscrow(BOND_ESCROW_SENTINEL);
+
+        assertEq(_slot(59), bytes32(uint256(uint160(EXPOSURE_LEDGER_SENTINEL))), "slot 59: _exposureLedger");
+        assertEq(_slot(60), bytes32(uint256(uint160(BOND_ESCROW_SENTINEL))), "slot 60: _bondEscrow");
+        assertEq(governor.exposureLedger(), EXPOSURE_LEDGER_SENTINEL);
+        assertEq(governor.bondEscrow(), BOND_ESCROW_SENTINEL);
+
+        // The Plan B appends must not have disturbed the slot below them.
+        assertEq(_slot(58), bytes32(uint256(uint160(address(0)))), "slot 58 untouched by Plan B writes");
     }
 }

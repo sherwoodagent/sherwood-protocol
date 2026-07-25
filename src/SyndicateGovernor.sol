@@ -1370,9 +1370,16 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      The gates are fail-closed by design, so a wired ledger with an
     ///      unpriceable vault asset (`FeedNotConfigured` / `StalePrice`) or a
     ///      zero cap (`CoveredTvlCapExceeded`) halts ALL proposal creation for
-    ///      this vault. Note the two fixes sit with different owners: the escape
-    ///      hatch here (`setExposureLedger(address(0))`) is factory-owned, while
-    ///      the feed/cap fixes are ledger-owner-owned.
+    ///      this vault.
+    ///
+    ///      RECOVERY (corrected, review finding I-3): `address(0)` is accepted
+    ///      here, but the factory has NO path that passes it — both callers
+    ///      (`createSyndicate` and `pushWiring`) SKIP unset slots rather than
+    ///      writing zero, precisely so wiring can never be silently removed.
+    ///      Un-wiring an already-wired governor is therefore not reachable in
+    ///      practice. Recover instead at the ledger (ledger-owner:
+    ///      `setAssetFeed` / `setCoveredTvlCapUsd`), or point the factory at a
+    ///      fresh permissive ledger and `pushWiring` this governor.
     function setExposureLedger(address newLedger) external onlyFactory {
         emit ExposureLedgerSet(_exposureLedger, newLedger);
         _exposureLedger = newLedger;

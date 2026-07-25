@@ -1,134 +1,316 @@
-[
-  {
-    "label": "_reviews",
-    "slot": "0",
-    "offset": 0,
-    "type": "t_mapping(t_bytes32,t_struct(Review)_storage)"
-  },
-  {
-    "label": "_votes",
-    "slot": "1",
-    "offset": 0,
-    "type": "t_mapping(t_bytes32,t_mapping(t_address,t_enum(GuardianVoteType)))"
-  },
-  {
-    "label": "_voteStake",
-    "slot": "2",
-    "offset": 0,
-    "type": "t_mapping(t_bytes32,t_mapping(t_address,t_uint128))"
-  },
-  {
-    "label": "_approvers",
-    "slot": "3",
-    "offset": 0,
-    "type": "t_mapping(t_bytes32,t_array(t_address)dyn_storage)"
-  },
-  {
-    "label": "_blockers",
-    "slot": "4",
-    "offset": 0,
-    "type": "t_mapping(t_bytes32,t_array(t_address)dyn_storage)"
-  },
-  {
-    "label": "_approverIndex",
-    "slot": "5",
-    "offset": 0,
-    "type": "t_mapping(t_bytes32,t_mapping(t_address,t_uint256))"
-  },
-  {
-    "label": "_blockerIndex",
-    "slot": "6",
-    "offset": 0,
-    "type": "t_mapping(t_bytes32,t_mapping(t_address,t_uint256))"
-  },
-  {
-    "label": "_emergencyReviews",
-    "slot": "7",
-    "offset": 0,
-    "type": "t_mapping(t_bytes32,t_struct(EmergencyReview)_storage)"
-  },
-  {
-    "label": "_emergencyBlockVotes",
-    "slot": "8",
-    "offset": 0,
-    "type": "t_mapping(t_bytes32,t_mapping(t_uint8,t_mapping(t_address,t_bool)))"
-  },
-  {
-    "label": "_emergencyCalls",
-    "slot": "9",
-    "offset": 0,
-    "type": "t_mapping(t_bytes32,t_array(t_struct(Call)_storage)dyn_storage)"
-  },
-  {
-    "label": "epochGenesis",
-    "slot": "10",
-    "offset": 0,
-    "type": "t_uint256"
-  },
-  {
-    "label": "paused",
-    "slot": "11",
-    "offset": 0,
-    "type": "t_bool"
-  },
-  {
-    "label": "pausedAt",
-    "slot": "11",
-    "offset": 1,
-    "type": "t_uint64"
-  },
-  {
-    "label": "slashAppealReserve",
-    "slot": "12",
-    "offset": 0,
-    "type": "t_uint256"
-  },
-  {
-    "label": "refundedInEpoch",
-    "slot": "13",
-    "offset": 0,
-    "type": "t_mapping(t_uint256,t_uint256)"
-  },
-  {
-    "label": "reviewPeriod",
-    "slot": "14",
-    "offset": 0,
-    "type": "t_uint256"
-  },
-  {
-    "label": "blockQuorumBps",
-    "slot": "15",
-    "offset": 0,
-    "type": "t_uint256"
-  },
-  {
-    "label": "_authorizedGovernors",
-    "slot": "16",
-    "offset": 0,
-    "type": "t_struct(AddressSet)_storage"
-  },
-  {
-    "label": "factory",
-    "slot": "18",
-    "offset": 0,
-    "type": "t_address"
-  },
-  {
-    "label": "swood",
-    "slot": "19",
-    "offset": 0,
-    "type": "t_contract(IStakedWood)"
-  },
-  {
-    "label": "exposureLedger",
-    "slot": "20",
-    "offset": 0,
-    "type": "t_contract(IExposureLedger)"
-  },
-  {
-    "label": "__gap",
-    "slot": "21",
-    "offset": 0,
-    "type": "t_array(t_uint256)_storage"
+{
+  "storage": [
+    {
+      "label": "_reviews",
+      "slot": "0",
+      "offset": 0,
+      "type": "t_mapping(t_bytes32,t_struct(Review)_storage)"
+    },
+    {
+      "label": "_votes",
+      "slot": "1",
+      "offset": 0,
+      "type": "t_mapping(t_bytes32,t_mapping(t_address,t_enum(GuardianVoteType)))"
+    },
+    {
+      "label": "_voteStake",
+      "slot": "2",
+      "offset": 0,
+      "type": "t_mapping(t_bytes32,t_mapping(t_address,t_uint128))"
+    },
+    {
+      "label": "_approvers",
+      "slot": "3",
+      "offset": 0,
+      "type": "t_mapping(t_bytes32,t_array(t_address)dyn_storage)"
+    },
+    {
+      "label": "_blockers",
+      "slot": "4",
+      "offset": 0,
+      "type": "t_mapping(t_bytes32,t_array(t_address)dyn_storage)"
+    },
+    {
+      "label": "_approverIndex",
+      "slot": "5",
+      "offset": 0,
+      "type": "t_mapping(t_bytes32,t_mapping(t_address,t_uint256))"
+    },
+    {
+      "label": "_blockerIndex",
+      "slot": "6",
+      "offset": 0,
+      "type": "t_mapping(t_bytes32,t_mapping(t_address,t_uint256))"
+    },
+    {
+      "label": "_emergencyReviews",
+      "slot": "7",
+      "offset": 0,
+      "type": "t_mapping(t_bytes32,t_struct(EmergencyReview)_storage)"
+    },
+    {
+      "label": "_emergencyBlockVotes",
+      "slot": "8",
+      "offset": 0,
+      "type": "t_mapping(t_bytes32,t_mapping(t_uint8,t_mapping(t_address,t_bool)))"
+    },
+    {
+      "label": "_emergencyCalls",
+      "slot": "9",
+      "offset": 0,
+      "type": "t_mapping(t_bytes32,t_array(t_struct(Call)_storage)dyn_storage)"
+    },
+    {
+      "label": "epochGenesis",
+      "slot": "10",
+      "offset": 0,
+      "type": "t_uint256"
+    },
+    {
+      "label": "paused",
+      "slot": "11",
+      "offset": 0,
+      "type": "t_bool"
+    },
+    {
+      "label": "pausedAt",
+      "slot": "11",
+      "offset": 1,
+      "type": "t_uint64"
+    },
+    {
+      "label": "slashAppealReserve",
+      "slot": "12",
+      "offset": 0,
+      "type": "t_uint256"
+    },
+    {
+      "label": "refundedInEpoch",
+      "slot": "13",
+      "offset": 0,
+      "type": "t_mapping(t_uint256,t_uint256)"
+    },
+    {
+      "label": "reviewPeriod",
+      "slot": "14",
+      "offset": 0,
+      "type": "t_uint256"
+    },
+    {
+      "label": "blockQuorumBps",
+      "slot": "15",
+      "offset": 0,
+      "type": "t_uint256"
+    },
+    {
+      "label": "_authorizedGovernors",
+      "slot": "16",
+      "offset": 0,
+      "type": "t_struct(AddressSet)_storage"
+    },
+    {
+      "label": "factory",
+      "slot": "18",
+      "offset": 0,
+      "type": "t_address"
+    },
+    {
+      "label": "swood",
+      "slot": "19",
+      "offset": 0,
+      "type": "t_contract(IStakedWood)"
+    },
+    {
+      "label": "exposureLedger",
+      "slot": "20",
+      "offset": 0,
+      "type": "t_contract(IExposureLedger)"
+    },
+    {
+      "label": "__gap",
+      "slot": "21",
+      "offset": 0,
+      "type": "t_array(t_uint256)_storage"
+    }
+  ],
+  "structs": {
+    "t_struct(AddressSet)_storage": [
+      {
+        "label": "_inner",
+        "slot": "0",
+        "offset": 0,
+        "type": "t_struct(Set)_storage"
+      }
+    ],
+    "t_struct(Call)_storage": [
+      {
+        "label": "target",
+        "slot": "0",
+        "offset": 0,
+        "type": "t_address"
+      },
+      {
+        "label": "data",
+        "slot": "1",
+        "offset": 0,
+        "type": "t_bytes_storage"
+      },
+      {
+        "label": "value",
+        "slot": "2",
+        "offset": 0,
+        "type": "t_uint256"
+      }
+    ],
+    "t_struct(EmergencyReview)_storage": [
+      {
+        "label": "callsHash",
+        "slot": "0",
+        "offset": 0,
+        "type": "t_bytes32"
+      },
+      {
+        "label": "reviewEnd",
+        "slot": "1",
+        "offset": 0,
+        "type": "t_uint64"
+      },
+      {
+        "label": "totalStakeAtOpen",
+        "slot": "1",
+        "offset": 8,
+        "type": "t_uint128"
+      },
+      {
+        "label": "blockStakeWeight",
+        "slot": "2",
+        "offset": 0,
+        "type": "t_uint128"
+      },
+      {
+        "label": "resolved",
+        "slot": "2",
+        "offset": 16,
+        "type": "t_bool"
+      },
+      {
+        "label": "blocked",
+        "slot": "2",
+        "offset": 17,
+        "type": "t_bool"
+      },
+      {
+        "label": "nonce",
+        "slot": "2",
+        "offset": 18,
+        "type": "t_uint8"
+      },
+      {
+        "label": "openedAt",
+        "slot": "2",
+        "offset": 19,
+        "type": "t_uint64"
+      },
+      {
+        "label": "totalDelegatedAtOpen",
+        "slot": "3",
+        "offset": 0,
+        "type": "t_uint128"
+      },
+      {
+        "label": "cohortTooSmall",
+        "slot": "3",
+        "offset": 16,
+        "type": "t_bool"
+      },
+      {
+        "label": "blockQuorumBpsAtOpen",
+        "slot": "3",
+        "offset": 17,
+        "type": "t_uint16"
+      },
+      {
+        "label": "governor",
+        "slot": "4",
+        "offset": 0,
+        "type": "t_address"
+      }
+    ],
+    "t_struct(Review)_storage": [
+      {
+        "label": "opened",
+        "slot": "0",
+        "offset": 0,
+        "type": "t_bool"
+      },
+      {
+        "label": "resolved",
+        "slot": "0",
+        "offset": 1,
+        "type": "t_bool"
+      },
+      {
+        "label": "blocked",
+        "slot": "0",
+        "offset": 2,
+        "type": "t_bool"
+      },
+      {
+        "label": "cohortTooSmall",
+        "slot": "0",
+        "offset": 3,
+        "type": "t_bool"
+      },
+      {
+        "label": "totalStakeAtOpen",
+        "slot": "0",
+        "offset": 4,
+        "type": "t_uint128"
+      },
+      {
+        "label": "approveStakeWeight",
+        "slot": "1",
+        "offset": 0,
+        "type": "t_uint128"
+      },
+      {
+        "label": "blockStakeWeight",
+        "slot": "1",
+        "offset": 16,
+        "type": "t_uint128"
+      },
+      {
+        "label": "openedAt",
+        "slot": "2",
+        "offset": 0,
+        "type": "t_uint64"
+      },
+      {
+        "label": "totalDelegatedAtOpen",
+        "slot": "2",
+        "offset": 8,
+        "type": "t_uint128"
+      },
+      {
+        "label": "blockQuorumBpsAtOpen",
+        "slot": "2",
+        "offset": 24,
+        "type": "t_uint16"
+      }
+    ],
+    "t_struct(Set)_storage": [
+      {
+        "label": "_values",
+        "slot": "0",
+        "offset": 0,
+        "type": "t_array(t_bytes32)dyn_storage"
+      },
+      {
+        "label": "_positions",
+        "slot": "1",
+        "offset": 0,
+        "type": "t_mapping(t_bytes32,t_uint256)"
+      }
+    ]
   }
-]
+}
