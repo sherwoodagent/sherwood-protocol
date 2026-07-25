@@ -38,6 +38,51 @@ interface ICourt {
         NotGuilty
     }
 
+    /// @notice Where a case sits in the two-layer process. `None` MUST be the
+    ///         zero value so an unreferred case is never mistaken for a live
+    ///         one — every phase-gated entrypoint compares against a specific
+    ///         member, so an untouched slot matches nothing.
+    /// @dev    `Panel` → layer 1 is taking votes. `AppealWindow` → the panel has
+    ///         ruled and Task 4's `appeal` may still be filed. `Appeal` → the
+    ///         token vote of layer 2 is open. `Resolved` → the verdict has been
+    ///         handed to `ChallengeGame.rule`. Task 3 implements
+    ///         `None → Panel → AppealWindow`; Tasks 4-5 own the rest, and the
+    ///         ordering is pinned here so neither can silently reinterpret it.
+    enum Phase {
+        None,
+        Panel,
+        AppealWindow,
+        Appeal,
+        Resolved
+    }
+
+    /// @notice One adjudication, opened by `refer` against one disputed
+    ///         challenge.
+    /// @param challengeId       The `ChallengeGame` challenge under adjudication.
+    /// @param snapshotTs        THE ELECTORATE, FIXED ONCE (decision D2):
+    ///        `executedAt - 1` of the challenged proposal, computed in `refer`
+    ///        and never re-derived. Both later votes — the merits appeal and the
+    ///        bad-faith vote — read this one value, so they cannot disagree
+    ///        about who votes; and it is the same instant Plan C's
+    ///        `slashToEscrow` uses for compensation claims, which makes the
+    ///        electorate that judges guilt identical to the set compensated out
+    ///        of the resulting slash.
+    /// @param referredAt        When the panel window started.
+    /// @param panelFinalizedAt  When `finalizePanel` wrote `panelRuling`; zero
+    ///        while layer 1 is still open. Task 4 measures `appealWindow` from it.
+    /// @param panelGuiltyVotes  Seats that voted guilty — a HEAD COUNT, not
+    ///        stake: layer 1 is a panel of people, layer 2 is the token vote.
+    struct Case {
+        uint256 challengeId;
+        uint256 snapshotTs;
+        uint256 referredAt;
+        uint256 panelFinalizedAt;
+        uint256 panelGuiltyVotes;
+        uint256 panelNotGuiltyVotes;
+        Phase phase;
+        Ruling panelRuling;
+    }
+
     // ── Errors ──
     // Roster and bonds (Task 2).
     error NotPanelist();
@@ -55,6 +100,17 @@ interface ICourt {
     // Adjudication (Tasks 3-5).
     error AlreadyRuled();
     error WrongPhase();
+    /// @notice `refer` on a challenge that is not `Disputed`. A `Filed` one is
+    ///         still inside its own auto-slash clock and nobody has contested
+    ///         it; a terminal one has nothing left to decide.
+    /// @dev    Distinct from `WrongPhase`, which is about THIS contract's case
+    ///         phases: this one reports the challenge game's status.
+    error ChallengeNotDisputed();
+    /// @notice A second `refer` against a challenge that already has a case.
+    ///         Two cases over one accusation would run two panels at two
+    ///         snapshots toward two verdicts, and only one of them could reach
+    ///         `ChallengeGame.rule`.
+    error AlreadyReferred();
     error WindowClosed();
     error WindowOpen();
     error ParticipationFloorNotMet();
@@ -79,6 +135,27 @@ interface ICourt {
     /// @dev    Emitted by Tasks 3-5 whenever a ruling is recorded or a
     ///         bad-faith vote is opened against one.
     event PanelBondLocked(address indexed member, uint256 lockedUntil);
+
+    // Adjudication, layer 1 (Task 3).
+    /// @param snapshotTs The voting-power instant this case is fixed to for
+    ///        every later vote (D2) — `executedAt - 1` of the challenged
+    ///        proposal. Emitted so an indexer can reconstruct the electorate
+    ///        from the log alone.
+    event CaseReferred(
+        uint256 indexed caseId,
+        uint256 indexed challengeId,
+        address indexed governor,
+        uint256 proposalId,
+        uint256 snapshotTs
+    );
+    event PanelVoteCast(uint256 indexed caseId, address indexed member, bool guilty);
+    /// @dev Carries the tally as well as the verdict, because a `NotGuilty` at
+    ///      `0-0` (nobody ruled) and one at `2-2` (a tie) are different facts
+    ///      about the panel even though they are the same outcome.
+    event PanelFinalized(uint256 indexed caseId, Ruling ruling, uint256 guiltyVotes, uint256 notGuiltyVotes);
+    event ChallengeGameSet(address indexed oldGame, address indexed newGame);
+    event PanelWindowSet(uint256 oldWindow, uint256 newWindow);
+    event BadFaithWindowSet(uint256 oldWindow, uint256 newWindow);
 
     // ── Roster (D1) ──
     /// @notice Replace the seated panel with `members`.
@@ -121,6 +198,53 @@ interface ICourt {
     ///         ready to rule.
     function isReadyToRule(address member) external view returns (bool);
 
+    // ── Layer 1: the panel rules (Task 3) ──
+    /// @notice Escalate a `Disputed` challenge to the court, opening a case.
+    /// @dev    PERMISSIONLESS. The caller chooses nothing: the challenge it
+    ///         names must already be `Disputed`, and everything the case is
+    ///         fixed to — the electorate snapshot, the panel deadline — is
+    ///         derived from state the caller does not control. Leaving it open
+    ///         removes the last place a privileged party could sit on an
+    ///         escalation, which matters because the challenge's own
+    ///         `disputeTimeout` acquits by default while nobody refers it.
+    /// @return caseId The new case. Case ids are the court's own; they are NOT
+    ///         challenge ids, and not the `caseId` sWOOD mints for a
+    ///         compensation case either.
+    function refer(uint256 challengeId) external returns (uint256 caseId);
+
+    /// @notice Record a seated, fully bonded panelist's verdict on a case.
+    /// @dev    Locks the caller's panel bond (see `panelBondLockedUntil`) — a
+    ///         panelist that has ruled cannot take its stake out of the
+    ///         bad-faith track's reach.
+    function panelRule(uint256 caseId, bool guilty) external;
+
+    /// @notice Close layer 1 and write `panelRuling`, once the panel window has
+    ///         elapsed or every seated member has voted.
+    /// @dev    A MAJORITY OF CAST VOTES CONVICTS; ANYTHING ELSE ACQUITS. A tie
+    ///         and a silent panel both yield `NotGuilty` — see `Court` for why
+    ///         that is a property and not an accident.
+    function finalizePanel(uint256 caseId) external;
+
+    function caseOf(uint256 caseId) external view returns (Case memory);
+    function caseCount() external view returns (uint256);
+    /// @notice The case opened against `challengeId`, or zero if none. Case ids
+    ///         start at one so zero is unambiguously "not referred".
+    function caseOfChallenge(uint256 challengeId) external view returns (uint256);
+    /// @notice How `member` voted on `caseId`; `Ruling.None` means it has not.
+    function panelVoteOf(uint256 caseId, address member) external view returns (Ruling);
+
+    /// @notice The challenge game this court adjudicates for. Owner-set after
+    ///         construction, mirroring `ChallengeGame.setStakedWood`: the two
+    ///         contracts reference each other, so one of the two links must be
+    ///         wired after both exist.
+    function challengeGame() external view returns (address);
+    /// @notice How long layer 1 has to rule, measured from `referredAt`.
+    function panelWindow() external view returns (uint256);
+    /// @notice How long a ruling stays open to a bad-faith challenge (Task 5).
+    ///         Read by Task 3 only to escrow a ruling panelist's bond for at
+    ///         least that long.
+    function badFaithWindow() external view returns (uint256);
+
     /// @notice WOOD the court holds on behalf of open positions (spec §4). The
     ///         invariant is `wood.balanceOf(court) == bondedWood`: in Task 2
     ///         that is posted panel bonds; Tasks 4 and 5 add open appeal and
@@ -129,4 +253,7 @@ interface ICourt {
 
     // ── Owner setters ──
     function setPanelBondWood(uint256 newBond) external;
+    function setChallengeGame(address newGame) external;
+    function setPanelWindow(uint256 newWindow) external;
+    function setBadFaithWindow(uint256 newWindow) external;
 }

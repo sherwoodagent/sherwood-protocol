@@ -5,6 +5,8 @@ import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ICourt} from "./interfaces/ICourt.sol";
+import {IChallengeGame} from "./interfaces/IChallengeGame.sol";
+import {ISyndicateGovernor} from "./interfaces/ISyndicateGovernor.sol";
 
 /**
  * @title Court
@@ -15,11 +17,10 @@ import {ICourt} from "./interfaces/ICourt.sol";
  *         appealable to a full WOOD vote, and the outcome drives
  *         `ChallengeGame.rule`.
  *
- * @dev    THIS REVISION IS THE ROSTER AND THE MEMBER BONDS ONLY (Plan E Task
- *         2). The panel ruling (Task 3), the token-vote appeal (Task 4) and the
- *         bad-faith track (Task 5) build on this foundation. `ICourt` already
- *         declares their errors and the `Ruling` enum, so those tasks add
- *         functions rather than churning the ABI.
+ * @dev    THIS REVISION IS THE ROSTER, THE MEMBER BONDS AND LAYER 1 (Plan E
+ *         Tasks 2-3). The token-vote appeal (Task 4) and the bad-faith track
+ *         (Task 5) build on this foundation. `ICourt` already declares their
+ *         errors, so those tasks add functions rather than churning the ABI.
  *
  * @dev    NEITHER HALF IS SAFE ALONE. §3.5: a token vote is incompetent for
  *         forensic questions and capturable at ~$15M mcap; a standalone panel
@@ -47,6 +48,26 @@ contract Court is Ownable2Step, ICourt {
     ///         new rosters and de-duplicates in O(n²); the bound keeps that
     ///         gas-safe. §3.5 contemplates a panel of ~5, so this is generous.
     uint256 public constant MAX_PANEL_SIZE = 21;
+
+    /// @notice Ceiling on `panelWindow`.
+    /// @dev    LOAD-BEARING AGAINST THE CHALLENGE CLOCK, not a style choice.
+    ///         `ChallengeGame.resolve` fails a disputed challenge to the accused
+    ///         once `disputeTimeout` (30d by default, 180d max) elapses from
+    ///         `filedAt`, and the court's whole process — panel window, appeal
+    ///         window, appeal vote — has to finish inside what is left of that
+    ///         after the referral. A panel window that could eat the entire
+    ///         timeout would let layer 1 run out the challenge's clock and
+    ///         acquit by default, which is exactly the hole Plan E exists to
+    ///         close. Task 7's deploy pre-flight is where the three windows are
+    ///         checked to fit together against the live `disputeTimeout`.
+    uint256 public constant MAX_PANEL_WINDOW = 14 days;
+
+    /// @notice Ceiling on `badFaithWindow`. It does NOT run against the
+    ///         challenge clock — the bad-faith track is about the panelist's
+    ///         bond, long after the challenge itself is terminal — so the only
+    ///         thing it bounds is how long a member's bond can be escrowed
+    ///         after it rules.
+    uint256 public constant MAX_BAD_FAITH_WINDOW = 90 days;
 
     IERC20 public immutable wood;
 
@@ -78,6 +99,33 @@ contract Court is Ownable2Step, ICourt {
     ///      whose bond is still locked against the bad-faith track is still
     ///      WOOD this contract holds and must still balance.
     uint256 public bondedWood;
+
+    // ─────────────────────── Adjudication state (Task 3) ───────────────────────
+
+    /// @inheritdoc ICourt
+    /// @dev Typed as `address` rather than `IChallengeGame` so the generated
+    ///      getter matches the interface, and cast at the two call sites.
+    address public challengeGame;
+
+    /// @inheritdoc ICourt
+    /// @dev 7 days: long enough that a panel of humans spread across time zones
+    ///      can read an evidence bundle and confer, short enough to leave room
+    ///      inside `ChallengeGame.disputeTimeout` for the appeal that follows.
+    uint256 public panelWindow = 7 days;
+
+    /// @inheritdoc ICourt
+    uint256 public badFaithWindow = 14 days;
+
+    /// @inheritdoc ICourt
+    uint256 public caseCount;
+
+    mapping(uint256 caseId => Case) internal _cases;
+
+    /// @inheritdoc ICourt
+    mapping(uint256 challengeId => uint256 caseId) public caseOfChallenge;
+
+    /// @inheritdoc ICourt
+    mapping(uint256 caseId => mapping(address member => Ruling)) public panelVoteOf;
 
     /// @param initialOwner   The governance multisig that executes the off-chain
     ///                       panel election (D1).
@@ -202,25 +250,171 @@ contract Court is Ownable2Step, ICourt {
         return isPanelist[member] && panelBondOf[member] >= panelBondWood;
     }
 
-    // ─────────────────────── Hooks for Tasks 3-5 ───────────────────────
+    // ──────────────────── Layer 1: the panel rules (§3.5) ────────────────────
 
-    /// @dev The single choke point Task 3's `panelRule` MUST call before
-    ///      recording a vote. Split from `isReadyToRule` only to report which
-    ///      of the two preconditions failed.
+    /// @inheritdoc ICourt
+    /// @dev THE SNAPSHOT IS COMPUTED HERE, ONCE, AND STORED (decision D2). It is
+    ///      `executedAt - 1` — the block before the challenged proposal
+    ///      executed — which is the SAME instant §3.8's compensation claims use
+    ///      and the same one Plan D hands `slashToEscrow` on the settle path.
+    ///      One rule, three consumers. Storing it rather than re-deriving it in
+    ///      each vote is what makes the electorate that judges guilt identical
+    ///      to the set compensated out of the resulting slash, and it means the
+    ///      merits appeal and the bad-faith vote cannot disagree about who is
+    ///      entitled to vote — not even if the governor's proposal record moved
+    ///      underneath them.
+    /// @dev NOTHING HERE EXTENDS THE CHALLENGE'S OWN CLOCK. `ChallengeGame`
+    ///      still fails a disputed challenge to the accused at
+    ///      `filedAt + disputeTimeout`, so a referral filed very late leaves the
+    ///      court too little time to reach a verdict and the fail-safe acquits.
+    ///      That is deliberate — the court must not be able to pin a guardian's
+    ///      frozen coverage indefinitely by opening a case — and it is why the
+    ///      window ceilings above are sized against the timeout.
+    function refer(uint256 challengeId) external returns (uint256 caseId) {
+        address game = challengeGame;
+        if (game == address(0)) revert ZeroAddress();
+        if (caseOfChallenge[challengeId] != 0) revert AlreadyReferred();
+
+        // Claim the challenge BEFORE reading anything external. The reads below
+        // call out to `ch.governor` — an address the CHALLENGER supplied to
+        // `ChallengeGame.file` and may therefore control. Today they are both
+        // `view`, so the compiler emits STATICCALL and re-entry is impossible at
+        // the EVM level; this ordering is what keeps that true if either
+        // interface ever loses its `view`, because a governor re-entering with
+        // the same id then hits `AlreadyReferred` rather than opening a second
+        // case over one accusation — two panels, two snapshots, one challenge.
+        // Both writes roll back with the transaction if a check below fails.
+        caseId = ++caseCount;
+        caseOfChallenge[challengeId] = caseId;
+
+        IChallengeGame.Challenge memory ch = IChallengeGame(game).challengeOf(challengeId);
+        // Only a contested challenge is escalated: a `Filed` one is still inside
+        // its own auto-slash clock (silence is already the verdict there), and a
+        // terminal one has nothing left to decide.
+        if (ch.status != IChallengeGame.Status.Disputed) revert ChallengeNotDisputed();
+
+        uint256 executedAt = ISyndicateGovernor(ch.governor).getProposal(ch.proposalId).executedAt;
+        // Unreachable through a real filing — `ChallengeGame.file` rejects an
+        // unexecuted proposal — but fail closed rather than underflow into a
+        // snapshot at `type(uint256).max`, an instant nobody has voting power at.
+        if (executedAt == 0) revert InvalidParameter();
+        uint256 snapshotTs = executedAt - 1;
+
+        Case storage c = _cases[caseId];
+        c.challengeId = challengeId;
+        c.snapshotTs = snapshotTs;
+        c.referredAt = block.timestamp;
+        c.phase = Phase.Panel;
+
+        emit CaseReferred(caseId, challengeId, ch.governor, ch.proposalId, snapshotTs);
+    }
+
+    /// @inheritdoc ICourt
+    /// @dev THE BOND LOCK IS THE POINT, not bookkeeping. Without it a panelist
+    ///      could rule, be rotated off the roster and `withdrawPanelBond` before
+    ///      anyone could open a bad-faith vote against that ruling — the F6
+    ///      track (Task 5) would have nothing to slash and the only binding
+    ///      incentive on panel behaviour would be decorative. The lock runs to
+    ///      `referredAt + panelWindow + badFaithWindow`: the latest instant
+    ///      layer 1 can close, plus a full bad-faith window.
+    ///
+    ///      THAT IS A FLOOR, NOT THE FINAL DEADLINE. Task 5 opens its window
+    ///      when the CASE finalizes, which is later than the panel phase
+    ///      whenever an appeal runs. TASK 4 MUST therefore call
+    ///      `_lockPanelBond(member, finalizedAt + badFaithWindow)` for the
+    ///      members that ruled when it resolves a case; `_lockPanelBond` only
+    ///      ever extends, so that is safe to layer on top of this one.
+    /// @dev ACCEPTED CONSEQUENCE: because unseating a locked member reverts, a
+    ///      panelist can delay its own rotation off the roster by ruling. The
+    ///      escape hatch is `setPanelBondWood` — raising the requirement makes
+    ///      an under-bonded member un-ready to rule immediately (see
+    ///      `isReadyToRule`) without waiting for its lock to expire.
+    function panelRule(uint256 caseId, bool guilty) external {
+        Case storage c = _cases[caseId];
+        if (c.phase != Phase.Panel) revert WrongPhase();
+        uint256 deadline = c.referredAt + panelWindow;
+        if (block.timestamp >= deadline) revert WindowClosed();
+
+        _requireReadyToRule(msg.sender);
+        if (panelVoteOf[caseId][msg.sender] != Ruling.None) revert AlreadyRuled();
+
+        panelVoteOf[caseId][msg.sender] = guilty ? Ruling.Guilty : Ruling.NotGuilty;
+        if (guilty) {
+            c.panelGuiltyVotes += 1;
+        } else {
+            c.panelNotGuiltyVotes += 1;
+        }
+
+        _lockPanelBond(msg.sender, deadline + badFaithWindow);
+        emit PanelVoteCast(caseId, msg.sender, guilty);
+    }
+
+    /// @inheritdoc ICourt
+    /// @dev PERMISSIONLESS, and the caller chooses nothing: the verdict is a
+    ///      function of the votes already cast and the clock.
+    /// @dev A MAJORITY OF CAST VOTES CONVICTS; EVERYTHING ELSE ACQUITS. Both
+    ///      non-majority cases are REAL PROPERTIES, deliberately chosen, not
+    ///      artefacts of the arithmetic:
+    ///
+    ///      1. A PANEL THAT DOES NOT RULE WITHIN `panelWindow` YIELDS
+    ///         `NotGuilty`. §3.5 hands this layer a 100% slash at
+    ///         `maxSlashBps`; a panel that said nothing has not established the
+    ///         ground truth that authorises it, so the court fails safe toward
+    ///         not slashing — the same direction Plan D's D5 fails when no court
+    ///         answers at all. The cost is stated rather than hidden: an
+    ///         INACTIVE PANEL ACQUITS, so panel liveness is an operational
+    ///         requirement, and the check on it is the appeal above (Task 4),
+    ///         which can still convict where layer 1 was silent.
+    ///      2. A TIE YIELDS `NotGuilty`, for the same reason: a panel split down
+    ///         the middle has not established ground truth either. `>` rather
+    ///         than `>=` is the whole implementation of that rule.
+    /// @dev EARLY CLOSE ONCE EVERY SEAT HAS VOTED — there is nothing left to
+    ///      wait for, and burning the rest of the window would only eat into the
+    ///      challenge's `disputeTimeout`. Compared with `>=` because the roster
+    ///      can shrink mid-case, which would otherwise leave votes cast by
+    ///      since-unseated members exceeding `panelSize` and wedge the case in
+    ///      `Panel` until the window elapsed. A roster emptied mid-case makes a
+    ///      case finalizable at once, as `NotGuilty` — fail-safe again.
+    function finalizePanel(uint256 caseId) external {
+        Case storage c = _cases[caseId];
+        if (c.phase != Phase.Panel) revert WrongPhase();
+
+        uint256 guiltyVotes = c.panelGuiltyVotes;
+        uint256 notGuiltyVotes = c.panelNotGuiltyVotes;
+        if (block.timestamp < c.referredAt + panelWindow && guiltyVotes + notGuiltyVotes < _panel.length) {
+            revert WindowOpen();
+        }
+
+        Ruling ruling = guiltyVotes > notGuiltyVotes ? Ruling.Guilty : Ruling.NotGuilty;
+        c.panelRuling = ruling;
+        c.panelFinalizedAt = block.timestamp;
+        c.phase = Phase.AppealWindow;
+
+        emit PanelFinalized(caseId, ruling, guiltyVotes, notGuiltyVotes);
+    }
+
+    /// @inheritdoc ICourt
+    function caseOf(uint256 caseId) external view returns (Case memory) {
+        return _cases[caseId];
+    }
+
+    // ─────────────────────── Hooks for Tasks 4-5 ───────────────────────
+
+    /// @dev The single choke point `panelRule` calls before recording a vote.
+    ///      Split from `isReadyToRule` only to report which of the two
+    ///      preconditions failed.
     function _requireReadyToRule(address member) internal view {
         if (!isPanelist[member]) revert NotPanelist();
         if (panelBondOf[member] < panelBondWood) revert PanelBondNotPosted();
     }
 
     /// @dev Whether `member`'s bond is still needed by the bad-faith track.
-    ///      Nothing in this revision writes `panelBondLockedUntil`, so today it
-    ///      is uniformly false and the roster/withdraw guards are inert — by
-    ///      construction, since there are no rulings yet. TASK 3 wires it up by
-    ///      calling `_lockPanelBond(member, finalizedAt + badFaithWindow)` when
-    ///      a panelist records a ruling, and TASK 5 extends the lock for as
-    ///      long as a bad-faith vote against that ruling stays open. The guards
-    ///      are implemented now so that wiring is a one-line change rather than
-    ///      a security property someone has to remember to add.
+    ///      `panelRule` is what makes this live: a member that records a ruling
+    ///      is locked to `referredAt + panelWindow + badFaithWindow`, so the
+    ///      roster and withdraw guards above genuinely bite from the moment it
+    ///      votes. TASK 4 extends the lock to the case's actual finalization
+    ///      plus `badFaithWindow`, and TASK 5 extends it again for as long as a
+    ///      bad-faith vote against that ruling stays open.
     function _hasOpenRuling(address member) internal view returns (bool) {
         return block.timestamp < panelBondLockedUntil[member];
     }
@@ -246,6 +440,48 @@ contract Court is Ownable2Step, ICourt {
         if (newBond == 0) revert InvalidParameter();
         emit PanelBondWoodSet(panelBondWood, newBond);
         panelBondWood = newBond;
+    }
+
+    /// @inheritdoc ICourt
+    /// @dev NO ZERO ESCAPE HERE, unlike `ChallengeGame.setCourt`. The off-switch
+    ///      lives on the game's side — unwiring the court there returns the game
+    ///      to D5's fail-safe timeout — whereas a court pointed at nothing could
+    ///      only refuse to open cases, which is a worse way to say the same
+    ///      thing.
+    function setChallengeGame(address newGame) external onlyOwner {
+        if (newGame == address(0)) revert ZeroAddress();
+        emit ChallengeGameSet(challengeGame, newGame);
+        challengeGame = newGame;
+    }
+
+    /// @inheritdoc ICourt
+    /// @dev Bounded `(0, MAX_PANEL_WINDOW]`: a zero window would close layer 1
+    ///      before any panelist could vote, making every case an automatic
+    ///      acquittal, and the ceiling keeps the panel phase from eating the
+    ///      challenge's `disputeTimeout` (see the constant).
+    /// @dev Applies to LIVE cases too, since the deadline is derived from
+    ///      `referredAt` at read time rather than stored. That is the honest
+    ///      shape for a governance parameter — a change takes effect everywhere
+    ///      at once — but it means shortening the window can close an open panel
+    ///      phase immediately, which acquits. Task 7's pre-flight is where the
+    ///      windows are set; changing them with cases open is an operational
+    ///      decision, not something a setter invariant can make safe.
+    function setPanelWindow(uint256 newWindow) external onlyOwner {
+        if (newWindow == 0 || newWindow > MAX_PANEL_WINDOW) revert InvalidParameter();
+        emit PanelWindowSet(panelWindow, newWindow);
+        panelWindow = newWindow;
+    }
+
+    /// @inheritdoc ICourt
+    /// @dev Bounded `(0, MAX_BAD_FAITH_WINDOW]`. A ZERO WINDOW IS REFUSED
+    ///      HERE, not only at Task 7's deploy pre-flight: it would mean the F6
+    ///      track can never open, and a panel whose rulings can never be
+    ///      challenged for bad faith is a bribable panel holding authority over
+    ///      100% slashes.
+    function setBadFaithWindow(uint256 newWindow) external onlyOwner {
+        if (newWindow == 0 || newWindow > MAX_BAD_FAITH_WINDOW) revert InvalidParameter();
+        emit BadFaithWindowSet(badFaithWindow, newWindow);
+        badFaithWindow = newWindow;
     }
 
     // ─────────────────────────── Internals ───────────────────────────

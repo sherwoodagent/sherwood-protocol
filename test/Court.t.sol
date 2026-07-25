@@ -5,7 +5,78 @@ import {Test} from "forge-std/Test.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Court} from "src/Court.sol";
 import {ICourt} from "src/interfaces/ICourt.sol";
+import {IChallengeGame} from "src/interfaces/IChallengeGame.sol";
+import {ISyndicateGovernor} from "src/interfaces/ISyndicateGovernor.sol";
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
+
+/// @dev Governor stub. The court reads exactly one field off `getProposal`:
+///      `executedAt`, from which D2's snapshot instant (`executedAt - 1`) is
+///      derived once, at referral. `setExecuted` is deliberately re-callable so
+///      a test can MOVE the proposal after referral and prove the case kept the
+///      snapshot it stored rather than re-deriving it.
+contract MockCourtGovernor {
+    mapping(uint256 proposalId => ISyndicateGovernor.StrategyProposal) internal _proposals;
+
+    function setExecuted(uint256 proposalId, uint256 executedAt) external {
+        _proposals[proposalId].executedAt = executedAt;
+    }
+
+    function getProposal(uint256 proposalId) external view returns (ISyndicateGovernor.StrategyProposal memory) {
+        return _proposals[proposalId];
+    }
+}
+
+/// @dev A HOSTILE governor. `ch.governor` is an address the challenger handed
+///      `ChallengeGame.file`, so `refer` reads a proposal from a contract the
+///      accuser may control — this stub re-enters `refer` from `getProposal` to
+///      prove one challenge can never open two cases.
+contract MockReentrantGovernor {
+    ICourt public court;
+    uint256 public challengeId;
+    bool public tried;
+    bool public innerSucceeded;
+
+    function arm(address court_, uint256 challengeId_) external {
+        court = ICourt(court_);
+        challengeId = challengeId_;
+    }
+
+    function getProposal(uint256) external returns (ISyndicateGovernor.StrategyProposal memory p) {
+        if (!tried) {
+            tried = true;
+            try court.refer(challengeId) {
+                innerSucceeded = true;
+            } catch {}
+        }
+        p.executedAt = block.timestamp - 1 days;
+    }
+}
+
+/// @dev Challenge-game stub exposing the single view the court reads at
+///      referral (`challengeOf`) plus a setter for the status it gates on.
+///      `rule` is NOT stubbed here: Task 3 deliberately never calls it — the
+///      final outcome drives `ChallengeGame.rule` from Task 4's
+///      `finalizeAppeal`/`finalizeUnappealed`.
+contract MockCourtChallengeGame {
+    mapping(uint256 challengeId => IChallengeGame.Challenge) internal _challenges;
+
+    function setChallenge(uint256 challengeId, address governor, uint256 proposalId, IChallengeGame.Status status)
+        external
+    {
+        IChallengeGame.Challenge storage c = _challenges[challengeId];
+        c.governor = governor;
+        c.proposalId = proposalId;
+        c.status = status;
+    }
+
+    function setStatus(uint256 challengeId, IChallengeGame.Status status) external {
+        _challenges[challengeId].status = status;
+    }
+
+    function challengeOf(uint256 challengeId) external view returns (IChallengeGame.Challenge memory) {
+        return _challenges[challengeId];
+    }
+}
 
 /// @dev Exposes the two internal hooks Tasks 3-5 will drive, so this task can
 ///      PROVE the roster/bond guards bite rather than merely asserting they are
@@ -29,6 +100,8 @@ contract CourtHarness is Court {
 contract CourtTest is Test {
     CourtHarness internal court;
     ERC20Mock internal wood;
+    MockCourtChallengeGame internal game;
+    MockCourtGovernor internal governor;
 
     address internal owner = makeAddr("owner");
     address internal alice = makeAddr("alice"); // panelist
@@ -37,13 +110,20 @@ contract CourtTest is Test {
     address internal dave = makeAddr("dave"); // outsider / replacement
 
     uint256 internal constant BOND = 1_000e18;
+    uint256 internal constant CHALLENGE_ID = 3;
+    uint256 internal constant PROPOSAL_ID = 7;
 
     function setUp() public {
         wood = new ERC20Mock("Sherwood", "WOOD", 18);
         court = new CourtHarness(owner, address(wood), BOND);
+        game = new MockCourtChallengeGame();
+        governor = new MockCourtGovernor();
 
         // Somewhere well past genesis so `block.timestamp - x` is safe.
         vm.warp(vm.getBlockTimestamp() + 365 days);
+
+        vm.prank(owner);
+        court.setChallengeGame(address(game));
 
         address[4] memory funded = [alice, bob, carol, dave];
         for (uint256 i; i < funded.length; ++i) {
@@ -80,6 +160,33 @@ contract CourtTest is Test {
     ///      `!=`, so the inline form silently mis-parses.
     function _bit(uint8 mask, uint256 i) internal pure returns (bool) {
         return ((uint256(mask) >> i) & 1) == 1;
+    }
+
+    /// @dev Seat `members` and post every one of their bonds, i.e. a panel that
+    ///      is actually READY to rule.
+    function _seatBonded(address[] memory members) internal {
+        _seat(members);
+        for (uint256 i; i < members.length; ++i) {
+            vm.prank(members[i]);
+            court.postPanelBond();
+        }
+    }
+
+    /// @dev A `Disputed` challenge whose proposal executed `age` ago, ready to
+    ///      be referred. Returns the executed instant so a test can assert the
+    ///      stored snapshot is exactly `executedAt - 1` (D2).
+    function _disputedChallenge(uint256 age) internal returns (uint256 executedAt) {
+        executedAt = vm.getBlockTimestamp() - age;
+        governor.setExecuted(PROPOSAL_ID, executedAt);
+        game.setChallenge(CHALLENGE_ID, address(governor), PROPOSAL_ID, IChallengeGame.Status.Disputed);
+    }
+
+    /// @dev Permissionless referral — called by the test contract itself, which
+    ///      is neither the owner nor a panelist, so every case in these tests
+    ///      proves `refer` needs no privilege.
+    function _refer() internal returns (uint256 caseId) {
+        _disputedChallenge(1 days);
+        caseId = court.refer(CHALLENGE_ID);
     }
 
     // ─────────────────────────── roster (D1) ───────────────────────────
@@ -571,5 +678,485 @@ contract CourtTest is Test {
         }
         assertEq(court.bondedWood(), expected);
         assertEq(wood.balanceOf(address(court)), court.bondedWood());
+    }
+
+    // ═══════════════════ Task 3: layer 1 — the panel rules ═══════════════════
+
+    // ────────────────────────────── referral ──────────────────────────────
+
+    /// @notice D2: the snapshot is `executedAt - 1` — the same instant §3.8's
+    ///         compensation claims and Plan D's `slashToEscrow` use — and it is
+    ///         computed HERE, once, so the electorate that judges guilt is
+    ///         identical to the set compensated from the resulting slash.
+    function test_refer_opensCaseWithStoredSnapshot() public {
+        uint256 executedAt = _disputedChallenge(1 days);
+
+        vm.expectEmit(true, true, true, true);
+        emit ICourt.CaseReferred(1, CHALLENGE_ID, address(governor), PROPOSAL_ID, executedAt - 1);
+        uint256 caseId = court.refer(CHALLENGE_ID);
+
+        assertEq(caseId, 1);
+        assertEq(court.caseCount(), 1);
+        assertEq(court.caseOfChallenge(CHALLENGE_ID), caseId);
+
+        ICourt.Case memory c = court.caseOf(caseId);
+        assertEq(c.challengeId, CHALLENGE_ID);
+        assertEq(c.snapshotTs, executedAt - 1);
+        assertEq(c.referredAt, vm.getBlockTimestamp());
+        assertEq(uint256(c.phase), uint256(ICourt.Phase.Panel));
+        assertEq(uint256(c.panelRuling), uint256(ICourt.Ruling.None));
+    }
+
+    /// @notice THE POINT OF STORING IT (D2). Move the proposal underneath the
+    ///         case and the snapshot does not budge: every later vote — the
+    ///         merits appeal and the bad-faith vote alike — reads one value, so
+    ///         no two of them can disagree about who the electorate is.
+    function test_refer_snapshotIsStoredNotRederived() public {
+        uint256 executedAt = _disputedChallenge(1 days);
+        uint256 caseId = court.refer(CHALLENGE_ID);
+
+        governor.setExecuted(PROPOSAL_ID, executedAt + 12 hours);
+
+        assertEq(court.caseOf(caseId).snapshotTs, executedAt - 1);
+    }
+
+    /// @notice A case cannot be referred twice — a second case over one
+    ///         challenge would run two panels at two snapshots toward two
+    ///         verdicts on the same accusation.
+    function test_refer_twiceReverts() public {
+        _refer();
+        vm.expectRevert(ICourt.AlreadyReferred.selector);
+        court.refer(CHALLENGE_ID);
+    }
+
+    /// @notice Only a DISPUTED challenge is escalated. A `Filed` one is still
+    ///         inside its own auto-slash clock and has not been contested.
+    function test_refer_revertsOnNonDisputedChallenge() public {
+        governor.setExecuted(PROPOSAL_ID, vm.getBlockTimestamp() - 1 days);
+        game.setChallenge(CHALLENGE_ID, address(governor), PROPOSAL_ID, IChallengeGame.Status.Filed);
+
+        vm.expectRevert(ICourt.ChallengeNotDisputed.selector);
+        court.refer(CHALLENGE_ID);
+    }
+
+    /// @notice ...including a challenge that already reached a terminal state:
+    ///         there is nothing left for the court to decide.
+    function test_refer_revertsOnTerminalChallenge() public {
+        _disputedChallenge(1 days);
+        game.setStatus(CHALLENGE_ID, IChallengeGame.Status.Failed);
+
+        vm.expectRevert(ICourt.ChallengeNotDisputed.selector);
+        court.refer(CHALLENGE_ID);
+    }
+
+    /// @notice The governor is CHALLENGER-SUPPLIED — `ChallengeGame.file` takes
+    ///         it as an argument — so `refer` reads a proposal from a contract
+    ///         the accuser may control. It cannot re-enter: both reads are
+    ///         `view` in their interfaces, so the court makes them with
+    ///         STATICCALL and a governor that so much as writes a flag reverts
+    ///         the referral instead of opening a second case over one
+    ///         accusation. No case is left half-open behind it.
+    function test_refer_hostileGovernorCannotReenter() public {
+        MockReentrantGovernor hostile = new MockReentrantGovernor();
+        hostile.arm(address(court), CHALLENGE_ID);
+        game.setChallenge(CHALLENGE_ID, address(hostile), PROPOSAL_ID, IChallengeGame.Status.Disputed);
+
+        vm.expectRevert();
+        court.refer(CHALLENGE_ID);
+
+        assertFalse(hostile.innerSucceeded());
+        assertEq(court.caseCount(), 0);
+        assertEq(court.caseOfChallenge(CHALLENGE_ID), 0);
+    }
+
+    function test_refer_revertsWithoutChallengeGameWired() public {
+        Court fresh = new Court(owner, address(wood), BOND);
+        vm.expectRevert(ICourt.ZeroAddress.selector);
+        fresh.refer(CHALLENGE_ID);
+    }
+
+    /// @notice Fail closed on a proposal that never executed: `executedAt - 1`
+    ///         would otherwise underflow into a snapshot at `type(uint256).max`
+    ///         — an electorate nobody has voting power in.
+    function test_refer_revertsOnUnexecutedProposal() public {
+        game.setChallenge(CHALLENGE_ID, address(governor), PROPOSAL_ID, IChallengeGame.Status.Disputed);
+        vm.expectRevert(ICourt.InvalidParameter.selector);
+        court.refer(CHALLENGE_ID);
+    }
+
+    // ──────────────────────────── panelRule ────────────────────────────
+
+    function test_panelRule_nonPanelistCannotRule() public {
+        _seatBonded(_three());
+        uint256 caseId = _refer();
+
+        vm.expectRevert(ICourt.NotPanelist.selector);
+        vm.prank(dave);
+        court.panelRule(caseId, true);
+    }
+
+    /// @notice A seated but UNBONDED panelist cannot rule: an unbonded panel is
+    ///         a panel with nothing the bad-faith track can reach.
+    function test_panelRule_unbondedPanelistCannotRule() public {
+        _seat(_three());
+        uint256 caseId = _refer();
+
+        vm.expectRevert(ICourt.PanelBondNotPosted.selector);
+        vm.prank(alice);
+        court.panelRule(caseId, true);
+    }
+
+    /// @notice A member that falls below a RAISED requirement stops being able
+    ///         to rule until it tops up — readiness is live, not historical.
+    function test_panelRule_underBondedAfterRaiseCannotRule() public {
+        _seatBonded(_three());
+        uint256 caseId = _refer();
+        vm.prank(owner);
+        court.setPanelBondWood(BOND * 2);
+
+        vm.expectRevert(ICourt.PanelBondNotPosted.selector);
+        vm.prank(alice);
+        court.panelRule(caseId, true);
+    }
+
+    function test_panelRule_recordsVote() public {
+        _seatBonded(_three());
+        uint256 caseId = _refer();
+
+        vm.expectEmit(true, true, false, true);
+        emit ICourt.PanelVoteCast(caseId, alice, true);
+        vm.prank(alice);
+        court.panelRule(caseId, true);
+
+        assertEq(uint256(court.panelVoteOf(caseId, alice)), uint256(ICourt.Ruling.Guilty));
+        assertEq(uint256(court.panelVoteOf(caseId, bob)), uint256(ICourt.Ruling.None));
+        ICourt.Case memory c = court.caseOf(caseId);
+        assertEq(c.panelGuiltyVotes, 1);
+        assertEq(c.panelNotGuiltyVotes, 0);
+    }
+
+    function test_panelRule_doubleVoteReverts() public {
+        _seatBonded(_three());
+        uint256 caseId = _refer();
+
+        vm.prank(alice);
+        court.panelRule(caseId, true);
+        vm.expectRevert(ICourt.AlreadyRuled.selector);
+        vm.prank(alice);
+        court.panelRule(caseId, false);
+    }
+
+    function test_panelRule_afterWindowReverts() public {
+        _seatBonded(_three());
+        uint256 caseId = _refer();
+        uint256 deadline = court.caseOf(caseId).referredAt + court.panelWindow();
+
+        vm.warp(deadline);
+        vm.expectRevert(ICourt.WindowClosed.selector);
+        vm.prank(alice);
+        court.panelRule(caseId, true);
+    }
+
+    function test_panelRule_onUnreferredCaseReverts() public {
+        _seatBonded(_three());
+        vm.expectRevert(ICourt.WrongPhase.selector);
+        vm.prank(alice);
+        court.panelRule(1, true);
+    }
+
+    /// @notice Once the panel phase is closed the vote is closed with it, even
+    ///         if the window itself has not elapsed.
+    function test_panelRule_afterFinalizeReverts() public {
+        _seatBonded(_three());
+        uint256 caseId = _refer();
+        vm.prank(alice);
+        court.panelRule(caseId, true);
+        vm.prank(bob);
+        court.panelRule(caseId, true);
+        vm.prank(carol);
+        court.panelRule(caseId, true);
+        court.finalizePanel(caseId);
+
+        vm.expectRevert(ICourt.WrongPhase.selector);
+        vm.prank(alice);
+        court.panelRule(caseId, false);
+    }
+
+    // ─────────────── the bond lock: F6's defence, not decoration ───────────────
+
+    /// @notice RULING LOCKS THE BOND. Without this a panelist could rule, be
+    ///         rotated off the roster and withdraw before anyone could open a
+    ///         bad-faith vote against the ruling — the whole F6 track would be
+    ///         decorative. The lock covers the rest of the panel window plus a
+    ///         full `badFaithWindow`; Tasks 4-5 extend it from the case's actual
+    ///         finalization.
+    function test_panelRule_locksPanelistBond() public {
+        _seatBonded(_three());
+        uint256 caseId = _refer();
+        uint256 referredAt = court.caseOf(caseId).referredAt;
+        uint256 expected = referredAt + court.panelWindow() + court.badFaithWindow();
+
+        assertEq(court.panelBondLockedUntil(alice), 0);
+        vm.expectEmit(true, false, false, true);
+        emit ICourt.PanelBondLocked(alice, expected);
+        vm.prank(alice);
+        court.panelRule(caseId, true);
+
+        assertEq(court.panelBondLockedUntil(alice), expected);
+        // A panelist that did NOT rule is not locked.
+        assertEq(court.panelBondLockedUntil(bob), 0);
+    }
+
+    /// @notice The consequence that matters: having ruled, the panelist can
+    ///         neither be rotated off the roster nor pull its bond out of the
+    ///         bad-faith track's reach until the lock expires.
+    function test_panelRule_lockedBondCannotEscape() public {
+        _seatBonded(_three());
+        uint256 caseId = _refer();
+        vm.prank(alice);
+        court.panelRule(caseId, true);
+
+        address[] memory next = new address[](2);
+        next[0] = bob;
+        next[1] = carol;
+        vm.expectRevert(ICourt.PanelistHasOpenRuling.selector);
+        vm.prank(owner);
+        court.setPanel(next);
+
+        // Even seated, the bond is unreachable; and it stays unreachable for
+        // the whole lock, which is what the bad-faith track needs.
+        vm.expectRevert(ICourt.StillSeated.selector);
+        vm.prank(alice);
+        court.withdrawPanelBond();
+
+        vm.warp(court.panelBondLockedUntil(alice));
+        vm.prank(owner);
+        court.setPanel(next);
+        vm.prank(alice);
+        assertEq(court.withdrawPanelBond(), BOND);
+    }
+
+    /// @notice The lock only ever extends. A second, EARLIER ruling must not
+    ///         pull an existing deadline back and release a bond the first one
+    ///         still needs.
+    function test_panelRule_lockNeverShortens() public {
+        _seatBonded(_three());
+        uint256 caseId = _refer();
+        uint256 far = vm.getBlockTimestamp() + 3650 days;
+        court.lockPanelBond(alice, far);
+
+        vm.prank(alice);
+        court.panelRule(caseId, true);
+        assertEq(court.panelBondLockedUntil(alice), far);
+    }
+
+    // ──────────────────────────── finalizePanel ────────────────────────────
+
+    function test_finalizePanel_majorityGuilty() public {
+        _seatBonded(_three());
+        uint256 caseId = _refer();
+        vm.prank(alice);
+        court.panelRule(caseId, true);
+        vm.prank(bob);
+        court.panelRule(caseId, true);
+        vm.prank(carol);
+        court.panelRule(caseId, false);
+
+        vm.expectEmit(true, false, false, true);
+        emit ICourt.PanelFinalized(caseId, ICourt.Ruling.Guilty, 2, 1);
+        court.finalizePanel(caseId);
+
+        ICourt.Case memory c = court.caseOf(caseId);
+        assertEq(uint256(c.panelRuling), uint256(ICourt.Ruling.Guilty));
+        assertEq(uint256(c.phase), uint256(ICourt.Phase.AppealWindow));
+        assertEq(c.panelFinalizedAt, vm.getBlockTimestamp());
+    }
+
+    function test_finalizePanel_majorityNotGuilty() public {
+        _seatBonded(_three());
+        uint256 caseId = _refer();
+        vm.prank(alice);
+        court.panelRule(caseId, false);
+        vm.prank(bob);
+        court.panelRule(caseId, false);
+        vm.prank(carol);
+        court.panelRule(caseId, true);
+        court.finalizePanel(caseId);
+
+        assertEq(uint256(court.caseOf(caseId).panelRuling), uint256(ICourt.Ruling.NotGuilty));
+    }
+
+    /// @notice A TIE IS AN ACQUITTAL, and that is a property rather than an
+    ///         accident: a panel that cannot agree has not established the
+    ///         ground truth §3.5 requires before a 100% slash, so the court
+    ///         fails safe toward not slashing (Plan D's D5).
+    function test_finalizePanel_tieIsNotGuilty() public {
+        address[] memory four = new address[](4);
+        four[0] = alice;
+        four[1] = bob;
+        four[2] = carol;
+        four[3] = dave;
+        _seatBonded(four);
+        uint256 caseId = _refer();
+
+        vm.prank(alice);
+        court.panelRule(caseId, true);
+        vm.prank(bob);
+        court.panelRule(caseId, true);
+        vm.prank(carol);
+        court.panelRule(caseId, false);
+        vm.prank(dave);
+        court.panelRule(caseId, false);
+
+        vm.expectEmit(true, false, false, true);
+        emit ICourt.PanelFinalized(caseId, ICourt.Ruling.NotGuilty, 2, 2);
+        court.finalizePanel(caseId);
+        assertEq(uint256(court.caseOf(caseId).panelRuling), uint256(ICourt.Ruling.NotGuilty));
+    }
+
+    /// @notice SILENCE IS AN ACQUITTAL, same fail-safe. The cost is stated
+    ///         rather than hidden: an inactive panel acquits instead of
+    ///         convicting, so panel liveness is an operational requirement.
+    function test_finalizePanel_silencePastWindowIsNotGuilty() public {
+        _seatBonded(_three());
+        uint256 caseId = _refer();
+
+        vm.warp(court.caseOf(caseId).referredAt + court.panelWindow());
+        vm.expectEmit(true, false, false, true);
+        emit ICourt.PanelFinalized(caseId, ICourt.Ruling.NotGuilty, 0, 0);
+        court.finalizePanel(caseId);
+
+        ICourt.Case memory c = court.caseOf(caseId);
+        assertEq(uint256(c.panelRuling), uint256(ICourt.Ruling.NotGuilty));
+        assertEq(uint256(c.phase), uint256(ICourt.Phase.AppealWindow));
+    }
+
+    /// @notice A minority cannot close the panel phase early and freeze out the
+    ///         members who have not voted yet.
+    function test_finalizePanel_beforeWindowWithVotesOutstandingReverts() public {
+        _seatBonded(_three());
+        uint256 caseId = _refer();
+        vm.prank(alice);
+        court.panelRule(caseId, true);
+        vm.prank(bob);
+        court.panelRule(caseId, true);
+
+        vm.expectRevert(ICourt.WindowOpen.selector);
+        court.finalizePanel(caseId);
+    }
+
+    /// @notice ...but once every seated member has voted there is nothing left
+    ///         to wait for, so the case moves on without burning the window.
+    function test_finalizePanel_earlyOnceEverySeatHasVoted() public {
+        _seatBonded(_three());
+        uint256 caseId = _refer();
+        vm.prank(alice);
+        court.panelRule(caseId, true);
+        vm.prank(bob);
+        court.panelRule(caseId, false);
+        vm.prank(carol);
+        court.panelRule(caseId, true);
+
+        court.finalizePanel(caseId);
+        assertEq(uint256(court.caseOf(caseId).panelRuling), uint256(ICourt.Ruling.Guilty));
+        assertLt(vm.getBlockTimestamp(), court.caseOf(caseId).referredAt + court.panelWindow());
+    }
+
+    function test_finalizePanel_twiceReverts() public {
+        _seatBonded(_three());
+        uint256 caseId = _refer();
+        vm.warp(court.caseOf(caseId).referredAt + court.panelWindow());
+        court.finalizePanel(caseId);
+
+        vm.expectRevert(ICourt.WrongPhase.selector);
+        court.finalizePanel(caseId);
+    }
+
+    function test_finalizePanel_onUnreferredCaseReverts() public {
+        vm.expectRevert(ICourt.WrongPhase.selector);
+        court.finalizePanel(1);
+    }
+
+    /// @notice Ruling does NOT touch the WOOD accounting: the §4 equality holds
+    ///         across a whole panel phase, because a ruling escrows the bond it
+    ///         already holds rather than moving any.
+    function test_panelPhase_leavesBondAccountingUntouched() public {
+        _seatBonded(_three());
+        uint256 caseId = _refer();
+        vm.prank(alice);
+        court.panelRule(caseId, true);
+        vm.prank(bob);
+        court.panelRule(caseId, false);
+        vm.warp(court.caseOf(caseId).referredAt + court.panelWindow());
+        court.finalizePanel(caseId);
+
+        assertEq(court.bondedWood(), BOND * 3);
+        assertEq(wood.balanceOf(address(court)), court.bondedWood());
+    }
+
+    // ─────────────────────────── owner parameters ───────────────────────────
+
+    function test_setChallengeGame_onlyOwner() public {
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        vm.prank(alice);
+        court.setChallengeGame(address(game));
+    }
+
+    function test_setChallengeGame_rejectsZero() public {
+        vm.expectRevert(ICourt.ZeroAddress.selector);
+        vm.prank(owner);
+        court.setChallengeGame(address(0));
+    }
+
+    function test_setPanelWindow_onlyOwnerAndBounded() public {
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        vm.prank(alice);
+        court.setPanelWindow(1 days);
+
+        vm.expectRevert(ICourt.InvalidParameter.selector);
+        vm.prank(owner);
+        court.setPanelWindow(0);
+
+        uint256 max = court.MAX_PANEL_WINDOW();
+        vm.expectRevert(ICourt.InvalidParameter.selector);
+        vm.prank(owner);
+        court.setPanelWindow(max + 1);
+
+        vm.prank(owner);
+        court.setPanelWindow(max);
+        assertEq(court.panelWindow(), max);
+    }
+
+    /// @notice A zero bad-faith window would mean the F6 track can never open,
+    ///         leaving a bribable panel — refuse it at the setter, not only at
+    ///         Task 7's deploy pre-flight.
+    function test_setBadFaithWindow_onlyOwnerAndBounded() public {
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        vm.prank(alice);
+        court.setBadFaithWindow(1 days);
+
+        vm.expectRevert(ICourt.InvalidParameter.selector);
+        vm.prank(owner);
+        court.setBadFaithWindow(0);
+
+        uint256 max = court.MAX_BAD_FAITH_WINDOW();
+        vm.expectRevert(ICourt.InvalidParameter.selector);
+        vm.prank(owner);
+        court.setBadFaithWindow(max + 1);
+
+        vm.prank(owner);
+        court.setBadFaithWindow(max);
+        assertEq(court.badFaithWindow(), max);
+    }
+
+    /// @notice Pin the phase ordering the way Task 2 pinned `Ruling`'s: Tasks
+    ///         4-6 branch on it, and `None` must stay the zero value so an
+    ///         unreferred case is never mistaken for a live one.
+    function test_phaseEnumOrdering() public pure {
+        assertEq(uint256(ICourt.Phase.None), 0);
+        assertEq(uint256(ICourt.Phase.Panel), 1);
+        assertEq(uint256(ICourt.Phase.AppealWindow), 2);
+        assertEq(uint256(ICourt.Phase.Appeal), 3);
+        assertEq(uint256(ICourt.Phase.Resolved), 4);
     }
 }
