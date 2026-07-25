@@ -222,8 +222,10 @@ contract ExposureLedgerTest is Test {
     }
 
     /// @notice Two half-bonded guardians jointly cover one proposal — §3.3a's
-    ///         aggregate quorum doing what it says. Both are slashed on
-    ///         conviction, so recovery is the SUM of their bonds.
+    ///         aggregate quorum doing what it says. Each RESERVES up to the full
+    ///         coverage (capped by its own budget); the pro-rata scale-back then
+    ///         decides what each actually carries. Arrival order changes
+    ///         nothing, which is the property the free-rider veto exploited.
     function test_recordApproval_twoGuardiansAggregateToCover() public {
         _wireRecording();
         address g2 = makeAddr("g2");
@@ -232,15 +234,61 @@ contract ExposureLedgerTest is Test {
 
         vm.prank(registry);
         ledger.recordApproval(address(mgov), 1, guardian);
-        assertEq(ledger.openExposureUsd(guardian), 5_000e18, "first commits its full budget");
+        assertEq(ledger.openExposureUsd(guardian), 5_000e18, "first reserves its whole budget");
 
         vm.prank(registry);
         ledger.recordApproval(address(mgov), 1, g2);
-        // The second only commits the REMAINDER ($3,000), not its whole $5,000.
-        assertEq(ledger.openExposureUsd(g2), 3_000e18, "second commits only what is still needed");
+        // The second reserves its OWN budget too, not merely the remainder —
+        // there is no leftover to race for.
+        assertEq(ledger.openExposureUsd(g2), 5_000e18, "second reserves its own budget, not the remainder");
 
-        // $5,000 + $3,000 == $8,000 → covered.
+        // $10,000 reserved against $8,000 needed, so each carries 5/10 of it.
+        assertEq(ledger.allocatedUsd(address(mgov), 1, guardian), 4_000e18, "pro-rata half");
+        assertEq(ledger.allocatedUsd(address(mgov), 1, g2), 4_000e18, "...and the other half");
+
+        // Reservations aggregate past the requirement -> covered.
         ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 8_000e6);
+    }
+
+    /// @notice C1 REGRESSION — the free-rider veto.
+    ///
+    ///         Under first-come booking an attacker could approve first and
+    ///         absorb the ENTIRE coverage, leaving an honest approver with a
+    ///         zero commitment and — worse — off the ledger's approver list
+    ///         entirely. Flipping to Block then released the whole commitment,
+    ///         while the registry's late-vote lockout stopped the free-ridden
+    ///         approver from re-registering: a permanent, costless veto by a
+    ///         guardian holding less than block quorum.
+    ///
+    ///         With per-approver reservations there is nothing to squat. The
+    ///         honest approver reserves its own budget regardless of who voted
+    ///         first, and the attacker's departure scales the survivor UP.
+    function test_recordApproval_frontRunnerCannotVetoByReleasing() public {
+        _wireRecording();
+        address attacker = makeAddr("attacker");
+        swood.setStake(attacker, 100_000e18, 0); // $5,000
+        mgov.set(4_000e6); // $4,000 needed — either could cover it alone
+
+        // The attacker gets in first and would, under the old rule, absorb it all.
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, attacker);
+
+        // The honest approver still books its own reservation.
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        assertEq(ledger.openExposureUsd(guardian), 4_000e18, "not free-ridden into a zero commitment");
+
+        // The attacker flips to Block, releasing everything it reserved.
+        vm.prank(registry);
+        ledger.releaseApproval(address(mgov), 1, attacker);
+        assertEq(ledger.openExposureUsd(attacker), 0, "attacker pays nothing and walks");
+
+        // The survivor absorbs the whole proposal rather than the veto landing.
+        assertEq(ledger.allocatedUsd(address(mgov), 1, guardian), 4_000e18, "scaled UP to the full coverage");
+        assertEq(ledger.allocatedUsd(address(mgov), 1, attacker), 0, "a released approver carries nothing");
+
+        // ...and the proposal stays executable, which is exactly what C1 broke.
+        ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 4_000e6);
     }
 
     function test_recordApproval_netsAcrossSequentialEpochs() public {

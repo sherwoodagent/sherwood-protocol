@@ -37,6 +37,16 @@ interface IExposureLedger {
         view;
 
     // ── Views ──
+
+    /// @notice What `guardian` actually carries on this proposal, after the
+    ///         pro-rata scale-back — as opposed to the deliberately over-sized
+    ///         amount `recordApproval` reserved.
+    /// @dev    Reservations are per-approver and each may run up to the full
+    ///         coverage, so the real split is computed at read time from
+    ///         whoever is still an approver. This is the number a conviction
+    ///         should slash against; the raw reservation would over-slash.
+    function allocatedUsd(address governor, uint256 proposalId, address guardian) external view returns (uint256);
+
     function slashableBondUsd(address guardian) external view returns (uint256);
     function openExposureUsd(address guardian) external view returns (uint256);
     function coverageUsd(address asset, uint256 amount) external view returns (uint256);
