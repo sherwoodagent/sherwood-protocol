@@ -140,6 +140,12 @@ contract MockRegistryMinimal is IGuardianRegistry {
         revert NotImplemented();
     }
 
+    /// @dev The stub is never paused: it has no pause state to flip, and the
+    ///      governor consults this before holding a proposal in GuardianReview.
+    function paused() external pure returns (bool) {
+        return false;
+    }
+
     function setBlockQuorumBps(uint256) external pure {
         revert NotImplemented();
     }
