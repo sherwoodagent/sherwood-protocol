@@ -607,11 +607,14 @@ contract ChallengeEndToEndTest is Test {
         //    challenger paid.
         vm.warp(filedAt + 1 hours);
         vm.prank(g1);
-        game.dispute(cid);
+        game.dispute(cid, type(uint256).max);
         IChallengeGame.Challenge memory c = game.challengeOf(cid);
         assertEq(uint256(c.status), uint256(IChallengeGame.Status.Disputed), "Disputed");
-        assertEq(c.counterBondWood, CHALLENGER_BOND, "the counter-bond matches the bond");
-        assertEq(c.disputer, g1, "recorded, because it returns to whoever posted it");
+        assertEq(c.counterBondWood, CHALLENGER_BOND, "the counter-bond pool matches the bond");
+        address[] memory funders = game.counterBondContributors(cid);
+        assertEq(funders.length, 1, "g1 covered all the coverage, so it funds the whole defence alone");
+        assertEq(funders[0], g1);
+        assertEq(game.counterBondContributionOf(cid, g1), CHALLENGER_BOND, "the forfeit follows this, not coverage");
         assertEq(game.bondedWood(), 2 * CHALLENGER_BOND, "both bonds are live");
         assertEq(wood.balanceOf(address(game)), 2 * CHALLENGER_BOND);
         assertEq(wood.balanceOf(g1), g1BalBefore - CHALLENGER_BOND, "the accused paid for the escalation");
@@ -635,7 +638,7 @@ contract ChallengeEndToEndTest is Test {
         assertEq(
             wood.balanceOf(g1),
             g1BalBefore + CHALLENGER_BOND,
-            "counter-bond returned plus the whole forfeit (g1 committed 100% of the coverage)"
+            "contribution returned plus the whole forfeit (g1 funded 100% of the counter-bond pool)"
         );
         assertEq(wood.balanceOf(address(game)), 0, "nothing stranded in the game");
         assertEq(game.bondedWood(), 0);

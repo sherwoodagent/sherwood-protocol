@@ -42,22 +42,50 @@ interface ITierRegistryDemoterMinimal {
  *         forfeited to the accused when a challenge fails — plus a dispute
  *         window generous relative to the auto-slash delay.
  *
- * @dev    THE DETECTOR INCENTIVE IS OFF-CHAIN, and deliberately so. §3.4 asks
- *         for "a first-detector bounty sized to cover forensic cost", and no
- *         constant in this contract can be sized to that: forensic cost runs
- *         from minutes for an obvious out-of-adapter transfer to days for a
- *         funding-graph linkage. So the bounty is a protocol BUG-BOUNTY
- *         PROGRAM, priced per case off-chain and keyed off this contract's
- *         `ChallengeFiled` / `ChallengeSettled` events — which keeps it
- *         auditable, because every payout points at a filing anyone can read.
+ * @dev    THE DETECTOR INCENTIVE IS THE FORFEITED COUNTER-BOND. §3.4 asks for
+ *         "a first-detector bounty sized to cover forensic cost" and warns that
+ *         "the challenge trigger must not depend on altruism". An earlier
+ *         version of this contract answered both entirely off-chain, with a
+ *         bug-bounty program keyed off these events, and refunded the
+ *         counter-bond on every outcome. That was wrong twice over:
  *
- *         NOTE THE CONSEQUENCE for anyone reasoning about incentives, stated
- *         here rather than left to be discovered: ON-CHAIN, A SUCCESSFUL
- *         CHALLENGER ONLY GETS ITS BOND BACK, and a failed one loses the bond
- *         entirely — so the on-chain payoff is break-even at best. Filing is
- *         rational ONLY because of the off-chain program. §3.4 warns that "the
- *         challenge trigger must not depend on altruism"; that warning is
- *         satisfied off-chain, NOT here.
+ *         — A REFUNDED COUNTER-BOND DID NO WORK. Disputing converted a certain
+ *           slash into a delayed slash with some chance the court errs, at zero
+ *           bond cost, so a genuinely guilty approver always disputed. A
+ *           counter-bond returned whatever happens is a deposit, not a stake,
+ *           and prices nothing.
+ *         — A WINNING CHALLENGER GOT NOTHING: only its own bond back, so the
+ *           on-chain payoff of correct forensic work was break-even at best and
+ *           the whole incentive rested on a program that can go unfunded or
+ *           simply lapse. That is the altruism dependency §3.4 warns against,
+ *           merely moved somewhere it could not be audited.
+ *
+ *         So the pool now FORFEITS TO THE CHALLENGER on a guilty verdict, on
+ *         top of its returned bond. The escalation costs the accused what it is
+ *         worth, and a challenger that is right is paid by the side that was
+ *         wrong. An off-chain bounty may still top this up where forensic cost
+ *         outruns the bond — that cost runs from minutes for an obvious
+ *         out-of-adapter transfer to days for a funding-graph linkage, and no
+ *         constant here can track it — but the mechanism no longer DEPENDS on
+ *         one existing.
+ *
+ * @dev    THE DEFENCE IS BOUGHT COLLECTIVELY, and the total is invariant under
+ *         identity-splitting. The counter-bond matches a bond sized to the
+ *         SUMMED coverage of all approvers, yet it used to be posted in full by
+ *         whichever single guardian happened to answer — so a guardian carrying
+ *         20% of the blame paid 100% of the defence, and the other 80%
+ *         free-rode. It is now a POOL any accused approver may contribute to.
+ *
+ *         The target stays pinned to the challenger's bond rather than being
+ *         charged per-guardian by coverage share, and that is not an accident:
+ *         THE ACCUSED SIDE CHOOSES WHO DISPUTES. Any rule keyed to the payer's
+ *         own share is answered by nominating — or manufacturing — the cheapest
+ *         identity, so an operator that split itself in two would halve the
+ *         bill. Pinning the TOTAL and letting only the PAYER vary is what makes
+ *         a Sybil split cost exactly what staying whole costs. Free-riding is
+ *         then priced from the other side: a failed challenge's forfeit splits
+ *         pro-rata to CONTRIBUTION, not to coverage, so an approver that sat
+ *         out the defence collects none of the upside it produced.
  *
  * @dev    Plain `Ownable2Step`, NOT upgradeable — same shape as `TierRegistry`
  *         and `ExposureLedger`, so its storage layout is unconstrained.
@@ -72,7 +100,14 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     uint256 internal constant BPS_DENOMINATOR = 10_000;
 
     /// @notice Hard floor on `autoSlashDelay` — the guardians' ENTIRE window to
-    ///         notice a filing and post a counter-bond.
+    ///         notice a filing and FULLY FUND a counter-bond between them.
+    /// @dev    Pooling makes this window strictly more load-bearing than it was
+    ///         when one guardian posted the whole counter-bond alone: a partial
+    ///         pool buys nothing, so the accused must now coordinate several
+    ///         independent signers inside the same wall clock. The floor was
+    ///         already sized for human response times, which is what makes it
+    ///         survive that; a governance change that shortened it would break
+    ///         the collective defence before it broke the individual one.
     /// @dev    D1 moved the vigilance burden onto guardians: nothing is proven
     ///         on-chain, so an approver that says nothing for `autoSlashDelay`
     ///         is slashed on an unproven assertion. That is only defensible if
@@ -159,16 +194,33 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     uint256 public disputeTimeout = 30 days;
 
     /// @notice WOOD held on behalf of live (`Filed`/`Disputed`) challenges —
-    ///         the sum of their challenger bonds and counter-bonds.
-    /// @dev    The §4 invariant is `wood.balanceOf(this) >= bondedWood`. With
-    ///         the detector incentive off-chain this contract pays out nothing
-    ///         but bonds, so the two are equal except for WOOD somebody donated
-    ///         here by mistake — which no path ever spends.
+    ///         the sum of their challenger bonds and counter-bond POOLS.
+    /// @dev    The §4 invariant is `wood.balanceOf(this) >= bondedWood`. Every
+    ///         wei this contract pays out was a bond or a pool contribution, so
+    ///         the two are equal except for WOOD somebody donated here by
+    ///         mistake — which no path ever spends. Note that a PARTIAL pool
+    ///         counts here exactly like a complete one: the contributions are
+    ///         held, and every terminal path either refunds them, forfeits them
+    ///         or splits them, so the decrement is always `bond + pool`.
     uint256 public bondedWood;
 
     uint256 public challengeCount;
 
     mapping(uint256 challengeId => Challenge) internal _challenges;
+
+    /// @dev Who has paid into a challenge's counter-bond pool, in first-payment
+    ///      order and without duplicates — a repeat contributor tops up its
+    ///      existing entry rather than appending a second one. This is the
+    ///      payout set on BOTH unwind paths: refunds on a settle, refunds plus
+    ///      the pro-rata forfeit on a failure. It is bounded because `dispute`
+    ///      admits only the accused set, which the ledger itself bounds.
+    mapping(uint256 challengeId => address[]) internal _contributors;
+
+    /// @dev Per-contributor totals, kept AFTER resolution rather than cleared:
+    ///      the pro-rata split a terminal challenge paid out stays reconstructible
+    ///      on-chain, and no path re-reads a terminal challenge's pool anyway
+    ///      (`dispute` requires `Filed`, and both unwinds require a live status).
+    mapping(uint256 challengeId => mapping(address contributor => uint256)) internal _contributed;
 
     /// @dev The most recent challenge against a proposal. Only meaningful while
     ///      that challenge is still live — `_liveChallengeId` re-checks status
@@ -260,7 +312,6 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             status: Status.Filed,
             filedAt: block.timestamp,
             frozenCoverageUsd: coverageUsd,
-            disputer: address(0),
             adapterTarget: adapterTarget,
             adapterSelector: adapterSelector
         });
@@ -275,21 +326,42 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     // ── Dispute ──
 
     /// @inheritdoc IChallengeGame
-    /// @dev The counter-bond MATCHES the challenger's bond: the accused buys
-    ///      the escalation at the same price the challenger paid for the
-    ///      accusation, so neither side can price the other out of the game.
-    /// @dev The dispute window closes exactly where the auto-slash opens
+    /// @dev THE POOL'S TARGET MATCHES THE CHALLENGER'S BOND, and does not move:
+    ///      the accused side buys the escalation at exactly the price the
+    ///      challenger paid for the accusation, so neither can price the other
+    ///      out of the game. What CHANGED is only who pays it — see the
+    ///      contract-level note on identity-splitting for why the total must
+    ///      stay pinned here rather than being charged by the payer's own share.
+    /// @dev THE OVERSHOOT IS CLAMPED, not refunded. `amountWood` is reduced to
+    ///      the shortfall exactly as `ExposureLedger.recordApproval` clamps a
+    ///      guardian's share to what a proposal still needs, so the contract
+    ///      never holds a wei it must later hand back for having been overpaid.
+    ///      That deletes a refund path rather than implementing one, and a
+    ///      refund path is precisely where this design strands funds.
+    /// @dev THE STATUS FLIPS THE MOMENT THE POOL IS FULL, in the same call. That
+    ///      is what keeps `_settle`'s two entries distinguishable by status
+    ///      alone: `Filed` implies a pool strictly below target (it never bought
+    ///      a dispute, so it is refunded) and `Disputed` implies a full one (it
+    ///      did, so it is forfeited). Nothing else in the contract has to
+    ///      re-derive which case it is in.
+    /// @dev The contribution window closes exactly where the auto-slash opens
     ///      (`filedAt + autoSlashDelay`), so the two are disjoint by
     ///      construction: at the boundary second the silence is already the
-    ///      verdict and there is nothing left to contest.
-    function dispute(uint256 challengeId) external {
+    ///      verdict and there is nothing left to contest. A pool that is still
+    ///      short at that instant simply loses — which is the point, because a
+    ///      part-funded defence is not a defence.
+    /// @dev CEI: every storage write lands before the `transferFrom`, so the
+    ///      token cannot observe or re-enter a half-updated pool.
+    function dispute(uint256 challengeId, uint256 amountWood) external {
         Challenge storage c = _challenges[challengeId];
         if (c.status != Status.Filed) revert WrongStatus();
         if (block.timestamp >= c.filedAt + autoSlashDelay) revert WindowClosed();
 
         // Standing: only a guardian this filing actually accuses. A guardian
         // that released its commitment before the filing covered nothing here
-        // and is not at risk, so it has nothing to defend (D2).
+        // and is not at risk, so it has nothing to defend (D2). This is also
+        // what BOUNDS the contributor list — the accused set is the ledger's,
+        // and each member can appear in it at most once.
         (address[] memory approvers, uint256[] memory committedUsd) =
             exposureLedger.approversOf(c.governor, c.proposalId);
         bool accused;
@@ -301,14 +373,30 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         }
         if (!accused) revert NotAccusedApprover();
 
-        uint256 counterBond = c.bondWood;
-        c.counterBondWood = counterBond;
-        c.disputer = msg.sender;
-        c.status = Status.Disputed;
-        bondedWood += counterBond;
+        uint256 target = c.bondWood;
+        uint256 pool = c.counterBondWood;
+        // `Filed` guarantees `pool < target`, so the shortfall is never zero and
+        // a clamped contribution is never zero either.
+        uint256 shortfall = target - pool;
+        uint256 amount = amountWood < shortfall ? amountWood : shortfall;
+        if (amount == 0) revert NothingToContribute();
 
-        wood.safeTransferFrom(msg.sender, address(this), counterBond);
-        emit ChallengeDisputed(challengeId, msg.sender, counterBond);
+        // First payment appends; a top-up finds its existing entry. Keeping the
+        // list duplicate-free is what makes the failure-path split a single pass
+        // over it with no double-payment.
+        if (_contributed[challengeId][msg.sender] == 0) _contributors[challengeId].push(msg.sender);
+        _contributed[challengeId][msg.sender] += amount;
+
+        pool += amount;
+        c.counterBondWood = pool;
+        bondedWood += amount;
+
+        bool complete = pool == target;
+        if (complete) c.status = Status.Disputed;
+
+        wood.safeTransferFrom(msg.sender, address(this), amount);
+        emit CounterBondContributed(challengeId, msg.sender, amount, pool);
+        if (complete) emit ChallengeDisputed(challengeId, pool);
     }
 
     // ── Resolution ──
@@ -362,23 +450,41 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         }
     }
 
-    /// @dev THE SILENCE VERDICT (§3.4, D1). Nobody contested inside the window,
-    ///      so the assertion stands: the covering approvers are slashed into the
-    ///      compensation escrow, the accused adapter loses its certification,
-    ///      and the challenger gets its bond back — its bond, and nothing else.
-    ///      The detector's reward is the off-chain bug-bounty program keyed off
-    ///      `ChallengeSettled`; see the contract-level note.
+    /// @dev THE CHALLENGE PASSED. Either nobody contested inside the window and
+    ///      the silence IS the adjudication (§3.4, D1), or the court ruled guilty
+    ///      (§3.5). Both say the same thing about the accused, so both slash the
+    ///      covering approvers into the compensation escrow, demote the named
+    ///      adapter, and return the challenger's bond.
     ///
-    ///      ALSO THE GUILTY-VERDICT PATH since Plan E: `rule(id, true)` enters
-    ///      here from `Disputed`, where — unlike the silence path — a
-    ///      counter-bond exists. It is released to whoever posted it, exactly as
-    ///      `_fail` does, because the counter-bond was the price of the
-    ///      escalation and not a stake on its outcome; the disputer's actual
-    ///      loss on a guilty verdict is the slash this function just executed.
-    ///      It is NOT paid to the challenger: §3.4's payoff is that a successful
-    ///      challenger gets its bond back and nothing more, and letting a win
-    ///      pay out the other side's bond would reintroduce the profit motive
-    ///      the off-chain bounty deliberately keeps out of this contract.
+    ///      TWO ENTRIES, TWO POOL STATES — and the status is what separates them.
+    ///      This helper's correctness has twice rested on WHO could reach it:
+    ///      Plan D could only enter from `Filed`, where the counter-bond was
+    ///      structurally zero, so it ignored the counter-bond entirely, and Plan
+    ///      E's `Disputed` entry had to add a release before it stopped stranding
+    ///      funds. Pooling widens the reachable set AGAIN — a partial pool can
+    ///      now arrive here — so the invariants are re-derived rather than
+    ///      assumed:
+    ///
+    ///      — FROM `Disputed` (a guilty ruling): the pool is EXACTLY `bondWood`,
+    ///        because the contribution that completed it is the very one that
+    ///        flipped the status. THE WHOLE POOL FORFEITS TO THE CHALLENGER, on
+    ///        top of its returned bond. This reverses Plan E's rule that a
+    ///        counter-bond is "the price of the escalation, not a stake on its
+    ///        outcome" — see the contract-level note. Refunded, it made disputing
+    ///        free for a guilty approver and left a winning challenger paid
+    ///        nothing; forfeited, the escalation costs what it is worth and the
+    ///        challenger that was right is paid by the side that was wrong.
+    ///
+    ///      — FROM `Filed` (the silence verdict): the pool is strictly BELOW
+    ///        `bondWood` — zero, or a part-funded defence that ran out of clock.
+    ///        IT IS REFUNDED TO ITS CONTRIBUTORS. They never bought a dispute:
+    ///        the escalation exists only once the pool is complete, so there is
+    ///        no escalation here whose price could be forfeited. Paying a partial
+    ///        pool to the challenger would charge for a good never delivered, and
+    ///        keeping it would strand it in this contract forever and break §4's
+    ///        custody invariant permanently. Note that a contributor is refunded
+    ///        AND still slashed: the slash is the verdict, the refund is only the
+    ///        unwinding of a purchase that never completed.
     function _settle(uint256 challengeId, Challenge storage c) private {
         IStakedWood swood = stakedWood;
         // Fail closed: without the slasher wired there is no verdict to
@@ -387,7 +493,7 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
 
         address governor = c.governor;
         uint256 proposalId = c.proposalId;
-        (address[] memory approvers,,) = _accused(governor, proposalId);
+        address[] memory approvers = _accused(governor, proposalId);
 
         // D6: the vault and the pre-drain instant are re-read from the proposal
         // rather than carried on the challenge — `executedAt - 1` is §3.8's
@@ -396,13 +502,13 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         ISyndicateGovernor.StrategyProposal memory p = ISyndicateGovernor(governor).getProposal(proposalId);
 
         uint256 bond = c.bondWood;
-        // Zero on the silence path, non-zero on a guilty ruling — see the note
-        // above. Read before the status write so the storage slot is warm and
-        // the two release paths stay textually identical to `_fail`'s.
-        uint256 counterBond = c.counterBondWood;
-        address disputer = c.disputer;
+        uint256 pool = c.counterBondWood;
+        // READ BEFORE THE TERMINAL WRITE. This is the only thing that keeps the
+        // two entries apart — a moment later every challenge here is `Settled`
+        // and a full pool is indistinguishable from a partial one.
+        bool escalated = c.status == Status.Disputed;
         c.status = Status.Settled;
-        bondedWood -= (bond + counterBond);
+        bondedWood -= (bond + pool);
 
         exposureLedger.unfreezeCoverage(governor, proposalId);
 
@@ -414,9 +520,33 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         // the filing actually named (D7).
         if (c.adapterTarget != address(0)) tierRegistry.demoteByChallenge(c.adapterTarget, c.adapterSelector);
 
-        wood.safeTransfer(c.challenger, bond);
-        if (counterBond != 0) wood.safeTransfer(disputer, counterBond);
+        // Exactly `bond + pool` leaves on BOTH branches, matching the decrement
+        // above to the wei: the forfeit adds the pool to the challenger's
+        // payment, the refund hands the same pool back to the people who paid it.
+        if (escalated) {
+            wood.safeTransfer(c.challenger, bond + pool);
+        } else {
+            wood.safeTransfer(c.challenger, bond);
+            _refundContributions(challengeId);
+        }
         emit ChallengeSettled(challengeId, slashedWood, caseId);
+    }
+
+    /// @dev Hands every contribution back to whoever made it. Reached only from
+    ///      the undisputed-settle path, where the pool never completed. The
+    ///      stored amounts are deliberately NOT zeroed: the challenge is already
+    ///      terminal and nothing can re-enter — `dispute` requires `Filed`, and
+    ///      both unwind paths require a live status — so leaving them keeps the
+    ///      payout auditable at no correctness cost.
+    function _refundContributions(uint256 challengeId) private {
+        address[] storage list = _contributors[challengeId];
+        uint256 n = list.length;
+        for (uint256 i = 0; i < n; i++) {
+            address contributor = list[i];
+            // Never zero: an address is listed only by a non-zero contribution,
+            // and a repeat contributor only ever adds to it.
+            wood.safeTransfer(contributor, _contributed[challengeId][contributor]);
+        }
     }
 
     /// @dev D5 — THE FAIL-SAFE. A disputed challenge escalates to the court of
@@ -426,54 +556,75 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      escalation fails in favour of the accused: not slashing is the right
     ///      default when the adjudicator is missing.
     ///
-    ///      ALSO THE NOT-GUILTY VERDICT PATH since Plan E, and with no change
-    ///      needed: this function asserts nothing about the clock — no deadline
-    ///      check, no `filedAt` arithmetic — it only unwinds the bonds and the
-    ///      freeze. An acquittal and an unruled escalation therefore settle
-    ///      identically, which is correct, because both say the disputer was
-    ///      right: its counter-bond returns and the challenger's bond forfeits.
+    ///      ALSO THE NOT-GUILTY VERDICT PATH since Plan E: this function asserts
+    ///      nothing about the clock — no deadline check, no `filedAt` arithmetic
+    ///      — it only unwinds the bonds and the freeze. An acquittal and an
+    ///      unruled escalation therefore settle identically, which is correct,
+    ///      because both say the defence was right: the pool returns and the
+    ///      challenger's bond forfeits.
+    ///
+    ///      THE FORFEIT IS SPLIT PRO-RATA TO CONTRIBUTION, NOT TO COVERAGE, and
+    ///      that reversal is the whole anti-free-riding mechanism. Paying the
+    ///      accused SET by committed share — what this did before — meant an
+    ///      approver could sit out the defence, let somebody else carry the
+    ///      entire counter-bond, and still collect its coverage share of the
+    ///      winnings. Every accused approver's best move was therefore to
+    ///      contribute nothing, which is exactly how a collective defence fails
+    ///      to get funded. Keyed to contribution, the upside accrues only to
+    ///      whoever actually bought the escalation that produced it, in the
+    ///      proportion they bought it.
+    ///
+    ///      ENTRY IS ONLY EVER FROM `Disputed` — `resolve` sends `Filed` to
+    ///      `_settle`, and `rule` demands `Disputed` — so the pool is complete
+    ///      and the contributor list is non-empty. The empty-list branch below is
+    ///      defensive only, and it no longer depends on the ledger at all: the
+    ///      payout set is this contract's own state, so a rewired ledger cannot
+    ///      strand the bond here the way it once could.
     ///
     ///      ACCEPTED COST, now scoped to an UNWIRED game (`court == address(0)`):
     ///      with no adjudicator, a genuinely guilty approver can still dispute
     ///      and run out this clock. That is strictly better than an indefinite
     ///      freeze, because it keeps the mechanism live and bounded — and once a
-    ///      court is wired, `rule` beats the timeout and closes it.
+    ///      court is wired, `rule` beats the timeout and closes it. Note that
+    ///      pooling does not widen this hole: the escalation still costs the
+    ///      accused side the full bond, it is merely split among them.
     function _fail(uint256 challengeId, Challenge storage c) private {
         address governor = c.governor;
         uint256 proposalId = c.proposalId;
-        (address[] memory approvers, uint256[] memory shares, uint256 totalUsd) = _accused(governor, proposalId);
 
         uint256 bond = c.bondWood;
-        uint256 counterBond = c.counterBondWood;
-        address disputer = c.disputer;
+        uint256 pool = c.counterBondWood;
         address challenger = c.challenger;
         c.status = Status.Failed;
-        bondedWood -= (bond + counterBond);
+        bondedWood -= (bond + pool);
 
         exposureLedger.unfreezeCoverage(governor, proposalId);
 
-        // The counter-bond was the price of the escalation, not a stake on its
-        // outcome: it returns to whoever posted it.
-        if (counterBond != 0) wood.safeTransfer(disputer, counterBond);
-
-        // Defensive: the freeze makes an empty accused set unreachable while a
-        // challenge is live, but a rewired ledger must not strand the bond.
-        if (totalUsd == 0) {
+        address[] storage list = _contributors[challengeId];
+        uint256 n = list.length;
+        // Defensive: unreachable from `Disputed`, where the pool is by
+        // construction complete and therefore funded by at least one address.
+        // Left in so the bond can never be stranded if a future caller widens
+        // the reachable states again — the hazard this file has now hit twice.
+        if (n == 0) {
             wood.safeTransfer(challenger, bond);
             emit ChallengeFailed(challengeId, 0);
             return;
         }
 
-        // §3.4: "failed challenge → challenger bond forfeits to the accused",
-        // pro-rata to what each of them actually committed (D4). The last
-        // recipient absorbs the rounding remainder, so the forfeit is
-        // distributed to the wei and nothing is stranded here.
+        // §3.4: "failed challenge → challenger bond forfeits to the accused" —
+        // to the ones that funded the defence, pro-rata to what each put in. The
+        // last recipient absorbs the rounding remainder, so the forfeit is
+        // distributed to the wei and nothing is stranded here. Each contributor
+        // is paid its stake back and its slice of the forfeit in one transfer.
         uint256 distributed;
-        uint256 last = approvers.length - 1;
+        uint256 last = n - 1;
         for (uint256 i = 0; i <= last; i++) {
-            uint256 amount = i == last ? bond - distributed : (bond * shares[i]) / totalUsd;
-            distributed += amount;
-            if (amount != 0) wood.safeTransfer(approvers[i], amount);
+            address contributor = list[i];
+            uint256 contributed = _contributed[challengeId][contributor];
+            uint256 winnings = i == last ? bond - distributed : (bond * contributed) / pool;
+            distributed += winnings;
+            wood.safeTransfer(contributor, contributed + winnings);
         }
         emit ChallengeFailed(challengeId, bond);
     }
@@ -481,26 +632,24 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     /// @dev The accused set: the ledger's covering approvers, filtered to those
     ///      whose committed share is still non-zero. The ledger reports a
     ///      released commitment as zero rather than dropping it, and a guardian
-    ///      that released before the filing backed nothing on this proposal —
-    ///      it is neither slashed nor paid out of a failed challenge.
-    function _accused(address governor, uint256 proposalId)
-        internal
-        view
-        returns (address[] memory accused, uint256[] memory shares, uint256 totalUsd)
-    {
+    ///      that released before the filing backed nothing on this proposal, so
+    ///      it is not slashed for it.
+    /// @dev It returns ADDRESSES ONLY. It used to hand back each guardian's
+    ///      committed share and their total as well, because a failed challenge
+    ///      paid the forfeit out by coverage; that split is now keyed to
+    ///      contribution instead (see `_fail`), so the only remaining consumer is
+    ///      the slash list in `_settle`, and the coverage weights are dead.
+    function _accused(address governor, uint256 proposalId) internal view returns (address[] memory accused) {
         (address[] memory all, uint256[] memory committedUsd) = exposureLedger.approversOf(governor, proposalId);
         uint256 n;
         for (uint256 i = 0; i < all.length; i++) {
             if (committedUsd[i] != 0) n++;
         }
         accused = new address[](n);
-        shares = new uint256[](n);
         uint256 j;
         for (uint256 i = 0; i < all.length; i++) {
             if (committedUsd[i] == 0) continue;
             accused[j] = all[i];
-            shares[j] = committedUsd[i];
-            totalUsd += committedUsd[i];
             j++;
         }
     }
@@ -510,6 +659,16 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     /// @inheritdoc IChallengeGame
     function challengeOf(uint256 challengeId) external view returns (Challenge memory) {
         return _challenges[challengeId];
+    }
+
+    /// @inheritdoc IChallengeGame
+    function counterBondContributors(uint256 challengeId) external view returns (address[] memory) {
+        return _contributors[challengeId];
+    }
+
+    /// @inheritdoc IChallengeGame
+    function counterBondContributionOf(uint256 challengeId, address contributor) external view returns (uint256) {
+        return _contributed[challengeId][contributor];
     }
 
     /// @inheritdoc IChallengeGame
