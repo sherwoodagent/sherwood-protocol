@@ -120,10 +120,10 @@
     "type": "t_contract(IStakedWood)"
   },
   {
-    "label": "vaultOf",
+    "label": "exposureLedger",
     "slot": "20",
     "offset": 0,
-    "type": "t_mapping(t_address,t_address)"
+    "type": "t_contract(IExposureLedger)"
   },
   {
     "label": "__gap",

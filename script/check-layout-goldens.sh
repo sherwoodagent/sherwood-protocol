@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # check-layout-goldens.sh — storage-layout golden guard for the beacon/proxy-upgraded
-# governance contracts (SyndicateGovernor, SyndicateFactory).
+# governance contracts (SyndicateGovernor, SyndicateFactory, GuardianRegistry).
 #
-# Both contracts live behind upgradeable proxies (governor: beacon; factory: UUPS), so
+# All three live behind upgradeable proxies (governor: beacon; factory + registry: UUPS), so
 # their storage layouts are FROZEN for deployed lineages: fields are append-only, gaps
 # shrink only from the front, and any reorder/insert/retype corrupts live state on the
 # next upgrade. This script pins the compiler-emitted layout (label, slot, offset, type
@@ -79,10 +79,10 @@ check_contract() {
 
 check_contract SyndicateGovernor script/syndicate-governor-layout.golden.json
 check_contract SyndicateFactory script/syndicate-factory-layout.golden.json
-# GuardianRegistry is UUPS-upgradeable and had no gate until the proposal-lifecycle
-# branch — which shipped a real collision (a `vaultOf` insert ahead of `factory`/`swood`
-# with no __gap decrement) caught only by manual diff, never by CI. Its slots move again
-# the moment an exposure ledger or similar is appended; gate it like the other two.
+# GuardianRegistry is UUPS and live: Plan B carved `exposureLedger` out of the
+# front of its __gap (50 -> 49), which is exactly the class of change this guard
+# exists to police. Pinned here so the next append is checked automatically
+# rather than by hand.
 check_contract GuardianRegistry script/guardian-registry-layout.golden.json
 
 [ "${UPDATE_GOLDEN:-0}" = "1" ] ||
