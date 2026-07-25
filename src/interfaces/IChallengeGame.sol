@@ -78,6 +78,11 @@ interface IChallengeGame {
     error NotAccusedApprover();
     error ZeroAddress();
     error InvalidParameter();
+    /// @notice `rule` called by anything other than the wired court (§3.5).
+    /// @dev    Also what an UNWIRED game reverts with, since `court` is then the
+    ///         zero address and no caller can match it — Plan D's timeout stays
+    ///         the only way out of `Disputed`.
+    error NotCourt();
 
     // ── Events ──
     /// @dev `evidenceURI` is carried on-chain unindexed so predicates 2 and 3 —
@@ -95,6 +100,10 @@ interface IChallengeGame {
     event ChallengeDisputed(uint256 indexed challengeId, address indexed disputer, uint256 counterBondWood);
     event ChallengeSettled(uint256 indexed challengeId, uint256 slashedWood, uint256 caseId);
     event ChallengeFailed(uint256 indexed challengeId, uint256 forfeitedWood);
+    /// @dev Emitted BEFORE the settle/fail it causes, so an indexer reading the
+    ///      log in order sees the verdict and then the accounting it produced.
+    event ChallengeRuled(uint256 indexed challengeId, bool guilty);
+    event CourtSet(address indexed oldCourt, address indexed newCourt);
     event ExposureLedgerSet(address indexed oldLedger, address indexed newLedger);
     event TierRegistrySet(address indexed oldRegistry, address indexed newRegistry);
     event StakedWoodSet(address indexed oldStakedWood, address indexed newStakedWood);
@@ -153,6 +162,25 @@ interface IChallengeGame {
     ///         challenge fails to the accused (D5). Reverts otherwise.
     function resolve(uint256 challengeId) external;
 
+    /// @notice The court's verdict on a DISPUTED challenge (spec §3.5, Plan E).
+    ///         Callable only by `court`, and only from `Disputed` — a `Filed`
+    ///         challenge is still inside its own auto-slash clock and has not
+    ///         been escalated to anyone.
+    /// @dev    THE COURT SUPPLIES ONLY THE GUILTY/NOT-GUILTY BIT and can vary
+    ///         nothing else. `guilty` takes the identical path an UNDISPUTED
+    ///         challenge takes — slash at sWOOD's `maxSlashBps` with no severity
+    ///         ramp (§3.5 "ground truth established", D7), the named adapter
+    ///         demoted, the challenger's bond returned — and `!guilty` the
+    ///         identical path the timeout takes. There is deliberately no
+    ///         severity argument: a court that could dial the slash would be
+    ///         negotiating with the accused rather than ruling on them.
+    /// @dev    A RULING BEATS THE TIMEOUT. Both outcomes are terminal, and
+    ///         `resolve` only acts on `Filed`/`Disputed`, so once the court has
+    ///         ruled the clock can no longer overwrite the verdict — which is
+    ///         the whole point: it is what stops a guilty approver disputing and
+    ///         running out `disputeTimeout`.
+    function rule(uint256 challengeId, bool guilty) external;
+
     // ── Views ──
     function challengeOf(uint256 challengeId) external view returns (Challenge memory);
     /// @notice The id of the LIVE (`Filed`/`Disputed`) challenge against a
@@ -168,8 +196,17 @@ interface IChallengeGame {
     ///         bondedWood`; the game pays out nothing but bonds, so the two are
     ///         equal except for WOOD donated here by mistake.
     function bondedWood() external view returns (uint256);
+    /// @notice The §3.5 adjudicator allowed to `rule` on disputed challenges, or
+    ///         the zero address while none is wired — in which case Plan D's
+    ///         behaviour is unchanged and `Disputed` remains terminal-by-timeout.
+    function court() external view returns (address);
 
     // ── Owner setters ──
+    /// @notice Wire (or unwire) the court. The zero address is DELIBERATELY
+    ///         permitted: it is how governance revokes a compromised court and
+    ///         falls back to Plan D's fail-safe timeout rather than leaving a
+    ///         hostile adjudicator able to force slashes.
+    function setCourt(address newCourt) external;
     function setExposureLedger(address ledger) external;
     function setTierRegistry(address registry) external;
     function setStakedWood(address stakedWood_) external;

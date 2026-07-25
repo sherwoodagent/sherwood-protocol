@@ -170,6 +170,9 @@ contract ChallengeGameTest is Test {
     address internal guardianA = makeAddr("guardianA");
     address internal guardianB = makeAddr("guardianB");
     address internal vault = makeAddr("vault");
+    /// @dev Stands in for the §3.5 court (Plan E). Only `rule` reads it, so
+    ///      wiring it in `setUp` leaves every Plan D path byte-identical.
+    address internal court = makeAddr("court");
 
     uint256 internal constant PROPOSAL = 1;
     string internal constant EVIDENCE = "ipfs://bafyEvidence";
@@ -186,8 +189,10 @@ contract ChallengeGameTest is Test {
         tiers = new MockChallengeTierRegistry();
         swood = new MockChallengeStakedWood();
         game = new ChallengeGame(owner, address(wood), address(ledger), address(tiers));
-        vm.prank(owner);
+        vm.startPrank(owner);
         game.setStakedWood(address(swood));
+        game.setCourt(court);
+        vm.stopPrank();
 
         wood.mint(challenger, 10_000_000e18);
         vm.prank(challenger);
@@ -950,5 +955,106 @@ contract ChallengeGameTest is Test {
             _assertLiveBondsBacked();
         }
         assertEq(wood.balanceOf(address(game)), 0, "nothing stranded once every challenge is terminal");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Plan E Task 1 — the court-only ruling entrypoint
+    // ─────────────────────────────────────────────────────────────────────────
+
+    function _file() internal returns (uint256 id) {
+        id = _fileStandard(PROPOSAL);
+    }
+
+    function _fileAndDispute() internal returns (uint256 id) {
+        id = _fileStandard(PROPOSAL);
+        vm.prank(guardianA);
+        game.dispute(id);
+    }
+
+    function test_rule_onlyCourt() public {
+        uint256 id = _fileAndDispute();
+        vm.expectRevert(IChallengeGame.NotCourt.selector);
+        game.rule(id, true);
+    }
+
+    /// @notice A guilty ruling routes into the SAME settle path an undisputed
+    ///         challenge takes — slash into the escrow, adapter demoted, bond
+    ///         returned — so the court supplies only the verdict bit (D7).
+    function test_rule_guiltySettles() public {
+        uint256 id = _fileAndDispute();
+        vm.prank(court);
+        game.rule(id, true);
+        assertEq(uint256(game.challengeOf(id).status), uint256(IChallengeGame.Status.Settled));
+    }
+
+    /// @notice A not-guilty ruling fails the challenge: the challenger's bond
+    ///         forfeits to the accused, exactly as a timeout would.
+    function test_rule_notGuiltyFails() public {
+        uint256 id = _fileAndDispute();
+        vm.prank(court);
+        game.rule(id, false);
+        assertEq(uint256(game.challengeOf(id).status), uint256(IChallengeGame.Status.Failed));
+    }
+
+    /// @notice The court may only rule on a DISPUTED challenge. A `Filed` one is
+    ///         still inside its own auto-slash clock and has not been escalated.
+    function test_rule_onlyFromDisputed() public {
+        uint256 id = _file();
+        vm.prank(court);
+        vm.expectRevert(IChallengeGame.WrongStatus.selector);
+        game.rule(id, true);
+    }
+
+    /// @notice A ruling BEATS the timeout: once the court has ruled, the challenge
+    ///         is terminal and `resolve` cannot re-resolve it.
+    function test_rule_thenResolveReverts() public {
+        uint256 id = _fileAndDispute();
+        vm.prank(court);
+        game.rule(id, true);
+        vm.warp(vm.getBlockTimestamp() + game.disputeTimeout() + 1);
+        vm.expectRevert(IChallengeGame.WrongStatus.selector);
+        game.resolve(id);
+    }
+
+    /// @notice With no court wired, Plan D's timeout behaviour is unchanged — a
+    ///         disputed challenge still fails to the accused. This is what makes
+    ///         the court additive rather than a breaking change.
+    function test_noCourtWired_timeoutStillFailsToAccused() public {
+        vm.prank(owner);
+        game.setCourt(address(0));
+        uint256 id = _fileAndDispute();
+        vm.warp(vm.getBlockTimestamp() + game.disputeTimeout() + 1);
+        game.resolve(id);
+        assertEq(uint256(game.challengeOf(id).status), uint256(IChallengeGame.Status.Failed));
+    }
+
+    /// @notice THE COUNTER-BOND ON THE GUILTY PATH. Plan D could only reach
+    ///         `_settle` from `Filed`, where `counterBondWood` is always zero, so
+    ///         it neither released the counter-bond nor discounted it from
+    ///         `bondedWood`. A court ruling reaches `_settle` from `Disputed`,
+    ///         where it is NOT zero — left unhandled, the disputer's WOOD would
+    ///         be stranded in the game forever and `bondedWood` would over-report
+    ///         live custody for good, breaking the §4 invariant this suite pins.
+    ///         The counter-bond is "the price of the escalation, not a stake on
+    ///         its outcome" (Plan D's own rule on the timeout path), and the
+    ///         contract's stated payoff — "a successful challenger ONLY gets its
+    ///         bond back" — forbids routing it to the challenger. So it returns
+    ///         to whoever posted it on this path too; the disputer's real loss is
+    ///         the slash the guilty verdict just executed.
+    function test_rule_guiltyReturnsCounterBondAndClearsAccounting() public {
+        uint256 id = _fileAndDispute();
+        uint256 counterBond = game.challengeOf(id).counterBondWood;
+        assertGt(counterBond, 0, "the dispute posted a counter-bond");
+
+        uint256 challengerBefore = wood.balanceOf(challenger);
+        uint256 disputerBefore = wood.balanceOf(guardianA);
+
+        vm.prank(court);
+        game.rule(id, true);
+
+        assertEq(wood.balanceOf(challenger) - challengerBefore, game.challengeOf(id).bondWood, "bond returned in full");
+        assertEq(wood.balanceOf(guardianA) - disputerBefore, counterBond, "counter-bond returned to its poster");
+        _assertLiveBondsBacked();
+        assertEq(wood.balanceOf(address(game)), 0, "nothing stranded once the ruling is terminal");
     }
 }

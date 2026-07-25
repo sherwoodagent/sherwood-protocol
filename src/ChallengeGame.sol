@@ -118,6 +118,17 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///         game can never redirect the proceeds of a slash it triggers.
     IStakedWood public stakedWood;
 
+    /// @notice The adjudicator for disputed challenges (spec §3.5, Plan E) — the
+    ///         only address that may `rule`.
+    /// @dev    THE ZERO ADDRESS LEAVES PLAN D EXACTLY AS IT WAS: no caller can
+    ///         match it, so `rule` is unreachable and a disputed challenge simply
+    ///         times out in favour of the accused (D5). That is what makes the
+    ///         court additive rather than a breaking change, and it is also the
+    ///         off-switch — governance can unwire a captured court and fall back
+    ///         to the fail-safe timeout instead of being stuck with an
+    ///         adjudicator that can force slashes.
+    address public court;
+
     /// @notice How long after execution a proposal remains challengeable
     ///         (spec §5: 14d initial, matching the ledger's coverage window —
     ///         coverage that has expired out of the exposure buckets can no
@@ -321,12 +332,53 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         }
     }
 
+    /// @inheritdoc IChallengeGame
+    /// @dev THE COURT SUPPLIES ONLY THE VERDICT BIT. `guilty` reuses `_settle`
+    ///      verbatim — the same path an UNDISPUTED challenge takes, so the slash
+    ///      is at sWOOD's `maxSlashBps` with no severity ramp (§3.5 "ground truth
+    ///      established", D7) — and `!guilty` reuses `_fail`, the same path the
+    ///      timeout takes, because a not-guilty ruling and an unruled escalation
+    ///      say the same thing about the accused: the disputer was right, so it
+    ///      gets its counter-bond back and the challenger's bond forfeits. There
+    ///      is deliberately no severity parameter here; a court that could dial
+    ///      the slash would be negotiating with the accused, not ruling on them.
+    /// @dev RULING BEATS THE TIMEOUT: both branches are terminal and `resolve`
+    ///      acts only on `Filed`/`Disputed`, so the clock can never overwrite a
+    ///      verdict already handed down. That ordering is the entire point of
+    ///      this entrypoint — it is what stops a genuinely guilty approver from
+    ///      disputing and running out `disputeTimeout`.
+    /// @dev CEI is inherited from `_settle`/`_fail`, which both write the
+    ///      terminal status before any external call; the event is emitted first
+    ///      so the log reads verdict-then-consequence.
+    function rule(uint256 challengeId, bool guilty) external {
+        if (msg.sender != court) revert NotCourt();
+        Challenge storage c = _challenges[challengeId];
+        if (c.status != Status.Disputed) revert WrongStatus();
+        emit ChallengeRuled(challengeId, guilty);
+        if (guilty) {
+            _settle(challengeId, c);
+        } else {
+            _fail(challengeId, c);
+        }
+    }
+
     /// @dev THE SILENCE VERDICT (§3.4, D1). Nobody contested inside the window,
     ///      so the assertion stands: the covering approvers are slashed into the
     ///      compensation escrow, the accused adapter loses its certification,
     ///      and the challenger gets its bond back — its bond, and nothing else.
     ///      The detector's reward is the off-chain bug-bounty program keyed off
     ///      `ChallengeSettled`; see the contract-level note.
+    ///
+    ///      ALSO THE GUILTY-VERDICT PATH since Plan E: `rule(id, true)` enters
+    ///      here from `Disputed`, where — unlike the silence path — a
+    ///      counter-bond exists. It is released to whoever posted it, exactly as
+    ///      `_fail` does, because the counter-bond was the price of the
+    ///      escalation and not a stake on its outcome; the disputer's actual
+    ///      loss on a guilty verdict is the slash this function just executed.
+    ///      It is NOT paid to the challenger: §3.4's payoff is that a successful
+    ///      challenger gets its bond back and nothing more, and letting a win
+    ///      pay out the other side's bond would reintroduce the profit motive
+    ///      the off-chain bounty deliberately keeps out of this contract.
     function _settle(uint256 challengeId, Challenge storage c) private {
         IStakedWood swood = stakedWood;
         // Fail closed: without the slasher wired there is no verdict to
@@ -344,8 +396,13 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         ISyndicateGovernor.StrategyProposal memory p = ISyndicateGovernor(governor).getProposal(proposalId);
 
         uint256 bond = c.bondWood;
+        // Zero on the silence path, non-zero on a guilty ruling — see the note
+        // above. Read before the status write so the storage slot is warm and
+        // the two release paths stay textually identical to `_fail`'s.
+        uint256 counterBond = c.counterBondWood;
+        address disputer = c.disputer;
         c.status = Status.Settled;
-        bondedWood -= bond;
+        bondedWood -= (bond + counterBond);
 
         exposureLedger.unfreezeCoverage(governor, proposalId);
 
@@ -358,20 +415,29 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         if (c.adapterTarget != address(0)) tierRegistry.demoteByChallenge(c.adapterTarget, c.adapterSelector);
 
         wood.safeTransfer(c.challenger, bond);
+        if (counterBond != 0) wood.safeTransfer(disputer, counterBond);
         emit ChallengeSettled(challengeId, slashedWood, caseId);
     }
 
     /// @dev D5 — THE FAIL-SAFE. A disputed challenge escalates to the court of
-    ///      §3.5, which does not exist yet. Without this path both bonds and the
-    ///      frozen coverage would sit stuck forever and anyone could pin a
+    ///      §3.5. Without this path both bonds and the frozen coverage would sit
+    ///      stuck forever whenever no court answered, and anyone could pin a
     ///      guardian's budget indefinitely just by filing. So an unruled
     ///      escalation fails in favour of the accused: not slashing is the right
     ///      default when the adjudicator is missing.
     ///
-    ///      ACCEPTED COST, stated rather than discovered: until Plan E ships, a
-    ///      genuinely guilty approver can dispute and run out this clock. That
-    ///      is strictly better than an indefinite freeze, because it keeps the
-    ///      mechanism live and bounded.
+    ///      ALSO THE NOT-GUILTY VERDICT PATH since Plan E, and with no change
+    ///      needed: this function asserts nothing about the clock — no deadline
+    ///      check, no `filedAt` arithmetic — it only unwinds the bonds and the
+    ///      freeze. An acquittal and an unruled escalation therefore settle
+    ///      identically, which is correct, because both say the disputer was
+    ///      right: its counter-bond returns and the challenger's bond forfeits.
+    ///
+    ///      ACCEPTED COST, now scoped to an UNWIRED game (`court == address(0)`):
+    ///      with no adjudicator, a genuinely guilty approver can still dispute
+    ///      and run out this clock. That is strictly better than an indefinite
+    ///      freeze, because it keeps the mechanism live and bounded — and once a
+    ///      court is wired, `rule` beats the timeout and closes it.
     function _fail(uint256 challengeId, Challenge storage c) private {
         address governor = c.governor;
         uint256 proposalId = c.proposalId;
@@ -459,6 +525,16 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     }
 
     // ── Owner setters ──
+
+    /// @dev NO ZERO CHECK, unlike every other setter here — the zero address is
+    ///      the meaningful "no court" state, not a mis-set one. It is both the
+    ///      pre-Plan-E default and the revocation switch: unwiring a captured
+    ///      court returns the game to D5's fail-safe timeout, which acquits, so
+    ///      the worst an unwiring can do is fail to slash.
+    function setCourt(address newCourt) external onlyOwner {
+        emit CourtSet(court, newCourt);
+        court = newCourt;
+    }
 
     function setExposureLedger(address ledger) external onlyOwner {
         if (ledger == address(0)) revert ZeroAddress();
