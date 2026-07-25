@@ -635,11 +635,17 @@ contract ChallengeEndToEndTest is Test {
         // ── The bond is a real cost to the challenger and a real payment to the
         //    accused; the counter-bond is returned, not staked on the outcome.
         assertEq(wood.balanceOf(challenger), challengerBalBefore - CHALLENGER_BOND, "the challenger forfeited it");
+        // The forfeit reaches the defence MINUS the burned slice: g1 funded 100%
+        // of the pool, so it takes 100% of what is distributed. The burn is what
+        // stops that funder from profitably being the challenger's own second
+        // address.
+        uint256 burned = (CHALLENGER_BOND * game.forfeitBurnBps()) / 10_000;
         assertEq(
             wood.balanceOf(g1),
-            g1BalBefore + CHALLENGER_BOND,
-            "contribution returned plus the whole forfeit (g1 funded 100% of the counter-bond pool)"
+            g1BalBefore + CHALLENGER_BOND - burned,
+            "contribution returned plus the whole UNBURNED forfeit (g1 funded 100% of the pool)"
         );
+        assertEq(wood.balanceOf(game.BURN_ADDRESS()), burned, "and the burned slice left the system for good");
         assertEq(wood.balanceOf(address(game)), 0, "nothing stranded in the game");
         assertEq(game.bondedWood(), 0);
 

@@ -87,6 +87,13 @@ interface ITierRegistryDemoterMinimal {
  *         pro-rata to CONTRIBUTION, not to coverage, so an approver that sat
  *         out the defence collects none of the upside it produced.
  *
+ *         That fix has a tail, and `forfeitBurnBps` is the answer to it: paying
+ *         the forfeit perfectly back to whoever funded the pool is free money
+ *         when the funder IS the challenger, which one operator with two
+ *         addresses can arrange against its own proposal. A slice of every
+ *         forfeit is therefore burned before the split, because the attacker
+ *         controls both sides and any recipient it can reach is a round trip.
+ *
  * @dev    Plain `Ownable2Step`, NOT upgradeable — same shape as `TierRegistry`
  *         and `ExposureLedger`, so its storage layout is unconstrained.
  *
@@ -127,6 +134,33 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      freezes is pinned for longer than any plausible court proceeding,
     ///      which is the griefing side of D5's fail-safe.
     uint256 internal constant MAX_DISPUTE_TIMEOUT = 180 days;
+
+    /// @notice Where the burned slice of a failed challenge's forfeit goes.
+    /// @dev    NOT A REAL BURN, because WOOD is a plain `IERC20` here — this
+    ///         contract holds it behind the standard interface, which has no
+    ///         `burn`, and nothing guarantees the deployed token exposes one or
+    ///         would let this contract call it. The other candidate sink,
+    ///         `address(0)`, is unusable: OpenZeppelin's ERC20 rejects a
+    ///         transfer to it, so `safeTransfer(address(0), ...)` would revert
+    ///         the whole resolution and pin the challenge in `Disputed`
+    ///         forever — a burn that bricks the fail-safe is worse than no burn.
+    ///         The conventional dead address is therefore the burn: no key for
+    ///         it is known, nothing has ever come back out of it, and every
+    ///         explorer and indexer already reads it as destroyed. Total supply
+    ///         keeps counting these WOOD; nobody in this game can ever spend
+    ///         them again, which is the only property the mechanism needs.
+    address public constant BURN_ADDRESS = 0x000000000000000000000000000000000000dEaD;
+
+    /// @dev Ceiling on `forfeitBurnBps`. The burn is priced to make a
+    ///      self-challenge round trip lose money, NOT to punish an honest
+    ///      defence, and past some point the second effect swamps the first: a
+    ///      guardian that correctly beat a bad-faith filing must still come out
+    ///      clearly ahead, or answering a challenge becomes the losing move and
+    ///      the counter-bond stops getting funded at all. Half the forfeit is
+    ///      the outer edge of that — it still leaves an honest defender the
+    ///      larger share — and it doubles as a cap on how much value a captured
+    ///      owner can destroy per failed challenge.
+    uint256 internal constant MAX_FORFEIT_BURN_BPS = 5_000;
 
     /// @notice Bond currency for both the challenger's bond and the accused's
     ///         counter-bond.
@@ -176,6 +210,48 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///         it to the accused approvers.
     uint256 public challengerBondBps = 500;
 
+    /// @notice The slice of a FAILED challenge's forfeited bond that is
+    ///         destroyed rather than paid to the guardians that funded the
+    ///         defence, in bps of the bond. Default 20%.
+    /// @dev    THIS IS THE PRICE OF CHALLENGING YOURSELF. Every other rule in
+    ///         this contract assumes the challenger and the accused are
+    ///         opposing parties. They need not be: an approver can file against
+    ///         its OWN executed proposal, post bond `B` as the challenger, then
+    ///         fund the entire counter-bond pool itself for another `B`, sit out
+    ///         `disputeTimeout` and collect its contribution back plus 100% of
+    ///         the forfeit — because it contributed 100% of the pool. Net cost
+    ///         zero, while every co-approver's coverage sat frozen for a month.
+    ///         Pro-rata-to-contribution killed free-riding and opened exactly
+    ///         this, because it made the forfeit follow the payer perfectly.
+    /// @dev    A `msg.sender != challenger` check would be theatre: two
+    ///         addresses defeat it, and this design has already conceded it
+    ///         cannot police identity — it is why the counter-bond target is
+    ///         pinned to the bond rather than charged by coverage share.
+    /// @dev    SO THE SLICE IS BURNED, and burning is not one option among
+    ///         several — it is the only one. The attacker controls both sides of
+    ///         the trade, so ANY recipient it can reach is a round trip: paying
+    ///         the challenger pays it, paying the contributors pays it (it is
+    ///         the sole contributor), and a treasury or fee sink pays whoever
+    ///         governs, which the attacker may be or may lobby. Only destruction
+    ///         has no beneficiary to be, and the cost then falls on whoever
+    ///         forfeited — which on the honest path is a genuinely bad-faith
+    ///         challenger and on the attack path is the attacker itself.
+    /// @dev    WHAT IT COSTS THE HONEST: a defender that beat a bad-faith filing
+    ///         collects 80% of the forfeit instead of 100%. It still profits,
+    ///         still recovers its whole contribution, and a free-riding approver
+    ///         still collects nothing — the anti-free-ride property is untouched
+    ///         because the burn is taken off the TOP, before the pro-rata split,
+    ///         and changes only the size of the pot, never its key. The losing
+    ///         challenger's position does not move at all: it forfeits the whole
+    ///         bond either way, so the burn changes who receives it, not what
+    ///         filing costs.
+    /// @dev    ONLY THE FORFEIT IS BURNED. A guilty ruling is untouched: the
+    ///         challenger still receives its bond back plus the whole pool. That
+    ///         asymmetry is deliberate — on the settle path the challenger and
+    ///         the accused genuinely are opposed (the accused is being slashed),
+    ///         so no round trip exists there to price.
+    uint256 public forfeitBurnBps = 2_000;
+
     /// @notice Silence window: an uncontested challenge auto-slashes once this
     ///         much time has passed since filing (§3.4 "undisputed challenge →
     ///         slash auto-executes after a delay"). See `MIN_AUTO_SLASH_DELAY`
@@ -201,7 +277,11 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///         mistake — which no path ever spends. Note that a PARTIAL pool
     ///         counts here exactly like a complete one: the contributions are
     ///         held, and every terminal path either refunds them, forfeits them
-    ///         or splits them, so the decrement is always `bond + pool`.
+    ///         or splits them, so the decrement is always `bond + pool`. The
+    ///         BURNED slice is no exception: it is part of the challenger's
+    ///         bond, it leaves the contract like any other payout, and it leaves
+    ///         this counter with it — `bond + pool` still describes the whole
+    ///         decrement, and custody still lands back on `bondedWood` after.
     uint256 public bondedWood;
 
     uint256 public challengeCount;
@@ -574,12 +654,36 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      whoever actually bought the escalation that produced it, in the
     ///      proportion they bought it.
     ///
+    ///      A SLICE OF THE FORFEIT IS BURNED FIRST (`forfeitBurnBps`), and only
+    ///      the remainder is split. The reason is that the two sides of this
+    ///      trade need not be two parties: an approver can challenge its own
+    ///      proposal and then fund the whole counter-bond itself, so a forfeit
+    ///      paid perfectly to contributors is paid straight back to the
+    ///      challenger. Burning is the only sink that is not a round trip for
+    ///      somebody who controls both sides — see `forfeitBurnBps` for the full
+    ///      argument and `BURN_ADDRESS` for why "burn" means a dead address.
+    ///      The burn comes off the TOP, before the pro-rata pass, so it changes
+    ///      the size of the pot and nothing about how it is keyed: a
+    ///      non-contributing approver still collects zero.
+    ///
     ///      ENTRY IS ONLY EVER FROM `Disputed` — `resolve` sends `Filed` to
     ///      `_settle`, and `rule` demands `Disputed` — so the pool is complete
     ///      and the contributor list is non-empty. The empty-list branch below is
     ///      defensive only, and it no longer depends on the ledger at all: the
     ///      payout set is this contract's own state, so a rewired ledger cannot
     ///      strand the bond here the way it once could.
+    ///
+    ///      THAT BRANCH DELIBERATELY DOES NOT BURN. It is not the failure path
+    ///      with nobody to pay — it is the path where NO DEFENCE WAS EVER
+    ///      BOUGHT, so there is no forfeit to take a slice of: the bond is
+    ///      returned to the challenger intact, exactly as it was before this
+    ///      parameter existed. Burning there would destroy a bond that is being
+    ///      handed BACK, punishing a challenger for a resolution nobody
+    ///      contested, and it would price nothing — the self-challenge attack
+    ///      cannot reach it, because completing the pool is what produces
+    ///      `Disputed` in the first place, and completing the pool means at
+    ///      least one contributor. `ChallengeFailed` reports `(0, 0)` there:
+    ///      nothing forfeited, nothing burned.
     ///
     ///      ACCEPTED COST, now scoped to an UNWIRED game (`court == address(0)`):
     ///      with no adjudicator, a genuinely guilty approver can still dispute
@@ -608,9 +712,22 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         // the reachable states again — the hazard this file has now hit twice.
         if (n == 0) {
             wood.safeTransfer(challenger, bond);
-            emit ChallengeFailed(challengeId, 0);
+            emit ChallengeFailed(challengeId, 0, 0);
             return;
         }
+
+        // The burn is taken off the top and the REMAINDER is what the funders
+        // split, so `burnAmount + sum(winnings) == bond` exactly: the pro-rata
+        // pass below is keyed to `payout`, not to `bond`, and its last recipient
+        // absorbs the rounding remainder of `payout` rather than of the bond.
+        // Integer division makes `burnAmount <= bond`, so `payout` cannot
+        // underflow, and a `forfeitBurnBps` of zero reproduces the pre-burn
+        // behaviour to the wei.
+        uint256 burnAmount = (bond * forfeitBurnBps) / BPS_DENOMINATOR;
+        uint256 payout = bond - burnAmount;
+        // Skipped when the parameter is zero: a zero-value transfer would only
+        // emit a misleading `Transfer` to the dead address.
+        if (burnAmount != 0) wood.safeTransfer(BURN_ADDRESS, burnAmount);
 
         // §3.4: "failed challenge → challenger bond forfeits to the accused" —
         // to the ones that funded the defence, pro-rata to what each put in. The
@@ -622,11 +739,11 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         for (uint256 i = 0; i <= last; i++) {
             address contributor = list[i];
             uint256 contributed = _contributed[challengeId][contributor];
-            uint256 winnings = i == last ? bond - distributed : (bond * contributed) / pool;
+            uint256 winnings = i == last ? payout - distributed : (payout * contributed) / pool;
             distributed += winnings;
             wood.safeTransfer(contributor, contributed + winnings);
         }
-        emit ChallengeFailed(challengeId, bond);
+        emit ChallengeFailed(challengeId, bond, burnAmount);
     }
 
     /// @dev The accused set: the ledger's covering approvers, filtered to those
@@ -723,6 +840,20 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         if (newBps == 0 || newBps > BPS_DENOMINATOR) revert InvalidParameter();
         emit ChallengerBondBpsSet(challengerBondBps, newBps);
         challengerBondBps = newBps;
+    }
+
+    /// @dev Bounded [0, `MAX_FORFEIT_BURN_BPS`]. ZERO IS ALLOWED, unlike
+    ///      `setChallengerBondBps` where it would make the freeze free: zero
+    ///      here restores the pre-burn behaviour — the whole forfeit paid to the
+    ///      funders — which is a coherent (if exploitable) configuration and the
+    ///      off-switch if the burn is ever shown to deter honest defences more
+    ///      than it deters self-challenges. The ceiling is justified at the
+    ///      constant: it keeps an honest defender's share the larger one and
+    ///      bounds what a captured owner can destroy per failed challenge.
+    function setForfeitBurnBps(uint256 newBps) external onlyOwner {
+        if (newBps > MAX_FORFEIT_BURN_BPS) revert InvalidParameter();
+        emit ForfeitBurnBpsSet(forfeitBurnBps, newBps);
+        forfeitBurnBps = newBps;
     }
 
     function setStakedWood(address stakedWood_) external onlyOwner {

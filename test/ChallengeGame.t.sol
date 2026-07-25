@@ -711,6 +711,12 @@ contract ChallengeGameTest is Test {
     ///         guardianA funds the whole pool alone, so it takes the whole
     ///         forfeit and guardianB — an accused approver that sat the defence
     ///         out — is paid nothing at all.
+    /// @dev    CHANGED AGAIN BY THE FORFEIT BURN. guardianA still takes the
+    ///         entire DISTRIBUTED forfeit, but that is now 80% of the bond: the
+    ///         other 20% is destroyed, because a forfeit paid perfectly back to
+    ///         its funder is free money whenever the funder and the challenger
+    ///         are the same operator. The challenger's side of the ledger is
+    ///         unchanged — it still loses the whole bond.
     function test_resolve_disputedPastTimeoutFailsToTheAccused() public {
         uint256 challengerBefore = wood.balanceOf(challenger); // before the bond is pulled
         uint256 id = _fileStandard(PROPOSAL); // $6,000 / $4,000 → 60/40 by COVERAGE
@@ -723,7 +729,7 @@ contract ChallengeGameTest is Test {
 
         vm.warp(filedAt + game.disputeTimeout());
         vm.expectEmit(true, true, true, true, address(game));
-        emit IChallengeGame.ChallengeFailed(id, 10_000e18);
+        emit IChallengeGame.ChallengeFailed(id, 10_000e18, 2_000e18);
         game.resolve(id);
 
         IChallengeGame.Challenge memory c = game.challengeOf(id);
@@ -732,14 +738,18 @@ contract ChallengeGameTest is Test {
         assertEq(tiers.demoteCount(), 0, "adapters demote only on a PASSED challenge");
         assertFalse(ledger.isCoverageFrozen(address(gov), PROPOSAL), "coverage released on failure");
 
-        // The challenger paid for the freeze it bought.
+        // The challenger paid for the freeze it bought — the whole bond, exactly
+        // as before the burn existed. The burn moves who RECEIVES the forfeit,
+        // never what filing costs.
         assertEq(challengerBefore - wood.balanceOf(challenger), 10_000e18, "bond forfeited in full");
-        // guardianA carried the defence alone, so it takes all of the upside:
-        // its contribution back (net 0) plus 100% of the forfeit.
-        assertEq(wood.balanceOf(guardianA) - aBefore, 10_000e18, "contribution returned plus the WHOLE forfeit");
+        // guardianA carried the defence alone, so it takes all of the DISTRIBUTED
+        // upside: its contribution back (net 0) plus 100% of the 80% that was not
+        // burned.
+        assertEq(wood.balanceOf(guardianA) - aBefore, 8_000e18, "contribution returned plus the unburned forfeit");
         assertEq(
             wood.balanceOf(guardianB) - bBefore, 0, "40% of the coverage but 0% of the defence, so 0% of the winnings"
         );
+        assertEq(wood.balanceOf(game.BURN_ADDRESS()), 2_000e18, "and 20% of the forfeit left the system entirely");
         _assertLiveBondsBacked();
     }
 
@@ -777,15 +787,19 @@ contract ChallengeGameTest is Test {
         vm.warp(vm.getBlockTimestamp() + game.disputeTimeout());
         game.resolve(id);
 
-        // Each gets its stake back plus its contribution-weighted slice.
+        // Each gets its stake back plus its contribution-weighted slice of what
+        // survives the burn. The BURN CHANGES THE POT, NOT THE KEY: the split is
+        // still `mine / pool`, applied to `bond - burn`.
+        uint256 burned = (bond * game.forfeitBurnBps()) / 10_000;
+        uint256 payout = bond - burned;
         uint256 aGain = wood.balanceOf(guardianA) - aBefore;
         uint256 bGain = wood.balanceOf(guardianB) - bBefore;
         uint256 pool = aPut + bPut; // a completed pool, i.e. the challenger's bond
-        assertEq(aGain, (bond * aPut) / pool, "the contribution key: forfeit * mine / pool");
-        assertEq(aGain, (bond * 30) / 100, "which here is 30%");
-        assertNotEq(aGain, (bond * 7_777e18) / 10_000e18, "and emphatically NOT the coverage share");
+        assertEq(aGain, (payout * aPut) / pool, "the contribution key: (forfeit - burn) * mine / pool");
+        assertEq(aGain, (payout * 30) / 100, "which here is 30%");
+        assertNotEq(aGain, (payout * 7_777e18) / 10_000e18, "and emphatically NOT the coverage share");
         assertNotEq(aGain, bGain, "unequal contributions produce an unequal split");
-        assertEq(aGain + bGain, bond, "every wei of the forfeit reaches the funders");
+        assertEq(aGain + bGain + burned, bond, "burn + distributed accounts for every wei of the forfeit");
         assertEq(wood.balanceOf(address(game)), 0, "no dust stranded in the game");
         _assertLiveBondsBacked();
     }
@@ -1326,11 +1340,283 @@ contract ChallengeGameTest is Test {
         vm.warp(vm.getBlockTimestamp() + game.disputeTimeout());
         game.resolve(id);
 
+        uint256 payout = bond - (bond * game.forfeitBurnBps()) / 10_000;
         uint256 s1Gain = wood.balanceOf(sybil1) - s1Before;
         uint256 s2Gain = wood.balanceOf(sybil2) - s2Before;
-        assertEq(s1Gain, (bond * 25) / 100, "25% of the pool bought 25% of the forfeit");
-        assertEq(s1Gain + s2Gain, bond, "the operator recovers exactly the whole forfeit, split across its identities");
+        assertEq(s1Gain, (payout * 25) / 100, "25% of the pool bought 25% of the distributed forfeit");
+        assertEq(
+            s1Gain + s2Gain, payout, "the operator recovers exactly the unburned forfeit, split across its identities"
+        );
         assertNotEq(s1Gain, s2Gain, "and not by halves");
         assertEq(wood.balanceOf(address(game)), 0, "nothing stranded");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // The forfeit burn — pricing the self-challenge
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice THE ATTACK THE BURN EXISTS FOR. Keying the forfeit to contribution
+    ///         killed free-riding and opened this: the challenger and the funder
+    ///         of the counter-bond can be the SAME operator. It files against its
+    ///         own executed proposal, funds the entire pool itself, waits out the
+    ///         timeout and — under a pure pro-rata payout — recovers its
+    ///         contribution plus 100% of its own forfeited bond. Net zero, while
+    ///         every co-approver's coverage sat frozen for a month.
+    ///
+    ///         With the burn it ends DOWN by exactly `burnAmount`, and that
+    ///         number is the price of the grief. Nothing else about its position
+    ///         changed: it still got its bond and its contribution back.
+    function test_selfChallenge_roundTripCostsExactlyTheBurn() public {
+        _setCoverage(PROPOSAL, 6_000e18, 4_000e18); // guardianA is an approver here
+        _execute(PROPOSAL);
+        uint256 attackerBefore = wood.balanceOf(guardianA);
+
+        // Step 1: the approver challenges its OWN proposal.
+        vm.prank(guardianA);
+        uint256 id =
+            game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.RogueAllowance, ADAPTER, SELECTOR, EVIDENCE);
+        uint256 bond = game.challengeOf(id).bondWood;
+        assertEq(game.challengeOf(id).challenger, guardianA, "challenger and accused are one address");
+
+        // Step 2: and funds the whole counter-bond pool itself.
+        vm.prank(guardianA);
+        game.dispute(id, type(uint256).max);
+        assertEq(game.counterBondContributionOf(id, guardianA), bond, "100% of the pool");
+
+        // Step 3: nobody rules, so it times out not guilty — the attacker's own
+        //         forfeit comes back to the only contributor, which is itself.
+        vm.warp(_filedAt(id) + game.disputeTimeout());
+        game.resolve(id);
+
+        uint256 burnAmount = (bond * game.forfeitBurnBps()) / 10_000;
+        assertGt(burnAmount, 0, "a zero burn would leave the round trip free");
+        assertEq(
+            attackerBefore - wood.balanceOf(guardianA), burnAmount, "the round trip is DOWN by exactly the burn, not 0"
+        );
+        assertEq(wood.balanceOf(game.BURN_ADDRESS()), burnAmount, "and that is where the difference went");
+        assertEq(wood.balanceOf(address(game)), 0, "nothing stranded");
+        _assertLiveBondsBacked();
+    }
+
+    /// @notice AND A TWO-ADDRESS OPERATOR IS NO BETTER OFF, which is why a
+    ///         `msg.sender != challenger` guard would have been theatre. The
+    ///         filer and the funder are different addresses here — a sender check
+    ///         passes — and the operator's COMBINED position still ends down by
+    ///         exactly the burn.
+    function test_selfChallenge_twoAddressOperatorPaysTheSameBurn() public {
+        address filer = makeAddr("attackerFiler"); // the operator's second key
+        _fund(filer);
+        _setCoverage(PROPOSAL, 6_000e18, 4_000e18); // guardianA is the funding half
+        _execute(PROPOSAL);
+
+        uint256 filerBefore = wood.balanceOf(filer);
+        uint256 funderBefore = wood.balanceOf(guardianA);
+
+        vm.prank(filer);
+        uint256 id = game.file(
+            address(gov), PROPOSAL, IChallengeGame.Predicate.ProposerLinkedOutflow, ADAPTER, SELECTOR, EVIDENCE
+        );
+        uint256 bond = game.challengeOf(id).bondWood;
+        assertNotEq(game.challengeOf(id).challenger, guardianA, "a sender check would see two unrelated parties");
+
+        vm.prank(guardianA);
+        game.dispute(id, type(uint256).max);
+
+        vm.warp(_filedAt(id) + game.disputeTimeout());
+        game.resolve(id);
+
+        uint256 burnAmount = (bond * game.forfeitBurnBps()) / 10_000;
+        uint256 combinedBefore = filerBefore + funderBefore;
+        uint256 combinedAfter = wood.balanceOf(filer) + wood.balanceOf(guardianA);
+        assertEq(combinedBefore - combinedAfter, burnAmount, "identity-splitting buys the griefer no discount");
+        assertEq(wood.balanceOf(game.BURN_ADDRESS()), burnAmount);
+        _assertLiveBondsBacked();
+    }
+
+    /// @notice THE HONEST SIDE STILL PROFITS. A guardian that correctly beat a
+    ///         bad-faith filing recovers its whole contribution plus 80% of the
+    ///         forfeited bond. That is the number the ceiling on `forfeitBurnBps`
+    ///         protects: if answering a challenge stopped paying, the counter-bond
+    ///         would stop being funded and the burn would have cured the griefing
+    ///         by killing the defence.
+    function test_resolve_honestSoleDefenderKeepsEightyPercentOfTheForfeit() public {
+        uint256 id = _fileStandard(PROPOSAL); // filed by `challenger`, not by an approver
+        uint256 bond = game.challengeOf(id).bondWood;
+        uint256 aBefore = wood.balanceOf(guardianA);
+
+        vm.prank(guardianA);
+        game.dispute(id, type(uint256).max);
+        assertEq(aBefore - wood.balanceOf(guardianA), bond, "the defender is out its whole stake while it waits");
+
+        vm.warp(_filedAt(id) + game.disputeTimeout());
+        game.resolve(id);
+
+        uint256 gain = wood.balanceOf(guardianA) - aBefore;
+        assertEq(gain, (bond * 8_000) / 10_000, "contribution back, plus 80% of the bond it defeated");
+        assertGt(gain, 0, "defending a good-faith position must still pay");
+        assertEq(wood.balanceOf(game.BURN_ADDRESS()), bond - gain, "the other 20% was destroyed, not withheld");
+    }
+
+    /// @notice THE ANTI-FREE-RIDE PROPERTY SURVIVES THE BURN. It is taken off the
+    ///         TOP, before the pro-rata pass, so it changes the size of the pot
+    ///         and nothing about its key: an accused approver that funded none of
+    ///         the defence still collects exactly zero, and the whole distributed
+    ///         forfeit lands on the one that paid.
+    function test_resolve_burnDoesNotPayNonContributors() public {
+        uint256 id = _fileStandard(PROPOSAL); // guardianA $6,000 / guardianB $4,000
+        uint256 bond = game.challengeOf(id).bondWood;
+        uint256 bBefore = wood.balanceOf(guardianB);
+        uint256 aBefore = wood.balanceOf(guardianA);
+
+        vm.prank(guardianA);
+        game.dispute(id, type(uint256).max); // guardianB sits it out entirely
+
+        vm.warp(_filedAt(id) + game.disputeTimeout());
+        game.resolve(id);
+
+        assertEq(wood.balanceOf(guardianB), bBefore, "40% of the coverage, 0% of the defence, 0% of the forfeit");
+        assertEq(game.counterBondContributionOf(id, guardianB), 0, "and it is the contribution that is zero");
+        uint256 burnAmount = (bond * game.forfeitBurnBps()) / 10_000;
+        assertEq(wood.balanceOf(guardianA) - aBefore, bond - burnAmount, "the funder takes all of what is distributed");
+    }
+
+    /// @notice WEI-EXACT: `burn + sum(distributed) == bond`, with three UNEQUAL
+    ///         contributions, a bond that is not a round number, and a burn rate
+    ///         chosen so BOTH divisions truncate. The burn is subtracted first
+    ///         and the pro-rata pass is keyed to what is left, so the last
+    ///         recipient must absorb the remainder of the PAYOUT — absorbing the
+    ///         remainder of the bond instead would over-pay by exactly the burn.
+    function test_resolve_burnPlusDistributedEqualsTheBondToTheWei() public {
+        vm.prank(owner);
+        game.setForfeitBurnBps(1_777); // deliberately not a divisor of anything here
+
+        address sybil1 = makeAddr("sybil1");
+        _fund(sybil1);
+        // $10,000.000...027 of coverage → a bond that is not a round number.
+        _setCoverage3(PROPOSAL, guardianA, 4_000e18 + 7, sybil1, 3_000e18 + 11, 3_000e18 + 9);
+        _execute(PROPOSAL);
+        vm.prank(challenger);
+        uint256 id =
+            game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.DrawdownBreach, ADAPTER, SELECTOR, EVIDENCE);
+        uint256 bond = game.challengeOf(id).bondWood;
+        assertEq(bond, 10_000e18 + 20, "an odd bond, so the rounding has somewhere to hide");
+        assertTrue((bond * 1_777) % 10_000 != 0, "and the burn itself truncates");
+
+        uint256 aBefore = wood.balanceOf(guardianA);
+        uint256 sBefore = wood.balanceOf(sybil1);
+        uint256 bBefore = wood.balanceOf(guardianB);
+
+        // Three unequal, deliberately un-round contributions. guardianB takes the
+        // clamped shortfall, so it is last in the list and absorbs the remainder.
+        uint256 aPut = 1_234e18 + 7;
+        uint256 sPut = 4_321e18 + 11;
+        vm.prank(guardianA);
+        game.dispute(id, aPut);
+        vm.prank(sybil1);
+        game.dispute(id, sPut);
+        vm.prank(guardianB);
+        game.dispute(id, type(uint256).max);
+        uint256 bPut = bond - aPut - sPut;
+        assertEq(game.counterBondContributionOf(id, guardianB), bPut, "the pool is exactly the bond");
+
+        uint256 burnAmount = (bond * 1_777) / 10_000;
+        uint256 payout = bond - burnAmount;
+        // Every floor() is short of the total, so the remainder is real: a
+        // distribution that ignored it would strand these wei in the contract.
+        assertLt(
+            (payout * aPut) / bond + (payout * sPut) / bond + (payout * bPut) / bond,
+            payout,
+            "flooring genuinely loses wei here"
+        );
+
+        vm.warp(_filedAt(id) + game.disputeTimeout());
+        game.resolve(id);
+
+        uint256 aGain = wood.balanceOf(guardianA) - aBefore;
+        uint256 sGain = wood.balanceOf(sybil1) - sBefore;
+        uint256 bGain = wood.balanceOf(guardianB) - bBefore;
+        assertEq(aGain, (payout * aPut) / bond, "pro-rata on the PAYOUT, not on the bond");
+        assertEq(sGain, (payout * sPut) / bond);
+        assertEq(bGain, payout - aGain - sGain, "the last funder absorbs the remainder");
+        assertEq(aGain + sGain + bGain + burnAmount, bond, "burn + distributed == bond, to the wei");
+        assertEq(wood.balanceOf(game.BURN_ADDRESS()), burnAmount, "the dead address got exactly the burn");
+        assertEq(wood.balanceOf(address(game)), 0, "and not one wei is stranded");
+        assertEq(game.bondedWood(), 0, "burned WOOD left the accounting with the contract");
+        _assertLiveBondsBacked();
+    }
+
+    /// @notice `forfeitBurnBps == 0` reproduces the pre-burn behaviour exactly:
+    ///         the whole forfeit reaches the funders and the dead address is
+    ///         never touched. This is the off-switch, and it is why zero is a
+    ///         legal setting here where it is not for `challengerBondBps`.
+    function test_resolve_zeroBurnBpsDistributesTheWholeBond() public {
+        vm.prank(owner);
+        game.setForfeitBurnBps(0);
+
+        uint256 id = _fileStandard(PROPOSAL);
+        uint256 bond = game.challengeOf(id).bondWood;
+        uint256 aBefore = wood.balanceOf(guardianA);
+        vm.prank(guardianA);
+        game.dispute(id, type(uint256).max);
+
+        vm.warp(_filedAt(id) + game.disputeTimeout());
+        game.resolve(id);
+
+        assertEq(wood.balanceOf(guardianA) - aBefore, bond, "the entire forfeit, exactly as before the burn existed");
+        assertEq(wood.balanceOf(game.BURN_ADDRESS()), 0, "and nothing was sent to the dead address at all");
+        assertEq(wood.balanceOf(address(game)), 0, "nothing stranded");
+        _assertLiveBondsBacked();
+    }
+
+    /// @notice The winning path is UNTOUCHED by the burn: a guilty ruling still
+    ///         pays the challenger its bond back plus the whole pool. The burn
+    ///         prices a round trip that only exists on the failure path, where
+    ///         the forfeit flows back toward the side that posted it.
+    function test_rule_guiltyPathBurnsNothing() public {
+        uint256 id = _fileAndDispute();
+        uint256 bond = game.challengeOf(id).bondWood;
+        uint256 pool = game.challengeOf(id).counterBondWood;
+        uint256 challengerBefore = wood.balanceOf(challenger);
+
+        vm.prank(court);
+        game.rule(id, true);
+
+        assertEq(wood.balanceOf(challenger) - challengerBefore, bond + pool, "bond back plus the WHOLE pool");
+        assertEq(wood.balanceOf(game.BURN_ADDRESS()), 0, "a settled challenge burns nothing");
+        assertEq(wood.balanceOf(address(game)), 0, "nothing stranded");
+    }
+
+    // ── The parameter ──
+
+    function test_forfeitBurnBps_defaultIsTwentyPercent() public view {
+        assertEq(game.forfeitBurnBps(), 2_000);
+        assertEq(game.BURN_ADDRESS(), 0x000000000000000000000000000000000000dEaD, "the conventional dead address");
+    }
+
+    function test_setForfeitBurnBps_onlyOwner() public {
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(this)));
+        game.setForfeitBurnBps(1_000);
+    }
+
+    /// @notice Bounded [0, 5_000]. ZERO IS LEGAL — it is the off-switch, not a
+    ///         broken state — and the ceiling keeps an honest defender's share
+    ///         the larger one, which is what stops the cure for griefing from
+    ///         killing the defence it is meant to protect.
+    function test_setForfeitBurnBps_bounded() public {
+        vm.startPrank(owner);
+        vm.expectRevert(IChallengeGame.InvalidParameter.selector);
+        game.setForfeitBurnBps(5_001); // more than half the forfeit destroyed
+        game.setForfeitBurnBps(5_000); // the ceiling itself is allowed
+        assertEq(game.forfeitBurnBps(), 5_000);
+        game.setForfeitBurnBps(0); // and so is switching it off entirely
+        assertEq(game.forfeitBurnBps(), 0);
+        vm.stopPrank();
+    }
+
+    function test_setForfeitBurnBps_emits() public {
+        vm.expectEmit(true, true, true, true, address(game));
+        emit IChallengeGame.ForfeitBurnBpsSet(2_000, 3_500);
+        vm.prank(owner);
+        game.setForfeitBurnBps(3_500);
     }
 }

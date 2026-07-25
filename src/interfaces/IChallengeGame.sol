@@ -116,7 +116,15 @@ interface IChallengeGame {
     ///      `CounterBondContributed` log that precedes this one.
     event ChallengeDisputed(uint256 indexed challengeId, uint256 counterBondWood);
     event ChallengeSettled(uint256 indexed challengeId, uint256 slashedWood, uint256 caseId);
-    event ChallengeFailed(uint256 indexed challengeId, uint256 forfeitedWood);
+    /// @param forfeitedWood What the CHALLENGER lost — its whole bond on the
+    ///        normal failure path, and zero on the defensive no-contributor
+    ///        branch where the bond is handed back instead.
+    /// @param burnedWood The slice of that forfeit destroyed rather than paid
+    ///        out (`forfeitBurnBps`). The contributors therefore share
+    ///        `forfeitedWood - burnedWood`; the two are reported separately
+    ///        because they answer different questions — what filing cost, and
+    ///        what the defence actually collected.
+    event ChallengeFailed(uint256 indexed challengeId, uint256 forfeitedWood, uint256 burnedWood);
     /// @dev Emitted BEFORE the settle/fail it causes, so an indexer reading the
     ///      log in order sees the verdict and then the accounting it produced.
     event ChallengeRuled(uint256 indexed challengeId, bool guilty);
@@ -126,6 +134,7 @@ interface IChallengeGame {
     event StakedWoodSet(address indexed oldStakedWood, address indexed newStakedWood);
     event ChallengeWindowSet(uint256 oldWindow, uint256 newWindow);
     event ChallengerBondBpsSet(uint256 oldBps, uint256 newBps);
+    event ForfeitBurnBpsSet(uint256 oldBps, uint256 newBps);
     event AutoSlashDelaySet(uint256 oldDelay, uint256 newDelay);
     event DisputeTimeoutSet(uint256 oldTimeout, uint256 newTimeout);
 
@@ -231,6 +240,15 @@ interface IChallengeGame {
     function challengeCount() external view returns (uint256);
     function challengeWindow() external view returns (uint256);
     function challengerBondBps() external view returns (uint256);
+    /// @notice The slice of a FAILED challenge's forfeited bond that is
+    ///         destroyed instead of being paid to the counter-bond's funders,
+    ///         in bps. It exists because the accused side can be the challenger:
+    ///         one operator can file against its own proposal and fund the whole
+    ///         counter-bond pool, and a forfeit paid entirely to contributors
+    ///         then returns to the address that posted it, making the whole
+    ///         round trip free. Burning is the only sink with no beneficiary the
+    ///         attacker can reach — see `ChallengeGame.BURN_ADDRESS`.
+    function forfeitBurnBps() external view returns (uint256);
     function autoSlashDelay() external view returns (uint256);
     function disputeTimeout() external view returns (uint256);
     /// @notice WOOD the game holds on behalf of live (`Filed`/`Disputed`)
@@ -254,6 +272,13 @@ interface IChallengeGame {
     function setStakedWood(address stakedWood_) external;
     function setChallengeWindow(uint256 newWindow) external;
     function setChallengerBondBps(uint256 newBps) external;
+    /// @notice Set the burned slice of a failed challenge's forfeit. Bounded by
+    ///         a ceiling well below the whole bond, and ZERO IS PERMITTED —
+    ///         unlike `setChallengerBondBps`, where zero would make the freeze
+    ///         free. Zero here only restores the pre-burn behaviour (the entire
+    ///         forfeit paid to the funders) and re-opens the self-challenge
+    ///         round trip; it is a governance off-switch, not a broken state.
+    function setForfeitBurnBps(uint256 newBps) external;
     function setAutoSlashDelay(uint256 newDelay) external;
     function setDisputeTimeout(uint256 newTimeout) external;
 }
