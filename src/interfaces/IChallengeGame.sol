@@ -44,11 +44,14 @@ interface IChallengeGame {
     /// @param frozenCoverageUsd The coverage this challenge pinned, in USD-18,
     ///        snapshotted at filing. The bond was sized against it, and it is
     ///        what the eventual verdict is worth.
-    /// @param disputer The accused approver that posted the counter-bond, or
-    ///        the zero address while nobody has contested. Recorded because the
-    ///        counter-bond is returned to WHOEVER posted it on the timeout path
-    ///        (D5) — it is not the challenger's to forfeit and not the accused
-    ///        set's to share.
+    /// @param counterBondWood The counter-bond POOL raised so far, summed over
+    ///        every accused approver that has contributed. There is deliberately
+    ///        NO single `disputer` field any more: the defence is bought
+    ///        collectively, so the payer set is a list
+    ///        (`counterBondContributors`) rather than one address. `Filed`
+    ///        implies this is strictly below `bondWood`; `Disputed` implies it
+    ///        is exactly `bondWood`, because the status flips in the very call
+    ///        that completes the pool.
     /// @param adapterTarget The adapter the challenger accuses, demoted on a
     ///        passed challenge (§3.4). The zero address means the filing
     ///        accuses no adapter — see `file`.
@@ -63,7 +66,6 @@ interface IChallengeGame {
         Status status;
         uint256 filedAt;
         uint256 frozenCoverageUsd;
-        address disputer;
         address adapterTarget;
         bytes4 adapterSelector;
     }
@@ -78,6 +80,11 @@ interface IChallengeGame {
     error NotAccusedApprover();
     error ZeroAddress();
     error InvalidParameter();
+    /// @notice A counter-bond contribution that would move nothing — a zero
+    ///         `amountWood`. The pool being already full cannot reach this: the
+    ///         completing contribution flips the status to `Disputed`, so a later
+    ///         caller is rejected by `WrongStatus` first.
+    error NothingToContribute();
     /// @notice `rule` called by anything other than the wired court (§3.5).
     /// @dev    Also what an UNWIRED game reverts with, since `court` is then the
     ///         zero address and no caller can match it — Plan D's timeout stays
@@ -97,7 +104,17 @@ interface IChallengeGame {
         uint256 bondWood,
         string evidenceURI
     );
-    event ChallengeDisputed(uint256 indexed challengeId, address indexed disputer, uint256 counterBondWood);
+    /// @dev One per contributing approver, so the payer set — and therefore the
+    ///      pro-rata split a failed challenge pays out — is reconstructible from
+    ///      the log alone.
+    event CounterBondContributed(
+        uint256 indexed challengeId, address indexed contributor, uint256 amountWood, uint256 poolWood
+    );
+    /// @dev Emitted ONCE, by the contribution that completes the pool — the
+    ///      instant the escalation is actually bought. It carries no `disputer`:
+    ///      the defence is collective, and who paid what is in the
+    ///      `CounterBondContributed` log that precedes this one.
+    event ChallengeDisputed(uint256 indexed challengeId, uint256 counterBondWood);
     event ChallengeSettled(uint256 indexed challengeId, uint256 slashedWood, uint256 caseId);
     event ChallengeFailed(uint256 indexed challengeId, uint256 forfeitedWood);
     /// @dev Emitted BEFORE the settle/fail it causes, so an indexer reading the
@@ -147,14 +164,30 @@ interface IChallengeGame {
     ) external returns (uint256 challengeId);
 
     // ── Dispute / resolution ──
-    /// @notice Contest a filed challenge by matching the challenger's bond.
-    ///         Callable only by an accused approver of the challenged proposal,
-    ///         and only strictly before `filedAt + autoSlashDelay` — at that
-    ///         instant the silence verdict is already final (D1).
-    /// @dev    Stops the auto-slash clock and escalates to the court (§3.5).
-    ///         The court does not exist yet, so `resolve` times the escalation
-    ///         out in favour of the accused after `disputeTimeout` (D5).
-    function dispute(uint256 challengeId) external;
+    /// @notice Contribute to the counter-bond POOL of a filed challenge. The
+    ///         pool's target is the challenger's own bond; the challenge becomes
+    ///         `Disputed` — stopping the auto-slash clock and escalating to the
+    ///         court (§3.5) — the moment the pool reaches it.
+    /// @param  challengeId The filed challenge to defend.
+    /// @param  amountWood  WOOD to contribute. CLAMPED to the shortfall, so an
+    ///                     over-sized amount (`type(uint256).max` is the idiom
+    ///                     for "whatever is left") pulls only what the pool still
+    ///                     needs. Nobody can overpay, so no refund-of-excess path
+    ///                     exists to get wrong.
+    /// @dev    THE BILL IS SHARED, THE PRICE IS NOT. The target stays pinned to
+    ///         the challenger's bond rather than being scaled to the caller's own
+    ///         share, and that is the whole design constraint: the accused side
+    ///         picks who disputes, so any rule keyed to the DISPUTER's share
+    ///         would just be answered by nominating — or manufacturing — the
+    ///         smallest identity. Splitting one operator into two guardians
+    ///         therefore changes who pays, never how much.
+    /// @dev    Callable only by an accused approver (non-zero committed share) of
+    ///         the challenged proposal — the accused buy their own escalation,
+    ///         and it is what bounds the contributor list. Only strictly before
+    ///         `filedAt + autoSlashDelay`, the same instant `resolve` starts
+    ///         settling an undisputed challenge: at that second the silence
+    ///         verdict is already final (D1) and there is nothing left to buy.
+    function dispute(uint256 challengeId, uint256 amountWood) external;
 
     /// @notice Permissionless resolution. From `Filed` past `autoSlashDelay` the
     ///         silence is the verdict and the accused are slashed into the
@@ -183,6 +216,15 @@ interface IChallengeGame {
 
     // ── Views ──
     function challengeOf(uint256 challengeId) external view returns (Challenge memory);
+    /// @notice Everyone that has put WOOD into a challenge's counter-bond pool,
+    ///         in first-contribution order and without duplicates. This is the
+    ///         payout set on the failure path — a failed challenge's forfeited
+    ///         bond splits pro-rata across THIS list, not across the accused set.
+    function counterBondContributors(uint256 challengeId) external view returns (address[] memory);
+    /// @notice What one address has contributed to a challenge's counter-bond
+    ///         pool. Retained after resolution, so the split a terminal challenge
+    ///         paid out stays auditable on-chain.
+    function counterBondContributionOf(uint256 challengeId, address contributor) external view returns (uint256);
     /// @notice The id of the LIVE (`Filed`/`Disputed`) challenge against a
     ///         proposal, or zero when none is live.
     function liveChallengeOf(address governor, uint256 proposalId) external view returns (uint256);

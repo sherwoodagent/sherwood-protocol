@@ -618,14 +618,16 @@ contract ChallengeGameTest is Test {
         uint256 guardianBefore = wood.balanceOf(guardianA);
 
         vm.expectEmit(true, true, true, true, address(game));
-        emit IChallengeGame.ChallengeDisputed(id, guardianA, 10_000e18);
+        emit IChallengeGame.CounterBondContributed(id, guardianA, 10_000e18, 10_000e18);
+        vm.expectEmit(true, true, true, true, address(game));
+        emit IChallengeGame.ChallengeDisputed(id, 10_000e18);
         vm.prank(guardianA);
-        game.dispute(id);
+        game.dispute(id, type(uint256).max);
 
         IChallengeGame.Challenge memory c = game.challengeOf(id);
         assertEq(uint8(c.status), uint8(IChallengeGame.Status.Disputed));
-        assertEq(c.counterBondWood, c.bondWood, "the counter-bond matches the challenger's");
-        assertEq(c.disputer, guardianA);
+        assertEq(c.counterBondWood, c.bondWood, "the pool matches the challenger's bond");
+        assertEq(game.counterBondContributionOf(id, guardianA), 10_000e18, "and guardianA funded all of it");
         assertEq(guardianBefore - wood.balanceOf(guardianA), 10_000e18, "counter-bond pulled");
         _assertLiveBondsBacked();
 
@@ -648,14 +650,14 @@ contract ChallengeGameTest is Test {
         uint256 id = _fileStandard(PROPOSAL);
         vm.prank(challenger);
         vm.expectRevert(IChallengeGame.NotAccusedApprover.selector);
-        game.dispute(id);
+        game.dispute(id, type(uint256).max);
 
         address stranger = makeAddr("stranger");
         wood.mint(stranger, 1_000_000e18);
         vm.startPrank(stranger);
         wood.approve(address(game), type(uint256).max);
         vm.expectRevert(IChallengeGame.NotAccusedApprover.selector);
-        game.dispute(id);
+        game.dispute(id, type(uint256).max);
         vm.stopPrank();
     }
 
@@ -670,7 +672,7 @@ contract ChallengeGameTest is Test {
 
         vm.prank(guardianB);
         vm.expectRevert(IChallengeGame.NotAccusedApprover.selector);
-        game.dispute(id);
+        game.dispute(id, type(uint256).max);
     }
 
     /// @notice The dispute window closes exactly where the auto-slash opens —
@@ -683,34 +685,41 @@ contract ChallengeGameTest is Test {
         vm.warp(filedAt + game.autoSlashDelay());
         vm.prank(guardianA);
         vm.expectRevert(IChallengeGame.WindowClosed.selector);
-        game.dispute(id);
+        game.dispute(id, type(uint256).max);
     }
 
     function test_dispute_revertsWhenNotFiled() public {
         uint256 id = _fileStandard(PROPOSAL);
         vm.prank(guardianA);
-        game.dispute(id);
+        game.dispute(id, type(uint256).max);
 
         vm.prank(guardianB);
         vm.expectRevert(IChallengeGame.WrongStatus.selector);
-        game.dispute(id); // already disputed — one counter-bond settles it
+        game.dispute(id, type(uint256).max); // already disputed — one counter-bond settles it
     }
 
     // ── Disputed → timeout → fail (D5) ──
 
     /// @notice D5: no court exists to rule, so a contested challenge fails SAFE
     ///         after `disputeTimeout`. The challenger's bond forfeits to the
-    ///         accused pro-rata to what each committed, and the counter-bond
-    ///         goes back to whoever posted it.
+    ///         guardians that FUNDED THE DEFENCE, and their contributions come
+    ///         back.
+    /// @dev    CHANGED WITH THE POOLED COUNTER-BOND. This used to assert a 60/40
+    ///         split by committed coverage, paying guardianB 40% of the forfeit
+    ///         despite guardianB never putting up a wei. That is exactly the
+    ///         free-ride the split is now keyed to contribution to kill: here
+    ///         guardianA funds the whole pool alone, so it takes the whole
+    ///         forfeit and guardianB — an accused approver that sat the defence
+    ///         out — is paid nothing at all.
     function test_resolve_disputedPastTimeoutFailsToTheAccused() public {
         uint256 challengerBefore = wood.balanceOf(challenger); // before the bond is pulled
-        uint256 id = _fileStandard(PROPOSAL); // $6,000 / $4,000 → 60/40
+        uint256 id = _fileStandard(PROPOSAL); // $6,000 / $4,000 → 60/40 by COVERAGE
         uint256 filedAt = _filedAt(id);
         uint256 aBefore = wood.balanceOf(guardianA);
         uint256 bBefore = wood.balanceOf(guardianB);
 
         vm.prank(guardianA);
-        game.dispute(id);
+        game.dispute(id, type(uint256).max);
 
         vm.warp(filedAt + game.disputeTimeout());
         vm.expectEmit(true, true, true, true, address(game));
@@ -725,16 +734,22 @@ contract ChallengeGameTest is Test {
 
         // The challenger paid for the freeze it bought.
         assertEq(challengerBefore - wood.balanceOf(challenger), 10_000e18, "bond forfeited in full");
-        // guardianA: counter-bond back (net 0) plus 60% of the forfeit.
-        assertEq(wood.balanceOf(guardianA) - aBefore, 6_000e18, "60% of the forfeit, counter-bond returned");
-        assertEq(wood.balanceOf(guardianB) - bBefore, 4_000e18, "40% of the forfeit");
+        // guardianA carried the defence alone, so it takes all of the upside:
+        // its contribution back (net 0) plus 100% of the forfeit.
+        assertEq(wood.balanceOf(guardianA) - aBefore, 10_000e18, "contribution returned plus the WHOLE forfeit");
+        assertEq(
+            wood.balanceOf(guardianB) - bBefore, 0, "40% of the coverage but 0% of the defence, so 0% of the winnings"
+        );
         _assertLiveBondsBacked();
     }
 
-    /// @notice The forfeit is pro-rata to committed shares, not per-capita: a
-    ///         guardian that backed more of the proposal is compensated more for
-    ///         having been accused of it.
-    function test_resolve_forfeitIsProRataAndLeavesNoDust() public {
+    /// @notice THE ANTI-FREE-RIDE SPLIT. The forfeit is pro-rata to what each
+    ///         guardian CONTRIBUTED to the counter-bond, not to what it covered.
+    ///         The two shares are deliberately unequal AND deliberately inverted
+    ///         against the coverage weights, so the assertion can only pass on
+    ///         the contribution key: guardianA covers 77.77% but funds 30% of the
+    ///         defence, and takes 30% of the winnings.
+    function test_resolve_forfeitIsProRataToContributionAndLeavesNoDust() public {
         _setCoverage(PROPOSAL, 7_777e18, 2_223e18);
         _execute(PROPOSAL);
         vm.prank(challenger);
@@ -745,16 +760,34 @@ contract ChallengeGameTest is Test {
         uint256 aBefore = wood.balanceOf(guardianA);
         uint256 bBefore = wood.balanceOf(guardianB);
 
+        // 30 / 70 of the pool, against 77.77 / 22.23 of the coverage.
+        uint256 aPut = (bond * 30) / 100;
+        vm.prank(guardianA);
+        game.dispute(id, aPut);
+        assertEq(
+            uint8(game.challengeOf(id).status),
+            uint8(IChallengeGame.Status.Filed),
+            "a part-funded pool is not a dispute"
+        );
         vm.prank(guardianB);
-        game.dispute(id);
+        game.dispute(id, type(uint256).max); // takes the 70% shortfall
+        uint256 bPut = bond - aPut;
+        assertEq(game.counterBondContributionOf(id, guardianB), bPut);
+
         vm.warp(vm.getBlockTimestamp() + game.disputeTimeout());
         game.resolve(id);
 
+        // Each gets its stake back plus its contribution-weighted slice.
         uint256 aGain = wood.balanceOf(guardianA) - aBefore;
         uint256 bGain = wood.balanceOf(guardianB) - bBefore;
-        assertEq(aGain, (bond * 7_777e18) / 10_000e18, "pro-rata to the committed share");
-        assertEq(aGain + bGain, bond, "every wei of the forfeit reaches the accused");
+        uint256 pool = aPut + bPut; // a completed pool, i.e. the challenger's bond
+        assertEq(aGain, (bond * aPut) / pool, "the contribution key: forfeit * mine / pool");
+        assertEq(aGain, (bond * 30) / 100, "which here is 30%");
+        assertNotEq(aGain, (bond * 7_777e18) / 10_000e18, "and emphatically NOT the coverage share");
+        assertNotEq(aGain, bGain, "unequal contributions produce an unequal split");
+        assertEq(aGain + bGain, bond, "every wei of the forfeit reaches the funders");
         assertEq(wood.balanceOf(address(game)), 0, "no dust stranded in the game");
+        _assertLiveBondsBacked();
     }
 
     // ── Coverage is released on BOTH terminal paths ──
@@ -776,7 +809,7 @@ contract ChallengeGameTest is Test {
         vm.expectRevert(MockChallengeLedger.CoverageFrozen.selector);
         ledger.releaseApproval(address(gov), 2, guardianA);
         vm.prank(guardianA);
-        game.dispute(failed);
+        game.dispute(failed, type(uint256).max);
         vm.warp(vm.getBlockTimestamp() + game.disputeTimeout());
         game.resolve(failed);
         ledger.releaseApproval(address(gov), 2, guardianA);
@@ -789,7 +822,7 @@ contract ChallengeGameTest is Test {
         game.setChallengeWindow(90 days); // outlive the dispute timeout
         uint256 id = _fileStandard(PROPOSAL);
         vm.prank(guardianA);
-        game.dispute(id);
+        game.dispute(id, type(uint256).max);
         vm.warp(vm.getBlockTimestamp() + game.disputeTimeout());
         game.resolve(id);
 
@@ -801,12 +834,13 @@ contract ChallengeGameTest is Test {
 
     // ── The detector incentive is off-chain ──
 
-    /// @notice A WINNING challenger is paid its bond back and NOTHING else. The
-    ///         first-detector bounty is a protocol bug-bounty program keyed off
-    ///         `ChallengeFiled`/`ChallengeSettled`, not an on-chain payout —
-    ///         forensic cost runs from minutes to days, and no constant in the
-    ///         contract could be "sized to cover" it. So the on-chain payoff of
-    ///         a successful filing is exactly break-even, and this pins it.
+    /// @notice AN UNCONTESTED win pays the challenger its bond back and nothing
+    ///         else, because there is nothing else to pay it FROM: no guardian
+    ///         funded a counter-bond, so no pool exists to forfeit. The
+    ///         challenger's upside comes strictly out of the accused side's own
+    ///         stake — never out of protocol funds, and never out of WOOD sitting
+    ///         on this contract. That is what the stray-WOOD assertion below
+    ///         pins: there is no bounty pot here, and no path invents one.
     function test_resolve_returnsBondAndPaysNoBounty() public {
         // WOOD sitting on the game beyond its live bonds is NOT a bounty pot:
         // no path spends it, so it is still here, untouched, afterwards.
@@ -843,7 +877,7 @@ contract ChallengeGameTest is Test {
         uint256 id = _fileStandard(PROPOSAL);
         uint256 before = wood.balanceOf(challenger);
         vm.prank(guardianA);
-        game.dispute(id);
+        game.dispute(id, type(uint256).max);
         vm.warp(vm.getBlockTimestamp() + game.disputeTimeout());
         game.resolve(id);
 
@@ -934,7 +968,7 @@ contract ChallengeGameTest is Test {
         for (uint256 i = 0; i < 3; i++) {
             if ((disputeMask >> i) & 1 == 1) {
                 vm.prank(guardianA);
-                game.dispute(ids[i]);
+                game.dispute(ids[i], type(uint256).max);
                 _assertLiveBondsBacked();
             }
         }
@@ -968,7 +1002,7 @@ contract ChallengeGameTest is Test {
     function _fileAndDispute() internal returns (uint256 id) {
         id = _fileStandard(PROPOSAL);
         vm.prank(guardianA);
-        game.dispute(id);
+        game.dispute(id, type(uint256).max);
     }
 
     function test_rule_onlyCourt() public {
@@ -1028,23 +1062,20 @@ contract ChallengeGameTest is Test {
         assertEq(uint256(game.challengeOf(id).status), uint256(IChallengeGame.Status.Failed));
     }
 
-    /// @notice THE COUNTER-BOND ON THE GUILTY PATH. Plan D could only reach
-    ///         `_settle` from `Filed`, where `counterBondWood` is always zero, so
-    ///         it neither released the counter-bond nor discounted it from
-    ///         `bondedWood`. A court ruling reaches `_settle` from `Disputed`,
-    ///         where it is NOT zero — left unhandled, the disputer's WOOD would
-    ///         be stranded in the game forever and `bondedWood` would over-report
-    ///         live custody for good, breaking the §4 invariant this suite pins.
-    ///         The counter-bond is "the price of the escalation, not a stake on
-    ///         its outcome" (Plan D's own rule on the timeout path), and the
-    ///         contract's stated payoff — "a successful challenger ONLY gets its
-    ///         bond back" — forbids routing it to the challenger. So it returns
-    ///         to whoever posted it on this path too; the disputer's real loss is
-    ///         the slash the guilty verdict just executed.
-    function test_rule_guiltyReturnsCounterBondAndClearsAccounting() public {
+    /// @notice THE COUNTER-BOND FORFEITS TO THE CHALLENGER ON A GUILTY VERDICT.
+    ///         This is the on-chain detector incentive, and it REVERSES the rule
+    ///         this test used to pin (the pool returning to whoever posted it).
+    ///         A refunded counter-bond did no work: disputing turned a certain
+    ///         slash into a delayed one with some chance the court errs, at zero
+    ///         bond cost, so a guilty approver always disputed — while a winning
+    ///         challenger got only its own bond back and so had no on-chain
+    ///         reason to do forensic work at all. Forfeited, the escalation costs
+    ///         the accused what it is worth and pays the party that was right.
+    function test_rule_guiltyForfeitsThePoolToTheChallenger() public {
         uint256 id = _fileAndDispute();
-        uint256 counterBond = game.challengeOf(id).counterBondWood;
-        assertGt(counterBond, 0, "the dispute posted a counter-bond");
+        uint256 bond = game.challengeOf(id).bondWood;
+        uint256 pool = game.challengeOf(id).counterBondWood;
+        assertEq(pool, bond, "a complete pool matches the challenger's bond");
 
         uint256 challengerBefore = wood.balanceOf(challenger);
         uint256 disputerBefore = wood.balanceOf(guardianA);
@@ -1052,9 +1083,254 @@ contract ChallengeGameTest is Test {
         vm.prank(court);
         game.rule(id, true);
 
-        assertEq(wood.balanceOf(challenger) - challengerBefore, game.challengeOf(id).bondWood, "bond returned in full");
-        assertEq(wood.balanceOf(guardianA) - disputerBefore, counterBond, "counter-bond returned to its poster");
+        assertEq(
+            wood.balanceOf(challenger) - challengerBefore, bond + pool, "its own bond back PLUS the forfeited pool"
+        );
+        assertEq(wood.balanceOf(guardianA), disputerBefore, "the accused loses the counter-bond it staked");
         _assertLiveBondsBacked();
         assertEq(wood.balanceOf(address(game)), 0, "nothing stranded once the ruling is terminal");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // The pooled counter-bond
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @dev Three covering approvers — needed for the Sybil-split comparison,
+    ///      where one operator shows up as two guardian identities.
+    function _setCoverage3(uint256 proposalId, address g0, uint256 usd0, address g1, uint256 usd1, uint256 usd2)
+        internal
+    {
+        address[] memory guardians = new address[](3);
+        uint256[] memory usd = new uint256[](3);
+        guardians[0] = g0;
+        guardians[1] = g1;
+        guardians[2] = guardianB;
+        usd[0] = usd0;
+        usd[1] = usd1;
+        usd[2] = usd2;
+        ledger.setApprovers(address(gov), proposalId, guardians, usd);
+    }
+
+    function _fund(address who) internal {
+        wood.mint(who, 10_000_000e18);
+        vm.prank(who);
+        wood.approve(address(game), type(uint256).max);
+    }
+
+    /// @notice CONTRIBUTIONS ACCUMULATE, AND THE POOL OPENS THE DISPUTE. A
+    ///         part-funded pool leaves the challenge `Filed` — the auto-slash
+    ///         clock is still running, because a partial defence is not a
+    ///         defence. The contribution that completes the pool is the one that
+    ///         flips the status, in the same call.
+    function test_dispute_poolAccumulatesAndOpensTheDisputeOnCompletion() public {
+        uint256 id = _fileStandard(PROPOSAL);
+        uint256 bond = game.challengeOf(id).bondWood;
+
+        vm.prank(guardianA);
+        game.dispute(id, 3_000e18);
+        IChallengeGame.Challenge memory mid = game.challengeOf(id);
+        assertEq(uint8(mid.status), uint8(IChallengeGame.Status.Filed), "still Filed - the pool is short");
+        assertEq(mid.counterBondWood, 3_000e18);
+        assertEq(game.bondedWood(), bond + 3_000e18, "the partial pool is custodied and accounted");
+        assertEq(wood.balanceOf(address(game)), bond + 3_000e18);
+        _assertLiveBondsBacked();
+
+        // A top-up from the SAME guardian must not append a second list entry.
+        vm.prank(guardianA);
+        game.dispute(id, 1_000e18);
+        assertEq(game.counterBondContributionOf(id, guardianA), 4_000e18, "topped up in place");
+        assertEq(game.counterBondContributors(id).length, 1, "and listed only once");
+
+        // The completing contribution flips the status.
+        vm.expectEmit(true, true, true, true, address(game));
+        emit IChallengeGame.CounterBondContributed(id, guardianB, 6_000e18, bond);
+        vm.expectEmit(true, true, true, true, address(game));
+        emit IChallengeGame.ChallengeDisputed(id, bond);
+        vm.prank(guardianB);
+        game.dispute(id, 6_000e18);
+
+        IChallengeGame.Challenge memory done = game.challengeOf(id);
+        assertEq(uint8(done.status), uint8(IChallengeGame.Status.Disputed), "the pool bought the escalation");
+        assertEq(done.counterBondWood, bond);
+        address[] memory funders = game.counterBondContributors(id);
+        assertEq(funders.length, 2);
+        assertEq(funders[0], guardianA, "first-contribution order");
+        assertEq(funders[1], guardianB);
+        _assertLiveBondsBacked();
+    }
+
+    /// @notice THE PARTIAL-POOL REFUND, which is where this design most easily
+    ///         strands funds forever. The pool never reached its target, so it
+    ///         never bought a dispute: the auto-slash clock ran out and `_settle`
+    ///         is entered from `Filed` WITH MONEY IN THE POOL — a state Plan D
+    ///         and Plan E could both assume was impossible. Those contributions
+    ///         must go back to the people who made them. Forfeiting them to the
+    ///         challenger would charge for a good never delivered; keeping them
+    ///         would break §4's custody invariant permanently.
+    function test_resolve_undisputedRefundsAPartialPool() public {
+        uint256 id = _fileStandard(PROPOSAL);
+        uint256 bond = game.challengeOf(id).bondWood;
+        uint256 aBefore = wood.balanceOf(guardianA);
+        uint256 bBefore = wood.balanceOf(guardianB);
+        uint256 challengerBefore = wood.balanceOf(challenger);
+
+        // Unequal partial contributions that together fall short of the target.
+        vm.prank(guardianA);
+        game.dispute(id, 2_500e18);
+        vm.prank(guardianB);
+        game.dispute(id, 1_500e18);
+        assertEq(game.challengeOf(id).counterBondWood, 4_000e18, "a pool short of the 10,000 target");
+        assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Filed), "so no dispute was bought");
+
+        // The clock runs out on the part-funded defence.
+        vm.warp(_filedAt(id) + game.autoSlashDelay());
+        game.resolve(id);
+
+        assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Settled), "silence was the verdict");
+        assertEq(swood.callCount(), 1, "the contributors are still slashed - the refund is not an acquittal");
+
+        // Exact balances: each contributor is made whole, to the wei.
+        assertEq(wood.balanceOf(guardianA), aBefore, "guardianA's 2,500 came back");
+        assertEq(wood.balanceOf(guardianB), bBefore, "guardianB's 1,500 came back");
+        assertEq(wood.balanceOf(challenger) - challengerBefore, bond, "the challenger gets its bond and NOT the pool");
+
+        assertEq(game.bondedWood(), 0, "nothing left accounted");
+        assertEq(wood.balanceOf(address(game)), 0, "and nothing left stranded");
+        _assertLiveBondsBacked();
+    }
+
+    /// @notice An over-sized contribution takes only the shortfall, so nobody
+    ///         can overpay and there is no refund-of-excess path to get wrong.
+    function test_dispute_overContributionTakesOnlyTheShortfall() public {
+        uint256 id = _fileStandard(PROPOSAL);
+        uint256 bond = game.challengeOf(id).bondWood;
+
+        vm.prank(guardianA);
+        game.dispute(id, 9_000e18);
+
+        uint256 bBefore = wood.balanceOf(guardianB);
+        // Asks for far more than the 1,000 still needed.
+        vm.expectEmit(true, true, true, true, address(game));
+        emit IChallengeGame.CounterBondContributed(id, guardianB, 1_000e18, bond);
+        vm.prank(guardianB);
+        game.dispute(id, 500_000e18);
+
+        assertEq(bBefore - wood.balanceOf(guardianB), 1_000e18, "only the shortfall was pulled");
+        assertEq(game.challengeOf(id).counterBondWood, bond, "the pool never exceeds its target");
+        assertEq(game.counterBondContributionOf(id, guardianB), 1_000e18);
+        _assertLiveBondsBacked();
+    }
+
+    /// @notice A zero-value contribution moves nothing and is rejected, rather
+    ///         than appending an empty entry to the contributor list.
+    function test_dispute_revertsOnAZeroContribution() public {
+        uint256 id = _fileStandard(PROPOSAL);
+        vm.prank(guardianA);
+        vm.expectRevert(IChallengeGame.NothingToContribute.selector);
+        game.dispute(id, 0);
+    }
+
+    /// @notice A PARTIAL contribution does not open a contribution window past
+    ///         the deadline: the pool is still short, the challenge is still
+    ///         `Filed`, and at `filedAt + autoSlashDelay` the silence verdict is
+    ///         already final, so no further WOOD may be added to the defence.
+    function test_dispute_revertsAfterTheDeadlineEvenWithAPartialPool() public {
+        uint256 id = _fileStandard(PROPOSAL);
+        uint256 filedAt = _filedAt(id);
+        vm.prank(guardianA);
+        game.dispute(id, 4_000e18);
+
+        vm.warp(filedAt + game.autoSlashDelay());
+        vm.prank(guardianB);
+        vm.expectRevert(IChallengeGame.WindowClosed.selector);
+        game.dispute(id, 6_000e18);
+
+        // Same for a top-up from the guardian that already paid in.
+        vm.prank(guardianA);
+        vm.expectRevert(IChallengeGame.WindowClosed.selector);
+        game.dispute(id, 6_000e18);
+    }
+
+    /// @notice SPLITTING AN IDENTITY BUYS NO DISCOUNT. This is the constraint
+    ///         that forced the target to stay pinned to the challenger's bond
+    ///         instead of being charged per-guardian by coverage share: the
+    ///         accused side picks who disputes, so any rule keyed to the payer's
+    ///         OWN share is answered by nominating — or manufacturing — the
+    ///         cheapest identity.
+    ///
+    ///         Same operator, same coverage, two shapes. Whole: one guardian
+    ///         covering $6,000. Split: two guardians covering $3,000 each, both
+    ///         contributing. The operator's total outlay is identical.
+    function test_dispute_sybilSplitPaysTheSameTotal() public {
+        // ── Shape 1: the operator is a single identity.
+        uint256 whole = _fileStandard(PROPOSAL); // guardianA $6,000 / guardianB $4,000
+        uint256 wholeBond = game.challengeOf(whole).bondWood;
+        uint256 aBefore = wood.balanceOf(guardianA);
+        vm.prank(guardianA);
+        game.dispute(whole, type(uint256).max);
+        uint256 wholeOutlay = aBefore - wood.balanceOf(guardianA);
+
+        // ── Shape 2: the SAME operator, split into two guardian identities that
+        //    together cover exactly what guardianA covered alone. Same summed
+        //    coverage overall, so the challenger's bond — and the pool target —
+        //    is the same number.
+        address sybil1 = makeAddr("sybil1");
+        address sybil2 = makeAddr("sybil2");
+        _fund(sybil1);
+        _fund(sybil2);
+        _setCoverage3(2, sybil1, 3_000e18, sybil2, 3_000e18, 4_000e18);
+        _execute(2);
+        vm.prank(challenger);
+        uint256 split =
+            game.file(address(gov), 2, IChallengeGame.Predicate.OutOfAdapterOutflow, ADAPTER, SELECTOR, EVIDENCE);
+        uint256 splitBond = game.challengeOf(split).bondWood;
+        assertEq(splitBond, wholeBond, "same summed coverage, so the same bond and the same pool target");
+
+        uint256 s1Before = wood.balanceOf(sybil1);
+        uint256 s2Before = wood.balanceOf(sybil2);
+        vm.prank(sybil1);
+        game.dispute(split, splitBond / 2);
+        vm.prank(sybil2);
+        game.dispute(split, type(uint256).max);
+
+        uint256 splitOutlay = (s1Before - wood.balanceOf(sybil1)) + (s2Before - wood.balanceOf(sybil2));
+        assertEq(uint8(game.challengeOf(split).status), uint8(IChallengeGame.Status.Disputed), "escalation bought");
+        assertEq(splitOutlay, wholeOutlay, "SPLITTING BOUGHT NO DISCOUNT - the total is invariant");
+        assertEq(splitOutlay, splitBond, "and it is still exactly the challenger's bond");
+        _assertLiveBondsBacked();
+    }
+
+    /// @notice And the split changes only WHO is repaid, never how much: on the
+    ///         failure path the two identities recover exactly what the single
+    ///         identity would have, in the proportion each put in.
+    function test_resolve_sybilSplitRecoversTheSameTotal() public {
+        address sybil1 = makeAddr("sybil1");
+        address sybil2 = makeAddr("sybil2");
+        _fund(sybil1);
+        _fund(sybil2);
+        _setCoverage3(PROPOSAL, sybil1, 3_000e18, sybil2, 3_000e18, 4_000e18);
+        _execute(PROPOSAL);
+        vm.prank(challenger);
+        uint256 id =
+            game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.RogueAllowance, ADAPTER, SELECTOR, EVIDENCE);
+        uint256 bond = game.challengeOf(id).bondWood;
+
+        uint256 s1Before = wood.balanceOf(sybil1);
+        uint256 s2Before = wood.balanceOf(sybil2);
+        // Deliberately uneven, so an equal-split bug would be visible.
+        vm.prank(sybil1);
+        game.dispute(id, (bond * 25) / 100);
+        vm.prank(sybil2);
+        game.dispute(id, type(uint256).max);
+
+        vm.warp(vm.getBlockTimestamp() + game.disputeTimeout());
+        game.resolve(id);
+
+        uint256 s1Gain = wood.balanceOf(sybil1) - s1Before;
+        uint256 s2Gain = wood.balanceOf(sybil2) - s2Before;
+        assertEq(s1Gain, (bond * 25) / 100, "25% of the pool bought 25% of the forfeit");
+        assertEq(s1Gain + s2Gain, bond, "the operator recovers exactly the whole forfeit, split across its identities");
+        assertNotEq(s1Gain, s2Gain, "and not by halves");
+        assertEq(wood.balanceOf(address(game)), 0, "nothing stranded");
     }
 }
