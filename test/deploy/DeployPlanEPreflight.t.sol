@@ -87,8 +87,13 @@ contract DeployPlanEPreflightTest is Test {
     ///      future setter regression, and a check nobody has ever seen fire is
     ///      a check nobody knows works. Read from
     ///      `forge inspect Court storage-layout`.
+    ///
+    ///      THESE MOVE WHEN `Court` GAINS STATE. `participationFloorBps` shifted
+    ///      22 -> 24 when the accused-exclusion fields landed. The assertions
+    ///      below re-read the getter after the poke precisely so a stale slot
+    ///      fails loudly here instead of silently testing nothing.
     uint256 internal constant SLOT_BAD_FAITH_WINDOW = 12;
-    uint256 internal constant SLOT_PARTICIPATION_FLOOR_BPS = 22;
+    uint256 internal constant SLOT_PARTICIPATION_FLOOR_BPS = 24;
 
     function setUp() public {
         wood = new ERC20Mock("WOOD", "WOOD", 18);
