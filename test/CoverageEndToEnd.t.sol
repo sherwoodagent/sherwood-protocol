@@ -436,13 +436,20 @@ contract CoverageEndToEndTest is Test {
 
     /// @notice Spec §3.3's core anti-batching property. ONE guardian, TWO
     ///         independent vaults/governors, two $1,000 drains. Either drain
-    ///         ALONE fits inside g1's $1,500 slashable bond — but the cap nets
-    ///         them, so approving the second while the first is still open
-    ///         reverts `ExposureCapExceeded`. Releasing the first (approve →
-    ///         block vote change) frees the budget and the very same second
-    ///         approval then succeeds, which proves the revert was the aggregate
-    ///         cap rather than some per-proposal size check.
-    function test_batchingAttack_secondApproveReverts() public {
+    ///         ALONE fits inside g1's $1,500 slashable bond — the pair does not.
+    ///
+    ///         g1 backs a proposal with a SHARE of its free budget, so the
+    ///         second approve is not rejected outright: it commits only the $500
+    ///         still available. What the cap guarantees is that g1's TOTAL
+    ///         committed exposure never exceeds its bond — so the second drain
+    ///         is left under-covered and cannot clear the execute-time quorum.
+    ///         The coalition can never get both drains executed against one bond.
+    ///
+    ///         Releasing the bookings (approve → block vote change) frees the
+    ///         budget, and re-approving the second then covers it in full —
+    ///         proving the shortfall was the shared budget and not a
+    ///         per-proposal size check.
+    function test_batchingAttack_cannotCoverTwoDrainsWithOneBond() public {
         uint256 pidA = _propose(govA, address(vaultA), agentA);
         uint256 pidB = _propose(govB, address(vaultB), agentB);
 
@@ -457,28 +464,27 @@ contract CoverageEndToEndTest is Test {
         _vote(govA, pidA, g1, IGuardianRegistry.GuardianVoteType.Approve);
         assertEq(ledger.openExposureUsd(g1), COVERAGE_USD);
 
-        // Drain #2 while #1's coverage is still open: the netting cap bites.
-        vm.prank(g1);
-        vm.expectRevert(IExposureLedger.ExposureCapExceeded.selector);
-        registry.voteOnProposal(address(govB), pidB, IGuardianRegistry.GuardianVoteType.Approve);
-
-        // The failed vote left no trace on either side.
-        assertEq(ledger.openExposureUsd(g1), COVERAGE_USD, "rejected approve booked nothing");
-        (address[] memory approversB,,) = registry.getApproverWeights(address(govB), pidB);
-        assertEq(approversB.length, 0, "drain #2 has no approver");
-
-        // ...and drain #2 was blocked ONLY because #1 was open: release #1 and
-        // the identical vote goes through.
-        _vote(govA, pidA, g1, IGuardianRegistry.GuardianVoteType.Block);
-        assertEq(ledger.openExposureUsd(g1), 0, "approve -> block releases the booking");
+        // Drain #2 while #1 is still open: only the leftover budget is committed.
         _vote(govB, pidB, g1, IGuardianRegistry.GuardianVoteType.Approve);
-        assertEq(ledger.openExposureUsd(g1), COVERAGE_USD, "drain #2 now fits");
+        assertEq(
+            ledger.openExposureUsd(g1),
+            ledger.slashableBondUsd(g1),
+            "total committed exposure pinned at the bond, never 2x the drain"
+        );
 
-        (address[] memory approversA,,) = registry.getApproverWeights(address(govA), pidA);
-        assertEq(approversA.length, 0, "drain #1 no longer has an approver");
-        (approversB,,) = registry.getApproverWeights(address(govB), pidB);
-        assertEq(approversB.length, 1);
-        assertEq(approversB[0], g1);
+        // #1 stays covered; #2 is short and cannot clear the quorum.
+        ledger.requireApproveQuorum(address(govA), pidA, address(usdg), MAX_CAPITAL);
+        vm.expectRevert(IExposureLedger.InsufficientApproveCoverage.selector);
+        ledger.requireApproveQuorum(address(govB), pidB, address(usdg), MAX_CAPITAL);
+
+        // Control: the shortfall was the SHARED budget, not drain #2 itself.
+        // Release both bookings, re-approve #2, and it covers in full.
+        _vote(govA, pidA, g1, IGuardianRegistry.GuardianVoteType.Block);
+        _vote(govB, pidB, g1, IGuardianRegistry.GuardianVoteType.Block);
+        assertEq(ledger.openExposureUsd(g1), 0, "approve -> block releases both bookings");
+        _vote(govB, pidB, g1, IGuardianRegistry.GuardianVoteType.Approve);
+        assertEq(ledger.openExposureUsd(g1), COVERAGE_USD, "drain #2 now fully covered");
+        ledger.requireApproveQuorum(address(govB), pidB, address(usdg), MAX_CAPITAL);
     }
 
     // ── 3. Cold start: a thin cohort BLOCKS execution, it does not force it ──

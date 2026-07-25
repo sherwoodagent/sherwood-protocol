@@ -209,10 +209,11 @@ contract RegistryExposureHookTest is Test {
     }
 
     function test_overCapGuardianCannotApprove() public {
-        // Crash the governance WOOD price to shrink g1's slashable bond to ~$0,
-        // so ANY nonzero coverage exceeds the cap and the approve vote reverts.
+        // Zero the governance WOOD price so g1's slashable bond — and therefore
+        // its free budget — is exactly $0. With no budget left to commit, the
+        // approve vote reverts outright rather than committing a partial share.
         vm.prank(ledgerOwner);
-        ledger.setWoodUsdPrice(1);
+        ledger.setWoodUsdPrice(0);
         vm.prank(g1);
         vm.expectRevert(IExposureLedger.ExposureCapExceeded.selector);
         wired.registry.voteOnProposal(address(wired.gov), PID, IGuardianRegistry.GuardianVoteType.Approve);

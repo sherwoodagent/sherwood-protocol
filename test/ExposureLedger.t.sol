@@ -203,12 +203,44 @@ contract ExposureLedgerTest is Test {
         assertEq(ledger.openExposureUsd(guardian), 1_000e18);
     }
 
-    function test_recordApproval_capExceededReverts() public {
+    /// @notice An under-bonded guardian is NOT rejected — it commits what its
+    ///         free budget allows and the shortfall is left to other approvers
+    ///         (or the proposal fails the execute-time quorum). Booking the full
+    ///         coverage against every approver would force each one to
+    ///         single-handedly cover the proposal, which is §3.3's per-guardian
+    ///         batching cap misapplied to a single proposal.
+    function test_recordApproval_underBondedGuardianCommitsPartialShare() public {
         _wireRecording();
-        mgov.set(6_000e6); // $6,000 > $5,000 bond
+        mgov.set(6_000e6); // $6,000 needed vs a $5,000 bond
         vm.prank(registry);
-        vm.expectRevert(IExposureLedger.ExposureCapExceeded.selector);
         ledger.recordApproval(address(mgov), 1, guardian);
+        // Commits its whole budget, not the full $6,000.
+        assertEq(ledger.openExposureUsd(guardian), 5_000e18);
+        // ...and the proposal is NOT covered: the quorum still fails.
+        vm.expectRevert(IExposureLedger.InsufficientApproveCoverage.selector);
+        ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 6_000e6);
+    }
+
+    /// @notice Two half-bonded guardians jointly cover one proposal — §3.3a's
+    ///         aggregate quorum doing what it says. Both are slashed on
+    ///         conviction, so recovery is the SUM of their bonds.
+    function test_recordApproval_twoGuardiansAggregateToCover() public {
+        _wireRecording();
+        address g2 = makeAddr("g2");
+        swood.setStake(g2, 100_000e18, 0); // $5,000 each at $0.05
+        mgov.set(8_000e6); // $8,000 needed — neither covers it alone
+
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        assertEq(ledger.openExposureUsd(guardian), 5_000e18, "first commits its full budget");
+
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, g2);
+        // The second only commits the REMAINDER ($3,000), not its whole $5,000.
+        assertEq(ledger.openExposureUsd(g2), 3_000e18, "second commits only what is still needed");
+
+        // $5,000 + $3,000 == $8,000 → covered.
+        ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 8_000e6);
     }
 
     function test_recordApproval_netsAcrossSequentialEpochs() public {
@@ -223,14 +255,41 @@ contract ExposureLedgerTest is Test {
         assertEq(ledger.openExposureUsd(guardian), 4_000e18); // only the live epoch counts
     }
 
+    /// @notice The batching attack (spec §3.3): one guardian cannot back two
+    ///         simultaneous drains with the same bond. Its committed exposure
+    ///         is capped at its bond in TOTAL across open approvals, so the
+    ///         second proposal is left short and cannot reach quorum.
     function test_recordApproval_blocksSimultaneousOverExposure() public {
         _wireRecording();
         mgov.set(3_000e6);
         vm.prank(registry);
         ledger.recordApproval(address(mgov), 1, guardian);
+        assertEq(ledger.openExposureUsd(guardian), 3_000e18);
+
+        // Second $3,000 drain: only $2,000 of budget remains, so that is all it
+        // can back — total exposure is pinned at the $5,000 bond, never $6,000.
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 2, guardian);
+        assertEq(ledger.openExposureUsd(guardian), 5_000e18, "total exposure capped at the bond");
+
+        // Proposal 1 stays covered; proposal 2 is under-covered and cannot execute.
+        ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 3_000e6);
+        vm.expectRevert(IExposureLedger.InsufficientApproveCoverage.selector);
+        ledger.requireApproveQuorum(address(mgov), 2, usdgAsset, 3_000e6);
+    }
+
+    /// @notice The hard edge of the batching cap: with NO free budget left, an
+    ///         approve reverts outright rather than committing zero.
+    function test_recordApproval_noFreeBudgetReverts() public {
+        _wireRecording();
+        mgov.set(5_000e6); // consumes the entire $5,000 bond
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        assertEq(ledger.openExposureUsd(guardian), 5_000e18);
+
         vm.prank(registry);
         vm.expectRevert(IExposureLedger.ExposureCapExceeded.selector);
-        ledger.recordApproval(address(mgov), 2, guardian); // $3k + $3k > $5k — the batching attack
+        ledger.recordApproval(address(mgov), 2, guardian);
     }
 
     function test_releaseApproval_freesExactRecordedAmount() public {
@@ -291,23 +350,57 @@ contract ExposureLedgerTest is Test {
         ledger.requireWithinCoveredTvlCap(usdgAsset, 1e6);
     }
 
-    function test_approveQuorum_sumOfApproverBondsCoversCoverage() public {
+    /// @notice The quorum sums COMMITTED shares from the ledger's own approver
+    ///         list — it no longer asks a registry who approved, so the ledger's
+    ///         and the governor's registry pointers cannot disagree (I-1).
+    function test_approveQuorum_sumOfCommittedSharesCoversCoverage() public {
         _wireRecording();
-        MockRegistryForLedger mockReg = new MockRegistryForLedger();
-        vm.prank(owner);
-        ledger.setGuardianRegistry(address(mockReg));
         address g2 = makeAddr("g2");
         swood.setStake(guardian, 60_000e18, 0); // $3,000
         swood.setStake(g2, 60_000e18, 0); // $3,000
-        address[] memory a = new address[](2);
-        a[0] = guardian;
-        a[1] = g2;
-        mockReg.setApprovers(a);
-        // $5,000 coverage vs $6,000 combined bonds: passes
+        mgov.set(5_000e6); // $5,000 needed
+
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian); // commits $3,000
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, g2); // commits the $2,000 remainder
+
+        // $3,000 + $2,000 == $5,000 → covered.
         ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 5_000e6);
-        // $7,000 coverage: fails
+        // Asking for more than was ever committed fails.
         vm.expectRevert(IExposureLedger.InsufficientApproveCoverage.selector);
         ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 7_000e6);
+    }
+
+    /// @notice The LIVE leg of the quorum (F2): a committed share counts only at
+    ///         what the bond behind it is worth NOW, so a WOOD price crash
+    ///         between approve and execute un-covers the proposal.
+    function test_approveQuorum_priceCrashShrinksCommittedShare() public {
+        _wireRecording();
+        mgov.set(5_000e6);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian); // commits its full $5,000
+        ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 5_000e6); // covered at $0.05
+
+        vm.prank(owner);
+        ledger.setWoodUsdPrice(0.005e8); // 10x crash — bond now worth $500
+        vm.expectRevert(IExposureLedger.InsufficientApproveCoverage.selector);
+        ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 5_000e6);
+    }
+
+    /// @notice A vote change releases the commitment, so the proposal loses the
+    ///         coverage it had — the quorum reflects it immediately.
+    function test_approveQuorum_releaseRemovesCoverage() public {
+        _wireRecording();
+        mgov.set(3_000e6);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 3_000e6);
+
+        vm.prank(registry);
+        ledger.releaseApproval(address(mgov), 1, guardian);
+        vm.expectRevert(IExposureLedger.InsufficientApproveCoverage.selector);
+        ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 3_000e6);
     }
 
     function test_approveQuorum_zeroApproversFailsClosed() public {
@@ -356,10 +449,11 @@ contract ExposureLedgerTest is Test {
         // into epoch 1, but epoch 0's challenge window (open until 28d + 14d) has not elapsed
         vm.warp(block.timestamp + 28 days + 1);
         assertEq(ledger.openExposureUsd(guardian), 3_000e18);
-        // a second approval that would overflow the cap still reverts: $3k + $3k > $5k
+        // The carried exposure still consumes budget: a second $3k approval can
+        // only commit the $2k that remains, pinning the total at the bond.
         vm.prank(registry);
-        vm.expectRevert(IExposureLedger.ExposureCapExceeded.selector);
         ledger.recordApproval(address(mgov), 2, guardian);
+        assertEq(ledger.openExposureUsd(guardian), 5_000e18, "epoch-0 exposure still counts against the cap");
     }
 
     function test_constructor_enforcesDefaultWindowInvariants() public {
@@ -383,11 +477,14 @@ contract ExposureLedgerTest is Test {
 
     function test_recordApproval_uint192OverflowGuardReverts() public {
         _wireRecording();
-        // re-point the asset's feed to an absurd price so coverageUsd overflows uint192:
-        // usd = 1e25 * 1e30 * 1e18 / 1e14 = 1e59 > type(uint192).max (~6.28e57)
+        // The committed share is min(free budget, still needed), so BOTH must
+        // exceed uint192 to reach the guard. Absurd feed price →
+        // needUsd = 1e25 * 1e30 * 1e18 / 1e14 = 1e59; absurd stake →
+        // free = 1e60 * 5e6 / 1e8 = 5e58. min == 5e58 > type(uint192).max (~6.28e57).
         MockFeed hugeFeed = new MockFeed(1e30, 8);
         vm.prank(owner);
         ledger.setAssetFeed(usdgAsset, address(hugeFeed), 365 days);
+        swood.setStake(guardian, 1e60, 0);
         mgov.set(1e25);
         vm.prank(registry);
         vm.expectRevert(IExposureLedger.InvalidParameter.selector);

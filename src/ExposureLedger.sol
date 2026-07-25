@@ -123,6 +123,21 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     mapping(address guardian => mapping(uint256 epoch => uint256 usd)) internal _buckets;
     mapping(bytes32 reviewKey => mapping(address guardian => RecordedExposure)) internal _recorded;
 
+    /// @dev Total USD committed by all approvers of a proposal. Lets
+    ///      `recordApproval` size the next approver's share against what is
+    ///      still uncovered, so the aggregate stops growing once the proposal
+    ///      is fully backed.
+    mapping(bytes32 reviewKey => uint256 usd) internal _committedUsd;
+
+    /// @dev The ledger's own approver list per proposal, plus a membership flag
+    ///      so a release/re-approve round trip cannot double-push. Read by
+    ///      `requireApproveQuorum` INSTEAD of the guardian registry: the ledger
+    ///      books commitments itself, so it needs no external opinion about who
+    ///      approved, and the ledger's and governor's registry pointers can
+    ///      therefore never disagree (review finding I-1).
+    mapping(bytes32 reviewKey => address[]) internal _approversOf;
+    mapping(bytes32 reviewKey => mapping(address guardian => bool)) internal _listed;
+
     // ── Modifiers / helpers ──
 
     modifier onlyRegistry() {
@@ -157,10 +172,21 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
 
     /// @inheritdoc IExposureLedger
     function slashableBondUsd(address guardian) public view returns (uint256) {
+        return _slashableBondUsd(guardian, swood.maxDelegatedSlashBps(), woodUsdPriceX8);
+    }
+
+    /// @dev `slashableBondUsd` with the two loop-invariant inputs passed in, so
+    ///      a multi-approver quorum reads them once instead of once per
+    ///      approver (review finding M-4).
+    function _slashableBondUsd(address guardian, uint256 maxDelegatedSlashBps_, uint256 priceX8)
+        internal
+        view
+        returns (uint256)
+    {
         uint256 own = swood.guardianStake(guardian);
         uint256 inbound = swood.delegatedInbound(guardian);
-        uint256 slashableWood = own + (inbound * swood.maxDelegatedSlashBps()) / BPS_DENOMINATOR;
-        return (slashableWood * woodUsdPriceX8) / 1e8;
+        uint256 slashableWood = own + (inbound * maxDelegatedSlashBps_) / BPS_DENOMINATOR;
+        return (slashableWood * priceX8) / 1e8;
     }
 
     // ── Owner setters ──
@@ -277,41 +303,85 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     }
 
     /// @inheritdoc IExposureLedger
-    /// @dev Called by GuardianRegistry.voteOnProposal on the approve side (spec
-    ///      §3.3: the cap is checked at vote time). Reverting here reverts the
-    ///      guardian's vote — an over-exposed guardian simply cannot approve.
+    /// @dev Called by GuardianRegistry.voteOnProposal on the approve side.
+    ///
+    ///      An approver commits a SHARE of its free bond — `min(free bond,
+    ///      coverage still uncovered)` — not the proposal's full coverage.
+    ///      This is what lets §3.3a's *aggregate* quorum actually aggregate:
+    ///      two guardians holding $600k each can jointly cover a $1M proposal,
+    ///      because a conviction slashes EVERY approver of that proposal
+    ///      (`GuardianRegistry.resolveReview` hands the whole approver array to
+    ///      `slashGuardians` at 100%), so recovery is the SUM of their bonds —
+    ///      exactly what §2's inequality states ("coalition loss >= Σ dollar
+    ///      value of slashable approver stake").
+    ///
+    ///      Booking the FULL coverage against EACH approver (the earlier
+    ///      behaviour) conflated two different rules: §3.3's cap exists to stop
+    ///      ONE guardian backing MANY proposals ("approve N drains in one
+    ///      window, lose one bond once") — not to force one guardian to
+    ///      single-handedly cover ONE proposal. Committing shares enforces the
+    ///      former without imposing the latter.
+    ///
+    ///      Consequence: an under-bonded guardian is no longer rejected at vote
+    ///      time — it commits what it can, and the proposal simply fails the
+    ///      execute-time quorum unless other approvers make up the rest. A
+    ///      guardian with NO free budget still reverts (`ExposureCapExceeded`),
+    ///      which is what closes the batching attack.
     function recordApproval(address governor, uint256 proposalId, address guardian) external onlyRegistry {
         bytes32 key = _reviewKey(governor, proposalId);
         if (_recorded[key][guardian].usd != 0) return; // idempotent (vote-change round trip)
         ILedgerGovernorMinimal gov = ILedgerGovernorMinimal(governor);
         address asset = IVaultAssetMinimal(gov.getProposalView(proposalId).vault).asset();
-        uint256 usd = coverageUsd(asset, gov.getRequiredCoverage(proposalId));
-        if (usd == 0) return; // zero-coverage: nothing to book
+        uint256 needUsd = coverageUsd(asset, gov.getRequiredCoverage(proposalId));
+        if (needUsd == 0) return; // zero-coverage: nothing to book
+
+        // Already fully covered by earlier approvers: this guardian still adds
+        // slashable weight on conviction, but consumes none of its own budget.
+        uint256 already = _committedUsd[key];
+        if (already >= needUsd) return;
+        uint256 stillNeeded = needUsd - already;
+
+        // Free budget = k * bond - open exposure. Zero free budget is the
+        // batching attack's boundary: this guardian's bond is already fully
+        // spoken for by its other open approvals, so it cannot back another drain.
+        uint256 capUsd = kNumerator * slashableBondUsd(guardian);
+        uint256 open = openExposureUsd(guardian);
+        if (open >= capUsd) revert ExposureCapExceeded();
+        uint256 free = capUsd - open;
+
+        uint256 share = free < stillNeeded ? free : stillNeeded;
         // Truncation in the uint192 store below would book phantom (smaller)
         // exposure — fail loudly instead.
-        if (usd > type(uint192).max) revert InvalidParameter();
+        if (share > type(uint192).max) revert InvalidParameter();
         uint256 epoch = currentEpoch();
-        if (openExposureUsd(guardian) + usd > kNumerator * slashableBondUsd(guardian)) {
-            revert ExposureCapExceeded();
-        }
-        _buckets[guardian][epoch] += usd;
-        // usd bounded to uint192 above; epoch = elapsed / epochLength cannot
+        _buckets[guardian][epoch] += share;
+        // share bounded to uint192 above; epoch = elapsed / epochLength cannot
         // approach 2^64 on any realistic timescale.
         // forge-lint: disable-next-line(unsafe-typecast)
-        _recorded[key][guardian] = RecordedExposure({usd: uint192(usd), epoch: uint64(epoch)});
-        emit ExposureRecorded(guardian, key, usd, epoch);
+        _recorded[key][guardian] = RecordedExposure({usd: uint192(share), epoch: uint64(epoch)});
+        _committedUsd[key] += share;
+        // The ledger keeps its OWN approver list: the quorum reads this, never
+        // the registry, so the ledger's registry pointer and the governor's can
+        // never disagree about who covered a proposal (review finding I-1).
+        if (!_listed[key][guardian]) {
+            _listed[key][guardian] = true;
+            _approversOf[key].push(guardian);
+        }
+        emit ExposureRecorded(guardian, key, share, epoch);
     }
 
     /// @inheritdoc IExposureLedger
     /// @dev Vote-change Approve→Block (or any registry-side unwind). Releases
-    ///      exactly what was recorded, from the bucket it was recorded into.
-    ///      No-op when nothing is recorded — never underflows.
+    ///      exactly what was committed, from the bucket it was committed into.
+    ///      No-op when nothing is recorded — never underflows. The address stays
+    ///      in `_approversOf` with a zeroed commitment; the quorum skips it.
     function releaseApproval(address governor, uint256 proposalId, address guardian) external onlyRegistry {
         bytes32 key = _reviewKey(governor, proposalId);
         RecordedExposure memory r = _recorded[key][guardian];
         if (r.usd == 0) return;
         delete _recorded[key][guardian];
         _buckets[guardian][r.epoch] -= r.usd;
+        _committedUsd[key] -= r.usd;
         emit ExposureReleased(guardian, key, r.usd, r.epoch);
     }
 
@@ -324,30 +394,56 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     }
 
     /// @inheritdoc IExposureLedger
-    /// @dev Spec §3.3a: execution requires the covering approvers' aggregate
-    ///      slashableBond (LIVE read, dollars) to meet the proposal's coverage.
-    ///      Live rather than at-vote: sWOOD's coolDownPeriod >= epoch + challenge
-    ///      window prevents full escape, and a live read is strictly conservative
-    ///      (a bond that shrank since the vote counts at its shrunken value).
-    ///      Zero approvers ALWAYS reverts, even at zero coverage — R1 requires an
-    ///      identified signer for anything tier-gated into this check.
-    ///      Called by SyndicateGovernor.executeProposal for proposals with
-    ///      envelopeTier >= quorumTierThreshold.
+    /// @dev Spec §3.3a: execution requires the covering approvers' AGGREGATE
+    ///      bond to meet the proposal's coverage. Each approver contributes
+    ///      `min(what it committed at vote time, what its bond is worth NOW)`:
+    ///
+    ///        - the committed leg is what makes the aggregate meaningful — a
+    ///          guardian only ever backs a proposal up to the free budget it
+    ///          actually pledged, so the same bond cannot cover two drains
+    ///          (the batching attack);
+    ///        - the LIVE leg keeps F2's dollar requirement honest — a bond that
+    ///          shrank since the vote (unstaking, or a WOOD price crash) counts
+    ///          at its shrunken value, so coverage must still hold in dollars
+    ///          at execution.
+    ///
+    ///      Approvers come from the ledger's OWN `_approversOf` list, never from
+    ///      the registry: the ledger booked the commitments itself, so it needs
+    ///      no external opinion about who approved. That also removes the
+    ///      divergence risk between the ledger's registry pointer and the
+    ///      governor's (review finding I-1). The list is bounded by the
+    ///      registry's own `MAX_APPROVERS_PER_PROPOSAL`.
+    ///
+    ///      Zero committed coverage ALWAYS reverts, even at zero required
+    ///      coverage — R1 requires an identified signer for anything tier-gated
+    ///      into this check. Called by `SyndicateGovernor.executeProposal` for
+    ///      proposals with `envelopeTier >= quorumTierThreshold`.
     function requireApproveQuorum(address governor, uint256 proposalId, address asset, uint256 requiredCoverage)
         external
         view
     {
         uint256 needUsd = coverageUsd(asset, requiredCoverage);
-        (address[] memory approvers,,) =
-            IRegistryApproversMinimal(guardianRegistry).getApproverWeights(governor, proposalId);
-        if (approvers.length == 0) revert InsufficientApproveCoverage();
+        bytes32 key = _reviewKey(governor, proposalId);
+        address[] storage approvers = _approversOf[key];
+        uint256 n = approvers.length;
+        if (n == 0) revert InsufficientApproveCoverage();
+
+        // Hoisted: both are loop-invariant, and `slashableBondUsd` would
+        // otherwise re-read them once per approver (review finding M-4).
+        uint256 bps = swood.maxDelegatedSlashBps();
+        uint256 priceX8 = woodUsdPriceX8;
+
         uint256 haveUsd;
-        for (uint256 i = 0; i < approvers.length; i++) {
-            haveUsd += slashableBondUsd(approvers[i]);
+        for (uint256 i = 0; i < n; i++) {
+            address g = approvers[i];
+            uint256 committed = _recorded[key][g].usd;
+            if (committed == 0) continue; // released via a vote change
+            uint256 live = _slashableBondUsd(g, bps, priceX8);
+            haveUsd += live < committed ? live : committed;
             if (haveUsd >= needUsd) return; // early exit
         }
-        // The loop early-returns on success — reaching here means the
-        // approvers' aggregate bond never met the required coverage.
+        // The loop early-returns on success — reaching here means the covering
+        // approvers' aggregate never met the required coverage.
         revert InsufficientApproveCoverage();
     }
 

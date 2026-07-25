@@ -112,6 +112,8 @@ contract GovernorCoverageGatesTest is Test {
 
     address public owner = makeAddr("owner");
     address public ledgerOwner = makeAddr("ledgerOwner");
+    /// @dev Stands in for the GuardianRegistry as the ledger's record/release caller.
+    address public ledgerRegistry = makeAddr("ledgerRegistry");
     address public agent = makeAddr("agent");
     address public agent2 = makeAddr("agent2");
     address public coAgent = makeAddr("coAgent");
@@ -142,10 +144,11 @@ contract GovernorCoverageGatesTest is Test {
         // deliberately. Feed staleness itself is covered in ExposureLedger.t.sol.
         ledger.setAssetFeed(address(usdg), address(feed), 365 days);
         ledger.setCoveredTvlCapUsd(10_000_000e18); // $10M — generous
-        // Approver source for the §3.3a quorum. Defaults to an EMPTY approver
-        // set — the cold-start case the quorum must fail closed on. Tests that
-        // need covering approvers re-point it via `_seatApprovers`.
-        ledger.setGuardianRegistry(address(new MockApproverRegistry()));
+        // The ledger books commitments itself and the quorum reads its OWN
+        // approver list, so this slot is only the record/release authorization.
+        // Nothing is committed by default — the cold-start case the quorum must
+        // fail closed on; `_seatApprovers` books real commitments.
+        ledger.setGuardianRegistry(ledgerRegistry);
         vm.stopPrank();
 
         // ── The wired syndicate (governor + vault). Test contract is factory.
@@ -510,15 +513,16 @@ contract GovernorCoverageGatesTest is Test {
         assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Approved));
     }
 
-    /// @dev Point the ledger at an approver set whose LIVE sWOOD bonds cover
-    ///      `neededUsd`. At $0.05/WOOD, 20,000 WOOD == $1,000.
-    function _seatApprovers(address[] memory gs, uint256 ownStakeEach) internal {
-        MockApproverRegistry approverReg = new MockApproverRegistry();
-        approverReg.setApprovers(gs);
-        vm.prank(ledgerOwner);
-        ledger.setGuardianRegistry(address(approverReg));
+    /// @dev Stake each guardian and book a REAL commitment against `pid`
+    ///      through the ledger's registry-only entrypoint. The quorum sums the
+    ///      ledger's own committed shares, so coverage has to be booked, not
+    ///      merely asserted by a mock approver list. At $0.05/WOOD, 20,000 WOOD
+    ///      == $1,000 of slashable bond.
+    function _seatApprovers(uint256 pid, address[] memory gs, uint256 ownStakeEach) internal {
         for (uint256 i = 0; i < gs.length; i++) {
             swood.setStake(gs[i], ownStakeEach, 0);
+            vm.prank(address(ledgerRegistry));
+            ledger.recordApproval(address(governor), pid, gs[i]);
         }
     }
 
@@ -540,7 +544,7 @@ contract GovernorCoverageGatesTest is Test {
         uint256 pid = _proposeSolo(governor, address(vault), agent, 1_000e6);
         address[] memory gs = new address[](1);
         gs[0] = makeAddr("g1");
-        _seatApprovers(gs, 20_000e18);
+        _seatApprovers(pid, gs, 20_000e18);
         _toApproved(pid);
         governor.executeProposal(pid);
         assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Executed));
@@ -553,7 +557,7 @@ contract GovernorCoverageGatesTest is Test {
         uint256 pid = _proposeSolo(governor, address(vault), agent, 1_000e6);
         address[] memory gs = new address[](1);
         gs[0] = makeAddr("g1");
-        _seatApprovers(gs, 10_000e18); // $500 — half the needed coverage
+        _seatApprovers(pid, gs, 10_000e18); // $500 — half the needed coverage
         _toApproved(pid);
         vm.expectRevert(IExposureLedger.InsufficientApproveCoverage.selector);
         governor.executeProposal(pid);
@@ -584,7 +588,7 @@ contract GovernorCoverageGatesTest is Test {
         uint256 pid = _proposeSolo(governor, address(vault), agent, 1_000e6);
         address[] memory gs = new address[](1);
         gs[0] = makeAddr("g1");
-        _seatApprovers(gs, 20_000e18); // fully covered
+        _seatApprovers(pid, gs, 20_000e18); // fully covered
         vm.prank(ledgerOwner);
         ledger.setAssetFeed(address(usdg), address(feed), 1 hours); // tight bound
         _toApproved(pid); // warps a full voting period ahead
