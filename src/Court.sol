@@ -6,8 +6,26 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ICourt} from "./interfaces/ICourt.sol";
 import {IChallengeGame} from "./interfaces/IChallengeGame.sol";
+import {IExposureLedger} from "./interfaces/IExposureLedger.sol";
 import {ISyndicateGovernor} from "./interfaces/ISyndicateGovernor.sol";
 import {IStakedWood} from "./interfaces/IStakedWood.sol";
+
+/// @notice The one thing the court needs from the challenge game that
+///         `IChallengeGame` does not declare: WHICH LEDGER THE GAME TRUSTS.
+/// @dev    READ FROM THE GAME, NEVER FROM THE GOVERNOR, and the distinction is
+///         load-bearing. `ISyndicateGovernor` also exposes an `exposureLedger`,
+///         but `ch.governor` is an address the CHALLENGER handed
+///         `ChallengeGame.file` and may control — a hostile governor could
+///         return a ledger reporting no approvers at all, which would empty the
+///         accused set and delete the exclusion entirely. The game's
+///         `exposureLedger` is owner-set on the game itself and is the very
+///         ledger `ChallengeGame._accused` reads when it builds the slash list,
+///         so taking the address from there is what keeps "barred from voting"
+///         and "slashed on conviction" ONE set rather than two that merely look
+///         alike.
+interface IChallengeGameLedger {
+    function exposureLedger() external view returns (address);
+}
 
 /**
  * @title Court
@@ -226,6 +244,21 @@ contract Court is Ownable2Step, ICourt {
     ///      that ruled has its bond re-locked to `finalizedAt + badFaithWindow`.
     ///      Bounded by `MAX_PANEL_SIZE`.
     mapping(uint256 caseId => address[]) internal _panelVoters;
+
+    /// @inheritdoc ICourt
+    /// @dev WRITTEN ONCE, IN `refer`, AND NEVER AGAIN — the same discipline
+    ///      `snapshotTs` follows (D2), and for the same reason: two votes on one
+    ///      case must not be able to disagree about who is barred. Deriving
+    ///      membership at vote time from the live ledger would let a commitment
+    ///      released mid-case re-enfranchise an approver halfway through the
+    ///      appeal it is the defendant in.
+    mapping(uint256 caseId => mapping(address approver => bool)) public isAccused;
+
+    /// @dev The same set as an array, for `accusedOf` and for indexers. Bounded
+    ///      by the ledger's approver list, which `ChallengeGame` already walks
+    ///      in full on every settle — so nothing here is reachable at a size the
+    ///      slash path could not already reach.
+    mapping(uint256 caseId => address[]) internal _accused;
 
     // ─────────────────── Layer 2 state: the appeal (Task 4) ───────────────────
 
@@ -478,6 +511,68 @@ contract Court is Ownable2Step, ICourt {
         c.phase = Phase.Panel;
 
         emit CaseReferred(caseId, challengeId, ch.governor, ch.proposalId, snapshotTs);
+
+        // THE ACCUSED SET IS FIXED HERE, under the same rule as the snapshot
+        // directly above it. Both votes this case will run are checks ON the
+        // panel that judges the accused, so the accused are barred from both,
+        // and the weight barred is subtracted from the participation floor's
+        // base — see `_participationFloor`.
+        _recordAccused(caseId, c, game, ch.governor, ch.proposalId, snapshotTs);
+    }
+
+    /// @dev MIRRORS `ChallengeGame._accused` EXACTLY, and deliberately does not
+    ///      invent a second definition: the ledger's covering approvers,
+    ///      filtered to those whose committed share is still non-zero. The
+    ///      ledger reports a RELEASED commitment as zero rather than dropping
+    ///      the entry, and a guardian that released before the filing backed
+    ///      nothing on this proposal — so it is not slashed for it, and by the
+    ///      same token it is not barred from voting on it. The set that loses
+    ///      its stake on a conviction and the set that may not vote on that
+    ///      conviction are one list read from one place.
+    /// @dev THE LEDGER COMES FROM THE GAME, NOT FROM `governor`. See
+    ///      `IChallengeGameLedger` for why substituting the challenger-supplied
+    ///      governor's ledger would hand the accused an empty accused set.
+    /// @dev WEIGHT IS SUMMED AT `snapshotTs`, the case's stored instant, so the
+    ///      number subtracted from the floor is measured on exactly the same
+    ///      electorate as the votes it is compared against. It is computed here
+    ///      and only here; `voteAppeal`, `finalizeAppeal`, `voteBadFaith` and
+    ///      `finalizeBadFaith` all read the stored value.
+    /// @dev A DOUBLE-LISTED APPROVER WOULD DOUBLE-COUNT ITS WEIGHT, so the
+    ///      `isAccused` flag is checked before accumulating. The ledger does not
+    ///      produce duplicates today; the guard costs one warm SLOAD and makes
+    ///      the floor's denominator independent of that.
+    function _recordAccused(
+        uint256 caseId,
+        Case storage c,
+        address game,
+        address governor,
+        uint256 proposalId,
+        uint256 snapshotTs
+    ) internal {
+        address ledger = IChallengeGameLedger(game).exposureLedger();
+        (address[] memory approvers, uint256[] memory committedUsd) =
+            IExposureLedger(ledger).approversOf(governor, proposalId);
+
+        address swood = stakedWood;
+        uint256 weight;
+        uint256 count;
+        for (uint256 i; i < approvers.length; ++i) {
+            if (committedUsd[i] == 0) continue; // released before the filing: backs nothing, answers for nothing
+            address approver = approvers[i];
+            if (isAccused[caseId][approver]) continue;
+
+            isAccused[caseId][approver] = true;
+            _accused[caseId].push(approver);
+            count += 1;
+            // A court with no electorate wired cannot weigh anyone. `appeal` and
+            // `openBadFaith` both refuse to open with `stakedWood` unset, so a
+            // case referred in that state can never reach a vote and the weight
+            // it would have subtracted is never read.
+            if (swood != address(0)) weight += IStakedWood(swood).getPastVotes(approver, snapshotTs);
+        }
+
+        c.accusedWeight = weight;
+        emit AccusedSetRecorded(caseId, count, weight);
     }
 
     /// @inheritdoc ICourt
@@ -610,11 +705,30 @@ contract Court is Ownable2Step, ICourt {
     ///      drain, by the exploiter or by anyone who saw it happen, has no
     ///      weight at all. There is no borrow, no flash loan and no post-hoc
     ///      accumulation that reaches back past a stored timestamp.
+    /// @dev THE ACCUSED MAY NOT VOTE, and this is the check the snapshot alone
+    ///      could never make. The snapshot bars whoever bought in AFTER the
+    ///      drain; it says nothing about the approvers who were already large
+    ///      holders BEFORE it — and those are exactly the defendants, because a
+    ///      guardian has to stake WOOD to back coverage at all. Left in, they
+    ///      are routinely enough on their own to clear the participation floor
+    ///      and carry the vote. §3.5 puts this layer above the panel to CHECK a
+    ///      possibly-corrupt panel; a defendant that can outvote its own jury
+    ///      inverts it, so a correct conviction is overturned by the party it
+    ///      convicted.
+    /// @dev THE BAR IS PAID FOR IN THE FLOOR'S DENOMINATOR, NOT CHARGED TO THE
+    ///      HONEST VOTERS WHO REMAIN. Removing weight from the numerator while
+    ///      still measuring against the whole electorate would raise the bar
+    ///      turnout has to clear, more appeals would land below the floor, and
+    ///      below the floor THE PANEL'S RULING STANDS — trading "the accused
+    ///      self-acquit" for "a bribed panel is harder to overturn", which is
+    ///      the other half of the failure §3.5 stacks two layers against. See
+    ///      `_participationFloor`.
     function voteAppeal(uint256 caseId, bool guilty) external {
         Case storage c = _cases[caseId];
         if (c.phase != Phase.Appeal) revert WrongPhase();
         if (block.timestamp >= c.appealedAt + appealVoteWindow) revert WindowClosed();
         if (appealVoteOf[caseId][msg.sender] != Ruling.None) revert AlreadyVoted();
+        if (isAccused[caseId][msg.sender]) revert AccusedCannotVote();
 
         uint256 weight = IStakedWood(stakedWood).getPastVotes(msg.sender, c.snapshotTs);
         if (weight == 0) revert NoVotingPower();
@@ -662,8 +776,7 @@ contract Court is Ownable2Step, ICourt {
         uint256 guiltyVotes = c.appealGuiltyVotes;
         uint256 notGuiltyVotes = c.appealNotGuiltyVotes;
         uint256 turnout = guiltyVotes + notGuiltyVotes;
-        uint256 floor =
-            participationFloorBps * IStakedWood(stakedWood).getPastTotalVotes(c.snapshotTs) / BPS_DENOMINATOR;
+        uint256 floor = _participationFloor(c.snapshotTs, c.accusedWeight);
 
         uint256 bond = c.appealBond;
         c.appealBond = 0;
@@ -762,11 +875,29 @@ contract Court is Ownable2Step, ICourt {
     ///      later reorganisation of the governor's records can move the roll.
     ///      `getPastVotes` has ALREADY applied the age curve (D3); do not
     ///      re-weight.
+    /// @dev THE ACCUSED ARE BARRED HERE AS WELL AS IN THE MERITS APPEAL, and
+    ///      that was decided rather than inherited. The question is genuinely a
+    ///      different one — a PANELIST's conduct, not the approver's guilt — and
+    ///      the accused have a real interest in an honest panel. What decides it
+    ///      is their position relative to THIS defendant: a convicted approver
+    ///      losing 100% of its stake is the party with the largest motive in the
+    ///      system to take the bond of the panelist who convicted it, and by
+    ///      construction (guardians stake WOOD to back coverage) usually the
+    ///      weight to do it. Retaliation is not a merits question but its effect
+    ///      is: a panel that knows conviction puts its bond at the mercy of the
+    ///      convicted acquits, so leaving the accused in this electorate lets
+    ///      them bias every verdict — their own included, ex ante — without
+    ///      casting a single merits vote. It costs the track nothing it needs:
+    ///      `openBadFaith` stays permissionless, so an accused that genuinely
+    ///      spotted a corrupt panelist can still put the question; it simply may
+    ///      not answer it. And it keeps this function's own first claim true —
+    ///      the two votes really are decided by one electorate under one rule.
     function voteBadFaith(uint256 caseId, address panelist, bool badFaith) external {
         BadFaithVote storage bf = _badFaith[caseId][panelist];
         if (bf.openedAt == 0 || bf.resolved) revert BadFaithNotOpen();
         if (block.timestamp >= bf.openedAt + appealVoteWindow) revert WindowClosed();
         if (badFaithVoteOf[caseId][panelist][msg.sender] != Ruling.None) revert AlreadyVoted();
+        if (isAccused[caseId][msg.sender]) revert AccusedCannotVote();
 
         uint256 weight = IStakedWood(stakedWood).getPastVotes(msg.sender, _cases[caseId].snapshotTs);
         if (weight == 0) revert NoVotingPower();
@@ -817,8 +948,8 @@ contract Court is Ownable2Step, ICourt {
         uint256 badFaithVotes = bf.badFaithVotes;
         uint256 goodFaithVotes = bf.goodFaithVotes;
         uint256 turnout = badFaithVotes + goodFaithVotes;
-        uint256 floor = participationFloorBps * IStakedWood(stakedWood).getPastTotalVotes(_cases[caseId].snapshotTs)
-            / BPS_DENOMINATOR;
+        Case storage c = _cases[caseId];
+        uint256 floor = _participationFloor(c.snapshotTs, c.accusedWeight);
 
         // Terminal before either transfer, and the open counter is released
         // here: a re-entrant call finds `resolved` set and hits BadFaithNotOpen.
@@ -848,6 +979,50 @@ contract Court is Ownable2Step, ICourt {
         emit BadFaithFinalized(caseId, panelist, slash, badFaithVotes, goodFaithVotes, floor);
         wood.safeTransfer(opener, bond);
         emit BadFaithBondReturned(caseId, panelist, opener, bond);
+    }
+
+    /// @dev THE ONE PLACE EITHER FLOOR IS COMPUTED, shared by `finalizeAppeal`
+    ///      and `finalizeBadFaith` so the two votes a case runs cannot end up
+    ///      measured against different denominators.
+    /// @dev THE BASE IS THE ELECTORATE THAT MAY ACTUALLY VOTE. `voteAppeal` and
+    ///      `voteBadFaith` bar the accused, so `accusedWeight` is stake that
+    ///      CANNOT appear in the turnout no matter how the vote goes. Leaving it
+    ///      in the denominator would price honest turnout against votes the
+    ///      contract itself refuses to accept: the same honest participation
+    ///      that cleared the floor before the exclusion would now miss it, and
+    ///      missing it means THE PANEL'S RULING STANDS. That is not a neutral
+    ///      failure — it converts the exclusion from "the accused cannot
+    ///      self-acquit" into "a bribed panel is harder to overturn", which is
+    ///      the very outcome layer 2 exists to prevent. Subtracting leaves the
+    ///      remaining electorate facing the same PROPORTIONAL bar it faced
+    ///      before, which is the whole intent of D6's parameter.
+    /// @dev THE UNDERFLOW GUARD FALLS BACK TO THE UNREDUCED TOTAL, and that
+    ///      choice is deliberate — it is NOT a clamp to zero. The two numbers
+    ///      come from different scales: `getPastTotalVotes` is the RAW own-stake
+    ///      total (sWOOD keeps totals raw as a conservative denominator), while
+    ///      `getPastVotes` adds k-capped DELEGATED inbound on top of aged own
+    ///      stake. Per-account weights can therefore sum past the total, so an
+    ///      accused guardian carrying enough delegation can genuinely push
+    ///      `accusedWeight` above it while a large honest electorate still
+    ///      exists. Clamping the base to zero there would set the floor to zero
+    ///      and let ONE non-accused voter holding dust overturn any panel
+    ///      ruling — deleting D6 exactly when an accused party has the means to
+    ///      arrange it, which makes it an attack rather than an edge case.
+    ///      Reverting is worse still: `refer` would fail, no case could open,
+    ///      and `ChallengeGame`'s `disputeTimeout` would acquit the accused by
+    ///      default — the hole Plan E exists to close. So when the subtraction
+    ///      is incoherent the court keeps the denominator it always had: a
+    ///      floor that is conservative, reachable by the honest electorate that
+    ///      demonstrably still exists, and answerable to no party's arithmetic.
+    function _participationFloor(uint256 snapshotTs, uint256 accusedWeight) internal view returns (uint256) {
+        uint256 total = IStakedWood(stakedWood).getPastTotalVotes(snapshotTs);
+        uint256 base = total >= accusedWeight ? total - accusedWeight : total;
+        return participationFloorBps * base / BPS_DENOMINATOR;
+    }
+
+    /// @inheritdoc ICourt
+    function accusedOf(uint256 caseId) external view returns (address[] memory) {
+        return _accused[caseId];
     }
 
     /// @inheritdoc ICourt

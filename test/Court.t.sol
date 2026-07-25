@@ -2,6 +2,7 @@
 pragma solidity 0.8.28;
 
 import {Test} from "forge-std/Test.sol";
+import {Vm} from "forge-std/Vm.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Court} from "src/Court.sol";
 import {ICourt} from "src/interfaces/ICourt.sol";
@@ -59,8 +60,44 @@ contract MockReentrantGovernor {
 ///      properties — `Disputed`-only, and terminal once ruled — so a test that
 ///      double-resolves a case fails here rather than passing against a stub
 ///      more permissive than production.
+/// @dev Exposure-ledger stub exposing the one view the court reads at referral:
+///      `approversOf`, from which the ACCUSED SET is derived exactly as
+///      `ChallengeGame._accused` derives its slash list — the covering
+///      approvers, filtered to a non-zero committed share. `setApprovers` takes
+///      the committed shares too, so a test can park a RELEASED approver
+///      (committed 0) in the list and prove it is neither accused nor barred.
+contract MockCourtExposureLedger {
+    mapping(bytes32 key => address[]) internal _approvers;
+    mapping(bytes32 key => uint256[]) internal _committed;
+
+    function setApprovers(address governor, uint256 proposalId, address[] memory who, uint256[] memory committedUsd)
+        external
+    {
+        bytes32 key = keccak256(abi.encode(governor, proposalId));
+        _approvers[key] = who;
+        _committed[key] = committedUsd;
+    }
+
+    function approversOf(address governor, uint256 proposalId)
+        external
+        view
+        returns (address[] memory approvers, uint256[] memory committedUsd)
+    {
+        bytes32 key = keccak256(abi.encode(governor, proposalId));
+        return (_approvers[key], _committed[key]);
+    }
+}
+
 contract MockCourtChallengeGame {
     mapping(uint256 challengeId => IChallengeGame.Challenge) internal _challenges;
+
+    /// @dev The court reads the ledger OFF THE GAME, never off the
+    ///      challenger-supplied governor, so the stub carries it here.
+    address public exposureLedger;
+
+    function setExposureLedger(address ledger) external {
+        exposureLedger = ledger;
+    }
 
     uint256 public ruleCallCount;
     uint256 public lastRuledChallengeId;
@@ -118,6 +155,7 @@ contract CourtTest is Test {
     MockCourtChallengeGame internal game;
     MockCourtGovernor internal governor;
     MockStakedWood internal swood;
+    MockCourtExposureLedger internal ledger;
 
     address internal owner = makeAddr("owner");
     address internal alice = makeAddr("alice"); // panelist
@@ -144,6 +182,8 @@ contract CourtTest is Test {
         game = new MockCourtChallengeGame();
         governor = new MockCourtGovernor();
         swood = new MockStakedWood();
+        ledger = new MockCourtExposureLedger();
+        game.setExposureLedger(address(ledger));
 
         // Somewhere well past genesis so `block.timestamp - x` is safe.
         vm.warp(vm.getBlockTimestamp() + 365 days);
@@ -3043,5 +3083,376 @@ contract CourtTest is Test {
         vm.prank(owner);
         court.setPanelRewardWood(0);
         assertEq(court.panelRewardWood(), 0);
+    }
+
+    // ═══════════ spec 3.5: the accused may not sit on their own appeal ═══════════
+    //
+    // A guardian has to STAKE WOOD to back coverage, so the approvers a challenge
+    // accuses are structurally among the largest holders in the electorate that
+    // judges them. Both of the court's stake-weighted votes exist to CHECK the
+    // panel; a defendant able to carry either one runs that check backwards.
+    //
+    // The exclusion is only half the fix, and the other half is the arithmetic:
+    // barring weight from the NUMERATOR while still measuring the floor against
+    // the whole electorate would make appeals harder to carry, and below the floor
+    // THE PANEL'S RULING STANDS. That would swap "the accused self-acquit" for "a
+    // bribed panel is harder to overturn" — the other failure §3.5 stacks two
+    // layers against. So the floor's base drops by the same weight the bar drops.
+
+    /// @dev Name the challenged proposal's covering approvers, each with a
+    ///      non-zero committed share. MUST run BEFORE `refer`: the accused set
+    ///      and its summed weight are fixed there, once, and never revised.
+    function _accuse(address[] memory who) internal {
+        uint256[] memory committed = new uint256[](who.length);
+        for (uint256 i; i < who.length; ++i) {
+            committed[i] = 1_000e18;
+        }
+        ledger.setApprovers(address(governor), PROPOSAL_ID, who, committed);
+    }
+
+    function _two(address a, address b) internal pure returns (address[] memory m) {
+        m = new address[](2);
+        m[0] = a;
+        m[1] = b;
+    }
+
+    /// @dev Find `AccusedSetRecorded` in the recorded logs and check its payload.
+    ///      Scanned rather than `expectEmit`-ed because the referral emits
+    ///      `CaseReferred` first and the assertion is about THIS event's
+    ///      contents, not about the pair's ordering.
+    function _assertAccusedSetRecorded(uint256 caseId, uint256 expectedCount, uint256 expectedWeight) internal {
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bool found;
+        for (uint256 i; i < logs.length; ++i) {
+            if (logs[i].topics[0] != ICourt.AccusedSetRecorded.selector) continue;
+            assertEq(uint256(logs[i].topics[1]), caseId, "the event names the case it fixed");
+            (uint256 count, uint256 weight) = abi.decode(logs[i].data, (uint256, uint256));
+            assertEq(count, expectedCount, "accused count");
+            assertEq(weight, expectedWeight, "accused weight");
+            found = true;
+        }
+        assertTrue(found, "refer must record the accused set it fixed");
+    }
+
+    /// @dev The snapshot instant the NEXT `_refer` will fix: `_disputedChallenge`
+    ///      executes the proposal 1 day back and the court stores
+    ///      `executedAt - 1`. Read through `vm.getBlockTimestamp()` because the
+    ///      optimizer CSEs a cached `block.timestamp` across `vm.warp`.
+    function _nextSnapshotTs() internal view returns (uint256) {
+        return vm.getBlockTimestamp() - 1 days - 1;
+    }
+
+    /// @dev Seed the electorate BEFORE the referral. `_setElectorate` runs AFTER
+    ///      `refer` and that is fine for VOTERS — they are weighed when they
+    ///      vote — but `accusedWeight` is summed AT REFERRAL under the same D2
+    ///      rule as the snapshot, so an accused approver's weight has to already
+    ///      exist by then or the case would record a zero.
+    function _preSeedElectorate() internal {
+        uint256 ts = _nextSnapshotTs();
+        swood.setPastTotalVotes(ts, TOTAL_VOTES);
+        swood.setPastVotes(whale, ts, 200_000e18); // 20%
+        swood.setPastVotes(dave, ts, 200_000e18); // 20% — the whale's mirror image
+        swood.setPastVotes(minnow, ts, 10_000e18); // 1%
+    }
+
+    /// @dev A convicted case in `AppealWindow` whose accused set is `accused`,
+    ///      with the electorate seeded on both sides of the referral.
+    function _accusedCase(address[] memory accused) internal returns (uint256 caseId) {
+        _preSeedElectorate();
+        _accuse(accused);
+        caseId = _panelRuled(true);
+    }
+
+    /// @notice THE EXCLUSION. An accused approver is refused, and a stranger
+    ///         holding the IDENTICAL weight at the identical snapshot is not —
+    ///         so what is being rejected is the voter's role in the case, not
+    ///         its stake, its timing or its size.
+    function test_voteAppeal_accusedApproverIsBarred_disinterestedPeerIsNot() public {
+        uint256 caseId = _accusedCase(_one(whale));
+        _appeal(caseId);
+
+        assertTrue(court.isAccused(caseId, whale), "the covering approver is on trial");
+        assertFalse(court.isAccused(caseId, dave), "and its equal-weight peer is not");
+
+        vm.expectRevert(ICourt.AccusedCannotVote.selector);
+        vm.prank(whale);
+        court.voteAppeal(caseId, false);
+
+        vm.prank(dave);
+        court.voteAppeal(caseId, false);
+
+        ICourt.Case memory c = court.caseOf(caseId);
+        assertEq(c.appealNotGuiltyVotes, 200_000e18, "the disinterested peer's identical weight counted in full");
+        assertEq(uint256(court.appealVoteOf(caseId, whale)), uint256(ICourt.Ruling.None), "the accused cast nothing");
+    }
+
+    /// @notice THE TEST THE DENOMINATOR FIX EXISTS FOR. Without it this change is
+    ///         a REGRESSION: the same honest turnout that decided an appeal
+    ///         before the exclusion would now fall below the floor, and below the
+    ///         floor the panel's ruling stands.
+    ///
+    ///         `minnow` musters 90,000 — SHORT of the old 100,000 floor (10% of
+    ///         the whole 1,000,000 electorate) but past the 80,000 the reduced
+    ///         base gives (10% of the 800,000 that may actually vote). The panel
+    ///         convicted; if the floor had not moved, this vote would have been a
+    ///         non-event and the conviction would have stood.
+    function test_finalizeAppeal_floorUsesReducedBase_turnoutThatMissedTheOldFloorNowDecides() public {
+        uint256 caseId = _accusedCase(_one(whale));
+        uint256 ts = court.caseOf(caseId).snapshotTs;
+        swood.setPastVotes(minnow, ts, 90_000e18);
+
+        uint256 oldFloor = court.participationFloorBps() * TOTAL_VOTES / 10_000;
+        uint256 reducedFloor = court.participationFloorBps() * (TOTAL_VOTES - 200_000e18) / 10_000;
+        assertEq(oldFloor, 100_000e18, "10% of the whole electorate");
+        assertEq(reducedFloor, 80_000e18, "10% of the electorate that may actually vote");
+
+        _appeal(caseId);
+        vm.prank(minnow);
+        court.voteAppeal(caseId, false);
+
+        assertLt(90_000e18, oldFloor, "this turnout would have been a NON-EVENT before the fix");
+        assertGe(90_000e18, reducedFloor, "and it clears the bar honest voters actually face");
+
+        vm.expectEmit(true, false, false, true);
+        emit ICourt.AppealFinalized(caseId, ICourt.Ruling.NotGuilty, 0, 90_000e18, reducedFloor);
+        _finalizeAppeal(caseId);
+
+        ICourt.Case memory c = court.caseOf(caseId);
+        assertEq(uint256(c.panelRuling), uint256(ICourt.Ruling.Guilty), "layer 1 had convicted");
+        assertEq(uint256(c.finalRuling), uint256(ICourt.Ruling.NotGuilty), "and the honest electorate overturned it");
+        assertEq(wood.balanceOf(appellant), 1_000_000e18, "a quorate appeal returns the bond whichever way it went");
+        assertEq(court.forfeitedWood(), 0, "nothing forfeited: this was not a below-floor non-event");
+    }
+
+    /// @notice THE ATTACK, DIRECTLY. Before the exclusion the two accused
+    ///         approvers held 400,000 of a 1,000,000 electorate against a
+    ///         100,000 floor — quadruple what they needed to clear it and carry
+    ///         their own acquittal alone. Now neither may vote, the honest
+    ///         remainder that shows up is a single 10,000 holder, and the appeal
+    ///         cannot reach quorum on anything the accused would have supplied.
+    function test_voteAppeal_accusedCannotCarryTheirOwnAcquittal() public {
+        uint256 caseId = _accusedCase(_two(whale, dave));
+
+        ICourt.Case memory referred = court.caseOf(caseId);
+        assertEq(referred.accusedWeight, 400_000e18, "the pair the challenge accuses");
+        uint256 oldFloor = court.participationFloorBps() * TOTAL_VOTES / 10_000;
+        assertGe(200_000e18, oldFloor, "either one of them alone once cleared the floor outright");
+
+        _appeal(caseId);
+        vm.expectRevert(ICourt.AccusedCannotVote.selector);
+        vm.prank(whale);
+        court.voteAppeal(caseId, false);
+        vm.expectRevert(ICourt.AccusedCannotVote.selector);
+        vm.prank(dave);
+        court.voteAppeal(caseId, false);
+
+        // The honest turnout that does show up is genuinely too small — measured
+        // against the REDUCED base, so this is a real quorum failure and not the
+        // arithmetic artefact the denominator fix removes.
+        vm.prank(minnow);
+        court.voteAppeal(caseId, false);
+        uint256 reducedFloor = court.participationFloorBps() * (TOTAL_VOTES - 400_000e18) / 10_000;
+        assertEq(reducedFloor, 60_000e18, "10% of the 600,000 that may vote");
+        assertLt(10_000e18, reducedFloor);
+
+        vm.expectEmit(true, false, false, true);
+        emit ICourt.AppealBelowFloor(caseId, 10_000e18, reducedFloor, ICourt.Ruling.Guilty, court.appealBondWood());
+        _finalizeAppeal(caseId);
+
+        assertEq(
+            uint256(court.caseOf(caseId).finalRuling),
+            uint256(ICourt.Ruling.Guilty),
+            "THE CONVICTION STANDS: the party it convicted could not vote it away"
+        );
+    }
+
+    /// @notice D2 DISCIPLINE, APPLIED TO THE ACCUSED SET. Both the membership and
+    ///         the summed weight are fixed at `refer` and never re-derived, so
+    ///         neither stake that moves afterwards nor a ledger that reports a
+    ///         different approver list later can change who may vote or what the
+    ///         floor is measured against — exactly as `snapshotTs` cannot move.
+    function test_refer_accusedWeightIsFixedAtReferral() public {
+        _preSeedElectorate();
+        _accuse(_one(whale));
+
+        _seatBonded(_three());
+        vm.recordLogs();
+        uint256 caseId = _refer();
+        _assertAccusedSetRecorded(caseId, 1, 200_000e18);
+
+        assertEq(court.caseOf(caseId).accusedWeight, 200_000e18, "summed once, at referral");
+        assertEq(court.accusedOf(caseId).length, 1);
+        assertEq(court.accusedOf(caseId)[0], whale);
+
+        // Everything the number was derived from now moves underneath the case.
+        uint256 ts = court.caseOf(caseId).snapshotTs;
+        swood.setPastVotes(whale, ts, 900_000e18);
+        swood.setPastTotalVotes(ts, 5_000_000e18);
+        _accuse(_two(whale, dave));
+
+        assertEq(court.caseOf(caseId).accusedWeight, 200_000e18, "and never re-read");
+        assertFalse(court.isAccused(caseId, dave), "a late addition to the ledger does not join the accused set");
+        assertEq(court.accusedOf(caseId).length, 1, "nor the recorded list");
+
+        // dave is therefore still a legitimate voter on THIS case, which is the
+        // point of freezing membership rather than reading it live.
+        vm.prank(alice);
+        court.panelRule(caseId, true);
+        vm.prank(bob);
+        court.panelRule(caseId, true);
+        vm.prank(carol);
+        court.panelRule(caseId, true);
+        court.finalizePanel(caseId);
+        _appeal(caseId);
+        vm.prank(dave);
+        court.voteAppeal(caseId, false);
+        assertEq(court.caseOf(caseId).appealNotGuiltyVotes, 200_000e18);
+    }
+
+    /// @notice ONE NOTION OF "ACCUSED", NOT TWO. `ChallengeGame._accused` filters
+    ///         the ledger's approvers to those whose committed share is still
+    ///         non-zero — a guardian that released before the filing backed
+    ///         nothing and is not slashed for it. The court mirrors that filter
+    ///         exactly, so the set barred from voting is the set that loses its
+    ///         stake, never a second list that merely looks similar.
+    function test_refer_releasedApproverIsNeitherAccusedNorBarred() public {
+        _preSeedElectorate();
+
+        address[] memory who = _two(whale, dave);
+        uint256[] memory committed = new uint256[](2);
+        committed[0] = 1_000e18;
+        committed[1] = 0; // released before the filing: backs nothing on this proposal
+        ledger.setApprovers(address(governor), PROPOSAL_ID, who, committed);
+
+        uint256 caseId = _panelRuled(true);
+        assertTrue(court.isAccused(caseId, whale), "still committed, so still on trial");
+        assertFalse(court.isAccused(caseId, dave), "released, so not slashed and not barred");
+        assertEq(court.caseOf(caseId).accusedWeight, 200_000e18, "only the committed approver's weight is subtracted");
+
+        _appeal(caseId);
+        vm.prank(dave);
+        court.voteAppeal(caseId, false);
+        assertEq(court.caseOf(caseId).appealNotGuiltyVotes, 200_000e18, "and it votes like anybody else");
+    }
+
+    /// @notice THE UNDERFLOW GUARD, AND WHY IT FALLS BACK TO THE UNREDUCED TOTAL
+    ///         RATHER THAN TO ZERO. `getPastTotalVotes` is sWOOD's RAW own-stake
+    ///         total; `getPastVotes` adds k-capped DELEGATED inbound on top of
+    ///         aged own stake. Per-account weights can therefore sum past the
+    ///         total, so an accused guardian carrying enough delegation can push
+    ///         `accusedWeight` above it while a real honest electorate still
+    ///         exists.
+    ///
+    ///         Clamping the base to zero there would set the floor to zero and
+    ///         let one holder of dust overturn any panel ruling — deleting D6
+    ///         precisely when an accused party has the means to arrange it.
+    ///         Reverting would be worse still: no case could open and
+    ///         `disputeTimeout` would acquit the accused by default. So the court
+    ///         keeps the conservative denominator it always had.
+    function test_finalizeAppeal_accusedWeightAboveTotal_fallsBackToTheUnreducedFloor() public {
+        // Seeded BEFORE the referral, because `accusedWeight` is summed there:
+        // whale's own + k-capped delegated inbound exceeds the raw own-stake
+        // total, which is the divergence that makes the subtraction underflow.
+        swood.setPastVotes(whale, _nextSnapshotTs(), 200_000e18);
+        _accuse(_one(whale));
+
+        uint256 caseId = _panelRuled(true);
+        uint256 ts = court.caseOf(caseId).snapshotTs;
+        // `_panelRuled` seeds the standard electorate on its way out; overwrite
+        // the two numbers this case is actually about, both read at FINALIZE.
+        swood.setPastTotalVotes(ts, 100_000e18); // raw own-stake total
+        swood.setPastVotes(minnow, ts, 5_000e18);
+        assertGt(court.caseOf(caseId).accusedWeight, 100_000e18, "the subtraction genuinely would have underflowed");
+
+        _appeal(caseId);
+        vm.prank(minnow);
+        court.voteAppeal(caseId, false);
+
+        // The floor is 10% of the UNREDUCED 100,000 — not zero, and not a revert.
+        uint256 fallbackFloor = court.participationFloorBps() * 100_000e18 / 10_000;
+        assertEq(fallbackFloor, 10_000e18);
+        vm.expectEmit(true, false, false, true);
+        emit ICourt.AppealBelowFloor(caseId, 5_000e18, fallbackFloor, ICourt.Ruling.Guilty, court.appealBondWood());
+        _finalizeAppeal(caseId);
+
+        assertEq(
+            uint256(court.caseOf(caseId).finalRuling),
+            uint256(ICourt.Ruling.Guilty),
+            "a zero-clamped floor would have let 5,000 WOOD of dust overturn the panel"
+        );
+    }
+
+    /// @notice SCOPE DECISION, MADE DELIBERATELY: the accused are barred from the
+    ///         BAD-FAITH track too.
+    ///
+    ///         The question there is a different one — whether a PANELIST ruled
+    ///         corruptly, not whether the approver was guilty — and D4 keeps the
+    ///         two tracks independent on purpose. The accused are barred anyway
+    ///         because of their position relative to THIS defendant: a convicted
+    ///         approver losing 100% of its stake is the party with the largest
+    ///         motive in the system to take the bond of the panelist who
+    ///         convicted it, and by construction usually the weight to do it.
+    ///         Retaliation is not a merits question, but its effect is — a panel
+    ///         that knows conviction puts its bond at the mercy of the convicted
+    ///         acquits, which biases every future verdict including, ex ante, the
+    ///         accused's own.
+    ///
+    ///         It costs the track nothing it needs: `openBadFaith` stays
+    ///         permissionless, so an accused that genuinely spotted a corrupt
+    ///         panelist can still put the question to the electorate — it simply
+    ///         may not answer it itself.
+    function test_voteBadFaith_accusedIsBarred_butMayStillOpenTheProceeding() public {
+        uint256 caseId = _accusedCase(_one(whale));
+        _resolveUnappealed(caseId);
+
+        // The accused may OPEN it — the check on a corrupt panel stays available
+        // to the party most likely to have noticed one.
+        wood.mint(whale, BOND);
+        vm.startPrank(whale);
+        wood.approve(address(court), type(uint256).max);
+        court.openBadFaith(caseId, alice);
+        vm.stopPrank();
+
+        vm.expectRevert(ICourt.AccusedCannotVote.selector);
+        vm.prank(whale);
+        court.voteBadFaith(caseId, alice, true);
+
+        // Its equal-weight, disinterested peer is not barred.
+        vm.prank(dave);
+        court.voteBadFaith(caseId, alice, true);
+        assertEq(court.badFaithOf(caseId, alice).badFaithVotes, 200_000e18);
+        assertEq(
+            uint256(court.badFaithVoteOf(caseId, alice, whale)),
+            uint256(ICourt.Ruling.None),
+            "the convicted party cast nothing against the panelist that convicted it"
+        );
+    }
+
+    /// @notice AND THE BAD-FAITH FLOOR IS REDUCED FOR THE SAME REASON THE
+    ///         APPEAL'S IS. Excluding weight from the numerator while leaving it
+    ///         in the denominator would make a bad-faith finding harder to reach,
+    ///         and below that floor A GENUINELY CORRUPT PANELIST KEEPS ITS BOND.
+    ///         `minnow`'s 90,000 misses the old 100,000 bar and clears the
+    ///         reduced 80,000 one, so the slash lands.
+    function test_finalizeBadFaith_floorUsesReducedBase() public {
+        uint256 caseId = _accusedCase(_one(whale));
+        uint256 ts = court.caseOf(caseId).snapshotTs;
+        swood.setPastVotes(minnow, ts, 90_000e18);
+        _resolveUnappealed(caseId);
+
+        _openBadFaith(caseId, alice, appellant);
+        _voteBadFaith(caseId, alice, minnow, true);
+
+        uint256 oldFloor = court.participationFloorBps() * TOTAL_VOTES / 10_000;
+        uint256 reducedFloor = court.participationFloorBps() * (TOTAL_VOTES - 200_000e18) / 10_000;
+        assertLt(90_000e18, oldFloor, "would have been a non-event on the unreduced base");
+        assertGe(90_000e18, reducedFloor);
+
+        uint256 forfeitedBefore = court.forfeitedWood();
+        _finalizeBadFaith(caseId, alice);
+
+        assertTrue(court.badFaithOf(caseId, alice).slashed, "the corrupt panelist's bond was taken");
+        assertEq(court.panelBondOf(alice), 0);
+        assertEq(court.forfeitedWood(), forfeitedBefore + BOND, "and it landed in the ownerless pot");
     }
 }

@@ -100,12 +100,20 @@ contract CourtE2EAdapter {
 ///           - Electorate = the four staked guardians, matured to par:
 ///             g1 30,000 + g2 20,000 + g3 20,000 + g4 30,000 = 100,000 WOOD of
 ///             `getPastTotalVotes` at the snapshot.
-///           - `participationFloorBps` 3,000 ⇒ floor 30,000 WOOD.
-///           - Arc 2 turnout g3+g4 = 50,000 (50%) CLEARS it and decides — and
-///             both are DISINTERESTED, so the acquittal is not the accused
-///             voting for itself.
-///           - Arc 3 turnout g3 alone = 20,000 (20%) MISSES it and decides
-///             nothing.
+///           - THE ACCUSED MAY NOT VOTE (§3.5). g1 + g2 are the covering
+///             approvers, so 50,000 of that 100,000 is barred from both of the
+///             court's votes, and the participation floor is measured on the
+///             50,000 that REMAINS — otherwise honest turnout would be asked to
+///             outvote stake the contract itself refuses to accept, more
+///             appeals would fall below the floor, and below the floor the
+///             panel's ruling stands.
+///           - `participationFloorBps` 6,000 of that reduced base ⇒ floor
+///             30,000 WOOD — the same bar in WOOD as before the exclusion, so
+///             the two arcs below still differ by TURNOUT ALONE.
+///           - Arc 2 turnout g3+g4 = 50,000 CLEARS it and decides — and both are
+///             DISINTERESTED, so the acquittal is not the accused voting for
+///             itself. It could not be: they would revert.
+///           - Arc 3 turnout g3 alone = 20,000 MISSES it and decides nothing.
 ///           - Windows: panel 7d, appeal 3d, appeal vote 5d — 15d total against
 ///             the challenge's own 30d `disputeTimeout`, so every arc finishes
 ///             with the timeout still pending. That ordering is the point.
@@ -208,10 +216,22 @@ contract CourtEndToEndTest is Test {
     /// @dev The constructor seeds `appealBondWood` from the panel bond, and this
     ///      test never re-tunes it — so they are the same number by construction.
     uint256 constant APPEAL_BOND = PANEL_BOND;
-    /// @dev 30% of `getPastTotalVotes`. See the contract header for why 3,000 is
-    ///      the number that makes arcs 2 and 3 differ by turnout ALONE.
-    uint256 constant FLOOR_BPS = 3_000;
-    uint256 constant FLOOR_VOTES = 30_000e18; // TOTAL_VOTES × 3,000 / 10,000
+    /// @dev 60% of the ELECTORATE THAT MAY ACTUALLY VOTE, which is
+    ///      `getPastTotalVotes` less the accused's own weight — the base
+    ///      `finalizeAppeal` measures against now that the accused are barred
+    ///      from their own appeal (spec §3.5). g1 + g2 hold 50,000 of the
+    ///      100,000 snapshot total and are the challenge's covering approvers,
+    ///      so the base is 50,000 and the floor is 30,000: THE SAME NUMBER OF
+    ///      WOOD AS BEFORE THE EXCLUSION, reached through the corrected
+    ///      denominator. That is the point of re-tuning the bps rather than the
+    ///      arcs — the bar honest turnout faces did not move, so arcs 2 and 3
+    ///      still differ by turnout ALONE.
+    uint256 constant FLOOR_BPS = 6_000;
+    uint256 constant FLOOR_VOTES = 30_000e18; // (TOTAL_VOTES − ACCUSED_VOTES) × 6,000 / 10,000
+    /// @dev g1 + g2, the two covering approvers — the set `ChallengeGame` slashes
+    ///      on a conviction and, now, the set barred from both of the court's
+    ///      stake-weighted votes.
+    uint256 constant ACCUSED_VOTES = G1_STAKE + FILLER_STAKE; // 50,000 WOOD
     /// @dev Arc 3 only, and turned on mid-arc so the two earlier arcs resolve
     ///      against an empty pot. Sized so three of them fit inside one forfeited
     ///      appeal bond with a surplus left over for the burn to take.
@@ -789,6 +809,18 @@ contract CourtEndToEndTest is Test {
         vm.prank(g4);
         court.voteAppeal(caseId, false); // 30,000 WOOD says it was wrong
 
+        // AND THEY COULD NOT HAVE. This arc always routed its overturn through
+        // the disinterested pair by construction; §3.5's exclusion makes that a
+        // property of the contract rather than of the fixture. g1 alone holds
+        // 30,000 WOOD — enough to clear the floor and carry this vote by itself —
+        // and it is the party the panel just convicted.
+        vm.expectRevert(ICourt.AccusedCannotVote.selector);
+        vm.prank(g1);
+        court.voteAppeal(caseId, false);
+        vm.expectRevert(ICourt.AccusedCannotVote.selector);
+        vm.prank(g2);
+        court.voteAppeal(caseId, false);
+
         assertEq(uint256(court.appealVoteOf(caseId, g1)), uint256(ICourt.Ruling.None), "the accused did not vote");
         assertEq(uint256(court.appealVoteOf(caseId, g2)), uint256(ICourt.Ruling.None), "nor its co-approver");
 
@@ -938,10 +970,17 @@ contract CourtEndToEndTest is Test {
         uint256 filedAt = game.challengeOf(cid).filedAt;
         uint256 snapshotTs = court.caseOf(caseId).snapshotTs;
 
-        // The floor, read off the live configuration rather than assumed.
+        // The floor, read off the live configuration rather than assumed — AND
+        // OFF THE REDUCED BASE, because the two covering approvers are barred
+        // from this vote and their weight is therefore not something honest
+        // turnout can be asked to outvote. `accusedWeight` was summed once, at
+        // referral, and is read from the case rather than recomputed here.
         assertEq(swood.getPastTotalVotes(snapshotTs), TOTAL_VOTES, "100,000 WOOD of electorate at the snapshot");
-        uint256 floor = (court.participationFloorBps() * TOTAL_VOTES) / 10_000;
-        assertEq(floor, FLOOR_VOTES, "30% of it");
+        assertEq(court.caseOf(caseId).accusedWeight, ACCUSED_VOTES, "g1 + g2 hold half of it and may not vote");
+        assertTrue(court.isAccused(caseId, g1), "the covering approvers are the ones on trial");
+        assertTrue(court.isAccused(caseId, g2));
+        uint256 floor = (court.participationFloorBps() * (TOTAL_VOTES - ACCUSED_VOTES)) / 10_000;
+        assertEq(floor, FLOOR_VOTES, "60% of the 50,000 that may actually vote: the same 30,000 bar as before");
 
         _panelConvicts(caseId);
 
