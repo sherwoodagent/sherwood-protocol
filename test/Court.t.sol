@@ -8,6 +8,7 @@ import {ICourt} from "src/interfaces/ICourt.sol";
 import {IChallengeGame} from "src/interfaces/IChallengeGame.sol";
 import {ISyndicateGovernor} from "src/interfaces/ISyndicateGovernor.sol";
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
+import {MockStakedWood} from "./mocks/MockStakedWood.sol";
 
 /// @dev Governor stub. The court reads exactly one field off `getProposal`:
 ///      `executedAt`, from which D2's snapshot instant (`executedAt - 1`) is
@@ -52,13 +53,27 @@ contract MockReentrantGovernor {
     }
 }
 
-/// @dev Challenge-game stub exposing the single view the court reads at
-///      referral (`challengeOf`) plus a setter for the status it gates on.
-///      `rule` is NOT stubbed here: Task 3 deliberately never calls it — the
-///      final outcome drives `ChallengeGame.rule` from Task 4's
-///      `finalizeAppeal`/`finalizeUnappealed`.
+/// @dev Challenge-game stub exposing the view the court reads at referral
+///      (`challengeOf`) plus the `rule` entrypoint Task 1 built and Task 4
+///      finally drives. `rule` mirrors the real contract's two load-bearing
+///      properties — `Disputed`-only, and terminal once ruled — so a test that
+///      double-resolves a case fails here rather than passing against a stub
+///      more permissive than production.
 contract MockCourtChallengeGame {
     mapping(uint256 challengeId => IChallengeGame.Challenge) internal _challenges;
+
+    uint256 public ruleCallCount;
+    uint256 public lastRuledChallengeId;
+    bool public lastRuledGuilty;
+
+    function rule(uint256 challengeId, bool guilty) external {
+        IChallengeGame.Challenge storage c = _challenges[challengeId];
+        if (c.status != IChallengeGame.Status.Disputed) revert IChallengeGame.WrongStatus();
+        ruleCallCount++;
+        lastRuledChallengeId = challengeId;
+        lastRuledGuilty = guilty;
+        c.status = guilty ? IChallengeGame.Status.Settled : IChallengeGame.Status.Failed;
+    }
 
     function setChallenge(uint256 challengeId, address governor, uint256 proposalId, IChallengeGame.Status status)
         external
@@ -102,30 +117,43 @@ contract CourtTest is Test {
     ERC20Mock internal wood;
     MockCourtChallengeGame internal game;
     MockCourtGovernor internal governor;
+    MockStakedWood internal swood;
 
     address internal owner = makeAddr("owner");
     address internal alice = makeAddr("alice"); // panelist
     address internal bob = makeAddr("bob"); // panelist
     address internal carol = makeAddr("carol"); // panelist
     address internal dave = makeAddr("dave"); // outsider / replacement
+    address internal appellant = makeAddr("appellant");
+    address internal whale = makeAddr("whale"); // large pre-exploit staker
+    address internal minnow = makeAddr("minnow"); // small pre-exploit staker
+    address internal newbie = makeAddr("newbie"); // staked only AFTER the snapshot
+    address internal backstop = makeAddr("backstop");
 
     uint256 internal constant BOND = 1_000e18;
     uint256 internal constant CHALLENGE_ID = 3;
     uint256 internal constant PROPOSAL_ID = 7;
+
+    /// @dev The electorate's total age-weighted vote weight at the snapshot.
+    ///      At the default 1_000 bps floor, an appeal must muster 100_000e18.
+    uint256 internal constant TOTAL_VOTES = 1_000_000e18;
 
     function setUp() public {
         wood = new ERC20Mock("Sherwood", "WOOD", 18);
         court = new CourtHarness(owner, address(wood), BOND);
         game = new MockCourtChallengeGame();
         governor = new MockCourtGovernor();
+        swood = new MockStakedWood();
 
         // Somewhere well past genesis so `block.timestamp - x` is safe.
         vm.warp(vm.getBlockTimestamp() + 365 days);
 
-        vm.prank(owner);
+        vm.startPrank(owner);
         court.setChallengeGame(address(game));
+        court.setStakedWood(address(swood));
+        vm.stopPrank();
 
-        address[4] memory funded = [alice, bob, carol, dave];
+        address[5] memory funded = [alice, bob, carol, dave, appellant];
         for (uint256 i; i < funded.length; ++i) {
             wood.mint(funded[i], 1_000_000e18);
             vm.prank(funded[i]);
@@ -1158,5 +1186,894 @@ contract CourtTest is Test {
         assertEq(uint256(ICourt.Phase.AppealWindow), 2);
         assertEq(uint256(ICourt.Phase.Appeal), 3);
         assertEq(uint256(ICourt.Phase.Resolved), 4);
+    }
+
+    // ═════════════════ Task 4: layer 2 — the token-vote appeal ═════════════════
+
+    // ── helpers ──
+
+    /// @dev Populate the electorate AT THE CASE'S STORED SNAPSHOT. Weights are
+    ///      whatever `getPastVotes` returns — sWOOD has ALREADY applied the age
+    ///      curve §3.5 asks for (D3), so neither this fixture nor the court
+    ///      re-weights them.
+    ///
+    ///      `newbie` is the point of the fixture: it holds a large position, but
+    ///      only from AFTER the snapshot instant. That is the post-drain buyer
+    ///      and the flash-loan borrower — anyone who acquired WOOD once the
+    ///      exploit was visible — and at `snapshotTs` it has nothing.
+    function _setElectorate(uint256 caseId) internal {
+        uint256 ts = court.caseOf(caseId).snapshotTs;
+        swood.setPastTotalVotes(ts, TOTAL_VOTES);
+        swood.setPastVotes(whale, ts, 200_000e18); // 20% — clears the 10% floor alone
+        swood.setPastVotes(dave, ts, 200_000e18); // 20% — the whale's mirror image
+        swood.setPastVotes(minnow, ts, 10_000e18); // 1% — cannot clear it alone
+        swood.setPastVotes(newbie, ts + 1 days, 500_000e18); // bought in after the drain
+    }
+
+    /// @dev A finalized panel ruling sitting in `AppealWindow`, with the
+    ///      electorate loaded. Every seat votes the same way, so `finalizePanel`
+    ///      closes early and `panelFinalizedAt == referredAt`.
+    function _panelRuled(bool guilty) internal returns (uint256 caseId) {
+        _seatBonded(_three());
+        caseId = _refer();
+        vm.prank(alice);
+        court.panelRule(caseId, guilty);
+        vm.prank(bob);
+        court.panelRule(caseId, guilty);
+        vm.prank(carol);
+        court.panelRule(caseId, guilty);
+        court.finalizePanel(caseId);
+        _setElectorate(caseId);
+    }
+
+    /// @dev Same, but CAROL ABSTAINS and the panel window is burnt down before
+    ///      `finalizePanel`. Two consequences the lock tests need: only alice
+    ///      and bob are in `panelVoters`, and the case finalizes late enough
+    ///      that `finalizedAt + badFaithWindow` genuinely EXTENDS the lock
+    ///      `panelRule` set from `referredAt`.
+    function _panelRuledWithAbstention(bool guilty) internal returns (uint256 caseId) {
+        _seatBonded(_three());
+        caseId = _refer();
+        vm.prank(alice);
+        court.panelRule(caseId, guilty);
+        vm.prank(bob);
+        court.panelRule(caseId, guilty);
+        vm.warp(court.caseOf(caseId).referredAt + court.panelWindow());
+        court.finalizePanel(caseId);
+        _setElectorate(caseId);
+    }
+
+    function _appeal(uint256 caseId) internal {
+        vm.prank(appellant);
+        court.appeal(caseId);
+    }
+
+    /// @dev Warp past the vote window and close layer 2.
+    function _finalizeAppeal(uint256 caseId) internal {
+        vm.warp(court.caseOf(caseId).appealedAt + court.appealVoteWindow());
+        court.finalizeAppeal(caseId);
+    }
+
+    // ──────────────────────────── appeal (filing) ────────────────────────────
+
+    function test_appeal_movesCaseToAppealPhase() public {
+        uint256 caseId = _panelRuled(true);
+        uint256 bondedBefore = court.bondedWood();
+        uint256 balanceBefore = wood.balanceOf(appellant);
+        uint256 bond = court.appealBondWood();
+
+        vm.expectEmit(true, true, false, true);
+        emit ICourt.AppealFiled(caseId, appellant, bond, vm.getBlockTimestamp() + court.appealVoteWindow());
+        _appeal(caseId);
+
+        ICourt.Case memory c = court.caseOf(caseId);
+        assertEq(uint256(c.phase), uint256(ICourt.Phase.Appeal));
+        assertEq(c.appellant, appellant);
+        assertEq(c.appealBond, bond);
+        assertEq(c.appealedAt, vm.getBlockTimestamp());
+        assertEq(wood.balanceOf(appellant), balanceBefore - bond);
+        assertEq(court.bondedWood(), bondedBefore + bond);
+        assertEq(wood.balanceOf(address(court)), court.bondedWood() + court.forfeitedWood());
+    }
+
+    /// @notice The appeal window is finite, and it runs from `panelFinalizedAt`
+    ///         — the court's whole process has to fit inside the challenge's own
+    ///         `disputeTimeout`.
+    function test_appeal_afterWindowReverts() public {
+        uint256 caseId = _panelRuled(true);
+        vm.warp(court.caseOf(caseId).panelFinalizedAt + court.appealWindow());
+
+        vm.expectRevert(ICourt.WindowClosed.selector);
+        vm.prank(appellant);
+        court.appeal(caseId);
+    }
+
+    /// @notice There is nothing to appeal until layer 1 has actually ruled.
+    function test_appeal_beforePanelFinalizedReverts() public {
+        _seatBonded(_three());
+        uint256 caseId = _refer();
+
+        vm.expectRevert(ICourt.WrongPhase.selector);
+        vm.prank(appellant);
+        court.appeal(caseId);
+    }
+
+    /// @notice One appeal per case. A second would either re-open a closed vote
+    ///         or overwrite the first appellant's bond record.
+    function test_appeal_twiceReverts() public {
+        uint256 caseId = _panelRuled(true);
+        _appeal(caseId);
+
+        vm.expectRevert(ICourt.WrongPhase.selector);
+        vm.prank(dave);
+        court.appeal(caseId);
+    }
+
+    /// @notice FAIL AT THE DOOR, not at the vote. A court with no electorate
+    ///         wired would take the appeal, then have no way to finalize it, and
+    ///         the case would sit in `Appeal` until the challenge's own
+    ///         `disputeTimeout` acquitted the accused — the precise hole Plan E
+    ///         exists to close. Refusing the appeal instead leaves the ruling
+    ///         unappealed, which `finalizeUnappealed` can still resolve.
+    function test_appeal_revertsWithoutStakedWoodWired() public {
+        CourtHarness fresh = new CourtHarness(owner, address(wood), BOND);
+        address[] memory m = _one(alice);
+        vm.startPrank(owner);
+        fresh.setChallengeGame(address(game));
+        fresh.setPanel(m);
+        vm.stopPrank();
+
+        vm.startPrank(alice);
+        wood.approve(address(fresh), type(uint256).max);
+        fresh.postPanelBond();
+        vm.stopPrank();
+
+        _disputedChallenge(1 days);
+        uint256 caseId = fresh.refer(CHALLENGE_ID);
+        vm.prank(alice);
+        fresh.panelRule(caseId, true);
+        fresh.finalizePanel(caseId);
+
+        vm.prank(appellant);
+        wood.approve(address(fresh), type(uint256).max);
+
+        vm.expectRevert(ICourt.ZeroAddress.selector);
+        vm.prank(appellant);
+        fresh.appeal(caseId);
+    }
+
+    /// @notice An acquittal is appealable too — the appeal checks the panel in
+    ///         BOTH directions, or it would only ever be a tool for the accused.
+    function test_appeal_worksOnAnAcquittal() public {
+        uint256 caseId = _panelRuled(false);
+        _appeal(caseId);
+        assertEq(uint256(court.caseOf(caseId).phase), uint256(ICourt.Phase.Appeal));
+    }
+
+    // ────────────────────────────── voteAppeal ──────────────────────────────
+
+    /// @notice Weight is `getPastVotes` at the case's STORED snapshot, tallied
+    ///         as stake — layer 2 weighs WOOD where layer 1 counted seats. The
+    ///         court does not re-weight it: sWOOD's return value is already the
+    ///         age-weighted number §3.5 asks for (D3).
+    function test_voteAppeal_tallyIsStakeAtTheStoredSnapshot() public {
+        uint256 caseId = _panelRuled(true);
+        _appeal(caseId);
+
+        vm.expectEmit(true, true, false, true);
+        emit ICourt.AppealVoteCast(caseId, whale, false, 200_000e18);
+        vm.prank(whale);
+        court.voteAppeal(caseId, false);
+
+        vm.prank(minnow);
+        court.voteAppeal(caseId, true);
+
+        ICourt.Case memory c = court.caseOf(caseId);
+        assertEq(c.appealNotGuiltyVotes, 200_000e18);
+        assertEq(c.appealGuiltyVotes, 10_000e18);
+        assertEq(uint256(court.appealVoteOf(caseId, whale)), uint256(ICourt.Ruling.NotGuilty));
+        assertEq(uint256(court.appealVoteOf(caseId, minnow)), uint256(ICourt.Ruling.Guilty));
+    }
+
+    /// @notice THE FLASH-LOAN / POST-DRAIN-BUYER DEFENCE. `newbie` holds half
+    ///         the electorate's weight — but only from AFTER `snapshotTs`, so at
+    ///         the instant before the challenged proposal executed it had
+    ///         nothing, and it cannot vote on whether the drain it bought into
+    ///         was a crime. The defence is the stored snapshot itself, not a
+    ///         separate check: no borrow, purchase or stake reaches back past a
+    ///         timestamp fixed at referral.
+    function test_voteAppeal_postSnapshotStakerHasNoVotingPower() public {
+        uint256 caseId = _panelRuled(true);
+        uint256 snapshotTs = court.caseOf(caseId).snapshotTs;
+        _appeal(caseId);
+
+        // The position is real, and large — just not at the snapshot.
+        assertEq(swood.getPastVotes(newbie, snapshotTs), 0);
+        assertEq(swood.getPastVotes(newbie, snapshotTs + 1 days), 500_000e18);
+
+        vm.expectRevert(ICourt.NoVotingPower.selector);
+        vm.prank(newbie);
+        court.voteAppeal(caseId, false);
+
+        // ...and it moved no tally on its way out.
+        ICourt.Case memory c = court.caseOf(caseId);
+        assertEq(c.appealGuiltyVotes, 0);
+        assertEq(c.appealNotGuiltyVotes, 0);
+    }
+
+    /// @notice An address that never staked at all is refused by the same
+    ///         branch — zero weight is zero weight.
+    function test_voteAppeal_strangerHasNoVotingPower() public {
+        uint256 caseId = _panelRuled(true);
+        _appeal(caseId);
+
+        vm.expectRevert(ICourt.NoVotingPower.selector);
+        vm.prank(makeAddr("stranger"));
+        court.voteAppeal(caseId, true);
+    }
+
+    function test_voteAppeal_doubleVoteReverts() public {
+        uint256 caseId = _panelRuled(true);
+        _appeal(caseId);
+
+        vm.prank(whale);
+        court.voteAppeal(caseId, true);
+
+        vm.expectRevert(ICourt.AlreadyVoted.selector);
+        vm.prank(whale);
+        court.voteAppeal(caseId, false);
+    }
+
+    /// @notice ...and the second attempt cannot double-count the weight either,
+    ///         which is the reason the guard exists.
+    function test_voteAppeal_doubleVoteDoesNotDoubleCount() public {
+        uint256 caseId = _panelRuled(true);
+        _appeal(caseId);
+
+        vm.prank(whale);
+        court.voteAppeal(caseId, true);
+        vm.expectRevert(ICourt.AlreadyVoted.selector);
+        vm.prank(whale);
+        court.voteAppeal(caseId, true);
+
+        assertEq(court.caseOf(caseId).appealGuiltyVotes, 200_000e18);
+    }
+
+    function test_voteAppeal_afterWindowReverts() public {
+        uint256 caseId = _panelRuled(true);
+        _appeal(caseId);
+        vm.warp(court.caseOf(caseId).appealedAt + court.appealVoteWindow());
+
+        vm.expectRevert(ICourt.WindowClosed.selector);
+        vm.prank(whale);
+        court.voteAppeal(caseId, true);
+    }
+
+    /// @notice No voting on a ruling nobody appealed — the phase gate, not the
+    ///         clock, is what says layer 2 is open.
+    function test_voteAppeal_beforeAppealReverts() public {
+        uint256 caseId = _panelRuled(true);
+
+        vm.expectRevert(ICourt.WrongPhase.selector);
+        vm.prank(whale);
+        court.voteAppeal(caseId, true);
+    }
+
+    function test_voteAppeal_afterResolutionReverts() public {
+        uint256 caseId = _panelRuled(true);
+        _appeal(caseId);
+        _finalizeAppeal(caseId);
+
+        vm.expectRevert(ICourt.WrongPhase.selector);
+        vm.prank(whale);
+        court.voteAppeal(caseId, true);
+    }
+
+    // ────── finalizeAppeal: the participation floor (D6) — THE KEY TEST ──────
+
+    /// @notice **THE ANTI-CAPTURE PROPERTY (D6), AND THE MOST IMPORTANT TEST IN
+    ///         TASK 4.** The panel convicted. An appeal was filed and the votes
+    ///         actually cast went the OTHER WAY — unanimously not-guilty — but
+    ///         they came to 1% of the snapshot electorate against a 10% floor.
+    ///         The appeal is therefore a NON-EVENT: the cast votes are
+    ///         discarded, the PANEL'S RULING STANDS, and `ChallengeGame.rule`
+    ///         receives `true` exactly as if nobody had appealed at all.
+    ///
+    ///         This is what removes §3.5's "swing a single-digit-turnout appeal
+    ///         cheaply at a ~$15M mcap" path. Without it, an attacker holding
+    ///         1% of the electorate could overturn any conviction.
+    function test_finalizeAppeal_belowFloorPanelRulingStandsDespiteContraryVotes() public {
+        uint256 caseId = _panelRuled(true);
+        _appeal(caseId);
+
+        // Every vote cast says NOT guilty — and it is not enough to matter.
+        vm.prank(minnow);
+        court.voteAppeal(caseId, false);
+
+        uint256 floor = TOTAL_VOTES * court.participationFloorBps() / 10_000;
+        assertLt(10_000e18, floor, "fixture must be below the floor");
+
+        vm.warp(court.caseOf(caseId).appealedAt + court.appealVoteWindow());
+        vm.expectEmit(true, false, false, true);
+        emit ICourt.AppealBelowFloor(caseId, 10_000e18, floor, ICourt.Ruling.Guilty, BOND);
+        court.finalizeAppeal(caseId);
+
+        ICourt.Case memory c = court.caseOf(caseId);
+        assertEq(uint256(c.finalRuling), uint256(ICourt.Ruling.Guilty), "panel ruling must stand");
+        assertEq(uint256(c.panelRuling), uint256(ICourt.Ruling.Guilty));
+        assertEq(uint256(c.phase), uint256(ICourt.Phase.Resolved));
+
+        // ...and the guilty bit reached the challenge game.
+        assertEq(game.ruleCallCount(), 1);
+        assertEq(game.lastRuledChallengeId(), CHALLENGE_ID);
+        assertTrue(game.lastRuledGuilty());
+    }
+
+    /// @notice The mirror image, so the property is not an artefact of the
+    ///         panel having convicted: a below-floor appeal cannot turn an
+    ///         ACQUITTAL into a conviction either. A non-event is a non-event in
+    ///         both directions.
+    function test_finalizeAppeal_belowFloorLeavesAcquittalStanding() public {
+        uint256 caseId = _panelRuled(false);
+        _appeal(caseId);
+        vm.prank(minnow);
+        court.voteAppeal(caseId, true);
+
+        _finalizeAppeal(caseId);
+
+        assertEq(uint256(court.caseOf(caseId).finalRuling), uint256(ICourt.Ruling.NotGuilty));
+        assertEq(game.ruleCallCount(), 1);
+        assertFalse(game.lastRuledGuilty());
+    }
+
+    /// @notice A below-floor appellant FORFEITS its bond — not for being wrong,
+    ///         but for escalating and then failing to raise the electorate that
+    ///         would have made the escalation mean anything. The WOOD moves out
+    ///         of `bondedWood` (claimable) into `forfeitedWood` (protocol-owned)
+    ///         in one step, so the §4 equality holds across the transition.
+    function test_finalizeAppeal_belowFloorForfeitsTheAppealBond() public {
+        uint256 caseId = _panelRuled(true);
+        uint256 balanceBefore = wood.balanceOf(appellant);
+        _appeal(caseId);
+        vm.prank(minnow);
+        court.voteAppeal(caseId, false);
+
+        _finalizeAppeal(caseId);
+
+        assertEq(wood.balanceOf(appellant), balanceBefore - BOND, "bond is gone");
+        assertEq(court.forfeitedWood(), BOND);
+        assertEq(court.bondedWood(), BOND * 3, "only the three panel bonds remain claimable");
+        assertEq(wood.balanceOf(address(court)), court.bondedWood() + court.forfeitedWood());
+        assertEq(court.caseOf(caseId).appealBond, 0);
+    }
+
+    /// @notice A ZERO-TURNOUT APPEAL LEAVES THE PANEL STANDING even in the
+    ///         degenerate case where the floor itself computes to zero because
+    ///         the snapshot's total vote weight is zero. Without the explicit
+    ///         `turnout == 0` branch the arithmetic would take `0 >= 0` as
+    ///         quorate and flip a conviction to an acquittal on an empty tally.
+    function test_finalizeAppeal_zeroTurnoutStandsEvenWithAZeroFloor() public {
+        uint256 caseId = _panelRuled(true);
+        swood.setPastTotalVotes(court.caseOf(caseId).snapshotTs, 0);
+        _appeal(caseId);
+
+        vm.warp(court.caseOf(caseId).appealedAt + court.appealVoteWindow());
+        vm.expectEmit(true, false, false, true);
+        emit ICourt.AppealBelowFloor(caseId, 0, 0, ICourt.Ruling.Guilty, BOND);
+        court.finalizeAppeal(caseId);
+
+        assertEq(uint256(court.caseOf(caseId).finalRuling), uint256(ICourt.Ruling.Guilty));
+        assertTrue(game.lastRuledGuilty());
+        assertEq(court.forfeitedWood(), BOND);
+    }
+
+    // ───────────── finalizeAppeal: above the floor, the vote decides ─────────────
+
+    /// @notice Quorate, and the electorate disagreed with the panel: the
+    ///         conviction is OVERTURNED and the challenge game is told
+    ///         not-guilty. This is the check §3.5 put above a bribable panel.
+    function test_finalizeAppeal_aboveFloorOverturnsConviction() public {
+        uint256 caseId = _panelRuled(true);
+        _appeal(caseId);
+        vm.prank(whale);
+        court.voteAppeal(caseId, false);
+
+        uint256 floor = TOTAL_VOTES * court.participationFloorBps() / 10_000;
+        vm.warp(court.caseOf(caseId).appealedAt + court.appealVoteWindow());
+        vm.expectEmit(true, false, false, true);
+        emit ICourt.AppealFinalized(caseId, ICourt.Ruling.NotGuilty, 0, 200_000e18, floor);
+        court.finalizeAppeal(caseId);
+
+        assertEq(uint256(court.caseOf(caseId).finalRuling), uint256(ICourt.Ruling.NotGuilty));
+        assertEq(game.ruleCallCount(), 1);
+        assertFalse(game.lastRuledGuilty());
+    }
+
+    /// @notice ...and in the other direction, which is the arc that actually
+    ///         closes Plan D's hole: layer 1 was silent or wrong and acquitted,
+    ///         and a quorate electorate CONVICTS anyway. A guilty approver
+    ///         cannot escape by capturing five panelists.
+    function test_finalizeAppeal_aboveFloorOverturnsAcquittalIntoConviction() public {
+        uint256 caseId = _panelRuled(false);
+        _appeal(caseId);
+        vm.prank(whale);
+        court.voteAppeal(caseId, true);
+
+        _finalizeAppeal(caseId);
+
+        assertEq(uint256(court.caseOf(caseId).finalRuling), uint256(ICourt.Ruling.Guilty));
+        assertEq(game.ruleCallCount(), 1);
+        assertTrue(game.lastRuledGuilty());
+    }
+
+    /// @notice A quorate appeal that UPHOLDS the panel still returns the bond.
+    ///         The bond prices failing to raise a quorum, not being wrong —
+    ///         charging good-faith appellants who lose would deter exactly the
+    ///         check §3.5 placed above the panel. Note the event: this is
+    ///         `AppealFinalized`, not `AppealBelowFloor`, even though the
+    ///         outcome matches the panel's.
+    function test_finalizeAppeal_aboveFloorUpholdingStillReturnsTheBond() public {
+        uint256 caseId = _panelRuled(true);
+        uint256 balanceBefore = wood.balanceOf(appellant);
+        _appeal(caseId);
+        vm.prank(whale);
+        court.voteAppeal(caseId, true);
+
+        vm.warp(court.caseOf(caseId).appealedAt + court.appealVoteWindow());
+        vm.expectEmit(true, true, false, true);
+        emit ICourt.AppealBondReturned(caseId, appellant, BOND);
+        court.finalizeAppeal(caseId);
+
+        assertEq(wood.balanceOf(appellant), balanceBefore, "bond returned in full");
+        assertEq(court.forfeitedWood(), 0);
+        assertEq(court.bondedWood(), BOND * 3);
+        assertEq(wood.balanceOf(address(court)), court.bondedWood());
+        assertTrue(game.lastRuledGuilty());
+    }
+
+    /// @notice A TIE ABOVE THE FLOOR ACQUITS — the same fail-safe
+    ///         `finalizePanel` applies, for the same reason: an electorate split
+    ///         down the middle has not established the ground truth §3.5
+    ///         requires before a 100% slash.
+    function test_finalizeAppeal_tieAboveFloorIsNotGuilty() public {
+        uint256 caseId = _panelRuled(true);
+        _appeal(caseId);
+        vm.prank(whale);
+        court.voteAppeal(caseId, true);
+        vm.prank(dave);
+        court.voteAppeal(caseId, false);
+
+        _finalizeAppeal(caseId);
+
+        ICourt.Case memory c = court.caseOf(caseId);
+        assertEq(c.appealGuiltyVotes, c.appealNotGuiltyVotes, "fixture must be a tie");
+        assertEq(uint256(c.finalRuling), uint256(ICourt.Ruling.NotGuilty));
+        assertFalse(game.lastRuledGuilty());
+    }
+
+    /// @notice Turnout EXACTLY AT the floor is quorate — the comparison is
+    ///         `turnout < floor`, so the boundary decides rather than voids.
+    function test_finalizeAppeal_turnoutExactlyAtFloorIsQuorate() public {
+        uint256 caseId = _panelRuled(true);
+        uint256 ts = court.caseOf(caseId).snapshotTs;
+        uint256 floor = TOTAL_VOTES * court.participationFloorBps() / 10_000;
+        swood.setPastVotes(minnow, ts, floor);
+        _appeal(caseId);
+
+        vm.prank(minnow);
+        court.voteAppeal(caseId, false);
+        _finalizeAppeal(caseId);
+
+        assertEq(uint256(court.caseOf(caseId).finalRuling), uint256(ICourt.Ruling.NotGuilty));
+        assertEq(court.forfeitedWood(), 0, "quorate, so the bond returns");
+    }
+
+    function test_finalizeAppeal_beforeVoteWindowReverts() public {
+        uint256 caseId = _panelRuled(true);
+        _appeal(caseId);
+
+        vm.expectRevert(ICourt.WindowOpen.selector);
+        court.finalizeAppeal(caseId);
+    }
+
+    function test_finalizeAppeal_twiceReverts() public {
+        uint256 caseId = _panelRuled(true);
+        _appeal(caseId);
+        _finalizeAppeal(caseId);
+
+        vm.expectRevert(ICourt.WrongPhase.selector);
+        court.finalizeAppeal(caseId);
+        assertEq(game.ruleCallCount(), 1, "the challenge game is ruled on exactly once");
+    }
+
+    function test_finalizeAppeal_onUnappealedCaseReverts() public {
+        uint256 caseId = _panelRuled(true);
+        vm.expectRevert(ICourt.WrongPhase.selector);
+        court.finalizeAppeal(caseId);
+    }
+
+    // ───────────────────────── finalizeUnappealed ─────────────────────────
+
+    /// @notice The quiet path, and the one that closes Plan D's hole in the
+    ///         common case: nobody appealed, so layer 1's conviction is the
+    ///         court's, and the guilty bit reaches `ChallengeGame.rule` before
+    ///         the challenge's own timeout could acquit the accused.
+    function test_finalizeUnappealed_convictionReachesTheChallengeGame() public {
+        uint256 caseId = _panelRuled(true);
+        vm.warp(court.caseOf(caseId).panelFinalizedAt + court.appealWindow());
+
+        vm.expectEmit(true, true, false, true);
+        emit ICourt.CaseResolved(caseId, CHALLENGE_ID, ICourt.Ruling.Guilty);
+        court.finalizeUnappealed(caseId);
+
+        ICourt.Case memory c = court.caseOf(caseId);
+        assertEq(uint256(c.finalRuling), uint256(ICourt.Ruling.Guilty));
+        assertEq(uint256(c.phase), uint256(ICourt.Phase.Resolved));
+        assertEq(c.finalizedAt, vm.getBlockTimestamp());
+        assertEq(game.ruleCallCount(), 1);
+        assertEq(game.lastRuledChallengeId(), CHALLENGE_ID);
+        assertTrue(game.lastRuledGuilty());
+    }
+
+    /// @notice An unappealed ACQUITTAL fails the challenge, so the challenger's
+    ///         bond forfeits to the accused — the same bit, the other way.
+    function test_finalizeUnappealed_acquittalReachesTheChallengeGame() public {
+        uint256 caseId = _panelRuled(false);
+        vm.warp(court.caseOf(caseId).panelFinalizedAt + court.appealWindow());
+        court.finalizeUnappealed(caseId);
+
+        assertEq(uint256(court.caseOf(caseId).finalRuling), uint256(ICourt.Ruling.NotGuilty));
+        assertEq(game.ruleCallCount(), 1);
+        assertFalse(game.lastRuledGuilty());
+    }
+
+    /// @notice The appeal window must actually elapse: finalizing early would
+    ///         let anyone front-run an appellant and make the panel final.
+    function test_finalizeUnappealed_beforeWindowReverts() public {
+        uint256 caseId = _panelRuled(true);
+        vm.expectRevert(ICourt.WindowOpen.selector);
+        court.finalizeUnappealed(caseId);
+    }
+
+    /// @notice Once appealed, this path is closed — the appeal decides.
+    function test_finalizeUnappealed_afterAppealReverts() public {
+        uint256 caseId = _panelRuled(true);
+        _appeal(caseId);
+        vm.warp(court.caseOf(caseId).panelFinalizedAt + court.appealWindow());
+
+        vm.expectRevert(ICourt.WrongPhase.selector);
+        court.finalizeUnappealed(caseId);
+    }
+
+    function test_finalizeUnappealed_twiceReverts() public {
+        uint256 caseId = _panelRuled(true);
+        vm.warp(court.caseOf(caseId).panelFinalizedAt + court.appealWindow());
+        court.finalizeUnappealed(caseId);
+
+        vm.expectRevert(ICourt.WrongPhase.selector);
+        court.finalizeUnappealed(caseId);
+        assertEq(game.ruleCallCount(), 1);
+    }
+
+    // ───── the seam Task 5 depends on: the bond lock survives a long case ─────
+
+    /// @notice **THE SEAM FOR TASK 5, ON THE UNAPPEALED PATH.** `panelRule`
+    ///         could only lock to `referredAt + panelWindow + badFaithWindow`,
+    ///         because the instant the CASE finalizes did not exist yet. Task
+    ///         5's bad-faith window opens at `finalizedAt`, so resolution must
+    ///         re-lock every member that ruled to `finalizedAt +
+    ///         badFaithWindow`. Without it a panelist escapes the bad-faith
+    ///         slash by outlasting the case, and F6 is decorative.
+    function test_finalizeUnappealed_extendsRulingPanelistsBondLock() public {
+        uint256 caseId = _panelRuledWithAbstention(true);
+        uint256 panelPhaseLock = court.panelBondLockedUntil(alice);
+
+        vm.warp(court.caseOf(caseId).panelFinalizedAt + court.appealWindow());
+        court.finalizeUnappealed(caseId);
+
+        uint256 expected = court.caseOf(caseId).finalizedAt + court.badFaithWindow();
+        assertGt(expected, panelPhaseLock, "fixture must actually extend the lock");
+        assertEq(court.panelBondLockedUntil(alice), expected);
+        assertEq(court.panelBondLockedUntil(bob), expected);
+        // Carol abstained, so she has no ruling to answer for.
+        assertEq(court.panelBondLockedUntil(carol), 0);
+    }
+
+    /// @notice **THE SAME SEAM ON THE APPEAL PATH**, which is where it actually
+    ///         bites: an appeal pushes the case's finalization days past the
+    ///         panel phase, and it is precisely that gap a corrupt panelist
+    ///         would sit out to get its bond back before anyone could vote on
+    ///         its conduct.
+    function test_finalizeAppeal_extendsRulingPanelistsBondLock() public {
+        uint256 caseId = _panelRuledWithAbstention(true);
+        uint256 panelPhaseLock = court.panelBondLockedUntil(alice);
+        _appeal(caseId);
+        vm.prank(whale);
+        court.voteAppeal(caseId, false);
+        _finalizeAppeal(caseId);
+
+        uint256 expected = court.caseOf(caseId).finalizedAt + court.badFaithWindow();
+        assertGt(expected, panelPhaseLock, "the appeal must push finalization out");
+        assertEq(court.panelBondLockedUntil(alice), expected);
+        assertEq(court.panelBondLockedUntil(bob), expected);
+        assertEq(court.panelBondLockedUntil(carol), 0);
+    }
+
+    /// @notice OVERTURNED ON THE MERITS IS NOT BAD FAITH (D4). The appeal above
+    ///         reversed alice's ruling and her bond is still whole and still
+    ///         escrowed — the merits vote never slashes. Task 5's separate
+    ///         bad-faith vote is the only thing that can, which is what stops an
+    ///         attacker who controls the cheap appeal from making a corrupt
+    ///         ruling safe, and stops panelists ruling to predict the vote.
+    function test_finalizeAppeal_overturningDoesNotSlashThePanel() public {
+        uint256 caseId = _panelRuledWithAbstention(true);
+        _appeal(caseId);
+        vm.prank(whale);
+        court.voteAppeal(caseId, false);
+        _finalizeAppeal(caseId);
+
+        assertEq(uint256(court.caseOf(caseId).finalRuling), uint256(ICourt.Ruling.NotGuilty));
+        assertEq(court.panelBondOf(alice), BOND, "the merits vote must not slash");
+        assertEq(court.panelBondOf(bob), BOND);
+        assertEq(court.bondedWood(), BOND * 3);
+    }
+
+    /// @notice The re-lock NEVER SHORTENS. A case that closes early — panel
+    ///         unanimous, appeal filed and resolved quickly — finalizes sooner
+    ///         than `referredAt + panelWindow`, so the panel-phase lock is the
+    ///         later of the two and must survive. The effective deadline is the
+    ///         max of the two, not the last one written.
+    function test_resolve_bondLockNeverShortens() public {
+        uint256 caseId = _panelRuled(true);
+        uint256 referredAt = court.caseOf(caseId).referredAt;
+        uint256 panelPhaseLock = referredAt + court.panelWindow() + court.badFaithWindow();
+        assertEq(court.panelBondLockedUntil(alice), panelPhaseLock);
+
+        _appeal(caseId);
+        vm.prank(whale);
+        court.voteAppeal(caseId, false);
+        _finalizeAppeal(caseId);
+
+        uint256 fromFinalization = court.caseOf(caseId).finalizedAt + court.badFaithWindow();
+        assertLt(fromFinalization, panelPhaseLock, "fixture must resolve early");
+        assertEq(court.panelBondLockedUntil(alice), panelPhaseLock, "the later deadline wins");
+    }
+
+    /// @notice `panelVoters` is stored per case rather than derived from the
+    ///         live roster — Task 5 opens bad-faith votes against exactly this
+    ///         set, and a roster scan would lose a member rotated off after its
+    ///         lock expired.
+    function test_panelVoters_recordsOnlyTheMembersThatRuled() public {
+        uint256 caseId = _panelRuledWithAbstention(true);
+        address[] memory voters = court.panelVoters(caseId);
+        assertEq(voters.length, 2);
+        assertEq(voters[0], alice);
+        assertEq(voters[1], bob);
+    }
+
+    // ────────────────────── windows against the challenge clock ──────────────────────
+
+    /// @notice THE COURT MUST FINISH BEFORE THE CHALLENGE TIMES OUT. Plan D's
+    ///         `resolve` acquits a disputed challenge to the accused once
+    ///         `disputeTimeout` (30 days by default) elapses from `filedAt`, so
+    ///         the court's three windows have to run back to back inside it. Pin
+    ///         the arithmetic here: raising any one ceiling without re-checking
+    ///         the total would hand a guilty approver the timeout acquittal Plan
+    ///         E exists to take away.
+    function test_windowCeilings_fitInsideDefaultDisputeTimeout() public view {
+        uint256 ceilings = court.MAX_PANEL_WINDOW() + court.MAX_APPEAL_WINDOW() + court.MAX_APPEAL_VOTE_WINDOW();
+        assertEq(ceilings, 28 days);
+        assertLt(ceilings, 30 days, "must fit inside ChallengeGame's default disputeTimeout");
+
+        uint256 defaults = court.panelWindow() + court.appealWindow() + court.appealVoteWindow();
+        assertEq(defaults, 15 days);
+        assertLt(defaults, ceilings);
+    }
+
+    // ─────────────────────────── owner parameters ───────────────────────────
+
+    function test_setStakedWood_onlyOwnerAndRejectsZero() public {
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        vm.prank(alice);
+        court.setStakedWood(address(swood));
+
+        vm.expectRevert(ICourt.ZeroAddress.selector);
+        vm.prank(owner);
+        court.setStakedWood(address(0));
+
+        address next = makeAddr("swood2");
+        vm.expectEmit(true, true, false, false);
+        emit ICourt.StakedWoodSet(address(swood), next);
+        vm.prank(owner);
+        court.setStakedWood(next);
+        assertEq(court.stakedWood(), next);
+    }
+
+    function test_setAppealWindow_onlyOwnerAndBounded() public {
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        vm.prank(alice);
+        court.setAppealWindow(1 days);
+
+        vm.expectRevert(ICourt.InvalidParameter.selector);
+        vm.prank(owner);
+        court.setAppealWindow(0);
+
+        uint256 max = court.MAX_APPEAL_WINDOW();
+        vm.expectRevert(ICourt.InvalidParameter.selector);
+        vm.prank(owner);
+        court.setAppealWindow(max + 1);
+
+        vm.prank(owner);
+        court.setAppealWindow(max);
+        assertEq(court.appealWindow(), max);
+    }
+
+    function test_setAppealVoteWindow_onlyOwnerAndBounded() public {
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        vm.prank(alice);
+        court.setAppealVoteWindow(1 days);
+
+        vm.expectRevert(ICourt.InvalidParameter.selector);
+        vm.prank(owner);
+        court.setAppealVoteWindow(0);
+
+        uint256 max = court.MAX_APPEAL_VOTE_WINDOW();
+        vm.expectRevert(ICourt.InvalidParameter.selector);
+        vm.prank(owner);
+        court.setAppealVoteWindow(max + 1);
+
+        vm.prank(owner);
+        court.setAppealVoteWindow(max);
+        assertEq(court.appealVoteWindow(), max);
+    }
+
+    /// @notice A zero appeal bond would make appeals free and delete the only
+    ///         price on failing to raise a quorum. It is never zero: the
+    ///         constructor seeds it from the panel bond and the setter refuses
+    ///         zero, so there is no window in the contract's life where an
+    ///         appeal costs nothing.
+    function test_setAppealBondWood_onlyOwnerAndRejectsZero() public {
+        assertEq(court.appealBondWood(), BOND, "seeded non-zero at construction");
+
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        vm.prank(alice);
+        court.setAppealBondWood(1);
+
+        vm.expectRevert(ICourt.InvalidParameter.selector);
+        vm.prank(owner);
+        court.setAppealBondWood(0);
+
+        vm.prank(owner);
+        court.setAppealBondWood(7e18);
+        assertEq(court.appealBondWood(), 7e18);
+    }
+
+    /// @notice An open appeal is owed the bond it ACTUALLY POSTED. Re-pricing
+    ///         mid-flight must not let governance shrink a refund or inflate a
+    ///         forfeit under an appellant who already paid.
+    function test_setAppealBondWood_doesNotRepriceAnOpenAppeal() public {
+        uint256 caseId = _panelRuled(true);
+        uint256 balanceBefore = wood.balanceOf(appellant);
+        _appeal(caseId);
+
+        vm.prank(owner);
+        court.setAppealBondWood(BOND * 5);
+
+        vm.prank(whale);
+        court.voteAppeal(caseId, false);
+        _finalizeAppeal(caseId);
+
+        assertEq(wood.balanceOf(appellant), balanceBefore, "refunded exactly what was posted");
+    }
+
+    /// @notice A ZERO FLOOR SILENTLY DELETES D6 — every appeal, including one
+    ///         swung by a handful of tokens bought for the purpose, would
+    ///         override the panel. Refuse it at the setter, not only at Task 7's
+    ///         deploy pre-flight.
+    function test_setParticipationFloorBps_onlyOwnerAndBounded() public {
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        vm.prank(alice);
+        court.setParticipationFloorBps(500);
+
+        vm.expectRevert(ICourt.InvalidParameter.selector);
+        vm.prank(owner);
+        court.setParticipationFloorBps(0);
+
+        vm.expectRevert(ICourt.InvalidParameter.selector);
+        vm.prank(owner);
+        court.setParticipationFloorBps(10_001);
+
+        vm.expectEmit(false, false, false, true);
+        emit ICourt.ParticipationFloorBpsSet(1_000, 2_500);
+        vm.prank(owner);
+        court.setParticipationFloorBps(2_500);
+        assertEq(court.participationFloorBps(), 2_500);
+    }
+
+    /// @notice The floor is LIVE, not snapshotted with the case: raising it
+    ///         turns a turnout that would have been quorate into a non-event,
+    ///         and the panel ruling stands.
+    function test_participationFloor_isReadAtFinalization() public {
+        uint256 caseId = _panelRuled(true);
+        _appeal(caseId);
+        vm.prank(whale); // 20% — quorate under the 10% default
+        court.voteAppeal(caseId, false);
+
+        vm.prank(owner);
+        court.setParticipationFloorBps(3_000); // now needs 30%
+
+        _finalizeAppeal(caseId);
+
+        assertEq(uint256(court.caseOf(caseId).finalRuling), uint256(ICourt.Ruling.Guilty));
+        assertEq(court.forfeitedWood(), BOND);
+    }
+
+    // ─────────────────────── forfeited WOOD (Task 5's sink) ───────────────────────
+
+    function test_sweepForfeited_onlyOwnerAndMovesOnlyForfeited() public {
+        uint256 caseId = _panelRuled(true);
+        _appeal(caseId);
+        vm.prank(minnow);
+        court.voteAppeal(caseId, false);
+        _finalizeAppeal(caseId);
+        assertEq(court.forfeitedWood(), BOND);
+
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        vm.prank(alice);
+        court.sweepForfeited(backstop);
+
+        vm.expectRevert(ICourt.ZeroAddress.selector);
+        vm.prank(owner);
+        court.sweepForfeited(address(0));
+
+        vm.expectEmit(true, false, false, true);
+        emit ICourt.ForfeitedWoodSwept(backstop, BOND);
+        vm.prank(owner);
+        uint256 amount = court.sweepForfeited(backstop);
+
+        assertEq(amount, BOND);
+        assertEq(wood.balanceOf(backstop), BOND);
+        assertEq(court.forfeitedWood(), 0);
+        // The panel bonds are untouched: a sweep can never reach a live position.
+        assertEq(court.bondedWood(), BOND * 3);
+        assertEq(wood.balanceOf(address(court)), BOND * 3);
+    }
+
+    function test_sweepForfeited_revertsWithNothingToSweep() public {
+        vm.expectRevert(ICourt.InvalidParameter.selector);
+        vm.prank(owner);
+        court.sweepForfeited(backstop);
+    }
+
+    // ────────────────── §4 invariant across the whole two-layer flow ──────────────────
+
+    /// @notice Spec §4's accounting identity, extended for layer 2:
+    ///         `balance == bondedWood + forfeitedWood` at EVERY step of a case
+    ///         that runs both layers. `bondedWood` is what somebody can still
+    ///         claim; `forfeitedWood` is what the protocol now owns.
+    function test_invariant_balanceEqualsBondedPlusForfeitedAcrossAnAppeal() public {
+        uint256 caseId = _panelRuled(true);
+        _assertWoodBalances();
+
+        _appeal(caseId);
+        _assertWoodBalances();
+        assertEq(court.bondedWood(), BOND * 4, "three panel bonds + the appeal bond");
+
+        vm.prank(minnow);
+        court.voteAppeal(caseId, false);
+        _assertWoodBalances();
+
+        _finalizeAppeal(caseId);
+        _assertWoodBalances();
+        assertEq(court.bondedWood(), BOND * 3);
+        assertEq(court.forfeitedWood(), BOND);
+
+        vm.prank(owner);
+        court.sweepForfeited(backstop);
+        _assertWoodBalances();
+    }
+
+    function _assertWoodBalances() internal view {
+        assertEq(wood.balanceOf(address(court)), court.bondedWood() + court.forfeitedWood());
     }
 }

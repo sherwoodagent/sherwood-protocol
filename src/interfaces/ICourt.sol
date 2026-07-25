@@ -72,6 +72,25 @@ interface ICourt {
     ///        while layer 1 is still open. Task 4 measures `appealWindow` from it.
     /// @param panelGuiltyVotes  Seats that voted guilty — a HEAD COUNT, not
     ///        stake: layer 1 is a panel of people, layer 2 is the token vote.
+    /// @param appellant         Who filed the appeal, or the zero address if
+    ///        the ruling was never appealed. The bond returns here when the
+    ///        appeal clears the participation floor, and NOT when it misses it.
+    /// @param appealedAt        When layer 2's vote opened; `appealVoteWindow`
+    ///        is measured from it.
+    /// @param appealBond        The WOOD posted with the appeal, captured at
+    ///        filing time so a later `setAppealBondWood` cannot change what an
+    ///        open appeal is owed. Zeroed once returned or forfeited.
+    /// @param appealGuiltyVotes STAKE, not a head count — the sum of
+    ///        `getPastVotes(voter, snapshotTs)` over guilty voters. Layer 2 is
+    ///        the token vote, so it weighs WOOD where layer 1 counted seats.
+    /// @param finalRuling       What the court actually handed
+    ///        `ChallengeGame.rule`. Equal to `panelRuling` when the ruling went
+    ///        unappealed OR when an appeal missed the floor (D6); the majority
+    ///        of cast votes otherwise.
+    /// @param finalizedAt       When the CASE resolved. Task 5's bad-faith
+    ///        window opens here — later than the panel phase whenever an appeal
+    ///        ran, which is why the panel bond lock is extended from this
+    ///        instant and not from `referredAt`.
     struct Case {
         uint256 challengeId;
         uint256 snapshotTs;
@@ -81,6 +100,13 @@ interface ICourt {
         uint256 panelNotGuiltyVotes;
         Phase phase;
         Ruling panelRuling;
+        address appellant;
+        uint256 appealedAt;
+        uint256 appealBond;
+        uint256 appealGuiltyVotes;
+        uint256 appealNotGuiltyVotes;
+        Ruling finalRuling;
+        uint256 finalizedAt;
     }
 
     // ── Errors ──
@@ -157,6 +183,38 @@ interface ICourt {
     event PanelWindowSet(uint256 oldWindow, uint256 newWindow);
     event BadFaithWindowSet(uint256 oldWindow, uint256 newWindow);
 
+    // Adjudication, layer 2 (Task 4).
+    /// @param voteDeadline When `voteAppeal` closes and `finalizeAppeal` opens.
+    event AppealFiled(uint256 indexed caseId, address indexed appellant, uint256 bond, uint256 voteDeadline);
+    /// @param weight `getPastVotes(voter, snapshotTs)` — ALREADY age-weighted by
+    ///        sWOOD (D3). The court does not re-weight it.
+    event AppealVoteCast(uint256 indexed caseId, address indexed voter, bool guilty, uint256 weight);
+    /// @notice THE ANTI-CAPTURE EVENT (D6). Turnout missed the participation
+    ///         floor, so the appeal was a NON-EVENT: the panel's ruling stands
+    ///         untouched and the appellant's bond forfeits for failing to raise
+    ///         a quorum. Deliberately NOT `AppealFinalized` with a ruling that
+    ///         happens to match — an indexer must be able to tell "the vote
+    ///         decided nothing" from "the vote upheld the panel".
+    event AppealBelowFloor(
+        uint256 indexed caseId, uint256 turnout, uint256 floor, Ruling standingRuling, uint256 bondForfeited
+    );
+    /// @notice Turnout cleared the floor and the majority of cast votes decided
+    ///         the case, overriding the panel where they disagree.
+    event AppealFinalized(
+        uint256 indexed caseId, Ruling ruling, uint256 guiltyVotes, uint256 notGuiltyVotes, uint256 floor
+    );
+    /// @notice The case is terminal and the verdict has been handed to
+    ///         `ChallengeGame.rule`. Emitted on every path out of the court —
+    ///         unappealed, below-floor and decided-on-appeal alike.
+    event CaseResolved(uint256 indexed caseId, uint256 indexed challengeId, Ruling ruling);
+    event AppealBondReturned(uint256 indexed caseId, address indexed appellant, uint256 amount);
+    event StakedWoodSet(address indexed oldStakedWood, address indexed newStakedWood);
+    event AppealWindowSet(uint256 oldWindow, uint256 newWindow);
+    event AppealVoteWindowSet(uint256 oldWindow, uint256 newWindow);
+    event AppealBondWoodSet(uint256 oldAmount, uint256 newAmount);
+    event ParticipationFloorBpsSet(uint256 oldBps, uint256 newBps);
+    event ForfeitedWoodSwept(address indexed to, uint256 amount);
+
     // ── Roster (D1) ──
     /// @notice Replace the seated panel with `members`.
     /// @dev    Owner-only: the owner is the governance multisig executing the
@@ -225,6 +283,50 @@ interface ICourt {
     ///         that is a property and not an accident.
     function finalizePanel(uint256 caseId) external;
 
+    // ── Layer 2: the token-vote appeal (Task 4) ──
+    /// @notice Appeal a panel ruling to the full WOOD electorate, posting
+    ///         `appealBondWood`. Permissionless and open for `appealWindow`
+    ///         after `finalizePanel`.
+    /// @dev    THE BOND IS NOT A FEE ON BEING WRONG. It forfeits on exactly one
+    ///         condition — turnout below the participation floor — and returns
+    ///         whichever way a quorate vote goes, including one that upholds the
+    ///         panel. Appealing a ruling you lose costs nothing; failing to
+    ///         raise an electorate costs the bond.
+    function appeal(uint256 caseId) external;
+
+    /// @notice Cast a stake-weighted vote on the merits.
+    /// @dev    Weight is `stakedWood.getPastVotes(msg.sender, case.snapshotTs)`,
+    ///         which is ALREADY age-weighted (D3) — the court does not re-weight
+    ///         it, because a second age curve would diverge from sWOOD's. Zero
+    ///         weight reverts `NoVotingPower`, which is what excludes anyone who
+    ///         accumulated WOOD after the exploit: the flash-loan and
+    ///         post-drain-buyer defence is the snapshot, not a separate check.
+    function voteAppeal(uint256 caseId, bool guilty) external;
+
+    /// @notice Close layer 2 and hand the verdict to `ChallengeGame.rule`.
+    /// @dev    TWO BRANCHES, AND THEY ARE NOT THE SAME OUTCOME REACHED TWO WAYS.
+    ///         Below the participation floor the PANEL RULING STANDS (D6) — the
+    ///         appeal decided nothing, so the cast votes are discarded even when
+    ///         they went the other way, and the bond forfeits. At or above it,
+    ///         the majority of cast votes decides and overrides the panel.
+    function finalizeAppeal(uint256 caseId) external;
+
+    /// @notice Make an unappealed panel ruling final once `appealWindow` has
+    ///         elapsed with no appeal, handing it to `ChallengeGame.rule`.
+    function finalizeUnappealed(uint256 caseId) external;
+
+    /// @notice How `voter` voted on `caseId`'s appeal; `Ruling.None` means it
+    ///         has not.
+    function appealVoteOf(uint256 caseId, address voter) external view returns (Ruling);
+
+    /// @notice The members that recorded a ruling on `caseId`, in vote order.
+    ///         The set whose bonds the case's resolution locks, and the set
+    ///         Task 5's bad-faith track can be opened against.
+    /// @dev    Stored per case rather than derived from the live roster: a
+    ///         member can be rotated off the panel once its lock expires, and a
+    ///         roster scan would then lose the fact that it ruled.
+    function panelVoters(uint256 caseId) external view returns (address[] memory);
+
     function caseOf(uint256 caseId) external view returns (Case memory);
     function caseCount() external view returns (uint256);
     /// @notice The case opened against `challengeId`, or zero if none. Case ids
@@ -245,15 +347,47 @@ interface ICourt {
     ///         least that long.
     function badFaithWindow() external view returns (uint256);
 
-    /// @notice WOOD the court holds on behalf of open positions (spec §4). The
-    ///         invariant is `wood.balanceOf(court) == bondedWood`: in Task 2
-    ///         that is posted panel bonds; Tasks 4 and 5 add open appeal and
-    ///         bad-faith bonds to the same accumulator.
+    /// @notice The staking contract layer 2's electorate is read from. Its
+    ///         `getPastVotes` is the age-weighted primitive §3.5 asks for (D3).
+    function stakedWood() external view returns (address);
+    /// @notice How long a panel ruling stays appealable, from `panelFinalizedAt`.
+    function appealWindow() external view returns (uint256);
+    /// @notice How long layer 2's vote stays open, from `appealedAt`.
+    function appealVoteWindow() external view returns (uint256);
+    /// @notice The WOOD an appellant posts. Forfeits only on a below-floor
+    ///         turnout.
+    function appealBondWood() external view returns (uint256);
+    /// @notice Minimum turnout, in bps of `getPastTotalVotes(snapshotTs)`, for
+    ///         an appeal to decide anything (D6). Below it the panel ruling
+    ///         stands. Never zero — a zero floor silently deletes the
+    ///         anti-capture property that stops a single-digit-turnout appeal
+    ///         from being swung cheaply at a ~$15M mcap.
+    function participationFloorBps() external view returns (uint256);
+
+    /// @notice WOOD the court holds on behalf of open positions (spec §4): the
+    ///         posted panel bonds plus the bonds of appeals still open. The
+    ///         invariant is `wood.balanceOf(court) == bondedWood +
+    ///         forfeitedWood`.
     function bondedWood() external view returns (uint256);
+
+    /// @notice WOOD the court owns outright, from appeal bonds forfeited for
+    ///         missing the participation floor. Held rather than burned so
+    ///         governance can direct it; Task 5 sends slashed panel bonds to
+    ///         the same accumulator and the deploy runbook points
+    ///         `sweepForfeited` at the protocol backstop.
+    function forfeitedWood() external view returns (uint256);
 
     // ── Owner setters ──
     function setPanelBondWood(uint256 newBond) external;
     function setChallengeGame(address newGame) external;
     function setPanelWindow(uint256 newWindow) external;
     function setBadFaithWindow(uint256 newWindow) external;
+    function setStakedWood(address newStakedWood) external;
+    function setAppealWindow(uint256 newWindow) external;
+    function setAppealVoteWindow(uint256 newWindow) external;
+    function setAppealBondWood(uint256 newBond) external;
+    function setParticipationFloorBps(uint256 newBps) external;
+    /// @notice Move forfeited WOOD out of the court. Never touches `bondedWood`,
+    ///         so no open position can be swept out from under its owner.
+    function sweepForfeited(address to) external returns (uint256 amount);
 }

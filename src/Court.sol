@@ -7,6 +7,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ICourt} from "./interfaces/ICourt.sol";
 import {IChallengeGame} from "./interfaces/IChallengeGame.sol";
 import {ISyndicateGovernor} from "./interfaces/ISyndicateGovernor.sol";
+import {IStakedWood} from "./interfaces/IStakedWood.sol";
 
 /**
  * @title Court
@@ -17,10 +18,10 @@ import {ISyndicateGovernor} from "./interfaces/ISyndicateGovernor.sol";
  *         appealable to a full WOOD vote, and the outcome drives
  *         `ChallengeGame.rule`.
  *
- * @dev    THIS REVISION IS THE ROSTER, THE MEMBER BONDS AND LAYER 1 (Plan E
- *         Tasks 2-3). The token-vote appeal (Task 4) and the bad-faith track
- *         (Task 5) build on this foundation. `ICourt` already declares their
- *         errors, so those tasks add functions rather than churning the ABI.
+ * @dev    THIS REVISION IS THE ROSTER, THE MEMBER BONDS AND BOTH LAYERS (Plan E
+ *         Tasks 2-4). The bad-faith track (Task 5) builds on it. `ICourt`
+ *         already declares its errors, so that task adds functions rather than
+ *         churning the ABI.
  *
  * @dev    NEITHER HALF IS SAFE ALONE. §3.5: a token vote is incompetent for
  *         forensic questions and capturable at ~$15M mcap; a standalone panel
@@ -34,12 +35,14 @@ import {ISyndicateGovernor} from "./interfaces/ISyndicateGovernor.sol";
  *         `ChallengeGame`). Storage layout is therefore unconstrained and no
  *         golden pins it.
  *
- * @dev    §4 INVARIANT: `wood.balanceOf(this) >= bondedWood`, matching
- *         `ChallengeGame`'s. In this revision `bondedWood` is exactly the sum
- *         of posted panel bonds; Tasks 4 and 5 add open appeal and bad-faith
- *         bonds to the same accumulator. The court pays out nothing but bonds,
- *         so the two are equal except for WOOD somebody donated here by
- *         mistake — which no path ever spends.
+ * @dev    §4 INVARIANT: `wood.balanceOf(this) == bondedWood + forfeitedWood`.
+ *         `bondedWood` is every WOOD position somebody can still claim — posted
+ *         panel bonds plus the bonds of appeals still open — and
+ *         `forfeitedWood` is what the protocol now owns, from appeal bonds that
+ *         missed the participation floor. Task 5 adds bad-faith bonds to the
+ *         first and slashed panel bonds to the second. The equality is exact
+ *         except for WOOD somebody donated here by mistake, which no path ever
+ *         spends.
  */
 contract Court is Ownable2Step, ICourt {
     using SafeERC20 for IERC20;
@@ -68,6 +71,24 @@ contract Court is Ownable2Step, ICourt {
     ///         thing it bounds is how long a member's bond can be escrowed
     ///         after it rules.
     uint256 public constant MAX_BAD_FAITH_WINDOW = 90 days;
+
+    /// @notice Ceiling on `appealWindow` — how long a panel ruling stays open
+    ///         to appeal.
+    /// @dev    SAME CLOCK AS `MAX_PANEL_WINDOW`, same reason. The court's three
+    ///         windows run back to back inside the challenge's `disputeTimeout`,
+    ///         and their ceilings are chosen so the worst case
+    ///         (`MAX_PANEL_WINDOW + MAX_APPEAL_WINDOW + MAX_APPEAL_VOTE_WINDOW`
+    ///         = 14 + 7 + 7 = 28 days) still fits inside `ChallengeGame`'s
+    ///         30-day default timeout with room for the referral itself.
+    ///         `test_windowCeilings_fitInsideDefaultDisputeTimeout` pins the
+    ///         arithmetic so raising one ceiling cannot quietly push the total
+    ///         past the clock and hand the accused an acquittal by default.
+    uint256 public constant MAX_APPEAL_WINDOW = 7 days;
+
+    /// @notice Ceiling on `appealVoteWindow` — how long layer 2's vote runs.
+    uint256 public constant MAX_APPEAL_VOTE_WINDOW = 7 days;
+
+    uint256 internal constant BPS_DENOMINATOR = 10_000;
 
     IERC20 public immutable wood;
 
@@ -100,6 +121,12 @@ contract Court is Ownable2Step, ICourt {
     ///      WOOD this contract holds and must still balance.
     uint256 public bondedWood;
 
+    /// @inheritdoc ICourt
+    /// @dev Grows only in `finalizeAppeal`'s below-floor branch. Never overlaps
+    ///      `bondedWood`: a bond moves from one to the other in the same
+    ///      statement, so the §4 equality holds across the transition.
+    uint256 public forfeitedWood;
+
     // ─────────────────────── Adjudication state (Task 3) ───────────────────────
 
     /// @inheritdoc ICourt
@@ -127,6 +154,42 @@ contract Court is Ownable2Step, ICourt {
     /// @inheritdoc ICourt
     mapping(uint256 caseId => mapping(address member => Ruling)) public panelVoteOf;
 
+    /// @dev Appended by `panelRule`, read when the case resolves so every member
+    ///      that ruled has its bond re-locked to `finalizedAt + badFaithWindow`.
+    ///      Bounded by `MAX_PANEL_SIZE`.
+    mapping(uint256 caseId => address[]) internal _panelVoters;
+
+    // ─────────────────── Layer 2 state: the appeal (Task 4) ───────────────────
+
+    /// @inheritdoc ICourt
+    /// @dev Typed as `address` so the generated getter matches the interface.
+    address public stakedWood;
+
+    /// @inheritdoc ICourt
+    /// @dev 3 days: an appeal is a decision to escalate, not the vote itself, so
+    ///      it needs only long enough for the electorate to notice a ruling.
+    uint256 public appealWindow = 3 days;
+
+    /// @inheritdoc ICourt
+    /// @dev 5 days: a full token vote, in the range governance votes normally
+    ///      run, and short enough that panel + appeal + vote stays well inside
+    ///      the challenge's `disputeTimeout`.
+    uint256 public appealVoteWindow = 5 days;
+
+    /// @inheritdoc ICourt
+    uint256 public appealBondWood;
+
+    /// @inheritdoc ICourt
+    /// @dev 10% of `getPastTotalVotes` at the snapshot. Named in D6 as the
+    ///      anti-capture parameter: §3.5 puts the token layer's failure mode at
+    ///      "single-digit turnout, capturable at ~$15M mcap", and this is the
+    ///      number that says an appeal below that turnout decides nothing rather
+    ///      than deciding everything cheaply.
+    uint256 public participationFloorBps = 1_000;
+
+    /// @inheritdoc ICourt
+    mapping(uint256 caseId => mapping(address voter => Ruling)) public appealVoteOf;
+
     /// @param initialOwner   The governance multisig that executes the off-chain
     ///                       panel election (D1).
     /// @param wood_          The WOOD token every bond here is denominated in.
@@ -139,6 +202,14 @@ contract Court is Ownable2Step, ICourt {
         wood = IERC20(wood_);
         panelBondWood = panelBondWood_;
         emit PanelBondWoodSet(0, panelBondWood_);
+
+        // The appeal bond starts at the panel bond so it is NEVER ZERO at any
+        // point in the contract's life. A zero appeal bond would make appeals
+        // free, and the below-floor forfeit — the only thing that prices a
+        // failed quorum (D6) — would cost the appellant nothing. Governance
+        // tunes it with `setAppealBondWood`, which also refuses zero.
+        appealBondWood = panelBondWood_;
+        emit AppealBondWoodSet(0, panelBondWood_);
     }
 
     // ─────────────────────────── Roster (D1) ───────────────────────────
@@ -318,12 +389,13 @@ contract Court is Ownable2Step, ICourt {
     ///      `referredAt + panelWindow + badFaithWindow`: the latest instant
     ///      layer 1 can close, plus a full bad-faith window.
     ///
-    ///      THAT IS A FLOOR, NOT THE FINAL DEADLINE. Task 5 opens its window
-    ///      when the CASE finalizes, which is later than the panel phase
-    ///      whenever an appeal runs. TASK 4 MUST therefore call
-    ///      `_lockPanelBond(member, finalizedAt + badFaithWindow)` for the
-    ///      members that ruled when it resolves a case; `_lockPanelBond` only
-    ///      ever extends, so that is safe to layer on top of this one.
+    ///      THAT IS A FLOOR, NOT THE FINAL DEADLINE, because Task 5's window
+    ///      opens when the CASE finalizes — later than the panel phase whenever
+    ///      an appeal runs. `_resolve` therefore re-locks every member in
+    ///      `_panelVoters[caseId]` to `finalizedAt + badFaithWindow` on BOTH
+    ///      finalize paths; `_lockPanelBond` only ever extends, so the two
+    ///      locks layer safely. Without that second lock a panelist could
+    ///      escape the bad-faith slash simply by sitting out a long appeal.
     /// @dev ACCEPTED CONSEQUENCE: because unseating a locked member reverts, a
     ///      panelist can delay its own rotation off the roster by ruling. The
     ///      escape hatch is `setPanelBondWood` — raising the requirement makes
@@ -339,6 +411,7 @@ contract Court is Ownable2Step, ICourt {
         if (panelVoteOf[caseId][msg.sender] != Ruling.None) revert AlreadyRuled();
 
         panelVoteOf[caseId][msg.sender] = guilty ? Ruling.Guilty : Ruling.NotGuilty;
+        _panelVoters[caseId].push(msg.sender);
         if (guilty) {
             c.panelGuiltyVotes += 1;
         } else {
@@ -393,9 +466,185 @@ contract Court is Ownable2Step, ICourt {
         emit PanelFinalized(caseId, ruling, guiltyVotes, notGuiltyVotes);
     }
 
+    // ─────────────── Layer 2: the token-vote appeal (§3.5) ───────────────
+
+    /// @inheritdoc ICourt
+    /// @dev PERMISSIONLESS, like `refer`. §3.5's second layer exists because a
+    ///      five-person panel is bribable; gating who may invoke the check on
+    ///      the panel would hand the same five people a say in whether they are
+    ///      checked.
+    /// @dev REQUIRES `stakedWood` WIRED, and refuses the appeal rather than the
+    ///      later vote. A case that entered `Appeal` with no electorate to read
+    ///      would have no way to finalize and would sit there until the
+    ///      challenge's own `disputeTimeout` acquitted the accused — the exact
+    ///      hole Plan E exists to close. Failing at the door leaves the ruling
+    ///      unappealed instead, which `finalizeUnappealed` can still resolve.
+    function appeal(uint256 caseId) external {
+        Case storage c = _cases[caseId];
+        if (c.phase != Phase.AppealWindow) revert WrongPhase();
+        if (block.timestamp >= c.panelFinalizedAt + appealWindow) revert WindowClosed();
+        if (stakedWood == address(0)) revert ZeroAddress();
+
+        uint256 bond = appealBondWood;
+        c.appellant = msg.sender;
+        c.appealBond = bond;
+        c.appealedAt = block.timestamp;
+        c.phase = Phase.Appeal;
+        bondedWood += bond;
+
+        wood.safeTransferFrom(msg.sender, address(this), bond);
+        emit AppealFiled(caseId, msg.sender, bond, block.timestamp + appealVoteWindow);
+    }
+
+    /// @inheritdoc ICourt
+    /// @dev DO NOT RE-WEIGHT THE RESULT (D3). `getPastVotes` is documented by
+    ///      `IStakedWood` as "AGE-WEIGHTED own staked + delegated-inbound capped
+    ///      at `delegatedWeightCapX ×` aged own", which is precisely the
+    ///      pre-accumulation defence §3.5 asks for. A second age curve here
+    ///      would duplicate the staking contract's and inevitably diverge from
+    ///      it.
+    /// @dev THE ZERO-WEIGHT REVERT IS THE FLASH-LOAN DEFENCE, and it is a
+    ///      consequence of the snapshot rather than a check of its own. Weight
+    ///      is read at `c.snapshotTs` — `executedAt - 1`, the instant BEFORE the
+    ///      challenged proposal executed — so WOOD bought or staked after the
+    ///      drain, by the exploiter or by anyone who saw it happen, has no
+    ///      weight at all. There is no borrow, no flash loan and no post-hoc
+    ///      accumulation that reaches back past a stored timestamp.
+    function voteAppeal(uint256 caseId, bool guilty) external {
+        Case storage c = _cases[caseId];
+        if (c.phase != Phase.Appeal) revert WrongPhase();
+        if (block.timestamp >= c.appealedAt + appealVoteWindow) revert WindowClosed();
+        if (appealVoteOf[caseId][msg.sender] != Ruling.None) revert AlreadyVoted();
+
+        uint256 weight = IStakedWood(stakedWood).getPastVotes(msg.sender, c.snapshotTs);
+        if (weight == 0) revert NoVotingPower();
+
+        appealVoteOf[caseId][msg.sender] = guilty ? Ruling.Guilty : Ruling.NotGuilty;
+        if (guilty) {
+            c.appealGuiltyVotes += weight;
+        } else {
+            c.appealNotGuiltyVotes += weight;
+        }
+
+        emit AppealVoteCast(caseId, msg.sender, guilty, weight);
+    }
+
+    /// @inheritdoc ICourt
+    /// @dev THE BELOW-FLOOR BRANCH IS THE ANTI-CAPTURE PROPERTY (D6), and it is
+    ///      NOT "the appeal upheld the panel". An appeal that fails to raise a
+    ///      quorum is a NON-EVENT: the votes that were cast are discarded even
+    ///      when they went the other way, the panel's ruling stands untouched,
+    ///      and the appellant's bond forfeits for failing to raise an
+    ///      electorate. That is what removes the "swing a single-digit-turnout
+    ///      appeal cheaply at a ~$15M mcap" path §3.5 names as the token layer's
+    ///      failure mode. It gets its own event so no indexer can confuse the
+    ///      two, and the bond forfeits precisely because the appellant chose to
+    ///      escalate and then did not deliver the turnout that would have made
+    ///      the escalation mean something.
+    /// @dev A ZERO-TURNOUT APPEAL ALSO LEAVES THE PANEL STANDING, even in the
+    ///      degenerate case where the floor itself computes to zero because the
+    ///      snapshot's total vote weight is zero or dust. A vote nobody cast has
+    ///      not overturned anything, and without this the arithmetic would flip
+    ///      a `Guilty` panel ruling to `NotGuilty` on an empty tally.
+    /// @dev ABOVE THE FLOOR, A TIE ACQUITS — the same fail-safe `finalizePanel`
+    ///      applies for the same reason: an electorate split down the middle has
+    ///      not established the ground truth §3.5 requires before a 100% slash.
+    /// @dev THE APPEAL BOND IS NOT A FEE ON LOSING. Above the floor it returns
+    ///      whichever way the vote went, including a vote that upheld the panel:
+    ///      the appellant did the thing the mechanism wanted — it brought the
+    ///      question to the electorate — and pricing a good-faith appeal that
+    ///      loses would deter exactly the check §3.5 put above the panel.
+    function finalizeAppeal(uint256 caseId) external {
+        Case storage c = _cases[caseId];
+        if (c.phase != Phase.Appeal) revert WrongPhase();
+        if (block.timestamp < c.appealedAt + appealVoteWindow) revert WindowOpen();
+
+        uint256 guiltyVotes = c.appealGuiltyVotes;
+        uint256 notGuiltyVotes = c.appealNotGuiltyVotes;
+        uint256 turnout = guiltyVotes + notGuiltyVotes;
+        uint256 floor =
+            participationFloorBps * IStakedWood(stakedWood).getPastTotalVotes(c.snapshotTs) / BPS_DENOMINATOR;
+
+        uint256 bond = c.appealBond;
+        c.appealBond = 0;
+        bondedWood -= bond;
+
+        Ruling ruling;
+        bool refund;
+        if (turnout == 0 || turnout < floor) {
+            ruling = c.panelRuling;
+            forfeitedWood += bond;
+            emit AppealBelowFloor(caseId, turnout, floor, ruling, bond);
+        } else {
+            ruling = guiltyVotes > notGuiltyVotes ? Ruling.Guilty : Ruling.NotGuilty;
+            refund = true;
+            emit AppealFinalized(caseId, ruling, guiltyVotes, notGuiltyVotes, floor);
+        }
+
+        // Every state write above and inside `_resolve` lands before either
+        // external call, and `_resolve` leaves the case `Resolved`, so neither
+        // the challenge game nor the appellant can re-enter this function.
+        _resolve(caseId, c, ruling);
+
+        if (refund) {
+            address appellant = c.appellant;
+            wood.safeTransfer(appellant, bond);
+            emit AppealBondReturned(caseId, appellant, bond);
+        }
+    }
+
+    /// @inheritdoc ICourt
+    /// @dev The quiet path, and the common one: nobody appealed, so layer 1's
+    ///      ruling is the court's. Permissionless, and the caller chooses
+    ///      nothing — the verdict is `c.panelRuling` and the clock decides when.
+    function finalizeUnappealed(uint256 caseId) external {
+        Case storage c = _cases[caseId];
+        if (c.phase != Phase.AppealWindow) revert WrongPhase();
+        if (block.timestamp < c.panelFinalizedAt + appealWindow) revert WindowOpen();
+        _resolve(caseId, c, c.panelRuling);
+    }
+
+    /// @inheritdoc ICourt
+    function panelVoters(uint256 caseId) external view returns (address[] memory) {
+        return _panelVoters[caseId];
+    }
+
     /// @inheritdoc ICourt
     function caseOf(uint256 caseId) external view returns (Case memory) {
         return _cases[caseId];
+    }
+
+    /// @dev THE ONE PLACE A CASE BECOMES TERMINAL. Shared by both finalize
+    ///      paths so the three things that must happen on every branch — write
+    ///      the verdict, RE-LOCK THE RULING PANELISTS' BONDS, hand the bit to
+    ///      `ChallengeGame.rule` — cannot be done on one path and forgotten on
+    ///      the other.
+    /// @dev THE RE-LOCK IS F6's DEFENCE, NOT BOOKKEEPING. `panelRule` could only
+    ///      lock to `referredAt + panelWindow + badFaithWindow`, because the
+    ///      instant the CASE finalizes did not exist yet. Task 5's bad-faith
+    ///      window opens HERE, which is later whenever an appeal ran, so without
+    ///      this extension a panelist could make a corrupt ruling, wait out a
+    ///      long appeal, withdraw its bond the moment the panel-phase lock
+    ///      expired and leave the bad-faith track with nothing to slash. The
+    ///      entire binding incentive on panel behaviour would be decorative.
+    /// @dev The verdict is a SINGLE BIT by the time it leaves here (D7): §3.5
+    ///      treats a guilty finding as ground truth and Plan D's `_settle`
+    ///      slashes at `maxSlashBps` with no severity ramp, so there is nothing
+    ///      else for the court to say.
+    function _resolve(uint256 caseId, Case storage c, Ruling ruling) internal {
+        c.finalRuling = ruling;
+        c.finalizedAt = block.timestamp;
+        c.phase = Phase.Resolved;
+
+        uint256 until = block.timestamp + badFaithWindow;
+        address[] storage voters = _panelVoters[caseId];
+        uint256 n = voters.length;
+        for (uint256 i; i < n; ++i) {
+            _lockPanelBond(voters[i], until);
+        }
+
+        emit CaseResolved(caseId, c.challengeId, ruling);
+        IChallengeGame(challengeGame).rule(c.challengeId, ruling == Ruling.Guilty);
     }
 
     // ─────────────────────── Hooks for Tasks 4-5 ───────────────────────
@@ -482,6 +731,75 @@ contract Court is Ownable2Step, ICourt {
         if (newWindow == 0 || newWindow > MAX_BAD_FAITH_WINDOW) revert InvalidParameter();
         emit BadFaithWindowSet(badFaithWindow, newWindow);
         badFaithWindow = newWindow;
+    }
+
+    /// @inheritdoc ICourt
+    /// @dev No zero escape, for the same reason as `setChallengeGame`: a court
+    ///      with no electorate to read cannot run layer 2, and §3.5 is explicit
+    ///      that neither layer is safe alone.
+    function setStakedWood(address newStakedWood) external onlyOwner {
+        if (newStakedWood == address(0)) revert ZeroAddress();
+        emit StakedWoodSet(stakedWood, newStakedWood);
+        stakedWood = newStakedWood;
+    }
+
+    /// @inheritdoc ICourt
+    /// @dev Bounded `(0, MAX_APPEAL_WINDOW]`. A zero window would close the
+    ///      appeal before anyone could file one, making the panel final and
+    ///      leaving the bribable half of §3.5 unchecked.
+    function setAppealWindow(uint256 newWindow) external onlyOwner {
+        if (newWindow == 0 || newWindow > MAX_APPEAL_WINDOW) revert InvalidParameter();
+        emit AppealWindowSet(appealWindow, newWindow);
+        appealWindow = newWindow;
+    }
+
+    /// @inheritdoc ICourt
+    /// @dev Bounded `(0, MAX_APPEAL_VOTE_WINDOW]`. A zero window would let an
+    ///      appeal be filed and finalized in one block on whatever votes the
+    ///      filer could line up in the same transaction.
+    function setAppealVoteWindow(uint256 newWindow) external onlyOwner {
+        if (newWindow == 0 || newWindow > MAX_APPEAL_VOTE_WINDOW) revert InvalidParameter();
+        emit AppealVoteWindowSet(appealVoteWindow, newWindow);
+        appealVoteWindow = newWindow;
+    }
+
+    /// @inheritdoc ICourt
+    /// @dev Zero refused: it would make appeals free and delete the only price
+    ///      on failing to raise a quorum. Governs FUTURE appeals only — an open
+    ///      appeal is owed the `c.appealBond` it actually posted.
+    function setAppealBondWood(uint256 newBond) external onlyOwner {
+        if (newBond == 0) revert InvalidParameter();
+        emit AppealBondWoodSet(appealBondWood, newBond);
+        appealBondWood = newBond;
+    }
+
+    /// @inheritdoc ICourt
+    /// @dev Bounded `(0, BPS_DENOMINATOR]`. ZERO IS REFUSED AT THE SETTER, not
+    ///      only at Task 7's deploy pre-flight: a zero floor silently deletes
+    ///      D6, and every appeal — including one swung by a handful of tokens
+    ///      bought for the purpose — would override the panel.
+    /// @dev The ceiling is the honest one rather than a comfortable one. A floor
+    ///      at 100% of `getPastTotalVotes` is unreachable in practice and makes
+    ///      the panel final; that is a governance decision this setter reports
+    ///      through its event rather than one it can prevent.
+    function setParticipationFloorBps(uint256 newBps) external onlyOwner {
+        if (newBps == 0 || newBps > BPS_DENOMINATOR) revert InvalidParameter();
+        emit ParticipationFloorBpsSet(participationFloorBps, newBps);
+        participationFloorBps = newBps;
+    }
+
+    /// @inheritdoc ICourt
+    /// @dev Only ever moves `forfeitedWood`, never `bondedWood`, so no open
+    ///      panel bond or live appeal can be swept out from under its owner —
+    ///      the §4 equality is what makes that guarantee checkable.
+    function sweepForfeited(address to) external onlyOwner returns (uint256 amount) {
+        if (to == address(0)) revert ZeroAddress();
+        amount = forfeitedWood;
+        if (amount == 0) revert InvalidParameter();
+
+        forfeitedWood = 0;
+        wood.safeTransfer(to, amount);
+        emit ForfeitedWoodSwept(to, amount);
     }
 
     // ─────────────────────────── Internals ───────────────────────────
