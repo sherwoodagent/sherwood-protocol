@@ -32,11 +32,33 @@ interface ICompensationEscrow {
     function redeem(uint256 caseId) external returns (uint256 amount);
     function sweepResidue(uint256 caseId) external returns (uint256 amount);
 
+    /// @notice What `holder` may still redeem from `caseId`.
+    /// @dev Pro-rata against the case's pinned snapshot:
+    ///      `proceeds * getPastVotes(holder, snap) / getPastTotalSupply(snap)`,
+    ///      rounded down and CAPPED at the case's own unpaid remainder
+    ///      (`proceeds - redeemed`) so a case can never pay out of a sibling
+    ///      case's funds. Returns 0 once redeemed or swept.
+    ///
+    /// @dev CLAIM BASIS (accepted edge, decision D1) — integrators read this:
+    ///      apportionment uses the vault's ERC20Votes CHECKPOINTS, not raw
+    ///      balances, because Solidity keeps no historical balance.
+    ///      `SyndicateVault` auto-delegates on receipt, so `getPastVotes(h, t)`
+    ///      equals h's balance for any holder that never delegated away. A
+    ///      holder that DID explicitly delegate has its compensation credited to
+    ///      the DELEGATE, not to itself. Accepted for v1b; revisit if
+    ///      vault-share delegation becomes common.
     function claimable(uint256 caseId, address holder) external view returns (uint256);
     function caseOf(uint256 caseId)
         external
         view
-        returns (address vault, uint256 snapshotTimestamp, uint256 proceeds, uint256 redeemed, uint256 openedAt);
+        returns (
+            address vault,
+            uint256 snapshotTimestamp,
+            uint256 proceeds,
+            uint256 redeemed,
+            uint256 openedAt,
+            bool swept
+        );
     function totalEscrowed() external view returns (uint256);
 
     function setAuthorizedFunder(address funder) external;

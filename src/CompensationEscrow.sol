@@ -43,9 +43,12 @@ interface IVaultVotesMinimal {
  *         compensation credited to the delegate instead. Accepted for v1b;
  *         revisit if vault-share delegation becomes common.
  *
- * @dev    Not upgradeable, and not refundable: the registry's `refundSlash`
- *         appeal reserve stays bound to the block-quorum review slash, because
- *         a verdict slash is proven malice (spec §4).
+ * @dev    Not upgradeable, and not refundable. The separation from the review
+ *         path is one of STRUCTURALLY SEPARATE ACCOUNTING, not of a binding
+ *         rule: the registry's `refundSlash` pays from the registry's own
+ *         funded appeal reserve, never from slash proceeds, so it cannot refund
+ *         a verdict. Nothing that reaches this escrow can flow back out through
+ *         the registry (spec §4).
  */
 contract CompensationEscrow is Ownable2Step, ICompensationEscrow {
     using SafeERC20 for IERC20;
@@ -57,6 +60,13 @@ contract CompensationEscrow is Ownable2Step, ICompensationEscrow {
         uint256 redeemed;
         uint256 openedAt;
         uint256 snapshotSupply; // cached: a past snapshot cannot change
+        /// @dev The residue window in force AT OPEN, frozen here. `sweepResidue`
+        ///      reads this, NOT the live `residueWindow`: otherwise the owner
+        ///      could lower the window to the 30-day floor after the fact and
+        ///      sweep a case whose holders were promised longer. The struct
+        ///      already carries `openedAt` and `snapshotSupply` for exactly this
+        ///      "terms are fixed at open" reason.
+        uint256 residueWindowAtOpen;
         bool swept; // residue returned to the backstop; claims are closed
     }
 
@@ -119,6 +129,8 @@ contract CompensationEscrow is Ownable2Step, ICompensationEscrow {
             redeemed: 0,
             openedAt: block.timestamp,
             snapshotSupply: supply,
+            // Freeze the redemption window at the terms in force right now.
+            residueWindowAtOpen: residueWindow,
             swept: false
         });
         totalEscrowed += proceeds;
@@ -130,10 +142,17 @@ contract CompensationEscrow is Ownable2Step, ICompensationEscrow {
     function caseOf(uint256 caseId)
         external
         view
-        returns (address vault, uint256 snapshotTimestamp, uint256 proceeds, uint256 redeemed, uint256 openedAt)
+        returns (
+            address vault,
+            uint256 snapshotTimestamp,
+            uint256 proceeds,
+            uint256 redeemed,
+            uint256 openedAt,
+            bool swept
+        )
     {
         Case storage c = _cases[caseId];
-        return (c.vault, c.snapshotTimestamp, c.proceeds, c.redeemed, c.openedAt);
+        return (c.vault, c.snapshotTimestamp, c.proceeds, c.redeemed, c.openedAt, c.swept);
     }
 
     /// @inheritdoc ICompensationEscrow
@@ -142,6 +161,19 @@ contract CompensationEscrow is Ownable2Step, ICompensationEscrow {
     ///      "what am I owed" and "what is left". Rounds DOWN, so the sum of
     ///      claims can never exceed `proceeds`; the dust stays in the case and
     ///      leaves with the residue.
+    ///
+    /// @dev PER-CASE FUND ISOLATION. The pro-rata result is capped at the case's
+    ///      own unpaid remainder (`proceeds - redeemed`). Cases share one WOOD
+    ///      balance but are separately funded, and the numerator is data read
+    ///      from the case's `vault` — an address supplied by the funder. Without
+    ///      the cap, a hostile or merely non-standard vault reporting
+    ///      `votes > supply` (or several holders whose votes oversum the
+    ///      snapshot supply) would let a small case pay out more than it was
+    ///      ever funded with, taking the difference from a SIBLING case's funds
+    ///      and, past the skew that exhausts the balance, underflowing
+    ///      `totalEscrowed -= amount` and bricking redemption protocol-wide.
+    ///      With the cap, a case can never pay out more than its own proceeds,
+    ///      so the blast radius of a bad `vault` is exactly that one case.
     function claimable(uint256 caseId, address holder) public view returns (uint256) {
         Case storage c = _cases[caseId];
         if (c.proceeds == 0) return 0;
@@ -149,7 +181,9 @@ contract CompensationEscrow is Ownable2Step, ICompensationEscrow {
         if (_redeemed[caseId][holder]) return 0;
         uint256 votes = IVaultVotesMinimal(c.vault).getPastVotes(holder, c.snapshotTimestamp);
         if (votes == 0) return 0;
-        return (c.proceeds * votes) / c.snapshotSupply;
+        uint256 amt = (c.proceeds * votes) / c.snapshotSupply;
+        uint256 remaining = c.proceeds - c.redeemed;
+        return amt < remaining ? amt : remaining;
     }
 
     /// @inheritdoc ICompensationEscrow
@@ -176,11 +210,20 @@ contract CompensationEscrow is Ownable2Step, ICompensationEscrow {
     ///      redirect it. Residue goes to the protocol insurance backstop and
     ///      NEVER to the vault's live NAV — paying live NAV is precisely the F1
     ///      recoupment channel this contract exists to close (§3.8).
+    /// @dev The deadline uses the case's FROZEN `residueWindowAtOpen`, not the
+    ///      live `residueWindow`. Reading the live value would let the owner
+    ///      lower the window to the 30-day floor and sweep cases opened under a
+    ///      longer promise — a retroactive shortening of holders' redemption
+    ///      rights. A `setResidueWindow` change therefore governs only cases
+    ///      opened after it.
+    /// @dev Reverts `ZeroAddress` if no backstop is configured, rather than
+    ///      transferring the residue to address(0).
     function sweepResidue(uint256 caseId) external returns (uint256 amount) {
         Case storage c = _cases[caseId];
         if (c.proceeds == 0) revert CaseNotFound();
-        if (block.timestamp < c.openedAt + residueWindow) revert ResidueWindowOpen();
+        if (block.timestamp < c.openedAt + c.residueWindowAtOpen) revert ResidueWindowOpen();
         if (c.swept) revert NothingToCompensate();
+        if (backstop == address(0)) revert ZeroAddress();
         amount = c.proceeds - c.redeemed;
         if (amount == 0) revert NothingToCompensate();
 

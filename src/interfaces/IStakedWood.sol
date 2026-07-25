@@ -16,7 +16,20 @@ interface IStakedWood {
     /// @notice Reverts when a non-slasher calls the verdict slash path.
     error NotAuthorizedSlasher();
 
+    /// @notice Reverts when `slashToEscrow` runs with no `compensationEscrow`
+    ///         configured. The sink is owner-set state, never a caller argument.
+    error CompensationEscrowNotSet();
+
+    /// @notice Reverts when the requested compensation snapshot is LATER than
+    ///         the verdict's own open timestamp.
+    error SnapshotAfterVerdict();
+
     event AuthorizedSlasherSet(address indexed slasher);
+    event CompensationEscrowSet(address indexed escrow);
+
+    /// @notice Correlates a verdict slash with the escrow case it funded, so
+    ///         Plan D and indexers can join the two without scraping the escrow.
+    event VerdictSlashRouted(bytes32 indexed caseKey, address indexed vault, uint256 total, uint256 caseId);
 
     // ── Guardian stake ──
     function stakeAsGuardian(uint256 amount, uint256 agentId) external;
@@ -143,18 +156,29 @@ interface IStakedWood {
     // ── Slasher-only mutations (verdict path) ──
     /// @notice Verdict-driven slash whose proceeds fund victim compensation
     ///         instead of burning (spec §3.8 + §4 authorized-slasher entrypoint).
+    /// @dev The escrow is NOT a parameter: it is owner-set state
+    ///      (`compensationEscrow`), because sWOOD custodies every WOOD bond in
+    ///      the protocol and a caller-named sink would carry an allowance
+    ///      against that balance. `slashBps` is clamped to
+    ///      `[minSlashBps, maxSlashBps]` — the same severity envelope the review
+    ///      path's `_severityBps` enforces — and `snapshotTimestamp` must be at
+    ///      or before `openedAt`, since any legitimate pre-drain snapshot
+    ///      precedes the verdict.
+    /// @return total  WOOD routed to the escrow across all approvers.
+    /// @return caseId The escrow case funded, or 0 when nothing was recovered.
     function slashToEscrow(
         bytes32 caseKey,
         uint256 openedAt,
         address[] calldata approvers,
         uint256 slashBps,
-        address escrow,
         address vault,
         uint256 snapshotTimestamp
-    ) external returns (uint256 total);
+    ) external returns (uint256 total, uint256 caseId);
 
     function setAuthorizedSlasher(address slasher) external;
     function authorizedSlasher() external view returns (address);
+    function setCompensationEscrow(address escrow) external;
+    function compensationEscrow() external view returns (address);
 
     // ── Admin (owner-instant; owner is a multisig with external delay) ──
     function setMinGuardianStake(uint256 newMin) external;

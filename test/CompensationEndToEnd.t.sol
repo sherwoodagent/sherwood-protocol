@@ -153,6 +153,7 @@ contract CompensationEndToEndTest is Test {
         escrow.setAuthorizedFunder(address(swood));
         escrow.setBackstop(backstop);
         swood.setAuthorizedSlasher(address(this));
+        swood.setCompensationEscrow(address(escrow));
         vm.stopPrank();
 
         // ── Guardian stakes and matures to par.
@@ -162,7 +163,6 @@ contract CompensationEndToEndTest is Test {
         swood.stakeAsGuardian(GUARDIAN_STAKE, 1);
         vm.stopPrank();
         skip(MATURATION);
-        openedAt = vm.getBlockTimestamp();
         vm.warp(vm.getBlockTimestamp() + 1);
 
         // ── PRE-drain LPs, one per timestamp so the ERC20Votes checkpoints
@@ -183,6 +183,12 @@ contract CompensationEndToEndTest is Test {
         //    snapshot the case is pinned to.
         _deposit(buyer, BUYER_ASSETS);
         postBuyTs = vm.getBlockTimestamp();
+        vm.warp(vm.getBlockTimestamp() + 1 hours);
+
+        // ── The verdict opens AFTER the drain it convicts, which is why
+        //    `slashToEscrow` can require `snapshotTimestamp <= openedAt`: a
+        //    pre-drain snapshot necessarily precedes the verdict.
+        openedAt = vm.getBlockTimestamp();
         vm.warp(vm.getBlockTimestamp() + 1 hours);
     }
 
@@ -244,10 +250,9 @@ contract CompensationEndToEndTest is Test {
     function _verdictSlash() internal returns (uint256 caseId, uint256 total) {
         address[] memory approvers = new address[](1);
         approvers[0] = g1;
-        total = swood.slashToEscrow(
-            bytes32("verdict-case"), openedAt, approvers, SLASH_BPS, address(escrow), address(vault), snapTs
-        );
-        caseId = escrow.caseCount();
+        (total, caseId) =
+            swood.slashToEscrow(bytes32("verdict-case"), openedAt, approvers, SLASH_BPS, address(vault), snapTs);
+        assertEq(caseId, escrow.caseCount(), "the returned case id is the escrow's newest case");
     }
 
     /// @dev Assert the fixture BEFORE asserting the behaviour: the vault's own
@@ -286,11 +291,12 @@ contract CompensationEndToEndTest is Test {
         assertEq(escrow.totalEscrowed(), PROCEEDS, "and books it as outstanding");
         assertEq(swood.guardianStake(g1), 0, "the guardian paid it");
 
-        (address v, uint256 ts, uint256 proceeds, uint256 redeemed,) = escrow.caseOf(caseId);
+        (address v, uint256 ts, uint256 proceeds, uint256 redeemed,, bool swept) = escrow.caseOf(caseId);
         assertEq(v, address(vault), "case is pinned to the real vault");
         assertEq(ts, snapTs, "and to the pre-drain snapshot");
         assertEq(proceeds, PROCEEDS);
         assertEq(redeemed, 0);
+        assertFalse(swept, "a fresh case is not swept");
 
         // ── Claims split with the snapshot, exactly.
         assertEq(escrow.claimable(caseId, lp1), LP1_CLAIM, "LP1 claims 70%");
@@ -314,7 +320,7 @@ contract CompensationEndToEndTest is Test {
         assertEq(wood.balanceOf(address(escrow)), escrowBefore, "escrow paid out the full proceeds");
         assertEq(escrow.totalEscrowed(), 0, "nothing outstanding");
 
-        (,,, uint256 redeemedAfter,) = escrow.caseOf(caseId);
+        (,,, uint256 redeemedAfter,,) = escrow.caseOf(caseId);
         assertEq(redeemedAfter, PROCEEDS, "case fully redeemed");
 
         // Re-redeeming is closed for both.

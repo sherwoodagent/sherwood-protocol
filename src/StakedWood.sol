@@ -48,6 +48,18 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     ///      declares its own errors rather than inheriting the interface.
     error NotAuthorizedSlasher();
 
+    /// @notice `slashToEscrow` called before the owner wired a compensation
+    ///         escrow. The verdict path has no sink without one, and sWOOD
+    ///         deliberately does NOT accept an escrow address from the caller
+    ///         (see `compensationEscrow`).
+    /// @dev Mirrors `IStakedWood.CompensationEscrowNotSet`.
+    error CompensationEscrowNotSet();
+
+    /// @notice `slashToEscrow` rejected because the requested compensation
+    ///         snapshot is LATER than the verdict's own open timestamp.
+    /// @dev Mirrors `IStakedWood.SnapshotAfterVerdict`.
+    error SnapshotAfterVerdict();
+
     /// @notice Insufficient WOOD to satisfy a stake minimum.
     /// @dev Relocated from `IGuardianRegistry` alongside `stakeAsGuardian`.
     error InsufficientStake();
@@ -170,6 +182,19 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     /// @notice Emitted when the owner rewires the verdict-slash role.
     /// @dev Mirrors `IStakedWood.AuthorizedSlasherSet`.
     event AuthorizedSlasherSet(address indexed slasher);
+
+    /// @notice Emitted when the owner rewires the compensation escrow that
+    ///         `slashToEscrow` funds.
+    /// @dev Mirrors `IStakedWood.CompensationEscrowSet`.
+    event CompensationEscrowSet(address indexed escrow);
+
+    /// @notice Emitted when a verdict slash funds a compensation case.
+    /// @dev Correlates the verdict (`caseKey`, `vault`) with the escrow case it
+    ///      produced, so Plan D and indexers can join the two without scraping
+    ///      the escrow's own `CaseOpened` log and guessing which slash it came
+    ///      from. `total` is the WOOD routed; `caseId` is the escrow's id.
+    ///      Mirrors `IStakedWood.VerdictSlashRouted`.
+    event VerdictSlashRouted(bytes32 indexed caseKey, address indexed vault, uint256 total, uint256 caseId);
 
     /// @notice Emitted once per approver actually slashed for a blocked proposal.
     /// @dev A slash is a significant value-destroying change; the appeal flow
@@ -337,6 +362,8 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     ///      `authorizedSlasher` consumes one slot. APPEND-ONLY — sWOOD is UUPS
     ///      and live, so the new field is carved off the FRONT of the gap and
     ///      no existing field moves.
+    ///      Decremented 8 → 7 (Plan C review): `compensationEscrow` consumes
+    ///      one slot, appended AFTER `authorizedSlasher`.
     /// @notice The one address permitted to drive the VERDICT slash path
     ///         (`slashToEscrow`). Deliberately distinct from `onlyRegistry`,
     ///         which drives the block-quorum review slash: the paths must stay
@@ -346,8 +373,21 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     ///         governance action until then.
     address public authorizedSlasher;
 
-    /// @dev Reserved storage for future upgrades (was 9; -1 authorizedSlasher).
-    uint256[8] private __gap;
+    /// @notice The `CompensationEscrow` that `slashToEscrow` funds.
+    /// @dev OWNER-SET STATE, deliberately NOT a `slashToEscrow` parameter.
+    ///      sWOOD custodies every WOOD bond in the protocol; letting the
+    ///      slasher name an arbitrary destination would hand it an ERC20
+    ///      allowance against that whole balance. Pinning the sink to an
+    ///      owner-configured address means a compromised `authorizedSlasher`
+    ///      can only misdirect proceeds INTO the honest escrow — where they are
+    ///      still bound to a snapshot-gated case — never to an address of its
+    ///      own choosing. Zero disables the verdict path
+    ///      (`CompensationEscrowNotSet`).
+    address public compensationEscrow;
+
+    /// @dev Reserved storage for future upgrades (was 9; -1 authorizedSlasher,
+    ///      -1 compensationEscrow).
+    uint256[7] private __gap;
 
     /// @notice Slashed WOOD is sent here — permanently out of circulation.
     /// @dev Burning via a transfer to a known-dead address keeps WOOD's
@@ -1018,6 +1058,18 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
         emit AuthorizedSlasherSet(slasher);
     }
 
+    /// @notice Set the `CompensationEscrow` that `slashToEscrow` funds.
+    /// @dev Owner-only, mirroring `setAuthorizedSlasher`. The escrow is state
+    ///      rather than a `slashToEscrow` argument on purpose: an
+    ///      argument-named destination would let the slasher point sWOOD's
+    ///      allowance — against the protocol's entire WOOD custody — at any
+    ///      address it liked. Zero is a valid value: it disables the verdict
+    ///      path (`CompensationEscrowNotSet`).
+    function setCompensationEscrow(address escrow) external onlyOwner {
+        compensationEscrow = escrow;
+        emit CompensationEscrowSet(escrow);
+    }
+
     // ── Slashing (registry-gated) ──
 
     /// @notice Slash a set of approvers for a blocked proposal.
@@ -1065,37 +1117,67 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     ///      approved to the escrow and booked as a compensation case pinned to
     ///      `snapshotTimestamp`, so pre-drain holders redeem them (§3.8) instead
     ///      of the WOOD burning.
+    /// @dev SEVERITY ENVELOPE. `slashBps` is clamped to
+    ///      `[minSlashBps, maxSlashBps]` here, so the verdict path enforces the
+    ///      SAME envelope as the review path — where `GuardianRegistry`'s
+    ///      `_severityBps` clamps to those exact bounds before calling
+    ///      `slashGuardians`, meaning sWOOD never sees a raw bps from the
+    ///      review side. Without the clamp the verdict path would be the one
+    ///      entrypoint that takes severity straight from its caller, letting a
+    ///      compromised `authorizedSlasher` exceed a ceiling governance set (or
+    ///      dodge a floor it set) at will.
+    ///
+    /// @dev SNAPSHOT BOUND. `snapshotTimestamp` must be at or before `openedAt`.
+    ///      Any legitimate PRE-drain snapshot precedes the verdict that convicts
+    ///      the drain, so this costs honest callers nothing while materially
+    ///      shrinking what a compromised `authorizedSlasher` can do before
+    ///      Plan D's challenge game lands: it cannot pin a case to a POST-drain
+    ///      instant at which the coalition holds the vault's supply and thereby
+    ///      pay the attacker back its own slash — the F1 recoupment channel this
+    ///      whole rail exists to close.
+    ///
     /// @param caseKey  Composite verdict key; feeds the `GuardianSlashed` topic.
     /// @param openedAt The verdict's open timestamp — the at-open anchor the own
-    ///        and delegated legs are sized against (see `_slashOne`).
+    ///        and delegated legs are sized against (see `_slashOne`), and the
+    ///        latest snapshot the case may be pinned to.
     /// @param approvers The approver addresses to slash.
-    /// @param slashBps Slash fraction in basis points out of `10_000`.
-    /// @param escrow The `CompensationEscrow` receiving the proceeds.
+    /// @param slashBps Requested slash fraction in bps, clamped to
+    ///        `[minSlashBps, maxSlashBps]`.
     /// @param vault The vault whose pre-drain holders are compensated. Supplied
     ///        by the caller because a `caseKey` cannot yield it.
     /// @param snapshotTimestamp The pre-drain snapshot the escrow apportions
-    ///        against. Chosen by the CALLER (§3.8): the block before the drain
-    ///        proposal executed for predicates 1-4, the epoch-N opening
-    ///        checkpoint for a per-epoch drawdown conviction.
-    /// @return total Total WOOD routed to the escrow across all approvers.
+    ///        against. Chosen by the CALLER within the bound above (§3.8): the
+    ///        block before the drain proposal executed for predicates 1-4, the
+    ///        epoch-N opening checkpoint for a per-epoch drawdown conviction.
+    /// @return total  Total WOOD routed to the escrow across all approvers.
+    /// @return caseId The escrow case funded, or 0 when nothing was recovered.
     function slashToEscrow(
         bytes32 caseKey,
         uint256 openedAt,
         address[] calldata approvers,
         uint256 slashBps,
-        address escrow,
         address vault,
         uint256 snapshotTimestamp
-    ) external onlyAuthorizedSlasher returns (uint256 total) {
+    ) external onlyAuthorizedSlasher returns (uint256 total, uint256 caseId) {
+        address escrow = compensationEscrow;
+        if (escrow == address(0)) revert CompensationEscrowNotSet();
+        if (snapshotTimestamp > openedAt) revert SnapshotAfterVerdict();
+
+        uint256 bps = Math.min(Math.max(slashBps, minSlashBps), maxSlashBps);
         for (uint256 i = 0; i < approvers.length; i++) {
-            total += _slashOne(caseKey, openedAt, approvers[i], slashBps);
+            total += _slashOne(caseKey, openedAt, approvers[i], bps);
         }
         // Nothing recovered: no case to open (the escrow rejects zero proceeds).
-        if (total == 0) return 0;
+        if (total == 0) return (0, 0);
         _totalStakeCheckpoint.push(uint32(block.timestamp), uint224(totalGuardianStake));
         // Effects are complete; hand the proceeds over and open the case.
-        IERC20(wood).approve(escrow, total);
-        ICompensationEscrow(escrow).openCase(vault, snapshotTimestamp, total);
+        // `forceApprove` tolerates non-standard tokens that reject a non-zero
+        // to non-zero approve; the allowance is zeroed straight after so the
+        // escrow never holds a standing claim on sWOOD's custody balance.
+        IERC20(wood).forceApprove(escrow, total);
+        caseId = ICompensationEscrow(escrow).openCase(vault, snapshotTimestamp, total);
+        IERC20(wood).forceApprove(escrow, 0);
+        emit VerdictSlashRouted(caseKey, vault, total, caseId);
     }
 
     /// @dev Per-approver slash. Extracted to keep `slashGuardians`'s stack
