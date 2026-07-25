@@ -139,8 +139,13 @@ contract InvariantNoProposalBleed is StdInvariant, Test {
         swood.setRegistry(address(registry));
 
         vm.startPrank(regFactory);
-        registry.addGovernor(address(governorA), address(this));
-        registry.addGovernor(address(governorB), address(this));
+        // `vaultOf` is load-bearing for the emergency owner-bond slash, but these
+        // mock governors serve no real vault and this suite asserts open-count
+        // bleed, not slash amounts. Distinct non-zero sentinels keep the two
+        // registrations distinguishable and read as deliberately synthetic
+        // rather than as a real bonded vault.
+        registry.addGovernor(address(governorA), address(0xFA017A));
+        registry.addGovernor(address(governorB), address(0xFA017B));
         vm.stopPrank();
 
         for (uint256 i = 0; i < 3; i++) {

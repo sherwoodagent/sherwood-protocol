@@ -214,7 +214,7 @@ contract SwoodReviewSlashTest is Test {
         // Authorize the per-vault governor with the registry (factory-only;
         // this test impersonates the factory). Required for openReview /
         // resolveReview to pass the registry's authorized-governor guard (P2).
-        registry.addGovernor(address(governor), address(this));
+        registry.addGovernor(address(governor), governor.vault());
 
         // Resolve the registry ↔ sWOOD circular dependency.
         vm.prank(owner);
