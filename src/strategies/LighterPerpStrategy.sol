@@ -114,7 +114,7 @@ contract LighterPerpStrategy is BaseStrategy {
     event MarketClosed(uint16 market, uint8 isAsk);
     event WithdrawQueued(uint64 ticks, uint256 cumulativeTicks);
     event ReturnsInitiated(address indexed caller);
-    event ShortfallAcknowledged(address indexed caller);
+    event ShortfallAcknowledged(address indexed caller, uint256 queuedTicks, uint256 accounted);
     event Settled();
     event FundsSwept(uint256 amount);
 
@@ -136,6 +136,7 @@ contract LighterPerpStrategy is BaseStrategy {
     error ZeroTicks();
     error NothingQueued();
     error WithdrawalInFlight(uint256 queued, uint256 accounted);
+    error NoShortfall(uint256 queued, uint256 accounted);
     error UnsupportedChain();
 
     /// @dev Template-only guard (ERC-1167 clones skip constructors). The venue and
@@ -323,10 +324,38 @@ contract LighterPerpStrategy is BaseStrategy {
     ///         timing gate — it cannot redirect funds, and anything that matures
     ///         later is still recoverable post-settle via `queueWithdraw` +
     ///         `recoverResiduals`.
+    ///
+    ///         R3: the waiver is gated on an ACTUAL, currently-observable
+    ///         shortfall. Ungated it was a one-call bypass of BOTH settle guards
+    ///         from the moment the strategy went `Executed` — arm it before the
+    ///         closes and before any drain, and `settle()` booked the entire
+    ///         principal as a 100% loss with the funds still at the venue. The
+    ///         stranding is recoverable (C1), but the damage is the Lane-B price
+    ///         stamp: `onProposalSettled` freezes the per-proposal redeem price
+    ///         at the deflated NAV, so a later `recoverResiduals` top-up lands
+    ///         AFTER the stamp and the haircut falls on the exiting LPs.
+    ///         Preconditions, all three necessary:
+    ///           - `ReturnsNotInitiated` — you cannot acknowledge a shortfall on
+    ///             positions that were never closed.
+    ///           - `NothingQueued`       — nor on a drain that was never asked
+    ///             for; there is no denominator to fall short of.
+    ///           - `NoShortfall`         — nor when everything asked for is
+    ///             already accounted. `returnedAssets` is monotone so `accounted`
+    ///             only grows: if it ever reaches `queuedTicks`, `_settle` passes
+    ///             unaided and the waiver is not needed. Arming while
+    ///             `accounted == 0` (nothing matured yet) stays legal — that is
+    ///             the normal venue-under-fill case.
     function acknowledgeShortfall() external {
         if (msg.sender != proposer() && msg.sender != ISyndicateVault(vault()).owner()) revert NotAuthorized();
+        if (returnsInitiatedAt == 0) revert ReturnsNotInitiated();
+        if (queuedTicks == 0) revert NothingQueued();
+
+        uint256 accounted = returnedAssets + ZK_LIGHTER.getPendingBalance(address(this), USDG_ASSET_INDEX)
+            + USDG.balanceOf(address(this));
+        if (accounted >= queuedTicks) revert NoShortfall(queuedTicks, accounted);
+
         shortfallAcknowledged = true;
-        emit ShortfallAcknowledged(msg.sender);
+        emit ShortfallAcknowledged(msg.sender, queuedTicks, accounted);
     }
 
     /// @notice Unwind step 3 (governor-called). Claims the matured pending USDG
@@ -341,6 +370,19 @@ contract LighterPerpStrategy is BaseStrategy {
     ///             sandwich. Replaces the old `pending == 0 && bal == 0` check,
     ///             which anyone could satisfy by donating 1 wei of USDG.
     ///         `acknowledgeShortfall()` waives the last two.
+    ///
+    ///         SCOPE (be precise about what this does NOT do): the denominator is
+    ///         `queuedTicks`, which the proposer chooses. This is a LIVENESS /
+    ///         anti-phantom-loss check — "everything I ASKED for came back" — and
+    ///         NOT a completeness check. `queueWithdraw(1)` plus one tick maturing
+    ///         satisfies it with the rest of the account still at the venue. It
+    ///         cannot be made complete on-chain: the contract has no way to read
+    ///         its own L2 balance (positions and margin are off-chain sequencer
+    ///         state, and IZkLighter exposes no accessor). Completeness is an
+    ///         OFF-CHAIN guarantee — the CLI's `queue-withdraw --all` reads the
+    ///         true L2 balance from the Lighter API and hard-aborts on any nonzero
+    ///         position — and it sits in the same trust bucket as the agent key.
+    ///         See the trust model in docs/LighterPerpStrategy.md.
     function _settle() internal override {
         if (returnsInitiatedAt == 0) revert ReturnsNotInitiated();
         if (block.number <= returnsInitiatedAt) revert SettleTooSoon();

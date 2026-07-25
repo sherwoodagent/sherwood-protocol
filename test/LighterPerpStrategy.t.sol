@@ -816,17 +816,140 @@ contract LighterPerpStrategyTest is Test {
     }
 
     function test_acknowledgeShortfall_vaultOwner() public {
-        _executeFirst();
+        _armedShortfall();
         vm.prank(owner);
         strategy.acknowledgeShortfall();
         assertTrue(strategy.shortfallAcknowledged());
     }
 
     function test_acknowledgeShortfall_attacker_reverts() public {
-        _executeFirst();
+        _armedShortfall();
         vm.prank(attacker);
         vm.expectRevert(LighterPerpStrategy.NotAuthorized.selector);
         strategy.acknowledgeShortfall();
+    }
+
+    // ============ R3 REGRESSION (acknowledgeShortfall pre-arm bypass) ============
+
+    /// @dev Drives the strategy to a REAL, currently-observable shortfall: the
+    ///      unwind is initiated, a drain was queued, and the venue matured less
+    ///      than that.
+    function _armedShortfall() internal {
+        _executeFirst();
+        zk.debitL2(address(strategy), 5_000e6); // trading loss on the venue
+        vm.startPrank(proposer);
+        strategy.initiateReturn();
+        strategy.queueWithdraw(uint64(DEPOSIT - 5_000e6));
+        vm.stopPrank();
+        zk.maturePartial(address(strategy), DEPOSIT - 10_000e6); // venue under-fills
+        vm.roll(block.number + 1);
+    }
+
+    /// @dev R3 PoC, permanently pinned.
+    ///
+    ///      Pre-fix: `acknowledgeShortfall()` had NO precondition — it could be
+    ///      armed the instant the strategy went `Executed`, before any close and
+    ///      before any drain was requested, and it permanently waived BOTH settle
+    ///      guards. Four calls booked the entire principal as a 100% loss with
+    ///      the funds still sitting at the venue:
+    ///
+    ///        execute -> acknowledgeShortfall -> initiateReturn -> roll -> settle
+    ///
+    ///      i.e. exactly the `NothingQueued` case the guard exists to prevent.
+    ///      The stranding itself is recoverable (C1); the damage is the Lane-B
+    ///      price stamp. `_finishSettlement` computes PnL from the vault's USDG
+    ///      balance and `onProposalSettled` FREEZES the per-proposal redeem price
+    ///      at that deflated NAV, so a later `queueWithdraw` + `recoverResiduals`
+    ///      top-up lands after the stamp: queued redeemers are paid the haircut
+    ///      and the recovery accrues to whoever stayed.
+    ///
+    ///      Post-fix: arming requires an initiated return, a nonzero
+    ///      `queuedTicks`, and a shortfall that is actually observable now.
+    function test_R3_acknowledgeShortfall_cannotPreArmBeforeUnwind() public {
+        _executeFirst();
+        assertEq(zk.l2Balance(address(strategy)), DEPOSIT);
+
+        // Step 1 of the PoC is gone: nothing has been closed or requested.
+        vm.prank(proposer);
+        vm.expectRevert(LighterPerpStrategy.ReturnsNotInitiated.selector);
+        strategy.acknowledgeShortfall();
+
+        // Still gone after the closes — no drain has been requested yet.
+        vm.prank(proposer);
+        strategy.initiateReturn();
+        vm.prank(proposer);
+        vm.expectRevert(LighterPerpStrategy.NothingQueued.selector);
+        strategy.acknowledgeShortfall();
+
+        // The vault owner cannot pre-arm it either.
+        vm.prank(owner);
+        vm.expectRevert(LighterPerpStrategy.NothingQueued.selector);
+        strategy.acknowledgeShortfall();
+
+        // So settle still refuses to book the principal as a loss.
+        vm.roll(block.number + 1);
+        vm.prank(vault);
+        vm.expectRevert(LighterPerpStrategy.NothingQueued.selector);
+        strategy.settle();
+
+        assertEq(strategy.shortfallAcknowledged(), false);
+        assertEq(zk.l2Balance(address(strategy)), DEPOSIT); // principal untouched
+    }
+
+    /// @dev The waiver cannot be armed against a drain that has fully arrived —
+    ///      there is no shortfall to acknowledge and `_settle` passes unaided.
+    function test_R3_acknowledgeShortfall_noShortfall_reverts() public {
+        _executeFirst();
+        vm.startPrank(proposer);
+        strategy.initiateReturn();
+        strategy.queueWithdraw(uint64(DEPOSIT));
+        vm.stopPrank();
+        zk.mature(address(strategy)); // everything asked for is claimable
+
+        vm.prank(proposer);
+        vm.expectRevert(
+            abi.encodeWithSelector(LighterPerpStrategy.NoShortfall.selector, uint256(DEPOSIT), uint256(DEPOSIT))
+        );
+        strategy.acknowledgeShortfall();
+
+        vm.roll(block.number + 1);
+        vm.prank(vault);
+        strategy.settle(); // no waiver needed
+        assertEq(usdg.balanceOf(vault), DEPOSIT);
+    }
+
+    /// @dev Liveness: arming must stay legal while `accounted == 0` (nothing has
+    ///      matured yet), otherwise the venue-under-fill escape hatch would be
+    ///      unreachable in exactly the case it exists for.
+    function test_R3_acknowledgeShortfall_armableBeforeAnyMaturity() public {
+        _executeFirst();
+        vm.startPrank(proposer);
+        strategy.initiateReturn();
+        strategy.queueWithdraw(uint64(DEPOSIT));
+        vm.stopPrank();
+
+        vm.prank(proposer);
+        strategy.acknowledgeShortfall();
+        assertTrue(strategy.shortfallAcknowledged());
+    }
+
+    /// @dev Positive control: a legitimately-armed shortfall carries through to
+    ///      `settle()`, and the residue stays recoverable afterwards.
+    function test_R3_armedShortfall_carriesThroughSettle() public {
+        _armedShortfall();
+        vm.prank(proposer);
+        strategy.acknowledgeShortfall();
+
+        vm.prank(vault);
+        strategy.settle();
+        assertEq(strategy.settled(), true);
+        assertEq(usdg.balanceOf(vault), DEPOSIT - 10_000e6);
+
+        // The 5k the venue never matured is still drainable post-settle.
+        zk.mature(address(strategy));
+        vm.prank(attacker);
+        strategy.recoverResiduals();
+        assertEq(usdg.balanceOf(vault), DEPOSIT - 5_000e6);
     }
 
     // ==================== C1 REGRESSION (under-withdraw) ====================

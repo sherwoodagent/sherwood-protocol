@@ -45,6 +45,7 @@ per-proposal queue price.
 | **On-chain kill switch** | The proposer can `CANCEL_ALL`, `CLOSE_MARKET` or `ROTATE_KEY` at any time via `updateParams`, `initiateReturn()` force-closes every configured market both directions, and `queueWithdraw(ticks)` drains the account — all without the agent's cooperation. |
 | **Value is never self-reported** | `positions()` returns empty; the venue exposes no on-chain mark the PriceRouter can trust for an in-flight perp. The vault reads float only while the proposal is open; realized PnL is the USDG that actually round-trips back at settle. |
 | **Residual trust: `markets` ≠ the agent's reach** | The registered L2 key can trade **any** Lighter market — the venue enforces no per-key whitelist. `markets` is only the list `initiateReturn()` auto-closes, so a position the agent opens outside it is **not** closed by the automatic unwind and its margin stays locked. See "Residual trust" below. |
+| **Residual trust: the settle gate is a *liveness* check, not a completeness check** | `_settle`'s guard compares what came back against `queuedTicks` — the amount the **proposer chose**. It proves "everything I *asked* for arrived", which is enough to stop a phantom-loss settle a depositor could sandwich, but it does **not** prove the venue account is empty: `queueWithdraw(1)` plus one tick maturing satisfies it with the rest of the margin still at Lighter. It cannot be made complete on-chain — position and margin state live with the off-chain sequencer and `IZkLighter` exposes no accessor for either, which is the same reason `positions()` is empty. **Completeness is an off-chain guarantee**: the CLI's `queue-withdraw --all` reads the true L2 balance from the Lighter API and hard-aborts on any nonzero position size. It sits in the same trust bucket as the agent key — a proposer who ignores the CLI can stamp the Lane-B redeem price at a deflated NAV, which is a transfer from exiting LPs to remaining LPs (the residue is still recoverable via `queueWithdraw` + `recoverResiduals`, but it lands *after* the stamp). See "The settle guard cannot brick the vault" below. |
 
 ## Lifecycle
 
@@ -161,7 +162,7 @@ Impact is bounded — `baseAmount = 0` can only *close* a position, never open o
 | `updateParams(...)` | | ✅ | | | `onlyProposer`, `Executed` |
 | `initiateReturn()` | | ✅ (anytime) | | ✅ (once `strategyDuration` has elapsed) | `Executed` |
 | `queueWithdraw(ticks)` | | ✅ | ✅ | | `Executed` **or** `Settled` |
-| `acknowledgeShortfall()` | | ✅ | ✅ | | any |
+| `acknowledgeShortfall()` | | ✅ | ✅ | | `returnsInitiatedAt != 0` **and** `queuedTicks != 0` **and** a shortfall is currently observable |
 | `recoverResiduals()` | | | | ✅ | any |
 | `sweepToVault()` | | | | ✅ | any |
 
@@ -169,7 +170,7 @@ The permissionless paths are safe because funds only ever flow to `vault()`: `_s
 claim+push and `recoverResiduals`/`sweepToVault` all push USDG to the vault, and none
 accept a caller-supplied destination.
 
-Three auth details are load-bearing:
+Five auth details are load-bearing:
 
 - **`queueWithdraw` is NOT permissionless**, even after `strategyDuration`. The amount is
   un-correctable once the request is queued, so letting an anonymous caller choose it
@@ -189,6 +190,25 @@ Three auth details are load-bearing:
   spam venue priority requests block after block. `returnsInitiatedAt` latches on the
   first call only — re-latching would reset the async-maturity clock and hold `_settle`
   in `SettleTooSoon` indefinitely.
+- **`acknowledgeShortfall()` is state-gated, not a free waiver.** It waives the two
+  settle guards that stand between `settle()` and booking the principal as a loss, so an
+  ungated version was a one-call bypass of both: arm it the moment the strategy went
+  `Executed` (before any close, before any drain was requested) and `settle()` booked
+  100% of the principal as a loss with the funds still at the venue. It now requires an
+  *initiated* return, a *nonzero* `queuedTicks`, and a shortfall that is **actually
+  observable right now** (`returnedAssets + pending + bal < queuedTicks`) — you can only
+  acknowledge a shortfall against something you actually asked for and did not get. Kept
+  on the proposer as well as the vault owner deliberately: post-gate the waiver grants
+  the proposer nothing they do not already hold via the denominator (see "the settle
+  gate is a liveness check" below), and the proposer is the party that observes the
+  under-fill operationally, so excluding them would cost liveness for no security.
+- **After an emergency settle, the permissionless `initiateReturn()` branch is closed.**
+  Rejecting `pid == 0` (the M1 fix) means that once `_activeProposal` is cleared the only
+  remaining unwind drivers are the **proposer** and the **vault owner** (via
+  `queueWithdraw`), with `recoverResiduals()`/`sweepToVault()` still open to anyone. This
+  is deliberate, not a gap: the emergency-settle path is itself vault-owner-driven, so
+  the owner is by construction present and is the correct unwind driver; leaving the
+  branch open in that state is precisely the fail-open M1 exploits.
 
 ## Three-step settle (G-H1 + the close/withdraw split)
 
@@ -245,6 +265,31 @@ reachable **after** settlement.
   here — `withdrawPendingBalance` is permissionless), then push the **entire** USDG balance
   to the vault.
 
+### What the settle gate does and does not prove
+
+Stated plainly, because the distinction is load-bearing and it is easy to read the guard as
+stronger than it is:
+
+- **It is a liveness / anti-phantom-loss check.** It proves *"everything I asked for has
+  come back"*. That is exactly enough to stop the attack it was added for — settling into a
+  0-balance vault and booking a phantom total loss that a depositor can sandwich.
+- **It is NOT a completeness check.** The denominator is `queuedTicks`, which the proposer
+  chooses. `queueWithdraw(1)` followed by 1 tick maturing satisfies the guard with **no
+  waiver at all**: the vault receives 0.000001 USDG and the rest of the margin is still at
+  the venue when the Lane-B price is stamped.
+- **It cannot be made complete on-chain.** The account's true balance and open positions are
+  off-chain sequencer state; `IZkLighter` exposes `getPendingBalance` (matured withdrawals
+  only) and nothing else. There is no value the contract could compare against.
+- **Completeness is enforced off-chain**, by the CLI: `queue-withdraw --all` reads the true
+  L2 balance from the Lighter API and hard-aborts if any market still has a nonzero position
+  size. That is an operational guarantee, not a contract one, and it belongs in the trust
+  model next to the agent key — see the "settle gate is a liveness check" row above.
+- **The residual risk is a NAV *transfer*, not a loss.** A proposer who under-queues stamps
+  the per-proposal redeem price low; the residue is still fully recoverable via
+  `queueWithdraw` + `recoverResiduals`, but it lands after the stamp, so the value moves
+  from exiting LPs to remaining LPs. The vault owner's `emergencySettleWithCalls` path is
+  the backstop if the proposer will not complete the drain.
+
 ### The settle guard cannot brick the vault
 
 The contract can never *know* the account is empty — it can only verify that what it
@@ -256,6 +301,28 @@ shut. Three independent releases exist, in increasing order of cost:
    It only relaxes a timing gate: it cannot redirect funds, and anything that matures later
    is still recoverable via `queueWithdraw` + `recoverResiduals` **after** settle. This is
    the normal path.
+
+   It is **state-gated**, and the gate matters: the waiver skips both `NothingQueued` and
+   `WithdrawalInFlight`, so without preconditions it was a one-call bypass of the entire
+   settle guard from the moment the strategy went `Executed`. Arming now requires all three
+   of:
+   - `returnsInitiatedAt != 0` (`ReturnsNotInitiated`) — the positions were actually closed;
+   - `queuedTicks != 0` (`NothingQueued`) — a drain was actually requested, so there is a
+     denominator to fall short of;
+   - `returnedAssets + pending + bal < queuedTicks` (`NoShortfall(queued, accounted)`) — the
+     shortfall is observable *now*. If `accounted` ever reaches `queuedTicks`, `_settle`
+     passes unaided and the waiver is not needed; `returnedAssets` is monotone so
+     `accounted` only grows, and this check can never lock out a genuine under-fill.
+     Arming while `accounted == 0` (nothing matured yet) stays legal — that is the normal
+     case.
+
+   Note what the gate does **not** claim: it does not stop a proposer from settling at a
+   deflated NAV, because `queueWithdraw(1)` already does that without any waiver (see "What
+   the settle gate does and does not prove"). What it stops is doing so *instantly*, against
+   an unwind that was never started and a drain that was never requested. Given that, the
+   proposer is kept on the function: excluding them would remove no lever they do not
+   already have, and would cost the liveness of the escape hatch in exactly the case it
+   exists for, since the proposer is the party that observes the under-fill.
 2. **`SyndicateGovernor.unstick(pid)`** — vault owner runs the pre-committed settlement
    calls. (Only helps if those calls don't include a reverting `strategy.settle()`.)
 3. **`emergencySettleWithCalls` → `finalizeEmergencySettle`** — the vault owner supplies
@@ -330,13 +397,14 @@ or `availableLiquidity`/`withdrawTo` (inherit the inert no-on-demand-exit defaul
 **Events:** `Deposited(amount, accountIndex)`, `AgentKeyRegistered(accountIndex, apiKeyIndex)`,
 `OrdersCancelled(accountIndex)`, `MarketClosed(market, isAsk)`,
 `WithdrawQueued(ticks, cumulativeTicks)`, `ReturnsInitiated(address indexed caller)`,
-`ShortfallAcknowledged(address indexed caller)`, `Settled()`, `FundsSwept(amount)`.
+`ShortfallAcknowledged(address indexed caller, uint256 queuedTicks, uint256 accounted)`
+(the two amounts make the assertion auditable from logs), `Settled()`, `FundsSwept(amount)`.
 
 **Errors:** `InvalidPubKey`, `InvalidApiKeyIndex`, `NoMarkets`, `InvalidMarket`,
 `DuplicateMarket`, `TooManyMarkets`, `DepositTooSmall`, `DepositTooLarge`,
 `AccountNotRegistered`, `InvalidAction`, `NotAuthorized`, `ReturnsNotInitiated`,
 `AlreadyInitiated`, `SettleTooSoon`, `ZeroTicks`, `NothingQueued`,
-`WithdrawalInFlight(queued, accounted)`, `UnsupportedChain`
+`WithdrawalInFlight(queued, accounted)`, `NoShortfall(queued, accounted)`, `UnsupportedChain`
 (plus `BaseStrategy`'s `NotProposer` / `NotVault` / `NotExecuted` / `AlreadyExecuted` /
 `AlreadyInitialized` / `ZeroAddress`).
 
