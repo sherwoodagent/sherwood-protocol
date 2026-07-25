@@ -220,8 +220,32 @@ contract TierRegistry is Ownable2Step {
         emit TierCertified(target, selector, tier, extractableBoundBps, ch);
     }
 
+    /// @notice The one address permitted to demote on a passed challenge — the
+    ///         ChallengeGame (spec §3.4: "adapters demote only on a passed
+    ///         challenge"). A ROLE rather than registry ownership, so the game
+    ///         can revoke a certification but never grant one.
+    address public authorizedDemoter;
+
+    error NotAuthorizedDemoter();
+
+    event AuthorizedDemoterSet(address indexed demoter);
+
+    function setAuthorizedDemoter(address demoter) external onlyOwner {
+        authorizedDemoter = demoter;
+        emit AuthorizedDemoterSet(demoter);
+    }
+
     /// @notice Owner demotion (revoke certification).
     function demote(address target, bytes4 selector) external onlyOwner {
+        _demote(target, selector);
+    }
+
+    /// @notice Demote (target, selector) back to the tier-2 default because a
+    ///         challenge against it passed. Reuses the same `_demote` path as
+    ///         owner demotion, so the submitter-bond release timelock starts
+    ///         identically (§3.6 slash-first layering).
+    function demoteByChallenge(address target, bytes4 selector) external {
+        if (msg.sender != authorizedDemoter) revert NotAuthorizedDemoter();
         _demote(target, selector);
     }
 
