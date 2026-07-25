@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
-import {ISyndicateGovernor} from "./ISyndicateGovernor.sol";
-
 /**
  * @title IProposalStatus
  * @notice The proposal-status view the vault consumes from governance — the
@@ -18,9 +16,9 @@ import {ISyndicateGovernor} from "./ISyndicateGovernor.sol";
  *   file alone, and vault tests satisfy one small adapter instead of mocking
  *   governor selectors by hand.
  *
- * @dev `getProposal` returns `ISyndicateGovernor.StrategyProposal` — a
- *      type-only import (the vault reads just `.strategy` from it). The
- *      functional dependency remains these three selectors.
+ * @dev Every member is a scalar, so this file has no type dependency on
+ *      `ISyndicateGovernor` at all — the seam is exactly these three
+ *      selectors and nothing else.
  */
 interface IProposalStatus {
     /// @notice Id of the proposal currently binding the vault (0 = none).
@@ -30,6 +28,8 @@ interface IProposalStatus {
     ///         instant deposits are gated (see vault `_depositsLocked`).
     function openProposalCount() external view returns (uint256);
 
-    /// @notice Full proposal record; the vault reads only `.strategy`.
-    function getProposal(uint256 proposalId) external view returns (ISyndicateGovernor.StrategyProposal memory);
+    /// @notice Strategy adapter of a proposal (address(0) = none / opted out of
+    ///         live NAV). A scalar — it cannot drift in shape, so callers need
+    ///         no defensive try/catch.
+    function strategyOf(uint256 proposalId) external view returns (address);
 }

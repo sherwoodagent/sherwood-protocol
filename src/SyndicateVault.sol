@@ -576,21 +576,17 @@ contract SyndicateVault is
         return _activeStrategy();
     }
 
-    /// @dev Reads the active proposal's `strategy` field through the governor.
-    ///      Returns `address(0)` when no proposal is active OR when the active
-    ///      proposal opted out of live NAV (proposer passed `strategy=0`).
-    ///      Wrapped in try/catch for `getProposal` because struct-shape drift
-    ///      across pre-V1.5 governors must not brick LP flow.
+    /// @dev Reads the active proposal's strategy through the governor's scalar
+    ///      `strategyOf` getter. Returns `address(0)` when no proposal is active
+    ///      OR when the active proposal opted out of live NAV (proposer passed
+    ///      `strategy=0`). No defensive catch: an `address` return cannot drift
+    ///      in shape the way the old full-struct `getProposal` read could.
     function _activeStrategy() internal view returns (address) {
         address gov = _getGovernor();
         if (gov == address(0)) return address(0);
         uint256 pid = IProposalStatus(gov).getActiveProposal();
         if (pid == 0) return address(0);
-        try IProposalStatus(gov).getProposal(pid) returns (ISyndicateGovernor.StrategyProposal memory p) {
-            return p.strategy;
-        } catch {
-            return address(0);
-        }
+        return IProposalStatus(gov).strategyOf(pid);
     }
 
     /// @inheritdoc ISyndicateVault
