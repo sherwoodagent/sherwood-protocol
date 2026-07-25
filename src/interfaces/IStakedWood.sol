@@ -24,6 +24,13 @@ interface IStakedWood {
     ///         the verdict's own open timestamp.
     error SnapshotAfterVerdict();
 
+    /// @notice Reverts when `slashToEscrow` is handed a rate array whose length
+    ///         does not match `approvers`. Positional alignment is the only
+    ///         thing binding a guardian to their own rate, so a mismatch is a
+    ///         caller bug that would otherwise slash the tail of the batch at a
+    ///         rate nobody chose.
+    error SlashBpsLengthMismatch();
+
     event AuthorizedSlasherSet(address indexed slasher);
     event CompensationEscrowSet(address indexed escrow);
 
@@ -170,7 +177,7 @@ interface IStakedWood {
         bytes32 caseKey,
         uint256 openedAt,
         address[] calldata approvers,
-        uint256 slashBps,
+        uint256[] calldata slashBpsPer,
         address vault,
         uint256 snapshotTimestamp
     ) external returns (uint256 total, uint256 caseId);

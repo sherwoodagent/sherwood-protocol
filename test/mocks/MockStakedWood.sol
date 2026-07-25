@@ -253,7 +253,7 @@ contract MockStakedWood is IStakedWood {
 
     // Verdict slash path (spec §4). Not modeled: the escrow hand-off needs a
     // real WOOD balance, so `StakedWoodSlashToEscrow.t.sol` drives a real proxy.
-    function slashToEscrow(bytes32, uint256, address[] calldata, uint256, address, uint256)
+    function slashToEscrow(bytes32, uint256, address[] calldata, uint256[] calldata, address, uint256)
         external
         pure
         returns (uint256, uint256)

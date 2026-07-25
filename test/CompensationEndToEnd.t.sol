@@ -250,8 +250,9 @@ contract CompensationEndToEndTest is Test {
     function _verdictSlash() internal returns (uint256 caseId, uint256 total) {
         address[] memory approvers = new address[](1);
         approvers[0] = g1;
-        (total, caseId) =
-            swood.slashToEscrow(bytes32("verdict-case"), openedAt, approvers, SLASH_BPS, address(vault), snapTs);
+        (total, caseId) = swood.slashToEscrow(
+            bytes32("verdict-case"), openedAt, approvers, _bpsArr(approvers.length, SLASH_BPS), address(vault), snapTs
+        );
         assertEq(caseId, escrow.caseCount(), "the returned case id is the escrow's newest case");
     }
 
@@ -411,5 +412,16 @@ contract CompensationEndToEndTest is Test {
             (navBefore * LP1_SHARES) / supplyBefore,
             "share price undisturbed by the payout"
         );
+    }
+
+    /// @dev `slashToEscrow` now takes one rate per approver. These suites all
+    ///      exercise the uniform case, so this fills an aligned array with a
+    ///      single rate — the per-approver spread is covered in
+    ///      `SlashToEscrowProportional.t.sol`.
+    function _bpsArr(uint256 n, uint256 bps) internal pure returns (uint256[] memory a) {
+        a = new uint256[](n);
+        for (uint256 i = 0; i < n; i++) {
+            a[i] = bps;
+        }
     }
 }

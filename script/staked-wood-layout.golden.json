@@ -271,7 +271,7 @@
       "type": "t_array(t_uint256)_storage"
     }
   ],
-  "structs": {
+  "types": {
     "t_struct(Checkpoint224)_storage": [
       {
         "label": "_key",

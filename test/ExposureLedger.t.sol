@@ -243,6 +243,84 @@ contract ExposureLedgerTest is Test {
         ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 8_000e6);
     }
 
+    /// @notice `slashBpsFor` converts each guardian's BOOKED coverage into the
+    ///         bps-of-stake that `slashToEscrow` speaks. Both inputs are USD, so
+    ///         the quotient is unitless — no price is read in the slash path.
+    ///         Here the two approvers underwrote different amounts of the same
+    ///         proposal, so they must carry different rates.
+    function test_slashBpsFor_ratesTrackEachApproversOwnCommitment() public {
+        _wireRecording();
+        address g2 = makeAddr("g2");
+        swood.setStake(g2, 100_000e18, 0); // $5,000 bond each
+        mgov.set(8_000e6); // $8,000 needed
+
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian); // books its whole $5,000
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, g2); // books only the $3,000 remainder
+
+        (address[] memory approvers, uint256[] memory bps) = ledger.slashBpsFor(address(mgov), 1);
+
+        assertEq(approvers.length, 2, "both approvers listed");
+        assertEq(approvers[0], guardian);
+        assertEq(approvers[1], g2);
+        // $5,000 of a $5,000 bond -> 100%; $3,000 of a $5,000 bond -> 60%.
+        assertEq(bps[0], 10_000, "first underwrote its entire bond");
+        assertEq(bps[1], 6_000, "second underwrote only the remainder");
+    }
+
+    /// @notice A guardian whose commitment was RELEASED by a vote change stays
+    ///         in the approver list with a zeroed booking. It must price at 0 —
+    ///         liability follows the commitment, and `slashToEscrow` skips a
+    ///         zero rate rather than flooring it to `minSlashBps`.
+    function test_slashBpsFor_zeroForAnApproverThatBookedNothing() public {
+        _wireRecording();
+        mgov.set(1_000e6);
+
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        vm.prank(registry);
+        ledger.releaseApproval(address(mgov), 1, guardian);
+
+        (address[] memory approvers, uint256[] memory bps) = ledger.slashBpsFor(address(mgov), 1);
+        assertEq(approvers.length, 1, "still listed");
+        assertEq(approvers[0], guardian);
+        assertEq(bps[0], 0, "released commitment owes nothing");
+    }
+
+    /// @notice Rounds UP. Truncation would shave every approver's rate and the
+    ///         residue compounds across a cohort, quietly breaking
+    ///         `sum(slashed) >= loss`. $1,000 booked against a $3,000 bond is
+    ///         3333.33 bps, which must price at 3334 rather than 3333.
+    function test_slashBpsFor_roundsUpSoTheCohortNeverUnderCovers() public {
+        _wireRecording();
+        swood.setStake(guardian, 60_000e18, 0); // $3,000 bond at $0.05
+        mgov.set(1_000e6); // books exactly $1,000
+
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+
+        (, uint256[] memory bps) = ledger.slashBpsFor(address(mgov), 1);
+        assertEq(bps[0], 3334, "3333.33 bps rounds toward the protocol");
+    }
+
+    /// @notice When the bond SHRANK below the commitment after the vote —
+    ///         unstaking, or a WOOD price crash — the rate saturates at 100%.
+    ///         The case under-recovers by the shortfall, which is unavoidable:
+    ///         the guardian no longer has it.
+    function test_slashBpsFor_saturatesWhenTheBondShrankBelowTheCommitment() public {
+        _wireRecording();
+        mgov.set(5_000e6); // books the full $5,000 bond
+
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+
+        swood.setStake(guardian, 50_000e18, 0); // bond halves to $2,500
+
+        (, uint256[] memory bps) = ledger.slashBpsFor(address(mgov), 1);
+        assertEq(bps[0], 10_000, "capped at everything the guardian still has");
+    }
+
     function test_recordApproval_netsAcrossSequentialEpochs() public {
         _wireRecording();
         mgov.set(4_000e6);
