@@ -794,50 +794,47 @@ contract ChallengeGameTest is Test {
         assertEq(game.liveChallengeOf(address(gov), PROPOSAL), second);
     }
 
-    // ── First-detector bounty ──
+    // ── The detector incentive is off-chain ──
 
-    /// @notice The bounty is Plan G's to fund. It is paid ONLY out of WOOD the
-    ///         game holds beyond its live bonds, so an unfunded game pays the
-    ///         bond back and nothing more rather than raiding another
-    ///         challenge's custody.
-    function test_resolve_bountyPaidOnlyFromSurplus() public {
-        vm.prank(owner);
-        game.setDetectorBountyWood(500e18);
-
-        uint256 unfunded = _fileStandard(PROPOSAL);
-        uint256 before1 = wood.balanceOf(challenger);
-        vm.warp(vm.getBlockTimestamp() + game.autoSlashDelay());
-        game.resolve(unfunded);
-        assertEq(wood.balanceOf(challenger) - before1, 10_000e18, "bond only - nothing to pay a bounty from");
-        _assertLiveBondsBacked();
-
-        // Governance funds the bounty pot, partially.
-        wood.mint(address(game), 200e18);
-        uint256 partialFunding = _fileStandard(2);
-        uint256 before2 = wood.balanceOf(challenger);
-        vm.warp(vm.getBlockTimestamp() + game.autoSlashDelay());
-        vm.expectEmit(true, true, true, true, address(game));
-        emit IChallengeGame.DetectorBountyPaid(partialFunding, challenger, 200e18);
-        game.resolve(partialFunding);
-        assertEq(wood.balanceOf(challenger) - before2, 10_000e18 + 200e18, "bond + the surplus available");
-        assertEq(wood.balanceOf(address(game)), 0, "the pot is drained, not overdrawn");
-
-        // Fully funded: the whole bounty is paid on top of the bond.
+    /// @notice A WINNING challenger is paid its bond back and NOTHING else. The
+    ///         first-detector bounty is a protocol bug-bounty program keyed off
+    ///         `ChallengeFiled`/`ChallengeSettled`, not an on-chain payout —
+    ///         forensic cost runs from minutes to days, and no constant in the
+    ///         contract could be "sized to cover" it. So the on-chain payoff of
+    ///         a successful filing is exactly break-even, and this pins it.
+    function test_resolve_returnsBondAndPaysNoBounty() public {
+        // WOOD sitting on the game beyond its live bonds is NOT a bounty pot:
+        // no path spends it, so it is still here, untouched, afterwards.
         wood.mint(address(game), 5_000e18);
-        uint256 funded = _fileStandard(3);
-        uint256 before3 = wood.balanceOf(challenger);
+
+        uint256 id = _fileStandard(PROPOSAL);
+        uint256 bond = game.challengeOf(id).bondWood;
+        assertEq(bond, 10_000e18);
+
+        uint256 before = wood.balanceOf(challenger);
         vm.warp(vm.getBlockTimestamp() + game.autoSlashDelay());
-        game.resolve(funded);
-        assertEq(wood.balanceOf(challenger) - before3, 10_000e18 + 500e18, "bond + the full bounty");
-        assertEq(wood.balanceOf(address(game)), 4_500e18, "the rest of the pot survives");
+        game.resolve(id);
+
+        assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Settled), "silence was the verdict");
+        assertEq(wood.balanceOf(challenger) - before, bond, "the bond back, to the wei, and nothing more");
+        assertEq(game.bondedWood(), 0, "no challenge is live");
+        assertEq(wood.balanceOf(address(game)), 5_000e18, "stray WOOD is never spent on a settlement");
     }
 
-    /// @notice A FAILED challenge pays no bounty — there was no detection.
-    function test_resolve_failedChallengePaysNoBounty() public {
-        vm.prank(owner);
-        game.setDetectorBountyWood(500e18);
-        wood.mint(address(game), 5_000e18);
+    /// @notice And with nothing donated, the game's custody returns to exactly
+    ///         `bondedWood` — zero once the only challenge is terminal.
+    function test_resolve_leavesTheGameHoldingExactlyItsLiveBonds() public {
+        uint256 id = _fileStandard(PROPOSAL);
+        vm.warp(vm.getBlockTimestamp() + game.autoSlashDelay());
+        game.resolve(id);
+        _assertLiveBondsBacked();
+        assertEq(wood.balanceOf(address(game)), 0, "nothing stranded, nothing withheld");
+    }
 
+    /// @notice A FAILED challenge pays the challenger nothing at all — the bond
+    ///         forfeits to the accused. With the settle path above, that is the
+    ///         whole on-chain payoff of filing: break-even at best.
+    function test_resolve_failedChallengePaysChallengerNothing() public {
         uint256 id = _fileStandard(PROPOSAL);
         uint256 before = wood.balanceOf(challenger);
         vm.prank(guardianA);
@@ -845,8 +842,8 @@ contract ChallengeGameTest is Test {
         vm.warp(vm.getBlockTimestamp() + game.disputeTimeout());
         game.resolve(id);
 
-        assertEq(wood.balanceOf(challenger), before, "the challenger gains nothing");
-        assertEq(wood.balanceOf(address(game)), 5_000e18, "the pot is untouched");
+        assertEq(wood.balanceOf(challenger), before, "the challenger loses the bond outright");
+        _assertLiveBondsBacked();
     }
 
     // ── Parameters ──
@@ -856,8 +853,6 @@ contract ChallengeGameTest is Test {
         game.setAutoSlashDelay(3 days);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(this)));
         game.setDisputeTimeout(60 days);
-        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(this)));
-        game.setDetectorBountyWood(1e18);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(this)));
         game.setStakedWood(makeAddr("rogue"));
     }
@@ -903,19 +898,12 @@ contract ChallengeGameTest is Test {
         game.setStakedWood(address(0));
     }
 
-    function test_setDetectorBountyWood() public {
-        vm.prank(owner);
-        game.setDetectorBountyWood(123e18);
-        assertEq(game.detectorBountyWood(), 123e18);
-    }
-
     /// @notice The defaults ship with a dispute window generous relative to the
     ///         auto-slash delay — the balance D1's shift in vigilance demands.
     function test_defaultTimings() public view {
         assertEq(game.autoSlashDelay(), 7 days);
         assertEq(game.disputeTimeout(), 30 days);
         assertGt(game.disputeTimeout(), game.autoSlashDelay());
-        assertEq(game.detectorBountyWood(), 0, "the bounty is Plan G's to fund");
     }
 
     // ── The §4 invariant ──

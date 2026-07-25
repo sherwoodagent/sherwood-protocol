@@ -42,6 +42,23 @@ interface ITierRegistryDemoterMinimal {
  *         forfeited to the accused when a challenge fails — plus a dispute
  *         window generous relative to the auto-slash delay.
  *
+ * @dev    THE DETECTOR INCENTIVE IS OFF-CHAIN, and deliberately so. §3.4 asks
+ *         for "a first-detector bounty sized to cover forensic cost", and no
+ *         constant in this contract can be sized to that: forensic cost runs
+ *         from minutes for an obvious out-of-adapter transfer to days for a
+ *         funding-graph linkage. So the bounty is a protocol BUG-BOUNTY
+ *         PROGRAM, priced per case off-chain and keyed off this contract's
+ *         `ChallengeFiled` / `ChallengeSettled` events — which keeps it
+ *         auditable, because every payout points at a filing anyone can read.
+ *
+ *         NOTE THE CONSEQUENCE for anyone reasoning about incentives, stated
+ *         here rather than left to be discovered: ON-CHAIN, A SUCCESSFUL
+ *         CHALLENGER ONLY GETS ITS BOND BACK, and a failed one loses the bond
+ *         entirely — so the on-chain payoff is break-even at best. Filing is
+ *         rational ONLY because of the off-chain program. §3.4 warns that "the
+ *         challenge trigger must not depend on altruism"; that warning is
+ *         satisfied off-chain, NOT here.
+ *
  * @dev    Plain `Ownable2Step`, NOT upgradeable — same shape as `TierRegistry`
  *         and `ExposureLedger`, so its storage layout is unconstrained.
  *
@@ -130,22 +147,12 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///         counter-bond must be worth more than the window they lost.
     uint256 public disputeTimeout = 30 days;
 
-    /// @notice First-detector bounty paid to the challenger on a PASSED
-    ///         challenge, on top of its returned bond (§3.4 "a first-detector
-    ///         bounty sized to cover forensic cost").
-    /// @dev    Defaults to zero, and is paid ONLY out of WOOD this contract
-    ///         holds beyond `bondedWood`. Its funding source is Plan G's
-    ///         (watchtower funding); until that lands, an unfunded game simply
-    ///         pays nothing rather than dipping into another live challenge's
-    ///         custody. That cap is what keeps the §4 invariant true by
-    ///         construction instead of by trusting the owner's arithmetic.
-    uint256 public detectorBountyWood;
-
     /// @notice WOOD held on behalf of live (`Filed`/`Disputed`) challenges —
     ///         the sum of their challenger bonds and counter-bonds.
-    /// @dev    The §4 invariant is `wood.balanceOf(this) >= bondedWood`, with
-    ///         equality whenever nobody has funded a bounty surplus. Everything
-    ///         above it is bounty pot and nothing else.
+    /// @dev    The §4 invariant is `wood.balanceOf(this) >= bondedWood`. With
+    ///         the detector incentive off-chain this contract pays out nothing
+    ///         but bonds, so the two are equal except for WOOD somebody donated
+    ///         here by mistake — which no path ever spends.
     uint256 public bondedWood;
 
     uint256 public challengeCount;
@@ -317,7 +324,9 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     /// @dev THE SILENCE VERDICT (§3.4, D1). Nobody contested inside the window,
     ///      so the assertion stands: the covering approvers are slashed into the
     ///      compensation escrow, the accused adapter loses its certification,
-    ///      and the challenger is made whole plus whatever bounty is funded.
+    ///      and the challenger gets its bond back — its bond, and nothing else.
+    ///      The detector's reward is the off-chain bug-bounty program keyed off
+    ///      `ChallengeSettled`; see the contract-level note.
     function _settle(uint256 challengeId, Challenge storage c) private {
         IStakedWood swood = stakedWood;
         // Fail closed: without the slasher wired there is no verdict to
@@ -335,10 +344,6 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         ISyndicateGovernor.StrategyProposal memory p = ISyndicateGovernor(governor).getProposal(proposalId);
 
         uint256 bond = c.bondWood;
-        // Bounty budget = everything held beyond the live bonds, measured
-        // BEFORE this challenge's bond stops counting as live. Anything else
-        // would let a settlement spend its own bond as if it were surplus.
-        uint256 surplus = wood.balanceOf(address(this)) - bondedWood;
         c.status = Status.Settled;
         bondedWood -= bond;
 
@@ -352,9 +357,7 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         // the filing actually named (D7).
         if (c.adapterTarget != address(0)) tierRegistry.demoteByChallenge(c.adapterTarget, c.adapterSelector);
 
-        uint256 bounty = detectorBountyWood < surplus ? detectorBountyWood : surplus;
-        wood.safeTransfer(c.challenger, bond + bounty);
-        if (bounty != 0) emit DetectorBountyPaid(challengeId, c.challenger, bounty);
+        wood.safeTransfer(c.challenger, bond);
         emit ChallengeSettled(challengeId, slashedWood, caseId);
     }
 
@@ -512,14 +515,5 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         if (newTimeout <= autoSlashDelay || newTimeout > MAX_DISPUTE_TIMEOUT) revert InvalidParameter();
         emit DisputeTimeoutSet(disputeTimeout, newTimeout);
         disputeTimeout = newTimeout;
-    }
-
-    /// @dev Unbounded on purpose: what a settlement can actually pay is capped
-    ///      at the surplus WOOD the game holds over `bondedWood`, so an
-    ///      over-ambitious value degrades to "pay what is funded" rather than
-    ///      becoming a claim on live bonds.
-    function setDetectorBountyWood(uint256 newBounty) external onlyOwner {
-        emit DetectorBountyWoodSet(detectorBountyWood, newBounty);
-        detectorBountyWood = newBounty;
     }
 }

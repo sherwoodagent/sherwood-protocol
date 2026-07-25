@@ -95,9 +95,6 @@ interface IChallengeGame {
     event ChallengeDisputed(uint256 indexed challengeId, address indexed disputer, uint256 counterBondWood);
     event ChallengeSettled(uint256 indexed challengeId, uint256 slashedWood, uint256 caseId);
     event ChallengeFailed(uint256 indexed challengeId, uint256 forfeitedWood);
-    /// @dev Emitted only when a bounty was actually paid, which requires the
-    ///      game to hold WOOD beyond its live bonds — see `detectorBountyWood`.
-    event DetectorBountyPaid(uint256 indexed challengeId, address indexed detector, uint256 amountWood);
     event ExposureLedgerSet(address indexed oldLedger, address indexed newLedger);
     event TierRegistrySet(address indexed oldRegistry, address indexed newRegistry);
     event StakedWoodSet(address indexed oldStakedWood, address indexed newStakedWood);
@@ -105,7 +102,6 @@ interface IChallengeGame {
     event ChallengerBondBpsSet(uint256 oldBps, uint256 newBps);
     event AutoSlashDelaySet(uint256 oldDelay, uint256 newDelay);
     event DisputeTimeoutSet(uint256 oldTimeout, uint256 newTimeout);
-    event DetectorBountyWoodSet(uint256 oldBounty, uint256 newBounty);
 
     // ── Filing ──
     /// @notice File a bonded challenge against an executed proposal, freezing
@@ -167,11 +163,10 @@ interface IChallengeGame {
     function challengerBondBps() external view returns (uint256);
     function autoSlashDelay() external view returns (uint256);
     function disputeTimeout() external view returns (uint256);
-    function detectorBountyWood() external view returns (uint256);
     /// @notice WOOD the game holds on behalf of live (`Filed`/`Disputed`)
     ///         challenges. The §4 invariant is `wood.balanceOf(game) >=
-    ///         bondedWood`, with equality whenever nobody has funded a bounty
-    ///         surplus.
+    ///         bondedWood`; the game pays out nothing but bonds, so the two are
+    ///         equal except for WOOD donated here by mistake.
     function bondedWood() external view returns (uint256);
 
     // ── Owner setters ──
@@ -182,5 +177,4 @@ interface IChallengeGame {
     function setChallengerBondBps(uint256 newBps) external;
     function setAutoSlashDelay(uint256 newDelay) external;
     function setDisputeTimeout(uint256 newTimeout) external;
-    function setDetectorBountyWood(uint256 newBounty) external;
 }
