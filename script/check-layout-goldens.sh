@@ -107,6 +107,11 @@ check_contract SyndicateFactory script/syndicate-factory-layout.golden.json
 # exists to police. Pinned here so the next append is checked automatically
 # rather than by hand.
 check_contract GuardianRegistry script/guardian-registry-layout.golden.json
+# StakedWood is UUPS and live, and custodies every WOOD bond in the protocol —
+# the highest-consequence layout on this branch. Plan C carved
+# `authorizedSlasher` out of the front of its __gap (9 -> 8); pinned here so the
+# next append is checked automatically rather than by hand.
+check_contract StakedWood script/staked-wood-layout.golden.json
 
 [ "${UPDATE_GOLDEN:-0}" = "1" ] ||
-  echo "layout-goldens: OK — SyndicateGovernor + SyndicateFactory + GuardianRegistry layouts match their goldens"
+  echo "layout-goldens: OK — SyndicateGovernor + SyndicateFactory + GuardianRegistry + StakedWood layouts match their goldens"
