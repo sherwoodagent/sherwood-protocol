@@ -681,6 +681,41 @@ contract GovernorCoverageGatesTest is Test {
         assertEq(wood.balanceOf(address(escrow)), 0); // drained from the ORIGINAL escrow
     }
 
+    /// @notice EXECUTED is the state a bond is most likely to be prematurely
+    ///         reclaimed from — capital is deployed and the strategy is live, so
+    ///         the bond must stay locked until settlement (review finding I-6).
+    function test_reclaimBond_executedProposalReverts() public {
+        uint256 pid = _proposeSolo(governor, address(vault), agent, 1_000e6);
+        address[] memory gs = new address[](1);
+        gs[0] = makeAddr("g1");
+        _seatApprovers(pid, gs, 20_000e18);
+        _toApproved(pid);
+        governor.executeProposal(pid);
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Executed));
+
+        vm.expectRevert(ISyndicateGovernor.ProposalNotTerminal.selector);
+        governor.reclaimProposerBond(pid);
+    }
+
+    /// @notice REJECTED returns the bond in full. A veto is the LP body
+    ///         declining the strategy, not a finding of misconduct — forfeiture
+    ///         belongs exclusively to a passed challenge (Plan C).
+    function test_reclaimBond_afterRejected() public {
+        uint256 pid = _proposeSolo(governor, address(vault), agent, 1_000e6);
+        uint256 balBefore = wood.balanceOf(agent);
+
+        // lp1 holds the entire share supply; voting Against clears the 4000 bps
+        // veto threshold, so the proposal resolves Rejected at voteEnd.
+        vm.prank(lp1);
+        governor.vote(pid, ISyndicateGovernor.VoteType.Against);
+        vm.warp(governor.getProposal(pid).voteEnd + 1);
+        governor.resolveProposalState(pid);
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Rejected));
+
+        governor.reclaimProposerBond(pid);
+        assertEq(wood.balanceOf(agent), balBefore + 200e18);
+    }
+
     /// @notice A proposal that never locked a bond (zero bond bps) has nothing
     ///         to reclaim — the terminal check passes, the amount check doesn't.
     function test_reclaimBond_noBondReverts() public {

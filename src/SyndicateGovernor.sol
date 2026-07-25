@@ -439,7 +439,18 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // §3.3a wants — suppressing the cohort blocks execution, never forces it).
         {
             address ledger = _exposureLedger;
-            if (ledger != address(0) && proposal.envelopeTier >= IExposureLedger(ledger).quorumTierThreshold()) {
+            // `requiredCoverage == 0` keeps optimistic passage: spec §3.3a
+            // carves out "proposals that move no coverage-consuming value", and
+            // demanding a covering signer for a proposal that can extract
+            // nothing is pure throughput loss (review finding M-1). Largely
+            // defensive today — `propose` rejects `maxCapital == 0`
+            // (`ZeroMaxCapital`), so zero coverage at tier 2 is not currently
+            // reachable — but the gate should key on extractable value, which is
+            // what the quorum actually underwrites.
+            if (
+                ledger != address(0) && proposal.requiredCoverage != 0
+                    && proposal.envelopeTier >= IExposureLedger(ledger).quorumTierThreshold()
+            ) {
                 IExposureLedger(ledger)
                     .requireApproveQuorum(address(this), proposalId, asset, proposal.requiredCoverage);
             }
