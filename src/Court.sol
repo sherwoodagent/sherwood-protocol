@@ -44,15 +44,27 @@ import {IStakedWood} from "./interfaces/IStakedWood.sol";
  *         golden pins it.
  *
  * @dev    §4 INVARIANT: `wood.balanceOf(this) == bondedWood + forfeitedWood`.
- *         `bondedWood` is every WOOD position somebody can still claim — posted
- *         panel bonds, the bonds of appeals and bad-faith votes still open, and
- *         accrued-but-unclaimed panel rewards — and `forfeitedWood` is what the
- *         protocol now owns: appeal bonds that missed the participation floor
- *         and panel bonds slashed for bad faith. TWO TERMS, NOT THREE: every
- *         transfer between the buckets moves the same amount out of one and into
- *         the other in a single statement, so the equality holds at every
- *         intermediate step and not merely at rest. The equality is exact except
- *         for WOOD somebody donated here by mistake, which no path ever spends.
+ *         `bondedWood` is every WOOD POSITION SOMEBODY POSTED and can still get
+ *         back — panel bonds, and the bonds of appeals and bad-faith votes still
+ *         open — and `forfeitedWood` is what the protocol now owns: appeal bonds
+ *         that missed the participation floor and panel bonds slashed for bad
+ *         faith. TWO TERMS, NOT THREE: every transfer between the buckets moves
+ *         the same amount out of one and into the other in a single statement,
+ *         so the equality holds at every intermediate step and not merely at
+ *         rest. The equality is exact except for WOOD somebody donated here by
+ *         mistake, which no path ever spends.
+ *
+ * @dev    `reservedRewards` IS A SUBSET OF `forfeitedWood`, NOT A THIRD TERM.
+ *         `forfeitedWood >= reservedRewards` holds always, so the two-term
+ *         equality above is untouched by it. Panel rewards are paid out of the
+ *         protocol-owned pot, so an accrued-but-unclaimed reward is still
+ *         forfeited WOOD — it is merely forfeited WOOD already committed to a
+ *         named payee. Tracking it as a subset rather than moving it into
+ *         `bondedWood` keeps `bondedWood` meaning exactly one thing ("somebody
+ *         posted this, and it answers to a bond rule"). What the subset buys is
+ *         `burnForfeited`: the burn may only ever take
+ *         `forfeitedWood - reservedRewards`, so a resolved case's rewards cannot
+ *         be destroyed out from under the panel that earned them.
  */
 contract Court is Ownable2Step, ICourt {
     using SafeERC20 for IERC20;
@@ -100,6 +112,22 @@ contract Court is Ownable2Step, ICourt {
 
     uint256 internal constant BPS_DENOMINATOR = 10_000;
 
+    /// @notice Where `burnForfeited` sends the pot — permanently out of anyone's
+    ///         reach, including the owner's.
+    /// @dev    A TRANSFER TO A DEAD ADDRESS, NOT A TRUE SUPPLY REDUCTION. WOOD is
+    ///         a plain `IERC20` with no `burn` and no post-deploy mint, so the
+    ///         court cannot lower `totalSupply`; the nearest available thing is a
+    ///         send to an address whose private key nobody has. `totalSupply`
+    ///         therefore does not move, and holders should read circulating
+    ///         supply net of this balance. `StakedWood` burns slashed WOOD the
+    ///         same way and to the same address, so the two contracts' burnt
+    ///         WOOD lands in one auditable place.
+    /// @dev    `address(0)` is NOT usable here: OpenZeppelin's `ERC20._update`
+    ///         reverts `ERC20InvalidReceiver` on a transfer to the zero address,
+    ///         so `safeTransfer(address(0), ...)` would make the burn revert
+    ///         rather than burn.
+    address internal constant BURN_ADDRESS = 0x000000000000000000000000000000000000dEaD;
+
     IERC20 public immutable wood;
 
     /// @notice The seated roster, in the order `setPanel` received it. Kept
@@ -136,9 +164,13 @@ contract Court is Ownable2Step, ICourt {
     /// @inheritdoc ICourt
     /// @dev Grows in exactly two places — `finalizeAppeal`'s below-floor branch
     ///      and `finalizeBadFaith`'s slash — and shrinks in exactly two:
-    ///      `sweepForfeited` and the flat panel reward. Never overlaps
-    ///      `bondedWood`: value moves from one to the other in the same
-    ///      statement, so the §4 equality holds across every transition.
+    ///      `burnForfeited` and `claimPanelReward`. Never overlaps `bondedWood`:
+    ///      value moves from one to the other in the same statement, so the §4
+    ///      equality holds across every transition.
+    /// @dev CONTAINS `reservedRewards`. The part of this number equal to
+    ///      `reservedRewards` is spoken for by resolved cases and only
+    ///      `claimPanelReward` may spend it; the remainder is the unreserved
+    ///      surplus and only `burnForfeited` may spend that.
     /// @dev ONE SINK, AND DELIBERATELY NOT `CompensationEscrow`. A slashed panel
     ///      bond is not the value that was drained, and `openCase` fixes a case's
     ///      `proceeds` at open time precisely to keep per-case funds isolated (a
@@ -146,6 +178,22 @@ contract Court is Ownable2Step, ICourt {
     ///      case would inflate its proceeds and pay claimants out of money that
     ///      was never theirs.
     uint256 public forfeitedWood;
+
+    /// @inheritdoc ICourt
+    /// @dev A SUBSET OF `forfeitedWood`, never a term beside it. Grows only in
+    ///      `_accruePanelRewards`, which reserves against the UNRESERVED surplus
+    ///      and so can never push this past `forfeitedWood`; shrinks only in
+    ///      `claimPanelReward`, which decrements it and `forfeitedWood` by the
+    ///      same amount in the same statement. `forfeitedWood >= reservedRewards`
+    ///      therefore holds at every intermediate step.
+    /// @dev WHY RESERVE AT ALL: the reward is all-or-nothing, so a burn landing
+    ///      between a case's resolution and its panelists' claims would leave the
+    ///      credits standing with nothing behind them. That is not merely a
+    ///      bookkeeping defect — an unpaid panel is an absent panel, and a panel
+    ///      that does not rule inside `panelWindow` acquits by default. Funding
+    ///      the reward is a LIVENESS property of layer 1, so the liability is set
+    ///      aside the instant it accrues rather than hoped for at claim time.
+    uint256 public reservedRewards;
 
     // ─────────────────────── Adjudication state (Task 3) ───────────────────────
 
@@ -753,7 +801,9 @@ contract Court is Ownable2Step, ICourt {
     ///      `proceeds` at open time precisely to keep per-case funds isolated (a
     ///      critical Plan C fix), so crediting an unrelated slash into a victim
     ///      case would inflate its proceeds and pay claimants out of money that
-    ///      was never theirs. One sink, governance-directed via `sweepForfeited`.
+    ///      was never theirs. One sink, and its only exits are the panel reward
+    ///      and the permissionless `burnForfeited` — nobody, the owner included,
+    ///      can direct a slashed bond anywhere.
     /// @dev THE PANELIST KEEPS ITS SEAT AND ITS ACCRUED REWARD; it loses its
     ///      bond, which drops it below `panelBondWood` and so out of
     ///      `isReadyToRule` until it posts again. Removing it from the roster is
@@ -806,14 +856,19 @@ contract Court is Ownable2Step, ICourt {
     }
 
     /// @inheritdoc ICourt
-    /// @dev Paid from `bondedWood`, which is where `_resolve` moved it when the
-    ///      reward accrued, so the §4 equality holds across the claim.
+    /// @dev PAID OUT OF THE RESERVE `_resolve` SET ASIDE, so the money is
+    ///      provably still here: `reservedRewards` is the sum of every
+    ///      outstanding `panelRewardOf`, and `burnForfeited` cannot reach it. The
+    ///      claim draws both numbers down by the same amount in the same
+    ///      statement, so `forfeitedWood >= reservedRewards` and the §4 equality
+    ///      both hold across it.
     function claimPanelReward() external returns (uint256 amount) {
         amount = panelRewardOf[msg.sender];
         if (amount == 0) revert NothingToClaim();
 
         panelRewardOf[msg.sender] = 0;
-        bondedWood -= amount;
+        reservedRewards -= amount;
+        forfeitedWood -= amount;
         wood.safeTransfer(msg.sender, amount);
         emit PanelRewardClaimed(msg.sender, amount);
     }
@@ -883,27 +938,38 @@ contract Court is Ownable2Step, ICourt {
     /// @dev PAID FROM `forfeitedWood` — the protocol-owned pot fed by below-floor
     ///      appeal bonds and by bad-faith slashes. Bad conduct funds the honest
     ///      panel's sitting fee, and no new WOOD sink is invented for it.
-    /// @dev ALL OR NOTHING. If the pot cannot cover every ruling member, none is
-    ///      paid and `PanelRewardUnfunded` says so. Paying down the pot in vote
-    ///      order would make the reward depend on WHEN a member ruled — a race to
-    ///      vote first, which is a bias on panel behaviour of exactly the kind
-    ///      D5 exists to remove — and it would put the court's accounting in the
-    ///      position of underpaying a member it had already credited.
+    /// @dev THE LIABILITY IS RESERVED AT THE INSTANT IT ACCRUES, not looked for
+    ///      at claim time. `required` moves into `reservedRewards`, which
+    ///      `burnForfeited` subtracts before it takes anything, so no burn — and
+    ///      there is no longer any owner sweep either — can leave these credits
+    ///      unbacked. The WOOD does not leave `forfeitedWood`; it is only marked
+    ///      as spoken for, which is why this is a subset and not a third bucket.
+    /// @dev FUNDING IS MEASURED AGAINST THE UNRESERVED SURPLUS. `available` is
+    ///      `forfeitedWood - reservedRewards`, never the raw pot: the reserved
+    ///      part belongs to earlier cases' panelists, and counting it here would
+    ///      let case N+1 credit rewards backed by case N's money and leave
+    ///      whichever panel claimed second unable to withdraw.
+    /// @dev ALL OR NOTHING. If the surplus cannot cover every ruling member, none
+    ///      is paid and `PanelRewardUnfunded` says so. Paying down the pot in
+    ///      vote order would make the reward depend on WHEN a member ruled — a
+    ///      race to vote first, which is a bias on panel behaviour of exactly the
+    ///      kind D5 exists to remove — and it would put the court's accounting in
+    ///      the position of underpaying a member it had already credited.
     function _accruePanelRewards(uint256 caseId, address[] storage voters, uint256 n) internal {
         uint256 reward = panelRewardWood;
         if (reward == 0 || n == 0) return;
 
         uint256 required = reward * n;
-        uint256 available = forfeitedWood;
+        uint256 available = forfeitedWood - reservedRewards;
         if (available < required) {
             emit PanelRewardUnfunded(caseId, required, available);
             return;
         }
 
-        // Straight from the protocol-owned bucket into the claimable one, in one
-        // statement, so the §4 equality never has an intermediate state.
-        forfeitedWood = available - required;
-        bondedWood += required;
+        // The pot itself does not move — `required` is merely fenced off inside
+        // it — so the §4 equality is untouched and `forfeitedWood` still bounds
+        // `reservedRewards` (the check above is exactly that bound).
+        reservedRewards += required;
         for (uint256 i; i < n; ++i) {
             address member = voters[i];
             panelRewardOf[member] += reward;
@@ -1073,17 +1139,47 @@ contract Court is Ownable2Step, ICourt {
     }
 
     /// @inheritdoc ICourt
-    /// @dev Only ever moves `forfeitedWood`, never `bondedWood`, so no open
-    ///      panel bond or live appeal can be swept out from under its owner —
-    ///      the §4 equality is what makes that guarantee checkable.
-    function sweepForfeited(address to) external onlyOwner returns (uint256 amount) {
-        if (to == address(0)) revert ZeroAddress();
-        amount = forfeitedWood;
-        if (amount == 0) revert InvalidParameter();
+    /// @dev NO OWNER, NO DESTINATION, ON PURPOSE — this REPLACED an
+    ///      `onlyOwner sweepForfeited(address to)` with an arbitrary recipient.
+    ///      `forfeitedWood` is fed by failed appeals and by slashed panel bonds,
+    ///      so an owner able to direct it was an owner who PROFITED FROM THE
+    ///      COURT'S FAILURES: a standing incentive to see appeals miss the floor
+    ///      and panelists slashed. Not an exploit, just an incentive pointing the
+    ///      wrong way, and the cheapest fix is to leave nobody to point it at.
+    /// @dev WHY BURN RATHER THAN ANYWHERE ELSE. Every other destination — a
+    ///      treasury, the protocol backstop, the owner — needs a party trusted to
+    ///      hold the pot, and that party then benefits when the court fails.
+    ///      Burning is the only destination with NO BENEFICIARY, which is what
+    ///      makes the panel's and the appellant's incentives clean: nobody
+    ///      anywhere is made better off by a forfeit. The value is not lost to
+    ///      WOOD holders either — removing it from circulation accrues pro rata
+    ///      to everyone who still holds, which is as close to "returned to the
+    ///      protocol" as a destination with no custodian can get.
+    /// @dev PERMISSIONLESS IS LOAD-BEARING, NOT CONVENIENCE. Gating the burn on
+    ///      the owner would let it sit on the pot indefinitely, which is the same
+    ///      discretion this function exists to delete, only exercised by
+    ///      inaction. Anyone may call it, so the surplus is always one
+    ///      transaction from gone and nobody's forbearance is worth anything.
+    ///      There is nothing to grief with: the caller chooses no amount and no
+    ///      destination, and burning early only burns money the protocol already
+    ///      owned outright.
+    /// @dev TAKES THE UNRESERVED SURPLUS ONLY. `reservedRewards` is subtracted
+    ///      first, so rewards a resolved case already accrued survive any number
+    ///      of burns; and it reads `forfeitedWood` alone, never `bondedWood`, so
+    ///      NO LIVE BOND IS EVER BURNABLE — not a posted panel bond, not an open
+    ///      appeal's, not an open bad-faith proceeding's. The §4 equality is what
+    ///      makes that guarantee checkable rather than merely asserted.
+    /// @dev Reverts on an empty surplus rather than no-opping, matching how this
+    ///      contract treats every other empty operation (`claimPanelReward`
+    ///      reverts `NothingToClaim`). A no-op burn would emit a
+    ///      `ForfeitedWoodBurned(caller, 0)` that indexers would have to filter.
+    function burnForfeited() external returns (uint256 amount) {
+        amount = forfeitedWood - reservedRewards;
+        if (amount == 0) revert NothingToBurn();
 
-        forfeitedWood = 0;
-        wood.safeTransfer(to, amount);
-        emit ForfeitedWoodSwept(to, amount);
+        forfeitedWood -= amount;
+        wood.safeTransfer(BURN_ADDRESS, amount);
+        emit ForfeitedWoodBurned(msg.sender, amount);
     }
 
     // ─────────────────────────── Internals ───────────────────────────

@@ -183,6 +183,11 @@ interface ICourt {
     ///         because none was opened or because it already resolved.
     error BadFaithNotOpen();
     error NothingToClaim();
+    /// @notice `burnForfeited` found no unreserved surplus — either the pot is
+    ///         empty or every last unit of it is reserved for accrued panel
+    ///         rewards. Reverting rather than no-opping matches
+    ///         `NothingToClaim`'s treatment of the same situation.
+    error NothingToBurn();
 
     // Shared.
     error ZeroAddress();
@@ -254,7 +259,12 @@ interface ICourt {
     event AppealVoteWindowSet(uint256 oldWindow, uint256 newWindow);
     event AppealBondWoodSet(uint256 oldAmount, uint256 newAmount);
     event ParticipationFloorBpsSet(uint256 oldBps, uint256 newBps);
-    event ForfeitedWoodSwept(address indexed to, uint256 amount);
+    /// @notice The unreserved forfeited surplus was sent to a dead address.
+    /// @dev    `caller` is indexed for completeness only — it earns nothing and
+    ///         chooses nothing. The burn is permissionless precisely so that no
+    ///         address in this log line has any discretion over the amount or the
+    ///         destination.
+    event ForfeitedWoodBurned(address indexed caller, uint256 amount);
 
     // The bad-faith track (Task 5, F6).
     /// @param voteDeadline When `voteBadFaith` closes and `finalizeBadFaith`
@@ -302,6 +312,9 @@ interface ICourt {
     ///         All-or-nothing is deliberate: paying the pot down in vote order
     ///         would make the reward depend on when a member ruled, which is a
     ///         bias on panel behaviour of exactly the kind D5 exists to remove.
+    /// @param available The UNRESERVED surplus, `forfeitedWood -
+    ///        reservedRewards`, not the raw pot. WOOD already reserved for an
+    ///        earlier case's panelists is not available to this one.
     event PanelRewardUnfunded(uint256 indexed caseId, uint256 required, uint256 available);
 
     // ── Roster (D1) ──
@@ -447,8 +460,9 @@ interface ICourt {
     ///         `proceeds` at open time precisely so per-case funds stay isolated
     ///         (a critical Plan C fix), and crediting an unrelated slash into a
     ///         victim case would inflate its proceeds and pay claimants out of
-    ///         money that was never theirs. One sink, governance-directed
-    ///         through `sweepForfeited`.
+    ///         money that was never theirs. One sink, and one with no custodian:
+    ///         its only exits are the flat panel reward and the permissionless
+    ///         `burnForfeited`.
     function finalizeBadFaith(uint256 caseId, address panelist) external;
 
     /// @notice The bad-faith proceeding against `panelist`'s ruling on `caseId`.
@@ -482,7 +496,9 @@ interface ICourt {
     function panelRewardWood() external view returns (uint256);
 
     /// @notice Reward credited to `member` and not yet claimed. Counted inside
-    ///         `bondedWood`, because it is WOOD somebody can still claim.
+    ///         `forfeitedWood` and reserved by `reservedRewards`, because it is
+    ///         protocol-owned WOOD promised to a payee rather than a bond
+    ///         anybody posted.
     function panelRewardOf(address member) external view returns (uint256);
 
     /// @notice Withdraw accrued panel rewards.
@@ -534,17 +550,36 @@ interface ICourt {
     function participationFloorBps() external view returns (uint256);
 
     /// @notice WOOD the court holds on behalf of open positions (spec §4): the
-    ///         posted panel bonds plus the bonds of appeals still open. The
-    ///         invariant is `wood.balanceOf(court) == bondedWood +
-    ///         forfeitedWood`.
+    ///         posted panel bonds plus the bonds of appeals and bad-faith
+    ///         proceedings still open. The invariant is
+    ///         `wood.balanceOf(court) == bondedWood + forfeitedWood`.
+    /// @dev    POSTED POSITIONS ONLY. Accrued-but-unclaimed panel rewards are
+    ///         NOT counted here — they were never posted by anyone, they are
+    ///         protocol-owned WOOD promised to a payee, so they live inside
+    ///         `forfeitedWood` and are tracked by `reservedRewards`.
     function bondedWood() external view returns (uint256);
 
-    /// @notice WOOD the court owns outright, from appeal bonds forfeited for
-    ///         missing the participation floor. Held rather than burned so
-    ///         governance can direct it; Task 5 sends slashed panel bonds to
-    ///         the same accumulator and the deploy runbook points
-    ///         `sweepForfeited` at the protocol backstop.
+    /// @notice WOOD the court owns outright: appeal bonds forfeited for missing
+    ///         the participation floor, and panel bonds slashed for bad faith.
+    /// @dev    NO CUSTODIAN AND NO OWNER PATH. It leaves by exactly two routes —
+    ///         the flat panel reward, and `burnForfeited`, which anyone may call
+    ///         and which sends the unreserved surplus to a dead address. There is
+    ///         deliberately no way for governance to direct it anywhere, because
+    ///         a party able to receive forfeits is a party that profits when the
+    ///         court fails.
+    /// @dev    CONTAINS `reservedRewards`: `forfeitedWood >= reservedRewards`
+    ///         always, and the difference is the burnable surplus.
     function forfeitedWood() external view returns (uint256);
+
+    /// @notice The part of `forfeitedWood` already committed to accrued panel
+    ///         rewards — equal to the sum of every outstanding `panelRewardOf`.
+    /// @dev    A SUBSET OF `forfeitedWood`, NOT A THIRD BALANCE, so the §4
+    ///         two-term equality is unaffected by it. Reserved at resolution so
+    ///         that `burnForfeited` cannot destroy a panel's pay after the panel
+    ///         has earned it — which matters beyond bookkeeping, because an
+    ///         unpaid panel is an absent panel and a panel that does not rule
+    ///         inside `panelWindow` acquits by default.
+    function reservedRewards() external view returns (uint256);
 
     // ── Owner setters ──
     function setPanelBondWood(uint256 newBond) external;
@@ -561,7 +596,19 @@ interface ICourt {
     ///         rewards off; the only shape this setter refuses is a non-flat one,
     ///         which it does by having no per-verdict argument to give.
     function setPanelRewardWood(uint256 newReward) external;
-    /// @notice Move forfeited WOOD out of the court. Never touches `bondedWood`,
-    ///         so no open position can be swept out from under its owner.
-    function sweepForfeited(address to) external returns (uint256 amount);
+    // ── Permissionless ──
+    /// @notice Burn the unreserved forfeited surplus —
+    ///         `forfeitedWood - reservedRewards` — by sending it to a dead
+    ///         address. Reverts `NothingToBurn` when that is zero.
+    /// @dev    NOT AN OWNER FUNCTION, AND NOT LISTED WITH THEM. It replaced an
+    ///         `onlyOwner sweepForfeited(address to)` whose arbitrary recipient
+    ///         let whoever ran the court collect every failed appeal bond and
+    ///         every slashed panel bond — a standing incentive to see bonds
+    ///         forfeited. Burning removes the beneficiary rather than changing
+    ///         who it is; permissionless removes the ability to sit on the pot
+    ///         instead, which would be the same discretion exercised by
+    ///         inaction.
+    /// @dev    Never reads or writes `bondedWood`, so no live bond — panel,
+    ///         appeal or bad-faith — is ever burnable.
+    function burnForfeited() external returns (uint256 amount);
 }
