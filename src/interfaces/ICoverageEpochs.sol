@@ -216,6 +216,79 @@ interface ICoverageEpochs {
     /// @notice Whether a cover exists for `(governor, proposalId)`.
     function isOpen(address governor, uint256 proposalId) external view returns (bool);
 
+    // ── Renewal (spec §3.4a) ──
+
+    /// @notice Commit to cover COVER-RELATIVE `epoch` (D8), booking real
+    ///         exposure against the same aggregate cap a fresh approval
+    ///         consumes — a guardian without capacity cannot renew, which is the
+    ///         point of booking at all.
+    /// @dev Accepted only while `block.timestamp < renewalDeadline(epoch)`. See
+    ///      that function for what the deadline does and does not buy.
+    /// @dev Reverts `NotOpened` without a cover, `WoundDown` on a cover already
+    ///      unwinding, `InvalidParameter` for `epoch == 0` (relative epoch 0 is
+    ///      the watch the cover opened on — covered by the ORIGINAL approvers
+    ///      through the ledger, so a "renewal" of it would create a second,
+    ///      contradictory notion of who covered it), `RenewalClosed` past the
+    ///      deadline, and `AlreadyCommitted` on a second commit by the same
+    ///      guardian. The last guard is load-bearing rather than defensive:
+    ///      `ExposureLedger.recordApproval` is idempotent, so without it a
+    ///      double commit would silently succeed and push a duplicate coverer.
+    function commitRenewal(address governor, uint256 proposalId, uint256 epoch) external;
+
+    /// @notice The instant renewal for COVER-RELATIVE `epoch` closes:
+    ///         `globalBoundary(epoch) - renewalLeadTime`, where the boundary is
+    ///         the START of that epoch on the ledger's GLOBAL grid (D8).
+    ///
+    /// @dev DELIBERATELY BEFORE THE BOUNDARY — AND READ WHAT THAT BUYS BEFORE
+    ///      SIZING `renewalLeadTime`. This closes the DISCONTINUOUS exit run: a
+    ///      hack, depeg or liquidation cascade landing in the hours between the
+    ///      deadline and the boundary cannot be front-run out of.
+    ///
+    ///      It does NOT create information asymmetry about a gradual decline.
+    ///      `IPriceRouter.valueStrategy` is a PUBLIC VIEW: a guardian can read
+    ///      it continuously and compute what the boundary checkpoint will almost
+    ///      certainly say, so a strategy deteriorating visibly across the epoch
+    ///      is not hidden by this deadline for one second. That case is handled
+    ///      by repricing at renewal (spec §3.10 — a riskier strategy costs more
+    ///      to renew, and if nobody will pay it winds down), which IS NOT BUILT
+    ///      YET. An implementer who believes sequencing is the whole defence
+    ///      will size `renewalLeadTime` wrongly: longer does not buy more
+    ///      protection against drift, it only makes guardians commit against
+    ///      staler information.
+    /// @dev Reverts `NotOpened` without a cover — an unopened cover has no
+    ///      schedule, and the boundary arithmetic would underflow on a zero
+    ///      genesis.
+    function renewalDeadline(address governor, uint256 proposalId, uint256 epoch) external view returns (uint256);
+
+    /// @notice The guardians who committed renewal for COVER-RELATIVE `epoch`.
+    /// @dev Renewals ONLY. Relative epoch 0's coverers are the original
+    ///      approvers held by `ExposureLedger`, and this list is empty for it;
+    ///      the unified claims-made view is `coverersOf` (Task 5).
+    function renewalCoverersOf(address governor, uint256 proposalId, uint256 epoch)
+        external
+        view
+        returns (address[] memory);
+
+    /// @notice Whether `guardian` has already committed to cover `epoch`.
+    function hasCommittedRenewal(address governor, uint256 proposalId, uint256 epoch, address guardian)
+        external
+        view
+        returns (bool);
+
+    /// @notice How far ahead of an epoch boundary renewal closes. Owner-set,
+    ///         default 3 days, bounded `(0, epochLength / 2]`.
+    function renewalLeadTime() external view returns (uint256);
+
+    // ── Owner setters ──
+
+    /// @notice Set how far ahead of a boundary renewal closes.
+    /// @dev Bounded `(0, epochLength / 2]`. Zero would put the deadline ON the
+    ///      boundary, leaving renewal open until the instant the checkpoint can
+    ///      be taken — closing no window at all. Beyond half an epoch, guardians
+    ///      commit against badly stale information, which is a different failure
+    ///      rather than a stronger defence: see `renewalDeadline`.
+    function setRenewalLeadTime(uint256 newLeadTime) external;
+
     /// @notice The key covers are stored under, mirroring
     ///         `ChallengeGame._reviewKey` so one proposal has one identity
     ///         across the whole economic-security stack.

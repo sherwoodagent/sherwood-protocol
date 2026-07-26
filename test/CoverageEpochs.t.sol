@@ -2,10 +2,12 @@
 pragma solidity 0.8.28;
 
 import {Test} from "forge-std/Test.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {CoverageEpochs} from "src/CoverageEpochs.sol";
 import {ICoverageEpochs} from "src/interfaces/ICoverageEpochs.sol";
 import {ISyndicateGovernor} from "src/interfaces/ISyndicateGovernor.sol";
 import {ExposureLedger} from "src/ExposureLedger.sol";
+import {IExposureLedger} from "src/interfaces/IExposureLedger.sol";
 
 /// @dev Minimal sWOOD stub: the ledger's constructor reads `coolDownPeriod`
 ///      only, and `maxDelegatedSlashBps` on the exposure paths Task 4 uses.
@@ -22,10 +24,50 @@ contract MockCoverageSwood {
     }
 }
 
+/// @dev Chainlink feed stub (same shape as `test/ExposureLedger.t.sol`'s). The
+///      ledger prices a renewal's coverage through it.
+contract MockCoverageFeed {
+    int256 public answer;
+    uint8 public immutable decimals;
+    uint256 public updatedAt;
+
+    constructor(int256 answer_, uint8 decimals_) {
+        answer = answer_;
+        decimals = decimals_;
+        updatedAt = block.timestamp;
+    }
+
+    function latestRoundData() external view returns (uint80, int256, uint256, uint256, uint80) {
+        return (1, answer, updatedAt, updatedAt, 1);
+    }
+}
+
 /// @dev Governor stub. `openCover` reads exactly three fields off
-///      `getProposal`: `state`, `strategy` and `maxDrawdownBps`.
+///      `getProposal`: `state`, `strategy` and `maxDrawdownBps`. Task 4 adds the
+///      two reads `ExposureLedger.recordApproval` makes when a renewal books
+///      exposure: `getProposalView().vault` and `getRequiredCoverage`.
 contract MockCoverageGovernor {
     mapping(uint256 proposalId => ISyndicateGovernor.StrategyProposal) internal _proposals;
+
+    uint256 public requiredCoverage;
+
+    struct ProposalViewLite {
+        uint256 voteEnd;
+        uint256 reviewEnd;
+        address vault;
+    }
+
+    function setRequiredCoverage(uint256 coverage) external {
+        requiredCoverage = coverage;
+    }
+
+    function getRequiredCoverage(uint256) external view returns (uint256) {
+        return requiredCoverage;
+    }
+
+    function getProposalView(uint256 proposalId) external view returns (ProposalViewLite memory v) {
+        v.vault = _proposals[proposalId].vault;
+    }
 
     function setProposal(
         uint256 proposalId,
@@ -83,9 +125,16 @@ contract MockCoverageRouter {
 ///      guardians.
 contract MockCoverageVault {
     uint256 public totalAssets;
+    /// @dev Read by `ExposureLedger.recordApproval` to price a renewal's
+    ///      coverage. Unrelated to `totalAssets`, which stays the trap.
+    address public asset;
 
     function setTotalAssets(uint256 v) external {
         totalAssets = v;
+    }
+
+    function setAsset(address a) external {
+        asset = a;
     }
 }
 
@@ -97,6 +146,10 @@ contract CoverageEpochsTest is Test {
 
     address internal owner = makeAddr("owner");
     address internal strategy = makeAddr("strategy");
+    address internal guardianA = makeAddr("guardianA");
+    address internal guardianB = makeAddr("guardianB");
+    address internal stranger = makeAddr("stranger");
+    address internal coverageAsset;
 
     CoverageEpochs internal epochs;
     ExposureLedger internal ledger;
@@ -498,5 +551,291 @@ contract CoverageEpochsTest is Test {
     function test_relativeEpochNow_revertsWithoutAnOpenCover() public {
         vm.expectRevert(ICoverageEpochs.NotOpened.selector);
         epochs.relativeEpochNow(address(governor), pid);
+    }
+
+    // ── Task 4 helpers ──
+
+    /// @dev Everything the ledger needs to price and book a renewal's exposure:
+    ///      a feed for the vault asset, a WOOD haircut price, the renewal-agent
+    ///      role on `epochs`, and two guardians with $5,000 of budget each
+    ///      (100k WOOD at $0.05).
+    function _wireRenewal() internal {
+        coverageAsset = makeAddr("coverageAsset");
+        vm.mockCall(coverageAsset, abi.encodeWithSignature("decimals()"), abi.encode(uint8(6)));
+        MockCoverageFeed feed = new MockCoverageFeed(1e8, 8); // $1.00
+        vault.setAsset(coverageAsset);
+        governor.setRequiredCoverage(1_000e6); // $1,000 of coverage
+
+        vm.startPrank(owner);
+        ledger.setWoodUsdPrice(0.05e8);
+        // Long staleness tolerance: these tests warp whole epochs, and feed
+        // staleness is ExposureLedger's concern, not this suite's.
+        ledger.setAssetFeed(coverageAsset, address(feed), 3_650 days);
+        ledger.setRenewalAgent(address(epochs));
+        vm.stopPrank();
+
+        swood.setStake(guardianA, 100_000e18, 0);
+        swood.setStake(guardianB, 100_000e18, 0);
+    }
+
+    // ── Task 4 tests: renewal commitments ──
+
+    function test_renewal_acceptedBeforeTheDeadline() public {
+        _wireRenewal();
+        _open();
+
+        // Hoisted: a call in ARGUMENT position would evaluate before `vm.prank`
+        // and eat it, and this repo has been bitten by that before.
+        uint256 deadline = epochs.renewalDeadline(address(governor), pid, 1);
+        vm.warp(deadline - 1);
+
+        vm.expectEmit(true, true, true, true);
+        emit ICoverageEpochs.RenewalCommitted(_key(), 1, guardianA);
+        vm.prank(guardianA);
+        epochs.commitRenewal(address(governor), pid, 1);
+
+        assertEq(epochs.renewalCoverersOf(address(governor), pid, 1).length, 1);
+        assertEq(epochs.renewalCoverersOf(address(governor), pid, 1)[0], guardianA);
+    }
+
+    /// @dev THE SEQUENCING TEST. After the deadline — even one second before the
+    ///      boundary, when the NAV is visibly cratering — renewal is closed.
+    ///      This is what stops the last-moment exit run on a DISCONTINUOUS move.
+    function test_renewal_refusedAfterTheDeadlineEvenBeforeTheBoundary() public {
+        _wireRenewal();
+        _open();
+
+        uint256 boundary = ledger.epochGenesis() + EPOCH_LENGTH;
+        vm.warp(boundary - 1); // one second before the boundary
+        router.setValue(strategy, 1e18, true); // visibly catastrophic
+
+        vm.prank(guardianA);
+        vm.expectRevert(ICoverageEpochs.RenewalClosed.selector);
+        epochs.commitRenewal(address(governor), pid, 1);
+    }
+
+    /// @dev The exact second. `>=` closes renewal AT the deadline, so the last
+    ///      accepted instant is `deadline - 1` — pinned in the test above.
+    function test_renewal_refusedAtTheExactDeadlineSecond() public {
+        _wireRenewal();
+        _open();
+
+        uint256 deadline = epochs.renewalDeadline(address(governor), pid, 1);
+        vm.warp(deadline);
+        assertLt(vm.getBlockTimestamp(), ledger.epochGenesis() + EPOCH_LENGTH, "still before the boundary");
+
+        vm.prank(guardianA);
+        vm.expectRevert(ICoverageEpochs.RenewalClosed.selector);
+        epochs.commitRenewal(address(governor), pid, 1);
+    }
+
+    /// @dev The sequencing property stated as an ordering: the deadline for the
+    ///      epoch about to begin is strictly EARLIER than the checkpoint that
+    ///      reveals the epoch now ending. Renewal therefore commits blind to the
+    ///      boundary NAV.
+    function test_checkpointCannotPrecedeTheRenewalDeadline() public {
+        _wireRenewal();
+        _open();
+
+        uint256 deadline = epochs.renewalDeadline(address(governor), pid, 1);
+        vm.warp(deadline);
+        vm.expectRevert(ICoverageEpochs.BoundaryNotReached.selector);
+        epochs.checkpoint(address(governor), pid);
+    }
+
+    function test_renewal_consumesExposureCapacity() public {
+        _wireRenewal();
+        _open();
+
+        uint256 openBefore = ledger.openExposureUsd(guardianA);
+        vm.prank(guardianA);
+        epochs.commitRenewal(address(governor), pid, 1);
+        assertGt(ledger.openExposureUsd(guardianA), openBefore, "renewal must book exposure");
+        assertEq(ledger.openExposureUsd(guardianA), 1_000e18, "the proposal's full $1,000 of coverage");
+    }
+
+    /// @dev The reason booking is not optional: a guardian whose bond is already
+    ///      fully spoken for cannot renew. Skipping the ledger call would let it
+    ///      back an unbounded number of epochs on one bond.
+    function test_renewal_withoutCapacityIsRefused() public {
+        _wireRenewal();
+        _open();
+        swood.setStake(guardianA, 0, 0); // no bond, no budget
+
+        vm.prank(guardianA);
+        vm.expectRevert(IExposureLedger.ExposureCapExceeded.selector);
+        epochs.commitRenewal(address(governor), pid, 1);
+        assertEq(epochs.renewalCoverersOf(address(governor), pid, 1).length, 0, "nothing recorded on a revert");
+    }
+
+    /// @dev `ExposureLedger.recordApproval` is deliberately idempotent (it
+    ///      absorbs a vote-change round trip), so without this guard a second
+    ///      commit would silently succeed and push a duplicate coverer.
+    function test_renewal_doubleCommitReverts() public {
+        _wireRenewal();
+        _open();
+
+        vm.startPrank(guardianA);
+        epochs.commitRenewal(address(governor), pid, 1);
+        vm.expectRevert(ICoverageEpochs.AlreadyCommitted.selector);
+        epochs.commitRenewal(address(governor), pid, 1);
+        vm.stopPrank();
+
+        assertEq(epochs.renewalCoverersOf(address(governor), pid, 1).length, 1, "no duplicate coverer");
+    }
+
+    /// @dev Relative epoch 0 is the watch the cover OPENED on — covered by the
+    ///      original approvers via the ledger. Accepting a "renewal" for it
+    ///      would create a second, contradictory notion of who covered epoch 0.
+    function test_renewal_epochZeroIsNotARenewal() public {
+        _wireRenewal();
+        _open();
+
+        vm.prank(guardianA);
+        vm.expectRevert(ICoverageEpochs.InvalidParameter.selector);
+        epochs.commitRenewal(address(governor), pid, 0);
+    }
+
+    function test_renewal_revertsWithoutAnOpenCover() public {
+        _wireRenewal();
+        vm.prank(guardianA);
+        vm.expectRevert(ICoverageEpochs.NotOpened.selector);
+        epochs.commitRenewal(address(governor), pid, 1);
+    }
+
+    function test_renewalDeadline_revertsWithoutAnOpenCover() public {
+        vm.expectRevert(ICoverageEpochs.NotOpened.selector);
+        epochs.renewalDeadline(address(governor), pid, 1);
+    }
+
+    function test_renewalLeadTime_defaultsToThreeDays() public view {
+        assertEq(epochs.renewalLeadTime(), 3 days);
+    }
+
+    function test_renewalLeadTime_boundedAndOwnerOnly() public {
+        // Hoisted before any prank: a call in argument position eats it.
+        uint256 half = ledger.epochLength() / 2;
+
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
+        epochs.setRenewalLeadTime(1 days);
+
+        vm.startPrank(owner);
+        // Zero would put the deadline ON the boundary: renewal would stay open
+        // until the instant the checkpoint can be taken, closing no window at all.
+        vm.expectRevert(ICoverageEpochs.InvalidParameter.selector);
+        epochs.setRenewalLeadTime(0);
+        // Beyond half an epoch guardians commit against badly stale information —
+        // a different failure, not a stronger defence (fact 2).
+        vm.expectRevert(ICoverageEpochs.InvalidParameter.selector);
+        epochs.setRenewalLeadTime(half + 1);
+
+        vm.expectEmit(true, true, true, true);
+        emit ICoverageEpochs.RenewalLeadTimeSet(3 days, half);
+        epochs.setRenewalLeadTime(half); // the boundary itself is legal
+        vm.stopPrank();
+
+        assertEq(epochs.renewalLeadTime(), half);
+    }
+
+    /// @dev A longer lead time moves the deadline EARLIER, widening the blind
+    ///      window. The deadline must track the setter, not a cached value.
+    function test_renewalLeadTime_movesTheDeadline() public {
+        _wireRenewal();
+        _open();
+        uint256 boundary = ledger.epochGenesis() + EPOCH_LENGTH;
+        assertEq(epochs.renewalDeadline(address(governor), pid, 1), boundary - 3 days);
+
+        vm.prank(owner);
+        epochs.setRenewalLeadTime(10 days);
+        assertEq(epochs.renewalDeadline(address(governor), pid, 1), boundary - 10 days);
+    }
+
+    // ── Task 4 tests: D8, the relative→global boundary conversion ──
+
+    /// @dev D8, THE HIGHEST-RISK CONVERSION IN THIS TASK. `commitRenewal`'s
+    ///      argument is COVER-RELATIVE; the deadline it is checked against lives
+    ///      on the ledger's GLOBAL grid. Reading the argument as an absolute
+    ///      epoch index puts the cover's epoch-1 deadline three epochs in the
+    ///      PAST for a cover opened in absolute epoch 3 — every renewal would be
+    ///      refused as already closed, and the whole cover would wind down for a
+    ///      reason nobody could see. Every test above opens in absolute epoch 0
+    ///      and is blind to this.
+    function test_renewal_deadlineIsRelativeToTheCoverNotTheLedger() public {
+        _wireRenewal();
+        _warpToEpochBoundary(3); // three whole epochs of ledger history first
+        _open();
+
+        // The cover's relative epoch 1 BEGINS at the ledger's absolute epoch-4
+        // boundary: the label is relative, the grid is global.
+        uint256 globalBoundary = ledger.epochGenesis() + 4 * EPOCH_LENGTH;
+        assertEq(epochs.renewalDeadline(address(governor), pid, 1), globalBoundary - 3 days);
+        assertGt(
+            epochs.renewalDeadline(address(governor), pid, 1),
+            vm.getBlockTimestamp(),
+            "an absolute reading would put the deadline in the past"
+        );
+
+        // ...and the deadline is live, not merely arithmetically correct.
+        vm.warp(globalBoundary - 3 days - 1);
+        vm.prank(guardianA);
+        epochs.commitRenewal(address(governor), pid, 1);
+        assertEq(epochs.renewalCoverersOf(address(governor), pid, 1)[0], guardianA);
+
+        vm.warp(globalBoundary - 3 days);
+        vm.prank(guardianB);
+        vm.expectRevert(ICoverageEpochs.RenewalClosed.selector);
+        epochs.commitRenewal(address(governor), pid, 1);
+    }
+
+    /// @dev The conversion must hold for every relative index, not just 1 — an
+    ///      implementation that special-cased the first renewal would pass the
+    ///      test above.
+    function test_renewal_deadlinesMarchWithTheGlobalGrid() public {
+        _wireRenewal();
+        _warpToEpochBoundary(3);
+        _open();
+
+        for (uint256 n = 1; n <= 4; n++) {
+            assertEq(
+                epochs.renewalDeadline(address(governor), pid, n),
+                ledger.epochGenesis() + (3 + n) * EPOCH_LENGTH - 3 days,
+                "relative n sits on the global (openEpoch + n) boundary"
+            );
+        }
+    }
+
+    /// @dev A cover opened MID-epoch renews against the same global grid: the
+    ///      deadline is anchored to the boundary, never to `openedAt`. Anchoring
+    ///      to `openedAt` would desynchronise the commitment from the exposure
+    ///      bucket it is supposed to expire with.
+    function test_renewal_midEpochCoverStillUsesTheGlobalBoundary() public {
+        _wireRenewal();
+        _warpToEpochBoundary(3);
+        vm.warp(vm.getBlockTimestamp() + 5 days);
+        _open();
+
+        assertEq(
+            epochs.renewalDeadline(address(governor), pid, 1),
+            ledger.epochGenesis() + 4 * EPOCH_LENGTH - 3 days,
+            "the boundary, not openedAt + epochLength"
+        );
+    }
+
+    /// @dev A renewal booked for the cover's epoch 1 lands in the LEDGER bucket
+    ///      current at commit time — the global grid the exposure expires on.
+    ///      This is the desynchronisation D8 exists to prevent, observed rather
+    ///      than argued.
+    function test_renewal_booksIntoTheLedgersGlobalEpochBucket() public {
+        _wireRenewal();
+        _warpToEpochBoundary(3);
+        _open();
+
+        vm.prank(guardianA);
+        epochs.commitRenewal(address(governor), pid, 1);
+
+        assertEq(ledger.currentEpoch(), 3, "committed during the ledger's absolute epoch 3");
+        assertEq(ledger.openExposureUsd(guardianA), 1_000e18);
+        assertEq(epochs.relativeEpochNow(address(governor), pid), 0, "which is the cover's epoch 0");
     }
 }

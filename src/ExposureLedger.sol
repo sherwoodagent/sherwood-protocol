@@ -145,10 +145,30 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     /// @dev Proposals whose committed coverage is pinned by a live challenge.
     mapping(bytes32 reviewKey => bool) internal _frozen;
 
+    /// @notice The one address permitted to BOOK exposure for an epoch renewal —
+    ///         the `CoverageEpochs` contract (spec §3.4a). Owner-set.
+    /// @dev A renewal is a fresh commitment to cover the same proposal, so it
+    ///      must consume the same aggregate cap an approve vote consumes;
+    ///      skipping the booking would let one bond back an unbounded number of
+    ///      epochs, which is exactly what §3.3's cap exists to prevent. Handing
+    ///      `CoverageEpochs` the REGISTRY role instead would have handed it
+    ///      `releaseApproval` and every other registry-gated power, so this is a
+    ///      third, strictly narrower principal: it may book, never release, and
+    ///      never freeze.
+    address public renewalAgent;
+
     // ── Modifiers / helpers ──
 
     modifier onlyRegistry() {
         if (msg.sender != guardianRegistry) revert NotGuardianRegistry();
+        _;
+    }
+
+    /// @dev Gates `recordApproval` ONLY. Reuses `NotGuardianRegistry` rather
+    ///      than minting a second error: the registry is still the primary
+    ///      principal and existing callers already branch on this selector.
+    modifier onlyBooker() {
+        if (msg.sender != guardianRegistry && msg.sender != renewalAgent) revert NotGuardianRegistry();
         _;
     }
 
@@ -239,6 +259,18 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     function setCoverageFreezer(address freezer) external onlyOwner {
         emit CoverageFreezerSet(coverageFreezer, freezer);
         coverageFreezer = freezer;
+    }
+
+    /// @notice Point the ledger at the `CoverageEpochs` allowed to book epoch
+    ///         renewals (spec §3.4a). Zero closes the path entirely.
+    /// @dev Zero is permitted and is the launch default: until governance wires
+    ///      a `CoverageEpochs`, no renewal can book, which fails closed. Unlike
+    ///      `setGuardianRegistry`, re-pointing orphans nothing — the renewal
+    ///      agent never releases, so exposures it booked stay releasable by the
+    ///      registry and expire with their buckets regardless.
+    function setRenewalAgent(address agent) external onlyOwner {
+        emit RenewalAgentSet(renewalAgent, agent);
+        renewalAgent = agent;
     }
 
     function setKNumerator(uint256 newK) external onlyOwner {
@@ -344,7 +376,12 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      execute-time quorum unless other approvers make up the rest. A
     ///      guardian with NO free budget still reverts (`ExposureCapExceeded`),
     ///      which is what closes the batching attack.
-    function recordApproval(address governor, uint256 proposalId, address guardian) external onlyRegistry {
+    ///      Also reachable by the `renewalAgent` (spec §3.4a): an epoch renewal
+    ///      is a fresh commitment to cover the same proposal, so it consumes the
+    ///      same budget by the same arithmetic. A guardian with no free budget
+    ///      cannot renew, which is the point. `releaseApproval` is deliberately
+    ///      NOT widened — see `onlyBooker`.
+    function recordApproval(address governor, uint256 proposalId, address guardian) external onlyBooker {
         bytes32 key = _reviewKey(governor, proposalId);
         if (_recorded[key][guardian].usd != 0) return; // idempotent (vote-change round trip)
         ILedgerGovernorMinimal gov = ILedgerGovernorMinimal(governor);

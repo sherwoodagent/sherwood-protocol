@@ -105,6 +105,9 @@ contract ExposureLedgerTest is Test {
     address internal guardian = makeAddr("guardian");
     address internal registry = makeAddr("registry");
     address internal freezer = makeAddr("freezer");
+    /// @dev The `CoverageEpochs` stand-in: the third role, allowed to BOOK a
+    ///      renewal's exposure but never to release anyone's coverage.
+    address internal renewer = makeAddr("renewer");
     MockGovernorForLedger internal mgov;
     address internal usdgAsset;
 
@@ -186,6 +189,11 @@ contract ExposureLedgerTest is Test {
         ledger.setAssetFeed(usdgAsset, address(feed), 365 days);
         ledger.setGuardianRegistry(registry);
         ledger.setCoverageFreezer(freezer);
+        // Wired in EVERY recording test on purpose. Widening `recordApproval`'s
+        // gate must not let a stranger through, and only a fixture with a live
+        // renewal agent can prove that — `test_recordApproval_registryOnly`
+        // below is that proof.
+        ledger.setRenewalAgent(renewer);
         vm.stopPrank();
         swood.setStake(guardian, 100_000e18, 0); // slashableBondUsd = $5,000 at $0.05
     }
@@ -581,5 +589,85 @@ contract ExposureLedgerTest is Test {
         vm.prank(registry);
         ledger.releaseApproval(address(mgov), 2, guardian);
         assertEq(ledger.openExposureUsd(guardian), 3_000e18, "only the frozen one remains");
+    }
+
+    // ── The renewal agent (spec §3.4a): a third role that may BOOK, never RELEASE ──
+
+    /// @notice `CoverageEpochs.commitRenewal` must consume the same aggregate
+    ///         cap a fresh approval consumes, and `recordApproval` was
+    ///         registry-only. Rather than hand `CoverageEpochs` the registry
+    ///         role — which would also hand it `releaseApproval` — the gate
+    ///         admits a second, narrower principal.
+    function test_recordApproval_renewalAgentMayBookExposure() public {
+        _wireRecording();
+        mgov.set(1_000e6); // $1,000
+        vm.prank(renewer);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        assertEq(ledger.openExposureUsd(guardian), 1_000e18, "a renewal books real exposure");
+    }
+
+    /// @notice The renewal agent is bounded by the SAME cap. A guardian with no
+    ///         free budget cannot renew — that is the point of booking at all.
+    function test_recordApproval_renewalAgentIsStillCapped() public {
+        _wireRecording();
+        mgov.set(5_000e6); // exactly the guardian's whole $5,000 budget
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+
+        mgov.set(1_000e6);
+        vm.prank(renewer);
+        vm.expectRevert(IExposureLedger.ExposureCapExceeded.selector);
+        ledger.recordApproval(address(mgov), 2, guardian);
+    }
+
+    /// @notice THE ASYMMETRY THIS ROLE EXISTS FOR. Booking is widened; releasing
+    ///         is not. A renewal agent that could release would be able to free
+    ///         another guardian's committed coverage — recycling a bond that is
+    ///         still answerable for a live proposal, which is precisely what the
+    ///         registry gate (and §3.4's freeze) exist to prevent.
+    function test_releaseApproval_staysRegistryOnlyEvenForTheRenewalAgent() public {
+        _wireRecording();
+        mgov.set(3_000e6);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+
+        vm.prank(renewer);
+        vm.expectRevert(IExposureLedger.NotGuardianRegistry.selector);
+        ledger.releaseApproval(address(mgov), 1, guardian);
+        assertEq(ledger.openExposureUsd(guardian), 3_000e18, "coverage untouched");
+    }
+
+    /// @notice The freeze role is not widened either: three roles, three powers.
+    function test_freezeCoverage_staysFreezerOnlyForTheRenewalAgent() public {
+        _wireRecording();
+        vm.prank(renewer);
+        vm.expectRevert(IExposureLedger.NotCoverageFreezer.selector);
+        ledger.freezeCoverage(address(mgov), 1);
+    }
+
+    function test_setRenewalAgent_onlyOwnerAndEmits() public {
+        address newAgent = makeAddr("newAgent");
+
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(this)));
+        ledger.setRenewalAgent(newAgent);
+
+        vm.expectEmit(true, true, true, true);
+        emit IExposureLedger.RenewalAgentSet(address(0), newAgent);
+        vm.prank(owner);
+        ledger.setRenewalAgent(newAgent);
+        assertEq(ledger.renewalAgent(), newAgent);
+    }
+
+    /// @notice Clearing the agent closes the path — the ledger must not keep
+    ///         honouring a decommissioned `CoverageEpochs`.
+    function test_setRenewalAgent_clearingClosesTheBookingPath() public {
+        _wireRecording();
+        mgov.set(1_000e6);
+        vm.prank(owner);
+        ledger.setRenewalAgent(address(0));
+
+        vm.prank(renewer);
+        vm.expectRevert(IExposureLedger.NotGuardianRegistry.selector);
+        ledger.recordApproval(address(mgov), 1, guardian);
     }
 }
