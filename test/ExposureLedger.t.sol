@@ -96,6 +96,11 @@ contract MockRegistryForLedger {
         weights = new uint128[](approvers.length);
         total = 0;
     }
+
+    /// @dev `setChallengeWindow` floors the window at
+    ///      `reviewPeriod + MAX_GOVERNOR_EXECUTION_WINDOW`, so the ledger now
+    ///      needs a registry that actually answers this.
+    uint256 public reviewPeriod = 3 days;
 }
 
 contract ExposureLedgerTest is Test {
@@ -250,6 +255,94 @@ contract ExposureLedgerTest is Test {
         ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 8_000e6);
     }
 
+    /// @notice M2 — the approver list must not grow with every guardian that
+    ///         ever approved. A release now swap-and-pops, so the array tracks
+    ///         CURRENT approvers and the execute-path loop stays bounded by the
+    ///         registry's own approver cap rather than by the cohort.
+    function test_releaseApproval_popsTheApproverList() public {
+        _wireRecording();
+        address g2 = makeAddr("g2");
+        swood.setStake(g2, 100_000e18, 0);
+        mgov.set(1_000e6);
+
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, g2);
+
+        // Release the FIRST of two, so the swap actually moves an element.
+        vm.prank(registry);
+        ledger.releaseApproval(address(mgov), 1, guardian);
+
+        // The survivor still carries the whole proposal -- proof the swap kept
+        // its index consistent rather than orphaning it.
+        assertEq(ledger.allocatedUsd(address(mgov), 1, g2), 1_000e18, "survivor intact after the swap");
+        assertEq(ledger.allocatedUsd(address(mgov), 1, guardian), 0, "released approver carries nothing");
+
+        // Re-approving re-lists cleanly (the index was cleared, not left stale).
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        assertEq(ledger.openExposureUsd(guardian), 1_000e18, "re-approve books again");
+    }
+
+    /// @notice M3 — the registry hook fires for EVERY authorized governor once
+    ///         the ledger is wired, including vaults whose asset has no feed.
+    ///         Reverting there made approve votes impossible on those vaults
+    ///         while Block votes still worked, so reviews became block-only.
+    ///         Booking nothing is the conservative half; failing the vote was
+    ///         the harmful half.
+    function test_recordApproval_unfedAssetBooksNothingInsteadOfReverting() public {
+        _wireRecording();
+        // Point the governor at a vault whose asset was never given a feed.
+        MockVaultForLedger unfed = new MockVaultForLedger(makeAddr("unfedAsset"));
+        MockGovernorForLedger gov2 = new MockGovernorForLedger(address(unfed));
+        gov2.set(1_000e6);
+
+        vm.prank(registry);
+        ledger.recordApproval(address(gov2), 1, guardian); // must not revert
+        assertEq(ledger.openExposureUsd(guardian), 0, "nothing booked, but the vote survives");
+    }
+
+    /// @notice M4 — the price may fall freely but may not more than double in
+    ///         one transaction. The directions are not symmetric: upward
+    ///         over-values every bond and overstates coverage, downward only
+    ///         tightens. Rate-limiting the fall would leave bonds over-valued
+    ///         during exactly the crash the price exists to absorb.
+    function test_setWoodUsdPrice_boundsTheUpwardMoveOnly() public {
+        vm.startPrank(owner);
+        ledger.setWoodUsdPrice(0.1e8); // exactly 2x from the 0.05e8 fixture -- allowed
+        assertEq(ledger.woodUsdPriceX8(), 0.1e8);
+
+        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
+        ledger.setWoodUsdPrice(0.2000001e8); // a hair over 2x -- rejected
+
+        ledger.setWoodUsdPrice(0.001e8); // a 100x collapse -- allowed, conservative
+        assertEq(ledger.woodUsdPriceX8(), 0.001e8);
+        vm.stopPrank();
+    }
+
+    /// @notice M1 — the challenge window must outlive the longest
+    ///         approve->execute gap, or one bond can cover two live drains
+    ///         across an epoch boundary. Only the upper bounds were enforced.
+    function test_setChallengeWindow_rejectsAWindowShorterThanReviewPlusExecution() public {
+        _wireRecording();
+        // The shared fixture wires an EOA as the registry, which cannot answer
+        // `reviewPeriod()`. Point at a real stub for the floor check.
+        MockRegistryForLedger reg = new MockRegistryForLedger();
+        vm.startPrank(owner);
+        ledger.setGuardianRegistry(address(reg));
+
+        // 3d review + 7d max execution window = a 10d floor.
+        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
+        ledger.setChallengeWindow(1); // the old code accepted this
+        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
+        ledger.setChallengeWindow(10 days - 1);
+
+        ledger.setChallengeWindow(10 days); // exactly the floor -- allowed
+        assertEq(ledger.challengeWindow(), 10 days);
+        vm.stopPrank();
+    }
+
     /// @notice C1 REGRESSION — the free-rider veto.
     ///
     ///         Under first-come booking an attacker could approve first and
@@ -361,9 +454,11 @@ contract ExposureLedgerTest is Test {
     /// openExposureUsd == sum recorded-minus-released in unexpired buckets.
     function testFuzz_exposureAccountingConserved(uint96 c1, uint96 c2, bool releaseFirst) public {
         _wireRecording();
-        swood.setStake(guardian, type(uint96).max, 0); // cap never binds in this fuzz
-        vm.prank(owner);
-        ledger.setWoodUsdPrice(1e8);
+        // uint96-max stake alone puts the bond ~3 orders of magnitude above
+        // any coverage this fuzz generates, so the cap never binds. The old
+        // 20x price raise on top of that was redundant, and now trips the
+        // upward rate limit on `setWoodUsdPrice`.
+        swood.setStake(guardian, type(uint96).max, 0);
         uint256 u1 = uint256(c1) % 1_000_000e6 + 1;
         uint256 u2 = uint256(c2) % 1_000_000e6 + 1;
         mgov.set(u1);

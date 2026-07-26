@@ -43,6 +43,9 @@ interface IRegistryApproversMinimal {
         external
         view
         returns (address[] memory approvers, uint128[] memory weights, uint128 totalApproveWeight);
+    /// @dev Read by `setChallengeWindow` to floor the window at the longest
+    ///      approve->execute gap a proposal can have.
+    function reviewPeriod() external view returns (uint256);
 }
 
 /**
@@ -70,6 +73,14 @@ interface IRegistryApproversMinimal {
  */
 contract ExposureLedger is Ownable2Step, IExposureLedger {
     uint256 internal constant BPS_DENOMINATOR = 10_000;
+
+    /// @dev Mirrors `GovernorParameters.MAX_EXECUTION_WINDOW`. Duplicated as a
+    ///      constant rather than read across, because the ledger has no handle
+    ///      on any particular governor at `setChallengeWindow` time — the floor
+    ///      has to hold for EVERY governor the registry serves, so it is sized
+    ///      against the worst legal configuration rather than a live one. Keep
+    ///      in step if the governor's ceiling ever moves.
+    uint256 internal constant MAX_GOVERNOR_EXECUTION_WINDOW = 7 days;
 
     bytes32 public constant PARAM_CHALLENGE_WINDOW = keccak256("challengeWindow");
     bytes32 public constant PARAM_K_NUMERATOR = keccak256("kNumerator");
@@ -136,7 +147,12 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      approved, and the ledger's and governor's registry pointers can
     ///      therefore never disagree (review finding I-1).
     mapping(bytes32 reviewKey => address[]) internal _approversOf;
-    mapping(bytes32 reviewKey => mapping(address guardian => bool)) internal _listed;
+    /// @dev 1-INDEXED position in `_approversOf`; 0 means "not listed". Carries
+    ///      the index rather than a bare flag so `releaseApproval` can
+    ///      swap-and-pop in O(1). A flag alone left released approvers in the
+    ///      array forever, so it grew with the number of guardians that ever
+    ///      approved — an unbounded loop in the execute path (review M2).
+    mapping(bytes32 reviewKey => mapping(address guardian => uint256)) internal _approverIndex;
 
     // ── Modifiers / helpers ──
 
@@ -191,8 +207,43 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
 
     // ── Owner setters ──
 
+    /// @dev BOUNDED AT 2x PER CHANGE in either direction (review M4). This is
+    ///      the single scalar behind every guardian's coverage, and it was the
+    ///      one setter here with no bound at all:
+    ///        - set it high and every quorum is trivially satisfied, so the
+    ///          coverage check becomes theatre;
+    ///        - set it to 0 and `capUsd` is 0, `open >= capUsd` holds at
+    ///          `0 >= 0`, and EVERY approve vote protocol-wide reverts
+    ///          `ExposureCapExceeded` — a global kill switch.
+    ///
+    ///      ZERO IS STILL ALLOWED, and rejecting it would have been theatre. A
+    ///      price of 1 wei-X8 shrinks every bond by ~5e6 and disables coverage
+    ///      just as thoroughly, so banning the round number removes the tidiest
+    ///      expression of the capability without removing the capability. The
+    ///      fail-closed direction is documented as intentional (spec §3.7); the
+    ///      real mitigation is owner custody, not a value check.
+    ///
+    ///      The FIRST price is exempt — there is no previous value to bound
+    ///      against, and the contract ships at 0 by design.
+    ///
+    ///      ONLY THE UPWARD MOVE IS BOUNDED, deliberately, and not as the review
+    ///      suggested (it proposed 2x in both directions). The two directions
+    ///      are not symmetric:
+    ///        - UPWARD over-values every bond, overstating coverage and making
+    ///          quorums easier to clear. That is the dangerous direction and the
+    ///          one worth rate-limiting.
+    ///        - DOWNWARD under-values every bond, shrinking budgets and
+    ///          tightening every quorum. It can only make approvals harder.
+    ///      Rate-limiting the downward move would be actively harmful: this
+    ///      price EXISTS to absorb a WOOD crash, and a 10x collapse capped at 2x
+    ///      per transaction would leave bonds over-valued 5x for as long as it
+    ///      took to walk the price down — precisely when the coverage number
+    ///      matters most. Bounding it would trade a governance-error risk for a
+    ///      solvency one.
     function setWoodUsdPrice(uint256 newPriceX8) external onlyOwner {
-        emit WoodUsdPriceSet(woodUsdPriceX8, newPriceX8);
+        uint256 current = woodUsdPriceX8;
+        if (current != 0 && newPriceX8 > current * 2) revert InvalidParameter();
+        emit WoodUsdPriceSet(current, newPriceX8);
         woodUsdPriceX8 = newPriceX8;
     }
 
@@ -220,6 +271,21 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         // epoch + challenge window, or an approver can unstake before its
         // epoch's approvals can be challenged.
         if (epochLength + newWindow > swood.coolDownPeriod()) revert InvalidParameter();
+        // LOWER BOUND (review M1). The anti-batching property depends on a
+        // bucket outliving the proposal it backs. With only the upper bounds
+        // above, a window shorter than the approve->execute gap lets one bond
+        // cover two live drains: approve #1 just before an epoch boundary, let
+        // the bucket expire while #1 is still Approved and inside its execution
+        // window, then approve #2 at full budget. Both quorums pass, both
+        // execute. Not reachable at shipped defaults (W = 14d), which is why it
+        // was latent rather than live — but nothing enforced it.
+        address reg = guardianRegistry;
+        if (
+            reg != address(0)
+                && newWindow < IRegistryApproversMinimal(reg).reviewPeriod() + MAX_GOVERNOR_EXECUTION_WINDOW
+        ) {
+            revert InvalidParameter();
+        }
         emit ParameterChangeFinalized(PARAM_CHALLENGE_WINDOW, challengeWindow, newWindow);
         challengeWindow = newWindow;
     }
@@ -332,6 +398,17 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         if (_recorded[key][guardian].usd != 0) return; // idempotent (vote-change round trip)
         ILedgerGovernorMinimal gov = ILedgerGovernorMinimal(governor);
         address asset = IVaultAssetMinimal(gov.getProposalView(proposalId).vault).asset();
+        // NO FEED -> BOOK NOTHING, don't revert (review M3). This hook fires for
+        // every authorized governor once the ledger is wired on the registry,
+        // including governors deliberately left un-wired on their own side and
+        // therefore carrying no coverage gate at all. Letting `coverageUsd`
+        // revert `FeedNotConfigured` here made APPROVE votes impossible on those
+        // vaults while Block votes still worked — turning their reviews
+        // block-only, so guardians could veto but never endorse, and the
+        // proposal passed optimistically anyway. Failing closed on the coverage
+        // (booking nothing, so the execute-time quorum cannot be met) is the
+        // conservative half; failing the vote was the harmful half.
+        if (_assetFeeds[asset].feed == address(0)) return;
         uint256 needUsd = coverageUsd(asset, gov.getRequiredCoverage(proposalId));
         if (needUsd == 0) return; // zero-coverage: nothing to book
 
@@ -376,9 +453,9 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         // The ledger keeps its OWN approver list: the quorum reads this, never
         // the registry, so the ledger's registry pointer and the governor's can
         // never disagree about who covered a proposal (review finding I-1).
-        if (!_listed[key][guardian]) {
-            _listed[key][guardian] = true;
+        if (_approverIndex[key][guardian] == 0) {
             _approversOf[key].push(guardian);
+            _approverIndex[key][guardian] = _approversOf[key].length; // 1-indexed
         }
         emit ExposureRecorded(guardian, key, share, epoch);
     }
@@ -395,6 +472,27 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         delete _recorded[key][guardian];
         _buckets[guardian][r.epoch] -= r.usd;
         _committedUsd[key] -= r.usd;
+
+        // Swap-and-pop out of the approver list (review M2). Leaving the entry
+        // behind was harmless per-iteration — every reader skips a zero
+        // commitment — but the array grew with the number of guardians that
+        // EVER approved, which is bounded by the cohort rather than by the
+        // registry's MAX_APPROVERS_PER_PROPOSAL, so the execute-path loop had
+        // no real bound. Order carries no meaning here: every consumer either
+        // sums over the list or returns it alongside per-guardian values.
+        uint256 idx = _approverIndex[key][guardian];
+        if (idx != 0) {
+            address[] storage list = _approversOf[key];
+            uint256 last = list.length;
+            if (idx != last) {
+                address moved = list[last - 1];
+                list[idx - 1] = moved;
+                _approverIndex[key][moved] = idx;
+            }
+            list.pop();
+            delete _approverIndex[key][guardian];
+        }
+
         emit ExposureReleased(guardian, key, r.usd, r.epoch);
     }
 
