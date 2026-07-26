@@ -148,7 +148,15 @@ contract CoverageEpochsTest is Test {
     address internal strategy = makeAddr("strategy");
     address internal guardianA = makeAddr("guardianA");
     address internal guardianB = makeAddr("guardianB");
+    /// @dev Task 5's renewer: it never approved at open, so it exists only to
+    ///      show a later epoch's coverer set is disjoint from epoch 0's.
+    address internal guardianC = makeAddr("guardianC");
     address internal stranger = makeAddr("stranger");
+    /// @dev Stands in for `GuardianRegistry`. `ExposureLedger.recordApproval` is
+    ///      `onlyBooker` (registry OR renewal agent) and `releaseApproval` is
+    ///      `onlyRegistry` — deliberately NOT widened to the renewal agent — so
+    ///      the original-approver side of Task 5 has to be driven from here.
+    address internal registry = makeAddr("registry");
     address internal coverageAsset;
 
     CoverageEpochs internal epochs;
@@ -837,5 +845,241 @@ contract CoverageEpochsTest is Test {
         assertEq(ledger.currentEpoch(), 3, "committed during the ledger's absolute epoch 3");
         assertEq(ledger.openExposureUsd(guardianA), 1_000e18);
         assertEq(epochs.relativeEpochNow(address(governor), pid), 0, "which is the cover's epoch 0");
+    }
+
+    // ── Task 5 helpers ──
+
+    /// @dev Wire the ORIGINAL approver side of a cover: `guardianA` and
+    ///      `guardianB` each book a non-zero share of the proposal's coverage
+    ///      through the ledger, exactly as `GuardianRegistry` does at vote time.
+    ///
+    ///      The $600 budgets are load-bearing. `recordApproval` returns early
+    ///      once `already >= needUsd`, so with `_wireRenewal`'s default $5,000
+    ///      guardians the FIRST approver would cover the whole $1,000 need and
+    ///      the second would book nothing and never even be listed — the fixture
+    ///      would then be testing a one-approver set while claiming two.
+    ///      $600 + $400 against $1,000 puts both in the ledger with real shares.
+    function _wireEpochZeroApprovers() internal {
+        _wireRenewal();
+
+        vm.prank(owner);
+        ledger.setGuardianRegistry(registry);
+
+        swood.setStake(guardianA, 12_000e18, 0); // $600 at $0.05/WOOD
+        swood.setStake(guardianB, 12_000e18, 0); // $600
+        swood.setStake(guardianC, 100_000e18, 0); // $5,000, the renewer
+
+        vm.startPrank(registry);
+        ledger.recordApproval(address(governor), pid, guardianA);
+        ledger.recordApproval(address(governor), pid, guardianB);
+        vm.stopPrank();
+    }
+
+    /// @dev A VERBATIM copy of `ChallengeGame._accused` (src/ChallengeGame.sol),
+    ///      kept here as an independent oracle. Task 5's whole correctness
+    ///      condition is that epoch 0's coverers are the same set predicate 5
+    ///      already slashes — if the two ever diverge, one of them slashes
+    ///      someone the other calls innocent. Task 7 makes `ChallengeGame` call
+    ///      `coverersOf` and deletes its copy, at which point they agree by
+    ///      construction; until then this comparison is the guarantee.
+    function _accusedOracle(address governor_, uint256 proposalId_) internal view returns (address[] memory accused) {
+        (address[] memory all, uint256[] memory committedUsd) = ledger.approversOf(governor_, proposalId_);
+        uint256 n;
+        for (uint256 i = 0; i < all.length; i++) {
+            if (committedUsd[i] != 0) n++;
+        }
+        accused = new address[](n);
+        uint256 j;
+        for (uint256 i = 0; i < all.length; i++) {
+            if (committedUsd[i] == 0) continue;
+            accused[j] = all[i];
+            j++;
+        }
+    }
+
+    function _assertSameSet(address[] memory got, address[] memory want, string memory what) internal pure {
+        assertEq(got.length, want.length, what);
+        for (uint256 i = 0; i < want.length; i++) {
+            assertEq(got[i], want[i], what);
+        }
+    }
+
+    // ── Task 5 tests: claims-made attribution ──
+
+    /// @dev Relative epoch 0 is the watch the cover opened on, and its coverers
+    ///      are the ledger's original approvers — not the (empty) renewal list.
+    function test_epochZeroCoverersAreTheOriginalApprovers() public {
+        _wireEpochZeroApprovers();
+        _warpToEpochBoundary(3); // a NON-ZERO absolute epoch (D8)
+        _open();
+
+        address[] memory cov = epochs.coverersOf(address(governor), pid, 0);
+        assertEq(cov.length, 2, "both original approvers cover epoch 0");
+        assertEq(cov[0], guardianA);
+        assertEq(cov[1], guardianB);
+
+        assertEq(
+            epochs.renewalCoverersOf(address(governor), pid, 0).length,
+            0,
+            "the renewal list is empty for epoch 0: coverersOf is the unified view"
+        );
+    }
+
+    /// @dev The guarantee this task turns on: epoch 0's set must be the SAME set
+    ///      `ChallengeGame._accused` computes, filter for filter.
+    function test_epochZeroCoverersMatchChallengeGameAccused() public {
+        _wireEpochZeroApprovers();
+        _warpToEpochBoundary(3);
+        _open();
+
+        _assertSameSet(
+            epochs.coverersOf(address(governor), pid, 0),
+            _accusedOracle(address(governor), pid),
+            "epoch 0 must equal ChallengeGame._accused"
+        );
+
+        // ...and it must still equal it once the set has a hole in it.
+        vm.prank(registry);
+        ledger.releaseApproval(address(governor), pid, guardianA);
+        _assertSameSet(
+            epochs.coverersOf(address(governor), pid, 0),
+            _accusedOracle(address(governor), pid),
+            "still equal after a release"
+        );
+    }
+
+    function test_laterEpochCoverersAreTheRenewers() public {
+        _wireEpochZeroApprovers();
+        _warpToEpochBoundary(3);
+        _open();
+
+        vm.prank(guardianC);
+        epochs.commitRenewal(address(governor), pid, 1);
+
+        address[] memory cov = epochs.coverersOf(address(governor), pid, 1);
+        assertEq(cov.length, 1);
+        assertEq(cov[0], guardianC, "epoch 1 is guardianC's watch");
+    }
+
+    /// @dev THE CORE CLAIMS-MADE PROPERTY. An original approver who did not
+    ///      renew answers for NOTHING that surfaces after its own epoch — which
+    ///      is what bounds a guardian's commitment at one epoch plus the
+    ///      challenge window however long the strategy runs.
+    function test_originalApproverIsNotLiableForALaterEpoch() public {
+        _wireEpochZeroApprovers();
+        _warpToEpochBoundary(3);
+        _open();
+
+        vm.prank(guardianC);
+        epochs.commitRenewal(address(governor), pid, 1);
+
+        address[] memory cov = epochs.coverersOf(address(governor), pid, 1);
+        for (uint256 i = 0; i < cov.length; i++) {
+            assertNotEq(cov[i], guardianA, "guardianA's watch ended at epoch 0");
+            assertNotEq(cov[i], guardianB, "guardianB's watch ended at epoch 0");
+        }
+        // A guardian is only ever released from FUTURE epochs, never from its
+        // own: epoch 0 still names them.
+        assertEq(epochs.coverersOf(address(governor), pid, 0).length, 2);
+    }
+
+    /// @dev An epoch nobody renewed has NO coverers. This is the honest answer,
+    ///      not a fallback to epoch 0's approvers: silently re-accusing the
+    ///      original approvers for an unrenewed watch is precisely the
+    ///      open-ended liability §3.4a exists to end. (Task 6 turns this state
+    ///      into a wind-down.)
+    function test_unrenewedEpochHasNoCoverers() public {
+        _wireEpochZeroApprovers();
+        _warpToEpochBoundary(3);
+        _open();
+
+        assertEq(epochs.coverersOf(address(governor), pid, 1).length, 0);
+        assertEq(epochs.coverersOf(address(governor), pid, 9).length, 0);
+    }
+
+    /// @dev A guardian that released its commitment before the filing backed
+    ///      nothing. `ExposureLedger` keeps it in `_approversOf` with a ZEROED
+    ///      share rather than dropping it, so the non-zero-`committedUsd` filter
+    ///      — not the array membership — is what defines coverage.
+    function test_releasedApproverIsNotACoverer() public {
+        _wireEpochZeroApprovers();
+        _warpToEpochBoundary(3);
+        _open();
+
+        vm.prank(registry);
+        ledger.releaseApproval(address(governor), pid, guardianB);
+
+        // The ledger still LISTS it, with a zero share...
+        (address[] memory all,) = ledger.approversOf(address(governor), pid);
+        assertEq(all.length, 2, "the ledger keeps the full historical set");
+
+        // ...and the coverer set does not.
+        address[] memory cov = epochs.coverersOf(address(governor), pid, 0);
+        assertEq(cov.length, 1);
+        for (uint256 i = 0; i < cov.length; i++) {
+            assertNotEq(cov[i], guardianB, "a zero committed share is not coverage");
+        }
+    }
+
+    /// @dev `breachEpoch` names the epoch the breach SURFACED on, not the one
+    ///      the cover opened on — and the coverers it points at are that epoch's
+    ///      renewers. Opened in absolute epoch 3 so a relative/absolute mix-up
+    ///      cannot pass, and checkpointed clean once first so the surfacing
+    ///      epoch and the opening epoch are different numbers.
+    function test_breachEpochIsRecorded() public {
+        _wireEpochZeroApprovers();
+        _warpToEpochBoundary(3);
+        _openWithEnvelope(2_000); // 20%
+
+        vm.prank(guardianC);
+        epochs.commitRenewal(address(governor), pid, 1);
+
+        // Relative epoch 0 closes inside the envelope: 5% down, no breach.
+        _warpToEpochBoundary(4);
+        router.setValue(strategy, 950e18, true);
+        epochs.checkpoint(address(governor), pid);
+        assertFalse(epochs.breached(address(governor), pid));
+
+        // Relative epoch 1 closes 30% down — the breach surfaces on guardianC's
+        // watch, not on the approvers'.
+        _warpToEpochBoundary(5);
+        router.setValue(strategy, 700e18, true);
+        epochs.checkpoint(address(governor), pid);
+
+        assertTrue(epochs.breached(address(governor), pid));
+        assertEq(epochs.breachEpochOf(address(governor), pid), 1, "the watch it surfaced on, not the one it opened on");
+
+        address[] memory liable =
+            epochs.coverersOf(address(governor), pid, epochs.breachEpochOf(address(governor), pid));
+        assertEq(liable.length, 1);
+        assertEq(liable[0], guardianC, "predicate 5 accuses epoch 1's coverer");
+    }
+
+    /// @dev Task 3 latches `breached` on the FIRST breach, so a later, deeper
+    ///      checkpoint must not re-point `breachEpoch` at a different epoch's
+    ///      coverers. Without the latch, liability would migrate to whoever
+    ///      happened to renew after the loss was already visible.
+    function test_breachEpochDoesNotMoveToADeeperLaterCheckpoint() public {
+        _wireEpochZeroApprovers();
+        _warpToEpochBoundary(3);
+        _openWithEnvelope(2_000);
+
+        _warpToEpochBoundary(4);
+        router.setValue(strategy, 700e18, true); // 30% down: breach on relative 0
+        epochs.checkpoint(address(governor), pid);
+        assertEq(epochs.breachEpochOf(address(governor), pid), 0);
+
+        _warpToEpochBoundary(5);
+        router.setValue(strategy, 400e18, true); // 60% down
+        epochs.checkpoint(address(governor), pid);
+        assertEq(epochs.breachEpochOf(address(governor), pid), 0, "still the epoch it surfaced on");
+    }
+
+    function test_breachEpochOfIsZeroWithoutABreach() public {
+        _wireEpochZeroApprovers();
+        _warpToEpochBoundary(3);
+        _open();
+        assertEq(epochs.breachEpochOf(address(governor), pid), 0);
+        assertFalse(epochs.breached(address(governor), pid));
     }
 }

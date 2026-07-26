@@ -273,6 +273,55 @@ contract CoverageEpochs is Ownable2Step, ICoverageEpochs {
         return _coverers[_coverKey(governor, proposalId)][epoch];
     }
 
+    // ── Claims-made attribution ──
+
+    /// @inheritdoc ICoverageEpochs
+    /// @dev §3.4a's whole point, and the function `ChallengeGame` asks for
+    ///      predicate 5. Liability attaches to the watch a breach SURFACED on,
+    ///      so a guardian is never committed for longer than one epoch plus the
+    ///      challenge window however long the strategy runs.
+    ///
+    ///      `epoch` is COVER-RELATIVE (D8). Relative 0 is the watch the cover
+    ///      opened on; everything above it delegates to the renewal list, which
+    ///      `commitRenewal` already keys relatively. Re-deriving the index here
+    ///      would be a second chance to read a relative argument as an absolute
+    ///      one — the exact bug D8 exists to name.
+    function coverersOf(address governor, uint256 proposalId, uint256 epoch) public view returns (address[] memory) {
+        // Any epoch past the first is covered by its RENEWERS and by nobody
+        // else. Falling back to epoch 0's approvers for an unrenewed epoch would
+        // reinstate exactly the open-ended liability epochs exist to end, so an
+        // empty set is the answer: an unrenewed epoch is a wind-down condition
+        // (D6/Task 6), not a liability one.
+        if (epoch != 0) return _coverers[_coverKey(governor, proposalId)][epoch];
+
+        // Relative epoch 0's coverers are the proposal's original approvers,
+        // held by the ledger rather than here — the ledger is the single source
+        // both this contract and `ChallengeGame` read, so there is exactly one
+        // answer to "who backed this proposal".
+        //
+        // THE FILTER BELOW IS `ChallengeGame._accused`, COPIED. It must stay
+        // that way: Task 7 points predicate 5 at this function, and until then
+        // any divergence means one of the two slashes a guardian the other calls
+        // innocent. `ExposureLedger.releaseApproval` keeps a released guardian
+        // in `_approversOf` with a ZEROED share instead of dropping it (so
+        // callers can see the full historical set), which is why array
+        // membership is not coverage and the non-zero `committedUsd` test is.
+        // Two passes because the output length must be known before allocation.
+        (address[] memory all, uint256[] memory committedUsd) = exposureLedger.approversOf(governor, proposalId);
+        uint256 n;
+        for (uint256 i = 0; i < all.length; i++) {
+            if (committedUsd[i] != 0) n++;
+        }
+        address[] memory out = new address[](n);
+        uint256 j;
+        for (uint256 i = 0; i < all.length; i++) {
+            if (committedUsd[i] == 0) continue;
+            out[j] = all[i];
+            j++;
+        }
+        return out;
+    }
+
     /// @inheritdoc ICoverageEpochs
     function hasCommittedRenewal(address governor, uint256 proposalId, uint256 epoch, address guardian)
         external
@@ -349,6 +398,11 @@ contract CoverageEpochs is Ownable2Step, ICoverageEpochs {
     /// @inheritdoc ICoverageEpochs
     function breached(address governor, uint256 proposalId) external view returns (bool) {
         return _covers[_coverKey(governor, proposalId)].breached;
+    }
+
+    /// @inheritdoc ICoverageEpochs
+    function breachEpochOf(address governor, uint256 proposalId) external view returns (uint64) {
+        return _covers[_coverKey(governor, proposalId)].breachEpoch;
     }
 
     /// @inheritdoc ICoverageEpochs

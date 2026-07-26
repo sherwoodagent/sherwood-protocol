@@ -203,6 +203,15 @@ interface ICoverageEpochs {
     ///      which checkpoints but carries no predicate-5 liability (D5).
     function breached(address governor, uint256 proposalId) external view returns (bool);
 
+    /// @notice The COVER-RELATIVE epoch (D8) a drawdown breach SURFACED on — the
+    ///         index to hand `coverersOf` to learn who answers for it.
+    /// @dev Latching: it names the FIRST breaching checkpoint and never moves to
+    ///      a later, deeper one. Without the latch, liability would migrate to
+    ///      whoever happened to renew after the loss was already visible.
+    /// @dev Zero on a cover that has not breached, so read it alongside
+    ///      `breached`: relative epoch 0 is a real epoch, not a sentinel.
+    function breachEpochOf(address governor, uint256 proposalId) external view returns (uint64);
+
     /// @notice The COVER-RELATIVE epoch index containing `block.timestamp` (D8).
     ///         Relative epoch 0 is the watch the cover opened on.
     /// @dev Exists so an off-chain watchtower cites the same number the contract
@@ -261,13 +270,42 @@ interface ICoverageEpochs {
     function renewalDeadline(address governor, uint256 proposalId, uint256 epoch) external view returns (uint256);
 
     /// @notice The guardians who committed renewal for COVER-RELATIVE `epoch`.
-    /// @dev Renewals ONLY. Relative epoch 0's coverers are the original
-    ///      approvers held by `ExposureLedger`, and this list is empty for it;
-    ///      the unified claims-made view is `coverersOf` (Task 5).
+    /// @dev Renewals ONLY, and therefore NOT the liability view. Relative epoch
+    ///      0's coverers are the original approvers held by `ExposureLedger` and
+    ///      this list is empty for it; `coverersOf` is the unified claims-made
+    ///      answer and the one `ChallengeGame` accuses from.
     function renewalCoverersOf(address governor, uint256 proposalId, uint256 epoch)
         external
         view
         returns (address[] memory);
+
+    // ── Claims-made attribution (spec §3.4a) ──
+
+    /// @notice Who is liable for a breach that surfaced in COVER-RELATIVE
+    ///         `epoch` (D8) — the single entry point for predicate-5
+    ///         attribution.
+    ///
+    ///         Relative epoch 0 is the watch the cover opened on, so its
+    ///         coverers are the proposal's ORIGINAL approvers. Every later epoch
+    ///         is covered by whoever committed renewal for it, and by nobody
+    ///         else: an original approver who did not renew answers for NOTHING
+    ///         surfacing after its own epoch. That bound — one epoch plus the
+    ///         challenge window, however long the strategy runs — is the entire
+    ///         reason coverage epochs exist.
+    ///
+    /// @dev An epoch nobody renewed has NO coverers, and the empty array is the
+    ///      honest answer rather than a fallback to epoch 0's approvers:
+    ///      re-accusing them for an unrenewed watch is exactly the open-ended
+    ///      liability this mechanism ends. An unrenewed epoch is a wind-down
+    ///      condition, not a liability condition.
+    ///
+    /// @dev Epoch 0 filters the ledger's approvers to a NON-ZERO `committedUsd`,
+    ///      byte for byte as `ChallengeGame._accused` does. A released approver
+    ///      stays in `ExposureLedger._approversOf` with a zeroed share rather
+    ///      than being dropped, so membership of that array is NOT coverage —
+    ///      the filter is. The two definitions must never diverge: one would
+    ///      slash a guardian the other calls innocent.
+    function coverersOf(address governor, uint256 proposalId, uint256 epoch) external view returns (address[] memory);
 
     /// @notice Whether `guardian` has already committed to cover `epoch`.
     function hasCommittedRenewal(address governor, uint256 proposalId, uint256 epoch, address guardian)
