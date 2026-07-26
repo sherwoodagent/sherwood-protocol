@@ -297,6 +297,26 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      only at low open exposure.
     function setGuardianRegistry(address registry) external onlyOwner {
         if (registry == address(0)) revert ZeroAddress();
+        // RE-CHECK THE FLOOR (review M1). `setChallengeWindow` skips it while no
+        // registry is wired, so wiring order was a bypass: set an 8d window with
+        // the registry unset, then point at a registry whose `reviewPeriod`
+        // makes the floor 10d, and the window sits below it with nothing
+        // revalidating.
+        // Tolerant read on purpose. This check catches an ORDERING MISTAKE by an
+        // owner, not an adversary — `setGuardianRegistry` is owner-only, and an
+        // owner who wires an address that cannot answer `reviewPeriod()` has
+        // already broken the record/release path this pointer exists for. A
+        // registry that does answer is held to the floor; one that does not is
+        // let through rather than bricking the wiring transaction.
+        // `registry.code.length` first: Solidity's extcodesize guard on a
+        // high-level call to an EOA reverts in THIS frame, which `try` cannot
+        // catch — so the check has to be skipped before it is attempted, not
+        // after it fails.
+        if (registry != address(0) && registry.code.length != 0) {
+            try IRegistryApproversMinimal(registry).reviewPeriod() returns (uint256 rp) {
+                if (challengeWindow < rp + MAX_GOVERNOR_EXECUTION_WINDOW) revert InvalidParameter();
+            } catch {}
+        }
         emit GuardianRegistrySet(guardianRegistry, registry);
         guardianRegistry = registry;
     }
@@ -456,8 +476,22 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         // proposal passed optimistically anyway. Failing closed on the coverage
         // (booking nothing, so the execute-time quorum cannot be met) is the
         // conservative half; failing the vote was the harmful half.
-        if (_assetFeeds[asset].feed == address(0)) return;
-        uint256 needUsd = coverageUsd(asset, gov.getRequiredCoverage(proposalId));
+        // ANY pricing failure books nothing rather than reverting (review M3).
+        // Special-casing the missing feed closed only half of it: a STALE feed
+        // still reverted here and took the approve vote with it, leaving the
+        // review block-only — guardians able to veto but not endorse, and the
+        // proposal passing optimistically anyway. A stale oracle is an
+        // operational condition rather than a wiring mistake, so that half was
+        // the more reachable one.
+        //
+        // Called externally so the revert can be caught; `coverageUsd` is a view
+        // on this same contract, and a same-contract call cannot be wrapped.
+        uint256 needUsd;
+        try this.coverageUsd(asset, gov.getRequiredCoverage(proposalId)) returns (uint256 v) {
+            needUsd = v;
+        } catch {
+            return; // unpriceable right now: book nothing, let the quorum decide
+        }
         if (needUsd == 0) return; // zero-coverage: nothing to book
 
         // RESERVATION, NOT ALLOCATION. This books the MOST this guardian could

@@ -408,6 +408,54 @@ contract ExposureLedgerTest is Test {
         ledger.recordApproval(address(mgov), 1, guardian);
     }
 
+    /// @notice M3 — a STALE feed must not kill the approve vote. Closing only
+    ///         the missing-feed case left the more reachable half live: a stale
+    ///         oracle is an operational condition, not a wiring mistake, and it
+    ///         made reviews block-only — guardians able to veto but not endorse,
+    ///         with the proposal passing optimistically anyway.
+    function test_recordApproval_staleFeedBooksNothingInsteadOfReverting() public {
+        _wireRecording();
+        mgov.set(1_000e6);
+
+        // Tighten the staleness bound so the fixture's feed is now stale.
+        // Hoisted: a constructor in ARGUMENT position is evaluated first and
+        // would consume the one-shot prank, leaving the setter unpranked.
+        MockFeed tight = new MockFeed(1e8, 8);
+        vm.prank(owner);
+        ledger.setAssetFeed(usdgAsset, address(tight), 1);
+        skip(2 days);
+
+        // The read itself genuinely reverts...
+        vm.expectRevert(IExposureLedger.StalePrice.selector);
+        ledger.coverageUsd(usdgAsset, 1_000e6);
+
+        // ...but the hook books nothing rather than taking the vote with it.
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        assertEq(ledger.openExposureUsd(guardian), 0, "unpriceable: booked nothing, vote survives");
+    }
+
+    /// @notice M1 gap 1 — wiring order was a bypass. `setChallengeWindow` skips
+    ///         the floor while no registry is wired, so an out-of-spec window
+    ///         could be seated first and the registry pointed at afterwards with
+    ///         nothing revalidating.
+    function test_setGuardianRegistry_rechecksTheChallengeWindowFloor() public {
+        MockRegistryForLedger reg = new MockRegistryForLedger(); // reviewPeriod 3d -> floor 10d
+        ExposureLedger led = new ExposureLedger(owner, address(swood), 28 days);
+
+        vm.startPrank(owner);
+        led.setChallengeWindow(8 days); // legal while unwired
+        assertEq(led.challengeWindow(), 8 days);
+
+        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
+        led.setGuardianRegistry(address(reg)); // 8d < 3d + 7d
+
+        led.setChallengeWindow(10 days);
+        led.setGuardianRegistry(address(reg)); // now consistent
+        vm.stopPrank();
+        assertEq(led.guardianRegistry(), address(reg));
+    }
+
     /// @notice C1 REGRESSION — the free-rider veto.
     ///
     ///         Under first-come booking an attacker could approve first and
