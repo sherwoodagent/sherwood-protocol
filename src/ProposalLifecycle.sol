@@ -69,7 +69,7 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
     ///         traversed review), a Draft expiry, an already-Approved -> Expired
     ///         transition (review concluded on a prior commit), an Unresolved
     ///         outcome past reviewEnd (no registered review to commit — see the
-    ///         SECURITY INVARIANT on that branch in `_afterVote`), and a paused
+    ///         TERMINAL AND CLOSED note on that branch in `_afterVote`), and a paused
     ///         registry (the commit would revert).
     ///         This reproduces exactly the set of transitions on which the
     ///         pre-refactor `_resolveState` called `resolveReview`.
@@ -148,47 +148,49 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
         IGuardianRegistry reg = IGuardianRegistry(_guardianRegistry);
         IGuardianRegistry.ReviewOutcome o = reg.outcomeOf(address(this), p.id);
         // Unresolved past `reviewEnd` means `outcomeOf` found no window
-        // (`r.reviewEnd == 0`), i.e. no review was ever registered. Treated as
-        // "no review configured => cleared", the same answer the collapsed
-        // window above gets, instead of fail-closing into a state with no exit
-        // (`resolveReview` reverts ReviewNotReadyForResolve, `_openProposalCount`
-        // stays pinned, and `emergencyCancel` is Draft/Pending-only).
+        // (`r.reviewEnd == 0`), i.e. no review was ever registered.
         // `reviewConcluded` is FALSE: there is no registry review to commit.
         //
-        // SECURITY INVARIANT — read before changing how this contract is
-        // deployed. This is NOT the same condition as the collapsed window: a
-        // collapsed window means the governor KNOWS there is no review; here
-        // the governor believes there IS one (`reviewEnd > voteEnd`) and the
-        // registry disagrees. Answering Cleared is therefore fail-OPEN — a
-        // proposal reaching this branch is Approved and executable with no
-        // guardian review at all — where the collapsed-window branch is merely
-        // permissive by construction. It is safe only because governor and
-        // registry are deployed in lockstep, which makes the branch
-        // unreachable:
-        //   - both push sites (`propose`, `approveCollaboration`) call
-        //     `registerReview` under the identical `reviewEnd > voteEnd`
-        //     predicate this function tests, so a registered window exists
-        //     whenever we get past the collapsed-window check above;
-        //   - `p.reviewEnd` is written only immediately before those pushes,
-        //     so the registry's `reviewEnd` can never trail the governor's;
-        //   - `_reviews` entries are never deleted and `registerReview` is
-        //     `onlyGovernor` (an unauthorised governor reverts at propose time,
-        //     it does not silently skip the push);
-        //   - `_guardianRegistry` is write-once at `initialize` — the factory's
-        //     `setGuardianRegistry` only affects future deployments;
-        //   - `_authorizedGovernors` has no `remove`, so a governor cannot be
-        //     de-authorised mid-flight.
-        // The one state that breaks all of this is a governor whose proposals
-        // PREDATE `registerReview`: those hold `reviewEnd > voteEnd` with no
-        // registry record, and they would land here and auto-approve. The
-        // storage relinearisation in this refactor already forces a fresh
-        // deployment (see the beacon constraint pinned in
-        // `test/governor/GovernorLayoutPins.t.sol`), which is what keeps them
-        // out of reach. Anyone proposing a beacon-migration path for the
-        // governor is re-arming a security gate here, not fixing a liveness
-        // bug, and must close this branch first.
+        // TERMINAL AND CLOSED — the deliberate asymmetry with the collapsed
+        // window above. Both branches mean "no registry record", but they are
+        // NOT the same condition: a collapsed window means the governor KNOWS
+        // there is no review (it skipped the push on this exact predicate),
+        // whereas here the governor believes there IS one (`reviewEnd >
+        // voteEnd`) and the registry disagrees. That disagreement is never a
+        // legitimate state, so it must not produce an executable proposal —
+        // answering Cleared here would approve a proposal no guardian ever
+        // reviewed.
+        //
+        // Expired rather than GuardianReview, because the defect this fold
+        // fixed was a strand with no exit: `resolveReview` reverts
+        // ReviewNotReadyForResolve, `_openProposalCount` stays pinned, and
+        // `emergencyCancel` is Draft/Pending-only, so the proposal AND the
+        // vault it binds are stuck until a beacon upgrade. Expired is terminal
+        // — `_commitState` runs `_decOpen()` on it, releasing the vault
+        // binding and stamping `_lastSettledAt` — so this keeps every liveness
+        // property the fold was for while still refusing to execute. All that
+        // is given up is executing a proposal that reached this branch, which
+        // is precisely what the guardian gate exists to prevent.
+        //
+        // Reachability, for the record: governor and registry deploy in
+        // lockstep, which makes this branch dead on any deployment this code
+        // can produce. Both push sites (`propose`, `approveCollaboration`)
+        // call `registerReview` under the identical `reviewEnd > voteEnd`
+        // predicate tested above; `p.reviewEnd` is written only immediately
+        // before those pushes, so the registry's copy can never trail the
+        // governor's; `_reviews` entries are never deleted and `registerReview`
+        // is `onlyGovernor`, so an unauthorised governor reverts the whole
+        // `propose` rather than silently skipping the push; `_guardianRegistry`
+        // is write-once at `initialize`; and `_authorizedGovernors` has no
+        // `remove`. The states that would break that chain — a governor whose
+        // proposals predate `registerReview`, or a stub registry wired through
+        // the factory that answers Unresolved forever — now land on a terminal
+        // Expired instead of an executable Approved, which is what makes the
+        // chain a liveness argument rather than a security one. Keep it that
+        // way: do NOT restore Approved here on the grounds that the branch is
+        // unreachable.
         if (o == IGuardianRegistry.ReviewOutcome.Unresolved) {
-            return (block.timestamp > p.executeBy ? ProposalState.Expired : ProposalState.Approved, false);
+            return (ProposalState.Expired, false);
         }
         // A paused registry cannot accept the economic commit: `resolveReview`
         // is `whenNotPaused` while `outcomeOf` is not. Reporting Approved here

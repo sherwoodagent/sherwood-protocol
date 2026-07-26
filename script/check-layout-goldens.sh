@@ -33,14 +33,26 @@ _layout_is_empty() {
 }
 
 inspect_layout() {
-  # Incremental builds can drop storageLayout from cached artifacts; retry with
-  # --force. A stale cache does NOT return the empty string — it returns valid
-  # JSON with an EMPTY layout (`{"storage": [], "types": {}}`), so testing only
-  # for `-z` let a degenerate read through. Not cosmetic: against a real golden
-  # it is a spurious FAIL, and if a golden is ever regenerated
-  # (--update-golden) while the cache is cold it bakes in an empty layout that
-  # then matches EVERYTHING forever — a gate protecting deployed proxy storage
-  # that silently stops protecting anything.
+  # A degenerate read does NOT return the empty string — it returns valid JSON
+  # with an EMPTY layout at rc 0 (`{"storage": [], "types": {}}`), so testing
+  # only for `-z` let it through. Two ways to get there, and the second is the
+  # one that matters:
+  #
+  #   - TRANSIENT: an artifact cached without its storageLayout. `--force`
+  #     clears it, and on forge 1.7.1 a genuinely missing layout exits non-zero
+  #     ("storage layout missing from artifact"), which the `!` half already
+  #     caught — so this one is largely self-healing.
+  #   - PERSISTENT: a name that resolves to a storage-less artifact. An
+  #     interface, a library, a renamed contract, a typo:
+  #         $ forge inspect IGuardianRegistry storageLayout --json
+  #         { "storage": [], "types": {} }        # rc 0
+  #     This does not clear on the next run. Left unguarded, a gate pointed at
+  #     such a name pins NOTHING, indefinitely and silently — and
+  #     `--update-golden` would bake the empty layout in, so the gate keeps
+  #     agreeing with itself while the real contract's storage drifts freely.
+  #
+  # Hence: retry once with --force for the transient case, then hard-fail
+  # rather than compare or bake a layout that pins nothing.
   local out
   if ! out=$(forge inspect "$1" storageLayout --json 2>/dev/null) || _layout_is_empty "$out"; then
     out=$(forge inspect "$1" storageLayout --json --force 2>/dev/null) ||
