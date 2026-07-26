@@ -52,6 +52,10 @@ Set `renewalLeadTime` long enough that the jump window is meaningful, short enou
 - **D5 — Passive mandates (`maxDrawdownBps == 10_000`) checkpoint but never breach.** §3.4a(c): their epochs still record NAV to feed §6 monitoring, but they carry no predicate-5 liability.
 - **D6 — Unpriceable at the boundary → wind-down, after a grace window.** A checkpoint that cannot be taken because `instantOK` is false may be retried anywhere inside `checkpointGrace`. If the grace expires with no successful checkpoint, the cover is flagged `windDown`. A strategy whose value cannot be established cannot be underwritten, and the alternative — carry on uncovered — is exactly the gap §3.4a exists to prevent.
 - **D7 — Wind-down seizes nothing.** It sets a flag making `settleProposal` permissionlessly callable ahead of `strategyDuration`. The existing settlement path does the unwinding. `CoverageEpochs` never moves funds; it holds no tokens at all.
+- **D8 — Boundaries are GLOBAL; epoch indices in the external API are COVER-RELATIVE.** (Added after Task 2 found the plan conflated them.) `ExposureLedger.epochGenesis` is *ledger deploy time*, so in production a cover opens in absolute epoch 40-something — "epoch 0" reads as 0 only in a fixture that deploys the ledger and opens the cover in the same block.
+  - **Boundaries stay on the ledger's global grid** (`epochGenesis + n * epochLength`, from the schedule copied at open per D3). They must: `ExposureLedger`'s buckets expire on that grid, and a guardian's commitment expiring together with its bucket is the whole mechanism. Re-slicing per cover would desynchronise them.
+  - **Every epoch index crossing the API is relative to the cover**: `relative = _epochAt(c, ts) - _epochAt(c, c.openedAt)`. So relative epoch 0 is the watch the cover opened on (the original approvers), relative 1 is the first renewal, and `commitRenewal(pid, 1)` means what a reader expects.
+  - This applies to `checkpoint`'s stored index, `breachEpoch`, `commitRenewal`'s argument, `coverersOf`'s argument, `flagWindDown`'s internals, and `ChallengeGame.file`'s new `epoch`. Add a `relativeEpochNow(governor, proposalId)` view so off-chain watchtowers cite the same number the contract expects, and test that a cover opened in a **non-zero absolute epoch** still numbers its own first watch 0.
 
 ---
 
@@ -404,6 +408,17 @@ renewalDeadline(epoch) = boundary(epoch) - renewalLeadTime
 `renewalLeadTime` is owner-set, default **3 days**, bounded `(0, epochLength / 2]`. Read fact 2 before changing it: sequencing closes the *jump* window only, and a lead time approaching the epoch length would have guardians committing against badly stale information — a different failure, not a stronger defence.
 
 The commitment calls `exposureLedger.recordApproval(governor, proposalId, guardian)` so it consumes the same aggregate exposure cap a fresh approval would. A guardian without capacity cannot renew — that is the point.
+
+**Blocker found during Task 1 — clear this first.** `ExposureLedger.recordApproval` is `onlyRegistry`, gated on a single `guardianRegistry` address, so `CoverageEpochs` calling it reverts `NotGuardianRegistry`. Do **not** work around it by making `CoverageEpochs` the registry (that hands it `releaseApproval` and every other registry-gated power), and do **not** skip booking exposure (a guardian could then renew far beyond its capacity, which is exactly what the cap exists to prevent).
+
+Add a **third owner-set role**, mirroring how Plan D added `coverageFreezer`:
+
+- `address public renewalAgent`, alongside `guardianRegistry` (~line 105) and `coverageFreezer` (~line 143)
+- Widen `recordApproval`'s gate to accept the registry **or** the renewal agent. Keep `releaseApproval` **registry-only** — renewal must never be able to *release* someone else's coverage.
+- `setRenewalAgent(address)`, owner-only with a `RenewalAgentSet` event, copying `setCoverageFreezer`'s shape
+- Test that a stranger still reverts, that the registry path is unchanged, and that `releaseApproval` stays registry-only even for the renewal agent
+
+`ExposureLedger` is not upgradeable, so appending state is unconstrained — run `./script/check-layout-goldens.sh` anyway to confirm nothing pinned moved.
 
 - [ ] **Step 1: Write the failing tests**
 
