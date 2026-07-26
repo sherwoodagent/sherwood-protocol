@@ -549,6 +549,82 @@ contract ExposureLedgerTest is Test {
         assertEq(ledger.openExposureUsd(guardian), once, "second pass changes nothing");
     }
 
+    /// @notice THE CAVEAT I LEFT OPEN on `settleCoverage`: a guardian whose
+    ///         bond collapses between the review shutting and settle being
+    ///         called.
+    ///
+    ///         The excess release keys off the RECORDED amount and epoch, not
+    ///         the live bond — `_buckets[g][e]` was incremented by exactly
+    ///         `r.usd` at record time, so subtracting `excess <= r.usd` cannot
+    ///         underflow however far the bond has fallen since. Asserted rather
+    ///         than assumed, because "I expect it falls out" is how the
+    ///         settlement bug got in.
+    function test_settleCoverage_survivesABondCollapseBeforeSettling() public {
+        _wireRecording();
+        address g2 = makeAddr("g2");
+        swood.setStake(g2, 100_000e18, 0);
+        mgov.set(1_000e6);
+        mgov.setSchedule(block.timestamp + 1 days, 3 days);
+
+        vm.startPrank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        ledger.recordApproval(address(mgov), 1, g2);
+        vm.stopPrank();
+        assertEq(ledger.openExposureUsd(guardian), 1_000e18, "reserved the full coverage");
+
+        skip(31 days); // review shut
+
+        // The guardian's bond evaporates -- unstaked, or WOOD collapsed.
+        swood.setStake(guardian, 0, 0);
+        assertEq(ledger.slashableBondUsd(guardian), 0, "nothing left to slash");
+
+        ledger.settleCoverage(address(mgov), 1); // must not revert or underflow
+
+        // Their booked liability is unchanged by the collapse -- it is what they
+        // committed, not what they can now pay. `requireApproveQuorum` is where
+        // the shrunken bond bites, via its `min(live, reserved)` leg.
+        assertEq(ledger.allocatedUsd(address(mgov), 1, guardian), 500e18, "still owes its half");
+        assertEq(ledger.allocatedUsd(address(mgov), 1, g2), 500e18);
+
+        vm.expectRevert(IExposureLedger.InsufficientApproveCoverage.selector);
+        ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 1_000e6);
+    }
+
+    /// @notice Settle with a RELEASED approver still in the list. The loop must
+    ///         skip zero-reservation entries without letting one become the
+    ///         residue holder, or the dust would be credited to somebody who
+    ///         underwrote nothing.
+    function test_settleCoverage_skipsReleasedApprovers() public {
+        _wireRecording();
+        address g2 = makeAddr("g2");
+        address g3 = makeAddr("g3");
+        swood.setStake(g2, 100_000e18, 0); // $5,000 -> reserves the full 1,000
+        // Deliberately UNEQUAL so the pro-rata split does not divide evenly and
+        // the residue path is actually exercised. With equal bonds this test
+        // passes with the residue top-up deleted, which makes it worthless as
+        // cover for that branch.
+        swood.setStake(g3, 10_000e18, 0); // $500 -> reserves only 500
+        mgov.set(1_000e6);
+        mgov.setSchedule(block.timestamp + 1 days, 3 days);
+
+        vm.startPrank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        ledger.recordApproval(address(mgov), 1, g2);
+        ledger.recordApproval(address(mgov), 1, g3);
+        // The FIRST-listed approver leaves, so the swap-and-pop moves an element
+        // and the residue holder is no longer the one the loop started with.
+        ledger.releaseApproval(address(mgov), 1, guardian);
+        vm.stopPrank();
+
+        skip(31 days);
+        ledger.settleCoverage(address(mgov), 1);
+
+        assertEq(ledger.allocatedUsd(address(mgov), 1, guardian), 0, "a departed approver carries nothing");
+        uint256 total = ledger.allocatedUsd(address(mgov), 1, g2) + ledger.allocatedUsd(address(mgov), 1, g3);
+        assertEq(total, 1_000e18, "the survivors carry all of it, residue included");
+        ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 1_000e6);
+    }
+
     /// @notice C1 REGRESSION — the free-rider veto.
     ///
     ///         Under first-come booking an attacker could approve first and
