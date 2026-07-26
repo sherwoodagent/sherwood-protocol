@@ -68,12 +68,12 @@ contract CoverageEpochs is Ownable2Step, ICoverageEpochs {
 
     mapping(bytes32 coverKey => Cover) internal _covers;
 
-    /// @dev Boundary NAV per epoch. Sparse on purpose: a boundary nobody
-    ///      checkpointed stays EMPTY forever (D4). Back-filling it later with a
-    ///      NAV read today would invent an observation for a period nobody
-    ///      watched, and — once Task 3 stamps `breachEpoch` — would attach the
-    ///      breach to the wrong epoch's coverers, which is the one thing
-    ///      claims-made attribution exists to get right.
+    /// @dev Boundary NAV per COVER-RELATIVE epoch (D8). Sparse on purpose: a
+    ///      boundary nobody checkpointed stays EMPTY forever (D4). Back-filling
+    ///      it later with a NAV read today would invent an observation for a
+    ///      period nobody watched, and would stamp `breachEpoch` with the wrong
+    ///      epoch's coverers — the one thing claims-made attribution exists to
+    ///      get right.
     mapping(bytes32 coverKey => mapping(uint256 epoch => uint256 nav)) internal _nav;
 
     /// @dev Whether `epoch`'s boundary was checkpointed. Separate from `_nav`
@@ -153,9 +153,14 @@ contract CoverageEpochs is Ownable2Step, ICoverageEpochs {
         // The epoch being closed is the one whose boundary just passed — not a
         // cursor position. Filing a NAV read today under an older, skipped
         // epoch would invent an observation for a period nobody watched and
-        // (Task 3) stamp `breachEpoch` with an epoch the breach did not surface
-        // on. D4 is explicit that a missed boundary simply stays uncheckpointed.
-        uint256 due = _epochAt(c, block.timestamp) - 1;
+        // stamp `breachEpoch` with an epoch the breach did not surface on. D4
+        // is explicit that a missed boundary simply stays uncheckpointed.
+        //
+        // D8: the INDEX is cover-relative even though the BOUNDARY above is
+        // global. `_relativeEpoch` is at least 1 here — the guard just proved
+        // the cover's own first boundary has passed — so the subtraction cannot
+        // underflow.
+        uint256 due = _relativeEpoch(c, block.timestamp) - 1;
         if (_checkpointed[key][due]) revert AlreadyCheckpointed();
 
         // D1: the router, never totalAssets(). A router outage reports a
@@ -171,7 +176,30 @@ contract CoverageEpochs is Ownable2Step, ICoverageEpochs {
         _lastNav[key] = nav;
         c.lastCheckpointedEpoch = uint64(due);
 
-        emit Checkpointed(key, due, nav, cumulativeLossBps(governor, proposalId));
+        uint256 lossBps = cumulativeLossBps(governor, proposalId);
+        emit Checkpointed(key, due, nav, lossBps);
+
+        // D5: a passive mandate (envelope 10_000) declared the full notional as
+        // its bound. It checkpoints so §6 monitoring sees the NAV, but it can
+        // never breach. The early return is deliberate rather than leaning on
+        // `lossBps > 10_000` being unreachable: that would be the same
+        // behaviour by accident, and a later change to how loss is computed
+        // could silently make it reachable.
+        if (c.maxDrawdownBps >= BPS_DENOMINATOR) return;
+
+        // Strictly greater. A mandate that declared a 20% envelope is permitted
+        // to lose exactly 20%; only a loss beyond the declared bound is the
+        // breach predicate 5 exists for.
+        //
+        // `!c.breached` latches the FIRST breach. Liability is claims-made: it
+        // attaches to the guardians covering the epoch the breach SURFACED on,
+        // so a later, deeper checkpoint must not re-point `breachEpoch` at a
+        // different epoch's coverers.
+        if (lossBps > c.maxDrawdownBps && !c.breached) {
+            c.breached = true;
+            c.breachEpoch = uint64(due); // cover-relative (D8)
+            emit DrawdownBreached(key, due, lossBps, c.maxDrawdownBps);
+        }
     }
 
     // ── Views ──
@@ -227,6 +255,20 @@ contract CoverageEpochs is Ownable2Step, ICoverageEpochs {
     }
 
     /// @inheritdoc ICoverageEpochs
+    function breached(address governor, uint256 proposalId) external view returns (bool) {
+        return _covers[_coverKey(governor, proposalId)].breached;
+    }
+
+    /// @inheritdoc ICoverageEpochs
+    function relativeEpochNow(address governor, uint256 proposalId) external view returns (uint256) {
+        Cover storage c = _covers[_coverKey(governor, proposalId)];
+        // Without this guard `epochLength` is zero and `_epochAt` panics on the
+        // division. An unopened cover has no schedule to be positioned on.
+        if (!c.opened) revert NotOpened();
+        return _relativeEpoch(c, block.timestamp);
+    }
+
+    /// @inheritdoc ICoverageEpochs
     function isOpen(address governor, uint256 proposalId) external view returns (bool) {
         return _covers[_coverKey(governor, proposalId)].opened;
     }
@@ -258,5 +300,28 @@ contract CoverageEpochs is Ownable2Step, ICoverageEpochs {
     ///      non-zero `epochLength` and a `epochGenesis` in the past.
     function _epochAt(Cover storage c, uint256 timestamp) internal view returns (uint256) {
         return (timestamp - uint256(c.epochGenesis)) / uint256(c.epochLength);
+    }
+
+    /// @dev D8 — the epoch index EVERY external surface speaks in: the ledger's
+    ///      absolute epoch minus the absolute epoch the cover opened in, so this
+    ///      cover's own first watch is 0.
+    ///
+    ///      Boundaries deliberately stay absolute (`_boundary`/`_epochAt` are
+    ///      untouched). `ExposureLedger`'s exposure buckets expire on the global
+    ///      grid, and a guardian's commitment expiring together with its bucket
+    ///      is the entire mechanism; re-slicing the grid per cover would
+    ///      desynchronise the two. Only the LABEL is cover-relative.
+    ///
+    ///      The distinction is invisible in a fixture that deploys the ledger
+    ///      and opens the cover in the same block — `epochGenesis` is ledger
+    ///      DEPLOY time, so in production a cover opens in absolute epoch
+    ///      40-something and an absolute index would be meaningless to anyone
+    ///      reading `breachEpoch`.
+    ///
+    ///      `timestamp` must be at or after `c.openedAt`; every caller either
+    ///      passes `block.timestamp` on an opened cover or has already cleared a
+    ///      boundary guard.
+    function _relativeEpoch(Cover storage c, uint256 timestamp) internal view returns (uint256) {
+        return _epochAt(c, timestamp) - _epochAt(c, uint256(c.openedAt));
     }
 }

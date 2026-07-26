@@ -363,4 +363,140 @@ contract CoverageEpochsTest is Test {
         assertFalse(c.breached);
         assertEq(c.breachEpoch, 0);
     }
+
+    // ── Task 3 helpers ──
+
+    /// @dev Open a cover whose proposal declared `envelopeBps` as its drawdown
+    ///      bound. Separate from `_open()` so the envelope is visible at the
+    ///      call site of every breach test.
+    function _openWithEnvelope(uint16 envelopeBps) internal {
+        governor.setProposal(pid, address(vault), strategy, envelopeBps, ISyndicateGovernor.ProposalState.Executed);
+        router.setValue(strategy, BASELINE, true);
+        epochs.openCover(address(governor), pid);
+    }
+
+    // ── Task 3 tests: drawdown evaluation (D5) ──
+
+    function test_breach_setsTheFlagAndEmits() public {
+        _openWithEnvelope(2_000); // 20%
+        _warpToEpochBoundary(1);
+        router.setValue(strategy, 700e18, true); // 30% loss
+        vm.expectEmit(true, true, true, true);
+        emit ICoverageEpochs.DrawdownBreached(_key(), 0, 3_000, 2_000);
+        epochs.checkpoint(address(governor), pid);
+        assertTrue(epochs.breached(address(governor), pid));
+    }
+
+    function test_lossInsideTheEnvelopeDoesNotBreach() public {
+        _openWithEnvelope(2_000);
+        _warpToEpochBoundary(1);
+        router.setValue(strategy, 850e18, true); // 15% < 20%
+        epochs.checkpoint(address(governor), pid);
+        assertFalse(epochs.breached(address(governor), pid));
+    }
+
+    /// @dev The envelope is an inclusive bound: a mandate that declared 20% is
+    ///      allowed to lose exactly 20%. Only a STRICTLY greater loss breaches.
+    function test_lossExactlyAtTheEnvelopeDoesNotBreach() public {
+        _openWithEnvelope(2_000);
+        _warpToEpochBoundary(1);
+        router.setValue(strategy, 800e18, true); // exactly 20%
+        epochs.checkpoint(address(governor), pid);
+        assertFalse(epochs.breached(address(governor), pid), "breach must be strictly greater");
+    }
+
+    /// @dev D5 — the passive mandate. Total loss, no breach, NAV still recorded.
+    function test_passiveMandateCheckpointsButNeverBreaches() public {
+        _openWithEnvelope(10_000);
+        _warpToEpochBoundary(1);
+        router.setValue(strategy, 1, true); // ~100% loss
+        epochs.checkpoint(address(governor), pid);
+        assertFalse(epochs.breached(address(governor), pid));
+        assertEq(epochs.navAt(address(governor), pid, 0), 1, "NAV still feeds monitoring");
+    }
+
+    /// @dev The breach is stamped on the epoch it SURFACED on, and it is the
+    ///      FIRST one: a later, deeper checkpoint must not move liability onto a
+    ///      different epoch's coverers.
+    function test_breach_stampsTheEpochItSurfacedOnAndDoesNotMove() public {
+        _openWithEnvelope(2_000);
+        _warpToEpochBoundary(1);
+        router.setValue(strategy, 700e18, true); // 30% — breaches on epoch 0
+        epochs.checkpoint(address(governor), pid);
+        assertEq(epochs.coverOf(address(governor), pid).breachEpoch, 0);
+
+        _warpToEpochBoundary(2);
+        router.setValue(strategy, 400e18, true); // worse, but liability is fixed
+        epochs.checkpoint(address(governor), pid);
+        assertEq(epochs.coverOf(address(governor), pid).breachEpoch, 0, "liability stays on the surfacing epoch");
+    }
+
+    // ── Task 3 tests: D8, cover-relative epoch indices ──
+
+    /// @dev D8, THE RULE OF THIS PART. `ExposureLedger.epochGenesis` is LEDGER
+    ///      DEPLOY TIME, so in production a cover opens in absolute epoch
+    ///      40-something; the rest of this file only reads "epoch 0" because the
+    ///      fixture deploys the ledger and opens the cover in the same block.
+    ///      Every index crossing the API is relative to the cover, so a cover
+    ///      opened deep into the ledger's life still numbers its own first watch
+    ///      0. Boundaries stay on the ledger's GLOBAL grid — that is what keeps a
+    ///      guardian's commitment expiring together with its exposure bucket.
+    function test_relativeEpochs_coverOpenedInANonZeroAbsoluteEpochStartsAtZero() public {
+        // Three whole epochs of ledger history before this cover exists.
+        _warpToEpochBoundary(3);
+        _openWithEnvelope(2_000);
+        assertEq(epochs.relativeEpochNow(address(governor), pid), 0, "the cover's own first watch is 0");
+
+        // The cover's first boundary is the ledger's absolute epoch-4 boundary:
+        // boundaries are global, indices are relative.
+        _warpToEpochBoundary(4);
+        assertEq(epochs.relativeEpochNow(address(governor), pid), 1);
+        router.setValue(strategy, 700e18, true);
+        epochs.checkpoint(address(governor), pid);
+
+        assertEq(epochs.navAt(address(governor), pid, 0), 700e18, "filed under the cover's epoch 0");
+        assertEq(epochs.navAt(address(governor), pid, 3), 0, "never under the absolute index");
+        assertEq(epochs.coverOf(address(governor), pid).lastCheckpointedEpoch, 0);
+        assertEq(epochs.coverOf(address(governor), pid).breachEpoch, 0);
+        assertTrue(epochs.breached(address(governor), pid));
+    }
+
+    /// @dev A cover opened MID-epoch waits for the global boundary of the epoch
+    ///      it opened in — it never back-fills the ledger epochs that ran before
+    ///      it existed — and that first watch is still relative epoch 0.
+    function test_relativeEpochs_coverOpenedMidEpochStillNumbersItsFirstWatchZero() public {
+        _warpToEpochBoundary(3);
+        vm.warp(vm.getBlockTimestamp() + 5 days);
+        _openWithEnvelope(2_000);
+        assertEq(epochs.relativeEpochNow(address(governor), pid), 0);
+
+        vm.expectRevert(ICoverageEpochs.BoundaryNotReached.selector);
+        epochs.checkpoint(address(governor), pid);
+
+        _warpToEpochBoundary(4);
+        router.setValue(strategy, 950e18, true);
+        epochs.checkpoint(address(governor), pid);
+        assertEq(epochs.navAt(address(governor), pid, 0), 950e18);
+    }
+
+    /// @dev A skipped boundary consumes a RELATIVE index too: the NAV read two
+    ///      of the cover's epochs in belongs to the cover's epoch 1, not to the
+    ///      ledger's absolute epoch 4.
+    function test_relativeEpochs_missedBoundaryIsLabelledRelatively() public {
+        _warpToEpochBoundary(3);
+        _openWithEnvelope(2_000);
+        _warpToEpochBoundary(5); // two of the cover's epochs have passed
+        router.setValue(strategy, 700e18, true);
+        epochs.checkpoint(address(governor), pid);
+
+        assertEq(epochs.navAt(address(governor), pid, 1), 700e18, "the cover's epoch 1");
+        assertEq(epochs.navAt(address(governor), pid, 0), 0, "the skipped watch stays unrecorded");
+        assertEq(epochs.navAt(address(governor), pid, 4), 0, "never the absolute index");
+        assertEq(epochs.coverOf(address(governor), pid).breachEpoch, 1);
+    }
+
+    function test_relativeEpochNow_revertsWithoutAnOpenCover() public {
+        vm.expectRevert(ICoverageEpochs.NotOpened.selector);
+        epochs.relativeEpochNow(address(governor), pid);
+    }
 }

@@ -74,11 +74,14 @@ interface ICoverageEpochs {
         uint256 baselineNav,
         uint16 maxDrawdownBps
     );
-    /// @notice An epoch boundary NAV was recorded. `cumulativeLossBps` is
-    ///         measured from BASELINE, never epoch-over-epoch (D4).
+    /// @notice An epoch boundary NAV was recorded. `epoch` is COVER-RELATIVE
+    ///         (D8); `cumulativeLossBps` is measured from BASELINE, never
+    ///         epoch-over-epoch (D4).
     event Checkpointed(bytes32 indexed coverKey, uint256 indexed epoch, uint256 nav, uint256 cumulativeLossBps);
-    /// @notice The declared drawdown envelope was exceeded on the cited epoch's
-    ///         watch. This is the event watchtowers file predicate 5 against.
+    /// @notice The declared drawdown envelope was exceeded on the cited
+    ///         COVER-RELATIVE epoch's watch (D8). This is the event watchtowers
+    ///         file predicate 5 against. Emitted at most once per cover: it names
+    ///         the epoch the breach SURFACED on, which is who is liable.
     event DrawdownBreached(bytes32 indexed coverKey, uint256 indexed epoch, uint256 lossBps, uint16 maxDrawdownBps);
     /// @notice A guardian committed to cover `epoch`, booking real exposure.
     event RenewalCommitted(bytes32 indexed coverKey, uint256 indexed epoch, address indexed guardian);
@@ -111,6 +114,11 @@ interface ICoverageEpochs {
         uint64 epochGenesis; // copied from the ledger (D3)
         uint16 maxDrawdownBps; // snapshot (D5: 10_000 == passive, never breaches)
         uint256 baselineNav; // D2: the NAV actually observed at openCover
+        /// @notice COVER-RELATIVE epoch indices (D8), not the ledger's absolute
+        ///         ones: relative 0 is the watch this cover opened on. The
+        ///         boundaries themselves stay on the ledger's global grid, which
+        ///         is what keeps a guardian's commitment expiring together with
+        ///         its exposure bucket.
         uint64 lastCheckpointedEpoch;
         uint64 breachEpoch;
         bool opened;
@@ -130,9 +138,17 @@ interface ICoverageEpochs {
     ///      every later drawdown would otherwise be measured against a fiction).
     function openCover(address governor, uint256 proposalId) external;
 
-    /// @notice Record the boundary NAV of the epoch that has just ended.
+    /// @notice Record the boundary NAV of the epoch that has just ended, and
+    ///         evaluate the cumulative drawdown against the declared envelope.
     ///         Permissionless, once per epoch, and only once that epoch's
     ///         boundary — the START of the following epoch — has passed.
+    /// @dev The epoch is stored COVER-RELATIVE (D8) while the boundary it fires
+    ///      on stays on the ledger's global grid.
+    /// @dev A cumulative loss STRICTLY greater than `maxDrawdownBps` latches
+    ///      `breached`, stamps `breachEpoch` with the relative epoch the breach
+    ///      surfaced on, and emits `DrawdownBreached`. A loss exactly AT the
+    ///      envelope does not breach: the mandate declared that bound as
+    ///      permitted. A passive mandate (`10_000`) never breaches at all (D5).
     /// @dev The recorded epoch is the one whose boundary just closed, NOT a
     ///      cursor position: a checkpoint taken late must not file a NAV read
     ///      today under an epoch nobody observed. Per D4 a missed boundary
@@ -148,8 +164,9 @@ interface ICoverageEpochs {
 
     // ── Views ──
 
-    /// @notice The NAV recorded for `epoch`, or zero if that boundary was never
-    ///         checkpointed. Zero is "no observation", never "worthless".
+    /// @notice The NAV recorded for COVER-RELATIVE `epoch` (D8), or zero if that
+    ///         boundary was never checkpointed. Zero is "no observation", never
+    ///         "worthless".
     function navAt(address governor, uint256 proposalId, uint256 epoch) external view returns (uint256);
 
     /// @notice Cumulative drawdown from the BASELINE in bps (D4), zero when the
@@ -178,6 +195,23 @@ interface ICoverageEpochs {
     /// @notice The drawdown envelope snapshotted at open. `10_000` is a passive
     ///         mandate, which checkpoints but never breaches (D5).
     function maxDrawdownBpsOf(address governor, uint256 proposalId) external view returns (uint16);
+
+    /// @notice Whether the declared drawdown envelope has been exceeded on some
+    ///         checkpoint. Latching: it names the epoch a breach SURFACED on and
+    ///         never moves to a later, deeper one.
+    /// @dev Always false for a passive mandate (`maxDrawdownBps == 10_000`),
+    ///      which checkpoints but carries no predicate-5 liability (D5).
+    function breached(address governor, uint256 proposalId) external view returns (bool);
+
+    /// @notice The COVER-RELATIVE epoch index containing `block.timestamp` (D8).
+    ///         Relative epoch 0 is the watch the cover opened on.
+    /// @dev Exists so an off-chain watchtower cites the same number the contract
+    ///      expects. The ledger's `epochGenesis` is its DEPLOY time, so a cover
+    ///      opened in production sits in absolute epoch 40-something while its
+    ///      own first watch is 0; every index crossing this interface is the
+    ///      relative one. Reverts `NotOpened` without a cover — an unopened
+    ///      cover has no schedule to be positioned on.
+    function relativeEpochNow(address governor, uint256 proposalId) external view returns (uint256);
 
     /// @notice Whether a cover exists for `(governor, proposalId)`.
     function isOpen(address governor, uint256 proposalId) external view returns (bool);
