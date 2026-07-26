@@ -24,12 +24,30 @@ fail() {
 
 forge build >/dev/null
 
+# True when the layout carries no top-level storage variables. Every contract
+# this gate guards is upgradeable and has state, so an empty read is always a
+# tooling failure, never a legitimate answer.
+_layout_is_empty() {
+  [ -z "$1" ] && return 0
+  printf '%s' "$1" | python3 -c 'import json,sys; sys.exit(0 if not json.load(sys.stdin).get("storage") else 1)' 2>/dev/null
+}
+
 inspect_layout() {
-  # Incremental builds can drop storageLayout from cached artifacts; retry with --force.
+  # Incremental builds can drop storageLayout from cached artifacts; retry with
+  # --force. A stale cache does NOT return the empty string — it returns valid
+  # JSON with an EMPTY layout (`{"storage": [], "types": {}}`), so testing only
+  # for `-z` let a degenerate read through. Not cosmetic: against a real golden
+  # it is a spurious FAIL, and if a golden is ever regenerated
+  # (--update-golden) while the cache is cold it bakes in an empty layout that
+  # then matches EVERYTHING forever — a gate protecting deployed proxy storage
+  # that silently stops protecting anything.
   local out
-  if ! out=$(forge inspect "$1" storageLayout --json 2>/dev/null) || [ -z "$out" ]; then
+  if ! out=$(forge inspect "$1" storageLayout --json 2>/dev/null) || _layout_is_empty "$out"; then
     out=$(forge inspect "$1" storageLayout --json --force 2>/dev/null) ||
       fail "forge inspect $1 storageLayout failed even with --force"
+  fi
+  if _layout_is_empty "$out"; then
+    fail "forge inspect $1 storageLayout returned an EMPTY layout even with --force — refusing to compare or bake a layout that pins nothing"
   fi
   printf '%s' "$out"
 }

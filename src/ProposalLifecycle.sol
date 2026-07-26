@@ -67,8 +67,10 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
     ///         ONLY condition under which `_commitState` fires the registry
     ///         economic commit. FALSE for: a veto-rejection at voteEnd (never
     ///         traversed review), a Draft expiry, an already-Approved -> Expired
-    ///         transition (review concluded on a prior commit), and an
-    ///         Unresolved outcome past reviewEnd (fail-closed, stays in review).
+    ///         transition (review concluded on a prior commit), an Unresolved
+    ///         outcome past reviewEnd (no registered review to commit — see the
+    ///         SECURITY INVARIANT on that branch in `_afterVote`), and a paused
+    ///         registry (the commit would revert).
     ///         This reproduces exactly the set of transitions on which the
     ///         pre-refactor `_resolveState` called `resolveReview`.
     function _computeState(StrategyProposal storage p)
@@ -145,14 +147,46 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
         }
         IGuardianRegistry reg = IGuardianRegistry(_guardianRegistry);
         IGuardianRegistry.ReviewOutcome o = reg.outcomeOf(address(this), p.id);
-        // Unresolved past `reviewEnd` is the SAME underlying condition as the
-        // collapsed window above: `outcomeOf` can only answer Unresolved here
-        // when the registry holds no window (`reviewEnd == 0`), i.e. no review
-        // was ever registered. Treat it identically — "no review configured =>
-        // cleared" — instead of fail-closing into a state with no exit
+        // Unresolved past `reviewEnd` means `outcomeOf` found no window
+        // (`r.reviewEnd == 0`), i.e. no review was ever registered. Treated as
+        // "no review configured => cleared", the same answer the collapsed
+        // window above gets, instead of fail-closing into a state with no exit
         // (`resolveReview` reverts ReviewNotReadyForResolve, `_openProposalCount`
         // stays pinned, and `emergencyCancel` is Draft/Pending-only).
         // `reviewConcluded` is FALSE: there is no registry review to commit.
+        //
+        // SECURITY INVARIANT — read before changing how this contract is
+        // deployed. This is NOT the same condition as the collapsed window: a
+        // collapsed window means the governor KNOWS there is no review; here
+        // the governor believes there IS one (`reviewEnd > voteEnd`) and the
+        // registry disagrees. Answering Cleared is therefore fail-OPEN — a
+        // proposal reaching this branch is Approved and executable with no
+        // guardian review at all — where the collapsed-window branch is merely
+        // permissive by construction. It is safe only because governor and
+        // registry are deployed in lockstep, which makes the branch
+        // unreachable:
+        //   - both push sites (`propose`, `approveCollaboration`) call
+        //     `registerReview` under the identical `reviewEnd > voteEnd`
+        //     predicate this function tests, so a registered window exists
+        //     whenever we get past the collapsed-window check above;
+        //   - `p.reviewEnd` is written only immediately before those pushes,
+        //     so the registry's `reviewEnd` can never trail the governor's;
+        //   - `_reviews` entries are never deleted and `registerReview` is
+        //     `onlyGovernor` (an unauthorised governor reverts at propose time,
+        //     it does not silently skip the push);
+        //   - `_guardianRegistry` is write-once at `initialize` — the factory's
+        //     `setGuardianRegistry` only affects future deployments;
+        //   - `_authorizedGovernors` has no `remove`, so a governor cannot be
+        //     de-authorised mid-flight.
+        // The one state that breaks all of this is a governor whose proposals
+        // PREDATE `registerReview`: those hold `reviewEnd > voteEnd` with no
+        // registry record, and they would land here and auto-approve. The
+        // storage relinearisation in this refactor already forces a fresh
+        // deployment (see the beacon constraint pinned in
+        // `test/governor/GovernorLayoutPins.t.sol`), which is what keeps them
+        // out of reach. Anyone proposing a beacon-migration path for the
+        // governor is re-arming a security gate here, not fixing a liveness
+        // bug, and must close this branch first.
         if (o == IGuardianRegistry.ReviewOutcome.Unresolved) {
             return (block.timestamp > p.executeBy ? ProposalState.Expired : ProposalState.Approved, false);
         }
@@ -160,10 +194,17 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
         // is `whenNotPaused` while `outcomeOf` is not. Reporting Approved here
         // would hand callers a state every path to act on reverts against
         // (`ProtocolPaused` from a contract they never called). Report the
-        // honest "still in review" for the duration, which also keeps
-        // `cancelProposal` usable — `cancelReview` is not pause-gated. Skipped
-        // when the registry already cached the resolution: the commit is then a
-        // no-op, so the pause cannot strand it.
+        // honest "still in review" for the duration. This is a view-honesty
+        // fix, NOT a liveness one: the hold does not make `cancelProposal`
+        // usable again. `cancelReview` is indeed not pause-gated, but this
+        // branch is only reachable past `p.reviewEnd`, and `cancelReview`
+        // rejects at exactly that point (it refuses once the window has
+        // closed, so the proposer cannot race a pending `resolveReview`
+        // slash) — the cancel bubbles `ReviewNotOpen` rather than
+        // `ProtocolPaused`. A pause outliving `executeBy` still lands on
+        // Expired the moment it lifts. Skipped when the registry already
+        // cached the resolution: the commit is then a no-op, so the pause
+        // cannot strand it.
         if (reg.paused()) {
             (, bool alreadyResolved,,) = reg.getReviewState(address(this), p.id);
             if (!alreadyResolved) return (ProposalState.GuardianReview, false);

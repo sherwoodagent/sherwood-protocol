@@ -573,7 +573,11 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             // `reviewEnd > voteEnd`: when `reviewPeriod == 0` (registry not
             // wired / unit-test mock) `reviewEnd == voteEnd` and the registry
             // would revert `InvalidReviewWindow` — the base's `_afterVote`
-            // handles the unregistered window fail-closed.
+            // treats that collapsed window as cleared.
+            // LOAD-BEARING: this predicate must stay identical to the one
+            // `_afterVote` tests. A proposal that gets past it there without
+            // having been registered here auto-approves with no guardian
+            // review — see the SECURITY INVARIANT in `ProposalLifecycle`.
             if (proposal.reviewEnd > proposal.voteEnd) {
                 IGuardianRegistry(_guardianRegistry).registerReview(proposalId, proposal.voteEnd, proposal.reviewEnd);
             }
@@ -769,7 +773,11 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // review without a call-back. Guarded on `reviewEnd > voteEnd`: with
         // `reviewPeriod == 0` (registry not wired / unit-test mock) the window
         // collapses and the registry would revert `InvalidReviewWindow` — the
-        // base's `_afterVote` handles the unregistered window fail-closed.
+        // base's `_afterVote` treats that collapsed window as cleared.
+        // LOAD-BEARING: this predicate must stay identical to the one
+        // `_afterVote` tests. A proposal that gets past it there without having
+        // been registered here auto-approves with no guardian review — see the
+        // SECURITY INVARIANT in `ProposalLifecycle`.
         if (p.reviewEnd > p.voteEnd) {
             IGuardianRegistry(_guardianRegistry).registerReview(p.id, p.voteEnd, p.reviewEnd);
         }
