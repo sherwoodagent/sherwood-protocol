@@ -365,6 +365,81 @@ contract CoverageEndToEndTest is Test {
         return uint256(gov.getProposal(pid).state);
     }
 
+    /// @dev First instant at which a vote CHANGE is refused — the registry's
+    ///      anti-sniping window, `reviewEnd - (reviewWindow * 10%)`. The C1
+    ///      attack depended on flipping one second before this.
+    function _lockoutStart(SyndicateGovernor gov, uint256 pid) internal view returns (uint256) {
+        ISyndicateGovernor.StrategyProposal memory p = gov.getProposal(pid);
+        uint256 window = p.reviewEnd - p.voteEnd;
+        return p.reviewEnd - (window * registry.LATE_VOTE_LOCKOUT_BPS()) / 10_000;
+    }
+
+    // ── C1 regression, end to end ─────────────────────────────────────────
+
+    /// @notice C1 — the free-rider veto, reconstructed against the REAL stack
+    ///         rather than mocks, because the attack composed three contracts:
+    ///         the ledger's booking rule, the registry's release-on-flip, and
+    ///         the registry's late-vote lockout. A unit test over the ledger
+    ///         alone proves only the first third.
+    ///
+    ///         The attack: g2 holds 20k of 90k staked WOOD — 2,222 bps, well
+    ///         under the 3,000 bps block quorum, so it cannot legitimately veto
+    ///         anything. Under first-come booking it approved first and absorbed
+    ///         the entire $1,000 of coverage; g3's approve then booked $0 and
+    ///         left it off the ledger's approver list; g2 flipped to Block one
+    ///         second before the lockout, releasing everything. Coverage $0, g3
+    ///         unable to re-register, review NOT blocked (g2 never reached
+    ///         quorum) — so the proposal resolved Approved and then reverted
+    ///         `InsufficientApproveCoverage` on execute, forever, at a cost of
+    ///         gas and with no conviction to slash.
+    ///
+    ///         With per-approver reservations there is nothing to absorb, so
+    ///         every step below still happens and the proposal executes anyway.
+    function test_poc_freeRiderVetoIsClosed() public {
+        uint256 pid = _propose(govA, address(vaultA), agentA);
+        _openReview(govA, pid);
+
+        // 1. The attacker gets in first. It reserves the full coverage — but a
+        //    reservation is an upper bound on liability, not a claim on the book.
+        _vote(govA, pid, g2, IGuardianRegistry.GuardianVoteType.Approve);
+        assertEq(ledger.openExposureUsd(g2), COVERAGE_USD, "attacker reserves the coverage");
+
+        // 2. THE FIX. The honest approver is no longer free-ridden into a zero
+        //    commitment, and is on the ledger's approver list. This assertion is
+        //    the exact line that read `0` before.
+        _vote(govA, pid, g3, IGuardianRegistry.GuardianVoteType.Approve);
+        assertEq(ledger.openExposureUsd(g3), COVERAGE_USD, "honest approver books its own reservation");
+        assertGe(ledger.slashableBondUsd(g3), COVERAGE_USD, "and could carry the proposal alone");
+
+        // Both reserved the full coverage, so each carries half of it for now.
+        assertEq(ledger.allocatedUsd(address(govA), pid, g2), COVERAGE_USD / 2, "split while both are in");
+        assertEq(ledger.allocatedUsd(address(govA), pid, g3), COVERAGE_USD / 2);
+
+        // 3. The attacker flips to Block at the last permitted instant, which
+        //    releases its reservation at zero cost. Exactly as before.
+        vm.warp(_lockoutStart(govA, pid) - 1);
+        _vote(govA, pid, g2, IGuardianRegistry.GuardianVoteType.Block);
+        assertEq(ledger.openExposureUsd(g2), 0, "attacker walks away paying nothing");
+
+        // 4. ...but the survivor's allocation scales UP to absorb the whole
+        //    proposal, instead of the coverage collapsing to zero.
+        assertEq(ledger.allocatedUsd(address(govA), pid, g3), COVERAGE_USD, "g3 absorbs the full coverage");
+        assertEq(ledger.allocatedUsd(address(govA), pid, g2), 0, "a released approver carries nothing");
+
+        // 5. The lockout still binds — g3 genuinely cannot re-register, which is
+        //    what made the original veto permanent. It no longer needs to.
+        vm.warp(_lockoutStart(govA, pid) + 1);
+        vm.prank(g3);
+        vm.expectRevert(IGuardianRegistry.VoteChangeLockedOut.selector);
+        registry.voteOnProposal(address(govA), pid, IGuardianRegistry.GuardianVoteType.Block);
+
+        // 6. The review resolves Approved (g2 never reached block quorum) — and
+        //    this time the proposal EXECUTES rather than being bricked.
+        _pastReview(govA, pid);
+        govA.executeProposal(pid);
+        assertEq(_state(govA, pid), uint256(ISyndicateGovernor.ProposalState.Executed), "the veto no longer lands");
+    }
+
     // ── 1. Full lifecycle: coverage accounting round-trips ────────────────
 
     /// @notice propose (bond locked, covered-TVL cap cleared) → guardian approves
