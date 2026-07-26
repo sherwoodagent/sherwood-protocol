@@ -184,6 +184,51 @@ introduce, and it is why the two constants moved together.
 Bucket width remains a deploy-time constant. Nothing here changes that; it
 changes only which widths are legal.
 
+## Delegation is out of scope for v1 (decided 2026-07-26)
+
+`delegationEnabled` defaults to false and no deploy script flips it, so v1
+already ships without delegation. This records that as a decision rather than
+an accident, and it closes several things at once.
+
+The problem it closes. `slashableBondUsd` credits delegated stake at
+`maxDelegatedSlashBps`, so a delegator's capital counts as backing a coverage
+window of ~35 days — but `requestUnstakeDelegation` checks only the DELEGATOR's
+own state, and the unbonding pool stays slashable for just `coolDownPeriod`
+(7 days). A delegator can therefore exit from under a conviction still heading
+for their delegate. Credit, liability and hold period are misaligned. This is
+PRE-EXISTING and independent of anything in this ADR.
+
+Two fixes were considered and rejected:
+
+- *Stop counting delegated stake toward coverage.* Forces a second question —
+  is it still slashable? If yes, delegators bear loss for coverage they were
+  never credited with and nobody rationally delegates. If no, delegation becomes
+  pure voting weight with zero downside and a free exit, so a guardian routes
+  capital through a second address and holds influence without liability.
+  `CannotSelfDelegate` blocks only the literal same address; two wallets defeat
+  it. Both branches are worse than the problem.
+- *Gate delegator exit on the DELEGATE's open exposure.* Correct — it realigns
+  the hold period with the credit — but it means a delegator is held by
+  commitments they had no say in, and by the union of them if they back several
+  guardians. That is a materially worse deal than delegators have today and
+  belongs in the delegation docs before anyone stakes under it. It is the right
+  fix when delegation ships; it is not something to introduce quietly.
+
+Deferring delegation removes the need to choose now. Also moot in v1 as a
+result: the `_slashOne` delegated legs and first-loss spill are dormant, and
+H1's residual gap (the ledger counting delegated stake at the cap while the
+slash applies that cap to the undiscounted pool) cannot arise.
+
+CONSEQUENCE FOR THE H1 ARGUMENT. The option-C evidence test on #24 demonstrates
+STRICT surplus (`recovery > allocation`), and that surplus comes entirely from
+the delegated discount asymmetry. With delegation off, recovery lands exactly ON
+the allocation. The v1 guarantee is therefore `recovery == allocation`, not
+`>`. The inequality still holds and the argument still stands — but the cushion
+is a v2 property and should not be cited as v1 safety margin.
+
+Worth adding a deploy pre-flight asserting `delegationEnabled == false`, so the
+scope is enforced rather than assumed.
+
 ## Exit gating (decided 2026-07-26)
 
 The flat `coolDownPeriod` is the wrong instrument. It is a proxy for "cannot
