@@ -64,10 +64,26 @@ contract MockGovernorForLedger {
         uint256 voteEnd;
         uint256 reviewEnd;
         address vault;
+        uint256 executeBy;
+        uint256 strategyDuration;
+    }
+
+    uint256 public executeBy;
+    uint256 public strategyDuration;
+
+    /// @dev Left at 0/0 by default, which makes `coverUntil` fall at or before
+    ///      epoch genesis so the ledger books into the CURRENT epoch — the
+    ///      pre-ADR behaviour every existing test in this file was written
+    ///      against. Set them to exercise the settlement-dated bucket.
+    function setSchedule(uint256 executeBy_, uint256 duration_) external {
+        executeBy = executeBy_;
+        strategyDuration = duration_;
     }
 
     function getProposalView(uint256) external view returns (ProposalViewLite memory v) {
         v.vault = vaultAddr;
+        v.executeBy = executeBy;
+        v.strategyDuration = strategyDuration;
     }
 }
 
@@ -341,6 +357,55 @@ contract ExposureLedgerTest is Test {
         ledger.setChallengeWindow(10 days); // exactly the floor -- allowed
         assertEq(ledger.challengeWindow(), 10 days);
         vm.stopPrank();
+    }
+
+    /// @notice ADR 2026-07-26 — THE SETTLEMENT-COVERAGE BUG.
+    ///
+    ///         A commitment must outlive the drain it backs. Risk ends at
+    ///         `executeBy + strategyDuration + challengeWindow`; keying the
+    ///         bucket on `currentEpoch()` expired it at
+    ///         `approval + challengeWindow`, releasing the guardian's budget
+    ///         roughly a month before their own approval could still be
+    ///         challenged. A drain surfacing in that gap had no bond to slash.
+    ///
+    ///         Booking into the bucket that CONTAINS settlement closes it.
+    function test_recordApproval_holdsBudgetUntilSettlementCanBeChallenged() public {
+        _wireRecording();
+        // Settles ~35 days out: one epoch (28d) ahead of the vote.
+        mgov.setSchedule(block.timestamp + 5 days, 30 days);
+        mgov.set(1_000e6);
+
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        assertEq(ledger.openExposureUsd(guardian), 1_000e18, "booked");
+
+        // Past the point the OLD keying would have freed it — one epoch plus a
+        // challenge window after the vote. The strategy has not even settled.
+        vm.warp(block.timestamp + 28 days + 14 days + 1);
+        assertEq(
+            ledger.openExposureUsd(guardian), 1_000e18, "still committed while the drain it backs can be challenged"
+        );
+
+        // ...and released once the bucket covering settlement has itself
+        // expired. Warped well past it rather than pinned to the exact
+        // boundary: the point of the test is that release happens AFTER the
+        // risk window, not that it happens on a particular second.
+        vm.warp(block.timestamp + 120 days);
+        assertEq(ledger.openExposureUsd(guardian), 0, "released once the risk window has closed");
+    }
+
+    /// @notice A settlement further out than the ledger will book for is
+    ///         REFUSED, not clamped. Clamping would silently under-cover the
+    ///         tail — reintroducing the bug above in a quieter form. The revert
+    ///         surfaces a duration ceiling set out of step with the epoch length.
+    function test_recordApproval_refusesASettlementBeyondTheHorizon() public {
+        _wireRecording();
+        mgov.setSchedule(block.timestamp + 1 days, 365 days); // far past 3 epochs
+        mgov.set(1_000e6);
+
+        vm.prank(registry);
+        vm.expectRevert(IExposureLedger.CoverageHorizonExceeded.selector);
+        ledger.recordApproval(address(mgov), 1, guardian);
     }
 
     /// @notice C1 REGRESSION — the free-rider veto.

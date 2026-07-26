@@ -11,6 +11,12 @@ interface IExposureLedger {
     // ── Errors ──
     error ExposureCapExceeded();
     error CoveredTvlCapExceeded();
+
+    /// @notice Reverts when a proposal's settlement (`executeBy +
+    ///         strategyDuration`) lands further ahead than the ledger will book
+    ///         a commitment for. Signals a duration ceiling set out of step with
+    ///         the epoch length, rather than silently under-covering the tail.
+    error CoverageHorizonExceeded();
     error InsufficientApproveCoverage();
     error NotGuardianRegistry();
     error FeedNotConfigured();

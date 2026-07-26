@@ -832,13 +832,22 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         v.voteEnd = p.voteEnd;
         v.reviewEnd = p.reviewEnd;
         v.vault = p.vault;
+        // `executeBy + strategyDuration` bounds the LATEST instant this proposal
+        // can still be settling, which is what the exposure ledger sizes a
+        // guardian's commitment against (ADR 2026-07-26). Read at approve time,
+        // before execution has happened, so `executeBy` is the conservative
+        // anchor — `executedAt` is not known yet and may never be set.
+        v.executeBy = p.executeBy;
+        v.strategyDuration = p.strategyDuration;
     }
 
-    /// @dev Narrow (voteEnd, reviewEnd, vault) tuple returned by `getProposalView`.
+    /// @dev Narrow proposal tuple returned by `getProposalView`.
     struct ProposalViewLite {
         uint256 voteEnd;
         uint256 reviewEnd;
         address vault;
+        uint256 executeBy;
+        uint256 strategyDuration;
     }
 
     // ==================== INTERNAL ====================

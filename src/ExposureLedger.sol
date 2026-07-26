@@ -28,6 +28,8 @@ interface ILedgerGovernorMinimal {
         uint256 voteEnd;
         uint256 reviewEnd;
         address vault;
+        uint256 executeBy;
+        uint256 strategyDuration;
     }
 
     function getProposalView(uint256 proposalId) external view returns (ProposalViewLite memory);
@@ -81,6 +83,14 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      against the worst legal configuration rather than a live one. Keep
     ///      in step if the governor's ceiling ever moves.
     uint256 internal constant MAX_GOVERNOR_EXECUTION_WINDOW = 7 days;
+
+    /// @dev How far ahead of the current epoch an approval may be booked. Every
+    ///      commitment is dated to the bucket covering its settlement, so this
+    ///      is what keeps `openExposureUsd`'s forward scan fixed-width — the
+    ///      loop spans `challengeWindow` back plus this many epochs forward.
+    ///      Three epochs is ~84 days at the shipped 28d length, well clear of a
+    ///      30d duration cap plus a 7d execution window.
+    uint256 internal constant MAX_FORWARD_EPOCHS = 3;
 
     bytes32 public constant PARAM_CHALLENGE_WINDOW = keccak256("challengeWindow");
     bytes32 public constant PARAM_K_NUMERATOR = keccak256("kNumerator");
@@ -397,7 +407,8 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         bytes32 key = _reviewKey(governor, proposalId);
         if (_recorded[key][guardian].usd != 0) return; // idempotent (vote-change round trip)
         ILedgerGovernorMinimal gov = ILedgerGovernorMinimal(governor);
-        address asset = IVaultAssetMinimal(gov.getProposalView(proposalId).vault).asset();
+        ILedgerGovernorMinimal.ProposalViewLite memory pv = gov.getProposalView(proposalId);
+        address asset = IVaultAssetMinimal(pv.vault).asset();
         // NO FEED -> BOOK NOTHING, don't revert (review M3). This hook fires for
         // every authorized governor once the ledger is wired on the registry,
         // including governors deliberately left un-wired on their own side and
@@ -443,7 +454,23 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         // Truncation in the uint192 store below would book phantom (smaller)
         // exposure — fail loudly instead.
         if (share > type(uint192).max) revert InvalidParameter();
-        uint256 epoch = currentEpoch();
+        // BOOK INTO THE BUCKET THAT OUTLIVES SETTLEMENT, not the one the vote
+        // happened to land in (ADR 2026-07-26). The commitment has to survive
+        // until the drain it backs can no longer be challenged:
+        //
+        //     risk ends at   executeBy + strategyDuration + challengeWindow
+        //     bucket expires at   bucketEnd + challengeWindow
+        //
+        // so the bucket must contain `executeBy + strategyDuration`. Keying on
+        // `currentEpoch()` released a guardian's budget as early as
+        // `approval + challengeWindow` — roughly a month before the challenge
+        // window on their own approval had closed. Nothing caught it because
+        // every other part works: the booking, the quorum and the slash maths
+        // are all correct, only the expiry date was wrong.
+        //
+        // `executeBy` rather than `executedAt`: at approve time the proposal has
+        // not executed and may never, so the deadline is the conservative anchor.
+        uint256 epoch = _coverageEpoch(pv);
         _buckets[guardian][epoch] += share;
         // share bounded to uint192 above; epoch = elapsed / epochLength cannot
         // approach 2^64 on any realistic timescale.
@@ -619,8 +646,37 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         uint256 cur = currentEpoch();
         uint256 elapsed = block.timestamp - epochGenesis;
         uint256 from = elapsed > challengeWindow ? (elapsed - challengeWindow) / epochLength : 0;
-        for (uint256 e = from; e <= cur; e++) {
+        // Scans FORWARD as well as back. Approvals are booked into the bucket
+        // covering settlement, which is in the future at vote time, so a
+        // backward-only sum would miss every live commitment and report a
+        // guardian's budget as free while it is fully pledged — the batching cap
+        // would then wave through exactly what it exists to stop.
+        // `MAX_FORWARD_EPOCHS` bounds the span, and `_coverageEpoch` refuses to
+        // book beyond it, so the two together keep this loop fixed-width.
+        uint256 to = cur + MAX_FORWARD_EPOCHS;
+        for (uint256 e = from; e <= to; e++) {
             total += _buckets[guardian][e];
         }
+    }
+
+    /// @dev The bucket whose expiry covers this proposal's settlement, floored
+    ///      at the current epoch (a proposal already past its deadline must not
+    ///      book into the past, where the bucket may have expired already).
+    ///
+    ///      Reverts rather than clamping when settlement lands beyond
+    ///      `MAX_FORWARD_EPOCHS`. Clamping would silently under-cover the tail
+    ///      of a long strategy, which is the very bug this replaced; refusing
+    ///      the approval instead surfaces a mis-set duration ceiling as a failed
+    ///      vote rather than as a hole nobody sees. At the shipped 28d epoch
+    ///      this permits ~84 days of horizon, comfortably above the 30d duration
+    ///      cap plus a 7d execution window.
+    function _coverageEpoch(ILedgerGovernorMinimal.ProposalViewLite memory pv) internal view returns (uint256) {
+        uint256 coverUntil = pv.executeBy + pv.strategyDuration;
+        uint256 cur = currentEpoch();
+        if (coverUntil <= epochGenesis) return cur;
+        uint256 target = (coverUntil - epochGenesis) / epochLength;
+        if (target <= cur) return cur;
+        if (target - cur > MAX_FORWARD_EPOCHS) revert CoverageHorizonExceeded();
+        return target;
     }
 }

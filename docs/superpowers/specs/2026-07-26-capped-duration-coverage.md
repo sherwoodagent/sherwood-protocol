@@ -102,7 +102,7 @@ Consequences that fall out:
 vault params against it. `GovernorParameters` already reads `ProtocolConfig`, so
 no new dependency.
 
-**(b) Key the bucket to settlement — SPECIFIED HERE, NOT YET BUILT.**
+**(b) Key the bucket to settlement — SHIPPED.**
 
 Book into the bucket containing `executeBy + strategyDuration` instead of
 `currentEpoch()`:
@@ -145,6 +145,45 @@ constructor, `setChallengeWindow`, `DeployPlanB` pre-flight). The
 `challengeWindow` floor was added for review finding M1.
 `GuardianRegistry.setReviewPeriod` does NOT check that it invalidates the
 ledger's window — the registry has no handle on the ledger. That gap is open.
+
+## Exit gating (decided 2026-07-26)
+
+The flat `coolDownPeriod` is the wrong instrument. It is a proxy for "cannot
+escape before a challenge lands", and as a proxy it punishes EVERY guardian for
+the worst case: someone with no open commitments waits six weeks for no reason.
+
+**Decision: gate the exit on actually having open exposure, not on a long
+timer.** `StakedWood` refuses to release stake while
+`exposureLedger.openExposureUsd(guardian) > 0`, and the baseline cooldown stays
+short for churn protection.
+
+This is strictly better than raising the cooldown:
+
+- Exact rather than conservative. You cannot leave while you owe coverage, and
+  you leave promptly when you do not.
+- It removes the `coolDownPeriod >= epochLength + challengeWindow` invariant
+  entirely — the invariant existed only to approximate this check.
+- It resolves the unmet prerequisite below without asking every guardian to
+  accept a six-week exit.
+
+Costs, stated rather than discovered: it couples `StakedWood` to the ledger (the
+ledger already reads sWOOD, so the two become mutually referential — both
+directions are views, so there is no reentrancy concern, but it is a real
+dependency). And a guardian is held until their exposure genuinely expires, so
+a stuck or over-conservative exposure figure delays an exit. Bucket expiry is
+time-based and self-clearing, so it cannot hang indefinitely.
+
+NOT YET BUILT. `StakedWood` is golden-pinned on the Plan C branch, so the
+ledger pointer must be added with layout care.
+
+## Chain target (decided 2026-07-26)
+
+Deployment is **Robinhood Chain only**. Review finding H2 — `SyndicateGovernor`
+at 27,586 bytes against EIP-170's 24,576 — is therefore NOT a blocker: Robinhood
+allows 98,304, leaving roughly 70 KB of headroom. What remains is a tooling fix
+so `forge build` stops failing on a limit that does not apply to the target
+chain. If any part of this stack is ever pointed at Base, H2 becomes blocking
+again and the governor needs splitting.
 
 ## Known unmet prerequisite
 

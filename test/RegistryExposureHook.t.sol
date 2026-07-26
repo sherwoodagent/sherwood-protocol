@@ -48,6 +48,20 @@ contract MockGovernorWithCoverage is MockGovernorMinimal {
         uint256 voteEnd;
         uint256 reviewEnd;
         address vault;
+        uint256 executeBy;
+        uint256 strategyDuration;
+    }
+
+    uint256 public executeBy;
+    uint256 public strategyDuration;
+
+    /// @dev Left at 0/0 by default, which makes `coverUntil` fall at or before
+    ///      epoch genesis so the ledger books into the CURRENT epoch — the
+    ///      pre-ADR behaviour every existing test in this file was written
+    ///      against. Set them to exercise the settlement-dated bucket.
+    function setSchedule(uint256 executeBy_, uint256 duration_) external {
+        executeBy = executeBy_;
+        strategyDuration = duration_;
     }
 
     uint256 public requiredCoverage;
@@ -67,6 +81,8 @@ contract MockGovernorWithCoverage is MockGovernorMinimal {
 
     function getProposalView(uint256) external view returns (ProposalViewLite memory v) {
         v.vault = proposalVault;
+        v.executeBy = executeBy;
+        v.strategyDuration = strategyDuration;
     }
 }
 
