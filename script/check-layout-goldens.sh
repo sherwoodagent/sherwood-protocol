@@ -74,7 +74,44 @@ canonical_layout() {
 import json, re, sys
 
 def norm(s):
-    return re.sub(r"\)\d+", ")", s)  # strip ast ids in type names
+    """Strip solc ast ids from type names while PRESERVING array lengths.
+
+        t_struct(Review)1234_storage   -> t_struct(Review)_storage    (ast id: noise)
+        t_array(t_uint256)49_storage   -> unchanged                   (length: load-bearing)
+
+    Both shapes are `)<digits>`, so the old `re.sub(r"\\)\\d+", ")")` canonicalised
+    `uint256[49] __gap` and `uint256[42] __gap` to the SAME string and the gate went
+    blind to a pure gap resize. A forgotten decrement on append still moves the gap`s
+    own slot (caught by the `storage` half), but a resize with no other change is
+    exactly the reserved-space accounting drift this gate exists to catch.
+
+    Digits after `)` are an ast id UNLESS the group was opened by `t_array(`, so we
+    track what opened each paren rather than pattern-matching (types nest:
+    `t_array(t_struct(Review)1234_storage)49_storage` needs both rules at once).
+    """
+    out, stack, i = [], [], 0
+    while i < len(s):
+        c = s[i]
+        if c == "(":
+            j = len(out) - 1
+            while j >= 0 and (out[j].isalnum() or out[j] == "_"):
+                j -= 1
+            stack.append("".join(out[j + 1:]))
+            out.append(c)
+            i += 1
+        elif c == ")":
+            kind = stack.pop() if stack else ""
+            out.append(c)
+            i += 1
+            j = i
+            while j < len(s) and s[j].isdigit():
+                j += 1
+            if j > i and kind != "t_array":
+                i = j  # ast id -> drop. array length -> fall through and keep.
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
 
 d = json.load(sys.stdin)
 types = d.get("types") or {}

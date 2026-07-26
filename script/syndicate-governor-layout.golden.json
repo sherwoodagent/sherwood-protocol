@@ -34,7 +34,7 @@
       "label": "__lifecycleGap",
       "slot": "5",
       "offset": 0,
-      "type": "t_array(t_uint256)_storage"
+      "type": "t_array(t_uint256)10_storage"
     },
     {
       "label": "vault",
@@ -76,13 +76,13 @@
       "label": "__paramsGap",
       "slot": "29",
       "offset": 0,
-      "type": "t_array(t_uint256)_storage"
+      "type": "t_array(t_uint256)7_storage"
     },
     {
       "label": "__emergencyGap",
       "slot": "36",
       "offset": 0,
-      "type": "t_array(t_uint256)_storage"
+      "type": "t_array(t_uint256)10_storage"
     },
     {
       "label": "_proposalCount",
@@ -166,7 +166,7 @@
       "label": "__gap",
       "slot": "59",
       "offset": 0,
-      "type": "t_array(t_uint256)_storage"
+      "type": "t_array(t_uint256)33_storage"
     }
   ],
   "types": {

@@ -124,7 +124,7 @@
       "label": "__gap",
       "slot": "20",
       "offset": 0,
-      "type": "t_array(t_uint256)_storage"
+      "type": "t_array(t_uint256)45_storage"
     }
   ],
   "types": {
