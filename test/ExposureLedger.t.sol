@@ -664,13 +664,65 @@ contract ExposureLedgerTest is Test {
         assertEq(ledger.openExposureUsd(guardian), 5_000e18, "epoch-0 exposure still counts against the cap");
     }
 
+    /// @notice `W <= L` is GONE. It was never a correctness rule — it was a
+    ///         proxy for keeping `openExposureUsd`'s walk short, and as a proxy
+    ///         it pinned buckets at >= 14 days. Narrow buckets are now the point:
+    ///         they let a guardian's short commitments expire without waiting on
+    ///         their long ones. What replaces it is a direct bound on the walk.
+    function test_constructor_allowsBucketsNarrowerThanTheChallengeWindow() public {
+        // 10d buckets under a 14d window: rejected before, fine now.
+        ExposureLedger narrow = new ExposureLedger(owner, address(swood), 10 days);
+        assertEq(narrow.epochLength(), 10 days);
+
+        // ...and 7d, the width that actually motivates this.
+        ExposureLedger sevenDay = new ExposureLedger(owner, address(swood), 7 days);
+        assertEq(sevenDay.epochLength(), 7 days);
+    }
+
     function test_constructor_enforcesDefaultWindowInvariants() public {
-        // epochLength 10d < default challengeWindow 14d: violates W <= L
-        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
-        new ExposureLedger(owner, address(swood), 10 days);
         // epochLength 40d: 40d + 14d = 54d > coolDownPeriod 45d
         vm.expectRevert(IExposureLedger.InvalidParameter.selector);
         new ExposureLedger(owner, address(swood), 40 days);
+        // Buckets so narrow that the walk would exceed MAX_SCAN_BUCKETS:
+        // (14d + 60d) / 4d + 2 = 20 > 16.
+        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
+        new ExposureLedger(owner, address(swood), 4 days);
+    }
+
+    /// @notice Narrow buckets are what buy independent release: a 7-day and a
+    ///         30-day commitment land in DIFFERENT buckets, so the short one
+    ///         frees up while the long one is still held. Under 28-day buckets
+    ///         they would share one and expire together.
+    function test_openExposure_shortCommitmentReleasesBeforeTheLongOne() public {
+        ExposureLedger led = new ExposureLedger(owner, address(swood), 7 days);
+        usdgAsset = makeAddr("usdgAssetSplit");
+        vm.mockCall(usdgAsset, abi.encodeWithSignature("decimals()"), abi.encode(uint8(6)));
+        MockFeed feed = new MockFeed(1e8, 8);
+        MockVaultForLedger vault = new MockVaultForLedger(usdgAsset);
+        MockGovernorForLedger shortGov = new MockGovernorForLedger(address(vault));
+        MockGovernorForLedger longGov = new MockGovernorForLedger(address(vault));
+        vm.startPrank(owner);
+        led.setAssetFeed(usdgAsset, address(feed), 365 days);
+        led.setGuardianRegistry(registry);
+        led.setWoodUsdPrice(0.05e8);
+        vm.stopPrank();
+        swood.setStake(guardian, 400_000e18, 0); // $20,000 budget
+
+        shortGov.setSchedule(block.timestamp + 1 days, 3 days); // settles ~4d out
+        shortGov.set(1_000e6);
+        longGov.setSchedule(block.timestamp + 1 days, 30 days); // settles ~31d out
+        longGov.set(2_000e6);
+
+        vm.startPrank(registry);
+        led.recordApproval(address(shortGov), 1, guardian);
+        led.recordApproval(address(longGov), 1, guardian);
+        vm.stopPrank();
+        assertEq(led.openExposureUsd(guardian), 3_000e18, "both held");
+
+        // Past the short one's bucket + challenge window, well short of the long
+        // one's. The short commitment is gone; the long one is untouched.
+        vm.warp(block.timestamp + 7 days + 14 days + 1);
+        assertEq(led.openExposureUsd(guardian), 2_000e18, "short released, long still held");
     }
 
     function test_kNumerator_doublesHeadroom() public {

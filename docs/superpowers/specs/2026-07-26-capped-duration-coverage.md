@@ -146,6 +146,44 @@ constructor, `setChallengeWindow`, `DeployPlanB` pre-flight). The
 `GuardianRegistry.setReviewPeriod` does NOT check that it invalidates the
 ledger's window — the registry has no handle on the ledger. That gap is open.
 
+## Bucket width is now a dial (decided 2026-07-26)
+
+Keying the bucket to settlement fixed WHERE a commitment sits; it did not
+change how WIDE a bucket is. At 28 days a 7-day strategy still rounded up to
+~42 days of lock-up:
+
+```
+12d  the job itself (execution window + duration)
+16d  rounding up to the end of a 28-day bucket   <- waste
+14d  challenge window                            <- real
+```
+
+Only the middle is waste, and narrowing the bucket removes most of it (~42d ->
+~28d at a 7-day width). The remainder is dominated by the challenge window, so
+exact per-commitment expiry would buy only ~2 further days for a rewrite of the
+accounting core — not worth it.
+
+The larger gain is not the waste. It is that two commitments of different
+lengths land in DIFFERENT buckets and expire independently: a guardian's 7-day
+work frees up while their 30-day work stays held. Under 28-day buckets both
+often shared one bucket, so the short commitment was held hostage by the long.
+
+**`challengeWindow <= epochLength` is removed.** It was never a correctness
+rule — it was a proxy for keeping `openExposureUsd`'s walk short, and as a proxy
+it pinned buckets at >= 14 days, forbidding exactly the narrow widths that make
+independent release work. It is replaced by `MAX_SCAN_BUCKETS`, a direct bound
+on the walk, checked in the constructor and in `setChallengeWindow`.
+
+The coverage horizon moved from an epoch COUNT to a TIME (`MAX_COVERAGE_HORIZON`
+= 60 days). An epoch-count horizon would have silently shrunk to nothing the
+moment someone narrowed the buckets — three 7-day epochs is 21 days, so a 30-day
+strategy would have started reverting `CoverageHorizonExceeded` for no reason a
+reader could see. This is the failure mode the change was most likely to
+introduce, and it is why the two constants moved together.
+
+Bucket width remains a deploy-time constant. Nothing here changes that; it
+changes only which widths are legal.
+
 ## Exit gating (decided 2026-07-26)
 
 The flat `coolDownPeriod` is the wrong instrument. It is a proxy for "cannot

@@ -84,13 +84,26 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      in step if the governor's ceiling ever moves.
     uint256 internal constant MAX_GOVERNOR_EXECUTION_WINDOW = 7 days;
 
-    /// @dev How far ahead of the current epoch an approval may be booked. Every
-    ///      commitment is dated to the bucket covering its settlement, so this
-    ///      is what keeps `openExposureUsd`'s forward scan fixed-width — the
-    ///      loop spans `challengeWindow` back plus this many epochs forward.
-    ///      Three epochs is ~84 days at the shipped 28d length, well clear of a
-    ///      30d duration cap plus a 7d execution window.
-    uint256 internal constant MAX_FORWARD_EPOCHS = 3;
+    /// @dev How far ahead of NOW a commitment may be dated. Expressed in TIME,
+    ///      not in epochs, on purpose: the bucket width is a tuning dial (see
+    ///      `MAX_SCAN_BUCKETS`), and an epoch-count horizon would silently
+    ///      shrink to nothing the moment someone narrowed the buckets — a 30d
+    ///      strategy would start reverting `CoverageHorizonExceeded` for no
+    ///      reason a reader could see. 60 days clears a 30d duration cap plus a
+    ///      7d execution window with room to spare.
+    uint256 internal constant MAX_COVERAGE_HORIZON = 60 days;
+
+    /// @dev Hard ceiling on how many buckets `openExposureUsd` may walk. This
+    ///      REPLACES the old `challengeWindow <= epochLength` rule, which was
+    ///      never about correctness — it was a proxy for keeping that loop
+    ///      short, and as a proxy it pinned buckets at >= 14 days.
+    ///
+    ///      Bounding the scan directly frees the bucket width to be tuned for
+    ///      precision instead: narrower buckets release a guardian's short
+    ///      commitments without waiting on their long ones, because the two no
+    ///      longer share a bucket. The cost is a longer walk, which is exactly
+    ///      what this caps.
+    uint256 internal constant MAX_SCAN_BUCKETS = 16;
 
     bytes32 public constant PARAM_CHALLENGE_WINDOW = keccak256("challengeWindow");
     bytes32 public constant PARAM_K_NUMERATOR = keccak256("kNumerator");
@@ -183,7 +196,7 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         // must cover epoch + challenge window (spec §5). A tiny epochLength
         // would violate W <= L, a huge one the unstake-escape invariant,
         // from genesis.
-        if (challengeWindow > epochLength_) revert InvalidParameter();
+        _requireScanBounded(challengeWindow, epochLength_);
         if (epochLength_ + challengeWindow > ISwoodMinimal(swood_).coolDownPeriod()) revert InvalidParameter();
         swood = ISwoodMinimal(swood_);
         epochLength = epochLength_;
@@ -274,9 +287,11 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      had already expired (conservative). Governance should change it
     ///      between epochs or at low open exposure.
     function setChallengeWindow(uint256 newWindow) external onlyOwner {
-        // Bounded (0, epochLength]: zero would free coverage instantly;
-        // beyond one epoch the lookback in openExposureUsd grows unbounded.
-        if (newWindow == 0 || newWindow > epochLength) revert InvalidParameter();
+        // Zero would free coverage instantly. The upper bound is no longer
+        // "one epoch" — it is whatever keeps `openExposureUsd`'s walk inside
+        // `MAX_SCAN_BUCKETS`, which is the property the old rule approximated.
+        if (newWindow == 0) revert InvalidParameter();
+        _requireScanBounded(newWindow, epochLength);
         // Cross-contract invariant (spec §5): unstake delay must cover
         // epoch + challenge window, or an approver can unstake before its
         // epoch's approvals can be challenged.
@@ -653,10 +668,18 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         // would then wave through exactly what it exists to stop.
         // `MAX_FORWARD_EPOCHS` bounds the span, and `_coverageEpoch` refuses to
         // book beyond it, so the two together keep this loop fixed-width.
-        uint256 to = cur + MAX_FORWARD_EPOCHS;
+        uint256 to = (elapsed + MAX_COVERAGE_HORIZON) / epochLength;
         for (uint256 e = from; e <= to; e++) {
             total += _buckets[guardian][e];
         }
+    }
+
+    /// @dev Both ends of `openExposureUsd`'s walk in one place: `challengeWindow`
+    ///      behind the current bucket, `MAX_COVERAGE_HORIZON` ahead of it, plus
+    ///      the partial bucket at each edge.
+    function _requireScanBounded(uint256 window, uint256 length) internal pure {
+        if (length == 0) revert InvalidParameter();
+        if ((window + MAX_COVERAGE_HORIZON) / length + 2 > MAX_SCAN_BUCKETS) revert InvalidParameter();
     }
 
     /// @dev The bucket whose expiry covers this proposal's settlement, floored
@@ -676,7 +699,7 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         if (coverUntil <= epochGenesis) return cur;
         uint256 target = (coverUntil - epochGenesis) / epochLength;
         if (target <= cur) return cur;
-        if (target - cur > MAX_FORWARD_EPOCHS) revert CoverageHorizonExceeded();
+        if (coverUntil > block.timestamp + MAX_COVERAGE_HORIZON) revert CoverageHorizonExceeded();
         return target;
     }
 }
