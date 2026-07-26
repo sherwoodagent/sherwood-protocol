@@ -939,8 +939,12 @@ contract CoverageEpochsTest is Test {
         );
     }
 
-    /// @dev The guarantee this task turns on: epoch 0's set must be the SAME set
-    ///      `ChallengeGame._accused` computes, filter for filter.
+    /// @dev Epoch 0's set must be the SAME set `ChallengeGame._accused`
+    ///      computes, filter for filter — SO LONG AS NO RENEWAL HAS LANDED. A
+    ///      renewal books through `recordApproval` under the same `proposalId`,
+    ///      which moves the two apart on purpose; see
+    ///      `test_epochZeroDivergesFromChallengeGameOnceARenewalLands` for the
+    ///      residual exposure that leaves and why it cannot be closed here.
     function test_epochZeroCoverersMatchChallengeGameAccused() public {
         _wireEpochZeroApprovers();
         _warpToEpochBoundary(3);
@@ -1033,6 +1037,164 @@ contract CoverageEpochsTest is Test {
         for (uint256 i = 0; i < cov.length; i++) {
             assertNotEq(cov[i], guardianB, "a zero committed share is not coverage");
         }
+    }
+
+    // ── Epoch 0 covers the ORIGINAL approvers, never a later renewer ──
+    //
+    // `commitRenewal` books through `exposureLedger.recordApproval(governor,
+    // proposalId, msg.sender)` under the SAME `proposalId`, so a renewer joins
+    // the very list `coverersOf(.., 0)` reads. A live ledger read alone
+    // therefore cannot tell "backed this proposal at vote time" from "took over
+    // the watch three epochs later" — and an epoch-0 predicate-5 filing would
+    // slash a guardian for a watch it never stood.
+
+    /// @dev The fixture that makes a renewer VISIBLE in the ledger's approver
+    ///      list. `recordApproval` returns early once `already >= needUsd`, so
+    ///      with `_wireEpochZeroApprovers`'s fully-covered $1,000 a renewer books
+    ///      nothing, is never listed, and the misattribution stays invisible —
+    ///      the fixture would quietly assert the bug away.
+    ///
+    ///      $2,000 of required coverage against two $600 guardians leaves $800
+    ///      unbooked, so the renewer's commitment lands in `_approversOf` with a
+    ///      real share. Under-coverage is not contrived: `recordApproval`'s own
+    ///      docs say an under-bonded guardian "commits what it can", and the same
+    ///      hole opens whenever an original approver releases.
+    function _wireUnderCoveredEpochZeroApprovers() internal {
+        _wireRenewal();
+
+        vm.prank(owner);
+        ledger.setGuardianRegistry(registry);
+
+        governor.setRequiredCoverage(2_000e6); // $2,000, more than A + B can carry
+        swood.setStake(guardianA, 12_000e18, 0); // $600 at $0.05/WOOD
+        swood.setStake(guardianB, 12_000e18, 0); // $600
+        swood.setStake(guardianC, 100_000e18, 0); // $5,000, the renewer
+
+        vm.startPrank(registry);
+        ledger.recordApproval(address(governor), pid, guardianA);
+        ledger.recordApproval(address(governor), pid, guardianB);
+        vm.stopPrank();
+    }
+
+    /// @dev THE BUG THIS FIX EXISTS FOR. `guardianC`'s first commitment to this
+    ///      proposal is relative epoch 3. It answers for epoch 3 and for nothing
+    ///      before it — anything else is claims-made attribution running
+    ///      backwards, the open-ended liability §3.4a ends arriving from the
+    ///      other direction.
+    function test_renewerOnlyGuardianIsNotAnEpochZeroCoverer() public {
+        _wireUnderCoveredEpochZeroApprovers();
+        _warpToEpochBoundary(3); // a NON-ZERO absolute epoch (D8)
+        _open();
+
+        _warpToEpochBoundary(5); // the cover's relative epoch 2
+        vm.prank(guardianC);
+        epochs.commitRenewal(address(governor), pid, 3);
+
+        // The ledger genuinely cannot tell the difference: guardianC is in the
+        // approver list with a real share, which is what made the live read a
+        // wrong answer for epoch 0.
+        (address[] memory all, uint256[] memory usd) = ledger.approversOf(address(governor), pid);
+        assertEq(all.length, 3, "the renewal booked under the same proposalId");
+        assertEq(all[2], guardianC);
+        assertGt(usd[2], 0, "and with a non-zero share, so the filter alone cannot exclude it");
+
+        address[] memory zero = epochs.coverersOf(address(governor), pid, 0);
+        assertEq(zero.length, 2, "epoch 0 is the original approvers and nobody else");
+        assertEq(zero[0], guardianA);
+        assertEq(zero[1], guardianB);
+        for (uint256 i = 0; i < zero.length; i++) {
+            assertNotEq(zero[i], guardianC, "guardianC never stood epoch 0's watch");
+        }
+        assertFalse(
+            epochs.isOriginalApprover(address(governor), pid, guardianC), "a renewal is not a retroactive approval"
+        );
+
+        // ...and it is fully liable for the watch it DID stand.
+        address[] memory three = epochs.coverersOf(address(governor), pid, 3);
+        assertEq(three.length, 1);
+        assertEq(three[0], guardianC, "epoch 3 is guardianC's watch");
+    }
+
+    /// @dev THE TEST THAT PROVES THE FIX IS NOT OVER-BROAD, and the reason it is
+    ///      an AND on the original-approver snapshot rather than an exclusion of
+    ///      anyone who renewed. §3.4a is explicit that "incumbent guardians roll
+    ///      over", so `guardianA` — an original approver who ALSO renews — stands
+    ///      TWO watches and answers for both. Excluding renewers would acquit it
+    ///      of epoch 0 and swap one attribution bug for its mirror image.
+    function test_rolledOverIncumbentIsLiableForBothWatches() public {
+        _wireUnderCoveredEpochZeroApprovers();
+        _warpToEpochBoundary(3);
+        _open();
+
+        // The incumbent rolls over, and a newcomer joins the same watch.
+        vm.prank(guardianA);
+        epochs.commitRenewal(address(governor), pid, 1);
+        vm.prank(guardianC);
+        epochs.commitRenewal(address(governor), pid, 1);
+
+        address[] memory zero = epochs.coverersOf(address(governor), pid, 0);
+        assertEq(zero.length, 2, "renewing does not release the incumbent from its own watch");
+        assertEq(zero[0], guardianA, "the rolled-over incumbent still answers for epoch 0");
+        assertEq(zero[1], guardianB);
+
+        address[] memory one = epochs.coverersOf(address(governor), pid, 1);
+        assertEq(one.length, 2, "and for the one it renewed into");
+        assertEq(one[0], guardianA);
+        assertEq(one[1], guardianC);
+
+        assertTrue(epochs.isOriginalApprover(address(governor), pid, guardianA));
+        assertFalse(epochs.isOriginalApprover(address(governor), pid, guardianC));
+    }
+
+    /// @dev The two halves are independent, and the release half is unchanged.
+    ///      `_originalApprover` is snapshotted once and never cleared, so if it
+    ///      REPLACED the live ledger read a released incumbent would be frozen
+    ///      into epoch 0 forever. It is an AND with the live read precisely so a
+    ///      release still drops a guardian out dynamically — the behaviour
+    ///      `test_releasedApproverIsNotACoverer` pins — while the snapshot only
+    ///      ever takes guardians OUT.
+    function test_originalApproverFlagSurvivesAReleaseButCoverageDoesNot() public {
+        _wireUnderCoveredEpochZeroApprovers();
+        _warpToEpochBoundary(3);
+        _open();
+
+        vm.prank(registry);
+        ledger.releaseApproval(address(governor), pid, guardianB);
+
+        assertTrue(
+            epochs.isOriginalApprover(address(governor), pid, guardianB),
+            "the snapshot records where a guardian started, not what it holds now"
+        );
+        address[] memory zero = epochs.coverersOf(address(governor), pid, 0);
+        assertEq(zero.length, 1, "but a zeroed share is still not coverage");
+        assertEq(zero[0], guardianA);
+    }
+
+    /// @dev THE RESIDUAL EXPOSURE, RECORDED RATHER THAN ASSUMED AWAY. This fix
+    ///      does NOT reach `ChallengeGame`: `_accused` routes only NON-ZERO
+    ///      epochs through `coverersOf`, and its epoch-0 branch still reads the
+    ///      ledger directly — so an epoch-0 predicate-5 filing STILL accuses a
+    ///      renewer-only guardian. Closing it needs a change inside
+    ///      `ChallengeGame.sol`, which is outside this change's blast radius.
+    ///
+    ///      Asserting the divergence rather than describing it means whoever
+    ///      lands that change is told by a red test that this note is stale.
+    function test_epochZeroDivergesFromChallengeGameOnceARenewalLands() public {
+        _wireUnderCoveredEpochZeroApprovers();
+        _warpToEpochBoundary(3);
+        _open();
+
+        vm.prank(guardianC);
+        epochs.commitRenewal(address(governor), pid, 1);
+
+        assertEq(epochs.coverersOf(address(governor), pid, 0).length, 2, "this contract has the right answer");
+
+        // The real ChallengeGame, asked the real question, still has the wrong
+        // one. When this stops being true, delete the assertion below and the
+        // caveat on `test_epochZeroCoverersMatchChallengeGameAccused`.
+        address[] memory accused = _accusedOracle(address(governor), pid);
+        assertEq(accused.length, 3, "ChallengeGame's epoch-0 branch still reads the ledger, renewers included");
+        assertEq(accused[2], guardianC, "the renewer-only guardian remains exposed to an epoch-0 filing");
     }
 
     /// @dev `breachEpoch` names the epoch the breach SURFACED on, not the one

@@ -95,6 +95,33 @@ contract CoverageEpochs is Ownable2Step, ICoverageEpochs {
     ///      into the accused set.
     mapping(bytes32 coverKey => mapping(uint256 epoch => mapping(address guardian => bool))) internal _committed;
 
+    /// @dev The proposal's ORIGINAL approvers, snapshotted at `openCover`.
+    ///
+    ///      Load-bearing, and the reason is not obvious. `commitRenewal` books a
+    ///      renewal through `exposureLedger.recordApproval` under the SAME
+    ///      `proposalId`, so a renewer joins `approversOf(governor, proposalId)`
+    ///      with a non-zero share and is indistinguishable, on a live ledger
+    ///      read, from someone who backed the proposal at vote time. Without
+    ///      this snapshot a guardian who first committed at relative epoch 3
+    ///      answers for relative epoch 0 — claims-made attribution inverted, the
+    ///      open-ended liability §3.4a ends arriving from the opposite
+    ///      direction.
+    ///
+    ///      It is an AND, never a replacement for the ledger read (see
+    ///      `coverersOf`), and it does not exclude anyone: §3.4a expects
+    ///      incumbents to roll over, so an original approver who ALSO renews
+    ///      stays liable for BOTH watches. The flag says "was here at open", not
+    ///      "never renewed".
+    ///
+    ///      Populated from the FILTERED set (non-zero `committedUsd`), so a
+    ///      guardian that had already released before the cover opened cannot be
+    ///      readmitted to epoch 0 later by renewing — a renewal would restore
+    ///      its ledger share and the live read alone would let it back in.
+    ///
+    ///      `openCover` cannot miss a renewer's write: `commitRenewal` reverts
+    ///      `NotOpened` until this snapshot exists, so no renewal can precede it.
+    mapping(bytes32 coverKey => mapping(address guardian => bool)) internal _originalApprover;
+
     /// @notice How far ahead of an epoch boundary renewal closes (spec §3.4a).
     /// @dev Default 3 days against the shipped 28-day epoch. The bound in
     ///      `setRenewalLeadTime` is `epochLength / 2`, and `ExposureLedger`'s
@@ -154,6 +181,18 @@ contract CoverageEpochs is Ownable2Step, ICoverageEpochs {
         c.maxDrawdownBps = p.maxDrawdownBps;
         c.baselineNav = nav;
         c.opened = true;
+
+        // Pin WHO the original approvers were, before any renewal can dilute the
+        // answer. `commitRenewal` books through `recordApproval` under this same
+        // `proposalId`, so from here on the ledger's approver list is "approvers
+        // ∪ renewers" and a live read alone can no longer tell relative epoch 0's
+        // watch from a later one. Filtered on a non-zero share for the same
+        // reason `coverersOf` filters: a guardian already released at open backed
+        // nothing, and must not be able to renew its way back into epoch 0.
+        (address[] memory approvers, uint256[] memory committedUsd) = exposureLedger.approversOf(governor, proposalId);
+        for (uint256 i = 0; i < approvers.length; i++) {
+            if (committedUsd[i] != 0) _originalApprover[key][approvers[i]] = true;
+        }
 
         emit CoverOpened(key, governor, proposalId, p.strategy, nav, p.maxDrawdownBps);
     }
@@ -364,39 +403,58 @@ contract CoverageEpochs is Ownable2Step, ICoverageEpochs {
     ///      would be a second chance to read a relative argument as an absolute
     ///      one — the exact bug D8 exists to name.
     function coverersOf(address governor, uint256 proposalId, uint256 epoch) public view returns (address[] memory) {
+        bytes32 key = _coverKey(governor, proposalId);
+
         // Any epoch past the first is covered by its RENEWERS and by nobody
         // else. Falling back to epoch 0's approvers for an unrenewed epoch would
         // reinstate exactly the open-ended liability epochs exist to end, so an
         // empty set is the answer: an unrenewed epoch is a wind-down condition
         // (D6/Task 6), not a liability one.
-        if (epoch != 0) return _coverers[_coverKey(governor, proposalId)][epoch];
+        if (epoch != 0) return _coverers[key][epoch];
 
-        // Relative epoch 0's coverers are the proposal's original approvers,
-        // held by the ledger rather than here — the ledger is the single source
-        // both this contract and `ChallengeGame` read, so there is exactly one
-        // answer to "who backed this proposal".
+        // Relative epoch 0's coverers are the proposal's original approvers, and
+        // the answer takes BOTH tests below — neither alone is correct.
         //
-        // THE FILTER BELOW IS `ChallengeGame._accused`, COPIED. It must stay
-        // that way: Task 7 points predicate 5 at this function, and until then
-        // any divergence means one of the two slashes a guardian the other calls
-        // innocent. `ExposureLedger.releaseApproval` keeps a released guardian
-        // in `_approversOf` with a ZEROED share instead of dropping it (so
-        // callers can see the full historical set), which is why array
-        // membership is not coverage and the non-zero `committedUsd` test is.
+        // 1. THE LIVE LEDGER READ, non-zero `committedUsd`. This is
+        //    `ChallengeGame._accused`'s filter, and it must stay that way:
+        //    `ExposureLedger.releaseApproval` keeps a released guardian in
+        //    `_approversOf` with a ZEROED share instead of dropping it (so
+        //    callers can see the full historical set), which is why array
+        //    membership is not coverage and the non-zero test is. Reading it
+        //    live rather than freezing an array at open is what makes a guardian
+        //    that releases drop out of epoch 0 DYNAMICALLY.
+        //
+        // 2. `_originalApprover`, snapshotted at `openCover`. The live read on
+        //    its own is not "who backed this proposal" any more: `commitRenewal`
+        //    books renewals through `recordApproval` under the SAME
+        //    `proposalId`, so the ledger's list grows to include renewers and a
+        //    guardian whose first commitment was relative epoch 3 would be
+        //    returned as a coverer of relative epoch 0.
+        //
+        // The conjunction is deliberately not "excluded anyone who renewed":
+        // §3.4a expects incumbents to roll over, and a rolled-over incumbent is
+        // liable for its own watch AND its renewed one. Test 2 asks where a
+        // guardian STARTED, never whether it continued.
+        //
         // Two passes because the output length must be known before allocation.
         (address[] memory all, uint256[] memory committedUsd) = exposureLedger.approversOf(governor, proposalId);
         uint256 n;
         for (uint256 i = 0; i < all.length; i++) {
-            if (committedUsd[i] != 0) n++;
+            if (committedUsd[i] != 0 && _originalApprover[key][all[i]]) n++;
         }
         address[] memory out = new address[](n);
         uint256 j;
         for (uint256 i = 0; i < all.length; i++) {
-            if (committedUsd[i] == 0) continue;
+            if (committedUsd[i] == 0 || !_originalApprover[key][all[i]]) continue;
             out[j] = all[i];
             j++;
         }
         return out;
+    }
+
+    /// @inheritdoc ICoverageEpochs
+    function isOriginalApprover(address governor, uint256 proposalId, address guardian) external view returns (bool) {
+        return _originalApprover[_coverKey(governor, proposalId)][guardian];
     }
 
     /// @inheritdoc ICoverageEpochs

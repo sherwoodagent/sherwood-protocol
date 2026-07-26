@@ -131,6 +131,11 @@ interface ICoverageEpochs {
     /// @notice Open the cover for an executed strategy proposal and pin its
     ///         baseline NAV. Permissionless — anyone may pay the gas, and the
     ///         guardians' liability does not depend on who did.
+    /// @dev ALSO SNAPSHOTS THE ORIGINAL APPROVER SET (see `isOriginalApprover`).
+    ///      This is the only moment the ledger can still answer "who backed this
+    ///      proposal" unambiguously: from here on `commitRenewal` adds renewers
+    ///      to the very same approver list, and relative epoch 0's coverers
+    ///      could no longer be told apart from a later watch's.
     /// @dev Reverts `NotExecuted` unless the proposal is `Executed`,
     ///      `NoStrategy` for a queue-only proposal, `AlreadyOpened` on a second
     ///      call, and `NavUnavailable` when the router cannot price the strategy
@@ -346,13 +351,47 @@ interface ICoverageEpochs {
     ///      liability this mechanism ends. An unrenewed epoch is a wind-down
     ///      condition, not a liability condition.
     ///
-    /// @dev Epoch 0 filters the ledger's approvers to a NON-ZERO `committedUsd`,
-    ///      byte for byte as `ChallengeGame._accused` does. A released approver
-    ///      stays in `ExposureLedger._approversOf` with a zeroed share rather
-    ///      than being dropped, so membership of that array is NOT coverage —
-    ///      the filter is. The two definitions must never diverge: one would
-    ///      slash a guardian the other calls innocent.
+    /// @dev Epoch 0 takes TWO tests, and neither alone is correct.
+    ///
+    ///      1. A NON-ZERO `committedUsd` on a LIVE read of the ledger's
+    ///         approvers, the filter `ChallengeGame._accused` also applies. A
+    ///         released approver stays in `ExposureLedger._approversOf` with a
+    ///         zeroed share rather than being dropped, so membership of that
+    ///         array is NOT coverage — the filter is. Reading it live rather
+    ///         than from a frozen array is what makes a released guardian drop
+    ///         out of epoch 0 dynamically.
+    ///
+    ///      2. Membership of the ORIGINAL approver set snapshotted at
+    ///         `openCover`. Test 1 alone is no longer "who backed this
+    ///         proposal": `commitRenewal` books a renewal through
+    ///         `ExposureLedger.recordApproval` under the SAME `proposalId`, so
+    ///         the ledger's list grows to include renewers, and a guardian whose
+    ///         first commitment was relative epoch 3 would otherwise be returned
+    ///         as a coverer of relative epoch 0 — claims-made attribution
+    ///         inverted.
+    ///
+    ///      The conjunction does NOT exclude guardians who renewed. §3.4a lets
+    ///      incumbents roll over, and a rolled-over incumbent is liable for its
+    ///      own watch AND its renewed one; test 2 asks where a guardian STARTED,
+    ///      never whether it continued.
+    ///
+    /// @dev DIVERGES FROM `ChallengeGame._accused` AT EPOCH 0, and knowingly.
+    ///      The game routes only NON-ZERO epochs through this function; its
+    ///      epoch-0 branch still reads the ledger directly and so still counts
+    ///      renewers as epoch-0 approvers. Closing that requires a change inside
+    ///      `ChallengeGame`, not here — a renewer-only guardian remains exposed
+    ///      to an epoch-0 predicate-5 filing until it lands.
     function coverersOf(address governor, uint256 proposalId, uint256 epoch) external view returns (address[] memory);
+
+    /// @notice Whether `guardian` was one of the proposal's ORIGINAL approvers,
+    ///         as snapshotted when the cover opened.
+    /// @dev Half of the epoch-0 answer, exposed because it is otherwise
+    ///      unobservable state that decides who a predicate-5 slash reaches. It
+    ///      is NOT the same question as `coverersOf(.., 0)` membership: this
+    ///      stays true after a release, while the coverer set drops the guardian
+    ///      the moment its ledger share zeroes. False for a cover that was never
+    ///      opened.
+    function isOriginalApprover(address governor, uint256 proposalId, address guardian) external view returns (bool);
 
     /// @notice Whether `guardian` has already committed to cover `epoch`.
     function hasCommittedRenewal(address governor, uint256 proposalId, uint256 epoch, address guardian)
