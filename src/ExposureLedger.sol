@@ -484,7 +484,22 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         // spoken for by its other open approvals, so it cannot back another drain.
         uint256 capUsd = kNumerator * slashableBondUsd(guardian);
         uint256 open = openExposureUsd(guardian);
-        if (open >= capUsd) revert ExposureCapExceeded();
+        // NO FREE BUDGET -> BOOK NOTHING, don't revert (review N1). Reverting
+        // here reverted `voteOnProposal` with it, so a guardian whose budget was
+        // spent on an earlier proposal could not cast an approve vote AT ALL.
+        // That is disenfranchisement, not a cap: it silences the approve side
+        // while Block votes still work, and it made the C1 veto survivable in a
+        // second form — an attacker who front-runs while the cohort is busy
+        // still bricks the proposal, because the guardians who would have
+        // covered it cannot participate.
+        //
+        // The cap itself is unchanged and still binds: this guardian commits
+        // nothing, so the same bond still cannot back two drains. Enforcement
+        // moves to `requireApproveQuorum` at execute, which is already the
+        // enforcement point and fails loudly with the shortfall visible. Same
+        // treatment as the unconfigured feed above, and for the same reason —
+        // failing the coverage is conservative, failing the VOTE is harmful.
+        if (open >= capUsd) return;
         uint256 free = capUsd - open;
 
         uint256 share = free < needUsd ? free : needUsd;

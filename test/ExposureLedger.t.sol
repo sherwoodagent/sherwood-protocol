@@ -486,7 +486,15 @@ contract ExposureLedgerTest is Test {
 
     /// @notice The hard edge of the batching cap: with NO free budget left, an
     ///         approve reverts outright rather than committing zero.
-    function test_recordApproval_noFreeBudgetReverts() public {
+    /// @notice N1 — a spent budget books NOTHING; it does not revert. Reverting
+    ///         took `voteOnProposal` down with it, so a guardian whose budget
+    ///         went on an earlier proposal could not cast an approve vote at
+    ///         all — approve-side silence while Block still worked.
+    ///
+    ///         The cap still binds: nothing is committed, so the same bond
+    ///         cannot back two drains. Enforcement moves to the execute-time
+    ///         quorum, which is already the enforcement point.
+    function test_recordApproval_noFreeBudgetBooksNothingWithoutReverting() public {
         _wireRecording();
         mgov.set(5_000e6); // consumes the entire $5,000 bond
         vm.prank(registry);
@@ -494,8 +502,11 @@ contract ExposureLedgerTest is Test {
         assertEq(ledger.openExposureUsd(guardian), 5_000e18);
 
         vm.prank(registry);
-        vm.expectRevert(IExposureLedger.ExposureCapExceeded.selector);
-        ledger.recordApproval(address(mgov), 2, guardian);
+        ledger.recordApproval(address(mgov), 2, guardian); // must not revert
+
+        // Nothing extra booked -- the cap is intact.
+        assertEq(ledger.openExposureUsd(guardian), 5_000e18, "no second drain backed by the same bond");
+        assertEq(ledger.allocatedUsd(address(mgov), 2, guardian), 0, "carries nothing on the second proposal");
     }
 
     function test_releaseApproval_freesExactRecordedAmount() public {

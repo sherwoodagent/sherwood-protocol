@@ -247,15 +247,26 @@ contract RegistryExposureHookTest is Test {
         assertEq(ledger.openExposureUsd(g1), 0);
     }
 
-    function test_overCapGuardianCannotApprove() public {
-        // Zero the governance WOOD price so g1's slashable bond — and therefore
-        // its free budget — is exactly $0. With no budget left to commit, the
-        // approve vote reverts outright rather than committing a partial share.
+    /// @notice N1 — a guardian with no free budget can still VOTE; it just
+    ///         books no coverage. Previously the hook reverted and took the vote
+    ///         with it, silencing the approve side while Block votes still
+    ///         worked. That is the shape the C1 veto survived in: an attacker
+    ///         who front-runs while the cohort is busy bricks the proposal,
+    ///         because the guardians who would have covered it cannot
+    ///         participate at all.
+    function test_overCapGuardianVotesButBooksNothing() public {
+        // Zero the governance WOOD price so g1's slashable bond -- and its free
+        // budget -- is exactly $0.
         vm.prank(ledgerOwner);
         ledger.setWoodUsdPrice(0);
+
         vm.prank(g1);
-        vm.expectRevert(IExposureLedger.ExposureCapExceeded.selector);
         wired.registry.voteOnProposal(address(wired.gov), PID, IGuardianRegistry.GuardianVoteType.Approve);
+
+        assertEq(ledger.openExposureUsd(g1), 0, "no coverage booked");
+        (address[] memory approvers,,) = wired.registry.getApproverWeights(address(wired.gov), PID);
+        assertEq(approvers.length, 1, "...but the vote itself counted");
+        assertEq(approvers[0], g1);
     }
 
     function test_ledgerUnset_votesUnaffected() public {

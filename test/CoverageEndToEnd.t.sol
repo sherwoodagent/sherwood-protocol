@@ -374,6 +374,46 @@ contract CoverageEndToEndTest is Test {
         return p.reviewEnd - (window * registry.LATE_VOTE_LOCKOUT_BPS()) / 10_000;
     }
 
+    // ── N1: budget exhaustion must not silence the approve side ───────────
+
+    /// @notice N1 (re-review) — a guardian whose budget went on an earlier
+    ///         proposal can still CAST an approve vote on the next one. It
+    ///         books nothing, so the batching cap is untouched, but the vote
+    ///         itself lands.
+    ///
+    ///         Before this, `recordApproval` reverted `ExposureCapExceeded` and
+    ///         took `voteOnProposal` down with it. That is what let the C1 veto
+    ///         survive in a second form: an attacker who front-runs while the
+    ///         cohort is busy still bricks the proposal, because the guardians
+    ///         who would have covered it cannot participate at all.
+    function test_n1_spentBudgetStillVotesAndDoesNotBreakTheReview() public {
+        // Warm-up on syndicate B consumes g3's budget entirely.
+        uint256 pidB = _propose(govB, address(vaultB), agentB);
+        _openReview(govB, pidB);
+        _vote(govB, pidB, g3, IGuardianRegistry.GuardianVoteType.Approve);
+        assertEq(ledger.openExposureUsd(g3), COVERAGE_USD, "g3 fully committed on B");
+
+        // Target proposal on syndicate A, same epoch.
+        uint256 pidA = _propose(govA, address(vaultA), agentA);
+        _openReview(govA, pidA);
+
+        // g3 has nothing left to pledge -- and votes anyway.
+        _vote(govA, pidA, g3, IGuardianRegistry.GuardianVoteType.Approve);
+        assertEq(ledger.allocatedUsd(address(govA), pidA, g3), 0, "books nothing: the cap still binds");
+
+        (address[] memory approvers,,) = registry.getApproverWeights(address(govA), pidA);
+        assertEq(approvers.length, 1, "but the review counted the vote");
+        assertEq(approvers[0], g3);
+
+        // g1 still has budget, so the proposal is genuinely coverable.
+        _vote(govA, pidA, g1, IGuardianRegistry.GuardianVoteType.Approve);
+        assertGt(ledger.openExposureUsd(g1), 0);
+
+        _pastReview(govA, pidA);
+        govA.executeProposal(pidA);
+        assertEq(_state(govA, pidA), uint256(ISyndicateGovernor.ProposalState.Executed), "executes on real coverage");
+    }
+
     // ── Exit gating (ADR 2026-07-26) ──────────────────────────────────────
 
     /// @notice A guardian who is currently insuring a proposal cannot pull
