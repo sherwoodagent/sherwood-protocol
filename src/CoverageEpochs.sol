@@ -68,6 +68,23 @@ contract CoverageEpochs is Ownable2Step, ICoverageEpochs {
 
     mapping(bytes32 coverKey => Cover) internal _covers;
 
+    /// @dev Boundary NAV per epoch. Sparse on purpose: a boundary nobody
+    ///      checkpointed stays EMPTY forever (D4). Back-filling it later with a
+    ///      NAV read today would invent an observation for a period nobody
+    ///      watched, and — once Task 3 stamps `breachEpoch` — would attach the
+    ///      breach to the wrong epoch's coverers, which is the one thing
+    ///      claims-made attribution exists to get right.
+    mapping(bytes32 coverKey => mapping(uint256 epoch => uint256 nav)) internal _nav;
+
+    /// @dev Whether `epoch`'s boundary was checkpointed. Separate from `_nav`
+    ///      because a NAV of zero is a legal reading, and "unobserved" must
+    ///      never be confused with "worthless".
+    mapping(bytes32 coverKey => mapping(uint256 epoch => bool)) internal _checkpointed;
+
+    /// @dev The most recent checkpointed NAV — the numerator of the drawdown.
+    ///      The denominator is always `baselineNav` (D4).
+    mapping(bytes32 coverKey => uint256 nav) internal _lastNav;
+
     /// @param initialOwner    owner of the parameter setters later tasks add
     /// @param priceRouter_    the router the vault's Lane A already trusts
     /// @param exposureLedger_ the ledger `ChallengeGame` reads
@@ -116,7 +133,73 @@ contract CoverageEpochs is Ownable2Step, ICoverageEpochs {
         emit CoverOpened(key, governor, proposalId, p.strategy, nav, p.maxDrawdownBps);
     }
 
+    /// @inheritdoc ICoverageEpochs
+    function checkpoint(address governor, uint256 proposalId) external {
+        bytes32 key = _coverKey(governor, proposalId);
+        Cover storage c = _covers[key];
+        // Before this guard `c.epochLength` is zero and `_epochAt` would panic
+        // on the division; an unopened cover has no schedule to be at a
+        // boundary of.
+        if (!c.opened) revert NotOpened();
+
+        // An epoch's boundary is the START of the following epoch, so the first
+        // boundary this cover can close is `_boundary(c, openEpoch + 1)`. A
+        // cover cannot close an epoch that ended before it existed: one opened
+        // mid-epoch waits for its own epoch's boundary, never back-filling the
+        // epochs the ledger's absolute schedule already ran through.
+        uint256 openEpoch = _epochAt(c, c.openedAt);
+        if (block.timestamp < _boundary(c, openEpoch + 1)) revert BoundaryNotReached();
+
+        // The epoch being closed is the one whose boundary just passed — not a
+        // cursor position. Filing a NAV read today under an older, skipped
+        // epoch would invent an observation for a period nobody watched and
+        // (Task 3) stamp `breachEpoch` with an epoch the breach did not surface
+        // on. D4 is explicit that a missed boundary simply stays uncheckpointed.
+        uint256 due = _epochAt(c, block.timestamp) - 1;
+        if (_checkpointed[key][due]) revert AlreadyCheckpointed();
+
+        // D1: the router, never totalAssets(). A router outage reports a
+        // float-only NAV whose `liveNav` is silently zero — recorded as a
+        // checkpoint that is a ~100% loss, and the epoch's coverers get slashed
+        // over an oracle hiccup. Refuse instead; D6 winds down a cover that
+        // stays unpriceable past the grace window.
+        (uint256 nav, bool ok) = priceRouter.valueStrategy(c.strategy);
+        if (!ok) revert NavUnavailable();
+
+        _nav[key][due] = nav;
+        _checkpointed[key][due] = true;
+        _lastNav[key] = nav;
+        c.lastCheckpointedEpoch = uint64(due);
+
+        emit Checkpointed(key, due, nav, cumulativeLossBps(governor, proposalId));
+    }
+
     // ── Views ──
+
+    /// @inheritdoc ICoverageEpochs
+    function navAt(address governor, uint256 proposalId, uint256 epoch) external view returns (uint256) {
+        return _nav[_coverKey(governor, proposalId)][epoch];
+    }
+
+    /// @inheritdoc ICoverageEpochs
+    function cumulativeLossBps(address governor, uint256 proposalId) public view returns (uint256) {
+        bytes32 key = _coverKey(governor, proposalId);
+        Cover storage c = _covers[key];
+        if (!c.opened || c.baselineNav == 0) return 0;
+        // No checkpoint yet means no observation. `_lastNav` defaults to zero,
+        // and reading that default as a NAV would report a fabricated 100%
+        // drawdown on a cover that has simply never been checkpointed — the
+        // same trap as D1, in view form. `lastCheckpointedEpoch` only ever
+        // names an epoch that was actually recorded, so this is exact even for
+        // a cover whose one checkpoint was epoch 0.
+        if (!_checkpointed[key][c.lastCheckpointedEpoch]) return 0;
+        uint256 last = _lastNav[key];
+        if (last >= c.baselineNav) return 0;
+        // D4: the denominator is the BASELINE, not the previous checkpoint. An
+        // epoch-over-epoch measure would let a missed call re-baseline against
+        // a depressed NAV and read a 30% drawdown as 0%.
+        return ((c.baselineNav - last) * BPS_DENOMINATOR) / c.baselineNav;
+    }
 
     /// @inheritdoc ICoverageEpochs
     function coverOf(address governor, uint256 proposalId) external view returns (Cover memory) {
@@ -160,5 +243,20 @@ contract CoverageEpochs is Ownable2Step, ICoverageEpochs {
     ///      economic-security stack.
     function _coverKey(address governor, uint256 proposalId) internal pure returns (bytes32) {
         return keccak256(abi.encode(governor, proposalId));
+    }
+
+    /// @dev Start of epoch `epoch`, which is also the BOUNDARY of epoch
+    ///      `epoch - 1`. Uses the schedule copied onto the cover at open (D3),
+    ///      never a fresh read of the ledger: a ledger re-point must not
+    ///      retroactively re-slice a live strategy's epochs.
+    function _boundary(Cover storage c, uint256 epoch) internal view returns (uint256) {
+        return uint256(c.epochGenesis) + epoch * uint256(c.epochLength);
+    }
+
+    /// @dev Epoch containing `timestamp` on the cover's copied schedule.
+    ///      Callers must have checked `c.opened`, which is what guarantees a
+    ///      non-zero `epochLength` and a `epochGenesis` in the past.
+    function _epochAt(Cover storage c, uint256 timestamp) internal view returns (uint256) {
+        return (timestamp - uint256(c.epochGenesis)) / uint256(c.epochLength);
     }
 }

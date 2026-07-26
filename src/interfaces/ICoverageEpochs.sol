@@ -130,7 +130,38 @@ interface ICoverageEpochs {
     ///      every later drawdown would otherwise be measured against a fiction).
     function openCover(address governor, uint256 proposalId) external;
 
+    /// @notice Record the boundary NAV of the epoch that has just ended.
+    ///         Permissionless, once per epoch, and only once that epoch's
+    ///         boundary — the START of the following epoch — has passed.
+    /// @dev The recorded epoch is the one whose boundary just closed, NOT a
+    ///      cursor position: a checkpoint taken late must not file a NAV read
+    ///      today under an epoch nobody observed. Per D4 a missed boundary
+    ///      simply stays unrecorded, and cumulative loss keeps measuring from
+    ///      the baseline, so a skipped call cannot launder a drawdown.
+    /// @dev Reverts `NotOpened` without a cover, `BoundaryNotReached` before
+    ///      the first boundary the cover is liable for, `AlreadyCheckpointed`
+    ///      on a second call inside the same epoch, and `NavUnavailable` when
+    ///      the router answers `instantOK == false` (D1 — refusing to act on an
+    ///      unpriceable strategy is the only safe reading; D6 winds such a
+    ///      cover down rather than slashing anyone for a fabricated loss).
+    function checkpoint(address governor, uint256 proposalId) external;
+
     // ── Views ──
+
+    /// @notice The NAV recorded for `epoch`, or zero if that boundary was never
+    ///         checkpointed. Zero is "no observation", never "worthless".
+    function navAt(address governor, uint256 proposalId, uint256 epoch) external view returns (uint256);
+
+    /// @notice Cumulative drawdown from the BASELINE in bps (D4), zero when the
+    ///         last checkpoint sat at or above baseline and zero while no
+    ///         checkpoint has been taken at all.
+    /// @dev Cumulative from baseline, NEVER epoch-over-epoch. Epoch-over-epoch
+    ///      looks natural — you just checkpointed, so compare against last time
+    ///      — and fails silently: if nobody checkpoints during a crash, the next
+    ///      checkpoint re-baselines against the depressed value and a 30%
+    ///      drawdown reads as 0%. Since checkpoints are permissionless and
+    ///      unpaid, that missed call is the expected case, not an edge case.
+    function cumulativeLossBps(address governor, uint256 proposalId) external view returns (uint256);
 
     /// @notice The full cover record for `(governor, proposalId)`.
     function coverOf(address governor, uint256 proposalId) external view returns (Cover memory);

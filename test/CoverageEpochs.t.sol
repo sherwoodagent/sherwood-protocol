@@ -198,4 +198,169 @@ contract CoverageEpochsTest is Test {
         assertFalse(c.breached);
         assertFalse(c.windDown);
     }
+
+    // ── Task 2 helpers ──
+
+    function _open() internal {
+        router.setValue(strategy, BASELINE, true);
+        epochs.openCover(address(governor), pid);
+    }
+
+    /// @dev Absolute boundary of epoch `n` on the ledger's schedule, which the
+    ///      cover copied at open (D3). Always forward of `setUp`'s warp, since
+    ///      `epochGenesis` IS `setUp`'s timestamp — `vm.warp` backwards is a
+    ///      silent no-op and would make these tests pass for the wrong reason.
+    function _warpToEpochBoundary(uint256 n) internal {
+        vm.warp(ledger.epochGenesis() + n * EPOCH_LENGTH);
+    }
+
+    function _key() internal view returns (bytes32) {
+        return epochs.coverKey(address(governor), pid);
+    }
+
+    // ── Task 2 tests ──
+
+    function test_checkpoint_revertsBeforeTheBoundary() public {
+        _open();
+        vm.expectRevert(ICoverageEpochs.BoundaryNotReached.selector);
+        epochs.checkpoint(address(governor), pid);
+    }
+
+    function test_checkpoint_recordsNavAtTheBoundary() public {
+        _open();
+        _warpToEpochBoundary(1);
+        router.setValue(strategy, 900e18, true);
+
+        vm.expectEmit(true, true, true, true);
+        emit ICoverageEpochs.Checkpointed(_key(), 0, 900e18, 1_000);
+        epochs.checkpoint(address(governor), pid);
+
+        assertEq(epochs.navAt(address(governor), pid, 0), 900e18);
+        assertEq(epochs.cumulativeLossBps(address(governor), pid), 1_000, "10% from baseline");
+    }
+
+    function test_checkpoint_cannotRunTwiceForOneEpoch() public {
+        _open();
+        _warpToEpochBoundary(1);
+        epochs.checkpoint(address(governor), pid);
+        vm.expectRevert(ICoverageEpochs.AlreadyCheckpointed.selector);
+        epochs.checkpoint(address(governor), pid);
+    }
+
+    /// @dev D1 again, at the boundary this time. A checkpoint taken while the
+    ///      router is down would record the outage's zero as a ~100% loss and
+    ///      slash the epoch's coverers over an oracle hiccup.
+    function test_checkpoint_revertsWhenTheRouterCannotPrice() public {
+        _open();
+        _warpToEpochBoundary(1);
+        router.setValue(strategy, 0, false);
+        vm.expectRevert(ICoverageEpochs.NavUnavailable.selector);
+        epochs.checkpoint(address(governor), pid);
+    }
+
+    /// @dev D4, THE RULE OF THIS TASK. Checkpoints are permissionless and
+    ///      unpaid, so "nobody called it at the boundary" is the expected case,
+    ///      not an edge case. Miss epoch 0 entirely, checkpoint during epoch 2,
+    ///      and the loss must still read against the ORIGINAL baseline —
+    ///      epoch-over-epoch would re-baseline against the depressed value and
+    ///      launder a 30% drawdown into a 0% one via a call nobody made.
+    function test_checkpoint_missedBoundaryStillMeasuresFromBaseline() public {
+        _open(); // baseline 1_000e18
+        _warpToEpochBoundary(2);
+        router.setValue(strategy, 700e18, true);
+        epochs.checkpoint(address(governor), pid);
+        assertEq(epochs.cumulativeLossBps(address(governor), pid), 3_000);
+    }
+
+    /// @dev D4 with teeth. The plan's missed-boundary test takes ONE
+    ///      checkpoint, so an epoch-over-epoch implementation that falls back
+    ///      to the baseline when there is no prior checkpoint passes it too.
+    ///      Two checkpoints separate the two rules: measured from baseline the
+    ///      loss is 3_000 bps (a breach of the 2_000 envelope); measured
+    ///      epoch-over-epoch it is (850-700)/850 = 1_764 bps and the strategy
+    ///      walks, having lost 30% of the LPs' money in visible steps.
+    function test_cumulativeLossBps_isNotEpochOverEpoch() public {
+        _open(); // baseline 1_000e18
+        _warpToEpochBoundary(1);
+        router.setValue(strategy, 850e18, true);
+        epochs.checkpoint(address(governor), pid);
+        assertEq(epochs.cumulativeLossBps(address(governor), pid), 1_500);
+
+        _warpToEpochBoundary(2);
+        router.setValue(strategy, 700e18, true);
+        epochs.checkpoint(address(governor), pid);
+        assertEq(
+            epochs.cumulativeLossBps(address(governor), pid), 3_000, "from baseline, never from the previous checkpoint"
+        );
+    }
+
+    /// @dev Off-by-one is the likeliest bug here, so pin both sides of the
+    ///      exact second. The boundary of epoch 0 is the START of epoch 1.
+    function test_checkpoint_succeedsExactlyAtTheBoundarySecond() public {
+        _open();
+        vm.warp(ledger.epochGenesis() + EPOCH_LENGTH); // the boundary itself
+        router.setValue(strategy, 950e18, true);
+        epochs.checkpoint(address(governor), pid);
+        assertEq(epochs.navAt(address(governor), pid, 0), 950e18);
+    }
+
+    function test_checkpoint_revertsOneSecondBeforeTheBoundary() public {
+        _open();
+        vm.warp(ledger.epochGenesis() + EPOCH_LENGTH - 1);
+        vm.expectRevert(ICoverageEpochs.BoundaryNotReached.selector);
+        epochs.checkpoint(address(governor), pid);
+    }
+
+    /// @dev D4's labelling half. The NAV recorded at the epoch-2 boundary
+    ///      belongs to epoch 1's watch — the epoch whose boundary just closed.
+    ///      Filing it under epoch 0 (the last cursor position) would fabricate
+    ///      a reading for a period nobody observed and, once Task 3 sets
+    ///      `breachEpoch`, would accuse the wrong epoch's coverers. A missed
+    ///      epoch stays MISSED.
+    function test_checkpoint_recordsUnderTheEpochWhoseBoundaryJustClosed() public {
+        _open();
+        _warpToEpochBoundary(2);
+        router.setValue(strategy, 700e18, true);
+        epochs.checkpoint(address(governor), pid);
+
+        assertEq(epochs.navAt(address(governor), pid, 0), 0, "the skipped epoch stays unrecorded");
+        assertEq(epochs.navAt(address(governor), pid, 1), 700e18, "recorded on the watch that just ended");
+        assertEq(epochs.coverOf(address(governor), pid).lastCheckpointedEpoch, 1);
+    }
+
+    function test_checkpoint_revertsWithoutAnOpenCover() public {
+        _warpToEpochBoundary(1);
+        vm.expectRevert(ICoverageEpochs.NotOpened.selector);
+        epochs.checkpoint(address(governor), pid);
+    }
+
+    /// @dev The view's own fail-closed. `_lastNav` defaults to zero, and
+    ///      reading that default as a NAV would report a fabricated 100%
+    ///      drawdown on a cover that has simply never been checkpointed.
+    function test_cumulativeLossBps_isZeroBeforeAnyCheckpoint() public {
+        _open();
+        assertEq(epochs.cumulativeLossBps(address(governor), pid), 0);
+    }
+
+    function test_checkpoint_navAboveBaselineIsNoLoss() public {
+        _open();
+        _warpToEpochBoundary(1);
+        router.setValue(strategy, 1_200e18, true);
+        epochs.checkpoint(address(governor), pid);
+        assertEq(epochs.cumulativeLossBps(address(governor), pid), 0, "a gain is not a negative loss");
+        assertEq(epochs.navAt(address(governor), pid, 0), 1_200e18);
+    }
+
+    /// @dev Task 2 records; it does not judge. A loss inside the declared
+    ///      envelope must leave the breach flags alone — Task 3 owns them.
+    function test_checkpoint_insideTheEnvelopeTouchesNoBreachFlag() public {
+        _open(); // envelope 2_000 bps
+        _warpToEpochBoundary(1);
+        router.setValue(strategy, 950e18, true); // 500 bps, well inside
+        epochs.checkpoint(address(governor), pid);
+
+        ICoverageEpochs.Cover memory c = epochs.coverOf(address(governor), pid);
+        assertFalse(c.breached);
+        assertEq(c.breachEpoch, 0);
+    }
 }
