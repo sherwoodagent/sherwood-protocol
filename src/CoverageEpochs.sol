@@ -102,6 +102,14 @@ contract CoverageEpochs is Ownable2Step, ICoverageEpochs {
     ///      at launch), so this default can never start out of bounds.
     uint256 public renewalLeadTime = 3 days;
 
+    /// @notice How long a missed boundary checkpoint may be retried before the
+    ///         cover is wound down (D6).
+    /// @dev Default 7 days against the shipped 28-day epoch. The bound in
+    ///      `setCheckpointGrace` is `epochLength` exclusive, and `ExposureLedger`
+    ///      already forces `epochLength >= challengeWindow` (14 days at launch),
+    ///      so this default can never start out of bounds.
+    uint256 public checkpointGrace = 7 days;
+
     /// @param initialOwner    owner of the parameter setters later tasks add
     /// @param priceRouter_    the router the vault's Lane A already trusts
     /// @param exposureLedger_ the ledger `ChallengeGame` reads
@@ -273,6 +281,75 @@ contract CoverageEpochs is Ownable2Step, ICoverageEpochs {
         return _coverers[_coverKey(governor, proposalId)][epoch];
     }
 
+    // ── Forced wind-down ──
+
+    /// @inheritdoc ICoverageEpochs
+    /// @dev §3.4a's clearinghouse close-out rule: expiring coverage converts into
+    ///      an orderly exit, never a gap.
+    ///
+    ///      D7 — THIS SEIZES NOTHING AND MOVES NO FUNDS. It writes one bool. All
+    ///      the unwinding is done by `SyndicateGovernor`'s existing settlement
+    ///      path, which the flag makes permissionlessly callable ahead of
+    ///      `strategyDuration`. There is deliberately no transfer surface here to
+    ///      make that impossible to get wrong later.
+    ///
+    ///      D8 — EVERY INDEX BELOW IS COVER-RELATIVE while every boundary stays
+    ///      on the ledger's global grid. The plan's own sketch read `_epochAt`
+    ///      (absolute) as the epoch now beginning and `_boundary` (absolute) as
+    ///      its start; both are wrong here and neither reverts. An absolute
+    ///      `nowEpoch` would look up `_coverers` under an index no renewal was
+    ///      ever filed at, so a fully covered strategy would wind down; it would
+    ///      also read `_checkpointed` under an index no checkpoint is ever filed
+    ///      at, so a cover checkpointed on time would go stale anyway; and it
+    ///      would never be zero for a cover opened in a non-zero absolute epoch,
+    ///      so the `BoundaryNotReached` guard would stop guarding.
+    function flagWindDown(address governor, uint256 proposalId) external {
+        bytes32 key = _coverKey(governor, proposalId);
+        Cover storage c = _covers[key];
+        // Before this guard `c.epochLength` is zero and `_epochAt` panics on the
+        // division; an unopened cover has nothing to unwind.
+        if (!c.opened) revert NotOpened();
+        // Latching. Re-flagging changes nothing on-chain but would emit a second
+        // `WindDownFlagged` for the same cover, and watchtowers key off it.
+        if (c.windDown) revert AlreadyWoundDown();
+
+        uint256 nowEpoch = _relativeEpoch(c, block.timestamp);
+        // Relative epoch 0 is the watch the cover OPENED on. No boundary has
+        // passed, so there is no epoch "now beginning" that could be uncovered
+        // and no closed epoch that could be stale. The subtraction below would
+        // also underflow.
+        if (nowEpoch == 0) revert BoundaryNotReached();
+
+        // Trigger 1. Nobody stood the watch that just began. `coverersOf` answers
+        // with an EMPTY set for such an epoch instead of falling back to relative
+        // epoch 0's approvers — re-accusing them for a watch nobody stood is
+        // exactly the open-ended liability §3.4a ends — so the state has to land
+        // somewhere, and it lands here. Read from `_coverers` rather than
+        // `coverersOf` because relative epoch 0's answer comes from the ledger
+        // and can never be the epoch now BEGINNING.
+        bool uncovered = _coverers[key][nowEpoch].length == 0;
+
+        // Trigger 2 (D6). A strategy whose value cannot be established cannot be
+        // underwritten. `checkpoint` fails closed on `instantOK == false` (D1),
+        // so a router outage leaves the closed epoch unrecorded; the grace is the
+        // window in which that call may still be retried. Strictly `>` so the
+        // last second of the grace is still inside it. `_globalBoundary(c,
+        // nowEpoch)` is where the closed epoch ENDED — the same conversion
+        // `renewalDeadline` uses, so the two can never drift apart.
+        bool stale =
+            !_checkpointed[key][nowEpoch - 1] && block.timestamp > _globalBoundary(c, nowEpoch) + checkpointGrace;
+
+        if (!uncovered && !stale) revert StillCovered();
+
+        c.windDown = true;
+        emit WindDownFlagged(key, nowEpoch, uncovered, stale);
+    }
+
+    /// @inheritdoc ICoverageEpochs
+    function windDownRequired(address governor, uint256 proposalId) external view returns (bool) {
+        return _covers[_coverKey(governor, proposalId)].windDown;
+    }
+
     // ── Claims-made attribution ──
 
     /// @inheritdoc ICoverageEpochs
@@ -341,6 +418,20 @@ contract CoverageEpochs is Ownable2Step, ICoverageEpochs {
         if (newLeadTime == 0 || newLeadTime > exposureLedger.epochLength() / 2) revert InvalidParameter();
         emit RenewalLeadTimeSet(renewalLeadTime, newLeadTime);
         renewalLeadTime = newLeadTime;
+    }
+
+    /// @inheritdoc ICoverageEpochs
+    function setCheckpointGrace(uint256 newGrace) external onlyOwner {
+        // Strictly below an epoch. At or beyond `epochLength` the NEXT boundary
+        // always arrives before the grace expires, `nowEpoch` advances, and the
+        // stale test moves to a different (also un-elapsed) epoch — D6 would be
+        // silently deleted rather than merely loosened. Read live for the same
+        // reason `setRenewalLeadTime` does: this is one global parameter and
+        // `ExposureLedger.epochLength` is immutable, so there is no per-cover
+        // schedule to pin per D3.
+        if (newGrace == 0 || newGrace >= exposureLedger.epochLength()) revert InvalidParameter();
+        emit CheckpointGraceSet(checkpointGrace, newGrace);
+        checkpointGrace = newGrace;
     }
 
     // ── Views ──

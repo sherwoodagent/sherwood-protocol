@@ -42,7 +42,8 @@ import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 ///                                        46 _proposalCount ... 58 _tierRegistry
 ///                                        59 _exposureLedger (Plan B)
 ///                                        60 _bondEscrow (Plan B)
-///                                        61..91 __gap[31]
+///                                        61 _coverageEpochs (Plan F)
+///                                        62..91 __gap[30]
 contract GovernorLayoutPinsTest is Test {
     SyndicateGovernor governor;
     MockRegistryMinimal guardianRegistry;
@@ -52,6 +53,7 @@ contract GovernorLayoutPinsTest is Test {
     address constant TIER_REGISTRY_SENTINEL = address(0xB1);
     address constant EXPOSURE_LEDGER_SENTINEL = address(0xB2);
     address constant BOND_ESCROW_SENTINEL = address(0xB3);
+    address constant COVERAGE_EPOCHS_SENTINEL = address(0xC1);
     address owner = makeAddr("owner");
 
     uint256 constant VOTING_PERIOD = 1 days;
@@ -153,5 +155,25 @@ contract GovernorLayoutPinsTest is Test {
 
         // The Plan B appends must not have disturbed the slot below them.
         assertEq(_slot(58), bytes32(uint256(uint160(address(0)))), "slot 58 untouched by Plan B writes");
+    }
+
+    /// @notice Plan F append: `_coverageEpochs` was carved from the FRONT of
+    ///         `__gap` (31 → 30), so it must land at 61 — immediately after
+    ///         `_bondEscrow` (60) — and leave every pre-existing slot untouched.
+    ///         This governor sits behind a BEACON: an insert rather than an
+    ///         append would re-point every live governor's `_bondEscrow` and
+    ///         `_exposureLedger` on the next `upgradeTo`.
+    function test_layout_planFFieldPinned() public {
+        assertEq(_slot(61), bytes32(0), "slot 61 starts unset");
+
+        // This test is the factory, so it may call the onlyFactory setter.
+        governor.setCoverageEpochs(COVERAGE_EPOCHS_SENTINEL);
+
+        assertEq(_slot(61), bytes32(uint256(uint160(COVERAGE_EPOCHS_SENTINEL))), "slot 61: _coverageEpochs");
+        assertEq(governor.coverageEpochs(), COVERAGE_EPOCHS_SENTINEL);
+
+        // The Plan F append must not have disturbed the Plan B slots below it.
+        assertEq(_slot(59), bytes32(0), "slot 59 untouched by the Plan F write");
+        assertEq(_slot(60), bytes32(0), "slot 60 untouched by the Plan F write");
     }
 }

@@ -70,6 +70,23 @@ contract MockFeed {
     }
 }
 
+/// @dev `CoverageEpochs` stub for the wind-down settle gate (Plan F Task 6). The
+///      governor reads exactly one bit off it, so dragging the real epoch
+///      machinery in here would test how the flag came to be set rather than the
+///      GATE, which is what this file owns. Keyed exactly as `CoverageEpochs`
+///      keys covers, so a mis-keyed read on the governor side would surface.
+contract MockCoverageEpochs {
+    mapping(bytes32 coverKey => bool) internal _wound;
+
+    function setWindDown(address governor, uint256 proposalId, bool required) external {
+        _wound[keccak256(abi.encode(governor, proposalId))] = required;
+    }
+
+    function windDownRequired(address governor, uint256 proposalId) external view returns (bool) {
+        return _wound[keccak256(abi.encode(governor, proposalId))];
+    }
+}
+
 /// @dev Escrow auth surface (separate from the governor's guardian registry):
 ///      the escrow only reads `isAuthorizedGovernor`.
 contract MockEscrowAuth {
@@ -118,6 +135,10 @@ contract GovernorCoverageGatesTest is Test {
     address public agent2 = makeAddr("agent2");
     address public coAgent = makeAddr("coAgent");
     address public lp1 = makeAddr("lp1");
+    /// @dev Neither proposer nor factory: the caller the settle gate exists to
+    ///      hold off until `strategyDuration` — and to let through immediately
+    ///      once the cover is wound down (Plan F Task 6).
+    address public stranger = makeAddr("stranger");
 
     uint256 constant VOTING_PERIOD = 1 days;
     uint256 constant EXECUTION_WINDOW = 1 days;
@@ -654,7 +675,6 @@ contract GovernorCoverageGatesTest is Test {
         uint256 pid = _proposeSolo(governor, address(vault), agent, 1_000e6);
         vm.prank(agent);
         governor.cancelProposal(pid);
-        address stranger = makeAddr("stranger");
         uint256 agentBefore = wood.balanceOf(agent);
         vm.prank(stranger);
         governor.reclaimProposerBond(pid);
@@ -727,6 +747,133 @@ contract GovernorCoverageGatesTest is Test {
         governor.cancelProposal(pid);
         vm.expectRevert(ISyndicateGovernor.NoBondToReclaim.selector);
         governor.reclaimProposerBond(pid);
+    }
+
+    // ── Plan F Task 6: settle honours the wind-down flag (spec §3.4a) ──
+
+    /// @dev Drive a proposal all the way to Executed on the wired governor. The
+    ///      strategy runs 7 days, so every settle assertion below sits well
+    ///      inside `strategyDuration` — which is the whole point: wind-down must
+    ///      not have to wait for a term nobody is underwriting.
+    function _executedProposal() internal returns (uint256 pid) {
+        pid = _proposeSolo(governor, address(vault), agent, 1_000e6);
+        address[] memory gs = new address[](1);
+        gs[0] = makeAddr("g1");
+        _seatApprovers(pid, gs, 20_000e18);
+        _toApproved(pid);
+        governor.executeProposal(pid);
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Executed));
+    }
+
+    /// @notice §3.4a. A strategy nobody renewed — or one whose NAV cannot be
+    ///         established — unwinds at the boundary instead of running uncovered
+    ///         to term. The flag makes settle permissionless IMMEDIATELY: not
+    ///         proposer-only, and not after `strategyDuration`.
+    function test_settleProposal_isPermissionlessOnceWoundDown() public {
+        uint256 pid = _executedProposal();
+
+        MockCoverageEpochs epochs = new MockCoverageEpochs();
+        governor.setCoverageEpochs(address(epochs)); // test contract is the factory
+        epochs.setWindDown(address(governor), pid, true);
+
+        // No warp at all: still inside the 1h even a PROPOSER would have to wait.
+        vm.prank(stranger);
+        governor.settleProposal(pid);
+
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
+    }
+
+    /// @notice The gate is unchanged for a wired-but-healthy cover. Wind-down is
+    ///         the exception, not a new default.
+    function test_settleProposal_stillGatedWhenWiredButNotWoundDown() public {
+        uint256 pid = _executedProposal();
+
+        MockCoverageEpochs epochs = new MockCoverageEpochs();
+        governor.setCoverageEpochs(address(epochs));
+        assertFalse(epochs.windDownRequired(address(governor), pid));
+
+        vm.prank(stranger);
+        vm.expectRevert(ISyndicateGovernor.StrategyDurationNotElapsed.selector);
+        governor.settleProposal(pid);
+
+        // ...and the proposer's own 1h wait is untouched too.
+        vm.prank(agent);
+        vm.expectRevert(ISyndicateGovernor.StrategyDurationNotElapsed.selector);
+        governor.settleProposal(pid);
+    }
+
+    /// @notice THE NULL-SAFETY TEST. `_coverageEpochs == address(0)` must leave
+    ///         today's behaviour EXACTLY as it was — proposer after 1h, anyone
+    ///         after `strategyDuration` — because every governor already deployed
+    ///         is in that state and the flag is wired in later, if at all.
+    function test_settleProposal_unwiredGovernorBehavesExactlyAsToday() public {
+        uint256 pid = _executedProposal();
+        assertEq(governor.coverageEpochs(), address(0), "unwired is the pre-Plan-F default");
+
+        // A stranger before `strategyDuration`: refused.
+        vm.prank(stranger);
+        vm.expectRevert(ISyndicateGovernor.StrategyDurationNotElapsed.selector);
+        governor.settleProposal(pid);
+
+        // The proposer inside its 1h floor: refused.
+        vm.prank(agent);
+        vm.expectRevert(ISyndicateGovernor.StrategyDurationNotElapsed.selector);
+        governor.settleProposal(pid);
+
+        // The proposer after the 1h floor: allowed, as before Plan F.
+        vm.warp(vm.getBlockTimestamp() + 1 hours + 1);
+        vm.prank(agent);
+        governor.settleProposal(pid);
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
+    }
+
+    /// @notice An unwired governor also lets ANYONE settle once `strategyDuration`
+    ///         has elapsed — the other half of "exactly unchanged".
+    function test_settleProposal_unwiredStrangerAfterStrategyDuration() public {
+        uint256 pid = _executedProposal();
+        vm.warp(vm.getBlockTimestamp() + 7 days + 1);
+        vm.prank(stranger);
+        governor.settleProposal(pid);
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
+    }
+
+    /// @notice Wind-down drops the CALLER/TIMING gate and nothing else. A
+    ///         proposal that is not Executed still cannot be settled, so a flag
+    ///         set against a settled cover cannot double-settle it.
+    function test_settleProposal_woundDownStillRequiresExecutedState() public {
+        uint256 pid = _executedProposal();
+
+        MockCoverageEpochs epochs = new MockCoverageEpochs();
+        governor.setCoverageEpochs(address(epochs));
+        epochs.setWindDown(address(governor), pid, true);
+
+        vm.prank(stranger);
+        governor.settleProposal(pid);
+
+        vm.prank(stranger);
+        vm.expectRevert(ISyndicateGovernor.ProposalNotExecuted.selector);
+        governor.settleProposal(pid);
+    }
+
+    /// @notice Factory-only wiring, mirroring `setExposureLedger` /
+    ///         `setBondEscrow`: `CoverageEpochs` is a protocol-wide singleton, so
+    ///         a per-vault owner must not be able to point its governor at an
+    ///         arbitrary contract that declares its own strategies uninsurable.
+    function test_setCoverageEpochs_isFactoryOnlyAndEmits() public {
+        MockCoverageEpochs epochs = new MockCoverageEpochs();
+
+        vm.prank(stranger);
+        vm.expectRevert(ISyndicateGovernor.NotFactory.selector);
+        governor.setCoverageEpochs(address(epochs));
+
+        vm.expectEmit(true, true, true, true);
+        emit ISyndicateGovernor.CoverageEpochsSet(address(0), address(epochs));
+        governor.setCoverageEpochs(address(epochs)); // test contract IS the factory
+        assertEq(governor.coverageEpochs(), address(epochs));
+
+        // address(0) un-wires, restoring the pre-Plan-F settle gate.
+        governor.setCoverageEpochs(address(0));
+        assertEq(governor.coverageEpochs(), address(0));
     }
 }
 

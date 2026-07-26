@@ -175,8 +175,14 @@
       "type": "t_address"
     },
     {
-      "label": "__gap",
+      "label": "_coverageEpochs",
       "slot": "61",
+      "offset": 0,
+      "type": "t_address"
+    },
+    {
+      "label": "__gap",
+      "slot": "62",
       "offset": 0,
       "type": "t_array(t_uint256)_storage"
     }

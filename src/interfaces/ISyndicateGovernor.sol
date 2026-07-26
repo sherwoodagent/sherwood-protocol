@@ -27,7 +27,9 @@ interface ISyndicateGovernor {
     ///                                         this optimistic model)
     ///        Approved       → Expired         time (executeBy passes)
     ///        Executed       → Settled         settleProposal (proposer any time after
-    ///                                         1h; anyone after strategyDuration) — or
+    ///                                         1h; anyone after strategyDuration; ANYONE
+    ///                                         immediately once coverageEpochs() reports
+    ///                                         windDownRequired — spec §3.4a) — or
     ///                                         the REGISTRY-driven emergency-settle path
     ///                                         (unstick → finalizeEmergencySettle)
     ///        Draft/Pending/GuardianReview/Approved → Cancelled
@@ -392,6 +394,9 @@ interface ISyndicateGovernor {
     /// @notice Proposer bond escrow wired (or un-wired, newEscrow == address(0)) — Plan B.
     event BondEscrowSet(address indexed oldEscrow, address indexed newEscrow);
 
+    /// @notice Coverage epochs wired (or un-wired, newEpochs == address(0)) — Plan F.
+    event CoverageEpochsSet(address indexed oldEpochs, address indexed newEpochs);
+
     /// @notice Emitted in `_distributeFees` when `guardianFeeBps > 0`.
     ///         Guardian fee is carved from gross PnL and transferred to
     ///         `recipient` (the team `guardiansFeeRecipient` multisig). This is
@@ -430,6 +435,18 @@ interface ISyndicateGovernor {
 
     function executeProposal(uint256 proposalId) external;
 
+    /// @notice Settle an executed strategy: run the pre-committed settlement
+    ///         calls and distribute P&L.
+    /// @dev Caller/timing gate: the proposer may settle 1h after execution,
+    ///      anyone else after `strategyDuration` — UNLESS a wired
+    ///      `coverageEpochs()` reports `windDownRequired`, in which case settle
+    ///      is permissionless immediately (spec §3.4a). A strategy nobody renewed
+    ///      or one whose NAV cannot be established is uninsurable, and must not
+    ///      have to run its full term with no guardian answerable for it.
+    ///      Wind-down drops the caller/timing gate and NOTHING else: the proposal
+    ///      must still be `Executed`, and the settlement calls still run under the
+    ///      proposal's `maxCapital` cap. An unwired `coverageEpochs()` leaves this
+    ///      gate exactly as it was before Plan F.
     function settleProposal(uint256 proposalId) external;
 
     // ── Guardian-review emergency settle lifecycle ──
@@ -495,6 +512,19 @@ interface ISyndicateGovernor {
     ///      (`StrategyProposal.proposerBondEscrow`), so re-pointing is safe for
     ///      existing proposals; a new escrow applies only to future ones.
     function setBondEscrow(address newEscrow) external;
+    /// @notice Wire the coverage-epochs contract (Plan F, spec §3.4a).
+    ///         Factory-only. address(0) un-wires: `settleProposal` reverts to
+    ///         "proposer after 1h, anyone after `strategyDuration`" exactly as
+    ///         before Plan F — the pre-epochs safe default.
+    /// @dev Factory-scoped rather than vault-owner-scoped on purpose:
+    ///      `CoverageEpochs` is a protocol-wide singleton (the same instance
+    ///      `ChallengeGame` attributes predicate-5 liability through), and a
+    ///      vault owner able to point its own governor at an arbitrary contract
+    ///      could declare its strategies wound down and hand every proposal a
+    ///      permissionless early settle.
+    /// @dev Non-custodial: this slot is read one bool at a time and never holds
+    ///      value, so re-pointing it is safe for live proposals.
+    function setCoverageEpochs(address newEpochs) external;
 
     /// @notice Permissionless: return the proposer bond once the proposal has
     ///         reached a terminal state (spec §3.9).
@@ -564,6 +594,10 @@ interface ISyndicateGovernor {
 
     /// @notice Address of the proposer bond escrow (zero if not wired — no bond).
     function bondEscrow() external view returns (address);
+
+    /// @notice Address of the coverage-epochs contract (zero if not wired — the
+    ///         pre-Plan-F settle gate applies unchanged).
+    function coverageEpochs() external view returns (address);
 
     /// @notice MAX tier across the proposal's execute calls, resolved at
     ///         propose time (spec §3.2). Returns 0 for a nonexistent

@@ -279,6 +279,53 @@ interface ICoverageEpochs {
         view
         returns (address[] memory);
 
+    // ── Forced wind-down (spec §3.4a, D6/D7) ──
+
+    /// @notice Flag a cover for wind-down. Permissionless: §3.4a's close-out is a
+    ///         property of the schedule, not a privilege, and whoever notices the
+    ///         lapse first may record it.
+    ///
+    ///         Two INDEPENDENT triggers, either of which is sufficient:
+    ///
+    ///         1. UNCOVERED — a boundary passed and nobody committed renewal for
+    ///            the epoch now beginning. `coverersOf` deliberately answers with
+    ///            an EMPTY set for such an epoch rather than falling back to the
+    ///            original approvers: re-accusing guardians for a watch nobody
+    ///            stood is precisely the open-ended liability §3.4a ends. So an
+    ///            unrenewed epoch is a WIND-DOWN condition, never a liability one,
+    ///            and this is where it goes.
+    ///         2. STALE (D6) — `checkpointGrace` expired with no successful
+    ///            checkpoint of the epoch that just closed. A strategy whose value
+    ///            cannot be established cannot be underwritten, and carrying on
+    ///            uncovered is exactly the gap §3.4a exists to prevent. The cover
+    ///            unwinds; it is never slashed for the fabricated ~100% loss a
+    ///            router outage would otherwise report (D1).
+    ///
+    /// @dev D7 — THIS SEIZES NOTHING. It sets one flag. The implementation holds
+    ///      no tokens and moves no funds on this path or any other; the unwinding
+    ///      is done by the settlement path that already exists in
+    ///      `SyndicateGovernor`, which the flag makes permissionlessly callable
+    ///      ahead of `strategyDuration`.
+    /// @dev Every index it reads is COVER-RELATIVE (D8) while the boundaries it
+    ///      compares against stay on the ledger's global grid.
+    /// @dev Reverts `NotOpened` without a cover, `AlreadyWoundDown` on a second
+    ///      call, `BoundaryNotReached` while the cover is still inside its own
+    ///      relative epoch 0 (no boundary has passed, so nothing can have lapsed),
+    ///      and `StillCovered` when the epoch now beginning has coverers and the
+    ///      closed epoch was either checkpointed or is still inside its grace.
+    function flagWindDown(address governor, uint256 proposalId) external;
+
+    /// @notice Whether this cover has been flagged for wind-down. False for a
+    ///         cover that does not exist — there is nothing to unwind.
+    /// @dev The single bit `SyndicateGovernor.settleProposal` reads to drop its
+    ///      caller/timing gate.
+    function windDownRequired(address governor, uint256 proposalId) external view returns (bool);
+
+    /// @notice How long a missed boundary checkpoint may be retried before the
+    ///         cover is wound down (D6). Owner-set, default 7 days, bounded
+    ///         `(0, epochLength)`.
+    function checkpointGrace() external view returns (uint256);
+
     // ── Claims-made attribution (spec §3.4a) ──
 
     /// @notice Who is liable for a breach that surfaced in COVER-RELATIVE
@@ -326,6 +373,16 @@ interface ICoverageEpochs {
     ///      commit against badly stale information, which is a different failure
     ///      rather than a stronger defence: see `renewalDeadline`.
     function setRenewalLeadTime(uint256 newLeadTime) external;
+
+    /// @notice Set how long a missed boundary checkpoint may be retried before
+    ///         the cover winds down (D6).
+    /// @dev Bounded `(0, epochLength)`. Strictly BELOW an epoch: a grace at or
+    ///      past `epochLength` means the next boundary always arrives before the
+    ///      grace expires, so the stale trigger could never fire and D6 would be
+    ///      silently deleted. Zero is refused for the mirror-image reason —
+    ///      checkpoints are permissionless and unpaid, so a zero grace would wind
+    ///      a healthy cover down over one late transaction.
+    function setCheckpointGrace(uint256 newGrace) external;
 
     /// @notice The key covers are stored under, mirroring
     ///         `ChallengeGame._reviewKey` so one proposal has one identity

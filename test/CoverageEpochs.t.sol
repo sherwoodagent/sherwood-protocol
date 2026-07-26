@@ -1082,4 +1082,220 @@ contract CoverageEpochsTest is Test {
         assertEq(epochs.breachEpochOf(address(governor), pid), 0);
         assertFalse(epochs.breached(address(governor), pid));
     }
+
+    // ── Task 6 tests: forced wind-down (D6/D7) ──
+    //
+    // Every cover here opens in a NON-ZERO absolute epoch. `flagWindDown` reads
+    // three cover-relative indices — the epoch now beginning, its coverer list,
+    // and the checkpoint flag of the epoch that just closed — against boundaries
+    // that stay on the ledger's GLOBAL grid (D8). A fixture that opened in
+    // absolute epoch 0 makes the two readings identical and is blind to the
+    // whole bug class.
+
+    /// @dev Trigger 1. A boundary passed and nobody committed renewal for the
+    ///      epoch now beginning. Task 5 made `coverersOf` return an EMPTY set for
+    ///      such an epoch rather than falling back to the original approvers —
+    ///      re-accusing them for a watch nobody stood is exactly the open-ended
+    ///      liability §3.4a ends. This is where that state goes instead.
+    function test_windDown_flaggedWhenNobodyRenewed() public {
+        _warpToEpochBoundary(3);
+        _open();
+
+        _warpToEpochBoundary(4); // the cover's RELATIVE epoch 1 begins
+        assertEq(epochs.relativeEpochNow(address(governor), pid), 1);
+
+        vm.expectEmit(true, true, true, true);
+        emit ICoverageEpochs.WindDownFlagged(_key(), 1, true, false);
+        vm.prank(stranger); // permissionless
+        epochs.flagWindDown(address(governor), pid);
+
+        assertTrue(epochs.windDownRequired(address(governor), pid));
+        // D7: the flag is the whole effect. Nothing was seized, nothing moved.
+        assertEq(epochs.coverOf(address(governor), pid).baselineNav, BASELINE);
+        assertFalse(epochs.breached(address(governor), pid));
+    }
+
+    /// @dev D8, AND the reason this suite opens in absolute epoch 3. The renewal
+    ///      was committed for the cover's RELATIVE epoch 1; an implementation
+    ///      that read the epoch now beginning as the ledger's ABSOLUTE 4 would
+    ///      find an empty coverer list and wind a fully covered strategy down.
+    function test_windDown_refusedWhileCoverageExists() public {
+        _wireEpochZeroApprovers();
+        _warpToEpochBoundary(3);
+        _open();
+
+        vm.prank(guardianC);
+        epochs.commitRenewal(address(governor), pid, 1);
+
+        _warpToEpochBoundary(4);
+        vm.expectRevert(ICoverageEpochs.StillCovered.selector);
+        epochs.flagWindDown(address(governor), pid);
+        assertFalse(epochs.windDownRequired(address(governor), pid));
+    }
+
+    /// @dev Trigger 2 (D6). A strategy whose value cannot be established cannot
+    ///      be underwritten. The checkpoint is retried inside the grace and fails
+    ///      closed (D1); once the grace expires the cover unwinds — it is NEVER
+    ///      slashed for the fabricated ~100% loss a router outage would report.
+    function test_windDown_flaggedWhenNavStaysUnavailablePastTheGrace() public {
+        _wireEpochZeroApprovers();
+        _warpToEpochBoundary(3);
+        _open();
+
+        vm.prank(guardianC);
+        epochs.commitRenewal(address(governor), pid, 1); // fully covered...
+
+        _warpToEpochBoundary(4);
+        router.setValue(strategy, 0, false); // ...but unpriceable
+        vm.expectRevert(ICoverageEpochs.NavUnavailable.selector);
+        epochs.checkpoint(address(governor), pid);
+
+        uint256 grace = epochs.checkpointGrace();
+        vm.warp(vm.getBlockTimestamp() + grace + 1);
+
+        vm.expectEmit(true, true, true, true);
+        emit ICoverageEpochs.WindDownFlagged(_key(), 1, false, true);
+        epochs.flagWindDown(address(governor), pid);
+
+        assertTrue(epochs.windDownRequired(address(governor), pid));
+        assertFalse(epochs.breached(address(governor), pid), "an unpriceable strategy winds down, never breaches");
+    }
+
+    /// @dev The grace is a window, not a formality: inside it the checkpoint may
+    ///      still be retried, so the flag must not arm. Pinned at the exact
+    ///      second — `>` means `boundary + grace` is still inside.
+    function test_windDown_staleIsNotArmedAtTheLastGraceSecond() public {
+        _wireEpochZeroApprovers();
+        _warpToEpochBoundary(3);
+        _open();
+
+        vm.prank(guardianC);
+        epochs.commitRenewal(address(governor), pid, 1);
+
+        _warpToEpochBoundary(4);
+        uint256 grace = epochs.checkpointGrace();
+        vm.warp(vm.getBlockTimestamp() + grace);
+
+        vm.expectRevert(ICoverageEpochs.StillCovered.selector);
+        epochs.flagWindDown(address(governor), pid);
+    }
+
+    /// @dev D8 on the OTHER index. Checkpoints are filed under COVER-RELATIVE
+    ///      epochs, so the staleness test must read the relative epoch that just
+    ///      closed (0), not the absolute one (3). Reading absolutely would find
+    ///      `_checkpointed[key][3]` false forever and wind down a cover that was
+    ///      checkpointed on time, purely because the grace elapsed.
+    function test_windDown_staleIsNotArmedAfterASuccessfulCheckpoint() public {
+        _wireEpochZeroApprovers();
+        _warpToEpochBoundary(3);
+        _open();
+
+        vm.prank(guardianC);
+        epochs.commitRenewal(address(governor), pid, 1);
+
+        _warpToEpochBoundary(4);
+        router.setValue(strategy, 950e18, true);
+        epochs.checkpoint(address(governor), pid);
+        assertEq(epochs.navAt(address(governor), pid, 0), 950e18, "filed under the cover's relative epoch 0");
+
+        uint256 grace = epochs.checkpointGrace();
+        vm.warp(vm.getBlockTimestamp() + grace + 1);
+
+        vm.expectRevert(ICoverageEpochs.StillCovered.selector);
+        epochs.flagWindDown(address(governor), pid);
+    }
+
+    /// @dev Relative epoch 0 is the watch the cover opened on: no boundary has
+    ///      passed, so there is no epoch "now beginning" to be uncovered and no
+    ///      closed epoch to be stale. An ABSOLUTE reading would see epoch 3 here
+    ///      and wind the cover down on its first day.
+    function test_windDown_refusedBeforeTheFirstBoundary() public {
+        _warpToEpochBoundary(3);
+        _open();
+        assertEq(epochs.relativeEpochNow(address(governor), pid), 0);
+
+        vm.expectRevert(ICoverageEpochs.BoundaryNotReached.selector);
+        epochs.flagWindDown(address(governor), pid);
+    }
+
+    function test_windDown_cannotBeFlaggedTwice() public {
+        _warpToEpochBoundary(3);
+        _open();
+        _warpToEpochBoundary(4);
+
+        epochs.flagWindDown(address(governor), pid);
+        vm.expectRevert(ICoverageEpochs.AlreadyWoundDown.selector);
+        epochs.flagWindDown(address(governor), pid);
+    }
+
+    function test_windDown_revertsWithoutAnOpenCover() public {
+        vm.expectRevert(ICoverageEpochs.NotOpened.selector);
+        epochs.flagWindDown(address(governor), pid);
+        assertFalse(epochs.windDownRequired(address(governor), pid), "no cover, nothing to wind down");
+    }
+
+    /// @dev A cover on its way out must not accept new commitments: a guardian
+    ///      booking exposure against it would be underwriting a watch that will
+    ///      never be stood.
+    function test_windDown_closesRenewal() public {
+        _wireEpochZeroApprovers();
+        _warpToEpochBoundary(3);
+        _open();
+        _warpToEpochBoundary(4);
+        epochs.flagWindDown(address(governor), pid);
+
+        vm.prank(guardianC);
+        vm.expectRevert(ICoverageEpochs.WoundDown.selector);
+        epochs.commitRenewal(address(governor), pid, 2);
+    }
+
+    function test_checkpointGrace_defaultsToSevenDays() public view {
+        assertEq(epochs.checkpointGrace(), 7 days);
+    }
+
+    /// @dev Bounded strictly BELOW `epochLength`: a grace at or past a whole
+    ///      epoch means the next boundary always arrives first, and the stale
+    ///      trigger can never fire at all. Zero is refused for the mirror-image
+    ///      reason — checkpoints are permissionless and unpaid, so a zero grace
+    ///      winds a healthy cover down over one late transaction.
+    function test_checkpointGrace_boundedAndOwnerOnly() public {
+        uint256 len = ledger.epochLength(); // hoisted: argument position eats a prank
+
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
+        epochs.setCheckpointGrace(1 days);
+
+        vm.startPrank(owner);
+        vm.expectRevert(ICoverageEpochs.InvalidParameter.selector);
+        epochs.setCheckpointGrace(0);
+        vm.expectRevert(ICoverageEpochs.InvalidParameter.selector);
+        epochs.setCheckpointGrace(len);
+
+        vm.expectEmit(true, true, true, true);
+        emit ICoverageEpochs.CheckpointGraceSet(7 days, len - 1);
+        epochs.setCheckpointGrace(len - 1); // one second inside the bound is legal
+        vm.stopPrank();
+
+        assertEq(epochs.checkpointGrace(), len - 1);
+    }
+
+    /// @dev The grace is read live, not cached at open: shortening it arms the
+    ///      stale trigger on a cover that was already waiting.
+    function test_checkpointGrace_movesTheStaleTrigger() public {
+        _wireEpochZeroApprovers();
+        _warpToEpochBoundary(3);
+        _open();
+        vm.prank(guardianC);
+        epochs.commitRenewal(address(governor), pid, 1);
+
+        _warpToEpochBoundary(4);
+        vm.warp(vm.getBlockTimestamp() + 2 days); // inside the 7-day default
+        vm.expectRevert(ICoverageEpochs.StillCovered.selector);
+        epochs.flagWindDown(address(governor), pid);
+
+        vm.prank(owner);
+        epochs.setCheckpointGrace(1 days);
+        epochs.flagWindDown(address(governor), pid);
+        assertTrue(epochs.windDownRequired(address(governor), pid));
+    }
 }
