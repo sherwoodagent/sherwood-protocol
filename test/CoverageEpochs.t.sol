@@ -8,6 +8,8 @@ import {ICoverageEpochs} from "src/interfaces/ICoverageEpochs.sol";
 import {ISyndicateGovernor} from "src/interfaces/ISyndicateGovernor.sol";
 import {ExposureLedger} from "src/ExposureLedger.sol";
 import {IExposureLedger} from "src/interfaces/IExposureLedger.sol";
+import {ChallengeGame} from "src/ChallengeGame.sol";
+import {IChallengeGame} from "src/interfaces/IChallengeGame.sol";
 
 /// @dev Minimal sWOOD stub: the ledger's constructor reads `coolDownPeriod`
 ///      only, and `maxDelegatedSlashBps` on the exposure paths Task 4 uses.
@@ -161,6 +163,11 @@ contract CoverageEpochsTest is Test {
 
     CoverageEpochs internal epochs;
     ExposureLedger internal ledger;
+    /// @dev The oracle for `_accusedOracle` — a real `ChallengeGame` over this
+    ///      fixture's ledger, so the epoch-0 equality test compares
+    ///      `coverersOf` against the code that actually slashes rather than
+    ///      against a copy of it kept in this file.
+    ChallengeGame internal challengeGame;
     MockCoverageGovernor internal governor;
     MockCoverageRouter internal router;
     MockCoverageVault internal vault;
@@ -180,6 +187,12 @@ contract CoverageEpochsTest is Test {
         governor = new MockCoverageGovernor();
 
         epochs = new CoverageEpochs(owner, address(router), address(ledger));
+        // Not a fixture under test: it is the ORACLE for `_accusedOracle`, and
+        // it must read the same `ledger` `CoverageEpochs` does or the epoch-0
+        // equality assertion compares two unrelated answers. WOOD and the tier
+        // registry are placeholders — the epoch-0 accused derivation is a pure
+        // ledger read and nothing is ever filed against this instance.
+        challengeGame = new ChallengeGame(owner, address(swood), address(ledger), address(this));
 
         governor.setProposal(pid, address(vault), strategy, 2_000, ISyndicateGovernor.ProposalState.Executed);
     }
@@ -875,26 +888,27 @@ contract CoverageEpochsTest is Test {
         vm.stopPrank();
     }
 
-    /// @dev A VERBATIM copy of `ChallengeGame._accused` (src/ChallengeGame.sol),
-    ///      kept here as an independent oracle. Task 5's whole correctness
-    ///      condition is that epoch 0's coverers are the same set predicate 5
-    ///      already slashes — if the two ever diverge, one of them slashes
-    ///      someone the other calls innocent. Task 7 makes `ChallengeGame` call
-    ///      `coverersOf` and deletes its copy, at which point they agree by
-    ///      construction; until then this comparison is the guarantee.
-    function _accusedOracle(address governor_, uint256 proposalId_) internal view returns (address[] memory accused) {
-        (address[] memory all, uint256[] memory committedUsd) = ledger.approversOf(governor_, proposalId_);
-        uint256 n;
-        for (uint256 i = 0; i < all.length; i++) {
-            if (committedUsd[i] != 0) n++;
-        }
-        accused = new address[](n);
-        uint256 j;
-        for (uint256 i = 0; i < all.length; i++) {
-            if (committedUsd[i] == 0) continue;
-            accused[j] = all[i];
-            j++;
-        }
+    /// @dev THE REAL `ChallengeGame`, ASKED THE REAL QUESTION. This helper used
+    ///      to be a hand-written copy of `ChallengeGame._accused`'s filter, kept
+    ///      here because the game exposed no public accused view — which made it
+    ///      a THIRD copy of a filter that already existed twice, asserting the
+    ///      other two agreed while being free to drift from both.
+    ///
+    ///      Task 7 added `accusedFor`, so the comparison now runs against the
+    ///      code that actually slashes. The guarantee is unchanged and still
+    ///      load-bearing: predicate 5 at relative epoch 0 takes the LEDGER path
+    ///      inside `ChallengeGame` (only a NON-ZERO epoch routes through
+    ///      `coverersOf`), so `CoverageEpochs.coverersOf(.., 0)` and the game's
+    ///      own filter remain two separate implementations that must never
+    ///      disagree — if they do, one slashes a guardian the other calls
+    ///      innocent. What is gone is the copy that could disagree with both.
+    ///
+    ///      The game is constructed against THIS fixture's `ledger`, which is
+    ///      the point: a divergence in the ledger read shows up right here. Its
+    ///      WOOD and tier-registry arguments are placeholders — the epoch-0
+    ///      derivation touches neither, and no challenge is ever filed on it.
+    function _accusedOracle(address governor_, uint256 proposalId_) internal view returns (address[] memory) {
+        return challengeGame.accusedFor(governor_, proposalId_, IChallengeGame.Predicate.DrawdownBreach, 0);
     }
 
     function _assertSameSet(address[] memory got, address[] memory want, string memory what) internal pure {
