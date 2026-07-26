@@ -374,6 +374,88 @@ contract CoverageEndToEndTest is Test {
         return p.reviewEnd - (window * registry.LATE_VOTE_LOCKOUT_BPS()) / 10_000;
     }
 
+    // ── Exit gating (ADR 2026-07-26) ──────────────────────────────────────
+
+    /// @notice A guardian who is currently insuring a proposal cannot pull
+    ///         their stake, however long they wait. The cooldown alone could
+    ///         not enforce this: it ships at 7 days against obligations running
+    ///         ~42, which is why the deploy pre-flight refuses to deploy.
+    ///
+    ///         REQUESTING stays open — it marks them inactive immediately, so
+    ///         they take on no new commitments while the existing one runs
+    ///         down. Only the release waits.
+    function test_exitGate_blocksClaimWhileCoverageIsOpen() public {
+        vm.startPrank(owner);
+        swood.setExposureLedger(address(ledger));
+        // Drop the cooldown to the value production actually ships (7 days).
+        // The fixture's 45d already outlasts this fixture's ~42d of coverage,
+        // so the timer would mask the gate and the test would prove nothing.
+        // A short cooldown is the case the gate exists for — and the case
+        // `DeployPlanB`'s pre-flight currently refuses to deploy.
+        swood.setCooldownPeriod(7 days);
+        vm.stopPrank();
+
+        uint256 pid = _propose(govA, address(vaultA), agentA);
+        _openReview(govA, pid);
+        _vote(govA, pid, g1, IGuardianRegistry.GuardianVoteType.Approve);
+        assertGt(ledger.openExposureUsd(g1), 0, "g1 is on the hook");
+
+        vm.prank(g1);
+        swood.requestUnstakeGuardian(); // allowed: stops them taking on more
+
+        // Past the cooldown but INSIDE the coverage window — the interval the
+        // timer alone cannot police, and the whole reason the gate exists.
+        vm.warp(vm.getBlockTimestamp() + 7 days + 1);
+        assertGt(ledger.openExposureUsd(g1), 0, "precondition: cooldown elapsed, coverage still open");
+
+        vm.prank(g1);
+        vm.expectRevert(StakedWood.CoverageStillOpen.selector);
+        swood.claimUnstakeGuardian();
+    }
+
+    /// @notice ...and released once the coverage genuinely expires. The gate is
+    ///         a condition, not a longer timer.
+    function test_exitGate_releasesOnceCoverageExpires() public {
+        vm.prank(owner);
+        swood.setExposureLedger(address(ledger));
+
+        uint256 pid = _propose(govA, address(vaultA), agentA);
+        _openReview(govA, pid);
+        _vote(govA, pid, g1, IGuardianRegistry.GuardianVoteType.Approve);
+
+        vm.prank(g1);
+        swood.requestUnstakeGuardian();
+
+        // Past the bucket covering settlement plus its challenge window.
+        vm.warp(vm.getBlockTimestamp() + 365 days);
+        assertEq(ledger.openExposureUsd(g1), 0, "coverage has expired");
+
+        uint256 balBefore = wood.balanceOf(g1);
+        vm.prank(g1);
+        swood.claimUnstakeGuardian();
+        assertGt(wood.balanceOf(g1), balBefore, "stake released once nothing is owed");
+    }
+
+    /// @notice FAIL-OPEN with no ledger wired. There is necessarily a window at
+    ///         deploy — and again on a UUPS upgrade — where the pointer is
+    ///         zero, and bricking withdrawals over a missed configuration step
+    ///         would be worse than the hole. `DeployPlanB` asserts the wiring
+    ///         instead, so the failure surfaces as a refused deploy.
+    function test_exitGate_failsOpenWhenNoLedgerIsWired() public {
+        assertEq(swood.exposureLedger(), address(0), "fixture leaves it unwired");
+
+        uint256 pid = _propose(govA, address(vaultA), agentA);
+        _openReview(govA, pid);
+        _vote(govA, pid, g1, IGuardianRegistry.GuardianVoteType.Approve);
+        assertGt(ledger.openExposureUsd(g1), 0, "genuinely on the hook...");
+
+        vm.prank(g1);
+        swood.requestUnstakeGuardian();
+        vm.warp(vm.getBlockTimestamp() + 365 days);
+        vm.prank(g1);
+        swood.claimUnstakeGuardian(); // ...and still allowed out: no gate wired
+    }
+
     // ── C1 regression, end to end ─────────────────────────────────────────
 
     /// @notice C1 — the free-rider veto, reconstructed against the REAL stack

@@ -9,6 +9,7 @@ import {IGuardianRegistry} from "../src/interfaces/IGuardianRegistry.sol";
 
 interface ISwoodCooldown {
     function coolDownPeriod() external view returns (uint256);
+    function exposureLedger() external view returns (address);
 }
 
 /**
@@ -123,6 +124,23 @@ contract DeployPlanB is Script {
         ISyndicateFactory(factory).setBondEscrow(address(escrow));
 
         vm.stopBroadcast();
+
+        // ── Pre-flight 3 (POST-wiring): the unstake gate must be live ──
+        // `StakedWood.claimUnstakeGuardian` FAILS OPEN when `exposureLedger` is
+        // unset, because there is necessarily a window at deploy — and again on
+        // a UUPS upgrade — where the pointer is still zero, and failing closed
+        // there would brick withdrawals over a missed configuration step.
+        //
+        // The cost of that choice is a deployment which looks entirely healthy
+        // while guardians can walk out from under a pending challenge. Asserting
+        // it here converts that silent hole into a refused deploy, which is the
+        // only point where the mistake is still cheap. Checked AFTER the
+        // broadcast because the wiring happens inside it.
+        require(
+            ISwoodCooldown(swood).exposureLedger() != address(0),
+            "PRE-FLIGHT: sWOOD exposureLedger is unset -- the unstake gate would fail open. "
+            "Call setExposureLedger(ledger) by governance, then re-run."
+        );
 
         console.log("ExposureLedger:     %s", address(ledger));
         console.log("ProposerBondEscrow: %s", address(escrow));
