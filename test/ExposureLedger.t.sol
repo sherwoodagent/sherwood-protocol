@@ -625,6 +625,77 @@ contract ExposureLedgerTest is Test {
         ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 1_000e6);
     }
 
+    // ── WOOD price: Chainlink feed with a governance fallback ─────────────
+
+    /// @notice Once a feed is wired it supersedes the governance number, and
+    ///         the haircut is applied on top — collateral wants a floor, not a
+    ///         quote. An unhaircut oracle tracks WOOD UP and inflates every
+    ///         bond exactly when the market is frothy, which is what the old
+    ///         manually-maintained "<= 30-day low" existed to prevent.
+    function test_woodPrice_feedSupersedesGovernanceAndAppliesTheHaircut() public {
+        assertEq(ledger.woodPriceX8(), 0.05e8, "governance value while unwired");
+
+        MockFeed woodFeed = new MockFeed(0.08e8, 8); // market says $0.08
+        vm.startPrank(owner);
+        ledger.setWoodFeed(address(woodFeed), 1 days);
+        assertEq(ledger.woodPriceX8(), 0.08e8, "feed wins, no haircut by default");
+
+        ledger.setWoodHaircutBps(7_500); // value bonds at 75% of market
+        vm.stopPrank();
+        assertEq(ledger.woodPriceX8(), 0.06e8, "haircut applied to the live read");
+
+        // And it flows through to what a bond is worth.
+        swood.setStake(guardian, 100_000e18, 0);
+        assertEq(ledger.slashableBondUsd(guardian), 6_000e18, "100k WOOD at the haircut price");
+    }
+
+    /// @notice A crash is tracked IMMEDIATELY, which is the direction where lag
+    ///         hurts: under the manual number somebody has to notice and
+    ///         transact while bonds stay over-valued in the meantime.
+    function test_woodPrice_tracksACrashWithoutAGovernanceTransaction() public {
+        MockFeed woodFeed = new MockFeed(0.05e8, 8);
+        vm.prank(owner);
+        ledger.setWoodFeed(address(woodFeed), 1 days);
+        swood.setStake(guardian, 100_000e18, 0);
+        assertEq(ledger.slashableBondUsd(guardian), 5_000e18);
+
+        woodFeed.set(0.005e8); // 10x collapse, no owner action
+        assertEq(ledger.slashableBondUsd(guardian), 500e18, "bond revalued with no transaction");
+    }
+
+    /// @notice A stale or broken feed FALLS BACK rather than reverting. Failing
+    ///         closed would value every bond at $0 and halt approvals
+    ///         protocol-wide on a Chainlink hiccup — a liveness risk the manual
+    ///         price does not have. The fallback is itself a conservative floor,
+    ///         so the degraded path stays safe; the cost is that the governance
+    ///         number must be MAINTAINED, not abandoned once the feed is wired.
+    function test_woodPrice_fallsBackToGovernanceWhenTheFeedIsStale() public {
+        MockFeed woodFeed = new MockFeed(0.08e8, 8);
+        vm.prank(owner);
+        ledger.setWoodFeed(address(woodFeed), 1 hours);
+
+        assertEq(ledger.woodPriceX8(), 0.08e8, "fresh: feed");
+        skip(2 hours);
+        assertEq(ledger.woodPriceX8(), 0.05e8, "stale: governance fallback, not zero");
+
+        swood.setStake(guardian, 100_000e18, 0);
+        assertEq(ledger.slashableBondUsd(guardian), 5_000e18, "bonds still valued, approvals still possible");
+    }
+
+    /// @notice The haircut is bounded on both sides. Zero would value bonds at
+    ///         $0 and brick approvals; above 100% would value them ABOVE market,
+    ///         which is the direction that overstates coverage.
+    function test_setWoodHaircutBps_bounded() public {
+        vm.startPrank(owner);
+        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
+        ledger.setWoodHaircutBps(0);
+        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
+        ledger.setWoodHaircutBps(10_001);
+        ledger.setWoodHaircutBps(10_000);
+        vm.stopPrank();
+        assertEq(ledger.woodHaircutBps(), 10_000);
+    }
+
     /// @notice C1 REGRESSION — the free-rider veto.
     ///
     ///         Under first-come booking an attacker could approve first and

@@ -136,6 +136,22 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     /// @notice Proposer bond as bps of USD coverage (spec §3.9/§5). Default 1%.
     uint256 public proposerBondBps = 100;
 
+    /// @notice Chainlink WOOD/USD feed. Once wired it supersedes the
+    ///         governance price for every bond valuation.
+    /// @dev    Reuses the same `AssetFeed` shape and staleness handling as the
+    ///         vault-asset feeds, so WOOD is priced by the machinery already
+    ///         exercised by `coverageUsd` rather than a parallel path.
+    AssetFeed internal _woodFeed;
+
+    /// @notice Haircut applied to the feed price, in bps. The governance number
+    ///         it replaces was a manually-maintained "<= 30-day low"; this is
+    ///         the same conservatism expressed as a factor on a live read.
+    /// @dev    Collateral wants a floor, not a quote — an unhaircut oracle
+    ///         tracks WOOD UP and inflates every bond exactly when the market is
+    ///         frothy. Default 10_000 (no haircut) so wiring a feed alone does
+    ///         not silently change valuations; governance sets it deliberately.
+    uint256 public woodHaircutBps = BPS_DENOMINATOR;
+
     address public guardianRegistry;
 
     /// @dev Per-asset USD feed config. `assetDecimals` cached at registration so
@@ -236,7 +252,35 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
 
     /// @inheritdoc IExposureLedger
     function slashableBondUsd(address guardian) public view returns (uint256) {
-        return _slashableBondUsd(guardian, swood.maxDelegatedSlashBps(), woodUsdPriceX8);
+        return _slashableBondUsd(guardian, swood.maxDelegatedSlashBps(), woodPriceX8());
+    }
+
+    /// @notice The WOOD/USD price every bond is valued at, 8 decimals.
+    ///
+    /// @dev    FEED FIRST, GOVERNANCE AS FALLBACK. A live read tracks a crash
+    ///         immediately, which is the direction where lag actually hurts:
+    ///         under the manual number somebody has to notice and transact
+    ///         while bonds stay over-valued in the meantime.
+    ///
+    ///         FALLS BACK RATHER THAN REVERTING when the feed is unset or
+    ///         stale. Failing closed here would value every bond at $0 and halt
+    ///         approvals protocol-wide on a Chainlink hiccup — a liveness risk
+    ///         the manual price does not have. The fallback is
+    ///         `woodUsdPriceX8`, which is itself a conservative floor, so the
+    ///         degraded path is still safe. It does mean the governance number
+    ///         must be MAINTAINED as a fallback rather than abandoned once the
+    ///         feed is wired.
+    function woodPriceX8() public view returns (uint256) {
+        AssetFeed storage f = _woodFeed;
+        if (f.feed == address(0)) return woodUsdPriceX8;
+        (, int256 answer,, uint256 updatedAt,) = IAggregatorMinimal(f.feed).latestRoundData();
+        if (answer <= 0) return woodUsdPriceX8;
+        uint256 age = block.timestamp > updatedAt ? block.timestamp - updatedAt : 0;
+        if (age > f.maxDelay) return woodUsdPriceX8;
+        // Normalise to 8 decimals, then haircut. `answer > 0` checked above.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint256 priceX8 = (uint256(answer) * 1e8) / (10 ** f.feedDecimals);
+        return (priceX8 * woodHaircutBps) / BPS_DENOMINATOR;
     }
 
     /// @dev `slashableBondUsd` with the two loop-invariant inputs passed in, so
@@ -300,6 +344,28 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      by the old registry become unreleasable and only self-heal when
     ///      their buckets expire (end of epoch + challenge window). Re-point
     ///      only at low open exposure.
+    function setWoodFeed(address feed, uint256 maxDelay) external onlyOwner {
+        if (feed == address(0)) revert ZeroAddress();
+        if (maxDelay == 0) revert InvalidParameter();
+        uint8 feedDecimals = IAggregatorMinimal(feed).decimals();
+        _woodFeed = AssetFeed({
+            feed: feed,
+            maxDelay: uint64(maxDelay),
+            assetDecimals: 18, // WOOD
+            feedDecimals: feedDecimals
+        });
+        emit WoodFeedSet(feed, maxDelay);
+    }
+
+    /// @dev Bounded like every other bps setter here. A zero haircut would
+    ///      value bonds at $0 and brick approvals; above 100% would value them
+    ///      ABOVE market, which is the direction that overstates coverage.
+    function setWoodHaircutBps(uint256 newBps) external onlyOwner {
+        if (newBps == 0 || newBps > BPS_DENOMINATOR) revert InvalidParameter();
+        emit ParameterChangeFinalized(keccak256("woodHaircutBps"), woodHaircutBps, newBps);
+        woodHaircutBps = newBps;
+    }
+
     function setGuardianRegistry(address registry) external onlyOwner {
         if (registry == address(0)) revert ZeroAddress();
         // RE-CHECK THE FLOOR (review M1). `setChallengeWindow` skips it while no
@@ -436,8 +502,9 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     function proposerBondWood(address asset, uint256 requiredCoverage) external view returns (uint256) {
         uint256 usd = (coverageUsd(asset, requiredCoverage) * proposerBondBps) / BPS_DENOMINATOR;
         if (usd == 0) return 0;
-        if (woodUsdPriceX8 == 0) revert InvalidParameter();
-        return (usd * 1e8) / woodUsdPriceX8;
+        uint256 px = woodPriceX8();
+        if (px == 0) revert InvalidParameter();
+        return (usd * 1e8) / px;
     }
 
     /// @inheritdoc IExposureLedger
@@ -660,7 +727,7 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         // Hoisted: both are loop-invariant, and `slashableBondUsd` would
         // otherwise re-read them once per approver (review finding M-4).
         uint256 bps = swood.maxDelegatedSlashBps();
-        uint256 priceX8 = woodUsdPriceX8;
+        uint256 priceX8 = woodPriceX8();
 
         // Summed over RESERVATIONS, not allocations. The question here is
         // "can the approvers who are still committed cover this?", and a
