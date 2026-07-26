@@ -63,6 +63,11 @@ interface IExposureLedger {
     function currentEpoch() external view returns (uint256);
     function woodUsdPriceX8() external view returns (uint256);
     function epochLength() external view returns (uint256);
+    /// @notice Timestamp epoch 0 began, pinned at deploy. Paired with
+    ///         `epochLength` this is the entire epoch schedule, which
+    ///         `CoverageEpochs` copies onto a cover at open (spec §3.4a, D3) so
+    ///         a future ledger re-point cannot re-slice a live cover's epochs.
+    function epochGenesis() external view returns (uint256);
     function challengeWindow() external view returns (uint256);
     function kNumerator() external view returns (uint256);
     function coveredTvlCapUsd() external view returns (uint256);
