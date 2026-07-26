@@ -622,16 +622,26 @@ contract ExposureLedgerTest is Test {
         ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 1e6);
     }
 
+    /// @notice What bounds the window now: zero (frees coverage instantly), the
+    ///         M1 floor, and `MAX_SCAN_BUCKETS`. The cooldown invariant is gone
+    ///         — unsatisfiable against sWOOD's 30-day setter cap, and superseded
+    ///         by the exit gate on `claimUnstakeGuardian`. A window longer than
+    ///         the epoch is now legal, which it had to become for narrow buckets
+    ///         to be usable at all.
     function test_setChallengeWindow_bounds() public {
         vm.startPrank(owner);
         vm.expectRevert(IExposureLedger.InvalidParameter.selector);
         ledger.setChallengeWindow(0);
-        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
-        ledger.setChallengeWindow(28 days + 1); // > epochLength
-        // epochLength + newWindow > coolDownPeriod: 28d + 18d = 46d > 45d
-        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
+
+        // Longer than the epoch: rejected before, fine now.
+        ledger.setChallengeWindow(28 days + 1);
+        assertEq(ledger.challengeWindow(), 28 days + 1);
+
+        // 18d used to fail on the cooldown (28 + 18 = 46 > 45). It passes now.
         ledger.setChallengeWindow(18 days);
-        ledger.setChallengeWindow(7 days); // 28d + 7d = 35d <= 45d: valid
+        assertEq(ledger.challengeWindow(), 18 days);
+
+        ledger.setChallengeWindow(7 days);
         vm.stopPrank();
         assertEq(ledger.challengeWindow(), 7 days);
     }
@@ -680,11 +690,13 @@ contract ExposureLedgerTest is Test {
     }
 
     function test_constructor_enforcesDefaultWindowInvariants() public {
-        // epochLength 40d: 40d + 14d = 54d > coolDownPeriod 45d
-        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
-        new ExposureLedger(owner, address(swood), 40 days);
-        // Buckets so narrow that the walk would exceed MAX_SCAN_BUCKETS:
-        // (14d + 60d) / 4d + 2 = 20 > 16.
+        // A 40d epoch used to fail the cooldown invariant (40 + 14 = 54 > 45).
+        // That invariant is gone, so this is now a legal ledger.
+        ExposureLedger wide = new ExposureLedger(owner, address(swood), 40 days);
+        assertEq(wide.epochLength(), 40 days);
+
+        // What still binds: buckets so narrow the walk would exceed
+        // MAX_SCAN_BUCKETS — (14d + 60d) / 4d + 2 = 20 > 16.
         vm.expectRevert(IExposureLedger.InvalidParameter.selector);
         new ExposureLedger(owner, address(swood), 4 days);
     }

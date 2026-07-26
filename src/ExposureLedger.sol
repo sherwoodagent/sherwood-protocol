@@ -197,7 +197,27 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         // would violate W <= L, a huge one the unstake-escape invariant,
         // from genesis.
         _requireScanBounded(challengeWindow, epochLength_);
-        if (epochLength_ + challengeWindow > ISwoodMinimal(swood_).coolDownPeriod()) revert InvalidParameter();
+        // The `coolDownPeriod >= epochLength + challengeWindow` invariant that
+        // used to sit here is GONE (ADR 2026-07-26). Two reasons, either
+        // sufficient:
+        //
+        //   1. UNSATISFIABLE. `StakedWood.setCooldownPeriod` caps the cooldown
+        //      at 30 days while this demanded 42 at defaults, so once sWOOD was
+        //      deployed no governance action could ever satisfy it — only
+        //      `initialize` could. `DeployPlanB`'s pre-flight told operators to
+        //      "raise the sWOOD cooldown by governance FIRST", which was not a
+        //      thing they could do.
+        //
+        //   2. SUPERSEDED. It was a timer approximating "an approver cannot
+        //      exit from under a pending challenge".
+        //      `StakedWood.claimUnstakeGuardian` now asks this ledger that
+        //      question directly, and exactly, via `openExposureUsd`.
+        //
+        // What this shifts onto the deploy: the gate FAILS OPEN when sWOOD's
+        // `exposureLedger` pointer is unset, so `DeployPlanB`'s post-broadcast
+        // wiring assertion is now the only thing standing between a deployment
+        // and no exit protection at all. It was belt-and-braces; it is now
+        // load-bearing.
         swood = ISwoodMinimal(swood_);
         epochLength = epochLength_;
         epochGenesis = block.timestamp;
@@ -295,7 +315,9 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         // Cross-contract invariant (spec §5): unstake delay must cover
         // epoch + challenge window, or an approver can unstake before its
         // epoch's approvals can be challenged.
-        if (epochLength + newWindow > swood.coolDownPeriod()) revert InvalidParameter();
+        // Cooldown invariant removed here for the same reasons as in the
+        // constructor: unsatisfiable against sWOOD's 30-day setter cap, and
+        // superseded by the exit gate on `claimUnstakeGuardian`.
         // LOWER BOUND (review M1). The anti-batching property depends on a
         // bucket outliving the proposal it backs. With only the upper bounds
         // above, a window shorter than the approve->execute gap lets one bond

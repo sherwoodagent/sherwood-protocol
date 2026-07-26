@@ -268,6 +268,48 @@ so `forge build` stops failing on a limit that does not apply to the target
 chain. If any part of this stack is ever pointed at Base, H2 becomes blocking
 again and the governor needs splitting.
 
+## The cooldown invariant was unsatisfiable (found 2026-07-26)
+
+While testing the exit gate, the "unmet prerequisite" below turned out to be
+worse than a mis-set value. Two contracts constrained `coolDownPeriod` in ways
+that cannot both hold:
+
+```
+StakedWood.setCooldownPeriod    1 day <= v <= 30 days,  v >= reviewPeriod
+ExposureLedger constructor      v >= epochLength + challengeWindow  = 42 days
+```
+
+The setter caps at 30; the ledger demanded 42. Once sWOOD is deployed, NO
+governance action can satisfy the ledger — only `initialize` can, i.e. only a
+fresh deployment. `DeployPlanB`'s pre-flight instructed operators to "raise the
+sWOOD cooldown by governance FIRST, then re-run", which was not something they
+could do.
+
+Removed from the ledger constructor, from `setChallengeWindow`, and the
+corresponding deploy pre-flight. It was a timer approximating "an approver
+cannot exit from under a pending challenge", and
+`StakedWood.claimUnstakeGuardian` now asks that question directly and exactly.
+
+TWO CONSEQUENCES WORTH TRACKING.
+
+First, `challengeWindow > epochLength` is now legal (it was already unpinned by
+the `MAX_SCAN_BUCKETS` change, but the cooldown rule was still blocking some
+combinations). Narrow buckets are usable in practice, not just in principle.
+
+Second, and more important: **the exit gate FAILS OPEN when sWOOD's
+`exposureLedger` pointer is unset.** With the ledger-side invariant gone, the
+post-broadcast wiring assertion in `DeployPlanB` is the only thing between a
+deployment and no exit protection at all. It was belt-and-braces when written;
+it is now load-bearing, and it must not be weakened or made conditional.
+
+`coolDownPeriod` itself stays, but its remaining job is small: it covers the
+REVIEW path (`coolDownPeriod >= reviewPeriod`), where a guardian who voted in an
+unresolved review is slashable and which the ledger cannot see. That is ~1 day
+at the fixture's `reviewPeriod`, not 42. Removing the timer entirely would need
+either a review-participation gate (new per-guardian bookkeeping in the
+registry, which the coverage gate did not need) or proof that nothing else
+depends on stake stickiness — the registry's appeal reserve is still untraced.
+
 ## Known unmet prerequisite
 
 `coolDownPeriod` ships at **7 days** (`script/Deploy.s.sol` `DEFAULT_COOLDOWN`,

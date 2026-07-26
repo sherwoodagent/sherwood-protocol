@@ -77,13 +77,22 @@ contract DeployPlanB is Script {
         uint256 woodPriceX8 = vm.envUint("WOOD_PRICE_HAIRCUT_X8"); // conservative, <= 30-day low
         uint256 coveredTvlCapUsd = vm.envUint("COVERED_TVL_CAP_USD18");
 
-        // ── Pre-flight 1: unstake-delay invariant (spec §5) ──
+        // ── Pre-flight 1: REMOVED (ADR 2026-07-26) ──
+        // This asserted `coolDownPeriod >= epochLength + challengeWindow` (42d
+        // at defaults). It was both unsatisfiable and unnecessary:
+        //
+        //   - `StakedWood.setCooldownPeriod` caps the cooldown at 30 days, so
+        //     the remedy this check printed — "raise the sWOOD cooldown by
+        //     governance FIRST" — was not an action any operator could take.
+        //     Only `initialize` could reach 42, i.e. only a fresh sWOOD.
+        //   - The property it approximated (an approver cannot exit from under
+        //     a pending challenge) is now enforced exactly by the exit gate on
+        //     `claimUnstakeGuardian`, which reads `openExposureUsd` directly.
+        //
+        // Pre-flight 3 below replaces it, and is strictly stronger: it checks
+        // the mechanism is WIRED rather than that a proxy for it is large
+        // enough.
         uint256 coolDown = ISwoodCooldown(swood).coolDownPeriod();
-        require(
-            coolDown >= EPOCH_LENGTH + EXPECTED_CHALLENGE_WINDOW,
-            "PRE-FLIGHT: sWOOD coolDownPeriod < epochLength + challengeWindow (42d at defaults). "
-            "Raise the sWOOD cooldown by governance FIRST, then re-run."
-        );
 
         // ── Pre-flight 2: a zero covered-TVL cap bricks all proposing ──
         require(
