@@ -169,6 +169,11 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      books commitments itself, so it needs no external opinion about who
     ///      approved, and the ledger's and governor's registry pointers can
     ///      therefore never disagree (review finding I-1).
+    /// @dev Set once `settleCoverage` has converted reservations into
+    ///      allocations for a proposal. Guards against a second pass, which
+    ///      would re-divide already-settled numbers against a shrunken total.
+    mapping(bytes32 reviewKey => bool) internal _settled;
+
     mapping(bytes32 reviewKey => address[]) internal _approversOf;
     /// @dev 1-INDEXED position in `_approversOf`; 0 means "not listed". Carries
     ///      the index rather than a bare flag so `releaseApproval` can
@@ -703,6 +708,109 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         address asset = IVaultAssetMinimal(gov.getProposalView(proposalId).vault).asset();
         uint256 needUsd = coverageUsd(asset, gov.getRequiredCoverage(proposalId));
         return _allocate(reserved, _committedUsd[key], needUsd);
+    }
+
+    /// @inheritdoc IExposureLedger
+    /// @dev Returns the over-reservation once the approver set is FINAL.
+    ///
+    ///      `recordApproval` reserves up to the whole coverage from every
+    ///      approver, because at vote time any one of them might end up carrying
+    ///      it alone. That is what closed C1 — there is no leftover to squat —
+    ///      but it means A approvers tie up A x coverage of aggregate cohort
+    ///      budget, and until now that lasted the whole bucket lifetime. It is
+    ///      why a busy cohort ran out of approve capacity (review N1).
+    ///
+    ///      Once the review window shuts, nobody can join or leave, so the
+    ///      worst case each approver was reserving against can no longer happen.
+    ///      This collapses each reservation to its actual pro-rata allocation
+    ///      and hands the difference back. The over-reservation now lasts the
+    ///      REVIEW WINDOW rather than the coverage window — days instead of
+    ///      weeks — which is the part of N1 that actually bites, since the
+    ///      bottleneck is budget being unavailable for the NEXT proposal.
+    ///
+    ///      Deliberately NOT the reviewer's suggested fix (reserve only the
+    ///      uncovered remainder, top survivors up on release). That reserves
+    ///      everything against the FIRST approver and nothing against later
+    ///      ones, which reintroduces first-mover-takes-the-line: under a
+    ///      coverage-weighted premium the whole payment goes to whoever is
+    ///      fastest, and the allocation stops being a fair split. Keeping equal
+    ///      reservations and settling afterwards buys the same budget relief
+    ///      without the ordering race, and keeps the loop off the vote path.
+    ///
+    ///      PERMISSIONLESS and SAFE TO SKIP. If nobody ever calls it the budget
+    ///      simply stays over-reserved until the bucket expires, exactly as
+    ///      today — conservative, never unsafe. So no keeper is load-bearing.
+    function settleCoverage(address governor, uint256 proposalId) external {
+        bytes32 key = _reviewKey(governor, proposalId);
+        if (_settled[key]) return;
+
+        ILedgerGovernorMinimal gov = ILedgerGovernorMinimal(governor);
+        ILedgerGovernorMinimal.ProposalViewLite memory pv = gov.getProposalView(proposalId);
+        // The set must be FINAL. Settling mid-review would hand budget back to
+        // approvers who could still be left carrying the proposal alone.
+        if (pv.reviewEnd == 0 || block.timestamp < pv.reviewEnd) revert ReviewNotClosed();
+
+        uint256 reservedTotal = _committedUsd[key];
+        if (reservedTotal == 0) {
+            _settled[key] = true;
+            return;
+        }
+
+        uint256 needUsd;
+        try this.coverageUsd(IVaultAssetMinimal(pv.vault).asset(), gov.getRequiredCoverage(proposalId)) returns (
+            uint256 v
+        ) {
+            needUsd = v;
+        } catch {
+            return; // unpriceable right now; retry later rather than mis-settle
+        }
+        // Under-subscribed: every approver already carries its whole
+        // reservation, so there is nothing to hand back.
+        if (reservedTotal <= needUsd) {
+            _settled[key] = true;
+            return;
+        }
+
+        address[] storage listed = _approversOf[key];
+        uint256 n = listed.length;
+        uint256 assigned;
+        address firstHolder;
+
+        for (uint256 i = 0; i < n; i++) {
+            address g = listed[i];
+            RecordedExposure memory r = _recorded[key][g];
+            if (r.usd == 0) continue;
+            if (firstHolder == address(0)) firstHolder = g;
+
+            uint256 alloc = (uint256(r.usd) * needUsd) / reservedTotal;
+            assigned += alloc;
+            uint256 excess = uint256(r.usd) - alloc;
+            if (excess != 0) {
+                _buckets[g][r.epoch] -= excess;
+                // `alloc <= r.usd`, itself a uint192.
+                // forge-lint: disable-next-line(unsafe-typecast)
+                _recorded[key][g].usd = uint192(alloc);
+            }
+        }
+
+        // Truncation leaves the total a few wei under `needUsd`. Give the
+        // residue to the first holder rather than leaving it short: the quorum
+        // compares this same aggregate against `needUsd`, so a rounded-down sum
+        // would make a fully-subscribed proposal fail its own coverage check
+        // after settling — the mirror of the dust bug the quorum already avoids
+        // by summing reservations.
+        if (assigned < needUsd && firstHolder != address(0)) {
+            uint256 residue = needUsd - assigned;
+            RecordedExposure memory rf = _recorded[key][firstHolder];
+            _buckets[firstHolder][rf.epoch] += residue;
+            // forge-lint: disable-next-line(unsafe-typecast)
+            _recorded[key][firstHolder].usd = uint192(uint256(rf.usd) + residue);
+            assigned = needUsd;
+        }
+
+        _committedUsd[key] = assigned;
+        _settled[key] = true;
+        emit CoverageSettled(key, reservedTotal, assigned);
     }
 
     /// @dev Pro-rata scale-back of one reservation. Under-subscribed

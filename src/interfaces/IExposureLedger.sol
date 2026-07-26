@@ -17,6 +17,13 @@ interface IExposureLedger {
     ///         a commitment for. Signals a duration ceiling set out of step with
     ///         the epoch length, rather than silently under-covering the tail.
     error CoverageHorizonExceeded();
+
+    /// @notice `settleCoverage` called before the review window shut, while the
+    ///         approver set can still change.
+    error ReviewNotClosed();
+
+    /// @notice Emitted when reservations collapse to allocations for a proposal.
+    event CoverageSettled(bytes32 indexed reviewKey, uint256 reservedTotal, uint256 allocatedTotal);
     error InsufficientApproveCoverage();
     error NotGuardianRegistry();
     error FeedNotConfigured();
@@ -52,6 +59,10 @@ interface IExposureLedger {
     ///         whoever is still an approver. This is the number a conviction
     ///         should slash against; the raw reservation would over-slash.
     function allocatedUsd(address governor, uint256 proposalId, address guardian) external view returns (uint256);
+
+    /// @notice Return each approver's over-reservation once the review has shut
+    ///         and the approver set is final. Permissionless; safe to skip.
+    function settleCoverage(address governor, uint256 proposalId) external;
 
     function slashableBondUsd(address guardian) external view returns (uint256);
     function openExposureUsd(address guardian) external view returns (uint256);

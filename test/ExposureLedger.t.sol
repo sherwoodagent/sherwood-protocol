@@ -75,15 +75,22 @@ contract MockGovernorForLedger {
     ///      epoch genesis so the ledger books into the CURRENT epoch — the
     ///      pre-ADR behaviour every existing test in this file was written
     ///      against. Set them to exercise the settlement-dated bucket.
+    uint256 public reviewEnd;
+
     function setSchedule(uint256 executeBy_, uint256 duration_) external {
         executeBy = executeBy_;
         strategyDuration = duration_;
+        // In the real governor `executeBy = reviewEnd + executionWindow`, so the
+        // review always shuts at or before `executeBy`. `settleCoverage` gates
+        // on it, and a mock returning 0 would read as "never closes".
+        reviewEnd = executeBy_;
     }
 
     function getProposalView(uint256) external view returns (ProposalViewLite memory v) {
         v.vault = vaultAddr;
         v.executeBy = executeBy;
         v.strategyDuration = strategyDuration;
+        v.reviewEnd = reviewEnd;
     }
 }
 
@@ -454,6 +461,92 @@ contract ExposureLedgerTest is Test {
         led.setGuardianRegistry(address(reg)); // now consistent
         vm.stopPrank();
         assertEq(led.guardianRegistry(), address(reg));
+    }
+
+    /// @notice N1 — the over-reservation is returned once the approver set is
+    ///         final. Every approver reserves up to the whole coverage (that is
+    ///         what closed C1), so three approvers on a $1,200 proposal tie up
+    ///         $3,600 of cohort budget. Settling collapses that to $1,200.
+    function test_settleCoverage_returnsTheOverReservation() public {
+        _wireRecording();
+        address g2 = makeAddr("g2");
+        address g3 = makeAddr("g3");
+        swood.setStake(g2, 100_000e18, 0);
+        swood.setStake(g3, 100_000e18, 0);
+        mgov.set(1_200e6); // $1,200, each guardian holds a $5,000 bond
+        mgov.setSchedule(block.timestamp + 1 days, 3 days);
+
+        vm.startPrank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        ledger.recordApproval(address(mgov), 1, g2);
+        ledger.recordApproval(address(mgov), 1, g3);
+        vm.stopPrank();
+
+        uint256 tiedUp = ledger.openExposureUsd(guardian) + ledger.openExposureUsd(g2) + ledger.openExposureUsd(g3);
+        assertEq(tiedUp, 3_600e18, "3 x full coverage reserved while the set can still change");
+
+        // Cannot settle while the review is open -- an approver could still be
+        // left carrying the whole thing alone.
+        vm.expectRevert(IExposureLedger.ReviewNotClosed.selector);
+        ledger.settleCoverage(address(mgov), 1);
+
+        skip(31 days); // past reviewEnd
+        ledger.settleCoverage(address(mgov), 1); // permissionless
+
+        uint256 afterSettle = ledger.openExposureUsd(guardian) + ledger.openExposureUsd(g2) + ledger.openExposureUsd(g3);
+        assertEq(afterSettle, 1_200e18, "collapsed to the real total liability");
+        assertEq(ledger.allocatedUsd(address(mgov), 1, guardian), 400e18, "even split, order irrelevant");
+        assertEq(ledger.allocatedUsd(address(mgov), 1, g2), 400e18);
+        assertEq(ledger.allocatedUsd(address(mgov), 1, g3), 400e18);
+    }
+
+    /// @notice Settling must not break the coverage check. Allocations round
+    ///         down, so a naive settle leaves the aggregate a few wei under
+    ///         `needUsd` and a fully-subscribed proposal would fail its own
+    ///         quorum afterwards. The residue goes to the first holder.
+    function test_settleCoverage_doesNotBreakTheQuorum() public {
+        _wireRecording();
+        address g2 = makeAddr("g2");
+        address g3 = makeAddr("g3");
+        swood.setStake(g2, 100_000e18, 0);
+        swood.setStake(g3, 100_000e18, 0);
+        mgov.set(1_000e6); // 1000e18 / 3 does not divide evenly
+        mgov.setSchedule(block.timestamp + 1 days, 3 days);
+
+        vm.startPrank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        ledger.recordApproval(address(mgov), 1, g2);
+        ledger.recordApproval(address(mgov), 1, g3);
+        vm.stopPrank();
+
+        skip(31 days);
+        ledger.settleCoverage(address(mgov), 1);
+
+        // Exactly on the requirement, not a wei under.
+        uint256 total = ledger.allocatedUsd(address(mgov), 1, guardian) + ledger.allocatedUsd(address(mgov), 1, g2)
+            + ledger.allocatedUsd(address(mgov), 1, g3);
+        assertEq(total, 1_000e18, "residue absorbed, not lost");
+        ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 1_000e6); // must not revert
+    }
+
+    /// @notice Idempotent. A second pass would otherwise re-divide already
+    ///         settled numbers against the shrunken total.
+    function test_settleCoverage_isIdempotent() public {
+        _wireRecording();
+        address g2 = makeAddr("g2");
+        swood.setStake(g2, 100_000e18, 0);
+        mgov.set(1_000e6);
+        mgov.setSchedule(block.timestamp + 1 days, 3 days);
+        vm.startPrank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        ledger.recordApproval(address(mgov), 1, g2);
+        vm.stopPrank();
+
+        skip(31 days);
+        ledger.settleCoverage(address(mgov), 1);
+        uint256 once = ledger.openExposureUsd(guardian);
+        ledger.settleCoverage(address(mgov), 1);
+        assertEq(ledger.openExposureUsd(guardian), once, "second pass changes nothing");
     }
 
     /// @notice C1 REGRESSION — the free-rider veto.
