@@ -9,17 +9,10 @@ import {IExposureLedger} from "src/interfaces/IExposureLedger.sol";
 /// @dev Minimal sWOOD stub exposing exactly the reads the ledger consumes.
 contract MockSwood {
     mapping(address => uint256) public guardianStake;
-    mapping(address => uint256) public delegatedInbound;
-    uint256 public maxDelegatedSlashBps = 2000;
     uint256 public coolDownPeriod = 45 days;
 
-    function setStake(address g, uint256 own, uint256 inbound) external {
+    function setStake(address g, uint256 own) external {
         guardianStake[g] = own;
-        delegatedInbound[g] = inbound;
-    }
-
-    function setMaxDelegatedSlashBps(uint256 v) external {
-        maxDelegatedSlashBps = v;
     }
 }
 
@@ -115,16 +108,16 @@ contract ExposureLedgerTest is Test {
         ledger.setWoodUsdPrice(0.05e8); // $0.05, conservative haircut price
     }
 
-    function test_slashableBondUsd_ownPlusCappedDelegated() public {
-        // own 100k WOOD, inbound 200k WOOD, delegated cap 2000 bps (20%)
-        swood.setStake(guardian, 100_000e18, 200_000e18);
-        // slashable WOOD = 100k + 200k * 20% = 140k; at $0.05 => $7,000
-        assertEq(ledger.slashableBondUsd(guardian), 7_000e18);
+    function test_slashableBondUsd_ownStakeAtPrice() public {
+        // own 100k WOOD (the only slashable capital post delegation-removal)
+        swood.setStake(guardian, 100_000e18);
+        // slashable WOOD = 100k; at $0.05 => $5,000
+        assertEq(ledger.slashableBondUsd(guardian), 5_000e18);
     }
 
     function test_slashableBondUsd_zeroWhenPriceUnset() public {
         ExposureLedger fresh = new ExposureLedger(owner, address(swood), 28 days);
-        swood.setStake(guardian, 100_000e18, 0);
+        swood.setStake(guardian, 100_000e18);
         // fail-closed: unset price values every bond at $0 (nothing can be approved)
         assertEq(fresh.slashableBondUsd(guardian), 0);
     }
@@ -185,7 +178,7 @@ contract ExposureLedgerTest is Test {
         ledger.setAssetFeed(usdgAsset, address(feed), 365 days);
         ledger.setGuardianRegistry(registry);
         vm.stopPrank();
-        swood.setStake(guardian, 100_000e18, 0); // slashableBondUsd = $5,000 at $0.05
+        swood.setStake(guardian, 100_000e18); // slashableBondUsd = $5,000 at $0.05
     }
 
     function test_recordApproval_registryOnly() public {
@@ -229,7 +222,7 @@ contract ExposureLedgerTest is Test {
     function test_recordApproval_twoGuardiansAggregateToCover() public {
         _wireRecording();
         address g2 = makeAddr("g2");
-        swood.setStake(g2, 100_000e18, 0); // $5,000 each at $0.05
+        swood.setStake(g2, 100_000e18); // $5,000 each at $0.05
         mgov.set(8_000e6); // $8,000 needed — neither covers it alone
 
         vm.prank(registry);
@@ -258,7 +251,7 @@ contract ExposureLedgerTest is Test {
     function test_slashBpsFor_ratesTrackEachApproversOwnCommitment() public {
         _wireRecording();
         address g2 = makeAddr("g2");
-        swood.setStake(g2, 50_000e18, 0); // $2,500 bond vs the guardian's $5,000
+        swood.setStake(g2, 50_000e18); // $2,500 bond vs the guardian's $5,000
         mgov.set(2_000e6); // $2,000 needed — either could carry it alone
 
         vm.prank(registry);
@@ -308,7 +301,7 @@ contract ExposureLedgerTest is Test {
     ///         3333.33 bps, which must price at 3334 rather than 3333.
     function test_slashBpsFor_roundsUpSoTheCohortNeverUnderCovers() public {
         _wireRecording();
-        swood.setStake(guardian, 60_000e18, 0); // $3,000 bond at $0.05
+        swood.setStake(guardian, 60_000e18); // $3,000 bond at $0.05
         mgov.set(1_000e6); // books exactly $1,000
 
         vm.prank(registry);
@@ -329,7 +322,7 @@ contract ExposureLedgerTest is Test {
         vm.prank(registry);
         ledger.recordApproval(address(mgov), 1, guardian);
 
-        swood.setStake(guardian, 50_000e18, 0); // bond halves to $2,500
+        swood.setStake(guardian, 50_000e18); // bond halves to $2,500
 
         (, uint256[] memory bps) = ledger.slashBpsFor(address(mgov), 1);
         assertEq(bps[0], 10_000, "capped at everything the guardian still has");
@@ -351,7 +344,7 @@ contract ExposureLedgerTest is Test {
     function test_recordApproval_frontRunnerCannotVetoByReleasing() public {
         _wireRecording();
         address attacker = makeAddr("attacker");
-        swood.setStake(attacker, 100_000e18, 0); // $5,000
+        swood.setStake(attacker, 100_000e18); // $5,000
         mgov.set(4_000e6); // $4,000 needed — either could cover it alone
 
         // The attacker gets in first and would, under the old rule, absorb it all.
@@ -446,7 +439,7 @@ contract ExposureLedgerTest is Test {
     /// openExposureUsd == sum recorded-minus-released in unexpired buckets.
     function testFuzz_exposureAccountingConserved(uint96 c1, uint96 c2, bool releaseFirst) public {
         _wireRecording();
-        swood.setStake(guardian, type(uint96).max, 0); // cap never binds in this fuzz
+        swood.setStake(guardian, type(uint96).max); // cap never binds in this fuzz
         vm.prank(owner);
         ledger.setWoodUsdPrice(1e8);
         uint256 u1 = uint256(c1) % 1_000_000e6 + 1;
@@ -489,8 +482,8 @@ contract ExposureLedgerTest is Test {
     function test_approveQuorum_sumOfCommittedSharesCoversCoverage() public {
         _wireRecording();
         address g2 = makeAddr("g2");
-        swood.setStake(guardian, 60_000e18, 0); // $3,000
-        swood.setStake(g2, 60_000e18, 0); // $3,000
+        swood.setStake(guardian, 60_000e18); // $3,000
+        swood.setStake(g2, 60_000e18); // $3,000
         mgov.set(5_000e6); // $5,000 needed
 
         vm.prank(registry);
@@ -617,7 +610,7 @@ contract ExposureLedgerTest is Test {
         MockFeed hugeFeed = new MockFeed(1e30, 8);
         vm.prank(owner);
         ledger.setAssetFeed(usdgAsset, address(hugeFeed), 365 days);
-        swood.setStake(guardian, 1e60, 0);
+        swood.setStake(guardian, 1e60);
         mgov.set(1e25);
         vm.prank(registry);
         vm.expectRevert(IExposureLedger.InvalidParameter.selector);

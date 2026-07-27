@@ -27,20 +27,11 @@ contract MockStakedWood is IStakedWood {
     mapping(address => mapping(uint256 => uint256)) internal _pastVotes;
     mapping(uint256 => uint256) internal _pastTotalVotes;
     mapping(uint256 => uint256) internal _pastTotalSupply;
-    mapping(uint256 => uint256) internal _pastTotalDelegated;
-    mapping(uint256 => uint256) internal _pastTotalActiveDelegated;
-    mapping(address => mapping(uint256 => uint256)) internal _pastCommission;
-    mapping(address => mapping(address => mapping(uint256 => uint256))) internal _pastDelegation;
-    mapping(address => mapping(uint256 => uint256)) internal _pastDelegatedInbound;
     mapping(address => uint256) internal _requiredOwnerBond;
     mapping(address => uint256) internal _ownerStake;
     mapping(address => bool) internal _isActiveGuardian;
     uint256 public totalGuardianStake;
-    uint256 public totalDelegatedStake;
     mapping(address => uint256) internal _guardianStake;
-    mapping(address => mapping(address => uint256)) internal _delegationOf;
-    mapping(address => uint256) internal _delegatedInbound;
-    mapping(address => uint256) internal _commissionOf;
     mapping(address => uint256) internal _preparedStakeOf;
     mapping(address => bool) internal _canCreateVault;
     uint256 public flatRequiredOwnerBond;
@@ -76,26 +67,6 @@ contract MockStakedWood is IStakedWood {
         _pastTotalSupply[timestamp] = v;
     }
 
-    function setPastTotalDelegated(uint256 timestamp, uint256 v) external {
-        _pastTotalDelegated[timestamp] = v;
-    }
-
-    function setPastTotalActiveDelegated(uint256 timestamp, uint256 v) external {
-        _pastTotalActiveDelegated[timestamp] = v;
-    }
-
-    function setPastCommission(address delegate, uint256 timestamp, uint256 v) external {
-        _pastCommission[delegate][timestamp] = v;
-    }
-
-    function setPastDelegation(address delegator, address delegate, uint256 timestamp, uint256 v) external {
-        _pastDelegation[delegator][delegate][timestamp] = v;
-    }
-
-    function setPastDelegatedInbound(address delegate, uint256 timestamp, uint256 v) external {
-        _pastDelegatedInbound[delegate][timestamp] = v;
-    }
-
     function setRequiredOwnerBond(address vault, uint256 v) external {
         _requiredOwnerBond[vault] = v;
     }
@@ -116,24 +87,8 @@ contract MockStakedWood is IStakedWood {
         totalGuardianStake = v;
     }
 
-    function setTotalDelegatedStake(uint256 v) external {
-        totalDelegatedStake = v;
-    }
-
     function setGuardianStake(address guardian, uint256 v) external {
         _guardianStake[guardian] = v;
-    }
-
-    function setDelegationOf(address delegator, address delegate, uint256 v) external {
-        _delegationOf[delegator][delegate] = v;
-    }
-
-    function setDelegatedInbound(address delegate, uint256 v) external {
-        _delegatedInbound[delegate] = v;
-    }
-
-    function setCommissionOf(address delegate, uint256 v) external {
-        _commissionOf[delegate] = v;
     }
 
     function setPreparedStakeOf(address owner, uint256 v) external {
@@ -166,26 +121,6 @@ contract MockStakedWood is IStakedWood {
         return _pastTotalSupply[timestamp];
     }
 
-    function getPastTotalDelegated(uint256 timestamp) external view returns (uint256) {
-        return _pastTotalDelegated[timestamp];
-    }
-
-    function getPastTotalActiveDelegated(uint256 timestamp) external view returns (uint256) {
-        return _pastTotalActiveDelegated[timestamp];
-    }
-
-    function getPastCommission(address delegate, uint256 timestamp) external view returns (uint256) {
-        return _pastCommission[delegate][timestamp];
-    }
-
-    function getPastDelegation(address delegator, address delegate, uint256 timestamp) external view returns (uint256) {
-        return _pastDelegation[delegator][delegate][timestamp];
-    }
-
-    function getPastDelegatedInbound(address delegate, uint256 timestamp) external view returns (uint256) {
-        return _pastDelegatedInbound[delegate][timestamp];
-    }
-
     // ── Live reads ──
     function requiredOwnerBond(address vault) external view returns (uint256) {
         uint256 perVault = _requiredOwnerBond[vault];
@@ -204,18 +139,6 @@ contract MockStakedWood is IStakedWood {
         return _ownerStake[vault];
     }
 
-    function delegationOf(address delegator, address delegate) external view returns (uint256) {
-        return _delegationOf[delegator][delegate];
-    }
-
-    function delegatedInbound(address delegate) external view returns (uint256) {
-        return _delegatedInbound[delegate];
-    }
-
-    function commissionOf(address delegate) external view returns (uint256) {
-        return _commissionOf[delegate];
-    }
-
     function preparedStakeOf(address owner) external view returns (uint256) {
         return _preparedStakeOf[owner];
     }
@@ -225,9 +148,8 @@ contract MockStakedWood is IStakedWood {
     }
 
     // ── Registry-only mutations (no-op stubs that record args) ──
-    // Sherlock run #3 #6: signature carries `openedAt` — sWOOD sizes the own
-    // and delegated slash legs off disjoint at-open snapshots (raw own-stake
-    // checkpoint + `getPastDelegatedInbound`). Mock ignores it.
+    // Sherlock run #3 #6: signature carries `openedAt` — sWOOD sizes the slash
+    // off the raw own-stake checkpoint at open. Mock ignores it.
     function slashGuardians(
         bytes32 reviewKey,
         uint256,
@@ -317,26 +239,6 @@ contract MockStakedWood is IStakedWood {
         revert("MockStakedWood: transferOwnerStakeSlot not modeled");
     }
 
-    function delegateStake(address, uint256) external pure {
-        revert("MockStakedWood: delegateStake not modeled");
-    }
-
-    function requestUnstakeDelegation(address) external pure {
-        revert("MockStakedWood: requestUnstakeDelegation not modeled");
-    }
-
-    function cancelUnstakeDelegation(address) external pure {
-        revert("MockStakedWood: cancelUnstakeDelegation not modeled");
-    }
-
-    function claimUnstakeDelegation(address) external pure {
-        revert("MockStakedWood: claimUnstakeDelegation not modeled");
-    }
-
-    function setCommission(uint256) external pure {
-        revert("MockStakedWood: setCommission not modeled");
-    }
-
     function setMinGuardianStake(uint256) external pure {
         revert("MockStakedWood: setMinGuardianStake not modeled");
     }
@@ -347,10 +249,6 @@ contract MockStakedWood is IStakedWood {
 
     function setCooldownPeriod(uint256) external pure {
         revert("MockStakedWood: setCooldownPeriod not modeled");
-    }
-
-    function setDelegationEnabled(bool) external pure {
-        revert("MockStakedWood: setDelegationEnabled not modeled");
     }
 
     function setMinSlashBps(uint256) external pure {

@@ -135,10 +135,8 @@ contract SlashToEscrowProportionalTest is Test {
                     // maxSlashBps 10_000 a cap test cannot tell a clamp from an
                     // uncapped pass-through.
                     maxSlashBps: MAX_SLASH_BPS,
-                    maxDelegatedSlashBps: 2000,
                     ageFloorBps: 2500,
-                    maturationPeriod: 30 days,
-                    delegatedWeightCapX: 4
+                    maturationPeriod: 30 days
                 }))
         );
         swood = StakedWood(address(new ERC1967Proxy(address(impl), initData)));
@@ -269,23 +267,14 @@ contract SlashToEscrowProportionalTest is Test {
     ///
     ///         The review flagged that `slashableBondUsd` is documented as
     ///         "what a 100% verdict can reach" while no conviction path slashes
-    ///         100%, so the booked number overstates recovery. Under the
-    ///         per-approver rates this is no longer true, and the reason is a
-    ///         discount asymmetry worth pinning down:
-    ///
-    ///           booked capacity = own + inbound * (C / 10_000)   <- DISCOUNTED
-    ///           slash           = own * rate + inbound * min(rate, C)
-    ///
-    ///         The ledger values delegated stake at the cap `C`; the slash
-    ///         applies `C` to the UNDISCOUNTED pool. So recovery meets or beats
-    ///         the allocation, and the margin grows with delegation. This test
-    ///         measures actual WOOD burned, values it at the ledger's own price,
-    ///         and compares against what the ledger said each approver owed.
-    ///
-    ///         Both sides of the cap are exercised: g1 carries delegation (so
-    ///         `rate` runs against the capped leg), g2 is own-stake only (the
-    ///         degenerate case where recovery should land exactly on the
-    ///         allocation, with no margin to hide a shortfall).
+    ///         100%, so the booked number overstated recovery. Under the
+    ///         per-approver rates this is no longer true: `slashBpsFor` derives
+    ///         each approver's rate from what they were ALLOCATED against their
+    ///         own bond, so recovery tracks the booking by construction. (The
+    ///         delegated-leg discount asymmetry this test used to measure is
+    ///         gone with the DPoS-delegation removal — the own bond is the only
+    ///         slashable capital, the degenerate case where recovery should
+    ///         land on the allocation with no margin to hide a shortfall.)
     function test_recoveryCoversEveryApproversAllocation() public {
         // ── A real ledger over the real sWOOD in this fixture.
         ExposureLedger ledger = new ExposureLedger(owner, address(swood), 28 days);
@@ -299,20 +288,6 @@ contract SlashToEscrowProportionalTest is Test {
         ledger.setGuardianRegistry(ledgerRegistry);
         ledger.setWoodUsdPrice(0.05e8); // $0.05/WOOD
         vm.stopPrank();
-
-        // ── g1 attracts delegation; g2 does not. Same own stake, so any
-        //    difference in outcome is the delegated leg alone.
-        vm.prank(owner);
-        swood.setDelegationEnabled(true); // owner flag, off by default
-
-        address delegator = makeAddr("delegator");
-        wood.mint(delegator, 100_000e18);
-        vm.startPrank(delegator);
-        wood.approve(address(swood), type(uint256).max);
-        swood.delegateStake(g1, 40_000e18);
-        vm.stopPrank();
-        assertGt(swood.delegatedInbound(g1), 0, "fixture: g1 really has inbound delegation");
-        assertEq(swood.delegatedInbound(g2), 0, "fixture: g2 is own-stake only");
 
         // ── Coverage both must jointly back.
         gov.set(1_200e6); // $1,200
@@ -330,23 +305,18 @@ contract SlashToEscrowProportionalTest is Test {
         (address[] memory accused, uint256[] memory rates) = ledger.slashBpsFor(address(gov), 1);
         uint256 own1Before = swood.guardianStake(g1);
         uint256 own2Before = swood.guardianStake(g2);
-        uint256 pool1Before = swood.delegatedInbound(g1);
 
         vm.prank(slasher);
         swood.slashToEscrow(bytes32("verdict"), openedAt, accused, rates, address(vault), snapTs);
 
         // ── Value the WOOD actually taken at the ledger's own price.
-        uint256 taken1 = (own1Before - swood.guardianStake(g1)) + (pool1Before - swood.delegatedInbound(g1));
+        uint256 taken1 = own1Before - swood.guardianStake(g1);
         uint256 taken2 = own2Before - swood.guardianStake(g2);
         uint256 recovered1 = (taken1 * 0.05e8) / 1e8;
         uint256 recovered2 = (taken2 * 0.05e8) / 1e8;
 
-        assertGe(recovered1, owed1, "delegated approver: recovery covers the allocation");
-        assertGe(recovered2, owed2, "own-stake approver: recovery covers the allocation");
-
-        // The margin is the discount asymmetry, and it shows up only where
-        // delegation does — which is the mechanism, not a rounding artefact.
-        assertGt(recovered1, owed1, "delegation creates genuine surplus");
+        assertGe(recovered1, owed1, "g1: recovery covers the allocation");
+        assertGe(recovered2, owed2, "g2: recovery covers the allocation");
     }
 
     /// @notice THE REASON THE CHANGE EXISTS. A partial rate leaves bond behind,

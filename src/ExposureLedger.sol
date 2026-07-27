@@ -4,13 +4,11 @@ pragma solidity 0.8.28;
 import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {IExposureLedger} from "./interfaces/IExposureLedger.sol";
 
-/// @dev Narrow sWOOD read surface (own stake, inbound delegation, delegated
-///      slash cap, cooldown). Mirrors the IGovernorMinimal pattern in
-///      GuardianRegistry — the ledger does not import the full IStakedWood ABI.
+/// @dev Narrow sWOOD read surface (own stake, cooldown). Mirrors the
+///      IGovernorMinimal pattern in GuardianRegistry — the ledger does not
+///      import the full IStakedWood ABI.
 interface ISwoodMinimal {
     function guardianStake(address guardian) external view returns (uint256);
-    function delegatedInbound(address delegate) external view returns (uint256);
-    function maxDelegatedSlashBps() external view returns (uint256);
     function coolDownPeriod() external view returns (uint256);
 }
 
@@ -52,10 +50,9 @@ interface IRegistryApproversMinimal {
  *
  *         `slashableBond(g)` (spec §3.3, precision definition):
  *             ownStake(g) * priceHaircut
- *           + delegatedInbound(g) * maxDelegatedSlashBps/10_000 * priceHaircut
- *         Delegated stake counts ONLY at the delegated-slash cap — a delegated
- *         pool cannot be slashed 100%; counting full vote weight would violate
- *         the coalition inequality at the accounting layer.
+ *         (The delegated-inbound term was removed with the DPoS-delegation
+ *         postponement — the guardian's own bond is the only slashable
+ *         capital.)
  *
  *         Exposure is EPOCH-BUCKETED (spec §3.4a): an approval consumes the
  *         current epoch's bucket; open exposure = the sum of all buckets young
@@ -172,21 +169,14 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
 
     /// @inheritdoc IExposureLedger
     function slashableBondUsd(address guardian) public view returns (uint256) {
-        return _slashableBondUsd(guardian, swood.maxDelegatedSlashBps(), woodUsdPriceX8);
+        return _slashableBondUsd(guardian, woodUsdPriceX8);
     }
 
-    /// @dev `slashableBondUsd` with the two loop-invariant inputs passed in, so
-    ///      a multi-approver quorum reads them once instead of once per
-    ///      approver (review finding M-4).
-    function _slashableBondUsd(address guardian, uint256 maxDelegatedSlashBps_, uint256 priceX8)
-        internal
-        view
-        returns (uint256)
-    {
-        uint256 own = swood.guardianStake(guardian);
-        uint256 inbound = swood.delegatedInbound(guardian);
-        uint256 slashableWood = own + (inbound * maxDelegatedSlashBps_) / BPS_DENOMINATOR;
-        return (slashableWood * priceX8) / 1e8;
+    /// @dev `slashableBondUsd` with the loop-invariant price passed in, so a
+    ///      multi-approver quorum reads it once instead of once per approver
+    ///      (review finding M-4).
+    function _slashableBondUsd(address guardian, uint256 priceX8) internal view returns (uint256) {
+        return (swood.guardianStake(guardian) * priceX8) / 1e8;
     }
 
     // ── Owner setters ──
@@ -441,9 +431,8 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         uint256 n = approvers.length;
         if (n == 0) revert InsufficientApproveCoverage();
 
-        // Hoisted: both are loop-invariant, and `slashableBondUsd` would
-        // otherwise re-read them once per approver (review finding M-4).
-        uint256 bps = swood.maxDelegatedSlashBps();
+        // Hoisted: loop-invariant — `slashableBondUsd` would otherwise
+        // re-read it once per approver (review finding M-4).
         uint256 priceX8 = woodUsdPriceX8;
 
         // Summed over RESERVATIONS, not allocations. The question here is
@@ -457,7 +446,7 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
             address g = approvers[i];
             uint256 reserved = _recorded[key][g].usd;
             if (reserved == 0) continue; // released via a vote change
-            uint256 live = _slashableBondUsd(g, bps, priceX8);
+            uint256 live = _slashableBondUsd(g, priceX8);
             haveUsd += live < reserved ? live : reserved;
             if (haveUsd >= needUsd) return; // early exit
         }
@@ -508,8 +497,7 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         approvers = new address[](n);
         bps = new uint256[](n);
 
-        // Hoisted for the reason `requireApproveQuorum` hoists them (M-4).
-        uint256 maxDelegated = swood.maxDelegatedSlashBps();
+        // Hoisted for the reason `requireApproveQuorum` hoists it (M-4).
         uint256 priceX8 = woodUsdPriceX8;
 
         // Prices against the ALLOCATION, never the reservation. `recordApproval`
@@ -535,7 +523,7 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
             if (reserved == 0) continue; // released -> owes nothing
             uint256 owed = _allocate(reserved, reservedTotal, needUsd);
             if (owed == 0) continue; // scaled to dust -> nothing to collect
-            uint256 live = _slashableBondUsd(g, maxDelegated, priceX8);
+            uint256 live = _slashableBondUsd(g, priceX8);
             if (live == 0 || owed >= live) {
                 bps[i] = BPS_DENOMINATOR;
                 continue;

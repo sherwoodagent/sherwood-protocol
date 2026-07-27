@@ -19,7 +19,7 @@ import {EnumerableSet} from "@openzeppelin/contracts/utils/structs/EnumerableSet
 ///         weekly Merkl); the on-chain reward pool/claim machinery was deleted
 ///         and `getApproverWeights` exposes the per-proposal approver split for
 ///         the bot. Guardian stake, owner bonds, DPoS
-///         delegation, vote checkpoints, and slashing live in `StakedWood`
+///         vote checkpoints, and slashing live in `StakedWood`
 ///         (sWOOD). The registry reads vote weight from sWOOD and calls sWOOD
 ///         to slash. See
 ///         `docs/superpowers/specs/2026-05-21-swood-staking-split-design.md`.
@@ -60,7 +60,6 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         uint128 approveStakeWeight;
         uint128 blockStakeWeight;
         uint64 openedAt; // timestamp for checkpoint lookup of vote weight
-        uint128 totalDelegatedAtOpen; // delegation half of the quorum denom
         /// @dev Sherlock run #2 #15: snapshot the block-quorum threshold at
         ///      `openReview` so the owner cannot shift it mid-review and
         ///      flip the resolution outcome. Read by `resolveReview` +
@@ -97,7 +96,6 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         bool blocked;
         uint8 nonce; // bumped on open/cancel so prior block votes go stale
         uint64 openedAt; // timestamp for checkpoint lookup of vote weight
-        uint128 totalDelegatedAtOpen; // delegation half of the quorum denom
         bool cohortTooSmall;
         /// @dev Sherlock run #2 #15 (emergency variant): snapshot block-quorum
         ///      threshold at `openEmergency` so the owner cannot shift it
@@ -149,7 +147,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     address public factory;
 
     /// @notice The StakedWood (sWOOD) contract — sole WOOD custodian. The
-    ///         registry reads vote weight / commission / delegation from sWOOD
+    ///         registry reads vote weight from sWOOD
     ///         and calls sWOOD to slash. Set in `initialize`.
     IStakedWood public swood;
 
@@ -320,7 +318,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     ///      `cohortTooSmall` short-circuits (both mean not-blocked) BEFORE this;
     ///      it evaluates only the at-open block-quorum comparison.
     function _isBlocked(Review storage r) private view returns (bool) {
-        uint256 denom = uint256(r.totalStakeAtOpen) + uint256(r.totalDelegatedAtOpen);
+        uint256 denom = uint256(r.totalStakeAtOpen);
         return uint256(r.blockStakeWeight) * 10_000 >= uint256(r.blockQuorumBpsAtOpen) * denom;
     }
 
@@ -418,7 +416,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
             uint256 lockoutStart = r.reviewEnd - (reviewWindowDuration * LATE_VOTE_LOCKOUT_BPS) / BPS_DENOMINATOR;
             if (block.timestamp >= lockoutStart) revert VoteChangeLockedOut();
 
-            // First vote — snapshot own + delegated weight AT `r.openedAt`.
+            // First vote — snapshot own weight AT `r.openedAt`.
             uint256 weight256 = swood.getPastVotes(msg.sender, uint256(r.openedAt));
             if (weight256 == 0) revert NotActiveGuardian(); // no votable weight at open time
             uint128 weight = uint128(weight256);
@@ -549,23 +547,19 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         // Sherlock #45: snapshot stake totals at open + flag cold-start cohort.
         // Sherlock #35 / Run-1 #18: denominator read at `t-1` matches the
         // numerator's checkpoint anchor — symmetric flash-(de)stake defense.
-        // Sherlock #39 / Run-1 #22: active-only delegated total excludes
-        // delegations to inactive guardians.
         IStakedWood sw = swood;
         uint256 ts1 = block.timestamp - 1;
         uint256 gs = sw.getPastTotalVotes(ts1);
-        uint256 ds = sw.getPastTotalActiveDelegated(ts1);
 
         er.governor = msg.sender; // stored before any external calls
         er.callsHash = callsHash;
         er.reviewEnd = uint64(block.timestamp + reviewPeriod);
         er.totalStakeAtOpen = uint128(gs);
-        er.totalDelegatedAtOpen = uint128(ds);
         er.blockStakeWeight = 0;
         er.resolved = false;
         er.blocked = false;
         er.openedAt = uint64(ts1);
-        er.cohortTooSmall = gs + ds < MIN_COHORT_STAKE_AT_OPEN;
+        er.cohortTooSmall = gs < MIN_COHORT_STAKE_AT_OPEN;
         // Sherlock run #2 #15: snapshot block-quorum threshold at open so the
         // owner can't shift it mid-review.
         // forge-lint: disable-next-line(unchecked-cast)
@@ -605,7 +599,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         if (er.reviewEnd > 0 && block.timestamp >= er.reviewEnd) revert ReviewNotOpen();
         // Sherlock #44: once block quorum is reached, the owner can't dodge.
         if (!er.cohortTooSmall) {
-            uint256 denom = uint256(er.totalStakeAtOpen) + uint256(er.totalDelegatedAtOpen);
+            uint256 denom = uint256(er.totalStakeAtOpen);
             // Sherlock run #2 #15: at-open snapshot.
             if (uint256(er.blockStakeWeight) * 10_000 >= uint256(er.blockQuorumBpsAtOpen) * denom) {
                 revert ReviewNotOpen();
@@ -674,7 +668,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     /// @inheritdoc IGuardianRegistry
     /// @dev Permissionless keeper entrypoint. Callable once
     ///      `block.timestamp >= proposal.voteEnd`. Snapshots sWOOD's
-    ///      `totalGuardianStake` / `totalDelegatedStake` into the review.
+    ///      `totalGuardianStake` into the review.
     ///      Idempotent: subsequent calls are no-ops.
     /// @dev A RESOLVED review never re-opens. `cancelReview`'s never-opened
     ///      short-circuit makes `(opened == false, resolved == true)` reachable
@@ -696,19 +690,14 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         IStakedWood sw = swood;
         // Sherlock #35 / Run-1 #18: read denominator at the SAME `t-1`
         // checkpoint that the numerator (voter weight) lookup uses, so
-        // flash-stake / flash-delegation in the same block as openReview
-        // can't asymmetrically inflate the quorum denominator while the
-        // matching numerator weight stays at the t-1 snapshot.
-        // Sherlock #39 / Run-1 #22: delegated total uses the ACTIVE-only
-        // checkpoint — delegations to inactive guardians are dead weight
-        // and don't inflate the quorum bar honest blockers must clear.
+        // flash-stake in the same block as openReview can't asymmetrically
+        // inflate the quorum denominator while the matching numerator weight
+        // stays at the t-1 snapshot.
         uint256 ts1 = block.timestamp - 1;
         uint128 totalAtOpen = uint128(sw.getPastTotalVotes(ts1));
-        uint128 delegatedAtOpen = uint128(sw.getPastTotalActiveDelegated(ts1));
-        uint256 combinedAtOpen = uint256(totalAtOpen) + uint256(delegatedAtOpen);
+        uint256 combinedAtOpen = uint256(totalAtOpen);
         r.opened = true;
         r.totalStakeAtOpen = totalAtOpen;
-        r.totalDelegatedAtOpen = delegatedAtOpen;
         // Sherlock run #2 #15: snapshot block-quorum at open so the owner
         // can't shift the threshold after voters have cast.
         // forge-lint: disable-next-line(unchecked-cast)
@@ -749,9 +738,9 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
             return false;
         }
 
-        // Block-quorum decision: own stake + delegated stake at review open vs
-        // the at-open quorum snapshot (Sherlock run #2 #15). Shared with the
-        // `outcomeOf` view via `_isBlocked` so the two can never disagree.
+        // Block-quorum decision: own stake at review open vs the at-open
+        // quorum snapshot (Sherlock run #2 #15). Shared with the `outcomeOf`
+        // view via `_isBlocked` so the two can never disagree.
         bool blocked_ = _isBlocked(r);
 
         // CEI: commit state BEFORE the external slash call.
@@ -767,9 +756,8 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
             // 2026-07-19 Part D). The burn and re-checkpoint all happen on
             // sWOOD.
             //
-            // Sherlock run #3 #6: pass `r.openedAt` so sWOOD's `_slashOne`
-            // can isolate the own-stake portion of each approver's combined
-            // snapshot via `getPastDelegatedInbound(approver, openedAt)`.
+            // Pass `r.openedAt` so sWOOD's `_slashOne` sizes each slash off
+            // the approver's raw own-stake checkpoint at review open.
             swood.slashGuardians(key, uint256(r.openedAt), _approvers[key], _severityBps(r));
             _emitBlockerAttribution(key, governor, proposalId);
         }
@@ -793,7 +781,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     function _severityBps(Review storage r) private view returns (uint256) {
         uint256 lo = swood.minSlashBps();
         uint256 hi = swood.maxSlashBps();
-        uint256 denom = uint256(r.totalStakeAtOpen) + uint256(r.totalDelegatedAtOpen);
+        uint256 denom = uint256(r.totalStakeAtOpen);
         if (denom == 0) return lo; // defensive: a reached quorum implies denom > 0
         uint256 bBps = uint256(r.blockStakeWeight) * 10_000 / denom;
         uint256 qBps = uint256(r.blockQuorumBpsAtOpen);
@@ -867,7 +855,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         // Sherlock #45: cold-start cohort -> blocked=false regardless of votes.
         bool blocked_;
         if (!er.cohortTooSmall) {
-            uint256 denomE = uint256(er.totalStakeAtOpen) + uint256(er.totalDelegatedAtOpen);
+            uint256 denomE = uint256(er.totalStakeAtOpen);
             if (denomE > 0) {
                 // Sherlock run #2 #15: at-open snapshot.
                 blocked_ = (uint256(er.blockStakeWeight) * 10_000 >= uint256(er.blockQuorumBpsAtOpen) * denomE);
@@ -976,8 +964,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     ///      (Sherlock run #2 #16): the review window may not exceed sWOOD's
     ///      guardian unstake cooldown. This invariant closes slash-evasion
     ///      for guardian OWN stake only — an approver cannot unstake and
-    ///      escape the slash before `resolveReview`. Delegator stake evasion
-    ///      is closed independently by the delegation unbonding-escrow.
+    ///      escape the slash before `resolveReview`.
     ///      Post sWOOD-split: cooldown lives on sWOOD; cross-call gated
     ///      behind `address(swood) != address(0)` for the pre-wiring window.
     ///      Other staking params (`minGuardianStake`, `minOwnerStake`,
