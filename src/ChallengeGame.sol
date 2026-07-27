@@ -93,6 +93,21 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      which is the griefing side of D5's fail-safe.
     uint256 internal constant MAX_DISPUTE_TIMEOUT = 180 days;
 
+    /// @dev THE GAS FLOOR sWOOD's natspec requires of its slasher (PR #24
+    ///      round-4 N-4 / N-3). `resolve` is permissionless, so the caller
+    ///      chooses the gas — exactly the regime where a starved `openCase`
+    ///      child inside `slashToEscrow` reads as empty returndata and BURNS
+    ///      the victims' compensation instead of bubbling. The floor is sized
+    ///      per approver plus a base: the slash loop runs before `openCase`,
+    ///      so a flat floor would let a large batch consume it before the
+    ///      call that needs protecting. ~300k/approver covers `_slashOne`
+    ///      plus the O(n²) dedup share at the 100-approver cap; the 1M base
+    ///      leaves the `openCase` child (~150-200k observed) a >5x margin
+    ///      after 63/64 forwarding, with the parent's burn/bubble branch
+    ///      still affordable behind it.
+    uint256 internal constant SLASH_GAS_PER_APPROVER = 300_000;
+    uint256 internal constant SLASH_GAS_BASE = 1_000_000;
+
     /// @notice Bond currency for both the challenger's bond and the accused's
     ///         counter-bond.
     IERC20 public immutable wood;
@@ -353,6 +368,13 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         bondedWood -= bond;
 
         exposureLedger.unfreezeCoverage(governor, proposalId);
+
+        // Pin the gas floor sWOOD's burn-vs-bubble classifier assumes (N-4).
+        // Checked as late as possible so everything already spent counts
+        // against the caller, not the margin.
+        if (gasleft() < approvers.length * SLASH_GAS_PER_APPROVER + SLASH_GAS_BASE) {
+            revert InsufficientSlashGas();
+        }
 
         (uint256 slashedWood, uint256 caseId) = swood.slashToEscrow(
             _reviewKey(governor, proposalId), c.filedAt, approvers, slashBpsPer, p.vault, p.executedAt - 1

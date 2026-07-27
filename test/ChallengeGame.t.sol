@@ -621,6 +621,30 @@ contract ChallengeGameTest is Test {
         assertEq(swood.callCount(), 0);
     }
 
+    /// @notice N-4 (PR #24 round 4): `resolve` is permissionless, so the
+    ///         caller chooses the gas — and a starved `openCase` child inside
+    ///         `slashToEscrow` BURNS the victims' compensation instead of
+    ///         bubbling. The game pins the floor sWOOD's natspec demands of
+    ///         its slasher: too little gas is refused before any state moves,
+    ///         and the retry costs nothing but the gas.
+    function test_resolve_enforcesTheSlashGasFloor() public {
+        uint256 id = _fileStandard(PROPOSAL);
+        vm.warp(_filedAt(id) + game.autoSlashDelay());
+
+        // Two approvers -> floor = 2 * 300k + 1M = 1.6M. 1.5M covers all the
+        // pre-floor work comfortably but cannot satisfy the floor itself.
+        bytes memory callData = abi.encodeWithSelector(game.resolve.selector, id);
+        (bool ok, bytes memory ret) = address(game).call{gas: 1_500_000}(callData);
+        assertFalse(ok, "a gas-starved resolve must not settle");
+        assertEq(bytes4(ret), IChallengeGame.InsufficientSlashGas.selector, "refused at the floor, not an OOG");
+        assertEq(swood.callCount(), 0, "the slasher was never reached");
+
+        // Same challenge, honest gas: settles clean.
+        swood.setNextResult(9_999e18, 42);
+        game.resolve(id);
+        assertEq(swood.callCount(), 1, "the retry lost nothing");
+    }
+
     function test_resolve_revertsOnATerminalOrUnknownChallenge() public {
         uint256 id = _fileStandard(PROPOSAL);
         vm.warp(vm.getBlockTimestamp() + game.autoSlashDelay());

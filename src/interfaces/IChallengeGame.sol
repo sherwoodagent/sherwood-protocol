@@ -78,6 +78,12 @@ interface IChallengeGame {
     error NotAccusedApprover();
     error ZeroAddress();
     error InvalidParameter();
+    /// @dev `resolve` was called with too little gas to guarantee the
+    ///      `openCase` child inside `slashToEscrow` cannot starve — a starved
+    ///      child is indistinguishable from a missing selector there and
+    ///      BURNS the victims' compensation (PR #24 round-4 N-4). Retry with
+    ///      more gas; nothing about the challenge state changes.
+    error InsufficientSlashGas();
 
     // ── Events ──
     /// @dev `evidenceURI` is carried on-chain unindexed so predicates 2 and 3 —

@@ -100,6 +100,9 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     /// @dev Mirrors `IStakedWood.ApproverAlreadySlashed`.
     error ApproverAlreadySlashed();
 
+    /// @dev Mirrors `IStakedWood.VaultNotFactoryDeployed`.
+    error VaultNotFactoryDeployed();
+
     /// @notice Insufficient WOOD to satisfy a stake minimum.
     /// @dev Relocated from `IGuardianRegistry` alongside `stakeAsGuardian`.
     error InsufficientStake();
@@ -1318,7 +1321,11 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     ///        the entire bond once, so a second concurrent conviction against
     ///        the same guardian recovers nothing.
     /// @param vault The vault whose pre-drain holders are compensated. Supplied
-    ///        by the caller because a `caseKey` cannot yield it.
+    ///        by the caller because a `caseKey` cannot yield it — but NOT
+    ///        trusted: it must resolve to a governor in the factory
+    ///        (`governorOf(vault) != 0`), so the F-A natspec's "no reachable
+    ///        caller path supplies a nonstandard vault" is enforced here
+    ///        rather than promised of a future slasher (PR #24 round-4 N-4).
     /// @param snapshotTimestamp The pre-drain snapshot the escrow apportions
     ///        against. Chosen by the CALLER within the bound above (§3.8): the
     ///        block before the drain proposal executed for predicates 1-4, the
@@ -1340,6 +1347,17 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
         // Positional alignment is the only thing tying a guardian to their rate,
         // so a mismatch is a caller bug, not something to absorb.
         if (slashBpsPer.length != approvers.length) revert SlashBpsLengthMismatch();
+        // FACTORY MEMBERSHIP (PR #24 round-4 N-4). The escrow apportions
+        // against `vault`'s ERC20Votes checkpoints, and the F-A analysis of
+        // `EmptySnapshot` holds only for OZ semantics — a nonstandard
+        // `getPastTotalSupply` is the one escape hatch it names. Asserting the
+        // vault is factory-deployed converts that scoping sentence from prose
+        // about the slasher into code here. Unconditional: `factory` is
+        // required non-zero at `initialize`, so there is no unwired window to
+        // fail open for.
+        if (IFactoryGovernorLookup(factory).governorOf(vault) == address(0)) {
+            revert VaultNotFactoryDeployed();
+        }
 
         // Namespace the verdict key before it feeds the shared `GuardianSlashed`
         // topic: a raw caller-chosen `caseKey` could be crafted to collide with

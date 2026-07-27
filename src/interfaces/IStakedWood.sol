@@ -55,6 +55,13 @@ interface IStakedWood {
     ///      Also makes an honest retried transaction idempotent per approver.
     error ApproverAlreadySlashed();
 
+    /// @dev `slashToEscrow`'s `vault` does not resolve to a governor in the
+    ///      factory (`governorOf(vault) == 0`). The escrow apportions against
+    ///      the vault's ERC20Votes checkpoints, and every safety claim about
+    ///      that population assumes OZ semantics — which only factory-deployed
+    ///      vaults are known to carry (PR #24 round-4 N-4).
+    error VaultNotFactoryDeployed();
+
     event AuthorizedSlasherSet(address indexed slasher);
     event CompensationEscrowSet(address indexed escrow);
 

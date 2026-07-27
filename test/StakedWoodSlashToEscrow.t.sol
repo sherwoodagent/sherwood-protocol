@@ -101,6 +101,13 @@ contract StakedWoodSlashToEscrowTest is Test {
 
         vault = new MockVotesVault();
 
+        // N-4: `slashToEscrow` asserts `governorOf(vault) != 0`. The fixture
+        // factory is codeless, so give it a byte of code and a wildcard mock —
+        // membership itself is pinned by the dedicated rejection test, which
+        // overrides this with an exact-calldata zero.
+        vm.etch(factory, hex"00");
+        vm.mockCall(factory, abi.encodeWithSignature("governorOf(address)"), abi.encode(makeAddr("gov")));
+
         // A staked, matured guardian to slash.
         wood.mint(g1, 1_000_000e18);
         vm.startPrank(g1);
@@ -191,6 +198,33 @@ contract StakedWoodSlashToEscrowTest is Test {
         vm.prank(registry);
         vm.expectRevert(IStakedWood.NotAuthorizedSlasher.selector);
         swood.slashToEscrow(bytes32("case"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs);
+    }
+
+    /// @notice N-4 (PR #24 round 4): the vault must be factory-deployed. The
+    ///         escrow apportions against the vault's checkpoints, and every
+    ///         claim about that population assumes OZ semantics — so a vault
+    ///         the factory does not recognise is refused BEFORE any stake
+    ///         moves, converting the F-A natspec's scoping sentence into code.
+    function test_slashToEscrow_rejectsAFactoryUnknownVault() public {
+        vm.prank(owner);
+        swood.setAuthorizedSlasher(slasher);
+
+        // Exact-calldata mock overrides the fixture's wildcard: this vault
+        // resolves to no governor.
+        address strangerVault = makeAddr("strangerVault");
+        vm.mockCall(factory, abi.encodeWithSignature("governorOf(address)", strangerVault), abi.encode(address(0)));
+
+        address[] memory gs = new address[](1);
+        gs[0] = g1;
+        uint256 stakeBefore = swood.guardianStake(g1);
+
+        uint256[] memory bps = _bpsArr(gs.length, 10_000);
+        vm.prank(slasher);
+        vm.expectRevert(StakedWood.VaultNotFactoryDeployed.selector);
+        swood.slashToEscrow(bytes32("stranger"), openedAt, gs, bps, strangerVault, snapTs);
+
+        assertEq(swood.guardianStake(g1), stakeBefore, "nothing was slashed for an unknown vault");
+        assertFalse(swood.verdictSlashed(bytes32("stranger"), g1), "and the verdict mark stays clean");
     }
 
     function test_slashToEscrow_routesProceedsToEscrowNotBurn() public {
