@@ -161,7 +161,20 @@ contract MockChallengeTierRegistry {
     bytes4 public lastSelector;
     uint256 public demoteCount;
 
+    /// @dev Stands in for a REVOKED demoter role: the real `TierRegistry` reverts
+    ///      `NotAuthorizedDemoter` once `setAuthorizedDemoter` has pointed
+    ///      elsewhere, and the game must survive that rather than strand the
+    ///      verdict behind it.
+    bool public reverting;
+
+    error NotAuthorizedDemoter();
+
+    function setReverting(bool v) external {
+        reverting = v;
+    }
+
     function demoteByChallenge(address target, bytes4 selector) external {
+        if (reverting) revert NotAuthorizedDemoter();
         lastTarget = target;
         lastSelector = selector;
         demoteCount++;
@@ -688,6 +701,46 @@ contract ChallengeGameTest is Test {
 
         // Less the F4 settle burn: a correct filing is cheap, not free.
         assertEq(wood.balanceOf(challenger) - challengerBefore, 8_000e18, "bond returned less the 20% burn");
+        _assertLiveBondsBacked();
+    }
+
+    /// @notice A REVOKED DEMOTER ROLE MUST NOT STRAND A VERDICT (PR #25 review
+    ///         🟠F11). `demoteByChallenge` is role-gated on the registry's side,
+    ///         and `TierRegistry.setAuthorizedDemoter(0)` is documented as an
+    ///         unwire switch that "fails CLOSED". Used while a challenge is live
+    ///         it did the opposite of closing: `_settle` reverted inside the
+    ///         demotion, so `resolve()` could never complete — the challenge sat
+    ///         in `Filed` forever, both bonds stranded with no withdrawal path,
+    ///         the coverage stayed frozen, and every accused approver stayed
+    ///         barred from `claimUnstakeGuardian`. One governance transaction,
+    ///         permanent.
+    ///
+    ///         Losing a certification revocation is a far smaller harm than
+    ///         losing the slash, the bond refund and the freeze release — and
+    ///         the registry owner can always demote by hand afterwards, since
+    ///         `demote` is theirs. So the demotion is BEST-EFFORT and its
+    ///         failure is surfaced as an event rather than swallowed.
+    function test_resolve_settlesEvenWhenTheDemoterRoleWasRevoked() public {
+        uint256 id = _fileStandard(PROPOSAL);
+        uint256 challengerBefore = wood.balanceOf(challenger);
+
+        // Governance rotates the demoter role out from under the live challenge.
+        tiers.setReverting(true);
+
+        swood.setNextResult(9_999e18, 42);
+        vm.warp(_filedAt(id) + game.autoSlashDelay());
+
+        vm.expectEmit(true, true, true, true, address(game));
+        emit IChallengeGame.AdapterDemotionFailed(id, ADAPTER, SELECTOR);
+        game.resolve(id);
+
+        // Everything that actually holds value still happened.
+        IChallengeGame.Challenge memory c = game.challengeOf(id);
+        assertEq(uint8(c.status), uint8(IChallengeGame.Status.Settled), "the verdict still lands");
+        assertEq(swood.callCount(), 1, "the slash still executed");
+        assertFalse(ledger.isCoverageFrozen(address(gov), PROPOSAL), "the coverage is still released");
+        assertEq(wood.balanceOf(challenger) - challengerBefore, 8_000e18, "the bond still comes back");
+        assertEq(tiers.demoteCount(), 0, "and the demotion is the only thing lost");
         _assertLiveBondsBacked();
     }
 

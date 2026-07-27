@@ -519,7 +519,24 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         // §3.4: "adapters demote only on a passed challenge" — and only the one
         // the filing actually named (D7), which `file` has already checked
         // against the proposal's own execute calls (🟠F4).
-        if (c.adapterTarget != address(0)) tierRegistry.demoteByChallenge(c.adapterTarget, c.adapterSelector);
+        //
+        // BEST-EFFORT, DELIBERATELY (review 🟠F11). `demoteByChallenge` is
+        // role-gated on the registry's side, so a single governance transaction
+        // — `setAuthorizedDemoter` pointed anywhere else while this challenge
+        // was live — used to make this line revert and take the whole verdict
+        // with it: `resolve()` could never complete, so the slash never landed,
+        // the bond never came back, the coverage stayed frozen, and every
+        // accused approver stayed barred from `claimUnstakeGuardian`, forever.
+        // A terminal path must not be hostage to a revocable role. Losing the
+        // certification revocation is the smallest of those harms and the only
+        // recoverable one — the registry owner's own `demote` fixes it — so the
+        // miss is surfaced as an event and the verdict proceeds.
+        if (c.adapterTarget != address(0)) {
+            try tierRegistry.demoteByChallenge(c.adapterTarget, c.adapterSelector) {}
+            catch {
+                emit AdapterDemotionFailed(challengeId, c.adapterTarget, c.adapterSelector);
+            }
+        }
 
         // A CORRECT FILING IS CHEAP, NOT FREE (🟠F4). The burn is taken from the
         // refund rather than paid to the accused: they were just convicted.

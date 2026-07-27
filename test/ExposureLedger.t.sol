@@ -1514,4 +1514,51 @@ contract ExposureLedgerTest is Test {
         ledger.releaseApproval(address(mgov), 2, guardian);
         assertEq(ledger.openExposureUsd(guardian), 3_000e18, "only the frozen one remains");
     }
+
+    /// @notice ROTATING THE FREEZER ROLE WHILE A FREEZE IS LIVE BRICKS IT
+    ///         (PR #25 review 🟠F11). `unfreezeCoverage` is `onlyFreezer` and the
+    ///         challenge game is its only caller, so re-pointing the role while a
+    ///         challenge is live leaves that freeze with nobody able to clear it.
+    ///         The game's `resolve()` then reverts `NotCoverageFreezer` on every
+    ///         call, forever: both bonds strand in the game with no withdrawal
+    ///         path, `_frozenCommitments` never decrements, and every accused
+    ///         approver is permanently barred from `claimUnstakeGuardian`.
+    ///
+    ///         This setter's natspec called zero a safe unwire that "fails
+    ///         closed". It fails closed for NEW filings and bricks the live ones,
+    ///         which is the opposite of what a safe unwire means when the thing
+    ///         being unwired is holding somebody's collateral. Refuse the
+    ///         rotation while it would orphan a freeze.
+    function test_setCoverageFreezer_revertsWhileCoverageIsFrozen() public {
+        _wireRecording();
+        mgov.set(3_000e6);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        vm.prank(freezer);
+        ledger.freezeCoverage(address(mgov), 1);
+
+        vm.prank(owner);
+        vm.expectRevert(IExposureLedger.CoverageFrozen.selector);
+        ledger.setCoverageFreezer(makeAddr("newFreezer"));
+    }
+
+    /// @notice The rotation is DEFERRED, not forbidden: once the live set has
+    ///         drained the role moves normally. A sequencing constraint on
+    ///         governance, not a lock — the documented remedy (resolve the live
+    ///         challenges first, then re-point) is exactly what this permits.
+    function test_setCoverageFreezer_succeedsOnceNothingIsFrozen() public {
+        _wireRecording();
+        mgov.set(3_000e6);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        vm.prank(freezer);
+        ledger.freezeCoverage(address(mgov), 1);
+        vm.prank(freezer);
+        ledger.unfreezeCoverage(address(mgov), 1);
+
+        address newFreezer = makeAddr("newFreezer");
+        vm.prank(owner);
+        ledger.setCoverageFreezer(newFreezer);
+        assertEq(ledger.coverageFreezer(), newFreezer, "the role rotates once nothing is pinned");
+    }
 }

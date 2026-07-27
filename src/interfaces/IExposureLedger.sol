@@ -78,8 +78,22 @@ interface IExposureLedger {
     ///      closes the freeze surface when the challenge game is replaced. Not
     ///      an oversight: with no freezer wired there is no filing, so the
     ///      unwired state fails closed for the game rather than open.
+    ///
+    ///      REFUSED WHILE ANY COVERAGE IS FROZEN (review 🟠F11). Failing closed
+    ///      for NEW filings is not the same as being safe for the LIVE ones:
+    ///      `unfreezeCoverage` is `onlyFreezer` and the game is its only caller,
+    ///      so rotating the role mid-challenge orphaned that freeze — the game's
+    ///      `resolve()` reverted forever, both bonds stranded with no withdrawal
+    ///      path, and every accused approver was permanently barred from
+    ///      `claimUnstakeGuardian`. The rotation is therefore DEFERRED, not
+    ///      forbidden: drain the live challenges until `frozenCoverageCount()`
+    ///      is zero, then re-point.
     function setCoverageFreezer(address freezer) external;
     function coverageFreezer() external view returns (address);
+    /// @notice How many proposals are frozen right now, across every guardian.
+    ///         Zero is the precondition for rotating `coverageFreezer`, so this
+    ///         is the read governance sequences a role change against.
+    function frozenCoverageCount() external view returns (uint256);
 
     // ── Views ──
     /// @notice The covering approvers of a proposal and the USD each committed.

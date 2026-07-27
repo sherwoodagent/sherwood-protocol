@@ -138,6 +138,14 @@ interface IChallengeGame {
     ///      same proposal already did. The approvers' liability is one
     ///      liability; concurrent filings do not multiply it.
     event VerdictAlreadyCollected(uint256 indexed challengeId, address indexed governor, uint256 indexed proposalId);
+    /// @dev A passed challenge whose adapter demotion did NOT land, because the
+    ///      registry refused the call — in practice because the game's
+    ///      `authorizedDemoter` role was rotated away while the challenge was
+    ///      live. The demotion is best-effort precisely so that cannot strand
+    ///      the slash, the bond refund and the freeze release behind it (review
+    ///      🟠F11); this event is how the miss becomes visible rather than
+    ///      silent, and the registry owner's own `demote` is the remedy.
+    event AdapterDemotionFailed(uint256 indexed challengeId, address indexed target, bytes4 indexed selector);
     event ChallengeFailed(uint256 indexed challengeId, uint256 forfeitedWood);
     event ExposureLedgerSet(address indexed oldLedger, address indexed newLedger);
     event TierRegistrySet(address indexed oldRegistry, address indexed newRegistry);

@@ -242,6 +242,11 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      silently tighten the batching cap, which is a different control.
     mapping(address guardian => uint256) internal _frozenCommitments;
 
+    /// @dev How many proposals are frozen right now, across every guardian.
+    ///      Exists so `setCoverageFreezer` can refuse a rotation that would
+    ///      ORPHAN a live freeze (review 🟠F11) — see that setter.
+    uint256 internal _frozenKeyCount;
+
     // ── Modifiers / helpers ──
 
     modifier onlyRegistry() {
@@ -543,7 +548,25 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         challengeWindow = newWindow;
     }
 
+    /// @dev REFUSED WHILE ANYTHING IS FROZEN (review 🟠F11). `unfreezeCoverage`
+    ///      is `onlyFreezer` and the challenge game is its only caller, so
+    ///      rotating this role mid-challenge left the old freeze with nobody
+    ///      able to clear it: the game's `resolve()` reverted
+    ///      `NotCoverageFreezer` on every call, both bonds stranded there with
+    ///      no withdrawal path, `_frozenCommitments` never decremented, and
+    ///      every accused approver was permanently barred from
+    ///      `claimUnstakeGuardian`. One governance transaction, unrecoverable.
+    ///
+    ///      An earlier version of this natspec called zero a safe unwire switch
+    ///      that "fails closed". It fails closed for NEW filings and BRICKS the
+    ///      live ones, which is not the same thing when the mechanism being
+    ///      unwired is holding somebody's collateral. Deferring the rotation
+    ///      until nothing is pinned makes the documented remedy — drain the live
+    ///      challenges, then re-point — the only reachable order. Zero is still
+    ///      legal, and still the unwire switch; it just cannot be thrown while
+    ///      it would strand a freeze.
     function setCoverageFreezer(address freezer) external onlyOwner {
+        if (_frozenKeyCount != 0) revert CoverageFrozen();
         emit CoverageFreezerSet(coverageFreezer, freezer);
         coverageFreezer = freezer;
     }
@@ -872,6 +895,7 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         bytes32 key = _reviewKey(governor, proposalId);
         if (!_frozen[key]) {
             _frozen[key] = true;
+            _frozenKeyCount++;
             address[] storage listed = _approversOf[key];
             for (uint256 i = 0; i < listed.length; i++) {
                 address g = listed[i];
@@ -894,6 +918,7 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         bytes32 key = _reviewKey(governor, proposalId);
         if (_frozen[key]) {
             _frozen[key] = false;
+            _frozenKeyCount--;
             address[] storage listed = _approversOf[key];
             for (uint256 i = 0; i < listed.length; i++) {
                 address g = listed[i];
@@ -913,6 +938,11 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     /// @inheritdoc IExposureLedger
     function isCoverageFrozen(address governor, uint256 proposalId) external view returns (bool) {
         return _frozen[_reviewKey(governor, proposalId)];
+    }
+
+    /// @inheritdoc IExposureLedger
+    function frozenCoverageCount() external view returns (uint256) {
+        return _frozenKeyCount;
     }
 
     /// @inheritdoc IExposureLedger
