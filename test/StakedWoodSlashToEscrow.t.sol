@@ -209,7 +209,7 @@ contract StakedWoodSlashToEscrowTest is Test {
         assertEq(caseId, 1, "the funded case id is returned, not scraped");
         assertEq(wood.balanceOf(BURN_ADDRESS), burnBefore, "verdict slash must NOT burn");
         assertEq(wood.balanceOf(address(escrow)), total, "proceeds land in the escrow");
-        (address v, uint256 ts, uint256 proceeds,,, bool swept) = escrow.caseOf(caseId);
+        (address v, uint256 ts, uint256 proceeds,,,, bool swept) = escrow.caseOf(caseId);
         assertEq(v, address(vault));
         assertEq(ts, snapTs);
         assertEq(proceeds, total, "the whole slash funds the case");
@@ -266,7 +266,7 @@ contract StakedWoodSlashToEscrowTest is Test {
         vm.prank(slasher);
         (, uint256 caseId) =
             swood.slashToEscrow(bytes32("case"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), openedAt);
-        (, uint256 ts,,,,) = escrow.caseOf(caseId);
+        (, uint256 ts,,,,,) = escrow.caseOf(caseId);
         assertEq(ts, openedAt);
     }
 

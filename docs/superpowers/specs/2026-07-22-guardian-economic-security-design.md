@@ -424,6 +424,39 @@ stable legs and lifts the ceiling.
 This mirrors the voting-snapshot primitive already in the design; the omission in
 the first draft was applying it to the payout as well as the vote.
 
+**Residual F1 recoupment channels (PR #24 review; threat model, not accepted
+edges).** The snapshot mechanism itself is sound; its *inputs* carry two
+residual channels and one inherent limit that belong here rather than in a
+"revisit if it becomes common" footnote:
+
+1. **Delegation (OPEN — closed by Plan D/E or a balance checkpoint).**
+   Apportionment reads `getPastVotes`, and `delegate()` is a free,
+   permissionless pointer that decides who a claim belongs to. A coalition that
+   solicits delegations *before* the drain — indistinguishable from ordinary
+   bloc-building — collects the delegating cohort's entire compensation stream.
+   Non-transferability of the claim mapping does not close this: the
+   *entitlement* follows the delegate pointer, and the pointer just has to be
+   set before the snapshot. "Revisit if delegation becomes common" is the wrong
+   trigger because the party who decides whether it becomes common is the
+   attacker. Until a challenge game (Plan D/E) can void such claims or the
+   vault checkpoints raw balances, this channel is open and documented as such
+   in `CompensationEscrow`'s natspec.
+2. **Compromised slasher timestamps (OPEN until Plan D).** `slashToEscrow`'s
+   `openedAt` and `snapshotTimestamp` are caller arguments. The code bounds
+   them against the future and against each other — honest-caller sanity only.
+   A compromised `authorizedSlasher` (today: the owner multisig) passes
+   `openedAt = now` and pins any past snapshot, including a post-drain instant
+   at which the coalition holds the supply — restoring F1 in full. Closed only
+   when the slasher is Plan D's challenge game passing timestamps from a
+   registered verdict record.
+3. **Pre-drain accumulation (INHERENT).** An attacker who accumulates shares
+   *before* the drain holds a genuine pre-drain claim and receives `f·S`
+   pro-rata — at essentially no marginal cost if the drain takes 100% of NAV
+   anyway. This is inherent to any pro-rata compensation scheme (the attacker
+   really was a holder of record) and is not fixable at this layer; it bounds
+   how much of the slash a *fully-invested* attacker recoups to its pre-drain
+   share fraction.
+
 ### 3.9 Risk-scaled proposer bond (F3)
 
 The proposer is the actual attacker yet posted no bond scaled to what it can
