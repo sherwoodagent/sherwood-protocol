@@ -113,6 +113,10 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      bounds a single call and nothing bounds the number of calls.
     uint256 internal constant MIN_PRICE_UPDATE_INTERVAL = 1 days;
 
+    /// @dev Floor on `woodHaircutBps`. Valuing bonds below half of market is a
+    ///      mis-set parameter, not a conservatism policy (review N6).
+    uint256 internal constant MIN_WOOD_HAIRCUT_BPS = 5_000;
+
     bytes32 public constant PARAM_CHALLENGE_WINDOW = keccak256("challengeWindow");
     bytes32 public constant PARAM_K_NUMERATOR = keccak256("kNumerator");
     bytes32 public constant PARAM_COVERED_TVL_CAP = keccak256("coveredTvlCapUsd");
@@ -163,6 +167,9 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     /// @dev Stamps every `setWoodUsdPrice`. Zero means "never set" — the only
     ///      state exempt from the interval.
     uint64 public lastPriceUpdateAt;
+
+    /// @dev Stamps every `setWoodHaircutBps`; zero means "never set".
+    uint64 public lastHaircutUpdateAt;
 
     address public guardianRegistry;
 
@@ -357,7 +364,7 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///          coverage check becomes theatre;
     ///        - set it to 0 and `capUsd` is 0, `open >= capUsd` holds at
     ///          `0 >= 0`, and EVERY approve vote protocol-wide reverts
-    ///          `ExposureCapExceeded` — a global kill switch.
+    ///          nothing bookable at all — a global kill switch, now a quiet one.
     ///
     ///      ZERO IS STILL ALLOWED, and rejecting it would have been theatre. A
     ///      price of 1 wei-X8 shrinks every bond by ~5e6 and disables coverage
@@ -432,8 +439,18 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     /// @dev Bounded like every other bps setter here. A zero haircut would
     ///      value bonds at $0 and brick approvals; above 100% would value them
     ///      ABOVE market, which is the direction that overstates coverage.
+    /// @dev Rate-limited and floored like `setWoodUsdPrice` (review N6). After
+    ///      the Chainlink path landed there were TWO unbounded multipliers on
+    ///      the same quantity and only one was bounded: a legal range of
+    ///      `[1, 10_000]` with no interval let the owner move every bond's
+    ///      valuation 10,000x in a single transaction, which is precisely what
+    ///      M4 existed to prevent. A haircut below `MIN_WOOD_HAIRCUT_BPS` is a
+    ///      mis-set parameter rather than a policy.
     function setWoodHaircutBps(uint256 newBps) external onlyOwner {
-        if (newBps == 0 || newBps > BPS_DENOMINATOR) revert InvalidParameter();
+        if (newBps < MIN_WOOD_HAIRCUT_BPS || newBps > BPS_DENOMINATOR) revert InvalidParameter();
+        uint256 lastH = lastHaircutUpdateAt;
+        if (lastH != 0 && block.timestamp < lastH + MIN_PRICE_UPDATE_INTERVAL) revert InvalidParameter();
+        lastHaircutUpdateAt = uint64(block.timestamp);
         emit ParameterChangeFinalized(keccak256("woodHaircutBps"), woodHaircutBps, newBps);
         woodHaircutBps = newBps;
     }
@@ -598,18 +615,24 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      exactly what §2's inequality states ("coalition loss >= Σ dollar
     ///      value of slashable approver stake").
     ///
-    ///      Booking the FULL coverage against EACH approver (the earlier
-    ///      behaviour) conflated two different rules: §3.3's cap exists to stop
-    ///      ONE guardian backing MANY proposals ("approve N drains in one
-    ///      window, lose one bond once") — not to force one guardian to
-    ///      single-handedly cover ONE proposal. Committing shares enforces the
-    ///      former without imposing the latter.
+    ///      TWO DIFFERENT RULES, and the distinction is what this design turns
+    ///      on. §3.3's cap exists to stop ONE guardian backing MANY proposals
+    ///      ("approve N drains in one window, lose one bond once"). It does NOT
+    ///      require one guardian to single-handedly cover ONE proposal.
+    ///
+    ///      Reserving the full coverage per approver — the rule that SHIPS —
+    ///      enforces the cap without imposing the second reading, because the
+    ///      reservation is an upper bound on liability and `allocatedUsd` is the
+    ///      actual per-guardian split. An earlier version instead sized each
+    ///      booking to `min(free, still uncovered)`, which conflated the two in
+    ///      the other direction: the first approver absorbed everything, later
+    ///      ones booked zero, and C1's costless veto followed.
     ///
     ///      Consequence: an under-bonded guardian is no longer rejected at vote
     ///      time — it commits what it can, and the proposal simply fails the
     ///      execute-time quorum unless other approvers make up the rest. A
-    ///      guardian with NO free budget still reverts (`ExposureCapExceeded`),
-    ///      which is what closes the batching attack.
+    ///      guardian with NO free budget books nothing and returns — the cap is
+    ///      enforced by committing zero, not by reverting the vote (review N1).
     function recordApproval(address governor, uint256 proposalId, address guardian) external onlyRegistry {
         bytes32 key = _reviewKey(governor, proposalId);
         if (_recorded[key][guardian].usd != 0) return; // idempotent (vote-change round trip)
@@ -706,7 +729,17 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         //
         // `executeBy` rather than `executedAt`: at approve time the proposal has
         // not executed and may never, so the deadline is the conservative anchor.
-        uint256 epoch = _coverageEpoch(pv);
+        // Horizon failures book nothing rather than reverting (review N4).
+        // `_coverageEpoch` sat outside the try/catch that guards the pricing
+        // read, so a strategy settling beyond `MAX_COVERAGE_HORIZON` reverted
+        // `voteOnProposal` itself — the THIRD trigger for the block-only review
+        // shape M3 was filed for, and the only one reachable at defaults, since
+        // `ProtocolConfig.maxStrategyDuration` ships unset. Same rule as the
+        // other two: failing the coverage is conservative, failing the VOTE is
+        // harmful. `SyndicateGovernor.propose` rejects such a duration up front,
+        // so this is the belt to that braces.
+        (uint256 epoch, bool withinHorizon) = _coverageEpochOrSkip(pv);
+        if (!withinHorizon) return;
         _buckets[guardian][epoch] += share;
         // share bounded to uint192 above; epoch = elapsed / epochLength cannot
         // approach 2^64 on any realistic timescale.
@@ -768,6 +801,27 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      until governance seeds it. Called by SyndicateGovernor.propose.
     function requireWithinCoveredTvlCap(address asset, uint256 requiredCoverage) external view {
         if (coverageUsd(asset, requiredCoverage) > coveredTvlCapUsd) revert CoveredTvlCapExceeded();
+    }
+
+    /// @inheritdoc IExposureLedger
+    /// @dev Refuses a proposal whose settlement lands beyond the ledger's
+    ///      booking horizon, AT PROPOSE (review N4).
+    ///
+    ///      Without it the failure surfaced at vote: `recordApproval` could not
+    ///      book, so every approve vote either reverted (before) or booked
+    ///      nothing (after), leaving a block-only review in which guardians can
+    ///      veto but never endorse. Failing here puts the error on the proposer,
+    ///      who chose the duration and can change it, instead of on a cohort
+    ///      that cannot.
+    ///
+    ///      Reachable at defaults, which is why it is a check rather than a
+    ///      comment: `ProtocolConfig.maxStrategyDuration` ships UNSET, and unset
+    ///      means no ceiling, so a vault owner may seat any duration up to
+    ///      `ABSOLUTE_MAX_STRATEGY_DURATION`.
+    function requireWithinCoverageHorizon(uint256 executeBy, uint256 strategyDuration) external view {
+        if (executeBy + strategyDuration > block.timestamp + MAX_COVERAGE_HORIZON) {
+            revert CoverageHorizonExceeded();
+        }
     }
 
     /// @inheritdoc IExposureLedger
@@ -981,10 +1035,14 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      SLASH off a price nobody can vouch for. Refusing to price a
     ///      conviction until the feed recovers is the safe failure.
     ///
-    ///      Operational consequence worth stating: a conviction cannot be
-    ///      computed while the asset feed is stale. That is a delay, not a
-    ///      loss — the exposure record is untouched and the challenge window is
-    ///      unaffected.
+    ///      Operational consequence, stated precisely (review N10): a conviction
+    ///      cannot be computed while the asset feed is stale. That is a delay
+    ///      UNLESS the outage outlasts the remaining challenge window. The
+    ///      exposure record is untouched, but it is also still counting down —
+    ///      bucket expiry is pure wall-clock and does not pause for an outage,
+    ///      and `claimUnstakeGuardian` releases the stake the instant it reads
+    ///      zero. A long enough outage converts the delay into a loss with no
+    ///      attacker involved.
     function allocatedUsd(address governor, uint256 proposalId, address guardian) public view returns (uint256) {
         bytes32 key = _reviewKey(governor, proposalId);
         uint256 reserved = _recorded[key][guardian].usd;
@@ -1064,7 +1122,28 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         ILedgerGovernorMinimal.ProposalViewLite memory pv = gov.getProposalView(proposalId);
         // The set must be FINAL. Settling mid-review would hand budget back to
         // approvers who could still be left carrying the proposal alone.
-        if (pv.reviewEnd == 0 || block.timestamp < pv.reviewEnd) revert ReviewNotClosed();
+        // GATED ON `executeBy`, NOT `reviewEnd` (review N3). Settling is not the
+        // neutral act the first version assumed. Before it, each approver holds
+        // a full-coverage reservation, so `requireApproveQuorum` sums an A-fold
+        // cushion; settling collapses that to EXACTLY `needUsd` priced at settle
+        // time, while the quorum re-derives `needUsd` from the live feed at
+        // execute. Any rise in between fails the quorum and `_settled` makes it
+        // permanent — so any EOA could settle the moment the review shut and let
+        // a 1% tick in the vault asset brick a fully-covered proposal, for the
+        // cost of gas.
+        //
+        // Nothing needs the relief before `executeBy`: by then the proposal has
+        // executed or expired, so collapsing its reservations can no longer
+        // change any quorum. Costs at most `executionWindow` of extra
+        // over-reservation against a bucket lifetime of weeks.
+        // STRICTLY AFTER `executeBy` (review N12). A proposal is executable
+        // while `block.timestamp <= executeBy`, so `>=` left a one-block overlap
+        // in which settling and executing were both available to different
+        // senders. Not price-exploitable — settling re-derives `needUsd` at the
+        // same instant the quorum reads it, so there is no rise in between —
+        // but there is no reason to permit settling in the last executable
+        // instant, and one character closes it.
+        if (pv.executeBy == 0 || block.timestamp <= pv.executeBy) revert ReviewNotClosed();
 
         uint256 reservedTotal = _committedUsd[key];
         if (reservedTotal == 0) {
@@ -1165,7 +1244,6 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      i.e. from = (elapsed - W) / L when elapsed > W. from <= cur always
     ///      (W > 0), so the loop is bounded by ceil(W/L) + 1 iterations.
     function openExposureUsd(address guardian) public view returns (uint256 total) {
-        uint256 cur = currentEpoch();
         uint256 elapsed = block.timestamp - epochGenesis;
         uint256 from = elapsed > challengeWindow ? (elapsed - challengeWindow) / epochLength : 0;
         // Scans FORWARD as well as back. Approvals are booked into the bucket
@@ -1173,7 +1251,7 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         // backward-only sum would miss every live commitment and report a
         // guardian's budget as free while it is fully pledged — the batching cap
         // would then wave through exactly what it exists to stop.
-        // `MAX_FORWARD_EPOCHS` bounds the span, and `_coverageEpoch` refuses to
+        // `MAX_COVERAGE_HORIZON` bounds the span, and `_coverageEpoch` refuses to
         // book beyond it, so the two together keep this loop fixed-width.
         uint256 to = (elapsed + MAX_COVERAGE_HORIZON) / epochLength;
         for (uint256 e = from; e <= to; e++) {
@@ -1194,12 +1272,25 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      book into the past, where the bucket may have expired already).
     ///
     ///      Reverts rather than clamping when settlement lands beyond
-    ///      `MAX_FORWARD_EPOCHS`. Clamping would silently under-cover the tail
+    ///      `MAX_COVERAGE_HORIZON`. Clamping would silently under-cover the tail
     ///      of a long strategy, which is the very bug this replaced; refusing
     ///      the approval instead surfaces a mis-set duration ceiling as a failed
     ///      vote rather than as a hole nobody sees. At the shipped 28d epoch
     ///      this permits ~84 days of horizon, comfortably above the 30d duration
     ///      cap plus a 7d execution window.
+    /// @dev `_coverageEpoch` without the revert — returns `(epoch, false)` when
+    ///      settlement lands beyond the horizon so `recordApproval` can decline
+    ///      to book instead of taking the vote down with it.
+    function _coverageEpochOrSkip(ILedgerGovernorMinimal.ProposalViewLite memory pv)
+        internal
+        view
+        returns (uint256, bool)
+    {
+        uint256 coverUntil = pv.executeBy + pv.strategyDuration;
+        if (coverUntil > block.timestamp + MAX_COVERAGE_HORIZON) return (0, false);
+        return (_coverageEpoch(pv), true);
+    }
+
     function _coverageEpoch(ILedgerGovernorMinimal.ProposalViewLite memory pv) internal view returns (uint256) {
         uint256 coverUntil = pv.executeBy + pv.strategyDuration;
         uint256 cur = currentEpoch();

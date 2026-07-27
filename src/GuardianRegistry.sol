@@ -444,8 +444,11 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
             // write below this hook. Same discipline as resolveReview (~L646).
             if (support == GuardianVoteType.Approve && address(exposureLedger) != address(0)) {
                 // Spec §3.3: the aggregate exposure cap is checked HERE, at
-                // the approve vote. A revert (ExposureCapExceeded) reverts
-                // the vote — an over-exposed guardian cannot approve.
+                // the approve vote. An over-exposed guardian books NOTHING
+                // rather than reverting (review N1) — the vote still lands and
+                // the shortfall surfaces at the execute-time quorum. Reverting
+                // here silenced the approve side while Block votes still
+                // worked, which made a review block-only.
                 exposureLedger.recordApproval(governor, proposalId, msg.sender);
             }
             emit GuardianVoteCast(proposalId, msg.sender, support, weight);
