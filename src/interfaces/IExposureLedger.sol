@@ -9,6 +9,10 @@ pragma solidity 0.8.28;
 ///         propose, approve-quorum check at execute).
 interface IExposureLedger {
     // ── Errors ──
+    /// @notice RETAINED FOR ABI STABILITY, no longer thrown. The exposure cap
+    ///         is enforced by booking zero rather than by reverting the vote
+    ///         (review N1); indexers and off-chain decoders that already know
+    ///         this selector keep working.
     error ExposureCapExceeded();
     error CoveredTvlCapExceeded();
 
@@ -46,6 +50,11 @@ interface IExposureLedger {
 
     // ── Governor-consumed checks (view) ──
     function requireWithinCoveredTvlCap(address asset, uint256 requiredCoverage) external view;
+
+    /// @notice Reverts when a proposal's settlement lands beyond the ledger's
+    ///         booking horizon. Called at propose so the error lands on the
+    ///         proposer rather than on the guardian cohort.
+    function requireWithinCoverageHorizon(uint256 executeBy, uint256 strategyDuration) external view;
     function requireApproveQuorum(address governor, uint256 proposalId, address asset, uint256 requiredCoverage)
         external
         view;

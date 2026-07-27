@@ -926,6 +926,11 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         if (ledger != address(0)) {
             address asset = IERC4626(GovernorParameters.vault).asset();
             IExposureLedger(ledger).requireWithinCoveredTvlCap(asset, coverage_);
+            // Fail on the PROPOSER, not on the cohort (review N4): a duration
+            // whose settlement outruns the ledger's booking horizon would
+            // otherwise leave every approve vote unable to book, turning the
+            // review block-only.
+            IExposureLedger(ledger).requireWithinCoverageHorizon(p.executeBy, p.strategyDuration);
             address escrow = _bondEscrow;
             if (escrow != address(0)) {
                 uint256 bondWood = IExposureLedger(ledger).proposerBondWood(asset, coverage_);

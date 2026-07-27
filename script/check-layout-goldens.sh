@@ -195,6 +195,11 @@ check_contract SyndicateFactory script/syndicate-factory-layout.golden.json
 # exists to police. Pinned here so the next append is checked automatically
 # rather than by hand.
 check_contract GuardianRegistry script/guardian-registry-layout.golden.json
+# StakedWood is UUPS and LIVE, and this PR carves `exposureLedger` out of the
+# front of its __gap — exactly the class of change this guard exists to police
+# (review N7). It was pinned on the Plan C branch and not here, which is the
+# wrong way round: the change happens on THIS branch.
+check_contract StakedWood script/staked-wood-layout.golden.json
 
 [ "${UPDATE_GOLDEN:-0}" = "1" ] ||
-  echo "layout-goldens: OK — SyndicateGovernor + SyndicateFactory + GuardianRegistry layouts match their goldens"
+  echo "layout-goldens: OK — SyndicateGovernor + SyndicateFactory + GuardianRegistry + StakedWood layouts match their goldens"
