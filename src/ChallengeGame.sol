@@ -296,6 +296,22 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         }
 
         bytes32 key = _reviewKey(governor, proposalId);
+        // NOTHING LEFT TO COLLECT, SO NOTHING LEFT TO CHALLENGE (review 🟡F12).
+        // The approvers underwrote ONE proposal and owe ONE liability; once a
+        // settled challenge has collected it, every later filing settles
+        // straight into the `VerdictAlreadyCollected` branch and can never
+        // reach a slash. It still FROZE the coverage on the way there, though,
+        // and the freeze is what bars an accused approver from
+        // `claimUnstakeGuardian` — so a filing that could not possibly convict
+        // anyone bought another `autoSlashDelay` of lock on already-slashed
+        // collateral. Cheaply: the accused have no reason to dispute a filing
+        // that cannot take anything more from them, so the griefer reliably
+        // reaches settle and is refunded all but `settleBurnBps` — 0.1% of
+        // coverage USD net, from as many funded addresses as it likes, since
+        // 🔴F3 made the slots per-challenger. A failed challenge is different
+        // and deliberately still allowed: it collected nothing, so the
+        // liability is outstanding and a fresh filing is legitimate.
+        if (_convicted[key]) revert AlreadyConvicted();
         // One live challenge per CHALLENGER (review 🔴F3) — see
         // `_liveByChallenger`. Concurrency is safe because the freeze is
         // refcounted below and the conviction is deduped by `_convicted`.

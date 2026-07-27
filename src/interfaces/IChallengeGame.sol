@@ -95,6 +95,16 @@ interface IChallengeGame {
     error NotExecuted();
     error WindowClosed();
     error AlreadyChallenged();
+    /// @dev The proposal's one liability has already been collected by a settled
+    ///      challenge, so no further filing against it can reach a verdict — it
+    ///      would settle straight into `VerdictAlreadyCollected`. Refused at the
+    ///      door because such a filing still FROZE the coverage on the way, and
+    ///      the freeze is what bars an accused approver from
+    ///      `claimUnstakeGuardian`: it bought another `autoSlashDelay` of lock on
+    ///      already-slashed collateral for the price of `settleBurnBps` on a
+    ///      refunded bond, from as many addresses as the griefer cared to fund
+    ///      (review 🟡F12).
+    error AlreadyConvicted();
     error NothingToFreeze();
     error WrongStatus();
     error DelayNotElapsed();

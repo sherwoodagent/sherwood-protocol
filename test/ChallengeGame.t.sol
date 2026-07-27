@@ -1034,8 +1034,50 @@ contract ChallengeGameTest is Test {
         ledger.releaseApproval(address(gov), 2, guardianA);
     }
 
+    /// @notice ONCE THE LIABILITY HAS BEEN COLLECTED THERE IS NOTHING LEFT TO
+    ///         CHALLENGE (PR #25 review 🟡F12). The approvers underwrote ONE
+    ///         proposal and owe ONE liability, which `_convicted` records as
+    ///         collected. A filing after that can never reach a slash — it
+    ///         settles straight into the `VerdictAlreadyCollected` branch — yet
+    ///         it still froze the coverage on the way, and the freeze is what
+    ///         bars every accused approver from `claimUnstakeGuardian`.
+    ///
+    ///         That made it a cheap way to keep already-slashed collateral
+    ///         locked. The accused have no reason to dispute a filing that
+    ///         cannot take anything more from them, so the filer reliably
+    ///         reaches settle and is refunded all but `settleBurnBps` — a net
+    ///         cost of 20% of (5% of coverage), or 0.1% of coverage USD, for
+    ///         another `autoSlashDelay` of lock. Slots are per-challenger, so N
+    ///         addresses buy N concurrent filings, chainable to the end of
+    ///         `challengeWindow`.
+    ///
+    ///         A filing that cannot reach a verdict has no legitimate purpose,
+    ///         so it is refused at the door rather than priced.
+    function test_file_rejectsAProposalWhoseVerdictWasAlreadyCollected() public {
+        uint256 id = _fileStandard(PROPOSAL);
+        vm.warp(_filedAt(id) + game.autoSlashDelay());
+        game.resolve(id);
+
+        // The window is still open — that is exactly the griefing window.
+        assertLt(vm.getBlockTimestamp(), _executedAt(PROPOSAL) + game.challengeWindow(), "still challengeable by time");
+
+        address griefer = makeAddr("griefer");
+        wood.mint(griefer, 1_000_000e18);
+        vm.startPrank(griefer);
+        wood.approve(address(game), type(uint256).max);
+        vm.expectRevert(IChallengeGame.AlreadyConvicted.selector);
+        game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.RogueAllowance, ADAPTER, SELECTOR, EVIDENCE);
+        vm.stopPrank();
+
+        // And the coverage the settled challenge released stays released.
+        assertFalse(ledger.isCoverageFrozen(address(gov), PROPOSAL), "no re-freeze");
+    }
+
     /// @notice A resolved challenge unblocks a later, legitimate filing against
     ///         the same proposal — the liveness check reads status, not history.
+    ///         Still true for a challenge that FAILED: nothing was collected, so
+    ///         the liability is still outstanding and a fresh filing is
+    ///         legitimate. Only a COLLECTED verdict closes the proposal (🟡F12).
     function test_resolve_allowsALaterFilingOnTheSameProposal() public {
         vm.prank(owner);
         game.setChallengeWindow(90 days); // outlive the dispute timeout
