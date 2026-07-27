@@ -80,9 +80,7 @@ contract GuardianRegistryOpenReviewTest is RegistryTestHarness {
 
     function test_openReview_revertsBeforeVoteEnd() public {
         _stakeN(5);
-        governor.setProposal(
-            PROPOSAL_ID, vm.getBlockTimestamp() + 1 hours, vm.getBlockTimestamp() + 1 hours + REVIEW_PERIOD
-        );
+        _registerReview(PROPOSAL_ID, vm.getBlockTimestamp() + 1 hours, vm.getBlockTimestamp() + 1 hours + REVIEW_PERIOD);
         vm.expectRevert(IGuardianRegistry.ReviewNotOpen.selector);
         registry.openReview(address(governor), PROPOSAL_ID);
     }
@@ -95,7 +93,7 @@ contract GuardianRegistryOpenReviewTest is RegistryTestHarness {
     function test_openReview_snapshotsTotalStakeAtOpen() public {
         _stakeN(5); // 50_000e18 total
         uint256 ve = vm.getBlockTimestamp();
-        governor.setProposal(PROPOSAL_ID, ve, ve + REVIEW_PERIOD);
+        _registerReview(PROPOSAL_ID, ve, ve + REVIEW_PERIOD);
 
         vm.expectEmit(true, false, false, true);
         emit IGuardianRegistry.ReviewOpened(PROPOSAL_ID, 50_000e18);
@@ -107,7 +105,7 @@ contract GuardianRegistryOpenReviewTest is RegistryTestHarness {
     function test_openReview_flagsCohortTooSmall() public {
         _stakeN(3); // 30_000e18 < 50_000e18 threshold
         uint256 ve = vm.getBlockTimestamp();
-        governor.setProposal(PROPOSAL_ID, ve, ve + REVIEW_PERIOD);
+        _registerReview(PROPOSAL_ID, ve, ve + REVIEW_PERIOD);
 
         vm.expectEmit(true, false, false, true);
         emit IGuardianRegistry.CohortTooSmallToReview(PROPOSAL_ID, 30_000e18);
@@ -117,7 +115,7 @@ contract GuardianRegistryOpenReviewTest is RegistryTestHarness {
     function test_openReview_idempotent() public {
         _stakeN(5);
         uint256 ve = vm.getBlockTimestamp();
-        governor.setProposal(PROPOSAL_ID, ve, ve + REVIEW_PERIOD);
+        _registerReview(PROPOSAL_ID, ve, ve + REVIEW_PERIOD);
         registry.openReview(address(governor), PROPOSAL_ID);
 
         // Bump totalGuardianStake by staking a 6th guardian post-open.
@@ -129,6 +127,49 @@ contract GuardianRegistryOpenReviewTest is RegistryTestHarness {
         registry.openReview(address(governor), PROPOSAL_ID);
         Vm.Log[] memory logs = vm.getRecordedLogs();
         assertEq(logs.length, 0);
+    }
+
+    // ── A cancelled (never-opened) review never re-opens ──
+    //
+    // `cancelReview`'s never-opened short-circuit writes `(opened = false,
+    // resolved = true)` BEFORE `reviewEnd`, i.e. while the vote window is still
+    // open. `openReview` and `voteOnProposal` gate on `opened` alone, so without
+    // the `resolved` guards a keeper could re-open a cancelled review and every
+    // active guardian could then mint reward-eligible approve weight on an
+    // already-Cancelled proposal at zero slash risk — `resolveReview` returns the
+    // cached `blocked == false` and never slashes. `getApproverWeights` is the
+    // documented input to off-chain reward attribution, so that weight is real
+    // money. Regression pins all three legs.
+    function test_openReview_neverReopensACancelledReview() public {
+        _stakeN(5);
+        uint256 ve = vm.getBlockTimestamp();
+        _registerReview(PROPOSAL_ID, ve, ve + REVIEW_PERIOD);
+
+        // Cancel inside the window, before any keeper called openReview.
+        vm.prank(address(governor));
+        registry.cancelReview(PROPOSAL_ID);
+
+        (bool opened, bool resolved,,) = registry.getReviewState(address(governor), PROPOSAL_ID);
+        assertFalse(opened, "cancel must not open the review");
+        assertTrue(resolved, "never-opened cancel resolves the review");
+
+        // Leg 1: openReview is an idempotent no-op, not a re-open.
+        vm.recordLogs();
+        registry.openReview(address(governor), PROPOSAL_ID);
+        assertEq(vm.getRecordedLogs().length, 0, "re-open must emit nothing");
+        (opened,,,) = registry.getReviewState(address(governor), PROPOSAL_ID);
+        assertFalse(opened, "a resolved review must never re-open");
+
+        // Leg 2: no guardian can vote on it.
+        vm.prank(guardians[0]);
+        vm.expectRevert(IGuardianRegistry.ReviewNotOpen.selector);
+        registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Approve);
+
+        // Leg 3: the reward-attribution surface stays empty.
+        (address[] memory approvers,, uint128 totalApproveWeight) =
+            registry.getApproverWeights(address(governor), PROPOSAL_ID);
+        assertEq(approvers.length, 0, "no approver may accrue on a cancelled proposal");
+        assertEq(totalApproveWeight, 0, "no reward-eligible weight may be minted");
     }
 }
 
@@ -156,7 +197,7 @@ contract GuardianRegistryVoteTest is RegistryTestHarness {
 
         voteEnd = vm.getBlockTimestamp();
         reviewEnd = voteEnd + REVIEW_PERIOD;
-        governor.setProposal(PROPOSAL_ID, voteEnd, reviewEnd);
+        _registerReview(PROPOSAL_ID, voteEnd, reviewEnd);
     }
 
     function _guardian(uint256 i) internal pure returns (address) {
@@ -253,9 +294,11 @@ contract GuardianRegistryVoteTest is RegistryTestHarness {
         address last = address(uint160(0x100000 + cap));
         _stakeGuardian(last, 10_000e18, 999);
 
+        // PROPOSAL_ID's window was already pushed in setUp (registration is
+        // immutable now), so no re-registration here. openReview still snapshots
+        // at block.timestamp - 1 = the time the 100 guardians staked, so the
+        // extra warp keeps their checkpoints visible to the cohort snapshot.
         vm.warp(vm.getBlockTimestamp() + 1);
-        uint256 newVoteEnd = vm.getBlockTimestamp();
-        governor.setProposal(PROPOSAL_ID, newVoteEnd, newVoteEnd + REVIEW_PERIOD);
         _openReview();
 
         for (uint256 i = 0; i < cap; i++) {
@@ -287,7 +330,7 @@ contract GuardianRegistryVoteTest is RegistryTestHarness {
 
         vm.warp(vm.getBlockTimestamp() + 1);
         uint256 newPid = 42;
-        governor.setProposal(newPid, vm.getBlockTimestamp(), vm.getBlockTimestamp() + REVIEW_PERIOD);
+        _registerReview(newPid, vm.getBlockTimestamp(), vm.getBlockTimestamp() + REVIEW_PERIOD);
         registry.openReview(address(governor), newPid);
 
         for (uint256 i = 0; i < cap; i++) {
@@ -321,7 +364,7 @@ contract GuardianRegistryVoteChangeTest is RegistryTestHarness {
 
         voteEnd = vm.getBlockTimestamp();
         reviewEnd = voteEnd + REVIEW_PERIOD;
-        governor.setProposal(PROPOSAL_ID, voteEnd, reviewEnd);
+        _registerReview(PROPOSAL_ID, voteEnd, reviewEnd);
         registry.openReview(address(governor), PROPOSAL_ID);
     }
 
@@ -414,7 +457,7 @@ contract GuardianRegistryVoteChangeTest is RegistryTestHarness {
         }
         vm.warp(vm.getBlockTimestamp() + 1);
         uint256 newPid = 2;
-        governor.setProposal(newPid, vm.getBlockTimestamp(), vm.getBlockTimestamp() + REVIEW_PERIOD);
+        _registerReview(newPid, vm.getBlockTimestamp(), vm.getBlockTimestamp() + REVIEW_PERIOD);
         registry.openReview(address(governor), newPid);
 
         address blockVoter = _guardian(0);
@@ -466,7 +509,7 @@ contract GuardianRegistryResolveTest is RegistryTestHarness {
 
         voteEnd = vm.getBlockTimestamp();
         reviewEnd = voteEnd + REVIEW_PERIOD;
-        governor.setProposal(PROPOSAL_ID, voteEnd, reviewEnd);
+        _registerReview(PROPOSAL_ID, voteEnd, reviewEnd);
     }
 
     function _guardian(uint256 i) internal pure returns (address) {
@@ -724,6 +767,13 @@ contract GuardianRegistryEmergencyTest is RegistryTestHarness {
         vault = new MockERC4626Vault();
         vault.setOwner(creator);
 
+        // Wire the vault this governor serves so the emergency owner-bond slash
+        // resolves the correct target from `vaultOf` (formerly fed via the
+        // removed getProposalView().vault). Overwrites the harness's inert
+        // default vault for this governor.
+        vm.prank(regFactory);
+        registry.addGovernor(address(governor), address(vault));
+
         // Bind an owner stake for the vault so emergency slashing has a target.
         // Creator mints, prepares, factory binds — all through sWOOD.
         wood.mint(creator, 100_000e18);
@@ -762,7 +812,6 @@ contract GuardianRegistryEmergencyTest is RegistryTestHarness {
 
     function _openEmergency() internal returns (uint64 reviewEnd_) {
         reviewEnd_ = uint64(vm.getBlockTimestamp() + REVIEW_PERIOD);
-        governor.setProposalWithVault(PROPOSAL_ID, vm.getBlockTimestamp(), reviewEnd_, address(vault));
         vm.prank(address(governor));
         registry.openEmergency(PROPOSAL_ID, _emptyCallsHash(), _emptyCalls());
     }
@@ -791,7 +840,6 @@ contract GuardianRegistryEmergencyTest is RegistryTestHarness {
         //   - Against live total (100_000e18): 20% < 30% → not blocked
         uint64 expectedEnd = uint64(vm.getBlockTimestamp() + REVIEW_PERIOD);
         bytes32 h = _emptyCallsHash();
-        governor.setProposalWithVault(PROPOSAL_ID, vm.getBlockTimestamp(), expectedEnd, address(vault));
         vm.expectEmit(true, false, false, true);
         emit IGuardianRegistry.EmergencyReviewOpened(PROPOSAL_ID, h, expectedEnd);
         vm.prank(address(governor));
@@ -1047,7 +1095,7 @@ contract GuardianRegistryPauseTest is RegistryTestHarness {
     function _openProposal() internal returns (uint256 voteEnd_, uint256 reviewEnd_) {
         voteEnd_ = vm.getBlockTimestamp();
         reviewEnd_ = voteEnd_ + REVIEW_PERIOD;
-        governor.setProposal(PROPOSAL_ID, voteEnd_, reviewEnd_);
+        _registerReview(PROPOSAL_ID, voteEnd_, reviewEnd_);
         registry.openReview(address(governor), PROPOSAL_ID);
     }
 

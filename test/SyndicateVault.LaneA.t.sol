@@ -4,7 +4,6 @@ pragma solidity 0.8.28;
 import {Test} from "forge-std/Test.sol";
 import {SyndicateVault} from "../src/SyndicateVault.sol";
 import {ISyndicateVault} from "../src/interfaces/ISyndicateVault.sol";
-import {ISyndicateGovernor} from "../src/interfaces/ISyndicateGovernor.sol";
 import {VaultWithdrawalQueue} from "../src/queue/VaultWithdrawalQueue.sol";
 import {BatchExecutorLib} from "../src/BatchExecutorLib.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
@@ -89,13 +88,7 @@ contract VaultLaneATest is Test {
         );
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("openProposalCount()"), abi.encode(locked ? uint256(1) : 0));
         if (locked) {
-            ISyndicateGovernor.StrategyProposal memory p;
-            p.id = PID;
-            p.vault = address(vault);
-            p.strategy = STRAT;
-            vm.mockCall(
-                MOCK_GOVERNOR, abi.encodeWithSelector(ISyndicateGovernor.getProposal.selector, PID), abi.encode(p)
-            );
+            vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("strategyOf(uint256)", PID), abi.encode(STRAT));
         }
     }
 
@@ -207,5 +200,25 @@ contract VaultLaneATest is Test {
         assertLe(mw, usdc.balanceOf(address(vault)), "capped by float");
         vm.prank(alice);
         vault.withdraw(mw, alice, alice);
+    }
+
+    // ── governor without `strategyOf` (independent-upgrade skew) ──
+
+    /// @dev Pins the `try/catch` in `SyndicateVault._activeStrategy`. The vault
+    ///      is a UUPS proxy and the governor is a BEACON proxy, so a vault impl
+    ///      that calls `strategyOf` can go live before the governor beacon
+    ///      carries it — the call then reverts with no data. `_activeStrategy`
+    ///      feeds `_laneState` and hence `maxWithdraw`/`maxRedeem`, so an
+    ///      uncaught revert is a vault-wide brick rather than a degradation.
+    ///      Delete the catch and this test fails with `EvmError: Revert`.
+    function test_missingStrategyOfDoesNotBrickWithdrawLanes() public {
+        vm.prank(alice);
+        vault.deposit(1_000e6, alice);
+        _setLocked(true);
+        vm.mockCallRevert(MOCK_GOVERNOR, abi.encodeWithSignature("strategyOf(uint256)", PID), "");
+
+        assertEq(vault.maxWithdraw(alice), 0, "degrades to lane-locked, does not revert");
+        assertEq(vault.maxRedeem(alice), 0, "degrades to lane-locked, does not revert");
+        assertEq(vault.totalAssets(), 1_000e6, "float only");
     }
 }

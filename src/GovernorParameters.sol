@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import {ISyndicateGovernor} from "./interfaces/ISyndicateGovernor.sol";
 import {ISyndicateVault} from "./interfaces/ISyndicateVault.sol";
+import {ProposalLifecycle} from "./ProposalLifecycle.sol";
 import {FeeConstants} from "./FeeConstants.sol";
 
 /**
@@ -21,7 +22,7 @@ import {FeeConstants} from "./FeeConstants.sol";
  *         so indexers can subscribe to a single topic regardless of which
  *         parameter changed.
  */
-abstract contract GovernorParameters is ISyndicateGovernor {
+abstract contract GovernorParameters is ProposalLifecycle {
     // ── Safety bounds (hardcoded) ──
 
     // Per-deployment timing floors are constructor-set immutables (see constructor).
@@ -147,10 +148,8 @@ abstract contract GovernorParameters is ISyndicateGovernor {
         _;
     }
 
-    modifier whenNoActiveProposal() {
-        if (openProposalCount() > 0) revert ParamsFrozenDuringProposal();
-        _;
-    }
+    // `whenNoActiveProposal` is inherited from ProposalLifecycle (the base owns
+    // the `_openProposalCount` lifecycle counter it guards on).
 
     // ── Bounds validator ──
 
@@ -279,9 +278,8 @@ abstract contract GovernorParameters is ISyndicateGovernor {
         return _params;
     }
 
-    // ── Abstract view (implemented by SyndicateGovernor) ──
-
-    function openProposalCount() public view virtual returns (uint256);
+    // `openProposalCount()` is a concrete virtual on ProposalLifecycle (the
+    // base owns `_openProposalCount`); no abstract declaration needed here.
 
     // ── Validation helpers ──
 

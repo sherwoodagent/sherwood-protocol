@@ -8,8 +8,9 @@ interface ISyndicateGovernor {
 
     /// @dev ── THE LIFECYCLE MAP ─ state × transition owner × where the state lives ──
     ///      One conceptual state machine, physically split across two contracts
-    ///      (EIP-170): the enum + most transitions live in `SyndicateGovernor`
-    ///      (`_resolveState`), but the GuardianReview verdict, emergency-review
+    ///      (EIP-170): the enum + most transitions live in the governor's
+    ///      `ProposalLifecycle` base (resolved by `_computeState`, committed by
+    ///      `_commitState`), but the GuardianReview verdict, emergency-review
     ///      state, quorum bookkeeping, and stored emergency settlement calls live
     ///      in `GuardianRegistry` (reached via the thin `GovernorEmergency` shims).
     ///

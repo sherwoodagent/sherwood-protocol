@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
-import {ISyndicateGovernor} from "./interfaces/ISyndicateGovernor.sol";
 import {ISyndicateVault} from "./interfaces/ISyndicateVault.sol";
 import {IGuardianRegistry} from "./interfaces/IGuardianRegistry.sol";
 import {BatchExecutorLib} from "./BatchExecutorLib.sol";
+import {ProposalLifecycle} from "./ProposalLifecycle.sol";
 
 /// @title GovernorEmergency
 /// @notice Abstract — emergency settlement paths extracted for bytecode headroom.
@@ -21,12 +21,14 @@ import {BatchExecutorLib} from "./BatchExecutorLib.sol";
 ///         - `cancelEmergencySettle`: vault owner withdraws their review.
 ///         - `finalizeEmergencySettle`: once the review period has elapsed and the
 ///           block quorum was not reached, the owner executes the reviewed calls.
-abstract contract GovernorEmergency is ISyndicateGovernor {
+abstract contract GovernorEmergency is ProposalLifecycle {
     // ── Virtual accessors (implemented by SyndicateGovernor) ──
+    //
+    // `_getProposal` / `_getRegistry` are gone: `_proposals` and
+    // `_guardianRegistry` are inherited from `ProposalLifecycle`, which owns the
+    // lifecycle state. What remains virtual is genuinely governor-owned.
 
-    function _getProposal(uint256) internal view virtual returns (StrategyProposal storage);
     function _getSettlementCalls(uint256) internal view virtual returns (BatchExecutorLib.Call[] storage);
-    function _getRegistry() internal view virtual returns (IGuardianRegistry);
     function _emergencyReentrancyEnter() internal virtual;
     function _emergencyReentrancyLeave() internal virtual;
     function _finishSettlementHook(uint256 pid, StrategyProposal storage p)
@@ -54,7 +56,7 @@ abstract contract GovernorEmergency is ISyndicateGovernor {
     ///         running the governance-approved pre-committed settlement calls.
     /// @dev Does NOT require active owner stake — the calls were already voted on.
     function unstick(uint256 proposalId) external emergencyNonReentrant {
-        StrategyProposal storage p = _getProposal(proposalId);
+        StrategyProposal storage p = _proposals[proposalId];
         _requireVaultOwner(p.vault);
         if (p.state != ProposalState.Executed) revert ProposalNotExecuted();
         if (block.timestamp < p.executedAt + p.strategyDuration) revert StrategyDurationNotElapsed();
@@ -72,12 +74,12 @@ abstract contract GovernorEmergency is ISyndicateGovernor {
         external
         emergencyNonReentrant
     {
-        StrategyProposal storage p = _getProposal(proposalId);
+        StrategyProposal storage p = _proposals[proposalId];
         _requireVaultOwner(p.vault);
         if (p.state != ProposalState.Executed) revert ProposalNotExecuted();
         if (block.timestamp < p.executedAt + p.strategyDuration) revert StrategyDurationNotElapsed();
 
-        IGuardianRegistry reg = _getRegistry();
+        IGuardianRegistry reg = IGuardianRegistry(_guardianRegistry);
         if (reg.ownerStake(p.vault) < reg.requiredOwnerBond(p.vault)) revert OwnerBondInsufficient();
 
         bytes32 h = keccak256(abi.encode(calls));
@@ -87,10 +89,10 @@ abstract contract GovernorEmergency is ISyndicateGovernor {
 
     /// @notice Vault owner withdraws their open emergency review before resolution.
     function cancelEmergencySettle(uint256 proposalId) external emergencyNonReentrant {
-        StrategyProposal storage p = _getProposal(proposalId);
+        StrategyProposal storage p = _proposals[proposalId];
         _requireVaultOwner(p.vault);
         if (p.state != ProposalState.Executed) revert ProposalNotExecuted();
-        IGuardianRegistry reg = _getRegistry();
+        IGuardianRegistry reg = IGuardianRegistry(_guardianRegistry);
         if (!reg.isEmergencyOpen(address(this), proposalId)) revert EmergencyNotProposed();
         reg.cancelEmergency(proposalId);
         emit EmergencySettleCancelled(proposalId, msg.sender);
@@ -99,11 +101,11 @@ abstract contract GovernorEmergency is ISyndicateGovernor {
     /// @notice Resolves a reviewed emergency settle and executes the approved calls.
     ///         Registry returns the stored calls; governor executes them on the vault.
     function finalizeEmergencySettle(uint256 proposalId) external emergencyNonReentrant {
-        StrategyProposal storage p = _getProposal(proposalId);
+        StrategyProposal storage p = _proposals[proposalId];
         _requireVaultOwner(p.vault);
         if (p.state != ProposalState.Executed) revert ProposalNotExecuted();
 
-        IGuardianRegistry reg = _getRegistry();
+        IGuardianRegistry reg = IGuardianRegistry(_guardianRegistry);
         (bool blocked, BatchExecutorLib.Call[] memory calls) = reg.finalizeEmergency(proposalId);
         if (blocked) revert EmergencySettleBlocked();
 

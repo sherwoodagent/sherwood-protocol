@@ -97,7 +97,7 @@ contract GuardianRegistryPauseIntegrationTest is RegistryTestHarness {
 
         uint256 voteEnd = vm.getBlockTimestamp();
         uint256 reviewEnd = voteEnd + REVIEW_PERIOD;
-        governor.setProposal(PROPOSAL_ID, voteEnd, reviewEnd);
+        _registerReview(PROPOSAL_ID, voteEnd, reviewEnd);
         registry.openReview(address(governor), PROPOSAL_ID);
 
         // Pause the registry.

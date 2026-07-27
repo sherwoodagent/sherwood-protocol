@@ -1,164 +1,422 @@
-[
-  {
-    "label": "vault",
-    "slot": "0",
-    "offset": 0,
-    "type": "t_address"
-  },
-  {
-    "label": "protocolConfig",
-    "slot": "1",
-    "offset": 0,
-    "type": "t_address"
-  },
-  {
-    "label": "factory",
-    "slot": "2",
-    "offset": 0,
-    "type": "t_address"
-  },
-  {
-    "label": "_params",
-    "slot": "3",
-    "offset": 0,
-    "type": "t_struct(GovernorParams)_storage"
-  },
-  {
-    "label": "_bootstrapOwner",
-    "slot": "12",
-    "offset": 0,
-    "type": "t_address"
-  },
-  {
-    "label": "_maxCapitalBps",
-    "slot": "13",
-    "offset": 0,
-    "type": "t_uint256"
-  },
-  {
-    "label": "__paramsGap",
-    "slot": "14",
-    "offset": 0,
-    "type": "t_array(t_uint256)_storage"
-  },
-  {
-    "label": "__emergencyGap",
-    "slot": "21",
-    "offset": 0,
-    "type": "t_array(t_uint256)_storage"
-  },
-  {
-    "label": "_proposalCount",
-    "slot": "31",
-    "offset": 0,
-    "type": "t_uint256"
-  },
-  {
-    "label": "_proposals",
-    "slot": "32",
-    "offset": 0,
-    "type": "t_mapping(t_uint256,t_struct(StrategyProposal)_storage)"
-  },
-  {
-    "label": "_hasVoted",
-    "slot": "33",
-    "offset": 0,
-    "type": "t_mapping(t_uint256,t_mapping(t_address,t_bool))"
-  },
-  {
-    "label": "_capitalSnapshots",
-    "slot": "34",
-    "offset": 0,
-    "type": "t_mapping(t_uint256,t_uint256)"
-  },
-  {
-    "label": "_activeProposal",
-    "slot": "35",
-    "offset": 0,
-    "type": "t_uint256"
-  },
-  {
-    "label": "_lastSettledAt",
-    "slot": "36",
-    "offset": 0,
-    "type": "t_uint256"
-  },
-  {
-    "label": "_coProposers",
-    "slot": "37",
-    "offset": 0,
-    "type": "t_mapping(t_uint256,t_array(t_struct(CoProposer)_storage)dyn_storage)"
-  },
-  {
-    "label": "coProposerApprovals",
-    "slot": "38",
-    "offset": 0,
-    "type": "t_mapping(t_uint256,t_mapping(t_address,t_bool))"
-  },
-  {
-    "label": "collaborationDeadline",
-    "slot": "39",
-    "offset": 0,
-    "type": "t_mapping(t_uint256,t_uint256)"
-  },
-  {
-    "label": "_reentrancyStatus",
-    "slot": "40",
-    "offset": 0,
-    "type": "t_uint256"
-  },
-  {
-    "label": "_executeCalls",
-    "slot": "41",
-    "offset": 0,
-    "type": "t_mapping(t_uint256,t_array(t_struct(Call)_storage)dyn_storage)"
-  },
-  {
-    "label": "_settlementCalls",
-    "slot": "42",
-    "offset": 0,
-    "type": "t_mapping(t_uint256,t_array(t_struct(Call)_storage)dyn_storage)"
-  },
-  {
-    "label": "_guardianRegistry",
-    "slot": "43",
-    "offset": 0,
-    "type": "t_address"
-  },
-  {
-    "label": "_openProposalCount",
-    "slot": "44",
-    "offset": 0,
-    "type": "t_uint256"
-  },
-  {
-    "label": "_unclaimedFees",
-    "slot": "45",
-    "offset": 0,
-    "type": "t_mapping(t_bytes32,t_uint256)"
-  },
-  {
-    "label": "_approvedCount",
-    "slot": "46",
-    "offset": 0,
-    "type": "t_mapping(t_uint256,t_uint256)"
-  },
-  {
-    "label": "_draftTimingSnap",
-    "slot": "47",
-    "offset": 0,
-    "type": "t_mapping(t_uint256,t_uint256)"
-  },
-  {
-    "label": "_tierRegistry",
-    "slot": "48",
-    "offset": 0,
-    "type": "t_address"
-  },
-  {
-    "label": "__gap",
-    "slot": "49",
-    "offset": 0,
-    "type": "t_array(t_uint256)_storage"
+{
+  "storage": [
+    {
+      "label": "_guardianRegistry",
+      "slot": "0",
+      "offset": 0,
+      "type": "t_address"
+    },
+    {
+      "label": "_proposals",
+      "slot": "1",
+      "offset": 0,
+      "type": "t_mapping(t_uint256,t_struct(StrategyProposal)_storage)"
+    },
+    {
+      "label": "_openProposalCount",
+      "slot": "2",
+      "offset": 0,
+      "type": "t_uint256"
+    },
+    {
+      "label": "_lastSettledAt",
+      "slot": "3",
+      "offset": 0,
+      "type": "t_uint256"
+    },
+    {
+      "label": "collaborationDeadline",
+      "slot": "4",
+      "offset": 0,
+      "type": "t_mapping(t_uint256,t_uint256)"
+    },
+    {
+      "label": "__lifecycleGap",
+      "slot": "5",
+      "offset": 0,
+      "type": "t_array(t_uint256)10_storage"
+    },
+    {
+      "label": "vault",
+      "slot": "15",
+      "offset": 0,
+      "type": "t_address"
+    },
+    {
+      "label": "protocolConfig",
+      "slot": "16",
+      "offset": 0,
+      "type": "t_address"
+    },
+    {
+      "label": "factory",
+      "slot": "17",
+      "offset": 0,
+      "type": "t_address"
+    },
+    {
+      "label": "_params",
+      "slot": "18",
+      "offset": 0,
+      "type": "t_struct(GovernorParams)_storage"
+    },
+    {
+      "label": "_bootstrapOwner",
+      "slot": "27",
+      "offset": 0,
+      "type": "t_address"
+    },
+    {
+      "label": "_maxCapitalBps",
+      "slot": "28",
+      "offset": 0,
+      "type": "t_uint256"
+    },
+    {
+      "label": "__paramsGap",
+      "slot": "29",
+      "offset": 0,
+      "type": "t_array(t_uint256)7_storage"
+    },
+    {
+      "label": "__emergencyGap",
+      "slot": "36",
+      "offset": 0,
+      "type": "t_array(t_uint256)10_storage"
+    },
+    {
+      "label": "_proposalCount",
+      "slot": "46",
+      "offset": 0,
+      "type": "t_uint256"
+    },
+    {
+      "label": "_hasVoted",
+      "slot": "47",
+      "offset": 0,
+      "type": "t_mapping(t_uint256,t_mapping(t_address,t_bool))"
+    },
+    {
+      "label": "_capitalSnapshots",
+      "slot": "48",
+      "offset": 0,
+      "type": "t_mapping(t_uint256,t_uint256)"
+    },
+    {
+      "label": "_activeProposal",
+      "slot": "49",
+      "offset": 0,
+      "type": "t_uint256"
+    },
+    {
+      "label": "_coProposers",
+      "slot": "50",
+      "offset": 0,
+      "type": "t_mapping(t_uint256,t_array(t_struct(CoProposer)_storage)dyn_storage)"
+    },
+    {
+      "label": "coProposerApprovals",
+      "slot": "51",
+      "offset": 0,
+      "type": "t_mapping(t_uint256,t_mapping(t_address,t_bool))"
+    },
+    {
+      "label": "_reentrancyStatus",
+      "slot": "52",
+      "offset": 0,
+      "type": "t_uint256"
+    },
+    {
+      "label": "_executeCalls",
+      "slot": "53",
+      "offset": 0,
+      "type": "t_mapping(t_uint256,t_array(t_struct(Call)_storage)dyn_storage)"
+    },
+    {
+      "label": "_settlementCalls",
+      "slot": "54",
+      "offset": 0,
+      "type": "t_mapping(t_uint256,t_array(t_struct(Call)_storage)dyn_storage)"
+    },
+    {
+      "label": "_unclaimedFees",
+      "slot": "55",
+      "offset": 0,
+      "type": "t_mapping(t_bytes32,t_uint256)"
+    },
+    {
+      "label": "_approvedCount",
+      "slot": "56",
+      "offset": 0,
+      "type": "t_mapping(t_uint256,t_uint256)"
+    },
+    {
+      "label": "_draftTimingSnap",
+      "slot": "57",
+      "offset": 0,
+      "type": "t_mapping(t_uint256,t_uint256)"
+    },
+    {
+      "label": "_tierRegistry",
+      "slot": "58",
+      "offset": 0,
+      "type": "t_address"
+    },
+    {
+      "label": "__gap",
+      "slot": "59",
+      "offset": 0,
+      "type": "t_array(t_uint256)33_storage"
+    }
+  ],
+  "types": {
+    "t_struct(Call)_storage": [
+      {
+        "label": "target",
+        "slot": "0",
+        "offset": 0,
+        "type": "t_address"
+      },
+      {
+        "label": "data",
+        "slot": "1",
+        "offset": 0,
+        "type": "t_bytes_storage"
+      },
+      {
+        "label": "value",
+        "slot": "2",
+        "offset": 0,
+        "type": "t_uint256"
+      }
+    ],
+    "t_struct(CoProposer)_storage": [
+      {
+        "label": "agent",
+        "slot": "0",
+        "offset": 0,
+        "type": "t_address"
+      },
+      {
+        "label": "splitBps",
+        "slot": "1",
+        "offset": 0,
+        "type": "t_uint256"
+      }
+    ],
+    "t_struct(GovernorParams)_storage": [
+      {
+        "label": "votingPeriod",
+        "slot": "0",
+        "offset": 0,
+        "type": "t_uint256"
+      },
+      {
+        "label": "executionWindow",
+        "slot": "1",
+        "offset": 0,
+        "type": "t_uint256"
+      },
+      {
+        "label": "vetoThresholdBps",
+        "slot": "2",
+        "offset": 0,
+        "type": "t_uint256"
+      },
+      {
+        "label": "maxPerformanceFeeBps",
+        "slot": "3",
+        "offset": 0,
+        "type": "t_uint256"
+      },
+      {
+        "label": "cooldownPeriod",
+        "slot": "4",
+        "offset": 0,
+        "type": "t_uint256"
+      },
+      {
+        "label": "collaborationWindow",
+        "slot": "5",
+        "offset": 0,
+        "type": "t_uint256"
+      },
+      {
+        "label": "maxCoProposers",
+        "slot": "6",
+        "offset": 0,
+        "type": "t_uint256"
+      },
+      {
+        "label": "minStrategyDuration",
+        "slot": "7",
+        "offset": 0,
+        "type": "t_uint256"
+      },
+      {
+        "label": "maxStrategyDuration",
+        "slot": "8",
+        "offset": 0,
+        "type": "t_uint256"
+      }
+    ],
+    "t_struct(StrategyProposal)_storage": [
+      {
+        "label": "id",
+        "slot": "0",
+        "offset": 0,
+        "type": "t_uint256"
+      },
+      {
+        "label": "proposer",
+        "slot": "1",
+        "offset": 0,
+        "type": "t_address"
+      },
+      {
+        "label": "vault",
+        "slot": "2",
+        "offset": 0,
+        "type": "t_address"
+      },
+      {
+        "label": "strategy",
+        "slot": "3",
+        "offset": 0,
+        "type": "t_address"
+      },
+      {
+        "label": "metadataURI",
+        "slot": "4",
+        "offset": 0,
+        "type": "t_string_storage"
+      },
+      {
+        "label": "performanceFeeBps",
+        "slot": "5",
+        "offset": 0,
+        "type": "t_uint256"
+      },
+      {
+        "label": "strategyDuration",
+        "slot": "6",
+        "offset": 0,
+        "type": "t_uint256"
+      },
+      {
+        "label": "votesFor",
+        "slot": "7",
+        "offset": 0,
+        "type": "t_uint256"
+      },
+      {
+        "label": "votesAgainst",
+        "slot": "8",
+        "offset": 0,
+        "type": "t_uint256"
+      },
+      {
+        "label": "votesAbstain",
+        "slot": "9",
+        "offset": 0,
+        "type": "t_uint256"
+      },
+      {
+        "label": "snapshotTimestamp",
+        "slot": "10",
+        "offset": 0,
+        "type": "t_uint256"
+      },
+      {
+        "label": "voteEnd",
+        "slot": "11",
+        "offset": 0,
+        "type": "t_uint256"
+      },
+      {
+        "label": "reviewEnd",
+        "slot": "12",
+        "offset": 0,
+        "type": "t_uint256"
+      },
+      {
+        "label": "executeBy",
+        "slot": "13",
+        "offset": 0,
+        "type": "t_uint256"
+      },
+      {
+        "label": "executedAt",
+        "slot": "14",
+        "offset": 0,
+        "type": "t_uint256"
+      },
+      {
+        "label": "state",
+        "slot": "15",
+        "offset": 0,
+        "type": "t_enum(ProposalState)"
+      },
+      {
+        "label": "vetoThresholdBps",
+        "slot": "16",
+        "offset": 0,
+        "type": "t_uint256"
+      },
+      {
+        "label": "snapshotProtocolFeeBps",
+        "slot": "17",
+        "offset": 0,
+        "type": "t_uint256"
+      },
+      {
+        "label": "snapshotProtocolFeeRecipient",
+        "slot": "18",
+        "offset": 0,
+        "type": "t_address"
+      },
+      {
+        "label": "snapshotGuardianFeeBps",
+        "slot": "19",
+        "offset": 0,
+        "type": "t_uint256"
+      },
+      {
+        "label": "snapshotGuardiansFeeRecipient",
+        "slot": "20",
+        "offset": 0,
+        "type": "t_address"
+      },
+      {
+        "label": "selfManagesFees",
+        "slot": "20",
+        "offset": 20,
+        "type": "t_bool"
+      },
+      {
+        "label": "maxCapital",
+        "slot": "21",
+        "offset": 0,
+        "type": "t_uint256"
+      },
+      {
+        "label": "maxDrawdownBps",
+        "slot": "22",
+        "offset": 0,
+        "type": "t_uint16"
+      },
+      {
+        "label": "envelopeTier",
+        "slot": "22",
+        "offset": 2,
+        "type": "t_uint8"
+      },
+      {
+        "label": "requiredCoverage",
+        "slot": "23",
+        "offset": 0,
+        "type": "t_uint256"
+      }
+    ]
   }
-]
+}

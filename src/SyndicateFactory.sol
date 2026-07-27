@@ -328,7 +328,7 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         );
         address govProxy = address(new BeaconProxy(beacon, govInitData));
         _governorOf[vault] = govProxy;
-        IGuardianRegistry(guardianRegistry).addGovernor(govProxy);
+        IGuardianRegistry(guardianRegistry).addGovernor(govProxy, vault);
         // Push the adapter-selector tier registry into the fresh governor
         // (spec §3.2). `setTierRegistry` is onlyFactory, so this is the sole
         // wiring point. When `tierRegistry` is unset the governor keeps its

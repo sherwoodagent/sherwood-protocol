@@ -86,7 +86,21 @@ contract MockRegistryMinimal is IGuardianRegistry {
         revert NotImplemented();
     }
 
-    function addGovernor(address) external pure {
+    function addGovernor(address, address) external pure {
+        revert NotImplemented();
+    }
+
+    /// @dev The governor pushes the review window here at every Draft/Pending
+    ///      transition (review registration). Accepted as a no-op: this mock
+    ///      models a "no review" cohort, so there is no window state to keep.
+    ///      Reverting would brick `propose()` for every governor unit test.
+    function registerReview(uint256, uint256, uint256) external pure {}
+
+    function reviewWindow(address, uint256) external pure returns (uint64, uint64) {
+        revert NotImplemented();
+    }
+
+    function vaultOf(address) external pure returns (address) {
         revert NotImplemented();
     }
 
@@ -126,12 +140,27 @@ contract MockRegistryMinimal is IGuardianRegistry {
         revert NotImplemented();
     }
 
+    /// @dev The stub is never paused: it has no pause state to flip, and the
+    ///      governor consults this before holding a proposal in GuardianReview.
+    function paused() external pure returns (bool) {
+        return false;
+    }
+
     function setBlockQuorumBps(uint256) external pure {
         revert NotImplemented();
     }
 
     function getApproverWeights(address, uint256) external pure returns (address[] memory, uint128[] memory, uint128) {
         revert NotImplemented();
+    }
+
+    /// @dev Read by `ProposalLifecycle._afterVote` in place of the old
+    ///      `getReviewState` 4-tuple. `Cleared` is the exact translation of this
+    ///      mock's long-standing default (`resolved = true, blocked = false`):
+    ///      a passing vote maps straight to Approved once the vote window
+    ///      closes, preserving the "no review" cohort semantics above.
+    function outcomeOf(address, uint256) external pure returns (ReviewOutcome) {
+        return ReviewOutcome.Cleared;
     }
 
     function factory() external pure returns (address) {

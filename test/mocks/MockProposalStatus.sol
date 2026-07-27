@@ -2,7 +2,6 @@
 pragma solidity 0.8.28;
 
 import {IProposalStatus} from "../../src/interfaces/IProposalStatus.sol";
-import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 
 /// @notice Canonical test adapter for the vault↔governance seam: satisfies
 ///         `IProposalStatus` (the ONLY governance surface the vault reads) in a
@@ -40,8 +39,7 @@ contract MockProposalStatus is IProposalStatus {
         return openCount;
     }
 
-    function getProposal(uint256) external view returns (ISyndicateGovernor.StrategyProposal memory p) {
-        p.id = activePid;
-        p.strategy = strategy;
+    function strategyOf(uint256) external view returns (address) {
+        return strategy;
     }
 }

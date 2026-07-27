@@ -4,7 +4,6 @@ pragma solidity 0.8.28;
 import {Test} from "forge-std/Test.sol";
 import {SyndicateVault} from "../../src/SyndicateVault.sol";
 import {ISyndicateVault} from "../../src/interfaces/ISyndicateVault.sol";
-import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
@@ -75,7 +74,7 @@ contract VaultRedemptionLockSemanticsTest is Test {
     ///      drives the MS-H4 deposit lock (Pending..Executed). Optional
     ///      `strategy` parameter (defaults to address(0)) is the address the
     ///      vault will resolve as `activeStrategyAdapter()` via
-    ///      `getProposal(activePid).strategy`.
+    ///      `strategyOf(activePid)`.
     function _mockState(bool active, uint256 openCount) internal {
         _mockStateWithStrategy(active, openCount, address(0));
     }
@@ -85,13 +84,7 @@ contract VaultRedemptionLockSemanticsTest is Test {
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal()"), abi.encode(pid));
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("openProposalCount()"), abi.encode(openCount));
         if (active) {
-            ISyndicateGovernor.StrategyProposal memory p;
-            p.id = pid;
-            p.vault = address(vault);
-            p.strategy = strategy;
-            vm.mockCall(
-                MOCK_GOVERNOR, abi.encodeWithSelector(ISyndicateGovernor.getProposal.selector, pid), abi.encode(p)
-            );
+            vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("strategyOf(uint256)", pid), abi.encode(strategy));
         }
     }
 

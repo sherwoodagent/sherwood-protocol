@@ -170,8 +170,11 @@ contract GuardianReviewLifecycleTest is Test {
         registry = GuardianRegistry(address(new ERC1967Proxy(address(regImpl), regInit)));
         // Authorize the per-vault governor on the composite-key registry
         // (replaces the removed governor.addVault wiring).
+        // Hoisted: `vault()` is a call, so evaluating it as an argument would
+        // consume the prank and leave `addGovernor` unauthorized.
+        address govVault = governor.vault();
         vm.prank(registry.factory());
-        registry.addGovernor(address(governor));
+        registry.addGovernor(address(governor), govVault);
         require(address(registry) == predictedRegistryProxy, "registry addr mismatch");
 
         // Resolve the registry ↔ sWOOD circular dependency.
@@ -291,15 +294,18 @@ contract GuardianReviewLifecycleTest is Test {
         vm.prank(g2);
         registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve);
 
-        // Review ends → state resolves to Approved (no blocks).
+        // Review ends → the view resolves to Approved IMMEDIATELY. Pre-refactor
+        // it reported GuardianReview here until a mutating call poked
+        // `resolveReview`; `stateOf` is now a true view and never lags a
+        // determinable outcome, so no poke is needed to learn the fate.
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
         assertEq(
             uint256(governor.getProposalState(pid)),
-            uint256(ISyndicateGovernor.ProposalState.GuardianReview),
-            "before resolveReview, the view path still sees GuardianReview"
+            uint256(ISyndicateGovernor.ProposalState.Approved),
+            "true view: Approved as soon as reviewEnd passes with no block quorum"
         );
 
-        // Execute drives `_resolveState` which calls `resolveReview`.
+        // Execute drives `_commitState`, which performs the economic commit.
         governor.executeProposal(pid);
         assertEq(
             uint256(governor.getProposal(pid).state),

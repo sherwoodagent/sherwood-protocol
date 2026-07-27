@@ -170,7 +170,10 @@ contract GovernorEmergencyTest is Test {
         // Authorize the per-vault governor on the composite-key registry
         // (replaces the removed governor.addVault wiring).
         vm.prank(registry.factory());
-        registry.addGovernor(address(governor));
+        // The vault is load-bearing, not a placeholder: the emergency slash path
+        // resolves its owner-bond target from `vaultOf[governor]` (it no longer
+        // calls back into the governor for it).
+        registry.addGovernor(address(governor), address(vault));
         require(address(registry) == predictedRegistryProxy, "registry addr mismatch");
 
         // Resolve the registry ↔ sWOOD circular dependency.
