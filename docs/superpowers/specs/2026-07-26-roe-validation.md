@@ -8,12 +8,10 @@ launch parameters."*
 
 **Depends on:** the fee model in `docs/specs/2026-07-24-fee-model-design.md`
 (branch `claude/fee-mechanism-design-lzl07b`, rev. 3 — "2 and 20"), and
-`2026-07-26-capped-duration-coverage.md` (PR #22).
+`2026-07-26-capped-duration-coverage.md`, which landed with PR #22.
 
-**Home:** written in the Plan F worktree for convenience. Plan F is parked as v2
-(draft PR #28), so **this ADR must be cherry-picked onto the branch where §4 is
-signed off** — PR #22 is the natural home, since the capped-duration ADR already
-lives there.
+**Acted on by:** `2026-07-27-tier-policy-v1.md`, which records the resulting
+governance decision, and PR #37, which implements it.
 
 ---
 

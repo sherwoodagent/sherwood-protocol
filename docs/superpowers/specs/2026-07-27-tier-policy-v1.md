@@ -9,9 +9,10 @@ That ADR established *whether* guardians can afford to underwrite; this one reco
 **Unblocks:** lowering `ExposureLedger.quorumTierThreshold`, whose natspec says
 "Lowering is gated on the §3.10 ROE validation — a BLOCKING launch gate."
 
-**Home:** written in the Plan F worktree. Plan F is parked as v2 (draft PR #28), so
-**cherry-pick this onto the branch where §4 is signed off** — PR #22, alongside the
-capped-duration and ROE ADRs.
+**Implemented by:** PR #37 — `ProtocolConfig.maxEnvelopeTier` with checks at propose
+and execute, and `quorumTierThreshold` defaulted to 0. The execute-site rationale in
+§ Implementation (a) was corrected during that implementation; the correction is
+recorded inline rather than silently applied.
 
 ---
 
