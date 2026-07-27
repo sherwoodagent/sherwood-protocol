@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
 /// @title ICompensationEscrow
 /// @notice Snapshot-gated victim compensation for the guardian
 ///         economic-security model (spec 2026-07-22 §3.8). Slash proceeds fund
@@ -18,6 +20,7 @@ interface ICompensationEscrow {
     error CaseNotFound();
     error InvalidWindow();
     error ZeroAddress();
+    error BackstopIsVault();
 
     event CaseOpened(
         uint256 indexed caseId, address indexed vault, uint256 indexed snapshotTimestamp, uint256 proceeds
@@ -39,14 +42,23 @@ interface ICompensationEscrow {
     ///      (`proceeds - redeemed`) so a case can never pay out of a sibling
     ///      case's funds. Returns 0 once redeemed or swept.
     ///
-    /// @dev CLAIM BASIS (accepted edge, decision D1) — integrators read this:
-    ///      apportionment uses the vault's ERC20Votes CHECKPOINTS, not raw
-    ///      balances, because Solidity keeps no historical balance.
-    ///      `SyndicateVault` auto-delegates on receipt, so `getPastVotes(h, t)`
-    ///      equals h's balance for any holder that never delegated away. A
-    ///      holder that DID explicitly delegate has its compensation credited to
-    ///      the DELEGATE, not to itself. Accepted for v1b; revisit if
-    ///      vault-share delegation becomes common.
+    /// @dev CLAIM BASIS (decision D1) — integrators read this: apportionment
+    ///      uses the vault's ERC20Votes CHECKPOINTS, not raw balances, because
+    ///      Solidity keeps no historical balance. `SyndicateVault._update`
+    ///      auto-delegates EVERY receipt (mint and plain transfer), so
+    ///      `getPastVotes(h, t)` equals h's balance for any holder that never
+    ///      delegated away; the withdrawal queue pays its custody claim through
+    ///      to request owners via `claimCompensation`. On a LIVE upgraded
+    ///      vault, a holder whose last receipt predates the upgrade and who
+    ///      received only by transfer stays undelegated until its next receipt.
+    ///
+    /// @dev KNOWN OPEN F1 RECOUPMENT CHANNEL: a holder that explicitly
+    ///      delegated has its compensation credited to the DELEGATE, not to
+    ///      itself. Delegation is free and permissionless, so a coalition can
+    ///      solicit delegations pre-drain and collect the delegating cohort's
+    ///      compensation. Closed by Plan D/E or a balance checkpoint — see the
+    ///      threat model in `CompensationEscrow`'s contract natspec and spec
+    ///      §3.8.
     function claimable(uint256 caseId, address holder) external view returns (uint256);
     function caseOf(uint256 caseId)
         external
@@ -57,9 +69,20 @@ interface ICompensationEscrow {
             uint256 proceeds,
             uint256 redeemed,
             uint256 openedAt,
+            uint256 residueWindowAtOpen,
             bool swept
         );
+
+    /// @notice `openedAt + residueWindowAtOpen` for `caseId` — the instant
+    ///         `sweepResidue` becomes callable. Reverts `CaseNotFound` for an
+    ///         unopened case.
+    function deadlineOf(uint256 caseId) external view returns (uint256);
     function totalEscrowed() external view returns (uint256);
+
+    /// @notice The payout token. Exposed so a claimant contract (the withdrawal
+    ///         queue's `claimCompensation`) can measure what it actually
+    ///         received rather than trusting the escrow's own reporting.
+    function wood() external view returns (IERC20);
 
     function setAuthorizedFunder(address funder) external;
     function setBackstop(address backstop) external;
