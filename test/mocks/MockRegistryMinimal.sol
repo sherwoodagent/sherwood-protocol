@@ -4,6 +4,7 @@ pragma solidity 0.8.28;
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {IGuardianRegistry} from "../../src/interfaces/IGuardianRegistry.sol";
 import {IStakedWood} from "../../src/interfaces/IStakedWood.sol";
+import {IExposureLedger} from "../../src/interfaces/IExposureLedger.sol";
 
 /// @notice Minimal guardian-registry mock exposing the read surface consumed by
 ///         SyndicateGovernor: `reviewPeriod()` (called during `propose` /
@@ -147,6 +148,14 @@ contract MockRegistryMinimal is IGuardianRegistry {
     }
 
     function setBlockQuorumBps(uint256) external pure {
+        revert NotImplemented();
+    }
+
+    function setExposureLedger(address) external pure {
+        revert NotImplemented();
+    }
+
+    function exposureLedger() external pure returns (IExposureLedger) {
         revert NotImplemented();
     }
 

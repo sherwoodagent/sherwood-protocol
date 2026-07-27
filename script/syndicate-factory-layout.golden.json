@@ -121,10 +121,22 @@
       "type": "t_address"
     },
     {
-      "label": "__gap",
+      "label": "exposureLedger",
       "slot": "20",
       "offset": 0,
-      "type": "t_array(t_uint256)45_storage"
+      "type": "t_address"
+    },
+    {
+      "label": "bondEscrow",
+      "slot": "21",
+      "offset": 0,
+      "type": "t_address"
+    },
+    {
+      "label": "__gap",
+      "slot": "22",
+      "offset": 0,
+      "type": "t_array(t_uint256)43_storage"
     }
   ],
   "types": {
