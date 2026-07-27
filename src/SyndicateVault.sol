@@ -646,6 +646,21 @@ contract SyndicateVault is
     {
         if (from != address(0) && to != address(0) && _isLaneALocked(from)) revert SharesLocked();
         super._update(from, to, value);
+        // AUTO-DELEGATE ON EVERY RECEIPT (PR #24 review 🔴1). Decision D1 makes
+        // the compensation escrow apportion on `getPastVotes`, which equals
+        // balance only if every holder is delegated. Delegating only on the
+        // MINT paths left plain ERC20 transfers — including `requestRedeem`'s
+        // move into queue custody — landing on undelegated addresses with zero
+        // votes at every snapshot: a secondary buyer or a queued exiter would
+        // be silently written out of victim compensation while still counted
+        // in its denominator. Runs AFTER `super._update` so the recipient's
+        // post-receipt balance is what checkpoints. Holders that explicitly
+        // delegated away keep their choice (`delegates(to) != 0`). On a LIVE
+        // vault this upgrade heals an undelegated holder at its next receipt;
+        // it cannot retroactively re-checkpoint the past.
+        if (to != address(0) && delegates(to) == address(0)) {
+            _delegate(to, to);
+        }
     }
 
     /// @dev Use timestamp-based voting checkpoints instead of block numbers
@@ -858,11 +873,7 @@ contract SyndicateVault is
         if (_depositsLocked() && !laneA) revert DepositsLocked();
         _requireApprovedDepositor(receiver);
         super._deposit(caller, receiver, assets, shares);
-
-        // Auto-delegate: if receiver has no delegate, delegate to self
-        if (delegates(receiver) == address(0)) {
-            _delegate(receiver, receiver);
-        }
+        // Auto-delegation happens in `_update` (every receipt path).
 
         // G1: a Lane A entry locks the receiver's shares until this proposal
         // settles — closes the deposit-low / exit-high intra-proposal MEV.
@@ -986,12 +997,16 @@ contract SyndicateVault is
         if (msg.sender != owner_) {
             _spendAllowance(owner_, msg.sender, shares);
         }
-        // Move shares into queue custody. Voting weight at the queue address is 0
-        // (queue contract has no delegate). For proposals already open at request
-        // time, the voter's checkpoint at `snapshotTimestamp` is frozen with the
-        // pre-transfer weight, so vote power is preserved for in-flight proposals.
-        // Queued shares forfeit voting power for any proposal opened after escrow.
-        // Shares are burned later by `claim`.
+        // Move shares into queue custody. `_update` auto-delegates the queue to
+        // itself, so custody shares keep checkpointed voting weight AT THE QUEUE
+        // — which is what lets the compensation escrow count them at a pre-drain
+        // snapshot and the queue pay that claim through to request owners
+        // (`VaultWithdrawalQueue.claimCompensation`, PR #24 review 🔴1). The
+        // queue never votes: it has no governance surface. For proposals already
+        // open at request time, the voter's checkpoint at `snapshotTimestamp` is
+        // frozen with the pre-transfer weight, so vote power is preserved for
+        // in-flight proposals. Queued shares forfeit voting power for any
+        // proposal opened after escrow. Shares are burned later by `claim`.
         uint256 pid = _activePid();
         _transfer(owner_, q, shares);
         requestId = IVaultWithdrawalQueue(q).queueRedeem(owner_, shares, pid);
@@ -1059,10 +1074,10 @@ contract SyndicateVault is
     ///         immediately before this call. Auto-delegates for voting power.
     /// @dev No `nonReentrant`: there is no external call (mint + delegate only),
     ///      and the only caller — the queue's `claim` — is itself `nonReentrant`.
+    ///      Auto-delegation happens in `_update`.
     function settleDeposit(uint256 shares, address to) external {
         if (msg.sender != _withdrawalQueue) revert NotQueue();
         _mint(to, shares);
-        if (delegates(to) == address(0)) _delegate(to, to);
     }
 
     /// @inheritdoc ISyndicateVault
@@ -1089,8 +1104,7 @@ contract SyndicateVault is
     ///      strategies run. The active-strategy gate is the trust boundary.
     function strategyMint(address to, uint256 shares) external onlyActiveStrategy whenNotPaused {
         _requireApprovedDepositor(to);
-        _mint(to, shares);
-        if (delegates(to) == address(0)) _delegate(to, to);
+        _mint(to, shares); // auto-delegation happens in `_update`
     }
 
     /// @inheritdoc ISyndicateVault

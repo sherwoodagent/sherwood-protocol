@@ -2,6 +2,7 @@
 pragma solidity 0.8.28;
 
 import {IVaultWithdrawalQueue} from "../interfaces/IVaultWithdrawalQueue.sol";
+import {ICompensationEscrow} from "../interfaces/ICompensationEscrow.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
@@ -15,6 +16,9 @@ interface IRequestableVault {
     /// @notice Queue-only: mint `shares` to `to`. Assets were pushed to the
     ///         vault by the queue immediately before this call.
     function settleDeposit(uint256 shares, address to) external;
+    /// @notice ERC20Votes read — the queue's own checkpointed custody balance
+    ///         at a compensation case's snapshot (pay-through denominator).
+    function getPastVotes(address account, uint256 timepoint) external view returns (uint256);
 }
 
 /// @title VaultWithdrawalQueue (Lane B async request substrate)
@@ -60,6 +64,22 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
     uint256 private _pendingDepositAssets; // escrowed deposit assets
     uint256 private _reservedAssets; // frozen assets owed to stamped-unclaimed redeems
 
+    /// @dev One pulled compensation-escrow case (PR #24 review 🔴1). `total` is
+    ///      what the escrow ACTUALLY transferred here (balance-delta measured),
+    ///      `votes` the queue's checkpointed custody balance at the case
+    ///      snapshot — the pay-through denominator. Keyed by (escrow, caseId)
+    ///      so an unrelated contract passed as `escrow` can never alias a real
+    ///      case's bookkeeping.
+    struct CompCase {
+        uint256 total;
+        uint256 votes;
+        uint256 snapshotTimestamp;
+        bool pulled;
+    }
+
+    mapping(address escrow => mapping(uint256 caseId => CompCase)) private _compCases;
+    mapping(address escrow => mapping(uint256 caseId => mapping(uint256 requestId => bool))) private _compClaimed;
+
     constructor(address vault_) {
         if (vault_ == address(0)) revert NotVault();
         vault = vault_;
@@ -98,7 +118,18 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
 
     function _push(address owner_, uint256 amount, uint256 pid, RequestKind kind) private returns (uint256 id) {
         id = _requests.length;
-        _requests.push(Request({owner: owner_, amount: amount, pid: pid, kind: kind, claimed: false, cancelled: false}));
+        _requests.push(
+            Request({
+                owner: owner_,
+                amount: amount,
+                pid: pid,
+                kind: kind,
+                claimed: false,
+                cancelled: false,
+                queuedAt: uint48(block.timestamp),
+                closedAt: 0
+            })
+        );
         _byOwner[owner_].push(id);
     }
 
@@ -140,6 +171,7 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
         if (IRequestableVault(vault).redemptionsLocked()) revert VaultLocked();
 
         r.claimed = true;
+        r.closedAt = uint48(block.timestamp);
         uint256 amount = r.amount;
 
         if (r.kind == RequestKind.Redeem) {
@@ -188,6 +220,7 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
         if (_settlePrice[r.pid].stamped) revert AlreadySettled();
 
         r.cancelled = true;
+        r.closedAt = uint48(block.timestamp);
         uint256 amount = r.amount;
         if (r.kind == RequestKind.Redeem) {
             _pendingShares -= amount;
@@ -198,6 +231,99 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
             IERC20(IRequestableVault(vault).asset()).safeTransfer(r.owner, amount);
         }
         emit RequestCancelled(requestId, r.owner);
+    }
+
+    // ── Compensation pay-through (PR #24 review 🔴1) ──
+
+    /// @inheritdoc IVaultWithdrawalQueue
+    /// @dev The queue is the holder of record the compensation escrow sees for
+    ///      every share sitting in custody at a case's snapshot — and
+    ///      `requestRedeem` is only callable while a proposal is open, which is
+    ///      exactly the window a drain occupies, so queued exiters are the
+    ///      MODAL victims. This pays the queue's claim through to them.
+    ///
+    ///      TRUST MODEL: `escrow` is caller-supplied and NOT trusted.
+    ///      - `total` is the measured WOOD balance delta across `redeem`, so a
+    ///        hostile "escrow" that reports a large `claimable` but transfers
+    ///        nothing distributes nothing — it can never redirect WOOD pulled
+    ///        earlier from a REAL case, because bookkeeping is keyed by
+    ///        (escrow, caseId) and payouts are bounded by that key's own
+    ///        measured `total`.
+    ///      - Payout destinations are the requests' own owners; the caller
+    ///        chooses only WHICH requests get processed, never where funds go.
+    ///      - `nonReentrant` (shared with `claim`/`cancel`) blocks a hostile
+    ///        escrow's `redeem` from re-entering queue state mid-pull.
+    ///
+    ///      ELIGIBILITY: a redeem request whose custody interval
+    ///      [queuedAt, closedAt) covers the snapshot. A request closed AT the
+    ///      snapshot timestamp is excluded — the queue's checkpoint at that
+    ///      instant no longer includes those shares (and its owner was
+    ///      re-checkpointed personally at the same instant), so inclusion
+    ///      would double-count against the queue's own votes.
+    ///
+    ///      ROUNDING: each payout floors; Σ eligible shares == the queue's
+    ///      votes at the snapshot, so total payouts never exceed `total` and
+    ///      sub-wei dust strands in the queue (mirrors the escrow's own
+    ///      dust-to-residue policy; the queue has no rescue path by design).
+    function claimCompensation(address escrow, uint256 caseId, uint256[] calldata requestIds)
+        external
+        nonReentrant
+        returns (uint256 paid)
+    {
+        CompCase storage cc = _compCases[escrow][caseId];
+        IERC20 woodToken = ICompensationEscrow(escrow).wood();
+        if (!cc.pulled) {
+            (address caseVault, uint256 snap,,,,,) = ICompensationEscrow(escrow).caseOf(caseId);
+            if (caseVault != vault) revert NotCompensationCase();
+            uint256 votes = IRequestableVault(vault).getPastVotes(address(this), snap);
+            if (votes == 0) revert NothingToClaim();
+            uint256 balBefore = woodToken.balanceOf(address(this));
+            ICompensationEscrow(escrow).redeem(caseId);
+            uint256 received = woodToken.balanceOf(address(this)) - balBefore;
+            if (received == 0) revert NothingToClaim();
+            cc.total = received;
+            cc.votes = votes;
+            cc.snapshotTimestamp = snap;
+            cc.pulled = true;
+            emit CompensationPulled(escrow, caseId, received, votes);
+        }
+
+        uint256 snapTs = cc.snapshotTimestamp;
+        for (uint256 i = 0; i < requestIds.length; i++) {
+            uint256 id = requestIds[i];
+            Request storage r = _req(id);
+            if (r.kind != RequestKind.Redeem) revert WrongKind();
+            // In custody at the snapshot: queued at-or-before it and not yet
+            // claimed/cancelled by then. `queuedAt == 0` marks a request from
+            // a pre-stamp queue build — its custody interval is unknowable.
+            if (r.queuedAt == 0 || r.queuedAt > snapTs || (r.closedAt != 0 && r.closedAt <= snapTs)) {
+                revert RequestNotEligible();
+            }
+            if (_compClaimed[escrow][caseId][id]) revert CompensationAlreadyClaimed();
+            _compClaimed[escrow][caseId][id] = true;
+            uint256 share = Math.mulDiv(cc.total, r.amount, cc.votes);
+            if (share != 0) {
+                paid += share;
+                woodToken.safeTransfer(r.owner, share);
+                emit CompensationPaid(escrow, caseId, id, r.owner, share);
+            }
+        }
+    }
+
+    /// @notice Pulled-case bookkeeping for (escrow, caseId): measured proceeds,
+    ///         snapshot votes (denominator), snapshot timestamp, pulled flag.
+    function compensationCase(address escrow, uint256 caseId)
+        external
+        view
+        returns (uint256 total, uint256 votes, uint256 snapshotTimestamp, bool pulled)
+    {
+        CompCase storage cc = _compCases[escrow][caseId];
+        return (cc.total, cc.votes, cc.snapshotTimestamp, cc.pulled);
+    }
+
+    /// @notice Whether `requestId` already received its share of (escrow, caseId).
+    function compensationClaimed(address escrow, uint256 caseId, uint256 requestId) external view returns (bool) {
+        return _compClaimed[escrow][caseId][requestId];
     }
 
     // ── Views ──

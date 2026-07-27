@@ -26,6 +26,10 @@ interface IVaultWithdrawalQueue {
     error ZeroAssets();
     error InsufficientShares();
     error WrongKind();
+    error NotCompensationCase();
+    error RequestNotEligible();
+    error CompensationAlreadyClaimed();
+    error NothingToClaim();
 
     // ── Types ──
     enum RequestKind {
@@ -40,6 +44,13 @@ interface IVaultWithdrawalQueue {
         RequestKind kind;
         bool claimed;
         bool cancelled;
+        /// @dev Custody interval stamps (PR #24 review 🔴1): `queuedAt` when the
+        ///      escrowed amount entered custody, `closedAt` when it left (claim
+        ///      or cancel; 0 while still open). `claimCompensation` uses these
+        ///      to decide whether a redeem request's shares were in queue
+        ///      custody at a compensation case's snapshot.
+        uint48 queuedAt;
+        uint48 closedAt;
     }
 
     /// @notice Frozen settlement price for a proposal, stamped at settle.
@@ -59,6 +70,10 @@ interface IVaultWithdrawalQueue {
     event RequestClaimed(uint256 indexed requestId, address indexed owner, uint256 inAmount, uint256 outAmount);
     event RequestCancelled(uint256 indexed requestId, address indexed owner);
     event SettlementStamped(uint256 indexed pid, uint256 num, uint256 den);
+    event CompensationPulled(address indexed escrow, uint256 indexed caseId, uint256 amount, uint256 votesAtSnapshot);
+    event CompensationPaid(
+        address indexed escrow, uint256 indexed caseId, uint256 indexed requestId, address owner, uint256 amount
+    );
 
     // ── Vault-only mutating ──
     function queueRedeem(address owner, uint256 shares, uint256 pid) external returns (uint256 requestId);
@@ -68,6 +83,19 @@ interface IVaultWithdrawalQueue {
     // ── Permissionless / owner ──
     function claim(uint256 requestId) external returns (uint256 outAmount);
     function cancel(uint256 requestId) external;
+
+    /// @notice Pay a compensation-escrow case through to redeem-request owners
+    ///         whose shares sat in queue custody at the case's snapshot
+    ///         (PR #24 review 🔴1: the queue is the holder of record the escrow
+    ///         sees; without this the modal victims — LPs whose exit was queued
+    ///         when the drain landed — would be paid nothing). First call for a
+    ///         case pulls the queue's whole claim from `escrow` (amount MEASURED
+    ///         by balance delta, never trusted from the escrow); each request in
+    ///         `requestIds` then receives `pulled * shares / queueVotesAtSnap`.
+    ///         Permissionless: payout destinations are the requests' own owners.
+    function claimCompensation(address escrow, uint256 caseId, uint256[] calldata requestIds)
+        external
+        returns (uint256 paid);
 
     // ── Views ──
     function vault() external view returns (address);
