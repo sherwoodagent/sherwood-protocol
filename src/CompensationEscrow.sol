@@ -35,20 +35,69 @@ interface IVaultVotesMinimal {
  *         proportionate to dollars at risk. v2 multi-collateral pays partly in
  *         stable legs.
  *
- * @dev    CLAIM BASIS (accepted edge, decision D1): apportionment uses the
- *         vault's ERC20Votes checkpoints, not raw balances — Solidity keeps no
- *         historical balance. `SyndicateVault` auto-delegates on receipt, so
- *         `getPastVotes(h, t)` equals h's balance for any holder that never
- *         delegated away. A holder that DID explicitly delegate has its
- *         compensation credited to the delegate instead. Accepted for v1b;
- *         revisit if vault-share delegation becomes common.
+ * @dev    CLAIM BASIS (decision D1): apportionment uses the vault's ERC20Votes
+ *         checkpoints, not raw balances — Solidity keeps no historical balance.
+ *         `SyndicateVault._update` auto-delegates EVERY receipt (mint AND
+ *         plain ERC20 transfer), so `getPastVotes(h, t)` equals h's balance
+ *         for any holder that never delegated away — including a secondary
+ *         buyer and the withdrawal queue's custody balance (the queue exposes
+ *         `claimCompensation` to pay its claim through to the request owners).
  *
- * @dev    Not upgradeable, and not refundable. The separation from the review
- *         path is one of STRUCTURALLY SEPARATE ACCOUNTING, not of a binding
- *         rule: the registry's `refundSlash` pays from the registry's own
- *         funded appeal reserve, never from slash proceeds, so it cannot refund
- *         a verdict. Nothing that reaches this escrow can flow back out through
- *         the registry (spec §4).
+ * @dev    CAVEAT FOR VAULTS ALREADY DEPLOYED — READ BEFORE ASSUMING COVERAGE
+ *         (PR #24 review 🟠N4). Two separate gaps; only one self-heals.
+ *
+ *         1. UNDELEGATED HOLDERS — self-heals, and can be forced. A holder
+ *            whose LAST receipt predates the `_update` upgrade and that
+ *            received only by transfer stays undelegated (zero votes) until
+ *            its next receipt. `_update` fires on a ZERO-VALUE transfer, so
+ *            any third party can arm a stranded holder for the cost of one
+ *            transfer — a keeper can heal the whole holder set without their
+ *            cooperation. Do it BEFORE a snapshot is needed: the checkpoint is
+ *            written when the transfer lands, not retroactively.
+ *
+ *         2. QUEUED EXITERS ON A PRE-EXISTING VAULT — does NOT self-heal and
+ *            is NOT retrofittable. `VaultWithdrawalQueue` is a plain
+ *            constructor deployment behind no proxy, and
+ *            `SyndicateVault.setWithdrawalQueue` is factory-only and SET-ONCE.
+ *            So on a vault deployed before this change: the vault can be
+ *            upgraded to auto-delegate, the queue therefore DOES accrue votes
+ *            at its next receipt and IS credited a claim here — but the
+ *            deployed queue has no `claimCompensation`, cannot call `redeem`,
+ *            and cannot be replaced. That cohort's entire claim strands and is
+ *            eventually swept to `backstop`. Outcome-identical to the pre-fix
+ *            state, so not a regression — but queued exiters on an existing
+ *            syndicate ARE NOT COVERED, whatever the D1 paragraph above says
+ *            about the queue paying its claim through. MIGRATION: a new
+ *            syndicate, or a vault upgrade adding a queue-replacement path.
+ *            There is no third option.
+ *
+ * @dev    KNOWN OPEN F1 RECOUPMENT CHANNEL — delegation: `delegate()` is a
+ *         free, permissionless pointer that decides who a claim belongs to. A
+ *         coalition that solicits delegations BEFORE the drain collects the
+ *         delegating cohort's entire compensation stream; the claim mapping
+ *         being non-transferable does not close this, because the ENTITLEMENT
+ *         follows the delegate pointer set before the snapshot. Closed by
+ *         Plan D/E's challenge game or by a balance checkpoint — NOT by
+ *         waiting to see whether delegation "becomes common": the party who
+ *         decides that is the attacker. See spec §3.8 threat model.
+ *
+ * @dev    Not upgradeable, and not refundable FROM THIS POT. The separation
+ *         from the review path is one of STRUCTURALLY SEPARATE ACCOUNTING, not
+ *         of a binding rule: the registry's `refundSlash` pays from the
+ *         registry's own funded appeal reserve, never from slash proceeds, so
+ *         verdict PROCEEDS cannot flow back out through the registry (spec §4).
+ *         That is a statement about the money, not the outcome — the registry
+ *         owner can still hand a verdict-slashed guardian an equivalent amount
+ *         from the appeal reserve. Whether it ever does is governance trust,
+ *         not a code guarantee.
+ *
+ * @dev    TOKEN ASSUMPTIONS: WOOD is a plain 18-dec ERC20 — no transfer fee,
+ *         no rebasing, no hooks on the escrow's side. `openCase` books
+ *         `proceeds` before pulling it, so a fee-on-transfer token would
+ *         over-book `totalEscrowed`. WOOD donated directly to the escrow (or
+ *         any balance above `totalEscrowed`) is permanently unrecoverable —
+ *         there is deliberately no rescue path that could double as an exit
+ *         for case funds.
  */
 contract CompensationEscrow is Ownable2Step, ICompensationEscrow {
     using SafeERC20 for IERC20;
@@ -148,11 +197,22 @@ contract CompensationEscrow is Ownable2Step, ICompensationEscrow {
             uint256 proceeds,
             uint256 redeemed,
             uint256 openedAt,
+            uint256 residueWindowAtOpen,
             bool swept
         )
     {
         Case storage c = _cases[caseId];
-        return (c.vault, c.snapshotTimestamp, c.proceeds, c.redeemed, c.openedAt, c.swept);
+        return (c.vault, c.snapshotTimestamp, c.proceeds, c.redeemed, c.openedAt, c.residueWindowAtOpen, c.swept);
+    }
+
+    /// @inheritdoc ICompensationEscrow
+    /// @dev The case's own frozen window, not the live `residueWindow` — a
+    ///      holder can compute its sweep deadline on-chain without replaying
+    ///      `ResidueWindowSet` events.
+    function deadlineOf(uint256 caseId) external view returns (uint256) {
+        Case storage c = _cases[caseId];
+        if (c.proceeds == 0) revert CaseNotFound();
+        return c.openedAt + c.residueWindowAtOpen;
     }
 
     /// @inheritdoc ICompensationEscrow
@@ -224,6 +284,15 @@ contract CompensationEscrow is Ownable2Step, ICompensationEscrow {
         if (block.timestamp < c.openedAt + c.residueWindowAtOpen) revert ResidueWindowOpen();
         if (c.swept) revert NothingToCompensate();
         if (backstop == address(0)) revert ZeroAddress();
+        // A TYPO-CATCHER, NOT A PROPERTY (PR #24 review, minor). This compares
+        // the backstop against `c.vault` and nothing else, so it catches the
+        // realistic misconfiguration — the owner pasting the vault address into
+        // `setBackstop` — and nothing beyond it. A backstop contract that
+        // FORWARDS to the vault bypasses it in one hop. "Residue never to live
+        // NAV" (§3.8) is therefore owner discipline plus one guardrail, not an
+        // invariant enforced in code; an earlier version of this comment
+        // claimed the stronger thing. Worth keeping for what it does catch.
+        if (backstop == c.vault) revert BackstopIsVault();
         amount = c.proceeds - c.redeemed;
         if (amount == 0) revert NothingToCompensate();
 

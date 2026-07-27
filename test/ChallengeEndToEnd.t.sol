@@ -516,7 +516,7 @@ contract ChallengeEndToEndTest is Test {
         );
         assertEq(escrow.caseCount(), 1, "one compensation case");
         uint256 caseId = escrow.caseCount();
-        (address caseVault, uint256 snapTs, uint256 proceeds, uint256 redeemed,, bool swept) = escrow.caseOf(caseId);
+        (address caseVault, uint256 snapTs, uint256 proceeds, uint256 redeemed,,, bool swept) = escrow.caseOf(caseId);
         assertEq(caseVault, address(vault), "pinned to the real vault");
         assertEq(snapTs, executedAt - 1, "and to the block before the drain executed (D6)");
         assertEq(proceeds, PROCEEDS, "the full slash reached the escrow");

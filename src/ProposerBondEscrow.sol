@@ -33,8 +33,13 @@ contract ProposerBondEscrow is IProposerBondEscrow {
     }
 
     /// @dev Integration requirement: WOOD must be a standard ERC20 — no
-    ///      transfer fee, no rebasing, no hooks. A fee-on-transfer token would
-    ///      make the escrow insolvent (recorded amounts exceed held balance).
+    ///      transfer fee, no rebasing, no hooks, AND NO BLOCKLIST (review m3).
+    ///      A fee-on-transfer token would make the escrow insolvent (recorded
+    ///      amounts exceed held balance). A blocklisting token is the quieter
+    ///      hazard: `releaseBond` pays the RECORDED proposer, so blocklisting
+    ///      that address strands the bond permanently — there is no alternate
+    ///      payee and no sweep. Informational while WOOD is in-house, and a
+    ///      hard requirement on any future bond token.
     IERC20 public immutable wood;
     IRegistryAuthMinimal public immutable registry;
 
@@ -56,6 +61,15 @@ contract ProposerBondEscrow is IProposerBondEscrow {
     }
 
     /// @inheritdoc IProposerBondEscrow
+    /// @dev `proposer` COMES FROM THE CALLER, not from `msg.sender` (review m4).
+    ///      Any authorized governor can therefore lock a bond against any
+    ///      address that has approved this escrow — and agents hold standing
+    ///      approvals in normal operation. It is a lockup grief rather than
+    ///      theft: the bond is recorded to that address and returns to it on
+    ///      release or reclaim, so nothing can be redirected. Governors are
+    ///      factory-registered, so the caller set is not open — but a
+    ///      compromised or buggy governor can freeze a third party's WOOD for
+    ///      the life of a proposal it did not consent to.
     function lockBond(uint256 proposalId, address proposer, uint256 amount) external onlyGovernor {
         if (proposer == address(0)) revert ZeroAddress();
         if (amount > type(uint96).max) revert AmountTooLarge();

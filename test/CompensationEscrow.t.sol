@@ -70,7 +70,7 @@ contract CompensationEscrowTest is Test {
         uint256 caseId = escrow.openCase(address(vault), snapTs, 10_000e18);
 
         assertEq(wood.balanceOf(address(escrow)), 10_000e18);
-        (address v, uint256 ts, uint256 proceeds, uint256 redeemed,, bool swept) = escrow.caseOf(caseId);
+        (address v, uint256 ts, uint256 proceeds, uint256 redeemed,,, bool swept) = escrow.caseOf(caseId);
         assertEq(v, address(vault));
         assertEq(ts, snapTs);
         assertEq(proceeds, 10_000e18);
@@ -274,7 +274,7 @@ contract CompensationEscrowTest is Test {
         assertEq(escrow.claimable(c1, alice), 0, "c1 claim spent");
         assertEq(escrow.claimable(c2, alice), 700e18, "c2 claim untouched");
         assertEq(escrow.claimable(c2, bob), 300e18, "c2 claim untouched");
-        (,,, uint256 redeemed2,,) = escrow.caseOf(c2);
+        (,,, uint256 redeemed2,,,) = escrow.caseOf(c2);
         assertEq(redeemed2, 0, "c2 has paid nothing");
         assertEq(escrow.totalEscrowed(), 4_000e18, "10,000 - 7,000 + 1,000");
         assertGe(wood.balanceOf(address(escrow)), escrow.totalEscrowed());
@@ -322,7 +322,7 @@ contract CompensationEscrowTest is Test {
         //    that keeps one case's holders out of another case's money.
         uint256 outstanding;
         for (uint256 i = 0; i < 3; i++) {
-            (,, uint256 proceeds, uint256 redeemed,,) = escrow.caseOf(ids[i]);
+            (,, uint256 proceeds, uint256 redeemed,,,) = escrow.caseOf(ids[i]);
             assertLe(redeemed, proceeds, "a case paid out more than its own proceeds");
             outstanding += proceeds - redeemed;
         }

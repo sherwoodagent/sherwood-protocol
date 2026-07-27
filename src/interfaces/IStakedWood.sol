@@ -31,12 +31,41 @@ interface IStakedWood {
     ///         rate nobody chose.
     error SlashBpsLengthMismatch();
 
+    /// @notice Reverts when `slashToEscrow`'s `openedAt` is in the future — the
+    ///         at-open anchor the slash legs are sized against must be a real
+    ///         past instant.
+    error VerdictNotPast();
+
+    /// @notice Reverts when `slashToEscrow`'s `approvers` names an address
+    ///         twice — the dedup that keeps a repeated approver from
+    ///         compounding past `maxSlashBps`. Order is NOT constrained
+    ///         (`ExposureLedger.slashBpsFor` feeds vote-order arrays).
+    error DuplicateApprover();
+
+    /// @notice Reverts when `slashToEscrow` names an approver already slashed
+    ///         under the same `caseKey` by an EARLIER call (PR #24 review 🟠N2).
+    /// @dev The intra-call dedup only bounds ONE array, so the severity ceiling
+    ///      bound per CALL rather than per verdict: `_slashOne` re-reads the
+    ///      live stake each time while sizing off the same `openedAt`
+    ///      checkpoint, so three sequential 5,000-bps calls against one
+    ///      approver take 8,750 bps of the bond they held at open — against a
+    ///      50% ceiling governance set. Splitting a quorum-sized batch across
+    ///      transactions stays legal (the natural workaround for a 100-approver
+    ///      batch that does not fit a block); replaying an approver does not.
+    ///      Also makes an honest retried transaction idempotent per approver.
+    error ApproverAlreadySlashed();
+
     event AuthorizedSlasherSet(address indexed slasher);
     event CompensationEscrowSet(address indexed escrow);
 
     /// @notice Correlates a verdict slash with the escrow case it funded, so
     ///         Plan D and indexers can join the two without scraping the escrow.
     event VerdictSlashRouted(bytes32 indexed caseKey, address indexed vault, uint256 total, uint256 caseId);
+
+    /// @notice A verdict slash whose compensation case could not be opened
+    ///         (`openCase` reverted); the proceeds were burned instead. The
+    ///         guardian is still slashed; the case's victims go uncompensated.
+    event VerdictSlashUncompensated(bytes32 indexed caseKey, address indexed vault, uint256 total);
 
     // ── Guardian stake ──
     function stakeAsGuardian(uint256 amount, uint256 agentId) external;
@@ -166,11 +195,20 @@ interface IStakedWood {
     /// @dev The escrow is NOT a parameter: it is owner-set state
     ///      (`compensationEscrow`), because sWOOD custodies every WOOD bond in
     ///      the protocol and a caller-named sink would carry an allowance
-    ///      against that balance. `slashBps` is clamped to
-    ///      `[minSlashBps, maxSlashBps]` — the same severity envelope the review
-    ///      path's `_severityBps` enforces — and `snapshotTimestamp` must be at
-    ///      or before `openedAt`, since any legitimate pre-drain snapshot
-    ///      precedes the verdict.
+    ///      against that balance. Each non-zero rate is clamped to
+    ///      `[minSlashBps, maxSlashBps]` — the same severity envelope the
+    ///      review path's `_severityBps` enforces. `approvers` must be
+    ///      duplicate-free (any order) AND must not repeat an approver already
+    ///      slashed under this `caseKey` by an earlier call
+    ///      (`ApproverAlreadySlashed`) — one verdict takes one slash per
+    ///      approver, so the envelope binds per VERDICT and not merely per
+    ///      call. `openedAt` must not be in the future
+    ///      and `snapshotTimestamp` must be at or before `openedAt` — honest-
+    ///      caller sanity bounds; they do NOT bind a compromised slasher, which
+    ///      chooses both timestamps freely (see the implementation natspec).
+    ///      If `openCase` reverts (unpriceable vault), the slash stands and the
+    ///      proceeds BURN (`VerdictSlashUncompensated`), so a bad vault cannot
+    ///      brick the verdict.
     /// @return total  WOOD routed to the escrow across all approvers.
     /// @return caseId The escrow case funded, or 0 when nothing was recovered.
     function slashToEscrow(
@@ -186,6 +224,11 @@ interface IStakedWood {
     function authorizedSlasher() external view returns (address);
     function setCompensationEscrow(address escrow) external;
     function compensationEscrow() external view returns (address);
+
+    /// @notice Whether `approver` has already been slashed under `caseKey`.
+    /// @dev Lets a slasher (Plan D, or a keeper resuming a batch that ran out
+    ///      of gas) resume a split verdict without re-slashing anyone.
+    function verdictSlashed(bytes32 caseKey, address approver) external view returns (bool);
 
     // ── Admin (owner-instant; owner is a multisig with external delay) ──
     function setMinGuardianStake(uint256 newMin) external;

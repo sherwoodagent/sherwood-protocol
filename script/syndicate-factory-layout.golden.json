@@ -133,10 +133,16 @@
       "type": "t_address"
     },
     {
-      "label": "__gap",
+      "label": "compensationEscrow",
       "slot": "22",
       "offset": 0,
-      "type": "t_array(t_uint256)_storage"
+      "type": "t_address"
+    },
+    {
+      "label": "__gap",
+      "slot": "23",
+      "offset": 0,
+      "type": "t_array(t_uint256)42_storage"
     }
   ],
   "types": {
