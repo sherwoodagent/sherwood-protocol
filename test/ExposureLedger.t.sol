@@ -885,6 +885,32 @@ contract ExposureLedgerTest is Test {
         assertFalse(fellBack, "recovered");
     }
 
+    /// @notice N11 — the propose-time horizon gate was fed `p.executeBy`, which
+    ///         is still ZERO on the collaborative Draft path, making the check
+    ///         `strategyDuration > block.timestamp`: unsatisfiable on any real
+    ///         chain, so the gate silently could not fire for co-proposed
+    ///         strategies.
+    ///
+    ///         `vm.warp` to real chain time is load-bearing here. Foundry starts
+    ///         at `t = 1`, where `duration > 1` is trivially true and the bug is
+    ///         invisible — which is exactly why the first version of this test
+    ///         passed against broken code.
+    function test_requireWithinCoverageHorizon_zeroDeadlineIsNotAFreePass() public {
+        vm.warp(1_800_000_000); // ~2027, i.e. a real chain
+
+        // The raw-field call the governor used to make. At `executeBy == 0` this
+        // is `3650 days > now + 60 days` -> false, so it does NOT revert: the
+        // gate is vacuous, which is the whole finding.
+        ledger.requireWithinCoverageHorizon(0, 3650 days);
+
+        // With a real deadline the same duration is refused.
+        vm.expectRevert(IExposureLedger.CoverageHorizonExceeded.selector);
+        ledger.requireWithinCoverageHorizon(block.timestamp + 1 days, 3650 days);
+
+        // ...and an in-horizon duration still passes.
+        ledger.requireWithinCoverageHorizon(block.timestamp + 1 days, 30 days);
+    }
+
     /// @notice C1 REGRESSION — the free-rider veto.
     ///
     ///         Under first-come booking an attacker could approve first and

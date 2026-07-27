@@ -615,12 +615,18 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      exactly what §2's inequality states ("coalition loss >= Σ dollar
     ///      value of slashable approver stake").
     ///
-    ///      Booking the FULL coverage against EACH approver (the earlier
-    ///      behaviour) conflated two different rules: §3.3's cap exists to stop
-    ///      ONE guardian backing MANY proposals ("approve N drains in one
-    ///      window, lose one bond once") — not to force one guardian to
-    ///      single-handedly cover ONE proposal. Committing shares enforces the
-    ///      former without imposing the latter.
+    ///      TWO DIFFERENT RULES, and the distinction is what this design turns
+    ///      on. §3.3's cap exists to stop ONE guardian backing MANY proposals
+    ///      ("approve N drains in one window, lose one bond once"). It does NOT
+    ///      require one guardian to single-handedly cover ONE proposal.
+    ///
+    ///      Reserving the full coverage per approver — the rule that SHIPS —
+    ///      enforces the cap without imposing the second reading, because the
+    ///      reservation is an upper bound on liability and `allocatedUsd` is the
+    ///      actual per-guardian split. An earlier version instead sized each
+    ///      booking to `min(free, still uncovered)`, which conflated the two in
+    ///      the other direction: the first approver absorbed everything, later
+    ///      ones booked zero, and C1's costless veto followed.
     ///
     ///      Consequence: an under-bonded guardian is no longer rejected at vote
     ///      time — it commits what it can, and the proposal simply fails the
@@ -1005,7 +1011,14 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         // executed or expired, so collapsing its reservations can no longer
         // change any quorum. Costs at most `executionWindow` of extra
         // over-reservation against a bucket lifetime of weeks.
-        if (pv.executeBy == 0 || block.timestamp < pv.executeBy) revert ReviewNotClosed();
+        // STRICTLY AFTER `executeBy` (review N12). A proposal is executable
+        // while `block.timestamp <= executeBy`, so `>=` left a one-block overlap
+        // in which settling and executing were both available to different
+        // senders. Not price-exploitable — settling re-derives `needUsd` at the
+        // same instant the quorum reads it, so there is no rise in between —
+        // but there is no reason to permit settling in the last executable
+        // instant, and one character closes it.
+        if (pv.executeBy == 0 || block.timestamp <= pv.executeBy) revert ReviewNotClosed();
 
         uint256 reservedTotal = _committedUsd[key];
         if (reservedTotal == 0) {

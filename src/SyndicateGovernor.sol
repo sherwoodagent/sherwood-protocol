@@ -930,7 +930,26 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             // whose settlement outruns the ledger's booking horizon would
             // otherwise leave every approve vote unable to book, turning the
             // review block-only.
-            IExposureLedger(ledger).requireWithinCoverageHorizon(p.executeBy, p.strategyDuration);
+            // `p.executeBy` IS STILL ZERO ON THE COLLABORATIVE PATH (review
+            // N11). `_initPendingProposal` writes it, and `propose` only calls
+            // that on the non-collaborative branch — a co-proposed strategy
+            // sits in Draft until `approveCollaboration`, which re-runs no
+            // ledger gate. Passing the raw field made the check
+            // `strategyDuration > block.timestamp`, unsatisfiable on any real
+            // chain, so the gate silently could not fire for co-proposed
+            // strategies. (Foundry's default `t = 1` hides it.)
+            //
+            // Compute the WORST-CASE deadline instead, which is well-defined
+            // before any of it is written and covers both paths from the one
+            // site: a Draft may idle for `collaborationWindow` before
+            // activating, then run voting -> review -> execution.
+            uint256 deadline = p.executeBy;
+            if (deadline == 0) {
+                ISyndicateGovernor.GovernorParams memory gp = _params;
+                deadline = block.timestamp + gp.collaborationWindow + gp.votingPeriod
+                    + IGuardianRegistry(_guardianRegistry).reviewPeriod() + gp.executionWindow;
+            }
+            IExposureLedger(ledger).requireWithinCoverageHorizon(deadline, p.strategyDuration);
             address escrow = _bondEscrow;
             if (escrow != address(0)) {
                 uint256 bondWood = IExposureLedger(ledger).proposerBondWood(asset, coverage_);

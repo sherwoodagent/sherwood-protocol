@@ -9,6 +9,7 @@ import {IGuardianRegistry} from "../src/interfaces/IGuardianRegistry.sol";
 
 interface ISwoodCooldown {
     function coolDownPeriod() external view returns (uint256);
+    function maxSlashBps() external view returns (uint256);
     function exposureLedger() external view returns (address);
 }
 
@@ -93,6 +94,25 @@ contract DeployPlanB is Script {
         // the mechanism is WIRED rather than that a proxy for it is large
         // enough.
         uint256 coolDown = ISwoodCooldown(swood).coolDownPeriod();
+
+        // ── Pre-flight 1b: the slash ceiling must not clip the allocation ──
+        // The ledger books liability at 100% of a guardian's allocation, and
+        // after the n1 fix `allocation == live slashable bond` is the DESIGNED
+        // outcome whenever a co-approver's bond collapses, not a corner case.
+        // With delegation deferred there is no surplus to absorb a clipped
+        // ceiling, so any `maxSlashBps` below 10_000 makes recovery a strict
+        // shortfall against the allocation and breaks §2's inequality by
+        // construction.
+        //
+        // Every shipped config already seats 10_000 (`Deploy.s.sol`'s
+        // DEFAULT_MAX_SLASH_BPS and both testnet scripts). This asserts the
+        // choice rather than leaving it to a later governance transaction that
+        // could lower it silently (review N9).
+        require(
+            ISwoodCooldown(swood).maxSlashBps() == 10_000,
+            "PRE-FLIGHT: sWOOD maxSlashBps != 10000 -- the ledger books at 100% of allocation, "
+            "so a lower ceiling makes recovery a strict shortfall."
+        );
 
         // ── Pre-flight 2: a zero covered-TVL cap bricks all proposing ──
         require(
