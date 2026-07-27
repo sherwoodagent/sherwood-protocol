@@ -736,4 +736,47 @@ contract ProposalLifecycleTest is Test {
         governor.resolveProposalState(pid);
         _assertState(pid, ISyndicateGovernor.ProposalState.Approved, "commit succeeds through the pause");
     }
+
+    // ── governor/registry disagreement fails CLOSED ──
+
+    /// @dev Pins the security posture of the Unresolved branch in `_afterVote`.
+    ///      The state is "governor believes a review window exists, registry
+    ///      holds no record for it" — unreachable on a lockstep deployment, so
+    ///      it is forced here by zeroing the registry's 4-slot `Review` for this
+    ///      `(governor, proposalId)` (`_reviews` is slot 0). That disagreement
+    ///      must NOT yield an executable proposal: answering Cleared would
+    ///      approve a strategy no guardian ever reviewed. It must also stay
+    ///      TERMINAL — holding at GuardianReview was the original strand this
+    ///      fold fixed, pinning `_openProposalCount` and the vault with it.
+    ///      Restore `Approved` on that branch and this test fails.
+    function test_unregisteredWindowExpiresAndCannotExecute() public {
+        uint256 pid = _propose();
+        _voteFor(pid);
+
+        bytes32 key = keccak256(abi.encode(address(governor), pid));
+        bytes32 base = keccak256(abi.encode(key, uint256(0)));
+        for (uint256 i = 0; i < 4; i++) {
+            vm.store(address(registry), bytes32(uint256(base) + i), bytes32(0));
+        }
+        assertEq(
+            uint8(registry.outcomeOf(address(governor), pid)),
+            uint8(IGuardianRegistry.ReviewOutcome.Unresolved),
+            "registry must hold no record for this proposal"
+        );
+
+        ISyndicateGovernor.StrategyProposal memory p = _proposal(pid);
+        assertGt(p.reviewEnd, p.voteEnd, "governor still believes a review window exists");
+
+        // Well inside `executeBy`: the old branch would have said Approved here.
+        _warpPast(p.reviewEnd);
+        assertLt(vm.getBlockTimestamp(), p.executeBy, "still inside the execution window");
+        _assertState(pid, ISyndicateGovernor.ProposalState.Expired, "fails CLOSED, not open");
+
+        // Terminal, so the vault binding is released rather than stranded.
+        uint256 openBefore = governor.openProposalCount();
+        governor.resolveProposalState(pid);
+        _assertState(pid, ISyndicateGovernor.ProposalState.Expired, "terminal after commit");
+        assertEq(governor.openProposalCount(), openBefore - 1, "Expired decrements the open count");
+        assertEq(governor.getActiveProposal(), 0, "no active proposal binds the vault");
+    }
 }
