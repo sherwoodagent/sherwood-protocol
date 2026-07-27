@@ -326,21 +326,48 @@ contract ExposureLedgerTest is Test {
         assertEq(ledger.openExposureUsd(guardian), 0, "nothing booked, but the vote survives");
     }
 
-    /// @notice M4 — the price may fall freely but may not more than double in
-    ///         one transaction. The directions are not symmetric: upward
-    ///         over-values every bond and overstates coverage, downward only
-    ///         tightens. Rate-limiting the fall would leave bonds over-valued
-    ///         during exactly the crash the price exists to absorb.
-    function test_setWoodUsdPrice_boundsTheUpwardMoveOnly() public {
+    /// @notice M4 — the ceiling bounds one CALL; the interval bounds how many.
+    ///         Without the interval, N calls in a single multisig batch move the
+    ///         price 2^N — seven take $0.05 to $6.40 — and `set(0)` followed by
+    ///         `set(anything)` walked straight through the zero exemption in the
+    ///         same transaction.
+    ///
+    ///         Only the UPWARD move is capped, deliberately: this price exists
+    ///         to absorb a WOOD crash, and rate-limiting the fall would leave
+    ///         bonds over-valued for as long as it took to walk the price down.
+    function test_setWoodUsdPrice_intervalAndUpwardCeiling() public {
         vm.startPrank(owner);
-        ledger.setWoodUsdPrice(0.1e8); // exactly 2x from the 0.05e8 fixture -- allowed
+
+        // Same block as the fixture's own update: the interval bites first.
+        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
+        ledger.setWoodUsdPrice(0.06e8);
+
+        skip(1 days);
+        ledger.setWoodUsdPrice(0.1e8); // exactly 2x -- allowed
         assertEq(ledger.woodUsdPriceX8(), 0.1e8);
 
+        // A second move in the same block, however small, is still refused.
         vm.expectRevert(IExposureLedger.InvalidParameter.selector);
-        ledger.setWoodUsdPrice(0.2000001e8); // a hair over 2x -- rejected
+        ledger.setWoodUsdPrice(0.11e8);
+
+        skip(1 days);
+        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
+        ledger.setWoodUsdPrice(0.2000001e8); // a hair over 2x
 
         ledger.setWoodUsdPrice(0.001e8); // a 100x collapse -- allowed, conservative
         assertEq(ledger.woodUsdPriceX8(), 0.001e8);
+
+        // Zero stays settable: it is the emergency stop, and banning it would
+        // strand the price there (any non-zero value exceeds `0 * 2`).
+        skip(1 days);
+        ledger.setWoodUsdPrice(0);
+        assertEq(ledger.woodUsdPriceX8(), 0);
+
+        // ...and the recovery that used to be a free second call now costs a day.
+        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
+        ledger.setWoodUsdPrice(1_000_000e8);
+        skip(1 days);
+        ledger.setWoodUsdPrice(1_000_000e8); // exempt from the ceiling, not from time
         vm.stopPrank();
     }
 
@@ -928,6 +955,9 @@ contract ExposureLedgerTest is Test {
         ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 5_000e6); // covered at $0.05
 
         vm.prank(owner);
+        // `setWoodUsdPrice` is rate-limited (review M4) and `setUp` already set
+        // one, so a second update waits out the interval.
+        skip(1 days);
         ledger.setWoodUsdPrice(0.005e8); // 10x crash — bond now worth $500
         vm.expectRevert(IExposureLedger.InsufficientApproveCoverage.selector);
         ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 5_000e6);

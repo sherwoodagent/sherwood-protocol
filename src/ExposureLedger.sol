@@ -109,6 +109,10 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      what this caps.
     uint256 internal constant MAX_SCAN_BUCKETS = 16;
 
+    /// @dev Minimum spacing between price updates. Without it the 2x ceiling
+    ///      bounds a single call and nothing bounds the number of calls.
+    uint256 internal constant MIN_PRICE_UPDATE_INTERVAL = 1 days;
+
     bytes32 public constant PARAM_CHALLENGE_WINDOW = keccak256("challengeWindow");
     bytes32 public constant PARAM_K_NUMERATOR = keccak256("kNumerator");
     bytes32 public constant PARAM_COVERED_TVL_CAP = keccak256("coveredTvlCapUsd");
@@ -155,6 +159,10 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///         frothy. Default 10_000 (no haircut) so wiring a feed alone does
     ///         not silently change valuations; governance sets it deliberately.
     uint256 public woodHaircutBps = BPS_DENOMINATOR;
+
+    /// @dev Stamps every `setWoodUsdPrice`. Zero means "never set" — the only
+    ///      state exempt from the interval.
+    uint64 public lastPriceUpdateAt;
 
     address public guardianRegistry;
 
@@ -342,7 +350,28 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      solvency one.
     function setWoodUsdPrice(uint256 newPriceX8) external onlyOwner {
         uint256 current = woodUsdPriceX8;
+        uint256 last = lastPriceUpdateAt;
+
+        // THE INTERVAL IS WHAT MAKES THIS A RATE LIMIT (review M4). A 2x
+        // ceiling with no time component is not one: N calls in a single
+        // multisig batch move the price 2^N, and seven take $0.05 to $6.40.
+        // Only the first-ever price is exempt, because there is nothing to
+        // compare it against.
+        if (last != 0 && block.timestamp < last + MIN_PRICE_UPDATE_INTERVAL) revert InvalidParameter();
+
+        // The ceiling binds every upward move except a recovery from zero.
+        //
+        // Zero stays SETTABLE — it is the emergency stop, and the earlier
+        // argument for banning it was wrong in both directions: banning it does
+        // not prevent disabling coverage (1 wei-X8 does that just as well), and
+        // it would strand the price at zero with no way back, since any
+        // non-zero value exceeds `0 * 2`. What made zero dangerous was the
+        // EXEMPTION being reachable in the same transaction: `set(0)` then
+        // `set(anything)` walked straight through. The interval above is what
+        // closes that — the round trip now costs a day rather than two calls.
         if (current != 0 && newPriceX8 > current * 2) revert InvalidParameter();
+
+        lastPriceUpdateAt = uint64(block.timestamp);
         emit WoodUsdPriceSet(current, newPriceX8);
         woodUsdPriceX8 = newPriceX8;
     }

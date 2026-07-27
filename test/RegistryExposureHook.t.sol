@@ -255,10 +255,16 @@ contract RegistryExposureHookTest is Test {
     ///         because the guardians who would have covered it cannot
     ///         participate at all.
     function test_overCapGuardianVotesButBooksNothing() public {
-        // Zero the governance WOOD price so g1's slashable bond -- and its free
-        // budget -- is exactly $0.
-        vm.prank(ledgerOwner);
-        ledger.setWoodUsdPrice(0);
+        // Zero g1's slashable bond so its free budget is exactly $0. Done by
+        // mocking the ledger's stake reads rather than by zeroing the WOOD
+        // price: the price setter is rate-limited now (review M4) and this test
+        // sits inside an already-open review window, so waiting out the interval
+        // would push past `reviewEnd` and change what is being tested.
+        vm.mockCall(address(wired.swood), abi.encodeWithSignature("guardianStake(address)", g1), abi.encode(uint256(0)));
+        vm.mockCall(
+            address(wired.swood), abi.encodeWithSignature("delegatedInbound(address)", g1), abi.encode(uint256(0))
+        );
+        assertEq(ledger.slashableBondUsd(g1), 0, "no slashable bond -> no free budget");
 
         vm.prank(g1);
         wired.registry.voteOnProposal(address(wired.gov), PID, IGuardianRegistry.GuardianVoteType.Approve);
