@@ -101,6 +101,9 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     /// @dev Mirrors `IStakedWood.DuplicateApprover`.
     error DuplicateApprover();
 
+    /// @dev Mirrors `IStakedWood.ApproverAlreadySlashed`.
+    error ApproverAlreadySlashed();
+
     /// @notice Insufficient WOOD to satisfy a stake minimum.
     /// @dev Relocated from `IGuardianRegistry` alongside `stakeAsGuardian`.
     error InsufficientStake();
@@ -249,7 +252,7 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     event VerdictSlashRouted(bytes32 indexed caseKey, address indexed vault, uint256 total, uint256 caseId);
 
     /// @notice Emitted when a verdict slash could NOT fund a compensation case
-    ///         — `openCase` reverted (empty snapshot, a vault without the
+    ///         — `openCase` reverted (a vault without the
     ///         ERC20Votes read surface, block-number clock mode) — and the
     ///         proceeds were burned instead. The guardian is still slashed;
     ///         the victims of THIS case go uncompensated (PR #24 review 🟡5:
@@ -396,28 +399,14 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///      with `maxDelegatedSlashBps` and `delegatedWeightCapX` here, and
     ///      the whole layout re-baselined (goldens regenerated in the same
     ///      PR; no mainnet 4663 deployment exists, testnets are redeployable).
-    ///      Reserve is 6 slots; from the first mainnet deploy onward changes
-    ///      must be append-only, carved off the FRONT of this gap.
-    uint256[6] private __gap;
-
-    /// @notice Coverage ledger consulted before releasing a guardian's stake.
-    ///
-    /// @dev    Replaces a blunt timer with the question the timer stood in for.
-    ///         `coolDownPeriod` had to be at least as long as the LONGEST
-    ///         obligation any guardian could hold (~42d at defaults) or an
-    ///         approver could exit from under a pending challenge — which
-    ///         charged every guardian the worst case, including one who never
-    ///         insured anything. Asking the ledger directly is exact.
-    ///
-    ///         FAIL-OPEN WHEN UNSET: `claimUnstakeGuardian` then behaves exactly
-    ///         as it did before this existed. There is necessarily a window at
-    ///         deploy, and again on a UUPS upgrade, where the pointer is still
-    ///         zero; failing closed there would brick withdrawals over a missed
-    ///         configuration step. The cost is that a permanently-unwired
-    ///         deployment has no gate and still looks healthy, so `DeployPlanB`
-    ///         asserts the wiring as a pre-flight — the failure surfaces as a
-    ///         refused deploy rather than as a hole nobody sees.
-    address public exposureLedger;
+    ///      Decremented 6 → 5 in the Plan C round-3 merge: `_verdictSlashed`
+    ///      (PR #24 review 🟠N2) consumes one slot, so the total size stays
+    ///      stable. DECLARATION ORDER IS DELIBERATE (PR #24 review F-F):
+    ///      Plan C's three fields sit BETWEEN the gap and Plan B's
+    ///      `exposureLedger`, so shrinks come off the END of the gap and the
+    ///      fields behind it never shift. From the first mainnet deploy onward
+    ///      changes must be append-only, carved off the FRONT of this gap.
+    uint256[5] private __gap;
 
     /// @notice The one address permitted to drive the VERDICT slash path
     ///         (`slashToEscrow`). Deliberately distinct from `onlyRegistry`,
@@ -439,6 +428,46 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///      own choosing. Zero disables the verdict path
     ///      (`CompensationEscrowNotSet`).
     address public compensationEscrow;
+
+    /// @dev One slash per (verdict, approver) — the persistent half of the
+    ///      severity envelope (PR #24 review 🟠N2). Keyed by the RAW `caseKey`
+    ///      the caller passed, so a slasher can read `verdictSlashed` with the
+    ///      same key it will pass back in.
+    ///
+    ///      Why persistence is needed at all: `_slashOne` applies its rate to
+    ///      the LIVE stake but sizes off the `openedAt` checkpoint, so repeats
+    ///      compound geometrically — N calls at `bps` take `1-(1-bps)^N`. The
+    ///      intra-call pairwise dedup bounds one array; it says nothing about
+    ///      the next transaction. And splitting IS the expected shape here: a
+    ///      100-approver quorum slash costs ~27M gas, more than an Ethereum
+    ///      mainnet block, so the batch has to be split to land at all.
+    ///      Without this map, the workaround for the gas limit silently voids
+    ///      the ceiling governance set.
+    mapping(bytes32 caseKey => mapping(address approver => bool)) private _verdictSlashed;
+
+    /// @notice Coverage ledger consulted before releasing a guardian's stake.
+    ///
+    /// @dev    Replaces a blunt timer with the question the timer stood in for.
+    ///         `coolDownPeriod` had to be at least as long as the LONGEST
+    ///         obligation any guardian could hold (~42d at defaults) or an
+    ///         approver could exit from under a pending challenge — which
+    ///         charged every guardian the worst case, including one who never
+    ///         insured anything. Asking the ledger directly is exact.
+    ///
+    ///         FAIL-OPEN WHEN UNSET: `claimUnstakeGuardian` then behaves exactly
+    ///         as it did before this existed. There is necessarily a window at
+    ///         deploy, and again on a UUPS upgrade, where the pointer is still
+    ///         zero; failing closed there would brick withdrawals over a missed
+    ///         configuration step. The cost is that a permanently-unwired
+    ///         deployment has no gate and still looks healthy, so `DeployPlanB`
+    ///         asserts the wiring as a pre-flight — the failure surfaces as a
+    ///         refused deploy rather than as a hole nobody sees.
+    ///
+    /// @dev    Declared AFTER Plan C's three fields, preserving the Plan C
+    ///         merge order (review F-F, see the `__gap` natspec); the
+    ///         DPoS-removal re-baseline shifted every absolute slot, and the
+    ///         regenerated golden pins where it landed.
+    address public exposureLedger;
 
     /// @notice Slashed WOOD is sent here — permanently out of circulation.
     /// @dev Burning via a transfer to a known-dead address keeps WOOD's
@@ -1058,6 +1087,14 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
         emit CompensationEscrowSet(escrow);
     }
 
+    /// @notice Whether `approver` has already been slashed under `caseKey`.
+    /// @dev Read this before resuming a verdict that had to be split across
+    ///      transactions (a full-quorum batch does not fit one block), so the
+    ///      continuation names only approvers still owed a slash.
+    function verdictSlashed(bytes32 caseKey, address approver) external view returns (bool) {
+        return _verdictSlashed[caseKey][approver];
+    }
+
     // ── Slashing (registry-gated) ──
 
     /// @notice Slash a set of approvers for a blocked proposal.
@@ -1102,6 +1139,33 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///      entrypoint that takes severity straight from its caller, letting a
     ///      compromised `authorizedSlasher` exceed a ceiling governance set (or
     ///      dodge a floor it set) at will.
+    ///
+    ///      The envelope binds per VERDICT, not per call: `_verdictSlashed`
+    ///      gives each (caseKey, approver) pair exactly one slash, so the
+    ///      ceiling cannot be compounded past by splitting one verdict across
+    ///      transactions (🟠N2).
+    ///
+    /// @dev `minSlashBps` IS A PUNITIVE FLOOR, NOT A PROPORTIONALITY RULE
+    ///      (PR #24 review 🟡N6). Any non-zero derived rate is raised to it, so
+    ///      an approver who underwrote $10 of a $1,000 bond (a 100-bps rate)
+    ///      pays `minSlashBps` of the bond — 10× what they insured at a 1,000-bps
+    ///      floor. That is deliberate: below the floor the recovery would not
+    ///      cover the cost of running the case, and a severity that rounds to
+    ///      nothing is not a deterrent. It is NOT an attempt to make the loss
+    ///      whole in proportion to what was underwritten. Zero stays exempt
+    ///      (see the loop) because zero is the absence of liability, not a
+    ///      small amount of it. Governance sets the floor knowing this:
+    ///      raising `minSlashBps` raises the over-slash multiple on every
+    ///      small allocation, and the per-verdict guard above is what stops
+    ///      concurrent small convictions from stacking those floors.
+    ///
+    ///      THE SHAPE, NOT JUST THE DATA POINT (review round 3): the over-slash
+    ///      multiple is `minSlashBps / derivedRate` and is UNBOUNDED as the
+    ///      allocation shrinks — the 10× above is one point on a hyperbola, not
+    ///      a cap. And `derivedRate` itself moves with the WOOD price
+    ///      (`ExposureLedger.slashBpsFor` prices bonds via `woodPriceX8()`), so
+    ///      a price move alone can push a small allocation's rate under the
+    ///      floor and put its holder on the punitive branch.
     ///
     /// @dev TIMESTAMP BOUNDS — WHAT THEY DO AND DO NOT GUARANTEE (PR #24
     ///      review 🟠2). `openedAt` must not be in the future (`VerdictNotPast`)
@@ -1166,15 +1230,22 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
         // carries the RAW `caseKey`, so indexers join the two deterministically.
         bytes32 slashKey = keccak256(abi.encodePacked("sherwood.verdict", caseKey));
 
-        // DEDUP (PR #24 review 🟠4). Each `_slashOne` pass re-applies its
-        // clamped rate to the ALREADY-REDUCED live stake, so N repeats of one
-        // approver compound to `1-(1-bps)^N` — above any `maxSlashBps` ceiling
-        // governance set. Pairwise over calldata rather than requiring sorted
-        // input: the production feed (`ExposureLedger.slashBpsFor`) is
-        // vote-ordered and positionally rate-aligned, and approver sets are
-        // quorum-sized, so O(n²) here is cheaper than every caller co-sorting
-        // two paired arrays. Zero-rate entries are NOT exempt — a zero slot
-        // must not smuggle a duplicate address past the check.
+        // INTRA-CALL DEDUP (PR #24 review 🟠4). Each `_slashOne` pass
+        // re-applies its clamped rate to the ALREADY-REDUCED live stake, so N
+        // repeats of one approver compound to `1-(1-bps)^N` — above any
+        // `maxSlashBps` ceiling governance set. Pairwise over calldata rather
+        // than requiring sorted input: the production feed
+        // (`ExposureLedger.slashBpsFor`) is vote-ordered and positionally
+        // rate-aligned, and approver sets are quorum-sized, so O(n²) here
+        // (2.30M gas at the 100-approver cap, against ~27M for the slash
+        // itself) is cheaper than every caller co-sorting two paired arrays.
+        // Zero-rate entries are NOT exempt — a zero slot must not smuggle a
+        // duplicate address past the check.
+        //
+        // This bounds ONE array. The same compounding across SEPARATE calls is
+        // bounded by `_verdictSlashed` in the loop below (🟠N2) — which is the
+        // half that actually binds in production, since a full-quorum batch
+        // has to be split across transactions to fit in a block at all.
         for (uint256 i = 0; i < approvers.length; i++) {
             for (uint256 j = i + 1; j < approvers.length; j++) {
                 if (approvers[i] == approvers[j]) revert DuplicateApprover();
@@ -1192,12 +1263,30 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
             // after coverage was already met.
             uint256 requested = slashBpsPer[i];
             if (requested == 0) continue;
+            // PERSISTENT DEDUP (PR #24 review 🟠N2). The pairwise scan above
+            // bounds one array; this bounds the VERDICT. Checked after the
+            // zero-skip on purpose: a zero rate takes nothing, so it must not
+            // consume the approver's one slash and block a later real one.
+            if (_verdictSlashed[caseKey][approvers[i]]) revert ApproverAlreadySlashed();
             // Clamped per element, not once for the batch: the envelope is a
             // per-guardian ceiling/floor on severity, so it has to bind each
             // approver's own rate. Hoisting it would let one approver's rate set
             // the envelope for everyone.
             uint256 bps = Math.min(Math.max(requested, minSlashBps), maxSlashBps);
-            total += _slashOne(slashKey, openedAt, approvers[i], bps);
+            uint256 amt = _slashOne(slashKey, openedAt, approvers[i], bps);
+            // MARK ONLY A SLASH THAT LANDED (PR #24 review F-C). `_slashOne`
+            // returns 0 when the approver has no live stake at slash time —
+            // already emptied by a concurrent conviction, or exited. Writing
+            // the mark there consumes the verdict's one slash on a no-op, so a
+            // retry after the guardian re-stakes (the at-open basis is
+            // unchanged, so it WOULD recover) reverts `ApproverAlreadySlashed`
+            // and the valid verdict is permanently foreclosed. A zero take is
+            // like the zero-rate skip above: nothing bound, nothing consumed.
+            // The ceiling still cannot compound — the mark is set on the first
+            // call that takes anything, and a zero take reduces nothing.
+            if (amt == 0) continue;
+            _verdictSlashed[caseKey][approvers[i]] = true;
+            total += amt;
         }
         // Nothing recovered: no case to open (the escrow rejects zero proceeds).
         if (total == 0) return (0, 0);
@@ -1209,23 +1298,109 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
         //
         // BURN FALLBACK (PR #24 review 🟡5): `openCase` is the slash's only
         // sink, and it reverts on a vault the escrow cannot apportion against
-        // (empty snapshot, missing ERC20Votes reads, block-number clock mode).
+        // (missing ERC20Votes reads, block-number clock mode).
         // Letting that revert bubble would make the SLASH hostage to a vault
         // read — a bad vault would mean the guilty guardian keeps its stake.
         // Instead the slash stands and the proceeds burn, exactly like the
         // review path's sink; `VerdictSlashUncompensated` marks the case as
         // never funded so Plan D / indexers see the victims went unpaid.
+        //
+        // NARROWED FROM A BARE CATCH (PR #24 review 🟡N8). The burn is
+        // irreversible and takes the victims' compensation with it, so it must
+        // answer only the failure it was written for: the vault cannot be
+        // apportioned against, and no retry will change that. Every revert the
+        // escrow raises about its OWN inputs is a recoverable caller or wiring
+        // mistake — a `snapshotTimestamp` that is not strictly past (or that
+        // predates the vault's first deposit: `EmptySnapshot`, review F-A), a
+        // zero vault, an escrow mid-rewire that no longer recognises sWOOD as
+        // its funder — and each of those is fixable by resubmitting. Those
+        // bubble. The slash is idempotent per (caseKey, approver), so a bubbled
+        // revert costs nothing but the gas: the whole transaction rolls back,
+        // including `_verdictSlashed`, and the corrected call runs clean.
         IERC20(wood).forceApprove(escrow, total);
         try ICompensationEscrow(escrow).openCase(vault, snapshotTimestamp, total) returns (uint256 id) {
             caseId = id;
             IERC20(wood).forceApprove(escrow, 0);
             emit VerdictSlashRouted(caseKey, vault, total, caseId);
-        } catch {
+        } catch (bytes memory reason) {
+            if (_isRecoverableOpenCaseFailure(reason)) {
+                // Not our failure mode — surface it instead of burning.
+                assembly ("memory-safe") {
+                    revert(add(reason, 0x20), mload(reason))
+                }
+            }
             IERC20(wood).forceApprove(escrow, 0);
             _burnWood(total);
             caseId = 0;
             emit VerdictSlashUncompensated(caseKey, vault, total);
         }
+    }
+
+    /// @dev Does this `openCase` revert describe a fixable input/wiring mistake
+    ///      rather than a vault the escrow can never apportion against?
+    ///      (PR #24 review 🟡N8.)
+    ///
+    ///      Recognised as RECOVERABLE (re-reverted, nothing burns):
+    ///        - `SnapshotNotPast`     — reachable from here: `slashToEscrow`
+    ///          allows `snapshotTimestamp == block.timestamp`, the escrow
+    ///          requires strictly past. Pure caller arithmetic.
+    ///        - `ZeroAddress`         — `vault` was zero.
+    ///        - `NothingToCompensate` — zero proceeds; unreachable today
+    ///          (`total != 0` above) but listed so a future refactor cannot
+    ///          turn it into a silent burn.
+    ///        - `NotAuthorizedFunder` — the escrow is mid-reconfiguration and
+    ///          no longer accepts sWOOD. Rewire and resubmit.
+    ///        - `EmptySnapshot` — the votes read SUCCEEDED and returned zero
+    ///          supply (review F-A). The vault demonstrably implements the
+    ///          ERC20Votes surface, so this is not the vault-capability failure
+    ///          the burn answers: on a real conviction a drain implies
+    ///          pre-drain holders, so a zero-supply snapshot means the
+    ///          TIMESTAMP is wrong (pre-first-deposit typo, wrong epoch
+    ///          anchor) — pure caller arithmetic, fixable by resubmitting with
+    ///          the corrected instant. Burning here would consume
+    ///          `_verdictSlashed` and strand the victims permanently on a
+    ///          recoverable input error. The classifier keys on RETRYABILITY,
+    ///          not on which contract raised the error.
+    ///
+    ///          WHY "PERMANENTLY EMPTY" CANNOT HAPPEN ON A REAL VAULT (PR #24
+    ///          review F-A objection, answered): OZ `Votes._transferVotingUnits`
+    ///          pushes `_totalCheckpoints` on every mint UNCONDITIONALLY —
+    ///          `getPastTotalSupply` counts total supply, NOT delegated votes
+    ///          ("Votes that have not been delegated are still part of total
+    ///          supply", OZ natspec). So a pre-`_update`-upgrade vault whose
+    ///          holders never delegated reads zero VOTES per holder (the 🟠N4
+    ///          caveat — case opens, claims strand to the backstop) but NEVER
+    ///          zero SUPPLY after its first deposit. A vault where
+    ///          `EmptySnapshot` is permanent despite holders would have to
+    ///          override `getPastTotalSupply` to mean delegated-sum — a
+    ///          nonstandard vault no reachable caller path supplies (v1b: the
+    ///          owner names factory vaults; Plan D: the vault comes from a
+    ///          registered proposal, factory-deployed, OZ semantics).
+    ///
+    ///      Everything else BURNS: any unrecognised or empty returndata — a
+    ///      vault missing the ERC20Votes selectors, a block-number clock mode,
+    ///      or an out-of-gas child. Empty returndata deliberately falls through
+    ///      to the burn: that is the shape of the missing-selector case, which
+    ///      is precisely 🟡5's motivating failure.
+    ///
+    ///      REQUIREMENT ON THE SLASHER (Plan D): an out-of-gas child is
+    ///      RETRYABLE but indistinguishable here from a missing selector, so a
+    ///      gas-starved `openCase` burns the victims' compensation
+    ///      irreversibly. Today's callers are trusted (owner multisig), but a
+    ///      challenge-game slasher that forwards user-influenced gas MUST pin a
+    ///      gas floor before calling `slashToEscrow` — do not let a caller
+    ///      choose the gas that decides between compensation and burn.
+    function _isRecoverableOpenCaseFailure(bytes memory reason) private pure returns (bool) {
+        if (reason.length < 4) return false;
+        bytes4 selector;
+        assembly ("memory-safe") {
+            selector := mload(add(reason, 0x20))
+        }
+        return selector == ICompensationEscrow.SnapshotNotPast.selector
+            || selector == ICompensationEscrow.ZeroAddress.selector
+            || selector == ICompensationEscrow.NothingToCompensate.selector
+            || selector == ICompensationEscrow.NotAuthorizedFunder.selector
+            || selector == ICompensationEscrow.EmptySnapshot.selector;
     }
 
     /// @dev Per-approver slash. Extracted to keep `slashGuardians`'s stack

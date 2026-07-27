@@ -352,6 +352,47 @@ contract StakedWoodSlashToEscrowTest is Test {
         assertEq(escrow.caseCount(), 0, "no empty case opened");
     }
 
+    /// @notice PR #24 review F-C: a slash that recovers NOTHING must not
+    ///         consume the verdict's one slash. Conviction A empties the
+    ///         guardian; conviction B then lands on zero live stake and takes
+    ///         nothing — if that no-op wrote `_verdictSlashed`, B would be
+    ///         permanently foreclosed and a re-staked guardian could never be
+    ///         held to it, even though B's at-open basis is intact and a retry
+    ///         WOULD recover.
+    function test_slashToEscrow_zeroRecoveryDoesNotConsumeTheVerdict() public {
+        vm.prank(owner);
+        swood.setAuthorizedSlasher(slasher);
+        address[] memory gs = new address[](1);
+        gs[0] = g1;
+
+        // Conviction A takes the whole bond.
+        vm.prank(slasher);
+        (uint256 totalA,) =
+            swood.slashToEscrow(bytes32("A"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs);
+        assertEq(totalA, 20_000e18, "A emptied the guardian");
+        assertEq(swood.guardianStake(g1), 0);
+
+        // Conviction B, independent verdict, same at-open basis: recovers
+        // nothing — and must NOT be marked as slashed.
+        vm.prank(slasher);
+        (uint256 totalB, uint256 caseB) =
+            swood.slashToEscrow(bytes32("B"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs);
+        assertEq(totalB, 0);
+        assertEq(caseB, 0);
+        assertFalse(swood.verdictSlashed(bytes32("B"), g1), "a zero take must not consume the one slash");
+
+        // The guardian re-stakes; retrying B now recovers against the intact
+        // at-open basis instead of reverting ApproverAlreadySlashed.
+        vm.prank(g1);
+        swood.stakeAsGuardian(20_000e18, 1);
+        vm.prank(slasher);
+        (uint256 totalRetry, uint256 caseRetry) =
+            swood.slashToEscrow(bytes32("B"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs);
+        assertGt(totalRetry, 0, "the retried verdict recovers");
+        assertGt(caseRetry, 0, "and funds a case");
+        assertTrue(swood.verdictSlashed(bytes32("B"), g1), "the landed slash is what consumes the verdict");
+    }
+
     /// @dev `slashToEscrow` now takes one rate per approver. These suites all
     ///      exercise the uniform case, so this fills an aligned array with a
     ///      single rate — the per-approver spread is covered in

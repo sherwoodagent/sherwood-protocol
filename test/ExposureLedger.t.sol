@@ -70,6 +70,15 @@ contract MockGovernorForLedger {
     ///      against. Set them to exercise the settlement-dated bucket.
     uint256 public reviewEnd;
 
+    /// @dev Separates `reviewEnd` from `executeBy`, which `setSchedule` collapses.
+    ///      `settleCoverage` gates on `executeBy` now, and the window between the
+    ///      two is exactly where N3's attack lived.
+    function setScheduleFull(uint256 executeBy_, uint256 duration_, uint256 reviewEnd_) external {
+        executeBy = executeBy_;
+        strategyDuration = duration_;
+        reviewEnd = reviewEnd_;
+    }
+
     function setSchedule(uint256 executeBy_, uint256 duration_) external {
         executeBy = executeBy_;
         strategyDuration = duration_;
@@ -421,18 +430,82 @@ contract ExposureLedgerTest is Test {
         assertEq(ledger.openExposureUsd(guardian), 0, "released once the risk window has closed");
     }
 
-    /// @notice A settlement further out than the ledger will book for is
-    ///         REFUSED, not clamped. Clamping would silently under-cover the
-    ///         tail — reintroducing the bug above in a quieter form. The revert
-    ///         surfaces a duration ceiling set out of step with the epoch length.
-    function test_recordApproval_refusesASettlementBeyondTheHorizon() public {
+    /// @notice N4 — an over-horizon settlement books NOTHING; it does not
+    ///         revert the vote. Reverting here took `voteOnProposal` with it,
+    ///         leaving a block-only review in which guardians can veto but never
+    ///         endorse — the third trigger for the shape M3 was filed for, and
+    ///         the only one reachable at defaults, since
+    ///         `ProtocolConfig.maxStrategyDuration` ships unset.
+    ///
+    ///         The refusal moved to `propose`, where it lands on the proposer
+    ///         who chose the duration rather than on a cohort that cannot
+    ///         change it.
+    function test_recordApproval_beyondHorizonBooksNothingAndProposeRejects() public {
         _wireRecording();
-        mgov.setSchedule(block.timestamp + 1 days, 365 days); // far past 3 epochs
+        mgov.setSchedule(block.timestamp + 1 days, 365 days); // far past the horizon
         mgov.set(1_000e6);
 
+        // The vote survives and books nothing.
         vm.prank(registry);
-        vm.expectRevert(IExposureLedger.CoverageHorizonExceeded.selector);
         ledger.recordApproval(address(mgov), 1, guardian);
+        assertEq(ledger.openExposureUsd(guardian), 0, "nothing booked, vote intact");
+
+        // ...and propose refuses it outright.
+        vm.expectRevert(IExposureLedger.CoverageHorizonExceeded.selector);
+        ledger.requireWithinCoverageHorizon(block.timestamp + 1 days, 365 days);
+
+        // A duration inside the horizon passes.
+        ledger.requireWithinCoverageHorizon(block.timestamp + 1 days, 30 days);
+    }
+
+    /// @notice N3 — settling is NOT neutral, so it must wait until the proposal
+    ///         can no longer execute. Settling collapses the A-fold cushion to
+    ///         exactly `needUsd` priced at settle time while the quorum
+    ///         re-derives it at execute, so any EOA settling at `reviewEnd`
+    ///         could let a small price rise permanently brick a covered
+    ///         proposal.
+    function test_settleCoverage_refusedUntilTheProposalCanNoLongerExecute() public {
+        _wireRecording();
+        address g2 = makeAddr("g2");
+        swood.setStake(g2, 100_000e18);
+        mgov.set(1_000e6);
+        // reviewEnd is well before executeBy, which is the window the attack used.
+        mgov.setScheduleFull(block.timestamp + 20 days, 3 days, block.timestamp + 1 days);
+
+        vm.startPrank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        ledger.recordApproval(address(mgov), 1, g2);
+        vm.stopPrank();
+
+        skip(2 days); // past reviewEnd, before executeBy
+        vm.expectRevert(IExposureLedger.ReviewNotClosed.selector);
+        ledger.settleCoverage(address(mgov), 1);
+
+        skip(25 days); // past executeBy
+        ledger.settleCoverage(address(mgov), 1);
+        assertEq(ledger.allocatedUsd(address(mgov), 1, guardian), 500e18, "settles once execution is moot");
+    }
+
+    /// @notice N6 — the haircut is the second multiplier on the same quantity
+    ///         and was unbounded, so M4's rate limit was bypassable through it:
+    ///         a legal `[1, 10_000]` range with no interval moved every bond's
+    ///         valuation 10,000x in one transaction.
+    function test_setWoodHaircutBps_rateLimitedAndFloored() public {
+        vm.startPrank(owner);
+        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
+        ledger.setWoodHaircutBps(1); // below the floor -- a mis-set parameter
+        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
+        ledger.setWoodHaircutBps(10_001);
+
+        ledger.setWoodHaircutBps(8_000);
+        // Second move in the same block is refused, as for the price itself.
+        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
+        ledger.setWoodHaircutBps(5_000);
+
+        skip(1 days);
+        ledger.setWoodHaircutBps(5_000);
+        vm.stopPrank();
+        assertEq(ledger.woodHaircutBps(), 5_000);
     }
 
     /// @notice M3 — a STALE feed must not kill the approve vote. Closing only
@@ -803,6 +876,32 @@ contract ExposureLedgerTest is Test {
         woodFeed.set(0.05e8); // fresh again
         (, fellBack) = ledger.woodPriceDetail();
         assertFalse(fellBack, "recovered");
+    }
+
+    /// @notice N11 — the propose-time horizon gate was fed `p.executeBy`, which
+    ///         is still ZERO on the collaborative Draft path, making the check
+    ///         `strategyDuration > block.timestamp`: unsatisfiable on any real
+    ///         chain, so the gate silently could not fire for co-proposed
+    ///         strategies.
+    ///
+    ///         `vm.warp` to real chain time is load-bearing here. Foundry starts
+    ///         at `t = 1`, where `duration > 1` is trivially true and the bug is
+    ///         invisible — which is exactly why the first version of this test
+    ///         passed against broken code.
+    function test_requireWithinCoverageHorizon_zeroDeadlineIsNotAFreePass() public {
+        vm.warp(1_800_000_000); // ~2027, i.e. a real chain
+
+        // The raw-field call the governor used to make. At `executeBy == 0` this
+        // is `3650 days > now + 60 days` -> false, so it does NOT revert: the
+        // gate is vacuous, which is the whole finding.
+        ledger.requireWithinCoverageHorizon(0, 3650 days);
+
+        // With a real deadline the same duration is refused.
+        vm.expectRevert(IExposureLedger.CoverageHorizonExceeded.selector);
+        ledger.requireWithinCoverageHorizon(block.timestamp + 1 days, 3650 days);
+
+        // ...and an in-horizon duration still passes.
+        ledger.requireWithinCoverageHorizon(block.timestamp + 1 days, 30 days);
     }
 
     /// @notice C1 REGRESSION — the free-rider veto.
@@ -1176,9 +1275,10 @@ contract ExposureLedgerTest is Test {
 
     /// @notice `slashBpsFor` converts each guardian's BOOKED coverage into the
     ///         bps-of-stake that `slashToEscrow` speaks. Both inputs are USD, so
-    ///         the quotient is unitless — no price is read in the slash path.
-    ///         Here the two approvers underwrote different amounts of the same
-    ///         proposal, so they must carry different rates.
+    ///         the quotient is DIMENSIONALLY unitless — but both operands are
+    ///         priced (🟡N5): asset feed in the numerator, `woodPriceX8()` in
+    ///         the denominator. Here the two approvers underwrote different
+    ///         amounts of the same proposal, so they must carry different rates.
     function test_slashBpsFor_ratesTrackEachApproversOwnCommitment() public {
         _wireRecording();
         address g2 = makeAddr("g2");
@@ -1205,6 +1305,44 @@ contract ExposureLedgerTest is Test {
         // what `slashToEscrow` applies to each one's own stake.
         assertEq(bps[0], 2_000, "a fifth of the larger bond");
         assertEq(bps[1], 4_000, "two fifths of the smaller one");
+    }
+
+    /// @notice PR #24 review F-B: `slashBpsFor` must price the bond with
+    ///         `woodPriceX8()` — the same Chainlink-with-haircut read every
+    ///         other consumer uses — not the raw governance scalar. A merge
+    ///         artefact had it on `woodUsdPriceX8`, so the moment a WOOD feed
+    ///         was wired the gate and the slash rail priced the same bond
+    ///         differently: a feed above the scalar over-slashed 2x, a haircut
+    ///         under-recovered by half.
+    function test_slashBpsFor_pricesBondsWithTheFeedNotTheRawScalar() public {
+        _wireRecording();
+        address g2 = makeAddr("g2");
+        swood.setStake(g2, 50_000e18);
+        mgov.set(2_000e6);
+
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, g2);
+
+        // Baseline (governance scalar $0.05): $5,000 / $2,500 bonds, $1,000
+        // liability each -> 2,000 / 4,000 bps.
+        (, uint256[] memory bpsBefore) = ledger.slashBpsFor(address(mgov), 1);
+        assertEq(bpsBefore[0], 2_000);
+        assertEq(bpsBefore[1], 4_000);
+
+        // Wire a feed at 2x the scalar. `woodPriceX8()` now reads $0.10, the
+        // bonds are worth twice as much, and the SAME dollar liability is half
+        // the rate. Reading the raw scalar would leave the rates unchanged —
+        // taking twice the liability from every approver.
+        MockFeed woodFeed = new MockFeed(0.1e8, 8);
+        vm.prank(owner);
+        ledger.setWoodFeed(address(woodFeed), 1 days);
+        assertEq(ledger.woodPriceX8(), 0.1e8, "feed supersedes the scalar");
+
+        (, uint256[] memory bpsAfter) = ledger.slashBpsFor(address(mgov), 1);
+        assertEq(bpsAfter[0], 1_000, "rate tracks the feed-priced bond");
+        assertEq(bpsAfter[1], 2_000, "rate tracks the feed-priced bond");
     }
 
     /// @notice A guardian whose commitment was RELEASED by a vote change stays

@@ -102,6 +102,12 @@ contract CompensationEndToEndTest is Test {
     ///      checkpoints really moved, they just moved too late to matter.
     uint256 public postBuyTs;
 
+    /// @dev This test contract stands in for the factory, so it also answers
+    ///      the factory's `compensationEscrow()` view — that is how a
+    ///      withdrawal queue resolves the escrow now that it is no longer a
+    ///      `claimCompensation` argument (PR #24 review 🔴N1).
+    address public compensationEscrow;
+
     function setUp() public {
         usdg = new ERC20Mock("USD Gov", "USDG", 6);
         wood = new ERC20Mock("Sherwood", "WOOD", 18);
@@ -150,6 +156,7 @@ contract CompensationEndToEndTest is Test {
         //    test contract stands in for Plan D's challenge game as the
         //    authorized slasher (until Plan D lands, a verdict is governance).
         escrow = new CompensationEscrow(owner, address(wood));
+        compensationEscrow = address(escrow); // factory stand-in wiring (🔴N1)
         vm.startPrank(owner);
         escrow.setAuthorizedFunder(address(swood));
         escrow.setBackstop(backstop);
@@ -505,13 +512,20 @@ contract CompensationEndToEndTest is Test {
         // ...and the pay-through hands it to the request owner.
         uint256[] memory ids = new uint256[](1);
         ids[0] = reqId;
-        uint256 paid = q.claimCompensation(address(escrow), caseId, ids);
+        (uint256 paid, uint256 processed, uint256 skipped) = q.claimCompensation(caseId, ids);
         assertEq(paid, queueClaim, "single request == the queue's whole claim");
+        assertEq(processed, 1, "the request was credited");
+        assertEq(skipped, 0, "nothing passed over");
         assertEq(wood.balanceOf(lp2), queueClaim, "the queued exiter got the WOOD");
 
-        // Idempotent per request.
-        vm.expectRevert(IVaultWithdrawalQueue.CompensationAlreadyClaimed.selector);
-        q.claimCompensation(address(escrow), caseId, ids);
+        // Idempotent per request: a replay naming ONLY the already-paid id
+        // distributes nothing, and a call that distributes nothing does not
+        // stand (PR #24 review F-D) — it reverts rather than reporting an
+        // all-skipped success. Mixed batches still skip per id (🟡N7, see
+        // test_carlos_N7_frontRunClaimDoesNotGriefTheBatch).
+        vm.expectRevert(IVaultWithdrawalQueue.NoEligibleRequests.selector);
+        q.claimCompensation(caseId, ids);
+        assertEq(wood.balanceOf(lp2), queueClaim, "balance unchanged by the replay");
     }
 
     /// @notice A request queued AFTER the snapshot was not in custody at the
@@ -532,15 +546,30 @@ contract CompensationEndToEndTest is Test {
 
         (uint256 caseId,) = _verdictSlash();
 
+        // A batch naming ONLY the post-snapshot request distributes nothing,
+        // and a call that distributes nothing does not stand (PR #24 review
+        // F-D): it reverts, and the revert rolls the PULL back too — the case
+        // stays with the escrow instead of parking undistributed in the queue.
         uint256[] memory ids = new uint256[](1);
         ids[0] = postId;
-        vm.expectRevert(IVaultWithdrawalQueue.RequestNotEligible.selector);
-        q.claimCompensation(address(escrow), caseId, ids);
+        vm.expectRevert(IVaultWithdrawalQueue.NoEligibleRequests.selector);
+        q.claimCompensation(caseId, ids);
+        assertEq(wood.balanceOf(buyer), 0, "the post-snapshot owner got nothing");
+        (,,,, bool pulled) = q.compensationCase(address(escrow), caseId);
+        assertFalse(pulled, "the failed distribution did not pull the case");
+        assertGt(escrow.claimable(caseId, address(q)), 0, "claim still at the escrow");
 
-        // The pre-snapshot request still collects.
-        ids[0] = preId;
-        uint256 paid = q.claimCompensation(address(escrow), caseId, ids);
+        // A mixed batch skips the ineligible id (🟡N7) and pays the eligible
+        // one — the pre-snapshot request collects, the post-snapshot one stays
+        // passed over.
+        uint256[] memory both = new uint256[](2);
+        both[0] = postId;
+        both[1] = preId;
+        (uint256 paid, uint256 credited, uint256 passedOver) = q.claimCompensation(caseId, both);
         assertGt(paid, 0);
+        assertEq(credited, 1, "only the pre-snapshot request was credited");
+        assertEq(passedOver, 1, "the post-snapshot request was skipped, not reverted");
+        assertEq(wood.balanceOf(buyer), 0, "the post-snapshot owner still got nothing");
         assertEq(wood.balanceOf(lp2), paid);
     }
 
@@ -608,6 +637,36 @@ contract CompensationEndToEndTest is Test {
         assertEq(wood.balanceOf(address(escrow)), 0, "not even unbooked WOOD");
     }
 
+    /// @notice Review F-A regression: `EmptySnapshot` means the escrow's votes
+    ///         read SUCCEEDED and returned zero supply — the vault implements
+    ///         the ERC20Votes surface and the TIMESTAMP is wrong (here it
+    ///         predates the first LP deposit). That is a resubmittable caller
+    ///         error, so it must BUBBLE rather than burn the victims'
+    ///         compensation: the whole transaction rolls back — stake and the
+    ///         per-(caseKey, approver) `_verdictSlashed` mark — and the
+    ///         corrected call runs clean.
+    function test_slashToEscrow_emptySnapshotBubblesAndRetrySucceeds() public {
+        uint256 emptyTs = snapTs - 2 hours - 1; // vault live for 30+ days, pre-first-deposit
+        assertEq(vault.getPastTotalSupply(emptyTs), 0, "fixture: nobody held the vault yet");
+
+        address[] memory approvers = new address[](1);
+        approvers[0] = g1;
+        uint256[] memory bps = _bpsArr(1, SLASH_BPS);
+        vm.expectRevert(ICompensationEscrow.EmptySnapshot.selector);
+        swood.slashToEscrow(bytes32("verdict-case"), openedAt, approvers, bps, address(vault), emptyTs);
+
+        // Nothing moved and nothing burned: the slash rolled back with the revert.
+        assertEq(swood.guardianStake(g1), GUARDIAN_STAKE, "stake untouched");
+        assertFalse(swood.verdictSlashed(bytes32("verdict-case"), g1), "the one slash was not consumed");
+
+        // The resubmission with the corrected snapshot lands in full.
+        (uint256 total, uint256 caseId) =
+            swood.slashToEscrow(bytes32("verdict-case"), openedAt, approvers, bps, address(vault), snapTs);
+        assertEq(total, PROCEEDS, "the corrected verdict slashed in full");
+        assertGt(caseId, 0, "a case was opened");
+        assertEq(escrow.totalEscrowed(), PROCEEDS, "proceeds escrowed, not burned");
+    }
+
     // ── 8. PR #24 review 🟡6 + minors: frozen window reads, backstop guard ─
 
     /// @notice A holder can compute its sweep deadline on-chain: `caseOf` now
@@ -666,6 +725,177 @@ contract CompensationEndToEndTest is Test {
         vm.expectEmit(true, true, false, false, address(swood));
         emit GuardianSlashed(namespaced, g1, 0, 0);
         swood.slashToEscrow(raw, openedAt, approvers, _bpsArr(1, SLASH_BPS), address(vault), snapTs);
+    }
+
+    // ── 10. PR #24 review round 2: N1 / N2 / N7 / N8 regressions ──────────
+
+    /// @notice 🔴N1. The escrow is no longer a caller argument, so the token
+    ///         substitution drain has no entry point: the queue resolves the
+    ///         escrow from the factory, and a caller who has not been granted
+    ///         that slot cannot make the queue pull from anything.
+    ///
+    ///         The PoC needed two capabilities — name a hostile escrow, and
+    ///         have the payout unit re-read from it after the amount was fixed.
+    ///         This asserts both are gone: the wiring is governance-owned, and
+    ///         the case pins its token at pull time.
+    function test_carlos_N1_escrowIsGovernanceWiredAndTokenIsPinned() public {
+        VaultWithdrawalQueue q = new VaultWithdrawalQueue(address(vault));
+        uint256 reqId = _queueCustody(q, lp2, LP2_SHARES, 1);
+
+        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        snapTs = vm.getBlockTimestamp();
+        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        openedAt = vm.getBlockTimestamp();
+        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        (uint256 caseId,) = _verdictSlash();
+
+        uint256[] memory ids = new uint256[](1);
+        ids[0] = reqId;
+
+        // Unwired factory ⇒ no pull at all, rather than a pull from wherever
+        // the caller pointed.
+        compensationEscrow = address(0);
+        vm.expectRevert(IVaultWithdrawalQueue.CompensationEscrowNotSet.selector);
+        q.claimCompensation(caseId, ids);
+
+        // A hostile escrow deployed by anyone is inert: only governance's slot
+        // is read, and this contract IS the factory stand-in, so the attacker's
+        // address never enters the path.
+        compensationEscrow = address(escrow);
+
+        (uint256 paid,,) = q.claimCompensation(caseId, ids);
+        assertGt(paid, 0, "the honest case pays");
+
+        // The unit is pinned to what was actually received, recorded per case.
+        (uint256 total,,, address pinned, bool pulled) = q.compensationCase(address(escrow), caseId);
+        assertTrue(pulled, "case pulled");
+        assertEq(pinned, address(wood), "payout token pinned to the token measured at pull time");
+        assertEq(paid, total, "the single eligible request took the whole measured total");
+        assertEq(wood.balanceOf(lp2), paid, "paid in real WOOD to the request owner");
+        assertEq(wood.balanceOf(address(q)), 0, "nothing idles in the queue for a later caller to take");
+    }
+
+    /// @notice 🔴N1 (fix 3). Pulling a case while naming nobody is refused, so
+    ///         proceeds cannot be parked in the queue by a front-runner ahead
+    ///         of the honest pay-through.
+    function test_carlos_N1_pullWithoutDistributionIsRefused() public {
+        VaultWithdrawalQueue q = new VaultWithdrawalQueue(address(vault));
+        _queueCustody(q, lp2, LP2_SHARES, 1);
+
+        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        snapTs = vm.getBlockTimestamp();
+        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        openedAt = vm.getBlockTimestamp();
+        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        (uint256 caseId,) = _verdictSlash();
+
+        vm.expectRevert(IVaultWithdrawalQueue.NoRequestsSupplied.selector);
+        q.claimCompensation(caseId, new uint256[](0));
+
+        (,,,, bool pulled) = q.compensationCase(address(escrow), caseId);
+        assertFalse(pulled, "an empty batch does not pull the case");
+        assertEq(wood.balanceOf(address(q)), 0, "and leaves no WOOD sitting in the queue");
+    }
+
+    /// @notice 🟡N7. One already-paid id no longer reverts a keeper's batch.
+    ///         A griefer claims one request out of two; the honest sweep still
+    ///         pays the other and reports the skip.
+    function test_carlos_N7_frontRunClaimDoesNotGriefTheBatch() public {
+        VaultWithdrawalQueue q = new VaultWithdrawalQueue(address(vault));
+        uint256 idA = _queueCustody(q, lp2, LP2_SHARES / 2, 1);
+        uint256 idB = _queueCustody(q, lp1, LP2_SHARES / 2, 1);
+
+        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        snapTs = vm.getBlockTimestamp();
+        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        openedAt = vm.getBlockTimestamp();
+        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        (uint256 caseId,) = _verdictSlash();
+
+        // The griefer front-runs with just one of the two ids.
+        uint256[] memory one = new uint256[](1);
+        one[0] = idA;
+        vm.prank(makeAddr("griefer"));
+        (uint256 griefPaid,,) = q.claimCompensation(caseId, one);
+        assertGt(griefPaid, 0, "the front-run still pays its owner, not the griefer");
+
+        // The keeper's full batch survives.
+        uint256[] memory both = new uint256[](2);
+        both[0] = idA;
+        both[1] = idB;
+        (uint256 paid, uint256 processed, uint256 skipped) = q.claimCompensation(caseId, both);
+        assertEq(processed, 1, "only the unpaid id is credited");
+        assertEq(skipped, 1, "the front-run id is skipped, not fatal");
+        assertGt(paid, 0, "and the honest exiter is paid");
+    }
+
+    /// @notice 🟠N2. The severity ceiling binds per VERDICT, not per call: a
+    ///         second `slashToEscrow` naming the same approver under the same
+    ///         `caseKey` is refused, so splitting one verdict across
+    ///         transactions cannot compound past `maxSlashBps`.
+    function test_carlos_N2_repeatedCallsCannotCompoundPastTheCeiling() public {
+        // A ceiling well below 100% so compounding would be visible.
+        vm.startPrank(owner);
+        swood.setMinSlashBps(0);
+        swood.setMaxSlashBps(5_000);
+        vm.stopPrank();
+
+        address[] memory approvers = new address[](1);
+        approvers[0] = g1;
+        uint256[] memory bps = _bpsArr(1, 5_000);
+        uint256 stakeAtOpen = swood.guardianStake(g1);
+
+        swood.slashToEscrow(bytes32("split-verdict"), openedAt, approvers, bps, address(vault), snapTs);
+        uint256 afterFirst = swood.guardianStake(g1);
+        assertEq(afterFirst, stakeAtOpen / 2, "one call takes exactly the ceiling");
+
+        assertTrue(swood.verdictSlashed(bytes32("split-verdict"), g1), "the pair is recorded");
+
+        vm.expectRevert(StakedWood.ApproverAlreadySlashed.selector);
+        swood.slashToEscrow(bytes32("split-verdict"), openedAt, approvers, bps, address(vault), snapTs);
+        vm.expectRevert(StakedWood.ApproverAlreadySlashed.selector);
+        swood.slashToEscrow(bytes32("split-verdict"), openedAt, approvers, bps, address(vault), snapTs);
+
+        assertEq(swood.guardianStake(g1), afterFirst, "the ceiling held across the retries");
+
+        // A DIFFERENT verdict is a different liability and still lands — the
+        // guard is per case, not a lifetime immunity. It takes 5,000 bps of
+        // what is LEFT (`_slashOne` sizes off `min(atOpenCheckpoint, live)`),
+        // which is the geometric compounding 🟠N2 exists to stop: two calls
+        // reach 75% of the original bond. Legitimate across two convictions,
+        // a ceiling bypass within one.
+        assertFalse(swood.verdictSlashed(bytes32("other-verdict"), g1), "unrelated case unaffected");
+        swood.slashToEscrow(bytes32("other-verdict"), openedAt, approvers, bps, address(vault), snapTs);
+        assertEq(swood.guardianStake(g1), afterFirst / 2, "a separate verdict slashes separately");
+        assertEq(swood.guardianStake(g1), stakeAtOpen / 4, "two convictions compound to 75%; one may not");
+    }
+
+    /// @notice 🟡N8. A recoverable caller mistake surfaces instead of burning
+    ///         the victims' compensation. `snapshotTimestamp == block.timestamp`
+    ///         passes sWOOD's bound but fails the escrow's strictly-past one:
+    ///         it must bubble, and the guardian's stake must be untouched so the
+    ///         corrected call can still land.
+    function test_carlos_N8_recoverableOpenCaseFailureBubblesInsteadOfBurning() public {
+        address burnAddr = 0x000000000000000000000000000000000000dEaD;
+        uint256 burnBefore = wood.balanceOf(burnAddr);
+        uint256 stakeBefore = swood.guardianStake(g1);
+
+        address[] memory approvers = new address[](1);
+        approvers[0] = g1;
+        uint256 now_ = vm.getBlockTimestamp();
+
+        vm.expectRevert(ICompensationEscrow.SnapshotNotPast.selector);
+        swood.slashToEscrow(bytes32("oops"), now_, approvers, _bpsArr(1, SLASH_BPS), address(vault), now_);
+
+        assertEq(wood.balanceOf(burnAddr), burnBefore, "nothing burned on a fixable mistake");
+        assertEq(swood.guardianStake(g1), stakeBefore, "the whole transaction rolled back");
+        assertFalse(swood.verdictSlashed(bytes32("oops"), g1), "the dedup rolled back too, so the retry is clean");
+
+        // The corrected call lands.
+        (uint256 total, uint256 caseId) =
+            swood.slashToEscrow(bytes32("oops"), openedAt, approvers, _bpsArr(1, SLASH_BPS), address(vault), snapTs);
+        assertEq(total, PROCEEDS, "the retry recovered in full");
+        assertGt(caseId, 0, "and opened a real case");
     }
 
     /// @dev `slashToEscrow` now takes one rate per approver. These suites all

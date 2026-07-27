@@ -48,9 +48,23 @@ interface ICompensationEscrow {
     ///      auto-delegates EVERY receipt (mint and plain transfer), so
     ///      `getPastVotes(h, t)` equals h's balance for any holder that never
     ///      delegated away; the withdrawal queue pays its custody claim through
-    ///      to request owners via `claimCompensation`. On a LIVE upgraded
-    ///      vault, a holder whose last receipt predates the upgrade and who
-    ///      received only by transfer stays undelegated until its next receipt.
+    ///      to request owners via `claimCompensation`.
+    ///
+    /// @dev NOT RETROACTIVE — both halves have caveats on a vault that already
+    ///      exists (PR #24 review 🟠N4):
+    ///        - an undelegated holder (last receipt predates the upgrade,
+    ///          received only by transfer) has zero votes until its next
+    ///          receipt. Self-healing, and forceable by anyone: `_update` fires
+    ///          on a ZERO-VALUE transfer, so a keeper can arm the whole holder
+    ///          set without their cooperation;
+    ///        - the queue pay-through is NEW DEPLOYMENTS ONLY. The queue sits
+    ///          behind no proxy and `setWithdrawalQueue` is set-once, so a
+    ///          vault deployed before this change has a queue with no
+    ///          `claimCompensation` and no way to replace it. Its queued cohort
+    ///          accrues a claim nobody can pull, and it sweeps to the backstop.
+    ///          Migration is a new syndicate or a vault upgrade adding a
+    ///          queue-replacement path — see `CompensationEscrow`'s contract
+    ///          natspec.
     ///
     /// @dev KNOWN OPEN F1 RECOUPMENT CHANNEL: a holder that explicitly
     ///      delegated has its compensation credited to the DELEGATE, not to

@@ -9,6 +9,10 @@ pragma solidity 0.8.28;
 ///         propose, approve-quorum check at execute).
 interface IExposureLedger {
     // ── Errors ──
+    /// @notice RETAINED FOR ABI STABILITY, no longer thrown. The exposure cap
+    ///         is enforced by booking zero rather than by reverting the vote
+    ///         (review N1); indexers and off-chain decoders that already know
+    ///         this selector keep working.
     error ExposureCapExceeded();
     error CoveredTvlCapExceeded();
 
@@ -46,6 +50,11 @@ interface IExposureLedger {
 
     // ── Governor-consumed checks (view) ──
     function requireWithinCoveredTvlCap(address asset, uint256 requiredCoverage) external view;
+
+    /// @notice Reverts when a proposal's settlement lands beyond the ledger's
+    ///         booking horizon. Called at propose so the error lands on the
+    ///         proposer rather than on the guardian cohort.
+    function requireWithinCoverageHorizon(uint256 executeBy, uint256 strategyDuration) external view;
     function requireApproveQuorum(address governor, uint256 proposalId, address asset, uint256 requiredCoverage)
         external
         view;
@@ -57,9 +66,15 @@ interface IExposureLedger {
     ///         returned approver list.
     /// @dev    Feeds `IStakedWood.slashToEscrow` directly. Each rate is that
     ///         guardian's booked coverage divided by their live slashable bond
-    ///         — both USD, so the quotient is unitless and no price is read in
-    ///         the slash path. A guardian who booked nothing returns 0 and is
-    ///         therefore slashed nothing.
+    ///         — both USD, so the quotient is DIMENSIONALLY unitless, but both
+    ///         operands are priced (PR #24 review 🟡N5): the numerator reads
+    ///         the asset's Chainlink feed behind a `StalePrice` gate (a stale
+    ///         feed makes the conviction unpriceable and this view reverts),
+    ///         and the denominator is priced by `woodPriceX8()` — Chainlink
+    ///         with the haircut, owner-set `woodUsdPriceX8` only as the
+    ///         degraded fallback. See the implementation natspec for the
+    ///         liveness and governance-trust consequences. A guardian who
+    ///         booked nothing returns 0 and is therefore slashed nothing.
     function slashBpsFor(address governor, uint256 proposalId)
         external
         view

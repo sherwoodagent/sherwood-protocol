@@ -37,6 +37,13 @@ contract MockFeed {
     function latestRoundData() external view returns (uint80, int256, uint256, uint256, uint80) {
         return (1, answer, updatedAt, updatedAt, 1);
     }
+
+    /// @dev Re-stamps `updatedAt`. Needed by any test that warps to real chain
+    ///      time, which otherwise leaves this fixture's feed stale.
+    function set(int256 answer_) external {
+        answer = answer_;
+        updatedAt = block.timestamp;
+    }
 }
 
 /// @dev A contract with real code (so `TierRegistry.certify` can snapshot its
@@ -401,6 +408,68 @@ contract CoverageEndToEndTest is Test {
         govA.settleProposal(pid);
         assertEq(govA.openProposalCount(), 0, "nothing in flight");
         govA.setExposureLedger(address(ledger));
+    }
+
+    /// @notice N11 — the propose-time horizon gate must fire on the
+    ///         COLLABORATIVE path too. `p.executeBy` is written by
+    ///         `_initPendingProposal`, which `propose` only calls on the
+    ///         non-collaborative branch; a co-proposed strategy sits in Draft
+    ///         with `executeBy == 0` until `approveCollaboration`, which re-runs
+    ///         no ledger gate.
+    ///
+    ///         Passing that raw zero made the check
+    ///         `strategyDuration > block.timestamp` — unsatisfiable on a real
+    ///         chain — so an over-horizon co-proposed strategy proposed
+    ///         cleanly, every approve booked zero, and it died at the
+    ///         execute-time quorum with nothing indicating why. The gate now
+    ///         computes the worst-case deadline instead.
+    ///
+    ///         `vm.warp` is load-bearing: at Foundry's default `t = 1` the
+    ///         broken comparison is trivially true and the bug is invisible.
+    function test_n11_collaborativeProposalIsGatedOnTheHorizonToo() public {
+        vm.warp(1_800_000_000);
+        feed.set(1e8); // re-stamp updatedAt: the warp made the fixture feed stale
+
+        vm.prank(owner);
+        govA.setMaxStrategyDuration(365 days); // legal: no protocol ceiling seated
+
+        // A co-proposer must be an agent registered on THIS vault; agentB is
+        // vaultB's.
+        address coAgent = makeAddr("coAgentA");
+        // Hoisted: `mint` in argument position would consume the prank and the
+        // registerAgent would run unpranked.
+        uint256 coAgentId = agentRegistry.mint(coAgent);
+        vm.prank(owner);
+        vaultA.registerAgent(coAgentId, coAgent);
+
+        ISyndicateGovernor.CoProposer[] memory cps = new ISyndicateGovernor.CoProposer[](1);
+        cps[0] = ISyndicateGovernor.CoProposer({agent: coAgent, splitBps: 1_000});
+
+        vm.prank(agentA);
+        vm.expectRevert(IExposureLedger.CoverageHorizonExceeded.selector);
+        govA.propose(
+            address(vaultA),
+            address(0),
+            "ipfs://n11",
+            100 days, // settles far past MAX_COVERAGE_HORIZON
+            ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000}),
+            _execCalls(),
+            _settleCalls(),
+            cps
+        );
+
+        // An in-horizon duration still proposes on the same path.
+        vm.prank(agentA);
+        govA.propose(
+            address(vaultA),
+            address(0),
+            "ipfs://n11-ok",
+            7 days,
+            ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000}),
+            _execCalls(),
+            _settleCalls(),
+            cps
+        );
     }
 
     // ── N1: budget exhaustion must not silence the approve side ───────────

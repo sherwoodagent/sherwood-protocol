@@ -14,7 +14,9 @@
 
 **Correction to the correction (2026-07-26).** The paragraph above described booking as `min(free budget, coverage still uncovered)`. That rule was removed: it let the first approver absorb the entire coverage, leaving later ones at zero and unlisted, which a front-run-then-release turned into a costless permanent veto (review C1). An approver now RESERVES `min(free budget, the proposal's FULL coverage)`, and the real per-guardian liability is the pro-rata `allocatedUsd`. The aggregate property is unchanged; the mechanism reaching it is not.
 
-**The "at 100%" claim was wrong and is withdrawn.** `GuardianRegistry.resolveReview` passes `_severityBps(r)` — a quadratic ramp from `minSlashBps` to `maxSlashBps` — not 100%, and measured recovery on a fully-covered proposal was 53.68% of the booked number, flooring at 10% for a bare-quorum conviction. What makes §2's inequality hold is not a 100% slash but per-approver proportional rates: `ExposureLedger.slashBpsFor` (Plan C) derives each approver's rate from what they were ALLOCATED, so recovery tracks the booking by construction rather than by assuming the maximum severity. Note the review path (`resolveReview`, punishing approvers when the block side wins) and the challenge path (`slashToEscrow`, compensating LPs after a drain) are different mechanisms; only the second backs the coverage number, and the original wording ran them together. §3.3's per-guardian cap remains in force with its stated purpose — bounding ONE guardian across MANY proposals (the batching attack) — which is a different rule from requiring one guardian to single-handedly cover ONE proposal. An earlier implementation conflated the two by booking full coverage against each approver, which made the aggregate unreachable and left only whales able to clear a tier-2 quorum.
+**The "at 100%" claim was wrong and is withdrawn.** `GuardianRegistry.resolveReview` passes `_severityBps(r)` — a quadratic ramp from `minSlashBps` to `maxSlashBps` — not 100%, and measured recovery on a fully-covered proposal was 53.68% of the booked number, flooring at 10% for a bare-quorum conviction. What makes §2's inequality hold is not a 100% slash but per-approver proportional rates: `ExposureLedger.slashBpsFor` (Plan C) derives each approver's rate from what they were ALLOCATED, so recovery tracks the booking by construction rather than by assuming the maximum severity. Note the review path (`resolveReview`, punishing approvers when the block side wins) and the challenge path (`slashToEscrow`, compensating LPs after a drain) are different mechanisms; only the second backs the coverage number, and the original wording ran them together. §3.3's per-guardian cap remains in force with its stated purpose — bounding ONE guardian across MANY proposals (the batching attack) — which is a different rule from requiring one guardian to single-handedly cover ONE proposal. Booking the full coverage against each approver, which is what SHIPS, does not conflate the two: the reservation is an upper bound on liability, and the per-guardian split is the pro-rata `allocatedUsd`. (An earlier draft of this paragraph named full-coverage booking as the discarded mechanism; it is the current one.)
+
+**Scope note (2026-07-26).** `ExposureLedger.slashBpsFor` and `StakedWood.slashToEscrow` are Plan C — they do not exist on the Plan B branch. The claim that per-approver proportional rates are what make §2's inequality hold is a statement about that code, not about anything verifiable in Plan B alone. Also note the guarantee is `recovery == allocation`, not a surplus: the surplus demonstrated in Plan C's evidence test comes entirely from the delegated discount asymmetry, and delegation is deferred to v2.
 
 ## 0. Revision log
 
@@ -463,6 +465,56 @@ residual channels and one inherent limit that belong here rather than in a
    really was a holder of record) and is not fixable at this layer; it bounds
    how much of the slash a *fully-invested* attacker recoups to its pre-drain
    share fraction.
+4. **Queued exiters on a pre-existing vault (OPEN — migration, not a code
+   fix).** `VaultWithdrawalQueue.claimCompensation` pays the queue's custody
+   claim through to request owners, which closes the modal-victim gap **for
+   vaults deployed after that change**. It does not retrofit. The queue is a
+   plain constructor deployment behind no proxy and `setWithdrawalQueue` is
+   factory-only and set-once, so on an existing vault the queue accrues votes
+   and is credited a claim it has no code to pull; that cohort's compensation
+   strands and sweeps to the backstop. Outcome-identical to the pre-fix state,
+   so not a regression — but it must not be read as covered. Migration is a new
+   syndicate, or a vault upgrade adding a queue-replacement path.
+
+   The sibling caveat — a holder undelegated because its last receipt predates
+   the `_update` upgrade — *does* self-heal, and can be forced: `_update` runs
+   on a zero-value transfer, so a keeper can arm the entire legacy holder set
+   without holder cooperation, ahead of any snapshot.
+
+**What the §2 inequality does and does not say (PR #24 review 🟠N3).**
+`recovery ≥ loss` is measured, and it holds only where the severity clamp does
+not bind. `requireApproveQuorum` admits coverage up to
+`Σ min(live_i, reserved_i)`, while the slash can take at most
+`Σ min(live_i · maxSlashBps/10_000, allocated_i)`. Set coverage to exactly the
+joint slashable bond and the gate passes, every derived rate correctly
+saturates at 10,000 bps, and recovery lands at `loss · maxSlashBps/10_000` —
+80% at a 8,000-bps ceiling, 50% at 5,000. (8,000 is the *test fixture's*
+ceiling, not the shipped one — PR #24 review N3 correction:
+`DEFAULT_MAX_SLASH_BPS = 10_000` in `script/Deploy.s.sol`, both testnet scripts
+seat 10,000, and `DeployPlanB` pre-flight 1b *refuses* to deploy otherwise. At
+10,000 the clamp never binds and recovery is exactly 1.0× allocation, so the
+shortfall regime is unreachable in every configuration this repo can produce.
+That reclassifies the gap from an open design question to an **unenforced
+runtime invariant**: `setMaxSlashBps` accepts anything in
+`[minSlashBps, 10_000]`, so one governance transaction after deploy silently
+re-opens it. Follow-up: a floor on that setter, or price `maxSlashBps` into
+`requireApproveQuorum`.) This is a gap in *front* of the
+residual, distinct from the "bond shrank since the vote" case `slashBpsFor`
+documents as unavoidable. Both regimes are now pinned by tests
+(`test_recoveryCoversEveryApproversAllocation`,
+`test_recoveryFallsShortWhenTheCeilingBinds`). Closing it means either pricing
+`maxSlashBps` into the quorum gate or restating this inequality as
+`recovery ≥ loss · maxSlashBps/10_000`; that is a coverage-gate change with its
+own parameter re-derivation and is **not** settled by the slash-rail work.
+
+**Verdict slashes are one-shot per (case, approver) (PR #24 review 🟠N2).** The
+severity envelope binds per verdict, not per call: `_slashOne` applies its rate
+to live stake while sizing off the at-open checkpoint, so repeats compound
+geometrically (`1-(1-bps)^N`). Since a full-quorum batch (~27M gas at the
+100-approver cap) must be split across transactions to land at all, splitting
+was the natural workaround *and* silently voided the ceiling. `StakedWood`
+records `(caseKey, approver)` pairs and refuses a second slash; splitting a
+batch across transactions stays legal, replaying an approver does not.
 
 ### 3.9 Risk-scaled proposer bond (F3)
 

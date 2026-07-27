@@ -658,6 +658,15 @@ contract SyndicateVault is
         // delegated away keep their choice (`delegates(to) != 0`). On a LIVE
         // vault this upgrade heals an undelegated holder at its next receipt;
         // it cannot retroactively re-checkpoint the past.
+        //
+        // THE HEAL IS PERMISSIONLESS AND DOES NOT NEED THE HOLDER (PR #24
+        // review round 2). This runs on a ZERO-VALUE transfer too — ERC20
+        // permits `value == 0` and `super._update` takes the same path — so
+        // ANYONE can arm a stranded legacy holder by sending it 0 shares. A
+        // keeper can walk the holder set and heal all of it in an afternoon,
+        // which turns the live-vault caveat from "wait for their next receipt,
+        // whenever that is" into a bounded operational task. Do it BEFORE a
+        // snapshot is needed: the checkpoint lands when the transfer does.
         if (to != address(0) && delegates(to) == address(0)) {
             _delegate(to, to);
         }
