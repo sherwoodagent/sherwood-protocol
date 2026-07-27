@@ -66,9 +66,14 @@ interface IExposureLedger {
     ///         returned approver list.
     /// @dev    Feeds `IStakedWood.slashToEscrow` directly. Each rate is that
     ///         guardian's booked coverage divided by their live slashable bond
-    ///         — both USD, so the quotient is unitless and no price is read in
-    ///         the slash path. A guardian who booked nothing returns 0 and is
-    ///         therefore slashed nothing.
+    ///         — both USD, so the quotient is DIMENSIONALLY unitless, but both
+    ///         operands are priced (PR #24 review 🟡N5): the numerator reads
+    ///         the asset's Chainlink feed behind a `StalePrice` gate (a stale
+    ///         feed makes the conviction unpriceable and this view reverts),
+    ///         and the denominator is priced off the owner-set
+    ///         `woodUsdPriceX8`. See the implementation natspec for the
+    ///         liveness and governance-trust consequences. A guardian who
+    ///         booked nothing returns 0 and is therefore slashed nothing.
     function slashBpsFor(address governor, uint256 proposalId)
         external
         view

@@ -629,6 +629,36 @@ contract CompensationEndToEndTest is Test {
         assertEq(wood.balanceOf(address(escrow)), 0, "not even unbooked WOOD");
     }
 
+    /// @notice Review F-A regression: `EmptySnapshot` means the escrow's votes
+    ///         read SUCCEEDED and returned zero supply — the vault implements
+    ///         the ERC20Votes surface and the TIMESTAMP is wrong (here it
+    ///         predates the first LP deposit). That is a resubmittable caller
+    ///         error, so it must BUBBLE rather than burn the victims'
+    ///         compensation: the whole transaction rolls back — stake and the
+    ///         per-(caseKey, approver) `_verdictSlashed` mark — and the
+    ///         corrected call runs clean.
+    function test_slashToEscrow_emptySnapshotBubblesAndRetrySucceeds() public {
+        uint256 emptyTs = snapTs - 2 hours - 1; // vault live for 30+ days, pre-first-deposit
+        assertEq(vault.getPastTotalSupply(emptyTs), 0, "fixture: nobody held the vault yet");
+
+        address[] memory approvers = new address[](1);
+        approvers[0] = g1;
+        uint256[] memory bps = _bpsArr(1, SLASH_BPS);
+        vm.expectRevert(ICompensationEscrow.EmptySnapshot.selector);
+        swood.slashToEscrow(bytes32("verdict-case"), openedAt, approvers, bps, address(vault), emptyTs);
+
+        // Nothing moved and nothing burned: the slash rolled back with the revert.
+        assertEq(swood.guardianStake(g1), GUARDIAN_STAKE, "stake untouched");
+        assertFalse(swood.verdictSlashed(bytes32("verdict-case"), g1), "the one slash was not consumed");
+
+        // The resubmission with the corrected snapshot lands in full.
+        (uint256 total, uint256 caseId) =
+            swood.slashToEscrow(bytes32("verdict-case"), openedAt, approvers, bps, address(vault), snapTs);
+        assertEq(total, PROCEEDS, "the corrected verdict slashed in full");
+        assertGt(caseId, 0, "a case was opened");
+        assertEq(escrow.totalEscrowed(), PROCEEDS, "proceeds escrowed, not burned");
+    }
+
     // ── 8. PR #24 review 🟡6 + minors: frozen window reads, backstop guard ─
 
     /// @notice A holder can compute its sweep deadline on-chain: `caseOf` now

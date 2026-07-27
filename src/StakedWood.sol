@@ -244,7 +244,7 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     event VerdictSlashRouted(bytes32 indexed caseKey, address indexed vault, uint256 total, uint256 caseId);
 
     /// @notice Emitted when a verdict slash could NOT fund a compensation case
-    ///         — `openCase` reverted (empty snapshot, a vault without the
+    ///         — `openCase` reverted (a vault without the
     ///         ERC20Votes read surface, block-number clock mode) — and the
     ///         proceeds were burned instead. The guardian is still slashed;
     ///         the victims of THIS case go uncompensated (PR #24 review 🟡5:
@@ -1390,7 +1390,7 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
         //
         // BURN FALLBACK (PR #24 review 🟡5): `openCase` is the slash's only
         // sink, and it reverts on a vault the escrow cannot apportion against
-        // (empty snapshot, missing ERC20Votes reads, block-number clock mode).
+        // (missing ERC20Votes reads, block-number clock mode).
         // Letting that revert bubble would make the SLASH hostage to a vault
         // read — a bad vault would mean the guilty guardian keeps its stake.
         // Instead the slash stands and the proceeds burn, exactly like the
@@ -1402,11 +1402,12 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
         // answer only the failure it was written for: the vault cannot be
         // apportioned against, and no retry will change that. Every revert the
         // escrow raises about its OWN inputs is a recoverable caller or wiring
-        // mistake — a `snapshotTimestamp` that is not strictly past, a zero
-        // vault, an escrow mid-rewire that no longer recognises sWOOD as its
-        // funder — and each of those is fixable by resubmitting. Those bubble.
-        // The slash is idempotent per (caseKey, approver), so a bubbled revert
-        // costs nothing but the gas: the whole transaction rolls back,
+        // mistake — a `snapshotTimestamp` that is not strictly past (or that
+        // predates the vault's first deposit: `EmptySnapshot`, review F-A), a
+        // zero vault, an escrow mid-rewire that no longer recognises sWOOD as
+        // its funder — and each of those is fixable by resubmitting. Those
+        // bubble. The slash is idempotent per (caseKey, approver), so a bubbled
+        // revert costs nothing but the gas: the whole transaction rolls back,
         // including `_verdictSlashed`, and the corrected call runs clean.
         IERC20(wood).forceApprove(escrow, total);
         try ICompensationEscrow(escrow).openCase(vault, snapshotTimestamp, total) returns (uint256 id) {
@@ -1441,14 +1442,23 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     ///          turn it into a silent burn.
     ///        - `NotAuthorizedFunder` — the escrow is mid-reconfiguration and
     ///          no longer accepts sWOOD. Rewire and resubmit.
+    ///        - `EmptySnapshot` — the votes read SUCCEEDED and returned zero
+    ///          supply (review F-A). The vault demonstrably implements the
+    ///          ERC20Votes surface, so this is not the vault-capability failure
+    ///          the burn answers: on a real conviction a drain implies
+    ///          pre-drain holders, so a zero-supply snapshot means the
+    ///          TIMESTAMP is wrong (pre-first-deposit typo, wrong epoch
+    ///          anchor) — pure caller arithmetic, fixable by resubmitting with
+    ///          the corrected instant. Burning here would consume
+    ///          `_verdictSlashed` and strand the victims permanently on a
+    ///          recoverable input error. The classifier keys on RETRYABILITY,
+    ///          not on which contract raised the error.
     ///
-    ///      Everything else BURNS: `EmptySnapshot` (nobody held the vault at
-    ///      that instant, so there is no one to compensate and no later call
-    ///      changes that), and any unrecognised or empty returndata — a vault
-    ///      missing the ERC20Votes selectors, a block-number clock mode, or an
-    ///      out-of-gas child. Empty returndata deliberately falls through to
-    ///      the burn: that is the shape of the missing-selector case, which is
-    ///      precisely 🟡5's motivating failure.
+    ///      Everything else BURNS: any unrecognised or empty returndata — a
+    ///      vault missing the ERC20Votes selectors, a block-number clock mode,
+    ///      or an out-of-gas child. Empty returndata deliberately falls through
+    ///      to the burn: that is the shape of the missing-selector case, which
+    ///      is precisely 🟡5's motivating failure.
     function _isRecoverableOpenCaseFailure(bytes memory reason) private pure returns (bool) {
         if (reason.length < 4) return false;
         bytes4 selector;
@@ -1458,7 +1468,8 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
         return selector == ICompensationEscrow.SnapshotNotPast.selector
             || selector == ICompensationEscrow.ZeroAddress.selector
             || selector == ICompensationEscrow.NothingToCompensate.selector
-            || selector == ICompensationEscrow.NotAuthorizedFunder.selector;
+            || selector == ICompensationEscrow.NotAuthorizedFunder.selector
+            || selector == ICompensationEscrow.EmptySnapshot.selector;
     }
 
     /// @dev Per-approver slash. Extracted to keep `slashGuardians`'s stack
