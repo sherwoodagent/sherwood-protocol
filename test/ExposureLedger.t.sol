@@ -761,6 +761,57 @@ contract ExposureLedgerTest is Test {
         ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 1_000e6);
     }
 
+    /// @notice FINDING 1 — the haircut must apply to the FALLBACK as well.
+    ///
+    ///         While `woodHaircutBps` defaults to `BPS_DENOMINATOR` both paths
+    ///         agree and nothing is visibly wrong, which is why the existing
+    ///         tests passed either way. The inconsistency only appears once
+    ///         governance turns the haircut on: the healthy path valued bonds at
+    ///         0.8x spot while every degraded path returned the manual number
+    ///         raw — so enabling the safety feature made the fallback LESS
+    ///         conservative than the primary, in exactly the state where more
+    ///         margin is wanted.
+    function test_woodPrice_haircutAppliesToTheFallbackToo() public {
+        MockFeed woodFeed = new MockFeed(0.05e8, 8);
+        vm.startPrank(owner);
+        ledger.setWoodFeed(address(woodFeed), 1 hours);
+        ledger.setWoodHaircutBps(8_000); // 20% haircut
+        vm.stopPrank();
+
+        assertEq(ledger.woodPriceX8(), 0.04e8, "healthy path: 0.8x spot");
+
+        skip(2 hours); // feed goes stale -> fallback
+        assertEq(ledger.woodPriceX8(), 0.04e8, "fallback: 0.8x the manual number, NOT raw 0.05e8");
+
+        // And it flows through to bond valuation, which is what the looser
+        // batching cap would have come from.
+        swood.setStake(guardian, 100_000e18, 0);
+        assertEq(ledger.slashableBondUsd(guardian), 4_000e18, "not the 5_000 an unhaircut fallback would give");
+    }
+
+    /// @notice FINDING 2 — the degraded path must be observable. Without this,
+    ///         "feed healthy" and "feed dead for months, running on a manual
+    ///         number nobody has touched" are indistinguishable from outside,
+    ///         and monitoring cannot alert on a condition it cannot see.
+    function test_woodPriceDetail_reportsWhenRunningOnTheFallback() public {
+        (, bool fellBack) = ledger.woodPriceDetail();
+        assertTrue(fellBack, "no feed wired -> fallback");
+
+        MockFeed woodFeed = new MockFeed(0.05e8, 8);
+        vm.prank(owner);
+        ledger.setWoodFeed(address(woodFeed), 1 hours);
+        (, fellBack) = ledger.woodPriceDetail();
+        assertFalse(fellBack, "fresh feed -> primary");
+
+        skip(2 hours);
+        (, fellBack) = ledger.woodPriceDetail();
+        assertTrue(fellBack, "stale feed -> fallback, and now visible");
+
+        woodFeed.set(0.05e8); // fresh again
+        (, fellBack) = ledger.woodPriceDetail();
+        assertFalse(fellBack, "recovered");
+    }
+
     /// @notice C1 REGRESSION — the free-rider veto.
     ///
     ///         Under first-come booking an attacker could approve first and

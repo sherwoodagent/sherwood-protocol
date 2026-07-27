@@ -72,6 +72,10 @@ interface IExposureLedger {
     function currentEpoch() external view returns (uint256);
     function woodUsdPriceX8() external view returns (uint256);
     function woodPriceX8() external view returns (uint256);
+
+    /// @notice The WOOD price plus whether it came from the fallback rather than
+    ///         the feed — so monitoring can observe the degraded path.
+    function woodPriceDetail() external view returns (uint256 price, bool usingFallback);
     function woodHaircutBps() external view returns (uint256);
     function epochLength() external view returns (uint256);
     function challengeWindow() external view returns (uint256);

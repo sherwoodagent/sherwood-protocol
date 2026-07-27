@@ -287,15 +287,50 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///         must be MAINTAINED as a fallback rather than abandoned once the
     ///         feed is wired.
     function woodPriceX8() public view returns (uint256) {
+        (uint256 price,) = _woodPrice();
+        return price;
+    }
+
+    /// @notice The WOOD price and whether it came from the FALLBACK rather than
+    ///         the feed.
+    /// @dev    Exists because the degraded path was otherwise invisible: no
+    ///         event, and `woodUsdPriceX8` carries no `updatedAt` of its own, so
+    ///         "feed healthy" and "feed dead for three months, running on a
+    ///         manual number nobody has touched" read identically from outside.
+    ///         §6 monitoring cannot alert on a condition it cannot observe.
+    function woodPriceDetail() external view returns (uint256 price, bool usingFallback) {
+        return _woodPrice();
+    }
+
+    function _woodPrice() internal view returns (uint256 price, bool usingFallback) {
         AssetFeed storage f = _woodFeed;
-        if (f.feed == address(0)) return woodUsdPriceX8;
+        if (f.feed == address(0)) return (_haircut(woodUsdPriceX8), true);
         (, int256 answer,, uint256 updatedAt,) = IAggregatorMinimal(f.feed).latestRoundData();
-        if (answer <= 0) return woodUsdPriceX8;
+        if (answer <= 0) return (_haircut(woodUsdPriceX8), true);
         uint256 age = block.timestamp > updatedAt ? block.timestamp - updatedAt : 0;
-        if (age > f.maxDelay) return woodUsdPriceX8;
-        // Normalise to 8 decimals, then haircut. `answer > 0` checked above.
+        if (age > f.maxDelay) return (_haircut(woodUsdPriceX8), true);
+        // Normalise to 8 decimals. `answer > 0` checked above.
         // forge-lint: disable-next-line(unsafe-typecast)
         uint256 priceX8 = (uint256(answer) * 1e8) / (10 ** f.feedDecimals);
+        return (_haircut(priceX8), false);
+    }
+
+    /// @dev THE HAIRCUT APPLIES TO BOTH PATHS. It originally applied only to the
+    ///      feed, which was harmless while `woodHaircutBps` defaulted to
+    ///      `BPS_DENOMINATOR` — and wrong the moment governance turned it on.
+    ///      With a 20% haircut the healthy path valued bonds at 0.8x spot while
+    ///      all three degraded paths returned `woodUsdPriceX8` raw, so enabling
+    ///      the safety feature made the FALLBACK less conservative than the
+    ///      primary: over-valued bonds, over-stated `slashableBondUsd`, a looser
+    ///      batching cap — and precisely in the state where more margin is
+    ///      wanted, not less.
+    ///
+    ///      The natspec's defence was that `woodUsdPriceX8` is "itself a
+    ///      conservative floor", but nothing enforced that: `setWoodUsdPrice`
+    ///      bounds only upward moves, deliberately, so the manual number may sit
+    ///      at spot. Haircutting both makes the claim structural instead of
+    ///      procedural.
+    function _haircut(uint256 priceX8) internal view returns (uint256) {
         return (priceX8 * woodHaircutBps) / BPS_DENOMINATOR;
     }
 
