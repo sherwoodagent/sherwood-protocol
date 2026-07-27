@@ -460,6 +460,46 @@ residual channels and one inherent limit that belong here rather than in a
    really was a holder of record) and is not fixable at this layer; it bounds
    how much of the slash a *fully-invested* attacker recoups to its pre-drain
    share fraction.
+4. **Queued exiters on a pre-existing vault (OPEN — migration, not a code
+   fix).** `VaultWithdrawalQueue.claimCompensation` pays the queue's custody
+   claim through to request owners, which closes the modal-victim gap **for
+   vaults deployed after that change**. It does not retrofit. The queue is a
+   plain constructor deployment behind no proxy and `setWithdrawalQueue` is
+   factory-only and set-once, so on an existing vault the queue accrues votes
+   and is credited a claim it has no code to pull; that cohort's compensation
+   strands and sweeps to the backstop. Outcome-identical to the pre-fix state,
+   so not a regression — but it must not be read as covered. Migration is a new
+   syndicate, or a vault upgrade adding a queue-replacement path.
+
+   The sibling caveat — a holder undelegated because its last receipt predates
+   the `_update` upgrade — *does* self-heal, and can be forced: `_update` runs
+   on a zero-value transfer, so a keeper can arm the entire legacy holder set
+   without holder cooperation, ahead of any snapshot.
+
+**What the §2 inequality does and does not say (PR #24 review 🟠N3).**
+`recovery ≥ loss` is measured, and it holds only where the severity clamp does
+not bind. `requireApproveQuorum` admits coverage up to
+`Σ min(live_i, reserved_i)`, while the slash can take at most
+`Σ min(live_i · maxSlashBps/10_000, allocated_i)`. Set coverage to exactly the
+joint slashable bond and the gate passes, every derived rate correctly
+saturates at 10,000 bps, and recovery lands at `loss · maxSlashBps/10_000` —
+80% at the shipped 8,000, 50% at 5,000. This is a gap in *front* of the
+residual, distinct from the "bond shrank since the vote" case `slashBpsFor`
+documents as unavoidable. Both regimes are now pinned by tests
+(`test_recoveryCoversEveryApproversAllocation`,
+`test_recoveryFallsShortWhenTheCeilingBinds`). Closing it means either pricing
+`maxSlashBps` into the quorum gate or restating this inequality as
+`recovery ≥ loss · maxSlashBps/10_000`; that is a coverage-gate change with its
+own parameter re-derivation and is **not** settled by the slash-rail work.
+
+**Verdict slashes are one-shot per (case, approver) (PR #24 review 🟠N2).** The
+severity envelope binds per verdict, not per call: `_slashOne` applies its rate
+to live stake while sizing off the at-open checkpoint, so repeats compound
+geometrically (`1-(1-bps)^N`). Since a full-quorum batch (~27M gas at the
+100-approver cap) must be split across transactions to land at all, splitting
+was the natural workaround *and* silently voided the ceiling. `StakedWood`
+records `(caseKey, approver)` pairs and refuses a second slash; splitting a
+batch across transactions stays legal, replaying an approver does not.
 
 ### 3.9 Risk-scaled proposer bond (F3)
 

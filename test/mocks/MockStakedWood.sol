@@ -277,6 +277,12 @@ contract MockStakedWood is IStakedWood {
         revert("MockStakedWood: compensationEscrow not modeled");
     }
 
+    // Per-(caseKey, approver) verdict dedup (PR #24 review 🟠N2). Same reason
+    // as `slashToEscrow`: the path it guards is not modeled here.
+    function verdictSlashed(bytes32, address) external pure returns (bool) {
+        revert("MockStakedWood: verdictSlashed not modeled");
+    }
+
     function stakeAsGuardian(uint256, uint256) external pure {
         revert("MockStakedWood: stakeAsGuardian not modeled");
     }

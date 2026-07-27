@@ -795,6 +795,31 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      coverage — R1 requires an identified signer for anything tier-gated
     ///      into this check. Called by `SyndicateGovernor.executeProposal` for
     ///      proposals with `envelopeTier >= quorumTierThreshold`.
+    ///
+    /// @dev KNOWN GAP — THIS GATE DOES NOT PRICE IN `maxSlashBps` (PR #24
+    ///      review 🟠N3). The sum checked here is
+    ///      `Σ min(live_i, reserved_i) >= needUsd`. What the slash can actually
+    ///      TAKE is `Σ min(live_i · maxSlashBps/10_000, allocated_i)`, because
+    ///      `slashToEscrow` clamps every rate to the severity ceiling. So an
+    ///      allocation that runs to the top of a bond is short by
+    ///      `1 - maxSlashBps/10_000` of itself: 20% at the shipped 8,000, 50%
+    ///      at 5,000. Worked case — coverage set to exactly the joint slashable
+    ///      bond ($2,000 across two $1,000 own-stake bonds): this gate PASSES,
+    ///      both derived rates are a correct 10,000 bps, and recovery is
+    ///      $1,600 against a $2,000 loss (80%).
+    ///
+    ///      This is a hole in FRONT of the residual, not behind it — distinct
+    ///      from the "bond shrank since the vote" case `slashBpsFor` documents
+    ///      as unavoidable. It is left open here deliberately: closing it is a
+    ///      change to the coverage GATE (either require
+    ///      `Σ min(live_i · maxSlashBps/10_000, reserved_i) >= needUsd`, or
+    ///      restate spec §2's inequality as
+    ///      `recovery >= loss · maxSlashBps/10_000`), and that belongs in its
+    ///      own PR with its own parameter re-derivation rather than bolted onto
+    ///      the slash rails. `test_recoveryCoversEveryApproversAllocation`
+    ///      exercises BOTH regimes — the slack one where the clamp never fires
+    ///      and the binding one above — so the shortfall is measured and pinned
+    ///      rather than assumed away.
     function requireApproveQuorum(address governor, uint256 proposalId, address asset, uint256 requiredCoverage)
         external
         view
@@ -834,9 +859,22 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     /// @dev The bridge between what a guardian UNDERWROTE and what the verdict
     ///      path can actually take. `slashToEscrow` speaks in bps of stake; the
     ///      ledger books liability in USD. Dividing one USD quantity by the
-    ///      other cancels the unit, so this conversion needs no price read of
-    ///      its own — which matters, because an oracle in the slash path would
-    ///      let a stale or compromised feed resize a conviction.
+    ///      other cancels the unit DIMENSIONALLY — but not the price
+    ///      sensitivity, and an earlier version of this comment claimed the
+    ///      conversion "needs no price read of its own" (PR #24 review 🟡N5).
+    ///      It reads two. Both operands are priced:
+    ///        - the numerator (the allocation) traces back to `coverageUsd`,
+    ///          which reads a Chainlink feed behind a `StalePrice` gate — so a
+    ///          stale asset feed makes a conviction UNPRICEABLE and this view
+    ///          reverts. Feed outages correlate with exactly the market stress
+    ///          a drain happens in, so that is a real liveness hole in the
+    ///          slash path;
+    ///        - the denominator (`live`, via `_slashableBondUsd`) is priced off
+    ///          the OWNER-SET `woodUsdPriceX8`. Halving it doubles every
+    ///          derived rate — governance resizes every conviction in the
+    ///          system with one scalar.
+    ///      Both are governance-trust statements of the same family as D4's,
+    ///      recorded here rather than argued away.
     ///
     ///      Approvers come from the ledger's OWN `_approversOf`, exactly as
     ///      `requireApproveQuorum` does and for the same reason (review finding

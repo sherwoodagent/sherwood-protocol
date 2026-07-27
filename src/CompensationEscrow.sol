@@ -42,9 +42,34 @@ interface IVaultVotesMinimal {
  *         for any holder that never delegated away — including a secondary
  *         buyer and the withdrawal queue's custody balance (the queue exposes
  *         `claimCompensation` to pay its claim through to the request owners).
- *         Caveat for LIVE upgraded vaults: a holder whose LAST receipt predates
- *         the `_update` upgrade and who received only by transfer stays
- *         undelegated (zero votes) until its next receipt.
+ *
+ * @dev    CAVEAT FOR VAULTS ALREADY DEPLOYED — READ BEFORE ASSUMING COVERAGE
+ *         (PR #24 review 🟠N4). Two separate gaps; only one self-heals.
+ *
+ *         1. UNDELEGATED HOLDERS — self-heals, and can be forced. A holder
+ *            whose LAST receipt predates the `_update` upgrade and that
+ *            received only by transfer stays undelegated (zero votes) until
+ *            its next receipt. `_update` fires on a ZERO-VALUE transfer, so
+ *            any third party can arm a stranded holder for the cost of one
+ *            transfer — a keeper can heal the whole holder set without their
+ *            cooperation. Do it BEFORE a snapshot is needed: the checkpoint is
+ *            written when the transfer lands, not retroactively.
+ *
+ *         2. QUEUED EXITERS ON A PRE-EXISTING VAULT — does NOT self-heal and
+ *            is NOT retrofittable. `VaultWithdrawalQueue` is a plain
+ *            constructor deployment behind no proxy, and
+ *            `SyndicateVault.setWithdrawalQueue` is factory-only and SET-ONCE.
+ *            So on a vault deployed before this change: the vault can be
+ *            upgraded to auto-delegate, the queue therefore DOES accrue votes
+ *            at its next receipt and IS credited a claim here — but the
+ *            deployed queue has no `claimCompensation`, cannot call `redeem`,
+ *            and cannot be replaced. That cohort's entire claim strands and is
+ *            eventually swept to `backstop`. Outcome-identical to the pre-fix
+ *            state, so not a regression — but queued exiters on an existing
+ *            syndicate ARE NOT COVERED, whatever the D1 paragraph above says
+ *            about the queue paying its claim through. MIGRATION: a new
+ *            syndicate, or a vault upgrade adding a queue-replacement path.
+ *            There is no third option.
  *
  * @dev    KNOWN OPEN F1 RECOUPMENT CHANNEL — delegation: `delegate()` is a
  *         free, permissionless pointer that decides who a claim belongs to. A
@@ -259,9 +284,14 @@ contract CompensationEscrow is Ownable2Step, ICompensationEscrow {
         if (block.timestamp < c.openedAt + c.residueWindowAtOpen) revert ResidueWindowOpen();
         if (c.swept) revert NothingToCompensate();
         if (backstop == address(0)) revert ZeroAddress();
-        // "Residue never to live NAV" (§3.8) enforced in code, not owner
-        // discipline: even a misconfigured backstop cannot point at the very
-        // vault whose drain this case compensates.
+        // A TYPO-CATCHER, NOT A PROPERTY (PR #24 review, minor). This compares
+        // the backstop against `c.vault` and nothing else, so it catches the
+        // realistic misconfiguration — the owner pasting the vault address into
+        // `setBackstop` — and nothing beyond it. A backstop contract that
+        // FORWARDS to the vault bypasses it in one hop. "Residue never to live
+        // NAV" (§3.8) is therefore owner discipline plus one guardrail, not an
+        // invariant enforced in code; an earlier version of this comment
+        // claimed the stronger thing. Worth keeping for what it does catch.
         if (backstop == c.vault) revert BackstopIsVault();
         amount = c.proceeds - c.redeemed;
         if (amount == 0) revert NothingToCompensate();

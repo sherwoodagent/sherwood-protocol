@@ -256,25 +256,31 @@
       "label": "__gap",
       "slot": "45",
       "offset": 0,
-      "type": "t_array(t_uint256)6_storage"
+      "type": "t_array(t_uint256)5_storage"
     },
     {
       "label": "exposureLedger",
-      "slot": "51",
+      "slot": "50",
       "offset": 0,
       "type": "t_address"
     },
     {
       "label": "authorizedSlasher",
-      "slot": "52",
+      "slot": "51",
       "offset": 0,
       "type": "t_address"
     },
     {
       "label": "compensationEscrow",
-      "slot": "53",
+      "slot": "52",
       "offset": 0,
       "type": "t_address"
+    },
+    {
+      "label": "_verdictSlashed",
+      "slot": "53",
+      "offset": 0,
+      "type": "t_mapping(t_bytes32,t_mapping(t_address,t_bool))"
     }
   ],
   "types": {

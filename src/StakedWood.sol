@@ -97,6 +97,9 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     /// @dev Mirrors `IStakedWood.DuplicateApprover`.
     error DuplicateApprover();
 
+    /// @dev Mirrors `IStakedWood.ApproverAlreadySlashed`.
+    error ApproverAlreadySlashed();
+
     /// @notice Insufficient WOOD to satisfy a stake minimum.
     /// @dev Relocated from `IGuardianRegistry` alongside `stakeAsGuardian`.
     error InsufficientStake();
@@ -418,7 +421,8 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     ///      off the FRONT of the gap and nothing existing moves, but the
     ///      sequence between the two branches is only decidable once, and this
     ///      is it.
-    uint256[6] private __gap;
+    ///      Decremented 6 → 5 for `_verdictSlashed` (PR #24 review 🟠N2).
+    uint256[5] private __gap;
 
     /// @notice Coverage ledger consulted before releasing a guardian's stake.
     ///
@@ -459,6 +463,22 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     ///      own choosing. Zero disables the verdict path
     ///      (`CompensationEscrowNotSet`).
     address public compensationEscrow;
+
+    /// @dev One slash per (verdict, approver) — the persistent half of the
+    ///      severity envelope (PR #24 review 🟠N2). Keyed by the RAW `caseKey`
+    ///      the caller passed, so a slasher can read `verdictSlashed` with the
+    ///      same key it will pass back in.
+    ///
+    ///      Why persistence is needed at all: `_slashOne` applies its rate to
+    ///      the LIVE stake but sizes off the `openedAt` checkpoint, so repeats
+    ///      compound geometrically — N calls at `bps` take `1-(1-bps)^N`. The
+    ///      intra-call pairwise dedup bounds one array; it says nothing about
+    ///      the next transaction. And splitting IS the expected shape here: a
+    ///      100-approver quorum slash costs ~27M gas, more than an Ethereum
+    ///      mainnet block, so the batch has to be split to land at all.
+    ///      Without this map, the workaround for the gas limit silently voids
+    ///      the ceiling governance set.
+    mapping(bytes32 caseKey => mapping(address approver => bool)) private _verdictSlashed;
 
     /// @notice Slashed WOOD is sent here — permanently out of circulation.
     /// @dev Burning via a transfer to a known-dead address keeps WOOD's
@@ -1167,6 +1187,14 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
         emit CompensationEscrowSet(escrow);
     }
 
+    /// @notice Whether `approver` has already been slashed under `caseKey`.
+    /// @dev Read this before resuming a verdict that had to be split across
+    ///      transactions (a full-quorum batch does not fit one block), so the
+    ///      continuation names only approvers still owed a slash.
+    function verdictSlashed(bytes32 caseKey, address approver) external view returns (bool) {
+        return _verdictSlashed[caseKey][approver];
+    }
+
     // ── Slashing (registry-gated) ──
 
     /// @notice Slash a set of approvers for a blocked proposal.
@@ -1223,6 +1251,25 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     ///      entrypoint that takes severity straight from its caller, letting a
     ///      compromised `authorizedSlasher` exceed a ceiling governance set (or
     ///      dodge a floor it set) at will.
+    ///
+    ///      The envelope binds per VERDICT, not per call: `_verdictSlashed`
+    ///      gives each (caseKey, approver) pair exactly one slash, so the
+    ///      ceiling cannot be compounded past by splitting one verdict across
+    ///      transactions (🟠N2).
+    ///
+    /// @dev `minSlashBps` IS A PUNITIVE FLOOR, NOT A PROPORTIONALITY RULE
+    ///      (PR #24 review 🟡N6). Any non-zero derived rate is raised to it, so
+    ///      an approver who underwrote $10 of a $1,000 bond (a 100-bps rate)
+    ///      pays `minSlashBps` of the bond — 10× what they insured at a 1,000-bps
+    ///      floor. That is deliberate: below the floor the recovery would not
+    ///      cover the cost of running the case, and a severity that rounds to
+    ///      nothing is not a deterrent. It is NOT an attempt to make the loss
+    ///      whole in proportion to what was underwritten. Zero stays exempt
+    ///      (see the loop) because zero is the absence of liability, not a
+    ///      small amount of it. Governance sets the floor knowing this:
+    ///      raising `minSlashBps` raises the over-slash multiple on every
+    ///      small allocation, and the per-verdict guard above is what stops
+    ///      concurrent small convictions from stacking those floors.
     ///
     /// @dev TIMESTAMP BOUNDS — WHAT THEY DO AND DO NOT GUARANTEE (PR #24
     ///      review 🟠2). `openedAt` must not be in the future (`VerdictNotPast`)
@@ -1287,15 +1334,22 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
         // carries the RAW `caseKey`, so indexers join the two deterministically.
         bytes32 slashKey = keccak256(abi.encodePacked("sherwood.verdict", caseKey));
 
-        // DEDUP (PR #24 review 🟠4). Each `_slashOne` pass re-applies its
-        // clamped rate to the ALREADY-REDUCED live stake, so N repeats of one
-        // approver compound to `1-(1-bps)^N` — above any `maxSlashBps` ceiling
-        // governance set. Pairwise over calldata rather than requiring sorted
-        // input: the production feed (`ExposureLedger.slashBpsFor`) is
-        // vote-ordered and positionally rate-aligned, and approver sets are
-        // quorum-sized, so O(n²) here is cheaper than every caller co-sorting
-        // two paired arrays. Zero-rate entries are NOT exempt — a zero slot
-        // must not smuggle a duplicate address past the check.
+        // INTRA-CALL DEDUP (PR #24 review 🟠4). Each `_slashOne` pass
+        // re-applies its clamped rate to the ALREADY-REDUCED live stake, so N
+        // repeats of one approver compound to `1-(1-bps)^N` — above any
+        // `maxSlashBps` ceiling governance set. Pairwise over calldata rather
+        // than requiring sorted input: the production feed
+        // (`ExposureLedger.slashBpsFor`) is vote-ordered and positionally
+        // rate-aligned, and approver sets are quorum-sized, so O(n²) here
+        // (2.30M gas at the 100-approver cap, against ~27M for the slash
+        // itself) is cheaper than every caller co-sorting two paired arrays.
+        // Zero-rate entries are NOT exempt — a zero slot must not smuggle a
+        // duplicate address past the check.
+        //
+        // This bounds ONE array. The same compounding across SEPARATE calls is
+        // bounded by `_verdictSlashed` in the loop below (🟠N2) — which is the
+        // half that actually binds in production, since a full-quorum batch
+        // has to be split across transactions to fit in a block at all.
         for (uint256 i = 0; i < approvers.length; i++) {
             for (uint256 j = i + 1; j < approvers.length; j++) {
                 if (approvers[i] == approvers[j]) revert DuplicateApprover();
@@ -1313,6 +1367,12 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
             // after coverage was already met.
             uint256 requested = slashBpsPer[i];
             if (requested == 0) continue;
+            // PERSISTENT DEDUP (PR #24 review 🟠N2). The pairwise scan above
+            // bounds one array; this bounds the VERDICT. Checked after the
+            // zero-skip on purpose: a zero rate takes nothing, so it must not
+            // consume the approver's one slash and block a later real one.
+            if (_verdictSlashed[caseKey][approvers[i]]) revert ApproverAlreadySlashed();
+            _verdictSlashed[caseKey][approvers[i]] = true;
             // Clamped per element, not once for the batch: the envelope is a
             // per-guardian ceiling/floor on severity, so it has to bind each
             // approver's own rate. Hoisting it would let one approver's rate set
@@ -1336,17 +1396,69 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
         // Instead the slash stands and the proceeds burn, exactly like the
         // review path's sink; `VerdictSlashUncompensated` marks the case as
         // never funded so Plan D / indexers see the victims went unpaid.
+        //
+        // NARROWED FROM A BARE CATCH (PR #24 review 🟡N8). The burn is
+        // irreversible and takes the victims' compensation with it, so it must
+        // answer only the failure it was written for: the vault cannot be
+        // apportioned against, and no retry will change that. Every revert the
+        // escrow raises about its OWN inputs is a recoverable caller or wiring
+        // mistake — a `snapshotTimestamp` that is not strictly past, a zero
+        // vault, an escrow mid-rewire that no longer recognises sWOOD as its
+        // funder — and each of those is fixable by resubmitting. Those bubble.
+        // The slash is idempotent per (caseKey, approver), so a bubbled revert
+        // costs nothing but the gas: the whole transaction rolls back,
+        // including `_verdictSlashed`, and the corrected call runs clean.
         IERC20(wood).forceApprove(escrow, total);
         try ICompensationEscrow(escrow).openCase(vault, snapshotTimestamp, total) returns (uint256 id) {
             caseId = id;
             IERC20(wood).forceApprove(escrow, 0);
             emit VerdictSlashRouted(caseKey, vault, total, caseId);
-        } catch {
+        } catch (bytes memory reason) {
+            if (_isRecoverableOpenCaseFailure(reason)) {
+                // Not our failure mode — surface it instead of burning.
+                assembly ("memory-safe") {
+                    revert(add(reason, 0x20), mload(reason))
+                }
+            }
             IERC20(wood).forceApprove(escrow, 0);
             _burnWood(total);
             caseId = 0;
             emit VerdictSlashUncompensated(caseKey, vault, total);
         }
+    }
+
+    /// @dev Does this `openCase` revert describe a fixable input/wiring mistake
+    ///      rather than a vault the escrow can never apportion against?
+    ///      (PR #24 review 🟡N8.)
+    ///
+    ///      Recognised as RECOVERABLE (re-reverted, nothing burns):
+    ///        - `SnapshotNotPast`     — reachable from here: `slashToEscrow`
+    ///          allows `snapshotTimestamp == block.timestamp`, the escrow
+    ///          requires strictly past. Pure caller arithmetic.
+    ///        - `ZeroAddress`         — `vault` was zero.
+    ///        - `NothingToCompensate` — zero proceeds; unreachable today
+    ///          (`total != 0` above) but listed so a future refactor cannot
+    ///          turn it into a silent burn.
+    ///        - `NotAuthorizedFunder` — the escrow is mid-reconfiguration and
+    ///          no longer accepts sWOOD. Rewire and resubmit.
+    ///
+    ///      Everything else BURNS: `EmptySnapshot` (nobody held the vault at
+    ///      that instant, so there is no one to compensate and no later call
+    ///      changes that), and any unrecognised or empty returndata — a vault
+    ///      missing the ERC20Votes selectors, a block-number clock mode, or an
+    ///      out-of-gas child. Empty returndata deliberately falls through to
+    ///      the burn: that is the shape of the missing-selector case, which is
+    ///      precisely 🟡5's motivating failure.
+    function _isRecoverableOpenCaseFailure(bytes memory reason) private pure returns (bool) {
+        if (reason.length < 4) return false;
+        bytes4 selector;
+        assembly ("memory-safe") {
+            selector := mload(add(reason, 0x20))
+        }
+        return selector == ICompensationEscrow.SnapshotNotPast.selector
+            || selector == ICompensationEscrow.ZeroAddress.selector
+            || selector == ICompensationEscrow.NothingToCompensate.selector
+            || selector == ICompensationEscrow.NotAuthorizedFunder.selector;
     }
 
     /// @dev Per-approver slash. Extracted to keep `slashGuardians`'s stack

@@ -354,6 +354,79 @@ contract SlashToEscrowProportionalTest is Test {
         assertGt(recovered1, owed1, "delegation creates genuine surplus");
     }
 
+    /// @notice THE SAME INEQUALITY WHERE THE CEILING BINDS — and it does not
+    ///         hold (PR #24 review 🟠N3).
+    ///
+    ///         `test_recoveryCoversEveryApproversAllocation` books $1,200
+    ///         against two $1,000 bonds, so every derived rate lands inside
+    ///         `[minSlashBps, maxSlashBps]` and the clamp never fires. Its
+    ///         conclusion is true in THAT regime and does not generalise. Push
+    ///         coverage to what the quorum gate actually permits — exactly the
+    ///         joint slashable bond — and every rate saturates at 10,000 bps,
+    ///         is clamped to `maxSlashBps`, and recovery lands short by
+    ///         `1 - maxSlashBps/10_000` of the loss. 20% at the shipped 8,000.
+    ///
+    ///         `requireApproveQuorum` checks `Σ min(live, reserved) >= needUsd`.
+    ///         It does NOT check `Σ min(live · maxSlashBps/10_000, allocated)`,
+    ///         which is what the slash can take. This measures the gap rather
+    ///         than asserting it away, so "option C" stands as settled only for
+    ///         the regime it was measured in. Closing it is a coverage-GATE
+    ///         change and belongs in its own PR — see the KNOWN GAP note on
+    ///         `ExposureLedger.requireApproveQuorum`.
+    function test_recoveryFallsShortWhenTheCeilingBinds() public {
+        ExposureLedger ledger = new ExposureLedger(owner, address(swood), 28 days);
+        address asset = makeAddr("ceilingAsset");
+        vm.mockCall(asset, abi.encodeWithSignature("decimals()"), abi.encode(uint8(6)));
+        PropGovernor gov = new PropGovernor(address(new PropVault(asset)));
+        address ledgerRegistry = makeAddr("ceilingRegistry");
+
+        vm.startPrank(owner);
+        ledger.setAssetFeed(asset, address(new PropFeed()), 365 days);
+        ledger.setGuardianRegistry(ledgerRegistry);
+        ledger.setWoodUsdPrice(0.05e8); // $0.05/WOOD → $1,000 per 20,000 WOOD bond
+        vm.stopPrank();
+
+        // Both own-stake only: with no delegated leg, the discount asymmetry
+        // that creates the surplus in the slack regime cannot mask a shortfall.
+        assertEq(swood.delegatedInbound(g1), 0, "fixture: g1 own-stake only");
+        assertEq(swood.delegatedInbound(g2), 0, "fixture: g2 own-stake only");
+
+        // Coverage set to EXACTLY the joint slashable bond — the most the
+        // quorum gate will admit. The gate speaks in asset units (6dp) against
+        // a $1.00 feed, while bonds are 1e18-scaled USD.
+        uint256 jointBondUsd = ledger.slashableBondUsd(g1) + ledger.slashableBondUsd(g2);
+        uint256 coverageUnits = jointBondUsd / 1e12;
+        gov.set(coverageUnits);
+
+        vm.startPrank(ledgerRegistry);
+        ledger.recordApproval(address(gov), 1, g1);
+        ledger.recordApproval(address(gov), 1, g2);
+        vm.stopPrank();
+
+        // The gate PASSES here. That is the whole point: it admits a loss
+        // larger than the slash rails can recover.
+        ledger.requireApproveQuorum(address(gov), 1, asset, coverageUnits);
+
+        uint256 owedTotal = ledger.allocatedUsd(address(gov), 1, g1) + ledger.allocatedUsd(address(gov), 1, g2);
+
+        (address[] memory accused, uint256[] memory rates) = ledger.slashBpsFor(address(gov), 1);
+        assertEq(rates[0], 10_000, "allocation == bond, so the derived rate saturates");
+        assertEq(rates[1], 10_000, "same for the second approver");
+
+        uint256 before1 = swood.guardianStake(g1);
+        uint256 before2 = swood.guardianStake(g2);
+        vm.prank(slasher);
+        swood.slashToEscrow(bytes32("ceiling-verdict"), openedAt, accused, rates, address(vault), snapTs);
+
+        uint256 taken = (before1 - swood.guardianStake(g1)) + (before2 - swood.guardianStake(g2));
+        uint256 recovered = (taken * ledger.woodPriceX8()) / 1e8;
+
+        // The clamp is what bounds recovery, exactly and measurably.
+        assertEq(recovered * 10_000, owedTotal * MAX_SLASH_BPS, "recovery == loss * maxSlashBps/10_000");
+        assertLt(recovered, owedTotal, "the section-2 inequality FAILS in the binding regime");
+        assertEq((recovered * 100) / owedTotal, 80, "80% of the loss at the shipped 8,000-bps ceiling");
+    }
+
     /// @notice THE REASON THE CHANGE EXISTS. A partial rate leaves bond behind,
     ///         so a second concurrent conviction against the same guardian still
     ///         recovers. Under a flat ceiling slash the first case took
