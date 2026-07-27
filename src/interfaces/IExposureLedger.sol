@@ -67,6 +67,17 @@ interface IExposureLedger {
     function freezeCoverage(address governor, uint256 proposalId) external;
     function unfreezeCoverage(address governor, uint256 proposalId) external;
     function isCoverageFrozen(address governor, uint256 proposalId) external view returns (bool);
+    /// @notice Whether ANY frozen proposal names this guardian as a covering
+    ///         approver. sWOOD gates the unstake CLAIM on it, which is what
+    ///         makes the freeze load-bearing rather than decorative: epoch
+    ///         buckets age out on wall-clock and a disputed challenge outlives
+    ///         them, so `openExposureUsd` alone let an accused guardian claim
+    ///         its bond mid-accusation (review 🔴F2 / 🟠F6).
+    function hasFrozenCoverage(address guardian) external view returns (bool);
+    /// @dev Zero is legal and deliberate — it is the UNWIRE switch, which
+    ///      closes the freeze surface when the challenge game is replaced. Not
+    ///      an oversight: with no freezer wired there is no filing, so the
+    ///      unwired state fails closed for the game rather than open.
     function setCoverageFreezer(address freezer) external;
     function coverageFreezer() external view returns (address);
 

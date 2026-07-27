@@ -240,6 +240,11 @@ contract TierRegistry is Ownable2Step {
 
     event AuthorizedDemoterSet(address indexed demoter);
 
+    /// @dev Zero is legal and deliberate — it is the UNWIRE switch, revoking
+    ///      the challenge game's demotion role outright while a replacement is
+    ///      wired. The unwired state fails CLOSED (nothing can demote), which
+    ///      is why this setter carries no zero-address check where the others
+    ///      in this diff do (PR #25 review, minor).
     function setAuthorizedDemoter(address demoter) external onlyOwner {
         authorizedDemoter = demoter;
         emit AuthorizedDemoterSet(demoter);

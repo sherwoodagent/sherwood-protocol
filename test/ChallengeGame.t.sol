@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import {Test} from "forge-std/Test.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {BatchExecutorLib} from "src/BatchExecutorLib.sol";
 import {ChallengeGame} from "src/ChallengeGame.sol";
 import {IChallengeGame} from "src/interfaces/IChallengeGame.sol";
 import {ISyndicateGovernor} from "src/interfaces/ISyndicateGovernor.sol";
@@ -13,14 +14,39 @@ import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 ///      `vault` (consumed by the slash path in the next task).
 contract MockChallengeGovernor {
     mapping(uint256 proposalId => ISyndicateGovernor.StrategyProposal) internal _proposals;
+    mapping(uint256 proposalId => BatchExecutorLib.Call[]) internal _calls;
+
+    /// @dev Stands in for "the proposal did touch the adapter the filing
+    ///      names", which is the usual case; `setExecuteCall` overrides it per
+    ///      proposal for the mismatch tests (review 🟠F4).
+    address public defaultTarget;
+    bytes4 public defaultSelector;
 
     function setExecuted(uint256 proposalId, address vault, uint256 executedAt) external {
         _proposals[proposalId].vault = vault;
         _proposals[proposalId].executedAt = executedAt;
     }
 
+    function setDefaultCall(address target, bytes4 selector) external {
+        defaultTarget = target;
+        defaultSelector = selector;
+    }
+
+    function setExecuteCall(uint256 proposalId, address target, bytes4 selector) external {
+        delete _calls[proposalId];
+        _calls[proposalId].push(BatchExecutorLib.Call({target: target, data: abi.encodePacked(selector), value: 0}));
+    }
+
     function getProposal(uint256 proposalId) external view returns (ISyndicateGovernor.StrategyProposal memory) {
         return _proposals[proposalId];
+    }
+
+    function getExecuteCalls(uint256 proposalId) external view returns (BatchExecutorLib.Call[] memory) {
+        BatchExecutorLib.Call[] storage stored = _calls[proposalId];
+        if (stored.length != 0) return stored;
+        BatchExecutorLib.Call[] memory one = new BatchExecutorLib.Call[](1);
+        one[0] = BatchExecutorLib.Call({target: defaultTarget, data: abi.encodePacked(defaultSelector), value: 0});
+        return one;
     }
 }
 
@@ -220,6 +246,9 @@ contract ChallengeGameTest is Test {
         vm.warp(365 days); // keep executedAt well away from the genesis timestamp
         wood = new ERC20Mock("Sherwood", "WOOD", 18);
         gov = new MockChallengeGovernor();
+        // Every proposal touches the adapter these tests accuse, so the 🟠F4
+        // membership test passes by default; the mismatch cases override it.
+        gov.setDefaultCall(ADAPTER, SELECTOR);
         ledger = new MockChallengeLedger(0.05e8); // $0.05, the governance haircut price
         tiers = new MockChallengeTierRegistry();
         swood = new MockChallengeStakedWood();
@@ -369,19 +398,117 @@ contract ChallengeGameTest is Test {
 
     /// @notice One live challenge per proposal: a second filing would double the
     ///         freeze and the accounting on the same coverage.
-    function test_file_revertsWhenAlreadyChallenged() public {
+    /// @notice The slot is PER CHALLENGER (review 🔴F3). One filer cannot file
+    ///         twice — that would double-charge the freeze for nothing — but a
+    ///         second, independent challenger always gets its own slot. The old
+    ///         one-slot-per-proposal rule let the accused cohort self-file,
+    ///         self-dispute, and lock the only slot for the whole window at
+    ///         zero net cost, since `_fail` returned both bonds to them.
+    function test_file_oneSlotPerChallengerNotPerProposal() public {
         _setCoverage(PROPOSAL, 6_000e18, 4_000e18);
         _execute(PROPOSAL);
         vm.prank(challenger);
-        game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.OutOfAdapterOutflow, ADAPTER, SELECTOR, EVIDENCE);
+        uint256 first = game.file(
+            address(gov), PROPOSAL, IChallengeGame.Predicate.OutOfAdapterOutflow, ADAPTER, SELECTOR, EVIDENCE
+        );
 
+        // The same challenger cannot occupy two slots on one proposal.
+        vm.prank(challenger);
+        vm.expectRevert(IChallengeGame.AlreadyChallenged.selector);
+        game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.RogueAllowance, ADAPTER, SELECTOR, EVIDENCE);
+
+        // An independent challenger does.
         address other = makeAddr("otherChallenger");
         wood.mint(other, 1_000_000e18);
         vm.startPrank(other);
         wood.approve(address(game), type(uint256).max);
-        vm.expectRevert(IChallengeGame.AlreadyChallenged.selector);
-        game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.ProposerLinkedOutflow, ADAPTER, SELECTOR, EVIDENCE);
+        uint256 second = game.file(
+            address(gov), PROPOSAL, IChallengeGame.Predicate.ProposerLinkedOutflow, ADAPTER, SELECTOR, EVIDENCE
+        );
         vm.stopPrank();
+
+        assertTrue(second != first, "the honest filer is not denied by an existing challenge");
+        assertEq(game.liveChallengeCountOf(address(gov), PROPOSAL), 2, "both are live");
+        assertEq(game.liveChallengeOfBy(address(gov), PROPOSAL, challenger), first, "each slot is its own");
+        assertEq(game.liveChallengeOfBy(address(gov), PROPOSAL, other), second);
+        assertTrue(ledger.isCoverageFrozen(address(gov), PROPOSAL), "one freeze covers both");
+    }
+
+    /// @notice 🔴F3, the squat itself: the accused cohort files and disputes to
+    ///         block the slot, and it no longer blocks anything. The freeze is
+    ///         refcounted, so the squatter's own resolution does not release
+    ///         coverage the honest challenge is still pinning.
+    function test_file_aSquattedSlotNoLongerDeniesTheHonestChallenge() public {
+        _setCoverage(PROPOSAL, 6_000e18, 4_000e18);
+        _execute(PROPOSAL);
+
+        // The cohort's sybil files, and an accused approver disputes it: under
+        // the old rule this pinned the only slot for `disputeTimeout` (30d),
+        // outliving the 14d challenge window entirely.
+        address sybil = makeAddr("sybil");
+        wood.mint(sybil, 1_000_000e18);
+        vm.startPrank(sybil);
+        wood.approve(address(game), type(uint256).max);
+        uint256 squat =
+            game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.DrawdownBreach, ADAPTER, SELECTOR, EVIDENCE);
+        vm.stopPrank();
+        vm.prank(guardianA);
+        game.dispute(squat);
+
+        // Deep into the window, the honest challenger still files.
+        vm.warp(vm.getBlockTimestamp() + 13 days);
+        vm.prank(challenger);
+        uint256 honest = game.file(
+            address(gov), PROPOSAL, IChallengeGame.Predicate.OutOfAdapterOutflow, ADAPTER, SELECTOR, EVIDENCE
+        );
+        assertEq(game.liveChallengeCountOf(address(gov), PROPOSAL), 2);
+
+        // The squat times out to the accused, as designed — and takes nothing
+        // with it: coverage stays frozen for the honest filing behind it.
+        vm.warp(_filedAt(squat) + game.disputeTimeout());
+        game.resolve(squat);
+        assertEq(uint8(game.challengeOf(squat).status), uint8(IChallengeGame.Status.Failed));
+        assertTrue(ledger.isCoverageFrozen(address(gov), PROPOSAL), "the honest challenge still pins the coverage");
+        assertEq(game.liveChallengeCountOf(address(gov), PROPOSAL), 1);
+
+        // And the honest challenge still convicts.
+        vm.warp(_filedAt(honest) + game.autoSlashDelay());
+        game.resolve(honest);
+        assertEq(swood.callCount(), 1, "the squat delayed the verdict; it did not prevent it");
+        assertFalse(ledger.isCoverageFrozen(address(gov), PROPOSAL), "last one out unfreezes");
+    }
+
+    /// @notice 🔴F3 corollary: two concurrent challenges must not slash the same
+    ///         approvers twice. The liability is one liability, and sWOOD's own
+    ///         per-verdict dedup would revert the second settle — wedging an
+    ///         otherwise-correct challenge with no terminal path — so the game
+    ///         records the conviction as already collected instead.
+    function test_resolve_concurrentSettlesConvictOnlyOnce() public {
+        _setCoverage(PROPOSAL, 6_000e18, 4_000e18);
+        _execute(PROPOSAL);
+
+        vm.prank(challenger);
+        uint256 a = game.file(
+            address(gov), PROPOSAL, IChallengeGame.Predicate.OutOfAdapterOutflow, ADAPTER, SELECTOR, EVIDENCE
+        );
+        address other = makeAddr("otherChallenger");
+        wood.mint(other, 1_000_000e18);
+        vm.startPrank(other);
+        wood.approve(address(game), type(uint256).max);
+        uint256 b =
+            game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.RogueAllowance, ADAPTER, SELECTOR, EVIDENCE);
+        vm.stopPrank();
+
+        vm.warp(_filedAt(b) + game.autoSlashDelay());
+        game.resolve(a);
+        assertEq(swood.callCount(), 1, "the first settle collects the liability");
+
+        uint256 otherBefore = wood.balanceOf(other);
+        game.resolve(b);
+        assertEq(swood.callCount(), 1, "the second does NOT slash again");
+        assertEq(uint8(game.challengeOf(b).status), uint8(IChallengeGame.Status.Settled), "but it still terminates");
+        assertGt(wood.balanceOf(other) - otherBefore, 0, "and its challenger is still refunded");
+        assertEq(game.bondedWood(), 0, "no bond is stranded");
     }
 
     /// @notice Nothing to accuse: a proposal no guardian covered (or whose
@@ -526,7 +653,12 @@ contract ChallengeGameTest is Test {
         // The verdict slash, argument by argument.
         assertEq(swood.callCount(), 1, "slashed exactly once");
         assertEq(swood.lastCaseKey(), keccak256(abi.encode(address(gov), PROPOSAL)), "case key is the review key");
-        assertEq(swood.lastOpenedAt(), filedAt, "verdict anchored at the filing");
+        // 🔴F1: anchored at EXECUTION, never at the filing. `filedAt` is a
+        // timestamp the accused controls the state of — one `requestUnstakeGuardian`
+        // between the drain and the accusation pushes a zero stake checkpoint,
+        // zeroing the slash basis, and `cancelUnstakeGuardian` puts it back.
+        assertEq(swood.lastOpenedAt(), executedAt, "verdict anchored at execution, before the accused could react");
+        assertTrue(swood.lastOpenedAt() < filedAt, "and strictly before the filing, which is the whole point");
         // Severity is now PER APPROVER, sourced from the ledger rather than
         // from one protocol-wide ceiling. The game must pass through exactly
         // what `slashBpsFor` derived — anything else would let the challenge
@@ -537,7 +669,7 @@ contract ChallengeGameTest is Test {
         for (uint256 i = 0; i < expectedBps.length; i++) {
             assertEq(sentBps[i], expectedBps[i], "rate passed through unmodified");
         }
-        assertEq(swood.lastVault(), vault, "vault re-read from the proposal");
+        assertEq(swood.lastVault(), vault, "vault pinned at filing, not re-read at resolve (F10)");
         assertEq(swood.lastSnapshotTimestamp(), executedAt - 1, "case pinned to the pre-drain block (D6)");
         address[] memory slashed = swood.lastApprovers();
         assertEq(slashed.length, 2);
@@ -554,7 +686,8 @@ contract ChallengeGameTest is Test {
         assertFalse(ledger.isCoverageFrozen(address(gov), PROPOSAL), "coverage released on settlement");
         assertEq(game.liveChallengeOf(address(gov), PROPOSAL), 0, "no longer live");
 
-        assertEq(wood.balanceOf(challenger) - challengerBefore, 10_000e18, "bond returned in full");
+        // Less the F4 settle burn: a correct filing is cheap, not free.
+        assertEq(wood.balanceOf(challenger) - challengerBefore, 8_000e18, "bond returned less the 20% burn");
         _assertLiveBondsBacked();
     }
 
@@ -883,13 +1016,155 @@ contract ChallengeGameTest is Test {
         assertEq(bond, 10_000e18);
 
         uint256 before = wood.balanceOf(challenger);
+        uint256 burnBefore = wood.balanceOf(0x000000000000000000000000000000000000dEaD);
         vm.warp(vm.getBlockTimestamp() + game.autoSlashDelay());
         game.resolve(id);
 
-        assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Settled), "silence was the verdict");
-        assertEq(wood.balanceOf(challenger) - before, bond, "the bond back, to the wei, and nothing more");
+        // A CORRECT FILING IS CHEAP, NOT FREE (review 🟠F4). The full refund
+        // made an attacker whose payoff is the CONSEQUENCE — the approvers
+        // slashed, the named adapter demoted — fully subsidised: the whole
+        // attack cost gas. 20% of the bond burns; the rest comes back.
+        uint256 burned = (bond * game.settleBurnBps()) / 10_000;
+        assertEq(burned, 2_000e18, "20% of a 10,000 WOOD bond");
+        assertEq(wood.balanceOf(challenger) - before, bond - burned, "the bond back less the burn, to the wei");
+        assertEq(wood.balanceOf(0x000000000000000000000000000000000000dEaD) - burnBefore, burned, "the slice is burned");
         assertEq(game.bondedWood(), 0, "no challenge is live");
         assertEq(wood.balanceOf(address(game)), 5_000e18, "stray WOOD is never spent on a settlement");
+    }
+
+    /// @notice 🔴F1 regression, at the boundary that matters: the slash basis
+    ///         must predate every instant the accused could have reacted to the
+    ///         accusation. Anchored at `filedAt`, an approver zeroed its own
+    ///         stake checkpoint with one reversible, cooldown-free transaction
+    ///         and a 100% conviction recovered nothing.
+    function test_resolve_slashBasisPredatesAnythingTheAccusedCanMove() public {
+        uint256 id = _fileStandard(PROPOSAL);
+        uint256 executedAt = _executedAt(PROPOSAL);
+        uint256 filedAt = _filedAt(id);
+
+        // The accused has this whole span to move state. The basis must sit
+        // before ALL of it, not at the far end.
+        assertGt(filedAt, executedAt, "fixture: the filing trails execution");
+
+        vm.warp(filedAt + game.autoSlashDelay());
+        game.resolve(id);
+
+        assertEq(swood.lastOpenedAt(), executedAt, "basis is the execution instant");
+        assertEq(swood.lastSnapshotTimestamp(), executedAt - 1, "snapshot is the block before the drain (D6)");
+        assertTrue(swood.lastSnapshotTimestamp() < swood.lastOpenedAt(), "sWOOD's snapshot <= openedAt bound holds");
+    }
+
+    /// @notice 🟠F5: the clocks a challenge runs on are the ones it received.
+    ///         Read live, the owner could shorten `autoSlashDelay` after a
+    ///         filing and retroactively erase a dispute window the accused was
+    ///         still inside — the exact griefing `MIN_AUTO_SLASH_DELAY`'s own
+    ///         natspec promises it prevents, and did not.
+    function test_dispute_windowIsPinnedAtFilingNotReadLive() public {
+        uint256 id = _fileStandard(PROPOSAL);
+        assertEq(game.challengeOf(id).autoSlashDelayAtFiling, 7 days, "the window this filing got");
+
+        // Three days into a seven-day window, the owner collapses the parameter
+        // to its floor. That is still a legal parameter — the floor bounds the
+        // PARAMETER, not the window any given challenge already received.
+        vm.warp(_filedAt(id) + 3 days);
+        // Hoisted: a call in argument position consumes the pending prank.
+        uint256 floorDelay = game.MIN_AUTO_SLASH_DELAY();
+        vm.prank(owner);
+        game.setAutoSlashDelay(floorDelay);
+
+        // The accused still has the window it was accused under.
+        vm.prank(guardianA);
+        game.dispute(id);
+        assertEq(
+            uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Disputed), "window survived the setter"
+        );
+
+        // And resolution still waits for the pinned clock, not the new one.
+        vm.expectRevert(IChallengeGame.DelayNotElapsed.selector);
+        game.resolve(id);
+    }
+
+    /// @notice 🟠F5, the other direction: raising `disputeTimeout` must not
+    ///         extend a freeze that is already live.
+    function test_resolve_disputeTimeoutIsPinnedAtFiling() public {
+        uint256 id = _fileStandard(PROPOSAL);
+        vm.prank(guardianA);
+        game.dispute(id);
+        assertEq(game.challengeOf(id).disputeTimeoutAtFiling, 30 days);
+
+        vm.prank(owner);
+        game.setDisputeTimeout(180 days); // 6x, at the ceiling
+
+        // The challenge times out on its own clock, so the coverage it pinned
+        // is released when it always would have been.
+        vm.warp(_filedAt(id) + 30 days);
+        game.resolve(id);
+        assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Failed));
+        assertFalse(ledger.isCoverageFrozen(address(gov), PROPOSAL), "freeze released on the original clock");
+    }
+
+    /// @notice 🟠F4, the other half: a filing may not name an adapter the
+    ///         proposal never touched. Paired with a full refund, that made
+    ///         demoting ANY certified adapter in the registry cost gas and a
+    ///         7-day wait — the slash of the approvers came along for free.
+    function test_file_rejectsAnAdapterTheProposalNeverTouched() public {
+        _setCoverage(PROPOSAL, 6_000e18, 4_000e18);
+        _execute(PROPOSAL);
+        gov.setExecuteCall(PROPOSAL, ADAPTER, SELECTOR);
+
+        vm.startPrank(challenger);
+        // Right target, wrong selector.
+        vm.expectRevert(IChallengeGame.AdapterNotInProposal.selector);
+        game.file(
+            address(gov), PROPOSAL, IChallengeGame.Predicate.OutOfAdapterOutflow, ADAPTER, bytes4(0xdeadbeef), EVIDENCE
+        );
+        // Wrong target entirely — the arbitrary-demotion case.
+        vm.expectRevert(IChallengeGame.AdapterNotInProposal.selector);
+        game.file(
+            address(gov), PROPOSAL, IChallengeGame.Predicate.OutOfAdapterOutflow, address(0xC0FFEE), SELECTOR, EVIDENCE
+        );
+        // The adapter the proposal actually called goes through.
+        uint256 id = game.file(
+            address(gov), PROPOSAL, IChallengeGame.Predicate.OutOfAdapterOutflow, ADAPTER, SELECTOR, EVIDENCE
+        );
+        vm.stopPrank();
+        assertGt(id, 0);
+        assertEq(tiers.demoteCount(), 0, "nothing demoted by a filing alone");
+    }
+
+    /// @notice A filing that accuses NO adapter is still legal — predicates 2, 3
+    ///         and 5 often indict a price or a destination rather than a
+    ///         certification — and skips the membership test entirely.
+    function test_file_zeroAdapterSkipsTheMembershipTest() public {
+        _setCoverage(PROPOSAL, 6_000e18, 4_000e18);
+        _execute(PROPOSAL);
+        gov.setExecuteCall(PROPOSAL, ADAPTER, SELECTOR);
+
+        vm.prank(challenger);
+        uint256 id = game.file(
+            address(gov), PROPOSAL, IChallengeGame.Predicate.OraclePriceDeviation, address(0), bytes4(0), EVIDENCE
+        );
+        vm.warp(_filedAt(id) + game.autoSlashDelay());
+        game.resolve(id);
+        assertEq(tiers.demoteCount(), 0, "a filing that names nothing demotes nothing");
+        assertEq(swood.callCount(), 1, "but it still convicts");
+    }
+
+    /// @notice 🟠F4: governance can retire the burn without an upgrade, and a
+    ///         zero burn restores the exact pre-finding refund.
+    function test_setSettleBurnBps_boundedAndZeroRestoresTheFullRefund() public {
+        vm.startPrank(owner);
+        vm.expectRevert(IChallengeGame.InvalidParameter.selector);
+        game.setSettleBurnBps(5_001);
+        game.setSettleBurnBps(0);
+        vm.stopPrank();
+
+        uint256 id = _fileStandard(PROPOSAL);
+        uint256 bond = game.challengeOf(id).bondWood;
+        uint256 before = wood.balanceOf(challenger);
+        vm.warp(vm.getBlockTimestamp() + game.autoSlashDelay());
+        game.resolve(id);
+        assertEq(wood.balanceOf(challenger) - before, bond, "zero burn: the whole bond comes back");
     }
 
     /// @notice And with nothing donated, the game's custody returns to exactly

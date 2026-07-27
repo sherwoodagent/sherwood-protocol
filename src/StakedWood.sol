@@ -40,6 +40,7 @@ interface IRegistryReviewPeriod {
 ///      carries no reentrancy concern.
 interface ILedgerExposureMinimal {
     function openExposureUsd(address guardian) external view returns (uint256);
+    function hasFrozenCoverage(address guardian) external view returns (bool);
 }
 
 contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable {
@@ -956,8 +957,21 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
         // about. This check covers the challenge path. Neither subsumes the
         // other.
         address ledger = exposureLedger;
-        if (ledger != address(0) && ILedgerExposureMinimal(ledger).openExposureUsd(msg.sender) != 0) {
-            revert CoverageStillOpen();
+        if (ledger != address(0)) {
+            // TWO QUESTIONS, NOT ONE (PR #25 review 🔴F2). `openExposureUsd`
+            // sums epoch buckets and a bucket ages out `challengeWindow` after
+            // its epoch on pure wall-clock — it does not pause because the
+            // guardian is under accusation. The challenge game's disputed tail
+            // (up to `disputeTimeout`) outlives that by design, so an accused
+            // approver could request at execution, wait out the cooldown, and
+            // claim its whole bond before the challenge could resolve: the
+            // conviction then priced maximum guilt and recovered nothing,
+            // silently. A frozen commitment is the accusation itself, and it
+            // does not expire on a clock.
+            ILedgerExposureMinimal l = ILedgerExposureMinimal(ledger);
+            if (l.openExposureUsd(msg.sender) != 0 || l.hasFrozenCoverage(msg.sender)) {
+                revert CoverageStillOpen();
+            }
         }
 
         uint256 amount = g.stakedAmount;

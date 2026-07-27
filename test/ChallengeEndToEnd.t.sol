@@ -530,8 +530,13 @@ contract ChallengeEndToEndTest is Test {
         assertEq(tierAfter, 2, "demoted back to the arbitrary-calldata default");
         assertEq(boundAfter, 10_000, "and back to full notional");
 
-        // ── The challenger is made whole; nothing is stranded in the game.
-        assertEq(wood.balanceOf(challenger), challengerBalBefore, "bond returned in full");
+        // ── The challenger gets its bond back LESS the settle burn (review F4:
+        //    a correct filing is cheap, not free — the old full refund fully
+        //    subsidised an attacker whose payoff is the consequence rather than
+        //    the bond). Nothing is stranded in the game either way.
+        uint256 settleBurn = (CHALLENGER_BOND * game.settleBurnBps()) / 10_000;
+        assertGt(settleBurn, 0, "the burn is live in this fixture");
+        assertEq(wood.balanceOf(challenger), challengerBalBefore - settleBurn, "bond back less the burn");
         assertEq(wood.balanceOf(address(game)), 0, "the game holds nothing");
         assertEq(game.bondedWood(), 0, "and books nothing as live");
         assertEq(game.liveChallengeOf(address(gov), pid), 0, "no live challenge remains");

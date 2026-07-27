@@ -278,6 +278,20 @@ Flow:
   coverage attributed to the challenged proposal — not their whole stake.
   Challenger bond scales with the exposure it freezes. Adapters demote only on a
   **passed** challenge; an unproven filing flags for expedited review.
+- **Reach of the game, stated rather than left to be discovered (PR #25 review
+  F9).** A filing must freeze something, so the game reaches exactly the set of
+  proposals that BOOKED coverage: envelope tier ≥ `quorumTierThreshold`,
+  non-zero `requiredCoverage`, and at least one approver whose commitment is
+  still live. A proposal below the tier threshold never runs
+  `requireApproveQuorum`, books nothing, and is therefore unchallengeable by
+  construction — even though predicates 1, 4 and 5 describe things a low-tier
+  proposal can still do. Two related gaps of the same kind: predicates 2 and 5
+  are not always proposal-scoped facts, and a drawdown emerging from cumulative
+  behaviour across several proposals has no single filing target in this design
+  (the same accepted slow-bleed residual as §8). The v1 position is that booking
+  coverage IS taking on the liability, so a proposal with no booked coverage has
+  no approver to hold retroactively liable; what remains is monitoring-only, not
+  a code gap.
 - **Standing watchtower:** the challenge trigger must not depend on altruism.
   Sherwood forensic agents run the predicate monitor as a funded protocol role
   (feeding SGRD reputation), plus a first-detector bounty sized to cover forensic
