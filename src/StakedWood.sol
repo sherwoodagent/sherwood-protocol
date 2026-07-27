@@ -66,6 +66,29 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     /// @dev Mirrors `IStakedWood.SlashBpsLengthMismatch`.
     error SlashBpsLengthMismatch();
 
+    /// @notice `slashToEscrow` rejected because `openedAt` is in the future.
+    ///         The at-open anchor `_slashOne` sizes the legs against must be a
+    ///         real past instant (also keeps the `uint32` checkpoint lookup
+    ///         from wrapping on an absurd value).
+    /// @dev Mirrors `IStakedWood.VerdictNotPast`.
+    error VerdictNotPast();
+
+    /// @notice `slashToEscrow` rejected because `approvers` names the same
+    ///         address twice. Without dedup, repeating one approver N times
+    ///         re-applies its clamped rate to the already-reduced stake —
+    ///         effective severity `1-(1-bps)^N`, unbounded above the
+    ///         `maxSlashBps` ceiling governance set (PR #24 review 🟠4). The
+    ///         review path is immune by construction (the registry's
+    ///         `_approvers` dedups at vote time); this path takes the array
+    ///         straight from the slasher, so it must enforce its own. A
+    ///         pairwise scan rather than a strictly-increasing requirement:
+    ///         the production feed (`ExposureLedger.slashBpsFor`) emits
+    ///         vote-order arrays positionally aligned with their rates, and
+    ///         forcing every caller to co-sort two paired arrays on-chain is a
+    ///         worse deal than O(n²) over a quorum-sized calldata array.
+    /// @dev Mirrors `IStakedWood.DuplicateApprover`.
+    error DuplicateApprover();
+
     /// @notice Insufficient WOOD to satisfy a stake minimum.
     /// @dev Relocated from `IGuardianRegistry` alongside `stakeAsGuardian`.
     error InsufficientStake();
@@ -201,6 +224,15 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     ///      from. `total` is the WOOD routed; `caseId` is the escrow's id.
     ///      Mirrors `IStakedWood.VerdictSlashRouted`.
     event VerdictSlashRouted(bytes32 indexed caseKey, address indexed vault, uint256 total, uint256 caseId);
+
+    /// @notice Emitted when a verdict slash could NOT fund a compensation case
+    ///         — `openCase` reverted (empty snapshot, a vault without the
+    ///         ERC20Votes read surface, block-number clock mode) — and the
+    ///         proceeds were burned instead. The guardian is still slashed;
+    ///         the victims of THIS case go uncompensated (PR #24 review 🟡5:
+    ///         a bad vault must not brick the verdict).
+    /// @dev Mirrors `IStakedWood.VerdictSlashUncompensated`.
+    event VerdictSlashUncompensated(bytes32 indexed caseKey, address indexed vault, uint256 total);
 
     /// @notice Emitted once per approver actually slashed for a blocked proposal.
     /// @dev A slash is a significant value-destroying change; the appeal flow
@@ -1133,14 +1165,21 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     ///      compromised `authorizedSlasher` exceed a ceiling governance set (or
     ///      dodge a floor it set) at will.
     ///
-    /// @dev SNAPSHOT BOUND. `snapshotTimestamp` must be at or before `openedAt`.
-    ///      Any legitimate PRE-drain snapshot precedes the verdict that convicts
-    ///      the drain, so this costs honest callers nothing while materially
-    ///      shrinking what a compromised `authorizedSlasher` can do before
-    ///      Plan D's challenge game lands: it cannot pin a case to a POST-drain
-    ///      instant at which the coalition holds the vault's supply and thereby
-    ///      pay the attacker back its own slash — the F1 recoupment channel this
-    ///      whole rail exists to close.
+    /// @dev TIMESTAMP BOUNDS — WHAT THEY DO AND DO NOT GUARANTEE (PR #24
+    ///      review 🟠2). `openedAt` must not be in the future (`VerdictNotPast`)
+    ///      and `snapshotTimestamp` must be at or before `openedAt`
+    ///      (`SnapshotAfterVerdict`). These are HONEST-CALLER sanity bounds:
+    ///      they catch a mis-built verdict and keep the `uint32` checkpoint
+    ///      lookup in `_slashOne` from wrapping. They do NOT constrain a
+    ///      COMPROMISED `authorizedSlasher`, which can always pass
+    ///      `openedAt = block.timestamp` and pin any past snapshot — including
+    ///      a post-drain instant at which an attacker coalition holds the
+    ///      supply, handing the attacker back its own slash (F1). Until the
+    ///      slasher is Plan D's challenge game passing timestamps from a
+    ///      REGISTERED verdict record rather than caller arguments, the
+    ///      integrity of `(openedAt, snapshotTimestamp)` is exactly as
+    ///      trustworthy as `authorizedSlasher` itself (today: the owner
+    ///      multisig).
     ///
     /// @param caseKey  Composite verdict key; feeds the `GuardianSlashed` topic.
     /// @param openedAt The verdict's open timestamp — the at-open anchor the own
@@ -1175,10 +1214,34 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     ) external onlyAuthorizedSlasher returns (uint256 total, uint256 caseId) {
         address escrow = compensationEscrow;
         if (escrow == address(0)) revert CompensationEscrowNotSet();
+        if (openedAt > block.timestamp) revert VerdictNotPast();
         if (snapshotTimestamp > openedAt) revert SnapshotAfterVerdict();
         // Positional alignment is the only thing tying a guardian to their rate,
         // so a mismatch is a caller bug, not something to absorb.
         if (slashBpsPer.length != approvers.length) revert SlashBpsLengthMismatch();
+
+        // Namespace the verdict key before it feeds the shared `GuardianSlashed`
+        // topic: a raw caller-chosen `caseKey` could be crafted to collide with
+        // a review path `reviewKey`, making a verdict slash indistinguishable
+        // from a review slash to the off-chain process that drives the owner's
+        // `refundSlash` (PR #24 review, minor 4). `VerdictSlashRouted` still
+        // carries the RAW `caseKey`, so indexers join the two deterministically.
+        bytes32 slashKey = keccak256(abi.encodePacked("sherwood.verdict", caseKey));
+
+        // DEDUP (PR #24 review 🟠4). Each `_slashOne` pass re-applies its
+        // clamped rate to the ALREADY-REDUCED live stake, so N repeats of one
+        // approver compound to `1-(1-bps)^N` — above any `maxSlashBps` ceiling
+        // governance set. Pairwise over calldata rather than requiring sorted
+        // input: the production feed (`ExposureLedger.slashBpsFor`) is
+        // vote-ordered and positionally rate-aligned, and approver sets are
+        // quorum-sized, so O(n²) here is cheaper than every caller co-sorting
+        // two paired arrays. Zero-rate entries are NOT exempt — a zero slot
+        // must not smuggle a duplicate address past the check.
+        for (uint256 i = 0; i < approvers.length; i++) {
+            for (uint256 j = i + 1; j < approvers.length; j++) {
+                if (approvers[i] == approvers[j]) revert DuplicateApprover();
+            }
+        }
 
         for (uint256 i = 0; i < approvers.length; i++) {
             // ZERO IS NOT A SEVERITY — it is the absence of liability, so it
@@ -1196,7 +1259,7 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
             // approver's own rate. Hoisting it would let one approver's rate set
             // the envelope for everyone.
             uint256 bps = Math.min(Math.max(requested, minSlashBps), maxSlashBps);
-            total += _slashOne(caseKey, openedAt, approvers[i], bps);
+            total += _slashOne(slashKey, openedAt, approvers[i], bps);
         }
         // Nothing recovered: no case to open (the escrow rejects zero proceeds).
         if (total == 0) return (0, 0);
@@ -1205,10 +1268,26 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
         // `forceApprove` tolerates non-standard tokens that reject a non-zero
         // to non-zero approve; the allowance is zeroed straight after so the
         // escrow never holds a standing claim on sWOOD's custody balance.
+        //
+        // BURN FALLBACK (PR #24 review 🟡5): `openCase` is the slash's only
+        // sink, and it reverts on a vault the escrow cannot apportion against
+        // (empty snapshot, missing ERC20Votes reads, block-number clock mode).
+        // Letting that revert bubble would make the SLASH hostage to a vault
+        // read — a bad vault would mean the guilty guardian keeps its stake.
+        // Instead the slash stands and the proceeds burn, exactly like the
+        // review path's sink; `VerdictSlashUncompensated` marks the case as
+        // never funded so Plan D / indexers see the victims went unpaid.
         IERC20(wood).forceApprove(escrow, total);
-        caseId = ICompensationEscrow(escrow).openCase(vault, snapshotTimestamp, total);
-        IERC20(wood).forceApprove(escrow, 0);
-        emit VerdictSlashRouted(caseKey, vault, total, caseId);
+        try ICompensationEscrow(escrow).openCase(vault, snapshotTimestamp, total) returns (uint256 id) {
+            caseId = id;
+            IERC20(wood).forceApprove(escrow, 0);
+            emit VerdictSlashRouted(caseKey, vault, total, caseId);
+        } catch {
+            IERC20(wood).forceApprove(escrow, 0);
+            _burnWood(total);
+            caseId = 0;
+            emit VerdictSlashUncompensated(caseKey, vault, total);
+        }
     }
 
     /// @dev Per-approver slash. Extracted to keep `slashGuardians`'s stack
