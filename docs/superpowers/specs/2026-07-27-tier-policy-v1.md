@@ -91,12 +91,35 @@ the same rule evaluated at zero.
   shape from `2026-07-26-capped-duration-coverage.md`), launch value **1**.
 - Checked at **propose**, where `envelopeTier` is resolved and snapshotted
   (`SyndicateGovernor:941`).
-- Re-checked at **execute**. Tier can move between the two — `TierRegressed`
-  (`SyndicateGovernor:444`) exists precisely because live tier can exceed the
-  snapshot after a lazy demotion. A ceiling enforced only at propose would let a
-  demoted adapter execute at tier 2.
+- Re-checked at **execute**.
+
+  **Corrected during implementation.** This ADR originally justified the second
+  site by claiming a propose-only ceiling "would let a demoted adapter execute at
+  tier 2". That is wrong about the code: `TierRegressed`
+  (`if (liveTier > proposal.envelopeTier)`) already blocks a tier-1 proposal that
+  demotes to tier-2, because `2 > 1`. The lazy-demotion case was never the gap.
+
+  The execute site earns its place on two other grounds:
+  1. **It reports the actionable error.** A demoted adapter needs certifying, not
+     re-proposing — re-proposing would just fail at propose. Ordering the ceiling
+     check *before* `TierRegressed` gives the caller the remedy that actually
+     applies.
+  2. **It catches governance lowering the ceiling mid-flight**, which
+     `TierRegressed` cannot see at all: `envelopeTier` and `liveTier` are both
+     unchanged, only `maxEnvelopeTier` moved. Nothing else would refuse an
+     in-flight proposal that the protocol has since decided is out of policy.
+
+  Both are pinned by tests, along with one proving the new check does not swallow
+  the old condition.
 - A distinct error (`EnvelopeTierTooHigh`) rather than reusing `TierRegressed`: the
   two conditions have different remedies (certify the adapter vs. re-propose).
+- **Sentinel:** the "no ceiling" value must NOT be `0`, despite
+  `maxStrategyDuration` using that convention. Tier 0 is a valid and meaningful
+  ceiling — "closed-loop adapters only", the exact future tightening contemplated
+  below — and a `0 = unset` reading would make it inexpressible *and fail
+  silently*: seating 0 would read back as no ceiling, and tier 1 would keep
+  executing with nothing reverting. Use `type(uint8).max`, which also makes the
+  sentinel branch unnecessary since no tier can exceed it.
 
 **(b) Threshold — parameter only.** `setQuorumTierThreshold(0)`. No code change; the
 `>=` comparison at `SyndicateGovernor:468` already admits every tier at 0.
