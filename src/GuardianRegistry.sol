@@ -296,9 +296,9 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         if (voteEnd == 0 || reviewEnd <= voteEnd) revert InvalidReviewWindow();
         Review storage r = _reviews[_reviewKey(msg.sender, proposalId)];
         if (r.voteEnd != 0) revert ReviewAlreadyRegistered();
-        // forge-lint: disable-next-line(unchecked-cast)
+        // forge-lint: disable-next-line(unsafe-typecast)
         r.voteEnd = uint64(voteEnd);
-        // forge-lint: disable-next-line(unchecked-cast)
+        // forge-lint: disable-next-line(unsafe-typecast)
         r.reviewEnd = uint64(reviewEnd);
         emit ReviewRegistered(msg.sender, proposalId, uint64(voteEnd), uint64(reviewEnd));
     }
@@ -574,7 +574,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         er.cohortTooSmall = gs + ds < MIN_COHORT_STAKE_AT_OPEN;
         // Sherlock run #2 #15: snapshot block-quorum threshold at open so the
         // owner can't shift it mid-review.
-        // forge-lint: disable-next-line(unchecked-cast)
+        // forge-lint: disable-next-line(unsafe-typecast)
         er.blockQuorumBpsAtOpen = uint16(blockQuorumBps);
         uint64 newReviewEnd = er.reviewEnd;
         unchecked {
@@ -717,7 +717,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         r.totalDelegatedAtOpen = delegatedAtOpen;
         // Sherlock run #2 #15: snapshot block-quorum at open so the owner
         // can't shift the threshold after voters have cast.
-        // forge-lint: disable-next-line(unchecked-cast)
+        // forge-lint: disable-next-line(unsafe-typecast)
         r.blockQuorumBpsAtOpen = uint16(blockQuorumBps);
         r.openedAt = uint64(ts1);
         if (combinedAtOpen < MIN_COHORT_STAKE_AT_OPEN) {
