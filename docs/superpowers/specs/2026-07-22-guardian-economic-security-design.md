@@ -6,7 +6,11 @@
 
 **Implementation status 2026-07-24 — v1a COMPLETE (Plan A + Plan B).** Plan A (PR #13, merged) shipped §3.1–§3.2: risk envelopes, per-proposal net-outflow metering, adapter tiering with the codehash fail-safe, and the ERC20 selector guard. Plan B (PR #22) completes v1a: the dollar-denominated `ExposureLedger` (§3.3 aggregate cap with epoch-bucketed exposure per §3.4a, §3.3a approve quorum, §3.7 covered-TVL cap), the risk-scaled proposer bond and its escrow (§3.9), the adapter-submitter bond (§3.6), and the factory rewire path that closes LOW-1. **v1b (Plan C) is next:** authorized-slasher entrypoint, compensation escrow (§3.8), challenge game (§3.4), approver premium (§3.10). Bond **forfeiture** lives there — in v1a a bond's only exit is release to the proposer; rejection, expiry and cancellation all return it, because a guardian block is not a conviction.
 
-**§3.3a wording correction (2026-07-24, from implementation review).** §3.3a's "aggregate" is now literal and implemented as such: an approver commits a SHARE of its free budget — `min(free budget, coverage still uncovered)` — so two guardians holding half the coverage each genuinely cover one proposal between them. This is sound because a conviction slashes EVERY approver of that proposal at 100%, so recovery is the sum of their bonds, exactly as §2's inequality states. §3.3's per-guardian cap remains in force with its stated purpose — bounding ONE guardian across MANY proposals (the batching attack) — which is a different rule from requiring one guardian to single-handedly cover ONE proposal. An earlier implementation conflated the two by booking full coverage against each approver, which made the aggregate unreachable and left only whales able to clear a tier-2 quorum.
+**§3.3a wording correction (2026-07-24, SUPERSEDED 2026-07-26 — see below).** §3.3a's "aggregate" is literal: two guardians holding half the coverage each genuinely cover one proposal between them.
+
+**Correction to the correction (2026-07-26).** The paragraph above described booking as `min(free budget, coverage still uncovered)`. That rule was removed: it let the first approver absorb the entire coverage, leaving later ones at zero and unlisted, which a front-run-then-release turned into a costless permanent veto (review C1). An approver now RESERVES `min(free budget, the proposal's FULL coverage)`, and the real per-guardian liability is the pro-rata `allocatedUsd`. The aggregate property is unchanged; the mechanism reaching it is not.
+
+**The "at 100%" claim was wrong and is withdrawn.** `GuardianRegistry.resolveReview` passes `_severityBps(r)` — a quadratic ramp from `minSlashBps` to `maxSlashBps` — not 100%, and measured recovery on a fully-covered proposal was 53.68% of the booked number, flooring at 10% for a bare-quorum conviction. What makes §2's inequality hold is not a 100% slash but per-approver proportional rates: `ExposureLedger.slashBpsFor` (Plan C) derives each approver's rate from what they were ALLOCATED, so recovery tracks the booking by construction rather than by assuming the maximum severity. Note the review path (`resolveReview`, punishing approvers when the block side wins) and the challenge path (`slashToEscrow`, compensating LPs after a drain) are different mechanisms; only the second backs the coverage number, and the original wording ran them together. §3.3's per-guardian cap remains in force with its stated purpose — bounding ONE guardian across MANY proposals (the batching attack) — which is a different rule from requiring one guardian to single-handedly cover ONE proposal. An earlier implementation conflated the two by booking full coverage against each approver, which made the aggregate unreachable and left only whales able to clear a tier-2 quorum.
 
 ## 0. Revision log
 
@@ -181,7 +185,7 @@ Guardian-level invariant, checked at `voteOnProposal` (approve side):
 ```
 
 - **`slashableBond(g)` — defined (precision bug).** The amount of `g`'s stake
-  that a 100% verdict slash can actually reach, in dollars at a conservative
+  that a verdict slash can actually reach, in dollars at a conservative
   haircut:
 
   ```

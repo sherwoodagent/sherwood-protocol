@@ -68,10 +68,14 @@ interface IRegistryApproversMinimal {
  *         commitment per approval is therefore bounded at one epoch + challenge
  *         window regardless of strategy duration.
  *
- * @dev    v1 is WOOD-only (spec §3.7): `woodUsdPriceX8` is a GOVERNANCE-SET
- *         conservative price (<= 30-day low), not an oracle read — no WOOD
- *         Chainlink feed exists on Robinhood Chain (spec §8). Fail-closed: an
- *         unset price values every bond at $0.
+ * @dev    WOOD is priced by `woodPriceX8()`: a Chainlink read times
+ *         `woodHaircutBps` when a feed is wired and fresh, falling back to the
+ *         governance-set `woodUsdPriceX8` otherwise. The governance number was
+ *         the ONLY source originally (spec §3.7/§8 — no WOOD feed existed on
+ *         Robinhood Chain); it is now the degraded path and must still be
+ *         MAINTAINED, because a stale feed falls back to it rather than
+ *         reverting. Failing closed there would value every bond at $0 and halt
+ *         approvals protocol-wide on a Chainlink hiccup.
  */
 contract ExposureLedger is Ownable2Step, IExposureLedger {
     uint256 internal constant BPS_DENOMINATOR = 10_000;
@@ -173,14 +177,18 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     mapping(address guardian => mapping(uint256 epoch => uint256 usd)) internal _buckets;
     mapping(bytes32 reviewKey => mapping(address guardian => RecordedExposure)) internal _recorded;
 
-    /// @dev Total USD committed by all approvers of a proposal. Lets
-    ///      `recordApproval` size the next approver's share against what is
-    ///      still uncovered, so the aggregate stops growing once the proposal
-    ///      is fully backed.
+    /// @dev Total USD RESERVED by all approvers of a proposal — which runs to
+    ///      A x coverage while the review is open, NOT to `coverage`. Each
+    ///      approver reserves up to the whole thing because any one of them
+    ///      might end up carrying it alone; `settleCoverage` collapses this to
+    ///      the real aggregate once the set is final. It is also the denominator
+    ///      the pro-rata split divides by, so it has to reflect reservations
+    ///      rather than allocations until then.
     mapping(bytes32 reviewKey => uint256 usd) internal _committedUsd;
 
-    /// @dev The ledger's own approver list per proposal, plus a membership flag
-    ///      so a release/re-approve round trip cannot double-push. Read by
+    /// @dev The ledger's own approver list per proposal, plus a 1-indexed
+    ///      POSITION (not a flag) so `releaseApproval` can swap-and-pop in O(1)
+    ///      and a release/re-approve round trip cannot double-push. Read by
     ///      `requireApproveQuorum` INSTEAD of the guardian registry: the ledger
     ///      books commitments itself, so it needs no external opinion about who
     ///      approved, and the ledger's and governor's registry pointers can
@@ -510,13 +518,19 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     /// @inheritdoc IExposureLedger
     /// @dev Called by GuardianRegistry.voteOnProposal on the approve side.
     ///
-    ///      An approver commits a SHARE of its free bond — `min(free bond,
-    ///      coverage still uncovered)` — not the proposal's full coverage.
-    ///      This is what lets §3.3a's *aggregate* quorum actually aggregate:
-    ///      two guardians holding $600k each can jointly cover a $1M proposal,
-    ///      because a conviction slashes EVERY approver of that proposal
-    ///      (`GuardianRegistry.resolveReview` hands the whole approver array to
-    ///      `slashGuardians` at 100%), so recovery is the SUM of their bonds —
+    ///      An approver RESERVES `min(free bond, the proposal's full
+    ///      coverage)` — not merely what is still uncovered. That was the
+    ///      original rule and it is what C1 exploited: the first approver
+    ///      absorbed everything, later ones booked zero and were not even
+    ///      listed, and a flip to Block then released the lot with no way back.
+    ///
+    ///      Reserving per approver costs budget — A approvers tie up A x
+    ///      coverage until `settleCoverage` runs (review N1) — and buys the
+    ///      property that there is nothing to squat. The real split is the
+    ///      pro-rata `allocatedUsd`, so §3.3a's *aggregate* quorum still
+    ///      aggregates: two guardians holding $600k each jointly cover a $1M
+    ///      proposal, because a conviction slashes EVERY approver of that
+    ///      proposal and recovery is the SUM of their bonds —
     ///      exactly what §2's inequality states ("coalition loss >= Σ dollar
     ///      value of slashable approver stake").
     ///
@@ -648,8 +662,11 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     /// @inheritdoc IExposureLedger
     /// @dev Vote-change Approve→Block (or any registry-side unwind). Releases
     ///      exactly what was committed, from the bucket it was committed into.
-    ///      No-op when nothing is recorded — never underflows. The address stays
-    ///      in `_approversOf` with a zeroed commitment; the quorum skips it.
+    ///      No-op when nothing is recorded — never underflows. The address is
+    ///      SWAP-AND-POPPED out of `_approversOf` (review M2): leaving it behind
+    ///      with a zeroed commitment grew the list with every guardian that ever
+    ///      approved, which is bounded by the cohort rather than by the
+    ///      registry's approver cap, and that loop runs on the execute path.
     function releaseApproval(address governor, uint256 proposalId, address guardian) external onlyRegistry {
         bytes32 key = _reviewKey(governor, proposalId);
         RecordedExposure memory r = _recorded[key][guardian];
