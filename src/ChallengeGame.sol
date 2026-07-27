@@ -16,6 +16,19 @@ interface ITierRegistryDemoterMinimal {
     function demoteByChallenge(address target, bytes4 selector) external;
 }
 
+/// @dev Narrow coverage-epoch surface (spec §3.4a, Plan F): the game asks WHO
+///      covered a given cover-relative epoch and nothing else. A pure view, so
+///      wiring it grants this contract no power over the epoch schedule, the
+///      renewal book or the wind-down flag — the registry may refuse to answer,
+///      but no filing can ever drive it.
+/// @dev  Declared narrowly instead of importing `ICoverageEpochs`, for the same
+///       reason `ITierRegistryDemoterMinimal` is: the dependency this file
+///       actually has is one function, and stating exactly that keeps the blast
+///       radius of any change to the rest of that interface at zero.
+interface ICoverageEpochsCoverersMinimal {
+    function coverersOf(address governor, uint256 proposalId, uint256 epoch) external view returns (address[] memory);
+}
+
 /**
  * @title ChallengeGame
  * @notice The challenge trigger of the guardian economic-security model
@@ -198,6 +211,27 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///         adjudicator that can force slashes.
     address public court;
 
+    /// @notice The §3.4a coverage-epoch registry (Plan F) — the only source of
+    ///         WHO covered a given cover-relative epoch, and therefore the only
+    ///         thing that makes a predicate-5 accusation land on the watch the
+    ///         breach surfaced on rather than on the guardians who signed the
+    ///         original proposal.
+    /// @dev    THE ZERO ADDRESS LEAVES PLANS D AND E EXACTLY AS THEY WERE: no
+    ///         pre-Plan-F filing cited a non-zero epoch, and a filing that cites
+    ///         one now is REFUSED (`NoCoverage`) rather than quietly falling
+    ///         back to the ledger. That fallback is the tempting bug: it would
+    ///         accuse epoch 0's approvers for a watch they did not stand, which
+    ///         is precisely the open-ended liability §3.4a exists to end. Since
+    ///         unwiring can only ever refuse an accusation, never misdirect one,
+    ///         it is a safe off-switch.
+    /// @dev    IT MUST READ THE SAME `exposureLedger` THIS GAME DOES. Two
+    ///         ledgers means two answers to "who covered epoch 0" — one of which
+    ///         slashes a guardian the other calls innocent. Enforced at deploy
+    ///         time by Plan F's pre-flight, not here: this contract cannot see
+    ///         the registry's ledger through the minimal interface it holds, and
+    ///         widening the interface to check would buy the coupling back.
+    address public coverageEpochs;
+
     /// @notice How long after execution a proposal remains challengeable
     ///         (spec §5: 14d initial, matching the ledger's coverage window —
     ///         coverage that has expired out of the exposure buckets can no
@@ -340,10 +374,24 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      derivable culprit anyway. Naming it is also the more honest model:
     ///      a challenge is an assertion, and *which* adapter misbehaved is part
     ///      of the assertion, filed under the same bond as the rest of it.
+    /// @dev THE EPOCH ARGUMENT IS COVER-RELATIVE (§3.4a, D8), not an absolute
+    ///      index off the ledger's global grid: `ExposureLedger.epochGenesis` is
+    ///      the ledger's DEPLOY time, so a production cover sits in absolute
+    ///      epoch 40-something while its own first watch is 0. Cite
+    ///      `CoverageEpochs.relativeEpochNow`, which exists to hand back exactly
+    ///      the number this argument expects.
+    /// @dev ONLY PREDICATE 5 READS IT, and that asymmetry is the substance of
+    ///      §3.4a rather than an optimisation. A drawdown is the only predicate
+    ///      that can SURFACE on a later watch than the approval it came from — it
+    ///      breaches at a checkpoint months after execution — whereas an
+    ///      unauthorized venue was unauthorized the moment it executed, a rogue
+    ///      allowance the moment it was granted. Epoch-scoping those would move
+    ///      liability off the guardians who actually let the act through.
     function file(
         address governor,
         uint256 proposalId,
         Predicate predicate,
+        uint256 epoch,
         address adapterTarget,
         bytes4 adapterSelector,
         string calldata evidenceURI
@@ -381,6 +429,26 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         uint256 bondWood = (((coverageUsd * challengerBondBps) / BPS_DENOMINATOR) * 1e8) / priceX8;
         if (bondWood == 0) revert InvalidParameter();
 
+        // §3.4a: THE CITATION IS VALIDATED BEFORE THE CHALLENGE EXISTS. An epoch
+        // nobody covered yields an empty accused set, and a challenge built on
+        // one would slash nobody, return the bond through `_fail`'s defensive
+        // branch, and leave a terminal record indistinguishable from a challenge
+        // that ran its course — see `NoCoverage`. Refusing it here means the
+        // phantom never gets written and never freezes anything.
+        //
+        // THIS IS THE ONLY PLACE THE EMPTY SET IS AN ERROR: creation must refuse
+        // it, unwinding must tolerate it, or an owner unwiring the registry
+        // mid-challenge would brick every live epoch-scoped filing. See
+        // `_accused`.
+        //
+        // GUARDED so the epoch-0 and non-drawdown paths do not pay for a read
+        // whose answer is already known: for them `_accused` is the unchanged
+        // ledger filter, and `coverageUsd != 0` above already proves it non-empty.
+        if (
+            predicate == Predicate.DrawdownBreach && epoch != 0
+                && _accused(governor, proposalId, predicate, epoch).length == 0
+        ) revert NoCoverage();
+
         challengeId = ++challengeCount;
         _challenges[challengeId] = Challenge({
             governor: governor,
@@ -393,7 +461,8 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             filedAt: block.timestamp,
             frozenCoverageUsd: coverageUsd,
             adapterTarget: adapterTarget,
-            adapterSelector: adapterSelector
+            adapterSelector: adapterSelector,
+            epoch: epoch
         });
         _lastChallenge[key] = challengeId;
         bondedWood += bondWood;
@@ -440,13 +509,24 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         // Standing: only a guardian this filing actually accuses. A guardian
         // that released its commitment before the filing covered nothing here
         // and is not at risk, so it has nothing to defend (D2). This is also
-        // what BOUNDS the contributor list — the accused set is the ledger's,
-        // and each member can appear in it at most once.
-        (address[] memory approvers, uint256[] memory committedUsd) =
-            exposureLedger.approversOf(c.governor, c.proposalId);
+        // what BOUNDS the contributor list — the accused set is bounded by the
+        // ledger (or, for an epoch citation, by that epoch's renewal book) and
+        // each member appears in it at most once.
+        //
+        // ONE DERIVATION, NOT TWO. This used to re-derive the accused set with
+        // its own inline copy of `_accused`'s filter, which was harmless only
+        // while both read the same ledger. §3.4a breaks that: an epoch-scoped
+        // filing accuses the epoch's COVERERS, and a standing check still keyed
+        // to the ledger would have handed the defence to guardians at no risk
+        // while denying it to the ones being slashed — the accused could not buy
+        // the escalation, so the auto-slash became unavoidable, and approvers
+        // with nothing at stake could fund a pool and collect the forfeit.
+        // Routing both through `_accused` makes standing and liability two views
+        // of ONE set by construction.
+        address[] memory approvers = _accused(c.governor, c.proposalId, c.predicate, c.epoch);
         bool accused;
         for (uint256 i = 0; i < approvers.length; i++) {
-            if (approvers[i] == msg.sender && committedUsd[i] != 0) {
+            if (approvers[i] == msg.sender) {
                 accused = true;
                 break;
             }
@@ -573,7 +653,21 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
 
         address governor = c.governor;
         uint256 proposalId = c.proposalId;
-        address[] memory approvers = _accused(governor, proposalId);
+        // The accused set is resolved from the CHALLENGE's own stored predicate
+        // and epoch, so the set slashed here is by construction the set the
+        // filing validated and the set `dispute` granted standing from.
+        //
+        // §3.4a WIDENS WHAT THIS CAN RETURN — the hazard this helper has been
+        // caught by twice — so the slash's own preconditions are re-derived
+        // rather than assumed. It survives an epoch-scoped set because the
+        // slash basis is `c.filedAt`, NOT the `executedAt - 1` snapshot passed
+        // below: a guardian who renewed into epoch 3 and staked long after
+        // execution is still sized off its stake at filing, so claims-made
+        // attribution and the slash arithmetic agree. `executedAt - 1` is
+        // §3.8's pre-drain instant and selects the compensated LPs, which is a
+        // property of the PROPOSAL and correctly unaffected by which watch is
+        // being accused.
+        address[] memory approvers = _accused(governor, proposalId, c.predicate, c.epoch);
 
         // D6: the vault and the pre-drain instant are re-read from the proposal
         // rather than carried on the challenge — `executedAt - 1` is §3.8's
@@ -746,17 +840,81 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         emit ChallengeFailed(challengeId, bond, burnAmount);
     }
 
-    /// @dev The accused set: the ledger's covering approvers, filtered to those
-    ///      whose committed share is still non-zero. The ledger reports a
-    ///      released commitment as zero rather than dropping it, and a guardian
-    ///      that released before the filing backed nothing on this proposal, so
-    ///      it is not slashed for it.
+    /// @dev The accused set. TWO SOURCES, AND WHICH ONE IS NOT A DETAIL:
+    ///
+    ///      — §3.4a CLAIMS-MADE (predicate 5, non-zero epoch): the guardians
+    ///        covering the cover-relative epoch the breach SURFACED on, read
+    ///        from `coverageEpochs`. This is the entire point of coverage
+    ///        epochs: a drawdown breaches at a checkpoint that may sit many
+    ///        epochs after execution, and accusing the original approvers for it
+    ///        would commit them for as long as the strategy runs. Claims-made
+    ///        bounds that at one epoch plus the challenge window. An original
+    ///        approver who did not renew answers for NOTHING surfacing after its
+    ///        own watch — and, symmetrically, a renewer who never signed the
+    ///        proposal DOES answer for the watch it took on.
+    ///
+    ///      — EVERY OTHER CASE (any other predicate, or epoch 0): the ledger's
+    ///        covering approvers, filtered to a still-non-zero committed share,
+    ///        byte for byte as before Plan F. The ledger reports a released
+    ///        commitment as zero rather than dropping it, so array membership is
+    ///        not coverage — the filter is. Relative epoch 0 is the watch the
+    ///        cover opened on, whose coverers ARE those approvers, so zero is
+    ///        not a special case so much as the same answer by the shorter road.
+    ///
+    /// @dev AN UNWIRED REGISTRY ANSWERS EMPTY, and never falls through to the
+    ///      ledger. The fallthrough is the tempting bug: it would accuse epoch
+    ///      0's approvers for a watch they did not stand, under a filing that
+    ///      explicitly said otherwise — the silent misattribution this whole
+    ///      mechanism exists to prevent.
+    ///
+    /// @dev THIS FUNCTION DOES NOT REVERT ON THE EMPTY SET; `file` refuses it.
+    ///      The split matters, and it is the Plan-E lesson applied to this
+    ///      change rather than rediscovered: the empty set must be refused where
+    ///      a challenge is CREATED, but tolerated everywhere a challenge is
+    ///      UNWOUND. Reverting here would have been simpler and wrong — the
+    ///      owner can unwire `coverageEpochs` at any moment, and a `Filed`
+    ///      epoch-scoped challenge would then be unable to reach `dispute`
+    ///      (which reads this) OR `_settle` (which also reads it), leaving it
+    ///      permanently stuck with the coverage it froze pinned forever. That is
+    ///      exactly the indefinite freeze D5's fail-safe exists to rule out, and
+    ///      it would have been NEW: re-pointing `exposureLedger` — the
+    ///      pre-Plan-F analogue — has always degraded to a zero-recovery settle
+    ///      rather than to a brick.
+    ///
+    ///      So an emptied set degrades the same way the ledger path always has:
+    ///      `dispute` finds no one with standing (`NotAccusedApprover`) and
+    ///      `_settle` slashes nobody and completes. Reaching that state requires
+    ///      an owner action mid-challenge; reaching it by accident is impossible,
+    ///      because `file` rejected the empty citation and `_coverers` only ever
+    ///      grows.
+    ///
+    /// @dev WHAT THE SET CAN DO BETWEEN FILING AND SETTLEMENT: grow, never
+    ///      shrink. `CoverageEpochs._coverers` is append-only, so nobody accused
+    ///      at filing can escape by the time the slash runs — the direction that
+    ///      would matter. Growth is sound and, in production, empty: renewal for
+    ///      epoch N closes `renewalLeadTime` BEFORE epoch N begins, and a breach
+    ///      cannot surface in an epoch that has not started, so by the time an
+    ///      epoch is citable its coverer set is already frozen. Where the window
+    ///      is non-empty (a citation of a future epoch), a guardian joining a
+    ///      watch already under public challenge has taken on that watch.
+    ///
     /// @dev It returns ADDRESSES ONLY. It used to hand back each guardian's
     ///      committed share and their total as well, because a failed challenge
     ///      paid the forfeit out by coverage; that split is now keyed to
-    ///      contribution instead (see `_fail`), so the only remaining consumer is
-    ///      the slash list in `_settle`, and the coverage weights are dead.
-    function _accused(address governor, uint256 proposalId) internal view returns (address[] memory accused) {
+    ///      contribution instead (see `_fail`), so the weights are dead — and
+    ///      that is also why an epoch-scoped set needs no committed-USD analogue:
+    ///      nothing downstream weighs the accused against each other.
+    function _accused(address governor, uint256 proposalId, Predicate predicate, uint256 epoch)
+        internal
+        view
+        returns (address[] memory accused)
+    {
+        if (predicate == Predicate.DrawdownBreach && epoch != 0) {
+            address registry = coverageEpochs;
+            if (registry == address(0)) return new address[](0);
+            return ICoverageEpochsCoverersMinimal(registry).coverersOf(governor, proposalId, epoch);
+        }
+
         (address[] memory all, uint256[] memory committedUsd) = exposureLedger.approversOf(governor, proposalId);
         uint256 n;
         for (uint256 i = 0; i < all.length; i++) {
@@ -776,6 +934,24 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     /// @inheritdoc IChallengeGame
     function challengeOf(uint256 challengeId) external view returns (Challenge memory) {
         return _challenges[challengeId];
+    }
+
+    /// @inheritdoc IChallengeGame
+    /// @dev Reads the challenge's OWN predicate and epoch, so a guardian asking
+    ///      "am I on the hook for this?" cannot answer it against a different
+    ///      citation than the one filed.
+    function accusedOf(uint256 challengeId) external view returns (address[] memory) {
+        Challenge storage c = _challenges[challengeId];
+        return _accused(c.governor, c.proposalId, c.predicate, c.epoch);
+    }
+
+    /// @inheritdoc IChallengeGame
+    function accusedFor(address governor, uint256 proposalId, Predicate predicate, uint256 epoch)
+        external
+        view
+        returns (address[] memory)
+    {
+        return _accused(governor, proposalId, predicate, epoch);
     }
 
     /// @inheritdoc IChallengeGame
@@ -810,6 +986,20 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     function setCourt(address newCourt) external onlyOwner {
         emit CourtSet(court, newCourt);
         court = newCourt;
+    }
+
+    /// @dev NO ZERO CHECK, for the same reason `setCourt` has none: the zero
+    ///      address is the meaningful "no epoch registry" state — the pre-Plan-F
+    ///      default and the revocation switch — not a mis-set one. Unwiring a
+    ///      captured or broken registry makes epoch citations unfileable and
+    ///      leaves every other filing untouched, so the worst it can do is
+    ///      refuse an accusation. It can never cause a wrong one.
+    /// @dev The registry MUST read this game's `exposureLedger`; see the state
+    ///      variable for why, and Plan F's deploy pre-flight for where that is
+    ///      actually checked.
+    function setCoverageEpochs(address registry) external onlyOwner {
+        emit CoverageEpochsSet(coverageEpochs, registry);
+        coverageEpochs = registry;
     }
 
     function setExposureLedger(address ledger) external onlyOwner {

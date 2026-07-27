@@ -520,6 +520,7 @@ contract CourtEndToEndTest is Test {
             address(gov),
             pid,
             IChallengeGame.Predicate.OutOfAdapterOutflow,
+            0,
             address(adapter),
             adapter.poke.selector,
             "ipfs://evidence/out-of-adapter-outflow"

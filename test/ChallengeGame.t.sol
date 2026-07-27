@@ -157,6 +157,29 @@ contract MockChallengeStakedWood {
     }
 }
 
+/// @dev Coverage-epoch stub (Plan F). The game asks it exactly ONE question —
+///      who covered a given COVER-RELATIVE epoch (D8) — so this stub is a
+///      settable answer to that and nothing else. Deliberately NOT a real
+///      `CoverageEpochs`: Task 7 is about the branch inside `_accused`, and
+///      wiring the real schedule here would re-test `CoverageEpochs` while
+///      making these cases depend on boundary arithmetic they do not exercise.
+///      The real contract is joined up end-to-end in Task 8.
+contract MockChallengeCoverageEpochs {
+    mapping(bytes32 epochKey => address[]) internal _coverers;
+
+    function setCoverers(address governor, uint256 proposalId, uint256 epoch, address[] memory who) external {
+        bytes32 k = keccak256(abi.encode(governor, proposalId, epoch));
+        delete _coverers[k];
+        for (uint256 i = 0; i < who.length; i++) {
+            _coverers[k].push(who[i]);
+        }
+    }
+
+    function coverersOf(address governor, uint256 proposalId, uint256 epoch) external view returns (address[] memory) {
+        return _coverers[keccak256(abi.encode(governor, proposalId, epoch))];
+    }
+}
+
 contract ChallengeGameTest is Test {
     ChallengeGame internal game;
     ERC20Mock internal wood;
@@ -164,11 +187,17 @@ contract ChallengeGameTest is Test {
     MockChallengeLedger internal ledger;
     MockChallengeTierRegistry internal tiers;
     MockChallengeStakedWood internal swood;
+    MockChallengeCoverageEpochs internal epochs;
 
     address internal owner = makeAddr("owner");
     address internal challenger = makeAddr("challenger");
     address internal guardianA = makeAddr("guardianA");
     address internal guardianB = makeAddr("guardianB");
+    /// @dev The RENEWER (Plan F). It never approved the proposal, so it is
+    ///      absent from the ledger's approver set and appears only as a coverer
+    ///      of a later epoch — which is exactly what makes it the witness for
+    ///      claims-made attribution.
+    address internal guardianC = makeAddr("guardianC");
     address internal vault = makeAddr("vault");
     /// @dev Stands in for the §3.5 court (Plan E). Only `rule` reads it, so
     ///      wiring it in `setUp` leaves every Plan D path byte-identical.
@@ -188,18 +217,23 @@ contract ChallengeGameTest is Test {
         ledger = new MockChallengeLedger(0.05e8); // $0.05, the governance haircut price
         tiers = new MockChallengeTierRegistry();
         swood = new MockChallengeStakedWood();
+        epochs = new MockChallengeCoverageEpochs();
         game = new ChallengeGame(owner, address(wood), address(ledger), address(tiers));
         vm.startPrank(owner);
         game.setStakedWood(address(swood));
         game.setCourt(court);
+        // Plan F. Wiring it in `setUp` leaves every pre-Plan-F path byte-
+        // identical: only a DrawdownBreach filing citing a NON-ZERO epoch reads
+        // it at all, and no test before Task 7 cites one.
+        game.setCoverageEpochs(address(epochs));
         vm.stopPrank();
 
         wood.mint(challenger, 10_000_000e18);
         vm.prank(challenger);
         wood.approve(address(game), type(uint256).max);
         // The accused need WOOD to match the challenger's bond when disputing.
-        for (uint256 i = 0; i < 2; i++) {
-            address g = i == 0 ? guardianA : guardianB;
+        for (uint256 i = 0; i < 3; i++) {
+            address g = i == 0 ? guardianA : (i == 1 ? guardianB : guardianC);
             wood.mint(g, 10_000_000e18);
             vm.prank(g);
             wood.approve(address(game), type(uint256).max);
@@ -252,7 +286,7 @@ contract ChallengeGameTest is Test {
         );
         vm.prank(challenger);
         uint256 id = game.file(
-            address(gov), PROPOSAL, IChallengeGame.Predicate.OutOfAdapterOutflow, ADAPTER, SELECTOR, EVIDENCE
+            address(gov), PROPOSAL, IChallengeGame.Predicate.OutOfAdapterOutflow, 0, ADAPTER, SELECTOR, EVIDENCE
         );
 
         assertEq(id, 1, "first challenge id");
@@ -284,12 +318,13 @@ contract ChallengeGameTest is Test {
         _execute(PROPOSAL);
         vm.prank(challenger);
         uint256 small =
-            game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.RogueAllowance, ADAPTER, SELECTOR, EVIDENCE);
+            game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.RogueAllowance, 0, ADAPTER, SELECTOR, EVIDENCE);
 
         _setCoverage(2, 12_000e18, 8_000e18); // $20,000 — double
         _execute(2);
         vm.prank(challenger);
-        uint256 big = game.file(address(gov), 2, IChallengeGame.Predicate.RogueAllowance, ADAPTER, SELECTOR, EVIDENCE);
+        uint256 big =
+            game.file(address(gov), 2, IChallengeGame.Predicate.RogueAllowance, 0, ADAPTER, SELECTOR, EVIDENCE);
 
         uint256 smallBond = game.challengeOf(small).bondWood;
         uint256 bigBond = game.challengeOf(big).bondWood;
@@ -309,7 +344,7 @@ contract ChallengeGameTest is Test {
         // deliberately no _execute()
         vm.prank(challenger);
         vm.expectRevert(IChallengeGame.NotExecuted.selector);
-        game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.DrawdownBreach, ADAPTER, SELECTOR, EVIDENCE);
+        game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.DrawdownBreach, 0, ADAPTER, SELECTOR, EVIDENCE);
     }
 
     /// @notice §3.4: filing closes `challengeWindow` after execution. The final
@@ -324,14 +359,14 @@ contract ChallengeGameTest is Test {
         // The last second of the window is still inside it.
         vm.warp(executedAt + game.challengeWindow());
         vm.prank(challenger);
-        game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.OraclePriceDeviation, ADAPTER, SELECTOR, EVIDENCE);
+        game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.OraclePriceDeviation, 0, ADAPTER, SELECTOR, EVIDENCE);
         assertEq(game.challengeCount(), 1, "filed on the closing second");
 
         // One second later it is shut, for a proposal executed at the same time.
         vm.warp(executedAt + game.challengeWindow() + 1);
         vm.prank(challenger);
         vm.expectRevert(IChallengeGame.WindowClosed.selector);
-        game.file(address(gov), 2, IChallengeGame.Predicate.OraclePriceDeviation, ADAPTER, SELECTOR, EVIDENCE);
+        game.file(address(gov), 2, IChallengeGame.Predicate.OraclePriceDeviation, 0, ADAPTER, SELECTOR, EVIDENCE);
     }
 
     /// @notice One live challenge per proposal: a second filing would double the
@@ -340,14 +375,16 @@ contract ChallengeGameTest is Test {
         _setCoverage(PROPOSAL, 6_000e18, 4_000e18);
         _execute(PROPOSAL);
         vm.prank(challenger);
-        game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.OutOfAdapterOutflow, ADAPTER, SELECTOR, EVIDENCE);
+        game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.OutOfAdapterOutflow, 0, ADAPTER, SELECTOR, EVIDENCE);
 
         address other = makeAddr("otherChallenger");
         wood.mint(other, 1_000_000e18);
         vm.startPrank(other);
         wood.approve(address(game), type(uint256).max);
         vm.expectRevert(IChallengeGame.AlreadyChallenged.selector);
-        game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.ProposerLinkedOutflow, ADAPTER, SELECTOR, EVIDENCE);
+        game.file(
+            address(gov), PROPOSAL, IChallengeGame.Predicate.ProposerLinkedOutflow, 0, ADAPTER, SELECTOR, EVIDENCE
+        );
         vm.stopPrank();
     }
 
@@ -358,14 +395,14 @@ contract ChallengeGameTest is Test {
         _execute(PROPOSAL);
         vm.prank(challenger);
         vm.expectRevert(IChallengeGame.NothingToFreeze.selector);
-        game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.OutOfAdapterOutflow, ADAPTER, SELECTOR, EVIDENCE);
+        game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.OutOfAdapterOutflow, 0, ADAPTER, SELECTOR, EVIDENCE);
 
         // An approver list whose committed shares are all zero is equally empty:
         // the ledger reports a released commitment as zero rather than dropping it.
         _setCoverage(PROPOSAL, 0, 0);
         vm.prank(challenger);
         vm.expectRevert(IChallengeGame.NothingToFreeze.selector);
-        game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.OutOfAdapterOutflow, ADAPTER, SELECTOR, EVIDENCE);
+        game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.OutOfAdapterOutflow, 0, ADAPTER, SELECTOR, EVIDENCE);
     }
 
     /// @notice Every predicate takes the identical path (D1) — the enum is a
@@ -376,7 +413,8 @@ contract ChallengeGameTest is Test {
             _setCoverage(proposalId, 6_000e18, 4_000e18);
             _execute(proposalId);
             vm.prank(challenger);
-            uint256 id = game.file(address(gov), proposalId, IChallengeGame.Predicate(i), ADAPTER, SELECTOR, EVIDENCE);
+            uint256 id =
+                game.file(address(gov), proposalId, IChallengeGame.Predicate(i), 0, ADAPTER, SELECTOR, EVIDENCE);
             IChallengeGame.Challenge memory c = game.challengeOf(id);
             assertEq(uint8(c.predicate), uint8(i));
             assertEq(c.bondWood, 10_000e18, "identical bond regardless of predicate");
@@ -392,7 +430,7 @@ contract ChallengeGameTest is Test {
         _execute(PROPOSAL);
         vm.prank(challenger);
         vm.expectRevert(IChallengeGame.InvalidParameter.selector);
-        game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.OutOfAdapterOutflow, ADAPTER, SELECTOR, EVIDENCE);
+        game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.OutOfAdapterOutflow, 0, ADAPTER, SELECTOR, EVIDENCE);
     }
 
     // ── Parameters ──
@@ -422,7 +460,7 @@ contract ChallengeGameTest is Test {
         _execute(PROPOSAL);
         vm.prank(challenger);
         uint256 id = game.file(
-            address(gov), PROPOSAL, IChallengeGame.Predicate.OutOfAdapterOutflow, ADAPTER, SELECTOR, EVIDENCE
+            address(gov), PROPOSAL, IChallengeGame.Predicate.OutOfAdapterOutflow, 0, ADAPTER, SELECTOR, EVIDENCE
         );
         assertEq(game.challengeOf(id).bondWood, 20_000e18, "10% of $10,000 at $0.05");
     }
@@ -451,7 +489,7 @@ contract ChallengeGameTest is Test {
         vm.warp(vm.getBlockTimestamp() + 3 days);
         vm.prank(challenger);
         id = game.file(
-            address(gov), proposalId, IChallengeGame.Predicate.OutOfAdapterOutflow, ADAPTER, SELECTOR, EVIDENCE
+            address(gov), proposalId, IChallengeGame.Predicate.OutOfAdapterOutflow, 0, ADAPTER, SELECTOR, EVIDENCE
         );
     }
 
@@ -526,7 +564,7 @@ contract ChallengeGameTest is Test {
         vm.warp(executedAt + 10 days);
         vm.prank(challenger);
         uint256 id =
-            game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.DrawdownBreach, ADAPTER, SELECTOR, EVIDENCE);
+            game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.DrawdownBreach, 0, ADAPTER, SELECTOR, EVIDENCE);
 
         vm.warp(_filedAt(id) + game.autoSlashDelay());
         game.resolve(id);
@@ -542,7 +580,7 @@ contract ChallengeGameTest is Test {
         _execute(PROPOSAL);
         vm.prank(challenger);
         uint256 id =
-            game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.RogueAllowance, ADAPTER, SELECTOR, EVIDENCE);
+            game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.RogueAllowance, 0, ADAPTER, SELECTOR, EVIDENCE);
 
         vm.warp(vm.getBlockTimestamp() + game.autoSlashDelay());
         game.resolve(id);
@@ -560,7 +598,7 @@ contract ChallengeGameTest is Test {
         _execute(PROPOSAL);
         vm.prank(challenger);
         uint256 id = game.file(
-            address(gov), PROPOSAL, IChallengeGame.Predicate.OraclePriceDeviation, address(0), bytes4(0), EVIDENCE
+            address(gov), PROPOSAL, IChallengeGame.Predicate.OraclePriceDeviation, 0, address(0), bytes4(0), EVIDENCE
         );
         vm.warp(vm.getBlockTimestamp() + game.autoSlashDelay());
         game.resolve(id);
@@ -599,7 +637,7 @@ contract ChallengeGameTest is Test {
         vm.startPrank(challenger);
         wood.approve(address(bare), type(uint256).max);
         uint256 id = bare.file(
-            address(gov), PROPOSAL, IChallengeGame.Predicate.OutOfAdapterOutflow, ADAPTER, SELECTOR, EVIDENCE
+            address(gov), PROPOSAL, IChallengeGame.Predicate.OutOfAdapterOutflow, 0, ADAPTER, SELECTOR, EVIDENCE
         );
         vm.stopPrank();
 
@@ -668,7 +706,7 @@ contract ChallengeGameTest is Test {
         _execute(PROPOSAL);
         vm.prank(challenger);
         uint256 id =
-            game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.RogueAllowance, ADAPTER, SELECTOR, EVIDENCE);
+            game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.RogueAllowance, 0, ADAPTER, SELECTOR, EVIDENCE);
 
         vm.prank(guardianB);
         vm.expectRevert(IChallengeGame.NotAccusedApprover.selector);
@@ -764,7 +802,7 @@ contract ChallengeGameTest is Test {
         _execute(PROPOSAL);
         vm.prank(challenger);
         uint256 id = game.file(
-            address(gov), PROPOSAL, IChallengeGame.Predicate.ProposerLinkedOutflow, ADAPTER, SELECTOR, EVIDENCE
+            address(gov), PROPOSAL, IChallengeGame.Predicate.ProposerLinkedOutflow, 0, ADAPTER, SELECTOR, EVIDENCE
         );
         uint256 bond = game.challengeOf(id).bondWood;
         uint256 aBefore = wood.balanceOf(guardianA);
@@ -842,7 +880,7 @@ contract ChallengeGameTest is Test {
 
         vm.prank(challenger);
         uint256 second =
-            game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.DrawdownBreach, ADAPTER, SELECTOR, EVIDENCE);
+            game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.DrawdownBreach, 0, ADAPTER, SELECTOR, EVIDENCE);
         assertEq(game.liveChallengeOf(address(gov), PROPOSAL), second);
     }
 
@@ -974,7 +1012,7 @@ contract ChallengeGameTest is Test {
             _execute(proposalId);
             vm.prank(challenger);
             ids[i] = game.file(
-                address(gov), proposalId, IChallengeGame.Predicate.DrawdownBreach, ADAPTER, SELECTOR, EVIDENCE
+                address(gov), proposalId, IChallengeGame.Predicate.DrawdownBreach, 0, ADAPTER, SELECTOR, EVIDENCE
             );
             _assertLiveBondsBacked();
         }
@@ -1296,7 +1334,7 @@ contract ChallengeGameTest is Test {
         _execute(2);
         vm.prank(challenger);
         uint256 split =
-            game.file(address(gov), 2, IChallengeGame.Predicate.OutOfAdapterOutflow, ADAPTER, SELECTOR, EVIDENCE);
+            game.file(address(gov), 2, IChallengeGame.Predicate.OutOfAdapterOutflow, 0, ADAPTER, SELECTOR, EVIDENCE);
         uint256 splitBond = game.challengeOf(split).bondWood;
         assertEq(splitBond, wholeBond, "same summed coverage, so the same bond and the same pool target");
 
@@ -1326,7 +1364,7 @@ contract ChallengeGameTest is Test {
         _execute(PROPOSAL);
         vm.prank(challenger);
         uint256 id =
-            game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.RogueAllowance, ADAPTER, SELECTOR, EVIDENCE);
+            game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.RogueAllowance, 0, ADAPTER, SELECTOR, EVIDENCE);
         uint256 bond = game.challengeOf(id).bondWood;
 
         uint256 s1Before = wood.balanceOf(sybil1);
@@ -1374,7 +1412,7 @@ contract ChallengeGameTest is Test {
         // Step 1: the approver challenges its OWN proposal.
         vm.prank(guardianA);
         uint256 id =
-            game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.RogueAllowance, ADAPTER, SELECTOR, EVIDENCE);
+            game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.RogueAllowance, 0, ADAPTER, SELECTOR, EVIDENCE);
         uint256 bond = game.challengeOf(id).bondWood;
         assertEq(game.challengeOf(id).challenger, guardianA, "challenger and accused are one address");
 
@@ -1414,7 +1452,7 @@ contract ChallengeGameTest is Test {
 
         vm.prank(filer);
         uint256 id = game.file(
-            address(gov), PROPOSAL, IChallengeGame.Predicate.ProposerLinkedOutflow, ADAPTER, SELECTOR, EVIDENCE
+            address(gov), PROPOSAL, IChallengeGame.Predicate.ProposerLinkedOutflow, 0, ADAPTER, SELECTOR, EVIDENCE
         );
         uint256 bond = game.challengeOf(id).bondWood;
         assertNotEq(game.challengeOf(id).challenger, guardianA, "a sender check would see two unrelated parties");
@@ -1497,7 +1535,7 @@ contract ChallengeGameTest is Test {
         _execute(PROPOSAL);
         vm.prank(challenger);
         uint256 id =
-            game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.DrawdownBreach, ADAPTER, SELECTOR, EVIDENCE);
+            game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.DrawdownBreach, 0, ADAPTER, SELECTOR, EVIDENCE);
         uint256 bond = game.challengeOf(id).bondWood;
         assertEq(bond, 10_000e18 + 20, "an odd bond, so the rounding has somewhere to hide");
         assertTrue((bond * 1_777) % 10_000 != 0, "and the burn itself truncates");
@@ -1618,5 +1656,315 @@ contract ChallengeGameTest is Test {
         emit IChallengeGame.ForfeitBurnBpsSet(2_000, 3_500);
         vm.prank(owner);
         game.setForfeitBurnBps(3_500);
+    }
+
+    // ── Task 7 (Plan F, spec §3.4a): predicate 5 accuses the covering epoch ──
+
+    function _one(address who) internal pure returns (address[] memory a) {
+        a = new address[](1);
+        a[0] = who;
+    }
+
+    function _two(address x, address y) internal pure returns (address[] memory a) {
+        a = new address[](2);
+        a[0] = x;
+        a[1] = y;
+    }
+
+    /// @dev A proposal whose ORIGINAL approvers (guardianA, guardianB) are in
+    ///      the ledger and whose relative epoch 1 was renewed by guardianC
+    ///      alone. Both halves matter: the bond and the freeze are still sized
+    ///      off the ledger's proposal-scoped coverage, while the ACCUSED set is
+    ///      the epoch's.
+    function _executeAndCover(uint256 proposalId) internal {
+        _setCoverage(proposalId, 6_000e18, 4_000e18);
+        _execute(proposalId);
+        epochs.setCoverers(address(gov), proposalId, 1, _one(guardianC));
+    }
+
+    function _fileDrawdown(uint256 proposalId, uint256 epoch) internal returns (uint256 id) {
+        vm.prank(challenger);
+        id = game.file(
+            address(gov), proposalId, IChallengeGame.Predicate.DrawdownBreach, epoch, ADAPTER, SELECTOR, EVIDENCE
+        );
+    }
+
+    /// @notice §3.4a, THE POINT OF PLAN F. A drawdown breaching in relative
+    ///         epoch 1 is answered for by epoch 1's coverers — not by the
+    ///         approvers who signed the original proposal and whose watch ended
+    ///         at epoch 0. Asserted twice over: on the view, and on the argument
+    ///         sWOOD is actually handed, because a view that agreed while the
+    ///         slash disagreed would be the worst possible outcome here.
+    function test_file_drawdownEpochAccusesTheEpochCoverers() public {
+        _executeAndCover(PROPOSAL);
+        uint256 id = _fileDrawdown(PROPOSAL, 1);
+
+        assertEq(game.challengeOf(id).epoch, 1, "the citation is recorded on the challenge");
+
+        address[] memory accused = game.accusedOf(id);
+        assertEq(accused.length, 1, "epoch 1 is guardianC's watch alone");
+        assertEq(accused[0], guardianC);
+
+        vm.warp(_filedAt(id) + game.autoSlashDelay());
+        game.resolve(id);
+
+        address[] memory slashed = swood.lastApprovers();
+        assertEq(slashed.length, 1, "and the SLASH list is the same set, not merely the view");
+        assertEq(slashed[0], guardianC);
+    }
+
+    /// @notice The claims-made bound from the other side: neither original
+    ///         approver appears anywhere in an epoch-1 accusation. This is what
+    ///         caps a guardian's commitment at one epoch plus the challenge
+    ///         window however long the strategy runs.
+    function test_file_originalApproversAreNotAccusedForALaterEpoch() public {
+        _executeAndCover(PROPOSAL);
+        uint256 id = _fileDrawdown(PROPOSAL, 1);
+
+        address[] memory accused = game.accusedOf(id);
+        for (uint256 i = 0; i < accused.length; i++) {
+            assertNotEq(accused[i], guardianA, "guardianA's watch ended at epoch 0");
+            assertNotEq(accused[i], guardianB, "guardianB's watch ended at epoch 0");
+        }
+    }
+
+    /// @notice `epoch == 0` is the pre-Plan-F path, unchanged: relative epoch 0
+    ///         is the watch the cover OPENED on, so its coverers are the
+    ///         ledger's original approvers and `CoverageEpochs` is not consulted
+    ///         at all — even though it is wired and holds a different answer for
+    ///         epoch 1.
+    function test_file_epochZeroKeepsLedgerBehaviour() public {
+        _executeAndCover(PROPOSAL);
+        uint256 id = _fileDrawdown(PROPOSAL, 0);
+
+        address[] memory accused = game.accusedOf(id);
+        assertEq(accused.length, 2, "the original approvers");
+        assertEq(accused[0], guardianA);
+        assertEq(accused[1], guardianB);
+    }
+
+    /// @notice ONLY PREDICATE 5 IS EPOCH-SCOPED, and the reason is not
+    ///         arbitrary: a drawdown is the only predicate that can SURFACE on a
+    ///         later watch than the approval it came from. An unauthorized venue
+    ///         was unauthorized the moment it executed, so its epoch citation is
+    ///         meaningless and is ignored rather than honoured.
+    function test_file_nonDrawdownPredicateIgnoresTheEpoch() public {
+        _executeAndCover(PROPOSAL);
+        vm.prank(challenger);
+        uint256 id = game.file(
+            address(gov), PROPOSAL, IChallengeGame.Predicate.OutOfAdapterOutflow, 1, ADAPTER, SELECTOR, EVIDENCE
+        );
+
+        address[] memory accused = game.accusedOf(id);
+        assertEq(accused.length, 2, "only predicate 5 is epoch-scoped");
+        assertEq(accused[0], guardianA);
+        assertEq(accused[1], guardianB);
+    }
+
+    /// @notice THE EMPTY SET IS NOT AN ACQUITTAL, IT IS A REVERT. `coverersOf`
+    ///         returns empty for an epoch nobody renewed — deliberately, because
+    ///         an unrenewed epoch is a WIND-DOWN condition, not a liability one —
+    ///         and an empty accused set here would slash nobody, refund the
+    ///         challenger through the defensive branch, and read on-chain as a
+    ///         challenge that ran to completion. A phantom challenge is worse
+    ///         than no challenge, so the citation is refused at filing.
+    function test_file_revertsWhenTheCitedEpochHasNoCoverers() public {
+        _executeAndCover(PROPOSAL); // epoch 1 renewed; epoch 2 was not
+        vm.prank(challenger);
+        vm.expectRevert(IChallengeGame.NoCoverage.selector);
+        game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.DrawdownBreach, 2, ADAPTER, SELECTOR, EVIDENCE);
+        assertEq(game.challengeCount(), 0, "nothing was recorded, so no coverage was frozen either");
+    }
+
+    /// @notice FAIL CLOSED WHEN UNWIRED. With no `coverageEpochs` there is no
+    ///         answer to "who covered epoch N", and the tempting fallback — the
+    ///         ledger's approvers — is precisely the open-ended liability §3.4a
+    ///         ends: it would silently slash epoch 0's guardians for a watch they
+    ///         did not stand. Refusing the citation is the only honest answer,
+    ///         and it changes no pre-Plan-F behaviour because nothing could cite
+    ///         a non-zero epoch before.
+    function test_file_revertsOnANonZeroEpochWhileUnwired() public {
+        _executeAndCover(PROPOSAL);
+        vm.prank(owner);
+        game.setCoverageEpochs(address(0));
+
+        vm.prank(challenger);
+        vm.expectRevert(IChallengeGame.NoCoverage.selector);
+        game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.DrawdownBreach, 1, ADAPTER, SELECTOR, EVIDENCE);
+
+        // ...while epoch 0 is entirely unaffected by the unwiring.
+        uint256 id = _fileDrawdown(PROPOSAL, 0);
+        assertEq(game.accusedOf(id).length, 2, "the ledger path never needed the registry");
+    }
+
+    /// @notice THE ACCUSED MUST BE ABLE TO DEFEND THEMSELVES — the consumer of
+    ///         `_accused` that is easiest to miss, because `dispute` used to
+    ///         re-derive the accused set with its OWN inline copy of the ledger
+    ///         filter instead of calling the helper. Left un-epoched, an
+    ///         epoch-1 filing would accuse guardianC while granting standing to
+    ///         guardianA and guardianB: the party actually at risk could not buy
+    ///         the escalation (so the auto-slash was guaranteed), and parties at
+    ///         no risk could fund a defence and collect the forfeit.
+    function test_dispute_standingFollowsTheEpochAccusedSet() public {
+        _executeAndCover(PROPOSAL);
+        uint256 id = _fileDrawdown(PROPOSAL, 1);
+
+        // An ORIGINAL approver is not accused here, so it has nothing to defend.
+        vm.prank(guardianA);
+        vm.expectRevert(IChallengeGame.NotAccusedApprover.selector);
+        game.dispute(id, type(uint256).max);
+
+        // The epoch's coverer is, and can.
+        vm.prank(guardianC);
+        game.dispute(id, type(uint256).max);
+        assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Disputed), "the accused bought it");
+        assertEq(game.counterBondContributionOf(id, guardianC), game.challengeOf(id).bondWood, "and paid in full");
+        _assertLiveBondsBacked();
+    }
+
+    /// @notice The mirror for `epoch == 0`: standing is byte-for-byte what it
+    ///         always was, so the renewer of a LATER epoch cannot fund the
+    ///         defence of an epoch-0 accusation it is not part of.
+    function test_dispute_epochZeroStandingIsUnchanged() public {
+        _executeAndCover(PROPOSAL);
+        uint256 id = _fileDrawdown(PROPOSAL, 0);
+
+        vm.prank(guardianC);
+        vm.expectRevert(IChallengeGame.NotAccusedApprover.selector);
+        game.dispute(id, type(uint256).max);
+
+        vm.prank(guardianA);
+        game.dispute(id, type(uint256).max);
+        assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Disputed));
+    }
+
+    /// @notice A DELIBERATE, ARGUED PROPERTY rather than an accident, because
+    ///         widening what `_accused` can return is exactly the hazard this
+    ///         file has been bitten by before. `CoverageEpochs._coverers` is
+    ///         APPEND-ONLY, so an epoch's set can grow between filing and
+    ///         settlement but can never shrink — nobody accused at filing can
+    ///         escape, and a guardian that commits to a watch already under
+    ///         public challenge joins it. In production the growth window is
+    ///         empty anyway: renewal for epoch N closes `renewalLeadTime` BEFORE
+    ///         epoch N begins, and a breach cannot surface in an epoch that has
+    ///         not started, so the set is frozen by the time it is citable.
+    function test_file_accusedSetTracksLaterRenewalsAndNeverShrinks() public {
+        _executeAndCover(PROPOSAL);
+        uint256 id = _fileDrawdown(PROPOSAL, 1);
+        assertEq(game.accusedOf(id).length, 1);
+
+        // A second guardian joins epoch 1's watch after the filing.
+        epochs.setCoverers(address(gov), PROPOSAL, 1, _two(guardianC, guardianB));
+
+        address[] memory accused = game.accusedOf(id);
+        assertEq(accused.length, 2, "the watch grew, and the accusation grew with it");
+        assertEq(accused[0], guardianC, "and the original coverer did not escape");
+        assertEq(accused[1], guardianB);
+
+        vm.warp(_filedAt(id) + game.autoSlashDelay());
+        game.resolve(id);
+        assertEq(swood.lastApprovers().length, 2, "both stand the watch at settlement");
+    }
+
+    /// @notice A GOVERNANCE PRE-CONDITION THIS TASK CANNOT SATISFY ALONE, pinned
+    ///         so it is not discovered in production. `challengeWindow` defaults
+    ///         to 14 days and runs from EXECUTION, while an epoch is 28 days — so
+    ///         a breach surfacing in relative epoch 1 is unchallengeable under
+    ///         the default. Predicate-5 epoch citations require governance to
+    ///         raise the window past the epochs it must reach; the setter's
+    ///         ceiling is 90 days, which bounds how many epochs are reachable.
+    function test_file_epochCitationNeedsAWindowOutlivingTheEpoch() public {
+        _executeAndCover(PROPOSAL);
+        uint256 executedAt = _executedAt(PROPOSAL);
+
+        // One epoch later, with the default 14-day window, the filing is shut.
+        vm.warp(executedAt + 28 days);
+        vm.prank(challenger);
+        vm.expectRevert(IChallengeGame.WindowClosed.selector);
+        game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.DrawdownBreach, 1, ADAPTER, SELECTOR, EVIDENCE);
+
+        vm.prank(owner);
+        game.setChallengeWindow(60 days);
+        uint256 id = _fileDrawdown(PROPOSAL, 1);
+        assertEq(game.accusedOf(id)[0], guardianC, "reachable only once the window outlives the epoch");
+    }
+
+    /// @notice UNWIRING THE REGISTRY MUST NOT BRICK A LIVE CHALLENGE — the
+    ///         regression this task came closest to introducing. Reverting on
+    ///         the empty accused set everywhere (rather than only at `file`)
+    ///         reads as the safer choice and is not: `dispute` and `_settle`
+    ///         both resolve the accused set, so an owner unwiring mid-challenge
+    ///         would leave an epoch-scoped filing unable to be defended AND
+    ///         unable to be settled, with the coverage it froze pinned forever.
+    ///         That is the indefinite freeze D5's fail-safe exists to rule out,
+    ///         and it would have been NEW: the pre-Plan-F analogue — re-pointing
+    ///         `exposureLedger` — has always degraded to a zero-recovery settle
+    ///         instead. So an emptied set degrades identically here.
+    function test_resolve_unwiringMidChallengeDegradesRatherThanBricks() public {
+        _executeAndCover(PROPOSAL);
+        uint256 id = _fileDrawdown(PROPOSAL, 1);
+        assertTrue(ledger.isCoverageFrozen(address(gov), PROPOSAL), "the filing pinned the coverage");
+
+        vm.prank(owner);
+        game.setCoverageEpochs(address(0));
+
+        // No one has standing any more, and that is a refusal, not a revert loop.
+        vm.prank(guardianC);
+        vm.expectRevert(IChallengeGame.NotAccusedApprover.selector);
+        game.dispute(id, type(uint256).max);
+
+        // The challenge still reaches a terminal state, the freeze still lifts,
+        // and the bond still comes home — it simply recovers nothing.
+        uint256 challengerBefore = wood.balanceOf(challenger);
+        vm.warp(_filedAt(id) + game.autoSlashDelay());
+        game.resolve(id);
+
+        assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Settled), "not stuck");
+        assertEq(swood.lastApprovers().length, 0, "nobody was slashed, because nobody was covering");
+        assertEq(wood.balanceOf(challenger) - challengerBefore, game.challengeOf(id).bondWood, "bond returned");
+        assertFalse(ledger.isCoverageFrozen(address(gov), PROPOSAL), "and the coverage is not pinned forever");
+        _assertLiveBondsBacked();
+    }
+
+    // ── The registry wiring ──
+
+    function test_setCoverageEpochs_onlyOwner() public {
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(this)));
+        game.setCoverageEpochs(address(0xBEEF));
+    }
+
+    /// @notice The zero address is DELIBERATELY permitted, exactly as it is for
+    ///         `setCourt`: it is both the pre-Plan-F default and the off-switch.
+    ///         Unwiring can never cause a wrong slash — it only makes epoch
+    ///         citations unfileable.
+    function test_setCoverageEpochs_emitsAndAcceptsZero() public {
+        vm.expectEmit(true, true, true, true, address(game));
+        emit IChallengeGame.CoverageEpochsSet(address(epochs), address(0));
+        vm.prank(owner);
+        game.setCoverageEpochs(address(0));
+        assertEq(game.coverageEpochs(), address(0));
+    }
+
+    /// @notice The pre-filing derivation view, which is what makes the epoch-0
+    ///         definition auditable from OUTSIDE this contract — `CoverageEpochs`
+    ///         must mirror it exactly, and a mirror nobody can read is a mirror
+    ///         nobody can check.
+    function test_accusedFor_answersBeforeAnythingIsFiled() public {
+        _executeAndCover(PROPOSAL);
+
+        address[] memory zero = game.accusedFor(address(gov), PROPOSAL, IChallengeGame.Predicate.DrawdownBreach, 0);
+        assertEq(zero.length, 2);
+
+        address[] memory one = game.accusedFor(address(gov), PROPOSAL, IChallengeGame.Predicate.DrawdownBreach, 1);
+        assertEq(one.length, 1);
+        assertEq(one[0], guardianC);
+
+        // A released approver is not covering, so it is not accused — array
+        // membership in the ledger is not coverage, the non-zero share is.
+        ledger.releaseApproval(address(gov), PROPOSAL, guardianB);
+        address[] memory afterRelease =
+            game.accusedFor(address(gov), PROPOSAL, IChallengeGame.Predicate.DrawdownBreach, 0);
+        assertEq(afterRelease.length, 1);
+        assertEq(afterRelease[0], guardianA);
     }
 }

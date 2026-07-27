@@ -1,0 +1,643 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.28;
+
+import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import {ICoverageEpochs} from "./interfaces/ICoverageEpochs.sol";
+import {IPriceRouter} from "./interfaces/IPriceRouter.sol";
+import {IExposureLedger} from "./interfaces/IExposureLedger.sol";
+import {ISyndicateGovernor} from "./interfaces/ISyndicateGovernor.sol";
+
+/**
+ * @title CoverageEpochs
+ * @notice Per-strategy coverage epochs for the guardian economic-security model
+ *         (spec 2026-07-22 §3.4a). A cover pins a baseline NAV when a strategy
+ *         proposal executes; later tasks checkpoint NAV at each epoch boundary,
+ *         evaluate cumulative drawdown against the proposal's declared
+ *         envelope, accept renewal commitments for the next epoch, and flag an
+ *         un-renewable cover for wind-down.
+ *
+ *         The point of epochs is claims-made attribution: liability for a
+ *         drawdown breach attaches to the guardians covering the epoch the
+ *         breach SURFACES on, so no guardian is committed for longer than one
+ *         epoch plus the challenge window however long the strategy runs.
+ *
+ * @dev    NAV SOURCE — THE RULE THIS CONTRACT EXISTS TO HOLD (D1). Every NAV
+ *         read goes through `IPriceRouter.valueStrategy(strategy)` and fails
+ *         CLOSED when `instantOK == false`. `SyndicateVault.totalAssets()` is
+ *         never read, and must never be: it is `idle float + liveNav`, and the
+ *         vault's `_laneState()` deliberately leaves `liveNav` at ZERO whenever
+ *         the router cannot price the strategy —
+ *
+ *             try IPriceRouter(pr).valueStrategy(active) returns (uint256 v, bool ok) {
+ *                 if (ok) { liveNav = v; laneA = true; }
+ *             } catch {}
+ *
+ *         — which is correct for the vault (it falls back to a float-only NAV
+ *         and routes LP flow through the async queue) and catastrophic as a
+ *         checkpoint. A baseline or checkpoint taken from `totalAssets()`
+ *         during a router outage would record a ~100% loss, breach the
+ *         drawdown envelope, and expose honest guardians to a full slash over
+ *         an oracle hiccup. Refusing to act on an unpriceable strategy is the
+ *         only safe reading: D6 winds such a cover down rather than slashing
+ *         anyone for a number nobody could establish.
+ *
+ * @dev    NOT UPGRADEABLE (plain `Ownable2Step`), so the storage layout is
+ *         unconstrained and no golden pins it. Stated plainly rather than
+ *         implying a layout check covers it.
+ *
+ * @dev    HOLDS NO TOKENS AND MOVES NO FUNDS, EVER (D7). There is no transfer
+ *         surface, no `receive`, and no rescue path, because there is nothing
+ *         to rescue. Wind-down seizes nothing: it flags a cover so the
+ *         settlement path that already exists in `SyndicateGovernor` becomes
+ *         permissionlessly callable ahead of `strategyDuration`.
+ */
+contract CoverageEpochs is Ownable2Step, ICoverageEpochs {
+    /// @dev Basis-point denominator. Also the passive-mandate threshold: an
+    ///      envelope of exactly `10_000` declared the full notional as its
+    ///      bound, so it checkpoints but can never breach (D5).
+    uint256 internal constant BPS_DENOMINATOR = 10_000;
+
+    /// @notice The only NAV oracle this contract will consult (D1).
+    IPriceRouter public immutable priceRouter;
+
+    /// @notice Source of the epoch schedule, of the approver set behind epoch-0
+    ///         attribution, and of the aggregate exposure a renewal books.
+    /// @dev Must be the same ledger `ChallengeGame` reads: two ledgers would
+    ///      mean two different accused sets for one proposal.
+    IExposureLedger public immutable exposureLedger;
+
+    mapping(bytes32 coverKey => Cover) internal _covers;
+
+    /// @dev Boundary NAV per COVER-RELATIVE epoch (D8). Sparse on purpose: a
+    ///      boundary nobody checkpointed stays EMPTY forever (D4). Back-filling
+    ///      it later with a NAV read today would invent an observation for a
+    ///      period nobody watched, and would stamp `breachEpoch` with the wrong
+    ///      epoch's coverers — the one thing claims-made attribution exists to
+    ///      get right.
+    mapping(bytes32 coverKey => mapping(uint256 epoch => uint256 nav)) internal _nav;
+
+    /// @dev Whether `epoch`'s boundary was checkpointed. Separate from `_nav`
+    ///      because a NAV of zero is a legal reading, and "unobserved" must
+    ///      never be confused with "worthless".
+    mapping(bytes32 coverKey => mapping(uint256 epoch => bool)) internal _checkpointed;
+
+    /// @dev The most recent checkpointed NAV — the numerator of the drawdown.
+    ///      The denominator is always `baselineNav` (D4).
+    mapping(bytes32 coverKey => uint256 nav) internal _lastNav;
+
+    /// @dev Guardians who committed to cover a COVER-RELATIVE epoch (D8).
+    mapping(bytes32 coverKey => mapping(uint256 epoch => address[])) internal _coverers;
+
+    /// @dev Membership flag for the list above. Load-bearing rather than
+    ///      defensive: `ExposureLedger.recordApproval` is idempotent (it absorbs
+    ///      an approve→block→approve round trip), so without this a second
+    ///      `commitRenewal` would silently succeed and push a duplicate coverer
+    ///      into the accused set.
+    mapping(bytes32 coverKey => mapping(uint256 epoch => mapping(address guardian => bool))) internal _committed;
+
+    /// @dev The proposal's ORIGINAL approvers, snapshotted at `openCover`.
+    ///
+    ///      Load-bearing, and the reason is not obvious. `commitRenewal` books a
+    ///      renewal through `exposureLedger.recordApproval` under the SAME
+    ///      `proposalId`, so a renewer joins `approversOf(governor, proposalId)`
+    ///      with a non-zero share and is indistinguishable, on a live ledger
+    ///      read, from someone who backed the proposal at vote time. Without
+    ///      this snapshot a guardian who first committed at relative epoch 3
+    ///      answers for relative epoch 0 — claims-made attribution inverted, the
+    ///      open-ended liability §3.4a ends arriving from the opposite
+    ///      direction.
+    ///
+    ///      It is an AND, never a replacement for the ledger read (see
+    ///      `coverersOf`), and it does not exclude anyone: §3.4a expects
+    ///      incumbents to roll over, so an original approver who ALSO renews
+    ///      stays liable for BOTH watches. The flag says "was here at open", not
+    ///      "never renewed".
+    ///
+    ///      Populated from the FILTERED set (non-zero `committedUsd`), so a
+    ///      guardian that had already released before the cover opened cannot be
+    ///      readmitted to epoch 0 later by renewing — a renewal would restore
+    ///      its ledger share and the live read alone would let it back in.
+    ///
+    ///      `openCover` cannot miss a renewer's write: `commitRenewal` reverts
+    ///      `NotOpened` until this snapshot exists, so no renewal can precede it.
+    mapping(bytes32 coverKey => mapping(address guardian => bool)) internal _originalApprover;
+
+    /// @notice How far ahead of an epoch boundary renewal closes (spec §3.4a).
+    /// @dev Default 3 days against the shipped 28-day epoch. The bound in
+    ///      `setRenewalLeadTime` is `epochLength / 2`, and `ExposureLedger`'s
+    ///      constructor already forces `epochLength >= challengeWindow` (14 days
+    ///      at launch), so this default can never start out of bounds.
+    uint256 public renewalLeadTime = 3 days;
+
+    /// @notice How long a missed boundary checkpoint may be retried before the
+    ///         cover is wound down (D6).
+    /// @dev Default 7 days against the shipped 28-day epoch. The bound in
+    ///      `setCheckpointGrace` is `epochLength` exclusive, and `ExposureLedger`
+    ///      already forces `epochLength >= challengeWindow` (14 days at launch),
+    ///      so this default can never start out of bounds.
+    uint256 public checkpointGrace = 7 days;
+
+    /// @param initialOwner    owner of the parameter setters later tasks add
+    /// @param priceRouter_    the router the vault's Lane A already trusts
+    /// @param exposureLedger_ the ledger `ChallengeGame` reads
+    constructor(address initialOwner, address priceRouter_, address exposureLedger_) Ownable(initialOwner) {
+        if (priceRouter_ == address(0) || exposureLedger_ == address(0)) revert ZeroAddress();
+        priceRouter = IPriceRouter(priceRouter_);
+        exposureLedger = IExposureLedger(exposureLedger_);
+    }
+
+    // ── Cover lifecycle ──
+
+    /// @inheritdoc ICoverageEpochs
+    function openCover(address governor, uint256 proposalId) external {
+        bytes32 key = _coverKey(governor, proposalId);
+        Cover storage c = _covers[key];
+        if (c.opened) revert AlreadyOpened();
+
+        ISyndicateGovernor.StrategyProposal memory p = ISyndicateGovernor(governor).getProposal(proposalId);
+        if (p.state != ISyndicateGovernor.ProposalState.Executed) revert NotExecuted();
+        if (p.strategy == address(0)) revert NoStrategy();
+
+        // D1: the router, never totalAssets() — a router outage reports
+        // float-only NAV, which as a baseline would fabricate a ~100% loss and
+        // slash honest guardians for an oracle hiccup. A cover whose
+        // denominator cannot be established must not open at all: every later
+        // drawdown would be measured against a fiction.
+        (uint256 nav, bool ok) = priceRouter.valueStrategy(p.strategy);
+        if (!ok) revert NavUnavailable();
+
+        c.governor = governor;
+        c.proposalId = proposalId;
+        c.strategy = p.strategy;
+        // D2: the baseline is what was actually READ, here and now. `openCover`
+        // is permissionless and may land blocks after execution, so stamping
+        // `executedAt` would back-date a number nobody observed.
+        c.openedAt = uint64(block.timestamp);
+        // D3: copy the schedule rather than re-reading the ledger on every
+        // call. `epochLength` is immutable today, but reading it once means a
+        // future ledger re-point cannot retroactively re-slice this cover.
+        c.epochLength = uint64(exposureLedger.epochLength());
+        c.epochGenesis = uint64(exposureLedger.epochGenesis());
+        c.maxDrawdownBps = p.maxDrawdownBps;
+        c.baselineNav = nav;
+        c.opened = true;
+
+        // Pin WHO the original approvers were, before any renewal can dilute the
+        // answer. `commitRenewal` books through `recordApproval` under this same
+        // `proposalId`, so from here on the ledger's approver list is "approvers
+        // ∪ renewers" and a live read alone can no longer tell relative epoch 0's
+        // watch from a later one. Filtered on a non-zero share for the same
+        // reason `coverersOf` filters: a guardian already released at open backed
+        // nothing, and must not be able to renew its way back into epoch 0.
+        (address[] memory approvers, uint256[] memory committedUsd) = exposureLedger.approversOf(governor, proposalId);
+        for (uint256 i = 0; i < approvers.length; i++) {
+            if (committedUsd[i] != 0) _originalApprover[key][approvers[i]] = true;
+        }
+
+        emit CoverOpened(key, governor, proposalId, p.strategy, nav, p.maxDrawdownBps);
+    }
+
+    /// @inheritdoc ICoverageEpochs
+    function checkpoint(address governor, uint256 proposalId) external {
+        bytes32 key = _coverKey(governor, proposalId);
+        Cover storage c = _covers[key];
+        // Before this guard `c.epochLength` is zero and `_epochAt` would panic
+        // on the division; an unopened cover has no schedule to be at a
+        // boundary of.
+        if (!c.opened) revert NotOpened();
+
+        // An epoch's boundary is the START of the following epoch, so the first
+        // boundary this cover can close is `_boundary(c, openEpoch + 1)`. A
+        // cover cannot close an epoch that ended before it existed: one opened
+        // mid-epoch waits for its own epoch's boundary, never back-filling the
+        // epochs the ledger's absolute schedule already ran through.
+        // `_globalBoundary(c, 1)` is the start of the cover's own relative epoch
+        // 1 on the ledger's global grid — single-sourced with the renewal
+        // deadline so the two can never drift apart.
+        if (block.timestamp < _globalBoundary(c, 1)) revert BoundaryNotReached();
+
+        // The epoch being closed is the one whose boundary just passed — not a
+        // cursor position. Filing a NAV read today under an older, skipped
+        // epoch would invent an observation for a period nobody watched and
+        // stamp `breachEpoch` with an epoch the breach did not surface on. D4
+        // is explicit that a missed boundary simply stays uncheckpointed.
+        //
+        // D8: the INDEX is cover-relative even though the BOUNDARY above is
+        // global. `_relativeEpoch` is at least 1 here — the guard just proved
+        // the cover's own first boundary has passed — so the subtraction cannot
+        // underflow.
+        uint256 due = _relativeEpoch(c, block.timestamp) - 1;
+        if (_checkpointed[key][due]) revert AlreadyCheckpointed();
+
+        // D1: the router, never totalAssets(). A router outage reports a
+        // float-only NAV whose `liveNav` is silently zero — recorded as a
+        // checkpoint that is a ~100% loss, and the epoch's coverers get slashed
+        // over an oracle hiccup. Refuse instead; D6 winds down a cover that
+        // stays unpriceable past the grace window.
+        (uint256 nav, bool ok) = priceRouter.valueStrategy(c.strategy);
+        if (!ok) revert NavUnavailable();
+
+        _nav[key][due] = nav;
+        _checkpointed[key][due] = true;
+        _lastNav[key] = nav;
+        c.lastCheckpointedEpoch = uint64(due);
+
+        uint256 lossBps = cumulativeLossBps(governor, proposalId);
+        emit Checkpointed(key, due, nav, lossBps);
+
+        // D5: a passive mandate (envelope 10_000) declared the full notional as
+        // its bound. It checkpoints so §6 monitoring sees the NAV, but it can
+        // never breach. The early return is deliberate rather than leaning on
+        // `lossBps > 10_000` being unreachable: that would be the same
+        // behaviour by accident, and a later change to how loss is computed
+        // could silently make it reachable.
+        if (c.maxDrawdownBps >= BPS_DENOMINATOR) return;
+
+        // Strictly greater. A mandate that declared a 20% envelope is permitted
+        // to lose exactly 20%; only a loss beyond the declared bound is the
+        // breach predicate 5 exists for.
+        //
+        // `!c.breached` latches the FIRST breach. Liability is claims-made: it
+        // attaches to the guardians covering the epoch the breach SURFACED on,
+        // so a later, deeper checkpoint must not re-point `breachEpoch` at a
+        // different epoch's coverers.
+        if (lossBps > c.maxDrawdownBps && !c.breached) {
+            c.breached = true;
+            c.breachEpoch = uint64(due); // cover-relative (D8)
+            emit DrawdownBreached(key, due, lossBps, c.maxDrawdownBps);
+        }
+    }
+
+    // ── Renewal ──
+
+    /// @inheritdoc ICoverageEpochs
+    function commitRenewal(address governor, uint256 proposalId, uint256 epoch) external {
+        bytes32 key = _coverKey(governor, proposalId);
+        Cover storage c = _covers[key];
+        if (!c.opened) revert NotOpened();
+        // A cover already unwinding must not accept new commitments: the
+        // strategy is on its way out, and a guardian booking exposure against it
+        // would be underwriting a watch that will never be stood.
+        if (c.windDown) revert WoundDown();
+        // Relative epoch 0 is the watch the cover OPENED on, covered by the
+        // original approvers through the ledger. A "renewal" of it would create
+        // a second, contradictory notion of who covered epoch 0.
+        if (epoch == 0) revert InvalidParameter();
+        // The sequencing guard. Strictly before the deadline, which itself sits
+        // `renewalLeadTime` before the boundary — see `renewalDeadline` for what
+        // this closes (the discontinuous jump) and what it does not (drift).
+        if (block.timestamp >= renewalDeadline(governor, proposalId, epoch)) revert RenewalClosed();
+        if (_committed[key][epoch][msg.sender]) revert AlreadyCommitted();
+
+        _committed[key][epoch][msg.sender] = true;
+        _coverers[key][epoch].push(msg.sender);
+
+        // The commitment books REAL exposure against the same aggregate cap a
+        // fresh approval consumes, so a guardian without capacity cannot renew.
+        // This reverts (`ExposureCapExceeded`) rather than silently under-
+        // booking when the guardian's bond is already fully spoken for, which
+        // unwinds the two writes above.
+        exposureLedger.recordApproval(governor, proposalId, msg.sender);
+
+        emit RenewalCommitted(key, epoch, msg.sender);
+    }
+
+    /// @inheritdoc ICoverageEpochs
+    function renewalDeadline(address governor, uint256 proposalId, uint256 epoch) public view returns (uint256) {
+        Cover storage c = _covers[_coverKey(governor, proposalId)];
+        // Without this guard `epochGenesis` and `epochLength` are zero, the
+        // boundary is zero, and the subtraction below panics on underflow.
+        if (!c.opened) revert NotOpened();
+        return _globalBoundary(c, epoch) - renewalLeadTime;
+    }
+
+    /// @inheritdoc ICoverageEpochs
+    function renewalCoverersOf(address governor, uint256 proposalId, uint256 epoch)
+        external
+        view
+        returns (address[] memory)
+    {
+        return _coverers[_coverKey(governor, proposalId)][epoch];
+    }
+
+    // ── Forced wind-down ──
+
+    /// @inheritdoc ICoverageEpochs
+    /// @dev §3.4a's clearinghouse close-out rule: expiring coverage converts into
+    ///      an orderly exit, never a gap.
+    ///
+    ///      D7 — THIS SEIZES NOTHING AND MOVES NO FUNDS. It writes one bool. All
+    ///      the unwinding is done by `SyndicateGovernor`'s existing settlement
+    ///      path, which the flag makes permissionlessly callable ahead of
+    ///      `strategyDuration`. There is deliberately no transfer surface here to
+    ///      make that impossible to get wrong later.
+    ///
+    ///      D8 — EVERY INDEX BELOW IS COVER-RELATIVE while every boundary stays
+    ///      on the ledger's global grid. The plan's own sketch read `_epochAt`
+    ///      (absolute) as the epoch now beginning and `_boundary` (absolute) as
+    ///      its start; both are wrong here and neither reverts. An absolute
+    ///      `nowEpoch` would look up `_coverers` under an index no renewal was
+    ///      ever filed at, so a fully covered strategy would wind down; it would
+    ///      also read `_checkpointed` under an index no checkpoint is ever filed
+    ///      at, so a cover checkpointed on time would go stale anyway; and it
+    ///      would never be zero for a cover opened in a non-zero absolute epoch,
+    ///      so the `BoundaryNotReached` guard would stop guarding.
+    function flagWindDown(address governor, uint256 proposalId) external {
+        bytes32 key = _coverKey(governor, proposalId);
+        Cover storage c = _covers[key];
+        // Before this guard `c.epochLength` is zero and `_epochAt` panics on the
+        // division; an unopened cover has nothing to unwind.
+        if (!c.opened) revert NotOpened();
+        // Latching. Re-flagging changes nothing on-chain but would emit a second
+        // `WindDownFlagged` for the same cover, and watchtowers key off it.
+        if (c.windDown) revert AlreadyWoundDown();
+
+        uint256 nowEpoch = _relativeEpoch(c, block.timestamp);
+        // Relative epoch 0 is the watch the cover OPENED on. No boundary has
+        // passed, so there is no epoch "now beginning" that could be uncovered
+        // and no closed epoch that could be stale. The subtraction below would
+        // also underflow.
+        if (nowEpoch == 0) revert BoundaryNotReached();
+
+        // Trigger 1. Nobody stood the watch that just began. `coverersOf` answers
+        // with an EMPTY set for such an epoch instead of falling back to relative
+        // epoch 0's approvers — re-accusing them for a watch nobody stood is
+        // exactly the open-ended liability §3.4a ends — so the state has to land
+        // somewhere, and it lands here. Read from `_coverers` rather than
+        // `coverersOf` because relative epoch 0's answer comes from the ledger
+        // and can never be the epoch now BEGINNING.
+        bool uncovered = _coverers[key][nowEpoch].length == 0;
+
+        // Trigger 2 (D6). A strategy whose value cannot be established cannot be
+        // underwritten. `checkpoint` fails closed on `instantOK == false` (D1),
+        // so a router outage leaves the closed epoch unrecorded; the grace is the
+        // window in which that call may still be retried. Strictly `>` so the
+        // last second of the grace is still inside it. `_globalBoundary(c,
+        // nowEpoch)` is where the closed epoch ENDED — the same conversion
+        // `renewalDeadline` uses, so the two can never drift apart.
+        bool stale =
+            !_checkpointed[key][nowEpoch - 1] && block.timestamp > _globalBoundary(c, nowEpoch) + checkpointGrace;
+
+        if (!uncovered && !stale) revert StillCovered();
+
+        c.windDown = true;
+        emit WindDownFlagged(key, nowEpoch, uncovered, stale);
+    }
+
+    /// @inheritdoc ICoverageEpochs
+    function windDownRequired(address governor, uint256 proposalId) external view returns (bool) {
+        return _covers[_coverKey(governor, proposalId)].windDown;
+    }
+
+    // ── Claims-made attribution ──
+
+    /// @inheritdoc ICoverageEpochs
+    /// @dev §3.4a's whole point, and the function `ChallengeGame` asks for
+    ///      predicate 5. Liability attaches to the watch a breach SURFACED on,
+    ///      so a guardian is never committed for longer than one epoch plus the
+    ///      challenge window however long the strategy runs.
+    ///
+    ///      `epoch` is COVER-RELATIVE (D8). Relative 0 is the watch the cover
+    ///      opened on; everything above it delegates to the renewal list, which
+    ///      `commitRenewal` already keys relatively. Re-deriving the index here
+    ///      would be a second chance to read a relative argument as an absolute
+    ///      one — the exact bug D8 exists to name.
+    function coverersOf(address governor, uint256 proposalId, uint256 epoch) public view returns (address[] memory) {
+        bytes32 key = _coverKey(governor, proposalId);
+
+        // Any epoch past the first is covered by its RENEWERS and by nobody
+        // else. Falling back to epoch 0's approvers for an unrenewed epoch would
+        // reinstate exactly the open-ended liability epochs exist to end, so an
+        // empty set is the answer: an unrenewed epoch is a wind-down condition
+        // (D6/Task 6), not a liability one.
+        if (epoch != 0) return _coverers[key][epoch];
+
+        // Relative epoch 0's coverers are the proposal's original approvers, and
+        // the answer takes BOTH tests below — neither alone is correct.
+        //
+        // 1. THE LIVE LEDGER READ, non-zero `committedUsd`. This is
+        //    `ChallengeGame._accused`'s filter, and it must stay that way:
+        //    `ExposureLedger.releaseApproval` keeps a released guardian in
+        //    `_approversOf` with a ZEROED share instead of dropping it (so
+        //    callers can see the full historical set), which is why array
+        //    membership is not coverage and the non-zero test is. Reading it
+        //    live rather than freezing an array at open is what makes a guardian
+        //    that releases drop out of epoch 0 DYNAMICALLY.
+        //
+        // 2. `_originalApprover`, snapshotted at `openCover`. The live read on
+        //    its own is not "who backed this proposal" any more: `commitRenewal`
+        //    books renewals through `recordApproval` under the SAME
+        //    `proposalId`, so the ledger's list grows to include renewers and a
+        //    guardian whose first commitment was relative epoch 3 would be
+        //    returned as a coverer of relative epoch 0.
+        //
+        // The conjunction is deliberately not "excluded anyone who renewed":
+        // §3.4a expects incumbents to roll over, and a rolled-over incumbent is
+        // liable for its own watch AND its renewed one. Test 2 asks where a
+        // guardian STARTED, never whether it continued.
+        //
+        // Two passes because the output length must be known before allocation.
+        (address[] memory all, uint256[] memory committedUsd) = exposureLedger.approversOf(governor, proposalId);
+        uint256 n;
+        for (uint256 i = 0; i < all.length; i++) {
+            if (committedUsd[i] != 0 && _originalApprover[key][all[i]]) n++;
+        }
+        address[] memory out = new address[](n);
+        uint256 j;
+        for (uint256 i = 0; i < all.length; i++) {
+            if (committedUsd[i] == 0 || !_originalApprover[key][all[i]]) continue;
+            out[j] = all[i];
+            j++;
+        }
+        return out;
+    }
+
+    /// @inheritdoc ICoverageEpochs
+    function isOriginalApprover(address governor, uint256 proposalId, address guardian) external view returns (bool) {
+        return _originalApprover[_coverKey(governor, proposalId)][guardian];
+    }
+
+    /// @inheritdoc ICoverageEpochs
+    function hasCommittedRenewal(address governor, uint256 proposalId, uint256 epoch, address guardian)
+        external
+        view
+        returns (bool)
+    {
+        return _committed[_coverKey(governor, proposalId)][epoch][guardian];
+    }
+
+    // ── Owner setters ──
+
+    /// @inheritdoc ICoverageEpochs
+    function setRenewalLeadTime(uint256 newLeadTime) external onlyOwner {
+        // Read live rather than from a cover: this is one global parameter, and
+        // `ExposureLedger.epochLength` is immutable, so there is no schedule to
+        // pin per D3.
+        if (newLeadTime == 0 || newLeadTime > exposureLedger.epochLength() / 2) revert InvalidParameter();
+        emit RenewalLeadTimeSet(renewalLeadTime, newLeadTime);
+        renewalLeadTime = newLeadTime;
+    }
+
+    /// @inheritdoc ICoverageEpochs
+    function setCheckpointGrace(uint256 newGrace) external onlyOwner {
+        // Strictly below an epoch. At or beyond `epochLength` the NEXT boundary
+        // always arrives before the grace expires, `nowEpoch` advances, and the
+        // stale test moves to a different (also un-elapsed) epoch — D6 would be
+        // silently deleted rather than merely loosened. Read live for the same
+        // reason `setRenewalLeadTime` does: this is one global parameter and
+        // `ExposureLedger.epochLength` is immutable, so there is no per-cover
+        // schedule to pin per D3.
+        if (newGrace == 0 || newGrace >= exposureLedger.epochLength()) revert InvalidParameter();
+        emit CheckpointGraceSet(checkpointGrace, newGrace);
+        checkpointGrace = newGrace;
+    }
+
+    // ── Views ──
+
+    /// @inheritdoc ICoverageEpochs
+    function navAt(address governor, uint256 proposalId, uint256 epoch) external view returns (uint256) {
+        return _nav[_coverKey(governor, proposalId)][epoch];
+    }
+
+    /// @inheritdoc ICoverageEpochs
+    function cumulativeLossBps(address governor, uint256 proposalId) public view returns (uint256) {
+        bytes32 key = _coverKey(governor, proposalId);
+        Cover storage c = _covers[key];
+        if (!c.opened || c.baselineNav == 0) return 0;
+        // No checkpoint yet means no observation. `_lastNav` defaults to zero,
+        // and reading that default as a NAV would report a fabricated 100%
+        // drawdown on a cover that has simply never been checkpointed — the
+        // same trap as D1, in view form. `lastCheckpointedEpoch` only ever
+        // names an epoch that was actually recorded, so this is exact even for
+        // a cover whose one checkpoint was epoch 0.
+        if (!_checkpointed[key][c.lastCheckpointedEpoch]) return 0;
+        uint256 last = _lastNav[key];
+        if (last >= c.baselineNav) return 0;
+        // D4: the denominator is the BASELINE, not the previous checkpoint. An
+        // epoch-over-epoch measure would let a missed call re-baseline against
+        // a depressed NAV and read a 30% drawdown as 0%.
+        return ((c.baselineNav - last) * BPS_DENOMINATOR) / c.baselineNav;
+    }
+
+    /// @inheritdoc ICoverageEpochs
+    function coverOf(address governor, uint256 proposalId) external view returns (Cover memory) {
+        return _covers[_coverKey(governor, proposalId)];
+    }
+
+    /// @inheritdoc ICoverageEpochs
+    function baselineNavOf(address governor, uint256 proposalId) external view returns (uint256) {
+        return _covers[_coverKey(governor, proposalId)].baselineNav;
+    }
+
+    /// @inheritdoc ICoverageEpochs
+    function epochLengthOf(address governor, uint256 proposalId) external view returns (uint64) {
+        return _covers[_coverKey(governor, proposalId)].epochLength;
+    }
+
+    /// @inheritdoc ICoverageEpochs
+    function epochGenesisOf(address governor, uint256 proposalId) external view returns (uint64) {
+        return _covers[_coverKey(governor, proposalId)].epochGenesis;
+    }
+
+    /// @inheritdoc ICoverageEpochs
+    function maxDrawdownBpsOf(address governor, uint256 proposalId) external view returns (uint16) {
+        return _covers[_coverKey(governor, proposalId)].maxDrawdownBps;
+    }
+
+    /// @inheritdoc ICoverageEpochs
+    function breached(address governor, uint256 proposalId) external view returns (bool) {
+        return _covers[_coverKey(governor, proposalId)].breached;
+    }
+
+    /// @inheritdoc ICoverageEpochs
+    function breachEpochOf(address governor, uint256 proposalId) external view returns (uint64) {
+        return _covers[_coverKey(governor, proposalId)].breachEpoch;
+    }
+
+    /// @inheritdoc ICoverageEpochs
+    function relativeEpochNow(address governor, uint256 proposalId) external view returns (uint256) {
+        Cover storage c = _covers[_coverKey(governor, proposalId)];
+        // Without this guard `epochLength` is zero and `_epochAt` panics on the
+        // division. An unopened cover has no schedule to be positioned on.
+        if (!c.opened) revert NotOpened();
+        return _relativeEpoch(c, block.timestamp);
+    }
+
+    /// @inheritdoc ICoverageEpochs
+    function isOpen(address governor, uint256 proposalId) external view returns (bool) {
+        return _covers[_coverKey(governor, proposalId)].opened;
+    }
+
+    /// @inheritdoc ICoverageEpochs
+    function coverKey(address governor, uint256 proposalId) external pure returns (bytes32) {
+        return _coverKey(governor, proposalId);
+    }
+
+    // ── Internal ──
+
+    /// @dev Same derivation as `ChallengeGame._reviewKey`, `ExposureLedger` and
+    ///      `GuardianRegistry`, so a proposal has ONE identity across the whole
+    ///      economic-security stack.
+    function _coverKey(address governor, uint256 proposalId) internal pure returns (bytes32) {
+        return keccak256(abi.encode(governor, proposalId));
+    }
+
+    /// @dev Start of epoch `epoch`, which is also the BOUNDARY of epoch
+    ///      `epoch - 1`. Uses the schedule copied onto the cover at open (D3),
+    ///      never a fresh read of the ledger: a ledger re-point must not
+    ///      retroactively re-slice a live strategy's epochs.
+    function _boundary(Cover storage c, uint256 epoch) internal view returns (uint256) {
+        return uint256(c.epochGenesis) + epoch * uint256(c.epochLength);
+    }
+
+    /// @dev Epoch containing `timestamp` on the cover's copied schedule.
+    ///      Callers must have checked `c.opened`, which is what guarantees a
+    ///      non-zero `epochLength` and a `epochGenesis` in the past.
+    function _epochAt(Cover storage c, uint256 timestamp) internal view returns (uint256) {
+        return (timestamp - uint256(c.epochGenesis)) / uint256(c.epochLength);
+    }
+
+    /// @dev D8 — the epoch index EVERY external surface speaks in: the ledger's
+    ///      absolute epoch minus the absolute epoch the cover opened in, so this
+    ///      cover's own first watch is 0.
+    ///
+    ///      Boundaries deliberately stay absolute (`_boundary`/`_epochAt` are
+    ///      untouched). `ExposureLedger`'s exposure buckets expire on the global
+    ///      grid, and a guardian's commitment expiring together with its bucket
+    ///      is the entire mechanism; re-slicing the grid per cover would
+    ///      desynchronise the two. Only the LABEL is cover-relative.
+    ///
+    ///      The distinction is invisible in a fixture that deploys the ledger
+    ///      and opens the cover in the same block — `epochGenesis` is ledger
+    ///      DEPLOY time, so in production a cover opens in absolute epoch
+    ///      40-something and an absolute index would be meaningless to anyone
+    ///      reading `breachEpoch`.
+    ///
+    ///      `timestamp` must be at or after `c.openedAt`; every caller either
+    ///      passes `block.timestamp` on an opened cover or has already cleared a
+    ///      boundary guard.
+    function _relativeEpoch(Cover storage c, uint256 timestamp) internal view returns (uint256) {
+        return _epochAt(c, timestamp) - _epochAt(c, uint256(c.openedAt));
+    }
+
+    /// @dev D8's OTHER direction, and the conversion this contract is most
+    ///      likely to get wrong. `_relativeEpoch` turns a global timestamp into
+    ///      a cover-relative label; this turns a cover-relative label back into
+    ///      the global timestamp that epoch STARTS at — which is also the
+    ///      boundary of relative epoch `relativeEpoch - 1`.
+    ///
+    ///      Every epoch index crossing this contract's API is cover-relative,
+    ///      but boundaries must stay on the ledger's global grid: a guardian's
+    ///      renewal commitment expiring together with the `ExposureLedger`
+    ///      bucket it booked into is the entire mechanism. Reading a relative
+    ///      index as an absolute one desynchronises the two, and it does not
+    ///      revert — a cover opened in absolute epoch 3 would get its relative
+    ///      epoch-1 deadline three epochs in the PAST, refuse every renewal as
+    ///      already closed, and wind down for a reason nobody could see. That
+    ///      silence is why it is worth a named helper.
+    ///
+    ///      Callers must have checked `c.opened` (non-zero `epochLength`).
+    function _globalBoundary(Cover storage c, uint256 relativeEpoch) internal view returns (uint256) {
+        return _boundary(c, relativeEpoch + _epochAt(c, uint256(c.openedAt)));
+    }
+}

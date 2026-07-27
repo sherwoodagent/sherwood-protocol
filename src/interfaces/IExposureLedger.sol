@@ -28,11 +28,26 @@ interface IExposureLedger {
     event ExposureReleased(address indexed guardian, bytes32 indexed reviewKey, uint256 usd, uint256 epoch);
     event ParameterChangeFinalized(bytes32 indexed paramKey, uint256 oldValue, uint256 newValue);
     event CoverageFreezerSet(address indexed oldFreezer, address indexed newFreezer);
+    event RenewalAgentSet(address indexed oldAgent, address indexed newAgent);
     event CoverageFrozenSet(address indexed governor, uint256 indexed proposalId, bool frozen);
 
-    // ── Registry-only mutations ──
+    // ── Gated mutations ──
+    /// @notice Book a guardian's share of a proposal's coverage against its
+    ///         aggregate cap. Callable by the guardian registry (an approve
+    ///         vote) OR the renewal agent (a §3.4a epoch renewal) — both are
+    ///         commitments to cover the same proposal, so both must consume the
+    ///         same budget. Reverts `NotGuardianRegistry` for anyone else.
     function recordApproval(address governor, uint256 proposalId, address guardian) external;
+    /// @notice Registry-only, deliberately NOT widened to the renewal agent.
+    ///         Booking coverage and freeing someone else's coverage are
+    ///         different powers: a renewal agent that could release would be
+    ///         able to recycle a bond that is still answerable for a live
+    ///         proposal.
     function releaseApproval(address governor, uint256 proposalId, address guardian) external;
+
+    // ── Renewal agent (CoverageEpochs, spec §3.4a) ──
+    function setRenewalAgent(address agent) external;
+    function renewalAgent() external view returns (address);
 
     // ── Governor-consumed checks (view) ──
     function requireWithinCoveredTvlCap(address asset, uint256 requiredCoverage) external view;
@@ -63,6 +78,11 @@ interface IExposureLedger {
     function currentEpoch() external view returns (uint256);
     function woodUsdPriceX8() external view returns (uint256);
     function epochLength() external view returns (uint256);
+    /// @notice Timestamp epoch 0 began, pinned at deploy. Paired with
+    ///         `epochLength` this is the entire epoch schedule, which
+    ///         `CoverageEpochs` copies onto a cover at open (spec §3.4a, D3) so
+    ///         a future ledger re-point cannot re-slice a live cover's epochs.
+    function epochGenesis() external view returns (uint256);
     function challengeWindow() external view returns (uint256);
     function kNumerator() external view returns (uint256);
     function coveredTvlCapUsd() external view returns (uint256);

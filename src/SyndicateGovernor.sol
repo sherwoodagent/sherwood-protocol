@@ -8,6 +8,7 @@ import {IGuardianRegistry} from "./interfaces/IGuardianRegistry.sol";
 import {ITierRegistry} from "./interfaces/ITierRegistry.sol";
 import {IExposureLedger} from "./interfaces/IExposureLedger.sol";
 import {IProposerBondEscrow} from "./interfaces/IProposerBondEscrow.sol";
+import {ICoverageEpochs} from "./interfaces/ICoverageEpochs.sol";
 import {IStrategy} from "./interfaces/IStrategy.sol";
 import {GovernorParameters} from "./GovernorParameters.sol";
 import {GovernorEmergency} from "./GovernorEmergency.sol";
@@ -147,6 +148,20 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///         skips bond locking. Wired via `setBondEscrow` (factory-only).
     address internal _bondEscrow;
 
+    /// @notice Coverage epochs (Plan F, spec §3.4a). Optional: address(0) leaves
+    ///         `settleProposal`'s caller/timing gate EXACTLY as it was before
+    ///         Plan F — the pre-epochs safe default every already-deployed
+    ///         governor is in. Wired post-init via `setCoverageEpochs`
+    ///         (factory-only, like `setExposureLedger`).
+    /// @dev APPEND-ONLY, carved from the FRONT of `__gap` (31 -> 30). This
+    ///      contract sits behind a beacon whose layout is pinned by
+    ///      `script/syndicate-governor-layout.golden.json` and by
+    ///      `test/governor/GovernorLayoutPins.t.sol`: every field above keeps its
+    ///      slot, this one claims a reserved slot (61), and both pins are updated
+    ///      in the same commit. Inserting rather than appending would silently
+    ///      corrupt every live governor on the next beacon upgrade.
+    address internal _coverageEpochs;
+
     /// @dev Reserved storage for future upgrades (shrunk by 1 for _guardianRegistry,
     ///      shrunk by 1 more for openProposalCount,
     ///      shrunk by 1 more for _unclaimedFees,
@@ -159,8 +174,9 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      to GuardianRegistry,
     ///      shrunk by 1 for _draftTimingSnap — Sherlock #14 restored,
     ///      shrunk by 1 for _tierRegistry — Task 5,
-    ///      shrunk by 2 for _exposureLedger + _bondEscrow — Plan B Task 8)
-    uint256[31] private __gap;
+    ///      shrunk by 2 for _exposureLedger + _bondEscrow — Plan B Task 8,
+    ///      shrunk by 1 for _coverageEpochs — Plan F Task 6)
+    uint256[30] private __gap;
 
     /// @param minVotingPeriod_   Per-deployment floor for `votingPeriod` (mainnet 24h).
     /// @param minCooldownPeriod_ Per-deployment floor for `cooldownPeriod` (mainnet 1h).
@@ -469,10 +485,26 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         StrategyProposal storage proposal = _proposals[proposalId];
         if (_commitState(proposal) != ProposalState.Executed) revert ProposalNotExecuted();
 
-        uint256 minWait =
-            msg.sender == proposal.proposer ? MIN_STRATEGY_DURATION_BEFORE_SELF_SETTLE : proposal.strategyDuration;
-        if (block.timestamp < proposal.executedAt + minWait) {
-            revert StrategyDurationNotElapsed();
+        // Spec §3.4a (Plan F): a strategy nobody renewed, or one whose NAV cannot
+        // be established, unwinds at the epoch boundary rather than running
+        // uncovered to term. Wind-down therefore makes settle PERMISSIONLESS
+        // IMMEDIATELY — an uninsurable strategy must not have to sit out its full
+        // `strategyDuration` while no guardian is answerable for it.
+        //
+        // NULL-SAFE BY CONSTRUCTION: an unwired `_coverageEpochs` short-circuits
+        // before the external call, so the gate below is byte-for-byte the
+        // pre-Plan-F one. Every governor already deployed is in that state.
+        //
+        // This drops the CALLER/TIMING gate and nothing else: the `Executed`
+        // check above still stands, and the settlement calls still run under the
+        // same `maxCapital` cap.
+        address epochs = _coverageEpochs;
+        if (epochs == address(0) || !ICoverageEpochs(epochs).windDownRequired(address(this), proposalId)) {
+            uint256 minWait =
+                msg.sender == proposal.proposer ? MIN_STRATEGY_DURATION_BEFORE_SELF_SETTLE : proposal.strategyDuration;
+            if (block.timestamp < proposal.executedAt + minWait) {
+                revert StrategyDurationNotElapsed();
+            }
         }
 
         // Run the pre-committed settlement calls under the SAME maxCapital cap
@@ -803,6 +835,11 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     /// @inheritdoc ISyndicateGovernor
     function bondEscrow() external view returns (address) {
         return _bondEscrow;
+    }
+
+    /// @inheritdoc ISyndicateGovernor
+    function coverageEpochs() external view returns (address) {
+        return _coverageEpochs;
     }
 
     /// @inheritdoc ISyndicateGovernor
@@ -1410,6 +1447,26 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     function setBondEscrow(address newEscrow) external onlyFactory {
         emit BondEscrowSet(_bondEscrow, newEscrow);
         _bondEscrow = newEscrow;
+    }
+
+    /// @inheritdoc ISyndicateGovernor
+    /// @dev address(0) is legal and is the pre-Plan-F default: it un-wires the
+    ///      epochs contract and `settleProposal` reverts to "proposer after 1h,
+    ///      anyone after `strategyDuration`" exactly as before.
+    ///
+    ///      FACTORY-ONLY, deliberately, mirroring `setExposureLedger`.
+    ///      `CoverageEpochs` is a protocol-wide singleton — the same instance
+    ///      `ChallengeGame` attributes predicate-5 liability through — so this is
+    ///      not a per-vault knob. A vault owner able to point its own governor at
+    ///      an arbitrary contract could declare its strategies wound down and
+    ///      hand every proposal a permissionless early settle.
+    ///
+    ///      No custodial meaning (unlike `setBondEscrow`): this slot is read, one
+    ///      bool at a time, and never holds value. Re-pointing it is safe for
+    ///      live proposals — it only changes who may settle them early.
+    function setCoverageEpochs(address newEpochs) external onlyFactory {
+        emit CoverageEpochsSet(_coverageEpochs, newEpochs);
+        _coverageEpochs = newEpochs;
     }
 
     /// @inheritdoc ISyndicateGovernor
