@@ -784,6 +784,18 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      It also means no keeper is required: execution reads the allocation
     ///      directly, so a settlement transaction can never be withheld to
     ///      strand a proposal.
+    /// @dev ORACLE ASYMMETRY, AND IT IS DELIBERATE (review n2). `recordApproval`
+    ///      books nothing when the price is unreadable; this function REVERTS.
+    ///      The two disagree on purpose, because the conservative direction is
+    ///      opposite on each path: booking nothing merely declines to extend
+    ///      coverage, whereas returning a made-up number here would size a
+    ///      SLASH off a price nobody can vouch for. Refusing to price a
+    ///      conviction until the feed recovers is the safe failure.
+    ///
+    ///      Operational consequence worth stating: a conviction cannot be
+    ///      computed while the asset feed is stale. That is a delay, not a
+    ///      loss — the exposure record is untouched and the challenge window is
+    ///      unaffected.
     function allocatedUsd(address governor, uint256 proposalId, address guardian) public view returns (uint256) {
         bytes32 key = _reviewKey(governor, proposalId);
         uint256 reserved = _recorded[key][guardian].usd;
@@ -791,7 +803,38 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         ILedgerGovernorMinimal gov = ILedgerGovernorMinimal(governor);
         address asset = IVaultAssetMinimal(gov.getProposalView(proposalId).vault).asset();
         uint256 needUsd = coverageUsd(asset, gov.getRequiredCoverage(proposalId));
-        return _allocate(reserved, _committedUsd[key], needUsd);
+        uint256 bps = swood.maxDelegatedSlashBps();
+        uint256 priceX8 = woodPriceX8();
+        uint256 live = _slashableBondUsd(guardian, bps, priceX8);
+        uint256 mine = live < reserved ? live : reserved;
+        if (mine == 0) return 0;
+        return _allocate(mine, _effectiveTotal(key, bps, priceX8), needUsd);
+    }
+
+    /// @dev Sum of `min(reserved, live bond)` across a proposal's approvers —
+    ///      what the cohort can ACTUALLY pay, not what it pledged (review n1).
+    ///
+    ///      Using raw `_committedUsd` as the denominator lets a guardian who
+    ///      unstaked or was devalued after approving keep diluting everyone
+    ///      else's share. Their slice is computed against a bond that is no
+    ///      longer there, the survivors are assigned correspondingly less, and
+    ///      the recoverable total falls short of the loss by far more than
+    ///      rounding. `requireApproveQuorum` already discounts by `min(live,
+    ///      reserved)`; this is the same discount applied to the split, so the
+    ///      two stop disagreeing about the same guardian.
+    function _effectiveTotal(bytes32 key, uint256 maxDelegatedSlashBps_, uint256 priceX8)
+        internal
+        view
+        returns (uint256 total)
+    {
+        address[] storage listed = _approversOf[key];
+        uint256 n = listed.length;
+        for (uint256 i = 0; i < n; i++) {
+            uint256 reserved = _recorded[key][listed[i]].usd;
+            if (reserved == 0) continue;
+            uint256 live = _slashableBondUsd(listed[i], maxDelegatedSlashBps_, priceX8);
+            total += live < reserved ? live : reserved;
+        }
     }
 
     /// @inheritdoc IExposureLedger
@@ -859,6 +902,15 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         uint256 n = listed.length;
         uint256 assigned;
         address firstHolder;
+        // Same effective basis as `allocatedUsd` (review n1): a guardian whose
+        // bond has gone must not dilute the survivors' shares.
+        uint256 maxDelegated = swood.maxDelegatedSlashBps();
+        uint256 priceX8 = woodPriceX8();
+        uint256 effectiveTotal = _effectiveTotal(key, maxDelegated, priceX8);
+        if (effectiveTotal == 0) {
+            _settled[key] = true;
+            return;
+        }
 
         for (uint256 i = 0; i < n; i++) {
             address g = listed[i];
@@ -866,8 +918,11 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
             if (r.usd == 0) continue;
             if (firstHolder == address(0)) firstHolder = g;
 
-            uint256 alloc = (uint256(r.usd) * needUsd) / reservedTotal;
+            uint256 liveG = _slashableBondUsd(g, maxDelegated, priceX8);
+            uint256 mine = liveG < uint256(r.usd) ? liveG : uint256(r.usd);
+            uint256 alloc = _allocate(mine, effectiveTotal, needUsd);
             assigned += alloc;
+            // `alloc <= mine <= r.usd`, so this cannot underflow.
             uint256 excess = uint256(r.usd) - alloc;
             if (excess != 0) {
                 _buckets[g][r.epoch] -= excess;

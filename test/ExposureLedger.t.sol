@@ -580,13 +580,20 @@ contract ExposureLedgerTest is Test {
 
         ledger.settleCoverage(address(mgov), 1); // must not revert or underflow
 
-        // Their booked liability is unchanged by the collapse -- it is what they
-        // committed, not what they can now pay. `requireApproveQuorum` is where
-        // the shrunken bond bites, via its `min(live, reserved)` leg.
-        assertEq(ledger.allocatedUsd(address(mgov), 1, guardian), 500e18, "still owes its half");
-        assertEq(ledger.allocatedUsd(address(mgov), 1, g2), 500e18);
+        // The split follows ABILITY TO PAY (review n1). A guardian with no bond
+        // left is allocated nothing, and the survivor absorbs the whole
+        // liability rather than being assigned half of a total the cohort can no
+        // longer cover.
+        //
+        // That is not an escape hatch: `StakedWood.claimUnstakeGuardian` refuses
+        // while open exposure remains, so the collapsed guardian is held — this
+        // only stops their absence from silently shrinking what everyone else
+        // owes. Before n1 the two shares were 500/500 and $500 of the $1,000 was
+        // simply unrecoverable.
+        assertEq(ledger.allocatedUsd(address(mgov), 1, guardian), 0, "cannot pay -> carries nothing");
+        assertEq(ledger.allocatedUsd(address(mgov), 1, g2), 1_000e18, "survivor absorbs it all");
 
-        vm.expectRevert(IExposureLedger.InsufficientApproveCoverage.selector);
+        // ...and the proposal is still genuinely covered, where it was not before.
         ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 1_000e6);
     }
 
@@ -694,6 +701,37 @@ contract ExposureLedgerTest is Test {
         ledger.setWoodHaircutBps(10_000);
         vm.stopPrank();
         assertEq(ledger.woodHaircutBps(), 10_000);
+    }
+
+    /// @notice n1 — a guardian who can no longer pay must not dilute the
+    ///         survivors' shares. Using the raw pledged total as the denominator
+    ///         computed everyone's slice against a bond that had gone, so the
+    ///         recoverable total fell short of the loss by far more than
+    ///         rounding.
+    function test_allocatedUsd_excludesBondThatIsNoLongerThere() public {
+        _wireRecording();
+        address g2 = makeAddr("g2");
+        swood.setStake(g2, 100_000e18, 0);
+        mgov.set(1_000e6);
+        mgov.setSchedule(block.timestamp + 1 days, 3 days);
+
+        vm.startPrank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        ledger.recordApproval(address(mgov), 1, g2);
+        vm.stopPrank();
+        assertEq(ledger.allocatedUsd(address(mgov), 1, guardian), 500e18, "even split while both can pay");
+
+        // One bond is devalued to a quarter of what it pledged.
+        swood.setStake(guardian, 5_000e18, 0); // $250 of a $1,000 reservation
+
+        // The split is pro-rata over EFFECTIVE capacity, not a simple cap:
+        // effective total is 250 + 1000 = 1250, so the shares are 250/1250 and
+        // 1000/1250 of the $1,000 needed.
+        assertEq(ledger.allocatedUsd(address(mgov), 1, guardian), 200e18, "sized by what it can still pay");
+        assertEq(ledger.allocatedUsd(address(mgov), 1, g2), 800e18, "survivor absorbs the shortfall");
+        // Still fully covered -- which is the point. Before n1 the devalued
+        // guardian kept a 500 slice it could not honour and $250 was unbacked.
+        ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 1_000e6);
     }
 
     /// @notice C1 REGRESSION — the free-rider veto.

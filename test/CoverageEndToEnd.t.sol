@@ -374,6 +374,37 @@ contract CoverageEndToEndTest is Test {
         return p.reviewEnd - (window * registry.LATE_VOTE_LOCKOUT_BPS()) / 10_000;
     }
 
+    /// @notice n3 — wiring a ledger onto a governor that already has live
+    ///         proposals would brick them: they were created before coverage
+    ///         existed, so nobody could have booked any, and `executeProposal`
+    ///         starts demanding it the moment the ledger is wired.
+    ///
+    ///         The M3 change made this worse rather than better — the approve
+    ///         hook now books nothing instead of reverting, so the failure moved
+    ///         from loud at vote time to silent until execute. Refusing the
+    ///         wiring is the last point it is visible.
+    function test_n3_cannotWireTheLedgerWhileProposalsAreOpen() public {
+        uint256 pid = _propose(govA, address(vaultA), agentA);
+        assertGt(govA.openProposalCount(), 0, "a proposal is in flight");
+
+        vm.expectRevert(ISyndicateGovernor.ParamsFrozenDuringProposal.selector);
+        govA.setExposureLedger(address(ledger));
+
+        // Un-wiring stays legal: it can only relax the execute gate.
+        govA.setExposureLedger(address(0));
+
+        // Once nothing is open, wiring is allowed again.
+        _openReview(govA, pid);
+        _vote(govA, pid, g1, IGuardianRegistry.GuardianVoteType.Approve);
+        _pastReview(govA, pid);
+        govA.executeProposal(pid);
+        vm.warp(vm.getBlockTimestamp() + 8 days); // strategy must run its course
+        vm.prank(agentA);
+        govA.settleProposal(pid);
+        assertEq(govA.openProposalCount(), 0, "nothing in flight");
+        govA.setExposureLedger(address(ledger));
+    }
+
     // ── N1: budget exhaustion must not silence the approve side ───────────
 
     /// @notice N1 (re-review) — a guardian whose budget went on an earlier

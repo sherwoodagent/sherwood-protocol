@@ -1401,6 +1401,19 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      `setAssetFeed` / `setCoveredTvlCapUsd`), or point the factory at a
     ///      fresh permissive ledger and `pushWiring` this governor.
     function setExposureLedger(address newLedger) external onlyFactory {
+        // NOT WHILE PROPOSALS ARE OPEN (review n3). A proposal created before
+        // the ledger existed carries no booked coverage — nobody could have
+        // booked any — but `executeProposal` starts demanding it the moment the
+        // ledger is wired, so those proposals become permanently unexecutable.
+        //
+        // The M3 change made this worse rather than better: the approve hook now
+        // books nothing instead of reverting, so the failure moved from LOUD at
+        // vote time to SILENT until execute. Refusing the wiring is the only
+        // point where it is still visible.
+        //
+        // Un-wiring (`newLedger == 0`) is exempt: it can only relax the execute
+        // gate, never brick a proposal that was relying on it.
+        if (newLedger != address(0) && _openProposalCount > 0) revert ParamsFrozenDuringProposal();
         emit ExposureLedgerSet(_exposureLedger, newLedger);
         _exposureLedger = newLedger;
     }
