@@ -1278,6 +1278,14 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     ///      small allocation, and the per-verdict guard above is what stops
     ///      concurrent small convictions from stacking those floors.
     ///
+    ///      THE SHAPE, NOT JUST THE DATA POINT (review round 3): the over-slash
+    ///      multiple is `minSlashBps / derivedRate` and is UNBOUNDED as the
+    ///      allocation shrinks — the 10× above is one point on a hyperbola, not
+    ///      a cap. And `derivedRate` itself moves with the WOOD price
+    ///      (`ExposureLedger.slashBpsFor` prices bonds via `woodPriceX8()`), so
+    ///      a price move alone can push a small allocation's rate under the
+    ///      floor and put its holder on the punitive branch.
+    ///
     /// @dev TIMESTAMP BOUNDS — WHAT THEY DO AND DO NOT GUARANTEE (PR #24
     ///      review 🟠2). `openedAt` must not be in the future (`VerdictNotPast`)
     ///      and `snapshotTimestamp` must be at or before `openedAt`
