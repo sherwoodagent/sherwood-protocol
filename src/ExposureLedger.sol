@@ -142,9 +142,36 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///         fail-closed until governance seeds it.
     uint256 public coveredTvlCapUsd;
     /// @notice Minimum envelopeTier at which the approve quorum is fail-closed
-    ///         (spec §3.3a + §4 gate 2). Launch value 2: tier-2 only. Lowering
-    ///         is gated on the §3.10 ROE validation — a BLOCKING launch gate.
-    uint8 public quorumTierThreshold = 2;
+    ///         (spec §3.3a + §4 gate 2). **Launch value 0: every tier.**
+    ///
+    /// @dev    The §3.10 ROE validation this parameter was gated on is
+    ///         RESOLVED — see `2026-07-26-roe-validation.md` (the gate passes at
+    ///         tier 0/1 and fails at tier 2) and `2026-07-27-tier-policy-v1.md`,
+    ///         which lowers this to 0 and pairs it with
+    ///         `ProtocolConfig.maxEnvelopeTier = 1`.
+    ///
+    ///         Coverage SIZING was already per-tier and already correct:
+    ///         `requiredCoverage = maxCapital × Σ boundBps / 10_000`, so a
+    ///         closed-loop adapter that can leak 1% requires 1% of coverage.
+    ///         What was missing was ENFORCEMENT — at a threshold of 2 that
+    ///         correctly-sized number was only checked at tier 2, so a tier-0/1
+    ///         proposal could execute with no covering approver at all. Zero is
+    ///         what makes the guardian layer mandatory rather than advisory,
+    ///         and what makes the §2 guarantee true for every proposal rather
+    ///         than for tier 2 alone.
+    ///
+    ///         Defaulting to 0 rather than leaving it to a deploy-time setter is
+    ///         deliberate: 2 is the configuration the ADR rejects, so a
+    ///         deployment that forgot the setter would silently ship it. The
+    ///         `DeployPlanB` pre-flight asserts the value regardless, since this
+    ///         and the tier ceiling are independently mutable after deploy.
+    ///
+    ///         `requiredCoverage == 0` still passes optimistically at every
+    ///         tier (review finding M-1) — that carve-out lives at the governor
+    ///         call site, not here. It is not an exception to this rule but the
+    ///         same rule evaluated at zero: a proposal that can extract nothing
+    ///         has nothing to underwrite.
+    uint8 public quorumTierThreshold = 0;
     /// @notice Proposer bond as bps of USD coverage (spec §3.9/§5). Default 1%.
     uint256 public proposerBondBps = 100;
 

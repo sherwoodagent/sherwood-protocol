@@ -6,6 +6,7 @@ import {ExposureLedger} from "../src/ExposureLedger.sol";
 import {ProposerBondEscrow} from "../src/ProposerBondEscrow.sol";
 import {ISyndicateFactory} from "../src/interfaces/ISyndicateFactory.sol";
 import {IGuardianRegistry} from "../src/interfaces/IGuardianRegistry.sol";
+import {IProtocolConfig} from "../src/interfaces/IProtocolConfig.sol";
 
 interface ISwoodCooldown {
     function coolDownPeriod() external view returns (uint256);
@@ -32,6 +33,9 @@ interface ISwoodCooldown {
  *      `InvalidParameter()`; the explicit require below names the fix. Raising
  *      the sWOOD cooldown is a LIVE-PARAMETER GOVERNANCE ACTION — surface it,
  *      do not work around it here.
+ * @dev PRE-FLIGHT 4 (ADR 2026-07-27): `maxEnvelopeTier <= 1` AND
+ *      `quorumTierThreshold == 0`, asserted together. See the block itself for
+ *      why landing one without the other is silently outside the ADR.
  * @dev PRE-FLIGHT 2: a zero `coveredTvlCapUsd` is fail-closed — the moment the
  *      ledger is wired into a governor, NOTHING can be proposed. Refuse to
  *      deploy into that state rather than brick proposing.
@@ -51,6 +55,7 @@ interface ISwoodCooldown {
  *     ASSET_FEED_MAX_DELAY      — feed staleness bound, seconds (see setAssetFeed below).
  *     WOOD_PRICE_HAIRCUT_X8     — conservative WOOD/USD, 8-dec (<= 30-day low).
  *     COVERED_TVL_CAP_USD18     — per-vault covered-TVL ceiling, USD-18. Non-zero.
+ *     PROTOCOL_CONFIG           — existing ProtocolConfig (tier-ceiling pre-flight).
  *
  *   Usage (simulate; never --broadcast blind):
  *     forge script script/DeployPlanB.s.sol:DeployPlanB --rpc-url <rpc> -vvvv
@@ -77,6 +82,9 @@ contract DeployPlanB is Script {
         uint256 feedMaxDelay = vm.envUint("ASSET_FEED_MAX_DELAY");
         uint256 woodPriceX8 = vm.envUint("WOOD_PRICE_HAIRCUT_X8"); // conservative, <= 30-day low
         uint256 coveredTvlCapUsd = vm.envUint("COVERED_TVL_CAP_USD18");
+        // Read early so a missing/typo'd address fails before any broadcast;
+        // the value it carries is asserted in pre-flight 4 below.
+        address protocolConfig = vm.envAddress("PROTOCOL_CONFIG");
 
         // ── Pre-flight 1: REMOVED (ADR 2026-07-26) ──
         // This asserted `coolDownPeriod >= epochLength + challengeWindow` (42d
@@ -145,8 +153,10 @@ contract DeployPlanB is Script {
         ledger.setAssetFeed(usdg, usdgFeed, feedMaxDelay);
         ledger.setGuardianRegistry(registry);
         ledger.setCoveredTvlCapUsd(coveredTvlCapUsd);
-        // quorumTierThreshold stays at the default 2 (tier-2 only) — lowering
-        // it is gated on the §3.10 ROE validation (BLOCKING, spec §4 gate 2).
+        // quorumTierThreshold stays at its default, which ADR 2026-07-27 moved
+        // to 0 (every tier fail-closed). Asserted in pre-flight 4 rather than
+        // re-set here, so a ledger whose default ever drifts is caught instead
+        // of silently corrected.
 
         IGuardianRegistry(registry).setExposureLedger(address(ledger));
         ISyndicateFactory(factory).setExposureLedger(address(ledger));
@@ -169,6 +179,37 @@ contract DeployPlanB is Script {
             ISwoodCooldown(swood).exposureLedger() != address(0),
             "PRE-FLIGHT: sWOOD exposureLedger is unset -- the unstake gate would fail open. "
             "Call setExposureLedger(ledger) by governance, then re-run."
+        );
+
+        // ── Pre-flight 4 (POST-wiring): the v1 tier policy, both halves ──
+        // ADR 2026-07-27 is TWO settings, and they are only sound together:
+        //
+        //   maxEnvelopeTier <= 1     refuses tier-2 exposure, which guardian
+        //                            ROE says nobody can rationally underwrite
+        //                            (0.0% at tier 2 vs 9.5%/49.5% at 1/0).
+        //   quorumTierThreshold == 0 requires a bond-backed approve quorum at
+        //                            EVERY tier, not tier 2 alone.
+        //
+        // They are independently settable, so a deploy can land one without the
+        // other and look entirely healthy while sitting outside the ADR:
+        //   - ceiling without threshold: tier-0/1 proposals execute with no
+        //     covering approver at all — coverage is sized but not enforced.
+        //   - threshold without ceiling: the protocol demands coverage for
+        //     tier-2 exposure that no guardian will supply, so tier-2
+        //     proposals simply hang instead of being refused honestly.
+        //
+        // Asserted as one block, after the broadcast, because that is the only
+        // point where both values are readable in the form the protocol will
+        // actually run with. Neither require is satisfiable by fixing the other.
+        require(
+            IProtocolConfig(protocolConfig).maxEnvelopeTier() <= 1,
+            "PRE-FLIGHT: ProtocolConfig.maxEnvelopeTier > 1 -- ADR 2026-07-27 refuses tier-2 exposure. "
+            "Call setMaxEnvelopeTier(1) as ProtocolConfig owner, then re-run."
+        );
+        require(
+            ledger.quorumTierThreshold() == 0,
+            "PRE-FLIGHT: ExposureLedger.quorumTierThreshold != 0 -- ADR 2026-07-27 requires a covering "
+            "approve quorum at EVERY tier. Call setQuorumTierThreshold(0), then re-run."
         );
 
         console.log("ExposureLedger:     %s", address(ledger));

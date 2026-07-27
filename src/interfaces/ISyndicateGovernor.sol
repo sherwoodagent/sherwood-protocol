@@ -194,6 +194,23 @@ interface ISyndicateGovernor {
     ///         the tier-only check waves through while Plan B's aggregate cap
     ///         would still trust the stale, lower snapshot.
     error CoverageRegressed();
+    /// @notice ADR 2026-07-27: the proposal's tier exceeds
+    ///         `ProtocolConfig.maxEnvelopeTier`, the protocol-wide ceiling on
+    ///         what guardians are asked to underwrite. Raised at propose AND at
+    ///         execute — a lazy demotion can push the live tier above the
+    ///         ceiling after the propose-time snapshot.
+    ///
+    /// @dev    DISTINCT from `TierRegressed` on purpose: the two have different
+    ///         remedies. `TierRegressed` means "this proposal's coverage price
+    ///         is stale relative to live tier" — re-propose at the tier the
+    ///         adapter now carries. `EnvelopeTierTooHigh` means "this tier is
+    ///         categorically inadmissible" — re-proposing changes nothing, the
+    ///         adapter must be CERTIFIED (or the ceiling raised by governance).
+    ///         With the launch ceiling of 1 the overwhelmingly common cause is
+    ///         an uncertified `(target, selector)`, which `TierRegistry` reports
+    ///         as tier 2 by default. Collapsing the two would point operators at
+    ///         the wrong fix.
+    error EnvelopeTierTooHigh();
     error StrategyAlreadyActive();
     error CooldownNotElapsed();
     error ProposalNotExecuted();

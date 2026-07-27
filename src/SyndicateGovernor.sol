@@ -425,15 +425,39 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // coverage exceeds the propose-time snapshot Plan B will consume.
         (uint8 liveTier, uint256 liveCoverage) =
             _resolveTierAndCoverage(calls, _loadCalls(_settlementCalls, proposalId), proposal.maxCapital);
+        // ADR 2026-07-27: re-check the protocol tier ceiling against the LIVE
+        // tier. NOT redundant with the propose-time check, for two reasons:
+        //   1. A lazy demotion (codehash change, revocation) can push an
+        //      adapter that was tier-1 at propose to tier 2 by execute. A
+        //      ceiling enforced only at propose would let exactly that run.
+        //   2. Governance can LOWER the ceiling while a proposal is in flight;
+        //      the exposure it just declined should not execute anyway.
+        //
+        // Ordered BEFORE `TierRegressed` deliberately. Both conditions can hold
+        // at once for a demotion past the ceiling, and the ceiling is the more
+        // informative of the two: it is categorical ("tier 2 is inadmissible —
+        // certify the adapter"), whereas `TierRegressed` is relative to this
+        // proposal's snapshot ("re-propose at the tier it now carries"), a
+        // remedy that would simply fail again at propose. Below the ceiling the
+        // ordering is invisible and `TierRegressed` still fires as before.
+        //
+        // Checks LIVE tier, not the snapshot: live is what the batch will
+        // actually run against. A proposal whose snapshot is above a
+        // newly-lowered ceiling but whose live tier is below it stays
+        // executable, and is safe by construction — it is priced and
+        // quorum-gated at the STRICTER snapshot tier.
+        _requireTierWithinCeiling(liveTier);
         if (liveTier > proposal.envelopeTier) revert TierRegressed();
         if (liveCoverage > proposal.requiredCoverage) revert CoverageRegressed();
 
         // Plan B (spec §3.3a): a coverage-consuming proposal at/above the tier
         // threshold cannot execute without a bond-encumbered approve quorum —
         // silence no longer passes it, so R1 always has an identified,
-        // stake-backed approver to hold liable. Below-threshold tiers keep
-        // optimistic passage until the §3.10 ROE arithmetic is validated
-        // (spec §4 gate 2, BLOCKING — launch threshold is 2, i.e. tier-2 only).
+        // stake-backed approver to hold liable. The §3.10 ROE arithmetic (spec
+        // §4 gate 2) is now validated, so the launch threshold is 0 — EVERY
+        // tier is fail-closed, not tier 2 alone (ADR 2026-07-27). Coverage was
+        // always sized per-tier and correctly; what was missing was enforcing
+        // it below tier 2.
         // A revert here leaves the proposal Approved: it expires at `executeBy`
         // unless covering approvals arrive first (the cold-start behaviour
         // §3.3a wants — suppressing the cohort blocks execution, never forces it).
@@ -901,6 +925,19 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         if (maxCapital > ceiling) revert MaxCapitalExceedsCeiling();
     }
 
+    /// @dev Protocol tier ceiling (ADR 2026-07-27). Called from BOTH check
+    ///      sites so the comparison and its sentinel semantics have one home.
+    ///
+    ///      No sentinel branch: `NO_ENVELOPE_TIER_CEILING` is `type(uint8).max`
+    ///      and tiers live in [0, 2], so an unseated ceiling makes `>` trivially
+    ///      false. That is exactly why the sentinel is NOT 0 — 0 is a valid,
+    ///      meaningful ceiling here ("tier-0 adapters only"), and a
+    ///      0-means-unset convention would silently foreclose the strictest
+    ///      setting the ADR contemplates as a future tightening.
+    function _requireTierWithinCeiling(uint8 tier_) private view {
+        if (tier_ > IProtocolConfig(protocolConfig).maxEnvelopeTier()) revert EnvelopeTierTooHigh();
+    }
+
     /// @dev Resolves and stores the proposal's tier + required coverage, then
     ///      runs the Plan B propose-time gates: the maxCapital ceiling check,
     ///      the exposure ledger's covered-TVL cap, and the risk-scaled proposer
@@ -918,6 +955,18 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         _checkMaxCapitalCeiling(p.maxCapital);
         (uint8 tier_, uint256 coverage_) =
             _resolveTierAndCoverage(execCalls, _loadCalls(_settlementCalls, p.id), p.maxCapital);
+        // ADR 2026-07-27: protocol-wide tier ceiling. Refuse outright what
+        // guardians cannot rationally underwrite — ROE is 0.0% at tier 2 (the
+        // whole cohort fee pool equals one guardian's expected annual tail
+        // loss) against 9.5% at tier 1 and 49.5% at tier 0. With the launch
+        // ceiling of 1 this means NO PROPOSAL MAY EXECUTE AN UNCERTIFIED CALL,
+        // since tier 2 is what `TierRegistry` reports by default.
+        //
+        // `protocolConfig` is non-zero by construction (`initialize` rejects
+        // it), so unlike the ledger gates below this needs no wired/unwired
+        // branch. An unseated ceiling reads `NO_ENVELOPE_TIER_CEILING`
+        // (`type(uint8).max`), which no tier can exceed.
+        _requireTierWithinCeiling(tier_);
         p.envelopeTier = tier_;
         p.requiredCoverage = coverage_;
         // Plan B gates (spec §3.7 + §3.9). Skipped when unwired — the
