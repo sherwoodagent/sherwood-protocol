@@ -2,6 +2,7 @@
 pragma solidity 0.8.28;
 
 import {IGuardianRegistry} from "./interfaces/IGuardianRegistry.sol";
+import {IExposureLedger} from "./interfaces/IExposureLedger.sol";
 import {IStakedWood} from "./interfaces/IStakedWood.sol";
 import {BatchExecutorLib} from "./BatchExecutorLib.sol";
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
@@ -38,6 +39,12 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     ///         `resolveReview` cannot be gas-DoS'd.
     uint256 public constant MAX_BLOCKERS_PER_PROPOSAL = 100;
     uint256 public constant LATE_VOTE_LOCKOUT_BPS = 1000;
+
+    /// @dev Mirrors `GovernorParameters.MAX_EXECUTION_WINDOW` and the ledger's
+    ///      copy of it. Duplicated for the same reason the ledger duplicates it:
+    ///      the floor must hold for EVERY governor the registry serves, so it is
+    ///      sized against the worst legal configuration rather than a live one.
+    uint256 internal constant MAX_GOVERNOR_EXECUTION_WINDOW = 7 days;
     /// @notice Block decisiveness (bps of at-open total weight) at which the
     ///         deterministic severity hits `maxSlashBps`. 2/3 supermajority.
     uint256 public constant SUPERMAJORITY_BPS = 6_667;
@@ -169,11 +176,20 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     // (Slots freed; the __gap below absorbs the layout delta — this is a fresh
     // V1.5 mainnet redeployment so no live storage to migrate.)
 
+    /// @notice Plan B (spec 2026-07-22 §3.3): exposure ledger consulted on every
+    ///         approve-side review vote. address(0) = not wired = hooks skipped.
+    ///         Owner-set via `setExposureLedger` (a setter, not init: the registry
+    ///         proxy is already live).
+    /// @dev APPENDED here for the same reason as `vaultOf` above — new fields go
+    ///      immediately before `__gap` and consume one gap slot, so no
+    ///      pre-existing field moves.
+    IExposureLedger public exposureLedger;
+
     /// @dev Reserved storage for future upgrades. Reduced 50 -> 49 when
-    ///      `vaultOf` was appended above, so the total slot count is conserved.
-    ///      Expect a further 49 -> 48 reduction when `exposureLedger` is
-    ///      appended; every new field takes one slot from here.
-    uint256[49] private __gap;
+    ///      `vaultOf` was appended (lifecycle), then 49 -> 48 for
+    ///      `exposureLedger` (Plan B). Total slot count is conserved: every new
+    ///      field takes one slot from here.
+    uint256[48] private __gap;
 
     /// @notice Per-deployment hard floor for `reviewPeriod` (impl-time immutable;
     ///         mainnet 6h). Lives in bytecode, not storage — the layout above is
@@ -422,6 +438,19 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
                 r.blockStakeWeight += weight;
             }
             _votes[key][msg.sender] = support;
+            // CEI: the external ledger call runs AFTER every state write above
+            // (`_votes`, tallies, approver/blocker push) so a re-entrant
+            // voteOnProposal observes committed state — do NOT move any state
+            // write below this hook. Same discipline as resolveReview (~L646).
+            if (support == GuardianVoteType.Approve && address(exposureLedger) != address(0)) {
+                // Spec §3.3: the aggregate exposure cap is checked HERE, at
+                // the approve vote. An over-exposed guardian books NOTHING
+                // rather than reverting (review N1) — the vote still lands and
+                // the shortfall surfaces at the execute-time quorum. Reverting
+                // here silenced the approve side while Block votes still
+                // worked, which made a review block-only.
+                exposureLedger.recordApproval(governor, proposalId, msg.sender);
+            }
             emit GuardianVoteCast(proposalId, msg.sender, support, weight);
         } else {
             // Vote-change: must be before the late lockout window.
@@ -448,6 +477,15 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
                 r.approveStakeWeight += weight;
             }
             _votes[key][msg.sender] = support;
+            // CEI (see first-vote branch above): ledger call is intentionally
+            // after all state writes; do not move a state write below it.
+            if (address(exposureLedger) != address(0)) {
+                if (support == GuardianVoteType.Block) {
+                    exposureLedger.releaseApproval(governor, proposalId, msg.sender);
+                } else {
+                    exposureLedger.recordApproval(governor, proposalId, msg.sender);
+                }
+            }
             emit GuardianVoteChanged(proposalId, msg.sender, existing, support);
         }
     }
@@ -959,6 +997,19 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         if (address(sw) != address(0) && v > sw.coolDownPeriod()) {
             revert CooldownBelowReviewPeriod();
         }
+        // MIRROR OF THE LEDGER'S FLOOR (review M1). `ExposureLedger` requires
+        // `challengeWindow >= reviewPeriod + MAX_GOVERNOR_EXECUTION_WINDOW`, but
+        // it can only enforce that when ITS setter runs. Raising `reviewPeriod`
+        // here raises the floor from the other side and nothing revalidated: a
+        // window seated legally at a 3d review period sits below the floor once
+        // the review period reaches 7d.
+        //
+        // Reaching across to the ledger is the same pattern this function
+        // already uses for sWOOD's cooldown two lines above.
+        IExposureLedger led = exposureLedger;
+        if (address(led) != address(0) && led.challengeWindow() < v + MAX_GOVERNOR_EXECUTION_WINDOW) {
+            revert InvalidParameter();
+        }
         emit ParameterChangeFinalized(PARAM_REVIEW_PERIOD, reviewPeriod, v);
         reviewPeriod = v;
     }
@@ -968,6 +1019,14 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         if (v < 1_000 || v > 10_000) revert InvalidParameter();
         emit ParameterChangeFinalized(PARAM_BLOCK_QUORUM_BPS, blockQuorumBps, v);
         blockQuorumBps = v;
+    }
+
+    /// @inheritdoc IGuardianRegistry
+    /// @notice Wire the exposure ledger (owner-instant; owner is a multisig with
+    ///         external delay).
+    function setExposureLedger(address ledger) external onlyOwner {
+        if (ledger == address(0)) revert ZeroAddress();
+        exposureLedger = IExposureLedger(ledger);
     }
 
     // ── Views ──

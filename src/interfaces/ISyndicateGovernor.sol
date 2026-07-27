@@ -126,6 +126,20 @@ interface ISyndicateGovernor {
         ///         notional isn't threaded through in Plan A. `maxCapital` flat
         ///         when no registry is wired.
         uint256 requiredCoverage;
+        /// @notice WOOD amount of the risk-scaled proposer bond locked in the
+        ///         ProposerBondEscrow at propose time (Plan B, spec §3.9). Zero
+        ///         when no escrow/ledger is wired or the bond bps is zero.
+        uint256 proposerBondWood;
+        /// @notice The ProposerBondEscrow that actually HOLDS this proposal's
+        ///         bond, bound at propose time. The bond is custodial and the
+        ///         escrow has no owner and no discretionary exit, and keys bonds
+        ///         by `(governor, proposalId)` — so a release must target this
+        ///         address, never the governor's live `_bondEscrow` slot.
+        ///         Re-pointing that slot is therefore safe for existing
+        ///         proposals (they keep releasing against the old escrow); a new
+        ///         escrow only applies to proposals created after the change.
+        ///         Zero when no bond was locked.
+        address proposerBondEscrow;
     }
 
     struct CoProposer {
@@ -216,6 +230,14 @@ interface ISyndicateGovernor {
     ///         Without this, a proposer declares maxCapital = uint256.max and
     ///         the net-outflow cap never binds (finding 3).
     error MaxCapitalExceedsCeiling();
+    /// @notice `reclaimProposerBond` called while the proposal can still reach
+    ///         execution. The bond is only returned from a TERMINAL state
+    ///         (Rejected / Expired / Cancelled / Settled) — spec §3.9.
+    error ProposalNotTerminal();
+    /// @notice `reclaimProposerBond` called for a proposal that never locked a
+    ///         bond, or whose bond was already reclaimed (the reclaim zeroes
+    ///         the stored amount, so a second call lands here — idempotence).
+    error NoBondToReclaim();
     /// @notice `setMaxCapitalBps` called with 0 or a value above 10_000.
     error InvalidMaxCapitalBps();
     /// @notice Revert if `envelope.maxDrawdownBps > 10_000` at propose — a
@@ -364,6 +386,12 @@ interface ISyndicateGovernor {
     /// @notice Tier registry wired (or un-wired, newRegistry == address(0)).
     event TierRegistrySet(address indexed oldRegistry, address indexed newRegistry);
 
+    /// @notice Exposure ledger wired (or un-wired, newLedger == address(0)) — Plan B.
+    event ExposureLedgerSet(address indexed oldLedger, address indexed newLedger);
+
+    /// @notice Proposer bond escrow wired (or un-wired, newEscrow == address(0)) — Plan B.
+    event BondEscrowSet(address indexed oldEscrow, address indexed newEscrow);
+
     /// @notice Emitted in `_distributeFees` when `guardianFeeBps > 0`.
     ///         Guardian fee is carved from gross PnL and transferred to
     ///         `recipient` (the team `guardiansFeeRecipient` multisig). This is
@@ -450,6 +478,33 @@ interface ISyndicateGovernor {
     ///         `setProtocolConfig`. address(0) un-wires: every proposal then
     ///         resolves to tier 2 / full notional — the safe default.
     function setTierRegistry(address newRegistry) external;
+    /// @notice Wire the exposure ledger (Plan B, spec §3.7/§3.9). Factory-only.
+    ///         address(0) un-wires: the covered-TVL cap and proposer bond gates
+    ///         are then skipped — the pre-ledger safe default.
+    /// @dev Precondition: seed the ledger's `setAssetFeed(vaultAsset, ...)` and
+    ///      `setCoveredTvlCapUsd(...)` BEFORE wiring it. The gates fail closed,
+    ///      so a wired ledger with an unpriceable vault asset or a zero cap
+    ///      halts all proposal creation for this vault. The escape hatch
+    ///      (`setExposureLedger(0)`) is factory-owned; the feed/cap fixes are
+    ///      ledger-owner-owned.
+    function setExposureLedger(address newLedger) external;
+    /// @notice Wire the proposer bond escrow (Plan B, spec §3.9). Factory-only.
+    ///         address(0) un-wires: the bond is not locked at propose.
+    /// @dev CUSTODIAL slot — re-point only at zero outstanding bonds. Bonds
+    ///      already locked are released against the per-proposal stored escrow
+    ///      (`StrategyProposal.proposerBondEscrow`), so re-pointing is safe for
+    ///      existing proposals; a new escrow applies only to future ones.
+    function setBondEscrow(address newEscrow) external;
+
+    /// @notice Permissionless: return the proposer bond once the proposal has
+    ///         reached a terminal state (spec §3.9).
+    /// @dev Rejection, expiry, and cancellation all RETURN the bond —
+    ///      forfeiture is exclusively a passed-challenge outcome (Plan C); a
+    ///      guardian block is not a conviction. Safe to leave permissionless:
+    ///      the escrow pays only the proposer it recorded at lock time, so a
+    ///      third-party caller can accelerate the refund but never redirect it.
+    ///      Idempotent — a second call reverts `NoBondToReclaim`.
+    function reclaimProposerBond(uint256 proposalId) external;
 
     // ── Init ──
     /// @notice Initialize a freshly deployed per-vault governor proxy.
@@ -503,6 +558,12 @@ interface ISyndicateGovernor {
 
     /// @notice Address of the tier registry (zero if not wired — tier 2 default).
     function tierRegistry() external view returns (address);
+
+    /// @notice Address of the exposure ledger (zero if not wired — gates skipped).
+    function exposureLedger() external view returns (address);
+
+    /// @notice Address of the proposer bond escrow (zero if not wired — no bond).
+    function bondEscrow() external view returns (address);
 
     /// @notice MAX tier across the proposal's execute calls, resolved at
     ///         propose time (spec §3.2). Returns 0 for a nonexistent

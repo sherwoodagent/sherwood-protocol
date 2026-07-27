@@ -163,10 +163,22 @@
       "type": "t_address"
     },
     {
-      "label": "__gap",
+      "label": "_exposureLedger",
       "slot": "59",
       "offset": 0,
-      "type": "t_array(t_uint256)33_storage"
+      "type": "t_address"
+    },
+    {
+      "label": "_bondEscrow",
+      "slot": "60",
+      "offset": 0,
+      "type": "t_address"
+    },
+    {
+      "label": "__gap",
+      "slot": "61",
+      "offset": 0,
+      "type": "t_array(t_uint256)31_storage"
     }
   ],
   "types": {
@@ -416,6 +428,18 @@
         "slot": "23",
         "offset": 0,
         "type": "t_uint256"
+      },
+      {
+        "label": "proposerBondWood",
+        "slot": "24",
+        "offset": 0,
+        "type": "t_uint256"
+      },
+      {
+        "label": "proposerBondEscrow",
+        "slot": "25",
+        "offset": 0,
+        "type": "t_address"
       }
     ]
   }

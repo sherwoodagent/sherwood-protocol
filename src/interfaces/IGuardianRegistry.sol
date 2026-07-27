@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import {BatchExecutorLib} from "../BatchExecutorLib.sol";
 import {IStakedWood} from "./IStakedWood.sol";
+import {IExposureLedger} from "./IExposureLedger.sol";
 
 /// @title IGuardianRegistry
 /// @notice Interface for the slimmed `GuardianRegistry` — review/emergency
@@ -153,6 +154,15 @@ interface IGuardianRegistry {
     // ── Parameter setters (owner-instant; owner is a multisig with external delay) ──
     function setReviewPeriod(uint256) external;
     function setBlockQuorumBps(uint256) external;
+
+    /// @notice Wire the exposure ledger consulted on approve-side review votes
+    ///         (spec 2026-07-22 §3.3). address(0) is rejected; address(0) as the
+    ///         current value means unset (hooks skipped).
+    function setExposureLedger(address ledger) external;
+    /// @dev Returns the interface-typed handle (matches the `IExposureLedger
+    ///      public exposureLedger` state variable getter, mirroring the
+    ///      `swood()`/`IStakedWood` precedent). address(0) handle = unset.
+    function exposureLedger() external view returns (IExposureLedger);
 
     // ── Views ──
     /// @notice Returns the cached review state for a proposal.

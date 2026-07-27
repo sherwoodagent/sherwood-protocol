@@ -1,0 +1,370 @@
+{
+  "storage": [
+    {
+      "label": "poolTokens",
+      "slot": "0",
+      "offset": 0,
+      "type": "t_mapping(t_address,t_uint256)"
+    },
+    {
+      "label": "poolShares",
+      "slot": "1",
+      "offset": 0,
+      "type": "t_mapping(t_address,t_uint256)"
+    },
+    {
+      "label": "delegationShares",
+      "slot": "2",
+      "offset": 0,
+      "type": "t_mapping(t_address,t_mapping(t_address,t_uint256))"
+    },
+    {
+      "label": "_unstakeDelegationRequestedAt",
+      "slot": "3",
+      "offset": 0,
+      "type": "t_mapping(t_address,t_mapping(t_address,t_uint64))"
+    },
+    {
+      "label": "_unstakeDelegationCooldown",
+      "slot": "4",
+      "offset": 0,
+      "type": "t_mapping(t_address,t_mapping(t_address,t_uint64))"
+    },
+    {
+      "label": "unbondingPoolTokens",
+      "slot": "5",
+      "offset": 0,
+      "type": "t_mapping(t_address,t_uint256)"
+    },
+    {
+      "label": "unbondingPoolShares",
+      "slot": "6",
+      "offset": 0,
+      "type": "t_mapping(t_address,t_uint256)"
+    },
+    {
+      "label": "unbondingShares",
+      "slot": "7",
+      "offset": 0,
+      "type": "t_mapping(t_address,t_mapping(t_address,t_uint256))"
+    },
+    {
+      "label": "totalDelegatedStake",
+      "slot": "8",
+      "offset": 0,
+      "type": "t_uint256"
+    },
+    {
+      "label": "delegationEnabled",
+      "slot": "9",
+      "offset": 0,
+      "type": "t_bool"
+    },
+    {
+      "label": "_commissionBps",
+      "slot": "10",
+      "offset": 0,
+      "type": "t_mapping(t_address,t_uint256)"
+    },
+    {
+      "label": "_lastCommissionRaiseEpoch",
+      "slot": "11",
+      "offset": 0,
+      "type": "t_mapping(t_address,t_uint256)"
+    },
+    {
+      "label": "_commissionEpochBaseline",
+      "slot": "12",
+      "offset": 0,
+      "type": "t_mapping(t_address,t_uint256)"
+    },
+    {
+      "label": "_commissionCheckpoints",
+      "slot": "13",
+      "offset": 0,
+      "type": "t_mapping(t_address,t_struct(Trace224)_storage)"
+    },
+    {
+      "label": "epochGenesis",
+      "slot": "14",
+      "offset": 0,
+      "type": "t_uint256"
+    },
+    {
+      "label": "_poolTokensCheckpoints",
+      "slot": "15",
+      "offset": 0,
+      "type": "t_mapping(t_address,t_struct(Trace224)_storage)"
+    },
+    {
+      "label": "_poolSharesCheckpoints",
+      "slot": "16",
+      "offset": 0,
+      "type": "t_mapping(t_address,t_struct(Trace224)_storage)"
+    },
+    {
+      "label": "_delegationSharesCheckpoints",
+      "slot": "17",
+      "offset": 0,
+      "type": "t_mapping(t_address,t_mapping(t_address,t_struct(Trace224)_storage))"
+    },
+    {
+      "label": "_totalDelegatedCheckpoint",
+      "slot": "18",
+      "offset": 0,
+      "type": "t_struct(Trace224)_storage"
+    },
+    {
+      "label": "totalActiveDelegatedStake",
+      "slot": "19",
+      "offset": 0,
+      "type": "t_uint256"
+    },
+    {
+      "label": "_totalActiveDelegatedCheckpoint",
+      "slot": "20",
+      "offset": 0,
+      "type": "t_struct(Trace224)_storage"
+    },
+    {
+      "label": "__delegationGap",
+      "slot": "21",
+      "offset": 0,
+      "type": "t_array(t_uint256)5_storage"
+    },
+    {
+      "label": "wood",
+      "slot": "26",
+      "offset": 0,
+      "type": "t_contract(IERC20)"
+    },
+    {
+      "label": "registry",
+      "slot": "27",
+      "offset": 0,
+      "type": "t_address"
+    },
+    {
+      "label": "factory",
+      "slot": "28",
+      "offset": 0,
+      "type": "t_address"
+    },
+    {
+      "label": "_registrySet",
+      "slot": "28",
+      "offset": 20,
+      "type": "t_bool"
+    },
+    {
+      "label": "_guardians",
+      "slot": "29",
+      "offset": 0,
+      "type": "t_mapping(t_address,t_struct(Guardian)_storage)"
+    },
+    {
+      "label": "totalGuardianStake",
+      "slot": "30",
+      "offset": 0,
+      "type": "t_uint256"
+    },
+    {
+      "label": "minGuardianStake",
+      "slot": "31",
+      "offset": 0,
+      "type": "t_uint256"
+    },
+    {
+      "label": "coolDownPeriod",
+      "slot": "32",
+      "offset": 0,
+      "type": "t_uint256"
+    },
+    {
+      "label": "_stakeCheckpoints",
+      "slot": "33",
+      "offset": 0,
+      "type": "t_mapping(t_address,t_struct(Trace224)_storage)"
+    },
+    {
+      "label": "_totalStakeCheckpoint",
+      "slot": "34",
+      "offset": 0,
+      "type": "t_struct(Trace224)_storage"
+    },
+    {
+      "label": "_ownerStakes",
+      "slot": "35",
+      "offset": 0,
+      "type": "t_mapping(t_address,t_struct(OwnerStake)_storage)"
+    },
+    {
+      "label": "_prepared",
+      "slot": "36",
+      "offset": 0,
+      "type": "t_mapping(t_address,t_struct(PreparedOwnerStake)_storage)"
+    },
+    {
+      "label": "minOwnerStake",
+      "slot": "37",
+      "offset": 0,
+      "type": "t_uint256"
+    },
+    {
+      "label": "minSlashBps",
+      "slot": "38",
+      "offset": 0,
+      "type": "t_uint256"
+    },
+    {
+      "label": "maxSlashBps",
+      "slot": "39",
+      "offset": 0,
+      "type": "t_uint256"
+    },
+    {
+      "label": "maxDelegatedSlashBps",
+      "slot": "40",
+      "offset": 0,
+      "type": "t_uint256"
+    },
+    {
+      "label": "ageFloorBps",
+      "slot": "41",
+      "offset": 0,
+      "type": "t_uint256"
+    },
+    {
+      "label": "maturationPeriod",
+      "slot": "42",
+      "offset": 0,
+      "type": "t_uint256"
+    },
+    {
+      "label": "delegatedWeightCapX",
+      "slot": "43",
+      "offset": 0,
+      "type": "t_uint256"
+    },
+    {
+      "label": "_pendingBurn",
+      "slot": "44",
+      "offset": 0,
+      "type": "t_mapping(t_address,t_uint256)"
+    },
+    {
+      "label": "__gap",
+      "slot": "45",
+      "offset": 0,
+      "type": "t_array(t_uint256)8_storage"
+    },
+    {
+      "label": "exposureLedger",
+      "slot": "53",
+      "offset": 0,
+      "type": "t_address"
+    }
+  ],
+  "types": {
+    "t_struct(Checkpoint224)_storage": [
+      {
+        "label": "_key",
+        "slot": "0",
+        "offset": 0,
+        "type": "t_uint32"
+      },
+      {
+        "label": "_value",
+        "slot": "0",
+        "offset": 4,
+        "type": "t_uint224"
+      }
+    ],
+    "t_struct(Guardian)_storage": [
+      {
+        "label": "stakedAmount",
+        "slot": "0",
+        "offset": 0,
+        "type": "t_uint128"
+      },
+      {
+        "label": "stakedAt",
+        "slot": "0",
+        "offset": 16,
+        "type": "t_uint64"
+      },
+      {
+        "label": "unstakeRequestedAt",
+        "slot": "0",
+        "offset": 24,
+        "type": "t_uint64"
+      },
+      {
+        "label": "agentId",
+        "slot": "1",
+        "offset": 0,
+        "type": "t_uint256"
+      },
+      {
+        "label": "cooldownAtRequest",
+        "slot": "2",
+        "offset": 0,
+        "type": "t_uint64"
+      }
+    ],
+    "t_struct(OwnerStake)_storage": [
+      {
+        "label": "stakedAmount",
+        "slot": "0",
+        "offset": 0,
+        "type": "t_uint128"
+      },
+      {
+        "label": "unstakeRequestedAt",
+        "slot": "0",
+        "offset": 16,
+        "type": "t_uint64"
+      },
+      {
+        "label": "owner",
+        "slot": "1",
+        "offset": 0,
+        "type": "t_address"
+      },
+      {
+        "label": "cooldownAtRequest",
+        "slot": "1",
+        "offset": 20,
+        "type": "t_uint64"
+      }
+    ],
+    "t_struct(PreparedOwnerStake)_storage": [
+      {
+        "label": "amount",
+        "slot": "0",
+        "offset": 0,
+        "type": "t_uint128"
+      },
+      {
+        "label": "preparedAt",
+        "slot": "0",
+        "offset": 16,
+        "type": "t_uint64"
+      },
+      {
+        "label": "bound",
+        "slot": "0",
+        "offset": 24,
+        "type": "t_bool"
+      }
+    ],
+    "t_struct(Trace224)_storage": [
+      {
+        "label": "_checkpoints",
+        "slot": "0",
+        "offset": 0,
+        "type": "t_array(t_struct(Checkpoint224)_storage)dyn_storage"
+      }
+    ]
+  }
+}
