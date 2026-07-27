@@ -1505,10 +1505,21 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     ///      REQUIREMENT ON THE SLASHER (Plan D): an out-of-gas child is
     ///      RETRYABLE but indistinguishable here from a missing selector, so a
     ///      gas-starved `openCase` burns the victims' compensation
-    ///      irreversibly. Today's callers are trusted (owner multisig), but a
-    ///      challenge-game slasher that forwards user-influenced gas MUST pin a
-    ///      gas floor before calling `slashToEscrow` — do not let a caller
-    ///      choose the gas that decides between compensation and burn.
+    ///      irreversibly. The exposure is NOT tx-level gas (PR #24 review
+    ///      round-4 N-3): the `openCase` call carries no `{gas:}` modifier, so
+    ///      an EOA-initiated call that starves the 63/64 child also leaves the
+    ///      parent unable to afford the burn branch — the whole transaction
+    ///      reverts, which is the safe outcome. The regime that burns is a
+    ///      slasher doing `slashToEscrow{gas: g}` with attacker-influenced
+    ///      `g`, where the same 63/64 arithmetic runs one frame up and `g` is
+    ///      chosen directly. (`_burnWood`'s `_pendingBurn` fallback widens the
+    ///      set of gas configurations in which the slash "succeeds" without
+    ///      funding a case, so degraded-burn accounting is no comfort here.)
+    ///      Today's callers are trusted (owner multisig), but a challenge-game
+    ///      slasher that forwards user-influenced gas MUST pin a gas floor
+    ///      before calling `slashToEscrow` — nothing in THIS contract enforces
+    ///      one; the obligation is recorded here and on the Plan D checklist,
+    ///      not implemented by the machine.
     function _isRecoverableOpenCaseFailure(bytes memory reason) private pure returns (bool) {
         if (reason.length < 4) return false;
         bytes4 selector;

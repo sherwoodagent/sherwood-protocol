@@ -856,16 +856,20 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      TAKE is `Σ min(live_i · maxSlashBps/10_000, allocated_i)`, because
     ///      `slashToEscrow` clamps every rate to the severity ceiling. So an
     ///      allocation that runs to the top of a bond is short by
-    ///      `1 - maxSlashBps/10_000` of itself: 20% at the shipped 8,000, 50%
-    ///      at 5,000. Worked case — coverage set to exactly the joint slashable
+    ///      `1 - maxSlashBps/10_000` of itself: 20% at the fixture's 8,000,
+    ///      50% at 5,000 (deploy scripts ship 10,000, where the clamp never
+    ///      binds — see spec §3.8). Worked case — coverage set to exactly the joint slashable
     ///      bond ($2,000 across two $1,000 own-stake bonds): this gate PASSES,
     ///      both derived rates are a correct 10,000 bps, and recovery is
     ///      $1,600 against a $2,000 loss (80%).
     ///
     ///      This is a hole in FRONT of the residual, not behind it — distinct
     ///      from the "bond shrank since the vote" case `slashBpsFor` documents
-    ///      as unavoidable. It is left open here deliberately: closing it is a
-    ///      change to the coverage GATE (either require
+    ///      as unavoidable. It is an UNENFORCED RUNTIME INVARIANT (spec §3.8):
+    ///      nothing here or in the deploy pre-flight keeps `maxSlashBps` at a
+    ///      value where the clamp never binds, so the gap is real the moment
+    ///      governance lowers the ceiling. Closing it is a change to the
+    ///      coverage GATE (either require
     ///      `Σ min(live_i · maxSlashBps/10_000, reserved_i) >= needUsd`, or
     ///      restate spec §2's inequality as
     ///      `recovery >= loss · maxSlashBps/10_000`), and that belongs in its

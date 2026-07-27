@@ -1352,6 +1352,33 @@ contract ExposureLedgerTest is Test {
         assertEq(bpsAfter[1], 2_000, "rate tracks the feed-priced bond");
     }
 
+    /// @notice F-B, the other direction (review round-4): the haircut must
+    ///         reach `slashBpsFor` too, and it needs NO feed at all —
+    ///         `_haircut` applies to the fallback scalar. Reading the raw
+    ///         scalar would value the bond at full price and under-recover by
+    ///         the haircut: at 5,000 bps that is half the liability, silently.
+    function test_slashBpsFor_appliesTheHaircut() public {
+        _wireRecording();
+        mgov.set(2_000e6);
+
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+
+        // No WOOD feed wired. Scalar $0.05, bond $5,000, $2,000 liability.
+        (, uint256[] memory bpsBefore) = ledger.slashBpsFor(address(mgov), 1);
+        assertEq(bpsBefore[0], 4_000, "baseline: raw scalar, no haircut");
+
+        // Haircut to 50%: `woodPriceX8()` reads $0.025, the bond books $2,500,
+        // and the same $2,000 liability is 8,000 bps. A raw-scalar read would
+        // stay at 4,000 — a 50% under-recovery with no feed involved.
+        vm.prank(owner);
+        ledger.setWoodHaircutBps(5_000);
+        assertEq(ledger.woodPriceX8(), 0.025e8, "haircut applies to the fallback");
+
+        (, uint256[] memory bpsAfter) = ledger.slashBpsFor(address(mgov), 1);
+        assertEq(bpsAfter[0], 8_000, "rate tracks the haircut-priced bond");
+    }
+
     /// @notice A guardian whose commitment was RELEASED by a vote change stays
     ///         in the approver list with a zeroed booking. It must price at 0 —
     ///         liability follows the commitment, and `slashToEscrow` skips a
