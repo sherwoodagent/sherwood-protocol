@@ -128,10 +128,8 @@ contract CompensationEndToEndTest is Test {
                     minOwnerStake: 10_000e18,
                     minSlashBps: 1000,
                     maxSlashBps: 10_000,
-                    maxDelegatedSlashBps: 2000,
                     ageFloorBps: 2500,
-                    maturationPeriod: MATURATION,
-                    delegatedWeightCapX: 4
+                    maturationPeriod: MATURATION
                 }))
         );
         swood = StakedWood(address(new ERC1967Proxy(address(swoodImpl), swoodInit)));
@@ -839,7 +837,6 @@ contract CompensationEndToEndTest is Test {
         // A ceiling well below 100% so compounding would be visible.
         vm.startPrank(owner);
         swood.setMinSlashBps(0);
-        swood.setMaxDelegatedSlashBps(2_500);
         swood.setMaxSlashBps(5_000);
         vm.stopPrank();
 
