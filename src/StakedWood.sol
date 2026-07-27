@@ -1459,6 +1459,14 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     ///      or an out-of-gas child. Empty returndata deliberately falls through
     ///      to the burn: that is the shape of the missing-selector case, which
     ///      is precisely 🟡5's motivating failure.
+    ///
+    ///      REQUIREMENT ON THE SLASHER (Plan D): an out-of-gas child is
+    ///      RETRYABLE but indistinguishable here from a missing selector, so a
+    ///      gas-starved `openCase` burns the victims' compensation
+    ///      irreversibly. Today's callers are trusted (owner multisig), but a
+    ///      challenge-game slasher that forwards user-influenced gas MUST pin a
+    ///      gas floor before calling `slashToEscrow` — do not let a caller
+    ///      choose the gas that decides between compensation and burn.
     function _isRecoverableOpenCaseFailure(bytes memory reason) private pure returns (bool) {
         if (reason.length < 4) return false;
         bytes4 selector;

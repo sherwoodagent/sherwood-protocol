@@ -27,8 +27,6 @@ interface IVaultWithdrawalQueue {
     error InsufficientShares();
     error WrongKind();
     error NotCompensationCase();
-    error RequestNotEligible();
-    error CompensationAlreadyClaimed();
     error NothingToClaim();
     /// @dev `claimCompensation` ran with no escrow wired on the factory
     ///      (`ISyndicateFactory.compensationEscrow() == address(0)`).
