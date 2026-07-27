@@ -274,8 +274,11 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
     ///        nothing distributes nothing.
     ///      - `cc.token` pins the payout unit at pull time; every later payout
     ///        for the case reads the pin, never the escrow.
-    ///      - A case must be distributed by the same call that pulls it
-    ///        (`NoRequestsSupplied`), so proceeds do not idle in the queue.
+    ///      - A case must be distributed by the same call that pulls it, so
+    ///        proceeds do not idle in the queue. Enforced by the
+    ///        `processed != 0` check at the end (`NoEligibleRequests`, review
+    ///        F-D) — the `NoRequestsSupplied` length check alone was not it,
+    ///        since a batch of all-skipped ids would pull and park.
     ///      - Payout destinations are the requests' own owners; the caller
     ///        chooses only WHICH requests get processed, never where funds go.
     ///      - `nonReentrant` (shared with `claim`/`cancel`) blocks the escrow's
@@ -347,7 +350,9 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
             // pending batch used to revert the whole transaction. Skipping
             // costs the caller nothing they did not already commit and is
             // reported in `skipped`. Funds are unaffected either way — payouts
-            // always go to `r.owner`.
+            // always go to `r.owner`. NOTE for keeper authors: an OUT-OF-RANGE
+            // id still reverts the whole batch (`_req` → `RequestNotFound`) —
+            // that is caller error, not front-runnable state, so it stays hard.
             bool eligible = r.kind == RequestKind.Redeem
                 // In custody at the snapshot: queued at-or-before it and not yet
                 // claimed/cancelled by then. `queuedAt == 0` marks a request from
@@ -368,6 +373,16 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
                 emit CompensationPaid(escrow, caseId, id, r.owner, share);
             }
         }
+        // A CALL THAT DISTRIBUTES NOTHING DOES NOT STAND (PR #24 review F-D).
+        // The length check above only proves ids were NAMED; with 🟡N7's
+        // skip-don't-revert, one ineligible id could satisfy it, pull the
+        // case's entire proceeds, and park them here — restoring the idle
+        // balance that was 🔴N1's precondition. Reverting when nothing was
+        // processed rolls the pull back too (the escrow case stays redeemable),
+        // so "a pull distributes in the same call" is enforced, not asserted.
+        // A keeper whose whole batch was front-run loses only gas: everything
+        // it named was already paid.
+        if (processed == 0) revert NoEligibleRequests();
     }
 
     /// @notice Pulled-case bookkeeping for (escrow, caseId): measured proceeds,

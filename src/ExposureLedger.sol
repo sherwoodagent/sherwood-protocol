@@ -923,10 +923,15 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///          reverts. Feed outages correlate with exactly the market stress
     ///          a drain happens in, so that is a real liveness hole in the
     ///          slash path;
-    ///        - the denominator (`live`, via `_slashableBondUsd`) is priced off
-    ///          the OWNER-SET `woodUsdPriceX8`. Halving it doubles every
-    ///          derived rate — governance resizes every conviction in the
-    ///          system with one scalar.
+    ///        - the denominator (`live`, via `_slashableBondUsd`) is priced by
+    ///          `woodPriceX8()` — Chainlink primary with `woodHaircutBps`,
+    ///          owner-set `woodUsdPriceX8` as the degraded fallback — the SAME
+    ///          read `requireApproveQuorum`, `allocatedUsd` and `settleCoverage`
+    ///          use (PR #24 review F-B: this site briefly read the raw scalar,
+    ///          a Plan B merge artefact, so the gate and the rail priced the
+    ///          same bond differently the moment a feed was wired). In the
+    ///          fallback regime governance still resizes every conviction with
+    ///          one scalar.
     ///      Both are governance-trust statements of the same family as D4's,
     ///      recorded here rather than argued away.
     ///
@@ -966,7 +971,7 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
 
         // Hoisted for the reason `requireApproveQuorum` hoists them (M-4).
         uint256 maxDelegated = swood.maxDelegatedSlashBps();
-        uint256 priceX8 = woodUsdPriceX8;
+        uint256 priceX8 = woodPriceX8();
 
         // Prices against the ALLOCATION, never the reservation. `recordApproval`
         // deliberately over-reserves — each approver books up to the full

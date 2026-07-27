@@ -364,7 +364,10 @@ contract SlashToEscrowProportionalTest is Test {
     ///         coverage to what the quorum gate actually permits — exactly the
     ///         joint slashable bond — and every rate saturates at 10,000 bps,
     ///         is clamped to `maxSlashBps`, and recovery lands short by
-    ///         `1 - maxSlashBps/10_000` of the loss. 20% at the shipped 8,000.
+    ///         `1 - maxSlashBps/10_000` of the loss. 20% at THIS FIXTURE's
+    ///         8,000 — every shipped config seats 10,000 and `DeployPlanB`
+    ///         refuses otherwise, so the regime is reachable only through a
+    ///         post-deploy `setMaxSlashBps` (see the spec §3.8 N3 note).
     ///
     ///         `requireApproveQuorum` checks `Σ min(live, reserved) >= needUsd`.
     ///         It does NOT check `Σ min(live · maxSlashBps/10_000, allocated)`,
@@ -424,7 +427,7 @@ contract SlashToEscrowProportionalTest is Test {
         // The clamp is what bounds recovery, exactly and measurably.
         assertEq(recovered * 10_000, owedTotal * MAX_SLASH_BPS, "recovery == loss * maxSlashBps/10_000");
         assertLt(recovered, owedTotal, "the section-2 inequality FAILS in the binding regime");
-        assertEq((recovered * 100) / owedTotal, 80, "80% of the loss at the shipped 8,000-bps ceiling");
+        assertEq((recovered * 100) / owedTotal, 80, "80% of the loss at the fixture's 8,000-bps ceiling");
     }
 
     /// @notice THE REASON THE CHANGE EXISTS. A partial rate leaves bond behind,

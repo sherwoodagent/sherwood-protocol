@@ -485,7 +485,17 @@ not bind. `requireApproveQuorum` admits coverage up to
 `Σ min(live_i · maxSlashBps/10_000, allocated_i)`. Set coverage to exactly the
 joint slashable bond and the gate passes, every derived rate correctly
 saturates at 10,000 bps, and recovery lands at `loss · maxSlashBps/10_000` —
-80% at the shipped 8,000, 50% at 5,000. This is a gap in *front* of the
+80% at a 8,000-bps ceiling, 50% at 5,000. (8,000 is the *test fixture's*
+ceiling, not the shipped one — PR #24 review N3 correction:
+`DEFAULT_MAX_SLASH_BPS = 10_000` in `script/Deploy.s.sol`, both testnet scripts
+seat 10,000, and `DeployPlanB` pre-flight 1b *refuses* to deploy otherwise. At
+10,000 the clamp never binds and recovery is exactly 1.0× allocation, so the
+shortfall regime is unreachable in every configuration this repo can produce.
+That reclassifies the gap from an open design question to an **unenforced
+runtime invariant**: `setMaxSlashBps` accepts anything in
+`[minSlashBps, 10_000]`, so one governance transaction after deploy silently
+re-opens it. Follow-up: a floor on that setter, or price `maxSlashBps` into
+`requireApproveQuorum`.) This is a gap in *front* of the
 residual, distinct from the "bond shrank since the vote" case `slashBpsFor`
 documents as unavoidable. Both regimes are now pinned by tests
 (`test_recoveryCoversEveryApproversAllocation`,

@@ -520,12 +520,13 @@ contract CompensationEndToEndTest is Test {
         assertEq(skipped, 0, "nothing passed over");
         assertEq(wood.balanceOf(lp2), queueClaim, "the queued exiter got the WOOD");
 
-        // Idempotent per request: a second pass pays nothing and now SKIPS
-        // rather than reverting the batch (PR #24 review 🟡N7).
-        (uint256 paid2, uint256 processed2, uint256 skipped2) = q.claimCompensation(caseId, ids);
-        assertEq(paid2, 0, "no second payout");
-        assertEq(processed2, 0, "nothing credited twice");
-        assertEq(skipped2, 1, "the already-paid id was skipped");
+        // Idempotent per request: a replay naming ONLY the already-paid id
+        // distributes nothing, and a call that distributes nothing does not
+        // stand (PR #24 review F-D) — it reverts rather than reporting an
+        // all-skipped success. Mixed batches still skip per id (🟡N7, see
+        // test_carlos_N7_frontRunClaimDoesNotGriefTheBatch).
+        vm.expectRevert(IVaultWithdrawalQueue.NoEligibleRequests.selector);
+        q.claimCompensation(caseId, ids);
         assertEq(wood.balanceOf(lp2), queueClaim, "balance unchanged by the replay");
     }
 
@@ -547,21 +548,30 @@ contract CompensationEndToEndTest is Test {
 
         (uint256 caseId,) = _verdictSlash();
 
-        // The post-snapshot request is passed over, not reverted (🟡N7) — but
-        // the pull still happens, so the case is now funded and undistributed
-        // to exactly the extent the caller failed to name eligible requests.
+        // A batch naming ONLY the post-snapshot request distributes nothing,
+        // and a call that distributes nothing does not stand (PR #24 review
+        // F-D): it reverts, and the revert rolls the PULL back too — the case
+        // stays with the escrow instead of parking undistributed in the queue.
         uint256[] memory ids = new uint256[](1);
         ids[0] = postId;
-        (uint256 nothing, uint256 credited, uint256 passedOver) = q.claimCompensation(caseId, ids);
-        assertEq(nothing, 0, "an ineligible request is paid nothing");
-        assertEq(credited, 0, "and is not credited");
-        assertEq(passedOver, 1, "it is reported as skipped");
+        vm.expectRevert(IVaultWithdrawalQueue.NoEligibleRequests.selector);
+        q.claimCompensation(caseId, ids);
         assertEq(wood.balanceOf(buyer), 0, "the post-snapshot owner got nothing");
+        (,,,, bool pulled) = q.compensationCase(address(escrow), caseId);
+        assertFalse(pulled, "the failed distribution did not pull the case");
+        assertGt(escrow.claimable(caseId, address(q)), 0, "claim still at the escrow");
 
-        // The pre-snapshot request still collects.
-        ids[0] = preId;
-        (uint256 paid,,) = q.claimCompensation(caseId, ids);
+        // A mixed batch skips the ineligible id (🟡N7) and pays the eligible
+        // one — the pre-snapshot request collects, the post-snapshot one stays
+        // passed over.
+        uint256[] memory both = new uint256[](2);
+        both[0] = postId;
+        both[1] = preId;
+        (uint256 paid, uint256 credited, uint256 passedOver) = q.claimCompensation(caseId, both);
         assertGt(paid, 0);
+        assertEq(credited, 1, "only the pre-snapshot request was credited");
+        assertEq(passedOver, 1, "the post-snapshot request was skipped, not reverted");
+        assertEq(wood.balanceOf(buyer), 0, "the post-snapshot owner still got nothing");
         assertEq(wood.balanceOf(lp2), paid);
     }
 

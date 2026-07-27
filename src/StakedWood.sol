@@ -415,33 +415,17 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     ///      at `openedAt`, so the per-vote mirror is dead. Pre-mainnet layout
     ///      re-baseline; the slot returns to the gap to keep total size stable.
     ///      Decremented 9 → 6 across two branches that each carved from this
-    ///      gap. ORDER IS THE MERGE ORDER, not the authoring order: #22 is #24's
-    ///      base, so `exposureLedger` lands first in the lineage and Plan C's
-    ///      two follow. sWOOD is UUPS and LIVE — every field here is appended
-    ///      off the FRONT of the gap and nothing existing moves, but the
-    ///      sequence between the two branches is only decidable once, and this
-    ///      is it.
-    ///      Decremented 6 → 5 for `_verdictSlashed` (PR #24 review 🟠N2).
+    ///      gap, then 6 → 5 for `_verdictSlashed` (PR #24 review 🟠N2).
+    ///      DECLARATION ORDER IS DELIBERATE (PR #24 review F-F): Plan C's three
+    ///      fields sit BETWEEN the gap and Plan B's `exposureLedger`, so the
+    ///      shrink comes off the END of the gap and `exposureLedger` keeps the
+    ///      slot the merge base gave it (53). An earlier arrangement declared
+    ///      them after `exposureLedger`, which shifted it 53 → 50 — safe only
+    ///      because nothing deployed carries the tail (origin/main still has
+    ///      `__gap[9]` and none of these four), but the golden gate cannot
+    ///      tell "appended" from "shifted" once regenerated, so the discipline
+    ///      is restored while the tail is still unreleased.
     uint256[5] private __gap;
-
-    /// @notice Coverage ledger consulted before releasing a guardian's stake.
-    ///
-    /// @dev    Replaces a blunt timer with the question the timer stood in for.
-    ///         `coolDownPeriod` had to be at least as long as the LONGEST
-    ///         obligation any guardian could hold (~42d at defaults) or an
-    ///         approver could exit from under a pending challenge — which
-    ///         charged every guardian the worst case, including one who never
-    ///         insured anything. Asking the ledger directly is exact.
-    ///
-    ///         FAIL-OPEN WHEN UNSET: `claimUnstakeGuardian` then behaves exactly
-    ///         as it did before this existed. There is necessarily a window at
-    ///         deploy, and again on a UUPS upgrade, where the pointer is still
-    ///         zero; failing closed there would brick withdrawals over a missed
-    ///         configuration step. The cost is that a permanently-unwired
-    ///         deployment has no gate and still looks healthy, so `DeployPlanB`
-    ///         asserts the wiring as a pre-flight — the failure surfaces as a
-    ///         refused deploy rather than as a hole nobody sees.
-    address public exposureLedger;
 
     /// @notice The one address permitted to drive the VERDICT slash path
     ///         (`slashToEscrow`). Deliberately distinct from `onlyRegistry`,
@@ -479,6 +463,29 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     ///      Without this map, the workaround for the gas limit silently voids
     ///      the ceiling governance set.
     mapping(bytes32 caseKey => mapping(address approver => bool)) private _verdictSlashed;
+
+    /// @notice Coverage ledger consulted before releasing a guardian's stake.
+    ///
+    /// @dev    Replaces a blunt timer with the question the timer stood in for.
+    ///         `coolDownPeriod` had to be at least as long as the LONGEST
+    ///         obligation any guardian could hold (~42d at defaults) or an
+    ///         approver could exit from under a pending challenge — which
+    ///         charged every guardian the worst case, including one who never
+    ///         insured anything. Asking the ledger directly is exact.
+    ///
+    ///         FAIL-OPEN WHEN UNSET: `claimUnstakeGuardian` then behaves exactly
+    ///         as it did before this existed. There is necessarily a window at
+    ///         deploy, and again on a UUPS upgrade, where the pointer is still
+    ///         zero; failing closed there would brick withdrawals over a missed
+    ///         configuration step. The cost is that a permanently-unwired
+    ///         deployment has no gate and still looks healthy, so `DeployPlanB`
+    ///         asserts the wiring as a pre-flight — the failure surfaces as a
+    ///         refused deploy rather than as a hole nobody sees.
+    ///
+    /// @dev    Declared AFTER Plan C's three fields so it keeps slot 53, the
+    ///         slot the merge base assigned it (review F-F, see the `__gap`
+    ///         natspec).
+    address public exposureLedger;
 
     /// @notice Slashed WOOD is sent here — permanently out of circulation.
     /// @dev Burning via a transfer to a known-dead address keeps WOOD's
@@ -1372,13 +1379,25 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
             // zero-skip on purpose: a zero rate takes nothing, so it must not
             // consume the approver's one slash and block a later real one.
             if (_verdictSlashed[caseKey][approvers[i]]) revert ApproverAlreadySlashed();
-            _verdictSlashed[caseKey][approvers[i]] = true;
             // Clamped per element, not once for the batch: the envelope is a
             // per-guardian ceiling/floor on severity, so it has to bind each
             // approver's own rate. Hoisting it would let one approver's rate set
             // the envelope for everyone.
             uint256 bps = Math.min(Math.max(requested, minSlashBps), maxSlashBps);
-            total += _slashOne(slashKey, openedAt, approvers[i], bps);
+            uint256 amt = _slashOne(slashKey, openedAt, approvers[i], bps);
+            // MARK ONLY A SLASH THAT LANDED (PR #24 review F-C). `_slashOne`
+            // returns 0 when the approver has no live stake at slash time —
+            // already emptied by a concurrent conviction, or exited. Writing
+            // the mark there consumes the verdict's one slash on a no-op, so a
+            // retry after the guardian re-stakes (the at-open basis is
+            // unchanged, so it WOULD recover) reverts `ApproverAlreadySlashed`
+            // and the valid verdict is permanently foreclosed. A zero take is
+            // like the zero-rate skip above: nothing bound, nothing consumed.
+            // The ceiling still cannot compound — the mark is set on the first
+            // call that takes anything, and a zero take reduces nothing.
+            if (amt == 0) continue;
+            _verdictSlashed[caseKey][approvers[i]] = true;
+            total += amt;
         }
         // Nothing recovered: no case to open (the escrow rejects zero proceeds).
         if (total == 0) return (0, 0);
@@ -1453,6 +1472,21 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     ///          `_verdictSlashed` and strand the victims permanently on a
     ///          recoverable input error. The classifier keys on RETRYABILITY,
     ///          not on which contract raised the error.
+    ///
+    ///          WHY "PERMANENTLY EMPTY" CANNOT HAPPEN ON A REAL VAULT (PR #24
+    ///          review F-A objection, answered): OZ `Votes._transferVotingUnits`
+    ///          pushes `_totalCheckpoints` on every mint UNCONDITIONALLY —
+    ///          `getPastTotalSupply` counts total supply, NOT delegated votes
+    ///          ("Votes that have not been delegated are still part of total
+    ///          supply", OZ natspec). So a pre-`_update`-upgrade vault whose
+    ///          holders never delegated reads zero VOTES per holder (the 🟠N4
+    ///          caveat — case opens, claims strand to the backstop) but NEVER
+    ///          zero SUPPLY after its first deposit. A vault where
+    ///          `EmptySnapshot` is permanent despite holders would have to
+    ///          override `getPastTotalSupply` to mean delegated-sum — a
+    ///          nonstandard vault no reachable caller path supplies (v1b: the
+    ///          owner names factory vaults; Plan D: the vault comes from a
+    ///          registered proposal, factory-deployed, OZ semantics).
     ///
     ///      Everything else BURNS: any unrecognised or empty returndata — a
     ///      vault missing the ERC20Votes selectors, a block-number clock mode,

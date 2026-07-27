@@ -259,28 +259,28 @@
       "type": "t_array(t_uint256)5_storage"
     },
     {
-      "label": "exposureLedger",
+      "label": "authorizedSlasher",
       "slot": "50",
       "offset": 0,
       "type": "t_address"
     },
     {
-      "label": "authorizedSlasher",
+      "label": "compensationEscrow",
       "slot": "51",
       "offset": 0,
       "type": "t_address"
     },
     {
-      "label": "compensationEscrow",
+      "label": "_verdictSlashed",
       "slot": "52",
       "offset": 0,
-      "type": "t_address"
+      "type": "t_mapping(t_bytes32,t_mapping(t_address,t_bool))"
     },
     {
-      "label": "_verdictSlashed",
+      "label": "exposureLedger",
       "slot": "53",
       "offset": 0,
-      "type": "t_mapping(t_bytes32,t_mapping(t_address,t_bool))"
+      "type": "t_address"
     }
   ],
   "types": {

@@ -1282,9 +1282,10 @@ contract ExposureLedgerTest is Test {
 
     /// @notice `slashBpsFor` converts each guardian's BOOKED coverage into the
     ///         bps-of-stake that `slashToEscrow` speaks. Both inputs are USD, so
-    ///         the quotient is unitless — no price is read in the slash path.
-    ///         Here the two approvers underwrote different amounts of the same
-    ///         proposal, so they must carry different rates.
+    ///         the quotient is DIMENSIONALLY unitless — but both operands are
+    ///         priced (🟡N5): asset feed in the numerator, `woodPriceX8()` in
+    ///         the denominator. Here the two approvers underwrote different
+    ///         amounts of the same proposal, so they must carry different rates.
     function test_slashBpsFor_ratesTrackEachApproversOwnCommitment() public {
         _wireRecording();
         address g2 = makeAddr("g2");
@@ -1311,6 +1312,44 @@ contract ExposureLedgerTest is Test {
         // what `slashToEscrow` applies to each one's own stake.
         assertEq(bps[0], 2_000, "a fifth of the larger bond");
         assertEq(bps[1], 4_000, "two fifths of the smaller one");
+    }
+
+    /// @notice PR #24 review F-B: `slashBpsFor` must price the bond with
+    ///         `woodPriceX8()` — the same Chainlink-with-haircut read every
+    ///         other consumer uses — not the raw governance scalar. A merge
+    ///         artefact had it on `woodUsdPriceX8`, so the moment a WOOD feed
+    ///         was wired the gate and the slash rail priced the same bond
+    ///         differently: a feed above the scalar over-slashed 2x, a haircut
+    ///         under-recovered by half.
+    function test_slashBpsFor_pricesBondsWithTheFeedNotTheRawScalar() public {
+        _wireRecording();
+        address g2 = makeAddr("g2");
+        swood.setStake(g2, 50_000e18, 0);
+        mgov.set(2_000e6);
+
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, g2);
+
+        // Baseline (governance scalar $0.05): $5,000 / $2,500 bonds, $1,000
+        // liability each -> 2,000 / 4,000 bps.
+        (, uint256[] memory bpsBefore) = ledger.slashBpsFor(address(mgov), 1);
+        assertEq(bpsBefore[0], 2_000);
+        assertEq(bpsBefore[1], 4_000);
+
+        // Wire a feed at 2x the scalar. `woodPriceX8()` now reads $0.10, the
+        // bonds are worth twice as much, and the SAME dollar liability is half
+        // the rate. Reading the raw scalar would leave the rates unchanged —
+        // taking twice the liability from every approver.
+        MockFeed woodFeed = new MockFeed(0.1e8, 8);
+        vm.prank(owner);
+        ledger.setWoodFeed(address(woodFeed), 1 days);
+        assertEq(ledger.woodPriceX8(), 0.1e8, "feed supersedes the scalar");
+
+        (, uint256[] memory bpsAfter) = ledger.slashBpsFor(address(mgov), 1);
+        assertEq(bpsAfter[0], 1_000, "rate tracks the feed-priced bond");
+        assertEq(bpsAfter[1], 2_000, "rate tracks the feed-priced bond");
     }
 
     /// @notice A guardian whose commitment was RELEASED by a vote change stays

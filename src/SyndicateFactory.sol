@@ -678,11 +678,17 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     ///      in a token they mint freely and then flip `wood()` to real WOOD and
     ///      withdraw the queue's whole balance. Governance owns the address; the
     ///      caller chooses only WHICH requests get paid.
-    /// @dev CUSTODIAL RE-POINT: cases already pulled into a queue stay payable —
-    ///      the queue's bookkeeping is keyed by the escrow that funded them and
-    ///      the payout token is pinned per case at pull time — but cases still
-    ///      unpulled at the OLD escrow become unreachable from the queue until
-    ///      the address is pointed back. Re-point at zero unpulled cases.
+    /// @dev CUSTODIAL RE-POINT (PR #24 review F-E): the queue's BOOKKEEPING is
+    ///      keyed by the escrow that funded a case and the payout token is
+    ///      pinned at pull time, but its LOOKUP resolves this pointer live — so
+    ///      once it moves, EVERY case tied to the old escrow becomes
+    ///      unaddressable from the queue: unpulled ones, and pulled ones not
+    ///      yet fully distributed (their remainder parks in the queue, which
+    ///      has no rescue path by design). Nothing is lost — pointing back
+    ///      restores payout exactly — but the funds are frozen meanwhile.
+    ///      Re-point only at zero unpulled cases AND zero
+    ///      incompletely-distributed pulled cases for every queue this factory
+    ///      deployed.
     function setCompensationEscrow(address newEscrow) external onlyOwner {
         address old = compensationEscrow;
         compensationEscrow = newEscrow;

@@ -70,8 +70,9 @@ interface IExposureLedger {
     ///         operands are priced (PR #24 review 🟡N5): the numerator reads
     ///         the asset's Chainlink feed behind a `StalePrice` gate (a stale
     ///         feed makes the conviction unpriceable and this view reverts),
-    ///         and the denominator is priced off the owner-set
-    ///         `woodUsdPriceX8`. See the implementation natspec for the
+    ///         and the denominator is priced by `woodPriceX8()` — Chainlink
+    ///         with the haircut, owner-set `woodUsdPriceX8` only as the
+    ///         degraded fallback. See the implementation natspec for the
     ///         liveness and governance-trust consequences. A guardian who
     ///         booked nothing returns 0 and is therefore slashed nothing.
     function slashBpsFor(address governor, uint256 proposalId)
