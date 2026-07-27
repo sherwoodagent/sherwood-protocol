@@ -39,6 +39,12 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     ///         `resolveReview` cannot be gas-DoS'd.
     uint256 public constant MAX_BLOCKERS_PER_PROPOSAL = 100;
     uint256 public constant LATE_VOTE_LOCKOUT_BPS = 1000;
+
+    /// @dev Mirrors `GovernorParameters.MAX_EXECUTION_WINDOW` and the ledger's
+    ///      copy of it. Duplicated for the same reason the ledger duplicates it:
+    ///      the floor must hold for EVERY governor the registry serves, so it is
+    ///      sized against the worst legal configuration rather than a live one.
+    uint256 internal constant MAX_GOVERNOR_EXECUTION_WINDOW = 7 days;
     /// @notice Block decisiveness (bps of at-open total weight) at which the
     ///         deterministic severity hits `maxSlashBps`. 2/3 supermajority.
     uint256 public constant SUPERMAJORITY_BPS = 6_667;
@@ -288,9 +294,9 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         if (voteEnd == 0 || reviewEnd <= voteEnd) revert InvalidReviewWindow();
         Review storage r = _reviews[_reviewKey(msg.sender, proposalId)];
         if (r.voteEnd != 0) revert ReviewAlreadyRegistered();
-        // forge-lint: disable-next-line(unchecked-cast)
+        // forge-lint: disable-next-line(unsafe-typecast)
         r.voteEnd = uint64(voteEnd);
-        // forge-lint: disable-next-line(unchecked-cast)
+        // forge-lint: disable-next-line(unsafe-typecast)
         r.reviewEnd = uint64(reviewEnd);
         emit ReviewRegistered(msg.sender, proposalId, uint64(voteEnd), uint64(reviewEnd));
     }
@@ -562,7 +568,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         er.cohortTooSmall = gs < MIN_COHORT_STAKE_AT_OPEN;
         // Sherlock run #2 #15: snapshot block-quorum threshold at open so the
         // owner can't shift it mid-review.
-        // forge-lint: disable-next-line(unchecked-cast)
+        // forge-lint: disable-next-line(unsafe-typecast)
         er.blockQuorumBpsAtOpen = uint16(blockQuorumBps);
         uint64 newReviewEnd = er.reviewEnd;
         unchecked {
@@ -700,7 +706,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         r.totalStakeAtOpen = totalAtOpen;
         // Sherlock run #2 #15: snapshot block-quorum at open so the owner
         // can't shift the threshold after voters have cast.
-        // forge-lint: disable-next-line(unchecked-cast)
+        // forge-lint: disable-next-line(unsafe-typecast)
         r.blockQuorumBpsAtOpen = uint16(blockQuorumBps);
         r.openedAt = uint64(ts1);
         if (combinedAtOpen < MIN_COHORT_STAKE_AT_OPEN) {
@@ -974,6 +980,19 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         IStakedWood sw = swood;
         if (address(sw) != address(0) && v > sw.coolDownPeriod()) {
             revert CooldownBelowReviewPeriod();
+        }
+        // MIRROR OF THE LEDGER'S FLOOR (review M1). `ExposureLedger` requires
+        // `challengeWindow >= reviewPeriod + MAX_GOVERNOR_EXECUTION_WINDOW`, but
+        // it can only enforce that when ITS setter runs. Raising `reviewPeriod`
+        // here raises the floor from the other side and nothing revalidated: a
+        // window seated legally at a 3d review period sits below the floor once
+        // the review period reaches 7d.
+        //
+        // Reaching across to the ledger is the same pattern this function
+        // already uses for sWOOD's cooldown two lines above.
+        IExposureLedger led = exposureLedger;
+        if (address(led) != address(0) && led.challengeWindow() < v + MAX_GOVERNOR_EXECUTION_WINDOW) {
+            revert InvalidParameter();
         }
         emit ParameterChangeFinalized(PARAM_REVIEW_PERIOD, reviewPeriod, v);
         reviewPeriod = v;

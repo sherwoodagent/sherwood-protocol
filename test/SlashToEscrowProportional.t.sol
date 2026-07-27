@@ -72,8 +72,13 @@ contract PropGovernor {
         uint256 voteEnd;
         uint256 reviewEnd;
         address vault;
+        uint256 executeBy;
+        uint256 strategyDuration;
     }
 
+    /// @dev Left at 0/0 so `coverUntil` falls at or before epoch genesis and the
+    ///      ledger books into the CURRENT epoch — this suite is about slash
+    ///      rates, not bucket dating.
     function getProposalView(uint256) external view returns (ProposalViewLite memory v) {
         v.vault = vaultAddr;
     }

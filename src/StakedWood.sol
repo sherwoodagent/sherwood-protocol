@@ -38,6 +38,14 @@ interface IRegistryReviewPeriod {
 ///      `StakedWoodDelegation`) was REMOVED/postponed before mainnet: vote
 ///      weight is aged own stake only, and slashing has exactly one leg (the
 ///      guardian's own bond). Re-introduction is a fresh design, not a revert.
+/// @dev Narrow ExposureLedger read surface. Mirrors the `ISwoodMinimal` pattern
+///      the ledger uses in the other direction — neither contract imports the
+///      other's full ABI. Both directions are views, so the mutual reference
+///      carries no reentrancy concern.
+interface ILedgerExposureMinimal {
+    function openExposureUsd(address guardian) external view returns (uint256);
+}
+
 contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgradeable {
     using SafeERC20 for IERC20;
     using Checkpoints for Checkpoints.Trace224;
@@ -120,6 +128,13 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///         `coolDownPeriod >= reviewPeriod` invariant closes slash-evasion
     ///         for guardian OWN stake (the `isActiveGuardian` voting gate).
     error CooldownBelowReviewPeriod();
+
+    /// @notice `claimUnstakeGuardian` refused: the guardian still backs a
+    ///         proposal whose drain could yet be challenged. REQUESTING the
+    ///         unstake stays open; only the release waits.
+    error CoverageStillOpen();
+
+    event ExposureLedgerSet(address indexed ledger);
 
     /// @notice Caller already has an unbound prepared owner stake.
     /// @dev Relocated verbatim from `IGuardianRegistry`.
@@ -374,30 +389,36 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///      risk). The amount accumulates here and `flushBurn` retries it.
     mapping(address => uint256) internal _pendingBurn;
 
-    /// @dev Reserves upgrade headroom for this leaf contract. Later tasks
-    ///      (slash bounds, etc.) decrement this as they add storage.
-    ///      Decremented 16 → 15 in Task 5.1: `voteStake` consumes one slot.
-    ///      Decremented 15 → 14 in Task 5.2: `_pendingBurn` consumes one slot.
-    ///      Decremented 14 → 12 in Task 6.2: `minSlashBps` + `maxSlashBps`.
-    ///      Decremented 12 → 8 (spec 2026-07-19): four weight/slash params
-    ///      (two of which were later deleted with the DPoS removal below).
-    ///      Incremented 8 → 9 (spec 2026-07-19 Task 5): `voteStake` deleted —
-    ///      `_slashOne` sizes the own slash off the raw own-stake checkpoint
-    ///      at `openedAt`, so the per-vote mirror is dead. Pre-mainnet layout
-    ///      re-baseline; the slot returns to the gap to keep total size stable.
-    ///      Decremented 9 → 8 (spec 2026-07-22 §4, Plan C Task 4):
-    ///      `authorizedSlasher` consumes one slot. APPEND-ONLY — sWOOD is UUPS
-    ///      and live, so the new field is carved off the FRONT of the gap and
-    ///      no existing field moves.
-    ///      Decremented 8 → 7 (Plan C review): `compensationEscrow` consumes
-    ///      one slot, appended AFTER `authorizedSlasher`.
-    ///      FULL RE-BASELINE (DPoS delegation removal, pre-mainnet): the
-    ///      `StakedWoodDelegation` base contract — and with it every
-    ///      delegation slot that used to precede this contract's storage —
-    ///      was deleted, along with `maxDelegatedSlashBps` and
-    ///      `delegatedWeightCapX` here. No mainnet (4663) StakedWood exists,
-    ///      so the layout is free to shift; the goldens were regenerated in
-    ///      the same PR.
+    /// @dev Reserves upgrade headroom for this leaf contract.
+    ///      RE-BASELINED 2026-07-26 (DPoS delegation removal, pre-mainnet):
+    ///      the `StakedWoodDelegation` base contract — every delegation slot
+    ///      that used to precede this contract's storage — was deleted, along
+    ///      with `maxDelegatedSlashBps` and `delegatedWeightCapX` here, and
+    ///      the whole layout re-baselined (goldens regenerated in the same
+    ///      PR; no mainnet 4663 deployment exists, testnets are redeployable).
+    ///      Reserve is 6 slots; from the first mainnet deploy onward changes
+    ///      must be append-only, carved off the FRONT of this gap.
+    uint256[6] private __gap;
+
+    /// @notice Coverage ledger consulted before releasing a guardian's stake.
+    ///
+    /// @dev    Replaces a blunt timer with the question the timer stood in for.
+    ///         `coolDownPeriod` had to be at least as long as the LONGEST
+    ///         obligation any guardian could hold (~42d at defaults) or an
+    ///         approver could exit from under a pending challenge — which
+    ///         charged every guardian the worst case, including one who never
+    ///         insured anything. Asking the ledger directly is exact.
+    ///
+    ///         FAIL-OPEN WHEN UNSET: `claimUnstakeGuardian` then behaves exactly
+    ///         as it did before this existed. There is necessarily a window at
+    ///         deploy, and again on a UUPS upgrade, where the pointer is still
+    ///         zero; failing closed there would brick withdrawals over a missed
+    ///         configuration step. The cost is that a permanently-unwired
+    ///         deployment has no gate and still looks healthy, so `DeployPlanB`
+    ///         asserts the wiring as a pre-flight — the failure surfaces as a
+    ///         refused deploy rather than as a hole nobody sees.
+    address public exposureLedger;
+
     /// @notice The one address permitted to drive the VERDICT slash path
     ///         (`slashToEscrow`). Deliberately distinct from `onlyRegistry`,
     ///         which drives the block-quorum review slash: the paths must stay
@@ -418,10 +439,6 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///      own choosing. Zero disables the verdict path
     ///      (`CompensationEscrowNotSet`).
     address public compensationEscrow;
-
-    /// @dev Reserved storage for future upgrades (was 9; -1 authorizedSlasher,
-    ///      -1 compensationEscrow).
-    uint256[7] private __gap;
 
     /// @notice Slashed WOOD is sent here — permanently out of circulation.
     /// @dev Burning via a transfer to a known-dead address keeps WOOD's
@@ -796,6 +813,21 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
         if (block.timestamp < uint256(g.unstakeRequestedAt) + uint256(g.cooldownAtRequest)) {
             revert CooldownNotElapsed();
         }
+        // GATE ON THE CLAIM, NOT THE REQUEST (ADR 2026-07-26). Requesting stays
+        // open at any time and is behaviour to encourage: it marks the guardian
+        // inactive immediately, so they take on no NEW commitments while the
+        // existing ones run down. It is the moment the stake actually leaves
+        // that has to wait for the obligations to clear.
+        //
+        // The cooldown above still earns its place — it covers the REVIEW path
+        // (`coolDownPeriod >= reviewPeriod`), where a guardian who voted in an
+        // unresolved review is slashable and which the ledger knows nothing
+        // about. This check covers the challenge path. Neither subsumes the
+        // other.
+        address ledger = exposureLedger;
+        if (ledger != address(0) && ILedgerExposureMinimal(ledger).openExposureUsd(msg.sender) != 0) {
+            revert CoverageStillOpen();
+        }
 
         uint256 amount = g.stakedAmount;
         delete _guardians[msg.sender];
@@ -992,6 +1024,17 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     /// @dev Relocated verbatim from `GuardianRegistry`.
     function canCreateVault(address o) external view returns (bool) {
         return _prepared[o].amount >= minOwnerStake && !_prepared[o].bound;
+    }
+
+    /// @notice Wire the coverage ledger that gates unstake claims.
+    /// @dev Settable to zero deliberately — that is the documented fail-open
+    ///      state, and an operator must be able to reach it if the ledger is
+    ///      ever replaced or found broken. `DeployPlanB` asserts it is non-zero
+    ///      at deploy, so the safe configuration is enforced where a mistake is
+    ///      still cheap to correct.
+    function setExposureLedger(address ledger) external onlyOwner {
+        exposureLedger = ledger;
+        emit ExposureLedgerSet(ledger);
     }
 
     /// @notice Set the address permitted to drive `slashToEscrow`.

@@ -48,6 +48,20 @@ contract MockGovernorWithCoverage is MockGovernorMinimal {
         uint256 voteEnd;
         uint256 reviewEnd;
         address vault;
+        uint256 executeBy;
+        uint256 strategyDuration;
+    }
+
+    uint256 public executeBy;
+    uint256 public strategyDuration;
+
+    /// @dev Left at 0/0 by default, which makes `coverUntil` fall at or before
+    ///      epoch genesis so the ledger books into the CURRENT epoch — the
+    ///      pre-ADR behaviour every existing test in this file was written
+    ///      against. Set them to exercise the settlement-dated bucket.
+    function setSchedule(uint256 executeBy_, uint256 duration_) external {
+        executeBy = executeBy_;
+        strategyDuration = duration_;
     }
 
     uint256 public requiredCoverage;
@@ -67,6 +81,8 @@ contract MockGovernorWithCoverage is MockGovernorMinimal {
 
     function getProposalView(uint256) external view returns (ProposalViewLite memory v) {
         v.vault = proposalVault;
+        v.executeBy = executeBy;
+        v.strategyDuration = strategyDuration;
     }
 }
 
@@ -229,15 +245,32 @@ contract RegistryExposureHookTest is Test {
         assertEq(ledger.openExposureUsd(g1), 0);
     }
 
-    function test_overCapGuardianCannotApprove() public {
-        // Zero the governance WOOD price so g1's slashable bond — and therefore
-        // its free budget — is exactly $0. With no budget left to commit, the
-        // approve vote reverts outright rather than committing a partial share.
-        vm.prank(ledgerOwner);
-        ledger.setWoodUsdPrice(0);
+    /// @notice N1 — a guardian with no free budget can still VOTE; it just
+    ///         books no coverage. Previously the hook reverted and took the vote
+    ///         with it, silencing the approve side while Block votes still
+    ///         worked. That is the shape the C1 veto survived in: an attacker
+    ///         who front-runs while the cohort is busy bricks the proposal,
+    ///         because the guardians who would have covered it cannot
+    ///         participate at all.
+    function test_overCapGuardianVotesButBooksNothing() public {
+        // Zero g1's slashable bond so its free budget is exactly $0. Done by
+        // mocking the ledger's stake reads rather than by zeroing the WOOD
+        // price: the price setter is rate-limited now (review M4) and this test
+        // sits inside an already-open review window, so waiting out the interval
+        // would push past `reviewEnd` and change what is being tested.
+        vm.mockCall(address(wired.swood), abi.encodeWithSignature("guardianStake(address)", g1), abi.encode(uint256(0)));
+        vm.mockCall(
+            address(wired.swood), abi.encodeWithSignature("delegatedInbound(address)", g1), abi.encode(uint256(0))
+        );
+        assertEq(ledger.slashableBondUsd(g1), 0, "no slashable bond -> no free budget");
+
         vm.prank(g1);
-        vm.expectRevert(IExposureLedger.ExposureCapExceeded.selector);
         wired.registry.voteOnProposal(address(wired.gov), PID, IGuardianRegistry.GuardianVoteType.Approve);
+
+        assertEq(ledger.openExposureUsd(g1), 0, "no coverage booked");
+        (address[] memory approvers,,) = wired.registry.getApproverWeights(address(wired.gov), PID);
+        assertEq(approvers.length, 1, "...but the vote itself counted");
+        assertEq(approvers[0], g1);
     }
 
     function test_ledgerUnset_votesUnaffected() public {

@@ -185,6 +185,16 @@ contract TierRegistry is Ownable2Step {
     ///         it goes demote → timelock → claim → fresh certify, so the old
     ///         bond must traverse its release timelock (slash-first layering)
     ///         before the key can carry a new bond.
+    ///
+    ///         OPERATIONAL COST, stated rather than discovered (review m2):
+    ///         this applies to BENIGN edits too. Correcting an
+    ///         `extractableBoundBps` typo, or re-certifying after a legitimate
+    ///         adapter upgrade, costs the full demote → 14d → claim → certify
+    ///         cycle — and the key sits at tier 2 (full notional, priced not
+    ///         bounded) for the whole window. Deliberate: the alternative is a
+    ///         path that swaps a certification out from under a live bond. It
+    ///         belongs in the runbook so operators plan around it rather than
+    ///         discovering it mid-incident.
     function certify(address target, bytes4 selector, uint8 tier, uint16 extractableBoundBps, address submitter)
         external
         onlyOwner

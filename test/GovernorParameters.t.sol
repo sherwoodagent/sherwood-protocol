@@ -204,6 +204,51 @@ contract GovernorParametersTest is Test {
         assertEq(governor.getGovernorParams().maxStrategyDuration, newVal);
     }
 
+    // ── ADR 2026-07-26: protocol-wide strategy-duration ceiling ───────────
+
+    /// @notice The vault owner may no longer bind guardians for as long as they
+    ///         like. Duration determines how long APPROVERS carry exposure, so
+    ///         the ceiling belongs to the protocol, not to the party proposing.
+    function test_setMaxStrategyDuration_respectsTheProtocolCeiling() public {
+        vm.prank(owner);
+        protocolConfig.setMaxStrategyDuration(30 days);
+
+        vm.prank(owner);
+        vm.expectRevert(ISyndicateGovernor.InvalidStrategyDurationBounds.selector);
+        governor.setMaxStrategyDuration(30 days + 1);
+
+        // Exactly at the ceiling is fine.
+        vm.prank(owner);
+        governor.setMaxStrategyDuration(30 days);
+        assertEq(governor.getGovernorParams().maxStrategyDuration, 30 days);
+    }
+
+    /// @notice UNSET (0) MEANS NO CEILING. Failing closed would brick every
+    ///         vault deployed before this parameter existed, the moment the
+    ///         config were upgraded — a fail-closed default is right for
+    ///         coverage, wrong for a bound that did not previously exist.
+    function test_setMaxStrategyDuration_unsetCeilingIsUnbounded() public {
+        assertEq(protocolConfig.maxStrategyDuration(), 0, "fixture leaves it unset");
+        // Hoisted: a call in ARGUMENT position is evaluated first and would
+        // consume the one-shot prank, leaving the setter to run unpranked.
+        uint256 absoluteMax = governor.ABSOLUTE_MAX_STRATEGY_DURATION();
+        vm.prank(owner);
+        governor.setMaxStrategyDuration(absoluteMax);
+        assertEq(governor.getGovernorParams().maxStrategyDuration, absoluteMax);
+    }
+
+    /// @notice A ceiling below the usable floor would make every vault
+    ///         unproposable protocol-wide in one transaction.
+    function test_protocolConfig_rejectsADegenerateCeiling() public {
+        vm.startPrank(owner);
+        vm.expectRevert(IProtocolConfig.InvalidMaxStrategyDuration.selector);
+        protocolConfig.setMaxStrategyDuration(1 hours);
+
+        protocolConfig.setMaxStrategyDuration(0); // unset stays legal
+        assertEq(protocolConfig.maxStrategyDuration(), 0);
+        vm.stopPrank();
+    }
+
     function test_setMaxStrategyDuration_aboveAbsoluteMax_reverts() public {
         uint256 aboveMax = governor.ABSOLUTE_MAX_STRATEGY_DURATION() + 1;
         vm.prank(owner);

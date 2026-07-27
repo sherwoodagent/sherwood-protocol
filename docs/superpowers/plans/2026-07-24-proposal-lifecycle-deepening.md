@@ -518,9 +518,16 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
         if (outcome == IGuardianRegistry.ReviewOutcome.Cleared) {
             return (block.timestamp > p.executeBy ? ProposalState.Expired : ProposalState.Approved, true);
         }
-        // Unresolved past reviewEnd should be unreachable for a registered
-        // review; stay in GuardianReview defensively (fail-closed).
-        return (ProposalState.GuardianReview, false);
+        // SUPERSEDED — do not implement this branch as written. Holding at
+        // GuardianReview strands the proposal AND the vault it binds:
+        // `resolveReview` reverts ReviewNotReadyForResolve, `_openProposalCount`
+        // stays pinned, and `emergencyCancel` is Draft/Pending-only, so only a
+        // beacon upgrade recovers it. As shipped, this branch returns a
+        // terminal `Expired` — closed (never executable without a guardian
+        // review) AND live (`_decOpen` releases the vault binding). See the
+        // TERMINAL AND CLOSED note on `_afterVote` in `src/ProposalLifecycle.sol`
+        // and `test_unregisteredWindowExpiresAndCannotExecute`.
+        return (ProposalState.Expired, false);
     }
 
     // ── State writes (single writer) ──

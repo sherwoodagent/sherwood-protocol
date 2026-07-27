@@ -363,6 +363,234 @@ contract CoverageEndToEndTest is Test {
         return uint256(gov.getProposal(pid).state);
     }
 
+    /// @dev First instant at which a vote CHANGE is refused — the registry's
+    ///      anti-sniping window, `reviewEnd - (reviewWindow * 10%)`. The C1
+    ///      attack depended on flipping one second before this.
+    function _lockoutStart(SyndicateGovernor gov, uint256 pid) internal view returns (uint256) {
+        ISyndicateGovernor.StrategyProposal memory p = gov.getProposal(pid);
+        uint256 window = p.reviewEnd - p.voteEnd;
+        return p.reviewEnd - (window * registry.LATE_VOTE_LOCKOUT_BPS()) / 10_000;
+    }
+
+    /// @notice n3 — wiring a ledger onto a governor that already has live
+    ///         proposals would brick them: they were created before coverage
+    ///         existed, so nobody could have booked any, and `executeProposal`
+    ///         starts demanding it the moment the ledger is wired.
+    ///
+    ///         The M3 change made this worse rather than better — the approve
+    ///         hook now books nothing instead of reverting, so the failure moved
+    ///         from loud at vote time to silent until execute. Refusing the
+    ///         wiring is the last point it is visible.
+    function test_n3_cannotWireTheLedgerWhileProposalsAreOpen() public {
+        uint256 pid = _propose(govA, address(vaultA), agentA);
+        assertGt(govA.openProposalCount(), 0, "a proposal is in flight");
+
+        vm.expectRevert(ISyndicateGovernor.ParamsFrozenDuringProposal.selector);
+        govA.setExposureLedger(address(ledger));
+
+        // Un-wiring stays legal: it can only relax the execute gate.
+        govA.setExposureLedger(address(0));
+
+        // Once nothing is open, wiring is allowed again.
+        _openReview(govA, pid);
+        _vote(govA, pid, g1, IGuardianRegistry.GuardianVoteType.Approve);
+        _pastReview(govA, pid);
+        govA.executeProposal(pid);
+        vm.warp(vm.getBlockTimestamp() + 8 days); // strategy must run its course
+        vm.prank(agentA);
+        govA.settleProposal(pid);
+        assertEq(govA.openProposalCount(), 0, "nothing in flight");
+        govA.setExposureLedger(address(ledger));
+    }
+
+    // ── N1: budget exhaustion must not silence the approve side ───────────
+
+    /// @notice N1 (re-review) — a guardian whose budget went on an earlier
+    ///         proposal can still CAST an approve vote on the next one. It
+    ///         books nothing, so the batching cap is untouched, but the vote
+    ///         itself lands.
+    ///
+    ///         Before this, `recordApproval` reverted `ExposureCapExceeded` and
+    ///         took `voteOnProposal` down with it. That is what let the C1 veto
+    ///         survive in a second form: an attacker who front-runs while the
+    ///         cohort is busy still bricks the proposal, because the guardians
+    ///         who would have covered it cannot participate at all.
+    function test_n1_spentBudgetStillVotesAndDoesNotBreakTheReview() public {
+        // Warm-up on syndicate B consumes g3's budget entirely.
+        uint256 pidB = _propose(govB, address(vaultB), agentB);
+        _openReview(govB, pidB);
+        _vote(govB, pidB, g3, IGuardianRegistry.GuardianVoteType.Approve);
+        assertEq(ledger.openExposureUsd(g3), COVERAGE_USD, "g3 fully committed on B");
+
+        // Target proposal on syndicate A, same epoch.
+        uint256 pidA = _propose(govA, address(vaultA), agentA);
+        _openReview(govA, pidA);
+
+        // g3 has nothing left to pledge -- and votes anyway.
+        _vote(govA, pidA, g3, IGuardianRegistry.GuardianVoteType.Approve);
+        assertEq(ledger.allocatedUsd(address(govA), pidA, g3), 0, "books nothing: the cap still binds");
+
+        (address[] memory approvers,,) = registry.getApproverWeights(address(govA), pidA);
+        assertEq(approvers.length, 1, "but the review counted the vote");
+        assertEq(approvers[0], g3);
+
+        // g1 still has budget, so the proposal is genuinely coverable.
+        _vote(govA, pidA, g1, IGuardianRegistry.GuardianVoteType.Approve);
+        assertGt(ledger.openExposureUsd(g1), 0);
+
+        _pastReview(govA, pidA);
+        govA.executeProposal(pidA);
+        assertEq(_state(govA, pidA), uint256(ISyndicateGovernor.ProposalState.Executed), "executes on real coverage");
+    }
+
+    // ── Exit gating (ADR 2026-07-26) ──────────────────────────────────────
+
+    /// @notice A guardian who is currently insuring a proposal cannot pull
+    ///         their stake, however long they wait. The cooldown alone could
+    ///         not enforce this: it ships at 7 days against obligations running
+    ///         ~42, which is why the deploy pre-flight refuses to deploy.
+    ///
+    ///         REQUESTING stays open — it marks them inactive immediately, so
+    ///         they take on no new commitments while the existing one runs
+    ///         down. Only the release waits.
+    function test_exitGate_blocksClaimWhileCoverageIsOpen() public {
+        vm.startPrank(owner);
+        swood.setExposureLedger(address(ledger));
+        // Drop the cooldown to the value production actually ships (7 days).
+        // The fixture's 45d already outlasts this fixture's ~42d of coverage,
+        // so the timer would mask the gate and the test would prove nothing.
+        // A short cooldown is the case the gate exists for — and the case
+        // `DeployPlanB`'s pre-flight currently refuses to deploy.
+        swood.setCooldownPeriod(7 days);
+        vm.stopPrank();
+
+        uint256 pid = _propose(govA, address(vaultA), agentA);
+        _openReview(govA, pid);
+        _vote(govA, pid, g1, IGuardianRegistry.GuardianVoteType.Approve);
+        assertGt(ledger.openExposureUsd(g1), 0, "g1 is on the hook");
+
+        vm.prank(g1);
+        swood.requestUnstakeGuardian(); // allowed: stops them taking on more
+
+        // Past the cooldown but INSIDE the coverage window — the interval the
+        // timer alone cannot police, and the whole reason the gate exists.
+        vm.warp(vm.getBlockTimestamp() + 7 days + 1);
+        assertGt(ledger.openExposureUsd(g1), 0, "precondition: cooldown elapsed, coverage still open");
+
+        vm.prank(g1);
+        vm.expectRevert(StakedWood.CoverageStillOpen.selector);
+        swood.claimUnstakeGuardian();
+    }
+
+    /// @notice ...and released once the coverage genuinely expires. The gate is
+    ///         a condition, not a longer timer.
+    function test_exitGate_releasesOnceCoverageExpires() public {
+        vm.prank(owner);
+        swood.setExposureLedger(address(ledger));
+
+        uint256 pid = _propose(govA, address(vaultA), agentA);
+        _openReview(govA, pid);
+        _vote(govA, pid, g1, IGuardianRegistry.GuardianVoteType.Approve);
+
+        vm.prank(g1);
+        swood.requestUnstakeGuardian();
+
+        // Past the bucket covering settlement plus its challenge window.
+        vm.warp(vm.getBlockTimestamp() + 365 days);
+        assertEq(ledger.openExposureUsd(g1), 0, "coverage has expired");
+
+        uint256 balBefore = wood.balanceOf(g1);
+        vm.prank(g1);
+        swood.claimUnstakeGuardian();
+        assertGt(wood.balanceOf(g1), balBefore, "stake released once nothing is owed");
+    }
+
+    /// @notice FAIL-OPEN with no ledger wired. There is necessarily a window at
+    ///         deploy — and again on a UUPS upgrade — where the pointer is
+    ///         zero, and bricking withdrawals over a missed configuration step
+    ///         would be worse than the hole. `DeployPlanB` asserts the wiring
+    ///         instead, so the failure surfaces as a refused deploy.
+    function test_exitGate_failsOpenWhenNoLedgerIsWired() public {
+        assertEq(swood.exposureLedger(), address(0), "fixture leaves it unwired");
+
+        uint256 pid = _propose(govA, address(vaultA), agentA);
+        _openReview(govA, pid);
+        _vote(govA, pid, g1, IGuardianRegistry.GuardianVoteType.Approve);
+        assertGt(ledger.openExposureUsd(g1), 0, "genuinely on the hook...");
+
+        vm.prank(g1);
+        swood.requestUnstakeGuardian();
+        vm.warp(vm.getBlockTimestamp() + 365 days);
+        vm.prank(g1);
+        swood.claimUnstakeGuardian(); // ...and still allowed out: no gate wired
+    }
+
+    // ── C1 regression, end to end ─────────────────────────────────────────
+
+    /// @notice C1 — the free-rider veto, reconstructed against the REAL stack
+    ///         rather than mocks, because the attack composed three contracts:
+    ///         the ledger's booking rule, the registry's release-on-flip, and
+    ///         the registry's late-vote lockout. A unit test over the ledger
+    ///         alone proves only the first third.
+    ///
+    ///         The attack: g2 holds 20k of 90k staked WOOD — 2,222 bps, well
+    ///         under the 3,000 bps block quorum, so it cannot legitimately veto
+    ///         anything. Under first-come booking it approved first and absorbed
+    ///         the entire $1,000 of coverage; g3's approve then booked $0 and
+    ///         left it off the ledger's approver list; g2 flipped to Block one
+    ///         second before the lockout, releasing everything. Coverage $0, g3
+    ///         unable to re-register, review NOT blocked (g2 never reached
+    ///         quorum) — so the proposal resolved Approved and then reverted
+    ///         `InsufficientApproveCoverage` on execute, forever, at a cost of
+    ///         gas and with no conviction to slash.
+    ///
+    ///         With per-approver reservations there is nothing to absorb, so
+    ///         every step below still happens and the proposal executes anyway.
+    function test_poc_freeRiderVetoIsClosed() public {
+        uint256 pid = _propose(govA, address(vaultA), agentA);
+        _openReview(govA, pid);
+
+        // 1. The attacker gets in first. It reserves the full coverage — but a
+        //    reservation is an upper bound on liability, not a claim on the book.
+        _vote(govA, pid, g2, IGuardianRegistry.GuardianVoteType.Approve);
+        assertEq(ledger.openExposureUsd(g2), COVERAGE_USD, "attacker reserves the coverage");
+
+        // 2. THE FIX. The honest approver is no longer free-ridden into a zero
+        //    commitment, and is on the ledger's approver list. This assertion is
+        //    the exact line that read `0` before.
+        _vote(govA, pid, g3, IGuardianRegistry.GuardianVoteType.Approve);
+        assertEq(ledger.openExposureUsd(g3), COVERAGE_USD, "honest approver books its own reservation");
+        assertGe(ledger.slashableBondUsd(g3), COVERAGE_USD, "and could carry the proposal alone");
+
+        // Both reserved the full coverage, so each carries half of it for now.
+        assertEq(ledger.allocatedUsd(address(govA), pid, g2), COVERAGE_USD / 2, "split while both are in");
+        assertEq(ledger.allocatedUsd(address(govA), pid, g3), COVERAGE_USD / 2);
+
+        // 3. The attacker flips to Block at the last permitted instant, which
+        //    releases its reservation at zero cost. Exactly as before.
+        vm.warp(_lockoutStart(govA, pid) - 1);
+        _vote(govA, pid, g2, IGuardianRegistry.GuardianVoteType.Block);
+        assertEq(ledger.openExposureUsd(g2), 0, "attacker walks away paying nothing");
+
+        // 4. ...but the survivor's allocation scales UP to absorb the whole
+        //    proposal, instead of the coverage collapsing to zero.
+        assertEq(ledger.allocatedUsd(address(govA), pid, g3), COVERAGE_USD, "g3 absorbs the full coverage");
+        assertEq(ledger.allocatedUsd(address(govA), pid, g2), 0, "a released approver carries nothing");
+
+        // 5. The lockout still binds — g3 genuinely cannot re-register, which is
+        //    what made the original veto permanent. It no longer needs to.
+        vm.warp(_lockoutStart(govA, pid) + 1);
+        vm.prank(g3);
+        vm.expectRevert(IGuardianRegistry.VoteChangeLockedOut.selector);
+        registry.voteOnProposal(address(govA), pid, IGuardianRegistry.GuardianVoteType.Block);
+
+        // 6. The review resolves Approved (g2 never reached block quorum) — and
+        //    this time the proposal EXECUTES rather than being bricked.
+        _pastReview(govA, pid);
+        govA.executeProposal(pid);
+        assertEq(_state(govA, pid), uint256(ISyndicateGovernor.ProposalState.Executed), "the veto no longer lands");
+    }
+
     // ── 1. Full lifecycle: coverage accounting round-trips ────────────────
 
     /// @notice propose (bond locked, covered-TVL cap cleared) → guardian approves
