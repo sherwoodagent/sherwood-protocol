@@ -61,6 +61,24 @@ interface IExposureLedger {
 
     // ── Views ──
 
+    /// @notice Per-approver slash rates for a proposal, in bps of each
+    ///         guardian's own slashable stake, positionally aligned with the
+    ///         returned approver list.
+    /// @dev    Feeds `IStakedWood.slashToEscrow` directly. Each rate is that
+    ///         guardian's booked coverage divided by their live slashable bond
+    ///         — both USD, so the quotient is DIMENSIONALLY unitless, but both
+    ///         operands are priced (PR #24 review 🟡N5): the numerator reads
+    ///         the asset's Chainlink feed behind a `StalePrice` gate (a stale
+    ///         feed makes the conviction unpriceable and this view reverts),
+    ///         and the denominator is priced by `woodPriceX8()` — Chainlink
+    ///         with the haircut, owner-set `woodUsdPriceX8` only as the
+    ///         degraded fallback. See the implementation natspec for the
+    ///         liveness and governance-trust consequences. A guardian who
+    ///         booked nothing returns 0 and is therefore slashed nothing.
+    function slashBpsFor(address governor, uint256 proposalId)
+        external
+        view
+        returns (address[] memory approvers, uint256[] memory bps);
     /// @notice What `guardian` actually carries on this proposal, after the
     ///         pro-rata scale-back — as opposed to the deliberately over-sized
     ///         amount `recordApproval` reserved.

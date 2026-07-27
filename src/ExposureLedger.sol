@@ -849,6 +849,35 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      coverage — R1 requires an identified signer for anything tier-gated
     ///      into this check. Called by `SyndicateGovernor.executeProposal` for
     ///      proposals with `envelopeTier >= quorumTierThreshold`.
+    ///
+    /// @dev KNOWN GAP — THIS GATE DOES NOT PRICE IN `maxSlashBps` (PR #24
+    ///      review 🟠N3). The sum checked here is
+    ///      `Σ min(live_i, reserved_i) >= needUsd`. What the slash can actually
+    ///      TAKE is `Σ min(live_i · maxSlashBps/10_000, allocated_i)`, because
+    ///      `slashToEscrow` clamps every rate to the severity ceiling. So an
+    ///      allocation that runs to the top of a bond is short by
+    ///      `1 - maxSlashBps/10_000` of itself: 20% at the fixture's 8,000,
+    ///      50% at 5,000 (deploy scripts ship 10,000, where the clamp never
+    ///      binds — see spec §3.8). Worked case — coverage set to exactly the joint slashable
+    ///      bond ($2,000 across two $1,000 own-stake bonds): this gate PASSES,
+    ///      both derived rates are a correct 10,000 bps, and recovery is
+    ///      $1,600 against a $2,000 loss (80%).
+    ///
+    ///      This is a hole in FRONT of the residual, not behind it — distinct
+    ///      from the "bond shrank since the vote" case `slashBpsFor` documents
+    ///      as unavoidable. It is an UNENFORCED RUNTIME INVARIANT (spec §3.8):
+    ///      nothing here or in the deploy pre-flight keeps `maxSlashBps` at a
+    ///      value where the clamp never binds, so the gap is real the moment
+    ///      governance lowers the ceiling. Closing it is a change to the
+    ///      coverage GATE (either require
+    ///      `Σ min(live_i · maxSlashBps/10_000, reserved_i) >= needUsd`, or
+    ///      restate spec §2's inequality as
+    ///      `recovery >= loss · maxSlashBps/10_000`), and that belongs in its
+    ///      own PR with its own parameter re-derivation rather than bolted onto
+    ///      the slash rails. `test_recoveryCoversEveryApproversAllocation`
+    ///      exercises BOTH regimes — the slack one where the clamp never fires
+    ///      and the binding one above — so the shortfall is measured and pinned
+    ///      rather than assumed away.
     function requireApproveQuorum(address governor, uint256 proposalId, address asset, uint256 requiredCoverage)
         external
         view
@@ -882,6 +911,111 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         // The loop early-returns on success — reaching here means the covering
         // approvers' aggregate never met the required coverage.
         revert InsufficientApproveCoverage();
+    }
+
+    /// @inheritdoc IExposureLedger
+    /// @dev The bridge between what a guardian UNDERWROTE and what the verdict
+    ///      path can actually take. `slashToEscrow` speaks in bps of stake; the
+    ///      ledger books liability in USD. Dividing one USD quantity by the
+    ///      other cancels the unit DIMENSIONALLY — but not the price
+    ///      sensitivity, and an earlier version of this comment claimed the
+    ///      conversion "needs no price read of its own" (PR #24 review 🟡N5).
+    ///      It reads two. Both operands are priced:
+    ///        - the numerator (the allocation) traces back to `coverageUsd`,
+    ///          which reads a Chainlink feed behind a `StalePrice` gate — so a
+    ///          stale asset feed makes a conviction UNPRICEABLE and this view
+    ///          reverts. Feed outages correlate with exactly the market stress
+    ///          a drain happens in, so that is a real liveness hole in the
+    ///          slash path;
+    ///        - the denominator (`live`, via `_slashableBondUsd`) is priced by
+    ///          `woodPriceX8()` — Chainlink primary with `woodHaircutBps`,
+    ///          owner-set `woodUsdPriceX8` as the degraded fallback — the SAME
+    ///          read `requireApproveQuorum`, `allocatedUsd` and `settleCoverage`
+    ///          use (PR #24 review F-B: this site briefly read the raw scalar,
+    ///          a Plan B merge artefact, so the gate and the rail priced the
+    ///          same bond differently the moment a feed was wired). In the
+    ///          fallback regime governance still resizes every conviction with
+    ///          one scalar.
+    ///      Both are governance-trust statements of the same family as D4's,
+    ///      recorded here rather than argued away.
+    ///
+    ///      Approvers come from the ledger's OWN `_approversOf`, exactly as
+    ///      `requireApproveQuorum` does and for the same reason (review finding
+    ///      I-1). A guardian holding a zero commitment — released by a vote
+    ///      change, or an approval that landed after coverage was already met —
+    ///      yields 0 bps and is slashed nothing. That is the intended
+    ///      semantics, not an omission: liability follows the commitment, and an
+    ///      approver who consumed none of their budget underwrote none of the
+    ///      loss.
+    ///
+    ///      Two saturating cases, both deliberate:
+    ///        - `committed >= live` — the bond shrank since the vote (unstake,
+    ///          or a WOOD price crash) — pins the rate at 100%. The case then
+    ///          under-recovers by the shortfall, which is unavoidable: the
+    ///          guardian does not have it. `requireApproveQuorum` already
+    ///          re-checks coverage in LIVE dollars at execution, so this is the
+    ///          residual after that gate, not a hole in front of it.
+    ///        - `live == 0` likewise yields 100%, keeping the division defined.
+    ///          Nothing is recoverable either way — `_slashOne` clamps to live
+    ///          stake — so the value is inert.
+    ///
+    ///      Rounds UP. Truncating would shave every approver's rate and the
+    ///      residue compounds across a cohort; rounding toward the protocol
+    ///      keeps `sum(slashed) >= loss` intact at the wei level.
+    function slashBpsFor(address governor, uint256 proposalId)
+        external
+        view
+        returns (address[] memory approvers, uint256[] memory bps)
+    {
+        bytes32 key = _reviewKey(governor, proposalId);
+        address[] storage listed = _approversOf[key];
+        uint256 n = listed.length;
+        approvers = new address[](n);
+        bps = new uint256[](n);
+
+        // Hoisted for the reason `requireApproveQuorum` hoists them (M-4).
+        uint256 maxDelegated = swood.maxDelegatedSlashBps();
+        uint256 priceX8 = woodPriceX8();
+
+        // Prices against the ALLOCATION, never the reservation. `recordApproval`
+        // deliberately over-reserves — each approver books up to the full
+        // coverage so there is no leftover to squat — so the reservation is an
+        // upper bound on liability, not the liability. Slashing it would take
+        // the whole coverage from EVERY approver: two approvers on a $8,000
+        // proposal each carry $4,000 but each reserved $5,000.
+        //
+        // Read once here rather than calling `allocatedUsd` per guardian: that
+        // would repeat two external calls (`getProposalView`, then the vault's
+        // `asset()`) and a feed read on every iteration.
+        ILedgerGovernorMinimal gov = ILedgerGovernorMinimal(governor);
+        uint256 needUsd = coverageUsd(
+            IVaultAssetMinimal(gov.getProposalView(proposalId).vault).asset(), gov.getRequiredCoverage(proposalId)
+        );
+        // EFFECTIVE basis, matching `allocatedUsd` (review n1). Dividing by the
+        // raw pledged total would let a guardian whose bond has gone keep
+        // shrinking everyone else's rate — and this is the slash path, so the
+        // shortfall would be unrecoverable rather than merely mis-stated. The
+        // two must agree about the same guardian.
+        uint256 effectiveTotal = _effectiveTotal(key, maxDelegated, priceX8);
+        if (effectiveTotal == 0) return (approvers, bps);
+
+        for (uint256 i = 0; i < n; i++) {
+            address g = listed[i];
+            approvers[i] = g;
+            uint256 reserved = _recorded[key][g].usd;
+            if (reserved == 0) continue; // released -> owes nothing
+            uint256 liveG = _slashableBondUsd(g, maxDelegated, priceX8);
+            uint256 mine = liveG < reserved ? liveG : reserved;
+            uint256 owed = _allocate(mine, effectiveTotal, needUsd);
+            if (owed == 0) continue; // scaled to dust -> nothing to collect
+            uint256 live = liveG;
+            if (live == 0 || owed >= live) {
+                bps[i] = BPS_DENOMINATOR;
+                continue;
+            }
+            // `owed <= reserved`, itself a uint192, so this cannot overflow.
+            bps[i] = (owed * BPS_DENOMINATOR + live - 1) / live;
+        }
     }
 
     /// @inheritdoc IExposureLedger

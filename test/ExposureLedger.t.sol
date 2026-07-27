@@ -1279,4 +1279,168 @@ contract ExposureLedgerTest is Test {
         vm.expectRevert(IExposureLedger.InvalidParameter.selector);
         ledger.recordApproval(address(mgov), 1, guardian);
     }
+
+    /// @notice `slashBpsFor` converts each guardian's BOOKED coverage into the
+    ///         bps-of-stake that `slashToEscrow` speaks. Both inputs are USD, so
+    ///         the quotient is DIMENSIONALLY unitless — but both operands are
+    ///         priced (🟡N5): asset feed in the numerator, `woodPriceX8()` in
+    ///         the denominator. Here the two approvers underwrote different
+    ///         amounts of the same proposal, so they must carry different rates.
+    function test_slashBpsFor_ratesTrackEachApproversOwnCommitment() public {
+        _wireRecording();
+        address g2 = makeAddr("g2");
+        swood.setStake(g2, 50_000e18, 0); // $2,500 bond vs the guardian's $5,000
+        mgov.set(2_000e6); // $2,000 needed — either could carry it alone
+
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, g2);
+
+        // Both reservations are capped by the COVERAGE ($2,000), not by budget,
+        // so the pro-rata split is even: $1,000 of liability each.
+        assertEq(ledger.allocatedUsd(address(mgov), 1, guardian), 1_000e18);
+        assertEq(ledger.allocatedUsd(address(mgov), 1, g2), 1_000e18);
+
+        (address[] memory approvers, uint256[] memory bps) = ledger.slashBpsFor(address(mgov), 1);
+
+        assertEq(approvers.length, 2, "both approvers listed");
+        assertEq(approvers[0], guardian);
+        assertEq(approvers[1], g2);
+        // Equal liability, unequal bonds -> unequal RATES. $1,000 is a fifth of
+        // the guardian's $5,000 but two fifths of g2's $2,500, and the rate is
+        // what `slashToEscrow` applies to each one's own stake.
+        assertEq(bps[0], 2_000, "a fifth of the larger bond");
+        assertEq(bps[1], 4_000, "two fifths of the smaller one");
+    }
+
+    /// @notice PR #24 review F-B: `slashBpsFor` must price the bond with
+    ///         `woodPriceX8()` — the same Chainlink-with-haircut read every
+    ///         other consumer uses — not the raw governance scalar. A merge
+    ///         artefact had it on `woodUsdPriceX8`, so the moment a WOOD feed
+    ///         was wired the gate and the slash rail priced the same bond
+    ///         differently: a feed above the scalar over-slashed 2x, a haircut
+    ///         under-recovered by half.
+    function test_slashBpsFor_pricesBondsWithTheFeedNotTheRawScalar() public {
+        _wireRecording();
+        address g2 = makeAddr("g2");
+        swood.setStake(g2, 50_000e18, 0);
+        mgov.set(2_000e6);
+
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, g2);
+
+        // Baseline (governance scalar $0.05): $5,000 / $2,500 bonds, $1,000
+        // liability each -> 2,000 / 4,000 bps.
+        (, uint256[] memory bpsBefore) = ledger.slashBpsFor(address(mgov), 1);
+        assertEq(bpsBefore[0], 2_000);
+        assertEq(bpsBefore[1], 4_000);
+
+        // Wire a feed at 2x the scalar. `woodPriceX8()` now reads $0.10, the
+        // bonds are worth twice as much, and the SAME dollar liability is half
+        // the rate. Reading the raw scalar would leave the rates unchanged —
+        // taking twice the liability from every approver.
+        MockFeed woodFeed = new MockFeed(0.1e8, 8);
+        vm.prank(owner);
+        ledger.setWoodFeed(address(woodFeed), 1 days);
+        assertEq(ledger.woodPriceX8(), 0.1e8, "feed supersedes the scalar");
+
+        (, uint256[] memory bpsAfter) = ledger.slashBpsFor(address(mgov), 1);
+        assertEq(bpsAfter[0], 1_000, "rate tracks the feed-priced bond");
+        assertEq(bpsAfter[1], 2_000, "rate tracks the feed-priced bond");
+    }
+
+    /// @notice F-B, the other direction (review round-4): the haircut must
+    ///         reach `slashBpsFor` too, and it needs NO feed at all —
+    ///         `_haircut` applies to the fallback scalar. Reading the raw
+    ///         scalar would value the bond at full price and under-recover by
+    ///         the haircut: at 5,000 bps that is half the liability, silently.
+    function test_slashBpsFor_appliesTheHaircut() public {
+        _wireRecording();
+        mgov.set(2_000e6);
+
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+
+        // No WOOD feed wired. Scalar $0.05, bond $5,000, $2,000 liability.
+        (, uint256[] memory bpsBefore) = ledger.slashBpsFor(address(mgov), 1);
+        assertEq(bpsBefore[0], 4_000, "baseline: raw scalar, no haircut");
+
+        // Haircut to 50%: `woodPriceX8()` reads $0.025, the bond books $2,500,
+        // and the same $2,000 liability is 8,000 bps. A raw-scalar read would
+        // stay at 4,000 — a 50% under-recovery with no feed involved.
+        vm.prank(owner);
+        ledger.setWoodHaircutBps(5_000);
+        assertEq(ledger.woodPriceX8(), 0.025e8, "haircut applies to the fallback");
+
+        (, uint256[] memory bpsAfter) = ledger.slashBpsFor(address(mgov), 1);
+        assertEq(bpsAfter[0], 8_000, "rate tracks the haircut-priced bond");
+    }
+
+    /// @notice A guardian whose commitment was RELEASED by a vote change stays
+    ///         in the approver list with a zeroed booking. It must price at 0 —
+    ///         liability follows the commitment, and `slashToEscrow` skips a
+    ///         zero rate rather than flooring it to `minSlashBps`.
+    function test_slashBpsFor_zeroForAnApproverThatBookedNothing() public {
+        _wireRecording();
+        mgov.set(1_000e6);
+
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        vm.prank(registry);
+        ledger.releaseApproval(address(mgov), 1, guardian);
+
+        // #22's M2 fix swap-and-pops a released approver out of the list rather
+        // than leaving it behind with a zeroed commitment, so it is no longer
+        // returned at all. The property this test exists for is unchanged and
+        // arguably stated better: a released approver contributes NOTHING to a
+        // conviction. Previously that was "present with a 0 rate"; it is now
+        // "absent", and `slashToEscrow` cannot slash whom it is not given.
+        (address[] memory approvers, uint256[] memory bps) = ledger.slashBpsFor(address(mgov), 1);
+        assertEq(approvers.length, 0, "released approver is popped, not zeroed");
+        assertEq(bps.length, 0);
+
+        // Re-approving re-lists cleanly, with a real rate.
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        (approvers, bps) = ledger.slashBpsFor(address(mgov), 1);
+        assertEq(approvers.length, 1, "re-listed");
+        assertEq(approvers[0], guardian);
+        assertGt(bps[0], 0, "and carries a real rate again");
+    }
+
+    /// @notice Rounds UP. Truncation would shave every approver's rate and the
+    ///         residue compounds across a cohort, quietly breaking
+    ///         `sum(slashed) >= loss`. $1,000 booked against a $3,000 bond is
+    ///         3333.33 bps, which must price at 3334 rather than 3333.
+    function test_slashBpsFor_roundsUpSoTheCohortNeverUnderCovers() public {
+        _wireRecording();
+        swood.setStake(guardian, 60_000e18, 0); // $3,000 bond at $0.05
+        mgov.set(1_000e6); // books exactly $1,000
+
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+
+        (, uint256[] memory bps) = ledger.slashBpsFor(address(mgov), 1);
+        assertEq(bps[0], 3334, "3333.33 bps rounds toward the protocol");
+    }
+
+    /// @notice When the bond SHRANK below the commitment after the vote —
+    ///         unstaking, or a WOOD price crash — the rate saturates at 100%.
+    ///         The case under-recovers by the shortfall, which is unavoidable:
+    ///         the guardian no longer has it.
+    function test_slashBpsFor_saturatesWhenTheBondShrankBelowTheCommitment() public {
+        _wireRecording();
+        mgov.set(5_000e6); // books the full $5,000 bond
+
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+
+        swood.setStake(guardian, 50_000e18, 0); // bond halves to $2,500
+
+        (, uint256[] memory bps) = ledger.slashBpsFor(address(mgov), 1);
+        assertEq(bps[0], 10_000, "capped at everything the guardian still has");
+    }
 }

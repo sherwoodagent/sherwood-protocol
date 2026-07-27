@@ -195,10 +195,11 @@ check_contract SyndicateFactory script/syndicate-factory-layout.golden.json
 # exists to police. Pinned here so the next append is checked automatically
 # rather than by hand.
 check_contract GuardianRegistry script/guardian-registry-layout.golden.json
-# StakedWood is UUPS and LIVE, and this PR carves `exposureLedger` out of the
-# front of its __gap — exactly the class of change this guard exists to police
-# (review N7). It was pinned on the Plan C branch and not here, which is the
-# wrong way round: the change happens on THIS branch.
+# StakedWood is UUPS and live, and custodies every WOOD bond in the protocol —
+# the highest-consequence layout on this branch (review N7). Plan B carved
+# `exposureLedger` out of its __gap, then Plan C carved `authorizedSlasher`,
+# `compensationEscrow`, and `_verdictSlashed`; pinned here so the next append
+# is checked automatically rather than by hand.
 check_contract StakedWood script/staked-wood-layout.golden.json
 
 [ "${UPDATE_GOLDEN:-0}" = "1" ] ||

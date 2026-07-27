@@ -6,6 +6,10 @@
 
 **Implementation status 2026-07-24 — v1a COMPLETE (Plan A + Plan B).** Plan A (PR #13, merged) shipped §3.1–§3.2: risk envelopes, per-proposal net-outflow metering, adapter tiering with the codehash fail-safe, and the ERC20 selector guard. Plan B (PR #22) completes v1a: the dollar-denominated `ExposureLedger` (§3.3 aggregate cap with epoch-bucketed exposure per §3.4a, §3.3a approve quorum, §3.7 covered-TVL cap), the risk-scaled proposer bond and its escrow (§3.9), the adapter-submitter bond (§3.6), and the factory rewire path that closes LOW-1. **v1b (Plan C) is next:** authorized-slasher entrypoint, compensation escrow (§3.8), challenge game (§3.4), approver premium (§3.10). Bond **forfeiture** lives there — in v1a a bond's only exit is release to the proposer; rejection, expiry and cancellation all return it, because a guardian block is not a conviction.
 
+**Implementation status 2026-07-25 — v1b PART 1 complete (Plan C).** The retroactive-liability *payout rails* are built: `StakedWood` gained an `authorizedSlasher` role and a `slashToEscrow` entrypoint that reuses the existing per-approver slash legs but routes proceeds to a new `CompensationEscrow` instead of the burn address (§4), and the escrow pays **non-transferable, snapshot-gated** claims pro-rata to holders of record at a pre-drain snapshot (§3.8) — closing the F1 recoupment channel. Residue unredeemed after a window sweeps to the protocol backstop, never to live NAV.
+
+**Still outstanding in v1b, and the honest consequence:** the **challenge game (§3.4)** — five predicates, bonded filing, per-proposal coverage freeze, undisputed auto-slash — is **not built** (Plan D), and neither is the **approver premium (§3.10)** or watchtower funding (Plan E). Until the challenge game lands, `authorizedSlasher` is an owner-set address, so **a verdict is a governance action, not an adjudicated one**. The rails are correct and tested; the trigger above them is still a multisig. The two-layer court (§3.5) remains v1c.
+
 **§3.3a wording correction (2026-07-24, SUPERSEDED 2026-07-26 — see below).** §3.3a's "aggregate" is literal: two guardians holding half the coverage each genuinely cover one proposal between them.
 
 **Correction to the correction (2026-07-26).** The paragraph above described booking as `min(free budget, coverage still uncovered)`. That rule was removed: it let the first approver absorb the entire coverage, leaving later ones at zero and unlisted, which a front-run-then-release turned into a costless permanent veto (review C1). An approver now RESERVES `min(free budget, the proposal's FULL coverage)`, and the real per-guardian liability is the pro-rata `allocatedUsd`. The aggregate property is unchanged; the mechanism reaching it is not.
@@ -425,6 +429,89 @@ stable legs and lifts the ceiling.
 
 This mirrors the voting-snapshot primitive already in the design; the omission in
 the first draft was applying it to the payout as well as the vote.
+
+**Residual F1 recoupment channels (PR #24 review; threat model, not accepted
+edges).** The snapshot mechanism itself is sound; its *inputs* carry two
+residual channels and one inherent limit that belong here rather than in a
+"revisit if it becomes common" footnote:
+
+1. **Delegation (OPEN — closed by Plan D/E or a balance checkpoint).**
+   Apportionment reads `getPastVotes`, and `delegate()` is a free,
+   permissionless pointer that decides who a claim belongs to. A coalition that
+   solicits delegations *before* the drain — indistinguishable from ordinary
+   bloc-building — collects the delegating cohort's entire compensation stream.
+   Non-transferability of the claim mapping does not close this: the
+   *entitlement* follows the delegate pointer, and the pointer just has to be
+   set before the snapshot. "Revisit if delegation becomes common" is the wrong
+   trigger because the party who decides whether it becomes common is the
+   attacker. Until a challenge game (Plan D/E) can void such claims or the
+   vault checkpoints raw balances, this channel is open and documented as such
+   in `CompensationEscrow`'s natspec.
+2. **Compromised slasher timestamps (OPEN until Plan D).** `slashToEscrow`'s
+   `openedAt` and `snapshotTimestamp` are caller arguments. The code bounds
+   them against the future and against each other — honest-caller sanity only.
+   A compromised `authorizedSlasher` (today: the owner multisig) passes
+   `openedAt = now` and pins any past snapshot, including a post-drain instant
+   at which the coalition holds the supply — restoring F1 in full. Closed only
+   when the slasher is Plan D's challenge game passing timestamps from a
+   registered verdict record.
+3. **Pre-drain accumulation (INHERENT).** An attacker who accumulates shares
+   *before* the drain holds a genuine pre-drain claim and receives `f·S`
+   pro-rata — at essentially no marginal cost if the drain takes 100% of NAV
+   anyway. This is inherent to any pro-rata compensation scheme (the attacker
+   really was a holder of record) and is not fixable at this layer; it bounds
+   how much of the slash a *fully-invested* attacker recoups to its pre-drain
+   share fraction.
+4. **Queued exiters on a pre-existing vault (OPEN — migration, not a code
+   fix).** `VaultWithdrawalQueue.claimCompensation` pays the queue's custody
+   claim through to request owners, which closes the modal-victim gap **for
+   vaults deployed after that change**. It does not retrofit. The queue is a
+   plain constructor deployment behind no proxy and `setWithdrawalQueue` is
+   factory-only and set-once, so on an existing vault the queue accrues votes
+   and is credited a claim it has no code to pull; that cohort's compensation
+   strands and sweeps to the backstop. Outcome-identical to the pre-fix state,
+   so not a regression — but it must not be read as covered. Migration is a new
+   syndicate, or a vault upgrade adding a queue-replacement path.
+
+   The sibling caveat — a holder undelegated because its last receipt predates
+   the `_update` upgrade — *does* self-heal, and can be forced: `_update` runs
+   on a zero-value transfer, so a keeper can arm the entire legacy holder set
+   without holder cooperation, ahead of any snapshot.
+
+**What the §2 inequality does and does not say (PR #24 review 🟠N3).**
+`recovery ≥ loss` is measured, and it holds only where the severity clamp does
+not bind. `requireApproveQuorum` admits coverage up to
+`Σ min(live_i, reserved_i)`, while the slash can take at most
+`Σ min(live_i · maxSlashBps/10_000, allocated_i)`. Set coverage to exactly the
+joint slashable bond and the gate passes, every derived rate correctly
+saturates at 10,000 bps, and recovery lands at `loss · maxSlashBps/10_000` —
+80% at a 8,000-bps ceiling, 50% at 5,000. (8,000 is the *test fixture's*
+ceiling, not the shipped one — PR #24 review N3 correction:
+`DEFAULT_MAX_SLASH_BPS = 10_000` in `script/Deploy.s.sol`, both testnet scripts
+seat 10,000, and `DeployPlanB` pre-flight 1b *refuses* to deploy otherwise. At
+10,000 the clamp never binds and recovery is exactly 1.0× allocation, so the
+shortfall regime is unreachable in every configuration this repo can produce.
+That reclassifies the gap from an open design question to an **unenforced
+runtime invariant**: `setMaxSlashBps` accepts anything in
+`[minSlashBps, 10_000]`, so one governance transaction after deploy silently
+re-opens it. Follow-up: a floor on that setter, or price `maxSlashBps` into
+`requireApproveQuorum`.) This is a gap in *front* of the
+residual, distinct from the "bond shrank since the vote" case `slashBpsFor`
+documents as unavoidable. Both regimes are now pinned by tests
+(`test_recoveryCoversEveryApproversAllocation`,
+`test_recoveryFallsShortWhenTheCeilingBinds`). Closing it means either pricing
+`maxSlashBps` into the quorum gate or restating this inequality as
+`recovery ≥ loss · maxSlashBps/10_000`; that is a coverage-gate change with its
+own parameter re-derivation and is **not** settled by the slash-rail work.
+
+**Verdict slashes are one-shot per (case, approver) (PR #24 review 🟠N2).** The
+severity envelope binds per verdict, not per call: `_slashOne` applies its rate
+to live stake while sizing off the at-open checkpoint, so repeats compound
+geometrically (`1-(1-bps)^N`). Since a full-quorum batch (~27M gas at the
+100-approver cap) must be split across transactions to land at all, splitting
+was the natural workaround *and* silently voided the ceiling. `StakedWood`
+records `(caseKey, approver)` pairs and refuses a second slash; splitting a
+batch across transactions stays legal, replaying an approver does not.
 
 ### 3.9 Risk-scaled proposer bond (F3)
 
