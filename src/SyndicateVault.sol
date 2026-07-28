@@ -579,14 +579,25 @@ contract SyndicateVault is
     /// @dev Reads the active proposal's strategy through the governor's scalar
     ///      `strategyOf` getter. Returns `address(0)` when no proposal is active
     ///      OR when the active proposal opted out of live NAV (proposer passed
-    ///      `strategy=0`). No defensive catch: an `address` return cannot drift
-    ///      in shape the way the old full-struct `getProposal` read could.
+    ///      `strategy=0`). Still wrapped in try/catch: the shape argument (an
+    ///      `address` return cannot drift the way the old full-struct
+    ///      `getProposal` read could) says nothing about EXISTENCE. The vault is
+    ///      a UUPS proxy and the governor is a BEACON proxy — they upgrade on
+    ///      independent paths, so a vault impl that calls `strategyOf` can go
+    ///      live before the governor beacon carries it, and the call then reverts
+    ///      with no data. `_activeStrategy` feeds `_laneState`, hence
+    ///      `maxWithdraw`/`maxRedeem`, so an uncaught revert here is a vault-wide
+    ///      brick rather than a degradation.
     function _activeStrategy() internal view returns (address) {
         address gov = _getGovernor();
         if (gov == address(0)) return address(0);
         uint256 pid = IProposalStatus(gov).getActiveProposal();
         if (pid == 0) return address(0);
-        return IProposalStatus(gov).strategyOf(pid);
+        try IProposalStatus(gov).strategyOf(pid) returns (address strategy) {
+            return strategy;
+        } catch {
+            return address(0);
+        }
     }
 
     /// @inheritdoc ISyndicateVault
@@ -635,6 +646,30 @@ contract SyndicateVault is
     {
         if (from != address(0) && to != address(0) && _isLaneALocked(from)) revert SharesLocked();
         super._update(from, to, value);
+        // AUTO-DELEGATE ON EVERY RECEIPT (PR #24 review 🔴1). Decision D1 makes
+        // the compensation escrow apportion on `getPastVotes`, which equals
+        // balance only if every holder is delegated. Delegating only on the
+        // MINT paths left plain ERC20 transfers — including `requestRedeem`'s
+        // move into queue custody — landing on undelegated addresses with zero
+        // votes at every snapshot: a secondary buyer or a queued exiter would
+        // be silently written out of victim compensation while still counted
+        // in its denominator. Runs AFTER `super._update` so the recipient's
+        // post-receipt balance is what checkpoints. Holders that explicitly
+        // delegated away keep their choice (`delegates(to) != 0`). On a LIVE
+        // vault this upgrade heals an undelegated holder at its next receipt;
+        // it cannot retroactively re-checkpoint the past.
+        //
+        // THE HEAL IS PERMISSIONLESS AND DOES NOT NEED THE HOLDER (PR #24
+        // review round 2). This runs on a ZERO-VALUE transfer too — ERC20
+        // permits `value == 0` and `super._update` takes the same path — so
+        // ANYONE can arm a stranded legacy holder by sending it 0 shares. A
+        // keeper can walk the holder set and heal all of it in an afternoon,
+        // which turns the live-vault caveat from "wait for their next receipt,
+        // whenever that is" into a bounded operational task. Do it BEFORE a
+        // snapshot is needed: the checkpoint lands when the transfer does.
+        if (to != address(0) && delegates(to) == address(0)) {
+            _delegate(to, to);
+        }
     }
 
     /// @dev Use timestamp-based voting checkpoints instead of block numbers
@@ -847,11 +882,7 @@ contract SyndicateVault is
         if (_depositsLocked() && !laneA) revert DepositsLocked();
         _requireApprovedDepositor(receiver);
         super._deposit(caller, receiver, assets, shares);
-
-        // Auto-delegate: if receiver has no delegate, delegate to self
-        if (delegates(receiver) == address(0)) {
-            _delegate(receiver, receiver);
-        }
+        // Auto-delegation happens in `_update` (every receipt path).
 
         // G1: a Lane A entry locks the receiver's shares until this proposal
         // settles — closes the deposit-low / exit-high intra-proposal MEV.
@@ -975,12 +1006,16 @@ contract SyndicateVault is
         if (msg.sender != owner_) {
             _spendAllowance(owner_, msg.sender, shares);
         }
-        // Move shares into queue custody. Voting weight at the queue address is 0
-        // (queue contract has no delegate). For proposals already open at request
-        // time, the voter's checkpoint at `snapshotTimestamp` is frozen with the
-        // pre-transfer weight, so vote power is preserved for in-flight proposals.
-        // Queued shares forfeit voting power for any proposal opened after escrow.
-        // Shares are burned later by `claim`.
+        // Move shares into queue custody. `_update` auto-delegates the queue to
+        // itself, so custody shares keep checkpointed voting weight AT THE QUEUE
+        // — which is what lets the compensation escrow count them at a pre-drain
+        // snapshot and the queue pay that claim through to request owners
+        // (`VaultWithdrawalQueue.claimCompensation`, PR #24 review 🔴1). The
+        // queue never votes: it has no governance surface. For proposals already
+        // open at request time, the voter's checkpoint at `snapshotTimestamp` is
+        // frozen with the pre-transfer weight, so vote power is preserved for
+        // in-flight proposals. Queued shares forfeit voting power for any
+        // proposal opened after escrow. Shares are burned later by `claim`.
         uint256 pid = _activePid();
         _transfer(owner_, q, shares);
         requestId = IVaultWithdrawalQueue(q).queueRedeem(owner_, shares, pid);
@@ -1048,10 +1083,10 @@ contract SyndicateVault is
     ///         immediately before this call. Auto-delegates for voting power.
     /// @dev No `nonReentrant`: there is no external call (mint + delegate only),
     ///      and the only caller — the queue's `claim` — is itself `nonReentrant`.
+    ///      Auto-delegation happens in `_update`.
     function settleDeposit(uint256 shares, address to) external {
         if (msg.sender != _withdrawalQueue) revert NotQueue();
         _mint(to, shares);
-        if (delegates(to) == address(0)) _delegate(to, to);
     }
 
     /// @inheritdoc ISyndicateVault
@@ -1078,8 +1113,7 @@ contract SyndicateVault is
     ///      strategies run. The active-strategy gate is the trust boundary.
     function strategyMint(address to, uint256 shares) external onlyActiveStrategy whenNotPaused {
         _requireApprovedDepositor(to);
-        _mint(to, shares);
-        if (delegates(to) == address(0)) _delegate(to, to);
+        _mint(to, shares); // auto-delegation happens in `_update`
     }
 
     /// @inheritdoc ISyndicateVault

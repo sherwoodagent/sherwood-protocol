@@ -135,15 +135,20 @@ contract GuardianRegistryOutcomeTest is RegistryTestHarness {
         assertEq(_outcome(PID), uint8(IGuardianRegistry.ReviewOutcome.Blocked));
     }
 
-    /// @notice The ONE state where cached != freshly-computed: `cancelReview`
-    ///         commits Cleared DURING the open window, then block votes inflate
-    ///         `blockStakeWeight` past quorum before `reviewEnd`. A fresh
-    ///         `_isBlocked` would now say Blocked, but `outcomeOf` must return
-    ///         the CACHED Cleared — matching `resolveReview`'s idempotent
-    ///         `return r.blocked`. This is what makes the resolved-first branch
-    ///         load-bearing (anti-drift on the one path where cached differs
-    ///         from a recompute). `voteOnProposal` does not check `r.resolved`,
-    ///         so the post-cancel inflation is a real reachable state.
+    /// @notice `cancelReview` commits Cleared DURING the open window, which used
+    ///         to leave the ONE state where cached != freshly-computed: further
+    ///         block votes could inflate `blockStakeWeight` past quorum before
+    ///         `reviewEnd`, so a fresh `_isBlocked` said Blocked while the cache
+    ///         said Cleared.
+    ///
+    ///         `voteOnProposal` now rejects a resolved review, which closes that
+    ///         divergence AT THE SOURCE: `blockStakeWeight` is frozen the moment
+    ///         the review resolves, so cached and recomputed agree in every
+    ///         reachable state. The resolved-first branch stays as the cheap,
+    ///         authoritative answer (and as the guarantee that a future edit
+    ///         re-opening a write path cannot make the view drift from the
+    ///         commit) — this test pins BOTH halves: the vote is rejected, and
+    ///         the cache holds.
     function test_outcomeOf_cachedClearedSurvivesLateBlockInflation() public {
         // Healthy cohort (50_000e18 == MIN), opened inside the window.
         _open();
@@ -156,14 +161,16 @@ contract GuardianRegistryOutcomeTest is RegistryTestHarness {
         registry.cancelReview(PID);
         assertEq(_outcome(PID), uint8(IGuardianRegistry.ReviewOutcome.Cleared));
 
-        // Still inside the window: push block weight PAST quorum. A second
-        // blocker takes blockStakeWeight to 20_000e18 = 40% >= 30% — a fresh
-        // `_isBlocked` recompute WOULD flip to Blocked.
-        _vote(1, IGuardianRegistry.GuardianVoteType.Block);
+        // Still inside the window, so the vote window itself is open — but the
+        // review is resolved, so the inflation that would have taken
+        // blockStakeWeight to 20_000e18 = 40% >= 30% is refused outright.
+        vm.prank(_guardian(1));
+        vm.expectRevert(IGuardianRegistry.ReviewNotOpen.selector);
+        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Block);
 
         vm.warp(reviewEnd);
 
-        // Cached Cleared wins over the would-be-Blocked recompute.
+        // Cache holds, and nothing could have moved the recompute off it.
         assertEq(_outcome(PID), uint8(IGuardianRegistry.ReviewOutcome.Cleared));
 
         // `resolveReview` is idempotent (returns the cached `false`), and the

@@ -42,8 +42,12 @@ interface IChallengeGame {
     }
 
     /// @param frozenCoverageUsd The coverage this challenge pinned, in USD-18,
-    ///        snapshotted at filing. The bond was sized against it, and it is
-    ///        what the eventual verdict is worth.
+    ///        snapshotted at filing. The bond was sized against it. It is NOT
+    ///        what the eventual verdict is worth (review, minor) — the verdict
+    ///        is sized by `slashBpsFor` against live bonds at resolve time, and
+    ///        the two diverge whenever a bond moved in between. Written once
+    ///        and never read on-chain: it exists for indexers and for auditing
+    ///        the bond arithmetic against the filing.
     /// @param counterBondWood The counter-bond POOL raised so far, summed over
     ///        every accused approver that has contributed. There is deliberately
     ///        NO single `disputer` field any more: the defence is bought
@@ -56,6 +60,21 @@ interface IChallengeGame {
     ///        passed challenge (§3.4). The zero address means the filing
     ///        accuses no adapter — see `file`.
     /// @param adapterSelector The accused adapter's selector.
+    /// @param executedAt The challenged proposal's execution timestamp, PINNED
+    ///        at filing. It is the slash basis (`openedAt`) the verdict is
+    ///        sized against, and pinning it is what makes the conviction
+    ///        recoverable: any instant at or after the accusation is one the
+    ///        accused can move its own stake checkpoint to (review 🔴F1, 🟡F10).
+    /// @param vault The challenged proposal's vault, likewise pinned at filing
+    ///        rather than re-read from a mutable governor at resolve time.
+    /// @param autoSlashDelayAtFiling The silence window this challenge actually
+    ///        received, snapshotted at filing. Reading the live parameter let
+    ///        the owner retroactively close a window the accused was still
+    ///        inside — precisely what `MIN_AUTO_SLASH_DELAY` claims to prevent
+    ///        and did not (review 🟠F5).
+    /// @param disputeTimeoutAtFiling The escalation clock this challenge
+    ///        received, snapshotted for the same reason from the other side: a
+    ///        live read let the owner extend an existing freeze 6x.
     struct Challenge {
         address governor;
         uint256 proposalId;
@@ -68,12 +87,26 @@ interface IChallengeGame {
         uint256 frozenCoverageUsd;
         address adapterTarget;
         bytes4 adapterSelector;
+        uint256 executedAt;
+        address vault;
+        uint256 autoSlashDelayAtFiling;
+        uint256 disputeTimeoutAtFiling;
     }
 
     // ── Errors ──
     error NotExecuted();
     error WindowClosed();
     error AlreadyChallenged();
+    /// @dev The proposal's one liability has already been collected by a settled
+    ///      challenge, so no further filing against it can reach a verdict — it
+    ///      would settle straight into `VerdictAlreadyCollected`. Refused at the
+    ///      door because such a filing still FROZE the coverage on the way, and
+    ///      the freeze is what bars an accused approver from
+    ///      `claimUnstakeGuardian`: it bought another `autoSlashDelay` of lock on
+    ///      already-slashed collateral for the price of `settleBurnBps` on a
+    ///      refunded bond, from as many addresses as the griefer cared to fund
+    ///      (review 🟡F12).
+    error AlreadyConvicted();
     error NothingToFreeze();
     error WrongStatus();
     error DelayNotElapsed();
@@ -90,6 +123,20 @@ interface IChallengeGame {
     ///         zero address and no caller can match it — Plan D's timeout stays
     ///         the only way out of `Disputed`.
     error NotCourt();
+    /// @dev `resolve` was called with too little gas to guarantee the
+    ///      `openCase` child inside `slashToEscrow` cannot starve — a starved
+    ///      child is indistinguishable from a missing selector there and
+    ///      BURNS the victims' compensation (PR #24 round-4 N-4). Retry with
+    ///      more gas; nothing about the challenge state changes.
+    error InsufficientSlashGas();
+    /// @dev The filing named an adapter `(target, selector)` that does not
+    ///      appear in the challenged proposal's own execute calls. A challenge
+    ///      is an assertion, but WHICH adapter a proposal touched is not an
+    ///      assertion — it is on-chain fact, and a full refund on the settle
+    ///      path made demoting an arbitrary certified adapter free (review
+    ///      🟠F4). This is a membership test over stored calls, not a second
+    ///      calldata parser, so D1's one-security-model rule is intact.
+    error AdapterNotInProposal();
 
     // ── Events ──
     /// @dev `evidenceURI` is carried on-chain unindexed so predicates 2 and 3 —
@@ -116,6 +163,24 @@ interface IChallengeGame {
     ///      `CounterBondContributed` log that precedes this one.
     event ChallengeDisputed(uint256 indexed challengeId, uint256 counterBondWood);
     event ChallengeSettled(uint256 indexed challengeId, uint256 slashedWood, uint256 caseId);
+    /// @dev The slice of the challenger's bond burned on the SETTLE path, so a
+    ///      filing is never free in either direction (review 🟠F4). Distinct
+    ///      from `ChallengeFailed.burnedWood`, which is the FAIL-path burn
+    ///      (`forfeitBurnBps`): one prices a correct filing, the other prices a
+    ///      wrong one, and a challenge only ever takes one of the two paths.
+    event ChallengerBondBurned(uint256 indexed challengeId, uint256 burnedWood);
+    /// @dev A settle that convicted nothing because an earlier challenge on the
+    ///      same proposal already did. The approvers' liability is one
+    ///      liability; concurrent filings do not multiply it.
+    event VerdictAlreadyCollected(uint256 indexed challengeId, address indexed governor, uint256 indexed proposalId);
+    /// @dev A passed challenge whose adapter demotion did NOT land, because the
+    ///      registry refused the call — in practice because the game's
+    ///      `authorizedDemoter` role was rotated away while the challenge was
+    ///      live. The demotion is best-effort precisely so that cannot strand
+    ///      the slash, the bond refund and the freeze release behind it (review
+    ///      🟠F11); this event is how the miss becomes visible rather than
+    ///      silent, and the registry owner's own `demote` is the remedy.
+    event AdapterDemotionFailed(uint256 indexed challengeId, address indexed target, bytes4 indexed selector);
     /// @param forfeitedWood What the CHALLENGER lost — its whole bond on the
     ///        normal failure path, and zero on the defensive no-contributor
     ///        branch where the bond is handed back instead.
@@ -137,6 +202,7 @@ interface IChallengeGame {
     event ForfeitBurnBpsSet(uint256 oldBps, uint256 newBps);
     event AutoSlashDelaySet(uint256 oldDelay, uint256 newDelay);
     event DisputeTimeoutSet(uint256 oldTimeout, uint256 newTimeout);
+    event SettleBurnBpsSet(uint256 oldBps, uint256 newBps);
 
     // ── Filing ──
     /// @notice File a bonded challenge against an executed proposal, freezing
@@ -234,9 +300,20 @@ interface IChallengeGame {
     ///         pool. Retained after resolution, so the split a terminal challenge
     ///         paid out stays auditable on-chain.
     function counterBondContributionOf(uint256 challengeId, address contributor) external view returns (uint256);
-    /// @notice The id of the LIVE (`Filed`/`Disputed`) challenge against a
-    ///         proposal, or zero when none is live.
+    /// @notice The MOST RECENTLY FILED challenge against a proposal if it is
+    ///         still live (`Filed`/`Disputed`), or zero.
+    /// @dev    Filings are per-challenger, so this is no longer "the" live
+    ///         challenge: an older one may still be live when the newest has
+    ///         gone terminal. Ask `liveChallengeCountOf` whether ANY is live,
+    ///         and `liveChallengeOfBy` for a specific challenger's slot.
     function liveChallengeOf(address governor, uint256 proposalId) external view returns (uint256);
+    /// @notice How many challenges against this proposal are live. Non-zero is
+    ///         exactly the condition under which its coverage stays frozen.
+    function liveChallengeCountOf(address governor, uint256 proposalId) external view returns (uint256);
+    /// @notice `challenger`'s own live challenge against this proposal, or zero.
+    ///         One slot per challenger is what stops the accused cohort from
+    ///         squatting the only slot for the whole window (review 🔴F3).
+    function liveChallengeOfBy(address governor, uint256 proposalId, address challenger) external view returns (uint256);
     function challengeCount() external view returns (uint256);
     function challengeWindow() external view returns (uint256);
     function challengerBondBps() external view returns (uint256);
@@ -251,6 +328,10 @@ interface IChallengeGame {
     function forfeitBurnBps() external view returns (uint256);
     function autoSlashDelay() external view returns (uint256);
     function disputeTimeout() external view returns (uint256);
+    /// @notice Share of a SUCCESSFUL challenger's bond burned on settle, in bps.
+    ///         Applies to the settle path only: the fail path already forfeits
+    ///         the whole bond to the accused (§3.4).
+    function settleBurnBps() external view returns (uint256);
     /// @notice WOOD the game holds on behalf of live (`Filed`/`Disputed`)
     ///         challenges. The §4 invariant is `wood.balanceOf(game) >=
     ///         bondedWood`; the game pays out nothing but bonds, so the two are
@@ -281,4 +362,5 @@ interface IChallengeGame {
     function setForfeitBurnBps(uint256 newBps) external;
     function setAutoSlashDelay(uint256 newDelay) external;
     function setDisputeTimeout(uint256 newTimeout) external;
+    function setSettleBurnBps(uint256 newBps) external;
 }

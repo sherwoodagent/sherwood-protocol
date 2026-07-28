@@ -101,6 +101,13 @@ contract StakedWoodSlashToEscrowTest is Test {
 
         vault = new MockVotesVault();
 
+        // N-4: `slashToEscrow` asserts `governorOf(vault) != 0`. The fixture
+        // factory is codeless, so give it a byte of code and a wildcard mock —
+        // membership itself is pinned by the dedicated rejection test, which
+        // overrides this with an exact-calldata zero.
+        vm.etch(factory, hex"00");
+        vm.mockCall(factory, abi.encodeWithSignature("governorOf(address)"), abi.encode(makeAddr("gov")));
+
         // A staked, matured guardian to slash.
         wood.mint(g1, 1_000_000e18);
         vm.startPrank(g1);
@@ -156,7 +163,7 @@ contract StakedWoodSlashToEscrowTest is Test {
         gs[0] = g1;
         vm.prank(slasher);
         vm.expectRevert(IStakedWood.CompensationEscrowNotSet.selector);
-        swood.slashToEscrow(bytes32("case"), openedAt, gs, 10_000, address(vault), snapTs);
+        swood.slashToEscrow(bytes32("case"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs);
     }
 
     /// @notice sWOOD must not leave a standing allowance behind: the escrow's
@@ -169,7 +176,7 @@ contract StakedWoodSlashToEscrowTest is Test {
         gs[0] = g1;
 
         vm.prank(slasher);
-        swood.slashToEscrow(bytes32("case"), openedAt, gs, 10_000, address(vault), snapTs);
+        swood.slashToEscrow(bytes32("case"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs);
 
         assertEq(wood.allowance(address(swood), address(escrow)), 0, "allowance zeroed after the hand-off");
     }
@@ -178,7 +185,7 @@ contract StakedWoodSlashToEscrowTest is Test {
         address[] memory gs = new address[](1);
         gs[0] = g1;
         vm.expectRevert(IStakedWood.NotAuthorizedSlasher.selector);
-        swood.slashToEscrow(bytes32("case"), openedAt, gs, 10_000, address(vault), snapTs);
+        swood.slashToEscrow(bytes32("case"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs);
     }
 
     /// @notice The registry cannot drive the verdict path either — the roles are
@@ -190,7 +197,34 @@ contract StakedWoodSlashToEscrowTest is Test {
         gs[0] = g1;
         vm.prank(registry);
         vm.expectRevert(IStakedWood.NotAuthorizedSlasher.selector);
-        swood.slashToEscrow(bytes32("case"), openedAt, gs, 10_000, address(vault), snapTs);
+        swood.slashToEscrow(bytes32("case"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs);
+    }
+
+    /// @notice N-4 (PR #24 round 4): the vault must be factory-deployed. The
+    ///         escrow apportions against the vault's checkpoints, and every
+    ///         claim about that population assumes OZ semantics — so a vault
+    ///         the factory does not recognise is refused BEFORE any stake
+    ///         moves, converting the F-A natspec's scoping sentence into code.
+    function test_slashToEscrow_rejectsAFactoryUnknownVault() public {
+        vm.prank(owner);
+        swood.setAuthorizedSlasher(slasher);
+
+        // Exact-calldata mock overrides the fixture's wildcard: this vault
+        // resolves to no governor.
+        address strangerVault = makeAddr("strangerVault");
+        vm.mockCall(factory, abi.encodeWithSignature("governorOf(address)", strangerVault), abi.encode(address(0)));
+
+        address[] memory gs = new address[](1);
+        gs[0] = g1;
+        uint256 stakeBefore = swood.guardianStake(g1);
+
+        uint256[] memory bps = _bpsArr(gs.length, 10_000);
+        vm.prank(slasher);
+        vm.expectRevert(StakedWood.VaultNotFactoryDeployed.selector);
+        swood.slashToEscrow(bytes32("stranger"), openedAt, gs, bps, strangerVault, snapTs);
+
+        assertEq(swood.guardianStake(g1), stakeBefore, "nothing was slashed for an unknown vault");
+        assertFalse(swood.verdictSlashed(bytes32("stranger"), g1), "and the verdict mark stays clean");
     }
 
     function test_slashToEscrow_routesProceedsToEscrowNotBurn() public {
@@ -203,13 +237,13 @@ contract StakedWoodSlashToEscrowTest is Test {
 
         vm.prank(slasher);
         (uint256 total, uint256 caseId) =
-            swood.slashToEscrow(bytes32("case"), openedAt, gs, 10_000, address(vault), snapTs);
+            swood.slashToEscrow(bytes32("case"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs);
 
         assertGt(total, 0, "something was actually slashed");
         assertEq(caseId, 1, "the funded case id is returned, not scraped");
         assertEq(wood.balanceOf(BURN_ADDRESS), burnBefore, "verdict slash must NOT burn");
         assertEq(wood.balanceOf(address(escrow)), total, "proceeds land in the escrow");
-        (address v, uint256 ts, uint256 proceeds,,, bool swept) = escrow.caseOf(caseId);
+        (address v, uint256 ts, uint256 proceeds,,,, bool swept) = escrow.caseOf(caseId);
         assertEq(v, address(vault));
         assertEq(ts, snapTs);
         assertEq(proceeds, total, "the whole slash funds the case");
@@ -228,7 +262,7 @@ contract StakedWoodSlashToEscrowTest is Test {
         vm.expectEmit(true, true, false, true, address(swood));
         emit IStakedWood.VerdictSlashRouted(bytes32("case"), address(vault), 20_000e18, 1);
         vm.prank(slasher);
-        swood.slashToEscrow(bytes32("case"), openedAt, gs, 10_000, address(vault), snapTs);
+        swood.slashToEscrow(bytes32("case"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs);
     }
 
     /// @notice FIX 5 / spec §3.8: the compensation snapshot must be at or before
@@ -249,7 +283,7 @@ contract StakedWoodSlashToEscrowTest is Test {
 
         vm.prank(slasher);
         vm.expectRevert(IStakedWood.SnapshotAfterVerdict.selector);
-        swood.slashToEscrow(bytes32("case"), openedAt, gs, 10_000, address(vault), postVerdictTs);
+        swood.slashToEscrow(bytes32("case"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), postVerdictTs);
     }
 
     /// @notice A snapshot exactly AT the verdict open is allowed — the bound is
@@ -264,8 +298,9 @@ contract StakedWoodSlashToEscrowTest is Test {
         gs[0] = g1;
 
         vm.prank(slasher);
-        (, uint256 caseId) = swood.slashToEscrow(bytes32("case"), openedAt, gs, 10_000, address(vault), openedAt);
-        (, uint256 ts,,,,) = escrow.caseOf(caseId);
+        (, uint256 caseId) =
+            swood.slashToEscrow(bytes32("case"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), openedAt);
+        (, uint256 ts,,,,,) = escrow.caseOf(caseId);
         assertEq(ts, openedAt);
     }
 
@@ -281,7 +316,8 @@ contract StakedWoodSlashToEscrowTest is Test {
         gs[0] = g1;
 
         vm.prank(slasher);
-        (uint256 total,) = swood.slashToEscrow(bytes32("case"), openedAt, gs, 1, address(vault), snapTs);
+        (uint256 total,) =
+            swood.slashToEscrow(bytes32("case"), openedAt, gs, _bpsArr(gs.length, 1), address(vault), snapTs);
         assertEq(total, 2_000e18, "1 bps floored to minSlashBps (1000) = 10% of 20k");
     }
 
@@ -295,7 +331,8 @@ contract StakedWoodSlashToEscrowTest is Test {
         address[] memory gs = new address[](1);
         gs[0] = g1;
         vm.prank(slasher);
-        (uint256 total,) = swood.slashToEscrow(bytes32("case"), openedAt, gs, 10_000, address(vault), snapTs);
+        (uint256 total,) =
+            swood.slashToEscrow(bytes32("case"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs);
         assertEq(total, 10_000e18, "10_000 bps capped to maxSlashBps (5000) = 50% of 20k");
         assertEq(swood.guardianStake(g1), 10_000e18, "the guardian kept the half the ceiling protects");
     }
@@ -310,7 +347,8 @@ contract StakedWoodSlashToEscrowTest is Test {
         address[] memory gs = new address[](1);
         gs[0] = g1;
         vm.prank(slasher);
-        (uint256 total,) = swood.slashToEscrow(bytes32("case"), openedAt, gs, 2500, address(vault), snapTs);
+        (uint256 total,) =
+            swood.slashToEscrow(bytes32("case"), openedAt, gs, _bpsArr(gs.length, 2500), address(vault), snapTs);
         uint256 slashedAt = vm.getBlockTimestamp();
 
         assertEq(total, 5_000e18, "25% of the 20k own stake");
@@ -344,9 +382,129 @@ contract StakedWoodSlashToEscrowTest is Test {
         gs[0] = makeAddr("neverStaked");
         vm.prank(slasher);
         (uint256 total, uint256 caseId) =
-            swood.slashToEscrow(bytes32("c"), openedAt, gs, 10_000, address(vault), snapTs);
+            swood.slashToEscrow(bytes32("c"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs);
         assertEq(total, 0);
         assertEq(caseId, 0, "no case id when nothing was recovered");
         assertEq(escrow.caseCount(), 0, "no empty case opened");
+    }
+
+    /// @notice PR #24 review F-C: a slash that recovers NOTHING must not
+    ///         consume the verdict's one slash. Conviction A empties the
+    ///         guardian; conviction B then lands on zero live stake and takes
+    ///         nothing — if that no-op wrote `_verdictSlashed`, B would be
+    ///         permanently foreclosed and a re-staked guardian could never be
+    ///         held to it, even though B's at-open basis is intact and a retry
+    ///         WOULD recover.
+    function test_slashToEscrow_zeroRecoveryDoesNotConsumeTheVerdict() public {
+        vm.prank(owner);
+        swood.setAuthorizedSlasher(slasher);
+        address[] memory gs = new address[](1);
+        gs[0] = g1;
+
+        // Conviction A takes the whole bond.
+        vm.prank(slasher);
+        (uint256 totalA,) =
+            swood.slashToEscrow(bytes32("A"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs);
+        assertEq(totalA, 20_000e18, "A emptied the guardian");
+        assertEq(swood.guardianStake(g1), 0);
+
+        // Conviction B, independent verdict, same at-open basis: recovers
+        // nothing — and must NOT be marked as slashed.
+        vm.prank(slasher);
+        (uint256 totalB, uint256 caseB) =
+            swood.slashToEscrow(bytes32("B"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs);
+        assertEq(totalB, 0);
+        assertEq(caseB, 0);
+        assertFalse(swood.verdictSlashed(bytes32("B"), g1), "a zero take must not consume the one slash");
+
+        // The guardian re-stakes; retrying B now recovers against the intact
+        // at-open basis instead of reverting ApproverAlreadySlashed.
+        vm.prank(g1);
+        swood.stakeAsGuardian(20_000e18, 1);
+        vm.prank(slasher);
+        (uint256 totalRetry, uint256 caseRetry) =
+            swood.slashToEscrow(bytes32("B"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs);
+        assertGt(totalRetry, 0, "the retried verdict recovers");
+        assertGt(caseRetry, 0, "and funds a case");
+        assertTrue(swood.verdictSlashed(bytes32("B"), g1), "the landed slash is what consumes the verdict");
+    }
+
+    /// @notice AN UNSTAKE REQUEST IS NOT A DISCHARGE. `requestUnstakeGuardian`
+    ///         revokes VOTING POWER; it does not settle what the guardian
+    ///         already underwrote, and the WOOD is still in this contract.
+    ///
+    ///         PR #25 review 🔴F1b. F1 moved the slash basis from `filedAt` to
+    ///         `executedAt` so an accused approver could not zero its own basis
+    ///         AFTER being accused. A deliberately malicious approver does not
+    ///         need to react, though — it can pre-position before the drain it
+    ///         voted for ever lands: approve while active, queue the exit, let
+    ///         the proposal execute. Every basis at or after `executedAt` then
+    ///         reads the request's zero checkpoint, and a 100% conviction
+    ///         recovers nothing while the full bond sits in custody waiting for
+    ///         the freeze to lift.
+    ///
+    ///         The divergence that makes it work: `ExposureLedger`'s coverage
+    ///         gate prices the bond off live `guardianStake()`, which a request
+    ///         does not touch, so quorum still passes at execution — while
+    ///         `_slashOne` prices it off the checkpoint trace, which the request
+    ///         zeroes. Liability and votability are two different questions and
+    ///         must not share one trace.
+    function test_slashToEscrow_unstakeRequestBeforeOpenDoesNotZeroTheBasis() public {
+        vm.prank(owner);
+        swood.setAuthorizedSlasher(slasher);
+
+        // The approver queues its exit BEFORE the proposal it approved executes.
+        vm.prank(g1);
+        swood.requestUnstakeGuardian();
+
+        // Voting power is gone, as intended — but the bond has not moved.
+        assertEq(swood.guardianStake(g1), 20_000e18, "the WOOD is still in custody");
+
+        // The drain executes AFTER the request, so `executedAt` sits on the far
+        // side of the zero checkpoint.
+        vm.warp(vm.getBlockTimestamp() + 1 days);
+        uint256 drainOpenedAt = vm.getBlockTimestamp();
+        vm.warp(vm.getBlockTimestamp() + 1);
+
+        uint256 drainSnapTs = drainOpenedAt - 1;
+        vault.setTotal(drainSnapTs, 1_000e18);
+        vault.setVotes(alice, drainSnapTs, 1_000e18);
+
+        address[] memory gs = new address[](1);
+        gs[0] = g1;
+        vm.prank(slasher);
+        (uint256 slashed, uint256 caseId) = swood.slashToEscrow(
+            bytes32("preExit"), drainOpenedAt, gs, _bpsArr(gs.length, 10_000), address(vault), drainSnapTs
+        );
+
+        assertEq(slashed, 20_000e18, "a 100% conviction takes the whole bond");
+        assertEq(swood.guardianStake(g1), 0, "nothing left to walk out with");
+        assertGt(caseId, 0, "and the victims get a funded case");
+    }
+
+    /// @notice The other half of the same invariant: a request must still stop
+    ///         the stake from counting toward VOTING weight at `openedAt`. The
+    ///         liability trace is additional to the votable trace, not a
+    ///         replacement for it.
+    function test_getPastStake_stillZeroAfterAnUnstakeRequest() public {
+        vm.prank(g1);
+        swood.requestUnstakeGuardian();
+
+        vm.warp(vm.getBlockTimestamp() + 1 days);
+        uint256 t = vm.getBlockTimestamp();
+        vm.warp(vm.getBlockTimestamp() + 1);
+
+        assertEq(swood.getPastVotes(g1, t), 0, "unstake-requested stake is not votable");
+    }
+
+    /// @dev `slashToEscrow` now takes one rate per approver. These suites all
+    ///      exercise the uniform case, so this fills an aligned array with a
+    ///      single rate — the per-approver spread is covered in
+    ///      `SlashToEscrowProportional.t.sol`.
+    function _bpsArr(uint256 n, uint256 bps) internal pure returns (uint256[] memory a) {
+        a = new uint256[](n);
+        for (uint256 i = 0; i < n; i++) {
+            a[i] = bps;
+        }
     }
 }

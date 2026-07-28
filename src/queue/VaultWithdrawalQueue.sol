@@ -2,6 +2,8 @@
 pragma solidity 0.8.28;
 
 import {IVaultWithdrawalQueue} from "../interfaces/IVaultWithdrawalQueue.sol";
+import {ICompensationEscrow} from "../interfaces/ICompensationEscrow.sol";
+import {ISyndicateFactory} from "../interfaces/ISyndicateFactory.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
@@ -15,6 +17,13 @@ interface IRequestableVault {
     /// @notice Queue-only: mint `shares` to `to`. Assets were pushed to the
     ///         vault by the queue immediately before this call.
     function settleDeposit(uint256 shares, address to) external;
+    /// @notice ERC20Votes read — the queue's own checkpointed custody balance
+    ///         at a compensation case's snapshot (pay-through denominator).
+    function getPastVotes(address account, uint256 timepoint) external view returns (uint256);
+    /// @notice The factory that deployed this vault (and this queue). Source of
+    ///         the governance-set compensation escrow — read live, so one
+    ///         factory call arms every queue (PR #24 review 🔴N1).
+    function factory() external view returns (address);
 }
 
 /// @title VaultWithdrawalQueue (Lane B async request substrate)
@@ -60,6 +69,30 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
     uint256 private _pendingDepositAssets; // escrowed deposit assets
     uint256 private _reservedAssets; // frozen assets owed to stamped-unclaimed redeems
 
+    /// @dev One pulled compensation-escrow case (PR #24 review 🔴1). `total` is
+    ///      what the escrow ACTUALLY transferred here (balance-delta measured),
+    ///      `votes` the queue's checkpointed custody balance at the case
+    ///      snapshot — the pay-through denominator. Keyed by (escrow, caseId)
+    ///      so a case funded by one escrow can never be paid out of another's
+    ///      bookkeeping after a governance re-point.
+    ///
+    ///      `token` PINS the unit `total` was measured in (PR #24 review 🔴N1).
+    ///      `total` is a scalar; re-reading `escrow.wood()` on a later call
+    ///      would denominate the payout in whatever the escrow reports THEN, so
+    ///      an escrow whose token changed between the pull and the payout would
+    ///      hand out a balance it never contributed. Measured once, paid in the
+    ///      same unit forever.
+    struct CompCase {
+        uint256 total;
+        uint256 votes;
+        uint256 snapshotTimestamp;
+        address token;
+        bool pulled;
+    }
+
+    mapping(address escrow => mapping(uint256 caseId => CompCase)) private _compCases;
+    mapping(address escrow => mapping(uint256 caseId => mapping(uint256 requestId => bool))) private _compClaimed;
+
     constructor(address vault_) {
         if (vault_ == address(0)) revert NotVault();
         vault = vault_;
@@ -98,7 +131,18 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
 
     function _push(address owner_, uint256 amount, uint256 pid, RequestKind kind) private returns (uint256 id) {
         id = _requests.length;
-        _requests.push(Request({owner: owner_, amount: amount, pid: pid, kind: kind, claimed: false, cancelled: false}));
+        _requests.push(
+            Request({
+                owner: owner_,
+                amount: amount,
+                pid: pid,
+                kind: kind,
+                claimed: false,
+                cancelled: false,
+                queuedAt: uint48(block.timestamp),
+                closedAt: 0
+            })
+        );
         _byOwner[owner_].push(id);
     }
 
@@ -140,6 +184,7 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
         if (IRequestableVault(vault).redemptionsLocked()) revert VaultLocked();
 
         r.claimed = true;
+        r.closedAt = uint48(block.timestamp);
         uint256 amount = r.amount;
 
         if (r.kind == RequestKind.Redeem) {
@@ -188,6 +233,7 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
         if (_settlePrice[r.pid].stamped) revert AlreadySettled();
 
         r.cancelled = true;
+        r.closedAt = uint48(block.timestamp);
         uint256 amount = r.amount;
         if (r.kind == RequestKind.Redeem) {
             _pendingShares -= amount;
@@ -198,6 +244,166 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
             IERC20(IRequestableVault(vault).asset()).safeTransfer(r.owner, amount);
         }
         emit RequestCancelled(requestId, r.owner);
+    }
+
+    // ── Compensation pay-through (PR #24 review 🔴1) ──
+
+    /// @inheritdoc IVaultWithdrawalQueue
+    /// @dev The queue is the holder of record the compensation escrow sees for
+    ///      every share sitting in custody at a case's snapshot — and
+    ///      `requestRedeem` is only callable while a proposal is open, which is
+    ///      exactly the window a drain occupies, so queued exiters are the
+    ///      MODAL victims. This pays the queue's claim through to them.
+    ///
+    ///      TRUST MODEL (rewritten, PR #24 review 🔴N1). The escrow is resolved
+    ///      from governance — `ISyndicateFactory(vault.factory()).compensationEscrow()`
+    ///      — and is NOT a parameter. The previous shape took it from the caller
+    ///      and defended only the AMOUNT (balance-delta measured, keyed by
+    ///      (escrow, caseId)); it said nothing about the UNIT. Because
+    ///      `escrow.wood()` was re-read on every call while `cc.total` was
+    ///      measured once, a caller could book a case total in a token they mint
+    ///      freely, flip `wood()` to real WOOD, and withdraw
+    ///      `total * shares / votes` of the queue's actual balance. Two
+    ///      transactions, no privilege, whole pot.
+    ///
+    ///      What holds now:
+    ///      - The escrow address is governance state, so no unrelated contract
+    ///        can write `_compCases` entries or emit this queue's events.
+    ///      - `total` is still the measured balance delta across `redeem` — a
+    ///        misbehaving escrow that reports a large `claimable` and transfers
+    ///        nothing distributes nothing.
+    ///      - `cc.token` pins the payout unit at pull time; every later payout
+    ///        for the case reads the pin, never the escrow.
+    ///      - A case must be distributed by the same call that pulls it, so
+    ///        proceeds do not idle in the queue. Enforced by the
+    ///        `processed != 0` check at the end (`NoEligibleRequests`, review
+    ///        F-D) — the `NoRequestsSupplied` length check alone was not it,
+    ///        since a batch of all-skipped ids would pull and park.
+    ///      - Payout destinations are the requests' own owners; the caller
+    ///        chooses only WHICH requests get processed, never where funds go.
+    ///      - `nonReentrant` (shared with `claim`/`cancel`) blocks the escrow's
+    ///        `redeem` from re-entering queue state mid-pull.
+    ///
+    ///      TOKEN COMMINGLING (PR #24 review, minor). Compensation proceeds and
+    ///      escrowed DEPOSIT assets share this contract's balance sheet, so if a
+    ///      vault's `asset()` is ever WOOD the two sit in one ERC-20 balance.
+    ///      That is safe only because every asset path here is counter-driven
+    ///      (`_pendingDepositAssets`, `_reservedAssets`) and every compensation
+    ///      payout is bounded by its own case's measured `total` — no path reads
+    ///      a raw `balanceOf` to decide what it may send. Any future
+    ///      balance-driven path in this contract breaks that and must not be
+    ///      added: 🔴N1 is exactly what happens when one is.
+    ///
+    ///      ELIGIBILITY: a redeem request whose custody interval
+    ///      [queuedAt, closedAt) covers the snapshot. A request closed AT the
+    ///      snapshot timestamp is excluded — the queue's checkpoint at that
+    ///      instant no longer includes those shares (and its owner was
+    ///      re-checkpointed personally at the same instant), so inclusion
+    ///      would double-count against the queue's own votes.
+    ///
+    ///      ROUNDING: each payout floors; Σ eligible shares == the queue's
+    ///      votes at the snapshot, so total payouts never exceed `total` and
+    ///      sub-wei dust strands in the queue (mirrors the escrow's own
+    ///      dust-to-residue policy; the queue has no rescue path by design).
+    function claimCompensation(uint256 caseId, uint256[] calldata requestIds)
+        external
+        nonReentrant
+        returns (uint256 paid, uint256 processed, uint256 skipped)
+    {
+        // Pulling a case and distributing none of it is not a use case — it
+        // only parks proceeds in the queue. Require the caller to name who
+        // gets paid (PR #24 review 🔴N1).
+        if (requestIds.length == 0) revert NoRequestsSupplied();
+
+        address escrow = ISyndicateFactory(IRequestableVault(vault).factory()).compensationEscrow();
+        if (escrow == address(0)) revert CompensationEscrowNotSet();
+
+        CompCase storage cc = _compCases[escrow][caseId];
+        if (!cc.pulled) {
+            (address caseVault, uint256 snap,,,,,) = ICompensationEscrow(escrow).caseOf(caseId);
+            if (caseVault != vault) revert NotCompensationCase();
+            uint256 votes = IRequestableVault(vault).getPastVotes(address(this), snap);
+            if (votes == 0) revert NothingToClaim();
+            IERC20 pullToken = ICompensationEscrow(escrow).wood();
+            uint256 balBefore = pullToken.balanceOf(address(this));
+            ICompensationEscrow(escrow).redeem(caseId);
+            uint256 received = pullToken.balanceOf(address(this)) - balBefore;
+            if (received == 0) revert NothingToClaim();
+            cc.total = received;
+            cc.votes = votes;
+            cc.snapshotTimestamp = snap;
+            // Pin the unit alongside the scalar — see `CompCase`.
+            cc.token = address(pullToken);
+            cc.pulled = true;
+            emit CompensationPulled(escrow, caseId, received, votes, address(pullToken));
+        }
+
+        // Read the PINNED token, never the escrow's current answer.
+        IERC20 payToken = IERC20(cc.token);
+        uint256 snapTs = cc.snapshotTimestamp;
+        for (uint256 i = 0; i < requestIds.length; i++) {
+            uint256 id = requestIds[i];
+            Request storage r = _req(id);
+            // SKIP, DON'T REVERT (PR #24 review 🟡N7). This is a permissionless
+            // helper meant to be run by a keeper over hundreds of ids, and both
+            // rejections below are front-runnable: claiming one id out of a
+            // pending batch used to revert the whole transaction. Skipping
+            // costs the caller nothing they did not already commit and is
+            // reported in `skipped`. Funds are unaffected either way — payouts
+            // always go to `r.owner`. NOTE for keeper authors: an OUT-OF-RANGE
+            // id still reverts the whole batch (`_req` → `RequestNotFound`) —
+            // that is caller error, not front-runnable state, so it stays hard.
+            bool eligible = r.kind == RequestKind.Redeem
+                // In custody at the snapshot: queued at-or-before it and not yet
+                // claimed/cancelled by then. `queuedAt == 0` marks a request from
+                // a pre-stamp queue build — its custody interval is unknowable.
+                && r.queuedAt != 0 && r.queuedAt <= snapTs && (r.closedAt == 0 || r.closedAt > snapTs)
+                && !_compClaimed[escrow][caseId][id];
+            if (!eligible) {
+                skipped++;
+                emit CompensationSkipped(escrow, caseId, id);
+                continue;
+            }
+            _compClaimed[escrow][caseId][id] = true;
+            processed++;
+            uint256 share = Math.mulDiv(cc.total, r.amount, cc.votes);
+            if (share != 0) {
+                paid += share;
+                payToken.safeTransfer(r.owner, share);
+                emit CompensationPaid(escrow, caseId, id, r.owner, share);
+            }
+        }
+        // A CALL THAT DISTRIBUTES NOTHING DOES NOT STAND (PR #24 review F-D).
+        // The length check above only proves ids were NAMED; with 🟡N7's
+        // skip-don't-revert, one ineligible id could satisfy it, pull the
+        // case's entire proceeds, and park them here — restoring the idle
+        // balance that was 🔴N1's precondition. Reverting when nothing was
+        // processed rolls the pull back too (the escrow case stays redeemable),
+        // so "a pull distributes in the same call" is enforced, not asserted.
+        // A keeper whose whole batch was front-run loses only gas: everything
+        // it named was already paid.
+        if (processed == 0) revert NoEligibleRequests();
+    }
+
+    /// @notice Pulled-case bookkeeping for (escrow, caseId): measured proceeds,
+    ///         snapshot votes (denominator), snapshot timestamp, the payout
+    ///         token pinned at pull time, and the pulled flag.
+    /// @dev `escrow` stays a parameter HERE — this is a read, and keeping it
+    ///      lets an indexer inspect cases pulled from a previous escrow after a
+    ///      governance re-point. Only the money-moving path resolves the escrow
+    ///      itself (PR #24 review 🔴N1).
+    function compensationCase(address escrow, uint256 caseId)
+        external
+        view
+        returns (uint256 total, uint256 votes, uint256 snapshotTimestamp, address token, bool pulled)
+    {
+        CompCase storage cc = _compCases[escrow][caseId];
+        return (cc.total, cc.votes, cc.snapshotTimestamp, cc.token, cc.pulled);
+    }
+
+    /// @notice Whether `requestId` already received its share of (escrow, caseId).
+    function compensationClaimed(address escrow, uint256 caseId, uint256 requestId) external view returns (bool) {
+        return _compClaimed[escrow][caseId][requestId];
     }
 
     // ── Views ──

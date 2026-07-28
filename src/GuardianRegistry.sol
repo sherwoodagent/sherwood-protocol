@@ -39,6 +39,12 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     ///         `resolveReview` cannot be gas-DoS'd.
     uint256 public constant MAX_BLOCKERS_PER_PROPOSAL = 100;
     uint256 public constant LATE_VOTE_LOCKOUT_BPS = 1000;
+
+    /// @dev Mirrors `GovernorParameters.MAX_EXECUTION_WINDOW` and the ledger's
+    ///      copy of it. Duplicated for the same reason the ledger duplicates it:
+    ///      the floor must hold for EVERY governor the registry serves, so it is
+    ///      sized against the worst legal configuration rather than a live one.
+    uint256 internal constant MAX_GOVERNOR_EXECUTION_WINDOW = 7 days;
     /// @notice Block decisiveness (bps of at-open total weight) at which the
     ///         deterministic severity hits `maxSlashBps`. 2/3 supermajority.
     uint256 public constant SUPERMAJORITY_BPS = 6_667;
@@ -290,7 +296,9 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         if (voteEnd == 0 || reviewEnd <= voteEnd) revert InvalidReviewWindow();
         Review storage r = _reviews[_reviewKey(msg.sender, proposalId)];
         if (r.voteEnd != 0) revert ReviewAlreadyRegistered();
+        // forge-lint: disable-next-line(unsafe-typecast)
         r.voteEnd = uint64(voteEnd);
+        // forge-lint: disable-next-line(unsafe-typecast)
         r.reviewEnd = uint64(reviewEnd);
         emit ReviewRegistered(msg.sender, proposalId, uint64(voteEnd), uint64(reviewEnd));
     }
@@ -396,6 +404,12 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         bytes32 key = _reviewKey(governor, proposalId);
         Review storage r = _reviews[key];
         if (!r.opened) revert ReviewNotOpen();
+        // Defence in depth alongside `openReview`'s resolved guard: a resolved
+        // review (cancelled, or already committed) accepts no further votes,
+        // so no approve weight can accrue on a proposal that carries no slash
+        // risk. Unreachable while `openReview` refuses to re-open — kept so a
+        // future edit to either guard cannot silently arm the other.
+        if (r.resolved) revert ReviewNotOpen();
 
         if (r.voteEnd == 0 || block.timestamp < r.voteEnd || block.timestamp >= r.reviewEnd) revert ReviewNotOpen();
 
@@ -430,8 +444,11 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
             // write below this hook. Same discipline as resolveReview (~L646).
             if (support == GuardianVoteType.Approve && address(exposureLedger) != address(0)) {
                 // Spec §3.3: the aggregate exposure cap is checked HERE, at
-                // the approve vote. A revert (ExposureCapExceeded) reverts
-                // the vote — an over-exposed guardian cannot approve.
+                // the approve vote. An over-exposed guardian books NOTHING
+                // rather than reverting (review N1) — the vote still lands and
+                // the shortfall surfaces at the execute-time quorum. Reverting
+                // here silenced the approve side while Block votes still
+                // worked, which made a review block-only.
                 exposureLedger.recordApproval(governor, proposalId, msg.sender);
             }
             emit GuardianVoteCast(proposalId, msg.sender, support, weight);
@@ -560,7 +577,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         er.cohortTooSmall = gs + ds < MIN_COHORT_STAKE_AT_OPEN;
         // Sherlock run #2 #15: snapshot block-quorum threshold at open so the
         // owner can't shift it mid-review.
-        // forge-lint: disable-next-line(unchecked-cast)
+        // forge-lint: disable-next-line(unsafe-typecast)
         er.blockQuorumBpsAtOpen = uint16(blockQuorumBps);
         uint64 newReviewEnd = er.reviewEnd;
         unchecked {
@@ -668,11 +685,19 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     ///      `block.timestamp >= proposal.voteEnd`. Snapshots sWOOD's
     ///      `totalGuardianStake` / `totalDelegatedStake` into the review.
     ///      Idempotent: subsequent calls are no-ops.
+    /// @dev A RESOLVED review never re-opens. `cancelReview`'s never-opened
+    ///      short-circuit makes `(opened == false, resolved == true)` reachable
+    ///      BEFORE `reviewEnd`, i.e. while the vote window is still open. Without
+    ///      this guard a keeper could re-open a cancelled review and guardians
+    ///      could then mint reward-eligible approve weight (`getApproverWeights`,
+    ///      the documented input to off-chain reward attribution) on a proposal
+    ///      that is already Cancelled — at zero slash risk, since `resolveReview`
+    ///      returns the cached `blocked == false` without ever slashing.
     function openReview(address governor, uint256 proposalId) external whenNotPaused {
         if (!_authorizedGovernors.contains(governor)) revert UnauthorizedGovernor();
         bytes32 key = _reviewKey(governor, proposalId);
         Review storage r = _reviews[key];
-        if (r.opened) return; // idempotent
+        if (r.opened || r.resolved) return; // idempotent
 
         uint256 ve = r.voteEnd;
         if (ve == 0 || block.timestamp < ve) revert ReviewNotOpen();
@@ -695,7 +720,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         r.totalDelegatedAtOpen = delegatedAtOpen;
         // Sherlock run #2 #15: snapshot block-quorum at open so the owner
         // can't shift the threshold after voters have cast.
-        // forge-lint: disable-next-line(unchecked-cast)
+        // forge-lint: disable-next-line(unsafe-typecast)
         r.blockQuorumBpsAtOpen = uint16(blockQuorumBps);
         r.openedAt = uint64(ts1);
         if (combinedAtOpen < MIN_COHORT_STAKE_AT_OPEN) {
@@ -971,6 +996,19 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         IStakedWood sw = swood;
         if (address(sw) != address(0) && v > sw.coolDownPeriod()) {
             revert CooldownBelowReviewPeriod();
+        }
+        // MIRROR OF THE LEDGER'S FLOOR (review M1). `ExposureLedger` requires
+        // `challengeWindow >= reviewPeriod + MAX_GOVERNOR_EXECUTION_WINDOW`, but
+        // it can only enforce that when ITS setter runs. Raising `reviewPeriod`
+        // here raises the floor from the other side and nothing revalidated: a
+        // window seated legally at a 3d review period sits below the floor once
+        // the review period reaches 7d.
+        //
+        // Reaching across to the ledger is the same pattern this function
+        // already uses for sWOOD's cooldown two lines above.
+        IExposureLedger led = exposureLedger;
+        if (address(led) != address(0) && led.challengeWindow() < v + MAX_GOVERNOR_EXECUTION_WINDOW) {
+            revert InvalidParameter();
         }
         emit ParameterChangeFinalized(PARAM_REVIEW_PERIOD, reviewPeriod, v);
         reviewPeriod = v;

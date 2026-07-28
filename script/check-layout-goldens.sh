@@ -24,27 +24,61 @@ fail() {
 
 forge build >/dev/null
 
+# True when the layout carries no top-level storage variables. Every contract
+# this gate guards is upgradeable and has state, so an empty read is always a
+# tooling failure, never a legitimate answer.
+_layout_is_empty() {
+  [ -z "$1" ] && return 0
+  printf '%s' "$1" | python3 -c 'import json,sys; sys.exit(0 if not json.load(sys.stdin).get("storage") else 1)' 2>/dev/null
+}
+
 inspect_layout() {
-  # Incremental builds can drop storageLayout from cached artifacts; retry with --force.
+  # A degenerate read does NOT return the empty string — it returns valid JSON
+  # with an EMPTY layout at rc 0 (`{"storage": [], "types": {}}`), so testing
+  # only for `-z` let it through. Two ways to get there, and the second is the
+  # one that matters:
+  #
+  #   - TRANSIENT: an artifact cached without its storageLayout. `--force`
+  #     clears it, and on forge 1.7.1 a genuinely missing layout exits non-zero
+  #     ("storage layout missing from artifact"), which the `!` half already
+  #     caught — so this one is largely self-healing.
+  #   - PERSISTENT: a name that resolves to a storage-less artifact. An
+  #     interface, a library, a renamed contract, a typo:
+  #         $ forge inspect IGuardianRegistry storageLayout --json
+  #         { "storage": [], "types": {} }        # rc 0
+  #     This does not clear on the next run. Left unguarded, a gate pointed at
+  #     such a name pins NOTHING, indefinitely and silently — and
+  #     `--update-golden` would bake the empty layout in, so the gate keeps
+  #     agreeing with itself while the real contract's storage drifts freely.
+  #
+  # Hence: retry once with --force for the transient case, then hard-fail
+  # rather than compare or bake a layout that pins nothing.
   local out
-  if ! out=$(forge inspect "$1" storageLayout --json 2>/dev/null) || [ -z "$out" ]; then
+  if ! out=$(forge inspect "$1" storageLayout --json 2>/dev/null) || _layout_is_empty "$out"; then
     out=$(forge inspect "$1" storageLayout --json --force 2>/dev/null) ||
       fail "forge inspect $1 storageLayout failed even with --force"
+  fi
+  if _layout_is_empty "$out"; then
+    fail "forge inspect $1 storageLayout returned an EMPTY layout even with --force — refusing to compare or bake a layout that pins nothing"
   fi
   printf '%s' "$out"
 }
 
 canonical_layout() {
-  # Canonical, ORDER-SIGNIFICANT JSON of the contract's storage, in two parts:
+  # Canonical, ORDER-SIGNIFICANT JSON of the contract's storage:
   #
-  #   "storage" — every top-level variable in slot order with (label, slot, offset, type).
-  #   "structs" — the member layout of every struct type in the layout, keyed by type.
+  #   "storage" — every top-level variable in slot order with (label, slot, offset,
+  #               type).
+  #   "types"   — the INTERNAL layout of every struct reachable from those variables
+  #               (transitively, through mapping values and array bases), each with its
+  #               members in slot order.
   #
-  # The "structs" half matters because top-level pins alone are BLIND to struct-internal
-  # drift: `StrategyProposal` lives behind `mapping(uint256 => StrategyProposal)`, so its
-  # fields occupy no top-level slot and a reorder/insert/retype inside it is invisible
-  # above — yet it would corrupt every live proposal on upgrade. Struct fields are
-  # append-only for the same reason top-level ones are.
+  # The `types` half is not optional. Top-level slots alone cannot see inside a struct:
+  # appending a member to a struct held in a mapping is a safe, invisible-to-`storage`
+  # change, but REORDERING two members of that same struct silently retypes every live
+  # record on the next upgrade and would pass a storage-only gate. (Concretely: the
+  # proposal-lifecycle branch grew `Review` from 3 slots to 4; safe as an append, and
+  # the gate could not have told the difference had it been a reorder.)
   #
   # Ast ids and the declaring contract qualifier are stripped so only genuine layout
   # drift diffs.
@@ -52,27 +86,81 @@ canonical_layout() {
 import json, re, sys
 
 def norm(s):
-    return re.sub(r"\)\d+", ")", s)  # strip ast ids in type names
+    """Strip solc ast ids from type names while PRESERVING array lengths.
+
+        t_struct(Review)1234_storage   -> t_struct(Review)_storage    (ast id: noise)
+        t_array(t_uint256)49_storage   -> unchanged                   (length: load-bearing)
+
+    Both shapes are `)<digits>`, so the old `re.sub(r"\\)\\d+", ")")` canonicalised
+    `uint256[49] __gap` and `uint256[42] __gap` to the SAME string and the gate went
+    blind to a pure gap resize. A forgotten decrement on append still moves the gap`s
+    own slot (caught by the `storage` half), but a resize with no other change is
+    exactly the reserved-space accounting drift this gate exists to catch.
+
+    Digits after `)` are an ast id UNLESS the group was opened by `t_array(`, so we
+    track what opened each paren rather than pattern-matching (types nest:
+    `t_array(t_struct(Review)1234_storage)49_storage` needs both rules at once).
+    """
+    out, stack, i = [], [], 0
+    while i < len(s):
+        c = s[i]
+        if c == "(":
+            j = len(out) - 1
+            while j >= 0 and (out[j].isalnum() or out[j] == "_"):
+                j -= 1
+            stack.append("".join(out[j + 1:]))
+            out.append(c)
+            i += 1
+        elif c == ")":
+            kind = stack.pop() if stack else ""
+            out.append(c)
+            i += 1
+            j = i
+            while j < len(s) and s[j].isdigit():
+                j += 1
+            if j > i and kind != "t_array":
+                i = j  # ast id -> drop. array length -> fall through and keep.
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
 
 d = json.load(sys.stdin)
-storage = [
-    {"label": v["label"], "slot": v["slot"], "offset": v["offset"], "type": norm(v["type"])}
-    for v in d["storage"]
-]
+types = d.get("types") or {}
 
-# Every struct type the layout mentions, member-by-member. Any struct present in
-# `types` is by construction reachable from `storage`, so no graph walk is needed.
-structs = {}
-for tname, tinfo in (d.get("types") or {}).items():
-    members = tinfo.get("members")
-    if not members:
+# Transitive closure over the type graph, starting from the top-level variables.
+# Structs contribute their members; mappings their key/value; arrays their base.
+seen, stack = set(), [v["type"] for v in d["storage"]]
+while stack:
+    t = stack.pop()
+    if t in seen or t not in types:
         continue
-    structs[norm(tname)] = [
+    seen.add(t)
+    info = types[t]
+    for m in info.get("members") or []:
+        stack.append(m["type"])
+    for edge in ("key", "value", "base"):
+        if info.get(edge):
+            stack.append(info[edge])
+
+structs = {}
+for t in seen:
+    members = types[t].get("members")
+    if not members:  # only structs carry an internal slot assignment
+        continue
+    structs[norm(t)] = [
         {"label": m["label"], "slot": m["slot"], "offset": m["offset"], "type": norm(m["type"])}
         for m in members
     ]
 
-print(json.dumps({"storage": storage, "structs": dict(sorted(structs.items()))}, indent=2))
+out = {
+    "storage": [
+        {"label": v["label"], "slot": v["slot"], "offset": v["offset"], "type": norm(v["type"])}
+        for v in d["storage"]
+    ],
+    "types": dict(sorted(structs.items())),
+}
+print(json.dumps(out, indent=2))
 '
 }
 
@@ -108,10 +196,10 @@ check_contract SyndicateFactory script/syndicate-factory-layout.golden.json
 # rather than by hand.
 check_contract GuardianRegistry script/guardian-registry-layout.golden.json
 # StakedWood is UUPS and live, and custodies every WOOD bond in the protocol —
-# the highest-consequence layout on this branch. Plan C carved
-# `authorizedSlasher` (9 -> 8) and then `compensationEscrow` (8 -> 7) out of the
-# front of its __gap; pinned here so the next append is checked automatically
-# rather than by hand.
+# the highest-consequence layout on this branch (review N7). Plan B carved
+# `exposureLedger` out of its __gap, then Plan C carved `authorizedSlasher`,
+# `compensationEscrow`, and `_verdictSlashed`; pinned here so the next append
+# is checked automatically rather than by hand.
 check_contract StakedWood script/staked-wood-layout.golden.json
 
 [ "${UPDATE_GOLDEN:-0}" = "1" ] ||

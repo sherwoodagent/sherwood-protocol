@@ -191,7 +191,11 @@ contract CourtEndToEndTest is Test {
     uint256 constant REQUIRED_COVERAGE = 2_000e6;
     uint256 constant COVERAGE_USD = 2_000e18;
     uint256 constant PROPOSER_BOND = 400e18; // $2,000 × 1% ÷ $0.05
-    uint256 constant CHALLENGER_BOND = 2_000e18; // $2,000 × 5% ÷ $0.05
+    /// @dev Sized off the FROZEN coverage, which is the sum of the approvers'
+    ///      RESERVATIONS ($1,500 + $1,000), not the proposal's $2,000 need. Each
+    ///      approver reserves up to the full need, so the two diverge as soon as
+    ///      more than one guardian covers — see `G2_COVERAGE_USD`.
+    uint256 constant CHALLENGER_BOND = 2_500e18; // $2,500 × 5% ÷ $0.05
 
     /// @dev THE COVERAGE DELIBERATELY EXCEEDS ONE GUARDIAN'S BUDGET, so the
     ///      proposal has TWO covering approvers and the defence has a free-rider
@@ -203,11 +207,24 @@ contract CourtEndToEndTest is Test {
     ///      funds the counter-bond, which is what makes the forfeit's
     ///      pro-rata-to-CONTRIBUTION rule observable rather than degenerate.
     uint256 constant G1_COVERAGE_USD = 1_500e18;
-    uint256 constant G2_COVERAGE_USD = 500e18;
+    /// @dev g2 RESERVES its whole free bond, not the $500 shortfall g1 left.
+    ///      The ledger books `min(free bond, the proposal's full need)` — a
+    ///      reservation is an upper bound on liability, and the pro-rata
+    ///      `allocatedUsd` is what scales it down at settle. Booking the
+    ///      remainder instead conflated the two, which is the bug the exposure
+    ///      ledger fixed; this constant tracked the superseded model.
+    uint256 constant G2_COVERAGE_USD = 1_000e18;
 
-    uint256 constant PROCEEDS = G1_STAKE + FILLER_STAKE; // both approvers, in full
-    uint256 constant LP1_CLAIM = 35_000e18; // 70% of PROCEEDS
-    uint256 constant LP2_CLAIM = 15_000e18; // 30% of PROCEEDS
+    /// @dev BOTH APPROVERS AT 8,000 bps, not in full. Each is slashed for the
+    ///      ALLOCATION it carries, not the reservation it booked: g1 carries
+    ///      $1,200 against a $1,500 bond and g2 carries $800 against a $1,000
+    ///      bond, both 80%. `slashBpsFor` prices the rate that way on purpose —
+    ///      slashing reservations would take the whole coverage from every
+    ///      approver, which is the conflation it exists to avoid.
+    uint256 constant APPROVER_SLASH_BPS = 8_000;
+    uint256 constant PROCEEDS = ((G1_STAKE + FILLER_STAKE) * APPROVER_SLASH_BPS) / 10_000; // 40,000
+    uint256 constant LP1_CLAIM = (PROCEEDS * 70) / 100; // 28,000 — 70% of PROCEEDS
+    uint256 constant LP2_CLAIM = (PROCEEDS * 30) / 100; // 12,000 — 30% of PROCEEDS
 
     uint16 constant CERTIFIED_BOUND_BPS = 5_000;
 
@@ -500,13 +517,18 @@ contract CourtEndToEndTest is Test {
         vm.prank(g2);
         registry.voteOnProposal(address(gov), pid, IGuardianRegistry.GuardianVoteType.Approve);
         assertEq(ledger.openExposureUsd(g1), G1_COVERAGE_USD, "g1 committed all the budget it had");
-        assertEq(ledger.openExposureUsd(g2), G2_COVERAGE_USD, "g2 committed the remainder");
+        assertEq(ledger.openExposureUsd(g2), G2_COVERAGE_USD, "g2 reserved its whole free bond");
 
         (address[] memory approvers, uint256[] memory shares) = ledger.approversOf(address(gov), pid);
         assertEq(approvers.length, 2, "two covering approvers");
         assertEq(approvers[0], g1);
         assertEq(approvers[1], g2);
-        assertEq(shares[0] + shares[1], COVERAGE_USD, "and between them they back the whole thing");
+        // AT LEAST, not exactly. Reservations are upper bounds on liability and
+        // each approver reserves up to the proposal's full need, so they sum to
+        // MORE than it whenever more than one guardian covers — the pro-rata
+        // `allocatedUsd` is what scales them back down at settle. The property
+        // §3.3a actually needs is `Σ min(live_i, reserved_i) >= need`.
+        assertGe(shares[0] + shares[1], COVERAGE_USD, "and between them they back the whole thing");
 
         vm.warp(gov.getProposal(pid).reviewEnd + 1);
         gov.executeProposal(pid);
@@ -604,7 +626,11 @@ contract CourtEndToEndTest is Test {
         // ── File. Bond pulled, coverage frozen.
         uint256 cid = _file(pid);
         uint256 filedAt = game.challengeOf(cid).filedAt;
-        assertEq(game.challengeOf(cid).bondWood, CHALLENGER_BOND, "5% of $2,000 at $0.05/WOOD");
+        assertEq(
+            game.challengeOf(cid).bondWood,
+            CHALLENGER_BOND,
+            "5% of the 2,500 USD of frozen reservations, at 0.05 USD/WOOD"
+        );
         assertTrue(ledger.isCoverageFrozen(address(gov), pid), "the filing pins the coverage");
 
         // ── THE COUNTER-BOND IS POOLED, and the completed pool is what buys the
@@ -675,9 +701,21 @@ contract CourtEndToEndTest is Test {
 
         // ── Plan D's settle path, reached through the court instead of silence.
         assertEq(uint256(game.challengeOf(cid).status), uint256(IChallengeGame.Status.Settled), "Settled");
-        assertEq(swood.guardianStake(g1), 0, "the covering approver was slashed in full (D7, maxSlashBps)");
+        // PROPORTIONAL, NOT FULL. g1 RESERVED $1,500 but CARRIES $1,200 — the
+        // $2,000 need split by effective bond, 1,500/2,500 — and its $1,500
+        // bond covers that at 8,000 bps. So 24,000 of its 30,000 WOOD is taken.
+        // The old "slashed in full" expectation priced liability at the
+        // reservation, which is precisely the conflation `slashBpsFor` fixed:
+        // slashing reservations would take the whole coverage from EVERY
+        // approver.
         assertEq(
-            swood.guardianStake(g2), 0, "and so was the one that free-rode the defence: coverage is what is judged"
+            swood.guardianStake(g1), 6_000e18, "the approver was slashed for what it carried, not what it reserved"
+        );
+        assertEq(
+            swood.guardianStake(g2),
+            4_000e18,
+            "and so was the one that free-rode the defence: coverage is what is judged, "
+            "at the same 8,000 bps - g2 carries $800 of the $2,000 against a $1,000 bond"
         );
 
         // ── A GUILTY RULING FORFEITS THE WHOLE POOL TO THE CHALLENGER, on top of
@@ -706,7 +744,7 @@ contract CourtEndToEndTest is Test {
         //    cohort owns all of it, exactly 70/30.
         assertEq(escrow.caseCount(), 1, "one compensation case");
         uint256 escrowCaseId = escrow.caseCount();
-        (address caseVault, uint256 snapTs, uint256 proceeds,,,) = escrow.caseOf(escrowCaseId);
+        (address caseVault, uint256 snapTs, uint256 proceeds,,,,) = escrow.caseOf(escrowCaseId);
         assertEq(caseVault, address(vault), "pinned to the real vault");
         assertEq(snapTs, executedAt - 1, "and to the block before the drain executed");
         assertEq(snapTs, resolved.snapshotTs, "THE SAME INSTANT THE COURT JUDGED AT (D2): one rule, both consumers");
@@ -744,7 +782,11 @@ contract CourtEndToEndTest is Test {
         vm.expectRevert(IChallengeGame.WrongStatus.selector);
         game.resolve(cid);
         assertEq(uint256(game.challengeOf(cid).status), uint256(IChallengeGame.Status.Settled), "still Settled");
-        assertEq(swood.guardianStake(g1), 0, "and still slashed: the ruling beat the timeout, terminally");
+        assertEq(
+            swood.guardianStake(g1),
+            6_000e18,
+            "and still slashed at its carried rate: the ruling beat the timeout, terminally"
+        );
 
         // The court's own case is likewise beyond re-litigation.
         vm.expectRevert(ICourt.WrongPhase.selector);
@@ -862,7 +904,7 @@ contract CourtEndToEndTest is Test {
         //    The burn is what stops the challenger's own second address from
         //    funding the counter-bond and collecting its own forfeited bond back.
         uint256 burned = (CHALLENGER_BOND * game.forfeitBurnBps()) / 10_000;
-        assertEq(burned, 400e18, "20% of a 2,000 WOOD bond");
+        assertEq(burned, 500e18, "20% of a 2,500 WOOD bond");
         assertEq(wood.balanceOf(challenger), challengerBalBefore - CHALLENGER_BOND, "the challenger forfeited it");
         assertEq(wood.balanceOf(game.BURN_ADDRESS()), burned, "and the burned slice left the system for good");
         assertEq(
@@ -1021,11 +1063,15 @@ contract CourtEndToEndTest is Test {
         // ── The consequence is Plan D's full settle path, identical to arc 1's:
         //    an appeal below the floor changes nothing about the outcome.
         assertEq(uint256(game.challengeOf(cid).status), uint256(IChallengeGame.Status.Settled), "Settled");
-        assertEq(swood.guardianStake(g1), 0, "the covering approver was slashed in full");
-        assertEq(swood.guardianStake(g2), 0, "and so was its co-approver");
+        // Proportional, exactly as in arc 1: $1,200 carried against a $1,500
+        // bond is 8,000 bps, so 6,000 of the 30,000 WOOD survives.
+        assertEq(
+            swood.guardianStake(g1), 6_000e18, "the approver was slashed for what it carried, not what it reserved"
+        );
+        assertEq(swood.guardianStake(g2), 4_000e18, "and so was its co-approver, at the same proportional rate");
         assertEq(escrow.caseCount(), 1, "a compensation case really opened");
         uint256 escrowCaseId = escrow.caseCount();
-        (address caseVault, uint256 snapTs, uint256 proceeds,,,) = escrow.caseOf(escrowCaseId);
+        (address caseVault, uint256 snapTs, uint256 proceeds,,,,) = escrow.caseOf(escrowCaseId);
         assertEq(caseVault, address(vault));
         assertEq(snapTs, executedAt - 1, "pinned to the block before the drain");
         assertEq(snapTs, snapshotTs, "the same instant the appeal's electorate was read at (D2)");
@@ -1111,6 +1157,10 @@ contract CourtEndToEndTest is Test {
         vm.warp(filedAt + game.disputeTimeout() + 1);
         vm.expectRevert(IChallengeGame.WrongStatus.selector);
         game.resolve(cid);
-        assertEq(swood.guardianStake(g1), 0, "still slashed: a failed appeal did not buy the accused an acquittal");
+        assertEq(
+            swood.guardianStake(g1),
+            6_000e18,
+            "still slashed at its carried rate: a failed appeal did not buy the accused an acquittal"
+        );
     }
 }

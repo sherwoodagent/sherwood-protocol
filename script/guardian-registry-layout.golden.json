@@ -136,10 +136,10 @@
       "label": "__gap",
       "slot": "22",
       "offset": 0,
-      "type": "t_array(t_uint256)_storage"
+      "type": "t_array(t_uint256)48_storage"
     }
   ],
-  "structs": {
+  "types": {
     "t_struct(AddressSet)_storage": [
       {
         "label": "_inner",

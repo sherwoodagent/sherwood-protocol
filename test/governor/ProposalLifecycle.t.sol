@@ -668,4 +668,115 @@ contract ProposalLifecycleTest is Test {
         assertEq(cp.voteEnd, vm.getBlockTimestamp() + VOTING_PERIOD, "voting opens at the transition, not at propose");
         assertEq(cp.reviewEnd, cp.voteEnd + REVIEW_PERIOD, "reviewEnd is voteEnd + the registry review period");
     }
+
+    // ── A paused registry never makes the view lie ──
+    //
+    // `resolveReview` is `whenNotPaused`; `outcomeOf` is not. Reporting Approved
+    // while the registry is paused hands callers a state that every path to act
+    // on reverts against, with an opaque `ProtocolPaused` from a contract they
+    // never called — and if the pause outlives `executeBy`, silently converts
+    // that Approved into Expired. The governor holds the proposal at
+    // GuardianReview for the duration instead, and resumes on unpause.
+    function test_pausedRegistry_holdsGuardianReviewThenResolvesOnUnpause() public {
+        uint256 pid = _propose();
+        _voteFor(pid);
+        _warpPast(_proposal(pid).voteEnd);
+
+        registry.openReview(address(governor), pid);
+        vm.prank(g1);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve);
+        _warpPast(_proposal(pid).reviewEnd);
+
+        // Determinable as Cleared — but the registry cannot take the commit.
+        _assertState(pid, ISyndicateGovernor.ProposalState.Approved, "resolvable while the registry is live");
+
+        vm.prank(owner);
+        registry.pause();
+
+        _assertState(
+            pid,
+            ISyndicateGovernor.ProposalState.GuardianReview,
+            "a paused registry must not report an Approved nobody can act on"
+        );
+
+        vm.prank(owner);
+        registry.unpause();
+
+        _assertState(pid, ISyndicateGovernor.ProposalState.Approved, "unpause resumes the normal outcome");
+
+        governor.resolveProposalState(pid);
+        _assertState(pid, ISyndicateGovernor.ProposalState.Approved, "commit agrees with the view after unpause");
+        (, bool resolved,,) = registry.getReviewState(address(governor), pid);
+        assertTrue(resolved, "the economic commit lands once the registry is live again");
+    }
+
+    /// @dev The already-committed case must NOT be held back: when the registry
+    ///      cached the resolution out-of-band before the pause, `_commitState`
+    ///      skips `resolveReview` entirely, so a pause cannot strand it.
+    function test_pausedRegistry_doesNotHoldAnAlreadyResolvedReview() public {
+        uint256 pid = _propose();
+        _voteFor(pid);
+        _warpPast(_proposal(pid).voteEnd);
+
+        registry.openReview(address(governor), pid);
+        vm.prank(g1);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve);
+        _warpPast(_proposal(pid).reviewEnd);
+
+        // Resolve out-of-band, THEN pause.
+        registry.resolveReview(address(governor), pid);
+        vm.prank(owner);
+        registry.pause();
+
+        _assertState(
+            pid,
+            ISyndicateGovernor.ProposalState.Approved,
+            "an already-cached resolution needs no commit, so the pause is irrelevant"
+        );
+        governor.resolveProposalState(pid);
+        _assertState(pid, ISyndicateGovernor.ProposalState.Approved, "commit succeeds through the pause");
+    }
+
+    // ── governor/registry disagreement fails CLOSED ──
+
+    /// @dev Pins the security posture of the Unresolved branch in `_afterVote`.
+    ///      The state is "governor believes a review window exists, registry
+    ///      holds no record for it" — unreachable on a lockstep deployment, so
+    ///      it is forced here by zeroing the registry's 4-slot `Review` for this
+    ///      `(governor, proposalId)` (`_reviews` is slot 0). That disagreement
+    ///      must NOT yield an executable proposal: answering Cleared would
+    ///      approve a strategy no guardian ever reviewed. It must also stay
+    ///      TERMINAL — holding at GuardianReview was the original strand this
+    ///      fold fixed, pinning `_openProposalCount` and the vault with it.
+    ///      Restore `Approved` on that branch and this test fails.
+    function test_unregisteredWindowExpiresAndCannotExecute() public {
+        uint256 pid = _propose();
+        _voteFor(pid);
+
+        bytes32 key = keccak256(abi.encode(address(governor), pid));
+        bytes32 base = keccak256(abi.encode(key, uint256(0)));
+        for (uint256 i = 0; i < 4; i++) {
+            vm.store(address(registry), bytes32(uint256(base) + i), bytes32(0));
+        }
+        assertEq(
+            uint8(registry.outcomeOf(address(governor), pid)),
+            uint8(IGuardianRegistry.ReviewOutcome.Unresolved),
+            "registry must hold no record for this proposal"
+        );
+
+        ISyndicateGovernor.StrategyProposal memory p = _proposal(pid);
+        assertGt(p.reviewEnd, p.voteEnd, "governor still believes a review window exists");
+
+        // Well inside `executeBy`: the old branch would have said Approved here.
+        _warpPast(p.reviewEnd);
+        assertLt(vm.getBlockTimestamp(), p.executeBy, "still inside the execution window");
+        _assertState(pid, ISyndicateGovernor.ProposalState.Expired, "fails CLOSED, not open");
+
+        // Terminal, so the vault binding is released rather than stranded.
+        uint256 openBefore = governor.openProposalCount();
+        governor.resolveProposalState(pid);
+        _assertState(pid, ISyndicateGovernor.ProposalState.Expired, "terminal after commit");
+        assertEq(governor.openProposalCount(), openBefore - 1, "Expired decrements the open count");
+        assertEq(governor.getActiveProposal(), 0, "no active proposal binds the vault");
+    }
 }

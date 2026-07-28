@@ -201,4 +201,24 @@ contract VaultLaneATest is Test {
         vm.prank(alice);
         vault.withdraw(mw, alice, alice);
     }
+
+    // ── governor without `strategyOf` (independent-upgrade skew) ──
+
+    /// @dev Pins the `try/catch` in `SyndicateVault._activeStrategy`. The vault
+    ///      is a UUPS proxy and the governor is a BEACON proxy, so a vault impl
+    ///      that calls `strategyOf` can go live before the governor beacon
+    ///      carries it — the call then reverts with no data. `_activeStrategy`
+    ///      feeds `_laneState` and hence `maxWithdraw`/`maxRedeem`, so an
+    ///      uncaught revert is a vault-wide brick rather than a degradation.
+    ///      Delete the catch and this test fails with `EvmError: Revert`.
+    function test_missingStrategyOfDoesNotBrickWithdrawLanes() public {
+        vm.prank(alice);
+        vault.deposit(1_000e6, alice);
+        _setLocked(true);
+        vm.mockCallRevert(MOCK_GOVERNOR, abi.encodeWithSignature("strategyOf(uint256)", PID), "");
+
+        assertEq(vault.maxWithdraw(alice), 0, "degrades to lane-locked, does not revert");
+        assertEq(vault.maxRedeem(alice), 0, "degrades to lane-locked, does not revert");
+        assertEq(vault.totalAssets(), 1_000e6, "float only");
+    }
 }

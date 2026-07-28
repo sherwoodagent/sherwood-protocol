@@ -659,7 +659,11 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             // `reviewEnd > voteEnd`: when `reviewPeriod == 0` (registry not
             // wired / unit-test mock) `reviewEnd == voteEnd` and the registry
             // would revert `InvalidReviewWindow` — the base's `_afterVote`
-            // handles the unregistered window fail-closed.
+            // treats that collapsed window as cleared.
+            // LOAD-BEARING: this predicate must stay identical to the one
+            // `_afterVote` tests. A proposal that gets past it there without
+            // having been registered here auto-approves with no guardian
+            // review — see the SECURITY INVARIANT in `ProposalLifecycle`.
             if (proposal.reviewEnd > proposal.voteEnd) {
                 IGuardianRegistry(_guardianRegistry).registerReview(proposalId, proposal.voteEnd, proposal.reviewEnd);
             }
@@ -832,13 +836,22 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         v.voteEnd = p.voteEnd;
         v.reviewEnd = p.reviewEnd;
         v.vault = p.vault;
+        // `executeBy + strategyDuration` bounds the LATEST instant this proposal
+        // can still be settling, which is what the exposure ledger sizes a
+        // guardian's commitment against (ADR 2026-07-26). Read at approve time,
+        // before execution has happened, so `executeBy` is the conservative
+        // anchor — `executedAt` is not known yet and may never be set.
+        v.executeBy = p.executeBy;
+        v.strategyDuration = p.strategyDuration;
     }
 
-    /// @dev Narrow (voteEnd, reviewEnd, vault) tuple returned by `getProposalView`.
+    /// @dev Narrow proposal tuple returned by `getProposalView`.
     struct ProposalViewLite {
         uint256 voteEnd;
         uint256 reviewEnd;
         address vault;
+        uint256 executeBy;
+        uint256 strategyDuration;
     }
 
     // ==================== INTERNAL ====================
@@ -865,7 +878,11 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // review without a call-back. Guarded on `reviewEnd > voteEnd`: with
         // `reviewPeriod == 0` (registry not wired / unit-test mock) the window
         // collapses and the registry would revert `InvalidReviewWindow` — the
-        // base's `_afterVote` handles the unregistered window fail-closed.
+        // base's `_afterVote` treats that collapsed window as cleared.
+        // LOAD-BEARING: this predicate must stay identical to the one
+        // `_afterVote` tests. A proposal that gets past it there without having
+        // been registered here auto-approves with no guardian review — see the
+        // SECURITY INVARIANT in `ProposalLifecycle`.
         if (p.reviewEnd > p.voteEnd) {
             IGuardianRegistry(_guardianRegistry).registerReview(p.id, p.voteEnd, p.reviewEnd);
         }
@@ -909,6 +926,30 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         if (ledger != address(0)) {
             address asset = IERC4626(GovernorParameters.vault).asset();
             IExposureLedger(ledger).requireWithinCoveredTvlCap(asset, coverage_);
+            // Fail on the PROPOSER, not on the cohort (review N4): a duration
+            // whose settlement outruns the ledger's booking horizon would
+            // otherwise leave every approve vote unable to book, turning the
+            // review block-only.
+            // `p.executeBy` IS STILL ZERO ON THE COLLABORATIVE PATH (review
+            // N11). `_initPendingProposal` writes it, and `propose` only calls
+            // that on the non-collaborative branch — a co-proposed strategy
+            // sits in Draft until `approveCollaboration`, which re-runs no
+            // ledger gate. Passing the raw field made the check
+            // `strategyDuration > block.timestamp`, unsatisfiable on any real
+            // chain, so the gate silently could not fire for co-proposed
+            // strategies. (Foundry's default `t = 1` hides it.)
+            //
+            // Compute the WORST-CASE deadline instead, which is well-defined
+            // before any of it is written and covers both paths from the one
+            // site: a Draft may idle for `collaborationWindow` before
+            // activating, then run voting -> review -> execution.
+            uint256 deadline = p.executeBy;
+            if (deadline == 0) {
+                ISyndicateGovernor.GovernorParams memory gp = _params;
+                deadline = block.timestamp + gp.collaborationWindow + gp.votingPeriod
+                    + IGuardianRegistry(_guardianRegistry).reviewPeriod() + gp.executionWindow;
+            }
+            IExposureLedger(ledger).requireWithinCoverageHorizon(deadline, p.strategyDuration);
             address escrow = _bondEscrow;
             if (escrow != address(0)) {
                 uint256 bondWood = IExposureLedger(ledger).proposerBondWood(asset, coverage_);
@@ -1392,6 +1433,19 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      `setAssetFeed` / `setCoveredTvlCapUsd`), or point the factory at a
     ///      fresh permissive ledger and `pushWiring` this governor.
     function setExposureLedger(address newLedger) external onlyFactory {
+        // NOT WHILE PROPOSALS ARE OPEN (review n3). A proposal created before
+        // the ledger existed carries no booked coverage — nobody could have
+        // booked any — but `executeProposal` starts demanding it the moment the
+        // ledger is wired, so those proposals become permanently unexecutable.
+        //
+        // The M3 change made this worse rather than better: the approve hook now
+        // books nothing instead of reverting, so the failure moved from LOUD at
+        // vote time to SILENT until execute. Refusing the wiring is the only
+        // point where it is still visible.
+        //
+        // Un-wiring (`newLedger == 0`) is exempt: it can only relax the execute
+        // gate, never brick a proposal that was relying on it.
+        if (newLedger != address(0) && _openProposalCount > 0) revert ParamsFrozenDuringProposal();
         emit ExposureLedgerSet(_exposureLedger, newLedger);
         _exposureLedger = newLedger;
     }

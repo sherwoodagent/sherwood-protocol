@@ -9,6 +9,8 @@ import {IGuardianRegistry} from "../src/interfaces/IGuardianRegistry.sol";
 
 interface ISwoodCooldown {
     function coolDownPeriod() external view returns (uint256);
+    function maxSlashBps() external view returns (uint256);
+    function exposureLedger() external view returns (address);
 }
 
 /**
@@ -76,12 +78,40 @@ contract DeployPlanB is Script {
         uint256 woodPriceX8 = vm.envUint("WOOD_PRICE_HAIRCUT_X8"); // conservative, <= 30-day low
         uint256 coveredTvlCapUsd = vm.envUint("COVERED_TVL_CAP_USD18");
 
-        // ── Pre-flight 1: unstake-delay invariant (spec §5) ──
+        // ── Pre-flight 1: REMOVED (ADR 2026-07-26) ──
+        // This asserted `coolDownPeriod >= epochLength + challengeWindow` (42d
+        // at defaults). It was both unsatisfiable and unnecessary:
+        //
+        //   - `StakedWood.setCooldownPeriod` caps the cooldown at 30 days, so
+        //     the remedy this check printed — "raise the sWOOD cooldown by
+        //     governance FIRST" — was not an action any operator could take.
+        //     Only `initialize` could reach 42, i.e. only a fresh sWOOD.
+        //   - The property it approximated (an approver cannot exit from under
+        //     a pending challenge) is now enforced exactly by the exit gate on
+        //     `claimUnstakeGuardian`, which reads `openExposureUsd` directly.
+        //
+        // Pre-flight 3 below replaces it, and is strictly stronger: it checks
+        // the mechanism is WIRED rather than that a proxy for it is large
+        // enough.
         uint256 coolDown = ISwoodCooldown(swood).coolDownPeriod();
+
+        // ── Pre-flight 1b: the slash ceiling must not clip the allocation ──
+        // The ledger books liability at 100% of a guardian's allocation, and
+        // after the n1 fix `allocation == live slashable bond` is the DESIGNED
+        // outcome whenever a co-approver's bond collapses, not a corner case.
+        // With delegation deferred there is no surplus to absorb a clipped
+        // ceiling, so any `maxSlashBps` below 10_000 makes recovery a strict
+        // shortfall against the allocation and breaks §2's inequality by
+        // construction.
+        //
+        // Every shipped config already seats 10_000 (`Deploy.s.sol`'s
+        // DEFAULT_MAX_SLASH_BPS and both testnet scripts). This asserts the
+        // choice rather than leaving it to a later governance transaction that
+        // could lower it silently (review N9).
         require(
-            coolDown >= EPOCH_LENGTH + EXPECTED_CHALLENGE_WINDOW,
-            "PRE-FLIGHT: sWOOD coolDownPeriod < epochLength + challengeWindow (42d at defaults). "
-            "Raise the sWOOD cooldown by governance FIRST, then re-run."
+            ISwoodCooldown(swood).maxSlashBps() == 10_000,
+            "PRE-FLIGHT: sWOOD maxSlashBps != 10000 -- the ledger books at 100% of allocation, "
+            "so a lower ceiling makes recovery a strict shortfall."
         );
 
         // ── Pre-flight 2: a zero covered-TVL cap bricks all proposing ──
@@ -123,6 +153,23 @@ contract DeployPlanB is Script {
         ISyndicateFactory(factory).setBondEscrow(address(escrow));
 
         vm.stopBroadcast();
+
+        // ── Pre-flight 3 (POST-wiring): the unstake gate must be live ──
+        // `StakedWood.claimUnstakeGuardian` FAILS OPEN when `exposureLedger` is
+        // unset, because there is necessarily a window at deploy — and again on
+        // a UUPS upgrade — where the pointer is still zero, and failing closed
+        // there would brick withdrawals over a missed configuration step.
+        //
+        // The cost of that choice is a deployment which looks entirely healthy
+        // while guardians can walk out from under a pending challenge. Asserting
+        // it here converts that silent hole into a refused deploy, which is the
+        // only point where the mistake is still cheap. Checked AFTER the
+        // broadcast because the wiring happens inside it.
+        require(
+            ISwoodCooldown(swood).exposureLedger() != address(0),
+            "PRE-FLIGHT: sWOOD exposureLedger is unset -- the unstake gate would fail open. "
+            "Call setExposureLedger(ledger) by governance, then re-run."
+        );
 
         console.log("ExposureLedger:     %s", address(ledger));
         console.log("ProposerBondEscrow: %s", address(escrow));

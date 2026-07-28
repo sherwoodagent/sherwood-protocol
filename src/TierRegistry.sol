@@ -185,6 +185,16 @@ contract TierRegistry is Ownable2Step {
     ///         it goes demote → timelock → claim → fresh certify, so the old
     ///         bond must traverse its release timelock (slash-first layering)
     ///         before the key can carry a new bond.
+    ///
+    ///         OPERATIONAL COST, stated rather than discovered (review m2):
+    ///         this applies to BENIGN edits too. Correcting an
+    ///         `extractableBoundBps` typo, or re-certifying after a legitimate
+    ///         adapter upgrade, costs the full demote → 14d → claim → certify
+    ///         cycle — and the key sits at tier 2 (full notional, priced not
+    ///         bounded) for the whole window. Deliberate: the alternative is a
+    ///         path that swaps a certification out from under a live bond. It
+    ///         belongs in the runbook so operators plan around it rather than
+    ///         discovering it mid-incident.
     function certify(address target, bytes4 selector, uint8 tier, uint16 extractableBoundBps, address submitter)
         external
         onlyOwner
@@ -230,6 +240,22 @@ contract TierRegistry is Ownable2Step {
 
     event AuthorizedDemoterSet(address indexed demoter);
 
+    /// @dev Zero is legal and deliberate — it is the UNWIRE switch, revoking
+    ///      the challenge game's demotion role outright while a replacement is
+    ///      wired. The unwired state fails CLOSED (nothing can demote), which
+    ///      is why this setter carries no zero-address check where the others
+    ///      in this diff do (PR #25 review, minor).
+    ///
+    ///      WHAT "FAILS CLOSED" DOES AND DOES NOT COVER (review 🟠F11). It holds
+    ///      for FUTURE demotions and did NOT hold for live challenges:
+    ///      `ChallengeGame._settle` called `demoteByChallenge` unguarded, so
+    ///      throwing this switch mid-challenge reverted the whole verdict —
+    ///      `resolve()` could never complete, the slash never landed, both bonds
+    ///      stranded in the game, and the frozen coverage barred every accused
+    ///      approver from `claimUnstakeGuardian`, permanently. The game now
+    ///      treats the demotion as best-effort and emits `AdapterDemotionFailed`
+    ///      instead, so this role is safe to rotate at any time — and `demote`
+    ///      below is the owner's remedy for any revocation the rotation lost.
     function setAuthorizedDemoter(address demoter) external onlyOwner {
         authorizedDemoter = demoter;
         emit AuthorizedDemoterSet(demoter);
