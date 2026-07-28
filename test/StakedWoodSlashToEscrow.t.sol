@@ -99,6 +99,13 @@ contract StakedWoodSlashToEscrowTest is Test {
 
         vault = new MockVotesVault();
 
+        // N-4: `slashToEscrow` asserts `governorOf(vault) != 0`. The fixture
+        // factory is codeless, so give it a byte of code and a wildcard mock —
+        // membership itself is pinned by the dedicated rejection test, which
+        // overrides this with an exact-calldata zero.
+        vm.etch(factory, hex"00");
+        vm.mockCall(factory, abi.encodeWithSignature("governorOf(address)"), abi.encode(makeAddr("gov")));
+
         // A staked, matured guardian to slash.
         wood.mint(g1, 1_000_000e18);
         vm.startPrank(g1);
@@ -189,6 +196,33 @@ contract StakedWoodSlashToEscrowTest is Test {
         vm.prank(registry);
         vm.expectRevert(IStakedWood.NotAuthorizedSlasher.selector);
         swood.slashToEscrow(bytes32("case"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs);
+    }
+
+    /// @notice N-4 (PR #24 round 4): the vault must be factory-deployed. The
+    ///         escrow apportions against the vault's checkpoints, and every
+    ///         claim about that population assumes OZ semantics — so a vault
+    ///         the factory does not recognise is refused BEFORE any stake
+    ///         moves, converting the F-A natspec's scoping sentence into code.
+    function test_slashToEscrow_rejectsAFactoryUnknownVault() public {
+        vm.prank(owner);
+        swood.setAuthorizedSlasher(slasher);
+
+        // Exact-calldata mock overrides the fixture's wildcard: this vault
+        // resolves to no governor.
+        address strangerVault = makeAddr("strangerVault");
+        vm.mockCall(factory, abi.encodeWithSignature("governorOf(address)", strangerVault), abi.encode(address(0)));
+
+        address[] memory gs = new address[](1);
+        gs[0] = g1;
+        uint256 stakeBefore = swood.guardianStake(g1);
+
+        uint256[] memory bps = _bpsArr(gs.length, 10_000);
+        vm.prank(slasher);
+        vm.expectRevert(StakedWood.VaultNotFactoryDeployed.selector);
+        swood.slashToEscrow(bytes32("stranger"), openedAt, gs, bps, strangerVault, snapTs);
+
+        assertEq(swood.guardianStake(g1), stakeBefore, "nothing was slashed for an unknown vault");
+        assertFalse(swood.verdictSlashed(bytes32("stranger"), g1), "and the verdict mark stays clean");
     }
 
     function test_slashToEscrow_routesProceedsToEscrowNotBurn() public {
@@ -391,6 +425,74 @@ contract StakedWoodSlashToEscrowTest is Test {
         assertGt(totalRetry, 0, "the retried verdict recovers");
         assertGt(caseRetry, 0, "and funds a case");
         assertTrue(swood.verdictSlashed(bytes32("B"), g1), "the landed slash is what consumes the verdict");
+    }
+
+    /// @notice AN UNSTAKE REQUEST IS NOT A DISCHARGE. `requestUnstakeGuardian`
+    ///         revokes VOTING POWER; it does not settle what the guardian
+    ///         already underwrote, and the WOOD is still in this contract.
+    ///
+    ///         PR #25 review 🔴F1b. F1 moved the slash basis from `filedAt` to
+    ///         `executedAt` so an accused approver could not zero its own basis
+    ///         AFTER being accused. A deliberately malicious approver does not
+    ///         need to react, though — it can pre-position before the drain it
+    ///         voted for ever lands: approve while active, queue the exit, let
+    ///         the proposal execute. Every basis at or after `executedAt` then
+    ///         reads the request's zero checkpoint, and a 100% conviction
+    ///         recovers nothing while the full bond sits in custody waiting for
+    ///         the freeze to lift.
+    ///
+    ///         The divergence that makes it work: `ExposureLedger`'s coverage
+    ///         gate prices the bond off live `guardianStake()`, which a request
+    ///         does not touch, so quorum still passes at execution — while
+    ///         `_slashOne` prices it off the checkpoint trace, which the request
+    ///         zeroes. Liability and votability are two different questions and
+    ///         must not share one trace.
+    function test_slashToEscrow_unstakeRequestBeforeOpenDoesNotZeroTheBasis() public {
+        vm.prank(owner);
+        swood.setAuthorizedSlasher(slasher);
+
+        // The approver queues its exit BEFORE the proposal it approved executes.
+        vm.prank(g1);
+        swood.requestUnstakeGuardian();
+
+        // Voting power is gone, as intended — but the bond has not moved.
+        assertEq(swood.guardianStake(g1), 20_000e18, "the WOOD is still in custody");
+
+        // The drain executes AFTER the request, so `executedAt` sits on the far
+        // side of the zero checkpoint.
+        vm.warp(vm.getBlockTimestamp() + 1 days);
+        uint256 drainOpenedAt = vm.getBlockTimestamp();
+        vm.warp(vm.getBlockTimestamp() + 1);
+
+        uint256 drainSnapTs = drainOpenedAt - 1;
+        vault.setTotal(drainSnapTs, 1_000e18);
+        vault.setVotes(alice, drainSnapTs, 1_000e18);
+
+        address[] memory gs = new address[](1);
+        gs[0] = g1;
+        vm.prank(slasher);
+        (uint256 slashed, uint256 caseId) = swood.slashToEscrow(
+            bytes32("preExit"), drainOpenedAt, gs, _bpsArr(gs.length, 10_000), address(vault), drainSnapTs
+        );
+
+        assertEq(slashed, 20_000e18, "a 100% conviction takes the whole bond");
+        assertEq(swood.guardianStake(g1), 0, "nothing left to walk out with");
+        assertGt(caseId, 0, "and the victims get a funded case");
+    }
+
+    /// @notice The other half of the same invariant: a request must still stop
+    ///         the stake from counting toward VOTING weight at `openedAt`. The
+    ///         liability trace is additional to the votable trace, not a
+    ///         replacement for it.
+    function test_getPastStake_stillZeroAfterAnUnstakeRequest() public {
+        vm.prank(g1);
+        swood.requestUnstakeGuardian();
+
+        vm.warp(vm.getBlockTimestamp() + 1 days);
+        uint256 t = vm.getBlockTimestamp();
+        vm.warp(vm.getBlockTimestamp() + 1);
+
+        assertEq(swood.getPastVotes(g1, t), 0, "unstake-requested stake is not votable");
     }
 
     /// @dev `slashToEscrow` now takes one rate per approver. These suites all

@@ -218,10 +218,41 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      approved — an unbounded loop in the execute path (review M2).
     mapping(bytes32 reviewKey => mapping(address guardian => uint256)) internal _approverIndex;
 
+    /// @notice The one address permitted to freeze a proposal's coverage — the
+    ///         ChallengeGame (spec §3.4). Owner-set.
+    address public coverageFreezer;
+
+    /// @dev Proposals whose committed coverage is pinned by a live challenge.
+    mapping(bytes32 reviewKey => bool) internal _frozen;
+
+    /// @dev Which guardians a given frozen key is holding, so `unfreezeCoverage`
+    ///      releases exactly what `freezeCoverage` took and the per-guardian
+    ///      counter below cannot drift.
+    mapping(bytes32 reviewKey => mapping(address guardian => bool)) internal _frozenFor;
+
+    /// @dev How many frozen proposals name this guardian. Non-zero is what
+    ///      makes the freeze load-bearing: sWOOD reads it on the unstake claim,
+    ///      so a guardian under live accusation cannot walk its collateral out
+    ///      after its epoch bucket ages out (review 🔴F2 / 🟠F6). A COUNT rather
+    ///      than a USD sum on purpose — the question the claim gate asks is
+    ///      binary, and summing would double-count against the live buckets and
+    ///      silently tighten the batching cap, which is a different control.
+    mapping(address guardian => uint256) internal _frozenCommitments;
+
+    /// @dev How many proposals are frozen right now, across every guardian.
+    ///      Exists so `setCoverageFreezer` can refuse a rotation that would
+    ///      ORPHAN a live freeze (review 🟠F11) — see that setter.
+    uint256 internal _frozenKeyCount;
+
     // ── Modifiers / helpers ──
 
     modifier onlyRegistry() {
         if (msg.sender != guardianRegistry) revert NotGuardianRegistry();
+        _;
+    }
+
+    modifier onlyFreezer() {
+        if (msg.sender != coverageFreezer) revert NotCoverageFreezer();
         _;
     }
 
@@ -507,6 +538,29 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         challengeWindow = newWindow;
     }
 
+    /// @dev REFUSED WHILE ANYTHING IS FROZEN (review 🟠F11). `unfreezeCoverage`
+    ///      is `onlyFreezer` and the challenge game is its only caller, so
+    ///      rotating this role mid-challenge left the old freeze with nobody
+    ///      able to clear it: the game's `resolve()` reverted
+    ///      `NotCoverageFreezer` on every call, both bonds stranded there with
+    ///      no withdrawal path, `_frozenCommitments` never decremented, and
+    ///      every accused approver was permanently barred from
+    ///      `claimUnstakeGuardian`. One governance transaction, unrecoverable.
+    ///
+    ///      An earlier version of this natspec called zero a safe unwire switch
+    ///      that "fails closed". It fails closed for NEW filings and BRICKS the
+    ///      live ones, which is not the same thing when the mechanism being
+    ///      unwired is holding somebody's collateral. Deferring the rotation
+    ///      until nothing is pinned makes the documented remedy — drain the live
+    ///      challenges, then re-point — the only reachable order. Zero is still
+    ///      legal, and still the unwire switch; it just cannot be thrown while
+    ///      it would strand a freeze.
+    function setCoverageFreezer(address freezer) external onlyOwner {
+        if (_frozenKeyCount != 0) revert CoverageFrozen();
+        emit CoverageFreezerSet(coverageFreezer, freezer);
+        coverageFreezer = freezer;
+    }
+
     function setKNumerator(uint256 newK) external onlyOwner {
         if (newK == 0) revert InvalidParameter();
         emit ParameterChangeFinalized(PARAM_K_NUMERATOR, kNumerator, newK);
@@ -756,6 +810,9 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      registry's approver cap, and that loop runs on the execute path.
     function releaseApproval(address governor, uint256 proposalId, address guardian) external onlyRegistry {
         bytes32 key = _reviewKey(governor, proposalId);
+        // A live challenge pins this coverage (§3.4): the guardian may not
+        // release it and recycle the budget while under challenge.
+        if (_frozen[key]) revert CoverageFrozen();
         RecordedExposure memory r = _recorded[key][guardian];
         if (r.usd == 0) return;
         delete _recorded[key][guardian];
@@ -783,6 +840,99 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         }
 
         emit ExposureReleased(guardian, key, r.usd, r.epoch);
+    }
+
+    /// @inheritdoc IExposureLedger
+    function approversOf(address governor, uint256 proposalId)
+        external
+        view
+        returns (address[] memory approvers, uint256[] memory committedUsd)
+    {
+        bytes32 key = _reviewKey(governor, proposalId);
+        approvers = _approversOf[key];
+        committedUsd = new uint256[](approvers.length);
+        for (uint256 i = 0; i < approvers.length; i++) {
+            committedUsd[i] = _recorded[key][approvers[i]].usd;
+        }
+    }
+
+    /// @inheritdoc IExposureLedger
+    /// @dev Spec §3.4 freeze scope: this pins ONE proposal's committed
+    ///      coverage. It deliberately does not touch the guardian's stake or
+    ///      its other open approvals — a challenge freezes the coverage it
+    ///      accuses, not the guardian.
+    /// @dev THE FREEZE PINS THE EXIT NOW, NOT JUST THE RELEASE (review 🟠F6,
+    ///      and the half of 🔴F2 the claim gate alone does not cover). Before
+    ///      this, `_frozen` was read in exactly one place — `releaseApproval`,
+    ///      whose only caller is the registry's Approve→Block vote change,
+    ///      which requires `block.timestamp < reviewEnd` and `!resolved`. A
+    ///      challenge cannot exist until the proposal has EXECUTED, which is
+    ///      after review resolution, so the freeze's only guard was unreachable
+    ///      in every state the freeze could exist in: a claimed control that
+    ///      controlled nothing.
+    ///
+    ///      What it controls now is the unstake CLAIM. `openExposureUsd` sums
+    ///      epoch buckets on pure wall-clock, so a guardian's exposure ages out
+    ///      `challengeWindow` after its epoch whether or not it is under
+    ///      accusation — and a disputed challenge outlives that by design.
+    ///      Counting frozen commitments per guardian closes the gap: while any
+    ///      proposal naming them is frozen, sWOOD refuses the claim and the
+    ///      collateral cannot walk out from under a live accusation.
+    ///
+    ///      Idempotent on both sides — the counters move only when the flag
+    ///      actually flips, so a repeated freeze/unfreeze cannot drift them.
+    function freezeCoverage(address governor, uint256 proposalId) external onlyFreezer {
+        bytes32 key = _reviewKey(governor, proposalId);
+        if (!_frozen[key]) {
+            _frozen[key] = true;
+            _frozenKeyCount++;
+            address[] storage listed = _approversOf[key];
+            for (uint256 i = 0; i < listed.length; i++) {
+                address g = listed[i];
+                if (_recorded[key][g].usd == 0) continue;
+                if (_frozenFor[key][g]) continue;
+                _frozenFor[key][g] = true;
+                _frozenCommitments[g]++;
+            }
+        }
+        emit CoverageFrozenSet(governor, proposalId, true);
+    }
+
+    /// @inheritdoc IExposureLedger
+    /// @dev Walks the SAME list `freezeCoverage` walked and clears only the
+    ///      entries it actually set, so the two are exactly symmetric even if
+    ///      the list moved. It cannot move while frozen in any case:
+    ///      `releaseApproval` is the only path that shrinks it, and that is the
+    ///      path the freeze blocks.
+    function unfreezeCoverage(address governor, uint256 proposalId) external onlyFreezer {
+        bytes32 key = _reviewKey(governor, proposalId);
+        if (_frozen[key]) {
+            _frozen[key] = false;
+            _frozenKeyCount--;
+            address[] storage listed = _approversOf[key];
+            for (uint256 i = 0; i < listed.length; i++) {
+                address g = listed[i];
+                if (!_frozenFor[key][g]) continue;
+                _frozenFor[key][g] = false;
+                _frozenCommitments[g]--;
+            }
+        }
+        emit CoverageFrozenSet(governor, proposalId, false);
+    }
+
+    /// @inheritdoc IExposureLedger
+    function hasFrozenCoverage(address guardian) external view returns (bool) {
+        return _frozenCommitments[guardian] != 0;
+    }
+
+    /// @inheritdoc IExposureLedger
+    function isCoverageFrozen(address governor, uint256 proposalId) external view returns (bool) {
+        return _frozen[_reviewKey(governor, proposalId)];
+    }
+
+    /// @inheritdoc IExposureLedger
+    function frozenCoverageCount() external view returns (uint256) {
+        return _frozenKeyCount;
     }
 
     /// @inheritdoc IExposureLedger

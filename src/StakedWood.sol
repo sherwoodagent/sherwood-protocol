@@ -44,6 +44,7 @@ interface IRegistryReviewPeriod {
 ///      carries no reentrancy concern.
 interface ILedgerExposureMinimal {
     function openExposureUsd(address guardian) external view returns (uint256);
+    function hasFrozenCoverage(address guardian) external view returns (bool);
 }
 
 contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgradeable {
@@ -103,6 +104,9 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
 
     /// @dev Mirrors `IStakedWood.ApproverAlreadySlashed`.
     error ApproverAlreadySlashed();
+
+    /// @dev Mirrors `IStakedWood.VaultNotFactoryDeployed`.
+    error VaultNotFactoryDeployed();
 
     /// @notice Insufficient WOOD to satisfy a stake minimum.
     /// @dev Relocated from `IGuardianRegistry` alongside `stakeAsGuardian`.
@@ -406,7 +410,30 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///      `exposureLedger`, so shrinks come off the END of the gap and the
     ///      fields behind it never shift. From the first mainnet deploy onward
     ///      changes must be append-only, carved off the FRONT of this gap.
-    uint256[5] private __gap;
+    ///      Decremented 5 → 4 for `_liabilityCheckpoints` (PR #25 review 🔴F1b),
+    ///      declared immediately below so the shrink comes off the END of the
+    ///      gap and every field after it keeps its slot.
+    uint256[4] private __gap;
+
+    /// @dev Per-guardian OWN-STAKE LIABILITY history: what the guardian is on
+    ///      the hook for at a past instant, as distinct from what it could VOTE
+    ///      with. `_stakeCheckpoints` answers the votability question and is
+    ///      zeroed by `requestUnstakeGuardian`; this one is not.
+    ///
+    ///      THE TWO ARE DIFFERENT QUESTIONS (PR #25 review 🔴F1b). Sharing one
+    ///      trace let an approver discharge its liability with a reversible
+    ///      transaction it could send BEFORE the drain it voted for ever
+    ///      executed: approve while active, `requestUnstakeGuardian`, let the
+    ///      proposal execute. The coverage gate still credited the full bond —
+    ///      `ExposureLedger._slashableBondUsd` prices it off live
+    ///      `guardianStake()`, which a request does not move — while every slash
+    ///      basis at or after `executedAt` read the request's zero, so a 100%
+    ///      conviction recovered nothing.
+    ///
+    ///      Pushed on stake, on slash and on claim — every event that changes
+    ///      what is actually recoverable. Deliberately NOT pushed on
+    ///      request/cancel, which change only votability.
+    mapping(address guardian => Checkpoints.Trace224) internal _liabilityCheckpoints;
 
     /// @notice The one address permitted to drive the VERDICT slash path
     ///         (`slashToEscrow`). Deliberately distinct from `onlyRegistry`,
@@ -614,6 +641,10 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
 
         // Checkpoint votable stake for historical quorum lookups.
         _stakeCheckpoints[msg.sender].push(uint32(block.timestamp), uint224(newTotal));
+        // New capital is recoverable from this instant on, so liability moves
+        // with it. The two traces agree here; they diverge only across an
+        // unstake request.
+        _liabilityCheckpoints[msg.sender].push(uint32(block.timestamp), uint224(newTotal));
         _totalStakeCheckpoint.push(uint32(block.timestamp), uint224(totalGuardianStake));
 
         emit GuardianStaked(msg.sender, amount, agentId);
@@ -803,6 +834,11 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
 
         // Unstake-requested stake is not votable. Push 0 so getPastStake
         // reflects the on-cooldown state accurately.
+        // `_liabilityCheckpoints` IS DELIBERATELY NOT PUSHED HERE (PR #25 review
+        // 🔴F1b). A request revokes voting power; it does not settle what the
+        // guardian already underwrote, and the WOOD is still in this contract —
+        // `claimUnstakeGuardian` is the moment it stops being recoverable, and
+        // that is where liability drops.
         _stakeCheckpoints[msg.sender].push(uint32(block.timestamp), 0);
         _totalStakeCheckpoint.push(uint32(block.timestamp), uint224(totalGuardianStake));
 
@@ -854,12 +890,29 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
         // about. This check covers the challenge path. Neither subsumes the
         // other.
         address ledger = exposureLedger;
-        if (ledger != address(0) && ILedgerExposureMinimal(ledger).openExposureUsd(msg.sender) != 0) {
-            revert CoverageStillOpen();
+        if (ledger != address(0)) {
+            // TWO QUESTIONS, NOT ONE (PR #25 review 🔴F2). `openExposureUsd`
+            // sums epoch buckets and a bucket ages out `challengeWindow` after
+            // its epoch on pure wall-clock — it does not pause because the
+            // guardian is under accusation. The challenge game's disputed tail
+            // (up to `disputeTimeout`) outlives that by design, so an accused
+            // approver could request at execution, wait out the cooldown, and
+            // claim its whole bond before the challenge could resolve: the
+            // conviction then priced maximum guilt and recovered nothing,
+            // silently. A frozen commitment is the accusation itself, and it
+            // does not expire on a clock.
+            ILedgerExposureMinimal l = ILedgerExposureMinimal(ledger);
+            if (l.openExposureUsd(msg.sender) != 0 || l.hasFrozenCoverage(msg.sender)) {
+                revert CoverageStillOpen();
+            }
         }
 
         uint256 amount = g.stakedAmount;
         delete _guardians[msg.sender];
+        // THE MOMENT LIABILITY ACTUALLY ENDS. Every gate above has cleared, so
+        // the capital is leaving and nothing further is recoverable from it —
+        // this, not the request, is where the liability trace drops to zero.
+        _liabilityCheckpoints[msg.sender].push(uint32(block.timestamp), 0);
 
         wood.safeTransfer(msg.sender, amount);
 
@@ -1221,6 +1274,17 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
         // Positional alignment is the only thing tying a guardian to their rate,
         // so a mismatch is a caller bug, not something to absorb.
         if (slashBpsPer.length != approvers.length) revert SlashBpsLengthMismatch();
+        // FACTORY MEMBERSHIP (PR #24 round-4 N-4). The escrow apportions against
+        // `vault`'s ERC20Votes checkpoints, and the F-A analysis of
+        // `EmptySnapshot` holds only for OZ semantics — a nonstandard
+        // `getPastTotalSupply` is the one escape hatch it names. Asserting the
+        // vault is factory-deployed converts that scoping sentence from prose
+        // about the slasher into code here. Unconditional: `factory` is required
+        // non-zero at `initialize`, so there is no unwired window to fail open
+        // for.
+        if (IFactoryGovernorLookup(factory).governorOf(vault) == address(0)) {
+            revert VaultNotFactoryDeployed();
+        }
 
         // Namespace the verdict key before it feeds the shared `GuardianSlashed`
         // topic: a raw caller-chosen `caseKey` could be crafted to collide with
@@ -1429,7 +1493,16 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     {
         Guardian storage g = _guardians[approver];
         uint256 live = g.stakedAmount;
-        uint256 snapOwnRaw = _stakeCheckpoints[approver].upperLookupRecent(uint32(openedAt));
+        // LIABILITY, NOT VOTABILITY (PR #25 review 🔴F1b). Reads the liability
+        // trace, which `requestUnstakeGuardian` does not zero, so an approver
+        // cannot pre-position an exit before the drain it voted for and make its
+        // own conviction recover nothing. Maxed with the votable trace so the
+        // read degrades to the pre-fix basis over history written before the
+        // liability trace existed.
+        uint256 snapOwnRaw = Math.max(
+            _liabilityCheckpoints[approver].upperLookupRecent(uint32(openedAt)),
+            _stakeCheckpoints[approver].upperLookupRecent(uint32(openedAt))
+        );
         uint256 ownSlash = Math.mulDiv(Math.min(snapOwnRaw, live), slashBps, 10_000);
 
         if (ownSlash != 0) {
@@ -1449,6 +1522,11 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
                 // ghost guardian with no stake.
                 g.unstakeRequestedAt = 0;
             }
+            // Liability tracks what is recoverable regardless of votability, so
+            // it re-checkpoints on BOTH branches — an unstake-requested guardian
+            // that is partially slashed must not stay on the hook for the
+            // pre-slash amount when the next verdict lands.
+            _liabilityCheckpoints[approver].push(uint32(block.timestamp), uint224(g.stakedAmount));
         }
         amt = ownSlash;
         // Emit only when something was actually slashed — an approver with no

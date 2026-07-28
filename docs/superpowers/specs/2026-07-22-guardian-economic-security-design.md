@@ -8,7 +8,11 @@
 
 **Implementation status 2026-07-25 — v1b PART 1 complete (Plan C).** The retroactive-liability *payout rails* are built: `StakedWood` gained an `authorizedSlasher` role and a `slashToEscrow` entrypoint that reuses the existing per-approver slash legs but routes proceeds to a new `CompensationEscrow` instead of the burn address (§4), and the escrow pays **non-transferable, snapshot-gated** claims pro-rata to holders of record at a pre-drain snapshot (§3.8) — closing the F1 recoupment channel. Residue unredeemed after a window sweeps to the protocol backstop, never to live NAV.
 
-**Still outstanding in v1b, and the honest consequence:** the **challenge game (§3.4)** — five predicates, bonded filing, per-proposal coverage freeze, undisputed auto-slash — is **not built** (Plan D), and neither is the **approver premium (§3.10)** or watchtower funding (Plan E). Until the challenge game lands, `authorizedSlasher` is an owner-set address, so **a verdict is a governance action, not an adjudicated one**. The rails are correct and tested; the trigger above them is still a multisig. The two-layer court (§3.5) remains v1c.
+**Implementation status 2026-07-25 — v1b PART 2 complete (Plan D): the challenge game (§3.4) is built.** Anyone may post a bonded challenge against an executed proposal, citing one of the five predicates and an evidence pointer; filing freezes exactly that proposal's committed coverage (never the guardian's whole stake), so the accused cannot recycle the budget while under challenge. An **undisputed** challenge auto-slashes the covering approvers into Plan C's `CompensationEscrow` once `autoSlashDelay` elapses, as a case pinned to the block before the drain, and demotes the adapter the filing named. A **disputed** one — the accused posts a matching counter-bond — escalates to §3.5. A failed challenge forfeits the challenger's bond to the accused pro-rata to their committed shares.
+
+**What that changes, precisely.** `authorizedSlasher` is now the `ChallengeGame`, not a multisig. So for an **UNDISPUTED** verdict the slash is finally driven by the mechanism rather than by governance — the trigger above the rails is no longer a human decision. **The decisive design fact, stated plainly: §3.4 adjudicates by SILENCE, not by on-chain proof.** There is no `prove()` and no on-chain predicate verification; all five predicates take one identical path and the predicate label is carried in the event for routing, nothing more. A fixed on-chain check could only ever cover predicates 1, 4 and 5 — 2 needs a venue-specific fair-value model and 3 is a funding-graph question §8 itself says needs a consistent evidentiary standard — and running code-enforced and judge-enforced predicates side by side would put two security models inside one mechanism. **The consequence, named rather than left to be found: vigilance cost moves to guardians**, who are slashed on an unproven assertion if they sleep through `autoSlashDelay`. What holds that in check is the challenger's bond, scaled to the coverage the filing freezes and forfeited to the accused when the challenge fails.
+
+**Still outstanding in v1b, and the honest consequence:** a **DISPUTED** challenge has nowhere to go. The two-layer court (§3.5) is **not built** (Plan E), so an escalated challenge that nobody rules on times out in favour of the accused once `disputeTimeout` elapses — failing safe toward *not* slashing, which is the right default when the adjudicator is missing, but it means **a genuinely guilty approver can dispute and run out the clock until Plan E ships**. That is the accepted cost of shipping the game before the court, and it is strictly better than an indefinite freeze, which would let anyone pin a guardian's coverage forever by filing. Also outstanding: §3.4a epoch NAV checkpointing (Plan F) and the **approver premium (§3.10)** plus watchtower funding (Plan G). Separately, the §3.4 first-detector bounty is delivered **off-chain** (see the implementation note in §3.4), so on-chain a successful challenger only breaks even.
 
 **§3.3a wording correction (2026-07-24, SUPERSEDED 2026-07-26 — see below).** §3.3a's "aggregate" is literal: two guardians holding half the coverage each genuinely cover one proposal between them.
 
@@ -277,10 +281,42 @@ Flow:
   coverage attributed to the challenged proposal — not their whole stake.
   Challenger bond scales with the exposure it freezes. Adapters demote only on a
   **passed** challenge; an unproven filing flags for expedited review.
+- **Reach of the game, stated rather than left to be discovered (PR #25 review
+  F9).** A filing must freeze something, so the game reaches exactly the set of
+  proposals that BOOKED coverage: envelope tier ≥ `quorumTierThreshold`,
+  non-zero `requiredCoverage`, and at least one approver whose commitment is
+  still live. A proposal below the tier threshold never runs
+  `requireApproveQuorum`, books nothing, and is therefore unchallengeable by
+  construction — even though predicates 1, 4 and 5 describe things a low-tier
+  proposal can still do. Two related gaps of the same kind: predicates 2 and 5
+  are not always proposal-scoped facts, and a drawdown emerging from cumulative
+  behaviour across several proposals has no single filing target in this design
+  (the same accepted slow-bleed residual as §8). The v1 position is that booking
+  coverage IS taking on the liability, so a proposal with no booked coverage has
+  no approver to hold retroactively liable; what remains is monitoring-only, not
+  a code gap.
 - **Standing watchtower:** the challenge trigger must not depend on altruism.
   Sherwood forensic agents run the predicate monitor as a funded protocol role
   (feeding SGRD reputation), plus a first-detector bounty sized to cover forensic
   cost. Health metric: a live challenge game shows filings, not silence.
+
+  **Implementation note (decided 2026-07-25, Plan D).** The bounty is delivered
+  **off-chain**, as a protocol bug-bounty program keyed off `ChallengeGame`'s
+  `ChallengeFiled` / `ChallengeSettled` events — not as an on-chain payout. The
+  intent above is unchanged; only the delivery mechanism is. Rationale: "sized to
+  cover forensic cost" is exactly what a constant in a contract cannot express,
+  since forensic cost runs from minutes for an obvious out-of-adapter transfer to
+  days for a funding-graph linkage. Per-case pricing needs human judgement, and
+  keying payouts to public events keeps them auditable regardless.
+
+  **The consequence, stated here rather than left to be discovered.** On-chain, a
+  successful challenger only gets its bond BACK, and a failed one loses the bond
+  entirely — the on-chain payoff is break-even at best. The off-chain program is
+  therefore not a garnish on top of on-chain economics; it is the ONLY thing that
+  makes filing rational. The "must not depend on altruism" requirement at the top
+  of this bullet is satisfied **off-chain, and nowhere else**. If the program is
+  never stood up, the challenge game's incentive story is a comment rather than a
+  mechanism.
 
 ### 3.4a Epoch-based renewable coverage (long-duration strategies)
 
@@ -670,10 +706,30 @@ the pieces that bound loss *before* the court:
   guarantees a covering signer — it degrades safely to "value-moving proposals
   need covering approvers or they don't execute" with no court yet.
 - **v1b — retroactive liability:** authorized-slasher entrypoint + compensation
-  escrow; challenge game (predicates 1–5, all single-proposal, per-proposal
-  freeze); watchtower funding; approver reward (§3.10).
+  escrow (part 1, Plan C); challenge game (predicates 1–5, all single-proposal,
+  per-proposal freeze) (part 2, Plan D).
 - **v1c — adjudication:** pre-exploit + pre-accumulation-hardened voting snapshot;
   two-layer court with the restructured panel bond.
+
+**Ordering amendment, 2026-07-25 — the court moves AHEAD of the epoch machinery
+and the premium.** The order above deferred the court to v1c on the reasoning
+quoted directly above it: front-loading the novel forensic court while deferring
+the machinery that bounds loss is backwards for risk. **That reasoning held only
+while the court was the ONLY path to liability.** It no longer is. Plan D shipped
+a working undisputed-slash path, so the court stops being the whole mechanism and
+becomes the patch for exactly one escape hatch — a guilty approver disputing and
+running out `disputeTimeout`. Leaving that hole open across two more plans is
+worse than building the court earlier, and nothing in the epoch machinery or the
+premium is a prerequisite for it. The remaining build order is therefore:
+
+1. **Plan E — the two-layer court (§3.5)**, with the pre-exploit /
+   pre-accumulation voting snapshot and the bad-faith panel-bond track. It
+   resolves the disputed challenges Plan D can only park.
+2. **Plan F — §3.4a epoch NAV checkpointing**: per-epoch mark-to-market,
+   renewal-before-reveal, forced wind-down — giving predicate 5 its per-epoch
+   attribution on strategies longer than one epoch.
+3. **Plan G — approver premium (§3.10) + watchtower funding**, still gated on
+   the **blocking** ROE validation in the gate list below.
 
 **v2:** multi-collateral bonds (lifts the per-vault TVL ceiling — §3.7); adapter
 probation/downgrade automation; threshold-calibrated auto-demote circuit breakers

@@ -230,8 +230,48 @@ contract TierRegistry is Ownable2Step {
         emit TierCertified(target, selector, tier, extractableBoundBps, ch);
     }
 
+    /// @notice The one address permitted to demote on a passed challenge — the
+    ///         ChallengeGame (spec §3.4: "adapters demote only on a passed
+    ///         challenge"). A ROLE rather than registry ownership, so the game
+    ///         can revoke a certification but never grant one.
+    address public authorizedDemoter;
+
+    error NotAuthorizedDemoter();
+
+    event AuthorizedDemoterSet(address indexed demoter);
+
+    /// @dev Zero is legal and deliberate — it is the UNWIRE switch, revoking
+    ///      the challenge game's demotion role outright while a replacement is
+    ///      wired. The unwired state fails CLOSED (nothing can demote), which
+    ///      is why this setter carries no zero-address check where the others
+    ///      in this diff do (PR #25 review, minor).
+    ///
+    ///      WHAT "FAILS CLOSED" DOES AND DOES NOT COVER (review 🟠F11). It holds
+    ///      for FUTURE demotions and did NOT hold for live challenges:
+    ///      `ChallengeGame._settle` called `demoteByChallenge` unguarded, so
+    ///      throwing this switch mid-challenge reverted the whole verdict —
+    ///      `resolve()` could never complete, the slash never landed, both bonds
+    ///      stranded in the game, and the frozen coverage barred every accused
+    ///      approver from `claimUnstakeGuardian`, permanently. The game now
+    ///      treats the demotion as best-effort and emits `AdapterDemotionFailed`
+    ///      instead, so this role is safe to rotate at any time — and `demote`
+    ///      below is the owner's remedy for any revocation the rotation lost.
+    function setAuthorizedDemoter(address demoter) external onlyOwner {
+        authorizedDemoter = demoter;
+        emit AuthorizedDemoterSet(demoter);
+    }
+
     /// @notice Owner demotion (revoke certification).
     function demote(address target, bytes4 selector) external onlyOwner {
+        _demote(target, selector);
+    }
+
+    /// @notice Demote (target, selector) back to the tier-2 default because a
+    ///         challenge against it passed. Reuses the same `_demote` path as
+    ///         owner demotion, so the submitter-bond release timelock starts
+    ///         identically (§3.6 slash-first layering).
+    function demoteByChallenge(address target, bytes4 selector) external {
+        if (msg.sender != authorizedDemoter) revert NotAuthorizedDemoter();
         _demote(target, selector);
     }
 

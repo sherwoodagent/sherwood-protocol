@@ -34,6 +34,8 @@ interface IExposureLedger {
     error StalePrice();
     error InvalidParameter();
     error ZeroAddress();
+    error NotCoverageFreezer();
+    error CoverageFrozen();
 
     // ── Events ──
     event WoodUsdPriceSet(uint256 oldPriceX8, uint256 newPriceX8);
@@ -43,6 +45,8 @@ interface IExposureLedger {
     event ExposureRecorded(address indexed guardian, bytes32 indexed reviewKey, uint256 usd, uint256 epoch);
     event ExposureReleased(address indexed guardian, bytes32 indexed reviewKey, uint256 usd, uint256 epoch);
     event ParameterChangeFinalized(bytes32 indexed paramKey, uint256 oldValue, uint256 newValue);
+    event CoverageFreezerSet(address indexed oldFreezer, address indexed newFreezer);
+    event CoverageFrozenSet(address indexed governor, uint256 indexed proposalId, bool frozen);
 
     // ── Registry-only mutations ──
     function recordApproval(address governor, uint256 proposalId, address guardian) external;
@@ -59,7 +63,46 @@ interface IExposureLedger {
         external
         view;
 
+    // ── Coverage freeze (challenge game, spec §3.4) ──
+    function freezeCoverage(address governor, uint256 proposalId) external;
+    function unfreezeCoverage(address governor, uint256 proposalId) external;
+    function isCoverageFrozen(address governor, uint256 proposalId) external view returns (bool);
+    /// @notice Whether ANY frozen proposal names this guardian as a covering
+    ///         approver. sWOOD gates the unstake CLAIM on it, which is what
+    ///         makes the freeze load-bearing rather than decorative: epoch
+    ///         buckets age out on wall-clock and a disputed challenge outlives
+    ///         them, so `openExposureUsd` alone let an accused guardian claim
+    ///         its bond mid-accusation (review 🔴F2 / 🟠F6).
+    function hasFrozenCoverage(address guardian) external view returns (bool);
+    /// @dev Zero is legal and deliberate — it is the UNWIRE switch, which
+    ///      closes the freeze surface when the challenge game is replaced. Not
+    ///      an oversight: with no freezer wired there is no filing, so the
+    ///      unwired state fails closed for the game rather than open.
+    ///
+    ///      REFUSED WHILE ANY COVERAGE IS FROZEN (review 🟠F11). Failing closed
+    ///      for NEW filings is not the same as being safe for the LIVE ones:
+    ///      `unfreezeCoverage` is `onlyFreezer` and the game is its only caller,
+    ///      so rotating the role mid-challenge orphaned that freeze — the game's
+    ///      `resolve()` reverted forever, both bonds stranded with no withdrawal
+    ///      path, and every accused approver was permanently barred from
+    ///      `claimUnstakeGuardian`. The rotation is therefore DEFERRED, not
+    ///      forbidden: drain the live challenges until `frozenCoverageCount()`
+    ///      is zero, then re-point.
+    function setCoverageFreezer(address freezer) external;
+    function coverageFreezer() external view returns (address);
+    /// @notice How many proposals are frozen right now, across every guardian.
+    ///         Zero is the precondition for rotating `coverageFreezer`, so this
+    ///         is the read governance sequences a role change against.
+    function frozenCoverageCount() external view returns (uint256);
+
     // ── Views ──
+    /// @notice The covering approvers of a proposal and the USD each committed.
+    ///         A released commitment reports a zero share rather than being
+    ///         dropped, so a caller sees the full historical set.
+    function approversOf(address governor, uint256 proposalId)
+        external
+        view
+        returns (address[] memory approvers, uint256[] memory committedUsd);
 
     /// @notice Per-approver slash rates for a proposal, in bps of each
     ///         guardian's own slashable stake, positionally aligned with the

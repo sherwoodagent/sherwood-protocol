@@ -146,6 +146,11 @@ contract SlashToEscrowProportionalTest is Test {
         );
         swood = StakedWood(address(new ERC1967Proxy(address(impl), initData)));
 
+        // N-4: `slashToEscrow` asserts `governorOf(vault) != 0`; the fixture
+        // factory is codeless, so etch a byte and wildcard-mock the lookup.
+        vm.etch(factory, hex"00");
+        vm.mockCall(factory, abi.encodeWithSignature("governorOf(address)"), abi.encode(makeAddr("gov")));
+
         vm.prank(owner);
         swood.setRegistry(registry);
 

@@ -134,6 +134,7 @@ contract ExposureLedgerTest is Test {
     address internal owner = makeAddr("owner");
     address internal guardian = makeAddr("guardian");
     address internal registry = makeAddr("registry");
+    address internal freezer = makeAddr("freezer");
     MockGovernorForLedger internal mgov;
     address internal usdgAsset;
 
@@ -214,6 +215,7 @@ contract ExposureLedgerTest is Test {
         vm.startPrank(owner);
         ledger.setAssetFeed(usdgAsset, address(feed), 365 days);
         ledger.setGuardianRegistry(registry);
+        ledger.setCoverageFreezer(freezer);
         vm.stopPrank();
         swood.setStake(guardian, 100_000e18); // slashableBondUsd = $5,000 at $0.05
     }
@@ -1435,5 +1437,45 @@ contract ExposureLedgerTest is Test {
 
         (, uint256[] memory bps) = ledger.slashBpsFor(address(mgov), 1);
         assertEq(bps[0], 10_000, "capped at everything the guardian still has");
+    }
+
+    /// @notice `approversOf` is the challenge game's read of who covered a
+    ///         proposal (Plan D). It reports RESERVATIONS, not allocations.
+    function test_approversOf_listsCommittedApprovers() public {
+        _wireRecording();
+        address g2 = makeAddr("g2");
+        swood.setStake(g2, 100_000e18);
+        mgov.set(8_000e6);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, g2);
+
+        (address[] memory gs, uint256[] memory shares) = ledger.approversOf(address(mgov), 1);
+        assertEq(gs.length, 2);
+        assertEq(gs[0], guardian);
+        assertEq(gs[1], g2);
+        // RESERVATION, NOT ALLOCATION: each approver books min(free budget,
+        // whole coverage) — the most it could ever carry — and the final
+        // pro-rata split is computed at read time by `allocatedUsd`.
+        assertEq(shares[0], 5_000e18); // its whole budget
+        assertEq(shares[1], 5_000e18); // its whole budget too, not the remainder
+    }
+
+    /// @notice #22's M2 fix swap-and-pops a released approver out of the list
+    ///         rather than leaving it behind with a zeroed commitment, so it is
+    ///         no longer returned at all — a released approver contributes
+    ///         NOTHING to a conviction, and the list stays bounded by the
+    ///         registry's approver cap instead of by everyone who EVER approved.
+    function test_approversOf_dropsReleasedApprovers() public {
+        _wireRecording();
+        mgov.set(3_000e6);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        vm.prank(registry);
+        ledger.releaseApproval(address(mgov), 1, guardian);
+        (address[] memory gs, uint256[] memory shares) = ledger.approversOf(address(mgov), 1);
+        assertEq(gs.length, 0, "released approver is popped, not zeroed");
+        assertEq(shares.length, 0);
     }
 }

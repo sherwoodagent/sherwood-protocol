@@ -258,10 +258,9 @@ contract RegistryExposureHookTest is Test {
         // price: the price setter is rate-limited now (review M4) and this test
         // sits inside an already-open review window, so waiting out the interval
         // would push past `reviewEnd` and change what is being tested.
+        // Own stake is the whole slashable bond post delegation-removal, so
+        // zeroing it is sufficient — there is no delegated leg left to mock.
         vm.mockCall(address(wired.swood), abi.encodeWithSignature("guardianStake(address)", g1), abi.encode(uint256(0)));
-        vm.mockCall(
-            address(wired.swood), abi.encodeWithSignature("delegatedInbound(address)", g1), abi.encode(uint256(0))
-        );
         assertEq(ledger.slashableBondUsd(g1), 0, "no slashable bond -> no free budget");
 
         vm.prank(g1);

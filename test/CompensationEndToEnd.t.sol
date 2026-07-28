@@ -619,6 +619,13 @@ contract CompensationEndToEndTest is Test {
     ///         its stake because a vault is unpriceable.
     function test_slashToEscrow_badVaultBurnsInsteadOfBricking() public {
         address deadVault = makeAddr("notAVault"); // no code: escrow's votes read reverts
+        // N-4 narrows this fallback to factory-RECOGNISED vaults: an unknown
+        // vault is refused outright (see the rejection test in
+        // StakedWoodSlashToEscrow.t.sol). The burn path under test is the
+        // recognised-but-broken case, so the factory must vouch for the vault.
+        vm.mockCall(
+            address(this), abi.encodeWithSignature("governorOf(address)", deadVault), abi.encode(makeAddr("gov"))
+        );
         address burnAddr = 0x000000000000000000000000000000000000dEaD;
         uint256 burnBefore = wood.balanceOf(burnAddr);
 
