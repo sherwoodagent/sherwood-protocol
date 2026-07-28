@@ -187,7 +187,7 @@ fail-safe governs).
 ### Verdict enum and rule
 
 ```solidity
-enum Verdict { Guilty, NotGuilty, Inconclusive }
+enum Verdict { Inconclusive, NotGuilty, Guilty }  // zero value is the harmless full unwind, never the max-slash conviction
 function rule(uint256 challengeId, Verdict verdict) external; // onlyCourt, requires Disputed
 ```
 

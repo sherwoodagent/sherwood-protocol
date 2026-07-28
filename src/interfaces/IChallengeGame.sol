@@ -48,10 +48,15 @@ interface IChallengeGame {
     ///         (spec 2026-07-28 §4). `Inconclusive` is a NON-VERDICT: the vote
     ///         missed its participation floor, so nothing was adjudicated and
     ///         both sides unwind whole.
+    /// @dev    `Inconclusive` IS DELIBERATELY THE ZERO VALUE. A
+    ///         default-initialized `Verdict` — an uninitialized local, a
+    ///         zeroed struct field, a decoding bug that leaves the value
+    ///         unset — must land on the harmless full unwind, never on
+    ///         `Guilty`'s max-slash conviction.
     enum Verdict {
-        Guilty,
+        Inconclusive,
         NotGuilty,
-        Inconclusive
+        Guilty
     }
 
     /// @param frozenCoverageUsd The coverage this challenge pinned, in USD-18,
@@ -253,6 +258,12 @@ interface IChallengeGame {
     event ChallengeRuled(uint256 indexed challengeId, Verdict verdict);
     /// @notice Inconclusive unwind: challenger bond returned whole, pool booked
     ///         for pull-claims, no conviction, no demotion (spec 2026-07-28 §4).
+    /// @dev    `bondWood` and `poolWood` always satisfy `bondWood == poolWood`
+    ///         today, since `rule` only reaches this from `Disputed`, where the
+    ///         pool is by construction complete. Reported as two separate
+    ///         fields anyway rather than folded into one, so the log stays
+    ///         truthful if the reachable set ever widens to an entry with a
+    ///         part-funded pool.
     event ChallengeInconclusive(uint256 indexed challengeId, uint256 bondWood, uint256 poolWood);
     event CourtSet(address indexed oldCourt, address indexed newCourt);
     event ExposureLedgerSet(address indexed oldLedger, address indexed newLedger);

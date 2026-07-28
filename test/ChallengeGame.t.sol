@@ -1873,6 +1873,57 @@ contract ChallengeGameTest is Test {
         assertEq(uint256(game.challengeOf(refiled).status), uint256(IChallengeGame.Status.Filed), "refiling succeeds");
     }
 
+    /// @notice `Inconclusive` is as terminal as `Settled`/`Failed`: the timeout
+    ///         can no longer resolve it, and the court cannot rule on it twice.
+    function test_rule_inconclusive_beatsTimeoutAndBarsASecondRuling() public {
+        uint256 id = _fileAndDispute();
+        vm.prank(court);
+        game.rule(id, IChallengeGame.Verdict.Inconclusive);
+
+        vm.warp(vm.getBlockTimestamp() + game.disputeTimeout() + 1);
+        vm.expectRevert(IChallengeGame.WrongStatus.selector);
+        game.resolve(id);
+
+        vm.prank(court);
+        vm.expectRevert(IChallengeGame.WrongStatus.selector);
+        game.rule(id, IChallengeGame.Verdict.Guilty);
+    }
+
+    /// @notice Multiple contributors, each claims EXACTLY its own stake back —
+    ///         no pro-rata split of anything, because an unwind has no forfeit
+    ///         to divide. Contrasts with the failed-path pro-rata tests: there
+    ///         the pot is `bond - burn` split by contribution key; here each
+    ///         funder's payout is just its own deposit, independent of the
+    ///         other funder's share.
+    function test_rule_inconclusive_multiContributorClaimsExactStake() public {
+        uint256 id = _fileStandard(PROPOSAL);
+        uint256 bond = game.challengeOf(id).bondWood;
+        uint256 aPut = (bond * 30) / 100;
+
+        vm.prank(guardianA);
+        game.dispute(id, aPut);
+        vm.prank(guardianB);
+        game.dispute(id, type(uint256).max); // takes the 70% shortfall, completes the pool
+        uint256 bPut = bond - aPut;
+        assertEq(uint256(game.challengeOf(id).status), uint256(IChallengeGame.Status.Disputed), "pool completed");
+
+        vm.prank(court);
+        game.rule(id, IChallengeGame.Verdict.Inconclusive);
+
+        assertEq(game.claimableContribution(id, guardianA), aPut, "guardianA's own stake, nothing pro-rated");
+        assertEq(game.claimableContribution(id, guardianB), bPut, "guardianB's own stake, nothing pro-rated");
+
+        uint256 aBefore = wood.balanceOf(guardianA);
+        uint256 bBefore = wood.balanceOf(guardianB);
+        vm.prank(guardianA);
+        game.claimContribution(id);
+        vm.prank(guardianB);
+        game.claimContribution(id);
+        assertEq(wood.balanceOf(guardianA) - aBefore, aPut, "guardianA claimed exactly its stake");
+        assertEq(wood.balanceOf(guardianB) - bBefore, bPut, "guardianB claimed exactly its stake");
+        assertEq(game.unclaimedWood(), 0, "fully claimed, nothing stranded");
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // The pooled counter-bond
     // ─────────────────────────────────────────────────────────────────────────

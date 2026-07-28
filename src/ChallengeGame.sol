@@ -959,9 +959,14 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         }
     }
 
-    /// @dev Moves a part-funded pool from LIVE accounting to UNCLAIMED, so its
-    ///      funders can collect via `claimContribution`. Reached only from the
-    ///      undisputed-settle path, where the pool never completed.
+    /// @dev Moves a pool from LIVE accounting to UNCLAIMED, so its funders can
+    ///      collect via `claimContribution`. Two callers, two pool states:
+    ///      `_settle`'s undisputed branch reaches this with a PART-FUNDED
+    ///      pool — the silence verdict landed before any defence completed —
+    ///      and `_refundAll`'s inconclusive ruling reaches it with a COMPLETE
+    ///      pool — `rule` only accepts `Disputed`, where the pool is by
+    ///      construction full. Either way the stored amounts are booked as-is;
+    ///      this helper does not care which shape it was handed.
     ///
     ///      This used to loop the contributor list and transfer to each, which
     ///      is what forced `dispute` to keep that list short and made one
