@@ -118,8 +118,9 @@ interface IStakedWood {
     ///         above by raw stake: the accused sum can no longer exceed the
     ///         total and `TokenCourt._participationFloor` can no longer be driven to
     ///         zero. What remains is a one-directional bias — the floor comes
-    ///         out too HIGH when the accused are freshly staked, which protects
-    ///         a panel ruling rather than enabling a cheap overturn.
+    ///         out too HIGH when the accused are freshly staked, which biases
+    ///         the outcome toward an inconclusive (no-verdict) result rather
+    ///         than enabling a cheap overturn.
     function getPastVotes(address guardian, uint256 timestamp) external view returns (uint256);
 
     /// @notice A guardian's RAW votable own stake at a past timestamp — the same
