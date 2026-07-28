@@ -191,11 +191,13 @@ contract CourtEndToEndTest is Test {
     uint256 constant REQUIRED_COVERAGE = 2_000e6;
     uint256 constant COVERAGE_USD = 2_000e18;
     uint256 constant PROPOSER_BOND = 400e18; // $2,000 × 1% ÷ $0.05
-    /// @dev Sized off the FROZEN coverage, which is the sum of the approvers'
-    ///      RESERVATIONS ($1,500 + $1,000), not the proposal's $2,000 need. Each
-    ///      approver reserves up to the full need, so the two diverge as soon as
-    ///      more than one guardian covers — see `G2_COVERAGE_USD`.
-    uint256 constant CHALLENGER_BOND = 2_500e18; // $2,500 × 5% ÷ $0.05
+    /// @dev Sized off the proposal's LIABILITY — the $2,000 a conviction could
+    ///      actually take — not off the $2,500 the approvers reserved between
+    ///      them. The two diverge as soon as more than one guardian covers,
+    ///      because each reserves up to the full need (see `G2_COVERAGE_USD`),
+    ///      and `file` caps at `liabilityUsd` so a better-covered proposal does
+    ///      not cost more to challenge (🟡F13).
+    uint256 constant CHALLENGER_BOND = 2_000e18; // $2,000 × 5% ÷ $0.05
 
     /// @dev THE COVERAGE DELIBERATELY EXCEEDS ONE GUARDIAN'S BUDGET, so the
     ///      proposal has TWO covering approvers and the defence has a free-rider
@@ -629,7 +631,7 @@ contract CourtEndToEndTest is Test {
         assertEq(
             game.challengeOf(cid).bondWood,
             CHALLENGER_BOND,
-            "5% of the 2,500 USD of frozen reservations, at 0.05 USD/WOOD"
+            "5% of the 2,000 USD of liability, at 0.05 USD/WOOD - not of the 2,500 reserved"
         );
         assertTrue(ledger.isCoverageFrozen(address(gov), pid), "the filing pins the coverage");
 
@@ -904,7 +906,7 @@ contract CourtEndToEndTest is Test {
         //    The burn is what stops the challenger's own second address from
         //    funding the counter-bond and collecting its own forfeited bond back.
         uint256 burned = (CHALLENGER_BOND * game.forfeitBurnBps()) / 10_000;
-        assertEq(burned, 500e18, "20% of a 2,500 WOOD bond");
+        assertEq(burned, 400e18, "20% of a 2,000 WOOD bond");
         assertEq(wood.balanceOf(challenger), challengerBalBefore - CHALLENGER_BOND, "the challenger forfeited it");
         assertEq(wood.balanceOf(game.BURN_ADDRESS()), burned, "and the burned slice left the system for good");
         assertEq(

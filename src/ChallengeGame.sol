@@ -469,6 +469,33 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         }
         if (coverageUsd == 0) revert NothingToFreeze();
 
+        // RESERVATIONS ARE NOT LIABILITY (review 🟡F13). The sum above is what
+        // the cohort RESERVED, and `recordApproval` deliberately over-reserves —
+        // every approver books up to the full coverage, because at vote time any
+        // one of them might end up carrying it alone. So it exceeds what a
+        // conviction could ever take, by a factor that GROWS WITH THE APPROVER
+        // COUNT: five well-funded approvers on one proposal reserve five times
+        // its need. Sizing the bond off it made a proposal more expensive to
+        // challenge the better covered it was, while the recoverable total
+        // stayed flat — the exact inversion of D4, which sizes the bond to the
+        // exposure a filing freezes. `slashBpsFor` has always priced the slash
+        // against the ALLOCATION for this reason; `liabilityUsd` is that same
+        // basis, asked for once.
+        //
+        // CAPPED, NOT REPLACED: an under-covered cohort whose reservations fall
+        // short of the need is still priced on what it pledged, because that is
+        // all there is to take.
+        //
+        // CAUGHT, because `liabilityUsd` reads the ASSET feed and this function
+        // otherwise reads none. A stale feed must not make filing impossible
+        // during exactly the market stress a drain happens in — the same
+        // liveness hole the ledger already documents on the slash path. Falling
+        // back to the reservation sum over-charges the challenger, which is
+        // recoverable; being unable to file at all is not.
+        try exposureLedger.liabilityUsd(governor, proposalId) returns (uint256 liability) {
+            if (liability != 0 && liability < coverageUsd) coverageUsd = liability;
+        } catch {}
+
         // D4: the bond scales with the exposure the filing freezes, converted
         // at the ledger's conservative haircut price. Fail-closed on an unset
         // price and on a bond that floors to zero — an unpriced or free

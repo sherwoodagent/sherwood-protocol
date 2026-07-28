@@ -150,6 +150,31 @@ contract MockChallengeLedger {
         return _frozen[_key(governor, proposalId)];
     }
 
+    /// @dev What a conviction could actually take. DEFAULTS to the sum of
+    ///      reservations — the pre-🟡F13 figure — so every suite that never sets
+    ///      it sees exactly the bond sizing it saw before. Setting it is what
+    ///      opens a gap between reservation and liability, which is the whole
+    ///      point of the real ledger's distinction.
+    mapping(bytes32 reviewKey => uint256) internal _liabilityUsd;
+    mapping(bytes32 reviewKey => bool) internal _liabilitySet;
+
+    function setLiabilityUsd(address governor, uint256 proposalId, uint256 usd) external {
+        bytes32 k = _key(governor, proposalId);
+        _liabilityUsd[k] = usd;
+        _liabilitySet[k] = true;
+    }
+
+    function liabilityUsd(address governor, uint256 proposalId) external view returns (uint256) {
+        bytes32 k = _key(governor, proposalId);
+        if (_liabilitySet[k]) return _liabilityUsd[k];
+        address[] storage list = _approvers[k];
+        uint256 total;
+        for (uint256 i = 0; i < list.length; i++) {
+            total += _committed[k][list[i]];
+        }
+        return total;
+    }
+
     function _key(address governor, uint256 proposalId) internal pure returns (bytes32) {
         return keccak256(abi.encode(governor, proposalId));
     }
@@ -532,6 +557,56 @@ contract ChallengeGameTest is Test {
     /// @notice Nothing to accuse: a proposal no guardian covered (or whose
     ///         approvers all released before execution) has no coverage to
     ///         freeze and therefore no bond to size against.
+    /// @notice THE BOND IS PRICED ON WHAT A CONVICTION CAN TAKE, NOT ON WHAT THE
+    ///         APPROVERS RESERVED (review 🟡F13).
+    ///
+    ///         `recordApproval` deliberately over-reserves: every approver books
+    ///         up to the FULL coverage, because at vote time any one of them
+    ///         might end up carrying it alone. So reservations sum ABOVE the
+    ///         proposal's need, and by a factor that grows with the approver
+    ///         count. `slashBpsFor` prices the slash against the ALLOCATION for
+    ///         exactly that reason — but `file` summed `approversOf`, the
+    ///         reservation, and charged the challenger against it.
+    ///
+    ///         The effect was perverse: the MORE guardians backed a proposal,
+    ///         the more expensive it became to challenge, while the recoverable
+    ///         total stayed flat. A well-covered proposal bought itself
+    ///         protection from scrutiny out of the fact that it was well
+    ///         covered. Here the cohort reserved $10,000 against $8,000 of real
+    ///         liability, and the bond must follow the $8,000.
+    function test_file_bondIsSizedOnLiabilityNotReservations() public {
+        _setCoverage(PROPOSAL, 6_000e18, 4_000e18); // reservations sum to $10,000
+        ledger.setLiabilityUsd(address(gov), PROPOSAL, 8_000e18); // but only $8,000 is takeable
+        _execute(PROPOSAL);
+
+        vm.prank(challenger);
+        uint256 id = game.file(
+            address(gov), PROPOSAL, IChallengeGame.Predicate.OutOfAdapterOutflow, ADAPTER, SELECTOR, EVIDENCE
+        );
+
+        // 5% of $8,000 at $0.05/WOOD = 8,000 WOOD. Against the reservations it
+        // would have been 10,000 — a 25% over-charge on this cohort alone.
+        assertEq(game.challengeOf(id).bondWood, 8_000e18, "the bond follows the liability, not the reservations");
+        assertEq(game.challengeOf(id).frozenCoverageUsd, 8_000e18, "and the recorded coverage is the liability too");
+    }
+
+    /// @notice The cap only ever REDUCES. An under-covered cohort — whose
+    ///         reservations fall short of the proposal's need — is still priced
+    ///         on what it actually pledged, because that is all a conviction
+    ///         could take from it.
+    function test_file_bondUsesReservationsWhenTheyAreTheSmallerFigure() public {
+        _setCoverage(PROPOSAL, 6_000e18, 4_000e18); // reservations sum to $10,000
+        ledger.setLiabilityUsd(address(gov), PROPOSAL, 25_000e18); // a larger need
+        _execute(PROPOSAL);
+
+        vm.prank(challenger);
+        uint256 id = game.file(
+            address(gov), PROPOSAL, IChallengeGame.Predicate.OutOfAdapterOutflow, ADAPTER, SELECTOR, EVIDENCE
+        );
+
+        assertEq(game.challengeOf(id).bondWood, 10_000e18, "capped by the cohort, never inflated by the need");
+    }
+
     function test_file_revertsWhenNothingToFreeze() public {
         _execute(PROPOSAL);
         vm.prank(challenger);
