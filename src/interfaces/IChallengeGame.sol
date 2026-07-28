@@ -32,13 +32,26 @@ interface IChallengeGame {
     /// @notice Challenge lifecycle. There is deliberately no `Proven` state —
     ///         see `Predicate`: nothing is proven on-chain, so a challenge is
     ///         only ever live (`Filed`/`Disputed`) or terminal
-    ///         (`Failed`/`Settled`).
+    ///         (`Failed`/`Settled`/`Inconclusive`). `Inconclusive` is a terminal
+    ///         NON-VERDICT — see `Verdict` — reachable only from `Disputed`, the
+    ///         same entry `Failed`/`Settled` take via a court ruling.
     enum Status {
         None,
         Filed,
         Disputed,
         Failed,
-        Settled
+        Settled,
+        Inconclusive
+    }
+
+    /// @notice The court's three-valued outcome for a disputed challenge
+    ///         (spec 2026-07-28 §4). `Inconclusive` is a NON-VERDICT: the vote
+    ///         missed its participation floor, so nothing was adjudicated and
+    ///         both sides unwind whole.
+    enum Verdict {
+        Guilty,
+        NotGuilty,
+        Inconclusive
     }
 
     /// @param frozenCoverageUsd The coverage this challenge pinned, in USD-18,
@@ -234,9 +247,13 @@ interface IChallengeGame {
     ///        because they answer different questions — what filing cost, and
     ///        what the defence actually collected.
     event ChallengeFailed(uint256 indexed challengeId, uint256 forfeitedWood, uint256 burnedWood);
-    /// @dev Emitted BEFORE the settle/fail it causes, so an indexer reading the
-    ///      log in order sees the verdict and then the accounting it produced.
-    event ChallengeRuled(uint256 indexed challengeId, bool guilty);
+    /// @dev Emitted BEFORE the settle/fail/refund it causes, so an indexer
+    ///      reading the log in order sees the verdict and then the accounting
+    ///      it produced.
+    event ChallengeRuled(uint256 indexed challengeId, Verdict verdict);
+    /// @notice Inconclusive unwind: challenger bond returned whole, pool booked
+    ///         for pull-claims, no conviction, no demotion (spec 2026-07-28 §4).
+    event ChallengeInconclusive(uint256 indexed challengeId, uint256 bondWood, uint256 poolWood);
     event CourtSet(address indexed oldCourt, address indexed newCourt);
     event ExposureLedgerSet(address indexed oldLedger, address indexed newLedger);
     event TierRegistrySet(address indexed oldRegistry, address indexed newRegistry);
@@ -314,24 +331,28 @@ interface IChallengeGame {
     ///         challenge fails to the accused (D5). Reverts otherwise.
     function resolve(uint256 challengeId) external;
 
-    /// @notice The court's verdict on a DISPUTED challenge (spec §3.5, Plan E).
-    ///         Callable only by `court`, and only from `Disputed` — a `Filed`
-    ///         challenge is still inside its own auto-slash clock and has not
-    ///         been escalated to anyone.
-    /// @dev    THE COURT SUPPLIES ONLY THE GUILTY/NOT-GUILTY BIT and can vary
-    ///         nothing else. `guilty` takes the identical path an UNDISPUTED
-    ///         challenge takes — slash at sWOOD's `maxSlashBps` with no severity
-    ///         ramp (§3.5 "ground truth established", D7), the named adapter
-    ///         demoted, the challenger's bond returned — and `!guilty` the
-    ///         identical path the timeout takes. There is deliberately no
-    ///         severity argument: a court that could dial the slash would be
-    ///         negotiating with the accused rather than ruling on them.
-    /// @dev    A RULING BEATS THE TIMEOUT. Both outcomes are terminal, and
+    /// @notice The court's verdict on a DISPUTED challenge (spec §3.5, Plan E;
+    ///         three-valued since spec 2026-07-28 §4). Callable only by
+    ///         `court`, and only from `Disputed` — a `Filed` challenge is still
+    ///         inside its own auto-slash clock and has not been escalated to
+    ///         anyone.
+    /// @dev    THE COURT SUPPLIES ONLY THE VERDICT ENUM and can vary nothing
+    ///         else. `Guilty` takes the identical path an UNDISPUTED challenge
+    ///         takes — slash at sWOOD's `maxSlashBps` with no severity ramp
+    ///         (§3.5 "ground truth established", D7), the named adapter
+    ///         demoted, the challenger's bond returned — `NotGuilty` the
+    ///         identical path the timeout takes, and `Inconclusive` (§4) unwinds
+    ///         BOTH sides whole: no slash, no demotion, no conviction, because
+    ///         the vote missed its participation floor and never reached a
+    ///         verdict on the merits at all. There is deliberately no severity
+    ///         argument: a court that could dial the slash would be negotiating
+    ///         with the accused rather than ruling on them.
+    /// @dev    A RULING BEATS THE TIMEOUT. All three outcomes are terminal, and
     ///         `resolve` only acts on `Filed`/`Disputed`, so once the court has
     ///         ruled the clock can no longer overwrite the verdict — which is
     ///         the whole point: it is what stops a guilty approver disputing and
     ///         running out `disputeTimeout`.
-    function rule(uint256 challengeId, bool guilty) external;
+    function rule(uint256 challengeId, Verdict verdict) external;
 
     // ── Views ──
     function challengeOf(uint256 challengeId) external view returns (Challenge memory);

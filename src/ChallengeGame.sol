@@ -746,32 +746,38 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     }
 
     /// @inheritdoc IChallengeGame
-    /// @dev THE COURT SUPPLIES ONLY THE VERDICT BIT. `guilty` reuses `_settle`
+    /// @dev THE COURT SUPPLIES ONLY THE VERDICT ENUM. `Guilty` reuses `_settle`
     ///      verbatim — the same path an UNDISPUTED challenge takes, so the slash
     ///      is at sWOOD's `maxSlashBps` with no severity ramp (§3.5 "ground truth
-    ///      established", D7) — and `!guilty` reuses `_fail`, the same path the
+    ///      established", D7) — `NotGuilty` reuses `_fail`, the same path the
     ///      timeout takes, because a not-guilty ruling and an unruled escalation
     ///      say the same thing about the accused: the disputer was right, so it
-    ///      gets its counter-bond back and the challenger's bond forfeits. There
-    ///      is deliberately no severity parameter here; a court that could dial
-    ///      the slash would be negotiating with the accused, not ruling on them.
-    /// @dev RULING BEATS THE TIMEOUT: both branches are terminal and `resolve`
-    ///      acts only on `Filed`/`Disputed`, so the clock can never overwrite a
-    ///      verdict already handed down. That ordering is the entire point of
-    ///      this entrypoint — it is what stops a genuinely guilty approver from
-    ///      disputing and running out `disputeTimeout`.
-    /// @dev CEI is inherited from `_settle`/`_fail`, which both write the
-    ///      terminal status before any external call; the event is emitted first
-    ///      so the log reads verdict-then-consequence.
-    function rule(uint256 challengeId, bool guilty) external {
+    ///      gets its counter-bond back and the challenger's bond forfeits. And
+    ///      `Inconclusive` (spec 2026-07-28 §4) reuses `_refundAll`: the vote
+    ///      missed its participation floor, so nothing was decided on the
+    ///      merits and both sides unwind whole rather than one paying the
+    ///      other. There is deliberately no severity parameter here; a court
+    ///      that could dial the slash would be negotiating with the accused,
+    ///      not ruling on them.
+    /// @dev RULING BEATS THE TIMEOUT: all three branches are terminal and
+    ///      `resolve` acts only on `Filed`/`Disputed`, so the clock can never
+    ///      overwrite a verdict already handed down. That ordering is the
+    ///      entire point of this entrypoint — it is what stops a genuinely
+    ///      guilty approver from disputing and running out `disputeTimeout`.
+    /// @dev CEI is inherited from `_settle`/`_fail`/`_refundAll`, which each
+    ///      write the terminal status before any external call; the event is
+    ///      emitted first so the log reads verdict-then-consequence.
+    function rule(uint256 challengeId, Verdict verdict) external {
         if (msg.sender != court) revert NotCourt();
         Challenge storage c = _challenges[challengeId];
         if (c.status != Status.Disputed) revert WrongStatus();
-        emit ChallengeRuled(challengeId, guilty);
-        if (guilty) {
+        emit ChallengeRuled(challengeId, verdict);
+        if (verdict == Verdict.Guilty) {
             _settle(challengeId, c);
-        } else {
+        } else if (verdict == Verdict.NotGuilty) {
             _fail(challengeId, c);
+        } else {
+            _refundAll(challengeId, c);
         }
     }
 
@@ -1083,6 +1089,50 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         emit ChallengeFailed(challengeId, bond, burnAmount);
     }
 
+    /// @dev THE `Inconclusive` PATH (spec 2026-07-28 §4) — AN UNWIND, NOT A
+    ///      VERDICT. The court's vote missed its participation floor, so
+    ///      neither side was found right or wrong: nothing here is a slash,
+    ///      nothing is a forfeit, both bonds simply come back.
+    ///
+    ///      THE CHALLENGER'S BOND RETURNS WHOLE, with no `settleBurnBps` slice.
+    ///      That burn exists to price a filing nobody answered (🟠F4) — the
+    ///      cost of a silence verdict. This challenger WAS answered; the
+    ///      dispute pool completed and escalated to the court. Burning an
+    ///      unwound bond here would charge the challenger for the
+    ///      electorate's apathy — a quorum failure it did not cause and could
+    ///      not have prevented — which is a bill nothing in §4 asks it to pay.
+    ///
+    ///      THE POOL GOES THROUGH `_bookRefund`, NOT A DIRECT TRANSFER, for the
+    ///      same reason `_settle`'s part-funded branch does: `dispute` keeps
+    ///      open standing precisely because the payout is pull, not push (see
+    ///      `claimContribution`), and this path reaches the same unbounded
+    ///      contributor list `_settle`'s partial pool does. Pushing here would
+    ///      reintroduce the single-reverting-recipient hazard pull-payments
+    ///      exist to remove.
+    ///
+    ///      NO `_convicted` MARK AND NO DEMOTION. Nothing was adjudicated, so
+    ///      there is no conviction to record and no adapter to demote — and
+    ///      because `_convicted` stays false and this challenge's own slot
+    ///      frees on the freeze release below, the SAME proposal is fully
+    ///      re-challengeable the instant this call returns (`file`'s
+    ///      `AlreadyConvicted`/`AlreadyChallenged` guards both read state this
+    ///      path never sets).
+    function _refundAll(uint256 challengeId, Challenge storage c) private {
+        address governor = c.governor;
+        uint256 proposalId = c.proposalId;
+        uint256 bond = c.bondWood;
+        uint256 pool = c.counterBondWood;
+        address challenger = c.challenger;
+
+        c.status = Status.Inconclusive;
+        bondedWood -= (bond + pool);
+        _releaseFreeze(_reviewKey(governor, proposalId), governor, proposalId);
+
+        _bookRefund(challengeId, pool);
+        wood.safeTransfer(challenger, bond);
+        emit ChallengeInconclusive(challengeId, bond, pool);
+    }
+
     /// @dev The accused set: the ledger's covering approvers, filtered to those
     ///      whose committed share is still non-zero. The ledger reports a
     ///      released commitment as zero rather than dropping it, and a guardian
@@ -1167,6 +1217,9 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             if (c.counterBondWood == c.bondWood) return 0;
             return contributed; // part-funded defence: stake back, no winnings
         }
+        if (c.status == Status.Inconclusive) {
+            return contributed; // unwind: stake back, nothing was won or lost
+        }
         return 0; // still live — nothing is owed until the outcome is fixed
     }
 
@@ -1174,7 +1227,9 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     function claimContribution(uint256 challengeId) external returns (uint256 amount) {
         Challenge storage c = _challenges[challengeId];
         Status status = c.status;
-        if (status != Status.Failed && status != Status.Settled) revert ChallengeNotTerminal();
+        if (status != Status.Failed && status != Status.Settled && status != Status.Inconclusive) {
+            revert ChallengeNotTerminal();
+        }
 
         amount = claimableContribution(challengeId, msg.sender);
         if (amount == 0) revert NothingToClaim();

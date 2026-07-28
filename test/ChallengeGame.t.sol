@@ -1712,7 +1712,7 @@ contract ChallengeGameTest is Test {
     function test_rule_onlyCourt() public {
         uint256 id = _fileAndDispute();
         vm.expectRevert(IChallengeGame.NotCourt.selector);
-        game.rule(id, true);
+        game.rule(id, IChallengeGame.Verdict.Guilty);
     }
 
     /// @notice A guilty ruling routes into the SAME settle path an undisputed
@@ -1721,7 +1721,7 @@ contract ChallengeGameTest is Test {
     function test_rule_guiltySettles() public {
         uint256 id = _fileAndDispute();
         vm.prank(court);
-        game.rule(id, true);
+        game.rule(id, IChallengeGame.Verdict.Guilty);
         assertEq(uint256(game.challengeOf(id).status), uint256(IChallengeGame.Status.Settled));
     }
 
@@ -1730,7 +1730,7 @@ contract ChallengeGameTest is Test {
     function test_rule_notGuiltyFails() public {
         uint256 id = _fileAndDispute();
         vm.prank(court);
-        game.rule(id, false);
+        game.rule(id, IChallengeGame.Verdict.NotGuilty);
         assertEq(uint256(game.challengeOf(id).status), uint256(IChallengeGame.Status.Failed));
     }
 
@@ -1740,7 +1740,7 @@ contract ChallengeGameTest is Test {
         uint256 id = _file();
         vm.prank(court);
         vm.expectRevert(IChallengeGame.WrongStatus.selector);
-        game.rule(id, true);
+        game.rule(id, IChallengeGame.Verdict.Guilty);
     }
 
     /// @notice A ruling BEATS the timeout: once the court has ruled, the challenge
@@ -1748,7 +1748,7 @@ contract ChallengeGameTest is Test {
     function test_rule_thenResolveReverts() public {
         uint256 id = _fileAndDispute();
         vm.prank(court);
-        game.rule(id, true);
+        game.rule(id, IChallengeGame.Verdict.Guilty);
         vm.warp(vm.getBlockTimestamp() + game.disputeTimeout() + 1);
         vm.expectRevert(IChallengeGame.WrongStatus.selector);
         game.resolve(id);
@@ -1785,7 +1785,7 @@ contract ChallengeGameTest is Test {
         uint256 disputerBefore = wood.balanceOf(guardianA);
 
         vm.prank(court);
-        game.rule(id, true);
+        game.rule(id, IChallengeGame.Verdict.Guilty);
 
         assertEq(
             wood.balanceOf(challenger) - challengerBefore, bond + pool, "its own bond back PLUS the forfeited pool"
@@ -1793,6 +1793,84 @@ contract ChallengeGameTest is Test {
         assertEq(wood.balanceOf(guardianA), disputerBefore, "the accused loses the counter-bond it staked");
         _assertLiveBondsBacked();
         assertEq(wood.balanceOf(address(game)), 0, "nothing stranded once the ruling is terminal");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Task 2 — three-valued Verdict: Inconclusive refunds both sides whole
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice `Inconclusive` is a NON-VERDICT: nothing was adjudicated, so the
+    ///         challenger's bond comes back WHOLE (no `settleBurnBps` slice —
+    ///         that burn prices an unanswered filing, and this one WAS
+    ///         answered, just not decided) and the pool is booked for pull-claims
+    ///         rather than pushed, exactly like the part-funded settle path.
+    function test_rule_inconclusive_refundsBothSidesWhole() public {
+        uint256 id = _fileAndDispute();
+        uint256 challengerBefore = wood.balanceOf(challenger);
+        uint256 bondedBefore = game.bondedWood();
+        IChallengeGame.Challenge memory before = game.challengeOf(id);
+
+        vm.prank(court);
+        game.rule(id, IChallengeGame.Verdict.Inconclusive);
+
+        IChallengeGame.Challenge memory c = game.challengeOf(id);
+        assertEq(uint256(c.status), uint256(IChallengeGame.Status.Inconclusive), "terminal status");
+        // Challenger bond back WHOLE - no settleBurn slice: nothing was adjudicated.
+        assertEq(wood.balanceOf(challenger) - challengerBefore, before.bondWood, "challenger whole");
+        // Pool booked as pull-claims, not pushed.
+        assertEq(game.unclaimedWood(), before.counterBondWood, "pool booked");
+        assertEq(game.bondedWood(), bondedBefore - before.bondWood - before.counterBondWood, "bonded released");
+        // Freeze released: the proposal's coverage is live again.
+        assertEq(game.liveChallengeCountOf(address(gov), PROPOSAL), 0, "freeze released");
+        _assertLiveBondsBacked();
+    }
+
+    /// @notice The pool's funders get their own stake back, one-for-one — no
+    ///         winnings, because nothing was won: the escalation they bought
+    ///         was never decided on the merits.
+    function test_rule_inconclusive_contributorsClaimExactlyTheirStake() public {
+        uint256 id = _fileAndDispute();
+        uint256 stake = game.counterBondContributionOf(id, guardianA);
+        vm.prank(court);
+        game.rule(id, IChallengeGame.Verdict.Inconclusive);
+
+        assertEq(game.claimableContribution(id, guardianA), stake, "stake back, no winnings");
+        uint256 before = wood.balanceOf(guardianA);
+        vm.prank(guardianA);
+        game.claimContribution(id);
+        assertEq(wood.balanceOf(guardianA) - before, stake, "claimed");
+    }
+
+    /// @notice The three verdicts route to three distinct terminal statuses:
+    ///         `Guilty` settles, `NotGuilty` fails, `Inconclusive` (covered
+    ///         above) refunds both sides whole.
+    function test_rule_verdictMapping() public {
+        uint256 g = _fileAndDispute();
+        vm.prank(court);
+        game.rule(g, IChallengeGame.Verdict.Guilty);
+        assertEq(uint256(game.challengeOf(g).status), uint256(IChallengeGame.Status.Settled));
+
+        uint256 n = _fileStandard(2); // a second proposal so the two rulings don't collide
+        vm.prank(guardianA);
+        game.dispute(n, type(uint256).max);
+        vm.prank(court);
+        game.rule(n, IChallengeGame.Verdict.NotGuilty);
+        assertEq(uint256(game.challengeOf(n).status), uint256(IChallengeGame.Status.Failed));
+    }
+
+    /// @notice No `_convicted` mark and no demotion on the inconclusive path, so
+    ///         the SAME proposal stays challengeable — a fresh filing must
+    ///         succeed rather than revert `AlreadyConvicted`/`AlreadyChallenged`.
+    function test_rule_inconclusive_allowsRefilingSameProposal() public {
+        uint256 id = _fileAndDispute();
+        vm.prank(court);
+        game.rule(id, IChallengeGame.Verdict.Inconclusive);
+
+        vm.prank(challenger);
+        uint256 refiled = game.file(
+            address(gov), PROPOSAL, IChallengeGame.Predicate.OutOfAdapterOutflow, ADAPTER, SELECTOR, EVIDENCE
+        );
+        assertEq(uint256(game.challengeOf(refiled).status), uint256(IChallengeGame.Status.Filed), "refiling succeeds");
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -2311,7 +2389,7 @@ contract ChallengeGameTest is Test {
         uint256 challengerBefore = wood.balanceOf(challenger);
 
         vm.prank(court);
-        game.rule(id, true);
+        game.rule(id, IChallengeGame.Verdict.Guilty);
 
         assertEq(wood.balanceOf(challenger) - challengerBefore, bond + pool, "bond back plus the WHOLE pool");
         assertEq(wood.balanceOf(game.BURN_ADDRESS()), 0, "a settled challenge burns nothing");
