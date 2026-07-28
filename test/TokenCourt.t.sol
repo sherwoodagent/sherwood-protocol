@@ -422,4 +422,137 @@ contract TokenCourtTest is Test {
         ITokenCourt.Case memory c = court.caseOf(id);
         assertEq(c.guiltyVotes, 300e18);
     }
+
+    function test_vote_windowLengtheningDoesNotExtendLiveCase() public {
+        // Owner lengthening voteWindow after referral must NOT extend a live case's clock either.
+        uint256 id = _referredCase();
+        vm.prank(owner);
+        court.setVoteWindow(10 days);
+        vm.warp(vm.getBlockTimestamp() + 5 days); // the case's PINNED window has closed
+        vm.prank(voterA);
+        vm.expectRevert(ITokenCourt.WindowClosed.selector);
+        court.vote(id, true);
+        court.finalize(id); // pinned window is genuinely closed at this instant
+        assertEq(uint256(court.caseOf(id).phase), uint256(ITokenCourt.Phase.Resolved));
+    }
+
+    // ── finalize ──
+
+    function test_finalize_verdictMatrix_guiltyMajority() public {
+        uint256 id = _referredCase(); // floor = 10% of 1000e18 = 100e18
+        vm.prank(voterA);
+        court.vote(id, true); // 300e18
+        vm.prank(voterB);
+        court.vote(id, false); // 200e18 -> turnout 500e18 >= floor
+        vm.warp(vm.getBlockTimestamp() + 5 days);
+        court.finalize(id);
+        ITokenCourt.Case memory c = court.caseOf(id);
+        assertEq(uint256(c.verdict), uint256(IChallengeGame.Verdict.Guilty));
+        assertEq(uint256(c.phase), uint256(ITokenCourt.Phase.Resolved));
+        assertEq(c.finalizedAt, vm.getBlockTimestamp());
+        assertEq(uint256(game.lastVerdict()), uint256(IChallengeGame.Verdict.Guilty));
+        assertEq(game.lastRuledChallenge(), CHALLENGE_ID);
+    }
+
+    function test_finalize_tieAcquits() public {
+        uint256 id = _referredCase();
+        uint256 snap = court.caseOf(id).snapshotTs;
+        swood.setPastVotes(voterB, snap, 300e18); // equalize
+        vm.prank(voterA);
+        court.vote(id, true);
+        vm.prank(voterB);
+        court.vote(id, false);
+        vm.warp(vm.getBlockTimestamp() + 5 days);
+        court.finalize(id);
+        assertEq(uint256(court.caseOf(id).verdict), uint256(IChallengeGame.Verdict.NotGuilty), "tie -> fail-safe");
+    }
+
+    function test_finalize_belowFloorInconclusive_andZeroTurnout() public {
+        uint256 id = _referredCase();
+        uint256 snap = court.caseOf(id).snapshotTs;
+        address dust = makeAddr("dustVoter");
+        swood.setPastVotes(dust, snap, 1e18); // << 100e18 floor
+        vm.prank(dust);
+        court.vote(id, true);
+        vm.warp(vm.getBlockTimestamp() + 5 days);
+        court.finalize(id);
+        assertEq(uint256(court.caseOf(id).verdict), uint256(IChallengeGame.Verdict.Inconclusive));
+
+        // Zero turnout, second case (same proposal, generous clock).
+        game.setChallenge(
+            CHALLENGE_ID + 1,
+            governor,
+            PROPOSAL_ID,
+            IChallengeGame.Status.Disputed,
+            vm.getBlockTimestamp(),
+            30 days,
+            vm.getBlockTimestamp() - 1 days
+        );
+        uint256 id2 = court.refer(CHALLENGE_ID + 1);
+        vm.warp(vm.getBlockTimestamp() + 5 days);
+        court.finalize(id2);
+        assertEq(uint256(court.caseOf(id2).verdict), uint256(IChallengeGame.Verdict.Inconclusive));
+    }
+
+    function test_finalize_accusedWeightLowersFloor() public {
+        // floor = 10% of (1000e18 - 600e18) = 40e18; a 45e18 aged turnout clears it.
+        _disputedChallenge();
+        address[] memory a = new address[](1);
+        uint256[] memory cm = new uint256[](1);
+        a[0] = accusedG;
+        cm[0] = 100e18; // committed USD, nonzero so accusedG is in the accused set
+        ledger.setApprovers(a, cm);
+        uint256 snap = vm.getBlockTimestamp() - 1 days - 1;
+        swood.setPastStake(accusedG, snap, 600e18);
+
+        uint256 id = court.refer(CHALLENGE_ID);
+        assertEq(court.caseOf(id).accusedWeight, 600e18, "accused raw stake recorded");
+
+        swood.setPastTotalVotes(snap, 1_000e18);
+        swood.setPastVotes(voterA, snap, 45e18);
+
+        vm.prank(voterA);
+        court.vote(id, true);
+
+        vm.warp(vm.getBlockTimestamp() + 5 days);
+        court.finalize(id);
+
+        ITokenCourt.Case memory c = court.caseOf(id);
+        assertEq(uint256(c.verdict), uint256(IChallengeGame.Verdict.Guilty), "cleared the lowered floor");
+    }
+
+    function test_finalize_terminalRace_caseClosesViaCatch() public {
+        uint256 id = _referredCase();
+        vm.prank(voterA);
+        court.vote(id, true);
+        vm.warp(vm.getBlockTimestamp() + 5 days);
+        game.setRuleReverts(true); // challenge already terminal on the game side
+        vm.expectEmit(true, true, false, false);
+        emit ITokenCourt.ChallengeAlreadyTerminal(id, CHALLENGE_ID);
+        court.finalize(id);
+        assertEq(uint256(court.caseOf(id).phase), uint256(ITokenCourt.Phase.Resolved), "case closed anyway");
+        assertFalse(game.ruled(), "verdict never landed");
+    }
+
+    function test_finalize_guards() public {
+        uint256 id = _referredCase();
+        vm.expectRevert(ITokenCourt.WindowOpen.selector);
+        court.finalize(id);
+        vm.expectRevert(ITokenCourt.WrongPhase.selector);
+        court.finalize(999); // nonexistent
+        vm.warp(vm.getBlockTimestamp() + 5 days);
+        court.finalize(id);
+        vm.expectRevert(ITokenCourt.WrongPhase.selector);
+        court.finalize(id); // already resolved
+    }
+
+    function test_finalize_emitsCaseFinalized() public {
+        uint256 id = _referredCase();
+        vm.prank(voterA);
+        court.vote(id, true);
+        vm.warp(vm.getBlockTimestamp() + 5 days);
+        vm.expectEmit(true, false, false, true);
+        emit ITokenCourt.CaseFinalized(id, IChallengeGame.Verdict.Guilty, 300e18, 0, 100e18);
+        court.finalize(id);
+    }
 }
