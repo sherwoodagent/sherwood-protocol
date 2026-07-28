@@ -3349,6 +3349,73 @@ contract CourtTest is Test {
     ///         Reverting would be worse still: no case could open and
     ///         `disputeTimeout` would acquit the accused by default. So the court
     ///         keeps the conservative denominator it always had.
+    /// @notice 🔴F17a: THE GUARD MISSES THE CASE IT WAS WRITTEN FOR.
+    ///
+    ///         `total >= accusedWeight` catches strict underflow only. At
+    ///         EQUALITY the subtraction branch is taken, `base` is 0, and the
+    ///         floor is 0 — the exact outcome the fallback exists to prevent,
+    ///         sitting on the ALLOWED side of the guard. The floor is therefore
+    ///         a non-monotonic cliff: it falls to zero as `accusedWeight`
+    ///         approaches the total and only snaps back once it passes it.
+    ///         Truncation widens the cliff — any `base` below 10 also floors to
+    ///         0 at a 1,000 bps rate.
+    function test_finalizeAppeal_accusedWeightEqualToTotal_doesNotZeroTheFloor() public {
+        swood.setPastVotes(whale, _nextSnapshotTs(), 100_000e18);
+        _accuse(_one(whale));
+
+        uint256 caseId = _panelRuled(true);
+        uint256 ts = court.caseOf(caseId).snapshotTs;
+        swood.setPastTotalVotes(ts, 100_000e18); // EXACTLY equal to accusedWeight
+        swood.setPastVotes(minnow, ts, 5_000e18);
+
+        _appeal(caseId);
+        vm.prank(minnow);
+        court.voteAppeal(caseId, false);
+        _finalizeAppeal(caseId);
+
+        assertEq(
+            uint256(court.caseOf(caseId).finalRuling),
+            uint256(ICourt.Ruling.Guilty),
+            "a zero floor at equality would let 5,000 WOOD of dust overturn the panel"
+        );
+    }
+
+    /// @notice 🔴F17b: THE SUBTRACTION MUST BE SAME-BASIS.
+    ///
+    ///         `getPastTotalVotes` sums RAW OWN stake — delegation never enters
+    ///         it. `getPastVotes` is aged own stake PLUS k-capped delegated
+    ///         inbound, so with `delegatedWeightCapX = 4` one account's weight
+    ///         ranges over a 20x band around its own contribution to that total.
+    ///         Subtracting the second from the first is not a rounding
+    ///         difference but a different measure — and the delegated term is
+    ///         the one that deletes the floor, because WOOD delegated to an
+    ///         accused guardian subtracts from the base while adding nothing to
+    ///         the total.
+    ///
+    ///         The lever is rented, not burned: the self-delegation ban only
+    ///         checks `delegate != msg.sender`, the WOOD is recoverable, and at
+    ///         most `maxDelegatedSlashBps` of it is ever at risk — so the
+    ///         accused can arrange the zero floor themselves, cheaply.
+    function test_refer_accusedWeightUsesRawStakeNotVoteWeight() public {
+        // Seeded BEFORE the referral, and NOT via `_accusedCase` — that helper
+        // calls `_preSeedElectorate`, which would overwrite the whale's weight
+        // with the standard fixture value and erase the divergence under test.
+        uint256 ts = _nextSnapshotTs();
+        // Voting power inflated 5x by delegated inbound; raw own stake is the
+        // quantity `getPastTotalVotes` is actually a sum of.
+        swood.setPastVotes(whale, ts, 500_000e18);
+        swood.setPastStake(whale, ts, 100_000e18);
+        _accuse(_one(whale));
+
+        uint256 caseId = _panelRuled(true);
+
+        assertEq(
+            court.caseOf(caseId).accusedWeight,
+            100_000e18,
+            "subtract the raw own stake the total is a sum of, not the delegation-inflated weight"
+        );
+    }
+
     function test_finalizeAppeal_accusedWeightAboveTotal_fallsBackToTheUnreducedFloor() public {
         // Seeded BEFORE the referral, because `accusedWeight` is summed there:
         // whale's own + k-capped delegated inbound exceeds the raw own-stake

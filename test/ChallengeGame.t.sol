@@ -70,6 +70,26 @@ contract MockChallengeLedger {
         woodUsdPriceX8 = priceX8;
     }
 
+    /// @dev THE COMPOSED PRICE, which is what every rail in the real ledger
+    ///      divides by: Chainlink first, `woodHaircutBps` applied, the owner-set
+    ///      scalar only as the degraded fallback — and the haircut applies to
+    ///      the fallback too, so these two diverge without any feed at all.
+    ///      DEFAULTS to the raw scalar so a suite that never sets it sees the
+    ///      pre-fix behaviour; `setWoodPriceX8` is what opens the gap. The old
+    ///      mock had no `woodPriceX8()` whatsoever, which is precisely why no
+    ///      challenge-path test could express this divergence (review 🟠F16).
+    uint256 internal _woodPriceX8;
+    bool internal _woodPriceSet;
+
+    function setWoodPriceX8(uint256 priceX8) external {
+        _woodPriceX8 = priceX8;
+        _woodPriceSet = true;
+    }
+
+    function woodPriceX8() external view returns (uint256) {
+        return _woodPriceSet ? _woodPriceX8 : woodUsdPriceX8;
+    }
+
     function setApprovers(address governor, uint256 proposalId, address[] memory guardians, uint256[] memory usd)
         external
     {
@@ -574,6 +594,26 @@ contract ChallengeGameTest is Test {
     ///         protection from scrutiny out of the fact that it was well
     ///         covered. Here the cohort reserved $10,000 against $8,000 of real
     ///         liability, and the bond must follow the $8,000.
+    function test_file_bondDividesByTheComposedPriceNotTheRawScalar() public {
+        // Raw scalar $0.05; composed $0.04 after a 20% haircut. No feed needed —
+        // the haircut applies to the fallback branches too, which is why these
+        // two diverge on a deployment that never wires Chainlink at all.
+        ledger.setWoodPriceX8(0.04e8);
+
+        _setCoverage(PROPOSAL, 6_000e18, 4_000e18); // $10,000 of liability
+        _execute(PROPOSAL);
+
+        vm.prank(challenger);
+        uint256 id = game.file(
+            address(gov), PROPOSAL, IChallengeGame.Predicate.OutOfAdapterOutflow, ADAPTER, SELECTOR, EVIDENCE
+        );
+
+        // 5% of $10,000 = $500. At the composed $0.04 that is 12,500 WOOD; at
+        // the raw $0.05 it would be 10,000 — a 20% under-charge. The bond
+        // DIVIDES by the price, so a stale-high scalar always under-charges.
+        assertEq(game.challengeOf(id).bondWood, 12_500e18, "bond divides by the composed price, not the raw scalar");
+    }
+
     function test_file_bondIsSizedOnLiabilityNotReservations() public {
         _setCoverage(PROPOSAL, 6_000e18, 4_000e18); // reservations sum to $10,000
         ledger.setLiabilityUsd(address(gov), PROPOSAL, 8_000e18); // but only $8,000 is takeable

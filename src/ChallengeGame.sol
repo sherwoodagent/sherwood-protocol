@@ -508,7 +508,33 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         // proposal: nobody can ever challenge it while the coverage and the
         // price stand, which is a fact worth surfacing rather than hiding behind
         // a shared selector.
-        uint256 priceX8 = exposureLedger.woodUsdPriceX8();
+        // THE COMPOSED PRICE, the one every other rail divides by (review 🟠F16).
+        // This read used to be `woodUsdPriceX8()` — the raw owner-set scalar,
+        // seeded at roughly a 30-day low — and it was the ONLY consumer read of
+        // that scalar in all of `src/`. Every other conversion, including
+        // `proposerBondWood` (the identical formula shape, commented "composed —
+        // matches the slash rails"), uses `woodPriceX8()`.
+        //
+        // Same unit and precision, DIFFERENT NUMBER: `_haircut` applies to the
+        // fallback branches too, so the two diverge with no feed wired at all —
+        // one `setWoodHaircutBps` call is enough. Since the bond DIVIDES by the
+        // price, a stale-high scalar under-charges, and the scalar is stale
+        // exactly when it matters: on a WOOD crash the feed follows within
+        // minutes while `MIN_PRICE_UPDATE_INTERVAL` holds the scalar for a day.
+        // Freezing a guardian's coverage would get cheapest during the market
+        // stress a drain happens in, and this bond is the only cost of a
+        // frivolous filing.
+        //
+        // It also mixed bases inside one formula once F13 landed: `liabilityUsd`
+        // derives its numerator at the composed price, so numerator and divisor
+        // disagreed within the same expression.
+        //
+        // Fail-closed semantics are preserved — the composed price is zero
+        // exactly when its source is, so `WoodPriceUnset` still means unpriced.
+        // Reading it composed additionally un-bricks the documented emergency
+        // stop: `setWoodUsdPrice(0)` with a healthy feed no longer blocks every
+        // filing protocol-wide.
+        uint256 priceX8 = exposureLedger.woodPriceX8();
         if (priceX8 == 0) revert WoodPriceUnset();
         uint256 bondWood = (((coverageUsd * challengerBondBps) / BPS_DENOMINATOR) * 1e8) / priceX8;
         if (bondWood == 0) revert BondTooSmall();

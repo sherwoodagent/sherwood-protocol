@@ -745,6 +745,29 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
         return agedOwn + Math.min(delegated, delegatedWeightCapX * agedOwn);
     }
 
+    /// @notice A guardian's RAW votable own stake at a past timestamp — the same
+    ///         basis `getPastTotalVotes` is a sum of.
+    /// @dev    ITS COUNTERPART `getPastVotes` IS NOT (review 🔴F17). That one
+    ///         returns aged own stake plus k-capped delegated inbound, so it is
+    ///         WOOD-scaled but is not a term of the total: delegation never
+    ///         enters `_totalStakeCheckpoint`. At the default
+    ///         `delegatedWeightCapX = 4` one account's vote weight spans roughly
+    ///         a 20x band around its own contribution to that total.
+    ///
+    ///         The note on `getPastVotes` — "aging and the k-cap only shrink
+    ///         numerators, so the raw denominator is conservative" — is sound
+    ///         where it was written, about vote COUNTING. It INVERTS under a
+    ///         subtraction: `Court._participationFloor` subtracts the accused
+    ///         cohort from the electorate, and there the k-cap term is not
+    ///         conservative at all — it is the term that can drive the floor to
+    ///         zero. This getter exists so that subtraction has a same-basis
+    ///         operand, after which the accused sum can never exceed the total
+    ///         by construction: both traces are pushed in the same transaction
+    ///         at every mutation site (stake, request, cancel, slash).
+    function getPastStake(address guardian, uint256 timestamp) public view returns (uint256) {
+        return _stakeCheckpoints[guardian].upperLookupRecent(uint32(timestamp));
+    }
+
     /// @notice Total guardian vote weight (quorum denominator) at a past timestamp.
     /// @dev Reads the global total-active-stake checkpoint trace. Relocated from
     ///      `GuardianRegistry`.

@@ -568,7 +568,21 @@ contract Court is Ownable2Step, ICourt {
             // `openBadFaith` both refuse to open with `stakedWood` unset, so a
             // case referred in that state can never reach a vote and the weight
             // it would have subtracted is never read.
-            if (swood != address(0)) weight += IStakedWood(swood).getPastVotes(approver, snapshotTs);
+            // RAW OWN STAKE, not vote weight (review 🔴F17). `_participationFloor`
+            // subtracts this sum from `getPastTotalVotes`, which sums raw own
+            // stake and nothing else — delegation never enters it. `getPastVotes`
+            // is aged own stake PLUS k-capped delegated inbound, so at the
+            // default `delegatedWeightCapX = 4` one account's weight spans a 20x
+            // band around its own contribution to that total. Subtracting the
+            // second from the first is not a rounding difference but a different
+            // measure, and the delegated term is the one that deletes the floor:
+            // WOOD delegated to an accused guardian subtracts from the base
+            // while adding nothing to the total. That lever is rented rather
+            // than burned — the self-delegation ban only checks
+            // `delegate != msg.sender`, the WOOD is recoverable, and at most
+            // `maxDelegatedSlashBps` is ever at risk — so the accused could
+            // otherwise arrange their own zero floor.
+            if (swood != address(0)) weight += IStakedWood(swood).getPastStake(approver, snapshotTs);
         }
 
         c.accusedWeight = weight;
@@ -1016,7 +1030,15 @@ contract Court is Ownable2Step, ICourt {
     ///      demonstrably still exists, and answerable to no party's arithmetic.
     function _participationFloor(uint256 snapshotTs, uint256 accusedWeight) internal view returns (uint256) {
         uint256 total = IStakedWood(stakedWood).getPastTotalVotes(snapshotTs);
-        uint256 base = total >= accusedWeight ? total - accusedWeight : total;
+        // STRICTLY GREATER (review 🔴F17). `>=` guarded strict underflow only, so
+        // EQUALITY took the subtraction branch and produced `base == 0` — a zero
+        // floor, the exact outcome this fallback exists to prevent, sitting on
+        // the ALLOWED side of the guard. Now that the subtrahend is same-basis
+        // this should be unreachable (`sum of accused raw stake <= total` holds
+        // by construction: both traces are pushed in the same transaction at
+        // every mutation site), so it is belt-and-braces rather than
+        // load-bearing.
+        uint256 base = total > accusedWeight ? total - accusedWeight : total;
         return participationFloorBps * base / BPS_DENOMINATOR;
     }
 

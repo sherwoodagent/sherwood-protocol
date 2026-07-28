@@ -72,6 +72,29 @@ contract MockStakedWood is IStakedWood {
         _pastTotalVotes[timestamp] = v;
     }
 
+    /// @dev RAW own stake — the quantity `getPastTotalVotes` is literally the sum
+    ///      of. DEFAULTS to the `getPastVotes` value so every existing fixture
+    ///      behaves exactly as before; set it only to open the gap between the
+    ///      two measures, which is the subject of review 🔴F17.
+    ///
+    ///      NOTE what this mock has always allowed: `setPastVotes` and
+    ///      `setPastTotalVotes` are independent, so a fixture can pick
+    ///      per-account weights that sum comfortably below the total — an
+    ///      invariant the REAL `StakedWood` does not provide, because delegation
+    ///      enters `getPastVotes` and never enters `getPastTotalVotes`. That is
+    ///      why the suite stayed green over a floor that can reach zero.
+    mapping(address => mapping(uint256 => uint256)) internal _pastStake;
+    mapping(address => mapping(uint256 => bool)) internal _pastStakeSet;
+
+    function setPastStake(address guardian, uint256 timestamp, uint256 v) external {
+        _pastStake[guardian][timestamp] = v;
+        _pastStakeSet[guardian][timestamp] = true;
+    }
+
+    function getPastStake(address guardian, uint256 timestamp) external view returns (uint256) {
+        return _pastStakeSet[guardian][timestamp] ? _pastStake[guardian][timestamp] : _pastVotes[guardian][timestamp];
+    }
+
     function setPastTotalSupply(uint256 timestamp, uint256 v) external {
         _pastTotalSupply[timestamp] = v;
     }

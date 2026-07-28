@@ -115,9 +115,23 @@ interface IStakedWood {
     function getVotes(address account) external view returns (uint256);
 
     /// @notice Guardian's own + delegated vote weight at a past timestamp.
+    /// @dev    NOT a term of `getPastTotalVotes` — it is aged own stake plus
+    ///         k-capped delegated inbound, and delegation never enters the
+    ///         total. Correct for weighing a VOTE; wrong on either side of a
+    ///         subtraction against the total (review 🔴F17). Use `getPastStake`
+    ///         there.
     function getPastVotes(address guardian, uint256 timestamp) external view returns (uint256);
 
+    /// @notice A guardian's RAW votable own stake at a past timestamp — the same
+    ///         basis `getPastTotalVotes` sums, so the two are comparable and
+    ///         subtractable. This is the operand `Court._participationFloor`
+    ///         needs; `getPastVotes` there would let delegation drive the floor
+    ///         to zero.
+    function getPastStake(address guardian, uint256 timestamp) external view returns (uint256);
+
     /// @notice Total guardian vote weight (quorum denominator) at a past timestamp.
+    /// @dev    A sum of RAW own stake. Pair it with `getPastStake`, never with
+    ///         `getPastVotes`.
     function getPastTotalVotes(uint256 timestamp) external view returns (uint256);
 
     /// @notice Total system vote weight at a past timestamp — own-stake total
