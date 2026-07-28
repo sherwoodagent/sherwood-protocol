@@ -14,7 +14,27 @@ import {IStrategy} from "../interfaces/IStrategy.sol";
 ///         Fail-closed: any unknown kind / adapter revert / not-OK adapter /
 ///         over-cap result yields `(0, false)` so the consuming vault silently
 ///         falls back to the async (Lane B) settlement path. Phase 1 of the
-///         live-NAV redesign (PR #357) — no vault consumes this yet.
+///         live-NAV redesign (PR #357).
+///
+/// @dev    THE OUTPUT IS NOT NORMALIZED, and a consumer must not assume it is.
+///         Each adapter answers in ITS OWN numeraire at that token's decimals —
+///         `IPriceAdapter.value` promises only "the position's underlying
+///         units" — and `_priceOne`'s haircut is a bps ratio, so it PRESERVES
+///         whatever unit the adapter returned. Nothing here converts, and
+///         `valueStrategy` takes no vault or asset argument, so it could not
+///         check even if it wanted to.
+///
+///         `SyndicateVault._laneState` adds this straight into `totalAssets()`
+///         with no rescale, which makes "the adapter's numeraire equals
+///         `asset()` at `asset().decimals()`" an UNENFORCED PRECONDITION on the
+///         vault's share price. `AerodromeLPStrategy` upholds it by binding
+///         `ref` to `IERC4626(vault()).asset()` and failing closed otherwise;
+///         any new adapter or position kind MUST do the same.
+///
+///         A previous version of this note said "no vault consumes this yet".
+///         True when written, false now — `SyndicateVault` does. Removed rather
+///         than corrected in place, because a stale nothing-depends-on-this
+///         claim is exactly what gets a numeraire bug de-prioritised.
 contract PriceRouter is Initializable, OwnableUpgradeable, UUPSUpgradeable, IPriceRouter {
     uint16 internal constant MAX_HAIRCUT_BPS = 10_000;
 

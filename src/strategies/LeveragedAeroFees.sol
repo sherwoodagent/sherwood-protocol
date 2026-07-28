@@ -14,7 +14,14 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 ///         ## Decimal context
 ///         - `navPre`        USDC, 6 dp.
 ///         - `totalSupply`   vault shares, 12 dp (`_decimalsOffset() = 6` on USDC 6 dp).
-///         - `hwmPerShareX`  = `navPre × 1e18 / totalSupply` — dimensionless, 1e18-scaled.
+///         - `hwmPerShareX`  = `navPre × 1e18 / totalSupply` — ASSET PER SHARE, 1e18-scaled.
+///           NOT dimensionless, despite the ratio-like shape: the numerator is
+///           `{ASSET}` at the asset's own decimals and the denominator is
+///           `{SHARE}` at `2 × assetDecimals`, so the 1e18 is a scale factor and
+///           the unit survives. Practical consequence: a high-water mark is only
+///           comparable against another mark from the SAME vault. Two vaults
+///           with different asset decimals produce marks that look like plain
+///           numbers and are not on the same scale.
 ///         - Fee rates (`managementFeeBps`, `performanceFeeBps`) are bps; 1% = 100.
 ///
 ///         ## Ordering
