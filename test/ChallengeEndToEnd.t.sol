@@ -654,6 +654,13 @@ contract ChallengeEndToEndTest is Test {
         // of the pool, so it takes 100% of what is distributed. The burn is what
         // stops that funder from profitably being the challenger's own second
         // address.
+        //
+        // Collected rather than pushed — resolution records the entitlement and
+        // the funder calls for it, which is what removed the unbounded payout
+        // loop and let contribution standing open up.
+        vm.prank(g1);
+        game.claimContribution(cid);
+
         uint256 burned = (CHALLENGER_BOND * game.forfeitBurnBps()) / 10_000;
         assertEq(
             wood.balanceOf(g1),
