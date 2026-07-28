@@ -75,6 +75,19 @@ interface IChallengeGame {
     /// @param disputeTimeoutAtFiling The escalation clock this challenge
     ///        received, snapshotted for the same reason from the other side: a
     ///        live read let the owner extend an existing freeze 6x.
+    /// @param settleBurnBpsAtFiling The settle-path burn rate in force when this
+    ///        challenge was filed (review 🔵F15). Pinned for the same reason as
+    ///        the clocks above: read live, the owner could raise it after a
+    ///        filing and take up to half the refund of a challenge that turned
+    ///        out to be CORRECT. The earlier argument for leaving it live — that
+    ///        it "prices the refund rather than bounding a window the accused is
+    ///        relying on" — does not hold, because the challenger relied on it
+    ///        when it decided to file and has no way to withdraw afterwards.
+    /// @param forfeitBurnBpsAtFiling The fail-path burn rate in force at filing,
+    ///        pinned for the symmetric reason. Its victims are the accused who
+    ///        funded the counter-bond: they commit WOOD to a pool whose payout
+    ///        this rate scales, so a raise after they paid in shrinks what they
+    ///        collect for a defence that WON.
     struct Challenge {
         address governor;
         uint256 proposalId;
@@ -91,6 +104,8 @@ interface IChallengeGame {
         address vault;
         uint256 autoSlashDelayAtFiling;
         uint256 disputeTimeoutAtFiling;
+        uint256 settleBurnBpsAtFiling;
+        uint256 forfeitBurnBpsAtFiling;
     }
 
     // ── Errors ──
@@ -113,6 +128,18 @@ interface IChallengeGame {
     error NotAccusedApprover();
     error ZeroAddress();
     error InvalidParameter();
+    /// @dev No WOOD price is configured on the ledger, so a bond cannot be
+    ///      denominated at all. TRANSIENT and protocol-wide: nothing is
+    ///      challengeable until governance sets one. Split out from
+    ///      `InvalidParameter` because it shared that error with `BondTooSmall`,
+    ///      and the two call for opposite responses (review 🔵F14).
+    error WoodPriceUnset();
+    /// @dev The bond floored to zero, so the filing would have bought its freeze
+    ///      for nothing. PERMANENT and specific to this proposal: nobody can
+    ///      ever challenge it while that coverage and that WOOD price stand.
+    ///      Wants a `MIN_BOND` floor rather than a revert if it turns out to be
+    ///      reachable in practice; naming it is what makes that visible.
+    error BondTooSmall();
     /// @notice A counter-bond contribution that would move nothing — a zero
     ///         `amountWood`. The pool being already full cannot reach this: the
     ///         completing contribution flips the status to `Disputed`, so a later

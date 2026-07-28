@@ -639,13 +639,83 @@ contract ChallengeGameTest is Test {
 
     /// @notice Fail-closed on an unset WOOD price: an unpriceable bond is no
     ///         bond, and no bond is a free freeze.
+    /// @notice 🔵F14: the two fail-closed branches in `file` shared ONE opaque
+    ///         error, so "the protocol has no WOOD price" and "your bond rounded
+    ///         away" were indistinguishable from outside. They need completely
+    ///         different responses — wait for governance to set a price, versus
+    ///         this proposal can never be challenged by anyone.
     function test_file_revertsWhenWoodPriceUnset() public {
         ledger.setWoodUsdPrice(0);
         _setCoverage(PROPOSAL, 6_000e18, 4_000e18);
         _execute(PROPOSAL);
         vm.prank(challenger);
-        vm.expectRevert(IChallengeGame.InvalidParameter.selector);
+        vm.expectRevert(IChallengeGame.WoodPriceUnset.selector);
         game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.OutOfAdapterOutflow, ADAPTER, SELECTOR, EVIDENCE);
+    }
+
+    /// @notice The other branch, named separately. Reaching it takes dust
+    ///         coverage against an absurd WOOD price — the bond is 18-decimal
+    ///         USD scaled by an 8-decimal price, so truncation needs the product
+    ///         to floor below one wei — but the FAILURE MODE is the point: the
+    ///         proposal becomes permanently unchallengeable, and the old shared
+    ///         error gave a reader no way to tell that from a missing price.
+    function test_file_revertsWhenTheBondTruncatesToZero() public {
+        _setCoverage(PROPOSAL, 1, 0); // one wei of USD coverage
+        ledger.setWoodUsdPrice(type(uint128).max); // against an absurd WOOD price
+        _execute(PROPOSAL);
+        vm.prank(challenger);
+        vm.expectRevert(IChallengeGame.BondTooSmall.selector);
+        game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.OutOfAdapterOutflow, ADAPTER, SELECTOR, EVIDENCE);
+    }
+
+    /// @notice 🔵F15: THE BURN RATES ARE PINNED AT FILING, like both clocks.
+    ///
+    ///         `autoSlashDelayAtFiling` and `disputeTimeoutAtFiling` exist
+    ///         because reading a live parameter let the owner change the deal
+    ///         after the money was committed. The burn rates were left live on
+    ///         the argument that they "price the refund rather than bound a
+    ///         window the accused is relying on" — but the challenger relied on
+    ///         `settleBurnBps` when it decided to file, and it cannot withdraw.
+    ///         Raising 0 -> 5,000 mid-window takes half the refund of a filing
+    ///         that turned out to be correct.
+    function test_resolve_settleBurnIsPinnedAtFiling() public {
+        vm.prank(owner);
+        game.setSettleBurnBps(0); // filed under a full-refund regime
+        uint256 id = _fileStandard(PROPOSAL);
+        uint256 bond = game.challengeOf(id).bondWood;
+        uint256 before = wood.balanceOf(challenger);
+
+        vm.prank(owner);
+        game.setSettleBurnBps(5_000); // governance changes its mind mid-window
+
+        vm.warp(_filedAt(id) + game.autoSlashDelay());
+        game.resolve(id);
+
+        assertEq(wood.balanceOf(challenger) - before, bond, "refunded at the rate it filed under, not the new one");
+    }
+
+    /// @notice The same on the FAIL side, where the victims are the accused who
+    ///         funded the counter-bond. They committed WOOD to a pool whose
+    ///         payout `forfeitBurnBps` scales, so a raise after they paid in
+    ///         shrinks what they collect for a defence that WON.
+    function test_resolve_forfeitBurnIsPinnedAtFiling() public {
+        vm.prank(owner);
+        game.setForfeitBurnBps(0);
+        uint256 id = _fileStandard(PROPOSAL);
+        uint256 bond = game.challengeOf(id).bondWood;
+
+        vm.prank(guardianA);
+        game.dispute(id, type(uint256).max); // guardianA funds the whole defence
+        uint256 before = wood.balanceOf(guardianA);
+
+        vm.prank(owner);
+        game.setForfeitBurnBps(5_000);
+
+        vm.warp(_filedAt(id) + game.disputeTimeout());
+        game.resolve(id);
+
+        // Its stake back plus the WHOLE forfeited bond: zero burn, as filed.
+        assertEq(wood.balanceOf(guardianA) - before, bond + bond, "forfeit paid at the rate in force when it was filed");
     }
 
     // ── Parameters ──

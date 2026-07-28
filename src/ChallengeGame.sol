@@ -501,10 +501,17 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         // price and on a bond that floors to zero — an unpriced or free
         // challenge is a free freeze, which is precisely what the bond exists
         // to prevent.
+        // TWO DISTINCT FAILURES, NAMED SEPARATELY (review 🔵F14). They shared
+        // `InvalidParameter`, which made them indistinguishable to a caller —
+        // and they are opposites. An unset price is TRANSIENT and protocol-wide:
+        // wait for governance. A truncated bond is PERMANENT and specific to one
+        // proposal: nobody can ever challenge it while the coverage and the
+        // price stand, which is a fact worth surfacing rather than hiding behind
+        // a shared selector.
         uint256 priceX8 = exposureLedger.woodUsdPriceX8();
-        if (priceX8 == 0) revert InvalidParameter();
+        if (priceX8 == 0) revert WoodPriceUnset();
         uint256 bondWood = (((coverageUsd * challengerBondBps) / BPS_DENOMINATOR) * 1e8) / priceX8;
-        if (bondWood == 0) revert InvalidParameter();
+        if (bondWood == 0) revert BondTooSmall();
 
         challengeId = ++challengeCount;
         _challenges[challengeId] = Challenge({
@@ -529,7 +536,17 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             // given challenge actually got. Symmetrically it let the timeout be
             // raised against a live dispute, extending the freeze 6x.
             autoSlashDelayAtFiling: autoSlashDelay,
-            disputeTimeoutAtFiling: disputeTimeout
+            disputeTimeoutAtFiling: disputeTimeout,
+            // AND BOTH BURN RATES, for the same reason (review 🔵F15). The
+            // earlier argument for leaving these live — that they price a refund
+            // rather than bound a window somebody is relying on — does not hold:
+            // the challenger relied on `settleBurnBps` when it decided to file
+            // and cannot withdraw, and the accused rely on `forfeitBurnBps`
+            // when they decide to fund the counter-bond. A raise after either
+            // commitment takes up to half of what the winning side collects, on
+            // a challenge that was already correct.
+            settleBurnBpsAtFiling: settleBurnBps,
+            forfeitBurnBpsAtFiling: forfeitBurnBps
         });
         _lastChallenge[key] = challengeId;
         _liveByChallenger[challengerKey] = challengeId;
@@ -855,7 +872,7 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         if (escalated) {
             wood.safeTransfer(c.challenger, bond + pool);
         } else {
-            burned = (bond * settleBurnBps) / BPS_DENOMINATOR;
+            burned = (bond * c.settleBurnBpsAtFiling) / BPS_DENOMINATOR;
             if (burned != 0) {
                 wood.safeTransfer(BURN_ADDRESS, burned);
                 emit ChallengerBondBurned(challengeId, burned);
@@ -991,7 +1008,7 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         // Integer division makes `burnAmount <= bond`, so `payout` cannot
         // underflow, and a `forfeitBurnBps` of zero reproduces the pre-burn
         // behaviour to the wei.
-        uint256 burnAmount = (bond * forfeitBurnBps) / BPS_DENOMINATOR;
+        uint256 burnAmount = (bond * c.forfeitBurnBpsAtFiling) / BPS_DENOMINATOR;
         uint256 payout = bond - burnAmount;
         // Skipped when the parameter is zero: a zero-value transfer would only
         // emit a misleading `Transfer` to the dead address.
@@ -1198,9 +1215,16 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      settle path refunds in full — the pre-🟠F4 behaviour — so governance
     ///      can retire the burn without an upgrade if the off-chain bounty ends
     ///      up pricing filings adequately on its own.
-    /// @dev Applies to challenges settled AFTER the change: unlike the two
-    ///      clocks, this is not pinned at filing, because it prices the refund
-    ///      rather than bounding a window the accused is relying on.
+    /// @dev Applies to challenges FILED after the change, not to challenges
+    ///      settled after it (review 🔵F15). An earlier version of this note
+    ///      argued the opposite — that the rate need not be pinned because it
+    ///      "prices the refund rather than bounding a window the accused is
+    ///      relying on." That distinction does not survive contact with the
+    ///      filer: the challenger reads this rate when it decides whether the
+    ///      bond is worth posting, and once posted it cannot withdraw. Leaving
+    ///      it live let a raise take up to half the refund of a filing that had
+    ///      already turned out to be correct, which is the same retroactivity
+    ///      `autoSlashDelayAtFiling` exists to prevent.
     function setSettleBurnBps(uint256 newBps) external onlyOwner {
         if (newBps > MAX_SETTLE_BURN_BPS) revert InvalidParameter();
         emit SettleBurnBpsSet(settleBurnBps, newBps);
