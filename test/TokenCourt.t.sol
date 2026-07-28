@@ -346,4 +346,80 @@ contract TokenCourtTest is Test {
         assertEq(court.caseOfChallenge(CHALLENGE_ID), firstCase);
         assertEq(court.caseOfChallenge(CHALLENGE_ID + 1), secondCase);
     }
+
+    function _referredCase() internal returns (uint256 caseId) {
+        _disputedChallenge();
+        address[] memory a = new address[](1);
+        uint256[] memory cm = new uint256[](1);
+        a[0] = accusedG;
+        cm[0] = 100e18;
+        ledger.setApprovers(a, cm);
+        caseId = court.refer(CHALLENGE_ID);
+        uint256 snap = court.caseOf(caseId).snapshotTs;
+        swood.setPastVotes(voterA, snap, 300e18);
+        swood.setPastVotes(voterB, snap, 200e18);
+        swood.setPastTotalVotes(snap, 1_000e18);
+    }
+
+    function test_vote_tallies_agedWeight() public {
+        uint256 id = _referredCase();
+        vm.prank(voterA);
+        court.vote(id, true);
+        vm.prank(voterB);
+        court.vote(id, false);
+        ITokenCourt.Case memory c = court.caseOf(id);
+        assertEq(c.guiltyVotes, 300e18);
+        assertEq(c.notGuiltyVotes, 200e18);
+        assertEq(uint256(court.voteOf(id, voterA)), uint256(ITokenCourt.Ruling.Guilty));
+        assertEq(uint256(court.voteOf(id, voterB)), uint256(ITokenCourt.Ruling.NotGuilty));
+    }
+
+    function test_vote_emitsWeight() public {
+        uint256 id = _referredCase();
+        vm.expectEmit(true, true, false, true);
+        emit ITokenCourt.VoteCast(id, voterA, true, 300e18);
+        vm.prank(voterA);
+        court.vote(id, true);
+    }
+
+    function test_vote_guards() public {
+        uint256 id = _referredCase();
+
+        // Nonexistent case: phase None.
+        vm.prank(voterA);
+        vm.expectRevert(ITokenCourt.WrongPhase.selector);
+        court.vote(999, true);
+
+        vm.prank(voterA);
+        court.vote(id, true);
+        vm.prank(voterA);
+        vm.expectRevert(ITokenCourt.AlreadyVoted.selector);
+        court.vote(id, false);
+
+        vm.prank(accusedG);
+        vm.expectRevert(ITokenCourt.AccusedCannotVote.selector);
+        court.vote(id, false);
+
+        address dust = makeAddr("noWeight");
+        vm.prank(dust);
+        vm.expectRevert(ITokenCourt.NoVotingPower.selector);
+        court.vote(id, true);
+
+        vm.warp(vm.getBlockTimestamp() + 5 days);
+        vm.prank(voterB);
+        vm.expectRevert(ITokenCourt.WindowClosed.selector);
+        court.vote(id, false);
+    }
+
+    function test_vote_windowIsThePinnedOne() public {
+        // Owner shortening voteWindow after referral must NOT close a live case early.
+        uint256 id = _referredCase();
+        vm.prank(owner);
+        court.setVoteWindow(1 days);
+        vm.warp(vm.getBlockTimestamp() + 2 days); // past the NEW window, inside the pinned 5d
+        vm.prank(voterA);
+        court.vote(id, true); // must succeed
+        ITokenCourt.Case memory c = court.caseOf(id);
+        assertEq(c.guiltyVotes, 300e18);
+    }
 }
