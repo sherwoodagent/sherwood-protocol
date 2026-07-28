@@ -570,18 +570,25 @@ contract Court is Ownable2Step, ICourt {
             // it would have subtracted is never read.
             // RAW OWN STAKE, not vote weight (review 🔴F17). `_participationFloor`
             // subtracts this sum from `getPastTotalVotes`, which sums raw own
-            // stake and nothing else — delegation never enters it. `getPastVotes`
-            // is aged own stake PLUS k-capped delegated inbound, so at the
-            // default `delegatedWeightCapX = 4` one account's weight spans a 20x
-            // band around its own contribution to that total. Subtracting the
-            // second from the first is not a rounding difference but a different
-            // measure, and the delegated term is the one that deletes the floor:
-            // WOOD delegated to an accused guardian subtracts from the base
-            // while adding nothing to the total. That lever is rented rather
-            // than burned — the self-delegation ban only checks
-            // `delegate != msg.sender`, the WOOD is recoverable, and at most
-            // `maxDelegatedSlashBps` is ever at risk — so the accused could
-            // otherwise arrange their own zero floor.
+            // stake; `getPastVotes` applies `_ageFactorBps` on top. Two measures
+            // of the same WOOD, and subtracting one from the other is not a
+            // rounding difference.
+            //
+            // SEVERITY RE-GRADED after the DPoS-delegation removal (#29). The
+            // finding was raised against a delegated electorate, where
+            // `getPastVotes` added k-capped inbound and one account's weight
+            // spanned a 20x band around its own contribution to the total — so
+            // the accused could drive the floor to exactly zero, cheaply, by
+            // renting delegation to themselves. None of that exists now: aging
+            // only ever SHRINKS, so per-account weight is bounded above by raw
+            // stake, the accused sum can never exceed the total, and the zero
+            // floor is unreachable.
+            //
+            // What remains is one-directional and still worth fixing: an accused
+            // cohort that staked recently is aged down, so too LITTLE is
+            // subtracted, the base comes out too large and the floor too high —
+            // biasing toward "panel ruling stands", which the contract itself
+            // calls a harm. Same fix, smaller claim.
             if (swood != address(0)) weight += IStakedWood(swood).getPastStake(approver, snapshotTs);
         }
 
@@ -707,11 +714,12 @@ contract Court is Ownable2Step, ICourt {
 
     /// @inheritdoc ICourt
     /// @dev DO NOT RE-WEIGHT THE RESULT (D3). `getPastVotes` is documented by
-    ///      `IStakedWood` as "AGE-WEIGHTED own staked + delegated-inbound capped
-    ///      at `delegatedWeightCapX ×` aged own", which is precisely the
-    ///      pre-accumulation defence §3.5 asks for. A second age curve here
+    ///      `IStakedWood` as AGE-WEIGHTED own staked WOOD, which is precisely
+    ///      the pre-accumulation defence §3.5 asks for. A second age curve here
     ///      would duplicate the staking contract's and inevitably diverge from
-    ///      it.
+    ///      it. (It carried a k-capped delegated-inbound term until the DPoS
+    ///      removal; the aging half is what this argument rested on and it is
+    ///      unchanged.)
     /// @dev THE ZERO-WEIGHT REVERT IS THE FLASH-LOAN DEFENCE, and it is a
     ///      consequence of the snapshot rather than a check of its own. Weight
     ///      is read at `c.snapshotTs` — `executedAt - 1`, the instant BEFORE the

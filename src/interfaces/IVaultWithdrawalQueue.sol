@@ -35,8 +35,9 @@ interface IVaultWithdrawalQueue {
     ///      case without distributing any of it leaves WOOD idling in the queue
     ///      (PR #24 review 🔴N1).
     error NoRequestsSupplied();
-    /// @dev `claimCompensation` processed none of the supplied ids — every one
-    ///      was skipped as ineligible or already paid. Reverting (rather than
+    /// @dev `claimCompensation` paid nothing across the supplied ids — every
+    ///      one was skipped as ineligible or already paid, or every eligible
+    ///      share floored to zero (round-4 N-2). Reverting (rather than
     ///      letting a first call pull the case and park its proceeds) keeps the
     ///      "a pull distributes in the same call" invariant real (PR #24 review
     ///      F-D); the whole transaction rolls back, including the pull.

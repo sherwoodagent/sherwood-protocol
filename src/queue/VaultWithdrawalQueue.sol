@@ -276,9 +276,11 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
     ///        for the case reads the pin, never the escrow.
     ///      - A case must be distributed by the same call that pulls it, so
     ///        proceeds do not idle in the queue. Enforced by the
-    ///        `processed != 0` check at the end (`NoEligibleRequests`, review
-    ///        F-D) — the `NoRequestsSupplied` length check alone was not it,
-    ///        since a batch of all-skipped ids would pull and park.
+    ///        `paid != 0` check at the end (`NoEligibleRequests`, review F-D;
+    ///        tightened from `processed != 0` in round-4 N-2) — the
+    ///        `NoRequestsSupplied` length check alone was not it, since a
+    ///        batch of all-skipped ids would pull and park, and a `processed`
+    ///        gate still let an all-dust batch do the same through rounding.
     ///      - Payout destinations are the requests' own owners; the caller
     ///        chooses only WHICH requests get processed, never where funds go.
     ///      - `nonReentrant` (shared with `claim`/`cancel`) blocks the escrow's
@@ -377,12 +379,19 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
         // The length check above only proves ids were NAMED; with 🟡N7's
         // skip-don't-revert, one ineligible id could satisfy it, pull the
         // case's entire proceeds, and park them here — restoring the idle
-        // balance that was 🔴N1's precondition. Reverting when nothing was
-        // processed rolls the pull back too (the escrow case stays redeemable),
-        // so "a pull distributes in the same call" is enforced, not asserted.
-        // A keeper whose whole batch was front-run loses only gas: everything
-        // it named was already paid.
-        if (processed == 0) revert NoEligibleRequests();
+        // balance that was 🔴N1's precondition. The gate is on `paid`, not
+        // `processed` (review round-4 N-2): a batch whose every eligible id
+        // floors to a zero share would otherwise pull the case, mark the ids
+        // `_compClaimed`, move nothing, and not revert — the same park shape
+        // through arithmetic instead of eligibility. Reachable when share
+        // supply exceeds WOOD proceeds in wei (an 18-decimals-offset vault
+        // against a small recovery) with dust-sized requests. The cost is that
+        // a legitimately all-dust batch is unclaimable — which the rounding
+        // policy already strands by design. Reverting rolls the pull back too
+        // (the escrow case stays redeemable), so "a pull distributes in the
+        // same call" is enforced, not asserted. A keeper whose whole batch was
+        // front-run loses only gas: everything it named was already paid.
+        if (paid == 0) revert NoEligibleRequests();
     }
 
     /// @notice Pulled-case bookkeeping for (escrow, caseId): measured proceeds,

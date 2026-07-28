@@ -3380,22 +3380,27 @@ contract CourtTest is Test {
         );
     }
 
-    /// @notice 🔴F17b: THE SUBTRACTION MUST BE SAME-BASIS.
+    /// @notice 🟠F17b: THE SUBTRACTION MUST BE SAME-BASIS.
     ///
-    ///         `getPastTotalVotes` sums RAW OWN stake — delegation never enters
-    ///         it. `getPastVotes` is aged own stake PLUS k-capped delegated
-    ///         inbound, so with `delegatedWeightCapX = 4` one account's weight
-    ///         ranges over a 20x band around its own contribution to that total.
-    ///         Subtracting the second from the first is not a rounding
-    ///         difference but a different measure — and the delegated term is
-    ///         the one that deletes the floor, because WOOD delegated to an
-    ///         accused guardian subtracts from the base while adding nothing to
-    ///         the total.
+    ///         `getPastTotalVotes` sums RAW OWN stake. `getPastVotes` applies
+    ///         `_ageFactorBps` on top. Subtracting the second from the first is
+    ///         not a rounding difference but a different measure of the same
+    ///         WOOD, and nothing in the type system says so.
     ///
-    ///         The lever is rented, not burned: the self-delegation ban only
-    ///         checks `delegate != msg.sender`, the WOOD is recoverable, and at
-    ///         most `maxDelegatedSlashBps` of it is ever at risk — so the
-    ///         accused can arrange the zero floor themselves, cheaply.
+    ///         SEVERITY RE-GRADED after the DPoS-delegation removal (#29), and
+    ///         the mock still exercises the general case rather than the retired
+    ///         one. As raised, `getPastVotes` also carried k-capped delegated
+    ///         inbound: one account's weight ranged over a 20x band, and WOOD
+    ///         delegated to an accused guardian subtracted from the base while
+    ///         adding nothing to the total — so the accused could rent
+    ///         themselves a ZERO floor and overturn a conviction with dust.
+    ///         Gone. Aging only shrinks, so weight is bounded above by raw stake
+    ///         and the floor cannot reach zero.
+    ///
+    ///         What is left is one-directional: a freshly-staked accused cohort
+    ///         is aged down, too little is subtracted, and the floor comes out
+    ///         too HIGH — biasing toward "panel ruling stands", which the
+    ///         contract itself calls a harm. Same fix, smaller claim.
     function test_refer_accusedWeightUsesRawStakeNotVoteWeight() public {
         // Seeded BEFORE the referral, and NOT via `_accusedCase` — that helper
         // calls `_preSeedElectorate`, which would overwrite the whale's weight
