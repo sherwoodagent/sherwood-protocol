@@ -1,0 +1,245 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.28;
+
+import {IChallengeGame} from "./IChallengeGame.sol";
+
+/// @title  ITokenCourt
+/// @notice Single-layer WOOD-vote adjudication of disputed challenges
+///         (spec 2026-07-28-token-court-design.md). Replaces the two-layer
+///         panel court. HOLDS NO WOOD: no bonds, no custody, pure logic.
+interface ITokenCourt {
+    /// @notice A case's lifecycle. `None` is the zero value shared with "no
+    ///         case referred yet" (`caseOfChallenge == 0`); `Voting` is the
+    ///         one open window a case ever gets; `Resolved` is terminal —
+    ///         there is no re-opening, mirroring the game's own
+    ///         silence-is-final posture.
+    enum Phase {
+        None,
+        Voting,
+        Resolved
+    }
+
+    /// @notice The court's own record of `finalize`'s tally outcome. Carries
+    ///         the same three values as `IChallengeGame.Verdict` in the same
+    ///         order — kept as a distinct type rather than reused because the
+    ///         court's tally and the game's verdict are conceptually
+    ///         different things that happen to always agree; `finalize`
+    ///         converts one to the other explicitly rather than sharing a
+    ///         type across the trust boundary.
+    enum Ruling {
+        None,
+        Guilty,
+        NotGuilty
+    }
+
+    /// @notice Everything the court knows about one disputed challenge.
+    /// @param challengeId The `ChallengeGame` challenge this case adjudicates.
+    ///        One case per challenge — `caseOfChallenge` enforces it.
+    /// @param snapshotTs `executedAt - 1`, written ONCE in `refer` (D2) and
+    ///        never re-derived. Pinning it is what stops the owner moving a
+    ///        live case's electorate by re-pointing the governor or letting
+    ///        `executedAt` drift — see `IChallengeGame.executedAt`'s own
+    ///        rationale for the identical hazard.
+    /// @param referredAt The instant `refer` opened this case — the anchor
+    ///        the vote window counts from.
+    /// @param voteWindowAtReferral The court's `voteWindow` PINNED at
+    ///        referral. The owner cannot move a LIVE case's clock (the F5
+    ///        lesson: a live read let a prior design retroactively shrink or
+    ///        stretch a window a party was already relying on). Only cases
+    ///        referred after a `setVoteWindow` call see the new value.
+    /// @param accusedWeight The raw `getPastStake` sum of the accused set at
+    ///        `snapshotTs` — same basis as `guiltyVotes`/`notGuiltyVotes`
+    ///        (aged `getPastVotes`, F17) so the participation floor's
+    ///        subtraction never compares two different measures of the same
+    ///        WOOD.
+    /// @param guiltyVotes Aged vote weight cast for `Guilty`.
+    /// @param notGuiltyVotes Aged vote weight cast for `NotGuilty`.
+    /// @param phase The case's lifecycle position.
+    /// @param verdict The three-valued outcome `finalize` handed to
+    ///        `IChallengeGame.rule`. Zero (`Inconclusive`) until resolved,
+    ///        matching `Verdict`'s own harmless-default design.
+    /// @param finalizedAt The instant `finalize` closed this case, or zero
+    ///        while it is still `Voting`.
+    struct Case {
+        uint256 challengeId;
+        uint256 snapshotTs; // executedAt - 1, written once in refer (D2)
+        uint256 referredAt;
+        uint256 voteWindowAtReferral; // pinned: owner cannot move a live case's clock (F5)
+        uint256 accusedWeight; // raw getPastStake sum at snapshotTs (F17 same-basis)
+        uint256 guiltyVotes; // aged weight
+        uint256 notGuiltyVotes; // aged weight
+        Phase phase;
+        IChallengeGame.Verdict verdict;
+        uint256 finalizedAt;
+    }
+
+    /// @notice A wiring setter was handed the zero address.
+    error ZeroAddress();
+    /// @notice A bounded setter was handed a value outside its allowed range.
+    error InvalidParameter();
+    /// @notice `refer` called on a challenge that already has a case
+    ///         (`caseOfChallenge != 0`) — one case per challenge, enforced at
+    ///         the door rather than left to a downstream overwrite.
+    error AlreadyReferred();
+    /// @notice `refer` called on a challenge whose `IChallengeGame.Status` is
+    ///         not `Disputed` — there is nothing to adjudicate yet (still
+    ///         `Filed`) or nothing left to adjudicate (already terminal).
+    error ChallengeNotDisputed();
+    /// @notice `refer`'s clock check failed: the challenge's own timeout does
+    ///         not leave `voteWindow + FINALIZE_BUFFER` of room, so a vote
+    ///         opened now could never finish before the game's permissionless
+    ///         timeout resolves the challenge out from under it.
+    error InsufficientClock();
+    /// @notice A call landed on a case whose `Phase` does not permit it —
+    ///         voting or finalizing outside `Voting`, for instance.
+    error WrongPhase();
+    /// @notice `finalize` called before `referredAt + voteWindowAtReferral`
+    ///         has elapsed. With an open electorate there is no "everyone has
+    ///         voted" early-close condition — the window must run its course.
+    error WindowOpen();
+    /// @notice `vote` called after `referredAt + voteWindowAtReferral` has
+    ///         elapsed — the one window this case gets has already closed.
+    error WindowClosed();
+    /// @notice `vote` called a second time by the same address. One vote per
+    ///         voter, no re-weighting (D3): there is no path to change a cast
+    ///         vote, only to be refused a second one.
+    error AlreadyVoted();
+    /// @notice `vote` called by an address in the accused set. The accused
+    ///         cannot vote on their own verdict.
+    error AccusedCannotVote();
+    /// @notice `vote` called by an address whose `getPastVotes` at
+    ///         `snapshotTs` is zero — no aged weight, no ballot.
+    error NoVotingPower();
+
+    /// @notice A case opened. `snapshotTs` is logged here so indexers never
+    ///         need a second read to learn the electorate cutoff `refer`
+    ///         pinned.
+    event CaseReferred(
+        uint256 indexed caseId,
+        uint256 indexed challengeId,
+        address indexed governor,
+        uint256 proposalId,
+        uint256 snapshotTs
+    );
+    /// @notice The accused set `refer` recorded for this case, and the raw
+    ///         `accusedWeight` it summed to. `count` is the array length —
+    ///         logged rather than requiring an indexer to decode
+    ///         `_accused[caseId]`'s eventual length from other events.
+    event AccusedSetRecorded(uint256 indexed caseId, uint256 count, uint256 accusedWeight);
+    /// @notice One vote cast. `weight` is the aged `getPastVotes` amount this
+    ///         ballot carried, not a raw stake — the same number `finalize`
+    ///         sums into `guiltyVotes`/`notGuiltyVotes`.
+    event VoteCast(uint256 indexed caseId, address indexed voter, bool guilty, uint256 weight);
+    /// @notice A case resolved. `floor` is logged alongside the tally so an
+    ///         `Inconclusive` verdict is explainable from the log alone —
+    ///         without it, "turnout < floor" is unverifiable off-chain
+    ///         without re-deriving `_participationFloor` at `snapshotTs`.
+    event CaseFinalized(
+        uint256 indexed caseId,
+        IChallengeGame.Verdict verdict,
+        uint256 guiltyVotes,
+        uint256 notGuiltyVotes,
+        uint256 floor
+    );
+    /// @notice `rule` reverted: the challenge went terminal (timeout during the
+    ///         finalize buffer) before the verdict landed. The case still
+    ///         closes; with zero custody this is bookkeeping, not fund loss.
+    event ChallengeAlreadyTerminal(uint256 indexed caseId, uint256 indexed challengeId);
+    /// @notice The wired `ChallengeGame` changed (or was set for the first
+    ///         time, `oldGame == address(0)`).
+    event ChallengeGameSet(address indexed oldGame, address indexed newGame);
+    /// @notice The wired `StakedWood` electorate source changed (or was set
+    ///         for the first time, `oldStakedWood == address(0)`).
+    event StakedWoodSet(address indexed oldStakedWood, address indexed newStakedWood);
+    /// @notice The default vote window changed. Governs future referrals
+    ///         only — every case already `Voting` keeps the window it was
+    ///         referred under (`voteWindowAtReferral`).
+    event VoteWindowSet(uint256 oldWindow, uint256 newWindow);
+    /// @notice The participation floor (D6's anti-capture parameter) changed.
+    ///         Governs future finalizations only.
+    event ParticipationFloorBpsSet(uint256 oldBps, uint256 newBps);
+
+    /// @notice Ceiling on `setVoteWindow`'s argument. Bounds how long a
+    ///         disputed challenge's coverage can stay frozen awaiting a vote.
+    function MAX_VOTE_WINDOW() external view returns (uint256);
+    /// @notice Grace period after the vote window closes during which
+    ///         someone should call `finalize` before the challenge's own
+    ///         `disputeTimeout` can resolve it by timeout instead. Not
+    ///         enforced on-chain (the game's timeout is not gated on court
+    ///         state) — it is the margin `refer`'s clock check reserves.
+    function FINALIZE_BUFFER() external view returns (uint256);
+    /// @notice The wired `IChallengeGame` this court adjudicates for and
+    ///         reads challenge state from. Zero while unwired.
+    function challengeGame() external view returns (address);
+    /// @notice The wired `IStakedWood` electorate source (`getPastVotes`,
+    ///         `getPastStake`, `getPastTotalVotes`). Zero while unwired.
+    function stakedWood() external view returns (address);
+    /// @notice The vote window newly referred cases receive. Bounded by
+    ///         `MAX_VOTE_WINDOW`; a live case keeps the window it was
+    ///         referred under regardless of later changes here.
+    function voteWindow() external view returns (uint256);
+    /// @notice The anti-capture participation floor (D6), in bps of
+    ///         `total - accusedWeight` at `snapshotTs`. Turnout below this
+    ///         floor resolves `Inconclusive` rather than on the raw tally, so
+    ///         a thin, rented-stake vote cannot convict or acquit alone.
+    function participationFloorBps() external view returns (uint256);
+    /// @notice Count of cases ever referred. Case ids are 1-indexed
+    ///         (`caseOfChallenge == 0` means "no case").
+    function caseCount() external view returns (uint256);
+    /// @notice The case id referred for `challengeId`, or zero if none has
+    ///         been.
+    function caseOfChallenge(uint256 challengeId) external view returns (uint256);
+    /// @notice Full state of one case.
+    function caseOf(uint256 caseId) external view returns (Case memory);
+    /// @notice How `voter` ruled on `caseId`, or `Ruling.None` if they have
+    ///         not voted.
+    function voteOf(uint256 caseId, address voter) external view returns (Ruling);
+    /// @notice Whether `account` is in `caseId`'s accused set — the set
+    ///         `vote` bars from casting a ballot.
+    function isAccused(uint256 caseId, address account) external view returns (bool);
+    /// @notice The accused set `refer` recorded for `caseId`, in the order it
+    ///         was recorded.
+    function accusedOf(uint256 caseId) external view returns (address[] memory);
+
+    /// @notice Open a case for a disputed challenge. Permissionless and free
+    ///         — the entry point both the game's auto-referral and any
+    ///         manual fallback call.
+    /// @dev    Requires `challengeGame`/`stakedWood` wired, no existing case
+    ///         for this challenge, the challenge status `Disputed`, and the
+    ///         clock check (`filedAt + disputeTimeoutAtFiling - now >=
+    ///         voteWindow + FINALIZE_BUFFER`) — a vote that could not finish
+    ///         before the game's own timeout never opens.
+    /// @return caseId The new case's id.
+    function refer(uint256 challengeId) external returns (uint256 caseId);
+    /// @notice Cast the one vote this address gets on `caseId`.
+    /// @dev    Weight is `getPastVotes(msg.sender, case.snapshotTs)` — aged,
+    ///         snapshot-fixed. Reverts outside the open window, for a second
+    ///         vote, for an accused address, or for zero weight.
+    function vote(uint256 caseId, bool guilty) external;
+    /// @notice Close the vote window and adjudicate `caseId`.
+    /// @dev    Requires the window to have elapsed. `Inconclusive` when
+    ///         turnout is zero or below the participation floor; otherwise
+    ///         `Guilty` on a strict majority, `NotGuilty` on a tie or
+    ///         majority the other way. Writes the verdict before calling
+    ///         `IChallengeGame.rule` and tolerates that call reverting
+    ///         (`ChallengeAlreadyTerminal`) — the court holds no WOOD, so a
+    ///         missed `rule` is bookkeeping, not stranded funds.
+    function finalize(uint256 caseId) external;
+
+    /// @notice Wire (or re-wire) the challenge game this court adjudicates
+    ///         for. The zero address is refused — an unwired court can
+    ///         `refer` nothing.
+    function setChallengeGame(address newGame) external;
+    /// @notice Wire (or re-wire) the electorate source. The zero address is
+    ///         refused — an unwired court has no vote weight to read.
+    function setStakedWood(address newStakedWood) external;
+    /// @notice Set the vote window newly referred cases receive. Bounded to
+    ///         `(0, MAX_VOTE_WINDOW]`; zero would open a case that could
+    ///         never be voted on. Governs future referrals only — see
+    ///         `voteWindowAtReferral`.
+    function setVoteWindow(uint256 newWindow) external;
+    /// @notice Set the anti-capture participation floor (D6). Bounded to
+    ///         `(0, 10_000]`; zero would let any nonzero turnout, however
+    ///         thin, reach a verdict on the merits.
+    function setParticipationFloorBps(uint256 newBps) external;
+}
