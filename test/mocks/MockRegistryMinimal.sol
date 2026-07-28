@@ -172,8 +172,18 @@ contract MockRegistryMinimal is IGuardianRegistry {
         return ReviewOutcome.Cleared;
     }
 
+    /// @dev Modeled rather than reverting, because this mock IS the case
+    ///      `SyndicateFactory.setGuardianRegistry` calls a "stateless beta stub"
+    ///      (Sherlock run #1 #28): that check probes `factory()` and accepts
+    ///      either this factory's own address (alignment) or `address(0)` (no
+    ///      factory binding), rejecting anything else — a revert included. This
+    ///      mock has no factory binding, so `address(0)` is the honest answer;
+    ///      reverting made the stub unswappable and failed a check it is meant
+    ///      to pass. Tests needing an ALIGNED registry must use a real
+    ///      `GuardianRegistry` proxy, which stores the factory it was
+    ///      initialized with.
     function factory() external pure returns (address) {
-        revert NotImplemented();
+        return address(0);
     }
 
     function swood() external pure returns (IStakedWood) {

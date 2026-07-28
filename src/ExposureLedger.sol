@@ -4,13 +4,11 @@ pragma solidity 0.8.28;
 import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {IExposureLedger} from "./interfaces/IExposureLedger.sol";
 
-/// @dev Narrow sWOOD read surface (own stake, inbound delegation, delegated
-///      slash cap, cooldown). Mirrors the IGovernorMinimal pattern in
-///      GuardianRegistry — the ledger does not import the full IStakedWood ABI.
+/// @dev Narrow sWOOD read surface (own stake, cooldown). Mirrors the
+///      IGovernorMinimal pattern in GuardianRegistry — the ledger does not
+///      import the full IStakedWood ABI.
 interface ISwoodMinimal {
     function guardianStake(address guardian) external view returns (uint256);
-    function delegatedInbound(address delegate) external view returns (uint256);
-    function maxDelegatedSlashBps() external view returns (uint256);
     function coolDownPeriod() external view returns (uint256);
 }
 
@@ -57,10 +55,9 @@ interface IRegistryApproversMinimal {
  *
  *         `slashableBond(g)` (spec §3.3, precision definition):
  *             ownStake(g) * priceHaircut
- *           + delegatedInbound(g) * maxDelegatedSlashBps/10_000 * priceHaircut
- *         Delegated stake counts ONLY at the delegated-slash cap — a delegated
- *         pool cannot be slashed 100%; counting full vote weight would violate
- *         the coalition inequality at the accounting layer.
+ *         (The delegated-inbound term was removed with the DPoS-delegation
+ *         postponement — the guardian's own bond is the only slashable
+ *         capital.)
  *
  *         Exposure is EPOCH-BUCKETED (spec §3.4a): an approval consumes the
  *         current epoch's bucket; open exposure = the sum of all buckets young
@@ -306,7 +303,7 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
 
     /// @inheritdoc IExposureLedger
     function slashableBondUsd(address guardian) public view returns (uint256) {
-        return _slashableBondUsd(guardian, swood.maxDelegatedSlashBps(), woodPriceX8());
+        return _slashableBondUsd(guardian, woodPriceX8());
     }
 
     /// @notice The WOOD/USD price every bond is valued at, 8 decimals.
@@ -372,18 +369,11 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         return (priceX8 * woodHaircutBps) / BPS_DENOMINATOR;
     }
 
-    /// @dev `slashableBondUsd` with the two loop-invariant inputs passed in, so
-    ///      a multi-approver quorum reads them once instead of once per
-    ///      approver (review finding M-4).
-    function _slashableBondUsd(address guardian, uint256 maxDelegatedSlashBps_, uint256 priceX8)
-        internal
-        view
-        returns (uint256)
-    {
-        uint256 own = swood.guardianStake(guardian);
-        uint256 inbound = swood.delegatedInbound(guardian);
-        uint256 slashableWood = own + (inbound * maxDelegatedSlashBps_) / BPS_DENOMINATOR;
-        return (slashableWood * priceX8) / 1e8;
+    /// @dev `slashableBondUsd` with the loop-invariant price passed in, so a
+    ///      multi-approver quorum reads it once instead of once per approver
+    ///      (review finding M-4).
+    function _slashableBondUsd(address guardian, uint256 priceX8) internal view returns (uint256) {
+        return (swood.guardianStake(guardian) * priceX8) / 1e8;
     }
 
     // ── Owner setters ──
@@ -1006,16 +996,20 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      TAKE is `Σ min(live_i · maxSlashBps/10_000, allocated_i)`, because
     ///      `slashToEscrow` clamps every rate to the severity ceiling. So an
     ///      allocation that runs to the top of a bond is short by
-    ///      `1 - maxSlashBps/10_000` of itself: 20% at the shipped 8,000, 50%
-    ///      at 5,000. Worked case — coverage set to exactly the joint slashable
+    ///      `1 - maxSlashBps/10_000` of itself: 20% at the fixture's 8,000,
+    ///      50% at 5,000 (deploy scripts ship 10,000, where the clamp never
+    ///      binds — see spec §3.8). Worked case — coverage set to exactly the joint slashable
     ///      bond ($2,000 across two $1,000 own-stake bonds): this gate PASSES,
     ///      both derived rates are a correct 10,000 bps, and recovery is
     ///      $1,600 against a $2,000 loss (80%).
     ///
     ///      This is a hole in FRONT of the residual, not behind it — distinct
     ///      from the "bond shrank since the vote" case `slashBpsFor` documents
-    ///      as unavoidable. It is left open here deliberately: closing it is a
-    ///      change to the coverage GATE (either require
+    ///      as unavoidable. It is an UNENFORCED RUNTIME INVARIANT (spec §3.8):
+    ///      nothing here or in the deploy pre-flight keeps `maxSlashBps` at a
+    ///      value where the clamp never binds, so the gap is real the moment
+    ///      governance lowers the ceiling. Closing it is a change to the
+    ///      coverage GATE (either require
     ///      `Σ min(live_i · maxSlashBps/10_000, reserved_i) >= needUsd`, or
     ///      restate spec §2's inequality as
     ///      `recovery >= loss · maxSlashBps/10_000`), and that belongs in its
@@ -1034,9 +1028,8 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         uint256 n = approvers.length;
         if (n == 0) revert InsufficientApproveCoverage();
 
-        // Hoisted: both are loop-invariant, and `slashableBondUsd` would
-        // otherwise re-read them once per approver (review finding M-4).
-        uint256 bps = swood.maxDelegatedSlashBps();
+        // Hoisted: loop-invariant — `slashableBondUsd` would otherwise
+        // re-read it once per approver (review finding M-4).
         uint256 priceX8 = woodPriceX8();
 
         // Summed over RESERVATIONS, not allocations. The question here is
@@ -1050,7 +1043,7 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
             address g = approvers[i];
             uint256 reserved = _recorded[key][g].usd;
             if (reserved == 0) continue; // released via a vote change
-            uint256 live = _slashableBondUsd(g, bps, priceX8);
+            uint256 live = _slashableBondUsd(g, priceX8);
             haveUsd += live < reserved ? live : reserved;
             if (haveUsd >= needUsd) return; // early exit
         }
@@ -1061,12 +1054,16 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
 
     /// @inheritdoc IExposureLedger
     /// @dev The bridge between what a guardian UNDERWROTE and what the verdict
-    ///      path can actually take. `slashToEscrow` speaks in bps of stake; the
-    ///      ledger books liability in USD. Dividing one USD quantity by the
-    ///      other cancels the unit DIMENSIONALLY — but not the price
-    ///      sensitivity, and an earlier version of this comment claimed the
-    ///      conversion "needs no price read of its own" (PR #24 review 🟡N5).
-    ///      It reads two. Both operands are priced:
+    ///      path can actually take — though NOT an exact one: this reads the
+    ///      LIVE bond while `_slashOne` slashes `min(checkpointAt(openedAt),
+    ///      live)`, so a top-up made after review-open inflates the booked
+    ///      coverage with capital a verdict anchored at `openedAt` cannot reach
+    ///      (PR #29 review 🟡3; tracked as a follow-up). `slashToEscrow` speaks
+    ///      in bps of stake; the ledger books liability in USD. Dividing one
+    ///      USD quantity by the other cancels the unit DIMENSIONALLY — but not
+    ///      the price sensitivity, and an earlier version of this comment
+    ///      claimed the conversion "needs no price read of its own" (PR #24
+    ///      review 🟡N5). It reads two. Both operands are priced:
     ///        - the numerator (the allocation) traces back to `coverageUsd`,
     ///          which reads a Chainlink feed behind a `StalePrice` gate — so a
     ///          stale asset feed makes a conviction UNPRICEABLE and this view
@@ -1119,8 +1116,7 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         approvers = new address[](n);
         bps = new uint256[](n);
 
-        // Hoisted for the reason `requireApproveQuorum` hoists them (M-4).
-        uint256 maxDelegated = swood.maxDelegatedSlashBps();
+        // Hoisted for the reason `requireApproveQuorum` hoists it (M-4).
         uint256 priceX8 = woodPriceX8();
 
         // Prices against the ALLOCATION, never the reservation. `recordApproval`
@@ -1142,7 +1138,7 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         // shrinking everyone else's rate — and this is the slash path, so the
         // shortfall would be unrecoverable rather than merely mis-stated. The
         // two must agree about the same guardian.
-        uint256 effectiveTotal = _effectiveTotal(key, maxDelegated, priceX8);
+        uint256 effectiveTotal = _effectiveTotal(key, priceX8);
         if (effectiveTotal == 0) return (approvers, bps);
 
         for (uint256 i = 0; i < n; i++) {
@@ -1150,7 +1146,7 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
             approvers[i] = g;
             uint256 reserved = _recorded[key][g].usd;
             if (reserved == 0) continue; // released -> owes nothing
-            uint256 liveG = _slashableBondUsd(g, maxDelegated, priceX8);
+            uint256 liveG = _slashableBondUsd(g, priceX8);
             uint256 mine = liveG < reserved ? liveG : reserved;
             uint256 owed = _allocate(mine, effectiveTotal, needUsd);
             if (owed == 0) continue; // scaled to dust -> nothing to collect
@@ -1205,12 +1201,11 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         ILedgerGovernorMinimal gov = ILedgerGovernorMinimal(governor);
         address asset = IVaultAssetMinimal(gov.getProposalView(proposalId).vault).asset();
         uint256 needUsd = coverageUsd(asset, gov.getRequiredCoverage(proposalId));
-        uint256 bps = swood.maxDelegatedSlashBps();
         uint256 priceX8 = woodPriceX8();
-        uint256 live = _slashableBondUsd(guardian, bps, priceX8);
+        uint256 live = _slashableBondUsd(guardian, priceX8);
         uint256 mine = live < reserved ? live : reserved;
         if (mine == 0) return 0;
-        return _allocate(mine, _effectiveTotal(key, bps, priceX8), needUsd);
+        return _allocate(mine, _effectiveTotal(key, priceX8), needUsd);
     }
 
     /// @dev Sum of `min(reserved, live bond)` across a proposal's approvers —
@@ -1224,17 +1219,13 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      rounding. `requireApproveQuorum` already discounts by `min(live,
     ///      reserved)`; this is the same discount applied to the split, so the
     ///      two stop disagreeing about the same guardian.
-    function _effectiveTotal(bytes32 key, uint256 maxDelegatedSlashBps_, uint256 priceX8)
-        internal
-        view
-        returns (uint256 total)
-    {
+    function _effectiveTotal(bytes32 key, uint256 priceX8) internal view returns (uint256 total) {
         address[] storage listed = _approversOf[key];
         uint256 n = listed.length;
         for (uint256 i = 0; i < n; i++) {
             uint256 reserved = _recorded[key][listed[i]].usd;
             if (reserved == 0) continue;
-            uint256 live = _slashableBondUsd(listed[i], maxDelegatedSlashBps_, priceX8);
+            uint256 live = _slashableBondUsd(listed[i], priceX8);
             total += live < reserved ? live : reserved;
         }
     }
@@ -1327,9 +1318,8 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         address firstHolder;
         // Same effective basis as `allocatedUsd` (review n1): a guardian whose
         // bond has gone must not dilute the survivors' shares.
-        uint256 maxDelegated = swood.maxDelegatedSlashBps();
         uint256 priceX8 = woodPriceX8();
-        uint256 effectiveTotal = _effectiveTotal(key, maxDelegated, priceX8);
+        uint256 effectiveTotal = _effectiveTotal(key, priceX8);
         if (effectiveTotal == 0) {
             _settled[key] = true;
             return;
@@ -1341,7 +1331,7 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
             if (r.usd == 0) continue;
             if (firstHolder == address(0)) firstHolder = g;
 
-            uint256 liveG = _slashableBondUsd(g, maxDelegated, priceX8);
+            uint256 liveG = _slashableBondUsd(g, priceX8);
             uint256 mine = liveG < uint256(r.usd) ? liveG : uint256(r.usd);
             uint256 alloc = _allocate(mine, effectiveTotal, needUsd);
             assigned += alloc;

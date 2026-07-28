@@ -200,13 +200,16 @@ Guardian-level invariant, checked at `voteOnProposal` (approve side):
 
   ```
   slashableBond(g) = ownStake(g) · priceHaircut
-                   + delegatedInbound(g) · (maxDelegatedSlashBps / 10_000) · priceHaircut
   ```
 
-  Delegated stake is counted **only at the `maxDelegatedSlashBps` haircut**
-  (`StakedWood.sol:664`; a delegated pool cannot be slashed 100% — first-loss
-  spills onto own stake). Counting full vote weight (own + full delegations)
-  would violate the inequality at the accounting layer before any attack.
+  **DPoS-delegation postponement (2026-07-26):** the delegated-inbound term
+  (`delegatedInbound(g) · maxDelegatedSlashBps/10_000 · priceHaircut`) was
+  removed together with the whole `StakedWoodDelegation` layer — share pools,
+  commission, the unbonding escrow, delegated slash legs and the k-capped
+  delegated vote weight. The guardian's own bond is the only slashable
+  capital and the only vote weight. Re-introducing delegation is a fresh
+  design exercise (it must re-answer slash caps, first-loss spill, unbonding
+  evasion and quorum accounting), not a revert of that commit.
   `priceHaircut` (§5) converts WOOD to a conservative dollar value robust to a
   WOOD drawdown. (v1 bonds are WOOD-only; multi-collateral legs at their own
   haircuts are a v2 extension — §3.7.)
@@ -418,9 +421,9 @@ adjudication (weeks, contested cases only).
     thin appeal.
 
 - Guilty verdict → slash via the authorized-slasher entrypoint (§4) at
-  `maxSlashBps` (100%; ground truth established, no severity ramp),
-  delegated-slash caps and first-loss spill preserved, proceeds → **compensation
-  escrow** (§3.8), never the live NAV.
+  `maxSlashBps` (100%; ground truth established, no severity ramp), proceeds →
+  **compensation escrow** (§3.8), never the live NAV. (Delegated-slash caps and
+  first-loss spill were removed with the DPoS-delegation postponement.)
 
 ### 3.8 Compensation escrow (F1 — the regression fix)
 

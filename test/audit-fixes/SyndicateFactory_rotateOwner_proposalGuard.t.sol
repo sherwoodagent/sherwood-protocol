@@ -87,10 +87,8 @@ contract SyndicateFactory_rotateOwner_proposalGuard is Test {
                     minOwnerStake: MIN_OWNER_STAKE,
                     minSlashBps: 1000,
                     maxSlashBps: 9999,
-                    maxDelegatedSlashBps: 2000,
                     ageFloorBps: 2500,
-                    maturationPeriod: 30 days,
-                    delegatedWeightCapX: 4
+                    maturationPeriod: 30 days
                 }))
         );
         swood = StakedWood(address(new ERC1967Proxy(address(swoodImpl), swoodInit)));

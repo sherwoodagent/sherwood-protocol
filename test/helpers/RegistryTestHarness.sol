@@ -50,10 +50,8 @@ abstract contract RegistryTestHarness is Test {
                     minOwnerStake: 10_000e18,
                     minSlashBps: 1000,
                     maxSlashBps: 9999,
-                    maxDelegatedSlashBps: 2000,
                     ageFloorBps: 2500,
-                    maturationPeriod: 30 days,
-                    delegatedWeightCapX: 4
+                    maturationPeriod: 30 days
                 }))
         );
         swood = StakedWood(address(new ERC1967Proxy(address(swoodImpl), swoodInit)));
@@ -96,23 +94,6 @@ abstract contract RegistryTestHarness is Test {
         vm.startPrank(g);
         wood.approve(address(swood), type(uint256).max);
         swood.stakeAsGuardian(amount, agentId);
-        vm.stopPrank();
-    }
-
-    /// @dev Owner-enables DPoS delegation on sWOOD. `delegationEnabled` defaults
-    ///      false at deploy; tests that exercise `delegateStake` must flip it.
-    function _enableDelegation() internal {
-        vm.prank(regOwner);
-        swood.setDelegationEnabled(true);
-    }
-
-    /// @dev Mints WOOD to `delegator`, approves sWOOD, and delegates `amount`
-    ///      to `delegate`. Requires `_enableDelegation` to have been called.
-    function _delegate(address delegator, address delegate, uint256 amount) internal {
-        wood.mint(delegator, amount);
-        vm.startPrank(delegator);
-        wood.approve(address(swood), type(uint256).max);
-        swood.delegateStake(delegate, amount);
         vm.stopPrank();
     }
 }

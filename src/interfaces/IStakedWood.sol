@@ -3,13 +3,13 @@ pragma solidity 0.8.28;
 
 /// @title IStakedWood
 /// @notice Interface for the StakedWood (sWOOD) contract — the sole WOOD-token
-///         custodian. sWOOD absorbs guardian staking, DPoS delegation, owner
+///         custodian. sWOOD absorbs guardian staking, owner
 ///         bonds, vote checkpoints, and slashing, all of which previously
 ///         lived in `GuardianRegistry`. The slimmed `GuardianRegistry`,
 ///         `SyndicateGovernor`, and `SyndicateFactory` call sWOOD through
 ///         this interface.
 /// @dev See `docs/superpowers/specs/2026-05-21-swood-staking-split-design.md`.
-///      Staking/delegation/owner-bond signatures are carried verbatim from the
+///      Staking/owner-bond signatures are carried verbatim from the
 ///      pre-split `IGuardianRegistry`. Checkpoint reads are timestamp-keyed
 ///      (EIP-6372 timestamp-mode clock).
 interface IStakedWood {
@@ -93,59 +93,27 @@ interface IStakedWood {
     ///         parameter is retained for forward-compatibility.
     function requiredOwnerBond(address vault) external view returns (uint256);
 
-    // ── Delegation ──
-    function delegateStake(address delegate, uint256 amount) external;
-    function requestUnstakeDelegation(address delegate) external;
-    function cancelUnstakeDelegation(address delegate) external;
-    function claimUnstakeDelegation(address delegate) external;
-    function setCommission(uint256 newBps) external;
-
     // ── Snapshot-compatible vote-read surface (timestamp-keyed) ──
     //
     // `getVotes` / `getPastVotes` / `getPastTotalSupply` form the read surface
     // Snapshot's `erc20-votes` strategy consumes. sWOOD intentionally does NOT
     // implement the full OZ `IVotes` (no `delegate` / `delegates` /
-    // `delegateBySig`) — sWOOD delegation is the custodial DPoS mechanism, a
-    // different concept. Vote weight = AGE-WEIGHTED own staked +
-    // delegated-inbound capped at `delegatedWeightCapX ×` aged own.
+    // `delegateBySig`). Vote weight = AGE-WEIGHTED own staked WOOD.
+    // (DPoS delegation was removed/postponed — no delegated component.)
 
     /// @notice An account's CURRENT vote weight: age-weighted own votable
-    ///         stake + k-capped delegated inbound. Live counterpart of
-    ///         `getPastVotes`.
+    ///         stake. Live counterpart of `getPastVotes`.
     function getVotes(address account) external view returns (uint256);
 
-    /// @notice Guardian's own + delegated vote weight at a past timestamp.
+    /// @notice Guardian's age-weighted own vote weight at a past timestamp.
     function getPastVotes(address guardian, uint256 timestamp) external view returns (uint256);
 
     /// @notice Total guardian vote weight (quorum denominator) at a past timestamp.
     function getPastTotalVotes(uint256 timestamp) external view returns (uint256);
 
-    /// @notice Total system vote weight at a past timestamp — own-stake total
-    ///         plus delegated total. Snapshot quorum/total denominator.
+    /// @notice Total system vote weight at a past timestamp — the raw own-stake
+    ///         total. Snapshot quorum/total denominator.
     function getPastTotalSupply(uint256 timestamp) external view returns (uint256);
-
-    /// @notice Total delegated stake at a past timestamp — `totalDelegatedStake`
-    ///         frozen against the global delegation history checkpoint. Used
-    ///         by `GuardianRegistry.openReview` so the quorum denominator is
-    ///         read at the same `t-1` anchor as the per-voter weight lookups
-    ///         (closes Sherlock #35 / Run-1 #18 timestamp asymmetry).
-    function getPastTotalDelegated(uint256 timestamp) external view returns (uint256);
-
-    /// @notice Total ACTIVE-ONLY delegated stake at a past timestamp — sum of
-    ///         `poolTokens[g]` over guardians g that were active at `timestamp`.
-    ///         Used by `GuardianRegistry.openReview` to exclude dead-weight
-    ///         delegations to inactive guardians from the quorum denominator
-    ///         (Sherlock #39 / Run-1 #22).
-    function getPastTotalActiveDelegated(uint256 timestamp) external view returns (uint256);
-
-    /// @notice A delegate's DPoS commission rate (bps) frozen at a past timestamp.
-    function getPastCommission(address delegate, uint256 timestamp) external view returns (uint256);
-
-    /// @notice A delegator's stake delegated to `delegate` at a past timestamp.
-    function getPastDelegation(address delegator, address delegate, uint256 timestamp) external view returns (uint256);
-
-    /// @notice A delegate's total inbound delegated WOOD at a past timestamp.
-    function getPastDelegatedInbound(address delegate, uint256 timestamp) external view returns (uint256);
 
     // ── Live reads ──
     /// @notice The WOOD ERC20 token sWOOD custodies. The registry reads this
@@ -155,10 +123,6 @@ interface IStakedWood {
     function guardianStake(address guardian) external view returns (uint256);
     function ownerStake(address vault) external view returns (uint256);
     function totalGuardianStake() external view returns (uint256);
-    function totalDelegatedStake() external view returns (uint256);
-    function delegationOf(address delegator, address delegate) external view returns (uint256);
-    function delegatedInbound(address delegate) external view returns (uint256);
-    function commissionOf(address delegate) external view returns (uint256);
     function preparedStakeOf(address owner) external view returns (uint256);
     function canCreateVault(address owner) external view returns (bool);
 
@@ -175,18 +139,11 @@ interface IStakedWood {
 
     // ── Registry-only mutations ──
     /// @notice Slash `approvers` for a blocked proposal. Burns `slashBps` of
-    ///         each approver's own stake plus `min(slashBps,
-    ///         maxDelegatedSlashBps)` of their delegated pools (pro-rata via
-    ///         the share model); the uncovered delegated remainder spills onto
-    ///         the approver's own remaining stake (first-loss bond, spec
-    ///         2026-07-19 Part A). Registry-only.
+    ///         each approver's own stake. Registry-only.
     /// @param reviewKey  Composite review key keccak256(abi.encode(governor, proposalId)) whose approvers are slashed.
     /// @param openedAt   The review's open timestamp. `_slashOne` sizes each
-    ///                   approver's own slash off their raw own-stake
-    ///                   checkpoint at this instant and the delegated legs off
-    ///                   `getPastDelegatedInbound(approver, openedAt)` — two
-    ///                   disjoint at-open snapshots (Sherlock run #3 #6: no
-    ///                   double-slash of the delegated contribution).
+    ///                   approver's slash off their raw own-stake checkpoint
+    ///                   at this instant.
     /// @param approvers  Plain `address[]` of approver addresses to slash.
     /// @param slashBps   Slash fraction in basis points.
     function slashGuardians(bytes32 reviewKey, uint256 openedAt, address[] calldata approvers, uint256 slashBps)
@@ -241,7 +198,6 @@ interface IStakedWood {
     function setMinGuardianStake(uint256 newMin) external;
     function setMinOwnerStake(uint256 newMin) external;
     function setCooldownPeriod(uint256 newPeriod) external;
-    function setDelegationEnabled(bool enabled) external;
     function setMinSlashBps(uint256 newBps) external;
     function setMaxSlashBps(uint256 newBps) external;
 }
