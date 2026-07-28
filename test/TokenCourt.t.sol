@@ -5,12 +5,15 @@ import {Test} from "forge-std/Test.sol";
 import {TokenCourt} from "../src/TokenCourt.sol";
 import {ITokenCourt} from "../src/interfaces/ITokenCourt.sol";
 import {IChallengeGame} from "../src/interfaces/IChallengeGame.sol";
-import {ISyndicateGovernor} from "../src/interfaces/ISyndicateGovernor.sol";
 import {MockStakedWood} from "./mocks/MockStakedWood.sol";
 
 /// @dev Just enough game for the court: a settable challenge record, the
 ///      ledger pointer the court reads, and a `rule` recorder with a revert
 ///      toggle for the terminal-race test.
+/// @dev `executedAt` is set directly on the challenge record (no separate
+///      governor stub) — the court reads `ch.executedAt`, the game's own pin
+///      (F10), never a live `ISyndicateGovernor.getProposal` call. There is
+///      therefore nothing left for a `MockGovernorForCourt` to stand in for.
 contract MockGameForCourt {
     mapping(uint256 => IChallengeGame.Challenge) internal _challenges;
     address public exposureLedger;
@@ -33,7 +36,8 @@ contract MockGameForCourt {
         uint256 proposalId,
         IChallengeGame.Status status,
         uint256 filedAt,
-        uint256 disputeTimeoutAtFiling
+        uint256 disputeTimeoutAtFiling,
+        uint256 executedAt
     ) external {
         IChallengeGame.Challenge storage c = _challenges[id];
         c.governor = governor;
@@ -41,6 +45,7 @@ contract MockGameForCourt {
         c.status = status;
         c.filedAt = filedAt;
         c.disputeTimeoutAtFiling = disputeTimeoutAtFiling;
+        c.executedAt = executedAt;
     }
 
     function challengeOf(uint256 id) external view returns (IChallengeGame.Challenge memory) {
@@ -52,25 +57,6 @@ contract MockGameForCourt {
         ruled = true;
         lastRuledChallenge = challengeId;
         lastVerdict = verdict;
-    }
-}
-
-/// @dev Governor stub. The court reads exactly one field off `getProposal`:
-///      `executedAt`, from which D2's snapshot instant (`executedAt - 1`) is
-///      derived once, at referral. `setExecuted` is deliberately re-callable so
-///      a test can MOVE the proposal after referral and prove the case kept the
-///      snapshot it stored rather than re-deriving it. Shape recovered from the
-///      deleted panel court's `MockCourtGovernor`
-///      (`git show 222ae21^:test/Court.t.sol`).
-contract MockGovernorForCourt {
-    mapping(uint256 proposalId => ISyndicateGovernor.StrategyProposal) internal _proposals;
-
-    function setExecuted(uint256 proposalId, uint256 executedAt) external {
-        _proposals[proposalId].executedAt = executedAt;
-    }
-
-    function getProposal(uint256 proposalId) external view returns (ISyndicateGovernor.StrategyProposal memory) {
-        return _proposals[proposalId];
     }
 }
 
@@ -91,7 +77,6 @@ contract MockLedgerForCourt {
 contract TokenCourtTest is Test {
     TokenCourt internal court;
     MockGameForCourt internal game;
-    MockGovernorForCourt internal governor;
     MockLedgerForCourt internal ledger;
     MockStakedWood internal swood;
 
@@ -99,6 +84,10 @@ contract TokenCourtTest is Test {
     address internal voterA = makeAddr("voterA");
     address internal voterB = makeAddr("voterB");
     address internal accusedG = makeAddr("accusedG");
+    // Not a contract: the court no longer calls anything on `ch.governor`
+    // (`refer` reads `ch.executedAt`, the game's own pin), so a plain address
+    // is enough to stand in for the identity the ledger is keyed by.
+    address internal governor = makeAddr("governor");
     uint256 internal constant CHALLENGE_ID = 7;
     uint256 internal constant PROPOSAL_ID = 42;
 
@@ -106,7 +95,6 @@ contract TokenCourtTest is Test {
         vm.warp(365 days); // keep executedAt/filedAt well away from the genesis timestamp
         court = new TokenCourt(owner);
         game = new MockGameForCourt();
-        governor = new MockGovernorForCourt();
         ledger = new MockLedgerForCourt();
         swood = new MockStakedWood();
         game.setExposureLedger(address(ledger));
@@ -185,14 +173,14 @@ contract TokenCourtTest is Test {
     /// @dev Disputed challenge with sane clocks: filed now, 30d timeout,
     ///      proposal executed 1d ago. CHALLENGE_ID becomes referable.
     function _disputedChallenge() internal {
-        governor.setExecuted(PROPOSAL_ID, vm.getBlockTimestamp() - 1 days);
         game.setChallenge(
             CHALLENGE_ID,
-            address(governor),
+            governor,
             PROPOSAL_ID,
             IChallengeGame.Status.Disputed,
             vm.getBlockTimestamp(),
-            30 days
+            30 days,
+            vm.getBlockTimestamp() - 1 days
         );
     }
 
@@ -208,6 +196,10 @@ contract TokenCourtTest is Test {
         uint256 snap = vm.getBlockTimestamp() - 1 days - 1;
         swood.setPastStake(accusedG, snap, 500e18);
 
+        vm.expectEmit(true, true, true, true);
+        emit ITokenCourt.CaseReferred(1, CHALLENGE_ID, governor, PROPOSAL_ID, snap);
+        vm.expectEmit(true, false, false, true);
+        emit ITokenCourt.AccusedSetRecorded(1, 1, 500e18);
         uint256 caseId = court.refer(CHALLENGE_ID);
 
         ITokenCourt.Case memory cs = court.caseOf(caseId);
@@ -221,35 +213,92 @@ contract TokenCourtTest is Test {
         assertEq(court.accusedOf(caseId).length, 1);
     }
 
+    function test_refer_accusedWeight_sumsMultiple() public {
+        _disputedChallenge();
+        address accusedH = makeAddr("accusedH");
+        address[] memory a = new address[](2);
+        uint256[] memory c = new uint256[](2);
+        a[0] = accusedG;
+        c[0] = 100e18;
+        a[1] = accusedH;
+        c[1] = 250e18;
+        ledger.setApprovers(a, c);
+        uint256 snap = vm.getBlockTimestamp() - 1 days - 1;
+        swood.setPastStake(accusedG, snap, 500e18);
+        swood.setPastStake(accusedH, snap, 300e18);
+
+        uint256 caseId = court.refer(CHALLENGE_ID);
+
+        ITokenCourt.Case memory cs = court.caseOf(caseId);
+        assertEq(cs.accusedWeight, 800e18, "sums both accused stakes");
+        assertEq(court.accusedOf(caseId).length, 2);
+        assertTrue(court.isAccused(caseId, accusedG));
+        assertTrue(court.isAccused(caseId, accusedH));
+    }
+
+    function test_refer_dedupesRepeatedApprover() public {
+        _disputedChallenge();
+        // The ledger names `accusedG` twice — `refer` must count its weight once.
+        address[] memory a = new address[](2);
+        uint256[] memory c = new uint256[](2);
+        a[0] = accusedG;
+        c[0] = 100e18;
+        a[1] = accusedG;
+        c[1] = 100e18;
+        ledger.setApprovers(a, c);
+        uint256 snap = vm.getBlockTimestamp() - 1 days - 1;
+        swood.setPastStake(accusedG, snap, 500e18);
+
+        uint256 caseId = court.refer(CHALLENGE_ID);
+
+        assertEq(court.accusedOf(caseId).length, 1, "counted once despite duplicate ledger entry");
+        ITokenCourt.Case memory cs = court.caseOf(caseId);
+        assertEq(cs.accusedWeight, 500e18, "weight counted once, not doubled");
+    }
+
     function test_refer_guards() public {
         // Unwired court refuses (review E4 closed structurally).
         TokenCourt fresh = new TokenCourt(owner);
         vm.expectRevert(ITokenCourt.ZeroAddress.selector);
         fresh.refer(CHALLENGE_ID);
 
+        // Wired game but zero stakedWood also refuses.
+        TokenCourt halfWired = new TokenCourt(owner);
+        vm.prank(owner);
+        halfWired.setChallengeGame(address(game));
+        vm.expectRevert(ITokenCourt.ZeroAddress.selector);
+        halfWired.refer(CHALLENGE_ID);
+
         // Not disputed.
-        governor.setExecuted(PROPOSAL_ID, vm.getBlockTimestamp() - 1 days);
         game.setChallenge(
-            CHALLENGE_ID, address(governor), PROPOSAL_ID, IChallengeGame.Status.Filed, vm.getBlockTimestamp(), 30 days
+            CHALLENGE_ID,
+            governor,
+            PROPOSAL_ID,
+            IChallengeGame.Status.Filed,
+            vm.getBlockTimestamp(),
+            30 days,
+            vm.getBlockTimestamp() - 1 days
         );
         vm.expectRevert(ITokenCourt.ChallengeNotDisputed.selector);
         court.refer(CHALLENGE_ID);
 
         // Unexecuted proposal fails closed.
         game.setChallenge(
-            CHALLENGE_ID,
-            address(governor),
-            PROPOSAL_ID,
-            IChallengeGame.Status.Disputed,
-            vm.getBlockTimestamp(),
-            30 days
+            CHALLENGE_ID, governor, PROPOSAL_ID, IChallengeGame.Status.Disputed, vm.getBlockTimestamp(), 30 days, 0
         );
-        governor.setExecuted(PROPOSAL_ID, 0);
         vm.expectRevert(ITokenCourt.InvalidParameter.selector);
         court.refer(CHALLENGE_ID);
 
         // Double referral.
-        governor.setExecuted(PROPOSAL_ID, vm.getBlockTimestamp() - 1 days);
+        game.setChallenge(
+            CHALLENGE_ID,
+            governor,
+            PROPOSAL_ID,
+            IChallengeGame.Status.Disputed,
+            vm.getBlockTimestamp(),
+            30 days,
+            vm.getBlockTimestamp() - 1 days
+        );
         court.refer(CHALLENGE_ID);
         vm.expectRevert(ITokenCourt.AlreadyReferred.selector);
         court.refer(CHALLENGE_ID);
@@ -258,9 +307,8 @@ contract TokenCourtTest is Test {
     function test_refer_clockCheckBoundary() public {
         // remaining == voteWindow + FINALIZE_BUFFER passes; one second less refuses.
         uint256 filedAt = vm.getBlockTimestamp();
-        governor.setExecuted(PROPOSAL_ID, filedAt - 1 days);
         game.setChallenge(
-            CHALLENGE_ID, address(governor), PROPOSAL_ID, IChallengeGame.Status.Disputed, filedAt, 30 days
+            CHALLENGE_ID, governor, PROPOSAL_ID, IChallengeGame.Status.Disputed, filedAt, 30 days, filedAt - 1 days
         );
 
         uint256 exactLatest = filedAt + 30 days - (5 days + 1 days);
@@ -269,10 +317,33 @@ contract TokenCourtTest is Test {
         assertEq(caseId, 1);
 
         game.setChallenge(
-            CHALLENGE_ID + 1, address(governor), PROPOSAL_ID, IChallengeGame.Status.Disputed, filedAt, 30 days
+            CHALLENGE_ID + 1, governor, PROPOSAL_ID, IChallengeGame.Status.Disputed, filedAt, 30 days, filedAt - 1 days
         );
         vm.warp(exactLatest + 1);
         vm.expectRevert(ITokenCourt.InsufficientClock.selector);
         court.refer(CHALLENGE_ID + 1);
+    }
+
+    function test_refer_secondChallengeOnSameProposal_distinctCase() public {
+        // Two challenges can name the same (governor, proposalId) pair —
+        // e.g. a failed challenge followed by a fresh one — and each gets
+        // its own case.
+        _disputedChallenge();
+        uint256 firstCase = court.refer(CHALLENGE_ID);
+
+        game.setChallenge(
+            CHALLENGE_ID + 1,
+            governor,
+            PROPOSAL_ID,
+            IChallengeGame.Status.Disputed,
+            vm.getBlockTimestamp(),
+            30 days,
+            vm.getBlockTimestamp() - 1 days
+        );
+        uint256 secondCase = court.refer(CHALLENGE_ID + 1);
+
+        assertTrue(secondCase != firstCase, "distinct case ids");
+        assertEq(court.caseOfChallenge(CHALLENGE_ID), firstCase);
+        assertEq(court.caseOfChallenge(CHALLENGE_ID + 1), secondCase);
     }
 }

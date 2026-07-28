@@ -4,7 +4,6 @@ pragma solidity 0.8.28;
 import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {ITokenCourt} from "./interfaces/ITokenCourt.sol";
 import {IChallengeGame} from "./interfaces/IChallengeGame.sol";
-import {ISyndicateGovernor} from "./interfaces/ISyndicateGovernor.sol";
 import {IExposureLedger} from "./interfaces/IExposureLedger.sol";
 import {IStakedWood} from "./interfaces/IStakedWood.sol";
 
@@ -199,16 +198,18 @@ contract TokenCourt is Ownable2Step {
     ///         one at all unless `voteWindow + FINALIZE_BUFFER` still fits
     ///         before the timeout — turning a runtime race into a structural
     ///         impossibility: a case that exists is always one that can finish.
-    /// @dev    STATE IS CLAIMED BEFORE ANY EXTERNAL READ. The reads below call
-    ///         out to `ch.governor` — an address the CHALLENGER supplied to
-    ///         `ChallengeGame.file` and may therefore control. Both
-    ///         `challengeOf` and `getProposal` are `view` today, so the
-    ///         compiler emits STATICCALL and re-entry is impossible at the EVM
-    ///         level; claiming `caseOfChallenge[challengeId]` first is what
-    ///         keeps that true even if either interface ever loses its `view`
-    ///         — a hostile governor re-entering with the same id then hits
-    ///         `AlreadyReferred` rather than opening a second case over one
-    ///         accusation.
+    /// @dev    STATE IS CLAIMED BEFORE ANY EXTERNAL READ, even though this
+    ///         function reads NOTHING off the challenger-supplied governor
+    ///         any more — `ch.executedAt` comes from the game's own pinned
+    ///         record, not a live `ISyndicateGovernor.getProposal` call (see
+    ///         below). The only external read left is `challengeOf` itself,
+    ///         and it is `view`, so the compiler emits STATICCALL and
+    ///         re-entry is impossible at the EVM level today. Claiming
+    ///         `caseOfChallenge[challengeId]` before that read is what keeps
+    ///         a second `refer` on the same challenge harmless — not
+    ///         impossible, just a no-op `AlreadyReferred` — if `challengeOf`
+    ///         ever loses its `view` or the game ever calls back into the
+    ///         court.
     /// @return caseId The new case's id.
     function refer(uint256 challengeId) external returns (uint256 caseId) {
         address game = challengeGame;
@@ -234,11 +235,20 @@ contract TokenCourt is Ownable2Step {
             revert InsufficientClock();
         }
 
-        uint256 executedAt = ISyndicateGovernor(ch.governor).getProposal(ch.proposalId).executedAt;
+        // `ch.executedAt` is the game's OWN pin (F10): `ChallengeGame` snapshots
+        // it at filing from the proposal record and never re-reads a live
+        // governor afterward — the settle-path slash is sized against this
+        // same field. Reading it here rather than calling back into
+        // `ch.governor` means the snapshot instant equals the settle-path
+        // slash instant BY CONSTRUCTION (one write, two readers), not because
+        // two independent reads happen to agree — a mutable governor record
+        // could otherwise move the second read out from under the first.
+        uint256 executedAt = ch.executedAt;
         // Unreachable through a real filing — `ChallengeGame.file` rejects an
-        // unexecuted proposal — but fail closed rather than underflow into a
-        // snapshot at `type(uint256).max`, an instant nobody has voting power
-        // at.
+        // unexecuted proposal, so `executedAt` is a restatement of that
+        // `NotExecuted` invariant here — but fail closed rather than
+        // underflow into a snapshot at `type(uint256).max`, an instant nobody
+        // has voting power at.
         if (executedAt == 0) revert InvalidParameter();
         uint256 snapshotTs = executedAt - 1;
 
@@ -281,7 +291,18 @@ contract TokenCourt is Ownable2Step {
     /// @dev  A DOUBLE-LISTED APPROVER WOULD DOUBLE-COUNT ITS WEIGHT, so the
     ///       `isAccused` flag is checked before accumulating (dedup guard).
     ///       The ledger does not produce duplicates today; the guard costs one
-    ///       warm SLOAD and makes the floor's denominator independent of that.
+    ///       extra SLOAD per approver and makes the floor's denominator
+    ///       independent of that.
+    /// @dev  THE LOOP IS BOUNDED, not unbounded despite the caller-controlled
+    ///       `proposalId`: `approversOf` returns the same list
+    ///       `GuardianRegistry` walks on every approve/settle, which is capped
+    ///       at `MAX_APPROVERS_PER_PROPOSAL = 100` (`GuardianRegistry.sol`).
+    ///       So this loop is at most 100 iterations, each one `getPastStake`
+    ///       staticcall. FORWARD NOTE for Task 8: the auto-referral path runs
+    ///       `refer` (and this loop) inside `ChallengeGame.dispute`'s
+    ///       try/catch, so that call pays for up to ~100 `getPastStake`
+    ///       staticcalls in the worst case — size the try/catch's gas stipend
+    ///       for it.
     function _recordAccused(
         uint256 caseId,
         ITokenCourt.Case storage c,
