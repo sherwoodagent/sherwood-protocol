@@ -693,7 +693,7 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///         Re-graded after the DPoS-delegation removal: `getPastVotes` used
     ///         to add k-capped delegated inbound, which put an account's weight
     ///         in a 20x band around its own contribution and let the accused
-    ///         drive `Court`'s participation floor to zero. Aging only ever
+    ///         drive `TokenCourt`'s participation floor to zero. Aging only ever
     ///         SHRINKS, so weight is now bounded above by raw stake and that is
     ///         unreachable. The residual bias is one-directional: too little
     ///         subtracted, so the floor comes out too high.
@@ -701,7 +701,7 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///         The note on `getPastVotes` — "aging and the k-cap only shrink
     ///         numerators, so the raw denominator is conservative" — is sound
     ///         where it was written, about vote COUNTING. It INVERTS under a
-    ///         subtraction: `Court._participationFloor` subtracts the accused
+    ///         subtraction: `TokenCourt._participationFloor` subtracts the accused
     ///         cohort from the electorate, and there the k-cap term is not
     ///         conservative at all — it is the term that can drive the floor to
     ///         zero. This getter exists so that subtraction has a same-basis

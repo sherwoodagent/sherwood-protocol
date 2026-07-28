@@ -116,7 +116,7 @@ interface IStakedWood {
     ///         The delegation removal narrowed the consequence without removing
     ///         it. Aging only ever SHRINKS, so per-account weight is now bounded
     ///         above by raw stake: the accused sum can no longer exceed the
-    ///         total and `Court._participationFloor` can no longer be driven to
+    ///         total and `TokenCourt._participationFloor` can no longer be driven to
     ///         zero. What remains is a one-directional bias — the floor comes
     ///         out too HIGH when the accused are freshly staked, which protects
     ///         a panel ruling rather than enabling a cheap overturn.
@@ -124,7 +124,7 @@ interface IStakedWood {
 
     /// @notice A guardian's RAW votable own stake at a past timestamp — the same
     ///         basis `getPastTotalVotes` sums, so the two are comparable and
-    ///         subtractable. This is the operand `Court._participationFloor`
+    ///         subtractable. This is the operand `TokenCourt._participationFloor`
     ///         needs; `getPastVotes` there would let delegation drive the floor
     ///         to zero.
     function getPastStake(address guardian, uint256 timestamp) external view returns (uint256);
