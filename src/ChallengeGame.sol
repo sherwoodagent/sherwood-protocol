@@ -221,10 +221,24 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///         adjudicator that can force slashes.
     address public court;
 
-    /// @notice The ONLY human backstop in the whole adjudication stack (spec
-    ///         §4): true gates `file` alone. Never checked in `dispute`,
-    ///         `resolve`, `rule`, or either claim path, so no in-flight
-    ///         challenge's rights ever depend on the owner.
+    /// @notice The owner's only lever that gates NEW filings (spec §4): true
+    ///         refuses `file` alone. Never checked in `dispute`, `resolve`,
+    ///         `rule`, or either claim path.
+    /// @dev    WHAT THIS DOES NOT CLAIM: a live challenge's rights are not
+    ///         wholly independent of the owner regardless of this flag —
+    ///         `rule` still checks the LIVE `court` (not one pinned at
+    ///         filing), and the settle path still reads `stakedWood` and
+    ///         `exposureLedger` live. An owner that rotates any of those
+    ///         mid-dispute changes what a pending challenge resolves into;
+    ///         this pause does nothing about that, and was never meant to.
+    ///         What IS true, and what this flag is the filing-side half of:
+    ///         the ECONOMIC terms a challenge is judged and priced against —
+    ///         `autoSlashDelayAtFiling`, `disputeTimeoutAtFiling`,
+    ///         `settleBurnBpsAtFiling`, `forfeitBurnBpsAtFiling` — are pinned
+    ///         at filing precisely so the owner cannot move them under a
+    ///         challenge already running. This flag adds the same guarantee
+    ///         at the door: an owner can stop a NEW challenge from starting,
+    ///         never dial the terms of one that already exists.
     /// @dev    THE ADVERSARY IS THE OWNER ITSELF (spec §4). Pausing referrals —
     ///         i.e. anything that could freeze `dispute`/`resolve`/`rule` mid-
     ///         flight — was rejected for exactly this reason: a disputed-but-
@@ -232,8 +246,15 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///         `_fail` branch and forfeit the challenger's bond by owner
     ///         inaction, not by anything the challenger did. Restricting the
     ///         lever to `file` means the worst a hostile or compromised owner
-    ///         can do is stop NEW challenges from starting; it can never reach
-    ///         into one that already exists.
+    ///         can do is stop NEW challenges from starting; it can never
+    ///         freeze one that already exists.
+    /// @dev    `setCourt` STAYS LIVE-READ ON PURPOSE, and this pause changes
+    ///         nothing about that. Pinning the court per challenge, the same
+    ///         way the economic terms above are pinned, would strand every
+    ///         open dispute on a dead or compromised adjudicator the instant
+    ///         governance replaced it — the live read is the rescue path that
+    ///         lets a broken or replaced court still rule pending disputes,
+    ///         instead of forcing all of them into a timeout acquittal.
     bool public filingsPaused;
 
     /// @notice How long after execution a proposal remains challengeable
@@ -1411,7 +1432,7 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      nothing else — no other setter here, and no path in `dispute`,
     ///      `resolve`, `rule`, or either claim function, ever reads this flag.
     function setFilingsPaused(bool paused) external onlyOwner {
+        emit FilingsPausedSet(filingsPaused, paused);
         filingsPaused = paused;
-        emit FilingsPausedSet(paused);
     }
 }

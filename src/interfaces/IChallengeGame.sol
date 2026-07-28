@@ -197,9 +197,8 @@ interface IChallengeGame {
     ///      calldata parser, so D1's one-security-model rule is intact.
     error AdapterNotInProposal();
     /// @notice `file` refused because the owner has paused NEW filings (spec §4:
-    ///         the owner's ONLY lever over adjudication). Never raised anywhere
-    ///         else — dispute/resolve/rule/claims are unaffected, so no in-flight
-    ///         challenge's rights depend on the owner.
+    ///         the owner's only lever gating filings). Never raised anywhere
+    ///         else — dispute/resolve/rule/claims are unaffected by this flag.
     error FilingsPaused();
 
     // ── Events ──
@@ -280,7 +279,7 @@ interface IChallengeGame {
     event AutoSlashDelaySet(uint256 oldDelay, uint256 newDelay);
     event DisputeTimeoutSet(uint256 oldTimeout, uint256 newTimeout);
     event SettleBurnBpsSet(uint256 oldBps, uint256 newBps);
-    event FilingsPausedSet(bool paused);
+    event FilingsPausedSet(bool oldPaused, bool newPaused);
 
     // ── Filing ──
     /// @notice File a bonded challenge against an executed proposal, freezing
@@ -460,9 +459,13 @@ interface IChallengeGame {
     ///         the zero address while none is wired — in which case Plan D's
     ///         behaviour is unchanged and `Disputed` remains terminal-by-timeout.
     function court() external view returns (address);
-    /// @notice The ONLY human backstop in the adjudication stack (spec §4):
-    ///         gates `file` alone. dispute/resolve/rule/claims always run, so
-    ///         no in-flight challenge's rights depend on the owner.
+    /// @notice The owner's only lever that gates NEW filings (spec §4): true
+    ///         refuses `file` alone. dispute/resolve/rule/claims always run
+    ///         unaffected by this flag. It is not a claim that a live
+    ///         challenge is fully insulated from the owner — see
+    ///         `ChallengeGame.filingsPaused` for what actually is (the
+    ///         `*AtFiling` economic pins) and what deliberately is not
+    ///         (`court`, read live by `rule`).
     function filingsPaused() external view returns (bool);
 
     // ── Owner setters ──

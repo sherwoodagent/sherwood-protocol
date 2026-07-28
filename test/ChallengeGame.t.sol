@@ -2485,13 +2485,20 @@ contract ChallengeGameTest is Test {
     // Task 3 — filings pause: the owner's ONLY lever over adjudication
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// @notice The pause gates `file` ALONE. An in-flight challenge (already
-    ///         disputed before the pause) keeps running end to end — rule and
-    ///         claims both still work — and unpausing restores filing.
+    /// @notice The pause gates `file` ALONE. In-flight challenges (already
+    ///         filed or disputed before the pause) keep running end to end —
+    ///         `dispute`, permissionless `resolve`, `rule` and claims all
+    ///         still work — and unpausing restores filing.
     function test_setFilingsPaused_gatesFileOnly() public {
-        uint256 id = _fileAndDispute(); // in-flight challenge BEFORE the pause
+        uint256 id = _fileAndDispute(); // in-flight, already disputed, BEFORE the pause
+        uint256 partialId = _fileStandard(4); // in-flight, still Filed, BEFORE the pause
+        uint256 undisputed = _fileStandard(5); // in-flight, still Filed, BEFORE the pause
+
         vm.prank(owner);
+        vm.expectEmit(true, true, true, true, address(game));
+        emit IChallengeGame.FilingsPausedSet(false, true);
         game.setFilingsPaused(true);
+        assertTrue(game.filingsPaused());
 
         // New filings refused... (inlined from `_fileStandard`: `vm.expectRevert`
         // only arms the NEXT call, and the fixture makes several external calls
@@ -2503,7 +2510,28 @@ contract ChallengeGameTest is Test {
         vm.expectRevert(IChallengeGame.FilingsPaused.selector);
         game.file(address(gov), 2, IChallengeGame.Predicate.OutOfAdapterOutflow, ADAPTER, SELECTOR, EVIDENCE);
 
-        // ...but every in-flight right still runs: rule, claims.
+        // ...but every in-flight right still runs.
+
+        // `dispute`, partially funding the pool — still runs while paused.
+        vm.prank(guardianA);
+        game.dispute(partialId, 1_000e18); // well short of the ~10_000e18 pool target
+        assertEq(
+            uint256(game.challengeOf(partialId).status),
+            uint256(IChallengeGame.Status.Filed),
+            "short of the pool target, but the contribution itself was not refused by the pause"
+        );
+
+        // Permissionless `resolve` — an undisputed challenge still auto-slashes
+        // past its silence window while paused.
+        vm.warp(_filedAt(undisputed) + game.autoSlashDelay());
+        game.resolve(undisputed);
+        assertEq(
+            uint256(game.challengeOf(undisputed).status),
+            uint256(IChallengeGame.Status.Settled),
+            "the silence verdict still lands while paused"
+        );
+
+        // `rule` and claims.
         vm.prank(court);
         game.rule(id, IChallengeGame.Verdict.Inconclusive);
         vm.prank(guardianA);
@@ -2511,13 +2539,23 @@ contract ChallengeGameTest is Test {
 
         // And unpausing restores filing.
         vm.prank(owner);
+        vm.expectEmit(true, true, true, true, address(game));
+        emit IChallengeGame.FilingsPausedSet(true, false);
         game.setFilingsPaused(false);
+        assertFalse(game.filingsPaused());
         _fileStandard(3);
     }
 
     function test_setFilingsPaused_onlyOwner() public {
         vm.prank(challenger);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, challenger));
+        game.setFilingsPaused(true);
+    }
+
+    function test_setFilingsPaused_emits() public {
+        vm.expectEmit(true, true, true, true, address(game));
+        emit IChallengeGame.FilingsPausedSet(false, true);
+        vm.prank(owner);
         game.setFilingsPaused(true);
     }
 }
