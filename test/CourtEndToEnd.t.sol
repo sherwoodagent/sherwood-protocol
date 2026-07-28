@@ -903,6 +903,14 @@ contract CourtEndToEndTest is Test {
         // ── THE FORFEIT, WITH THE BURN OFF THE TOP AND KEYED TO CONTRIBUTION.
         //    The burn is what stops the challenger's own second address from
         //    funding the counter-bond and collecting its own forfeited bond back.
+        //
+        //    COLLECTED, NOT PUSHED: resolution records what each funder is owed
+        //    and the funder calls for it. That is what removed the unbounded
+        //    payout loop and let contribution standing open up; the economics
+        //    below are unchanged, only the timing is.
+        vm.prank(g1);
+        game.claimContribution(cid);
+
         uint256 burned = (CHALLENGER_BOND * game.forfeitBurnBps()) / 10_000;
         assertEq(burned, 400e18, "20% of a 2,000 WOOD bond");
         assertEq(wood.balanceOf(challenger), challengerBalBefore - CHALLENGER_BOND, "the challenger forfeited it");

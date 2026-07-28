@@ -106,6 +106,12 @@ interface IChallengeGame {
         uint256 disputeTimeoutAtFiling;
         uint256 settleBurnBpsAtFiling;
         uint256 forfeitBurnBpsAtFiling;
+        /// @dev The forfeited challenger bond, net of the fail-path burn, that
+        ///      the pool's funders split pro-rata to what each put in. Written
+        ///      once by `_fail`, read by `claimContribution`, zero on every
+        ///      other path. Storing the TOTAL rather than paying it out is what
+        ///      lets a claimant compute its own share in O(1).
+        uint256 forfeitPayoutWood;
     }
 
     // ── Errors ──
@@ -145,6 +151,14 @@ interface IChallengeGame {
     ///         completing contribution flips the status to `Disputed`, so a later
     ///         caller is rejected by `WrongStatus` first.
     error NothingToContribute();
+    /// @notice `claimContribution` found nothing owed — the caller never
+    ///         contributed, has already claimed, or the challenge ended on the
+    ///         guilty-ruling path where the whole pool forfeits to the
+    ///         challenger and the funders are owed nothing.
+    error NothingToClaim();
+    /// @notice `claimContribution` on a challenge that is not yet terminal.
+    ///         Entitlements are only knowable once the outcome is fixed.
+    error ChallengeNotTerminal();
     /// @notice `rule` called by anything other than the wired court (§3.5).
     /// @dev    Also what an UNWIRED game reverts with, since `court` is then the
     ///         zero address and no caller can match it — Plan D's timeout stays
@@ -178,7 +192,10 @@ interface IChallengeGame {
         uint256 bondWood,
         string evidenceURI
     );
-    /// @dev One per contributing approver, so the payer set — and therefore the
+    /// @dev A funder collecting what a terminal challenge owed it: stake back,
+    ///      plus its slice of the forfeit on the failed path.
+    event ContributionClaimed(uint256 indexed challengeId, address indexed contributor, uint256 amountWood);
+    /// @dev One per contributing address, so the payer set — and therefore the
     ///      pro-rata split a failed challenge pays out — is reconstructible from
     ///      the log alone.
     event CounterBondContributed(
@@ -327,6 +344,43 @@ interface IChallengeGame {
     ///         pool. Retained after resolution, so the split a terminal challenge
     ///         paid out stays auditable on-chain.
     function counterBondContributionOf(uint256 challengeId, address contributor) external view returns (uint256);
+
+    /// @notice Collect what a terminal challenge owes you for funding its
+    ///         counter-bond: your stake back, plus your pro-rata slice of the
+    ///         forfeited challenger bond when the challenge FAILED.
+    /// @dev    PULL, NOT PUSH, and that is the point. `_fail` and `_settle` used
+    ///         to loop the contributor list and transfer to each — so the list
+    ///         had to stay short, which is why `dispute` was restricted to the
+    ///         accused. One reverting or blocklisted recipient would also have
+    ///         bricked the whole resolution, stranding both bonds and leaving
+    ///         the coverage frozen.
+    ///
+    ///         Resolution now stores the total to split and each claimant
+    ///         computes its own share on the way out, so the payout is O(1) per
+    ///         claimant and the list length is irrelevant. That is what makes
+    ///         open contribution standing safe.
+    ///
+    ///         Rounding: shares are floor-divided independently, so up to
+    ///         `contributors - 1` wei of a failed challenge's payout is never
+    ///         claimable. The push version handed that remainder to the last
+    ///         recipient; distributing it lazily is not possible without the
+    ///         loop this exists to remove. Bounded at wei scale and left in the
+    ///         contract, still covered by `unclaimedWood`.
+    function claimContribution(uint256 challengeId) external returns (uint256 amount);
+
+    /// @notice What `claimContribution` would pay `contributor` right now — the
+    ///         stake plus, on the failed path, its slice of the forfeit. Zero
+    ///         once claimed, and zero on the guilty-ruling path.
+    function claimableContribution(uint256 challengeId, address contributor) external view returns (uint256);
+
+    /// @notice WOOD owed to counter-bond funders of terminal challenges and not
+    ///         yet collected.
+    /// @dev    `bondedWood` keeps its meaning — WOOD held for LIVE challenges —
+    ///         so the §4 invariant becomes
+    ///         `wood.balanceOf(game) >= bondedWood + unclaimedWood`. Splitting
+    ///         the two keeps "no live challenge implies `bondedWood == 0`" true,
+    ///         which several tests and the fuzz invariant rely on.
+    function unclaimedWood() external view returns (uint256);
     /// @notice The MOST RECENTLY FILED challenge against a proposal if it is
     ///         still live (`Filed`/`Disputed`), or zero.
     /// @dev    Filings are per-challenger, so this is no longer "the" live

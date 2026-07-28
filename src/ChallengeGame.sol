@@ -323,6 +323,21 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///         decrement, and custody still lands back on `bondedWood` after.
     uint256 public bondedWood;
 
+    /// @inheritdoc IChallengeGame
+    /// @dev WOOD owed to counter-bond funders of TERMINAL challenges, not yet
+    ///      collected. Deliberately separate from `bondedWood` rather than
+    ///      folded into it: `bondedWood` means "held for a LIVE challenge", and
+    ///      "no live challenge implies `bondedWood == 0`" is an invariant the
+    ///      suite and the §4 fuzz test both lean on. Keeping the two apart
+    ///      preserves that while widening the custody invariant to
+    ///      `wood.balanceOf(this) >= bondedWood + unclaimedWood`.
+    ///
+    ///      Never returns to zero exactly on a failed challenge: lazy pro-rata
+    ///      shares floor-divide independently, so wei-scale dust stays
+    ///      accounted here forever. That is the price of removing the payout
+    ///      loop, and it is why the invariant is `>=` rather than `==`.
+    uint256 public unclaimedWood;
+
     uint256 public challengeCount;
 
     mapping(uint256 challengeId => Challenge) internal _challenges;
@@ -572,7 +587,10 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             // commitment takes up to half of what the winning side collects, on
             // a challenge that was already correct.
             settleBurnBpsAtFiling: settleBurnBps,
-            forfeitBurnBpsAtFiling: forfeitBurnBps
+            forfeitBurnBpsAtFiling: forfeitBurnBps,
+            // Written only by `_fail`, which is the sole path that gives the
+            // pool's funders anything beyond their stake back.
+            forfeitPayoutWood: 0
         });
         _lastChallenge[key] = challengeId;
         _liveByChallenger[challengerKey] = challengeId;
@@ -655,22 +673,31 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         // prefer right now (review 🟠F5).
         if (block.timestamp >= c.filedAt + c.autoSlashDelayAtFiling) revert WindowClosed();
 
-        // Standing: only a guardian this filing actually accuses. A guardian
-        // that released its commitment before the filing covered nothing here
-        // and is not at risk, so it has nothing to defend (D2). This is also
-        // what BOUNDS the contributor list — the accused set is the ledger's,
-        // and each member can appear in it at most once.
-        (address[] memory approvers, uint256[] memory committedUsd) =
-            exposureLedger.approversOf(c.governor, c.proposalId);
-        bool accused;
-        for (uint256 i = 0; i < approvers.length; i++) {
-            if (approvers[i] == msg.sender && committedUsd[i] != 0) {
-                accused = true;
-                break;
-            }
-        }
-        if (!accused) revert NotAccusedApprover();
-
+        // ANYONE MAY FUND THE DEFENCE (review 🟠F18). This was restricted to the
+        // accused, which answered "who may BUY the escalation" — correct — but
+        // once the counter-bond became a POOL the same check silently also
+        // answered "who may help FILL it", and those are different questions. A
+        // cohort ten percent short with an hour left could not be topped up by
+        // anyone: not another guardian, not the protocol itself. The pool
+        // failed, everyone was slashed, and the contributions went home.
+        //
+        // The restriction's OTHER job was bounding the contributor list, because
+        // resolution used to loop it and transfer to each. `claimContribution`
+        // removed that loop — each claimant computes its own share in O(1) — so
+        // the list length no longer matters and the bound is not load-bearing.
+        //
+        // Skin in the game is enforced ECONOMICALLY, not by identity: a guilty
+        // ruling forfeits the whole pool to the challenger, so an outside funder
+        // risks real capital rather than buying free influence. That is a
+        // strictly better gate than an allowlist — and it lets a third party who
+        // believes the accused innocent PAY TO FORCE ADJUDICATION rather than
+        // let an unproven silence verdict stand, which is D1's weakest point.
+        //
+        // What this does NOT change: a self-funded round trip (file, then fund
+        // your own counter-bond) still costs only `forfeitBurnBps` while the
+        // coverage stays frozen. That is §4 gap 9, "priced, not eliminated" —
+        // widened here from the accused to anyone, at the same price, not newly
+        // created.
         uint256 target = c.bondWood;
         uint256 pool = c.counterBondWood;
         // `Filed` guarantees `pool < target`, so the shortfall is never zero and
@@ -904,7 +931,10 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
                 emit ChallengerBondBurned(challengeId, burned);
             }
             wood.safeTransfer(c.challenger, bond - burned);
-            _refundContributions(challengeId);
+            // The part-funded pool moves from live accounting to unclaimed; its
+            // funders collect with `claimContribution`. Nothing is pushed, so a
+            // single reverting recipient can no longer brick the resolution.
+            _bookRefund(challengeId, pool);
         }
         emit ChallengeSettled(challengeId, slashedWood, caseId);
     }
@@ -923,21 +953,17 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         }
     }
 
-    /// @dev Hands every contribution back to whoever made it. Reached only from
-    ///      the undisputed-settle path, where the pool never completed. The
-    ///      stored amounts are deliberately NOT zeroed: the challenge is already
-    ///      terminal and nothing can re-enter — `dispute` requires `Filed`, and
-    ///      both unwind paths require a live status — so leaving them keeps the
-    ///      payout auditable at no correctness cost.
-    function _refundContributions(uint256 challengeId) private {
-        address[] storage list = _contributors[challengeId];
-        uint256 n = list.length;
-        for (uint256 i = 0; i < n; i++) {
-            address contributor = list[i];
-            // Never zero: an address is listed only by a non-zero contribution,
-            // and a repeat contributor only ever adds to it.
-            wood.safeTransfer(contributor, _contributed[challengeId][contributor]);
-        }
+    /// @dev Moves a part-funded pool from LIVE accounting to UNCLAIMED, so its
+    ///      funders can collect via `claimContribution`. Reached only from the
+    ///      undisputed-settle path, where the pool never completed.
+    ///
+    ///      This used to loop the contributor list and transfer to each, which
+    ///      is what forced `dispute` to keep that list short and made one
+    ///      reverting recipient able to brick the whole resolution. Nothing is
+    ///      transferred here now; the stored `_contributed` amounts ARE the
+    ///      entitlements, and `claimContribution` zeroes them on the way out.
+    function _bookRefund(uint256 challengeId, uint256 pool) private {
+        if (pool != 0) unclaimedWood += pool;
     }
 
     /// @dev D5 — THE FAIL-SAFE. A disputed challenge escalates to the court of
@@ -1015,25 +1041,20 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
 
         _releaseFreeze(_reviewKey(governor, proposalId), governor, proposalId);
 
-        address[] storage list = _contributors[challengeId];
-        uint256 n = list.length;
         // Defensive: unreachable from `Disputed`, where the pool is by
         // construction complete and therefore funded by at least one address.
         // Left in so the bond can never be stranded if a future caller widens
         // the reachable states again — the hazard this file has now hit twice.
-        if (n == 0) {
+        if (pool == 0) {
             wood.safeTransfer(challenger, bond);
             emit ChallengeFailed(challengeId, 0, 0);
             return;
         }
 
         // The burn is taken off the top and the REMAINDER is what the funders
-        // split, so `burnAmount + sum(winnings) == bond` exactly: the pro-rata
-        // pass below is keyed to `payout`, not to `bond`, and its last recipient
-        // absorbs the rounding remainder of `payout` rather than of the bond.
-        // Integer division makes `burnAmount <= bond`, so `payout` cannot
-        // underflow, and a `forfeitBurnBps` of zero reproduces the pre-burn
-        // behaviour to the wei.
+        // split. Integer division makes `burnAmount <= bond`, so `payout`
+        // cannot underflow, and a `forfeitBurnBps` of zero reproduces the
+        // pre-burn behaviour to the wei.
         uint256 burnAmount = (bond * c.forfeitBurnBpsAtFiling) / BPS_DENOMINATOR;
         uint256 payout = bond - burnAmount;
         // Skipped when the parameter is zero: a zero-value transfer would only
@@ -1041,19 +1062,24 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         if (burnAmount != 0) wood.safeTransfer(BURN_ADDRESS, burnAmount);
 
         // §3.4: "failed challenge → challenger bond forfeits to the accused" —
-        // to the ones that funded the defence, pro-rata to what each put in. The
-        // last recipient absorbs the rounding remainder, so the forfeit is
-        // distributed to the wei and nothing is stranded here. Each contributor
-        // is paid its stake back and its slice of the forfeit in one transfer.
-        uint256 distributed;
-        uint256 last = n - 1;
-        for (uint256 i = 0; i <= last; i++) {
-            address contributor = list[i];
-            uint256 contributed = _contributed[challengeId][contributor];
-            uint256 winnings = i == last ? payout - distributed : (payout * contributed) / pool;
-            distributed += winnings;
-            wood.safeTransfer(contributor, contributed + winnings);
-        }
+        // to the ones that funded the defence, pro-rata to what each put in.
+        //
+        // RECORDED, NOT PAID (review 🟠F18). This used to loop the contributor
+        // list and transfer to each, which forced `dispute` to keep that list
+        // short and let a single reverting recipient brick the resolution —
+        // stranding both bonds and leaving the coverage frozen, the same class
+        // as 🟠F11. Storing the TOTAL to split lets each funder compute its own
+        // slice in `claimContribution` at O(1), so the list length stops
+        // mattering and open contribution standing becomes safe.
+        //
+        // The cost is rounding. The push version gave the last recipient the
+        // remainder so the forfeit distributed to the wei; lazy shares are
+        // floor-divided independently, so up to `contributors - 1` wei is never
+        // claimable. It stays in the contract, still covered by `unclaimedWood`,
+        // and is bounded at wei scale — the loop is what buying exactness would
+        // cost.
+        c.forfeitPayoutWood = payout;
+        unclaimedWood += pool + payout;
         emit ChallengeFailed(challengeId, bond, burnAmount);
     }
 
@@ -1118,6 +1144,49 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     /// @inheritdoc IChallengeGame
     function counterBondContributionOf(uint256 challengeId, address contributor) external view returns (uint256) {
         return _contributed[challengeId][contributor];
+    }
+
+    /// @inheritdoc IChallengeGame
+    function claimableContribution(uint256 challengeId, address contributor) public view returns (uint256) {
+        Challenge storage c = _challenges[challengeId];
+        uint256 contributed = _contributed[challengeId][contributor];
+        if (contributed == 0) return 0;
+
+        if (c.status == Status.Failed) {
+            // Stake back plus this funder's slice of the forfeit. `pool` is the
+            // denominator the shares were promised against, and it is frozen
+            // once the challenge is terminal.
+            return contributed + (c.forfeitPayoutWood * contributed) / c.counterBondWood;
+        }
+        if (c.status == Status.Settled) {
+            // A COMPLETE pool at settle means the challenge was escalated and
+            // the court ruled guilty, so the whole pool forfeited to the
+            // challenger and the funders are owed nothing. `Filed` can only
+            // reach `_settle` with `pool < bondWood`, so this comparison
+            // distinguishes the two entries without a stored flag.
+            if (c.counterBondWood == c.bondWood) return 0;
+            return contributed; // part-funded defence: stake back, no winnings
+        }
+        return 0; // still live — nothing is owed until the outcome is fixed
+    }
+
+    /// @inheritdoc IChallengeGame
+    function claimContribution(uint256 challengeId) external returns (uint256 amount) {
+        Challenge storage c = _challenges[challengeId];
+        Status status = c.status;
+        if (status != Status.Failed && status != Status.Settled) revert ChallengeNotTerminal();
+
+        amount = claimableContribution(challengeId, msg.sender);
+        if (amount == 0) revert NothingToClaim();
+
+        // CEI, and the zeroing is what makes the claim single-shot: the
+        // entitlement is derived from `_contributed`, so clearing it before the
+        // transfer closes both the re-entrancy door and the double-claim one.
+        _contributed[challengeId][msg.sender] = 0;
+        unclaimedWood -= amount;
+
+        wood.safeTransfer(msg.sender, amount);
+        emit ContributionClaimed(challengeId, msg.sender, amount);
     }
 
     /// @inheritdoc IChallengeGame

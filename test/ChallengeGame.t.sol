@@ -753,6 +753,7 @@ contract ChallengeGameTest is Test {
 
         vm.warp(_filedAt(id) + game.disputeTimeout());
         game.resolve(id);
+        _claimAll(id); // pull-payment: funders collect before balances are asserted
 
         // Its stake back plus the WHOLE forfeited bond: zero burn, as filed.
         assertEq(wood.balanceOf(guardianA) - before, bond + bond, "forfeit paid at the rate in force when it was filed");
@@ -818,8 +819,16 @@ contract ChallengeGameTest is Test {
         );
     }
 
-    /// @dev The §4 invariant, asserted point-by-point: the game custodies
-    ///      exactly the bonds of the challenges still live.
+    /// @dev The §4 invariant, asserted point-by-point. `bondedWood` still means
+    ///      exactly the bonds of the LIVE challenges — that is why the
+    ///      pull-payment change put entitlements in a separate counter rather
+    ///      than folding them in. Custody widened to cover both, because a
+    ///      terminal challenge's funders are paid lazily and their WOOD sits
+    ///      here until claimed.
+    ///
+    ///      `>=` rather than `==` on custody: lazy pro-rata shares floor-divide
+    ///      independently, so wei-scale dust from a failed challenge stays
+    ///      accounted in `unclaimedWood` and is never claimable.
     function _assertLiveBondsBacked() internal view {
         uint256 live;
         for (uint256 i = 1; i <= game.challengeCount(); i++) {
@@ -829,7 +838,31 @@ contract ChallengeGameTest is Test {
             }
         }
         assertEq(game.bondedWood(), live, "accounted bonds != live bonds");
-        assertEq(wood.balanceOf(address(game)), live, "custody != live bonds");
+        assertGe(
+            wood.balanceOf(address(game)), game.bondedWood() + game.unclaimedWood(), "custody < accounted obligations"
+        );
+    }
+
+    /// @dev Collect what a terminal challenge owes `who`, if anything.
+    ///
+    ///      Resolution used to transfer to every funder in a loop; it now
+    ///      records entitlements and each funder collects for itself, which is
+    ///      what removed the unbounded-loop hazard and let contribution standing
+    ///      open up. Tests that assert end-to-end balances therefore have to
+    ///      settle up first — the economics are unchanged, the timing is not.
+    function _claim(uint256 id, address who) internal {
+        if (game.claimableContribution(id, who) == 0) return;
+        vm.prank(who);
+        game.claimContribution(id);
+    }
+
+    /// @dev Settle up for the fixture's standard funders. A no-op for anyone who
+    ///      contributed nothing, so it is safe to call after any resolution.
+    ///      Tests with bespoke funders call `_claim` for those directly.
+    function _claimAll(uint256 id) internal {
+        _claim(id, guardianA);
+        _claim(id, guardianB);
+        _claim(id, challenger);
     }
 
     // ── Undisputed: silence is the verdict ──
@@ -1086,26 +1119,42 @@ contract ChallengeGameTest is Test {
         assertTrue(ledger.isCoverageFrozen(address(gov), PROPOSAL), "still frozen while contested");
     }
 
-    /// @notice Only the ACCUSED may buy the escalation. Anyone else posting a
-    ///         counter-bond would be paying to stop a clock they are not under.
-    function test_dispute_revertsForANonApprover() public {
+    /// @notice 🟠F18: ANY ADDRESS MAY FUND THE DEFENCE.
+    ///
+    ///         This asserted the opposite until the payout became pull-based.
+    ///         The accused-only rule answered "who may BUY the escalation" —
+    ///         right — but with a POOL the same check also decided "who may help
+    ///         FILL it", and a cohort short by a sliver could not be topped up
+    ///         by anyone. The rule's other job was bounding the contributor
+    ///         list, which `claimContribution` retired.
+    ///
+    ///         Skin in the game is now economic rather than by identity: a
+    ///         guilty ruling forfeits the whole pool to the challenger, so a
+    ///         stranger funding a defence risks real capital. Pinned here so a
+    ///         future re-tightening has to argue with a test.
+    function test_dispute_anyAddressMayFundTheDefence() public {
         uint256 id = _fileStandard(PROPOSAL);
-        vm.prank(challenger);
-        vm.expectRevert(IChallengeGame.NotAccusedApprover.selector);
-        game.dispute(id, type(uint256).max);
+        uint256 target = game.challengeOf(id).bondWood;
 
         address stranger = makeAddr("stranger");
         wood.mint(stranger, 1_000_000e18);
         vm.startPrank(stranger);
         wood.approve(address(game), type(uint256).max);
-        vm.expectRevert(IChallengeGame.NotAccusedApprover.selector);
-        game.dispute(id, type(uint256).max);
+        game.dispute(id, target / 2);
         vm.stopPrank();
+
+        assertEq(game.counterBondContributionOf(id, stranger), target / 2, "a non-approver's stake is recorded");
+        assertEq(game.challengeOf(id).counterBondWood, target / 2, "and it counts toward the pool");
+        assertEq(
+            uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Filed), "half a pool buys no escalation"
+        );
     }
 
-    /// @notice A guardian that released its commitment before the filing is not
-    ///         among the accused, so it has nothing to defend here either.
-    function test_dispute_revertsForAReleasedApprover() public {
+    /// @notice A guardian that released its commitment before the filing may
+    ///         fund too. It is not itself at risk, but its WOOD is: the forfeit
+    ///         rule does not care who posted it, which is exactly why the
+    ///         identity check was redundant.
+    function test_dispute_aReleasedApproverMayFundTheDefence() public {
         _setCoverage(PROPOSAL, 10_000e18, 0);
         _execute(PROPOSAL);
         vm.prank(challenger);
@@ -1113,8 +1162,12 @@ contract ChallengeGameTest is Test {
             game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.RogueAllowance, ADAPTER, SELECTOR, EVIDENCE);
 
         vm.prank(guardianB);
-        vm.expectRevert(IChallengeGame.NotAccusedApprover.selector);
         game.dispute(id, type(uint256).max);
+
+        assertEq(
+            uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Disputed), "a full pool buys the dispute"
+        );
+        assertEq(game.counterBondContributionOf(id, guardianB), game.challengeOf(id).bondWood, "funded in full");
     }
 
     /// @notice The dispute window closes exactly where the auto-slash opens —
@@ -1173,6 +1226,7 @@ contract ChallengeGameTest is Test {
         vm.expectEmit(true, true, true, true, address(game));
         emit IChallengeGame.ChallengeFailed(id, 10_000e18, 2_000e18);
         game.resolve(id);
+        _claimAll(id); // pull-payment: funders collect before balances are asserted
 
         IChallengeGame.Challenge memory c = game.challengeOf(id);
         assertEq(uint8(c.status), uint8(IChallengeGame.Status.Failed));
@@ -1228,6 +1282,7 @@ contract ChallengeGameTest is Test {
 
         vm.warp(vm.getBlockTimestamp() + game.disputeTimeout());
         game.resolve(id);
+        _claimAll(id); // pull-payment: funders collect before balances are asserted
 
         // Each gets its stake back plus its contribution-weighted slice of what
         // survives the burn. The BURN CHANGES THE POT, NOT THE KEY: the split is
@@ -1520,6 +1575,7 @@ contract ChallengeGameTest is Test {
         game.dispute(id, type(uint256).max);
         vm.warp(vm.getBlockTimestamp() + game.disputeTimeout());
         game.resolve(id);
+        _claimAll(id); // pull-payment: funders collect before balances are asserted
 
         assertEq(wood.balanceOf(challenger), before, "the challenger loses the bond outright");
         _assertLiveBondsBacked();
@@ -1628,7 +1684,15 @@ contract ChallengeGameTest is Test {
             game.resolve(ids[order[i]]);
             _assertLiveBondsBacked();
         }
-        assertEq(wood.balanceOf(address(game)), 0, "nothing stranded once every challenge is terminal");
+        // "Nothing stranded" now means "nothing UNACCOUNTED": resolution records
+        // entitlements instead of pushing them out, so whatever the game still
+        // holds is owed to a funder that has not collected yet.
+        assertEq(
+            wood.balanceOf(address(game)),
+            game.unclaimedWood(),
+            "every wei still held is owed to a funder, none is stranded"
+        );
+        assertEq(game.bondedWood(), 0, "and no challenge is live");
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1825,6 +1889,7 @@ contract ChallengeGameTest is Test {
         // The clock runs out on the part-funded defence.
         vm.warp(_filedAt(id) + game.autoSlashDelay());
         game.resolve(id);
+        _claimAll(id); // pull-payment: funders collect before balances are asserted
 
         assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Settled), "silence was the verdict");
         assertEq(swood.callCount(), 1, "the contributors are still slashed - the refund is not an acquittal");
@@ -1974,14 +2039,21 @@ contract ChallengeGameTest is Test {
 
         vm.warp(vm.getBlockTimestamp() + game.disputeTimeout());
         game.resolve(id);
+        _claimAll(id); // pull-payment: funders collect before balances are asserted
+
+        _claim(id, sybil1);
+        _claim(id, sybil2);
 
         uint256 payout = bond - (bond * game.forfeitBurnBps()) / 10_000;
         uint256 s1Gain = wood.balanceOf(sybil1) - s1Before;
         uint256 s2Gain = wood.balanceOf(sybil2) - s2Before;
         assertEq(s1Gain, (payout * 25) / 100, "25% of the pool bought 25% of the distributed forfeit");
-        assertEq(
-            s1Gain + s2Gain, payout, "the operator recovers exactly the unburned forfeit, split across its identities"
-        );
+        // Within rounding: lazy shares floor independently, so the split can be
+        // short by under one wei per identity. The POINT of this test is that
+        // splitting identities buys no advantage, and that survives exactly —
+        // the shortfall is dust and it costs the sybil, never the protocol.
+        assertLe(s1Gain + s2Gain, payout, "identity-splitting never recovers MORE than the unburned forfeit");
+        assertGt(s1Gain + s2Gain + 2, payout, "and recovers it to within rounding");
         assertNotEq(s1Gain, s2Gain, "and not by halves");
         assertEq(wood.balanceOf(address(game)), 0, "nothing stranded");
     }
@@ -2022,6 +2094,7 @@ contract ChallengeGameTest is Test {
         //         forfeit comes back to the only contributor, which is itself.
         vm.warp(_filedAt(id) + game.disputeTimeout());
         game.resolve(id);
+        _claimAll(id); // pull-payment: funders collect before balances are asserted
 
         uint256 burnAmount = (bond * game.forfeitBurnBps()) / 10_000;
         assertGt(burnAmount, 0, "a zero burn would leave the round trip free");
@@ -2059,6 +2132,7 @@ contract ChallengeGameTest is Test {
 
         vm.warp(_filedAt(id) + game.disputeTimeout());
         game.resolve(id);
+        _claimAll(id); // pull-payment: funders collect before balances are asserted
 
         uint256 burnAmount = (bond * game.forfeitBurnBps()) / 10_000;
         uint256 combinedBefore = filerBefore + funderBefore;
@@ -2085,6 +2159,7 @@ contract ChallengeGameTest is Test {
 
         vm.warp(_filedAt(id) + game.disputeTimeout());
         game.resolve(id);
+        _claimAll(id); // pull-payment: funders collect before balances are asserted
 
         uint256 gain = wood.balanceOf(guardianA) - aBefore;
         assertEq(gain, (bond * 8_000) / 10_000, "contribution back, plus 80% of the bond it defeated");
@@ -2108,6 +2183,7 @@ contract ChallengeGameTest is Test {
 
         vm.warp(_filedAt(id) + game.disputeTimeout());
         game.resolve(id);
+        _claimAll(id); // pull-payment: funders collect before balances are asserted
 
         assertEq(wood.balanceOf(guardianB), bBefore, "40% of the coverage, 0% of the defence, 0% of the forfeit");
         assertEq(game.counterBondContributionOf(id, guardianB), 0, "and it is the contribution that is zero");
@@ -2166,17 +2242,37 @@ contract ChallengeGameTest is Test {
 
         vm.warp(_filedAt(id) + game.disputeTimeout());
         game.resolve(id);
+        _claimAll(id); // pull-payment: funders collect before balances are asserted
+
+        _claim(id, sybil1);
 
         uint256 aGain = wood.balanceOf(guardianA) - aBefore;
         uint256 sGain = wood.balanceOf(sybil1) - sBefore;
         uint256 bGain = wood.balanceOf(guardianB) - bBefore;
+
+        // EVERY share floors independently now. The push version handed the last
+        // recipient `payout - distributed` so the forfeit landed to the wei —
+        // but that required the loop `claimContribution` exists to remove, so
+        // the exactness was bought with the unbounded-list hazard. Each funder
+        // now gets exactly its own floor, the last one included.
         assertEq(aGain, (payout * aPut) / bond, "pro-rata on the PAYOUT, not on the bond");
         assertEq(sGain, (payout * sPut) / bond);
-        assertEq(bGain, payout - aGain - sGain, "the last funder absorbs the remainder");
-        assertEq(aGain + sGain + bGain + burnAmount, bond, "burn + distributed == bond, to the wei");
+        assertEq(bGain, (payout * bPut) / bond, "the last funder floors like everyone else");
+
+        // WHAT REPLACES "to the wei": never over-paid, and short by less than one
+        // wei per funder. That bound is the entire cost of dropping the loop.
+        uint256 distributed = aGain + sGain + bGain;
+        assertLe(distributed + burnAmount, bond, "the forfeit can never over-pay");
+        assertGt(distributed + burnAmount + 3, bond, "and is short by under one wei per funder");
+
         assertEq(wood.balanceOf(game.BURN_ADDRESS()), burnAmount, "the dead address got exactly the burn");
-        assertEq(wood.balanceOf(address(game)), 0, "and not one wei is stranded");
-        assertEq(game.bondedWood(), 0, "burned WOOD left the accounting with the contract");
+
+        // The dust is not lost track of — it stays counted in `unclaimedWood`,
+        // which is why the custody invariant is `>=` and not `==`.
+        uint256 dust = bond - distributed - burnAmount;
+        assertEq(wood.balanceOf(address(game)), dust, "only the rounding dust is left behind");
+        assertEq(game.unclaimedWood(), dust, "and it is still accounted, not silently stranded");
+        assertEq(game.bondedWood(), 0, "no challenge is live");
         _assertLiveBondsBacked();
     }
 
@@ -2196,6 +2292,7 @@ contract ChallengeGameTest is Test {
 
         vm.warp(_filedAt(id) + game.disputeTimeout());
         game.resolve(id);
+        _claimAll(id); // pull-payment: funders collect before balances are asserted
 
         assertEq(wood.balanceOf(guardianA) - aBefore, bond, "the entire forfeit, exactly as before the burn existed");
         assertEq(wood.balanceOf(game.BURN_ADDRESS()), 0, "and nothing was sent to the dead address at all");
