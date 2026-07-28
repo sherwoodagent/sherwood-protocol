@@ -196,6 +196,11 @@ interface IChallengeGame {
     ///      🟠F4). This is a membership test over stored calls, not a second
     ///      calldata parser, so D1's one-security-model rule is intact.
     error AdapterNotInProposal();
+    /// @notice `file` refused because the owner has paused NEW filings (spec §4:
+    ///         the owner's ONLY lever over adjudication). Never raised anywhere
+    ///         else — dispute/resolve/rule/claims are unaffected, so no in-flight
+    ///         challenge's rights depend on the owner.
+    error FilingsPaused();
 
     // ── Events ──
     /// @dev `evidenceURI` is carried on-chain unindexed so predicates 2 and 3 —
@@ -275,6 +280,7 @@ interface IChallengeGame {
     event AutoSlashDelaySet(uint256 oldDelay, uint256 newDelay);
     event DisputeTimeoutSet(uint256 oldTimeout, uint256 newTimeout);
     event SettleBurnBpsSet(uint256 oldBps, uint256 newBps);
+    event FilingsPausedSet(bool paused);
 
     // ── Filing ──
     /// @notice File a bonded challenge against an executed proposal, freezing
@@ -454,6 +460,10 @@ interface IChallengeGame {
     ///         the zero address while none is wired — in which case Plan D's
     ///         behaviour is unchanged and `Disputed` remains terminal-by-timeout.
     function court() external view returns (address);
+    /// @notice The ONLY human backstop in the adjudication stack (spec §4):
+    ///         gates `file` alone. dispute/resolve/rule/claims always run, so
+    ///         no in-flight challenge's rights depend on the owner.
+    function filingsPaused() external view returns (bool);
 
     // ── Owner setters ──
     /// @notice Wire (or unwire) the court. The zero address is DELIBERATELY
@@ -476,4 +486,5 @@ interface IChallengeGame {
     function setAutoSlashDelay(uint256 newDelay) external;
     function setDisputeTimeout(uint256 newTimeout) external;
     function setSettleBurnBps(uint256 newBps) external;
+    function setFilingsPaused(bool paused) external;
 }

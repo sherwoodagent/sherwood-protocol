@@ -221,6 +221,21 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///         adjudicator that can force slashes.
     address public court;
 
+    /// @notice The ONLY human backstop in the whole adjudication stack (spec
+    ///         §4): true gates `file` alone. Never checked in `dispute`,
+    ///         `resolve`, `rule`, or either claim path, so no in-flight
+    ///         challenge's rights ever depend on the owner.
+    /// @dev    THE ADVERSARY IS THE OWNER ITSELF (spec §4). Pausing referrals —
+    ///         i.e. anything that could freeze `dispute`/`resolve`/`rule` mid-
+    ///         flight — was rejected for exactly this reason: a disputed-but-
+    ///         not-yet-referred challenge would drift into `disputeTimeout`'s
+    ///         `_fail` branch and forfeit the challenger's bond by owner
+    ///         inaction, not by anything the challenger did. Restricting the
+    ///         lever to `file` means the worst a hostile or compromised owner
+    ///         can do is stop NEW challenges from starting; it can never reach
+    ///         into one that already exists.
+    bool public filingsPaused;
+
     /// @notice How long after execution a proposal remains challengeable
     ///         (spec §5: 14d initial, matching the ledger's coverage window —
     ///         coverage that has expired out of the exposure buckets can no
@@ -428,6 +443,12 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         bytes4 adapterSelector,
         string calldata evidenceURI
     ) external returns (uint256 challengeId) {
+        // THE OWNER'S ONLY LEVER (spec §4), checked FIRST and before anything
+        // else runs: pausing stops a NEW filing from ever starting, full stop.
+        // It says nothing about any challenge already in flight — see
+        // `filingsPaused`'s natspec for why that boundary is deliberate.
+        if (filingsPaused) revert FilingsPaused();
+
         // A challenge accuses an EXECUTED proposal: there is no drain to allege
         // before execution, and `executedAt` is what §3.8's pre-drain snapshot
         // is derived from on the slash path. The whole proposal is read once
@@ -1384,5 +1405,13 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         if (newBps > MAX_SETTLE_BURN_BPS) revert InvalidParameter();
         emit SettleBurnBpsSet(settleBurnBps, newBps);
         settleBurnBps = newBps;
+    }
+
+    /// @dev Gates `file` ONLY (see `filingsPaused`). Deliberately touches
+    ///      nothing else — no other setter here, and no path in `dispute`,
+    ///      `resolve`, `rule`, or either claim function, ever reads this flag.
+    function setFilingsPaused(bool paused) external onlyOwner {
+        filingsPaused = paused;
+        emit FilingsPausedSet(paused);
     }
 }

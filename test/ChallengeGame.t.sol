@@ -2480,4 +2480,44 @@ contract ChallengeGameTest is Test {
         vm.prank(owner);
         game.setForfeitBurnBps(3_500);
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Task 3 — filings pause: the owner's ONLY lever over adjudication
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice The pause gates `file` ALONE. An in-flight challenge (already
+    ///         disputed before the pause) keeps running end to end — rule and
+    ///         claims both still work — and unpausing restores filing.
+    function test_setFilingsPaused_gatesFileOnly() public {
+        uint256 id = _fileAndDispute(); // in-flight challenge BEFORE the pause
+        vm.prank(owner);
+        game.setFilingsPaused(true);
+
+        // New filings refused... (inlined from `_fileStandard`: `vm.expectRevert`
+        // only arms the NEXT call, and the fixture makes several external calls
+        // of its own before reaching `file`).
+        _setCoverage(2, 6_000e18, 4_000e18);
+        _execute(2);
+        vm.warp(vm.getBlockTimestamp() + 3 days);
+        vm.prank(challenger);
+        vm.expectRevert(IChallengeGame.FilingsPaused.selector);
+        game.file(address(gov), 2, IChallengeGame.Predicate.OutOfAdapterOutflow, ADAPTER, SELECTOR, EVIDENCE);
+
+        // ...but every in-flight right still runs: rule, claims.
+        vm.prank(court);
+        game.rule(id, IChallengeGame.Verdict.Inconclusive);
+        vm.prank(guardianA);
+        game.claimContribution(id);
+
+        // And unpausing restores filing.
+        vm.prank(owner);
+        game.setFilingsPaused(false);
+        _fileStandard(3);
+    }
+
+    function test_setFilingsPaused_onlyOwner() public {
+        vm.prank(challenger);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, challenger));
+        game.setFilingsPaused(true);
+    }
 }
