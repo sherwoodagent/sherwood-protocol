@@ -440,19 +440,46 @@ contract TokenCourtTest is Test {
         swood.setPastVotes(exited, snap, 400e18); // historic weight survives the exit
         swood.setVotes(exited, 0); // present holdings: none
         vm.prank(exited);
-        vm.expectRevert(ITokenCourt.NoVotingPower.selector);
+        vm.expectRevert(ITokenCourt.NoPresentHoldings.selector);
         court.vote(id, false);
+    }
+
+    /// @dev The mock's `getVotes` can't distinguish "claimed and gone" from
+    ///      "requested, cooling down, WOOD still locked in the contract" —
+    ///      both collapse to present votes == 0 the instant
+    ///      `requestUnstakeGuardian` re-anchors `stakedAt` and zeros the
+    ///      checkpoint (real contract; see `StakedWood.requestUnstakeGuardian`).
+    ///      That is the point: the gate is binary on present holdings, so a
+    ///      guardian mid-cooldown is refused exactly like one who already
+    ///      claimed out — there is no partial credit for "technically still
+    ///      recoverable". The REAL request -> vote-reverts arc, on a real
+    ///      `StakedWood` stack, is proven end-to-end in
+    ///      `TokenCourtEndToEnd.t.sol`'s `test_arc_requestedUnstakeMidCooldown_blocksVote`.
+    function test_vote_refusesAGuardianMidCooldown() public {
+        uint256 id = _referredCase();
+        uint256 snap = court.caseOf(id).snapshotTs;
+        address cooling = makeAddr("cooling");
+        swood.setPastVotes(cooling, snap, 250e18); // historic weight, staked before the drain
+        swood.setVotes(cooling, 0); // requested unstake: present votes already zeroed, WOOD still locked
+        vm.prank(cooling);
+        vm.expectRevert(ITokenCourt.NoPresentHoldings.selector);
+        court.vote(id, true);
     }
 
     function test_vote_acceptsACurrentHolderWithHistoricWeight() public {
         uint256 id = _referredCase();
-        swood.setVotes(voterA, 1); // any present stake at all
+        swood.setVotes(voterA, 42); // present stake distinguishable from the mock's default-1
         vm.prank(voterA);
         court.vote(id, true);
         assertEq(court.caseOf(id).guiltyVotes, 300e18, "weight is still the SNAPSHOT figure, not the present one");
     }
 
-    function test_vote_refusesPresentHolderWithNoSnapshotWeight() public {
+    /// @dev The latecomer has NO snapshot weight, so the pre-existing
+    ///      `weight == 0` check (`NoVotingPower`) fires before the
+    ///      present-holdings gate (`NoPresentHoldings`) is ever reached —
+    ///      mutation-confirmed: deleting the B4 gate does not fail this test.
+    ///      Kept anyway because it pins that ordering explicitly.
+    function test_vote_snapshotCheckFiresBeforeTheHoldingsGate() public {
         uint256 id = _referredCase();
         address latecomer = makeAddr("latecomer");
         swood.setVotes(latecomer, 5_000e18); // bought in after the drain

@@ -870,4 +870,79 @@ contract TokenCourtEndToEndTest is Test {
 
         assertEq(wood.balanceOf(address(court)), 0, "court custody is zero, always");
     }
+
+    // ── 6. Present-holdings gate (B4): requesting to unstake mid-cooldown blocks a vote ──
+
+    /// @notice The whole premise of the present-holdings gate -- historic
+    ///         weight surviving while present holdings are gone -- was
+    ///         previously asserted only through `MockStakedWood`'s settable
+    ///         storage (`TokenCourt.t.sol`). This arc proves it on the real
+    ///         `StakedWood` stack: g3's RAW stake checkpoint at the snapshot
+    ///         (`getPastStake`) is genuinely immutable across
+    ///         `requestUnstakeGuardian` -- checkpoints are append-only.
+    ///         `getPastVotes(snapshotTs)` is a subtler read: it re-derives
+    ///         the age factor from the guardian's CURRENT (mutable)
+    ///         `stakedAt` every call (review F17's own basis mismatch), so
+    ///         once `requestUnstakeGuardian` re-anchors `stakedAt` to now,
+    ///         a later call to `getPastVotes(g3, snapshotTs)` recomputes at
+    ///         `ageFloorBps` too -- it does NOT freeze at its pre-request
+    ///         value. That is not a hole in the gate: `getPastVotes` STAYS
+    ///         NONZERO (floored, never zeroed), which is exactly the
+    ///         "still votes at 25% of historic weight" shape B4 describes --
+    ///         the gate has to be the present-holdings check, because the
+    ///         historic weight alone can never reach zero here. Present
+    ///         holdings, meanwhile, are zeroed from the REQUEST instant --
+    ///         before `claimUnstakeGuardian` ever runs, and long before
+    ///         `coolDownPeriod` (45 days here) could elapse. The attack
+    ///         this closes dies at the vote, not at the claim.
+    function test_arc_requestedUnstakeMidCooldown_blocksVote() public {
+        uint256 pid = _proposeApproveExecute();
+
+        vm.prank(challenger);
+        uint256 cid = game.file(
+            address(gov),
+            pid,
+            IChallengeGame.Predicate.ProposerLinkedOutflow,
+            address(adapter),
+            adapter.poke.selector,
+            "ipfs://evidence/mid-cooldown"
+        );
+
+        _disputeFull(cid);
+        uint256 caseId = court.caseOfChallenge(cid);
+        assertTrue(caseId != 0);
+        uint256 snapshotTs = court.caseOf(caseId).snapshotTs;
+
+        vm.prank(g2);
+        court.vote(caseId, true); // g2 alone clears the participation floor
+
+        assertTrue(swood.getPastVotes(g3, snapshotTs) != 0, "g3 held weight at the snapshot");
+        uint256 g3RawStakeAtSnapshot = swood.getPastStake(g3, snapshotTs);
+        assertTrue(g3RawStakeAtSnapshot != 0, "g3's raw checkpoint at the snapshot is nonzero");
+
+        // g3 requests to unstake. Still mid-cooldown -- nothing claimed,
+        // WOOD still locked in `swood` -- but present holdings are already
+        // gone.
+        vm.prank(g3);
+        swood.requestUnstakeGuardian();
+
+        assertEq(
+            swood.getPastStake(g3, snapshotTs), g3RawStakeAtSnapshot, "the RAW checkpoint at the snapshot is immutable"
+        );
+        assertTrue(
+            swood.getPastVotes(g3, snapshotTs) != 0,
+            "historic AGED weight still nonzero (floored, never zeroed) -- the gate must be present-holdings, not history"
+        );
+        assertEq(swood.getVotes(g3), 0, "present holdings zeroed from the REQUEST instant, not the claim");
+
+        vm.prank(g3);
+        vm.expectRevert(ITokenCourt.NoPresentHoldings.selector);
+        court.vote(caseId, true);
+
+        _warpPastVoteWindow(caseId);
+        court.finalize(caseId);
+        assertEq(
+            uint256(court.caseOf(caseId).verdict), uint256(IChallengeGame.Verdict.Guilty), "g2 alone still convicts"
+        );
+    }
 }

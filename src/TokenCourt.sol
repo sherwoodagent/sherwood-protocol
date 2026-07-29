@@ -250,6 +250,29 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///         would have summed for the same voters; the floor stays
     ///         conservative rather than reachable by an aged-down electorate.
     ///         See `_participationFloor`.
+    /// @dev    PRESENT HOLDINGS ARE A GATE, NEVER A WEIGHT (spec 2026-07-29
+    ///         §3, B4). Historical weight still decides how much a vote
+    ///         counts — that is the D2 flash-loan defence above, and it is
+    ///         unchanged. This decides only WHETHER the caller may vote at
+    ///         all — you must be an active guardian (present stake, no
+    ///         pending unstake request) at the INSTANT you cast, nothing
+    ///         about before or after. `requestUnstakeGuardian` — not
+    ///         `claimUnstakeGuardian` — is where the leak actually opens: it
+    ///         re-anchors `stakedAt` and pushes a 0 stake checkpoint, so
+    ///         `getVotes` already reads zero from the request instant, well
+    ///         before the cooldown that `claimUnstakeGuardian` waits out. The
+    ///         gate is evaluated only at vote time, so it does not make
+    ///         voting capital illiquid for the rest of the case — vote, then
+    ///         request, then claim once `coolDownPeriod` elapses (floor 1
+    ///         day), all comfortably before `finalize`, is untouched. Nor
+    ///         does it drive alignment to exactly zero: a fully exited holder
+    ///         can re-stake `minGuardianStake` and pass the gate while still
+    ///         voting at the historic weight — the residual this leaves is
+    ///         bounded by `minGuardianStake`, not eliminated. That is the
+    ///         inherent shape of a binary gate, not a bug in it.
+    ///         Re-WEIGHTING on present holdings would reintroduce the
+    ///         post-hoc accumulation the snapshot exists to close, so this
+    ///         stays binary.
     function vote(uint256 caseId, bool guilty) external {
         ITokenCourt.Case storage c = _cases[caseId];
         if (c.phase != ITokenCourt.Phase.Voting) revert WrongPhase();
@@ -259,19 +282,8 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
 
         uint256 weight = IStakedWood(stakedWood).getPastVotes(msg.sender, c.snapshotTs);
         if (weight == 0) revert NoVotingPower();
-        // PRESENT HOLDINGS ARE A GATE, NEVER A WEIGHT (spec 2026-07-29 §3).
-        // Historical weight still decides how much a vote counts - that is the
-        // D2 flash-loan defence and it is unchanged. This decides only WHETHER
-        // you may vote, and it exists because `claimUnstakeGuardian` deletes
-        // the guardian record: `stakedAt` becomes 0, `_ageFactorBps` floors at
-        // `ageFloorBps`, and the raw checkpoint at `snapshotTs` survives the
-        // exit. Without this line an attacker pre-positions stake, executes the
-        // drain, requests unstake, votes to acquit at 25% of historic weight,
-        // and claims out - voting capital liquid before the verdict lands, and
-        // alignment exactly zero for the party most motivated to vote.
-        // Re-WEIGHTING on present holdings would reintroduce the post-hoc
-        // accumulation the snapshot exists to close, so this stays binary.
-        if (IStakedWood(stakedWood).getVotes(msg.sender) == 0) revert NoVotingPower();
+        // Present-holdings gate (B4) — see the @dev block above `vote`.
+        if (IStakedWood(stakedWood).getVotes(msg.sender) == 0) revert NoPresentHoldings();
 
         voteOf[caseId][msg.sender] = guilty ? ITokenCourt.Ruling.Guilty : ITokenCourt.Ruling.NotGuilty;
         if (guilty) {

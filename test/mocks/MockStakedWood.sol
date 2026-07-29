@@ -17,23 +17,33 @@ import {IStakedWood} from "../../src/interfaces/IStakedWood.sol";
 ///         Mirrors the shape of `MockRegistryMinimal`: defaults model an
 ///         "empty cohort" — `getPast*` returns 0, `isActiveGuardian` returns
 ///         false, totals are 0 — so governor unit tests that only touch the
-///         optimistic path keep their previous semantics. Tests that drive
-///         guardian-review slashing should use a real `StakedWood` proxy via
+///         optimistic path keep their previous semantics. The ONE deliberate
+///         exception is `getVotes` (present holdings, B4's gate) — see its
+///         own doc below for why, and why it still can't express a state the
+///         real `StakedWood` can't produce. Tests that drive guardian-review
+///         slashing should use a real `StakedWood` proxy via
 ///         `RegistryTestHarness`.
 contract MockStakedWood is IStakedWood {
     // ── Settable reads ──
     address public wood;
     mapping(address => uint256) internal _votes;
-    /// @dev Tracks whether `setVotes` was ever called for an account. `getVotes`
-    ///      (present holdings) defaults to 1 — NOT 0 — for any account that
-    ///      hasn't had it explicitly set, because the vast majority of existing
-    ///      fixtures set snapshot weight via `setPastVotes` and never touch
-    ///      `getVotes` at all; they are modeling a voter who still holds, just
-    ///      without bothering to say so. Only a test that calls `setVotes(acct,
-    ///      0)` explicitly is modeling a fully-exited holder (present-holdings
-    ///      gate, B4). Defaulting to 0 instead would make every such fixture
-    ///      fail the present-holdings gate for the wrong reason.
+    /// @dev Tracks whether `setVotes` was ever called for an account.
     mapping(address => bool) internal _votesSet;
+    /// @dev Tracks whether `setPastVotes` was ever called for an account, at
+    ///      any timestamp. `getVotes` (present holdings) defaults to 1 — NOT
+    ///      0 — for an account that has snapshot weight recorded somewhere
+    ///      but no explicit `setVotes` call, because the vast majority of
+    ///      existing fixtures set weight via `setPastVotes` alone and are
+    ///      modeling a voter who still holds, just without bothering to say
+    ///      so explicitly. An account with NEITHER call defaults `getVotes`
+    ///      to 0, same as the rest of the "empty cohort" surface — this
+    ///      keeps the mock from expressing `getVotes == 1 && isActiveGuardian
+    ///      == false` for an account nothing ever configured, a combination
+    ///      the real `StakedWood` cannot produce (both reduce to
+    ///      `stakedAmount > 0 && unstakeRequestedAt == 0`). Only an explicit
+    ///      `setVotes(acct, 0)` after `setPastVotes` models a fully-exited
+    ///      holder (the present-holdings gate, B4).
+    mapping(address => bool) internal _hasPastVotes;
     mapping(address => mapping(uint256 => uint256)) internal _pastVotes;
     mapping(uint256 => uint256) internal _pastTotalVotes;
     mapping(uint256 => uint256) internal _pastTotalSupply;
@@ -72,6 +82,7 @@ contract MockStakedWood is IStakedWood {
 
     function setPastVotes(address guardian, uint256 timestamp, uint256 v) external {
         _pastVotes[guardian][timestamp] = v;
+        _hasPastVotes[guardian] = true;
     }
 
     function setPastTotalVotes(uint256 timestamp, uint256 v) external {
@@ -144,7 +155,8 @@ contract MockStakedWood is IStakedWood {
 
     // ── Checkpoint reads ──
     function getVotes(address account) external view returns (uint256) {
-        return _votesSet[account] ? _votes[account] : 1;
+        if (_votesSet[account]) return _votes[account];
+        return _hasPastVotes[account] ? 1 : 0;
     }
 
     function getPastVotes(address guardian, uint256 timestamp) external view returns (uint256) {

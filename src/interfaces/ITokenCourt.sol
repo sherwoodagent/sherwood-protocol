@@ -117,8 +117,17 @@ interface ITokenCourt {
     ///         cannot vote on their own verdict.
     error AccusedCannotVote();
     /// @notice `vote` called by an address whose `getPastVotes` at
-    ///         `snapshotTs` is zero — no aged weight, no ballot.
+    ///         `snapshotTs` is zero — no aged weight, no ballot. This is a
+    ///         verdict on the past: the address held nothing at the snapshot
+    ///         and there is no remedy — it was never going to be a voter on
+    ///         this case.
     error NoVotingPower();
+    /// @notice `vote` called by an address that had weight at `snapshotTs`
+    ///         but holds nothing NOW (`getVotes == 0`) — B4, the present-
+    ///         holdings gate. Distinct from `NoVotingPower` because the
+    ///         remedy is the opposite: re-stake at least `minGuardianStake`
+    ///         and the same historic weight becomes votable again.
+    error NoPresentHoldings();
 
     /// @notice A case opened. `snapshotTs` is logged here so indexers never
     ///         need a second read to learn the electorate cutoff `refer`
@@ -229,7 +238,12 @@ interface ITokenCourt {
     /// @notice Cast the one vote this address gets on `caseId`.
     /// @dev    Weight is `getPastVotes(msg.sender, case.snapshotTs)` — aged,
     ///         snapshot-fixed. Reverts outside the open window, for a second
-    ///         vote, for an accused address, or for zero weight.
+    ///         vote, for an accused address, for zero snapshot weight
+    ///         (`NoVotingPower`), or for holding nothing at the present
+    ///         instant (`NoPresentHoldings`, B4) — the caller must be an
+    ///         active guardian (present stake, no pending unstake request) at
+    ///         the moment the vote is cast, even though the weight it counts
+    ///         for is the historic one.
     function vote(uint256 caseId, bool guilty) external;
     /// @notice Close the vote window and adjudicate `caseId`.
     /// @dev    Requires the window to have elapsed. `Inconclusive` when
