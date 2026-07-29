@@ -126,7 +126,9 @@ interface ITokenCourt {
     ///         but holds nothing NOW (`getVotes == 0`) — B4, the present-
     ///         holdings gate. Distinct from `NoVotingPower` because the
     ///         remedy is the opposite: re-stake at least `minGuardianStake`
-    ///         and the same historic weight becomes votable again.
+    ///         and the address becomes votable again — at the historic raw
+    ///         checkpoint discounted to `ageFloorBps`, because the re-stake
+    ///         re-anchors `stakedAt`, not at its original historic weight.
     error NoPresentHoldings();
 
     /// @notice A case opened. `snapshotTs` is logged here so indexers never

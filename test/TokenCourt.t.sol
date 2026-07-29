@@ -479,11 +479,33 @@ contract TokenCourtTest is Test {
     ///      present-holdings gate (`NoPresentHoldings`) is ever reached —
     ///      mutation-confirmed: deleting the B4 gate does not fail this test.
     ///      Kept anyway because it pins that ordering explicitly.
-    function test_vote_snapshotCheckFiresBeforeTheHoldingsGate() public {
+    /// @dev The latecomer has present holdings but NO snapshot weight, so it
+    ///      fails only the pre-existing `weight == 0` check -- it never even
+    ///      reaches the present-holdings gate. This does NOT pin the two
+    ///      checks' ORDERING: an address failing just one check gets the same
+    ///      error regardless of which check runs first. See
+    ///      `test_vote_bothChecksFail_getsNoVotingPowerNotNoPresentHoldings`
+    ///      for the test that actually is ordering-sensitive.
+    function test_vote_presentHolderWithoutSnapshotWeightRevertsNoVotingPower() public {
         uint256 id = _referredCase();
         address latecomer = makeAddr("latecomer");
         swood.setVotes(latecomer, 5_000e18); // bought in after the drain
         vm.prank(latecomer);
+        vm.expectRevert(ITokenCourt.NoVotingPower.selector);
+        court.vote(id, true);
+    }
+
+    /// @dev An address failing BOTH checks must get `NoVotingPower` ("no
+    ///      remedy — never had snapshot weight"), not `NoPresentHoldings`
+    ///      ("re-stake and you're fine" — false here, re-staking cannot
+    ///      manufacture weight at a past snapshot). This IS ordering-
+    ///      sensitive: swap the two checks in `vote` and this test starts
+    ///      failing, because the present-holdings check would then fire
+    ///      first and revert `NoPresentHoldings` instead.
+    function test_vote_bothChecksFail_getsNoVotingPowerNotNoPresentHoldings() public {
+        uint256 id = _referredCase();
+        address neither = makeAddr("neither"); // no setPastVotes, no setVotes: zero on both axes
+        vm.prank(neither);
         vm.expectRevert(ITokenCourt.NoVotingPower.selector);
         court.vote(id, true);
     }

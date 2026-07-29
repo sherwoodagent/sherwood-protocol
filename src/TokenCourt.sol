@@ -266,10 +266,14 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///         request, then claim once `coolDownPeriod` elapses (floor 1
     ///         day), all comfortably before `finalize`, is untouched. Nor
     ///         does it drive alignment to exactly zero: a fully exited holder
-    ///         can re-stake `minGuardianStake` and pass the gate while still
-    ///         voting at the historic weight — the residual this leaves is
-    ///         bounded by `minGuardianStake`, not eliminated. That is the
-    ///         inherent shape of a binary gate, not a bug in it.
+    ///         can re-stake `minGuardianStake` and pass the gate again —
+    ///         voting at the historic raw checkpoint discounted to
+    ///         `ageFloorBps`, because the re-stake re-anchors `stakedAt`, NOT
+    ///         at its original historic weight. That returns the bypass to
+    ///         exactly the 25%-of-historic-weight shape B4 describes, now
+    ///         costing `minGuardianStake` instead of nothing — a residual
+    ///         bounded by that cost, not eliminated. That is the inherent
+    ///         shape of a binary gate, not a bug in it.
     ///         Re-WEIGHTING on present holdings would reintroduce the
     ///         post-hoc accumulation the snapshot exists to close, so this
     ///         stays binary.
@@ -466,6 +470,18 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///       `_participationFloor` subtracts this sum from `getPastTotalVotes`,
     ///       which sums raw own stake — the two must be the same basis or the
     ///       subtraction compares two different measures of the same WOOD.
+    ///       POST-A5: the raw basis is not merely a units argument — it also
+    ///       denies the accused a free lever on its own conviction threshold.
+    ///       If this summed aged `getPastVotes` instead, an accused approver
+    ///       could call `requestUnstakeGuardian` — free, permissionless,
+    ///       cancellable — between the drain and `refer`, re-anchoring its
+    ///       `stakedAt` and flooring its own contribution to `ageFloorBps`.
+    ///       That shrinks the subtrahend, RAISES the floor, and can push a
+    ///       case the accused was certain to lose into `Inconclusive` (which
+    ///       unwinds both sides whole and escapes the slash entirely). The
+    ///       raw basis is immune: `getPastStake` reads the checkpointed
+    ///       amount directly, with no live, re-anchorable factor for a
+    ///       pending unstake request to move.
     /// @dev  A DOUBLE-LISTED APPROVER WOULD DOUBLE-COUNT ITS WEIGHT, so the
     ///       `isAccused` flag is checked before accumulating (dedup guard).
     ///       The ledger does not produce duplicates today; the guard costs one

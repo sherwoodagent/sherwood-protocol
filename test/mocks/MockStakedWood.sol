@@ -29,20 +29,23 @@ contract MockStakedWood is IStakedWood {
     mapping(address => uint256) internal _votes;
     /// @dev Tracks whether `setVotes` was ever called for an account.
     mapping(address => bool) internal _votesSet;
-    /// @dev Tracks whether `setPastVotes` was ever called for an account, at
-    ///      any timestamp. `getVotes` (present holdings) defaults to 1 — NOT
-    ///      0 — for an account that has snapshot weight recorded somewhere
-    ///      but no explicit `setVotes` call, because the vast majority of
-    ///      existing fixtures set weight via `setPastVotes` alone and are
-    ///      modeling a voter who still holds, just without bothering to say
-    ///      so explicitly. An account with NEITHER call defaults `getVotes`
-    ///      to 0, same as the rest of the "empty cohort" surface — this
-    ///      keeps the mock from expressing `getVotes == 1 && isActiveGuardian
-    ///      == false` for an account nothing ever configured, a combination
-    ///      the real `StakedWood` cannot produce (both reduce to
+    /// @dev Tracks whether `setPastVotes` was ever called for an account with
+    ///      a NON-ZERO value, at any timestamp — a zero-weight `setPastVotes`
+    ///      call is indistinguishable from never having been staked at all,
+    ///      so it does NOT set this flag. `getVotes` (present holdings)
+    ///      defaults to 1 — NOT 0 — for an account with real snapshot weight
+    ///      recorded somewhere but no explicit `setVotes` call, because the
+    ///      vast majority of existing fixtures set weight via `setPastVotes`
+    ///      alone and are modeling a voter who still holds, just without
+    ///      bothering to say so explicitly. An account with NEITHER a
+    ///      non-zero `setPastVotes` NOR a `setVotes` call defaults `getVotes`
+    ///      to 0, same as the rest of the "empty cohort" surface — this keeps
+    ///      the mock from expressing `getVotes == 1 && isActiveGuardian ==
+    ///      false` for an account nothing ever meaningfully configured, a
+    ///      combination the real `StakedWood` cannot produce (both reduce to
     ///      `stakedAmount > 0 && unstakeRequestedAt == 0`). Only an explicit
-    ///      `setVotes(acct, 0)` after `setPastVotes` models a fully-exited
-    ///      holder (the present-holdings gate, B4).
+    ///      `setVotes(acct, 0)` after a non-zero `setPastVotes` models a
+    ///      fully-exited holder (the present-holdings gate, B4).
     mapping(address => bool) internal _hasPastVotes;
     mapping(address => mapping(uint256 => uint256)) internal _pastVotes;
     mapping(uint256 => uint256) internal _pastTotalVotes;
@@ -82,7 +85,7 @@ contract MockStakedWood is IStakedWood {
 
     function setPastVotes(address guardian, uint256 timestamp, uint256 v) external {
         _pastVotes[guardian][timestamp] = v;
-        _hasPastVotes[guardian] = true;
+        if (v != 0) _hasPastVotes[guardian] = true;
     }
 
     function setPastTotalVotes(uint256 timestamp, uint256 v) external {

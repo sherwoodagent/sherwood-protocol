@@ -758,6 +758,22 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///         operand, after which the accused sum can never exceed the total
     ///         by construction: both traces are pushed in the same transaction
     ///         at every mutation site (stake, request, cancel, slash).
+    ///
+    ///         POST-A5: the raw basis is not merely a units argument — it also
+    ///         denies the accused a free lever on its own conviction
+    ///         threshold. If `TokenCourt._recordAccused` summed aged
+    ///         `getPastVotes` instead, an accused approver could call
+    ///         `requestUnstakeGuardian` — free, permissionless, cancellable —
+    ///         between the drain and `refer`, re-anchoring its `stakedAt` and
+    ///         flooring its own contribution to `ageFloorBps`. That shrinks
+    ///         the subtrahend, RAISES the participation floor, and can push a
+    ///         case the accused was certain to lose into `Inconclusive`
+    ///         (which unwinds both sides whole and escapes the slash
+    ///         entirely). This getter is immune: it reads the checkpointed
+    ///         amount directly, with no live, re-anchorable factor for a
+    ///         pending unstake request to move. A future refactor that
+    ///         "harmonises the two bases" onto `getPastVotes` would reopen
+    ///         this lever.
     function getPastStake(address guardian, uint256 timestamp) public view returns (uint256) {
         return _stakeCheckpoints[guardian].upperLookupRecent(uint32(timestamp));
     }
