@@ -215,15 +215,21 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///         chosen conviction-bounty recipient (`slashToEscrow`'s
     ///         `bountyTo`/`bountyBps`, spec 2026-07-29 §2) — that channel has
     ///         to be caller-chosen, since only the caller knows which
-    ///         challenger caused THIS conviction. sWOOD caps it at
-    ///         `MAX_CONVICTION_BOUNTY_BPS` itself rather than trusting this
-    ///         game's own `[0, 2_000]` clamp, for the same reason it re-clamps
-    ///         `slashBpsPer`: sWOOD is the contract that actually moves the
-    ///         WOOD, so a compromised or buggy caller here is bounded by
-    ///         sWOOD's own ceiling, not by this game's. At HEAD this game
-    ///         always passes `(address(0), 0)` — no bounty flows yet; a later
-    ///         task wires the real routing (paid only on an escalated
-    ///         conviction, never the silence settle).
+    ///         challenger caused THIS conviction. This game does NOT restate
+    ///         `MAX_CONVICTION_BOUNTY_BPS` as its own clamp anywhere:
+    ///         `setConvictionBountyBps` and `setStakedWood` both read sWOOD's
+    ///         ceiling live rather than duplicating the literal, for the same
+    ///         reason sWOOD itself re-clamps `slashBpsPer` rather than
+    ///         trusting `ExposureLedger` — sWOOD is the contract that actually
+    ///         moves the WOOD, so a compromised or buggy caller here is
+    ///         bounded by sWOOD's own ceiling, not by this game's. `_settle`
+    ///         (Task 2, spec 2026-07-29 §2) forwards the challenge's pinned
+    ///         `convictionBountyBpsAtFiling` ONLY on a CONTESTED escalated
+    ///         conviction — a `Guilty` ruling where the challenger did not
+    ///         fund its own counter-bond — and passes `(address(0), 0)` on
+    ///         every other path: the silence settle, and an escalated
+    ///         conviction the challenger self-funded (see `_settle`'s
+    ///         `contested` gate).
     IStakedWood public stakedWood;
 
     /// @notice The adjudicator for disputed challenges (spec §3.5, Plan E) — the
@@ -1114,7 +1120,46 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             // contested and lost on the merits, and a liar who picks a guardian
             // that is paying attention forfeits the whole bond on `NotGuilty`.
             // That is why the bounty is safe here at any size, and why no
-            // anti-abuse bound is needed.
+            // anti-abuse bound is needed - PROVIDED the pool that bought the
+            // escalation was actually funded by someone ELSE (see `contested`
+            // below; PR review 2026-07-29 IMPORTANT-1).
+            //
+            // CONTESTED, NOT MERELY ESCALATED. PR #50 made pool contribution
+            // permissionless, so the challenger itself can `file` then
+            // `dispute(id, type(uint256).max)` in the same flow, filling the
+            // pool with its OWN money (clamped to `bondWood`, which locks the
+            // real accused out of the only slot the pool has left). On
+            // `Guilty` that self-funded pool would still read `escalated`, and
+            // the challenger would recover bond + pool - both amounts it
+            // itself posted - PLUS the bounty, while a `NotGuilty` ruling
+            // would only cost it `forfeitBurnBps` of the bond, not the whole
+            // bond. That drops a liar's downside 5x versus never disputing at
+            // all and makes self-disputing strictly dominant even for an
+            // honest filer, which is exactly the round trip `forfeitBurnBps`
+            // was calibrated to make lossy - before this bounty gave it a
+            // revenue branch it dodges by construction, since the self-funded
+            // pool was never contested on the merits by anyone else.
+            //
+            // So the bounty pays only when `escalated` AND the challenger did
+            // NOT fund its own counter-bond: `_contributed[challengeId][c.
+            // challenger] == 0` is the existing per-contributor ledger,
+            // already keyed on this exact challenge and address, so the check
+            // is an O(1) read of state `dispute` already maintains - no new
+            // storage. The PAYOUT branch below stays keyed on `escalated`
+            // alone: a self-disputed win still returns the challenger's own
+            // bond and pool (nothing new happens there), this only closes the
+            // BOUNTY channel on top of it.
+            //
+            // WHAT THIS DOES NOT CLOSE: a SYBIL-funded pool - a second address
+            // the challenger controls, funding the pool instead of the
+            // challenger's own `msg.sender` - still reads `contested == true`
+            // here, because `_contributed` is keyed per-address and this
+            // contract cannot see through an off-chain identity link. That
+            // residual is the same one `forfeitBurnBps`'s own natspec already
+            // concedes for the two-address round trip ("this design has
+            // already conceded it cannot police identity") and is recorded in
+            // spec §2, not newly introduced by this gate.
+            bool contested = escalated && _contributed[challengeId][c.challenger] == 0;
             (slashedWood, caseId) = swood.slashToEscrow(
                 key,
                 c.executedAt,
@@ -1122,8 +1167,8 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
                 slashBpsPer,
                 c.vault,
                 c.executedAt - 1,
-                escalated ? c.challenger : address(0),
-                escalated ? c.convictionBountyBpsAtFiling : 0
+                contested ? c.challenger : address(0),
+                contested ? c.convictionBountyBpsAtFiling : 0
             );
         }
 
@@ -1578,8 +1623,37 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         forfeitBurnBps = newBps;
     }
 
+    /// @dev RE-VALIDATES `convictionBountyBps` AGAINST THE NEW SLASHER'S OWN
+    ///      CEILING (PR review 2026-07-29 IMPORTANT-2). `setConvictionBountyBps`
+    ///      only bounds a NEW rate against whichever `stakedWood` is wired at
+    ///      that moment; it says nothing about `stakedWood` itself changing
+    ///      later underneath an unchanged rate. WITHOUT THIS CHECK: re-pointing
+    ///      from a sWOOD with `MAX_CONVICTION_BOUNTY_BPS == 2_000` to one with
+    ///      `== 500` while `convictionBountyBps` is still `2_000` would leave
+    ///      every open challenge carrying a pinned `convictionBountyBpsAtFiling`
+    ///      the NEW slasher's own `slashToEscrow` rejects (`InvalidParameter`)
+    ///      the moment `_settle` tries to forward it. THIS DOES NOT STRAND THE
+    ///      CHALLENGE ITSELF, even in that unchecked scenario: a `Filed` one
+    ///      still settles fine, because the silence path never sets
+    ///      `contested` and forwards a bounty of `0` unconditionally,
+    ///      regardless of what the pinned rate is; a `Disputed` one still
+    ///      times out to `_fail` on a `NotGuilty` ruling or a timeout, neither
+    ///      of which ever calls `slashToEscrow`. What breaks is narrower and
+    ///      permanent: a CONTESTED conviction (a real `Guilty` ruling on a
+    ///      challenge someone else actually disputed) against a challenge
+    ///      pinned at a rate now above the new ceiling can never settle,
+    ///      because every `_settle` call for it reverts inside sWOOD forever.
+    ///      Checked here, at re-point time, is what prevents the owner from
+    ///      creating that state in the first place, rather than leaving it to
+    ///      surface only once a real conviction tries to land. RESIDUAL: this
+    ///      bounds the re-point against the CURRENT `convictionBountyBps`, not
+    ///      against every historical `convictionBountyBpsAtFiling` a still-open
+    ///      challenge may carry from before a rate DECREASE — the ordinary case
+    ///      this closes is the common one, a live rate that was never lowered
+    ///      colliding with a lower new ceiling.
     function setStakedWood(address stakedWood_) external onlyOwner {
         if (stakedWood_ == address(0)) revert ZeroAddress();
+        if (convictionBountyBps > IStakedWood(stakedWood_).MAX_CONVICTION_BOUNTY_BPS()) revert InvalidParameter();
         emit StakedWoodSet(address(stakedWood), stakedWood_);
         stakedWood = IStakedWood(stakedWood_);
     }
@@ -1635,11 +1709,17 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///       unwired game could accept a rate `_settle` fail-closes on today
     ///       (`ZeroAddress`), but that rate is PINNED per challenge at filing
     ///       and outlives any later `setStakedWood` — a challenge filed under a
-    ///       since-lowered or since-wired ceiling would carry a pinned rate
-    ///       sWOOD's own `slashToEscrow` then rejects forever, stranding a
-    ///       challenge with no terminal path. Failing closed here, at
-    ///       configuration time, is cheap; failing closed at resolution time,
-    ///       mid-challenge, is not.
+    ///       since-lowered ceiling would carry a pinned rate sWOOD's own
+    ///       `slashToEscrow` then rejects forever, permanently foreclosing a
+    ///       CONTESTED conviction on that one challenge (NOT "stranding the
+    ///       challenge with no terminal path" — see `setStakedWood`'s own
+    ///       natspec for the precise, narrower failure this produces: the
+    ///       silence and dispute-timeout paths are untouched, only an
+    ///       escalated `Guilty` ruling against the affected challenge can never
+    ///       settle). Failing closed here, at configuration time, is cheap;
+    ///       failing closed at resolution time, mid-challenge, is not. See
+    ///       `setStakedWood` for the OTHER direction of this same hazard — a
+    ///       re-pointed slasher whose ceiling drops below an unchanged rate.
     function setConvictionBountyBps(uint256 newBps) external onlyOwner {
         IStakedWood swood = stakedWood;
         if (address(swood) == address(0)) revert ZeroAddress();

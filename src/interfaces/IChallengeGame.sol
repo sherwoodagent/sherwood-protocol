@@ -249,6 +249,15 @@ interface IChallengeGame {
     ///         with no retry path, so that catch may not be broad; a skipped
     ///         referral here always has one, so this catch may be.
     event AutoReferFailed(uint256 indexed challengeId);
+    /// @param slashedWood What the compensation escrow (or the burn fallback)
+    ///        actually received — NOT the gross amount taken off the accused.
+    ///        On a CONTESTED escalated conviction (spec 2026-07-29 §2) this is
+    ///        NET of the conviction bounty paid to the challenger, since
+    ///        `IStakedWood.slashToEscrow` deducts the bounty before the escrow
+    ///        ever sees the proceeds; on the silence path, and on an escalated
+    ///        conviction the challenger itself funded (see `ChallengeGame.
+    ///        _settle`'s `contested` gate), no bounty is paid and this equals
+    ///        the gross slash.
     event ChallengeSettled(uint256 indexed challengeId, uint256 slashedWood, uint256 caseId);
     /// @dev The slice of the challenger's bond burned on the SETTLE path, so a
     ///      filing is never free in either direction (review 🟠F4). Distinct
@@ -259,6 +268,17 @@ interface IChallengeGame {
     /// @dev A settle that convicted nothing because an earlier challenge on the
     ///      same proposal already did. The approvers' liability is one
     ///      liability; concurrent filings do not multiply it.
+    /// @dev  WORTH A FILER KNOWING: this challenge still pays the `settleBurnBps`
+    ///       slice of its own bond (the silence-path burn applies regardless of
+    ///       which concurrent challenge actually collected) and receives
+    ///       nothing back beyond the remainder of its own bond — no slash
+    ///       share, no bounty, because nothing was slashed on ITS behalf. A
+    ///       second, independently correct challenger racing an already-
+    ///       settled one is therefore net `-settleBurnBps` of its bond for a
+    ///       filing that could never have collected — spec-compliant (the
+    ///       liability really was already collected) but easy to miss before
+    ///       filing a second challenge against a proposal that may already be
+    ///       resolved.
     event VerdictAlreadyCollected(uint256 indexed challengeId, address indexed governor, uint256 indexed proposalId);
     /// @dev A passed challenge whose adapter demotion did NOT land, because the
     ///      registry refused the call — in practice because the game's
