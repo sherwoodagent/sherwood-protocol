@@ -32,34 +32,41 @@ bountyWood = slashedWood * c.convictionBountyBpsAtFiling / 10_000;
 
 Rules:
 
-- Paid on **both** conviction paths — the silence settle and the escalated guilty ruling. The silence path is where the incentive is most broken today.
-- Paid **only when `slashedWood > 0`**. A filing that recovers nothing pays nothing, so the bounty can never fund a bogus accusation on its own.
+- **Paid ONLY on the escalated conviction** — a `Guilty` ruling from the court after the accused actually contested. **Never on the silence settle.** See "why not the silence path" below; this is the decision the whole design turns on.
+- Paid **only when `slashedWood > 0`**. A filing that recovers nothing pays nothing.
 - Deducted **before** `slashToEscrow` books the case, so the escrow's `proceeds` reflect what claimants actually receive. No accounting fiction.
 - **Not** paid on the `_convicted` short-circuit — a second challenge against an already-convicted proposal collects nothing.
-- `settleBurnBps` is **unchanged**. It is the only price on the free-slash attack (a bogus unopposed filing against a well-covered guardian), and removing it to help honest challengers would reopen that attack. The bounty is what offsets the burn for filers who are right.
+- `settleBurnBps` is **unchanged**. It remains the only price on the free-slash attack.
+
+### Why not the silence path (decision 2026-07-29)
+
+On the silence path an honest filer and a liar are **indistinguishable to the contract**:
+
+| | Honest filer | Liar |
+|---|---|---|
+| Accusation | true | false |
+| Accused response | none (guilty, or asleep) | none (asleep) |
+| Contract observes | silence | silence |
+| Payout | −burn + bounty | −burn + bounty |
+
+Any bounty that rewards one rewards the other by exactly the same amount, so **no bounty size works there**. The two constraints are literally contradictory: making honest filing profitable needs `bounty >= settleBurnBps * bond`, and keeping false filing unprofitable needs `bounty < settleBurnBps * bond`.
+
+The escalated path does not have this problem, because the accused fought back and lost on the merits. A liar who picks a guardian that is actually paying attention gets contested, loses on a `NotGuilty` ruling, and forfeits the **entire** bond. That branch separates the two filer types, so the bounty is safe there at any size — which is why no anti-abuse bound is needed and `convictionBountyBps` can be generous.
 
 ### Payoffs (coverage $1M, bond 5% = $50k, bounty 500 bps)
 
 | Outcome | Today | With bounty |
 |---|---|---|
-| Correct, unanswered | −$10k | **+$40k** |
+| Correct, unanswered | −$10k | **−$10k (unchanged, by decision)** |
 | Disputed → Guilty | +$50k | **+$100k** |
 | Disputed → NotGuilty | −$50k | −$50k |
 | Disputed → Inconclusive | 0 | 0 |
 
-### The bound that must hold
+### Accepted costs
 
-The bounty must not make speculative filing profitable. A bogus unopposed filing still produces a real slash against a well-covered guardian, so it also collects a bounty. The burn must stay the larger number:
+**The silence path stays unprofitable for honest filers.** If genuinely guilty guardians tend to stay quiet rather than burn a counter-bond defending the indefensible, real convictions may mostly arrive that way — and those filers are still not paid. This is the deliberate half of the trade: the cheap branch is also the abusable one, and the only branch where being wrong costs nothing but gas. **Trigger to revisit:** instrument the ratio of convictions arriving via silence versus escalation; if honest filers are systematically underpaid because escalation is rare, the silence path needs a reward that does not also pay liars (delayed/claimable, or conditioned on something the contract can actually distinguish).
 
-```
-settleBurnBps * bond  >  expected bounty on a filing with no basis
-```
-
-Checked in `WireTokenCourt` as an explicit pre-flight rather than left to reasoning (§8).
-
-### Accepted cost
-
-Depositors recover 95% of a slash instead of 100%. That is the price of anyone outside the affected vault watching at all — and 95% of a conviction that happened beats 100% of one nobody filed. Sherwood is a security-agent platform; third-party watchdogs are the intended filers, and they hold no vault shares to recover through.
+**Depositors recover 95% of an escalated slash instead of 100%.** That is the price of anyone outside the affected vault watching at all. Sherwood is a security-agent platform; third-party watchdogs are the intended filers, and they hold no vault shares to recover through.
 
 ## 3. Present-holdings gate (on-chain)
 
@@ -163,11 +170,11 @@ Specifically, §1's three "properties UMA lacks" need correcting: property 2 ("v
 
 New: `convictionBountyBps = 500`, bounded `[0, 2_000]`, pinned per challenge, zero legal (bounty off).
 
-New pre-flight in `WireTokenCourt`: the speculative-filing bound of §2 — the burn must exceed the bounty on a baseless filing.
+**No anti-abuse pre-flight is required.** The escalated-only rule of §2 removes the attack a bound would have guarded against: a liar cannot reach the bounty without first surviving a contested vote, and being contested costs them the whole bond.
 
 Tests:
 
-- Bounty paid on both conviction paths, and nowhere else (not on `_fail`, not on `_refundAll`, not on the `_convicted` short-circuit).
+- Bounty paid on the escalated `Guilty` ruling ONLY — not on the silence settle, not on `_fail`, not on `_refundAll`, not on the `_convicted` short-circuit.
 - Escrow `proceeds` net of the bounty; claimants receive exactly the reduced amount.
 - Bounty pinned at filing — moving `convictionBountyBps` mid-challenge does not move the payout.
 - Exited holder refused; current holder with historical weight accepted; holder with present stake but no snapshot weight still refused.

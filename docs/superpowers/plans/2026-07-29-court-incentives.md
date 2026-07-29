@@ -160,22 +160,24 @@ git add -A && git commit -m "feat(swood): conviction bounty paid off the top of 
 - [ ] **Step 2.1: Write the failing tests**
 
 ```solidity
-    function test_convictionBounty_paidOnTheSilencePath() public {
+    /// @notice THE SILENCE PATH PAYS NO BOUNTY, and that is the design's
+    ///         central decision (spec 2026-07-29 §2): on that path an honest
+    ///         filer and a liar are indistinguishable to the contract, so any
+    ///         bounty there rewards both identically and no size works.
+    function test_convictionBounty_notPaidOnTheSilencePath() public {
         uint256 id = _fileStandard(PROPOSAL);
         uint256 before = wood.balanceOf(challenger);
         vm.warp(vm.getBlockTimestamp() + 7 days + 1);
         game.resolve(id);
 
         IChallengeGame.Challenge memory c = game.challengeOf(id);
-        uint256 slashed = _slashedFrom(id); // see note below
-        uint256 expected = slashed * 500 / 10_000;
-        assertGt(expected, 0, "fixture must recover real WOOD");
         uint256 burn = c.bondWood * c.settleBurnBpsAtFiling / 10_000;
         assertEq(
             wood.balanceOf(challenger) - before,
-            c.bondWood - burn + expected,
-            "bounty on top of the returned bond"
+            c.bondWood - burn,
+            "bond back minus the burn, and NOT a wei more"
         );
+        assertGt(_slashedFrom(id), 0, "a real slash still happened - it just pays no bounty");
     }
 
     function test_convictionBounty_paidOnTheGuiltyRuling() public {
@@ -207,17 +209,20 @@ git add -A && git commit -m "feat(swood): conviction bounty paid off the top of 
     }
 
     function test_convictionBounty_pinnedAtFiling() public {
-        uint256 id = _fileStandard(PROPOSAL);
+        uint256 id = _fileAndDispute(); // escalated - the only path that pays
         vm.prank(owner);
         game.setConvictionBountyBps(2_000); // raise AFTER filing
         uint256 before = wood.balanceOf(challenger);
-        vm.warp(vm.getBlockTimestamp() + 7 days + 1);
-        game.resolve(id);
+        vm.prank(court);
+        game.rule(id, IChallengeGame.Verdict.Guilty);
         IChallengeGame.Challenge memory c = game.challengeOf(id);
         assertEq(c.convictionBountyBpsAtFiling, 500, "the challenge keeps the rate it was filed under");
-        uint256 burn = c.bondWood * c.settleBurnBpsAtFiling / 10_000;
         uint256 atOld = _slashedFrom(id) * 500 / 10_000;
-        assertEq(wood.balanceOf(challenger) - before, c.bondWood - burn + atOld, "paid at the pinned rate");
+        assertEq(
+            wood.balanceOf(challenger) - before,
+            c.bondWood + c.counterBondWood + atOld,
+            "paid at the pinned rate, not the raised one"
+        );
     }
 
     function test_setConvictionBountyBps_boundsAndOwner() public {
@@ -271,9 +276,20 @@ State + setter, mirroring `setSettleBurnBps`'s shape exactly (read it first):
 
 Zero is legal (bounty off) — do not reject it. In `file`, pin it alongside the other rates: `convictionBountyBpsAtFiling: convictionBountyBps,`.
 
-In `_settle`, forward it:
+In `_settle`, forward it — **gated on `escalated`**, the local `bool escalated = c.status == Status.Disputed;` the function already computes before it writes the terminal status:
 
 ```solidity
+            // ESCALATED CONVICTIONS ONLY (spec 2026-07-29 §2). On the silence
+            // path an honest filer and a liar are indistinguishable to this
+            // contract - both produce a real slash against a real cohort and
+            // both would collect - so any bounty there pays liars exactly as
+            // well as watchdogs, and the two constraints (make honest filing
+            // profitable / keep false filing unprofitable) are contradictory at
+            // every rate. The escalated path separates them: the accused
+            // contested and lost on the merits, and a liar who picks a guardian
+            // that is paying attention forfeits the whole bond on `NotGuilty`.
+            // That is why the bounty is safe here at any size, and why no
+            // anti-abuse bound is needed.
             (slashedWood, caseId) = swood.slashToEscrow(
                 key,
                 c.executedAt,
@@ -282,9 +298,11 @@ In `_settle`, forward it:
                 c.vault,
                 c.executedAt - 1,
                 c.challenger,
-                c.convictionBountyBpsAtFiling
+                escalated ? c.convictionBountyBpsAtFiling : 0
             );
 ```
+
+Read `_settle` first to confirm `escalated` is in scope at the call site — it is computed near the top ("READ BEFORE THE TERMINAL WRITE"). If the slash block sits above that declaration, hoist the declaration rather than recomputing it.
 
 This sits inside the `else` branch of `if (_convicted[key])`, so a second challenge against an already-convicted proposal collects nothing — asserted next.
 
@@ -717,63 +735,17 @@ git add -A && git commit -m "fix: enforce the cross-contract window invariant on
 
 ---
 
-### Task 8: Speculative-filing pre-flight bound
+### Task 8: REMOVED (decision 2026-07-29)
 
-**Files:** `script/DeployTokenCourt.s.sol`, `test/deploy/DeployTokenCourtPreflight.t.sol`
+This task originally added a `WireTokenCourt` pre-flight bounding `convictionBountyBps` below `settleBurnBps * challengerBondBps / 10_000`, so that a baseless unopposed filing could not earn more from the bounty than the burn took from its bond.
 
-Spec §2 requires the burn stay larger than the bounty on a baseless filing: a bogus unopposed filing against a well-covered guardian still produces a real slash, so it also collects a bounty.
+**It is unnecessary under the escalated-only rule**, and the reasoning is worth keeping because it is what forced that rule.
 
-- [ ] **Step 8.1: Do the arithmetic FIRST and report it**
+Writing the bound revealed that the two constraints on a silence-path bounty are contradictory. Expressed against the slash, the burn earns `settleBurnBps * challengerBondBps / 10_000` = **100 bps** at the defaults. Making an honest unopposed filing profitable needs the bounty **above** that; keeping a false one unprofitable needs it **below**. No rate satisfies both — because on the silence path the contract cannot tell the two filers apart, so any bounty pays them identically.
 
-Both rates are bps of different bases. The burn takes `settleBurnBps` of the BOND; the bounty pays `convictionBountyBps` of the SLASH. The bond is `challengerBondBps` of coverage, and the worst case for the attacker's profit is a slash equal to the full coverage. So expressed against the slash:
+The fix was not a smaller number but a narrower branch: pay only on the escalated `Guilty` ruling, where a liar must first survive a contested vote and forfeits the entire bond if they lose. With no bounty reachable from silence, the attack has no payout and the bound has nothing to enforce.
 
-```
-burn earns   = settleBurnBps * challengerBondBps / 10_000   bps of the slash
-bounty pays  = convictionBountyBps                          bps of the slash
-```
-
-At the current defaults: `2_000 * 500 / 10_000 = 100` bps, against a proposed bounty of **500** bps.
-
-**The proposed default therefore FAILS its own bound.** Do not silently change either number. Report this to the controller with the arithmetic and stop for a decision: lower `convictionBountyBps` below 100 bps, raise `settleBurnBps`, or re-derive the bound against a different base. Implement Steps 8.2–8.4 only once the controller answers.
-
-- [ ] **Step 8.2: Failing test**
-
-```solidity
-    function test_wirePreflight_bites_whenTheBountyOutrunsTheBurn() public {
-        vm.startPrank(DEFAULT_SENDER);
-        game.setSettleBurnBps(100);          // 1% of the bond
-        game.setConvictionBountyBps(2_000);  // 20% of the slash
-        vm.stopPrank();
-        _runWireExpecting("PRE-FLIGHT: convictionBountyBps makes speculative filing profitable");
-    }
-```
-
-- [ ] **Step 8.3: Implement** — pre-flight 6 in `WireTokenCourt`, after the existing five:
-
-```solidity
-        // ── Pre-flight 6: a baseless filing must cost more than it earns ──
-        // A bogus unopposed filing against a well-covered guardian produces a
-        // REAL slash and therefore a real bounty. `settleBurnBps` is the only
-        // price on that attack, so it must exceed what the bounty pays back.
-        // The two are bps of different bases (bond vs slash), so the bound is
-        // expressed against the slash: the burn earns
-        // `settleBurnBps * challengerBondBps / 10_000` of it.
-        uint256 burnOnSlash = game.settleBurnBps() * game.challengerBondBps() / 10_000;
-        require(
-            game.convictionBountyBps() < burnOnSlash,
-            "PRE-FLIGHT: convictionBountyBps makes speculative filing profitable - it must stay "
-            "below settleBurnBps * challengerBondBps / 10_000, or a baseless unopposed filing "
-            "earns more from the bounty than the burn takes from its bond."
-        );
-        console.log("speculative-filing margin (bps of slash): %s", burnOnSlash - game.convictionBountyBps());
-```
-
-- [ ] **Step 8.4: Run + commit**
-
-```bash
-forge test --match-path test/deploy/DeployTokenCourtPreflight.t.sol | tail -3
-git add -A && git commit -m "feat(deploy): pre-flight the speculative-filing bound (spec §2)"
-```
+**No work in this task.** Skip to Task 9. (Numbering is preserved so the mutation table in Task 10 and any external references stay valid.)
 
 ---
 
@@ -820,6 +792,7 @@ Apply each mutation, confirm the named test FAILS, restore from a backup copy ou
 | Mutation | Must fail |
 |---|---|
 | `bounty` never deducted from `total` in `slashToEscrow` | `test_slashToEscrow_paysBountyAndNetsTheEscrowCase` |
+| `escalated ? ... : 0` replaced by the unconditional rate (bounty on silence) | `test_convictionBounty_notPaidOnTheSilencePath` |
 | bounty read from live `convictionBountyBps` instead of the pin | `test_convictionBounty_pinnedAtFiling` |
 | present-holdings check deleted | `test_vote_refusesAFullyExitedHolder` |
 | `challengeableUntil` write removed from `_refundAll` | `test_inconclusive_extendsTheRechallengeWindow` |
@@ -840,8 +813,10 @@ gh pr comment 52 --repo sherwoodagent/sherwood-protocol --body "Incentive layer 
 
 ## Self-review
 
-**Spec coverage:** §2 bounty → Tasks 1, 2, 8. §3 holdings gate → Task 3. §4 off-chain APY → no task (policy, not code — correctly out of scope). §5 re-challenge window → Task 4. §6 M1 accepted → Task 9.1. §7 A1/A2/A5 → Tasks 9.2–9.3. §8 parameters/tests → Tasks 2, 8, 10.2. Review defects: B1→5, B2→6, B3→7, B4→3.
+**Spec coverage:** §2 bounty → Tasks 1, 2 (Task 8's bound removed by the escalated-only decision). §3 holdings gate → Task 3. §4 off-chain APY → no task (policy, not code — correctly out of scope). §5 re-challenge window → Task 4. §6 M1 accepted → Task 9.1. §7 A1/A2/A5 → Tasks 9.2–9.3. §8 parameters/tests → Tasks 2, 10.2. Review defects: B1→5, B2→6, B3→7, B4→3.
 
-**Known unknowns, named not guessed:** whether `Challenge` carries the slashed amount (Step 2.1), whether `MockStakedWood` has `getVotes` (3.1), whether `BPS_DENOMINATOR` exists in `StakedWood` (1.4), `MockGameForCourt.setChallenge`'s real arity (5.1), the real fixture names in both test files, and — flagged loudest — **the proposed 500 bps default appears to FAIL its own pre-flight bound** (Step 8.1), which stops that task for a controller decision rather than guessing.
+**Known unknowns, named not guessed:** whether `Challenge` carries the slashed amount (Step 2.1), whether `MockStakedWood` has `getVotes` (3.1), whether `BPS_DENOMINATOR` exists in `StakedWood` (1.4), whether `escalated` is in scope at `_settle`'s slash call site (2.4), `MockGameForCourt.setChallenge`'s real arity (5.1), and the real fixture names in both test files.
+
+**Resolved during planning:** the proposed 500 bps default failed the speculative-filing bound, which turned out to be unsatisfiable at any rate on the silence path. Fixed by narrowing the bounty to escalated convictions only (spec §2), which deleted both the bound and Task 8.
 
 **Type consistency:** `slashToEscrow(..., address bountyTo, uint256 bountyBps)` identical in Tasks 1 and 2; `convictionBountyBpsAtFiling` on the `Challenge` struct used in Tasks 2 and 10; `WindowInvariantViolated` declared in both interfaces in Task 7; `caseOfChallenge(address,uint256)` consistent across Tasks 5 and 10.
