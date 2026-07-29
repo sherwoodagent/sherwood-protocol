@@ -782,38 +782,66 @@ contract TokenCourtEndToEndTest is Test {
         assertEq(wood.balanceOf(address(court)), 0, "court custody is zero, always");
     }
 
-    // ── 5. A failed auto-referral leaves no poison, and anyone can refer later ──
+    // ── 5. A reverting `refer` leaves no poison, and anyone can refer a fresh challenge later ──
 
-    /// @notice THE PROPERTY TASK 8'S WHOLE AUTO-REFERRAL DESIGN RESTS ON, and
-    ///         until this test asserted only in `dispute`'s own comments and
-    ///         proven by nothing: `refer` claims `caseCount++` and
-    ///         `caseOfChallenge[id] = caseId` BEFORE its clock check runs, so a
-    ///         revert inside that check must discard those writes along with
-    ///         everything else in the reverted call frame -- not merely leave
-    ///         them unassigned to anything meaningful. This is arranged
-    ///         against a REAL, reachable revert reason (`InsufficientClock`)
-    ///         on the real court, reached through `dispute`'s own broad,
-    ///         deliberately un-narrowed catch (see `dispute`'s natspec for why
-    ///         that catch must stay broad rather than selector-filtered).
+    /// @notice THE FINDING THIS TASK'S OWN WINDOW INVARIANT PRODUCED, worth
+    ///         recording here because it changes what this test can even
+    ///         reach: with `ChallengeGame._requireWindowFits` /
+    ///         `TokenCourt.setVoteWindow`'s cross-contract check enforced (B3),
+    ///         `refer`'s clock check can NEVER fail through ordinary
+    ///         auto-referral again. Proof: the latest a counter-bond pool can
+    ///         complete is `filedAt + autoSlashDelay`, so the remaining clock
+    ///         at that instant is AT LEAST `disputeTimeout - autoSlashDelay`,
+    ///         and the invariant guarantees `disputeTimeout - autoSlashDelay
+    ///         >= voteWindow + FINALIZE_BUFFER` -- exactly what `refer`
+    ///         requires. THE OLD VERSION of this test reached its failure by
+    ///         calling `game.setDisputeTimeout(8 days)`, a state Part A's
+    ///         `_requireWindowFits` now REJECTS outright
+    ///         (`WindowInvariantViolated`) at the default 7-day
+    ///         `autoSlashDelay` / 5-day `voteWindow` / 1-day
+    ///         `FINALIZE_BUFFER` (7 + 5 + 1 = 13 > 8). So the window invariant
+    ///         didn't break this test -- it made the test's premise
+    ///         unreachable by configuration, a strengthening worth recording
+    ///         rather than working around.
+    /// @dev    THE PROPERTY STILL WORTH PINNING, reached a different way:
+    ///         `refer` claims `caseCount++` and `caseOfChallenge[id] = caseId`
+    ///         BEFORE its `InsufficientClock` check runs, so a revert there
+    ///         must discard those writes along with everything else in the
+    ///         reverted call frame -- not merely leave them unassigned to
+    ///         anything meaningful. Auto-referral can no longer manufacture
+    ///         that revert (see above), so this test reaches the SAME
+    ///         reverting path DELIBERATELY instead: unwire the court so
+    ///         `dispute` never attempts a referral (its auto-refer is itself
+    ///         gated on `court != address(0)`), let the pool complete and the
+    ///         clock run down past `refer`'s own boundary, then re-wire the
+    ///         court and call `refer` BY HAND, expecting `InsufficientClock`
+    ///         to revert exactly as it always could -- this path is
+    ///         independent of the window invariant, which bounds the
+    ///         PARAMETERS, not how late a caller chooses to call `refer`.
     /// @dev    THE "RECONFIGURE THE SAME CHALLENGE AND RE-REFER IT" HALF OF
     ///         THIS TASK'S SPEC IS STRUCTURALLY IMPOSSIBLE, and that limitation
     ///         is worth recording plainly rather than working around it:
     ///         `disputeTimeoutAtFiling` is PINNED at filing (review F5)
     ///         precisely so the owner cannot move a live challenge's clock,
     ///         and a challenge's remaining clock only ever shrinks as time
-    ///         passes -- raising the LIVE `disputeTimeout` afterwards changes
-    ///         nothing about a challenge already filed under the old value
-    ///         (asserted below directly). So this test proves the no-poison
-    ///         half on the SAME (tight-clocked) challenge, and the
-    ///         stranger-can-refer half on a SECOND, generously-clocked one --
-    ///         exactly the two-challenge structure the task itself anticipates
-    ///         for this reason.
-    function test_failedAutoReferral_leavesNoPoisonAndAnyoneCanReferLater() public {
-        vm.prank(owner);
-        game.setDisputeTimeout(8 days); // > autoSlashDelay (7d): a tight but legal timeout
-
+    ///         passes. So this test proves the no-poison half on the SAME
+    ///         (clock-starved) challenge, and the stranger-can-refer half on a
+    ///         SECOND, generously-clocked one -- exactly the two-challenge
+    ///         structure the task itself anticipates for this reason.
+    function test_revertingRefer_leavesNoPoisonAndAnyoneCanReferAFreshChallenge() public {
         uint256 pid = _proposeApproveExecute();
 
+        // BOTH CHALLENGES ARE FILED UP FRONT, seconds apart, against the SAME
+        // proposal -- g1 is the sole accused approver on both, so it funds
+        // both pools (this file's own top-level comment anticipates exactly
+        // this: "some arcs have g1 fund TWO pools in the same test"). Filing
+        // both now, before any warp, is what keeps cidB's own clock fresh AND
+        // keeps `pid`'s 14-day `challengeWindow` from ever being in play --
+        // a SECOND filing timed after the large warp cidA's scenario needs
+        // would revert `WindowClosed` (`pid` aged out) or, filed against a
+        // fresh proposal instead, `VaultHasOpenProposal` (this vault's one
+        // proposal at a time gate, unrelated to the challenge system and
+        // still open because `pid` hasn't been settled).
         vm.prank(challenger);
         uint256 cidA = game.file(
             address(gov),
@@ -821,52 +849,65 @@ contract TokenCourtEndToEndTest is Test {
             IChallengeGame.Predicate.OutOfAdapterOutflow,
             address(adapter),
             adapter.poke.selector,
-            "ipfs://evidence/tight-clock"
+            "ipfs://evidence/reverting-refer"
         );
         uint256 filedAtA = game.challengeOf(cidA).filedAt;
+        uint256 disputeTimeoutAtFilingA = game.challengeOf(cidA).disputeTimeoutAtFiling;
 
-        // Complete the pool 6.5 days in -- still inside the 7-day
-        // `autoSlashDelay` dispute window, but only 1.5 days remain of the
-        // pinned 8-day timeout: short of the 6 days (`voteWindow` 5d +
-        // `FINALIZE_BUFFER` 1d) `refer`'s own clock check requires.
-        vm.warp(filedAtA + 6 days + 12 hours);
-        vm.expectEmit(true, false, false, false);
-        emit IChallengeGame.AutoReferFailed(cidA);
-        vm.prank(g1);
-        game.dispute(cidA, type(uint256).max);
-
-        // ── THE ANSWER: the reverted child frame left NOTHING behind.
-        assertEq(court.caseOfChallenge(cidA), 0, "no case was ever recorded for the failed referral");
-        assertEq(court.caseCount(), 0, "the reverted refer()'s caseCount++ was discarded, not merely unassigned");
-
-        // Reconfiguring the LIVE parameter cannot rescue cidA -- its own pin
-        // stays exactly what it was at filing.
-        vm.prank(owner);
-        game.setDisputeTimeout(30 days);
-        assertEq(game.challengeOf(cidA).disputeTimeoutAtFiling, 8 days, "the pin is immune to the reconfigure");
-
-        // ── So the stranger-can-refer half is proven on a SECOND, fresh
-        //    challenge, filed under the now-generous 30-day timeout.
-        vm.prank(owner);
-        game.setCourt(address(0)); // suppress auto-referral again -- the manual refer below is what's under test
         vm.prank(challengerB);
         uint256 cidB = game.file(
             address(gov),
             pid,
-            IChallengeGame.Predicate.OutOfAdapterOutflow,
+            IChallengeGame.Predicate.RogueAllowance,
             address(adapter),
             adapter.poke.selector,
             "ipfs://evidence/generous-clock"
         );
-        vm.prank(g1);
-        game.dispute(cidB, type(uint256).max); // pool completes; no auto-referral while court == 0
 
+        // Unwire the court FIRST: `dispute`'s auto-referral is gated on
+        // `court != address(0)` (see its own natspec), so completing either
+        // pool below attempts nothing -- no case opened, no poison possible
+        // yet.
+        vm.prank(owner);
+        game.setCourt(address(0));
+        vm.startPrank(g1);
+        game.dispute(cidA, type(uint256).max);
+        game.dispute(cidB, type(uint256).max);
+        vm.stopPrank();
+
+        // ── The stranger-can-refer half, proven FIRST, while cidB's own
+        //    clock is still fresh (filed only seconds after cidA, under the
+        //    same defaults). Proving it AFTER the big warp below would fail
+        //    it too, for the identical reason cidA is about to.
         vm.prank(owner);
         game.setCourt(address(court));
         vm.prank(stranger); // ANYONE may call `refer` -- the recovery path `dispute`'s natspec promises
         uint256 caseId = court.refer(cidB);
-        assertEq(caseId, 1, "the first case ever opened -- the failed attempt above minted none");
+        assertEq(caseId, 1, "the first case ever opened");
         assertEq(court.caseOfChallenge(cidB), 1);
+
+        // ── Now exhaust cidA's OWN clock and reach the reverting path.
+        // Run the clock down past `refer`'s own boundary (identical
+        // arithmetic to `test_refer_clockCheckBoundary`, test/TokenCourt.t.sol):
+        // one second past the last instant that leaves `voteWindow +
+        // FINALIZE_BUFFER` of runway before cidA's own pinned timeout.
+        uint256 lastLegal = filedAtA + disputeTimeoutAtFilingA - court.voteWindow() - court.FINALIZE_BUFFER();
+        vm.warp(lastLegal + 1);
+
+        // Call `refer` BY HAND -- the deliberate trigger the vanished
+        // auto-referral race used to provide for free (the court is already
+        // wired from cidB's referral above; `dispute` never runs again for
+        // cidA, so there is nothing left to auto-refer through anyway).
+        vm.expectRevert(ITokenCourt.InsufficientClock.selector);
+        court.refer(cidA);
+
+        // ── THE ANSWER: the reverted child frame left NOTHING behind for
+        //    cidA -- `caseCount` staying at 1 (cidB's real, earlier case)
+        //    rather than advancing to 2 is exactly what proves it: a
+        //    poisoned `caseCount++` would show up here as 2, not silently as
+        //    0, since a real case already exists.
+        assertEq(court.caseOfChallenge(cidA), 0, "no case was ever recorded for the reverted referral");
+        assertEq(court.caseCount(), 1, "the reverted refer()'s caseCount++ was discarded, not merely unassigned");
 
         assertEq(wood.balanceOf(address(court)), 0, "court custody is zero, always");
     }
