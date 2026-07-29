@@ -2290,21 +2290,47 @@ contract ChallengeGameTest is Test {
     }
 
     /// @notice A second inconclusive round must never pull the deadline back
-    ///         in, even though its own `challengeWindow` is computed from a
-    ///         LATER instant than the first round's.
+    ///         in — NOT because block.timestamp only moves forward (round 2
+    ///         is chronologically later than round 1 no matter what, which
+    ///         would make a bare `assertGe` true even with the guard deleted
+    ///         and the write made unconditional), but because the guard
+    ///         itself refuses to shrink a bigger stored value.
+    ///
+    ///         To tell those two apart, round 1 STALLS (`_completePoolAt`,
+    ///         `autoSlashDelay - 1`) so it rules LATE and its extension —
+    ///         `ruledAt1 + challengeWindow` at the DEFAULT 14-day window — is
+    ///         inflated well past what an un-stalled round 2 would compute on
+    ///         its own. `challengeWindow` is then shrunk before round 2, so
+    ///         round 2's own `block.timestamp + challengeWindow` comes out
+    ///         SMALLER than round 1's stored value even though round 2 rules
+    ///         strictly later in wall-clock time — the only way an
+    ///         unconditional write could ever produce a smaller number here.
+    ///         `assertEq` (not `assertGe`) is what makes that shrink visible.
     function test_challengeableUntil_onlyEverLengthens() public {
-        uint256 id = _fileStandard(PROPOSAL);
-        _completePool(id);
+        uint256 id = _fileStandardAt(PROPOSAL, 3 days);
+        _completePoolAt(id, 7 days - 1); // stall to the edge of autoSlashDelay: rules late
         vm.prank(court);
         game.rule(id, IChallengeGame.Verdict.Inconclusive);
         bytes32 key = _reviewKeyFor(address(gov), PROPOSAL);
         uint256 first = game.challengeableUntil(key);
 
-        uint256 again = _fileStandard(PROPOSAL);
+        // Shrink the window so round 2's OWN extension is smaller than round
+        // 1's, despite ruling strictly later.
+        vm.prank(owner);
+        game.setChallengeWindow(1 days);
+
+        uint256 again = _fileStandard(PROPOSAL); // no stall; re-executes and rules promptly
         _completePool(again);
         vm.prank(court);
         game.rule(again, IChallengeGame.Verdict.Inconclusive);
-        assertGe(game.challengeableUntil(key), first, "never shortens");
+
+        // Sanity-check the fixture itself: if this ever fails, the timeline
+        // no longer produces a smaller round-2 extension and the assertion
+        // below would pass for the wrong reason (or for no reason at all).
+        uint256 round2Extension = vm.getBlockTimestamp() + game.challengeWindow();
+        assertLt(round2Extension, first, "fixture must make round 2's own extension smaller than round 1's");
+
+        assertEq(game.challengeableUntil(key), first, "never shortens");
     }
 
     /// @notice A proposal that never went inconclusive must behave exactly as
