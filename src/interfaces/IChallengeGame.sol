@@ -200,15 +200,6 @@ interface IChallengeGame {
     ///         the owner's only lever gating filings). Never raised anywhere
     ///         else — dispute/resolve/rule/claims are unaffected by this flag.
     error FilingsPaused();
-    /// @notice `dispute`'s pool-completing branch found too little gas left to
-    ///         guarantee the best-effort `TokenCourt.refer` call cannot be
-    ///         starved (Task 8). Reverting the whole `dispute` beats silently
-    ///         skipping the referral: a skipped referral is only recoverable
-    ///         while `refer`'s own `InsufficientClock` guard still admits one,
-    ///         so it must never be the silent, gas-tunable outcome of an
-    ///         under-gassed caller. Retry with more gas; nothing about the
-    ///         pool or the challenge changes.
-    error InsufficientReferGas();
 
     // ── Events ──
     /// @dev `evidenceURI` is carried on-chain unindexed so predicates 2 and 3 —

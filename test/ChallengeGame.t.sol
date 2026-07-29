@@ -302,10 +302,9 @@ contract MockRevertingCourt {
 }
 
 /// @dev Stands in for a court whose `refer` needs at least `floor` gas to
-///      complete — the starved-child case `REFER_GAS_FLOOR` exists to make
-///      structurally impossible. `floor` is set to a real `TokenCourt`
-///      measurement so the gas-floor test proves something about the actual
-///      constant, not an arbitrary number.
+///      complete. Set the floor beyond any reachable budget and every referral
+///      reverts — which is exactly the scenario `dispute` must survive without
+///      denying the accused its defence.
 contract MockGasHungryCourt {
     uint256 public lastReferred;
     uint256 public floor;
@@ -354,12 +353,6 @@ contract ChallengeGameTest is Test {
     ///      demotes. Named by the filer (§3.4), not derived on-chain.
     address internal constant ADAPTER = address(0xADA9);
     bytes4 internal constant SELECTOR = bytes4(0xfeedface);
-    /// @dev `ChallengeGame.REFER_GAS_FLOOR` is `internal` (no public getter,
-    ///      mirroring `SLASH_GAS_PER_APPROVER`/`SLASH_GAS_BASE`) —
-    ///      `REFER_GAS_BASE` (1_000_000) + 100 * `REFER_GAS_PER_APPROVER`
-    ///      (300_000), hardcoded here the same way
-    ///      `test_resolve_enforcesTheSlashGasFloor` hardcodes its own floor.
-    uint256 internal constant REFER_GAS_FLOOR_MIRROR = 1_000_000 + 100 * 300_000;
 
     function setUp() public {
         vm.warp(365 days); // keep executedAt well away from the genesis timestamp
@@ -1332,44 +1325,48 @@ contract ChallengeGameTest is Test {
         assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Disputed));
     }
 
-    /// @notice THE STRUCTURAL GAS FLOOR. `REFER_GAS_FLOOR` must make a starved
-    ///         child impossible, not merely unlikely — proven here two ways at
-    ///         once: `MockGasHungryCourt`'s own floor is set to the exact
-    ///         constant `dispute` checks, and the outer call is capped at
-    ///         exactly `REFER_GAS_FLOOR`. `dispute` does real, positive-cost
-    ///         work (storage writes, the counter-bond `transferFrom`, two event
-    ///         emissions) BEFORE reaching the gas check, so `gasleft()` at the
-    ///         check is *always* strictly less than the outer cap, regardless
-    ///         of compiler or optimizer settings — the same structural framing
-    ///         as the `finalize` under-gassed regression test, adapted to a
-    ///         floor that lives in the PARENT rather than the child. The call
-    ///         must revert with `InsufficientReferGas` BEFORE ever reaching the
-    ///         court, not land in the catch and silently emit
-    ///         `AutoReferFailed` as if the court had genuinely been asked and
-    ///         had refused.
-    function test_dispute_gasFloorRejectsStarvedCall() public {
-        MockGasHungryCourt hungry = new MockGasHungryCourt(REFER_GAS_FLOOR_MIRROR);
+    /// @notice THE DEFENCE IS NEVER HOSTAGE TO THE COURT'S GAS APPETITE. A
+    ///         court whose `refer` cannot complete within whatever gas an
+    ///         ordinary caller forwards must not be able to stop the accused
+    ///         from buying its escalation — because a reverting `dispute`
+    ///         leaves the counter-bond incomplete, the auto-slash clock
+    ///         running, and the accused slashed by the silence verdict without
+    ///         ever reaching adjudication. That failure is unrecoverable; the
+    ///         one this test permits instead is not, and the second half proves
+    ///         it: a stranger opens the case afterwards through the
+    ///         permissionless `refer` the catch left available.
+    ///
+    ///         This is the mirror image of `finalize`'s under-gassed
+    ///         regression, and deliberately so. There, swallowing a failure
+    ///         destroyed a verdict with no retry, so the catch had to narrow.
+    ///         Here, bubbling a failure would destroy a defence with no retry,
+    ///         so the catch stays broad and unguarded. Same shape, opposite
+    ///         answer, because the retry path sits on opposite sides.
+    function test_dispute_starvedCourtStillLandsTheDispute() public {
+        // A floor no ordinary call will ever clear: every `refer` reverts.
+        MockGasHungryCourt hungry = new MockGasHungryCourt(type(uint128).max);
         vm.prank(owner);
         game.setCourt(address(hungry));
 
         uint256 id = _fileStandard(PROPOSAL);
 
+        vm.expectEmit(true, false, false, false);
+        emit IChallengeGame.AutoReferFailed(id);
         vm.prank(guardianA);
-        vm.expectRevert(IChallengeGame.InsufficientReferGas.selector);
-        game.dispute{gas: REFER_GAS_FLOOR_MIRROR}(id, type(uint256).max);
+        game.dispute(id, type(uint256).max); // ordinary gas budget: must NOT revert
 
-        // Nothing about the pool moved: the whole call reverted, including the
-        // counter-bond transfer and the status flip.
-        assertEq(
-            uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Filed), "the starved call reverted whole"
-        );
-        assertEq(hungry.lastReferred(), 0, "the child was never even reached");
+        // The defence landed in full despite the court refusing outright.
+        IChallengeGame.Challenge memory c = game.challengeOf(id);
+        assertEq(uint8(c.status), uint8(IChallengeGame.Status.Disputed), "the accused bought its escalation");
+        assertEq(c.counterBondWood, c.bondWood, "pool completed");
+        assertEq(game.counterBondContributionOf(id, guardianA), c.counterBondWood, "contributor accounting intact");
+        assertEq(hungry.lastReferred(), 0, "the court never recorded a referral");
 
-        // Control: an adequately-gassed retry lands the referral for real.
-        vm.prank(guardianA);
-        game.dispute(id, type(uint256).max);
-        assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Disputed));
-        assertEq(hungry.lastReferred(), id, "the honest retry actually reached the court");
+        // And the miss is recoverable by anyone: a stranger opens the case.
+        MockRecordingCourt fresh = new MockRecordingCourt();
+        vm.prank(makeAddr("stranger"));
+        fresh.refer(id);
+        assertEq(fresh.lastReferred(), id, "permissionless referral is still available afterwards");
     }
 
     // ── Disputed → timeout → fail (D5) ──
