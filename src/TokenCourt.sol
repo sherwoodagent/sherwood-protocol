@@ -73,8 +73,19 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     /// @notice Count of cases ever referred. Case ids are 1-indexed.
     uint256 public caseCount;
     mapping(uint256 caseId => ITokenCourt.Case) internal _cases;
-    /// @notice The case id referred for a challenge, or zero if none has been.
-    mapping(uint256 challengeId => uint256 caseId) public caseOfChallenge;
+    /// @notice The case id referred for a challenge on a given game, or zero
+    ///         if none has been.
+    /// @dev KEYED BY (GAME, CHALLENGE ID), not by id alone (B1).
+    ///      `ChallengeGame` is non-upgradeable, so redeploying it IS the
+    ///      migration path and `setChallengeGame` exists to serve it - but a
+    ///      fresh game's `challengeCount` restarts at 0, so its ids collide
+    ///      with every case the old game already minted. Single-keyed, every
+    ///      colliding challenge reverted `AlreadyReferred` on BOTH the
+    ///      auto-referral and the permissionless manual fallback, forever, and
+    ///      timed out to `_fail` - auto-acquitting the accused and paying it the
+    ///      challenger's bond, once per id the old game ever used. Pinning
+    ///      `Case.game` fixed the `finalize` half of this; this fixes `refer`.
+    mapping(address game => mapping(uint256 challengeId => uint256 caseId)) public caseOfChallenge;
     /// @notice How an address ruled on a case, or `Ruling.None` unvoted.
     mapping(uint256 caseId => mapping(address voter => ITokenCourt.Ruling)) public voteOf;
     /// @notice Whether an address is in a case's accused set.
@@ -161,21 +172,21 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///         below). The only external read of challenge state left is
     ///         `challengeOf` itself, and it is `view`, so the compiler emits
     ///         STATICCALL and re-entry is impossible at the EVM level today.
-    ///         Claiming `caseOfChallenge[challengeId]` before that read is what keeps
-    ///         a second `refer` on the same challenge harmless — not
-    ///         impossible, just a no-op `AlreadyReferred` — if `challengeOf`
-    ///         ever loses its `view` or the game ever calls back into the
-    ///         court.
+    ///         Claiming `caseOfChallenge[game][challengeId]` before that read
+    ///         is what keeps a second `refer` on the same (game, challenge)
+    ///         harmless — not impossible, just a no-op `AlreadyReferred` — if
+    ///         `challengeOf` ever loses its `view` or the game ever calls back
+    ///         into the court.
     function refer(uint256 challengeId) external returns (uint256 caseId) {
         address game = challengeGame;
         address swood = stakedWood;
         // Requires wired (review finding E4 closed structurally): a case can
         // no longer exist before its electorate does.
         if (game == address(0) || swood == address(0)) revert ZeroAddress();
-        if (caseOfChallenge[challengeId] != 0) revert AlreadyReferred();
+        if (caseOfChallenge[game][challengeId] != 0) revert AlreadyReferred();
 
         caseId = ++caseCount;
-        caseOfChallenge[challengeId] = caseId;
+        caseOfChallenge[game][challengeId] = caseId;
 
         IChallengeGame.Challenge memory ch = IChallengeGame(game).challengeOf(challengeId);
         // Only a contested challenge is escalated: a `Filed` one is still

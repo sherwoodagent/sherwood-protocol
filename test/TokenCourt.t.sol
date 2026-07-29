@@ -212,7 +212,7 @@ contract TokenCourtTest is Test {
         assertEq(cs.challengeId, 0);
         assertEq(uint256(cs.phase), uint256(ITokenCourt.Phase.None));
         assertEq(court.accusedOf(999).length, 0);
-        assertEq(court.caseOfChallenge(999), 0);
+        assertEq(court.caseOfChallenge(address(game), 999), 0);
     }
 
     function test_setters_wiringEmitOldNew() public {
@@ -273,7 +273,7 @@ contract TokenCourtTest is Test {
         assertEq(uint256(cs.phase), uint256(ITokenCourt.Phase.Voting));
         assertTrue(court.isAccused(caseId, accusedG));
         assertFalse(court.isAccused(caseId, a[1]), "released is not accused");
-        assertEq(court.caseOfChallenge(CHALLENGE_ID), caseId);
+        assertEq(court.caseOfChallenge(address(game), CHALLENGE_ID), caseId);
         assertEq(court.accusedOf(caseId).length, 1);
     }
 
@@ -407,8 +407,49 @@ contract TokenCourtTest is Test {
         uint256 secondCase = court.refer(CHALLENGE_ID + 1);
 
         assertTrue(secondCase != firstCase, "distinct case ids");
-        assertEq(court.caseOfChallenge(CHALLENGE_ID), firstCase);
-        assertEq(court.caseOfChallenge(CHALLENGE_ID + 1), secondCase);
+        assertEq(court.caseOfChallenge(address(game), CHALLENGE_ID), firstCase);
+        assertEq(court.caseOfChallenge(address(game), CHALLENGE_ID + 1), secondCase);
+    }
+
+    /// @notice B1: `ChallengeGame` is non-upgradeable, so redeploying it IS
+    ///         the migration path (`setChallengeGame` exists to serve it) —
+    ///         but a fresh game's `challengeCount` restarts at 0, so its
+    ///         challenge ids collide with every id the old game ever minted.
+    ///         Single-keyed by challenge id alone, this collision made BOTH
+    ///         the auto-referral and the permissionless manual `refer`
+    ///         fallback revert `AlreadyReferred` forever on the new game's
+    ///         colliding ids, with no exit but `disputeTimeout` auto-acquitting
+    ///         the accused. Namespacing `caseOfChallenge` by (game, challenge)
+    ///         closes it: the same numeric challenge id on two different
+    ///         games gets two independent cases.
+    function test_refer_afterGameMigration_doesNotCollideOnChallengeId() public {
+        _disputedChallenge();
+        uint256 firstCase = court.refer(CHALLENGE_ID);
+        assertEq(firstCase, 1);
+
+        // Migrate to a second game; its ids restart from the same numbers.
+        MockGameForCourt game2 = new MockGameForCourt();
+        game2.setExposureLedger(address(ledger));
+        vm.prank(owner);
+        court.setChallengeGame(address(game2));
+
+        // game2's defaults (7d autoSlashDelay / 30d disputeTimeout) already
+        // satisfy setChallengeGame's window-invariant mirror check above, so
+        // no extra autoSlashDelay/disputeTimeout wiring is needed here.
+        game2.setChallenge(
+            CHALLENGE_ID,
+            governor,
+            PROPOSAL_ID,
+            IChallengeGame.Status.Disputed,
+            vm.getBlockTimestamp(),
+            30 days,
+            vm.getBlockTimestamp() - 1 days
+        );
+
+        uint256 secondCase = court.refer(CHALLENGE_ID); // MUST NOT revert AlreadyReferred
+        assertEq(secondCase, 2, "the new game's challenge gets its own case");
+        assertEq(court.caseOfChallenge(address(game2), CHALLENGE_ID), secondCase);
+        assertEq(court.caseOfChallenge(address(game), CHALLENGE_ID), firstCase, "the old mapping is intact");
     }
 
     function _referredCase() internal returns (uint256 caseId) {

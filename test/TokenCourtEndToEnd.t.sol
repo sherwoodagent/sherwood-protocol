@@ -464,7 +464,7 @@ contract TokenCourtEndToEndTest is Test {
         );
 
         _disputeFull(cid); // g1 funds the whole pool -> Disputed -> auto-refers
-        uint256 caseId = court.caseOfChallenge(cid);
+        uint256 caseId = court.caseOfChallenge(address(game), cid);
         assertTrue(caseId != 0, "the pool-completing auto-referral landed a real case");
         assertEq(uint256(court.caseOf(caseId).phase), uint256(ITokenCourt.Phase.Voting));
 
@@ -575,7 +575,7 @@ contract TokenCourtEndToEndTest is Test {
         );
 
         _disputeFull(cid);
-        uint256 caseId = court.caseOfChallenge(cid);
+        uint256 caseId = court.caseOfChallenge(address(game), cid);
         assertTrue(caseId != 0);
 
         vm.prank(g2);
@@ -640,7 +640,7 @@ contract TokenCourtEndToEndTest is Test {
         );
 
         _disputeFull(cid);
-        uint256 caseId = court.caseOfChallenge(cid);
+        uint256 caseId = court.caseOfChallenge(address(game), cid);
         assertTrue(caseId != 0);
 
         // Nobody votes: turnout is zero, which `finalize` reads as
@@ -724,7 +724,7 @@ contract TokenCourtEndToEndTest is Test {
             "ipfs://evidence/race-a"
         );
         _disputeFull(cidA); // court wired throughout -> auto-refers immediately
-        uint256 caseIdA = court.caseOfChallenge(cidA);
+        uint256 caseIdA = court.caseOfChallenge(address(game), cidA);
         assertTrue(caseIdA != 0);
 
         vm.prank(g2);
@@ -804,8 +804,8 @@ contract TokenCourtEndToEndTest is Test {
     ///         unreachable by configuration, a strengthening worth recording
     ///         rather than working around.
     /// @dev    THE PROPERTY STILL WORTH PINNING, reached a different way:
-    ///         `refer` claims `caseCount++` and `caseOfChallenge[id] = caseId`
-    ///         BEFORE its `InsufficientClock` check runs, so a revert there
+    ///         `refer` claims `caseCount++` and `caseOfChallenge[game][id] =
+    ///         caseId` BEFORE its `InsufficientClock` check runs, so a revert there
     ///         must discard those writes along with everything else in the
     ///         reverted call frame -- not merely leave them unassigned to
     ///         anything meaningful. Auto-referral can no longer manufacture
@@ -884,7 +884,7 @@ contract TokenCourtEndToEndTest is Test {
         vm.prank(stranger); // ANYONE may call `refer` -- the recovery path `dispute`'s natspec promises
         uint256 caseId = court.refer(cidB);
         assertEq(caseId, 1, "the first case ever opened");
-        assertEq(court.caseOfChallenge(cidB), 1);
+        assertEq(court.caseOfChallenge(address(game), cidB), 1);
 
         // ── Now exhaust cidA's OWN clock and reach the reverting path.
         // Run the clock down past `refer`'s own boundary (identical
@@ -906,7 +906,7 @@ contract TokenCourtEndToEndTest is Test {
         //    rather than advancing to 2 is exactly what proves it: a
         //    poisoned `caseCount++` would show up here as 2, not silently as
         //    0, since a real case already exists.
-        assertEq(court.caseOfChallenge(cidA), 0, "no case was ever recorded for the reverted referral");
+        assertEq(court.caseOfChallenge(address(game), cidA), 0, "no case was ever recorded for the reverted referral");
         assertEq(court.caseCount(), 1, "the reverted refer()'s caseCount++ was discarded, not merely unassigned");
 
         assertEq(wood.balanceOf(address(court)), 0, "court custody is zero, always");
@@ -950,7 +950,7 @@ contract TokenCourtEndToEndTest is Test {
         );
 
         _disputeFull(cid);
-        uint256 caseId = court.caseOfChallenge(cid);
+        uint256 caseId = court.caseOfChallenge(address(game), cid);
         assertTrue(caseId != 0);
         uint256 snapshotTs = court.caseOf(caseId).snapshotTs;
 

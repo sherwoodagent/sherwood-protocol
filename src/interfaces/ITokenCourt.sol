@@ -34,7 +34,7 @@ interface ITokenCourt {
 
     /// @notice Everything the court knows about one disputed challenge.
     /// @param challengeId The `ChallengeGame` challenge this case adjudicates.
-    ///        One case per challenge — `caseOfChallenge` enforces it.
+    ///        One case per (game, challenge) — `caseOfChallenge` enforces it.
     /// @param game The `IChallengeGame` this case's verdict is delivered to,
     ///        PINNED at `refer` from the then-current `challengeGame`. `finalize`
     ///        calls `rule` on this address, never on the live `challengeGame` —
@@ -86,9 +86,10 @@ interface ITokenCourt {
     error ZeroAddress();
     /// @notice A bounded setter was handed a value outside its allowed range.
     error InvalidParameter();
-    /// @notice `refer` called on a challenge that already has a case
-    ///         (`caseOfChallenge != 0`) — one case per challenge, enforced at
-    ///         the door rather than left to a downstream overwrite.
+    /// @notice `refer` called on a challenge that already has a case on the
+    ///         currently-wired game (`caseOfChallenge[challengeGame][id] != 0`)
+    ///         — one case per (game, challenge), enforced at the door rather
+    ///         than left to a downstream overwrite.
     error AlreadyReferred();
     /// @notice `refer` called on a challenge whose `IChallengeGame.Status` is
     ///         not `Disputed` — there is nothing to adjudicate yet (still
@@ -217,9 +218,14 @@ interface ITokenCourt {
     /// @notice Count of cases ever referred. Case ids are 1-indexed
     ///         (`caseOfChallenge == 0` means "no case").
     function caseCount() external view returns (uint256);
-    /// @notice The case id referred for `challengeId`, or zero if none has
-    ///         been.
-    function caseOfChallenge(uint256 challengeId) external view returns (uint256);
+    /// @notice The case id referred for `challengeId` on `game`, or zero if
+    ///         none has been.
+    /// @dev    Keyed by (game, challengeId), NOT challengeId alone (B1):
+    ///         `ChallengeGame` is non-upgradeable, so redeploying it is the
+    ///         migration path (`setChallengeGame`), and a fresh game's
+    ///         `challengeCount` restarts at 0 — its ids would otherwise
+    ///         collide with every case the old game ever referred.
+    function caseOfChallenge(address game, uint256 challengeId) external view returns (uint256);
     /// @notice Full state of one case.
     function caseOf(uint256 caseId) external view returns (Case memory);
     /// @notice How `voter` ruled on `caseId`, or `Ruling.None` if they have
@@ -236,9 +242,10 @@ interface ITokenCourt {
     ///         — the entry point both the game's auto-referral and any
     ///         manual fallback call.
     /// @dev    Requires `challengeGame`/`stakedWood` wired, no existing case
-    ///         for this challenge, the challenge status `Disputed`, and the
-    ///         clock check (`filedAt + disputeTimeoutAtFiling - now >=
-    ///         voteWindow + FINALIZE_BUFFER`) — a vote that could not finish
+    ///         for this challenge on the currently-wired game, the challenge
+    ///         status `Disputed`, and the clock check (`filedAt +
+    ///         disputeTimeoutAtFiling - now >= voteWindow + FINALIZE_BUFFER`)
+    ///         — a vote that could not finish
     ///         before the game's own timeout never opens.
     /// @return caseId The new case's id.
     function refer(uint256 challengeId) external returns (uint256 caseId);
