@@ -414,6 +414,20 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
 
     uint256 public challengeCount;
 
+    /// @inheritdoc IChallengeGame
+    /// @dev    WITHOUT THIS, `Inconclusive` IS A PERMANENT ACQUITTAL. Reaching
+    ///         it takes at least `autoSlashDelay + voteWindow` — 12 days at
+    ///         the defaults — and THE ACCUSED CHOOSES when the pool
+    ///         completes, anywhere inside `autoSlashDelay`. So a challenge
+    ///         filed more than ~2 days after execution could never be
+    ///         re-filed, and stalling the pool converted "the electorate did
+    ///         not turn out" into "the accused wins, finally". Extending on
+    ///         the unwind (`_refundAll`) makes the stall buy a DELAY instead
+    ///         of an ACQUITTAL. Zero means this proposal never went
+    ///         inconclusive: `file` falls back to
+    ///         `executedAt + challengeWindow`.
+    mapping(bytes32 reviewKey => uint256) public challengeableUntil;
+
     mapping(uint256 challengeId => Challenge) internal _challenges;
 
     /// @dev Who has paid into a challenge's counter-bond pool, in first-payment
@@ -517,7 +531,22 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         ISyndicateGovernor.StrategyProposal memory p = ISyndicateGovernor(governor).getProposal(proposalId);
         uint256 executedAt = p.executedAt;
         if (executedAt == 0) revert NotExecuted();
-        if (block.timestamp > executedAt + challengeWindow) revert WindowClosed();
+
+        // M3 (spec §5): the gate is `challengeableUntil`, EXTENDED past
+        // `executedAt + challengeWindow` whenever an earlier challenge on
+        // this same proposal unwound `Inconclusive` (`_refundAll`). Without
+        // this, reaching `Inconclusive` — at least `autoSlashDelay +
+        // voteWindow` after filing, and the accused controls exactly when
+        // inside that span the pool completes — could land past the
+        // ordinary window and make the acquittal permanent. Zero (never went
+        // inconclusive) falls back to the original gate byte-for-byte.
+        // `key` is computed here, once, rather than again a few lines down —
+        // it is needed for both this gate and the `AlreadyConvicted`/
+        // `AlreadyChallenged` checks below.
+        bytes32 key = _reviewKey(governor, proposalId);
+        uint256 deadline = challengeableUntil[key];
+        if (deadline == 0) deadline = executedAt + challengeWindow;
+        if (block.timestamp > deadline) revert WindowClosed();
 
         // WHICH ADAPTER A PROPOSAL TOUCHED IS FACT, NOT ASSERTION (review 🟠F4).
         // The filer still NAMES the adapter — D1's argument against deriving it
@@ -530,7 +559,6 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             _requireAdapterInProposal(governor, proposalId, adapterTarget, adapterSelector);
         }
 
-        bytes32 key = _reviewKey(governor, proposalId);
         // NOTHING LEFT TO COLLECT, SO NOTHING LEFT TO CHALLENGE (review 🟡F12).
         // The approvers underwrote ONE proposal and owe ONE liability; once a
         // settled challenge has collected it, every later filing settles
@@ -1431,7 +1459,20 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
 
         c.status = Status.Inconclusive;
         bondedWood -= (bond + pool);
-        _releaseFreeze(_reviewKey(governor, proposalId), governor, proposalId);
+        bytes32 rk = _reviewKey(governor, proposalId);
+        _releaseFreeze(rk, governor, proposalId);
+
+        // M3 (spec §5): EXTEND, NEVER SHORTEN — a second inconclusive round
+        // against the same proposal must not let its own `challengeWindow`
+        // pull the deadline back in. Without this line, `Inconclusive` is a
+        // permanent acquittal for any challenge filed more than roughly
+        // `challengeWindow - autoSlashDelay - voteWindow` after execution:
+        // the accused stalls the pool to the last legal instant inside
+        // `autoSlashDelay`, the vote runs, and the verdict lands past
+        // `executedAt + challengeWindow` with no filing gate left standing.
+        // Extending on every unwind turns that stall into a delay, not a win.
+        uint256 extended = block.timestamp + challengeWindow;
+        if (extended > challengeableUntil[rk]) challengeableUntil[rk] = extended;
 
         _bookRefund(challengeId, pool);
         wood.safeTransfer(challenger, bond);

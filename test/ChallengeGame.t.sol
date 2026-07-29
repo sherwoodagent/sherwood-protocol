@@ -2206,6 +2206,119 @@ contract ChallengeGameTest is Test {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // Task 4 (review M3) — Inconclusive extends the re-challenge window
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @dev Mirrors `ChallengeGame._reviewKey` exactly — the two must derive
+    ///      the same key or every `challengeableUntil` lookup below means
+    ///      nothing.
+    function _reviewKeyFor(address governor, uint256 proposalId) internal pure returns (bytes32) {
+        return keccak256(abi.encode(governor, proposalId));
+    }
+
+    /// @dev Like `_fileStandard`, but files `offset` after execution instead
+    ///      of the fixed 3 days — needed to put the filing close enough to
+    ///      execution that a pool stalled to the edge of `autoSlashDelay` can
+    ///      still land an `Inconclusive` verdict past
+    ///      `executedAt + challengeWindow`.
+    function _fileStandardAt(uint256 proposalId, uint256 offset) internal returns (uint256 id) {
+        _setCoverage(proposalId, 6_000e18, 4_000e18);
+        _execute(proposalId);
+        vm.warp(vm.getBlockTimestamp() + offset);
+        vm.prank(challenger);
+        id = game.file(
+            address(gov), proposalId, IChallengeGame.Predicate.OutOfAdapterOutflow, ADAPTER, SELECTOR, EVIDENCE
+        );
+    }
+
+    /// @dev Completes a filed challenge's counter-bond pool at `filedAt +
+    ///      instant` — standing in for the accused choosing exactly when
+    ///      inside `autoSlashDelay` to stop stalling. `instant` must be
+    ///      strictly less than the challenge's `autoSlashDelayAtFiling`, or
+    ///      the contribution window has already closed.
+    function _completePoolAt(uint256 id, uint256 instant) internal {
+        vm.warp(_filedAt(id) + instant);
+        vm.prank(guardianA);
+        game.dispute(id, type(uint256).max);
+    }
+
+    /// @dev Completes a filed challenge's counter-bond pool right now, with no
+    ///      stall — the ordinary case, used where the timing of completion
+    ///      does not matter to the assertion.
+    function _completePool(uint256 id) internal {
+        vm.prank(guardianA);
+        game.dispute(id, type(uint256).max);
+    }
+
+    /// @dev Files against `proposalId` from `who` WITHOUT re-executing it —
+    ///      unlike `_fileStandard`, which always re-stamps `executedAt` to
+    ///      "now" and so would silently reset any re-challenge deadline back
+    ///      to a fresh `executedAt + challengeWindow`. Needed whenever a test
+    ///      must file a SECOND time against the SAME execution instant, to
+    ///      prove a re-challenge window was — or was not — actually extended,
+    ///      rather than merely reset by a fresh execution.
+    function _fileStandardFrom(address who, uint256 proposalId) internal returns (uint256 id) {
+        vm.prank(who);
+        id = game.file(
+            address(gov), proposalId, IChallengeGame.Predicate.OutOfAdapterOutflow, ADAPTER, SELECTOR, EVIDENCE
+        );
+    }
+
+    /// @notice M3: without extending `challengeableUntil` on an `Inconclusive`
+    ///         unwind, `Inconclusive` is a PERMANENT acquittal for any
+    ///         challenge filed more than roughly `challengeWindow -
+    ///         autoSlashDelay - voteWindow` after execution — the accused
+    ///         simply stalls the counter-bond pool to the last legal instant
+    ///         inside `autoSlashDelay`, and the verdict lands past
+    ///         `executedAt + challengeWindow` with no filing gate left
+    ///         standing. Filed at day 3, stalled to the edge of the 7-day
+    ///         `autoSlashDelay`, ruled `Inconclusive` the same instant: this
+    ///         proposal must still be re-challengeable five days later, well
+    ///         past the original 14-day window.
+    function test_inconclusive_extendsTheRechallengeWindow() public {
+        uint256 id = _fileStandardAt(PROPOSAL, 3 days);
+        _completePoolAt(id, 7 days - 1);
+        vm.prank(court);
+        game.rule(id, IChallengeGame.Verdict.Inconclusive);
+
+        bytes32 key = _reviewKeyFor(address(gov), PROPOSAL);
+        assertGt(game.challengeableUntil(key), vm.getBlockTimestamp(), "window was extended");
+
+        vm.warp(vm.getBlockTimestamp() + 5 days); // well past executedAt + 14 days
+        uint256 refiled = _fileStandardFrom(challenger, PROPOSAL); // MUST NOT revert WindowClosed
+        assertGt(refiled, 0, "the proposal is genuinely re-challengeable");
+    }
+
+    /// @notice A second inconclusive round must never pull the deadline back
+    ///         in, even though its own `challengeWindow` is computed from a
+    ///         LATER instant than the first round's.
+    function test_challengeableUntil_onlyEverLengthens() public {
+        uint256 id = _fileStandard(PROPOSAL);
+        _completePool(id);
+        vm.prank(court);
+        game.rule(id, IChallengeGame.Verdict.Inconclusive);
+        bytes32 key = _reviewKeyFor(address(gov), PROPOSAL);
+        uint256 first = game.challengeableUntil(key);
+
+        uint256 again = _fileStandard(PROPOSAL);
+        _completePool(again);
+        vm.prank(court);
+        game.rule(again, IChallengeGame.Verdict.Inconclusive);
+        assertGe(game.challengeableUntil(key), first, "never shortens");
+    }
+
+    /// @notice A proposal that never went inconclusive must behave exactly as
+    ///         before: the gate is `executedAt + challengeWindow`, unextended,
+    ///         and filing past it reverts.
+    function test_challengeableUntil_unsetFallsBackToExecutedAtPlusWindow() public {
+        _fileStandard(PROPOSAL);
+        assertEq(game.challengeableUntil(_reviewKeyFor(address(gov), PROPOSAL)), 0, "unset until an unwind");
+        vm.warp(vm.getBlockTimestamp() + 15 days);
+        vm.expectRevert(IChallengeGame.WindowClosed.selector);
+        _fileStandardFrom(makeAddr("otherChallenger"), PROPOSAL);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // The pooled counter-bond
     // ─────────────────────────────────────────────────────────────────────────
 

@@ -518,6 +518,20 @@ interface IChallengeGame {
     ///         `*AtFiling` economic pins) and what deliberately is not
     ///         (`court`, read live by `rule`).
     function filingsPaused() external view returns (bool);
+    /// @notice Per-proposal deadline for NEW filings, extended whenever a
+    ///         challenge on that proposal unwinds `Inconclusive` (spec
+    ///         2026-07-29 §5).
+    /// @dev    WITHOUT THIS, `Inconclusive` IS A PERMANENT ACQUITTAL. Reaching
+    ///         it takes at least `autoSlashDelay + voteWindow` — 12 days at
+    ///         the defaults — and THE ACCUSED CHOOSES when the pool
+    ///         completes, anywhere inside `autoSlashDelay`. So a challenge
+    ///         filed more than ~2 days after execution could never be
+    ///         re-filed, and stalling the pool converted "the electorate did
+    ///         not turn out" into "the accused wins, finally". Extending on
+    ///         the unwind makes the stall buy a DELAY instead of an
+    ///         ACQUITTAL. Zero means this proposal never went inconclusive:
+    ///         `file` falls back to `executedAt + challengeWindow`.
+    function challengeableUntil(bytes32 reviewKey) external view returns (uint256);
 
     // ── Owner setters ──
     /// @notice Wire (or unwire) the court. The zero address is DELIBERATELY
