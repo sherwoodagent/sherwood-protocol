@@ -250,6 +250,11 @@ contract MockChallengeStakedWood {
     address public lastBountyTo;
     uint256 public lastBountyBps;
 
+    /// @dev Mirrors the real `StakedWood.MAX_CONVICTION_BOUNTY_BPS` (2_000) so
+    ///      `ChallengeGame.setConvictionBountyBps`'s live-read ceiling has
+    ///      something to read in this suite.
+    uint256 public constant MAX_CONVICTION_BOUNTY_BPS = 2_000;
+
     uint256 internal _nextTotal = 1_000e18;
     uint256 internal _nextCaseId = 1;
 
@@ -2799,5 +2804,103 @@ contract ChallengeGameTest is Test {
         emit IChallengeGame.FilingsPausedSet(false, true);
         vm.prank(owner);
         game.setFilingsPaused(true);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Task 2 (court-incentives) — conviction bounty, pinned at filing,
+    // paid ONLY on an escalated (Guilty-ruled) conviction
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @dev A second proposal's silence-path challenge, escalated by guardianA
+    ///      alone — the same shape as `_fileAndDispute`, just on proposal 2 so
+    ///      it can run alongside a challenge already live on `PROPOSAL`.
+    function _fileAndDisputeSecondProposal() internal returns (uint256 id) {
+        id = _fileStandard(2);
+        vm.prank(guardianA);
+        game.dispute(id, type(uint256).max);
+    }
+
+    /// @dev Two concurrent silence-path challenges against the SAME proposal,
+    ///      by two different challengers — the exact fixture
+    ///      `test_resolve_concurrentSettlesConvictOnlyOnce` already exercises,
+    ///      just returning both ids so a caller can resolve them in order and
+    ///      watch the second hit the `_convicted` short-circuit.
+    function _twoConcurrentChallenges() internal returns (uint256 first, uint256 second) {
+        _setCoverage(PROPOSAL, 6_000e18, 4_000e18);
+        _execute(PROPOSAL);
+
+        vm.prank(challenger);
+        first = game.file(
+            address(gov), PROPOSAL, IChallengeGame.Predicate.OutOfAdapterOutflow, ADAPTER, SELECTOR, EVIDENCE
+        );
+
+        address other = makeAddr("otherChallenger");
+        wood.mint(other, 1_000_000e18);
+        vm.startPrank(other);
+        wood.approve(address(game), type(uint256).max);
+        second = game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.RogueAllowance, ADAPTER, SELECTOR, EVIDENCE);
+        vm.stopPrank();
+    }
+
+    /// @notice THE SILENCE PATH PAYS NO BOUNTY, and that is the design's
+    ///         central decision (spec 2026-07-29 §2): on that path an honest
+    ///         filer and a liar are indistinguishable to the contract, so any
+    ///         bounty there rewards both identically and no size works.
+    function test_convictionBounty_notPaidOnTheSilencePath() public {
+        uint256 id = _fileStandard(PROPOSAL);
+        vm.warp(vm.getBlockTimestamp() + 7 days + 1);
+        game.resolve(id);
+        assertEq(swood.lastBountyTo(), address(0), "no recipient on the silence settle");
+        assertEq(swood.lastBountyBps(), 0, "no rate on the silence settle");
+    }
+
+    function test_convictionBounty_paidOnTheGuiltyRuling() public {
+        uint256 id = _fileAndDispute();
+        vm.prank(court);
+        game.rule(id, IChallengeGame.Verdict.Guilty);
+        assertEq(swood.lastBountyTo(), challenger, "the challenger is the recipient");
+        assertEq(swood.lastBountyBps(), 500, "the pinned rate is forwarded");
+    }
+
+    function test_convictionBounty_notPaidOnFailOrInconclusive() public {
+        uint256 a = _fileAndDispute();
+        vm.prank(court);
+        game.rule(a, IChallengeGame.Verdict.NotGuilty);
+        assertEq(swood.lastBountyBps(), 0, "_fail never slashes, so never pays");
+
+        uint256 b = _fileAndDisputeSecondProposal();
+        vm.prank(court);
+        game.rule(b, IChallengeGame.Verdict.Inconclusive);
+        assertEq(swood.lastBountyBps(), 0, "_refundAll never slashes, so never pays");
+    }
+
+    function test_convictionBounty_pinnedAtFiling() public {
+        uint256 id = _fileAndDispute(); // escalated - the only path that pays
+        vm.prank(owner);
+        game.setConvictionBountyBps(2_000); // raise AFTER filing
+        vm.prank(court);
+        game.rule(id, IChallengeGame.Verdict.Guilty);
+        assertEq(game.challengeOf(id).convictionBountyBpsAtFiling, 500, "the challenge keeps its filing rate");
+        assertEq(swood.lastBountyBps(), 500, "forwarded at the pinned rate, not the raised one");
+    }
+
+    function test_convictionBounty_notPaidTwiceOnAConcurrentChallenge() public {
+        (uint256 first, uint256 second) = _twoConcurrentChallenges();
+        vm.warp(vm.getBlockTimestamp() + 7 days + 1);
+        game.resolve(first);
+        game.resolve(second); // hits the _convicted short-circuit - no slash at all
+        assertEq(swood.lastBountyBps(), 0, "the short-circuit slashes nothing, so pays nothing");
+    }
+
+    function test_setConvictionBountyBps_boundsAndOwner() public {
+        vm.prank(owner);
+        vm.expectRevert(IChallengeGame.InvalidParameter.selector);
+        game.setConvictionBountyBps(2_001); // above sWOOD's ceiling
+        vm.prank(challenger);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, challenger));
+        game.setConvictionBountyBps(100);
+        vm.prank(owner);
+        game.setConvictionBountyBps(0); // zero is legal - bounty off
+        assertEq(game.convictionBountyBps(), 0);
     }
 }

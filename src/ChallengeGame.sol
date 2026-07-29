@@ -360,6 +360,22 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///         filing would invert the incentive it is meant to price.
     uint256 public settleBurnBps = 2_000;
 
+    /// @notice Slice of a verdict slash paid to the challenger that caused it,
+    ///         in bps (spec 2026-07-29 §2). Default 5%.
+    /// @dev    ESCALATED CONVICTIONS ONLY (see `_settle`'s gate on `escalated`).
+    ///         On the silence path an honest filer and a liar are
+    ///         indistinguishable to this contract — both produce a real slash
+    ///         against a real cohort, both would collect — so any bounty there
+    ///         pays liars exactly as well as watchdogs, and the two
+    ///         constraints (make honest filing profitable / keep false filing
+    ///         unprofitable) are contradictory at every rate. The escalated
+    ///         path separates them: the accused contested and lost on the
+    ///         merits, and a liar who picks a guardian that is paying
+    ///         attention forfeits the whole bond on `NotGuilty`. That is why
+    ///         the bounty is safe here at any size, and why no anti-abuse
+    ///         bound is needed beyond sWOOD's own ceiling.
+    uint256 public convictionBountyBps = 500;
+
     /// @notice WOOD held on behalf of live (`Filed`/`Disputed`) challenges —
     ///         the sum of their challenger bonds and counter-bond POOLS.
     /// @dev    The §4 invariant is `wood.balanceOf(this) >= bondedWood`. Every
@@ -646,6 +662,12 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             // a challenge that was already correct.
             settleBurnBpsAtFiling: settleBurnBps,
             forfeitBurnBpsAtFiling: forfeitBurnBps,
+            // Pinned for the same reason as the rates above (spec 2026-07-29
+            // §2): read live, a post-filing raise would change what the
+            // challenger stood to collect on a conviction it already bonded
+            // itself against. Forwarded to `slashToEscrow` only on an
+            // escalated conviction — see `_settle`.
+            convictionBountyBpsAtFiling: convictionBountyBps,
             // Written only by `_fail`, which is the sole path that gives the
             // pool's funders anything beyond their stake back.
             forfeitPayoutWood: 0
@@ -1082,8 +1104,26 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             // delegated capital at the drain, not at the accusation.
             // `executedAt - 1 < executedAt` keeps sWOOD's
             // `snapshotTimestamp <= openedAt` bound satisfied.
+            // ESCALATED CONVICTIONS ONLY (spec 2026-07-29 §2). On the silence
+            // path an honest filer and a liar are indistinguishable to this
+            // contract - both produce a real slash against a real cohort and
+            // both would collect - so any bounty there pays liars exactly as
+            // well as watchdogs, and the two constraints (make honest filing
+            // profitable / keep false filing unprofitable) are contradictory at
+            // every rate. The escalated path separates them: the accused
+            // contested and lost on the merits, and a liar who picks a guardian
+            // that is paying attention forfeits the whole bond on `NotGuilty`.
+            // That is why the bounty is safe here at any size, and why no
+            // anti-abuse bound is needed.
             (slashedWood, caseId) = swood.slashToEscrow(
-                key, c.executedAt, approvers, slashBpsPer, c.vault, c.executedAt - 1, address(0), 0
+                key,
+                c.executedAt,
+                approvers,
+                slashBpsPer,
+                c.vault,
+                c.executedAt - 1,
+                escalated ? c.challenger : address(0),
+                escalated ? c.convictionBountyBpsAtFiling : 0
             );
         }
 
@@ -1583,6 +1623,29 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         if (newBps > MAX_SETTLE_BURN_BPS) revert InvalidParameter();
         emit SettleBurnBpsSet(settleBurnBps, newBps);
         settleBurnBps = newBps;
+    }
+
+    /// @dev Bounded by the SLASHER's own ceiling, read live rather than
+    ///      restated here: sWOOD enforces `MAX_CONVICTION_BOUNTY_BPS` on every
+    ///      call regardless of what this game asks for, so duplicating the
+    ///      literal would create two constants that must agree with nothing
+    ///      checking that they do. Zero is legal and turns the bounty off.
+    /// @dev  REQUIRES `stakedWood` WIRED FIRST (unlike every other rate setter
+    ///       here), because there is nothing to bound against otherwise. An
+    ///       unwired game could accept a rate `_settle` fail-closes on today
+    ///       (`ZeroAddress`), but that rate is PINNED per challenge at filing
+    ///       and outlives any later `setStakedWood` — a challenge filed under a
+    ///       since-lowered or since-wired ceiling would carry a pinned rate
+    ///       sWOOD's own `slashToEscrow` then rejects forever, stranding a
+    ///       challenge with no terminal path. Failing closed here, at
+    ///       configuration time, is cheap; failing closed at resolution time,
+    ///       mid-challenge, is not.
+    function setConvictionBountyBps(uint256 newBps) external onlyOwner {
+        IStakedWood swood = stakedWood;
+        if (address(swood) == address(0)) revert ZeroAddress();
+        if (newBps > swood.MAX_CONVICTION_BOUNTY_BPS()) revert InvalidParameter();
+        emit ConvictionBountyBpsSet(convictionBountyBps, newBps);
+        convictionBountyBps = newBps;
     }
 
     /// @dev Gates `file` ONLY (see `filingsPaused`). Deliberately touches

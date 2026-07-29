@@ -493,22 +493,38 @@ contract TokenCourtEndToEndTest is Test {
 
         // ── The accused's REAL staked WOOD was really slashed, at exactly what
         //    the ledger priced its liability at.
-        assertEq(swood.guardianStake(g1), G1_STAKE - (G1_STAKE * expectedBps) / 10_000, "g1 paid exactly what it owed");
+        uint256 slashedGross = (G1_STAKE * expectedBps) / 10_000;
+        assertEq(swood.guardianStake(g1), G1_STAKE - slashedGross, "g1 paid exactly what it owed");
 
-        // ── The challenger is repaid bond + the whole forfeited pool
-        //    (escalated settle: no burn -- see `_settle`'s `escalated` branch).
+        // ── The challenger is repaid bond + the whole forfeited pool, PLUS the
+        //    conviction bounty (Task 2, spec 2026-07-29 §2): this ruling is an
+        //    ESCALATED conviction (a real `Guilty` verdict from the court, on
+        //    the real StakedWood), so `_settle` forwards the challenge's pinned
+        //    `convictionBountyBpsAtFiling` and sWOOD pays it straight to the
+        //    challenger, off the top of the gross slash, before the escrow ever
+        //    sees the proceeds -- exactly what makes this arc different from an
+        //    unanswered silence settle, which pays none of this.
         IChallengeGame.Challenge memory c = game.challengeOf(cid);
-        assertEq(wood.balanceOf(challenger), challengerBalBefore + c.counterBondWood, "bond back plus the whole pool");
+        uint256 bounty = (slashedGross * c.convictionBountyBpsAtFiling) / 10_000;
+        assertEq(
+            wood.balanceOf(challenger),
+            challengerBalBefore + c.counterBondWood + bounty,
+            "bond back plus the whole pool plus the escalated conviction bounty"
+        );
 
         // ── The named adapter lost its certification (D7).
         (uint8 tierAfter, uint16 boundAfter) = tierRegistry.tierOf(address(adapter), adapter.poke.selector);
         assertEq(tierAfter, 2, "demoted to the arbitrary-calldata default");
         assertEq(boundAfter, 10_000, "and to full notional");
 
-        // ── A real compensation case opened in the escrow.
+        // ── A real compensation case opened in the escrow, funded with the
+        //    slash NET of the conviction bounty paid out above (spec 2026-07-29
+        //    §2: the bounty comes off the top before the escrow ever sees the
+        //    proceeds, so victims' claimable total is smaller by exactly what
+        //    the challenger was just paid).
         assertEq(escrow.caseCount(), 1, "the slash reached the compensation escrow");
         (,, uint256 proceeds,,,,) = escrow.caseOf(1);
-        assertEq(proceeds, (G1_STAKE * expectedBps) / 10_000, "the whole slash reached the case");
+        assertEq(proceeds, slashedGross - bounty, "the slash net of the conviction bounty reached the case");
 
         assertEq(wood.balanceOf(address(court)), 0, "court custody is zero, always");
     }

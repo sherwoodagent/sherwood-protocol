@@ -106,6 +106,14 @@ interface IChallengeGame {
     ///        funded the counter-bond: they commit WOOD to a pool whose payout
     ///        this rate scales, so a raise after they paid in shrinks what they
     ///        collect for a defence that WON.
+    /// @param convictionBountyBpsAtFiling The conviction-bounty rate in force at
+    ///        filing (spec 2026-07-29 §2), pinned for the same reason as the
+    ///        clocks and burn rates above: read live, the owner could raise it
+    ///        after a filing and change what the challenger stood to collect on
+    ///        a conviction it had already committed its bond toward. Forwarded
+    ///        to `IStakedWood.slashToEscrow` as `bountyBps` — but ONLY on an
+    ///        escalated (`Guilty`-ruled) conviction, never on the silence
+    ///        settle. See `ChallengeGame._settle`.
     struct Challenge {
         address governor;
         uint256 proposalId;
@@ -124,6 +132,7 @@ interface IChallengeGame {
         uint256 disputeTimeoutAtFiling;
         uint256 settleBurnBpsAtFiling;
         uint256 forfeitBurnBpsAtFiling;
+        uint256 convictionBountyBpsAtFiling;
         /// @dev The forfeited challenger bond, net of the fail-path burn, that
         ///      the pool's funders split pro-rata to what each put in. Written
         ///      once by `_fail`, read by `claimContribution`, zero on every
@@ -292,6 +301,7 @@ interface IChallengeGame {
     event DisputeTimeoutSet(uint256 oldTimeout, uint256 newTimeout);
     event SettleBurnBpsSet(uint256 oldBps, uint256 newBps);
     event FilingsPausedSet(bool oldPaused, bool newPaused);
+    event ConvictionBountyBpsSet(uint256 oldBps, uint256 newBps);
 
     // ── Filing ──
     /// @notice File a bonded challenge against an executed proposal, freezing
@@ -462,6 +472,15 @@ interface IChallengeGame {
     ///         Applies to the settle path only: the fail path already forfeits
     ///         the whole bond to the accused (§3.4).
     function settleBurnBps() external view returns (uint256);
+    /// @notice Slice of a verdict slash paid to the challenger that caused it
+    ///         (spec 2026-07-29 §2). Pinned per challenge at filing.
+    /// @dev    ESCALATED CONVICTIONS ONLY, and never while a dispute is open.
+    ///         `_settle` is the sole payer and it is reached only by the
+    ///         silence timeout or a `Guilty` ruling; of those two it forwards a
+    ///         non-zero rate ONLY for the ruling. A `NotGuilty` ruling, an
+    ///         `Inconclusive` unwind and the dispute timeout all route through
+    ///         `_fail`/`_refundAll`, which slash nothing and so pay nothing.
+    function convictionBountyBps() external view returns (uint256);
     /// @notice WOOD the game holds on behalf of live (`Filed`/`Disputed`)
     ///         challenges. The §4 invariant is `wood.balanceOf(game) >=
     ///         bondedWood`; the game pays out nothing but bonds, so the two are
@@ -502,4 +521,5 @@ interface IChallengeGame {
     function setDisputeTimeout(uint256 newTimeout) external;
     function setSettleBurnBps(uint256 newBps) external;
     function setFilingsPaused(bool paused) external;
+    function setConvictionBountyBps(uint256 newBps) external;
 }
