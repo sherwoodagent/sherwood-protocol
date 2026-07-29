@@ -1067,8 +1067,9 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             // delegated capital at the drain, not at the accusation.
             // `executedAt - 1 < executedAt` keeps sWOOD's
             // `snapshotTimestamp <= openedAt` bound satisfied.
-            (slashedWood, caseId) =
-                swood.slashToEscrow(key, c.executedAt, approvers, slashBpsPer, c.vault, c.executedAt - 1);
+            (slashedWood, caseId) = swood.slashToEscrow(
+                key, c.executedAt, approvers, slashBpsPer, c.vault, c.executedAt - 1, address(0), 0
+            );
         }
 
         // §3.4: "adapters demote only on a passed challenge" — and only the one

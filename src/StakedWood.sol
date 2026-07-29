@@ -264,6 +264,11 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     /// @dev Mirrors `IStakedWood.VerdictSlashUncompensated`.
     event VerdictSlashUncompensated(bytes32 indexed caseKey, address indexed vault, uint256 total);
 
+    /// @notice A conviction bounty was paid out of a verdict slash before the
+    ///         remainder opened a compensation case (spec 2026-07-29 §2).
+    /// @dev Mirrors `IStakedWood.ConvictionBountyPaid`.
+    event ConvictionBountyPaid(bytes32 indexed caseKey, address indexed bountyTo, uint256 amount);
+
     /// @notice Emitted once per approver actually slashed for a blocked proposal.
     /// @dev A slash is a significant value-destroying change; the appeal flow
     ///      (`refundSlash`) and indexers need on-chain records. Emitted only
@@ -1285,7 +1290,15 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///        against. Chosen by the CALLER within the bound above (§3.8): the
     ///        block before the drain proposal executed for predicates 1-4, the
     ///        epoch-N opening checkpoint for a per-epoch drawdown conviction.
-    /// @return total  Total WOOD routed to the escrow across all approvers.
+    /// @param bountyTo  Recipient of the conviction bounty (spec 2026-07-29
+    ///        §2), or `address(0)` to disable it. Never storage — the caller
+    ///        (`ChallengeGame`) decides per settle whether this path pays at
+    ///        all, so sWOOD gains no state variable for it and this stays a
+    ///        plain UUPS upgrade.
+    /// @param bountyBps Slice of the recovered total paid to `bountyTo`, in
+    ///        bps. `0` disables the bounty even with a non-zero `bountyTo`.
+    /// @return total  Total WOOD routed to the escrow across all approvers,
+    ///         NET of the conviction bounty.
     /// @return caseId The escrow case funded, or 0 when nothing was recovered.
     function slashToEscrow(
         bytes32 caseKey,
@@ -1293,7 +1306,9 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
         address[] calldata approvers,
         uint256[] calldata slashBpsPer,
         address vault,
-        uint256 snapshotTimestamp
+        uint256 snapshotTimestamp,
+        address bountyTo,
+        uint256 bountyBps
     ) external onlyAuthorizedSlasher returns (uint256 total, uint256 caseId) {
         address escrow = compensationEscrow;
         if (escrow == address(0)) revert CompensationEscrowNotSet();
@@ -1382,6 +1397,26 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
         }
         // Nothing recovered: no case to open (the escrow rejects zero proceeds).
         if (total == 0) return (0, 0);
+
+        // THE BOUNTY COMES OFF THE TOP, BEFORE THE ESCROW SEES THE MONEY
+        // (spec 2026-07-29 §2). Paying the prosecutor out of what the
+        // prosecution recovered is what makes filing rational: a correct but
+        // unanswered challenge otherwise LOSES `settleBurnBps` of its bond, so
+        // nobody outside the drained vault has a reason to watch. Deducting
+        // here rather than inside the escrow keeps `proceeds` honest - the
+        // number a claimant redeems against is the number actually present -
+        // and keeps a non-victim payout out of the contract whose only job is
+        // victim compensation.
+        uint256 bounty;
+        if (bountyTo != address(0) && bountyBps != 0) {
+            bounty = total * bountyBps / 10_000;
+            if (bounty != 0) {
+                total -= bounty;
+                wood.safeTransfer(bountyTo, bounty);
+                emit ConvictionBountyPaid(caseKey, bountyTo, bounty);
+            }
+        }
+
         _totalStakeCheckpoint.push(uint32(block.timestamp), uint224(totalGuardianStake));
         // Effects are complete; hand the proceeds over and open the case.
         // `forceApprove` tolerates non-standard tokens that reject a non-zero
@@ -1422,6 +1457,11 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
                 }
             }
             IERC20(wood).forceApprove(escrow, 0);
+            // `total` here is already NET of the bounty: it left in the branch
+            // above, before this fallback could ever run. Burning the gross
+            // would double-count it — the bounty recipient keeps its cut
+            // either way, so only what was actually destined for the escrow
+            // burns.
             _burnWood(total);
             caseId = 0;
             emit VerdictSlashUncompensated(caseKey, vault, total);

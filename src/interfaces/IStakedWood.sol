@@ -74,6 +74,10 @@ interface IStakedWood {
     ///         guardian is still slashed; the case's victims go uncompensated.
     event VerdictSlashUncompensated(bytes32 indexed caseKey, address indexed vault, uint256 total);
 
+    /// @notice A conviction bounty was paid out of a verdict slash before the
+    ///         remainder opened a compensation case (spec 2026-07-29 §2).
+    event ConvictionBountyPaid(bytes32 indexed caseKey, address indexed bountyTo, uint256 amount);
+
     // ── Guardian stake ──
     function stakeAsGuardian(uint256 amount, uint256 agentId) external;
     function requestUnstakeGuardian() external;
@@ -197,7 +201,18 @@ interface IStakedWood {
     ///      If `openCase` reverts (unpriceable vault), the slash stands and the
     ///      proceeds BURN (`VerdictSlashUncompensated`), so a bad vault cannot
     ///      brick the verdict.
-    /// @return total  WOOD routed to the escrow across all approvers.
+    /// @dev    THE BOUNTY IS THE PROSECUTOR'S FEE (spec 2026-07-29 §2). It is
+    ///         paid only when a slash actually recovers WOOD, and it is
+    ///         deducted BEFORE `openCase` so the escrow's `proceeds` equal what
+    ///         claimants can really redeem. `bountyTo == address(0)` or
+    ///         `bountyBps == 0` disables it and the escrow receives the whole
+    ///         slash - which is how the caller expresses "this path pays no
+    ///         bounty" (see `ChallengeGame._settle`: only an ESCALATED
+    ///         conviction pays, never the silence settle).
+    /// @param  bountyTo   Recipient of the conviction bounty, or `address(0)`.
+    /// @param  bountyBps  Slice of the recovered total, in bps.
+    /// @return total  WOOD routed to the escrow across all approvers, NET of
+    ///                the conviction bounty.
     /// @return caseId The escrow case funded, or 0 when nothing was recovered.
     function slashToEscrow(
         bytes32 caseKey,
@@ -205,7 +220,9 @@ interface IStakedWood {
         address[] calldata approvers,
         uint256[] calldata slashBpsPer,
         address vault,
-        uint256 snapshotTimestamp
+        uint256 snapshotTimestamp,
+        address bountyTo,
+        uint256 bountyBps
     ) external returns (uint256 total, uint256 caseId);
 
     function setAuthorizedSlasher(address slasher) external;

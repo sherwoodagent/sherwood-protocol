@@ -266,7 +266,9 @@ contract MockChallengeStakedWood {
         address[] calldata approvers,
         uint256[] calldata slashBpsPer,
         address vault,
-        uint256 snapshotTimestamp
+        uint256 snapshotTimestamp,
+        address, /* bountyTo */
+        uint256 /* bountyBps */
     ) external returns (uint256, uint256) {
         callCount++;
         lastCaseKey = caseKey;

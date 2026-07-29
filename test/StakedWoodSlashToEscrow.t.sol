@@ -161,7 +161,9 @@ contract StakedWoodSlashToEscrowTest is Test {
         gs[0] = g1;
         vm.prank(slasher);
         vm.expectRevert(IStakedWood.CompensationEscrowNotSet.selector);
-        swood.slashToEscrow(bytes32("case"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs);
+        swood.slashToEscrow(
+            bytes32("case"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs, address(0), 0
+        );
     }
 
     /// @notice sWOOD must not leave a standing allowance behind: the escrow's
@@ -174,7 +176,9 @@ contract StakedWoodSlashToEscrowTest is Test {
         gs[0] = g1;
 
         vm.prank(slasher);
-        swood.slashToEscrow(bytes32("case"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs);
+        swood.slashToEscrow(
+            bytes32("case"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs, address(0), 0
+        );
 
         assertEq(wood.allowance(address(swood), address(escrow)), 0, "allowance zeroed after the hand-off");
     }
@@ -183,7 +187,9 @@ contract StakedWoodSlashToEscrowTest is Test {
         address[] memory gs = new address[](1);
         gs[0] = g1;
         vm.expectRevert(IStakedWood.NotAuthorizedSlasher.selector);
-        swood.slashToEscrow(bytes32("case"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs);
+        swood.slashToEscrow(
+            bytes32("case"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs, address(0), 0
+        );
     }
 
     /// @notice The registry cannot drive the verdict path either — the roles are
@@ -195,7 +201,9 @@ contract StakedWoodSlashToEscrowTest is Test {
         gs[0] = g1;
         vm.prank(registry);
         vm.expectRevert(IStakedWood.NotAuthorizedSlasher.selector);
-        swood.slashToEscrow(bytes32("case"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs);
+        swood.slashToEscrow(
+            bytes32("case"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs, address(0), 0
+        );
     }
 
     /// @notice N-4 (PR #24 round 4): the vault must be factory-deployed. The
@@ -219,7 +227,7 @@ contract StakedWoodSlashToEscrowTest is Test {
         uint256[] memory bps = _bpsArr(gs.length, 10_000);
         vm.prank(slasher);
         vm.expectRevert(StakedWood.VaultNotFactoryDeployed.selector);
-        swood.slashToEscrow(bytes32("stranger"), openedAt, gs, bps, strangerVault, snapTs);
+        swood.slashToEscrow(bytes32("stranger"), openedAt, gs, bps, strangerVault, snapTs, address(0), 0);
 
         assertEq(swood.guardianStake(g1), stakeBefore, "nothing was slashed for an unknown vault");
         assertFalse(swood.verdictSlashed(bytes32("stranger"), g1), "and the verdict mark stays clean");
@@ -234,8 +242,9 @@ contract StakedWoodSlashToEscrowTest is Test {
         gs[0] = g1;
 
         vm.prank(slasher);
-        (uint256 total, uint256 caseId) =
-            swood.slashToEscrow(bytes32("case"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs);
+        (uint256 total, uint256 caseId) = swood.slashToEscrow(
+            bytes32("case"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs, address(0), 0
+        );
 
         assertGt(total, 0, "something was actually slashed");
         assertEq(caseId, 1, "the funded case id is returned, not scraped");
@@ -260,7 +269,9 @@ contract StakedWoodSlashToEscrowTest is Test {
         vm.expectEmit(true, true, false, true, address(swood));
         emit IStakedWood.VerdictSlashRouted(bytes32("case"), address(vault), 20_000e18, 1);
         vm.prank(slasher);
-        swood.slashToEscrow(bytes32("case"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs);
+        swood.slashToEscrow(
+            bytes32("case"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs, address(0), 0
+        );
     }
 
     /// @notice FIX 5 / spec §3.8: the compensation snapshot must be at or before
@@ -281,7 +292,9 @@ contract StakedWoodSlashToEscrowTest is Test {
 
         vm.prank(slasher);
         vm.expectRevert(IStakedWood.SnapshotAfterVerdict.selector);
-        swood.slashToEscrow(bytes32("case"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), postVerdictTs);
+        swood.slashToEscrow(
+            bytes32("case"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), postVerdictTs, address(0), 0
+        );
     }
 
     /// @notice A snapshot exactly AT the verdict open is allowed — the bound is
@@ -296,8 +309,9 @@ contract StakedWoodSlashToEscrowTest is Test {
         gs[0] = g1;
 
         vm.prank(slasher);
-        (, uint256 caseId) =
-            swood.slashToEscrow(bytes32("case"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), openedAt);
+        (, uint256 caseId) = swood.slashToEscrow(
+            bytes32("case"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), openedAt, address(0), 0
+        );
         (, uint256 ts,,,,,) = escrow.caseOf(caseId);
         assertEq(ts, openedAt);
     }
@@ -314,8 +328,9 @@ contract StakedWoodSlashToEscrowTest is Test {
         gs[0] = g1;
 
         vm.prank(slasher);
-        (uint256 total,) =
-            swood.slashToEscrow(bytes32("case"), openedAt, gs, _bpsArr(gs.length, 1), address(vault), snapTs);
+        (uint256 total,) = swood.slashToEscrow(
+            bytes32("case"), openedAt, gs, _bpsArr(gs.length, 1), address(vault), snapTs, address(0), 0
+        );
         assertEq(total, 2_000e18, "1 bps floored to minSlashBps (1000) = 10% of 20k");
     }
 
@@ -329,8 +344,9 @@ contract StakedWoodSlashToEscrowTest is Test {
         address[] memory gs = new address[](1);
         gs[0] = g1;
         vm.prank(slasher);
-        (uint256 total,) =
-            swood.slashToEscrow(bytes32("case"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs);
+        (uint256 total,) = swood.slashToEscrow(
+            bytes32("case"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs, address(0), 0
+        );
         assertEq(total, 10_000e18, "10_000 bps capped to maxSlashBps (5000) = 50% of 20k");
         assertEq(swood.guardianStake(g1), 10_000e18, "the guardian kept the half the ceiling protects");
     }
@@ -345,8 +361,9 @@ contract StakedWoodSlashToEscrowTest is Test {
         address[] memory gs = new address[](1);
         gs[0] = g1;
         vm.prank(slasher);
-        (uint256 total,) =
-            swood.slashToEscrow(bytes32("case"), openedAt, gs, _bpsArr(gs.length, 2500), address(vault), snapTs);
+        (uint256 total,) = swood.slashToEscrow(
+            bytes32("case"), openedAt, gs, _bpsArr(gs.length, 2500), address(vault), snapTs, address(0), 0
+        );
         uint256 slashedAt = vm.getBlockTimestamp();
 
         assertEq(total, 5_000e18, "25% of the 20k own stake");
@@ -379,8 +396,9 @@ contract StakedWoodSlashToEscrowTest is Test {
         address[] memory gs = new address[](1);
         gs[0] = makeAddr("neverStaked");
         vm.prank(slasher);
-        (uint256 total, uint256 caseId) =
-            swood.slashToEscrow(bytes32("c"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs);
+        (uint256 total, uint256 caseId) = swood.slashToEscrow(
+            bytes32("c"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs, address(0), 0
+        );
         assertEq(total, 0);
         assertEq(caseId, 0, "no case id when nothing was recovered");
         assertEq(escrow.caseCount(), 0, "no empty case opened");
@@ -401,16 +419,18 @@ contract StakedWoodSlashToEscrowTest is Test {
 
         // Conviction A takes the whole bond.
         vm.prank(slasher);
-        (uint256 totalA,) =
-            swood.slashToEscrow(bytes32("A"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs);
+        (uint256 totalA,) = swood.slashToEscrow(
+            bytes32("A"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs, address(0), 0
+        );
         assertEq(totalA, 20_000e18, "A emptied the guardian");
         assertEq(swood.guardianStake(g1), 0);
 
         // Conviction B, independent verdict, same at-open basis: recovers
         // nothing — and must NOT be marked as slashed.
         vm.prank(slasher);
-        (uint256 totalB, uint256 caseB) =
-            swood.slashToEscrow(bytes32("B"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs);
+        (uint256 totalB, uint256 caseB) = swood.slashToEscrow(
+            bytes32("B"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs, address(0), 0
+        );
         assertEq(totalB, 0);
         assertEq(caseB, 0);
         assertFalse(swood.verdictSlashed(bytes32("B"), g1), "a zero take must not consume the one slash");
@@ -420,8 +440,9 @@ contract StakedWoodSlashToEscrowTest is Test {
         vm.prank(g1);
         swood.stakeAsGuardian(20_000e18, 1);
         vm.prank(slasher);
-        (uint256 totalRetry, uint256 caseRetry) =
-            swood.slashToEscrow(bytes32("B"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs);
+        (uint256 totalRetry, uint256 caseRetry) = swood.slashToEscrow(
+            bytes32("B"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs, address(0), 0
+        );
         assertGt(totalRetry, 0, "the retried verdict recovers");
         assertGt(caseRetry, 0, "and funds a case");
         assertTrue(swood.verdictSlashed(bytes32("B"), g1), "the landed slash is what consumes the verdict");
@@ -472,7 +493,14 @@ contract StakedWoodSlashToEscrowTest is Test {
         gs[0] = g1;
         vm.prank(slasher);
         (uint256 slashed, uint256 caseId) = swood.slashToEscrow(
-            bytes32("preExit"), drainOpenedAt, gs, _bpsArr(gs.length, 10_000), address(vault), drainSnapTs
+            bytes32("preExit"),
+            drainOpenedAt,
+            gs,
+            _bpsArr(gs.length, 10_000),
+            address(vault),
+            drainSnapTs,
+            address(0),
+            0
         );
 
         assertEq(slashed, 20_000e18, "a 100% conviction takes the whole bond");
@@ -504,5 +532,70 @@ contract StakedWoodSlashToEscrowTest is Test {
         for (uint256 i = 0; i < n; i++) {
             a[i] = bps;
         }
+    }
+
+    /// @notice Task 1 (spec 2026-07-29 §2): conviction bounty. A slice of a
+    ///         verdict slash paid to the challenger who caused it, so a
+    ///         correct-but-unanswered challenge does not just lose 20% of its
+    ///         bond with nobody outside the drained vault having any reason to
+    ///         watch. Reuses this file's exact slash fixture (g1's full
+    ///         20,000e18 stake, 100% conviction) so the gross recovery is a
+    ///         known constant and the bounty math is checkable independently
+    ///         of what `slashToEscrow` returns.
+    function test_slashToEscrow_paysBountyAndNetsTheEscrowCase() public {
+        address challenger = makeAddr("challenger");
+        uint256 before = wood.balanceOf(challenger);
+
+        (uint256 total, uint256 caseId) = _slashWithBounty(challenger, 500);
+
+        // 100% conviction against the 20,000e18 fixture stake is the GROSS
+        // recovery; 500 bps of that is what the challenger is owed. `total`
+        // is NET of the bounty (see IStakedWood.slashToEscrow) — it is the
+        // figure `forceApprove`/`openCase` actually hand the escrow — so it is
+        // gross minus the bounty, not the bounty's own denominator.
+        uint256 gross = 20_000e18;
+        uint256 expectedBounty = gross * 500 / 10_000;
+        assertGt(expectedBounty, 0, "fixture must produce a non-trivial bounty");
+        assertEq(wood.balanceOf(challenger) - before, expectedBounty, "challenger paid the bounty");
+        assertEq(total, gross - expectedBounty, "returned total is NET of the bounty");
+        assertEq(_caseProceeds(caseId), total, "case proceeds equal the net total routed to escrow");
+    }
+
+    function test_slashToEscrow_zeroBpsPaysNothing() public {
+        address challenger = makeAddr("challenger");
+        uint256 before = wood.balanceOf(challenger);
+        (uint256 total, uint256 caseId) = _slashWithBounty(challenger, 0);
+        assertEq(wood.balanceOf(challenger), before, "no bounty at 0 bps");
+        assertEq(total, 20_000e18, "0 bps takes nothing: total is the full gross recovery");
+        assertEq(_caseProceeds(caseId), total, "full proceeds to the escrow");
+    }
+
+    function test_slashToEscrow_zeroRecipientPaysNothing() public {
+        (uint256 total, uint256 caseId) = _slashWithBounty(address(0), 500);
+        assertEq(total, 20_000e18, "no recipient: total is the full gross recovery");
+        assertEq(_caseProceeds(caseId), total, "full proceeds when there is no recipient");
+    }
+
+    /// @dev Thin wrapper around the file's slash fixture: sets up the
+    ///      slasher role and forwards the two new bounty args against g1's
+    ///      full 20,000e18 stake at 100% conviction. Does not invent a
+    ///      parallel fixture — same `openedAt`/`snapTs`/`vault` every other
+    ///      test in this file uses.
+    function _slashWithBounty(address bountyTo, uint256 bountyBps) internal returns (uint256 total, uint256 caseId) {
+        vm.prank(owner);
+        swood.setAuthorizedSlasher(slasher);
+        address[] memory gs = new address[](1);
+        gs[0] = g1;
+        vm.prank(slasher);
+        (total, caseId) = swood.slashToEscrow(
+            bytes32("bountyCase"), openedAt, gs, _bpsArr(gs.length, 10_000), address(vault), snapTs, bountyTo, bountyBps
+        );
+    }
+
+    /// @dev The escrow test double has no `caseProceeds` getter — read the
+    ///      case the way every existing assertion in this file does, via
+    ///      `caseOf`'s tuple.
+    function _caseProceeds(uint256 caseId) internal view returns (uint256 proceeds) {
+        (,, proceeds,,,,) = escrow.caseOf(caseId);
     }
 }

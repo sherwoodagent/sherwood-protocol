@@ -259,7 +259,14 @@ contract CompensationEndToEndTest is Test {
         address[] memory approvers = new address[](1);
         approvers[0] = g1;
         (total, caseId) = swood.slashToEscrow(
-            bytes32("verdict-case"), openedAt, approvers, _bpsArr(approvers.length, SLASH_BPS), address(vault), snapTs
+            bytes32("verdict-case"),
+            openedAt,
+            approvers,
+            _bpsArr(approvers.length, SLASH_BPS),
+            address(vault),
+            snapTs,
+            address(0),
+            0
         );
         assertEq(caseId, escrow.caseCount(), "the returned case id is the escrow's newest case");
     }
@@ -582,7 +589,7 @@ contract CompensationEndToEndTest is Test {
         uint256[] memory bps = _bpsArr(1, SLASH_BPS);
         uint256 future = vm.getBlockTimestamp() + 1;
         vm.expectRevert(StakedWood.VerdictNotPast.selector);
-        swood.slashToEscrow(bytes32("verdict-case"), future, approvers, bps, address(vault), snapTs);
+        swood.slashToEscrow(bytes32("verdict-case"), future, approvers, bps, address(vault), snapTs, address(0), 0);
     }
 
     /// @notice Regression for the review's clamp-bypass PoC: N repeats of one
@@ -596,7 +603,9 @@ contract CompensationEndToEndTest is Test {
             dup[i] = g1;
         }
         vm.expectRevert(StakedWood.DuplicateApprover.selector);
-        swood.slashToEscrow(bytes32("case"), openedAt, dup, _bpsArr(8, SLASH_BPS), address(vault), snapTs);
+        swood.slashToEscrow(
+            bytes32("case"), openedAt, dup, _bpsArr(8, SLASH_BPS), address(vault), snapTs, address(0), 0
+        );
 
         // A zero-rate entry is not a free slot for smuggling a duplicate.
         address[] memory zeroDup = new address[](2);
@@ -606,7 +615,7 @@ contract CompensationEndToEndTest is Test {
         rates[0] = SLASH_BPS;
         rates[1] = 0;
         vm.expectRevert(StakedWood.DuplicateApprover.selector);
-        swood.slashToEscrow(bytes32("case"), openedAt, zeroDup, rates, address(vault), snapTs);
+        swood.slashToEscrow(bytes32("case"), openedAt, zeroDup, rates, address(vault), snapTs, address(0), 0);
     }
 
     // ── 7. PR #24 review 🟡5: a bad vault burns instead of bricking ───────
@@ -633,8 +642,9 @@ contract CompensationEndToEndTest is Test {
         approvers[0] = g1;
         vm.expectEmit(true, true, false, true, address(swood));
         emit VerdictSlashUncompensated(bytes32("verdict-case"), deadVault, PROCEEDS);
-        (uint256 total, uint256 caseId) =
-            swood.slashToEscrow(bytes32("verdict-case"), openedAt, approvers, _bpsArr(1, SLASH_BPS), deadVault, snapTs);
+        (uint256 total, uint256 caseId) = swood.slashToEscrow(
+            bytes32("verdict-case"), openedAt, approvers, _bpsArr(1, SLASH_BPS), deadVault, snapTs, address(0), 0
+        );
 
         assertEq(total, PROCEEDS, "the slash landed in full");
         assertEq(caseId, 0, "no case was opened");
@@ -660,15 +670,16 @@ contract CompensationEndToEndTest is Test {
         approvers[0] = g1;
         uint256[] memory bps = _bpsArr(1, SLASH_BPS);
         vm.expectRevert(ICompensationEscrow.EmptySnapshot.selector);
-        swood.slashToEscrow(bytes32("verdict-case"), openedAt, approvers, bps, address(vault), emptyTs);
+        swood.slashToEscrow(bytes32("verdict-case"), openedAt, approvers, bps, address(vault), emptyTs, address(0), 0);
 
         // Nothing moved and nothing burned: the slash rolled back with the revert.
         assertEq(swood.guardianStake(g1), GUARDIAN_STAKE, "stake untouched");
         assertFalse(swood.verdictSlashed(bytes32("verdict-case"), g1), "the one slash was not consumed");
 
         // The resubmission with the corrected snapshot lands in full.
-        (uint256 total, uint256 caseId) =
-            swood.slashToEscrow(bytes32("verdict-case"), openedAt, approvers, bps, address(vault), snapTs);
+        (uint256 total, uint256 caseId) = swood.slashToEscrow(
+            bytes32("verdict-case"), openedAt, approvers, bps, address(vault), snapTs, address(0), 0
+        );
         assertEq(total, PROCEEDS, "the corrected verdict slashed in full");
         assertGt(caseId, 0, "a case was opened");
         assertEq(escrow.totalEscrowed(), PROCEEDS, "proceeds escrowed, not burned");
@@ -731,7 +742,7 @@ contract CompensationEndToEndTest is Test {
 
         vm.expectEmit(true, true, false, false, address(swood));
         emit GuardianSlashed(namespaced, g1, 0, 0);
-        swood.slashToEscrow(raw, openedAt, approvers, _bpsArr(1, SLASH_BPS), address(vault), snapTs);
+        swood.slashToEscrow(raw, openedAt, approvers, _bpsArr(1, SLASH_BPS), address(vault), snapTs, address(0), 0);
     }
 
     // ── 10. PR #24 review round 2: N1 / N2 / N7 / N8 regressions ──────────
@@ -852,16 +863,16 @@ contract CompensationEndToEndTest is Test {
         uint256[] memory bps = _bpsArr(1, 5_000);
         uint256 stakeAtOpen = swood.guardianStake(g1);
 
-        swood.slashToEscrow(bytes32("split-verdict"), openedAt, approvers, bps, address(vault), snapTs);
+        swood.slashToEscrow(bytes32("split-verdict"), openedAt, approvers, bps, address(vault), snapTs, address(0), 0);
         uint256 afterFirst = swood.guardianStake(g1);
         assertEq(afterFirst, stakeAtOpen / 2, "one call takes exactly the ceiling");
 
         assertTrue(swood.verdictSlashed(bytes32("split-verdict"), g1), "the pair is recorded");
 
         vm.expectRevert(StakedWood.ApproverAlreadySlashed.selector);
-        swood.slashToEscrow(bytes32("split-verdict"), openedAt, approvers, bps, address(vault), snapTs);
+        swood.slashToEscrow(bytes32("split-verdict"), openedAt, approvers, bps, address(vault), snapTs, address(0), 0);
         vm.expectRevert(StakedWood.ApproverAlreadySlashed.selector);
-        swood.slashToEscrow(bytes32("split-verdict"), openedAt, approvers, bps, address(vault), snapTs);
+        swood.slashToEscrow(bytes32("split-verdict"), openedAt, approvers, bps, address(vault), snapTs, address(0), 0);
 
         assertEq(swood.guardianStake(g1), afterFirst, "the ceiling held across the retries");
 
@@ -872,7 +883,7 @@ contract CompensationEndToEndTest is Test {
         // reach 75% of the original bond. Legitimate across two convictions,
         // a ceiling bypass within one.
         assertFalse(swood.verdictSlashed(bytes32("other-verdict"), g1), "unrelated case unaffected");
-        swood.slashToEscrow(bytes32("other-verdict"), openedAt, approvers, bps, address(vault), snapTs);
+        swood.slashToEscrow(bytes32("other-verdict"), openedAt, approvers, bps, address(vault), snapTs, address(0), 0);
         assertEq(swood.guardianStake(g1), afterFirst / 2, "a separate verdict slashes separately");
         assertEq(swood.guardianStake(g1), stakeAtOpen / 4, "two convictions compound to 75%; one may not");
     }
@@ -892,15 +903,18 @@ contract CompensationEndToEndTest is Test {
         uint256 now_ = vm.getBlockTimestamp();
 
         vm.expectRevert(ICompensationEscrow.SnapshotNotPast.selector);
-        swood.slashToEscrow(bytes32("oops"), now_, approvers, _bpsArr(1, SLASH_BPS), address(vault), now_);
+        swood.slashToEscrow(
+            bytes32("oops"), now_, approvers, _bpsArr(1, SLASH_BPS), address(vault), now_, address(0), 0
+        );
 
         assertEq(wood.balanceOf(burnAddr), burnBefore, "nothing burned on a fixable mistake");
         assertEq(swood.guardianStake(g1), stakeBefore, "the whole transaction rolled back");
         assertFalse(swood.verdictSlashed(bytes32("oops"), g1), "the dedup rolled back too, so the retry is clean");
 
         // The corrected call lands.
-        (uint256 total, uint256 caseId) =
-            swood.slashToEscrow(bytes32("oops"), openedAt, approvers, _bpsArr(1, SLASH_BPS), address(vault), snapTs);
+        (uint256 total, uint256 caseId) = swood.slashToEscrow(
+            bytes32("oops"), openedAt, approvers, _bpsArr(1, SLASH_BPS), address(vault), snapTs, address(0), 0
+        );
         assertEq(total, PROCEEDS, "the retry recovered in full");
         assertGt(caseId, 0, "and opened a real case");
     }
