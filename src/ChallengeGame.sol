@@ -9,6 +9,7 @@ import {IChallengeGame} from "./interfaces/IChallengeGame.sol";
 import {IExposureLedger} from "./interfaces/IExposureLedger.sol";
 import {IStakedWood} from "./interfaces/IStakedWood.sol";
 import {ISyndicateGovernor} from "./interfaces/ISyndicateGovernor.sol";
+import {ITokenCourt} from "./interfaces/ITokenCourt.sol";
 
 /// @dev Narrow tier-registry surface: the game may REVOKE a certification on a
 ///      passed challenge and nothing else (spec §3.4, decision D7). A role
@@ -150,6 +151,68 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      still affordable behind it.
     uint256 internal constant SLASH_GAS_PER_APPROVER = 300_000;
     uint256 internal constant SLASH_GAS_BASE = 1_000_000;
+
+    /// @dev THE GAS FLOOR the pool-completing branch of `dispute` checks before
+    ///      attempting the best-effort `TokenCourt.refer` call (Task 8). The
+    ///      catch around that call is deliberately broad — see `AutoReferFailed`
+    ///      — but broad is only safe if the child cannot be made to fail merely
+    ///      because it was starved: an attacker who under-gasses the outer
+    ///      `dispute` call could otherwise force `refer` to run out of gas mid-
+    ///      loop, land in the catch, and skip a referral that a properly-gassed
+    ///      call would have opened — the same starved-child shape as PR #24
+    ///      round-4 N-4 / N-3 and the `finalize` fix one task ago, just on the
+    ///      REFERRAL rather than the SLASH or the RULING. Checked BEFORE the
+    ///      call so a starved caller reverts the whole `dispute` — see
+    ///      `InsufficientReferGas` — rather than silently buying a skipped
+    ///      referral for the price of a low gas limit.
+    ///
+    ///      SIZED PER-APPROVER LIKE `SLASH_GAS_PER_APPROVER`, because the
+    ///      operation it bounds is the same shape: `TokenCourt.refer` calls
+    ///      `_recordAccused`, which loops the accused set once and does ONE
+    ///      cold `IStakedWood.getPastStake` staticcall (a checkpoint lookup)
+    ///      per approver — textually the identical external call this game's
+    ///      own `_settle` budgets 300k for. `_recordAccused`'s iteration also
+    ///      does two cold `SSTORE`s the slash loop does not (`isAccused[...]  =
+    ///      true` and `_accused[caseId].push(...)`), so reusing that exact
+    ///      per-unit budget rather than a smaller one is the generous choice,
+    ///      not merely the consistent one. MEASURED: a scratch harness calling
+    ///      `TokenCourt.refer` directly against a 100-entry accused set (the
+    ///      `GuardianRegistry.MAX_APPROVERS_PER_PROPOSAL` cap `refer`'s own
+    ///      natspec cites as the loop's bound) used ~5,063,456 gas total —
+    ///      ~213,544 of it independent of the approver count (`REFER_GAS_BASE`,
+    ///      below) and the remaining ~4,849,912 scaling at ~48,900/approver.
+    ///      That measurement used a flat-mapping `getPastStake` stub, which
+    ///      UNDERSTATES a real `StakedWood`'s checkpoint binary search — 300k
+    ///      is a >6x margin over the measured marginal cost, generous enough to
+    ///      absorb that gap along with the EIP-150 1/64 the `try` call withholds
+    ///      before this floor's headroom is even touched.
+    uint256 internal constant REFER_GAS_PER_APPROVER = 300_000;
+
+    /// @dev The approver-count-independent floor of a `refer` call: the game's
+    ///      `challengeOf` read, the ledger's `approversOf` read, the case
+    ///      struct's storage writes, and two event emissions. MEASURED at
+    ///      ~213,544 gas (the same scratch harness as `REFER_GAS_PER_APPROVER`,
+    ///      at zero approvers). Set equal to `SLASH_GAS_BASE` rather than a
+    ///      tighter number close to the measurement — same reasoning as that
+    ///      constant's own comment: consistency with an already-generous
+    ///      sibling costs nothing here, and it leaves headroom for a real
+    ///      `ChallengeGame`/`ExposureLedger` pair to cost more than the stubs
+    ///      this was measured against.
+    uint256 internal constant REFER_GAS_BASE = 1_000_000;
+
+    /// @dev THE FLOOR ITSELF, sized for the WORST CASE rather than THIS
+    ///      challenge's actual accused-set size. `dispute` has no cheap way to
+    ///      learn that size — the accused set lives on the ledger, and reading
+    ///      it here just to size a gas check would spend an external call on
+    ///      bookkeeping the check exists to protect against being under-gassed
+    ///      for. Pinning `100` to `GuardianRegistry.MAX_APPROVERS_PER_PROPOSAL`
+    ///      (mirrored, not imported — this game already treats that cap as an
+    ///      external fact rather than a compile-time dependency, same as
+    ///      `TokenCourt._recordAccused`'s own natspec does) makes the floor
+    ///      correct for every reachable challenge, not merely the common one:
+    ///      a large cohort is exactly the case the naive per-approver check
+    ///      would under-count if this instead scaled with something read late.
+    uint256 internal constant REFER_GAS_FLOOR = REFER_GAS_BASE + 100 * REFER_GAS_PER_APPROVER;
 
     /// @notice Where every burned slice of a challenger's bond goes — both the
     ///         SETTLE path's `settleBurnBps` and the FAIL path's
@@ -708,6 +771,49 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      mid-collection.
     /// @dev CEI: every storage write lands before the `transferFrom`, so the
     ///      token cannot observe or re-enter a half-updated pool.
+    /// @dev BEST-EFFORT AUTO-REFERRAL (Task 8), run LAST — after the transfer
+    ///      and both events, so it never reorders anything CEI above already
+    ///      guarantees. Once the pool completes, `Disputed` is a status with
+    ///      nothing to do next until SOMEONE calls `TokenCourt.refer` — an
+    ///      unbounded gap between "escalated" and "actually referred" is what
+    ///      fed review finding E1's timeout race, because a referral filed too
+    ///      close to `disputeTimeout` cannot fit `refer`'s own `voteWindow +
+    ///      FINALIZE_BUFFER` clock check and simply never opens. Calling
+    ///      `refer` here closes most of that gap for free, on the same
+    ///      transaction that already paid to complete the pool.
+    ///
+    ///      IS THIS THE SAME SEVERITY AS `finalize`'s bare-catch bug one task
+    ///      ago (the one that swallowed `InsufficientSlashGas` and burned a
+    ///      `Guilty` verdict with no retry path)? NO, and the difference is not
+    ///      cosmetic: `refer` is permissionless and stays reachable for as long
+    ///      as `filedAt + disputeTimeoutAtFiling - now >= voteWindow +
+    ///      FINALIZE_BUFFER` holds, so a skipped auto-referral here is a
+    ///      RECOVERABLE miss — literally anyone can call `TokenCourt.refer`
+    ///      directly, immediately, no different from the manual fallback this
+    ///      whole feature is layered on top of. `rule`'s bare catch swallowed a
+    ///      VERDICT, which had no such fallback: once dropped, the accused was
+    ///      acquitted by timeout with no path back. A dropped verdict is
+    ///      terminal; a skipped referral is a call away from being un-skipped.
+    ///      That asymmetry, not a general preference for lenient error
+    ///      handling, is what makes a broad catch RIGHT here and was WRONG
+    ///      there.
+    ///
+    ///      SO THE CATCH STAYS BROAD — any revert is swallowed and reported via
+    ///      `AutoReferFailed`, unlike `finalize`'s selector-filtered one — but
+    ///      broad is only safe once the ONE way a broad catch turns dangerous
+    ///      is closed structurally: a caller choosing a gas limit that starves
+    ///      the child on purpose, landing in the catch not because the court
+    ///      genuinely rejected the referral but because it was never given the
+    ///      chance to try. `REFER_GAS_FLOOR` closes exactly that gap, checked
+    ///      BEFORE the call: `dispute` reverts whole rather than accept an
+    ///      under-gassed attempt, so "the child could not have succeeded
+    ///      regardless of gas" is true every time this catch fires — the same
+    ///      guarantee `finalize`'s bubble-instead-of-swallow gives its own
+    ///      floor, reached by a different mechanism because a REVERT here costs
+    ///      the caller nothing dispute wouldn't have cost anyway (the pool
+    ///      completion itself still requires an adequately-gassed retry), while
+    ///      bubbling `finalize`'s `rule` call would have reverted a verdict
+    ///      that was ALREADY DECIDED on the merits.
     function dispute(uint256 challengeId, uint256 amountWood) external {
         Challenge storage c = _challenges[challengeId];
         if (c.status != Status.Filed) revert WrongStatus();
@@ -764,6 +870,29 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         wood.safeTransferFrom(msg.sender, address(this), amount);
         emit CounterBondContributed(challengeId, msg.sender, amount, pool);
         if (complete) emit ChallengeDisputed(challengeId, pool);
+
+        // See the function-level note above for why this is best-effort, why
+        // the catch is broad rather than selector-filtered, and why that is
+        // only safe with the gas floor immediately below it.
+        if (complete) {
+            address courtAddr = court;
+            // No court wired means no referral is possible either way — Plan
+            // D's timeout remains the only path out of `Disputed`, same as
+            // everywhere else in this contract that reads `court` live.
+            if (courtAddr != address(0)) {
+                // STRUCTURAL, not merely best-effort: this must revert the
+                // whole `dispute` rather than let the catch below silently
+                // report a referral that was never actually attempted at full
+                // strength. See `REFER_GAS_FLOOR`'s own natspec for why 100
+                // (the accused-set cap) is the right constant regardless of
+                // this challenge's real accused-set size.
+                if (gasleft() < REFER_GAS_FLOOR) revert InsufficientReferGas();
+                try ITokenCourt(courtAddr).refer(challengeId) {}
+                catch {
+                    emit AutoReferFailed(challengeId);
+                }
+            }
+        }
     }
 
     // ── Resolution ──

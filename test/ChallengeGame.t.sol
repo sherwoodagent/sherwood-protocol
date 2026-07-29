@@ -279,6 +279,48 @@ contract MockChallengeStakedWood {
     }
 }
 
+/// @dev Stands in for `TokenCourt.refer` on the RECORDING path — Task 8's
+///      auto-referral happy case. Records the challenge id it was called
+///      with so the test can assert `dispute`'s pool-completing branch
+///      actually invoked it.
+contract MockRecordingCourt {
+    uint256 public lastReferred;
+
+    function refer(uint256 challengeId) external returns (uint256) {
+        lastReferred = challengeId;
+        return 1;
+    }
+}
+
+/// @dev Stands in for a court whose `refer` always reverts — the case
+///      `AutoReferFailed` exists for. `dispute`'s try/catch must swallow this
+///      and let the completing dispute land regardless.
+contract MockRevertingCourt {
+    function refer(uint256) external pure returns (uint256) {
+        revert("nope");
+    }
+}
+
+/// @dev Stands in for a court whose `refer` needs at least `floor` gas to
+///      complete — the starved-child case `REFER_GAS_FLOOR` exists to make
+///      structurally impossible. `floor` is set to a real `TokenCourt`
+///      measurement so the gas-floor test proves something about the actual
+///      constant, not an arbitrary number.
+contract MockGasHungryCourt {
+    uint256 public lastReferred;
+    uint256 public floor;
+
+    constructor(uint256 f) {
+        floor = f;
+    }
+
+    function refer(uint256 challengeId) external returns (uint256) {
+        if (gasleft() < floor) revert("starved");
+        lastReferred = challengeId;
+        return 1;
+    }
+}
+
 contract ChallengeGameTest is Test {
     ChallengeGame internal game;
     ERC20Mock internal wood;
@@ -292,9 +334,19 @@ contract ChallengeGameTest is Test {
     address internal guardianA = makeAddr("guardianA");
     address internal guardianB = makeAddr("guardianB");
     address internal vault = makeAddr("vault");
-    /// @dev Stands in for the §3.5 court (Plan E). Only `rule` reads it, so
-    ///      wiring it in `setUp` leaves every Plan D path byte-identical.
-    address internal court = makeAddr("court");
+    /// @dev Stands in for the §3.5 court (Plan E). `rule` reads it as a
+    ///      caller identity via `vm.prank`, which works whether or not the
+    ///      address has code — but since Task 8, a POOL-COMPLETING `dispute`
+    ///      also CALLS INTO it (`ITokenCourt(court).refer`), so this can no
+    ///      longer be a bare `makeAddr` EOA: an external call into an address
+    ///      with no code is a distinct failure mode from a reverting one, and
+    ///      it is not what any pre-Task-8 dispute test means to exercise. A
+    ///      `MockRecordingCourt` is deployed in `setUp` instead — it always
+    ///      succeeds and touches no state these tests assert on, so every
+    ///      Plan D/E path this fixture already covers stays byte-identical;
+    ///      only the auto-referral tests below swap in a different mock to
+    ///      exercise the revert/gas-floor cases deliberately.
+    address internal court;
 
     uint256 internal constant PROPOSAL = 1;
     string internal constant EVIDENCE = "ipfs://bafyEvidence";
@@ -302,6 +354,12 @@ contract ChallengeGameTest is Test {
     ///      demotes. Named by the filer (§3.4), not derived on-chain.
     address internal constant ADAPTER = address(0xADA9);
     bytes4 internal constant SELECTOR = bytes4(0xfeedface);
+    /// @dev `ChallengeGame.REFER_GAS_FLOOR` is `internal` (no public getter,
+    ///      mirroring `SLASH_GAS_PER_APPROVER`/`SLASH_GAS_BASE`) —
+    ///      `REFER_GAS_BASE` (1_000_000) + 100 * `REFER_GAS_PER_APPROVER`
+    ///      (300_000), hardcoded here the same way
+    ///      `test_resolve_enforcesTheSlashGasFloor` hardcodes its own floor.
+    uint256 internal constant REFER_GAS_FLOOR_MIRROR = 1_000_000 + 100 * 300_000;
 
     function setUp() public {
         vm.warp(365 days); // keep executedAt well away from the genesis timestamp
@@ -314,6 +372,7 @@ contract ChallengeGameTest is Test {
         tiers = new MockChallengeTierRegistry();
         swood = new MockChallengeStakedWood();
         game = new ChallengeGame(owner, address(wood), address(ledger), address(tiers));
+        court = address(new MockRecordingCourt()); // see the field's own doc for why not a bare EOA
         vm.startPrank(owner);
         game.setStakedWood(address(swood));
         game.setCourt(court);
@@ -1191,6 +1250,126 @@ contract ChallengeGameTest is Test {
         vm.prank(guardianB);
         vm.expectRevert(IChallengeGame.WrongStatus.selector);
         game.dispute(id, type(uint256).max); // already disputed — one counter-bond settles it
+    }
+
+    // ── Dispute: best-effort auto-referral (Task 8) ──
+
+    /// @notice The happy path: the pool-completing `dispute` call refers the
+    ///         challenge to the wired court itself, in the same transaction
+    ///         that bought the escalation.
+    function test_dispute_autoRefersOnCompletion() public {
+        MockRecordingCourt recording = new MockRecordingCourt();
+        vm.prank(owner);
+        game.setCourt(address(recording));
+
+        uint256 id = _fileStandard(PROPOSAL);
+        vm.prank(guardianA);
+        game.dispute(id, type(uint256).max); // completes the pool
+
+        assertEq(recording.lastReferred(), id, "the completing dispute referred itself");
+        assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Disputed));
+    }
+
+    /// @notice A contribution that does not complete the pool buys no
+    ///         escalation (existing behaviour) and therefore must not attempt a
+    ///         referral either — there is nothing yet to refer.
+    function test_dispute_partialContributionDoesNotRefer() public {
+        MockRecordingCourt recording = new MockRecordingCourt();
+        vm.prank(owner);
+        game.setCourt(address(recording));
+
+        uint256 id = _fileStandard(PROPOSAL);
+        uint256 target = game.challengeOf(id).bondWood;
+        vm.prank(guardianA);
+        game.dispute(id, target / 2); // short of the pool target
+
+        assertEq(recording.lastReferred(), 0, "half a pool buys no referral attempt either");
+        assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Filed));
+    }
+
+    /// @notice A court that reverts on `refer` must not brick the dispute: the
+    ///         accused's defence purchase always lands, the miss is surfaced as
+    ///         `AutoReferFailed`, and — the point of best-effort here — the
+    ///         referral is still recoverable afterward because `refer` stays
+    ///         permissionless.
+    function test_dispute_courtRevertDoesNotBrickDispute() public {
+        MockRevertingCourt reverting = new MockRevertingCourt();
+        vm.prank(owner);
+        game.setCourt(address(reverting));
+
+        uint256 id = _fileStandard(PROPOSAL);
+
+        vm.expectEmit(true, true, true, true, address(game));
+        emit IChallengeGame.AutoReferFailed(id);
+        vm.prank(guardianA);
+        game.dispute(id, type(uint256).max); // must not revert despite the court reverting
+
+        assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Disputed), "the dispute still landed");
+        _assertLiveBondsBacked();
+
+        // RECOVERY IS REAL, not merely asserted: `TokenCourt.refer` is
+        // permissionless (this mock stands in for it), so anyone can still
+        // open the escalation directly — nothing about the failed auto-referral
+        // consumed or blocked that path.
+        MockRecordingCourt recovery = new MockRecordingCourt();
+        address stranger = makeAddr("referralStranger");
+        vm.prank(stranger);
+        recovery.refer(id);
+        assertEq(recovery.lastReferred(), id, "a fresh, permissionless referral still succeeds after the miss");
+    }
+
+    /// @notice No court wired (the zero address, Plan D's off-switch) skips the
+    ///         auto-referral attempt entirely rather than reverting or emitting
+    ///         a failure — there is nothing to refer to.
+    function test_dispute_noCourtSkipsAutoRefer() public {
+        vm.prank(owner);
+        game.setCourt(address(0));
+
+        uint256 id = _fileStandard(PROPOSAL);
+        vm.prank(guardianA);
+        game.dispute(id, type(uint256).max); // must not revert with no court wired
+
+        assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Disputed));
+    }
+
+    /// @notice THE STRUCTURAL GAS FLOOR. `REFER_GAS_FLOOR` must make a starved
+    ///         child impossible, not merely unlikely — proven here two ways at
+    ///         once: `MockGasHungryCourt`'s own floor is set to the exact
+    ///         constant `dispute` checks, and the outer call is capped at
+    ///         exactly `REFER_GAS_FLOOR`. `dispute` does real, positive-cost
+    ///         work (storage writes, the counter-bond `transferFrom`, two event
+    ///         emissions) BEFORE reaching the gas check, so `gasleft()` at the
+    ///         check is *always* strictly less than the outer cap, regardless
+    ///         of compiler or optimizer settings — the same structural framing
+    ///         as the `finalize` under-gassed regression test, adapted to a
+    ///         floor that lives in the PARENT rather than the child. The call
+    ///         must revert with `InsufficientReferGas` BEFORE ever reaching the
+    ///         court, not land in the catch and silently emit
+    ///         `AutoReferFailed` as if the court had genuinely been asked and
+    ///         had refused.
+    function test_dispute_gasFloorRejectsStarvedCall() public {
+        MockGasHungryCourt hungry = new MockGasHungryCourt(REFER_GAS_FLOOR_MIRROR);
+        vm.prank(owner);
+        game.setCourt(address(hungry));
+
+        uint256 id = _fileStandard(PROPOSAL);
+
+        vm.prank(guardianA);
+        vm.expectRevert(IChallengeGame.InsufficientReferGas.selector);
+        game.dispute{gas: REFER_GAS_FLOOR_MIRROR}(id, type(uint256).max);
+
+        // Nothing about the pool moved: the whole call reverted, including the
+        // counter-bond transfer and the status flip.
+        assertEq(
+            uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Filed), "the starved call reverted whole"
+        );
+        assertEq(hungry.lastReferred(), 0, "the child was never even reached");
+
+        // Control: an adequately-gassed retry lands the referral for real.
+        vm.prank(guardianA);
+        game.dispute(id, type(uint256).max);
+        assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Disputed));
+        assertEq(hungry.lastReferred(), id, "the honest retry actually reached the court");
     }
 
     // ── Disputed → timeout → fail (D5) ──

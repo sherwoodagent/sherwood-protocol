@@ -200,6 +200,15 @@ interface IChallengeGame {
     ///         the owner's only lever gating filings). Never raised anywhere
     ///         else — dispute/resolve/rule/claims are unaffected by this flag.
     error FilingsPaused();
+    /// @notice `dispute`'s pool-completing branch found too little gas left to
+    ///         guarantee the best-effort `TokenCourt.refer` call cannot be
+    ///         starved (Task 8). Reverting the whole `dispute` beats silently
+    ///         skipping the referral: a skipped referral is only recoverable
+    ///         while `refer`'s own `InsufficientClock` guard still admits one,
+    ///         so it must never be the silent, gas-tunable outcome of an
+    ///         under-gassed caller. Retry with more gas; nothing about the
+    ///         pool or the challenge changes.
+    error InsufficientReferGas();
 
     // ── Events ──
     /// @dev `evidenceURI` is carried on-chain unindexed so predicates 2 and 3 —
@@ -228,6 +237,18 @@ interface IChallengeGame {
     ///      the defence is collective, and who paid what is in the
     ///      `CounterBondContributed` log that precedes this one.
     event ChallengeDisputed(uint256 indexed challengeId, uint256 counterBondWood);
+    /// @notice The pool-completing `dispute` call tried `TokenCourt.refer` on
+    ///         the challenger's behalf and the court reverted (Task 8:
+    ///         best-effort auto-referral). The dispute itself still landed —
+    ///         status flipped to `Disputed`, the counter-bond transfer
+    ///         cleared — and `refer` stays permissionless, so ANY caller may
+    ///         retry it directly against the court until `InsufficientClock`
+    ///         closes that window. This is the recoverable half of the
+    ///         asymmetry with `finalize`'s selector-filtered catch on
+    ///         `IChallengeGame.rule`: a dropped verdict there was terminal
+    ///         with no retry path, so that catch may not be broad; a skipped
+    ///         referral here always has one, so this catch may be.
+    event AutoReferFailed(uint256 indexed challengeId);
     event ChallengeSettled(uint256 indexed challengeId, uint256 slashedWood, uint256 caseId);
     /// @dev The slice of the challenger's bond burned on the SETTLE path, so a
     ///      filing is never free in either direction (review 🟠F4). Distinct
