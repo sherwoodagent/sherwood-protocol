@@ -176,10 +176,13 @@ fail-safe governs).
   was re-pointed away before the call landed). **Every other revert bubbles**
   out of `finalize` whole, reverting the state writes above and leaving the
   case `Voting` for an honest retry. This is load-bearing, not cosmetic: a bare
-  catch turns `IStakedWood.slashToEscrow`'s own `InsufficientSlashGas` gas
-  floor into a verdict-burning primitive — anyone (profitably, the accused)
-  could call `finalize` under-gassed so the child `rule`→`slashToEscrow` call
-  starves and reverts while the parent still has gas to spare, writing
+  catch turns `rule`'s own callee-side `InsufficientSlashGas` gas floor — the
+  check `ChallengeGame._settle` runs on behalf of sWOOD's burn-vs-bubble
+  classifier (pinning the gas `slashToEscrow`'s child call needs, per N-4)
+  before it ever calls `slashToEscrow` — into a verdict-burning primitive —
+  anyone (profitably, the accused) could call `finalize` under-gassed so the
+  `rule`→`_settle` call starves and reverts while the parent still has gas to
+  spare, writing
   `Resolved` and dropping a `Guilty` verdict permanently, with the challenge
   later timing out to acquit the accused and pay them the challenger's bond.
   Filtering by selector closes that: an under-gassed or otherwise transient

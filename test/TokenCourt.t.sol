@@ -569,9 +569,14 @@ contract TokenCourtTest is Test {
         court.vote(id, true); // 300e18 guilty, clears the floor alone
         vm.warp(vm.getBlockTimestamp() + 5 days);
 
-        // A floor `rule` cannot clear once `finalize`'s own overhead (SLOADs,
-        // the swood staticcall, event emission, the EIP-150 63/64ths held
-        // back at the CALL boundary) has eaten into a capped outer budget.
+        // STRUCTURAL, not gas-tuned: set the floor EQUAL to the outer cap
+        // (200_000). EIP-150 forwards at most 63/64 of the gas available at
+        // the CALL, so the child can receive at most 200_000 * 63/64 ==
+        // 196_875 < 200_000 -- `rule`'s own gasleft() < ruleGasFloor check
+        // trips no matter how the parent's pre-CALL cost (SLOADs, the swood
+        // staticcall, event emission -- measured ~30.7k here, leaving ~5.5x
+        // headroom to reach the CALL) moves with compiler or optimizer
+        // settings, because the 1/64th withheld alone already exceeds it.
         game.setRuleGasFloor(200_000);
 
         vm.expectRevert(IChallengeGame.InsufficientSlashGas.selector);
@@ -627,6 +632,27 @@ contract TokenCourtTest is Test {
 
         assertEq(uint256(court.caseOf(id).phase), uint256(ITokenCourt.Phase.Resolved), "case closed anyway");
         assertFalse(game.ruled(), "verdict never landed");
+    }
+
+    /// @dev `Case.game` PINS the game a case rules on at `refer` time. A
+    ///      `setChallengeGame` re-wire in between must not redirect an
+    ///      in-flight case's `finalize` to the newly-wired game.
+    function test_finalize_rulesThePinnedGameNotTheLiveOne() public {
+        uint256 id = _referredCase(); // referred against `game`, pinned into the case
+        MockGameForCourt game2 = new MockGameForCourt();
+
+        vm.prank(owner);
+        court.setChallengeGame(address(game2)); // re-wire the LIVE pointer after referral
+
+        vm.prank(voterA);
+        court.vote(id, true);
+        vm.warp(vm.getBlockTimestamp() + 5 days);
+        court.finalize(id);
+
+        assertTrue(game.ruled(), "verdict landed on the pinned game, not the live one");
+        assertEq(uint256(game.lastVerdict()), uint256(IChallengeGame.Verdict.Guilty));
+        assertEq(game.lastRuledChallenge(), CHALLENGE_ID);
+        assertFalse(game2.ruled(), "the re-pointed live game must never be touched by this case");
     }
 
     function test_finalize_guards() public {
