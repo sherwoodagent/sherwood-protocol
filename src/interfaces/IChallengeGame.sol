@@ -518,19 +518,24 @@ interface IChallengeGame {
     ///         `*AtFiling` economic pins) and what deliberately is not
     ///         (`court`, read live by `rule`).
     function filingsPaused() external view returns (bool);
-    /// @notice Per-proposal deadline for NEW filings, extended whenever a
-    ///         challenge on that proposal unwinds `Inconclusive` (spec
-    ///         2026-07-29 §5).
-    /// @dev    WITHOUT THIS, `Inconclusive` IS A PERMANENT ACQUITTAL. Reaching
-    ///         it takes at least `autoSlashDelay + voteWindow` — 12 days at
-    ///         the defaults — and THE ACCUSED CHOOSES when the pool
-    ///         completes, anywhere inside `autoSlashDelay`. So a challenge
-    ///         filed more than ~2 days after execution could never be
-    ///         re-filed, and stalling the pool converted "the electorate did
-    ///         not turn out" into "the accused wins, finally". Extending on
-    ///         the unwind makes the stall buy a DELAY instead of an
-    ///         ACQUITTAL. Zero means this proposal never went inconclusive:
-    ///         `file` falls back to `executedAt + challengeWindow`.
+    /// @notice Per-proposal deadline for NEW filings, raised (never lowered)
+    ///         whenever a challenge on that proposal unwinds `Inconclusive`
+    ///         (spec 2026-07-29 §5). `file` gates on the LARGER of this value
+    ///         and `executedAt + challengeWindow` — zero is not a sentinel
+    ///         here, it is simply what an untouched key contributes to that
+    ///         max.
+    /// @dev    WITHOUT A RAISED FLOOR, `INCONCLUSIVE` IS A PERMANENT
+    ///         ACQUITTAL. Reaching it takes anywhere from `voteWindow` (the
+    ///         accused's counter-bond pool may complete the instant it is
+    ///         filed) up to `autoSlashDelay + voteWindow` (the accused stalls
+    ///         completion to the edge of `autoSlashDelay` first) — roughly 5
+    ///         to 12 days at the defaults, and the accused chooses where in
+    ///         that span it lands. So a challenge filed more than ~2 days
+    ///         after execution could, in the worst case, never be re-filed,
+    ///         and stalling let the accused force exactly that worst case:
+    ///         "the electorate did not turn out" became "the accused wins,
+    ///         finally". Raising the floor on every unwind turns the stall
+    ///         into a delay instead of an acquittal.
     function challengeableUntil(bytes32 reviewKey) external view returns (uint256);
 
     // ── Owner setters ──

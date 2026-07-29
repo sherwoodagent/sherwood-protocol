@@ -415,17 +415,19 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     uint256 public challengeCount;
 
     /// @inheritdoc IChallengeGame
-    /// @dev    WITHOUT THIS, `Inconclusive` IS A PERMANENT ACQUITTAL. Reaching
-    ///         it takes at least `autoSlashDelay + voteWindow` — 12 days at
-    ///         the defaults — and THE ACCUSED CHOOSES when the pool
-    ///         completes, anywhere inside `autoSlashDelay`. So a challenge
-    ///         filed more than ~2 days after execution could never be
-    ///         re-filed, and stalling the pool converted "the electorate did
-    ///         not turn out" into "the accused wins, finally". Extending on
-    ///         the unwind (`_refundAll`) makes the stall buy a DELAY instead
-    ///         of an ACQUITTAL. Zero means this proposal never went
-    ///         inconclusive: `file` falls back to
-    ///         `executedAt + challengeWindow`.
+    /// @dev NEVER READ AS A STORED ABSOLUTE — `file` always maxes this value
+    ///      against the live `executedAt + challengeWindow` baseline at the
+    ///      call site, and this mapping never compares against that baseline
+    ///      at write time. An earlier version of `_refundAll` wrote
+    ///      `challengeableUntil[rk] = max(this write, the PREVIOUS write)`,
+    ///      which reads the same but is not: `challengeWindow` is live,
+    ///      mutable state, so an owner who shortened it, let a challenge
+    ///      unwind while it was short, then restored it, left this mapping
+    ///      holding a deadline SMALLER than a fresh proposal would ever
+    ///      compute — and with no setter for this mapping, that shrink was
+    ///      permanent. `file`'s call-site max is what actually makes
+    ///      "extend, never shorten" hold; this mapping only ever needs to
+    ///      raise the floor, never defend against having stored a stale one.
     mapping(bytes32 reviewKey => uint256) public challengeableUntil;
 
     mapping(uint256 challengeId => Challenge) internal _challenges;
@@ -532,20 +534,34 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         uint256 executedAt = p.executedAt;
         if (executedAt == 0) revert NotExecuted();
 
-        // M3 (spec §5): the gate is `challengeableUntil`, EXTENDED past
-        // `executedAt + challengeWindow` whenever an earlier challenge on
-        // this same proposal unwound `Inconclusive` (`_refundAll`). Without
-        // this, reaching `Inconclusive` — at least `autoSlashDelay +
-        // voteWindow` after filing, and the accused controls exactly when
-        // inside that span the pool completes — could land past the
-        // ordinary window and make the acquittal permanent. Zero (never went
-        // inconclusive) falls back to the original gate byte-for-byte.
+        // M3 (spec §5): the gate is the LARGER of the ordinary
+        // `executedAt + challengeWindow` and whatever `_refundAll` has raised
+        // `challengeableUntil` to for an earlier `Inconclusive` unwind on
+        // this same proposal. Without a raised floor, reaching `Inconclusive`
+        // — anywhere from `voteWindow` up to `autoSlashDelay + voteWindow`
+        // after filing, since the accused controls when inside that span the
+        // counter-bond pool completes — could land past the ordinary window
+        // and make the acquittal permanent.
+        //
+        // RECOMPUTED AS A MAX ON EVERY CALL, NOT READ AS A STORED ABSOLUTE.
+        // An earlier version of this gate read `challengeableUntil[key]`
+        // directly once non-zero, falling back to the baseline only while it
+        // was still zero. `challengeWindow` is live, mutable state, so an
+        // owner who shortened it, let a challenge unwind while it was short,
+        // then restored it, left the mapping holding a deadline SMALLER than
+        // a fresh proposal would ever compute — and with no setter for
+        // `challengeableUntil`, that shrink was permanent. Taking the max
+        // against the live baseline on every read, rather than trusting
+        // whatever was stored at the last write, is what makes "extend,
+        // never shorten" true against the thing that actually matters.
+        //
         // `key` is computed here, once, rather than again a few lines down —
         // it is needed for both this gate and the `AlreadyConvicted`/
         // `AlreadyChallenged` checks below.
         bytes32 key = _reviewKey(governor, proposalId);
-        uint256 deadline = challengeableUntil[key];
-        if (deadline == 0) deadline = executedAt + challengeWindow;
+        uint256 deadline = executedAt + challengeWindow;
+        uint256 extended = challengeableUntil[key];
+        if (extended > deadline) deadline = extended;
         if (block.timestamp > deadline) revert WindowClosed();
 
         // WHICH ADAPTER A PROPOSAL TOUCHED IS FACT, NOT ASSERTION (review 🟠F4).
@@ -1462,17 +1478,31 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         bytes32 rk = _reviewKey(governor, proposalId);
         _releaseFreeze(rk, governor, proposalId);
 
-        // M3 (spec §5): EXTEND, NEVER SHORTEN — a second inconclusive round
-        // against the same proposal must not let its own `challengeWindow`
-        // pull the deadline back in. Without this line, `Inconclusive` is a
+        // M3 (spec §5): raise the re-challenge floor so a stall cannot buy a
         // permanent acquittal for any challenge filed more than roughly
-        // `challengeWindow - autoSlashDelay - voteWindow` after execution:
+        // `challengeWindow - autoSlashDelay - voteWindow` after execution —
         // the accused stalls the pool to the last legal instant inside
-        // `autoSlashDelay`, the vote runs, and the verdict lands past
-        // `executedAt + challengeWindow` with no filing gate left standing.
-        // Extending on every unwind turns that stall into a delay, not a win.
-        uint256 extended = block.timestamp + challengeWindow;
-        if (extended > challengeableUntil[rk]) challengeableUntil[rk] = extended;
+        // `autoSlashDelay`, the vote runs, and the verdict would otherwise
+        // land past `executedAt + challengeWindow` with no filing gate left
+        // standing. `file`'s gate takes the max of this value and the live
+        // `executedAt + challengeWindow` baseline on every call, so nothing
+        // here needs to guard against its OWN write shrinking a later read —
+        // only against raising it needlessly.
+        //
+        // SKIPPED WHEN THE PROPOSAL IS ALREADY CONVICTED. A concurrent
+        // challenge against the SAME proposal may have already settled to a
+        // conviction while this one was disputed (`_convicted[rk]` true) —
+        // `file` refuses ANY further filing against a convicted proposal
+        // regardless of what this mapping holds (`AlreadyConvicted`), so an
+        // unguarded write here would be inert to control flow either way.
+        // It is still worth skipping: left unguarded, the public getter
+        // would advertise a live re-challenge deadline for a proposal that
+        // can never actually be challenged again — a stale signal an
+        // indexer built against this mapping would otherwise trust.
+        if (!_convicted[rk]) {
+            uint256 extended = block.timestamp + challengeWindow;
+            if (extended > challengeableUntil[rk]) challengeableUntil[rk] = extended;
+        }
 
         _bookRefund(challengeId, pool);
         wood.safeTransfer(challenger, bond);

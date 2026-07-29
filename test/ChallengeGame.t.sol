@@ -2344,6 +2344,40 @@ contract ChallengeGameTest is Test {
         _fileStandardFrom(makeAddr("otherChallenger"), PROPOSAL);
     }
 
+    /// @notice Review blocker: a TEMPORARY shortening of `challengeWindow`
+    ///         around an `Inconclusive` unwind must not PERMANENTLY shrink a
+    ///         proposal's re-challenge deadline below what the RESTORED
+    ///         window would give it. `_refundAll` reads `challengeWindow`
+    ///         live, so an owner who shortens it, lets a challenge unwind
+    ///         while it is short, then restores it, must not leave
+    ///         `challengeableUntil` holding a deadline smaller than
+    ///         `executedAt + challengeWindow` computed against the RESTORED
+    ///         value — there is no setter for `challengeableUntil` to undo
+    ///         that, so `file`'s gate must take the max of the two on every
+    ///         call rather than trusting whichever was stored at the last
+    ///         write.
+    function test_challengeableUntil_survivesATemporarilyShortenedWindow() public {
+        uint256 id = _fileStandard(PROPOSAL);
+
+        // Shorten the window to almost nothing, and unwind while it is short.
+        vm.prank(owner);
+        game.setChallengeWindow(1);
+        _completePool(id);
+        vm.prank(court);
+        game.rule(id, IChallengeGame.Verdict.Inconclusive);
+
+        // Restore the ordinary window.
+        vm.prank(owner);
+        game.setChallengeWindow(14 days);
+
+        // Still well inside `executedAt + 14 days` (the restored window),
+        // but past the tiny stored extension the shortened window produced.
+        vm.warp(vm.getBlockTimestamp() + 5 days);
+
+        uint256 refiled = _fileStandardFrom(challenger, PROPOSAL); // MUST NOT revert WindowClosed
+        assertGt(refiled, 0, "restoring the window must restore full challengeability");
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // The pooled counter-bond
     // ─────────────────────────────────────────────────────────────────────────
