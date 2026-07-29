@@ -253,12 +253,31 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///         alone could never make. The snapshot bars whoever bought in
     ///         AFTER the drain; it says nothing about the approvers who were
     ///         already large holders BEFORE it — and those are exactly the
-    ///         defendants, because a guardian has to stake WOOD to back
-    ///         coverage at all. Left in, they could be routinely large enough
-    ///         on their own to clear the participation floor and carry the
-    ///         vote: a defendant that can outvote its own jury inverts the
-    ///         layer, turning "the electorate judges the accused" into "the
-    ///         accused judges itself".
+    ///         accused APPROVING ADDRESSES, because a guardian has to stake
+    ///         WOOD to back coverage at all. Left in, they could be routinely
+    ///         large enough on their own to clear the participation floor and
+    ///         carry the vote: an accused address that can outvote its own
+    ///         jury inverts the layer, turning "the electorate judges the
+    ///         accused" into "the accused judges itself".
+    /// @dev    A1 (open, not fixed, spec 2026-07-29 §7): THE BAR IS ON THE
+    ///         APPROVING ADDRESS, NOT THE PARTY BEHIND IT. `isAccused` is
+    ///         built from the ledger's approver list — addresses — and
+    ///         permissionless staking means one economic actor can approve
+    ///         (and back coverage for) the same proposal from several
+    ///         addresses, or route the drain's benefit to an address that
+    ///         never approved at all. Splitting across addresses defeats the
+    ///         bar outright: none of the beneficiary's other addresses are in
+    ///         the accused set, so they vote freely. The floor mechanics make
+    ///         this worse, not neutral: `_participationFloor` subtracts the
+    ///         accused set's raw stake from the electorate base, so every
+    ///         address the accused set DOES name shrinks the floor the
+    ///         siblings' un-accused addresses must clear to carry the vote —
+    ///         a larger accused cohort makes the remaining, still-interested
+    ///         electorate's job easier, not harder. This is likely unfixable
+    ///         under permissionless staking (there is no on-chain notion of
+    ///         "the same party"); the natspec must not claim the bar covers a
+    ///         defendant or a party — only that it covers the specific
+    ///         addresses the ledger already named as approvers.
     /// @dev    NO VOTE CHANGES (D3). `AlreadyVoted` refuses a second call from
     ///         the same address outright rather than accepting the latest one
     ///         — there is no path to change a cast vote, only to be refused a
@@ -385,6 +404,24 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///         verdict are all already fixed by state and the clock before this
     ///         call runs; opening it to anyone just removes the last place a
     ///         privileged party could sit on a decided case.
+    /// @dev    A2 (open, not fixed, spec 2026-07-29 §7): LAST-MOVER ADVANTAGE
+    ///         IS UNMITIGATED. Every vote is visible on-chain the instant it
+    ///         lands (`VoteCast`), the deadline is hard
+    ///         (`referredAt + voteWindowAtReferral`), and a TIE ACQUITS
+    ///         (`NotGuilty`, see the verdict table above) — so the acquitting
+    ///         side only has to MATCH the guilty tally in the final block, not
+    ///         exceed it, while the guilty side must move first to be seen at
+    ///         all. Public tallies mean nothing is learned by waiting except
+    ///         everyone else's position, so the rational strategy for a
+    ///         well-funded acquittal is to hold votes back and land exactly
+    ///         enough weight after the last honest vote to tie or win, with no
+    ///         window left for a response. §6's trigger for revisiting M1
+    ///         names this precisely: "any case where the tally moves
+    ///         decisively in the final hour of the vote window" IS what a
+    ///         bought vote looks like. The mitigation short of commit-reveal is
+    ///         a vote-extension (any late vote pushes the deadline out), which
+    ///         this contract deliberately does not implement — deferred with
+    ///         §6's trigger, not fixed here.
     function finalize(uint256 caseId) external {
         ITokenCourt.Case storage c = _cases[caseId];
         if (c.phase != ITokenCourt.Phase.Voting) revert WrongPhase();

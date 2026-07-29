@@ -28,14 +28,27 @@ Why:
   is shrinking in scope; Aragon Court (bespoke drafted-juror court) is dead from
   low case volume. Kleros-style sortition scales but is a heavier machine and
   does not exist on Robinhood Chain.
-- **Capture economics are better than UMA's, not worse.** The §3.5 fear ("token
-  vote capturable at ~$15M mcap") is blunted by three properties UMA lacks:
-  the electorate snapshots at `executedAt - 1` (**before the crime** — capture
-  must be pre-positioned before the prize is known), voters hold no position in
-  the outcome (a conviction pays the compensation escrow, never voters), and
-  aged voting weight makes rented stake weak. The residual vector — the accused
-  bribing a pre-positioned whale for acquittal — is bounded by the accused's own
-  slashable stake.
+- **Capture economics — corrected 2026-07-29, see below.** The §3.5 fear
+  ("token vote capturable at ~$15M mcap") was originally argued away by three
+  properties claimed as UMA's shortfall: the electorate snapshots at
+  `executedAt - 1` (before the crime), voters hold no position in the
+  outcome, and aged voting weight makes rented stake weak. An adversarial
+  review (`2026-07-29-court-incentives-design.md` §6) established that
+  argument is wrong, not merely incomplete: property 2 is what makes a voter
+  **cheap to buy** — with nothing at risk, a voter's reservation price to
+  sell a vote is epsilon — not a defence against buying one. Property 1 does
+  not bind the relevant attacker: the accused is a pre-positioned whale **by
+  construction**, since backing coverage requires staked WOOD, so "before the
+  crime" describes exactly where the accused already stands. Property 3 had
+  an unstated inverse — a fully exited holder retained 25% of its historic
+  weight — closed only later by the present-holdings gate (§3 there).
+  **The honest framing:** the optimistic layer is the mechanism; the court is
+  a backstop effective against unsophisticated adversaries — guardians who
+  are asleep, careless, or unwilling to spend real money defending an
+  indefensible proposal. That is most guardians most of the time. It is not a
+  determined attacker, who can still buy a jury with nothing at stake and be
+  acquitted. See `2026-07-29-court-incentives-design.md` §6 for the full
+  argument and the accepted-risk decision.
 
 Decisions locked during brainstorm (2026-07-28):
 
@@ -169,11 +182,10 @@ fail-safe governs).
   case's **pinned** `game`, never the live `challengeGame` (a re-wire between
   `refer` and `finalize` must not redirect an in-flight case's verdict to a
   different game instance).
-- The catch is **selector-filtered, not bare**. Only two reverts mean "nothing
-  left to rule" and are swallowed, emitting `ChallengeAlreadyTerminal(caseId,
+- The catch is **selector-filtered, not bare**. Only one revert means "nothing
+  left to rule" and is swallowed, emitting `ChallengeAlreadyTerminal(caseId,
   challengeId)`: `WrongStatus` (the challenge went terminal on its own clock
-  during the finalize buffer — the E1 race) and `NotCourt` (the game's `court`
-  was re-pointed away before the call landed). **Every other revert bubbles**
+  during the finalize buffer — the E1 race). **Every other revert bubbles**
   out of `finalize` whole, reverting the state writes above and leaving the
   case `Voting` for an honest retry. This is load-bearing, not cosmetic: a bare
   catch turns `rule`'s own callee-side `InsufficientSlashGas` gas floor — the
@@ -186,10 +198,24 @@ fail-safe governs).
   `Resolved` and dropping a `Guilty` verdict permanently, with the challenge
   later timing out to acquit the accused and pay them the challenger's bond.
   Filtering by selector closes that: an under-gassed or otherwise transient
-  failure never resolves the case, only `WrongStatus`/`NotCourt` do. The case
-  is closed either way it legitimately can be, and because the court holds no
-  WOOD, a swallowed `WrongStatus`/`NotCourt` is bookkeeping, not stranded
+  failure never resolves the case, only `WrongStatus` does. The case is
+  closed only when it legitimately has nothing left to rule, and because the
+  court holds no WOOD, a swallowed `WrongStatus` is bookkeeping, not stranded
   funds (review finding E1's fix, made structural).
+
+  **`NotCourt` bubbles instead (defect B2, fixed `8bda7ba`).** An earlier
+  revision of this catch swallowed `NotCourt` — the game's `court` re-pointed
+  away before the call landed — identically to `WrongStatus`. That was wrong:
+  `NotCourt` fires while the underlying challenge is **still `Disputed` and
+  fully rulable** — re-pointing the court resolved nothing about the
+  challenge itself — so swallowing it recorded a verdict (often `Guilty`)
+  that could never be delivered, and re-wiring the court back cannot
+  redeliver it either (`refer` reverts `AlreadyReferred`). That is a
+  retryable, transient condition wearing terminal clothing, not "nothing left
+  to rule": bubbling it instead reverts the state writes above and leaves the
+  case `Voting`, so an honest retry (or a re-point back before the next
+  `finalize` call) still lands the verdict. `WrongStatus` alone is genuinely
+  terminal — nothing but the challenge itself resolving produces it.
 
 ### Owner surface (all `onlyOwner`, all bounded)
 
@@ -292,14 +318,18 @@ New:
 - **Both orderings of the timeout race** (the E1 lesson): court finalizes then
   `resolve` reverts `WrongStatus`; `resolve` fires during the buffer then
   `finalize` closes the case via catch with `ChallengeAlreadyTerminal`.
-- **`NotCourt` is swallowed identically to `WrongStatus`** (the game's `court`
-  re-pointed away before `rule` landed) — case closes, `ChallengeAlreadyTerminal`.
+- **`NotCourt` bubbles, same as any other transient revert** (the game's
+  `court` re-pointed away before `rule` landed, while the challenge is still
+  `Disputed` and fully rulable) — `finalize` reverts whole, the case stays
+  `Voting`, and a retry (or a re-point back) still lands the verdict. It is
+  no longer swallowed alongside `WrongStatus` (defect B2, fixed `8bda7ba`):
+  swallowing it closed cases with a recorded, undeliverable `Guilty` verdict.
 - **The selector filter is not a bare catch**: an under-gassed `finalize` call
   that trips `rule`'s own `InsufficientSlashGas` floor must revert the whole
   `finalize` and leave the case `Voting` (regression test for the
   verdict-burning PoC), and a plain transient revert (any selector other than
-  `WrongStatus`/`NotCourt`) must do the same — both then succeed on a retry
-  once the condition clears.
+  `WrongStatus`, `NotCourt` included) must do the same — both then succeed on
+  a retry once the condition clears.
 - Pause: `file` refused while paused; `dispute`/`resolve`/`rule`/claims run on
   a pre-pause challenge.
 - Custody: court WOOD balance is 0 across every arc (donation-only tolerance).

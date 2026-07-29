@@ -38,6 +38,40 @@ Rules:
 - **Not** paid on the `_convicted` short-circuit — a second challenge against an already-convicted proposal collects nothing.
 - `settleBurnBps` is **unchanged**. It remains the only price on the free-slash attack.
 
+### The approver-membership gate on `contested` (added post-spec, PR review 2026-07-29)
+
+The bounty is gated on `contested`, not merely on `status == Disputed`
+completing: an escalated `Guilty` ruling only pays the bounty when at least
+one funder of the counter-bond pool is a member of the accused set (the
+ledger's approvers for that exact proposal).
+
+Reason: `dispute` is open to anyone (#50's pull-payment counter-bond has no
+membership check on who may fund it), so a challenger could stage a contest
+from a second address it controls, recover its own pool on a `Guilty` ruling,
+and collect the bounty for a fight nobody had. "Was the funder the
+challenger?" is unanswerable — addresses are free, and a same-wallet check is
+defeated by a second one. "Was the funder one of the accused?" is answerable:
+joining the accused set for a proposal means staking WOOD and recording an
+approval on the very proposal you are about to accuse — joining the cohort
+your own conviction slashes. That turns an unenforceable identity predicate
+into a verifiable role predicate.
+
+**Accepted false negative:** a genuine third party who funds a defence
+because it believes the accused innocent still forces adjudication —
+`dispute`'s open standing is untouched — but a `Guilty` ruling it provoked
+pays the challenger no bounty. The gate narrows only what *earns* the bounty,
+never what is allowed to happen.
+
+**Why this gate is load-bearing, not tidiness:** it is what keeps the bounty
+from widening M1 (§6) into a *profitable prosecution* attack. Pre-gate, a
+captured jury convicting an innocent accused paid the attacker 5% of the
+slash on top of the conviction itself — profitable even with no underlying
+drain to recover. Post-gate, collecting that bounty requires the attacker to
+route the contest through the accused set, which it cannot do without
+joining the very cohort being slashed. §6's accepted risk stays acquittal
+capture only — buying a jury to acquit a real drain — not conviction-for-
+profit against an innocent guardian.
+
 ### Why not the silence path (decision 2026-07-29)
 
 On the silence path an honest filer and a liar are **indistinguishable to the contract**:
@@ -126,6 +160,42 @@ challengeableUntil[key] = extended > current ? extended : current;
 
 `file` reads `challengeableUntil[key]`, falling back to `executedAt + challengeWindow` when unset. Stalling the pool to force `Inconclusive` now buys the accused a delay instead of an acquittal, and the spec's re-challengeability claim becomes true.
 
+### Lock-time reductions (owner decision, 2026-07-29)
+
+Two ceilings were cut after review found the worst-case coverage-freeze pin
+too long relative to what the token court's real clocks need:
+
+- **`MAX_DISPUTE_TIMEOUT`: 180 days → 60 days.** The old figure was 6x the
+  30-day default with nothing arguing for the headroom. At the `voteWindow`
+  ceiling the cross-contract window invariant (§5 above,
+  `autoSlashDelay + voteWindow + FINALIZE_BUFFER <= disputeTimeout`) needs 15
+  days of runway, so 60 still permits `autoSlashDelay` up to 45 days against
+  a 7-day default.
+- **`setChallengeWindow`'s ceiling: the `90 days` literal → read
+  `exposureLedger.challengeWindow()` live** (14 days today). The old literal
+  sat 6x above the constraint its own natspec named — a game window that far
+  above the ledger's actual coverage window let a filing freeze exposure the
+  ledger had already aged out of its epoch buckets. Reading it live also
+  means the two can never drift apart again.
+- **Worst-case single-challenge exit block: 270 days → 74 days**; unchanged
+  at 44 days on defaults.
+
+**What the freeze does and does not block** — earlier reviews got this wrong
+twice: it blocks full exit (`claimUnstakeGuardian`) and early release of the
+challenged commitment. It does **not** block approving new proposals
+(`recordApproval` has no frozen check) and it does **not** stop exposure
+buckets ageing out on wall-clock — the freeze pins the reviewed commitment,
+not the guardian's whole book or the calendar.
+
+**There is no system-wide maximum.** Concurrent challenges plus the M3
+window extension above mean a determined attacker can contest a guardian's
+exit indefinitely — every `Inconclusive` unwind re-extends
+`challengeableUntil`, and a fresh filing can open a new challenge before the
+previous freeze has fully cleared. Every round still ends with a gap in
+which a matured claim succeeds, and the guardian keeps underwriting coverage
+and earning throughout — the freeze blocks exit, not participation, and
+never accumulates into a permanent lock.
+
 ## 6. ACCEPTED RISK — M1, jury capture
 
 **Decision (2026-07-29): ship without vote locking. This risk is accepted, not solved.**
@@ -164,7 +234,19 @@ Specifically, §1's three "properties UMA lacks" need correcting: property 2 ("v
 
 - **A1** — address splitting defeats `AccusedCannotVote`: `isAccused` covers the approving *address*, not the party, and the floor's accused-subtraction makes the siblings' quorum *smaller* as the accused cohort grows. Likely unfixable under permissionless staking; the natspec must stop claiming the bar covers a party.
 - **A2** — last-mover advantage: public tallies + hard deadline + **tie acquits** means the acquitting side need only *match*, not exceed, in the final block. Mitigation short of commit-reveal is a vote-extension (any late vote pushes the deadline), deferred with §6's trigger.
-- **A5** — `_ageFactorBps` reads live `stakedAt`, so a voter who tops up mid-case silently drops toward the age floor; achievable turnout decays during the window.
+- **A5 — confirmed on the real contract, not inferred (2026-07-29).**
+  `getPastVotes` re-derives its age factor from the guardian's CURRENT
+  mutable `stakedAt`, so a past-timestamp read is not a frozen historical
+  value: any later action that re-anchors `stakedAt` floors that historic
+  weight toward `ageFloorBps`. The drift is deflation-only (every writer
+  moves `stakedAt` forward or to the zero sentinel; `cancelUnstakeGuardian`
+  deliberately does not restore it), so weight can never be manufactured —
+  D2 holds. Two consequences: a guardian who tops up before voting in a live
+  case votes at LESS weight than one who votes first, then tops up ("vote
+  first, then top up" is load-bearing operational advice); and a guardian
+  who cancels an unstake to regain the vote returns at `ageFloorBps`, not
+  their matured weight, because the unstake request already re-anchored
+  `stakedAt` before the cancel.
 
 ## 8. Parameters and testing
 
