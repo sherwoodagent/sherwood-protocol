@@ -243,6 +243,12 @@ contract MockChallengeStakedWood {
     }
     address public lastVault;
     uint256 public lastSnapshotTimestamp;
+    /// @dev Task 1 (spec 2026-07-29 §2) added the conviction-bounty params.
+    ///      Recorded, not swallowed, so a test can pin exactly what `_settle`
+    ///      passes: at HEAD, always `(address(0), 0)` — Task 2 is what wires
+    ///      real bounty routing (only on an escalated conviction).
+    address public lastBountyTo;
+    uint256 public lastBountyBps;
 
     uint256 internal _nextTotal = 1_000e18;
     uint256 internal _nextCaseId = 1;
@@ -267,8 +273,8 @@ contract MockChallengeStakedWood {
         uint256[] calldata slashBpsPer,
         address vault,
         uint256 snapshotTimestamp,
-        address, /* bountyTo */
-        uint256 /* bountyBps */
+        address bountyTo,
+        uint256 bountyBps
     ) external returns (uint256, uint256) {
         callCount++;
         lastCaseKey = caseKey;
@@ -277,6 +283,8 @@ contract MockChallengeStakedWood {
         _lastSlashBpsPer = slashBpsPer;
         lastVault = vault;
         lastSnapshotTimestamp = snapshotTimestamp;
+        lastBountyTo = bountyTo;
+        lastBountyBps = bountyBps;
         return (_nextTotal, _nextCaseId);
     }
 }
@@ -965,6 +973,13 @@ contract ChallengeGameTest is Test {
         assertEq(slashed.length, 2);
         assertEq(slashed[0], guardianA);
         assertEq(slashed[1], guardianB);
+        // Task 1 (spec 2026-07-29 §2) added the conviction-bounty params to
+        // `slashToEscrow`; Task 2 is what decides when this game actually
+        // pays one. At HEAD `_settle` always passes the disabled form —
+        // this pins that so a later task's routing change shows up here as
+        // an intentional, reviewed diff instead of a silent behavior change.
+        assertEq(swood.lastBountyTo(), address(0), "HEAD pays no bounty: bountyTo is always zero for now");
+        assertEq(swood.lastBountyBps(), 0, "HEAD pays no bounty: bountyBps is always zero for now");
 
         // The adapter the challenger named is demoted (§3.4, D7).
         assertEq(tiers.demoteCount(), 1);

@@ -208,7 +208,22 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///         order at deploy time.
     /// @dev    The compensation escrow is NOT named here: it is owner-set state
     ///         on sWOOD, deliberately not a `slashToEscrow` argument, so this
-    ///         game can never redirect the proceeds of a slash it triggers.
+    ///         game can never redirect the ESCROW portion of a slash it
+    ///         triggers to anywhere but that owner-configured sink.
+    ///
+    ///         CORRECTED (2026-07-29 review): this game CAN name a caller-
+    ///         chosen conviction-bounty recipient (`slashToEscrow`'s
+    ///         `bountyTo`/`bountyBps`, spec 2026-07-29 §2) — that channel has
+    ///         to be caller-chosen, since only the caller knows which
+    ///         challenger caused THIS conviction. sWOOD caps it at
+    ///         `MAX_CONVICTION_BOUNTY_BPS` itself rather than trusting this
+    ///         game's own `[0, 2_000]` clamp, for the same reason it re-clamps
+    ///         `slashBpsPer`: sWOOD is the contract that actually moves the
+    ///         WOOD, so a compromised or buggy caller here is bounded by
+    ///         sWOOD's own ceiling, not by this game's. At HEAD this game
+    ///         always passes `(address(0), 0)` — no bounty flows yet; a later
+    ///         task wires the real routing (paid only on an escalated
+    ///         conviction, never the silence settle).
     IStakedWood public stakedWood;
 
     /// @notice The adjudicator for disputed challenges (spec §3.5, Plan E) — the

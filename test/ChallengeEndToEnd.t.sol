@@ -81,7 +81,12 @@ contract ChallengeE2EAdapter {
 ///           - `escrow.authorizedFunder` is sWOOD, NOT the game: the escrow
 ///             address is owner-set state on sWOOD and deliberately not a
 ///             `slashToEscrow` argument, so the game can never redirect the
-///             proceeds of a slash it triggers.
+///             ESCROW portion of a slash it triggers. It CAN name a caller-
+///             chosen conviction-bounty recipient (`bountyTo`/`bountyBps`,
+///             spec 2026-07-29 §2), but sWOOD caps that channel at
+///             `MAX_CONVICTION_BOUNTY_BPS` itself rather than trusting the
+///             game's own clamp — the same reason `slashBpsPer` is re-clamped
+///             in sWOOD rather than trusted from `ExposureLedger`.
 ///
 /// @dev    Fixture arithmetic, all exact:
 ///           - USDG 6-dec at $1.00; `_decimalsOffset()` is the asset's decimals,

@@ -248,6 +248,11 @@ contract WireTokenCourt is Script {
         require(game.court() == courtAddr, "wiring: game.court");
 
         console.log("ChallengeGame.court:      %s", game.court());
+        console.log("MANUAL NEXT: a StakedWood upgrade (slashToEscrow's ABI, e.g. the conviction-");
+        console.log("  bounty params) and any ChallengeGame redeploy that calls it MUST ship as ONE");
+        console.log("  atomic governance batch. A selector mismatch between the two - one upgraded,");
+        console.log("  the other not - makes every resolve() revert: coverage stays frozen and every");
+        console.log("  accused approver is barred from claimUnstakeGuardian until both sides agree.");
         console.log("MANUAL NEXT: referral on dispute completion is automatic but BEST-EFFORT -");
         console.log("  permissionless TokenCourt.refer is the fallback. Monitor AutoReferFailed and");
         console.log("  have someone ready to call refer directly if it fires.");

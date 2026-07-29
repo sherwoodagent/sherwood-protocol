@@ -67,11 +67,17 @@ interface IStakedWood {
 
     /// @notice Correlates a verdict slash with the escrow case it funded, so
     ///         Plan D and indexers can join the two without scraping the escrow.
+    /// @dev `total` is NET of any conviction bounty (spec 2026-07-29 §2) — it
+    ///      equals the escrow's own `proceeds` for this case.
     event VerdictSlashRouted(bytes32 indexed caseKey, address indexed vault, uint256 total, uint256 caseId);
 
     /// @notice A verdict slash whose compensation case could not be opened
     ///         (`openCase` reverted); the proceeds were burned instead. The
     ///         guardian is still slashed; the case's victims go uncompensated.
+    /// @dev `total` is NET of any conviction bounty. The bounty is paid on
+    ///      this path too (see `slashToEscrow`'s dev block) — depositors
+    ///      recover 0% of `total` either way, so paying it first costs them
+    ///      nothing.
     event VerdictSlashUncompensated(bytes32 indexed caseKey, address indexed vault, uint256 total);
 
     /// @notice A conviction bounty was paid out of a verdict slash before the
@@ -209,10 +215,32 @@ interface IStakedWood {
     ///         slash - which is how the caller expresses "this path pays no
     ///         bounty" (see `ChallengeGame._settle`: only an ESCALATED
     ///         conviction pays, never the silence settle).
+    ///
+    ///         PAID EVEN ON THE BURN FALLBACK. If `openCase` reverts, the
+    ///         remainder still burns (`VerdictSlashUncompensated`) rather than
+    ///         being clawed back — depositors recover 0% of the slash on that
+    ///         path EITHER WAY (no case was ever opened to divide), so paying
+    ///         the bounty first costs them nothing; it comes out of what would
+    ///         otherwise simply burn.
+    ///
+    ///         `bountyBps` IS NOT TRUSTED FROM THE CALLER. sWOOD clamps it to
+    ///         `[0, MAX_CONVICTION_BOUNTY_BPS]` itself (`InvalidParameter`
+    ///         above that, including any value `>= 10_000`) — the same
+    ///         treatment `slashBpsPer` gets against `[minSlashBps,
+    ///         maxSlashBps]`. `ChallengeGame` also pins its own rate to this
+    ///         range at filing, but that bound lives in the CALLER; sWOOD is
+    ///         the contract that actually moves the WOOD, so a compromised or
+    ///         buggy slasher can divert at most `MAX_CONVICTION_BOUNTY_BPS` of
+    ///         any one slash to a caller-named `bountyTo` — the remainder can
+    ///         still only ever reach the owner-set `compensationEscrow` or the
+    ///         burn address, never an arbitrary destination of the slasher's
+    ///         own choosing.
     /// @param  bountyTo   Recipient of the conviction bounty, or `address(0)`.
-    /// @param  bountyBps  Slice of the recovered total, in bps.
+    /// @param  bountyBps  Slice of the recovered total, in bps. Clamped to
+    ///                     `[0, MAX_CONVICTION_BOUNTY_BPS]` by sWOOD itself.
     /// @return total  WOOD routed to the escrow across all approvers, NET of
-    ///                the conviction bounty.
+    ///                the conviction bounty. `VerdictSlashRouted` and
+    ///                `VerdictSlashUncompensated` both report this NET figure.
     /// @return caseId The escrow case funded, or 0 when nothing was recovered.
     function slashToEscrow(
         bytes32 caseKey,

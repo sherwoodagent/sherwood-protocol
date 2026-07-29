@@ -252,6 +252,8 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///      produced, so Plan D and indexers can join the two without scraping
     ///      the escrow's own `CaseOpened` log and guessing which slash it came
     ///      from. `total` is the WOOD routed; `caseId` is the escrow's id.
+    ///      `total` is NET of any conviction bounty (spec 2026-07-29 §2) — it
+    ///      is exactly what the escrow's own `proceeds` for this case equal.
     ///      Mirrors `IStakedWood.VerdictSlashRouted`.
     event VerdictSlashRouted(bytes32 indexed caseKey, address indexed vault, uint256 total, uint256 caseId);
 
@@ -261,7 +263,11 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///         proceeds were burned instead. The guardian is still slashed;
     ///         the victims of THIS case go uncompensated (PR #24 review 🟡5:
     ///         a bad vault must not brick the verdict).
-    /// @dev Mirrors `IStakedWood.VerdictSlashUncompensated`.
+    /// @dev Mirrors `IStakedWood.VerdictSlashUncompensated`. `total` here is
+    ///      also NET of the conviction bounty, which is paid regardless of
+    ///      whether `openCase` succeeds (spec 2026-07-29 §2 burn-fallback
+    ///      decision): depositors recover 0% of `total` on this path either
+    ///      way, so paying the bounty first costs them nothing.
     event VerdictSlashUncompensated(bytes32 indexed caseKey, address indexed vault, uint256 total);
 
     /// @notice A conviction bounty was paid out of a verdict slash before the
@@ -452,13 +458,26 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     /// @notice The `CompensationEscrow` that `slashToEscrow` funds.
     /// @dev OWNER-SET STATE, deliberately NOT a `slashToEscrow` parameter.
     ///      sWOOD custodies every WOOD bond in the protocol; letting the
-    ///      slasher name an arbitrary destination would hand it an ERC20
-    ///      allowance against that whole balance. Pinning the sink to an
-    ///      owner-configured address means a compromised `authorizedSlasher`
-    ///      can only misdirect proceeds INTO the honest escrow — where they are
-    ///      still bound to a snapshot-gated case — never to an address of its
-    ///      own choosing. Zero disables the verdict path
+    ///      slasher name an arbitrary destination for THIS SINK would hand it
+    ///      an ERC20 allowance against that whole balance. Pinning the sink to
+    ///      an owner-configured address means a compromised `authorizedSlasher`
+    ///      can misdirect the ESCROW PORTION of a slash only INTO the honest
+    ///      escrow — where it is still bound to a snapshot-gated case — never
+    ///      to an address of its own choosing. Zero disables the verdict path
     ///      (`CompensationEscrowNotSet`).
+    ///
+    ///      CORRECTED (2026-07-29 review): this no longer describes the WHOLE
+    ///      slash. `slashToEscrow`'s `bountyTo`/`bountyBps` is a SEPARATE,
+    ///      deliberately caller-chosen channel — the bounty recipient must be
+    ///      caller-named, because it is the challenger who caused THIS
+    ///      conviction, a fact sWOOD has no way to know on its own. What stays
+    ///      true, and is the actual guarantee: a compromised `authorizedSlasher`
+    ///      can divert AT MOST `MAX_CONVICTION_BOUNTY_BPS` of any one slash to
+    ///      a caller-named address; the remainder can only ever reach this
+    ///      owner-set escrow or, on the burn fallback, `BURN_ADDRESS` — never
+    ///      an arbitrary destination of the slasher's own choosing. The bound
+    ///      on the bounty channel is what makes that remainder-side guarantee
+    ///      still hold; see `MAX_CONVICTION_BOUNTY_BPS`.
     address public compensationEscrow;
 
     /// @dev One slash per (verdict, approver) — the persistent half of the
@@ -505,6 +524,21 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     /// @dev Burning via a transfer to a known-dead address keeps WOOD's
     ///      `totalSupply` semantics intact (no `burn` dependency on the token).
     address internal constant BURN_ADDRESS = 0x000000000000000000000000000000000000dEaD;
+
+    /// @notice Ceiling on `slashToEscrow`'s `bountyBps` (spec 2026-07-29 §2:
+    ///         "bounded [0, 2_000]").
+    /// @dev ENFORCED HERE, NOT ONLY IN THE CALLER. `ChallengeGame` pins its own
+    ///      `convictionBountyBps` to this same range at filing, but sWOOD is
+    ///      the contract that actually moves the WOOD — the same reason
+    ///      `slashBpsPer` is re-clamped to `[minSlashBps, maxSlashBps]` here
+    ///      instead of trusted from `ExposureLedger.slashBpsFor`. A compromised
+    ///      or simply buggy `authorizedSlasher` must not be able to name an
+    ///      arbitrary `bountyBps` and route the whole slash to a caller-chosen
+    ///      address; capping it here means the WORST a bad slasher can do
+    ///      through this parameter is redirect `MAX_CONVICTION_BOUNTY_BPS` of
+    ///      any one slash — the rest still lands only in the honest escrow or
+    ///      the burn address, never at the slasher's discretion.
+    uint256 public constant MAX_CONVICTION_BOUNTY_BPS = 2_000;
 
     /// @notice Grouped `initialize` arguments. A struct keeps the call site
     ///         keyword-addressed — a prior review flagged the positional arg
@@ -1297,8 +1331,18 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///        plain UUPS upgrade.
     /// @param bountyBps Slice of the recovered total paid to `bountyTo`, in
     ///        bps. `0` disables the bounty even with a non-zero `bountyTo`.
+    ///        Clamped to `[0, MAX_CONVICTION_BOUNTY_BPS]` — NOT trusted from
+    ///        the caller, for the same reason `slashBpsPer` is re-clamped here
+    ///        rather than trusted from `ExposureLedger`: `ChallengeGame` pins
+    ///        its own rate to this range at filing, but sWOOD is the contract
+    ///        that actually moves the WOOD, so it enforces its own ceiling
+    ///        rather than relying on the caller's. Anything above
+    ///        `MAX_CONVICTION_BOUNTY_BPS` (in particular any value `>= 10_000`,
+    ///        which would otherwise be able to route the ENTIRE slash to
+    ///        `bountyTo`) reverts `InvalidParameter`.
     /// @return total  Total WOOD routed to the escrow across all approvers,
-    ///         NET of the conviction bounty.
+    ///         NET of the conviction bounty. Also what `VerdictSlashRouted` and
+    ///         `VerdictSlashUncompensated` report as `total` — both are NET.
     /// @return caseId The escrow case funded, or 0 when nothing was recovered.
     function slashToEscrow(
         bytes32 caseKey,
@@ -1317,6 +1361,19 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
         // Positional alignment is the only thing tying a guardian to their rate,
         // so a mismatch is a caller bug, not something to absorb.
         if (slashBpsPer.length != approvers.length) revert SlashBpsLengthMismatch();
+        // BOUNTY RATE IS NOT TRUSTED FROM THE CALLER (2026-07-29 review). Same
+        // reasoning as clamping `slashBpsPer` below to `[minSlashBps,
+        // maxSlashBps]` instead of trusting `ExposureLedger`: `ChallengeGame`
+        // pins `convictionBountyBps` to `[0, 2_000]` at filing, but that bound
+        // lives in the CALLER. Left unchecked here, a compromised or buggy
+        // `authorizedSlasher` could pass `bountyBps` up to just under 10_000
+        // and route almost the entire slash to a `bountyTo` of its own
+        // choosing — the exact one-address-of-its-own-choosing outcome
+        // `compensationEscrow`'s natspec says sWOOD does not allow. Enforcing
+        // the ceiling here, unconditionally (even when `bountyTo == address(0)`
+        // and the rate would never be spent), keeps that guarantee true
+        // regardless of what the caller does.
+        if (bountyBps > MAX_CONVICTION_BOUNTY_BPS) revert InvalidParameter();
         // FACTORY MEMBERSHIP (PR #24 round-4 N-4). The escrow apportions against
         // `vault`'s ERC20Votes checkpoints, and the F-A analysis of
         // `EmptySnapshot` holds only for OZ semantics — a nonstandard
@@ -1462,6 +1519,15 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
             // would double-count it — the bounty recipient keeps its cut
             // either way, so only what was actually destined for the escrow
             // burns.
+            //
+            // THE BOUNTY IS DELIBERATELY NOT CLAWED BACK HERE (spec 2026-07-29
+            // §2 decision). On this path `openCase` never ran, so depositors
+            // recover 0% of `total` EITHER WAY — paying the bounty first does
+            // not take anything away from them, because there was never a
+            // funded case to divide. The bounty comes out of what would
+            // otherwise simply burn, not out of anyone's recovery, so the
+            // prosecutor still gets paid even when the vault turns out to be
+            // unpriceable.
             _burnWood(total);
             caseId = 0;
             emit VerdictSlashUncompensated(caseKey, vault, total);
