@@ -841,7 +841,8 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      lives on the callee side, in `ChallengeGame._settle`'s
     ///      `InsufficientSlashGas` — what `finalize` gets right is BUBBLING
     ///      rather than swallowing that revert (its catch is selector-filtered
-    ///      to only `WrongStatus`/`NotCourt`, everything else propagates), and
+    ///      to only `WrongStatus`, everything else - `NotCourt` included -
+    ///      propagates), and
     ///      that is cheap to do because swallowing is what would be
     ///      catastrophic there: the verdict was already decided, the case's
     ///      tally is intact regardless of how `finalize` reverts, and the

@@ -166,15 +166,15 @@ interface ITokenCourt {
         uint256 notGuiltyVotes,
         uint256 floor
     );
-    /// @notice `rule` reverted with `WrongStatus` (the challenge went terminal
-    ///         on its own clock during the finalize buffer — the E1 race) or
-    ///         `NotCourt` (the game's `court` was re-pointed away from this
-    ///         contract before the call landed). Only these two mean "nothing
-    ///         is left to rule"; the case still closes and, with zero custody,
-    ///         this is bookkeeping, not fund loss. Every OTHER revert from
-    ///         `rule` — `InsufficientSlashGas` from an under-gassed call chief
-    ///         among them — bubbles out of `finalize` instead of being
-    ///         swallowed here, so the case stays `Voting` for an honest retry.
+    /// @notice `rule` reverted with `WrongStatus` — the challenge went terminal
+    ///         on its own clock during the finalize buffer (the E1 race), so
+    ///         there is nothing left to rule. The case still closes and, with
+    ///         zero custody, this is bookkeeping, not fund loss. Every OTHER
+    ///         revert from `rule` — `InsufficientSlashGas` from an under-gassed
+    ///         call, or `NotCourt` from the game's `court` being re-pointed
+    ///         away while the challenge is still `Disputed` and fully rulable
+    ///         (B2) — bubbles out of `finalize` instead of being swallowed
+    ///         here, so the case stays `Voting` for an honest retry.
     event ChallengeAlreadyTerminal(uint256 indexed caseId, uint256 indexed challengeId);
     /// @notice The wired `ChallengeGame` changed (or was set for the first
     ///         time, `oldGame == address(0)`).
@@ -259,13 +259,15 @@ interface ITokenCourt {
     ///         majority the other way. Writes the verdict before calling
     ///         `IChallengeGame.rule` on `caseId`'s pinned `game` and
     ///         SELECTIVELY tolerates that call reverting: only `WrongStatus`
-    ///         and `NotCourt` are swallowed (`ChallengeAlreadyTerminal`) — the
-    ///         court holds no WOOD, so those two are bookkeeping, not stranded
-    ///         funds. Every other revert, `InsufficientSlashGas` from a
-    ///         deliberately under-gassed call included, bubbles out of
-    ///         `finalize` whole so the case stays `Voting` for an honest
-    ///         retry — a bare catch there would let anyone burn a `Guilty`
-    ///         verdict for free by starving the child call's gas.
+    ///         is swallowed (`ChallengeAlreadyTerminal`) — the court holds no
+    ///         WOOD, so a terminal challenge is bookkeeping, not stranded
+    ///         funds. Every other revert — `InsufficientSlashGas` from a
+    ///         deliberately under-gassed call, or `NotCourt` from the game's
+    ///         `court` being re-pointed away while the challenge is still
+    ///         `Disputed` and fully rulable (B2) — bubbles out of `finalize`
+    ///         whole so the case stays `Voting` for an honest retry — a bare
+    ///         catch there would let anyone burn a `Guilty` verdict for free
+    ///         by starving the child call's gas, or by unwiring the court.
     function finalize(uint256 caseId) external;
 
     /// @notice Wire (or re-wire) the challenge game this court adjudicates

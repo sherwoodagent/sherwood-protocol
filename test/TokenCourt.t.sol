@@ -10,10 +10,12 @@ import {MockStakedWood} from "./mocks/MockStakedWood.sol";
 /// @dev Just enough game for the court: a settable challenge record, the
 ///      ledger pointer the court reads, and a `rule` recorder with several
 ///      revert toggles — one per class `finalize`'s selector-filtered catch
-///      must tell apart: the two swallowed terminal-race causes
-///      (`WrongStatus`, `NotCourt`) and a stand-in transient failure
-///      (`ZeroAddress`) that must bubble instead, plus a gas floor standing in
-///      for `InsufficientSlashGas` (the under-gas verdict-burning PoC).
+///      must tell apart: the ONE swallowed terminal-race cause
+///      (`WrongStatus`), and the transient failures that must bubble instead
+///      (`NotCourt`, B2 — the game was re-pointed away but the challenge is
+///      still rulable; and a stand-in `ZeroAddress`), plus a gas floor
+///      standing in for `InsufficientSlashGas` (the under-gas verdict-burning
+///      PoC).
 /// @dev `executedAt` is set directly on the challenge record (no separate
 ///      governor stub) — the court reads `ch.executedAt`, the game's own pin
 ///      (F10), never a live `ISyndicateGovernor.getProposal` call. There is
@@ -22,7 +24,7 @@ contract MockGameForCourt {
     mapping(uint256 => IChallengeGame.Challenge) internal _challenges;
     address public exposureLedger;
     bool public ruleReverts; // reverts WrongStatus - swallowed (terminal race)
-    bool public ruleRevertsNotCourt; // reverts NotCourt - swallowed (re-pointed court)
+    bool public ruleRevertsNotCourt; // reverts NotCourt - bubbles (re-pointed court, still rulable, B2)
     bool public ruleRevertsOther; // reverts ZeroAddress - must bubble (transient stand-in)
     uint256 public ruleGasFloor; // 0 disables; else reverts InsufficientSlashGas under it
     uint256 public lastRuledChallenge;
@@ -712,16 +714,16 @@ contract TokenCourtTest is Test {
     }
 
     /// @dev A TRANSIENT, NON-TERMINAL revert (anything other than
-    ///      `WrongStatus`/`NotCourt`) must bubble out of `finalize` whole,
-    ///      exactly like the gas-floor case above, so the case survives for a
-    ///      retry once the underlying condition clears.
+    ///      `WrongStatus`) must bubble out of `finalize` whole, exactly like
+    ///      the gas-floor case above, so the case survives for a retry once
+    ///      the underlying condition clears.
     function test_finalize_transientRevert_bubblesAndLeavesCaseVoting() public {
         uint256 id = _referredCase();
         vm.prank(voterA);
         court.vote(id, true);
         vm.warp(vm.getBlockTimestamp() + 5 days);
 
-        game.setRuleRevertsOther(true); // stand-in: reverts ZeroAddress, not WrongStatus/NotCourt
+        game.setRuleRevertsOther(true); // stand-in: reverts ZeroAddress, not WrongStatus
         vm.expectRevert(IChallengeGame.ZeroAddress.selector);
         court.finalize(id);
         assertEq(
@@ -735,20 +737,33 @@ contract TokenCourtTest is Test {
     }
 
     /// @dev `NotCourt` (the game's `court` re-pointed away before `rule`
-    ///      landed) is the SECOND swallowed cause, alongside `WrongStatus`.
-    function test_finalize_notCourt_swallowed() public {
+    ///      landed, e.g. an owner `setCourt(address(0))` emergency lever)
+    ///      does NOT mean "nothing left to rule" (B2) - the challenge is
+    ///      still `Disputed` and fully rulable, unlike `WrongStatus`'s
+    ///      terminal race. Swallowing it would close the case with a verdict
+    ///      recorded and undelivered, and re-wiring could not redeliver it
+    ///      (`refer` reverts `AlreadyReferred`) - the same verdict-burning
+    ///      outcome this catch exists to prevent, reached by an owner action
+    ///      instead of a gas dial. It is transient and retryable, so it must
+    ///      bubble like every other non-`WrongStatus` revert.
+    function test_finalize_notCourt_bubblesAndLeavesCaseVoting() public {
         uint256 id = _referredCase();
         vm.prank(voterA);
         court.vote(id, true);
         vm.warp(vm.getBlockTimestamp() + 5 days);
 
-        game.setRuleRevertsNotCourt(true);
-        vm.expectEmit(true, true, false, false);
-        emit ITokenCourt.ChallengeAlreadyTerminal(id, CHALLENGE_ID);
+        game.setRuleRevertsNotCourt(true); // the game no longer recognises this court
+        vm.expectRevert(IChallengeGame.NotCourt.selector);
         court.finalize(id);
 
-        assertEq(uint256(court.caseOf(id).phase), uint256(ITokenCourt.Phase.Resolved), "case closed anyway");
-        assertFalse(game.ruled(), "verdict never landed");
+        assertEq(uint256(court.caseOf(id).phase), uint256(ITokenCourt.Phase.Voting), "case stays retryable");
+        assertFalse(game.ruled(), "nothing delivered");
+
+        // Re-wire and the verdict lands for real - the whole point of bubbling.
+        game.setRuleRevertsNotCourt(false);
+        court.finalize(id);
+        assertEq(uint256(game.lastVerdict()), uint256(IChallengeGame.Verdict.Guilty));
+        assertEq(uint256(court.caseOf(id).phase), uint256(ITokenCourt.Phase.Resolved));
     }
 
     /// @dev `Case.game` PINS the game a case rules on at `refer` time. A

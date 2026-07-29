@@ -339,13 +339,13 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///         underlying challenge can go terminal on its OWN clock
     ///         (`ChallengeGame.resolve`'s `disputeTimeout`, or a second court
     ///         beating this call to `rule`), in which case `IChallengeGame.rule`
-    ///         reverts `WrongStatus`/`NotCourt`. Writing `phase = Resolved` and
-    ///         emitting `CaseFinalized` FIRST, then tolerating ONLY THOSE TWO
-    ///         reverts (`ChallengeAlreadyTerminal`), is what stops a
-    ///         terminal-race loser from wedging this case open forever: the
-    ///         court holds no WOOD, as stated in the contract-level docs above,
-    ///         so a verdict that never lands on the game is bookkeeping — a case
-    ///         this contract will never again act on — not a stuck-funds hazard.
+    ///         reverts `WrongStatus`. Writing `phase = Resolved` and emitting
+    ///         `CaseFinalized` FIRST, then tolerating ONLY THAT ONE revert
+    ///         (`ChallengeAlreadyTerminal`), is what stops a terminal-race loser
+    ///         from wedging this case open forever: the court holds no WOOD, as
+    ///         stated in the contract-level docs above, so a verdict that never
+    ///         lands on the game is bookkeeping — a case this contract will
+    ///         never again act on — not a stuck-funds hazard.
     /// @dev    THE CATCH IS SELECTOR-FILTERED, NOT BARE. A bare catch here is a
     ///         verdict-burning primitive: `rule`'s callee-side gas floor
     ///         (`InsufficientSlashGas`, sized against the slash's approver
@@ -355,13 +355,20 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///         a `Guilty` verdict PERMANENTLY, for the price of choosing a gas
     ///         limit, with the accused as the obvious profiteer: acquitted by
     ///         timeout later, and paid the challenger's forfeited bond. Only
-    ///         `WrongStatus` and `NotCourt` mean "nothing is left to rule" —
-    ///         every other revert (`InsufficientSlashGas` chief among them, but
-    ///         also an unwired escrow/slasher or a token failure inside the
-    ///         slash) is TRANSIENT: it bubbles the whole `finalize` call back
-    ///         out, which reverts the state writes above too, so the case is
-    ///         left exactly where it was — `Voting`, tally intact — for an
-    ///         honest caller to retry with adequate gas.
+    ///         `WrongStatus` means "nothing is left to rule" — every other
+    ///         revert (`InsufficientSlashGas` chief among them, but also
+    ///         `NotCourt` from an owner re-pointing the game's `court` while the
+    ///         challenge is still `Disputed` and fully rulable (B2), an unwired
+    ///         escrow/slasher, or a token failure inside the slash) is
+    ///         TRANSIENT: it bubbles the whole `finalize` call back out, which
+    ///         reverts the state writes above too, so the case is left exactly
+    ///         where it was — `Voting`, tally intact — for an honest caller to
+    ///         retry once the condition clears. `NotCourt` in particular must
+    ///         NOT be swallowed here: doing so would close the case with a
+    ///         verdict recorded and undelivered, and re-wiring the court back
+    ///         could not redeliver it (`refer` reverts `AlreadyReferred`) — the
+    ///         same verdict-burning outcome this filter exists to prevent,
+    ///         reached by an owner action instead of a gas dial.
     /// @dev    PERMISSIONLESS, like `refer` and `resolve` on the game side: the
     ///         caller chooses nothing here. The window, the tally, and the
     ///         verdict are all already fixed by state and the clock before this
@@ -387,8 +394,9 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
         }
 
         // Terminal before the external call (E1, made structural): a swallowed
-        // WrongStatus/NotCourt below is bookkeeping, not stranded funds, with
-        // zero custody. Everything else bubbles and reverts these writes too.
+        // WrongStatus below is bookkeeping, not stranded funds, with zero
+        // custody. Everything else - NotCourt included (B2) - bubbles and
+        // reverts these writes too.
         c.verdict = verdict;
         c.finalizedAt = block.timestamp;
         c.phase = ITokenCourt.Phase.Resolved;
@@ -396,17 +404,22 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
 
         try IChallengeGame(c.game).rule(c.challengeId, verdict) {}
         catch (bytes memory reason) {
-            // Swallow ONLY the two reverts that mean "nothing left to rule":
-            // WrongStatus (challenge went terminal first - the E1 race) and
-            // NotCourt (game re-pointed away). Everything else -
-            // InsufficientSlashGas from a deliberately under-gassed call,
-            // unwired escrow/slasher, token failures - is transient: bubble
-            // it, leave the case Voting, let an honest caller retry.
-            // Swallowing those would convert a retryable condition into a
-            // permanently dropped verdict, which is the verdict-burning
-            // primitive this filter exists to close.
+            // SWALLOW ONLY `WrongStatus` - the one revert that genuinely means
+            // "there is nothing left to rule": once `refer` has succeeded a
+            // challenge can only leave `Disputed` by going terminal, which is
+            // the E1 race this catch exists for.
+            //
+            // `NotCourt` does NOT mean that (B2). It means the game was
+            // re-pointed away while the challenge is STILL `Disputed` and fully
+            // rulable, so swallowing it closes the case with a verdict recorded
+            // and undelivered - and re-wiring cannot redeliver it, because
+            // `refer` reverts `AlreadyReferred`. The challenge then times out
+            // and acquits, paying the accused the challenger's forfeited bond:
+            // the same verdict-burning outcome this filter was written to
+            // close, reached by an owner action instead of a gas dial. It is
+            // transient and retryable, so it bubbles with everything else.
             bytes4 sel = reason.length >= 4 ? bytes4(reason) : bytes4(0);
-            if (sel != IChallengeGame.WrongStatus.selector && sel != IChallengeGame.NotCourt.selector) {
+            if (sel != IChallengeGame.WrongStatus.selector) {
                 assembly ("memory-safe") {
                     revert(add(reason, 0x20), mload(reason))
                 }
