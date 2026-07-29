@@ -8,8 +8,12 @@ import {IChallengeGame} from "../src/interfaces/IChallengeGame.sol";
 import {MockStakedWood} from "./mocks/MockStakedWood.sol";
 
 /// @dev Just enough game for the court: a settable challenge record, the
-///      ledger pointer the court reads, and a `rule` recorder with a revert
-///      toggle for the terminal-race test.
+///      ledger pointer the court reads, and a `rule` recorder with several
+///      revert toggles — one per class `finalize`'s selector-filtered catch
+///      must tell apart: the two swallowed terminal-race causes
+///      (`WrongStatus`, `NotCourt`) and a stand-in transient failure
+///      (`ZeroAddress`) that must bubble instead, plus a gas floor standing in
+///      for `InsufficientSlashGas` (the under-gas verdict-burning PoC).
 /// @dev `executedAt` is set directly on the challenge record (no separate
 ///      governor stub) — the court reads `ch.executedAt`, the game's own pin
 ///      (F10), never a live `ISyndicateGovernor.getProposal` call. There is
@@ -17,7 +21,10 @@ import {MockStakedWood} from "./mocks/MockStakedWood.sol";
 contract MockGameForCourt {
     mapping(uint256 => IChallengeGame.Challenge) internal _challenges;
     address public exposureLedger;
-    bool public ruleReverts;
+    bool public ruleReverts; // reverts WrongStatus - swallowed (terminal race)
+    bool public ruleRevertsNotCourt; // reverts NotCourt - swallowed (re-pointed court)
+    bool public ruleRevertsOther; // reverts ZeroAddress - must bubble (transient stand-in)
+    uint256 public ruleGasFloor; // 0 disables; else reverts InsufficientSlashGas under it
     uint256 public lastRuledChallenge;
     IChallengeGame.Verdict public lastVerdict;
     bool public ruled;
@@ -28,6 +35,18 @@ contract MockGameForCourt {
 
     function setRuleReverts(bool r) external {
         ruleReverts = r;
+    }
+
+    function setRuleRevertsNotCourt(bool r) external {
+        ruleRevertsNotCourt = r;
+    }
+
+    function setRuleRevertsOther(bool r) external {
+        ruleRevertsOther = r;
+    }
+
+    function setRuleGasFloor(uint256 g) external {
+        ruleGasFloor = g;
     }
 
     function setChallenge(
@@ -53,7 +72,10 @@ contract MockGameForCourt {
     }
 
     function rule(uint256 challengeId, IChallengeGame.Verdict verdict) external {
+        if (ruleGasFloor != 0 && gasleft() < ruleGasFloor) revert IChallengeGame.InsufficientSlashGas();
         if (ruleReverts) revert IChallengeGame.WrongStatus();
+        if (ruleRevertsNotCourt) revert IChallengeGame.NotCourt();
+        if (ruleRevertsOther) revert IChallengeGame.ZeroAddress();
         ruled = true;
         lastRuledChallenge = challengeId;
         lastVerdict = verdict;
@@ -530,6 +552,79 @@ contract TokenCourtTest is Test {
         vm.expectEmit(true, true, false, false);
         emit ITokenCourt.ChallengeAlreadyTerminal(id, CHALLENGE_ID);
         court.finalize(id);
+        assertEq(uint256(court.caseOf(id).phase), uint256(ITokenCourt.Phase.Resolved), "case closed anyway");
+        assertFalse(game.ruled(), "verdict never landed");
+    }
+
+    /// @dev THE VERDICT-BURNING REGRESSION. A bare `catch` in `finalize` would
+    ///      let an under-gassed call trip `rule`'s own `InsufficientSlashGas`
+    ///      gas floor while the OUTER `finalize` call still has plenty of gas
+    ///      to complete on the refund — writing `Resolved` and silently
+    ///      dropping a `Guilty` verdict forever. The fix bubbles that revert
+    ///      instead: the under-gassed call must revert the WHOLE `finalize`,
+    ///      leaving the case `Voting` for an honest, adequately-gassed retry.
+    function test_finalize_underGassedCall_revertsAndLeavesCaseVoting() public {
+        uint256 id = _referredCase(); // floor = 100e18
+        vm.prank(voterA);
+        court.vote(id, true); // 300e18 guilty, clears the floor alone
+        vm.warp(vm.getBlockTimestamp() + 5 days);
+
+        // A floor `rule` cannot clear once `finalize`'s own overhead (SLOADs,
+        // the swood staticcall, event emission, the EIP-150 63/64ths held
+        // back at the CALL boundary) has eaten into a capped outer budget.
+        game.setRuleGasFloor(200_000);
+
+        vm.expectRevert(IChallengeGame.InsufficientSlashGas.selector);
+        court.finalize{gas: 200_000}(id);
+
+        ITokenCourt.Case memory c = court.caseOf(id);
+        assertEq(uint256(c.phase), uint256(ITokenCourt.Phase.Voting), "under-gassed call must not resolve the case");
+        assertFalse(game.ruled(), "verdict never landed on the under-gassed attempt");
+
+        // Control: a plain (adequately gassed) retry lands the verdict.
+        court.finalize(id);
+        c = court.caseOf(id);
+        assertEq(uint256(c.phase), uint256(ITokenCourt.Phase.Resolved), "honest retry resolves the case");
+        assertTrue(game.ruled(), "verdict landed on the honest retry");
+        assertEq(uint256(game.lastVerdict()), uint256(IChallengeGame.Verdict.Guilty));
+    }
+
+    /// @dev A TRANSIENT, NON-TERMINAL revert (anything other than
+    ///      `WrongStatus`/`NotCourt`) must bubble out of `finalize` whole,
+    ///      exactly like the gas-floor case above, so the case survives for a
+    ///      retry once the underlying condition clears.
+    function test_finalize_transientRevert_bubblesAndLeavesCaseVoting() public {
+        uint256 id = _referredCase();
+        vm.prank(voterA);
+        court.vote(id, true);
+        vm.warp(vm.getBlockTimestamp() + 5 days);
+
+        game.setRuleRevertsOther(true); // stand-in: reverts ZeroAddress, not WrongStatus/NotCourt
+        vm.expectRevert(IChallengeGame.ZeroAddress.selector);
+        court.finalize(id);
+        assertEq(
+            uint256(court.caseOf(id).phase), uint256(ITokenCourt.Phase.Voting), "transient revert must not resolve"
+        );
+
+        game.setRuleRevertsOther(false); // condition cleared
+        court.finalize(id);
+        assertEq(uint256(court.caseOf(id).phase), uint256(ITokenCourt.Phase.Resolved), "retry resolves once cleared");
+        assertTrue(game.ruled());
+    }
+
+    /// @dev `NotCourt` (the game's `court` re-pointed away before `rule`
+    ///      landed) is the SECOND swallowed cause, alongside `WrongStatus`.
+    function test_finalize_notCourt_swallowed() public {
+        uint256 id = _referredCase();
+        vm.prank(voterA);
+        court.vote(id, true);
+        vm.warp(vm.getBlockTimestamp() + 5 days);
+
+        game.setRuleRevertsNotCourt(true);
+        vm.expectEmit(true, true, false, false);
+        emit ITokenCourt.ChallengeAlreadyTerminal(id, CHALLENGE_ID);
+        court.finalize(id);
+
         assertEq(uint256(court.caseOf(id).phase), uint256(ITokenCourt.Phase.Resolved), "case closed anyway");
         assertFalse(game.ruled(), "verdict never landed");
     }

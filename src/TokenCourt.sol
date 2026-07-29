@@ -195,6 +195,7 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
 
         ITokenCourt.Case storage c = _cases[caseId];
         c.challengeId = challengeId;
+        c.game = game; // pinned: setChallengeGame afterward must not redirect finalize's rule call
         c.snapshotTs = snapshotTs;
         c.referredAt = block.timestamp;
         c.voteWindowAtReferral = window;
@@ -296,12 +297,28 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///         (`ChallengeGame.resolve`'s `disputeTimeout`, or a second court
     ///         beating this call to `rule`), in which case `IChallengeGame.rule`
     ///         reverts `WrongStatus`/`NotCourt`. Writing `phase = Resolved` and
-    ///         emitting `CaseFinalized` FIRST, then tolerating that revert
-    ///         (`ChallengeAlreadyTerminal`), is what stops a terminal-race loser
-    ///         from wedging this case open forever: the court holds no WOOD, as
-    ///         stated in the contract-level docs above, so a verdict that never
-    ///         lands on the game is bookkeeping — a case this contract will
-    ///         never again act on — not a stuck-funds hazard.
+    ///         emitting `CaseFinalized` FIRST, then tolerating ONLY THOSE TWO
+    ///         reverts (`ChallengeAlreadyTerminal`), is what stops a
+    ///         terminal-race loser from wedging this case open forever: the
+    ///         court holds no WOOD, as stated in the contract-level docs above,
+    ///         so a verdict that never lands on the game is bookkeeping — a case
+    ///         this contract will never again act on — not a stuck-funds hazard.
+    /// @dev    THE CATCH IS SELECTOR-FILTERED, NOT BARE. A bare catch here is a
+    ///         verdict-burning primitive: `rule`'s callee-side gas floor
+    ///         (`InsufficientSlashGas`, sized against the slash's approver
+    ///         count) can be forced to revert by an under-gassed `finalize`
+    ///         call while the parent still has plenty of gas left to complete
+    ///         on the refund — so a bare catch would write `Resolved` and drop
+    ///         a `Guilty` verdict PERMANENTLY, for the price of choosing a gas
+    ///         limit, with the accused as the obvious profiteer: acquitted by
+    ///         timeout later, and paid the challenger's forfeited bond. Only
+    ///         `WrongStatus` and `NotCourt` mean "nothing is left to rule" —
+    ///         every other revert (`InsufficientSlashGas` chief among them, but
+    ///         also an unwired escrow/slasher or a token failure inside the
+    ///         slash) is TRANSIENT: it bubbles the whole `finalize` call back
+    ///         out, which reverts the state writes above too, so the case is
+    ///         left exactly where it was — `Voting`, tally intact — for an
+    ///         honest caller to retry with adequate gas.
     /// @dev    PERMISSIONLESS, like `refer` and `resolve` on the game side: the
     ///         caller chooses nothing here. The window, the tally, and the
     ///         verdict are all already fixed by state and the clock before this
@@ -326,15 +343,31 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
             verdict = IChallengeGame.Verdict.NotGuilty; // tie fails safe
         }
 
-        // Terminal before the external call (E1, made structural): a missed
-        // `rule` below is bookkeeping, not stranded funds, with zero custody.
+        // Terminal before the external call (E1, made structural): a swallowed
+        // WrongStatus/NotCourt below is bookkeeping, not stranded funds, with
+        // zero custody. Everything else bubbles and reverts these writes too.
         c.verdict = verdict;
         c.finalizedAt = block.timestamp;
         c.phase = ITokenCourt.Phase.Resolved;
         emit CaseFinalized(caseId, verdict, guiltyVotes, notGuiltyVotes, floor);
 
-        try IChallengeGame(challengeGame).rule(c.challengeId, verdict) {}
-        catch {
+        try IChallengeGame(c.game).rule(c.challengeId, verdict) {}
+        catch (bytes memory reason) {
+            // Swallow ONLY the two reverts that mean "nothing left to rule":
+            // WrongStatus (challenge went terminal first - the E1 race) and
+            // NotCourt (game re-pointed away). Everything else -
+            // InsufficientSlashGas from a deliberately under-gassed call,
+            // unwired escrow/slasher, token failures - is transient: bubble
+            // it, leave the case Voting, let an honest caller retry.
+            // Swallowing those would convert a retryable condition into a
+            // permanently dropped verdict, which is the verdict-burning
+            // primitive this filter exists to close.
+            bytes4 sel = reason.length >= 4 ? bytes4(reason) : bytes4(0);
+            if (sel != IChallengeGame.WrongStatus.selector && sel != IChallengeGame.NotCourt.selector) {
+                assembly ("memory-safe") {
+                    revert(add(reason, 0x20), mload(reason))
+                }
+            }
             emit ChallengeAlreadyTerminal(caseId, c.challengeId);
         }
     }
@@ -361,6 +394,27 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///      spec (D6) sanctions this: a floor change is meant to apply to any
     ///      case finalizing after it takes effect, including one already
     ///      `Voting` when the owner adjusts it.
+    /// @dev  THE LIVE READ ALSO MEANS the owner can, by raising
+    ///       `participationFloorBps` before a pending `finalize`, push a live
+    ///       case that would otherwise have cleared the floor down into
+    ///       `Inconclusive` instead. Accepted for the same D6 reason above:
+    ///       `Inconclusive` unwinds both sides whole and the proposal stays
+    ///       re-challengeable, so the owner's live lever here can only ever
+    ///       withhold a verdict — it moves no money to anyone and cannot
+    ///       manufacture a conviction or an acquittal it did not earn.
+    /// @dev  `stakedWood` IS LIKEWISE READ LIVE HERE, not pinned per-case: this
+    ///       `total` comes from whichever contract `stakedWood` names at
+    ///       `finalize` time, while `accusedWeight` was already fixed against
+    ///       whatever `stakedWood` named back at `refer`, and the votes summed
+    ///       into `guiltyVotes`/`notGuiltyVotes` were weighed against whatever
+    ///       it named at each `vote` call. A `setStakedWood` re-point between
+    ///       `vote` and `finalize` therefore changes the floor's basis to a
+    ///       different contract's checkpoints than the ones the cast votes
+    ///       were weighed against. Accepted for the same reason the game's own
+    ///       wiring setters (`setChallengeGame`, `setStakedWood`) stay live
+    ///       rather than pinned per-case: they are the owner's rescue path for
+    ///       a compromised or upgraded dependency, and the owner is trusted.
+    ///       Flagged here as a deliberately deferred hazard, not an oversight.
     function _participationFloor(uint256 snapshotTs, uint256 accusedWeight) internal view returns (uint256) {
         uint256 total = IStakedWood(stakedWood).getPastTotalVotes(snapshotTs);
         uint256 base = total > accusedWeight ? total - accusedWeight : total;

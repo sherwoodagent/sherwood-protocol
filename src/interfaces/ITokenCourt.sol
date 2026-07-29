@@ -35,6 +35,14 @@ interface ITokenCourt {
     /// @notice Everything the court knows about one disputed challenge.
     /// @param challengeId The `ChallengeGame` challenge this case adjudicates.
     ///        One case per challenge — `caseOfChallenge` enforces it.
+    /// @param game The `IChallengeGame` this case's verdict is delivered to,
+    ///        PINNED at `refer` from the then-current `challengeGame`. `finalize`
+    ///        calls `rule` on this address, never on the live `challengeGame` —
+    ///        `snapshotTs` and `voteWindowAtReferral` are pinned for exactly
+    ///        this class of hazard, and the game address was the one field in
+    ///        this struct that was not: an owner re-pointing `challengeGame`
+    ///        between `refer` and `finalize` would otherwise make `finalize`
+    ///        rule a DIFFERENT game's challenge at the same numeric id.
     /// @param snapshotTs `executedAt - 1`, written ONCE in `refer` (D2) and
     ///        never re-derived. Pinning it is what stops the owner moving a
     ///        live case's electorate by re-pointing the governor or letting
@@ -62,6 +70,7 @@ interface ITokenCourt {
     ///        while it is still `Voting`.
     struct Case {
         uint256 challengeId;
+        address game; // pinned IChallengeGame this case rules on, written once in refer
         uint256 snapshotTs; // executedAt - 1, written once in refer (D2)
         uint256 referredAt;
         uint256 voteWindowAtReferral; // pinned: owner cannot move a live case's clock (F5)
@@ -141,9 +150,15 @@ interface ITokenCourt {
         uint256 notGuiltyVotes,
         uint256 floor
     );
-    /// @notice `rule` reverted: the challenge went terminal (timeout during the
-    ///         finalize buffer) before the verdict landed. The case still
-    ///         closes; with zero custody this is bookkeeping, not fund loss.
+    /// @notice `rule` reverted with `WrongStatus` (the challenge went terminal
+    ///         on its own clock during the finalize buffer — the E1 race) or
+    ///         `NotCourt` (the game's `court` was re-pointed away from this
+    ///         contract before the call landed). Only these two mean "nothing
+    ///         is left to rule"; the case still closes and, with zero custody,
+    ///         this is bookkeeping, not fund loss. Every OTHER revert from
+    ///         `rule` — `InsufficientSlashGas` from an under-gassed call chief
+    ///         among them — bubbles out of `finalize` instead of being
+    ///         swallowed here, so the case stays `Voting` for an honest retry.
     event ChallengeAlreadyTerminal(uint256 indexed caseId, uint256 indexed challengeId);
     /// @notice The wired `ChallengeGame` changed (or was set for the first
     ///         time, `oldGame == address(0)`).
@@ -221,14 +236,23 @@ interface ITokenCourt {
     ///         turnout is zero or below the participation floor; otherwise
     ///         `Guilty` on a strict majority, `NotGuilty` on a tie or
     ///         majority the other way. Writes the verdict before calling
-    ///         `IChallengeGame.rule` and tolerates that call reverting
-    ///         (`ChallengeAlreadyTerminal`) — the court holds no WOOD, so a
-    ///         missed `rule` is bookkeeping, not stranded funds.
+    ///         `IChallengeGame.rule` on `caseId`'s pinned `game` and
+    ///         SELECTIVELY tolerates that call reverting: only `WrongStatus`
+    ///         and `NotCourt` are swallowed (`ChallengeAlreadyTerminal`) — the
+    ///         court holds no WOOD, so those two are bookkeeping, not stranded
+    ///         funds. Every other revert, `InsufficientSlashGas` from a
+    ///         deliberately under-gassed call included, bubbles out of
+    ///         `finalize` whole so the case stays `Voting` for an honest
+    ///         retry — a bare catch there would let anyone burn a `Guilty`
+    ///         verdict for free by starving the child call's gas.
     function finalize(uint256 caseId) external;
 
     /// @notice Wire (or re-wire) the challenge game this court adjudicates
     ///         for. The zero address is refused — an unwired court can
-    ///         `refer` nothing.
+    ///         `refer` nothing. Governs future referrals only: a case already
+    ///         `Voting` or `Resolved` keeps the `game` it was referred under
+    ///         (`Case.game`), so re-wiring here never redirects a live case's
+    ///         `finalize` to a different game.
     function setChallengeGame(address newGame) external;
     /// @notice Wire (or re-wire) the electorate source. The zero address is
     ///         refused — an unwired court has no vote weight to read.

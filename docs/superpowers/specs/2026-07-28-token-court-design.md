@@ -109,6 +109,7 @@ the §4 court custody invariant (now vacuous: balance is 0 save donations).
 enum Phase { None, Voting, Resolved }
 struct Case {
     uint256 challengeId;
+    address game;            // pinned IChallengeGame this case rules on, written once in refer
     uint256 snapshotTs;      // executedAt - 1, written once
     uint256 referredAt;
     uint256 voteWindowAtReferral; // pinned (F5 lesson): owner cannot move a live case's clock
@@ -138,8 +139,8 @@ Requires, in order:
    challenge's own timeout never opens. `FINALIZE_BUFFER = 1 days` (constant):
    the grace period for someone to call `finalize` after the window closes.
 
-Effects: create case (`Phase.Voting`), store snapshot, pin `voteWindow`, record
-accused set + weight. Emits `CaseReferred`.
+Effects: create case (`Phase.Voting`), pin the referring `game` address, store
+snapshot, pin `voteWindow`, record accused set + weight. Emits `CaseReferred`.
 
 **Auto-referral:** `ChallengeGame.dispute`'s pool-completing branch calls
 `court.refer(challengeId)` in a try/catch after its own state writes (CEI
@@ -164,15 +165,35 @@ fail-safe governs).
   - else `guilty > notGuilty` → **Guilty**; otherwise (tie) → **NotGuilty**.
     Fail-safe direction throughout: no slash without established ground truth.
 - Write verdict + `Phase.Resolved` **before** the external call, then
-  `try game.rule(challengeId, verdict)` — on catch (challenge already terminal:
-  the timeout fired during the finalize buffer, or the game was re-pointed) emit
-  `ChallengeAlreadyTerminal(caseId, challengeId)` and return normally. The case
-  is closed either way and, because the court holds no WOOD, a missed `rule` is
-  bookkeeping, not stranded funds (review finding E1's fix, made structural).
+  `try IChallengeGame(case.game).rule(challengeId, verdict)` — against the
+  case's **pinned** `game`, never the live `challengeGame` (a re-wire between
+  `refer` and `finalize` must not redirect an in-flight case's verdict to a
+  different game instance).
+- The catch is **selector-filtered, not bare**. Only two reverts mean "nothing
+  left to rule" and are swallowed, emitting `ChallengeAlreadyTerminal(caseId,
+  challengeId)`: `WrongStatus` (the challenge went terminal on its own clock
+  during the finalize buffer — the E1 race) and `NotCourt` (the game's `court`
+  was re-pointed away before the call landed). **Every other revert bubbles**
+  out of `finalize` whole, reverting the state writes above and leaving the
+  case `Voting` for an honest retry. This is load-bearing, not cosmetic: a bare
+  catch turns `IStakedWood.slashToEscrow`'s own `InsufficientSlashGas` gas
+  floor into a verdict-burning primitive — anyone (profitably, the accused)
+  could call `finalize` under-gassed so the child `rule`→`slashToEscrow` call
+  starves and reverts while the parent still has gas to spare, writing
+  `Resolved` and dropping a `Guilty` verdict permanently, with the challenge
+  later timing out to acquit the accused and pay them the challenger's bond.
+  Filtering by selector closes that: an under-gassed or otherwise transient
+  failure never resolves the case, only `WrongStatus`/`NotCourt` do. The case
+  is closed either way it legitimately can be, and because the court holds no
+  WOOD, a swallowed `WrongStatus`/`NotCourt` is bookkeeping, not stranded
+  funds (review finding E1's fix, made structural).
 
 ### Owner surface (all `onlyOwner`, all bounded)
 
 - `setChallengeGame(addr != 0)`, `setStakedWood(addr != 0)` — wiring.
+  `setChallengeGame` governs future referrals only: a case already `Voting` or
+  `Resolved` keeps the `game` it was referred under (`Case.game`), so
+  re-wiring never redirects a live case's `finalize` to a different game.
 - `setVoteWindow(0 < w ≤ MAX_VOTE_WINDOW = 14 days)` — governs future
   referrals only (pinned per case).
 - `setParticipationFloorBps(0 < bps ≤ 10_000)`.
@@ -268,6 +289,14 @@ New:
 - **Both orderings of the timeout race** (the E1 lesson): court finalizes then
   `resolve` reverts `WrongStatus`; `resolve` fires during the buffer then
   `finalize` closes the case via catch with `ChallengeAlreadyTerminal`.
+- **`NotCourt` is swallowed identically to `WrongStatus`** (the game's `court`
+  re-pointed away before `rule` landed) — case closes, `ChallengeAlreadyTerminal`.
+- **The selector filter is not a bare catch**: an under-gassed `finalize` call
+  that trips `rule`'s own `InsufficientSlashGas` floor must revert the whole
+  `finalize` and leave the case `Voting` (regression test for the
+  verdict-burning PoC), and a plain transient revert (any selector other than
+  `WrongStatus`/`NotCourt`) must do the same — both then succeed on a retry
+  once the condition clears.
 - Pause: `file` refused while paused; `dispute`/`resolve`/`rule`/claims run on
   a pre-pause challenge.
 - Custody: court WOOD balance is 0 across every arc (donation-only tolerance).
