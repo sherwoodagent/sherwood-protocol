@@ -117,6 +117,7 @@ contract TokenCourtEndToEndTest is Test {
     address public g1 = makeAddr("guardian1"); // the covering approver -- the court's sole accused
     address public g2 = makeAddr("guardian2"); // non-accused voter
     address public g3 = makeAddr("guardian3"); // non-accused voter
+    address public g4 = makeAddr("guardian4"); // stakes AFTER execution -- must carry zero weight at the snapshot
 
     address public lp1 = makeAddr("lp1"); // keeps the escrow's pre-drain snapshot non-empty
 
@@ -380,10 +381,18 @@ contract TokenCourtEndToEndTest is Test {
         vm.warp(c.referredAt + c.voteWindowAtReferral + 1);
     }
 
-    /// @dev The bps g1 is actually priced at by the REAL ledger right now --
-    ///      read live rather than hardcoded, so the assertions that use it
-    ///      check the real contract's arithmetic instead of a guess frozen at
-    ///      write time.
+    /// @dev The bps g1 is actually priced at by the REAL ledger right now.
+    ///      THIS IS A CROSS-CHECK, NOT A SUBSTITUTE for a pinned literal: arc 1
+    ///      also asserts `expectedBps == 6667` directly, and THAT literal is
+    ///      what catches a wrong rate (a mutated `slashBpsFor` that, say,
+    ///      halves its output would still satisfy every assertion phrased only
+    ///      in terms of this helper's own live return value -- reading the
+    ///      answer from the same function under test proves nothing about
+    ///      whether that answer is correct). The live read's job is narrower:
+    ///      it keeps the literal in step with the fixture if the coverage or
+    ///      the haircut price ever changes, so this helper and the pinned
+    ///      constant are re-derived from the same real contract call rather
+    ///      than drifting apart silently.
     function _g1SlashBpsFor(uint256 pid) internal view returns (uint256) {
         (address[] memory approvers, uint256[] memory bps) = ledger.slashBpsFor(address(gov), pid);
         for (uint256 i = 0; i < approvers.length; i++) {
@@ -405,9 +414,21 @@ contract TokenCourtEndToEndTest is Test {
     ///         of that call is a mock.
     function test_arc_guiltyVerdict_slashesAndPaysChallenger() public {
         uint256 pid = _proposeApproveExecute();
+        // g4 stakes AFTER the proposal already executed -- on the far side of
+        // the instant `snapshotTs` (`executedAt - 1`) pins the electorate to.
+        _stakeGuardian(g4, FILLER_STAKE, 4);
         uint256 challengerBalBefore = wood.balanceOf(challenger);
         uint256 expectedBps = _g1SlashBpsFor(pid);
-        assertGt(expectedBps, 0, "g1 is genuinely on the hook for this proposal");
+        // PINNED LITERAL (not derived from the same function under test): g1
+        // committed $1,000 of coverage against $1,500 of slashable bond
+        // ($0.05 x 30,000 WOOD), so its liability prices at
+        // ceil(1_000 * 10_000 / 1_500) = 6,667 bps. This is what actually
+        // catches a wrong rate -- a mutated `slashBpsFor` that returns a
+        // different number fails HERE, not only downstream where it would
+        // otherwise agree with itself.
+        assertEq(
+            expectedBps, 6667, "$1,000 of coverage against $1,500 of slashable bond ($0.05 x 30,000 WOOD), rounded up"
+        );
 
         vm.prank(challenger);
         uint256 cid = game.file(
@@ -423,6 +444,19 @@ contract TokenCourtEndToEndTest is Test {
         uint256 caseId = court.caseOfChallenge(cid);
         assertTrue(caseId != 0, "the pool-completing auto-referral landed a real case");
         assertEq(uint256(court.caseOf(caseId).phase), uint256(ITokenCourt.Phase.Voting));
+
+        // D2, proven on the real stack rather than only against
+        // MockStakedWood (see TokenCourt.t.sol): g4's stake exists only AFTER
+        // `executedAt`, strictly after the pinned `snapshotTs` -- so it must
+        // carry zero weight and must not be able to vote at all.
+        assertEq(
+            swood.getPastVotes(g4, court.caseOf(caseId).snapshotTs),
+            0,
+            "stake acquired after the drain carries no weight"
+        );
+        vm.prank(g4);
+        vm.expectRevert(ITokenCourt.NoVotingPower.selector);
+        court.vote(caseId, true);
 
         vm.prank(g2);
         court.vote(caseId, true); // guilty; g2 alone clears the participation floor
@@ -460,11 +494,33 @@ contract TokenCourtEndToEndTest is Test {
 
     /// @notice The mirror of arc 1: the electorate acquits, so the court's
     ///         `NotGuilty` ruling routes into the SAME path the game's own
-    ///         `disputeTimeout` takes (`_fail`) -- the challenger's bond
-    ///         forfeits pro-rata to whoever actually funded the defence (PR
-    ///         #50's contribution-keyed split, not a coverage-share split), and
-    ///         the accused is never touched: an acquittal, real or by timeout,
-    ///         leaves no mark.
+    ///         `disputeTimeout` takes (`_fail`) -- the challenger's bond is
+    ///         forfeited, the burn slice is taken off the top at the pinned
+    ///         rate, and the remainder reaches the funder that actually bought
+    ///         the defence through the real pull-payment accounting
+    ///         (`claimableContribution`/`claimContribution`). The accused is
+    ///         never touched: an acquittal, real or by timeout, leaves no mark.
+    /// @dev    WHAT THIS ARC DOES NOT PROVE: contribution-keyed splitting
+    ///         (PR #50 -- forfeit follows what each accused approver actually
+    ///         paid into the pool, not its coverage share) is untestable here,
+    ///         because this fixture's court electorate design makes g1 the
+    ///         SOLE approver of the challenged proposal, so it is necessarily
+    ///         also the sole possible contributor: its contribution share and
+    ///         its coverage share are numerically identical, and no amount of
+    ///         arithmetic on a single-contributor pool can tell the two keying
+    ///         schemes apart. Restructuring this fixture to add a second
+    ///         approver would collide with the court's own electorate design
+    ///         (a second approver is also an accused non-voter, which changes
+    ///         `accusedWeight` and the participation floor arc 1/3 depend on),
+    ///         so this arc instead proves what IS available on the real stack
+    ///         -- the forfeit reaches the real funder through the real pull
+    ///         path, at the pinned burn rate, and the accounting balances to
+    ///         the wei -- and leaves the free-rider/sybil-split distinction to
+    ///         `test/ChallengeGame.t.sol`'s `test_resolve_forfeitIsProRataToContributionAndLeavesNoDust`,
+    ///         `test_resolve_honestSoleDefenderKeepsEightyPercentOfTheForfeit`,
+    ///         `test_selfChallenge_roundTripCostsExactlyTheBurn` and
+    ///         `test_selfChallenge_twoAddressOperatorPaysTheSameBurn`, which
+    ///         exercise multi-contributor pools directly against the game.
     function test_arc_notGuilty_forfeitsToDefenders() public {
         uint256 pid = _proposeApproveExecute();
         uint256 challengerBalBefore = wood.balanceOf(challenger);
@@ -498,8 +554,12 @@ contract TokenCourtEndToEndTest is Test {
         // ── g1 funded the whole pool alone, so `claimContribution` gives it
         //    its stake back plus its whole (burn-adjusted) pro-rata slice.
         IChallengeGame.Challenge memory c = game.challengeOf(cid);
+        // PINNED, not merely "greater than zero": at the default 20%
+        // `forfeitBurnBps`, g1's payout is exactly 80% of the bond. A
+        // zeroed-out burn rate would still clear `assertGt(..., 0)`, so the
+        // literal is what actually pins the rate rather than merely its sign.
+        assertEq(c.forfeitPayoutWood, (CHALLENGER_BOND * 8_000) / 10_000, "80% of the bond, net of the 20% burn");
         uint256 expectedClaim = c.counterBondWood + c.forfeitPayoutWood;
-        assertGt(c.forfeitPayoutWood, 0, "there really was a forfeit to split");
         assertEq(game.claimableContribution(cid, g1), expectedClaim);
         uint256 g1BalBeforeClaim = wood.balanceOf(g1);
         vm.prank(g1);
@@ -653,7 +713,15 @@ contract TokenCourtEndToEndTest is Test {
         vm.prank(g1);
         game.dispute(cidB, type(uint256).max); // pool completes; no auto-referral while court == 0
 
-        uint256 lastLegal = filedAtB + game.disputeTimeout() - court.voteWindow() - court.FINALIZE_BUFFER();
+        // THE PIN, NOT THE LIVE PARAMETER: this arc's whole point is that the
+        // challenge's own `disputeTimeoutAtFiling` -- not whatever
+        // `game.disputeTimeout()` happens to read at the time -- is the clock
+        // that ultimately wins the race below. Reading the live parameter here
+        // would still pass today (nothing re-points it mid-arc), but it would
+        // silently stop meaning what this comment says the moment that
+        // stopped being true.
+        uint256 disputeTimeoutAtFilingB = game.challengeOf(cidB).disputeTimeoutAtFiling;
+        uint256 lastLegal = filedAtB + disputeTimeoutAtFilingB - court.voteWindow() - court.FINALIZE_BUFFER();
         vm.warp(lastLegal);
         vm.prank(owner);
         game.setCourt(address(court)); // re-wire just before the manual referral
@@ -663,7 +731,7 @@ contract TokenCourtEndToEndTest is Test {
         vm.prank(g3);
         court.vote(caseIdB, true); // the tally is moot -- the timeout wins this race regardless
 
-        vm.warp(filedAtB + game.disputeTimeout()); // exactly the challenge's own timeout
+        vm.warp(filedAtB + disputeTimeoutAtFilingB); // exactly the challenge's own (pinned) timeout
         game.resolve(cidB); // Disputed, clock elapsed -> _fail
         assertEq(uint256(game.challengeOf(cidB).status), uint256(IChallengeGame.Status.Failed), "timeout won the race");
 
