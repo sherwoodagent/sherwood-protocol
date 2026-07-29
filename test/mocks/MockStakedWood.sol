@@ -38,6 +38,10 @@ contract MockStakedWood is IStakedWood {
     uint256 public minSlashBps;
     uint256 public maxSlashBps;
     uint256 public coolDownPeriod;
+    /// @dev Mirrors the real `StakedWood.MAX_CONVICTION_BOUNTY_BPS` value.
+    ///      `slashToEscrow` is not modeled by this mock (see below), so this
+    ///      exists only so `IStakedWood`-typed callers can read it.
+    uint256 public constant MAX_CONVICTION_BOUNTY_BPS = 2_000;
 
     // ── Recorded mutation args (for assertions) ──
     uint256 public slashGuardiansCallCount;

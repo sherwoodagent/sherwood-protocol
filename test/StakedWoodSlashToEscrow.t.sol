@@ -747,16 +747,16 @@ contract StakedWoodSlashToEscrowTest is Test {
         );
     }
 
-    /// @notice Mutation kill: moving the bounty transfer to AFTER the
-    ///         try/catch would let it survive a RECOVERABLE `openCase` revert
-    ///         (a fixable caller/wiring mistake that must bubble whole, per
-    ///         `_isRecoverableOpenCaseFailure`) instead of unwinding with the
-    ///         rest of the transaction. `EmptySnapshot` is exactly that: the
-    ///         vault's votes read succeeds and returns a real (non-zero)
-    ///         supply at `openedAt`, but the earlier `snapshotTimestamp` this
-    ///         call names was never given a supply in the fixture, so it
-    ///         reads zero — a caller arithmetic error, not a vault-capability
-    ///         one, so it bubbles rather than burning.
+    /// @notice On a RECOVERABLE `openCase` failure (a fixable caller/wiring
+    ///         mistake that must bubble whole, per
+    ///         `_isRecoverableOpenCaseFailure`) the entire call reverts, so
+    ///         the bounty transfer unwinds with the rest of the transaction
+    ///         and the challenger is left with nothing. `EmptySnapshot` is
+    ///         exactly that: the vault's votes read succeeds and returns a
+    ///         real (non-zero) supply at `openedAt`, but the earlier
+    ///         `snapshotTimestamp` this call names was never given a supply
+    ///         in the fixture, so it reads zero — a caller arithmetic error,
+    ///         not a vault-capability one, so it bubbles rather than burning.
     function test_slashToEscrow_recoverableFailureBubblesAndUnwindsTheBounty() public {
         vault.setTotal(openedAt, 1_000e18);
         vault.setVotes(alice, openedAt, 1_000e18);

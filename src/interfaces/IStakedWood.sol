@@ -223,21 +223,27 @@ interface IStakedWood {
     ///         the bounty first costs them nothing; it comes out of what would
     ///         otherwise simply burn.
     ///
-    ///         `bountyBps` IS NOT TRUSTED FROM THE CALLER. sWOOD clamps it to
-    ///         `[0, MAX_CONVICTION_BOUNTY_BPS]` itself (`InvalidParameter`
-    ///         above that, including any value `>= 10_000`) — the same
-    ///         treatment `slashBpsPer` gets against `[minSlashBps,
-    ///         maxSlashBps]`. `ChallengeGame` also pins its own rate to this
-    ///         range at filing, but that bound lives in the CALLER; sWOOD is
-    ///         the contract that actually moves the WOOD, so a compromised or
-    ///         buggy slasher can divert at most `MAX_CONVICTION_BOUNTY_BPS` of
-    ///         any one slash to a caller-named `bountyTo` — the remainder can
-    ///         still only ever reach the owner-set `compensationEscrow` or the
-    ///         burn address, never an arbitrary destination of the slasher's
-    ///         own choosing.
+    ///         `bountyBps` IS NOT TRUSTED FROM THE CALLER. sWOOD rejects it
+    ///         outside `[0, MAX_CONVICTION_BOUNTY_BPS]` itself
+    ///         (`InvalidParameter`, including any value `>= 10_000`) — the
+    ///         same MOTIVATION as re-checking `slashBpsPer` against
+    ///         `[minSlashBps, maxSlashBps]` rather than trusting it from
+    ///         `ExposureLedger`, though the MECHANISM differs: `slashBpsPer`
+    ///         is silently clamped, `bountyBps` reverts. `ChallengeGame` also
+    ///         pins its own rate to this range at filing, but that bound
+    ///         lives in the CALLER; sWOOD is the contract that actually moves
+    ///         the WOOD, so a compromised or buggy slasher can divert at most
+    ///         `MAX_CONVICTION_BOUNTY_BPS` of any ONE CALL's slash to a
+    ///         caller-named `bountyTo` — that call's remainder can still only
+    ///         ever reach the owner-set `compensationEscrow` or the burn
+    ///         address, never an arbitrary destination of the slasher's own
+    ///         choosing. PER CALL, NOT PER GUARDIAN: `verdictSlashed` keys on
+    ///         a caller-chosen `caseKey`, so repeated verdicts against the
+    ///         same approver under fresh case keys compound.
     /// @param  bountyTo   Recipient of the conviction bounty, or `address(0)`.
-    /// @param  bountyBps  Slice of the recovered total, in bps. Clamped to
-    ///                     `[0, MAX_CONVICTION_BOUNTY_BPS]` by sWOOD itself.
+    /// @param  bountyBps  Slice of the recovered total, in bps. Rejected
+    ///                     outside `[0, MAX_CONVICTION_BOUNTY_BPS]` by sWOOD
+    ///                     itself (reverts, not silently clamped down).
     /// @return total  WOOD routed to the escrow across all approvers, NET of
     ///                the conviction bounty. `VerdictSlashRouted` and
     ///                `VerdictSlashUncompensated` both report this NET figure.
@@ -252,6 +258,12 @@ interface IStakedWood {
         address bountyTo,
         uint256 bountyBps
     ) external returns (uint256 total, uint256 caseId);
+
+    /// @notice The authoritative ceiling on `slashToEscrow`'s `bountyBps` —
+    ///         read this rather than restating the literal bps value
+    ///         elsewhere (e.g. in `ChallengeGame`), so a caller's own clamp
+    ///         and sWOOD's enforced one cannot silently drift apart.
+    function MAX_CONVICTION_BOUNTY_BPS() external view returns (uint256);
 
     function setAuthorizedSlasher(address slasher) external;
     function authorizedSlasher() external view returns (address);

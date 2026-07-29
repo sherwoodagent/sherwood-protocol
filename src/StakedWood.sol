@@ -472,12 +472,16 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///      caller-named, because it is the challenger who caused THIS
     ///      conviction, a fact sWOOD has no way to know on its own. What stays
     ///      true, and is the actual guarantee: a compromised `authorizedSlasher`
-    ///      can divert AT MOST `MAX_CONVICTION_BOUNTY_BPS` of any one slash to
-    ///      a caller-named address; the remainder can only ever reach this
-    ///      owner-set escrow or, on the burn fallback, `BURN_ADDRESS` — never
-    ///      an arbitrary destination of the slasher's own choosing. The bound
-    ///      on the bounty channel is what makes that remainder-side guarantee
-    ///      still hold; see `MAX_CONVICTION_BOUNTY_BPS`.
+    ///      can divert AT MOST `MAX_CONVICTION_BOUNTY_BPS` of any ONE CALL to
+    ///      a caller-named address; the remainder of that call can only ever
+    ///      reach this owner-set escrow or, on the burn fallback,
+    ///      `BURN_ADDRESS` — never an arbitrary destination of the slasher's
+    ///      own choosing. PER CALL, NOT PER GUARDIAN: `_verdictSlashed` is
+    ///      keyed by a caller-chosen `caseKey`, so repeated verdicts against
+    ///      the same approver under fresh case keys compound — nothing bounds
+    ///      the number of times a slasher can convict one guardian across
+    ///      separate calls, only what fraction of any single one it can
+    ///      redirect. See `MAX_CONVICTION_BOUNTY_BPS`.
     address public compensationEscrow;
 
     /// @dev One slash per (verdict, approver) — the persistent half of the
@@ -528,16 +532,23 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     /// @notice Ceiling on `slashToEscrow`'s `bountyBps` (spec 2026-07-29 §2:
     ///         "bounded [0, 2_000]").
     /// @dev ENFORCED HERE, NOT ONLY IN THE CALLER. `ChallengeGame` pins its own
-    ///      `convictionBountyBps` to this same range at filing, but sWOOD is
-    ///      the contract that actually moves the WOOD — the same reason
-    ///      `slashBpsPer` is re-clamped to `[minSlashBps, maxSlashBps]` here
-    ///      instead of trusted from `ExposureLedger.slashBpsFor`. A compromised
-    ///      or simply buggy `authorizedSlasher` must not be able to name an
-    ///      arbitrary `bountyBps` and route the whole slash to a caller-chosen
-    ///      address; capping it here means the WORST a bad slasher can do
-    ///      through this parameter is redirect `MAX_CONVICTION_BOUNTY_BPS` of
-    ///      any one slash — the rest still lands only in the honest escrow or
-    ///      the burn address, never at the slasher's discretion.
+    ///      `convictionBountyBps` to this same range at filing, but that bound
+    ///      lives in the CALLER, and sWOOD is the contract that actually moves
+    ///      the WOOD — the same motivation that has sWOOD re-check
+    ///      `slashBpsPer` against `[minSlashBps, maxSlashBps]` rather than
+    ///      trusting `ExposureLedger.slashBpsFor`'s own bound. The MECHANISM
+    ///      differs, though: `slashBpsPer` is silently CLAMPED
+    ///      (`Math.min`/`Math.max`), while an out-of-range `bountyBps` here
+    ///      REVERTS. A compromised or simply buggy `authorizedSlasher` must
+    ///      not be able to name an arbitrary `bountyBps` and route the whole
+    ///      slash to a caller-chosen address; capping it here means the WORST
+    ///      a bad slasher can do through this parameter, IN ANY ONE CALL, is
+    ///      redirect `MAX_CONVICTION_BOUNTY_BPS` of that call's slash — the
+    ///      rest of that call still lands only in the honest escrow or the
+    ///      burn address, never at the slasher's discretion. This is a PER-
+    ///      CALL bound, not a per-guardian one: `_verdictSlashed` keys on a
+    ///      caller-chosen `caseKey`, so nothing stops repeated verdicts against
+    ///      the same approver under fresh case keys from compounding.
     uint256 public constant MAX_CONVICTION_BOUNTY_BPS = 2_000;
 
     /// @notice Grouped `initialize` arguments. A struct keeps the call site
@@ -1331,12 +1342,13 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///        plain UUPS upgrade.
     /// @param bountyBps Slice of the recovered total paid to `bountyTo`, in
     ///        bps. `0` disables the bounty even with a non-zero `bountyTo`.
-    ///        Clamped to `[0, MAX_CONVICTION_BOUNTY_BPS]` — NOT trusted from
-    ///        the caller, for the same reason `slashBpsPer` is re-clamped here
-    ///        rather than trusted from `ExposureLedger`: `ChallengeGame` pins
-    ///        its own rate to this range at filing, but sWOOD is the contract
-    ///        that actually moves the WOOD, so it enforces its own ceiling
-    ///        rather than relying on the caller's. Anything above
+    ///        Rejected outside `[0, MAX_CONVICTION_BOUNTY_BPS]` (reverts, not
+    ///        silently clamped down) — NOT trusted from the caller, for the
+    ///        same motivation sWOOD re-checks `slashBpsPer` rather than
+    ///        trusting `ExposureLedger`'s bound: `ChallengeGame`
+    ///        pins its own rate to this range at filing, but sWOOD is the
+    ///        contract that actually moves the WOOD, so it enforces its own
+    ///        ceiling rather than relying on the caller's. Anything above
     ///        `MAX_CONVICTION_BOUNTY_BPS` (in particular any value `>= 10_000`,
     ///        which would otherwise be able to route the ENTIRE slash to
     ///        `bountyTo`) reverts `InvalidParameter`.
@@ -1362,17 +1374,22 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
         // so a mismatch is a caller bug, not something to absorb.
         if (slashBpsPer.length != approvers.length) revert SlashBpsLengthMismatch();
         // BOUNTY RATE IS NOT TRUSTED FROM THE CALLER (2026-07-29 review). Same
-        // reasoning as clamping `slashBpsPer` below to `[minSlashBps,
+        // motivation as re-checking `slashBpsPer` below against `[minSlashBps,
         // maxSlashBps]` instead of trusting `ExposureLedger`: `ChallengeGame`
         // pins `convictionBountyBps` to `[0, 2_000]` at filing, but that bound
-        // lives in the CALLER. Left unchecked here, a compromised or buggy
-        // `authorizedSlasher` could pass `bountyBps` up to just under 10_000
-        // and route almost the entire slash to a `bountyTo` of its own
-        // choosing — the exact one-address-of-its-own-choosing outcome
-        // `compensationEscrow`'s natspec says sWOOD does not allow. Enforcing
-        // the ceiling here, unconditionally (even when `bountyTo == address(0)`
-        // and the rate would never be spent), keeps that guarantee true
-        // regardless of what the caller does.
+        // lives in the CALLER. The mechanism differs — `slashBpsPer` is
+        // silently clamped, this reverts — because a bad payout ADDRESS
+        // should never be laundered into a smaller-but-still-caller-chosen
+        // one. Left unchecked here, a compromised or buggy `authorizedSlasher`
+        // could pass `bountyBps` up to just under 10_000 and route almost the
+        // entire slash to a `bountyTo` of its own choosing — the exact one-
+        // address-of-its-own-choosing outcome `compensationEscrow`'s natspec
+        // says sWOOD does not allow. Enforcing the ceiling here,
+        // unconditionally (even when `bountyTo == address(0)` and the rate
+        // would never be spent), keeps that guarantee true regardless of what
+        // the caller does. PER CALL, NOT PER GUARDIAN: `_verdictSlashed` keys
+        // on a caller-chosen `caseKey`, so this bounds one call's diversion,
+        // not what repeated verdicts under fresh case keys can compound to.
         if (bountyBps > MAX_CONVICTION_BOUNTY_BPS) revert InvalidParameter();
         // FACTORY MEMBERSHIP (PR #24 round-4 N-4). The escrow apportions against
         // `vault`'s ERC20Votes checkpoints, and the F-A analysis of
