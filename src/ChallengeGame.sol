@@ -1121,45 +1121,61 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             // that is paying attention forfeits the whole bond on `NotGuilty`.
             // That is why the bounty is safe here at any size, and why no
             // anti-abuse bound is needed - PROVIDED the pool that bought the
-            // escalation was actually funded by someone ELSE (see `contested`
-            // below; PR review 2026-07-29 IMPORTANT-1).
+            // escalation was actually funded by one of the ACCUSED (see
+            // `contested` below; PR review 2026-07-29 IMPORTANT-1).
             //
-            // CONTESTED, NOT MERELY ESCALATED. PR #50 made pool contribution
-            // permissionless, so the challenger itself can `file` then
-            // `dispute(id, type(uint256).max)` in the same flow, filling the
-            // pool with its OWN money (clamped to `bondWood`, which locks the
-            // real accused out of the only slot the pool has left). On
-            // `Guilty` that self-funded pool would still read `escalated`, and
-            // the challenger would recover bond + pool - both amounts it
-            // itself posted - PLUS the bounty, while a `NotGuilty` ruling
-            // would only cost it `forfeitBurnBps` of the bond, not the whole
-            // bond. That drops a liar's downside 5x versus never disputing at
-            // all and makes self-disputing strictly dominant even for an
-            // honest filer, which is exactly the round trip `forfeitBurnBps`
-            // was calibrated to make lossy - before this bounty gave it a
-            // revenue branch it dodges by construction, since the self-funded
-            // pool was never contested on the merits by anyone else.
+            // A CONTEST IS A DEFENCE THE ACCUSED ACTUALLY BOUGHT (spec 2026-07-29
+            // §2). `status == Disputed` only says SOMEBODY completed the pool,
+            // and PR #50 opened that to anyone - so a challenger can stage a
+            // contest from a second address it controls, recover its own pool
+            // on a `Guilty` ruling, and collect the bounty for a fight nobody
+            // had. Asking "was the funder the challenger?" is unanswerable:
+            // addresses are free, and a same-wallet check is defeated by a
+            // second one. Asking "was the funder one of the ACCUSED?" is not -
+            // the accused set is the ledger's approver list for this exact
+            // proposal (`approvers`, already in memory from
+            // `_accusedWithRates` above), so faking membership means staking
+            // WOOD and recording an approval on the very proposal you are
+            // about to accuse, joining the cohort your own conviction slashes.
+            // That converts an unenforceable identity predicate into a
+            // verifiable ROLE predicate, and it is what prices the sybil.
             //
-            // So the bounty pays only when `escalated` AND the challenger did
-            // NOT fund its own counter-bond: `_contributed[challengeId][c.
-            // challenger] == 0` is the existing per-contributor ledger,
-            // already keyed on this exact challenge and address, so the check
-            // is an O(1) read of state `dispute` already maintains - no new
-            // storage. The PAYOUT branch below stays keyed on `escalated`
-            // alone: a self-disputed win still returns the challenger's own
-            // bond and pool (nothing new happens there), this only closes the
+            // ACCEPTED FALSE NEGATIVE: a third party who funds a defence
+            // because it believes the accused innocent still forces
+            // adjudication - `dispute`'s open standing is untouched - but a
+            // `Guilty` ruling it provoked pays the challenger no bounty.
+            // Narrowing what EARNS the bounty, never what is allowed to
+            // happen.
+            //
+            // BOUNDED, NOT UNBOUNDED: the scan below runs over `approvers`,
+            // already capped at the accused-set size (100) and already looped
+            // under the gas floor checked just above (`SLASH_GAS_PER_APPROVER`
+            // per approver) - no new unbounded work.
+            //
+            // REENTRANCY NOTE (reviewer Minor): this reads `_contributed`
+            // AFTER `c.status = Status.Settled` and after `_releaseFreeze`'s
+            // external call into `exposureLedger.unfreezeCoverage`. That is
+            // safe today only because `claimableContribution` returns 0 for a
+            // `Settled` challenge whose pool is complete (`c.counterBondWood
+            // == c.bondWood`, the exact case reachable here), so nothing a
+            // re-entrant ledger could trigger can zero `_contributed` before
+            // this scan reads it. A future change to that view's Settled
+            // branch would silently reopen the bounty to a since-refunded
+            // "contributor".
+            //
+            // The PAYOUT branch below stays keyed on `escalated` alone: a
+            // self- or sybil-disputed win still returns the challenger's own
+            // bond and pool (nothing new happens there) - this only closes the
             // BOUNTY channel on top of it.
-            //
-            // WHAT THIS DOES NOT CLOSE: a SYBIL-funded pool - a second address
-            // the challenger controls, funding the pool instead of the
-            // challenger's own `msg.sender` - still reads `contested == true`
-            // here, because `_contributed` is keyed per-address and this
-            // contract cannot see through an off-chain identity link. That
-            // residual is the same one `forfeitBurnBps`'s own natspec already
-            // concedes for the two-address round trip ("this design has
-            // already conceded it cannot police identity") and is recorded in
-            // spec §2, not newly introduced by this gate.
-            bool contested = escalated && _contributed[challengeId][c.challenger] == 0;
+            bool contested;
+            if (escalated) {
+                for (uint256 i = 0; i < approvers.length; ++i) {
+                    if (_contributed[challengeId][approvers[i]] != 0) {
+                        contested = true;
+                        break;
+                    }
+                }
+            }
             (slashedWood, caseId) = swood.slashToEscrow(
                 key,
                 c.executedAt,

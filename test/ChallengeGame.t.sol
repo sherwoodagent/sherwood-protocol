@@ -2962,6 +2962,14 @@ contract ChallengeGameTest is Test {
     ///         the challenger's net position is NOT profitable — it recovers
     ///         exactly what it put in (its filing bond, plus the pool it funded
     ///         itself), nothing more.
+    /// @dev Updated for the approver-membership gate (PR review 2026-07-29,
+    ///      option 1): the challenger is blocked here not because the funder
+    ///      literally equals `c.challenger` (that identity check is exactly
+    ///      what a sybil defeats — see
+    ///      `test_convictionBounty_notPaidWhenASybilFundsThePool` below) but
+    ///      because the funder is not one of the ACCUSED approvers
+    ///      (guardianA/guardianB in this fixture): nobody who could be slashed
+    ///      by this conviction bought the defence, so nothing was contested.
     function test_selfChallenge_guiltyRulingOnASelfFundedPoolPaysNoBounty() public {
         uint256 challengerBefore = wood.balanceOf(challenger);
 
@@ -2978,7 +2986,7 @@ contract ChallengeGameTest is Test {
         vm.prank(court);
         game.rule(id, IChallengeGame.Verdict.Guilty);
 
-        // NO BOUNTY: `contested` is false because the challenger funded its own pool.
+        // NO BOUNTY: the challenger is not one of the accused approvers.
         assertEq(swood.lastBountyTo(), address(0), "self-funded pool: no bounty recipient");
         assertEq(swood.lastBountyBps(), 0, "self-funded pool: no bounty rate");
 
@@ -2991,6 +2999,64 @@ contract ChallengeGameTest is Test {
             "self-funded guilty ruling nets exactly zero - no bounty profit on top"
         );
         _assertLiveBondsBacked();
+    }
+
+    /// @notice THE SYBIL SHAPE THIS GATE EXISTS FOR (PR review 2026-07-29
+    ///         IMPORTANT-1, option 1): a second address the challenger
+    ///         controls — distinct from `c.challenger`, never staked, never an
+    ///         approver of anything — funds the pool instead of the challenger
+    ///         funding it directly. A same-wallet check
+    ///         (`_contributed[id][c.challenger] == 0`) reads this as a genuine
+    ///         contest, because the funder literally is not `c.challenger`, and
+    ///         would pay the bounty for a fight nobody had. The
+    ///         approver-membership gate does not ask WHOSE wallet funded the
+    ///         pool at all; it asks whether the funder is one of the ACCUSED —
+    ///         and a fresh address with no stake and no recorded approval on
+    ///         this proposal is not, no matter which EOA happens to control it.
+    function test_convictionBounty_notPaidWhenASybilFundsThePool() public {
+        address sybil = makeAddr("sybilFunder");
+        _fund(sybil);
+
+        uint256 id = _fileStandard(PROPOSAL);
+        uint256 bond = game.challengeOf(id).bondWood;
+
+        // A DISTINCT address — not the challenger, not an accused approver —
+        // funds the whole counter-bond.
+        vm.prank(sybil);
+        game.dispute(id, type(uint256).max);
+        assertEq(game.counterBondContributionOf(id, sybil), bond, "the sybil funded 100% of the pool");
+        assertEq(uint256(game.challengeOf(id).status), uint256(IChallengeGame.Status.Disputed), "forced to Disputed");
+
+        vm.prank(court);
+        game.rule(id, IChallengeGame.Verdict.Guilty);
+
+        // NO BOUNTY: the funder (the sybil address) is not one of the accused
+        // approvers, so `contested` stays false even though the funder is not
+        // literally `c.challenger` either.
+        assertEq(swood.lastBountyTo(), address(0), "sybil-funded pool: no bounty recipient");
+        assertEq(swood.lastBountyBps(), 0, "sybil-funded pool: no bounty rate");
+        _assertLiveBondsBacked();
+    }
+
+    /// @notice THE PROPERTY THE GATE MUST NOT BREAK: when an ACTUAL accused
+    ///         approver funds the counter-bond — guardianA here, via the
+    ///         standard `_fileAndDispute` fixture — a `Guilty` ruling still
+    ///         pays the bounty at the pinned rate. Without this, the
+    ///         membership scan could be stuck `false` from an unrelated bug
+    ///         (wrong array, off-by-one, wrong mapping) and every `notPaid*`
+    ///         test above would still pass for the wrong reason. Duplicates
+    ///         `test_convictionBounty_paidOnTheGuiltyRuling` in substance —
+    ///         named separately here to sit next to the negative cases as the
+    ///         fixture's positive control.
+    function test_convictionBounty_paidWhenAnAccusedApproverFundsThePool() public {
+        uint256 id = _fileAndDispute(); // guardianA, an accused approver, funds the pool
+        assertGt(game.counterBondContributionOf(id, guardianA), 0, "fixture sanity: guardianA is the funder");
+
+        vm.prank(court);
+        game.rule(id, IChallengeGame.Verdict.Guilty);
+
+        assertEq(swood.lastBountyTo(), challenger, "an approver-funded defence is a real contest: bounty paid");
+        assertEq(swood.lastBountyBps(), 500, "at the pinned rate");
     }
 
     function test_setConvictionBountyBps_boundsAndOwner() public {
