@@ -67,8 +67,19 @@ contract TCE2EAdapter {
 ///         auto-referral actually calls into a real `TokenCourt`, a real
 ///         `TokenCourt.finalize` actually calls back into a real
 ///         `ChallengeGame.rule`, and a real `StakedWood` supplies the votes on
-///         both sides of that call (aged weight for the electorate, raw stake
-///         for the slash). These five arcs are that proof.
+///         both sides of that call. These five arcs are that proof.
+/// @dev    WHAT THIS FILE DELIBERATELY DOES NOT PROVE: that the electorate is
+///         weighed on AGED stake while the accused sum uses RAW stake (review
+///         F17). `setUp` matures the whole cohort to par, so the two bases are
+///         numerically identical here and no assertion can separate them --
+///         swapping `getPastStake` for `getPastVotes` in `_recordAccused`
+///         survives every arc below. Separating them would need a partially
+///         matured accused plus turnout tuned into the narrow band between the
+///         two resulting floors, a knife-edge fixture that arcs 1-3 all depend
+///         on and would each have to be re-tuned around. It is left to
+///         `TokenCourt.t.sol`, where four tests kill that mutation against
+///         `MockStakedWood`. Recorded rather than chased, so the gap is a
+///         decision and not a discovery.
 /// @dev    Fixture arithmetic mirrors `ChallengeEndToEndTest` exactly -- same
 ///         proposal, same tier pricing, same coverage and bond sizing --
 ///         because reusing a proven fixture keeps this file about the
@@ -416,7 +427,19 @@ contract TokenCourtEndToEndTest is Test {
         uint256 pid = _proposeApproveExecute();
         // g4 stakes AFTER the proposal already executed -- on the far side of
         // the instant `snapshotTs` (`executedAt - 1`) pins the electorate to.
+        //
         _stakeGuardian(g4, FILLER_STAKE, 4);
+        // THE WARP IS LOAD-BEARING, and its POSITION is the whole point. g4
+        // stakes on the same second the proposal executed; the warp then
+        // separates that instant from the referral. That puts g4's stake
+        // BETWEEN the two candidate snapshots: `executedAt - 1` (correct --
+        // g4 is weightless) and `block.timestamp - 1` read at referral time
+        // (wrong -- g4 would count). Without the separation both formulas
+        // land on the same second, g4 reads as weightless under either, and
+        // the assertions below pass for the wrong reason -- verified by
+        // mutation: anchoring the snapshot at the referral survives this arc
+        // when the warp precedes the stake, and dies when it follows it.
+        vm.warp(vm.getBlockTimestamp() + 1 days);
         uint256 challengerBalBefore = wood.balanceOf(challenger);
         uint256 expectedBps = _g1SlashBpsFor(pid);
         // PINNED LITERAL (not derived from the same function under test): g1
