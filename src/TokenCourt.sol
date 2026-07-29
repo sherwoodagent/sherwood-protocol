@@ -451,11 +451,25 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///       `GuardianRegistry` walks on every approve/settle, which is capped
     ///       at `MAX_APPROVERS_PER_PROPOSAL = 100` (`GuardianRegistry.sol`).
     ///       So this loop is at most 100 iterations, each one `getPastStake`
-    ///       staticcall. FORWARD NOTE for Task 8: the auto-referral path runs
-    ///       `refer` (and this loop) inside `ChallengeGame.dispute`'s
-    ///       try/catch, so that call pays for up to ~100 `getPastStake`
-    ///       staticcalls in the worst case — size the try/catch's gas stipend
-    ///       for it.
+    ///       staticcall.
+    /// @dev  TASK 8 DECIDED THE OPPOSITE OF SIZING A STIPEND FOR THIS LOOP.
+    ///       The auto-referral path does run `refer` (and this loop) inside
+    ///       `ChallengeGame.dispute`'s try/catch, which pays for up to ~100
+    ///       `getPastStake` staticcalls in the worst case — but no gas floor
+    ///       fronts that call, deliberately. `dispute` is how the accused BUY
+    ///       their defence: a reverting `dispute` denies it outright and the
+    ///       accused is slashed by the silence verdict without ever reaching
+    ///       adjudication, which is unrecoverable. A skipped referral is not —
+    ///       `refer` is permissionless, so anyone (the challenger, who wants
+    ///       the slash, most of all) can call it directly once the catch
+    ///       reports `AutoReferFailed`. Guarding the recoverable failure by
+    ///       manufacturing the unrecoverable one is the wrong trade, so the
+    ///       try/catch in `ChallengeGame.dispute` stays broad and ungated. In
+    ///       practice an ordinary caller's gas budget is enough anyway: this
+    ///       loop's cost is bounded by the same 100-approver cap referenced
+    ///       above, measured at ~5.06M gas at that cap — well inside what a
+    ///       real transaction forwards. See `ChallengeGame.dispute`'s own
+    ///       natspec for the full argument.
     function _recordAccused(
         uint256 caseId,
         ITokenCourt.Case storage c,

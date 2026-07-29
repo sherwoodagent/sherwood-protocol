@@ -740,11 +740,16 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      an earlier version of this function reverted the whole `dispute`
     ///      when `gasleft()` fell below a floor, reasoning that a starved
     ///      `refer` call should never be allowed to land in the catch. That
-    ///      reasoning inverted the two functions' actual risk. `finalize`
-    ///      GATES CORRECTLY on gas because bubbling there is cheap and
-    ///      swallowing is catastrophic: the verdict was already decided, the
-    ///      case's tally is intact regardless of how `finalize` reverts, and
-    ///      the court holds no WOOD — a reverted `finalize` costs nothing but
+    ///      reasoning inverted the two functions' actual risk. `finalize` HAS
+    ///      NO `gasleft()` CHECK OF ITS OWN EITHER — the floor that matters
+    ///      lives on the callee side, in `ChallengeGame._settle`'s
+    ///      `InsufficientSlashGas` — what `finalize` gets right is BUBBLING
+    ///      rather than swallowing that revert (its catch is selector-filtered
+    ///      to only `WrongStatus`/`NotCourt`, everything else propagates), and
+    ///      that is cheap to do because swallowing is what would be
+    ///      catastrophic there: the verdict was already decided, the case's
+    ///      tally is intact regardless of how `finalize` reverts, and the
+    ///      court holds no WOOD — a reverted `finalize` costs nothing but
     ///      an honest retry. `dispute` is the OPPOSITE shape: it is not
     ///      reporting a decision, it is HOW THE ACCUSED BUY THEIR DEFENCE. If
     ///      this function reverted for insufficient gas, the accused could not
@@ -762,14 +767,22 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      slash and is paid from the forfeited counter-bond pool on a guilty
     ///      ruling — is strongly motivated to call it if this attempt lands in
     ///      the catch. `refer`'s own `InsufficientClock` guard bounds how long
-    ///      that window stays open, and it is generous by construction: a pool
-    ///      that completes promptly (well inside `autoSlashDelay`, typically
+    ///      that window stays open. That window is a PARAMETER CONTINGENCY, not
+    ///      a construction guarantee: nothing on-chain enforces
+    ///      `autoSlashDelay + voteWindow + FINALIZE_BUFFER <= disputeTimeout`
+    ///      — `setAutoSlashDelay` accepts anything strictly below
+    ///      `disputeTimeout`, and `voteWindow` lives on the court with no
+    ///      cross-check against either. The cross-contract invariant is
+    ///      checked at deploy pre-flight (Task 10), not by this contract. At
+    ///      today's defaults it holds with room to spare: a pool that
+    ///      completes promptly (well inside `autoSlashDelay`, typically
     ///      7 days) leaves most of `disputeTimeout` (30 days) still ahead of
-    ///      it — roughly 23 of 30 days of room against the ~6 days
-    ///      `voteWindow + FINALIZE_BUFFER` needs by default. A late-completing
-    ///      pool has less room, symmetrically, but that scarcity is inherent to
-    ///      the clocks `dispute` already runs against, not something a gas
-    ///      floor here could change.
+    ///      it — 17 to 24 days of room, depending on when in the 7-day window
+    ///      the pool completes, against the ~6 days `voteWindow +
+    ///      FINALIZE_BUFFER` needs by default. A late-completing pool has less
+    ///      room, symmetrically, but that scarcity is inherent to the clocks
+    ///      `dispute` already runs against, not something a gas floor here
+    ///      could change.
     ///
     ///      A GAS FLOOR WOULD ALSO BE NEAR-UNUSABLE ON THE TARGET CHAIN, which
     ///      compounds rather than merely repeats the argument above: sizing a
@@ -781,6 +794,22 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      no longer reads `approversOf` at all (open counter-bond standing,
     ///      §4/PR #50), so sizing anything tighter than the worst case would
     ///      mean spending an extra external call solely to size a gas check.
+    ///
+    ///      THE TRUST BOUNDARY WIDENED HERE, not just the gas discussion above:
+    ///      before Task 8 this contract never called OUT to `court` — only
+    ///      `court` called IN, via `rule`. Now `dispute` calls into `court`
+    ///      itself, so a malicious court can re-enter `game.rule(challengeId,
+    ///      ...)` from inside this very try block: `msg.sender == court`
+    ///      passes trivially (it IS the court, mid-call), and the challenge's
+    ///      status is `Disputed` at that point — exactly what `rule` requires.
+    ///      Not exploitable: every storage write this function makes happens
+    ///      before the call (the CEI note above), so there is no half-updated
+    ///      state for a re-entrant `rule` to observe or corrupt, and forcing a
+    ///      verdict through `rule` is a privilege `court` already holds
+    ///      unconditionally — reaching it one call frame deeper changes
+    ///      nothing about what it can do. Stated rather than left implicit: a
+    ///      wired `court` is trusted for re-entrancy now, not only for the
+    ///      verdicts it hands back through `rule`.
     function dispute(uint256 challengeId, uint256 amountWood) external {
         Challenge storage c = _challenges[challengeId];
         if (c.status != Status.Filed) revert WrongStatus();
@@ -855,10 +884,13 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         //
         // What the catch gives up is recoverable by comparison: `refer` is
         // permissionless, so anyone may open the case afterwards — and the
-        // challenger, who wants the slash, is the party most motivated to. The
-        // window is wide: a dispute completing inside `autoSlashDelay` leaves
-        // roughly 23 of the 30 default days against the ~6 that `refer`'s own
-        // `InsufficientClock` guard demands. Guarding a recoverable failure by
+        // challenger, who wants the slash, is the party most motivated to. At
+        // today's defaults the window is wide: a dispute completing inside
+        // `autoSlashDelay` leaves 17-24 days of room, depending on when in
+        // that window the pool completes, against the ~6 days `refer`'s own
+        // `InsufficientClock` guard demands — though that margin is a
+        // parameter contingency, not a construction guarantee (see the
+        // natspec above `dispute`). Guarding a recoverable failure by
         // manufacturing an unrecoverable one is the wrong trade in every gas
         // regime, which is why no floor stands here.
         if (complete) {
