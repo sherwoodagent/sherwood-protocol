@@ -132,10 +132,19 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///         window to nothing and turning the game into a griefing weapon.
     uint256 public constant MIN_AUTO_SLASH_DELAY = 2 days;
 
-    /// @dev Ceiling on `disputeTimeout`. Beyond this the coverage a filing
-    ///      freezes is pinned for longer than any plausible court proceeding,
-    ///      which is the griefing side of D5's fail-safe.
-    uint256 internal constant MAX_DISPUTE_TIMEOUT = 180 days;
+    /// @dev Ceiling on `disputeTimeout` — a ceiling on how long a filing may
+    ///      pin a guardian's coverage, not merely a griefing bound (review
+    ///      2026-07-29 lock-time reduction). The old 180 days was 6x the
+    ///      30-day default with nothing arguing for that headroom: with the
+    ///      token court's real clocks a verdict needs at most
+    ///      `MAX_VOTE_WINDOW + FINALIZE_BUFFER` (15 days) after referral, so
+    ///      60 is still generous — it leaves 45 days of `autoSlashDelay`
+    ///      headroom above the 15 days a worst-case adjudication needs, against
+    ///      a 7-day default. Compatible with the cross-contract window
+    ///      invariant (`_requireWindowFits`): at the `voteWindow` ceiling the
+    ///      invariant needs 15 days of runway, so a 60-day timeout still
+    ///      permits `autoSlashDelay` up to 45 days.
+    uint256 internal constant MAX_DISPUTE_TIMEOUT = 60 days;
 
     /// @dev THE GAS FLOOR sWOOD's natspec requires of its slasher (PR #24
     ///      round-4 N-4 / N-3). `resolve` is permissionless, so the caller
@@ -1666,8 +1675,23 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      the ledger's own documented `setGuardianRegistry` orphaning, and the
     ///      same remedy: re-point only when no challenge is live, or point back
     ///      and drain the live set first.
+    /// @dev RE-VALIDATES `challengeWindow` AGAINST THE NEW LEDGER'S OWN WINDOW
+    ///      (same class as `setStakedWood`'s re-point guard, review 2026-07-29
+    ///      lock-time reduction, Part C). `setChallengeWindow` only bounds a NEW
+    ///      window against whichever ledger is wired at that moment; it says
+    ///      nothing about the ledger itself changing later underneath an
+    ///      unchanged window. WITHOUT THIS CHECK: re-pointing from a ledger with
+    ///      a 30-day `challengeWindow` to one with 7 days, while this game's own
+    ///      `challengeWindow` is still 14, would silently reopen the exact gap
+    ///      Part C closes — a filing could freeze exposure the NEW ledger has
+    ///      already aged out of its epoch buckets, with no setter call on this
+    ///      game to catch it. Reverting here, at re-point time, is cheap;
+    ///      catching it only the next time someone happens to call
+    ///      `setChallengeWindow` is not — that setter might never be called
+    ///      again while the mismatch sits live.
     function setExposureLedger(address ledger) external onlyOwner {
         if (ledger == address(0)) revert ZeroAddress();
+        if (challengeWindow > IExposureLedger(ledger).challengeWindow()) revert InvalidParameter();
         emit ExposureLedgerSet(address(exposureLedger), ledger);
         exposureLedger = IExposureLedger(ledger);
     }
@@ -1678,12 +1702,16 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         tierRegistry = ITierRegistryDemoterMinimal(registry);
     }
 
-    /// @dev Bounded (0, 90 days]: a zero window makes every proposal
-    ///      unchallengeable, and a window far beyond the ledger's coverage
-    ///      window would let a filing freeze exposure that has already expired
-    ///      out of its epoch buckets.
     function setChallengeWindow(uint256 newWindow) external onlyOwner {
-        if (newWindow == 0 || newWindow > 90 days) revert InvalidParameter();
+        if (newWindow == 0) revert InvalidParameter();
+        // THE LEDGER'S WINDOW IS AUTHORITATIVE, read live rather than restated.
+        // It governs the epoch-bucket scan a coverage freeze depends on, so a
+        // game window above it lets a filing freeze exposure the ledger has
+        // already aged out - which is precisely what this bound was always
+        // described as preventing and never did (the old `90 days` literal sat
+        // 6x above the ledger's own 14-day default). Reading it live also means
+        // the two cannot drift.
+        if (newWindow > exposureLedger.challengeWindow()) revert InvalidParameter();
         emit ChallengeWindowSet(challengeWindow, newWindow);
         challengeWindow = newWindow;
     }
@@ -1745,14 +1773,37 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         stakedWood = IStakedWood(stakedWood_);
     }
 
+    /// @dev THE INVARIANT SPANS TWO CONTRACTS, so neither holds it alone (B3).
+    ///      A counter-bond pool may complete as late as
+    ///      `filedAt + autoSlashDelay`, and from that instant a referral needs
+    ///      `voteWindow + FINALIZE_BUFFER` of runway before the challenge dies
+    ///      at `filedAt + disputeTimeout`. Violated, the referral window can be
+    ///      NEGATIVE - and the ACCUSED chooses when the pool completes, so it
+    ///      defeats adjudication unilaterally by stalling. The deploy
+    ///      pre-flight catches the wiring-time case; this catches the setters
+    ///      that could each break it afterwards. Vacuous with no court wired:
+    ///      there is no referral to fit.
+    function _requireWindowFits(uint256 autoSlash, uint256 timeout) private view {
+        address c = court;
+        if (c == address(0)) return;
+        if (autoSlash + ITokenCourt(c).voteWindow() + ITokenCourt(c).FINALIZE_BUFFER() > timeout) {
+            revert WindowInvariantViolated();
+        }
+    }
+
     /// @dev Bounded [`MIN_AUTO_SLASH_DELAY`, `disputeTimeout`). The floor is
     ///      justified at the constant; the ceiling is the cross-parameter
     ///      invariant — both clocks run from `filedAt`, so a delay at or above
     ///      the dispute timeout would let a contested challenge time out before
     ///      the slash it was raised against ever came due, and the accused
     ///      would have bought its escalation for nothing.
+    /// @dev LAST CHECK IS THE CROSS-CONTRACT ONE (B3, `_requireWindowFits`):
+    ///      the two bounds above are this contract's own; the window invariant
+    ///      additionally needs the court's `voteWindow`/`FINALIZE_BUFFER`, which
+    ///      only exists on `TokenCourt`.
     function setAutoSlashDelay(uint256 newDelay) external onlyOwner {
         if (newDelay < MIN_AUTO_SLASH_DELAY || newDelay >= disputeTimeout) revert InvalidParameter();
+        _requireWindowFits(newDelay, disputeTimeout);
         emit AutoSlashDelaySet(autoSlashDelay, newDelay);
         autoSlashDelay = newDelay;
     }
@@ -1760,8 +1811,11 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     /// @dev Bounded (`autoSlashDelay`, `MAX_DISPUTE_TIMEOUT`] — the same
     ///      cross-parameter invariant from the other side, plus a ceiling on how
     ///      long a filing may pin a guardian's coverage.
+    /// @dev LAST CHECK IS THE CROSS-CONTRACT ONE (B3, `_requireWindowFits`) —
+    ///      see `setAutoSlashDelay`'s identical note.
     function setDisputeTimeout(uint256 newTimeout) external onlyOwner {
         if (newTimeout <= autoSlashDelay || newTimeout > MAX_DISPUTE_TIMEOUT) revert InvalidParameter();
+        _requireWindowFits(autoSlashDelay, newTimeout);
         emit DisputeTimeoutSet(disputeTimeout, newTimeout);
         disputeTimeout = newTimeout;
     }

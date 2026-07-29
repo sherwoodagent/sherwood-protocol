@@ -57,6 +57,12 @@ contract MockChallengeGovernor {
 contract MockChallengeLedger {
     uint256 public woodUsdPriceX8;
 
+    /// @dev Mirrors the real `ExposureLedger.challengeWindow` default (Part C,
+    ///      review 2026-07-29 lock-time reduction) — `ChallengeGame` now reads
+    ///      this live from `setChallengeWindow` and `setExposureLedger`, so a
+    ///      mock without it would revert every call into either setter.
+    uint256 public challengeWindow = 14 days;
+
     mapping(bytes32 reviewKey => address[]) internal _approvers;
     mapping(bytes32 reviewKey => mapping(address guardian => uint256)) internal _committed;
     mapping(bytes32 reviewKey => bool) internal _frozen;
@@ -68,6 +74,10 @@ contract MockChallengeLedger {
 
     function setWoodUsdPrice(uint256 priceX8) external {
         woodUsdPriceX8 = priceX8;
+    }
+
+    function setChallengeWindow(uint256 newWindow) external {
+        challengeWindow = newWindow;
     }
 
     /// @dev THE COMPOSED PRICE, which is what every rail in the real ledger
@@ -310,6 +320,15 @@ contract MockChallengeStakedWood {
 ///      actually invoked it.
 contract MockRecordingCourt {
     uint256 public lastReferred;
+
+    /// @dev Mirrors the real `TokenCourt`'s defaults (5-day `voteWindow`,
+    ///      1-day `FINALIZE_BUFFER`) — `ChallengeGame._requireWindowFits` (B3,
+    ///      review 2026-07-29 lock-time reduction) now reads both live off
+    ///      whatever `court` is wired, so a mock without them would revert
+    ///      every `setAutoSlashDelay`/`setDisputeTimeout` call once this court
+    ///      is set in `setUp`.
+    uint256 public voteWindow = 5 days;
+    uint256 public constant FINALIZE_BUFFER = 1 days;
 
     function refer(uint256 challengeId) external returns (uint256) {
         lastReferred = challengeId;
@@ -877,6 +896,46 @@ contract ChallengeGameTest is Test {
         game.setChallengeWindow(7 days);
         vm.stopPrank();
         assertEq(game.challengeWindow(), 7 days);
+    }
+
+    /// @notice Part C: the ceiling is the LEDGER's own live window, not a
+    ///         restated literal — a window above it would let a filing freeze
+    ///         exposure the ledger has already aged out of its epoch buckets,
+    ///         which is exactly what the old `90 days` literal (6x the
+    ///         ledger's 14-day default) let happen.
+    function test_setChallengeWindow_boundedByLedgersLiveWindow() public {
+        uint256 ledgerWindow = ledger.challengeWindow();
+        vm.startPrank(owner);
+        vm.expectRevert(IChallengeGame.InvalidParameter.selector);
+        game.setChallengeWindow(ledgerWindow + 1);
+        game.setChallengeWindow(ledgerWindow); // exactly the ledger's window succeeds
+        vm.stopPrank();
+        assertEq(game.challengeWindow(), ledgerWindow);
+    }
+
+    /// @notice Part C mirror guard, same class as `setStakedWood`'s re-point
+    ///         check: re-pointing to a ledger whose OWN window is smaller than
+    ///         this game's current `challengeWindow` would silently reopen the
+    ///         gap `setChallengeWindow` closes, with no setter call left to
+    ///         catch it. Chosen to REVERT rather than clamp — the same choice
+    ///         `setStakedWood` makes for its own re-point hazard.
+    function test_setExposureLedger_revertsWhenNewLedgersWindowIsSmallerThanCurrent() public {
+        assertEq(game.challengeWindow(), 14 days, "fixture: default game window");
+        MockChallengeLedger smaller = new MockChallengeLedger(0.05e8);
+        smaller.setChallengeWindow(7 days); // below the game's current 14-day window
+        vm.prank(owner);
+        vm.expectRevert(IChallengeGame.InvalidParameter.selector);
+        game.setExposureLedger(address(smaller));
+    }
+
+    /// @notice The other side of the same guard: a new ledger whose window
+    ///         covers (or exceeds) the game's current one re-points cleanly.
+    function test_setExposureLedger_succeedsWhenNewLedgersWindowCoversCurrent() public {
+        MockChallengeLedger bigger = new MockChallengeLedger(0.05e8);
+        bigger.setChallengeWindow(30 days); // >= the game's current 14-day window
+        vm.prank(owner);
+        game.setExposureLedger(address(bigger));
+        assertEq(address(game.exposureLedger()), address(bigger));
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1590,6 +1649,9 @@ contract ChallengeGameTest is Test {
     ///         the liability is still outstanding and a fresh filing is
     ///         legitimate. Only a COLLECTED verdict closes the proposal (🟡F12).
     function test_resolve_allowsALaterFilingOnTheSameProposal() public {
+        // The ledger's own window must widen FIRST (Part C): the game's
+        // `challengeWindow` is now capped at whatever the ledger reports live.
+        ledger.setChallengeWindow(90 days);
         vm.prank(owner);
         game.setChallengeWindow(90 days); // outlive the dispute timeout
         uint256 id = _fileStandard(PROPOSAL);
@@ -1700,7 +1762,7 @@ contract ChallengeGameTest is Test {
         assertEq(game.challengeOf(id).disputeTimeoutAtFiling, 30 days);
 
         vm.prank(owner);
-        game.setDisputeTimeout(180 days); // 6x, at the ceiling
+        game.setDisputeTimeout(60 days); // 2x, at the new ceiling (Part B)
 
         // The challenge times out on its own clock, so the coverage it pinned
         // is released when it always would have been.
@@ -1840,10 +1902,50 @@ contract ChallengeGameTest is Test {
         vm.expectRevert(IChallengeGame.InvalidParameter.selector);
         game.setDisputeTimeout(delay); // never at or below the slash clock
         vm.expectRevert(IChallengeGame.InvalidParameter.selector);
-        game.setDisputeTimeout(181 days);
+        game.setDisputeTimeout(61 days); // above the new 60-day ceiling (Part B)
         game.setDisputeTimeout(60 days);
         vm.stopPrank();
         assertEq(game.disputeTimeout(), 60 days);
+    }
+
+    /// @notice Part A / B3: `setDisputeTimeout(8 days)` used to be legal on its
+    ///         own bound (`> autoSlashDelay`, 7 days by default) despite
+    ///         leaving NEGATIVE room for `voteWindow + FINALIZE_BUFFER` (5d + 1d
+    ///         on the wired `MockRecordingCourt`) — the exact defeat this task
+    ///         closes: the accused could stall a counter-bond pool to the edge
+    ///         of `autoSlashDelay` and guarantee `refer` can never fit.
+    function test_setDisputeTimeout_revertsWindowInvariantViolated() public {
+        vm.prank(owner);
+        vm.expectRevert(IChallengeGame.WindowInvariantViolated.selector);
+        game.setDisputeTimeout(8 days); // 7d autoSlashDelay + 5d voteWindow + 1d buffer = 13d > 8d
+    }
+
+    /// @notice Part A / B3, the other side: `setAutoSlashDelay(25 days)` was
+    ///         also legal on its own bound (`< disputeTimeout`, 30 days by
+    ///         default) despite the same negative-window defeat.
+    function test_setAutoSlashDelay_revertsWindowInvariantViolated() public {
+        vm.prank(owner);
+        vm.expectRevert(IChallengeGame.WindowInvariantViolated.selector);
+        game.setAutoSlashDelay(25 days); // 25d + 5d voteWindow + 1d buffer = 31d > 30d disputeTimeout
+    }
+
+    /// @notice The invariant is VACUOUS with no court wired — there is no
+    ///         referral to fit, so neither setter has anything to check against.
+    function test_setDisputeTimeout_vacuousWithNoCourtWired() public {
+        vm.startPrank(owner);
+        game.setCourt(address(0));
+        game.setDisputeTimeout(8 days); // would violate the invariant if a court were wired
+        vm.stopPrank();
+        assertEq(game.disputeTimeout(), 8 days);
+    }
+
+    /// @notice The vacuous case, other side.
+    function test_setAutoSlashDelay_vacuousWithNoCourtWired() public {
+        vm.startPrank(owner);
+        game.setCourt(address(0));
+        game.setAutoSlashDelay(25 days); // would violate the invariant if a court were wired
+        vm.stopPrank();
+        assertEq(game.autoSlashDelay(), 25 days);
     }
 
     function test_setStakedWood_rejectsZero() public {

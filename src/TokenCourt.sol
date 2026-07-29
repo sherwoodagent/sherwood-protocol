@@ -108,8 +108,22 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     }
 
     /// @inheritdoc ITokenCourt
+    /// @dev THE MIRROR OF `ChallengeGame._requireWindowFits` (B3): the
+    ///      cross-contract invariant `autoSlashDelay + voteWindow +
+    ///      FINALIZE_BUFFER <= disputeTimeout` spans both contracts, so this
+    ///      setter must enforce it too, reading the game's LIVE
+    ///      `autoSlashDelay`/`disputeTimeout` rather than trusting whatever held
+    ///      the last time either contract's setters happened to check it.
+    ///      Vacuous with no game wired: there is no referral clock to fit yet.
     function setVoteWindow(uint256 newWindow) external onlyOwner {
         if (newWindow == 0 || newWindow > MAX_VOTE_WINDOW) revert InvalidParameter();
+        address g = challengeGame;
+        if (g != address(0)) {
+            IChallengeGame game_ = IChallengeGame(g);
+            if (game_.autoSlashDelay() + newWindow + FINALIZE_BUFFER > game_.disputeTimeout()) {
+                revert WindowInvariantViolated();
+            }
+        }
         emit VoteWindowSet(voteWindow, newWindow);
         voteWindow = newWindow;
     }

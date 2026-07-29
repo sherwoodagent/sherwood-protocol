@@ -29,8 +29,25 @@ contract MockGameForCourt {
     IChallengeGame.Verdict public lastVerdict;
     bool public ruled;
 
+    /// @dev Mirrors the real `ChallengeGame`'s defaults (7-day
+    ///      `autoSlashDelay`, 30-day `disputeTimeout`) — `TokenCourt.setVoteWindow`
+    ///      now reads both live off the wired game to enforce the B3
+    ///      cross-contract window invariant, so a mock without them would
+    ///      revert every `setVoteWindow` call once this game is wired in
+    ///      `setUp`.
+    uint256 public autoSlashDelay = 7 days;
+    uint256 public disputeTimeout = 30 days;
+
     function setExposureLedger(address l) external {
         exposureLedger = l;
+    }
+
+    function setAutoSlashDelay(uint256 d) external {
+        autoSlashDelay = d;
+    }
+
+    function setDisputeTimeout(uint256 t) external {
+        disputeTimeout = t;
     }
 
     function setRuleReverts(bool r) external {
@@ -163,6 +180,29 @@ contract TokenCourtTest is Test {
         emit ITokenCourt.VoteWindowSet(5 days, 7 days);
         vm.prank(owner);
         court.setVoteWindow(7 days);
+    }
+
+    /// @notice Part A / B3, the court-side mirror of `ChallengeGame`'s window
+    ///         invariant: `setVoteWindow` must not accept a window the wired
+    ///         game's own LIVE `autoSlashDelay`/`disputeTimeout` cannot fit.
+    ///         Tightening the game's `disputeTimeout` to 20 days is enough to
+    ///         make `MAX_VOTE_WINDOW` (14d) no longer fit against the default
+    ///         7-day `autoSlashDelay` + 1-day `FINALIZE_BUFFER`
+    ///         (7 + 14 + 1 = 22 > 20).
+    function test_setVoteWindow_revertsWindowInvariantViolated_whenGameNumbersCannotFit() public {
+        game.setDisputeTimeout(20 days);
+        vm.prank(owner);
+        vm.expectRevert(ITokenCourt.WindowInvariantViolated.selector);
+        court.setVoteWindow(14 days);
+    }
+
+    /// @notice The invariant is VACUOUS with no game wired — there is no
+    ///         referral clock to fit yet.
+    function test_setVoteWindow_vacuousWithNoGameWired() public {
+        TokenCourt freshCourt = new TokenCourt(owner);
+        vm.prank(owner);
+        freshCourt.setVoteWindow(14 days); // no game wired: would violate the invariant if one were
+        assertEq(freshCourt.voteWindow(), 14 days);
     }
 
     function test_views_nonexistentCaseReturnDefaults() public view {

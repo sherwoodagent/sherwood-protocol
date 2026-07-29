@@ -130,6 +130,11 @@ interface ITokenCourt {
     ///         checkpoint discounted to `ageFloorBps`, because the re-stake
     ///         re-anchors `stakedAt`, not at its original historic weight.
     error NoPresentHoldings();
+    /// @notice A setter would break the cross-contract invariant `autoSlashDelay
+    ///         + voteWindow + FINALIZE_BUFFER <= disputeTimeout` (B3). Raised by
+    ///         `setVoteWindow` — see `ChallengeGame._requireWindowFits` for why
+    ///         neither contract can hold this invariant alone.
+    error WindowInvariantViolated();
 
     /// @notice A case opened. `snapshotTs` is logged here so indexers never
     ///         need a second read to learn the electorate cutoff `refer`

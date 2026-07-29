@@ -11,6 +11,7 @@ import {StakedWood} from "../../src/StakedWood.sol";
 import {ExposureLedger} from "../../src/ExposureLedger.sol";
 import {TierRegistry} from "../../src/TierRegistry.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
+import {MockStakedWood} from "../mocks/MockStakedWood.sol";
 
 /// @dev THE ONLY WAY TO RUN A SCRIPT AS ITS OWN BROADCASTER FROM A TEST.
 ///      `vm.startBroadcast()` executes the script's calls as forge's
@@ -148,10 +149,24 @@ contract DeployTokenCourtPreflightTest is Test {
     /// @dev PRE-FLIGHT 2: sWOOD identity must match on BOTH contracts. Break
     ///      it from the GAME's side (the court's own pointer is untouched),
     ///      proving this check is independent of pre-flight 1.
+    /// @dev A REAL `IStakedWood` IMPLEMENTER, NOT A BARE ADDRESS. `setStakedWood`
+    ///      re-validates `convictionBountyBps` against the NEW slasher's own
+    ///      `MAX_CONVICTION_BOUNTY_BPS()` (PR review 2026-07-29 IMPORTANT-2,
+    ///      predates this task) — a code-less `address(0xBEEF)` has no such
+    ///      function to call and the setter itself reverts before this test
+    ///      ever reaches the wire pre-flight it means to exercise.
+    ///      `MockStakedWood` (already used identically in `TokenCourt.t.sol`)
+    ///      is a minimal `IStakedWood` that satisfies the re-point guard while
+    ///      still genuinely differing from `swood`.
     function test_wirePreflight_bites_whenGameStakedWoodDiffersFromCourt() public {
         _deployAndSetCourtEnv();
+        // Hoisted: a call in argument position (`new MockStakedWood()`) would
+        // consume the pending one-shot `vm.prank` before `setStakedWood` ever
+        // runs, leaving the setter called as this test contract instead of
+        // `DEFAULT_SENDER` and reverting `OwnableUnauthorizedAccount`.
+        address otherStakedWood = address(new MockStakedWood());
         vm.prank(DEFAULT_SENDER);
-        game.setStakedWood(address(0xBEEF));
+        game.setStakedWood(otherStakedWood);
         _runWireExpecting("PRE-FLIGHT: ChallengeGame.stakedWood != STAKED_WOOD.");
     }
 

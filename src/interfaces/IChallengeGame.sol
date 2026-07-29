@@ -209,6 +209,12 @@ interface IChallengeGame {
     ///         the owner's only lever gating filings). Never raised anywhere
     ///         else — dispute/resolve/rule/claims are unaffected by this flag.
     error FilingsPaused();
+    /// @notice A setter would break the cross-contract invariant `autoSlashDelay
+    ///         + voteWindow + FINALIZE_BUFFER <= disputeTimeout` (B3). Raised by
+    ///         `setAutoSlashDelay` and `setDisputeTimeout` — see
+    ///         `ChallengeGame._requireWindowFits` for why neither contract can
+    ///         hold this alone.
+    error WindowInvariantViolated();
 
     // ── Events ──
     /// @dev `evidenceURI` is carried on-chain unindexed so predicates 2 and 3 —
