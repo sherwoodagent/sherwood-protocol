@@ -1832,9 +1832,31 @@ contract ChallengeGameTest is Test {
     /// @notice Spec §4 requires an invariant + fuzz per new accounting path. The
     ///         game's WOOD custody must equal the bonds of the challenges still
     ///         live, at EVERY point — across fuzzed bond sizes, an arbitrary
-    ///         subset disputed, and an arbitrary resolution order.
-    function testFuzz_woodBalanceEqualsLiveBonds(uint96[3] memory coverage, uint8 disputeMask, uint8 orderSeed) public {
+    ///         subset disputed, an arbitrary resolution order, AND an arbitrary
+    ///         resolution PATH.
+    /// @dev    `verdictSeed` is what adds that last dimension. Before it, every
+    ///         resolution in this fuzz ran through `game.resolve`, which only
+    ///         ever reaches `_settle` (an undisputed silence) or `_fail` (a
+    ///         disputed challenge past its timeout) — `rule`'s `Inconclusive`
+    ///         branch (`_refundAll`) was never once exercised under fuzzing,
+    ///         despite being a THIRD accounting path with its own pool-refund
+    ///         shape. For each DISPUTED challenge, a 2-bit slice of
+    ///         `verdictSeed` now independently chooses between the timeout
+    ///         (`resolve`, unchanged) and a court ruling (`rule`, as `court`)
+    ///         with a fuzzed verdict — so `_settle`, `_fail` and `_refundAll`
+    ///         are all reachable in the same run, and the custody invariant is
+    ///         checked across whichever mix the fuzzer picks. A `Filed`
+    ///         (undisputed) challenge always resolves via `resolve`: `rule`
+    ///         demands `Disputed`, so routing an undisputed one through it
+    ///         would just revert `WrongStatus` rather than exercise anything.
+    function testFuzz_woodBalanceEqualsLiveBonds(
+        uint96[3] memory coverage,
+        uint8 disputeMask,
+        uint8 orderSeed,
+        uint8 verdictSeed
+    ) public {
         uint256[3] memory ids;
+        bool[3] memory disputed;
         for (uint256 i = 0; i < 3; i++) {
             uint256 usd = bound(uint256(coverage[i]), 1e18, 1_000_000e18);
             uint256 proposalId = 500 + i;
@@ -1851,12 +1873,15 @@ contract ChallengeGameTest is Test {
             if ((disputeMask >> i) & 1 == 1) {
                 vm.prank(guardianA);
                 game.dispute(ids[i], type(uint256).max);
+                disputed[i] = true;
                 _assertLiveBondsBacked();
             }
         }
 
         // Past BOTH deadlines, so every challenge is resolvable whichever state
-        // it is in and the order is genuinely free.
+        // it is in and the order is genuinely free. `rule` itself checks only
+        // `status == Disputed`, never the clock, so warping this far forecloses
+        // nothing for the rule() path exercised below.
         vm.warp(vm.getBlockTimestamp() + game.disputeTimeout());
 
         // All six orderings of {0,1,2}.
@@ -1867,7 +1892,21 @@ contract ChallengeGameTest is Test {
         uint256[3] memory order = [first, second, third];
 
         for (uint256 i = 0; i < 3; i++) {
-            game.resolve(ids[order[i]]);
+            uint256 idx = order[i];
+            // 2-bit slice per ORIGINAL challenge index: 0 => timeout via
+            // `resolve`; 1/2/3 => a court ruling via `rule`, one fuzzed verdict
+            // apiece. Only meaningful for a DISPUTED challenge — `rule` demands
+            // `Disputed`, so an undisputed (`Filed`) one always takes `resolve`.
+            uint256 choice = (uint256(verdictSeed) >> (2 * idx)) & 0x3;
+            if (disputed[idx] && choice != 0) {
+                IChallengeGame.Verdict v = choice == 1
+                    ? IChallengeGame.Verdict.Guilty
+                    : choice == 2 ? IChallengeGame.Verdict.NotGuilty : IChallengeGame.Verdict.Inconclusive;
+                vm.prank(court);
+                game.rule(ids[idx], v);
+            } else {
+                game.resolve(ids[idx]);
+            }
             _assertLiveBondsBacked();
         }
         // "Nothing stranded" now means "nothing UNACCOUNTED": resolution records
