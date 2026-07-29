@@ -259,6 +259,19 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
 
         uint256 weight = IStakedWood(stakedWood).getPastVotes(msg.sender, c.snapshotTs);
         if (weight == 0) revert NoVotingPower();
+        // PRESENT HOLDINGS ARE A GATE, NEVER A WEIGHT (spec 2026-07-29 §3).
+        // Historical weight still decides how much a vote counts - that is the
+        // D2 flash-loan defence and it is unchanged. This decides only WHETHER
+        // you may vote, and it exists because `claimUnstakeGuardian` deletes
+        // the guardian record: `stakedAt` becomes 0, `_ageFactorBps` floors at
+        // `ageFloorBps`, and the raw checkpoint at `snapshotTs` survives the
+        // exit. Without this line an attacker pre-positions stake, executes the
+        // drain, requests unstake, votes to acquit at 25% of historic weight,
+        // and claims out - voting capital liquid before the verdict lands, and
+        // alignment exactly zero for the party most motivated to vote.
+        // Re-WEIGHTING on present holdings would reintroduce the post-hoc
+        // accumulation the snapshot exists to close, so this stays binary.
+        if (IStakedWood(stakedWood).getVotes(msg.sender) == 0) revert NoVotingPower();
 
         voteOf[caseId][msg.sender] = guilty ? ITokenCourt.Ruling.Guilty : ITokenCourt.Ruling.NotGuilty;
         if (guilty) {

@@ -24,6 +24,16 @@ contract MockStakedWood is IStakedWood {
     // ── Settable reads ──
     address public wood;
     mapping(address => uint256) internal _votes;
+    /// @dev Tracks whether `setVotes` was ever called for an account. `getVotes`
+    ///      (present holdings) defaults to 1 — NOT 0 — for any account that
+    ///      hasn't had it explicitly set, because the vast majority of existing
+    ///      fixtures set snapshot weight via `setPastVotes` and never touch
+    ///      `getVotes` at all; they are modeling a voter who still holds, just
+    ///      without bothering to say so. Only a test that calls `setVotes(acct,
+    ///      0)` explicitly is modeling a fully-exited holder (present-holdings
+    ///      gate, B4). Defaulting to 0 instead would make every such fixture
+    ///      fail the present-holdings gate for the wrong reason.
+    mapping(address => bool) internal _votesSet;
     mapping(address => mapping(uint256 => uint256)) internal _pastVotes;
     mapping(uint256 => uint256) internal _pastTotalVotes;
     mapping(uint256 => uint256) internal _pastTotalSupply;
@@ -57,6 +67,7 @@ contract MockStakedWood is IStakedWood {
 
     function setVotes(address account, uint256 v) external {
         _votes[account] = v;
+        _votesSet[account] = true;
     }
 
     function setPastVotes(address guardian, uint256 timestamp, uint256 v) external {
@@ -133,7 +144,7 @@ contract MockStakedWood is IStakedWood {
 
     // ── Checkpoint reads ──
     function getVotes(address account) external view returns (uint256) {
-        return _votes[account];
+        return _votesSet[account] ? _votes[account] : 1;
     }
 
     function getPastVotes(address guardian, uint256 timestamp) external view returns (uint256) {

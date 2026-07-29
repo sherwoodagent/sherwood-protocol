@@ -433,6 +433,34 @@ contract TokenCourtTest is Test {
         court.vote(id, false);
     }
 
+    function test_vote_refusesAFullyExitedHolder() public {
+        uint256 id = _referredCase();
+        uint256 snap = court.caseOf(id).snapshotTs;
+        address exited = makeAddr("exited");
+        swood.setPastVotes(exited, snap, 400e18); // historic weight survives the exit
+        swood.setVotes(exited, 0); // present holdings: none
+        vm.prank(exited);
+        vm.expectRevert(ITokenCourt.NoVotingPower.selector);
+        court.vote(id, false);
+    }
+
+    function test_vote_acceptsACurrentHolderWithHistoricWeight() public {
+        uint256 id = _referredCase();
+        swood.setVotes(voterA, 1); // any present stake at all
+        vm.prank(voterA);
+        court.vote(id, true);
+        assertEq(court.caseOf(id).guiltyVotes, 300e18, "weight is still the SNAPSHOT figure, not the present one");
+    }
+
+    function test_vote_refusesPresentHolderWithNoSnapshotWeight() public {
+        uint256 id = _referredCase();
+        address latecomer = makeAddr("latecomer");
+        swood.setVotes(latecomer, 5_000e18); // bought in after the drain
+        vm.prank(latecomer);
+        vm.expectRevert(ITokenCourt.NoVotingPower.selector);
+        court.vote(id, true);
+    }
+
     function test_vote_windowIsThePinnedOne() public {
         // Owner shortening voteWindow after referral must NOT close a live case early.
         uint256 id = _referredCase();
