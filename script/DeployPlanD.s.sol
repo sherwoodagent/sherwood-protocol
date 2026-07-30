@@ -50,10 +50,13 @@ interface ICompensationEscrowFunder {
  *      `escrow.authorizedFunder() == swood` and `swood.compensationEscrow() ==
  *      escrow`. Either one missing makes every settled challenge revert at the
  *      last step, after the coverage was frozen and the bond was posted.
- * @dev PRE-FLIGHT 3: a zero `woodUsdPriceX8` on the ledger is fail-closed for
- *      the game exactly as it is for the bond math — `file()` reverts
- *      `InvalidParameter()` when the haircut price is unset, so the game would
- *      deploy into a state where NOTHING can be challenged.
+ * @dev PRE-FLIGHT 3: a zero COMPOSED price on the ledger is fail-closed for the
+ *      game exactly as it is for the bond math — `file()` reverts
+ *      `WoodPriceUnset()` when it is unset, so the game would deploy into a
+ *      state where NOTHING can be challenged. Checked as `woodPriceX8()`, the
+ *      figure `file` actually divides by: the raw `woodUsdPriceX8` scalar would
+ *      pass this pre-flight while the game was unpriced, and fail it while the
+ *      game was healthy off a live feed (review 🟠F16).
  *
  *      Ownership: the broadcaster becomes the game's owner and must ALREADY own
  *      the ExposureLedger, the TierRegistry and StakedWood (all three setters
@@ -111,13 +114,14 @@ contract DeployPlanD is Script {
         );
 
         // ── Pre-flight 3: an unpriced ledger makes every filing revert ──
-        uint256 priceX8 = IExposureLedger(ledger).woodUsdPriceX8();
-        require(
-            priceX8 != 0, "PRE-FLIGHT: ExposureLedger.woodUsdPriceX8 is 0 (fail-closed: no challenge could be filed)"
-        );
+        // The COMPOSED price, matching what `ChallengeGame.file` divides by
+        // (review 🟠F16). Pre-flighting the raw scalar would pass while the
+        // figure the game actually uses was zero, and fail while it was healthy.
+        uint256 priceX8 = IExposureLedger(ledger).woodPriceX8();
+        require(priceX8 != 0, "PRE-FLIGHT: ExposureLedger.woodPriceX8 is 0 (fail-closed: no challenge could be filed)");
 
         console.log("deployer / game owner:  %s", deployer);
-        console.log("ledger woodUsdPriceX8:  %s", priceX8);
+        console.log("ledger woodPriceX8:     %s", priceX8);
 
         vm.startBroadcast();
 

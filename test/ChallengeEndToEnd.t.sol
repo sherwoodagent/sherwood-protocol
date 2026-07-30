@@ -81,7 +81,12 @@ contract ChallengeE2EAdapter {
 ///           - `escrow.authorizedFunder` is sWOOD, NOT the game: the escrow
 ///             address is owner-set state on sWOOD and deliberately not a
 ///             `slashToEscrow` argument, so the game can never redirect the
-///             proceeds of a slash it triggers.
+///             ESCROW portion of a slash it triggers. It CAN name a caller-
+///             chosen conviction-bounty recipient (`bountyTo`/`bountyBps`,
+///             spec 2026-07-29 §2), but sWOOD caps that channel at
+///             `MAX_CONVICTION_BOUNTY_BPS` itself rather than trusting the
+///             game's own clamp — the same reason `slashBpsPer` is re-clamped
+///             in sWOOD rather than trusted from `ExposureLedger`.
 ///
 /// @dev    Fixture arithmetic, all exact:
 ///           - USDG 6-dec at $1.00; `_decimalsOffset()` is the asset's decimals,
@@ -622,11 +627,14 @@ contract ChallengeEndToEndTest is Test {
         //    challenger paid.
         vm.warp(filedAt + 1 hours);
         vm.prank(g1);
-        game.dispute(cid);
+        game.dispute(cid, type(uint256).max);
         IChallengeGame.Challenge memory c = game.challengeOf(cid);
         assertEq(uint256(c.status), uint256(IChallengeGame.Status.Disputed), "Disputed");
-        assertEq(c.counterBondWood, CHALLENGER_BOND, "the counter-bond matches the bond");
-        assertEq(c.disputer, g1, "recorded, because it returns to whoever posted it");
+        assertEq(c.counterBondWood, CHALLENGER_BOND, "the counter-bond pool matches the bond");
+        address[] memory funders = game.counterBondContributors(cid);
+        assertEq(funders.length, 1, "g1 covered all the coverage, so it funds the whole defence alone");
+        assertEq(funders[0], g1);
+        assertEq(game.counterBondContributionOf(cid, g1), CHALLENGER_BOND, "the forfeit follows this, not coverage");
         assertEq(game.bondedWood(), 2 * CHALLENGER_BOND, "both bonds are live");
         assertEq(wood.balanceOf(address(game)), 2 * CHALLENGER_BOND);
         assertEq(wood.balanceOf(g1), g1BalBefore - CHALLENGER_BOND, "the accused paid for the escalation");
@@ -647,11 +655,24 @@ contract ChallengeEndToEndTest is Test {
         // ── The bond is a real cost to the challenger and a real payment to the
         //    accused; the counter-bond is returned, not staked on the outcome.
         assertEq(wood.balanceOf(challenger), challengerBalBefore - CHALLENGER_BOND, "the challenger forfeited it");
+        // The forfeit reaches the defence MINUS the burned slice: g1 funded 100%
+        // of the pool, so it takes 100% of what is distributed. The burn is what
+        // stops that funder from profitably being the challenger's own second
+        // address.
+        //
+        // Collected rather than pushed — resolution records the entitlement and
+        // the funder calls for it, which is what removed the unbounded payout
+        // loop and let contribution standing open up.
+        vm.prank(g1);
+        game.claimContribution(cid);
+
+        uint256 burned = (CHALLENGER_BOND * game.forfeitBurnBps()) / 10_000;
         assertEq(
             wood.balanceOf(g1),
-            g1BalBefore + CHALLENGER_BOND,
-            "counter-bond returned plus the whole forfeit (g1 committed 100% of the coverage)"
+            g1BalBefore + CHALLENGER_BOND - burned,
+            "contribution returned plus the whole UNBURNED forfeit (g1 funded 100% of the pool)"
         );
+        assertEq(wood.balanceOf(game.BURN_ADDRESS()), burned, "and the burned slice left the system for good");
         assertEq(wood.balanceOf(address(game)), 0, "nothing stranded in the game");
         assertEq(game.bondedWood(), 0);
 

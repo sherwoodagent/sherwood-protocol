@@ -131,6 +131,26 @@ interface IExposureLedger {
     ///         should slash against; the raw reservation would over-slash.
     function allocatedUsd(address governor, uint256 proposalId, address guardian) external view returns (uint256);
 
+    /// @notice What a conviction on this proposal can ACTUALLY take, in USD-18 —
+    ///         the cohort's whole liability, not the sum of what it reserved.
+    /// @dev    Summing `approversOf` overstates this by a factor that GROWS WITH
+    ///         THE APPROVER COUNT: `recordApproval` deliberately reserves up to
+    ///         the full coverage from every approver, because at vote time any
+    ///         one of them might end up carrying it alone. `allocatedUsd` and
+    ///         `slashBpsFor` already price against the allocation for exactly
+    ///         that reason.
+    ///
+    ///         This exposes the same figure as ONE number, so callers outside
+    ///         the ledger need not re-derive the reservation/allocation
+    ///         distinction — re-deriving it is how `ChallengeGame.file()` came
+    ///         to size the challenger's bond off reservations, charging more to
+    ///         challenge a proposal the better covered it was (review 🟡F13).
+    ///
+    ///         `min(needUsd, effectiveTotal)`: allocations sum to the need when
+    ///         the cohort can cover it, and are bounded by what the cohort can
+    ///         actually pay when it cannot.
+    function liabilityUsd(address governor, uint256 proposalId) external view returns (uint256);
+
     /// @notice Return each approver's over-reservation once the review has shut
     ///         and the approver set is final. Permissionless; safe to skip.
     function settleCoverage(address governor, uint256 proposalId) external;

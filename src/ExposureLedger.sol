@@ -1208,6 +1208,30 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         return _allocate(mine, _effectiveTotal(key, priceX8), needUsd);
     }
 
+    /// @inheritdoc IExposureLedger
+    /// @dev Mirrors `slashBpsFor`'s own basis exactly — the same `needUsd`, the
+    ///      same `_effectiveTotal` — so the figure a challenger is charged
+    ///      against and the figure a conviction takes cannot drift apart. That
+    ///      drift is the bug this exists to close: `ChallengeGame.file()` summed
+    ///      `approversOf`, which is the RESERVATION, while every slash prices
+    ///      the ALLOCATION.
+    ///
+    ///      Reverts rather than returning a stale figure when the asset feed is
+    ///      down, inheriting `coverageUsd`'s `StalePrice` gate. A caller that
+    ///      must stay live through a feed outage has to say so explicitly — see
+    ///      `ChallengeGame.file()`, which catches and falls back.
+    function liabilityUsd(address governor, uint256 proposalId) external view returns (uint256) {
+        bytes32 key = _reviewKey(governor, proposalId);
+        uint256 effectiveTotal = _effectiveTotal(key, woodPriceX8());
+        if (effectiveTotal == 0) return 0;
+
+        ILedgerGovernorMinimal gov = ILedgerGovernorMinimal(governor);
+        uint256 needUsd = coverageUsd(
+            IVaultAssetMinimal(gov.getProposalView(proposalId).vault).asset(), gov.getRequiredCoverage(proposalId)
+        );
+        return needUsd < effectiveTotal ? needUsd : effectiveTotal;
+    }
+
     /// @dev Sum of `min(reserved, live bond)` across a proposal's approvers —
     ///      what the cohort can ACTUALLY pay, not what it pledged (review n1).
     ///

@@ -206,7 +206,9 @@ contract SlashToEscrowProportionalTest is Test {
         assertEq(before1, before2, "fixture: equal basis");
 
         vm.prank(slasher);
-        swood.slashToEscrow(bytes32("case"), openedAt, _pair(g1, g2), _rates(5000, 2500), address(vault), snapTs);
+        swood.slashToEscrow(
+            bytes32("case"), openedAt, _pair(g1, g2), _rates(5000, 2500), address(vault), snapTs, address(0), 0
+        );
 
         uint256 lost1 = before1 - swood.guardianStake(g1);
         uint256 lost2 = before2 - swood.guardianStake(g2);
@@ -226,7 +228,9 @@ contract SlashToEscrowProportionalTest is Test {
         uint256 before2 = swood.guardianStake(g2);
 
         vm.prank(slasher);
-        swood.slashToEscrow(bytes32("case"), openedAt, _pair(g1, g2), _rates(0, 5000), address(vault), snapTs);
+        swood.slashToEscrow(
+            bytes32("case"), openedAt, _pair(g1, g2), _rates(0, 5000), address(vault), snapTs, address(0), 0
+        );
 
         assertEq(swood.guardianStake(g1), before1, "zero rate takes nothing, not minSlashBps");
         assertEq(before2 - swood.guardianStake(g2), (STAKE * 5000) / 10_000, "the other is untouched by the skip");
@@ -240,7 +244,9 @@ contract SlashToEscrowProportionalTest is Test {
         uint256 before1 = swood.guardianStake(g1);
 
         vm.prank(slasher);
-        swood.slashToEscrow(bytes32("case"), openedAt, _pair(g1, g2), _rates(1, 0), address(vault), snapTs);
+        swood.slashToEscrow(
+            bytes32("case"), openedAt, _pair(g1, g2), _rates(1, 0), address(vault), snapTs, address(0), 0
+        );
 
         assertEq(before1 - swood.guardianStake(g1), (STAKE * MIN_SLASH_BPS) / 10_000, "1 bp floored to the minimum");
     }
@@ -253,7 +259,9 @@ contract SlashToEscrowProportionalTest is Test {
         uint256 before2 = swood.guardianStake(g2);
 
         vm.prank(slasher);
-        swood.slashToEscrow(bytes32("case"), openedAt, _pair(g1, g2), _rates(10_000, 2000), address(vault), snapTs);
+        swood.slashToEscrow(
+            bytes32("case"), openedAt, _pair(g1, g2), _rates(10_000, 2000), address(vault), snapTs, address(0), 0
+        );
 
         assertEq(before1 - swood.guardianStake(g1), (STAKE * MAX_SLASH_BPS) / 10_000, "g1 capped at the ceiling");
         assertEq(before2 - swood.guardianStake(g2), (STAKE * 2000) / 10_000, "g2 keeps its own sub-ceiling rate");
@@ -268,7 +276,7 @@ contract SlashToEscrowProportionalTest is Test {
 
         vm.prank(slasher);
         vm.expectRevert(IStakedWood.SlashBpsLengthMismatch.selector);
-        swood.slashToEscrow(bytes32("case"), openedAt, _pair(g1, g2), short, address(vault), snapTs);
+        swood.slashToEscrow(bytes32("case"), openedAt, _pair(g1, g2), short, address(vault), snapTs, address(0), 0);
     }
 
     // ── Option C: what the coverage number actually guarantees ────────────
@@ -317,7 +325,7 @@ contract SlashToEscrowProportionalTest is Test {
         uint256 own2Before = swood.guardianStake(g2);
 
         vm.prank(slasher);
-        swood.slashToEscrow(bytes32("verdict"), openedAt, accused, rates, address(vault), snapTs);
+        swood.slashToEscrow(bytes32("verdict"), openedAt, accused, rates, address(vault), snapTs, address(0), 0);
 
         // ── Value the WOOD actually taken at the ledger's own price.
         uint256 taken1 = own1Before - swood.guardianStake(g1);
@@ -393,7 +401,7 @@ contract SlashToEscrowProportionalTest is Test {
         uint256 before1 = swood.guardianStake(g1);
         uint256 before2 = swood.guardianStake(g2);
         vm.prank(slasher);
-        swood.slashToEscrow(bytes32("ceiling-verdict"), openedAt, accused, rates, address(vault), snapTs);
+        swood.slashToEscrow(bytes32("ceiling-verdict"), openedAt, accused, rates, address(vault), snapTs, address(0), 0);
 
         uint256 taken = (before1 - swood.guardianStake(g1)) + (before2 - swood.guardianStake(g2));
         uint256 recovered = (taken * ledger.woodPriceX8()) / 1e8;
@@ -413,8 +421,9 @@ contract SlashToEscrowProportionalTest is Test {
         uint256 start = swood.guardianStake(g1);
 
         vm.prank(slasher);
-        (uint256 firstTotal,) =
-            swood.slashToEscrow(bytes32("case-1"), openedAt, _pair(g1, g2), _rates(3000, 0), address(vault), snapTs);
+        (uint256 firstTotal,) = swood.slashToEscrow(
+            bytes32("case-1"), openedAt, _pair(g1, g2), _rates(3000, 0), address(vault), snapTs, address(0), 0
+        );
         assertGt(firstTotal, 0, "first conviction recovers");
 
         uint256 afterFirst = swood.guardianStake(g1);
@@ -429,7 +438,7 @@ contract SlashToEscrowProportionalTest is Test {
 
         vm.prank(slasher);
         (uint256 secondTotal,) = swood.slashToEscrow(
-            bytes32("case-2"), secondOpenedAt, _pair(g1, g2), _rates(3000, 0), address(vault), snapTs
+            bytes32("case-2"), secondOpenedAt, _pair(g1, g2), _rates(3000, 0), address(vault), snapTs, address(0), 0
         );
 
         assertGt(secondTotal, 0, "the SECOND conviction also recovers -- coverage nets");
