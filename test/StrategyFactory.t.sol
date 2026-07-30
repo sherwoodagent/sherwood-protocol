@@ -4,7 +4,7 @@ pragma solidity 0.8.28;
 import {Test} from "forge-std/Test.sol";
 import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {StrategyFactory} from "../src/StrategyFactory.sol";
-import {MoonwellSupplyStrategy} from "../src/strategies/MoonwellSupplyStrategy.sol";
+import {MockStrategy} from "./mocks/MockStrategy.sol";
 import {BaseStrategy} from "../src/strategies/BaseStrategy.sol";
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 import {MockMToken} from "./mocks/MockMToken.sol";
@@ -36,7 +36,7 @@ contract _MockVault {
 
 contract StrategyFactoryTest is Test {
     StrategyFactory factory;
-    MoonwellSupplyStrategy template;
+    MockStrategy template;
     ERC20Mock usdc;
     MockMToken mUsdc;
     _MockSyndicateRegistry registry;
@@ -49,7 +49,7 @@ contract StrategyFactoryTest is Test {
     function setUp() public {
         registry = new _MockSyndicateRegistry();
         factory = new StrategyFactory(address(registry), address(this));
-        template = new MoonwellSupplyStrategy();
+        template = new MockStrategy();
         // Sherlock #34: allowlist template.
         factory.setTemplateApproval(address(template), true);
         usdc = new ERC20Mock("USDC", "USDC", 6);
@@ -62,7 +62,7 @@ contract StrategyFactoryTest is Test {
         vm.prank(vaultOwner);
         address clone = factory.cloneAndInit(address(template), address(vault), vaultOwner, initData);
 
-        MoonwellSupplyStrategy strategy = MoonwellSupplyStrategy(payable(clone));
+        MockStrategy strategy = MockStrategy(payable(clone));
         assertEq(strategy.vault(), address(vault));
         // Sherlock run #2 #9 partial: proposer == msg.sender (the prank).
         assertEq(strategy.proposer(), vaultOwner);
@@ -78,7 +78,7 @@ contract StrategyFactoryTest is Test {
         // is rejected by the existing _initialized flag.
         vm.prank(attacker);
         vm.expectRevert(BaseStrategy.AlreadyInitialized.selector);
-        MoonwellSupplyStrategy(payable(clone)).initialize(attacker, attacker, initData);
+        MockStrategy(payable(clone)).initialize(attacker, attacker, initData);
     }
 
     function test_cloneAndInitDeterministic_predictableAddress() public {
