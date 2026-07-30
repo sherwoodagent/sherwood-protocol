@@ -2238,7 +2238,8 @@ contract ChallengeGameTest is Test {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Task 2 — three-valued Verdict: Inconclusive refunds both sides whole
+    // Task 2 — three-valued Verdict: Inconclusive unwinds both sides (pool
+    // whole, challenger bond minus the inconclusive burn — review #1 below)
     // ─────────────────────────────────────────────────────────────────────────
 
     /// @notice `Inconclusive` is a NON-VERDICT: nothing was adjudicated, so the
@@ -2246,7 +2247,13 @@ contract ChallengeGameTest is Test {
     ///         that burn prices an unanswered filing, and this one WAS
     ///         answered, just not decided) and the pool is booked for pull-claims
     ///         rather than pushed, exactly like the part-funded settle path.
-    function test_rule_inconclusive_refundsBothSidesWhole() public {
+    /// @dev Renamed from `test_rule_inconclusive_refundsBothSidesWhole` (review
+    ///      #1, 2026-07-30): the POOL still comes back whole — nothing was won
+    ///      or lost by the accused's defenders — but the CHALLENGER's bond no
+    ///      longer does, since a slice is now burned (see the
+    ///      `test_inconclusive_*` block above). "Both sides whole" stopped
+    ///      being true the moment the freeze itself got priced.
+    function test_rule_inconclusive_poolWholeChallengerBondMinusBurn() public {
         uint256 id = _fileAndDispute();
         uint256 challengerBefore = wood.balanceOf(challenger);
         uint256 bondedBefore = game.bondedWood();
@@ -2257,9 +2264,13 @@ contract ChallengeGameTest is Test {
 
         IChallengeGame.Challenge memory c = game.challengeOf(id);
         assertEq(uint256(c.status), uint256(IChallengeGame.Status.Inconclusive), "terminal status");
-        // Challenger bond back WHOLE - no settleBurn slice: nothing was adjudicated.
-        assertEq(wood.balanceOf(challenger) - challengerBefore, before.bondWood, "challenger whole");
-        // Pool booked as pull-claims, not pushed.
+        // Challenger bond back MINUS the inconclusive-path burn (review #1):
+        // an unwind no longer refunds the bond whole, unlike before this fix.
+        uint256 expectedBurn = before.bondWood * before.inconclusiveBurnBpsAtFiling / 10_000;
+        assertEq(
+            wood.balanceOf(challenger) - challengerBefore, before.bondWood - expectedBurn, "challenger bond minus burn"
+        );
+        // Pool booked as pull-claims, not pushed — untouched by the burn.
         assertEq(game.unclaimedWood(), before.counterBondWood, "pool booked");
         assertEq(game.bondedWood(), bondedBefore - before.bondWood - before.counterBondWood, "bonded released");
         // Freeze released: the proposal's coverage is live again.
@@ -2364,6 +2375,116 @@ contract ChallengeGameTest is Test {
         assertEq(wood.balanceOf(guardianA) - aBefore, aPut, "guardianA claimed exactly its stake");
         assertEq(wood.balanceOf(guardianB) - bBefore, bPut, "guardianB claimed exactly its stake");
         assertEq(game.unclaimedWood(), 0, "fully claimed, nothing stranded");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Review #1 (2026-07-30) — the Inconclusive path prices the freeze too
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice The challenger's bond is no longer returned whole on an
+    ///         `Inconclusive` unwind: a slice is burned, exactly like the
+    ///         silence-settle path burns `settleBurnBps` and the fail path
+    ///         forfeits the whole bond. Filing is never free, on ANY terminal
+    ///         path — this was the one exception.
+    function test_inconclusive_burnsASliceOfTheChallengerBond() public {
+        uint256 id = _fileAndDispute();
+        uint256 before = wood.balanceOf(challenger);
+        uint256 burnedBefore = wood.balanceOf(game.BURN_ADDRESS());
+        vm.prank(court);
+        game.rule(id, IChallengeGame.Verdict.Inconclusive);
+
+        IChallengeGame.Challenge memory c = game.challengeOf(id);
+        uint256 expectedBurn = c.bondWood * 500 / 10_000;
+        assertGt(expectedBurn, 0, "fixture must produce a non-trivial burn");
+        assertEq(wood.balanceOf(challenger) - before, c.bondWood - expectedBurn, "bond back MINUS the burn");
+        assertEq(wood.balanceOf(game.BURN_ADDRESS()) - burnedBefore, expectedBurn, "the slice was burned");
+    }
+
+    /// @notice The rate is pinned at filing, mirroring `settleBurnBpsAtFiling`
+    ///         and `forfeitBurnBpsAtFiling`: a post-filing raise must not bite
+    ///         a challenger who already committed its bond under the old rate.
+    function test_inconclusive_burnIsPinnedAtFiling() public {
+        uint256 id = _fileAndDispute();
+        vm.prank(owner);
+        game.setInconclusiveBurnBps(2_000); // raise AFTER filing
+        uint256 before = wood.balanceOf(challenger);
+        vm.prank(court);
+        game.rule(id, IChallengeGame.Verdict.Inconclusive);
+        IChallengeGame.Challenge memory c = game.challengeOf(id);
+        assertEq(c.inconclusiveBurnBpsAtFiling, 500, "the challenge keeps its filing rate");
+        assertEq(
+            wood.balanceOf(challenger) - before,
+            c.bondWood - (c.bondWood * 500 / 10_000),
+            "burned at the pinned rate, not the raised one"
+        );
+    }
+
+    /// @notice The burn comes off the CHALLENGER's bond only. The counter-bond
+    ///         pool is the accused's own money, posted to buy a defence that
+    ///         was never decided on the merits, and must come back whole.
+    function test_inconclusive_contributorsStillClaimTheirFullStake() public {
+        uint256 id = _fileAndDispute();
+        uint256 stake = game.counterBondContributionOf(id, guardianA);
+        vm.prank(court);
+        game.rule(id, IChallengeGame.Verdict.Inconclusive);
+        assertEq(game.claimableContribution(id, guardianA), stake, "pool untouched by the burn");
+    }
+
+    /// @notice THE GRIEF THE BURN PRICES: the M3 fix re-arms
+    ///         `challengeableUntil` on every `Inconclusive` unwind so a stall
+    ///         cannot buy a PERMANENT acquittal — but that same re-arming used
+    ///         to make the identical free cycle repeatable indefinitely
+    ///         against the same proposal. Each round now costs real WOOD, so
+    ///         re-arming the window is no longer free.
+    ///
+    ///         `balBefore` is captured BEFORE round 1 even files, not after —
+    ///         filing pulls the whole bond out of the challenger's balance,
+    ///         and ruling only ever hands back `bond - burn`, so a snapshot
+    ///         taken between those two steps would read as a net GAIN from
+    ///         ruling, not a cost. The net cost of a full file-then-unwind
+    ///         cycle is only visible measured from before the cycle starts.
+    ///
+    ///         Round 2 reuses `_fileAndDispute`, which re-executes the same
+    ///         proposal (`_fileStandard` always re-stamps `executedAt`) — no
+    ///         separate "fresh filing" helper was needed, because a fresh
+    ///         execution already produces its own `executedAt + challengeWindow`
+    ///         deadline well beyond `block.timestamp`, independent of whatever
+    ///         M3 re-armed `challengeableUntil` to.
+    function test_inconclusive_repeatedRoundsCostTheAttackerEachTime() public {
+        uint256 balBefore = wood.balanceOf(challenger);
+
+        uint256 first = _fileAndDispute();
+        vm.prank(court);
+        game.rule(first, IChallengeGame.Verdict.Inconclusive);
+        uint256 afterRound1 = wood.balanceOf(challenger);
+        assertLt(afterRound1, balBefore, "round 1 cost the challenger");
+
+        uint256 second = _fileAndDispute(); // the window was re-armed, so this is legal
+        vm.prank(court);
+        game.rule(second, IChallengeGame.Verdict.Inconclusive);
+        assertLt(wood.balanceOf(challenger), afterRound1, "round 2 cost it again");
+    }
+
+    function test_setInconclusiveBurnBps_boundsAndOwner() public {
+        // `MAX_INCONCLUSIVE_BURN_BPS` is `internal` on `ChallengeGame` (same
+        // visibility as `MAX_SETTLE_BURN_BPS`/`MAX_FORFEIT_BURN_BPS`, neither
+        // of which this suite's own bound tests read externally either), so
+        // the ceiling is asserted against the literal it is pinned to:
+        // `MAX_SETTLE_BURN_BPS == 5_000`.
+        vm.startPrank(owner);
+        vm.expectRevert(IChallengeGame.InvalidParameter.selector);
+        game.setInconclusiveBurnBps(5_001);
+        game.setInconclusiveBurnBps(5_000); // the ceiling itself is allowed
+        assertEq(game.inconclusiveBurnBps(), 5_000);
+        vm.stopPrank();
+
+        vm.prank(challenger);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, challenger));
+        game.setInconclusiveBurnBps(100);
+
+        vm.prank(owner);
+        game.setInconclusiveBurnBps(0); // zero legal - burn off
+        assertEq(game.inconclusiveBurnBps(), 0);
     }
 
     // ─────────────────────────────────────────────────────────────────────────

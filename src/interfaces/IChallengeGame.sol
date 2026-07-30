@@ -114,6 +114,12 @@ interface IChallengeGame {
     ///        to `IStakedWood.slashToEscrow` as `bountyBps` — but ONLY on an
     ///        escalated (`Guilty`-ruled) conviction, never on the silence
     ///        settle. See `ChallengeGame._settle`.
+    /// @param inconclusiveBurnBpsAtFiling The Inconclusive-unwind burn rate in
+    ///        force at filing (review #1, 2026-07-30), pinned for the same
+    ///        reason as every other rate above: the challenger relied on it
+    ///        when it decided to post the bond, and cannot withdraw once a
+    ///        court vote misses its participation floor out from under it. See
+    ///        `ChallengeGame._refundAll`.
     struct Challenge {
         address governor;
         uint256 proposalId;
@@ -133,6 +139,7 @@ interface IChallengeGame {
         uint256 settleBurnBpsAtFiling;
         uint256 forfeitBurnBpsAtFiling;
         uint256 convictionBountyBpsAtFiling;
+        uint256 inconclusiveBurnBpsAtFiling;
         /// @dev The forfeited challenger bond, net of the fail-path burn, that
         ///      the pool's funders split pro-rata to what each put in. Written
         ///      once by `_fail`, read by `claimContribution`, zero on every
@@ -265,11 +272,15 @@ interface IChallengeGame {
     ///        _settle`'s `contested` gate), no bounty is paid and this equals
     ///        the gross slash.
     event ChallengeSettled(uint256 indexed challengeId, uint256 slashedWood, uint256 caseId);
-    /// @dev The slice of the challenger's bond burned on the SETTLE path, so a
-    ///      filing is never free in either direction (review 🟠F4). Distinct
-    ///      from `ChallengeFailed.burnedWood`, which is the FAIL-path burn
-    ///      (`forfeitBurnBps`): one prices a correct filing, the other prices a
-    ///      wrong one, and a challenge only ever takes one of the two paths.
+    /// @dev The slice of the challenger's bond burned on the SETTLE path
+    ///      (`settleBurnBps`, review 🟠F4) or the INCONCLUSIVE unwind path
+    ///      (`inconclusiveBurnBps`, review #1 2026-07-30) — a filing is never
+    ///      free on either of the two paths where the challenger did nothing
+    ///      wrong, because an unanswered or unresolved filing still froze a
+    ///      cohort's coverage for the price of gas. Distinct from
+    ///      `ChallengeFailed.burnedWood`, which is the FAIL-path burn
+    ///      (`forfeitBurnBps`) charged to a challenger who was actually wrong;
+    ///      a challenge only ever takes one of the three paths.
     event ChallengerBondBurned(uint256 indexed challengeId, uint256 burnedWood);
     /// @dev A settle that convicted nothing because an earlier challenge on the
     ///      same proposal already did. The approvers' liability is one
@@ -328,6 +339,7 @@ interface IChallengeGame {
     event SettleBurnBpsSet(uint256 oldBps, uint256 newBps);
     event FilingsPausedSet(bool oldPaused, bool newPaused);
     event ConvictionBountyBpsSet(uint256 oldBps, uint256 newBps);
+    event InconclusiveBurnBpsSet(uint256 oldBps, uint256 newBps);
 
     // ── Filing ──
     /// @notice File a bonded challenge against an executed proposal, freezing
@@ -507,6 +519,20 @@ interface IChallengeGame {
     ///         `Inconclusive` unwind and the dispute timeout all route through
     ///         `_fail`/`_refundAll`, which slash nothing and so pay nothing.
     function convictionBountyBps() external view returns (uint256);
+    /// @notice Share of the challenger's bond burned on an `Inconclusive`
+    ///         unwind, in bps (review #1, 2026-07-30). Every OTHER terminal
+    ///         path prices the freeze a filing buys — the silence settle burns
+    ///         `settleBurnBps`, a failed challenge forfeits the whole bond, an
+    ///         escalated guilty verdict correctly charges nothing because the
+    ///         filing was right — except this one, where a court vote that
+    ///         misses its participation floor used to hand the whole bond back
+    ///         untouched. This contract cannot tell an honest challenger from
+    ///         one that filed purely to freeze a cohort's coverage and was
+    ///         content to let turnout do the rest; both look identical here.
+    ///         Deliberately BELOW `settleBurnBps`'s ceiling, never above it — a
+    ///         non-verdict recovered nothing, so it must never cost the
+    ///         challenger more than a verdict that actually recovered value.
+    function inconclusiveBurnBps() external view returns (uint256);
     /// @notice WOOD the game holds on behalf of live (`Filed`/`Disputed`)
     ///         challenges. The §4 invariant is `wood.balanceOf(game) >=
     ///         bondedWood`; the game pays out nothing but bonds, so the two are
@@ -567,4 +593,10 @@ interface IChallengeGame {
     function setSettleBurnBps(uint256 newBps) external;
     function setFilingsPaused(bool paused) external;
     function setConvictionBountyBps(uint256 newBps) external;
+    /// @notice Set the burned slice of an `Inconclusive` unwind's returned
+    ///         bond. Bounded by a ceiling at or below `settleBurnBps`'s own —
+    ///         a non-verdict must never be allowed to cost more than a verdict
+    ///         that actually recovered value. Zero is legal and restores the
+    ///         pre-fix behaviour (the whole bond back, untouched).
+    function setInconclusiveBurnBps(uint256 newBps) external;
 }

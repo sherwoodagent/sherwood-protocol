@@ -651,12 +651,23 @@ contract TokenCourtEndToEndTest is Test {
         assertEq(uint256(game.challengeOf(cid).status), uint256(IChallengeGame.Status.Inconclusive), "Inconclusive");
         assertEq(uint256(court.caseOf(caseId).verdict), uint256(IChallengeGame.Verdict.Inconclusive));
 
-        // ── The challenger's bond returns WHOLE -- no settle-path burn slice,
-        //    because an unwind is not a correct filing being rewarded.
-        assertEq(wood.balanceOf(challenger), challengerBalBefore, "the whole bond came back");
+        // ── The challenger's bond returns MINUS the inconclusive-path burn
+        //    (review #1, 2026-07-30): a court vote that misses its
+        //    participation floor still froze the accused cohort's coverage for
+        //    the price of gas, and this contract cannot tell that filing apart
+        //    from an honest one that simply drew a thin turnout -- so, exactly
+        //    like the silence-settle path's `settleBurnBps`, a slice is priced
+        //    rather than refunded whole.
+        IChallengeGame.Challenge memory c = game.challengeOf(cid);
+        uint256 expectedBurn = (c.bondWood * c.inconclusiveBurnBpsAtFiling) / 10_000;
+        assertGt(expectedBurn, 0, "fixture must produce a non-trivial burn");
+        assertEq(
+            wood.balanceOf(challenger),
+            challengerBalBefore - expectedBurn,
+            "the bond came back minus the inconclusive burn"
+        );
 
         // ── g1 collects EXACTLY its stake back -- no winnings, nothing was won.
-        IChallengeGame.Challenge memory c = game.challengeOf(cid);
         assertEq(game.claimableContribution(cid, g1), c.counterBondWood, "stake only, no forfeit to split");
         uint256 g1BalBeforeClaim = wood.balanceOf(g1);
         vm.prank(g1);

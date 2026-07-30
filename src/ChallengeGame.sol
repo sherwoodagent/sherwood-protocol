@@ -195,6 +195,20 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      on-chain reason to file at all.
     uint256 internal constant MAX_SETTLE_BURN_BPS = 5_000;
 
+    /// @dev Ceiling on `inconclusiveBurnBps` (review #1, 2026-07-30). Set
+    ///      IDENTICAL to `MAX_SETTLE_BURN_BPS`, not independently chosen,
+    ///      because the finding this rate answers is precisely an ordering
+    ///      constraint: an `Inconclusive` unwind is a NON-verdict — nothing was
+    ///      adjudicated, nothing was recovered — while the settle path's burn
+    ///      prices a filing that WAS answered and turned out correct. A
+    ///      non-verdict must never be allowed to cost the challenger more than
+    ///      a verdict that actually recovered value, or the contract would be
+    ///      pricing silence above proof. Reusing the same literal, rather than
+    ///      picking a fresh one that happens to satisfy "at or below" today,
+    ///      is what keeps that ordering true automatically if a future
+    ///      governance change ever revisits either ceiling.
+    uint256 internal constant MAX_INCONCLUSIVE_BURN_BPS = MAX_SETTLE_BURN_BPS;
+
     /// @notice Bond currency for both the challenger's bond and the accused's
     ///         counter-bond.
     IERC20 public immutable wood;
@@ -390,6 +404,43 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///         the bounty is safe here at any size, and why no anti-abuse
     ///         bound is needed beyond sWOOD's own ceiling.
     uint256 public convictionBountyBps = 500;
+
+    /// @notice Share of the challenger's bond burned on an `Inconclusive`
+    ///         unwind, in bps (review #1, 2026-07-30). Default 5%.
+    /// @dev    THE LAST FREE FREEZE, CLOSED. Every other terminal path already
+    ///         prices what filing bought: the silence settle burns
+    ///         `settleBurnBps`, a failed challenge forfeits the whole bond, and
+    ///         an escalated guilty verdict correctly charges nothing because
+    ///         the filing was right. `Inconclusive` was the one path that
+    ///         didn't — the court's vote missed its participation floor, the
+    ///         bond came back whole, and `_convicted` was never set. Filing
+    ///         still froze the accused cohort's coverage for the whole
+    ///         `autoSlashDelay` + adjudication window, for the price of gas.
+    ///         `file`'s own rule — "an unpriced or free challenge is a free
+    ///         freeze" — applied to every path but this one.
+    /// @dev    IT IS WORSE THAN A SINGLE FREE CYCLE. The M3 fix re-arms
+    ///         `challengeableUntil` on every `Inconclusive` unwind precisely so
+    ///         a stall cannot buy a PERMANENT acquittal — but that same
+    ///         re-arming means the SAME free cycle is now repeatable
+    ///         indefinitely against the same proposal, for as long as turnout
+    ///         keeps missing the floor. Capping the re-arm was rejected: that
+    ///         would partially reopen M3, whose whole point is that stalling
+    ///         must buy a delay, never an acquittal. Pricing every round
+    ///         instead is what re-bounds the repetition without touching the
+    ///         window extension at all.
+    /// @dev    THIS CONTRACT CANNOT TELL THE TWO CASES APART. An honest
+    ///         challenger whose evidence was real, and an attacker who filed
+    ///         purely to freeze a cohort's coverage and was content to let
+    ///         turnout do the rest, produce the IDENTICAL on-chain shape: a
+    ///         completed counter-bond pool, a vote that missed quorum. There is
+    ///         no signal here that separates them, so the price has to apply
+    ///         to both — same as every other burn in this contract.
+    /// @dev    DELIBERATELY BELOW `settleBurnBps`, and bounded by
+    ///         `MAX_INCONCLUSIVE_BURN_BPS` to stay that way: a non-verdict
+    ///         recovered nothing, so it must cost strictly less than a verdict
+    ///         that recovered real value, never more. 5% versus 20% is that
+    ///         asymmetry stated as defaults.
+    uint256 public inconclusiveBurnBps = 500;
 
     /// @notice WOOD held on behalf of live (`Filed`/`Disputed`) challenges —
     ///         the sum of their challenger bonds and counter-bond POOLS.
@@ -727,6 +778,13 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             // itself against. Forwarded to `slashToEscrow` only on an
             // escalated conviction — see `_settle`.
             convictionBountyBpsAtFiling: convictionBountyBps,
+            // Pinned for the same reason as every other rate above (review #1,
+            // 2026-07-30): the challenger relies on this rate the moment it
+            // posts the bond, with no way to withdraw once a court vote later
+            // misses its participation floor. A live read would let the owner
+            // raise it mid-dispute and take a larger bite of a bond the
+            // challenger committed under a lower one.
+            inconclusiveBurnBpsAtFiling: inconclusiveBurnBps,
             // Written only by `_fail`, which is the sole path that gives the
             // pool's funders anything beyond their stake back.
             forfeitPayoutWood: 0
@@ -1460,23 +1518,58 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     /// @dev THE `Inconclusive` PATH (spec 2026-07-28 §4) — AN UNWIND, NOT A
     ///      VERDICT. The court's vote missed its participation floor, so
     ///      neither side was found right or wrong: nothing here is a slash,
-    ///      nothing is a forfeit, both bonds simply come back.
+    ///      nothing is a forfeit, and the counter-bond pool simply comes back.
     ///
-    ///      THE CHALLENGER'S BOND RETURNS WHOLE, with no `settleBurnBps` slice.
-    ///      That burn exists to price a filing nobody answered (🟠F4) — the
-    ///      cost of a silence verdict. This challenger WAS answered; the
-    ///      dispute pool completed and escalated to the court. Burning an
-    ///      unwound bond here would charge the challenger for the
-    ///      electorate's apathy — a quorum failure it did not cause and could
-    ///      not have prevented — which is a bill nothing in §4 asks it to pay.
+    ///      THE CHALLENGER'S BOND IS NO LONGER RETURNED WHOLE (review #1,
+    ///      2026-07-30 — reversing this function's own earlier argument). The
+    ///      case for a full refund used to be that burning here "would charge
+    ///      the challenger for the electorate's apathy — a quorum failure it
+    ///      did not cause and could not have prevented." That argument does
+    ///      not survive contact with `file`'s own rule, stated plainly in its
+    ///      D4 comment: "an unpriced or free challenge is a free freeze, which
+    ///      is precisely what the bond exists to prevent." A full refund here
+    ///      made this the ONE terminal path where that rule did not hold —
+    ///      the silence settle burns `settleBurnBps`, a failed challenge
+    ///      forfeits the whole bond, an escalated guilty verdict correctly
+    ///      charges nothing because the filing was RIGHT — while an
+    ///      `Inconclusive` unwind filed the coverage frozen for the whole
+    ///      `autoSlashDelay` plus adjudication window, at the price of gas.
     ///
-    ///      THE POOL GOES THROUGH `_bookRefund`, NOT A DIRECT TRANSFER, for the
-    ///      same reason `_settle`'s part-funded branch does: `dispute` keeps
-    ///      open standing precisely because the payout is pull, not push (see
-    ///      `claimContribution`), and this path reaches the same unbounded
-    ///      contributor list `_settle`'s partial pool does. Pushing here would
-    ///      reintroduce the single-reverting-recipient hazard pull-payments
-    ///      exist to remove.
+    ///      AND THIS CONTRACT CANNOT TELL THE TWO CASES APART. An honest
+    ///      challenger whose evidence was real and an attacker who filed
+    ///      purely to freeze a cohort's coverage — content to let turnout do
+    ///      the rest — produce the identical on-chain shape here: a completed
+    ///      counter-bond pool, a vote that missed quorum. There is no signal
+    ///      to separate them, which is exactly the situation every other burn
+    ///      in this contract already prices rather than tries to adjudicate.
+    ///
+    ///      THE RATE IS DELIBERATELY BELOW `settleBurnBps`, and
+    ///      `MAX_INCONCLUSIVE_BURN_BPS` keeps it that way: a non-verdict
+    ///      recovered nothing, so it must cost strictly less than a verdict
+    ///      that recovered real value, never more.
+    ///
+    ///      PRICING EACH ROUND IS WHAT RE-BOUNDS THE REPETITION M3 OTHERWISE
+    ///      MAKES FREE. `_refundAll` re-arms `challengeableUntil` on every
+    ///      unwind so a stall cannot buy a PERMANENT acquittal — but that same
+    ///      re-arming means the identical free cycle was repeatable
+    ///      indefinitely against one proposal for as long as turnout kept
+    ///      missing the floor. Capping how many times the window could be
+    ///      re-armed was rejected in favour of this burn: a cap would partly
+    ///      reopen M3, whose whole point is that stalling must buy a delay,
+    ///      never an acquittal. Burning instead prices every round without
+    ///      touching the window extension at all — the stall still works, it
+    ///      is simply no longer free.
+    ///
+    ///      THE POOL IS UNTOUCHED. The burn comes off the CHALLENGER's bond
+    ///      only, mirroring `_settle`'s silence branch exactly. The pool is
+    ///      the accused's own money, posted to buy a defence that was never
+    ///      decided on the merits, and it goes through `_bookRefund`, not a
+    ///      direct transfer, for the same reason `_settle`'s part-funded
+    ///      branch does: `dispute` keeps open standing precisely because the
+    ///      payout is pull, not push (see `claimContribution`), and this path
+    ///      reaches the same unbounded contributor list `_settle`'s partial
+    ///      pool does. Pushing here would reintroduce the single-reverting-
+    ///      recipient hazard pull-payments exist to remove.
     ///
     ///      NO `_convicted` MARK AND NO DEMOTION. Nothing was adjudicated, so
     ///      there is no conviction to record and no adapter to demote — and
@@ -1524,7 +1617,19 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         }
 
         _bookRefund(challengeId, pool);
-        wood.safeTransfer(challenger, bond);
+
+        // Off the challenger's bond only — mirroring `_settle`'s silence
+        // branch to the letter, including the skipped zero-value transfer
+        // when the pinned rate is zero. `bond - burned` cannot underflow:
+        // integer division makes `burned <= bond` for any
+        // `inconclusiveBurnBpsAtFiling <= BPS_DENOMINATOR`, and the setter
+        // enforces a ceiling well below that.
+        uint256 burned = (bond * c.inconclusiveBurnBpsAtFiling) / BPS_DENOMINATOR;
+        if (burned != 0) {
+            wood.safeTransfer(BURN_ADDRESS, burned);
+            emit ChallengerBondBurned(challengeId, burned);
+        }
+        wood.safeTransfer(challenger, bond - burned);
         emit ChallengeInconclusive(challengeId, bond, pool);
     }
 
@@ -1965,6 +2070,26 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         if (newBps > swood.MAX_CONVICTION_BOUNTY_BPS()) revert InvalidParameter();
         emit ConvictionBountyBpsSet(convictionBountyBps, newBps);
         convictionBountyBps = newBps;
+    }
+
+    /// @dev Bounded [0, `MAX_INCONCLUSIVE_BURN_BPS`] (review #1, 2026-07-30).
+    ///      ZERO IS ALLOWED, exactly like `setSettleBurnBps` and
+    ///      `setForfeitBurnBps`: it restores the pre-fix behaviour (the whole
+    ///      bond back, untouched) and is the off-switch if this burn is ever
+    ///      shown to deter honest filers more than it deters the free-freeze
+    ///      it exists to price. The ceiling is `MAX_INCONCLUSIVE_BURN_BPS`,
+    ///      itself pinned to `MAX_SETTLE_BURN_BPS` — see that constant for why
+    ///      a non-verdict must never be allowed to cost more than a verdict
+    ///      that recovered real value.
+    /// @dev Applies to challenges FILED after the change, not to ones ruled
+    ///      after it — same reasoning as `setSettleBurnBps`'s own note:
+    ///      `inconclusiveBurnBpsAtFiling` is what the challenger relied on
+    ///      when it posted the bond, and it has no way to withdraw once a
+    ///      later court vote misses its participation floor.
+    function setInconclusiveBurnBps(uint256 newBps) external onlyOwner {
+        if (newBps > MAX_INCONCLUSIVE_BURN_BPS) revert InvalidParameter();
+        emit InconclusiveBurnBpsSet(inconclusiveBurnBps, newBps);
+        inconclusiveBurnBps = newBps;
     }
 
     /// @dev Gates `file` ONLY (see `filingsPaused`). Deliberately touches
