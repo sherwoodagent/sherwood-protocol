@@ -2260,13 +2260,29 @@ contract ChallengeGameTest is Test {
     ///      #1, 2026-07-30): the POOL still comes back whole — nothing was won
     ///      or lost by the accused's defenders — but the CHALLENGER's bond no
     ///      longer does, since a slice is now burned (see the
-    ///      `test_inconclusive_*` block above). "Both sides whole" stopped
+    ///      `test_inconclusive_*` block below). "Both sides whole" stopped
     ///      being true the moment the freeze itself got priced.
+    /// @dev ROUND 2, NOT ROUND 1 (owner decision 2026-07-30, review round 3):
+    ///      round 1 against a fresh proposal is priced at 0 bps under the
+    ///      escalating schedule (see `_inconclusiveBurnBpsForRound`), so
+    ///      measuring this property on a single `_fileAndDispute()` would
+    ///      exercise only the degenerate zero-burn case. A first, unmeasured
+    ///      round establishes the escalation before the assertions below run.
     function test_rule_inconclusive_poolWholeChallengerBondMinusBurn() public {
-        uint256 id = _fileAndDispute();
+        uint256 firstRoundId = _fileAndDispute();
+        vm.prank(court);
+        game.rule(firstRoundId, IChallengeGame.Verdict.Inconclusive); // round 1: free, unmeasured
+
+        uint256 id = _fileAndDispute(); // round 2: escalated, this is what the test measures
         uint256 challengerBefore = wood.balanceOf(challenger);
         uint256 bondedBefore = game.bondedWood();
+        // Round 1's own pool is ALREADY booked into `unclaimedWood` at this
+        // point (it went through the same `_bookRefund` path) — the
+        // assertion below must measure round 2's OWN contribution to it, not
+        // the running total.
+        uint256 unclaimedBefore = game.unclaimedWood();
         IChallengeGame.Challenge memory before = game.challengeOf(id);
+        assertGt(before.inconclusiveBurnBpsAtFiling, 0, "fixture must reach an escalated, non-zero round");
 
         vm.prank(court);
         game.rule(id, IChallengeGame.Verdict.Inconclusive);
@@ -2280,7 +2296,7 @@ contract ChallengeGameTest is Test {
             wood.balanceOf(challenger) - challengerBefore, before.bondWood - expectedBurn, "challenger bond minus burn"
         );
         // Pool booked as pull-claims, not pushed — untouched by the burn.
-        assertEq(game.unclaimedWood(), before.counterBondWood, "pool booked");
+        assertEq(game.unclaimedWood() - unclaimedBefore, before.counterBondWood, "pool booked");
         assertEq(game.bondedWood(), bondedBefore - before.bondWood - before.counterBondWood, "bonded released");
         // Freeze released: the proposal's coverage is live again.
         assertEq(game.liveChallengeCountOf(address(gov), PROPOSAL), 0, "freeze released");
@@ -2390,141 +2406,183 @@ contract ChallengeGameTest is Test {
     // Review #1 (2026-07-30) — the Inconclusive path prices the freeze too
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// @notice The challenger's bond is no longer returned whole on an
-    ///         `Inconclusive` unwind: a slice is burned, exactly like the
-    ///         silence-settle path burns `settleBurnBps` and the fail path
-    ///         forfeits the whole bond. Filing is never free, on ANY terminal
-    ///         path — this was the one exception.
-    function test_inconclusive_burnsASliceOfTheChallengerBond() public {
+    /// @notice ROUND 1 IS FREE (owner decision 2026-07-30, review round 3 —
+    ///         escalating the Inconclusive burn). A proposal's first-ever
+    ///         attempt — or its first since the escalation last reset — is not
+    ///         charged: an honest one-shot filer whose vote merely missed the
+    ///         participation floor pays nothing, exactly as before review #1.
+    ///         The escalation prices REPETITION, not a single unlucky vote.
+    function test_inconclusive_firstRoundIsFree() public {
         uint256 id = _fileAndDispute();
+        assertEq(game.challengeOf(id).inconclusiveBurnBpsAtFiling, 0, "round 1 pins a free rate");
+
         uint256 before = wood.balanceOf(challenger);
-        uint256 burnedBefore = wood.balanceOf(game.BURN_ADDRESS());
         vm.prank(court);
         game.rule(id, IChallengeGame.Verdict.Inconclusive);
-
-        IChallengeGame.Challenge memory c = game.challengeOf(id);
-        uint256 expectedBurn = c.bondWood * 500 / 10_000;
-        assertGt(expectedBurn, 0, "fixture must produce a non-trivial burn");
-        assertEq(wood.balanceOf(challenger) - before, c.bondWood - expectedBurn, "bond back MINUS the burn");
-        assertEq(wood.balanceOf(game.BURN_ADDRESS()) - burnedBefore, expectedBurn, "the slice was burned");
+        assertEq(wood.balanceOf(challenger) - before, game.challengeOf(id).bondWood, "the whole bond came back");
     }
 
-    /// @notice The rate is pinned at filing, mirroring `settleBurnBpsAtFiling`
-    ///         and `forfeitBurnBpsAtFiling`: a post-filing raise must not bite
-    ///         a challenger who already committed its bond under the old rate.
+    /// @notice THE FULL SCHEDULE, ROUND BY ROUND: 1 free, 2 at 5%, 3 at 10%,
+    ///         4 (and beyond) at the `inconclusiveBurnBps` steady state (20%
+    ///         by default). Each round reuses `_fileAndDispute`, which
+    ///         re-executes the same proposal (`_fileStandard` always
+    ///         re-stamps `executedAt`) and refiles well inside the window
+    ///         `_refundAll` just re-armed, so `inconclusiveRounds` climbs by
+    ///         exactly one per round without ever resetting.
+    function test_inconclusive_escalationSchedule() public {
+        bytes32 key = _reviewKeyFor(address(gov), PROPOSAL);
+
+        uint256 r1 = _fileAndDispute();
+        assertEq(game.challengeOf(r1).inconclusiveBurnBpsAtFiling, 0, "round 1: free");
+        vm.prank(court);
+        game.rule(r1, IChallengeGame.Verdict.Inconclusive);
+        assertEq(game.inconclusiveRounds(key), 1, "one round recorded");
+
+        uint256 r2 = _fileAndDispute();
+        assertEq(game.challengeOf(r2).inconclusiveBurnBpsAtFiling, 500, "round 2: 5%");
+        vm.prank(court);
+        game.rule(r2, IChallengeGame.Verdict.Inconclusive);
+
+        uint256 r3 = _fileAndDispute();
+        assertEq(game.challengeOf(r3).inconclusiveBurnBpsAtFiling, 1_000, "round 3: 10%");
+        vm.prank(court);
+        game.rule(r3, IChallengeGame.Verdict.Inconclusive);
+
+        uint256 r4 = _fileAndDispute();
+        assertEq(game.challengeOf(r4).inconclusiveBurnBpsAtFiling, 2_000, "round 4: the steady state");
+        vm.prank(court);
+        game.rule(r4, IChallengeGame.Verdict.Inconclusive);
+
+        uint256 r5 = _fileAndDispute();
+        assertEq(game.challengeOf(r5).inconclusiveBurnBpsAtFiling, 2_000, "round 5 (4+): stays at the steady state");
+    }
+
+    /// @notice THE ESCALATION IS REAL WOOD, NOT JUST A BIGGER BPS NUMBER: round
+    ///         3 must burn strictly more WOOD than round 2, on the same
+    ///         proposal with essentially the same bond size.
+    function test_inconclusive_escalationCostsMoreWoodEachRound() public {
+        uint256 r1 = _fileAndDispute();
+        vm.prank(court);
+        game.rule(r1, IChallengeGame.Verdict.Inconclusive); // round 1: free, establishes the streak
+
+        uint256 r2 = _fileAndDispute();
+        uint256 burnedBeforeR2 = wood.balanceOf(game.BURN_ADDRESS());
+        vm.prank(court);
+        game.rule(r2, IChallengeGame.Verdict.Inconclusive);
+        uint256 round2Burn = wood.balanceOf(game.BURN_ADDRESS()) - burnedBeforeR2;
+        assertGt(round2Burn, 0, "round 2 burns something");
+
+        uint256 r3 = _fileAndDispute();
+        uint256 burnedBeforeR3 = wood.balanceOf(game.BURN_ADDRESS());
+        vm.prank(court);
+        game.rule(r3, IChallengeGame.Verdict.Inconclusive);
+        uint256 round3Burn = wood.balanceOf(game.BURN_ADDRESS()) - burnedBeforeR3;
+        assertGt(round3Burn, round2Burn, "round 3 burns strictly more WOOD than round 2");
+    }
+
+    /// @notice The round-4+ tier's rate is pinned at filing, mirroring
+    ///         `settleBurnBpsAtFiling` and `forfeitBurnBpsAtFiling`: a
+    ///         post-filing raise of `inconclusiveBurnBps` must not bite a
+    ///         challenger who already committed its bond under the old rate.
+    ///         Exercised at round 4 specifically, since rounds 1-3 are fixed
+    ///         literals this setter cannot move at all.
     function test_inconclusive_burnIsPinnedAtFiling() public {
-        uint256 id = _fileAndDispute();
+        uint256 r1 = _fileAndDispute();
+        vm.prank(court);
+        game.rule(r1, IChallengeGame.Verdict.Inconclusive);
+        uint256 r2 = _fileAndDispute();
+        vm.prank(court);
+        game.rule(r2, IChallengeGame.Verdict.Inconclusive);
+        uint256 r3 = _fileAndDispute();
+        vm.prank(court);
+        game.rule(r3, IChallengeGame.Verdict.Inconclusive);
+
+        uint256 id = _fileAndDispute(); // round 4: reads inconclusiveBurnBps at filing
         vm.prank(owner);
-        game.setInconclusiveBurnBps(2_000); // raise AFTER filing
+        game.setInconclusiveBurnBps(500); // lower AFTER filing (still legal: <= live settleBurnBps)
         uint256 before = wood.balanceOf(challenger);
         vm.prank(court);
         game.rule(id, IChallengeGame.Verdict.Inconclusive);
         IChallengeGame.Challenge memory c = game.challengeOf(id);
-        assertEq(c.inconclusiveBurnBpsAtFiling, 500, "the challenge keeps its filing rate");
+        assertEq(c.inconclusiveBurnBpsAtFiling, 2_000, "the challenge keeps its filing-time rate");
         assertEq(
             wood.balanceOf(challenger) - before,
-            c.bondWood - (c.bondWood * 500 / 10_000),
-            "burned at the pinned rate, not the raised one"
+            c.bondWood - (c.bondWood * 2_000 / 10_000),
+            "burned at the pinned rate, not the lowered one"
         );
     }
 
-    /// @notice The burn comes off the CHALLENGER's bond only. The counter-bond
-    ///         pool is the accused's own money, posted to buy a defence that
-    ///         was never decided on the merits, and must come back whole.
-    function test_inconclusive_contributorsStillClaimTheirFullStake() public {
-        uint256 id = _fileAndDispute();
-        uint256 stake = game.counterBondContributionOf(id, guardianA);
+    /// @notice THE GRIND RESETS WHEN THE WINDOW LAPSES NATURALLY (owner
+    ///         decision 2026-07-30): if nobody refiles before the re-armed
+    ///         `challengeableUntil` passes, the repetition streak is over, so
+    ///         an old, cold proposal must not keep punishing a later,
+    ///         unrelated legitimate filer at an escalated rate forever.
+    function test_inconclusive_roundsResetAfterTheWindowLapsesNaturally() public {
+        uint256 r1 = _fileAndDispute();
         vm.prank(court);
-        game.rule(id, IChallengeGame.Verdict.Inconclusive);
-        assertEq(game.claimableContribution(id, guardianA), stake, "pool untouched by the burn");
-    }
-
-    /// @notice THE GRIEF THE BURN PRICES: the M3 fix re-arms
-    ///         `challengeableUntil` on every `Inconclusive` unwind so a stall
-    ///         cannot buy a PERMANENT acquittal — but that same re-arming used
-    ///         to make the identical free cycle repeatable indefinitely
-    ///         against the same proposal. Each round now costs real WOOD, so
-    ///         re-arming the window is no longer free.
-    ///
-    ///         `balBefore` is captured BEFORE round 1 even files, not after —
-    ///         filing pulls the whole bond out of the challenger's balance,
-    ///         and ruling only ever hands back `bond - burn`, so a snapshot
-    ///         taken between those two steps would read as a net GAIN from
-    ///         ruling, not a cost. The net cost of a full file-then-unwind
-    ///         cycle is only visible measured from before the cycle starts.
-    ///
-    ///         Round 2 reuses `_fileAndDispute`, which re-executes the same
-    ///         proposal (`_fileStandard` always re-stamps `executedAt`) — no
-    ///         separate "fresh filing" helper was needed, because a fresh
-    ///         execution already produces its own `executedAt + challengeWindow`
-    ///         deadline well beyond `block.timestamp`, independent of whatever
-    ///         M3 re-armed `challengeableUntil` to.
-    function test_inconclusive_repeatedRoundsCostTheAttackerEachTime() public {
-        uint256 balBefore = wood.balanceOf(challenger);
-
-        uint256 first = _fileAndDispute();
-        vm.prank(court);
-        game.rule(first, IChallengeGame.Verdict.Inconclusive);
-        uint256 afterRound1 = wood.balanceOf(challenger);
-        assertLt(afterRound1, balBefore, "round 1 cost the challenger");
-
-        // Re-execution alone makes this refiling legal (see the docstring
-        // above) — `_fileAndDispute`'s `_fileStandard` re-stamps `executedAt`,
-        // so this round's own window covers it independent of the M3 re-arm.
-        uint256 second = _fileAndDispute();
-        vm.prank(court);
-        game.rule(second, IChallengeGame.Verdict.Inconclusive);
-        assertLt(wood.balanceOf(challenger), afterRound1, "round 2 cost it again");
-    }
-
-    /// @notice THE MOTIVATING CASE ITSELF (review round 2, 2026-07-30): unlike
-    ///         `test_inconclusive_repeatedRoundsCostTheAttackerEachTime` above
-    ///         — where round 2's legality comes from a fresh execution's own
-    ///         `executedAt + challengeWindow`, making the M3 re-arm irrelevant
-    ///         to that test — this one proves a SECOND filing against the
-    ///         SAME execution, legal ONLY because the first round's
-    ///         `Inconclusive` unwind re-armed `challengeableUntil` past the
-    ///         ordinary deadline, ALSO burns. Crib's `_fileStandardAt` +
-    ///         `_completePoolAt`'s fixture shape from
-    ///         `test_inconclusive_extendsTheRechallengeWindow`, which already
-    ///         proves the window re-arm in isolation; this proves the burn
-    ///         travels with it.
-    function test_inconclusive_secondRoundThroughTheRearmedWindowAlsoBurns() public {
-        // Captured BEFORE round 1 even files, not after — filing pulls the
-        // whole bond out of the challenger's balance and ruling only ever
-        // hands back `bond - burn`, so a snapshot taken between those two
-        // steps would read as a net GAIN from ruling rather than a cost (see
-        // `test_inconclusive_repeatedRoundsCostTheAttackerEachTime`'s
-        // identical note).
-        uint256 balBeforeRound1 = wood.balanceOf(challenger);
-        uint256 id = _fileStandardAt(PROPOSAL, 3 days);
-        _completePoolAt(id, 7 days - 1); // stall to the edge of autoSlashDelay: rules late
-        vm.prank(court);
-        game.rule(id, IChallengeGame.Verdict.Inconclusive);
-        uint256 afterRound1 = wood.balanceOf(challenger);
-        assertLt(afterRound1, balBeforeRound1, "round 1 burned");
-
-        uint256 executedAt = _executedAt(PROPOSAL);
-        uint256 ordinaryDeadline = executedAt + game.challengeWindow();
-        // Warp PAST the ordinary deadline: without the re-arm, a fresh filing
-        // here would revert `WindowClosed`.
-        vm.warp(ordinaryDeadline + 1 days);
+        game.rule(r1, IChallengeGame.Verdict.Inconclusive);
         bytes32 key = _reviewKeyFor(address(gov), PROPOSAL);
-        assertGt(game.challengeableUntil(key), vm.getBlockTimestamp(), "still open only via the re-arm");
+        assertEq(game.inconclusiveRounds(key), 1, "round 1 recorded");
 
-        // `_fileStandardFrom` files WITHOUT re-executing — the same
-        // `executedAt` as round 1, so the re-armed floor is the ONLY thing
-        // that makes this legal. `afterRound1`, captured above BEFORE this
-        // filing pulls a second bond, is the correct baseline for round 2's
-        // own cost — the same reasoning as round 1's baseline, restated.
-        uint256 second = _fileStandardFrom(challenger, PROPOSAL);
-        vm.prank(guardianA);
-        game.dispute(second, type(uint256).max);
+        // Let the re-armed window lapse naturally: nobody refiles inside it.
+        vm.warp(game.challengeableUntil(key) + 1);
 
+        uint256 r2 = _fileAndDispute(); // a fresh execution makes this legal again
+        assertEq(game.inconclusiveRounds(key), 0, "the streak reset before this filing incremented anything");
+        assertEq(game.challengeOf(r2).inconclusiveBurnBpsAtFiling, 0, "priced as a fresh round 1, not round 2");
+    }
+
+    /// @notice SYBIL-RESISTANCE: the escalation is keyed on the PROPOSAL
+    ///         (`reviewKey`), not on the challenger. A different address
+    ///         filing round 2 against the same proposal, still inside the
+    ///         re-armed window, still pays the escalated rate — switching
+    ///         identity buys no reset. Same tradeoff `_convicted` and
+    ///         `challengeableUntil` already make, for the same reason.
+    function test_inconclusive_sybilCannotResetTheEscalationWithADifferentChallenger() public {
+        uint256 r1 = _fileAndDispute(); // filed by `challenger`
         vm.prank(court);
-        game.rule(second, IChallengeGame.Verdict.Inconclusive);
-        assertLt(
-            wood.balanceOf(challenger), afterRound1, "the round reachable only through the re-armed window burns too"
+        game.rule(r1, IChallengeGame.Verdict.Inconclusive);
+
+        address sybil = makeAddr("sybilChallenger");
+        wood.mint(sybil, 10_000_000e18);
+        vm.prank(sybil);
+        wood.approve(address(game), type(uint256).max);
+        vm.prank(sybil);
+        uint256 r2 = game.file(
+            address(gov), PROPOSAL, IChallengeGame.Predicate.OutOfAdapterOutflow, ADAPTER, SELECTOR, EVIDENCE
+        );
+        assertEq(game.challengeOf(r2).inconclusiveBurnBpsAtFiling, 500, "the sybil still pays the escalated rate");
+    }
+
+    /// @notice THE CLAMP, NOT A REVERT, WHEN `settleBurnBps` SITS BELOW THE
+    ///         SCHEDULE. Rounds 2/3 are fixed literals (500/1,000 bps), not
+    ///         covered by the `setSettleBurnBps`/`setInconclusiveBurnBps`
+    ///         cross-check pair (that pair only bounds the round-4+ tier), so
+    ///         lowering `settleBurnBps` below one of them must not revert
+    ///         `file` — it must silently clamp the pinned rate down instead,
+    ///         since a revert here would block filing entirely.
+    function test_inconclusive_clampsToTheLiveSettleBurnBpsWhenLoweredBelowTheSchedule() public {
+        vm.startPrank(owner);
+        // The two-sided setter check refuses `settleBurnBps` below the live
+        // `inconclusiveBurnBps`, so the round-4+ tier must come down first.
+        game.setInconclusiveBurnBps(800);
+        game.setSettleBurnBps(800); // now below the round-3 schedule step (1_000)
+        vm.stopPrank();
+
+        uint256 r1 = _fileAndDispute();
+        vm.prank(court);
+        game.rule(r1, IChallengeGame.Verdict.Inconclusive);
+
+        uint256 r2 = _fileAndDispute();
+        assertEq(game.challengeOf(r2).inconclusiveBurnBpsAtFiling, 500, "round 2's 5% is still under the ceiling");
+        vm.prank(court);
+        game.rule(r2, IChallengeGame.Verdict.Inconclusive);
+
+        uint256 r3 = _fileAndDispute();
+        assertEq(
+            game.challengeOf(r3).inconclusiveBurnBpsAtFiling,
+            800,
+            "round 3's 1_000bps schedule step clamps to the live settleBurnBps instead of reverting"
         );
     }
 
@@ -2571,14 +2629,18 @@ contract ChallengeGameTest is Test {
     }
 
     /// @notice Direction 2 of the same ordering: `setSettleBurnBps` must
-    ///         refuse to drop below the live `inconclusiveBurnBps`.
+    ///         refuse to drop below the live `inconclusiveBurnBps`. Both
+    ///         default to 2,000 now (owner decision 2026-07-30 changed
+    ///         `inconclusiveBurnBps`'s default from 500 to 2,000, repurposing
+    ///         it as the round-4+ steady state), so the probe values shift
+    ///         accordingly from the review-round-2 version of this test.
     function test_setSettleBurnBps_revertsBelowTheLiveInconclusiveBurnBps() public {
-        assertEq(game.inconclusiveBurnBps(), 500, "sanity: the default this bound is checked against");
+        assertEq(game.inconclusiveBurnBps(), 2_000, "sanity: the default this bound is checked against");
         vm.startPrank(owner);
         vm.expectRevert(IChallengeGame.InvalidParameter.selector);
-        game.setSettleBurnBps(499); // one bps below the live inconclusiveBurnBps
-        game.setSettleBurnBps(500); // equal to it is fine
-        assertEq(game.settleBurnBps(), 500);
+        game.setSettleBurnBps(1_999); // one bps below the live inconclusiveBurnBps
+        game.setSettleBurnBps(2_000); // equal to it is fine
+        assertEq(game.settleBurnBps(), 2_000);
         vm.stopPrank();
     }
 

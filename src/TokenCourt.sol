@@ -363,8 +363,11 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     /// @inheritdoc ITokenCourt
     /// @dev    THE VERDICT TABLE (spec §3), and why each branch fails safe:
     ///         - `turnout == 0 || turnout < floor` -> `Inconclusive`. This is a
-    ///           NON-EVENT that unwinds both sides whole (`IChallengeGame.rule`'s
-    ///           own natspec), not an acquittal-with-forfeit. A thin or absent
+    ///           NON-EVENT that unwinds both sides — the accused's
+    ///           counter-bond whole, the challenger's bond minus the escalating
+    ///           Inconclusive burn (`IChallengeGame._refundAll`, owner decision
+    ///           2026-07-30) — never an acquittal-with-forfeit: neither side
+    ///           pays the OTHER. A thin or absent
     ///           vote answers nothing about guilt, so it must not be read as an
     ///           answer in either direction — the D6 anti-capture floor exists
     ///           precisely so a small, possibly rented, stake cannot manufacture
@@ -518,11 +521,26 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     /// @dev  THE LIVE READ ALSO MEANS the owner can, by raising
     ///       `participationFloorBps` before a pending `finalize`, push a live
     ///       case that would otherwise have cleared the floor down into
-    ///       `Inconclusive` instead. Accepted for the same D6 reason above:
-    ///       `Inconclusive` unwinds both sides whole and the proposal stays
-    ///       re-challengeable, so the owner's live lever here can only ever
-    ///       withhold a verdict — it moves no money to anyone and cannot
-    ///       manufacture a conviction or an acquittal it did not earn.
+    ///       `Inconclusive` instead. Accepted for the same D6 reason above,
+    ///       BUT NO LONGER MONEY-NEUTRAL (review round 3, 2026-07-30 —
+    ///       corrected; this claim was accurate when written and stopped
+    ///       being true the moment `IChallengeGame._refundAll` started
+    ///       burning a slice of the challenger's bond on this path). The
+    ///       lever still cannot MANUFACTURE a conviction or an acquittal it
+    ///       did not earn, and it still moves nothing to the accused or to
+    ///       the owner — but it is no longer true that "it moves no money to
+    ///       anyone": forcing a live case into `Inconclusive` instead of the
+    ///       `Guilty`/`NotGuilty` verdict it would otherwise have reached
+    ///       destroys a real slice of the challenger's bond that a clean
+    ///       verdict would not have (a `Guilty` verdict returns the bond
+    ///       WHOLE; only the forced `Inconclusive` burns any of it). The
+    ///       magnitude is small and itself bounded — the same escalating
+    ///       schedule that prices every other `Inconclusive` unwind, capped
+    ///       well below what a real verdict recovers — but it is destroyed
+    ///       value, not a neutral withholding, and the owner is trusted not
+    ///       to use this lever that way for the same reason the owner is
+    ///       trusted with every other live-read parameter in this contract
+    ///       family.
     /// @dev  `stakedWood` IS LIKEWISE READ LIVE HERE, not pinned per-case: this
     ///       `total` comes from whichever contract `stakedWood` names at
     ///       `finalize` time, while `accusedWeight` was already fixed against
@@ -570,7 +588,9 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///       `stakedAt` and flooring its own contribution to `ageFloorBps`.
     ///       That shrinks the subtrahend, RAISES the floor, and can push a
     ///       case the accused was certain to lose into `Inconclusive` (which
-    ///       unwinds both sides whole and escapes the slash entirely). The
+    ///       escapes the slash entirely — the accused's counter-bond returns
+    ///       whole, and only the challenger's bond takes the escalating
+    ///       Inconclusive burn, owner decision 2026-07-30). The
     ///       raw basis is immune: `getPastStake` reads the checkpointed
     ///       amount directly, with no live, re-anchorable factor for a
     ///       pending unstake request to move.

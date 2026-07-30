@@ -767,9 +767,11 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///         between the drain and `refer`, re-anchoring its `stakedAt` and
     ///         flooring its own contribution to `ageFloorBps`. That shrinks
     ///         the subtrahend, RAISES the participation floor, and can push a
-    ///         case the accused was certain to lose into `Inconclusive`
-    ///         (which unwinds both sides whole and escapes the slash
-    ///         entirely). This getter is immune: it reads the checkpointed
+    ///         case the accused was certain to lose into `Inconclusive` (which
+    ///         escapes the slash entirely — the accused's counter-bond returns
+    ///         whole, and only the challenger's bond takes the escalating
+    ///         Inconclusive burn, owner decision 2026-07-30). This getter is
+    ///         immune: it reads the checkpointed
     ///         amount directly, with no live, re-anchorable factor for a
     ///         pending unstake request to move. A future refactor that
     ///         "harmonises the two bases" onto `getPastVotes` would reopen

@@ -94,7 +94,7 @@ The escalated path does not have this problem, because the accused fought back a
 | Correct, unanswered | −$10k | **−$10k (unchanged, by decision)** |
 | Disputed → Guilty | +$50k | **+$100k** |
 | Disputed → NotGuilty | −$50k | −$50k |
-| Disputed → Inconclusive | 0 | 0 |
+| Disputed → Inconclusive | 0 | **0 (round 1), then −$2.5k / −$5k / −$10k** (rounds 2/3/4+, escalating burn, §8) |
 
 ### Accepted costs
 
@@ -254,6 +254,17 @@ New: `convictionBountyBps = 500`, bounded `[0, 2_000]`, pinned per challenge, ze
 
 **No anti-abuse pre-flight is required.** The escalated-only rule of §2 removes the attack a bound would have guarded against: a liar cannot reach the bounty without first surviving a contested vote, and being contested costs them the whole bond.
 
+**New: the Inconclusive burn escalates per proposal, not per challenger.** `_refundAll` now increments `mapping(bytes32 reviewKey => uint256) public inconclusiveRounds`, alongside the existing `challengeableUntil` re-arm, whenever a non-convicted proposal goes `Inconclusive`. `file()` reads the count and pins the resulting rate into `inconclusiveBurnBpsAtFiling` on the `Challenge` struct — pinned at filing exactly like every other rate, never retroactive:
+
+```solidity
+mapping(bytes32 reviewKey => uint256) public inconclusiveRounds;
+uint256 inconclusiveBurnBpsAtFiling; // on Challenge, pinned in file()
+```
+
+Schedule: round 1 (first-ever attempt against a proposal) → **0 bps**, free — an honest one-shot filer whose vote merely missed quorum is not charged. Round 2 → **500 bps**. Round 3 → **1,000 bps**. Round 4 and beyond → **`inconclusiveBurnBps`** (repurposed: was a flat rate for every round, now specifically the round-4+ steady-state target; default 2,000 bps, matching `settleBurnBps`'s default — the ceiling this whole burn family (`settleBurnBps`/`forfeitBurnBps`/`inconclusiveBurnBps`) is built around: a non-verdict must never cost more than a verdict that recovered real value). `file()` resets `inconclusiveRounds[reviewKey]` to zero once `block.timestamp > challengeableUntil[reviewKey]` — the re-armed window lapsed with nobody refiling inside it, so the grind streak is over and a cold proposal does not punish a later, unrelated filer. Keyed on `reviewKey` alone, not `(reviewKey, challenger)` — the same tradeoff `_convicted` and `challengeableUntil` already make, since per-challenger keying lets a sybil reset the escalation by switching addresses between rounds.
+
+`inconclusiveBurnBps` stays cross-checked against `settleBurnBps` in both directions via `setInconclusiveBurnBps`/`setSettleBurnBps` (unchanged mechanism from a prior review round). **That check only covers the round-4+ tier — the round 2/3 flat steps (500/1,000 bps) are not bounded by it.** So `setSettleBurnBps` can now legally be lowered to a value below 500 or 1,000. Reverting `file()` over that interaction is unacceptable — filing must never fail for a parameter reason — so `file()` additionally clamps: whatever the schedule's raw target is for the round in question, the pinned rate is `min(raw, live settleBurnBps)`. This is a new invariant, not previously documented: the clamp never reverts, it silently prices the round at the live ceiling instead.
+
 Tests:
 
 - Bounty paid on the escalated `Guilty` ruling ONLY — not on the silence settle, not on `_fail`, not on `_refundAll`, not on the `_convicted` short-circuit.
@@ -261,4 +272,6 @@ Tests:
 - Bounty pinned at filing — moving `convictionBountyBps` mid-challenge does not move the payout.
 - Exited holder refused; current holder with historical weight accepted; holder with present stake but no snapshot weight still refused.
 - Inconclusive → re-file succeeds at day 20 (fails today); the extension only ever lengthens.
+- Inconclusive-round escalation: round 1 pins 0 bps; round 2 pins 500; round 3 pins 1,000; round 4+ pins live `inconclusiveBurnBps`; a lapsed `challengeableUntil` resets the counter before the next `file()`.
+- Round 2/3 clamp: `setSettleBurnBps` lowered below 500 (or 1,000) makes the corresponding round's `file()` pin `settleBurnBps`, not the schedule value, and does not revert.
 - The mutation battery re-run over all of the above — a test that does not fail under the corresponding mutation does not count.

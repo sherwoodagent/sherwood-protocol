@@ -651,21 +651,18 @@ contract TokenCourtEndToEndTest is Test {
         assertEq(uint256(game.challengeOf(cid).status), uint256(IChallengeGame.Status.Inconclusive), "Inconclusive");
         assertEq(uint256(court.caseOf(caseId).verdict), uint256(IChallengeGame.Verdict.Inconclusive));
 
-        // ── The challenger's bond returns MINUS the inconclusive-path burn
-        //    (review #1, 2026-07-30): a court vote that misses its
-        //    participation floor still froze the accused cohort's coverage for
-        //    the price of gas, and this contract cannot tell that filing apart
-        //    from an honest one that simply drew a thin turnout -- so, exactly
-        //    like the silence-settle path's `settleBurnBps`, a slice is priced
-        //    rather than refunded whole.
+        // ── The challenger's bond returns WHOLE on THIS filing specifically
+        //    (owner decision 2026-07-30, escalating the Inconclusive burn):
+        //    it is this proposal's first-ever challenge, and round 1 of the
+        //    escalating schedule is priced at 0 bps -- an honest one-shot
+        //    filer whose vote merely missed the participation floor once is
+        //    not charged. A SECOND Inconclusive round against the SAME
+        //    proposal would escalate (see `ChallengeGame.t.sol`'s
+        //    `test_inconclusive_escalationSchedule` for the full ladder);
+        //    this arc test covers the single-round happy path only.
         IChallengeGame.Challenge memory c = game.challengeOf(cid);
-        uint256 expectedBurn = (c.bondWood * c.inconclusiveBurnBpsAtFiling) / 10_000;
-        assertGt(expectedBurn, 0, "fixture must produce a non-trivial burn");
-        assertEq(
-            wood.balanceOf(challenger),
-            challengerBalBefore - expectedBurn,
-            "the bond came back minus the inconclusive burn"
-        );
+        assertEq(c.inconclusiveBurnBpsAtFiling, 0, "round 1 against a fresh proposal is free");
+        assertEq(wood.balanceOf(challenger), challengerBalBefore, "the whole bond came back");
 
         // ── g1 collects EXACTLY its stake back -- no winnings, nothing was won.
         assertEq(game.claimableContribution(cid, g1), c.counterBondWood, "stake only, no forfeit to split");

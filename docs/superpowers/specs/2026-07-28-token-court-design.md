@@ -56,7 +56,7 @@ Decisions locked during brainstorm (2026-07-28):
 |---|---|
 | Human backstop | **Pause only, on `ChallengeGame.file`** — stops new cases entering; no human ever touches a live case or a verdict |
 | Vote privacy | **Open voting** (single tx per voter; commit-reveal explicitly deferred — revisit only on observed tally-watching) |
-| Floor miss | **Inconclusive: refund both sides** (acquit, no forfeit, no conviction mark; proposal re-challengeable) |
+| Floor miss | **Inconclusive: refund both sides** (acquit, no conviction mark; proposal re-challengeable) — **amended (`2026-07-29-court-incentives-design.md` §8):** refund is no longer whole past round 1; the challenger's bond takes an escalating per-round burn (0 / 5% / 10% / 20%) to price repeated grinding of the same proposal, capped at live `settleBurnBps` |
 | Voter incentives | **Bare vote on-chain.** Electorate = permissionless `stakeAsGuardian` sWOOD stakers with aged weight; incentives, if any, are off-chain |
 | Migration | **Rebuild on `e` before merge** — PR #26 closes unmerged; token court cut from its reviewed parts |
 
@@ -237,7 +237,7 @@ fail-safe governs).
 ### Verdict enum and rule
 
 ```solidity
-enum Verdict { Inconclusive, NotGuilty, Guilty }  // zero value is the harmless full unwind, never the max-slash conviction
+enum Verdict { Inconclusive, NotGuilty, Guilty }  // zero value is the no-conviction unwind (escalating burn past round 1, §4 below), never the max-slash conviction
 function rule(uint256 challengeId, Verdict verdict) external; // onlyCourt, requires Disputed
 ```
 
@@ -251,10 +251,19 @@ contributors via #50's pull machinery). `Inconclusive → _refundAll` (new).
 - Status → `Status.Inconclusive` (enum **appended**; existing members keep
   their values — indexers unaffected).
 - `bondedWood -= bond + pool`; freeze released via `_releaseFreeze`.
-- Challenger bond returned **whole** — no `settleBurnBps` slice. Nothing was
-  adjudicated; this is an unwind, not a verdict, and burning an unwound bond
-  would price electorate apathy onto the challenger (the exact harm the
-  Inconclusive outcome exists to avoid).
+- Challenger bond burns on an **escalating, per-proposal schedule**, pinned at
+  filing (`inconclusiveBurnBpsAtFiling`): round 1 (first-ever attempt against
+  the proposal) is free, then 5% / 10% / 20% of bond for rounds 2/3/4+,
+  clamped to the live `settleBurnBps` ceiling (full schedule and rationale:
+  `2026-07-29-court-incentives-design.md` §8). A full refund was the original
+  call here — burning an unwound bond looked like pricing the electorate's
+  apathy onto a challenger who did nothing wrong. That argument didn't
+  survive the M3 fix: once `challengeableUntil` re-arms on every Inconclusive
+  unwind, a full refund makes Inconclusive the cheapest way to freeze an
+  accused cohort's coverage, repeatable indefinitely for nothing but gas.
+  Escalating the burn per round prices the repetition specifically, while
+  round 1 staying free keeps a genuine one-shot filer whose vote merely
+  missed quorum unpunished.
 - Contributions booked into **#50's pull machinery** (`unclaimedWood` +
   `claimContribution`), never a push loop: open standing makes the contributor
   list unbounded.
@@ -308,8 +317,10 @@ floor tests.
 
 New:
 
-- Inconclusive end-to-end: bonds whole, freeze released, no conviction mark,
-  re-challenge of the same proposal succeeds.
+- Inconclusive end-to-end: bond whole on round 1, escalating burn on rounds
+  2/3/4+ per the pinned schedule (`2026-07-29-court-incentives-design.md`
+  §8), freeze released, no conviction mark, re-challenge of the same
+  proposal succeeds.
 - Clock-check boundary: referral at exactly `remaining == voteWindow + buffer`
   passes; one second less refuses.
 - Auto-refer: fires on pool completion; court revert does not brick `dispute`
