@@ -114,12 +114,6 @@ interface IChallengeGame {
     ///        to `IStakedWood.slashToEscrow` as `bountyBps` — but ONLY on an
     ///        escalated (`Guilty`-ruled) conviction, never on the silence
     ///        settle. See `ChallengeGame._settle`.
-    /// @param inconclusiveBurnBpsAtFiling The Inconclusive-unwind burn rate in
-    ///        force at filing (review #1, 2026-07-30), pinned for the same
-    ///        reason as every other rate above: the challenger relied on it
-    ///        when it decided to post the bond, and cannot withdraw once a
-    ///        court vote misses its participation floor out from under it. See
-    ///        `ChallengeGame._refundAll`.
     struct Challenge {
         address governor;
         uint256 proposalId;
@@ -139,13 +133,27 @@ interface IChallengeGame {
         uint256 settleBurnBpsAtFiling;
         uint256 forfeitBurnBpsAtFiling;
         uint256 convictionBountyBpsAtFiling;
-        uint256 inconclusiveBurnBpsAtFiling;
         /// @dev The forfeited challenger bond, net of the fail-path burn, that
         ///      the pool's funders split pro-rata to what each put in. Written
         ///      once by `_fail`, read by `claimContribution`, zero on every
         ///      other path. Storing the TOTAL rather than paying it out is what
         ///      lets a claimant compute its own share in O(1).
         uint256 forfeitPayoutWood;
+        /// @dev The Inconclusive-unwind burn rate in force at filing (review
+        ///      #1, 2026-07-30), pinned for the same reason as every other
+        ///      rate above: the challenger relied on it when it decided to
+        ///      post the bond, and cannot withdraw once a court vote misses
+        ///      its participation floor out from under it. See
+        ///      `ChallengeGame._refundAll`.
+        ///
+        ///      TRUE APPEND, not grouped with the other `*AtFiling` rates
+        ///      above (review round 2, 2026-07-30): `forfeitPayoutWood` was
+        ///      already the trailing field at `9f3a07a`, and inserting this
+        ///      one ahead of it — however naturally it reads alongside its
+        ///      sibling rates — would shift `forfeitPayoutWood`'s tuple
+        ///      position for anything decoding `challengeOf()` positionally.
+        ///      Appending after it costs nothing but the grouping.
+        uint256 inconclusiveBurnBpsAtFiling;
     }
 
     // ── Errors ──
@@ -529,9 +537,15 @@ interface IChallengeGame {
     ///         untouched. This contract cannot tell an honest challenger from
     ///         one that filed purely to freeze a cohort's coverage and was
     ///         content to let turnout do the rest; both look identical here.
-    ///         Deliberately BELOW `settleBurnBps`'s ceiling, never above it — a
-    ///         non-verdict recovered nothing, so it must never cost the
+    ///         Deliberately kept BELOW the LIVE `settleBurnBps`, never above it
+    ///         — a non-verdict recovered nothing, so it must never cost the
     ///         challenger more than a verdict that actually recovered value.
+    ///         Enforced by `setInconclusiveBurnBps`/`setSettleBurnBps` each
+    ///         cross-checking the OTHER's current value (review round 2,
+    ///         2026-07-30) — sharing a ceiling with `settleBurnBps` bounds
+    ///         both rates' maximums identically but says nothing about where
+    ///         either live rate actually sits, which a ceiling-only check on
+    ///         each setter left open.
     function inconclusiveBurnBps() external view returns (uint256);
     /// @notice WOOD the game holds on behalf of live (`Filed`/`Disputed`)
     ///         challenges. The §4 invariant is `wood.balanceOf(game) >=
@@ -590,13 +604,21 @@ interface IChallengeGame {
     function setForfeitBurnBps(uint256 newBps) external;
     function setAutoSlashDelay(uint256 newDelay) external;
     function setDisputeTimeout(uint256 newTimeout) external;
+    /// @notice Set the settle-path burn. ALSO REJECTS dropping below the LIVE
+    ///         `inconclusiveBurnBps` (review round 2, 2026-07-30): the two
+    ///         rates share a ceiling, but a ceiling-only check on this setter
+    ///         let it fall below an unchanged `inconclusiveBurnBps`, inverting
+    ///         the ordering that burn exists to guarantee.
     function setSettleBurnBps(uint256 newBps) external;
     function setFilingsPaused(bool paused) external;
     function setConvictionBountyBps(uint256 newBps) external;
     /// @notice Set the burned slice of an `Inconclusive` unwind's returned
-    ///         bond. Bounded by a ceiling at or below `settleBurnBps`'s own —
-    ///         a non-verdict must never be allowed to cost more than a verdict
-    ///         that actually recovered value. Zero is legal and restores the
+    ///         bond. Bounded by a ceiling at or below `settleBurnBps`'s own,
+    ///         AND rejects rising above the LIVE `settleBurnBps` itself
+    ///         (review round 2, 2026-07-30) — a non-verdict must never be
+    ///         allowed to cost more than a verdict that actually recovered
+    ///         value, and the shared ceiling alone did not guarantee that
+    ///         ordering against the live rates. Zero is legal and restores the
     ///         pre-fix behaviour (the whole bond back, untouched).
     function setInconclusiveBurnBps(uint256 newBps) external;
 }

@@ -828,8 +828,13 @@ contract ChallengeGameTest is Test {
     ///         Raising 0 -> 5,000 mid-window takes half the refund of a filing
     ///         that turned out to be correct.
     function test_resolve_settleBurnIsPinnedAtFiling() public {
-        vm.prank(owner);
+        vm.startPrank(owner);
+        // `setSettleBurnBps` now refuses to drop below the live
+        // `inconclusiveBurnBps` (review round 2, 2026-07-30) — zero it first,
+        // or the default 500 `inconclusiveBurnBps` would refuse this call.
+        game.setInconclusiveBurnBps(0);
         game.setSettleBurnBps(0); // filed under a full-refund regime
+        vm.stopPrank();
         uint256 id = _fileStandard(PROPOSAL);
         uint256 bond = game.challengeOf(id).bondWood;
         uint256 before = wood.balanceOf(challenger);
@@ -1838,6 +1843,10 @@ contract ChallengeGameTest is Test {
         vm.startPrank(owner);
         vm.expectRevert(IChallengeGame.InvalidParameter.selector);
         game.setSettleBurnBps(5_001);
+        // `setSettleBurnBps` now refuses to drop below the live
+        // `inconclusiveBurnBps` (review round 2, 2026-07-30) — zero it first,
+        // or the default 500 `inconclusiveBurnBps` would refuse this call.
+        game.setInconclusiveBurnBps(0);
         game.setSettleBurnBps(0);
         vm.stopPrank();
 
@@ -2459,19 +2468,75 @@ contract ChallengeGameTest is Test {
         uint256 afterRound1 = wood.balanceOf(challenger);
         assertLt(afterRound1, balBefore, "round 1 cost the challenger");
 
-        uint256 second = _fileAndDispute(); // the window was re-armed, so this is legal
+        // Re-execution alone makes this refiling legal (see the docstring
+        // above) — `_fileAndDispute`'s `_fileStandard` re-stamps `executedAt`,
+        // so this round's own window covers it independent of the M3 re-arm.
+        uint256 second = _fileAndDispute();
         vm.prank(court);
         game.rule(second, IChallengeGame.Verdict.Inconclusive);
         assertLt(wood.balanceOf(challenger), afterRound1, "round 2 cost it again");
     }
 
+    /// @notice THE MOTIVATING CASE ITSELF (review round 2, 2026-07-30): unlike
+    ///         `test_inconclusive_repeatedRoundsCostTheAttackerEachTime` above
+    ///         — where round 2's legality comes from a fresh execution's own
+    ///         `executedAt + challengeWindow`, making the M3 re-arm irrelevant
+    ///         to that test — this one proves a SECOND filing against the
+    ///         SAME execution, legal ONLY because the first round's
+    ///         `Inconclusive` unwind re-armed `challengeableUntil` past the
+    ///         ordinary deadline, ALSO burns. Crib's `_fileStandardAt` +
+    ///         `_completePoolAt`'s fixture shape from
+    ///         `test_inconclusive_extendsTheRechallengeWindow`, which already
+    ///         proves the window re-arm in isolation; this proves the burn
+    ///         travels with it.
+    function test_inconclusive_secondRoundThroughTheRearmedWindowAlsoBurns() public {
+        // Captured BEFORE round 1 even files, not after — filing pulls the
+        // whole bond out of the challenger's balance and ruling only ever
+        // hands back `bond - burn`, so a snapshot taken between those two
+        // steps would read as a net GAIN from ruling rather than a cost (see
+        // `test_inconclusive_repeatedRoundsCostTheAttackerEachTime`'s
+        // identical note).
+        uint256 balBeforeRound1 = wood.balanceOf(challenger);
+        uint256 id = _fileStandardAt(PROPOSAL, 3 days);
+        _completePoolAt(id, 7 days - 1); // stall to the edge of autoSlashDelay: rules late
+        vm.prank(court);
+        game.rule(id, IChallengeGame.Verdict.Inconclusive);
+        uint256 afterRound1 = wood.balanceOf(challenger);
+        assertLt(afterRound1, balBeforeRound1, "round 1 burned");
+
+        uint256 executedAt = _executedAt(PROPOSAL);
+        uint256 ordinaryDeadline = executedAt + game.challengeWindow();
+        // Warp PAST the ordinary deadline: without the re-arm, a fresh filing
+        // here would revert `WindowClosed`.
+        vm.warp(ordinaryDeadline + 1 days);
+        bytes32 key = _reviewKeyFor(address(gov), PROPOSAL);
+        assertGt(game.challengeableUntil(key), vm.getBlockTimestamp(), "still open only via the re-arm");
+
+        // `_fileStandardFrom` files WITHOUT re-executing — the same
+        // `executedAt` as round 1, so the re-armed floor is the ONLY thing
+        // that makes this legal. `afterRound1`, captured above BEFORE this
+        // filing pulls a second bond, is the correct baseline for round 2's
+        // own cost — the same reasoning as round 1's baseline, restated.
+        uint256 second = _fileStandardFrom(challenger, PROPOSAL);
+        vm.prank(guardianA);
+        game.dispute(second, type(uint256).max);
+
+        vm.prank(court);
+        game.rule(second, IChallengeGame.Verdict.Inconclusive);
+        assertLt(
+            wood.balanceOf(challenger), afterRound1, "the round reachable only through the re-armed window burns too"
+        );
+    }
+
+    /// @notice Bounded [0, `MAX_INCONCLUSIVE_BURN_BPS`], owner-only. The
+    ///         ceiling is exercised with `settleBurnBps` first raised to its
+    ///         own ceiling, isolating this bound from the cross-setter
+    ///         ordering check covered separately below — otherwise `5_000`
+    ///         would collide with the default 2,000 `settleBurnBps` and this
+    ///         test would be proving the wrong revert.
     function test_setInconclusiveBurnBps_boundsAndOwner() public {
-        // `MAX_INCONCLUSIVE_BURN_BPS` is `internal` on `ChallengeGame` (same
-        // visibility as `MAX_SETTLE_BURN_BPS`/`MAX_FORFEIT_BURN_BPS`, neither
-        // of which this suite's own bound tests read externally either), so
-        // the ceiling is asserted against the literal it is pinned to:
-        // `MAX_SETTLE_BURN_BPS == 5_000`.
         vm.startPrank(owner);
+        game.setSettleBurnBps(5_000); // headroom for the ceiling case below
         vm.expectRevert(IChallengeGame.InvalidParameter.selector);
         game.setInconclusiveBurnBps(5_001);
         game.setInconclusiveBurnBps(5_000); // the ceiling itself is allowed
@@ -2485,6 +2550,36 @@ contract ChallengeGameTest is Test {
         vm.prank(owner);
         game.setInconclusiveBurnBps(0); // zero legal - burn off
         assertEq(game.inconclusiveBurnBps(), 0);
+    }
+
+    /// @notice THE CROSS-SETTER ORDERING, BOTH DIRECTIONS (review round 2,
+    ///         2026-07-30). Equal ceilings (`MAX_INCONCLUSIVE_BURN_BPS ==
+    ///         MAX_SETTLE_BURN_BPS`) bound the two rates' maximums
+    ///         identically but say nothing about where the LIVE rates sit —
+    ///         each setter must additionally check the OTHER's current value,
+    ///         or the owner could legally invert the ordering one call at a
+    ///         time. This is direction 1: `setInconclusiveBurnBps` must refuse
+    ///         to rise above the live `settleBurnBps`.
+    function test_setInconclusiveBurnBps_revertsAboveTheLiveSettleBurnBps() public {
+        assertEq(game.settleBurnBps(), 2_000, "sanity: the default this bound is checked against");
+        vm.startPrank(owner);
+        vm.expectRevert(IChallengeGame.InvalidParameter.selector);
+        game.setInconclusiveBurnBps(2_001); // one bps above the live settleBurnBps
+        game.setInconclusiveBurnBps(2_000); // equal to it is fine
+        assertEq(game.inconclusiveBurnBps(), 2_000);
+        vm.stopPrank();
+    }
+
+    /// @notice Direction 2 of the same ordering: `setSettleBurnBps` must
+    ///         refuse to drop below the live `inconclusiveBurnBps`.
+    function test_setSettleBurnBps_revertsBelowTheLiveInconclusiveBurnBps() public {
+        assertEq(game.inconclusiveBurnBps(), 500, "sanity: the default this bound is checked against");
+        vm.startPrank(owner);
+        vm.expectRevert(IChallengeGame.InvalidParameter.selector);
+        game.setSettleBurnBps(499); // one bps below the live inconclusiveBurnBps
+        game.setSettleBurnBps(500); // equal to it is fine
+        assertEq(game.settleBurnBps(), 500);
+        vm.stopPrank();
     }
 
     // ─────────────────────────────────────────────────────────────────────────

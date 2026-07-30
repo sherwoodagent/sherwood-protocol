@@ -203,10 +203,20 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      prices a filing that WAS answered and turned out correct. A
     ///      non-verdict must never be allowed to cost the challenger more than
     ///      a verdict that actually recovered value, or the contract would be
-    ///      pricing silence above proof. Reusing the same literal, rather than
-    ///      picking a fresh one that happens to satisfy "at or below" today,
-    ///      is what keeps that ordering true automatically if a future
-    ///      governance change ever revisits either ceiling.
+    ///      pricing silence above proof.
+    /// @dev THIS CONSTANT ALONE DOES NOT ENFORCE THAT ORDERING (review round
+    ///      2, 2026-07-30 — corrected). Equal ceilings bound the two RATES'
+    ///      maximum legal values identically; they say nothing about where the
+    ///      LIVE rates actually sit, and each setter originally checked only
+    ///      its own ceiling. That let the owner set `inconclusiveBurnBps` to
+    ///      4,000 while `settleBurnBps` sat at its 500 default — both calls
+    ///      individually legal, together inverting the exact ordering this
+    ///      constant's own comment claims to guarantee. The two setters below
+    ///      now cross-check each other's LIVE value, not just this shared
+    ///      ceiling — see `setSettleBurnBps` and `setInconclusiveBurnBps`. This
+    ///      is the same class of bug as sWOOD's bounty ceiling, the ledger's
+    ///      challenge window and the window invariant's five doors: guarding
+    ///      one side of a two-sided constraint guards nothing.
     uint256 internal constant MAX_INCONCLUSIVE_BURN_BPS = MAX_SETTLE_BURN_BPS;
 
     /// @notice Bond currency for both the challenger's bond and the accused's
@@ -435,11 +445,15 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///         completed counter-bond pool, a vote that missed quorum. There is
     ///         no signal here that separates them, so the price has to apply
     ///         to both — same as every other burn in this contract.
-    /// @dev    DELIBERATELY BELOW `settleBurnBps`, and bounded by
-    ///         `MAX_INCONCLUSIVE_BURN_BPS` to stay that way: a non-verdict
-    ///         recovered nothing, so it must cost strictly less than a verdict
-    ///         that recovered real value, never more. 5% versus 20% is that
-    ///         asymmetry stated as defaults.
+    /// @dev    DELIBERATELY BELOW `settleBurnBps`, and kept that way by BOTH
+    ///         setters cross-checking each other's LIVE value (review round 2,
+    ///         2026-07-30), not merely by sharing a ceiling with it: a
+    ///         non-verdict recovered nothing, so it must cost strictly less
+    ///         than a verdict that recovered real value, never more. 5% versus
+    ///         20% is that asymmetry stated as defaults. See
+    ///         `setInconclusiveBurnBps`/`setSettleBurnBps` for the enforcement
+    ///         and `MAX_INCONCLUSIVE_BURN_BPS` for why the shared ceiling by
+    ///         itself was not enough.
     uint256 public inconclusiveBurnBps = 500;
 
     /// @notice WOOD held on behalf of live (`Filed`/`Disputed`) challenges —
@@ -778,16 +792,22 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             // itself against. Forwarded to `slashToEscrow` only on an
             // escalated conviction — see `_settle`.
             convictionBountyBpsAtFiling: convictionBountyBps,
+            // Written only by `_fail`, which is the sole path that gives the
+            // pool's funders anything beyond their stake back.
+            forfeitPayoutWood: 0,
             // Pinned for the same reason as every other rate above (review #1,
             // 2026-07-30): the challenger relies on this rate the moment it
             // posts the bond, with no way to withdraw once a court vote later
             // misses its participation floor. A live read would let the owner
             // raise it mid-dispute and take a larger bite of a bond the
             // challenger committed under a lower one.
-            inconclusiveBurnBpsAtFiling: inconclusiveBurnBps,
-            // Written only by `_fail`, which is the sole path that gives the
-            // pool's funders anything beyond their stake back.
-            forfeitPayoutWood: 0
+            //
+            // TRUE APPEND (review round 2, 2026-07-30): ordered here, after
+            // `forfeitPayoutWood`, to match the struct's true-append field
+            // order — see `IChallengeGame.Challenge`'s own note on why this
+            // field sits last rather than grouped with the other `*AtFiling`
+            // rates above.
+            inconclusiveBurnBpsAtFiling: inconclusiveBurnBps
         });
         _lastChallenge[key] = challengeId;
         _liveByChallenger[challengerKey] = challengeId;
@@ -1543,10 +1563,14 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      to separate them, which is exactly the situation every other burn
     ///      in this contract already prices rather than tries to adjudicate.
     ///
-    ///      THE RATE IS DELIBERATELY BELOW `settleBurnBps`, and
-    ///      `MAX_INCONCLUSIVE_BURN_BPS` keeps it that way: a non-verdict
-    ///      recovered nothing, so it must cost strictly less than a verdict
-    ///      that recovered real value, never more.
+    ///      THE RATE IS DELIBERATELY BELOW `settleBurnBps`, and BOTH setters
+    ///      cross-check each other's LIVE value to keep it that way (review
+    ///      round 2, 2026-07-30) — the shared `MAX_INCONCLUSIVE_BURN_BPS`
+    ///      ceiling alone was not enough, since equal ceilings bound the two
+    ///      rates' maximums identically without saying anything about where
+    ///      either LIVE rate sits. A non-verdict recovered nothing, so it must
+    ///      cost strictly less than a verdict that recovered real value, never
+    ///      more. See `setInconclusiveBurnBps`/`setSettleBurnBps`.
     ///
     ///      PRICING EACH ROUND IS WHAT RE-BOUNDS THE REPETITION M3 OTHERWISE
     ///      MAKES FREE. `_refundAll` re-arms `challengeableUntil` on every
@@ -2037,8 +2061,22 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      it live let a raise take up to half the refund of a filing that had
     ///      already turned out to be correct, which is the same retroactivity
     ///      `autoSlashDelayAtFiling` exists to prevent.
+    /// @dev ALSO REFUSES TO DROP BELOW THE LIVE `inconclusiveBurnBps` (review
+    ///      round 2, 2026-07-30). `MAX_INCONCLUSIVE_BURN_BPS ==
+    ///      MAX_SETTLE_BURN_BPS` bounds the two rates' CEILINGS identically but
+    ///      says nothing about where either LIVE rate sits — checking only
+    ///      this setter's own ceiling let the owner drop `settleBurnBps` below
+    ///      an unchanged `inconclusiveBurnBps`, inverting the ordering the
+    ///      Inconclusive burn exists to guarantee (a non-verdict must never
+    ///      cost more than a verdict that recovered real value). This is the
+    ///      OTHER of the two doors onto that constraint; see
+    ///      `setInconclusiveBurnBps` for the door on the far side, and the
+    ///      class of bug this repeats — sWOOD's bounty ceiling, the ledger's
+    ///      challenge window, the window invariant's five doors — each
+    ///      guarded once and bitten from the side left open.
     function setSettleBurnBps(uint256 newBps) external onlyOwner {
         if (newBps > MAX_SETTLE_BURN_BPS) revert InvalidParameter();
+        if (newBps < inconclusiveBurnBps) revert InvalidParameter();
         emit SettleBurnBpsSet(settleBurnBps, newBps);
         settleBurnBps = newBps;
     }
@@ -2081,6 +2119,16 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      itself pinned to `MAX_SETTLE_BURN_BPS` — see that constant for why
     ///      a non-verdict must never be allowed to cost more than a verdict
     ///      that recovered real value.
+    /// @dev ALSO REFUSES TO RISE ABOVE THE LIVE `settleBurnBps` (review round
+    ///      2, 2026-07-30 — the ceiling check above is necessary but not
+    ///      sufficient). Sharing a ceiling with `settleBurnBps` bounds both
+    ///      rates' MAXIMUM legal values identically; it does not stop this
+    ///      rate from being set ABOVE an unchanged, lower `settleBurnBps` — the
+    ///      owner could legally raise this to 4,000 while `settleBurnBps` sat
+    ///      at its 500 default, both calls individually within their own
+    ///      ceilings, together inverting the ordering this burn exists to
+    ///      guarantee. This is one of the two doors onto that constraint; see
+    ///      `setSettleBurnBps` for the door on the far side.
     /// @dev Applies to challenges FILED after the change, not to ones ruled
     ///      after it — same reasoning as `setSettleBurnBps`'s own note:
     ///      `inconclusiveBurnBpsAtFiling` is what the challenger relied on
@@ -2088,6 +2136,7 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      later court vote misses its participation floor.
     function setInconclusiveBurnBps(uint256 newBps) external onlyOwner {
         if (newBps > MAX_INCONCLUSIVE_BURN_BPS) revert InvalidParameter();
+        if (newBps > settleBurnBps) revert InvalidParameter();
         emit InconclusiveBurnBpsSet(inconclusiveBurnBps, newBps);
         inconclusiveBurnBps = newBps;
     }
