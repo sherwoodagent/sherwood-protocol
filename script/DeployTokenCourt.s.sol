@@ -117,25 +117,35 @@ contract DeployTokenCourt is Script {
  *      match on BOTH contracts. A split here means the electorate that votes
  *      is not the cohort that gets slashed: the court could convict against
  *      one set of checkpoints while `_settle` slashes against another.
- * @dev PRE-FLIGHT 3 — THE CROSS-CONTRACT WINDOW INVARIANT, load-bearing and
- *      otherwise unenforced anywhere on-chain: `game.autoSlashDelay() +
- *      court.voteWindow() + court.FINALIZE_BUFFER() <= game.disputeTimeout()`.
- *      A counter-bond pool may complete as late as `filedAt + autoSlashDelay`
- *      (the instant the pool fills is the earliest the game's own
- *      auto-referral can fire, and it is also the LATEST a manual `refer` is
- *      still answering a live dispute rather than a moot one) — and from
- *      that instant a referral needs `voteWindow + FINALIZE_BUFFER` of
- *      runway before the challenge dies at `filedAt + disputeTimeout`. If the
- *      sum exceeds the timeout, the referral window is NEGATIVE: no referral
- *      is possible, auto or manual, and every disputed challenge free-wins
- *      for the accused. `ChallengeGame.setAutoSlashDelay` accepts anything
- *      strictly below `disputeTimeout` on its own, with no view onto the
- *      court's `voteWindow` at all — and `TokenCourt.setVoteWindow` is
- *      bounded only by `MAX_VOTE_WINDOW`, with no view onto the game's
- *      clocks either. Neither contract can check this alone; it is checked
- *      HERE, at deploy pre-flight, per `ChallengeGame.dispute`'s own natspec
- *      pointer to "Task 10". At defaults: `7 days + 5 days + 1 days == 13
- *      days <= 30 days` OK, with 17 days of referral slack.
+ * @dev PRE-FLIGHT 3 — THE CROSS-CONTRACT WINDOW INVARIANT:
+ *      `game.autoSlashDelay() + court.voteWindow() + court.FINALIZE_BUFFER()
+ *      <= game.disputeTimeout()`. CORRECTED (review 2026-07-29 audit, item 6
+ *      — three claims below were true before that review and are not now):
+ *      both contracts enforce this too as of "guard the wiring setters" —
+ *      `ChallengeGame.setAutoSlashDelay` / `setDisputeTimeout` / `setCourt`
+ *      and `TokenCourt.setVoteWindow` / `setChallengeGame` each check it
+ *      against whatever the OTHER contract is CURRENTLY wired to at call
+ *      time, so this is no longer "otherwise unenforced anywhere on-chain",
+ *      `setAutoSlashDelay` is no longer blind to the court's `voteWindow`, and
+ *      neither contract is checking this "alone" — each checks it against the
+ *      other's live state. What THIS pre-flight still covers, and the only
+ *      thing it covers: a pair's very FIRST wiring, before either side has
+ *      anything to validate against. `ChallengeGame.setCourt`'s check is
+ *      vacuous while `court == address(0)` (by design — unwiring must always
+ *      stay legal, the fail-safe off-switch), and a court that has never
+ *      called `setChallengeGame` has no game to check either — so the very
+ *      first handshake between a fresh pair still needs an external check,
+ *      which is what this script is. A counter-bond pool may complete as late
+ *      as `filedAt + autoSlashDelay` (the instant the pool fills is the
+ *      earliest the game's own auto-referral can fire, and it is also the
+ *      LATEST a manual `refer` is still answering a live dispute rather than
+ *      a moot one) — and from that instant a referral needs
+ *      `voteWindow + FINALIZE_BUFFER` of runway before the challenge dies at
+ *      `filedAt + disputeTimeout`. If the sum exceeds the timeout, the
+ *      referral window is NEGATIVE: no referral is possible, auto or manual,
+ *      and every disputed challenge free-wins for the accused. At defaults:
+ *      `7 days + 5 days + 1 days == 13 days <= 30 days` OK, with 17 days of
+ *      referral slack.
  * @dev PRE-FLIGHT 4 — LAUNCH-MATH: `court.participationFloorBps() <
  *      swood.ageFloorBps()` (spec §5). Turnout is measured with AGED weight
  *      (`getPastVotes`), while the floor's base is RAW total stake

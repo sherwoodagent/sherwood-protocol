@@ -105,8 +105,25 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     }
 
     /// @inheritdoc ITokenCourt
+    /// @dev GUARDS THE WIRING ITSELF (review 2026-07-29 audit, item 1 BLOCKER
+    ///      — PROVEN executable, same class as `ChallengeGame.setCourt`'s own
+    ///      re-wire guard). Re-pointing to a NEW game is a setter that can
+    ///      break the B3 window invariant just like `setVoteWindow` below, and
+    ///      the two compose into a bypass if only one is guarded: e.g. this
+    ///      court's `setVoteWindow` raises `voteWindow` while unwired (passes
+    ///      vacuously — no game to check against yet), then this setter wires
+    ///      it to a game whose own clocks cannot fit that window. Checked
+    ///      against the NEW game's OWN `autoSlashDelay`/`disputeTimeout`, not
+    ///      whatever the OLD `challengeGame` (if any) used to report — this
+    ///      setter requires non-zero unconditionally, so unlike
+    ///      `ChallengeGame.setCourt` there is no vacuous branch to preserve
+    ///      here; every call validates.
     function setChallengeGame(address newGame) external onlyOwner {
         if (newGame == address(0)) revert ZeroAddress();
+        IChallengeGame game_ = IChallengeGame(newGame);
+        if (game_.autoSlashDelay() + voteWindow + FINALIZE_BUFFER > game_.disputeTimeout()) {
+            revert WindowInvariantViolated();
+        }
         emit ChallengeGameSet(challengeGame, newGame);
         challengeGame = newGame;
     }

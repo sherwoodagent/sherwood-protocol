@@ -144,7 +144,7 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      invariant (`_requireWindowFits`): at the `voteWindow` ceiling the
     ///      invariant needs 15 days of runway, so a 60-day timeout still
     ///      permits `autoSlashDelay` up to 45 days.
-    uint256 internal constant MAX_DISPUTE_TIMEOUT = 60 days;
+    uint256 public constant MAX_DISPUTE_TIMEOUT = 60 days;
 
     /// @dev THE GAS FLOOR sWOOD's natspec requires of its slasher (PR #24
     ///      round-4 N-4 / N-3). `resolve` is permissionless, so the caller
@@ -864,22 +864,29 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      slash and is paid from the forfeited counter-bond pool on a guilty
     ///      ruling — is strongly motivated to call it if this attempt lands in
     ///      the catch. `refer`'s own `InsufficientClock` guard bounds how long
-    ///      that window stays open. That window is a PARAMETER CONTINGENCY, not
-    ///      a construction guarantee: nothing on-chain enforces
+    ///      that window stays open, and — as of the window-invariant setters
+    ///      (B3, review 2026-07-29 audit, item 6) — that bound is now PARTLY a
+    ///      construction guarantee, not merely a parameter contingency:
+    ///      `setAutoSlashDelay`, `setDisputeTimeout`, `setCourt` and
+    ///      `TokenCourt.setVoteWindow` / `setChallengeGame` each enforce
     ///      `autoSlashDelay + voteWindow + FINALIZE_BUFFER <= disputeTimeout`
-    ///      — `setAutoSlashDelay` accepts anything strictly below
-    ///      `disputeTimeout`, and `voteWindow` lives on the court with no
-    ///      cross-check against either. The cross-contract invariant is
-    ///      checked at deploy pre-flight (Task 10), not by this contract. At
-    ///      today's defaults it holds with room to spare: a pool that
-    ///      completes promptly (well inside `autoSlashDelay`, typically
-    ///      7 days) leaves most of `disputeTimeout` (30 days) still ahead of
-    ///      it — 17 to 24 days of room, depending on when in the 7-day window
-    ///      the pool completes, against the ~6 days `voteWindow +
-    ///      FINALIZE_BUFFER` needs by default. A late-completing pool has less
-    ///      room, symmetrically, but that scarcity is inherent to the clocks
-    ///      `dispute` already runs against, not something a gas floor here
-    ///      could change.
+    ///      against whatever the OTHER contract is CURRENTLY wired to at call
+    ///      time. What is still a contingency rather than a guarantee: those
+    ///      checks bind CURRENT state, not any already-open challenge's PINNED
+    ///      clock (see `_requireWindowFits`'s own RESIDUAL note), and the
+    ///      deploy pre-flight (Task 10) remains the only check for a pair's
+    ///      very FIRST wiring, before either side has anything wired to
+    ///      validate against (`setCourt`'s check is vacuous while
+    ///      `court == address(0)`, by design — unwiring must always stay
+    ///      legal). At today's defaults the invariant holds with room to
+    ///      spare: a pool that completes promptly (well inside
+    ///      `autoSlashDelay`, typically 7 days) leaves most of
+    ///      `disputeTimeout` (30 days) still ahead of it — 17 to 24 days of
+    ///      room, depending on when in the 7-day window the pool completes,
+    ///      against the ~6 days `voteWindow + FINALIZE_BUFFER` needs by
+    ///      default. A late-completing pool has less room, symmetrically, but
+    ///      that scarcity is inherent to the clocks `dispute` already runs
+    ///      against, not something a gas floor here could change.
     ///
     ///      A GAS FLOOR WOULD ALSO BE NEAR-UNUSABLE ON THE TARGET CHAIN, which
     ///      compounds rather than merely repeats the argument above: sizing a
@@ -985,9 +992,11 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         // today's defaults the window is wide: a dispute completing inside
         // `autoSlashDelay` leaves 17-24 days of room, depending on when in
         // that window the pool completes, against the ~6 days `refer`'s own
-        // `InsufficientClock` guard demands — though that margin is a
-        // parameter contingency, not a construction guarantee (see the
-        // natspec above `dispute`). Guarding a recoverable failure by
+        // `InsufficientClock` guard demands — and that margin is now PARTLY a
+        // construction guarantee rather than a pure parameter contingency
+        // (the window-invariant setters, B3; see the natspec above
+        // `dispute`), though the RESIDUAL documented there still applies to
+        // any already-open challenge. Guarding a recoverable failure by
         // manufacturing an unrecoverable one is the wrong trade in every gas
         // regime, which is why no floor stands here.
         if (complete) {
@@ -1664,7 +1673,23 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      pre-Plan-E default and the revocation switch: unwiring a captured
     ///      court returns the game to D5's fail-safe timeout, which acquits, so
     ///      the worst an unwiring can do is fail to slash.
+    /// @dev GUARDS THE RE-WIRE TOO (review 2026-07-29 audit, item 1 BLOCKER —
+    ///      PROVEN executable). Re-pointing to a NEW non-zero court is itself
+    ///      a setter that can break the B3 window invariant, and leaving it
+    ///      unguarded composed with the vacuous branch in
+    ///      `_requireWindowFits` into a full bypass of the three setters that
+    ///      WERE guarded: `setCourt(0)` (legal, vacuous) →
+    ///      `setAutoSlashDelay`/`setDisputeTimeout` to a value that only
+    ///      passes BECAUSE no court is wired → `setCourt(realCourt)`
+    ///      (previously unguarded) lands exactly the violation those two
+    ///      setters exist to refuse, using the escape hatch each of them
+    ///      individually left open. Checked against the NEW court's OWN
+    ///      `voteWindow`/`FINALIZE_BUFFER` — passing `newCourt` explicitly
+    ///      rather than reading `court` from storage is what makes this
+    ///      validate the address about to become live, not the stale one
+    ///      still there at call time.
     function setCourt(address newCourt) external onlyOwner {
+        if (newCourt != address(0)) _requireWindowFits(newCourt, autoSlashDelay, disputeTimeout);
         emit CourtSet(court, newCourt);
         court = newCourt;
     }
@@ -1690,6 +1715,23 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      catching it only the next time someone happens to call
     ///      `setChallengeWindow` is not — that setter might never be called
     ///      again while the mismatch sits live.
+    /// @dev RESIDUAL: THE LEDGER-SIDE DOOR THIS GAME CANNOT CLOSE (review
+    ///      2026-07-29 audit, item 4 — PROVEN executable). `ExposureLedger.
+    ///      setChallengeWindow` can LOWER the ledger's own window at any time
+    ///      with no reference to any game at all — the ledger holds no
+    ///      pointer back to whichever `ChallengeGame` reads it, so it has
+    ///      nothing to check against and cannot be made to. This guard, plus
+    ///      `setChallengeWindow`'s own live read above, close 2 of the 3 doors
+    ///      onto the same mismatch — this game's `setChallengeWindow` raising
+    ///      above the ledger, and this game's `setExposureLedger` re-pointing
+    ///      to a smaller-windowed ledger. The third — the LEDGER's owner
+    ///      shrinking its `challengeWindow` out from under an already-larger,
+    ///      already-legal game window — is unreachable from this contract by
+    ///      construction. Left as a documented gap rather than a false sense
+    ///      of completeness: closing it would require the LEDGER to track
+    ///      every game that reads it, which is the dependency direction this
+    ///      design has never taken (the game depends on the ledger, never the
+    ///      reverse).
     function setExposureLedger(address ledger) external onlyOwner {
         if (ledger == address(0)) revert ZeroAddress();
         if (challengeWindow > IExposureLedger(ledger).challengeWindow()) revert InvalidParameter();
@@ -1708,10 +1750,32 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         // THE LEDGER'S WINDOW IS AUTHORITATIVE, read live rather than restated.
         // It governs the epoch-bucket scan a coverage freeze depends on, so a
         // game window above it lets a filing freeze exposure the ledger has
-        // already aged out - which is precisely what this bound was always
-        // described as preventing and never did (the old `90 days` literal sat
-        // 6x above the ledger's own 14-day default). Reading it live also means
-        // the two cannot drift.
+        // already aged out - which this bound closes ON THE BASE PATH (the old
+        // `90 days` literal sat 6x above the ledger's own 14-day default).
+        // Reading it live also means the two cannot drift.
+        //
+        // NOT THE WHOLE REACHABLE WINDOW, and that is a scope choice, not an
+        // oversight (review 2026-07-29 audit, item 3 - PROVEN executable):
+        // `file`'s actual deadline is `max(executedAt + challengeWindow,
+        // challengeableUntil[key])`, and M3's `_refundAll` can raise
+        // `challengeableUntil` to `block.timestamp + challengeWindow` from an
+        // `Inconclusive` unwind that itself can land up to `autoSlashDelay +
+        // voteWindow` after a filing made up to `challengeWindow` after
+        // execution. Composed, the effective reach is
+        // `executedAt + 2 * challengeWindow + autoSlashDelay + voteWindow` -
+        // roughly 40 days at defaults against this ledger's 14-day window.
+        // LEFT OUT OF SCOPE HERE, deliberately: `challengeableUntil` governs
+        // whether a FRESH filing is still admitted, not how long any SINGLE
+        // challenge's freeze survives - a late re-challenge re-derives its own
+        // coverage and price live at `file` time regardless of how far past
+        // the ledger's window the deadline sits, so reaching it is not
+        // "freezing exposure the ledger has aged out" in the sense this bound
+        // exists to prevent. Capping `_refundAll`'s own write against the
+        // ledger's window instead would collide with M3's separate,
+        // already-proven "never shortens" guarantee (see that path's own
+        // natspec) for no gap closed in return - a change to make
+        // deliberately, inside M3's own review, not as a side effect of this
+        // one.
         if (newWindow > exposureLedger.challengeWindow()) revert InvalidParameter();
         emit ChallengeWindowSet(challengeWindow, newWindow);
         challengeWindow = newWindow;
@@ -1782,10 +1846,43 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      NEGATIVE - and the ACCUSED chooses when the pool completes, so it
     ///      defeats adjudication unilaterally by stalling. The deploy
     ///      pre-flight catches the wiring-time case; this catches the setters
-    ///      that could each break it afterwards. Vacuous with no court wired:
-    ///      there is no referral to fit.
-    function _requireWindowFits(uint256 autoSlash, uint256 timeout) private view {
-        address c = court;
+    ///      that could each break it afterwards — INCLUDING RE-WIRING ITSELF
+    ///      (review 2026-07-29 audit, item 1): `setCourt` calls this against
+    ///      the address it is ABOUT to become, not the stale one already in
+    ///      storage, which is why `c` is a PARAMETER here rather than always
+    ///      read from `court` — closing the composed bypass where an unwired
+    ///      game accepts a violating clock through the vacuous branch below
+    ///      and then re-wires unguarded. Vacuous with no court wired: there is
+    ///      no referral to fit.
+    /// @dev RESIDUAL (same class as `setStakedWood`'s and
+    ///      `setConvictionBountyBps`'s own RESIDUAL notes, review 2026-07-29
+    ///      audit, item 2 — PROVEN executable): this binds the court's
+    ///      CURRENT `voteWindow`/`FINALIZE_BUFFER` against this game's
+    ///      CURRENT `autoSlashDelay`/`disputeTimeout` — not against any
+    ///      already-open challenge's PINNED `autoSlashDelayAtFiling`/
+    ///      `disputeTimeoutAtFiling`. Concretely: file while `disputeTimeout
+    ///      == 13 days` (13 pinned, fitting the court's then-current 5-day
+    ///      `voteWindow`); the owner later raises the LIVE `disputeTimeout` to
+    ///      30 days (passes — still fits the court's 5-day window); the owner
+    ///      then raises the court's LIVE `voteWindow` to 14 days (passes —
+    ///      `7 + 14 + 1 == 22 <= 30` against the NEW live timeout). Both
+    ///      raises are individually guarded and individually legal against
+    ///      whatever is CURRENT at each call — but the OLD challenge's pin
+    ///      never moved: `refer` reads the new 14-day `voteWindow` against the
+    ///      old 13-day pin and can revert `InsufficientClock` from the instant
+    ///      of filing onward, resolving that one challenge via `_fail`
+    ///      (timeout acquittal) regardless of guilt. OWNER-ONLY, not
+    ///      adversary-reachable — neither a challenger nor the accused can
+    ///      trigger either raise — and RECOVERABLE: lowering `voteWindow` back
+    ///      below the pinned challenge's remaining runway restores its
+    ///      referability, precisely because `refer`'s clock check reads
+    ///      `voteWindow` live rather than pinning it. Closing this fully would
+    ///      mean re-validating every open challenge's own pin on every setter
+    ///      call — unbounded work this design has already rejected elsewhere
+    ///      (the pool/contributor loops removed for the same reason) — so
+    ///      binding SETTERS against CURRENT state is the achievable half of
+    ///      this invariant; binding every PAST commitment is not.
+    function _requireWindowFits(address c, uint256 autoSlash, uint256 timeout) private view {
         if (c == address(0)) return;
         if (autoSlash + ITokenCourt(c).voteWindow() + ITokenCourt(c).FINALIZE_BUFFER() > timeout) {
             revert WindowInvariantViolated();
@@ -1804,7 +1901,7 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      only exists on `TokenCourt`.
     function setAutoSlashDelay(uint256 newDelay) external onlyOwner {
         if (newDelay < MIN_AUTO_SLASH_DELAY || newDelay >= disputeTimeout) revert InvalidParameter();
-        _requireWindowFits(newDelay, disputeTimeout);
+        _requireWindowFits(court, newDelay, disputeTimeout);
         emit AutoSlashDelaySet(autoSlashDelay, newDelay);
         autoSlashDelay = newDelay;
     }
@@ -1816,7 +1913,7 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      see `setAutoSlashDelay`'s identical note.
     function setDisputeTimeout(uint256 newTimeout) external onlyOwner {
         if (newTimeout <= autoSlashDelay || newTimeout > MAX_DISPUTE_TIMEOUT) revert InvalidParameter();
-        _requireWindowFits(autoSlashDelay, newTimeout);
+        _requireWindowFits(court, autoSlashDelay, newTimeout);
         emit DisputeTimeoutSet(disputeTimeout, newTimeout);
         disputeTimeout = newTimeout;
     }

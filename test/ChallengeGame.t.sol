@@ -330,6 +330,10 @@ contract MockRecordingCourt {
     uint256 public voteWindow = 5 days;
     uint256 public constant FINALIZE_BUFFER = 1 days;
 
+    function setVoteWindow(uint256 w) external {
+        voteWindow = w;
+    }
+
     function refer(uint256 challengeId) external returns (uint256) {
         lastReferred = challengeId;
         return 1;
@@ -340,6 +344,12 @@ contract MockRecordingCourt {
 ///      `AutoReferFailed` exists for. `dispute`'s try/catch must swallow this
 ///      and let the completing dispute land regardless.
 contract MockRevertingCourt {
+    /// @dev Mirrors `MockRecordingCourt`'s defaults — `ChallengeGame.setCourt`
+    ///      (B3 re-wire guard, review 2026-07-29 audit item 1) now reads these
+    ///      live off ANY court it is pointed at, including this one.
+    uint256 public voteWindow = 5 days;
+    uint256 public constant FINALIZE_BUFFER = 1 days;
+
     function refer(uint256) external pure returns (uint256) {
         revert("nope");
     }
@@ -352,6 +362,9 @@ contract MockRevertingCourt {
 contract MockGasHungryCourt {
     uint256 public lastReferred;
     uint256 public floor;
+    /// @dev Same reason as `MockRevertingCourt`'s identical fields.
+    uint256 public voteWindow = 5 days;
+    uint256 public constant FINALIZE_BUFFER = 1 days;
 
     constructor(uint256 f) {
         floor = f;
@@ -1946,6 +1959,52 @@ contract ChallengeGameTest is Test {
         game.setAutoSlashDelay(25 days); // would violate the invariant if a court were wired
         vm.stopPrank();
         assertEq(game.autoSlashDelay(), 25 days);
+    }
+
+    /// @notice BLOCKER (review 2026-07-29 audit, item 1): re-wiring to a NEW
+    ///         court is itself a setter that can break the window invariant,
+    ///         and it was completely unguarded. A fresh court whose own
+    ///         `voteWindow` cannot fit this game's CURRENT clocks must be
+    ///         refused at the door, not accepted and left for `refer` to
+    ///         discover later.
+    function test_setCourt_revertsWindowInvariantViolated_whenNewCourtCannotFit() public {
+        MockRecordingCourt tooSlow = new MockRecordingCourt();
+        tooSlow.setVoteWindow(25 days); // 7d autoSlashDelay + 25d + 1d buffer = 33d > 30d disputeTimeout
+        vm.prank(owner);
+        vm.expectRevert(IChallengeGame.WindowInvariantViolated.selector);
+        game.setCourt(address(tooSlow));
+    }
+
+    /// @notice THE PROVEN 3-STEP BYPASS ITSELF (review 2026-07-29 audit, item
+    ///         1 BLOCKER), as a single test: the two guarded setters
+    ///         (`setAutoSlashDelay`/`setDisputeTimeout`) and the previously
+    ///         UNGUARDED `setCourt` compose into a full defeat of the B3
+    ///         invariant using the very vacuous branch the guarded setters'
+    ///         own tests establish as intended. `setCourt(0)` is legal (the
+    ///         fail-safe off-switch); `setAutoSlashDelay(25 days)` then passes
+    ///         ONLY because no court is wired to check against; re-wiring the
+    ///         real court must now re-validate against that value and refuse,
+    ///         or the composition lands the exact violation the individual
+    ///         setters exist to prevent.
+    function test_setCourt_bypassClosed_rewiringAfterVacuousAutoSlashDelayChangeReverts() public {
+        vm.startPrank(owner);
+        game.setCourt(address(0));
+        game.setAutoSlashDelay(25 days); // legal while vacuous: would violate if court were wired (25+5+1=31>30)
+        vm.expectRevert(IChallengeGame.WindowInvariantViolated.selector);
+        game.setCourt(court); // rewiring must catch what the vacuous branch let through
+        vm.stopPrank();
+    }
+
+    /// @notice The bypass composition still fails to LAND when the vacuous
+    ///         change kept the invariant fitting — re-wiring is guarded, not
+    ///         merely blocked outright.
+    function test_setCourt_succeedsWhenRewiringToAFittingCourtAfterAVacuousChange() public {
+        vm.startPrank(owner);
+        game.setCourt(address(0));
+        game.setAutoSlashDelay(3 days); // still fits: 3+5+1=9<=30
+        game.setCourt(court);
+        vm.stopPrank();
+        assertEq(game.court(), court);
     }
 
     function test_setStakedWood_rejectsZero() public {

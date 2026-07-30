@@ -207,6 +207,38 @@ contract TokenCourtTest is Test {
         assertEq(freshCourt.voteWindow(), 14 days);
     }
 
+    /// @notice BLOCKER (review 2026-07-29 audit, item 1): wiring to a NEW game
+    ///         is itself a setter that can break the window invariant, and it
+    ///         was completely unguarded. A game whose own `disputeTimeout`
+    ///         cannot fit this court's CURRENT `voteWindow` must be refused at
+    ///         the door.
+    function test_setChallengeGame_revertsWindowInvariantViolated_whenNewGameCannotFit() public {
+        MockGameForCourt tooTight = new MockGameForCourt();
+        tooTight.setDisputeTimeout(8 days); // 7d autoSlashDelay + 5d court voteWindow + 1d buffer = 13d > 8d
+        vm.prank(owner);
+        vm.expectRevert(ITokenCourt.WindowInvariantViolated.selector);
+        court.setChallengeGame(address(tooTight));
+    }
+
+    /// @notice THE INVERTED 3-STEP BYPASS (review 2026-07-29 audit, item 1
+    ///         BLOCKER), as a single test: a FRESH court's `setVoteWindow` can
+    ///         raise its window while unwired (vacuous — no game to check
+    ///         against yet), and `setChallengeGame` must re-validate that
+    ///         raised window against whatever game it is THEN pointed at,
+    ///         rather than trusting the vacuous pass to mean the window is
+    ///         fine. Mirrors `ChallengeGame`'s own `setCourt` bypass test
+    ///         exactly, with the guarded/unguarded setters swapped.
+    function test_setChallengeGame_bypassClosed_wiringAfterVacuousVoteWindowRaiseReverts() public {
+        MockGameForCourt tight = new MockGameForCourt();
+        tight.setDisputeTimeout(8 days); // pre-configured, tight clock — nothing to do with wiring yet
+        TokenCourt freshCourt = new TokenCourt(owner);
+        vm.startPrank(owner);
+        freshCourt.setVoteWindow(14 days); // legal while vacuous: would violate against `tight` (7+14+1=22>8)
+        vm.expectRevert(ITokenCourt.WindowInvariantViolated.selector);
+        freshCourt.setChallengeGame(address(tight)); // wiring must catch what the vacuous branch let through
+        vm.stopPrank();
+    }
+
     function test_views_nonexistentCaseReturnDefaults() public view {
         ITokenCourt.Case memory cs = court.caseOf(999);
         assertEq(cs.challengeId, 0);
@@ -216,7 +248,13 @@ contract TokenCourtTest is Test {
     }
 
     function test_setters_wiringEmitOldNew() public {
-        address newGame = makeAddr("newGame");
+        // A REAL `IChallengeGame` STAND-IN, not a bare address (review
+        // 2026-07-29 audit, item 1): `setChallengeGame` now calls the new
+        // game's own `autoSlashDelay()`/`disputeTimeout()` to re-validate the
+        // window invariant, which a code-less `makeAddr` has no answer for.
+        // `MockGameForCourt`'s defaults (7d/30d) fit the court's current
+        // 5-day `voteWindow` (7+5+1=13<=30).
+        address newGame = address(new MockGameForCourt());
         vm.expectEmit(true, true, false, true);
         emit ITokenCourt.ChallengeGameSet(address(game), newGame);
         vm.prank(owner);
@@ -433,9 +471,11 @@ contract TokenCourtTest is Test {
         vm.prank(owner);
         court.setChallengeGame(address(game2));
 
-        // game2's defaults (7d autoSlashDelay / 30d disputeTimeout) already
-        // satisfy setChallengeGame's window-invariant mirror check above, so
-        // no extra autoSlashDelay/disputeTimeout wiring is needed here.
+        // `setChallengeGame` now RE-VALIDATES the window invariant against the
+        // new game's own clocks (review 2026-07-29 audit, item 1): game2's
+        // defaults (7d autoSlashDelay / 30d disputeTimeout) fit the court's
+        // current 5-day voteWindow (7+5+1=13<=30), so that check above already
+        // passed and no extra wiring is needed here.
         game2.setChallenge(
             CHALLENGE_ID,
             governor,
