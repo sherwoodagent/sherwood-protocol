@@ -1240,7 +1240,8 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///             read LIVE at settle — the one non-snapshotted rate)
     ///      Escape hatch: IStrategy.selfManagesFees() == true (snapshotted at propose)
     ///      skips this ENTIRE waterfall — the strategy must self-collect including the
-    ///      protocol's cut (e.g. LeveragedAeroFees.protocolFeeOwed).
+    ///      protocol's cut. No in-tree strategy currently does; any that sets
+    ///      the flag must implement its own protocol-fee leg.
     ///      Failure mode: any recipient transfer that reverts escrows in _unclaimedFees
     ///      (pull via claimUnclaimedFees) so settlement never bricks.
     function _distributeFees(

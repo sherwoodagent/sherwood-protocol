@@ -130,7 +130,7 @@ contract SynthraDirectAdapter is ISwapAdapter {
     ///      Callers that drive `amountOutMin` from `quote()` (e.g. PortfolioStrategy
     ///      execute/settle/rebalance) will revert with `QuoteUnavailable`. Use this
     ///      adapter only with strategies whose minOut is computed from an external
-    ///      price source (e.g. Chainlink Data Streams, MoonwellSupplyStrategy).
+    ///      price source (e.g. Chainlink Data Streams).
     function quote(address, address, uint256, bytes calldata) external pure override returns (uint256) {
         return 0;
     }
