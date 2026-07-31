@@ -1,9 +1,56 @@
 # Sherwood Fee Model — Technical Design
 
 **Date:** 2026-07-24 (rev. 3 — simplified to the two-number model; volume fee removed)
-**Status:** Design — not implemented
-**Scope:** `ProtocolConfig`, `SyndicateVault`, `SyndicateGovernor`, `BaseStrategy`/`IStrategy`
+**Status:** Implemented 2026-07-31 via openspec change `apply-the-new-fee-model`
+**Scope:** `ProtocolConfig`, `SyndicateVault`, `SyndicateGovernor` (no strategy changes — see D1)
 **Companion:** product framing in `docs/product/2026-07-24-fee-model-product-spec.md`
+
+---
+
+## Implementation deviations (authoritative)
+
+Where this document and the shipped code disagree, the code is right and the
+reasoning lives in `openspec/changes/apply-the-new-fee-model/design.md`.
+
+**D1 — The management-fee accumulator lives on the vault, not on strategies.**
+§7 item 3 put a TWA accumulator on the strategy. Every base-changing event
+already passes through `SyndicateVault` (execute stamp, Lane A deposit, Lane A
+instant exit, `strategyMint`/`strategyBurn`), so one vault-side accumulator is
+complete and touches none of the 12+ strategy clones. It stores an
+**asset-seconds integral** and restamps its base from `totalAssets()` on each
+event, which is what lets the share-denominated custody hooks participate
+without any share→asset conversion.
+
+**D2 — Exit-time fees are retained by the vault, not transferred at exit.**
+§4.1 routes `perfFeeExit`/`mgmtFeeExit` to recipients immediately via `_payFee`.
+The vault cannot resolve those recipients — the agent is the proposal's
+`proposer` in governor storage — so this would mean a governor call on the
+ERC-4626 hot path plus a new brick vector. They are booked into
+`_crystallizedMgmt`/`_crystallizedPerf`, **excluded from `totalAssets()`**, and
+paid at the next settlement through the existing escrow. Net incidence is
+identical and the exit path stays call-free.
+
+**D3 — `selfManagesFees` exempts the performance leg only.**
+§6 folds both legs. That flag exists because float-delta PnL misreads custody
+deposits as profit — a defect in *profit measurement*. The management fee is
+capital × time and does not use PnL, so the exemption does not reach it.
+
+**D4 — The management rate is read live at settle, not snapshotted.**
+`SyndicateVault._managementFeeBps` is written only at `initialize` and has no
+setter, so it cannot move between propose and settle; a snapshot would be
+equivalent and `propose` has no spare Yul stack slot for the extra read. The two
+*splits* are snapshotted, since governance can change those at any time.
+
+**D5 — Ordering constraints the original text did not state.**
+Releasing crystallized fees raises `totalAssets()`, so the performance base must
+be read *before* `consumeCrystallizedPerf()`. And `previewWithdraw` cannot
+invert the kinked exit-fee function in closed form: it iterates, grossing each
+shortfall up by the penalty rate so it converges from above rather than
+approaching the target from below forever.
+
+**Not removed, because it never existed:** the volume fee. §2.3 describes
+deleting code that `grep -rn "volumeFee\|_chargeVolume\|VolumeFeePaid" src/`
+does not find. No deletion work was required.
 
 ---
 

@@ -1,8 +1,24 @@
 # Sherwood Fee Model — Product Spec
 
-**Status:** Proposed
+**Status:** Implemented (2026-07-31) — openspec change `apply-the-new-fee-model`
 **Date:** 2026-07-24
 **Companion:** technical design in `docs/specs/2026-07-24-fee-model-design.md`
+
+> **What shipped vs. what this document proposed.** Three behaviours differ from
+> the original write-up; each is recorded with its reasoning in
+> `openspec/changes/apply-the-new-fee-model/design.md`.
+>
+> 1. **The management fee accrues only while a strategy is live** — see the note
+>    under "The two numbers" below. Charging continuously is blocked on there
+>    being no proposal to name the agent recipient between runs.
+> 2. **Instant-exit fees are retained by the fund and paid at the next
+>    settlement**, rather than transferred to recipients at the moment of exit.
+>    The vault cannot resolve those recipients without calling the governor on
+>    the ERC-4626 withdraw path. The money is excluded from the fund's reported
+>    assets in the meantime, so the economics are identical.
+> 3. **Strategies that self-collect their fees still pay the management fee.**
+>    That exemption exists because profit is mismeasured for those strategies;
+>    the management fee does not use profit at all.
 
 Sherwood funds charge **two numbers, like a hedge fund: "2 and 20"** — a 2%/yr
 management fee and a 20% performance fee above a high-water mark. Every party that
@@ -38,8 +54,17 @@ into one 20% performance fee** that splits behind the scenes.
 
 | Fee | Rate | Charged on | Paid when |
 |---|---|---|---|
-| **Management fee** | 2%/yr | fund assets (AUM), time-weighted | **Always** — profit, flat, or loss |
+| **Management fee** | 2%/yr | fund assets (AUM), time-weighted | Every settlement — profit, flat, **or loss** |
 | **Performance fee** | 20% | profit above the high-water mark | Profitable settlements only |
+
+> **One clarification on "always".** The management fee accrues while a strategy
+> is live and stops at settlement. Capital sitting in the fund *between*
+> proposals accrues nothing. This is deliberate: between proposals nobody is
+> managing the money, guardians have nothing to review, and withdrawals are
+> open — so a management fee with no management would be the anomaly. In
+> practice the gap is an hour of cooldown against strategy runs of up to 30
+> days, so the effect is a rounding error. But a fund whose agent stops
+> proposing entirely charges 0%/yr, by design.
 
 That's the whole depositor-facing picture, plus one-time and redemption terms
 (below). The management fee keeps every party that does continuous work funded in
