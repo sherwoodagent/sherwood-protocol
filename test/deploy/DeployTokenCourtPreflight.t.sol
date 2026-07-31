@@ -101,8 +101,12 @@ contract DeployTokenCourtPreflightTest is Test {
         // settle-before-freeze order `DeployPlanD` itself now uses (review M3),
         // plus Plan C's escrow pair, which pre-flight 5 checks (review M4).
         vm.startPrank(DEFAULT_SENDER);
-        game.setStakedWood(address(swood));
+        // Grant before pointing: `setStakedWood` refuses a sWOOD that has not
+        // already named this game as its slasher (review M2, `RoleNotGranted`).
+        // Settle-before-freeze (M3) still holds — the freeze role is granted two
+        // lines below, once the verdict path is complete.
         swood.setAuthorizedSlasher(address(game));
+        game.setStakedWood(address(swood));
         tiers.setAuthorizedDemoter(address(game));
         ledger.setCoverageFreezer(address(game));
         swood.setCompensationEscrow(address(escrow));

@@ -226,12 +226,17 @@ contract DeployPlanD is Script {
         // repair itself. Reversing the order costs nothing and closes it: the
         // ability to freeze is granted only once the ability to settle exists.
         //
-        // The reciprocal pointer. sWOOD is owner-set state on the game rather
-        // than a constructor arg because the role is granted on sWOOD's side —
-        // the two CAN be wired in either order as far as the contracts are
-        // concerned, which is exactly why the order has to be chosen here.
-        game.setStakedWood(swood);
+        // GRANT BEFORE POINTING — and this pair is no longer free to order.
+        // `ChallengeGame.setStakedWood` now REJECTS a sWOOD that has not already
+        // named this game as its `authorizedSlasher` (review M2, `RoleNotGranted`),
+        // so "point, then grant" reverts. The earlier note here said the two could
+        // be wired in either order; that was true before M2 and is not now.
+        //
+        // Both requirements hold together under this interleave: grant the slash
+        // role, point the game at sWOOD — the verdict path is complete at this
+        // line — and only afterwards grant the freeze role below.
         IStakedWood(swood).setAuthorizedSlasher(address(game));
+        game.setStakedWood(swood);
         ITierRegistryDemoterRole(tierRegistry).setAuthorizedDemoter(address(game));
         // LAST. Nothing can be frozen before the verdict path is complete.
         IExposureLedger(ledger).setCoverageFreezer(address(game));
