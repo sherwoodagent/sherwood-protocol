@@ -1,6 +1,38 @@
 # ADR 2026-07-27 — v1 tier policy: tier 2 refused, every covered tier provably covered
 
-**Status:** accepted for v1.
+**Status:** partially superseded (2026-07-31). Decision 2 shipped. **Decision 1 —
+refusing tier-2 exposure — was reversed by the owner before implementation landed.**
+
+> **SUPERSEDING DECISION (2026-07-31).** Tier 2 is NOT refused on-chain. The
+> guardian ROE gap this ADR measured at tier 2 is to be closed with **off-chain
+> team token incentives** — subsidising guardians who underwrite tier-2 exposure
+> — rather than by making the tier inadmissible. `ProtocolConfig.maxEnvelopeTier`
+> and the `EnvelopeTierTooHigh` error were removed from PR #37; no tier ceiling
+> exists in the code.
+>
+> What this ADR's arithmetic still establishes is unchanged and worth keeping:
+> at tier 2 an unsubsidised guardian's entire fee income equals its expected
+> annual tail loss, the result is scale-invariant, and fee splits move it by ~3×
+> against a ~100× gap. **The subsidy is therefore load-bearing, not a top-up.**
+> Two consequences follow that the on-chain ceiling would have made impossible:
+>
+> - The protocol's solvency at tier 2 now depends on an off-chain promise. If
+>   the team stops paying, tier-2 guardians are underwater and nothing on-chain
+>   refuses the exposure — the ceiling failed closed; an unfunded subsidy fails
+>   open.
+> - Tier 2's sign-dependence on the adjudication-error rate `p_e` returns. This
+>   ADR's cleanest argument was that refusing tier 2 removed the protocol's
+>   reliance on a number nobody has measured. Admitting tier 2 restores it, and
+>   the subsidy has to be sized against that unmeasured input.
+>
+> Decision 2 (`quorumTierThreshold` 2 → 0) is untouched and shipped. It was never
+> a consequence of decision 1: coverage was already sized correctly at every
+> tier, and only *enforcement* was gated at 2, so tier-0/1 proposals could
+> execute with no covering approver at all. That is a correctness fix and stands
+> on its own.
+>
+> Recorded here rather than by rewriting the sections below, so the reasoning
+> that was reversed stays legible next to the reason it was reversed.
 
 **Resolves:** the §4 blocking gate, together with `2026-07-26-roe-validation.md`.
 That ADR established *whether* guardians can afford to underwrite; this one records

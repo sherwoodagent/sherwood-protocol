@@ -431,9 +431,11 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // Plan B (spec §3.3a): a coverage-consuming proposal at/above the tier
         // threshold cannot execute without a bond-encumbered approve quorum —
         // silence no longer passes it, so R1 always has an identified,
-        // stake-backed approver to hold liable. Below-threshold tiers keep
-        // optimistic passage until the §3.10 ROE arithmetic is validated
-        // (spec §4 gate 2, BLOCKING — launch threshold is 2, i.e. tier-2 only).
+        // stake-backed approver to hold liable. The §3.10 ROE arithmetic (spec
+        // §4 gate 2) is now validated, so the launch threshold is 0 — EVERY
+        // tier is fail-closed, not tier 2 alone (ADR 2026-07-27). Coverage was
+        // always sized per-tier and correctly; what was missing was enforcing
+        // it below tier 2.
         // A revert here leaves the proposal Approved: it expires at `executeBy`
         // unless covering approvals arrive first (the cold-start behaviour
         // §3.3a wants — suppressing the cohort blocks execution, never forces it).

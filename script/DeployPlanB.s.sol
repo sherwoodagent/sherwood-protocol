@@ -32,6 +32,9 @@ interface ISwoodCooldown {
  *      `InvalidParameter()`; the explicit require below names the fix. Raising
  *      the sWOOD cooldown is a LIVE-PARAMETER GOVERNANCE ACTION — surface it,
  *      do not work around it here.
+ * @dev PRE-FLIGHT 4 (ADR 2026-07-27): `maxEnvelopeTier <= 1` AND
+ *      `quorumTierThreshold == 0`, asserted together. See the block itself for
+ *      why landing one without the other is silently outside the ADR.
  * @dev PRE-FLIGHT 2: a zero `coveredTvlCapUsd` is fail-closed — the moment the
  *      ledger is wired into a governor, NOTHING can be proposed. Refuse to
  *      deploy into that state rather than brick proposing.
@@ -77,7 +80,6 @@ contract DeployPlanB is Script {
         uint256 feedMaxDelay = vm.envUint("ASSET_FEED_MAX_DELAY");
         uint256 woodPriceX8 = vm.envUint("WOOD_PRICE_HAIRCUT_X8"); // conservative, <= 30-day low
         uint256 coveredTvlCapUsd = vm.envUint("COVERED_TVL_CAP_USD18");
-
         // ── Pre-flight 1: REMOVED (ADR 2026-07-26) ──
         // This asserted `coolDownPeriod >= epochLength + challengeWindow` (42d
         // at defaults). It was both unsatisfiable and unnecessary:
@@ -145,8 +147,10 @@ contract DeployPlanB is Script {
         ledger.setAssetFeed(usdg, usdgFeed, feedMaxDelay);
         ledger.setGuardianRegistry(registry);
         ledger.setCoveredTvlCapUsd(coveredTvlCapUsd);
-        // quorumTierThreshold stays at the default 2 (tier-2 only) — lowering
-        // it is gated on the §3.10 ROE validation (BLOCKING, spec §4 gate 2).
+        // quorumTierThreshold stays at its default, which ADR 2026-07-27 moved
+        // to 0 (every tier fail-closed). Asserted in pre-flight 4 rather than
+        // re-set here, so a ledger whose default ever drifts is caught instead
+        // of silently corrected.
 
         IGuardianRegistry(registry).setExposureLedger(address(ledger));
         ISyndicateFactory(factory).setExposureLedger(address(ledger));
@@ -169,6 +173,27 @@ contract DeployPlanB is Script {
             ISwoodCooldown(swood).exposureLedger() != address(0),
             "PRE-FLIGHT: sWOOD exposureLedger is unset -- the unstake gate would fail open. "
             "Call setExposureLedger(ledger) by governance, then re-run."
+        );
+
+        // ── Pre-flight 4 (POST-wiring): coverage is enforced at every tier ──
+        // ADR 2026-07-27 originally paired this with a `maxEnvelopeTier <= 1`
+        // ceiling that refused tier-2 exposure outright. THAT HALF WAS DROPPED
+        // (owner decision 2026-07-31): tier-2 guardian ROE is to be closed with
+        // off-chain team token incentives rather than by refusing the tier, so
+        // tier 2 remains admissible on-chain and there is no ceiling to assert.
+        //
+        // What remains is the half that was never a policy choice. Coverage
+        // SIZING was already correct at every tier; only ENFORCEMENT was gated,
+        // and at the old default of 2 it ran at tier 2 alone — so a tier-0/1
+        // proposal could execute with NO covering approver at all, its
+        // correctly-sized coverage never checked. Threshold 0 closes that.
+        //
+        // Asserted after the broadcast, the only point where the value is
+        // readable in the form the protocol will actually run with.
+        require(
+            ledger.quorumTierThreshold() == 0,
+            "PRE-FLIGHT: ExposureLedger.quorumTierThreshold != 0 -- a covering approve quorum is "
+            "required at EVERY tier. Call setQuorumTierThreshold(0), then re-run."
         );
 
         console.log("ExposureLedger:     %s", address(ledger));

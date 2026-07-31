@@ -970,19 +970,15 @@ contract CoverageEndToEndTest is Test {
 
     // ── 5. The bounded (below-threshold) lane is genuinely preserved ───────
 
-    /// @notice Spec §4 gate 2: the §3.10 ROE argument is only allowed to lower
-    ///         `quorumTierThreshold` because the optimistic lane below it still
-    ///         works. A tier-1-certified execute target therefore executes with
-    ///         ZERO approvers — the quorum is never consulted — while the
-    ///         propose-time gates (covered-TVL cap, risk-scaled bond) still run.
-    function test_boundedTierFlowUnaffected() public {
-        // Certify the (adapter, poke) pair at tier 1 with a 1% extractable bound.
+    /// @dev Certifies (adapter, poke) at tier 1 with a 1% extractable bound and
+    ///      proposes against it. Returns the proposal id, asserting the tier-1
+    ///      SIZING that both tests below share — sizing is unchanged by the ADR.
+    function _proposeBoundedTier1() internal returns (uint256 pid) {
         govA.setTierRegistry(address(tierRegistry)); // test contract is the factory
         tierRegistry.certify(address(adapter), adapter.poke.selector, 1, 100, address(0));
 
-        uint256 pid = _propose(govA, address(vaultA), agentA, _adapterCalls(), _adapterCalls());
+        pid = _propose(govA, address(vaultA), agentA, _adapterCalls(), _adapterCalls());
         assertEq(govA.getProposal(pid).envelopeTier, 1, "certified tier 1");
-        assertLt(govA.getProposal(pid).envelopeTier, ledger.quorumTierThreshold(), "below the quorum threshold");
         // coverage = maxCapital × Σ(exec 100 bps + settle 100 bps) / 10_000.
         uint256 coverage = (MAX_CAPITAL * 200) / 10_000;
         assertEq(govA.getProposal(pid).requiredCoverage, coverage, "bounded coverage, not full notional");
@@ -992,6 +988,23 @@ contract CoverageEndToEndTest is Test {
             ledger.proposerBondWood(address(usdg), coverage),
             "risk-scaled bond still locked"
         );
+    }
+
+    /// @notice ADR 2026-07-27 REVERSED this test's original conclusion, and the
+    ///         reversal is the whole point of the ADR. It used to assert that a
+    ///         tier-1 proposal executes with ZERO approvers — the optimistic
+    ///         lane below `quorumTierThreshold`, which the §4 gate-2 argument
+    ///         leaned on. The ROE validation resolved that gate the other way:
+    ///         the threshold is now 0, tier 1 is no longer below it, and the
+    ///         quorum IS consulted.
+    ///
+    ///         Coverage SIZING is unchanged and still bounded (asserted in the
+    ///         helper) — sizing was never the gap. ENFORCEMENT was: this exact
+    ///         shape, a bounded-tier proposal with no covering approver, is what
+    ///         used to execute unbacked.
+    function test_boundedTierNowRequiresCoverage() public {
+        uint256 pid = _proposeBoundedTier1();
+        assertEq(ledger.quorumTierThreshold(), 0, "ADR 2026-07-27: every tier fail-closed");
 
         // Review runs with a healthy cohort and NOBODY approves.
         _openReview(govA, pid);
@@ -1000,13 +1013,30 @@ contract CoverageEndToEndTest is Test {
         assertEq(approvers.length, 0, "zero approvers");
         assertEq(ledger.openExposureUsd(g1), 0, "no exposure booked anywhere");
 
-        // Optimistic passage survives below the threshold.
+        vm.expectRevert(IExposureLedger.InsufficientApproveCoverage.selector);
+        govA.executeProposal(pid);
+        assertEq(_state(govA, pid), uint256(ISyndicateGovernor.ProposalState.Approved), "stays Approved, unexecuted");
+        assertEq(adapter.pokes(), 0, "the batch never ran");
+    }
+
+    /// @notice The optimistic lane still EXISTS as a mechanism — it is simply no
+    ///         longer reachable at the launch threshold. Raising the threshold
+    ///         back above the proposal's tier restores it, which is what proves
+    ///         the `>=` comparison is doing the work rather than the tier alone.
+    ///         Kept so a future re-admission (v2, per the ADR) has a live test of
+    ///         the knob rather than a re-derivation.
+    function test_boundedTierExecutesOptimisticallyWhenThresholdRaised() public {
+        uint256 pid = _proposeBoundedTier1();
+        vm.prank(ledgerOwner);
+        ledger.setQuorumTierThreshold(2); // the pre-ADR launch value
+
+        _openReview(govA, pid);
+        _pastReview(govA, pid);
+        (address[] memory approvers,,) = registry.getApproverWeights(address(govA), pid);
+        assertEq(approvers.length, 0, "zero approvers");
+
         govA.executeProposal(pid);
         assertEq(_state(govA, pid), uint256(ISyndicateGovernor.ProposalState.Executed), "bounded lane still executes");
         assertEq(adapter.pokes(), 1, "the batch really ran");
-
-        // The threshold is what did the work: the identical zero-approver shape
-        // at tier 2 is exactly what `test_thinCohortCannotForceExecution` rejects.
-        assertEq(ledger.quorumTierThreshold(), 2, "launch threshold unchanged");
     }
 }
