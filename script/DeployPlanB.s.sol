@@ -33,8 +33,9 @@ interface ISwoodCooldown {
  *           4. registry.setExposureLedger   (owner op — REQUIRES the UUPS-upgraded impl)
  *           5. factory.setExposureLedger / setBondEscrow (new syndicates)
  *           6. swood.setExposureLedger      (owner op — arms the unstake gate)
- *         MANUAL follow-ups printed at the end (beacon/UUPS upgrades,
- *         pushWiring per governor, TierRegistry redeploy + recertify).
+ *         MANUAL follow-ups printed at the end (UUPS upgrade, TierRegistry
+ *         redeploy + recertify, and — CONDITIONAL ON THE CHAIN, see pre-flight
+ *         5 — either a governor beacon upgrade or pushWiring per governor).
  *
  * @dev PRE-FLIGHT 1 was REMOVED (ADR 2026-07-26) — it demanded a 42d sWOOD
  *      cooldown that `setCooldownPeriod`'s own 30d cap made unreachable, so its
@@ -51,6 +52,12 @@ interface ISwoodCooldown {
  * @dev PRE-FLIGHT 2: a zero `coveredTvlCapUsd` is fail-closed — the moment the
  *      ledger is wired into a governor, NOTHING can be proposed. Refuse to
  *      deploy into that state rather than brick proposing.
+ * @dev PRE-FLIGHT 5 (review M5): a factory with LIVE governor proxies whose
+ *      beacon impl predates Plan B is refused. Plan B cannot be wired into
+ *      those governors, and the beacon upgrade that would make it possible is
+ *      forbidden on this stack — `SyndicateGovernor`'s layout was re-baselined
+ *      non-append-only, so an impl swap on a populated beacon corrupts every
+ *      proxy. See the block itself; it also shapes the manual follow-ups.
  * @dev PRE-FLIGHT 3 (review B3): the three ledger pointers — registry, factory
  *      and sWOOD — must all name THE LEDGER THIS RUN DEPLOYED. sWOOD's is wired
  *      inside the broadcast rather than demanded of the operator beforehand,
@@ -200,8 +207,71 @@ contract DeployPlanB is Script {
             "Re-run with --sender set to the sWOOD owner (the same multisig that owns the registry " "and the factory)."
         );
 
+        // ── Pre-flight 5: the governor beacon must not need an impl swap it
+        //    cannot survive (review M5) ──
+        // Plan B needs every governor to carry `_exposureLedger` / `_bondEscrow`:
+        // `createSyndicate` pushes both into each new governor, and `pushWiring`
+        // pushes them into the existing ones. On a beacon whose implementation
+        // predates Plan B, BOTH of those calls revert — so the moment this script
+        // sets `factory.exposureLedger`, syndicate creation on that factory is
+        // bricked until the beacon is upgraded.
+        //
+        // AND THE BEACON UPGRADE IS THE ONE THING THAT MUST NOT HAPPEN HERE. This
+        // stack re-baselined `SyndicateGovernor`'s storage layout non-append-only:
+        // `GovernorParameters` now inherits `ProposalLifecycle`, which C3
+        // PREPENDS, so every field moved (`vault` 0 -> 15, `_guardianRegistry`
+        // 43 -> 0, `_tierRegistry` 48 -> 58). That is legitimate for a FRESH
+        // deployment and only for a fresh deployment — pushed onto a beacon with
+        // live proxies, every governor reads garbage at every slot. See
+        // `test/governor/GovernorLayoutPins.t.sol`, which pins the new baseline
+        // and carries the same warning.
+        //
+        // So the three live states differ completely and the script must not
+        // treat them alike:
+        //   - `syndicateCount == 0`  — no proxies exist; a beacon upgrade is a
+        //     no-op on live state and the manual follow-up is safe to print.
+        //   - `syndicateCount != 0` and the beacon ALREADY serves a Plan B-capable
+        //     governor — nothing needs upgrading; `pushWiring` alone finishes the
+        //     job. This is the ordinary "Plan A from this stack, then Plan B"
+        //     path and stays allowed: having syndicates is not by itself a
+        //     problem, and refusing it would block legitimate work.
+        //   - `syndicateCount != 0` and the beacon serves a PRE-Plan B governor —
+        //     refused below. There is no ordering of the remaining steps that is
+        //     both safe and complete: wiring the factory bricks creation,
+        //     `pushWiring` reverts, and the upgrade that would fix either
+        //     corrupts the live proxies. Those syndicates need a fresh factory
+        //     and beacon, not an upgrade.
+        //
+        // REFUSES rather than warns, and refuses BEFORE the broadcast, for the
+        // same reason as every other pre-flight here: the failure is silent and
+        // the remedy is a redeployment. The scope is the narrowest one that is
+        // still honest — this is not "the chain has syndicates", it is "the chain
+        // has syndicates this deployment cannot reach without an upgrade that
+        // would corrupt them".
+        //
+        // TWO WAYS THIS READS CONSERVATIVELY, both deliberate. `syndicateCount`
+        // counts every syndicate this factory ever created, so after a
+        // `setBeacon` migration it over-counts the CURRENT beacon's proxies; and
+        // if two factories were ever pointed at one beacon, this factory's count
+        // says nothing about the other's proxies. Over-refusal is the safe
+        // direction for the first; the second is an operator obligation — check
+        // every factory sharing the beacon.
+        uint256 liveGovernors = ISyndicateFactory(factory).syndicateCount();
+        if (liveGovernors != 0) {
+            require(
+                _beaconServesPlanBGovernor(ISyndicateFactory(factory).beacon()),
+                "PRE-FLIGHT: SYNDICATE_FACTORY has live governor proxies on a PRE-PLAN-B governor "
+                "impl. Plan B cannot be wired into them: createSyndicate/pushWiring would revert, and "
+                "upgrading the beacon is FORBIDDEN on this stack -- SyndicateGovernor's layout was "
+                "re-baselined non-append-only (fresh deploys only, see GovernorLayoutPins.t.sol), so "
+                "every live governor would read garbage. Deploy a FRESH SyndicateFactory + "
+                "GovernorBeacon on the Plan B governor impl and run this against that factory."
+            );
+        }
+
         console.log("sWOOD coolDownPeriod (s): %s", coolDown);
         console.log("deployer / ledger owner:  %s", deployer);
+        console.log("existing syndicates on this factory: %s", liveGovernors);
 
         vm.startBroadcast();
 
@@ -313,8 +383,71 @@ contract DeployPlanB is Script {
         console.log("ExposureLedger:     %s", address(ledger));
         console.log("ProposerBondEscrow: %s", address(escrow));
         console.log("asset feed maxDelay (s): %s", feedMaxDelay);
-        console.log("MANUAL NEXT: governor beacon upgrade, registry UUPS upgrade,");
-        console.log("factory.pushWiring(<each existing governor>), TierRegistry redeploy + recertify.");
+
+        // The manual follow-ups are NOT the same list in both states, and the
+        // difference is the whole of review M5. The old unconditional text told
+        // every operator to upgrade the governor beacon and then `pushWiring`
+        // each existing governor — an instruction that is correct on a fresh
+        // chain and destroys a populated one. Pre-flight 5 above has already
+        // refused the genuinely unreachable case, so only two states get here;
+        // each is printed with its own precondition spelled out, so the safety
+        // of the step is legible from the transcript rather than from having
+        // read this file.
+        console.log("MANUAL NEXT: registry UUPS upgrade, TierRegistry redeploy + recertify.");
+        if (liveGovernors == 0) {
+            console.log("MANUAL NEXT: governor beacon upgrade.");
+            console.log("  PRECONDITION MET: syndicateCount == 0 -- this beacon has no live governor");
+            console.log("  proxies, so swapping its impl cannot corrupt anyone. This is the ONLY");
+            console.log("  state in which the upgrade is safe on this stack: SyndicateGovernor's");
+            console.log("  layout was re-baselined non-append-only (see GovernorLayoutPins.t.sol).");
+            console.log("  Re-check the count immediately before broadcasting the upgrade -- a");
+            console.log("  syndicate created in between makes it unsafe.");
+            console.log("  No pushWiring calls: there are no existing governors to wire.");
+        } else {
+            console.log("MANUAL NEXT: factory.pushWiring(<each existing governor>) -- %s syndicates.", liveGovernors);
+            console.log("  DO *NOT* UPGRADE THE GOVERNOR BEACON ON THIS CHAIN. %s live governor", liveGovernors);
+            console.log("  proxies read their impl from it, and this stack's SyndicateGovernor layout");
+            console.log("  was re-baselined non-append-only (vault 0->15, _guardianRegistry 43->0,");
+            console.log("  _tierRegistry 48->58): an impl swap makes every one of them read garbage.");
+            console.log("  No upgrade is needed -- pre-flight 5 confirmed the beacon impl already");
+            console.log("  exposes the Plan B wiring, which is why this run was allowed to proceed.");
+            console.log("  If some future governor change DOES require a new impl here, those");
+            console.log("  syndicates need a FRESH factory + beacon and a migration, not an upgrade.");
+        }
         console.log("MANUAL NEXT: hand ledger ownership to the protocol owner (Ownable2Step: transfer + accept).");
+    }
+
+    /// @notice True when `beacon`'s CURRENT implementation is a governor that
+    ///         already carries the Plan B wiring slots.
+    /// @dev Probes for the two views (`exposureLedger()` / `bondEscrow()`) that
+    ///      only a Plan B-era `SyndicateGovernor` has. A pre-Plan B impl has no
+    ///      such selector and no fallback, so the staticcall reverts and returns
+    ///      `false` — which is also the answer for a `beacon` that is not a
+    ///      beacon at all, or one whose impl has no code. FAIL-CLOSED
+    ///      throughout: every unknown answers "not capable", and pre-flight 5
+    ///      turns that into a refusal rather than a silent pass.
+    ///
+    ///      Deliberately a CAPABILITY probe, not a version or codehash
+    ///      comparison. What Plan B needs from the beacon is exactly that
+    ///      `setExposureLedger`/`setBondEscrow` land somewhere the governor
+    ///      reads back; any impl offering that is fine, and pinning a specific
+    ///      codehash would refuse legitimate governor builds for no gain.
+    ///
+    ///      A `view` staticcall on an UNINITIALIZED implementation is fine here:
+    ///      these getters read storage unconditionally, so the selector's
+    ///      existence — not the impl's initialization state — is what answers.
+    function _beaconServesPlanBGovernor(address beacon) internal view returns (bool) {
+        if (beacon.code.length == 0) return false;
+        (bool okImpl, bytes memory implRet) = beacon.staticcall(abi.encodeWithSignature("implementation()"));
+        if (!okImpl || implRet.length != 32) return false;
+
+        address impl = abi.decode(implRet, (address));
+        if (impl.code.length == 0) return false;
+
+        (bool okLedger, bytes memory ledgerRet) = impl.staticcall(abi.encodeWithSignature("exposureLedger()"));
+        if (!okLedger || ledgerRet.length != 32) return false;
+
+        (bool okEscrow, bytes memory escrowRet) = impl.staticcall(abi.encodeWithSignature("bondEscrow()"));
+        return okEscrow && escrowRet.length == 32;
     }
 }

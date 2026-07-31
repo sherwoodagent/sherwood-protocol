@@ -84,9 +84,52 @@ contract DeafSyndicateFactory {
     address public exposureLedger;
     address public bondEscrow;
 
+    /// @dev Fresh: pre-flight 5 skips the beacon probe entirely at a zero count,
+    ///      so this stub stays about the wiring assertion it was written for.
+    function syndicateCount() external pure returns (uint256) {
+        return 0;
+    }
+
     function setExposureLedger(address) external {}
 
     function setBondEscrow(address) external {}
+}
+
+/// @dev A factory with a DECLARED syndicate count and beacon — the two inputs
+///      pre-flight 5 reads — plus real storage for the two wiring setters, so a
+///      PERMITTED run still reaches and passes the post-broadcast wiring
+///      assertions. The real `SyndicateFactory` cannot stand in here: reaching
+///      `syndicateCount != 0` through it means driving `createSyndicate`, which
+///      needs the whole ENS / agent-registry / owner-stake apparatus, and the
+///      state under test is the COUNT and the BEACON, not how they were reached.
+contract CountingSyndicateFactory {
+    uint256 public syndicateCount;
+    address public beacon;
+    address public exposureLedger;
+    address public bondEscrow;
+
+    constructor(uint256 count_, address beacon_) {
+        syndicateCount = count_;
+        beacon = beacon_;
+    }
+
+    function setExposureLedger(address newLedger) external {
+        exposureLedger = newLedger;
+    }
+
+    function setBondEscrow(address newEscrow) external {
+        bondEscrow = newEscrow;
+    }
+}
+
+/// @dev A governor implementation from BEFORE Plan B: no `exposureLedger()` and
+///      no `bondEscrow()` selector, and no fallback to fake one. This is the
+///      shape a legacy chain's beacon actually serves — Robinhood testnet 46630
+///      has 9 live governor proxies on such a beacon — and it is the state
+///      pre-flight 5 must refuse, because the beacon upgrade that would make
+///      Plan B reachable is exactly what the layout re-baseline forbids.
+contract PrePlanBGovernor {
+    address public vault;
 }
 
 /// @notice Drives the REAL `DeployPlanB` script against a REAL `StakedWood`,
@@ -304,6 +347,85 @@ contract DeployPlanBPreflightTest is Test {
         DeafSyndicateFactory deaf = new DeafSyndicateFactory();
         _setBook(address(swood), address(registry), address(deaf));
         _runExpecting("WIRING: SyndicateFactory.exposureLedger != the ledger just deployed");
+    }
+
+    // ───────────── pre-flight 5: the beacon guard (review M5) ─────────────
+
+    /// @dev THE GUARD BITES. A factory reporting live governor proxies whose
+    ///      beacon still serves a PRE-Plan B governor is refused outright.
+    ///
+    ///      This is not hypothetical: Robinhood testnet (46630) has 9
+    ///      `SyndicateCreated` events on factory 0xB9E7..7cce, and a sampled
+    ///      governor's ERC-1967 beacon slot reads the recorded beacon
+    ///      0x11B726c49E0bAc95bEafF8d648cf3030Dc11B73a. Before this guard the
+    ///      script printed "MANUAL NEXT: governor beacon upgrade,
+    ///      factory.pushWiring(<each existing governor>)" unconditionally — an
+    ///      instruction that on that chain re-points 9 live proxies at an impl
+    ///      where every field moved (`vault` 0 -> 15, `_guardianRegistry`
+    ///      43 -> 0, `_tierRegistry` 48 -> 58).
+    function test_preflight_bites_whenLiveGovernorsSitOnAPrePlanBBeacon() public {
+        GovernorBeacon legacyBeacon = new GovernorBeacon(address(new PrePlanBGovernor()), DEFAULT_SENDER);
+        CountingSyndicateFactory legacyFactory = new CountingSyndicateFactory(9, address(legacyBeacon));
+        _setBook(address(swood), address(registry), address(legacyFactory));
+
+        _runExpecting("PRE-FLIGHT: SYNDICATE_FACTORY has live governor proxies on a PRE-PLAN-B governor");
+
+        // Refused BEFORE the broadcast: nothing was deployed and nothing wired.
+        assertEq(swood.exposureLedger(), address(0), "a refused deploy must not have wired anything");
+        assertEq(address(registry.exposureLedger()), address(0), "a refused deploy must not have wired anything");
+        assertEq(legacyFactory.exposureLedger(), address(0), "a refused deploy must not have wired anything");
+    }
+
+    /// @dev THE PROBE IS FAIL-CLOSED. An unreadable beacon (here: no code at
+    ///      all, standing in for a mis-recorded address, a self-destructed
+    ///      beacon, or anything that is not an `UpgradeableBeacon`) counts as
+    ///      "not Plan B-capable" and is refused, rather than being waved
+    ///      through on an unanswered question.
+    function test_preflight_bites_whenTheBeaconCannotBeProbed() public {
+        address notABeacon = address(0xB3AC0);
+        assertEq(notABeacon.code.length, 0, "fixture must be code-less");
+
+        CountingSyndicateFactory legacyFactory = new CountingSyndicateFactory(9, notABeacon);
+        _setBook(address(swood), address(registry), address(legacyFactory));
+
+        _runExpecting("PRE-FLIGHT: SYNDICATE_FACTORY has live governor proxies on a PRE-PLAN-B governor");
+    }
+
+    /// @dev AND IT DOES NOT OVER-REFUSE. Having syndicates is not by itself the
+    ///      problem — a chain whose beacon ALREADY serves a Plan B-capable
+    ///      governor needs no upgrade at all, so `pushWiring` finishes the job
+    ///      and the run must proceed. This is the ordinary "Plan A from this
+    ///      stack, then Plan B" path; refusing it would gate legitimate work on
+    ///      a condition that has nothing to do with the hazard.
+    function test_deploy_allowedWhenLiveGovernorsSitOnAPlanBCapableBeacon() public {
+        GovernorBeacon capableBeacon =
+            new GovernorBeacon(address(new SyndicateGovernor(24 hours, 1 hours)), DEFAULT_SENDER);
+        CountingSyndicateFactory populated = new CountingSyndicateFactory(9, address(capableBeacon));
+        _setBook(address(swood), address(registry), address(populated));
+
+        _run();
+
+        address ledger = swood.exposureLedger();
+        assertTrue(ledger != address(0), "the deploy must arm the unstake gate");
+        assertEq(populated.exposureLedger(), ledger, "the populated factory must be wired");
+        assertTrue(populated.bondEscrow() != address(0), "bond escrow must be wired");
+    }
+
+    /// @dev A ZERO COUNT DOES NOT TRIGGER THE GUARD, and specifically does not
+    ///      trigger it even behind a PRE-Plan B beacon. That pairing is the
+    ///      point: with no live proxies there is nothing an impl swap can
+    ///      corrupt, so the beacon's current implementation is irrelevant and
+    ///      the probe is skipped entirely. A guard keyed on the beacon alone
+    ///      would refuse this — the state every fresh chain, mainnet 4663
+    ///      included, actually deploys from.
+    function test_preflight_passes_whenTheFactoryHasNoSyndicates() public {
+        GovernorBeacon legacyBeacon = new GovernorBeacon(address(new PrePlanBGovernor()), DEFAULT_SENDER);
+        CountingSyndicateFactory freshFactory = new CountingSyndicateFactory(0, address(legacyBeacon));
+        _setBook(address(swood), address(registry), address(freshFactory));
+
+        _run();
+
+        assertEq(freshFactory.exposureLedger(), swood.exposureLedger(), "a fresh factory must be wired normally");
     }
 
     // ─────────────────────────────── helpers ───────────────────────────────
