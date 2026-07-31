@@ -256,6 +256,26 @@ contract DeployPlanB is Script {
         // says nothing about the other's proxies. Over-refusal is the safe
         // direction for the first; the second is an operator obligation — check
         // every factory sharing the beacon.
+        //
+        // INVARIANT THIS GUARD DEPENDS ON: ONE BEACON SERVES EXACTLY ONE FACTORY.
+        // Nothing on-chain enforces it and nothing today violates it — but once a
+        // beacon serves two factories this check becomes unsound in the DANGEROUS
+        // direction, not the safe one: a factory reporting zero would wave through
+        // an upgrade that corrupts a sibling factory's live proxies. A beacon
+        // cannot enumerate its proxies, so no on-chain check can recover this.
+        // Preserving the invariant is free; losing it is discovered only after
+        // governors start reading garbage. Deploy a beacon per factory.
+        //
+        // TOCTOU: this read and the beacon upgrade are separate transactions,
+        // possibly days apart. A syndicate created in between flips a safe upgrade
+        // into a corrupting one. Re-read the count immediately before broadcasting
+        // any `upgradeTo` — the console output below says so, but a signed-off
+        // runbook step is the real control.
+        //
+        // Both are closed by the same thing: a guard contract owning the beacon,
+        // holding the factory reference, and re-reading this count in the SAME
+        // transaction as `upgradeTo`. Deferred until the first governor upgrade
+        // needs it, rather than shipped untested against a scenario months away.
         uint256 liveGovernors = ISyndicateFactory(factory).syndicateCount();
         if (liveGovernors != 0) {
             require(
