@@ -1408,7 +1408,21 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         // would make a fully-subscribed proposal fail its own coverage check
         // after settling — the mirror of the dust bug the quorum already avoids
         // by summing reservations.
-        if (assigned < needUsd && firstHolder != address(0)) {
+        // GATED ON THE OVER-SUBSCRIBED BRANCH. `_allocate` only divides — and so
+        // only truncates — when `effectiveTotal > needUsd`; below that it returns
+        // each reservation unscaled, making `assigned == effectiveTotal`. The
+        // early return above guards `reservedTotal`, which is the RESERVED total
+        // rather than the payable one, so a cohort whose bonds shrank between the
+        // vote and settling lands here with `needUsd - assigned` being a genuine
+        // coverage SHORTFALL, not dust. Crediting that to the first holder booked
+        // exposure it never reserved, above its own `kNumerator *
+        // slashableBondUsd` cap — freezing that guardian's approve budget and its
+        // unstake claim for the rest of the bucket's life, on a victim any
+        // approver could select via `releaseApproval`'s swap-and-pop. An
+        // under-covered proposal stays under-covered: inventing collateral nobody
+        // pledged is precisely what `_allocate` refuses to do when it declines to
+        // scale UP.
+        if (effectiveTotal > needUsd && assigned < needUsd && firstHolder != address(0)) {
             uint256 residue = needUsd - assigned;
             RecordedExposure memory rf = _recorded[key][firstHolder];
             _buckets[firstHolder][rf.epoch] += residue;
