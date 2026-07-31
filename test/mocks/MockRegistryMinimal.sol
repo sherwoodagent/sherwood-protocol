@@ -135,7 +135,10 @@ contract MockRegistryMinimal is IGuardianRegistry {
     }
 
     function factory() external pure returns (address) {
-        revert NotImplemented();
+        // address(0) = "stateless beta stub" — the value SyndicateFactory's
+        // Sherlock #28 alignment check accepts (any other non-zero mismatched
+        // address reverts RegistryFactoryMismatch at setGuardianRegistry).
+        return address(0);
     }
 
     function swood() external pure returns (IStakedWood) {

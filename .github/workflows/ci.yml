@@ -1,0 +1,141 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Must match the forge version developers format/build with — forge fmt rules
+  # drift across versions, so bump this together with a repo-wide `forge fmt`.
+  FOUNDRY_VERSION: v1.7.1
+  FOUNDRY_PROFILE: default
+
+jobs:
+  build-test:
+    name: Build & test (non-fork)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: ${{ env.FOUNDRY_VERSION }}
+
+      - name: Cache build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            cache
+            out
+          key: forge-${{ env.FOUNDRY_VERSION }}-${{ hashFiles('foundry.toml', 'src/**/*.sol', 'lib/**/*.sol', 'test/**/*.sol', 'script/**/*.sol') }}
+          restore-keys: |
+            forge-${{ env.FOUNDRY_VERSION }}-
+
+      - name: Build
+        run: forge build
+
+      # Fork/integration tests need live RPC endpoints (no secrets in CI):
+      # everything under test/integration/ plus WstETHMoonwellStrategy.t.sol,
+      # which forks public Base RPC in setUp(). All other tests run.
+      - name: Test
+        run: forge test --no-match-path "{test/integration/**,test/WstETHMoonwellStrategy.t.sol}" -vv
+
+  fmt:
+    name: Format check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: ${{ env.FOUNDRY_VERSION }}
+
+      - name: forge fmt --check
+        run: forge fmt --check src test script
+
+  storage-layout:
+    name: Storage-layout gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: ${{ env.FOUNDRY_VERSION }}
+
+      - name: Cache build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            cache
+            out
+          key: forge-${{ env.FOUNDRY_VERSION }}-${{ hashFiles('foundry.toml', 'src/**/*.sol', 'lib/**/*.sol', 'test/**/*.sol', 'script/**/*.sol') }}
+          restore-keys: |
+            forge-${{ env.FOUNDRY_VERSION }}-
+
+      # Both scripts run `forge build` themselves and rely on
+      # extra_output = ["storageLayout"] being present in every artifact.
+      - name: Storage parity (LeveragedAero seam)
+        run: ./script/check-storage-parity.sh
+
+      - name: Layout goldens (governor + factory)
+        run: ./script/check-layout-goldens.sh
+
+  contract-size:
+    name: Contract size (Robinhood 96 KiB limit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: ${{ env.FOUNDRY_VERSION }}
+
+      - name: Cache build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            cache
+            out
+          key: forge-size-${{ env.FOUNDRY_VERSION }}-${{ hashFiles('foundry.toml', 'src/**/*.sol', 'lib/**/*.sol') }}
+          restore-keys: |
+            forge-size-${{ env.FOUNDRY_VERSION }}-
+
+      # Robinhood Chain (4663, ArbOS) MaxCodeSize is 98,304 bytes (4x EIP-170).
+      # `forge build --sizes` alone enforces the wrong limit (24,576), so apply
+      # the chain's real threshold ourselves. `|| true`: forge exits non-zero on
+      # the 24,576 warning, which is not our gate.
+      - name: Check deployable contract sizes
+        run: |
+          forge build --skip test --skip script --sizes --json > sizes.json || true
+          python3 - <<'PY'
+          import json, sys
+
+          LIMIT = 98_304  # Robinhood Chain MaxCodeSize (see issue #16)
+          with open("sizes.json") as f:
+              sizes = json.load(f)
+          if not sizes:
+              print("FAIL: empty --sizes output — build failed?", file=sys.stderr)
+              sys.exit(1)
+
+          offenders = [
+              (name, info["runtime_size"])
+              for name, info in sizes.items()
+              if info.get("runtime_size", 0) > LIMIT
+          ]
+          for name, size in sorted(offenders, key=lambda x: -x[1]):
+              print(f"FAIL: {name} runtime bytecode {size:,} B > {LIMIT:,} B", file=sys.stderr)
+          if offenders:
+              sys.exit(1)
+          print(f"OK: all {len(sizes)} contracts within {LIMIT:,} B runtime limit")
+          PY
