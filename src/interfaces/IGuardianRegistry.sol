@@ -190,6 +190,26 @@ interface IGuardianRegistry {
         view
         returns (address[] memory approvers, uint128[] memory weights, uint128 totalApproveWeight);
 
+    /// @notice Per-proposal approver set + the COVERAGE each one actually
+    ///         underwrote, from the exposure ledger's settled allocation.
+    /// @dev    The weight guardian fees should be paid on (§3.10).
+    ///         `getApproverWeights` returns staked WOOD, which pays for parking
+    ///         capital rather than for underwriting — an approver the ledger
+    ///         booked nothing for (no free budget, unpriceable feed, zero
+    ///         coverage, beyond horizon) still appears there at full stake
+    ///         weight. Weighting on this instead pays zero for a zero-coverage
+    ///         approve without touching anyone's right to vote.
+    /// @return approvers   Registry-side approver set for the proposal.
+    /// @return coverageUsd Allocated coverage per approver, USD-18. Zero entries
+    ///                     are real: that approver underwrote nothing.
+    /// @return priced      False when the ledger could not value the coverage
+    ///                     (stale/unconfigured asset feed). RETRY — do not treat
+    ///                     the zeros as a payable result.
+    function getApproverCoverage(address governor, uint256 proposalId)
+        external
+        view
+        returns (address[] memory approvers, uint256[] memory coverageUsd, bool priced);
+
     /// @notice The review window pushed by a governor via `registerReview`.
     ///         `(0, 0)` if never registered.
     function reviewWindow(address governor, uint256 proposalId) external view returns (uint64 voteEnd, uint64 reviewEnd);

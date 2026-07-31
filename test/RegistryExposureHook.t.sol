@@ -272,6 +272,69 @@ contract RegistryExposureHookTest is Test {
         assertEq(approvers[0], g1);
     }
 
+    /// @notice THE FEE-WEIGHTING GAP (§3.10). The test above pins the divergence
+    ///         that makes it possible: the registry counts the vote while the
+    ///         ledger books nothing. Since `getApproverWeights` returns
+    ///         `_voteStake` — staked WOOD, not underwritten coverage — an
+    ///         approver the ledger declined to book still carries full stake
+    ///         weight into the off-chain Merkl attribution, and is paid beside
+    ///         approvers who actually carried the risk.
+    ///
+    ///         The free-ride needs no exotic state: burn the whole budget on one
+    ///         proposal, then keep approving everything else. Every later
+    ///         approve books zero and consumes no capacity, yet still bills at
+    ///         full stake.
+    ///
+    ///         `getApproverCoverage` is the weight the fee should be paid on. It
+    ///         reports what each approver actually underwrote, so a zero-coverage
+    ///         approve weighs zero — closing the free-ride WITHOUT gating the
+    ///         vote, which review N1 rejected because it silenced the approve
+    ///         side and revived the C1 veto.
+    function test_getApproverCoverage_zeroForAnApproverThatUnderwroteNothing() public {
+        // Same setup as above: g1 has no slashable bond, so no free budget.
+        vm.mockCall(address(wired.swood), abi.encodeWithSignature("guardianStake(address)", g1), abi.encode(uint256(0)));
+
+        vm.prank(g1);
+        wired.registry.voteOnProposal(address(wired.gov), PID, IGuardianRegistry.GuardianVoteType.Approve);
+        vm.prank(g2);
+        wired.registry.voteOnProposal(address(wired.gov), PID, IGuardianRegistry.GuardianVoteType.Approve);
+
+        // Stake weighting: both approvers listed, and g1 is NOT weighted zero --
+        // this is the surface that overpays.
+        (address[] memory sApprovers, uint128[] memory stakeWeights,) =
+            wired.registry.getApproverWeights(address(wired.gov), PID);
+        assertEq(sApprovers.length, 2, "both votes counted for attribution");
+
+        // Coverage weighting: same set, but the free-rider weighs nothing.
+        (address[] memory cApprovers, uint256[] memory coverage, bool priced) =
+            wired.registry.getApproverCoverage(address(wired.gov), PID);
+        assertTrue(priced, "asset feed is live in this fixture");
+        assertEq(cApprovers.length, 2, "same approver set as the stake view");
+
+        for (uint256 i; i < cApprovers.length; ++i) {
+            if (cApprovers[i] == g1) {
+                assertEq(coverage[i], 0, "underwrote nothing -> weighs nothing");
+                assertGt(uint256(stakeWeights[i]), 0, "...while stake weighting paid it in full");
+            } else {
+                assertGt(coverage[i], 0, "the guardian that actually covered it carries weight");
+            }
+        }
+    }
+
+    /// @notice An unwired ledger has no coverage to attribute, and that is a
+    ///         real answer rather than a failure — `priced` stays true so the
+    ///         payout job does not retry forever against a Plan A deployment.
+    function test_getApproverCoverage_unwiredLedgerReportsPricedZeros() public {
+        vm.prank(g1);
+        unwired.registry.voteOnProposal(address(unwired.gov), PID2, IGuardianRegistry.GuardianVoteType.Approve);
+
+        (address[] memory approvers, uint256[] memory coverage, bool priced) =
+            unwired.registry.getApproverCoverage(address(unwired.gov), PID2);
+        assertTrue(priced, "no ledger is a determinate answer, not an outage");
+        assertEq(approvers.length, 1);
+        assertEq(coverage[0], 0);
+    }
+
     function test_ledgerUnset_votesUnaffected() public {
         // Plan A behavior preserved: an unwired registry runs no hooks.
         assertEq(address(unwired.registry.exposureLedger()), address(0));
