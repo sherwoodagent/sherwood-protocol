@@ -384,8 +384,9 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         // WOOD feed failed the VOTE — the block-only review this contract's
         // review history exists to prevent. Falling back keeps the same
         // fail-degraded stance the other three shapes already take.
-        try IAggregatorMinimal(f.feed).latestRoundData() returns (uint80, int256 answer, uint256, uint256 updatedAt, uint80)
-        {
+        try IAggregatorMinimal(f.feed).latestRoundData() returns (
+            uint80, int256 answer, uint256, uint256 updatedAt, uint80
+        ) {
             if (answer <= 0) return (_haircut(woodUsdPriceX8), true);
             uint256 age = block.timestamp > updatedAt ? block.timestamp - updatedAt : 0;
             if (age > f.maxDelay) return (_haircut(woodUsdPriceX8), true);
