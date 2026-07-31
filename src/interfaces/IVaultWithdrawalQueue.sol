@@ -42,6 +42,12 @@ interface IVaultWithdrawalQueue {
     ///      "a pull distributes in the same call" invariant real (PR #24 review
     ///      F-D); the whole transaction rolls back, including the pull.
     error NoEligibleRequests();
+    /// @dev `distributeCompensation` named an (escrow, caseId) pair this queue
+    ///      never pulled. That path distributes ONLY already-recorded proceeds;
+    ///      pulling stays behind `claimCompensation`'s governance-resolved
+    ///      escrow, so a caller cannot introduce an escrow of their own
+    ///      choosing on a money path (PR #56 review M6 / PR #24 review 🔴N1).
+    error CaseNotPulled();
 
     // ── Types ──
     enum RequestKind {
@@ -125,6 +131,31 @@ interface IVaultWithdrawalQueue {
     /// @return processed Ids newly credited by this call.
     /// @return skipped Ids passed over (ineligible, wrong kind, already paid).
     function claimCompensation(uint256 caseId, uint256[] calldata requestIds)
+        external
+        returns (uint256 paid, uint256 processed, uint256 skipped);
+
+    /// @notice Finish distributing a case this queue ALREADY pulled, naming the
+    ///         escrow it was pulled from.
+    /// @dev The pull and the distribution are decoupled — a keeper batches ids
+    ///      across transactions — so a `setCompensationEscrow` re-point landing
+    ///      mid-distribution used to strand the remainder of the old escrow's
+    ///      case in this contract forever: `claimCompensation` resolves the NEW
+    ///      escrow, finds nothing pulled under it, and tries to pull a
+    ///      same-numbered case that is a different case entirely (ids are
+    ///      per-escrow). PR #56 review M6.
+    /// @dev This does NOT reintroduce the caller-chosen escrow 🔴N1 closed. The
+    ///      parameter is a mapping key, never a callee: this path makes no call
+    ///      to `escrow`, pulls nothing, and reverts `CaseNotPulled` unless the
+    ///      case was already pulled — and `pulled` is only ever set by
+    ///      `claimCompensation` after resolving the escrow from governance. The
+    ///      selectable set is therefore exactly the escrows governance itself
+    ///      pointed at, and every payout is bounded by that case's own measured
+    ///      `total`, denominated in its pinned `token`, and sent to the
+    ///      requests' own owners.
+    /// @return paid Total tokens transferred by this call.
+    /// @return processed Ids newly credited by this call.
+    /// @return skipped Ids passed over (ineligible, wrong kind, already paid).
+    function distributeCompensation(address escrow, uint256 caseId, uint256[] calldata requestIds)
         external
         returns (uint256 paid, uint256 processed, uint256 skipped);
 
