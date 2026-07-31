@@ -139,6 +139,30 @@ contract PriceRouter is Initializable, OwnableUpgradeable, UUPSUpgradeable, IPri
     }
 
     /// @inheritdoc IPriceRouter
+    /// @dev ONE-SIDED HAIRCUT, SYMMETRIC CONSUMER — read this before raising it
+    ///      above 0 for a kind whose Lane A is enabled.
+    ///
+    ///      The haircut is a realizability discount, and it is applied to the
+    ///      single value `SyndicateVault.totalAssets()` consumes for BOTH
+    ///      directions. On the redeem side that is the intent: an exiter is paid
+    ///      against a conservative mark. On the DEPOSIT side it inverts —
+    ///      `_deposit` mints against an understated NAV, so a Lane A depositor
+    ///      receives more shares than the position is worth, and the vault's own
+    ///      `_laneALockPid` forces them to hold to settle, which is exactly when
+    ///      the haircut comes off and the difference is realised at the expense
+    ///      of existing holders. For an accrual-lag haircut (realized >= mark
+    ///      essentially always) the capture is near-deterministic rather than a
+    ///      risk premium.
+    ///
+    ///      The correct shape is a two-sided quote — un-haircut "ask" for mints,
+    ///      haircut "bid" for redemptions — which is an `IPriceRouter` change,
+    ///      not a parameter change. Until that lands, either keep the haircut at
+    ///      0 for any kind with `laneAEnabled == true`, or route deposits for
+    ///      that kind to Lane B.
+    ///
+    ///      Currently dormant on three independent counts: no `IPriceAdapter`
+    ///      implementation exists in-tree, no deploy script registers one or
+    ///      enables Lane A, and this mapping defaults to 0.
     function setHaircutBps(bytes32 kind, uint16 bps) external onlyOwner {
         if (bps > MAX_HAIRCUT_BPS) revert HaircutTooHigh();
         if (bps < haircutBps[kind]) revert HaircutCannotDecrease();
