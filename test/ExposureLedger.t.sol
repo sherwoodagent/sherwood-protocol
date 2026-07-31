@@ -37,6 +37,18 @@ contract MockFeed {
     }
 }
 
+/// @dev A wired-but-data-less Chainlink aggregator. A fresh proxy with no round
+///      published reverts `"No data present"` rather than returning a bad
+///      answer, which is NOT one of the three degraded shapes `_woodPrice`
+///      handles (unset feed / non-positive answer / stale answer).
+contract RevertingFeed {
+    uint8 public constant decimals = 8;
+
+    function latestRoundData() external pure returns (uint80, int256, uint256, uint256, uint80) {
+        revert("No data present");
+    }
+}
+
 contract MockGovernorForLedger {
     address public vaultAddr;
     uint256 public coverage;
@@ -778,6 +790,57 @@ contract ExposureLedgerTest is Test {
             ledger.kNumerator() * ledger.slashableBondUsd(guardian),
             "booked exposure must stay within the guardian's own cap"
         );
+    }
+
+    /// @notice `_woodPrice` degrades to the governance fallback on an unset
+    ///         feed, a non-positive answer and a stale answer — but the read
+    ///         itself was unwrapped, so a feed that REVERTS propagated instead.
+    ///         A fresh aggregator with no round published is exactly that shape,
+    ///         and it is the shape the first WOOD/USD wiring will have (there is
+    ///         no WOOD feed on Robinhood today).
+    ///
+    ///         Unhandled, it halts far more than pricing: every Approve vote,
+    ///         every tier-gated `executeProposal`, `settleCoverage` and
+    ///         `slashBpsFor` route through `slashableBondUsd`. `recordApproval`
+    ///         deliberately wraps only the ASSET-price read, so the WOOD read
+    ///         reverting fails the vote — reproducing the block-only review that
+    ///         three review rounds existed to eliminate.
+    function test_woodPrice_fallsBackWhenTheFeedReverts() public {
+        RevertingFeed dead = new RevertingFeed();
+        vm.prank(owner);
+        ledger.setWoodFeed(address(dead), 1 days);
+
+        (uint256 price, bool usingFallback) = ledger.woodPriceDetail();
+        assertTrue(usingFallback, "a reverting feed is a degraded feed, not a fatal one");
+        assertEq(price, 0.05e8, "falls back to the governance price");
+
+        // The property that matters: bonds still price, so approvals still work.
+        swood.setStake(guardian, 100_000e18);
+        assertEq(ledger.slashableBondUsd(guardian), 5_000e18, "bond still priceable through the outage");
+    }
+
+    /// @notice Recovery must not require deploying a substitute aggregator.
+    ///         `setWoodFeed` rejected `address(0)`, so once a bad feed was
+    ///         wired there was no transaction that returned the ledger to its
+    ///         governance fallback.
+    function test_setWoodFeed_canClearBackToTheFallback() public {
+        RevertingFeed dead = new RevertingFeed();
+        vm.startPrank(owner);
+        ledger.setWoodFeed(address(dead), 1 days);
+        ledger.setWoodFeed(address(0), 0); // clear
+        vm.stopPrank();
+
+        (uint256 price, bool usingFallback) = ledger.woodPriceDetail();
+        assertTrue(usingFallback, "cleared feed reads the fallback");
+        assertEq(price, 0.05e8, "governance price restored");
+    }
+
+    /// @notice Clearing is an explicit two-zero move, so a mis-typed maxDelay
+    ///         alongside a zero feed is still rejected.
+    function test_setWoodFeed_zeroFeedWithNonZeroDelayReverts() public {
+        vm.prank(owner);
+        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
+        ledger.setWoodFeed(address(0), 1 days);
     }
 
     // ── WOOD price: Chainlink feed with a governance fallback ─────────────

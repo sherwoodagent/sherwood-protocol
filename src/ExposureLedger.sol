@@ -373,14 +373,29 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     function _woodPrice() internal view returns (uint256 price, bool usingFallback) {
         AssetFeed storage f = _woodFeed;
         if (f.feed == address(0)) return (_haircut(woodUsdPriceX8), true);
-        (, int256 answer,, uint256 updatedAt,) = IAggregatorMinimal(f.feed).latestRoundData();
-        if (answer <= 0) return (_haircut(woodUsdPriceX8), true);
-        uint256 age = block.timestamp > updatedAt ? block.timestamp - updatedAt : 0;
-        if (age > f.maxDelay) return (_haircut(woodUsdPriceX8), true);
-        // Normalise to 8 decimals. `answer > 0` checked above.
-        // forge-lint: disable-next-line(unsafe-typecast)
-        uint256 priceX8 = (uint256(answer) * 1e8) / (10 ** f.feedDecimals);
-        return (_haircut(priceX8), false);
+        // A REVERTING feed is a fourth degraded shape, and it was the one left
+        // unhandled. The three below model a feed that answers badly; an
+        // aggregator with no round published answers not at all ("No data
+        // present"), and so does a proxy whose implementation slot is zeroed.
+        // Unwrapped, that revert propagated out of every consumer of
+        // `slashableBondUsd`: each Approve vote, each tier-gated
+        // `executeProposal`, `settleCoverage` and `slashBpsFor`. Since
+        // `recordApproval` deliberately wraps only the ASSET-price read, a dead
+        // WOOD feed failed the VOTE — the block-only review this contract's
+        // review history exists to prevent. Falling back keeps the same
+        // fail-degraded stance the other three shapes already take.
+        try IAggregatorMinimal(f.feed).latestRoundData() returns (uint80, int256 answer, uint256, uint256 updatedAt, uint80)
+        {
+            if (answer <= 0) return (_haircut(woodUsdPriceX8), true);
+            uint256 age = block.timestamp > updatedAt ? block.timestamp - updatedAt : 0;
+            if (age > f.maxDelay) return (_haircut(woodUsdPriceX8), true);
+            // Normalise to 8 decimals. `answer > 0` checked above.
+            // forge-lint: disable-next-line(unsafe-typecast)
+            uint256 priceX8 = (uint256(answer) * 1e8) / (10 ** f.feedDecimals);
+            return (_haircut(priceX8), false);
+        } catch {
+            return (_haircut(woodUsdPriceX8), true);
+        }
     }
 
     /// @dev THE HAIRCUT APPLIES TO BOTH PATHS. It originally applied only to the
@@ -477,8 +492,21 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      by the old registry become unreleasable and only self-heal when
     ///      their buckets expire (end of epoch + challenge window). Re-point
     ///      only at low open exposure.
+    /// @dev CLEARING IS SUPPORTED: `setWoodFeed(address(0), 0)` unwires the feed
+    ///      and returns pricing to the governance fallback. Without it, wiring a
+    ///      bad aggregator was a one-way door — the zero-address rejection meant
+    ///      recovery required DEPLOYING a substitute aggregator contract first,
+    ///      while every Approve vote and every tier-gated execute stayed halted.
+    ///      Requiring `maxDelay == 0` alongside keeps the clear explicit, so a
+    ///      mis-typed address with a real delay still reverts rather than
+    ///      silently disabling the feed.
     function setWoodFeed(address feed, uint256 maxDelay) external onlyOwner {
-        if (feed == address(0)) revert ZeroAddress();
+        if (feed == address(0)) {
+            if (maxDelay != 0) revert InvalidParameter();
+            delete _woodFeed;
+            emit WoodFeedSet(address(0), 0);
+            return;
+        }
         if (maxDelay == 0) revert InvalidParameter();
         uint8 feedDecimals = IAggregatorMinimal(feed).decimals();
         _woodFeed = AssetFeed({
