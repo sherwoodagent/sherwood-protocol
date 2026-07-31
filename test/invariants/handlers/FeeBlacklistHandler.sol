@@ -240,21 +240,28 @@ contract FeeBlacklistHandler is Test {
         // Settle as proposer. MUST NOT revert on blacklist —
         // any revert here is a real INV-47 violation. Capture revert and
         // surface via assert so the harness produces a counterexample.
+        vm.recordLogs();
         vm.prank(leadAgent);
         try governor.settleProposal(proposalId) {
-            // Compute the expected fee waterfall using the contract's own
-            // formula. This is the INDEPENDENT accrued measure.
+            // Read the fee the settlement actually charged, off its own
+            // `ProposalSettled` event.
             //
-            // protocolFee = profit * protocolFeeBps / 10_000
-            // netProfit   = profit - protocolFee  (guardianFee = 0 in setUp)
-            // agentFee    = netProfit * perfFeeBps / 10_000
-            // mgmtFee     = (netProfit - agentFee) * mgmtFeeBps / 10_000
-            // totalFee    = protocolFee + agentFee + mgmtFee
-            uint256 protocolFee = (profit * protocolFeeBps) / 10_000;
-            uint256 netProfit = profit - protocolFee;
-            uint256 agentFee = (netProfit * perfFeeBps) / 10_000;
-            uint256 mgmtFee = ((netProfit - agentFee) * managementFeeBps) / 10_000;
-            uint256 totalFee = protocolFee + agentFee + mgmtFee;
+            // This used to recompute the fee from a hardcoded formula
+            // (protocol off gross, then agent off the remainder, then
+            // management off what was left). That formula described the
+            // four-step waterfall and stopped being true when the two-number
+            // model replaced it — and an "independent" measure that encodes
+            // one specific fee model tests the model, not the invariant.
+            // Reading the emitted total keeps INV-47 about what it is for:
+            // whatever is charged must end up claimed or escrowed, never lost.
+            Vm.Log[] memory logs = vm.getRecordedLogs();
+            uint256 totalFee;
+            for (uint256 i = 0; i < logs.length; i++) {
+                if (logs[i].topics[0] == ISyndicateGovernor.ProposalSettled.selector) {
+                    (, totalFee,) = abi.decode(logs[i].data, (int256, uint256, uint256));
+                    break;
+                }
+            }
 
             totalFeesAccrued += totalFee;
 
