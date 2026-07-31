@@ -33,7 +33,7 @@
 #       slot in assembly, or declares a 32-byte hex / large decimal constant (slot anchors
 #       under any name). Comments are stripped first so prose can't false-positive.
 #
-# Run from anywhere; CI wires it in .github/workflows/contracts.yml.
+# Run from anywhere; CI wires it in .github/workflows/ci.yml.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
