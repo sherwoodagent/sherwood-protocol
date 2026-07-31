@@ -43,7 +43,6 @@ interface ISyndicateVault {
     error NotQueue();
     error ZeroAssets();
     error SharesLocked();
-    error NotActiveStrategy();
     /// @notice `setAgentFeeBps` was called with `bps > MAX_AGENT_FEE_BPS`.
     error AgentFeeTooHigh();
     /// @notice `setMinBufferBps` was called with `bps > 5_000` (50%).
@@ -145,8 +144,6 @@ interface ISyndicateVault {
     ///         from the settlement float delta so mid-proposal flows don't
     ///         corrupt strategy PnL (and fees aren't charged on principal).
     function interimNetFlow() external view returns (int256);
-    function strategyMint(address to, uint256 shares) external; // active-strategy-only
-    function strategyBurn(uint256 shares) external; // active-strategy-only
 
     // ── Rescue ──
     function rescueEth(address payable to, uint256 amount) external;
