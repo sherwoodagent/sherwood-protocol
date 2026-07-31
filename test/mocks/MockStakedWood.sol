@@ -236,12 +236,18 @@ contract MockStakedWood is IStakedWood {
         revert("MockStakedWood: slashToEscrow not modeled");
     }
 
-    function setAuthorizedSlasher(address) external pure {
-        revert("MockStakedWood: setAuthorizedSlasher not modeled");
-    }
+    /// @dev MODELLED AS A PLAIN SETTABLE SLOT (review PR #56 M2), unlike the
+    ///      neighbouring "not modeled" stubs. `ChallengeGame.setStakedWood` now
+    ///      READS this back and refuses a sWOOD that has not named it — the
+    ///      other half of a two-sided grant, whose absence wedged every
+    ///      `_settle` inside `slashToEscrow`'s own caller gate. A reverting stub
+    ///      would make that setter unreachable in any suite that points a game
+    ///      at this mock, which is not the failure those suites mean to
+    ///      exercise. No access control: it is a test double.
+    address public authorizedSlasher;
 
-    function authorizedSlasher() external pure returns (address) {
-        revert("MockStakedWood: authorizedSlasher not modeled");
+    function setAuthorizedSlasher(address slasher) external {
+        authorizedSlasher = slasher;
     }
 
     function setCompensationEscrow(address) external pure {
