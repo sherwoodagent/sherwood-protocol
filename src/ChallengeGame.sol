@@ -153,13 +153,66 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      the victims' compensation instead of bubbling. The floor is sized
     ///      per approver plus a base: the slash loop runs before `openCase`,
     ///      so a flat floor would let a large batch consume it before the
-    ///      call that needs protecting. ~300k/approver covers `_slashOne`
-    ///      plus the O(n²) dedup share at the 100-approver cap; the 1M base
-    ///      leaves the `openCase` child (~150-200k observed) a >5x margin
-    ///      after 63/64 forwarding, with the parent's burn/bubble branch
-    ///      still affordable behind it.
-    uint256 internal constant SLASH_GAS_PER_APPROVER = 300_000;
-    uint256 internal constant SLASH_GAS_BASE = 1_000_000;
+    ///      call that needs protecting.
+    ///
+    ///      A FLOOR MUST ALSO BE REACHABLE, WHICH THIS ONE WAS NOT (PR #56
+    ///      review H2). At the previous 300k/1M the full-cap floor was
+    ///      `100 * 300_000 + 1_000_000 = 31,000,000` — read INSIDE
+    ///      `ChallengeGame.rule`, two `CALL`s below an EOA on the court path
+    ///      (`finalize` -> `rule`; `_settle` is private and adds no frame,
+    ///      and neither contract is proxied). Robinhood Chain (4663) caps a
+    ///      transaction at `maxTxGasLimit = 32,000,000`
+    ///      (`ArbGasInfo.getGasAccountingParams()`, probed on mainnet
+    ///      2026-07-24 — the block `gasLimit` field is Orbit's 2^50 "no block
+    ///      cap" sentinel, so the per-tx limit is the binding one). Two
+    ///      EIP-150 haircuts put 31,000,000 out of reach of ANY transaction,
+    ///      so a conviction against a full cohort could not be mined at all:
+    ///      `finalize` bubbles the revert (it swallows only `WrongStatus`),
+    ///      the case sits in `Voting`, and the challenge times out through
+    ///      `resolve` -> `_fail`, ACQUITTING the accused and paying them the
+    ///      challenger's forfeited bond. A gas floor that converts a guilty
+    ///      verdict into an acquittal is worse than the mid-array
+    ///      out-of-gas it was written to prevent.
+    ///
+    ///      THE NUMBERS ARE NOW MEASURED, NOT ESTIMATED
+    ///      (`test/SlashGasCeiling.t.sol`). A conviction run end to end
+    ///      against the real stack — court `finalize`, every approver
+    ///      carrying a real non-zero rate, so every one is a genuine
+    ///      `_slashOne` — costs:
+    ///
+    ///          4 approvers      713,853
+    ///         52 approvers    5,428,313
+    ///        100 approvers   11,176,224
+    ///
+    ///      which fits `~224*n^2 + 85,659*n + 367,629`: a ~368k fixed base,
+    ///      ~86k of linear work per approver, and `slashToEscrow`'s O(n²)
+    ///      pairwise dedup scan at ~224 gas per pair (2.24M of the total at
+    ///      the cap). Average cost per approver at the cap is ~108k; the
+    ///      MARGINAL cost of the hundredth is ~130k. 300k was therefore
+    ///      2.3-3.5x over-provisioned, and that over-provisioning — not the
+    ///      approver cap — is what made the floor unreachable.
+    ///
+    ///      180k/approver keeps ~1.4x over the marginal cost of the last
+    ///      approver and ~1.7x over the average, which is the headroom that
+    ///      matters for the cases this fixture does NOT reproduce: a
+    ///      long-lived guardian whose checkpoint trace makes each
+    ///      `upperLookupRecent` a deeper binary search than a freshly-staked
+    ///      one. The base doubles to 2M rather than shrinking, so the
+    ///      `openCase` child (~150-200k observed) keeps well over the >5x
+    ///      margin after 63/64 forwarding that the original sizing argued
+    ///      for, with the parent's burn/bubble branch still affordable behind
+    ///      it.
+    ///
+    ///      Full-cap floor is now `100 * 180_000 + 2_000_000 = 20,000,000`
+    ///      against a `32,000,000 * (63/64)^3 = 30,523,315` ceiling — 1.5x of
+    ///      slack, and 1.8x over what a full-cap conviction actually spends.
+    ///      THE APPROVER CAP IS UNCHANGED: `MAX_APPROVERS_PER_PROPOSAL` is
+    ///      also the size of the cohort that can underwrite one proposal, so
+    ///      cutting it would cut coverage capacity, and the measurement shows
+    ///      nothing required that. `test_slashGasFloorFitsRobinhoodMaxTxGas`
+    ///      is the CI tripwire that keeps this true.
+    uint256 public constant SLASH_GAS_PER_APPROVER = 180_000;
+    uint256 public constant SLASH_GAS_BASE = 2_000_000;
 
     /// @notice Where every burned slice of a challenger's bond goes — both the
     ///         SETTLE path's `settleBurnBps` and the FAIL path's
