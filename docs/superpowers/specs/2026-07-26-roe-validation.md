@@ -178,7 +178,19 @@ fairly; it cannot enlarge one. Its scope also shrank: per-epoch repricing and
 epoch-checkpoint watchtower funding are gone with §3.4a, while the always-on
 guardian management-fee slice now exists at v1 by design.
 
-What remains genuinely unfunded and worth Plan G's attention: the court panel
-reward (`panelRewardWood` defaults to **0**, and an unpaid panel **acquits by
-default**), the off-chain detector bounty, and the permissionless-but-unpaid
-liveness calls throughout the stack.
+What remains genuinely unfunded and worth Plan G's attention: **adjudicator
+incentives under `TokenCourt`** — deliberately off-chain at v1, an APY for sWOOD
+holders who vote, with no on-chain reward and no vote locking — the off-chain
+detector bounty, and the permissionless-but-unpaid liveness calls throughout the
+stack.
+
+An earlier draft of this paragraph named the court panel reward instead
+(`panelRewardWood` defaulting to **0**, with an unpaid panel **acquitting by
+default**). That gap was designed out rather than funded: PR #52 replaced the
+panel court with a single-layer WOOD vote, so there is no panel and no panel
+reward. The nearest surviving mechanism is `participationFloorBps`, and failing
+it yields `Inconclusive` — a non-verdict that re-arms the challenge window and,
+from round 2 on, burns an escalating slice of the challenger's bond — **not** an
+acquittal. Recorded rather than silently rewritten, because "an unpaid court
+acquits" was load-bearing in this section's funding argument and is no longer
+true of any code path.
