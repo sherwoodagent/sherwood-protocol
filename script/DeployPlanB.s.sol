@@ -6,7 +6,6 @@ import {ExposureLedger} from "../src/ExposureLedger.sol";
 import {ProposerBondEscrow} from "../src/ProposerBondEscrow.sol";
 import {ISyndicateFactory} from "../src/interfaces/ISyndicateFactory.sol";
 import {IGuardianRegistry} from "../src/interfaces/IGuardianRegistry.sol";
-import {IProtocolConfig} from "../src/interfaces/IProtocolConfig.sol";
 
 interface ISwoodCooldown {
     function coolDownPeriod() external view returns (uint256);
@@ -55,7 +54,6 @@ interface ISwoodCooldown {
  *     ASSET_FEED_MAX_DELAY      — feed staleness bound, seconds (see setAssetFeed below).
  *     WOOD_PRICE_HAIRCUT_X8     — conservative WOOD/USD, 8-dec (<= 30-day low).
  *     COVERED_TVL_CAP_USD18     — per-vault covered-TVL ceiling, USD-18. Non-zero.
- *     PROTOCOL_CONFIG           — existing ProtocolConfig (tier-ceiling pre-flight).
  *
  *   Usage (simulate; never --broadcast blind):
  *     forge script script/DeployPlanB.s.sol:DeployPlanB --rpc-url <rpc> -vvvv
@@ -82,10 +80,6 @@ contract DeployPlanB is Script {
         uint256 feedMaxDelay = vm.envUint("ASSET_FEED_MAX_DELAY");
         uint256 woodPriceX8 = vm.envUint("WOOD_PRICE_HAIRCUT_X8"); // conservative, <= 30-day low
         uint256 coveredTvlCapUsd = vm.envUint("COVERED_TVL_CAP_USD18");
-        // Read early so a missing/typo'd address fails before any broadcast;
-        // the value it carries is asserted in pre-flight 4 below.
-        address protocolConfig = vm.envAddress("PROTOCOL_CONFIG");
-
         // ── Pre-flight 1: REMOVED (ADR 2026-07-26) ──
         // This asserted `coolDownPeriod >= epochLength + challengeWindow` (42d
         // at defaults). It was both unsatisfiable and unnecessary:
@@ -181,35 +175,25 @@ contract DeployPlanB is Script {
             "Call setExposureLedger(ledger) by governance, then re-run."
         );
 
-        // ── Pre-flight 4 (POST-wiring): the v1 tier policy, both halves ──
-        // ADR 2026-07-27 is TWO settings, and they are only sound together:
+        // ── Pre-flight 4 (POST-wiring): coverage is enforced at every tier ──
+        // ADR 2026-07-27 originally paired this with a `maxEnvelopeTier <= 1`
+        // ceiling that refused tier-2 exposure outright. THAT HALF WAS DROPPED
+        // (owner decision 2026-07-31): tier-2 guardian ROE is to be closed with
+        // off-chain team token incentives rather than by refusing the tier, so
+        // tier 2 remains admissible on-chain and there is no ceiling to assert.
         //
-        //   maxEnvelopeTier <= 1     refuses tier-2 exposure, which guardian
-        //                            ROE says nobody can rationally underwrite
-        //                            (0.0% at tier 2 vs 9.5%/49.5% at 1/0).
-        //   quorumTierThreshold == 0 requires a bond-backed approve quorum at
-        //                            EVERY tier, not tier 2 alone.
+        // What remains is the half that was never a policy choice. Coverage
+        // SIZING was already correct at every tier; only ENFORCEMENT was gated,
+        // and at the old default of 2 it ran at tier 2 alone — so a tier-0/1
+        // proposal could execute with NO covering approver at all, its
+        // correctly-sized coverage never checked. Threshold 0 closes that.
         //
-        // They are independently settable, so a deploy can land one without the
-        // other and look entirely healthy while sitting outside the ADR:
-        //   - ceiling without threshold: tier-0/1 proposals execute with no
-        //     covering approver at all — coverage is sized but not enforced.
-        //   - threshold without ceiling: the protocol demands coverage for
-        //     tier-2 exposure that no guardian will supply, so tier-2
-        //     proposals simply hang instead of being refused honestly.
-        //
-        // Asserted as one block, after the broadcast, because that is the only
-        // point where both values are readable in the form the protocol will
-        // actually run with. Neither require is satisfiable by fixing the other.
-        require(
-            IProtocolConfig(protocolConfig).maxEnvelopeTier() <= 1,
-            "PRE-FLIGHT: ProtocolConfig.maxEnvelopeTier > 1 -- ADR 2026-07-27 refuses tier-2 exposure. "
-            "Call setMaxEnvelopeTier(1) as ProtocolConfig owner, then re-run."
-        );
+        // Asserted after the broadcast, the only point where the value is
+        // readable in the form the protocol will actually run with.
         require(
             ledger.quorumTierThreshold() == 0,
-            "PRE-FLIGHT: ExposureLedger.quorumTierThreshold != 0 -- ADR 2026-07-27 requires a covering "
-            "approve quorum at EVERY tier. Call setQuorumTierThreshold(0), then re-run."
+            "PRE-FLIGHT: ExposureLedger.quorumTierThreshold != 0 -- a covering approve quorum is "
+            "required at EVERY tier. Call setQuorumTierThreshold(0), then re-run."
         );
 
         console.log("ExposureLedger:     %s", address(ledger));

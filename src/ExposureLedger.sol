@@ -144,8 +144,14 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     /// @dev    The §3.10 ROE validation this parameter was gated on is
     ///         RESOLVED — see `2026-07-26-roe-validation.md` (the gate passes at
     ///         tier 0/1 and fails at tier 2) and `2026-07-27-tier-policy-v1.md`,
-    ///         which lowers this to 0 and pairs it with
-    ///         `ProtocolConfig.maxEnvelopeTier = 1`.
+    ///         which lowers this to 0.
+    ///
+    ///         The ADR also proposed refusing tier-2 exposure outright via a
+    ///         `ProtocolConfig` ceiling. That half was DROPPED (owner decision
+    ///         2026-07-31): tier-2 guardian ROE is to be closed with off-chain
+    ///         team token incentives instead, so tier 2 stays admissible
+    ///         on-chain. This parameter is the half that shipped, and it is the
+    ///         half that is a correctness fix rather than a policy choice.
     ///
     ///         Coverage SIZING was already per-tier and already correct:
     ///         `requiredCoverage = maxCapital × Σ boundBps / 10_000`, so a
