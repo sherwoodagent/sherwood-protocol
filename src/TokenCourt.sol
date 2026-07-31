@@ -56,6 +56,18 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     uint256 public constant FINALIZE_BUFFER = 1 days;
     /// @dev Basis-point denominator shared by `participationFloorBps`.
     uint256 internal constant BPS_DENOMINATOR = 10_000;
+    /// @notice How far BEFORE a case's snapshot the participation floor's
+    ///         electorate base is cross-checked (B2). The base is the SMALLER
+    ///         of the electorate at the snapshot and the electorate this long
+    ///         before it, so stake younger than this cannot raise the floor.
+    /// @dev    A `constant`, NOT an owner parameter, and deliberately so — see
+    ///         `_participationFloor` for the full argument. In short: an owner
+    ///         setter here would be a lever to shrink the lookback to zero
+    ///         immediately before a drain, which is precisely the attack this
+    ///         constant closes; and a constant is the strongest possible form
+    ///         of the D2 "pin it at `refer`" discipline, since a value that
+    ///         cannot change cannot move under a live case at all.
+    uint256 public constant FLOOR_LOOKBACK = 30 days;
 
     /// @notice The wired `IChallengeGame` this court adjudicates for and
     ///         reads challenge state from. Zero while unwired.
@@ -126,6 +138,22 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
         }
         emit ChallengeGameSet(challengeGame, newGame);
         challengeGame = newGame;
+    }
+
+    /// @dev THERE IS NO PATH TO AN OWNERLESS COURT. `Ownable.renounceOwnership`
+    ///      would leave `setChallengeGame` / `setStakedWood` /
+    ///      `setVoteWindow` / `setParticipationFloorBps` permanently
+    ///      unreachable, and this contract is non-upgradeable, so there is no
+    ///      recovery afterwards. Those setters are the rescue path for a
+    ///      compromised or redeployed dependency — the `_participationFloor`
+    ///      docs below lean on the live `participationFloorBps` read as an
+    ///      operational lever precisely because a live owner exists to pull
+    ///      it, and `ChallengeGame.setCourt(0)`-style escape hatches on the
+    ///      other side of the wiring assume the same. `pure`, not `onlyOwner`:
+    ///      it is refused for everyone, the owner included, so there is no
+    ///      "the owner meant it" branch to get wrong.
+    function renounceOwnership() public pure override {
+        revert OwnershipCannotBeRenounced();
     }
 
     /// @inheritdoc ITokenCourt
@@ -379,10 +407,13 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///           ground truth either way; failing it to `NotGuilty` rather than
     ///           `Guilty` is deliberate, because `Guilty` triggers a 100%-style
     ///           slash (D7, `IChallengeGame.rule`) and an even vote is the worst
-    ///           possible basis for destroying stake. `IChallengeGame.Verdict`'s
-    ///           enum order (`{Inconclusive, NotGuilty, Guilty}`) makes this the
-    ///           SAME direction the zero-value default already fails toward —
-    ///           there is no separate case here that could disagree with it.
+    ///           possible basis for destroying stake. THIS BRANCH STANDS ON
+    ///           THAT ARGUMENT ALONE, not on any enum-ordering coincidence: the
+    ///           zero value of `IChallengeGame.Verdict` is `Inconclusive`
+    ///           (`{Inconclusive, NotGuilty, Guilty}`), NOT `NotGuilty`, so a
+    ///           tie deliberately resolves to a DIFFERENT value than an
+    ///           uninitialised `Verdict` would. Every branch above assigns
+    ///           `verdict` explicitly; nothing here relies on a default.
     /// @dev    STATE IS CLOSED BEFORE THE EXTERNAL CALL, and the `rule` call is
     ///         wrapped in try/catch — review finding E1 made structural. Between
     ///         a case's vote window closing and someone calling `finalize`, the
@@ -496,15 +527,120 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
         }
     }
 
-    /// @dev THE FLOOR'S BASE IS `getPastTotalVotes(snapshotTs) - accusedWeight`,
-    ///      with a `>` fallback to the unreduced total when the subtrahend
+    /// @dev THE FLOOR'S BASE IS `min(getPastTotalVotes(snapshotTs),
+    ///      getPastTotalVotes(snapshotTs - FLOOR_LOOKBACK)) - accusedWeight`,
+    ///      with a `>` fallback to the unreduced base when the subtrahend
     ///      would not strictly reduce it. POST-#29 (carrying review finding
     ///      E3's fix forward): `accusedWeight` sums `getPastStake` over the
     ///      accused set, the exact same raw-own-stake basis
-    ///      `getPastTotalVotes` sums over the whole electorate — so
-    ///      `accusedWeight <= total` BY CONSTRUCTION, not by luck. The `>`
-    ///      check is defence-in-depth against a future basis change on either
-    ///      side, not a condition this code expects to fail today.
+    ///      `getPastTotalVotes` sums over the whole electorate — so the two
+    ///      operands are the same measure of the same WOOD.
+    /// @dev THE `>` FALLBACK IS NOW A LIVE BRANCH, NOT DEFENCE-IN-DEPTH. It
+    ///      used to be unreachable: `accusedWeight <= total` held BY
+    ///      CONSTRUCTION because both were summed at the SAME instant
+    ///      (`snapshotTs`). The B2 lookback below breaks that identity on
+    ///      purpose — the base can now come from `snapshotTs -
+    ///      FLOOR_LOOKBACK`, an instant at which an accused approver who
+    ///      staked recently was not yet counted, so `accusedWeight` (still
+    ///      measured at `snapshotTs`, where it must be, because that is the
+    ///      stake a conviction actually slashes) can legitimately exceed it.
+    ///      The fallback direction is the safe one: it yields
+    ///      `bps * base` with `base <= accusedWeight`, i.e. a SMALLER floor
+    ///      than the subtraction would have produced — never a larger one, so
+    ///      it cannot be turned into a denial lever of its own.
+    /// @dev THE BASE IS THE MIN OVER A LOOKBACK (B2, review of PR #56 —
+    ///      BLOCKING). The D2 snapshot defends the NUMERATOR: vote weight is
+    ///      read at `executedAt - 1`, so post-drain buyers and flash loans
+    ///      count for nothing. The DENOMINATOR had the opposite exposure
+    ///      profile, and a single `getPastTotalVotes(snapshotTs)` read was
+    ///      wide open to it: the base is RAISED by anyone staked BEFORE
+    ///      `executedAt`, and the attacker is exactly the party who knows when
+    ///      `executedAt` will be, because it is their own drain.
+    ///
+    ///      The attack the min closes: stake large from an address that never
+    ///      approves anything, immediately before executing the malicious
+    ///      proposal. `StakedWood.stakeAsGuardian` is permissionless — no
+    ///      registry gate, no cap, only a `minGuardianStake` floor — and
+    ///      `_recordAccused` subtracts only LEDGER APPROVERS, so that stake is
+    ///      never subtracted back out. With `E` the honest electorate's raw
+    ///      stake and `f` the turnout achievable after age-weighting, denial
+    ///      needs only `X > (10f - 1) * E` (roughly `2E` at `f ~ 0.3` and the
+    ///      default 10% floor) to put the floor beyond ANY achievable turnout.
+    ///      `finalize` then returns `Inconclusive` — no slash, no `_convicted`
+    ///      mark, no adapter demotion, counter-bond returned whole, coverage
+    ///      freeze released — and the attacker never voted, never coordinated,
+    ///      and is never slashable (`slashToEscrow` only ever touches the
+    ///      approver array), recovering its capital after the cooldown.
+    ///
+    ///      THIS IS NOT THE ACCEPTED A1 RISK. Spec 2026-07-29 §7/A1 accepts
+    ///      address-splitting, but frames it purely as helping siblings WIN a
+    ///      vote (`NotGuilty`, on the merits, needing voters). Moving stake
+    ///      OUT of the accused set is simultaneously a DENIAL-OF-QUORUM lever
+    ///      needing no voters at all, and it lands on `Inconclusive` rather
+    ///      than `NotGuilty` — a different outcome with a different unwind.
+    ///
+    ///      Taking the min with the electorate `FLOOR_LOOKBACK` earlier makes
+    ///      the base insensitive to a late pre-drain surge: the attacker's
+    ///      stake has to be present at BOTH instants to move it, so an
+    ///      inflating stake must sit on-chain, visible and idle, for a month
+    ///      before the drain it exists to protect. Reading two immutable
+    ///      historical checkpoints costs one extra staticcall and no new
+    ///      state.
+    /// @dev WHY THE MIN AND NOT THE EARLIER READ ALONE. The min is what makes
+    ///      the defence one-directional. Reading only `snapshotTs -
+    ///      FLOOR_LOOKBACK` would let an attacker stake before that instant
+    ///      and `requestUnstakeGuardian` after it — inflating the base while
+    ///      holding the capital for a fraction of the window — and would also
+    ///      raise the floor whenever the electorate legitimately SHRANK over
+    ///      the month. The min can only ever lower the base relative to
+    ///      today's behaviour, which is the safe direction for the one
+    ///      property that must hold: a pre-drain staker must not be able to
+    ///      push the floor out of reach.
+    /// @dev WHY 30 DAYS. It is the maturation horizon the NUMERATOR already
+    ///      uses: `StakedWood._ageFactorBps` ramps a stake's vote weight from
+    ///      `ageFloorBps` to par linearly over `maturationPeriod`, whose
+    ///      deployed value is 30 days (bounded [7, 90]). `min(total(t),
+    ///      total(t - 30 days))` is a conservative global proxy for "raw stake
+    ///      that has been staked at least 30 days", so the denominator now
+    ///      admits stake on the same maturity horizon the numerator weights it
+    ///      on, instead of admitting day-old stake at full value. It is also
+    ///      comfortably longer than a full `SyndicateGovernor` proposal
+    ///      lifecycle, so an attacker cannot wait until their proposal is
+    ///      already certain to execute before committing the capital: the
+    ///      stake must be down before the proposal is even filed.
+    ///      Hardcoded rather than read live off `StakedWood.maturationPeriod`
+    ///      deliberately — a live read would hand a second contract's owner a
+    ///      lever to shrink this court's lookback to 7 days, and `IStakedWood`
+    ///      does not expose the parameter anyway.
+    /// @dev THE ZERO FALLBACK, AND THE ONE RESIDUAL IT LEAVES. When the
+    ///      lookback instant predates the FIRST guardian stake ever
+    ///      (`getPastTotalVotes` returns 0 — checkpoint traces read zero
+    ///      before their first entry) there is no earlier electorate to
+    ///      compare against, and the code falls back to the snapshot total
+    ///      rather than to a base of zero. `snapshotTs < FLOOR_LOOKBACK` (a
+    ///      proposal executing in the chain's first month) clamps the lookback
+    ///      instant to 0 and lands in the same branch, which is also what
+    ///      keeps the subtraction from underflowing.
+    ///
+    ///      Falling back to ZERO would be the wrong failure. It would disable
+    ///      the D6 anti-capture floor outright for the protocol's first
+    ///      `FLOOR_LOOKBACK` of staking history, letting a single dust-weight
+    ///      guardian carry a case alone — and a wrongful `Guilty` destroys an
+    ///      honest guardian's entire stake, which is strictly more destructive
+    ///      than the forced `Inconclusive` the fallback leaves possible.
+    ///      Falling back to the total therefore keeps the pre-fix behaviour
+    ///      during bootstrap and nowhere else: this function is monotone
+    ///      against the old one — never a higher floor than before, anywhere.
+    ///      The residual is the bootstrap window only, it shrinks to nothing
+    ///      once the protocol has a month of stake history, and it is the
+    ///      period in which TVL — and therefore the payoff for denying a
+    ///      verdict — is smallest.
+    /// @dev THE MIN ALSO NEUTRALISES THE ACCUSED'S OWN INFLATION LEVER, which
+    ///      A1 notes runs the other way: an accused approver topping up its
+    ///      stake just before the drain used to raise `total` and
+    ///      `accusedWeight` together, but a NON-approving sibling address
+    ///      topping up raised only `total`. Now neither moves the base at all
+    ///      unless it was already staked a month earlier.
     /// @dev THE FLOOR READS THE LIVE `participationFloorBps`, DELIBERATELY NOT
     ///      PINNED per-case. This is the opposite choice from `snapshotTs` and
     ///      `voteWindowAtReferral`, which ARE pinned at `refer` — and the
@@ -555,8 +691,19 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///       a compromised or upgraded dependency, and the owner is trusted.
     ///       Flagged here as a deliberately deferred hazard, not an oversight.
     function _participationFloor(uint256 snapshotTs, uint256 accusedWeight) internal view returns (uint256) {
-        uint256 total = IStakedWood(stakedWood).getPastTotalVotes(snapshotTs);
-        uint256 base = total > accusedWeight ? total - accusedWeight : total;
+        IStakedWood swood = IStakedWood(stakedWood);
+        uint256 total = swood.getPastTotalVotes(snapshotTs);
+        // Clamped, never subtracted below zero: a proposal executing in the
+        // chain's first `FLOOR_LOOKBACK` reads the trace at 0, which is empty
+        // by definition and lands in the `earlier == 0` fallback below.
+        uint256 lookbackTs = snapshotTs > FLOOR_LOOKBACK ? snapshotTs - FLOOR_LOOKBACK : 0;
+        uint256 earlier = swood.getPastTotalVotes(lookbackTs);
+        // B2: the smaller of the two electorates, EXCEPT when there is no
+        // earlier electorate at all to compare against (`earlier == 0`), in
+        // which case the snapshot total stands — see the fallback rationale
+        // above for why zero is the wrong failure there.
+        uint256 base = (earlier != 0 && earlier < total) ? earlier : total;
+        base = base > accusedWeight ? base - accusedWeight : base;
         return participationFloorBps * base / BPS_DENOMINATOR;
     }
 
