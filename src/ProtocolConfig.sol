@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {IProtocolConfig} from "./interfaces/IProtocolConfig.sol";
+import {FeeConstants} from "./FeeConstants.sol";
 
 /// @title ProtocolConfig
 /// @notice Protocol-level fee params shared by all per-vault governors. Read
@@ -48,7 +49,64 @@ contract ProtocolConfig is Ownable2Step, IProtocolConfig {
     ///         failing closed here would brick existing vaults on upgrade.
     uint256 public maxStrategyDuration;
 
-    constructor(address owner_) Ownable(owner_) {}
+    /// @dev Private with an explicit struct getter rather than `public`: the
+    ///      auto-getter would return a flat tuple, and every consumer here
+    ///      wants the struct whole so it can be snapshotted onto a proposal in
+    ///      one assignment.
+    MgmtSplit private _mgmtSplit;
+    PerfSplit private _perfSplit;
+
+    /// @dev Seeded with the launch splits so a config is valid from birth. This
+    ///      contract is not upgradeable, so adopting the two-number fee model
+    ///      means deploying a fresh one and re-pointing governors via
+    ///      `setProtocolConfig` — seeding at that moment removes the "operator
+    ///      forgot to set the split" failure class entirely. Combined with the
+    ///      setters' sum check, an invalid split is unreachable rather than
+    ///      merely discouraged. Governance can still change either at will.
+    constructor(address owner_) Ownable(owner_) {
+        // Management 70/20/10 — the agent manages the book, the protocol runs
+        // the rails, the guardian network reviews. The guardian slice is the
+        // always-on funding the economic-security analysis called for: review
+        // effort does not stop when markets go flat.
+        _mgmtSplit = MgmtSplit({agentBps: 7000, protocolBps: 2000, guardianBps: 1000});
+        // Performance 60/15/15/10 — the fund owner earns only on the profit
+        // side, which is why this leg exists here and not above.
+        _perfSplit = PerfSplit({agentBps: 6000, protocolBps: 1500, guardianBps: 1500, ownerBps: 1000});
+    }
+
+    /// @inheritdoc IProtocolConfig
+    function mgmtSplit() external view returns (MgmtSplit memory) {
+        return _mgmtSplit;
+    }
+
+    /// @inheritdoc IProtocolConfig
+    function perfSplit() external view returns (PerfSplit memory) {
+        return _perfSplit;
+    }
+
+    /// @notice Set how the always-on management fee divides between the agent,
+    ///         the protocol and the guardian network.
+    /// @dev Only the sum is constrained, so a zero share is legal — governance
+    ///      may route the whole fee to one party. The sum is widened to
+    ///      `uint256` so the check does not depend on `uint16` headroom if a
+    ///      field type ever changes.
+    function setMgmtSplit(MgmtSplit calldata s) external onlyOwner {
+        uint256 sum = uint256(s.agentBps) + s.protocolBps + s.guardianBps;
+        if (sum != FeeConstants.BPS_DENOMINATOR) revert InvalidMgmtSplit();
+        _mgmtSplit = s;
+        emit MgmtSplitSet(s.agentBps, s.protocolBps, s.guardianBps);
+    }
+
+    /// @notice Set how the performance fee divides between the agent, the
+    ///         protocol, the guardian network and the fund owner.
+    /// @dev One division of one base — deliberately not the sequential
+    ///      waterfall it replaces, which compounded four separate haircuts.
+    function setPerfSplit(PerfSplit calldata s) external onlyOwner {
+        uint256 sum = uint256(s.agentBps) + s.protocolBps + s.guardianBps + s.ownerBps;
+        if (sum != FeeConstants.BPS_DENOMINATOR) revert InvalidPerfSplit();
+        _perfSplit = s;
+        emit PerfSplitSet(s.agentBps, s.protocolBps, s.guardianBps, s.ownerBps);
+    }
 
     /// @dev Changing this does NOT retroactively bind in-flight proposals: the
     ///      governor snapshots parameters at propose time, so it only affects

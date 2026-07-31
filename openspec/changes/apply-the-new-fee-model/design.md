@@ -175,6 +175,35 @@ rounds conservatively, burning marginally more shares than strictly necessary.
 `previewRedeem` is exact and monotone under either basis, so invertibility is the only
 mechanical difference. See Open Question 1 for the argument against.
 
+### Decision 8 — Splits are born valid in the constructor; a bad snapshot pays nothing rather than reverting
+
+*Revised during implementation of group 2. Supersedes the original reading of Migration
+Plan step 3.*
+
+`ProtocolConfig` is **not upgradeable** (plain `Ownable2Step`; the natspec says replacement
+happens by pointing governors at a new address via `setProtocolConfig`). An existing
+deployment therefore cannot gain the split fields at all — the migration must deploy a
+fresh config regardless. Given that, seeding the launch splits in the constructor is
+strictly better than leaving them unset:
+
+- Every config is valid from birth, so the "operator forgot migration step 3" failure class
+  disappears rather than being documented.
+- The setters still validate, so a split can never *become* invalid. Born-valid plus
+  validated-on-write means the invalid state is unreachable, not merely discouraged.
+
+Propose-time therefore adds **no new revert**. Two reasons:
+
+1. It would be unreachable for any real config, and would only ever fire against a mock —
+   buying no safety and breaking test fixtures across ~40 files.
+2. More importantly, it points the failure the wrong way. This codebase already treats a
+   bricked settlement as the worse outcome — that is why `_payFee` is a try/catch. A
+   snapshot that somehow carries a zero-sum split must cause the fee to be **skipped**, not
+   the settlement to revert. Fail closed on *configuration* (the setter rejects), fail open
+   on *payment* (settlement always completes). Task 5 implements the settle-side half.
+
+*Alternative — revert at propose.* Rejected: unreachable in production, breaks ~40 fixtures,
+and converts a fee-accounting problem into a liveness problem.
+
 ## Risks / Trade-offs
 
 - **The upstream plan's line anchors may have drifted.** It was written 26 commits back.
@@ -222,16 +251,89 @@ mechanical difference. See Open Question 1 for the argument against.
 2. Before upgrading any live vault, read and record the stored `managementFeeBps` on each.
    Any nonzero legacy value must be reset in the same batch as the upgrade proxy call, since
    its meaning changes.
-3. Set the two splits on `ProtocolConfig` **before** the first proposal is created
-   post-upgrade. An unset split is a zero-sum split and will be rejected by validation, which
-   fails closed — a proposal cannot be created rather than one settling with a bad split.
+3. Deploy a fresh `ProtocolConfig` and point the governors at it via `setProtocolConfig`.
+   The contract is not upgradeable, so an existing deployment cannot gain the split fields —
+   a redeploy is mandatory, not optional. Its constructor seeds the launch splits, so it is
+   valid from birth (Decision 8); governance only needs to act if it wants different numbers.
+   Re-set the fee recipients on the new config, which do not carry over.
 4. Raise the factory default and the protocol constant together. Raising the constant alone
    leaves every new vault clamped at 1500 with a `FeeClamped` event on each settlement.
 5. **Rollback:** the UUPS proxies can be pointed back at the prior implementation. Storage is
-   append-only, so a rollback leaves the four new vault slots populated but unread; a
+   append-only, so a rollback leaves the new vault slots populated but unread; a
    subsequent re-upgrade reads them intact. The one non-reversible effect is any
    high-water mark already ratcheted — rolling back does not un-ratchet it, and it should
    not, since the fee it recorded was genuinely charged.
+
+### Pre-upgrade checklist for a live vault
+
+Run in this order. Steps 1 and 2 must be in the same transaction batch as the
+implementation swap; a vault that executes a proposal between them charges the wrong rate.
+
+1. **Read and reset `managementFeeBps` on every live vault.** Its meaning changes from a
+   profit-gated slice to an annual rate on AUM. A vault carrying `500` under the old
+   semantics (5% of residual profit) would, post-upgrade, charge **5%/yr on assets** —
+   roughly 25× the intended 2%. This is the single most damaging thing that can go wrong
+   in this migration, and it fails silently: no revert, just an over-charge every
+   settlement. Do not assume the stored value is the factory default; read each one.
+2. **Set `instantExitFeeBps`** if the early-exit penalty is wanted. It defaults to 0
+   (disabled), which is the safe default — a vault that never sets it behaves exactly as
+   it does today on the exit path.
+3. **Deploy a fresh `ProtocolConfig` and re-point governors** via `setProtocolConfig`. The
+   contract is not upgradeable, so this is mandatory rather than optional. Its constructor
+   seeds valid splits, so no split configuration is required — but the **fee recipients do
+   not carry over** and must be re-set, or the protocol and guardian shares escrow instead
+   of paying.
+4. **Verify before the first proposal:** `mgmtSplit()` and `perfSplit()` each sum to
+   10 000, both recipients are non-zero, and `getGovernorParams().maxPerformanceFeeBps` is
+   at least the vault's `agentFeeBps()` — otherwise every settlement emits `FeeClamped`
+   and quietly pays the agent less than advertised.
+5. **First settlement is the real test.** Check `ManagementFeeCharged.assetSeconds` against
+   the expected `assets × duration`; a figure that is orders of magnitude off means the
+   accrual clock was not started or not reset.
+
+### Decision 9 — `protocolFeeBps` / `guardianFeeBps` are superseded by the splits
+
+*Surfaced during the regression pass.*
+
+Under the old waterfall these were standalone rates: the protocol took
+`grossPnl × protocolFeeBps` and the guardian network `grossPnl × guardianFeeBps`,
+each off the top. Under the two-number model both parties are paid as a **share of
+one of the two fees**, so those rates no longer participate in any computation.
+
+They are still snapshotted onto the proposal, and both are still settable on
+`ProtocolConfig` — but settlement now reads only the **recipients**
+(`snapshotProtocolFeeRecipient`, `snapshotGuardiansFeeRecipient`), never the rates.
+Left in place deliberately rather than removed:
+
+- Removing `snapshotProtocolFeeBps`/`snapshotGuardianFeeBps` from `StrategyProposal`
+  would reorder a struct that `getProposal` returns, breaking every off-chain
+  consumer's ABI decode for no functional gain.
+- Removing the setters would break deploy scripts and ~40 test fixtures.
+
+**The consequence to be aware of:** setting `guardianFeeBps` now has **no effect on
+what the guardian network is paid**. That lever is `mgmtSplit.guardianBps` and
+`perfSplit.guardianBps`. An operator who raises the old rate expecting guardians to
+earn more will see nothing change — which is exactly the kind of silent no-op worth
+naming before someone relies on it. A follow-up should either remove the dead rates
+outright (accepting the ABI break) or repurpose them.
+
+## Follow-up work (not in this change)
+
+- **Subgraph.** Index `ManagementFeeCharged(proposalId, asset, amount, assetSeconds)` and
+  `PerformanceFeeCharged(proposalId, asset, amount, aboveMark)` per proposal, plus
+  `HighWaterMarkUpdated(pricePerShare)` as a series and `ExitFeesCrystallized` per exit.
+  `assetSeconds` and `aboveMark` are on the events precisely so an indexer can reconstruct
+  the effective rate and the average base without replaying every flow. The `VolumeFee`
+  entity from the superseded draft is dropped — it was never built.
+- **Share-dilution fee collection.** The onchain standard (Set, Enzyme, dHEDGE, Yearn):
+  mint fee shares instead of transferring assets, so a fully-deployed strategy never has to
+  liquidate to pay a fee. Changes *how* fees are paid, not *what* is owed, so it can land
+  later without revisiting these specs. See Non-Goals.
+- **`maxWithdraw` under exit fees.** It reports the gross figure, so during a Lane A window
+  a caller asking for exactly `maxWithdraw` may receive slightly less than quoted after
+  crystallization and the penalty. `previewRedeem` / `previewWithdraw` are both exact; only
+  the cap is loose. Tightening it means duplicating the fee math in a third place, which is
+  why it was left — worth revisiting if an integrator relies on the cap being exact.
 
 ## Open Questions
 
