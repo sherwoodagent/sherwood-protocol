@@ -4,13 +4,11 @@ pragma solidity 0.8.28;
 import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {IExposureLedger} from "./interfaces/IExposureLedger.sol";
 
-/// @dev Narrow sWOOD read surface (own stake, inbound delegation, delegated
-///      slash cap, cooldown). Mirrors the IGovernorMinimal pattern in
-///      GuardianRegistry — the ledger does not import the full IStakedWood ABI.
+/// @dev Narrow sWOOD read surface (own stake, cooldown). Mirrors the
+///      IGovernorMinimal pattern in GuardianRegistry — the ledger does not
+///      import the full IStakedWood ABI.
 interface ISwoodMinimal {
     function guardianStake(address guardian) external view returns (uint256);
-    function delegatedInbound(address delegate) external view returns (uint256);
-    function maxDelegatedSlashBps() external view returns (uint256);
     function coolDownPeriod() external view returns (uint256);
 }
 
@@ -57,10 +55,9 @@ interface IRegistryApproversMinimal {
  *
  *         `slashableBond(g)` (spec §3.3, precision definition):
  *             ownStake(g) * priceHaircut
- *           + delegatedInbound(g) * maxDelegatedSlashBps/10_000 * priceHaircut
- *         Delegated stake counts ONLY at the delegated-slash cap — a delegated
- *         pool cannot be slashed 100%; counting full vote weight would violate
- *         the coalition inequality at the accounting layer.
+ *         (The delegated-inbound term was removed with the DPoS-delegation
+ *         postponement — the guardian's own bond is the only slashable
+ *         capital.)
  *
  *         Exposure is EPOCH-BUCKETED (spec §3.4a): an approval consumes the
  *         current epoch's bucket; open exposure = the sum of all buckets young
@@ -142,9 +139,42 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///         fail-closed until governance seeds it.
     uint256 public coveredTvlCapUsd;
     /// @notice Minimum envelopeTier at which the approve quorum is fail-closed
-    ///         (spec §3.3a + §4 gate 2). Launch value 2: tier-2 only. Lowering
-    ///         is gated on the §3.10 ROE validation — a BLOCKING launch gate.
-    uint8 public quorumTierThreshold = 2;
+    ///         (spec §3.3a + §4 gate 2). **Launch value 0: every tier.**
+    ///
+    /// @dev    The §3.10 ROE validation this parameter was gated on is
+    ///         RESOLVED — see `2026-07-26-roe-validation.md` (the gate passes at
+    ///         tier 0/1 and fails at tier 2) and `2026-07-27-tier-policy-v1.md`,
+    ///         which lowers this to 0.
+    ///
+    ///         The ADR also proposed refusing tier-2 exposure outright via a
+    ///         `ProtocolConfig` ceiling. That half was DROPPED (owner decision
+    ///         2026-07-31): tier-2 guardian ROE is to be closed with off-chain
+    ///         team token incentives instead, so tier 2 stays admissible
+    ///         on-chain. This parameter is the half that shipped, and it is the
+    ///         half that is a correctness fix rather than a policy choice.
+    ///
+    ///         Coverage SIZING was already per-tier and already correct:
+    ///         `requiredCoverage = maxCapital × Σ boundBps / 10_000`, so a
+    ///         closed-loop adapter that can leak 1% requires 1% of coverage.
+    ///         What was missing was ENFORCEMENT — at a threshold of 2 that
+    ///         correctly-sized number was only checked at tier 2, so a tier-0/1
+    ///         proposal could execute with no covering approver at all. Zero is
+    ///         what makes the guardian layer mandatory rather than advisory,
+    ///         and what makes the §2 guarantee true for every proposal rather
+    ///         than for tier 2 alone.
+    ///
+    ///         Defaulting to 0 rather than leaving it to a deploy-time setter is
+    ///         deliberate: 2 is the configuration the ADR rejects, so a
+    ///         deployment that forgot the setter would silently ship it. The
+    ///         `DeployPlanB` pre-flight asserts the value regardless, since this
+    ///         and the tier ceiling are independently mutable after deploy.
+    ///
+    ///         `requiredCoverage == 0` still passes optimistically at every
+    ///         tier (review finding M-1) — that carve-out lives at the governor
+    ///         call site, not here. It is not an exception to this rule but the
+    ///         same rule evaluated at zero: a proposal that can extract nothing
+    ///         has nothing to underwrite.
+    uint8 public quorumTierThreshold = 0;
     /// @notice Proposer bond as bps of USD coverage (spec §3.9/§5). Default 1%.
     uint256 public proposerBondBps = 100;
 
@@ -221,10 +251,41 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      approved — an unbounded loop in the execute path (review M2).
     mapping(bytes32 reviewKey => mapping(address guardian => uint256)) internal _approverIndex;
 
+    /// @notice The one address permitted to freeze a proposal's coverage — the
+    ///         ChallengeGame (spec §3.4). Owner-set.
+    address public coverageFreezer;
+
+    /// @dev Proposals whose committed coverage is pinned by a live challenge.
+    mapping(bytes32 reviewKey => bool) internal _frozen;
+
+    /// @dev Which guardians a given frozen key is holding, so `unfreezeCoverage`
+    ///      releases exactly what `freezeCoverage` took and the per-guardian
+    ///      counter below cannot drift.
+    mapping(bytes32 reviewKey => mapping(address guardian => bool)) internal _frozenFor;
+
+    /// @dev How many frozen proposals name this guardian. Non-zero is what
+    ///      makes the freeze load-bearing: sWOOD reads it on the unstake claim,
+    ///      so a guardian under live accusation cannot walk its collateral out
+    ///      after its epoch bucket ages out (review 🔴F2 / 🟠F6). A COUNT rather
+    ///      than a USD sum on purpose — the question the claim gate asks is
+    ///      binary, and summing would double-count against the live buckets and
+    ///      silently tighten the batching cap, which is a different control.
+    mapping(address guardian => uint256) internal _frozenCommitments;
+
+    /// @dev How many proposals are frozen right now, across every guardian.
+    ///      Exists so `setCoverageFreezer` can refuse a rotation that would
+    ///      ORPHAN a live freeze (review 🟠F11) — see that setter.
+    uint256 internal _frozenKeyCount;
+
     // ── Modifiers / helpers ──
 
     modifier onlyRegistry() {
         if (msg.sender != guardianRegistry) revert NotGuardianRegistry();
+        _;
+    }
+
+    modifier onlyFreezer() {
+        if (msg.sender != coverageFreezer) revert NotCoverageFreezer();
         _;
     }
 
@@ -275,7 +336,7 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
 
     /// @inheritdoc IExposureLedger
     function slashableBondUsd(address guardian) public view returns (uint256) {
-        return _slashableBondUsd(guardian, swood.maxDelegatedSlashBps(), woodPriceX8());
+        return _slashableBondUsd(guardian, woodPriceX8());
     }
 
     /// @notice The WOOD/USD price every bond is valued at, 8 decimals.
@@ -341,18 +402,11 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         return (priceX8 * woodHaircutBps) / BPS_DENOMINATOR;
     }
 
-    /// @dev `slashableBondUsd` with the two loop-invariant inputs passed in, so
-    ///      a multi-approver quorum reads them once instead of once per
-    ///      approver (review finding M-4).
-    function _slashableBondUsd(address guardian, uint256 maxDelegatedSlashBps_, uint256 priceX8)
-        internal
-        view
-        returns (uint256)
-    {
-        uint256 own = swood.guardianStake(guardian);
-        uint256 inbound = swood.delegatedInbound(guardian);
-        uint256 slashableWood = own + (inbound * maxDelegatedSlashBps_) / BPS_DENOMINATOR;
-        return (slashableWood * priceX8) / 1e8;
+    /// @dev `slashableBondUsd` with the loop-invariant price passed in, so a
+    ///      multi-approver quorum reads it once instead of once per approver
+    ///      (review finding M-4).
+    function _slashableBondUsd(address guardian, uint256 priceX8) internal view returns (uint256) {
+        return (swood.guardianStake(guardian) * priceX8) / 1e8;
     }
 
     // ── Owner setters ──
@@ -515,6 +569,29 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         }
         emit ParameterChangeFinalized(PARAM_CHALLENGE_WINDOW, challengeWindow, newWindow);
         challengeWindow = newWindow;
+    }
+
+    /// @dev REFUSED WHILE ANYTHING IS FROZEN (review 🟠F11). `unfreezeCoverage`
+    ///      is `onlyFreezer` and the challenge game is its only caller, so
+    ///      rotating this role mid-challenge left the old freeze with nobody
+    ///      able to clear it: the game's `resolve()` reverted
+    ///      `NotCoverageFreezer` on every call, both bonds stranded there with
+    ///      no withdrawal path, `_frozenCommitments` never decremented, and
+    ///      every accused approver was permanently barred from
+    ///      `claimUnstakeGuardian`. One governance transaction, unrecoverable.
+    ///
+    ///      An earlier version of this natspec called zero a safe unwire switch
+    ///      that "fails closed". It fails closed for NEW filings and BRICKS the
+    ///      live ones, which is not the same thing when the mechanism being
+    ///      unwired is holding somebody's collateral. Deferring the rotation
+    ///      until nothing is pinned makes the documented remedy — drain the live
+    ///      challenges, then re-point — the only reachable order. Zero is still
+    ///      legal, and still the unwire switch; it just cannot be thrown while
+    ///      it would strand a freeze.
+    function setCoverageFreezer(address freezer) external onlyOwner {
+        if (_frozenKeyCount != 0) revert CoverageFrozen();
+        emit CoverageFreezerSet(coverageFreezer, freezer);
+        coverageFreezer = freezer;
     }
 
     function setKNumerator(uint256 newK) external onlyOwner {
@@ -766,6 +843,9 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      registry's approver cap, and that loop runs on the execute path.
     function releaseApproval(address governor, uint256 proposalId, address guardian) external onlyRegistry {
         bytes32 key = _reviewKey(governor, proposalId);
+        // A live challenge pins this coverage (§3.4): the guardian may not
+        // release it and recycle the budget while under challenge.
+        if (_frozen[key]) revert CoverageFrozen();
         RecordedExposure memory r = _recorded[key][guardian];
         if (r.usd == 0) return;
         delete _recorded[key][guardian];
@@ -793,6 +873,99 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         }
 
         emit ExposureReleased(guardian, key, r.usd, r.epoch);
+    }
+
+    /// @inheritdoc IExposureLedger
+    function approversOf(address governor, uint256 proposalId)
+        external
+        view
+        returns (address[] memory approvers, uint256[] memory committedUsd)
+    {
+        bytes32 key = _reviewKey(governor, proposalId);
+        approvers = _approversOf[key];
+        committedUsd = new uint256[](approvers.length);
+        for (uint256 i = 0; i < approvers.length; i++) {
+            committedUsd[i] = _recorded[key][approvers[i]].usd;
+        }
+    }
+
+    /// @inheritdoc IExposureLedger
+    /// @dev Spec §3.4 freeze scope: this pins ONE proposal's committed
+    ///      coverage. It deliberately does not touch the guardian's stake or
+    ///      its other open approvals — a challenge freezes the coverage it
+    ///      accuses, not the guardian.
+    /// @dev THE FREEZE PINS THE EXIT NOW, NOT JUST THE RELEASE (review 🟠F6,
+    ///      and the half of 🔴F2 the claim gate alone does not cover). Before
+    ///      this, `_frozen` was read in exactly one place — `releaseApproval`,
+    ///      whose only caller is the registry's Approve→Block vote change,
+    ///      which requires `block.timestamp < reviewEnd` and `!resolved`. A
+    ///      challenge cannot exist until the proposal has EXECUTED, which is
+    ///      after review resolution, so the freeze's only guard was unreachable
+    ///      in every state the freeze could exist in: a claimed control that
+    ///      controlled nothing.
+    ///
+    ///      What it controls now is the unstake CLAIM. `openExposureUsd` sums
+    ///      epoch buckets on pure wall-clock, so a guardian's exposure ages out
+    ///      `challengeWindow` after its epoch whether or not it is under
+    ///      accusation — and a disputed challenge outlives that by design.
+    ///      Counting frozen commitments per guardian closes the gap: while any
+    ///      proposal naming them is frozen, sWOOD refuses the claim and the
+    ///      collateral cannot walk out from under a live accusation.
+    ///
+    ///      Idempotent on both sides — the counters move only when the flag
+    ///      actually flips, so a repeated freeze/unfreeze cannot drift them.
+    function freezeCoverage(address governor, uint256 proposalId) external onlyFreezer {
+        bytes32 key = _reviewKey(governor, proposalId);
+        if (!_frozen[key]) {
+            _frozen[key] = true;
+            _frozenKeyCount++;
+            address[] storage listed = _approversOf[key];
+            for (uint256 i = 0; i < listed.length; i++) {
+                address g = listed[i];
+                if (_recorded[key][g].usd == 0) continue;
+                if (_frozenFor[key][g]) continue;
+                _frozenFor[key][g] = true;
+                _frozenCommitments[g]++;
+            }
+        }
+        emit CoverageFrozenSet(governor, proposalId, true);
+    }
+
+    /// @inheritdoc IExposureLedger
+    /// @dev Walks the SAME list `freezeCoverage` walked and clears only the
+    ///      entries it actually set, so the two are exactly symmetric even if
+    ///      the list moved. It cannot move while frozen in any case:
+    ///      `releaseApproval` is the only path that shrinks it, and that is the
+    ///      path the freeze blocks.
+    function unfreezeCoverage(address governor, uint256 proposalId) external onlyFreezer {
+        bytes32 key = _reviewKey(governor, proposalId);
+        if (_frozen[key]) {
+            _frozen[key] = false;
+            _frozenKeyCount--;
+            address[] storage listed = _approversOf[key];
+            for (uint256 i = 0; i < listed.length; i++) {
+                address g = listed[i];
+                if (!_frozenFor[key][g]) continue;
+                _frozenFor[key][g] = false;
+                _frozenCommitments[g]--;
+            }
+        }
+        emit CoverageFrozenSet(governor, proposalId, false);
+    }
+
+    /// @inheritdoc IExposureLedger
+    function hasFrozenCoverage(address guardian) external view returns (bool) {
+        return _frozenCommitments[guardian] != 0;
+    }
+
+    /// @inheritdoc IExposureLedger
+    function isCoverageFrozen(address governor, uint256 proposalId) external view returns (bool) {
+        return _frozen[_reviewKey(governor, proposalId)];
+    }
+
+    /// @inheritdoc IExposureLedger
+    function frozenCoverageCount() external view returns (uint256) {
+        return _frozenKeyCount;
     }
 
     /// @inheritdoc IExposureLedger
@@ -888,9 +1061,8 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         uint256 n = approvers.length;
         if (n == 0) revert InsufficientApproveCoverage();
 
-        // Hoisted: both are loop-invariant, and `slashableBondUsd` would
-        // otherwise re-read them once per approver (review finding M-4).
-        uint256 bps = swood.maxDelegatedSlashBps();
+        // Hoisted: loop-invariant — `slashableBondUsd` would otherwise
+        // re-read it once per approver (review finding M-4).
         uint256 priceX8 = woodPriceX8();
 
         // Summed over RESERVATIONS, not allocations. The question here is
@@ -904,7 +1076,7 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
             address g = approvers[i];
             uint256 reserved = _recorded[key][g].usd;
             if (reserved == 0) continue; // released via a vote change
-            uint256 live = _slashableBondUsd(g, bps, priceX8);
+            uint256 live = _slashableBondUsd(g, priceX8);
             haveUsd += live < reserved ? live : reserved;
             if (haveUsd >= needUsd) return; // early exit
         }
@@ -915,12 +1087,16 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
 
     /// @inheritdoc IExposureLedger
     /// @dev The bridge between what a guardian UNDERWROTE and what the verdict
-    ///      path can actually take. `slashToEscrow` speaks in bps of stake; the
-    ///      ledger books liability in USD. Dividing one USD quantity by the
-    ///      other cancels the unit DIMENSIONALLY — but not the price
-    ///      sensitivity, and an earlier version of this comment claimed the
-    ///      conversion "needs no price read of its own" (PR #24 review 🟡N5).
-    ///      It reads two. Both operands are priced:
+    ///      path can actually take — though NOT an exact one: this reads the
+    ///      LIVE bond while `_slashOne` slashes `min(checkpointAt(openedAt),
+    ///      live)`, so a top-up made after review-open inflates the booked
+    ///      coverage with capital a verdict anchored at `openedAt` cannot reach
+    ///      (PR #29 review 🟡3; tracked as a follow-up). `slashToEscrow` speaks
+    ///      in bps of stake; the ledger books liability in USD. Dividing one
+    ///      USD quantity by the other cancels the unit DIMENSIONALLY — but not
+    ///      the price sensitivity, and an earlier version of this comment
+    ///      claimed the conversion "needs no price read of its own" (PR #24
+    ///      review 🟡N5). It reads two. Both operands are priced:
     ///        - the numerator (the allocation) traces back to `coverageUsd`,
     ///          which reads a Chainlink feed behind a `StalePrice` gate — so a
     ///          stale asset feed makes a conviction UNPRICEABLE and this view
@@ -973,8 +1149,7 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         approvers = new address[](n);
         bps = new uint256[](n);
 
-        // Hoisted for the reason `requireApproveQuorum` hoists them (M-4).
-        uint256 maxDelegated = swood.maxDelegatedSlashBps();
+        // Hoisted for the reason `requireApproveQuorum` hoists it (M-4).
         uint256 priceX8 = woodPriceX8();
 
         // Prices against the ALLOCATION, never the reservation. `recordApproval`
@@ -996,7 +1171,7 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         // shrinking everyone else's rate — and this is the slash path, so the
         // shortfall would be unrecoverable rather than merely mis-stated. The
         // two must agree about the same guardian.
-        uint256 effectiveTotal = _effectiveTotal(key, maxDelegated, priceX8);
+        uint256 effectiveTotal = _effectiveTotal(key, priceX8);
         if (effectiveTotal == 0) return (approvers, bps);
 
         for (uint256 i = 0; i < n; i++) {
@@ -1004,7 +1179,7 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
             approvers[i] = g;
             uint256 reserved = _recorded[key][g].usd;
             if (reserved == 0) continue; // released -> owes nothing
-            uint256 liveG = _slashableBondUsd(g, maxDelegated, priceX8);
+            uint256 liveG = _slashableBondUsd(g, priceX8);
             uint256 mine = liveG < reserved ? liveG : reserved;
             uint256 owed = _allocate(mine, effectiveTotal, needUsd);
             if (owed == 0) continue; // scaled to dust -> nothing to collect
@@ -1059,12 +1234,35 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         ILedgerGovernorMinimal gov = ILedgerGovernorMinimal(governor);
         address asset = IVaultAssetMinimal(gov.getProposalView(proposalId).vault).asset();
         uint256 needUsd = coverageUsd(asset, gov.getRequiredCoverage(proposalId));
-        uint256 bps = swood.maxDelegatedSlashBps();
         uint256 priceX8 = woodPriceX8();
-        uint256 live = _slashableBondUsd(guardian, bps, priceX8);
+        uint256 live = _slashableBondUsd(guardian, priceX8);
         uint256 mine = live < reserved ? live : reserved;
         if (mine == 0) return 0;
-        return _allocate(mine, _effectiveTotal(key, bps, priceX8), needUsd);
+        return _allocate(mine, _effectiveTotal(key, priceX8), needUsd);
+    }
+
+    /// @inheritdoc IExposureLedger
+    /// @dev Mirrors `slashBpsFor`'s own basis exactly — the same `needUsd`, the
+    ///      same `_effectiveTotal` — so the figure a challenger is charged
+    ///      against and the figure a conviction takes cannot drift apart. That
+    ///      drift is the bug this exists to close: `ChallengeGame.file()` summed
+    ///      `approversOf`, which is the RESERVATION, while every slash prices
+    ///      the ALLOCATION.
+    ///
+    ///      Reverts rather than returning a stale figure when the asset feed is
+    ///      down, inheriting `coverageUsd`'s `StalePrice` gate. A caller that
+    ///      must stay live through a feed outage has to say so explicitly — see
+    ///      `ChallengeGame.file()`, which catches and falls back.
+    function liabilityUsd(address governor, uint256 proposalId) external view returns (uint256) {
+        bytes32 key = _reviewKey(governor, proposalId);
+        uint256 effectiveTotal = _effectiveTotal(key, woodPriceX8());
+        if (effectiveTotal == 0) return 0;
+
+        ILedgerGovernorMinimal gov = ILedgerGovernorMinimal(governor);
+        uint256 needUsd = coverageUsd(
+            IVaultAssetMinimal(gov.getProposalView(proposalId).vault).asset(), gov.getRequiredCoverage(proposalId)
+        );
+        return needUsd < effectiveTotal ? needUsd : effectiveTotal;
     }
 
     /// @dev Sum of `min(reserved, live bond)` across a proposal's approvers —
@@ -1078,17 +1276,13 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      rounding. `requireApproveQuorum` already discounts by `min(live,
     ///      reserved)`; this is the same discount applied to the split, so the
     ///      two stop disagreeing about the same guardian.
-    function _effectiveTotal(bytes32 key, uint256 maxDelegatedSlashBps_, uint256 priceX8)
-        internal
-        view
-        returns (uint256 total)
-    {
+    function _effectiveTotal(bytes32 key, uint256 priceX8) internal view returns (uint256 total) {
         address[] storage listed = _approversOf[key];
         uint256 n = listed.length;
         for (uint256 i = 0; i < n; i++) {
             uint256 reserved = _recorded[key][listed[i]].usd;
             if (reserved == 0) continue;
-            uint256 live = _slashableBondUsd(listed[i], maxDelegatedSlashBps_, priceX8);
+            uint256 live = _slashableBondUsd(listed[i], priceX8);
             total += live < reserved ? live : reserved;
         }
     }
@@ -1181,9 +1375,8 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         address firstHolder;
         // Same effective basis as `allocatedUsd` (review n1): a guardian whose
         // bond has gone must not dilute the survivors' shares.
-        uint256 maxDelegated = swood.maxDelegatedSlashBps();
         uint256 priceX8 = woodPriceX8();
-        uint256 effectiveTotal = _effectiveTotal(key, maxDelegated, priceX8);
+        uint256 effectiveTotal = _effectiveTotal(key, priceX8);
         if (effectiveTotal == 0) {
             _settled[key] = true;
             return;
@@ -1195,7 +1388,7 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
             if (r.usd == 0) continue;
             if (firstHolder == address(0)) firstHolder = g;
 
-            uint256 liveG = _slashableBondUsd(g, maxDelegated, priceX8);
+            uint256 liveG = _slashableBondUsd(g, priceX8);
             uint256 mine = liveG < uint256(r.usd) ? liveG : uint256(r.usd);
             uint256 alloc = _allocate(mine, effectiveTotal, needUsd);
             assigned += alloc;

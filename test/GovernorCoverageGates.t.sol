@@ -16,18 +16,16 @@ import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "./mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "./mocks/MockRegistryMinimal.sol";
 import {ProtocolConfig} from "../src/ProtocolConfig.sol";
+import {TierRegistry} from "../src/TierRegistry.sol";
 
 /// @dev Minimal sWOOD read surface the ExposureLedger constructor consumes.
 ///      `coolDownPeriod` (45d) covers epochLength (28d) + challengeWindow (14d).
 contract MockSwood {
     mapping(address => uint256) public guardianStake;
-    mapping(address => uint256) public delegatedInbound;
-    uint256 public maxDelegatedSlashBps = 2000;
     uint256 public coolDownPeriod = 45 days;
 
-    function setStake(address g, uint256 own, uint256 inbound) external {
+    function setStake(address g, uint256 own) external {
         guardianStake[g] = own;
-        delegatedInbound[g] = inbound;
     }
 }
 
@@ -520,7 +518,7 @@ contract GovernorCoverageGatesTest is Test {
     ///      == $1,000 of slashable bond.
     function _seatApprovers(uint256 pid, address[] memory gs, uint256 ownStakeEach) internal {
         for (uint256 i = 0; i < gs.length; i++) {
-            swood.setStake(gs[i], ownStakeEach, 0);
+            swood.setStake(gs[i], ownStakeEach);
             vm.prank(address(ledgerRegistry));
             ledger.recordApproval(address(governor), pid, gs[i]);
         }
@@ -594,6 +592,83 @@ contract GovernorCoverageGatesTest is Test {
         _toApproved(pid); // warps a full voting period ahead
         vm.expectRevert(IExposureLedger.StalePrice.selector);
         governor.executeProposal(pid);
+    }
+
+    // ── ADR 2026-07-27: quorumTierThreshold == 0 (coverage required at EVERY tier) ──
+
+    /// @dev Wires a TierRegistry and certifies BOTH the execute and settlement
+    ///      calls at `tier` with `bound` bps, so the proposal resolves to that
+    ///      tier with `requiredCoverage = maxCapital × 2 × bound / 10_000`.
+    ///      Created inside the tests rather than in `setUp` so the rest of this
+    ///      suite keeps its simpler tier-2 / full-notional arithmetic.
+    function _wireTierRegistryCertifiedAt(uint8 tier, uint16 bound) internal returns (TierRegistry reg) {
+        reg = new TierRegistry(address(this));
+        governor.setTierRegistry(address(reg)); // test contract is the factory
+        reg.setAdapterAllowed(address(targetToken), true);
+        reg.setAdapterAllowed(address(usdg), true);
+        reg.certify(address(targetToken), targetToken.approve.selector, tier, bound, address(0));
+        reg.certify(address(usdg), usdg.approve.selector, tier, bound, address(0));
+    }
+
+    /// @notice The launch default is 0 — every tier fail-closed. The §3.10 ROE
+    ///         gate that held this at 2 is resolved (ADR 2026-07-27).
+    function test_quorumTierThresholdDefaultsToZero() public view {
+        assertEq(ledger.quorumTierThreshold(), 0);
+    }
+
+    /// @notice THE enforcement gap this ADR closes. A tier-0 proposal carrying
+    ///         non-zero `requiredCoverage` and NO covering approver used to
+    ///         execute optimistically, because the quorum was only checked at
+    ///         tier 2. Coverage was always sized correctly per tier; it simply
+    ///         was not enforced below the threshold. At threshold 0 it is.
+    function test_execute_tier0WithCoverageAndNoApprovers_reverts() public {
+        _wireTierRegistryCertifiedAt(0, 500); // closed-loop, 5% extractable
+        uint256 pid = _proposeSolo(governor, address(vault), agent, 1_000e6);
+        assertEq(governor.getProposalTier(pid), 0);
+        // (500 exec + 500 settle) bps of 1_000e6 == $100 of extractable value.
+        assertEq(governor.getRequiredCoverage(pid), 100e6);
+
+        _toApproved(pid);
+        vm.expectRevert(IExposureLedger.InsufficientApproveCoverage.selector);
+        governor.executeProposal(pid);
+    }
+
+    /// @notice Same tier-0 proposal, but with an approver whose slashable bond
+    ///         actually covers it, executes. The guardian layer is mandatory at
+    ///         tier 0 now, not impassable. 2,000 WOOD == $100 at $0.05.
+    function test_execute_tier0WithCoveringApprover_succeeds() public {
+        _wireTierRegistryCertifiedAt(0, 500);
+        uint256 pid = _proposeSolo(governor, address(vault), agent, 1_000e6);
+        address[] memory gs = new address[](1);
+        gs[0] = makeAddr("g1");
+        _seatApprovers(pid, gs, 2_000e18); // $100 — exactly the coverage needed
+
+        _toApproved(pid);
+        governor.executeProposal(pid);
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Executed));
+    }
+
+    /// @notice Review finding M-1, preserved: `requiredCoverage == 0` still
+    ///         passes optimistically at threshold 0, with zero approvers. Not an
+    ///         exception to the rule above but the same rule evaluated at zero —
+    ///         a proposal that can extract nothing has nothing to underwrite,
+    ///         and demanding a covering signer for it is pure throughput loss.
+    ///
+    /// @dev    Reached by ROUNDING, not by a zero bound: `TierRegistry.certify`
+    ///         rejects `extractableBoundBps == 0` (`BoundRequired`), so the only
+    ///         way to a zero coverage figure is a `maxCapital` small enough that
+    ///         `maxCapital × boundBps / 10_000` floors to 0. That makes this the
+    ///         genuine reachable case rather than a synthetic one.
+    function test_execute_zeroRequiredCoverage_passesOptimistically() public {
+        _wireTierRegistryCertifiedAt(0, 1); // 1 bp — the smallest certifiable bound
+        // 1 unit × 1 bp / 10_000 == 0 after integer division, on both calls.
+        uint256 pid = _proposeSolo(governor, address(vault), agent, 1);
+        assertEq(governor.getProposalTier(pid), 0);
+        assertEq(governor.getRequiredCoverage(pid), 0);
+
+        _toApproved(pid);
+        governor.executeProposal(pid); // no approvers, still executes
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Executed));
     }
 
     /// @notice An unwired governor keeps Plan A behaviour — no quorum at all.

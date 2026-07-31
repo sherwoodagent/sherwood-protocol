@@ -160,10 +160,8 @@ contract CoverageEndToEndTest is Test {
                     minOwnerStake: 10_000e18,
                     minSlashBps: 1000,
                     maxSlashBps: 9999,
-                    maxDelegatedSlashBps: 2000,
                     ageFloorBps: 2500,
-                    maturationPeriod: 30 days,
-                    delegatedWeightCapX: 4
+                    maturationPeriod: 30 days
                 }))
         );
         swood = StakedWood(address(new ERC1967Proxy(address(swoodImpl), swoodInit)));
@@ -576,6 +574,90 @@ contract CoverageEndToEndTest is Test {
         assertGt(wood.balanceOf(g1), balBefore, "stake released once nothing is owed");
     }
 
+    /// @notice PR #25 review F2/F6: expiry alone is NOT the exit condition while
+    ///         an accusation is live. `openExposureUsd` sums epoch buckets on
+    ///         pure wall-clock, so coverage ages out on a timer that does not
+    ///         pause for a challenge — and the challenge game's disputed tail
+    ///         (up to `disputeTimeout`, 30d) outlives it by design. The accused
+    ///         could therefore request at execution, wait, and walk the whole
+    ///         bond out before the challenge could resolve; the conviction then
+    ///         priced maximum guilt (`live == 0` saturates `slashBpsFor` at
+    ///         10,000 bps) and recovered nothing, silently.
+    ///
+    ///         The freeze is what closes it — and closing it is also what makes
+    ///         the freeze load-bearing at all (F6): before this its only reader
+    ///         was `releaseApproval`, whose sole caller is unreachable in every
+    ///         state a freeze can exist in.
+    function test_exitGate_frozenCoverageOutlivesBucketExpiry() public {
+        vm.prank(owner);
+        swood.setExposureLedger(address(ledger));
+        // This test contract stands in for the challenge game.
+        vm.prank(ledgerOwner);
+        ledger.setCoverageFreezer(address(this));
+
+        uint256 pid = _propose(govA, address(vaultA), agentA);
+        _openReview(govA, pid);
+        _vote(govA, pid, g1, IGuardianRegistry.GuardianVoteType.Approve);
+
+        // A challenge lands against the proposal g1 covered.
+        ledger.freezeCoverage(address(govA), pid);
+        assertTrue(ledger.hasFrozenCoverage(g1), "g1 is named by a frozen proposal");
+
+        vm.prank(g1);
+        swood.requestUnstakeGuardian();
+
+        // Far past every bucket clock — exactly the window that used to release
+        // the bond out from under a live accusation.
+        vm.warp(vm.getBlockTimestamp() + 365 days);
+        assertEq(ledger.openExposureUsd(g1), 0, "the buckets have expired, as they always did");
+
+        vm.prank(g1);
+        vm.expectRevert(StakedWood.CoverageStillOpen.selector);
+        swood.claimUnstakeGuardian();
+
+        // Once the challenge resolves, the exit opens on the same terms as before.
+        ledger.unfreezeCoverage(address(govA), pid);
+        assertFalse(ledger.hasFrozenCoverage(g1), "nothing pins g1 any more");
+
+        uint256 balBefore = wood.balanceOf(g1);
+        vm.prank(g1);
+        swood.claimUnstakeGuardian();
+        assertGt(wood.balanceOf(g1), balBefore, "the gate is a condition, not a longer timer");
+    }
+
+    /// @notice The frozen-commitment count is per guardian and exact: a second
+    ///         frozen proposal naming the same guardian must not be released by
+    ///         the first one unfreezing, and a repeated unfreeze must not
+    ///         underflow it into a permanent lock.
+    function test_exitGate_frozenCoverageCountsEveryLiveAccusation() public {
+        vm.prank(owner);
+        swood.setExposureLedger(address(ledger));
+        // This test contract stands in for the challenge game.
+        vm.prank(ledgerOwner);
+        ledger.setCoverageFreezer(address(this));
+
+        // Two syndicates, so g1 carries two independent commitments at once.
+        uint256 pidA = _propose(govA, address(vaultA), agentA);
+        _openReview(govA, pidA);
+        _vote(govA, pidA, g1, IGuardianRegistry.GuardianVoteType.Approve);
+        uint256 pidB = _propose(govB, address(vaultB), agentB);
+        _openReview(govB, pidB);
+        _vote(govB, pidB, g1, IGuardianRegistry.GuardianVoteType.Approve);
+
+        ledger.freezeCoverage(address(govA), pidA);
+        ledger.freezeCoverage(address(govB), pidB);
+        assertTrue(ledger.hasFrozenCoverage(g1));
+
+        ledger.unfreezeCoverage(address(govA), pidA);
+        assertTrue(ledger.hasFrozenCoverage(g1), "the second accusation still pins the guardian");
+
+        ledger.unfreezeCoverage(address(govB), pidB);
+        assertFalse(ledger.hasFrozenCoverage(g1), "released only when the last one clears");
+
+        ledger.unfreezeCoverage(address(govB), pidB);
+        assertFalse(ledger.hasFrozenCoverage(g1), "a repeated unfreeze cannot underflow the count");
+    }
+
     /// @notice FAIL-OPEN with no ledger wired. There is necessarily a window at
     ///         deploy — and again on a UUPS upgrade — where the pointer is
     ///         zero, and bricking withdrawals over a missed configuration step
@@ -888,19 +970,15 @@ contract CoverageEndToEndTest is Test {
 
     // ── 5. The bounded (below-threshold) lane is genuinely preserved ───────
 
-    /// @notice Spec §4 gate 2: the §3.10 ROE argument is only allowed to lower
-    ///         `quorumTierThreshold` because the optimistic lane below it still
-    ///         works. A tier-1-certified execute target therefore executes with
-    ///         ZERO approvers — the quorum is never consulted — while the
-    ///         propose-time gates (covered-TVL cap, risk-scaled bond) still run.
-    function test_boundedTierFlowUnaffected() public {
-        // Certify the (adapter, poke) pair at tier 1 with a 1% extractable bound.
+    /// @dev Certifies (adapter, poke) at tier 1 with a 1% extractable bound and
+    ///      proposes against it. Returns the proposal id, asserting the tier-1
+    ///      SIZING that both tests below share — sizing is unchanged by the ADR.
+    function _proposeBoundedTier1() internal returns (uint256 pid) {
         govA.setTierRegistry(address(tierRegistry)); // test contract is the factory
         tierRegistry.certify(address(adapter), adapter.poke.selector, 1, 100, address(0));
 
-        uint256 pid = _propose(govA, address(vaultA), agentA, _adapterCalls(), _adapterCalls());
+        pid = _propose(govA, address(vaultA), agentA, _adapterCalls(), _adapterCalls());
         assertEq(govA.getProposal(pid).envelopeTier, 1, "certified tier 1");
-        assertLt(govA.getProposal(pid).envelopeTier, ledger.quorumTierThreshold(), "below the quorum threshold");
         // coverage = maxCapital × Σ(exec 100 bps + settle 100 bps) / 10_000.
         uint256 coverage = (MAX_CAPITAL * 200) / 10_000;
         assertEq(govA.getProposal(pid).requiredCoverage, coverage, "bounded coverage, not full notional");
@@ -910,6 +988,23 @@ contract CoverageEndToEndTest is Test {
             ledger.proposerBondWood(address(usdg), coverage),
             "risk-scaled bond still locked"
         );
+    }
+
+    /// @notice ADR 2026-07-27 REVERSED this test's original conclusion, and the
+    ///         reversal is the whole point of the ADR. It used to assert that a
+    ///         tier-1 proposal executes with ZERO approvers — the optimistic
+    ///         lane below `quorumTierThreshold`, which the §4 gate-2 argument
+    ///         leaned on. The ROE validation resolved that gate the other way:
+    ///         the threshold is now 0, tier 1 is no longer below it, and the
+    ///         quorum IS consulted.
+    ///
+    ///         Coverage SIZING is unchanged and still bounded (asserted in the
+    ///         helper) — sizing was never the gap. ENFORCEMENT was: this exact
+    ///         shape, a bounded-tier proposal with no covering approver, is what
+    ///         used to execute unbacked.
+    function test_boundedTierNowRequiresCoverage() public {
+        uint256 pid = _proposeBoundedTier1();
+        assertEq(ledger.quorumTierThreshold(), 0, "ADR 2026-07-27: every tier fail-closed");
 
         // Review runs with a healthy cohort and NOBODY approves.
         _openReview(govA, pid);
@@ -918,13 +1013,30 @@ contract CoverageEndToEndTest is Test {
         assertEq(approvers.length, 0, "zero approvers");
         assertEq(ledger.openExposureUsd(g1), 0, "no exposure booked anywhere");
 
-        // Optimistic passage survives below the threshold.
+        vm.expectRevert(IExposureLedger.InsufficientApproveCoverage.selector);
+        govA.executeProposal(pid);
+        assertEq(_state(govA, pid), uint256(ISyndicateGovernor.ProposalState.Approved), "stays Approved, unexecuted");
+        assertEq(adapter.pokes(), 0, "the batch never ran");
+    }
+
+    /// @notice The optimistic lane still EXISTS as a mechanism — it is simply no
+    ///         longer reachable at the launch threshold. Raising the threshold
+    ///         back above the proposal's tier restores it, which is what proves
+    ///         the `>=` comparison is doing the work rather than the tier alone.
+    ///         Kept so a future re-admission (v2, per the ADR) has a live test of
+    ///         the knob rather than a re-derivation.
+    function test_boundedTierExecutesOptimisticallyWhenThresholdRaised() public {
+        uint256 pid = _proposeBoundedTier1();
+        vm.prank(ledgerOwner);
+        ledger.setQuorumTierThreshold(2); // the pre-ADR launch value
+
+        _openReview(govA, pid);
+        _pastReview(govA, pid);
+        (address[] memory approvers,,) = registry.getApproverWeights(address(govA), pid);
+        assertEq(approvers.length, 0, "zero approvers");
+
         govA.executeProposal(pid);
         assertEq(_state(govA, pid), uint256(ISyndicateGovernor.ProposalState.Executed), "bounded lane still executes");
         assertEq(adapter.pokes(), 1, "the batch really ran");
-
-        // The threshold is what did the work: the identical zero-approver shape
-        // at tier 2 is exactly what `test_thinCohortCannotForceExecution` rejects.
-        assertEq(ledger.quorumTierThreshold(), 2, "launch threshold unchanged");
     }
 }

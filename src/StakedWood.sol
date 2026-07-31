@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
-import {StakedWoodDelegation} from "./StakedWoodDelegation.sol";
+import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -32,17 +32,22 @@ interface IRegistryReviewPeriod {
 
 /// @title StakedWood (sWOOD)
 /// @notice Non-transferable vote-escrow contract. Sole WOOD custodian:
-///         guardian stake, owner bonds, DPoS delegation, vote checkpoints,
-///         slashing + burn. See spec 2026-05-21-swood-staking-split-design.md.
+///         guardian stake, owner bonds, vote checkpoints, slashing + burn.
+///         See spec 2026-05-21-swood-staking-split-design.md.
+/// @dev DPoS delegation (share pools, commission, unbonding escrow —
+///      `StakedWoodDelegation`) was REMOVED/postponed before mainnet: vote
+///      weight is aged own stake only, and slashing has exactly one leg (the
+///      guardian's own bond). Re-introduction is a fresh design, not a revert.
 /// @dev Narrow ExposureLedger read surface. Mirrors the `ISwoodMinimal` pattern
 ///      the ledger uses in the other direction — neither contract imports the
 ///      other's full ABI. Both directions are views, so the mutual reference
 ///      carries no reentrancy concern.
 interface ILedgerExposureMinimal {
     function openExposureUsd(address guardian) external view returns (uint256);
+    function hasFrozenCoverage(address guardian) external view returns (bool);
 }
 
-contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable {
+contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgradeable {
     using SafeERC20 for IERC20;
     using Checkpoints for Checkpoints.Trace224;
 
@@ -100,9 +105,27 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     /// @dev Mirrors `IStakedWood.ApproverAlreadySlashed`.
     error ApproverAlreadySlashed();
 
+    /// @dev Mirrors `IStakedWood.VaultNotFactoryDeployed`.
+    error VaultNotFactoryDeployed();
+
     /// @notice Insufficient WOOD to satisfy a stake minimum.
     /// @dev Relocated from `IGuardianRegistry` alongside `stakeAsGuardian`.
     error InsufficientStake();
+
+    // ── Errors absorbed from the removed `StakedWoodDelegation` base (shared
+    //    by the guardian/owner unstake flows) ──
+
+    /// @notice Caller has no active stake to operate on.
+    error NoActiveStake();
+
+    /// @notice An unstake request is already pending.
+    error UnstakeAlreadyRequested();
+
+    /// @notice No pending unstake request to cancel or claim.
+    error UnstakeNotRequested();
+
+    /// @notice `claim*` called before `coolDownPeriod` elapsed.
+    error CooldownNotElapsed();
 
     /// @notice Parameter setter argument failed bounds validation.
     /// @dev Relocated verbatim from `IGuardianRegistry`.
@@ -110,9 +133,7 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     /// @notice Sherlock #16: `setCooldownPeriod` rejected because the new
     ///         cooldown is shorter than the registry's `reviewPeriod`. The
     ///         `coolDownPeriod >= reviewPeriod` invariant closes slash-evasion
-    ///         for guardian OWN stake (the `isActiveGuardian` voting gate);
-    ///         delegator stake evasion is closed separately by the delegation
-    ///         unbonding-escrow.
+    ///         for guardian OWN stake (the `isActiveGuardian` voting gate).
     error CooldownBelowReviewPeriod();
 
     /// @notice `claimUnstakeGuardian` refused: the guardian still backs a
@@ -211,20 +232,11 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     ///      decisiveness ramp (spec 2026-07-19 Part D).
     bytes32 public constant PARAM_MAX_SLASH_BPS = keccak256("maxSlashBps");
 
-    /// @notice Parameter key for `maxDelegatedSlashBps`.
-    bytes32 public constant PARAM_MAX_DELEGATED_SLASH_BPS = keccak256("maxDelegatedSlashBps");
-
     /// @notice Parameter key for `ageFloorBps`.
     bytes32 public constant PARAM_AGE_FLOOR_BPS = keccak256("ageFloorBps");
 
     /// @notice Parameter key for `maturationPeriod`.
     bytes32 public constant PARAM_MATURATION_PERIOD = keccak256("maturationPeriod");
-
-    /// @notice Parameter key for `delegatedWeightCapX`.
-    bytes32 public constant PARAM_DELEGATED_WEIGHT_CAP_X = keccak256("delegatedWeightCapX");
-
-    /// @notice Emitted when the owner toggles the delegation feature flag.
-    event DelegationEnabledSet(bool enabled);
 
     /// @notice Emitted when the owner rewires the verdict-slash role.
     /// @dev Mirrors `IStakedWood.AuthorizedSlasherSet`.
@@ -240,6 +252,8 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     ///      produced, so Plan D and indexers can join the two without scraping
     ///      the escrow's own `CaseOpened` log and guessing which slash it came
     ///      from. `total` is the WOOD routed; `caseId` is the escrow's id.
+    ///      `total` is NET of any conviction bounty (spec 2026-07-29 §2) — it
+    ///      is exactly what the escrow's own `proceeds` for this case equal.
     ///      Mirrors `IStakedWood.VerdictSlashRouted`.
     event VerdictSlashRouted(bytes32 indexed caseKey, address indexed vault, uint256 total, uint256 caseId);
 
@@ -249,18 +263,24 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     ///         proceeds were burned instead. The guardian is still slashed;
     ///         the victims of THIS case go uncompensated (PR #24 review 🟡5:
     ///         a bad vault must not brick the verdict).
-    /// @dev Mirrors `IStakedWood.VerdictSlashUncompensated`.
+    /// @dev Mirrors `IStakedWood.VerdictSlashUncompensated`. `total` here is
+    ///      also NET of the conviction bounty, which is paid regardless of
+    ///      whether `openCase` succeeds (spec 2026-07-29 §2 burn-fallback
+    ///      decision): depositors recover 0% of `total` on this path either
+    ///      way, so paying the bounty first costs them nothing.
     event VerdictSlashUncompensated(bytes32 indexed caseKey, address indexed vault, uint256 total);
+
+    /// @notice A conviction bounty was paid out of a verdict slash before the
+    ///         remainder opened a compensation case (spec 2026-07-29 §2).
+    /// @dev Mirrors `IStakedWood.ConvictionBountyPaid`.
+    event ConvictionBountyPaid(bytes32 indexed caseKey, address indexed bountyTo, uint256 amount);
 
     /// @notice Emitted once per approver actually slashed for a blocked proposal.
     /// @dev A slash is a significant value-destroying change; the appeal flow
-    ///      (`refundSlash`), delegators, and indexers all need on-chain records.
-    ///      Emitted only when `ownSlash != 0 || delegatedSlash != 0`.
-    ///      `ownSlash` is the TOTAL own-stake hit — the base own slash plus
-    ///      the first-loss spill of the delegated damage the
-    ///      `maxDelegatedSlashBps` cap absorbed. `delegatedSlash` is the
-    ///      COMBINED delegated hit — the live delegation pool plus the I-1
-    ///      unbonding-escrow pool.
+    ///      (`refundSlash`) and indexers need on-chain records. Emitted only
+    ///      when `ownSlash != 0`. `delegatedSlash` is retained in the ABI for
+    ///      indexer compatibility but is ALWAYS 0 — DPoS delegation was
+    ///      removed/postponed, so the own bond is the only slashable leg.
     event GuardianSlashed(
         bytes32 indexed reviewKey, address indexed approver, uint256 ownSlash, uint256 delegatedSlash
     );
@@ -367,32 +387,16 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     uint256 public minSlashBps;
 
     /// @notice Ceiling (bps) of the deterministic slash severity.
-    /// @dev May be a full `10_000` (100%) — the ceiling only sizes the
-    ///      approver's OWN-stake slash, which is a plain integer subtraction
-    ///      with no share math to brick. The C-2 pool-bricking guard that used
-    ///      to cap this at `9_999` now lives on `maxDelegatedSlashBps` (the
-    ///      pool legs' ceiling) below.
+    /// @dev May be a full `10_000` (100%) — the ceiling sizes the approver's
+    ///      OWN-stake slash, a plain integer subtraction with no share math
+    ///      to brick.
     uint256 public maxSlashBps;
-
-    /// @notice Per-incident ceiling (bps) on the delegated + unbonding pool
-    ///         slash. The pool legs of `_slashOne` are sized by
-    ///         `min(slashBps, maxDelegatedSlashBps)`; the uncovered remainder
-    ///         spills onto the approver's own stake (first-loss bond).
-    /// @dev Strictly `< 10_000` — this is where the C-2 pool-bricking guard
-    ///      lives now: a 100% pool slash zeroes `poolTokens` while
-    ///      `poolShares` stay nonzero, bricking `delegateStake` with a
-    ///      `Math.mulDiv` divide-by-zero. `maxSlashBps` itself may be 10_000
-    ///      (own stake is a plain integer, no share math).
-    uint256 public maxDelegatedSlashBps;
 
     /// @notice Vote-weight fraction (bps) of raw own stake at age 0.
     uint256 public ageFloorBps;
 
     /// @notice Stake age at which own-stake weight reaches par (100%).
     uint256 public maturationPeriod;
-
-    /// @notice Max delegated vote weight as a multiple of AGED own weight.
-    uint256 public delegatedWeightCapX;
 
     /// @notice Slashed WOOD whose burn transfer failed, queued for retry.
     /// @dev Keyed by `address(this)` — relocated verbatim from
@@ -403,29 +407,44 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     ///      risk). The amount accumulates here and `flushBurn` retries it.
     mapping(address => uint256) internal _pendingBurn;
 
-    /// @dev Reserves upgrade headroom for this leaf contract. Later tasks
-    ///      (slash bounds, etc.) decrement this as they add storage.
-    ///      Decremented 16 → 15 in Task 5.1: `voteStake` consumes one slot.
-    ///      Decremented 15 → 14 in Task 5.2: `_pendingBurn` consumes one slot.
-    ///      Decremented 14 → 12 in Task 6.2: `minSlashBps` + `maxSlashBps`.
-    ///      Decremented 12 → 8 (spec 2026-07-19): maxDelegatedSlashBps,
-    ///      ageFloorBps, maturationPeriod, delegatedWeightCapX.
-    ///      Incremented 8 → 9 (spec 2026-07-19 Task 5): `voteStake` deleted —
-    ///      `_slashOne` sizes the own slash off the raw own-stake checkpoint
-    ///      at `openedAt`, so the per-vote mirror is dead. Pre-mainnet layout
-    ///      re-baseline; the slot returns to the gap to keep total size stable.
-    ///      Decremented 9 → 6 across two branches that each carved from this
-    ///      gap, then 6 → 5 for `_verdictSlashed` (PR #24 review 🟠N2).
-    ///      DECLARATION ORDER IS DELIBERATE (PR #24 review F-F): Plan C's three
-    ///      fields sit BETWEEN the gap and Plan B's `exposureLedger`, so the
-    ///      shrink comes off the END of the gap and `exposureLedger` keeps the
-    ///      slot the merge base gave it (53). An earlier arrangement declared
-    ///      them after `exposureLedger`, which shifted it 53 → 50 — safe only
-    ///      because nothing deployed carries the tail (origin/main still has
-    ///      `__gap[9]` and none of these four), but the golden gate cannot
-    ///      tell "appended" from "shifted" once regenerated, so the discipline
-    ///      is restored while the tail is still unreleased.
-    uint256[5] private __gap;
+    /// @dev Reserves upgrade headroom for this leaf contract.
+    ///      RE-BASELINED 2026-07-26 (DPoS delegation removal, pre-mainnet):
+    ///      the `StakedWoodDelegation` base contract — every delegation slot
+    ///      that used to precede this contract's storage — was deleted, along
+    ///      with `maxDelegatedSlashBps` and `delegatedWeightCapX` here, and
+    ///      the whole layout re-baselined (goldens regenerated in the same
+    ///      PR; no mainnet 4663 deployment exists, testnets are redeployable).
+    ///      Decremented 6 → 5 in the Plan C round-3 merge: `_verdictSlashed`
+    ///      (PR #24 review 🟠N2) consumes one slot, so the total size stays
+    ///      stable. DECLARATION ORDER IS DELIBERATE (PR #24 review F-F):
+    ///      Plan C's three fields sit BETWEEN the gap and Plan B's
+    ///      `exposureLedger`, so shrinks come off the END of the gap and the
+    ///      fields behind it never shift. From the first mainnet deploy onward
+    ///      changes must be append-only, carved off the FRONT of this gap.
+    ///      Decremented 5 → 4 for `_liabilityCheckpoints` (PR #25 review 🔴F1b),
+    ///      declared immediately below so the shrink comes off the END of the
+    ///      gap and every field after it keeps its slot.
+    uint256[4] private __gap;
+
+    /// @dev Per-guardian OWN-STAKE LIABILITY history: what the guardian is on
+    ///      the hook for at a past instant, as distinct from what it could VOTE
+    ///      with. `_stakeCheckpoints` answers the votability question and is
+    ///      zeroed by `requestUnstakeGuardian`; this one is not.
+    ///
+    ///      THE TWO ARE DIFFERENT QUESTIONS (PR #25 review 🔴F1b). Sharing one
+    ///      trace let an approver discharge its liability with a reversible
+    ///      transaction it could send BEFORE the drain it voted for ever
+    ///      executed: approve while active, `requestUnstakeGuardian`, let the
+    ///      proposal execute. The coverage gate still credited the full bond —
+    ///      `ExposureLedger._slashableBondUsd` prices it off live
+    ///      `guardianStake()`, which a request does not move — while every slash
+    ///      basis at or after `executedAt` read the request's zero, so a 100%
+    ///      conviction recovered nothing.
+    ///
+    ///      Pushed on stake, on slash and on claim — every event that changes
+    ///      what is actually recoverable. Deliberately NOT pushed on
+    ///      request/cancel, which change only votability.
+    mapping(address guardian => Checkpoints.Trace224) internal _liabilityCheckpoints;
 
     /// @notice The one address permitted to drive the VERDICT slash path
     ///         (`slashToEscrow`). Deliberately distinct from `onlyRegistry`,
@@ -439,13 +458,30 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     /// @notice The `CompensationEscrow` that `slashToEscrow` funds.
     /// @dev OWNER-SET STATE, deliberately NOT a `slashToEscrow` parameter.
     ///      sWOOD custodies every WOOD bond in the protocol; letting the
-    ///      slasher name an arbitrary destination would hand it an ERC20
-    ///      allowance against that whole balance. Pinning the sink to an
-    ///      owner-configured address means a compromised `authorizedSlasher`
-    ///      can only misdirect proceeds INTO the honest escrow — where they are
-    ///      still bound to a snapshot-gated case — never to an address of its
-    ///      own choosing. Zero disables the verdict path
+    ///      slasher name an arbitrary destination for THIS SINK would hand it
+    ///      an ERC20 allowance against that whole balance. Pinning the sink to
+    ///      an owner-configured address means a compromised `authorizedSlasher`
+    ///      can misdirect the ESCROW PORTION of a slash only INTO the honest
+    ///      escrow — where it is still bound to a snapshot-gated case — never
+    ///      to an address of its own choosing. Zero disables the verdict path
     ///      (`CompensationEscrowNotSet`).
+    ///
+    ///      CORRECTED (2026-07-29 review): this no longer describes the WHOLE
+    ///      slash. `slashToEscrow`'s `bountyTo`/`bountyBps` is a SEPARATE,
+    ///      deliberately caller-chosen channel — the bounty recipient must be
+    ///      caller-named, because it is the challenger who caused THIS
+    ///      conviction, a fact sWOOD has no way to know on its own. What stays
+    ///      true, and is the actual guarantee: a compromised `authorizedSlasher`
+    ///      can divert AT MOST `MAX_CONVICTION_BOUNTY_BPS` of any ONE CALL to
+    ///      a caller-named address; the remainder of that call can only ever
+    ///      reach this owner-set escrow or, on the burn fallback,
+    ///      `BURN_ADDRESS` — never an arbitrary destination of the slasher's
+    ///      own choosing. PER CALL, NOT PER GUARDIAN: `_verdictSlashed` is
+    ///      keyed by a caller-chosen `caseKey`, so repeated verdicts against
+    ///      the same approver under fresh case keys compound — nothing bounds
+    ///      the number of times a slasher can convict one guardian across
+    ///      separate calls, only what fraction of any single one it can
+    ///      redirect. See `MAX_CONVICTION_BOUNTY_BPS`.
     address public compensationEscrow;
 
     /// @dev One slash per (verdict, approver) — the persistent half of the
@@ -482,15 +518,38 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     ///         asserts the wiring as a pre-flight — the failure surfaces as a
     ///         refused deploy rather than as a hole nobody sees.
     ///
-    /// @dev    Declared AFTER Plan C's three fields so it keeps slot 53, the
-    ///         slot the merge base assigned it (review F-F, see the `__gap`
-    ///         natspec).
+    /// @dev    Declared AFTER Plan C's three fields, preserving the Plan C
+    ///         merge order (review F-F, see the `__gap` natspec); the
+    ///         DPoS-removal re-baseline shifted every absolute slot, and the
+    ///         regenerated golden pins where it landed.
     address public exposureLedger;
 
     /// @notice Slashed WOOD is sent here — permanently out of circulation.
     /// @dev Burning via a transfer to a known-dead address keeps WOOD's
     ///      `totalSupply` semantics intact (no `burn` dependency on the token).
     address internal constant BURN_ADDRESS = 0x000000000000000000000000000000000000dEaD;
+
+    /// @notice Ceiling on `slashToEscrow`'s `bountyBps` (spec 2026-07-29 §2:
+    ///         "bounded [0, 2_000]").
+    /// @dev ENFORCED HERE, NOT ONLY IN THE CALLER. `ChallengeGame` pins its own
+    ///      `convictionBountyBps` to this same range at filing, but that bound
+    ///      lives in the CALLER, and sWOOD is the contract that actually moves
+    ///      the WOOD — the same motivation that has sWOOD re-check
+    ///      `slashBpsPer` against `[minSlashBps, maxSlashBps]` rather than
+    ///      trusting `ExposureLedger.slashBpsFor`'s own bound. The MECHANISM
+    ///      differs, though: `slashBpsPer` is silently CLAMPED
+    ///      (`Math.min`/`Math.max`), while an out-of-range `bountyBps` here
+    ///      REVERTS. A compromised or simply buggy `authorizedSlasher` must
+    ///      not be able to name an arbitrary `bountyBps` and route the whole
+    ///      slash to a caller-chosen address; capping it here means the WORST
+    ///      a bad slasher can do through this parameter, IN ANY ONE CALL, is
+    ///      redirect `MAX_CONVICTION_BOUNTY_BPS` of that call's slash — the
+    ///      rest of that call still lands only in the honest escrow or the
+    ///      burn address, never at the slasher's discretion. This is a PER-
+    ///      CALL bound, not a per-guardian one: `_verdictSlashed` keys on a
+    ///      caller-chosen `caseKey`, so nothing stops repeated verdicts against
+    ///      the same approver under fresh case keys from compounding.
+    uint256 public constant MAX_CONVICTION_BOUNTY_BPS = 2_000;
 
     /// @notice Grouped `initialize` arguments. A struct keeps the call site
     ///         keyword-addressed — a prior review flagged the positional arg
@@ -513,14 +572,10 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
         uint256 minSlashBps;
         /// @dev Upper clamp bound (bps, ≤ 10_000) for graduated slash severity.
         uint256 maxSlashBps;
-        /// @dev Per-incident delegated-slash ceiling (bps, < 10_000).
-        uint256 maxDelegatedSlashBps;
         /// @dev Own-stake weight fraction at age 0 (bps, [1, 10_000]).
         uint256 ageFloorBps;
         /// @dev Age at which own-stake weight reaches par ([7, 90] days).
         uint256 maturationPeriod;
-        /// @dev Delegated-weight cap multiple over aged own weight ([1, 20]).
-        uint256 delegatedWeightCapX;
     }
 
     /// @custom:oz-upgrades-unsafe-allow constructor
@@ -538,26 +593,17 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
         minGuardianStake = p.minGuardianStake;
         coolDownPeriod = p.coolDownPeriod;
         minOwnerStake = p.minOwnerStake;
-        // Severity ceiling may be a full 100% (own stake is a plain integer).
-        // The C-2 pool-bricking guard lives on `maxDelegatedSlashBps` below.
+        // Severity ceiling may be a full 100% (own stake is a plain integer
+        // subtraction with no share math to brick).
         if (p.minSlashBps > p.maxSlashBps || p.maxSlashBps > 10_000) {
             revert InvalidParameter();
         }
         minSlashBps = p.minSlashBps;
         maxSlashBps = p.maxSlashBps;
-        // C-2 guard: pool legs are sized by `min(S, C)`, so C < 10_000 keeps
-        // at least 1 wei in every slashed pool.
-        if (p.maxDelegatedSlashBps > p.maxSlashBps || p.maxDelegatedSlashBps >= 10_000) {
-            revert InvalidParameter();
-        }
-        maxDelegatedSlashBps = p.maxDelegatedSlashBps;
         if (p.ageFloorBps == 0 || p.ageFloorBps > 10_000) revert InvalidParameter();
         ageFloorBps = p.ageFloorBps;
         if (p.maturationPeriod < 7 days || p.maturationPeriod > 90 days) revert InvalidParameter();
         maturationPeriod = p.maturationPeriod;
-        if (p.delegatedWeightCapX == 0 || p.delegatedWeightCapX > 20) revert InvalidParameter();
-        delegatedWeightCapX = p.delegatedWeightCapX;
-        _initEpochGenesis();
     }
 
     function setRegistry(address registry_) external onlyOwner {
@@ -567,19 +613,11 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
         _registrySet = true;
     }
 
-    function _wood() internal view override returns (IERC20) {
-        return wood;
-    }
-
     /// @dev Active iff the guardian holds stake >= `minGuardianStake` and has no
     ///      pending unstake request. Relocated verbatim from `GuardianRegistry`.
-    function _isActiveGuardian(address g) internal view override returns (bool) {
+    function _isActiveGuardian(address g) internal view returns (bool) {
         Guardian storage gs = _guardians[g];
         return gs.stakedAmount > 0 && gs.unstakeRequestedAt == 0;
-    }
-
-    function _coolDownPeriod() internal view virtual override returns (uint256) {
-        return coolDownPeriod;
     }
 
     modifier onlyRegistry() {
@@ -653,17 +691,11 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
 
         // Checkpoint votable stake for historical quorum lookups.
         _stakeCheckpoints[msg.sender].push(uint32(block.timestamp), uint224(newTotal));
+        // New capital is recoverable from this instant on, so liability moves
+        // with it. The two traces agree here; they diverge only across an
+        // unstake request.
+        _liabilityCheckpoints[msg.sender].push(uint32(block.timestamp), uint224(newTotal));
         _totalStakeCheckpoint.push(uint32(block.timestamp), uint224(totalGuardianStake));
-
-        // Sherlock #39 / Run-1 #22: first-time stake transitions guardian
-        // active. Any pre-existing delegations to msg.sender (which until
-        // now were excluded from `totalActiveDelegatedStake`) now count.
-        if (wasInactive) {
-            uint256 pool = poolTokens[msg.sender];
-            if (pool != 0) {
-                _writeActiveDelegated(totalActiveDelegatedStake + pool);
-            }
-        }
 
         emit GuardianStaked(msg.sender, amount, agentId);
     }
@@ -688,25 +720,64 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     }
 
     /// @notice A guardian's total votable weight at a past timestamp.
-    /// @dev Votes = AGE-WEIGHTED own checkpointed stake + delegated inbound
-    ///      (`poolTokens`) at `timestamp`. The own term is the raw checkpoint
-    ///      discounted by `_ageFactorBps` (linear ramp from `ageFloorBps` at
-    ///      stake time to par at `maturationPeriod` — spec §4 of
-    ///      2026-07-19-slash-cap-age-weighted-voting-design.md); it drops to 0
-    ///      once the guardian requests unstake. The delegated term is capped
-    ///      at `delegatedWeightCapX × agedOwn`: the cap base being AGED means
-    ///      delegation cannot bypass maturation, and a zero-own (or
-    ///      unstake-requested → 0-checkpoint) guardian carries no delegated
-    ///      weight. The cap bounds VOTING POWER only — the pool's slashable
-    ///      base stays the raw inbound snapshot. Totals (`getPastTotalVotes`,
-    ///      `getPastTotalSupply`) deliberately stay RAW — aging and the k-cap
-    ///      only shrink numerators, so the raw denominator is conservative
-    ///      (spec §5).
+    /// @dev Votes = AGE-WEIGHTED own checkpointed stake at `timestamp`: the
+    ///      raw checkpoint discounted by `_ageFactorBps` (linear ramp from
+    ///      `ageFloorBps` at stake time to par at `maturationPeriod` — spec §4
+    ///      of 2026-07-19-slash-cap-age-weighted-voting-design.md); drops to 0
+    ///      once the guardian requests unstake. Totals (`getPastTotalVotes`,
+    ///      `getPastTotalSupply`) deliberately stay RAW — aging only shrinks
+    ///      numerators, so the raw denominator is conservative (spec §5).
+    ///      (The DPoS delegated-inbound term and its k-cap were removed with
+    ///      the delegation postponement.)
     function getPastVotes(address guardian, uint256 timestamp) public view returns (uint256) {
         uint256 rawOwn = _stakeCheckpoints[guardian].upperLookupRecent(uint32(timestamp));
-        uint256 agedOwn = rawOwn * _ageFactorBps(_guardians[guardian].stakedAt, timestamp) / 10_000;
-        uint256 delegated = getPastDelegatedInbound(guardian, timestamp);
-        return agedOwn + Math.min(delegated, delegatedWeightCapX * agedOwn);
+        return rawOwn * _ageFactorBps(_guardians[guardian].stakedAt, timestamp) / 10_000;
+    }
+
+    /// @notice A guardian's RAW votable own stake at a past timestamp — the same
+    ///         basis `getPastTotalVotes` is a sum of.
+    /// @dev    ITS COUNTERPART `getPastVotes` IS NOT (review 🔴F17). That one
+    ///         applies `_ageFactorBps` on top, so it is WOOD-scaled but is not a
+    ///         term of the total — two different measures of the same stake.
+    ///
+    ///         Re-graded after the DPoS-delegation removal: `getPastVotes` used
+    ///         to add k-capped delegated inbound, which put an account's weight
+    ///         in a 20x band around its own contribution and let the accused
+    ///         drive `TokenCourt`'s participation floor to zero. Aging only ever
+    ///         SHRINKS, so weight is now bounded above by raw stake and that is
+    ///         unreachable. The residual bias is one-directional: too little
+    ///         subtracted, so the floor comes out too high.
+    ///
+    ///         The note on `getPastVotes` — "aging and the k-cap only shrink
+    ///         numerators, so the raw denominator is conservative" — is sound
+    ///         where it was written, about vote COUNTING. It INVERTS under a
+    ///         subtraction: `TokenCourt._participationFloor` subtracts the accused
+    ///         cohort from the electorate, and there the k-cap term is not
+    ///         conservative at all — it is the term that can drive the floor to
+    ///         zero. This getter exists so that subtraction has a same-basis
+    ///         operand, after which the accused sum can never exceed the total
+    ///         by construction: both traces are pushed in the same transaction
+    ///         at every mutation site (stake, request, cancel, slash).
+    ///
+    ///         POST-A5: the raw basis is not merely a units argument — it also
+    ///         denies the accused a free lever on its own conviction
+    ///         threshold. If `TokenCourt._recordAccused` summed aged
+    ///         `getPastVotes` instead, an accused approver could call
+    ///         `requestUnstakeGuardian` — free, permissionless, cancellable —
+    ///         between the drain and `refer`, re-anchoring its `stakedAt` and
+    ///         flooring its own contribution to `ageFloorBps`. That shrinks
+    ///         the subtrahend, RAISES the participation floor, and can push a
+    ///         case the accused was certain to lose into `Inconclusive` (which
+    ///         escapes the slash entirely — the accused's counter-bond returns
+    ///         whole, and only the challenger's bond takes the escalating
+    ///         Inconclusive burn, owner decision 2026-07-30). This getter is
+    ///         immune: it reads the checkpointed
+    ///         amount directly, with no live, re-anchorable factor for a
+    ///         pending unstake request to move. A future refactor that
+    ///         "harmonises the two bases" onto `getPastVotes` would reopen
+    ///         this lever.
+    function getPastStake(address guardian, uint256 timestamp) public view returns (uint256) {
+        return _stakeCheckpoints[guardian].upperLookupRecent(uint32(timestamp));
     }
 
     /// @notice Total guardian vote weight (quorum denominator) at a past timestamp.
@@ -721,36 +792,32 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     // `getVotes` / `getPastVotes` / `getPastTotalSupply` give Snapshot's
     // `erc20-votes` strategy the read surface it consumes, since the post-split
     // `WoodToken` no longer inherits `ERC20Votes`. sWOOD intentionally does NOT
-    // implement the full OZ `IVotes` interface: `delegate` / `delegates` /
-    // `delegateBySig` would collide with sWOOD's custodial DPoS delegation,
-    // which is a different mechanism (stake-pool shares, not vote re-pointing).
-    // Vote weight = AGE-WEIGHTED own staked WOOD (linear discount-to-par via
-    // `_ageFactorBps`; votable — zero once unstake is requested) +
-    // delegated-inbound WOOD capped at `delegatedWeightCapX ×` aged own.
-    // Totals stay raw (conservative denominator).
+    // implement the full OZ `IVotes` interface (no `delegate` / `delegates` /
+    // `delegateBySig`). Vote weight = AGE-WEIGHTED own staked WOOD (linear
+    // discount-to-par via `_ageFactorBps`; votable — zero once unstake is
+    // requested). Totals stay raw (conservative denominator).
 
-    /// @notice An account's CURRENT vote weight: own votable stake + delegated
-    ///         inbound. The live counterpart of `getPastVotes`.
+    /// @notice An account's CURRENT vote weight — the live counterpart of
+    ///         `getPastVotes`.
     /// @dev Delegates to `getPastVotes(account, block.timestamp)`. The
     ///      checkpoint traces are pushed on every votable-weight change with
     ///      key `uint32(block.timestamp)`, and `upperLookupRecent` includes a
     ///      checkpoint written in the current block — so a same-block lookup
     ///      returns the live value. A guardian with a pending unstake request
-    ///      has a 0 own-stake checkpoint, so BOTH the own term and the
-    ///      k-capped delegated term are 0 (cap = `delegatedWeightCapX × 0`).
+    ///      has a 0 own-stake checkpoint, so its weight is 0.
     function getVotes(address account) external view returns (uint256) {
         return getPastVotes(account, block.timestamp);
     }
 
     /// @notice Total system vote weight at a past timestamp — the denominator a
     ///         Snapshot quorum/total would use.
-    /// @dev Delegates to `getPastTotalVotes(timestamp) + getPastTotalDelegated(timestamp)`
-    ///      — the RAW (conservative) counterpart of the per-account reads: the
+    /// @dev Delegates to `getPastTotalVotes(timestamp)` — the RAW
+    ///      (conservative) counterpart of the per-account reads: the
     ///      age-weighted `getPastVotes` values sum to AT MOST this total, so it
     ///      remains a valid quorum denominator (spec §5 of
     ///      2026-07-19-slash-cap-age-weighted-voting-design.md).
     function getPastTotalSupply(uint256 timestamp) external view returns (uint256) {
-        return getPastTotalVotes(timestamp) + getPastTotalDelegated(timestamp);
+        return getPastTotalVotes(timestamp);
     }
 
     /// @notice True iff `guardian` has an active stake and no pending unstake.
@@ -778,8 +845,7 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     ///      drop below the registry's review window. This invariant closes
     ///      slash-evasion for guardian OWN stake only — a guardian cannot
     ///      unstake and escape the slash before `resolveReview` runs.
-    ///      Delegator stake evasion is closed independently by the delegation
-    ///      unbonding-escrow. The cross-call is guarded behind
+    ///      The cross-call is guarded behind
     ///      `registry != address(0)` so a not-yet-wired sWOOD (deploy-time,
     ///      before `setRegistry`) does not revert.
     function setCooldownPeriod(uint256 v) external onlyOwner {
@@ -806,10 +872,8 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
 
     /// @notice Set the floor of the deterministic slash severity.
     /// @dev Owner-only. Must keep `minSlashBps <= maxSlashBps`, where
-    ///      `maxSlashBps <= 10_000` (a full-100% own-stake ceiling is legal;
-    ///      the C-2 pool-bricking guard lives on `maxDelegatedSlashBps`,
-    ///      enforced by `setMaxSlashBps` / `initialize`). So this only needs
-    ///      to gate against `v > maxSlashBps`.
+    ///      `maxSlashBps <= 10_000` (a full-100% own-stake ceiling is legal).
+    ///      So this only needs to gate against `v > maxSlashBps`.
     function setMinSlashBps(uint256 v) external onlyOwner {
         if (v > maxSlashBps) revert InvalidParameter();
         emit ParameterChangeFinalized(PARAM_MIN_SLASH_BPS, minSlashBps, v);
@@ -817,24 +881,12 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     }
 
     /// @notice Set the upper clamp bound for the slash severity.
-    /// @dev Owner-only. `10_000` (100%) is legal for the OWN-stake ceiling;
-    ///      the pool-bricking guard lives on `maxDelegatedSlashBps`. Must
-    ///      keep `minSlashBps <= maxSlashBps` and `maxDelegatedSlashBps <=
-    ///      maxSlashBps`.
+    /// @dev Owner-only. `10_000` (100%) is legal for the OWN-stake ceiling.
+    ///      Must keep `minSlashBps <= maxSlashBps`.
     function setMaxSlashBps(uint256 v) external onlyOwner {
-        if (v < minSlashBps || v > 10_000 || v < maxDelegatedSlashBps) revert InvalidParameter();
+        if (v < minSlashBps || v > 10_000) revert InvalidParameter();
         emit ParameterChangeFinalized(PARAM_MAX_SLASH_BPS, maxSlashBps, v);
         maxSlashBps = v;
-    }
-
-    /// @notice Set the per-incident delegated-slash ceiling.
-    /// @dev Owner-only. Strict `< 10_000` is the relocated C-2 pool-bricking
-    ///      guard; also bounded by `maxSlashBps` so the spill term
-    ///      `S - min(S, C)` is never negative-by-config.
-    function setMaxDelegatedSlashBps(uint256 v) external onlyOwner {
-        if (v >= 10_000 || v > maxSlashBps) revert InvalidParameter();
-        emit ParameterChangeFinalized(PARAM_MAX_DELEGATED_SLASH_BPS, maxDelegatedSlashBps, v);
-        maxDelegatedSlashBps = v;
     }
 
     /// @notice Set the age-0 weight floor.
@@ -849,13 +901,6 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
         if (v < 7 days || v > 90 days) revert InvalidParameter();
         emit ParameterChangeFinalized(PARAM_MATURATION_PERIOD, maturationPeriod, v);
         maturationPeriod = v;
-    }
-
-    /// @notice Set the delegated-weight cap multiple.
-    function setDelegatedWeightCapX(uint256 v) external onlyOwner {
-        if (v == 0 || v > 20) revert InvalidParameter();
-        emit ParameterChangeFinalized(PARAM_DELEGATED_WEIGHT_CAP_X, delegatedWeightCapX, v);
-        delegatedWeightCapX = v;
     }
 
     // ── Guardian unstake cooldown (relocated verbatim from GuardianRegistry) ──
@@ -885,17 +930,13 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
 
         // Unstake-requested stake is not votable. Push 0 so getPastStake
         // reflects the on-cooldown state accurately.
+        // `_liabilityCheckpoints` IS DELIBERATELY NOT PUSHED HERE (PR #25 review
+        // 🔴F1b). A request revokes voting power; it does not settle what the
+        // guardian already underwrote, and the WOOD is still in this contract —
+        // `claimUnstakeGuardian` is the moment it stops being recoverable, and
+        // that is where liability drops.
         _stakeCheckpoints[msg.sender].push(uint32(block.timestamp), 0);
         _totalStakeCheckpoint.push(uint32(block.timestamp), uint224(totalGuardianStake));
-
-        // Sherlock #39 / Run-1 #22: guardian transitions inactive — their
-        // delegated pool stops contributing to the active-only total
-        // (delegators still hold pool shares; they can re-bind to an
-        // active delegate or wait out the cooldown).
-        uint256 pool = poolTokens[msg.sender];
-        if (pool != 0) {
-            _writeActiveDelegated(totalActiveDelegatedStake - pool);
-        }
 
         emit GuardianUnstakeRequested(msg.sender, block.timestamp);
     }
@@ -917,14 +958,6 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
         // Stake is votable again.
         _stakeCheckpoints[msg.sender].push(uint32(block.timestamp), uint224(g.stakedAmount));
         _totalStakeCheckpoint.push(uint32(block.timestamp), uint224(totalGuardianStake));
-
-        // Sherlock #39 / Run-1 #22: guardian transitions back to active —
-        // their delegated pool resumes contributing to the active-only
-        // total.
-        uint256 pool = poolTokens[msg.sender];
-        if (pool != 0) {
-            _writeActiveDelegated(totalActiveDelegatedStake + pool);
-        }
 
         emit GuardianUnstakeCancelled(msg.sender);
     }
@@ -953,12 +986,29 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
         // about. This check covers the challenge path. Neither subsumes the
         // other.
         address ledger = exposureLedger;
-        if (ledger != address(0) && ILedgerExposureMinimal(ledger).openExposureUsd(msg.sender) != 0) {
-            revert CoverageStillOpen();
+        if (ledger != address(0)) {
+            // TWO QUESTIONS, NOT ONE (PR #25 review 🔴F2). `openExposureUsd`
+            // sums epoch buckets and a bucket ages out `challengeWindow` after
+            // its epoch on pure wall-clock — it does not pause because the
+            // guardian is under accusation. The challenge game's disputed tail
+            // (up to `disputeTimeout`) outlives that by design, so an accused
+            // approver could request at execution, wait out the cooldown, and
+            // claim its whole bond before the challenge could resolve: the
+            // conviction then priced maximum guilt and recovered nothing,
+            // silently. A frozen commitment is the accusation itself, and it
+            // does not expire on a clock.
+            ILedgerExposureMinimal l = ILedgerExposureMinimal(ledger);
+            if (l.openExposureUsd(msg.sender) != 0 || l.hasFrozenCoverage(msg.sender)) {
+                revert CoverageStillOpen();
+            }
         }
 
         uint256 amount = g.stakedAmount;
         delete _guardians[msg.sender];
+        // THE MOMENT LIABILITY ACTUALLY ENDS. Every gate above has cleared, so
+        // the capital is leaving and nothing further is recoverable from it —
+        // this, not the request, is where the liability trace drops to zero.
+        _liabilityCheckpoints[msg.sender].push(uint32(block.timestamp), 0);
 
         wood.safeTransfer(msg.sender, amount);
 
@@ -1154,9 +1204,6 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
         return _prepared[o].amount >= minOwnerStake && !_prepared[o].bound;
     }
 
-    /// @notice Enable or disable share-based DPoS delegation.
-    /// @dev Owner-only. `delegationEnabled` defaults false at deploy so
-    ///      delegation can be switched on after the cohort bootstraps.
     /// @notice Wire the coverage ledger that gates unstake claims.
     /// @dev Settable to zero deliberately — that is the documented fail-open
     ///      state, and an operator must be able to reach it if the ledger is
@@ -1166,11 +1213,6 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     function setExposureLedger(address ledger) external onlyOwner {
         exposureLedger = ledger;
         emit ExposureLedgerSet(ledger);
-    }
-
-    function setDelegationEnabled(bool enabled) external onlyOwner {
-        delegationEnabled = enabled;
-        emit DelegationEnabledSet(enabled);
     }
 
     /// @notice Set the address permitted to drive `slashToEscrow`.
@@ -1206,23 +1248,13 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
 
     /// @notice Slash a set of approvers for a blocked proposal.
     /// @dev Registry-only. For each approver, burns `slashBps` of their OWN
-    ///      guardian stake (sized by the raw own-stake checkpoint at
-    ///      `openedAt`, clamped to live stake) AND `min(slashBps,
-    ///      maxDelegatedSlashBps)` of their inbound delegation pools; the
-    ///      delegated damage the cap absorbed spills onto the approver's
-    ///      remaining own stake (first-loss bond — see `_slashOne`). The
-    ///      delegated slash is O(1): a single write to `poolTokens` dilutes
-    ///      every delegator in that pool pro-rata via the ERC-4626 share model
-    ///      — no per-delegator loop. The aggregate total-stake checkpoint is
-    ///      pushed once after the loop; the slashed WOOD is burned in a single
-    ///      transfer.
+    ///      guardian stake, sized by the raw own-stake checkpoint at
+    ///      `openedAt` and clamped to live stake (see `_slashOne`). The
+    ///      aggregate total-stake checkpoint is pushed once after the loop;
+    ///      the slashed WOOD is burned in a single transfer.
     /// @param reviewKey  Composite review key keccak256(abi.encode(governor, proposalId)).
     /// @param openedAt   The review's open timestamp. `_slashOne` reads the
-    ///                   approver's raw own-stake checkpoint and
-    ///                   `getPastDelegatedInbound(approver, openedAt)` at this
-    ///                   instant, so the own and delegated legs are sized off
-    ///                   disjoint at-open snapshots (Sherlock run #3 #6: no
-    ///                   double-slash of the delegated contribution).
+    ///                   approver's raw own-stake checkpoint at this instant.
     /// @param approvers  The approver addresses to slash.
     /// @param slashBps   Slash fraction in basis points out of `10_000`.
     /// @return total     Total WOOD burned across all approvers.
@@ -1242,13 +1274,11 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
 
     /// @notice Verdict-driven slash whose proceeds fund victim compensation
     ///         instead of burning (spec §3.8 + §4 authorized-slasher entrypoint).
-    /// @dev Reuses the SAME per-approver legs as the review path (`_slashOne`:
-    ///      own stake at `slashBps`, delegated pools at
-    ///      `min(slashBps, maxDelegatedSlashBps)`, uncovered remainder spilling
-    ///      onto own stake as first loss) — only the SINK differs. Proceeds are
-    ///      approved to the escrow and booked as a compensation case pinned to
-    ///      `snapshotTimestamp`, so pre-drain holders redeem them (§3.8) instead
-    ///      of the WOOD burning.
+    /// @dev Reuses the SAME per-approver own-stake leg as the review path
+    ///      (`_slashOne`) — only the SINK differs. Proceeds are approved to
+    ///      the escrow and booked as a compensation case pinned to
+    ///      `snapshotTimestamp`, so pre-drain holders redeem them (§3.8)
+    ///      instead of the WOOD burning.
     /// @dev SEVERITY ENVELOPE. Every element of `slashBpsPer` is clamped to
     ///      `[minSlashBps, maxSlashBps]` here, so the verdict path enforces the
     ///      SAME envelope as the review path — where `GuardianRegistry`'s
@@ -1303,8 +1333,8 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     ///      multisig).
     ///
     /// @param caseKey  Composite verdict key; feeds the `GuardianSlashed` topic.
-    /// @param openedAt The verdict's open timestamp — the at-open anchor the own
-    ///        and delegated legs are sized against (see `_slashOne`), and the
+    /// @param openedAt The verdict's open timestamp — the at-open anchor the
+    ///        own-stake leg is sized against (see `_slashOne`), and the
     ///        latest snapshot the case may be pinned to.
     /// @param approvers The approver addresses to slash.
     /// @param slashBpsPer Per-approver slash fractions in bps, positionally
@@ -1323,7 +1353,26 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     ///        against. Chosen by the CALLER within the bound above (§3.8): the
     ///        block before the drain proposal executed for predicates 1-4, the
     ///        epoch-N opening checkpoint for a per-epoch drawdown conviction.
-    /// @return total  Total WOOD routed to the escrow across all approvers.
+    /// @param bountyTo  Recipient of the conviction bounty (spec 2026-07-29
+    ///        §2), or `address(0)` to disable it. Never storage — the caller
+    ///        (`ChallengeGame`) decides per settle whether this path pays at
+    ///        all, so sWOOD gains no state variable for it and this stays a
+    ///        plain UUPS upgrade.
+    /// @param bountyBps Slice of the recovered total paid to `bountyTo`, in
+    ///        bps. `0` disables the bounty even with a non-zero `bountyTo`.
+    ///        Rejected outside `[0, MAX_CONVICTION_BOUNTY_BPS]` (reverts, not
+    ///        silently clamped down) — NOT trusted from the caller, for the
+    ///        same motivation sWOOD re-checks `slashBpsPer` rather than
+    ///        trusting `ExposureLedger`'s bound: `ChallengeGame`
+    ///        pins its own rate to this range at filing, but sWOOD is the
+    ///        contract that actually moves the WOOD, so it enforces its own
+    ///        ceiling rather than relying on the caller's. Anything above
+    ///        `MAX_CONVICTION_BOUNTY_BPS` (in particular any value `>= 10_000`,
+    ///        which would otherwise be able to route the ENTIRE slash to
+    ///        `bountyTo`) reverts `InvalidParameter`.
+    /// @return total  Total WOOD routed to the escrow across all approvers,
+    ///         NET of the conviction bounty. Also what `VerdictSlashRouted` and
+    ///         `VerdictSlashUncompensated` report as `total` — both are NET.
     /// @return caseId The escrow case funded, or 0 when nothing was recovered.
     function slashToEscrow(
         bytes32 caseKey,
@@ -1331,7 +1380,9 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
         address[] calldata approvers,
         uint256[] calldata slashBpsPer,
         address vault,
-        uint256 snapshotTimestamp
+        uint256 snapshotTimestamp,
+        address bountyTo,
+        uint256 bountyBps
     ) external onlyAuthorizedSlasher returns (uint256 total, uint256 caseId) {
         address escrow = compensationEscrow;
         if (escrow == address(0)) revert CompensationEscrowNotSet();
@@ -1340,6 +1391,35 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
         // Positional alignment is the only thing tying a guardian to their rate,
         // so a mismatch is a caller bug, not something to absorb.
         if (slashBpsPer.length != approvers.length) revert SlashBpsLengthMismatch();
+        // BOUNTY RATE IS NOT TRUSTED FROM THE CALLER (2026-07-29 review). Same
+        // motivation as re-checking `slashBpsPer` below against `[minSlashBps,
+        // maxSlashBps]` instead of trusting `ExposureLedger`: `ChallengeGame`
+        // pins `convictionBountyBps` to `[0, 2_000]` at filing, but that bound
+        // lives in the CALLER. The mechanism differs — `slashBpsPer` is
+        // silently clamped, this reverts — because a bad payout ADDRESS
+        // should never be laundered into a smaller-but-still-caller-chosen
+        // one. Left unchecked here, a compromised or buggy `authorizedSlasher`
+        // could pass `bountyBps` up to just under 10_000 and route almost the
+        // entire slash to a `bountyTo` of its own choosing — the exact one-
+        // address-of-its-own-choosing outcome `compensationEscrow`'s natspec
+        // says sWOOD does not allow. Enforcing the ceiling here,
+        // unconditionally (even when `bountyTo == address(0)` and the rate
+        // would never be spent), keeps that guarantee true regardless of what
+        // the caller does. PER CALL, NOT PER GUARDIAN: `_verdictSlashed` keys
+        // on a caller-chosen `caseKey`, so this bounds one call's diversion,
+        // not what repeated verdicts under fresh case keys can compound to.
+        if (bountyBps > MAX_CONVICTION_BOUNTY_BPS) revert InvalidParameter();
+        // FACTORY MEMBERSHIP (PR #24 round-4 N-4). The escrow apportions against
+        // `vault`'s ERC20Votes checkpoints, and the F-A analysis of
+        // `EmptySnapshot` holds only for OZ semantics — a nonstandard
+        // `getPastTotalSupply` is the one escape hatch it names. Asserting the
+        // vault is factory-deployed converts that scoping sentence from prose
+        // about the slasher into code here. Unconditional: `factory` is required
+        // non-zero at `initialize`, so there is no unwired window to fail open
+        // for.
+        if (IFactoryGovernorLookup(factory).governorOf(vault) == address(0)) {
+            revert VaultNotFactoryDeployed();
+        }
 
         // Namespace the verdict key before it feeds the shared `GuardianSlashed`
         // topic: a raw caller-chosen `caseKey` could be crafted to collide with
@@ -1409,6 +1489,26 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
         }
         // Nothing recovered: no case to open (the escrow rejects zero proceeds).
         if (total == 0) return (0, 0);
+
+        // THE BOUNTY COMES OFF THE TOP, BEFORE THE ESCROW SEES THE MONEY
+        // (spec 2026-07-29 §2). Paying the prosecutor out of what the
+        // prosecution recovered is what makes filing rational: a correct but
+        // unanswered challenge otherwise LOSES `settleBurnBps` of its bond, so
+        // nobody outside the drained vault has a reason to watch. Deducting
+        // here rather than inside the escrow keeps `proceeds` honest - the
+        // number a claimant redeems against is the number actually present -
+        // and keeps a non-victim payout out of the contract whose only job is
+        // victim compensation.
+        uint256 bounty;
+        if (bountyTo != address(0) && bountyBps != 0) {
+            bounty = total * bountyBps / 10_000;
+            if (bounty != 0) {
+                total -= bounty;
+                wood.safeTransfer(bountyTo, bounty);
+                emit ConvictionBountyPaid(caseKey, bountyTo, bounty);
+            }
+        }
+
         _totalStakeCheckpoint.push(uint32(block.timestamp), uint224(totalGuardianStake));
         // Effects are complete; hand the proceeds over and open the case.
         // `forceApprove` tolerates non-standard tokens that reject a non-zero
@@ -1449,6 +1549,20 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
                 }
             }
             IERC20(wood).forceApprove(escrow, 0);
+            // `total` here is already NET of the bounty: it left in the branch
+            // above, before this fallback could ever run. Burning the gross
+            // would double-count it — the bounty recipient keeps its cut
+            // either way, so only what was actually destined for the escrow
+            // burns.
+            //
+            // THE BOUNTY IS DELIBERATELY NOT CLAWED BACK HERE (spec 2026-07-29
+            // §2 decision). On this path `openCase` never ran, so depositors
+            // recover 0% of `total` EITHER WAY — paying the bounty first does
+            // not take anything away from them, because there was never a
+            // funded case to divide. The bounty comes out of what would
+            // otherwise simply burn, not out of anyone's recovery, so the
+            // prosecutor still gets paid even when the vault turns out to be
+            // unpriceable.
             _burnWood(total);
             caseId = 0;
             emit VerdictSlashUncompensated(caseKey, vault, total);
@@ -1534,14 +1648,13 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     }
 
     /// @dev Per-approver slash. Extracted to keep `slashGuardians`'s stack
-    ///      frame shallow. Returns the WOOD slashed from `approver`
-    ///      (own + delegated). Three legs (spec 2026-07-19 Part A):
-    ///        1. Own base slash at `slashBps`, sized by the raw own-stake
-    ///           checkpoint at `openedAt`, clamped to live stake.
-    ///        2. Delegated legs (live + unbonding pools) at
-    ///           `min(slashBps, maxDelegatedSlashBps)`.
-    ///        3. First-loss spill: the delegated damage the cap absorbed is
-    ///           charged to the approver's remaining own stake (clamped).
+    ///      frame shallow. Returns the WOOD slashed from `approver` — a single
+    ///      leg since the DPoS-delegation removal: `slashBps` of the OWN stake,
+    ///      sized by the raw own-stake checkpoint at `openedAt` and clamped to
+    ///      live stake (a concurrent slash may have already reduced live stake
+    ///      below the at-open checkpoint — PR #359 review #8). Age discounts
+    ///      VOTING POWER, not liability: the capital at risk is the staked
+    ///      amount (spec 2026-07-19 §5).
     ///      `reviewKey` only feeds the `GuardianSlashed` event topic.
     function _slashOne(bytes32 reviewKey, uint256 openedAt, address approver, uint256 slashBps)
         private
@@ -1549,111 +1662,27 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
     {
         Guardian storage g = _guardians[approver];
         uint256 live = g.stakedAmount;
-        // Sherlock #39 / Run-1 #22: snapshot pre-slash active state + pool
-        // so the active-delegated adjustment can pick the right delta
-        // after own-stake and pool writes mutate the relevant fields.
-        bool wasActive = live > 0 && g.unstakeRequestedAt == 0;
-        uint256 oldPool = poolTokens[approver];
-
-        // Own-slash basis: the RAW own-stake checkpoint at `openedAt`, read
-        // directly. Age discounts VOTING POWER, not liability — the capital
-        // at risk is the staked amount (spec 2026-07-19 §5). Replaces the
-        // old voteStake-minus-delegated derivation (Sherlock run #3 #6),
-        // which broke once vote snapshots became aged + k-capped: the own
-        // and delegated legs are now sized off disjoint at-open reads, so
-        // the #6 double-slash stays structurally impossible. Clamp to live:
-        // a concurrent slash may have already reduced live stake below the
-        // at-open checkpoint (PR #359 review #8: `Math.min` over a ternary).
-        uint256 snapOwnRaw = _stakeCheckpoints[approver].upperLookupRecent(uint32(openedAt));
-        uint256 snapDelegated = getPastDelegatedInbound(approver, openedAt);
+        // LIABILITY, NOT VOTABILITY (PR #25 review 🔴F1b). Reads the liability
+        // trace, which `requestUnstakeGuardian` does not zero, so an approver
+        // cannot pre-position an exit before the drain it voted for and make its
+        // own conviction recover nothing. Maxed with the votable trace so the
+        // read degrades to the pre-fix basis over history written before the
+        // liability trace existed.
+        uint256 snapOwnRaw = Math.max(
+            _liabilityCheckpoints[approver].upperLookupRecent(uint32(openedAt)),
+            _stakeCheckpoints[approver].upperLookupRecent(uint32(openedAt))
+        );
         uint256 ownSlash = Math.mulDiv(Math.min(snapOwnRaw, live), slashBps, 10_000);
 
-        // Delegated legs capped at C = maxDelegatedSlashBps (spec Part A):
-        // the pools never lose more than C bps per incident, whatever the
-        // voted severity. Budget mechanics unchanged from PR #351 #2 +
-        // PR #359 review #2/#4: bound the TOTAL delegated slash (live pool +
-        // unbonding pool) at the OPENED-AT exposure `snapDelegated`. The
-        // at-open delegated capital is now spread across both pools — a
-        // pre-open delegator who `requestUnstake`d after open sits in the
-        // unbonding pool; a post-open joiner sits in the live pool. We
-        // compute one budget basis and spend it live-pool-first, spilling
-        // the remainder to the unbonding pool (`unbondBasis`, below). This:
-        //   - keeps the pre-open-unbonded delegator slashed (I-1 evasion stays
-        //     closed: budget flows to the unbonding pool once the live pool is
-        //     exhausted), and
-        //   - bounds the post-open joiner's exposure to the at-open budget
-        //     instead of the prior full-unbonding-pool over-slash (the
-        //     asymmetry PR #359 review #2 flagged: the live cap existed but the
-        //     unbonding burn did not).
-        //
-        // LIMIT (PR #359 review #4): this bounds total slash MAGNITUDE; it does
-        // NOT achieve per-delegator isolation. Burning `poolTokens` /
-        // `unbondingPoolTokens` dilutes every current shareholder of that pool
-        // pro-rata by share count, so a post-open joiner is still diluted (at
-        // reduced magnitude) and a pre-open delegator can be under-slashed.
-        // Per-delegator isolation is unachievable under the O(1) share-factor
-        // (Cosmos validator-shares) model without per-delegator loops.
-        //
-        // Backward-compat (mirrors Run-3 #6): `snapDelegated == 0` is an
-        // uninformative snapshot — no `openedAt` passed (tests / pre-snapshot
-        // proposals) OR genuinely no delegations at open. Fall back to slashing
-        // the full live pool AND the full unbonding pool, at the capped rate.
-        //
-        // The SPILL basis is 0 in this branch, NOT `oldPool + unbondPool`.
-        // The spill charges the guardian's OWN bond for delegated damage the
-        // cap absorbed, sized on AT-OPEN exposure. With `snapDelegated == 0`
-        // there was no at-open exposure, so the design-doc formula
-        // `excess = snapDelegated × (S − min(S,C)) / 10_000` is 0. Sizing the
-        // spill off the current pools instead would let a third party inflate
-        // an about-to-be-slashed approver's own-bond loss by delegating to
-        // them AFTER review-open (`delegateStake` is permissionless), paying
-        // only the capped pool loss themselves. The delegators' pools are
-        // still slashed below (their capital); the bond simply owes no spill.
-        uint256 poolBps = Math.min(slashBps, maxDelegatedSlashBps);
-        uint256 unbondPool = unbondingPoolTokens[approver];
-        uint256 delSlashBasis;
-        uint256 unbondBasis;
-        uint256 spillBasis;
-        if (snapDelegated == 0) {
-            delSlashBasis = oldPool;
-            unbondBasis = unbondPool;
-            spillBasis = 0;
-        } else {
-            delSlashBasis = Math.min(snapDelegated, oldPool);
-            // Remaining budget after the live pool spills to the unbonding pool.
-            unbondBasis = Math.min(snapDelegated - delSlashBasis, unbondPool);
-            spillBasis = snapDelegated;
-        }
-        uint256 delSlash = Math.mulDiv(delSlashBasis, poolBps, 10_000);
-        uint256 unbondSlash = Math.mulDiv(unbondBasis, poolBps, 10_000);
-
-        // First-loss spill (spec Part A): the delegated damage the cap
-        // absorbed is charged to the approver's remaining own stake — the
-        // guardian bond backs the delegated book (Rocket Pool pattern: the
-        // operator bond absorbs losses before the pooled stakers). Also
-        // closes the LIP-10 self-delegation shield: a sybil routing their own
-        // stake through delegation eats the shielded excess out of their own
-        // bond until it is wiped. Deliberate: the spill is sized on the
-        // AT-OPEN exposure (`spillBasis`), NOT on what the pools actually
-        // paid (`delSlashBasis + unbondBasis`) — liability is the exposure
-        // that backed the vote, even if pool churn since open means the
-        // pools themselves cover less.
-        uint256 spill = Math.mulDiv(spillBasis, slashBps - poolBps, 10_000);
-        uint256 ownRemaining = live - ownSlash;
-        if (spill > ownRemaining) spill = ownRemaining;
-        uint256 ownDebit = ownSlash + spill;
-
-        if (ownDebit != 0) {
+        if (ownSlash != 0) {
             // forge-lint: disable-next-line(unchecked-cast)
-            // Safe-by-construction: `ownDebit <= live` (both terms clamped:
-            // `ownSlash <= live` and `spill <= live - ownSlash`), and `live`
-            // originates from the `uint128 stakedAmount` field, so the
-            // difference fits a `uint128`.
-            g.stakedAmount = uint128(live - ownDebit);
+            // Safe-by-construction: `ownSlash <= live`, and `live` originates
+            // from the `uint128 stakedAmount` field, so the difference fits.
+            g.stakedAmount = uint128(live - ownSlash);
             if (g.unstakeRequestedAt == 0) {
                 // Still active: their stake counts toward the aggregate, so
                 // decrement it and re-checkpoint the post-slash votable stake.
-                totalGuardianStake -= ownDebit;
+                totalGuardianStake -= ownSlash;
                 _stakeCheckpoints[approver].push(uint32(block.timestamp), uint224(g.stakedAmount));
             } else if (g.stakedAmount == 0) {
                 // Unstake-requested: `totalGuardianStake` was already
@@ -1662,45 +1691,18 @@ contract StakedWood is StakedWoodDelegation, OwnableUpgradeable, UUPSUpgradeable
                 // ghost guardian with no stake.
                 g.unstakeRequestedAt = 0;
             }
+            // Liability tracks what is recoverable regardless of votability, so
+            // it re-checkpoints on BOTH branches — an unstake-requested guardian
+            // that is partially slashed must not stay on the hook for the
+            // pre-slash amount when the next verdict lands.
+            _liabilityCheckpoints[approver].push(uint32(block.timestamp), uint224(g.stakedAmount));
         }
-        if (delSlash != 0) {
-            poolTokens[approver] -= delSlash;
-            totalDelegatedStake -= delSlash;
-            _pushDelegationCheckpoints(address(0), approver); // re-checkpoint pool aggregates
-        }
-        // Sherlock #39 / Run-1 #22: active-delegated adjustment based on
-        // the (wasActive, nowActive) transition. Inactive → inactive is a
-        // no-op (pool was already excluded). Active → active: drop by the
-        // pool slash. Active → inactive: drop by the FULL pre-slash pool
-        // (everything that was counting now stops counting). Inactive →
-        // active cannot happen from a slash (slash only reduces).
-        if (wasActive) {
-            bool nowActive = g.stakedAmount > 0 && g.unstakeRequestedAt == 0;
-            if (nowActive) {
-                if (delSlash != 0) _writeActiveDelegated(totalActiveDelegatedStake - delSlash);
-            } else if (oldPool != 0) {
-                _writeActiveDelegated(totalActiveDelegatedStake - oldPool);
-            }
-        }
-        // I-1: unbonding-escrow slash, sized by `unbondBasis` — the delegated
-        // budget left after the live pool (PR #359 review #2) — at the capped
-        // rate. ONE write dilutes every unbonding delegator pro-rata. The
-        // unbonding pool is not vote-weighted / not in `totalDelegatedStake`,
-        // so no checkpoint and no `totalDelegatedStake` decrement here.
-        // `unbondBasis <= unbondingPoolTokens` by construction, so the
-        // subtraction can't underflow.
-        if (unbondSlash != 0) {
-            unbondingPoolTokens[approver] -= unbondSlash;
-        }
-        amt = ownDebit + delSlash + unbondSlash;
+        amt = ownSlash;
         // Emit only when something was actually slashed — an approver with no
-        // own stake and no delegated/unbonding pool produces no on-chain
-        // record. `ownSlash` in the event reports base + spill (the total
-        // own-stake hit); `delegatedSlash` reports the COMBINED delegated
-        // slash (live pool + unbonding-escrow pool) so indexers and the
-        // appeal flow see the full delegated hit.
+        // own stake produces no on-chain record. `delegatedSlash` is always 0
+        // post delegation-removal; the parameter stays for ABI compatibility.
         if (amt != 0) {
-            emit GuardianSlashed(reviewKey, approver, ownDebit, delSlash + unbondSlash);
+            emit GuardianSlashed(reviewKey, approver, ownSlash, 0);
         }
     }
 

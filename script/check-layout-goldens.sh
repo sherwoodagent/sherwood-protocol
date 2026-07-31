@@ -190,10 +190,14 @@ check_contract() {
 
 check_contract SyndicateGovernor script/syndicate-governor-layout.golden.json
 check_contract SyndicateFactory script/syndicate-factory-layout.golden.json
-# GuardianRegistry is UUPS and live: Plan B carved `exposureLedger` out of the
-# front of its __gap (50 -> 49), which is exactly the class of change this guard
-# exists to police. Pinned here so the next append is checked automatically
-# rather than by hand.
+# GuardianRegistry and StakedWood are UUPS, deployed on TESTNETS ONLY
+# (46630 / 9994663 — both redeployable; chains/4663.json has neither, so there
+# is no mainnet lineage). Their goldens were FULLY RE-BASELINED by the
+# DPoS-delegation removal (2026-07-26): StakedWood lost its 22-slot delegation
+# base contract, and GuardianRegistry lost `totalDelegatedAtOpen` mid-struct in
+# `Review`/`EmergencyReview`. From the first MAINNET deploy onward these
+# layouts are frozen and every change must be append-only against these
+# goldens — which is exactly the class of change this guard exists to police.
 check_contract GuardianRegistry script/guardian-registry-layout.golden.json
 # StakedWood is UUPS and live, and custodies every WOOD bond in the protocol —
 # the highest-consequence layout on this branch (review N7). Plan B carved

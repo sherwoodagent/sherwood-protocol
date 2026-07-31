@@ -17,36 +17,54 @@ import {IStakedWood} from "../../src/interfaces/IStakedWood.sol";
 ///         Mirrors the shape of `MockRegistryMinimal`: defaults model an
 ///         "empty cohort" — `getPast*` returns 0, `isActiveGuardian` returns
 ///         false, totals are 0 — so governor unit tests that only touch the
-///         optimistic path keep their previous semantics. Tests that drive
-///         guardian-review slashing should use a real `StakedWood` proxy via
+///         optimistic path keep their previous semantics. The ONE deliberate
+///         exception is `getVotes` (present holdings, B4's gate) — see its
+///         own doc below for why, and why it still can't express a state the
+///         real `StakedWood` can't produce. Tests that drive guardian-review
+///         slashing should use a real `StakedWood` proxy via
 ///         `RegistryTestHarness`.
 contract MockStakedWood is IStakedWood {
     // ── Settable reads ──
     address public wood;
     mapping(address => uint256) internal _votes;
+    /// @dev Tracks whether `setVotes` was ever called for an account.
+    mapping(address => bool) internal _votesSet;
+    /// @dev Tracks whether `setPastVotes` was ever called for an account with
+    ///      a NON-ZERO value, at any timestamp — a zero-weight `setPastVotes`
+    ///      call is indistinguishable from never having been staked at all,
+    ///      so it does NOT set this flag. `getVotes` (present holdings)
+    ///      defaults to 1 — NOT 0 — for an account with real snapshot weight
+    ///      recorded somewhere but no explicit `setVotes` call, because the
+    ///      vast majority of existing fixtures set weight via `setPastVotes`
+    ///      alone and are modeling a voter who still holds, just without
+    ///      bothering to say so explicitly. An account with NEITHER a
+    ///      non-zero `setPastVotes` NOR a `setVotes` call defaults `getVotes`
+    ///      to 0, same as the rest of the "empty cohort" surface — this keeps
+    ///      the mock from expressing `getVotes == 1 && isActiveGuardian ==
+    ///      false` for an account nothing ever meaningfully configured, a
+    ///      combination the real `StakedWood` cannot produce (both reduce to
+    ///      `stakedAmount > 0 && unstakeRequestedAt == 0`). Only an explicit
+    ///      `setVotes(acct, 0)` after a non-zero `setPastVotes` models a
+    ///      fully-exited holder (the present-holdings gate, B4).
+    mapping(address => bool) internal _hasPastVotes;
     mapping(address => mapping(uint256 => uint256)) internal _pastVotes;
     mapping(uint256 => uint256) internal _pastTotalVotes;
     mapping(uint256 => uint256) internal _pastTotalSupply;
-    mapping(uint256 => uint256) internal _pastTotalDelegated;
-    mapping(uint256 => uint256) internal _pastTotalActiveDelegated;
-    mapping(address => mapping(uint256 => uint256)) internal _pastCommission;
-    mapping(address => mapping(address => mapping(uint256 => uint256))) internal _pastDelegation;
-    mapping(address => mapping(uint256 => uint256)) internal _pastDelegatedInbound;
     mapping(address => uint256) internal _requiredOwnerBond;
     mapping(address => uint256) internal _ownerStake;
     mapping(address => bool) internal _isActiveGuardian;
     uint256 public totalGuardianStake;
-    uint256 public totalDelegatedStake;
     mapping(address => uint256) internal _guardianStake;
-    mapping(address => mapping(address => uint256)) internal _delegationOf;
-    mapping(address => uint256) internal _delegatedInbound;
-    mapping(address => uint256) internal _commissionOf;
     mapping(address => uint256) internal _preparedStakeOf;
     mapping(address => bool) internal _canCreateVault;
     uint256 public flatRequiredOwnerBond;
     uint256 public minSlashBps;
     uint256 public maxSlashBps;
     uint256 public coolDownPeriod;
+    /// @dev Mirrors the real `StakedWood.MAX_CONVICTION_BOUNTY_BPS` value.
+    ///      `slashToEscrow` is not modeled by this mock (see below), so this
+    ///      exists only so `IStakedWood`-typed callers can read it.
+    uint256 public constant MAX_CONVICTION_BOUNTY_BPS = 2_000;
 
     // ── Recorded mutation args (for assertions) ──
     uint256 public slashGuardiansCallCount;
@@ -62,38 +80,43 @@ contract MockStakedWood is IStakedWood {
 
     function setVotes(address account, uint256 v) external {
         _votes[account] = v;
+        _votesSet[account] = true;
     }
 
     function setPastVotes(address guardian, uint256 timestamp, uint256 v) external {
         _pastVotes[guardian][timestamp] = v;
+        if (v != 0) _hasPastVotes[guardian] = true;
     }
 
     function setPastTotalVotes(uint256 timestamp, uint256 v) external {
         _pastTotalVotes[timestamp] = v;
     }
 
+    /// @dev RAW own stake — the quantity `getPastTotalVotes` is literally the sum
+    ///      of. DEFAULTS to the `getPastVotes` value so every existing fixture
+    ///      behaves exactly as before; set it only to open the gap between the
+    ///      two measures, which is the subject of review 🔴F17.
+    ///
+    ///      NOTE what this mock has always allowed: `setPastVotes` and
+    ///      `setPastTotalVotes` are independent, so a fixture can pick
+    ///      per-account weights that sum comfortably below the total — an
+    ///      invariant the REAL `StakedWood` does not provide, because delegation
+    ///      enters `getPastVotes` and never enters `getPastTotalVotes`. That is
+    ///      why the suite stayed green over a floor that can reach zero.
+    mapping(address => mapping(uint256 => uint256)) internal _pastStake;
+    mapping(address => mapping(uint256 => bool)) internal _pastStakeSet;
+
+    function setPastStake(address guardian, uint256 timestamp, uint256 v) external {
+        _pastStake[guardian][timestamp] = v;
+        _pastStakeSet[guardian][timestamp] = true;
+    }
+
+    function getPastStake(address guardian, uint256 timestamp) external view returns (uint256) {
+        return _pastStakeSet[guardian][timestamp] ? _pastStake[guardian][timestamp] : _pastVotes[guardian][timestamp];
+    }
+
     function setPastTotalSupply(uint256 timestamp, uint256 v) external {
         _pastTotalSupply[timestamp] = v;
-    }
-
-    function setPastTotalDelegated(uint256 timestamp, uint256 v) external {
-        _pastTotalDelegated[timestamp] = v;
-    }
-
-    function setPastTotalActiveDelegated(uint256 timestamp, uint256 v) external {
-        _pastTotalActiveDelegated[timestamp] = v;
-    }
-
-    function setPastCommission(address delegate, uint256 timestamp, uint256 v) external {
-        _pastCommission[delegate][timestamp] = v;
-    }
-
-    function setPastDelegation(address delegator, address delegate, uint256 timestamp, uint256 v) external {
-        _pastDelegation[delegator][delegate][timestamp] = v;
-    }
-
-    function setPastDelegatedInbound(address delegate, uint256 timestamp, uint256 v) external {
-        _pastDelegatedInbound[delegate][timestamp] = v;
     }
 
     function setRequiredOwnerBond(address vault, uint256 v) external {
@@ -116,24 +139,8 @@ contract MockStakedWood is IStakedWood {
         totalGuardianStake = v;
     }
 
-    function setTotalDelegatedStake(uint256 v) external {
-        totalDelegatedStake = v;
-    }
-
     function setGuardianStake(address guardian, uint256 v) external {
         _guardianStake[guardian] = v;
-    }
-
-    function setDelegationOf(address delegator, address delegate, uint256 v) external {
-        _delegationOf[delegator][delegate] = v;
-    }
-
-    function setDelegatedInbound(address delegate, uint256 v) external {
-        _delegatedInbound[delegate] = v;
-    }
-
-    function setCommissionOf(address delegate, uint256 v) external {
-        _commissionOf[delegate] = v;
     }
 
     function setPreparedStakeOf(address owner, uint256 v) external {
@@ -151,7 +158,8 @@ contract MockStakedWood is IStakedWood {
 
     // ── Checkpoint reads ──
     function getVotes(address account) external view returns (uint256) {
-        return _votes[account];
+        if (_votesSet[account]) return _votes[account];
+        return _hasPastVotes[account] ? 1 : 0;
     }
 
     function getPastVotes(address guardian, uint256 timestamp) external view returns (uint256) {
@@ -164,26 +172,6 @@ contract MockStakedWood is IStakedWood {
 
     function getPastTotalSupply(uint256 timestamp) external view returns (uint256) {
         return _pastTotalSupply[timestamp];
-    }
-
-    function getPastTotalDelegated(uint256 timestamp) external view returns (uint256) {
-        return _pastTotalDelegated[timestamp];
-    }
-
-    function getPastTotalActiveDelegated(uint256 timestamp) external view returns (uint256) {
-        return _pastTotalActiveDelegated[timestamp];
-    }
-
-    function getPastCommission(address delegate, uint256 timestamp) external view returns (uint256) {
-        return _pastCommission[delegate][timestamp];
-    }
-
-    function getPastDelegation(address delegator, address delegate, uint256 timestamp) external view returns (uint256) {
-        return _pastDelegation[delegator][delegate][timestamp];
-    }
-
-    function getPastDelegatedInbound(address delegate, uint256 timestamp) external view returns (uint256) {
-        return _pastDelegatedInbound[delegate][timestamp];
     }
 
     // ── Live reads ──
@@ -204,18 +192,6 @@ contract MockStakedWood is IStakedWood {
         return _ownerStake[vault];
     }
 
-    function delegationOf(address delegator, address delegate) external view returns (uint256) {
-        return _delegationOf[delegator][delegate];
-    }
-
-    function delegatedInbound(address delegate) external view returns (uint256) {
-        return _delegatedInbound[delegate];
-    }
-
-    function commissionOf(address delegate) external view returns (uint256) {
-        return _commissionOf[delegate];
-    }
-
     function preparedStakeOf(address owner) external view returns (uint256) {
         return _preparedStakeOf[owner];
     }
@@ -225,9 +201,8 @@ contract MockStakedWood is IStakedWood {
     }
 
     // ── Registry-only mutations (no-op stubs that record args) ──
-    // Sherlock run #3 #6: signature carries `openedAt` — sWOOD sizes the own
-    // and delegated slash legs off disjoint at-open snapshots (raw own-stake
-    // checkpoint + `getPastDelegatedInbound`). Mock ignores it.
+    // Sherlock run #3 #6: signature carries `openedAt` — sWOOD sizes the slash
+    // off the raw own-stake checkpoint at open. Mock ignores it.
     function slashGuardians(
         bytes32 reviewKey,
         uint256,
@@ -253,7 +228,7 @@ contract MockStakedWood is IStakedWood {
 
     // Verdict slash path (spec §4). Not modeled: the escrow hand-off needs a
     // real WOOD balance, so `StakedWoodSlashToEscrow.t.sol` drives a real proxy.
-    function slashToEscrow(bytes32, uint256, address[] calldata, uint256[] calldata, address, uint256)
+    function slashToEscrow(bytes32, uint256, address[] calldata, uint256[] calldata, address, uint256, address, uint256)
         external
         pure
         returns (uint256, uint256)
@@ -323,26 +298,6 @@ contract MockStakedWood is IStakedWood {
         revert("MockStakedWood: transferOwnerStakeSlot not modeled");
     }
 
-    function delegateStake(address, uint256) external pure {
-        revert("MockStakedWood: delegateStake not modeled");
-    }
-
-    function requestUnstakeDelegation(address) external pure {
-        revert("MockStakedWood: requestUnstakeDelegation not modeled");
-    }
-
-    function cancelUnstakeDelegation(address) external pure {
-        revert("MockStakedWood: cancelUnstakeDelegation not modeled");
-    }
-
-    function claimUnstakeDelegation(address) external pure {
-        revert("MockStakedWood: claimUnstakeDelegation not modeled");
-    }
-
-    function setCommission(uint256) external pure {
-        revert("MockStakedWood: setCommission not modeled");
-    }
-
     function setMinGuardianStake(uint256) external pure {
         revert("MockStakedWood: setMinGuardianStake not modeled");
     }
@@ -353,10 +308,6 @@ contract MockStakedWood is IStakedWood {
 
     function setCooldownPeriod(uint256) external pure {
         revert("MockStakedWood: setCooldownPeriod not modeled");
-    }
-
-    function setDelegationEnabled(bool) external pure {
-        revert("MockStakedWood: setDelegationEnabled not modeled");
     }
 
     function setMinSlashBps(uint256) external pure {

@@ -218,26 +218,20 @@
         "type": "t_uint64"
       },
       {
-        "label": "totalDelegatedAtOpen",
-        "slot": "3",
-        "offset": 0,
-        "type": "t_uint128"
-      },
-      {
         "label": "cohortTooSmall",
-        "slot": "3",
-        "offset": 16,
+        "slot": "2",
+        "offset": 27,
         "type": "t_bool"
       },
       {
         "label": "blockQuorumBpsAtOpen",
-        "slot": "3",
-        "offset": 17,
+        "slot": "2",
+        "offset": 28,
         "type": "t_uint16"
       },
       {
         "label": "governor",
-        "slot": "4",
+        "slot": "3",
         "offset": 0,
         "type": "t_address"
       }
@@ -292,27 +286,21 @@
         "type": "t_uint64"
       },
       {
-        "label": "totalDelegatedAtOpen",
-        "slot": "2",
-        "offset": 8,
-        "type": "t_uint128"
-      },
-      {
         "label": "blockQuorumBpsAtOpen",
         "slot": "2",
-        "offset": 24,
+        "offset": 8,
         "type": "t_uint16"
       },
       {
         "label": "voteEnd",
-        "slot": "3",
-        "offset": 0,
+        "slot": "2",
+        "offset": 10,
         "type": "t_uint64"
       },
       {
         "label": "reviewEnd",
-        "slot": "3",
-        "offset": 8,
+        "slot": "2",
+        "offset": 18,
         "type": "t_uint64"
       }
     ],

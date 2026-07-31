@@ -152,7 +152,6 @@ Baked in by the deploy (constructor immutables + init args) — matching mainnet
 | `minGuardianStake` / `minOwnerStake` | 10,000 WOOD each | sWOOD init |
 | `coolDownPeriod` | 7 days | sWOOD init |
 | `minSlashBps` / `maxSlashBps` | 10% / 100% | sWOOD init |
-| `maxDelegatedSlashBps` | 20% | sWOOD init |
 | protocol fee / mgmt fee | 1% / 0.5% | ProtocolConfig / factory |
 
 Unlike the 46630 testnet (which upgrades the governor to 600s floors), the fork
@@ -239,8 +238,8 @@ must exceed **`MIN_COHORT_STAKE_AT_OPEN` = 50,000 WOOD**.
    - Vote-change is allowed until the final 10% of the window (late-vote lockout).
    - Approvers capped at 100/proposal; blockers uncapped.
 4. **Slash severity** = stake-weighted median of blockers' proposed `slashBps`,
-   clamped to sWOOD's `[minSlashBps, maxSlashBps]` (10–100% own stake, ≤20%
-   delegated).
+   clamped to sWOOD's `[minSlashBps, maxSlashBps]` (10–100% own stake; DPoS
+   delegation removed/postponed 2026-07-26 — the own bond is the only leg).
 5. **Owner bond** — `emergencySettleWithCalls` re-checks
    `requiredOwnerBond = max(minOwnerStake, TVL·ownerStakeTvlBps/1e4)` at call time
    (`ownerStakeTvlBps = 0` in V1 → flat 10k floor).
