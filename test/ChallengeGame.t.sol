@@ -1261,10 +1261,15 @@ contract ChallengeGameTest is Test {
         uint256 id = _fileStandard(PROPOSAL);
         vm.warp(_filedAt(id) + game.autoSlashDelay());
 
-        // Two approvers -> floor = 2 * 300k + 1M = 1.6M. 1.5M covers all the
-        // pre-floor work comfortably but cannot satisfy the floor itself.
+        // Two approvers -> floor = 2 * SLASH_GAS_PER_APPROVER + SLASH_GAS_BASE.
+        // Starve the call to just under it: ample for all the pre-floor work,
+        // never enough for the floor itself. Derived from the LIVE constants
+        // rather than hardcoded, so re-sizing the floor (PR #56 H2 did, from
+        // 300k/1M to 180k/2M) cannot quietly turn this into an out-of-gas test
+        // that passes for the wrong reason.
+        uint256 starved = 2 * game.SLASH_GAS_PER_APPROVER() + game.SLASH_GAS_BASE() - 100_000;
         bytes memory callData = abi.encodeWithSelector(game.resolve.selector, id);
-        (bool ok, bytes memory ret) = address(game).call{gas: 1_500_000}(callData);
+        (bool ok, bytes memory ret) = address(game).call{gas: starved}(callData);
         assertFalse(ok, "a gas-starved resolve must not settle");
         assertEq(bytes4(ret), IChallengeGame.InsufficientSlashGas.selector, "refused at the floor, not an OOG");
         assertEq(swood.callCount(), 0, "the slasher was never reached");
