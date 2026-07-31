@@ -134,7 +134,10 @@ contract DeployPlanB is Script {
             "ExposureLedger default challengeWindow changed - update EXPECTED_CHALLENGE_WINDOW"
         );
 
-        ProposerBondEscrow escrow = new ProposerBondEscrow(wood, registry);
+        // The ledger third: the escrow reads `coverageFreezer()` off it to
+        // decide who may forfeit a bond, so it must be deployed first (it is,
+        // just above) and the pointer is immutable.
+        ProposerBondEscrow escrow = new ProposerBondEscrow(wood, registry, address(ledger));
 
         ledger.setWoodUsdPrice(woodPriceX8);
         // maxDelay is LOAD-BEARING, not cosmetic: the §3.3a approve quorum

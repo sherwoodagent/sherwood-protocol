@@ -161,6 +161,23 @@ interface IChallengeGame {
         ///      position for anything decoding `challengeOf()` positionally.
         ///      Appending after it costs nothing but the grouping.
         uint256 inconclusiveBurnBpsAtFiling;
+        /// @dev The escrow holding this proposal's PROPOSER bond, pinned at
+        ///      filing from `StrategyProposal.proposerBondEscrow` — the same
+        ///      binding `SyndicateGovernor.reclaimProposerBond` releases
+        ///      against. `_settle` confiscates it there on a conviction.
+        ///
+        ///      PINNED, NOT RE-READ, for the reason 🟡F10 gives for `vault` and
+        ///      `executedAt`: a verdict can land a full `disputeTimeout` after
+        ///      the filing, and nothing about it should be movable in between
+        ///      by a governor upgrade or a re-pointed escrow slot. Zero when the
+        ///      proposal locked no bond (no ledger wired at propose, or
+        ///      `proposerBondBps` set to zero), which the settle path treats as
+        ///      "nothing to forfeit" rather than as an error.
+        ///
+        ///      TRUE APPEND, same discipline as `inconclusiveBurnBpsAtFiling`
+        ///      above: anything decoding `challengeOf()` positionally keeps
+        ///      every existing tuple index.
+        address proposerBondEscrow;
     }
 
     // ── Errors ──
@@ -320,6 +337,27 @@ interface IChallengeGame {
     ///      🟠F11); this event is how the miss becomes visible rather than
     ///      silent, and the registry owner's own `demote` is the remedy.
     event AdapterDemotionFailed(uint256 indexed challengeId, address indexed target, bytes4 indexed selector);
+
+    /// @notice A conviction confiscated the convicted proposal's proposer bond.
+    ///         `amount` left the system at the escrow's burn address; `proposer`
+    ///         is who lost it.
+    event ProposerBondForfeited(
+        uint256 indexed challengeId,
+        address indexed governor,
+        uint256 indexed proposalId,
+        address proposer,
+        uint256 amount
+    );
+
+    /// @notice A conviction could NOT confiscate the proposer bond — already
+    ///         reclaimed, already forfeited by a concurrent challenge, or an
+    ///         escrow that refused the call. Surfaced rather than reverted for
+    ///         the same reason `AdapterDemotionFailed` is: a terminal path must
+    ///         not be hostage to a call that can fail, or the slash never lands
+    ///         and the coverage never unfreezes.
+    event ProposerBondForfeitureFailed(
+        uint256 indexed challengeId, address indexed governor, uint256 indexed proposalId, address escrow
+    );
     /// @param forfeitedWood What the CHALLENGER lost — its whole bond on the
     ///        normal failure path, and zero on the defensive no-contributor
     ///        branch where the bond is handed back instead.

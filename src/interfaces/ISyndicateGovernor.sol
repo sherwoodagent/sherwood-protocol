@@ -238,6 +238,21 @@ interface ISyndicateGovernor {
     ///         bond, or whose bond was already reclaimed (the reclaim zeroes
     ///         the stored amount, so a second call lands here — idempotence).
     error NoBondToReclaim();
+    /// @notice `reclaimProposerBond` called on a proposal that EXECUTED, while
+    ///         a conviction is still reachable — either the ledger's
+    ///         `challengeWindow` has not yet run out from `executedAt`, or a
+    ///         filing inside it is still live (the proposal's coverage is
+    ///         frozen). Terminal is not the same as unchallengeable: the
+    ///         proposer can self-settle an hour after execution, and returning
+    ///         the bond there would let the only party the bond is posted
+    ///         against outrun every path that could take it.
+    error ChallengeWindowOpen();
+    /// @notice `reclaimProposerBond` called on an EXECUTED proposal while this
+    ///         governor has no exposure ledger wired, so the challenge window
+    ///         cannot be read. Fails CLOSED deliberately — see the function's
+    ///         own natspec for why unwiring the ledger must not become the
+    ///         escape hatch from the delay it enforces.
+    error ExposureLedgerUnset();
     /// @notice `setMaxCapitalBps` called with 0 or a value above 10_000.
     error InvalidMaxCapitalBps();
     /// @notice Revert if `envelope.maxDrawdownBps > 10_000` at propose — a

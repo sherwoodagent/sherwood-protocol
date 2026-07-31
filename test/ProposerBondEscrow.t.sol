@@ -14,18 +14,33 @@ contract MockRegistryAuth {
     }
 }
 
+/// @dev The one thing the escrow reads off the ledger: who the challenge game
+///      is. Settable so the rotation the real `setCoverageFreezer` performs can
+///      be exercised here without standing up the whole ledger.
+contract MockLedgerFreezer {
+    address public coverageFreezer;
+
+    function setCoverageFreezer(address freezer) external {
+        coverageFreezer = freezer;
+    }
+}
+
 contract ProposerBondEscrowTest is Test {
     ProposerBondEscrow internal escrow;
     ERC20Mock internal wood;
     MockRegistryAuth internal reg;
+    MockLedgerFreezer internal ledger;
     address internal governor = makeAddr("governor");
     address internal proposer = makeAddr("proposer");
+    address internal game = makeAddr("challengeGame");
 
     function setUp() public {
         wood = new ERC20Mock();
         reg = new MockRegistryAuth();
         reg.set(governor, true);
-        escrow = new ProposerBondEscrow(address(wood), address(reg));
+        ledger = new MockLedgerFreezer();
+        ledger.setCoverageFreezer(game);
+        escrow = new ProposerBondEscrow(address(wood), address(reg), address(ledger));
         wood.mint(proposer, 1_000e18);
         vm.prank(proposer);
         wood.approve(address(escrow), type(uint256).max);
@@ -113,9 +128,11 @@ contract ProposerBondEscrowTest is Test {
 
     function test_constructor_zeroAddressReverts() public {
         vm.expectRevert(IProposerBondEscrow.ZeroAddress.selector);
-        new ProposerBondEscrow(address(0), address(reg));
+        new ProposerBondEscrow(address(0), address(reg), address(ledger));
         vm.expectRevert(IProposerBondEscrow.ZeroAddress.selector);
-        new ProposerBondEscrow(address(wood), address(0));
+        new ProposerBondEscrow(address(wood), address(0), address(ledger));
+        vm.expectRevert(IProposerBondEscrow.ZeroAddress.selector);
+        new ProposerBondEscrow(address(wood), address(reg), address(0));
     }
 
     function test_lockBond_zeroProposerReverts() public {
@@ -148,6 +165,135 @@ contract ProposerBondEscrowTest is Test {
         escrow.releaseBond(1);
         assertEq(wood.balanceOf(proposer), 1_000e18);
         assertEq(wood.balanceOf(address(escrow)), 0);
+    }
+
+    // ── Forfeiture ────────────────────────────────────────────────────────
+
+    /// The bond's downside branch: a conviction destroys it rather than paying
+    /// it anywhere. Every reachable payee is a round trip back to the proposer
+    /// (it can be its own challenger, and it can hold vault shares), so the
+    /// only sink with no beneficiary to be is the burn address.
+    function test_forfeitBond_burnsTheBondAndClearsTheRecord() public {
+        vm.prank(governor);
+        escrow.lockBond(1, proposer, 100e18);
+
+        vm.prank(game);
+        (address who, uint256 amount) = escrow.forfeitBond(governor, 1);
+        assertEq(who, proposer, "the loss is attributed to the proposer");
+        assertEq(amount, 100e18);
+
+        assertEq(wood.balanceOf(escrow.BURN_ADDRESS()), 100e18, "the WOOD left the system");
+        assertEq(wood.balanceOf(address(escrow)), 0, "and the escrow no longer holds it");
+        assertEq(wood.balanceOf(proposer), 900e18, "the proposer never got it back");
+        (address p, uint256 amt) = escrow.bondOf(governor, 1);
+        assertEq(p, address(0), "the record is gone");
+        assertEq(amt, 0);
+    }
+
+    /// Confiscation is a verdict, so only the contract that reaches verdicts
+    /// may trigger it. Notably the GOVERNOR that locked the bond cannot — it
+    /// gates WHEN a bond is released, never whether it is destroyed.
+    function test_forfeitBond_onlyTheCoverageFreezer() public {
+        vm.prank(governor);
+        escrow.lockBond(1, proposer, 100e18);
+
+        vm.prank(makeAddr("rogue"));
+        vm.expectRevert(IProposerBondEscrow.NotAuthorizedConvictor.selector);
+        escrow.forfeitBond(governor, 1);
+
+        vm.prank(governor);
+        vm.expectRevert(IProposerBondEscrow.NotAuthorizedConvictor.selector);
+        escrow.forfeitBond(governor, 1);
+
+        vm.prank(proposer);
+        vm.expectRevert(IProposerBondEscrow.NotAuthorizedConvictor.selector);
+        escrow.forfeitBond(governor, 1);
+
+        // Nothing moved on any of the three.
+        assertEq(wood.balanceOf(address(escrow)), 100e18);
+        (address p, uint256 amt) = escrow.bondOf(governor, 1);
+        assertEq(p, proposer);
+        assertEq(amt, 100e18);
+    }
+
+    /// The role is READ LIVE off the ledger rather than mirrored here, so
+    /// replacing the challenge game moves the privilege with it — the old game
+    /// loses it in the same transaction, with no second pointer to update.
+    function test_forfeitBond_followsTheFreezerRotation() public {
+        vm.prank(governor);
+        escrow.lockBond(1, proposer, 100e18);
+
+        address newGame = makeAddr("replacementGame");
+        ledger.setCoverageFreezer(newGame);
+
+        vm.prank(game);
+        vm.expectRevert(IProposerBondEscrow.NotAuthorizedConvictor.selector);
+        escrow.forfeitBond(governor, 1);
+
+        vm.prank(newGame);
+        escrow.forfeitBond(governor, 1);
+        assertEq(wood.balanceOf(escrow.BURN_ADDRESS()), 100e18);
+    }
+
+    /// FAILS CLOSED with no freezer wired: `msg.sender` can never be the zero
+    /// address, so an unwired protocol confiscates nothing rather than letting
+    /// anyone confiscate.
+    function test_forfeitBond_unwiredFreezerAuthorizesNobody() public {
+        vm.prank(governor);
+        escrow.lockBond(1, proposer, 100e18);
+        ledger.setCoverageFreezer(address(0));
+
+        vm.prank(game);
+        vm.expectRevert(IProposerBondEscrow.NotAuthorizedConvictor.selector);
+        escrow.forfeitBond(governor, 1);
+        assertEq(wood.balanceOf(address(escrow)), 100e18, "the bond is merely un-confiscatable, not lost");
+    }
+
+    /// Effects before interaction, so the two exits are mutually exclusive and
+    /// each is once-only: a forfeited bond cannot then be released, a released
+    /// bond cannot then be forfeited, and concurrent challenges convicting the
+    /// same proposal cannot double-burn.
+    function test_forfeitBond_andReleaseAreMutuallyExclusive() public {
+        vm.prank(governor);
+        escrow.lockBond(1, proposer, 100e18);
+        vm.prank(game);
+        escrow.forfeitBond(governor, 1);
+
+        vm.prank(game);
+        vm.expectRevert(IProposerBondEscrow.NoBond.selector);
+        escrow.forfeitBond(governor, 1);
+
+        vm.prank(governor);
+        vm.expectRevert(IProposerBondEscrow.NoBond.selector);
+        escrow.releaseBond(1);
+
+        // ...and the other order.
+        vm.prank(governor);
+        escrow.lockBond(2, proposer, 50e18);
+        vm.prank(governor);
+        escrow.releaseBond(2);
+        vm.prank(game);
+        vm.expectRevert(IProposerBondEscrow.NoBond.selector);
+        escrow.forfeitBond(governor, 2);
+    }
+
+    /// The bond key is (governor, proposalId) on the forfeit path too, so a
+    /// conviction against one governor's proposal cannot reach another's.
+    function test_forfeitBond_crossGovernorIsolation() public {
+        address governorB = makeAddr("governorB");
+        reg.set(governorB, true);
+        vm.prank(governor);
+        escrow.lockBond(1, proposer, 100e18);
+        vm.prank(governorB);
+        escrow.lockBond(1, proposer, 200e18);
+
+        vm.prank(game);
+        escrow.forfeitBond(governor, 1);
+
+        assertEq(wood.balanceOf(escrow.BURN_ADDRESS()), 100e18);
+        (address pB, uint256 amtB) = escrow.bondOf(governorB, 1);
+        assertEq(pB, proposer, "governorB's bond is untouched");
+        assertEq(amtB, 200e18);
     }
 
     /// Fuzz the conservation invariant: balance == sum of locked-unreleased.
