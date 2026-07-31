@@ -55,7 +55,6 @@ contract SyndicateGovernorTest is Test {
         // propose). Match the legacy 1% protocol fee the settlement tests expect.
         vm.startPrank(owner);
         protocolConfig.setProtocolFeeRecipient(owner);
-        protocolConfig.setProtocolFeeBps(100);
         vm.stopPrank();
         usdc = new ERC20Mock("USD Coin", "USDC", 6);
         targetToken = new ERC20Mock("Target", "TGT", 18);
@@ -238,7 +237,6 @@ contract SyndicateGovernorTest is Test {
         assertEq(governor.proposalCount(), 0);
         // isRegisteredVault removed in per-vault design - governor.vault() tracks the linked vault
         // assertTrue(governor.isRegisteredVault(address(vault)));
-        assertEq(protocolConfig.protocolFeeBps(), 100);
         assertEq(protocolConfig.protocolFeeRecipient(), owner);
     }
 

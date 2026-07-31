@@ -28,10 +28,6 @@ interface IProtocolConfig {
     event MgmtSplitSet(uint16 agentBps, uint16 protocolBps, uint16 guardianBps);
     event PerfSplitSet(uint16 agentBps, uint16 protocolBps, uint16 guardianBps, uint16 ownerBps);
 
-    error InvalidProtocolFeeBps();
-    error InvalidGuardianFeeBps();
-    error InvalidProtocolFeeRecipient();
-    error InvalidGuardiansFeeRecipient();
     error InvalidMgmtSplit();
     error InvalidPerfSplit();
 
@@ -40,9 +36,13 @@ interface IProtocolConfig {
     ///         means "unset / no ceiling".
     error InvalidMaxStrategyDuration();
 
-    function protocolFeeBps() external view returns (uint256);
+    /// @notice Where the protocol's share is sent. Zero unwires the leg — the
+    ///         governor folds that share into the agent's remainder rather than
+    ///         escrowing it against `address(0)`.
     function protocolFeeRecipient() external view returns (address);
-    function guardianFeeBps() external view returns (uint256);
+
+    /// @notice Where the guardian network's share of each fee is sent. Same
+    ///         zero semantics as above.
     function guardiansFeeRecipient() external view returns (address);
 
     /// @notice Protocol-wide ceiling on `strategyDuration`; 0 = unset/no ceiling.

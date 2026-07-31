@@ -48,7 +48,6 @@ contract PerVaultParamsTest is Test {
         protocolConfig = new ProtocolConfig(owner);
         vm.startPrank(owner);
         protocolConfig.setProtocolFeeRecipient(protocolRecipient);
-        protocolConfig.setProtocolFeeBps(100); // 1% at propose time
         vm.stopPrank();
 
         usdc = new ERC20Mock("USD Coin", "USDC", 6);
@@ -278,20 +277,21 @@ contract PerVaultParamsTest is Test {
     // ──────────────────────────────────────────────────────────────
 
     /// @notice A post-vote config change must not reach an in-flight proposal.
-    /// @dev The lever this test originally pulled — `protocolFeeBps` — no longer
-    ///      participates in settlement at all: the protocol is now paid a SHARE
-    ///      of each of the two fees, not a standalone rate off gross profit
-    ///      (design.md Decision 9). So raising it 1% → 10% mid-flight is
-    ///      expected to change nothing, which is a stronger result than the
-    ///      original assertion and is what this now pins. The live version of
-    ///      this property — a mid-flight SPLIT change being ignored — is
-    ///      covered by `test_splitChangeAfterProposeDoesNotAffectTheInFlightProposal`.
+    /// @dev Originally pulled `protocolFeeBps`, which no longer exists — the
+    ///      protocol is paid a SHARE of each fee now, not a standalone rate off
+    ///      gross profit (design.md Decision 9). Repointed at the split, which
+    ///      is the lever carrying that meaning today: swinging the protocol to
+    ///      90% mid-flight must not change what this proposal pays, because the
+    ///      split was snapshotted at propose.
     function test_settleIgnoresPostVoteProtocolRateChange() public {
         uint256 proposalId = _propose();
 
-        // Config jumps to the 10% max AFTER voters saw 1%.
+        // Swing the protocol's share to nearly the whole fee AFTER voters saw
+        // 20%. The old version of this test raised `protocolFeeBps`, which no
+        // longer exists — the split IS the protocol's rate now, so this is the
+        // lever that carries the same meaning.
         vm.prank(owner);
-        protocolConfig.setProtocolFeeBps(1000);
+        protocolConfig.setMgmtSplit(IProtocolConfig.MgmtSplit({agentBps: 500, protocolBps: 9000, guardianBps: 500}));
 
         // 10k profit lands mid-strategy.
         vm.prank(lp1);
@@ -304,8 +304,10 @@ contract PerVaultParamsTest is Test {
         governor.settleProposal(proposalId);
 
         uint256 paid = usdc.balanceOf(protocolRecipient);
-        assertGt(paid, 0, "the protocol is still paid, via its split share");
-        // Had the raised 10% rate applied to the 10k gain it would be 1000e6.
-        assertLt(paid, 1_000e6, "and never at the post-vote rate");
+        assertGt(paid, 0, "the protocol is still paid, at its snapshotted share");
+        // Under the snapshotted 20% the protocol takes 15% of a 20% performance
+        // fee on the 10k gain — a few hundred. Had the post-vote 90% split
+        // applied it would be an order of magnitude larger.
+        assertLt(paid, 1_000e6, "and never at the post-vote split");
     }
 }

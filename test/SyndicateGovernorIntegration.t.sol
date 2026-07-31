@@ -57,7 +57,6 @@ contract SyndicateGovernorIntegrationTest is Test {
         // profit) assume it. Snapshotted onto proposals at propose time.
         vm.startPrank(owner);
         protocolConfig.setProtocolFeeRecipient(owner);
-        protocolConfig.setProtocolFeeBps(100);
         vm.stopPrank();
         usdc = new ERC20Mock("USD Coin", "USDC", 6);
         targetToken = new ERC20Mock("Target", "TGT", 18);

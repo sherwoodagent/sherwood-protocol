@@ -75,7 +75,6 @@ contract DeployRobinhoodMainnet is DeploySherwood {
             ensRegistrar: L2_REGISTRAR,
             agentRegistry: AGENT_REGISTRY,
             managementFeeBps: MANAGEMENT_FEE_BPS,
-            protocolFeeBps: PROTOCOL_FEE_BPS,
             maxStrategyDays: MAX_STRATEGY_DAYS,
             votingPeriod: VOTING_PERIOD,
             woodToken: woodToken,
@@ -173,7 +172,6 @@ contract DeployRobinhoodMainnet is DeploySherwood {
         // the beacon (shared impl + upgrade authority) and ProtocolConfig.
         _checkAddr("beacon.owner", Ownable(beaconAddr).owner(), expectedOwner);
         _checkAddr("protocolConfig.owner", Ownable(protocolConfigAddr).owner(), expectedOwner);
-        _checkUint("protocolConfig.protocolFeeBps", protocolConfig.protocolFeeBps(), PROTOCOL_FEE_BPS);
         _checkAddr("protocolConfig.protocolFeeRecipient", protocolConfig.protocolFeeRecipient(), deployer);
 
         _checkAddr("factory.owner", Ownable(factoryAddr).owner(), expectedOwner);

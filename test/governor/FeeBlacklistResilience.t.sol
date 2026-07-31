@@ -76,7 +76,6 @@ contract FeeBlacklistResilienceTest is Test {
         ProtocolConfig protocolConfig = new ProtocolConfig(owner);
         vm.startPrank(owner);
         protocolConfig.setProtocolFeeRecipient(protocolRecipient);
-        protocolConfig.setProtocolFeeBps(100);
         vm.stopPrank();
 
         SyndicateGovernor govImpl = new SyndicateGovernor(24 hours, 1 hours);

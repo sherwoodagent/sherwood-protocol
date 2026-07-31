@@ -52,11 +52,11 @@ contract GuardianFeeBuybackTest is Test {
     function setUp() public {
         protocolConfig = new ProtocolConfig(owner);
         // Guardian fee lives on ProtocolConfig now; the governor snapshots it
-        // at propose. Recipient-first coupling: set recipient, then bps.
-        vm.startPrank(owner);
+        // at propose. Only the RECIPIENT is configurable now — the guardian
+        // network's share is `mgmtSplit.guardianBps` / `perfSplit.guardianBps`,
+        // seeded by the ProtocolConfig constructor.
+        vm.prank(owner);
         protocolConfig.setGuardiansFeeRecipient(guardiansFeeRecipient);
-        protocolConfig.setGuardianFeeBps(GUARDIAN_FEE_BPS);
-        vm.stopPrank();
         usdc = new BlacklistingERC20Mock("USD Coin", "USDC", 6);
         executorLib = new BatchExecutorLib();
         agentRegistry = new MockAgentRegistry();
@@ -255,44 +255,19 @@ contract GuardianFeeBuybackTest is Test {
         assertEq(usdc.balanceOf(guardiansFeeRecipient), 0, "no fee to recipient");
     }
 
-    // ── 3. setGuardianFeeBps coupling with the recipient ──
-
-    function test_setGuardianFeeBps_revertsWhenRecipientUnset() public {
-        // Turn off the fee, then clear the recipient (allowed while off).
-        vm.startPrank(owner);
-        protocolConfig.setGuardianFeeBps(0);
-        protocolConfig.setGuardiansFeeRecipient(address(0));
-        // Now raising the fee with no recipient must revert.
-        vm.expectRevert(ISyndicateGovernor.InvalidGuardiansFeeRecipient.selector);
-        protocolConfig.setGuardianFeeBps(100);
-        vm.stopPrank();
-    }
-
-    function test_setGuardianFeeBps_succeedsAfterRecipientSet() public {
-        vm.startPrank(owner);
-        protocolConfig.setGuardianFeeBps(0);
-        protocolConfig.setGuardiansFeeRecipient(address(0));
-        // Re-set a recipient, then raising the fee succeeds.
-        protocolConfig.setGuardiansFeeRecipient(guardiansFeeRecipient);
-        protocolConfig.setGuardianFeeBps(150);
-        vm.stopPrank();
-        assertEq(protocolConfig.guardianFeeBps(), 150);
-    }
+    // ── 3. The guardian rate is gone ──
+    //
+    // `setGuardianFeeBps` and its recipient-coupling reverts were removed with
+    // the two-number fee model: the guardian network is paid a SHARE of each
+    // fee, so there is no standalone rate to keep consistent with a recipient.
+    // A zero recipient is now unconditionally allowed and simply unwires the
+    // leg — the governor folds that share into the agent's remainder.
 
     // ── 4. setGuardiansFeeRecipient(0) coupling + event ──
 
-    function test_setGuardiansFeeRecipient_zeroReverts_whenFeeOn() public {
-        // Fee is on (GUARDIAN_FEE_BPS) from setUp.
+    function test_setGuardiansFeeRecipient_zeroAlwaysAllowed() public {
         vm.prank(owner);
-        vm.expectRevert(ISyndicateGovernor.InvalidGuardiansFeeRecipient.selector);
         protocolConfig.setGuardiansFeeRecipient(address(0));
-    }
-
-    function test_setGuardiansFeeRecipient_zeroAllowed_whenFeeOff() public {
-        vm.startPrank(owner);
-        protocolConfig.setGuardianFeeBps(0);
-        protocolConfig.setGuardiansFeeRecipient(address(0));
-        vm.stopPrank();
         assertEq(protocolConfig.guardiansFeeRecipient(), address(0));
     }
 

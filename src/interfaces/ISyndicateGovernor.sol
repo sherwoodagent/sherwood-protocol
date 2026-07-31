@@ -102,9 +102,22 @@ interface ISyndicateGovernor {
         ///      moving the rejection threshold.
         uint256 vetoThresholdBps;
         // ── Fee snapshot (read from ProtocolConfig at propose time) ──
-        uint256 snapshotProtocolFeeBps;
+        /// @dev Only the RECIPIENTS are snapshotted. The protocol and guardian
+        ///      SHARES come from `snapshotMgmtSplit` / `snapshotPerfSplit`
+        ///      below; the standalone `snapshotProtocolFeeBps` /
+        ///      `snapshotGuardianFeeBps` fields that used to sit here are gone
+        ///      with the two-number fee model — both were write-only.
+        ///
+        ///      They occupied struct slots 17 and 19, so removing them shifts
+        ///      every later member down two slots. `_proposals` is a mapping
+        ///      laid out by member index and the governor is a `BeaconProxy`,
+        ///      so upgrading a governor that already held proposals would
+        ///      re-read them against the new offsets. This ships as a FRESH
+        ///      DEPLOYMENT — no proposal predates the change — which is what
+        ///      makes the removal safe. A later release must not repeat this
+        ///      shape of change without first draining or migrating every
+        ///      existing proposal.
         address snapshotProtocolFeeRecipient;
-        uint256 snapshotGuardianFeeBps;
         address snapshotGuardiansFeeRecipient;
         /// @notice `IStrategy.selfManagesFees()` snapshotted at propose time (like
         ///         performanceFeeBps). Read from storage at settle so a non-pure

@@ -264,10 +264,13 @@ and converts a fee-accounting problem into a liveness problem.
    high-water mark already ratcheted — rolling back does not un-ratchet it, and it should
    not, since the fee it recorded was genuinely charged.
 
-### Pre-upgrade checklist for a live vault
+### Deployment checklist
 
-Run in this order. Steps 1 and 2 must be in the same transaction batch as the
-implementation swap; a vault that executes a proposal between them charges the wrong rate.
+**This ships as a fresh deployment, not an in-place upgrade** (decision 2026-07-31).
+That is what makes the `StrategyProposal` storage change safe — see Decision 9. The
+steps below are written for that path; steps 1 and 2 apply only if a vault is ever
+carried across rather than created new, and if so they must land in the same
+transaction batch as the implementation swap.
 
 1. **Read and reset `managementFeeBps` on every live vault.** Its meaning changes from a
    profit-gated slice to an annual rate on AUM. A vault carrying `500` under the old
@@ -291,31 +294,61 @@ implementation swap; a vault that executes a proposal between them charges the w
    the expected `assets × duration`; a figure that is orders of magnitude off means the
    accrual clock was not started or not reset.
 
-### Decision 9 — `protocolFeeBps` / `guardianFeeBps` are superseded by the splits
+### Decision 9 — `guardianFeeBps` removed; `protocolFeeBps` kept because it is NOT dead
 
-*Surfaced during the regression pass.*
+*Surfaced during the regression pass. **Corrected** on implementation — the first
+version of this decision claimed both rates were dead. That was wrong about
+`protocolFeeBps`.*
 
-Under the old waterfall these were standalone rates: the protocol took
-`grossPnl × protocolFeeBps` and the guardian network `grossPnl × guardianFeeBps`,
-each off the top. Under the two-number model both parties are paid as a **share of
-one of the two fees**, so those rates no longer participate in any computation.
+Under the old waterfall both were standalone rates off gross profit. Under the
+two-number model settlement pays the protocol and the guardian network a **share of
+each fee**, so neither rate participates in governor settlement any more. But they
+are not equally dead:
 
-They are still snapshotted onto the proposal, and both are still settable on
-`ProtocolConfig` — but settlement now reads only the **recipients**
-(`snapshotProtocolFeeRecipient`, `snapshotGuardiansFeeRecipient`), never the rates.
-Left in place deliberately rather than removed:
+**`guardianFeeBps` — genuinely dead, removed.** No reader anywhere in `src/`.
+Keeping it settable made `setGuardianFeeBps` look like a live lever while doing
+nothing: an operator raising it to pay guardians more would have seen no change.
+Removed along with `MAX_GUARDIAN_FEE_BPS`, its setter, and the recipient-coupling
+reverts that existed only to keep it consistent.
 
-- Removing `snapshotProtocolFeeBps`/`snapshotGuardianFeeBps` from `StrategyProposal`
-  would reorder a struct that `getProposal` returns, breaking every off-chain
-  consumer's ABI decode for no functional gain.
-- Removing the setters would break deploy scripts and ~40 test fixtures.
+**`protocolFeeBps` — LIVE, kept.**
+`LeveragedAerodromeCLStrategy._protocolFeeBps()`
+(`src/strategies/LeveragedAerodromeCLStrategy.sol:609`) reads it directly from
+`ProtocolConfig` to crystallise the protocol's cut on the `selfManagesFees` path —
+the one path the governor deliberately does not charge (Decision 3). Removing it
+would have silently zeroed the protocol's revenue on that strategy. This is the trap
+in "the governor doesn't read it, so it's unused": grep for consumers of the
+*config*, not just readers of the *snapshot*.
 
-**The consequence to be aware of:** setting `guardianFeeBps` now has **no effect on
-what the guardian network is paid**. That lever is `mgmtSplit.guardianBps` and
-`perfSplit.guardianBps`. An operator who raises the old rate expecting guardians to
-earn more will see nothing change — which is exactly the kind of silent no-op worth
-naming before someone relies on it. A follow-up should either remove the dead rates
-outright (accepting the ABI break) or repurpose them.
+**Also removed:** `snapshotProtocolFeeBps` / `snapshotGuardianFeeBps` from
+`StrategyProposal`. Both were write-only — nothing in `src/`, `test/` or `script/`
+read either. The recipients (`snapshotProtocolFeeRecipient`,
+`snapshotGuardiansFeeRecipient`) stay, since both charge functions use them.
+
+This costs two things, and the second is the one that matters:
+
+1. **An ABI break.** The tuple `getProposal` returns loses two `uint256` members,
+   so off-chain consumers must regenerate their decoders.
+2. **A storage-layout break.** The two fields sat at struct slots **17** and **19** —
+   the middle, not the end — so every later member shifts down two slots
+   (`selfManagesFees` 20→18, `proposerBondEscrow` 25→23). `_proposals` is a
+   `mapping(uint256 => StrategyProposal)` whose values are laid out by member
+   index, and the governor is a `BeaconProxy`: a single `upgradeTo` on a governor
+   that already held proposals would re-read every one of them against the new
+   offsets. `selfManagesFees` would read the old `snapshotGuardianFeeBps`,
+   `proposerBondEscrow` would read garbage, and a bonded proposal could release to
+   the wrong address.
+
+**This is safe here only because the change ships as a FRESH DEPLOYMENT** (decision
+2026-07-31): no proposal predates the new layout, so there is nothing to misread.
+That premise is load-bearing — a later release must not make a change of this shape
+against a live governor without first draining or migrating every existing proposal.
+The layout goldens are regenerated to match.
+
+**Zero-recipient semantics, now unconditional for guardians:** clearing
+`guardiansFeeRecipient` is always allowed and simply unwires the leg — the governor
+folds that share into the agent's remainder rather than escrowing against
+`address(0)`, where it would be permanently unclaimable.
 
 ## Follow-up work (not in this change)
 

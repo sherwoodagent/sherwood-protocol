@@ -1257,9 +1257,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      instead (design.md Decision 8).
     function _snapshotFeeConfig(StrategyProposal storage p) private {
         IProtocolConfig cfg = IProtocolConfig(protocolConfig);
-        p.snapshotProtocolFeeBps = cfg.protocolFeeBps();
         p.snapshotProtocolFeeRecipient = cfg.protocolFeeRecipient();
-        p.snapshotGuardianFeeBps = cfg.guardianFeeBps();
         p.snapshotGuardiansFeeRecipient = cfg.guardiansFeeRecipient();
         p.snapshotMgmtSplit = cfg.mgmtSplit();
         p.snapshotPerfSplit = cfg.perfSplit();

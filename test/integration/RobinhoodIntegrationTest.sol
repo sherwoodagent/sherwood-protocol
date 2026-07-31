@@ -144,7 +144,6 @@ abstract contract RobinhoodIntegrationTest is Test {
             ensRegistrar: address(0), // no ENS on Robinhood testnet
             agentRegistry: address(0), // no ERC-8004 on Robinhood testnet
             managementFeeBps: 50, // deploy-script defaults (mirrors the live-deploy config)
-            protocolFeeBps: 100,
             maxStrategyDays: 14,
             votingPeriod: 1 days,
             woodToken: address(wood),

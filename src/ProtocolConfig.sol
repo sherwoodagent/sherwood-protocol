@@ -13,18 +13,24 @@ import {FeeConstants} from "./FeeConstants.sol";
 ///         `setProtocolConfig(address)` (factory-only); snapshotting means no
 ///         in-flight proposal is affected.
 contract ProtocolConfig is Ownable2Step, IProtocolConfig {
-    uint256 public constant MAX_PROTOCOL_FEE_BPS = 1000; // 10%
-    uint256 public constant MAX_GUARDIAN_FEE_BPS = 500; // 5%
-
     /// @notice Floor on the protocol-wide strategy-duration ceiling. Guards the
     ///         degenerate setting: a ceiling below the shortest usable strategy
     ///         would make every vault unproposable protocol-wide in one
     ///         transaction.
     uint256 public constant MIN_PROTOCOL_MAX_STRATEGY_DURATION = 1 days;
 
-    uint256 public protocolFeeBps;
+    /// @notice Where the protocol's share is sent — both the settlement splits
+    ///         and the self-managed strategy's crystallisation.
+    /// @dev A zero recipient unwires the leg: the governor folds its share into
+    ///      the agent's remainder rather than paying `address(0)`, where the
+    ///      transfer would revert and escrow permanently unclaimable.
     address public protocolFeeRecipient;
-    uint256 public guardianFeeBps;
+
+    /// @notice Where the guardian network's share of each fee is sent.
+    /// @dev The standalone `guardianFeeBps` rate that used to sit beside this
+    ///      was removed with the two-number fee model — nothing read it, and
+    ///      leaving it settable made `setGuardianFeeBps` look like a live lever
+    ///      when the real one is `mgmtSplit.guardianBps` / `perfSplit.guardianBps`.
     address public guardiansFeeRecipient;
 
     /// @notice Protocol-wide CEILING on `strategyDuration`; every vault's own
@@ -120,31 +126,21 @@ contract ProtocolConfig is Ownable2Step, IProtocolConfig {
         emit ParameterChangeFinalized(keccak256("maxStrategyDuration"), old, newValue);
     }
 
-    function setProtocolFeeBps(uint256 newValue) external onlyOwner {
-        if (newValue > MAX_PROTOCOL_FEE_BPS) revert InvalidProtocolFeeBps();
-        if (newValue > 0 && protocolFeeRecipient == address(0)) revert InvalidProtocolFeeRecipient();
-        uint256 old = protocolFeeBps;
-        protocolFeeBps = newValue;
-        emit ParameterChangeFinalized(keccak256("protocolFeeBps"), old, newValue);
-    }
-
+    /// @notice Set where the protocol's share is sent.
+    /// @notice Set where the protocol's share of each fee is sent.
+    /// @dev Unconditional. The standalone rates these setters used to guard are
+    ///      gone (see the state-variable note), so a zero recipient has nothing
+    ///      to be inconsistent with — it simply unwires the leg.
     function setProtocolFeeRecipient(address newRecipient) external onlyOwner {
-        if (newRecipient == address(0) && protocolFeeBps > 0) revert InvalidProtocolFeeRecipient();
         address old = protocolFeeRecipient;
         protocolFeeRecipient = newRecipient;
         emit ProtocolFeeRecipientSet(old, newRecipient);
     }
 
-    function setGuardianFeeBps(uint256 newValue) external onlyOwner {
-        if (newValue > MAX_GUARDIAN_FEE_BPS) revert InvalidGuardianFeeBps();
-        if (newValue > 0 && guardiansFeeRecipient == address(0)) revert InvalidGuardiansFeeRecipient();
-        uint256 old = guardianFeeBps;
-        guardianFeeBps = newValue;
-        emit ParameterChangeFinalized(keccak256("guardianFeeBps"), old, newValue);
-    }
-
+    /// @notice Set where the guardian network's share of both fees is sent.
+    /// @dev Unconditional: there is no longer a `guardianFeeBps` to be
+    ///      inconsistent with. Zero unwires the leg.
     function setGuardiansFeeRecipient(address newRecipient) external onlyOwner {
-        if (newRecipient == address(0) && guardianFeeBps > 0) revert InvalidGuardiansFeeRecipient();
         address old = guardiansFeeRecipient;
         guardiansFeeRecipient = newRecipient;
         emit GuardiansFeeRecipientSet(old, newRecipient);
