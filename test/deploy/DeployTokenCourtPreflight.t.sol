@@ -165,6 +165,14 @@ contract DeployTokenCourtPreflightTest is Test {
         // runs, leaving the setter called as this test contract instead of
         // `DEFAULT_SENDER` and reverting `OwnableUnauthorizedAccount`.
         address otherStakedWood = address(new MockStakedWood());
+        // The reciprocal half of the slasher grant (review PR #56 M2):
+        // `setStakedWood` now refuses a sWOOD that has not named this game
+        // `authorizedSlasher`, because such a re-point wedges every `_settle`
+        // inside `slashToEscrow`'s caller gate. Granted here so this test still
+        // reaches the WIRE pre-flight it exists to exercise — the divergence it
+        // asserts on is between the game's sWOOD and the court's, which the
+        // grant leaves untouched.
+        MockStakedWood(otherStakedWood).setAuthorizedSlasher(address(game));
         vm.prank(DEFAULT_SENDER);
         game.setStakedWood(otherStakedWood);
         _runWireExpecting("PRE-FLIGHT: ChallengeGame.stakedWood != STAKED_WOOD.");
