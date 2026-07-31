@@ -390,6 +390,35 @@ contract GovernorEmergencyTest is Test {
         governor.finalizeEmergencySettle(pid);
     }
 
+    /// @notice `voteOnProposal` carries an explicit `if (r.resolved) revert
+    ///         ReviewNotOpen()` and calls it defence in depth. Its emergency
+    ///         twin had no such guard — it tested only `er.reviewEnd`, which
+    ///         `cancelEmergency` REPURPOSES as a post-cancel cooldown deadline
+    ///         (`reviewEnd = block.timestamp + reviewPeriod`, Sherlock #15).
+    ///         So for a full `reviewPeriod` after a cancel, `block.timestamp <
+    ///         er.reviewEnd` still held and votes were accepted into a resolved
+    ///         review — guardians reacting to `EmergencyReviewOpened` burn gas
+    ///         on a vote that can never count and consume their `AlreadyVoted`
+    ///         flag for that nonce.
+    function test_voteBlockEmergencySettle_revertsAfterCancel() public {
+        uint256 pid = _createExecutedProposal(7 days);
+        vm.warp(vm.getBlockTimestamp() + 7 days);
+
+        vm.prank(owner);
+        governor.emergencySettleWithCalls(pid, _customCalls());
+
+        // Cancel with no votes cast, so the Sherlock #44 quorum gate allows it.
+        vm.prank(owner);
+        governor.cancelEmergencySettle(pid);
+        assertFalse(registry.isEmergencyOpen(address(governor), pid), "cancel resolves the emergency review");
+
+        // Still inside the repurposed cooldown window, so the reviewEnd test
+        // alone would let this through.
+        vm.prank(guardianA);
+        vm.expectRevert(IGuardianRegistry.ReviewNotOpen.selector);
+        registry.voteBlockEmergencySettle(address(governor), pid);
+    }
+
     /// @notice Regression for PR #229 critical fix: cancelling an emergency
     ///         settle must also invalidate the registry-side review so stale
     ///         block votes cannot slash the owner.
