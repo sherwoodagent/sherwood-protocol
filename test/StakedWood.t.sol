@@ -733,6 +733,67 @@ contract StakedWoodTest is Test {
         swood.claimUnstakeOwner(vault);
     }
 
+    /// @notice PR #56 review. `bindOwnerStake` used to blind-overwrite
+    ///         `_ownerStakes[vault]`, so binding over a vault that still held a
+    ///         live bond replaced the prior owner's record and stranded their
+    ///         WOOD: `requestUnstakeOwner`/`claimUnstakeOwner` key on
+    ///         `s.owner == msg.sender`, and the slot now names someone else.
+    ///         It now refuses exactly like its sibling `transferOwnerStakeSlot`.
+    function test_bindOwnerStake_revertsWhenPriorStakeNotCleared() public {
+        address vault = address(0xBEEF);
+        _bindAliceTo(vault);
+
+        address newOwner = address(0xC0FFEE);
+        wood.mint(newOwner, 10_000e18);
+        vm.prank(newOwner);
+        wood.approve(address(swood), type(uint256).max);
+        vm.prank(newOwner);
+        swood.prepareOwnerStake(1_000e18);
+
+        vm.prank(factory);
+        vm.expectRevert(StakedWood.PriorStakeNotCleared.selector);
+        swood.bindOwnerStake(newOwner, vault);
+
+        // The prior owner's bond is intact and still theirs to reclaim.
+        assertEq(swood.ownerStake(vault), 1_000e18, "alice's bond survived");
+        vm.warp(vm.getBlockTimestamp() + 1);
+        vm.prank(alice);
+        swood.requestUnstakeOwner(vault);
+        vm.warp(vm.getBlockTimestamp() + swood.coolDownPeriod());
+        uint256 balBefore = wood.balanceOf(alice);
+        vm.prank(alice);
+        swood.claimUnstakeOwner(vault);
+        assertEq(wood.balanceOf(alice) - balBefore, 1_000e18, "and was reclaimable");
+    }
+
+    /// @notice The guard keys on a LIVE bond, not on the slot having ever been
+    ///         used: once the prior owner has fully exited (`stakedAmount == 0`)
+    ///         a bind is allowed again, so zero-bond onboarding and post-unstake
+    ///         re-use are unaffected.
+    function test_bindOwnerStake_allowedOncePriorStakeCleared() public {
+        address vault = address(0xBEEF);
+        _bindAliceTo(vault);
+
+        vm.warp(vm.getBlockTimestamp() + 1);
+        vm.prank(alice);
+        swood.requestUnstakeOwner(vault);
+        vm.warp(vm.getBlockTimestamp() + swood.coolDownPeriod());
+        vm.prank(alice);
+        swood.claimUnstakeOwner(vault);
+        assertEq(swood.ownerStake(vault), 0, "slot cleared");
+
+        address newOwner = address(0xC0FFEE);
+        wood.mint(newOwner, 10_000e18);
+        vm.prank(newOwner);
+        wood.approve(address(swood), type(uint256).max);
+        vm.prank(newOwner);
+        swood.prepareOwnerStake(1_000e18);
+
+        vm.prank(factory);
+        swood.bindOwnerStake(newOwner, vault);
+        assertEq(swood.ownerStake(vault), 1_000e18, "a cleared slot binds again");
+    }
+
     function test_transferOwnerStakeSlot_revertsWhenPriorStakeNotCleared() public {
         address vault = address(0xBEEF);
         _bindAliceTo(vault);

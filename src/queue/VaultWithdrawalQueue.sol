@@ -307,6 +307,12 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
     ///      votes at the snapshot, so total payouts never exceed `total` and
     ///      sub-wei dust strands in the queue (mirrors the escrow's own
     ///      dust-to-residue policy; the queue has no rescue path by design).
+    ///
+    ///      RE-POINTS: this entry point only ever serves the escrow governance
+    ///      points at RIGHT NOW, because it may PULL. A case pulled from a
+    ///      previous escrow and only partly distributed is finished through
+    ///      `distributeCompensation`, which reads the recorded pull and never
+    ///      pulls (PR #56 review M6).
     function claimCompensation(uint256 caseId, uint256[] calldata requestIds)
         external
         nonReentrant
@@ -340,6 +346,88 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
             emit CompensationPulled(escrow, caseId, received, votes, address(pullToken));
         }
 
+        (paid, processed, skipped) = _distribute(escrow, caseId, requestIds);
+        // A CALL THAT DISTRIBUTES NOTHING DOES NOT STAND (PR #24 review F-D).
+        // The length check above only proves ids were NAMED; with 🟡N7's
+        // skip-don't-revert, one ineligible id could satisfy it, pull the
+        // case's entire proceeds, and park them here — restoring the idle
+        // balance that was 🔴N1's precondition. The gate is on `paid`, not
+        // `processed` (review round-4 N-2): a batch whose every eligible id
+        // floors to a zero share would otherwise pull the case, mark the ids
+        // `_compClaimed`, move nothing, and not revert — the same park shape
+        // through arithmetic instead of eligibility. Reachable when share
+        // supply exceeds WOOD proceeds in wei (an 18-decimals-offset vault
+        // against a small recovery) with dust-sized requests. The cost is that
+        // a legitimately all-dust batch is unclaimable — which the rounding
+        // policy already strands by design. Reverting rolls the pull back too
+        // (the escrow case stays redeemable), so "a pull distributes in the
+        // same call" is enforced, not asserted. A keeper whose whole batch was
+        // front-run loses only gas: everything it named was already paid.
+        if (paid == 0) revert NoEligibleRequests();
+    }
+
+    /// @inheritdoc IVaultWithdrawalQueue
+    /// @dev THE RE-POINT REMAINDER PATH (PR #56 review M6). `claimCompensation`
+    ///      books a case under the escrow governance pointed at when the case
+    ///      was PULLED, and the pull is decoupled from the distribution (a
+    ///      keeper batches ids across many transactions). If governance calls
+    ///      `setCompensationEscrow(B)` between the pull from A and the last
+    ///      batch, every later `claimCompensation` resolves B, finds
+    ///      `_compCases[B][caseId].pulled == false`, and tries to pull B's
+    ///      case with the same id — a DIFFERENT case, since ids are per-escrow.
+    ///      The undistributed remainder of A's case, already sitting in this
+    ///      contract's balance, would be stranded forever: there is no rescue
+    ///      path here by design.
+    ///
+    ///      WHY THE `escrow` PARAMETER IS SAFE HERE (i.e. why this does not
+    ///      reintroduce 🔴N1). N1 was about a caller-chosen escrow being the
+    ///      source of a PULL: the caller named a contract, the queue called
+    ///      `redeem`/`wood()` on it, and the payout UNIT came back from that
+    ///      call. Nothing of that shape survives on this path:
+    ///      - This function NEVER pulls and makes NO call to `escrow` at all —
+    ///        the address is used solely as a mapping key.
+    ///      - It refuses any key whose case is not already `pulled`
+    ///        (`CaseNotPulled`). `pulled` is written in exactly one place:
+    ///        `claimCompensation`, after resolving the escrow from governance.
+    ///        So the reachable key set is exactly {escrows governance has
+    ///        pointed at} — a caller cannot introduce a new one, only select
+    ///        among the ones governance already authorized.
+    ///      - `total`, `votes`, `snapshotTimestamp` and `token` all come from
+    ///        the pin written at pull time; the escrow is never re-read, so the
+    ///        unit-substitution the N1 fix closed stays closed.
+    ///      - Payouts still go to the requests' own owners, and each id is
+    ///        `_compClaimed`-gated per (escrow, caseId), so selecting a
+    ///        different (already-pulled) case cannot double-pay anyone.
+    ///      The worst a caller can do is finish distributing money the queue
+    ///      already holds, to the owners it is already owed to — which is the
+    ///      whole point.
+    ///
+    ///      The `paid == 0` gate is kept even though there is no pull to roll
+    ///      back: without it a caller could mark eligible-but-dust ids
+    ///      `_compClaimed` while moving nothing, burning their claim.
+    function distributeCompensation(address escrow, uint256 caseId, uint256[] calldata requestIds)
+        external
+        nonReentrant
+        returns (uint256 paid, uint256 processed, uint256 skipped)
+    {
+        if (requestIds.length == 0) revert NoRequestsSupplied();
+        // Distribute-only: the case must ALREADY have been pulled under this
+        // escrow by `claimCompensation`. No pull, no external call to `escrow`.
+        if (!_compCases[escrow][caseId].pulled) revert CaseNotPulled();
+
+        (paid, processed, skipped) = _distribute(escrow, caseId, requestIds);
+        if (paid == 0) revert NoEligibleRequests();
+    }
+
+    /// @dev Shared payout loop for both compensation entry points. Reads ONLY
+    ///      the recorded `CompCase` — never the escrow — so it is identical
+    ///      whether the case was pulled in this transaction or an earlier one
+    ///      under an escrow governance has since re-pointed away from.
+    function _distribute(address escrow, uint256 caseId, uint256[] calldata requestIds)
+        private
+        returns (uint256 paid, uint256 processed, uint256 skipped)
+    {
+        CompCase storage cc = _compCases[escrow][caseId];
         // Read the PINNED token, never the escrow's current answer.
         IERC20 payToken = IERC20(cc.token);
         uint256 snapTs = cc.snapshotTimestamp;
@@ -375,23 +463,6 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
                 emit CompensationPaid(escrow, caseId, id, r.owner, share);
             }
         }
-        // A CALL THAT DISTRIBUTES NOTHING DOES NOT STAND (PR #24 review F-D).
-        // The length check above only proves ids were NAMED; with 🟡N7's
-        // skip-don't-revert, one ineligible id could satisfy it, pull the
-        // case's entire proceeds, and park them here — restoring the idle
-        // balance that was 🔴N1's precondition. The gate is on `paid`, not
-        // `processed` (review round-4 N-2): a batch whose every eligible id
-        // floors to a zero share would otherwise pull the case, mark the ids
-        // `_compClaimed`, move nothing, and not revert — the same park shape
-        // through arithmetic instead of eligibility. Reachable when share
-        // supply exceeds WOOD proceeds in wei (an 18-decimals-offset vault
-        // against a small recovery) with dust-sized requests. The cost is that
-        // a legitimately all-dust batch is unclaimable — which the rounding
-        // policy already strands by design. Reverting rolls the pull back too
-        // (the escrow case stays redeemable), so "a pull distributes in the
-        // same call" is enforced, not asserted. A keeper whose whole batch was
-        // front-run loses only gas: everything it named was already paid.
-        if (paid == 0) revert NoEligibleRequests();
     }
 
     /// @notice Pulled-case bookkeeping for (escrow, caseId): measured proceeds,

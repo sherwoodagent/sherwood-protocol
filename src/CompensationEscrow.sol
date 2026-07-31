@@ -316,6 +316,23 @@ contract CompensationEscrow is Ownable2Step, ICompensationEscrow {
         backstop = backstop_;
     }
 
+    /// @notice Disabled. Ownership can be TRANSFERRED (`Ownable2Step`) but never
+    ///         dropped.
+    /// @dev PR #56 review. This contract's escape hatches all require a live
+    ///      owner, and one of them is the only exit for stranded residue:
+    ///      `sweepResidue` reverts `ZeroAddress` whenever `backstop == 0`, and
+    ///      `setBackstop` is `onlyOwner`. Renouncing before a backstop is wired
+    ///      would therefore lock every case's unredeemed remainder in this
+    ///      contract permanently — and even with one wired it would freeze
+    ///      `setAuthorizedFunder` / `setResidueWindow` against a funder
+    ///      migration or a window change. Reverting turns an irreversible
+    ///      one-call mistake into a no-op; a genuine hand-off still goes
+    ///      through `transferOwnership` → `acceptOwnership`, which cannot land
+    ///      on address(0). Mirrors `SyndicateVault.renounceOwnership`.
+    function renounceOwnership() public pure override {
+        revert OwnershipNotRenounceable();
+    }
+
     function setResidueWindow(uint256 window) external onlyOwner {
         // Bounded: a zero window would let residue be swept before holders can
         // realistically redeem; beyond a year the backstop never recovers dust.
