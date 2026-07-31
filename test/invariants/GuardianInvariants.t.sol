@@ -58,10 +58,8 @@ contract GuardianInvariantsTest is StdInvariant, Test {
                     minOwnerStake: MIN_OWNER_STAKE,
                     minSlashBps: 1000,
                     maxSlashBps: 9999,
-                    maxDelegatedSlashBps: 2000,
                     ageFloorBps: 2500,
-                    maturationPeriod: 30 days,
-                    delegatedWeightCapX: 4
+                    maturationPeriod: 30 days
                 }))
         );
         swood = StakedWood(address(new ERC1967Proxy(address(swoodImpl), swoodInit)));
@@ -76,44 +74,34 @@ contract GuardianInvariantsTest is StdInvariant, Test {
         vm.prank(owner);
         swood.setRegistry(address(registry));
 
-        // Delegation defaults off at deploy — flip it on so the handler can
-        // exercise the `poolTokens` WOOD bucket.
-        vm.prank(owner);
-        swood.setDelegationEnabled(true);
-
         handler = new GuardianHandler(registry, swood, wood, governor, vault, owner, factory);
 
         // Restrict the fuzzer to the handler's action surface.
         targetContract(address(handler));
 
-        bytes4[] memory selectors = new bytes4[](21);
+        bytes4[] memory selectors = new bytes4[](17);
         // Bucket 1 — guardian own stake.
         selectors[0] = GuardianHandler.stake.selector;
         selectors[1] = GuardianHandler.requestUnstake.selector;
         selectors[2] = GuardianHandler.cancelUnstake.selector;
         selectors[3] = GuardianHandler.claimUnstake.selector;
-        // Bucket 2 — delegation pools (poolTokens).
-        selectors[4] = GuardianHandler.delegate.selector;
-        selectors[5] = GuardianHandler.requestUnstakeDelegation.selector;
-        selectors[6] = GuardianHandler.cancelUnstakeDelegation.selector;
-        selectors[7] = GuardianHandler.claimUnstakeDelegation.selector;
-        // Bucket 3 — owner bonds.
-        selectors[8] = GuardianHandler.prepareOwnerStake.selector;
-        selectors[9] = GuardianHandler.cancelPreparedStake.selector;
-        selectors[10] = GuardianHandler.bindOwnerStake.selector;
-        selectors[11] = GuardianHandler.requestUnstakeOwner.selector;
-        selectors[12] = GuardianHandler.claimUnstakeOwner.selector;
-        // Bucket 4 — pending burn (via slashing).
-        selectors[13] = GuardianHandler.slash.selector;
-        selectors[14] = GuardianHandler.flushBurn.selector;
+        // Bucket 2 — owner bonds.
+        selectors[4] = GuardianHandler.prepareOwnerStake.selector;
+        selectors[5] = GuardianHandler.cancelPreparedStake.selector;
+        selectors[6] = GuardianHandler.bindOwnerStake.selector;
+        selectors[7] = GuardianHandler.requestUnstakeOwner.selector;
+        selectors[8] = GuardianHandler.claimUnstakeOwner.selector;
+        // Bucket 3 — pending burn (via slashing).
+        selectors[9] = GuardianHandler.slash.selector;
+        selectors[10] = GuardianHandler.flushBurn.selector;
         // Review lifecycle + time.
-        selectors[15] = GuardianHandler.vote.selector;
-        selectors[16] = GuardianHandler.openReview.selector;
-        selectors[17] = GuardianHandler.resolveReview.selector;
-        selectors[18] = GuardianHandler.createProposal.selector;
-        selectors[19] = GuardianHandler.warp.selector;
+        selectors[11] = GuardianHandler.vote.selector;
+        selectors[12] = GuardianHandler.openReview.selector;
+        selectors[13] = GuardianHandler.resolveReview.selector;
+        selectors[14] = GuardianHandler.createProposal.selector;
+        selectors[15] = GuardianHandler.warp.selector;
         // Registry-side slash-appeal reserve.
-        selectors[20] = GuardianHandler.fundSlashAppealReserve.selector;
+        selectors[16] = GuardianHandler.fundSlashAppealReserve.selector;
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
     }
 
@@ -123,28 +111,21 @@ contract GuardianInvariantsTest is StdInvariant, Test {
 
     /// @notice INV-1 (sWOOD): WOOD conservation. sWOOD is the sole WOOD
     ///         custodian post-split, so its WOOD balance must EXACTLY equal the
-    ///         sum of every obligation it tracks across all four buckets:
+    ///         sum of every obligation it tracks across all three buckets:
     ///
-    ///           Σ poolTokens (every delegate live pool)    bucket 2
-    ///         + Σ unbondingPoolTokens (every unbond pool)   bucket 2
-    ///         + Σ guardian own stake                 bucket 1
-    ///         + Σ unbound prepared owner stake        bucket 3
-    ///         + Σ owner bonds                         bucket 3
-    ///         + _pendingBurn                          bucket 4
+    ///           Σ guardian own stake                  bucket 1
+    ///         + Σ unbound prepared owner stake        bucket 2
+    ///         + Σ owner bonds                         bucket 2
+    ///         + _pendingBurn                          bucket 3
     ///         == wood.balanceOf(swood)
-    ///
-    ///         I-1: the unbonding-escrow pool (`unbondingPoolTokens`) custodies
-    ///         WOOD requested-out but not yet claimed — it is a real obligation
-    ///         and is slashed by `_slashOne` exactly like the live pool, so it
-    ///         joins bucket 2.
     ///
     ///         Burn handling — the crux of the equation:
     ///         * Successful slash burn: WOOD `transfer`s to BURN_ADDRESS, so it
     ///           leaves `balanceOf(swood)`; the slash also decremented own
-    ///           stake / poolTokens by the same amount, so both sides drop
-    ///           together — equality holds.
+    ///           stake by the same amount, so both sides drop together —
+    ///           equality holds.
     ///         * Failed slash burn: WOOD stays in `balanceOf(swood)`, own stake
-    ///           / poolTokens are decremented, and `_pendingBurn` is credited —
+    ///           is decremented, and `_pendingBurn` is credited —
     ///           `_pendingBurn` rebalances the equation.
     ///
     ///         `preparedStakeOf` keeps returning the amount after a slot is
@@ -163,62 +144,19 @@ contract GuardianInvariantsTest is StdInvariant, Test {
         for (uint256 i = 0; i < actors.length; i++) {
             // Bucket 1 — guardian own stake.
             obligations += swood.guardianStake(actors[i]);
-            // Bucket 2 — delegation pool backing for any actor that is a
-            // delegate. `delegatedInbound` returns `poolTokens[delegate]`.
-            obligations += swood.delegatedInbound(actors[i]);
-            // Bucket 2 — I-1 unbonding-escrow pool: WOOD requested-out but not
-            // yet claimed, still custodied by sWOOD.
-            obligations += swood.unbondingPoolTokens(actors[i]);
         }
 
-        // Bucket 3 — unbound prepared owner stakes (handler-tracked to dodge
+        // Bucket 2 — unbound prepared owner stakes (handler-tracked to dodge
         // the post-bind double-count described above).
         obligations += handler.totalUnboundPrepared();
 
-        // Bucket 3 — bound owner stakes across every vault the handler binds.
+        // Bucket 2 — bound owner stakes across every vault the handler binds.
         address[] memory bondVaults = handler.getBondVaults();
         for (uint256 i = 0; i < bondVaults.length; i++) {
             obligations += swood.ownerStake(bondVaults[i]);
         }
 
         assertEq(contractBal, obligations, "INV-1: sWOOD wood conservation violated");
-    }
-
-    /// @notice INV-1b (sWOOD): per-pool share consistency.
-    ///
-    ///         The task spec frames this as the biconditional
-    ///         `poolShares == 0 ⟺ poolTokens == 0`, but only ONE direction is a
-    ///         true protocol invariant — slashing breaks the other:
-    ///
-    ///         * `poolShares == 0 ⟹ poolTokens == 0` — HOLDS. The last
-    ///           delegator to `claimUnstakeDelegation` redeems `myShares ==
-    ///           poolShares`, and `owed == myShares * poolTokens / poolShares ==
-    ///           poolTokens`, so both hit zero together. No path leaves tokens
-    ///           with no shares to back them: `delegateStake` always mints
-    ///           shares for the tokens it adds.
-    ///
-    ///         * `poolTokens == 0 ⟹ poolShares == 0` — does NOT hold. A 100%
-    ///           slash (`_slashOne`) writes `poolTokens -= delSlash` to zero but
-    ///           deliberately leaves `poolShares` untouched — delegators keep
-    ///           their (now worthless) shares and redeem at a 0 rate. That is
-    ///           the intended dilution semantics, not a bug, so the invariant
-    ///           must not assert it. (`delegateStake` into such a pool reverts
-    ///           on the `mulDiv(amount, sh, 0)` divide-by-zero, so the
-    ///           shares-without-tokens pool is a safe terminal state.)
-    ///
-    ///         A `poolShares != 0 && poolTokens == 0` pool is therefore valid;
-    ///         a `poolShares == 0 && poolTokens != 0` pool is the real
-    ///         corruption this invariant guards against — free tokens with no
-    ///         claimant, un-redeemable WOOD stranded in a pool.
-    function invariant_poolShareConsistency() public view {
-        address[] memory delegates = handler.getTouchedDelegates();
-        for (uint256 i = 0; i < delegates.length; i++) {
-            if (swood.poolShares(delegates[i]) == 0) {
-                assertEq(
-                    swood.poolTokens(delegates[i]), 0, "INV-1b: pool has tokens but zero shares (un-redeemable WOOD)"
-                );
-            }
-        }
     }
 
     /// @notice The registry custodies WOOD only for the slash-appeal reserve
@@ -252,56 +190,31 @@ contract GuardianInvariantsTest is StdInvariant, Test {
     }
 
     // ──────────────────────────────────────────────────────────────
-    // INV-3: aged + k-capped vote weight bounds (spec Parts B/C)
+    // INV-3: aged vote weight bounds (spec Part B)
     // ──────────────────────────────────────────────────────────────
 
-    /// @notice Aged + k-capped vote weight never exceeds raw own stake ×
-    ///         (1 + k), and a zero-stake guardian carries zero weight.
+    /// @notice Age-weighted vote weight never exceeds raw own stake, and a
+    ///         zero-stake guardian carries zero weight.
     ///
-    ///         Bound derivation (spec §4-§5): `getVotes = agedOwn +
-    ///         min(delegated, k · agedOwn)` where `agedOwn = rawCheckpoint ·
-    ///         factor/10_000` and `factor <= 10_000`, so `agedOwn <=
-    ///         rawCheckpoint`. The stake checkpoint is re-pushed to
-    ///         `stakedAmount` on every mutation (stake/cancel/slash) and to 0
-    ///         on unstake-request, so `rawCheckpoint <= guardianStake` always.
-    ///         Hence `getVotes <= raw + k·raw`.
+    ///         Bound derivation (spec §4-§5): `getVotes = agedOwn` where
+    ///         `agedOwn = rawCheckpoint · factor/10_000` and `factor <=
+    ///         10_000`, so `agedOwn <= rawCheckpoint`. The stake checkpoint is
+    ///         re-pushed to `stakedAmount` on every mutation
+    ///         (stake/cancel/slash) and to 0 on unstake-request, so
+    ///         `rawCheckpoint <= guardianStake` always. Hence
+    ///         `getVotes <= raw`.
     ///
     ///         Zero-stake leg: a guardian slashed to zero own stake re-pushes
     ///         a 0 checkpoint (active leg) or already carries one (unstake-
-    ///         requested leg), so both `agedOwn` and the cap `k · agedOwn`
-    ///         collapse to 0 — delegation cannot resurrect weight for a
-    ///         zero-own guardian. The `slash` + `delegate` handler selectors
-    ///         exercise both legs, so this is non-vacuous.
+    ///         requested leg), so `agedOwn` collapses to 0. The `slash`
+    ///         handler selector exercises both legs, so this is non-vacuous.
     function invariant_agedWeightBounds() public view {
         address[] memory gs = handler.getActors();
-        uint256 k = swood.delegatedWeightCapX();
         for (uint256 i = 0; i < gs.length; i++) {
             uint256 raw = swood.guardianStake(gs[i]);
             uint256 votes = swood.getVotes(gs[i]);
-            assertLe(votes, raw + k * raw, "INV-3: vote weight exceeds raw stake x (1+k)");
+            assertLe(votes, raw, "INV-3: vote weight exceeds raw own stake");
             if (raw == 0) assertEq(votes, 0, "INV-3: zero-stake guardian carries nonzero weight");
-        }
-    }
-
-    /// @notice Relocated C-2: a slashed pool with outstanding shares retains
-    ///         >= 1 wei of backing tokens. `maxDelegatedSlashBps < 10_000`
-    ///         (enforced at init/setter) sizes the pool leg at `min(S, C)`, so
-    ///         a slash can never zero `poolTokens` while `poolShares` remain —
-    ///         the divide-by-zero that would brick `delegateStake` /
-    ///         `claimUnstakeDelegation` share math is impossible.
-    ///
-    ///         Non-vacuous: the handler drives `delegate` (mints shares +
-    ///         tokens) and `slash` (which invokes `_slashOne`'s pool legs),
-    ///         so live-share pools are actually slashed under fuzzing.
-    function invariant_poolsNeverZeroWithLiveShares() public view {
-        address[] memory gs = handler.getActors();
-        for (uint256 i = 0; i < gs.length; i++) {
-            if (swood.poolShares(gs[i]) != 0) {
-                assertGt(swood.poolTokens(gs[i]), 0, "INV-C2: live pool shares with zero backing tokens");
-            }
-            if (swood.unbondingPoolShares(gs[i]) != 0) {
-                assertGt(swood.unbondingPoolTokens(gs[i]), 0, "INV-C2: live unbonding shares with zero backing tokens");
-            }
         }
     }
 }

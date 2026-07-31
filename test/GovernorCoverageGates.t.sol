@@ -22,13 +22,10 @@ import {TierRegistry} from "../src/TierRegistry.sol";
 ///      `coolDownPeriod` (45d) covers epochLength (28d) + challengeWindow (14d).
 contract MockSwood {
     mapping(address => uint256) public guardianStake;
-    mapping(address => uint256) public delegatedInbound;
-    uint256 public maxDelegatedSlashBps = 2000;
     uint256 public coolDownPeriod = 45 days;
 
-    function setStake(address g, uint256 own, uint256 inbound) external {
+    function setStake(address g, uint256 own) external {
         guardianStake[g] = own;
-        delegatedInbound[g] = inbound;
     }
 }
 
@@ -521,7 +518,7 @@ contract GovernorCoverageGatesTest is Test {
     ///      == $1,000 of slashable bond.
     function _seatApprovers(uint256 pid, address[] memory gs, uint256 ownStakeEach) internal {
         for (uint256 i = 0; i < gs.length; i++) {
-            swood.setStake(gs[i], ownStakeEach, 0);
+            swood.setStake(gs[i], ownStakeEach);
             vm.prank(address(ledgerRegistry));
             ledger.recordApproval(address(governor), pid, gs[i]);
         }

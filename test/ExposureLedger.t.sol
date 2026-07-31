@@ -9,17 +9,10 @@ import {IExposureLedger} from "src/interfaces/IExposureLedger.sol";
 /// @dev Minimal sWOOD stub exposing exactly the reads the ledger consumes.
 contract MockSwood {
     mapping(address => uint256) public guardianStake;
-    mapping(address => uint256) public delegatedInbound;
-    uint256 public maxDelegatedSlashBps = 2000;
     uint256 public coolDownPeriod = 45 days;
 
-    function setStake(address g, uint256 own, uint256 inbound) external {
+    function setStake(address g, uint256 own) external {
         guardianStake[g] = own;
-        delegatedInbound[g] = inbound;
-    }
-
-    function setMaxDelegatedSlashBps(uint256 v) external {
-        maxDelegatedSlashBps = v;
     }
 }
 
@@ -141,6 +134,7 @@ contract ExposureLedgerTest is Test {
     address internal owner = makeAddr("owner");
     address internal guardian = makeAddr("guardian");
     address internal registry = makeAddr("registry");
+    address internal freezer = makeAddr("freezer");
     MockGovernorForLedger internal mgov;
     address internal usdgAsset;
 
@@ -152,16 +146,16 @@ contract ExposureLedgerTest is Test {
         ledger.setWoodUsdPrice(0.05e8); // $0.05, conservative haircut price
     }
 
-    function test_slashableBondUsd_ownPlusCappedDelegated() public {
-        // own 100k WOOD, inbound 200k WOOD, delegated cap 2000 bps (20%)
-        swood.setStake(guardian, 100_000e18, 200_000e18);
-        // slashable WOOD = 100k + 200k * 20% = 140k; at $0.05 => $7,000
-        assertEq(ledger.slashableBondUsd(guardian), 7_000e18);
+    function test_slashableBondUsd_ownStakeAtPrice() public {
+        // own 100k WOOD (the only slashable capital post delegation-removal)
+        swood.setStake(guardian, 100_000e18);
+        // slashable WOOD = 100k; at $0.05 => $5,000
+        assertEq(ledger.slashableBondUsd(guardian), 5_000e18);
     }
 
     function test_slashableBondUsd_zeroWhenPriceUnset() public {
         ExposureLedger fresh = new ExposureLedger(owner, address(swood), 28 days);
-        swood.setStake(guardian, 100_000e18, 0);
+        swood.setStake(guardian, 100_000e18);
         // fail-closed: unset price values every bond at $0 (nothing can be approved)
         assertEq(fresh.slashableBondUsd(guardian), 0);
     }
@@ -221,8 +215,9 @@ contract ExposureLedgerTest is Test {
         vm.startPrank(owner);
         ledger.setAssetFeed(usdgAsset, address(feed), 365 days);
         ledger.setGuardianRegistry(registry);
+        ledger.setCoverageFreezer(freezer);
         vm.stopPrank();
-        swood.setStake(guardian, 100_000e18, 0); // slashableBondUsd = $5,000 at $0.05
+        swood.setStake(guardian, 100_000e18); // slashableBondUsd = $5,000 at $0.05
     }
 
     function test_recordApproval_registryOnly() public {
@@ -266,7 +261,7 @@ contract ExposureLedgerTest is Test {
     function test_recordApproval_twoGuardiansAggregateToCover() public {
         _wireRecording();
         address g2 = makeAddr("g2");
-        swood.setStake(g2, 100_000e18, 0); // $5,000 each at $0.05
+        swood.setStake(g2, 100_000e18); // $5,000 each at $0.05
         mgov.set(8_000e6); // $8,000 needed — neither covers it alone
 
         vm.prank(registry);
@@ -294,7 +289,7 @@ contract ExposureLedgerTest is Test {
     function test_releaseApproval_popsTheApproverList() public {
         _wireRecording();
         address g2 = makeAddr("g2");
-        swood.setStake(g2, 100_000e18, 0);
+        swood.setStake(g2, 100_000e18);
         mgov.set(1_000e6);
 
         vm.prank(registry);
@@ -474,7 +469,7 @@ contract ExposureLedgerTest is Test {
     function test_settleCoverage_refusedUntilTheProposalCanNoLongerExecute() public {
         _wireRecording();
         address g2 = makeAddr("g2");
-        swood.setStake(g2, 100_000e18, 0);
+        swood.setStake(g2, 100_000e18);
         mgov.set(1_000e6);
         // reviewEnd is well before executeBy, which is the window the attack used.
         mgov.setScheduleFull(block.timestamp + 20 days, 3 days, block.timestamp + 1 days);
@@ -571,8 +566,8 @@ contract ExposureLedgerTest is Test {
         _wireRecording();
         address g2 = makeAddr("g2");
         address g3 = makeAddr("g3");
-        swood.setStake(g2, 100_000e18, 0);
-        swood.setStake(g3, 100_000e18, 0);
+        swood.setStake(g2, 100_000e18);
+        swood.setStake(g3, 100_000e18);
         mgov.set(1_200e6); // $1,200, each guardian holds a $5,000 bond
         mgov.setSchedule(block.timestamp + 1 days, 3 days);
 
@@ -608,8 +603,8 @@ contract ExposureLedgerTest is Test {
         _wireRecording();
         address g2 = makeAddr("g2");
         address g3 = makeAddr("g3");
-        swood.setStake(g2, 100_000e18, 0);
-        swood.setStake(g3, 100_000e18, 0);
+        swood.setStake(g2, 100_000e18);
+        swood.setStake(g3, 100_000e18);
         mgov.set(1_000e6); // 1000e18 / 3 does not divide evenly
         mgov.setSchedule(block.timestamp + 1 days, 3 days);
 
@@ -634,7 +629,7 @@ contract ExposureLedgerTest is Test {
     function test_settleCoverage_isIdempotent() public {
         _wireRecording();
         address g2 = makeAddr("g2");
-        swood.setStake(g2, 100_000e18, 0);
+        swood.setStake(g2, 100_000e18);
         mgov.set(1_000e6);
         mgov.setSchedule(block.timestamp + 1 days, 3 days);
         vm.startPrank(registry);
@@ -662,7 +657,7 @@ contract ExposureLedgerTest is Test {
     function test_settleCoverage_survivesABondCollapseBeforeSettling() public {
         _wireRecording();
         address g2 = makeAddr("g2");
-        swood.setStake(g2, 100_000e18, 0);
+        swood.setStake(g2, 100_000e18);
         mgov.set(1_000e6);
         mgov.setSchedule(block.timestamp + 1 days, 3 days);
 
@@ -675,7 +670,7 @@ contract ExposureLedgerTest is Test {
         skip(31 days); // review shut
 
         // The guardian's bond evaporates -- unstaked, or WOOD collapsed.
-        swood.setStake(guardian, 0, 0);
+        swood.setStake(guardian, 0);
         assertEq(ledger.slashableBondUsd(guardian), 0, "nothing left to slash");
 
         ledger.settleCoverage(address(mgov), 1); // must not revert or underflow
@@ -705,12 +700,12 @@ contract ExposureLedgerTest is Test {
         _wireRecording();
         address g2 = makeAddr("g2");
         address g3 = makeAddr("g3");
-        swood.setStake(g2, 100_000e18, 0); // $5,000 -> reserves the full 1,000
+        swood.setStake(g2, 100_000e18); // $5,000 -> reserves the full 1,000
         // Deliberately UNEQUAL so the pro-rata split does not divide evenly and
         // the residue path is actually exercised. With equal bonds this test
         // passes with the residue top-up deleted, which makes it worthless as
         // cover for that branch.
-        swood.setStake(g3, 10_000e18, 0); // $500 -> reserves only 500
+        swood.setStake(g3, 10_000e18); // $500 -> reserves only 500
         mgov.set(1_000e6);
         mgov.setSchedule(block.timestamp + 1 days, 3 days);
 
@@ -752,7 +747,7 @@ contract ExposureLedgerTest is Test {
         assertEq(ledger.woodPriceX8(), 0.06e8, "haircut applied to the live read");
 
         // And it flows through to what a bond is worth.
-        swood.setStake(guardian, 100_000e18, 0);
+        swood.setStake(guardian, 100_000e18);
         assertEq(ledger.slashableBondUsd(guardian), 6_000e18, "100k WOOD at the haircut price");
     }
 
@@ -763,7 +758,7 @@ contract ExposureLedgerTest is Test {
         MockFeed woodFeed = new MockFeed(0.05e8, 8);
         vm.prank(owner);
         ledger.setWoodFeed(address(woodFeed), 1 days);
-        swood.setStake(guardian, 100_000e18, 0);
+        swood.setStake(guardian, 100_000e18);
         assertEq(ledger.slashableBondUsd(guardian), 5_000e18);
 
         woodFeed.set(0.005e8); // 10x collapse, no owner action
@@ -785,7 +780,7 @@ contract ExposureLedgerTest is Test {
         skip(2 hours);
         assertEq(ledger.woodPriceX8(), 0.05e8, "stale: governance fallback, not zero");
 
-        swood.setStake(guardian, 100_000e18, 0);
+        swood.setStake(guardian, 100_000e18);
         assertEq(ledger.slashableBondUsd(guardian), 5_000e18, "bonds still valued, approvals still possible");
     }
 
@@ -811,7 +806,7 @@ contract ExposureLedgerTest is Test {
     function test_allocatedUsd_excludesBondThatIsNoLongerThere() public {
         _wireRecording();
         address g2 = makeAddr("g2");
-        swood.setStake(g2, 100_000e18, 0);
+        swood.setStake(g2, 100_000e18);
         mgov.set(1_000e6);
         mgov.setSchedule(block.timestamp + 1 days, 3 days);
 
@@ -822,7 +817,7 @@ contract ExposureLedgerTest is Test {
         assertEq(ledger.allocatedUsd(address(mgov), 1, guardian), 500e18, "even split while both can pay");
 
         // One bond is devalued to a quarter of what it pledged.
-        swood.setStake(guardian, 5_000e18, 0); // $250 of a $1,000 reservation
+        swood.setStake(guardian, 5_000e18); // $250 of a $1,000 reservation
 
         // The split is pro-rata over EFFECTIVE capacity, not a simple cap:
         // effective total is 250 + 1000 = 1250, so the shares are 250/1250 and
@@ -858,7 +853,7 @@ contract ExposureLedgerTest is Test {
 
         // And it flows through to bond valuation, which is what the looser
         // batching cap would have come from.
-        swood.setStake(guardian, 100_000e18, 0);
+        swood.setStake(guardian, 100_000e18);
         assertEq(ledger.slashableBondUsd(guardian), 4_000e18, "not the 5_000 an unhaircut fallback would give");
     }
 
@@ -927,7 +922,7 @@ contract ExposureLedgerTest is Test {
     function test_recordApproval_frontRunnerCannotVetoByReleasing() public {
         _wireRecording();
         address attacker = makeAddr("attacker");
-        swood.setStake(attacker, 100_000e18, 0); // $5,000
+        swood.setStake(attacker, 100_000e18); // $5,000
         mgov.set(4_000e6); // $4,000 needed — either could cover it alone
 
         // The attacker gets in first and would, under the old rule, absorb it all.
@@ -1037,7 +1032,7 @@ contract ExposureLedgerTest is Test {
         // any coverage this fuzz generates, so the cap never binds. The old
         // 20x price raise on top of that was redundant, and now trips the
         // upward rate limit on `setWoodUsdPrice`.
-        swood.setStake(guardian, type(uint96).max, 0);
+        swood.setStake(guardian, type(uint96).max);
         uint256 u1 = uint256(c1) % 1_000_000e6 + 1;
         uint256 u2 = uint256(c2) % 1_000_000e6 + 1;
         mgov.set(u1);
@@ -1078,8 +1073,8 @@ contract ExposureLedgerTest is Test {
     function test_approveQuorum_sumOfCommittedSharesCoversCoverage() public {
         _wireRecording();
         address g2 = makeAddr("g2");
-        swood.setStake(guardian, 60_000e18, 0); // $3,000
-        swood.setStake(g2, 60_000e18, 0); // $3,000
+        swood.setStake(guardian, 60_000e18); // $3,000
+        swood.setStake(g2, 60_000e18); // $3,000
         mgov.set(5_000e6); // $5,000 needed
 
         vm.prank(registry);
@@ -1235,7 +1230,7 @@ contract ExposureLedgerTest is Test {
         led.setGuardianRegistry(registry);
         led.setWoodUsdPrice(0.05e8);
         vm.stopPrank();
-        swood.setStake(guardian, 400_000e18, 0); // $20,000 budget
+        swood.setStake(guardian, 400_000e18); // $20,000 budget
 
         shortGov.setSchedule(block.timestamp + 1 days, 3 days); // settles ~4d out
         shortGov.set(1_000e6);
@@ -1273,10 +1268,214 @@ contract ExposureLedgerTest is Test {
         MockFeed hugeFeed = new MockFeed(1e30, 8);
         vm.prank(owner);
         ledger.setAssetFeed(usdgAsset, address(hugeFeed), 365 days);
-        swood.setStake(guardian, 1e60, 0);
+        swood.setStake(guardian, 1e60);
         mgov.set(1e25);
         vm.prank(registry);
         vm.expectRevert(IExposureLedger.InvalidParameter.selector);
         ledger.recordApproval(address(mgov), 1, guardian);
+    }
+
+    /// @notice `slashBpsFor` converts each guardian's BOOKED coverage into the
+    ///         bps-of-stake that `slashToEscrow` speaks. Both inputs are USD, so
+    ///         the quotient is DIMENSIONALLY unitless — but both operands are
+    ///         priced (🟡N5): asset feed in the numerator, `woodPriceX8()` in
+    ///         the denominator. Here the two approvers underwrote different
+    ///         amounts of the same proposal, so they must carry different rates.
+    function test_slashBpsFor_ratesTrackEachApproversOwnCommitment() public {
+        _wireRecording();
+        address g2 = makeAddr("g2");
+        swood.setStake(g2, 50_000e18); // $2,500 bond vs the guardian's $5,000
+        mgov.set(2_000e6); // $2,000 needed — either could carry it alone
+
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, g2);
+
+        // Both reservations are capped by the COVERAGE ($2,000), not by budget,
+        // so the pro-rata split is even: $1,000 of liability each.
+        assertEq(ledger.allocatedUsd(address(mgov), 1, guardian), 1_000e18);
+        assertEq(ledger.allocatedUsd(address(mgov), 1, g2), 1_000e18);
+
+        (address[] memory approvers, uint256[] memory bps) = ledger.slashBpsFor(address(mgov), 1);
+
+        assertEq(approvers.length, 2, "both approvers listed");
+        assertEq(approvers[0], guardian);
+        assertEq(approvers[1], g2);
+        // Equal liability, unequal bonds -> unequal RATES. $1,000 is a fifth of
+        // the guardian's $5,000 but two fifths of g2's $2,500, and the rate is
+        // what `slashToEscrow` applies to each one's own stake.
+        assertEq(bps[0], 2_000, "a fifth of the larger bond");
+        assertEq(bps[1], 4_000, "two fifths of the smaller one");
+    }
+
+    /// @notice PR #24 review F-B: `slashBpsFor` must price the bond with
+    ///         `woodPriceX8()` — the same Chainlink-with-haircut read every
+    ///         other consumer uses — not the raw governance scalar. A merge
+    ///         artefact had it on `woodUsdPriceX8`, so the moment a WOOD feed
+    ///         was wired the gate and the slash rail priced the same bond
+    ///         differently: a feed above the scalar over-slashed 2x, a haircut
+    ///         under-recovered by half.
+    function test_slashBpsFor_pricesBondsWithTheFeedNotTheRawScalar() public {
+        _wireRecording();
+        address g2 = makeAddr("g2");
+        swood.setStake(g2, 50_000e18);
+        mgov.set(2_000e6);
+
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, g2);
+
+        // Baseline (governance scalar $0.05): $5,000 / $2,500 bonds, $1,000
+        // liability each -> 2,000 / 4,000 bps.
+        (, uint256[] memory bpsBefore) = ledger.slashBpsFor(address(mgov), 1);
+        assertEq(bpsBefore[0], 2_000);
+        assertEq(bpsBefore[1], 4_000);
+
+        // Wire a feed at 2x the scalar. `woodPriceX8()` now reads $0.10, the
+        // bonds are worth twice as much, and the SAME dollar liability is half
+        // the rate. Reading the raw scalar would leave the rates unchanged —
+        // taking twice the liability from every approver.
+        MockFeed woodFeed = new MockFeed(0.1e8, 8);
+        vm.prank(owner);
+        ledger.setWoodFeed(address(woodFeed), 1 days);
+        assertEq(ledger.woodPriceX8(), 0.1e8, "feed supersedes the scalar");
+
+        (, uint256[] memory bpsAfter) = ledger.slashBpsFor(address(mgov), 1);
+        assertEq(bpsAfter[0], 1_000, "rate tracks the feed-priced bond");
+        assertEq(bpsAfter[1], 2_000, "rate tracks the feed-priced bond");
+    }
+
+    /// @notice F-B, the other direction (review round-4): the haircut must
+    ///         reach `slashBpsFor` too, and it needs NO feed at all —
+    ///         `_haircut` applies to the fallback scalar. Reading the raw
+    ///         scalar would value the bond at full price and under-recover by
+    ///         the haircut: at 5,000 bps that is half the liability, silently.
+    function test_slashBpsFor_appliesTheHaircut() public {
+        _wireRecording();
+        mgov.set(2_000e6);
+
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+
+        // No WOOD feed wired. Scalar $0.05, bond $5,000, $2,000 liability.
+        (, uint256[] memory bpsBefore) = ledger.slashBpsFor(address(mgov), 1);
+        assertEq(bpsBefore[0], 4_000, "baseline: raw scalar, no haircut");
+
+        // Haircut to 50%: `woodPriceX8()` reads $0.025, the bond books $2,500,
+        // and the same $2,000 liability is 8,000 bps. A raw-scalar read would
+        // stay at 4,000 — a 50% under-recovery with no feed involved.
+        vm.prank(owner);
+        ledger.setWoodHaircutBps(5_000);
+        assertEq(ledger.woodPriceX8(), 0.025e8, "haircut applies to the fallback");
+
+        (, uint256[] memory bpsAfter) = ledger.slashBpsFor(address(mgov), 1);
+        assertEq(bpsAfter[0], 8_000, "rate tracks the haircut-priced bond");
+    }
+
+    /// @notice A guardian whose commitment was RELEASED by a vote change stays
+    ///         in the approver list with a zeroed booking. It must price at 0 —
+    ///         liability follows the commitment, and `slashToEscrow` skips a
+    ///         zero rate rather than flooring it to `minSlashBps`.
+    function test_slashBpsFor_zeroForAnApproverThatBookedNothing() public {
+        _wireRecording();
+        mgov.set(1_000e6);
+
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        vm.prank(registry);
+        ledger.releaseApproval(address(mgov), 1, guardian);
+
+        // #22's M2 fix swap-and-pops a released approver out of the list rather
+        // than leaving it behind with a zeroed commitment, so it is no longer
+        // returned at all. The property this test exists for is unchanged and
+        // arguably stated better: a released approver contributes NOTHING to a
+        // conviction. Previously that was "present with a 0 rate"; it is now
+        // "absent", and `slashToEscrow` cannot slash whom it is not given.
+        (address[] memory approvers, uint256[] memory bps) = ledger.slashBpsFor(address(mgov), 1);
+        assertEq(approvers.length, 0, "released approver is popped, not zeroed");
+        assertEq(bps.length, 0);
+
+        // Re-approving re-lists cleanly, with a real rate.
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        (approvers, bps) = ledger.slashBpsFor(address(mgov), 1);
+        assertEq(approvers.length, 1, "re-listed");
+        assertEq(approvers[0], guardian);
+        assertGt(bps[0], 0, "and carries a real rate again");
+    }
+
+    /// @notice Rounds UP. Truncation would shave every approver's rate and the
+    ///         residue compounds across a cohort, quietly breaking
+    ///         `sum(slashed) >= loss`. $1,000 booked against a $3,000 bond is
+    ///         3333.33 bps, which must price at 3334 rather than 3333.
+    function test_slashBpsFor_roundsUpSoTheCohortNeverUnderCovers() public {
+        _wireRecording();
+        swood.setStake(guardian, 60_000e18); // $3,000 bond at $0.05
+        mgov.set(1_000e6); // books exactly $1,000
+
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+
+        (, uint256[] memory bps) = ledger.slashBpsFor(address(mgov), 1);
+        assertEq(bps[0], 3334, "3333.33 bps rounds toward the protocol");
+    }
+
+    /// @notice When the bond SHRANK below the commitment after the vote —
+    ///         unstaking, or a WOOD price crash — the rate saturates at 100%.
+    ///         The case under-recovers by the shortfall, which is unavoidable:
+    ///         the guardian no longer has it.
+    function test_slashBpsFor_saturatesWhenTheBondShrankBelowTheCommitment() public {
+        _wireRecording();
+        mgov.set(5_000e6); // books the full $5,000 bond
+
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+
+        swood.setStake(guardian, 50_000e18); // bond halves to $2,500
+
+        (, uint256[] memory bps) = ledger.slashBpsFor(address(mgov), 1);
+        assertEq(bps[0], 10_000, "capped at everything the guardian still has");
+    }
+
+    /// @notice `approversOf` is the challenge game's read of who covered a
+    ///         proposal (Plan D). It reports RESERVATIONS, not allocations.
+    function test_approversOf_listsCommittedApprovers() public {
+        _wireRecording();
+        address g2 = makeAddr("g2");
+        swood.setStake(g2, 100_000e18);
+        mgov.set(8_000e6);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, g2);
+
+        (address[] memory gs, uint256[] memory shares) = ledger.approversOf(address(mgov), 1);
+        assertEq(gs.length, 2);
+        assertEq(gs[0], guardian);
+        assertEq(gs[1], g2);
+        // RESERVATION, NOT ALLOCATION: each approver books min(free budget,
+        // whole coverage) — the most it could ever carry — and the final
+        // pro-rata split is computed at read time by `allocatedUsd`.
+        assertEq(shares[0], 5_000e18); // its whole budget
+        assertEq(shares[1], 5_000e18); // its whole budget too, not the remainder
+    }
+
+    /// @notice #22's M2 fix swap-and-pops a released approver out of the list
+    ///         rather than leaving it behind with a zeroed commitment, so it is
+    ///         no longer returned at all — a released approver contributes
+    ///         NOTHING to a conviction, and the list stays bounded by the
+    ///         registry's approver cap instead of by everyone who EVER approved.
+    function test_approversOf_dropsReleasedApprovers() public {
+        _wireRecording();
+        mgov.set(3_000e6);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        vm.prank(registry);
+        ledger.releaseApproval(address(mgov), 1, guardian);
+        (address[] memory gs, uint256[] memory shares) = ledger.approversOf(address(mgov), 1);
+        assertEq(gs.length, 0, "released approver is popped, not zeroed");
+        assertEq(shares.length, 0);
     }
 }

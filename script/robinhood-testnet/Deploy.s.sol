@@ -88,10 +88,8 @@ contract DeployRobinhoodTestnet is ScriptBase {
                     minOwnerStake: 10_000e18,
                     minSlashBps: 1000,
                     maxSlashBps: 10_000,
-                    maxDelegatedSlashBps: 2000,
                     ageFloorBps: 2500,
-                    maturationPeriod: 30 days,
-                    delegatedWeightCapX: 4
+                    maturationPeriod: 30 days
                 }))
         );
         address swoodProxy = address(new ERC1967Proxy(address(swoodImpl), swoodInitData));

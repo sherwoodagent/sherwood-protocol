@@ -160,10 +160,8 @@ contract CoverageEndToEndTest is Test {
                     minOwnerStake: 10_000e18,
                     minSlashBps: 1000,
                     maxSlashBps: 9999,
-                    maxDelegatedSlashBps: 2000,
                     ageFloorBps: 2500,
-                    maturationPeriod: 30 days,
-                    delegatedWeightCapX: 4
+                    maturationPeriod: 30 days
                 }))
         );
         swood = StakedWood(address(new ERC1967Proxy(address(swoodImpl), swoodInit)));
@@ -574,6 +572,90 @@ contract CoverageEndToEndTest is Test {
         vm.prank(g1);
         swood.claimUnstakeGuardian();
         assertGt(wood.balanceOf(g1), balBefore, "stake released once nothing is owed");
+    }
+
+    /// @notice PR #25 review F2/F6: expiry alone is NOT the exit condition while
+    ///         an accusation is live. `openExposureUsd` sums epoch buckets on
+    ///         pure wall-clock, so coverage ages out on a timer that does not
+    ///         pause for a challenge — and the challenge game's disputed tail
+    ///         (up to `disputeTimeout`, 30d) outlives it by design. The accused
+    ///         could therefore request at execution, wait, and walk the whole
+    ///         bond out before the challenge could resolve; the conviction then
+    ///         priced maximum guilt (`live == 0` saturates `slashBpsFor` at
+    ///         10,000 bps) and recovered nothing, silently.
+    ///
+    ///         The freeze is what closes it — and closing it is also what makes
+    ///         the freeze load-bearing at all (F6): before this its only reader
+    ///         was `releaseApproval`, whose sole caller is unreachable in every
+    ///         state a freeze can exist in.
+    function test_exitGate_frozenCoverageOutlivesBucketExpiry() public {
+        vm.prank(owner);
+        swood.setExposureLedger(address(ledger));
+        // This test contract stands in for the challenge game.
+        vm.prank(ledgerOwner);
+        ledger.setCoverageFreezer(address(this));
+
+        uint256 pid = _propose(govA, address(vaultA), agentA);
+        _openReview(govA, pid);
+        _vote(govA, pid, g1, IGuardianRegistry.GuardianVoteType.Approve);
+
+        // A challenge lands against the proposal g1 covered.
+        ledger.freezeCoverage(address(govA), pid);
+        assertTrue(ledger.hasFrozenCoverage(g1), "g1 is named by a frozen proposal");
+
+        vm.prank(g1);
+        swood.requestUnstakeGuardian();
+
+        // Far past every bucket clock — exactly the window that used to release
+        // the bond out from under a live accusation.
+        vm.warp(vm.getBlockTimestamp() + 365 days);
+        assertEq(ledger.openExposureUsd(g1), 0, "the buckets have expired, as they always did");
+
+        vm.prank(g1);
+        vm.expectRevert(StakedWood.CoverageStillOpen.selector);
+        swood.claimUnstakeGuardian();
+
+        // Once the challenge resolves, the exit opens on the same terms as before.
+        ledger.unfreezeCoverage(address(govA), pid);
+        assertFalse(ledger.hasFrozenCoverage(g1), "nothing pins g1 any more");
+
+        uint256 balBefore = wood.balanceOf(g1);
+        vm.prank(g1);
+        swood.claimUnstakeGuardian();
+        assertGt(wood.balanceOf(g1), balBefore, "the gate is a condition, not a longer timer");
+    }
+
+    /// @notice The frozen-commitment count is per guardian and exact: a second
+    ///         frozen proposal naming the same guardian must not be released by
+    ///         the first one unfreezing, and a repeated unfreeze must not
+    ///         underflow it into a permanent lock.
+    function test_exitGate_frozenCoverageCountsEveryLiveAccusation() public {
+        vm.prank(owner);
+        swood.setExposureLedger(address(ledger));
+        // This test contract stands in for the challenge game.
+        vm.prank(ledgerOwner);
+        ledger.setCoverageFreezer(address(this));
+
+        // Two syndicates, so g1 carries two independent commitments at once.
+        uint256 pidA = _propose(govA, address(vaultA), agentA);
+        _openReview(govA, pidA);
+        _vote(govA, pidA, g1, IGuardianRegistry.GuardianVoteType.Approve);
+        uint256 pidB = _propose(govB, address(vaultB), agentB);
+        _openReview(govB, pidB);
+        _vote(govB, pidB, g1, IGuardianRegistry.GuardianVoteType.Approve);
+
+        ledger.freezeCoverage(address(govA), pidA);
+        ledger.freezeCoverage(address(govB), pidB);
+        assertTrue(ledger.hasFrozenCoverage(g1));
+
+        ledger.unfreezeCoverage(address(govA), pidA);
+        assertTrue(ledger.hasFrozenCoverage(g1), "the second accusation still pins the guardian");
+
+        ledger.unfreezeCoverage(address(govB), pidB);
+        assertFalse(ledger.hasFrozenCoverage(g1), "released only when the last one clears");
+
+        ledger.unfreezeCoverage(address(govB), pidB);
+        assertFalse(ledger.hasFrozenCoverage(g1), "a repeated unfreeze cannot underflow the count");
     }
 
     /// @notice FAIL-OPEN with no ledger wired. There is necessarily a window at

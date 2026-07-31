@@ -21,10 +21,10 @@ import {MockERC4626Vault} from "../../mocks/MockERC4626Vault.sol";
 ///         `GuardianRegistry`. The handler drives the staking surface on sWOOD
 ///         and the review surface on the registry.
 ///
-///         Task 11.2: the handler now exercises ALL FOUR WOOD-holding buckets
-///         on `StakedWood` so the WOOD-conservation invariant is meaningful:
-///         (1) guardian own stake, (2) delegation pools (`poolTokens`),
-///         (3) owner bonds, (4) the `_pendingBurn` queue (via slashing).
+///         DPoS delegation was removed from the protocol (postponed), so the
+///         handler exercises the THREE remaining WOOD-holding buckets on
+///         `StakedWood`: (1) guardian own stake, (2) owner bonds, (3) the
+///         `_pendingBurn` queue (via slashing).
 contract GuardianHandler is Test {
     GuardianRegistry public registry;
     StakedWood public swood;
@@ -43,11 +43,6 @@ contract GuardianHandler is Test {
     ///      harness `vault` is element 0 so review flows (which read the
     ///      registry's `vault`) and owner-bond flows share it.
     address[] public bondVaults;
-
-    /// @dev Delegates the handler has ever delegated to — the share-consistency
-    ///      invariant iterates this set.
-    address[] public touchedDelegates;
-    mapping(address => bool) internal _seenDelegate;
 
     /// @dev Vaults that currently hold a bound owner stake. The production
     ///      factory calls `bindOwnerStake` exactly once per freshly-created
@@ -75,7 +70,6 @@ contract GuardianHandler is Test {
     // Stats for debugging / logs.
     uint256 public successfulStakes;
     uint256 public successfulResolves;
-    uint256 public successfulDelegations;
     uint256 public successfulBonds;
     uint256 public successfulSlashes;
 
@@ -150,46 +144,7 @@ contract GuardianHandler is Test {
     }
 
     // ──────────────────────────────────────────────────────────────
-    // Delegation actions (pool tokens → sWOOD bucket 2)
-    // ──────────────────────────────────────────────────────────────
-
-    function delegate(uint256 delegatorSeed, uint256 delegateSeed, uint256 amount) external {
-        address delegator = actors[bound(delegatorSeed, 0, actors.length - 1)];
-        address delegateAddr = actors[bound(delegateSeed, 0, actors.length - 1)];
-        amount = bound(amount, 1e18, 100_000e18);
-        vm.prank(delegator);
-        try swood.delegateStake(delegateAddr, amount) {
-            successfulDelegations += 1;
-            if (!_seenDelegate[delegateAddr]) {
-                _seenDelegate[delegateAddr] = true;
-                touchedDelegates.push(delegateAddr);
-            }
-        } catch {}
-    }
-
-    function requestUnstakeDelegation(uint256 delegatorSeed, uint256 delegateSeed) external {
-        address delegator = actors[bound(delegatorSeed, 0, actors.length - 1)];
-        address delegateAddr = actors[bound(delegateSeed, 0, actors.length - 1)];
-        vm.prank(delegator);
-        try swood.requestUnstakeDelegation(delegateAddr) {} catch {}
-    }
-
-    function cancelUnstakeDelegation(uint256 delegatorSeed, uint256 delegateSeed) external {
-        address delegator = actors[bound(delegatorSeed, 0, actors.length - 1)];
-        address delegateAddr = actors[bound(delegateSeed, 0, actors.length - 1)];
-        vm.prank(delegator);
-        try swood.cancelUnstakeDelegation(delegateAddr) {} catch {}
-    }
-
-    function claimUnstakeDelegation(uint256 delegatorSeed, uint256 delegateSeed) external {
-        address delegator = actors[bound(delegatorSeed, 0, actors.length - 1)];
-        address delegateAddr = actors[bound(delegateSeed, 0, actors.length - 1)];
-        vm.prank(delegator);
-        try swood.claimUnstakeDelegation(delegateAddr) {} catch {}
-    }
-
-    // ──────────────────────────────────────────────────────────────
-    // Owner-bond actions (owner stake → sWOOD bucket 3)
+    // Owner-bond actions (owner stake → sWOOD bucket 2)
     // ──────────────────────────────────────────────────────────────
 
     function prepareOwnerStake(uint256 actorSeed, uint256 amount) external {
@@ -246,16 +201,16 @@ contract GuardianHandler is Test {
     }
 
     // ──────────────────────────────────────────────────────────────
-    // Slashing (pending-burn → sWOOD bucket 4)
+    // Slashing (pending-burn → sWOOD bucket 3)
     // ──────────────────────────────────────────────────────────────
 
     /// @dev Slashing is `onlyRegistry`. Driving a real review-block to quorum
     ///      from the fuzzer is brittle, so the handler pranks the registry
-    ///      directly to exercise the slash path — this mutates own stake,
-    ///      `poolTokens` and (on a transfer-failing WOOD) `_pendingBurn`,
-    ///      which is exactly the bucket-4 coverage the conservation invariant
-    ///      needs. `slashGuardians` clamps `slashBps` to [minSlashBps,
-    ///      maxSlashBps] internally; any value is safe to pass.
+    ///      directly to exercise the slash path — this mutates own stake and
+    ///      (on a transfer-failing WOOD) `_pendingBurn`, which is exactly the
+    ///      pending-burn coverage the conservation invariant needs.
+    ///      `slashGuardians` clamps `slashBps` to [minSlashBps, maxSlashBps]
+    ///      internally; any value is safe to pass.
     function slash(uint256 proposalSeed, uint256 approverSeed, uint256 slashBps) external {
         if (proposalIds.length == 0) return;
         uint256 pid = proposalIds[bound(proposalSeed, 0, proposalIds.length - 1)];
@@ -365,10 +320,6 @@ contract GuardianHandler is Test {
 
     function getBondVaults() external view returns (address[] memory) {
         return bondVaults;
-    }
-
-    function getTouchedDelegates() external view returns (address[] memory) {
-        return touchedDelegates;
     }
 
     /// @dev Sum of every actor's UNBOUND prepared owner stake — mirrors what

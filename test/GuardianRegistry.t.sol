@@ -4,7 +4,6 @@ pragma solidity 0.8.28;
 import "forge-std/Test.sol";
 import {GuardianRegistry} from "../src/GuardianRegistry.sol";
 import {StakedWood} from "../src/StakedWood.sol";
-import {StakedWoodDelegation} from "../src/StakedWoodDelegation.sol";
 import {IGuardianRegistry} from "../src/interfaces/IGuardianRegistry.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
@@ -15,12 +14,12 @@ import {RegistryTestHarness} from "./helpers/RegistryTestHarness.sol";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Post-split note (Task 7.1): WOOD custody, guardian staking, owner bonds, DPoS
-// delegation, vote checkpoints, slashing + burn all moved to `StakedWood`
+// vote checkpoints, slashing + burn all moved to `StakedWood`
 // (sWOOD). The pure-staking / owner-bond / burn test contracts that used to
 // live here (`GuardianRegistryStakeTest`, `…UnstakeTest`, `…OwnerPrepareTest`,
 // `…OwnerBindTest`, `…OwnerUnstakeTest`, `…BondTest`, `…BurnTest`) were DELETED
 // — that behaviour is now covered by `StakedWood.t.sol`,
-// `StakedWoodDelegation.t.sol`, and `StakedWoodSlashing.t.sol`.
+// and `StakedWoodSlashing.t.sol`.
 //
 // The remaining contracts (init / review / vote / resolve / emergency / appeal
 // / pause / param) are migrated onto `RegistryTestHarness`: they deploy BOTH

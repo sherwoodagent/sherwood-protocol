@@ -6,6 +6,20 @@
 
 **Implementation status 2026-07-24 — v1a COMPLETE (Plan A + Plan B).** Plan A (PR #13, merged) shipped §3.1–§3.2: risk envelopes, per-proposal net-outflow metering, adapter tiering with the codehash fail-safe, and the ERC20 selector guard. Plan B (PR #22) completes v1a: the dollar-denominated `ExposureLedger` (§3.3 aggregate cap with epoch-bucketed exposure per §3.4a, §3.3a approve quorum, §3.7 covered-TVL cap), the risk-scaled proposer bond and its escrow (§3.9), the adapter-submitter bond (§3.6), and the factory rewire path that closes LOW-1. **v1b (Plan C) is next:** authorized-slasher entrypoint, compensation escrow (§3.8), challenge game (§3.4), approver premium (§3.10). Bond **forfeiture** lives there — in v1a a bond's only exit is release to the proposer; rejection, expiry and cancellation all return it, because a guardian block is not a conviction.
 
+**Implementation status 2026-07-25 — v1b PART 1 complete (Plan C).** The retroactive-liability *payout rails* are built: `StakedWood` gained an `authorizedSlasher` role and a `slashToEscrow` entrypoint that reuses the existing per-approver slash legs but routes proceeds to a new `CompensationEscrow` instead of the burn address (§4), and the escrow pays **non-transferable, snapshot-gated** claims pro-rata to holders of record at a pre-drain snapshot (§3.8) — closing the F1 recoupment channel. Residue unredeemed after a window sweeps to the protocol backstop, never to live NAV.
+
+**Implementation status 2026-07-25 — v1b PART 2 complete (Plan D): the challenge game (§3.4) is built.** Anyone may post a bonded challenge against an executed proposal, citing one of the five predicates and an evidence pointer; filing freezes exactly that proposal's committed coverage (never the guardian's whole stake), so the accused cannot recycle the budget while under challenge. An **undisputed** challenge auto-slashes the covering approvers into Plan C's `CompensationEscrow` once `autoSlashDelay` elapses, as a case pinned to the block before the drain, and demotes the adapter the filing named. A **disputed** one — the accused posts a matching counter-bond — escalates to §3.5. A failed challenge forfeits the challenger's bond to the accused pro-rata to their committed shares.
+
+**What that changes, precisely.** `authorizedSlasher` is now the `ChallengeGame`, not a multisig. So for an **UNDISPUTED** verdict the slash is finally driven by the mechanism rather than by governance — the trigger above the rails is no longer a human decision. **The decisive design fact, stated plainly: §3.4 adjudicates by SILENCE, not by on-chain proof.** There is no `prove()` and no on-chain predicate verification; all five predicates take one identical path and the predicate label is carried in the event for routing, nothing more. A fixed on-chain check could only ever cover predicates 1, 4 and 5 — 2 needs a venue-specific fair-value model and 3 is a funding-graph question §8 itself says needs a consistent evidentiary standard — and running code-enforced and judge-enforced predicates side by side would put two security models inside one mechanism. **The consequence, named rather than left to be found: vigilance cost moves to guardians**, who are slashed on an unproven assertion if they sleep through `autoSlashDelay`. What holds that in check is the challenger's bond, scaled to the coverage the filing freezes and forfeited to the accused when the challenge fails.
+
+**Still outstanding in v1b, and the honest consequence — SUPERSEDED by the v1c entry below, kept for the record:** a **DISPUTED** challenge had nowhere to go. The two-layer court (§3.5) was **not built** (Plan E), so an escalated challenge that nobody rules on times out in favour of the accused once `disputeTimeout` elapses — failing safe toward *not* slashing, which is the right default when the adjudicator is missing, but it means **a genuinely guilty approver can dispute and run out the clock until Plan E ships**. That is the accepted cost of shipping the game before the court, and it is strictly better than an indefinite freeze, which would let anyone pin a guardian's coverage forever by filing. Also outstanding: §3.4a epoch NAV checkpointing (Plan F) and the **approver premium (§3.10)** plus watchtower funding (Plan G). Separately, the §3.4 first-detector bounty is delivered **off-chain** (see the implementation note in §3.4), so on-chain a successful challenger only breaks even.
+
+**Implementation status 2026-07-25 — v1c COMPLETE (Plan E): the two-layer court (§3.5) adjudicates disputed challenges.** The hole named directly above is closed. A disputed challenge is referred to a `Court` whose panel — elected off-chain by WOOD governance, seated by the owner, each member holding a slashable bond — rules within `panelWindow`. Any ruling is appealable to a full WOOD vote weighted by `StakedWood.getPastVotes` at the block **before the challenged proposal executed**, so the pre-accumulation defence comes from the staking contract's own age weighting rather than a second curve. An appeal only overturns if turnout clears a participation floor; below the floor it is a non-event, the panel's ruling stands and the appellant's bond forfeits — which is what removes the "swing a single-digit-turnout appeal cheaply at a ~$15M mcap" path. A **separate** token vote, never the merits appeal (F6), decides whether a ruling was made in bad faith and slashes the panelist's bond: overturning a ruling does not punish the panelist, and controlling the cheap appeal does not immunize one. The verdict is a single bit handed to a court-only `ChallengeGame.rule`, routing into Plan D's existing `_settle` (slash at `maxSlashBps` into the compensation escrow, §3.8) or `_fail` (challenger's bond forfeits to the accused). **A guilty approver can no longer dispute and run out the clock.**
+
+**What v1c does NOT fix, stated plainly.** Panel *selection* is trusted — the roster is owner-set from an off-chain election; only panel *behaviour* is bonded. A panel that never rules yields `NotGuilty` by default, so panel liveness is an operational requirement no contract can enforce. The bad-faith vote is itself a token vote at the same market cap: it constrains a bribed panel, not a bought electorate — the win is that capturing the appeal alone is no longer sufficient. Slashing is capped at one panel bond, so a panelist bribed for more than `panelBondWood` remains profitably bribable; bond sizing is a deploy-time decision. And the merits electorate is not filtered: a guardian that approved the challenged proposal may vote on its own appeal, and the checks on that are the panel below and the bad-faith track above, not the electorate definition.
+
+**Still outstanding after v1c:** §3.4a epoch NAV checkpointing (**Plan F**) and the approver premium (§3.10) plus watchtower funding (**Plan G**, gated on the §4 blocking ROE validation).
+
 **§3.3a wording correction (2026-07-24, SUPERSEDED 2026-07-26 — see below).** §3.3a's "aggregate" is literal: two guardians holding half the coverage each genuinely cover one proposal between them.
 
 **Correction to the correction (2026-07-26).** The paragraph above described booking as `min(free budget, coverage still uncovered)`. That rule was removed: it let the first approver absorb the entire coverage, leaving later ones at zero and unlisted, which a front-run-then-release turned into a costless permanent veto (review C1). An approver now RESERVES `min(free budget, the proposal's FULL coverage)`, and the real per-guardian liability is the pro-rata `allocatedUsd`. The aggregate property is unchanged; the mechanism reaching it is not.
@@ -192,13 +206,16 @@ Guardian-level invariant, checked at `voteOnProposal` (approve side):
 
   ```
   slashableBond(g) = ownStake(g) · priceHaircut
-                   + delegatedInbound(g) · (maxDelegatedSlashBps / 10_000) · priceHaircut
   ```
 
-  Delegated stake is counted **only at the `maxDelegatedSlashBps` haircut**
-  (`StakedWood.sol:664`; a delegated pool cannot be slashed 100% — first-loss
-  spills onto own stake). Counting full vote weight (own + full delegations)
-  would violate the inequality at the accounting layer before any attack.
+  **DPoS-delegation postponement (2026-07-26):** the delegated-inbound term
+  (`delegatedInbound(g) · maxDelegatedSlashBps/10_000 · priceHaircut`) was
+  removed together with the whole `StakedWoodDelegation` layer — share pools,
+  commission, the unbonding escrow, delegated slash legs and the k-capped
+  delegated vote weight. The guardian's own bond is the only slashable
+  capital and the only vote weight. Re-introducing delegation is a fresh
+  design exercise (it must re-answer slash caps, first-loss spill, unbonding
+  evasion and quorum accounting), not a revert of that commit.
   `priceHaircut` (§5) converts WOOD to a conservative dollar value robust to a
   WOOD drawdown. (v1 bonds are WOOD-only; multi-collateral legs at their own
   haircuts are a v2 extension — §3.7.)
@@ -270,10 +287,42 @@ Flow:
   coverage attributed to the challenged proposal — not their whole stake.
   Challenger bond scales with the exposure it freezes. Adapters demote only on a
   **passed** challenge; an unproven filing flags for expedited review.
+- **Reach of the game, stated rather than left to be discovered (PR #25 review
+  F9).** A filing must freeze something, so the game reaches exactly the set of
+  proposals that BOOKED coverage: envelope tier ≥ `quorumTierThreshold`,
+  non-zero `requiredCoverage`, and at least one approver whose commitment is
+  still live. A proposal below the tier threshold never runs
+  `requireApproveQuorum`, books nothing, and is therefore unchallengeable by
+  construction — even though predicates 1, 4 and 5 describe things a low-tier
+  proposal can still do. Two related gaps of the same kind: predicates 2 and 5
+  are not always proposal-scoped facts, and a drawdown emerging from cumulative
+  behaviour across several proposals has no single filing target in this design
+  (the same accepted slow-bleed residual as §8). The v1 position is that booking
+  coverage IS taking on the liability, so a proposal with no booked coverage has
+  no approver to hold retroactively liable; what remains is monitoring-only, not
+  a code gap.
 - **Standing watchtower:** the challenge trigger must not depend on altruism.
   Sherwood forensic agents run the predicate monitor as a funded protocol role
   (feeding SGRD reputation), plus a first-detector bounty sized to cover forensic
   cost. Health metric: a live challenge game shows filings, not silence.
+
+  **Implementation note (decided 2026-07-25, Plan D).** The bounty is delivered
+  **off-chain**, as a protocol bug-bounty program keyed off `ChallengeGame`'s
+  `ChallengeFiled` / `ChallengeSettled` events — not as an on-chain payout. The
+  intent above is unchanged; only the delivery mechanism is. Rationale: "sized to
+  cover forensic cost" is exactly what a constant in a contract cannot express,
+  since forensic cost runs from minutes for an obvious out-of-adapter transfer to
+  days for a funding-graph linkage. Per-case pricing needs human judgement, and
+  keying payouts to public events keeps them auditable regardless.
+
+  **The consequence, stated here rather than left to be discovered.** On-chain, a
+  successful challenger only gets its bond BACK, and a failed one loses the bond
+  entirely — the on-chain payoff is break-even at best. The off-chain program is
+  therefore not a garnish on top of on-chain economics; it is the ONLY thing that
+  makes filing rational. The "must not depend on altruism" requirement at the top
+  of this bullet is satisfied **off-chain, and nowhere else**. If the program is
+  never stood up, the challenge game's incentive story is a comment rather than a
+  mechanism.
 
 ### 3.4a Epoch-based renewable coverage (long-duration strategies)
 
@@ -378,9 +427,9 @@ adjudication (weeks, contested cases only).
     thin appeal.
 
 - Guilty verdict → slash via the authorized-slasher entrypoint (§4) at
-  `maxSlashBps` (100%; ground truth established, no severity ramp),
-  delegated-slash caps and first-loss spill preserved, proceeds → **compensation
-  escrow** (§3.8), never the live NAV.
+  `maxSlashBps` (100%; ground truth established, no severity ramp), proceeds →
+  **compensation escrow** (§3.8), never the live NAV. (Delegated-slash caps and
+  first-loss spill were removed with the DPoS-delegation postponement.)
 
 ### 3.8 Compensation escrow (F1 — the regression fix)
 
@@ -425,6 +474,89 @@ stable legs and lifts the ceiling.
 
 This mirrors the voting-snapshot primitive already in the design; the omission in
 the first draft was applying it to the payout as well as the vote.
+
+**Residual F1 recoupment channels (PR #24 review; threat model, not accepted
+edges).** The snapshot mechanism itself is sound; its *inputs* carry two
+residual channels and one inherent limit that belong here rather than in a
+"revisit if it becomes common" footnote:
+
+1. **Delegation (OPEN — closed by Plan D/E or a balance checkpoint).**
+   Apportionment reads `getPastVotes`, and `delegate()` is a free,
+   permissionless pointer that decides who a claim belongs to. A coalition that
+   solicits delegations *before* the drain — indistinguishable from ordinary
+   bloc-building — collects the delegating cohort's entire compensation stream.
+   Non-transferability of the claim mapping does not close this: the
+   *entitlement* follows the delegate pointer, and the pointer just has to be
+   set before the snapshot. "Revisit if delegation becomes common" is the wrong
+   trigger because the party who decides whether it becomes common is the
+   attacker. Until a challenge game (Plan D/E) can void such claims or the
+   vault checkpoints raw balances, this channel is open and documented as such
+   in `CompensationEscrow`'s natspec.
+2. **Compromised slasher timestamps (OPEN until Plan D).** `slashToEscrow`'s
+   `openedAt` and `snapshotTimestamp` are caller arguments. The code bounds
+   them against the future and against each other — honest-caller sanity only.
+   A compromised `authorizedSlasher` (today: the owner multisig) passes
+   `openedAt = now` and pins any past snapshot, including a post-drain instant
+   at which the coalition holds the supply — restoring F1 in full. Closed only
+   when the slasher is Plan D's challenge game passing timestamps from a
+   registered verdict record.
+3. **Pre-drain accumulation (INHERENT).** An attacker who accumulates shares
+   *before* the drain holds a genuine pre-drain claim and receives `f·S`
+   pro-rata — at essentially no marginal cost if the drain takes 100% of NAV
+   anyway. This is inherent to any pro-rata compensation scheme (the attacker
+   really was a holder of record) and is not fixable at this layer; it bounds
+   how much of the slash a *fully-invested* attacker recoups to its pre-drain
+   share fraction.
+4. **Queued exiters on a pre-existing vault (OPEN — migration, not a code
+   fix).** `VaultWithdrawalQueue.claimCompensation` pays the queue's custody
+   claim through to request owners, which closes the modal-victim gap **for
+   vaults deployed after that change**. It does not retrofit. The queue is a
+   plain constructor deployment behind no proxy and `setWithdrawalQueue` is
+   factory-only and set-once, so on an existing vault the queue accrues votes
+   and is credited a claim it has no code to pull; that cohort's compensation
+   strands and sweeps to the backstop. Outcome-identical to the pre-fix state,
+   so not a regression — but it must not be read as covered. Migration is a new
+   syndicate, or a vault upgrade adding a queue-replacement path.
+
+   The sibling caveat — a holder undelegated because its last receipt predates
+   the `_update` upgrade — *does* self-heal, and can be forced: `_update` runs
+   on a zero-value transfer, so a keeper can arm the entire legacy holder set
+   without holder cooperation, ahead of any snapshot.
+
+**What the §2 inequality does and does not say (PR #24 review 🟠N3).**
+`recovery ≥ loss` is measured, and it holds only where the severity clamp does
+not bind. `requireApproveQuorum` admits coverage up to
+`Σ min(live_i, reserved_i)`, while the slash can take at most
+`Σ min(live_i · maxSlashBps/10_000, allocated_i)`. Set coverage to exactly the
+joint slashable bond and the gate passes, every derived rate correctly
+saturates at 10,000 bps, and recovery lands at `loss · maxSlashBps/10_000` —
+80% at a 8,000-bps ceiling, 50% at 5,000. (8,000 is the *test fixture's*
+ceiling, not the shipped one — PR #24 review N3 correction:
+`DEFAULT_MAX_SLASH_BPS = 10_000` in `script/Deploy.s.sol`, both testnet scripts
+seat 10,000, and `DeployPlanB` pre-flight 1b *refuses* to deploy otherwise. At
+10,000 the clamp never binds and recovery is exactly 1.0× allocation, so the
+shortfall regime is unreachable in every configuration this repo can produce.
+That reclassifies the gap from an open design question to an **unenforced
+runtime invariant**: `setMaxSlashBps` accepts anything in
+`[minSlashBps, 10_000]`, so one governance transaction after deploy silently
+re-opens it. Follow-up: a floor on that setter, or price `maxSlashBps` into
+`requireApproveQuorum`.) This is a gap in *front* of the
+residual, distinct from the "bond shrank since the vote" case `slashBpsFor`
+documents as unavoidable. Both regimes are now pinned by tests
+(`test_recoveryCoversEveryApproversAllocation`,
+`test_recoveryFallsShortWhenTheCeilingBinds`). Closing it means either pricing
+`maxSlashBps` into the quorum gate or restating this inequality as
+`recovery ≥ loss · maxSlashBps/10_000`; that is a coverage-gate change with its
+own parameter re-derivation and is **not** settled by the slash-rail work.
+
+**Verdict slashes are one-shot per (case, approver) (PR #24 review 🟠N2).** The
+severity envelope binds per verdict, not per call: `_slashOne` applies its rate
+to live stake while sizing off the at-open checkpoint, so repeats compound
+geometrically (`1-(1-bps)^N`). Since a full-quorum batch (~27M gas at the
+100-approver cap) must be split across transactions to land at all, splitting
+was the natural workaround *and* silently voided the ceiling. `StakedWood`
+records `(caseKey, approver)` pairs and refuses a second slash; splitting a
+batch across transactions stays legal, replaying an approver does not.
 
 ### 3.9 Risk-scaled proposer bond (F3)
 
@@ -580,10 +712,30 @@ the pieces that bound loss *before* the court:
   guarantees a covering signer — it degrades safely to "value-moving proposals
   need covering approvers or they don't execute" with no court yet.
 - **v1b — retroactive liability:** authorized-slasher entrypoint + compensation
-  escrow; challenge game (predicates 1–5, all single-proposal, per-proposal
-  freeze); watchtower funding; approver reward (§3.10).
+  escrow (part 1, Plan C); challenge game (predicates 1–5, all single-proposal,
+  per-proposal freeze) (part 2, Plan D).
 - **v1c — adjudication:** pre-exploit + pre-accumulation-hardened voting snapshot;
   two-layer court with the restructured panel bond.
+
+**Ordering amendment, 2026-07-25 — the court moves AHEAD of the epoch machinery
+and the premium.** The order above deferred the court to v1c on the reasoning
+quoted directly above it: front-loading the novel forensic court while deferring
+the machinery that bounds loss is backwards for risk. **That reasoning held only
+while the court was the ONLY path to liability.** It no longer is. Plan D shipped
+a working undisputed-slash path, so the court stops being the whole mechanism and
+becomes the patch for exactly one escape hatch — a guilty approver disputing and
+running out `disputeTimeout`. Leaving that hole open across two more plans is
+worse than building the court earlier, and nothing in the epoch machinery or the
+premium is a prerequisite for it. The remaining build order is therefore:
+
+1. **Plan E — the two-layer court (§3.5)**, with the pre-exploit /
+   pre-accumulation voting snapshot and the bad-faith panel-bond track. It
+   resolves the disputed challenges Plan D can only park.
+2. **Plan F — §3.4a epoch NAV checkpointing**: per-epoch mark-to-market,
+   renewal-before-reveal, forced wind-down — giving predicate 5 its per-epoch
+   attribution on strategies longer than one epoch.
+3. **Plan G — approver premium (§3.10) + watchtower funding**, still gated on
+   the **blocking** ROE validation in the gate list below.
 
 **v2:** multi-collateral bonds (lifts the per-vault TVL ceiling — §3.7); adapter
 probation/downgrade automation; threshold-calibrated auto-demote circuit breakers

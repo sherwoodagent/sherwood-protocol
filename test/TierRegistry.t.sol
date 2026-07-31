@@ -443,4 +443,47 @@ contract TierRegistryTest is Test {
         }
         assertEq(wood.balanceOf(address(reg)), reg.totalBondedWood());
     }
+
+    function test_setAuthorizedDemoter_onlyOwner() public {
+        vm.expectRevert();
+        reg.setAuthorizedDemoter(makeAddr("rogue"));
+    }
+
+    function test_demoteByChallenge_onlyDemoter() public {
+        vm.prank(owner);
+        reg.certify(target, bytes4(0x77777777), 1, 500, address(0));
+        vm.expectRevert(TierRegistry.NotAuthorizedDemoter.selector);
+        reg.demoteByChallenge(target, bytes4(0x77777777));
+    }
+
+    /// @notice A passed challenge demotes the offending adapter back to the
+    ///         tier-2 default without needing registry ownership (§3.4).
+    function test_demoteByChallenge_demotes() public {
+        address demoter = makeAddr("demoter");
+        vm.startPrank(owner);
+        reg.certify(target, bytes4(0x77777777), 1, 500, address(0));
+        reg.setAuthorizedDemoter(demoter);
+        vm.stopPrank();
+
+        (uint8 tierBefore,) = reg.tierOf(target, bytes4(0x77777777));
+        assertEq(tierBefore, 1);
+
+        vm.prank(demoter);
+        reg.demoteByChallenge(target, bytes4(0x77777777));
+
+        (uint8 tierAfter, uint16 boundAfter) = reg.tierOf(target, bytes4(0x77777777));
+        assertEq(tierAfter, 2, "back to the arbitrary-calldata default");
+        assertEq(boundAfter, 10_000);
+    }
+
+    /// @notice The demoter can only REVOKE. It must not be able to certify — that
+    ///         is why this is a role rather than registry ownership.
+    function test_demoter_cannotCertify() public {
+        address demoter = makeAddr("demoter");
+        vm.prank(owner);
+        reg.setAuthorizedDemoter(demoter);
+        vm.prank(demoter);
+        vm.expectRevert();
+        reg.certify(target, bytes4(0x88888888), 1, 500, address(0));
+    }
 }

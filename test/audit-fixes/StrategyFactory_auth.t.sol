@@ -3,7 +3,7 @@ pragma solidity 0.8.28;
 
 import {Test} from "forge-std/Test.sol";
 import {StrategyFactory} from "../../src/StrategyFactory.sol";
-import {MoonwellSupplyStrategy} from "../../src/strategies/MoonwellSupplyStrategy.sol";
+import {MockStrategy} from "../mocks/MockStrategy.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockMToken} from "../mocks/MockMToken.sol";
 
@@ -56,7 +56,7 @@ contract MockVault {
 contract StrategyFactoryAuthTest is Test {
     StrategyFactory public factory;
     MockSyndicateRegistry public registry;
-    MoonwellSupplyStrategy public template;
+    MockStrategy public template;
     ERC20Mock public usdc;
     MockMToken public mUsdc;
 
@@ -77,7 +77,7 @@ contract StrategyFactoryAuthTest is Test {
         registry.register(address(registeredVault), 1);
 
         factory = new StrategyFactory(address(registry), address(this));
-        template = new MoonwellSupplyStrategy();
+        template = new MockStrategy();
         // Sherlock #34: allowlist template for cloneAndInit happy path.
         factory.setTemplateApproval(address(template), true);
         usdc = new ERC20Mock("USDC", "USDC", 6);
@@ -98,7 +98,7 @@ contract StrategyFactoryAuthTest is Test {
     /// @notice Sherlock run #1 finding #34 — clone reverts for a template
     ///         not on the allowlist.
     function test_cloneAndInit_revertsForUnapprovedTemplate() public {
-        MoonwellSupplyStrategy bad = new MoonwellSupplyStrategy();
+        MockStrategy bad = new MockStrategy();
         vm.prank(vaultOwner);
         vm.expectRevert(abi.encodeWithSelector(StrategyFactory.TemplateNotApproved.selector, address(bad)));
         factory.cloneAndInit(address(bad), address(registeredVault), proposer, _initData());
@@ -219,7 +219,7 @@ contract StrategyFactoryAuthTest is Test {
             address(template), address(registeredVault), agentAddr, _initData(), salt
         );
         assertTrue(clone != address(0));
-        assertEq(MoonwellSupplyStrategy(payable(clone)).vault(), address(registeredVault));
+        assertEq(MockStrategy(payable(clone)).vault(), address(registeredVault));
     }
 
     // ── Fuzz: no random caller can clone (must be vault/owner/agent) ──
