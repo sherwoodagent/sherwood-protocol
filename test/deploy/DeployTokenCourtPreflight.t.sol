@@ -10,6 +10,7 @@ import {ChallengeGame} from "../../src/ChallengeGame.sol";
 import {StakedWood} from "../../src/StakedWood.sol";
 import {ExposureLedger} from "../../src/ExposureLedger.sol";
 import {TierRegistry} from "../../src/TierRegistry.sol";
+import {CompensationEscrow} from "../../src/CompensationEscrow.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockStakedWood} from "../mocks/MockStakedWood.sol";
 
@@ -56,6 +57,7 @@ contract DeployTokenCourtPreflightTest is Test {
     ExposureLedger internal ledger;
     TierRegistry internal tiers;
     ChallengeGame internal game;
+    CompensationEscrow internal escrow;
 
     DeployTokenCourt internal deployScript;
     WireTokenCourt internal wireScript;
@@ -93,13 +95,18 @@ contract DeployTokenCourtPreflightTest is Test {
         ledger = new ExposureLedger(DEFAULT_SENDER, address(swood), 28 days);
         tiers = new TierRegistry(DEFAULT_SENDER);
         game = new ChallengeGame(DEFAULT_SENDER, address(wood), address(ledger), address(tiers));
+        escrow = new CompensationEscrow(DEFAULT_SENDER, address(wood));
 
-        // Plan D's wiring, as this deployment presumes to find it.
+        // Plan D's wiring, as this deployment presumes to find it — in the
+        // settle-before-freeze order `DeployPlanD` itself now uses (review M3),
+        // plus Plan C's escrow pair, which pre-flight 5 checks (review M4).
         vm.startPrank(DEFAULT_SENDER);
-        ledger.setCoverageFreezer(address(game));
-        tiers.setAuthorizedDemoter(address(game));
-        swood.setAuthorizedSlasher(address(game));
         game.setStakedWood(address(swood));
+        swood.setAuthorizedSlasher(address(game));
+        tiers.setAuthorizedDemoter(address(game));
+        ledger.setCoverageFreezer(address(game));
+        swood.setCompensationEscrow(address(escrow));
+        escrow.setAuthorizedFunder(address(swood));
         vm.stopPrank();
 
         deployScript = new DeployTokenCourt();
@@ -229,6 +236,36 @@ contract DeployTokenCourtPreflightTest is Test {
 
         assertEq(court.participationFloorBps(), swood.ageFloorBps(), "floor should equal age floor, not be below it");
         _runWireExpecting("PRE-FLIGHT: TokenCourt.participationFloorBps >= StakedWood.ageFloorBps.");
+    }
+
+    /// @dev PRE-FLIGHT 5 — THE RAIL THIS SCRIPT USED TO OMIT (review M4).
+    ///      `setCompensationEscrow` is owner-mutable and explicitly
+    ///      zero-settable, and zero is not a lost capability but an INVERTED
+    ///      one: `slashToEscrow` reverts `CompensationEscrowNotSet`,
+    ///      `TokenCourt.finalize` correctly bubbles it (its filter swallows
+    ///      only `WrongStatus`), the case stays `Voting`, and the underlying
+    ///      challenge then times out through `resolve` → `_fail` — acquitting
+    ///      the accused and paying them the challenger's bond. Wiring the court
+    ///      into that state is the one refusal this script most needs.
+    function test_wirePreflight_bites_whenCompensationEscrowIsUnset() public {
+        _deployAndSetCourtEnv();
+        vm.prank(DEFAULT_SENDER);
+        swood.setCompensationEscrow(address(0)); // a legal call on its own setter
+        _runWireExpecting("PRE-FLIGHT: StakedWood.compensationEscrow is UNSET");
+    }
+
+    /// @dev PRE-FLIGHT 5, the other direction of the same pair. A non-zero but
+    ///      wrongly-funded escrow dead-ends at `fundCase` exactly as an unset
+    ///      one does, so a bare `!= address(0)` check would not have been
+    ///      enough. Checked against the escrow sWOOD itself names — no extra
+    ///      env var that could drift away from it.
+    function test_wirePreflight_bites_whenEscrowDoesNotAuthorizeStakedWood() public {
+        _deployAndSetCourtEnv();
+        vm.prank(DEFAULT_SENDER);
+        escrow.setAuthorizedFunder(address(0xDEAD));
+
+        assertTrue(swood.compensationEscrow() != address(0), "a non-zero check would have passed this state");
+        _runWireExpecting("PRE-FLIGHT: CompensationEscrow.authorizedFunder != STAKED_WOOD.");
     }
 
     /// @dev PRE-FLIGHT 5 (a): Plan D's coverage-freezer role lost.
