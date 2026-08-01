@@ -89,6 +89,7 @@ contract DeployPlanDPreflightTest is Test {
         // `DeployPlanB` now makes that call inside its own broadcast.
         vm.startPrank(DEFAULT_SENDER);
         ledger.setWoodUsdPrice(WOOD_PRICE_X8);
+        ledger.setWoodFallbackPriceX8(WOOD_PRICE_X8);
         swood.setExposureLedger(address(ledger));
         vm.stopPrank();
 
@@ -185,14 +186,17 @@ contract DeployPlanDPreflightTest is Test {
 
     /// @dev PRE-FLIGHT 3: an unpriced ledger makes every `file()` revert, so
     ///      the game would deploy into a state where nothing can be challenged.
-    ///      Zero stays settable on the ledger (it is the emergency stop), so no
-    ///      storage poke is needed.
+    ///
+    ///      THE UNPRICED STATE IS NOW `woodFallbackPriceX8 == 0`, not
+    ///      `woodUsdPriceX8 == 0`. The latter is the emergency CEILING and zero
+    ///      there means "no ceiling"; the former is the maintained price, and
+    ///      with no feed and no TWAP oracle wired its absence leaves the ledger
+    ///      with no source at all. `woodPriceX8()` then reverts `NoWoodPrice`
+    ///      rather than serving zero, which the pre-flight catches and reports
+    ///      as the same operator error.
     function test_preflight_bites_whenTheLedgerIsUnpriced() public {
-        // `setWoodUsdPrice` rate-limits to one move per `MIN_PRICE_UPDATE_INTERVAL`;
-        // the fixture already set a price in `setUp`, so move time first.
-        vm.warp(vm.getBlockTimestamp() + 2 days);
         vm.prank(DEFAULT_SENDER);
-        ledger.setWoodUsdPrice(0);
+        ledger.setWoodFallbackPriceX8(0);
         _runExpecting("PRE-FLIGHT: ExposureLedger.woodPriceX8 is 0");
     }
 

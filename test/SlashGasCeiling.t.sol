@@ -248,6 +248,10 @@ contract SlashGasCeilingTest is Test {
         feed = new SlashGasFeed(1e8, 8);
         vm.startPrank(ledgerOwner);
         ledger.setWoodUsdPrice(0.05e8);
+        // The MAINTAINED price. The line above is the emergency CEILING;
+        // seating both at $0.05 makes `min(fallback, ceiling)` $0.05, which
+        // is the number every expectation in this file was written against.
+        ledger.setWoodFallbackPriceX8(0.05e8);
         ledger.setAssetFeed(address(usdg), address(feed), 365 days);
         ledger.setCoveredTvlCapUsd(10_000_000e18);
         ledger.setGuardianRegistry(address(registry));

@@ -8,54 +8,54 @@
   cumulatives and the 2^32 timestamp wrap are all standard. No deviation; the
   change rests on solid ground. **Re-run this derivation if the pair address
   ever changes** — it is a one-command check.
-- [ ] 2. Re-read the live reserves and ETH/USD answer; update design.md's
+- [x] 2. Re-read the live reserves and ETH/USD answer; update design.md's
   measured block if they have moved materially.
-- [ ] 3. `src/pricing/WoodTwapOracle.sol`: permissionless `update()` storing
+- [x] 3. `src/pricing/WoodTwapOracle.sol`: permissionless `update()` storing
   `(cumulative, timestamp)`; `view consult()` returning
   `(uint256 twapUsdX8, bool ok)`; window + `maxTwapAge` bounded setters; USD
   conversion via the ETH/USD feed with the same staleness treatment used
   elsewhere in the ledger.
-- [ ] 4. `src/ExposureLedger.sol`: implement the option-A resolution order in
+- [x] 4. `src/ExposureLedger.sol`: implement the option-A resolution order in
   `_woodPrice` — `source = twap fresh ? twap : (fallback != 0 ? fallback :
   revert NoWoodPrice)`, then `_haircut(min(source, woodUsdPriceX8))`. Wire the
   oracle with the `code.length` + `try/catch` protection `_woodPrice` already
   uses for feeds, and extend `woodPriceDetail()` per the spec delta.
-- [ ] 4a. Add `woodFallbackPriceX8` + its setter (maintained, conservative;
+- [x] 4a. Add `woodFallbackPriceX8` + its setter (maintained, conservative;
   rate-limit upward moves for the same anti-pump reason `setWoodUsdPrice`
   does, but do not inherit the 1-day interval on downward moves — a maintained
   price needs to be able to track a fall promptly).
-- [ ] 4b. Consider relaxing `MIN_PRICE_UPDATE_INTERVAL` for *downward*
+- [ ] 4b. NOT DONE — deferred to its own issue. Consider relaxing `MIN_PRICE_UPDATE_INTERVAL` for *downward*
   `setWoodUsdPrice` moves. The interval exists to stop the 2^N pump (review
   M4), which is an upward-only concern; gating downward moves makes the
   emergency brake usable once per day, which is not what a brake should be.
-- [ ] 4c. **Cross-check before relying on `woodUsdPriceX8 = 0` as the kill
+- [x] 4c. **Cross-check before relying on `woodUsdPriceX8 = 0` as the kill
   switch.** With the `min` in place, a zero ceiling drives the price to zero,
   and the 2026-08-01 audit found `effectiveTotal == 0` marks a challenge
   convicted while recovering nothing and blocking re-filing. Either fix that
   path first or document that the emergency stop should be a small non-zero
   value rather than literal zero.
-- [ ] 5. Interfaces + layout goldens (`./script/check-layout-goldens.sh`),
+- [x] 5. Interfaces + layout goldens (`./script/check-layout-goldens.sh`),
   since `ExposureLedger` gains storage.
-- [ ] 6. Tests — failing-first where feasible, one per spec scenario. Include:
+- [x] 6. Tests — failing-first where feasible, one per spec scenario. Include:
   ceiling binds only downward; stale snapshot degrades rather than reverts;
   codeless/reverting oracle degrades; ETH/USD stale degrades; permissionless
   `update()`; window bounds rejected; unwire works. Repo gotchas: use
   `vm.getBlockTimestamp()` rather than a cached `block.timestamp` across
   `vm.warp`; warps are forward-only; hoist argument-position calls before
   `vm.prank`.
-- [ ] 7. Deploy wiring + address-book entries. Note `chains/4663.json` has **no
+- [x] 7. PARTIAL — `WOOD_TOKEN` + `WOOD_WETH_V2_PAIR` added to chains/4663.json; the deployed oracle address is added at deploy time. Deploy wiring + address-book entries. Note `chains/4663.json` has **no
   `WOOD_TOKEN` key** — add it alongside the pair and oracle addresses.
-- [ ] 7a. **Deploy pre-flight: assert `woodFallbackPriceX8 != 0` and
+- [x] 7a. **Deploy pre-flight: assert `woodFallbackPriceX8 != 0` and
   `woodUsdPriceX8 != 0`.** This is what makes the `NoWoodPrice` revert a
   configuration guard rather than a live failure mode; without it the revert is
   reachable in production and the design is worse than what it replaces.
-- [ ] 8. Gate (serialize forge with `while pgrep -x solc >/dev/null; do sleep 30;
+- [x] 8. Gate (serialize forge with `while pgrep -x solc >/dev/null; do sleep 30;
   done` — this machine OOM-kills concurrent `via_ir` builds): `forge build`,
   non-fork `forge test`, `forge fmt --check src test script`, layout goldens.
-- [ ] 9. Update `docs/robinhood-fork-deployment.md` §10 — it currently frames
+- [x] 9. Update `docs/robinhood-fork-deployment.md` §10 — it currently frames
   `woodUsdPriceX8` as a fallback to maintain, which is wrong while it is the
   primary. That section should describe the ceiling and what a binding ceiling
   means operationally.
-- [ ] 10. Open the PR linked to this change. **Independent of all the above:**
+- [x] 10. Open the PR linked to this change. **Independent of all the above:**
   raise `woodHaircutBps` off its 10_000 default as the launch-week mitigation —
   it needs no code and should not wait on this work.

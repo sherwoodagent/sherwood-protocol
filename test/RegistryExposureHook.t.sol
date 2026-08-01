@@ -153,6 +153,10 @@ contract RegistryExposureHookTest is Test {
         feed = new MockFeed(1e8, 8); // $1.00, 8-dec feed
         vm.startPrank(ledgerOwner);
         ledger.setWoodUsdPrice(0.05e8); // $0.05 conservative haircut
+        // The MAINTAINED price. The line above is the emergency CEILING;
+        // seating both at $0.05 makes `min(fallback, ceiling)` $0.05, which
+        // is the number every expectation in this file was written against.
+        ledger.setWoodFallbackPriceX8(0.05e8);
         ledger.setAssetFeed(address(wired.asset), address(feed), 1 days);
         ledger.setCoveredTvlCapUsd(1_000_000e18); // generous
         ledger.setGuardianRegistry(address(wired.registry));

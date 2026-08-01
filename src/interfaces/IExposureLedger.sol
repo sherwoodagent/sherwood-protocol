@@ -36,8 +36,48 @@ interface IExposureLedger {
     error NotCoverageFreezer();
     error CoverageFrozen();
 
+    /// @notice No WOOD price is obtainable from any source: the Chainlink feed
+    ///         and the TWAP oracle are both unavailable AND
+    ///         `woodFallbackPriceX8` is zero.
+    ///
+    /// @dev    A CONFIGURATION GUARD, NOT A RUNTIME STATE. `DeployPlanB`'s
+    ///         post-broadcast pre-flight asserts `woodFallbackPriceX8 != 0` and
+    ///         `woodUsdPriceX8 != 0`, so a correctly deployed ledger never
+    ///         reaches this.
+    ///
+    ///         It is a deliberate, narrow exception to the rule that
+    ///         `_woodPrice` must not revert — a rule that is real and
+    ///         load-bearing (`setWoodFeed`'s natspec records that a reverting
+    ///         price path "took `recordApproval` and `requireApproveQuorum` with
+    ///         it protocol-wide"). The exception is justified only because the
+    ///         alternative is worse: serving `0` silently values every bond at
+    ///         nothing, and the 2026-08-01 audit showed `effectiveTotal == 0` on
+    ///         the slash path marks a challenge convicted while recovering
+    ///         nothing and permanently blocking a re-file. A loud failure on a
+    ///         state that should be unreachable beats a silent one that is not.
+    error NoWoodPrice();
+
+    /// @notice Which input produced the WOOD price on the most recent read.
+    ///
+    /// @dev    `usingFallback` alone stopped carrying information once the
+    ///         fallback became permanent: there is no Chainlink WOOD feed on
+    ///         chain 4663 and none is expected, so the flag reads `true`
+    ///         forever. This says WHICH source answered, which is what §6
+    ///         monitoring actually needs.
+    enum WoodPriceSource {
+        /// @dev Chainlink WOOD/USD feed — wired, fresh and positive.
+        Feed,
+        /// @dev The DEX TWAP oracle.
+        Twap,
+        /// @dev The maintained governance fallback `woodFallbackPriceX8`,
+        ///      serving because neither of the above was available.
+        Fallback
+    }
+
     // ── Events ──
     event WoodUsdPriceSet(uint256 oldPriceX8, uint256 newPriceX8);
+    event WoodFallbackPriceSet(uint256 oldPriceX8, uint256 newPriceX8);
+    event WoodTwapOracleSet(address indexed oldOracle, address indexed newOracle);
     event WoodFeedSet(address indexed feed, uint256 maxDelay);
     event GuardianRegistrySet(address indexed oldRegistry, address indexed newRegistry);
     event AssetFeedSet(address indexed asset, address feed, uint256 maxDelay, uint8 assetDecimals);
@@ -167,12 +207,42 @@ interface IExposureLedger {
     function coverageUsd(address asset, uint256 amount) external view returns (uint256);
     function proposerBondWood(address asset, uint256 requiredCoverage) external view returns (uint256);
     function currentEpoch() external view returns (uint256);
+    /// @notice THE EMERGENCY CEILING, not a price to maintain. Applied as a
+    ///         `min` to whichever source is live, so it can only ever lower the
+    ///         WOOD price. Under the emergency-only doctrine (owner decision
+    ///         2026-08-01) it is set HIGH and non-binding and touched only to
+    ///         pull the brake.
+    /// @dev    ZERO MEANS "NO CEILING", not "price zero" — see
+    ///         `ExposureLedger.setWoodUsdPrice`.
     function woodUsdPriceX8() external view returns (uint256);
+
+    /// @notice The maintained conservative WOOD/USD price used when no market
+    ///         source is available. Distinct from `woodUsdPriceX8` because one
+    ///         number cannot be both a brake and a fallback: a brake wants to
+    ///         sit high so it never binds, a fallback must be accurate the
+    ///         moment it is needed.
+    function woodFallbackPriceX8() external view returns (uint256);
+
+    /// @notice The wired `WoodTwapOracle`, or `address(0)` when unwired.
+    function woodTwapOracle() external view returns (address);
+
     function woodPriceX8() external view returns (uint256);
 
-    /// @notice The WOOD price plus whether it came from the fallback rather than
-    ///         the feed — so monitoring can observe the degraded path.
-    function woodPriceDetail() external view returns (uint256 price, bool usingFallback);
+    /// @notice The WOOD price, which source produced it, and whether the
+    ///         emergency ceiling bound — so monitoring can observe both the
+    ///         degraded path and a governance number that has drifted.
+    /// @param price          The haircut, ceiling-capped price, 8 decimals.
+    /// @param usingFallback  Retained: true whenever the price did NOT come
+    ///                       from a Chainlink WOOD feed. Permanently true on
+    ///                       chain 4663, which is why `source` exists.
+    /// @param source         Which input answered.
+    /// @param ceilingBound   Whether `woodUsdPriceX8` was the binding value —
+    ///                       the signal that the market has fallen through the
+    ///                       brake, or that the brake has been pulled.
+    function woodPriceDetail()
+        external
+        view
+        returns (uint256 price, bool usingFallback, WoodPriceSource source, bool ceilingBound);
     function woodHaircutBps() external view returns (uint256);
     function epochLength() external view returns (uint256);
     function challengeWindow() external view returns (uint256);
@@ -183,6 +253,11 @@ interface IExposureLedger {
 
     // ── Owner setters ──
     function setWoodUsdPrice(uint256 newPriceX8) external;
+    function setWoodFallbackPriceX8(uint256 newPriceX8) external;
+    /// @dev Zero is the UNWIRE switch and is always accepted, mirroring
+    ///      `setWoodFeed`: a bad oracle address must never be able to take the
+    ///      pricing path with it.
+    function setWoodTwapOracle(address oracle) external;
     function setWoodFeed(address feed, uint256 maxDelay) external;
     function setWoodHaircutBps(uint256 newBps) external;
     function setAssetFeed(address asset, address feed, uint256 maxDelay) external;
