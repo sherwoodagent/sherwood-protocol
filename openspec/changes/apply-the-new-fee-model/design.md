@@ -63,14 +63,21 @@ See `proposal.md` § Why for motivation. The constraints that actually shape the
 accumulator" on the strategy.
 
 Every event that changes the management-fee base already passes through `SyndicateVault`:
-the execute-time capital stamp (`SyndicateGovernor:395`), Lane A deposits
-(`SyndicateVault:866`), Lane A instant exits (`:909`), and the custody hooks
-`strategyMint`/`strategyBurn` (`:1083`/`:1098`). A single vault-side accumulator is
-therefore complete.
+the execute-time capital stamp, Lane A deposits, and Lane A instant exits. A single
+vault-side accumulator is therefore complete.
 
 *Alternative — per-strategy accumulators.* Requires an accumulator, an update on every
-base-changing path, and a test suite in each of 12+ clones, and adds gas to strategy hot
+base-changing path, and a test suite in each strategy clone, and adds gas to strategy hot
 paths. It buys nothing the vault-side accumulator does not already observe. Rejected.
+
+**Amended on rebase (2026-07-31).** This decision originally also cited the custody share
+hooks `strategyMint` / `strategyBurn` as a fourth base-changing path the vault already
+observed. Upstream has since **deleted both**, from `src/` and `test/` alike, along with
+the custody-model strategies that used them — so that hook site is gone and the accrual no
+longer wires into it. The reasoning is unaffected: the three remaining paths still all pass
+through the vault, and they are what the accrual tests exercise. Recorded because the
+original argument leaned on a fourth site that no longer exists, and a reader chasing the
+citation would find nothing there.
 
 The accumulator is an **asset-seconds integral**: on each base-changing event, add
 `base × (now − lastUpdate)` and restamp. At settlement,
