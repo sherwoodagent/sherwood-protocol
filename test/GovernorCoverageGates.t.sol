@@ -155,7 +155,7 @@ contract GovernorCoverageGatesTest is Test {
         // ── Escrow: auth registry recognizes the wired governor only.
         escrowAuth = new MockEscrowAuth();
         escrowAuth.set(address(governor), true);
-        escrow = new ProposerBondEscrow(address(wood), address(escrowAuth));
+        escrow = new ProposerBondEscrow(address(wood), address(escrowAuth), address(ledger));
 
         // ── Wire ledger + escrow into the governor (as factory).
         governor.setExposureLedger(address(ledger));
@@ -407,7 +407,7 @@ contract GovernorCoverageGatesTest is Test {
     function test_propose_collaborative_reentrantWoodCannotExpireDraft() public {
         // Escrow bound to a hostile WOOD (immutable), authorized for `governor`.
         ReentrantWood rwood = new ReentrantWood();
-        ProposerBondEscrow rEscrow = new ProposerBondEscrow(address(rwood), address(escrowAuth));
+        ProposerBondEscrow rEscrow = new ProposerBondEscrow(address(rwood), address(escrowAuth), address(ledger));
         governor.setBondEscrow(address(rEscrow));
 
         rwood.mint(agent, 1_000_000e18);
@@ -487,7 +487,7 @@ contract GovernorCoverageGatesTest is Test {
         uint256 pid = _proposeSolo(governor, address(vault), agent, 1_000e6);
         assertEq(governor.getProposal(pid).proposerBondEscrow, address(escrow));
 
-        ProposerBondEscrow escrow2 = new ProposerBondEscrow(address(wood), address(escrowAuth));
+        ProposerBondEscrow escrow2 = new ProposerBondEscrow(address(wood), address(escrowAuth), address(ledger));
         governor.setBondEscrow(address(escrow2));
 
         assertEq(governor.bondEscrow(), address(escrow2));
@@ -744,7 +744,7 @@ contract GovernorCoverageGatesTest is Test {
     ///         exit, bond keyed by (governor, proposalId)).
     function test_reclaimBond_releasesAgainstStoredEscrow() public {
         uint256 pid = _proposeSolo(governor, address(vault), agent, 1_000e6);
-        ProposerBondEscrow escrow2 = new ProposerBondEscrow(address(wood), address(escrowAuth));
+        ProposerBondEscrow escrow2 = new ProposerBondEscrow(address(wood), address(escrowAuth), address(ledger));
         governor.setBondEscrow(address(escrow2));
 
         uint256 balBefore = wood.balanceOf(agent);

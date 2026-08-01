@@ -221,7 +221,7 @@ contract TokenCourtEndToEndTest is Test {
         vm.prank(owner);
         registry.setExposureLedger(address(ledger));
 
-        bondEscrow = new ProposerBondEscrow(address(wood), address(registry));
+        bondEscrow = new ProposerBondEscrow(address(wood), address(registry), address(ledger));
 
         // ── The game and the court, then their roles.
         game = new ChallengeGame(owner, address(wood), address(ledger), address(tierRegistry));

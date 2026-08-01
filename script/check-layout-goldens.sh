@@ -188,6 +188,27 @@ check_contract() {
 
 [ "${1:-}" = "--update-golden" ] && UPDATE_GOLDEN=1
 
+# SyndicateGovernor sits behind a BEACON, so one `beacon.upgradeTo` re-points
+# EVERY per-vault governor at once — the widest blast radius of the four.
+#
+# ITS GOLDEN WAS FULLY RE-BASELINED (proposal-lifecycle refactor, PR #56), the
+# one exception to the append-only rule stated in the header above.
+# `GovernorParameters` now inherits `ProposalLifecycle`, which C3 linearization
+# PREPENDS, so its 15 slots come first and every governor field moved:
+# `vault` 0 -> 15, `_guardianRegistry` 43 -> 0, `_tierRegistry` 48 -> 58.
+#
+# LEGITIMATE ONLY BECAUSE THIS IS A FRESH DEPLOYMENT — the same condition as
+# GuardianRegistry and StakedWood below. chains/4663.json records no protocol
+# addresses, so mainnet has no governor lineage to stay compatible with.
+# test/governor/GovernorLayoutPins.t.sol pins the new baseline and states the
+# rule this re-baseline must never be read as licensing: DO NOT cherry-pick the
+# fold onto a beacon that already has live proxies — every governor would read
+# garbage at every slot. Robinhood TESTNET (46630) is exactly such a chain: 9
+# syndicates behind beacon 0x11B726c49E0bAc95bEafF8d648cf3030Dc11B73a. Those
+# need a fresh factory + beacon, not an upgrade; DeployPlanB's pre-flight 5
+# refuses that state rather than printing an instruction that would corrupt it.
+#
+# From this baseline forward the append-only rule applies again.
 check_contract SyndicateGovernor script/syndicate-governor-layout.golden.json
 check_contract SyndicateFactory script/syndicate-factory-layout.golden.json
 # GuardianRegistry and StakedWood are UUPS, deployed on TESTNETS ONLY
@@ -201,8 +222,9 @@ check_contract SyndicateFactory script/syndicate-factory-layout.golden.json
 check_contract GuardianRegistry script/guardian-registry-layout.golden.json
 # StakedWood is UUPS and live, and custodies every WOOD bond in the protocol —
 # the highest-consequence layout on this branch (review N7). Plan B carved
-# `exposureLedger` out of its __gap, then Plan C carved `authorizedSlasher`,
-# `compensationEscrow`, and `_verdictSlashed`; pinned here so the next append
+# `exposureLedger` out of its __gap, then Plan C carved `authorizedSlasher`
+# and `_verdictSlashed` (`compensationEscrow` was carved too, and returned to
+# the gap when slash proceeds moved to a burn); pinned here so the next append
 # is checked automatically rather than by hand.
 check_contract StakedWood script/staked-wood-layout.golden.json
 

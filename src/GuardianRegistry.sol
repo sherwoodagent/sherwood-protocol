@@ -22,7 +22,7 @@ import {EnumerableSet} from "@openzeppelin/contracts/utils/structs/EnumerableSet
 ///         vote checkpoints, and slashing live in `StakedWood`
 ///         (sWOOD). The registry reads vote weight from sWOOD and calls sWOOD
 ///         to slash. See
-///         `docs/superpowers/specs/2026-05-21-swood-staking-split-design.md`.
+///         `openspec/specs/guardian-staking/spec.md`.
 contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgradeable {
     using SafeERC20 for IERC20;
     using EnumerableSet for EnumerableSet.AddressSet;

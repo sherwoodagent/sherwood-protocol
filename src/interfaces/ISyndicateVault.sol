@@ -47,6 +47,7 @@ interface ISyndicateVault {
     error AgentFeeTooHigh();
     /// @notice `setMinBufferBps` was called with `bps > 5_000` (50%).
     error BufferTooHigh();
+    error InstantExitFeeTooHigh();
     /// @notice A governor batch left the vault below the idle floor
     ///         (`reservedQueueAssets + minBufferBps%` of the pre-batch float).
     error BufferBreached();
@@ -144,6 +145,89 @@ interface ISyndicateVault {
     ///         from the settlement float delta so mid-proposal flows don't
     ///         corrupt strategy PnL (and fees aren't charged on principal).
     function interimNetFlow() external view returns (int256);
+
+    // ── Management-fee accrual (two-number fee model) ──
+
+    /// @notice Governor-only: begin management-fee accrual for a newly executed
+    ///         proposal, starting from zero.
+    function startManagementAccrual() external;
+
+    /// @notice Governor-only: settle up and return the accrued integral in
+    ///         asset-seconds, then stop accruing.
+    /// @return assetSeconds Fund assets integrated over time for this proposal.
+    ///         The fee is `assetSeconds * rate / (BPS_DENOMINATOR * 365 days)`.
+    function consumeManagementAccrual() external returns (uint256 assetSeconds);
+
+    /// @notice Accrued asset-seconds including the interval still in progress.
+    /// @dev View-only; does not restamp. Returns the stored figure unchanged
+    ///      when no proposal is live.
+    function managementAssetSeconds() external view returns (uint256);
+
+    /// @notice Whether a management fee is currently accruing — true only while
+    ///         a proposal is live. Capital idle between proposals accrues
+    ///         nothing.
+    function isAccruingManagementFee() external view returns (bool);
+
+    // ── High-water mark (two-number fee model) ──
+
+    /// @notice Emitted when the high-water mark is seeded or advanced.
+    event HighWaterMarkUpdated(uint256 pricePerShare);
+
+    /// @notice Assets per 1e18 shares, using the vault's own ERC-4626
+    ///         conversion (and therefore its virtual-offset rounding).
+    function pricePerShare() external view returns (uint256);
+
+    /// @notice Highest price per share a performance fee has been charged at.
+    function highWaterPricePerShare() external view returns (uint256);
+
+    /// @notice Value above the mark, in assets — the performance-fee base.
+    ///         Zero at or below the mark. Read it AFTER the management fee has
+    ///         been taken, since that fee lowers the price per share.
+    function aboveHighWaterMark() external view returns (uint256);
+
+    /// @notice Governor-only: advance the mark to the current price per share.
+    ///         Monotonic — a loss leaves it unchanged.
+    function ratchetHighWaterMark() external;
+
+    // ── Exit-time fee crystallization ──
+
+    /// @notice Emitted when an instant exit pays its accrued fees on the way out.
+    event ExitFeesCrystallized(address indexed owner, uint256 shares, uint256 mgmtFee, uint256 perfFee);
+
+    /// @notice Management fees taken from instant exiters, awaiting payout at
+    ///         the next settlement. Excluded from `totalAssets()`.
+    function crystallizedMgmt() external view returns (uint256);
+
+    /// @notice Performance fees taken from instant exiters, awaiting payout.
+    ///         Excluded from `totalAssets()`.
+    function crystallizedPerf() external view returns (uint256);
+
+    /// @notice Fees `shares` would owe on an instant exit right now. Zero
+    ///         outside a Lane A window — a queue exit bears its share through
+    ///         the post-settlement price instead.
+    function previewExitFees(uint256 shares) external view returns (uint256 mgmtFee, uint256 perfFee);
+
+    /// @notice Governor-only: release parked management fees for payout.
+    function consumeCrystallizedMgmt() external returns (uint256 amount);
+
+    /// @notice Governor-only: release parked performance fees for payout. Call
+    ///         only after `aboveHighWaterMark()` has been read — releasing
+    ///         raises `totalAssets()` and would inflate that base.
+    function consumeCrystallizedPerf() external returns (uint256 amount);
+
+    // ── Early-exit penalty ──
+
+    /// @notice Emitted when the owner changes the early-exit penalty rate.
+    event InstantExitFeeUpdated(uint16 bps);
+
+    /// @notice Early-exit penalty in basis points of the portion of an instant
+    ///         exit that had to be pulled back from the strategy. Accrues to
+    ///         the vault — the depositors who stay — never to a fee recipient.
+    function instantExitFeeBps() external view returns (uint16);
+
+    /// @notice Owner-only: set the early-exit penalty. Bounded by
+    ///         `MAX_INSTANT_EXIT_FEE_BPS`.
+    function setInstantExitFeeBps(uint16 bps) external;
 
     // ── Rescue ──
     function rescueEth(address payable to, uint256 amount) external;

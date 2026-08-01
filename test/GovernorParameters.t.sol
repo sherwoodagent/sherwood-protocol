@@ -40,7 +40,6 @@ contract GovernorParametersTest is Test {
         vm.prank(owner);
         protocolConfig.setProtocolFeeRecipient(owner);
         vm.prank(owner);
-        protocolConfig.setProtocolFeeBps(PROTOCOL_FEE_BPS);
 
         SyndicateGovernor govImpl = new SyndicateGovernor(24 hours, 1 hours);
         bytes memory govInit = abi.encodeCall(
@@ -350,24 +349,9 @@ contract GovernorParametersTest is Test {
         governor.setMaxCoProposers(aboveMax);
     }
 
-    // ==================== setProtocolFeeBps ====================
-
-    function test_setProtocolFeeBps_happyPath() public {
-        uint256 oldVal = protocolConfig.protocolFeeBps();
-        uint256 newVal = 50;
-        vm.expectEmit(true, false, false, true, address(protocolConfig));
-        emit IProtocolConfig.ParameterChangeFinalized(keccak256("protocolFeeBps"), oldVal, newVal);
-        vm.prank(owner);
-        protocolConfig.setProtocolFeeBps(newVal);
-        assertEq(protocolConfig.protocolFeeBps(), newVal);
-    }
-
-    function test_setProtocolFeeBps_aboveMax_reverts() public {
-        uint256 aboveMax = protocolConfig.MAX_PROTOCOL_FEE_BPS() + 1;
-        vm.prank(owner);
-        vm.expectRevert(IProtocolConfig.InvalidProtocolFeeBps.selector);
-        protocolConfig.setProtocolFeeBps(aboveMax);
-    }
+    // `setProtocolFeeBps` / `setGuardianFeeBps` removed with the two-number fee
+    // model — the protocol's and guardian network's shares are now
+    // `mgmtSplit` / `perfSplit`, covered by test/fees/ProtocolConfigSplits.t.sol.
 
     // ==================== setProtocolFeeRecipient ====================
 
@@ -384,45 +368,18 @@ contract GovernorParametersTest is Test {
 
     function test_setProtocolFeeRecipient_zero_reverts() public {
         vm.prank(owner);
-        vm.expectRevert(IProtocolConfig.InvalidProtocolFeeRecipient.selector);
         protocolConfig.setProtocolFeeRecipient(address(0));
     }
 
-    // ==================== setGuardianFeeBps ====================
-
-    function test_setGuardianFeeBps_happyPath() public {
-        // Raising the guardian fee above 0 now requires a guardians-fee
-        // recipient (coupling mirrors the protocol-fee recipient rule).
-        vm.prank(owner);
-        protocolConfig.setGuardiansFeeRecipient(makeAddr("guardiansFeeRecipient"));
-
-        uint256 oldVal = protocolConfig.guardianFeeBps();
-        uint256 newVal = 250;
-        vm.expectEmit(true, false, false, true, address(protocolConfig));
-        emit IProtocolConfig.ParameterChangeFinalized(keccak256("guardianFeeBps"), oldVal, newVal);
-        vm.prank(owner);
-        protocolConfig.setGuardianFeeBps(newVal);
-        assertEq(protocolConfig.guardianFeeBps(), newVal);
-    }
-
-    function test_setGuardianFeeBps_aboveMax_reverts() public {
-        uint256 aboveMax = protocolConfig.MAX_GUARDIAN_FEE_BPS() + 1;
-        vm.prank(owner);
-        vm.expectRevert(IProtocolConfig.InvalidGuardianFeeBps.selector);
-        protocolConfig.setGuardianFeeBps(aboveMax);
-    }
+    // `setGuardianFeeBps` removed with the two-number fee model — the guardian
+    // network's share is now `mgmtSplit.guardianBps` / `perfSplit.guardianBps`,
+    // covered by test/fees/ProtocolConfigSplits.t.sol.
 
     // setFactory removed in per-vault governor design — factory is set-once at initialize.
 
-    // ==================== Cross-setter: protocolFeeBps requires recipient ====================
-
-    function test_setProtocolFeeBps_noRecipient_reverts() public {
-        // Deploy a fresh ProtocolConfig with no recipient set.
-        ProtocolConfig pc2 = new ProtocolConfig(owner);
-        vm.prank(owner);
-        vm.expectRevert(IProtocolConfig.InvalidProtocolFeeRecipient.selector);
-        pc2.setProtocolFeeBps(100);
-    }
+    // The "a nonzero rate requires a recipient" cross-check is gone with the
+    // rates themselves. A recipient may now be set or cleared freely; an unset
+    // one simply unwires that leg at settlement.
 
     // ==================== onlyOwner blanket coverage ====================
 
@@ -454,11 +411,9 @@ contract GovernorParametersTest is Test {
         bytes memory expectedOwnable =
             abi.encodeWithSelector(OwnableUpgradeable.OwnableUnauthorizedAccount.selector, random);
         vm.expectRevert(expectedOwnable);
-        protocolConfig.setProtocolFeeBps(500);
-        vm.expectRevert(expectedOwnable);
         protocolConfig.setProtocolFeeRecipient(makeAddr("r"));
         vm.expectRevert(expectedOwnable);
-        protocolConfig.setGuardianFeeBps(250);
+        protocolConfig.setGuardiansFeeRecipient(makeAddr("g"));
         // governor.setFactory removed in per-vault design — factory is set-once at initialize.
         vm.stopPrank();
     }

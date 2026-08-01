@@ -9,23 +9,43 @@ interface IRegistryAuthMinimal {
     function isAuthorizedGovernor(address gov) external view returns (bool);
 }
 
+/// @dev The ledger's `coverageFreezer` IS the challenge game — it is the role
+///      that freezes a proposal's coverage on a filing and lifts it on a
+///      verdict. Read live rather than mirrored here so the two can never
+///      drift, and so replacing the game is one `setCoverageFreezer` on the
+///      ledger rather than a redeploy of this escrow.
+interface ILedgerFreezerMinimal {
+    function coverageFreezer() external view returns (address);
+}
+
 /**
  * @title ProposerBondEscrow
  * @notice Holds the risk-scaled proposer bond (spec 2026-07-22 §3.9) for the
  *         lifetime of a proposal. The proposer is the actual attacker in the
  *         threat model, so it posts capital scaled to what the proposal can
- *         extract; in v1a the bond's only exit is release back to the
+ *         extract.
+ *
+ *         TWO EXITS, AND ONLY TWO. `releaseBond` returns the bond to the
  *         proposer once the proposal reaches a terminal state (the governor
- *         gates WHEN — see `SyndicateGovernor.reclaimProposerBond`).
- *         A forfeiture path was once planned to route this bond into the
- *         compensation escrow alongside the challenge game; that escrow is
- *         gone (slash proceeds burn), and no forfeiture path was ever built
- *         here. Release to the proposer remains the ONLY exit.
- *         This contract deliberately has no owner and no
- *         discretionary exit — the invariant `wood.balanceOf(this) >=
- *         sum of locked-unreleased bonds` holds by construction (equality
- *         absent direct transfers; surplus from donations is permanently
- *         stuck, accepted for v1a).
+ *         gates WHEN — see `SyndicateGovernor.reclaimProposerBond`), and
+ *         `forfeitBond` confiscates it when a challenge convicts the proposal.
+ *         Neither is discretionary and this contract still has NO OWNER: the
+ *         release payee is the address recorded at lock time, and the
+ *         forfeiture destination is a compile-time constant. The invariant
+ *         `wood.balanceOf(this) >= sum of locked-unreleased bonds` holds by
+ *         construction (equality absent direct transfers; surplus from
+ *         donations is permanently stuck, accepted for v1a).
+ *
+ *         WHY THE SECOND EXIT EXISTS AT ALL. Before it, `releaseBond` was the
+ *         only way WOOD ever left this contract, so a bond could be recovered
+ *         but never lost — a "deterrent" with no downside branch. Paired with
+ *         `SyndicateGovernor`'s one-hour proposer self-settle, a proposer could
+ *         execute a drain, settle its own strategy at +1h, reclaim the bond in
+ *         full and be gone while the 14-day challenge window was still in its
+ *         first day. The two halves are useless apart: a confiscation function
+ *         nothing can reach in time changes nothing, and a reclaim delay with
+ *         nothing to confiscate at the end of it only inconveniences the
+ *         honest. Both landed together.
  */
 contract ProposerBondEscrow is IProposerBondEscrow {
     using SafeERC20 for IERC20;
@@ -46,12 +66,35 @@ contract ProposerBondEscrow is IProposerBondEscrow {
     IERC20 public immutable wood;
     IRegistryAuthMinimal public immutable registry;
 
+    /// @notice The singleton exposure ledger whose `coverageFreezer` this
+    ///         escrow accepts forfeitures from.
+    /// @dev    IMMUTABLE, AND THE LEDGER RATHER THAN THE GAME ITSELF. Pointing
+    ///         straight at `ChallengeGame` would be circular at deployment —
+    ///         the game must know which escrow holds a proposal's bond and the
+    ///         escrow must know which game may take it — and resolving that
+    ///         circularity is exactly what an owner-set pointer is usually for.
+    ///         This contract does not have an owner and should not grow one for
+    ///         this: an owner able to name the convictor is an owner able to
+    ///         name itself and destroy every open bond. The ledger breaks the
+    ///         cycle without one. It is deployed before both, it is the only
+    ///         contract that already treats the game as a privileged role, and
+    ///         rotating that role is guarded on its side (`setCoverageFreezer`
+    ///         refuses while anything is frozen, review 🟠F11), which is a
+    ///         stronger rotation guard than anything this escrow could impose.
+    ILedgerFreezerMinimal public immutable exposureLedger;
+
+    /// @dev Where a forfeited bond goes. Same sink and same constant as
+    ///      `ChallengeGame`'s `settleBurnBps`/`forfeitBurnBps` and sWOOD's
+    ///      uncompensatable slash residue.
+    address public constant BURN_ADDRESS = 0x000000000000000000000000000000000000dEaD;
+
     mapping(bytes32 bondKey => Bond) internal _bonds;
 
-    constructor(address wood_, address registry_) {
-        if (wood_ == address(0) || registry_ == address(0)) revert ZeroAddress();
+    constructor(address wood_, address registry_, address exposureLedger_) {
+        if (wood_ == address(0) || registry_ == address(0) || exposureLedger_ == address(0)) revert ZeroAddress();
         wood = IERC20(wood_);
         registry = IRegistryAuthMinimal(registry_);
+        exposureLedger = ILedgerFreezerMinimal(exposureLedger_);
     }
 
     modifier onlyGovernor() {
@@ -102,6 +145,95 @@ contract ProposerBondEscrow is IProposerBondEscrow {
         delete _bonds[key];
         wood.safeTransfer(b.proposer, b.amount);
         emit BondReleased(msg.sender, proposalId, b.proposer, b.amount);
+    }
+
+    /// @inheritdoc IProposerBondEscrow
+    /// @dev THE BOND'S DOWNSIDE BRANCH (spec §3.8 / Plan C). Called from
+    ///      `ChallengeGame._settle`, the single point at which a proposal is
+    ///      convicted — by a guilty court ruling or by the silence verdict,
+    ///      which say the same thing about the proposal. Takes `governor`
+    ///      explicitly rather than deriving it from `msg.sender` the way
+    ///      `releaseBond` does: the convictor is the challenge game, not the
+    ///      governor that locked the bond, and the game already carries
+    ///      `(governor, proposalId)` on the challenge it is settling.
+    ///
+    /// @dev AUTHORIZATION — WHO. `msg.sender` must be the live
+    ///      `coverageFreezer` of the wired ledger, which is the challenge game
+    ///      and nothing else. The precedent is `StakedWood.slashToEscrow`'s
+    ///      `authorizedSlasher`: one named contract, the one that reaches
+    ///      verdicts, may move somebody else's capital. The difference is where
+    ///      the name is kept — sWOOD keeps its own owner-set copy, this escrow
+    ///      borrows the ledger's, because a second copy of "who is the game"
+    ///      is a second thing to keep in step and an owner-set copy here would
+    ///      hand this contract the discretionary exit its whole design refuses.
+    ///
+    ///      FAILS CLOSED when the freezer is unset: `msg.sender` can never be
+    ///      `address(0)`, so an unwired protocol convicts nothing rather than
+    ///      letting anyone confiscate. That is the correct direction — an
+    ///      unreachable forfeiture leaves bonds releasable, which is the
+    ///      pre-Plan-C behaviour, while a permissive one destroys them.
+    ///
+    /// @dev DESTINATION — WHERE. Burned. THIS DEVIATES FROM THE WRITTEN SPEC,
+    ///      knowingly and visibly: spec 2026-07-22 §3.9 says "the proposer bond
+    ///      is slashed to the compensation escrow (§3.8) on a passed challenge,
+    ///      before approver stake", and the economic-security paper §5.8 repeats
+    ///      it. The deviation is a SCOPE call, not a disagreement with the
+    ///      spec's intent, and the blocker is mechanical:
+    ///      `CompensationEscrow.openCase` is `onlyFunder` against a SINGLE
+    ///      owner-set funder slot, already held by `StakedWood`. Paying a bond
+    ///      into it therefore means changing the escrow's access model — a
+    ///      contract that custodies LP compensation and is not otherwise
+    ///      touched by this fix — and that belongs in its own review, not as a
+    ///      side effect of closing a forfeiture hole. Burning is the
+    ///      conservative interim: it is strictly worse for the proposer than
+    ///      the spec's routing (the bond is gone either way) and strictly
+    ///      neutral for everyone else, so switching to §3.8 routing later is a
+    ///      pure improvement to the victims' side with no incentive to unwind.
+    ///
+    ///      It is also independently defensible, by the same reasoning
+    ///      `forfeitBurnBps` sets out for the challenger bond, applied to a
+    ///      party that is by construction the attacker: EVERY REACHABLE PAYEE
+    ///      IS A ROUND TRIP.
+    ///        - The challenger? Addresses are free. A proposer can file against
+    ///          its own drain and refund itself the bond it was supposed to
+    ///          lose, at the cost of a challenger bond it also gets back.
+    ///        - The vault's LPs, via `CompensationEscrow`? Closest to the
+    ///          spec's intent and the right eventual answer — but note even
+    ///          there the proposer may hold shares and recover its pro-rata
+    ///          slice, since the case is apportioned on a pre-drain snapshot it
+    ///          could have bought into before proposing. Beyond the `onlyFunder`
+    ///          blocker above, `openCase` can revert on `EmptySnapshot` /
+    ///          `SnapshotNotPast` / `NothingToCompensate`, and it would be
+    ///          reverting inside `_settle`, where the caller already treats a
+    ///          failable external call as something to wrap rather than trust
+    ///          (see the best-effort `demoteByChallenge`).
+    ///        - A treasury? Pays whoever governs, which the attacker may be or
+    ///          may lobby.
+    ///      Destruction is the only sink with no beneficiary to be, so the loss
+    ///      falls exactly on whoever forfeited. It is also why this is a
+    ///      constant and not a parameter: a caller-chosen destination would
+    ///      hand a compromised game the power to redirect bonds to itself,
+    ///      which is the specific thing sWOOD refuses when it keeps the
+    ///      compensation escrow as owner-set state rather than a
+    ///      `slashToEscrow` argument.
+    ///
+    /// @dev NO PARTIAL FORFEIT, and no bounty carved off the top. The proposer
+    ///      bond is priced at what the proposal could extract; a conviction
+    ///      means it extracted. Splitting it would reintroduce a payee.
+    function forfeitBond(address governor, uint256 proposalId) external returns (address, uint256) {
+        if (msg.sender != exposureLedger.coverageFreezer()) revert NotAuthorizedConvictor();
+        bytes32 key = _key(governor, proposalId);
+        Bond memory b = _bonds[key];
+        if (b.proposer == address(0)) revert NoBond();
+        // Effects before interaction, matching `releaseBond`: the record is
+        // gone before any transfer, so a second forfeit (concurrent challenges
+        // against the same proposal both reaching a verdict) hits `NoBond`
+        // rather than double-burning, and a hooked WOOD cannot re-enter into a
+        // still-live bond.
+        delete _bonds[key];
+        if (b.amount != 0) wood.safeTransfer(BURN_ADDRESS, b.amount);
+        emit BondForfeited(governor, proposalId, b.proposer, b.amount);
+        return (b.proposer, b.amount);
     }
 
     /// @inheritdoc IProposerBondEscrow

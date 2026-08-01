@@ -8,7 +8,7 @@ pragma solidity 0.8.28;
 ///         lived in `GuardianRegistry`. The slimmed `GuardianRegistry`,
 ///         `SyndicateGovernor`, and `SyndicateFactory` call sWOOD through
 ///         this interface.
-/// @dev See `docs/superpowers/specs/2026-05-21-swood-staking-split-design.md`.
+/// @dev See `openspec/specs/guardian-staking/spec.md`.
 ///      Staking/owner-bond signatures are carried verbatim from the
 ///      pre-split `IGuardianRegistry`. Checkpoint reads are timestamp-keyed
 ///      (EIP-6372 timestamp-mode clock).
@@ -218,11 +218,18 @@ interface IStakedWood {
     ///                     itself (reverts, not silently clamped down).
     /// @return total  WOOD burned across all approvers, NET of the conviction
     ///                bounty — the `burned` leg of `VerdictSlashBurned`.
+    /// @param  contestors Positionally aligned with `approvers`: true where that
+    ///         approver funded the counter-bond. Their SUMMED slash caps the
+    ///         bounty, so staging a contest can never pay more than it costs
+    ///         the stager — the bound the punitive rate would otherwise break,
+    ///         since the bounty is a share of the whole cohort's bonds while a
+    ///         faker risks only its own.
     function slashVerdict(
         bytes32 caseKey,
         uint256 openedAt,
         address[] calldata approvers,
         uint256[] calldata slashBpsPer,
+        bool[] calldata contestors,
         address bountyTo,
         uint256 bountyBps
     ) external returns (uint256 total);

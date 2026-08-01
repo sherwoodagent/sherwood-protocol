@@ -105,7 +105,6 @@ contract DeploySherwood is ScriptBase {
         address ensRegistrar;
         address agentRegistry;
         uint256 managementFeeBps;
-        uint256 protocolFeeBps;
         uint256 maxStrategyDays;
         uint256 votingPeriod;
         address woodToken;
@@ -130,7 +129,6 @@ contract DeploySherwood is ScriptBase {
             ensRegistrar: vm.envOr("ENS_REGISTRAR", address(0)),
             agentRegistry: vm.envOr("AGENT_REGISTRY", address(0)),
             managementFeeBps: vm.envOr("MANAGEMENT_FEE", uint256(50)),
-            protocolFeeBps: vm.envOr("PROTOCOL_FEE", uint256(100)),
             maxStrategyDays: vm.envOr("MAX_STRATEGY_DAYS", uint256(14)),
             votingPeriod: vm.envOr("VOTING_PERIOD", uint256(1 days)),
             // WOOD_TOKEN is required — the full GuardianRegistry stakes it.
@@ -242,10 +240,6 @@ contract DeploySherwood is ScriptBase {
 
         // Deploy ProtocolConfig (plain Ownable — no proxy needed).
         ProtocolConfig protocolConfig = new ProtocolConfig(d.deployer);
-        if (cfg.protocolFeeBps > 0) {
-            protocolConfig.setProtocolFeeRecipient(d.deployer);
-            protocolConfig.setProtocolFeeBps(cfg.protocolFeeBps);
-        }
         d.protocolConfig = address(protocolConfig);
 
         // Per-vault governor model: deploy the governor implementation once and

@@ -74,7 +74,7 @@ contract SyndicateVault is
     ///         fits comfortably in any block. `removeAgent` frees a slot.
     uint256 public constant MAX_AGENTS_PER_VAULT = 32;
 
-    /// @notice Hard cap on the vault-owner-set agent performance fee (15%),
+    /// @notice Hard cap on the vault-owner-set agent performance fee (30%),
     ///         equal to the governor's `MAX_PERFORMANCE_FEE_CAP` — the protocol
     ///         ceiling on `maxPerformanceFeeBps`. The governor additionally
     ///         clamps the realized fee to its (lower, tunable) configured
@@ -82,10 +82,18 @@ contract SyndicateVault is
     ///         live param is never charged. Capping here at the same ceiling
     ///         keeps `agentFeeBps()` from advertising a rate that can never be
     ///         realized (PR #384 review C4).
+    /// @dev This ceiling is a backstop, not the headline rate. A vault created
+    ///      through the factory starts with a per-vault `maxPerformanceFeeBps`
+    ///      of `FeeConstants.DEFAULT_MAX_PERFORMANCE_FEE_BPS` (20%), so setting
+    ///      above the headline here is legal but clamped at settlement until
+    ///      governance raises that param.
     uint256 public constant MAX_AGENT_FEE_BPS = FeeConstants.MAX_PERFORMANCE_FEE_BPS;
 
     /// @notice Cap on the owner-set idle-liquidity floor (50%).
     uint256 private constant MAX_MIN_BUFFER_BPS = 5_000;
+
+    /// @notice Cap on the early-exit penalty (2%). Proposed launch value 50 bps.
+    uint256 public constant MAX_INSTANT_EXIT_FEE_BPS = 200;
 
     // ── Value-moving ERC20 selectors guarded in governor batches ──
     // (see `_guardBatchCalls`; findings 1+7 of the economic-security review)
@@ -167,6 +175,16 @@ contract SyndicateVault is
     ///      under the EIP-170 runtime size limit. Storage slot/type reserved.
     uint32 internal minHoldingPeriod;
 
+    /// @notice Early-exit penalty on a Lane A instant exit, in basis points of
+    ///         the portion that had to be pulled back from the strategy.
+    /// @dev Accrues to the VAULT — the depositors who stay — not to any fee
+    ///      recipient. It is an anti-mercenary redemption term compensating
+    ///      them for the forced unwind, not revenue, which is why it is
+    ///      deliberately NOT excluded from `totalAssets()` the way crystallized
+    ///      fees are. Packs into the slot above (16 + 32 + 16 bits), so the
+    ///      linear layout is unchanged and no `__gap` slot is consumed.
+    uint16 public instantExitFeeBps;
+
     /// @notice Net LP asset flow (deposits − instant exits) accumulated while
     ///         the current proposal is active. Read by the governor at
     ///         settlement so mid-proposal flows don't corrupt strategy PnL;
@@ -180,10 +198,50 @@ contract SyndicateVault is
     ///      under the EIP-170 runtime size limit. Storage slot/type reserved.
     mapping(address => uint40) internal lastDepositAt;
 
+    // ── Two-number fee model (management + performance) ──
+
+    /// @notice Integral of fund assets over time for the live proposal, in
+    ///         asset-seconds. The management fee is this figure annualized:
+    ///         `fee = assetSeconds * rate / (BPS_DENOMINATOR * 365 days)`.
+    /// @dev Exact under arbitrary mid-proposal flows because the integral is
+    ///      piecewise-constant: every base-changing event closes off the
+    ///      elapsed interval at the base that applied during it, then restamps.
+    uint256 private _mgmtAssetSeconds;
+
+    /// @notice Fund assets in force since `_mgmtLastUpdate` — the height of the
+    ///         current rectangle in the integral above.
+    uint192 private _mgmtBase;
+
+    /// @notice When `_mgmtBase` was last restamped. Zero means "not accruing":
+    ///         no proposal is live, so no management fee is owed. This is the
+    ///         gate that keeps capital idle between proposals free, and it also
+    ///         keeps `totalAssets()` (an external call for live NAV) off the
+    ///         ordinary deposit path.
+    uint64 private _mgmtLastUpdate;
+
+    /// @notice Highest price per share this fund has ever been charged a
+    ///         performance fee at, carrying the ERC-4626 virtual offsets.
+    ///         Performance fee applies only above this mark, so a fund that
+    ///         falls and recovers is not charged twice on the same dollars.
+    uint256 private _highWaterPricePerShare;
+
+    /// @notice Management fee already collected from exiting shares on the Lane
+    ///         A instant path, awaiting distribution at the next settlement.
+    ///         Netted out of the settlement charge so nothing is billed twice.
+    uint128 private _crystallizedMgmt;
+
+    /// @notice Performance fee already collected from exiting shares, same
+    ///         deferral. Excluded from `totalAssets()` alongside the above, so
+    ///         retaining it does not move the remaining holders' share price.
+    uint128 private _crystallizedPerf;
+
     /// @dev Reserved storage for future upgrades. Shrunk 35 → 32: one packed
     ///      slot (minBufferBps + minHoldingPeriod), _interimNetFlow,
     ///      lastDepositAt (spec 2026-07-19 instant-withdrawal-liquidity).
-    uint256[32] private __gap;
+    ///      Shrunk 32 → 28 for the two-number fee model: _mgmtAssetSeconds,
+    ///      (_mgmtBase + _mgmtLastUpdate), _highWaterPricePerShare,
+    ///      (_crystallizedMgmt + _crystallizedPerf).
+    uint256[28] private __gap;
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -601,7 +659,10 @@ contract SyndicateVault is
     }
 
     /// @inheritdoc ISyndicateVault
-    function agentFeeBps() external view returns (uint256) {
+    /// @dev `public` rather than `external`: `_exitFees` reads it internally to
+    ///      price an instant exiter's performance fee at the same rate
+    ///      settlement would charge.
+    function agentFeeBps() public view returns (uint256) {
         // One SLOAD: 0 = never set → the 5% default (agent never silently
         // unpaid, H1); otherwise the stored value is fee+1, so an explicit 0%
         // (stored 1) stays distinct from unset.
@@ -623,6 +684,13 @@ contract SyndicateVault is
         if (bps > MAX_MIN_BUFFER_BPS) revert BufferTooHigh();
         minBufferBps = bps;
         emit MinBufferUpdated(bps);
+    }
+
+    /// @inheritdoc ISyndicateVault
+    function setInstantExitFeeBps(uint16 bps) external onlyOwner {
+        if (bps > MAX_INSTANT_EXIT_FEE_BPS) revert InstantExitFeeTooHigh();
+        instantExitFeeBps = bps;
+        emit InstantExitFeeUpdated(bps);
     }
 
     // ==================== OVERRIDES ====================
@@ -844,9 +912,21 @@ contract SyndicateVault is
     ///      PriceRouter (`_laneState`). When Lane A is unavailable the live term is
     ///      0, so during a proposal the vault shows float-only and mid-flight LP
     ///      flow goes through the async queue, settling at the realized price.
+    /// @dev Crystallized fees are physically in the vault's balance but are no
+    ///      longer the fund's money — they belong to the split recipients and
+    ///      are paid out at the next settlement. Excluding them here is what
+    ///      makes an instant exit invisible to the holders who stay: their
+    ///      price per share is the same before and after, and the payout at
+    ///      settle moves nothing. Since price per share, the high-water mark
+    ///      and the management-fee base ALL read this function, the exclusion
+    ///      has to live here and only here.
     function totalAssets() public view override returns (uint256) {
         (,, uint256 liveNav,) = _laneState();
-        return IERC20(asset()).balanceOf(address(this)) + liveNav;
+        uint256 gross = IERC20(asset()).balanceOf(address(this)) + liveNav;
+        uint256 owed = uint256(_crystallizedMgmt) + _crystallizedPerf;
+        // Cannot legitimately underflow — the counters track assets the vault
+        // holds — but under-reporting beats inventing value if it ever did.
+        return gross > owed ? gross - owed : 0;
     }
 
     /// @dev Sherlock run #2 #12: return 0 when `paused()` so the EIP-4626 IMP-1
@@ -883,6 +963,10 @@ contract SyndicateVault is
         if (_depositsLocked() && !laneA) revert DepositsLocked();
         _requireApprovedDepositor(receiver);
         super._deposit(caller, receiver, assets, shares);
+        // The fund's first shares establish the high-water mark. Cannot be done
+        // at `initialize` — before any shares exist there is no price.
+        _initHighWaterMarkIfUnset();
+
         // Auto-delegation happens in `_update` (every receipt path).
 
         // G1: a Lane A entry locks the receiver's shares until this proposal
@@ -892,6 +976,11 @@ contract SyndicateVault is
             // Mid-proposal principal in — excluded from settlement PnL so
             // performance fees are never charged on depositor principal.
             _interimNetFlow += int256(assets);
+            // The management fee IS charged on it, for the time it is present:
+            // close the interval at the old base, restamp at the new one. A late
+            // depositor therefore pays only for the days their capital was in
+            // the fund.
+            _accrueManagementFee();
         }
     }
 
@@ -921,20 +1010,40 @@ contract SyndicateVault is
                 _pullFromStrategy(assets + reserve - float);
             }
         }
+        // Crystallize the exiting shares' fees BEFORE the burn, while the
+        // pro-rata denominator still includes them. `assets` arriving here is
+        // already net of these fees (see `previewRedeem`), so the fee portion
+        // simply stays behind in the vault — no transfer, no recipient lookup,
+        // no external call on the ERC-4626 hot path.
+        //
+        // Fee incidence, RESOLVED. This used to be an accepted leak: the
+        // departing LP's price included their slice of unrealized gain taken
+        // fee-free, and the settlement fee was later borne by whoever stayed.
+        // The exiter now pays the fees they owe at the moment they leave, so
+        // exit timing is fee-neutral.
+        (,,, bool laneAExit) = _laneState();
+        if (caller != _withdrawalQueue && laneAExit) {
+            (uint256 mgmtFee, uint256 perfFee) = _exitFees(shares);
+            if (mgmtFee != 0 || perfFee != 0) {
+                // forge-lint: disable-next-line(unsafe-typecast)
+                _crystallizedMgmt += uint128(mgmtFee);
+                // forge-lint: disable-next-line(unsafe-typecast)
+                _crystallizedPerf += uint128(perfFee);
+                emit ExitFeesCrystallized(_owner, shares, mgmtFee, perfFee);
+            }
+        }
+
         super._withdraw(caller, receiver, _owner, assets, shares);
         // Mid-proposal principal out — excluded from settlement PnL. Queue
         // settlements post-date the PnL read, so only live instant exits count.
-        //
-        // Fee incidence (spec Q3, explicit decision — PR #6 review note): the
-        // departing LP's share price includes their pro-rata slice of any
-        // UNREALIZED strategy gain, taken fee-free; the settlement fee is
-        // later computed on the FULL realized PnL and borne by remaining
-        // holders. This small leak is ACCEPTED for V1 — exact pro-rata fee
-        // skimming on instant exits would cost EIP-4626 preview-exactness and
-        // EIP-170 bytecode budget. Partially offset when `instantExitFeeBps`
-        // lands (deferred, spec §6).
         if (caller != _withdrawalQueue && redemptionsLocked()) {
             _interimNetFlow -= int256(assets);
+            // Accrual continues on the reduced base from this moment; the
+            // withdrawn capital accrues nothing for the remainder of the
+            // proposal. The high-water mark is deliberately NOT ratcheted here:
+            // it advances only at settlement, so the holders who stayed keep
+            // measuring from the same mark.
+            _accrueManagementFee();
         }
     }
 
@@ -1109,6 +1218,342 @@ contract SyndicateVault is
     /// @inheritdoc ISyndicateVault
     function interimNetFlow() external view returns (int256) {
         return _interimNetFlow;
+    }
+
+    // ==================== MANAGEMENT-FEE ACCRUAL ====================
+
+    /// @dev Close off the elapsed interval at the base that applied during it,
+    ///      then restamp the base from live fund assets. Called on every event
+    ///      that can move the base: proposal execute, Lane A deposit, Lane A
+    ///      instant exit, and the custody-model share hooks.
+    ///
+    ///      Restamping from `totalAssets()` rather than applying a per-event
+    ///      delta is what lets `strategyMint` / `strategyBurn` participate at
+    ///      all: those are denominated in SHARES, and reconstructing an asset
+    ///      delta from them mid-mutation is fragile. Reading the base from
+    ///      truth is both simpler and correct for the custody model.
+    ///
+    ///      The `_mgmtLastUpdate == 0` early return is load-bearing twice over:
+    ///      it is the "no live proposal, no fee" rule (design.md Decision 4),
+    ///      and it keeps `totalAssets()` — an external call for live NAV — off
+    ///      the ordinary deposit path entirely.
+    function _accrueManagementFee() private {
+        uint256 last = _mgmtLastUpdate;
+        if (last == 0) return;
+        uint256 nowTs = block.timestamp;
+        if (nowTs > last) {
+            _mgmtAssetSeconds += uint256(_mgmtBase) * (nowTs - last);
+            _mgmtLastUpdate = uint64(nowTs);
+        }
+        _stampMgmtBase();
+    }
+
+    /// @dev Restamp the accrual base from live fund assets, falling back to
+    ///      idle float if the valuation is unavailable.
+    ///
+    ///      `totalAssets()` resolves live NAV through `factory.priceRouter()`.
+    ///      A fee accrual must never be the reason `executeProposal` or a
+    ///      settlement reverts, so a router that is unwired or reverting
+    ///      degrades the BASE rather than the transaction — the fund is valued
+    ///      at its float for that interval and the fee comes out conservative
+    ///      (too low), never inflated. Routed through an external self-call
+    ///      because `try` cannot wrap an internal one.
+    function _stampMgmtBase() private {
+        uint256 base;
+        try this.totalAssets() returns (uint256 a) {
+            base = a;
+        } catch {
+            base = IERC20(asset()).balanceOf(address(this));
+        }
+        // forge-lint: disable-next-line(unsafe-typecast)
+        _mgmtBase = uint192(base > type(uint192).max ? type(uint192).max : base);
+    }
+
+    /// @inheritdoc ISyndicateVault
+    /// @notice Governor-only: begin management-fee accrual for a newly executed
+    ///         proposal.
+    /// @dev Starts from zero rather than carrying anything forward, which is
+    ///      what makes the gap between proposals free: nothing accrued while no
+    ///      proposal was live, and nothing stale survives into this one.
+    function startManagementAccrual() external onlyGovernor {
+        _mgmtAssetSeconds = 0;
+        _mgmtLastUpdate = uint64(block.timestamp);
+        _stampMgmtBase();
+    }
+
+    /// @inheritdoc ISyndicateVault
+    /// @notice Governor-only: settle up the accrual and hand back the integral,
+    ///         then stop accruing.
+    /// @dev Consume-and-reset. Zeroing `_mgmtLastUpdate` is what stops the
+    ///      clock between proposals; without it the idle gap would accrue.
+    function consumeManagementAccrual() external onlyGovernor returns (uint256 assetSeconds) {
+        _accrueManagementFee();
+        assetSeconds = _mgmtAssetSeconds;
+        _mgmtAssetSeconds = 0;
+        _mgmtBase = 0;
+        _mgmtLastUpdate = 0;
+    }
+
+    /// @inheritdoc ISyndicateVault
+    /// @dev `public` rather than `external`: `_exitFees` reads it internally to
+    ///      size an exiter's pro-rata slice of the accrual so far.
+    function managementAssetSeconds() public view returns (uint256) {
+        uint256 last = _mgmtLastUpdate;
+        if (last == 0 || block.timestamp <= last) return _mgmtAssetSeconds;
+        return _mgmtAssetSeconds + uint256(_mgmtBase) * (block.timestamp - last);
+    }
+
+    /// @inheritdoc ISyndicateVault
+    function isAccruingManagementFee() external view returns (bool) {
+        return _mgmtLastUpdate != 0;
+    }
+
+    // ==================== HIGH-WATER MARK ====================
+
+    /// @notice Shares the price-per-share figure is quoted against. Fixed at
+    ///         1e18 so the mark's unit is independent of the asset's decimals.
+    uint256 private constant PPS_SHARES = 1e18;
+
+    /// @inheritdoc ISyndicateVault
+    /// @dev Routed through `convertToAssets` rather than computing
+    ///      `totalAssets() / totalSupply()` by hand, so the mark inherits the
+    ///      ERC-4626 virtual-offset rounding the vault uses for every other
+    ///      conversion. A hand-rolled ratio would drift from real share pricing
+    ///      and the drift would land in the fee.
+    function pricePerShare() public view returns (uint256) {
+        return convertToAssets(PPS_SHARES);
+    }
+
+    /// @inheritdoc ISyndicateVault
+    function highWaterPricePerShare() external view returns (uint256) {
+        return _highWaterPricePerShare;
+    }
+
+    /// @inheritdoc ISyndicateVault
+    /// @notice Value above the mark, in assets — the performance-fee base.
+    /// @dev Zero when the fund sits at or below its previous peak, which is the
+    ///      whole point: a fund that falls and recovers is not charged twice on
+    ///      the same dollars. Callers must read this AFTER the management fee
+    ///      has been taken, since that fee lowers the price per share.
+    function aboveHighWaterMark() external view returns (uint256) {
+        uint256 mark = _highWaterPricePerShare;
+        uint256 pps = pricePerShare();
+        if (pps <= mark) return 0;
+        return (pps - mark) * totalSupply() / PPS_SHARES;
+    }
+
+    /// @inheritdoc ISyndicateVault
+    /// @notice Governor-only: advance the mark to the current (post-fee) price
+    ///         per share.
+    /// @dev Monotonic by construction — a loss leaves the mark where it was,
+    ///      which is what makes the recovery free. Called at settlement only;
+    ///      a partial exit must NOT ratchet, or the holders who stayed would
+    ///      start measuring from a peak the fund never actually banked.
+    function ratchetHighWaterMark() external onlyGovernor {
+        uint256 pps = pricePerShare();
+        if (pps > _highWaterPricePerShare) {
+            _highWaterPricePerShare = pps;
+            emit HighWaterMarkUpdated(pps);
+        }
+    }
+
+    /// @dev Seed the mark at the fund's first deposit so the first proposal's
+    ///      gains above it are chargeable. Before any shares exist the price is
+    ///      meaningless, so this cannot be done at `initialize`.
+    function _initHighWaterMarkIfUnset() private {
+        if (_highWaterPricePerShare == 0 && totalSupply() != 0) {
+            uint256 pps = pricePerShare();
+            _highWaterPricePerShare = pps;
+            emit HighWaterMarkUpdated(pps);
+        }
+    }
+
+    // ==================== EXIT-TIME FEE CRYSTALLIZATION ====================
+
+    /// @inheritdoc ISyndicateVault
+    function crystallizedMgmt() external view returns (uint256) {
+        return _crystallizedMgmt;
+    }
+
+    /// @inheritdoc ISyndicateVault
+    function crystallizedPerf() external view returns (uint256) {
+        return _crystallizedPerf;
+    }
+
+    /// @dev The fees `shares` owe if they leave right now: their pro-rata slice
+    ///      of the management fee accrued-but-uncollected so far, plus their
+    ///      per-share performance fee above the high-water mark.
+    ///
+    ///      This is what makes exit timing fee-neutral. Without it an instant
+    ///      exiter walks away mid-proposal at a live price having paid nothing,
+    ///      and the fees they owed land on the depositors who stayed.
+    ///
+    ///      The performance rate is clamped to the governor's per-vault ceiling
+    ///      exactly as settlement clamps it. Reading the vault's own
+    ///      `agentFeeBps()` unclamped would let an over-configured vault charge
+    ///      an exiter more than a hold-to-settle depositor pays — breaking the
+    ///      neutrality this function exists to provide.
+    function _exitFees(uint256 shares) private view returns (uint256 mgmtFee, uint256 perfFee) {
+        uint256 supply = totalSupply();
+        if (shares == 0 || supply == 0) return (0, 0);
+
+        // ── Management: pro-rata of the fund-level accrual to now ──
+        uint256 rate = _managementFeeBps;
+        if (rate != 0) {
+            uint256 owedNow = (managementAssetSeconds() * rate) / (10_000 * 365 days);
+            uint256 collected = _crystallizedMgmt;
+            if (owedNow > collected) {
+                mgmtFee = ((owedNow - collected) * shares) / supply;
+            }
+        }
+
+        // ── Performance: per-share, above the mark, on the shares leaving ──
+        uint256 mark = _highWaterPricePerShare;
+        uint256 pps = pricePerShare();
+        if (pps > mark) {
+            uint256 bps = agentFeeBps();
+            uint256 cap = _governorPerformanceCap();
+            if (bps > cap) bps = cap;
+            perfFee = (((pps - mark) * shares) / PPS_SHARES) * bps / 10_000;
+        }
+    }
+
+    /// @dev The governor's per-vault performance-fee ceiling. Falls back to the
+    ///      protocol constant when the governor is unwired, has no code, or
+    ///      returns something undecodable — a quoting view on the ERC-4626
+    ///      withdraw path must never revert.
+    ///
+    ///      Deliberately a low-level staticcall rather than `try`/`catch`:
+    ///      `try` catches a REVERT, but a call that succeeds and returns short
+    ///      or empty data fails while decoding the return value, and that
+    ///      failure is not catchable. Checking `returndata.length` first is the
+    ///      only form that survives an EOA or a stubbed governor.
+    function _governorPerformanceCap() private view returns (uint256) {
+        address gov = _getGovernor();
+        if (gov == address(0) || gov.code.length == 0) return FeeConstants.MAX_PERFORMANCE_FEE_BPS;
+        (bool ok, bytes memory ret) =
+            gov.staticcall(abi.encodeWithSelector(ISyndicateGovernor.getGovernorParams.selector));
+        // GovernorParams is nine words; anything shorter is not one.
+        if (!ok || ret.length < 9 * 32) return FeeConstants.MAX_PERFORMANCE_FEE_BPS;
+        ISyndicateGovernor.GovernorParams memory p = abi.decode(ret, (ISyndicateGovernor.GovernorParams));
+        return p.maxPerformanceFeeBps;
+    }
+
+    /// @dev The early-exit penalty on `netAssets` leaving now.
+    ///
+    ///      Charged on the PULLED portion only — the part of the exit that idle
+    ///      float cannot absorb and that therefore forces the strategy to
+    ///      unwind early. That matches what the penalty is compensating the
+    ///      remaining depositors for. An exit small enough to be served from
+    ///      float causes no unwind and pays nothing.
+    ///
+    ///      This makes the fee function kinked at the float boundary, so
+    ///      `previewWithdraw` cannot invert it in closed form; it grosses up and
+    ///      rounds conservatively instead. `previewRedeem` stays exact and
+    ///      monotone either side of the kink (d(net)/d(assets) = 1 - bps/1e4 > 0),
+    ///      which is what EIP-4626 actually requires.
+    ///
+    ///      Known trade-off (design.md Open Question 1): because the charge
+    ///      depends on float, the first exiters in a rush pay nothing and the
+    ///      last pays full — which adds a little pressure to run early, the
+    ///      opposite of what an anti-mercenary term wants. Kept because it
+    ///      matches the fee's stated purpose and instant-exit capacity is
+    ///      already bounded by `availableLiquidity()` regardless.
+    function _exitPenalty(uint256 netAssets) private view returns (uint256) {
+        uint256 bps = instantExitFeeBps;
+        if (bps == 0 || netAssets == 0) return 0;
+        uint256 float = IERC20(asset()).balanceOf(address(this));
+        uint256 reserve = reservedQueueAssets();
+        uint256 absorbable = float > reserve ? float - reserve : 0;
+        if (netAssets <= absorbable) return 0;
+        return ((netAssets - absorbable) * bps) / 10_000;
+    }
+
+    /// @notice Assets an instant exit of `shares` would release, net of the
+    ///         fees those shares owe and the early-exit penalty.
+    /// @dev Only the Lane A instant path is charged. A Lane B queue exit claims
+    ///      at the frozen post-settlement price and has therefore already borne
+    ///      its share — charging it here would double-bill.
+    ///
+    ///      Order is fixed and the two charges are independent: crystallization
+    ///      first, against the exiting shares' value (it goes to the fee
+    ///      recipients — fees the exiter owed anyway), then the penalty on what
+    ///      remains (it goes to the vault — compensation for the early unwind).
+    function previewRedeem(uint256 shares) public view override returns (uint256) {
+        uint256 gross = super.previewRedeem(shares);
+        (,,, bool laneA) = _laneState();
+        if (!laneA) return gross;
+
+        (uint256 mgmtFee, uint256 perfFee) = _exitFees(shares);
+        uint256 fees = mgmtFee + perfFee;
+        uint256 net = gross > fees ? gross - fees : 0;
+
+        return net - _exitPenalty(net);
+    }
+
+    /// @notice Shares to burn for `assets` out of an instant exit.
+    /// @dev The fee function is kinked at the float boundary (see
+    ///      `_exitPenalty`) and concave above it, so it has no closed-form
+    ///      inverse and a single linear correction lands short — grossing up
+    ///      pushes more of the exit past the boundary, which the first estimate
+    ///      did not price. Iterate instead, rounding UP each time: the caller
+    ///      burns marginally more shares than strictly necessary rather than
+    ///      receiving less than they asked for. Erring the other way would
+    ///      break the EIP-4626 guarantee that `withdraw` delivers the requested
+    ///      assets.
+    ///
+    ///      Convergence is quadratic in the penalty rate (each round leaves a
+    ///      residual of order `bps^(n+1)`), so at the 200 bps ceiling three
+    ///      rounds are exact to well under one wei. The bound also makes this
+    ///      view unconditionally terminating.
+    function previewWithdraw(uint256 assets) public view override returns (uint256) {
+        uint256 shares = super.previewWithdraw(assets);
+        (,,, bool laneA) = _laneState();
+        if (!laneA || shares == 0) return shares;
+
+        uint256 bps = instantExitFeeBps;
+        for (uint256 i = 0; i < 3; ++i) {
+            uint256 net = previewRedeem(shares);
+            if (net >= assets) break;
+            // Top up by what the shortfall is worth in shares — but gross the
+            // shortfall up by the penalty first. Shares added to cover a
+            // deficit are themselves charged on the way out, so closing on the
+            // raw deficit only ever recovers `(1 - bps)` of it and the estimate
+            // creeps toward the target from below without reaching it.
+            // Grossing up makes each round overshoot instead, which terminates.
+            uint256 deficit = assets - net;
+            if (bps != 0) deficit = (deficit * 10_000) / (10_000 - bps) + 1;
+            shares += convertToShares(deficit) + 1;
+        }
+        return shares;
+    }
+
+    /// @inheritdoc ISyndicateVault
+    function previewExitFees(uint256 shares) external view returns (uint256 mgmtFee, uint256 perfFee) {
+        (,,, bool laneA) = _laneState();
+        if (!laneA) return (0, 0);
+        return _exitFees(shares);
+    }
+
+    /// @inheritdoc ISyndicateVault
+    /// @notice Governor-only: release the parked management fees for payout.
+    /// @dev The assets never left the vault — this only moves them from
+    ///      "parked, excluded from `totalAssets`" to "payable", which is why
+    ///      the two legs are released separately. Releasing raises
+    ///      `totalAssets()`, so the performance leg must read its base BEFORE
+    ///      `consumeCrystallizedPerf` is called or it would charge a fee on
+    ///      money that already belongs to the recipients.
+    function consumeCrystallizedMgmt() external onlyGovernor returns (uint256 amount) {
+        amount = _crystallizedMgmt;
+        _crystallizedMgmt = 0;
+    }
+
+    /// @inheritdoc ISyndicateVault
+    /// @notice Governor-only: release the parked performance fees for payout.
+    ///         Call only after the above-mark base has been read.
+    function consumeCrystallizedPerf() external onlyGovernor returns (uint256 amount) {
+        amount = _crystallizedPerf;
+        _crystallizedPerf = 0;
     }
 
     // ==================== RESCUE ====================

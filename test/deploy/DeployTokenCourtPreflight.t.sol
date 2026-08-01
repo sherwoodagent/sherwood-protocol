@@ -94,12 +94,19 @@ contract DeployTokenCourtPreflightTest is Test {
         tiers = new TierRegistry(DEFAULT_SENDER);
         game = new ChallengeGame(DEFAULT_SENDER, address(wood), address(ledger), address(tiers));
 
-        // Plan D's wiring, as this deployment presumes to find it.
+        // Plan D's wiring, as this deployment presumes to find it — in the
+        // settle-before-freeze order `DeployPlanD` itself now uses (review M3),
+        // Plan C's escrow pair is gone: slash proceeds burn, so pre-flight 5
+        // has no sink to check.
         vm.startPrank(DEFAULT_SENDER);
-        ledger.setCoverageFreezer(address(game));
-        tiers.setAuthorizedDemoter(address(game));
+        // Grant before pointing: `setStakedWood` refuses a sWOOD that has not
+        // already named this game as its slasher (review M2, `RoleNotGranted`).
+        // Settle-before-freeze (M3) still holds — the freeze role is granted two
+        // lines below, once the verdict path is complete.
         swood.setAuthorizedSlasher(address(game));
         game.setStakedWood(address(swood));
+        tiers.setAuthorizedDemoter(address(game));
+        ledger.setCoverageFreezer(address(game));
         vm.stopPrank();
 
         deployScript = new DeployTokenCourt();
@@ -165,6 +172,14 @@ contract DeployTokenCourtPreflightTest is Test {
         // runs, leaving the setter called as this test contract instead of
         // `DEFAULT_SENDER` and reverting `OwnableUnauthorizedAccount`.
         address otherStakedWood = address(new MockStakedWood());
+        // The reciprocal half of the slasher grant (review PR #56 M2):
+        // `setStakedWood` now refuses a sWOOD that has not named this game
+        // `authorizedSlasher`, because such a re-point wedges every `_settle`
+        // inside `slashToEscrow`'s caller gate. Granted here so this test still
+        // reaches the WIRE pre-flight it exists to exercise — the divergence it
+        // asserts on is between the game's sWOOD and the court's, which the
+        // grant leaves untouched.
+        MockStakedWood(otherStakedWood).setAuthorizedSlasher(address(game));
         vm.prank(DEFAULT_SENDER);
         game.setStakedWood(otherStakedWood);
         _runWireExpecting("PRE-FLIGHT: ChallengeGame.stakedWood != STAKED_WOOD.");

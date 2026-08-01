@@ -159,9 +159,28 @@ contract DeployTokenCourt is Script {
  *      `1_000 * 10_000 / 2_500 == 4_000` bps (40%) of RAW stake must vote to
  *      clear the floor at launch.
  * @dev PRE-FLIGHT 5: Plan D's wiring is still intact, or a `Guilty` verdict
- *      dead-ends at `_settle` — `ledger.coverageFreezer() == CHALLENGE_GAME`,
- *      `tiers.authorizedDemoter() == CHALLENGE_GAME`,
- *      `swood.authorizedSlasher() == CHALLENGE_GAME`.
+ *      dead-ends at `_settle`. Ranked by what a miss actually costs (review
+ *      M4).
+ *
+ *      THE ESCROW PAIR THAT USED TO LEAD THIS LIST IS GONE. It checked
+ *      `swood.compensationEscrow()` and that escrow's funder, and it led
+ *      because it was the one rail that was not merely lost but WEAPONISED
+ *      when broken: a zero escrow made `slashToEscrow` revert, `finalize`
+ *      bubble it, the case stay `Voting`, and the challenge time out through
+ *      `resolve` → `_fail` — acquitting the accused and paying them the
+ *      challenger's bond. Slash proceeds burn inside sWOOD now, so there is no
+ *      sink to unset and no such inversion to guard.
+ *        - `swood.authorizedSlasher() == CHALLENGE_GAME`. Load-bearing: without
+ *          it the slash itself has no executor.
+ *        - `ledger.coverageFreezer() == CHALLENGE_GAME`. Load-bearing: the game
+ *          cannot move coverage when the court rules.
+ *        - `tiers.authorizedDemoter() == CHALLENGE_GAME`. NOT load-bearing, and
+ *          listed last for that reason — `_settle` wraps `demoteByChallenge` in
+ *          a try/catch and emits `AdapterDemotionFailed` rather than reverting,
+ *          precisely so a revocable role cannot hold a terminal path hostage.
+ *          Still worth refusing on: a demotion silently skipped leaves a
+ *          convicted adapter certified, and the registry owner has to fix it by
+ *          hand.
  *
  *      Ownership: the broadcaster must own the `ChallengeGame` (`setCourt` is
  *      `onlyOwner`).
@@ -223,21 +242,37 @@ contract WireTokenCourt is Script {
             "unclearable no matter how complete the vote."
         );
 
-        // ── Pre-flight 5: Plan D's wiring intact, or a Guilty verdict dead-ends ──
+        // ── Pre-flight 5: the verdict's rails intact, or a Guilty verdict
+        //    dead-ends. Asserted as ONE block: these are not independent
+        //    settings but one path, and any single break makes a conviction
+        //    unexecutable. Each require names its own remedy.
+        //
+        //    THE ESCROW PAIR THAT USED TO LEAD THIS BLOCK IS GONE. It checked
+        //    `swood.compensationEscrow()` and that escrow's funder, because an
+        //    unset or wrongly-funded escrow made `slashToEscrow` revert,
+        //    `finalize` bubble it, and the challenge time out — ACQUITTING the
+        //    accused and paying them the challenger's bond. Slash proceeds now
+        //    burn inside sWOOD, so there is no sink to mis-wire and no such
+        //    inverted state to refuse.
+        require(
+            IStakedWood(swoodAddr).authorizedSlasher() == gameAddr,
+            "PRE-FLIGHT: StakedWood.authorizedSlasher != CHALLENGE_GAME. Plan D wiring is "
+            "missing - a guilty verdict would have no slasher to execute it."
+        );
         require(
             IExposureLedger(ledgerAddr).coverageFreezer() == gameAddr,
             "PRE-FLIGHT: ExposureLedger.coverageFreezer != CHALLENGE_GAME. Plan D wiring is "
             "missing - the game cannot move coverage when the court rules."
         );
+        // LAST, because it is the only one here that is not fatal: `_settle`
+        // try/catches the demotion and emits `AdapterDemotionFailed`. Refused
+        // on anyway — a silently un-demoted convicted adapter stays certified
+        // until the registry owner notices.
         require(
             ITierRegistryDemoterRole(tierRegistryAddr).authorizedDemoter() == gameAddr,
             "PRE-FLIGHT: TierRegistry.authorizedDemoter != CHALLENGE_GAME. Plan D wiring is "
-            "missing - a guilty verdict would revert demoting the adapter."
-        );
-        require(
-            IStakedWood(swoodAddr).authorizedSlasher() == gameAddr,
-            "PRE-FLIGHT: StakedWood.authorizedSlasher != CHALLENGE_GAME. Plan D wiring is "
-            "missing - a guilty verdict would have no slasher to execute it."
+            "missing - a guilty verdict would skip demoting the adapter (try/catch: it emits "
+            "AdapterDemotionFailed rather than reverting), leaving it certified."
         );
 
         console.log("court:                    %s", courtAddr);

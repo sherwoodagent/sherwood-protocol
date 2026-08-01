@@ -23,9 +23,68 @@ bracket_spacing = false
 [lint]
 exclude_lints = ["screaming-snake-case-immutable", "mixed-case-variable"]
 
-# forge coverage is incompatible with via_ir (Yul stack-too-deep) — pin to legacy pipeline
+# `forge coverage` force-disables the optimizer and via_ir for the whole project
+# (it needs unoptimized bytecode to keep source maps accurate), so `via_ir = false`
+# here only documents that — forge would do it regardless, and plain optimizer /
+# optimizer_runs / via_ir keys in this profile are ignored by the coverage command.
+#
+# Unoptimized legacy codegen then blows the EVM stack in the eight largest
+# contracts. The escape hatch that does survive forge's override is per-file
+# compilation restrictions: those eight compile in a second solc group that keeps
+# via_ir + the optimizer, while every other file stays on the legacy pipeline and
+# reports accurate coverage.
+#
+# What this costs: the eight restricted files are absent from the report entirely
+# (forge drops via_ir units rather than mis-mapping them) — they show up in neither
+# the summary nor lcov.info. Their TESTS still run and still gate the job; only the
+# line/branch instrumentation is missing. The alternative was no coverage signal at
+# all, since the run previously died at the first stack-too-deep.
+#
+# The list is empirical: each entry is a file that failed `forge build` under
+# coverage codegen with "Stack too deep" / "Yul exception". Growing a contract past
+# the stack limit adds it here. Reproduce with:
+#   FOUNDRY_PROFILE=coverage FOUNDRY_OPTIMIZER=false FOUNDRY_VIA_IR=false forge build
+# Tracked in #73; drop entries as the underlying stack pressure is refactored away.
 [profile.coverage]
 via_ir = false
+
+[[profile.coverage.additional_compiler_profiles]]
+name = "ir"
+via_ir = true
+optimizer = true
+optimizer_runs = 50
+
+[[profile.coverage.compilation_restrictions]]
+paths = "src/ChallengeGame.sol"
+via_ir = true
+
+[[profile.coverage.compilation_restrictions]]
+paths = "src/ExposureLedger.sol"
+via_ir = true
+
+[[profile.coverage.compilation_restrictions]]
+paths = "src/StakedWood.sol"
+via_ir = true
+
+[[profile.coverage.compilation_restrictions]]
+paths = "src/SyndicateGovernor.sol"
+via_ir = true
+
+[[profile.coverage.compilation_restrictions]]
+paths = "src/TokenCourt.sol"
+via_ir = true
+
+[[profile.coverage.compilation_restrictions]]
+paths = "src/adapters/SynthraDirectAdapter.sol"
+via_ir = true
+
+[[profile.coverage.compilation_restrictions]]
+paths = "src/queue/VaultWithdrawalQueue.sol"
+via_ir = true
+
+[[profile.coverage.compilation_restrictions]]
+paths = "src/strategies/PortfolioStrategy.sol"
+via_ir = true
 
 [rpc_endpoints]
 base = "${BASE_RPC_URL}"

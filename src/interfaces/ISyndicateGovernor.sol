@@ -2,6 +2,7 @@
 pragma solidity 0.8.28;
 
 import {BatchExecutorLib} from "../BatchExecutorLib.sol";
+import {IProtocolConfig} from "./IProtocolConfig.sol";
 
 interface ISyndicateGovernor {
     // ── Enums ──
@@ -101,9 +102,22 @@ interface ISyndicateGovernor {
         ///      moving the rejection threshold.
         uint256 vetoThresholdBps;
         // ── Fee snapshot (read from ProtocolConfig at propose time) ──
-        uint256 snapshotProtocolFeeBps;
+        /// @dev Only the RECIPIENTS are snapshotted. The protocol and guardian
+        ///      SHARES come from `snapshotMgmtSplit` / `snapshotPerfSplit`
+        ///      below; the standalone `snapshotProtocolFeeBps` /
+        ///      `snapshotGuardianFeeBps` fields that used to sit here are gone
+        ///      with the two-number fee model — both were write-only.
+        ///
+        ///      They occupied struct slots 17 and 19, so removing them shifts
+        ///      every later member down two slots. `_proposals` is a mapping
+        ///      laid out by member index and the governor is a `BeaconProxy`,
+        ///      so upgrading a governor that already held proposals would
+        ///      re-read them against the new offsets. This ships as a FRESH
+        ///      DEPLOYMENT — no proposal predates the change — which is what
+        ///      makes the removal safe. A later release must not repeat this
+        ///      shape of change without first draining or migrating every
+        ///      existing proposal.
         address snapshotProtocolFeeRecipient;
-        uint256 snapshotGuardianFeeBps;
         address snapshotGuardiansFeeRecipient;
         /// @notice `IStrategy.selfManagesFees()` snapshotted at propose time (like
         ///         performanceFeeBps). Read from storage at settle so a non-pure
@@ -140,6 +154,15 @@ interface ISyndicateGovernor {
         ///         escrow only applies to proposals created after the change.
         ///         Zero when no bond was locked.
         address proposerBondEscrow;
+        /// @notice Management-fee split snapshotted from `ProtocolConfig` at
+        ///         propose time, for the same reason every other fee field here
+        ///         is snapshotted: a governance change after propose must not
+        ///         alter what an in-flight proposal pays. Three `uint16`s, one
+        ///         slot.
+        IProtocolConfig.MgmtSplit snapshotMgmtSplit;
+        /// @notice Performance-fee split snapshotted at propose time. Four
+        ///         `uint16`s, one slot.
+        IProtocolConfig.PerfSplit snapshotPerfSplit;
     }
 
     struct CoProposer {
@@ -238,6 +261,21 @@ interface ISyndicateGovernor {
     ///         bond, or whose bond was already reclaimed (the reclaim zeroes
     ///         the stored amount, so a second call lands here — idempotence).
     error NoBondToReclaim();
+    /// @notice `reclaimProposerBond` called on a proposal that EXECUTED, while
+    ///         a conviction is still reachable — either the ledger's
+    ///         `challengeWindow` has not yet run out from `executedAt`, or a
+    ///         filing inside it is still live (the proposal's coverage is
+    ///         frozen). Terminal is not the same as unchallengeable: the
+    ///         proposer can self-settle an hour after execution, and returning
+    ///         the bond there would let the only party the bond is posted
+    ///         against outrun every path that could take it.
+    error ChallengeWindowOpen();
+    /// @notice `reclaimProposerBond` called on an EXECUTED proposal while this
+    ///         governor has no exposure ledger wired, so the challenge window
+    ///         cannot be read. Fails CLOSED deliberately — see the function's
+    ///         own natspec for why unwiring the ledger must not become the
+    ///         escape hatch from the delay it enforces.
+    error ExposureLedgerUnset();
     /// @notice `setMaxCapitalBps` called with 0 or a value above 10_000.
     error InvalidMaxCapitalBps();
     /// @notice Revert if `envelope.maxDrawdownBps > 10_000` at propose — a
@@ -318,6 +356,17 @@ interface ISyndicateGovernor {
     ///         detect the divergence. `snapshotted`/`clamped` are indexed (cheap
     ///         topics, no memory encoding) so the dual emit stays under budget.
     event FeeClamped(uint256 indexed proposalId, uint256 indexed snapshotted, uint256 indexed clamped);
+
+    /// @notice The always-on management fee charged at settlement.
+    /// @param assetSeconds The integral the fee was computed from, so an
+    ///        indexer can reconstruct the effective rate and the average base
+    ///        without replaying every flow.
+    event ManagementFeeCharged(uint256 indexed proposalId, address indexed asset, uint256 amount, uint256 assetSeconds);
+
+    /// @notice The performance fee charged at settlement.
+    /// @param aboveMark Value above the high-water mark that the fee was
+    ///        computed on — not the proposal's raw profit.
+    event PerformanceFeeCharged(uint256 indexed proposalId, address indexed asset, uint256 amount, uint256 aboveMark);
 
     event VoteCast(uint256 indexed proposalId, address indexed voter, VoteType support, uint256 weight);
 
@@ -479,14 +528,23 @@ interface ISyndicateGovernor {
     ///         resolves to tier 2 / full notional — the safe default.
     function setTierRegistry(address newRegistry) external;
     /// @notice Wire the exposure ledger (Plan B, spec §3.7/§3.9). Factory-only.
-    ///         address(0) un-wires: the covered-TVL cap and proposer bond gates
-    ///         are then skipped — the pre-ledger safe default.
+    ///         address(0) un-wires: the covered-TVL cap, the proposer bond gate
+    ///         AND the §3.3a approve quorum are then skipped — the pre-ledger
+    ///         default. The quorum is the load-bearing one now that
+    ///         `quorumTierThreshold == 0` applies it at every tier, so a governor
+    ///         created while the factory's ledger is unset carries no coverage
+    ///         gate at all until `pushWiring` reaches it.
     /// @dev Precondition: seed the ledger's `setAssetFeed(vaultAsset, ...)` and
     ///      `setCoveredTvlCapUsd(...)` BEFORE wiring it. The gates fail closed,
     ///      so a wired ledger with an unpriceable vault asset or a zero cap
-    ///      halts all proposal creation for this vault. The escape hatch
-    ///      (`setExposureLedger(0)`) is factory-owned; the feed/cap fixes are
-    ///      ledger-owner-owned.
+    ///      halts all proposal creation for this vault.
+    ///
+    ///      THERE IS NO `setExposureLedger(0)` ESCAPE HATCH, contrary to what
+    ///      this comment previously claimed. Both factory call sites SKIP when
+    ///      the factory's own ledger is unset (`SyndicateFactory.sol:390-392`,
+    ///      `:726`), so zero is unreachable through them — the implementation
+    ///      natspec already records this (review finding I-3). The feed/cap
+    ///      fixes are ledger-owner-owned and are the real remedy.
     function setExposureLedger(address newLedger) external;
     /// @notice Wire the proposer bond escrow (Plan B, spec §3.9). Factory-only.
     ///         address(0) un-wires: the bond is not locked at propose.

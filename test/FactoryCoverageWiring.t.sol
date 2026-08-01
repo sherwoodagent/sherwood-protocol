@@ -107,7 +107,7 @@ contract FactoryCoverageWiringTest is Test {
 
         tierReg = new TierRegistry(owner);
         ledger = new ExposureLedger(owner, swoodAddr, 28 days);
-        escrow = new ProposerBondEscrow(address(wood), guardianRegistryAddr);
+        escrow = new ProposerBondEscrow(address(wood), guardianRegistryAddr, address(ledger));
     }
 
     // ── Helpers ──

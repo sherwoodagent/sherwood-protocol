@@ -1,0 +1,38 @@
+name: Vendor provenance
+
+# Proves that everything under lib/ still matches lib/VENDOR-MANIFEST.json.
+# Deliberately a separate workflow from ci.yml: this is a supply-chain gate with
+# its own trigger surface (path-filtered PRs + manual dispatch + a slow periodic
+# sweep), and it must not contend with the build/test workflow.
+
+on:
+  pull_request:
+    paths:
+      - "lib/**"
+      - "lib/VENDOR-MANIFEST.json"
+      - "script/check-vendor-provenance.sh"
+      - ".github/workflows/provenance.yml"
+  workflow_dispatch:
+  schedule:
+    # Monthly, off the hour and off the top of the month, so this does not land
+    # in the cron stampede. 04:37 UTC on the 5th. Provenance rot is slow;
+    # anything more frequent is noise.
+    - cron: "37 4 5 * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: provenance-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  vendor-provenance:
+    name: lib/ matches VENDOR-MANIFEST.json
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check vendored dependency provenance
+        run: script/check-vendor-provenance.sh

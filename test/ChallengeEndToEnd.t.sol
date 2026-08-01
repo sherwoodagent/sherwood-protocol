@@ -251,7 +251,7 @@ contract ChallengeEndToEndTest is Test {
         vm.prank(owner);
         registry.setExposureLedger(address(ledger));
 
-        bondEscrow = new ProposerBondEscrow(address(wood), address(registry));
+        bondEscrow = new ProposerBondEscrow(address(wood), address(registry), address(ledger));
 
         // ── The game, then its roles.
         game = new ChallengeGame(owner, address(wood), address(ledger), address(tierRegistry));
@@ -677,5 +677,156 @@ contract ChallengeEndToEndTest is Test {
         vm.prank(address(registry));
         ledger.releaseApproval(address(gov), pid, g1);
         assertEq(ledger.openExposureUsd(g1), 0, "the guardian recycled the budget a bad-faith filing had pinned");
+    }
+
+    // ── 3. The proposer bond is a deterrent, not a deposit ─────────────────
+
+    /// @notice THE SELF-SETTLE RACE. `MIN_STRATEGY_DURATION_BEFORE_SELF_SETTLE`
+    ///         lets the PROPOSER settle its own strategy an hour after
+    ///         execution, while everyone else waits `strategyDuration`. That
+    ///         hour is two orders of magnitude shorter than the window a
+    ///         challenge has to be filed in, so a proposer that executed a
+    ///         drain used to be able to self-settle at +1h, reclaim its whole
+    ///         bond from the terminal `Settled` state, and be gone long before
+    ///         anything could convict it — the bond deterred nothing it was
+    ///         posted to deter.
+    ///
+    ///         An EXECUTED proposal therefore holds its bond until the
+    ///         challenge window has run out from `executedAt`. Settlement is
+    ///         still not a conviction: once no filing can arrive, the bond
+    ///         returns in full to the proposer, permissionlessly and unburned.
+    function test_settledProposal_bondLockedUntilTheChallengeWindowCloses() public {
+        uint256 pid = _proposeApproveExecute();
+        uint256 agentBalAfterBond = wood.balanceOf(agent);
+
+        vm.warp(gov.getProposal(pid).executedAt + 1 hours + 1);
+        vm.prank(agent);
+        gov.settleProposal(pid);
+        assertEq(_state(pid), uint256(ISyndicateGovernor.ProposalState.Settled), "self-settled an hour in");
+
+        // The terminal state is reached, and the bond still does not move.
+        vm.expectRevert(ISyndicateGovernor.ChallengeWindowOpen.selector);
+        gov.reclaimProposerBond(pid);
+        assertEq(wood.balanceOf(address(bondEscrow)), PROPOSER_BOND, "the escrow still holds it");
+
+        // Anchored on what the CONTRACT stored, never on a local captured
+        // before a warp — the optimizer CSEs `block.timestamp` across
+        // `vm.warp`, and `executedAt` is the value the gate itself reads.
+        uint256 opensAt = gov.getProposal(pid).executedAt + ledger.challengeWindow();
+        vm.warp(opensAt - 1);
+        vm.expectRevert(ISyndicateGovernor.ChallengeWindowOpen.selector);
+        gov.reclaimProposerBond(pid);
+
+        // One second later the last filing deadline has passed and the bond is
+        // free — in full, to the proposer, on a permissionless call.
+        vm.warp(opensAt);
+        vm.prank(makeAddr("stranger"));
+        gov.reclaimProposerBond(pid);
+        assertEq(wood.balanceOf(agent), agentBalAfterBond + PROPOSER_BOND, "returned whole, and to the proposer");
+        assertEq(wood.balanceOf(address(bondEscrow)), 0, "escrow drained");
+        assertEq(gov.getProposal(pid).proposerBondWood, 0);
+    }
+
+    /// @notice A LIVE CHALLENGE OUTLIVES THE FILING WINDOW, and the bond has to
+    ///         outlive it too. `autoSlashDelay` (7d) runs from `filedAt`, so a
+    ///         filing on the last day of the window convicts a week after the
+    ///         window shut. A pure `executedAt + challengeWindow` gate would
+    ///         hand the bond back mid-accusation and leave the forfeiture path
+    ///         with nothing to confiscate — so the reclaim also refuses while
+    ///         the ledger reports this proposal's coverage frozen, which is
+    ///         exactly the flag a live filing sets and every terminal challenge
+    ///         path clears.
+    function test_liveChallenge_holdsTheBondPastTheWindow() public {
+        uint256 pid = _proposeApproveExecute();
+        uint256 executedAt = gov.getProposal(pid).executedAt;
+
+        // Terminal FIRST, so what this test pins is the freeze gate and not
+        // the pre-existing `ProposalNotTerminal` guard.
+        vm.warp(executedAt + 1 hours + 1);
+        vm.prank(agent);
+        gov.settleProposal(pid);
+        assertEq(_state(pid), uint256(ISyndicateGovernor.ProposalState.Settled), "self-settled an hour in");
+
+        // File on the last day the window admits it.
+        vm.warp(executedAt + game.challengeWindow() - 1);
+        vm.prank(challenger);
+        uint256 cid = game.file(
+            address(gov),
+            pid,
+            IChallengeGame.Predicate.OutOfAdapterOutflow,
+            address(adapter),
+            adapter.poke.selector,
+            "ipfs://evidence/late-filing"
+        );
+
+        // The ordinary window has now closed, and the bond stays put: the
+        // accusation is live and unadjudicated.
+        vm.warp(executedAt + ledger.challengeWindow() + 1);
+        assertTrue(ledger.isCoverageFrozen(address(gov), pid), "the filing pinned the coverage");
+        vm.expectRevert(ISyndicateGovernor.ChallengeWindowOpen.selector);
+        gov.reclaimProposerBond(pid);
+
+        // Silence convicts, so this bond is forfeited rather than released —
+        // the freeze lifts on the terminal path either way.
+        vm.warp(game.challengeOf(cid).filedAt + game.autoSlashDelay());
+        game.resolve(cid);
+        assertEq(uint256(game.challengeOf(cid).status), uint256(IChallengeGame.Status.Settled));
+        assertFalse(ledger.isCoverageFrozen(address(gov), pid), "the freeze lifted with the verdict");
+    }
+
+    /// @notice THE OTHER HALF OF THE SAME FIX. Locking the reclaim is only
+    ///         worth something if a conviction can actually take the bond, and
+    ///         until now nothing could: the escrow's only exit was
+    ///         release-to-proposer. A passed challenge now confiscates it —
+    ///         burned, not paid to anyone (see `ProposerBondEscrow.forfeitBond`
+    ///         for why every reachable payee is a round trip to the proposer) —
+    ///         and the reclaim that would have returned it can never pay out
+    ///         again.
+    function test_conviction_forfeitsTheProposerBond() public {
+        uint256 pid = _proposeApproveExecute();
+        uint256 burnBalBefore = wood.balanceOf(game.BURN_ADDRESS());
+        uint256 agentBalAfterBond = wood.balanceOf(agent);
+
+        vm.prank(challenger);
+        uint256 cid = game.file(
+            address(gov),
+            pid,
+            IChallengeGame.Predicate.OutOfAdapterOutflow,
+            address(adapter),
+            adapter.poke.selector,
+            "ipfs://evidence/out-of-adapter-outflow"
+        );
+
+        // Silence is the verdict (D1).
+        vm.warp(game.challengeOf(cid).filedAt + game.autoSlashDelay());
+        game.resolve(cid);
+        assertEq(uint256(game.challengeOf(cid).status), uint256(IChallengeGame.Status.Settled), "convicted");
+
+        // The proposer's bond is GONE — not sitting in the escrow waiting to be
+        // reclaimed, and not returned to the proposer.
+        assertEq(wood.balanceOf(address(bondEscrow)), 0, "the escrow no longer holds the bond");
+        (address bondProposer, uint256 bondAmount) = bondEscrow.bondOf(address(gov), pid);
+        assertEq(bondProposer, address(0), "the bond record is cleared");
+        assertEq(bondAmount, 0);
+
+        // THREE SINKS SHARE THIS ADDRESS NOW, so the total is asserted with all
+        // three named rather than as "the bond plus the settle burn". The
+        // conviction also slashes the covering approver, and those proceeds
+        // burn here too — before, they went to the compensation escrow, so this
+        // delta used to see only the bond and the challenger's settle burn. A
+        // bare total would silently absorb a regression in any one leg.
+        uint256 settleBurn = (CHALLENGER_BOND * game.settleBurnBps()) / 10_000;
+        assertEq(
+            wood.balanceOf(game.BURN_ADDRESS()),
+            burnBalBefore + PROPOSER_BOND + settleBurn + G1_STAKE,
+            "proposer bond + challenger settle burn + the whole slashed guardian bond all left the system"
+        );
+        assertEq(wood.balanceOf(agent), agentBalAfterBond, "the proposer got nothing back");
+
+        // And the reclaim path cannot resurrect it, at any later time.
+        vm.warp(gov.getProposal(pid).executedAt + ledger.challengeWindow() + 365 days);
+        vm.expectRevert();
+        gov.reclaimProposerBond(pid);
+        assertEq(wood.balanceOf(agent), agentBalAfterBond, "still nothing");
     }
 }

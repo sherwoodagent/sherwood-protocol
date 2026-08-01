@@ -20,9 +20,15 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 ///         file makes the next such mistake fail loudly.
 ///
 ///         New fields are APPEND-ONLY, carved from the FRONT of `__gap`: add a
-///         pin, never edit one. A guardian-economic-security branch is expected
-///         to append `exposureLedger` next (gap 49 -> 48); that lands at slot 21
-///         and pushes `__gap` to 22, leaving every pin below untouched.
+///         pin, never edit one. That append has since happened — Plan B added
+///         `exposureLedger` (gap 49 -> 48), landing at slot 21 and pushing
+///         `__gap` to 22, leaving every pin below untouched. The gap pin was
+///         RE-TARGETED 21 -> 22 to follow it, and a positive pin for
+///         `exposureLedger` at 21 was added (PR #56 review M7): the old assert
+///         passed only because this fixture never wired a ledger, so the real
+///         `__gap[0]` was unguarded and the assert would have started failing
+///         for the wrong reason the day one was wired. Pins that were still
+///         correct (14, 15, 18, 19, 20) did not move.
 ///
 ///         Layout map (linear; OZ Ownable/UUPS are ERC-7201 namespaced and hold
 ///         no linear slot):
@@ -32,7 +38,8 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 ///           12 slashAppealReserve               18 factory
 ///           13 refundedInEpoch                  19 swood
 ///                                               20 vaultOf
-///                                               21..69 __gap[49]
+///                                               21 exposureLedger
+///                                               22..69 __gap[48]
 contract GuardianRegistryLayoutPinsTest is Test {
     GuardianRegistry registry;
 
@@ -41,6 +48,7 @@ contract GuardianRegistryLayoutPinsTest is Test {
     address constant SWOOD_SENTINEL = address(0x5000D);
     address constant GOV_SENTINEL = address(0x60F);
     address constant VAULT_SENTINEL = address(0xFA017);
+    address constant LEDGER_SENTINEL = address(0x1ED6E);
 
     uint256 constant REVIEW_PERIOD = 24 hours;
     uint256 constant BLOCK_QUORUM_BPS = 3000;
@@ -85,10 +93,29 @@ contract GuardianRegistryLayoutPinsTest is Test {
         assertEq(registry.vaultOf(GOV_SENTINEL), VAULT_SENTINEL);
     }
 
-    /// @notice The reserved gap starts immediately after `vaultOf`. Slot 21 must
-    ///         be unwritten — if a field were appended without shrinking the gap,
-    ///         or inserted above, this word would hold data.
-    function test_layout_gapStartsAtSlot21() public view {
-        assertEq(_slot(21), bytes32(0), "slot 21: __gap[0] must be unused");
+    /// @notice `exposureLedger` must sit at slot 21 — the word Plan B carved off
+    ///         the FRONT of `__gap` (49 -> 48). Pinned POSITIVELY, by writing a
+    ///         sentinel and reading the raw word back: a zero-check would pass
+    ///         for a field that had moved, which is exactly how the stale
+    ///         `gapStartsAtSlot21` assert stayed green (PR #56 review M7).
+    function test_layout_exposureLedgerPinnedToSlot21() public {
+        vm.prank(OWNER_SENTINEL);
+        registry.setExposureLedger(LEDGER_SENTINEL);
+
+        assertEq(_slot(21), bytes32(uint256(uint160(LEDGER_SENTINEL))), "slot 21: exposureLedger moved");
+        // Sanity: the getter agrees with the raw read.
+        assertEq(address(registry.exposureLedger()), LEDGER_SENTINEL);
+    }
+
+    /// @notice The reserved gap starts immediately after `exposureLedger`. Slot
+    ///         22 must be unwritten — if a field were appended without shrinking
+    ///         the gap, or inserted above, this word would hold data. Asserted
+    ///         with the ledger WIRED so the check cannot be satisfied by a
+    ///         fixture that simply never populates the field above it.
+    function test_layout_gapStartsAtSlot22() public {
+        vm.prank(OWNER_SENTINEL);
+        registry.setExposureLedger(LEDGER_SENTINEL);
+
+        assertEq(_slot(22), bytes32(0), "slot 22: __gap[0] must be unused");
     }
 }

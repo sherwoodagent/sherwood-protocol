@@ -55,6 +55,18 @@ interface IChallengeGame {
     ///         zeroed struct field, a decoding bug that leaves the value
     ///         unset — must land on the harmless full unwind, never on
     ///         `Guilty`'s max-slash conviction.
+    /// @dev    NOT THE SAME ORDER AS `ITokenCourt.Ruling`, AND A CAST BETWEEN THE
+    ///         TWO IS NEVER VALID. `Ruling` is `{None, Guilty, NotGuilty}`; this
+    ///         is `{Inconclusive, NotGuilty, Guilty}` — the two non-zero values
+    ///         are INVERTED, so `Verdict(uint8(ruling))` silently turns a
+    ///         `Guilty` ruling into a `NotGuilty` verdict and vice versa. The
+    ///         divergence is deliberate on both sides and neither should be
+    ///         renumbered to match: each enum's zero value is pinned to ITS OWN
+    ///         safe default (`Ruling.None` = "the court has not ruled";
+    ///         `Verdict.Inconclusive` = "nothing was adjudicated, unwind whole"),
+    ///         and those defaults are load-bearing where they sit. `TokenCourt`
+    ///         therefore TRANSLATES explicitly, arm by arm, when it calls `rule`
+    ///         — the only correct conversion between them.
     enum Verdict {
         Inconclusive,
         NotGuilty,
@@ -164,6 +176,23 @@ interface IChallengeGame {
         ///      position for anything decoding `challengeOf()` positionally.
         ///      Appending after it costs nothing but the grouping.
         uint256 inconclusiveBurnBpsAtFiling;
+        /// @dev The escrow holding this proposal's PROPOSER bond, pinned at
+        ///      filing from `StrategyProposal.proposerBondEscrow` — the same
+        ///      binding `SyndicateGovernor.reclaimProposerBond` releases
+        ///      against. `_settle` confiscates it there on a conviction.
+        ///
+        ///      PINNED, NOT RE-READ, for the reason 🟡F10 gives for `vault` and
+        ///      `executedAt`: a verdict can land a full `disputeTimeout` after
+        ///      the filing, and nothing about it should be movable in between
+        ///      by a governor upgrade or a re-pointed escrow slot. Zero when the
+        ///      proposal locked no bond (no ledger wired at propose, or
+        ///      `proposerBondBps` set to zero), which the settle path treats as
+        ///      "nothing to forfeit" rather than as an error.
+        ///
+        ///      TRUE APPEND, same discipline as `inconclusiveBurnBpsAtFiling`
+        ///      above: anything decoding `challengeOf()` positionally keeps
+        ///      every existing tuple index.
+        address proposerBondEscrow;
     }
 
     // ── Errors ──
@@ -240,6 +269,28 @@ interface IChallengeGame {
     ///         `ChallengeGame._requireWindowFits` for why neither contract can
     ///         hold this alone.
     error WindowInvariantViolated();
+    /// @notice A role setter was pointed at a contract that has not granted this
+    ///         game the reciprocal role it needs there — a ledger whose
+    ///         `coverageFreezer` is not this address, or a sWOOD whose
+    ///         `authorizedSlasher` is not this address (review PR #56 M2).
+    /// @dev    Both grants are TWO-SIDED, and moving only this side is a wedge
+    ///         rather than a misconfiguration that surfaces harmlessly: every
+    ///         terminal path of a live challenge routes through
+    ///         `unfreezeCoverage` (which reverts `NotCoverageFreezer`) and every
+    ///         conviction through `slashToEscrow` (which reverts on its own
+    ///         caller gate), leaving bonds and the counter-bond pool with no exit
+    ///         and the coverage frozen on a ledger that can no longer be told to
+    ///         release it. Grant the role on the target contract first, then
+    ///         re-point here — the order the deploy scripts already use.
+    error RoleNotGranted();
+    /// @notice `renounceOwnership` is disabled. Ownership is transferable
+    ///         (`Ownable2Step`) but never abandonable.
+    /// @dev    The owner-only escapes this design relies on — `setStakedWood` as
+    ///         the un-wedge for a mis-wired slasher, `setCourt(address(0))` as
+    ///         the off-switch for a captured court — have no permissionless
+    ///         equivalent, so an ownerless game is a game whose documented
+    ///         recoveries are all gone.
+    error RenounceDisabled();
 
     // ── Events ──
     /// @dev `evidenceURI` is carried on-chain unindexed so predicates 2 and 3 —
@@ -324,6 +375,27 @@ interface IChallengeGame {
     ///      🟠F11); this event is how the miss becomes visible rather than
     ///      silent, and the registry owner's own `demote` is the remedy.
     event AdapterDemotionFailed(uint256 indexed challengeId, address indexed target, bytes4 indexed selector);
+
+    /// @notice A conviction confiscated the convicted proposal's proposer bond.
+    ///         `amount` left the system at the escrow's burn address; `proposer`
+    ///         is who lost it.
+    event ProposerBondForfeited(
+        uint256 indexed challengeId,
+        address indexed governor,
+        uint256 indexed proposalId,
+        address proposer,
+        uint256 amount
+    );
+
+    /// @notice A conviction could NOT confiscate the proposer bond — already
+    ///         reclaimed, already forfeited by a concurrent challenge, or an
+    ///         escrow that refused the call. Surfaced rather than reverted for
+    ///         the same reason `AdapterDemotionFailed` is: a terminal path must
+    ///         not be hostage to a call that can fail, or the slash never lands
+    ///         and the coverage never unfreezes.
+    event ProposerBondForfeitureFailed(
+        uint256 indexed challengeId, address indexed governor, uint256 indexed proposalId, address escrow
+    );
     /// @param forfeitedWood What the CHALLENGER lost — its whole bond on the
     ///        normal failure path, and zero on the defensive no-contributor
     ///        branch where the bond is handed back instead.
@@ -424,12 +496,33 @@ interface IChallengeGame {
     ///         would just be answered by nominating — or manufacturing — the
     ///         smallest identity. Splitting one operator into two guardians
     ///         therefore changes who pays, never how much.
-    /// @dev    Callable only by an accused approver (non-zero committed share) of
-    ///         the challenged proposal — the accused buy their own escalation,
-    ///         and it is what bounds the contributor list. Only strictly before
-    ///         `filedAt + autoSlashDelay`, the same instant `resolve` starts
-    ///         settling an undisputed challenge: at that second the silence
-    ///         verdict is already final (D1) and there is nothing left to buy.
+    /// @dev    PERMISSIONLESS — ANYONE MAY FUND THE DEFENCE (review 🟠F18). This
+    ///         doc previously said "callable only by an accused approver (non-zero
+    ///         committed share)"; the implementation has carried no caller check
+    ///         since F18, and this text was simply left behind. Corrected because
+    ///         the interface is what integrators compile and reason against: an
+    ///         allowlist that does not exist is a worse error than none at all —
+    ///         a client that pre-filters callers on it silently refuses to relay
+    ///         the top-up that would have completed a pool.
+    ///
+    ///         The restriction answered "who may BUY the escalation", which is
+    ///         still the right question — but once the counter-bond became a POOL
+    ///         it also silently answered "who may help FILL it", and those differ.
+    ///         Its other job, BOUNDING THE CONTRIBUTOR LIST, is likewise gone:
+    ///         `claimContribution` made every payout O(1) and pull-based, so the
+    ///         list length is no longer load-bearing anywhere. Skin in the game is
+    ///         enforced economically instead — a `Guilty` ruling forfeits the whole
+    ///         pool to the challenger, so an outside funder risks real capital.
+    ///
+    ///         What IS still restricted is what the contribution EARNS, not who
+    ///         may make it: `_settle` pays the conviction bounty only when one of
+    ///         the ACCUSED funded the pool (spec 2026-07-29 §2), so a
+    ///         self-staged contest by the challenger buys no bounty.
+    /// @dev    Only strictly before `filedAt + autoSlashDelay`, the same instant
+    ///         `resolve` starts settling an undisputed challenge: at that second
+    ///         the silence verdict is already final (D1) and there is nothing left
+    ///         to buy. The clock is the one the challenge RECEIVED at filing
+    ///         (`autoSlashDelayAtFiling`), not the live parameter.
     function dispute(uint256 challengeId, uint256 amountWood) external;
 
     /// @notice Permissionless resolution. From `Filed` past `autoSlashDelay` the

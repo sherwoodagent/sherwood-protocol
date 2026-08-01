@@ -15,12 +15,12 @@ compilation. Full protocol docs: **https://docs.sherwood.sh/**
 | Contract | Description |
 |----------|-------------|
 | `src/SyndicateVault.sol` | ERC-4626 vault + `ERC20Votes` for governance snapshots. The onchain identity — holds every position. Two-lane liquidity while a proposal is live (Lane A oracle-instant, Lane B async queue), instant against float otherwise. Strategy execution runs only through the governor via `executeGovernorBatch` (delegatecall to the executor lib); no arbitrary-calldata owner entrypoint. Active-strategy share hooks `strategyMint` / `strategyBurn` let a custody strategy service its own deposits/redeems. |
-| `src/SyndicateGovernor.sol` | Proposal lifecycle: propose → vote → guardian review → execute → settle. **One governor per vault**, deployed by the factory as a `BeaconProxy` and resolved via `factory.governorOf(vault)`. Optimistic voting, collaborative (multi-agent) proposals, permissionless settlement, P&L from balance-snapshot diffs; protocol/guardian fee rates are snapshotted from `ProtocolConfig` at propose time, agent/management fees from the vault. Inherits `GovernorParameters` + `GovernorEmergency`. |
+| `src/SyndicateGovernor.sol` | Proposal lifecycle: propose → vote → guardian review → execute → settle. **One governor per vault**, deployed by the factory as a `BeaconProxy` and resolved via `factory.governorOf(vault)`. Optimistic voting, collaborative (multi-agent) proposals, permissionless settlement, P&L from balance-snapshot diffs. Settlement charges the two-number fee model: an always-on management fee off the vault's asset-seconds accumulator, then a performance fee on value above the high-water mark, each divided by the splits snapshotted from `ProtocolConfig` at propose time. Inherits `GovernorParameters` + `GovernorEmergency`. |
 | `src/ProposalLifecycle.sol` | Abstract. Owns the proposal lifecycle (propose → vote → guardian review → execute → settle) and its storage. One resolver, `_computeState`, backs the **true view** `stateOf(pid)` — it reports Approved/Rejected/Expired as soon as they are determinable, instead of lagging until a transaction pokes it. `_transition` is the **only** writer of `proposal.state`; `_commitState` persists a transition and fires the registry's economic commit exactly when a guardian review concluded (never for a veto-rejection, a Draft expiry, or an already-Approved re-expiry). Inherited by `GovernorParameters` and `GovernorEmergency`, so `SyndicateGovernor` gets it through both. |
 | `src/GovernorParameters.sol` | Abstract. Extends `ProposalLifecycle`. **Per-vault, vault-owner-instant** parameter setters with hardcoded bounds, frozen while a proposal is open (`whenNoActiveProposal`, inherited from the base); emits a uniform `ParameterChangeFinalized(key, old, new)`. No onchain timelock — the vault owner is a multisig that enforces its own delay. |
 | `src/GovernorEmergency.sol` | Abstract. Extends `ProposalLifecycle` and reads its proposal/registry storage directly. Emergency-settle entrypoints: `unstick`, `emergencySettleWithCalls`, `cancelEmergencySettle`, `finalizeEmergencySettle`. Emergency review state lives in the registry. |
 | `src/GovernorBeacon.sol` | Thin `UpgradeableBeacon` holding the shared `SyndicateGovernor` implementation for every per-vault governor proxy. `upgradeTo(newImpl)` mass-upgrades all vault governors atomically; owner is the factory-owner multisig. |
-| `src/ProtocolConfig.sol` | Plain `Ownable2Step`. Protocol-wide fee params (protocol/guardian fee bps + recipients) shared by all per-vault governors; read once at propose time and snapshotted into the proposal. `MAX_PROTOCOL_FEE_BPS = 1000` (10%), `MAX_GUARDIAN_FEE_BPS = 500` (5%). |
+| `src/ProtocolConfig.sol` | Plain `Ownable2Step`. Protocol-wide fee params shared by all per-vault governors; read once at propose time and snapshotted into the proposal. Holds the fee recipients and the two splits of the two-number model — `mgmtSplit` (agent/protocol/guardian) and `perfSplit` (agent/protocol/guardian/owner), each required to sum to 10 000 bps and seeded with the launch values at construction. `MAX_PROTOCOL_FEE_BPS = 1000` (10%), `MAX_GUARDIAN_FEE_BPS = 500` (5%). Not upgradeable: replacement is a fresh deploy plus `setProtocolConfig`, which snapshotting makes safe for in-flight proposals. |
 | `src/GuardianRegistry.sol` | UUPS. Guardian review / emergency-review lifecycle and the slash-appeal reserve. Holds zero assets — reads vote weight from sWOOD and calls sWOOD to slash. Computes the graduated (stake-weighted-median) voted slash severity. |
 | `src/StakedWood.sol` | UUPS. Sole WOOD custodian for the guardian layer: guardian stake, owner bonds, checkpointed age-weighted vote weight, slashing + burn. Non-transferable vote-escrow — no ERC-20 transfer surface. (DPoS delegation removed/postponed 2026-07-26.) |
 | `src/SyndicateFactory.sol` | UUPS. Deploys each vault as an immutable ERC-1967 proxy in one tx, plus a per-vault governor (`BeaconProxy` off the shared `beacon`), registers its ENS subname and withdrawal queue, and binds the owner stake. Exposes `governorOf(vault)`. The governor `beacon`, `protocolConfig`, and guardian registry are set-once at init; a protocol-wide governor upgrade is one `beacon.upgradeTo(newImpl)`. |
@@ -61,10 +61,31 @@ reports on-venue holdings for vault-side pricing (empty array = Lane B only).
   timestamp checkpoints. One strategy live per vault at a time.
 - **Per-vault governance** — every vault gets its own governor (`BeaconProxy`, resolved
   via `factory.governorOf(vault)`); that vault's owner sets its governance parameters
-  instantly, frozen while a proposal is open (`whenNoActiveProposal`). Protocol + guardian
-  fee rates live in the shared `ProtocolConfig` and are snapshotted onto each proposal at
+  instantly, frozen while a proposal is open (`whenNoActiveProposal`). Fee rates and
+  splits live in the shared `ProtocolConfig` and are snapshotted onto each proposal at
   propose time (never read live at settle). A protocol-wide governor upgrade is a single
   `beacon.upgradeTo(newImpl)`.
+- **Two-number fees ("2 and 20")** — depositors see two charges; everyone who earns is
+  paid out of them through governance-set splits that must each sum to 10 000 bps.
+
+  | Fee | Rate | Base | Charged | Split |
+  |---|---|---|---|---|
+  | Management | 2%/yr | fund assets × time deployed | **every** settlement — profit, flat or loss | agent 70 / protocol 20 / guardian 10 |
+  | Performance | 20% | value above the fund's previous **peak** price per share | profitable settlements only | agent 60 / protocol 15 / guardian 15 / owner 10 |
+
+  Each fee is one division of one base, not a waterfall — no recipient's share is
+  reduced by another's. The high-water mark ratchets up only, so a fund that falls
+  and recovers is never charged twice on the same dollars. Order is load-bearing:
+  the management fee is charged first (it lowers price per share), then the mark is
+  compared, then performance. Accrual runs only while a strategy is live; capital
+  idle between proposals is free. Instant (Lane A) exits crystallize their accrued
+  fees on the way out so exit timing is fee-neutral, and may additionally pay an
+  early-exit penalty (≤ 2%, on the portion pulled back from the strategy) that
+  accrues to the depositors who stay. Full detail:
+  [`openspec/specs/management-fee/spec.md`](openspec/specs/management-fee/spec.md),
+  [`openspec/specs/performance-fee/spec.md`](openspec/specs/performance-fee/spec.md),
+  [`openspec/specs/instant-exit-fees/spec.md`](openspec/specs/instant-exit-fees/spec.md), and
+  [`openspec/specs/fee-splits/spec.md`](openspec/specs/fee-splits/spec.md).
 - **Guardian review** — a `GuardianReview` window (default 24h) sits between `Pending`
   and `Approved`. Guardians stake WOOD (in sWOOD) and review calldata; a block quorum
   rejects the proposal and slashes approvers (WOOD burned). Slash severity is a

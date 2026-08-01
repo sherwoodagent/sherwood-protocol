@@ -1036,8 +1036,26 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///      zero bond (owner recorded; the empty prepared slot is NOT consumed,
     ///      so they can open more vaults). `canCreateVault` already passes at
     ///      floor 0, so the factory reaches this path.
+    /// @dev DEFENCE IN DEPTH — `PriorStakeNotCleared` (PR #56 review). This is
+    ///      a blind overwrite of `_ownerStakes[vault]`: binding over a vault
+    ///      that already holds a live owner bond would drop the prior owner's
+    ///      record on the floor, and their WOOD would be unreclaimable
+    ///      (`requestUnstakeOwner`/`claimUnstakeOwner` both key on
+    ///      `s.owner == msg.sender`, and the slot now names someone else). The
+    ///      sibling re-point path `transferOwnerStakeSlot` has always refused
+    ///      that; this one did not. Unreachable today — the sole call site is
+    ///      `SyndicateFactory.createSyndicate`, against a freshly derived CREATE3
+    ///      address that cannot already carry a bond — so this costs one SLOAD
+    ///      to make a fund-stranding overwrite impossible rather than merely
+    ///      unreached, and any future factory-side "re-bind" entry point (see
+    ///      `claimUnstakeOwner`) lands on the guard instead of on the hazard.
+    ///      A zero-bond slot (`stakedAmount == 0`, incl. one cleared by
+    ///      `claimUnstakeOwner` or a full slash) still binds, so floor-0
+    ///      onboarding and multi-vault creators are unchanged.
     /// @dev nonReentrant dropped — no external calls after state write.
     function bindOwnerStake(address owner_, address vault) external onlyFactory {
+        if (_ownerStakes[vault].stakedAmount != 0) revert PriorStakeNotCleared();
+
         PreparedOwnerStake storage p = _prepared[owner_];
         if (p.bound) revert PreparedStakeNotFound();
         if (p.amount < minOwnerStake) revert OwnerBondInsufficient();
@@ -1085,8 +1103,19 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     /// @dev After `coolDownPeriod` from `unstakeRequestedAt`, releases WOOD to
     ///      the recorded owner and deletes `_ownerStakes[vault]` entirely — the
     ///      vault then enters grace-period state (`ownerStaked == false`). New
-    ///      proposals cannot be created until owner re-binds a fresh stake via
-    ///      the factory. Relocated verbatim from `GuardianRegistry`.
+    ///      proposals cannot be created until the slot is re-funded.
+    /// @dev RE-FUNDING THE SLOT (comment corrected, PR #56 review). An earlier
+    ///      version of this note said the owner "re-binds a fresh stake via the
+    ///      factory". There is no such factory function: `bindOwnerStake` is
+    ///      reachable only from `SyndicateFactory.createSyndicate`, i.e. once
+    ///      per vault at birth. The single route back to a funded slot on a
+    ///      LIVE vault is `SyndicateFactory.rotateOwner` →
+    ///      `transferOwnerStakeSlot`, which consumes the incoming owner's
+    ///      `prepareOwnerStake` — and the incoming owner may be the outgoing
+    ///      one. Keeping the stale wording mattered: it described a re-bind
+    ///      entry point that, if someone added it, would have walked straight
+    ///      into `bindOwnerStake`'s (formerly missing) prior-stake guard.
+    ///      Relocated verbatim from `GuardianRegistry`.
     /// @dev nonReentrant dropped — CEI: struct deleted before transfer.
     function claimUnstakeOwner(address vault) external {
         OwnerStake storage s = _ownerStakes[vault];
@@ -1176,9 +1205,11 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     /// @notice Wire the coverage ledger that gates unstake claims.
     /// @dev Settable to zero deliberately — that is the documented fail-open
     ///      state, and an operator must be able to reach it if the ledger is
-    ///      ever replaced or found broken. `DeployPlanB` asserts it is non-zero
-    ///      at deploy, so the safe configuration is enforced where a mistake is
-    ///      still cheap to correct.
+    ///      ever replaced or found broken. `DeployPlanB` now WIRES this inside
+    ///      its own broadcast and asserts IDENTITY against the ledger it just
+    ///      deployed — not merely non-zero (review B3). The weaker check let a
+    ///      hand-wired stale ledger satisfy it while the script deployed a
+    ///      second one, leaving this gate reading a ledger with no bookings.
     function setExposureLedger(address ledger) external onlyOwner {
         exposureLedger = ledger;
         emit ExposureLedgerSet(ledger);
@@ -1333,10 +1364,12 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
         uint256 openedAt,
         address[] calldata approvers,
         uint256[] calldata slashBpsPer,
+        bool[] calldata contestors,
         address bountyTo,
         uint256 bountyBps
     ) external onlyAuthorizedSlasher returns (uint256 total) {
         if (openedAt > block.timestamp) revert VerdictNotPast();
+        if (contestors.length != approvers.length) revert SlashBpsLengthMismatch();
         // Positional alignment is the only thing tying a guardian to their rate,
         // so a mismatch is a caller bug, not something to absorb.
         if (slashBpsPer.length != approvers.length) revert SlashBpsLengthMismatch();
@@ -1373,6 +1406,10 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
         // `refundSlash` (PR #24 review, minor 4). `VerdictSlashRouted` still
         // carries the RAW `caseKey`, so indexers join the two deterministically.
         bytes32 slashKey = keccak256(abi.encodePacked("sherwood.verdict", caseKey));
+
+        /// @dev Summed slash of the approvers who funded the counter-bond —
+        ///      the ceiling on the conviction bounty. See the cap below.
+        uint256 contestorSlash;
 
         // INTRA-CALL DEDUP (PR #24 review 🟠4). Each `_slashOne` pass
         // re-applies its clamped rate to the ALREADY-REDUCED live stake, so N
@@ -1431,6 +1468,9 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
             if (amt == 0) continue;
             _verdictSlashed[caseKey][approvers[i]] = true;
             total += amt;
+            // Accumulated HERE because this is the only frame that knows what
+            // each approver actually forfeited — see the bounty cap below.
+            if (contestors[i]) contestorSlash += amt;
         }
         // Nothing recovered: nothing to pay, nothing to burn.
         if (total == 0) return 0;
@@ -1446,9 +1486,31 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
         // cannot over-pay anyone, so the slash is free to exceed the loss —
         // which is the whole reason the verdict rate is now the severity
         // ceiling rather than a share of the damages.
+        // CAPPED AT WHAT THE CONTEST ACTUALLY COST ITS FUNDERS. The caller
+        // pays a bounty only when an APPROVER funded the counter-bond, which
+        // is meant to price a staged contest: to fake one you must join the
+        // cohort your own conviction slashes. That pricing argument holds only
+        // while the payout is bounded by what the faker forfeits — and the
+        // punitive rate broke that bound, because the bounty is a share of the
+        // WHOLE cohort's bonds while the faker still risks only its own.
+        //
+        // Worked: five approvers at 100,000 WOOD, an attacker joining at a
+        // 1,000 WOOD minimum stake and self-funding the pool, 500 bps ->
+        // 25,050 WOOD paid for 1,000 WOOD risked. Capping at `contestorSlash`
+        // makes that trade exactly break-even at best, for any parameter set,
+        // without a threshold to tune.
+        //
+        // SUMMED OVER EVERY CONTRIBUTING APPROVER, not the first one found: a
+        // genuine defence is funded by real approvers with real bonds, so the
+        // cap sits far above the fee and never binds. It binds only when the
+        // contest was staged by someone with nothing at stake — which is the
+        // case it exists for. A contestor whose own slash landed at zero
+        // (`amt == 0`, no live stake) contributes nothing to the cap and so
+        // unlocks no bounty, which is the same rule stated at the wei level.
         uint256 bounty;
         if (bountyTo != address(0) && bountyBps != 0) {
             bounty = total * bountyBps / 10_000;
+            if (bounty > contestorSlash) bounty = contestorSlash;
             if (bounty != 0) {
                 total -= bounty;
                 wood.safeTransfer(bountyTo, bounty);

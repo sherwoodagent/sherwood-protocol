@@ -168,6 +168,20 @@ contract MockChallengeLedger {
         _committed[k][guardian] = 0;
     }
 
+    /// @dev The ledger's HALF of the two-sided freeze grant (review PR #56 M2).
+    ///      `ChallengeGame.setExposureLedger` now refuses a ledger that has not
+    ///      named it, so a mock without this field could never be re-pointed to.
+    ///      Deliberately NOT enforced on `freezeCoverage`/`unfreezeCoverage`
+    ///      below: those stay open so the pre-existing suite keeps exercising
+    ///      the game's own logic rather than the mock's access control, and the
+    ///      test that cares about the revoked-role failure asserts the SETTER
+    ///      refuses rather than trying to reach the failure through the mock.
+    address public coverageFreezer;
+
+    function setCoverageFreezer(address freezer) external {
+        coverageFreezer = freezer;
+    }
+
     function freezeCoverage(address governor, uint256 proposalId) external {
         _frozen[_key(governor, proposalId)] = true;
     }
@@ -247,6 +261,7 @@ contract MockChallengeStakedWood {
     uint256 public lastOpenedAt;
     address[] internal _lastApprovers;
     uint256[] internal _lastSlashBpsPer;
+    bool[] internal _lastContestors;
 
     function lastSlashBpsPer() external view returns (uint256[] memory) {
         return _lastSlashBpsPer;
@@ -287,22 +302,65 @@ contract MockChallengeStakedWood {
         return _lastApprovers;
     }
 
+    /// @dev THE HALF OF THE VERDICT DEDUP THAT OUTLIVES A GAME DEPLOYMENT
+    ///      (review PR #56 B1). The real sWOOD keys this on
+    ///      `keccak256(governor, proposalId)` — the SAME key a redeployed
+    ///      `ChallengeGame` derives — and `slashVerdict` reverts
+    ///      `ApproverAlreadySlashed` the moment it is handed an approver already
+    ///      marked under it. Modelling both halves faithfully is what lets the
+    ///      redeploy regression below prove a real wedge rather than a mock's
+    ///      convenience: without the revert, the old code would have "settled"
+    ///      the second conviction and the test would have proved nothing.
+    mapping(bytes32 caseKey => mapping(address approver => bool)) internal _verdictSlashed;
+
+    error ApproverAlreadySlashed();
+
+    /// @dev Seeds the state a PREVIOUS deployment of the game would have left
+    ///      behind — the whole point of the redeploy fixture, since the fresh
+    ///      game's own `_convicted` mapping starts empty either way.
+    function setVerdictSlashed(bytes32 caseKey, address approver, bool v) external {
+        _verdictSlashed[caseKey][approver] = v;
+    }
+
+    function verdictSlashed(bytes32 caseKey, address approver) external view returns (bool) {
+        return _verdictSlashed[caseKey][approver];
+    }
+
+    /// @dev sWOOD's half of the two-sided slasher grant (review PR #56 M2).
+    ///      `ChallengeGame.setStakedWood` now refuses a sWOOD that has not named
+    ///      it, which is the order `DeployPlanD` already wires in.
+    address public authorizedSlasher;
+
+    function setAuthorizedSlasher(address slasher) external {
+        authorizedSlasher = slasher;
+    }
+
     function slashVerdict(
         bytes32 caseKey,
         uint256 openedAt,
         address[] calldata approvers,
         uint256[] calldata slashBpsPer,
+        bool[] calldata contestors,
         address bountyTo,
         uint256 bountyBps
     ) external returns (uint256) {
+        for (uint256 i = 0; i < approvers.length; i++) {
+            if (_verdictSlashed[caseKey][approvers[i]]) revert ApproverAlreadySlashed();
+            _verdictSlashed[caseKey][approvers[i]] = true;
+        }
         callCount++;
         lastCaseKey = caseKey;
         lastOpenedAt = openedAt;
         _lastApprovers = approvers;
         _lastSlashBpsPer = slashBpsPer;
+        _lastContestors = contestors;
         lastBountyTo = bountyTo;
         lastBountyBps = bountyBps;
         return _nextTotal;
+    }
+
+    function lastContestors() external view returns (bool[] memory) {
+        return _lastContestors;
     }
 }
 
@@ -415,6 +473,11 @@ contract ChallengeGameTest is Test {
         swood = new MockChallengeStakedWood();
         game = new ChallengeGame(owner, address(wood), address(ledger), address(tiers));
         court = address(new MockRecordingCourt()); // see the field's own doc for why not a bare EOA
+        // BOTH HALVES OF BOTH GRANTS, IN THE ORDER `DeployPlanD` uses (review PR
+        // #56 M2): the target contract names the game FIRST, then the game is
+        // pointed at it. `setStakedWood` below now enforces that order.
+        ledger.setCoverageFreezer(address(game));
+        swood.setAuthorizedSlasher(address(game));
         vm.startPrank(owner);
         game.setStakedWood(address(swood));
         game.setCourt(court);
@@ -943,6 +1006,9 @@ contract ChallengeGameTest is Test {
     function test_setExposureLedger_succeedsWhenNewLedgersWindowCoversCurrent() public {
         MockChallengeLedger bigger = new MockChallengeLedger(0.05e8);
         bigger.setChallengeWindow(30 days); // >= the game's current 14-day window
+        // The new ledger's own half of the freeze grant (review PR #56 M2) —
+        // without it the re-point is refused, which is the sibling test below.
+        bigger.setCoverageFreezer(address(game));
         vm.prank(owner);
         game.setExposureLedger(address(bigger));
         assertEq(address(game.exposureLedger()), address(bigger));
@@ -1184,23 +1250,27 @@ contract ChallengeGameTest is Test {
         assertEq(swood.callCount(), 0);
     }
 
-    /// @notice N-4 (PR #24 round 4): `resolve` is permissionless, so the
-    ///         caller chooses the gas — and a starved `openCase` child inside
-    ///         `slashToEscrow` BURNS the victims' compensation instead of
-    ///         bubbling. The game pins the floor sWOOD's natspec demands of
-    ///         its slasher: too little gas is refused before any state moves,
-    ///         and the retry costs nothing but the gas.
+    /// @notice `resolve` is permissionless, so the caller chooses the gas. The
+    ///         game pins a floor: too little is refused before any state moves,
+    ///         and the retry costs nothing but the gas. Originally N-4 (PR #24
+    ///         round 4), where a starved `openCase` child inside
+    ///         `slashToEscrow` burned the victims' compensation instead of
+    ///         bubbling; the burn removed that child, and what the floor now
+    ///         protects is the best-effort `demoteByChallenge` that runs AFTER
+    ///         the slash.
     function test_resolve_enforcesTheSlashGasFloor() public {
         uint256 id = _fileStandard(PROPOSAL);
         vm.warp(_filedAt(id) + game.autoSlashDelay());
 
-        // Two approvers -> floor = 2 * 110k + 1M = 1.22M (re-derived from
-        // measurement in `SlashGasCeiling.t.sol`; was 1.6M when the floor
-        // reserved margin for an `openCase` child that no longer exists).
-        // 1.15M covers all the pre-floor work comfortably but cannot satisfy
-        // the floor itself.
+        // Two approvers -> floor = 2 * SLASH_GAS_PER_APPROVER + SLASH_GAS_BASE.
+        // Starve the call to just under it: ample for all the pre-floor work,
+        // never enough for the floor itself. Derived from the LIVE constants
+        // rather than hardcoded, so re-sizing the floor (PR #56 H2 did, from
+        // 300k/1M to 180k/2M) cannot quietly turn this into an out-of-gas test
+        // that passes for the wrong reason.
+        uint256 starved = 2 * game.SLASH_GAS_PER_APPROVER() + game.SLASH_GAS_BASE() - 100_000;
         bytes memory callData = abi.encodeWithSelector(game.resolve.selector, id);
-        (bool ok, bytes memory ret) = address(game).call{gas: 1_150_000}(callData);
+        (bool ok, bytes memory ret) = address(game).call{gas: starved}(callData);
         assertFalse(ok, "a gas-starved resolve must not settle");
         assertEq(bytes4(ret), IChallengeGame.InsufficientSlashGas.selector, "refused at the floor, not an OOG");
         assertEq(swood.callCount(), 0, "the slasher was never reached");
@@ -2033,6 +2103,9 @@ contract ChallengeGameTest is Test {
         // A ceiling AT OR ABOVE the current rate is unaffected.
         MockChallengeStakedWood lenient = new MockChallengeStakedWood();
         lenient.setMaxConvictionBountyBps(500);
+        // ...provided it has also named this game its slasher (review PR #56 M2)
+        // — the reciprocal half, asserted on its own in the sibling test below.
+        lenient.setAuthorizedSlasher(address(game));
         vm.prank(owner);
         game.setStakedWood(address(lenient));
         assertEq(address(game.stakedWood()), address(lenient));
@@ -3674,5 +3747,287 @@ contract ChallengeGameTest is Test {
         vm.prank(owner);
         game.setConvictionBountyBps(0); // zero is legal - bounty off
         assertEq(game.convictionBountyBps(), 0);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Review PR #56 — cross-deployment verdict dedup (B1) and two-sided role
+    // grants (M2). Both are WEDGES: states in which a live challenge has no
+    // terminal exit at all, so every assertion below ends on the money.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @dev A SECOND `ChallengeGame` against the SAME sWOOD and the SAME ledger —
+    ///      the migration path this contract actually has, since it is not
+    ///      upgradeable and every role it needs is re-pointable. Its `_convicted`
+    ///      mapping starts empty; sWOOD's `_verdictSlashed`, keyed on
+    ///      `(governor, proposalId)`, does not.
+    function _redeployGame() internal returns (ChallengeGame v2) {
+        v2 = new ChallengeGame(owner, address(wood), address(ledger), address(tiers));
+        // Re-pointing the roles is exactly what a migration does.
+        ledger.setCoverageFreezer(address(v2));
+        swood.setAuthorizedSlasher(address(v2));
+        vm.startPrank(owner);
+        v2.setStakedWood(address(swood));
+        v2.setCourt(court);
+        vm.stopPrank();
+    }
+
+    /// @notice B1: A REDEPLOYED GAME MUST NOT ACCEPT A FILING IT COULD NEVER
+    ///         TERMINATE. V1 convicts the cohort; V2 is deployed and wired; a
+    ///         filing against the same proposal reaches V2 with `_convicted`
+    ///         empty. Before the fix it was accepted, took the bond, froze the
+    ///         coverage — and then `_settle`'s `slashToEscrow` reverted
+    ///         `ApproverAlreadySlashed` forever, with `rule` unreachable from
+    ///         `Filed`. The money assertions are the point: the bond is never
+    ///         taken and the coverage is never re-frozen.
+    function test_file_refusesWhenAnEarlierDeploymentAlreadyCollectedTheVerdict() public {
+        // V1 collects the one liability.
+        uint256 v1Id = _fileStandard(PROPOSAL);
+        vm.warp(_filedAt(v1Id) + game.autoSlashDelay());
+        game.resolve(v1Id);
+        assertEq(swood.callCount(), 1, "fixture: V1 really slashed");
+        assertTrue(swood.verdictSlashed(_reviewKeyFor(address(gov), PROPOSAL), guardianA), "sWOOD marked the cohort");
+
+        ChallengeGame v2 = _redeployGame();
+        assertFalse(ledger.isCoverageFrozen(address(gov), PROPOSAL), "fixture: V1 released its freeze");
+
+        address filer = makeAddr("v2filer");
+        wood.mint(filer, 1_000_000e18);
+        vm.prank(filer);
+        wood.approve(address(v2), type(uint256).max);
+
+        uint256 filerBefore = wood.balanceOf(filer);
+        vm.prank(filer);
+        vm.expectRevert(IChallengeGame.AlreadyConvicted.selector);
+        v2.file(address(gov), PROPOSAL, IChallengeGame.Predicate.RogueAllowance, ADAPTER, SELECTOR, EVIDENCE);
+
+        assertEq(wood.balanceOf(filer), filerBefore, "no bond taken by a filing that could never convict");
+        assertEq(wood.balanceOf(address(v2)), 0, "V2 custodies nothing");
+        assertFalse(ledger.isCoverageFrozen(address(gov), PROPOSAL), "coverage not re-frozen");
+        assertEq(v2.liveChallengeCountOf(address(gov), PROPOSAL), 0, "no live challenge pinning the freeze");
+    }
+
+    /// @notice B1: A PARTIAL PRIOR SLASH IS ENOUGH. The norm is a partialPool
+    ///         conviction — the approvers keep live stake, so nothing about the
+    ///         cohort's later state advertises that its liability is spent.
+    ///         `slashToEscrow` reverts if ANY member of the array it is handed is
+    ///         already marked, so one marked approver out of two must refuse the
+    ///         filing, not one out of one.
+    function test_file_refusesWhenOnlyOneAccusedApproverWasPreviouslySlashed() public {
+        _setCoverage(PROPOSAL, 6_000e18, 4_000e18);
+        _execute(PROPOSAL);
+        // Exactly what a previous deployment's partialPool verdict leaves behind.
+        swood.setVerdictSlashed(_reviewKeyFor(address(gov), PROPOSAL), guardianB, true);
+
+        uint256 before = wood.balanceOf(challenger);
+        vm.prank(challenger);
+        vm.expectRevert(IChallengeGame.AlreadyConvicted.selector);
+        game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.OutOfAdapterOutflow, ADAPTER, SELECTOR, EVIDENCE);
+        assertEq(wood.balanceOf(challenger), before, "bond untouched");
+        assertFalse(ledger.isCoverageFrozen(address(gov), PROPOSAL), "coverage untouched");
+    }
+
+    /// @notice B1, THE OTHER HALF: `file`'s gate reads the slasher wired AT
+    ///         FILING TIME, so it cannot be the only defence — sWOOD can be
+    ///         re-pointed (or the prior deployment can settle a concurrent
+    ///         challenge) after a perfectly legal filing. `_settle` must then
+    ///         DIVERT into `VerdictAlreadyCollected` rather than revert.
+    ///
+    ///         THE MONEY IS THE ASSERTION: the challenge reaches `Settled`, the
+    ///         challenger is refunded all but the pinned `settleBurnBps`, the
+    ///         part-funded pool is claimable back to its contributor, and the
+    ///         coverage genuinely unfreezes — proven through a real
+    ///         `releaseApproval`, not a flag.
+    function test_settle_divertsWhenTheVerdictWasCollectedAfterFiling() public {
+        uint256 id = _fileStandard(PROPOSAL);
+        IChallengeGame.Challenge memory filed = game.challengeOf(id);
+        uint256 bond = filed.bondWood;
+
+        // A PART-FUNDED defence: `Filed` is preserved, and its contributor must
+        // still get its stake back on the diverted settle.
+        uint256 partialPool = bond / 4;
+        vm.prank(guardianB);
+        game.dispute(id, partialPool);
+        assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Filed), "still Filed");
+
+        // The liability is collected out from under the live challenge — the
+        // shape a prior deployment settling concurrently leaves behind.
+        bytes32 key = _reviewKeyFor(address(gov), PROPOSAL);
+        swood.setVerdictSlashed(key, guardianA, true);
+        swood.setVerdictSlashed(key, guardianB, true);
+
+        uint256 challengerBefore = wood.balanceOf(challenger);
+        uint256 guardianBefore = wood.balanceOf(guardianB);
+        uint256 slashesBefore = swood.callCount();
+
+        vm.warp(_filedAt(id) + game.autoSlashDelay());
+        vm.expectEmit(true, true, true, true, address(game));
+        emit IChallengeGame.VerdictAlreadyCollected(id, address(gov), PROPOSAL);
+        game.resolve(id); // must NOT revert `ApproverAlreadySlashed`
+
+        assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Settled), "terminal");
+        assertEq(swood.callCount(), slashesBefore, "no second slash attempted");
+
+        // The bond comes back, less the pinned settle burn — the ordinary
+        // undisputed-settle payout, not a stranded balance.
+        uint256 burned = (bond * filed.settleBurnBpsAtFiling) / 10_000;
+        assertEq(wood.balanceOf(challenger) - challengerBefore, bond - burned, "challenger refunded");
+
+        // The part-funded pool is claimable, which `ChallengeNotTerminal` made
+        // impossible for the whole life of the wedge.
+        assertEq(game.claimableContribution(id, guardianB), partialPool, "pool owed back");
+        vm.prank(guardianB);
+        game.claimContribution(id);
+        assertEq(wood.balanceOf(guardianB) - guardianBefore, partialPool, "pool returned");
+
+        // And the freeze is genuinely gone.
+        assertFalse(ledger.isCoverageFrozen(address(gov), PROPOSAL), "unfrozen");
+        ledger.releaseApproval(address(gov), PROPOSAL, guardianA);
+        _assertLiveBondsBacked();
+    }
+
+    /// @notice B1 END TO END ON THE REDEPLOY ITSELF: a V2 filing that was legal
+    ///         when made (nothing collected yet) but whose liability V1 collects
+    ///         while it is live. This is the case `file`'s gate structurally
+    ///         cannot catch, and it must still terminate with the money back.
+    function test_redeployedGame_liveChallengeStillTerminatesWhenV1CollectsFirst() public {
+        // Two live filings against the same proposal, one per deployment.
+        uint256 v1Id = _fileStandard(PROPOSAL);
+
+        ChallengeGame v2 = _redeployGame();
+        address filer = makeAddr("v2filer");
+        wood.mint(filer, 1_000_000e18);
+        vm.startPrank(filer);
+        wood.approve(address(v2), type(uint256).max);
+        uint256 v2Id =
+            v2.file(address(gov), PROPOSAL, IChallengeGame.Predicate.RogueAllowance, ADAPTER, SELECTOR, EVIDENCE);
+        vm.stopPrank();
+        IChallengeGame.Challenge memory v2c = v2.challengeOf(v2Id);
+        assertGt(v2c.bondWood, 0, "fixture: V2 took a bond");
+
+        // V1 settles first and collects the one liability.
+        vm.warp(_filedAt(v1Id) + game.autoSlashDelay());
+        game.resolve(v1Id);
+
+        uint256 filerBefore = wood.balanceOf(filer);
+        vm.warp(v2.challengeOf(v2Id).filedAt + v2.autoSlashDelay());
+        v2.resolve(v2Id); // pre-fix: reverts `ApproverAlreadySlashed`, forever
+
+        assertEq(uint8(v2.challengeOf(v2Id).status), uint8(IChallengeGame.Status.Settled), "V2 terminal");
+        uint256 burned = (v2c.bondWood * v2c.settleBurnBpsAtFiling) / 10_000;
+        assertEq(wood.balanceOf(filer) - filerBefore, v2c.bondWood - burned, "V2 bond refunded");
+        assertEq(v2.liveChallengeCountOf(address(gov), PROPOSAL), 0, "V2 released its refcount");
+        assertFalse(ledger.isCoverageFrozen(address(gov), PROPOSAL), "coverage released");
+        ledger.releaseApproval(address(gov), PROPOSAL, guardianA);
+    }
+
+    /// @notice M2: RE-POINTING THE LEDGER MID-CHALLENGE IS REFUSED. A fresh
+    ///         ledger's `coverageFreezer` is the zero address, so every terminal
+    ///         path of the live challenge would have gone into
+    ///         `NotCoverageFreezer` — bond and pool stranded, the OLD ledger
+    ///         frozen forever with its own `setCoverageFreezer` bricked by
+    ///         `CoverageFrozen`. The setter refuses, and the live challenge
+    ///         still terminates with the money back.
+    function test_setExposureLedger_refusesALedgerThatHasNotNamedThisGame() public {
+        uint256 id = _fileStandard(PROPOSAL);
+        assertTrue(ledger.isCoverageFrozen(address(gov), PROPOSAL), "fixture: live freeze");
+
+        MockChallengeLedger fresh = new MockChallengeLedger(0.05e8);
+        fresh.setChallengeWindow(30 days); // window bound satisfied: isolate the role check
+        vm.prank(owner);
+        vm.expectRevert(IChallengeGame.RoleNotGranted.selector);
+        game.setExposureLedger(address(fresh));
+        assertEq(address(game.exposureLedger()), address(ledger), "ledger unchanged");
+
+        // The live challenge is untouched and still reaches a terminal state.
+        uint256 challengerBefore = wood.balanceOf(challenger);
+        IChallengeGame.Challenge memory c = game.challengeOf(id);
+        vm.warp(_filedAt(id) + game.autoSlashDelay());
+        game.resolve(id);
+        uint256 burned = (c.bondWood * c.settleBurnBpsAtFiling) / 10_000;
+        assertEq(wood.balanceOf(challenger) - challengerBefore, c.bondWood - burned, "bond home");
+        assertFalse(ledger.isCoverageFrozen(address(gov), PROPOSAL), "unfrozen on the ledger that froze it");
+    }
+
+    /// @notice M2, the other side: a CORRECTLY wired re-point still succeeds. The
+    ///         guard enforces an order, not a prohibition — grant the role on the
+    ///         new ledger first, exactly as `DeployPlanD` does.
+    function test_setExposureLedger_acceptsACorrectlyWiredRePoint() public {
+        MockChallengeLedger fresh = new MockChallengeLedger(0.05e8);
+        fresh.setChallengeWindow(30 days);
+        fresh.setCoverageFreezer(address(game));
+        vm.prank(owner);
+        game.setExposureLedger(address(fresh));
+        assertEq(address(game.exposureLedger()), address(fresh), "re-pointed");
+
+        // And the new ledger is genuinely usable: a filing freezes on IT.
+        address[] memory guardians = new address[](2);
+        uint256[] memory usd = new uint256[](2);
+        guardians[0] = guardianA;
+        guardians[1] = guardianB;
+        usd[0] = 6_000e18;
+        usd[1] = 4_000e18;
+        fresh.setApprovers(address(gov), 7, guardians, usd);
+        _execute(7);
+        vm.prank(challenger);
+        uint256 id = game.file(address(gov), 7, IChallengeGame.Predicate.DrawdownBreach, ADAPTER, SELECTOR, EVIDENCE);
+        assertTrue(fresh.isCoverageFrozen(address(gov), 7), "new ledger froze");
+        vm.warp(_filedAt(id) + game.autoSlashDelay());
+        game.resolve(id);
+        assertFalse(fresh.isCoverageFrozen(address(gov), 7), "new ledger unfroze");
+    }
+
+    /// @notice M2 mirrored onto the slasher: a sWOOD that has not named this game
+    ///         `authorizedSlasher` would reject every `_settle`, which is the same
+    ///         wedge from the other rail.
+    function test_setStakedWood_refusesASlasherThatHasNotNamedThisGame() public {
+        MockChallengeStakedWood ungranted = new MockChallengeStakedWood();
+        vm.prank(owner);
+        vm.expectRevert(IChallengeGame.RoleNotGranted.selector);
+        game.setStakedWood(address(ungranted));
+        assertEq(address(game.stakedWood()), address(swood), "slasher unchanged");
+
+        ungranted.setAuthorizedSlasher(address(game));
+        vm.prank(owner);
+        game.setStakedWood(address(ungranted));
+        assertEq(address(game.stakedWood()), address(ungranted), "granted re-point succeeds");
+    }
+
+    /// @notice The constructor's own copy of the window bound — the third door
+    ///         onto the same mismatch, and the one no setter could ever catch
+    ///         because a deployment need never call one.
+    function test_constructor_rejectsALedgerWhoseWindowIsBelowTheDefault() public {
+        MockChallengeLedger tooSmall = new MockChallengeLedger(0.05e8);
+        tooSmall.setChallengeWindow(7 days); // below the 14-day default
+        vm.expectRevert(IChallengeGame.InvalidParameter.selector);
+        new ChallengeGame(owner, address(wood), address(tooSmall), address(tiers));
+
+        // Exactly at the default is legal — the bound is `>`, not `>=`.
+        MockChallengeLedger exact = new MockChallengeLedger(0.05e8);
+        exact.setChallengeWindow(14 days);
+        ChallengeGame ok = new ChallengeGame(owner, address(wood), address(exact), address(tiers));
+        assertEq(ok.challengeWindow(), 14 days);
+    }
+
+    /// @notice `renounceOwnership` is disabled: `setStakedWood` is the documented
+    ///         un-wedge and `setCourt(0)` the documented off-switch, and both are
+    ///         owner-only with no permissionless equivalent.
+    function test_renounceOwnership_isDisabled() public {
+        vm.prank(owner);
+        vm.expectRevert(IChallengeGame.RenounceDisabled.selector);
+        game.renounceOwnership();
+        assertEq(game.owner(), owner, "still owned");
+
+        // A non-owner is still rejected on ownership, not on the new error.
+        vm.prank(challenger);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, challenger));
+        game.renounceOwnership();
+
+        // Handing ownership over is untouched — only abandoning it is refused.
+        address successor = makeAddr("successor");
+        vm.prank(owner);
+        game.transferOwnership(successor);
+        vm.prank(successor);
+        game.acceptOwnership();
+        assertEq(game.owner(), successor, "transfer still works");
     }
 }
