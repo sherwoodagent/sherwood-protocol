@@ -1,0 +1,83 @@
+name: Fork tests
+
+# Opt-in counterpart to CI's `build-test` job: runs exactly the suites that job
+# excludes (`test/integration/**` plus `test/WstETHMoonwellStrategy.t.sol`).
+# Never runs on PR/push cadence — public RPC forks are rate-limited and
+# nondeterministic, so they must not gate PRs.
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly, Mondays 06:23 UTC. Off-minute on purpose: top-of-hour crons queue
+    # behind GitHub's shared scheduler and get delayed or dropped.
+    - cron: "23 6 * * 1"
+
+concurrency:
+  # Separate from CI's PR group so a fork run never cancels (or is cancelled
+  # by) a PR check. Fork runs are rare and slow — let an in-flight one finish.
+  group: fork-tests-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Keep in lockstep with .github/workflows/ci.yml.
+  FOUNDRY_VERSION: v1.7.1
+  FOUNDRY_PROFILE: default
+
+jobs:
+  fork-test:
+    name: Fork & integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # Public fallbacks for the two endpoints whose URLs are already public
+      # knowledge in this repo's docs/scripts, so a dispatch works out of the
+      # box before any secret is configured.
+      BASE_RPC_URL: ${{ secrets.BASE_RPC_URL || 'https://mainnet.base.org' }}
+      ROBINHOOD_RPC_URL: ${{ secrets.ROBINHOOD_RPC_URL || 'https://rpc.mainnet.chain.robinhood.com' }}
+      # Robinhood testnet (46630) has no public endpoint documented in this
+      # repo, so it gets no fallback: secret-only, preflighted below. Read by
+      # test/integration/RobinhoodIntegrationTest.sol.
+      ROBINHOOD_TESTNET_RPC_URL: ${{ secrets.ROBINHOOD_TESTNET_RPC_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: ${{ env.FOUNDRY_VERSION }}
+
+      # The fork suites read their RPC with `vm.envOr(..., "")` and `vm.skip(true)`
+      # when it is empty — so a missing secret silently turns a fork suite into a
+      # green no-op. Fail loudly instead, naming the secret.
+      - name: Preflight required secrets
+        run: |
+          missing=""
+          for var in ROBINHOOD_TESTNET_RPC_URL; do
+            if [ -z "${!var}" ]; then
+              missing="$missing $var"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Missing required repository secret(s):$missing — no public fallback exists for these endpoints. Set them under Settings > Secrets and variables > Actions, then re-run."
+            exit 1
+          fi
+          echo "OK: every endpoint without a public fallback has a secret set."
+
+      - name: Build
+        run: forge build
+
+      # `--fork-url $BASE_RPC_URL` supplies the default fork the Base-mainnet
+      # suites assume (see the "Run with: forge test --fork-url $BASE_RPC_URL"
+      # natspec on BaseIntegrationTest and UniswapAdapterForkTest). The
+      # Robinhood suites call `vm.createSelectFork` themselves off the env vars
+      # above, so the default fork does not affect them.
+      #
+      # The path filter is the exact complement of ci.yml's `--no-match-path`;
+      # keep the two in sync. `test/WstETHMoonwellStrategy.t.sol` was deleted in
+      # e9c3512 along with the Base-chain strategies — the glob keeps the stale
+      # entry purely so the two filters stay verifiably complementary.
+      - name: Fork tests
+        run: |
+          forge test \
+            --match-path "{test/integration/**,test/WstETHMoonwellStrategy.t.sol}" \
+            --fork-url "$BASE_RPC_URL" \
+            -vv

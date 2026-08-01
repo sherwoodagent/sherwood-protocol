@@ -47,6 +47,68 @@ jobs:
       - name: Test
         run: forge test --no-match-path "{test/integration/**,test/WstETHMoonwellStrategy.t.sol}" -vv
 
+  coverage:
+    name: Coverage (advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # forge coverage is the least stable forge subcommand — it may not hold PRs
+    # hostage. Its red/green status stays visible in the checks list; revisit
+    # making it blocking once it has proven stable.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: ${{ env.FOUNDRY_VERSION }}
+
+      # Own cache key: the coverage profile builds with via_ir off, so its
+      # artifacts are incompatible with the default profile's — sharing the
+      # `forge-` key would make the two jobs thrash each other's cache.
+      - name: Cache build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            cache
+            out
+          key: forge-coverage-${{ env.FOUNDRY_VERSION }}-${{ hashFiles('foundry.toml', 'src/**/*.sol', 'lib/**/*.sol', 'test/**/*.sol', 'script/**/*.sol') }}
+          restore-keys: |
+            forge-coverage-${{ env.FOUNDRY_VERSION }}-
+
+      # `[profile.coverage]` pins via_ir = false — forge coverage is
+      # incompatible with the IR pipeline (Yul stack-too-deep). Same fork-path
+      # exclusion as the Test step above: those suites need live RPC.
+      #
+      # KNOWN RED (forge 1.7.1, verified locally 2026-08-01): the src tree no
+      # longer compiles under either coverage codegen mode, so this step fails
+      # before it instruments anything — hence `continue-on-error` above.
+      #   - profile default (via_ir off, optimizer off): legacy stack-too-deep
+      #     at src/queue/VaultWithdrawalQueue.sol:399
+      #   - `--ir-minimum` (viaIR + min optimization): Yul stack-too-deep at
+      #     src/SyndicateGovernor.sol:282
+      # Fixing that is a src-side change (scope out of #63). The job is wired
+      # now so the signal appears the moment the blocker is lifted.
+      - name: forge coverage
+        env:
+          FOUNDRY_PROFILE: coverage
+        run: |
+          forge coverage \
+            --report lcov \
+            --report summary \
+            --no-match-path "{test/integration/**,test/WstETHMoonwellStrategy.t.sol}"
+
+      # TODO(#63): sink is artifact-only for now — wiring Codecov needs a
+      # CODECOV_TOKEN repository secret, a decision deferred out of this change.
+      - name: Upload lcov report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          retention-days: 14
+          if-no-files-found: warn
+
   fmt:
     name: Format check
     runs-on: ubuntu-latest
