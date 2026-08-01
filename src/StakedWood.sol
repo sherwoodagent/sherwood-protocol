@@ -1236,9 +1236,11 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     /// @notice Wire the coverage ledger that gates unstake claims.
     /// @dev Settable to zero deliberately — that is the documented fail-open
     ///      state, and an operator must be able to reach it if the ledger is
-    ///      ever replaced or found broken. `DeployPlanB` asserts it is non-zero
-    ///      at deploy, so the safe configuration is enforced where a mistake is
-    ///      still cheap to correct.
+    ///      ever replaced or found broken. `DeployPlanB` now WIRES this inside
+    ///      its own broadcast and asserts IDENTITY against the ledger it just
+    ///      deployed — not merely non-zero (review B3). The weaker check let a
+    ///      hand-wired stale ledger satisfy it while the script deployed a
+    ///      second one, leaving this gate reading a ledger with no bookings.
     function setExposureLedger(address ledger) external onlyOwner {
         exposureLedger = ledger;
         emit ExposureLedgerSet(ledger);
