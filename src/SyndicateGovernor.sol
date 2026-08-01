@@ -580,9 +580,45 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      proposer the ESCROW recorded at lock time, so an arbitrary caller
     ///      can only accelerate the refund, never redirect it.
     ///
-    ///      Rejected / Expired / Cancelled all return the bond: forfeiture is
-    ///      exclusively a passed-challenge outcome (Plan C) — a guardian block
-    ///      is not a conviction, and an expired proposal moved no funds.
+    ///      Rejected / Expired / Cancelled all return the bond IMMEDIATELY:
+    ///      forfeiture is exclusively a passed-challenge outcome (Plan C), a
+    ///      guardian block is not a conviction, and — the load-bearing part —
+    ///      none of those three ever EXECUTED, so no drain was possible and
+    ///      there is nothing for a challenge to allege. Delaying them would
+    ///      lock honest capital for a fortnight to deter an attack their own
+    ///      lifecycle already made impossible.
+    ///
+    ///      SETTLED IS THE ONE THAT WAITS, and it waits on `executedAt` rather
+    ///      than on the state name — "did this proposal execute" is the real
+    ///      predicate, and it stays correct if a later state is ever added.
+    ///      `MIN_STRATEGY_DURATION_BEFORE_SELF_SETTLE` lets the PROPOSER settle
+    ///      its own strategy an hour after execution while everyone else waits
+    ///      `strategyDuration`; that hour against a 14-day challenge window
+    ///      meant a proposer could execute a drain, self-settle, reclaim the
+    ///      whole bond and be gone on day one, with the bond it posted against
+    ///      exactly that outcome never at risk. `ChallengeGame._settle` can now
+    ///      confiscate the bond — but only while it is still here to confiscate,
+    ///      which is what this delay guarantees. Neither half works alone.
+    ///
+    ///      TWO CONDITIONS, because the window is not the whole exposure. A
+    ///      filing on the last legal day convicts `autoSlashDelay` (7d) later,
+    ///      well past `executedAt + challengeWindow`, so the elapsed-time check
+    ///      alone would hand the bond back mid-accusation. The second check is
+    ///      the ledger's per-proposal coverage freeze — set by `file`, cleared
+    ///      by every terminal challenge path (`_settle` / `_fail` /
+    ///      `_refundAll`, refcounted across concurrent filings) — which is
+    ///      precisely "an accusation against this proposal is live". It cannot
+    ///      strand the bond: `resolve` is permissionless once the delay has run
+    ///      and a dispute times out on its own clock, so every freeze has a
+    ///      permissionless path off.
+    ///
+    ///      ACCEPTED RESIDUAL: `ChallengeGame.challengeableUntil` can extend the
+    ///      filing deadline past this gate after an `Inconclusive` unwind, so a
+    ///      bond can be released while a re-filing is still technically
+    ///      admissible. Closing it would mean reading a deadline that lives on
+    ///      the game, which this contract has no pointer to and should not grow
+    ///      one for; the game's own `setChallengeWindow` makes the same scope
+    ///      choice for the same reason.
     ///
     ///      Releases against `proposal.proposerBondEscrow` (bound at propose),
     ///      NOT the live `_bondEscrow` slot: the escrow has no owner and no
@@ -600,6 +636,35 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         }
         uint256 bond = proposal.proposerBondWood;
         if (bond == 0) revert NoBondToReclaim();
+        // The challenge-window hold, for EXECUTED proposals only. Ordered after
+        // the `bond == 0` check so a proposal that never posted a bond still
+        // reports `NoBondToReclaim` rather than being told to wait for a window
+        // it has nothing at stake in.
+        uint256 executedAt = proposal.executedAt;
+        if (executedAt != 0) {
+            address ledger = _exposureLedger;
+            // FAILS CLOSED, and the choice is not close. Fail-open would make
+            // `setExposureLedger(0)` a one-transaction bypass of this entire
+            // delay, available to the vault owner — who may be the proposer, or
+            // colluding with it — at exactly the moment it matters. Fail-closed
+            // costs a stuck bond, and that bond cannot be stuck permanently:
+            // a bond exists here only because a ledger was wired at propose
+            // time (that is where `proposerBondWood` is priced and locked), so
+            // the unset state is always a REGRESSION from a working
+            // configuration, and re-pointing `setExposureLedger` at any ledger
+            // — the old one, a replacement — makes every held bond reclaimable
+            // again. A recoverable freeze against an unrecoverable escape: the
+            // freeze wins. Same reasoning for a ledger that reverts on the
+            // reads below: the revert bubbles, the bond waits, governance
+            // re-points.
+            if (ledger == address(0)) revert ExposureLedgerUnset();
+            if (block.timestamp < executedAt + IExposureLedger(ledger).challengeWindow()) {
+                revert ChallengeWindowOpen();
+            }
+            if (IExposureLedger(ledger).isCoverageFrozen(address(this), proposalId)) {
+                revert ChallengeWindowOpen();
+            }
+        }
         address escrow = proposal.proposerBondEscrow;
         // Effects before interaction: zeroing first makes the reclaim
         // idempotent (a second call reverts NoBondToReclaim) and closes any

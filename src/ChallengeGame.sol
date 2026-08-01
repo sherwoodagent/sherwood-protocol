@@ -8,6 +8,7 @@ import {BatchExecutorLib} from "./BatchExecutorLib.sol";
 import {IChallengeGame} from "./interfaces/IChallengeGame.sol";
 import {IExposureLedger} from "./interfaces/IExposureLedger.sol";
 import {IStakedWood} from "./interfaces/IStakedWood.sol";
+import {IProposerBondEscrow} from "./interfaces/IProposerBondEscrow.sol";
 import {ISyndicateGovernor} from "./interfaces/ISyndicateGovernor.sol";
 import {ITokenCourt} from "./interfaces/ITokenCourt.sol";
 
@@ -1078,7 +1079,15 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             // order — see `IChallengeGame.Challenge`'s own note on why this
             // field sits last rather than grouped with the other `*AtFiling`
             // rates above.
-            inconclusiveBurnBpsAtFiling: _inconclusiveBurnBpsForRound(inconclusiveRounds[key])
+            inconclusiveBurnBpsAtFiling: _inconclusiveBurnBpsForRound(inconclusiveRounds[key]),
+            // The escrow that actually holds this proposal's proposer bond, off
+            // the same `getProposal` read `executedAt` and `vault` came from.
+            // Bound at propose time by the governor and never re-pointed for an
+            // existing proposal, so pinning it costs nothing and buys the same
+            // immunity 🟡F10 bought for the other two: a verdict up to a
+            // `disputeTimeout` later confiscates from the escrow the bond was
+            // locked in, not from whatever the governor's live slot says today.
+            proposerBondEscrow: p.proposerBondEscrow
         });
         _lastChallenge[key] = challengeId;
         _liveByChallenger[challengerKey] = challengeId;
@@ -1614,6 +1623,44 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
                 contested ? c.challenger : address(0),
                 contested ? c.convictionBountyBpsAtFiling : 0
             );
+
+            // §3.9's other side of the ledger: THE PROPOSER PAYS TOO. Every
+            // slash above falls on the approvers who UNDERWROTE the proposal;
+            // the proposer, who is the actual attacker in the threat model,
+            // posted a bond sized to what its proposal could extract and until
+            // this line could always get it back. `SyndicateGovernor` lets the
+            // proposer self-settle an hour after execution and reclaim from the
+            // terminal `Settled` state, so "wait for the verdict" was never a
+            // real constraint on it — the governor now holds the bond for the
+            // whole challenge window, and this is what makes that hold mean
+            // something. Confiscating one without the other is theatre in
+            // either direction.
+            //
+            // INSIDE THE `!_convicted` BRANCH, deliberately. A proposal has ONE
+            // liability and one bond; a second concurrent challenge reaching a
+            // verdict records `VerdictAlreadyCollected` and must not try to
+            // confiscate a bond the first one already took.
+            //
+            // BEST-EFFORT, for exactly the reason `demoteByChallenge` below is
+            // (review 🟠F11): a terminal path must not be hostage to a call
+            // that can fail. This one can, legitimately — the bond may have
+            // been reclaimed before the filing (a proposal challenged after its
+            // window and delay have both run is not reachable, but a zero-bond
+            // proposal and a re-pointed escrow both are), and an escrow that
+            // reverts would otherwise take the whole verdict with it: no slash,
+            // no bond returned to the challenger, coverage frozen forever and
+            // every accused approver barred from `claimUnstakeGuardian`. Losing
+            // the forfeiture is by far the smallest of those harms.
+            address bondEscrow = c.proposerBondEscrow;
+            if (bondEscrow != address(0)) {
+                try IProposerBondEscrow(bondEscrow).forfeitBond(governor, proposalId) returns (
+                    address bondProposer, uint256 bondAmount
+                ) {
+                    emit ProposerBondForfeited(challengeId, governor, proposalId, bondProposer, bondAmount);
+                } catch {
+                    emit ProposerBondForfeitureFailed(challengeId, governor, proposalId, bondEscrow);
+                }
+            }
         }
 
         // §3.4: "adapters demote only on a passed challenge" — and only the one
