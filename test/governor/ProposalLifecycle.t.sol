@@ -414,8 +414,17 @@ contract ProposalLifecycleTest is Test {
         assertEq(emitted, 0, "veto-rejection must NOT emit GuardianReviewResolved");
         _assertNoGuardianSlashing("veto never traversed guardian review");
 
-        (, bool reviewResolved,,) = registry.getReviewState(address(governor), pid);
-        assertFalse(reviewResolved, "registry review must stay unresolved - resolveReview must never be called");
+        // The review is CLOSED, not adjudicated. `assertFalse(resolved)` used to
+        // stand in for "resolveReview was never called", which held only while
+        // `resolveReview` was the sole writer of `resolved`. The terminal edge
+        // now also closes the review via `cancelReview` so it cannot be opened
+        // and slashed later, and that writes `resolved = true, blocked = false`
+        // without touching a bond. The property under test is unchanged and is
+        // asserted directly above and below: no `GuardianReviewResolved`, no
+        // slash. What must never happen is the review resolving as BLOCKED.
+        (, bool reviewResolved, bool reviewBlocked,) = registry.getReviewState(address(governor), pid);
+        assertTrue(reviewResolved, "a veto-rejected proposal's review must be closed, not left open to a keeper");
+        assertFalse(reviewBlocked, "closing must never adjudicate the review as blocked");
 
         // The commit still released the vault binding.
         _assertState(pid, ISyndicateGovernor.ProposalState.Rejected, "state stays Rejected after commit");
@@ -625,6 +634,75 @@ contract ProposalLifecycleTest is Test {
     // ──────────────────────────────────────────────────────────────
     // 7. Review-window registration is pushed at the Pending transition
     // ──────────────────────────────────────────────────────────────
+
+    /// @notice ZOMBIE REVIEWS. `registerReview` fires at the Draft -> Pending
+    ///         transition, so EVERY terminal path out of Pending leaves a live,
+    ///         open-able review behind unless it closes one. Only the
+    ///         GuardianReview branch of `cancelProposal` did.
+    ///
+    ///         Left open, a dead proposal's review can still be opened at
+    ///         `voteEnd`, voted on, and resolved — slashing guardians for
+    ///         endorsing something that can never execute — and each approve
+    ///         also books coverage that pins the approver's budget and blocks
+    ///         `claimUnstakeGuardian` until the bucket expires.
+    function test_cancelDuringPending_closesTheRegistryReview() public {
+        uint256 pid = _propose();
+        (uint64 ve,) = registry.reviewWindow(address(governor), pid);
+        assertGt(uint256(ve), 0, "a Pending proposal has a registered review");
+
+        vm.prank(agent);
+        governor.cancelProposal(pid);
+
+        (, bool resolved,,) = registry.getReviewState(address(governor), pid);
+        assertTrue(resolved, "cancelling out of Pending must close the review");
+
+        // The proof that matters: it can never be opened afterwards.
+        _warpPast(uint256(ve));
+        registry.openReview(address(governor), pid); // idempotent no-op
+        (bool opened,,,) = registry.getReviewState(address(governor), pid);
+        assertFalse(opened, "a cancelled proposal's review must never open");
+    }
+
+    /// @notice Same hazard on the owner's veto path.
+    function test_vetoProposal_closesTheRegistryReview() public {
+        uint256 pid = _propose();
+        (uint64 ve,) = registry.reviewWindow(address(governor), pid);
+
+        vm.prank(owner);
+        governor.vetoProposal(pid);
+
+        (, bool resolved,,) = registry.getReviewState(address(governor), pid);
+        assertTrue(resolved, "vetoing out of Pending must close the review");
+
+        _warpPast(uint256(ve));
+        registry.openReview(address(governor), pid);
+        (bool opened,,,) = registry.getReviewState(address(governor), pid);
+        assertFalse(opened, "a vetoed proposal's review must never open");
+    }
+
+    /// @notice And on the LP veto-rejection edge, which `_computeState` resolves
+    ///         passively with `reviewConcluded == false` — so nothing on the
+    ///         registry side was ever told the proposal died.
+    function test_lpVetoRejection_closesTheRegistryReview() public {
+        uint256 pid = _propose();
+        _voteAgainst(pid);
+        ISyndicateGovernor.StrategyProposal memory p = _proposal(pid);
+        _warpPast(p.voteEnd);
+
+        governor.resolveProposalState(pid);
+        _assertState(pid, ISyndicateGovernor.ProposalState.Rejected, "AGAINST weight rejects at voteEnd");
+
+        (, bool resolved,,) = registry.getReviewState(address(governor), pid);
+        assertTrue(resolved, "a veto-rejected proposal must not leave an open review");
+
+        registry.openReview(address(governor), pid);
+        (bool opened,,,) = registry.getReviewState(address(governor), pid);
+        assertFalse(opened, "a veto-rejected proposal's review must never open");
+
+        // The economic path stays closed exactly as before -- closing the review
+        // must not become a slash.
+        _assertNoGuardianSlashing("veto never traversed guardian review");
+    }
 
     /// @notice The governor pushes `(voteEnd, reviewEnd)` to the registry at the
     ///         transition INTO Pending: at propose time for a plain proposal, and

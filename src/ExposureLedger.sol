@@ -409,6 +409,21 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      guards its tolerant read that way.
     function _woodPrice() internal view returns (uint256 price, bool usingFallback) {
         AssetFeed storage f = _woodFeed;
+        // A REVERTING feed is a fourth degraded shape, and it was the one left
+        // unhandled. The three below model a feed that answers badly; an
+        // aggregator with no round published answers not at all ("No data
+        // present"), and so does a proxy whose implementation slot is zeroed.
+        // Unwrapped, that revert propagated out of every consumer of
+        // `slashableBondUsd`: each Approve vote, each tier-gated
+        // `executeProposal`, `settleCoverage` and `slashBpsFor`. Since
+        // `recordApproval` deliberately wraps only the ASSET-price read, a dead
+        // WOOD feed failed the VOTE — the block-only review this contract's
+        // review history exists to prevent. Falling back keeps the same
+        // fail-degraded stance the other three shapes already take.
+        //
+        // `code.length` FIRST: `try` cannot catch the extcodesize revert a
+        // high-level call to a codeless address raises in THIS frame, so a
+        // zeroed proxy would still propagate past the wrap below.
         address feed = f.feed;
         if (feed == address(0) || feed.code.length == 0) return (_haircut(woodUsdPriceX8), true);
         try IAggregatorMinimal(feed).latestRoundData() returns (
@@ -531,10 +546,16 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///         an abandoned one. It is not free — the manual number lags a crash
     ///         — so it is a degraded mode, not a resting state.
     ///
-    ///         `maxDelay` is ignored (and unconstrained) when unwiring; there is
-    ///         no feed to time out.
+    ///         UNWIRING MUST BE SPELLED `setWoodFeed(address(0), 0)`. There is no
+    ///         feed left to time out, so `maxDelay` carries no meaning here — but
+    ///         it is REQUIRED to be zero rather than merely ignored, so that a
+    ///         mis-typed feed address paired with a real delay reverts instead of
+    ///         silently dropping the ledger onto the governance price.
     function setWoodFeed(address feed, uint256 maxDelay) external onlyOwner {
         if (feed == address(0)) {
+            // `maxDelay` must be zero too: a mis-typed address paired with a real
+            // delay then reverts instead of silently unwiring the feed.
+            if (maxDelay != 0) revert InvalidParameter();
             delete _woodFeed;
             emit WoodFeedSet(address(0), 0);
             return;

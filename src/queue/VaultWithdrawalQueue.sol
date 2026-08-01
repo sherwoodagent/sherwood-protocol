@@ -51,6 +51,12 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
     Request[] private _requests; // index 0 unused (sentinel)
     mapping(address => uint256[]) private _byOwner;
     mapping(uint256 pid => SettlePrice) private _settlePrice;
+    /// @dev The pid of the most recent `stampSettlement`. Deposit claims price
+    ///      against THIS rather than the pid their request was tagged to — see
+    ///      the rationale in `claim`. Redeem claims deliberately keep their own
+    ///      pid's price, because their shares left the supply at that settlement
+    ///      and `_pidReserved` is denominated against it.
+    uint256 private _lastStampedPid;
     /// @notice Redeem shares still queued per proposal. Incremented at
     ///         `queueRedeem`, decremented at `cancel` (pre-stamp) and at `claim`
     ///         (post-stamp). Reaching 0 after stamp means the proposal is fully
@@ -159,6 +165,7 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
         sp.num = num;
         sp.den = den;
         sp.stamped = true;
+        _lastStampedPid = pid;
         uint256 redeemShares = _pidRedeemShares[pid];
         if (redeemShares != 0 && den != 0) {
             uint256 reservedForPid = Math.mulDiv(redeemShares, num, den);
@@ -212,8 +219,31 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
             _reservedAssets = reserved > release ? reserved - release : 0;
             IRequestableVault(vault).settleRedeem(amount, outAmount, r.owner);
         } else {
+            // PRICED AT THE LATEST SETTLEMENT, not at the request's own pid.
+            //
+            // A queued deposit has no claim deadline and `cancel` shuts once its
+            // proposal stamps, so waiting is strictly free. Pricing at the
+            // request's frozen pid therefore handed the depositor a perpetual
+            // look-back call on the vault's NAV: hold the request, watch the
+            // next proposal settle, and claim only when the OLD price mints
+            // more shares — diluting incumbents by the difference, repeatably,
+            // and across several requests at once by exercising only the
+            // favourable ones.
+            //
+            // The escrowed assets sat in this contract the whole time and never
+            // entered the strategy, so the honest price is the one prevailing
+            // when they actually join the pool. Claims are already confined to
+            // the gap between proposals (`redemptionsLocked` above), and in that
+            // gap the current share price IS the latest stamp. With no later
+            // settlement this is the request's own pid and nothing changes.
+            //
+            // Redeem (above) keeps its own pid deliberately: those shares left
+            // the supply at that settlement and `_pidReserved` is denominated
+            // against that same price.
+            SettlePrice memory dp = _settlePrice[_lastStampedPid];
+            if (!dp.stamped) dp = sp; // defensive; `sp.stamped` was required above
             // shares = assets * den / num (matches ERC-4626 convertToShares at settle)
-            outAmount = Math.mulDiv(amount, sp.den, sp.num);
+            outAmount = Math.mulDiv(amount, dp.den, dp.num);
             _pendingDepositAssets -= amount;
             // Push escrowed assets into the vault, then mint at the frozen price.
             IERC20(IRequestableVault(vault).asset()).safeTransfer(vault, amount);

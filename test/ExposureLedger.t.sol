@@ -37,15 +37,17 @@ contract MockFeed {
     }
 }
 
-/// @dev An aggregator that answers `decimals()` (so it can be wired) and then
-///      REVERTS on every price read — a proxy pointed at a dead implementation,
-///      a paused feed, an address that stopped being an aggregator. Distinct
-///      from the stale and unset cases the ledger already handled.
+/// @dev A wired-but-data-less Chainlink aggregator: answers `decimals()` (so it
+///      can be wired) and then REVERTS on every price read. A fresh proxy with
+///      no round published reverts `"No data present"`; a proxy pointed at a
+///      dead implementation, a paused feed, or an address that stopped being an
+///      aggregator behave the same way. None is one of the three degraded shapes
+///      `_woodPrice` originally handled (unset / non-positive / stale).
 contract RevertingFeed {
     uint8 public constant decimals = 8;
 
     function latestRoundData() external pure returns (uint80, int256, uint256, uint256, uint80) {
-        revert("aggregator down");
+        revert("No data present");
     }
 }
 
@@ -904,6 +906,110 @@ contract ExposureLedgerTest is Test {
         uint256 total = ledger.allocatedUsd(address(mgov), 1, g2) + ledger.allocatedUsd(address(mgov), 1, g3);
         assertEq(total, 1_000e18, "the survivors carry all of it, residue included");
         ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 1_000e6);
+    }
+
+    /// @notice The residue top-up exists for `_allocate`'s truncation dust. But
+    ///         `_allocate` returns each reservation UNSCALED whenever
+    ///         `effectiveTotal <= needUsd`, and the early return above it guards
+    ///         `reservedTotal`, not `effectiveTotal`. Between those two a cohort
+    ///         whose bonds shrank after the vote lands in a regime where
+    ///         `assigned` is the cohort's whole ability to pay, so
+    ///         `needUsd - assigned` is a genuine coverage SHORTFALL — not dust.
+    ///
+    ///         Crediting it to the first holder books exposure that guardian
+    ///         never reserved, above its own `kNumerator * slashableBondUsd`
+    ///         cap, which freezes its approve budget and its unstake claim for
+    ///         the rest of the bucket's life. The victim is attacker-selectable:
+    ///         `releaseApproval`'s swap-and-pop chooses who sits at index 0.
+    function test_settleCoverage_shortfallIsNotBookedOnTheFirstHolder() public {
+        _wireRecording();
+        address g2 = makeAddr("g2");
+        swood.setStake(g2, 100_000e18); // $5,000 -> reserves the full $1,000
+        mgov.set(1_000e6); // needUsd = $1,000
+        mgov.setSchedule(block.timestamp + 1 days, 3 days);
+
+        vm.startPrank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        ledger.recordApproval(address(mgov), 1, g2);
+        vm.stopPrank();
+        // reservedTotal = $2,000 > needUsd, so settle does NOT take the
+        // under-subscribed early return -- this is the gap the guard misses.
+        assertEq(ledger.openExposureUsd(guardian), 1_000e18, "reserved the full coverage");
+
+        skip(31 days); // review shut, past executeBy
+
+        // Both bonds fall to $200 (WOOD decline / partial unstake), so
+        // effectiveTotal = $400 <= needUsd and `_allocate` scales nothing.
+        swood.setStake(guardian, 4_000e18);
+        swood.setStake(g2, 4_000e18);
+
+        ledger.settleCoverage(address(mgov), 1);
+
+        // Each guardian carries exactly what it can pay. The $600 the cohort
+        // cannot cover stays uncovered -- booking it on someone invents
+        // collateral nobody pledged, which is the same reasoning `_allocate`
+        // already applies when it refuses to scale UP.
+        assertEq(ledger.openExposureUsd(guardian), 200e18, "first holder carries only its own ability to pay");
+        assertEq(ledger.openExposureUsd(g2), 200e18, "second holder unchanged");
+
+        // The invariant that makes this a bug and not an accounting preference:
+        // booked exposure must never exceed the guardian's own coverage cap.
+        assertLe(
+            ledger.openExposureUsd(guardian),
+            ledger.kNumerator() * ledger.slashableBondUsd(guardian),
+            "booked exposure must stay within the guardian's own cap"
+        );
+    }
+
+    /// @notice `_woodPrice` degrades to the governance fallback on an unset
+    ///         feed, a non-positive answer and a stale answer — but the read
+    ///         itself was unwrapped, so a feed that REVERTS propagated instead.
+    ///         A fresh aggregator with no round published is exactly that shape,
+    ///         and it is the shape the first WOOD/USD wiring will have (there is
+    ///         no WOOD feed on Robinhood today).
+    ///
+    ///         Unhandled, it halts far more than pricing: every Approve vote,
+    ///         every tier-gated `executeProposal`, `settleCoverage` and
+    ///         `slashBpsFor` route through `slashableBondUsd`. `recordApproval`
+    ///         deliberately wraps only the ASSET-price read, so the WOOD read
+    ///         reverting fails the vote — reproducing the block-only review that
+    ///         three review rounds existed to eliminate.
+    function test_woodPrice_fallsBackWhenTheFeedReverts() public {
+        RevertingFeed dead = new RevertingFeed();
+        vm.prank(owner);
+        ledger.setWoodFeed(address(dead), 1 days);
+
+        (uint256 price, bool usingFallback) = ledger.woodPriceDetail();
+        assertTrue(usingFallback, "a reverting feed is a degraded feed, not a fatal one");
+        assertEq(price, 0.05e8, "falls back to the governance price");
+
+        // The property that matters: bonds still price, so approvals still work.
+        swood.setStake(guardian, 100_000e18);
+        assertEq(ledger.slashableBondUsd(guardian), 5_000e18, "bond still priceable through the outage");
+    }
+
+    /// @notice Recovery must not require deploying a substitute aggregator.
+    ///         `setWoodFeed` rejected `address(0)`, so once a bad feed was
+    ///         wired there was no transaction that returned the ledger to its
+    ///         governance fallback.
+    function test_setWoodFeed_canClearBackToTheFallback() public {
+        RevertingFeed dead = new RevertingFeed();
+        vm.startPrank(owner);
+        ledger.setWoodFeed(address(dead), 1 days);
+        ledger.setWoodFeed(address(0), 0); // clear
+        vm.stopPrank();
+
+        (uint256 price, bool usingFallback) = ledger.woodPriceDetail();
+        assertTrue(usingFallback, "cleared feed reads the fallback");
+        assertEq(price, 0.05e8, "governance price restored");
+    }
+
+    /// @notice Clearing is an explicit two-zero move, so a mis-typed maxDelay
+    ///         alongside a zero feed is still rejected.
+    function test_setWoodFeed_zeroFeedWithNonZeroDelayReverts() public {
+        vm.prank(owner);
+        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
+        ledger.setWoodFeed(address(0), 1 days);
     }
 
     // ── WOOD price: Chainlink feed with a governance fallback ─────────────

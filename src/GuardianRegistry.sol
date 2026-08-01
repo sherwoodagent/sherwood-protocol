@@ -382,6 +382,61 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         totalApproveWeight = _reviews[key].approveStakeWeight;
     }
 
+    /// @inheritdoc IGuardianRegistry
+    /// @dev THE WEIGHT THE FEE SHOULD BE PAID ON (§3.10). `getApproverWeights`
+    ///      above returns `_voteStake` — how much WOOD the approver had staked,
+    ///      which is what they PARKED, not what they UNDERWROTE. Distribution
+    ///      keyed off that pays for staking, and lets an approver who booked no
+    ///      coverage earn beside one who booked the full amount.
+    ///
+    ///      That divergence is reachable, not theoretical. `recordApproval`
+    ///      deliberately books nothing and returns WITHOUT reverting when the
+    ///      guardian has no free budget (`open >= capUsd`), when the asset feed
+    ///      is unpriceable, when coverage is zero, or when settlement is beyond
+    ///      `MAX_COVERAGE_HORIZON` — review N1 chose that over failing the vote,
+    ///      because reverting silenced the approve side and revived the C1 veto.
+    ///      The registry still pushes the voter into `_approvers` (that push
+    ///      happens BEFORE the ledger hook), so the vote counts for attribution
+    ///      whether or not a dollar was booked. A guardian can therefore spend
+    ///      its whole budget on one proposal and keep approving everything else
+    ///      at full stake weight, underwriting nothing further.
+    ///
+    ///      Returns the ledger's ALLOCATION — each approver's settled pro-rata
+    ///      share — rather than their reservation. Reservations are deliberately
+    ///      equal to the full coverage per approver (so nobody can squat the
+    ///      book), so paying on them over-pays every approver on an
+    ///      over-subscribed proposal. Allocations require `settleCoverage` to
+    ///      have run; it is permissionless, so the payout job should call it
+    ///      before reading this rather than paying on the un-scaled figure.
+    ///
+    ///      `priced` is FALSE when the ledger could not value the coverage (a
+    ///      stale or unconfigured asset feed makes `allocatedUsd` revert). The
+    ///      caller MUST retry rather than treat the zeros as a result: silently
+    ///      paying zero to every approver through a feed outage would be a worse
+    ///      failure than the one this view exists to fix. An unwired ledger
+    ///      returns all-zero with `priced == true` — in that configuration there
+    ///      is genuinely no coverage to attribute.
+    function getApproverCoverage(address governor, uint256 proposalId)
+        external
+        view
+        returns (address[] memory approvers, uint256[] memory coverageUsd, bool priced)
+    {
+        bytes32 key = _reviewKey(governor, proposalId);
+        approvers = _approvers[key];
+        uint256 n = approvers.length;
+        coverageUsd = new uint256[](n);
+        IExposureLedger led = exposureLedger;
+        if (address(led) == address(0)) return (approvers, coverageUsd, true);
+        for (uint256 i = 0; i < n; i++) {
+            try led.allocatedUsd(governor, proposalId, approvers[i]) returns (uint256 v) {
+                coverageUsd[i] = v;
+            } catch {
+                return (approvers, new uint256[](n), false);
+            }
+        }
+        priced = true;
+    }
+
     // ──────────────────────────────────────────────────────────────
     // Guardian review voting
     // ──────────────────────────────────────────────────────────────
@@ -900,6 +955,12 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         if (!_authorizedGovernors.contains(governor)) revert UnauthorizedGovernor();
         bytes32 eKey = _reviewKey(governor, proposalId);
         EmergencyReview storage er = _emergencyReviews[eKey];
+        // Mirrors `voteOnProposal`'s `resolved` guard. The `reviewEnd` test
+        // alone is NOT sufficient here: `cancelEmergency` repurposes `reviewEnd`
+        // as a post-cancel cooldown deadline (Sherlock #15), so for a whole
+        // `reviewPeriod` after a cancel `block.timestamp < er.reviewEnd` still
+        // holds and votes were accepted into an already-resolved review.
+        if (er.resolved) revert ReviewNotOpen();
         if (er.reviewEnd == 0 || block.timestamp >= er.reviewEnd) revert ReviewNotOpen();
         if (!swood.isActiveGuardian(msg.sender)) revert NotActiveGuardian();
         uint8 nonce = er.nonce;

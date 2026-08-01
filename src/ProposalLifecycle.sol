@@ -261,7 +261,36 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
                 bool blocked = IGuardianRegistry(_guardianRegistry).resolveReview(address(this), p.id);
                 emit GuardianReviewResolved(p.id, blocked);
             }
+        } else if (stored != resolved && (resolved == ProposalState.Rejected || resolved == ProposalState.Expired)) {
+            // Terminal WITHOUT a concluded review — the LP veto-rejection edge
+            // and the Pending/Approved -> Expired edges. The review was
+            // registered at the Draft -> Pending transition and nothing else
+            // ever closes it, so without this a keeper can still `openReview`
+            // it at `voteEnd` and slash guardians for approving a proposal that
+            // can never execute.
+            _closeReviewIfRegistered(p);
         }
+    }
+
+    /// @dev Close a registered guardian review whose proposal died before
+    ///      execution. `registerReview` fires at the Draft -> Pending
+    ///      transition, so every terminal path out of Pending leaves an entry a
+    ///      keeper could otherwise open at `voteEnd`; a review opened on a dead
+    ///      proposal still slashes its approvers, and each approve still books
+    ///      coverage that pins their budget and their `claimUnstakeGuardian`.
+    ///
+    ///      BEST EFFORT, deliberately. `cancelReview` reverts once block quorum
+    ///      is reached (Sherlock run #2 #2, the anti-dodge guard) and once
+    ///      `reviewEnd` has elapsed. Neither may brick a terminal transition,
+    ///      and swallowing preserves both guards exactly: a review that refuses
+    ///      to cancel is precisely one that SHOULD still resolve and slash.
+    ///
+    ///      Guarded on the same `reviewEnd > voteEnd` predicate the
+    ///      `registerReview` call sites use — a collapsed window was never
+    ///      registered, so there is nothing to close.
+    function _closeReviewIfRegistered(StrategyProposal storage p) internal {
+        if (p.reviewEnd <= p.voteEnd) return;
+        try IGuardianRegistry(_guardianRegistry).cancelReview(p.id) {} catch {}
     }
 
     /// @dev Release a vault binding and stamp the settlement clock.

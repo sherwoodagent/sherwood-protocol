@@ -508,6 +508,13 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         if (s == ProposalState.Pending) {
             // Pending: only during the voting period.
             if (block.timestamp > proposal.voteEnd) revert ProposalNotCancellable();
+            // The review was registered at the Draft -> Pending transition, so
+            // it must be closed here too — otherwise a keeper opens it at
+            // `voteEnd` and guardians are slashed for approving a proposal that
+            // is already Cancelled. Best-effort (see `_closeReviewIfRegistered`);
+            // in this branch `block.timestamp <= voteEnd < reviewEnd` and the
+            // review cannot yet be open, so it takes the never-opened path.
+            _closeReviewIfRegistered(proposal);
             _decOpen();
         } else if (s == ProposalState.GuardianReview) {
             // Close the registry-side review BEFORE marking the proposal
@@ -550,6 +557,10 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // otherwise a cancelled Draft soft-locks the vault (every later
         // propose reverts VaultHasOpenProposal).
         if (s != ProposalState.Pending && s != ProposalState.Draft) revert ProposalNotCancellable();
+        // Pending carries a registered review (Draft does not — the window is
+        // pushed on the Draft -> Pending transition, and the guard inside
+        // `_closeReviewIfRegistered` no-ops for the Draft case).
+        _closeReviewIfRegistered(proposal);
         _decOpen();
         _transition(proposal, ProposalState.Cancelled);
         emit ProposalCancelled(proposalId, msg.sender);
@@ -604,6 +615,10 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         _requireVaultOwner(proposal.vault);
         if (_commitState(proposal) != ProposalState.Pending) revert ProposalNotCancellable();
         _transition(proposal, ProposalState.Rejected);
+        // Same registered-review cleanup as the Pending branch of
+        // `cancelProposal`: a vetoed proposal can never execute, so its review
+        // must not stay open for a keeper to slash its approvers on.
+        _closeReviewIfRegistered(proposal);
         // `_activeProposal` is unset during Pending (only set by execute).
         _decOpen();
         emit ProposalVetoed(proposalId, msg.sender);

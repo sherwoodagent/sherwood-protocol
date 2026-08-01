@@ -568,6 +568,93 @@ contract PortfolioStrategyTest is Test {
         strategy.updateParams(abi.encode(new uint256[](0), uint256(200), new bytes[](0)));
     }
 
+    /// @notice The `> 0` sentinel means "keep the current value" — it was never
+    ///         a monotonicity guard. So the proposer could raise the tolerance
+    ///         to 99.99% AFTER the proposal was reviewed and executed, then
+    ///         self-settle into a sandwich they control: every floor in
+    ///         `execute` / `settle` / `rebalance` / `rebalanceDelta` collapses to
+    ///         a rounding error. `VeniceInferenceStrategy` already floors its
+    ///         equivalent relaxation (Sherlock #49); this is the same class.
+    function test_updateParams_slippageCannotBeLoosened() public {
+        _executeStrategy();
+        assertEq(strategy.maxSlippageBps(), MAX_SLIPPAGE, "fixture starts at 1%");
+
+        vm.prank(proposer);
+        vm.expectRevert(PortfolioStrategy.InvalidSlippage.selector);
+        strategy.updateParams(abi.encode(new uint256[](0), uint256(MAX_SLIPPAGE + 1), new bytes[](0)));
+
+        assertEq(strategy.maxSlippageBps(), MAX_SLIPPAGE, "tolerance unchanged after a rejected loosen");
+    }
+
+    /// @notice Tightening stays available — the guard bounds the direction, not
+    ///         the ability to react.
+    function test_updateParams_slippageCanBeTightened() public {
+        _executeStrategy();
+
+        vm.prank(proposer);
+        strategy.updateParams(abi.encode(new uint256[](0), uint256(MAX_SLIPPAGE - 1), new bytes[](0)));
+
+        assertEq(strategy.maxSlippageBps(), MAX_SLIPPAGE - 1, "tightening is allowed");
+    }
+
+    /// @notice `_quoteMinOut` prices the SAME route it is about to swap, so the
+    ///         floor tracks whatever pool the route names. Rewriting the route
+    ///         after approval moves the floor with it, and the slippage ceiling
+    ///         cannot bound that — the ceiling is applied to the attacker's own
+    ///         quote. Routes are reviewed as part of the proposal, so they are
+    ///         frozen once it executes.
+    function test_updateParams_routesAreFrozenAfterExecute() public {
+        _executeStrategy();
+        bytes[] memory routesBefore = strategy.getSwapExtraData();
+
+        bytes[] memory hostileRoutes = new bytes[](3);
+        for (uint256 i; i < 3; ++i) {
+            hostileRoutes[i] = abi.encode(uint24(10_000)); // a fee tier the proposer seeded
+        }
+
+        vm.prank(proposer);
+        vm.expectRevert(PortfolioStrategy.RoutesFrozen.selector);
+        strategy.updateParams(abi.encode(new uint256[](0), uint256(0), hostileRoutes));
+
+        bytes[] memory routesAfter = strategy.getSwapExtraData();
+        for (uint256 i; i < 3; ++i) {
+            assertEq(routesAfter[i], routesBefore[i], "route must be unchanged");
+        }
+    }
+
+    /// @notice The init bound was only `< BPS_DENOMINATOR`, so a proposal could
+    ///         seat a 99.99% tolerance from the very start and never need to
+    ///         relax it — the tighten-only guard alone would not have helped.
+    function test_initialize_rejectsSlippageAboveTheProtocolCeiling() public {
+        PortfolioStrategy fresh = PortfolioStrategy(Clones.clone(address(template)));
+
+        address[] memory tokens = new address[](3);
+        tokens[0] = address(tsla);
+        tokens[1] = address(amzn);
+        tokens[2] = address(nflx);
+        uint256[] memory weights = new uint256[](3);
+        weights[0] = 4000;
+        weights[1] = 3500;
+        weights[2] = 2500;
+        bytes[] memory extraData = new bytes[](3);
+
+        bytes memory initData = abi.encode(
+            address(weth),
+            address(adapter),
+            address(verifier),
+            tokens,
+            weights,
+            TOTAL_AMOUNT,
+            fresh.MAX_SLIPPAGE_CEILING_BPS() + 1,
+            extraData,
+            _pd(tokens.length),
+            _feedIdsFor(tokens.length)
+        );
+
+        vm.expectRevert(PortfolioStrategy.InvalidSlippage.selector);
+        fresh.initialize(vault, proposer, initData);
+    }
+
     // ==================== REBALANCE (SIMPLE) ====================
 
     function test_rebalance() public {
