@@ -15,6 +15,7 @@ import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
+import {IProtocolConfig} from "../../src/interfaces/IProtocolConfig.sol";
 
 /// @title PerVaultParams.t
 /// @notice Task 21 — per-vault governance parameters:
@@ -47,7 +48,6 @@ contract PerVaultParamsTest is Test {
         protocolConfig = new ProtocolConfig(owner);
         vm.startPrank(owner);
         protocolConfig.setProtocolFeeRecipient(protocolRecipient);
-        protocolConfig.setProtocolFeeBps(100); // 1% at propose time
         vm.stopPrank();
 
         usdc = new ERC20Mock("USD Coin", "USDC", 6);
@@ -127,6 +127,72 @@ contract PerVaultParamsTest is Test {
             new ISyndicateGovernor.CoProposer[](0)
         );
         vm.warp(vm.getBlockTimestamp() + 1);
+    }
+
+    // ── Two-number fee model: split snapshots ──
+
+    /// @notice A split change after propose must not reach an in-flight
+    ///         proposal — the same immutability the fee *rates* above already
+    ///         have. Without this, governance could re-price a proposal
+    ///         voters had already approved.
+    function test_splitChangeAfterProposeDoesNotAffectTheInFlightProposal() public {
+        uint256 proposalId = _propose();
+
+        vm.startPrank(owner);
+        protocolConfig.setMgmtSplit(IProtocolConfig.MgmtSplit({agentBps: 5000, protocolBps: 3000, guardianBps: 2000}));
+        protocolConfig.setPerfSplit(
+            IProtocolConfig.PerfSplit({agentBps: 2500, protocolBps: 2500, guardianBps: 2500, ownerBps: 2500})
+        );
+        vm.stopPrank();
+
+        ISyndicateGovernor.StrategyProposal memory p = governor.getProposal(proposalId);
+
+        assertEq(p.snapshotMgmtSplit.agentBps, 7000, "mgmt agent share must hold at the propose-time value");
+        assertEq(p.snapshotMgmtSplit.protocolBps, 2000);
+        assertEq(p.snapshotMgmtSplit.guardianBps, 1000);
+
+        assertEq(p.snapshotPerfSplit.agentBps, 6000, "perf agent share must hold at the propose-time value");
+        assertEq(p.snapshotPerfSplit.protocolBps, 1500);
+        assertEq(p.snapshotPerfSplit.guardianBps, 1500);
+        assertEq(p.snapshotPerfSplit.ownerBps, 1000);
+    }
+
+    /// @notice The mirror case: a change made BEFORE propose must be picked up,
+    ///         or the snapshot would be a frozen constant rather than a
+    ///         snapshot.
+    function test_splitChangeBeforeProposeIsPickedUpByTheNextProposal() public {
+        vm.startPrank(owner);
+        protocolConfig.setMgmtSplit(IProtocolConfig.MgmtSplit({agentBps: 5000, protocolBps: 3000, guardianBps: 2000}));
+        protocolConfig.setPerfSplit(
+            IProtocolConfig.PerfSplit({agentBps: 2500, protocolBps: 2500, guardianBps: 2500, ownerBps: 2500})
+        );
+        vm.stopPrank();
+
+        uint256 proposalId = _propose();
+        ISyndicateGovernor.StrategyProposal memory p = governor.getProposal(proposalId);
+
+        assertEq(p.snapshotMgmtSplit.agentBps, 5000);
+        assertEq(p.snapshotMgmtSplit.protocolBps, 3000);
+        assertEq(p.snapshotMgmtSplit.guardianBps, 2000);
+
+        assertEq(p.snapshotPerfSplit.agentBps, 2500);
+        assertEq(p.snapshotPerfSplit.ownerBps, 2500);
+    }
+
+    /// @dev Whatever was snapshotted must still divide a fee cleanly.
+    function test_snapshottedSplitsSumToFullBasisPoints() public {
+        uint256 proposalId = _propose();
+        ISyndicateGovernor.StrategyProposal memory p = governor.getProposal(proposalId);
+
+        assertEq(
+            uint256(p.snapshotMgmtSplit.agentBps) + p.snapshotMgmtSplit.protocolBps + p.snapshotMgmtSplit.guardianBps,
+            10_000
+        );
+        assertEq(
+            uint256(p.snapshotPerfSplit.agentBps) + p.snapshotPerfSplit.protocolBps + p.snapshotPerfSplit.guardianBps
+                + p.snapshotPerfSplit.ownerBps,
+            10_000
+        );
     }
 
     function _settleThrough(uint256 proposalId) internal {
@@ -210,12 +276,22 @@ contract PerVaultParamsTest is Test {
     // 3. Fee snapshot at propose beats a post-vote config change
     // ──────────────────────────────────────────────────────────────
 
-    function test_settleUsesSnapshotNotUpdatedConfig() public {
-        uint256 proposalId = _propose(); // snapshots 100 bps
+    /// @notice A post-vote config change must not reach an in-flight proposal.
+    /// @dev Originally pulled `protocolFeeBps`, which no longer exists — the
+    ///      protocol is paid a SHARE of each fee now, not a standalone rate off
+    ///      gross profit (design.md Decision 9). Repointed at the split, which
+    ///      is the lever carrying that meaning today: swinging the protocol to
+    ///      90% mid-flight must not change what this proposal pays, because the
+    ///      split was snapshotted at propose.
+    function test_settleIgnoresPostVoteProtocolRateChange() public {
+        uint256 proposalId = _propose();
 
-        // Config jumps to the 10% max AFTER voters saw 1%.
+        // Swing the protocol's share to nearly the whole fee AFTER voters saw
+        // 20%. The old version of this test raised `protocolFeeBps`, which no
+        // longer exists — the split IS the protocol's rate now, so this is the
+        // lever that carries the same meaning.
         vm.prank(owner);
-        protocolConfig.setProtocolFeeBps(1000);
+        protocolConfig.setMgmtSplit(IProtocolConfig.MgmtSplit({agentBps: 500, protocolBps: 9000, guardianBps: 500}));
 
         // 10k profit lands mid-strategy.
         vm.prank(lp1);
@@ -227,7 +303,11 @@ contract PerVaultParamsTest is Test {
         vm.prank(agent);
         governor.settleProposal(proposalId);
 
-        // Protocol fee = 1% of 10k (the snapshot), NOT 10%.
-        assertEq(usdc.balanceOf(protocolRecipient), 100e6, "settle charges the propose-time snapshot");
+        uint256 paid = usdc.balanceOf(protocolRecipient);
+        assertGt(paid, 0, "the protocol is still paid, at its snapshotted share");
+        // Under the snapshotted 20% the protocol takes 15% of a 20% performance
+        // fee on the 10k gain — a few hundred. Had the post-vote 90% split
+        // applied it would be an order of magnitude larger.
+        assertLt(paid, 1_000e6, "and never at the post-vote split");
     }
 }

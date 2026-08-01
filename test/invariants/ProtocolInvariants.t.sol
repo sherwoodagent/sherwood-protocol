@@ -152,7 +152,6 @@ contract ProtocolInvariantsTest is StdInvariant, Test {
             protocolConfig = new ProtocolConfig(governorOwner);
             vm.startPrank(governorOwner);
             protocolConfig.setProtocolFeeRecipient(initialFeeRecipient);
-            protocolConfig.setProtocolFeeBps(INITIAL_PROTOCOL_FEE_BPS);
             vm.stopPrank();
         }
 
@@ -302,11 +301,12 @@ contract ProtocolInvariantsTest is StdInvariant, Test {
             uint256 maxPerf = governor.getGovernorParams().maxPerformanceFeeBps;
             if (perfFeeBps > maxPerf) perfFeeBps = maxPerf;
             assertLe(perfFeeBps, MAX_PERF_FEE_BPS, "INV-2: perf fee bps exceeds cap");
-            assertLe(protocolConfig.protocolFeeBps(), 10_000, "INV-2: protocol fee bps out of range");
-            // Sum of all bps must not exceed 10_000 (would take >100% of
-            // gross profit; nonsense state).
-            uint256 totalBps = perfFeeBps + protocolConfig.protocolFeeBps();
-            assertLe(totalBps, 10_000, "INV-2: total fee bps > 100%");
+            // The old sum-of-rates check added `protocolFeeBps` and
+            // `guardianFeeBps` here; both are gone with the two-number fee
+            // model. Those parties are now paid a SHARE of the performance fee,
+            // so the clamped rate above IS the whole profit-side take and
+            // bounding it is the complete check.
+            assertLe(perfFeeBps, 10_000, "INV-2: total fee bps > 100%");
         }
     }
 
@@ -439,12 +439,15 @@ contract ProtocolInvariantsTest is StdInvariant, Test {
     ///         the `_validateForFinalize` re-check actually holds under
     ///         adversarial ordering (queue bps → queue recipient-zero
     ///         attempt → finalize, etc.).
-    function invariant_protocolFeeRecipientNonZero() public view {
-        if (protocolConfig.protocolFeeBps() > 0) {
-            assertTrue(
-                protocolConfig.protocolFeeRecipient() != address(0), "INV-30: protocolFeeBps > 0 but recipient is zero"
-            );
-        }
+    /// @dev Previously gated on `protocolFeeBps > 0`. That rate is gone with the
+    ///      two-number fee model, and a zero recipient is now legal — it unwires
+    ///      the protocol leg, folding its share into the agent's remainder
+    ///      rather than escrowing against address(0). What survives is the
+    ///      weaker property: the recipient is always readable, so no sequence of
+    ///      handler actions can leave the config in a state settlement cannot
+    ///      resolve.
+    function invariant_protocolFeeRecipientReadable() public view {
+        protocolConfig.protocolFeeRecipient();
     }
 
     // ──────────────────────────────────────────────────────────────

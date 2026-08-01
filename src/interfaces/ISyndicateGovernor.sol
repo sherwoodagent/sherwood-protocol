@@ -2,6 +2,7 @@
 pragma solidity 0.8.28;
 
 import {BatchExecutorLib} from "../BatchExecutorLib.sol";
+import {IProtocolConfig} from "./IProtocolConfig.sol";
 
 interface ISyndicateGovernor {
     // ── Enums ──
@@ -101,9 +102,22 @@ interface ISyndicateGovernor {
         ///      moving the rejection threshold.
         uint256 vetoThresholdBps;
         // ── Fee snapshot (read from ProtocolConfig at propose time) ──
-        uint256 snapshotProtocolFeeBps;
+        /// @dev Only the RECIPIENTS are snapshotted. The protocol and guardian
+        ///      SHARES come from `snapshotMgmtSplit` / `snapshotPerfSplit`
+        ///      below; the standalone `snapshotProtocolFeeBps` /
+        ///      `snapshotGuardianFeeBps` fields that used to sit here are gone
+        ///      with the two-number fee model — both were write-only.
+        ///
+        ///      They occupied struct slots 17 and 19, so removing them shifts
+        ///      every later member down two slots. `_proposals` is a mapping
+        ///      laid out by member index and the governor is a `BeaconProxy`,
+        ///      so upgrading a governor that already held proposals would
+        ///      re-read them against the new offsets. This ships as a FRESH
+        ///      DEPLOYMENT — no proposal predates the change — which is what
+        ///      makes the removal safe. A later release must not repeat this
+        ///      shape of change without first draining or migrating every
+        ///      existing proposal.
         address snapshotProtocolFeeRecipient;
-        uint256 snapshotGuardianFeeBps;
         address snapshotGuardiansFeeRecipient;
         /// @notice `IStrategy.selfManagesFees()` snapshotted at propose time (like
         ///         performanceFeeBps). Read from storage at settle so a non-pure
@@ -140,6 +154,15 @@ interface ISyndicateGovernor {
         ///         escrow only applies to proposals created after the change.
         ///         Zero when no bond was locked.
         address proposerBondEscrow;
+        /// @notice Management-fee split snapshotted from `ProtocolConfig` at
+        ///         propose time, for the same reason every other fee field here
+        ///         is snapshotted: a governance change after propose must not
+        ///         alter what an in-flight proposal pays. Three `uint16`s, one
+        ///         slot.
+        IProtocolConfig.MgmtSplit snapshotMgmtSplit;
+        /// @notice Performance-fee split snapshotted at propose time. Four
+        ///         `uint16`s, one slot.
+        IProtocolConfig.PerfSplit snapshotPerfSplit;
     }
 
     struct CoProposer {
@@ -318,6 +341,17 @@ interface ISyndicateGovernor {
     ///         detect the divergence. `snapshotted`/`clamped` are indexed (cheap
     ///         topics, no memory encoding) so the dual emit stays under budget.
     event FeeClamped(uint256 indexed proposalId, uint256 indexed snapshotted, uint256 indexed clamped);
+
+    /// @notice The always-on management fee charged at settlement.
+    /// @param assetSeconds The integral the fee was computed from, so an
+    ///        indexer can reconstruct the effective rate and the average base
+    ///        without replaying every flow.
+    event ManagementFeeCharged(uint256 indexed proposalId, address indexed asset, uint256 amount, uint256 assetSeconds);
+
+    /// @notice The performance fee charged at settlement.
+    /// @param aboveMark Value above the high-water mark that the fee was
+    ///        computed on — not the proposal's raw profit.
+    event PerformanceFeeCharged(uint256 indexed proposalId, address indexed asset, uint256 amount, uint256 aboveMark);
 
     event VoteCast(uint256 indexed proposalId, address indexed voter, VoteType support, uint256 weight);
 

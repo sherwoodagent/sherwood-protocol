@@ -272,6 +272,52 @@
         "type": "t_uint256"
       }
     ],
+    "t_struct(MgmtSplit)_storage": [
+      {
+        "label": "agentBps",
+        "slot": "0",
+        "offset": 0,
+        "type": "t_uint16"
+      },
+      {
+        "label": "protocolBps",
+        "slot": "0",
+        "offset": 2,
+        "type": "t_uint16"
+      },
+      {
+        "label": "guardianBps",
+        "slot": "0",
+        "offset": 4,
+        "type": "t_uint16"
+      }
+    ],
+    "t_struct(PerfSplit)_storage": [
+      {
+        "label": "agentBps",
+        "slot": "0",
+        "offset": 0,
+        "type": "t_uint16"
+      },
+      {
+        "label": "protocolBps",
+        "slot": "0",
+        "offset": 2,
+        "type": "t_uint16"
+      },
+      {
+        "label": "guardianBps",
+        "slot": "0",
+        "offset": 4,
+        "type": "t_uint16"
+      },
+      {
+        "label": "ownerBps",
+        "slot": "0",
+        "offset": 6,
+        "type": "t_uint16"
+      }
+    ],
     "t_struct(StrategyProposal)_storage": [
       {
         "label": "id",
@@ -376,70 +422,70 @@
         "type": "t_uint256"
       },
       {
-        "label": "snapshotProtocolFeeBps",
+        "label": "snapshotProtocolFeeRecipient",
         "slot": "17",
         "offset": 0,
-        "type": "t_uint256"
+        "type": "t_address"
       },
       {
-        "label": "snapshotProtocolFeeRecipient",
+        "label": "snapshotGuardiansFeeRecipient",
         "slot": "18",
         "offset": 0,
         "type": "t_address"
       },
       {
-        "label": "snapshotGuardianFeeBps",
-        "slot": "19",
-        "offset": 0,
-        "type": "t_uint256"
-      },
-      {
-        "label": "snapshotGuardiansFeeRecipient",
-        "slot": "20",
-        "offset": 0,
-        "type": "t_address"
-      },
-      {
         "label": "selfManagesFees",
-        "slot": "20",
+        "slot": "18",
         "offset": 20,
         "type": "t_bool"
       },
       {
         "label": "maxCapital",
-        "slot": "21",
+        "slot": "19",
         "offset": 0,
         "type": "t_uint256"
       },
       {
         "label": "maxDrawdownBps",
-        "slot": "22",
+        "slot": "20",
         "offset": 0,
         "type": "t_uint16"
       },
       {
         "label": "envelopeTier",
-        "slot": "22",
+        "slot": "20",
         "offset": 2,
         "type": "t_uint8"
       },
       {
         "label": "requiredCoverage",
-        "slot": "23",
+        "slot": "21",
         "offset": 0,
         "type": "t_uint256"
       },
       {
         "label": "proposerBondWood",
-        "slot": "24",
+        "slot": "22",
         "offset": 0,
         "type": "t_uint256"
       },
       {
         "label": "proposerBondEscrow",
-        "slot": "25",
+        "slot": "23",
         "offset": 0,
         "type": "t_address"
+      },
+      {
+        "label": "snapshotMgmtSplit",
+        "slot": "24",
+        "offset": 0,
+        "type": "t_struct(MgmtSplit)_storage"
+      },
+      {
+        "label": "snapshotPerfSplit",
+        "slot": "25",
+        "offset": 0,
+        "type": "t_struct(PerfSplit)_storage"
       }
     ]
   }

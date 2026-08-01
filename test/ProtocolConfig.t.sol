@@ -15,68 +15,50 @@ contract ProtocolConfigTest is Test {
     }
 
     function test_defaultsAreZero() public view {
-        assertEq(cfg.protocolFeeBps(), 0);
         assertEq(cfg.protocolFeeRecipient(), address(0));
-        assertEq(cfg.guardianFeeBps(), 0);
         assertEq(cfg.guardiansFeeRecipient(), address(0));
     }
 
-    function test_setProtocolFeeRecipientThenBps() public {
+    function test_setProtocolFeeRecipient() public {
         vm.startPrank(owner);
         cfg.setProtocolFeeRecipient(recipient);
-        cfg.setProtocolFeeBps(100);
         vm.stopPrank();
-        assertEq(cfg.protocolFeeBps(), 100);
         assertEq(cfg.protocolFeeRecipient(), recipient);
     }
 
-    function test_protocolFeeBpsRequiresRecipientFirst() public {
-        vm.prank(owner);
-        vm.expectRevert(IProtocolConfig.InvalidProtocolFeeRecipient.selector);
-        cfg.setProtocolFeeBps(100);
-    }
-
-    function test_protocolFeeBpsBound() public {
-        vm.startPrank(owner);
-        cfg.setProtocolFeeRecipient(recipient);
-        vm.expectRevert(IProtocolConfig.InvalidProtocolFeeBps.selector);
-        cfg.setProtocolFeeBps(1001);
-        vm.stopPrank();
-    }
-
-    function test_guardianFeeBpsBound() public {
-        vm.startPrank(owner);
-        cfg.setGuardiansFeeRecipient(recipient);
-        vm.expectRevert(IProtocolConfig.InvalidGuardianFeeBps.selector);
-        cfg.setGuardianFeeBps(501);
-        vm.stopPrank();
-    }
+    // The rate bound and the "recipient first" coupling both went away with
+    // `protocolFeeBps` itself — the protocol's share is `mgmtSplit.protocolBps`
+    // / `perfSplit.protocolBps` now, covered by test/fees/ProtocolConfigSplits.
 
     function test_onlyOwner() public {
         vm.expectRevert();
         cfg.setProtocolFeeRecipient(recipient);
     }
 
-    function test_cannotClearRecipientWhileFeeActive() public {
+    /// @notice The protocol recipient may be cleared at any time — same reason
+    ///         as the guardian one below: no rate remains for it to contradict.
+    function test_protocolRecipientCanAlwaysBeCleared() public {
         vm.startPrank(owner);
         cfg.setProtocolFeeRecipient(recipient);
-        cfg.setProtocolFeeBps(100);
-        vm.expectRevert(IProtocolConfig.InvalidProtocolFeeRecipient.selector);
+        assertEq(cfg.protocolFeeRecipient(), recipient);
         cfg.setProtocolFeeRecipient(address(0));
-        cfg.setProtocolFeeBps(0); // zero out fee first
-        cfg.setProtocolFeeRecipient(address(0)); // now allowed
         vm.stopPrank();
+        assertEq(cfg.protocolFeeRecipient(), address(0));
     }
 
-    function test_cannotClearGuardianRecipientWhileFeeActive() public {
+    /// @notice The guardian recipient may be cleared at any time. There is no
+    ///         longer a `guardianFeeBps` for it to be inconsistent with — the
+    ///         guardian share comes from the splits — so the old "cannot clear
+    ///         while the fee is active" coupling has nothing left to enforce.
+    ///         A zero recipient unwires the leg; the governor folds that share
+    ///         into the agent's remainder rather than escrowing to address(0).
+    function test_guardianRecipientCanAlwaysBeCleared() public {
         vm.startPrank(owner);
         cfg.setGuardiansFeeRecipient(recipient);
-        cfg.setGuardianFeeBps(100);
-        vm.expectRevert(IProtocolConfig.InvalidGuardiansFeeRecipient.selector);
+        assertEq(cfg.guardiansFeeRecipient(), recipient);
         cfg.setGuardiansFeeRecipient(address(0));
-        cfg.setGuardianFeeBps(0);
-        cfg.setGuardiansFeeRecipient(address(0)); // now allowed
         vm.stopPrank();
+        assertEq(cfg.guardiansFeeRecipient(), address(0));
     }
 
     function test_ownership2Step() public {

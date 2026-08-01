@@ -118,7 +118,6 @@ abstract contract RobinhoodMainnetIntegrationTest is Test {
             ensRegistrar: address(0),
             agentRegistry: address(0),
             managementFeeBps: 50,
-            protocolFeeBps: 100,
             maxStrategyDays: 14,
             votingPeriod: 1 days,
             woodToken: address(wood),

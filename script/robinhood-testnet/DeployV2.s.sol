@@ -80,7 +80,6 @@ contract DeployRobinhoodTestnetV2 is DeploySherwood {
             ensRegistrar: address(0),
             agentRegistry: address(0),
             managementFeeBps: MANAGEMENT_FEE_BPS,
-            protocolFeeBps: PROTOCOL_FEE_BPS,
             maxStrategyDays: MAX_STRATEGY_DAYS,
             votingPeriod: VOTING_PERIOD,
             woodToken: woodToken,
@@ -188,7 +187,6 @@ contract DeployRobinhoodTestnetV2 is DeploySherwood {
         // checkable surface is the beacon + ProtocolConfig.
         _checkAddr("beacon.owner", Ownable(d.beacon).owner(), expectedOwner);
         _checkAddr("protocolConfig.owner", Ownable(d.protocolConfig).owner(), expectedOwner);
-        _checkUint("protocolConfig.protocolFeeBps", protocolConfig.protocolFeeBps(), PROTOCOL_FEE_BPS);
         _checkAddr("protocolConfig.protocolFeeRecipient", protocolConfig.protocolFeeRecipient(), d.deployer);
 
         _checkAddr("factory.owner", Ownable(d.factoryProxy).owner(), expectedOwner);
