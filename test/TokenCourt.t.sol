@@ -358,6 +358,116 @@ contract TokenCourtTest is Test {
         assertEq(cs.accusedWeight, 500e18, "weight counted once, not doubled");
     }
 
+    /// @notice Issue #69: the exposure ledger the accused set was derived from
+    ///         is PINNED into `Case` at `refer` — the last case input that used
+    ///         to be resolved live inside `_recordAccused`.
+    function test_ledgerPinnedAtRefer() public {
+        _disputedChallenge();
+        address[] memory a = new address[](1);
+        uint256[] memory c = new uint256[](1);
+        a[0] = accusedG;
+        c[0] = 100e18;
+        ledger.setApprovers(a, c);
+        uint256 snap = vm.getBlockTimestamp() - 1 days - 1;
+        swood.setPastStake(accusedG, snap, 500e18);
+
+        uint256 caseId = court.refer(CHALLENGE_ID);
+
+        ITokenCourt.Case memory cs = court.caseOf(caseId);
+        assertEq(cs.ledger, address(ledger), "ledger the accused set came from is pinned");
+        assertEq(cs.accusedWeight, 500e18, "accused weight derived from that same ledger");
+    }
+
+    /// @notice Issue #69 regression: an owner re-point of the game's exposure
+    ///         ledger AFTER `refer` must not reach back into a live case.
+    ///         Numbers mirror `test_finalize_accusedWeightLowersFloor`: floor =
+    ///         10% of (1000e18 - 600e18) = 40e18, which a 45e18 turnout clears.
+    ///         Had the re-point emptied the case's accused set, `accusedWeight`
+    ///         would fall to zero, the floor would rise to 100e18, and the
+    ///         verdict would flip to `Inconclusive` — so the finalize path is
+    ///         itself an assertion that the pin held.
+    function test_repointAfterReferDoesNotDisturbCase() public {
+        _disputedChallenge();
+        address[] memory a = new address[](1);
+        uint256[] memory cm = new uint256[](1);
+        a[0] = accusedG;
+        cm[0] = 100e18;
+        ledger.setApprovers(a, cm);
+        uint256 snap = vm.getBlockTimestamp() - 1 days - 1;
+        swood.setPastStake(accusedG, snap, 600e18);
+
+        uint256 id = court.refer(CHALLENGE_ID);
+        uint256 accusedCountBefore = court.accusedOf(id).length;
+
+        // The owner re-points the game at a ledger that names nobody.
+        MockLedgerForCourt emptyLedger = new MockLedgerForCourt();
+        game.setExposureLedger(address(emptyLedger));
+
+        ITokenCourt.Case memory c = court.caseOf(id);
+        assertEq(c.ledger, address(ledger), "pinned ledger survives the re-point");
+        assertEq(c.accusedWeight, 600e18, "accused weight survives the re-point");
+        assertTrue(court.isAccused(id, accusedG), "accused set survives the re-point");
+        assertEq(court.accusedOf(id).length, accusedCountBefore, "accused list unchanged");
+
+        swood.setPastTotalVotes(snap, 1_000e18);
+        swood.setPastVotes(voterA, snap, 45e18);
+        vm.prank(voterA);
+        court.vote(id, true);
+
+        vm.warp(vm.getBlockTimestamp() + 5 days);
+        vm.expectEmit(true, false, false, true);
+        emit ITokenCourt.CaseFinalized(id, IChallengeGame.Verdict.Guilty, 45e18, 0, 40e18);
+        court.finalize(id);
+        assertEq(
+            uint256(court.caseOf(id).verdict),
+            uint256(IChallengeGame.Verdict.Guilty),
+            "floor still computed off the pinned accused weight"
+        );
+    }
+
+    /// @notice Issue #69's "check when doing it": pinning the ledger without
+    ///         its derived weight would leave half the property. The stored
+    ///         `accusedWeight` must be exactly the `getPastStake` sum over the
+    ///         PINNED ledger's still-committed approvers at the PINNED
+    ///         `snapshotTs` — recomputed here from `Case` alone.
+    function test_ledgerAndWeightPinnedTogether() public {
+        _disputedChallenge();
+        address accusedH = makeAddr("accusedH");
+        address[] memory a = new address[](3);
+        uint256[] memory cm = new uint256[](3);
+        a[0] = accusedG;
+        cm[0] = 100e18;
+        a[1] = accusedH;
+        cm[1] = 250e18;
+        a[2] = makeAddr("released");
+        cm[2] = 0; // released before the filing: backs nothing, not accused
+        ledger.setApprovers(a, cm);
+        uint256 snap = vm.getBlockTimestamp() - 1 days - 1;
+        swood.setPastStake(accusedG, snap, 500e18);
+        swood.setPastStake(accusedH, snap, 300e18);
+        swood.setPastStake(a[2], snap, 900e18); // must never enter the sum
+
+        uint256 id = court.refer(CHALLENGE_ID);
+
+        ITokenCourt.Case memory c = court.caseOf(id);
+        (address[] memory approvers, uint256[] memory committed) =
+            MockLedgerForCourt(c.ledger).approversOf(governor, PROPOSAL_ID);
+        uint256 expected;
+        for (uint256 i; i < approvers.length; ++i) {
+            if (committed[i] == 0) continue;
+            expected += swood.getPastStake(approvers[i], c.snapshotTs);
+        }
+        assertEq(expected, 800e18, "fixture sanity: the recompute sees both live approvers");
+        assertEq(c.accusedWeight, expected, "weight is the pinned ledger's sum at the pinned snapshot");
+
+        // The identity holds after a re-point too: both halves moved together
+        // or neither did.
+        game.setExposureLedger(address(new MockLedgerForCourt()));
+        ITokenCourt.Case memory pinned = court.caseOf(id);
+        assertEq(pinned.ledger, address(ledger), "ledger half still pinned");
+        assertEq(pinned.accusedWeight, expected, "weight half still pinned");
+    }
+
     function test_refer_guards() public {
         // Unwired court refuses (review E4 closed structurally).
         TokenCourt fresh = new TokenCourt(owner);
@@ -888,5 +998,304 @@ contract TokenCourtTest is Test {
         vm.expectEmit(true, false, false, true);
         emit ITokenCourt.CaseFinalized(id, IChallengeGame.Verdict.Guilty, 300e18, 0, 100e18);
         court.finalize(id);
+    }
+
+    // ── B2: the participation floor's denominator (the lookback min) ──
+
+    /// @dev Opens a referable case whose electorate is described at BOTH
+    ///      instants the floor now reads: `snapshotTs` and `snapshotTs -
+    ///      FLOOR_LOOKBACK`. The accused set is exercised (accusedG is a
+    ///      covering approver) but carries no stake, so `accusedWeight` is 0
+    ///      and the floor is a clean `participationFloorBps` of the base.
+    ///      Voters A (300e18) and B (200e18) hold snapshot weight, for a
+    ///      maximum achievable turnout of 500e18.
+    /// @param totalAtSnapshot     `getPastTotalVotes(snapshotTs)`.
+    /// @param totalAtLookback     `getPastTotalVotes(snapshotTs - FLOOR_LOOKBACK)`,
+    ///                            or 0 to model an electorate with no history
+    ///                            that far back.
+    function _caseWithElectorate(uint256 totalAtSnapshot, uint256 totalAtLookback)
+        internal
+        returns (uint256 caseId, uint256 snap)
+    {
+        _disputedChallenge();
+        address[] memory a = new address[](1);
+        uint256[] memory cm = new uint256[](1);
+        a[0] = accusedG;
+        cm[0] = 100e18;
+        ledger.setApprovers(a, cm);
+
+        caseId = court.refer(CHALLENGE_ID);
+        snap = court.caseOf(caseId).snapshotTs;
+        assertEq(court.caseOf(caseId).accusedWeight, 0, "fixture assumes a zero-stake accused set");
+
+        swood.setPastTotalVotes(snap, totalAtSnapshot);
+        if (totalAtLookback != 0) swood.setPastTotalVotes(snap - court.FLOOR_LOOKBACK(), totalAtLookback);
+        swood.setPastVotes(voterA, snap, 300e18);
+        swood.setPastVotes(voterB, snap, 200e18);
+    }
+
+    /// @dev Casts the full achievable turnout (500e18, both voters, guilty)
+    ///      and closes the window, stopping SHORT of `finalize` so a caller
+    ///      can arm `vm.expectEmit` on `CaseFinalized` without the two
+    ///      `VoteCast` emissions consuming it first. After this returns,
+    ///      `Guilty` out of `finalize` means the floor was cleared and
+    ///      `Inconclusive` means it was not.
+    function _castFullTurnoutAndCloseWindow(uint256 caseId) internal {
+        vm.prank(voterA);
+        court.vote(caseId, true);
+        vm.prank(voterB);
+        court.vote(caseId, true);
+        vm.warp(vm.getBlockTimestamp() + 5 days);
+    }
+
+    /// @notice B2 (BLOCKING, review of PR #56), AS A REGRESSION TEST: THE
+    ///         DENIAL-OF-QUORUM ATTACK ON THE FLOOR'S DENOMINATOR.
+    ///
+    ///         D2 defends the NUMERATOR — weight is read at `executedAt - 1`,
+    ///         so post-drain buyers and flash loans count for nothing. The
+    ///         DENOMINATOR had the opposite exposure: it is RAISED by anyone
+    ///         staked before `executedAt`, and the attacker is exactly the
+    ///         party who knows when `executedAt` will be, because it is their
+    ///         own drain.
+    ///
+    ///         The attack, verbatim: stake large from an address that NEVER
+    ///         APPROVES ANYTHING, immediately before executing the malicious
+    ///         proposal. `stakeAsGuardian` is permissionless, and
+    ///         `_recordAccused` subtracts only ledger approvers, so the stake
+    ///         is never subtracted back out. Here the honest electorate is
+    ///         1_000e18 with 500e18 of achievable turnout; the attacker adds
+    ///         9_000e18, taking the pre-fix floor to 10% of 10_000e18 =
+    ///         1_000e18 — beyond ANY achievable turnout. The case would
+    ///         finalize `Inconclusive`: no slash, no `_convicted` mark, no
+    ///         adapter demotion, counter-bond returned whole, coverage freeze
+    ///         released — with the attacker never voting, never coordinating,
+    ///         never slashable, and recovering its capital after cooldown.
+    ///
+    ///         MUTATION-CHECKED: reverting `_participationFloor` to the single
+    ///         `getPastTotalVotes(snapshotTs)` read fails this test with
+    ///         `Inconclusive != Guilty`.
+    function test_finalize_floorIgnoresAPreDrainStakeSurge_denialOfQuorumClosed() public {
+        // 10_000e18 at the snapshot (1_000e18 honest + 9_000e18 attacker),
+        // but only the honest 1_000e18 a lookback earlier: the attacker's
+        // stake landed inside the window and cannot raise the base.
+        (uint256 id,) = _caseWithElectorate(10_000e18, 1_000e18);
+        _castFullTurnoutAndCloseWindow(id);
+
+        vm.expectEmit(true, false, false, true);
+        // floor = 10% of min(10_000e18, 1_000e18) = 100e18, NOT 1_000e18.
+        emit ITokenCourt.CaseFinalized(id, IChallengeGame.Verdict.Guilty, 500e18, 0, 100e18);
+        court.finalize(id);
+
+        assertEq(
+            uint256(court.caseOf(id).verdict),
+            uint256(IChallengeGame.Verdict.Guilty),
+            "a pre-drain stake surge must not deny the case a real verdict"
+        );
+        assertTrue(game.ruled(), "the verdict reached the game");
+    }
+
+    /// @notice THE PROPERTY IS PRESERVED, NOT DELETED (half 1): a legitimate
+    ///         electorate that did not move over the lookback window still
+    ///         produces exactly the floor it always did, and real turnout
+    ///         still clears it. The min is a no-op when the two reads agree.
+    function test_finalize_floorUnchangedWhenElectorateStable() public {
+        (uint256 id,) = _caseWithElectorate(1_000e18, 1_000e18);
+        _castFullTurnoutAndCloseWindow(id);
+
+        vm.expectEmit(true, false, false, true);
+        emit ITokenCourt.CaseFinalized(id, IChallengeGame.Verdict.Guilty, 500e18, 0, 100e18);
+        court.finalize(id);
+
+        assertEq(
+            uint256(court.caseOf(id).verdict),
+            uint256(IChallengeGame.Verdict.Guilty),
+            "stable electorate, ordinary verdict"
+        );
+    }
+
+    /// @notice THE PROPERTY IS PRESERVED, NOT DELETED (half 2): honest turnout
+    ///         BELOW the floor still resolves `Inconclusive`. The lookback
+    ///         lowers the base when stake is young; it does not remove the D6
+    ///         floor. Here both reads agree at 10_000e18 — a genuinely large,
+    ///         long-standing electorate — so 500e18 of turnout against a
+    ///         1_000e18 floor is exactly the thin vote D6 refuses to read as
+    ///         an answer.
+    function test_finalize_belowFloorStillInconclusive_withBothCheckpointsSet() public {
+        (uint256 id,) = _caseWithElectorate(10_000e18, 10_000e18);
+        _castFullTurnoutAndCloseWindow(id);
+
+        vm.expectEmit(true, false, false, true);
+        emit ITokenCourt.CaseFinalized(id, IChallengeGame.Verdict.Inconclusive, 500e18, 0, 1_000e18);
+        court.finalize(id);
+
+        assertEq(
+            uint256(court.caseOf(id).verdict),
+            uint256(IChallengeGame.Verdict.Inconclusive),
+            "thin turnout is still no answer"
+        );
+    }
+
+    /// @notice THE RESIDUAL, PINNED DELIBERATELY RATHER THAN LEFT IMPLICIT.
+    ///         The lookback does not make the attack impossible — it prices
+    ///         it. An attacker who commits the same 9_000e18 a FULL
+    ///         `FLOOR_LOOKBACK` before the drain is present at both reads, so
+    ///         the min does not exclude it and the case still lands
+    ///         `Inconclusive`. What changed is the cost: the capital must sit
+    ///         on-chain, idle and publicly visible, for a month before the
+    ///         drain it exists to protect, rather than being staked in the
+    ///         block before `executedAt` for free. The live
+    ///         `participationFloorBps` read (D6) is the operational
+    ///         counter-lever if such a stake is spotted mid-case — proven by
+    ///         the second half of this test.
+    function test_finalize_floorStillInflatableByAMonthOldStake_knownResidual() public {
+        (uint256 id,) = _caseWithElectorate(10_000e18, 10_000e18);
+
+        vm.prank(voterA);
+        court.vote(id, true);
+        vm.prank(voterB);
+        court.vote(id, true);
+        vm.warp(vm.getBlockTimestamp() + 5 days);
+
+        // Snapshot the state, prove the residual, then rewind to prove the lever.
+        uint256 snapshotId = vm.snapshotState();
+        court.finalize(id);
+        assertEq(
+            uint256(court.caseOf(id).verdict),
+            uint256(IChallengeGame.Verdict.Inconclusive),
+            "a lookback-old stake still inflates the base: the residual"
+        );
+
+        vm.revertToState(snapshotId);
+        vm.prank(owner);
+        court.setParticipationFloorBps(100); // 1%: floor 100e18, cleared by 500e18
+        court.finalize(id);
+        assertEq(
+            uint256(court.caseOf(id).verdict),
+            uint256(IChallengeGame.Verdict.Guilty),
+            "the live floor read is the counter-lever against an observed inflating stake"
+        );
+    }
+
+    /// @notice NO UNDERFLOW WHEN `snapshotTs < FLOOR_LOOKBACK`. A proposal
+    ///         that executed in the chain's first month makes
+    ///         `snapshotTs - FLOOR_LOOKBACK` a subtraction below zero; the
+    ///         clamp keeps it at 0, where the trace is empty by definition,
+    ///         and the `earlier == 0` fallback stands the snapshot total up
+    ///         instead. `executedAt` is set to one hour past genesis directly
+    ///         on the game record rather than warping the chain backwards —
+    ///         `vm.warp` backwards is a no-op, and `snapshotTs` is derived
+    ///         from the game's pinned `executedAt`, not from `block.timestamp`.
+    function test_finalize_floorDoesNotUnderflowWhenSnapshotPrecedesLookback() public {
+        assertLt(1 hours, court.FLOOR_LOOKBACK(), "fixture must actually exercise the clamp");
+        game.setChallenge(
+            CHALLENGE_ID,
+            governor,
+            PROPOSAL_ID,
+            IChallengeGame.Status.Disputed,
+            vm.getBlockTimestamp(),
+            30 days,
+            1 hours // executedAt: one hour into the chain's life
+        );
+        address[] memory a = new address[](1);
+        uint256[] memory cm = new uint256[](1);
+        a[0] = accusedG;
+        cm[0] = 100e18;
+        ledger.setApprovers(a, cm);
+
+        uint256 id = court.refer(CHALLENGE_ID);
+        uint256 snap = court.caseOf(id).snapshotTs;
+        assertEq(snap, 1 hours - 1, "snapshotTs is well below FLOOR_LOOKBACK");
+
+        swood.setPastTotalVotes(snap, 1_000e18);
+        swood.setPastVotes(voterA, snap, 300e18);
+        swood.setPastVotes(voterB, snap, 200e18);
+
+        _castFullTurnoutAndCloseWindow(id);
+        vm.expectEmit(true, false, false, true);
+        // The clamped read is empty, so the snapshot total stands: floor = 100e18.
+        emit ITokenCourt.CaseFinalized(id, IChallengeGame.Verdict.Guilty, 500e18, 0, 100e18);
+        court.finalize(id);
+        assertEq(
+            uint256(court.caseOf(id).verdict),
+            uint256(IChallengeGame.Verdict.Guilty),
+            "no revert, no underflow, floor intact"
+        );
+    }
+
+    /// @notice THE BOOTSTRAP FALLBACK, ASSERTED IN THE DIRECTION IT MATTERS.
+    ///         With no electorate at all a lookback before the snapshot
+    ///         (`getPastTotalVotes` reads zero before a trace's first entry),
+    ///         the base falls back to the SNAPSHOT TOTAL, not to zero. A zero
+    ///         base would disable the D6 anti-capture floor outright for the
+    ///         protocol's first `FLOOR_LOOKBACK` of staking history, letting a
+    ///         single dust-weight guardian carry a case alone — and a wrongful
+    ///         `Guilty` destroys an honest guardian's whole stake, strictly
+    ///         worse than the forced `Inconclusive` the fallback leaves
+    ///         possible. So the floor here is the pre-fix 10% of 10_000e18,
+    ///         and 500e18 of turnout does NOT clear it.
+    function test_finalize_floorFallsBackToSnapshotTotalWhenNoEarlierElectorateExists() public {
+        (uint256 id,) = _caseWithElectorate(10_000e18, 0); // nothing staked a lookback ago
+        _castFullTurnoutAndCloseWindow(id);
+
+        vm.expectEmit(true, false, false, true);
+        emit ITokenCourt.CaseFinalized(id, IChallengeGame.Verdict.Inconclusive, 500e18, 0, 1_000e18);
+        court.finalize(id);
+
+        assertEq(
+            uint256(court.caseOf(id).verdict),
+            uint256(IChallengeGame.Verdict.Inconclusive),
+            "an empty lookback must not zero the floor, only decline to lower it"
+        );
+    }
+
+    /// @notice The floor is monotone against the pre-fix formula: the lookback
+    ///         can only ever LOWER the base, never raise it. Proven on the
+    ///         asymmetric case the min exists for — an electorate that SHRANK
+    ///         over the window, where reading the lookback instant ALONE
+    ///         (rather than the min) would have raised the floor from 100e18
+    ///         to 1_000e18 and denied the verdict.
+    function test_finalize_floorTakesTheMinNotTheEarlierReadAlone() public {
+        (uint256 id,) = _caseWithElectorate(1_000e18, 10_000e18); // electorate shrank 10x
+        _castFullTurnoutAndCloseWindow(id);
+
+        vm.expectEmit(true, false, false, true);
+        emit ITokenCourt.CaseFinalized(id, IChallengeGame.Verdict.Guilty, 500e18, 0, 100e18);
+        court.finalize(id);
+
+        assertEq(
+            uint256(court.caseOf(id).verdict),
+            uint256(IChallengeGame.Verdict.Guilty),
+            "a shrunken electorate must not raise the floor"
+        );
+    }
+
+    /// @notice `FLOOR_LOOKBACK` is a constant, not an owner parameter: there
+    ///         is no setter to shrink it to zero before a drain, and being
+    ///         immutable it satisfies the D2 "pinned at `refer`" discipline
+    ///         more strongly than any stored field could. Its value matches
+    ///         `StakedWood`'s deployed `maturationPeriod`, the horizon the
+    ///         NUMERATOR already ages stake over.
+    function test_floorLookback_isAThirtyDayConstant() public view {
+        assertEq(court.FLOOR_LOOKBACK(), 30 days);
+    }
+
+    // ── ownership ──
+
+    /// @notice An ownerless court is unrecoverable: it is non-upgradeable, so
+    ///         `setChallengeGame` / `setStakedWood` (the rescue path for a
+    ///         compromised or redeployed dependency) and
+    ///         `setParticipationFloorBps` (the counter-lever the B2 residual
+    ///         above leans on) would be gone permanently. Refused for
+    ///         everyone, the owner included.
+    function test_renounceOwnership_reverts() public {
+        vm.prank(owner);
+        vm.expectRevert(ITokenCourt.OwnershipCannotBeRenounced.selector);
+        court.renounceOwnership();
+
+        vm.prank(voterA);
+        vm.expectRevert(ITokenCourt.OwnershipCannotBeRenounced.selector);
+        court.renounceOwnership();
+
+        assertEq(court.owner(), owner, "owner survives both attempts");
     }
 }

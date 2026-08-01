@@ -17,6 +17,7 @@ import {IStakedWood} from "../src/interfaces/IStakedWood.sol";
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 import {MockL2Registrar} from "./mocks/MockL2Registrar.sol";
 import {MockAgentRegistry} from "./mocks/MockAgentRegistry.sol";
+import {FeeConstants} from "../src/FeeConstants.sol";
 
 contract SyndicateFactoryTest is Test {
     SyndicateFactory public factory;
@@ -127,6 +128,27 @@ contract SyndicateFactoryTest is Test {
         // _executorImpl getter was dropped to free EIP-170 budget; verifying
         // the slot via vm.load is sufficient for this round-trip check.
         assertEq(address(uint160(uint256(vm.load(address(vault), bytes32(uint256(3)))))), address(executorLib));
+    }
+
+    /// @notice A freshly created vault's governor starts at the advertised 20%
+    ///         headline, not at the 30% protocol ceiling. The settle-time clamp
+    ///         resolves an over-ceiling rate silently, so a permissive default
+    ///         would let an owner quietly charge above the headline; this must
+    ///         fail closed instead. Leaving it at the old 1500 would be the
+    ///         opposite failure — every new vault silently clamped below the
+    ///         headline at settle.
+    function test_createSyndicate_governorDefaultsToTheHeadlinePerformanceFeeCeiling() public {
+        vm.prank(creator1);
+        (, address vaultAddr) = factory.createSyndicate(creator1AgentId, _defaultConfig());
+
+        ISyndicateGovernor governor = ISyndicateGovernor(factory.governorOf(vaultAddr));
+        uint256 perVaultCeiling = governor.getGovernorParams().maxPerformanceFeeBps;
+
+        assertEq(
+            perVaultCeiling, FeeConstants.DEFAULT_MAX_PERFORMANCE_FEE_BPS, "new vault should start at the headline"
+        );
+        assertEq(perVaultCeiling, 2000, "the headline is 20%");
+        assertLt(perVaultCeiling, FeeConstants.MAX_PERFORMANCE_FEE_BPS, "the default must sit below the ceiling");
     }
 
     /// @notice F4 — a reverting registrar `available()` view must NOT brick

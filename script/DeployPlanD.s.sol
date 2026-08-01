@@ -22,17 +22,26 @@ interface ICompensationEscrowFunder {
     function authorizedFunder() external view returns (address);
 }
 
+/// @dev `IStakedWood` carries `authorizedSlasher` and `compensationEscrow` but
+///      not `exposureLedger`, which pre-flight 2b below has to read. Same reason
+///      the two interfaces above exist: one view function does not justify
+///      dragging the concrete `StakedWood` into a wiring script.
+interface ISwoodExposureLedger {
+    function exposureLedger() external view returns (address);
+}
+
 /**
  * @title  DeployPlanD
  * @notice Plan D deployment against an EXISTING Plan B + Plan C deployment.
  *         Address book via env vars (from chains/<chainid>.json). Order:
  *           1. pre-flights (see below) — fail BEFORE anything is deployed
  *           2. deploy ChallengeGame (ledger + tier registry set in constructor)
- *           3. wire the four roles the game needs to execute a verdict:
- *                ledger.setCoverageFreezer(game)          — freeze on filing
- *                tierRegistry.setAuthorizedDemoter(game)  — demote on a pass
- *                swood.setAuthorizedSlasher(game)         — execute the slash
+ *           3. wire the four roles the game needs to execute a verdict, in
+ *              SETTLE-BEFORE-FREEZE order (review M3 — see the block itself):
  *                game.setStakedWood(swood)                — the reciprocal pointer
+ *                swood.setAuthorizedSlasher(game)         — execute the slash
+ *                tierRegistry.setAuthorizedDemoter(game)  — demote on a pass
+ *                ledger.setCoverageFreezer(game)          — freeze on filing, LAST
  *         MANUAL follow-ups printed at the end (ownership handoff, parameter
  *         review, and the OFF-CHAIN bug-bounty program without which the
  *         challenge game has no detector incentive at all).
@@ -50,6 +59,11 @@ interface ICompensationEscrowFunder {
  *      `escrow.authorizedFunder() == swood` and `swood.compensationEscrow() ==
  *      escrow`. Either one missing makes every settled challenge revert at the
  *      last step, after the coverage was frozen and the bond was posted.
+ * @dev PRE-FLIGHT 2b (review B4): Plan B's exit gate must read the SAME ledger
+ *      the game is constructed against — `swood.exposureLedger() ==
+ *      EXPOSURE_LEDGER`. A split (or a zero, where the gate fails open by
+ *      design) lets an accused approver unstake before `resolve` and be
+ *      convicted for a zero recovery, silently. See the block itself.
  * @dev PRE-FLIGHT 3: a zero COMPOSED price on the ledger is fail-closed for the
  *      game exactly as it is for the bond math — `file()` reverts
  *      `WoodPriceUnset()` when it is unset, so the game would deploy into a
@@ -75,14 +89,47 @@ interface ICompensationEscrowFunder {
  *     forge script script/DeployPlanD.s.sol:DeployPlanD --rpc-url <rpc> -vvvv
  */
 contract DeployPlanD is Script {
+    /// @notice The address book this deployment runs against, exactly as
+    ///         `run()` reads it out of the environment.
+    /// @dev    THE ENV READ AND THE DEPLOYMENT ARE SPLIT ON PURPOSE. `vm.setEnv`
+    ///         writes the PROCESS environment — one shared mutable global that
+    ///         forge does not roll back between tests and that every parallel
+    ///         test suite writes to. A pre-flight test driven through `run()`
+    ///         races every sibling suite seeding the same keys. `deploy()`
+    ///         takes the book as an argument so the tests never touch that
+    ///         global; `run()` is the thin env adapter and stays the only
+    ///         production entry point. Same split as `DeployPlanB`.
+    struct AddressBook {
+        address swood;
+        address wood;
+        address ledger;
+        address tierRegistry;
+        address escrow;
+    }
+
     function run() external {
+        deploy(
+            AddressBook({
+                swood: vm.envAddress("STAKED_WOOD"),
+                wood: vm.envAddress("WOOD_TOKEN"),
+                ledger: vm.envAddress("EXPOSURE_LEDGER"),
+                tierRegistry: vm.envAddress("TIER_REGISTRY"),
+                escrow: vm.envAddress("COMPENSATION_ESCROW")
+            })
+        );
+    }
+
+    /// @notice Every pre-flight, deploy and wiring step. Public so the
+    ///         pre-flight tests can drive the real thing without the process
+    ///         environment — see `AddressBook`.
+    function deploy(AddressBook memory book) public {
         address deployer = msg.sender;
 
-        address swood = vm.envAddress("STAKED_WOOD");
-        address wood = vm.envAddress("WOOD_TOKEN");
-        address ledger = vm.envAddress("EXPOSURE_LEDGER");
-        address tierRegistry = vm.envAddress("TIER_REGISTRY");
-        address escrow = vm.envAddress("COMPENSATION_ESCROW");
+        address swood = book.swood;
+        address wood = book.wood;
+        address ledger = book.ledger;
+        address tierRegistry = book.tierRegistry;
+        address escrow = book.escrow;
 
         // ── Pre-flight 1: never silently steal a role from a live holder ──
         require(
@@ -113,6 +160,34 @@ contract DeployPlanD is Script {
             "missing - slashToEscrow has nowhere to send the proceeds."
         );
 
+        // ── Pre-flight 2b: Plan B's exit gate must read THIS ledger (review B4) ──
+        // The game freezes commitments on the ledger it is constructed with, by
+        // writing `_frozenCommitments[guardian]` THERE. `claimUnstakeGuardian`
+        // asks whichever ledger sWOOD points at. Point them at different
+        // contracts — or leave sWOOD's pointer at zero, where the gate is
+        // documented to fail OPEN — and the freeze is written somewhere nobody
+        // reads.
+        //
+        // The failure is total and completely silent. An accused approver
+        // requests an unstake, waits out `coolDownPeriod` (floor 1 day) inside
+        // the 7-day `autoSlashDelay`, and claims. At `resolve`, `_slashOne`
+        // finds nothing staked and returns 0, `slashToEscrow` returns (0,0) —
+        // and `_settle` still marks `_convicted[key]`, so the proposal can never
+        // be re-challenged either. No revert, no distinguishing event, zero
+        // recovered. Nothing else in this script would notice: pre-flight 1 and
+        // the post-conditions all check the ledger→game direction.
+        //
+        // `== ledger`, not `!= address(0)`: a stale pointer from an earlier
+        // deployment passes a non-zero test while holding none of this
+        // deployment's bookings, which is the same hole with extra steps.
+        require(
+            ISwoodExposureLedger(swood).exposureLedger() == ledger,
+            "PRE-FLIGHT: StakedWood.exposureLedger != EXPOSURE_LEDGER. The exit gate reads a "
+            "different ledger than the game freezes on, so an accused approver can unstake before "
+            "resolve and be convicted for nothing. Run DeployPlanB (it wires this), or call "
+            "setExposureLedger(EXPOSURE_LEDGER) from the sWOOD owner, then re-run."
+        );
+
         // ── Pre-flight 3: an unpriced ledger makes every filing revert ──
         // The COMPOSED price, matching what `ChallengeGame.file` divides by
         // (review 🟠F16). Pre-flighting the raw scalar would pass while the
@@ -139,13 +214,32 @@ contract DeployPlanD is Script {
             "ChallengeGame.challengeWindow != ExposureLedger.challengeWindow - reconcile before wiring"
         );
 
-        IExposureLedger(ledger).setCoverageFreezer(address(game));
-        ITierRegistryDemoterRole(tierRegistry).setAuthorizedDemoter(address(game));
+        // ORDER IS LOAD-BEARING: SETTLE FIRST, FREEZE LAST (review M3).
+        // These are four separate transactions from an owner multisig, and a
+        // challenge filed between the first and the last is not hypothetical —
+        // `file()` is permissionless. Granting the freeze before the game can
+        // settle opens a window where a filing sets `_frozen[key]` on the ledger
+        // while `_settle` still reverts `ZeroAddress` for want of sWOOD; and
+        // `ExposureLedger.setCoverageFreezer` refuses to run at all while any
+        // key is frozen (`CoverageFrozen`), so pre-flight 1 above becomes
+        // PERMANENTLY unsatisfiable and the deployment cannot even be re-run to
+        // repair itself. Reversing the order costs nothing and closes it: the
+        // ability to freeze is granted only once the ability to settle exists.
+        //
+        // GRANT BEFORE POINTING — and this pair is no longer free to order.
+        // `ChallengeGame.setStakedWood` now REJECTS a sWOOD that has not already
+        // named this game as its `authorizedSlasher` (review M2, `RoleNotGranted`),
+        // so "point, then grant" reverts. The earlier note here said the two could
+        // be wired in either order; that was true before M2 and is not now.
+        //
+        // Both requirements hold together under this interleave: grant the slash
+        // role, point the game at sWOOD — the verdict path is complete at this
+        // line — and only afterwards grant the freeze role below.
         IStakedWood(swood).setAuthorizedSlasher(address(game));
-        // The reciprocal pointer. sWOOD is owner-set state on the game rather
-        // than a constructor arg because the role is granted on sWOOD's side and
-        // the two can be wired in either order.
         game.setStakedWood(swood);
+        ITierRegistryDemoterRole(tierRegistry).setAuthorizedDemoter(address(game));
+        // LAST. Nothing can be frozen before the verdict path is complete.
+        IExposureLedger(ledger).setCoverageFreezer(address(game));
 
         vm.stopBroadcast();
 

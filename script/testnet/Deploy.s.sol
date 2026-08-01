@@ -68,7 +68,6 @@ contract DeployTestnet is ScriptBase {
         // Deploy ProtocolConfig (plain Ownable)
         ProtocolConfig protocolConfig = new ProtocolConfig(deployer);
         protocolConfig.setProtocolFeeRecipient(deployer);
-        protocolConfig.setProtocolFeeBps(200);
 
         SyndicateGovernor govImpl = new SyndicateGovernor(24 hours, 1 hours);
         // Per-vault governor: deploy a GovernorBeacon over the impl (keeps the

@@ -24,6 +24,13 @@ interface IStakedWoodAgeFloor {
     function ageFloorBps() external view returns (uint256);
 }
 
+/// @dev `ICompensationEscrow` declares `setAuthorizedFunder` but no getter, so
+///      pre-flight 5's escrow half — which has to read the funder back — needs
+///      this narrow surface. Same shape and same reason as `DeployPlanD`'s.
+interface ICompensationEscrowFunder {
+    function authorizedFunder() external view returns (address);
+}
+
 /**
  * @title  DeployTokenCourt
  * @notice Deploy step for the token court (spec 2026-07-28-token-court-design.md)
@@ -158,10 +165,36 @@ contract DeployTokenCourt is Script {
  *      court's only decision path. At defaults: `1_000 < 2_500` OK, implying
  *      `1_000 * 10_000 / 2_500 == 4_000` bps (40%) of RAW stake must vote to
  *      clear the floor at launch.
- * @dev PRE-FLIGHT 5: Plan D's wiring is still intact, or a `Guilty` verdict
- *      dead-ends at `_settle` — `ledger.coverageFreezer() == CHALLENGE_GAME`,
- *      `tiers.authorizedDemoter() == CHALLENGE_GAME`,
- *      `swood.authorizedSlasher() == CHALLENGE_GAME`.
+ * @dev PRE-FLIGHT 5: Plan D's AND Plan C's wiring are still intact, or a
+ *      `Guilty` verdict dead-ends at `_settle`. Ranked by what a miss actually
+ *      costs (review M4 — the first version of this list checked three rails
+ *      and omitted the worst one):
+ *        - `swood.compensationEscrow() != 0`, and that escrow's
+ *          `authorizedFunder() == STAKED_WOOD`. THE LOAD-BEARING PAIR, and the
+ *          only rail here that is not merely lost but WEAPONISED when broken.
+ *          `setCompensationEscrow` is owner-mutable and explicitly
+ *          zero-settable; with it zero `slashToEscrow` reverts
+ *          `CompensationEscrowNotSet`, `TokenCourt.finalize`'s selector filter
+ *          correctly bubbles that (it only swallows `WrongStatus`), and the
+ *          case stays `Voting` — so the underlying challenge then times out
+ *          through `resolve` → `_fail`, ACQUITTING the accused and paying the
+ *          challenger's bond to them. One `setCompensationEscrow(0)` converts
+ *          every in-flight Guilty verdict into an acquittal plus a payment, in
+ *          the very script whose job is switching forced convictions on. The
+ *          funder direction is checked against the escrow sWOOD actually points
+ *          at (no extra env var): a wrong-but-non-zero escrow dead-ends at
+ *          `fundCase` in exactly the same way.
+ *        - `swood.authorizedSlasher() == CHALLENGE_GAME`. Load-bearing: without
+ *          it the slash itself has no executor.
+ *        - `ledger.coverageFreezer() == CHALLENGE_GAME`. Load-bearing: the game
+ *          cannot move coverage when the court rules.
+ *        - `tiers.authorizedDemoter() == CHALLENGE_GAME`. NOT load-bearing, and
+ *          listed last for that reason — `_settle` wraps `demoteByChallenge` in
+ *          a try/catch and emits `AdapterDemotionFailed` rather than reverting,
+ *          precisely so a revocable role cannot hold a terminal path hostage.
+ *          Still worth refusing on: a demotion silently skipped leaves a
+ *          convicted adapter certified, and the registry owner has to fix it by
+ *          hand.
  *
  *      Ownership: the broadcaster must own the `ChallengeGame` (`setCourt` is
  *      `onlyOwner`).
@@ -223,21 +256,48 @@ contract WireTokenCourt is Script {
             "unclearable no matter how complete the vote."
         );
 
-        // ── Pre-flight 5: Plan D's wiring intact, or a Guilty verdict dead-ends ──
+        // ── Pre-flight 5: the verdict's rails intact, or a Guilty verdict
+        //    dead-ends. Asserted as ONE block: these are not four independent
+        //    settings but one payout path, and any single break makes a
+        //    conviction unexecutable (or, for the escrow, actively harmful).
+        //    Each require names its own remedy. Ordered worst-first — see the
+        //    contract natspec for the ranking and why the escrow leads it.
+
+        // The escrow pair, both directions, checked against the escrow sWOOD
+        // itself names so no extra env var can drift out of sync with it.
+        address compEscrow = IStakedWood(swoodAddr).compensationEscrow();
         require(
-            IExposureLedger(ledgerAddr).coverageFreezer() == gameAddr,
-            "PRE-FLIGHT: ExposureLedger.coverageFreezer != CHALLENGE_GAME. Plan D wiring is "
-            "missing - the game cannot move coverage when the court rules."
+            compEscrow != address(0),
+            "PRE-FLIGHT: StakedWood.compensationEscrow is UNSET (owner-settable to zero). "
+            "slashToEscrow would revert CompensationEscrowNotSet, finalize would bubble it, and "
+            "the challenge would time out ACQUITTING the accused and paying them the challenger's "
+            "bond. Call setCompensationEscrow(<escrow>) from the sWOOD owner, then re-run."
         );
         require(
-            ITierRegistryDemoterRole(tierRegistryAddr).authorizedDemoter() == gameAddr,
-            "PRE-FLIGHT: TierRegistry.authorizedDemoter != CHALLENGE_GAME. Plan D wiring is "
-            "missing - a guilty verdict would revert demoting the adapter."
+            ICompensationEscrowFunder(compEscrow).authorizedFunder() == swoodAddr,
+            "PRE-FLIGHT: CompensationEscrow.authorizedFunder != STAKED_WOOD. Plan C wiring is "
+            "half-applied - fundCase would reject sWOOD and the verdict dead-ends exactly as an "
+            "unset escrow does. Call setAuthorizedFunder(STAKED_WOOD) on the escrow, then re-run."
         );
         require(
             IStakedWood(swoodAddr).authorizedSlasher() == gameAddr,
             "PRE-FLIGHT: StakedWood.authorizedSlasher != CHALLENGE_GAME. Plan D wiring is "
             "missing - a guilty verdict would have no slasher to execute it."
+        );
+        require(
+            IExposureLedger(ledgerAddr).coverageFreezer() == gameAddr,
+            "PRE-FLIGHT: ExposureLedger.coverageFreezer != CHALLENGE_GAME. Plan D wiring is "
+            "missing - the game cannot move coverage when the court rules."
+        );
+        // LAST, because it is the only one here that is not fatal: `_settle`
+        // try/catches the demotion and emits `AdapterDemotionFailed`. Refused
+        // on anyway — a silently un-demoted convicted adapter stays certified
+        // until the registry owner notices.
+        require(
+            ITierRegistryDemoterRole(tierRegistryAddr).authorizedDemoter() == gameAddr,
+            "PRE-FLIGHT: TierRegistry.authorizedDemoter != CHALLENGE_GAME. Plan D wiring is "
+            "missing - a guilty verdict would skip demoting the adapter (try/catch: it emits "
+            "AdapterDemotionFailed rather than reverting), leaving it certified."
         );
 
         console.log("court:                    %s", courtAddr);

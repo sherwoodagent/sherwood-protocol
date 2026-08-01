@@ -102,7 +102,6 @@ contract FeeBlacklistInvariantTest is StdInvariant, Test {
         ProtocolConfig protocolConfig = new ProtocolConfig(owner);
         vm.startPrank(owner);
         protocolConfig.setProtocolFeeRecipient(protocolRecipient);
-        protocolConfig.setProtocolFeeBps(PROTOCOL_FEE_BPS);
         vm.stopPrank();
 
         SyndicateGovernor govImpl = new SyndicateGovernor(24 hours, 1 hours);

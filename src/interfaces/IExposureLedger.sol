@@ -153,6 +153,15 @@ interface IExposureLedger {
 
     /// @notice Return each approver's over-reservation once the review has shut
     ///         and the approver set is final. Permissionless; safe to skip.
+    /// @dev    RE-RUNNABLE, and a caller that prices money off a settled
+    ///         proposal should re-run it first. Each pass re-derives the whole
+    ///         split from the pledges recorded at vote time, at the CURRENT
+    ///         price, so a pass taken while WOOD or the vault asset was
+    ///         depressed leaves a stale number the next pass corrects rather
+    ///         than a permanent one. It was one-shot originally, which let any
+    ///         caller pick an instant that permanently reduced what a conviction
+    ///         could recover (review H1). No pass can book a guardian above its
+    ///         own pledge, in either direction.
     function settleCoverage(address governor, uint256 proposalId) external;
 
     function slashableBondUsd(address guardian) external view returns (uint256);

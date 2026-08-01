@@ -19,13 +19,33 @@ interface ITokenCourt {
         Resolved
     }
 
-    /// @notice The court's own record of `finalize`'s tally outcome. Carries
-    ///         the same three values as `IChallengeGame.Verdict` in the same
-    ///         order — kept as a distinct type rather than reused because the
-    ///         court's tally and the game's verdict are conceptually
-    ///         different things that happen to always agree; `finalize`
-    ///         converts one to the other explicitly rather than sharing a
-    ///         type across the trust boundary.
+    /// @notice The court's own record of how ONE VOTER ruled — not a case
+    ///         outcome. `voteOf` is its only use; a case's outcome is stored
+    ///         as an `IChallengeGame.Verdict` in `Case.verdict`.
+    /// @dev    THE ORDERS ARE INVERTED, AND A CAST BETWEEN THE TWO TYPES IS
+    ///         NEVER VALID. This enum and `IChallengeGame.Verdict` name
+    ///         overlapping concepts, but they are ordered DELIBERATELY
+    ///         DIFFERENTLY and their numeric values do not correspond:
+    ///
+    ///           Ruling  { None = 0,         Guilty = 1,    NotGuilty = 2 }
+    ///           Verdict { Inconclusive = 0, NotGuilty = 1, Guilty = 2 }
+    ///
+    ///         so `Ruling.Guilty == 1 == Verdict.NotGuilty` and
+    ///         `Ruling.NotGuilty == 2 == Verdict.Guilty` — a numeric
+    ///         conversion between them INVERTS GUILT, turning a guilty ballot
+    ///         into an acquittal and back. Nothing in this codebase casts
+    ///         between them and nothing ever should. Each enum's zero value is
+    ///         chosen for ITS OWN default semantics (`Ruling.None` = "this
+    ///         address has not voted", the sentinel `vote`'s `AlreadyVoted`
+    ///         check reads; `Verdict.Inconclusive` = "the case answered
+    ///         nothing"), and those are different meanings rather than one
+    ///         meaning spelled twice. `finalize` builds a `Verdict` from the
+    ///         TALLY directly and never converts a `Ruling` into one, which is
+    ///         why the divergence is inert today — do NOT "harmonise" the
+    ///         orders to enable a cast: the types are distinct on purpose,
+    ///         across a trust boundary, and re-ordering either one to make a
+    ///         cast typecheck is how an inert divergence becomes a
+    ///         guilt-inverting bug.
     enum Ruling {
         None,
         Guilty,
@@ -43,6 +63,19 @@ interface ITokenCourt {
     ///        this struct that was not: an owner re-pointing `challengeGame`
     ///        between `refer` and `finalize` would otherwise make `finalize`
     ///        rule a DIFFERENT game's challenge at the same numeric id.
+    /// @param ledger The `IExposureLedger` this case's accused set was derived
+    ///        from, PINNED at `refer` from the then-current
+    ///        `IChallengeGame.exposureLedger()`. `refer` reads that pointer
+    ///        exactly once and hands the resolved address to `_recordAccused`,
+    ///        so the accused set, `accusedWeight` and this field can never come
+    ///        from three different ledgers. Without the pin the case record
+    ///        carried no evidence of WHICH ledger produced its accused set, and
+    ///        any future reader that re-resolved the pointer live — a floor
+    ///        recompute, an indexer, a follow-up feature — would silently
+    ///        adjudicate against a different set than the one `vote` bars.
+    ///        RESIDUAL WINDOW: an owner re-point strictly between `file` and
+    ///        `refer` is absorbed BY the pin rather than blocked by it — see
+    ///        `refer`'s natspec.
     /// @param snapshotTs `executedAt - 1`, written ONCE in `refer` (D2) and
     ///        never re-derived. Pinning it is what stops the owner moving a
     ///        live case's electorate by re-pointing the governor or letting
@@ -71,6 +104,7 @@ interface ITokenCourt {
     struct Case {
         uint256 challengeId;
         address game; // pinned IChallengeGame this case rules on, written once in refer
+        address ledger; // pinned IExposureLedger the accused set was derived from, written once in refer
         uint256 snapshotTs; // executedAt - 1, written once in refer (D2)
         uint256 referredAt;
         uint256 voteWindowAtReferral; // pinned: owner cannot move a live case's clock (F5)
@@ -131,6 +165,15 @@ interface ITokenCourt {
     ///         checkpoint discounted to `ageFloorBps`, because the re-stake
     ///         re-anchors `stakedAt`, not at its original historic weight.
     error NoPresentHoldings();
+    /// @notice `renounceOwnership` was called. The court refuses it outright,
+    ///         for everyone including the owner: it is non-upgradeable, and an
+    ///         ownerless court can never again be re-wired
+    ///         (`setChallengeGame` / `setStakedWood`) or re-tuned
+    ///         (`setVoteWindow` / `setParticipationFloorBps`) — the rescue
+    ///         path for a compromised or redeployed dependency, and the
+    ///         counter-lever the live `participationFloorBps` read exists to
+    ///         provide, would both be gone permanently.
+    error OwnershipCannotBeRenounced();
     /// @notice A setter would break the cross-contract invariant `autoSlashDelay
     ///         + voteWindow + FINALIZE_BUFFER <= disputeTimeout` (B3). Raised by
     ///         `setVoteWindow` — see `ChallengeGame._requireWindowFits` for why
@@ -200,6 +243,14 @@ interface ITokenCourt {
     ///         enforced on-chain (the game's timeout is not gated on court
     ///         state) — it is the margin `refer`'s clock check reserves.
     function FINALIZE_BUFFER() external view returns (uint256);
+    /// @notice How far before a case's `snapshotTs` the participation floor's
+    ///         electorate base is cross-checked (B2). The base is the SMALLER
+    ///         of the electorate at the snapshot and the electorate this long
+    ///         before it, so stake younger than this cannot RAISE the floor —
+    ///         closing the denial-of-quorum lever a single snapshot read left
+    ///         open to anyone staking large, from a never-approving address,
+    ///         immediately before executing their own drain.
+    function FLOOR_LOOKBACK() external view returns (uint256);
     /// @notice The wired `IChallengeGame` this court adjudicates for and
     ///         reads challenge state from. Zero while unwired.
     function challengeGame() external view returns (address);
@@ -211,9 +262,13 @@ interface ITokenCourt {
     ///         referred under regardless of later changes here.
     function voteWindow() external view returns (uint256);
     /// @notice The anti-capture participation floor (D6), in bps of
-    ///         `total - accusedWeight` at `snapshotTs`. Turnout below this
-    ///         floor resolves `Inconclusive` rather than on the raw tally, so
-    ///         a thin, rented-stake vote cannot convict or acquit alone.
+    ///         `min(total(snapshotTs), total(snapshotTs - FLOOR_LOOKBACK))`
+    ///         minus `accusedWeight`. Turnout below this floor resolves
+    ///         `Inconclusive` rather than on the raw tally, so a thin,
+    ///         rented-stake vote cannot convict or acquit alone. Read LIVE at
+    ///         `finalize`, never pinned per case (D6) — which also makes it
+    ///         the owner's counter-lever if a large idle stake is observed
+    ///         inflating a live case's base.
     function participationFloorBps() external view returns (uint256);
     /// @notice Count of cases ever referred. Case ids are 1-indexed
     ///         (`caseOfChallenge == 0` means "no case").
@@ -247,6 +302,15 @@ interface ITokenCourt {
     ///         disputeTimeoutAtFiling - now >= voteWindow + FINALIZE_BUFFER`)
     ///         — a vote that could not finish
     ///         before the game's own timeout never opens.
+    /// @dev    PINS THE EXPOSURE LEDGER (`Case.ledger`) alongside `game` and
+    ///         `snapshotTs`: one read of `IChallengeGame.exposureLedger()`
+    ///         feeds both the stored pointer and the accused-set derivation.
+    ///         An owner `setExposureLedger` call AFTER this point cannot move
+    ///         a live case's accused set, weight, or participation floor.
+    ///         Its residual counterpart — a re-point strictly BETWEEN `file`
+    ///         and `refer` — is out of the court's reach entirely; see the
+    ///         implementation's natspec for why closing it belongs to
+    ///         `ChallengeGame`.
     /// @return caseId The new case's id.
     function refer(uint256 challengeId) external returns (uint256 caseId);
     /// @notice Cast the one vote this address gets on `caseId`.

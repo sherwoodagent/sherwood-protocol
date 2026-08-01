@@ -7,9 +7,13 @@ context: |
 
   Core capabilities are specced under openspec/specs/: syndicate-vault,
   syndicate-governor, guardian-staking, guardian-coverage, challenge-game,
-  token-court, epoch-nav, tier-policy, deployment-docs, dimensional-conventions.
+  token-court, epoch-nav, tier-policy, deployment-docs, dimensional-conventions,
+  operator-docs, supply-chain, test-fixtures, deploy-scripts, fee-splits,
+  instant-exit-fees, management-fee, performance-fee.
   Historical design/implementation records (migrated from the former
-  docs/superpowers workflow) live in openspec/changes/archive/.
+  docs/superpowers workflow, and reconciled from independently-authored
+  OpenSpec change proposals already merged to main) live in
+  openspec/changes/archive/.
 
   Conventions:
   - Robinhood Chain MaxCodeSize is 98,304 bytes (4x EIP-170); the legacy Base

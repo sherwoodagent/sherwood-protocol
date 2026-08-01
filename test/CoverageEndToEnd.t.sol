@@ -231,7 +231,7 @@ contract CoverageEndToEndTest is Test {
         registry.setExposureLedger(address(ledger));
 
         // ── Proposer-bond escrow authorized through the registry itself.
-        escrow = new ProposerBondEscrow(address(wood), address(registry));
+        escrow = new ProposerBondEscrow(address(wood), address(registry), address(ledger));
 
         // ── Wire both governors (test contract is their factory).
         govA.setExposureLedger(address(ledger));
@@ -797,7 +797,16 @@ contract CoverageEndToEndTest is Test {
         // Settle does NOT recycle the budget — the challenge window is still open.
         assertEq(ledger.openExposureUsd(g1), COVERAGE_USD, "coverage stays booked through settle");
 
-        // ── Bond returns in full: settlement is not a conviction.
+        // ── But not YET: the proposer self-settled an hour in, and an executed
+        //    proposal holds its bond until nothing can still convict it. The
+        //    bond is the one thing an early self-settle must not accelerate.
+        vm.expectRevert(ISyndicateGovernor.ChallengeWindowOpen.selector);
+        govA.reclaimProposerBond(pid);
+
+        // ── Bond returns in full once the challenge window has run out from
+        //    execution: settlement is not a conviction, it just is not proof of
+        //    innocence on the hour either.
+        vm.warp(govA.getProposal(pid).executedAt + ledger.challengeWindow());
         govA.reclaimProposerBond(pid);
         assertEq(wood.balanceOf(agentA), agentBalBefore, "bond refunded in full");
         assertEq(wood.balanceOf(address(escrow)), 0, "escrow drained");

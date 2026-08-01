@@ -305,13 +305,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         p.maxDrawdownBps = envelope.maxDrawdownBps;
         // Snapshot protocol and guardian fee config at propose time so settlement
         // uses rates/recipients that voters actually saw, not a post-vote change.
-        {
-            IProtocolConfig cfg = IProtocolConfig(protocolConfig);
-            p.snapshotProtocolFeeBps = cfg.protocolFeeBps();
-            p.snapshotProtocolFeeRecipient = cfg.protocolFeeRecipient();
-            p.snapshotGuardianFeeBps = cfg.guardianFeeBps();
-            p.snapshotGuardiansFeeRecipient = cfg.guardiansFeeRecipient();
-        }
+        _snapshotFeeConfig(p);
         if (isCollaborative) {
             _transition(p, ProposalState.Draft);
             // Written HERE, not in `_storeCoProposers` (which runs after
@@ -408,6 +402,13 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         _activeProposal = proposalId;
         _transition(proposal, ProposalState.Executed);
         proposal.executedAt = block.timestamp;
+        // Start the management-fee clock. Must follow `_activeProposal` so the
+        // vault's `totalAssets()` reads live NAV through the now-active lane,
+        // and must precede the execute batch so capital deployed by it is
+        // picked up by the batch's own base-changing hooks rather than being
+        // missed. Accrual runs from here to settle and nowhere else — the gap
+        // between proposals is free (design.md Decision 4).
+        ISyndicateVault(vault).startManagementAccrual();
         // Counter stays incremented through Executed; decremented once on the
         // Executed -> Settled edge in `_finishSettlement`. `_activeProposal`
         // also guards the Executed window (see `requestUnstakeOwner`).
@@ -579,9 +580,45 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      proposer the ESCROW recorded at lock time, so an arbitrary caller
     ///      can only accelerate the refund, never redirect it.
     ///
-    ///      Rejected / Expired / Cancelled all return the bond: forfeiture is
-    ///      exclusively a passed-challenge outcome (Plan C) — a guardian block
-    ///      is not a conviction, and an expired proposal moved no funds.
+    ///      Rejected / Expired / Cancelled all return the bond IMMEDIATELY:
+    ///      forfeiture is exclusively a passed-challenge outcome (Plan C), a
+    ///      guardian block is not a conviction, and — the load-bearing part —
+    ///      none of those three ever EXECUTED, so no drain was possible and
+    ///      there is nothing for a challenge to allege. Delaying them would
+    ///      lock honest capital for a fortnight to deter an attack their own
+    ///      lifecycle already made impossible.
+    ///
+    ///      SETTLED IS THE ONE THAT WAITS, and it waits on `executedAt` rather
+    ///      than on the state name — "did this proposal execute" is the real
+    ///      predicate, and it stays correct if a later state is ever added.
+    ///      `MIN_STRATEGY_DURATION_BEFORE_SELF_SETTLE` lets the PROPOSER settle
+    ///      its own strategy an hour after execution while everyone else waits
+    ///      `strategyDuration`; that hour against a 14-day challenge window
+    ///      meant a proposer could execute a drain, self-settle, reclaim the
+    ///      whole bond and be gone on day one, with the bond it posted against
+    ///      exactly that outcome never at risk. `ChallengeGame._settle` can now
+    ///      confiscate the bond — but only while it is still here to confiscate,
+    ///      which is what this delay guarantees. Neither half works alone.
+    ///
+    ///      TWO CONDITIONS, because the window is not the whole exposure. A
+    ///      filing on the last legal day convicts `autoSlashDelay` (7d) later,
+    ///      well past `executedAt + challengeWindow`, so the elapsed-time check
+    ///      alone would hand the bond back mid-accusation. The second check is
+    ///      the ledger's per-proposal coverage freeze — set by `file`, cleared
+    ///      by every terminal challenge path (`_settle` / `_fail` /
+    ///      `_refundAll`, refcounted across concurrent filings) — which is
+    ///      precisely "an accusation against this proposal is live". It cannot
+    ///      strand the bond: `resolve` is permissionless once the delay has run
+    ///      and a dispute times out on its own clock, so every freeze has a
+    ///      permissionless path off.
+    ///
+    ///      ACCEPTED RESIDUAL: `ChallengeGame.challengeableUntil` can extend the
+    ///      filing deadline past this gate after an `Inconclusive` unwind, so a
+    ///      bond can be released while a re-filing is still technically
+    ///      admissible. Closing it would mean reading a deadline that lives on
+    ///      the game, which this contract has no pointer to and should not grow
+    ///      one for; the game's own `setChallengeWindow` makes the same scope
+    ///      choice for the same reason.
     ///
     ///      Releases against `proposal.proposerBondEscrow` (bound at propose),
     ///      NOT the live `_bondEscrow` slot: the escrow has no owner and no
@@ -599,6 +636,35 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         }
         uint256 bond = proposal.proposerBondWood;
         if (bond == 0) revert NoBondToReclaim();
+        // The challenge-window hold, for EXECUTED proposals only. Ordered after
+        // the `bond == 0` check so a proposal that never posted a bond still
+        // reports `NoBondToReclaim` rather than being told to wait for a window
+        // it has nothing at stake in.
+        uint256 executedAt = proposal.executedAt;
+        if (executedAt != 0) {
+            address ledger = _exposureLedger;
+            // FAILS CLOSED, and the choice is not close. Fail-open would make
+            // `setExposureLedger(0)` a one-transaction bypass of this entire
+            // delay, available to the vault owner — who may be the proposer, or
+            // colluding with it — at exactly the moment it matters. Fail-closed
+            // costs a stuck bond, and that bond cannot be stuck permanently:
+            // a bond exists here only because a ledger was wired at propose
+            // time (that is where `proposerBondWood` is priced and locked), so
+            // the unset state is always a REGRESSION from a working
+            // configuration, and re-pointing `setExposureLedger` at any ledger
+            // — the old one, a replacement — makes every held bond reclaimable
+            // again. A recoverable freeze against an unrecoverable escape: the
+            // freeze wins. Same reasoning for a ledger that reverts on the
+            // reads below: the revert bubbles, the bond waits, governance
+            // re-points.
+            if (ledger == address(0)) revert ExposureLedgerUnset();
+            if (block.timestamp < executedAt + IExposureLedger(ledger).challengeWindow()) {
+                revert ChallengeWindowOpen();
+            }
+            if (IExposureLedger(ledger).isCoverageFrozen(address(this), proposalId)) {
+                revert ChallengeWindowOpen();
+            }
+        }
         address escrow = proposal.proposerBondEscrow;
         // Effects before interaction: zeroing first makes the reclaim
         // idempotent (a second call reverts NoBondToReclaim) and closes any
@@ -1198,18 +1264,36 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // adversarial emergency cannot dodge slash by racing a settle.
         _decOpen();
 
-        uint256 totalFee = 0;
-        if (pnl > 0) {
-            // H2/M4: a self-fee'd strategy (custody model — LPs deposit/redeem into the
-            // strategy, shares minted/burned on the vault) crystallises its own fees; the
-            // governor's float-delta PnL would misread net deposits as profit and double-
-            // charge. Such strategies opt out of ALL governor settle-fees. Read the
-            // propose-time snapshot, never a live call (TOCTOU + brick-on-revert).
-            if (!proposal.selfManagesFees) {
-                (agentFee, totalFee) = _distributeFees(
-                    proposalId, vault, asset, proposal.proposer, proposal.performanceFeeBps, uint256(pnl)
-                );
-            }
+        // ── Two-number fee model ──
+        // Ordering is load-bearing: management fee first (it lowers assets and
+        // therefore price per share), then the high-water-mark comparison, then
+        // performance. Reversing any pair would charge performance on assets the
+        // management fee already took, or ratchet the mark past value the fund
+        // never banked.
+        //
+        // The management fee is charged on EVERY settlement — profit, flat or
+        // loss. It is what funds the parties doing continuous work (the agent
+        // managing the book, the guardian network reviewing) in months when
+        // there is no profit to share.
+        uint256 totalFee = _chargeManagementFee(proposalId, vault, asset, proposal.proposer);
+
+        // H2/M4: a self-fee'd strategy (custody model — LPs deposit/redeem into the
+        // strategy, shares minted/burned on the vault) crystallises its own fees; the
+        // governor's float-delta PnL would misread net deposits as profit and double-
+        // charge. Read the propose-time snapshot, never a live call (TOCTOU +
+        // brick-on-revert).
+        //
+        // The opt-out covers the PERFORMANCE leg only. `selfManagesFees` exists
+        // because float-delta PnL misreads custody deposits as profit — a defect
+        // in profit measurement. The management fee does not use PnL at all
+        // (it is capital x time), so the reason for the exemption does not reach
+        // it (design.md Decision 3).
+        // Always called, even on the self-managed path — see `chargeNew`.
+        {
+            uint256 perfFee;
+            (agentFee, perfFee) =
+                _chargePerformanceFee(proposalId, vault, asset, proposal.proposer, !proposal.selfManagesFees);
+            totalFee += perfFee;
         }
 
         // Stamp the frozen Lane B settle price for this proposal AFTER fees so
@@ -1221,6 +1305,29 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         emit ProposalSettled(proposalId, vault, pnl, totalFee, block.timestamp - proposal.executedAt);
     }
 
+    /// @dev Snapshot every fee rate, recipient and split in force at propose
+    ///      time so settlement pays what voters actually approved rather than a
+    ///      post-vote governance change.
+    ///
+    ///      Extracted from `propose` rather than inlined: `propose` sits at the
+    ///      Yul stack-depth limit (its own arguments alone nearly fill the
+    ///      frame), and the reads below need more slots than remain. Keeping
+    ///      them in a separate frame is what makes the snapshot affordable.
+    ///
+    ///      The splits are deliberately NOT validated here. `ProtocolConfig` is
+    ///      born valid and rejects an invalid write, so a zero-sum split is
+    ///      unreachable for a real config; reverting would only ever fire
+    ///      against a mock, and would turn a fee-accounting problem into a
+    ///      settlement-liveness one. The charge functions skip a zero-sum split
+    ///      instead (design.md Decision 8).
+    function _snapshotFeeConfig(StrategyProposal storage p) private {
+        IProtocolConfig cfg = IProtocolConfig(protocolConfig);
+        p.snapshotProtocolFeeRecipient = cfg.protocolFeeRecipient();
+        p.snapshotGuardiansFeeRecipient = cfg.guardiansFeeRecipient();
+        p.snapshotMgmtSplit = cfg.mgmtSplit();
+        p.snapshotPerfSplit = cfg.perfSplit();
+    }
+
     /// @dev Clamp `fee` to `cap`, emitting FeeClamped when the clamp fires.
     function _clampPerformanceFee(uint256 proposalId, uint256 fee, uint256 cap) private returns (uint256) {
         if (fee > cap) {
@@ -1230,102 +1337,206 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         return fee;
     }
 
-    /// @dev Distribute protocol, agent, and management fees. Extracted to avoid stack-too-deep.
-    ///      Reads fee config from the propose-time snapshot so settlement uses rates and
-    ///      recipients that voters actually approved, not any post-vote change.
+    /// @dev Charge the always-on management fee and divide it three ways.
+    ///      Extracted to avoid stack-too-deep.
     ///
-    ///      ── THE FEE MAP ─ every bps source, its owner, its cap, its snapshot point ──
-    ///      Stage order (1–2 are parallel slices of gross profit; only 3–4 waterfall,
-    ///      each computed on what the previous left):
-    ///        1. protocolFee  = grossPnl · protocolFeeBps
-    ///             source: ProtocolConfig.protocolFeeBps (owner: protocol multisig)
-    ///             snapshot: propose time → prop.snapshotProtocolFeeBps/-Recipient
-    ///        2. guardianFee  = grossPnl · guardianFeeBps
-    ///             source: ProtocolConfig.guardianFeeBps (owner: protocol multisig)
-    ///             snapshot: propose time → prop.snapshotGuardianFeeBps/-Recipient
-    ///             delivery: WOOD airdrop via Merkl, attributed by GuardianFeeAccrued
-    ///        3. agentFee     = netPnl · perfFeeBps
+    ///      ── THE FEE MAP — two depositor-facing numbers, everyone else paid
+    ///      out of internal splits ──
+    ///      Unlike the four-step waterfall this replaced, the two fees are
+    ///      independent and each is ONE division of ONE base. No recipient's
+    ///      share is reduced by another's.
+    ///
+    ///        1. managementFee = assetSeconds · managementFeeBps / (10_000 · 365d)
+    ///             base: fund assets integrated over the proposal's life, from
+    ///             the vault's accrual accumulator (`consumeManagementAccrual`)
+    ///             charged: on EVERY settlement — profit, flat, or loss
+    ///             source: vault.managementFeeBps() — read LIVE, and safely so:
+    ///             it is written only at vault `initialize` and has no setter,
+    ///             so it cannot move between propose and settle
+    ///             split: prop.snapshotMgmtSplit → agent / protocol / guardian
+    ///
+    ///        2. performanceFee = aboveHighWaterMark · perfFeeBps
+    ///             base: value above the fund's previous PEAK price per share,
+    ///             read AFTER the management fee (which lowers it)
+    ///             charged: only when the fund is above its mark
     ///             source: vault.agentFeeBps() (owner: VAULT owner; offset-by-one
     ///             sentinel, default FeeConstants.DEFAULT_AGENT_FEE_BPS = 5%)
-    ///             caps: vault-side FeeConstants.MAX_PERFORMANCE_FEE_BPS (15%) at set;
+    ///             caps: vault-side FeeConstants.MAX_PERFORMANCE_FEE_BPS (30%) at set;
     ///             clamped AGAIN here to the governor's live _params.maxPerformanceFeeBps
-    ///             (owner: governor params; the cap-of-caps lives in GovernorParameters)
-    ///             snapshot: propose time → prop.performanceFeeBps; split across
-    ///             co-proposers by _distributeAgentFee
-    ///        4. mgmtFee      = (netPnl − agentFee) · managementFeeBps
-    ///             source: vault.managementFeeBps() (owner: vault owner, set at init;
-    ///             read LIVE at settle — the one non-snapshotted rate)
-    ///      Escape hatch: IStrategy.selfManagesFees() == true (snapshotted at propose)
-    ///      skips this ENTIRE waterfall — the strategy must self-collect including the
-    ///      protocol's cut. No in-tree strategy currently does; any that sets
-    ///      the flag must implement its own protocol-fee leg.
+    ///             (factory default = the 20% headline)
+    ///             snapshot: propose time → prop.performanceFeeBps
+    ///             split: prop.snapshotPerfSplit → agent / protocol / guardian / owner
+    ///             then: the high-water mark ratchets to the post-fee price
+    ///
+    ///      The agent's slice of BOTH fees flows through `_distributeAgentFee`,
+    ///      so co-proposer splits apply to management as well as carry.
+    ///      Guardian delivery is a WOOD airdrop via Merkl, attributed by the
+    ///      GuardianFeeAccrued event.
+    ///      Escape hatch: IStrategy.selfManagesFees() == true (snapshotted at
+    ///      propose) skips the PERFORMANCE leg only — the management fee does
+    ///      not use PnL, so the misread-PnL reason for the exemption does not
+    ///      reach it (design.md Decision 3). No in-tree strategy currently sets
+    ///      the flag; any that does must implement its own protocol-fee leg.
     ///      Failure mode: any recipient transfer that reverts escrows in _unclaimedFees
     ///      (pull via claimUnclaimedFees) so settlement never bricks.
-    function _distributeFees(
-        uint256 proposalId,
-        address vault,
-        address asset,
-        address proposer,
-        uint256 perfFeeBps,
-        uint256 profit
-    ) internal returns (uint256 agentFee, uint256 totalFee) {
-        uint256 protocolFee = 0;
-        uint256 guardianFee = 0;
-
-        // Read fee config from the propose-time snapshot.
+    /// @return mgmtFee The whole management fee charged.
+    function _chargeManagementFee(uint256 proposalId, address vault, address asset, address proposer)
+        internal
+        returns (uint256 mgmtFee)
+    {
+        // Consume-and-reset: hands back the integral and stops the clock, so
+        // the gap before the next proposal accrues nothing.
+        uint256 assetSeconds = ISyndicateVault(vault).consumeManagementAccrual();
         StrategyProposal storage prop = _proposals[proposalId];
-        uint256 snapshotProtocolFeeBps = prop.snapshotProtocolFeeBps;
-        address snapshotProtocolFeeRecipient = prop.snapshotProtocolFeeRecipient;
-        uint256 snapshotGuardianFeeBps = prop.snapshotGuardianFeeBps;
-        address snapshotGuardiansFeeRecipient = prop.snapshotGuardiansFeeRecipient;
+        // Read live rather than snapshotted, and safe to do so: `_managementFeeBps`
+        // is written only at `SyndicateVault.initialize` and has no setter, so it
+        // cannot move between propose and settle. A snapshot would be equivalent
+        // and would cost `propose` a stack slot it does not have.
+        uint256 rateBps = ISyndicateVault(vault).managementFeeBps();
 
-        // Protocol fee taken first from gross profit.
-        if (snapshotProtocolFeeBps > 0) {
-            protocolFee = (profit * snapshotProtocolFeeBps) / BPS_DENOMINATOR;
-            if (protocolFee > 0) {
-                if (snapshotProtocolFeeRecipient == address(0)) revert InvalidProtocolFeeRecipient();
-                _payFee(vault, asset, snapshotProtocolFeeRecipient, protocolFee);
-            }
+        // The fee owed for the WHOLE proposal, including the time exiters'
+        // capital was present — the accumulator kept ticking on it.
+        mgmtFee = (assetSeconds * rateBps) / (BPS_DENOMINATOR * 365 days);
+
+        // Release what instant exiters already paid. This is the fix for the
+        // double-charge: the figure above still contains the exiters' share, so
+        // paying out the full amount must be funded partly from their parked
+        // contribution rather than entirely from the fund. Releasing raises
+        // `totalAssets()` by exactly that contribution, so the depositors who
+        // stayed bear only `mgmtFee - crystallized`. (The performance leg needs
+        // no equivalent: exited shares are burned, so they are absent from its
+        // base by construction.)
+        uint256 crystallized = ISyndicateVault(vault).consumeCrystallizedMgmt();
+        if (crystallized > mgmtFee) {
+            // Rounding only — the parked amount is a pro-rata slice of the same
+            // accrual. Pay out what was actually collected.
+            mgmtFee = crystallized;
         }
 
-        // Guardian fee — slice of gross PnL routed to the team guardians-fee
-        // recipient (a multisig). Swapped to WOOD off-chain and airdropped to
-        // approvers/delegators weekly via Merkl. Per-proposal attribution is the
-        // GuardianFeeAccrued event + the registry getApproverWeights getter.
-        if (snapshotGuardianFeeBps > 0) {
-            guardianFee = (profit * snapshotGuardianFeeBps) / BPS_DENOMINATOR;
-            if (guardianFee > 0) {
+        if (mgmtFee == 0) return 0;
+
+        IProtocolConfig.MgmtSplit memory s = prop.snapshotMgmtSplit;
+        // A zero-sum split is unreachable for a real config (ProtocolConfig is
+        // born valid and validates every write), but skipping beats reverting:
+        // a bricked settlement is the worse failure (design.md Decision 8).
+        if (uint256(s.agentBps) + s.protocolBps + s.guardianBps != BPS_DENOMINATOR) return 0;
+
+        uint256 toProtocol = (mgmtFee * s.protocolBps) / BPS_DENOMINATOR;
+        uint256 toGuardian = (mgmtFee * s.guardianBps) / BPS_DENOMINATOR;
+        // A leg whose recipient was never configured pays nothing and folds
+        // into the agent's remainder. Paying it anyway would send to
+        // address(0): the transfer reverts, `_payFee` escrows it against
+        // address(0), and it becomes permanently unclaimable — a silent burn
+        // of 10% of every management fee. This could not happen under the
+        // previous model, where the guardian leg was its own rate that
+        // defaulted to zero; here it is a share of the split and is always
+        // present.
+        if (prop.snapshotProtocolFeeRecipient == address(0)) toProtocol = 0;
+        if (prop.snapshotGuardiansFeeRecipient == address(0)) toGuardian = 0;
+        // The agent takes the remainder rather than its own floor-divided
+        // share, so rounding dust lands with the largest earner instead of
+        // stranding in the vault.
+        uint256 toAgent = mgmtFee - toProtocol - toGuardian;
+
+        if (toProtocol > 0) _payFee(vault, asset, prop.snapshotProtocolFeeRecipient, toProtocol);
+        if (toGuardian > 0) {
+            // Attribution signal only on actual delivery — see the note in
+            // `_chargePerformanceFee`.
+            if (_payFee(vault, asset, prop.snapshotGuardiansFeeRecipient, toGuardian)) {
+                emit GuardianFeeAccrued(proposalId, asset, prop.snapshotGuardiansFeeRecipient, toGuardian);
+            }
+        }
+        // The agent's slice follows the co-proposer split, exactly as carry does.
+        if (toAgent > 0) _distributeAgentFee(proposalId, vault, asset, proposer, toAgent);
+
+        emit ManagementFeeCharged(proposalId, asset, mgmtFee, assetSeconds);
+    }
+
+    /// @dev Charge the performance fee on value above the high-water mark and
+    ///      divide it four ways in ONE split — not the sequential waterfall this
+    ///      replaces, which compounded four separate haircuts on the same
+    ///      profit. Each recipient's share is computed from the full fee, never
+    ///      from what another recipient left behind.
+    ///
+    ///      Must run AFTER the management fee: that fee lowers the vault's
+    ///      assets and therefore its price per share, so reading the above-mark
+    ///      base first would charge performance on assets already taken.
+    /// @return agentFee The agent's slice, reported for the settle event.
+    /// @return perfFee  The whole fee charged.
+    /// @param chargeNew False on the `selfManagesFees` path: the strategy
+    ///        collects its own performance fee, so settlement charges none.
+    ///        The function still runs, because fees already crystallized from
+    ///        instant exiters must be released and paid — skipping the call
+    ///        entirely would strand them in the vault forever, permanently
+    ///        excluded from `totalAssets()` and therefore lost to depositors.
+    function _chargePerformanceFee(uint256 proposalId, address vault, address asset, address proposer, bool chargeNew)
+        internal
+        returns (uint256 agentFee, uint256 perfFee)
+    {
+        StrategyProposal storage prop = _proposals[proposalId];
+
+        // Profit measured against the fund's previous peak, not against this
+        // proposal's own starting balance — a fund that fell and recovered has
+        // already paid for this ground.
+        //
+        // Read BEFORE releasing the parked performance fees: those assets sit
+        // in the vault but already belong to the recipients, and releasing them
+        // raises `totalAssets()` and therefore the price per share. Reading
+        // after would charge a performance fee on money the fund does not own.
+        uint256 base = chargeNew ? ISyndicateVault(vault).aboveHighWaterMark() : 0;
+
+        if (base > 0) {
+            // Snapshotted at propose so it matches what voters approved, then
+            // clamped to the governor's tunable ceiling so a later cap reduction
+            // still bites. The clamp emits and continues rather than reverting.
+            uint256 perfFeeBps = _clampPerformanceFee(proposalId, prop.performanceFeeBps, _params.maxPerformanceFeeBps);
+            perfFee = (base * perfFeeBps) / BPS_DENOMINATOR;
+        }
+
+        // Now safe to release: whatever instant exiters already paid is
+        // distributed on top of what settlement charges the stayers.
+        perfFee += ISyndicateVault(vault).consumeCrystallizedPerf();
+
+        IProtocolConfig.PerfSplit memory s = prop.snapshotPerfSplit;
+        // A zero-sum split is unreachable for a real config; skipping beats
+        // reverting, since a bricked settlement is the worse failure. Still
+        // ratchet so the mark is not left stale.
+        if (uint256(s.agentBps) + s.protocolBps + s.guardianBps + s.ownerBps != BPS_DENOMINATOR) {
+            ISyndicateVault(vault).ratchetHighWaterMark();
+            return (0, 0);
+        }
+
+        if (perfFee > 0) {
+            uint256 toProtocol = (perfFee * s.protocolBps) / BPS_DENOMINATOR;
+            uint256 toGuardian = (perfFee * s.guardianBps) / BPS_DENOMINATOR;
+            uint256 toOwner = (perfFee * s.ownerBps) / BPS_DENOMINATOR;
+            // Same unconfigured-recipient rule as the management leg: fold into
+            // the agent's remainder rather than escrowing against address(0),
+            // where the amount would be permanently unclaimable.
+            if (prop.snapshotProtocolFeeRecipient == address(0)) toProtocol = 0;
+            if (prop.snapshotGuardiansFeeRecipient == address(0)) toGuardian = 0;
+            agentFee = perfFee - toProtocol - toGuardian - toOwner;
+
+            if (toProtocol > 0) _payFee(vault, asset, prop.snapshotProtocolFeeRecipient, toProtocol);
+            if (toGuardian > 0) {
                 // Emit the attribution signal ONLY on actual delivery. If the
                 // transfer escrows (recipient blacklisted), the asset stays in
                 // the vault pending `claimUnclaimedFees` — emitting here would
                 // make the off-chain Merkl bot airdrop WOOD for a fee that was
                 // never delivered, then double-pay when the escrow is recovered.
-                if (_payFee(vault, asset, snapshotGuardiansFeeRecipient, guardianFee)) {
-                    emit GuardianFeeAccrued(proposalId, asset, snapshotGuardiansFeeRecipient, guardianFee);
+                if (_payFee(vault, asset, prop.snapshotGuardiansFeeRecipient, toGuardian)) {
+                    emit GuardianFeeAccrued(proposalId, asset, prop.snapshotGuardiansFeeRecipient, toGuardian);
                 }
             }
+            if (toOwner > 0) _payFee(vault, asset, ISyndicateVault(vault).owner(), toOwner);
+            if (agentFee > 0) _distributeAgentFee(proposalId, vault, asset, proposer, agentFee);
+
+            emit PerformanceFeeCharged(proposalId, asset, perfFee, base);
         }
 
-        uint256 netProfit = profit - protocolFee - guardianFee;
-
-        // Agent performance fee from net profit. `perfFeeBps` was snapshotted
-        // from the vault at propose time (so it matches what voters approved);
-        // clamp it to the governor's tunable maxPerformanceFeeBps so a later
-        // cap reduction still applies.
-        perfFeeBps = _clampPerformanceFee(proposalId, perfFeeBps, _params.maxPerformanceFeeBps);
-        agentFee = (netProfit * perfFeeBps) / BPS_DENOMINATOR;
-
-        // Management fee from remainder after agent fee
-        uint256 mgmtFee = ((netProfit - agentFee) * ISyndicateVault(vault).managementFeeBps()) / BPS_DENOMINATOR;
-
-        if (agentFee > 0) {
-            _distributeAgentFee(proposalId, vault, asset, proposer, agentFee);
-        }
-        if (mgmtFee > 0) {
-            _payFee(vault, asset, ISyndicateVault(vault).owner(), mgmtFee);
-        }
-
-        totalFee = protocolFee + guardianFee + agentFee + mgmtFee;
+        // Ratchet last, against the post-fee price. Monotonic: a loss leaves the
+        // mark where it was, which is what makes the recovery free.
+        ISyndicateVault(vault).ratchetHighWaterMark();
     }
 
     /// @dev Distribute agent fee to co-proposers (if any) and lead proposer. Extracted to avoid stack-too-deep.
