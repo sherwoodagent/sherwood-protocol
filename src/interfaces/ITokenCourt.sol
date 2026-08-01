@@ -63,6 +63,19 @@ interface ITokenCourt {
     ///        this struct that was not: an owner re-pointing `challengeGame`
     ///        between `refer` and `finalize` would otherwise make `finalize`
     ///        rule a DIFFERENT game's challenge at the same numeric id.
+    /// @param ledger The `IExposureLedger` this case's accused set was derived
+    ///        from, PINNED at `refer` from the then-current
+    ///        `IChallengeGame.exposureLedger()`. `refer` reads that pointer
+    ///        exactly once and hands the resolved address to `_recordAccused`,
+    ///        so the accused set, `accusedWeight` and this field can never come
+    ///        from three different ledgers. Without the pin the case record
+    ///        carried no evidence of WHICH ledger produced its accused set, and
+    ///        any future reader that re-resolved the pointer live — a floor
+    ///        recompute, an indexer, a follow-up feature — would silently
+    ///        adjudicate against a different set than the one `vote` bars.
+    ///        RESIDUAL WINDOW: an owner re-point strictly between `file` and
+    ///        `refer` is absorbed BY the pin rather than blocked by it — see
+    ///        `refer`'s natspec.
     /// @param snapshotTs `executedAt - 1`, written ONCE in `refer` (D2) and
     ///        never re-derived. Pinning it is what stops the owner moving a
     ///        live case's electorate by re-pointing the governor or letting
@@ -91,6 +104,7 @@ interface ITokenCourt {
     struct Case {
         uint256 challengeId;
         address game; // pinned IChallengeGame this case rules on, written once in refer
+        address ledger; // pinned IExposureLedger the accused set was derived from, written once in refer
         uint256 snapshotTs; // executedAt - 1, written once in refer (D2)
         uint256 referredAt;
         uint256 voteWindowAtReferral; // pinned: owner cannot move a live case's clock (F5)
@@ -288,6 +302,15 @@ interface ITokenCourt {
     ///         disputeTimeoutAtFiling - now >= voteWindow + FINALIZE_BUFFER`)
     ///         — a vote that could not finish
     ///         before the game's own timeout never opens.
+    /// @dev    PINS THE EXPOSURE LEDGER (`Case.ledger`) alongside `game` and
+    ///         `snapshotTs`: one read of `IChallengeGame.exposureLedger()`
+    ///         feeds both the stored pointer and the accused-set derivation.
+    ///         An owner `setExposureLedger` call AFTER this point cannot move
+    ///         a live case's accused set, weight, or participation floor.
+    ///         Its residual counterpart — a re-point strictly BETWEEN `file`
+    ///         and `refer` — is out of the court's reach entirely; see the
+    ///         implementation's natspec for why closing it belongs to
+    ///         `ChallengeGame`.
     /// @return caseId The new case's id.
     function refer(uint256 challengeId) external returns (uint256 caseId);
     /// @notice Cast the one vote this address gets on `caseId`.
