@@ -105,12 +105,31 @@ theft-enabling.
 
 ## Risks and preconditions
 
-- **The factory is not canonical Uniswap** (`0x8bcE…937f`). Code size (~11KB) is
-  consistent with a standard `UniswapV2Pair`, but that is not proof. **Before
-  wiring, verify the fork keeps standard semantics**: `price0CumulativeLast` in
-  UQ112x112, advanced inside `_update` on the first interaction per block,
-  `blockTimestampLast` wrapping at 2^32. A fork with a modified accumulator
-  produces a wrong TWAP silently.
+- ~~**The factory is not canonical Uniswap**~~ — **RESOLVED 2026-08-01, proven
+  standard.** The factory (`0x8bcE…937f`) is not a Uniswap deployment, but the
+  pair contract is byte-identical Uniswap V2. Proof by CREATE2 derivation:
+
+  ```
+  salt    = keccak(WETH ‖ WOOD)        = 0x4ae4de5c…9831
+  init    = canonical UniswapV2Pair    = 0x96e8ac42…845f
+  CREATE2(0x8bcE…937f, salt, init)     = 0xbf3bb81d…54c1
+  actual deployed pair                 = 0xBF3BB81d…54C1     MATCH
+  ```
+
+  A CREATE2 address commits to the exact creation bytecode, so reproducing the
+  live address from Uniswap's canonical init-code hash means the deployed
+  contract came from byte-identical V2 pair code — forging it would require a
+  keccak256 preimage collision. This is stronger than reading verified source.
+  Corroborated by the 11,293-byte runtime (right size for `UniswapV2Pair`) and
+  by an encoding sanity check: `price0CumulativeLast / (spot × 2^112)` implies
+  a pair age of ~8.8 days, which is plausible and would be absurd under any
+  other fixed-point format.
+
+  Therefore confirmed: `_update` advances the accumulator on the first
+  interaction per block, cumulatives are UQ112x112, `blockTimestampLast` wraps
+  at 2^32, standard 0.3% fee. Only residual is a metamorphic redeploy
+  (selfdestruct + re-CREATE2), which `UniswapV2Pair` cannot do — it contains no
+  `SELFDESTRUCT`, and post-EIP-6780 it would not clear code regardless.
 - **Quiet-pair degradation.** The standard `currentCumulativePrices` helper
   extrapolates the gap since the last interaction using *current spot*. The
   pair is presently traded every few seconds so this is inert — but a long

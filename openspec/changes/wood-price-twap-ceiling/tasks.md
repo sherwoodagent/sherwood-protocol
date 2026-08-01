@@ -1,12 +1,13 @@
 # Tasks
 
-- [ ] 1. **Verify the fork before building anything.** Read the pair at
-  `0xBF3BB81de6285b8310A028d1C2Cd38F9419d54C1` and its factory
-  `0x8bcEaA40B9AcdfAedF85AdF4FF01F5Ad6517937f`. Confirm standard V2
-  accumulator semantics: `price0CumulativeLast` in UQ112x112, advanced in
-  `_update` on the first interaction per block, `blockTimestampLast` wrapping
-  at 2^32. **If the fork deviates, stop and report** — the rest of this change
-  is unsound without it.
+- [x] 1. ~~Verify the fork before building anything.~~ **DONE 2026-08-01 —
+  proven standard by CREATE2 derivation** (see design.md risks). The pair at
+  `0xBF3BB81de6285b8310A028d1C2Cd38F9419d54C1` reproduces exactly from the
+  canonical Uniswap V2 init-code hash under factory
+  `0x8bcEaA40B9AcdfAedF85AdF4FF01F5Ad6517937f`, so `_update`, the UQ112x112
+  cumulatives and the 2^32 timestamp wrap are all standard. No deviation; the
+  change rests on solid ground. **Re-run this derivation if the pair address
+  ever changes** — it is a one-command check.
 - [ ] 2. Re-read the live reserves and ETH/USD answer; update design.md's
   measured block if they have moved materially.
 - [ ] 3. `src/pricing/WoodTwapOracle.sol`: permissionless `update()` storing
