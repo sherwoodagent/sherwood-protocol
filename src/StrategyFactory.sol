@@ -38,9 +38,8 @@ interface IVaultMembership {
 ///         The vault must additionally be registered on `syndicateFactory` so
 ///         a rogue contract cannot spoof the membership view.
 ///
-///         Sherlock run #1 finding #34 — `template` is gated by an
-///         owner-managed allowlist. Pre-fix, `cloneAndInit` accepted any
-///         address as a template, so a hostile agent could clone an
+///         `template` is gated by an owner-managed allowlist: an unlisted
+///         template reverts, so a hostile agent cannot clone an
 ///         attacker-controlled contract and route vault assets to it via a
 ///         governor proposal. The governor doesn't independently validate
 ///         the strategy address against an implementation registry, so the
@@ -51,7 +50,7 @@ contract StrategyFactory is Ownable {
     ///      meaningless if the registry it consults can be hot-swapped.
     address public immutable syndicateFactory;
 
-    /// @notice Sherlock #34 — owner-managed allowlist of strategy templates
+    /// @notice Owner-managed allowlist of strategy templates
     ///         that may be cloned through this factory. Default: empty
     ///         (everything reverts). The owner (deployer / Sherwood multisig)
     ///         adds the canonical templates (Aerodrome / Moonwell / Portfolio
@@ -61,12 +60,11 @@ contract StrategyFactory is Ownable {
     error Unauthorized();
     error VaultNotRegistered();
     error InvalidSyndicateFactory();
-    /// @notice Sherlock #34 — `template` is not on the allowlist.
+    /// @notice `template` is not on the allowlist.
     error TemplateNotApproved(address template);
-    /// @notice Sherlock run #2 #9 partial — `proposer` arg to
-    ///         `cloneAndInit` / `cloneAndInitDeterministic` must equal
-    ///         `msg.sender` so the strategy's stored `_proposer` is the
-    ///         deployer (a known authorized address), not an arbitrary
+    /// @notice `proposer` arg to `cloneAndInit` / `cloneAndInitDeterministic`
+    ///         must equal `msg.sender` so the strategy's stored `_proposer` is
+    ///         the deployer (a known authorized address), not an arbitrary
     ///         external address that could retain `onlyProposer` mutation
     ///         rights post-execution.
     error ProposerMustBeSender();
@@ -97,33 +95,31 @@ contract StrategyFactory is Ownable {
         revert Unauthorized();
     }
 
-    /// @dev Sherlock #34 — gate the template against the allowlist.
+    /// @dev Gate the template against the allowlist.
     function _authTemplate(address template) internal view {
         if (!approvedTemplate[template]) revert TemplateNotApproved(template);
     }
 
     /// @notice Clone `template` and run `initialize(vault, proposer, data)` atomically.
-    /// @param template Strategy template address. MUST be on the allowlist (Sherlock #34).
+    /// @param template Strategy template address. MUST be on the allowlist.
     /// @param vault    Vault that will own the clone's lifecycle. MUST equal `msg.sender`.
-    /// @param proposer Strategy proposer. MUST equal `msg.sender` (Sherlock run #2 #9
-    ///                 partial fix — see contract-level comment for full rationale).
+    /// @param proposer Strategy proposer. MUST equal `msg.sender` (see the
+    ///                 dev comment below for the rationale).
     /// @param data     Strategy-specific init bytes (decoded inside `_initialize`).
     /// @return clone   Address of the cloned + initialized strategy.
-    /// @dev Sherlock run #2 #9 partial: requiring `proposer == msg.sender`
-    ///      ties the strategy clone's stored `_proposer` to the deployer.
-    ///      Closes the audit's specific attack vector (an arbitrary EXTERNAL
-    ///      address X retaining `onlyProposer` mutation rights on the live
-    ///      strategy) by ensuring `_proposer` is a known authorized address
-    ///      (vault owner OR registered agent of this vault) rather than an
-    ///      attacker-supplied unknown. Does NOT fully close the
-    ///      cross-agent case (agent A deploys, agent B proposes via
+    /// @dev Requiring `proposer == msg.sender` ties the strategy clone's
+    ///      stored `_proposer` to the deployer, closing the attack vector of
+    ///      an arbitrary EXTERNAL address X retaining `onlyProposer`
+    ///      mutation rights on the live strategy — `_proposer` is a known
+    ///      authorized address (vault owner OR registered agent of this
+    ///      vault) rather than an attacker-supplied unknown. Does NOT fully
+    ///      close the cross-agent case (agent A deploys, agent B proposes via
     ///      governor → strategy's `_proposer = A` ≠ `proposal.proposer = B`);
     ///      the full fix requires a governor-side `IStrategy.proposer() ==
     ///      msg.sender` check at `propose`, deferred because the ~140 B
     ///      `staticcall` setup doesn't fit governor's +12 B margin without
     ///      ABI-breaking trims. In practice, agents deploy their own
-    ///      strategies and propose them, so the partial fix covers the
-    ///      common case.
+    ///      strategies and propose them, so this covers the common case.
     function cloneAndInit(address template, address vault, address proposer, bytes calldata data)
         external
         returns (address clone)
@@ -138,18 +134,18 @@ contract StrategyFactory is Ownable {
 
     /// @notice Deterministic variant — caller can predict the clone address via
     ///         `Clones.predictDeterministicAddress(template, keccak256(abi.encode(vault, salt)), factory)`.
-    /// @dev Sherlock run #2 #9 partial — see `cloneAndInit` for the rationale.
-    /// @dev #387 — the CREATE2 salt is bound to `vault`
+    /// @dev See `cloneAndInit` for the `proposer == msg.sender` rationale.
+    /// @dev The CREATE2 salt is bound to `vault`
     ///      (`keccak256(abi.encode(vault, salt))`) so each vault gets its own
-    ///      address namespace. `salt` is visible in calldata; without the fold a
+    ///      address namespace. `salt` is visible in calldata; without this a
     ///      front-runner could race the deploy and occupy the predicted address
     ///      with a clone bound to their own vault — a recoverable DoS that would
-    ///      brick a keyless propose referencing it. With the fold, occupying a
-    ///      vault's address requires passing that vault here, which `_authClone`
+    ///      brick a keyless propose referencing it. Occupying a vault's address
+    ///      requires passing that vault here, which `_authClone`
     ///      only lets the vault's owner / registered agents do. The off-chain
-    ///      predictor mirrors this fold byte-for-byte (SDK `effectiveStrategySalt`,
-    ///      issue #387 external-signer PR); the two MUST stay in lockstep or
-    ///      predictions diverge from the deployed address.
+    ///      predictor mirrors this byte-for-byte (SDK `effectiveStrategySalt`);
+    ///      the two MUST stay in lockstep or predictions diverge from the
+    ///      deployed address.
     function cloneAndInitDeterministic(
         address template,
         address vault,

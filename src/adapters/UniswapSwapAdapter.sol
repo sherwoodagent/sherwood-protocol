@@ -46,7 +46,7 @@ interface IQuoterV2 {
         external
         returns (uint256 amountOut, uint160 sqrtPriceX96After, uint32 initializedTicksCrossed, uint256 gasEstimate);
 
-    /// @dev Sherlock #58 — packed V3 path quoting for mode-1 multi-hop routes.
+    /// @dev Packed V3 path quoting for mode-1 multi-hop routes.
     function quoteExactInput(bytes calldata path, uint256 amountIn)
         external
         returns (
@@ -237,19 +237,15 @@ contract UniswapSwapAdapter is ISwapAdapter {
         } else if (mode == 1) {
             // V3 multi-hop via chained exactInputSingle calls.
             // SwapRouter02's exactInput computes wrong pool addresses for certain pairs
-            // on Base, so we decompose the path and swap hop-by-hop using exactInputSingle
-            // which always resolves pools correctly.
+            // on Base, so this decomposes the path and swaps hop-by-hop using
+            // exactInputSingle, which always resolves pools correctly.
             //
-            // Sherlock run #2 #11: extraData v2 — `abi.encode(bytes path,
-            // uint16 perHopSlippageBps)`. Each non-terminal hop's
-            // `amountOutMinimum` is derived AT SWAP TIME from a quoter
-            // pre-call (`expected * (10000 - perHopSlippageBps) / 10000`),
-            // so an MEV sandwich on any intermediate hop reverts at that
-            // hop instead of silently draining value into the next. Stays
-            // STATIC across swaps (template-friendly): the caller sets one
-            // slippage bps and the adapter handles per-swap quoting. The
-            // legacy `amountOutMin` parameter is still enforced on the
-            // terminal hop as a top-level safety check.
+            // extraData: `abi.encode(bytes path, uint16 perHopSlippageBps)`. Each
+            // non-terminal hop's `amountOutMinimum` is derived at swap time from a
+            // quoter pre-call (`expected * (10000 - perHopSlippageBps) / 10000`),
+            // so an MEV sandwich on any intermediate hop reverts at that hop
+            // instead of silently draining value into the next. The legacy
+            // `amountOutMin` parameter is still enforced on the terminal hop.
             (bytes memory path, uint16 perHopSlippageBps) = abi.decode(routeData, (bytes, uint16));
             require(perHopSlippageBps <= 10_000, "slippage > 100%");
             address pathStart = _extractFirstAddress(path);
@@ -273,7 +269,7 @@ contract UniswapSwapAdapter is ISwapAdapter {
     ///
     ///      MEV note: this terminal floor bounds TOTAL route slippage to the
     ///      caller's budget; it does NOT localize which hop was attacked (unlike
-    ///      mode 1's per-hop quoter floors — see Sherlock run #2 #11). Per-hop
+    ///      mode 1's per-hop quoter floors). Per-hop
     ///      floors are NOT implementable here: the V4Quoter itself drives
     ///      poolManager.unlock, and a nested unlock reverts, so we cannot quote
     ///      mid-callback. Pre-quoting each hop before unlock would add no security
@@ -402,15 +398,14 @@ contract UniswapSwapAdapter is ISwapAdapter {
     }
 
     /// @dev Execute a multi-hop swap as sequential exactInputSingle calls.
-    ///      Intermediate tokens are held by this contract between hops.
-    ///      Sherlock run #2 #11: each hop's `amountOutMinimum` is derived
-    ///      at swap time from `quoter.quoteExactInputSingle` against the
-    ///      hop's input, scaled by `(10_000 - perHopSlippageBps) / 10_000`.
-    ///      The final-hop floor also respects the legacy top-level
-    ///      `amountOutMin` (max of the two) so the existing slippage
-    ///      contract still holds. Adapter does the quoter calls so
-    ///      callers don't need to re-compute per-hop floors at every
-    ///      swap — the extraData stays static (template-friendly).
+    ///      Intermediate tokens are held by this contract between hops. Each
+    ///      hop's `amountOutMinimum` is derived at swap time from
+    ///      `quoter.quoteExactInputSingle` against the hop's input, scaled by
+    ///      `(10_000 - perHopSlippageBps) / 10_000`. The final-hop floor also
+    ///      respects the legacy top-level `amountOutMin` (max of the two) so
+    ///      the existing slippage contract still holds. The adapter does the
+    ///      quoter calls so callers don't need to re-compute per-hop floors at
+    ///      every swap — the extraData stays static (template-friendly).
     function _chainedSingleHops(bytes memory path, uint256 amountIn, uint256 amountOutMin, uint16 perHopSlippageBps)
         internal
         returns (uint256 amountOut)
@@ -518,12 +513,6 @@ contract UniswapSwapAdapter is ISwapAdapter {
     }
 
     /// @inheritdoc ISwapAdapter
-    /// @dev Sherlock #58: mode-1 multi-hop quoting was unsupported, so
-    ///      `PortfolioStrategy._quoteMinOut` (which wraps this) reverted with
-    ///      `QuoteUnavailable` for any allocation configured with a packed
-    ///      V3 path. The matching `swap()` already supports mode 1 — adding
-    ///      the symmetric `quoteExactInput(path, amountIn)` here unblocks
-    ///      multi-hop routes end-to-end.
     function quote(address tokenIn, address tokenOut, uint256 amountIn, bytes calldata extraData)
         external
         override

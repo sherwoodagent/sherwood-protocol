@@ -3,15 +3,11 @@ pragma solidity 0.8.28;
 
 /// @title IStakedWood
 /// @notice Interface for the StakedWood (sWOOD) contract — the sole WOOD-token
-///         custodian. sWOOD absorbs guardian staking, owner
-///         bonds, vote checkpoints, and slashing, all of which previously
-///         lived in `GuardianRegistry`. The slimmed `GuardianRegistry`,
-///         `SyndicateGovernor`, and `SyndicateFactory` call sWOOD through
-///         this interface.
-/// @dev See `openspec/specs/guardian-staking/spec.md`.
-///      Staking/owner-bond signatures are carried verbatim from the
-///      pre-split `IGuardianRegistry`. Checkpoint reads are timestamp-keyed
-///      (EIP-6372 timestamp-mode clock).
+///         custodian, holding guardian staking, owner bonds, vote
+///         checkpoints, and slashing. `GuardianRegistry`, `SyndicateGovernor`,
+///         and `SyndicateFactory` call sWOOD through this interface.
+/// @dev See `openspec/specs/guardian-staking/spec.md`. Checkpoint reads are
+///      timestamp-keyed (EIP-6372 timestamp-mode clock).
 interface IStakedWood {
     /// @notice Reverts when a non-slasher calls the verdict slash path.
     error NotAuthorizedSlasher();
@@ -35,16 +31,14 @@ interface IStakedWood {
     error DuplicateApprover();
 
     /// @notice Reverts when `slashVerdict` names an approver already slashed
-    ///         under the same `caseKey` by an EARLIER call (PR #24 review 🟠N2).
+    ///         under the same `caseKey` by an EARLIER call.
     /// @dev The intra-call dedup only bounds ONE array, so the severity ceiling
     ///      bound per CALL rather than per verdict: `_slashOne` re-reads the
     ///      live stake each time while sizing off the same `openedAt`
-    ///      checkpoint, so three sequential 5,000-bps calls against one
-    ///      approver take 8,750 bps of the bond they held at open — against a
-    ///      50% ceiling governance set. Splitting a quorum-sized batch across
-    ///      transactions stays legal (the natural workaround for a 100-approver
-    ///      batch that does not fit a block); replaying an approver does not.
-    ///      Also makes an honest retried transaction idempotent per approver.
+    ///      checkpoint, so repeated calls against one approver can exceed the
+    ///      governance-set ceiling. Splitting a quorum-sized batch across
+    ///      transactions stays legal; replaying an approver does not. Also
+    ///      makes a retried transaction idempotent per approver.
     error ApproverAlreadySlashed();
 
     event AuthorizedSlasherSet(address indexed slasher);
@@ -59,7 +53,7 @@ interface IStakedWood {
     event VerdictSlashBurned(bytes32 indexed caseKey, uint256 gross, uint256 bounty, uint256 burned);
 
     /// @notice A conviction bounty was paid out of a verdict slash before the
-    ///         remainder opened a compensation case (spec 2026-07-29 §2).
+    ///         remainder opened a compensation case.
     event ConvictionBountyPaid(bytes32 indexed caseKey, address indexed bountyTo, uint256 amount);
 
     // ── Guardian stake ──
@@ -84,31 +78,23 @@ interface IStakedWood {
     // ── Snapshot-compatible vote-read surface (timestamp-keyed) ──
     //
     // `getVotes` / `getPastVotes` / `getPastTotalSupply` form the read surface
-    // Snapshot's `erc20-votes` strategy consumes. sWOOD intentionally does NOT
-    // implement the full OZ `IVotes` (no `delegate` / `delegates` /
-    // `delegateBySig`). Vote weight = AGE-WEIGHTED own staked WOOD.
-    // (DPoS delegation was removed/postponed — no delegated component.)
+    // Snapshot's `erc20-votes` strategy consumes. sWOOD does not implement the
+    // full OZ `IVotes` (no `delegate` / `delegates` / `delegateBySig`). Vote
+    // weight = age-weighted own staked WOOD; there is no delegated component.
 
     /// @notice An account's CURRENT vote weight: age-weighted own votable
     ///         stake. Live counterpart of `getPastVotes`.
     function getVotes(address account) external view returns (uint256);
 
     /// @notice Guardian's age-weighted own vote weight at a past timestamp.
-    /// @dev    STILL NOT A TERM OF `getPastTotalVotes` (review 🔴F17), even with
-    ///         DPoS delegation removed. The total sums RAW own stake; this
-    ///         applies `_ageFactorBps` on top, so the two remain different
-    ///         measures of the same WOOD. Correct for weighing a VOTE; wrong on
-    ///         either side of a subtraction against the total — use
-    ///         `getPastStake` there.
-    ///
-    ///         The delegation removal narrowed the consequence without removing
-    ///         it. Aging only ever SHRINKS, so per-account weight is now bounded
-    ///         above by raw stake: the accused sum can no longer exceed the
-    ///         total and `TokenCourt._participationFloor` can no longer be driven to
-    ///         zero. What remains is a one-directional bias — the floor comes
-    ///         out too HIGH when the accused are freshly staked, which biases
-    ///         the outcome toward an inconclusive (no-verdict) result rather
-    ///         than enabling a cheap overturn.
+    /// @dev    Not a term of `getPastTotalVotes`: the total sums RAW own
+    ///         stake; this applies `_ageFactorBps` on top, so the two are
+    ///         different measures of the same WOOD. Correct for weighing a
+    ///         vote; wrong for a subtraction against the total — use
+    ///         `getPastStake` there. Aging only ever shrinks weight, so
+    ///         per-account weight is bounded above by raw stake, biasing
+    ///         `TokenCourt._participationFloor` too HIGH when the accused are
+    ///         freshly staked (favoring an inconclusive result).
     function getPastVotes(address guardian, uint256 timestamp) external view returns (uint256);
 
     /// @notice A guardian's RAW votable own stake at a past timestamp — the same
@@ -139,8 +125,8 @@ interface IStakedWood {
     function canCreateVault(address owner) external view returns (bool);
 
     /// @notice The guardian unstake cooldown period. The registry reads this
-    ///         in `setReviewPeriod` to enforce the `coolDownPeriod >=
-    ///         reviewPeriod` cross-contract invariant (Sherlock #16).
+    ///         in `setReviewPeriod` to enforce the cross-contract invariant
+    ///         `coolDownPeriod >= reviewPeriod`.
     function coolDownPeriod() external view returns (uint256);
 
     /// @notice Lower clamp bound (bps) for the graduated slash severity.
@@ -244,8 +230,8 @@ interface IStakedWood {
     function authorizedSlasher() external view returns (address);
 
     /// @notice Whether `approver` has already been slashed under `caseKey`.
-    /// @dev Lets a slasher (Plan D, or a keeper resuming a batch that ran out
-    ///      of gas) resume a split verdict without re-slashing anyone.
+    /// @dev Lets a slasher (e.g. a keeper resuming a batch that ran out of
+    ///      gas) resume a split verdict without re-slashing anyone.
     function verdictSlashed(bytes32 caseKey, address approver) external view returns (bool);
 
     // ── Admin (owner-instant; owner is a multisig with external delay) ──

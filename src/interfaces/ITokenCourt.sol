@@ -4,9 +4,8 @@ pragma solidity 0.8.28;
 import {IChallengeGame} from "./IChallengeGame.sol";
 
 /// @title  ITokenCourt
-/// @notice Single-layer WOOD-vote adjudication of disputed challenges
-///         (spec 2026-07-28-token-court-design.md). Replaces the two-layer
-///         panel court. HOLDS NO WOOD: no bonds, no custody, pure logic.
+/// @notice Single-layer WOOD-vote adjudication of disputed challenges.
+///         HOLDS NO WOOD: no bonds, no custody, pure logic.
 interface ITokenCourt {
     /// @notice A case's lifecycle. `None` is the zero value shared with "no
     ///         case referred yet" (`caseOfChallenge == 0`); `Voting` is the
@@ -76,23 +75,22 @@ interface ITokenCourt {
     ///        RESIDUAL WINDOW: an owner re-point strictly between `file` and
     ///        `refer` is absorbed BY the pin rather than blocked by it — see
     ///        `refer`'s natspec.
-    /// @param snapshotTs `executedAt - 1`, written ONCE in `refer` (D2) and
-    ///        never re-derived. Pinning it is what stops the owner moving a
-    ///        live case's electorate by re-pointing the governor or letting
+    /// @param snapshotTs `executedAt - 1`, written ONCE in `refer` and never
+    ///        re-derived. Pinning it is what stops the owner moving a live
+    ///        case's electorate by re-pointing the governor or letting
     ///        `executedAt` drift — see `IChallengeGame.executedAt`'s own
     ///        rationale for the identical hazard.
     /// @param referredAt The instant `refer` opened this case — the anchor
     ///        the vote window counts from.
     /// @param voteWindowAtReferral The court's `voteWindow` PINNED at
-    ///        referral. The owner cannot move a LIVE case's clock (the F5
-    ///        lesson: a live read let a prior design retroactively shrink or
-    ///        stretch a window a party was already relying on). Only cases
-    ///        referred after a `setVoteWindow` call see the new value.
+    ///        referral. The owner cannot move a LIVE case's clock: a live
+    ///        read would let the owner retroactively shrink or stretch a
+    ///        window a party is already relying on. Only cases referred
+    ///        after a `setVoteWindow` call see the new value.
     /// @param accusedWeight The raw `getPastStake` sum of the accused set at
     ///        `snapshotTs` — same basis as `guiltyVotes`/`notGuiltyVotes`
-    ///        (aged `getPastVotes`, F17) so the participation floor's
-    ///        subtraction never compares two different measures of the same
-    ///        WOOD.
+    ///        (aged `getPastVotes`) so the participation floor's subtraction
+    ///        never compares two different measures of the same WOOD.
     /// @param guiltyVotes Aged vote weight cast for `Guilty`.
     /// @param notGuiltyVotes Aged vote weight cast for `NotGuilty`.
     /// @param phase The case's lifecycle position.
@@ -105,10 +103,10 @@ interface ITokenCourt {
         uint256 challengeId;
         address game; // pinned IChallengeGame this case rules on, written once in refer
         address ledger; // pinned IExposureLedger the accused set was derived from, written once in refer
-        uint256 snapshotTs; // executedAt - 1, written once in refer (D2)
+        uint256 snapshotTs; // executedAt - 1, written once in refer
         uint256 referredAt;
-        uint256 voteWindowAtReferral; // pinned: owner cannot move a live case's clock (F5)
-        uint256 accusedWeight; // raw getPastStake sum at snapshotTs (F17 same-basis)
+        uint256 voteWindowAtReferral; // pinned: owner cannot move a live case's clock
+        uint256 accusedWeight; // raw getPastStake sum at snapshotTs, same basis as aged votes
         uint256 guiltyVotes; // aged weight
         uint256 notGuiltyVotes; // aged weight
         Phase phase;
@@ -145,7 +143,7 @@ interface ITokenCourt {
     ///         elapsed — the one window this case gets has already closed.
     error WindowClosed();
     /// @notice `vote` called a second time by the same address. One vote per
-    ///         voter, no re-weighting (D3): there is no path to change a cast
+    ///         voter, no re-weighting: there is no path to change a cast
     ///         vote, only to be refused a second one.
     error AlreadyVoted();
     /// @notice `vote` called by an address in the accused set. The accused
@@ -158,8 +156,8 @@ interface ITokenCourt {
     ///         this case.
     error NoVotingPower();
     /// @notice `vote` called by an address that had weight at `snapshotTs`
-    ///         but holds nothing NOW (`getVotes == 0`) — B4, the present-
-    ///         holdings gate. Distinct from `NoVotingPower` because the
+    ///         but holds nothing NOW (`getVotes == 0`) — the present-holdings
+    ///         gate. Distinct from `NoVotingPower` because the
     ///         remedy is the opposite: re-stake at least `minGuardianStake`
     ///         and the address becomes votable again — at the historic raw
     ///         checkpoint discounted to `ageFloorBps`, because the re-stake
@@ -175,7 +173,7 @@ interface ITokenCourt {
     ///         provide, would both be gone permanently.
     error OwnershipCannotBeRenounced();
     /// @notice A setter would break the cross-contract invariant `autoSlashDelay
-    ///         + voteWindow + FINALIZE_BUFFER <= disputeTimeout` (B3). Raised by
+    ///         + voteWindow + FINALIZE_BUFFER <= disputeTimeout`. Raised by
     ///         `setVoteWindow` — see `ChallengeGame._requireWindowFits` for why
     ///         neither contract can hold this invariant alone.
     error WindowInvariantViolated();
@@ -210,15 +208,16 @@ interface ITokenCourt {
         uint256 notGuiltyVotes,
         uint256 floor
     );
-    /// @notice `rule` reverted with `WrongStatus` — the challenge went terminal
-    ///         on its own clock during the finalize buffer (the E1 race), so
-    ///         there is nothing left to rule. The case still closes and, with
-    ///         zero custody, this is bookkeeping, not fund loss. Every OTHER
-    ///         revert from `rule` — `InsufficientSlashGas` from an under-gassed
-    ///         call, or `NotCourt` from the game's `court` being re-pointed
-    ///         away while the challenge is still `Disputed` and fully rulable
-    ///         (B2) — bubbles out of `finalize` instead of being swallowed
-    ///         here, so the case stays `Voting` for an honest retry.
+    /// @notice `rule` reverted with `WrongStatus` — the challenge went
+    ///         terminal on its own clock during the finalize buffer, so
+    ///         there is nothing left to rule. The case still closes and,
+    ///         with zero custody, this is bookkeeping, not fund loss. Every
+    ///         OTHER revert from `rule` — `InsufficientSlashGas` from an
+    ///         under-gassed call, or `NotCourt` from the game's `court`
+    ///         being re-pointed away while the challenge is still
+    ///         `Disputed` and fully rulable — bubbles out of `finalize`
+    ///         instead of being swallowed here, so the case stays `Voting`
+    ///         for an honest retry.
     event ChallengeAlreadyTerminal(uint256 indexed caseId, uint256 indexed challengeId);
     /// @notice The wired `ChallengeGame` changed (or was set for the first
     ///         time, `oldGame == address(0)`).
@@ -230,8 +229,8 @@ interface ITokenCourt {
     ///         only — every case already `Voting` keeps the window it was
     ///         referred under (`voteWindowAtReferral`).
     event VoteWindowSet(uint256 oldWindow, uint256 newWindow);
-    /// @notice The participation floor (D6's anti-capture parameter) changed.
-    ///         Governs future finalizations only.
+    /// @notice The anti-capture participation floor changed. Governs future
+    ///         finalizations only.
     event ParticipationFloorBpsSet(uint256 oldBps, uint256 newBps);
 
     /// @notice Ceiling on `setVoteWindow`'s argument. Bounds how long a
@@ -244,7 +243,7 @@ interface ITokenCourt {
     ///         state) — it is the margin `refer`'s clock check reserves.
     function FINALIZE_BUFFER() external view returns (uint256);
     /// @notice How far before a case's `snapshotTs` the participation floor's
-    ///         electorate base is cross-checked (B2). The base is the SMALLER
+    ///         electorate base is cross-checked. The base is the SMALLER
     ///         of the electorate at the snapshot and the electorate this long
     ///         before it, so stake younger than this cannot RAISE the floor —
     ///         closing the denial-of-quorum lever a single snapshot read left
@@ -261,13 +260,13 @@ interface ITokenCourt {
     ///         `MAX_VOTE_WINDOW`; a live case keeps the window it was
     ///         referred under regardless of later changes here.
     function voteWindow() external view returns (uint256);
-    /// @notice The anti-capture participation floor (D6), in bps of
+    /// @notice The anti-capture participation floor, in bps of
     ///         `min(total(snapshotTs), total(snapshotTs - FLOOR_LOOKBACK))`
     ///         minus `accusedWeight`. Turnout below this floor resolves
     ///         `Inconclusive` rather than on the raw tally, so a thin,
     ///         rented-stake vote cannot convict or acquit alone. Read LIVE at
-    ///         `finalize`, never pinned per case (D6) — which also makes it
-    ///         the owner's counter-lever if a large idle stake is observed
+    ///         `finalize`, never pinned per case — which also makes it the
+    ///         owner's counter-lever if a large idle stake is observed
     ///         inflating a live case's base.
     function participationFloorBps() external view returns (uint256);
     /// @notice Count of cases ever referred. Case ids are 1-indexed
@@ -275,7 +274,7 @@ interface ITokenCourt {
     function caseCount() external view returns (uint256);
     /// @notice The case id referred for `challengeId` on `game`, or zero if
     ///         none has been.
-    /// @dev    Keyed by (game, challengeId), NOT challengeId alone (B1):
+    /// @dev    Keyed by (game, challengeId), NOT challengeId alone:
     ///         `ChallengeGame` is non-upgradeable, so redeploying it is the
     ///         migration path (`setChallengeGame`), and a fresh game's
     ///         `challengeCount` restarts at 0 — its ids would otherwise
@@ -318,7 +317,7 @@ interface ITokenCourt {
     ///         snapshot-fixed. Reverts outside the open window, for a second
     ///         vote, for an accused address, for zero snapshot weight
     ///         (`NoVotingPower`), or for holding nothing at the present
-    ///         instant (`NoPresentHoldings`, B4) — the caller must be an
+    ///         instant (`NoPresentHoldings`) — the caller must be an
     ///         active guardian (present stake, no pending unstake request) at
     ///         the moment the vote is cast, even though the weight it counts
     ///         for is the historic one.
@@ -335,7 +334,7 @@ interface ITokenCourt {
     ///         funds. Every other revert — `InsufficientSlashGas` from a
     ///         deliberately under-gassed call, or `NotCourt` from the game's
     ///         `court` being re-pointed away while the challenge is still
-    ///         `Disputed` and fully rulable (B2) — bubbles out of `finalize`
+    ///         `Disputed` and fully rulable — bubbles out of `finalize`
     ///         whole so the case stays `Voting` for an honest retry — a bare
     ///         catch there would let anyone burn a `Guilty` verdict for free
     ///         by starving the child call's gas, or by unwiring the court.
@@ -356,7 +355,7 @@ interface ITokenCourt {
     ///         never be voted on. Governs future referrals only — see
     ///         `voteWindowAtReferral`.
     function setVoteWindow(uint256 newWindow) external;
-    /// @notice Set the anti-capture participation floor (D6). Bounded to
+    /// @notice Set the anti-capture participation floor. Bounded to
     ///         `(0, 10_000]`; zero would let any nonzero turnout, however
     ///         thin, reach a verdict on the merits.
     function setParticipationFloorBps(uint256 newBps) external;

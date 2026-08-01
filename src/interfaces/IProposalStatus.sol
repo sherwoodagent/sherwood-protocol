@@ -9,12 +9,10 @@ pragma solidity 0.8.28;
  *         governor satisfies this interface without any change; a test fake
  *         satisfies it in ~10 lines (see `test/mocks/MockProposalStatus.sol`).
  *
- *   Deepening rationale: the vault previously type-cast to the full
- *   `ISyndicateGovernor` (43 functions) while reading exactly these three
- *   things. Narrowing the declared dependency concentrates the seam — "what
- *   can the vault possibly learn from governance" is now answerable from this
- *   file alone, and vault tests satisfy one small adapter instead of mocking
- *   governor selectors by hand.
+ *   Narrowing the declared dependency to these three functions concentrates
+ *   the seam — "what can the vault possibly learn from governance" is
+ *   answerable from this file alone, and vault tests satisfy one small
+ *   adapter instead of mocking governor selectors by hand.
  *
  * @dev Every member is a scalar, so this file has no type dependency on
  *      `ISyndicateGovernor` at all — the seam is exactly these three

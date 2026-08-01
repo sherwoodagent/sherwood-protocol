@@ -38,9 +38,9 @@ interface IRequestableVault {
 ///           DEPOSIT: vault.requestDeposit → queueDeposit (assets escrowed here)
 ///                    [settle → stampSettlement] → claim → vault.settleDeposit
 ///
-///         `cancel` is allowed ONLY before the request's proposal is stamped
-///         (G7): once a settle price is frozen, post-settle cancel would be a
-///         free look-back option, so the request must be claimed.
+///         `cancel` is allowed ONLY before the request's proposal is stamped:
+///         once a settle price is frozen, post-settle cancel would be a free
+///         look-back option, so the request must be claimed.
 contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient {
     using SafeERC20 for IERC20;
 
@@ -101,7 +101,7 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
     /// @dev Called by `vault.requestDeposit` after it transferred `assets` into
     ///      this contract's custody (escrowed off-vault so they never inflate
     ///      `totalAssets` / are never swept into the strategy — resolves the
-    ///      concurrent-exit over-promise, PR #351 finding #6).
+    ///      concurrent-exit over-promise).
     function queueDeposit(address owner_, uint256 assets, uint256 pid) external onlyVault returns (uint256 id) {
         if (assets == 0) revert ZeroAssets();
         id = _push(owner_, assets, pid, RequestKind.Deposit);
@@ -227,7 +227,7 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
     }
 
     /// @inheritdoc IVaultWithdrawalQueue
-    /// @dev G7: cancel is allowed ONLY before the request's proposal is stamped.
+    /// @dev Cancel is allowed ONLY before the request's proposal is stamped.
     ///      Returns the escrowed shares (Redeem) or assets (Deposit) to the owner.
     function cancel(uint256 requestId) external nonReentrant {
         Request storage r = _req(requestId);

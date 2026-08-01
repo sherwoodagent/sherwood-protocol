@@ -3,16 +3,15 @@ pragma solidity 0.8.28;
 
 /// @title IExposureLedger
 /// @notice Dollar-denominated aggregate exposure cap + covered-TVL cap +
-///         approve-quorum arithmetic (spec 2026-07-22 §3.3, §3.3a, §3.7).
-///         Singleton; consumed by GuardianRegistry (exposure recording at
-///         approve-vote time) and SyndicateGovernor (covered-TVL check at
-///         propose, approve-quorum check at execute).
+///         approve-quorum arithmetic. Singleton; consumed by GuardianRegistry
+///         (exposure recording at approve-vote time) and SyndicateGovernor
+///         (covered-TVL check at propose, approve-quorum check at execute).
 interface IExposureLedger {
     // ── Errors ──
-    /// @notice RETAINED FOR ABI STABILITY, no longer thrown. The exposure cap
-    ///         is enforced by booking zero rather than by reverting the vote
-    ///         (review N1); indexers and off-chain decoders that already know
-    ///         this selector keep working.
+    /// @notice Retained for ABI stability; no longer thrown. The exposure cap
+    ///         is enforced by booking zero rather than by reverting the vote,
+    ///         so indexers and off-chain decoders that already know this
+    ///         selector keep working.
     error ExposureCapExceeded();
     error CoveredTvlCapExceeded();
 
@@ -63,7 +62,7 @@ interface IExposureLedger {
         external
         view;
 
-    // ── Coverage freeze (challenge game, spec §3.4) ──
+    // ── Coverage freeze (challenge game) ──
     function freezeCoverage(address governor, uint256 proposalId) external;
     function unfreezeCoverage(address governor, uint256 proposalId) external;
     function isCoverageFrozen(address governor, uint256 proposalId) external view returns (bool);
@@ -71,23 +70,21 @@ interface IExposureLedger {
     ///         approver. sWOOD gates the unstake CLAIM on it, which is what
     ///         makes the freeze load-bearing rather than decorative: epoch
     ///         buckets age out on wall-clock and a disputed challenge outlives
-    ///         them, so `openExposureUsd` alone let an accused guardian claim
-    ///         its bond mid-accusation (review 🔴F2 / 🟠F6).
+    ///         them, so `openExposureUsd` alone would let an accused guardian
+    ///         claim its bond mid-accusation.
     function hasFrozenCoverage(address guardian) external view returns (bool);
-    /// @dev Zero is legal and deliberate — it is the UNWIRE switch, which
-    ///      closes the freeze surface when the challenge game is replaced. Not
-    ///      an oversight: with no freezer wired there is no filing, so the
-    ///      unwired state fails closed for the game rather than open.
+    /// @dev Zero is legal and deliberate — it is the UNWIRE switch, closing
+    ///      the freeze surface when the challenge game is replaced: with no
+    ///      freezer wired there is no filing, so the unwired state fails
+    ///      closed for the game rather than open.
     ///
-    ///      REFUSED WHILE ANY COVERAGE IS FROZEN (review 🟠F11). Failing closed
-    ///      for NEW filings is not the same as being safe for the LIVE ones:
-    ///      `unfreezeCoverage` is `onlyFreezer` and the game is its only caller,
-    ///      so rotating the role mid-challenge orphaned that freeze — the game's
-    ///      `resolve()` reverted forever, both bonds stranded with no withdrawal
-    ///      path, and every accused approver was permanently barred from
-    ///      `claimUnstakeGuardian`. The rotation is therefore DEFERRED, not
-    ///      forbidden: drain the live challenges until `frozenCoverageCount()`
-    ///      is zero, then re-point.
+    ///      Reverts while any coverage is frozen. `unfreezeCoverage` is
+    ///      `onlyFreezer` and the game is its only caller, so rotating the
+    ///      role mid-challenge would orphan the freeze: `resolve()` would
+    ///      revert forever, both bonds would be stranded with no withdrawal
+    ///      path, and every accused approver would be permanently barred
+    ///      from `claimUnstakeGuardian`. Rotate only after draining live
+    ///      challenges until `frozenCoverageCount()` is zero.
     function setCoverageFreezer(address freezer) external;
     function coverageFreezer() external view returns (address);
     /// @notice How many proposals are frozen right now, across every guardian.
@@ -144,11 +141,11 @@ interface IExposureLedger {
     ///         (`slashBpsFor` once did too; it is now punitive and prices
     ///         against nothing.)
     ///
-    ///         This exposes the same figure as ONE number, so callers outside
-    ///         the ledger need not re-derive the reservation/allocation
-    ///         distinction — re-deriving it is how `ChallengeGame.file()` came
-    ///         to size the challenger's bond off reservations, charging more to
-    ///         challenge a proposal the better covered it was (review 🟡F13).
+    ///         Exposes the same figure as one number, so callers outside the
+    ///         ledger need not re-derive the reservation/allocation
+    ///         distinction — sizing a challenger's bond off reservations
+    ///         instead would charge more to challenge a proposal the better
+    ///         covered it was.
     ///
     ///         `min(needUsd, effectiveTotal)`: allocations sum to the need when
     ///         the cohort can cover it, and are bounded by what the cohort can
@@ -157,15 +154,12 @@ interface IExposureLedger {
 
     /// @notice Return each approver's over-reservation once the review has shut
     ///         and the approver set is final. Permissionless; safe to skip.
-    /// @dev    RE-RUNNABLE, and a caller that prices money off a settled
+    /// @dev    Re-runnable, and a caller that prices money off a settled
     ///         proposal should re-run it first. Each pass re-derives the whole
     ///         split from the pledges recorded at vote time, at the CURRENT
     ///         price, so a pass taken while WOOD or the vault asset was
-    ///         depressed leaves a stale number the next pass corrects rather
-    ///         than a permanent one. It was one-shot originally, which let any
-    ///         caller pick an instant that permanently reduced what a conviction
-    ///         could recover (review H1). No pass can book a guardian above its
-    ///         own pledge, in either direction.
+    ///         depressed leaves a stale number the next pass corrects. No pass
+    ///         can book a guardian above its own pledge, in either direction.
     function settleCoverage(address governor, uint256 proposalId) external;
 
     function slashableBondUsd(address guardian) external view returns (uint256);

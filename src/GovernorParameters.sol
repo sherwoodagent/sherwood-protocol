@@ -27,12 +27,11 @@ abstract contract GovernorParameters is ProposalLifecycle {
     // ── Safety bounds (hardcoded) ──
 
     // Per-deployment timing floors are constructor-set immutables (see constructor).
-    // Mainnet impls deploy with the historical values (`votingPeriod` >= 24h,
-    // `cooldownPeriod` >= 1h); a testnet impl can deploy with lower floors to
-    // compress fund lifecycles. Immutables live in bytecode (not storage), so the
-    // storage layout is UNCHANGED vs. the prior `constant` form and reads resolve
-    // correctly through the beacon proxy. The absolute floor-of-floors below caps
-    // how low a deploy may set them, so a misconfigured impl fails loudly.
+    // Mainnet impls deploy with `votingPeriod` >= 24h and `cooldownPeriod` >= 1h;
+    // a testnet impl can deploy with lower floors to compress fund lifecycles.
+    // Immutables live in bytecode (not storage), so reads resolve correctly
+    // through the beacon proxy. The absolute floor-of-floors below caps how low
+    // a deploy may set them, so a misconfigured impl fails loudly.
     uint256 internal constant ABSOLUTE_MIN_TIMING_FLOOR = 1 minutes;
 
     /// @notice Hard floor for `votingPeriod` (per-deployment; mainnet 24h).
@@ -104,16 +103,14 @@ abstract contract GovernorParameters is ProposalLifecycle {
     address internal _bootstrapOwner;
 
     /// @notice Ceiling on a proposal's `envelope.maxCapital`, in bps of the
-    ///         vault's `totalAssets()` at propose time (finding 3: without a
-    ///         ceiling a proposer sets maxCapital = uint256.max and the
-    ///         net-outflow cap never binds). Stored 0 means "unset" and reads
-    ///         as the 10_000 (100% of TVL) default via `maxCapitalBps()` — no
-    ///         initialize change needed, existing governors keep working.
+    ///         vault's `totalAssets()` at propose time — without a ceiling a
+    ///         proposer could set maxCapital = uint256.max and the
+    ///         net-outflow cap never binds. Stored 0 means "unset" and reads
+    ///         as the 10_000 (100% of TVL) default via `maxCapitalBps()`.
     uint256 internal _maxCapitalBps;
 
     /// @dev Reserved storage slots at the `GovernorParameters` layer so future
     ///      param additions here don't shift `SyndicateGovernor`'s layout.
-    ///      (Shrunk 8 → 7 for `_maxCapitalBps` — append-only.)
     uint256[7] private __paramsGap;
 
     // ── Constructor (impl-time; sets per-deployment timing floors) ──
@@ -170,16 +167,15 @@ abstract contract GovernorParameters is ProposalLifecycle {
             p.minStrategyDuration < ABSOLUTE_MIN_STRATEGY_DURATION
                 || p.maxStrategyDuration > ABSOLUTE_MAX_STRATEGY_DURATION
                 || p.minStrategyDuration > p.maxStrategyDuration
-                // ADR 2026-07-26: the PROTOCOL ceiling binds here too, for the
-                // same reason the individual bounds do (I2, above) — otherwise
+                // The PROTOCOL ceiling binds here too — otherwise
                 // `forceSetParams` seats a duration `setMaxStrategyDuration`
                 // would reject, and guardians inherit an exposure window the
                 // protocol never sanctioned.
                 || p.maxStrategyDuration > _protocolMaxStrategyDuration()
         ) revert InvalidStrategyDurationBounds();
-        // I2 (review): the individual setters bound these, so the rescue path
-        // (initialize / forceSetParams) must too, or setParamsOverride could
-        // seat an out-of-range value the setters would reject.
+        // The individual setters bound these, so the rescue path (initialize /
+        // forceSetParams) must too, or setParamsOverride could seat an
+        // out-of-range value the setters would reject.
         if (p.collaborationWindow < MIN_COLLABORATION_WINDOW || p.collaborationWindow > MAX_COLLABORATION_WINDOW) {
             revert InvalidCollaborationWindow();
         }
@@ -220,7 +216,7 @@ abstract contract GovernorParameters is ProposalLifecycle {
         emit ParameterChangeFinalized(PARAM_MAX_PERF_FEE, old, newValue);
     }
 
-    /// @dev The protocol-wide `strategyDuration` ceiling (ADR 2026-07-26), or
+    /// @dev The protocol-wide `strategyDuration` ceiling, or
     ///      `type(uint256).max` when unset so the check is a no-op.
     ///
     ///      Read LIVE rather than mirrored into governor storage on purpose:

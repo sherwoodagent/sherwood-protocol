@@ -31,8 +31,8 @@ interface IPriceRouter {
     ///                   units, or 0 when not instantly priceable.
     /// @return instantOK true only when the position is safely priceable now
     ///                   AND within the instant cap. When false, `value` is 0
-    ///                   (G2 Option A) and the caller must use the async (Lane
-    ///                   B) settlement path.
+    ///                   and the caller must use the async (Lane B)
+    ///                   settlement path.
     function valuePosition(Position calldata p, address holder) external view returns (uint256 value, bool instantOK);
 
     /// @notice Aggregate vault-facing valuation: reads a strategy's on-venue

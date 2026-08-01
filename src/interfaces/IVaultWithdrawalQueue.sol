@@ -9,9 +9,8 @@ pragma solidity 0.8.28;
 ///         mid-flight NAV. At settlement the vault stamps ONE frozen price per
 ///         proposal (`num/den` = realized NAV checkpoint); every request tagged
 ///         to that proposal then claims at that single, un-front-runnable price.
-/// @dev    Kept under the legacy file/interface name to avoid churning every
-///         factory/vault reference; functionally this is the "VaultRequestQueue"
-///         from the spec (gains deposit-side + frozen settlement price).
+/// @dev    Functionally this is the "VaultRequestQueue" from the spec, kept
+///         under the legacy `IVaultWithdrawalQueue` name.
 interface IVaultWithdrawalQueue {
     // ── Errors ──
     error NotVault();
@@ -40,7 +39,7 @@ interface IVaultWithdrawalQueue {
         RequestKind kind;
         bool claimed;
         bool cancelled;
-        /// @dev Custody interval stamps (PR #24 review 🔴1): `queuedAt` when the
+        /// @dev Custody interval stamps: `queuedAt` when the
         ///      escrowed amount entered custody, `closedAt` when it left (claim
         ///      or cancel; 0 while still open). Their original consumer — the
         ///      compensation pay-through — is gone with the escrow; they are

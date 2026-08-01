@@ -2,9 +2,9 @@
 pragma solidity 0.8.28;
 
 /// @title IProposerBondEscrow
-/// @notice WOOD escrow for the risk-scaled proposer bond (spec 2026-07-22
-///         §3.9). Governor-only lock/release, and ONE non-release exit:
-///         `forfeitBond`, driven by a passed challenge (spec §3.8, Plan C).
+/// @notice WOOD escrow for the risk-scaled proposer bond. Governor-only
+///         lock/release, and ONE non-release exit: `forfeitBond`, driven by
+///         a passed challenge.
 interface IProposerBondEscrow {
     error NotAuthorizedGovernor();
     error BondAlreadyLocked();

@@ -18,10 +18,9 @@ interface IChallengeGameLedger {
 /**
  * @title TokenCourt
  * @notice Single-layer WOOD-vote adjudication of disputed `ChallengeGame`
- *         challenges (spec 2026-07-28-token-court-design.md §3). Replaces the
- *         two-layer panel court: one referral opens one vote window, one
- *         tally against a participation floor produces the verdict. There is
- *         no panel, no appeal, no bad-faith track.
+ *         challenges. One referral opens one vote window, one tally against
+ *         a participation floor produces the verdict. There is no panel, no
+ *         appeal, no bad-faith track.
  *
  * @dev    HOLDS NO WOOD, EVER. No bonds, no custody bookkeeping, no
  *         `SafeERC20` import — every WOOD-moving effect of a verdict
@@ -60,7 +59,7 @@ interface IChallengeGameLedger {
  *         layout to protect across upgrades and no shared implementation to
  *         coordinate, so the upgrade machinery would be pure surface area.
  *
- * @dev    NO PAUSE EXISTS ON THIS CONTRACT (spec §3). The human backstop for
+ * @dev    NO PAUSE EXISTS ON THIS CONTRACT. The human backstop for
  *         the whole system is `ChallengeGame.setFilingsPaused`, which gates
  *         `file` only. Pausing referral or voting HERE would let an
  *         already-disputed challenge drift toward its own `disputeTimeout`
@@ -79,7 +78,7 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     /// @dev Basis-point denominator shared by `participationFloorBps`.
     uint256 internal constant BPS_DENOMINATOR = 10_000;
     /// @notice How far BEFORE a case's snapshot the participation floor's
-    ///         electorate base is cross-checked (B2). The base is the SMALLER
+    ///         electorate base is cross-checked. The base is the SMALLER
     ///         of the electorate at the snapshot and the electorate this long
     ///         before it, so stake younger than this cannot raise the floor.
     /// @dev    A `constant`, NOT an owner parameter, and deliberately so — see
@@ -87,7 +86,7 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///         setter here would be a lever to shrink the lookback to zero
     ///         immediately before a drain, which is precisely the attack this
     ///         constant closes; and a constant is the strongest possible form
-    ///         of the D2 "pin it at `refer`" discipline, since a value that
+    ///         of the "pin it at `refer`" discipline, since a value that
     ///         cannot change cannot move under a live case at all.
     uint256 public constant FLOOR_LOOKBACK = 30 days;
 
@@ -100,7 +99,7 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///         `MAX_VOTE_WINDOW`; a live case keeps the window it was
     ///         referred under regardless of later changes here.
     uint256 public voteWindow = 5 days;
-    /// @notice The anti-capture participation floor (spec §3 D6), in bps of
+    /// @notice The anti-capture participation floor, in bps of
     ///         `total - accusedWeight` at a case's snapshot.
     uint256 public participationFloorBps = 1_000;
 
@@ -109,16 +108,14 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     mapping(uint256 caseId => ITokenCourt.Case) internal _cases;
     /// @notice The case id referred for a challenge on a given game, or zero
     ///         if none has been.
-    /// @dev KEYED BY (GAME, CHALLENGE ID), not by id alone (B1).
-    ///      `ChallengeGame` is non-upgradeable, so redeploying it IS the
-    ///      migration path and `setChallengeGame` exists to serve it - but a
-    ///      fresh game's `challengeCount` restarts at 0, so its ids collide
-    ///      with every case the old game already minted. Single-keyed, every
-    ///      colliding challenge reverted `AlreadyReferred` on BOTH the
-    ///      auto-referral and the permissionless manual fallback, forever, and
-    ///      timed out to `_fail` - auto-acquitting the accused and paying it the
-    ///      challenger's bond, once per id the old game ever used. Pinning
-    ///      `Case.game` fixed the `finalize` half of this; this fixes `refer`.
+    /// @dev Keyed by (game, challenge id), not by id alone. `ChallengeGame` is
+    ///      non-upgradeable, so redeploying it is the migration path
+    ///      (`setChallengeGame`) — but a fresh game's `challengeCount`
+    ///      restarts at 0, so its ids collide with every case the old game
+    ///      already minted. Single-keying would make every colliding
+    ///      challenge revert `AlreadyReferred` forever and time out to
+    ///      `_fail`, auto-acquitting the accused and paying it the
+    ///      challenger's bond.
     mapping(address game => mapping(uint256 challengeId => uint256 caseId)) public caseOfChallenge;
     /// @notice How an address ruled on a case, or `Ruling.None` unvoted.
     mapping(uint256 caseId => mapping(address voter => ITokenCourt.Ruling)) public voteOf;
@@ -139,19 +136,17 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     }
 
     /// @inheritdoc ITokenCourt
-    /// @dev GUARDS THE WIRING ITSELF (review 2026-07-29 audit, item 1 BLOCKER
-    ///      — PROVEN executable, same class as `ChallengeGame.setCourt`'s own
-    ///      re-wire guard). Re-pointing to a NEW game is a setter that can
-    ///      break the B3 window invariant just like `setVoteWindow` below, and
+    /// @dev Guards the wiring itself, same class as `ChallengeGame.setCourt`'s
+    ///      own re-wire guard. Re-pointing to a new game is a setter that can
+    ///      break the window invariant just like `setVoteWindow` below, and
     ///      the two compose into a bypass if only one is guarded: e.g. this
     ///      court's `setVoteWindow` raises `voteWindow` while unwired (passes
     ///      vacuously — no game to check against yet), then this setter wires
     ///      it to a game whose own clocks cannot fit that window. Checked
-    ///      against the NEW game's OWN `autoSlashDelay`/`disputeTimeout`, not
-    ///      whatever the OLD `challengeGame` (if any) used to report — this
-    ///      setter requires non-zero unconditionally, so unlike
-    ///      `ChallengeGame.setCourt` there is no vacuous branch to preserve
-    ///      here; every call validates.
+    ///      against the new game's own `autoSlashDelay`/`disputeTimeout`, not
+    ///      whatever the old `challengeGame` (if any) reported — this setter
+    ///      requires non-zero unconditionally, so unlike `ChallengeGame.setCourt`
+    ///      there is no vacuous branch to preserve here; every call validates.
     function setChallengeGame(address newGame) external onlyOwner {
         if (newGame == address(0)) revert ZeroAddress();
         IChallengeGame game_ = IChallengeGame(newGame);
@@ -186,13 +181,12 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     }
 
     /// @inheritdoc ITokenCourt
-    /// @dev THE MIRROR OF `ChallengeGame._requireWindowFits` (B3): the
-    ///      cross-contract invariant `autoSlashDelay + voteWindow +
-    ///      FINALIZE_BUFFER <= disputeTimeout` spans both contracts, so this
-    ///      setter must enforce it too, reading the game's LIVE
-    ///      `autoSlashDelay`/`disputeTimeout` rather than trusting whatever held
-    ///      the last time either contract's setters happened to check it.
-    ///      Vacuous with no game wired: there is no referral clock to fit yet.
+    /// @dev Mirrors `ChallengeGame._requireWindowFits`: the cross-contract
+    ///      invariant `autoSlashDelay + voteWindow + FINALIZE_BUFFER <=
+    ///      disputeTimeout` spans both contracts, so this setter must
+    ///      enforce it too, reading the game's LIVE `autoSlashDelay`/
+    ///      `disputeTimeout` rather than trusting a stale value. Vacuous with
+    ///      no game wired: there is no referral clock to fit yet.
     function setVoteWindow(uint256 newWindow) external onlyOwner {
         if (newWindow == 0 || newWindow > MAX_VOTE_WINDOW) revert InvalidParameter();
         address g = challengeGame;
@@ -229,11 +223,11 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///         still fails a disputed challenge to the accused at
     ///         `filedAt + disputeTimeoutAtFiling`, so a referral filed very
     ///         late would leave the vote too little time to reach a verdict.
-    ///         Rather than open a case doomed to lose the race (review finding
-    ///         E1's live-race version), THE CLOCK CHECK below refuses to open
-    ///         one at all unless `voteWindow + FINALIZE_BUFFER` still fits
-    ///         before the timeout — turning a runtime race into a structural
-    ///         impossibility: a case that exists is always one that can finish.
+    ///         Rather than open a case doomed to lose the race, THE CLOCK
+    ///         CHECK below refuses to open one at all unless `voteWindow +
+    ///         FINALIZE_BUFFER` still fits before the timeout — turning a
+    ///         runtime race into a structural impossibility: a case that
+    ///         exists is always one that can finish.
     /// @dev    STATE IS CLAIMED BEFORE ANY EXTERNAL READ, even though this
     ///         function reads NOTHING off the challenger-supplied governor
     ///         any more — `ch.executedAt` comes from the game's own pinned
@@ -246,17 +240,16 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///         harmless — not impossible, just a no-op `AlreadyReferred` — if
     ///         `challengeOf` ever loses its `view` or the game ever calls back
     ///         into the court.
-    /// @dev    THE EXPOSURE LEDGER IS PINNED HERE TOO (issue #69), under the
-    ///         same discipline as `snapshotTs` above and `game` beside it:
-    ///         one read of `IChallengeGame.exposureLedger()`, stored in
-    ///         `Case.ledger` AND handed to `_recordAccused`, so the accused
-    ///         set and the record of where it came from cannot diverge. It was
-    ///         the last case input still resolved live. An owner
-    ///         `ChallengeGame.setExposureLedger` call after this point is now
+    /// @dev    THE EXPOSURE LEDGER IS PINNED HERE TOO, under the same
+    ///         discipline as `snapshotTs` above and `game` beside it: one read
+    ///         of `IChallengeGame.exposureLedger()`, stored in `Case.ledger`
+    ///         AND handed to `_recordAccused`, so the accused set and the
+    ///         record of where it came from cannot diverge. An owner
+    ///         `ChallengeGame.setExposureLedger` call after this point is
     ///         inert for this case — it cannot empty the accused set (which
     ///         would let every real approver vote on its own case), cannot
     ///         zero `accusedWeight`, and so cannot push the participation
-    ///         floor to its maximum and compound the B2 denial-of-quorum
+    ///         floor to its maximum and compound the denial-of-quorum
     ///         behaviour.
     /// @dev    THE RESIDUAL WINDOW IS FILE→REFER AND STAYS OPEN. A re-point
     ///         made strictly between `ChallengeGame.file` and this call is
@@ -271,8 +264,8 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     function refer(uint256 challengeId) external returns (uint256 caseId) {
         address game = challengeGame;
         address swood = stakedWood;
-        // Requires wired (review finding E4 closed structurally): a case can
-        // no longer exist before its electorate does.
+        // Requires wired: a case can no longer exist before its electorate
+        // does.
         if (game == address(0) || swood == address(0)) revert ZeroAddress();
         if (caseOfChallenge[game][challengeId] != 0) revert AlreadyReferred();
 
@@ -292,7 +285,7 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
             revert InsufficientClock();
         }
 
-        // `ch.executedAt` is the game's OWN pin (F10): `ChallengeGame` snapshots
+        // `ch.executedAt` is the game's OWN pin: `ChallengeGame` snapshots
         // it at filing from the proposal record and never re-reads a live
         // governor afterward — the settle-path slash is sized against this
         // same field. Reading it here rather than calling back into
@@ -332,7 +325,7 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     }
 
     /// @inheritdoc ITokenCourt
-    /// @dev    DO NOT RE-WEIGHT THE RESULT (D3). `getPastVotes` is documented
+    /// @dev    DO NOT RE-WEIGHT THE RESULT. `getPastVotes` is documented
     ///         by `IStakedWood` as age-weighted own staked WOOD already — a
     ///         second aging curve here would duplicate the staking contract's
     ///         and inevitably diverge from it. There is exactly one basis for
@@ -355,8 +348,8 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///         carry the vote: an accused address that can outvote its own
     ///         jury inverts the layer, turning "the electorate judges the
     ///         accused" into "the accused judges itself".
-    /// @dev    A1 (open, not fixed, spec 2026-07-29 §7): THE BAR IS ON THE
-    ///         APPROVING ADDRESS, NOT THE PARTY BEHIND IT. `isAccused` is
+    /// @dev    OPEN LIMITATION: THE BAR IS ON THE APPROVING ADDRESS, NOT THE
+    ///         PARTY BEHIND IT. `isAccused` is
     ///         built from the ledger's approver list — addresses — and
     ///         permissionless staking means one economic actor can approve
     ///         (and back coverage for) the same proposal from several
@@ -374,12 +367,12 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///         "the same party"); the natspec must not claim the bar covers a
     ///         defendant or a party — only that it covers the specific
     ///         addresses the ledger already named as approvers.
-    /// @dev    NO VOTE CHANGES (D3). `AlreadyVoted` refuses a second call from
+    /// @dev    NO VOTE CHANGES. `AlreadyVoted` refuses a second call from
     ///         the same address outright rather than accepting the latest one
     ///         — there is no path to change a cast vote, only to be refused a
     ///         second one.
     /// @dev    THE WINDOW IS THE CASE'S PINNED `voteWindowAtReferral`, never
-    ///         the live `voteWindow` — see that field's own rationale (F5): a
+    ///         the live `voteWindow` — see that field's own rationale: a
     ///         later `setVoteWindow` call must not move a live case's clock.
     /// @dev    `guiltyVotes`/`notGuiltyVotes` ACCUMULATE AGED `getPastVotes`
     ///         WEIGHT, while `_participationFloor`'s base is RAW `getPastTotalVotes`
@@ -390,11 +383,11 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///         would have summed for the same voters; the floor stays
     ///         conservative rather than reachable by an aged-down electorate.
     ///         See `_participationFloor`.
-    /// @dev    PRESENT HOLDINGS ARE A GATE, NEVER A WEIGHT (spec 2026-07-29
-    ///         §3, B4). Historical weight still decides how much a vote
-    ///         counts — that is the D2 flash-loan defence above, and it is
-    ///         unchanged. This decides only WHETHER the caller may vote at
-    ///         all — you must be an active guardian (present stake, no
+    /// @dev    PRESENT HOLDINGS ARE A GATE, NEVER A WEIGHT. Historical weight
+    ///         still decides how much a vote counts — that is the flash-loan
+    ///         defence above, and it is unchanged. This decides only WHETHER
+    ///         the caller may vote at all — you must be an active guardian
+    ///         (present stake, no
     ///         pending unstake request) at the INSTANT you cast, nothing
     ///         about before or after. `requestUnstakeGuardian` — not
     ///         `claimUnstakeGuardian` — is where the leak actually opens: it
@@ -410,7 +403,7 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///         voting at the historic raw checkpoint discounted to
     ///         `ageFloorBps`, because the re-stake re-anchors `stakedAt`, NOT
     ///         at its original historic weight. That returns the bypass to
-    ///         exactly the 25%-of-historic-weight shape B4 describes, now
+    ///         exactly the 25%-of-historic-weight shape described above, now
     ///         costing `minGuardianStake` instead of nothing — a residual
     ///         bounded by that cost, not eliminated. That is the inherent
     ///         shape of a binary gate, not a bug in it.
@@ -426,7 +419,7 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
 
         uint256 weight = IStakedWood(stakedWood).getPastVotes(msg.sender, c.snapshotTs);
         if (weight == 0) revert NoVotingPower();
-        // Present-holdings gate (B4) — see the @dev block above `vote`.
+        // Present-holdings gate — see the @dev block above `vote`.
         if (IStakedWood(stakedWood).getVotes(msg.sender) == 0) revert NoPresentHoldings();
 
         voteOf[caseId][msg.sender] = guilty ? ITokenCourt.Ruling.Guilty : ITokenCourt.Ruling.NotGuilty;
@@ -440,15 +433,15 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     }
 
     /// @inheritdoc ITokenCourt
-    /// @dev    THE VERDICT TABLE (spec §3), and why each branch fails safe:
+    /// @dev    THE VERDICT TABLE, and why each branch fails safe:
     ///         - `turnout == 0 || turnout < floor` -> `Inconclusive`. This is a
     ///           NON-EVENT that unwinds both sides — the accused's
     ///           counter-bond whole, the challenger's bond minus the escalating
-    ///           Inconclusive burn (`IChallengeGame._refundAll`, owner decision
-    ///           2026-07-30) — never an acquittal-with-forfeit: neither side
+    ///           Inconclusive burn (`IChallengeGame._refundAll`) — never an
+    ///           acquittal-with-forfeit: neither side
     ///           pays the OTHER. A thin or absent
     ///           vote answers nothing about guilt, so it must not be read as an
-    ///           answer in either direction — the D6 anti-capture floor exists
+    ///           answer in either direction — the anti-capture floor exists
     ///           precisely so a small, possibly rented, stake cannot manufacture
     ///           either a conviction or a clean acquittal by being the only
     ///           voice in the room.
@@ -457,7 +450,7 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///         - otherwise (a tie included) -> `NotGuilty`. A tie carries no
     ///           ground truth either way; failing it to `NotGuilty` rather than
     ///           `Guilty` is deliberate, because `Guilty` triggers a 100%-style
-    ///           slash (D7, `IChallengeGame.rule`) and an even vote is the worst
+    ///           slash (`IChallengeGame.rule`) and an even vote is the worst
     ///           possible basis for destroying stake. THIS BRANCH STANDS ON
     ///           THAT ARGUMENT ALONE, not on any enum-ordering coincidence: the
     ///           zero value of `IChallengeGame.Verdict` is `Inconclusive`
@@ -466,7 +459,7 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///           uninitialised `Verdict` would. Every branch above assigns
     ///           `verdict` explicitly; nothing here relies on a default.
     /// @dev    STATE IS CLOSED BEFORE THE EXTERNAL CALL, and the `rule` call is
-    ///         wrapped in try/catch — review finding E1 made structural. Between
+    ///         wrapped in try/catch. Between
     ///         a case's vote window closing and someone calling `finalize`, the
     ///         underlying challenge can go terminal on its OWN clock
     ///         (`ChallengeGame.resolve`'s `disputeTimeout`, or a second court
@@ -490,7 +483,7 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///         `WrongStatus` means "nothing is left to rule" — every other
     ///         revert (`InsufficientSlashGas` chief among them, but also
     ///         `NotCourt` from an owner re-pointing the game's `court` while the
-    ///         challenge is still `Disputed` and fully rulable (B2), an unwired
+    ///         challenge is still `Disputed` and fully rulable, an unwired
     ///         escrow/slasher, or a token failure inside the slash) is
     ///         TRANSIENT: it bubbles the whole `finalize` call back out, which
     ///         reverts the state writes above too, so the case is left exactly
@@ -506,24 +499,22 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///         verdict are all already fixed by state and the clock before this
     ///         call runs; opening it to anyone just removes the last place a
     ///         privileged party could sit on a decided case.
-    /// @dev    A2 (open, not fixed, spec 2026-07-29 §7): LAST-MOVER ADVANTAGE
-    ///         IS UNMITIGATED. Every vote is visible on-chain the instant it
-    ///         lands (`VoteCast`), the deadline is hard
-    ///         (`referredAt + voteWindowAtReferral`), and a TIE ACQUITS
-    ///         (`NotGuilty`, see the verdict table above) — so the acquitting
-    ///         side only has to MATCH the guilty tally in the final block, not
-    ///         exceed it, while the guilty side must move first to be seen at
-    ///         all. Public tallies mean nothing is learned by waiting except
-    ///         everyone else's position, so the rational strategy for a
-    ///         well-funded acquittal is to hold votes back and land exactly
-    ///         enough weight after the last honest vote to tie or win, with no
-    ///         window left for a response. §6's trigger for revisiting M1
-    ///         names this precisely: "any case where the tally moves
-    ///         decisively in the final hour of the vote window" IS what a
-    ///         bought vote looks like. The mitigation short of commit-reveal is
-    ///         a vote-extension (any late vote pushes the deadline out), which
-    ///         this contract deliberately does not implement — deferred with
-    ///         §6's trigger, not fixed here.
+    /// @dev    OPEN LIMITATION: LAST-MOVER ADVANTAGE IS UNMITIGATED. Every
+    ///         vote is visible on-chain the instant it lands (`VoteCast`), the
+    ///         deadline is hard (`referredAt + voteWindowAtReferral`), and a
+    ///         TIE ACQUITS (`NotGuilty`, see the verdict table above) — so the
+    ///         acquitting side only has to MATCH the guilty tally in the
+    ///         final block, not exceed it, while the guilty side must move
+    ///         first to be seen at all. Public tallies mean nothing is
+    ///         learned by waiting except everyone else's position, so the
+    ///         rational strategy for a well-funded acquittal is to hold votes
+    ///         back and land exactly enough weight after the last honest vote
+    ///         to tie or win, with no window left for a response: a tally
+    ///         that moves decisively in the final hour of the vote window is
+    ///         what a bought vote looks like. The mitigation short of
+    ///         commit-reveal is a vote-extension (any late vote pushes the
+    ///         deadline out), which this contract deliberately does not
+    ///         implement.
     function finalize(uint256 caseId) external {
         ITokenCourt.Case storage c = _cases[caseId];
         if (c.phase != ITokenCourt.Phase.Voting) revert WrongPhase();
@@ -543,10 +534,9 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
             verdict = IChallengeGame.Verdict.NotGuilty; // tie fails safe
         }
 
-        // Terminal before the external call (E1, made structural): a swallowed
-        // WrongStatus below is bookkeeping, not stranded funds, with zero
-        // custody. Everything else - NotCourt included (B2) - bubbles and
-        // reverts these writes too.
+        // Terminal before the external call: a swallowed WrongStatus below is
+        // bookkeeping, not stranded funds, with zero custody. Everything else
+        // - NotCourt included - bubbles and reverts these writes too.
         c.verdict = verdict;
         c.finalizedAt = block.timestamp;
         c.phase = ITokenCourt.Phase.Resolved;
@@ -557,17 +547,15 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
             // SWALLOW ONLY `WrongStatus` - the one revert that genuinely means
             // "there is nothing left to rule": once `refer` has succeeded a
             // challenge can only leave `Disputed` by going terminal, which is
-            // the E1 race this catch exists for.
+            // the race this catch exists for.
             //
-            // `NotCourt` does NOT mean that (B2). It means the game was
-            // re-pointed away while the challenge is STILL `Disputed` and fully
-            // rulable, so swallowing it closes the case with a verdict recorded
-            // and undelivered - and re-wiring cannot redeliver it, because
-            // `refer` reverts `AlreadyReferred`. The challenge then times out
-            // and acquits, paying the accused the challenger's forfeited bond:
-            // the same verdict-burning outcome this filter was written to
-            // close, reached by an owner action instead of a gas dial. It is
-            // transient and retryable, so it bubbles with everything else.
+            // `NotCourt` does NOT mean that. It means the game was re-pointed
+            // away while the challenge is STILL `Disputed` and fully rulable,
+            // so swallowing it closes the case with a verdict recorded and
+            // undelivered - and re-wiring cannot redeliver it, because `refer`
+            // reverts `AlreadyReferred`. The challenge then times out and
+            // acquits, paying the accused the challenger's forfeited bond. It
+            // is transient and retryable, so it bubbles with everything else.
             bytes4 sel = reason.length >= 4 ? bytes4(reason) : bytes4(0);
             if (sel != IChallengeGame.WrongStatus.selector) {
                 assembly ("memory-safe") {
@@ -581,16 +569,13 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     /// @dev THE FLOOR'S BASE IS `min(getPastTotalVotes(snapshotTs),
     ///      getPastTotalVotes(snapshotTs - FLOOR_LOOKBACK)) - accusedWeight`,
     ///      with a `>` fallback to the unreduced base when the subtrahend
-    ///      would not strictly reduce it. POST-#29 (carrying review finding
-    ///      E3's fix forward): `accusedWeight` sums `getPastStake` over the
-    ///      accused set, the exact same raw-own-stake basis
+    ///      would not strictly reduce it. `accusedWeight` sums `getPastStake`
+    ///      over the accused set, the exact same raw-own-stake basis
     ///      `getPastTotalVotes` sums over the whole electorate — so the two
     ///      operands are the same measure of the same WOOD.
-    /// @dev THE `>` FALLBACK IS NOW A LIVE BRANCH, NOT DEFENCE-IN-DEPTH. It
-    ///      used to be unreachable: `accusedWeight <= total` held BY
-    ///      CONSTRUCTION because both were summed at the SAME instant
-    ///      (`snapshotTs`). The B2 lookback below breaks that identity on
-    ///      purpose — the base can now come from `snapshotTs -
+    /// @dev THE `>` FALLBACK IS A LIVE BRANCH, NOT DEFENCE-IN-DEPTH:
+    ///      `accusedWeight <= total` does not hold by construction once the
+    ///      lookback below is in play — the base can come from `snapshotTs -
     ///      FLOOR_LOOKBACK`, an instant at which an accused approver who
     ///      staked recently was not yet counted, so `accusedWeight` (still
     ///      measured at `snapshotTs`, where it must be, because that is the
@@ -599,9 +584,9 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///      `bps * base` with `base <= accusedWeight`, i.e. a SMALLER floor
     ///      than the subtraction would have produced — never a larger one, so
     ///      it cannot be turned into a denial lever of its own.
-    /// @dev THE BASE IS THE MIN OVER A LOOKBACK (B2, review of PR #56 —
-    ///      BLOCKING). The D2 snapshot defends the NUMERATOR: vote weight is
-    ///      read at `executedAt - 1`, so post-drain buyers and flash loans
+    /// @dev THE BASE IS THE MIN OVER A LOOKBACK. The snapshot defends the
+    ///      NUMERATOR: vote weight is read at `executedAt - 1`, so post-drain
+    ///      buyers and flash loans
     ///      count for nothing. The DENOMINATOR had the opposite exposure
     ///      profile, and a single `getPastTotalVotes(snapshotTs)` read was
     ///      wide open to it: the base is RAISED by anyone staked BEFORE
@@ -623,10 +608,10 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///      and is never slashable (`slashToEscrow` only ever touches the
     ///      approver array), recovering its capital after the cooldown.
     ///
-    ///      THIS IS NOT THE ACCEPTED A1 RISK. Spec 2026-07-29 §7/A1 accepts
-    ///      address-splitting, but frames it purely as helping siblings WIN a
-    ///      vote (`NotGuilty`, on the merits, needing voters). Moving stake
-    ///      OUT of the accused set is simultaneously a DENIAL-OF-QUORUM lever
+    ///      THIS IS NOT THE ALREADY-ACCEPTED ADDRESS-SPLITTING RISK, which is
+    ///      accepted purely as helping siblings WIN a vote (`NotGuilty`, on
+    ///      the merits, needing voters). Moving stake OUT of the accused set
+    ///      is simultaneously a DENIAL-OF-QUORUM lever
     ///      needing no voters at all, and it lands on `Inconclusive` rather
     ///      than `NotGuilty` — a different outcome with a different unwind.
     ///
@@ -674,24 +659,23 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///      keeps the subtraction from underflowing.
     ///
     ///      Falling back to ZERO would be the wrong failure. It would disable
-    ///      the D6 anti-capture floor outright for the protocol's first
+    ///      the anti-capture floor outright for the protocol's first
     ///      `FLOOR_LOOKBACK` of staking history, letting a single dust-weight
     ///      guardian carry a case alone — and a wrongful `Guilty` destroys an
     ///      honest guardian's entire stake, which is strictly more destructive
     ///      than the forced `Inconclusive` the fallback leaves possible.
-    ///      Falling back to the total therefore keeps the pre-fix behaviour
-    ///      during bootstrap and nowhere else: this function is monotone
-    ///      against the old one — never a higher floor than before, anywhere.
+    ///      Falling back to the total during bootstrap never produces a
+    ///      higher floor than the ordinary min-based branch would elsewhere.
     ///      The residual is the bootstrap window only, it shrinks to nothing
     ///      once the protocol has a month of stake history, and it is the
     ///      period in which TVL — and therefore the payoff for denying a
     ///      verdict — is smallest.
     /// @dev THE MIN ALSO NEUTRALISES THE ACCUSED'S OWN INFLATION LEVER, which
-    ///      A1 notes runs the other way: an accused approver topping up its
-    ///      stake just before the drain used to raise `total` and
-    ///      `accusedWeight` together, but a NON-approving sibling address
-    ///      topping up raised only `total`. Now neither moves the base at all
-    ///      unless it was already staked a month earlier.
+    ///      runs the other way: without it, an accused approver topping up
+    ///      its stake just before the drain would raise `total` and
+    ///      `accusedWeight` together, while a NON-approving sibling address
+    ///      topping up would raise only `total`. Neither moves the base at
+    ///      all unless it was already staked a month earlier.
     /// @dev THE FLOOR READS THE LIVE `participationFloorBps`, DELIBERATELY NOT
     ///      PINNED per-case. This is the opposite choice from `snapshotTs` and
     ///      `voteWindowAtReferral`, which ARE pinned at `refer` — and the
@@ -701,22 +685,19 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///      out from under a vote already in progress. The participation floor
     ///      has no such hazard: it is read exactly once, at `finalize`, after
     ///      voting has already closed — there is no window during which a
-    ///      change to it could retroactively alter anyone's cast ballot. The
-    ///      spec (D6) sanctions this: a floor change is meant to apply to any
-    ///      case finalizing after it takes effect, including one already
-    ///      `Voting` when the owner adjusts it.
+    ///      change to it could retroactively alter anyone's cast ballot. This
+    ///      is by design: a floor change is meant to apply to any case
+    ///      finalizing after it takes effect, including one already `Voting`
+    ///      when the owner adjusts it.
     /// @dev  THE LIVE READ ALSO MEANS the owner can, by raising
     ///       `participationFloorBps` before a pending `finalize`, push a live
     ///       case that would otherwise have cleared the floor down into
-    ///       `Inconclusive` instead. Accepted for the same D6 reason above,
-    ///       BUT NO LONGER MONEY-NEUTRAL (review round 3, 2026-07-30 —
-    ///       corrected; this claim was accurate when written and stopped
-    ///       being true the moment `IChallengeGame._refundAll` started
-    ///       burning a slice of the challenger's bond on this path). The
-    ///       lever still cannot MANUFACTURE a conviction or an acquittal it
-    ///       did not earn, and it still moves nothing to the accused or to
-    ///       the owner — but it is no longer true that "it moves no money to
-    ///       anyone": forcing a live case into `Inconclusive` instead of the
+    ///       `Inconclusive` instead. Accepted for the same reason above, but
+    ///       NOT MONEY-NEUTRAL: `IChallengeGame._refundAll` burns a slice of
+    ///       the challenger's bond on the `Inconclusive` path. The lever
+    ///       still cannot MANUFACTURE a conviction or an acquittal it did not
+    ///       earn, and it still moves nothing to the accused or to the owner
+    ///       — but forcing a live case into `Inconclusive` instead of the
     ///       `Guilty`/`NotGuilty` verdict it would otherwise have reached
     ///       destroys a real slice of the challenger's bond that a clean
     ///       verdict would not have (a `Guilty` verdict returns the bond
@@ -775,8 +756,8 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///       `Case.ledger`, so the address this function derives the accused
     ///       set from and the address the case record advertises are the same
     ///       value by construction, not by two reads happening to agree. A
-    ///       second live resolution here — which is what this function used to
-    ///       do — would be exactly the drift the pin exists to deny.
+    ///       second live resolution here would be exactly the drift the pin
+    ///       exists to deny.
     /// @dev  THE RESIDUAL RE-POINT WINDOW IS FILE→REFER, AND IT IS OUT OF THE
     ///       COURT'S REACH. `ChallengeGame.setExposureLedger` vets the
     ///       INCOMING ledger — non-zero, `challengeWindow` wide enough, and
@@ -793,17 +774,17 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///       for the challenge's own timeout), and closing it belongs to
     ///       `ChallengeGame`: either an at-`file` pin in the `Challenge`
     ///       struct, or a live-challenge guard on `setExposureLedger`. Both
-    ///       are deliberately out of scope here — see issue #69.
+    ///       are deliberately out of scope here.
     /// @dev  WEIGHT IS SUMMED AT `snapshotTs`, the case's stored instant, so
     ///       the number subtracted from the floor is measured on exactly the
     ///       same electorate as the votes it is compared against. RAW
-    ///       `getPastStake`, not aged `getPastVotes` (review finding F17):
-    ///       `_participationFloor` subtracts this sum from `getPastTotalVotes`,
-    ///       which sums raw own stake — the two must be the same basis or the
-    ///       subtraction compares two different measures of the same WOOD.
-    ///       POST-A5: the raw basis is not merely a units argument — it also
-    ///       denies the accused a free lever on its own conviction threshold.
-    ///       If this summed aged `getPastVotes` instead, an accused approver
+    ///       `getPastStake`, not aged `getPastVotes`: `_participationFloor`
+    ///       subtracts this sum from `getPastTotalVotes`, which sums raw own
+    ///       stake — the two must be the same basis or the subtraction
+    ///       compares two different measures of the same WOOD. The raw basis
+    ///       is not merely a units argument — it also denies the accused a
+    ///       free lever on its own conviction threshold. If this summed aged
+    ///       `getPastVotes` instead, an accused approver
     ///       could call `requestUnstakeGuardian` — free, permissionless,
     ///       cancellable — between the drain and `refer`, re-anchoring its
     ///       `stakedAt` and flooring its own contribution to `ageFloorBps`.
@@ -811,8 +792,8 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///       case the accused was certain to lose into `Inconclusive` (which
     ///       escapes the slash entirely — the accused's counter-bond returns
     ///       whole, and only the challenger's bond takes the escalating
-    ///       Inconclusive burn, owner decision 2026-07-30). The
-    ///       raw basis is immune: `getPastStake` reads the checkpointed
+    ///       Inconclusive burn). The raw basis is immune: `getPastStake`
+    ///       reads the checkpointed
     ///       amount directly, with no live, re-anchorable factor for a
     ///       pending unstake request to move.
     /// @dev  A DOUBLE-LISTED APPROVER WOULD DOUBLE-COUNT ITS WEIGHT, so the
@@ -826,11 +807,11 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///       at `MAX_APPROVERS_PER_PROPOSAL = 100` (`GuardianRegistry.sol`).
     ///       So this loop is at most 100 iterations, each one `getPastStake`
     ///       staticcall.
-    /// @dev  TASK 8 DECIDED THE OPPOSITE OF SIZING A STIPEND FOR THIS LOOP.
-    ///       The auto-referral path does run `refer` (and this loop) inside
+    /// @dev  NO GAS STIPEND IS SIZED FOR THIS LOOP, DELIBERATELY. The
+    ///       auto-referral path does run `refer` (and this loop) inside
     ///       `ChallengeGame.dispute`'s try/catch, which pays for up to ~100
     ///       `getPastStake` staticcalls in the worst case — but no gas floor
-    ///       fronts that call, deliberately. `dispute` is how the accused BUY
+    ///       fronts that call. `dispute` is how the accused BUY
     ///       their defence: a reverting `dispute` denies it outright and the
     ///       accused is slashed by the silence verdict without ever reaching
     ///       adjudication, which is unrecoverable. A skipped referral is not —

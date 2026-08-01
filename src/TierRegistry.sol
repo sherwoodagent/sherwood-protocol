@@ -8,8 +8,8 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 /**
  * @title TierRegistry
  * @notice Adapter-selector tier certification for the guardian economic-security
- *         model (spec 2026-07-22 §3.2). Tier is a property of (target, selector),
- *         set at listing by governance, consumed at propose/execute time.
+ *         model. Tier is a property of (target, selector), set at listing by
+ *         governance, consumed at propose/execute time.
  *
  *         Tier 0: closed-loop — extractable bounded to `extractableBoundBps`.
  *         Tier 1: oracle-bounded discretion — extractable bounded likewise.
@@ -21,16 +21,15 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
  *      on mismatch — no state write in the hot path, nothing to grief. `poke`
  *      persists the demotion and emits for indexers.
  *
- *      SCOPE OF THE CODEHASH CHECK (finding 4): EXTCODEHASH identity catches
- *      ONLY same-address bytecode mutation — i.e. metamorphic redeploys
- *      (CREATE2 + SELFDESTRUCT). It does NOT catch proxy implementation swaps:
- *      for EIP-1967 / UUPS / transparent / beacon proxies the PROXY's runtime
+ *      SCOPE OF THE CODEHASH CHECK: EXTCODEHASH identity catches ONLY
+ *      same-address bytecode mutation — i.e. metamorphic redeploys (CREATE2 +
+ *      SELFDESTRUCT). It does NOT catch proxy implementation swaps: for
+ *      EIP-1967 / UUPS / transparent / beacon proxies the PROXY's runtime
  *      bytecode is static across upgrades, so the certified hash keeps
  *      matching while the behavior behind it changes arbitrarily. Governance
- *      MUST NOT certify proxied adapters at tier 0/1 — certification is a
- *      governance judgment (per spec), and an upgradeable target can never be
- *      "closed-loop" or "oracle-bounded" by inspection of frozen code. Leave
- *      proxies at the tier-2 default.
+ *      MUST NOT certify proxied adapters at tier 0/1 — an upgradeable target
+ *      can never be "closed-loop" or "oracle-bounded" by inspection of frozen
+ *      code. Leave proxies at the tier-2 default.
  */
 contract TierRegistry is Ownable2Step {
     using SafeERC20 for IERC20;
@@ -41,11 +40,10 @@ contract TierRegistry is Ownable2Step {
         bytes32 certifiedCodehash; // EXTCODEHASH of target at certification
     }
 
-    /// @dev Submitter bond per certification (spec §3.6: "tier downgrade = bonded
-    ///      claim"). Held while certified; demotion starts `bondReleaseDelay`,
-    ///      then the submitter claims. The delay is the seam Plan C's
-    ///      guard-bypass slash attaches to (slash-first layering: submitter bond
-    ///      before protocol backstop).
+    /// @dev Submitter bond per certification. Held while certified; demotion
+    ///      starts `bondReleaseDelay`, then the submitter claims. The delay
+    ///      gives the slash mechanism a window to act before the submitter's
+    ///      bond can be pulled out from under it.
     struct SubmitterBond {
         address submitter;
         uint96 amount;
@@ -55,9 +53,9 @@ contract TierRegistry is Ownable2Step {
     uint8 public constant TIER_ARBITRARY = 2;
     uint16 public constant FULL_NOTIONAL_BPS = 10_000;
 
-    /// @dev Floor preserves Plan C's slash window: a demoted bond must stay
-    ///      claimable-not-yet-claimed long enough for the guard-bypass slash
-    ///      machinery to act. Ceiling bounds governance error.
+    /// @dev Floor keeps a demoted bond claimable-not-yet-claimed long enough
+    ///      for the slash mechanism to act before payout. Ceiling bounds
+    ///      governance error.
     uint256 public constant MIN_BOND_RELEASE_DELAY = 1 days;
     uint256 public constant MAX_BOND_RELEASE_DELAY = 365 days;
 
@@ -146,7 +144,7 @@ contract TierRegistry is Ownable2Step {
     }
 
     /// @notice Set the submitter bond amount pulled on `certify`. Zero disables
-    ///         the bond requirement (Plan A no-bond passthrough).
+    ///         the bond requirement.
     /// @dev    Bounded to uint96 so the `SubmitterBond.amount` narrowing cast
     ///         in `certify` is provably lossless.
     function setSubmitterBondWood(uint256 amount) external onlyOwner {
@@ -158,9 +156,8 @@ contract TierRegistry is Ownable2Step {
 
     /// @notice Set the timelock delay between demotion and submitter bond claim.
     /// @dev    Bounded to [MIN_BOND_RELEASE_DELAY, MAX_BOND_RELEASE_DELAY]. The
-    ///         floor preserves Plan C's slash window — a zero/near-zero delay
-    ///         would let a mis-certifying submitter exit before the guard-bypass
-    ///         slash can attach.
+    ///         floor prevents a mis-certifying submitter from exiting before
+    ///         the slash mechanism can act.
     function setBondReleaseDelay(uint256 delay) external onlyOwner {
         if (delay < MIN_BOND_RELEASE_DELAY || delay > MAX_BOND_RELEASE_DELAY) revert InvalidDelay();
         bondReleaseDelay = delay;
@@ -183,18 +180,14 @@ contract TierRegistry is Ownable2Step {
     ///         bond exists for the key — active (`BondActive`) or pending
     ///         release (`BondPendingRelease`) — `certify` reverts. Replacing
     ///         it goes demote → timelock → claim → fresh certify, so the old
-    ///         bond must traverse its release timelock (slash-first layering)
-    ///         before the key can carry a new bond.
+    ///         bond must traverse its release timelock before the key can
+    ///         carry a new bond.
     ///
-    ///         OPERATIONAL COST, stated rather than discovered (review m2):
-    ///         this applies to BENIGN edits too. Correcting an
-    ///         `extractableBoundBps` typo, or re-certifying after a legitimate
-    ///         adapter upgrade, costs the full demote → 14d → claim → certify
-    ///         cycle — and the key sits at tier 2 (full notional, priced not
-    ///         bounded) for the whole window. Deliberate: the alternative is a
-    ///         path that swaps a certification out from under a live bond. It
-    ///         belongs in the runbook so operators plan around it rather than
-    ///         discovering it mid-incident.
+    ///         This applies to benign edits too: correcting an
+    ///         `extractableBoundBps` typo, or re-certifying after a
+    ///         legitimate adapter upgrade, costs the full demote → delay →
+    ///         claim → certify cycle, and the key sits at tier 2 (full
+    ///         notional, priced not bounded) for the whole window.
     function certify(address target, bytes4 selector, uint8 tier, uint16 extractableBoundBps, address submitter)
         external
         onlyOwner
@@ -212,9 +205,7 @@ contract TierRegistry is Ownable2Step {
             if (existing.releasableAt != 0) revert BondPendingRelease();
             revert BondActive();
         }
-        // Pull the submitter bond when configured (spec §3.6). Zero-config
-        // (bond amount 0) preserves the Plan A no-bond path for the governance-
-        // assigned initial adapter set.
+        // Pull the submitter bond when configured; a zero bond amount skips it.
         uint256 bondAmount = submitterBondWood;
         if (bondAmount != 0) {
             if (submitter == address(0)) revert ZeroAddressSubmitter();
@@ -231,9 +222,8 @@ contract TierRegistry is Ownable2Step {
     }
 
     /// @notice The one address permitted to demote on a passed challenge — the
-    ///         ChallengeGame (spec §3.4: "adapters demote only on a passed
-    ///         challenge"). A ROLE rather than registry ownership, so the game
-    ///         can revoke a certification but never grant one.
+    ///         ChallengeGame. A ROLE rather than registry ownership, so the
+    ///         game can revoke a certification but never grant one.
     address public authorizedDemoter;
 
     error NotAuthorizedDemoter();
@@ -241,21 +231,14 @@ contract TierRegistry is Ownable2Step {
     event AuthorizedDemoterSet(address indexed demoter);
 
     /// @dev Zero is legal and deliberate — it is the UNWIRE switch, revoking
-    ///      the challenge game's demotion role outright while a replacement is
-    ///      wired. The unwired state fails CLOSED (nothing can demote), which
-    ///      is why this setter carries no zero-address check where the others
-    ///      in this diff do (PR #25 review, minor).
+    ///      the challenge game's demotion role while a replacement is wired.
+    ///      The unwired state fails CLOSED (nothing can demote), which is why
+    ///      this setter carries no zero-address check.
     ///
-    ///      WHAT "FAILS CLOSED" DOES AND DOES NOT COVER (review 🟠F11). It holds
-    ///      for FUTURE demotions and did NOT hold for live challenges:
-    ///      `ChallengeGame._settle` called `demoteByChallenge` unguarded, so
-    ///      throwing this switch mid-challenge reverted the whole verdict —
-    ///      `resolve()` could never complete, the slash never landed, both bonds
-    ///      stranded in the game, and the frozen coverage barred every accused
-    ///      approver from `claimUnstakeGuardian`, permanently. The game now
-    ///      treats the demotion as best-effort and emits `AdapterDemotionFailed`
-    ///      instead, so this role is safe to rotate at any time — and `demote`
-    ///      below is the owner's remedy for any revocation the rotation lost.
+    ///      `ChallengeGame` treats the demotion call as best-effort and emits
+    ///      `AdapterDemotionFailed` on failure rather than reverting the
+    ///      verdict, so this role is safe to rotate at any time; `demote`
+    ///      below is the owner's remedy for any revocation a rotation misses.
     function setAuthorizedDemoter(address demoter) external onlyOwner {
         authorizedDemoter = demoter;
         emit AuthorizedDemoterSet(demoter);
@@ -269,7 +252,7 @@ contract TierRegistry is Ownable2Step {
     /// @notice Demote (target, selector) back to the tier-2 default because a
     ///         challenge against it passed. Reuses the same `_demote` path as
     ///         owner demotion, so the submitter-bond release timelock starts
-    ///         identically (§3.6 slash-first layering).
+    ///         identically.
     function demoteByChallenge(address target, bytes4 selector) external {
         if (msg.sender != authorizedDemoter) revert NotAuthorizedDemoter();
         _demote(target, selector);
@@ -301,8 +284,7 @@ contract TierRegistry is Ownable2Step {
     ///         recorded submitter, so a caller gate would protect nothing —
     ///         and it would let a lost-key submitter permanently retire a
     ///         (target, selector) key, since `certify` blocks while any bond
-    ///         exists. The delay is the window Plan C's guard-bypass slash
-    ///         will act in.
+    ///         exists. The delay is the window the slash mechanism acts in.
     function claimSubmitterBond(address target, bytes4 selector) external {
         bytes32 k = key(target, selector);
         SubmitterBond memory b = _bonds[k];
@@ -313,9 +295,9 @@ contract TierRegistry is Ownable2Step {
         emit SubmitterBondClaimed(target, selector, b.submitter, b.amount);
     }
 
-    /// @notice Full bond record for (target, selector) — Plan C's slash
-    ///         contract and UIs need `releasableAt` to time the challenge
-    ///         window. Zeroed struct when no bond exists.
+    /// @notice Full bond record for (target, selector); `releasableAt` times
+    ///         the challenge window for callers that need it. Zeroed struct
+    ///         when no bond exists.
     function bondOf(address target, bytes4 selector) external view returns (SubmitterBond memory) {
         return _bonds[key(target, selector)];
     }

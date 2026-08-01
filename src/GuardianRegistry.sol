@@ -14,15 +14,13 @@ import {EnumerableSet} from "@openzeppelin/contracts/utils/structs/EnumerableSet
 
 /// @title GuardianRegistry
 /// @notice UUPS-upgradeable registry for guardian review votes, emergency
-///         review lifecycle, and the slash-appeal reserve. Holds **zero
-///         assets** — the guardian fee is paid out off-chain (buyback-WOOD via
-///         weekly Merkl); the on-chain reward pool/claim machinery was deleted
-///         and `getApproverWeights` exposes the per-proposal approver split for
-///         the bot. Guardian stake, owner bonds, DPoS
-///         vote checkpoints, and slashing live in `StakedWood`
-///         (sWOOD). The registry reads vote weight from sWOOD and calls sWOOD
-///         to slash. See
-///         `openspec/specs/guardian-staking/spec.md`.
+///         review lifecycle, and the slash-appeal reserve. Holds zero assets —
+///         the guardian fee is paid out off-chain (buyback-WOOD via weekly
+///         Merkl); `getApproverWeights` exposes the per-proposal approver
+///         split for the bot. Guardian stake, owner bonds, DPoS vote
+///         checkpoints, and slashing live in `StakedWood` (sWOOD); the
+///         registry reads vote weight from sWOOD and calls sWOOD to slash.
+///         See `openspec/specs/guardian-staking/spec.md`.
 contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgradeable {
     using SafeERC20 for IERC20;
     using EnumerableSet for EnumerableSet.AddressSet;
@@ -66,16 +64,15 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         uint128 approveStakeWeight;
         uint128 blockStakeWeight;
         uint64 openedAt; // timestamp for checkpoint lookup of vote weight
-        /// @dev Sherlock run #2 #15: snapshot the block-quorum threshold at
-        ///      `openReview` so the owner cannot shift it mid-review and
-        ///      flip the resolution outcome. Read by `resolveReview` +
-        ///      `cancelReview` instead of the live `blockQuorumBps` slot.
+        /// @dev Snapshot of the block-quorum threshold at `openReview` so the
+        ///      owner cannot shift it mid-review and flip the resolution
+        ///      outcome. Read by `resolveReview` + `cancelReview` instead of
+        ///      the live `blockQuorumBps` slot.
         uint16 blockQuorumBpsAtOpen;
-        /// @dev Review-window timestamps PUSHED by the governor at propose time
-        ///      via `registerReview` (ProposalLifecycle Task 1). The registry
-        ///      reads these stored fields directly instead of calling back into
-        ///      the governor; `voteEnd != 0` doubles as the "already registered"
-        ///      sentinel.
+        /// @dev Review-window timestamps pushed by the governor at propose
+        ///      time via `registerReview`. The registry reads these stored
+        ///      fields directly instead of calling back into the governor;
+        ///      `voteEnd != 0` doubles as the "already registered" sentinel.
         uint64 voteEnd;
         uint64 reviewEnd;
     }
@@ -86,7 +83,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     ///      instant their review vote was recorded. Read by the off-chain Merkl
     ///      bot via `getApproverWeights` to attribute the (off-chain) guardian
     ///      fee. Vote accounting only — slashing is sized on sWOOD from its
-    ///      own raw own-stake checkpoint at `openedAt` (spec 2026-07-19 §5).
+    ///      own raw own-stake checkpoint at `openedAt`.
     mapping(bytes32 => mapping(address => uint128)) internal _voteStake;
     mapping(bytes32 => address[]) internal _approvers;
     mapping(bytes32 => address[]) internal _blockers;
@@ -103,9 +100,9 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         uint8 nonce; // bumped on open/cancel so prior block votes go stale
         uint64 openedAt; // timestamp for checkpoint lookup of vote weight
         bool cohortTooSmall;
-        /// @dev Sherlock run #2 #15 (emergency variant): snapshot block-quorum
-        ///      threshold at `openEmergency` so the owner cannot shift it
-        ///      mid-review. Read by `cancelEmergency` + `_resolveEmergency`.
+        /// @dev Snapshot of the block-quorum threshold at `openEmergency` so
+        ///      the owner cannot shift it mid-review. Read by
+        ///      `cancelEmergency` + `_resolveEmergency`.
         uint16 blockQuorumBpsAtOpen;
         /// @dev Set to msg.sender at openEmergency; read by _resolveEmergency
         ///      to resolve the vault from `vaultOf[governor]` for the owner-bond
@@ -120,7 +117,6 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
 
     /// @dev Emergency call array — stored by governor via `openEmergency`,
     ///      returned on `finalizeEmergency`, cleared on cancel/finalize.
-    ///      Moved from SyndicateGovernor to consolidate emergency state.
     mapping(bytes32 => BatchExecutorLib.Call[]) internal _emergencyCalls;
 
     // Epoch accounting. `epochGenesis` anchors the `_emitBlockerAttribution`
@@ -140,16 +136,12 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     uint256 public blockQuorumBps;
 
     // Privileged addresses
-    /// @dev Set of authorized governor addresses (replaces the single `governor` slot).
-    ///      Added by `addGovernor` (factory-only). The slot formerly held by the
-    ///      `address public governor` singleton is repurposed as the EnumerableSet
-    ///      internal storage; callers must use `addGovernor` after deploy.
+    /// @dev Set of authorized governor addresses. Added by `addGovernor`
+    ///      (factory-only).
     EnumerableSet.AddressSet private _authorizedGovernors;
-    /// @dev Retained post-slim purely as an alignment beacon: the slimmed
-    ///      registry no longer gates any logic on `factory` (factory-gated
-    ///      staking moved to sWOOD), but `SyndicateFactory.setGuardianRegistry`
-    ///      reads this getter as a Sherlock #28 misconfig check, and it is part
-    ///      of the deployed proxy storage layout. Do not remove.
+    /// @dev Unused internally; `SyndicateFactory.setGuardianRegistry` reads
+    ///      this getter as a misconfig check, and it is part of the deployed
+    ///      proxy storage layout. Do not remove.
     address public factory;
 
     /// @notice The StakedWood (sWOOD) contract — sole WOOD custodian. The
@@ -161,32 +153,20 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     ///      `addGovernor`); the slash path resolves the vault from this trusted
     ///      mapping so a compromised governor cannot misdirect `slashOwnerBond`
     ///      to an arbitrary vault.
-    /// @dev APPENDED here (not next to `_authorizedGovernors`) so no
-    ///      pre-existing field moves: new fields go immediately before `__gap`
-    ///      and consume one gap slot.
+    /// @dev Appended immediately before `__gap` (not next to
+    ///      `_authorizedGovernors`) so no pre-existing field moves; consumes
+    ///      one gap slot.
     mapping(address => address) public vaultOf;
 
-    // Guardian-fee reward distribution is OFF-CHAIN (buyback-WOOD via weekly
-    // Merkl): the governor sends the fee slice to the team `guardiansFeeRecipient`
-    // multisig and emits `GuardianFeeAccrued`; the bot reads that event +
-    // `getApproverWeights` to attribute WOOD airdrops. The on-chain pool /
-    // claim / escrow machinery was deleted — the registry holds zero assets.
-    // (Slots freed; the __gap below absorbs the layout delta — this is a fresh
-    // V1.5 mainnet redeployment so no live storage to migrate.)
-
-    /// @notice Plan B (spec 2026-07-22 §3.3): exposure ledger consulted on every
-    ///         approve-side review vote. address(0) = not wired = hooks skipped.
-    ///         Owner-set via `setExposureLedger` (a setter, not init: the registry
-    ///         proxy is already live).
-    /// @dev APPENDED here for the same reason as `vaultOf` above — new fields go
-    ///      immediately before `__gap` and consume one gap slot, so no
+    /// @notice Exposure ledger consulted on every approve-side review vote.
+    ///         address(0) = not wired = hooks skipped. Owner-set via
+    ///         `setExposureLedger`.
+    /// @dev Appended immediately before `__gap`, consumes one gap slot; no
     ///      pre-existing field moves.
     IExposureLedger public exposureLedger;
 
-    /// @dev Reserved storage for future upgrades. Reduced 50 -> 49 when
-    ///      `vaultOf` was appended (lifecycle), then 49 -> 48 for
-    ///      `exposureLedger` (Plan B). Total slot count is conserved: every new
-    ///      field takes one slot from here.
+    /// @dev Reserved storage for future upgrades; each new field consumes
+    ///      one slot from here.
     uint256[48] private __gap;
 
     /// @notice Per-deployment hard floor for `reviewPeriod` (impl-time immutable;
@@ -230,16 +210,14 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         if (owner_ == address(0) || factory_ == address(0) || swood_ == address(0)) {
             revert ZeroAddress();
         }
-        // Mirror `setReviewPeriod`'s bounds. Without this a deploy could seat
-        // `reviewPeriod == 0` — a value `setReviewPeriod` can never produce —
-        // and the governor would then skip `registerReview` (the window
-        // collapses to `reviewEnd == voteEnd`), leaving every proposal
-        // unresolvable and the vault permanently bound by a proposal that can
-        // never terminate. Fail loudly at deploy instead.
+        // Mirrors `setReviewPeriod`'s bounds: a zero `reviewPeriod` would make
+        // the governor skip `registerReview` (window collapses to
+        // `reviewEnd == voteEnd`), leaving every proposal unresolvable and the
+        // vault permanently bound. Fail loudly at deploy instead.
         if (reviewPeriod_ < minReviewPeriod || reviewPeriod_ > 7 days) revert InvalidParameter();
-        // Sherlock run #2 #16 invariant (cooldown >= review) is enforced at
-        // the setters only — the deploy script seeds compatible values, and
-        // skipping the init-time check claws back ~10 bytes under EIP-170.
+        // The cooldown >= review invariant is enforced at the setters only —
+        // the deploy script seeds compatible values, and skipping the
+        // init-time check saves ~10 bytes under EIP-170.
 
         __Ownable_init(owner_);
 
@@ -272,9 +250,9 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     /// @param vault The vault `gov` serves; recorded in `vaultOf` so the slash
     ///        path resolves the vault from trusted factory-wired state.
     function addGovernor(address gov, address vault) external {
-        // I3 (review) + spec §7: factory-only. The registry owner authorizing an
-        // arbitrary governor would let an attacker-controlled vault
-        // reach slashOwnerBond(anyVault) — restore the spec's onlyFactory gate.
+        // Factory-only: letting the registry owner authorize an arbitrary
+        // governor would let an attacker-controlled vault reach
+        // slashOwnerBond(anyVault).
         if (msg.sender != factory) revert UnauthorizedGovernor();
         if (gov == address(0) || vault == address(0)) revert ZeroAddress();
         _authorizedGovernors.add(gov);
@@ -328,8 +306,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         return uint256(r.blockStakeWeight) * 10_000 >= uint256(r.blockQuorumBpsAtOpen) * denom;
     }
 
-    // ── sWOOD passthrough views (so `GovernorEmergency` can read the owner
-    //    bond through the registry handle without a separate sWOOD reference) ──
+    // ── sWOOD passthrough views (lets GovernorEmergency read the owner bond via the registry) ──
 
     /// @inheritdoc IGuardianRegistry
     function ownerStake(address vault) external view returns (uint256) {
@@ -357,16 +334,14 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         return _authorizedGovernors.contains(gov);
     }
 
-    // ──────────────────────────────────────────────────────────────
-    // Guardian-fee attribution (read-only)
-    // ──────────────────────────────────────────────────────────────
+    // ── Guardian-fee attribution (read-only) ──
 
     /// @inheritdoc IGuardianRegistry
-    /// @dev Reads the (retained) `_approvers` / `_voteStake` accounting. Data
-    ///      persists after settle (arrays are not cleared), so this is callable
-    ///      for any historical proposal. The off-chain Merkl bot pulls this in
-    ///      a single RPC call to attribute the guardian fee (paid out as WOOD)
-    ///      to approvers — replacing the deleted on-chain claim machinery.
+    /// @dev Reads the `_approvers` / `_voteStake` accounting. Data persists
+    ///      after settle (arrays are not cleared), so this is callable for
+    ///      any historical proposal. The off-chain Merkl bot pulls this in a
+    ///      single RPC call to attribute the guardian fee (paid out as WOOD)
+    ///      to approvers.
     function getApproverWeights(address governor, uint256 proposalId)
         external
         view
@@ -383,28 +358,25 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     }
 
     /// @inheritdoc IGuardianRegistry
-    /// @dev THE WEIGHT THE FEE SHOULD BE PAID ON (§3.10). `getApproverWeights`
-    ///      above returns `_voteStake` — how much WOOD the approver had staked,
-    ///      which is what they PARKED, not what they UNDERWROTE. Distribution
-    ///      keyed off that pays for staking, and lets an approver who booked no
+    /// @dev The weight the fee should be paid on. `getApproverWeights` above
+    ///      returns `_voteStake` — what the approver PARKED, not what they
+    ///      UNDERWROTE — so paying on that would let an approver who booked no
     ///      coverage earn beside one who booked the full amount.
     ///
-    ///      That divergence is reachable, not theoretical. `recordApproval`
-    ///      deliberately books nothing and returns WITHOUT reverting when the
-    ///      guardian has no free budget (`open >= capUsd`), when the asset feed
-    ///      is unpriceable, when coverage is zero, or when settlement is beyond
-    ///      `MAX_COVERAGE_HORIZON` — review N1 chose that over failing the vote,
-    ///      because reverting silenced the approve side and revived the C1 veto.
-    ///      The registry still pushes the voter into `_approvers` (that push
-    ///      happens BEFORE the ledger hook), so the vote counts for attribution
-    ///      whether or not a dollar was booked. A guardian can therefore spend
-    ///      its whole budget on one proposal and keep approving everything else
-    ///      at full stake weight, underwriting nothing further.
+    ///      The divergence is reachable: `recordApproval` deliberately books
+    ///      nothing and does not revert when the guardian has no free budget
+    ///      (`open >= capUsd`), the asset feed is unpriceable, coverage is
+    ///      zero, or settlement is beyond `MAX_COVERAGE_HORIZON`. The registry
+    ///      still pushes the voter into `_approvers` before the ledger hook
+    ///      runs, so the vote counts for attribution whether or not a dollar
+    ///      was booked. A guardian can therefore spend its whole budget on
+    ///      one proposal and keep approving everything else at full stake
+    ///      weight, underwriting nothing further.
     ///
-    ///      Returns the ledger's ALLOCATION — each approver's settled pro-rata
-    ///      share — rather than their reservation. Reservations are deliberately
-    ///      equal to the full coverage per approver (so nobody can squat the
-    ///      book), so paying on them over-pays every approver on an
+    ///      Returns the ledger's ALLOCATION — each approver's settled
+    ///      pro-rata share — rather than their reservation. Reservations
+    ///      equal the full coverage per approver (so nobody can squat the
+    ///      book), so paying on them would over-pay every approver on an
     ///      over-subscribed proposal. Allocations require `settleCoverage` to
     ///      have run; it is permissionless, so the payout job should call it
     ///      before reading this rather than paying on the un-scaled figure.
@@ -437,9 +409,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         priced = true;
     }
 
-    // ──────────────────────────────────────────────────────────────
-    // Guardian review voting
-    // ──────────────────────────────────────────────────────────────
+    // ── Guardian review voting ──
 
     /// @inheritdoc IGuardianRegistry
     /// @dev First-vote path OR vote-change. Requires `openReview` to have been
@@ -449,7 +419,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     ///      tally. Approvers and Blockers are each capped. Block votes carry
     ///      no proposed severity: the slash severity is not voted — it is a
     ///      deterministic function of block-side decisiveness computed at
-    ///      `resolveReview` (see `_severityBps`, spec 2026-07-19 Part D).
+    ///      `resolveReview` (see `_severityBps`).
     function voteOnProposal(address governor, uint256 proposalId, GuardianVoteType support) external whenNotPaused {
         if (support == GuardianVoteType.None) revert();
         if (!_authorizedGovernors.contains(governor)) revert UnauthorizedGovernor();
@@ -472,7 +442,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         if (existing == support) revert NoVoteChange();
 
         if (existing == GuardianVoteType.None) {
-            // Sherlock #42: apply the late-vote lockout to first-time votes too.
+            // Apply the late-vote lockout to first-time votes too.
             uint256 reviewWindowDuration = uint256(r.reviewEnd) - uint256(r.voteEnd);
             uint256 lockoutStart = r.reviewEnd - (reviewWindowDuration * LATE_VOTE_LOCKOUT_BPS) / BPS_DENOMINATOR;
             if (block.timestamp >= lockoutStart) revert VoteChangeLockedOut();
@@ -494,14 +464,12 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
             // CEI: the external ledger call runs AFTER every state write above
             // (`_votes`, tallies, approver/blocker push) so a re-entrant
             // voteOnProposal observes committed state — do NOT move any state
-            // write below this hook. Same discipline as resolveReview (~L646).
+            // write below this hook. Same discipline as resolveReview.
             if (support == GuardianVoteType.Approve && address(exposureLedger) != address(0)) {
-                // Spec §3.3: the aggregate exposure cap is checked HERE, at
-                // the approve vote. An over-exposed guardian books NOTHING
-                // rather than reverting (review N1) — the vote still lands and
-                // the shortfall surfaces at the execute-time quorum. Reverting
-                // here silenced the approve side while Block votes still
-                // worked, which made a review block-only.
+                // The aggregate exposure cap is checked here, at the approve
+                // vote. An over-exposed guardian books nothing rather than
+                // reverting; the vote still lands and the shortfall surfaces
+                // at the execute-time quorum.
                 exposureLedger.recordApproval(governor, proposalId, msg.sender);
             }
             emit GuardianVoteCast(proposalId, msg.sender, support, weight);
@@ -608,9 +576,9 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         bytes32 eKey = _reviewKey(msg.sender, proposalId);
         EmergencyReview storage er = _emergencyReviews[eKey];
         if (er.reviewEnd > 0 && block.timestamp < er.reviewEnd) revert EmergencyAlreadyOpen();
-        // Sherlock #45: snapshot stake totals at open + flag cold-start cohort.
-        // Sherlock #35 / Run-1 #18: denominator read at `t-1` matches the
-        // numerator's checkpoint anchor — symmetric flash-(de)stake defense.
+        // Snapshot stake totals at open and flag a cold-start cohort.
+        // Denominator is read at `t-1`, matching the numerator's checkpoint
+        // anchor — symmetric flash-(de)stake defense.
         IStakedWood sw = swood;
         uint256 ts1 = block.timestamp - 1;
         uint256 gs = sw.getPastTotalVotes(ts1);
@@ -624,8 +592,8 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         er.blocked = false;
         er.openedAt = uint64(ts1);
         er.cohortTooSmall = gs < MIN_COHORT_STAKE_AT_OPEN;
-        // Sherlock run #2 #15: snapshot block-quorum threshold at open so the
-        // owner can't shift it mid-review.
+        // Snapshot block-quorum threshold at open so the owner can't shift
+        // it mid-review.
         // forge-lint: disable-next-line(unsafe-typecast)
         er.blockQuorumBpsAtOpen = uint16(blockQuorumBps);
         uint64 newReviewEnd = er.reviewEnd;
@@ -661,10 +629,9 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         bytes32 eKey = _reviewKey(msg.sender, proposalId);
         EmergencyReview storage er = _emergencyReviews[eKey];
         if (er.reviewEnd > 0 && block.timestamp >= er.reviewEnd) revert ReviewNotOpen();
-        // Sherlock #44: once block quorum is reached, the owner can't dodge.
+        // Once block quorum is reached, the owner can't dodge.
         if (!er.cohortTooSmall) {
             uint256 denom = uint256(er.totalStakeAtOpen);
-            // Sherlock run #2 #15: at-open snapshot.
             if (uint256(er.blockStakeWeight) * 10_000 >= uint256(er.blockQuorumBpsAtOpen) * denom) {
                 revert ReviewNotOpen();
             }
@@ -672,8 +639,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         er.resolved = true;
         er.blocked = false;
         er.blockStakeWeight = 0;
-        // Sherlock #15: repurpose `reviewEnd` post-cancel to encode the
-        // cooldown deadline.
+        // Repurpose `reviewEnd` post-cancel to encode the cooldown deadline.
         er.reviewEnd = uint64(block.timestamp + reviewPeriod);
         er.callsHash = bytes32(0);
         unchecked {
@@ -715,11 +681,10 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
             emit ReviewResolved(proposalId, false, 0);
             return;
         }
-        // Sherlock run #2 #2: once block quorum is reached, the proposer
-        // can't dodge approver slashing by cancelling. Mirrors
-        // `cancelEmergency`'s Sherlock #44 gate. Cold-start cohorts skip
-        // the check — quorum is not meaningful when `totalStakeAtOpen` is
-        // below the floor. Sherlock run #2 #15: use the at-open snapshot.
+        // Once block quorum is reached, the proposer can't dodge approver
+        // slashing by cancelling. Mirrors `cancelEmergency`'s gate. Cold-start
+        // cohorts skip the check — quorum is not meaningful when
+        // `totalStakeAtOpen` is below the floor.
         if (!r.cohortTooSmall) {
             if (_isBlocked(r)) revert ReviewNotOpen();
         }
@@ -752,18 +717,17 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         if (ve == 0 || block.timestamp < ve) revert ReviewNotOpen();
 
         IStakedWood sw = swood;
-        // Sherlock #35 / Run-1 #18: read denominator at the SAME `t-1`
-        // checkpoint that the numerator (voter weight) lookup uses, so
-        // flash-stake in the same block as openReview can't asymmetrically
-        // inflate the quorum denominator while the matching numerator weight
-        // stays at the t-1 snapshot.
+        // Read denominator at the SAME `t-1` checkpoint that the numerator
+        // (voter weight) lookup uses, so flash-stake in the same block as
+        // openReview can't asymmetrically inflate the quorum denominator
+        // while the matching numerator weight stays at the t-1 snapshot.
         uint256 ts1 = block.timestamp - 1;
         uint128 totalAtOpen = uint128(sw.getPastTotalVotes(ts1));
         uint256 combinedAtOpen = uint256(totalAtOpen);
         r.opened = true;
         r.totalStakeAtOpen = totalAtOpen;
-        // Sherlock run #2 #15: snapshot block-quorum at open so the owner
-        // can't shift the threshold after voters have cast.
+        // Snapshot block-quorum at open so the owner can't shift the
+        // threshold after voters have cast.
         // forge-lint: disable-next-line(unsafe-typecast)
         r.blockQuorumBpsAtOpen = uint16(blockQuorumBps);
         r.openedAt = uint64(ts1);
@@ -803,8 +767,8 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         }
 
         // Block-quorum decision: own stake at review open vs the at-open
-        // quorum snapshot (Sherlock run #2 #15). Shared with the `outcomeOf`
-        // view via `_isBlocked` so the two can never disagree.
+        // quorum snapshot. Shared with the `outcomeOf` view via `_isBlocked`
+        // so the two can never disagree.
         bool blocked_ = _isBlocked(r);
 
         // CEI: commit state BEFORE the external slash call.
@@ -816,9 +780,8 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
             // quadratic ramp of block-side decisiveness from the at-open
             // block quorum (floor: `minSlashBps`) to SUPERMAJORITY_BPS
             // (ceiling: `maxSlashBps`), computed by `_severityBps` from the
-            // Review's at-open snapshots. Severity is not voted (spec
-            // 2026-07-19 Part D). The burn and re-checkpoint all happen on
-            // sWOOD.
+            // Review's at-open snapshots. Severity is not voted. The burn and
+            // re-checkpoint all happen on sWOOD.
             //
             // Pass `r.openedAt` so sWOOD's `_slashOne` sizes each slash off
             // the approver's raw own-stake checkpoint at review open.
@@ -830,10 +793,9 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         return blocked_;
     }
 
-    /// @dev Deterministic slash severity from block-side decisiveness
-    ///      (spec 2026-07-19 Part D). Replaces the blocker-voted
-    ///      stake-weighted median: the winning side of a review must not
-    ///      choose the losers' penalty. Quadratic ramp from the at-open
+    /// @dev Deterministic slash severity from block-side decisiveness: the
+    ///      winning side of a review must not choose the losers' penalty.
+    ///      Quadratic ramp from the at-open
     ///      block quorum (floor — a scraped quorum is a genuinely contested
     ///      call) to SUPERMAJORITY_BPS (ceiling — overwhelming condemnation).
     ///      Approvers cannot lower it (honest blockers' weight is not theirs
@@ -899,8 +861,8 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     ///         resolution and slashes the vault owner if blocked. Does NOT
     ///         return or execute calls. The governor's `finalizeEmergencySettle`
     ///         must still be called to execute the calls (if not blocked).
-    /// @dev Restores the V1 permissionless slash path so the bond deterrent
-    ///      works even if the owner never calls `finalizeEmergencySettle`.
+    /// @dev Permissionless slash path so the bond deterrent works even if
+    ///      the owner never calls `finalizeEmergencySettle`.
     function resolveEmergencyReview(address governor, uint256 proposalId) external whenNotPaused {
         if (!_authorizedGovernors.contains(governor)) revert UnauthorizedGovernor();
         bytes32 eKey = _reviewKey(governor, proposalId);
@@ -916,12 +878,11 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     ///      owner's bond on sWOOD if blocked. Reads `er.governor` (set at
     ///      `openEmergency`) instead of the removed singleton to locate the vault.
     function _resolveEmergency(bytes32, uint256 proposalId, EmergencyReview storage er) private {
-        // Sherlock #45: cold-start cohort -> blocked=false regardless of votes.
+        // Cold-start cohort -> blocked=false regardless of votes.
         bool blocked_;
         if (!er.cohortTooSmall) {
             uint256 denomE = uint256(er.totalStakeAtOpen);
             if (denomE > 0) {
-                // Sherlock run #2 #15: at-open snapshot.
                 blocked_ = (uint256(er.blockStakeWeight) * 10_000 >= uint256(er.blockQuorumBpsAtOpen) * denomE);
             }
         }
@@ -957,9 +918,10 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         EmergencyReview storage er = _emergencyReviews[eKey];
         // Mirrors `voteOnProposal`'s `resolved` guard. The `reviewEnd` test
         // alone is NOT sufficient here: `cancelEmergency` repurposes `reviewEnd`
-        // as a post-cancel cooldown deadline (Sherlock #15), so for a whole
-        // `reviewPeriod` after a cancel `block.timestamp < er.reviewEnd` still
-        // holds and votes were accepted into an already-resolved review.
+        // as a post-cancel cooldown deadline, so for a whole `reviewPeriod`
+        // after a cancel `block.timestamp < er.reviewEnd` still holds —
+        // without this check, votes would be accepted into an
+        // already-resolved review.
         if (er.resolved) revert ReviewNotOpen();
         if (er.reviewEnd == 0 || block.timestamp >= er.reviewEnd) revert ReviewNotOpen();
         if (!swood.isActiveGuardian(msg.sender)) revert NotActiveGuardian();
@@ -1025,27 +987,25 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         emit Unpaused(msg.sender, deadman);
     }
 
-    // ── Parameter setters (owner-instant; owner is a multisig with external
-    //    delay) ──
+    // ── Parameter setters (owner-instant; owner is a multisig with external delay) ──
 
     /// @inheritdoc IGuardianRegistry
     /// @dev Enforces the absolute `[6 hours, 7 days]` bounds AND the
-    ///      `coolDownPeriod >= reviewPeriod` cross-contract invariant
-    ///      (Sherlock run #2 #16): the review window may not exceed sWOOD's
-    ///      guardian unstake cooldown. This invariant closes slash-evasion
-    ///      for guardian OWN stake only — an approver cannot unstake and
-    ///      escape the slash before `resolveReview`.
-    ///      Post sWOOD-split: cooldown lives on sWOOD; cross-call gated
+    ///      `coolDownPeriod >= reviewPeriod` cross-contract invariant: the
+    ///      review window may not exceed sWOOD's guardian unstake cooldown.
+    ///      This invariant closes slash-evasion for guardian OWN stake only —
+    ///      an approver cannot unstake and escape the slash before
+    ///      `resolveReview`. Cooldown lives on sWOOD; the cross-call is gated
     ///      behind `address(swood) != address(0)` for the pre-wiring window.
     ///      Other staking params (`minGuardianStake`, `minOwnerStake`,
-    ///      `coolDownPeriod`) moved to sWOOD with their own setters there.
+    ///      `coolDownPeriod`) have their own setters on sWOOD.
     function setReviewPeriod(uint256 v) external onlyOwner {
         if (v < minReviewPeriod || v > 7 days) revert InvalidParameter();
         IStakedWood sw = swood;
         if (address(sw) != address(0) && v > sw.coolDownPeriod()) {
             revert CooldownBelowReviewPeriod();
         }
-        // MIRROR OF THE LEDGER'S FLOOR (review M1). `ExposureLedger` requires
+        // MIRROR OF THE LEDGER'S FLOOR. `ExposureLedger` requires
         // `challengeWindow >= reviewPeriod + MAX_GOVERNOR_EXECUTION_WINDOW`, but
         // it can only enforce that when ITS setter runs. Raising `reviewPeriod`
         // here raises the floor from the other side and nothing revalidated: a

@@ -32,7 +32,7 @@ interface ISyndicateGovernor {
     ///                                         the REGISTRY-driven emergency-settle path
     ///                                         (unstick → finalizeEmergencySettle)
     ///        Draft/Pending/GuardianReview/Approved → Cancelled
-    ///                                         cancelProposal (proposer; G-H2 near-quorum
+    ///                                         cancelProposal (proposer; near-quorum
     ///                                         guard) or emergencyCancel (vault owner,
     ///                                         Draft/Pending only)
     ///
@@ -41,7 +41,7 @@ interface ISyndicateGovernor {
     enum ProposalState {
         Draft, // collaborative proposal awaiting co-proposer consent
         Pending, // voting active
-        GuardianReview, // voting passed, guardian review window active (Task 25)
+        GuardianReview, // voting passed, guardian review window active
         Approved, // review ended without block quorum
         Rejected, // voting ended, veto threshold reached OR guardians blocked
         Expired, // execution window passed without execution
@@ -93,30 +93,24 @@ interface ISyndicateGovernor {
         uint256 votesAbstain;
         uint256 snapshotTimestamp;
         uint256 voteEnd;
-        uint256 reviewEnd; // guardian review window end (Task 25); zero for collaborative drafts
+        uint256 reviewEnd; // guardian review window end; zero for collaborative drafts
         uint256 executeBy;
         uint256 executedAt;
         ProposalState state;
-        /// @dev G-H6: vetoThresholdBps snapshot taken at Draft -> Pending.
-        ///      Prevents mid-vote timelock finalizes from retroactively
-        ///      moving the rejection threshold.
+        /// @dev vetoThresholdBps snapshot taken at Draft -> Pending. Prevents
+        ///      mid-vote timelock finalizes from retroactively moving the
+        ///      rejection threshold.
         uint256 vetoThresholdBps;
         // ── Fee snapshot (read from ProtocolConfig at propose time) ──
-        /// @dev Only the RECIPIENTS are snapshotted. The protocol and guardian
-        ///      SHARES come from `snapshotMgmtSplit` / `snapshotPerfSplit`
-        ///      below; the standalone `snapshotProtocolFeeBps` /
-        ///      `snapshotGuardianFeeBps` fields that used to sit here are gone
-        ///      with the two-number fee model — both were write-only.
+        /// @dev Only the RECIPIENTS are snapshotted; the protocol and
+        ///      guardian SHARES come from `snapshotMgmtSplit` /
+        ///      `snapshotPerfSplit` below.
         ///
-        ///      They occupied struct slots 17 and 19, so removing them shifts
-        ///      every later member down two slots. `_proposals` is a mapping
-        ///      laid out by member index and the governor is a `BeaconProxy`,
-        ///      so upgrading a governor that already held proposals would
-        ///      re-read them against the new offsets. This ships as a FRESH
-        ///      DEPLOYMENT — no proposal predates the change — which is what
-        ///      makes the removal safe. A later release must not repeat this
-        ///      shape of change without first draining or migrating every
-        ///      existing proposal.
+        ///      `_proposals` is a mapping laid out by member index and the
+        ///      governor is a `BeaconProxy`, so reordering or removing a
+        ///      member here shifts every later member's offset and corrupts
+        ///      an already-upgraded governor's existing proposals unless
+        ///      they are drained or migrated first.
         address snapshotProtocolFeeRecipient;
         address snapshotGuardiansFeeRecipient;
         /// @notice `IStrategy.selfManagesFees()` snapshotted at propose time (like
@@ -125,24 +119,24 @@ interface ISyndicateGovernor {
         ///         and a broken/EOA strategy can't brick settle via a revert.
         bool selfManagesFees;
         // ── APPENDED FIELDS ONLY BELOW (beacon-upgraded governors; storage parity) ──
-        uint256 maxCapital; // risk envelope: net-outflow ceiling (spec §3.1)
+        uint256 maxCapital; // risk envelope: net-outflow ceiling
         uint16 maxDrawdownBps; // risk envelope: declared drawdown bound
         /// @notice MAX tier across the proposal's execute calls, resolved via
-        ///         the TierRegistry at propose time (spec §3.2). 2 whenever no
-        ///         registry is wired — the safe default.
+        ///         the TierRegistry at propose time. 2 whenever no registry
+        ///         is wired — the safe default.
         uint8 envelopeTier;
-        /// @notice Extractable-value figure the aggregate exposure cap consumes
-        ///         (Plan B). Finding 5: the SUM of per-call contributions across
+        /// @notice Extractable-value figure the aggregate exposure cap
+        ///         consumes: the SUM of per-call contributions across
         ///         execute AND settlement calls — `maxCapital * Σ boundBps /
-        ///         10_000`, where each tier-0/1 call contributes its certified
-        ///         bound and each tier-2/uncertified call contributes 10_000
-        ///         (full notional). Conservative (over-counting) since per-call
-        ///         notional isn't threaded through in Plan A. `maxCapital` flat
-        ///         when no registry is wired.
+        ///         10_000`, where each tier-0/1 call contributes its
+        ///         certified bound and each tier-2/uncertified call
+        ///         contributes 10_000 (full notional). Conservative
+        ///         (over-counting) since per-call notional isn't threaded
+        ///         through. `maxCapital` flat when no registry is wired.
         uint256 requiredCoverage;
-        /// @notice WOOD amount of the risk-scaled proposer bond locked in the
-        ///         ProposerBondEscrow at propose time (Plan B, spec §3.9). Zero
-        ///         when no escrow/ledger is wired or the bond bps is zero.
+        /// @notice WOOD amount of the risk-scaled proposer bond locked in
+        ///         the ProposerBondEscrow at propose time. Zero when no
+        ///         escrow/ledger is wired or the bond bps is zero.
         uint256 proposerBondWood;
         /// @notice The ProposerBondEscrow that actually HOLDS this proposal's
         ///         bond, bound at propose time. The bond is custodial and the
@@ -170,11 +164,11 @@ interface ISyndicateGovernor {
         uint256 splitBps;
     }
 
-    /// @notice Per-proposal risk envelope (spec 2026-07-22 §3.1).
+    /// @notice Per-proposal risk envelope.
     /// @param maxCapital   Net-outflow ceiling for the execute batch, enforced
     ///                     by the vault at custody level. Nonzero.
     /// @param maxDrawdownBps Declared drawdown envelope; losses beyond it are
-    ///                     challengeable (challenge game, later plan). <= 10_000.
+    ///                     challengeable via the challenge game. <= 10_000.
     ///                     10_000 (100%) is a legal declaration and means any
     ///                     loss up to the full committed capital is inside the
     ///                     envelope — no drawdown challenge can ever fire. It is
@@ -202,20 +196,21 @@ interface ISyndicateGovernor {
     error ProposalNotFound();
     error ProposalNotApproved();
     error ExecutionWindowExpired();
-    /// @notice Spec §3.2 fail-safe: revert at execute if the proposal's live
-    ///         tier (re-resolved from its stored execute calls) is WORSE than
-    ///         the `envelopeTier` snapshotted at propose. A certified tier-0/1
-    ///         adapter that demoted since propose (codehash change or
-    ///         governance revocation) leaves the proposal under-covered — block
-    ///         execution rather than run a possibly-unbounded batch against a
-    ///         bounded-tier coverage price.
+    /// @notice Fail-safe: revert at execute if the proposal's live tier
+    ///         (re-resolved from its stored execute calls) is WORSE than
+    ///         the `envelopeTier` snapshotted at propose. A certified
+    ///         tier-0/1 adapter that demoted since propose (codehash change
+    ///         or governance revocation) leaves the proposal
+    ///         under-covered — block execution rather than run a
+    ///         possibly-unbounded batch against a bounded-tier coverage
+    ///         price.
     error TierRegressed();
-    /// @notice Finding 5(b) companion to `TierRegressed`: revert at execute if
-    ///         the live re-resolved `requiredCoverage` exceeds the propose-time
+    /// @notice Companion to `TierRegressed`: revert at execute if the live
+    ///         re-resolved `requiredCoverage` exceeds the propose-time
     ///         snapshot. Catches a same-tier RE-certification with a HIGHER
-    ///         extractableBoundBps (tier unchanged, coverage regressed) that
-    ///         the tier-only check waves through while Plan B's aggregate cap
-    ///         would still trust the stale, lower snapshot.
+    ///         extractableBoundBps (tier unchanged, coverage regressed)
+    ///         that the tier-only check waves through while the aggregate
+    ///         cap would still trust the stale, lower snapshot.
     error CoverageRegressed();
     error StrategyAlreadyActive();
     error CooldownNotElapsed();
@@ -235,13 +230,13 @@ interface ISyndicateGovernor {
     error StrategyDurationNotElapsed();
     error InvalidProtocolFeeBps();
     error InvalidProtocolFeeRecipient();
-    /// @notice G-M1: Revert if a vault already has a non-terminal proposal
+    /// @notice Revert if a vault already has a non-terminal proposal
     ///         (Draft / Pending / GuardianReview / Approved / Executed) when
     ///         a new propose() or approveCollaboration Draft->Pending is
     ///         attempted. Prevents duplicate lifecycles that would race the
     ///         same vault state.
     error VaultHasOpenProposal();
-    /// @notice G-M11: Revert if `metadataURI.length` exceeds
+    /// @notice Revert if `metadataURI.length` exceeds
     ///         MAX_METADATA_URI_LENGTH. Bounds a calldata-unbounded string
     ///         that would otherwise let a proposer grief gas / event storage.
     error MetadataURITooLong();
@@ -251,11 +246,11 @@ interface ISyndicateGovernor {
     /// @notice Revert if `envelope.maxCapital` exceeds the governor's ceiling
     ///         (`totalAssets() * maxCapitalBps / 10_000` at propose time).
     ///         Without this, a proposer declares maxCapital = uint256.max and
-    ///         the net-outflow cap never binds (finding 3).
+    ///         the net-outflow cap never binds.
     error MaxCapitalExceedsCeiling();
     /// @notice `reclaimProposerBond` called while the proposal can still reach
     ///         execution. The bond is only returned from a TERMINAL state
-    ///         (Rejected / Expired / Cancelled / Settled) — spec §3.9.
+    ///         (Rejected / Expired / Cancelled / Settled).
     error ProposalNotTerminal();
     /// @notice `reclaimProposerBond` called for a proposal that never locked a
     ///         bond, or whose bond was already reclaimed (the reclaim zeroes
@@ -281,10 +276,10 @@ interface ISyndicateGovernor {
     /// @notice Revert if `envelope.maxDrawdownBps > 10_000` at propose — a
     ///         drawdown declaration cannot exceed 100% of committed capital.
     error InvalidDrawdown();
-    /// @notice G-M2/G-M6: Revert if `executeCalls.length` or
-    ///         `settlementCalls.length` exceeds MAX_CALLS_PER_PROPOSAL. Bounds
-    ///         calldata-unbounded arrays that otherwise let a proposer grief
-    ///         gas when the batch is executed.
+    /// @notice Revert if `executeCalls.length` or `settlementCalls.length`
+    ///         exceeds MAX_CALLS_PER_PROPOSAL. Bounds calldata-unbounded
+    ///         arrays that otherwise let a proposer grief gas when the batch
+    ///         is executed.
     error TooManyCalls();
 
     // ── Guardian-review emergency settle errors ──
@@ -312,18 +307,17 @@ interface ISyndicateGovernor {
     error InvalidMaxCoProposers();
     error Reentrancy();
     /// @notice Revert if lead tries to cancel a Draft once all-but-one
-    ///         co-proposer has approved (G-H2). Prevents front-running the
-    ///         final approve tx.
+    ///         co-proposer has approved. Prevents front-running the final
+    ///         approve tx.
     error CancelNotAllowedNearQuorum();
-    /// @notice Sherlock #9 — `rejectCollaboration` is gated to the lead
-    ///         proposer; a co-proposer who disagrees must withhold approval
-    ///         (Draft lapses naturally at the collaboration window).
+    /// @notice `rejectCollaboration` is gated to the lead proposer; a
+    ///         co-proposer who disagrees must withhold approval (Draft
+    ///         lapses naturally at the collaboration window).
     error NotLeadProposer();
-    /// @notice Revert when `getVoteWeight` is called on a Draft proposal whose
-    ///         snapshotTimestamp hasn't been stamped yet (G-H3). The prior
-    ///         silent zero return confused callers who assumed no power.
+    /// @notice Revert when `getVoteWeight` is called on a Draft proposal
+    ///         whose snapshotTimestamp hasn't been stamped yet.
     error ProposalInDraft();
-    /// @notice Revert if an active co-proposer's rounded share is 0 (G-C7).
+    /// @notice Revert if an active co-proposer's rounded share is 0.
     /// @dev Prevents silent routing of zero-rounded shares to the lead.
     error CoProposerShareUnderflow();
 
@@ -382,13 +376,10 @@ interface ISyndicateGovernor {
 
     event EmergencySettled(uint256 indexed proposalId, address indexed vault, int256 pnl, uint256 customCallCount);
 
-    // PR #351 review #1: GuardianRegistrySet event removed alongside the
-    // `setGuardianRegistry` setter. Repointing mid-proposal silently
-    // auto-Approved blocked reviews — same hazard class as V-H2. The
-    // registry slot is now write-only at `initialize`; migration happens
-    // through a governor UUPS upgrade.
+    // There is no setter for the guardian registry. The slot is write-only
+    // at `initialize`; migration happens through a governor UUPS upgrade.
 
-    // ── Fee-distribution resilience events (W-1) ──
+    // ── Fee-distribution resilience events ──
     /// @notice Emitted when a per-recipient fee transfer in `_distributeFees` /
     ///         `_distributeAgentFee` reverts (e.g., USDC blacklist). The amount
     ///         is escrowed against `(vault, recipient, token)` in storage (see
@@ -435,10 +426,10 @@ interface ISyndicateGovernor {
     /// @notice Tier registry wired (or un-wired, newRegistry == address(0)).
     event TierRegistrySet(address indexed oldRegistry, address indexed newRegistry);
 
-    /// @notice Exposure ledger wired (or un-wired, newLedger == address(0)) — Plan B.
+    /// @notice Exposure ledger wired (or un-wired, newLedger == address(0)).
     event ExposureLedgerSet(address indexed oldLedger, address indexed newLedger);
 
-    /// @notice Proposer bond escrow wired (or un-wired, newEscrow == address(0)) — Plan B.
+    /// @notice Proposer bond escrow wired (or un-wired, newEscrow == address(0)).
     event BondEscrowSet(address indexed oldEscrow, address indexed newEscrow);
 
     /// @notice Emitted in `_distributeFees` when `guardianFeeBps > 0`.
@@ -523,31 +514,30 @@ interface ISyndicateGovernor {
     ///         default when never set).
     function maxCapitalBps() external view returns (uint256);
     function setProtocolConfig(address newConfig) external;
-    /// @notice Wire the tier registry (spec §3.2). Factory-only, like
+    /// @notice Wire the tier registry. Factory-only, like
     ///         `setProtocolConfig`. address(0) un-wires: every proposal then
     ///         resolves to tier 2 / full notional — the safe default.
     function setTierRegistry(address newRegistry) external;
-    /// @notice Wire the exposure ledger (Plan B, spec §3.7/§3.9). Factory-only.
-    ///         address(0) un-wires: the covered-TVL cap, the proposer bond gate
-    ///         AND the §3.3a approve quorum are then skipped — the pre-ledger
-    ///         default. The quorum is the load-bearing one now that
-    ///         `quorumTierThreshold == 0` applies it at every tier, so a governor
-    ///         created while the factory's ledger is unset carries no coverage
-    ///         gate at all until `pushWiring` reaches it.
-    /// @dev Precondition: seed the ledger's `setAssetFeed(vaultAsset, ...)` and
-    ///      `setCoveredTvlCapUsd(...)` BEFORE wiring it. The gates fail closed,
-    ///      so a wired ledger with an unpriceable vault asset or a zero cap
-    ///      halts all proposal creation for this vault.
+    /// @notice Wire the exposure ledger. Factory-only. address(0) un-wires:
+    ///         the covered-TVL cap, the proposer bond gate AND the approve
+    ///         quorum are then skipped — the pre-ledger default. The quorum
+    ///         is load-bearing whenever `quorumTierThreshold == 0` applies
+    ///         it at every tier, so a governor created while the factory's
+    ///         ledger is unset carries no coverage gate at all until
+    ///         `pushWiring` reaches it.
+    /// @dev Precondition: seed the ledger's `setAssetFeed(vaultAsset, ...)`
+    ///      and `setCoveredTvlCapUsd(...)` BEFORE wiring it. The gates fail
+    ///      closed, so a wired ledger with an unpriceable vault asset or a
+    ///      zero cap halts all proposal creation for this vault.
     ///
-    ///      THERE IS NO `setExposureLedger(0)` ESCAPE HATCH, contrary to what
-    ///      this comment previously claimed. Both factory call sites SKIP when
-    ///      the factory's own ledger is unset (`SyndicateFactory.sol:390-392`,
-    ///      `:726`), so zero is unreachable through them — the implementation
-    ///      natspec already records this (review finding I-3). The feed/cap
-    ///      fixes are ledger-owner-owned and are the real remedy.
+    ///      THERE IS NO `setExposureLedger(0)` ESCAPE HATCH once wired: both
+    ///      factory call sites skip re-wiring when the factory's own ledger
+    ///      is unset, so zero is unreachable through them. The feed/cap
+    ///      fixes on the ledger itself are the real remedy for a
+    ///      misconfigured gate.
     function setExposureLedger(address newLedger) external;
-    /// @notice Wire the proposer bond escrow (Plan B, spec §3.9). Factory-only.
-    ///         address(0) un-wires: the bond is not locked at propose.
+    /// @notice Wire the proposer bond escrow. Factory-only. address(0)
+    ///         un-wires: the bond is not locked at propose.
     /// @dev CUSTODIAL slot — re-point only at zero outstanding bonds. Bonds
     ///      already locked are released against the per-proposal stored escrow
     ///      (`StrategyProposal.proposerBondEscrow`), so re-pointing is safe for
@@ -555,9 +545,9 @@ interface ISyndicateGovernor {
     function setBondEscrow(address newEscrow) external;
 
     /// @notice Permissionless: return the proposer bond once the proposal has
-    ///         reached a terminal state (spec §3.9).
+    ///         reached a terminal state.
     /// @dev Rejection, expiry, and cancellation all RETURN the bond —
-    ///      forfeiture is exclusively a passed-challenge outcome (Plan C); a
+    ///      forfeiture is exclusively a passed-challenge outcome; a
     ///      guardian block is not a conviction. Safe to leave permissionless:
     ///      the escrow pays only the proposer it recorded at lock time, so a
     ///      third-party caller can accelerate the refund but never redirect it.
@@ -601,8 +591,8 @@ interface ISyndicateGovernor {
     function getCooldownEnd() external view returns (uint256);
     function getCapitalSnapshot(uint256 proposalId) external view returns (uint256);
     function getCoProposers(uint256 proposalId) external view returns (CoProposer[] memory);
-    /// @notice Risk envelope declared by the proposer at propose time
-    ///         (spec 2026-07-22 §3.1). Immutable for the proposal's lifetime.
+    /// @notice Risk envelope declared by the proposer at propose time.
+    ///         Immutable for the proposal's lifetime.
     /// @dev    Returns (0, 0) for a nonexistent proposalId — the zero-value
     ///         convention shared with getCapitalSnapshot / getCoProposers.
     ///         Unambiguous here: `maxCapital == 0` is rejected at propose, so a
@@ -624,19 +614,19 @@ interface ISyndicateGovernor {
     function bondEscrow() external view returns (address);
 
     /// @notice MAX tier across the proposal's execute calls, resolved at
-    ///         propose time (spec §3.2). Returns 0 for a nonexistent
-    ///         proposalId — pair with `getRiskEnvelope` (maxCapital == 0 means
-    ///         "no such proposal") when disambiguation matters.
+    ///         propose time. Returns 0 for a nonexistent proposalId — pair
+    ///         with `getRiskEnvelope` (maxCapital == 0 means "no such
+    ///         proposal") when disambiguation matters.
     function getProposalTier(uint256 proposalId) external view returns (uint8);
 
     /// @notice Extractable-value coverage the proposal demands from the
-    ///         aggregate exposure cap (Plan B). Snapshotted at propose time as
-    ///         the per-call SUM across execute and settlement calls (see
+    ///         aggregate exposure cap. Snapshotted at propose time as the
+    ///         per-call SUM across execute and settlement calls (see
     ///         `StrategyProposal.requiredCoverage`); re-checked at execute
     ///         (`CoverageRegressed`).
     function getRequiredCoverage(uint256 proposalId) external view returns (uint256);
 
-    // ── Fee-escrow (W-1) ──
+    // ── Fee-escrow ──
 
     /// @notice Pull previously escrowed fees after the blacklist / revert
     ///         condition that caused the original settlement transfer has been
