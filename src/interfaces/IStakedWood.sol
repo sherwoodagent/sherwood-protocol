@@ -3,15 +3,11 @@ pragma solidity 0.8.28;
 
 /// @title IStakedWood
 /// @notice Interface for the StakedWood (sWOOD) contract — the sole WOOD-token
-///         custodian. sWOOD absorbs guardian staking, owner
-///         bonds, vote checkpoints, and slashing, all of which previously
-///         lived in `GuardianRegistry`. The slimmed `GuardianRegistry`,
-///         `SyndicateGovernor`, and `SyndicateFactory` call sWOOD through
-///         this interface.
-/// @dev See `openspec/specs/guardian-staking/spec.md`.
-///      Staking/owner-bond signatures are carried verbatim from the
-///      pre-split `IGuardianRegistry`. Checkpoint reads are timestamp-keyed
-///      (EIP-6372 timestamp-mode clock).
+///         custodian, holding guardian staking, owner bonds, vote
+///         checkpoints, and slashing. `GuardianRegistry`, `SyndicateGovernor`,
+///         and `SyndicateFactory` call sWOOD through this interface.
+/// @dev See `openspec/specs/guardian-staking/spec.md`. Checkpoint reads are
+///      timestamp-keyed (EIP-6372 timestamp-mode clock).
 interface IStakedWood {
     /// @notice Reverts when a non-slasher calls the verdict slash path.
     error NotAuthorizedSlasher();
@@ -24,11 +20,9 @@ interface IStakedWood {
     ///         the verdict's own open timestamp.
     error SnapshotAfterVerdict();
 
-    /// @notice Reverts when `slashToEscrow` is handed a rate array whose length
-    ///         does not match `approvers`. Positional alignment is the only
-    ///         thing binding a guardian to their own rate, so a mismatch is a
-    ///         caller bug that would otherwise slash the tail of the batch at a
-    ///         rate nobody chose.
+    /// @notice Reverts when `slashToEscrow`'s rate array length does not match
+    ///         `approvers`. Positional alignment binds each guardian to their
+    ///         own rate.
     error SlashBpsLengthMismatch();
 
     /// @notice Reverts when `slashToEscrow`'s `openedAt` is in the future — the
@@ -37,38 +31,35 @@ interface IStakedWood {
     error VerdictNotPast();
 
     /// @notice Reverts when `slashToEscrow`'s `approvers` names an address
-    ///         twice — the dedup that keeps a repeated approver from
-    ///         compounding past `maxSlashBps`. Order is NOT constrained
+    ///         twice — the dedup keeps a repeated approver from compounding
+    ///         past `maxSlashBps`. Order is not constrained
     ///         (`ExposureLedger.slashBpsFor` feeds vote-order arrays).
     error DuplicateApprover();
 
     /// @notice Reverts when `slashToEscrow` names an approver already slashed
-    ///         under the same `caseKey` by an EARLIER call (PR #24 review 🟠N2).
-    /// @dev The intra-call dedup only bounds ONE array, so the severity ceiling
-    ///      bound per CALL rather than per verdict: `_slashOne` re-reads the
+    ///         under the same `caseKey` by an earlier call.
+    /// @dev The intra-call dedup only bounds one array, so the severity
+    ///      ceiling binds per CALL, not per verdict: `_slashOne` re-reads the
     ///      live stake each time while sizing off the same `openedAt`
-    ///      checkpoint, so three sequential 5,000-bps calls against one
-    ///      approver take 8,750 bps of the bond they held at open — against a
-    ///      50% ceiling governance set. Splitting a quorum-sized batch across
-    ///      transactions stays legal (the natural workaround for a 100-approver
-    ///      batch that does not fit a block); replaying an approver does not.
-    ///      Also makes an honest retried transaction idempotent per approver.
+    ///      checkpoint, so repeated calls against one approver can exceed the
+    ///      governance-set ceiling. Splitting a quorum-sized batch across
+    ///      transactions stays legal; replaying an approver does not. Also
+    ///      makes a retried transaction idempotent per approver.
     error ApproverAlreadySlashed();
 
     /// @dev `slashToEscrow`'s `vault` does not resolve to a governor in the
     ///      factory (`governorOf(vault) == 0`). The escrow apportions against
-    ///      the vault's ERC20Votes checkpoints, and every safety claim about
-    ///      that population assumes OZ semantics — which only factory-deployed
-    ///      vaults are known to carry (PR #24 round-4 N-4).
+    ///      the vault's ERC20Votes checkpoints, which only factory-deployed
+    ///      vaults are guaranteed to carry OZ semantics for.
     error VaultNotFactoryDeployed();
 
     event AuthorizedSlasherSet(address indexed slasher);
     event CompensationEscrowSet(address indexed escrow);
 
     /// @notice Correlates a verdict slash with the escrow case it funded, so
-    ///         Plan D and indexers can join the two without scraping the escrow.
-    /// @dev `total` is NET of any conviction bounty (spec 2026-07-29 §2) — it
-    ///      equals the escrow's own `proceeds` for this case.
+    ///         indexers can join the two without scraping the escrow.
+    /// @dev `total` is NET of any conviction bounty — it equals the escrow's
+    ///      own `proceeds` for this case.
     event VerdictSlashRouted(bytes32 indexed caseKey, address indexed vault, uint256 total, uint256 caseId);
 
     /// @notice A verdict slash whose compensation case could not be opened
@@ -81,7 +72,7 @@ interface IStakedWood {
     event VerdictSlashUncompensated(bytes32 indexed caseKey, address indexed vault, uint256 total);
 
     /// @notice A conviction bounty was paid out of a verdict slash before the
-    ///         remainder opened a compensation case (spec 2026-07-29 §2).
+    ///         remainder opened a compensation case.
     event ConvictionBountyPaid(bytes32 indexed caseKey, address indexed bountyTo, uint256 amount);
 
     // ── Guardian stake ──
@@ -106,31 +97,23 @@ interface IStakedWood {
     // ── Snapshot-compatible vote-read surface (timestamp-keyed) ──
     //
     // `getVotes` / `getPastVotes` / `getPastTotalSupply` form the read surface
-    // Snapshot's `erc20-votes` strategy consumes. sWOOD intentionally does NOT
-    // implement the full OZ `IVotes` (no `delegate` / `delegates` /
-    // `delegateBySig`). Vote weight = AGE-WEIGHTED own staked WOOD.
-    // (DPoS delegation was removed/postponed — no delegated component.)
+    // Snapshot's `erc20-votes` strategy consumes. sWOOD does not implement the
+    // full OZ `IVotes` (no `delegate` / `delegates` / `delegateBySig`). Vote
+    // weight = age-weighted own staked WOOD; there is no delegated component.
 
     /// @notice An account's CURRENT vote weight: age-weighted own votable
     ///         stake. Live counterpart of `getPastVotes`.
     function getVotes(address account) external view returns (uint256);
 
     /// @notice Guardian's age-weighted own vote weight at a past timestamp.
-    /// @dev    STILL NOT A TERM OF `getPastTotalVotes` (review 🔴F17), even with
-    ///         DPoS delegation removed. The total sums RAW own stake; this
-    ///         applies `_ageFactorBps` on top, so the two remain different
-    ///         measures of the same WOOD. Correct for weighing a VOTE; wrong on
-    ///         either side of a subtraction against the total — use
-    ///         `getPastStake` there.
-    ///
-    ///         The delegation removal narrowed the consequence without removing
-    ///         it. Aging only ever SHRINKS, so per-account weight is now bounded
-    ///         above by raw stake: the accused sum can no longer exceed the
-    ///         total and `TokenCourt._participationFloor` can no longer be driven to
-    ///         zero. What remains is a one-directional bias — the floor comes
-    ///         out too HIGH when the accused are freshly staked, which biases
-    ///         the outcome toward an inconclusive (no-verdict) result rather
-    ///         than enabling a cheap overturn.
+    /// @dev    Not a term of `getPastTotalVotes`: the total sums RAW own
+    ///         stake; this applies `_ageFactorBps` on top, so the two are
+    ///         different measures of the same WOOD. Correct for weighing a
+    ///         vote; wrong for a subtraction against the total — use
+    ///         `getPastStake` there. Aging only ever shrinks weight, so
+    ///         per-account weight is bounded above by raw stake, biasing
+    ///         `TokenCourt._participationFloor` too HIGH when the accused are
+    ///         freshly staked (favoring an inconclusive result).
     function getPastVotes(address guardian, uint256 timestamp) external view returns (uint256);
 
     /// @notice A guardian's RAW votable own stake at a past timestamp — the same
@@ -161,8 +144,8 @@ interface IStakedWood {
     function canCreateVault(address owner) external view returns (bool);
 
     /// @notice The guardian unstake cooldown period. The registry reads this
-    ///         in `setReviewPeriod` to enforce the `coolDownPeriod >=
-    ///         reviewPeriod` cross-contract invariant (Sherlock #16).
+    ///         in `setReviewPeriod` to enforce the cross-contract invariant
+    ///         `coolDownPeriod >= reviewPeriod`.
     function coolDownPeriod() external view returns (uint256);
 
     /// @notice Lower clamp bound (bps) for the graduated slash severity.
@@ -189,57 +172,36 @@ interface IStakedWood {
 
     // ── Slasher-only mutations (verdict path) ──
     /// @notice Verdict-driven slash whose proceeds fund victim compensation
-    ///         instead of burning (spec §3.8 + §4 authorized-slasher entrypoint).
-    /// @dev The escrow is NOT a parameter: it is owner-set state
+    ///         instead of burning.
+    /// @dev The escrow is not a parameter: it is owner-set state
     ///      (`compensationEscrow`), because sWOOD custodies every WOOD bond in
     ///      the protocol and a caller-named sink would carry an allowance
     ///      against that balance. Each non-zero rate is clamped to
-    ///      `[minSlashBps, maxSlashBps]` — the same severity envelope the
-    ///      review path's `_severityBps` enforces. `approvers` must be
-    ///      duplicate-free (any order) AND must not repeat an approver already
-    ///      slashed under this `caseKey` by an earlier call
-    ///      (`ApproverAlreadySlashed`) — one verdict takes one slash per
-    ///      approver, so the envelope binds per VERDICT and not merely per
-    ///      call. `openedAt` must not be in the future
-    ///      and `snapshotTimestamp` must be at or before `openedAt` — honest-
-    ///      caller sanity bounds; they do NOT bind a compromised slasher, which
-    ///      chooses both timestamps freely (see the implementation natspec).
-    ///      If `openCase` reverts (unpriceable vault), the slash stands and the
-    ///      proceeds BURN (`VerdictSlashUncompensated`), so a bad vault cannot
+    ///      `[minSlashBps, maxSlashBps]`, the same severity envelope the
+    ///      review path enforces. `approvers` must be duplicate-free and must
+    ///      not repeat an approver already slashed under this `caseKey` by an
+    ///      earlier call (`ApproverAlreadySlashed`). `openedAt` must not be in
+    ///      the future and `snapshotTimestamp` must be at or before
+    ///      `openedAt` — honest-caller sanity bounds; they do not bind a
+    ///      compromised slasher, which chooses both timestamps freely. If
+    ///      `openCase` reverts (unpriceable vault), the slash stands and the
+    ///      proceeds burn (`VerdictSlashUncompensated`), so a bad vault cannot
     ///      brick the verdict.
-    /// @dev    THE BOUNTY IS THE PROSECUTOR'S FEE (spec 2026-07-29 §2). It is
-    ///         paid only when a slash actually recovers WOOD, and it is
-    ///         deducted BEFORE `openCase` so the escrow's `proceeds` equal what
-    ///         claimants can really redeem. `bountyTo == address(0)` or
-    ///         `bountyBps == 0` disables it and the escrow receives the whole
-    ///         slash - which is how the caller expresses "this path pays no
-    ///         bounty" (see `ChallengeGame._settle`: only an ESCALATED
-    ///         conviction pays, never the silence settle).
-    ///
-    ///         PAID EVEN ON THE BURN FALLBACK. If `openCase` reverts, the
-    ///         remainder still burns (`VerdictSlashUncompensated`) rather than
-    ///         being clawed back — depositors recover 0% of the slash on that
-    ///         path EITHER WAY (no case was ever opened to divide), so paying
-    ///         the bounty first costs them nothing; it comes out of what would
-    ///         otherwise simply burn.
-    ///
-    ///         `bountyBps` IS NOT TRUSTED FROM THE CALLER. sWOOD rejects it
-    ///         outside `[0, MAX_CONVICTION_BOUNTY_BPS]` itself
-    ///         (`InvalidParameter`, including any value `>= 10_000`) — the
-    ///         same MOTIVATION as re-checking `slashBpsPer` against
-    ///         `[minSlashBps, maxSlashBps]` rather than trusting it from
-    ///         `ExposureLedger`, though the MECHANISM differs: `slashBpsPer`
-    ///         is silently clamped, `bountyBps` reverts. `ChallengeGame` also
-    ///         pins its own rate to this range at filing, but that bound
-    ///         lives in the CALLER; sWOOD is the contract that actually moves
-    ///         the WOOD, so a compromised or buggy slasher can divert at most
-    ///         `MAX_CONVICTION_BOUNTY_BPS` of any ONE CALL's slash to a
-    ///         caller-named `bountyTo` — that call's remainder can still only
-    ///         ever reach the owner-set `compensationEscrow` or the burn
-    ///         address, never an arbitrary destination of the slasher's own
-    ///         choosing. PER CALL, NOT PER GUARDIAN: `verdictSlashed` keys on
-    ///         a caller-chosen `caseKey`, so repeated verdicts against the
-    ///         same approver under fresh case keys compound.
+    /// @dev    The conviction bounty is the prosecutor's fee: paid only when a
+    ///         slash recovers WOOD, deducted before `openCase` so the
+    ///         escrow's `proceeds` equal what claimants can redeem.
+    ///         `bountyTo == address(0)` or `bountyBps == 0` disables it,
+    ///         routing the whole slash to the escrow. Paid even on the burn
+    ///         fallback, since depositors recover nothing on that path
+    ///         either way. `bountyBps` is enforced by sWOOD itself against
+    ///         `[0, MAX_CONVICTION_BOUNTY_BPS]` (reverts, not silently
+    ///         clamped) — a compromised or buggy slasher can divert at most
+    ///         that fraction of any one call's slash to a caller-named
+    ///         `bountyTo`; the remainder can only reach the owner-set
+    ///         `compensationEscrow` or burn. The bound is per call, not per
+    ///         guardian: `verdictSlashed` keys on a caller-chosen `caseKey`,
+    ///         so repeated verdicts against the same approver under fresh
+    ///         case keys compound.
     /// @param  bountyTo   Recipient of the conviction bounty, or `address(0)`.
     /// @param  bountyBps  Slice of the recovered total, in bps. Rejected
     ///                     outside `[0, MAX_CONVICTION_BOUNTY_BPS]` by sWOOD
@@ -271,8 +233,8 @@ interface IStakedWood {
     function compensationEscrow() external view returns (address);
 
     /// @notice Whether `approver` has already been slashed under `caseKey`.
-    /// @dev Lets a slasher (Plan D, or a keeper resuming a batch that ran out
-    ///      of gas) resume a split verdict without re-slashing anyone.
+    /// @dev Lets a slasher (e.g. a keeper resuming a batch that ran out of
+    ///      gas) resume a split verdict without re-slashing anyone.
     function verdictSlashed(bytes32 caseKey, address approver) external view returns (bool);
 
     // ── Admin (owner-instant; owner is a multisig with external delay) ──

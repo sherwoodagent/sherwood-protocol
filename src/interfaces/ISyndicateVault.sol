@@ -15,9 +15,9 @@ interface ISyndicateVault {
     error NotApprovedDepositor();
     error AgentAlreadyRegistered();
     error AgentNotActive();
-    /// @notice PR #324 review R4 — registering this agent would push
-    ///         `_agentSet.length()` past `MAX_AGENTS_PER_VAULT`. Bound for the
-    ///         `rotateOwnership` deactivation loop.
+    /// @notice Registering this agent would push `_agentSet.length()` past
+    ///         `MAX_AGENTS_PER_VAULT` — bound for the `rotateOwnership`
+    ///         deactivation loop.
     error AgentCapExceeded();
     error InvalidAgentRegistry();
     error NotAgentOwner();
@@ -55,7 +55,7 @@ interface ISyndicateVault {
     ///         requested (balance-diff verified vault-side).
     error UnwindShortfall();
     /// @notice The batch's net asset outflow exceeded the proposal's declared
-    ///         maxCapital (risk envelope, spec 2026-07-22 §3.1).
+    ///         maxCapital.
     error MaxNetOutflowExceeded(uint256 netOutflow, uint256 cap);
     /// @notice A governor-batch call carries a value-moving ERC20 selector
     ///         (approve / increaseAllowance / transfer / transferFrom) whose
@@ -81,7 +81,7 @@ interface ISyndicateVault {
     // ── Per-Agent Config ──
     struct AgentConfig {
         uint256 agentId; // ERC-8004 identity token ID
-        address agentAddress; // Agent wallet address
+        address agentAddress;
         bool active;
     }
 
@@ -95,8 +95,7 @@ interface ISyndicateVault {
     function openDeposits() external view returns (bool);
 
     // ── Views ──
-    // `getAgentConfig` dropped to fit MAX_AGENTS_PER_VAULT cap under
-    // EIP-170. Use `isAgent(addr)` for the auth check.
+    // Use `isAgent(addr)` for the auth check; there is no per-agent config getter.
     function getAgentCount() external view returns (uint256);
     function agentsPaginated(uint256 offset, uint256 limit) external view returns (address[] memory);
     function isAgent(address agentAddress) external view returns (bool);
@@ -253,10 +252,6 @@ interface ISyndicateVault {
     /// @notice Emitted whenever the governor drives a strategy batch into the
     ///         vault via `executeGovernorBatch`. `callCount` is the number of
     ///         sub-calls fanned out by `BatchExecutorLib.executeBatch`.
-    /// @dev V-M9: subgraphs and monitors previously had to observe strategy
-    ///      execution indirectly via downstream protocol events (Moonwell /
-    ///      Aerodrome / Uniswap). Emitting here gives a first-class
-    ///      vault-level execution marker.
     event GovernorBatchExecuted(address indexed governor, uint256 callCount);
     event WithdrawalQueueSet(address indexed queue);
     event RedeemRequested(uint256 indexed requestId, address indexed owner, uint256 shares);

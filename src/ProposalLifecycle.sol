@@ -23,20 +23,15 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
     uint256 private constant BPS_DENOMINATOR = 10_000;
 
     // ── Storage ──────────────────────────────────────────────────────────────
-    // Moved here in the later fold task; declared now so the base compiles
-    // standalone. Nothing inherits this base yet, so these names do NOT collide
-    // with the identical declarations still living in SyndicateGovernor.
     address internal _guardianRegistry;
     mapping(uint256 => StrategyProposal) internal _proposals;
     uint256 internal _openProposalCount;
     uint256 internal _lastSettledAt;
     /// @notice Draft collaboration deadline per proposal.
-    /// @dev Deliberately `public` here, where the pre-fold governor kept it
-    ///      `internal` with a "no auto-getter — bytecode lever" note. That
-    ///      rationale was an EIP-170 concession; this stack targets Robinhood's
-    ///      98,304-byte limit, where the getter's cost is immaterial, and
-    ///      `_computeState` reads this for the Draft -> Expired edge so an
-    ///      external reader (and the lifecycle harness) legitimately wants it.
+    /// @dev Public: the getter's bytecode cost is immaterial under Robinhood's
+    ///      98,304-byte limit, and `_computeState` reads this for the Draft ->
+    ///      Expired edge so an external reader (and the lifecycle harness)
+    ///      legitimately wants it.
     mapping(uint256 => uint256) public collaborationDeadline;
     uint256[10] private __lifecycleGap;
 
@@ -71,8 +66,6 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
     ///         outcome past reviewEnd (no registered review to commit — see the
     ///         TERMINAL AND CLOSED note on that branch in `_afterVote`), and a paused
     ///         registry (the commit would revert).
-    ///         This reproduces exactly the set of transitions on which the
-    ///         pre-refactor `_resolveState` called `resolveReview`.
     function _computeState(StrategyProposal storage p)
         internal
         view
@@ -89,9 +82,9 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
 
             // Voting ended — optimistic: approved unless AGAINST votes reach the
             // veto threshold.
-            // G-H4: skip the veto check when pastTotalSupply == 0, otherwise the
+            // Skip the veto check when pastTotalSupply == 0, otherwise the
             // threshold collapses to 0 and every proposal auto-rejects.
-            // G-H6: read the vetoThresholdBps snapshot taken at Draft -> Pending,
+            // Reads the vetoThresholdBps snapshot taken at Draft -> Pending,
             // not a live param, so mid-vote finalizes don't move the bar.
             uint256 pastTotalSupply = IVotes(p.vault).getPastTotalSupply(p.snapshotTimestamp);
             if (pastTotalSupply > 0) {
@@ -135,9 +128,8 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
         // review was registered — `propose` skips the push on exactly this
         // condition — so the registry holds no record and `outcomeOf` would
         // answer Unresolved forever, stranding the proposal AND the vault that
-        // it binds. Treat "no review configured" as cleared, matching the
-        // pre-refactor path where the registry resolved a never-opened review
-        // to not-blocked. `reviewConcluded` is FALSE: there is no registry
+        // it binds. Treat "no review configured" as cleared.
+        // `reviewConcluded` is FALSE: there is no registry
         // review to commit, and calling `resolveReview` here would revert.
         // The `initialize` floor in GuardianRegistry makes this unreachable for
         // a sanctioned deploy; kept as defence in depth for a stub registry
@@ -151,62 +143,36 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
         // (`r.reviewEnd == 0`), i.e. no review was ever registered.
         // `reviewConcluded` is FALSE: there is no registry review to commit.
         //
-        // TERMINAL AND CLOSED — the deliberate asymmetry with the collapsed
-        // window above. Both branches mean "no registry record", but they are
-        // NOT the same condition: a collapsed window means the governor KNOWS
-        // there is no review (it skipped the push on this exact predicate),
-        // whereas here the governor believes there IS one (`reviewEnd >
-        // voteEnd`) and the registry disagrees. That disagreement is never a
-        // legitimate state, so it must not produce an executable proposal —
-        // answering Cleared here would approve a proposal no guardian ever
-        // reviewed.
+        // TERMINAL AND CLOSED — deliberate asymmetry with the collapsed
+        // window above. Both mean "no registry record", but here the
+        // governor believes a review exists (`reviewEnd > voteEnd`) and the
+        // registry disagrees; that disagreement must never produce an
+        // executable proposal, so this reports Expired rather than Cleared
+        // or GuardianReview — answering Cleared here would approve a
+        // proposal no guardian ever reviewed. Expired is terminal:
+        // `_commitState` runs `_decOpen()` on it, releasing the vault
+        // binding rather than leaving the proposal and vault stuck.
         //
-        // Expired rather than GuardianReview, because the defect this fold
-        // fixed was a strand with no exit: `resolveReview` reverts
-        // ReviewNotReadyForResolve, `_openProposalCount` stays pinned, and
-        // `emergencyCancel` is Draft/Pending-only, so the proposal AND the
-        // vault it binds are stuck until a beacon upgrade. Expired is terminal
-        // — `_commitState` runs `_decOpen()` on it, releasing the vault
-        // binding and stamping `_lastSettledAt` — so this keeps every liveness
-        // property the fold was for while still refusing to execute. All that
-        // is given up is executing a proposal that reached this branch, which
-        // is precisely what the guardian gate exists to prevent.
-        //
-        // Reachability, for the record: governor and registry deploy in
-        // lockstep, which makes this branch dead on any deployment this code
-        // can produce. Both push sites (`propose`, `approveCollaboration`)
-        // call `registerReview` under the identical `reviewEnd > voteEnd`
-        // predicate tested above; `p.reviewEnd` is written only immediately
-        // before those pushes, so the registry's copy can never trail the
-        // governor's; `_reviews` entries are never deleted and `registerReview`
-        // is `onlyGovernor`, so an unauthorised governor reverts the whole
-        // `propose` rather than silently skipping the push; `_guardianRegistry`
-        // is write-once at `initialize`; and `_authorizedGovernors` has no
-        // `remove`. The states that would break that chain — a governor whose
-        // proposals predate `registerReview`, or a stub registry wired through
-        // the factory that answers Unresolved forever — now land on a terminal
-        // Expired instead of an executable Approved, which is what makes the
-        // chain a liveness argument rather than a security one. Keep it that
-        // way: do NOT restore Approved here on the grounds that the branch is
-        // unreachable.
+        // This branch is unreachable on any deployment this code can
+        // produce: governor and registry deploy in lockstep, both push
+        // sites (`propose`, `approveCollaboration`) register the review
+        // under the identical `reviewEnd > voteEnd` predicate,
+        // `_guardianRegistry` is write-once, and `_authorizedGovernors` has
+        // no `remove`. Kept as defence in depth: do NOT restore Approved
+        // here on the grounds that the branch is unreachable.
         if (o == IGuardianRegistry.ReviewOutcome.Unresolved) {
             return (ProposalState.Expired, false);
         }
         // A paused registry cannot accept the economic commit: `resolveReview`
         // is `whenNotPaused` while `outcomeOf` is not. Reporting Approved here
         // would hand callers a state every path to act on reverts against
-        // (`ProtocolPaused` from a contract they never called). Report the
-        // honest "still in review" for the duration. This is a view-honesty
-        // fix, NOT a liveness one: the hold does not make `cancelProposal`
-        // usable again. `cancelReview` is indeed not pause-gated, but this
-        // branch is only reachable past `p.reviewEnd`, and `cancelReview`
-        // rejects at exactly that point (it refuses once the window has
-        // closed, so the proposer cannot race a pending `resolveReview`
-        // slash) — the cancel bubbles `ReviewNotOpen` rather than
-        // `ProtocolPaused`. A pause outliving `executeBy` still lands on
-        // Expired the moment it lifts. Skipped when the registry already
-        // cached the resolution: the commit is then a no-op, so the pause
-        // cannot strand it.
+        // (`ProtocolPaused` from a contract they never called), so this
+        // reports the honest "still in review" for the duration.
+        // `cancelReview` rejects once the review window has closed (bubbling
+        // `ReviewNotOpen`), so the proposer cannot race a pending
+        // `resolveReview` slash via cancel. A pause outliving `executeBy`
+        // still lands on Expired once it lifts. Skipped when the registry
+        // already cached the resolution, since the commit is then a no-op.
         if (reg.paused()) {
             (, bool alreadyResolved,,) = reg.getReviewState(address(this), p.id);
             if (!alreadyResolved) return (ProposalState.GuardianReview, false);
@@ -221,11 +187,10 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
     }
 
     /// @dev Persist the resolved state and, when the guardian review concluded on
-    ///      THIS transition, fire the registry economic commit. Mirrors the
-    ///      pre-refactor `_resolveState`: resolveReview runs iff the review
-    ///      actually concluded (vote passed + window elapsed + determinable
-    ///      outcome), never for a veto-rejection, a Draft expiry, or an
-    ///      already-Approved -> Expired transition.
+    ///      THIS transition, fire the registry economic commit. resolveReview
+    ///      runs iff the review actually concluded (vote passed + window elapsed
+    ///      + determinable outcome), never for a veto-rejection, a Draft expiry,
+    ///      or an already-Approved -> Expired transition.
     function _commitState(StrategyProposal storage p) internal returns (ProposalState resolved) {
         ProposalState stored = p.state;
         bool reviewConcluded;
@@ -238,7 +203,7 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
         // caller has to remember.
         if (resolved != stored) {
             _transition(p, resolved);
-            // Sherlock #8: Draft binds the vault — both Draft and non-Draft
+            // Draft binds the vault — both Draft and non-Draft
             // terminal transitions decrement. Draft additionally emits telemetry.
             if (resolved == ProposalState.Rejected || resolved == ProposalState.Expired) {
                 _decOpen();
@@ -252,9 +217,7 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
         // `resolveReview` is `whenNotPaused` while `outcomeOf` is not, so a
         // review resolved out-of-band before a pause would otherwise make every
         // mutating entrypoint for this proposal revert until unpause — and if
-        // `executeBy` elapsed meanwhile, strand it as Expired. Skipping also
-        // restores exact parity with the pre-refactor path, which emitted no
-        // governor-side event when the registry resolved the review first.
+        // `executeBy` elapsed meanwhile, strand it as Expired.
         if (reviewConcluded && stored != resolved) {
             (, bool alreadyResolved,,) = IGuardianRegistry(_guardianRegistry).getReviewState(address(this), p.id);
             if (!alreadyResolved) {
@@ -280,7 +243,7 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
     ///      coverage that pins their budget and their `claimUnstakeGuardian`.
     ///
     ///      BEST EFFORT, deliberately. `cancelReview` reverts once block quorum
-    ///      is reached (Sherlock run #2 #2, the anti-dodge guard) and once
+    ///      is reached (the anti-dodge guard) and once
     ///      `reviewEnd` has elapsed. Neither may brick a terminal transition,
     ///      and swallowing preserves both guards exactly: a review that refuses
     ///      to cancel is precisely one that SHOULD still resolve and slash.

@@ -65,8 +65,7 @@ contract VeniceInferenceStrategy is BaseStrategy {
     error InvalidAmount();
     error SwapFailed();
     error NoAgent();
-    /// @notice Sherlock #49 — repaymentAmount cannot drop below the loan's
-    ///         principal (`assetAmount`).
+    /// @notice repaymentAmount cannot drop below the loan's principal (`assetAmount`).
     error RepaymentBelowPrincipal();
 
     // ── Initialization parameters ──
@@ -119,7 +118,6 @@ contract VeniceInferenceStrategy is BaseStrategy {
         if (p.agent == address(0)) revert NoAgent();
         if (p.assetAmount == 0) revert InvalidAmount();
 
-        // If asset != vvv, we need swap infra
         if (p.asset != p.vvv) {
             if (p.aeroRouter == address(0) || p.aeroFactory == address(0)) revert ZeroAddress();
             if (!p.singleHop && p.weth == address(0)) revert ZeroAddress();
@@ -144,13 +142,11 @@ contract VeniceInferenceStrategy is BaseStrategy {
 
     /// @notice Pull asset from vault → [swap to VVV if needed] → stake to agent
     function _execute() internal override {
-        // 1. Pull asset from vault
         _pullFromVault(asset, assetAmount);
 
         uint256 vvvToStake;
 
         if (needsSwap()) {
-            // 2a. Swap asset → VVV via Aerodrome
             IERC20(asset).forceApprove(aeroRouter, assetAmount);
 
             IAeroRouter.Route[] memory routes;
@@ -168,49 +164,29 @@ contract VeniceInferenceStrategy is BaseStrategy {
             vvvToStake = amounts[amounts.length - 1];
             if (vvvToStake == 0) revert SwapFailed();
         } else {
-            // 2b. Asset is VVV — stake directly
             vvvToStake = assetAmount;
         }
 
-        // 3. Stake VVV to agent — sVVV is non-transferrable and stays with agent
+        // sVVV is non-transferrable and stays with the agent
         IERC20(vvv).forceApprove(sVVV, vvvToStake);
         IVeniceStaking(sVVV).stake(agent, vvvToStake);
         stakedAmount = vvvToStake;
 
-        // 4. Push any dust back to vault
         if (needsSwap()) _pushAllToVault(asset);
         _pushAllToVault(vvv);
     }
 
     /// @notice Agent repays the vault in the vault's asset (principal + profit).
-    /// @dev The agent must have approved this strategy for `repaymentAmount` of `asset`.
-    ///      sVVV stays with the agent — it is their inference license.
-    ///      The governor calculates P&L from vault balance diff and distributes fees.
+    /// @dev Requires the agent to have approved this strategy for `repaymentAmount` of `asset`.
+    ///      sVVV stays with the agent as their inference license; the governor computes P&L
+    ///      from the vault balance diff and distributes fees.
     ///
-    ///      Sherlock run #3 #5 — AGENT-TRUST BOUNDARY ACKNOWLEDGED.
-    ///      A malicious or unresponsive agent CAN brick settlement by
-    ///      withholding approval, revoking allowance, or letting their
-    ///      asset balance fall below `repaymentAmount`. The strategy has
-    ///      NO internal force-close path. This is by design:
-    ///
-    ///        - The agent is the proposer who deployed this strategy clone
-    ///          via `StrategyFactory.cloneAndInit`. Both clone deployment
-    ///          and governor proposal land within the registered-agent /
-    ///          vault-owner trust boundary, vetted by guardians during
-    ///          GuardianReview. The agent's identity is on-record on-chain.
-    ///        - Vault-owner external recovery: `SyndicateGovernor`'s
-    ///          `emergencySettleWithCalls` lets the owner multisig craft a
-    ///          batch that writes off the loaned principal and transitions
-    ///          `Executed` → `Settled` without agent cooperation. The slot
-    ///          is not permanently stuck.
-    ///        - sVVV is non-transferrable on Base, so the vault has no
-    ///          claim on the staked VVV anyway — recovery for a defaulted
-    ///          agent is necessarily an off-chain / governance action.
-    ///
-    ///      A proper in-contract force-close (slash schedule, sVVV
-    ///      disposition, trigger gate) is tracked as a future design spec.
-    ///      Adding one inline would introduce new attack surface that
-    ///      needs full review.
+    ///      A malicious or unresponsive agent can block settlement by withholding or revoking
+    ///      approval, or letting their asset balance fall below `repaymentAmount` — there is
+    ///      no in-contract force-close. Recovery is external: `SyndicateGovernor`'s
+    ///      `emergencySettleWithCalls` lets the owner multisig write off the principal and
+    ///      transition `Executed` → `Settled` without agent cooperation. sVVV is non-transferrable,
+    ///      so the vault has no claim on the staked VVV regardless.
     function _settle() internal override {
         address _vault = this.vault();
         IERC20(asset).safeTransferFrom(agent, _vault, repaymentAmount);
@@ -228,11 +204,8 @@ contract VeniceInferenceStrategy is BaseStrategy {
         (uint256 newRepayment, uint256 newMinVVV, uint256 newDeadlineOffset) =
             abi.decode(data, (uint256, uint256, uint256));
         if (newRepayment > 0) {
-            // Sherlock #49: proposer must not be able to reduce the agent's
-            // obligation below the principal — pre-fix, the agent could
-            // settle with `repaymentAmount = 1`, the vault would accept 1
-            // unit as "settled", and the agent would retain the borrowed
-            // capital + any off-chain profit.
+            // Blocks the proposer from reducing the agent's repayment below principal,
+            // which would let the agent keep the borrowed capital after a token settlement.
             if (newRepayment < assetAmount) revert RepaymentBelowPrincipal();
             repaymentAmount = newRepayment;
         }

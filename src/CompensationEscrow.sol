@@ -16,80 +16,77 @@ interface IVaultVotesMinimal {
 
 /**
  * @title CompensationEscrow
- * @notice Victim compensation for a passed challenge (spec 2026-07-22 §3.8).
+ * @notice Victim compensation for a passed challenge.
  *
  *         Slash proceeds do NOT go to the vault's live ERC4626 balance.
  *         `totalAssets` is pro-rata and share transfers are ungated, so paying
  *         the live NAV would let a coalition drain, buy the depressed shares of
  *         exiting honest holders, and recoup its own slash — a recoupment
- *         channel the burn sink never had (finding F1). Instead each conviction
- *         opens a CASE pinned to a pre-drain snapshot, and only holders of
- *         record AT THAT SNAPSHOT can redeem.
+ *         channel the burn sink never had. Instead each conviction opens a
+ *         CASE pinned to a pre-drain snapshot, and only holders of record AT
+ *         THAT SNAPSHOT can redeem.
  *
  *         Claims are entries in a mapping, never a token: there is no transfer
  *         surface, so a claim cannot be bought from an exiting honest holder.
  *
- * @dev    PAYOUT IS WOOD (§3.8 "WOOD-only payout boundary"): a victim is made
- *         whole in WOOD valued at slash time, which is exactly why §3.7's
- *         covered-TVL cap must bind — it keeps recoverable dollars
- *         proportionate to dollars at risk. v2 multi-collateral pays partly in
- *         stable legs.
+ * @dev    PAYOUT IS WOOD ("WOOD-only payout boundary"): a victim is made whole
+ *         in WOOD valued at slash time, which is exactly why the covered-TVL
+ *         cap must bind — it keeps recoverable dollars proportionate to
+ *         dollars at risk. v2 multi-collateral pays partly in stable legs.
  *
- * @dev    CLAIM BASIS (decision D1): apportionment uses the vault's ERC20Votes
- *         checkpoints, not raw balances — Solidity keeps no historical balance.
+ * @dev    CLAIM BASIS: apportionment uses the vault's ERC20Votes checkpoints,
+ *         not raw balances — Solidity keeps no historical balance.
  *         `SyndicateVault._update` auto-delegates EVERY receipt (mint AND
  *         plain ERC20 transfer), so `getPastVotes(h, t)` equals h's balance
  *         for any holder that never delegated away — including a secondary
  *         buyer and the withdrawal queue's custody balance (the queue exposes
  *         `claimCompensation` to pay its claim through to the request owners).
  *
- * @dev    CAVEAT FOR VAULTS ALREADY DEPLOYED — READ BEFORE ASSUMING COVERAGE
- *         (PR #24 review 🟠N4). Two separate gaps; only one self-heals.
+ * @dev    CAVEAT FOR VAULTS ALREADY DEPLOYED — READ BEFORE ASSUMING COVERAGE.
+ *         Two separate gaps; only one self-heals.
  *
  *         1. UNDELEGATED HOLDERS — self-heals, and can be forced. A holder
- *            whose LAST receipt predates the `_update` upgrade and that
- *            received only by transfer stays undelegated (zero votes) until
- *            its next receipt. `_update` fires on a ZERO-VALUE transfer, so
- *            any third party can arm a stranded holder for the cost of one
- *            transfer — a keeper can heal the whole holder set without their
- *            cooperation. Do it BEFORE a snapshot is needed: the checkpoint is
- *            written when the transfer lands, not retroactively.
+ *            whose LAST receipt predates auto-delegation and that received
+ *            only by transfer stays undelegated (zero votes) until its next
+ *            receipt. `_update` fires on a ZERO-VALUE transfer, so any third
+ *            party can arm a stranded holder for the cost of one transfer — a
+ *            keeper can heal the whole holder set without their cooperation.
+ *            Do it BEFORE a snapshot is needed: the checkpoint is written when
+ *            the transfer lands, not retroactively.
  *
  *         2. QUEUED EXITERS ON A PRE-EXISTING VAULT — does NOT self-heal and
  *            is NOT retrofittable. `VaultWithdrawalQueue` is a plain
  *            constructor deployment behind no proxy, and
  *            `SyndicateVault.setWithdrawalQueue` is factory-only and SET-ONCE.
- *            So on a vault deployed before this change: the vault can be
- *            upgraded to auto-delegate, the queue therefore DOES accrue votes
- *            at its next receipt and IS credited a claim here — but the
- *            deployed queue has no `claimCompensation`, cannot call `redeem`,
- *            and cannot be replaced. That cohort's entire claim strands and is
- *            eventually swept to `backstop`. Outcome-identical to the pre-fix
- *            state, so not a regression — but queued exiters on an existing
- *            syndicate ARE NOT COVERED, whatever the D1 paragraph above says
- *            about the queue paying its claim through. MIGRATION: a new
- *            syndicate, or a vault upgrade adding a queue-replacement path.
- *            There is no third option.
+ *            On a vault deployed before auto-delegation: even after a vault
+ *            upgrade adds it, the queue accrues votes at its next receipt and
+ *            IS credited a claim here — but the deployed queue has no
+ *            `claimCompensation`, cannot call `redeem`, and cannot be
+ *            replaced. That cohort's entire claim strands and is eventually
+ *            swept to `backstop` — queued exiters on an existing syndicate
+ *            ARE NOT COVERED, despite the queue paying its claim through in
+ *            the general case. MIGRATION: a new syndicate, or a vault upgrade
+ *            adding a queue-replacement path. There is no third option.
  *
- * @dev    KNOWN OPEN F1 RECOUPMENT CHANNEL — delegation: `delegate()` is a
- *         free, permissionless pointer that decides who a claim belongs to. A
+ * @dev    KNOWN OPEN RECOUPMENT CHANNEL — delegation: `delegate()` is a free,
+ *         permissionless pointer that decides who a claim belongs to. A
  *         coalition that solicits delegations BEFORE the drain collects the
  *         delegating cohort's entire compensation stream; the claim mapping
  *         being non-transferable does not close this, because the ENTITLEMENT
- *         follows the delegate pointer set before the snapshot. Closed by
- *         Plan D/E's challenge game or by a balance checkpoint — NOT by
- *         waiting to see whether delegation "becomes common": the party who
- *         decides that is the attacker. See spec §3.8 threat model.
+ *         follows the delegate pointer set before the snapshot. Closed by a
+ *         future challenge game or by a balance checkpoint — NOT by waiting to
+ *         see whether delegation "becomes common": the party who decides that
+ *         is the attacker.
  *
  * @dev    Not upgradeable, and not refundable FROM THIS POT. The separation
  *         from the review path is one of STRUCTURALLY SEPARATE ACCOUNTING, not
  *         of a binding rule: the registry's `refundSlash` pays from the
  *         registry's own funded appeal reserve, never from slash proceeds, so
- *         verdict PROCEEDS cannot flow back out through the registry (spec §4).
- *         That is a statement about the money, not the outcome — the registry
- *         owner can still hand a verdict-slashed guardian an equivalent amount
- *         from the appeal reserve. Whether it ever does is governance trust,
- *         not a code guarantee.
+ *         verdict PROCEEDS cannot flow back out through the registry. That is
+ *         a statement about the money, not the outcome — the registry owner
+ *         can still hand a verdict-slashed guardian an equivalent amount from
+ *         the appeal reserve. Whether it ever does is governance trust, not a
+ *         code guarantee.
  *
  * @dev    TOKEN ASSUMPTIONS: WOOD is a plain 18-dec ERC20 — no transfer fee,
  *         no rebasing, no hooks on the escrow's side. `openCase` books
@@ -122,19 +119,19 @@ contract CompensationEscrow is Ownable2Step, ICompensationEscrow {
     IERC20 public immutable wood;
 
     /// @notice The only address permitted to fund cases. In v1b this is
-    ///         `StakedWood` (whose `slashToEscrow` opens the case); Plan D's
+    ///         `StakedWood` (whose `slashToEscrow` opens the case); the
     ///         challenge game drives that entrypoint.
     address public authorizedFunder;
 
     /// @notice Where unredeemed residue goes once the window closes — the
-    ///         protocol insurance backstop, NEVER the live vault NAV (§3.8).
+    ///         protocol insurance backstop, NEVER the live vault NAV.
     address public backstop;
 
     /// @notice How long holders have to redeem before residue may be swept.
     uint256 public residueWindow = 180 days;
 
     /// @notice Sum over cases of (proceeds - redeemed - swept). The escrow's
-    ///         WOOD balance must never fall below this (fuzz invariant, Task 2).
+    ///         WOOD balance must never fall below this (a fuzz invariant).
     uint256 public totalEscrowed;
 
     uint256 public caseCount;
@@ -152,11 +149,10 @@ contract CompensationEscrow is Ownable2Step, ICompensationEscrow {
     }
 
     /// @inheritdoc ICompensationEscrow
-    /// @dev The snapshot timestamp is chosen by the CALLER, not derived here
-    ///      (decision D2): §3.8 uses the block before the drain proposal
-    ///      executed for predicates 1-4, but the epoch-N opening checkpoint for
-    ///      a per-epoch drawdown conviction. Only "is it in the past" is
-    ///      enforceable at this layer.
+    /// @dev The snapshot timestamp is chosen by the CALLER, not derived here:
+    ///      the block before the drain proposal executed for predicates 1-4,
+    ///      but the epoch-N opening checkpoint for a per-epoch drawdown
+    ///      conviction. Only "is it in the past" is enforceable at this layer.
     function openCase(address vault, uint256 snapshotTimestamp, uint256 proceeds)
         external
         onlyFunder
@@ -268,8 +264,8 @@ contract CompensationEscrow is Ownable2Step, ICompensationEscrow {
     /// @dev Permissionless: the destination is the owner-set backstop, so an
     ///      arbitrary caller can only accelerate a fixed transfer, never
     ///      redirect it. Residue goes to the protocol insurance backstop and
-    ///      NEVER to the vault's live NAV — paying live NAV is precisely the F1
-    ///      recoupment channel this contract exists to close (§3.8).
+    ///      NEVER to the vault's live NAV — paying live NAV is precisely the
+    ///      recoupment channel this contract exists to close.
     /// @dev The deadline uses the case's FROZEN `residueWindowAtOpen`, not the
     ///      live `residueWindow`. Reading the live value would let the owner
     ///      lower the window to the 30-day floor and sweep cases opened under a
@@ -284,14 +280,13 @@ contract CompensationEscrow is Ownable2Step, ICompensationEscrow {
         if (block.timestamp < c.openedAt + c.residueWindowAtOpen) revert ResidueWindowOpen();
         if (c.swept) revert NothingToCompensate();
         if (backstop == address(0)) revert ZeroAddress();
-        // A TYPO-CATCHER, NOT A PROPERTY (PR #24 review, minor). This compares
-        // the backstop against `c.vault` and nothing else, so it catches the
-        // realistic misconfiguration — the owner pasting the vault address into
+        // A TYPO-CATCHER, NOT A PROPERTY. This compares the backstop against
+        // `c.vault` and nothing else, so it catches the realistic
+        // misconfiguration — the owner pasting the vault address into
         // `setBackstop` — and nothing beyond it. A backstop contract that
         // FORWARDS to the vault bypasses it in one hop. "Residue never to live
-        // NAV" (§3.8) is therefore owner discipline plus one guardrail, not an
-        // invariant enforced in code; an earlier version of this comment
-        // claimed the stronger thing. Worth keeping for what it does catch.
+        // NAV" is therefore owner discipline plus one guardrail, not an
+        // invariant enforced in code. Worth keeping for what it does catch.
         if (backstop == c.vault) revert BackstopIsVault();
         amount = c.proceeds - c.redeemed;
         if (amount == 0) revert NothingToCompensate();
@@ -318,8 +313,8 @@ contract CompensationEscrow is Ownable2Step, ICompensationEscrow {
 
     /// @notice Disabled. Ownership can be TRANSFERRED (`Ownable2Step`) but never
     ///         dropped.
-    /// @dev PR #56 review. This contract's escape hatches all require a live
-    ///      owner, and one of them is the only exit for stranded residue:
+    /// @dev This contract's escape hatches all require a live owner, and one
+    ///      of them is the only exit for stranded residue:
     ///      `sweepResidue` reverts `ZeroAddress` whenever `backstop == 0`, and
     ///      `setBackstop` is `onlyOwner`. Renouncing before a backstop is wired
     ///      would therefore lock every case's unredeemed remainder in this

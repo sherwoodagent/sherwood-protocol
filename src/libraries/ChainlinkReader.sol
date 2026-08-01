@@ -4,8 +4,7 @@ pragma solidity 0.8.28;
 import {IAggregatorV3} from "../interfaces/IAggregatorV3.sol";
 
 /// @notice Fail-closed Chainlink USD reads for Base: staleness + round-completeness
-///         + L2 sequencer-uptime + grace period. (Hardens Mamo SlippagePriceChecker._readFeed,
-///         which checks staleness only.)
+///         + L2 sequencer-uptime + grace period.
 library ChainlinkReader {
     error StaleOracle();
     error SequencerDown();
