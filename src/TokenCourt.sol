@@ -222,6 +222,28 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///         harmless — not impossible, just a no-op `AlreadyReferred` — if
     ///         `challengeOf` ever loses its `view` or the game ever calls back
     ///         into the court.
+    /// @dev    THE EXPOSURE LEDGER IS PINNED HERE TOO (issue #69), under the
+    ///         same discipline as `snapshotTs` above and `game` beside it:
+    ///         one read of `IChallengeGame.exposureLedger()`, stored in
+    ///         `Case.ledger` AND handed to `_recordAccused`, so the accused
+    ///         set and the record of where it came from cannot diverge. It was
+    ///         the last case input still resolved live. An owner
+    ///         `ChallengeGame.setExposureLedger` call after this point is now
+    ///         inert for this case — it cannot empty the accused set (which
+    ///         would let every real approver vote on its own case), cannot
+    ///         zero `accusedWeight`, and so cannot push the participation
+    ///         floor to its maximum and compound the B2 denial-of-quorum
+    ///         behaviour.
+    /// @dev    THE RESIDUAL WINDOW IS FILE→REFER AND STAYS OPEN. A re-point
+    ///         made strictly between `ChallengeGame.file` and this call is
+    ///         absorbed by the pin rather than blocked by it: the empty
+    ///         accused set is what gets pinned, because `refer` is the
+    ///         earliest instant the court exists for. Owner-only, and
+    ///         recoverable by re-pointing back before `refer`. Closing it
+    ///         requires an at-`file` pin inside `ChallengeGame`'s `Challenge`
+    ///         struct or a live-challenge guard on `setExposureLedger` — a
+    ///         follow-up decision on that contract, deliberately not expanded
+    ///         into here. See `_recordAccused` for the full statement.
     function refer(uint256 challengeId) external returns (uint256 caseId) {
         address game = challengeGame;
         address swood = stakedWood;
@@ -263,9 +285,14 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
         if (executedAt == 0) revert InvalidParameter();
         uint256 snapshotTs = executedAt - 1;
 
+        // THE LEDGER IS RESOLVED EXACTLY ONCE, here, and every consumer below
+        // reads that resolved address rather than the game's live pointer.
+        address ledger = IChallengeGameLedger(game).exposureLedger();
+
         ITokenCourt.Case storage c = _cases[caseId];
         c.challengeId = challengeId;
         c.game = game; // pinned: setChallengeGame afterward must not redirect finalize's rule call
+        c.ledger = ledger; // pinned: setExposureLedger afterward must not re-derive this case's accused set
         c.snapshotTs = snapshotTs;
         c.referredAt = block.timestamp;
         c.voteWindowAtReferral = window;
@@ -277,7 +304,7 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
         // directly above it. `vote` bars this set from casting a ballot, and
         // the weight recorded below is what the participation floor's base
         // subtracts.
-        _recordAccused(caseId, c, game, ch.governor, ch.proposalId, snapshotTs);
+        _recordAccused(caseId, c, ledger, ch.governor, ch.proposalId, snapshotTs);
     }
 
     /// @inheritdoc ITokenCourt
@@ -719,7 +746,30 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     /// @dev  THE LEDGER COMES FROM THE GAME, NOT FROM `governor`. See
     ///       `IChallengeGameLedger` for why substituting the challenger-
     ///       supplied governor's ledger would hand the accused an empty
-    ///       accused set.
+    ///       accused set. It arrives as a PARAMETER, already resolved: `refer`
+    ///       performs the one `exposureLedger()` read and stores it in
+    ///       `Case.ledger`, so the address this function derives the accused
+    ///       set from and the address the case record advertises are the same
+    ///       value by construction, not by two reads happening to agree. A
+    ///       second live resolution here — which is what this function used to
+    ///       do — would be exactly the drift the pin exists to deny.
+    /// @dev  THE RESIDUAL RE-POINT WINDOW IS FILE→REFER, AND IT IS OUT OF THE
+    ///       COURT'S REACH. `ChallengeGame.setExposureLedger` vets the
+    ///       INCOMING ledger — non-zero, `challengeWindow` wide enough, and
+    ///       `coverageFreezer` already pointed back at the game
+    ///       (`RoleNotGranted`) — but none of those consult LIVE CHALLENGES,
+    ///       so a re-point still lands mid-challenge freely. Pinning at
+    ///       `refer` closes the refer→finalize half: once a
+    ///       case exists, no re-point can empty its accused set, zero its
+    ///       `accusedWeight`, or raise the participation floor under it. The
+    ///       other half remains — an owner who re-points strictly BETWEEN
+    ///       `file` and `refer` still has the empty set pinned, because there
+    ///       is no earlier instant the court is present for. That failure is
+    ///       owner-only and recoverable (re-point back before `refer`, or wait
+    ///       for the challenge's own timeout), and closing it belongs to
+    ///       `ChallengeGame`: either an at-`file` pin in the `Challenge`
+    ///       struct, or a live-challenge guard on `setExposureLedger`. Both
+    ///       are deliberately out of scope here — see issue #69.
     /// @dev  WEIGHT IS SUMMED AT `snapshotTs`, the case's stored instant, so
     ///       the number subtracted from the floor is measured on exactly the
     ///       same electorate as the votes it is compared against. RAW
@@ -773,12 +823,11 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     function _recordAccused(
         uint256 caseId,
         ITokenCourt.Case storage c,
-        address game,
+        address ledger,
         address governor,
         uint256 proposalId,
         uint256 snapshotTs
     ) internal {
-        address ledger = IChallengeGameLedger(game).exposureLedger();
         (address[] memory approvers, uint256[] memory committedUsd) =
             IExposureLedger(ledger).approversOf(governor, proposalId);
 

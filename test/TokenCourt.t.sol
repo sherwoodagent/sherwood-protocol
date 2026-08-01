@@ -358,6 +358,116 @@ contract TokenCourtTest is Test {
         assertEq(cs.accusedWeight, 500e18, "weight counted once, not doubled");
     }
 
+    /// @notice Issue #69: the exposure ledger the accused set was derived from
+    ///         is PINNED into `Case` at `refer` — the last case input that used
+    ///         to be resolved live inside `_recordAccused`.
+    function test_ledgerPinnedAtRefer() public {
+        _disputedChallenge();
+        address[] memory a = new address[](1);
+        uint256[] memory c = new uint256[](1);
+        a[0] = accusedG;
+        c[0] = 100e18;
+        ledger.setApprovers(a, c);
+        uint256 snap = vm.getBlockTimestamp() - 1 days - 1;
+        swood.setPastStake(accusedG, snap, 500e18);
+
+        uint256 caseId = court.refer(CHALLENGE_ID);
+
+        ITokenCourt.Case memory cs = court.caseOf(caseId);
+        assertEq(cs.ledger, address(ledger), "ledger the accused set came from is pinned");
+        assertEq(cs.accusedWeight, 500e18, "accused weight derived from that same ledger");
+    }
+
+    /// @notice Issue #69 regression: an owner re-point of the game's exposure
+    ///         ledger AFTER `refer` must not reach back into a live case.
+    ///         Numbers mirror `test_finalize_accusedWeightLowersFloor`: floor =
+    ///         10% of (1000e18 - 600e18) = 40e18, which a 45e18 turnout clears.
+    ///         Had the re-point emptied the case's accused set, `accusedWeight`
+    ///         would fall to zero, the floor would rise to 100e18, and the
+    ///         verdict would flip to `Inconclusive` — so the finalize path is
+    ///         itself an assertion that the pin held.
+    function test_repointAfterReferDoesNotDisturbCase() public {
+        _disputedChallenge();
+        address[] memory a = new address[](1);
+        uint256[] memory cm = new uint256[](1);
+        a[0] = accusedG;
+        cm[0] = 100e18;
+        ledger.setApprovers(a, cm);
+        uint256 snap = vm.getBlockTimestamp() - 1 days - 1;
+        swood.setPastStake(accusedG, snap, 600e18);
+
+        uint256 id = court.refer(CHALLENGE_ID);
+        uint256 accusedCountBefore = court.accusedOf(id).length;
+
+        // The owner re-points the game at a ledger that names nobody.
+        MockLedgerForCourt emptyLedger = new MockLedgerForCourt();
+        game.setExposureLedger(address(emptyLedger));
+
+        ITokenCourt.Case memory c = court.caseOf(id);
+        assertEq(c.ledger, address(ledger), "pinned ledger survives the re-point");
+        assertEq(c.accusedWeight, 600e18, "accused weight survives the re-point");
+        assertTrue(court.isAccused(id, accusedG), "accused set survives the re-point");
+        assertEq(court.accusedOf(id).length, accusedCountBefore, "accused list unchanged");
+
+        swood.setPastTotalVotes(snap, 1_000e18);
+        swood.setPastVotes(voterA, snap, 45e18);
+        vm.prank(voterA);
+        court.vote(id, true);
+
+        vm.warp(vm.getBlockTimestamp() + 5 days);
+        vm.expectEmit(true, false, false, true);
+        emit ITokenCourt.CaseFinalized(id, IChallengeGame.Verdict.Guilty, 45e18, 0, 40e18);
+        court.finalize(id);
+        assertEq(
+            uint256(court.caseOf(id).verdict),
+            uint256(IChallengeGame.Verdict.Guilty),
+            "floor still computed off the pinned accused weight"
+        );
+    }
+
+    /// @notice Issue #69's "check when doing it": pinning the ledger without
+    ///         its derived weight would leave half the property. The stored
+    ///         `accusedWeight` must be exactly the `getPastStake` sum over the
+    ///         PINNED ledger's still-committed approvers at the PINNED
+    ///         `snapshotTs` — recomputed here from `Case` alone.
+    function test_ledgerAndWeightPinnedTogether() public {
+        _disputedChallenge();
+        address accusedH = makeAddr("accusedH");
+        address[] memory a = new address[](3);
+        uint256[] memory cm = new uint256[](3);
+        a[0] = accusedG;
+        cm[0] = 100e18;
+        a[1] = accusedH;
+        cm[1] = 250e18;
+        a[2] = makeAddr("released");
+        cm[2] = 0; // released before the filing: backs nothing, not accused
+        ledger.setApprovers(a, cm);
+        uint256 snap = vm.getBlockTimestamp() - 1 days - 1;
+        swood.setPastStake(accusedG, snap, 500e18);
+        swood.setPastStake(accusedH, snap, 300e18);
+        swood.setPastStake(a[2], snap, 900e18); // must never enter the sum
+
+        uint256 id = court.refer(CHALLENGE_ID);
+
+        ITokenCourt.Case memory c = court.caseOf(id);
+        (address[] memory approvers, uint256[] memory committed) =
+            MockLedgerForCourt(c.ledger).approversOf(governor, PROPOSAL_ID);
+        uint256 expected;
+        for (uint256 i; i < approvers.length; ++i) {
+            if (committed[i] == 0) continue;
+            expected += swood.getPastStake(approvers[i], c.snapshotTs);
+        }
+        assertEq(expected, 800e18, "fixture sanity: the recompute sees both live approvers");
+        assertEq(c.accusedWeight, expected, "weight is the pinned ledger's sum at the pinned snapshot");
+
+        // The identity holds after a re-point too: both halves moved together
+        // or neither did.
+        game.setExposureLedger(address(new MockLedgerForCourt()));
+        ITokenCourt.Case memory pinned = court.caseOf(id);
+        assertEq(pinned.ledger, address(ledger), "ledger half still pinned");
+        assertEq(pinned.accusedWeight, expected, "weight half still pinned");
+    }
+
     function test_refer_guards() public {
         // Unwired court refuses (review E4 closed structurally).
         TokenCourt fresh = new TokenCourt(owner);

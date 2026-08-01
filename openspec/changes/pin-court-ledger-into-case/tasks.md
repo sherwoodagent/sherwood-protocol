@@ -1,16 +1,16 @@
 # Tasks
 
-- [ ] 1. Interface: add `address ledger` to `ITokenCourt.Case` (adjacent to
+- [x] 1. Interface: add `address ledger` to `ITokenCourt.Case` (adjacent to
   `game`, with the "written once in refer" comment); update natspec.
-- [ ] 2. `TokenCourt.refer`: hoist the single
+- [x] 2. `TokenCourt.refer`: hoist the single
   `IChallengeGameLedger(game).exposureLedger()` read into a local, store it in
   `c.ledger`, pass it to `_recordAccused`.
-- [ ] 3. `TokenCourt._recordAccused`: replace the `game` parameter with
+- [x] 3. `TokenCourt._recordAccused`: replace the `game` parameter with
   `address ledger`; delete the internal ledger lookup; body otherwise
   unchanged.
-- [ ] 4. Natspec: document the residual file→refer re-point window on
+- [x] 4. Natspec: document the residual file→refer re-point window on
   `refer`/`_recordAccused` per the spec delta.
-- [ ] 5. Tests (failing-first where feasible): `test_ledgerPinnedAtRefer`,
+- [x] 5. Tests (failing-first where feasible): `test_ledgerPinnedAtRefer`,
   `test_repointAfterReferDoesNotDisturbCase`,
   `test_ledgerAndWeightPinnedTogether`. Reuse/extend existing TokenCourt test
   fixtures and mocks.
