@@ -1,8 +1,14 @@
 name: CI
 
 on:
+  # NO BASE FILTER ON `pull_request`, deliberately. A `branches: [main]` filter
+  # here means a PR stacked on an integration branch triggers NOTHING — and it
+  # surfaces as an EMPTY check list, which reads like "nothing wrong" rather
+  # than "nothing verified". Stacked PRs are where CI matters most: the diff is
+  # reviewed against a base that is itself unmerged and moving. The `push`
+  # filter below is what keeps post-merge runs scoped to `main`; this one only
+  # bought silence. (Found 2026-08-01: PRs #75/#78/#80 each ran zero checks.)
   pull_request:
-    branches: [main]
   push:
     branches: [main]
 
@@ -46,6 +52,66 @@ jobs:
       # which forks public Base RPC in setUp(). All other tests run.
       - name: Test
         run: forge test --no-match-path "{test/integration/**,test/WstETHMoonwellStrategy.t.sol}" -vv
+
+  coverage:
+    name: Coverage (advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # forge coverage is the least stable forge subcommand — it may not hold PRs
+    # hostage. Its red/green status stays visible in the checks list; revisit
+    # making it blocking once it has proven stable.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: ${{ env.FOUNDRY_VERSION }}
+
+      # Own cache key: the coverage profile builds with via_ir off, so its
+      # artifacts are incompatible with the default profile's — sharing the
+      # `forge-` key would make the two jobs thrash each other's cache.
+      - name: Cache build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            cache
+            out
+          key: forge-coverage-${{ env.FOUNDRY_VERSION }}-${{ hashFiles('foundry.toml', 'src/**/*.sol', 'lib/**/*.sol', 'test/**/*.sol', 'script/**/*.sol') }}
+          restore-keys: |
+            forge-coverage-${{ env.FOUNDRY_VERSION }}-
+
+      # `forge coverage` disables the optimizer and via_ir project-wide to keep
+      # source maps accurate, and unoptimized legacy codegen blows the stack in
+      # this repo's eight largest contracts. `[profile.coverage]` works around
+      # that with per-file `compilation_restrictions` that keep exactly those
+      # eight on the IR pipeline; see the comment block in foundry.toml for the
+      # list, the reproduce command, and what the workaround costs. Same
+      # fork-path exclusion as the Test step above: those suites need live RPC.
+      #
+      # Still `continue-on-error` (see above) on stability grounds only — as of
+      # forge 1.7.1 this step passes: 1478 tests, ~52% line coverage over the 83
+      # instrumented files.
+      - name: forge coverage
+        env:
+          FOUNDRY_PROFILE: coverage
+        run: |
+          forge coverage \
+            --report lcov \
+            --report summary \
+            --no-match-path "{test/integration/**,test/WstETHMoonwellStrategy.t.sol}"
+
+      # TODO(#63): sink is artifact-only for now — wiring Codecov needs a
+      # CODECOV_TOKEN repository secret, a decision deferred out of this change.
+      - name: Upload lcov report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          retention-days: 14
+          if-no-files-found: warn
 
   fmt:
     name: Format check
