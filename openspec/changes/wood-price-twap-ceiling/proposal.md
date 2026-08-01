@@ -83,18 +83,39 @@ change can only fail *same*, never *worse*.
 as a routine price. It is set once as a standing ceiling and touched only in an
 emergency.
 
-That is what the `min` structure is for, and it inverts which input does the
-work:
+This removes recurring human judgment from the pricing path and leaves humans
+only a brake. It also forces a split, because **one number cannot be both a
+brake and a fallback**: a brake wants to sit high so it never binds, a fallback
+must be accurate the moment it is needed. Set high it is a dangerous fallback;
+set snug it needs exactly the maintenance this doctrine exists to remove.
 
-| | Routine | Emergency |
-|---|---|---|
-| `woodUsdPriceX8` | set once, high enough not to bind; **left alone** | slammed **down** to throttle all bond valuation at once (downward moves are unbounded and immediate by design) |
-| TWAP | **binds** — tracks the market without human action | may be capped or bypassed by the emergency setting |
+So there are two, each with one job (owner decision, option A):
 
-This is strictly better than the alternative, because it removes recurring human
-judgment from the pricing path and leaves humans only a brake. But it changes
-what "TWAP unavailable" may do — see the staleness consequence below and
-design.md decision 2, which this doctrine revises.
+| | Value | Touched | Role |
+|---|---|---|---|
+| `woodUsdPriceX8` (existing) | HIGH, non-binding | **emergency only** | ceiling, applied as `min` to whichever source is live |
+| `woodFallbackPriceX8` (new) | snug, conservative | maintained | the price used when the TWAP is stale |
+| TWAP | — | nobody | **the routine price** |
+
+The existing setter stays where it is: `setWoodUsdPrice` is already
+brake-shaped — unbounded immediate downward moves, upward capped at 2× per
+interval, zero as the emergency stop — so `woodUsdPriceX8` becomes the ceiling
+unchanged.
+
+Resolution order:
+
+```
+source = twap fresh            ? twapUsd
+       : woodFallbackPriceX8≠0 ? woodFallbackPriceX8
+       :                         REVERT NoWoodPrice
+
+price  = haircut( min(source, woodUsdPriceX8) )
+```
+
+The ceiling caps **both** branches on purpose — capping only the TWAP branch
+would leave the fallback unthrottled exactly when the brake is being pulled.
+The revert is a deploy-misconfiguration guard, not a runtime state; see
+design.md decision 3 for why a loud failure beats serving `0` here.
 
 ## What lowering `woodHaircutBps` does and does not buy
 

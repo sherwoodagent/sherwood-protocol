@@ -82,39 +82,52 @@ theft-enabling.
    that promotes the TWAP to a primary source re-opens a $219k-deep pool as the
    protocol's collateral valuation. Encode it as a spec requirement, not a
    comment.
-2. **Staleness guard — REVISED by the emergency-only doctrine.** The original
-   decision was "drop the `min`, fall back to the governance number", justified
-   because that is today's behaviour and therefore fails *same*, not *worse*.
+2. **TWO governance numbers, each with exactly one job (owner decision,
+   2026-08-01).** One number cannot serve as both an emergency brake and a
+   staleness fallback: a brake wants to sit HIGH so it never binds in normal
+   operation, while a fallback must be ACCURATE the moment it is needed. Set
+   high it is a dangerous fallback; set snug it needs the routine maintenance
+   the emergency-only doctrine exists to eliminate. So they are split.
 
-   **That justification does not survive the owner decision of 2026-08-01.** It
-   assumed the governance number is a maintained, roughly-correct price. Under
-   emergency-only operation it is deliberately set HIGH and left alone — so
-   falling back to it on TWAP staleness would fail in exactly the dangerous
-   direction, and worse, it would do so precisely when the market data stopped
-   arriving.
+   | | Value | Who touches it | Role |
+   |---|---|---|---|
+   | `woodUsdPriceX8` (existing) | HIGH, non-binding | emergency only | **ceiling**, applied as `min` to whatever source is live |
+   | `woodFallbackPriceX8` (new) | snug, conservative | maintained | **fallback price** when the TWAP is stale |
 
-   Revised behaviour: on TWAP staleness, keep serving the **last known good
-   TWAP**, progressively haircut as it ages, and let the governance number act
-   only as the hard ceiling it now is. Properties:
+   The existing setter keeps its existing home. `setWoodUsdPrice`'s semantics
+   are already brake-shaped — unbounded immediate downward moves, upward capped
+   at 2× per `MIN_PRICE_UPDATE_INTERVAL`, zero settable as the emergency stop —
+   so `woodUsdPriceX8` becomes the ceiling and needs no behavioural change.
 
-   - routine → TWAP binds, no human in the loop;
-   - TWAP stale → last real market price, drifting conservative as it ages, so
-     quorum gets *harder*, never easier;
-   - emergency → the multisig slams `woodUsdPriceX8` down and the `min` caps
-     everything at once.
+   Resolution order:
 
-   Reverting is still refused, for the original reason: it would let anyone
-   halt the protocol by not running a keeper.
+   ```
+   source = twap fresh          ? twapUsd
+          : fallbackPriceX8 != 0 ? fallbackPriceX8
+          :                        REVERT NoWoodPrice
 
-   **OPEN — needs an owner call.** What happens at the end of the decay, when
-   the last good TWAP is too old to trust at any haircut? The candidates are
-   (a) floor the decay and keep serving a heavily-discounted price forever,
-   (b) stop admitting *new* coverage while leaving existing operations priced,
-   or (c) fall through to the governance number and accept that the emergency
-   lever must then be used as a price after all. (b) is the most honest —
-   degrading capability rather than silently degrading a number — but it is a
-   larger change and touches `requireApproveQuorum` rather than just pricing.
-   Flagged rather than guessed.
+   price  = _haircut( min(source, woodUsdPriceX8) )
+   ```
+
+   The ceiling caps **both** branches deliberately. If it capped only the TWAP
+   branch, slamming the brake in an emergency would leave the fallback path
+   unthrottled — a hole in the lever precisely when it is being pulled.
+
+3. **The revert is a config guard, not a runtime failure mode.** It fires only
+   when there is no price from any source, which is a deploy misconfiguration
+   rather than a reachable operating state. It must be paired with a deploy
+   pre-flight asserting `woodFallbackPriceX8 != 0` **and**
+   `woodUsdPriceX8 != 0`, so it can never fire in production.
+
+   This is a deliberate, narrow exception to the rule that `_woodPrice` must not
+   revert. That rule is real and load-bearing — `setWoodFeed`'s natspec records
+   that a reverting price path "took `recordApproval` and `requireApproveQuorum`
+   with it protocol-wide", and the 2026-08-01 audit found a revert on the slash
+   path can burn a `Guilty` verdict. The exception is justified only because the
+   alternative is worse: serving `0` silently values every bond at nothing, and
+   that same audit showed `effectiveTotal == 0` marks a challenge convicted while
+   recovering nothing and permanently blocking a re-file. A loud failure on a
+   state that should be unreachable beats a silent one that is not.
 3. **Window length: ≥ 1 hour, configurable, bounded.** The live risk is
    sustained down-manipulation, and cost scales with the window. Short windows
    are cheap to hold; excessively long ones stop tracking a real drawdown,

@@ -29,22 +29,46 @@ The change must be incapable of failing *worse* than the current design.
 - **GIVEN** the oracle address is `address(0)`
 - **THEN** `woodPriceX8()` behaves exactly as it does today.
 
-#### Scenario: stale snapshot
+#### Scenario: stale snapshot falls back to the maintained price
 
 - **GIVEN** the oracle's last `update()` is older than `maxTwapAge`
-- **THEN** the last known good TWAP continues to be served, progressively
-  haircut as it ages, still capped by the governance number via the `min`.
-- **AND** it does **not** revert — reverting would let anyone halt the protocol
-  by not running a keeper.
-- **AND** it does **not** simply fall back to the governance number: under the
-  emergency-only doctrine that number is deliberately set high, so falling back
-  to it would fail in the dangerous direction at exactly the moment market data
-  stopped arriving.
+- **AND** `woodFallbackPriceX8 != 0`
+- **THEN** `woodPriceX8()` returns
+  `_haircut(min(woodFallbackPriceX8, woodUsdPriceX8))` — the maintained
+  conservative price, still capped by the emergency ceiling.
+- **AND** it does **not** fall back to `woodUsdPriceX8` as a *price*: that
+  number is deliberately set high under the emergency-only doctrine, so using
+  it as the price would fail in the dangerous direction at exactly the moment
+  market data stopped arriving.
 
-> **OPEN — owner decision required.** The terminal behaviour once the last good
-> TWAP is too old to trust at any haircut is unresolved: floor the decay, stop
-> admitting new coverage, or fall through to the governance number. See
-> design.md decision 2. This spec is not implementable until that is settled.
+#### Scenario: no price from any source
+
+- **GIVEN** the TWAP is unavailable or stale
+- **AND** `woodFallbackPriceX8 == 0`
+- **THEN** `woodPriceX8()` **reverts** `NoWoodPrice`.
+- **AND** a deploy pre-flight asserts `woodFallbackPriceX8 != 0` and
+  `woodUsdPriceX8 != 0`, so this state is unreachable in production and the
+  revert is a configuration guard rather than a live failure mode.
+
+Serving `0` here is rejected as the alternative: it silently values every bond
+at nothing, and `effectiveTotal == 0` on the slash path marks a challenge
+convicted while recovering nothing and permanently blocking a re-file
+(2026-08-01 audit). A loud failure on an unreachable state beats a silent one
+on a reachable path.
+
+## ADDED Requirement: The emergency ceiling caps every source
+
+#### Scenario: brake pulled while the TWAP is live
+
+- **WHEN** the owner lowers `woodUsdPriceX8`
+- **THEN** the new value caps the TWAP-derived price immediately.
+
+#### Scenario: brake pulled while the fallback is in use
+
+- **GIVEN** the TWAP is stale and the fallback price is serving
+- **WHEN** the owner lowers `woodUsdPriceX8`
+- **THEN** the new value caps the fallback price too — the brake must not have
+  a hole on the branch that is live precisely when it is being pulled.
 
 #### Scenario: oracle reverts, is codeless, or returns malformed data
 
