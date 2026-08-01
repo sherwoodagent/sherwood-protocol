@@ -474,6 +474,28 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     /// @notice Slashed WOOD is sent here — permanently out of circulation.
     /// @dev Burning via a transfer to a known-dead address keeps WOOD's
     ///      `totalSupply` semantics intact (no `burn` dependency on the token).
+    ///
+    ///      WHAT "BURN" MEANS HERE, PRECISELY. WOOD exposes no `burn()` /
+    ///      `ERC20Burnable`, so this is a SUPPLY SINK, not a supply reduction:
+    ///      `totalSupply` never falls. The effect is on CIRCULATING supply, and
+    ///      only for anyone who treats this address as outside circulation.
+    ///      State any deflation claim in those terms — a claim about
+    ///      `totalSupply` would be false.
+    ///
+    ///      Nothing in this protocol reads WOOD's `totalSupply`, so the
+    ///      accumulating dead balance pollutes no internal denominator (no
+    ///      quorum, rate, or price derives from it). The exposure is purely
+    ///      external reporting: if a data provider does not exclude
+    ///      `0x...dEaD`, the burn is real on-chain and invisible everywhere a
+    ///      holder would look for it.
+    ///
+    ///      Volume is CONVICTION-DRIVEN, not continuous. A healthy protocol
+    ///      burns nothing; the supply curve steps down exactly when the
+    ///      protocol is being successfully attacked. That is the correct
+    ///      incentive and a poor growth narrative, and the two should not be
+    ///      confused. There is no continuous WOOD burn source to complement it
+    ///      — the only protocol fee is the agent performance fee, denominated
+    ///      in the VAULT's asset (see `FeeConstants`), not in WOOD.
     address internal constant BURN_ADDRESS = 0x000000000000000000000000000000000000dEaD;
 
     /// @notice Ceiling on `slashToEscrow`'s `bountyBps` (spec 2026-07-29 §2:
@@ -1327,9 +1349,10 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
         // should never be laundered into a smaller-but-still-caller-chosen
         // one. Left unchecked here, a compromised or buggy `authorizedSlasher`
         // could pass `bountyBps` up to just under 10_000 and route almost the
-        // entire slash to a `bountyTo` of its own choosing — the exact one-
-        // address-of-its-own-choosing outcome `compensationEscrow`'s natspec
-        // says sWOOD does not allow. Enforcing the ceiling here,
+        // entire slash to a `bountyTo` of its own choosing. The guarantee this
+        // preserves: a compromised slasher can divert at most
+        // `MAX_CONVICTION_BOUNTY_BPS` of any ONE call, and the remainder can
+        // only ever reach `BURN_ADDRESS`. Enforcing the ceiling here,
         // unconditionally (even when `bountyTo == address(0)` and the rate
         // would never be spent), keeps that guarantee true regardless of what
         // the caller does. PER CALL, NOT PER GUARDIAN: `_verdictSlashed` keys

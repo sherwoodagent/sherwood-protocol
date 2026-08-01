@@ -3,7 +3,9 @@ pragma solidity 0.8.28;
 
 /// @title IChallengeGame
 /// @notice Bonded challenges against executed proposals (spec 2026-07-22 §3.4)
-///         — the trigger above the slash/compensation rails.
+///         — the trigger above the slash rails. Slash proceeds are BURNED, not
+///         compensated: the protocol punishes the approver, it does not
+///         reimburse the vault.
 ///
 ///         A challenge is an ASSERTION with an evidence pointer, never an
 ///         on-chain proof. §3.4's flow is "undisputed → slash after a delay,
@@ -278,8 +280,8 @@ interface IChallengeGame {
     ///         with no retry path, so that catch may not be broad; a skipped
     ///         referral here always has one, so this catch may be.
     event AutoReferFailed(uint256 indexed challengeId);
-    /// @param slashedWood What the compensation escrow (or the burn fallback)
-    ///        actually BURNED — NOT the gross amount taken off the accused.
+    /// @param slashedWood What was actually BURNED — NOT the gross amount taken
+    ///        off the accused.
     ///        On a CONTESTED escalated conviction (spec 2026-07-29 §2) this is
     ///        NET of the conviction bounty paid to the challenger, since
     ///        `IStakedWood.slashVerdict` deducts the bounty before burning the
@@ -431,9 +433,9 @@ interface IChallengeGame {
     function dispute(uint256 challengeId, uint256 amountWood) external;
 
     /// @notice Permissionless resolution. From `Filed` past `autoSlashDelay` the
-    ///         silence is the verdict and the accused are slashed into the
-    ///         compensation escrow; from `Disputed` past `disputeTimeout` the
-    ///         challenge fails to the accused (D5). Reverts otherwise.
+    ///         silence is the verdict and the accused are slashed, their bonds
+    ///         burned; from `Disputed` past `disputeTimeout` the challenge fails
+    ///         to the accused (D5). Reverts otherwise.
     function resolve(uint256 challengeId) external;
 
     /// @notice The court's verdict on a DISPUTED challenge (spec §3.5, Plan E;

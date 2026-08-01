@@ -32,6 +32,28 @@ interface IChallengeGameLedger {
  *         a reverting `IChallengeGame.rule` call (`ChallengeAlreadyTerminal`)
  *         is bookkeeping rather than a stuck-funds hazard.
  *
+ * @dev    THIS COURT'S RESISTANCE TO CAPTURE IS NOW LOAD-BEARING FOR CHALLENGE
+ *         ECONOMICS, in a way it was not when slash proceeds funded victim
+ *         compensation. Convictions BURN the accused's bond, and burned WOOD
+ *         raises every remaining holder's share of the supply — so a
+ *         WOOD-heavy party profits from ANY conviction, on top of the
+ *         conviction bounty, and profits whether or not the accused was
+ *         actually guilty.
+ *
+ *         That turns "can this court be swayed?" from a FAIRNESS question into
+ *         a PROFIT question. A holder of fraction `f` of supply collects
+ *         `f x burn` per conviction; the larger `f`, the lower the confidence
+ *         at which filing against an honest guardian becomes worth trying.
+ *         Under the old escrow the same manipulation paid only vault
+ *         shareholders, so an attacker had to hold the drained vault's shares
+ *         to benefit — a far narrower and more visible position.
+ *
+ *         Nothing here is broken by that; it raises the assurance this
+ *         contract must carry. Treat the participation floor, the vote window,
+ *         and the snapshot instant as economic parameters, not just procedural
+ *         ones, and re-examine them alongside `ChallengeGame.challengerBondBps`
+ *         rather than in isolation (burn-slash-proceeds design.md R4).
+ *
  * @dev    NON-UPGRADEABLE, PLAIN `Ownable2Step` — the house shape for
  *         single-owner administrative contracts in this protocol (mirrors
  *         `ChallengeGame`). No UUPS/beacon proxy: the court has no storage
@@ -166,8 +188,10 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     /// @inheritdoc ITokenCourt
     /// @dev    THE SNAPSHOT IS COMPUTED HERE, ONCE, AND STORED (decision D2).
     ///         It is `executedAt - 1` — the block before the challenged
-    ///         proposal executed — the same instant the compensation path and
-    ///         the settle-path slash use. Storing it rather than re-deriving
+    ///         proposal executed. It once had a second consumer, the
+    ///         compensation path's apportionment; that is gone with the escrow
+    ///         and the instant now serves only to fix THIS court's electorate.
+    ///         Storing it rather than re-deriving
     ///         it on every `vote`/`finalize` call is what keeps the electorate
     ///         that judges guilt identical no matter how many blocks pass
     ///         before the window closes, and it means the vote cannot be made

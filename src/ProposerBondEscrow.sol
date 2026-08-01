@@ -17,8 +17,11 @@ interface IRegistryAuthMinimal {
  *         extract; in v1a the bond's only exit is release back to the
  *         proposer once the proposal reaches a terminal state (the governor
  *         gates WHEN — see `SyndicateGovernor.reclaimProposerBond`).
- *         Forfeiture to the compensation escrow arrives with the challenge
- *         game (Plan C); this contract deliberately has no owner and no
+ *         A forfeiture path was once planned to route this bond into the
+ *         compensation escrow alongside the challenge game; that escrow is
+ *         gone (slash proceeds burn), and no forfeiture path was ever built
+ *         here. Release to the proposer remains the ONLY exit.
+ *         This contract deliberately has no owner and no
  *         discretionary exit — the invariant `wood.balanceOf(this) >=
  *         sum of locked-unreleased bonds` holds by construction (equality
  *         absent direct transfers; surplus from donations is permanently
