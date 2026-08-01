@@ -257,7 +257,7 @@ contract SlashGasCeilingTest is Test {
         vm.prank(owner);
         registry.setExposureLedger(address(ledger));
 
-        bondEscrow = new ProposerBondEscrow(address(wood), address(registry));
+        bondEscrow = new ProposerBondEscrow(address(wood), address(registry), address(ledger));
         escrow = new CompensationEscrow(owner, address(wood));
 
         game = new ChallengeGame(owner, address(wood), address(ledger), address(tierRegistry));
