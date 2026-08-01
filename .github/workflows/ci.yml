@@ -1,8 +1,14 @@
 name: CI
 
 on:
+  # NO BASE FILTER ON `pull_request`, deliberately. A `branches: [main]` filter
+  # here means a PR stacked on an integration branch triggers NOTHING — and it
+  # surfaces as an EMPTY check list, which reads like "nothing wrong" rather
+  # than "nothing verified". Stacked PRs are where CI matters most: the diff is
+  # reviewed against a base that is itself unmerged and moving. The `push`
+  # filter below is what keeps post-merge runs scoped to `main`; this one only
+  # bought silence. (Found 2026-08-01: PRs #75/#78/#80 each ran zero checks.)
   pull_request:
-    branches: [main]
   push:
     branches: [main]
 
