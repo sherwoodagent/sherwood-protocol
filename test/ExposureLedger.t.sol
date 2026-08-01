@@ -143,6 +143,46 @@ contract MockRegistryForLedger {
 }
 
 contract ExposureLedgerTest is Test {
+    // ── FIXTURE HAZARD: TWO EARLY EXITS SILENTLY SHRINK A MULTI-APPROVER SET ──
+    //
+    // Both exits below are correct, deliberate behaviour in `ExposureLedger` and
+    // both stay. What they do to a TEST is quieter: a fixture that wires N
+    // approvers can end up exercising fewer than N, and still pass. Four tests
+    // shipped passing for the wrong reason (repaired in #61), two of them
+    // exactly this shape.
+    //
+    //   1. `requireApproveQuorum` — QUORUM-REACHED BREAK.
+    //      The loop returns the moment `haveUsd >= needUsd`, so every approver
+    //      after the one that tips the sum is never read. Size a fixture so the
+    //      FIRST approver's reservation alone meets the requirement and the
+    //      second approver's accounting is not under test at all: break that
+    //      path and the assertion still passes.
+    //
+    //   2. `recordApproval` — NO-FREE-BUDGET RETURN.
+    //      A guardian whose `kNumerator * slashableBondUsd` is already spoken
+    //      for by its open exposure returns before booking. It books zero, it is
+    //      NOT pushed onto `_approversOf`, and nothing reverts to mark it. The
+    //      fixture believes it seated N approvers; the ledger holds N-1. Reached
+    //      whenever an approver's stake is left at zero, or an earlier proposal
+    //      in the same test already consumed its budget.
+    //
+    // THE SIZING RULE, which defeats both at once: give every approver a
+    // bookable budget STRICTLY GREATER THAN ZERO and STRICTLY SMALLER than the
+    // proposal's requirement. Then each one books a real non-zero share (exit 2
+    // cannot fire), no single reservation can satisfy the quorum on its own
+    // (exit 1 cannot fire before the last approver), and every approver is
+    // genuinely read.
+    //
+    // `_wireUnderCoveredApprovers` applies the rule BY CONSTRUCTION, asserts it,
+    // and ends on an `approversOf` count check. `_assertApproverSet` is that
+    // count check on its own, for fixtures whose sizing is deliberately
+    // different — an over-reservation test needs each bond ABOVE the
+    // requirement, so it cannot take the rule, but it still wants to know the
+    // ledger seated the set it wired.
+    //
+    // A fixture that WANTS an early exit says so with an
+    // `// EARLY-EXIT INTENDED:` comment naming which one and why.
+
     ExposureLedger internal ledger;
     MockSwood internal swood;
     address internal owner = makeAddr("owner");
@@ -234,6 +274,71 @@ contract ExposureLedgerTest is Test {
         swood.setStake(guardian, 100_000e18); // slashableBondUsd = $5,000 at $0.05
     }
 
+    /// @dev THE SHARED MULTI-APPROVER FIXTURE (see the hazard block above).
+    ///      Seats `coverage6` as the proposal's requirement, stakes every
+    ///      approver at `stakeWood`, records all their approvals, and hands back
+    ///      a set that BOTH early exits leave intact.
+    ///
+    ///      Call after `_wireRecording()`. The sizing rule is ASSERTED rather
+    ///      than assumed: each approver's free budget must be non-zero (so it
+    ///      books a real share instead of taking `recordApproval`'s
+    ///      no-free-budget return) and strictly below the requirement (so no
+    ///      single reservation can satisfy `requireApproveQuorum` on its own and
+    ///      leave the later approvers unread). A fixture that cannot hold to
+    ///      that sizing does not belong on this helper — it either states
+    ///      `// EARLY-EXIT INTENDED:` or takes `_assertApproverSet` alone.
+    function _wireUnderCoveredApprovers(
+        uint256 proposalId,
+        uint256 coverage6,
+        uint256 stakeWood,
+        address[] memory approvers
+    ) internal {
+        mgov.set(coverage6);
+        uint256 needUsd = ledger.coverageUsd(usdgAsset, coverage6);
+        uint256 k = ledger.kNumerator();
+        for (uint256 i = 0; i < approvers.length; i++) {
+            swood.setStake(approvers[i], stakeWood);
+            uint256 capUsd = k * ledger.slashableBondUsd(approvers[i]);
+            uint256 open = ledger.openExposureUsd(approvers[i]);
+            uint256 free = capUsd > open ? capUsd - open : 0;
+            assertGt(free, 0, "sizing rule: an approver with no free budget books nothing and is never listed");
+            assertLt(free, needUsd, "sizing rule: no approver may satisfy the quorum on its own");
+        }
+        vm.startPrank(registry);
+        for (uint256 i = 0; i < approvers.length; i++) {
+            ledger.recordApproval(address(mgov), proposalId, approvers[i]);
+        }
+        vm.stopPrank();
+        _assertApproverSet(proposalId, approvers);
+    }
+
+    /// @dev The count check on its own, for fixtures whose sizing is
+    ///      deliberately different from the rule above. `recordApproval`'s
+    ///      no-free-budget return leaves no trace — no revert, no event, no
+    ///      list entry — so asking the ledger who it actually seated is the only
+    ///      way a fixture learns that one of its approvers silently dropped out.
+    function _assertApproverSet(uint256 proposalId, address[] memory expected) internal {
+        (address[] memory listed, uint256[] memory shares) = ledger.approversOf(address(mgov), proposalId);
+        assertEq(listed.length, expected.length, "the ledger seated a different approver set than the fixture wired");
+        for (uint256 i = 0; i < expected.length; i++) {
+            assertEq(listed[i], expected[i], "approver membership/order");
+            assertGt(shares[i], 0, "every approver books a non-zero share");
+        }
+    }
+
+    function _approverSet(address a, address b) internal pure returns (address[] memory set) {
+        set = new address[](2);
+        set[0] = a;
+        set[1] = b;
+    }
+
+    function _approverSet(address a, address b, address c) internal pure returns (address[] memory set) {
+        set = new address[](3);
+        set[0] = a;
+        set[1] = b;
+        set[2] = c;
+    }
+
     function test_recordApproval_registryOnly() public {
         _wireRecording();
         mgov.set(1_000e6);
@@ -272,20 +377,21 @@ contract ExposureLedgerTest is Test {
     ///         coverage (capped by its own budget); the pro-rata scale-back then
     ///         decides what each actually carries. Arrival order changes
     ///         nothing, which is the property the free-rider veto exploited.
+    ///
+    /// @dev    On the shared helper: $5,000 budgets against an $8,000
+    ///         requirement IS the sizing rule — neither approver can clear the
+    ///         quorum alone, so `requireApproveQuorum` has to read both, and
+    ///         the helper's count check proves the ledger seated both.
     function test_recordApproval_twoGuardiansAggregateToCover() public {
         _wireRecording();
         address g2 = makeAddr("g2");
-        swood.setStake(g2, 100_000e18); // $5,000 each at $0.05
-        mgov.set(8_000e6); // $8,000 needed — neither covers it alone
+        // $5,000 each at $0.05; $8,000 needed — neither covers it alone.
+        _wireUnderCoveredApprovers(1, 8_000e6, 100_000e18, _approverSet(guardian, g2));
 
-        vm.prank(registry);
-        ledger.recordApproval(address(mgov), 1, guardian);
         assertEq(ledger.openExposureUsd(guardian), 5_000e18, "first reserves its whole budget");
-
-        vm.prank(registry);
-        ledger.recordApproval(address(mgov), 1, g2);
         // The second reserves its OWN budget too, not merely the remainder —
-        // there is no leftover to race for.
+        // there is no leftover to race for. Under the old first-come rule this
+        // would read $3,000.
         assertEq(ledger.openExposureUsd(g2), 5_000e18, "second reserves its own budget, not the remainder");
 
         // $10,000 reserved against $8,000 needed, so each carries 5/10 of it.
@@ -1308,8 +1414,12 @@ contract ExposureLedgerTest is Test {
         ledger.requireApproveQuorum(address(mgov), 2, usdgAsset, 3_000e6);
     }
 
-    /// @notice The hard edge of the batching cap: with NO free budget left, an
-    ///         approve reverts outright rather than committing zero.
+    // EARLY-EXIT INTENDED: `recordApproval`'s no-free-budget return. This test IS
+    // that exit — the second approval books nothing and the guardian is never
+    // listed for proposal 2, which is the asserted behaviour rather than a
+    // fixture that lost an approver by accident. (A stale line here used to claim
+    // the opposite, "an approve reverts outright"; N1 replaced that revert with
+    // this return.)
     /// @notice N1 — a spent budget books NOTHING; it does not revert. Reverting
     ///         took `voteOnProposal` down with it, so a guardian whose budget
     ///         went on an earlier proposal could not cast an approve vote at
