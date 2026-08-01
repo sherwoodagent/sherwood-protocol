@@ -1,32 +1,34 @@
 schema: spec-driven
 
-# Project context (optional)
-# This is shown to AI when creating artifacts.
-# Add your tech stack, conventions, style guides, domain knowledge, etc.
-# Example:
-#   context: |
-#     Tech stack: TypeScript, React, Node.js
-#     We use conventional commits
-#     Domain: e-commerce platform
+context: |
+  Sherwood Protocol — guardian-secured DeFi syndicate platform on Robinhood Chain
+  (chain id 4663; testnet 46630). Tech stack: Solidity 0.8.28, Foundry
+  (via_ir = true, optimizer_runs = 50), OpenZeppelin.
 
-# Per-artifact rules (optional)
-# Add custom rules for specific artifacts.
-# Example:
-#   rules:
-#     proposal:
-#       - Keep proposals under 500 words
-#       - Always include a "Non-goals" section
-#     tasks:
-#       - Break tasks into chunks of max 2 hours
+  Core capabilities are specced under openspec/specs/: syndicate-vault,
+  syndicate-governor, guardian-staking, guardian-coverage, challenge-game,
+  token-court, epoch-nav, tier-policy, deployment-docs, dimensional-conventions,
+  operator-docs, supply-chain, test-fixtures, fee-splits, instant-exit-fees,
+  management-fee, performance-fee.
+  Historical design/implementation records (migrated from the former
+  docs/superpowers workflow, and reconciled from independently-authored
+  OpenSpec change proposals already merged to main) live in
+  openspec/changes/archive/.
 
-# Per-operation guidance (optional)
-# Add advisory guidance for how apply and archive work should be conducted.
-# This is separate from artifact rules above.
-# Example:
-#   operations:
-#     apply:
-#       guidance:
-#         - Keep test summaries concise
-#     archive:
-#       guidance:
-#         - Summarize the archive outcome before finishing
+  Conventions:
+  - Robinhood Chain MaxCodeSize is 98,304 bytes (4x EIP-170); the legacy Base
+    deployment is constrained to 24,576.
+  - Deploy wiring order is security-relevant: DeployPlanD wires coverageFreezer
+    first, then demoter, then authorizedSlasher, and points ChallengeGame at
+    sWOOD (setStakedWood) last — see openspec/specs/deployment-docs/spec.md.
+  - Natspec house style: every guard states its adversary; cross-reference
+    spec sections (see ChallengeGame.sol).
+  - Dimensional/unit rules: see openspec/specs/dimensional-conventions/spec.md.
+  - Run forge test before committing contract changes; fork tests are pinned
+    to fixed blocks and excluded from the default CI job.
+
+rules:
+  proposal:
+    - Name capabilities with the existing kebab-case spec folders in openspec/specs/ where applicable
+  specs:
+    - Every guard/requirement states its adversary where security-relevant

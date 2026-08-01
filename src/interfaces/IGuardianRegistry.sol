@@ -10,7 +10,7 @@ import {IExposureLedger} from "./IExposureLedger.sol";
 ///         lifecycle + multi-asset reward pools only. WOOD custody, guardian
 ///         staking, DPoS delegation, owner bonds, vote checkpoints, and
 ///         slashing moved to `StakedWood` (sWOOD); see `IStakedWood`.
-/// @dev See `docs/superpowers/specs/2026-05-21-swood-staking-split-design.md`.
+/// @dev See `openspec/specs/guardian-staking/spec.md`.
 interface IGuardianRegistry {
     // ── Enums ──
     enum GuardianVoteType {

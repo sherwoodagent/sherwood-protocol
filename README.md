@@ -82,7 +82,10 @@ reports on-venue holdings for vault-side pricing (empty array = Lane B only).
   fees on the way out so exit timing is fee-neutral, and may additionally pay an
   early-exit penalty (≤ 2%, on the portion pulled back from the strategy) that
   accrues to the depositors who stay. Full detail:
-  [`docs/specs/2026-07-24-fee-model-design.md`](docs/specs/2026-07-24-fee-model-design.md).
+  [`openspec/specs/management-fee/spec.md`](openspec/specs/management-fee/spec.md),
+  [`openspec/specs/performance-fee/spec.md`](openspec/specs/performance-fee/spec.md),
+  [`openspec/specs/instant-exit-fees/spec.md`](openspec/specs/instant-exit-fees/spec.md), and
+  [`openspec/specs/fee-splits/spec.md`](openspec/specs/fee-splits/spec.md).
 - **Guardian review** — a `GuardianReview` window (default 24h) sits between `Pending`
   and `Approved`. Guardians stake WOOD (in sWOOD) and review calldata; a block quorum
   rejects the proposal and slashes approvers (WOOD burned). Slash severity is a

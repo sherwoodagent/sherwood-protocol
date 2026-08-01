@@ -8,7 +8,7 @@ pragma solidity 0.8.28;
 ///         lived in `GuardianRegistry`. The slimmed `GuardianRegistry`,
 ///         `SyndicateGovernor`, and `SyndicateFactory` call sWOOD through
 ///         this interface.
-/// @dev See `docs/superpowers/specs/2026-05-21-swood-staking-split-design.md`.
+/// @dev See `openspec/specs/guardian-staking/spec.md`.
 ///      Staking/owner-bond signatures are carried verbatim from the
 ///      pre-split `IGuardianRegistry`. Checkpoint reads are timestamp-keyed
 ///      (EIP-6372 timestamp-mode clock).
