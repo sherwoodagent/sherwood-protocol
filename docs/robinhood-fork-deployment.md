@@ -254,7 +254,108 @@ machinery and is worth including in a full sim.
 
 ---
 
-## 10. Regenerating after a vnet expires
+## 10. Accepted v1 oracle risks (read before wiring feeds)
+
+Two oracle exposures are **accepted for v1**: known, deliberate, and not open
+defects. The oracle hardening in `ExposureLedger` (stale or reverting feeds fall
+back instead of bricking approvals, `woodHaircutBps` applied on the feed path
+*and* every degraded path, `woodPriceDetail()` for observability) makes the
+remaining exposure easy to mistake for zero. It is not zero, and neither of the
+two is detectable on-chain — both are the operator's problem.
+
+### 10.1 Chainlink aggregators clamp at `minAnswer` / `maxAnswer`
+
+Every Chainlink aggregator answers inside a fixed band. If the market leaves the
+band, `latestRoundData()` keeps returning the bound, with a fresh `updatedAt` and
+a positive answer. Nothing in `ExposureLedger` can see that: its checks are
+`answer <= 0` and `age > maxDelay`, and a clamped price passes both.
+
+The dangerous direction is **downward, and it is anti-conservative**:
+
+- **`coverageUsd(asset, amount)`** returns *less* than the position is worth when
+  the asset feed is pinned at `minAnswer`. `requireApproveQuorum` then demands
+  **less** guardian collateral than the risk warrants — during exactly the
+  collapse that pinned the feed, i.e. when the valuation matters most.
+  Downstream, `proposerBondWood` (sized off `coverageUsd`) is under-sized the
+  same way.
+- **`woodPriceX8()`** carries the same exposure on the WOOD feed, and it prices
+  the *other* side of the check (`slashableBondUsd` = guardian stake × this
+  price). A WOOD feed clamped at `maxAnswer` over-values every guardian bond, so
+  quorums clear on collateral that is not there. `woodHaircutBps` helps but does
+  **not bound a clamp**: it is a fixed discount (floor `MIN_WOOD_HAIRCUT_BPS` =
+  5000 bps, so at most a 50% shave), not an error bound.
+
+Affected read paths: `coverageUsd` (asset side) and `woodPriceX8` →
+`slashableBondUsd` / `proposerBondWood` (WOOD side).
+
+Operator handling, since the contract cannot detect it:
+
+1. **Before wiring**, read each aggregator's `minAnswer` / `maxAnswer` (on the
+   underlying aggregator, not the proxy) and confirm the band leaves real
+   headroom around plausible crash and spike prices for that asset.
+2. **Monitor off-chain**: alert when an on-chain feed answer sits at either
+   bound, or diverges from an independent reference beyond a threshold. That
+   alert is the only signal you get.
+3. **Response is manual and owner-only.** WOOD side: `setWoodFeed(address(0), 0)`
+   clears the feed and returns pricing to the governance fallback, then walk
+   `setWoodUsdPrice` to a conservative number (downward moves are deliberately
+   unbounded; upward is capped at 2x per `MIN_PRICE_UPDATE_INTERVAL` = 1 day, as
+   is `setWoodHaircutBps`). Asset side: `setAssetFeed` **rejects the zero
+   address**, so there is no unwire — recovery means pointing the asset at a
+   replacement aggregator, or accepting that the asset stays mispriced.
+
+### 10.2 No sequencer-uptime feed on Robinhood 4663
+
+The standard L2 pattern is to gate every price read on a sequencer-uptime feed
+plus a grace period, so reads are rejected while the sequencer is down and for a
+window after it restarts. **Robinhood Chain 4663 publishes no sequencer-uptime
+feed**, so that gate cannot be built here: there is no address to pass. The repo
+does carry the fail-closed reader (`src/libraries/ChainlinkReader.sol`, with
+`SequencerDown` / `GracePeriodNotOver`), but it requires a `sequencerUptimeFeed`
+argument and is therefore unused on this chain; `ExposureLedger` reads the
+aggregator directly.
+
+Consequence: a read that looks fresh may predate an outage. `updatedAt` bounds
+how old the *answer* is, not whether the chain was accepting transactions in
+between — so a proposal can be coverage-checked, approved and executed on prices
+from before a downtime window, at a valuation the staleness check accepted.
+
+Operator handling: size `ASSET_FEED_MAX_DELAY` (and the WOOD feed's `maxDelay`)
+tightly enough that a plausible outage pushes reads past staleness rather than
+through it — while staying long enough to cover the full vote + review + execute
+lifecycle, since a `maxDelay` shorter than that lifecycle kills fully covered
+proposals at execution with `StalePrice`. Treat post-outage restarts as a manual
+hold: do not execute or settle across a known downtime window until feeds have
+visibly re-published.
+
+Revisit both of the above when 4663 gets a sequencer-uptime feed.
+
+### 10.3 `woodUsdPriceX8` stays load-bearing after a WOOD feed is wired
+
+Wiring a Chainlink WOOD feed with `setWoodFeed(feed, maxDelay)` does **not**
+retire the governance price. `_woodPrice()` falls back to
+`_haircut(woodUsdPriceX8)` on all four degraded shapes — feed unset, non-positive
+answer, `age > maxDelay`, and a reverting aggregator — because failing closed
+here would value every bond at $0 and halt approvals protocol-wide on a Chainlink
+hiccup.
+
+So an abandoned manual number does not fail loudly; it silently values every
+bond. `woodUsdPriceX8` carries no `updatedAt` of its own, which means "feed
+healthy" and "feed dead for three months, running on a manual number nobody has
+touched" are indistinguishable from the outside unless you look.
+
+Operator duties after wiring a feed:
+
+- **Keep maintaining `woodUsdPriceX8`** on the same cadence as before, as a
+  conservative floor. It is a live fallback, not a deploy-time leftover.
+- **Poll `woodPriceDetail()`** — it returns `(price, usingFallback)`. Alert on
+  `usingFallback == true` persisting beyond a short blip, and on a fallback price
+  that has not been refreshed recently. This is the only observable for the
+  degraded path: there is no event.
+
+---
+
+## 11. Regenerating after a vnet expires
 
 1. Mint a new Tenderly vnet (same fork target). Update `TENDERLY_ROBINHOOD_RPC_URL`
    (admin) in `contracts/.env` and the public-RPC constants in the CLI/app if the
