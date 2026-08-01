@@ -163,6 +163,10 @@ contract MockRegistryMinimal is IGuardianRegistry {
         revert NotImplemented();
     }
 
+    function getApproverCoverage(address, uint256) external pure returns (address[] memory, uint256[] memory, bool) {
+        revert NotImplemented();
+    }
+
     /// @dev Read by `ProposalLifecycle._afterVote` in place of the old
     ///      `getReviewState` 4-tuple. `Cleared` is the exact translation of this
     ///      mock's long-standing default (`resolved = true, blocked = false`):
