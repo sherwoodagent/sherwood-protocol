@@ -580,6 +580,116 @@ contract CompensationEndToEndTest is Test {
         assertEq(wood.balanceOf(lp2), paid);
     }
 
+    /// @notice PR #56 review M6. The pull and the distribution are decoupled
+    ///         across calls — a keeper batches ids — so a governance re-point
+    ///         landing BETWEEN them used to strand the undistributed remainder
+    ///         in the queue forever: `claimCompensation` resolves the NEW
+    ///         escrow, finds nothing pulled under it, and tries to pull a
+    ///         same-numbered case that belongs to a different escrow entirely.
+    ///         `distributeCompensation` finishes the old case from the recorded
+    ///         pull.
+    function test_M6_repointMidDistributionDoesNotStrandTheRemainder() public {
+        VaultWithdrawalQueue q = new VaultWithdrawalQueue(address(vault));
+        // Three custody requests so one batch can pay a strict subset.
+        uint256 idA = _queueCustody(q, lp1, LP1_SHARES / 2, 1);
+        uint256 idB = _queueCustody(q, lp1, LP1_SHARES / 2, 1);
+        uint256 idC = _queueCustody(q, lp2, LP2_SHARES, 1);
+
+        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        snapTs = vm.getBlockTimestamp();
+        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        openedAt = vm.getBlockTimestamp();
+        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        (uint256 caseId,) = _verdictSlash();
+
+        // ── First batch: pulls the WHOLE case, distributes one third of it.
+        uint256[] memory first = new uint256[](1);
+        first[0] = idA;
+        (uint256 firstPaid,,) = q.claimCompensation(caseId, first);
+        assertGt(firstPaid, 0, "the first batch paid its id");
+
+        (uint256 total,,,, bool pulled) = q.compensationCase(address(escrow), caseId);
+        assertTrue(pulled, "the case is pulled and booked under escrow A");
+        uint256 remainder = wood.balanceOf(address(q));
+        assertEq(remainder, total - firstPaid, "the other two owners' share now sits in the queue");
+        assertGt(remainder, 0, "there is something left to strand");
+
+        // ── Governance re-points the factory at a DIFFERENT escrow.
+        CompensationEscrow escrowB = new CompensationEscrow(owner, address(wood));
+        compensationEscrow = address(escrowB);
+
+        // THE BUG: the money path resolves B, sees nothing pulled under B, and
+        // reaches for B's case with the same id — which is not this vault's
+        // case (ids are per-escrow). Pre-fix this was the ONLY payout path, so
+        // `remainder` was unreachable for good.
+        uint256[] memory rest = new uint256[](2);
+        rest[0] = idB;
+        rest[1] = idC;
+        vm.expectRevert(IVaultWithdrawalQueue.NotCompensationCase.selector);
+        q.claimCompensation(caseId, rest);
+        assertEq(wood.balanceOf(address(q)), remainder, "still stranded via the pull path");
+
+        // THE FIX: distribute the case from the escrow it was PULLED from. No
+        // pull, no call to the escrow — only the pin written at pull time.
+        uint256 lp2Before = wood.balanceOf(lp2);
+        (uint256 paid, uint256 processed, uint256 skipped) = q.distributeCompensation(address(escrow), caseId, rest);
+        assertEq(processed, 2, "both remaining owners credited");
+        assertEq(skipped, 0, "nothing passed over");
+        assertGt(wood.balanceOf(lp2) - lp2Before, 0, "the second remaining owner was paid too");
+        // The remainder moves in full bar the per-payout floor: each share is
+        // `mulDiv(total, amount, votes)` and two floors can shed at most 1 wei
+        // each. That sub-wei dust stranding is the queue's documented rounding
+        // policy, NOT the M6 strand — the point is that the 10,833 WOOD is
+        // reachable at all.
+        assertApproxEqAbs(paid, remainder, 2, "the whole remainder moved (bar floor dust)");
+        assertLt(wood.balanceOf(address(q)), 3, "only rounding dust left in the queue");
+
+        // Idempotent: the same ids cannot be paid twice off the old escrow.
+        vm.expectRevert(IVaultWithdrawalQueue.NoEligibleRequests.selector);
+        q.distributeCompensation(address(escrow), caseId, rest);
+    }
+
+    /// @notice PR #56 review M6, the other half: the remainder path must not
+    ///         reopen 🔴N1. `distributeCompensation` takes an escrow ADDRESS,
+    ///         so prove it is a mapping key and never a callee — an escrow this
+    ///         queue never pulled from is refused outright, including the real
+    ///         one before its case has been pulled.
+    function test_M6_distributeCannotIntroduceACallerChosenEscrow() public {
+        VaultWithdrawalQueue q = new VaultWithdrawalQueue(address(vault));
+        uint256 reqId = _queueCustody(q, lp2, LP2_SHARES, 1);
+
+        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        snapTs = vm.getBlockTimestamp();
+        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        openedAt = vm.getBlockTimestamp();
+        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        (uint256 caseId,) = _verdictSlash();
+
+        uint256[] memory ids = new uint256[](1);
+        ids[0] = reqId;
+
+        // An arbitrary address (here an EOA — it has no `caseOf`/`wood`/`redeem`
+        // to call at all) is rejected on the recorded-pull check, not on a
+        // failed external call. Nothing was pulled under it, so nothing pays.
+        address hostile = makeAddr("hostileEscrow");
+        vm.expectRevert(IVaultWithdrawalQueue.CaseNotPulled.selector);
+        q.distributeCompensation(hostile, caseId, ids);
+
+        // Even the REAL escrow is refused before its case has been pulled by
+        // the governance-resolved path — distribute-only means distribute-only.
+        vm.expectRevert(IVaultWithdrawalQueue.CaseNotPulled.selector);
+        q.distributeCompensation(address(escrow), caseId, ids);
+        assertGt(escrow.claimable(caseId, address(q)), 0, "the claim is untouched at the escrow");
+        assertEq(wood.balanceOf(address(q)), 0, "and nothing was pulled into the queue");
+
+        // Only after the governance-wired pull does the key become selectable,
+        // and the payout still uses the token pinned at pull time.
+        (uint256 paid,,) = q.claimCompensation(caseId, ids);
+        assertGt(paid, 0, "the honest path pays");
+        (,,, address pinned,) = q.compensationCase(address(escrow), caseId);
+        assertEq(pinned, address(wood), "unit still pinned at pull time");
+    }
+
     // ── 6. PR #24 review 🟠2 / 🟠4: slashToEscrow input hardening ─────────
 
     /// @notice `openedAt` must be a real past instant.

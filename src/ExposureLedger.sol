@@ -225,11 +225,25 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     /// @dev Total USD RESERVED by all approvers of a proposal — which runs to
     ///      A x coverage while the review is open, NOT to `coverage`. Each
     ///      approver reserves up to the whole thing because any one of them
-    ///      might end up carrying it alone; `settleCoverage` collapses this to
-    ///      the real aggregate once the set is final. It is also the denominator
-    ///      the pro-rata split divides by, so it has to reflect reservations
-    ///      rather than allocations until then.
+    ///      might end up carrying it alone.
+    ///
+    ///      IT STAYS THE RESERVATION TOTAL FOR THE LIFE OF THE KEY. It used to
+    ///      be overwritten with the settled aggregate, which made settlement a
+    ///      one-way door: the basis it divided by was destroyed by the first
+    ///      pass, so a pass taken at a bad instant could never be re-derived.
+    ///      Only `recordApproval` and `releaseApproval` move it now.
     mapping(bytes32 reviewKey => uint256 usd) internal _committedUsd;
+
+    /// @dev The reservation `recordApproval` booked, preserved verbatim while
+    ///      the approver is listed.
+    ///
+    ///      `_recorded[key][g].usd` is the guardian's CURRENT booking, and
+    ///      `settleCoverage` rewrites it; this is the immutable input that
+    ///      rewrite is derived FROM. Keeping the two apart is what makes
+    ///      settlement re-runnable rather than a latch — see `settleCoverage`,
+    ///      where the whole H1 write-down-at-a-trough problem lives. Costs one
+    ///      SSTORE per approval and refunds it on release.
+    mapping(bytes32 reviewKey => mapping(address guardian => uint256 usd)) internal _reservedUsd;
 
     /// @dev The ledger's own approver list per proposal, plus a 1-indexed
     ///      POSITION (not a flag) so `releaseApproval` can swap-and-pop in O(1)
@@ -238,9 +252,15 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      books commitments itself, so it needs no external opinion about who
     ///      approved, and the ledger's and governor's registry pointers can
     ///      therefore never disagree (review finding I-1).
-    /// @dev Set once `settleCoverage` has converted reservations into
-    ///      allocations for a proposal. Guards against a second pass, which
-    ///      would re-divide already-settled numbers against a shrunken total.
+    /// @dev Whether `settleCoverage` has run at least once for a proposal.
+    ///
+    ///      OBSERVABILITY ONLY — it no longer gates. It used to block a second
+    ///      pass, on the reasoning that re-running would "re-divide
+    ///      already-settled numbers against a shrunken total". That was true of
+    ///      the old code and it was the wrong fix: the shrunken total was the
+    ///      bug (settlement destroyed its own basis), and latching it made every
+    ///      mis-priced pass permanent. `_reservedUsd` keeps the basis, so a
+    ///      re-run recomputes from the same inputs instead of compounding.
     mapping(bytes32 reviewKey => bool) internal _settled;
 
     mapping(bytes32 reviewKey => address[]) internal _approversOf;
@@ -370,9 +390,25 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         return _woodPrice();
     }
 
+    /// @dev EVERY failure mode of the aggregator falls back, including a bare
+    ///      REVERT — the fourth block-only path, sibling of M3/N1/N4. Unset and
+    ///      stale were already handled; a reverting `latestRoundData` was not,
+    ///      and it propagated all the way up:
+    ///      `_woodPrice` -> `slashableBondUsd` -> `recordApproval`, which reads
+    ///      the bond OUTSIDE the try/catch guarding the asset feed, so approve
+    ///      votes reverted while Block votes still worked; and
+    ///      `requireApproveQuorum` reverted with it, blocking execution
+    ///      protocol-wide. With `setWoodFeed(address(0), …)` previously refused
+    ///      there was no unwire either, so one bad aggregator bricked coverage
+    ///      with no governance path back. Both halves are closed: this catches,
+    ///      and the setter unwires.
+    ///
+    ///      `code.length` is checked FIRST because Solidity's extcodesize guard
+    ///      on a high-level call to a codeless address reverts in THIS frame,
+    ///      which `try` cannot catch — the same reason `setGuardianRegistry`
+    ///      guards its tolerant read that way.
     function _woodPrice() internal view returns (uint256 price, bool usingFallback) {
         AssetFeed storage f = _woodFeed;
-        if (f.feed == address(0)) return (_haircut(woodUsdPriceX8), true);
         // A REVERTING feed is a fourth degraded shape, and it was the one left
         // unhandled. The three below model a feed that answers badly; an
         // aggregator with no round published answers not at all ("No data
@@ -384,7 +420,13 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         // WOOD feed failed the VOTE — the block-only review this contract's
         // review history exists to prevent. Falling back keeps the same
         // fail-degraded stance the other three shapes already take.
-        try IAggregatorMinimal(f.feed).latestRoundData() returns (
+        //
+        // `code.length` FIRST: `try` cannot catch the extcodesize revert a
+        // high-level call to a codeless address raises in THIS frame, so a
+        // zeroed proxy would still propagate past the wrap below.
+        address feed = f.feed;
+        if (feed == address(0) || feed.code.length == 0) return (_haircut(woodUsdPriceX8), true);
+        try IAggregatorMinimal(feed).latestRoundData() returns (
             uint80, int256 answer, uint256, uint256 updatedAt, uint80
         ) {
             if (answer <= 0) return (_haircut(woodUsdPriceX8), true);
@@ -488,28 +530,40 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         woodUsdPriceX8 = newPriceX8;
     }
 
-    /// @dev Re-pointing the registry ORPHANS exposures booked under the old
-    ///      registry: releaseApproval is registry-gated, so entries recorded
-    ///      by the old registry become unreleasable and only self-heal when
-    ///      their buckets expire (end of epoch + challenge window). Re-point
-    ///      only at low open exposure.
-    /// @dev CLEARING IS SUPPORTED: `setWoodFeed(address(0), 0)` unwires the feed
-    ///      and returns pricing to the governance fallback. Without it, wiring a
-    ///      bad aggregator was a one-way door — the zero-address rejection meant
-    ///      recovery required DEPLOYING a substitute aggregator contract first,
-    ///      while every Approve vote and every tier-gated execute stayed halted.
-    ///      Requiring `maxDelay == 0` alongside keeps the clear explicit, so a
-    ///      mis-typed address with a real delay still reverts rather than
-    ///      silently disabling the feed.
+    /// @notice Wire (or UNWIRE) the Chainlink WOOD/USD feed.
+    ///
+    /// @dev    ZERO IS THE UNWIRE SWITCH and it is load-bearing, not a
+    ///         convenience. Refusing it left the ledger with no way back from a
+    ///         bad aggregator: every coverage path prices bonds through
+    ///         `_woodPrice`, so a feed that reverts, or one wired at the wrong
+    ///         address, took `recordApproval` and `requireApproveQuorum` with it
+    ///         protocol-wide. `_woodPrice` now catches that, and this is the
+    ///         other half — the deliberate return to the governance price.
+    ///
+    ///         Unwiring is SAFE in the direction that matters: it falls back to
+    ///         `woodUsdPriceX8`, which is haircut on the same terms as the feed
+    ///         and is documented as a maintained conservative floor rather than
+    ///         an abandoned one. It is not free — the manual number lags a crash
+    ///         — so it is a degraded mode, not a resting state.
+    ///
+    ///         UNWIRING MUST BE SPELLED `setWoodFeed(address(0), 0)`. There is no
+    ///         feed left to time out, so `maxDelay` carries no meaning here — but
+    ///         it is REQUIRED to be zero rather than merely ignored, so that a
+    ///         mis-typed feed address paired with a real delay reverts instead of
+    ///         silently dropping the ledger onto the governance price.
     function setWoodFeed(address feed, uint256 maxDelay) external onlyOwner {
         if (feed == address(0)) {
+            // `maxDelay` must be zero too: a mis-typed address paired with a real
+            // delay then reverts instead of silently unwiring the feed.
             if (maxDelay != 0) revert InvalidParameter();
             delete _woodFeed;
             emit WoodFeedSet(address(0), 0);
             return;
         }
-        if (maxDelay == 0) revert InvalidParameter();
+        if (maxDelay == 0 || maxDelay > type(uint64).max) revert InvalidParameter();
         uint8 feedDecimals = IAggregatorMinimal(feed).decimals();
+        // maxDelay bounded to type(uint64).max above; cast cannot truncate.
+        // forge-lint: disable-next-line(unsafe-typecast)
         _woodFeed = AssetFeed({
             feed: feed,
             maxDelay: uint64(maxDelay),
@@ -741,7 +795,11 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      enforced by committing zero, not by reverting the vote (review N1).
     function recordApproval(address governor, uint256 proposalId, address guardian) external onlyRegistry {
         bytes32 key = _reviewKey(governor, proposalId);
-        if (_recorded[key][guardian].usd != 0) return; // idempotent (vote-change round trip)
+        // Idempotent (vote-change round trip). Keyed on the PLEDGE, not the live
+        // booking: `settleCoverage` can write a booking down to zero without the
+        // guardian having left, and keying on `_recorded` there would let a
+        // repeat call re-book and double-count `_committedUsd`.
+        if (_reservedUsd[key][guardian] != 0) return;
         ILedgerGovernorMinimal gov = ILedgerGovernorMinimal(governor);
         ILedgerGovernorMinimal.ProposalViewLite memory pv = gov.getProposalView(proposalId);
         address asset = IVaultAssetMinimal(pv.vault).asset();
@@ -851,6 +909,10 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         // approach 2^64 on any realistic timescale.
         // forge-lint: disable-next-line(unsafe-typecast)
         _recorded[key][guardian] = RecordedExposure({usd: uint192(share), epoch: uint64(epoch)});
+        // The same number in two places on purpose: `_recorded` is the live
+        // booking and `settleCoverage` rewrites it, `_reservedUsd` is the
+        // pledge and nothing but a release clears it.
+        _reservedUsd[key][guardian] = share;
         _committedUsd[key] += share;
         // The ledger keeps its OWN approver list: the quorum reads this, never
         // the registry, so the ledger's registry pointer and the governor's can
@@ -875,11 +937,16 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         // A live challenge pins this coverage (§3.4): the guardian may not
         // release it and recycle the budget while under challenge.
         if (_frozen[key]) revert CoverageFrozen();
+        uint256 reserved = _reservedUsd[key][guardian];
+        if (reserved == 0) return;
         RecordedExposure memory r = _recorded[key][guardian];
-        if (r.usd == 0) return;
         delete _recorded[key][guardian];
+        delete _reservedUsd[key][guardian];
+        // The BUCKET releases the live booking, `_committedUsd` releases the
+        // PLEDGE — the two diverge once `settleCoverage` has run, and each
+        // counter has to be unwound with the number that was added to it.
         _buckets[guardian][r.epoch] -= r.usd;
-        _committedUsd[key] -= r.usd;
+        _committedUsd[key] -= reserved;
 
         // Swap-and-pop out of the approver list (review M2). Leaving the entry
         // behind was harmless per-iteration — every reader skips a zero
@@ -1346,9 +1413,52 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      PERMISSIONLESS and SAFE TO SKIP. If nobody ever calls it the budget
     ///      simply stays over-reserved until the bucket expires, exactly as
     ///      today — conservative, never unsafe. So no keeper is load-bearing.
+    ///
+    /// @dev RE-RUNNABLE, AND THAT IS THE SECURITY PROPERTY (review H1). This
+    ///      used to be a ONE-SHOT that wrote every approver's booking down to a
+    ///      figure priced at the caller's chosen instant, and `_settled` made
+    ///      the figure permanent. When the cohort's live value had dipped below
+    ///      `needUsd`, `_allocate` returned each approver's `min(live, pledge)`
+    ///      unchanged, so every booking was pinned at the dollar value of that
+    ///      bond AT THE TROUGH and never re-scaled when WOOD recovered.
+    ///
+    ///      Worked case that motivated the fix — two approvers, 100k WOOD each,
+    ///      $8,000 of coverage:
+    ///        - settled at $0.05: $4,000 each, $8,000 recoverable;
+    ///        - settled at $0.025, WOOD then back to $0.05: $5,500 + $2,500 with
+    ///          the old unbounded residue, $7,500 recoverable. Permanently, for
+    ///          the cost of gas at a chosen block — and any approver is
+    ///          motivated to be that caller.
+    ///
+    ///      THE FIX IS TO REMOVE THE LATCH, not to pick a better instant. There
+    ///      is no instant that is right in advance: the write-down depends on a
+    ///      WOOD price and an asset price that both move after settling, so ANY
+    ///      single pass is a guess. `_reservedUsd` keeps the pledges the pass
+    ///      divides, so every call re-derives the whole split from unchanged
+    ///      inputs at the CURRENT price, up or down, and no earlier pass can
+    ///      bind a later one. A settlement taken at a trough is now a stale
+    ///      number anyone can refresh — including, in the same transaction, a
+    ///      challenger about to file or a resolver about to price a conviction.
+    ///
+    ///      DELIBERATELY NOT GATED ON `_frozen`, which was the other candidate.
+    ///      Freezing the numbers during a challenge sounds protective and is
+    ///      backwards here: the trough pass happens BEFORE the challenge exists
+    ///      (the drain has to happen first), so a freeze gate would latch
+    ///      exactly the figure that needs correcting, at exactly the moment
+    ///      correcting it matters. Re-derivation is monotone-optimal instead —
+    ///      each run books every approver at `min(live bond, pledge)` scaled to
+    ///      the need, which is the most the cohort can pay at that instant — so
+    ///      there is no direction in which an adversarial re-run helps: at a
+    ///      trough the live bonds are low too, and the slash is clamped to them
+    ///      either way.
+    ///
+    ///      The remaining cost of re-running is that a booking can grow again,
+    ///      re-consuming budget and holding the exit gate. It is bounded by the
+    ///      guardian's own pledge, i.e. by exactly what they would have been
+    ///      holding had nobody ever settled, so it can only walk back toward the
+    ///      un-settled baseline and never past it.
     function settleCoverage(address governor, uint256 proposalId) external {
         bytes32 key = _reviewKey(governor, proposalId);
-        if (_settled[key]) return;
 
         ILedgerGovernorMinimal gov = ILedgerGovernorMinimal(governor);
         ILedgerGovernorMinimal.ProposalViewLite memory pv = gov.getProposalView(proposalId);
@@ -1391,78 +1501,119 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         } catch {
             return; // unpriceable right now; retry later rather than mis-settle
         }
-        // Under-subscribed: every approver already carries its whole
-        // reservation, so there is nothing to hand back.
-        if (reservedTotal <= needUsd) {
-            _settled[key] = true;
-            return;
-        }
 
         address[] storage listed = _approversOf[key];
         uint256 n = listed.length;
         uint256 assigned;
-        address firstHolder;
         // Same effective basis as `allocatedUsd` (review n1): a guardian whose
-        // bond has gone must not dilute the survivors' shares.
+        // bond has gone must not dilute the survivors' shares. Summed over the
+        // PLEDGES rather than over the live bookings, because the bookings are
+        // what this function is about to rewrite — dividing by them would make
+        // each pass depend on the last, which is the compounding `_settled`
+        // used to prevent by refusing to run twice.
         uint256 priceX8 = woodPriceX8();
-        uint256 effectiveTotal = _effectiveTotal(key, priceX8);
+        uint256 effectiveTotal = _effectiveReservedTotal(key, priceX8);
         if (effectiveTotal == 0) {
             _settled[key] = true;
             return;
         }
 
+        // Per-approver room left between the allocation and what that approver
+        // could actually pay. The residue below may not exceed it.
+        uint256[] memory headroom = new uint256[](n);
+
         for (uint256 i = 0; i < n; i++) {
             address g = listed[i];
-            RecordedExposure memory r = _recorded[key][g];
-            if (r.usd == 0) continue;
-            if (firstHolder == address(0)) firstHolder = g;
+            uint256 reserved = _reservedUsd[key][g];
+            if (reserved == 0) continue; // released via a vote change
 
             uint256 liveG = _slashableBondUsd(g, priceX8);
-            uint256 mine = liveG < uint256(r.usd) ? liveG : uint256(r.usd);
+            uint256 mine = liveG < reserved ? liveG : reserved;
             uint256 alloc = _allocate(mine, effectiveTotal, needUsd);
             assigned += alloc;
-            // `alloc <= mine <= r.usd`, so this cannot underflow.
-            uint256 excess = uint256(r.usd) - alloc;
-            if (excess != 0) {
-                _buckets[g][r.epoch] -= excess;
-                // `alloc <= r.usd`, itself a uint192.
-                // forge-lint: disable-next-line(unsafe-typecast)
-                _recorded[key][g].usd = uint192(alloc);
+            headroom[i] = mine - alloc; // `_allocate` never scales up: alloc <= mine
+            _rebook(key, g, alloc);
+        }
+
+        // Truncation leaves the total a few wei under `needUsd`. Hand the
+        // residue out rather than leaving it short: the quorum compares this
+        // same aggregate against `needUsd`, so a rounded-down sum would make a
+        // fully-subscribed proposal fail its own coverage check after settling.
+        //
+        // BOUNDED BY EACH HOLDER'S OWN HEADROOM (review M1). The old code
+        // credited the whole residue to the first holder on the assumption that
+        // it was truncation dust. It is dust only when `effectiveTotal >
+        // needUsd`. When the cohort's live value has fallen BELOW the need,
+        // `_allocate` returns `mine` for everyone, `assigned` is the whole
+        // `effectiveTotal`, and the "residue" is the entire COHORT SHORTFALL.
+        // Handing that to one guardian scaled its booking above its own pledge
+        // and past `k x bond` — the reproduction was a $600 pledge booked at
+        // $950 — which contradicts `_allocate`'s own rule that scaling up
+        // "would invent collateral nobody pledged", and grieves that guardian's
+        // budget for a full bucket lifetime over a liability it never took on.
+        //
+        // Capping each top-up at `mine - alloc` bounds the booking by
+        // `min(live bond, pledge)`, which is both the guardian's pledge and the
+        // most a conviction could ever take from it — crediting past that would
+        // consume budget that buys no recovery. In the shortfall case every
+        // headroom is zero, so nothing is handed out and the aggregate lands
+        // UNDER `needUsd`. That is the honest answer and it costs the quorum
+        // nothing: `requireApproveQuorum` sums `min(live, booked)`, which is the
+        // same `effectiveTotal` it would have summed had this never run, so the
+        // proposal fails its coverage check exactly as it already would have.
+        // Settling neither creates nor destroys coverage — it only stops
+        // over-reserving for it.
+        if (assigned < needUsd) {
+            uint256 residue = needUsd - assigned;
+            for (uint256 i = 0; i < n && residue != 0; i++) {
+                uint256 room = headroom[i];
+                if (room == 0) continue;
+                uint256 take = room < residue ? room : residue;
+                address g = listed[i];
+                _rebook(key, g, uint256(_recorded[key][g].usd) + take);
+                residue -= take;
+                assigned += take;
             }
         }
 
-        // Truncation leaves the total a few wei under `needUsd`. Give the
-        // residue to the first holder rather than leaving it short: the quorum
-        // compares this same aggregate against `needUsd`, so a rounded-down sum
-        // would make a fully-subscribed proposal fail its own coverage check
-        // after settling — the mirror of the dust bug the quorum already avoids
-        // by summing reservations.
-        // GATED ON THE OVER-SUBSCRIBED BRANCH. `_allocate` only divides — and so
-        // only truncates — when `effectiveTotal > needUsd`; below that it returns
-        // each reservation unscaled, making `assigned == effectiveTotal`. The
-        // early return above guards `reservedTotal`, which is the RESERVED total
-        // rather than the payable one, so a cohort whose bonds shrank between the
-        // vote and settling lands here with `needUsd - assigned` being a genuine
-        // coverage SHORTFALL, not dust. Crediting that to the first holder booked
-        // exposure it never reserved, above its own `kNumerator *
-        // slashableBondUsd` cap — freezing that guardian's approve budget and its
-        // unstake claim for the rest of the bucket's life, on a victim any
-        // approver could select via `releaseApproval`'s swap-and-pop. An
-        // under-covered proposal stays under-covered: inventing collateral nobody
-        // pledged is precisely what `_allocate` refuses to do when it declines to
-        // scale UP.
-        if (effectiveTotal > needUsd && assigned < needUsd && firstHolder != address(0)) {
-            uint256 residue = needUsd - assigned;
-            RecordedExposure memory rf = _recorded[key][firstHolder];
-            _buckets[firstHolder][rf.epoch] += residue;
-            // forge-lint: disable-next-line(unsafe-typecast)
-            _recorded[key][firstHolder].usd = uint192(uint256(rf.usd) + residue);
-            assigned = needUsd;
-        }
-
-        _committedUsd[key] = assigned;
         _settled[key] = true;
         emit CoverageSettled(key, reservedTotal, assigned);
+    }
+
+    /// @dev Move a guardian's live booking to `target`, keeping its epoch bucket
+    ///      in step. Both directions: settlement is re-runnable, so a booking
+    ///      that was written down at a bad price has to be able to walk back up.
+    ///      `target` is always `<= _reservedUsd[key][g]`, which `recordApproval`
+    ///      bounded to `uint192`, so neither the cast nor the bucket arithmetic
+    ///      can misbehave — the bucket was incremented by the pledge and every
+    ///      subsequent booking is a fraction of it.
+    function _rebook(bytes32 key, address g, uint256 target) internal {
+        RecordedExposure memory r = _recorded[key][g];
+        uint256 current = uint256(r.usd);
+        if (target == current) return;
+        if (target < current) {
+            _buckets[g][r.epoch] -= (current - target);
+        } else {
+            _buckets[g][r.epoch] += (target - current);
+        }
+        // forge-lint: disable-next-line(unsafe-typecast)
+        _recorded[key][g].usd = uint192(target);
+    }
+
+    /// @dev `_effectiveTotal` over the PLEDGES rather than the live bookings.
+    ///      The two coincide until `settleCoverage` first runs and diverge
+    ///      afterwards; settlement needs this one, because it is rewriting the
+    ///      very numbers `_effectiveTotal` reads and must divide by an input its
+    ///      own previous passes did not move.
+    function _effectiveReservedTotal(bytes32 key, uint256 priceX8) internal view returns (uint256 total) {
+        address[] storage listed = _approversOf[key];
+        uint256 n = listed.length;
+        for (uint256 i = 0; i < n; i++) {
+            uint256 reserved = _reservedUsd[key][listed[i]];
+            if (reserved == 0) continue;
+            uint256 live = _slashableBondUsd(listed[i], priceX8);
+            total += live < reserved ? live : reserved;
+        }
     }
 
     /// @dev Pro-rata scale-back of one reservation. Under-subscribed
@@ -1476,6 +1627,14 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      leaves the aggregate a few wei short of `needUsd`, which the caller
     ///      absorbs — `requireApproveQuorum` compares against the same rounded
     ///      sum it just built, so the comparison stays self-consistent.
+    ///
+    ///      TWO REGIMES, and `settleCoverage`'s residue top-up must not conflate
+    ///      them (review M1). Above `needUsd` the shortfall this leaves really
+    ///      is dust, at most one wei per approver. At or below it the function
+    ///      returns `reserved` untouched, `assigned` comes out equal to the
+    ///      cohort's whole effective total, and the gap to `needUsd` is the
+    ///      cohort SHORTFALL rather than rounding — not something a top-up may
+    ///      paper over, because the collateral to cover it does not exist.
     function _allocate(uint256 reserved, uint256 reservedTotal, uint256 needUsd) internal pure returns (uint256) {
         if (reservedTotal <= needUsd) return reserved;
         return (reserved * needUsd) / reservedTotal;

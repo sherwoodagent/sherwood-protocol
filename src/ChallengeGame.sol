@@ -153,13 +153,66 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      the victims' compensation instead of bubbling. The floor is sized
     ///      per approver plus a base: the slash loop runs before `openCase`,
     ///      so a flat floor would let a large batch consume it before the
-    ///      call that needs protecting. ~300k/approver covers `_slashOne`
-    ///      plus the O(n²) dedup share at the 100-approver cap; the 1M base
-    ///      leaves the `openCase` child (~150-200k observed) a >5x margin
-    ///      after 63/64 forwarding, with the parent's burn/bubble branch
-    ///      still affordable behind it.
-    uint256 internal constant SLASH_GAS_PER_APPROVER = 300_000;
-    uint256 internal constant SLASH_GAS_BASE = 1_000_000;
+    ///      call that needs protecting.
+    ///
+    ///      A FLOOR MUST ALSO BE REACHABLE, WHICH THIS ONE WAS NOT (PR #56
+    ///      review H2). At the previous 300k/1M the full-cap floor was
+    ///      `100 * 300_000 + 1_000_000 = 31,000,000` — read INSIDE
+    ///      `ChallengeGame.rule`, two `CALL`s below an EOA on the court path
+    ///      (`finalize` -> `rule`; `_settle` is private and adds no frame,
+    ///      and neither contract is proxied). Robinhood Chain (4663) caps a
+    ///      transaction at `maxTxGasLimit = 32,000,000`
+    ///      (`ArbGasInfo.getGasAccountingParams()`, probed on mainnet
+    ///      2026-07-24 — the block `gasLimit` field is Orbit's 2^50 "no block
+    ///      cap" sentinel, so the per-tx limit is the binding one). Two
+    ///      EIP-150 haircuts put 31,000,000 out of reach of ANY transaction,
+    ///      so a conviction against a full cohort could not be mined at all:
+    ///      `finalize` bubbles the revert (it swallows only `WrongStatus`),
+    ///      the case sits in `Voting`, and the challenge times out through
+    ///      `resolve` -> `_fail`, ACQUITTING the accused and paying them the
+    ///      challenger's forfeited bond. A gas floor that converts a guilty
+    ///      verdict into an acquittal is worse than the mid-array
+    ///      out-of-gas it was written to prevent.
+    ///
+    ///      THE NUMBERS ARE NOW MEASURED, NOT ESTIMATED
+    ///      (`test/SlashGasCeiling.t.sol`). A conviction run end to end
+    ///      against the real stack — court `finalize`, every approver
+    ///      carrying a real non-zero rate, so every one is a genuine
+    ///      `_slashOne` — costs:
+    ///
+    ///          4 approvers      713,853
+    ///         52 approvers    5,428,313
+    ///        100 approvers   11,176,224
+    ///
+    ///      which fits `~224*n^2 + 85,659*n + 367,629`: a ~368k fixed base,
+    ///      ~86k of linear work per approver, and `slashToEscrow`'s O(n²)
+    ///      pairwise dedup scan at ~224 gas per pair (2.24M of the total at
+    ///      the cap). Average cost per approver at the cap is ~108k; the
+    ///      MARGINAL cost of the hundredth is ~130k. 300k was therefore
+    ///      2.3-3.5x over-provisioned, and that over-provisioning — not the
+    ///      approver cap — is what made the floor unreachable.
+    ///
+    ///      180k/approver keeps ~1.4x over the marginal cost of the last
+    ///      approver and ~1.7x over the average, which is the headroom that
+    ///      matters for the cases this fixture does NOT reproduce: a
+    ///      long-lived guardian whose checkpoint trace makes each
+    ///      `upperLookupRecent` a deeper binary search than a freshly-staked
+    ///      one. The base doubles to 2M rather than shrinking, so the
+    ///      `openCase` child (~150-200k observed) keeps well over the >5x
+    ///      margin after 63/64 forwarding that the original sizing argued
+    ///      for, with the parent's burn/bubble branch still affordable behind
+    ///      it.
+    ///
+    ///      Full-cap floor is now `100 * 180_000 + 2_000_000 = 20,000,000`
+    ///      against a `32,000,000 * (63/64)^3 = 30,523,315` ceiling — 1.5x of
+    ///      slack, and 1.8x over what a full-cap conviction actually spends.
+    ///      THE APPROVER CAP IS UNCHANGED: `MAX_APPROVERS_PER_PROPOSAL` is
+    ///      also the size of the cohort that can underwrite one proposal, so
+    ///      cutting it would cut coverage capacity, and the measurement shows
+    ///      nothing required that. `test_slashGasFloorFitsRobinhoodMaxTxGas`
+    ///      is the CI tripwire that keeps this true.
+    uint256 public constant SLASH_GAS_PER_APPROVER = 180_000;
+    uint256 public constant SLASH_GAS_BASE = 2_000_000;
 
     /// @notice Where every burned slice of a challenger's bond goes — both the
     ///         SETTLE path's `settleBurnBps` and the FAIL path's
@@ -642,15 +695,81 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      (PR #24 🟠N2). Without this flag the second concurrent settle would
     ///      hit that guard, revert `ApproverAlreadySlashed`, and wedge an
     ///      otherwise-correct challenge in `Filed` with no terminal path.
+    ///
+    ///      THIS FLAG IS ONLY HALF THE DEDUP, and the missing half was a wedge
+    ///      of its own (review PR #56 B1). sWOOD's `_verdictSlashed` is keyed on
+    ///      `keccak256(governor, proposalId)` — STABLE ACROSS DEPLOYMENTS of
+    ///      this game — while this mapping is per-deployment storage that starts
+    ///      empty. Redeployment is the supported migration path: this contract
+    ///      is not upgradeable, and `StakedWood.setAuthorizedSlasher`,
+    ///      `ExposureLedger.setCoverageFreezer` and
+    ///      `TokenCourt.setChallengeGame` all exist precisely to re-point at a
+    ///      new one. So a V1 conviction — a PARTIAL slash is the norm, the
+    ///      approvers keep live stake — leaves every V2 filing against the same
+    ///      proposal believing the liability is uncollected. `_settle` would
+    ///      then call `slashToEscrow` and revert `ApproverAlreadySlashed` for
+    ///      good: `Filed`'s only other exit is `rule`, which demands `Disputed`.
+    ///      Bond and counter-bond stranded (`claimContribution` reverts
+    ///      `ChallengeNotTerminal`), `_liveCount[key]` never decremented, so the
+    ///      coverage stays frozen forever. The authoritative answer is sWOOD's
+    ///      own `verdictSlashed` view, now asked at BOTH ends via
+    ///      `_verdictAlreadyCollected`, so this flag is a cheap local cache of a
+    ///      cross-deployment fact rather than the fact itself.
     mapping(bytes32 reviewKey => bool) internal _convicted;
 
+    /// @dev CONSTRUCTION IS THE THIRD DOOR onto the game/ledger `challengeWindow`
+    ///      mismatch, and it was the one left open. `setChallengeWindow` bounds a
+    ///      NEW window against the wired ledger and `setExposureLedger` bounds a
+    ///      NEW ledger against the current window — but a game deployed straight
+    ///      against a ledger whose own `challengeWindow` sits below this
+    ///      contract's 14-day default passed through neither, and nothing obliges
+    ///      a deployment to call a setter at all. Same bound, same reason (a game
+    ///      window above the ledger's lets a filing freeze exposure the ledger has
+    ///      already aged out of its epoch buckets), applied at the remaining entry.
+    ///
+    ///      NOT ALSO CHECKED HERE: the `coverageFreezer` grant `setExposureLedger`
+    ///      demands. This address does not exist yet while this body runs, so the
+    ///      ledger cannot possibly have been pointed at it — requiring it would
+    ///      make every deployment impossible rather than catch a mis-wiring. The
+    ///      deploy scripts' own pre-flight covers the wiring step that follows.
     constructor(address initialOwner, address wood_, address exposureLedger_, address tierRegistry_)
         Ownable(initialOwner)
     {
         if (wood_ == address(0) || exposureLedger_ == address(0) || tierRegistry_ == address(0)) revert ZeroAddress();
+        if (challengeWindow > IExposureLedger(exposureLedger_).challengeWindow()) revert InvalidParameter();
         wood = IERC20(wood_);
         exposureLedger = IExposureLedger(exposureLedger_);
         tierRegistry = ITierRegistryDemoterMinimal(tierRegistry_);
+    }
+
+    /// @dev Has this proposal's ONE liability already been collected — by an
+    ///      earlier challenge in this deployment, or by ANY earlier deployment of
+    ///      this game against the same sWOOD (review PR #56 B1)?
+    ///
+    ///      The local flag is checked first: it is a storage read and it answers
+    ///      the common case. The sWOOD scan is what makes the answer correct
+    ///      across a redeploy. ANY hit is decisive, because `slashToEscrow`
+    ///      reverts `ApproverAlreadySlashed` if any member of the array it is
+    ///      handed is already marked under this `caseKey` — so one marked
+    ///      approver means a slash of this cohort can never land again, and every
+    ///      path that would attempt one must be diverted rather than left to
+    ///      revert.
+    ///
+    ///      BOUNDED: the loop runs over the ledger's accused set, which the ledger
+    ///      itself caps, and short-circuits on the first hit — the wedge case is
+    ///      the cheap one; the ordinary "nothing collected yet" case pays the full
+    ///      scan, which is the same order of work the settle path already does.
+    ///
+    ///      Vacuous with no slasher wired: there is no `_verdictSlashed` to
+    ///      consult, and `_settle` fails closed on that separately.
+    function _verdictAlreadyCollected(bytes32 key, address[] memory accused) private view returns (bool) {
+        if (_convicted[key]) return true;
+        IStakedWood swood = stakedWood;
+        if (address(swood) == address(0)) return false;
+        for (uint256 i = 0; i < accused.length; i++) {
+            if (swood.verdictSlashed(key, accused[i])) return true;
+        }
+        return false;
     }
 
     /// @dev Same derivation as `ExposureLedger` and `GuardianRegistry`.
@@ -792,12 +911,41 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         // exactly those is what makes §2's inequality hold, because recovery is
         // the sum of THEIR bonds. A released commitment reports zero, so it
         // contributes nothing to the frozen total.
-        (, uint256[] memory committedUsd) = exposureLedger.approversOf(governor, proposalId);
+        (address[] memory covering, uint256[] memory committedUsd) = exposureLedger.approversOf(governor, proposalId);
         uint256 coverageUsd;
+        uint256 accusedCount;
         for (uint256 i = 0; i < committedUsd.length; i++) {
             coverageUsd += committedUsd[i];
+            if (committedUsd[i] != 0) accusedCount++;
         }
         if (coverageUsd == 0) revert NothingToFreeze();
+
+        // THE SAME "NOTHING LEFT TO COLLECT" REFUSAL AS `_convicted` ABOVE, ASKED
+        // OF THE CONTRACT THAT ACTUALLY KNOWS (review PR #56 B1). `_convicted` is
+        // this deployment's storage and starts empty on a redeploy; sWOOD's
+        // `verdictSlashed` is keyed on `(governor, proposalId)` and survives one.
+        // Without this, a game deployed to replace an earlier one accepted
+        // filings against proposals whose cohort the OLD game had already
+        // convicted, froze their coverage, took the bond — and then could never
+        // terminate: `_settle`'s `slashToEscrow` reverts `ApproverAlreadySlashed`
+        // and `rule` is unreachable from `Filed`.
+        //
+        // REFUSED AT THE DOOR rather than absorbed at settle, for exactly 🟡F12's
+        // reason: a challenge that cannot possibly convict anyone must not be
+        // able to buy another `autoSlashDelay` of lock on already-slashed
+        // collateral. `_settle` is made safe as well (see its own diversion into
+        // `VerdictAlreadyCollected`), because the slasher can be re-pointed —
+        // and the collection can therefore happen — AFTER a legitimate filing.
+        //
+        // The accused set is the committed cohort, the same one `_settle` sends
+        // to `slashToEscrow`; a released approver reports zero committed USD and
+        // is excluded from both.
+        address[] memory accused = new address[](accusedCount);
+        for (uint256 i = 0; i < committedUsd.length; i++) {
+            if (committedUsd[i] == 0) continue;
+            accused[--accusedCount] = covering[i];
+        }
+        if (_verdictAlreadyCollected(key, accused)) revert AlreadyConvicted();
 
         // RESERVATIONS ARE NOT LIABILITY (review 🟡F13). The sum above is what
         // the cohort RESERVED, and `recordApproval` deliberately over-reserves —
@@ -1344,11 +1492,27 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
 
         uint256 slashedWood;
         uint256 caseId;
-        if (_convicted[key]) {
-            // A concurrent challenge already collected this proposal's one
-            // liability. Settling again would revert inside sWOOD's per-verdict
-            // dedup and strand this challenge with no terminal path, so the
-            // conviction is simply recorded as already-collected.
+        // ASKED OF sWOOD, NOT ONLY OF THE LOCAL FLAG (review PR #56 B1). The
+        // local flag catches the concurrent-challenge case this branch was
+        // written for; the sWOOD read catches the case it could not — an EARLIER
+        // DEPLOYMENT of this game having already collected this cohort under the
+        // same, deployment-independent `caseKey`. `file` refuses such a filing at
+        // the door, but that gate reads the slasher wired AT FILING TIME and the
+        // owner may re-point sWOOD (or the old game may settle a concurrent
+        // challenge) at any point afterwards, so the settle path cannot assume it
+        // was reachable. Diverting here rather than letting `slashToEscrow`
+        // revert is the whole point: a revert leaves the challenge in `Filed`
+        // with no terminal exit at all, taking the bond, the counter-bond pool
+        // and the coverage freeze with it.
+        if (_verdictAlreadyCollected(key, approvers)) {
+            // A concurrent challenge — or a previous deployment of this game —
+            // already collected this proposal's one liability. Settling again
+            // would revert inside sWOOD's per-verdict dedup and strand this
+            // challenge with no terminal path, so the conviction is simply
+            // recorded as already-collected. The local flag is set on the way
+            // out so the next `file` against this proposal is refused by the
+            // cheap storage read rather than re-deriving the same answer.
+            _convicted[key] = true;
             emit VerdictAlreadyCollected(challengeId, governor, proposalId);
         } else {
             _convicted[key] = true;
@@ -2062,9 +2226,31 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      every game that reads it, which is the dependency direction this
     ///      design has never taken (the game depends on the ledger, never the
     ///      reverse).
+    /// @dev REQUIRES THE OTHER HALF OF THE GRANT TO ALREADY EXIST (review PR #56
+    ///      M2, mirroring `TokenCourt.setChallengeGame`'s own re-wire guard).
+    ///      `coverageFreezer` is the ledger's side of a TWO-SIDED relationship
+    ///      and this setter only ever moved one side of it. A fresh ledger's
+    ///      `coverageFreezer` is the zero address, so re-pointing at one while a
+    ///      challenge is live sent every terminal path — `_settle`, `_fail`,
+    ///      `_refundAll`, all through `_releaseFreeze` — into
+    ///      `unfreezeCoverage`'s `NotCoverageFreezer`. That is a WEDGE, not an
+    ///      inconvenience: the bond and the counter-bond pool are stranded with
+    ///      no terminal exit, and the OLD ledger's `_frozen[key]` stays true
+    ///      forever, barring every accused approver from `claimUnstakeGuardian`
+    ///      — while that ledger's own `setCoverageFreezer` is bricked by its
+    ///      `CoverageFrozen` guard, so the role cannot even be rotated to clean
+    ///      up. It also falsified this contract's own claim that a hostile owner
+    ///      "can never freeze [coverage] that already exists".
+    ///
+    ///      Demanding the grant FIRST does not remove the orphaning hazard
+    ///      documented above — a correctly-granted new ledger still knows
+    ///      nothing about freezes the old one holds — but it does mean every
+    ///      reachable re-point leaves the terminal paths callable, which is the
+    ///      part that cannot be repaired after the fact.
     function setExposureLedger(address ledger) external onlyOwner {
         if (ledger == address(0)) revert ZeroAddress();
         if (challengeWindow > IExposureLedger(ledger).challengeWindow()) revert InvalidParameter();
+        if (IExposureLedger(ledger).coverageFreezer() != address(this)) revert RoleNotGranted();
         emit ExposureLedgerSet(address(exposureLedger), ledger);
         exposureLedger = IExposureLedger(ledger);
     }
@@ -2161,11 +2347,40 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      challenge may carry from before a rate DECREASE — the ordinary case
     ///      this closes is the common one, a live rate that was never lowered
     ///      colliding with a lower new ceiling.
+    /// @dev ALSO REQUIRES THE OTHER HALF OF THE GRANT (review PR #56 M2, same
+    ///      shape as `setExposureLedger`'s `coverageFreezer` check and
+    ///      `TokenCourt.setChallengeGame`'s). `authorizedSlasher` is sWOOD's side
+    ///      of the same two-sided relationship: point this game at a sWOOD that
+    ///      has not named it, and every `_settle` reverts inside
+    ///      `slashToEscrow`'s own caller gate — the wedge shape this whole
+    ///      review round is about, since `Filed`'s only other exit (`rule`)
+    ///      demands `Disputed`. The reciprocal pointer is already the documented
+    ///      deploy order (`swood.setAuthorizedSlasher(game)` THEN
+    ///      `game.setStakedWood(swood)` — see `DeployPlanD`), so this enforces
+    ///      the sequence the scripts already follow rather than imposing a new
+    ///      one. `_settle`'s own "`setStakedWood` is the owner escape" note
+    ///      stands and is strengthened: the escape now cannot itself be
+    ///      mis-aimed at a sWOOD that would reject the verdict.
     function setStakedWood(address stakedWood_) external onlyOwner {
         if (stakedWood_ == address(0)) revert ZeroAddress();
         if (convictionBountyBps > IStakedWood(stakedWood_).MAX_CONVICTION_BOUNTY_BPS()) revert InvalidParameter();
+        if (IStakedWood(stakedWood_).authorizedSlasher() != address(this)) revert RoleNotGranted();
         emit StakedWoodSet(address(stakedWood), stakedWood_);
         stakedWood = IStakedWood(stakedWood_);
+    }
+
+    /// @dev DISABLED (review PR #56). `Ownable`'s default would leave this
+    ///      contract permanently ownerless, and several documented recovery
+    ///      levers are owner-only and irreplaceable: `setStakedWood` is the
+    ///      stated un-wedge for a challenge stuck on an unwired or mis-granted
+    ///      slasher, `setCourt(address(0))` is the stated off-switch for a
+    ///      captured court, and `setExposureLedger` is the only way to move the
+    ///      freeze rail. Renouncing does not merely reduce privilege here — it
+    ///      forecloses the escapes the rest of this contract's reasoning assumes
+    ///      exist. Ownership can still be HANDED OVER: `Ownable2Step`'s
+    ///      transfer/accept pair is untouched.
+    function renounceOwnership() public view override onlyOwner {
+        revert RenounceDisabled();
     }
 
     /// @dev THE INVARIANT SPANS TWO CONTRACTS, so neither holds it alone (B3).

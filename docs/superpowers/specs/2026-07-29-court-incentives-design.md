@@ -233,6 +233,13 @@ Specifically, §1's three "properties UMA lacks" need correcting: property 2 ("v
 ## 7. Also open, documented not fixed
 
 - **A1** — address splitting defeats `AccusedCannotVote`: `isAccused` covers the approving *address*, not the party, and the floor's accused-subtraction makes the siblings' quorum *smaller* as the accused cohort grows. Likely unfixable under permissionless staking; the natspec must stop claiming the bar covers a party.
+- **A1b — DENIAL OF QUORUM, the other half of A1** (added 2026-07-31, review B2 on PR #56). A1 frames splitting as helping siblings *win* a vote. Moving stake **out** of the accused set is simultaneously a lever to make the vote *unwinnable by anyone*, and it needs no voters at all. `stakeAsGuardian` is permissionless and uncapped, so an address that **approves nothing** can stake before the drain: `getPastTotalVotes(snapshotTs)` rises, `accusedWeight` never subtracts it (not an approver), and no achievable turnout clears the floor. The case lands on **`Inconclusive`**, not `NotGuilty` — a different outcome needing a different mitigation, which is why A1 did not cover it. `_refundAll` then releases the coverage freeze with no slash, no `_convicted` mark and no demotion; the attacker never votes and is never slashable, since `slashToEscrow` only touches the approver array.
+
+  **Mitigated** by `TokenCourt.FLOOR_LOOKBACK` (30 days): the floor's base is `min(getPastTotalVotes(snapshotTs), getPastTotalVotes(snapshotTs − FLOOR_LOOKBACK))`, excluding a late pre-drain surge. Monotone against the old formula — never a higher floor — and `earlier == 0` falls back to the snapshot total rather than zero, because a zero base would disable D6 entirely during the protocol's first month.
+
+  **Residual, accepted:** an attacker who commits the capital a full 30 days ahead is present at both reads. The lookback *prices* the attack (≈2× the honest electorate, idle and publicly visible for a month) rather than eliminating it. `participationFloorBps` is the operational counter-lever. Deliberately a `constant` and not a parameter — a `setFloorLookback(0)` before a drain would restore the attack outright.
+
+  **§6 monitoring trigger:** a large guardian stake appearing shortly before a challenged proposal executes, from an address that approves nothing.
 - **A2** — last-mover advantage: public tallies + hard deadline + **tie acquits** means the acquitting side need only *match*, not exceed, in the final block. Mitigation short of commit-reveal is a vote-extension (any late vote pushes the deadline), deferred with §6's trigger.
 - **A5 — confirmed on the real contract, not inferred (2026-07-29).**
   `getPastVotes` re-derives its age factor from the guardian's CURRENT

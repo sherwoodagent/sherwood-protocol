@@ -479,14 +479,23 @@ interface ISyndicateGovernor {
     ///         resolves to tier 2 / full notional — the safe default.
     function setTierRegistry(address newRegistry) external;
     /// @notice Wire the exposure ledger (Plan B, spec §3.7/§3.9). Factory-only.
-    ///         address(0) un-wires: the covered-TVL cap and proposer bond gates
-    ///         are then skipped — the pre-ledger safe default.
+    ///         address(0) un-wires: the covered-TVL cap, the proposer bond gate
+    ///         AND the §3.3a approve quorum are then skipped — the pre-ledger
+    ///         default. The quorum is the load-bearing one now that
+    ///         `quorumTierThreshold == 0` applies it at every tier, so a governor
+    ///         created while the factory's ledger is unset carries no coverage
+    ///         gate at all until `pushWiring` reaches it.
     /// @dev Precondition: seed the ledger's `setAssetFeed(vaultAsset, ...)` and
     ///      `setCoveredTvlCapUsd(...)` BEFORE wiring it. The gates fail closed,
     ///      so a wired ledger with an unpriceable vault asset or a zero cap
-    ///      halts all proposal creation for this vault. The escape hatch
-    ///      (`setExposureLedger(0)`) is factory-owned; the feed/cap fixes are
-    ///      ledger-owner-owned.
+    ///      halts all proposal creation for this vault.
+    ///
+    ///      THERE IS NO `setExposureLedger(0)` ESCAPE HATCH, contrary to what
+    ///      this comment previously claimed. Both factory call sites SKIP when
+    ///      the factory's own ledger is unset (`SyndicateFactory.sol:390-392`,
+    ///      `:726`), so zero is unreachable through them — the implementation
+    ///      natspec already records this (review finding I-3). The feed/cap
+    ///      fixes are ledger-owner-owned and are the real remedy.
     function setExposureLedger(address newLedger) external;
     /// @notice Wire the proposer bond escrow (Plan B, spec §3.9). Factory-only.
     ///         address(0) un-wires: the bond is not locked at propose.
