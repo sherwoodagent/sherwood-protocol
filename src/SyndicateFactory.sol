@@ -66,6 +66,8 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     error ProposalActive();
     error ProposalsOpen();
     error InvalidSyndicateConfig();
+    /// @dev `pushWiring` target is not a governor this factory deployed.
+    error NotFactoryGovernor();
 
     struct SyndicateConfig {
         string metadataURI; // ipfs://Qm... (name, description, strategies)
@@ -174,12 +176,51 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     ///      slots are untouched, this var claims the first reserved slot.
     address public tierRegistry;
 
+    /// @notice Aggregate-exposure ledger (guardian economic-security model,
+    ///         spec 2026-07-22 §3.3/§3.7). Optional — `address(0)` means governors
+    ///         created by this factory skip the covered-TVL cap and the
+    ///         risk-scaled proposer bond (the pre-ledger default). Set post-deploy
+    ///         by the owner via `setExposureLedger`, then pushed into each
+    ///         per-vault governor at `createSyndicate` — or into an already-created
+    ///         governor via `pushWiring`.
+    /// @dev Appended before `__gap` (gap shrunk 45 → 43 together with
+    ///      `bondEscrow`) — upgrade-safe: existing slots are untouched, this var
+    ///      claims a reserved slot.
+    address public exposureLedger;
+
+    /// @notice Proposer-bond escrow (guardian economic-security model, spec
+    ///         2026-07-22 §3.9). Optional — `address(0)` means governors created
+    ///         by this factory lock no proposer bond at `propose`. Set post-deploy
+    ///         by the owner via `setBondEscrow`, then pushed into each per-vault
+    ///         governor at `createSyndicate` — or into an already-created governor
+    ///         via `pushWiring`.
+    /// @dev Appended before `__gap` (gap shrunk 45 → 43 together with
+    ///      `exposureLedger`) — upgrade-safe: existing slots are untouched, this
+    ///      var claims a reserved slot.
+    address public bondEscrow;
+
+    /// @notice Protocol `CompensationEscrow` (spec §3.8). The withdrawal queues
+    ///         this factory deploys resolve it from here to pay a case through
+    ///         to their request owners — see `VaultWithdrawalQueue.claimCompensation`.
+    /// @dev Governance-owned rather than a `claimCompensation` argument (PR #24
+    ///      review 🔴N1): a caller-supplied escrow controls both the payout
+    ///      TOKEN and the pulled amount, which let an attacker mint a case
+    ///      total in a junk token and withdraw it in real WOOD. `address(0)`
+    ///      disables the queue pay-through (`CompensationEscrowNotSet`).
+    ///      Keep it equal to `StakedWood.compensationEscrow` — sWOOD funds the
+    ///      cases the queues redeem.
+    /// @dev Appended before `__gap` (gap shrunk 43 → 42) — upgrade-safe:
+    ///      existing slots are untouched, this var claims a reserved slot.
+    address public compensationEscrow;
+
     /// @dev Reserved for future storage. Per-vault-governor refactor: replaced
     ///      the single `governor` slot (1) with `beacon` (1) + `protocolConfig`
     ///      (1) + `_governorOf` mapping (1) = net +2 slots, so the gap drops
     ///      50 → 48 → 46 across this and prior reductions; then 46 → 45 for
-    ///      `tierRegistry` (Task 7).
-    uint256[45] private __gap;
+    ///      `tierRegistry` (Task 7); then 45 → 43 for `exposureLedger` +
+    ///      `bondEscrow` (Plan B Task 10); then 43 → 42 for
+    ///      `compensationEscrow` (PR #24 review 🔴N1).
+    uint256[42] private __gap;
 
     // ── Events ──
 
@@ -203,6 +244,12 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     event EnsRegistrationFailed(address indexed vault, string subdomain);
     event GuardianRegistrySet(address indexed oldRegistry, address indexed newRegistry);
     event TierRegistrySet(address indexed oldRegistry, address indexed newRegistry);
+    event ExposureLedgerSet(address indexed oldLedger, address indexed newLedger);
+    event BondEscrowSet(address indexed oldEscrow, address indexed newEscrow);
+    event CompensationEscrowSet(address indexed oldEscrow, address indexed newEscrow);
+    /// @notice Emitted when `pushWiring` re-pushes the factory's current
+    ///         tierRegistry / exposureLedger / bondEscrow into an existing governor.
+    event WiringPushed(address indexed governor);
     event GovernorDeployed(address indexed vault, address indexed governor);
     event BeaconUpdated(address indexed oldBeacon, address indexed newBeacon);
     event ProtocolConfigUpdated(address indexed oldConfig, address indexed newConfig);
@@ -328,13 +375,23 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         );
         address govProxy = address(new BeaconProxy(beacon, govInitData));
         _governorOf[vault] = govProxy;
-        IGuardianRegistry(guardianRegistry).addGovernor(govProxy);
+        IGuardianRegistry(guardianRegistry).addGovernor(govProxy, vault);
         // Push the adapter-selector tier registry into the fresh governor
         // (spec §3.2). `setTierRegistry` is onlyFactory, so this is the sole
         // wiring point. When `tierRegistry` is unset the governor keeps its
         // safe tier-2 default — skip the call rather than write address(0).
         if (tierRegistry != address(0)) {
             ISyndicateGovernor(govProxy).setTierRegistry(tierRegistry);
+        }
+        // Same idiom for the two Plan B wiring slots (spec §3.3/§3.7 and §3.9):
+        // `setExposureLedger` / `setBondEscrow` are onlyFactory, so this is the
+        // sole wiring point at creation. Unset ⇒ skip the call, leaving the
+        // governor at its pre-ledger / no-bond default rather than writing zero.
+        if (exposureLedger != address(0)) {
+            ISyndicateGovernor(govProxy).setExposureLedger(exposureLedger);
+        }
+        if (bondEscrow != address(0)) {
+            ISyndicateGovernor(govProxy).setBondEscrow(bondEscrow);
         }
         emit GovernorDeployed(vault, govProxy);
 
@@ -568,12 +625,121 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     ///         disables tier pricing for governors created afterward (they keep
     ///         the safe tier-2 full-notional default). Only affects governors
     ///         created AFTER this call; existing per-vault governors are rewired
-    ///         individually via `SyndicateGovernor.setTierRegistry` (onlyFactory)
-    ///         if needed.
+    ///         via `pushWiring(governor)`. (The governor's own `setTierRegistry`
+    ///         is `onlyFactory`, so it is NOT callable directly — that dead end
+    ///         was the LOW-1 gap `pushWiring` exists to close.)
     function setTierRegistry(address newRegistry) external onlyOwner {
         address old = tierRegistry;
         tierRegistry = newRegistry;
         emit TierRegistrySet(old, newRegistry);
+    }
+
+    /// @notice Set the aggregate-exposure ledger pushed into governors at
+    ///         `createSyndicate` (spec §3.3/§3.7). `address(0)` is tolerated — it
+    ///         disables the covered-TVL cap and the risk-scaled proposer bond for
+    ///         governors created afterward. Only affects governors created AFTER
+    ///         this call; existing per-vault governors are rewired via
+    ///         `pushWiring`.
+    /// @dev WIRING ORDER: seed the ledger's asset feeds and covered-TVL cap
+    ///      BEFORE wiring it here — the governor's gates are fail-closed, so a
+    ///      wired-but-unseeded ledger bricks `propose`.
+    function setExposureLedger(address newLedger) external onlyOwner {
+        address old = exposureLedger;
+        exposureLedger = newLedger;
+        emit ExposureLedgerSet(old, newLedger);
+    }
+
+    /// @notice Set the proposer-bond escrow pushed into governors at
+    ///         `createSyndicate` (spec §3.9). `address(0)` is tolerated — it
+    ///         disables the proposer bond for governors created afterward. Only
+    ///         affects governors created AFTER this call; existing per-vault
+    ///         governors are rewired via `pushWiring`.
+    /// @dev The escrow slot is CUSTODIAL — re-point it only at zero outstanding
+    ///      bonds. Bonds already locked are released against the escrow recorded
+    ///      per proposal, so re-pointing does not strand them, but it does split
+    ///      custody across two escrows.
+    function setBondEscrow(address newEscrow) external onlyOwner {
+        address old = bondEscrow;
+        bondEscrow = newEscrow;
+        emit BondEscrowSet(old, newEscrow);
+    }
+
+    /// @notice Set the protocol `CompensationEscrow` the withdrawal queues pay
+    ///         their custody claims out of (spec §3.8). `address(0)` is
+    ///         tolerated — it disables the queue pay-through. Read LIVE by every
+    ///         queue this factory deployed, so one call arms or repoints them all.
+    /// @dev Wire this to the SAME escrow as `StakedWood.setCompensationEscrow`:
+    ///      sWOOD's `slashToEscrow` opens the cases, the queues redeem them, and
+    ///      a queue pointed at a different escrow simply finds no case for its
+    ///      vault (`NotCompensationCase`).
+    /// @dev The escrow is factory state and NOT a `claimCompensation` argument
+    ///      (PR #24 review 🔴N1). A caller-supplied escrow controls the payout
+    ///      TOKEN as well as the amount, so an attacker could book a case total
+    ///      in a token they mint freely and then flip `wood()` to real WOOD and
+    ///      withdraw the queue's whole balance. Governance owns the address; the
+    ///      caller chooses only WHICH requests get paid.
+    /// @dev CUSTODIAL RE-POINT (PR #24 review F-E): the queue's BOOKKEEPING is
+    ///      keyed by the escrow that funded a case and the payout token is
+    ///      pinned at pull time, but its LOOKUP resolves this pointer live — so
+    ///      once it moves, EVERY case tied to the old escrow becomes
+    ///      unaddressable from the queue: unpulled ones, and pulled ones not
+    ///      yet fully distributed (their remainder parks in the queue, which
+    ///      has no rescue path by design). Nothing is lost — pointing back
+    ///      restores payout exactly — but the funds are frozen meanwhile.
+    ///      Re-point only at zero unpulled cases AND zero
+    ///      incompletely-distributed pulled cases for every queue this factory
+    ///      deployed.
+    function setCompensationEscrow(address newEscrow) external onlyOwner {
+        address old = compensationEscrow;
+        compensationEscrow = newEscrow;
+        emit CompensationEscrowSet(old, newEscrow);
+    }
+
+    /// @notice Whether `governor` is a per-vault governor deployed by THIS factory.
+    /// @dev Derived from the existing `_governorOf` bookkeeping rather than a new
+    ///      membership set: a fresh `mapping(address => bool)` would only be
+    ///      populated by future `createSyndicate` calls, so it would answer
+    ///      `false` for exactly the pre-upgrade governors `pushWiring` exists to
+    ///      rescue. The round-trip `governor.vault()` → `_governorOf[vault]` is
+    ///      unforgeable: `_governorOf` only ever holds proxies this factory
+    ///      deployed, so a foreign contract can never make the equality hold for
+    ///      its own address.
+    function isFactoryGovernor(address governor) public view returns (bool) {
+        return _isFactoryGovernor(governor);
+    }
+
+    /// @notice Push the factory's CURRENT `tierRegistry`, `exposureLedger` and
+    ///         `bondEscrow` into an EXISTING governor deployed by this factory.
+    /// @dev Closes the "governor predates the registry" gap (LOW-1, issue #19):
+    ///      the `createSyndicate` push only reaches governors created AFTER the
+    ///      addresses were set, so without this entrypoint a governor deployed
+    ///      before the registries existed would run batches unguarded forever
+    ///      with no way to fix it (the governor's setters are `onlyFactory`, and
+    ///      the factory had no path to call them post-creation).
+    /// @dev Unset factory slots are SKIPPED, never written as zero — `pushWiring`
+    ///      can only add wiring, never silently un-wire a governor that some
+    ///      other path already configured.
+    /// @param governor A per-vault governor proxy deployed by this factory.
+    function pushWiring(address governor) external onlyOwner {
+        if (!_isFactoryGovernor(governor)) revert NotFactoryGovernor();
+        if (tierRegistry != address(0)) ISyndicateGovernor(governor).setTierRegistry(tierRegistry);
+        if (exposureLedger != address(0)) ISyndicateGovernor(governor).setExposureLedger(exposureLedger);
+        if (bondEscrow != address(0)) ISyndicateGovernor(governor).setBondEscrow(bondEscrow);
+        emit WiringPushed(governor);
+    }
+
+    /// @dev See `isFactoryGovernor`. `try/catch` (plus the code-length probe)
+    ///      turns an EOA or a non-governor contract into `false` instead of a
+    ///      bare decode revert, so the caller sees `NotFactoryGovernor`.
+    function _isFactoryGovernor(address governor) internal view returns (bool) {
+        if (governor == address(0) || governor.code.length == 0) return false;
+        address boundVault;
+        try ISyndicateGovernor(governor).vault() returns (address v) {
+            boundVault = v;
+        } catch {
+            return false;
+        }
+        return boundVault != address(0) && _governorOf[boundVault] == governor;
     }
 
     /// @notice Transfer a vault's ownership to `newOwner` and rebind the owner-stake

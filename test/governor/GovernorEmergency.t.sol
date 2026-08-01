@@ -122,10 +122,8 @@ contract GovernorEmergencyTest is Test {
                     minOwnerStake: MIN_OWNER_STAKE,
                     minSlashBps: 1000,
                     maxSlashBps: 9999,
-                    maxDelegatedSlashBps: 2000,
                     ageFloorBps: 2500,
-                    maturationPeriod: 30 days,
-                    delegatedWeightCapX: 4
+                    maturationPeriod: 30 days
                 }))
         );
         swood = StakedWood(address(new ERC1967Proxy(address(swoodImpl), swoodInit)));
@@ -170,7 +168,10 @@ contract GovernorEmergencyTest is Test {
         // Authorize the per-vault governor on the composite-key registry
         // (replaces the removed governor.addVault wiring).
         vm.prank(registry.factory());
-        registry.addGovernor(address(governor));
+        // The vault is load-bearing, not a placeholder: the emergency slash path
+        // resolves its owner-bond target from `vaultOf[governor]` (it no longer
+        // calls back into the governor for it).
+        registry.addGovernor(address(governor), address(vault));
         require(address(registry) == predictedRegistryProxy, "registry addr mismatch");
 
         // Resolve the registry ↔ sWOOD circular dependency.
@@ -387,6 +388,35 @@ contract GovernorEmergencyTest is Test {
         vm.prank(owner);
         vm.expectRevert(IGuardianRegistry.ReviewNotReadyForResolve.selector);
         governor.finalizeEmergencySettle(pid);
+    }
+
+    /// @notice `voteOnProposal` carries an explicit `if (r.resolved) revert
+    ///         ReviewNotOpen()` and calls it defence in depth. Its emergency
+    ///         twin had no such guard — it tested only `er.reviewEnd`, which
+    ///         `cancelEmergency` REPURPOSES as a post-cancel cooldown deadline
+    ///         (`reviewEnd = block.timestamp + reviewPeriod`, Sherlock #15).
+    ///         So for a full `reviewPeriod` after a cancel, `block.timestamp <
+    ///         er.reviewEnd` still held and votes were accepted into a resolved
+    ///         review — guardians reacting to `EmergencyReviewOpened` burn gas
+    ///         on a vote that can never count and consume their `AlreadyVoted`
+    ///         flag for that nonce.
+    function test_voteBlockEmergencySettle_revertsAfterCancel() public {
+        uint256 pid = _createExecutedProposal(7 days);
+        vm.warp(vm.getBlockTimestamp() + 7 days);
+
+        vm.prank(owner);
+        governor.emergencySettleWithCalls(pid, _customCalls());
+
+        // Cancel with no votes cast, so the Sherlock #44 quorum gate allows it.
+        vm.prank(owner);
+        governor.cancelEmergencySettle(pid);
+        assertFalse(registry.isEmergencyOpen(address(governor), pid), "cancel resolves the emergency review");
+
+        // Still inside the repurposed cooldown window, so the reviewEnd test
+        // alone would let this through.
+        vm.prank(guardianA);
+        vm.expectRevert(IGuardianRegistry.ReviewNotOpen.selector);
+        registry.voteBlockEmergencySettle(address(governor), pid);
     }
 
     /// @notice Regression for PR #229 critical fix: cancelling an emergency

@@ -108,10 +108,8 @@ contract Governor_emergencyCancelOnSettle_Test is Test {
                     minOwnerStake: MIN_OWNER_STAKE,
                     minSlashBps: 1000,
                     maxSlashBps: 9999,
-                    maxDelegatedSlashBps: 2000,
                     ageFloorBps: 2500,
-                    maturationPeriod: 30 days,
-                    delegatedWeightCapX: 4
+                    maturationPeriod: 30 days
                 }))
         );
         swood = StakedWood(address(new ERC1967Proxy(address(swoodImpl), swoodInit)));
@@ -150,8 +148,11 @@ contract Governor_emergencyCancelOnSettle_Test is Test {
         registry = GuardianRegistry(address(new ERC1967Proxy(address(regImpl), regInit)));
         // Authorize the per-vault governor on the composite-key registry
         // (replaces the removed governor.addVault wiring).
+        // Hoisted: `vault()` is a call, so evaluating it as an argument would
+        // consume the prank and leave `addGovernor` unauthorized.
+        address govVault = governor.vault();
         vm.prank(registry.factory());
-        registry.addGovernor(address(governor));
+        registry.addGovernor(address(governor), govVault);
         require(address(registry) == predictedRegistryProxy, "registry addr mismatch");
 
         // Resolve the registry ↔ sWOOD circular dependency.

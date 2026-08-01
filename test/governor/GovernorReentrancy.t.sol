@@ -13,6 +13,7 @@ import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
+import {IGuardianRegistry} from "../../src/interfaces/IGuardianRegistry.sol";
 
 /// @title GovernorReentrancy.t
 /// @notice Regression for G-C6 — `vote` / `cancelProposal` / `vetoProposal` /
@@ -262,6 +263,14 @@ contract ReentrantRegistry {
         reviewPeriod = r;
     }
 
+    /// @dev The governor consults `paused()` before concluding a review, so the
+    ///      hostile stub must answer it — a missing selector reverts with empty
+    ///      data and would mask the `Reentrancy()` these tests match on. Always
+    ///      live: pausing would short-circuit the reentry path under test.
+    function paused() external pure returns (bool) {
+        return false;
+    }
+
     function setGovernor(address g) external {
         governor = g;
     }
@@ -302,5 +311,18 @@ contract ReentrantRegistry {
         if (reviewOpened) return (true, false, false, false);
         // Default: resolved so the state machine skips the mutating callout.
         return (true, true, false, false);
+    }
+
+    /// @dev The governor pushes the review window here at propose. No-op: this
+    ///      mock keeps no window state, it only needs to accept the call.
+    function registerReview(uint256, uint256, uint256) external {}
+
+    /// @dev Read by `ProposalLifecycle._afterVote`, replacing the old
+    ///      `getReviewState` tuple above. `Cleared` past `reviewEnd` makes
+    ///      `_computeState` report `reviewConcluded = true`, so `_commitState`
+    ///      performs the economic commit — the `resolveReview` callout this
+    ///      suite arms to re-enter the governor.
+    function outcomeOf(address, uint256) external pure returns (IGuardianRegistry.ReviewOutcome) {
+        return IGuardianRegistry.ReviewOutcome.Cleared;
     }
 }

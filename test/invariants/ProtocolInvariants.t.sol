@@ -107,10 +107,8 @@ contract ProtocolInvariantsTest is StdInvariant, Test {
                                     minOwnerStake: MIN_OWNER_STAKE,
                                     minSlashBps: 1000,
                                     maxSlashBps: 9999,
-                                    maxDelegatedSlashBps: 2000,
                                     ageFloorBps: 2500,
-                                    maturationPeriod: 30 days,
-                                    delegatedWeightCapX: 4
+                                    maturationPeriod: 30 days
                                 }))
                         )
                     )
@@ -268,8 +266,11 @@ contract ProtocolInvariantsTest is StdInvariant, Test {
         // Governor: addGovernor is factory-only (I3) — call as the newly-set
         // factory to register the real governor. The registry was initialized
         // with governor_=address(0) so the authorized set starts empty.
+        // Hoisted: `vault()` is a call, so evaluating it as an argument would
+        // consume the prank and leave `addGovernor` unauthorized.
+        address govVault = SyndicateGovernor(newGovernor).vault();
         vm.prank(newFactory);
-        registry.addGovernor(newGovernor);
+        registry.addGovernor(newGovernor, govVault);
     }
 
     // ──────────────────────────────────────────────────────────────

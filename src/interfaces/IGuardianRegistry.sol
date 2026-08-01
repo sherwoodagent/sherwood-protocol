@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import {BatchExecutorLib} from "../BatchExecutorLib.sol";
 import {IStakedWood} from "./IStakedWood.sol";
+import {IExposureLedger} from "./IExposureLedger.sol";
 
 /// @title IGuardianRegistry
 /// @notice Interface for the slimmed `GuardianRegistry` — review/emergency
@@ -16,6 +17,16 @@ interface IGuardianRegistry {
         None,
         Approve,
         Block
+    }
+
+    /// @notice Review outcome — the guardian review's verdict on a proposal.
+    ///         Deterministic from stored review state once the window ends.
+    ///         Unresolved before reviewEnd (or when unregistered); a never-opened
+    ///         or cohort-too-small review Clears.
+    enum ReviewOutcome {
+        Unresolved,
+        Cleared,
+        Blocked
     }
 
     // ── Errors ──
@@ -46,9 +57,18 @@ interface IGuardianRegistry {
     ///         approver unstake and escape the slash before `resolveReview`.
     error CooldownBelowReviewPeriod();
     error UnauthorizedGovernor();
+    /// @notice `registerReview` rejected a window with `voteEnd == 0` (the
+    ///         unregistered sentinel) or `reviewEnd <= voteEnd` — a collapsed
+    ///         window (`reviewEnd == voteEnd`) must not register either.
+    error InvalidReviewWindow();
+    /// @notice `registerReview` called twice for the same `(governor, proposalId)`.
+    ///         The pushed window is immutable once set.
+    error ReviewAlreadyRegistered();
 
     // ── Events ──
     event GovernorAdded(address indexed governor);
+    /// @notice Governor pushed a proposal's review window at propose time.
+    event ReviewRegistered(address indexed governor, uint256 indexed proposalId, uint64 voteEnd, uint64 reviewEnd);
     event ReviewOpened(uint256 indexed proposalId, uint128 totalStakeAtOpen);
     event CohortTooSmallToReview(uint256 indexed proposalId, uint256 totalStakeAtOpen);
     event GuardianVoteCast(
@@ -87,7 +107,13 @@ interface IGuardianRegistry {
     function voteOnProposal(address governor, uint256 proposalId, GuardianVoteType support) external;
 
     // ── Multi-governor management ──
-    function addGovernor(address governor) external;
+    function addGovernor(address governor, address vault) external;
+
+    /// @notice Governor push of a proposal's review-window timestamps at propose
+    ///         time. The governor is the single source of the window and pushes
+    ///         it once, on `propose`; the registry stores it and reads the
+    ///         stored fields directly.
+    function registerReview(uint256 proposalId, uint256 voteEnd, uint256 reviewEnd) external;
 
     // ── Governor-only (emergency) ──
     function openEmergency(uint256 proposalId, bytes32 callsHash, BatchExecutorLib.Call[] calldata calls) external;
@@ -119,10 +145,24 @@ interface IGuardianRegistry {
     // ── Pause ──
     function pause() external;
     function unpause() external;
+    /// @notice True while the registry is paused. Every mutating review
+    ///         entrypoint (`openReview`, `voteOnProposal`, `resolveReview`) is
+    ///         `whenNotPaused`, so callers that need the economic commit must
+    ///         consult this before reporting a proposal as actionable.
+    function paused() external view returns (bool);
 
     // ── Parameter setters (owner-instant; owner is a multisig with external delay) ──
     function setReviewPeriod(uint256) external;
     function setBlockQuorumBps(uint256) external;
+
+    /// @notice Wire the exposure ledger consulted on approve-side review votes
+    ///         (spec 2026-07-22 §3.3). address(0) is rejected; address(0) as the
+    ///         current value means unset (hooks skipped).
+    function setExposureLedger(address ledger) external;
+    /// @dev Returns the interface-typed handle (matches the `IExposureLedger
+    ///      public exposureLedger` state variable getter, mirroring the
+    ///      `swood()`/`IStakedWood` precedent). address(0) handle = unset.
+    function exposureLedger() external view returns (IExposureLedger);
 
     // ── Views ──
     /// @notice Returns the cached review state for a proposal.
@@ -135,12 +175,48 @@ interface IGuardianRegistry {
         view
         returns (bool opened, bool resolved, bool blocked, bool cohortTooSmall);
 
+    /// @notice The guardian review's verdict on a proposal, as a pure view.
+    ///         Mirrors `resolveReview`'s committed result WITHOUT mutating or
+    ///         slashing: `Unresolved` before `reviewEnd` (or when unregistered),
+    ///         `Blocked`/`Cleared` once the window has elapsed, and the cached
+    ///         flag once resolved. Shares the `_isBlocked` predicate with
+    ///         `resolveReview` so the view can never drift from the commit.
+    function outcomeOf(address governor, uint256 proposalId) external view returns (ReviewOutcome);
+
     /// @notice Per-proposal approver set + their snapshot vote weights + the
     ///         summed approve-weight denominator. Read by the off-chain Merkl bot.
     function getApproverWeights(address governor, uint256 proposalId)
         external
         view
         returns (address[] memory approvers, uint128[] memory weights, uint128 totalApproveWeight);
+
+    /// @notice Per-proposal approver set + the COVERAGE each one actually
+    ///         underwrote, from the exposure ledger's settled allocation.
+    /// @dev    The weight guardian fees should be paid on (§3.10).
+    ///         `getApproverWeights` returns staked WOOD, which pays for parking
+    ///         capital rather than for underwriting — an approver the ledger
+    ///         booked nothing for (no free budget, unpriceable feed, zero
+    ///         coverage, beyond horizon) still appears there at full stake
+    ///         weight. Weighting on this instead pays zero for a zero-coverage
+    ///         approve without touching anyone's right to vote.
+    /// @return approvers   Registry-side approver set for the proposal.
+    /// @return coverageUsd Allocated coverage per approver, USD-18. Zero entries
+    ///                     are real: that approver underwrote nothing.
+    /// @return priced      False when the ledger could not value the coverage
+    ///                     (stale/unconfigured asset feed). RETRY — do not treat
+    ///                     the zeros as a payable result.
+    function getApproverCoverage(address governor, uint256 proposalId)
+        external
+        view
+        returns (address[] memory approvers, uint256[] memory coverageUsd, bool priced);
+
+    /// @notice The review window pushed by a governor via `registerReview`.
+    ///         `(0, 0)` if never registered.
+    function reviewWindow(address governor, uint256 proposalId) external view returns (uint64 voteEnd, uint64 reviewEnd);
+
+    /// @notice The vault served by an authorized governor (factory-wired at
+    ///         `addGovernor`). `address(0)` if the governor is not authorized.
+    function vaultOf(address governor) external view returns (address);
 
     function reviewPeriod() external view returns (uint256);
     function factory() external view returns (address);

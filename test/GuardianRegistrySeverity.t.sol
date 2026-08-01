@@ -10,7 +10,7 @@ import {IGuardianRegistry} from "../src/interfaces/IGuardianRegistry.sol";
 ///         block-side decisiveness — no longer the blockers' stake-weighted
 ///         median vote. Quadratic ramp:
 ///
-///           bBps     = blockStakeWeight × 10_000 / (totalStakeAtOpen + totalDelegatedAtOpen)
+///           bBps     = blockStakeWeight × 10_000 / totalStakeAtOpen
 ///           t        = (bBps − blockQuorumBpsAtOpen) / (SUPERMAJORITY_BPS − blockQuorumBpsAtOpen)
 ///           severity = minSlashBps + (maxSlashBps − minSlashBps) × t²
 ///
@@ -85,7 +85,7 @@ contract GuardianRegistrySeverityTest is RegistryTestHarness {
 
         uint256 voteEnd = vm.getBlockTimestamp();
         reviewEnd = voteEnd + REVIEW_PERIOD;
-        governor.setProposal(PID, voteEnd, reviewEnd);
+        _registerReview(PID, voteEnd, reviewEnd);
         registry.openReview(address(governor), PID);
 
         vm.prank(approver1);
@@ -138,7 +138,7 @@ contract GuardianRegistrySeverityTest is RegistryTestHarness {
     ///         vanishes cleanly rather than leaving rounding dust.
     function test_severity_collapsedBandSingleValue() public {
         // Squeeze the band to a point at 5000/5000. Order matters: lower the
-        // ceiling first (5000 ≥ minSlashBps 1000, ≥ maxDelegatedSlashBps 2000),
+        // ceiling first (5000 ≥ minSlashBps 1000),
         // then raise the floor to meet it (5000 ≤ maxSlashBps 5000).
         vm.startPrank(regOwner);
         swood.setMaxSlashBps(5000);
@@ -182,7 +182,7 @@ contract GuardianRegistrySeverityTest is RegistryTestHarness {
 
         uint256 voteEnd = vm.getBlockTimestamp();
         reviewEnd = voteEnd + REVIEW_PERIOD;
-        governor.setProposal(PID, voteEnd, reviewEnd);
+        _registerReview(PID, voteEnd, reviewEnd);
         registry.openReview(address(governor), PID);
 
         vm.prank(blocker1);

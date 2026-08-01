@@ -95,16 +95,11 @@ contract DeploySherwood is ScriptBase {
     uint256 constant DEFAULT_SLASH_APPEAL_SEED = 1_000_000e18;
     uint256 constant DEFAULT_EPOCH_ZERO_SEED = 10_000e18;
     uint256 constant DEFAULT_MIN_SLASH_BPS = 1000; // 10%
-    // The own-stake severity ceiling may now be a full 100% — own stake is a
-    // plain integer with no share math to brick. The C-2 pool-bricking guard
-    // (a 100% slash zeroes `poolTokens` while `poolShares` stay nonzero,
-    // bricking `delegateStake` in `Math.mulDiv`) lives on
-    // `maxDelegatedSlashBps` (< 10_000) below.
+    // The own-stake severity ceiling may be a full 100% — own stake is a
+    // plain integer with no share math to brick.
     uint256 constant DEFAULT_MAX_SLASH_BPS = 10_000; // 100%
-    uint256 constant DEFAULT_MAX_DELEGATED_SLASH_BPS = 2000; // 20%
     uint256 constant DEFAULT_AGE_FLOOR_BPS = 2500; // 25% weight at age 0
     uint256 constant DEFAULT_MATURATION_PERIOD = 30 days;
-    uint256 constant DEFAULT_DELEGATED_WEIGHT_CAP_X = 4; // 4x aged own weight
 
     struct Config {
         address ensRegistrar;
@@ -313,10 +308,8 @@ contract DeploySherwood is ScriptBase {
                     minOwnerStake: DEFAULT_MIN_OWNER_STAKE,
                     minSlashBps: DEFAULT_MIN_SLASH_BPS,
                     maxSlashBps: DEFAULT_MAX_SLASH_BPS,
-                    maxDelegatedSlashBps: DEFAULT_MAX_DELEGATED_SLASH_BPS,
                     ageFloorBps: DEFAULT_AGE_FLOOR_BPS,
-                    maturationPeriod: DEFAULT_MATURATION_PERIOD,
-                    delegatedWeightCapX: DEFAULT_DELEGATED_WEIGHT_CAP_X
+                    maturationPeriod: DEFAULT_MATURATION_PERIOD
                 }))
         );
         return

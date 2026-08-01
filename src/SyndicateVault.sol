@@ -400,11 +400,6 @@ contract SyndicateVault is
         _;
     }
 
-    modifier onlyActiveStrategy() {
-        if (msg.sender != _activeStrategy()) revert NotActiveStrategy();
-        _;
-    }
-
     /// @dev Read governor address from factory
     function _getGovernor() internal view returns (address) {
         return ISyndicateFactory(_factory).governorOf(address(this));
@@ -576,18 +571,25 @@ contract SyndicateVault is
         return _activeStrategy();
     }
 
-    /// @dev Reads the active proposal's `strategy` field through the governor.
-    ///      Returns `address(0)` when no proposal is active OR when the active
-    ///      proposal opted out of live NAV (proposer passed `strategy=0`).
-    ///      Wrapped in try/catch for `getProposal` because struct-shape drift
-    ///      across pre-V1.5 governors must not brick LP flow.
+    /// @dev Reads the active proposal's strategy through the governor's scalar
+    ///      `strategyOf` getter. Returns `address(0)` when no proposal is active
+    ///      OR when the active proposal opted out of live NAV (proposer passed
+    ///      `strategy=0`). Still wrapped in try/catch: the shape argument (an
+    ///      `address` return cannot drift the way the old full-struct
+    ///      `getProposal` read could) says nothing about EXISTENCE. The vault is
+    ///      a UUPS proxy and the governor is a BEACON proxy — they upgrade on
+    ///      independent paths, so a vault impl that calls `strategyOf` can go
+    ///      live before the governor beacon carries it, and the call then reverts
+    ///      with no data. `_activeStrategy` feeds `_laneState`, hence
+    ///      `maxWithdraw`/`maxRedeem`, so an uncaught revert here is a vault-wide
+    ///      brick rather than a degradation.
     function _activeStrategy() internal view returns (address) {
         address gov = _getGovernor();
         if (gov == address(0)) return address(0);
         uint256 pid = IProposalStatus(gov).getActiveProposal();
         if (pid == 0) return address(0);
-        try IProposalStatus(gov).getProposal(pid) returns (ISyndicateGovernor.StrategyProposal memory p) {
-            return p.strategy;
+        try IProposalStatus(gov).strategyOf(pid) returns (address strategy) {
+            return strategy;
         } catch {
             return address(0);
         }
@@ -639,6 +641,30 @@ contract SyndicateVault is
     {
         if (from != address(0) && to != address(0) && _isLaneALocked(from)) revert SharesLocked();
         super._update(from, to, value);
+        // AUTO-DELEGATE ON EVERY RECEIPT (PR #24 review 🔴1). Decision D1 makes
+        // the compensation escrow apportion on `getPastVotes`, which equals
+        // balance only if every holder is delegated. Delegating only on the
+        // MINT paths left plain ERC20 transfers — including `requestRedeem`'s
+        // move into queue custody — landing on undelegated addresses with zero
+        // votes at every snapshot: a secondary buyer or a queued exiter would
+        // be silently written out of victim compensation while still counted
+        // in its denominator. Runs AFTER `super._update` so the recipient's
+        // post-receipt balance is what checkpoints. Holders that explicitly
+        // delegated away keep their choice (`delegates(to) != 0`). On a LIVE
+        // vault this upgrade heals an undelegated holder at its next receipt;
+        // it cannot retroactively re-checkpoint the past.
+        //
+        // THE HEAL IS PERMISSIONLESS AND DOES NOT NEED THE HOLDER (PR #24
+        // review round 2). This runs on a ZERO-VALUE transfer too — ERC20
+        // permits `value == 0` and `super._update` takes the same path — so
+        // ANYONE can arm a stranded legacy holder by sending it 0 shares. A
+        // keeper can walk the holder set and heal all of it in an afternoon,
+        // which turns the live-vault caveat from "wait for their next receipt,
+        // whenever that is" into a bounded operational task. Do it BEFORE a
+        // snapshot is needed: the checkpoint lands when the transfer does.
+        if (to != address(0) && delegates(to) == address(0)) {
+            _delegate(to, to);
+        }
     }
 
     /// @dev Use timestamp-based voting checkpoints instead of block numbers
@@ -783,7 +809,7 @@ contract SyndicateVault is
     }
 
     /// @dev Closed-deposit gate: reverts unless deposits are open OR `who` is
-    ///      whitelisted. Shared by `_deposit` / `requestDeposit` / `strategyMint`.
+    ///      whitelisted. Shared by `_deposit` / `requestDeposit`.
     function _requireApprovedDepositor(address who) private view {
         if (!_openDeposits && !_approvedDepositors.contains(who)) revert NotApprovedDepositor();
     }
@@ -851,11 +877,7 @@ contract SyndicateVault is
         if (_depositsLocked() && !laneA) revert DepositsLocked();
         _requireApprovedDepositor(receiver);
         super._deposit(caller, receiver, assets, shares);
-
-        // Auto-delegate: if receiver has no delegate, delegate to self
-        if (delegates(receiver) == address(0)) {
-            _delegate(receiver, receiver);
-        }
+        // Auto-delegation happens in `_update` (every receipt path).
 
         // G1: a Lane A entry locks the receiver's shares until this proposal
         // settles — closes the deposit-low / exit-high intra-proposal MEV.
@@ -979,12 +1001,16 @@ contract SyndicateVault is
         if (msg.sender != owner_) {
             _spendAllowance(owner_, msg.sender, shares);
         }
-        // Move shares into queue custody. Voting weight at the queue address is 0
-        // (queue contract has no delegate). For proposals already open at request
-        // time, the voter's checkpoint at `snapshotTimestamp` is frozen with the
-        // pre-transfer weight, so vote power is preserved for in-flight proposals.
-        // Queued shares forfeit voting power for any proposal opened after escrow.
-        // Shares are burned later by `claim`.
+        // Move shares into queue custody. `_update` auto-delegates the queue to
+        // itself, so custody shares keep checkpointed voting weight AT THE QUEUE
+        // — which is what lets the compensation escrow count them at a pre-drain
+        // snapshot and the queue pay that claim through to request owners
+        // (`VaultWithdrawalQueue.claimCompensation`, PR #24 review 🔴1). The
+        // queue never votes: it has no governance surface. For proposals already
+        // open at request time, the voter's checkpoint at `snapshotTimestamp` is
+        // frozen with the pre-transfer weight, so vote power is preserved for
+        // in-flight proposals. Queued shares forfeit voting power for any
+        // proposal opened after escrow. Shares are burned later by `claim`.
         uint256 pid = _activePid();
         _transfer(owner_, q, shares);
         requestId = IVaultWithdrawalQueue(q).queueRedeem(owner_, shares, pid);
@@ -1052,51 +1078,10 @@ contract SyndicateVault is
     ///         immediately before this call. Auto-delegates for voting power.
     /// @dev No `nonReentrant`: there is no external call (mint + delegate only),
     ///      and the only caller — the queue's `claim` — is itself `nonReentrant`.
+    ///      Auto-delegation happens in `_update`.
     function settleDeposit(uint256 shares, address to) external {
         if (msg.sender != _withdrawalQueue) revert NotQueue();
         _mint(to, shares);
-        if (delegates(to) == address(0)) _delegate(to, to);
-    }
-
-    /// @inheritdoc ISyndicateVault
-    /// @notice Active-strategy-only: mint `shares` to a depositor whose assets
-    ///         are custodied by the strategy (the strategy oracle-prices the entry).
-    ///         Auto-delegates for voting power if the recipient has no delegate.
-    /// @dev Enforces the same depositor whitelist as `_deposit` (`_openDeposits` /
-    ///      `_approvedDepositors`) so the strategy is not a back door around the
-    ///      vault's access control — a closed-deposit vault stays closed even via
-    ///      the strategy. `whenNotPaused` (above) likewise mirrors `_deposit`, so
-    ///      pausing the vault stops LP inflows during an incident. No `nonReentrant`:
-    ///      there is no external call (mint + delegate only).
-    ///
-    ///      DELIBERATELY does NOT apply the vault's Lane-A `_laneALockPid` (G1) stamp or
-    ///      the `DepositsLocked` gate that `_deposit` uses — those guard the vault's OWN
-    ///      oracle-priced instant-exit (Lane A). A strategy-hook strategy runs Lane A OFF
-    ///      (its `kind` is unregistered in the PriceRouter → `maxRedeem == 0` during a
-    ///      proposal), so there is no oracle-priced vault redeem to MEV; the active strategy
-    ///      prices each entry at its OWN oracle NAV (not the vault's float-only
-    ///      `totalAssets()`, so no float-NAV dilution) and services exits via an oracle-free
-    ///      proportional redeem. Stamping the G1 lock here would BRICK that redeem: `_update`
-    ///      reverts `SharesLocked` on any transfer from a locked holder, and the lock lifts
-    ///      only at settle — which never happens under the indefinite proposal these
-    ///      strategies run. The active-strategy gate is the trust boundary.
-    function strategyMint(address to, uint256 shares) external onlyActiveStrategy whenNotPaused {
-        _requireApprovedDepositor(to);
-        _mint(to, shares);
-        if (delegates(to) == address(0)) _delegate(to, to);
-    }
-
-    /// @inheritdoc ISyndicateVault
-    /// @notice Active-strategy-only: burn `shares` that the strategy pulled from a
-    ///         redeemer (the strategy's oracle-free proportional exit). Burns from
-    ///         `msg.sender` (the strategy holds the redeemer's shares after transfer).
-    /// @dev Not gated by `whenNotPaused`, so the DIRECT `strategy.redeem → strategyBurn`
-    ///      user-exit keeps working while the vault is paused. This does NOT mean all
-    ///      unwinding proceeds when paused: governance settlement (`settleProposal →
-    ///      executeGovernorBatch`) carries `whenNotPaused` and is blocked by a pause —
-    ///      only the per-user direct exit is pause-immune.
-    function strategyBurn(uint256 shares) external onlyActiveStrategy {
-        _burn(msg.sender, shares);
     }
 
     /// @inheritdoc ISyndicateVault

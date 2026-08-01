@@ -11,7 +11,7 @@ import {EnumerableSet} from "@openzeppelin/contracts/utils/structs/EnumerableSet
  *         extracted from `SyndicateVault` to free EIP-170 runtime headroom.
  *
  *   Deployed once and DELEGATECALLed (Foundry auto-links, same idiom as
- *   `LeveragedAeroManager`). Every function runs in the calling vault's storage
+ *   a delegatecall-linked manager library). Every function runs in the calling vault's storage
  *   context: the vault passes its own storage (`EnumerableSet.AddressSet` /
  *   `mapping`) by reference, so the state stays declared in — and owned by —
  *   the vault. Its storage layout is unchanged.

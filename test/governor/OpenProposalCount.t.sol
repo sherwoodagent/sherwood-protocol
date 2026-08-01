@@ -113,10 +113,8 @@ contract OpenProposalCountTest is Test {
                     minOwnerStake: MIN_OWNER_STAKE,
                     minSlashBps: 1000,
                     maxSlashBps: 9999,
-                    maxDelegatedSlashBps: 2000,
                     ageFloorBps: 2500,
-                    maturationPeriod: 30 days,
-                    delegatedWeightCapX: 4
+                    maturationPeriod: 30 days
                 }))
         );
         swood = StakedWood(address(new ERC1967Proxy(address(swoodImpl), swoodInit)));
@@ -155,8 +153,11 @@ contract OpenProposalCountTest is Test {
         registry = GuardianRegistry(address(new ERC1967Proxy(address(regImpl), regInit)));
         // Authorize the per-vault governor on the composite-key registry
         // (replaces the removed governor.addVault wiring).
+        // Hoisted: `vault()` is a call, so evaluating it as an argument would
+        // consume the prank and leave `addGovernor` unauthorized.
+        address govVault = governor.vault();
         vm.prank(registry.factory());
-        registry.addGovernor(address(governor));
+        registry.addGovernor(address(governor), govVault);
         require(address(registry) == predictedRegistryProxy, "registry addr mismatch");
 
         // Resolve the registry ↔ sWOOD circular dependency.
@@ -434,17 +435,22 @@ contract OpenProposalCountTest is Test {
         uint256 pid = _propose();
         _voteFor(pid);
 
-        // Past voteEnd → GuardianReview, past reviewEnd with no blockers
-        // would be Approved, past executeBy with no executeProposal call
-        // would be Expired. The VIEW remains at GuardianReview until a
-        // mutating `_resolveState` calls `resolveReview` on the registry.
+        // Past voteEnd → GuardianReview; past reviewEnd with no blockers →
+        // Approved; past executeBy with no executeProposal call → Expired.
+        // `stateOf` is a true view, so it reports Expired straight away rather
+        // than pinning at GuardianReview until someone pokes the registry.
+        //
+        // The COUNTER, however, is storage: it can only move in a transaction.
+        // That gap — view already resolved, bookkeeping not yet committed — is
+        // precisely why the permissionless `resolveProposalState` flush still
+        // exists after the refactor.
         vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + REVIEW_PERIOD + EXECUTION_WINDOW + 1);
         assertEq(
             uint256(governor.getProposalState(pid)),
-            uint256(ISyndicateGovernor.ProposalState.GuardianReview),
-            "view pins at GuardianReview until registry resolves"
+            uint256(ISyndicateGovernor.ProposalState.Expired),
+            "true view: Expired once executeBy passes, no poke required"
         );
-        assertEq(governor.openProposalCount(), 1, "counter stuck at 1 pre-flush");
+        assertEq(governor.openProposalCount(), 1, "counter stuck at 1 until the flush commits");
 
         // Permissionless flush resolves the registry review AND commits the
         // state transition, decrementing the counter.

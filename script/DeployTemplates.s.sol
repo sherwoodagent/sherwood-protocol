@@ -4,11 +4,7 @@ pragma solidity 0.8.28;
 import {ScriptBase} from "./ScriptBase.sol";
 import {console} from "forge-std/console.sol";
 import {IStrategy} from "../src/interfaces/IStrategy.sol";
-import {MoonwellSupplyStrategy} from "../src/strategies/MoonwellSupplyStrategy.sol";
-import {AerodromeLPStrategy} from "../src/strategies/AerodromeLPStrategy.sol";
 import {VeniceInferenceStrategy} from "../src/strategies/VeniceInferenceStrategy.sol";
-import {WstETHMoonwellStrategy} from "../src/strategies/WstETHMoonwellStrategy.sol";
-import {MamoYieldStrategy} from "../src/strategies/MamoYieldStrategy.sol";
 import {PortfolioStrategy} from "../src/strategies/PortfolioStrategy.sol";
 import {UniswapSwapAdapter} from "../src/adapters/UniswapSwapAdapter.sol";
 
@@ -20,8 +16,8 @@ import {UniswapSwapAdapter} from "../src/adapters/UniswapSwapAdapter.sol";
  *         Appends new addresses and validates all templates after deployment.
  *
  *         Per-chain matrix:
- *           Base (8453): Moonwell, Aerodrome, Venice, wstETH, Mamo, Portfolio + UniswapSwapAdapter
- *           Other:       Moonwell, Aerodrome, Venice, wstETH, Mamo (Portfolio skipped if no Uniswap V3)
+ *           Chains with Uniswap V3: Venice, Portfolio + UniswapSwapAdapter
+ *           Other:                  Venice (Portfolio skipped if no Uniswap V3)
  *
  *   Usage:
  *     forge script script/DeployTemplates.s.sol:DeployTemplates \
@@ -31,11 +27,7 @@ import {UniswapSwapAdapter} from "../src/adapters/UniswapSwapAdapter.sol";
  *     forge script script/DeployTemplates.s.sol:DeployTemplates --rpc-url base
  */
 contract DeployTemplates is ScriptBase {
-    string constant MOONWELL_KEY = "MOONWELL_SUPPLY_TEMPLATE";
-    string constant AERODROME_KEY = "AERODROME_LP_TEMPLATE";
     string constant VENICE_KEY = "VENICE_INFERENCE_TEMPLATE";
-    string constant WSTETH_KEY = "WSTETH_MOONWELL_TEMPLATE";
-    string constant MAMO_KEY = "MAMO_YIELD_TEMPLATE";
     string constant PORTFOLIO_KEY = "PORTFOLIO_TEMPLATE";
     string constant UNISWAP_SWAP_ADAPTER_KEY = "UNISWAP_SWAP_ADAPTER";
 
@@ -52,11 +44,7 @@ contract DeployTemplates is ScriptBase {
     }
 
     struct Templates {
-        address moonwell;
-        address aerodrome;
         address venice;
-        address wsteth;
-        address mamo;
         address portfolio;
         address uniswapSwapAdapter;
     }
@@ -97,22 +85,14 @@ contract DeployTemplates is ScriptBase {
 
     /// @notice Read already-deployed template addresses from the chain JSON into `t`.
     function _readExisting(Templates memory t, string memory json) internal pure {
-        t.moonwell = _tryReadAddress(json, MOONWELL_KEY);
-        t.aerodrome = _tryReadAddress(json, AERODROME_KEY);
         t.venice = _tryReadAddress(json, VENICE_KEY);
-        t.wsteth = _tryReadAddress(json, WSTETH_KEY);
-        t.mamo = _tryReadAddress(json, MAMO_KEY);
         t.portfolio = _tryReadAddress(json, PORTFOLIO_KEY);
         t.uniswapSwapAdapter = _tryReadAddress(json, UNISWAP_SWAP_ADAPTER_KEY);
     }
 
     /// @notice Persist deployed template addresses back to the chain JSON.
     function _save(Templates memory t, string memory path, bool hasUniswapV3) internal {
-        vm.writeJson(vm.toString(t.moonwell), path, string.concat(".", MOONWELL_KEY));
-        vm.writeJson(vm.toString(t.aerodrome), path, string.concat(".", AERODROME_KEY));
         vm.writeJson(vm.toString(t.venice), path, string.concat(".", VENICE_KEY));
-        vm.writeJson(vm.toString(t.wsteth), path, string.concat(".", WSTETH_KEY));
-        vm.writeJson(vm.toString(t.mamo), path, string.concat(".", MAMO_KEY));
         if (hasUniswapV3) {
             vm.writeJson(vm.toString(t.uniswapSwapAdapter), path, string.concat(".", UNISWAP_SWAP_ADAPTER_KEY));
             vm.writeJson(vm.toString(t.portfolio), path, string.concat(".", PORTFOLIO_KEY));
@@ -123,28 +103,6 @@ contract DeployTemplates is ScriptBase {
     function _deployAll(Templates memory t, bool hasUniswapV3) internal returns (bool anyDeployed) {
         vm.startBroadcast();
 
-        if (_needsDeploy(t.moonwell)) {
-            if (t.moonwell != address(0)) {
-                console.log("  Stale    MoonwellSupplyStrategy:   %s (no code, redeploying)", t.moonwell);
-            }
-            t.moonwell = address(new MoonwellSupplyStrategy());
-            console.log("  Deployed MoonwellSupplyStrategy:   %s", t.moonwell);
-            anyDeployed = true;
-        } else {
-            console.log("  Skipped  MoonwellSupplyStrategy:   %s (already deployed)", t.moonwell);
-        }
-
-        if (_needsDeploy(t.aerodrome)) {
-            if (t.aerodrome != address(0)) {
-                console.log("  Stale    AerodromeLPStrategy:      %s (no code, redeploying)", t.aerodrome);
-            }
-            t.aerodrome = address(new AerodromeLPStrategy());
-            console.log("  Deployed AerodromeLPStrategy:      %s", t.aerodrome);
-            anyDeployed = true;
-        } else {
-            console.log("  Skipped  AerodromeLPStrategy:      %s (already deployed)", t.aerodrome);
-        }
-
         if (_needsDeploy(t.venice)) {
             if (t.venice != address(0)) {
                 console.log("  Stale    VeniceInferenceStrategy:  %s (no code, redeploying)", t.venice);
@@ -154,28 +112,6 @@ contract DeployTemplates is ScriptBase {
             anyDeployed = true;
         } else {
             console.log("  Skipped  VeniceInferenceStrategy:  %s (already deployed)", t.venice);
-        }
-
-        if (_needsDeploy(t.wsteth)) {
-            if (t.wsteth != address(0)) {
-                console.log("  Stale    WstETHMoonwellStrategy:   %s (no code, redeploying)", t.wsteth);
-            }
-            t.wsteth = address(new WstETHMoonwellStrategy());
-            console.log("  Deployed WstETHMoonwellStrategy:   %s", t.wsteth);
-            anyDeployed = true;
-        } else {
-            console.log("  Skipped  WstETHMoonwellStrategy:   %s (already deployed)", t.wsteth);
-        }
-
-        if (_needsDeploy(t.mamo)) {
-            if (t.mamo != address(0)) {
-                console.log("  Stale    MamoYieldStrategy:        %s (no code, redeploying)", t.mamo);
-            }
-            t.mamo = address(new MamoYieldStrategy());
-            console.log("  Deployed MamoYieldStrategy:        %s", t.mamo);
-            anyDeployed = true;
-        } else {
-            console.log("  Skipped  MamoYieldStrategy:        %s (already deployed)", t.mamo);
         }
 
         // Portfolio + UniswapSwapAdapter ship as a pair — the strategy hardcodes
@@ -231,20 +167,8 @@ contract DeployTemplates is ScriptBase {
 
     /// @notice Validate all deployed templates have correct on-chain state.
     function _validate(Templates memory t, bool hasUniswapV3) internal view {
-        require(t.moonwell.code.length > 0, "MoonwellSupplyStrategy: no code");
-        console.log("  MoonwellSupplyStrategy:  code OK (%s bytes)", t.moonwell.code.length);
-
-        require(t.aerodrome.code.length > 0, "AerodromeLPStrategy: no code");
-        console.log("  AerodromeLPStrategy:     code OK (%s bytes)", t.aerodrome.code.length);
-
         require(t.venice.code.length > 0, "VeniceInferenceStrategy: no code");
         console.log("  VeniceInferenceStrategy: code OK (%s bytes)", t.venice.code.length);
-
-        require(t.wsteth.code.length > 0, "WstETHMoonwellStrategy: no code");
-        console.log("  WstETHMoonwellStrategy:  code OK (%s bytes)", t.wsteth.code.length);
-
-        require(t.mamo.code.length > 0, "MamoYieldStrategy: no code");
-        console.log("  MamoYieldStrategy:       code OK (%s bytes)", t.mamo.code.length);
 
         if (hasUniswapV3) {
             require(t.uniswapSwapAdapter.code.length > 0, "UniswapSwapAdapter: no code");
@@ -260,17 +184,9 @@ contract DeployTemplates is ScriptBase {
             console.log("  PortfolioStrategy:       skipped (no Uniswap V3)");
         }
 
-        _validateName(t.moonwell, "Moonwell Supply", "MoonwellSupplyStrategy");
-        _validateName(t.aerodrome, "Aerodrome LP", "AerodromeLPStrategy");
         _validateName(t.venice, "Venice Inference", "VeniceInferenceStrategy");
-        _validateName(t.wsteth, "wstETH Moonwell Yield", "WstETHMoonwellStrategy");
-        _validateName(t.mamo, "Mamo Yield", "MamoYieldStrategy");
 
-        require(IStrategy(t.moonwell).vault() == address(0), "MoonwellSupplyStrategy: already initialized");
-        require(IStrategy(t.aerodrome).vault() == address(0), "AerodromeLPStrategy: already initialized");
         require(IStrategy(t.venice).vault() == address(0), "VeniceInferenceStrategy: already initialized");
-        require(IStrategy(t.wsteth).vault() == address(0), "WstETHMoonwellStrategy: already initialized");
-        require(IStrategy(t.mamo).vault() == address(0), "MamoYieldStrategy: already initialized");
 
         console.log("  All templates: vault == address(0) (not initialized) OK");
     }

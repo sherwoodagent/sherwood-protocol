@@ -82,11 +82,15 @@ jobs:
           restore-keys: |
             forge-${{ env.FOUNDRY_VERSION }}-
 
-      # Both scripts run `forge build` themselves and rely on
-      # extra_output = ["storageLayout"] being present in every artifact.
-      - name: Storage parity (LeveragedAero seam)
-        run: ./script/check-storage-parity.sh
-
+      # Runs `forge build` itself and relies on extra_output = ["storageLayout"]
+      # being present in every artifact.
+      #
+      # The LeveragedAero storage-parity step was dropped with the seam it
+      # guarded: `check-storage-parity.sh` pinned the delegatecall layout shared
+      # by LeveragedAerodromeCLStrategy and LeveragedAeroManager, and both were
+      # removed with the Base-chain strategies. Nothing delegatecalls a shared
+      # 7201 struct any more, so there is no seam left to drift. Restore the step
+      # alongside the script if a delegatecall pair is ever reintroduced.
       - name: Layout goldens (governor + factory)
         run: ./script/check-layout-goldens.sh
 

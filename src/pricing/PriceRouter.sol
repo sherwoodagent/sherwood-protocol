@@ -14,7 +14,28 @@ import {IStrategy} from "../interfaces/IStrategy.sol";
 ///         Fail-closed: any unknown kind / adapter revert / not-OK adapter /
 ///         over-cap result yields `(0, false)` so the consuming vault silently
 ///         falls back to the async (Lane B) settlement path. Phase 1 of the
-///         live-NAV redesign (PR #357) — no vault consumes this yet.
+///         live-NAV redesign (PR #357).
+///
+/// @dev    CURRENTLY INERT, BUT NOT UNUSED. A previous version of this note said
+///         "no vault consumes this yet" — false: `SyndicateVault._laneState`
+///         calls `valueStrategy` and adds the result into `totalAssets()`.
+///         What is true today is narrower: no adapter is registered (the
+///         Moonwell and Aerodrome adapters were removed with the Base-chain
+///         strategies), and no surviving strategy overrides `positions()`, so
+///         `valueStrategy` short-circuits on the empty array and every vault
+///         takes Lane B. See issue #54 before adding an adapter.
+///
+/// @dev    THE OUTPUT IS NOT NORMALIZED, and a consumer must not assume it is.
+///         Each adapter answers in ITS OWN numeraire at that token's decimals —
+///         `IPriceAdapter.value` promises only "the position's underlying
+///         units" — and `_priceOne`'s haircut is a bps ratio, so it PRESERVES
+///         whatever unit the adapter returned. Nothing here converts, and
+///         `valueStrategy` takes no vault or asset argument, so it could not
+///         check even if it wanted to. That makes "the adapter's numeraire
+///         equals `asset()` at `asset().decimals()`" an UNENFORCED PRECONDITION
+///         on the vault's share price, and the first thing any new adapter must
+///         uphold — bind the locator to `IERC4626(vault()).asset()` and fail
+///         closed, as the removed `AerodromeLPStrategy` did.
 contract PriceRouter is Initializable, OwnableUpgradeable, UUPSUpgradeable, IPriceRouter {
     uint16 internal constant MAX_HAIRCUT_BPS = 10_000;
 
@@ -118,6 +139,30 @@ contract PriceRouter is Initializable, OwnableUpgradeable, UUPSUpgradeable, IPri
     }
 
     /// @inheritdoc IPriceRouter
+    /// @dev ONE-SIDED HAIRCUT, SYMMETRIC CONSUMER — read this before raising it
+    ///      above 0 for a kind whose Lane A is enabled.
+    ///
+    ///      The haircut is a realizability discount, and it is applied to the
+    ///      single value `SyndicateVault.totalAssets()` consumes for BOTH
+    ///      directions. On the redeem side that is the intent: an exiter is paid
+    ///      against a conservative mark. On the DEPOSIT side it inverts —
+    ///      `_deposit` mints against an understated NAV, so a Lane A depositor
+    ///      receives more shares than the position is worth, and the vault's own
+    ///      `_laneALockPid` forces them to hold to settle, which is exactly when
+    ///      the haircut comes off and the difference is realised at the expense
+    ///      of existing holders. For an accrual-lag haircut (realized >= mark
+    ///      essentially always) the capture is near-deterministic rather than a
+    ///      risk premium.
+    ///
+    ///      The correct shape is a two-sided quote — un-haircut "ask" for mints,
+    ///      haircut "bid" for redemptions — which is an `IPriceRouter` change,
+    ///      not a parameter change. Until that lands, either keep the haircut at
+    ///      0 for any kind with `laneAEnabled == true`, or route deposits for
+    ///      that kind to Lane B.
+    ///
+    ///      Currently dormant on three independent counts: no `IPriceAdapter`
+    ///      implementation exists in-tree, no deploy script registers one or
+    ///      enables Lane A, and this mapping defaults to 0.
     function setHaircutBps(bytes32 kind, uint16 bps) external onlyOwner {
         if (bps > MAX_HAIRCUT_BPS) revert HaircutTooHigh();
         if (bps < haircutBps[kind]) revert HaircutCannotDecrease();

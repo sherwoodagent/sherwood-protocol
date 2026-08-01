@@ -251,10 +251,10 @@ contract TierEndToEndTest is Test {
     ///         at the stale, under-covered price.
     function test_e2e_certifiedAdapterReducedCoverage() public {
         _wireTierRegistry();
-        tierRegistry.certify(address(adapter), adapter.deploy.selector, 0, 100); // tier 0, 1%
+        tierRegistry.certify(address(adapter), adapter.deploy.selector, 0, 100, address(0)); // tier 0, 1%
         // Finding 5: settlement calls count toward coverage too — certify the
         // settle call's (usdc, approve) pair so the whole proposal is bounded.
-        tierRegistry.certify(address(usdc), usdc.approve.selector, 0, 100);
+        tierRegistry.certify(address(usdc), usdc.approve.selector, 0, 100, address(0));
 
         uint256 pid = _propose(_singleDeployCall(MAX_CAPITAL));
         assertEq(governor.getProposalTier(pid), 0, "certified tier 0 snapshotted at propose");

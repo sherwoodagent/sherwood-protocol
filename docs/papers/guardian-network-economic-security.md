@@ -184,10 +184,15 @@ slashableBond(g) is measured in dollars at a conservative haircut, because a WOO
 
 ```
 slashableBond(g) = ownStake(g) · priceHaircut
-                 + delegatedInbound(g) · (C / 10⁴) · priceHaircut
 ```
 
-where C is the delegated-slash cap (2000 bps). Delegated stake enters only at that haircut, because a delegated pool cannot be slashed to zero (the first-loss spill lands on own stake, §5.7); counting full delegated weight would break the inequality at the accounting layer before any attack. priceHaircut converts WOOD to a dollar value robust to a coordinated drawdown, and multi-collateral bond legs enter at their own haircuts (§7). Covered TVL per vault is capped at the dollar value of the bonds behind it, so a vault above the WOOD-only budget cannot open coverage-consuming proposals until it is backed by multi-collateral bonds.
+> **Postponement note (2026-07-26).** DPoS delegation — and with it the
+> delegated-inbound term `delegatedInbound(g) · (C/10⁴) · priceHaircut`, the
+> delegated-slash cap, the first-loss spill, and the unbonding escrow (§5.7) —
+> was removed from the implementation before mainnet. The guardian's own bond
+> is the only slashable capital and the only vote weight. §5.7 is retained
+> below as the design record for a future re-introduction, which is a fresh
+> design exercise, not a revert. priceHaircut converts WOOD to a dollar value robust to a coordinated drawdown, and multi-collateral bond legs enter at their own haircuts (§7). Covered TVL per vault is capped at the dollar value of the bonds behind it, so a vault above the WOOD-only budget cannot open coverage-consuming proposals until it is backed by multi-collateral bonds.
 
 There are deliberately no per-proposal earmark locks. The cap nets across time, so the same stake covers sequential proposals across many vaults and only *simultaneous* over-exposure is blocked, which is precisely the batching attack (approve N drains in one window hoping to lose one bond N times over). An approval's coverage stays encumbered until the challenge window (§5.4) has elapsed, and the unstake delay is at least that long, so a guardian cannot approve a proposal and unstake before it can be challenged.
 
@@ -235,7 +240,15 @@ A guilty verdict slashes the proposer bond first and then the convicted approver
 
 Adapters are born tier 2: deploying and registering one requires no permission, at the price of full-notional coverage. Claiming a lower tier is a bonded act. The submitter posts the runtime guards, a certified extractable bound per selector, the valuation method, and a bond underwriting the claim itself. Liability then layers: guardians underwrite losses up to the certified bound; loss beyond it, meaning the guard was bypassed, slashes the submitter's bond first and a protocol insurance backstop second. Guardians can price tier-0 approvals sanely because they are not silently underwriting the correctness of someone else's guard code. Demotion is instant and permissionless on a passed challenge.
 
-### 5.7 Delegated stake
+### 5.7 Delegated stake — POSTPONED (design record)
+
+> **This section describes a mechanism that is NOT in the implementation.**
+> DPoS delegation was removed/postponed on 2026-07-26 (see §5.3 note). The
+> sybil-neutrality argument below — `(O+X)·S/10⁴` — depends on the first-loss
+> spill and the unbonding escrow, neither of which exists in code today; with
+> no delegation surface at all, the sybil-amplification and slash-socialization
+> vectors it closes are equally absent. Kept as the reference design for a
+> future re-introduction.
 
 The coverage arithmetic above is only as deep as the bonds behind it, and most WOOD holders cannot operate simulation infrastructure. Delegation lets them back guardians who can: a delegator deposits WOOD into a guardian's pool against pool shares, and the guardian's review weight becomes own stake plus delegated inbound, shaped by two rules:
 
@@ -300,7 +313,7 @@ Multi-collateral bonds and the dollar-denominated coverage cap belong in step on
 
 Some early simplifications remain. Tiers for the initial adapter set are assigned by governance rather than through the permissionless probation pipeline; the submitter bond and its slash-first layering apply from the start, so a mis-certified bound is backstopped, but the certification is a governance judgment during this period. The watchtower is initially protocol-operated, with the first-detector bounty open to independent watchers and challenge-game silence treated as an alarm. The probation pipeline, threshold-calibrated auto-demotion, and per-risk-class k are later work, because their thresholds need live traffic to calibrate without creating a denial-of-service lever. The whole design leans on oracles: tier-0/1 guards, the price-deviation predicate, and settlement PnL all require manipulation-resistant valuations, and an adapter without one is tier 2 permanently. Challenge-bond sizing is a live calibration between griefing resistance and accessibility. On cold-start, the cohort floor (50,000 WOOD) means a below-floor guardian set cannot block, but under the approve quorum a coverage-consuming proposal that cannot raise covering approvals expires rather than executing unreviewed, so the floor bounds throughput at launch, not safety. The slow-bleed vector (§5.4) is an accepted residual: v1 carries no onchain slow-drain protection at all — neither a cumulative-drawdown predicate nor an outflow-rate cap — so a patient in-envelope bleed is bounded only by monitoring and human response, unbounded in rate onchain. Onchain slow-drain machinery is deferred to later work, to be added only if monitoring shows real attempts.
 
-All parameters quoted in this paper (block quorum 3000 bps, slash bounds 1000–10000 bps, the delegated-slash cap of 2000 bps, the 2500 bps age floor over a 30-day maturation, the 4× delegated-weight cap, k = 1, a conservative WOOD-to-dollar price haircut, the proposer bond as a fraction of max-extractable value, challenge windows of 7 and 14 days, an unstake and exposure-open delay of at least the challenge window, and the appeal participation floor) are initial values subject to governance. The panel bond is slashable only on the bad-faith track, never automatically on a merits overturn. Every new accounting path added by the rollout carries a stated invariant and a fuzz test before merge.
+All parameters quoted in this paper (block quorum 3000 bps, slash bounds 1000–10000 bps, the 2500 bps age floor over a 30-day maturation, k = 1, the delegated-slash cap and 4× delegated-weight cap of the postponed §5.7 design, a conservative WOOD-to-dollar price haircut, the proposer bond as a fraction of max-extractable value, challenge windows of 7 and 14 days, an unstake and exposure-open delay of at least the challenge window, and the appeal participation floor) are initial values subject to governance. The panel bond is slashable only on the bad-faith track, never automatically on a merits overturn. Every new accounting path added by the rollout carries a stated invariant and a fuzz test before merge.
 
 ## 8. Related work
 
@@ -314,7 +327,7 @@ The guardian network composes mechanisms with substantial prior art; what is nov
 
 **Token votes as courts.** The court's structure answers a documented literature: plutocratic token voting is capturable and bribable [14, 15, 16], including via onchain vote-buying and dark-DAO constructions [17]. Kleros supplies the constructive precedents we borrow — coherence-based retroactive stake redistribution for adjudicators, per-case slash caps, and an appeal game whose escalating cost structure makes bribery uneconomical [6].
 
-**Delegated slashing.** Bounding delegator loss while keeping delegates fully exposed has precedent in Livepeer's delegator-slashing debates [18] and the Cosmos SDK's pro-rata delegated slashing [19]; our delegated-slash cap with first-loss spill onto the guardian's own bond is the same concern resolved so that self-delegation through a second wallet buys nothing.
+**Delegated slashing.** Bounding delegator loss while keeping delegates fully exposed has precedent in Livepeer's delegator-slashing debates [18] and the Cosmos SDK's pro-rata delegated slashing [19]; the postponed §5.7 design resolved the same concern with a delegated-slash cap and a first-loss spill onto the guardian's own bond, so that self-delegation through a second wallet bought nothing. (Not in the current implementation — delegation is postponed.)
 
 ## 9. Closing
 

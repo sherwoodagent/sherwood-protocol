@@ -6,6 +6,8 @@ import {ISyndicateVault} from "./interfaces/ISyndicateVault.sol";
 import {IProtocolConfig} from "./interfaces/IProtocolConfig.sol";
 import {IGuardianRegistry} from "./interfaces/IGuardianRegistry.sol";
 import {ITierRegistry} from "./interfaces/ITierRegistry.sol";
+import {IExposureLedger} from "./interfaces/IExposureLedger.sol";
+import {IProposerBondEscrow} from "./interfaces/IProposerBondEscrow.sol";
 import {IStrategy} from "./interfaces/IStrategy.sol";
 import {GovernorParameters} from "./GovernorParameters.sol";
 import {GovernorEmergency} from "./GovernorEmergency.sol";
@@ -37,8 +39,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     /// @notice Proposal ID counter (1-indexed)
     uint256 private _proposalCount;
 
-    /// @notice Proposal ID -> proposal data
-    mapping(uint256 => StrategyProposal) private _proposals;
+    // `_proposals` migrated to ProposalLifecycle (base owns the state machine).
 
     /// @notice Proposal ID -> voter -> bool
     mapping(uint256 => mapping(address => bool)) private _hasVoted;
@@ -49,8 +50,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     /// @notice Currently executing proposal ID (0 if none)
     uint256 private _activeProposal;
 
-    /// @notice Timestamp of last settlement
-    uint256 private _lastSettledAt;
+    // `_lastSettledAt` migrated to ProposalLifecycle (stamped by `_decOpen`).
 
     // ── Collaborative proposal storage ──
 
@@ -62,9 +62,8 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      ISyndicateGovernor / cli / app / subgraph / tests. Bytecode lever.
     mapping(uint256 => mapping(address => bool)) internal coProposerApprovals;
 
-    /// @notice Proposal ID -> deadline for co-proposer consent
-    /// @dev `internal` (no auto-getter): governor-only read. Bytecode lever.
-    mapping(uint256 => uint256) internal collaborationDeadline;
+    // `collaborationDeadline` migrated to ProposalLifecycle (read by the base's
+    // `_computeState` for the Draft -> Expired edge).
 
     /// @notice Simple reentrancy lock for execute/settle entrypoints
     uint256 private _reentrancyStatus;
@@ -96,20 +95,19 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     /// @notice Proposal ID -> settlement (closing) calls
     mapping(uint256 => BatchExecutorLib.Call[]) private _settlementCalls;
 
-    /// @notice Guardian registry. Set in `initialize`; required (non-zero).
-    ///         Fees always route here — no separate recipient slot.
-    address internal _guardianRegistry;
+    // `_guardianRegistry` migrated to ProposalLifecycle. Still set in
+    // `initialize` (writes the inherited slot) and required (non-zero); fees
+    // always route here — no separate recipient slot.
 
     // ── Guardian-review storage ──
     // `_emergencyCallsHashes` and `_emergencyCalls` live in GuardianRegistry.
     // Two mapping slots reclaimed into __gap.
 
-    /// @notice Count of non-terminal proposals (Pending, GuardianReview, Approved, Executed).
-    ///         Used by `GuardianRegistry.requestUnstakeOwner` alongside
-    ///         `_activeProposal` to block owner rage-quit while any proposal
-    ///         is in flight. Incremented on Draft -> Pending. Decremented on
-    ///         the terminal edge (Rejected / Expired / Cancelled / Settled).
-    uint256 private _openProposalCount;
+    // `_openProposalCount` migrated to ProposalLifecycle. Counts non-terminal
+    // proposals (Draft/Pending/GuardianReview/Approved/Executed); used by
+    // `GuardianRegistry.requestUnstakeOwner` alongside `_activeProposal` to
+    // block owner rage-quit while any proposal is in flight. Incremented here
+    // (Draft/Pending); decremented via the inherited `_decOpen`.
 
     /// @dev Escrow of fee transfers that reverted (e.g., USDC blacklist) so the
     ///      rest of `_distributeFees` keeps flowing and settlement never bricks.
@@ -139,6 +137,16 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///         like `setProtocolConfig`).
     address internal _tierRegistry;
 
+    /// @notice Exposure ledger (Plan B, spec §3.7/§3.9). Optional: address(0)
+    ///         skips the covered-TVL cap + proposer-bond gates at propose — the
+    ///         pre-ledger safe default. Wired post-init via `setExposureLedger`
+    ///         (factory-only, like `setTierRegistry`).
+    address internal _exposureLedger;
+
+    /// @notice Proposer bond escrow (Plan B, spec §3.9). Optional: address(0)
+    ///         skips bond locking. Wired via `setBondEscrow` (factory-only).
+    address internal _bondEscrow;
+
     /// @dev Reserved storage for future upgrades (shrunk by 1 for _guardianRegistry,
     ///      shrunk by 1 more for openProposalCount,
     ///      shrunk by 1 more for _unclaimedFees,
@@ -150,8 +158,9 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      grew by 2 after V2: _emergencyCallsHashes + _emergencyCalls moved
     ///      to GuardianRegistry,
     ///      shrunk by 1 for _draftTimingSnap — Sherlock #14 restored,
-    ///      shrunk by 1 for _tierRegistry — Task 5)
-    uint256[33] private __gap;
+    ///      shrunk by 1 for _tierRegistry — Task 5,
+    ///      shrunk by 2 for _exposureLedger + _bondEscrow — Plan B Task 8)
+    uint256[31] private __gap;
 
     /// @param minVotingPeriod_   Per-deployment floor for `votingPeriod` (mainnet 24h).
     /// @param minCooldownPeriod_ Per-deployment floor for `cooldownPeriod` (mainnet 1h).
@@ -202,16 +211,8 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
 
     // ── GovernorEmergency virtual accessor overrides ──
 
-    function _getProposal(uint256 id) internal view override returns (StrategyProposal storage) {
-        return _proposals[id];
-    }
-
     function _getSettlementCalls(uint256 id) internal view override returns (BatchExecutorLib.Call[] storage) {
         return _settlementCalls[id];
-    }
-
-    function _getRegistry() internal view override returns (IGuardianRegistry) {
-        return IGuardianRegistry(_guardianRegistry);
     }
 
     function _emergencyReentrancyEnter() internal override {
@@ -263,7 +264,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // clamped to the maxCapitalBps ceiling (finding 3), drawdown
         // declaration capped at 100%.
         if (envelope.maxCapital == 0) revert ZeroMaxCapital();
-        // maxCapital ceiling (finding 3) is enforced in `_snapshotTier` below —
+        // maxCapital ceiling (finding 3) is enforced in `_snapshotTierAndGate` below —
         // same tx, hoisted off this frame for Yul stack budget.
         if (envelope.maxDrawdownBps > 10_000) revert InvalidDrawdown();
 
@@ -312,7 +313,16 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             p.snapshotGuardiansFeeRecipient = cfg.guardiansFeeRecipient();
         }
         if (isCollaborative) {
-            p.state = ProposalState.Draft;
+            _transition(p, ProposalState.Draft);
+            // Written HERE, not in `_storeCoProposers` (which runs after
+            // `_snapshotTierAndGate`): `lockBond` is a state-changing external
+            // call, and a WOOD with a transfer hook can re-enter the governor
+            // mid-propose. A Draft observed with `collaborationDeadline == 0`
+            // resolves to Expired (the base's `_computeState` Draft -> Expired
+            // edge), which permissionless `resolveProposalState` would commit —
+            // bricking the proposal (`approveCollaboration` then reverts
+            // `NotDraftState` forever).
+            collaborationDeadline[proposalId] = block.timestamp + _params.collaborationWindow;
             // Sherlock #14: snapshot timing params for the collaborative Draft
             // so the Draft → Pending transition can't be moved by a mid-Draft
             // owner param change. Packed (executionWindow << 128 | votingPeriod).
@@ -340,7 +350,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // calldata arrays so the `envelope`/`executeCalls` calldata refs are
         // dead by this point — keeps propose() under Yul's stack budget. Reads
         // the same storage arrays Task 6 re-resolves at execute time.
-        _snapshotTier(p, _loadCalls(_executeCalls, proposalId));
+        _snapshotTierAndGate(p, _loadCalls(_executeCalls, proposalId));
 
         // Store co-proposers and set collaboration deadline
         if (coProposers.length > 0) {
@@ -354,7 +364,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     function vote(uint256 proposalId, VoteType support) external nonReentrant {
         StrategyProposal storage proposal = _proposals[proposalId];
         if (proposal.id == 0) revert ProposalNotFound();
-        if (_resolveState(proposal) != ProposalState.Pending) revert NotWithinVotingPeriod();
+        if (_commitState(proposal) != ProposalState.Pending) revert NotWithinVotingPeriod();
         if (_hasVoted[proposalId][msg.sender]) revert AlreadyVoted();
 
         // Get vote weight from ERC20Votes checkpoint at proposal creation
@@ -379,7 +389,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         StrategyProposal storage proposal = _proposals[proposalId];
 
         // Resolve state (may transition Pending->Approved/Rejected/Expired or Approved->Expired)
-        if (_resolveState(proposal) != ProposalState.Approved) revert ProposalNotApproved();
+        if (_commitState(proposal) != ProposalState.Approved) revert ProposalNotApproved();
 
         address vault = proposal.vault;
         if (_activeProposal != 0) revert StrategyAlreadyActive();
@@ -396,7 +406,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
 
         // Update state BEFORE external call (CEI pattern)
         _activeProposal = proposalId;
-        proposal.state = ProposalState.Executed;
+        _transition(proposal, ProposalState.Executed);
         proposal.executedAt = block.timestamp;
         // Counter stays incremented through Executed; decremented once on the
         // Executed -> Settled edge in `_finishSettlement`. `_activeProposal`
@@ -418,6 +428,36 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         if (liveTier > proposal.envelopeTier) revert TierRegressed();
         if (liveCoverage > proposal.requiredCoverage) revert CoverageRegressed();
 
+        // Plan B (spec §3.3a): a coverage-consuming proposal at/above the tier
+        // threshold cannot execute without a bond-encumbered approve quorum —
+        // silence no longer passes it, so R1 always has an identified,
+        // stake-backed approver to hold liable. The §3.10 ROE arithmetic (spec
+        // §4 gate 2) is now validated, so the launch threshold is 0 — EVERY
+        // tier is fail-closed, not tier 2 alone (ADR 2026-07-27). Coverage was
+        // always sized per-tier and correctly; what was missing was enforcing
+        // it below tier 2.
+        // A revert here leaves the proposal Approved: it expires at `executeBy`
+        // unless covering approvals arrive first (the cold-start behaviour
+        // §3.3a wants — suppressing the cohort blocks execution, never forces it).
+        {
+            address ledger = _exposureLedger;
+            // `requiredCoverage == 0` keeps optimistic passage: spec §3.3a
+            // carves out "proposals that move no coverage-consuming value", and
+            // demanding a covering signer for a proposal that can extract
+            // nothing is pure throughput loss (review finding M-1). Largely
+            // defensive today — `propose` rejects `maxCapital == 0`
+            // (`ZeroMaxCapital`), so zero coverage at tier 2 is not currently
+            // reachable — but the gate should key on extractable value, which is
+            // what the quorum actually underwrites.
+            if (
+                ledger != address(0) && proposal.requiredCoverage != 0
+                    && proposal.envelopeTier >= IExposureLedger(ledger).quorumTierThreshold()
+            ) {
+                IExposureLedger(ledger)
+                    .requireApproveQuorum(address(this), proposalId, asset, proposal.requiredCoverage);
+            }
+        }
+
         // Execute the opening calls via the vault. The risk envelope's
         // maxCapital caps the batch's net asset outflow (spec 2026-07-22 §3.1).
         ISyndicateVault(vault).executeGovernorBatch(calls, proposal.maxCapital);
@@ -429,7 +469,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     /// @notice Settle a strategy. Proposer can settle at any time; anyone else must wait for duration.
     function settleProposal(uint256 proposalId) external nonReentrant {
         StrategyProposal storage proposal = _proposals[proposalId];
-        if (_resolveState(proposal) != ProposalState.Executed) revert ProposalNotExecuted();
+        if (_commitState(proposal) != ProposalState.Executed) revert ProposalNotExecuted();
 
         uint256 minWait =
             msg.sender == proposal.proposer ? MIN_STRATEGY_DURATION_BEFORE_SELF_SETTLE : proposal.strategyDuration;
@@ -464,10 +504,17 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     function cancelProposal(uint256 proposalId) external nonReentrant {
         StrategyProposal storage proposal = _proposals[proposalId];
         if (msg.sender != proposal.proposer) revert NotProposer();
-        ProposalState s = _resolveState(proposal);
+        ProposalState s = _commitState(proposal);
         if (s == ProposalState.Pending) {
             // Pending: only during the voting period.
             if (block.timestamp > proposal.voteEnd) revert ProposalNotCancellable();
+            // The review was registered at the Draft -> Pending transition, so
+            // it must be closed here too — otherwise a keeper opens it at
+            // `voteEnd` and guardians are slashed for approving a proposal that
+            // is already Cancelled. Best-effort (see `_closeReviewIfRegistered`);
+            // in this branch `block.timestamp <= voteEnd < reviewEnd` and the
+            // review cannot yet be open, so it takes the never-opened path.
+            _closeReviewIfRegistered(proposal);
             _decOpen();
         } else if (s == ProposalState.GuardianReview) {
             // Close the registry-side review BEFORE marking the proposal
@@ -493,7 +540,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         } else {
             revert ProposalNotCancellable();
         }
-        proposal.state = ProposalState.Cancelled;
+        _transition(proposal, ProposalState.Cancelled);
         emit ProposalCancelled(proposalId, msg.sender);
     }
 
@@ -504,31 +551,60 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     function emergencyCancel(uint256 proposalId) external nonReentrant {
         StrategyProposal storage proposal = _proposals[proposalId];
         _requireVaultOwner(proposal.vault);
-        ProposalState s = _resolveState(proposal);
+        ProposalState s = _commitState(proposal);
         // PR #324 review 4454151855 + Sherlock #8: BOTH Draft and Pending
         // increment the open count, so BOTH must decrement on cancel —
         // otherwise a cancelled Draft soft-locks the vault (every later
         // propose reverts VaultHasOpenProposal).
         if (s != ProposalState.Pending && s != ProposalState.Draft) revert ProposalNotCancellable();
+        // Pending carries a registered review (Draft does not — the window is
+        // pushed on the Draft -> Pending transition, and the guard inside
+        // `_closeReviewIfRegistered` no-ops for the Draft case).
+        _closeReviewIfRegistered(proposal);
         _decOpen();
-        proposal.state = ProposalState.Cancelled;
+        _transition(proposal, ProposalState.Cancelled);
         emit ProposalCancelled(proposalId, msg.sender);
     }
 
-    /// @dev Decrement the open-proposal counter AND stamp the settle cooldown.
-    ///      PR #359 review #1: `_lastSettledAt` is bumped HERE, the single
-    ///      chokepoint, rather than at each caller — the lazy `_resolveState`
-    ///      terminal path is reachable permissionlessly via
-    ///      `resolveProposalState` and previously skipped the bump, letting
-    ///      propose→resolve→propose→execute dodge the cooldown.
-    function _decOpen() private {
-        --_openProposalCount;
-        _lastSettledAt = block.timestamp;
-    }
+    // `_decOpen()` and `openProposalCount()` are inherited from
+    // ProposalLifecycle (single chokepoint: `_decOpen` decrements the counter
+    // AND stamps `_lastSettledAt` so the permissionless lazy terminal path via
+    // `resolveProposalState` can't dodge the settle cooldown).
 
     /// @inheritdoc ISyndicateGovernor
-    function openProposalCount() public view override(GovernorParameters, ISyndicateGovernor) returns (uint256) {
-        return _openProposalCount;
+    /// @dev Spec §3.9. ONE reclaim entrypoint rather than hooks in the settle /
+    ///      cancel / expiry / emergency paths — fewer seams to keep in sync,
+    ///      and the lazy terminal resolution means expiry has no hook to attach
+    ///      to anyway. Permissionless is safe because `releaseBond` pays the
+    ///      proposer the ESCROW recorded at lock time, so an arbitrary caller
+    ///      can only accelerate the refund, never redirect it.
+    ///
+    ///      Rejected / Expired / Cancelled all return the bond: forfeiture is
+    ///      exclusively a passed-challenge outcome (Plan C) — a guardian block
+    ///      is not a conviction, and an expired proposal moved no funds.
+    ///
+    ///      Releases against `proposal.proposerBondEscrow` (bound at propose),
+    ///      NOT the live `_bondEscrow` slot: the escrow has no owner and no
+    ///      discretionary exit, and its bond key is (governor, proposalId), so
+    ///      releasing against a re-pointed slot would strand the WOOD forever.
+    function reclaimProposerBond(uint256 proposalId) external nonReentrant {
+        StrategyProposal storage proposal = _proposals[proposalId];
+        if (proposal.id == 0) revert ProposalNotFound();
+        ProposalState s = _commitState(proposal);
+        if (
+            s != ProposalState.Rejected && s != ProposalState.Expired && s != ProposalState.Cancelled
+                && s != ProposalState.Settled
+        ) {
+            revert ProposalNotTerminal();
+        }
+        uint256 bond = proposal.proposerBondWood;
+        if (bond == 0) revert NoBondToReclaim();
+        address escrow = proposal.proposerBondEscrow;
+        // Effects before interaction: zeroing first makes the reclaim
+        // idempotent (a second call reverts NoBondToReclaim) and closes any
+        // re-entrant double-release through a hooked WOOD.
+        proposal.proposerBondWood = 0;
+        IProposerBondEscrow(escrow).releaseBond(proposalId);
     }
 
     /// @inheritdoc ISyndicateGovernor
@@ -537,8 +613,12 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     function vetoProposal(uint256 proposalId) external nonReentrant {
         StrategyProposal storage proposal = _proposals[proposalId];
         _requireVaultOwner(proposal.vault);
-        if (_resolveState(proposal) != ProposalState.Pending) revert ProposalNotCancellable();
-        proposal.state = ProposalState.Rejected;
+        if (_commitState(proposal) != ProposalState.Pending) revert ProposalNotCancellable();
+        _transition(proposal, ProposalState.Rejected);
+        // Same registered-review cleanup as the Pending branch of
+        // `cancelProposal`: a vetoed proposal can never execute, so its review
+        // must not stay open for a keeper to slash its approvers on.
+        _closeReviewIfRegistered(proposal);
         // `_activeProposal` is unset during Pending (only set by execute).
         _decOpen();
         emit ProposalVetoed(proposalId, msg.sender);
@@ -547,10 +627,10 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     // ==================== COLLABORATIVE PROPOSALS ====================
 
     /// @inheritdoc ISyndicateGovernor
-    function approveCollaboration(uint256 proposalId) external {
+    function approveCollaboration(uint256 proposalId) external nonReentrant {
         StrategyProposal storage proposal = _proposals[proposalId];
         ProposalState storedState = proposal.state;
-        ProposalState state = _resolveState(proposal);
+        ProposalState state = _commitState(proposal);
         // Give a specific error for expired collaboration windows
         if (state != ProposalState.Draft) {
             if (storedState == ProposalState.Draft && block.timestamp > collaborationDeadline[proposalId]) {
@@ -577,7 +657,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             if (_openProposalCount > 1) revert VaultHasOpenProposal();
             // Transition to Pending -- voting begins
             uint256 reviewPeriod_ = IGuardianRegistry(_guardianRegistry).reviewPeriod();
-            proposal.state = ProposalState.Pending;
+            _transition(proposal, ProposalState.Pending);
             // -1: see propose() (G-C1).
             proposal.snapshotTimestamp = block.timestamp - 1;
             // Sherlock #14: timing comes from the propose-time snapshot, not
@@ -591,20 +671,33 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             proposal.vetoThresholdBps = _params.vetoThresholdBps;
             // Sherlock #8: the Draft already incremented _openProposalCount at
             // propose time — do NOT re-increment here.
+            // Push the review window to the registry so it can resolve the
+            // guardian review without calling back. Guarded on
+            // `reviewEnd > voteEnd`: when `reviewPeriod == 0` (registry not
+            // wired / unit-test mock) `reviewEnd == voteEnd` and the registry
+            // would revert `InvalidReviewWindow` — the base's `_afterVote`
+            // treats that collapsed window as cleared.
+            // LOAD-BEARING: this predicate must stay identical to the one
+            // `_afterVote` tests. A proposal that gets past it there without
+            // having been registered here auto-approves with no guardian
+            // review — see the SECURITY INVARIANT in `ProposalLifecycle`.
+            if (proposal.reviewEnd > proposal.voteEnd) {
+                IGuardianRegistry(_guardianRegistry).registerReview(proposalId, proposal.voteEnd, proposal.reviewEnd);
+            }
             emit CollaborationTransitionedToPending(proposalId);
         }
     }
 
     /// @inheritdoc ISyndicateGovernor
-    function rejectCollaboration(uint256 proposalId) external {
+    function rejectCollaboration(uint256 proposalId) external nonReentrant {
         StrategyProposal storage proposal = _proposals[proposalId];
-        if (_resolveState(proposal) != ProposalState.Draft) revert NotDraftState();
+        if (_commitState(proposal) != ProposalState.Draft) revert NotDraftState();
 
         // Sherlock #9: lead-only. A dissenting co-proposer simply withholds
         // approval (the Draft lapses at the collaboration window).
         if (proposal.proposer != msg.sender) revert NotLeadProposer();
 
-        proposal.state = ProposalState.Cancelled;
+        _transition(proposal, ProposalState.Cancelled);
         // Sherlock #8: Draft binds the vault — decrement on reject.
         _decOpen();
         emit CollaborationRejected(proposalId, msg.sender);
@@ -616,7 +709,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     /// @notice Permissionless: flushes a proposal's lazy terminal-state
     ///         transition (Rejected / Expired) so that
     ///         `_openProposalCount` dec commits.
-    /// @dev `_resolveState` dec's the counter when it transitions the proposal
+    /// @dev `_commitState` dec's the counter when it transitions the proposal
     ///      into a terminal state, but each mutating caller (`vote`,
     ///      `executeProposal`, `settleProposal`, `cancelProposal`,
     ///      `emergencyCancel`, `vetoProposal`, collaborative approve/reject)
@@ -628,10 +721,10 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      `requestUnstakeOwner` (which also OR-checks `openProposalCount`).
     ///      Idempotent: re-calling after the transition has already committed
     ///      is a no-op.
-    function resolveProposalState(uint256 proposalId) external {
+    function resolveProposalState(uint256 proposalId) external nonReentrant {
         StrategyProposal storage proposal = _proposals[proposalId];
         if (proposal.id == 0) revert ProposalNotFound();
-        _resolveState(proposal);
+        _commitState(proposal);
     }
 
     // ==================== VIEWS ====================
@@ -639,12 +732,17 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     /// @inheritdoc ISyndicateGovernor
     function getProposal(uint256 proposalId) external view returns (StrategyProposal memory p) {
         p = _proposals[proposalId];
-        p.state = _resolveStateView(_proposals[proposalId]);
+        // Overwrite the returned memory copy's state with the authoritative
+        // resolved value (tuple-destructure into the memory field — this is a
+        // returned-struct copy, not the storage single-writer path).
+        (p.state,) = _computeState(_proposals[proposalId]);
     }
 
     /// @inheritdoc ISyndicateGovernor
+    /// @dev Delegates to the base `stateOf` so the interface accessor and the
+    ///      authoritative resolver can never drift.
     function getProposalState(uint256 proposalId) external view returns (ProposalState) {
-        return _resolveStateView(_proposals[proposalId]);
+        return stateOf(proposalId);
     }
 
     // V1.5 cleanup: dropped `getProposalCalls(uint256)` (concat helper).
@@ -719,6 +817,16 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     }
 
     /// @inheritdoc ISyndicateGovernor
+    function exposureLedger() external view returns (address) {
+        return _exposureLedger;
+    }
+
+    /// @inheritdoc ISyndicateGovernor
+    function bondEscrow() external view returns (address) {
+        return _bondEscrow;
+    }
+
+    /// @inheritdoc ISyndicateGovernor
     function getProposalTier(uint256 proposalId) external view returns (uint8) {
         return _proposals[proposalId].envelopeTier;
     }
@@ -728,22 +836,39 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         return _proposals[proposalId].requiredCoverage;
     }
 
-    /// @notice Narrow proposal view consumed by the guardian registry.
-    /// @dev Returns a tuple (`voteEnd`, `reviewEnd`, `vault`) encoded to match
-    ///      `GuardianRegistry.IGovernorMinimal.ProposalView`. Keeps the registry
-    ///      decoupled from the full `StrategyProposal` ABI.
+    /// @notice Strategy adapter of a proposal (address(0) = none / opted out of
+    ///         live NAV). Scalar seam for the vault — replaces the vault's
+    ///         full-struct getProposal read.
+    function strategyOf(uint256 proposalId) external view returns (address) {
+        return _proposals[proposalId].strategy;
+    }
+
+    /// @notice Narrow proposal view: (`voteEnd`, `reviewEnd`, `vault`).
+    /// @dev RETAINED: the guardian registry no longer calls this (it reads its own
+    ///      pushed `reviewWindow` and `vaultOf`), but the Plan B `ExposureLedger`
+    ///      reads `.vault` through this getter on the approve-vote path. Do not
+    ///      remove until that consumer migrates to the registry's `vaultOf`.
     function getProposalView(uint256 proposalId) external view returns (ProposalViewLite memory v) {
         StrategyProposal storage p = _proposals[proposalId];
         v.voteEnd = p.voteEnd;
         v.reviewEnd = p.reviewEnd;
         v.vault = p.vault;
+        // `executeBy + strategyDuration` bounds the LATEST instant this proposal
+        // can still be settling, which is what the exposure ledger sizes a
+        // guardian's commitment against (ADR 2026-07-26). Read at approve time,
+        // before execution has happened, so `executeBy` is the conservative
+        // anchor — `executedAt` is not known yet and may never be set.
+        v.executeBy = p.executeBy;
+        v.strategyDuration = p.strategyDuration;
     }
 
-    /// @dev Mirrors `GuardianRegistry.IGovernorMinimal.ProposalView` for ABI parity.
+    /// @dev Narrow proposal tuple returned by `getProposalView`.
     struct ProposalViewLite {
         uint256 voteEnd;
         uint256 reviewEnd;
         address vault;
+        uint256 executeBy;
+        uint256 strategyDuration;
     }
 
     // ==================== INTERNAL ====================
@@ -758,13 +883,25 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         p.voteEnd = block.timestamp + _params.votingPeriod;
         p.reviewEnd = p.voteEnd + reviewPeriod_;
         p.executeBy = p.reviewEnd + _params.executionWindow;
-        p.state = ProposalState.Pending;
+        _transition(p, ProposalState.Pending);
         // G-H6: snapshot vetoThresholdBps so a mid-vote timelock finalize
         // can't retroactively move the threshold for this proposal.
         p.vetoThresholdBps = _params.vetoThresholdBps;
         // Draft doesn't count (not binding on the vault); Pending does.
         unchecked {
             ++_openProposalCount;
+        }
+        // Push the review window to the registry so it can resolve the guardian
+        // review without a call-back. Guarded on `reviewEnd > voteEnd`: with
+        // `reviewPeriod == 0` (registry not wired / unit-test mock) the window
+        // collapses and the registry would revert `InvalidReviewWindow` — the
+        // base's `_afterVote` treats that collapsed window as cleared.
+        // LOAD-BEARING: this predicate must stay identical to the one
+        // `_afterVote` tests. A proposal that gets past it there without having
+        // been registered here auto-approves with no guardian review — see the
+        // SECURITY INVARIANT in `ProposalLifecycle`.
+        if (p.reviewEnd > p.voteEnd) {
+            IGuardianRegistry(_guardianRegistry).registerReview(p.id, p.voteEnd, p.reviewEnd);
         }
     }
 
@@ -781,13 +918,17 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         if (maxCapital > ceiling) revert MaxCapitalExceedsCeiling();
     }
 
-    /// @dev Thin store-wrapper around `_resolveTierAndCoverage`, hoisted out of
-    ///      `propose` to keep that function under Yul's stack budget (see
-    ///      `_initPendingProposal`). Reads p.maxCapital / p.id from storage
-    ///      (written before this call in `propose`) rather than taking them as
-    ///      stack arguments — the propose() call site must stay exactly
+    /// @dev Resolves and stores the proposal's tier + required coverage, then
+    ///      runs the Plan B propose-time gates: the maxCapital ceiling check,
+    ///      the exposure ledger's covered-TVL cap, and the risk-scaled proposer
+    ///      bond (which PULLS WOOD from the proposer — a state-changing
+    ///      external call, see the CEI note at the `lockBond` site below).
+    ///      Hoisted out of `propose` to keep that function under Yul's stack
+    ///      budget (see `_initPendingProposal`). Reads p.maxCapital / p.id from
+    ///      storage (written before this call in `propose`) rather than taking
+    ///      them as stack arguments — the propose() call site must stay exactly
     ///      `(p, _loadCalls(...))`-shaped or Yul goes "too deep by 1 slot".
-    function _snapshotTier(StrategyProposal storage p, BatchExecutorLib.Call[] memory execCalls) private {
+    function _snapshotTierAndGate(StrategyProposal storage p, BatchExecutorLib.Call[] memory execCalls) private {
         // Finding 3: envelope ceiling check. Lives here (not in propose's
         // validation block) purely for the same stack-budget reason — an extra
         // call frame in propose() tips it over. Same-tx revert either way.
@@ -796,6 +937,60 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             _resolveTierAndCoverage(execCalls, _loadCalls(_settlementCalls, p.id), p.maxCapital);
         p.envelopeTier = tier_;
         p.requiredCoverage = coverage_;
+        // Plan B gates (spec §3.7 + §3.9). Skipped when unwired — the
+        // pre-ledger safe default matches the tierRegistry pattern.
+        address ledger = _exposureLedger;
+        if (ledger != address(0)) {
+            address asset = IERC4626(GovernorParameters.vault).asset();
+            IExposureLedger(ledger).requireWithinCoveredTvlCap(asset, coverage_);
+            // Fail on the PROPOSER, not on the cohort (review N4): a duration
+            // whose settlement outruns the ledger's booking horizon would
+            // otherwise leave every approve vote unable to book, turning the
+            // review block-only.
+            // `p.executeBy` IS STILL ZERO ON THE COLLABORATIVE PATH (review
+            // N11). `_initPendingProposal` writes it, and `propose` only calls
+            // that on the non-collaborative branch — a co-proposed strategy
+            // sits in Draft until `approveCollaboration`, which re-runs no
+            // ledger gate. Passing the raw field made the check
+            // `strategyDuration > block.timestamp`, unsatisfiable on any real
+            // chain, so the gate silently could not fire for co-proposed
+            // strategies. (Foundry's default `t = 1` hides it.)
+            //
+            // Compute the WORST-CASE deadline instead, which is well-defined
+            // before any of it is written and covers both paths from the one
+            // site: a Draft may idle for `collaborationWindow` before
+            // activating, then run voting -> review -> execution.
+            uint256 deadline = p.executeBy;
+            if (deadline == 0) {
+                ISyndicateGovernor.GovernorParams memory gp = _params;
+                deadline = block.timestamp + gp.collaborationWindow + gp.votingPeriod
+                    + IGuardianRegistry(_guardianRegistry).reviewPeriod() + gp.executionWindow;
+            }
+            IExposureLedger(ledger).requireWithinCoverageHorizon(deadline, p.strategyDuration);
+            address escrow = _bondEscrow;
+            if (escrow != address(0)) {
+                uint256 bondWood = IExposureLedger(ledger).proposerBondWood(asset, coverage_);
+                if (bondWood != 0) {
+                    // Bind the bond to THIS escrow: `reclaimProposerBond`
+                    // releases against the stored address, so re-pointing
+                    // `_bondEscrow` later cannot strand it (the escrow has no
+                    // owner and no discretionary exit; its bond key is
+                    // (governor, proposalId), so nobody else can address it).
+                    // Both writes precede the external call (CEI).
+                    p.proposerBondWood = bondWood;
+                    p.proposerBondEscrow = escrow;
+                    // STATE-CHANGING external call: `lockBond` pulls WOOD via
+                    // `transferFrom`, so a WOOD with a transfer hook can
+                    // re-enter this governor here. INVARIANT: every
+                    // proposal-state field the lifecycle reads must ALREADY be
+                    // written by this point (including
+                    // `collaborationDeadline`, hoisted into `propose`'s
+                    // isCollaborative branch for exactly this reason). Do not
+                    // move a state write below this call.
+                    IProposerBondEscrow(escrow).lockBond(p.id, p.proposer, bondWood);
+                }
+            }
+        }
     }
 
     /// @dev Proposal tier = max tier across EXECUTE calls; coverage = the
@@ -906,12 +1101,15 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         revert NotCoProposer();
     }
 
-    /// @dev Store co-proposers, set deadline, emit event
+    /// @dev Store co-proposers, emit event. `collaborationDeadline` is NOT set
+    ///      here — `propose` writes it in the `isCollaborative` branch, before
+    ///      any external call, so the Draft is never observable with a zero
+    ///      deadline (which the base's `_computeState` maps to Expired). See the
+    ///      ordering comment at the `lockBond` call site.
     function _storeCoProposers(uint256 proposalId, CoProposer[] calldata coProposers) internal {
         for (uint256 i = 0; i < coProposers.length; i++) {
             _coProposers[proposalId].push(coProposers[i]);
         }
-        collaborationDeadline[proposalId] = block.timestamp + _params.collaborationWindow;
 
         address[] memory coAddrs = new address[](coProposers.length);
         uint256[] memory splits = new uint256[](coProposers.length);
@@ -952,99 +1150,11 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         if (totalCoSplitBps > 9000) revert LeadSplitTooLow();
     }
 
-    /// @dev Compute the resolved state and persist any transitions to storage.
-    ///      Drives registry-side review resolution when the review window has
-    ///      elapsed and no cached resolution exists yet (mutating path).
-    function _resolveState(StrategyProposal storage proposal) internal returns (ProposalState) {
-        ProposalState stored = proposal.state;
-        ProposalState resolved = _resolveStateView(proposal);
-
-        // If the review window ended and the registry hasn't cached a resolution
-        // yet, call `resolveReview` once to finalize it. Mirrors the view-path
-        // logic but commits the registry-side state.
-        if (resolved == ProposalState.GuardianReview && block.timestamp > proposal.reviewEnd) {
-            bool blocked = IGuardianRegistry(_guardianRegistry).resolveReview(address(this), proposal.id);
-            if (blocked) {
-                resolved = ProposalState.Rejected;
-            } else {
-                resolved = block.timestamp > proposal.executeBy ? ProposalState.Expired : ProposalState.Approved;
-            }
-            emit GuardianReviewResolved(proposal.id, blocked);
-        }
-
-        if (resolved != stored) {
-            proposal.state = resolved;
-            // Sherlock #8: Draft binds the vault — both Draft and non-Draft
-            // terminal transitions decrement. Draft additionally emits its
-            // telemetry event.
-            if (resolved == ProposalState.Rejected || resolved == ProposalState.Expired) {
-                _decOpen();
-                if (stored == ProposalState.Draft) emit CollaborationDeadlineExpired(proposal.id);
-            }
-        }
-        return resolved;
-    }
-
-    /// @dev Pure state resolution logic (view-only, no storage writes).
-    ///      Optimistic governance: proposals pass the vote unless AGAINST votes
-    ///      reach veto threshold, then transition to GuardianReview until the
-    ///      review window ends. After review, they map to Approved or Rejected
-    ///      based on the registry's cached resolution.
-    function _resolveStateView(StrategyProposal storage proposal) internal view returns (ProposalState) {
-        ProposalState stored = proposal.state;
-
-        if (stored == ProposalState.Draft) {
-            return block.timestamp > collaborationDeadline[proposal.id] ? ProposalState.Expired : ProposalState.Draft;
-        }
-
-        if (stored == ProposalState.Pending) {
-            if (block.timestamp <= proposal.voteEnd) return ProposalState.Pending;
-
-            // Voting ended -- optimistic: approved unless AGAINST votes reach veto threshold
-            // G-H4: skip the veto check when pastTotalSupply == 0, otherwise
-            // the threshold collapses to 0 and every proposal auto-rejects.
-            // G-H6: read the snapshot taken at Draft -> Pending, not the live
-            // `_params.vetoThresholdBps`, so mid-vote timelock finalizes
-            // don't move the bar for in-flight proposals.
-            uint256 pastTotalSupply = IVotes(proposal.vault).getPastTotalSupply(proposal.snapshotTimestamp);
-            if (pastTotalSupply > 0) {
-                uint256 vetoThreshold = (pastTotalSupply * proposal.vetoThresholdBps) / BPS_DENOMINATOR;
-                if (proposal.votesAgainst >= vetoThreshold) {
-                    return ProposalState.Rejected;
-                }
-            }
-
-            // Voting passed — fall through to guardian-review handling below.
-            return _resolveAfterVote(proposal);
-        }
-
-        if (stored == ProposalState.GuardianReview) {
-            return _resolveAfterVote(proposal);
-        }
-
-        if (stored == ProposalState.Approved) {
-            return block.timestamp > proposal.executeBy ? ProposalState.Expired : ProposalState.Approved;
-        }
-
-        return stored;
-    }
-
-    /// @dev Maps a vote-passed proposal to GuardianReview / Approved / Rejected / Expired
-    ///      based on `reviewEnd` and the registry's cached review state.
-    function _resolveAfterVote(StrategyProposal storage proposal) internal view returns (ProposalState) {
-        if (block.timestamp <= proposal.reviewEnd) return ProposalState.GuardianReview;
-
-        (, bool resolved, bool blocked, bool cohortTooSmall) =
-            IGuardianRegistry(_guardianRegistry).getReviewState(address(this), proposal.id);
-        if (resolved) {
-            if (blocked && !cohortTooSmall) return ProposalState.Rejected;
-            return block.timestamp > proposal.executeBy ? ProposalState.Expired : ProposalState.Approved;
-        }
-        // Review window ended but registry hasn't resolved yet — remain in
-        // GuardianReview. Mutating callers (`_resolveState`) will trigger
-        // `resolveReview` which maps to Approved / Rejected.
-        return ProposalState.GuardianReview;
-    }
+    // State resolution folded into ProposalLifecycle: mutating callers use
+    // `_commitState` (resolves + fires the registry economic commit on the
+    // concluding review transition), read-only callers use `_computeState` /
+    // `stateOf` (the ONE pure resolver — a TRUE view that never lags
+    // determinable reality).
 
     /// @dev Finalize a settled proposal: compute P&L, distribute fees, clear
     ///      counters. Invoked by both happy-path `settleProposal` and the
@@ -1080,7 +1190,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
 
         // Finalize state before external transfers to prevent reentrancy on stale state
         _activeProposal = 0;
-        proposal.state = ProposalState.Settled;
+        _transition(proposal, ProposalState.Settled);
         delete _capitalSnapshots[proposalId];
         // Open emergency reviews are NOT auto-cancelled here — they resolve
         // naturally via `resolveEmergencyReview` at reviewEnd (slashing if the
@@ -1147,7 +1257,8 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///             read LIVE at settle — the one non-snapshotted rate)
     ///      Escape hatch: IStrategy.selfManagesFees() == true (snapshotted at propose)
     ///      skips this ENTIRE waterfall — the strategy must self-collect including the
-    ///      protocol's cut (e.g. LeveragedAeroFees.protocolFeeOwed).
+    ///      protocol's cut. No in-tree strategy currently does; any that sets
+    ///      the flag must implement its own protocol-fee leg.
     ///      Failure mode: any recipient transfer that reverts escrows in _unclaimedFees
     ///      (pull via claimUnclaimedFees) so settlement never bricks.
     function _distributeFees(
@@ -1317,6 +1428,60 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     function setTierRegistry(address newRegistry) external onlyFactory {
         emit TierRegistrySet(_tierRegistry, newRegistry);
         _tierRegistry = newRegistry;
+    }
+
+    /// @inheritdoc ISyndicateGovernor
+    /// @dev address(0) is legal: it un-wires the ledger and the covered-TVL cap
+    ///      + proposer-bond gates are then skipped — the pre-ledger safe
+    ///      default (mirrors `setTierRegistry`).
+    ///
+    ///      WIRING ORDER (precondition): seed `setAssetFeed(vaultAsset, ...)`
+    ///      AND `setCoveredTvlCapUsd(...)` on the ledger BEFORE wiring it here.
+    ///      The gates are fail-closed by design, so a wired ledger with an
+    ///      unpriceable vault asset (`FeedNotConfigured` / `StalePrice`) or a
+    ///      zero cap (`CoveredTvlCapExceeded`) halts ALL proposal creation for
+    ///      this vault.
+    ///
+    ///      RECOVERY (corrected, review finding I-3): `address(0)` is accepted
+    ///      here, but the factory has NO path that passes it — both callers
+    ///      (`createSyndicate` and `pushWiring`) SKIP unset slots rather than
+    ///      writing zero, precisely so wiring can never be silently removed.
+    ///      Un-wiring an already-wired governor is therefore not reachable in
+    ///      practice. Recover instead at the ledger (ledger-owner:
+    ///      `setAssetFeed` / `setCoveredTvlCapUsd`), or point the factory at a
+    ///      fresh permissive ledger and `pushWiring` this governor.
+    function setExposureLedger(address newLedger) external onlyFactory {
+        // NOT WHILE PROPOSALS ARE OPEN (review n3). A proposal created before
+        // the ledger existed carries no booked coverage — nobody could have
+        // booked any — but `executeProposal` starts demanding it the moment the
+        // ledger is wired, so those proposals become permanently unexecutable.
+        //
+        // The M3 change made this worse rather than better: the approve hook now
+        // books nothing instead of reverting, so the failure moved from LOUD at
+        // vote time to SILENT until execute. Refusing the wiring is the only
+        // point where it is still visible.
+        //
+        // Un-wiring (`newLedger == 0`) is exempt: it can only relax the execute
+        // gate, never brick a proposal that was relying on it.
+        if (newLedger != address(0) && _openProposalCount > 0) revert ParamsFrozenDuringProposal();
+        emit ExposureLedgerSet(_exposureLedger, newLedger);
+        _exposureLedger = newLedger;
+    }
+
+    /// @inheritdoc ISyndicateGovernor
+    /// @dev address(0) is legal: it un-wires the escrow and no bond is locked at
+    ///      propose.
+    ///
+    ///      Unlike `setTierRegistry`, this slot has CUSTODIAL meaning: the
+    ///      escrow holds real WOOD for already-created proposals. Re-point it
+    ///      only at ZERO outstanding bonds. Bonds already locked are released
+    ///      against the escrow stored per proposal
+    ///      (`StrategyProposal.proposerBondEscrow`), never this live slot — so
+    ///      re-pointing is safe for existing proposals, and a new escrow applies
+    ///      only to proposals created after the change.
+    function setBondEscrow(address newEscrow) external onlyFactory {
+        emit BondEscrowSet(_bondEscrow, newEscrow);
+        _bondEscrow = newEscrow;
     }
 
     /// @inheritdoc ISyndicateGovernor

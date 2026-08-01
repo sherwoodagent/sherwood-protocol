@@ -3,7 +3,6 @@ pragma solidity 0.8.28;
 
 import {Test} from "forge-std/Test.sol";
 import {SyndicateVault} from "../../../src/SyndicateVault.sol";
-import {ISyndicateGovernor} from "../../../src/interfaces/ISyndicateGovernor.sol";
 import {ERC20Mock} from "../../mocks/ERC20Mock.sol";
 
 /// @notice Router mock: `valueStrategy` returns the strategy's live mark and a
@@ -98,13 +97,7 @@ contract InstantLiquidityHandler is Test {
             mockGovernor, abi.encodeWithSignature("openProposalCount()"), abi.encode(l ? uint256(1) : uint256(0))
         );
         if (l) {
-            ISyndicateGovernor.StrategyProposal memory p;
-            p.id = pid;
-            p.vault = address(vault);
-            p.strategy = address(strat);
-            vm.mockCall(
-                mockGovernor, abi.encodeWithSelector(ISyndicateGovernor.getProposal.selector, pid), abi.encode(p)
-            );
+            vm.mockCall(mockGovernor, abi.encodeWithSignature("strategyOf(uint256)", pid), abi.encode(address(strat)));
         }
     }
 

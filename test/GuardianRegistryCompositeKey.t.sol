@@ -58,10 +58,8 @@ contract GuardianRegistryCompositeKeyTest is Test {
                     minOwnerStake: OWNER_BOND,
                     minSlashBps: 1000,
                     maxSlashBps: 9999,
-                    maxDelegatedSlashBps: 2000,
                     ageFloorBps: 2500,
-                    maturationPeriod: 30 days,
-                    delegatedWeightCapX: 4
+                    maturationPeriod: 30 days
                 }))
         );
         swood = StakedWood(address(new ERC1967Proxy(address(swoodImpl), swoodInit)));
@@ -75,10 +73,12 @@ contract GuardianRegistryCompositeKeyTest is Test {
         vm.prank(regOwner);
         swood.setRegistry(address(registry));
 
-        // Authorize BOTH governors (the factory does this per createSyndicate).
+        // Authorize BOTH governors (the factory does this per createSyndicate)
+        // and wire each to the vault it serves so the emergency slash resolves
+        // the correct target from `vaultOf` (was fed via getProposalView().vault).
         vm.startPrank(regFactory);
-        registry.addGovernor(address(governorA));
-        registry.addGovernor(address(governorB));
+        registry.addGovernor(address(governorA), vaultA);
+        registry.addGovernor(address(governorB), vaultB);
         vm.stopPrank();
 
         // Cohort: 3 guardians × 20k = 60k total (≥ MIN_COHORT_STAKE_AT_OPEN).
@@ -104,7 +104,8 @@ contract GuardianRegistryCompositeKeyTest is Test {
 
     function _openReviewUnder(MockGovernorMinimal gov) internal {
         uint256 ve = vm.getBlockTimestamp();
-        gov.setProposal(PID, ve, ve + REVIEW_PERIOD);
+        vm.prank(address(gov));
+        registry.registerReview(PID, ve, ve + REVIEW_PERIOD);
         registry.openReview(address(gov), PID);
     }
 
@@ -202,12 +203,8 @@ contract GuardianRegistryCompositeKeyTest is Test {
         _bond(ownerA, vaultA);
         _bond(ownerB, vaultB);
 
-        // Wire pid → vault on each mock so `_resolveEmergency` can look up
-        // the slash target through `er.governor`.
-        uint256 ve = vm.getBlockTimestamp();
-        governorA.setProposalWithVault(PID, ve, ve + REVIEW_PERIOD, vaultA);
-        governorB.setProposalWithVault(PID, ve, ve + REVIEW_PERIOD, vaultB);
-
+        // `_resolveEmergency` resolves the slash target from `vaultOf[er.governor]`
+        // (wired in setUp: governorA→vaultA, governorB→vaultB).
         BatchExecutorLib.Call[] memory calls = _callsFor(address(0xCCCC));
         bytes32 h = keccak256(abi.encode(calls));
         vm.prank(address(governorA));
