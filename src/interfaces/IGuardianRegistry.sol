@@ -40,10 +40,9 @@ interface IGuardianRegistry {
     error ReviewNotReadyForResolve();
     error EmergencyTooManyCalls();
     error EmergencyHashMismatch();
-    /// @notice Sherlock #15 (collapsed into this revert): `openEmergency`
-    ///         invoked while the existing review is still open OR within
-    ///         `reviewPeriod` of a prior `cancelEmergency` on the same
-    ///         proposal. The cooldown branch blocks cancel-and-replay
+    /// @notice `openEmergency` invoked while the existing review is still open
+    ///         OR within `reviewPeriod` of a prior `cancelEmergency` on the
+    ///         same proposal. The cooldown branch blocks cancel-and-replay
     ///         grinding of guardian block votes.
     error EmergencyAlreadyOpen();
     error ProtocolPaused();
@@ -51,10 +50,10 @@ interface IGuardianRegistry {
     error NotPausedOrDeadmanNotElapsed();
     error RefundCapExceeded();
     error InvalidParameter();
-    /// @notice Sherlock #16: `setReviewPeriod` rejected because the new
-    ///         review window exceeds sWOOD's `coolDownPeriod`. A review
-    ///         window longer than the guardian unstake cooldown would let an
-    ///         approver unstake and escape the slash before `resolveReview`.
+    /// @notice `setReviewPeriod` rejected because the new review window
+    ///         exceeds sWOOD's `coolDownPeriod`. A review window longer than
+    ///         the guardian unstake cooldown would let an approver unstake
+    ///         and escape the slash before `resolveReview`.
     error CooldownBelowReviewPeriod();
     error UnauthorizedGovernor();
     /// @notice `registerReview` rejected a window with `voteEnd == 0` (the
@@ -103,7 +102,7 @@ interface IGuardianRegistry {
     ///         is read from sWOOD's `getPastVotes` at the review's `openedAt`.
     ///         Block votes carry no proposed severity — the slash severity is
     ///         a deterministic function of block-side decisiveness, computed
-    ///         at `resolveReview` (spec 2026-07-19 Part D).
+    ///         at `resolveReview`.
     function voteOnProposal(address governor, uint256 proposalId, GuardianVoteType support) external;
 
     // ── Multi-governor management ──
@@ -155,9 +154,9 @@ interface IGuardianRegistry {
     function setReviewPeriod(uint256) external;
     function setBlockQuorumBps(uint256) external;
 
-    /// @notice Wire the exposure ledger consulted on approve-side review votes
-    ///         (spec 2026-07-22 §3.3). address(0) is rejected; address(0) as the
-    ///         current value means unset (hooks skipped).
+    /// @notice Wire the exposure ledger consulted on approve-side review
+    ///         votes. address(0) is rejected; address(0) as the current value
+    ///         means unset (hooks skipped).
     function setExposureLedger(address ledger) external;
     /// @dev Returns the interface-typed handle (matches the `IExposureLedger
     ///      public exposureLedger` state variable getter, mirroring the
@@ -192,7 +191,7 @@ interface IGuardianRegistry {
 
     /// @notice Per-proposal approver set + the COVERAGE each one actually
     ///         underwrote, from the exposure ledger's settled allocation.
-    /// @dev    The weight guardian fees should be paid on (§3.10).
+    /// @dev    The weight guardian fees should be paid on.
     ///         `getApproverWeights` returns staked WOOD, which pays for parking
     ///         capital rather than for underwriting — an approver the ledger
     ///         booked nothing for (no free budget, unpriceable feed, zero

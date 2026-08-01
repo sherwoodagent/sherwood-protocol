@@ -20,9 +20,9 @@ interface ILedgerFreezerMinimal {
 
 /**
  * @title ProposerBondEscrow
- * @notice Holds the risk-scaled proposer bond (spec 2026-07-22 §3.9) for the
- *         lifetime of a proposal. The proposer is the actual attacker in the
- *         threat model, so it posts capital scaled to what the proposal can
+ * @notice Holds the risk-scaled proposer bond for the lifetime of a
+ *         proposal. The proposer is the actual attacker in the threat
+ *         model, so it posts capital scaled to what the proposal can
  *         extract.
  *
  *         TWO EXITS, AND ONLY TWO. `releaseBond` returns the bond to the
@@ -36,16 +36,15 @@ interface ILedgerFreezerMinimal {
  *         construction (equality absent direct transfers; surplus from
  *         donations is permanently stuck, accepted for v1a).
  *
- *         WHY THE SECOND EXIT EXISTS AT ALL. Before it, `releaseBond` was the
- *         only way WOOD ever left this contract, so a bond could be recovered
- *         but never lost — a "deterrent" with no downside branch. Paired with
- *         `SyndicateGovernor`'s one-hour proposer self-settle, a proposer could
- *         execute a drain, settle its own strategy at +1h, reclaim the bond in
- *         full and be gone while the 14-day challenge window was still in its
- *         first day. The two halves are useless apart: a confiscation function
- *         nothing can reach in time changes nothing, and a reclaim delay with
- *         nothing to confiscate at the end of it only inconveniences the
- *         honest. Both landed together.
+ *         BOTH EXITS ARE REQUIRED TOGETHER. `releaseBond` alone would make a
+ *         bond recoverable but never losable — a "deterrent" with no
+ *         downside branch. Paired with `SyndicateGovernor`'s one-hour
+ *         proposer self-settle, a proposer could execute a drain, settle its
+ *         own strategy at +1h, reclaim the bond in full and be gone while the
+ *         14-day challenge window was still in its first day. A confiscation
+ *         function nothing can reach in time changes nothing, and a reclaim
+ *         delay with nothing to confiscate at the end of it only
+ *         inconveniences the honest.
  */
 contract ProposerBondEscrow is IProposerBondEscrow {
     using SafeERC20 for IERC20;
@@ -56,7 +55,7 @@ contract ProposerBondEscrow is IProposerBondEscrow {
     }
 
     /// @dev Integration requirement: WOOD must be a standard ERC20 — no
-    ///      transfer fee, no rebasing, no hooks, AND NO BLOCKLIST (review m3).
+    ///      transfer fee, no rebasing, no hooks, AND NO BLOCKLIST.
     ///      A fee-on-transfer token would make the escrow insolvent (recorded
     ///      amounts exceed held balance). A blocklisting token is the quieter
     ///      hazard: `releaseBond` pays the RECORDED proposer, so blocklisting
@@ -79,7 +78,7 @@ contract ProposerBondEscrow is IProposerBondEscrow {
     ///         cycle without one. It is deployed before both, it is the only
     ///         contract that already treats the game as a privileged role, and
     ///         rotating that role is guarded on its side (`setCoverageFreezer`
-    ///         refuses while anything is frozen, review 🟠F11), which is a
+    ///         refuses while anything is frozen), which is a
     ///         stronger rotation guard than anything this escrow could impose.
     ILedgerFreezerMinimal public immutable exposureLedger;
 
@@ -107,7 +106,7 @@ contract ProposerBondEscrow is IProposerBondEscrow {
     }
 
     /// @inheritdoc IProposerBondEscrow
-    /// @dev `proposer` COMES FROM THE CALLER, not from `msg.sender` (review m4).
+    /// @dev `proposer` COMES FROM THE CALLER, not from `msg.sender`.
     ///      Any authorized governor can therefore lock a bond against any
     ///      address that has approved this escrow — and agents hold standing
     ///      approvals in normal operation. It is a lockup grief rather than
@@ -148,7 +147,7 @@ contract ProposerBondEscrow is IProposerBondEscrow {
     }
 
     /// @inheritdoc IProposerBondEscrow
-    /// @dev THE BOND'S DOWNSIDE BRANCH (spec §3.8 / Plan C). Called from
+    /// @dev THE BOND'S DOWNSIDE BRANCH. Called from
     ///      `ChallengeGame._settle`, the single point at which a proposal is
     ///      convicted — by a guilty court ruling or by the silence verdict,
     ///      which say the same thing about the proposal. Takes `governor`
@@ -170,27 +169,17 @@ contract ProposerBondEscrow is IProposerBondEscrow {
     ///      FAILS CLOSED when the freezer is unset: `msg.sender` can never be
     ///      `address(0)`, so an unwired protocol convicts nothing rather than
     ///      letting anyone confiscate. That is the correct direction — an
-    ///      unreachable forfeiture leaves bonds releasable, which is the
-    ///      pre-Plan-C behaviour, while a permissive one destroys them.
+    ///      unreachable forfeiture leaves bonds releasable, while a
+    ///      permissive one destroys them.
     ///
-    /// @dev DESTINATION — WHERE. Burned. THIS DEVIATES FROM THE WRITTEN SPEC,
-    ///      knowingly and visibly: spec 2026-07-22 §3.9 says "the proposer bond
-    ///      is slashed to the compensation escrow (§3.8) on a passed challenge,
-    ///      before approver stake", and the economic-security paper §5.8 repeats
-    ///      it. The deviation is a SCOPE call, not a disagreement with the
-    ///      spec's intent, and the blocker is mechanical:
+    /// @dev DESTINATION — WHERE. Burned, not routed to `CompensationEscrow`:
     ///      `CompensationEscrow.openCase` is `onlyFunder` against a SINGLE
     ///      owner-set funder slot, already held by `StakedWood`. Paying a bond
-    ///      into it therefore means changing the escrow's access model — a
+    ///      into it would mean changing the escrow's access model — a
     ///      contract that custodies LP compensation and is not otherwise
-    ///      touched by this fix — and that belongs in its own review, not as a
-    ///      side effect of closing a forfeiture hole. Burning is the
-    ///      conservative interim: it is strictly worse for the proposer than
-    ///      the spec's routing (the bond is gone either way) and strictly
-    ///      neutral for everyone else, so switching to §3.8 routing later is a
-    ///      pure improvement to the victims' side with no incentive to unwind.
+    ///      touched here — which belongs in its own review.
     ///
-    ///      It is also independently defensible, by the same reasoning
+    ///      Burning is also independently defensible, by the same reasoning
     ///      `forfeitBurnBps` sets out for the challenger bond, applied to a
     ///      party that is by construction the attacker: EVERY REACHABLE PAYEE
     ///      IS A ROUND TRIP.
@@ -198,15 +187,15 @@ contract ProposerBondEscrow is IProposerBondEscrow {
     ///          its own drain and refund itself the bond it was supposed to
     ///          lose, at the cost of a challenger bond it also gets back.
     ///        - The vault's LPs, via `CompensationEscrow`? Closest to the
-    ///          spec's intent and the right eventual answer — but note even
-    ///          there the proposer may hold shares and recover its pro-rata
-    ///          slice, since the case is apportioned on a pre-drain snapshot it
-    ///          could have bought into before proposing. Beyond the `onlyFunder`
-    ///          blocker above, `openCase` can revert on `EmptySnapshot` /
-    ///          `SnapshotNotPast` / `NothingToCompensate`, and it would be
-    ///          reverting inside `_settle`, where the caller already treats a
-    ///          failable external call as something to wrap rather than trust
-    ///          (see the best-effort `demoteByChallenge`).
+    ///          ideal — but even there the proposer may hold shares and
+    ///          recover its pro-rata slice, since the case is apportioned on
+    ///          a pre-drain snapshot it could have bought into before
+    ///          proposing. Beyond the `onlyFunder` blocker above, `openCase`
+    ///          can revert on `EmptySnapshot` / `SnapshotNotPast` /
+    ///          `NothingToCompensate`, and it would be reverting inside
+    ///          `_settle`, where the caller already treats a failable
+    ///          external call as something to wrap rather than trust (see
+    ///          the best-effort `demoteByChallenge`).
     ///        - A treasury? Pays whoever governs, which the attacker may be or
     ///          may lobby.
     ///      Destruction is the only sink with no beneficiary to be, so the loss

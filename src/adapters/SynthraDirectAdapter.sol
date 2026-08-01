@@ -68,10 +68,8 @@ contract SynthraDirectAdapter is ISwapAdapter {
         address pool = factory.getPool(tokenIn, tokenOut, fee);
         if (pool == address(0)) revert PoolNotFound();
 
-        // Pull tokens from caller
         IERC20(tokenIn).safeTransferFrom(msg.sender, address(this), amountIn);
 
-        // Determine swap direction
         address token0 = ISynthraPool(pool).token0();
         bool zeroForOne = (tokenIn == token0);
 
@@ -85,22 +83,21 @@ contract SynthraDirectAdapter is ISwapAdapter {
             tstore(poolSlot, pool)
         }
 
-        // Execute swap — positive amountSpecified = exact input
+        // Positive amountSpecified = exact input.
         (int256 amount0, int256 amount1) = ISynthraPool(pool)
             .swap(
-                msg.sender, // recipient gets output tokens
+                msg.sender, // output goes directly to the caller
                 zeroForOne,
                 int256(amountIn),
                 zeroForOne ? MIN_SQRT_RATIO + 1 : MAX_SQRT_RATIO - 1,
                 ""
             );
 
-        // Calculate output amount (the negative delta is the output)
+        // Negative delta is the output amount.
         amountOut = zeroForOne ? uint256(-amount1) : uint256(-amount0);
 
         if (amountOut < amountOutMin) revert SlippageExceeded();
 
-        // Clear callback transient state
         assembly {
             tstore(tokenSlot, 0)
             tstore(amountSlot, 0)

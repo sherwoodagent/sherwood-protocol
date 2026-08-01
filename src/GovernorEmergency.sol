@@ -10,7 +10,7 @@ import {ProposalLifecycle} from "./ProposalLifecycle.sol";
 /// @notice Abstract — emergency settlement paths extracted for bytecode headroom.
 ///         Inherited by SyndicateGovernor alongside GovernorParameters.
 ///
-///         V2: All emergency state (call hash, call array, review lifecycle) is
+///         All emergency state (call hash, call array, review lifecycle) is
 ///         owned by GuardianRegistry. Governor entrypoints are thin wrappers that
 ///         delegate to the registry and execute calls on the vault.
 ///
@@ -24,9 +24,8 @@ import {ProposalLifecycle} from "./ProposalLifecycle.sol";
 abstract contract GovernorEmergency is ProposalLifecycle {
     // ── Virtual accessors (implemented by SyndicateGovernor) ──
     //
-    // `_getProposal` / `_getRegistry` are gone: `_proposals` and
-    // `_guardianRegistry` are inherited from `ProposalLifecycle`, which owns the
-    // lifecycle state. What remains virtual is genuinely governor-owned.
+    // `_proposals` and `_guardianRegistry` are inherited from `ProposalLifecycle`,
+    // which owns the lifecycle state. What remains virtual below is governor-owned.
 
     function _getSettlementCalls(uint256) internal view virtual returns (BatchExecutorLib.Call[] storage);
     function _emergencyReentrancyEnter() internal virtual;

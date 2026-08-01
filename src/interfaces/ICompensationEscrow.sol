@@ -5,10 +5,10 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 /// @title ICompensationEscrow
 /// @notice Snapshot-gated victim compensation for the guardian
-///         economic-security model (spec 2026-07-22 §3.8). Slash proceeds fund
-///         per-case claims payable ONLY to holders of record at a pre-drain
-///         snapshot, so a coalition that drains and then accumulates shares
-///         from exiting holders recoups nothing (finding F1).
+///         economic-security model. Slash proceeds fund per-case claims
+///         payable ONLY to holders of record at a pre-drain snapshot, so a
+///         coalition that drains and then accumulates shares from exiting
+///         holders recoups nothing.
 interface ICompensationEscrow {
     error NotAuthorizedFunder();
     error SnapshotNotPast();
@@ -21,8 +21,8 @@ interface ICompensationEscrow {
     error InvalidWindow();
     error ZeroAddress();
     error BackstopIsVault();
-    /// @dev `renounceOwnership` is disabled (PR #56 review): every escape hatch
-    ///      here is `onlyOwner`, and `sweepResidue` reverts forever without a
+    /// @dev `renounceOwnership` is disabled: every escape hatch here is
+    ///      `onlyOwner`, and `sweepResidue` reverts forever without a
     ///      `setBackstop` call, so dropping the owner would strand residue
     ///      permanently. Transfer ownership instead.
     error OwnershipNotRenounceable();
@@ -56,7 +56,7 @@ interface ICompensationEscrow {
     ///      to request owners via `claimCompensation`.
     ///
     /// @dev NOT RETROACTIVE — both halves have caveats on a vault that already
-    ///      exists (PR #24 review 🟠N4):
+    ///      exists:
     ///        - an undelegated holder (last receipt predates the upgrade,
     ///          received only by transfer) has zero votes until its next
     ///          receipt. Self-healing, and forceable by anyone: `_update` fires
@@ -71,13 +71,12 @@ interface ICompensationEscrow {
     ///          queue-replacement path — see `CompensationEscrow`'s contract
     ///          natspec.
     ///
-    /// @dev KNOWN OPEN F1 RECOUPMENT CHANNEL: a holder that explicitly
-    ///      delegated has its compensation credited to the DELEGATE, not to
-    ///      itself. Delegation is free and permissionless, so a coalition can
-    ///      solicit delegations pre-drain and collect the delegating cohort's
-    ///      compensation. Closed by Plan D/E or a balance checkpoint — see the
-    ///      threat model in `CompensationEscrow`'s contract natspec and spec
-    ///      §3.8.
+    /// @dev KNOWN OPEN RECOUPMENT CHANNEL: a holder that explicitly delegated
+    ///      has its compensation credited to the DELEGATE, not to itself.
+    ///      Delegation is free and permissionless, so a coalition can solicit
+    ///      delegations pre-drain and collect the delegating cohort's
+    ///      compensation. See the threat model in `CompensationEscrow`'s
+    ///      contract natspec.
     function claimable(uint256 caseId, address holder) external view returns (uint256);
     function caseOf(uint256 caseId)
         external

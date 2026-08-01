@@ -47,7 +47,7 @@ interface IProtocolConfig {
 
     /// @notice Protocol-wide ceiling on `strategyDuration`; 0 = unset/no ceiling.
     /// @dev    Read by `GovernorParameters` when validating a vault's own
-    ///         `maxStrategyDuration` (ADR 2026-07-26).
+    ///         `maxStrategyDuration`.
     function maxStrategyDuration() external view returns (uint256);
 
     /// @notice The management-fee split in force now.

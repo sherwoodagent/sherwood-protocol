@@ -79,24 +79,23 @@ contract PortfolioStrategy is BaseStrategy {
     error RoutesFrozen();
     error QuoteUnavailable();
     error InvalidPriceDecimals();
-    /// @notice Sherlock #56 — feed id missing at init, or report's `feedId`
-    ///         doesn't match the slot's declared `_feedIds[i]`.
+    /// @notice Feed id missing at init, or report's `feedId` doesn't match
+    ///         the slot's declared `_feedIds[i]`.
     error InvalidFeedId();
     error WrongFeedId(uint256 index, bytes32 expected, bytes32 actual);
     /// @notice Push-mode per-slot max-age (upper 96 bits of `_feedIds[i]`) is
     ///         outside `[MIN_PUSH_PRICE_AGE, MAX_PUSH_PRICE_AGE_CAP]`.
     error InvalidPriceAge();
-    /// @notice Sherlock #52 — basket cannot contain the same token address
-    ///         twice; double-counted balances inflate live NAV.
+    /// @notice Basket cannot contain the same token address twice —
+    ///         duplicates would double-count balances and inflate live NAV.
     error DuplicateToken(address token);
 
     // ── Constants ──
     uint256 public constant MAX_BASKET_SIZE = 20;
     uint256 public constant BPS_DENOMINATOR = 10_000;
     /// @notice Hard ceiling on the swap slippage tolerance, at init and on every
-    ///         update (10%). Matches the cap the leveraged-CL template carried.
-    ///         Live baskets run at 100–500 bps, so this bounds the parameter well
-    ///         above real use while removing the 99.99% setting entirely.
+    ///         update (10%). Live baskets run at 100–500 bps, so this bounds the
+    ///         parameter well above real use while excluding degenerate settings.
     /// @dev    NOT sandwich protection on its own: `_quoteMinOut` measures against
     ///         a quote taken in the same transaction as the swap, so this bounds
     ///         drift from that quote, not from a fair price. The oracle-anchored
@@ -137,8 +136,7 @@ contract PortfolioStrategy is BaseStrategy {
     bool private _rebalancing;
 
     /// @dev Cached `decimals()` of the vault asset, read once at init so the
-    ///      rebalance decimal-scaling math (Sherlock #21/#29) avoids a per-read
-    ///      external call.
+    ///      rebalance decimal-scaling math avoids a per-read external call.
     uint8 internal _assetDecimals;
 
     /// @dev Cached `decimals()` per allocation, parallel to `_allocations`.
@@ -152,9 +150,9 @@ contract PortfolioStrategy is BaseStrategy {
     /// @dev Per-allocation feed identifier. Two modes:
     ///        Data Streams (chainlinkVerifier != 0): the full 32 bytes are the
     ///          expected Data Streams `feedId`; the verifier-decoded report must
-    ///          match exactly or `_verifyPrice` reverts (Sherlock #56 — pre-fix
-    ///          any valid signed report could be replayed into any slot,
-    ///          e.g. WBTC's $80k report shoved into the AAPL slot).
+    ///          match exactly or `_verifyPrice` reverts, blocking a valid signed
+    ///          report for one feed (e.g. WBTC) from being replayed into another
+    ///          slot's price (e.g. AAPL).
     ///        Push (chainlinkVerifier == 0): packed as
     ///          `bytes32(uint256(maxAgeSeconds) << 160 | uint160(feedAddress))`.
     ///          The low 160 bits are the AggregatorV3 proxy; the upper 96 bits
@@ -200,13 +198,13 @@ contract PortfolioStrategy is BaseStrategy {
     ///         allocation `i` (typically 8 for tokenized stocks, 18 for crypto
     ///         pairs). Must be ≤ 36 to keep `10**(...)` math safe. Token decimals
     ///         are read once via `IERC20Metadata.decimals()` and cached for the
-    ///         rebalance decimal-scaling math (Sherlock #21/#29).
+    ///         rebalance decimal-scaling math.
     ///
-    ///         Sherlock #56: `feedIds[i]` binds each allocation to its expected
-    ///         Chainlink Data Streams feed id. Any inbound report whose decoded
-    ///         `feedId` doesn't match the per-slot value reverts in
-    ///         `_verifyPrice`. Required to be non-zero — the contract cannot
-    ///         enforce binding against a zero sentinel.
+    ///         `feedIds[i]` binds each allocation to its expected Chainlink Data
+    ///         Streams feed id. Any inbound report whose decoded `feedId` doesn't
+    ///         match the per-slot value reverts in `_verifyPrice`. Required to be
+    ///         non-zero — the contract cannot enforce binding against a zero
+    ///         sentinel.
     ///
     ///         Push mode (`chainlinkVerifier == 0`): `feedIds[i]` packs an
     ///         AggregatorV3 proxy in the low 160 bits and an OPTIONAL per-slot
@@ -236,10 +234,9 @@ contract PortfolioStrategy is BaseStrategy {
         if (tokens.length != weightsBps.length || tokens.length != swapExtraData_.length) revert LengthMismatch();
         if (tokens.length != priceDecimals_.length || tokens.length != feedIds_.length) revert LengthMismatch();
         if (totalAmount_ == 0) revert InvalidAmount();
-        // Ceiling, not just a sanity bound. `< BPS_DENOMINATOR` let a proposal
-        // seat a 99.99% tolerance at init and never need to relax it later, so
-        // the tighten-only guard in `_updateParams` would have had nothing to
-        // bite on.
+        // Ceiling, not just a sanity bound — bounds the initial tolerance below
+        // 100% so the tighten-only guard in `_updateParams` has room to enforce
+        // a monotonic decrease.
         if (maxSlippageBps_ == 0 || maxSlippageBps_ > MAX_SLIPPAGE_CEILING_BPS) revert InvalidSlippage();
 
         // Push-feed mode when no Data Streams verifier is wired: each
@@ -264,11 +261,10 @@ contract PortfolioStrategy is BaseStrategy {
                 }
                 if (AggregatorV3Interface(feed).decimals() != priceDecimals_[i]) revert InvalidPriceDecimals();
             }
-            // Sherlock #52: reject duplicate token addresses. A basket like
-            // [TSLA, TSLA] aggregates into a single TSLA balance on the
-            // strategy while the rebalance math treats each slot as a distinct
-            // target weight — mis-scaling current value (slots x balance) and
-            // corrupting the overweight/underweight swap sizing.
+            // Rejects duplicate token addresses: a basket like [TSLA, TSLA]
+            // aggregates into a single TSLA balance while rebalance math treats
+            // each slot as a distinct target weight, corrupting
+            // overweight/underweight swap sizing.
             for (uint256 j; j < i; ++j) {
                 if (tokens[j] == tokens[i]) revert DuplicateToken(tokens[i]);
             }
@@ -311,7 +307,6 @@ contract PortfolioStrategy is BaseStrategy {
             alloc.investedAmount = allocation;
         }
 
-        // Push any residual dust back to vault
         _pushAllToVault(asset);
     }
 
@@ -357,27 +352,21 @@ contract PortfolioStrategy is BaseStrategy {
             emit WeightsUpdated(tokens, oldWeights, newWeightsBps);
         }
 
-        // TIGHTEN-ONLY. `> 0` is the "keep current value" sentinel, never a
-        // monotonicity guard, so this previously accepted any value below
-        // `BPS_DENOMINATOR` — letting the proposer raise the tolerance to 99.99%
-        // AFTER the proposal was reviewed and executed, then self-settle into a
+        // TIGHTEN-ONLY: blocks the proposer from raising the slippage tolerance
+        // after a proposal was reviewed and executed, then self-settling into a
         // sandwich they control (`settleProposal` is proposer-callable an hour
-        // after execute). Same class as the `RepaymentBelowPrincipal` floor
-        // `VeniceInferenceStrategy` carries for Sherlock #49.
+        // after execute).
         if (newMaxSlippageBps > 0) {
             if (newMaxSlippageBps > maxSlippageBps) revert InvalidSlippage();
             maxSlippageBps = newMaxSlippageBps;
         }
 
-        // ROUTES ARE FROZEN once the proposal executes. `_quoteMinOut` prices the
-        // SAME `extraData` route it is about to swap through, so the floor tracks
-        // whatever pool the route names: rewriting the route moves the floor with
-        // it, and `maxSlippageBps` cannot bound that, because the percentage is
-        // applied to the attacker's own quote. The routes were reviewed as part
-        // of the proposal; swapping them afterwards is the reviewed-then-replaced
-        // attack. Reacting to a dead pool is still possible through the
-        // oracle-anchored `rebalanceDelta`, whose floors come from signed feeds
-        // rather than from the route.
+        // Routes are frozen once the proposal executes: `_quoteMinOut` prices the
+        // SAME `extraData` route it swaps through, so rewriting the route would
+        // move the slippage floor with it — `maxSlippageBps` can't bound that
+        // because the percentage applies to the attacker's own quote.
+        // `rebalanceDelta` stays available since its floors come from signed
+        // oracle feeds rather than the route.
         if (newSwapExtraData.length > 0) revert RoutesFrozen();
     }
 
@@ -404,7 +393,7 @@ contract PortfolioStrategy is BaseStrategy {
             oldBalances[i] = IERC20(_allocations[i].token).balanceOf(address(this));
         }
 
-        // 1. Sell all positions back to asset
+        // Sell all positions back to asset
         for (uint256 i; i < len; ++i) {
             TokenAllocation storage alloc = _allocations[i];
             uint256 bal = IERC20(alloc.token).balanceOf(address(this));
@@ -417,7 +406,7 @@ contract PortfolioStrategy is BaseStrategy {
             alloc.investedAmount = 0;
         }
 
-        // 2. Re-buy at current target weights
+        // Re-buy at current target weights
         uint256 assetBalance = IERC20(asset).balanceOf(address(this));
         for (uint256 i; i < len; ++i) {
             TokenAllocation storage alloc = _allocations[i];
@@ -474,14 +463,11 @@ contract PortfolioStrategy is BaseStrategy {
 
         DeltaSnapshot memory snap = _snapshotAllocations(len);
 
-        // 1. Verify prices and compute current portfolio value.
-        // Sherlock #21/#29: scale per-allocation by `_tokenDecimals[i] +
-        // _priceDecimals[i]` vs cached `_assetDecimals` (D-3/D-4 closure).
-        // Pre-fix this divided by hard-coded `PRICE_PRECISION = 1e18`, which
-        // only matched when ALL tokens had 0 decimals and ALL feeds had 18
-        // decimals. Chainlink tokenized-stock feeds are 8 decimals -> 1e10x
-        // mis-scale for the current-value snapshot, propagating into target /
-        // overweight / underweight math.
+        // Verify prices and compute current portfolio value, scaling each
+        // allocation by `_tokenDecimals[i] + _priceDecimals[i]` against the
+        // cached `_assetDecimals` — Chainlink tokenized-stock feeds are 8
+        // decimals, so a flat `PRICE_PRECISION` would mis-scale by orders of
+        // magnitude and propagate into the target/overweight/underweight math.
         uint256 totalValue;
         uint256 assetDec = uint256(_assetDecimals);
         for (uint256 i; i < len; ++i) {
@@ -492,18 +478,18 @@ contract PortfolioStrategy is BaseStrategy {
         // Include any asset balance already held (e.g. from previous partial rebalances).
         totalValue += IERC20(asset).balanceOf(address(this));
 
-        // 2. Sell overweight positions.
+        // Sell overweight positions.
         uint256 swapsExecuted;
         for (uint256 i; i < len; ++i) {
             if (_sellOverweight(i, totalValue, snap.currentValues[i], snap.prices[i])) ++swapsExecuted;
         }
 
-        // 3. Buy underweight positions with available asset.
+        // Buy underweight positions with available asset.
         for (uint256 i; i < len; ++i) {
             if (_buyUnderweight(i, totalValue, snap.currentValues[i], snap.prices[i])) ++swapsExecuted;
         }
 
-        // 4. Update stored token amounts and snapshot post-balances.
+        // Update stored token amounts and snapshot post-balances.
         uint256[] memory newBalances = new uint256[](len);
         for (uint256 i; i < len; ++i) {
             uint256 bal = IERC20(_allocations[i].token).balanceOf(address(this));
@@ -541,11 +527,6 @@ contract PortfolioStrategy is BaseStrategy {
     /// @dev If allocation `i` is overweight at `currentValue`, sell the
     ///      excess back to the asset using the chainlink-priced floor.
     ///      Returns true when a swap was executed.
-    /// @dev Sherlock #21/#29: per-allocation decimal scaling via
-    ///      `_valueToTokens` + `_tokensToValue`. Pre-fix used hard-coded
-    ///      `PRICE_PRECISION = 1e18` for both conversions, which mis-scaled
-    ///      by factors of `10^(td+pd-18)` for any allocation whose
-    ///      `tokenDecimals + priceDecimals != 18`.
     function _sellOverweight(uint256 i, uint256 totalValue, uint256 currentValue, uint256 price)
         private
         returns (bool)
@@ -569,8 +550,8 @@ contract PortfolioStrategy is BaseStrategy {
 
     /// @dev If allocation `i` is underweight at `currentValue`, buy the
     ///      deficit (capped at currently-available asset balance). Returns
-    ///      true when a swap was executed.
-    /// @dev Sherlock #21/#29: same per-allocation scaling as `_sellOverweight`.
+    ///      true when a swap was executed. Uses the same per-allocation decimal
+    ///      scaling as `_sellOverweight`.
     function _buyUnderweight(uint256 i, uint256 totalValue, uint256 currentValue, uint256 price)
         private
         returns (bool)
@@ -590,12 +571,12 @@ contract PortfolioStrategy is BaseStrategy {
         return true;
     }
 
-    // ── Sherlock #21/#29: per-allocation dimensional helpers ──
+    // ── Per-allocation dimensional helpers ──
 
     /// @dev Convert `balance` of allocation `i`'s token (in token decimals) at
     ///      `price` (in price decimals) into asset-denominated value (in
-    ///      `assetDec` decimals). Closes punch list D-3/D-4: the result is in
-    ///      the same decimals as `IERC20(asset).balanceOf(...)`.
+    ///      `assetDec` decimals) — the same decimals as
+    ///      `IERC20(asset).balanceOf(...)`.
     ///
     ///        value = balance * price / 10^(tokenDec + priceDec - assetDec)
     ///              = balance * price * 10^(assetDec - tokenDec - priceDec)
@@ -687,10 +668,10 @@ contract PortfolioStrategy is BaseStrategy {
     /// @param i             Allocation index — used to check `report.feedId`
     ///                      against the slot's expected feed id.
     /// @param signedReport  LayerZero-style signed Chainlink Data Streams report.
-    /// @dev Sherlock #56 — verify the report's `feedId` matches the slot's
-    ///      expected id BEFORE returning the price, so a valid-but-mismatched
-    ///      report (e.g. WBTC's $80k report into the AAPL slot) cannot
-    ///      inflate cached NAV.
+    /// @dev Verifies the report's `feedId` matches the slot's expected id
+    ///      before returning the price, so a valid-but-mismatched report
+    ///      (e.g. WBTC's report accepted into the AAPL slot) cannot inflate
+    ///      cached NAV.
     function _verifyPrice(uint256 i, bytes calldata signedReport) internal returns (uint256 price) {
         // Push-feed mode: `_feedIds[i]` packs an AggregatorV3 proxy (low 160
         // bits) + an optional per-slot max age (upper 96 bits). No signed
