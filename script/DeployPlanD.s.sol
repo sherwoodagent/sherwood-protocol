@@ -15,13 +15,6 @@ interface ITierRegistryDemoterRole {
     function setAuthorizedDemoter(address demoter) external;
 }
 
-/// @dev `ICompensationEscrow` declares `setAuthorizedFunder` but no getter, and
-///      the pre-flight below needs to READ the funder — Plan C's wiring is a
-///      precondition of this deployment, not something to re-apply here.
-interface ICompensationEscrowFunder {
-    function authorizedFunder() external view returns (address);
-}
-
 /**
  * @title  DeployPlanD
  * @notice Plan D deployment against an EXISTING Plan B + Plan C deployment.
@@ -44,13 +37,12 @@ interface ICompensationEscrowFunder {
  *      quietly steal the role from the live holder and leave it unable to
  *      freeze, demote or slash. Refuse rather than clobber; if a rotation is
  *      genuinely intended, clear the role by governance first and say so.
- * @dev PRE-FLIGHT 2 (Plan C's wiring must already be in place): the slash path
- *      ends in `StakedWood.slashToEscrow` → `CompensationEscrow.fundCase`, so
- *      it dead-ends unless BOTH directions of Plan C's wiring hold —
- *      `escrow.authorizedFunder() == swood` and `swood.compensationEscrow() ==
- *      escrow`. Either one missing makes every settled challenge revert at the
- *      last step, after the coverage was frozen and the bond was posted.
- * @dev PRE-FLIGHT 3: a zero COMPOSED price on the ledger is fail-closed for the
+ *      NOTE — there is no longer an escrow wiring pre-flight. The slash path
+ *      used to end in `StakedWood.slashToEscrow` → `CompensationEscrow`, which
+ *      dead-ended unless both directions of Plan C's wiring held. The verdict
+ *      slash now burns internally, so it has no external sink to mis-wire and
+ *      nothing to check here.
+ * @dev PRE-FLIGHT 2: a zero COMPOSED price on the ledger is fail-closed for the
  *      game exactly as it is for the bond math — `file()` reverts
  *      `WoodPriceUnset()` when it is unset, so the game would deploy into a
  *      state where NOTHING can be challenged. Checked as `woodPriceX8()`, the
@@ -69,7 +61,6 @@ interface ICompensationEscrowFunder {
  *     WOOD_TOKEN           — bond currency for challenger and counter bonds.
  *     EXPOSURE_LEDGER      — Plan B ledger; approver set + coverage freeze.
  *     TIER_REGISTRY        — adapter certification registry to demote against.
- *     COMPENSATION_ESCROW  — Plan C escrow; read-only here (pre-flight 2).
  *
  *   Usage (simulate; never --broadcast blind):
  *     forge script script/DeployPlanD.s.sol:DeployPlanD --rpc-url <rpc> -vvvv
@@ -82,7 +73,6 @@ contract DeployPlanD is Script {
         address wood = vm.envAddress("WOOD_TOKEN");
         address ledger = vm.envAddress("EXPOSURE_LEDGER");
         address tierRegistry = vm.envAddress("TIER_REGISTRY");
-        address escrow = vm.envAddress("COMPENSATION_ESCROW");
 
         // ── Pre-flight 1: never silently steal a role from a live holder ──
         require(
@@ -101,19 +91,7 @@ contract DeployPlanD is Script {
             "FIRST if a rotation is intended - this script will not overwrite a live holder."
         );
 
-        // ── Pre-flight 2: Plan C's rails, both directions ──
-        require(
-            ICompensationEscrowFunder(escrow).authorizedFunder() == swood,
-            "PRE-FLIGHT: CompensationEscrow.authorizedFunder != STAKED_WOOD. Plan C wiring is "
-            "missing - every settled challenge would revert funding the case."
-        );
-        require(
-            IStakedWood(swood).compensationEscrow() == escrow,
-            "PRE-FLIGHT: StakedWood.compensationEscrow != COMPENSATION_ESCROW. Plan C wiring is "
-            "missing - slashToEscrow has nowhere to send the proceeds."
-        );
-
-        // ── Pre-flight 3: an unpriced ledger makes every filing revert ──
+        // ── Pre-flight 2: an unpriced ledger makes every filing revert ──
         // The COMPOSED price, matching what `ChallengeGame.file` divides by
         // (review 🟠F16). Pre-flighting the raw scalar would pass while the
         // figure the game actually uses was zero, and fail while it was healthy.

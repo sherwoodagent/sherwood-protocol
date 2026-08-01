@@ -61,9 +61,10 @@ interface IChallengeGame {
 
     /// @param frozenCoverageUsd The coverage this challenge pinned, in USD-18,
     ///        snapshotted at filing. The bond was sized against it. It is NOT
-    ///        what the eventual verdict is worth (review, minor) — the verdict
-    ///        is sized by `slashBpsFor` against live bonds at resolve time, and
-    ///        the two diverge whenever a bond moved in between. Written once
+    ///        what the eventual verdict is worth — the verdict is punitive and
+    ///        takes the severity ceiling of each convicted approver's live
+    ///        bond, so the two are related only incidentally and diverge
+    ///        whenever a bond moved or the cohort was over-covered. Written once
     ///        and never read on-chain: it exists for indexers and for auditing
     ///        the bond arithmetic against the filing.
     /// @param counterBondWood The counter-bond POOL raised so far, summed over
@@ -213,11 +214,11 @@ interface IChallengeGame {
     ///         zero address and no caller can match it — Plan D's timeout stays
     ///         the only way out of `Disputed`.
     error NotCourt();
-    /// @dev `resolve` was called with too little gas to guarantee the
-    ///      `openCase` child inside `slashToEscrow` cannot starve — a starved
-    ///      child is indistinguishable from a missing selector there and
-    ///      BURNS the victims' compensation (PR #24 round-4 N-4). Retry with
-    ///      more gas; nothing about the challenge state changes.
+    /// @dev `resolve` was called with too little gas to guarantee the slash
+    ///      loop can finish. Retry with more gas; nothing about the challenge
+    ///      state changes. The floor is currently conservative — it was sized
+    ///      around an external `openCase` child that no longer exists (see
+    ///      `ChallengeGame.SLASH_GAS_BASE`).
     error InsufficientSlashGas();
     /// @dev The filing named an adapter `(target, selector)` that does not
     ///      appear in the challenged proposal's own execute calls. A challenge
@@ -278,15 +279,16 @@ interface IChallengeGame {
     ///         referral here always has one, so this catch may be.
     event AutoReferFailed(uint256 indexed challengeId);
     /// @param slashedWood What the compensation escrow (or the burn fallback)
-    ///        actually received — NOT the gross amount taken off the accused.
+    ///        actually BURNED — NOT the gross amount taken off the accused.
     ///        On a CONTESTED escalated conviction (spec 2026-07-29 §2) this is
     ///        NET of the conviction bounty paid to the challenger, since
-    ///        `IStakedWood.slashToEscrow` deducts the bounty before the escrow
-    ///        ever sees the proceeds; on the silence path, and on an escalated
-    ///        conviction the challenger itself funded (see `ChallengeGame.
-    ///        _settle`'s `contested` gate), no bounty is paid and this equals
-    ///        the gross slash.
-    event ChallengeSettled(uint256 indexed challengeId, uint256 slashedWood, uint256 caseId);
+    ///        `IStakedWood.slashVerdict` deducts the bounty before burning the
+    ///        remainder; on the silence path, and on an escalated conviction
+    ///        the challenger itself funded (see `ChallengeGame._settle`'s
+    ///        `contested` gate), no bounty is paid and this equals the gross
+    ///        slash. `IStakedWood.VerdictSlashBurned` carries all three legs if
+    ///        an indexer needs the split.
+    event ChallengeSettled(uint256 indexed challengeId, uint256 slashedWood);
     /// @dev The slice of the challenger's bond burned on the SETTLE path
     ///      (`settleBurnBps`, review 🟠F4) or the INCONCLUSIVE unwind path
     ///      (`inconclusiveBurnBps`, review #1 2026-07-30) — a filing is never

@@ -16,7 +16,6 @@ import {ChallengeGame} from "../src/ChallengeGame.sol";
 import {IChallengeGame} from "../src/interfaces/IChallengeGame.sol";
 import {TokenCourt} from "../src/TokenCourt.sol";
 import {ITokenCourt} from "../src/interfaces/ITokenCourt.sol";
-import {CompensationEscrow} from "../src/CompensationEscrow.sol";
 import {ProposerBondEscrow} from "../src/ProposerBondEscrow.sol";
 import {BatchExecutorLib} from "../src/BatchExecutorLib.sol";
 import {ProtocolConfig} from "../src/ProtocolConfig.sol";
@@ -110,7 +109,6 @@ contract TokenCourtEndToEndTest is Test {
     ExposureLedger public ledger;
     TierRegistry public tierRegistry;
     ProposerBondEscrow public bondEscrow;
-    CompensationEscrow public escrow;
     ChallengeGame public game;
     TokenCourt public court;
 
@@ -224,7 +222,6 @@ contract TokenCourtEndToEndTest is Test {
         registry.setExposureLedger(address(ledger));
 
         bondEscrow = new ProposerBondEscrow(address(wood), address(registry));
-        escrow = new CompensationEscrow(owner, address(wood));
 
         // ── The game and the court, then their roles.
         game = new ChallengeGame(owner, address(wood), address(ledger), address(tierRegistry));
@@ -234,9 +231,6 @@ contract TokenCourtEndToEndTest is Test {
         tierRegistry.setAuthorizedDemoter(address(game));
         vm.startPrank(owner);
         swood.setAuthorizedSlasher(address(game));
-        swood.setCompensationEscrow(address(escrow));
-        escrow.setAuthorizedFunder(address(swood));
-        escrow.setBackstop(backstop);
         game.setStakedWood(address(swood));
         court.setChallengeGame(address(game));
         court.setStakedWood(address(swood));
@@ -425,6 +419,11 @@ contract TokenCourtEndToEndTest is Test {
     ///         of that call is a mock.
     function test_arc_guiltyVerdict_slashesAndPaysChallenger() public {
         uint256 pid = _proposeApproveExecute();
+        // sWOOD's OWN balance, not the burn address: the burn address also
+        // receives challenger-bond burns (settle/forfeit/inconclusive), so a
+        // delta measured there conflates two sinks. Only a slash moves WOOD out
+        // of the custodian.
+        uint256 swoodBalBefore = wood.balanceOf(address(swood));
         // g4 stakes AFTER the proposal already executed -- on the far side of
         // the instant `snapshotTs` (`executedAt - 1`) pins the electorate to.
         //
@@ -442,16 +441,15 @@ contract TokenCourtEndToEndTest is Test {
         vm.warp(vm.getBlockTimestamp() + 1 days);
         uint256 challengerBalBefore = wood.balanceOf(challenger);
         uint256 expectedBps = _g1SlashBpsFor(pid);
-        // PINNED LITERAL (not derived from the same function under test): g1
-        // committed $1,000 of coverage against $1,500 of slashable bond
-        // ($0.05 x 30,000 WOOD), so its liability prices at
-        // ceil(1_000 * 10_000 / 1_500) = 6,667 bps. This is what actually
-        // catches a wrong rate -- a mutated `slashBpsFor` that returns a
-        // different number fails HERE, not only downstream where it would
-        // otherwise agree with itself.
-        assertEq(
-            expectedBps, 6667, "$1,000 of coverage against $1,500 of slashable bond ($0.05 x 30,000 WOOD), rounded up"
-        );
+        // PINNED LITERAL (not derived from the same function under test): the
+        // rate is PUNITIVE, so a committed approver prices at the ceiling
+        // whatever it underwrote. This used to read 6,667 — g1's $1,000 of
+        // coverage against a $1,500 slashable bond, ceil(1_000 * 10_000 /
+        // 1_500) — and that arithmetic is precisely what the burn retired. The
+        // literal still does the real work: a mutated `slashBpsFor` returning
+        // anything else fails HERE, not only downstream where it would agree
+        // with itself.
+        assertEq(expectedBps, 10_000, "punitive: the severity ceiling, not a share of the loss");
 
         vm.prank(challenger);
         uint256 cid = game.file(
@@ -485,6 +483,10 @@ contract TokenCourtEndToEndTest is Test {
         court.vote(caseId, true); // guilty; g2 alone clears the participation floor
 
         _warpPastVoteWindow(caseId);
+        // Captured HERE, not at the top of the test: g4 staked `FILLER_STAKE`
+        // into sWOOD partway through, so an earlier baseline would net that
+        // inflow against the slash and understate it.
+        uint256 swoodBalPreSlash = wood.balanceOf(address(swood));
         court.finalize(caseId);
 
         // ── The verdict landed on the REAL game.
@@ -522,9 +524,12 @@ contract TokenCourtEndToEndTest is Test {
         //    §2: the bounty comes off the top before the escrow ever sees the
         //    proceeds, so victims' claimable total is smaller by exactly what
         //    the challenger was just paid).
-        assertEq(escrow.caseCount(), 1, "the slash reached the compensation escrow");
-        (,, uint256 proceeds,,,,) = escrow.caseOf(1);
-        assertEq(proceeds, slashedGross - bounty, "the slash net of the conviction bounty reached the case");
+        assertEq(
+            swoodBalPreSlash - wood.balanceOf(address(swood)),
+            slashedGross,
+            "the whole slash left the custodian: bounty to the challenger, remainder burned"
+        );
+        assertEq(swood.pendingBurn(), 0, "and the burn transfer landed rather than parking");
 
         assertEq(wood.balanceOf(address(court)), 0, "court custody is zero, always");
     }
@@ -563,6 +568,11 @@ contract TokenCourtEndToEndTest is Test {
     function test_arc_notGuilty_forfeitsToDefenders() public {
         uint256 pid = _proposeApproveExecute();
         uint256 challengerBalBefore = wood.balanceOf(challenger);
+        // sWOOD's OWN balance, not the burn address: the burn address also
+        // receives challenger-bond burns (settle/forfeit/inconclusive), so a
+        // delta measured there conflates two sinks. Only a slash moves WOOD out
+        // of the custodian.
+        uint256 swoodBalBefore = wood.balanceOf(address(swood));
 
         vm.prank(challenger);
         uint256 cid = game.file(
@@ -608,7 +618,7 @@ contract TokenCourtEndToEndTest is Test {
 
         // ── The accused was NEVER slashed -- an acquittal marks nothing.
         assertEq(swood.guardianStake(g1), G1_STAKE, "g1's stake is untouched");
-        assertEq(escrow.caseCount(), 0, "no compensation case was ever opened");
+        assertEq(wood.balanceOf(address(swood)), swoodBalBefore, "and no WOOD left the custodian");
         (uint8 tierAfter, uint16 boundAfter) = tierRegistry.tierOf(address(adapter), adapter.poke.selector);
         assertEq(tierAfter, 1, "the adapter keeps its certification");
         assertEq(boundAfter, CERTIFIED_BOUND_BPS);
@@ -628,6 +638,11 @@ contract TokenCourtEndToEndTest is Test {
     function test_arc_inconclusive_unwindsAndAllowsRefiling() public {
         uint256 pid = _proposeApproveExecute();
         uint256 challengerBalBefore = wood.balanceOf(challenger);
+        // sWOOD's OWN balance, not the burn address: the burn address also
+        // receives challenger-bond burns (settle/forfeit/inconclusive), so a
+        // delta measured there conflates two sinks. Only a slash moves WOOD out
+        // of the custodian.
+        uint256 swoodBalBefore = wood.balanceOf(address(swood));
 
         vm.prank(challenger);
         uint256 cid = game.file(
@@ -675,7 +690,7 @@ contract TokenCourtEndToEndTest is Test {
         // ── Coverage unfroze, and NO conviction mark was left anywhere.
         assertFalse(ledger.isCoverageFrozen(address(gov), pid), "unfrozen");
         assertEq(swood.guardianStake(g1), G1_STAKE, "never slashed");
-        assertEq(escrow.caseCount(), 0, "no compensation case was ever opened");
+        assertEq(wood.balanceOf(address(swood)), swoodBalBefore, "and no WOOD left the custodian");
 
         // ── The proof that nothing was marked: the SAME challenger can file a
         //    FRESH challenge against the SAME proposal, and it is accepted.

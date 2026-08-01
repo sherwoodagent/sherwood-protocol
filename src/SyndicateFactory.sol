@@ -199,20 +199,6 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     ///      var claims a reserved slot.
     address public bondEscrow;
 
-    /// @notice Protocol `CompensationEscrow` (spec §3.8). The withdrawal queues
-    ///         this factory deploys resolve it from here to pay a case through
-    ///         to their request owners — see `VaultWithdrawalQueue.claimCompensation`.
-    /// @dev Governance-owned rather than a `claimCompensation` argument (PR #24
-    ///      review 🔴N1): a caller-supplied escrow controls both the payout
-    ///      TOKEN and the pulled amount, which let an attacker mint a case
-    ///      total in a junk token and withdraw it in real WOOD. `address(0)`
-    ///      disables the queue pay-through (`CompensationEscrowNotSet`).
-    ///      Keep it equal to `StakedWood.compensationEscrow` — sWOOD funds the
-    ///      cases the queues redeem.
-    /// @dev Appended before `__gap` (gap shrunk 43 → 42) — upgrade-safe:
-    ///      existing slots are untouched, this var claims a reserved slot.
-    address public compensationEscrow;
-
     /// @dev Reserved for future storage. Per-vault-governor refactor: replaced
     ///      the single `governor` slot (1) with `beacon` (1) + `protocolConfig`
     ///      (1) + `_governorOf` mapping (1) = net +2 slots, so the gap drops
@@ -220,7 +206,12 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     ///      `tierRegistry` (Task 7); then 45 → 43 for `exposureLedger` +
     ///      `bondEscrow` (Plan B Task 10); then 43 → 42 for
     ///      `compensationEscrow` (PR #24 review 🔴N1).
-    uint256[42] private __gap;
+    ///      RESTORED 42 → 43 by the burn-slash-proceeds change: slash proceeds
+    ///      burn, so there are no compensation cases for a queue to pay through
+    ///      and `compensationEscrow` was REMOVED rather than deprecated. Legal
+    ///      only pre-mainnet (the golden is regenerated in the same PR); from
+    ///      the first mainnet deploy onward this slot would have to stay.
+    uint256[43] private __gap;
 
     // ── Events ──
 
@@ -246,7 +237,6 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     event TierRegistrySet(address indexed oldRegistry, address indexed newRegistry);
     event ExposureLedgerSet(address indexed oldLedger, address indexed newLedger);
     event BondEscrowSet(address indexed oldEscrow, address indexed newEscrow);
-    event CompensationEscrowSet(address indexed oldEscrow, address indexed newEscrow);
     /// @notice Emitted when `pushWiring` re-pushes the factory's current
     ///         tierRegistry / exposureLedger / bondEscrow into an existing governor.
     event WiringPushed(address indexed governor);
@@ -662,37 +652,6 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         address old = bondEscrow;
         bondEscrow = newEscrow;
         emit BondEscrowSet(old, newEscrow);
-    }
-
-    /// @notice Set the protocol `CompensationEscrow` the withdrawal queues pay
-    ///         their custody claims out of (spec §3.8). `address(0)` is
-    ///         tolerated — it disables the queue pay-through. Read LIVE by every
-    ///         queue this factory deployed, so one call arms or repoints them all.
-    /// @dev Wire this to the SAME escrow as `StakedWood.setCompensationEscrow`:
-    ///      sWOOD's `slashToEscrow` opens the cases, the queues redeem them, and
-    ///      a queue pointed at a different escrow simply finds no case for its
-    ///      vault (`NotCompensationCase`).
-    /// @dev The escrow is factory state and NOT a `claimCompensation` argument
-    ///      (PR #24 review 🔴N1). A caller-supplied escrow controls the payout
-    ///      TOKEN as well as the amount, so an attacker could book a case total
-    ///      in a token they mint freely and then flip `wood()` to real WOOD and
-    ///      withdraw the queue's whole balance. Governance owns the address; the
-    ///      caller chooses only WHICH requests get paid.
-    /// @dev CUSTODIAL RE-POINT (PR #24 review F-E): the queue's BOOKKEEPING is
-    ///      keyed by the escrow that funded a case and the payout token is
-    ///      pinned at pull time, but its LOOKUP resolves this pointer live — so
-    ///      once it moves, EVERY case tied to the old escrow becomes
-    ///      unaddressable from the queue: unpulled ones, and pulled ones not
-    ///      yet fully distributed (their remainder parks in the queue, which
-    ///      has no rescue path by design). Nothing is lost — pointing back
-    ///      restores payout exactly — but the funds are frozen meanwhile.
-    ///      Re-point only at zero unpulled cases AND zero
-    ///      incompletely-distributed pulled cases for every queue this factory
-    ///      deployed.
-    function setCompensationEscrow(address newEscrow) external onlyOwner {
-        address old = compensationEscrow;
-        compensationEscrow = newEscrow;
-        emit CompensationEscrowSet(old, newEscrow);
     }
 
     /// @notice Whether `governor` is a per-vault governor deployed by THIS factory.

@@ -26,22 +26,6 @@ interface IVaultWithdrawalQueue {
     error ZeroAssets();
     error InsufficientShares();
     error WrongKind();
-    error NotCompensationCase();
-    error NothingToClaim();
-    /// @dev `claimCompensation` ran with no escrow wired on the factory
-    ///      (`ISyndicateFactory.compensationEscrow() == address(0)`).
-    error CompensationEscrowNotSet();
-    /// @dev `claimCompensation` ran with an empty `requestIds` array. Pulling a
-    ///      case without distributing any of it leaves WOOD idling in the queue
-    ///      (PR #24 review 🔴N1).
-    error NoRequestsSupplied();
-    /// @dev `claimCompensation` paid nothing across the supplied ids — every
-    ///      one was skipped as ineligible or already paid, or every eligible
-    ///      share floored to zero (round-4 N-2). Reverting (rather than
-    ///      letting a first call pull the case and park its proceeds) keeps the
-    ///      "a pull distributes in the same call" invariant real (PR #24 review
-    ///      F-D); the whole transaction rolls back, including the pull.
-    error NoEligibleRequests();
 
     // ── Types ──
     enum RequestKind {
@@ -58,9 +42,9 @@ interface IVaultWithdrawalQueue {
         bool cancelled;
         /// @dev Custody interval stamps (PR #24 review 🔴1): `queuedAt` when the
         ///      escrowed amount entered custody, `closedAt` when it left (claim
-        ///      or cancel; 0 while still open). `claimCompensation` uses these
-        ///      to decide whether a redeem request's shares were in queue
-        ///      custody at a compensation case's snapshot.
+        ///      or cancel; 0 while still open). Their original consumer — the
+        ///      compensation pay-through — is gone with the escrow; they are
+        ///      retained as request-lifecycle provenance for indexers.
         uint48 queuedAt;
         uint48 closedAt;
     }
@@ -82,19 +66,6 @@ interface IVaultWithdrawalQueue {
     event RequestClaimed(uint256 indexed requestId, address indexed owner, uint256 inAmount, uint256 outAmount);
     event RequestCancelled(uint256 indexed requestId, address indexed owner);
     event SettlementStamped(uint256 indexed pid, uint256 num, uint256 den);
-    /// @param token The payout token PINNED to this case at pull time. Every
-    ///        later payout for the case uses it, so the unit a case was measured
-    ///        in can never change under it (PR #24 review 🔴N1).
-    event CompensationPulled(
-        address indexed escrow, uint256 indexed caseId, uint256 amount, uint256 votesAtSnapshot, address token
-    );
-    event CompensationPaid(
-        address indexed escrow, uint256 indexed caseId, uint256 indexed requestId, address owner, uint256 amount
-    );
-    /// @notice A supplied request id was passed over instead of reverting the
-    ///         batch (PR #24 review 🟡N7): already paid for this case, not a
-    ///         redeem, or not in queue custody at the case snapshot.
-    event CompensationSkipped(address indexed escrow, uint256 indexed caseId, uint256 indexed requestId);
 
     // ── Vault-only mutating ──
     function queueRedeem(address owner, uint256 shares, uint256 pid) external returns (uint256 requestId);
@@ -104,29 +75,6 @@ interface IVaultWithdrawalQueue {
     // ── Permissionless / owner ──
     function claim(uint256 requestId) external returns (uint256 outAmount);
     function cancel(uint256 requestId) external;
-
-    /// @notice Pay a compensation-escrow case through to redeem-request owners
-    ///         whose shares sat in queue custody at the case's snapshot
-    ///         (PR #24 review 🔴1: the queue is the holder of record the escrow
-    ///         sees; without this the modal victims — LPs whose exit was queued
-    ///         when the drain landed — would be paid nothing). First call for a
-    ///         case pulls the queue's whole claim (amount MEASURED by balance
-    ///         delta, never trusted from the escrow); each request in
-    ///         `requestIds` then receives `pulled * shares / queueVotesAtSnap`.
-    ///         Permissionless: payout destinations are the requests' own owners.
-    /// @dev The escrow is resolved from the factory
-    ///      (`ISyndicateFactory.compensationEscrow()`), NOT supplied by the
-    ///      caller (PR #24 review 🔴N1) — a caller-chosen escrow controls the
-    ///      payout TOKEN, which let an attacker book a case total in a token
-    ///      they mint freely and collect it in real WOOD.
-    /// @dev Ineligible / already-paid ids are SKIPPED, not reverted (🟡N7), so
-    ///      one front-run claim cannot grief a keeper's whole batch.
-    /// @return paid Total tokens transferred by this call.
-    /// @return processed Ids newly credited by this call.
-    /// @return skipped Ids passed over (ineligible, wrong kind, already paid).
-    function claimCompensation(uint256 caseId, uint256[] calldata requestIds)
-        external
-        returns (uint256 paid, uint256 processed, uint256 skipped);
 
     // ── Views ──
     function vault() external view returns (address);

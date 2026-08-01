@@ -26,9 +26,6 @@ interface ISyndicateFactory {
     event BondEscrowSet(address indexed oldEscrow, address indexed newEscrow);
     event WiringPushed(address indexed governor);
 
-    // ── Events (guardian economic-security Plan C, PR #24 review 🔴N1) ──
-    event CompensationEscrowSet(address indexed oldEscrow, address indexed newEscrow);
-
     // ── Views ──
     function governorOf(address vault) external view returns (address);
     function beacon() external view returns (address);
@@ -42,11 +39,6 @@ interface ISyndicateFactory {
     function exposureLedger() external view returns (address);
     /// @notice Proposer-bond escrow pushed into governors at `createSyndicate` / `pushWiring`.
     function bondEscrow() external view returns (address);
-    /// @notice Protocol `CompensationEscrow` (spec §3.8) the withdrawal queues
-    ///         this factory deployed pay their custody claims out of. Read LIVE
-    ///         by `VaultWithdrawalQueue.claimCompensation`, never caller-supplied
-    ///         (PR #24 review 🔴N1).
-    function compensationEscrow() external view returns (address);
     /// @notice Whether `governor` is a per-vault governor deployed by this factory.
     function isFactoryGovernor(address governor) external view returns (bool);
 
@@ -56,9 +48,6 @@ interface ISyndicateFactory {
     function setTierRegistry(address newRegistry) external;
     function setExposureLedger(address newLedger) external;
     function setBondEscrow(address newEscrow) external;
-    /// @notice Point every queue this factory deployed at the compensation
-    ///         escrow their cases are funded into (spec §3.8).
-    function setCompensationEscrow(address newEscrow) external;
     /// @notice Push the factory's current tierRegistry / exposureLedger / bondEscrow
     ///         into an EXISTING factory-deployed governor (closes LOW-1 / issue #19).
     function pushWiring(address governor) external;

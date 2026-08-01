@@ -16,33 +16,25 @@ interface IStakedWood {
     /// @notice Reverts when a non-slasher calls the verdict slash path.
     error NotAuthorizedSlasher();
 
-    /// @notice Reverts when `slashToEscrow` runs with no `compensationEscrow`
-    ///         configured. The sink is owner-set state, never a caller argument.
-    error CompensationEscrowNotSet();
-
-    /// @notice Reverts when the requested compensation snapshot is LATER than
-    ///         the verdict's own open timestamp.
-    error SnapshotAfterVerdict();
-
-    /// @notice Reverts when `slashToEscrow` is handed a rate array whose length
+    /// @notice Reverts when `slashVerdict` is handed a rate array whose length
     ///         does not match `approvers`. Positional alignment is the only
     ///         thing binding a guardian to their own rate, so a mismatch is a
     ///         caller bug that would otherwise slash the tail of the batch at a
     ///         rate nobody chose.
     error SlashBpsLengthMismatch();
 
-    /// @notice Reverts when `slashToEscrow`'s `openedAt` is in the future — the
+    /// @notice Reverts when `slashVerdict`'s `openedAt` is in the future — the
     ///         at-open anchor the slash legs are sized against must be a real
     ///         past instant.
     error VerdictNotPast();
 
-    /// @notice Reverts when `slashToEscrow`'s `approvers` names an address
+    /// @notice Reverts when `slashVerdict`'s `approvers` names an address
     ///         twice — the dedup that keeps a repeated approver from
     ///         compounding past `maxSlashBps`. Order is NOT constrained
     ///         (`ExposureLedger.slashBpsFor` feeds vote-order arrays).
     error DuplicateApprover();
 
-    /// @notice Reverts when `slashToEscrow` names an approver already slashed
+    /// @notice Reverts when `slashVerdict` names an approver already slashed
     ///         under the same `caseKey` by an EARLIER call (PR #24 review 🟠N2).
     /// @dev The intra-call dedup only bounds ONE array, so the severity ceiling
     ///      bound per CALL rather than per verdict: `_slashOne` re-reads the
@@ -55,30 +47,16 @@ interface IStakedWood {
     ///      Also makes an honest retried transaction idempotent per approver.
     error ApproverAlreadySlashed();
 
-    /// @dev `slashToEscrow`'s `vault` does not resolve to a governor in the
-    ///      factory (`governorOf(vault) == 0`). The escrow apportions against
-    ///      the vault's ERC20Votes checkpoints, and every safety claim about
-    ///      that population assumes OZ semantics — which only factory-deployed
-    ///      vaults are known to carry (PR #24 round-4 N-4).
-    error VaultNotFactoryDeployed();
-
     event AuthorizedSlasherSet(address indexed slasher);
-    event CompensationEscrowSet(address indexed escrow);
 
-    /// @notice Correlates a verdict slash with the escrow case it funded, so
-    ///         Plan D and indexers can join the two without scraping the escrow.
-    /// @dev `total` is NET of any conviction bounty (spec 2026-07-29 §2) — it
-    ///      equals the escrow's own `proceeds` for this case.
-    event VerdictSlashRouted(bytes32 indexed caseKey, address indexed vault, uint256 total, uint256 caseId);
-
-    /// @notice A verdict slash whose compensation case could not be opened
-    ///         (`openCase` reverted); the proceeds were burned instead. The
-    ///         guardian is still slashed; the case's victims go uncompensated.
-    /// @dev `total` is NET of any conviction bounty. The bounty is paid on
-    ///      this path too (see `slashToEscrow`'s dev block) — depositors
-    ///      recover 0% of `total` either way, so paying it first costs them
-    ///      nothing.
-    event VerdictSlashUncompensated(bytes32 indexed caseKey, address indexed vault, uint256 total);
+    /// @notice A verdict slash was settled: what it took, what the prosecutor
+    ///         was paid, and what was destroyed.
+    /// @dev `gross == bounty + burned` by construction, so an indexer never has
+    ///      to re-derive the split. `burned` is also `slashVerdict`'s return
+    ///      value. Replaces the `VerdictSlashRouted` / `VerdictSlashUncompensated`
+    ///      pair, whose whole purpose was to report WHETHER victims were paid —
+    ///      a question with one answer now.
+    event VerdictSlashBurned(bytes32 indexed caseKey, uint256 gross, uint256 bounty, uint256 burned);
 
     /// @notice A conviction bounty was paid out of a verdict slash before the
     ///         remainder opened a compensation case (spec 2026-07-29 §2).
@@ -188,40 +166,34 @@ interface IStakedWood {
     function slashOwnerBond(address vault) external;
 
     // ── Slasher-only mutations (verdict path) ──
-    /// @notice Verdict-driven slash whose proceeds fund victim compensation
-    ///         instead of burning (spec §3.8 + §4 authorized-slasher entrypoint).
-    /// @dev The escrow is NOT a parameter: it is owner-set state
-    ///      (`compensationEscrow`), because sWOOD custodies every WOOD bond in
-    ///      the protocol and a caller-named sink would carry an allowance
-    ///      against that balance. Each non-zero rate is clamped to
-    ///      `[minSlashBps, maxSlashBps]` — the same severity envelope the
-    ///      review path's `_severityBps` enforces. `approvers` must be
-    ///      duplicate-free (any order) AND must not repeat an approver already
-    ///      slashed under this `caseKey` by an earlier call
+    /// @notice Verdict-driven slash whose proceeds are BURNED (spec §3.8 + §4
+    ///         authorized-slasher entrypoint).
+    /// @dev PUNITIVE, NOT COMPENSATORY. Nothing is paid to the harmed vault or
+    ///      its holders — the protocol makes no compensation promise. Each
+    ///      non-zero rate is clamped to `[minSlashBps, maxSlashBps]`, the same
+    ///      severity envelope the review path's `_severityBps` enforces, and
+    ///      the production feed (`ExposureLedger.slashBpsFor`) supplies the
+    ///      ceiling for every approver still holding a live commitment.
+    ///
+    ///      `approvers` must be duplicate-free (any order) AND must not repeat
+    ///      an approver already slashed under this `caseKey` by an earlier call
     ///      (`ApproverAlreadySlashed`) — one verdict takes one slash per
     ///      approver, so the envelope binds per VERDICT and not merely per
-    ///      call. `openedAt` must not be in the future
-    ///      and `snapshotTimestamp` must be at or before `openedAt` — honest-
-    ///      caller sanity bounds; they do NOT bind a compromised slasher, which
-    ///      chooses both timestamps freely (see the implementation natspec).
-    ///      If `openCase` reverts (unpriceable vault), the slash stands and the
-    ///      proceeds BURN (`VerdictSlashUncompensated`), so a bad vault cannot
-    ///      brick the verdict.
+    ///      call. `openedAt` must not be in the future: an honest-caller sanity
+    ///      bound that does NOT bind a compromised slasher, which chooses it
+    ///      freely (see the implementation natspec).
+    ///
+    ///      NO EXTERNAL SINK. The burn is unconditional and internal, so there
+    ///      is no child call whose revert could hold a conviction hostage, no
+    ///      allowance against sWOOD's custody balance, and no gas to reserve
+    ///      for a callee.
     /// @dev    THE BOUNTY IS THE PROSECUTOR'S FEE (spec 2026-07-29 §2). It is
     ///         paid only when a slash actually recovers WOOD, and it is
-    ///         deducted BEFORE `openCase` so the escrow's `proceeds` equal what
-    ///         claimants can really redeem. `bountyTo == address(0)` or
-    ///         `bountyBps == 0` disables it and the escrow receives the whole
-    ///         slash - which is how the caller expresses "this path pays no
-    ///         bounty" (see `ChallengeGame._settle`: only an ESCALATED
-    ///         conviction pays, never the silence settle).
-    ///
-    ///         PAID EVEN ON THE BURN FALLBACK. If `openCase` reverts, the
-    ///         remainder still burns (`VerdictSlashUncompensated`) rather than
-    ///         being clawed back — depositors recover 0% of the slash on that
-    ///         path EITHER WAY (no case was ever opened to divide), so paying
-    ///         the bounty first costs them nothing; it comes out of what would
-    ///         otherwise simply burn.
+    ///         deducted BEFORE the burn. `bountyTo == address(0)` or
+    ///         `bountyBps == 0` disables it and the whole slash burns — which
+    ///         is how the caller expresses "this path pays no bounty" (see
+    ///         `ChallengeGame._settle`: only an ESCALATED conviction pays,
+    ///         never the silence settle).
     ///
     ///         `bountyBps` IS NOT TRUSTED FROM THE CALLER. sWOOD rejects it
     ///         outside `[0, MAX_CONVICTION_BOUNTY_BPS]` itself
@@ -234,32 +206,28 @@ interface IStakedWood {
     ///         lives in the CALLER; sWOOD is the contract that actually moves
     ///         the WOOD, so a compromised or buggy slasher can divert at most
     ///         `MAX_CONVICTION_BOUNTY_BPS` of any ONE CALL's slash to a
-    ///         caller-named `bountyTo` — that call's remainder can still only
-    ///         ever reach the owner-set `compensationEscrow` or the burn
-    ///         address, never an arbitrary destination of the slasher's own
-    ///         choosing. PER CALL, NOT PER GUARDIAN: `verdictSlashed` keys on
-    ///         a caller-chosen `caseKey`, so repeated verdicts against the
-    ///         same approver under fresh case keys compound.
+    ///         caller-named `bountyTo` — that call's remainder can only ever
+    ///         reach `BURN_ADDRESS`, never an arbitrary destination of the
+    ///         slasher's own choosing. PER CALL, NOT PER GUARDIAN:
+    ///         `verdictSlashed` keys on a caller-chosen `caseKey`, so repeated
+    ///         verdicts against the same approver under fresh case keys
+    ///         compound.
     /// @param  bountyTo   Recipient of the conviction bounty, or `address(0)`.
     /// @param  bountyBps  Slice of the recovered total, in bps. Rejected
     ///                     outside `[0, MAX_CONVICTION_BOUNTY_BPS]` by sWOOD
     ///                     itself (reverts, not silently clamped down).
-    /// @return total  WOOD routed to the escrow across all approvers, NET of
-    ///                the conviction bounty. `VerdictSlashRouted` and
-    ///                `VerdictSlashUncompensated` both report this NET figure.
-    /// @return caseId The escrow case funded, or 0 when nothing was recovered.
-    function slashToEscrow(
+    /// @return total  WOOD burned across all approvers, NET of the conviction
+    ///                bounty — the `burned` leg of `VerdictSlashBurned`.
+    function slashVerdict(
         bytes32 caseKey,
         uint256 openedAt,
         address[] calldata approvers,
         uint256[] calldata slashBpsPer,
-        address vault,
-        uint256 snapshotTimestamp,
         address bountyTo,
         uint256 bountyBps
-    ) external returns (uint256 total, uint256 caseId);
+    ) external returns (uint256 total);
 
-    /// @notice The authoritative ceiling on `slashToEscrow`'s `bountyBps` —
+    /// @notice The authoritative ceiling on `slashVerdict`'s `bountyBps` —
     ///         read this rather than restating the literal bps value
     ///         elsewhere (e.g. in `ChallengeGame`), so a caller's own clamp
     ///         and sWOOD's enforced one cannot silently drift apart.
@@ -267,8 +235,6 @@ interface IStakedWood {
 
     function setAuthorizedSlasher(address slasher) external;
     function authorizedSlasher() external view returns (address);
-    function setCompensationEscrow(address escrow) external;
-    function compensationEscrow() external view returns (address);
 
     /// @notice Whether `approver` has already been slashed under `caseKey`.
     /// @dev Lets a slasher (Plan D, or a keeper resuming a batch that ran out

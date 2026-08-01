@@ -251,8 +251,6 @@ contract MockChallengeStakedWood {
     function lastSlashBpsPer() external view returns (uint256[] memory) {
         return _lastSlashBpsPer;
     }
-    address public lastVault;
-    uint256 public lastSnapshotTimestamp;
     /// @dev Task 1 (spec 2026-07-29 §2) added the conviction-bounty params;
     ///      Task 2 wired the real routing. Recorded, not swallowed, so a test
     ///      can pin exactly what `_settle` passes: `(challenger,
@@ -276,41 +274,35 @@ contract MockChallengeStakedWood {
     }
 
     uint256 internal _nextTotal = 1_000e18;
-    uint256 internal _nextCaseId = 1;
 
     function setMaxSlashBps(uint256 v) external {
         maxSlashBps = v;
     }
 
-    function setNextResult(uint256 total, uint256 caseId) external {
+    function setNextResult(uint256 total) external {
         _nextTotal = total;
-        _nextCaseId = caseId;
     }
 
     function lastApprovers() external view returns (address[] memory) {
         return _lastApprovers;
     }
 
-    function slashToEscrow(
+    function slashVerdict(
         bytes32 caseKey,
         uint256 openedAt,
         address[] calldata approvers,
         uint256[] calldata slashBpsPer,
-        address vault,
-        uint256 snapshotTimestamp,
         address bountyTo,
         uint256 bountyBps
-    ) external returns (uint256, uint256) {
+    ) external returns (uint256) {
         callCount++;
         lastCaseKey = caseKey;
         lastOpenedAt = openedAt;
         _lastApprovers = approvers;
         _lastSlashBpsPer = slashBpsPer;
-        lastVault = vault;
-        lastSnapshotTimestamp = snapshotTimestamp;
         lastBountyTo = bountyTo;
         lastBountyBps = bountyBps;
-        return (_nextTotal, _nextCaseId);
+        return _nextTotal;
     }
 }
 
@@ -1033,11 +1025,11 @@ contract ChallengeGameTest is Test {
         assertEq(filedAt, executedAt + 3 days, "the filing trails execution, so the two are distinguishable");
         uint256 challengerBefore = wood.balanceOf(challenger);
 
-        swood.setNextResult(9_999e18, 42);
+        swood.setNextResult(9_999e18);
         vm.warp(filedAt + game.autoSlashDelay());
 
         vm.expectEmit(true, true, true, true, address(game));
-        emit IChallengeGame.ChallengeSettled(id, 9_999e18, 42);
+        emit IChallengeGame.ChallengeSettled(id, 9_999e18);
         game.resolve(id); // permissionless — this test contract is nobody
 
         // The verdict slash, argument by argument.
@@ -1059,8 +1051,6 @@ contract ChallengeGameTest is Test {
         for (uint256 i = 0; i < expectedBps.length; i++) {
             assertEq(sentBps[i], expectedBps[i], "rate passed through unmodified");
         }
-        assertEq(swood.lastVault(), vault, "vault pinned at filing, not re-read at resolve (F10)");
-        assertEq(swood.lastSnapshotTimestamp(), executedAt - 1, "case pinned to the pre-drain block (D6)");
         address[] memory slashed = swood.lastApprovers();
         assertEq(slashed.length, 2);
         assertEq(slashed[0], guardianA);
@@ -1112,7 +1102,7 @@ contract ChallengeGameTest is Test {
         // Governance rotates the demoter role out from under the live challenge.
         tiers.setReverting(true);
 
-        swood.setNextResult(9_999e18, 42);
+        swood.setNextResult(9_999e18);
         vm.warp(_filedAt(id) + game.autoSlashDelay());
 
         vm.expectEmit(true, true, true, true, address(game));
@@ -1143,8 +1133,10 @@ contract ChallengeGameTest is Test {
 
         vm.warp(_filedAt(id) + game.autoSlashDelay());
         game.resolve(id);
-        assertEq(swood.lastSnapshotTimestamp(), executedAt - 1);
-        assertLt(swood.lastSnapshotTimestamp(), swood.lastOpenedAt(), "snapshot precedes the verdict");
+        // The pre-drain snapshot this used to pin died with the compensation
+        // escrow — nothing is apportioned, so there is no instant to choose.
+        // The surviving anchor is the one that sizes the slash.
+        assertEq(swood.lastOpenedAt(), executedAt, "verdict anchored at execution");
     }
 
     /// @notice Only the guardians STILL covering the proposal are slashed. One
@@ -1211,7 +1203,7 @@ contract ChallengeGameTest is Test {
         assertEq(swood.callCount(), 0, "the slasher was never reached");
 
         // Same challenge, honest gas: settles clean.
-        swood.setNextResult(9_999e18, 42);
+        swood.setNextResult(9_999e18);
         game.resolve(id);
         assertEq(swood.callCount(), 1, "the retry lost nothing");
     }
@@ -1737,8 +1729,6 @@ contract ChallengeGameTest is Test {
         game.resolve(id);
 
         assertEq(swood.lastOpenedAt(), executedAt, "basis is the execution instant");
-        assertEq(swood.lastSnapshotTimestamp(), executedAt - 1, "snapshot is the block before the drain (D6)");
-        assertTrue(swood.lastSnapshotTimestamp() < swood.lastOpenedAt(), "sWOOD's snapshot <= openedAt bound holds");
     }
 
     /// @notice 🟠F5: the clocks a challenge runs on are the ones it received.
