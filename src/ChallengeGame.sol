@@ -146,25 +146,41 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      permits `autoSlashDelay` up to 45 days.
     uint256 public constant MAX_DISPUTE_TIMEOUT = 60 days;
 
-    /// @dev THE GAS FLOOR for a permissionless `resolve`. `resolve` is callable
-    ///      by anyone, so the caller chooses the gas, and a slash that runs out
-    ///      halfway leaves the challenge with no terminal path.
+    /// @dev THE GAS FLOOR for a permissionless `resolve`, re-derived from
+    ///      measurement (`test/SlashGasCeiling.t.sol`) after the burn change.
     ///
-    ///      OVER-RESERVED, PENDING RE-DERIVATION. These constants were sized
-    ///      against a threat that no longer exists (PR #24 round-4 N-4 / N-3):
-    ///      a starved `openCase` child inside the old `slashToEscrow` read as
-    ///      empty returndata and BURNED the victims' compensation rather than
-    ///      bubbling, so the base had to leave that child a >5x margin after
-    ///      63/64 forwarding. There is no child call any more — the burn is
-    ///      internal — so the 1M base in particular is far larger than the
-    ///      remaining work needs.
+    ///      WHAT IT PROTECTS NOW. The original job is gone: these guarded an
+    ///      `openCase` child whose out-of-gas revert was indistinguishable from
+    ///      a missing selector and so BURNED the victims' compensation
+    ///      irreversibly (PR #24 round-4 N-4 / N-3). The burn is internal now;
+    ///      there is no such child. What remains is `demoteByChallenge` below —
+    ///      a BEST-EFFORT `try/catch` (review 🟠F11) that runs AFTER the slash.
+    ///      Under EIP-150 a caller supplying just enough gas to finish the
+    ///      slash leaves that child 63/64 of a nearly-empty frame: it starves,
+    ///      the catch swallows it, and the verdict settles with the challenged
+    ///      adapter KEEPING its certification. Permissionless, cheap, and
+    ///      undone only by a separate governance `demote`. Everything else
+    ///      after the slash reverts the whole call (unguarded `safeTransfer`s)
+    ///      or is internal bookkeeping, so it is safe by rollback.
     ///
-    ///      They are deliberately NOT lowered here. The safe value is a
-    ///      measured one, and lowering a permissionless-entry gas floor by
-    ///      estimate is how you brick a conviction at the 100-approver cap.
-    ///      ~300k/approver still covers `_slashOne` plus the O(n²) dedup share.
-    ///      Re-measure and right-size before mainnet: burn-slash-proceeds §6.1.
-    uint256 internal constant SLASH_GAS_PER_APPROVER = 300_000;
+    ///      SIZING. Measured `slashVerdict` cost: 137k at 1 approver, 824k at
+    ///      10, 4.44M at 50, 9.97M at 100 — a marginal ~101.6k/approver that
+    ///      RISES with cohort size (82k -> 89k -> 100k per approver) because
+    ///      the duplicate scan is O(n²). 110k/approver covers that marginal
+    ///      with ~8% headroom at the cap and far more below it, and the linear
+    ///      floor stays above the convex actual curve at every n up to 100.
+    ///
+    ///      The 1M base is RETAINED, repurposed: it is no longer margin for a
+    ///      child call but the post-slash reserve — the O(n) `contested` scan
+    ///      (~210k at the cap), the demote child, the bond transfers and the
+    ///      events. Being generous here costs nothing but rejecting an
+    ///      under-gassed caller, while being tight silently drops demotions.
+    ///
+    ///      At the 100-approver cap this reserves 12M against a measured 9.97M,
+    ///      leaving ~2M of headroom — and fits Robinhood's 32M per-transaction
+    ///      limit with 20M to spare. The previous 31M floor consumed nearly the
+    ///      whole limit, which is what made a full-cohort verdict a blocker (H2).
+    uint256 internal constant SLASH_GAS_PER_APPROVER = 110_000;
     uint256 internal constant SLASH_GAS_BASE = 1_000_000;
 
     /// @notice Where every burned slice of a challenger's bond goes — both the

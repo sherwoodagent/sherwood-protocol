@@ -1194,10 +1194,13 @@ contract ChallengeGameTest is Test {
         uint256 id = _fileStandard(PROPOSAL);
         vm.warp(_filedAt(id) + game.autoSlashDelay());
 
-        // Two approvers -> floor = 2 * 300k + 1M = 1.6M. 1.5M covers all the
-        // pre-floor work comfortably but cannot satisfy the floor itself.
+        // Two approvers -> floor = 2 * 110k + 1M = 1.22M (re-derived from
+        // measurement in `SlashGasCeiling.t.sol`; was 1.6M when the floor
+        // reserved margin for an `openCase` child that no longer exists).
+        // 1.15M covers all the pre-floor work comfortably but cannot satisfy
+        // the floor itself.
         bytes memory callData = abi.encodeWithSelector(game.resolve.selector, id);
-        (bool ok, bytes memory ret) = address(game).call{gas: 1_500_000}(callData);
+        (bool ok, bytes memory ret) = address(game).call{gas: 1_150_000}(callData);
         assertFalse(ok, "a gas-starved resolve must not settle");
         assertEq(bytes4(ret), IChallengeGame.InsufficientSlashGas.selector, "refused at the floor, not an OOG");
         assertEq(swood.callCount(), 0, "the slasher was never reached");
