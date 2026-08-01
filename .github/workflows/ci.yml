@@ -82,19 +82,17 @@ jobs:
           restore-keys: |
             forge-coverage-${{ env.FOUNDRY_VERSION }}-
 
-      # `[profile.coverage]` pins via_ir = false — forge coverage is
-      # incompatible with the IR pipeline (Yul stack-too-deep). Same fork-path
-      # exclusion as the Test step above: those suites need live RPC.
+      # `forge coverage` disables the optimizer and via_ir project-wide to keep
+      # source maps accurate, and unoptimized legacy codegen blows the stack in
+      # this repo's eight largest contracts. `[profile.coverage]` works around
+      # that with per-file `compilation_restrictions` that keep exactly those
+      # eight on the IR pipeline; see the comment block in foundry.toml for the
+      # list, the reproduce command, and what the workaround costs. Same
+      # fork-path exclusion as the Test step above: those suites need live RPC.
       #
-      # KNOWN RED (forge 1.7.1, verified locally 2026-08-01): the src tree no
-      # longer compiles under either coverage codegen mode, so this step fails
-      # before it instruments anything — hence `continue-on-error` above.
-      #   - profile default (via_ir off, optimizer off): legacy stack-too-deep
-      #     at src/queue/VaultWithdrawalQueue.sol:399
-      #   - `--ir-minimum` (viaIR + min optimization): Yul stack-too-deep at
-      #     src/SyndicateGovernor.sol:282
-      # Fixing that is a src-side change (scope out of #63). The job is wired
-      # now so the signal appears the moment the blocker is lifted.
+      # Still `continue-on-error` (see above) on stability grounds only — as of
+      # forge 1.7.1 this step passes: 1478 tests, ~52% line coverage over the 83
+      # instrumented files.
       - name: forge coverage
         env:
           FOUNDRY_PROFILE: coverage
