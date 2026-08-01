@@ -76,6 +76,42 @@ contract VaultWithdrawalQueueTest is Test {
         assertEq(queue.pendingDepositAssets(), 500e6);
     }
 
+    /// @notice A queued deposit carried NO claim deadline, and `cancel` is shut
+    ///         once its proposal stamps — so waiting was strictly free. That
+    ///         turned the frozen settle price into a perpetual look-back call on
+    ///         the vault's NAV: sit on the request, watch the next proposal
+    ///         settle, and claim only if the OLD price mints more shares.
+    ///
+    ///         The escrowed assets never entered the strategy, so the honest
+    ///         price is the one prevailing when they actually join — the latest
+    ///         settlement, not the one their request happened to be tagged to.
+    function test_claimDeposit_pricesAtTheLatestSettlement() public {
+        uint256 id = _queueDeposit(alice, 1_000e6);
+        _stamp(); // PID 1 at 2 assets/share
+
+        // A later proposal doubles the share price before the depositor claims.
+        vm.prank(address(vault));
+        queue.stampSettlement(PID + 1, 4, 1);
+
+        vm.prank(alice);
+        uint256 shares = queue.claim(id);
+
+        // Priced at the CURRENT 4 assets/share, not the stale 2.
+        assertEq(shares, 250e6, "deposit mints at the latest settle price");
+    }
+
+    /// @notice With no later settlement the behaviour is unchanged — the
+    ///         request's own stamped price is still the latest one.
+    function test_claimDeposit_unchangedWhenNoLaterSettlement() public {
+        uint256 id = _queueDeposit(alice, 1_000e6);
+        _stamp();
+
+        vm.prank(alice);
+        uint256 shares = queue.claim(id);
+
+        assertEq(shares, 500e6, "unchanged: own stamp is the latest");
+    }
+
     function test_queueRedeem_onlyVault() public {
         vm.expectRevert(IVaultWithdrawalQueue.NotVault.selector);
         queue.queueRedeem(alice, 100e18, PID);

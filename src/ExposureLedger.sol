@@ -373,14 +373,30 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     function _woodPrice() internal view returns (uint256 price, bool usingFallback) {
         AssetFeed storage f = _woodFeed;
         if (f.feed == address(0)) return (_haircut(woodUsdPriceX8), true);
-        (, int256 answer,, uint256 updatedAt,) = IAggregatorMinimal(f.feed).latestRoundData();
-        if (answer <= 0) return (_haircut(woodUsdPriceX8), true);
-        uint256 age = block.timestamp > updatedAt ? block.timestamp - updatedAt : 0;
-        if (age > f.maxDelay) return (_haircut(woodUsdPriceX8), true);
-        // Normalise to 8 decimals. `answer > 0` checked above.
-        // forge-lint: disable-next-line(unsafe-typecast)
-        uint256 priceX8 = (uint256(answer) * 1e8) / (10 ** f.feedDecimals);
-        return (_haircut(priceX8), false);
+        // A REVERTING feed is a fourth degraded shape, and it was the one left
+        // unhandled. The three below model a feed that answers badly; an
+        // aggregator with no round published answers not at all ("No data
+        // present"), and so does a proxy whose implementation slot is zeroed.
+        // Unwrapped, that revert propagated out of every consumer of
+        // `slashableBondUsd`: each Approve vote, each tier-gated
+        // `executeProposal`, `settleCoverage` and `slashBpsFor`. Since
+        // `recordApproval` deliberately wraps only the ASSET-price read, a dead
+        // WOOD feed failed the VOTE — the block-only review this contract's
+        // review history exists to prevent. Falling back keeps the same
+        // fail-degraded stance the other three shapes already take.
+        try IAggregatorMinimal(f.feed).latestRoundData() returns (
+            uint80, int256 answer, uint256, uint256 updatedAt, uint80
+        ) {
+            if (answer <= 0) return (_haircut(woodUsdPriceX8), true);
+            uint256 age = block.timestamp > updatedAt ? block.timestamp - updatedAt : 0;
+            if (age > f.maxDelay) return (_haircut(woodUsdPriceX8), true);
+            // Normalise to 8 decimals. `answer > 0` checked above.
+            // forge-lint: disable-next-line(unsafe-typecast)
+            uint256 priceX8 = (uint256(answer) * 1e8) / (10 ** f.feedDecimals);
+            return (_haircut(priceX8), false);
+        } catch {
+            return (_haircut(woodUsdPriceX8), true);
+        }
     }
 
     /// @dev THE HAIRCUT APPLIES TO BOTH PATHS. It originally applied only to the
@@ -477,8 +493,21 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      by the old registry become unreleasable and only self-heal when
     ///      their buckets expire (end of epoch + challenge window). Re-point
     ///      only at low open exposure.
+    /// @dev CLEARING IS SUPPORTED: `setWoodFeed(address(0), 0)` unwires the feed
+    ///      and returns pricing to the governance fallback. Without it, wiring a
+    ///      bad aggregator was a one-way door — the zero-address rejection meant
+    ///      recovery required DEPLOYING a substitute aggregator contract first,
+    ///      while every Approve vote and every tier-gated execute stayed halted.
+    ///      Requiring `maxDelay == 0` alongside keeps the clear explicit, so a
+    ///      mis-typed address with a real delay still reverts rather than
+    ///      silently disabling the feed.
     function setWoodFeed(address feed, uint256 maxDelay) external onlyOwner {
-        if (feed == address(0)) revert ZeroAddress();
+        if (feed == address(0)) {
+            if (maxDelay != 0) revert InvalidParameter();
+            delete _woodFeed;
+            emit WoodFeedSet(address(0), 0);
+            return;
+        }
         if (maxDelay == 0) revert InvalidParameter();
         uint8 feedDecimals = IAggregatorMinimal(feed).decimals();
         _woodFeed = AssetFeed({
@@ -1408,7 +1437,21 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         // would make a fully-subscribed proposal fail its own coverage check
         // after settling — the mirror of the dust bug the quorum already avoids
         // by summing reservations.
-        if (assigned < needUsd && firstHolder != address(0)) {
+        // GATED ON THE OVER-SUBSCRIBED BRANCH. `_allocate` only divides — and so
+        // only truncates — when `effectiveTotal > needUsd`; below that it returns
+        // each reservation unscaled, making `assigned == effectiveTotal`. The
+        // early return above guards `reservedTotal`, which is the RESERVED total
+        // rather than the payable one, so a cohort whose bonds shrank between the
+        // vote and settling lands here with `needUsd - assigned` being a genuine
+        // coverage SHORTFALL, not dust. Crediting that to the first holder booked
+        // exposure it never reserved, above its own `kNumerator *
+        // slashableBondUsd` cap — freezing that guardian's approve budget and its
+        // unstake claim for the rest of the bucket's life, on a victim any
+        // approver could select via `releaseApproval`'s swap-and-pop. An
+        // under-covered proposal stays under-covered: inventing collateral nobody
+        // pledged is precisely what `_allocate` refuses to do when it declines to
+        // scale UP.
+        if (effectiveTotal > needUsd && assigned < needUsd && firstHolder != address(0)) {
             uint256 residue = needUsd - assigned;
             RecordedExposure memory rf = _recorded[key][firstHolder];
             _buckets[firstHolder][rf.epoch] += residue;

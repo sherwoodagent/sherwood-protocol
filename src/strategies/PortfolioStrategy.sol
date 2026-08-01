@@ -73,6 +73,10 @@ contract PortfolioStrategy is BaseStrategy {
     error RebalancingInProgress();
     error StalePrice();
     error InvalidSlippage();
+    /// @notice `_updateParams` was passed a non-empty `swapExtraData`. Routes are
+    ///         reviewed with the proposal and frozen once it executes — see the
+    ///         rationale in `_updateParams`.
+    error RoutesFrozen();
     error QuoteUnavailable();
     error InvalidPriceDecimals();
     /// @notice Sherlock #56 — feed id missing at init, or report's `feedId`
@@ -89,6 +93,16 @@ contract PortfolioStrategy is BaseStrategy {
     // ── Constants ──
     uint256 public constant MAX_BASKET_SIZE = 20;
     uint256 public constant BPS_DENOMINATOR = 10_000;
+    /// @notice Hard ceiling on the swap slippage tolerance, at init and on every
+    ///         update (10%). Matches the cap the leveraged-CL template carried.
+    ///         Live baskets run at 100–500 bps, so this bounds the parameter well
+    ///         above real use while removing the 99.99% setting entirely.
+    /// @dev    NOT sandwich protection on its own: `_quoteMinOut` measures against
+    ///         a quote taken in the same transaction as the swap, so this bounds
+    ///         drift from that quote, not from a fair price. The oracle-anchored
+    ///         floor is `rebalanceDelta`, which prices off signed Chainlink
+    ///         reports; see the note on `_quoteMinOut`.
+    uint256 public constant MAX_SLIPPAGE_CEILING_BPS = 1_000;
     uint256 public constant PRICE_PRECISION = 1e18;
     /// @notice Default max staleness for a push-feed `latestRoundData` when a
     ///         slot declares no per-slot age. Robinhood Chainlink push feeds
@@ -222,7 +236,11 @@ contract PortfolioStrategy is BaseStrategy {
         if (tokens.length != weightsBps.length || tokens.length != swapExtraData_.length) revert LengthMismatch();
         if (tokens.length != priceDecimals_.length || tokens.length != feedIds_.length) revert LengthMismatch();
         if (totalAmount_ == 0) revert InvalidAmount();
-        if (maxSlippageBps_ == 0 || maxSlippageBps_ >= BPS_DENOMINATOR) revert InvalidSlippage();
+        // Ceiling, not just a sanity bound. `< BPS_DENOMINATOR` let a proposal
+        // seat a 99.99% tolerance at init and never need to relax it later, so
+        // the tighten-only guard in `_updateParams` would have had nothing to
+        // bite on.
+        if (maxSlippageBps_ == 0 || maxSlippageBps_ > MAX_SLIPPAGE_CEILING_BPS) revert InvalidSlippage();
 
         // Push-feed mode when no Data Streams verifier is wired: each
         // `feedIds[i]` encodes an AggregatorV3 proxy as bytes32(uint160(feed)).
@@ -339,17 +357,28 @@ contract PortfolioStrategy is BaseStrategy {
             emit WeightsUpdated(tokens, oldWeights, newWeightsBps);
         }
 
+        // TIGHTEN-ONLY. `> 0` is the "keep current value" sentinel, never a
+        // monotonicity guard, so this previously accepted any value below
+        // `BPS_DENOMINATOR` — letting the proposer raise the tolerance to 99.99%
+        // AFTER the proposal was reviewed and executed, then self-settle into a
+        // sandwich they control (`settleProposal` is proposer-callable an hour
+        // after execute). Same class as the `RepaymentBelowPrincipal` floor
+        // `VeniceInferenceStrategy` carries for Sherlock #49.
         if (newMaxSlippageBps > 0) {
-            if (newMaxSlippageBps >= BPS_DENOMINATOR) revert InvalidSlippage();
+            if (newMaxSlippageBps > maxSlippageBps) revert InvalidSlippage();
             maxSlippageBps = newMaxSlippageBps;
         }
 
-        if (newSwapExtraData.length > 0) {
-            if (newSwapExtraData.length != _allocations.length) revert LengthMismatch();
-            for (uint256 i; i < newSwapExtraData.length; ++i) {
-                _swapExtraData[i] = newSwapExtraData[i];
-            }
-        }
+        // ROUTES ARE FROZEN once the proposal executes. `_quoteMinOut` prices the
+        // SAME `extraData` route it is about to swap through, so the floor tracks
+        // whatever pool the route names: rewriting the route moves the floor with
+        // it, and `maxSlippageBps` cannot bound that, because the percentage is
+        // applied to the attacker's own quote. The routes were reviewed as part
+        // of the proposal; swapping them afterwards is the reviewed-then-replaced
+        // attack. Reacting to a dead pool is still possible through the
+        // oracle-anchored `rebalanceDelta`, whose floors come from signed feeds
+        // rather than from the route.
+        if (newSwapExtraData.length > 0) revert RoutesFrozen();
     }
 
     // ── Rebalancing ──
@@ -609,8 +638,28 @@ contract PortfolioStrategy is BaseStrategy {
     ///      UniswapSwapAdapter against a real V3 pool) return the expected
     ///      output, off which we apply maxSlippageBps. Adapters whose quote()
     ///      returns 0 or reverts cannot guarantee slippage, so we revert with
-    ///      `QuoteUnavailable`. The chainlink-priced `rebalanceDelta` path
-    ///      bypasses this helper and computes its floor from signed feeds.
+    ///      `QuoteUnavailable`.
+    ///
+    ///      NOT SANDWICH PROTECTION, and it must not be described as such. The
+    ///      quote is taken in the same transaction — and through the same
+    ///      `extraData` route — as the swap that follows, so both operands come
+    ///      from the same pool state. What this bounds is drift between the
+    ///      quote and the execution, which within one transaction is zero; it
+    ///      does NOT bound the price against a fair external reference. A
+    ///      searcher who moves the pool before the call gets a quote at the
+    ///      moved price and a floor derived from it, and the swap clears.
+    ///      `UniswapSwapAdapter._swapV4` states the same reasoning for its own
+    ///      construction.
+    ///
+    ///      The oracle-anchored path is `rebalanceDelta`, which derives its
+    ///      floors from signed Chainlink reports via `_verifyPrice` /
+    ///      `_tokensToValue` and does not consult the adapter quote at all.
+    ///      Extending that anchoring to `execute` / `settle` / `rebalance`
+    ///      requires price data at those call sites, which their `IStrategy`
+    ///      signatures do not carry — tracked separately. Until then the
+    ///      exposure is bounded by `MAX_SLIPPAGE_CEILING_BPS`, by the routes
+    ///      being frozen at execute, and by the guardian review of the routes
+    ///      the proposal declared.
     function _quoteMinOut(address tokenIn, address tokenOut, uint256 amountIn, bytes memory extraData)
         internal
         returns (uint256)

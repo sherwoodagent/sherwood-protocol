@@ -400,11 +400,6 @@ contract SyndicateVault is
         _;
     }
 
-    modifier onlyActiveStrategy() {
-        if (msg.sender != _activeStrategy()) revert NotActiveStrategy();
-        _;
-    }
-
     /// @dev Read governor address from factory
     function _getGovernor() internal view returns (address) {
         return ISyndicateFactory(_factory).governorOf(address(this));
@@ -814,7 +809,7 @@ contract SyndicateVault is
     }
 
     /// @dev Closed-deposit gate: reverts unless deposits are open OR `who` is
-    ///      whitelisted. Shared by `_deposit` / `requestDeposit` / `strategyMint`.
+    ///      whitelisted. Shared by `_deposit` / `requestDeposit`.
     function _requireApprovedDepositor(address who) private view {
         if (!_openDeposits && !_approvedDepositors.contains(who)) revert NotApprovedDepositor();
     }
@@ -1087,46 +1082,6 @@ contract SyndicateVault is
     function settleDeposit(uint256 shares, address to) external {
         if (msg.sender != _withdrawalQueue) revert NotQueue();
         _mint(to, shares);
-    }
-
-    /// @inheritdoc ISyndicateVault
-    /// @notice Active-strategy-only: mint `shares` to a depositor whose assets
-    ///         are custodied by the strategy (the strategy oracle-prices the entry).
-    ///         Auto-delegates for voting power if the recipient has no delegate.
-    /// @dev Enforces the same depositor whitelist as `_deposit` (`_openDeposits` /
-    ///      `_approvedDepositors`) so the strategy is not a back door around the
-    ///      vault's access control — a closed-deposit vault stays closed even via
-    ///      the strategy. `whenNotPaused` (above) likewise mirrors `_deposit`, so
-    ///      pausing the vault stops LP inflows during an incident. No `nonReentrant`:
-    ///      there is no external call (mint + delegate only).
-    ///
-    ///      DELIBERATELY does NOT apply the vault's Lane-A `_laneALockPid` (G1) stamp or
-    ///      the `DepositsLocked` gate that `_deposit` uses — those guard the vault's OWN
-    ///      oracle-priced instant-exit (Lane A). A strategy-hook strategy runs Lane A OFF
-    ///      (its `kind` is unregistered in the PriceRouter → `maxRedeem == 0` during a
-    ///      proposal), so there is no oracle-priced vault redeem to MEV; the active strategy
-    ///      prices each entry at its OWN oracle NAV (not the vault's float-only
-    ///      `totalAssets()`, so no float-NAV dilution) and services exits via an oracle-free
-    ///      proportional redeem. Stamping the G1 lock here would BRICK that redeem: `_update`
-    ///      reverts `SharesLocked` on any transfer from a locked holder, and the lock lifts
-    ///      only at settle — which never happens under the indefinite proposal these
-    ///      strategies run. The active-strategy gate is the trust boundary.
-    function strategyMint(address to, uint256 shares) external onlyActiveStrategy whenNotPaused {
-        _requireApprovedDepositor(to);
-        _mint(to, shares); // auto-delegation happens in `_update`
-    }
-
-    /// @inheritdoc ISyndicateVault
-    /// @notice Active-strategy-only: burn `shares` that the strategy pulled from a
-    ///         redeemer (the strategy's oracle-free proportional exit). Burns from
-    ///         `msg.sender` (the strategy holds the redeemer's shares after transfer).
-    /// @dev Not gated by `whenNotPaused`, so the DIRECT `strategy.redeem → strategyBurn`
-    ///      user-exit keeps working while the vault is paused. This does NOT mean all
-    ///      unwinding proceeds when paused: governance settlement (`settleProposal →
-    ///      executeGovernorBatch`) carries `whenNotPaused` and is blocked by a pause —
-    ///      only the per-user direct exit is pause-immune.
-    function strategyBurn(uint256 shares) external onlyActiveStrategy {
-        _burn(msg.sender, shares);
     }
 
     /// @inheritdoc ISyndicateVault

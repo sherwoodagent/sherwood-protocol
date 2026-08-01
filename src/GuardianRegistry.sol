@@ -900,6 +900,12 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         if (!_authorizedGovernors.contains(governor)) revert UnauthorizedGovernor();
         bytes32 eKey = _reviewKey(governor, proposalId);
         EmergencyReview storage er = _emergencyReviews[eKey];
+        // Mirrors `voteOnProposal`'s `resolved` guard. The `reviewEnd` test
+        // alone is NOT sufficient here: `cancelEmergency` repurposes `reviewEnd`
+        // as a post-cancel cooldown deadline (Sherlock #15), so for a whole
+        // `reviewPeriod` after a cancel `block.timestamp < er.reviewEnd` still
+        // holds and votes were accepted into an already-resolved review.
+        if (er.resolved) revert ReviewNotOpen();
         if (er.reviewEnd == 0 || block.timestamp >= er.reviewEnd) revert ReviewNotOpen();
         if (!swood.isActiveGuardian(msg.sender)) revert NotActiveGuardian();
         uint8 nonce = er.nonce;
