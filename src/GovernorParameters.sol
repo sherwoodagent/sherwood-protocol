@@ -43,7 +43,7 @@ abstract contract GovernorParameters is ProposalLifecycle {
     uint256 public constant MAX_EXECUTION_WINDOW = 7 days;
     uint256 public constant MIN_VETO_THRESHOLD_BPS = 2000; // 20%
     uint256 public constant MAX_VETO_THRESHOLD_BPS = 5000; // 50%
-    uint256 public constant MAX_PERFORMANCE_FEE_CAP = FeeConstants.MAX_PERFORMANCE_FEE_BPS; // 15%
+    uint256 public constant MAX_PERFORMANCE_FEE_CAP = FeeConstants.MAX_PERFORMANCE_FEE_BPS; // 30%
     uint256 public constant ABSOLUTE_MIN_STRATEGY_DURATION = 1 hours;
     // ~10y: supports indefinitely-lived strategies (e.g. leveraged Aerodrome CL). Params freeze and
     // the owner bond stays locked only WHILE a proposal is open — the proposer can self-settle 1h

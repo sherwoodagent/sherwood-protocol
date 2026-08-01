@@ -31,6 +31,12 @@ interface ISyndicateFactory {
 
     // ── Views ──
     function governorOf(address vault) external view returns (address);
+    /// @notice Number of syndicates this factory has created — i.e. the number
+    ///         of LIVE governor `BeaconProxy`s reading their implementation
+    ///         from `beacon()`. Non-zero means a governor-impl swap on that
+    ///         beacon is a live-state migration, not a fresh deployment; see
+    ///         `DeployPlanB`'s beacon pre-flight.
+    function syndicateCount() external view returns (uint256);
     function beacon() external view returns (address);
     function protocolConfig() external view returns (address);
     function priceRouter() external view returns (address);

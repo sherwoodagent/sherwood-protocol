@@ -37,10 +37,12 @@ contract MockFeed {
     }
 }
 
-/// @dev A wired-but-data-less Chainlink aggregator. A fresh proxy with no round
-///      published reverts `"No data present"` rather than returning a bad
-///      answer, which is NOT one of the three degraded shapes `_woodPrice`
-///      handles (unset feed / non-positive answer / stale answer).
+/// @dev A wired-but-data-less Chainlink aggregator: answers `decimals()` (so it
+///      can be wired) and then REVERTS on every price read. A fresh proxy with
+///      no round published reverts `"No data present"`; a proxy pointed at a
+///      dead implementation, a paused feed, or an address that stopped being an
+///      aggregator behave the same way. None is one of the three degraded shapes
+///      `_woodPrice` originally handled (unset / non-positive / stale).
 contract RevertingFeed {
     uint8 public constant decimals = 8;
 
@@ -141,6 +143,46 @@ contract MockRegistryForLedger {
 }
 
 contract ExposureLedgerTest is Test {
+    // ── FIXTURE HAZARD: TWO EARLY EXITS SILENTLY SHRINK A MULTI-APPROVER SET ──
+    //
+    // Both exits below are correct, deliberate behaviour in `ExposureLedger` and
+    // both stay. What they do to a TEST is quieter: a fixture that wires N
+    // approvers can end up exercising fewer than N, and still pass. Four tests
+    // shipped passing for the wrong reason (repaired in #61), two of them
+    // exactly this shape.
+    //
+    //   1. `requireApproveQuorum` — QUORUM-REACHED BREAK.
+    //      The loop returns the moment `haveUsd >= needUsd`, so every approver
+    //      after the one that tips the sum is never read. Size a fixture so the
+    //      FIRST approver's reservation alone meets the requirement and the
+    //      second approver's accounting is not under test at all: break that
+    //      path and the assertion still passes.
+    //
+    //   2. `recordApproval` — NO-FREE-BUDGET RETURN.
+    //      A guardian whose `kNumerator * slashableBondUsd` is already spoken
+    //      for by its open exposure returns before booking. It books zero, it is
+    //      NOT pushed onto `_approversOf`, and nothing reverts to mark it. The
+    //      fixture believes it seated N approvers; the ledger holds N-1. Reached
+    //      whenever an approver's stake is left at zero, or an earlier proposal
+    //      in the same test already consumed its budget.
+    //
+    // THE SIZING RULE, which defeats both at once: give every approver a
+    // bookable budget STRICTLY GREATER THAN ZERO and STRICTLY SMALLER than the
+    // proposal's requirement. Then each one books a real non-zero share (exit 2
+    // cannot fire), no single reservation can satisfy the quorum on its own
+    // (exit 1 cannot fire before the last approver), and every approver is
+    // genuinely read.
+    //
+    // `_wireUnderCoveredApprovers` applies the rule BY CONSTRUCTION, asserts it,
+    // and ends on an `approversOf` count check. `_assertApproverSet` is that
+    // count check on its own, for fixtures whose sizing is deliberately
+    // different — an over-reservation test needs each bond ABOVE the
+    // requirement, so it cannot take the rule, but it still wants to know the
+    // ledger seated the set it wired.
+    //
+    // A fixture that WANTS an early exit says so with an
+    // `// EARLY-EXIT INTENDED:` comment naming which one and why.
+
     ExposureLedger internal ledger;
     MockSwood internal swood;
     address internal owner = makeAddr("owner");
@@ -232,6 +274,71 @@ contract ExposureLedgerTest is Test {
         swood.setStake(guardian, 100_000e18); // slashableBondUsd = $5,000 at $0.05
     }
 
+    /// @dev THE SHARED MULTI-APPROVER FIXTURE (see the hazard block above).
+    ///      Seats `coverage6` as the proposal's requirement, stakes every
+    ///      approver at `stakeWood`, records all their approvals, and hands back
+    ///      a set that BOTH early exits leave intact.
+    ///
+    ///      Call after `_wireRecording()`. The sizing rule is ASSERTED rather
+    ///      than assumed: each approver's free budget must be non-zero (so it
+    ///      books a real share instead of taking `recordApproval`'s
+    ///      no-free-budget return) and strictly below the requirement (so no
+    ///      single reservation can satisfy `requireApproveQuorum` on its own and
+    ///      leave the later approvers unread). A fixture that cannot hold to
+    ///      that sizing does not belong on this helper — it either states
+    ///      `// EARLY-EXIT INTENDED:` or takes `_assertApproverSet` alone.
+    function _wireUnderCoveredApprovers(
+        uint256 proposalId,
+        uint256 coverage6,
+        uint256 stakeWood,
+        address[] memory approvers
+    ) internal {
+        mgov.set(coverage6);
+        uint256 needUsd = ledger.coverageUsd(usdgAsset, coverage6);
+        uint256 k = ledger.kNumerator();
+        for (uint256 i = 0; i < approvers.length; i++) {
+            swood.setStake(approvers[i], stakeWood);
+            uint256 capUsd = k * ledger.slashableBondUsd(approvers[i]);
+            uint256 open = ledger.openExposureUsd(approvers[i]);
+            uint256 free = capUsd > open ? capUsd - open : 0;
+            assertGt(free, 0, "sizing rule: an approver with no free budget books nothing and is never listed");
+            assertLt(free, needUsd, "sizing rule: no approver may satisfy the quorum on its own");
+        }
+        vm.startPrank(registry);
+        for (uint256 i = 0; i < approvers.length; i++) {
+            ledger.recordApproval(address(mgov), proposalId, approvers[i]);
+        }
+        vm.stopPrank();
+        _assertApproverSet(proposalId, approvers);
+    }
+
+    /// @dev The count check on its own, for fixtures whose sizing is
+    ///      deliberately different from the rule above. `recordApproval`'s
+    ///      no-free-budget return leaves no trace — no revert, no event, no
+    ///      list entry — so asking the ledger who it actually seated is the only
+    ///      way a fixture learns that one of its approvers silently dropped out.
+    function _assertApproverSet(uint256 proposalId, address[] memory expected) internal {
+        (address[] memory listed, uint256[] memory shares) = ledger.approversOf(address(mgov), proposalId);
+        assertEq(listed.length, expected.length, "the ledger seated a different approver set than the fixture wired");
+        for (uint256 i = 0; i < expected.length; i++) {
+            assertEq(listed[i], expected[i], "approver membership/order");
+            assertGt(shares[i], 0, "every approver books a non-zero share");
+        }
+    }
+
+    function _approverSet(address a, address b) internal pure returns (address[] memory set) {
+        set = new address[](2);
+        set[0] = a;
+        set[1] = b;
+    }
+
+    function _approverSet(address a, address b, address c) internal pure returns (address[] memory set) {
+        set = new address[](3);
+        set[0] = a;
+        set[1] = b;
+        set[2] = c;
+    }
+
     function test_recordApproval_registryOnly() public {
         _wireRecording();
         mgov.set(1_000e6);
@@ -270,20 +377,21 @@ contract ExposureLedgerTest is Test {
     ///         coverage (capped by its own budget); the pro-rata scale-back then
     ///         decides what each actually carries. Arrival order changes
     ///         nothing, which is the property the free-rider veto exploited.
+    ///
+    /// @dev    On the shared helper: $5,000 budgets against an $8,000
+    ///         requirement IS the sizing rule — neither approver can clear the
+    ///         quorum alone, so `requireApproveQuorum` has to read both, and
+    ///         the helper's count check proves the ledger seated both.
     function test_recordApproval_twoGuardiansAggregateToCover() public {
         _wireRecording();
         address g2 = makeAddr("g2");
-        swood.setStake(g2, 100_000e18); // $5,000 each at $0.05
-        mgov.set(8_000e6); // $8,000 needed — neither covers it alone
+        // $5,000 each at $0.05; $8,000 needed — neither covers it alone.
+        _wireUnderCoveredApprovers(1, 8_000e6, 100_000e18, _approverSet(guardian, g2));
 
-        vm.prank(registry);
-        ledger.recordApproval(address(mgov), 1, guardian);
         assertEq(ledger.openExposureUsd(guardian), 5_000e18, "first reserves its whole budget");
-
-        vm.prank(registry);
-        ledger.recordApproval(address(mgov), 1, g2);
         // The second reserves its OWN budget too, not merely the remainder —
-        // there is no leftover to race for.
+        // there is no leftover to race for. Under the old first-come rule this
+        // would read $3,000.
         assertEq(ledger.openExposureUsd(g2), 5_000e18, "second reserves its own budget, not the remainder");
 
         // $10,000 reserved against $8,000 needed, so each carries 5/10 of it.
@@ -690,18 +798,185 @@ contract ExposureLedgerTest is Test {
         // The split follows ABILITY TO PAY (review n1). A guardian with no bond
         // left is allocated nothing, and the survivor absorbs the whole
         // liability rather than being assigned half of a total the cohort can no
-        // longer cover.
-        //
-        // That is not an escape hatch: `StakedWood.claimUnstakeGuardian` refuses
-        // while open exposure remains, so the collapsed guardian is held — this
-        // only stops their absence from silently shrinking what everyone else
-        // owes. Before n1 the two shares were 500/500 and $500 of the $1,000 was
-        // simply unrecoverable.
+        // longer cover. Before n1 the two shares were 500/500 and $500 of the
+        // $1,000 was simply unrecoverable.
         assertEq(ledger.allocatedUsd(address(mgov), 1, guardian), 0, "cannot pay -> carries nothing");
         assertEq(ledger.allocatedUsd(address(mgov), 1, g2), 1_000e18, "survivor absorbs it all");
 
+        // AND THE EXIT GATE NO LONGER HOLDS THE COLLAPSED GUARDIAN. This comment
+        // used to claim the opposite — "`StakedWood.claimUnstakeGuardian`
+        // refuses while open exposure remains, so the collapsed guardian is
+        // held" — and nothing asserted it, because it is false. Settling zeroes
+        // their booking, which zeroes the bucket, which is exactly the number
+        // that gate reads. Asserted here so the claim is measured rather than
+        // repeated.
+        assertEq(ledger.openExposureUsd(guardian), 0, "settling releases the collapsed guardian's bucket");
+
+        // What actually holds a guardian under accusation is the FREEZE, not the
+        // bucket: `claimUnstakeGuardian` asks two questions, and
+        // `hasFrozenCoverage` is the one that does not age out on wall-clock
+        // (review 🔴F2 / 🟠F6). Nothing is frozen here, so nothing holds them —
+        // which is the honest state, not a hidden safety net.
+        assertFalse(ledger.hasFrozenCoverage(guardian), "no challenge filed: nothing pins them either");
+        vm.prank(freezer);
+        ledger.freezeCoverage(address(mgov), 1);
+        assertTrue(ledger.hasFrozenCoverage(g2), "the freeze is what pins a live approver");
+        // ...and it pins only guardians still carrying something, so a booking
+        // settled to zero is outside even that. A guardian whose bond is gone
+        // has nothing to hold; the loss is booked against the cohort, not
+        // recovered from them.
+        assertFalse(ledger.hasFrozenCoverage(guardian), "a zero booking is not frozen either");
+
         // ...and the proposal is still genuinely covered, where it was not before.
         ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 1_000e6);
+    }
+
+    /// @notice H1 — `settleCoverage` was a ONE-SHOT priced at the caller's
+    ///         chosen instant, so an approver could time it to a WOOD trough and
+    ///         permanently write down what a conviction could recover.
+    ///
+    ///         Two approvers, 100k WOOD each, an $8,000 proposal. Settled at
+    ///         $0.05 the cohort books $4,000 + $4,000 and $8,000 is recoverable.
+    ///         Settled at $0.025 the live cohort value ($5,000) falls under the
+    ///         need, `_allocate` returns each bond's trough value unchanged, and
+    ///         the old unbounded residue dumped the $3,000 gap on the first
+    ///         holder: $5,500 + $2,500 booked, of which only $7,500 is ever
+    ///         recoverable once WOOD comes back. 6.25% of underwritten coverage
+    ///         gone, permanently, for the cost of gas at a chosen block.
+    ///
+    ///         The fix is that no pass binds a later one: the pledges survive
+    ///         settlement, so anyone can re-derive the split at the recovered
+    ///         price. Asserted against the SAME numbers the good-instant pass
+    ///         produces.
+    function test_settleCoverage_cannotBePinnedAtAPriceTrough() public {
+        _wireRecording();
+        address g2 = makeAddr("g2");
+        swood.setStake(g2, 100_000e18); // both hold $5,000 at $0.05
+        mgov.set(8_000e6); // $8,000 needed; each reserves its whole $5,000
+        mgov.setSchedule(block.timestamp + 1 days, 3 days);
+
+        vm.startPrank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        ledger.recordApproval(address(mgov), 1, g2);
+        vm.stopPrank();
+
+        skip(31 days); // past executeBy: settling is now permitted
+
+        // WOOD halves and an approver settles at exactly that instant.
+        vm.prank(owner);
+        ledger.setWoodUsdPrice(0.025e8);
+        ledger.settleCoverage(address(mgov), 1);
+
+        // WOOD comes back. (Two hops would trip the 2x ceiling; 0.025 -> 0.05 is
+        // exactly 2x, and the interval is why the day passes first.)
+        skip(1 days);
+        vm.prank(owner);
+        ledger.setWoodUsdPrice(0.05e8);
+
+        // Anyone refreshes it — the challenger about to file, the resolver about
+        // to price a conviction, or a passer-by.
+        ledger.settleCoverage(address(mgov), 1);
+
+        assertEq(ledger.allocatedUsd(address(mgov), 1, guardian), 4_000e18, "re-derived, not pinned at the trough");
+        assertEq(ledger.allocatedUsd(address(mgov), 1, g2), 4_000e18, "and the residue did not favour the first");
+        assertEq(ledger.liabilityUsd(address(mgov), 1), 8_000e18, "the whole coverage is recoverable again");
+        ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 8_000e6);
+    }
+
+    /// @notice M1 — the residue is TRUNCATION DUST only when the cohort's live
+    ///         value still covers the need. When `reservedTotal > needUsd` (so
+    ///         the old under-subscribed short-circuit did not fire) but
+    ///         `effectiveTotal < needUsd`, `_allocate` returns everyone's whole
+    ///         `min(live, pledge)` and the "residue" is the entire cohort
+    ///         shortfall — which the old code credited wholesale to the first
+    ///         holder, with no bound against that guardian's own reservation.
+    ///
+    ///         $1,000 needed. A pledges its whole $600 budget; B pledges the
+    ///         full $1,000 off a $5,000 bond. Reservations total $1,600, above
+    ///         the need. B's bond then collapses to $50, leaving a live cohort
+    ///         value of $650 and a $350 gap — which landed on A, booking $950
+    ///         against a $600 pledge and a $600 `k x bond` cap.
+    ///         Pure budget griefing: $350 of A's capacity locked for a bucket
+    ///         lifetime against a liability A never took on, and no extra dollar
+    ///         recovered, since the slash clamps to the live bond either way.
+    function test_settleCoverage_residueCannotExceedAGuardiansOwnReservation() public {
+        _wireRecording();
+        address big = makeAddr("bigBond");
+        swood.setStake(guardian, 12_000e18); // $600 bond -> pledges all of it
+        swood.setStake(big, 100_000e18); // $5,000 bond -> pledges the full $1,000
+        mgov.set(1_000e6);
+        mgov.setSchedule(block.timestamp + 1 days, 3 days);
+
+        vm.startPrank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        ledger.recordApproval(address(mgov), 1, big);
+        vm.stopPrank();
+        assertEq(ledger.openExposureUsd(guardian), 600e18, "pledged its whole budget, not a wei more");
+
+        skip(31 days);
+        swood.setStake(big, 1_000e18); // $50 left: the cohort can only pay $650
+        ledger.settleCoverage(address(mgov), 1);
+
+        (, uint256[] memory committed) = ledger.approversOf(address(mgov), 1);
+        assertEq(committed[0], 600e18, "booked at its pledge, never above it");
+        assertEq(ledger.openExposureUsd(guardian), 600e18, "no griefed $350 of locked capacity");
+        assertLe(
+            ledger.openExposureUsd(guardian),
+            ledger.kNumerator() * ledger.slashableBondUsd(guardian),
+            "coverage <= k x slashableBondUsd still holds"
+        );
+
+        // The aggregate lands UNDER `needUsd`, which is the honest answer and
+        // costs the quorum nothing: it sums the same `min(live, booked)` it
+        // would have summed had settling never run, so the proposal fails its
+        // coverage check exactly as it already would have.
+        assertEq(ledger.liabilityUsd(address(mgov), 1), 650e18, "bounded by what the cohort can actually pay");
+        vm.expectRevert(IExposureLedger.InsufficientApproveCoverage.selector);
+        ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 1_000e6);
+    }
+
+    /// @notice The fourth block-only path (siblings: M3, N1, N4). `_woodPrice`
+    ///         handled an UNSET and a STALE feed by falling back, but a bare
+    ///         `latestRoundData()` revert propagated through `slashableBondUsd`
+    ///         into `recordApproval` — which reads the bond OUTSIDE the
+    ///         try/catch guarding the asset feed — so approve votes reverted
+    ///         while Block votes worked, and `requireApproveQuorum` reverted
+    ///         with them, blocking execution protocol-wide. `setWoodFeed(0, …)`
+    ///         was refused, so there was no path back either.
+    function test_woodPrice_revertingAggregatorFallsBackAndIsUnwireable() public {
+        _wireRecording();
+        mgov.set(1_000e6);
+
+        RevertingFeed dead = new RevertingFeed();
+        vm.prank(owner);
+        ledger.setWoodFeed(address(dead), 1 days);
+
+        (uint256 px, bool usingFallback) = ledger.woodPriceDetail();
+        assertEq(px, 0.05e8, "falls back to the governance price");
+        assertTrue(usingFallback, "and says so, for monitoring");
+        assertEq(ledger.slashableBondUsd(guardian), 5_000e18, "bonds still price");
+
+        // The approve side is not silenced, and execution is not blocked.
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        assertEq(ledger.openExposureUsd(guardian), 1_000e18);
+        ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 1_000e6);
+
+        // A healthy feed still supersedes the governance number...
+        MockFeed healthy = new MockFeed(0.1e8, 8);
+        vm.prank(owner);
+        ledger.setWoodFeed(address(healthy), 1 days);
+        (uint256 p2, bool fb2) = ledger.woodPriceDetail();
+        assertEq(p2, 0.1e8);
+        assertFalse(fb2);
+
+        // ...and zero is the unwire switch, which is the governance path back
+        // from an aggregator that has gone bad.
+        vm.prank(owner);
+        ledger.setWoodFeed(address(0), 0);
+        (uint256 p3, bool fb3) = ledger.woodPriceDetail();
+        assertEq(p3, 0.05e8, "back on the governance price");
+        assertTrue(fb3);
     }
 
     /// @notice Settle with a RELEASED approver still in the list. The loop must
@@ -1063,25 +1338,66 @@ contract ExposureLedgerTest is Test {
         ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 4_000e6);
     }
 
+    /// @notice Budget recycles once a commitment's bucket has expired — measured
+    ///         against the SETTLEMENT bucket, which is what the ledger actually
+    ///         keys on.
+    ///
+    /// @dev    This test used to run on the mock's default `executeBy = 0,
+    ///         strategyDuration = 0`, which makes `coverUntil <= epochGenesis`
+    ///         so `_coverageEpoch` short-circuits to `cur` — the PRE-ADR
+    ///         current-epoch keying. It therefore asserted "recycles after epoch
+    ///         + window", which is the property the ADR deliberately replaced:
+    ///         production books into the bucket covering `executeBy +
+    ///         strategyDuration`, so the budget is held until THAT bucket's
+    ///         challenge window elapses, roughly a month later.
+    ///
+    ///         With a realistic schedule the mid-point assertion below is the
+    ///         discriminating one: at epoch + window the pre-ADR keying would
+    ///         have released the budget, and the shipped keying still holds it.
     function test_recordApproval_netsAcrossSequentialEpochs() public {
         _wireRecording();
         mgov.set(4_000e6);
+        // Settles in epoch 1 (t0+30d), so the commitment is booked forward.
+        mgov.setSchedule(block.timestamp + 25 days, 5 days);
         vm.prank(registry);
         ledger.recordApproval(address(mgov), 1, guardian);
-        // same guardian, next epoch + challenge window fully elapsed: budget recycled
-        vm.warp(block.timestamp + 28 days + 14 days + 1);
+        assertEq(ledger.currentEpoch(), 0, "voted in epoch 0...");
+        assertEq(ledger.openExposureUsd(guardian), 4_000e18, "...but booked into the settlement bucket");
+
+        // One epoch + one challenge window on from the VOTE. Under the pre-ADR
+        // keying the bucket would have expired here and the budget would be
+        // free while the drain it backs is still challengeable.
+        // `skip` rather than `vm.warp(block.timestamp + …)`: the optimizer
+        // CSE-s `block.timestamp` across a warp, so a re-read can silently
+        // return the pre-warp value.
+        skip(28 days + 14 days + 1);
+        assertEq(ledger.openExposureUsd(guardian), 4_000e18, "still committed: the settlement bucket is live");
+
+        // Epoch 1 runs to t0+56d and its challenge window closes at t0+70d.
+        skip(28 days);
+        assertEq(ledger.openExposureUsd(guardian), 0, "budget recycled once the settlement bucket expired");
+
+        // Same guardian, a fresh proposal: would exceed the cap if netted with #1.
+        mgov.setSchedule(vm.getBlockTimestamp() + 25 days, 5 days);
         vm.prank(registry);
-        ledger.recordApproval(address(mgov), 2, guardian); // would exceed the cap if netted with #1
-        assertEq(ledger.openExposureUsd(guardian), 4_000e18); // only the live epoch counts
+        ledger.recordApproval(address(mgov), 2, guardian);
+        assertEq(ledger.openExposureUsd(guardian), 4_000e18); // only the live bucket counts
     }
 
     /// @notice The batching attack (spec §3.3): one guardian cannot back two
     ///         simultaneous drains with the same bond. Its committed exposure
     ///         is capped at its bond in TOTAL across open approvals, so the
     ///         second proposal is left short and cannot reach quorum.
+    /// @dev The mock carries a REALISTIC schedule here. On its default
+    ///      `executeBy = 0, strategyDuration = 0` the ledger short-circuits to
+    ///      current-epoch keying, so this exercised the pre-ADR bucket rather
+    ///      than the shipped one. With a settlement date both proposals land in
+    ///      the SAME forward-dated bucket, which is what production does and is
+    ///      the configuration the batching cap has to hold under.
     function test_recordApproval_blocksSimultaneousOverExposure() public {
         _wireRecording();
         mgov.set(3_000e6);
+        mgov.setSchedule(block.timestamp + 25 days, 5 days);
         vm.prank(registry);
         ledger.recordApproval(address(mgov), 1, guardian);
         assertEq(ledger.openExposureUsd(guardian), 3_000e18);
@@ -1098,8 +1414,12 @@ contract ExposureLedgerTest is Test {
         ledger.requireApproveQuorum(address(mgov), 2, usdgAsset, 3_000e6);
     }
 
-    /// @notice The hard edge of the batching cap: with NO free budget left, an
-    ///         approve reverts outright rather than committing zero.
+    // EARLY-EXIT INTENDED: `recordApproval`'s no-free-budget return. This test IS
+    // that exit — the second approval books nothing and the guardian is never
+    // listed for proposal 2, which is the asserted behaviour rather than a
+    // fixture that lost an approver by accident. (A stale line here used to claim
+    // the opposite, "an approve reverts outright"; N1 replaced that revert with
+    // this return.)
     /// @notice N1 — a spent budget books NOTHING; it does not revert. Reverting
     ///         took `voteOnProposal` down with it, so a guardian whose budget
     ///         went on an earlier proposal could not cast an approve vote at
@@ -1186,6 +1506,20 @@ contract ExposureLedgerTest is Test {
     /// @notice The quorum sums COMMITTED shares from the ledger's own approver
     ///         list — it no longer asks a registry who approved, so the ledger's
     ///         and the governor's registry pointers cannot disagree (I-1).
+    ///
+    /// @dev    THE ARITHMETIC IS PINNED DELIBERATELY, because the obvious
+    ///         version of this test cannot fail. Its comment used to claim g2
+    ///         "commits the $2,000 remainder"; under the shipped
+    ///         FULL-reservation rule g2 reserves its own $3,000 budget, so the
+    ///         reservations total $6,000, not $5,000. Checking only "covered at
+    ///         $5,000, uncovered at $7,000" passes identically under both rules
+    ///         — 3,000 + 2,000 = 5,000 also clears $5,000 and also misses
+    ///         $7,000 — so the test read as cover for the C1 regression while
+    ///         being blind to it.
+    ///
+    ///         Two things discriminate: the per-approver commitments, and a
+    ///         threshold BETWEEN the two totals. $6,000 is covered under the
+    ///         reservation rule and uncovered under the remainder rule.
     function test_approveQuorum_sumOfCommittedSharesCoversCoverage() public {
         _wireRecording();
         address g2 = makeAddr("g2");
@@ -1194,13 +1528,22 @@ contract ExposureLedgerTest is Test {
         mgov.set(5_000e6); // $5,000 needed
 
         vm.prank(registry);
-        ledger.recordApproval(address(mgov), 1, guardian); // commits $3,000
+        ledger.recordApproval(address(mgov), 1, guardian); // reserves its whole $3,000
         vm.prank(registry);
-        ledger.recordApproval(address(mgov), 1, g2); // commits the $2,000 remainder
+        // NOT the $2,000 remainder: g2 reserves its own $3,000 too, because it
+        // might end up carrying the proposal alone. That is what closed C1.
+        ledger.recordApproval(address(mgov), 1, g2);
 
-        // $3,000 + $2,000 == $5,000 → covered.
+        (address[] memory approvers, uint256[] memory committed) = ledger.approversOf(address(mgov), 1);
+        assertEq(approvers.length, 2);
+        assertEq(committed[0], 3_000e18, "first approver reserves its whole budget");
+        assertEq(committed[1], 3_000e18, "second reserves its own budget, not the remainder");
+
+        // $3,000 + $3,000 == $6,000 of reservations.
         ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 5_000e6);
-        // Asking for more than was ever committed fails.
+        // The discriminating threshold: only the reservation rule clears this.
+        ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 6_000e6);
+        // Asking for more than was ever committed still fails.
         vm.expectRevert(IExposureLedger.InsufficientApproveCoverage.selector);
         ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 7_000e6);
     }

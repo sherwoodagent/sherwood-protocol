@@ -76,7 +76,6 @@ contract FeeBlacklistResilienceTest is Test {
         ProtocolConfig protocolConfig = new ProtocolConfig(owner);
         vm.startPrank(owner);
         protocolConfig.setProtocolFeeRecipient(protocolRecipient);
-        protocolConfig.setProtocolFeeBps(100);
         vm.stopPrank();
 
         SyndicateGovernor govImpl = new SyndicateGovernor(24 hours, 1 hours);
@@ -192,20 +191,26 @@ contract FeeBlacklistResilienceTest is Test {
 
         // Expect the fee-failure event for the blacklisted protocol recipient.
         // We don't hard-match the reason bytes — just assert the topics.
-        vm.expectEmit(true, true, false, true);
-        emit ISyndicateGovernor.FeeTransferFailed(protocolRecipient, address(usdc), 100e6);
+        // Topics only (checkData = false): the protocol is now paid a share of
+        // each fee rather than a standalone rate off gross profit, so the
+        // amount moved. What this test guards is that a blacklisted recipient
+        // ESCROWS rather than reverting the settlement — the amount is
+        // asserted separately below.
+        vm.expectEmit(true, true, false, false);
+        emit ISyndicateGovernor.FeeTransferFailed(protocolRecipient, address(usdc), 0);
 
         // MS-H3: proposer self-settle requires MIN_STRATEGY_DURATION_BEFORE_SELF_SETTLE.
         vm.warp(vm.getBlockTimestamp() + 1 hours + 1);
         vm.prank(agent);
         governor.settleProposal(proposalId);
 
-        // Agent + owner mgmt fee still land; protocol recipient escrowed.
-        // 1% protocol of 10k = 100; net = 9900; agent 15% = 1485; mgmt 0.5% of 8415 = 42.075
-        assertEq(usdc.balanceOf(agent), agentBalBefore + 1_485e6, "agent fee paid");
-        assertEq(usdc.balanceOf(owner), ownerBalBefore + 42_075000, "mgmt fee paid");
+        // The other recipients still land; only the blacklisted protocol
+        // recipient escrows. Amount unpinned — the retired waterfall's 1485
+        // came from a rate structure that no longer exists.
+        assertGt(usdc.balanceOf(agent), agentBalBefore, "agent fee paid");
+        assertGt(usdc.balanceOf(owner), ownerBalBefore, "owner's share paid");
         assertEq(usdc.balanceOf(protocolRecipient), 0, "protocol recipient unpaid");
-        assertEq(governor.unclaimedFees(address(vault), protocolRecipient, address(usdc)), 100e6, "escrowed amount");
+        assertGt(governor.unclaimedFees(address(vault), protocolRecipient, address(usdc)), 0, "escrowed amount");
 
         // Strategy is Settled.
         assertEq(
@@ -227,18 +232,21 @@ contract FeeBlacklistResilienceTest is Test {
         vm.warp(vm.getBlockTimestamp() + 1 hours + 1);
         vm.prank(agent);
         governor.settleProposal(proposalId);
-        assertEq(governor.unclaimedFees(address(vault), protocolRecipient, address(usdc)), 100e6);
+        // Read the escrowed amount rather than pinning the retired waterfall's
+        // figure — this test is about the claim path, not the rate.
+        uint256 escrowed = governor.unclaimedFees(address(vault), protocolRecipient, address(usdc));
+        assertGt(escrowed, 0, "fee escrowed while blacklisted");
 
         // Lift the blacklist + pull.
         usdc.setBlacklisted(protocolRecipient, false);
 
         vm.expectEmit(true, true, false, true);
-        emit ISyndicateGovernor.FeeClaimed(protocolRecipient, address(usdc), 100e6);
+        emit ISyndicateGovernor.FeeClaimed(protocolRecipient, address(usdc), escrowed);
 
         vm.prank(protocolRecipient);
         governor.claimUnclaimedFees(address(vault), address(usdc));
 
-        assertEq(usdc.balanceOf(protocolRecipient), 100e6, "fee delivered");
+        assertEq(usdc.balanceOf(protocolRecipient), escrowed, "fee delivered");
         assertEq(governor.unclaimedFees(address(vault), protocolRecipient, address(usdc)), 0, "escrow cleared");
     }
 
@@ -259,12 +267,17 @@ contract FeeBlacklistResilienceTest is Test {
         vm.prank(agent);
         governor.settleProposal(proposalId);
 
-        // Agent fee math: perfFee = 15% of 9900 net = 1485.
-        // Co split 3000 bps: 1485 * 0.3 = 445.5 -> escrowed.
-        // Lead 70% = 1485 - 445.5 = 1039.5 -> paid.
-        assertEq(usdc.balanceOf(agent), agentBalBefore + 1_039_500000, "lead paid");
+        // The agent pot is now management + performance rather than the old
+        // waterfall's net-profit slice, so the absolute figures moved. The
+        // property under test is the SPLIT surviving a blacklisted co-proposer:
+        // the lead is paid, the co-proposer's 30% escrows instead of being lost.
+        uint256 leadPaid = usdc.balanceOf(agent) - agentBalBefore;
+        uint256 coEscrowed = governor.unclaimedFees(address(vault), coAgent, address(usdc));
+
+        assertGt(leadPaid, 0, "lead paid");
         assertEq(usdc.balanceOf(coAgent), 0, "coAgent unpaid");
-        assertEq(governor.unclaimedFees(address(vault), coAgent, address(usdc)), 445_500000, "coAgent escrowed");
+        assertGt(coEscrowed, 0, "coAgent escrowed");
+        assertApproxEqRel(coEscrowed, ((leadPaid + coEscrowed) * 3000) / 10_000, 1e15, "at its 30% split");
 
         assertEq(
             uint256(governor.getProposal(proposalId).state),
@@ -296,7 +309,8 @@ contract FeeBlacklistResilienceTest is Test {
         vm.warp(vm.getBlockTimestamp() + 1 hours + 1);
         vm.prank(agent);
         governor.settleProposal(proposalId);
-        assertEq(governor.unclaimedFees(address(vault), protocolRecipient, address(usdc)), 100e6);
+        uint256 escrowedA = governor.unclaimedFees(address(vault), protocolRecipient, address(usdc));
+        assertGt(escrowedA, 0, "escrow accrued on vault A");
 
         // 2. Deploy and register an unrelated vault B that holds plenty of USDC.
         SyndicateVault vaultImplB = new SyndicateVault();
@@ -329,7 +343,7 @@ contract FeeBlacklistResilienceTest is Test {
         // Escrow on vault A still intact — the attempted misroute did not clear it.
         assertEq(
             governor.unclaimedFees(address(vault), protocolRecipient, address(usdc)),
-            100e6,
+            escrowedA,
             "origin-vault escrow preserved"
         );
     }

@@ -115,7 +115,6 @@ abstract contract BaseIntegrationTest is Test {
             ensRegistrar: address(0), // ENS identity is not under test here
             agentRegistry: AGENT_REGISTRY, // real Base ERC-8004 registry; ownerOf mocked below
             managementFeeBps: 0, // keep settle PnL asserts exact (Venice equality asserts)
-            protocolFeeBps: 0, // keep settle PnL math clean (e2e convention)
             maxStrategyDays: 30,
             votingPeriod: 1 hours,
             woodToken: address(wood),

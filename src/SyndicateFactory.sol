@@ -17,6 +17,7 @@ import {IGuardianRegistry} from "./interfaces/IGuardianRegistry.sol";
 import {IStakedWood} from "./interfaces/IStakedWood.sol";
 import {IL2Registrar} from "./interfaces/IL2Registrar.sol";
 import {VaultWithdrawalQueue} from "./queue/VaultWithdrawalQueue.sol";
+import {FeeConstants} from "./FeeConstants.sol";
 
 /**
  * @title SyndicateFactory
@@ -468,12 +469,20 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     ///      owner-instant setters (frozen while a proposal is open). All values
     ///      sit within `GovernorParameters` bounds so the governor's
     ///      `_validateParamBounds` at `initialize` accepts them.
+    /// @dev `maxPerformanceFeeBps` starts at the advertised headline (20%), not
+    ///      at the protocol ceiling (30%). The settle-time clamp resolves an
+    ///      over-ceiling rate silently — it emits `FeeClamped` and continues —
+    ///      so a permissive default would fail open, letting an owner quietly
+    ///      charge above the headline. Fail-closed is the right default for a
+    ///      depositor-facing rate; raising it is a separately authorized
+    ///      governor param change. Named constant, not a literal, so it cannot
+    ///      drift from `FeeConstants` (the L1 finding).
     function _defaultGovernorParams() private pure returns (ISyndicateGovernor.GovernorParams memory) {
         return ISyndicateGovernor.GovernorParams({
             votingPeriod: 24 hours,
             executionWindow: 24 hours,
             vetoThresholdBps: 2000,
-            maxPerformanceFeeBps: 1500,
+            maxPerformanceFeeBps: FeeConstants.DEFAULT_MAX_PERFORMANCE_FEE_BPS,
             cooldownPeriod: 1 hours,
             collaborationWindow: 24 hours,
             maxCoProposers: 10,

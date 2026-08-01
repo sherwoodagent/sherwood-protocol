@@ -461,4 +461,48 @@ contract CompensationEscrowTest is Test {
         vm.expectRevert(ICompensationEscrow.NoClaim.selector);
         escrow.redeem(caseId);
     }
+
+    /// @notice PR #56 review. Ownership cannot be dropped. Every escape hatch
+    ///         here is `onlyOwner`, and one of them is the ONLY exit for
+    ///         residue: `sweepResidue` reverts `ZeroAddress` while
+    ///         `backstop == 0`, and only the owner can `setBackstop`. Renouncing
+    ///         would lock every case's remainder in the contract for good.
+    function test_renounceOwnership_reverts() public {
+        vm.prank(owner);
+        vm.expectRevert(ICompensationEscrow.OwnershipNotRenounceable.selector);
+        escrow.renounceOwnership();
+
+        assertEq(escrow.owner(), owner, "owner survives the attempt");
+
+        // And the escape hatch the renounce would have bricked still works.
+        address newBackstop = makeAddr("newBackstop");
+        vm.prank(owner);
+        escrow.setBackstop(newBackstop);
+        assertEq(escrow.backstop(), newBackstop);
+    }
+
+    /// @notice The residue exit really is owner-gated, so the override above is
+    ///         load-bearing rather than decorative: with no backstop wired,
+    ///         `sweepResidue` reverts and only the owner can unblock it.
+    function test_sweepResidue_needsALiveOwnerToWireTheBackstop() public {
+        CompensationEscrow fresh = new CompensationEscrow(owner, address(wood));
+        vm.prank(owner);
+        fresh.setAuthorizedFunder(slasher);
+
+        wood.mint(slasher, 10_000e18);
+        vm.startPrank(slasher);
+        wood.approve(address(fresh), type(uint256).max);
+        uint256 caseId = fresh.openCase(address(vault), snapTs, 10_000e18);
+        vm.stopPrank();
+
+        vm.warp(vm.getBlockTimestamp() + 180 days + 1);
+        vm.expectRevert(ICompensationEscrow.ZeroAddress.selector);
+        fresh.sweepResidue(caseId);
+
+        uint256 backstopBefore = wood.balanceOf(backstop);
+        vm.prank(owner);
+        fresh.setBackstop(backstop);
+        fresh.sweepResidue(caseId);
+        assertGt(wood.balanceOf(backstop) - backstopBefore, 0, "residue reached the backstop");
+    }
 }

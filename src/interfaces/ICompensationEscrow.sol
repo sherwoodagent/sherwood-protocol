@@ -21,6 +21,11 @@ interface ICompensationEscrow {
     error InvalidWindow();
     error ZeroAddress();
     error BackstopIsVault();
+    /// @dev `renounceOwnership` is disabled (PR #56 review): every escape hatch
+    ///      here is `onlyOwner`, and `sweepResidue` reverts forever without a
+    ///      `setBackstop` call, so dropping the owner would strand residue
+    ///      permanently. Transfer ownership instead.
+    error OwnershipNotRenounceable();
 
     event CaseOpened(
         uint256 indexed caseId, address indexed vault, uint256 indexed snapshotTimestamp, uint256 proceeds
