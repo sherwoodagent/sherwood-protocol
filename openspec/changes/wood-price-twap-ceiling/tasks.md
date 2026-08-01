@@ -24,7 +24,7 @@
   rate-limit upward moves for the same anti-pump reason `setWoodUsdPrice`
   does, but do not inherit the 1-day interval on downward moves — a maintained
   price needs to be able to track a fall promptly).
-- [ ] 4b. NOT DONE — deferred to its own issue. Consider relaxing `MIN_PRICE_UPDATE_INTERVAL` for *downward*
+- [x] 4b. DEFERRED — filed as issue #89 (alters live emergency semantics; does not belong in an oracle PR). Consider relaxing `MIN_PRICE_UPDATE_INTERVAL` for *downward*
   `setWoodUsdPrice` moves. The interval exists to stop the 2^N pump (review
   M4), which is an upward-only concern; gating downward moves makes the
   emergency brake usable once per day, which is not what a brake should be.
