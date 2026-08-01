@@ -77,10 +77,54 @@ change can only fail *same*, never *worse*.
 - Promoting the TWAP to a primary price source. See design.md — pair depth
   forbids it, and that constraint must survive future refactors.
 
-## Ship-order note
+## Operating doctrine: `setWoodUsdPrice` is an EMERGENCY lever, not a feed
 
-`woodHaircutBps` is currently 10_000 (no haircut) and can be lowered to 5_000
-today with **no code change**. Setting it to 6_000–7_000 buys real margin
-against the drift this proposal addresses and does not depend on any of the
-work here. That is the launch-week mitigation; this change is what removes the
-multisig from the pricing loop afterwards.
+**Owner decision, 2026-08-01.** The governance number is not to be maintained
+as a routine price. It is set once as a standing ceiling and touched only in an
+emergency.
+
+That is what the `min` structure is for, and it inverts which input does the
+work:
+
+| | Routine | Emergency |
+|---|---|---|
+| `woodUsdPriceX8` | set once, high enough not to bind; **left alone** | slammed **down** to throttle all bond valuation at once (downward moves are unbounded and immediate by design) |
+| TWAP | **binds** — tracks the market without human action | may be capped or bypassed by the emergency setting |
+
+This is strictly better than the alternative, because it removes recurring human
+judgment from the pricing path and leaves humans only a brake. But it changes
+what "TWAP unavailable" may do — see the staleness consequence below and
+design.md decision 2, which this doctrine revises.
+
+## What lowering `woodHaircutBps` does and does not buy
+
+Correcting an earlier, looser framing: **the haircut does not make the price
+more accurate.** It pre-funds an allowance for how wrong the price may be.
+
+Bonds are overvalued once `manual × haircut > true price`, so the haircut is
+exactly a pre-funded allowance for a drawdown between updates:
+
+| `woodHaircutBps` | tolerates manual overstating by | absorbs a WOOD crash of |
+|---|---|---|
+| 10_000 (today) | 0% | **0%** — any drop overvalues immediately |
+| 7_000 | 42.9% | 30% |
+| 6_000 | 66.7% | 40% |
+| 5_000 (floor) | 100% | **50%** |
+
+Two honest limits:
+
+1. It is a **constant factor against an unbounded error**. It covers one crash
+   of a known size; it does not cover a number nobody ever updates. Under the
+   emergency-only doctrine above, that limit is load-bearing rather than
+   theoretical.
+2. **There is no signal when the allowance is exhausted** — the same blind spot
+   as `usingFallback` being permanently true.
+
+So the haircut is worth setting because it converts an unbounded silent failure
+into a bounded one. It is **not** a substitute for this change: only something
+that tracks reality (the TWAP ceiling, or a real feed) lets the protocol notice
+on its own.
+
+Related: issue #31 (`maxSlashBps` at 9,999) is the same inequality — collateral
+worth less than the model claims. Both defaults currently sit on the wrong
+side; decide them together.

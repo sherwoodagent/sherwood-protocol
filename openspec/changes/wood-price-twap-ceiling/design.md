@@ -82,11 +82,39 @@ theft-enabling.
    that promotes the TWAP to a primary source re-opens a $219k-deep pool as the
    protocol's collateral valuation. Encode it as a spec requirement, not a
    comment.
-2. **Staleness guard drops the ceiling, does not revert.** A snapshot older
-   than `maxTwapAge` makes `consult()` report unavailable, and `_woodPrice`
-   skips the `min`. This is today's behaviour, so the change fails *same*, not
-   *worse*. Reverting here would hand an attacker a protocol-wide halt by
-   stopping a keeper.
+2. **Staleness guard — REVISED by the emergency-only doctrine.** The original
+   decision was "drop the `min`, fall back to the governance number", justified
+   because that is today's behaviour and therefore fails *same*, not *worse*.
+
+   **That justification does not survive the owner decision of 2026-08-01.** It
+   assumed the governance number is a maintained, roughly-correct price. Under
+   emergency-only operation it is deliberately set HIGH and left alone — so
+   falling back to it on TWAP staleness would fail in exactly the dangerous
+   direction, and worse, it would do so precisely when the market data stopped
+   arriving.
+
+   Revised behaviour: on TWAP staleness, keep serving the **last known good
+   TWAP**, progressively haircut as it ages, and let the governance number act
+   only as the hard ceiling it now is. Properties:
+
+   - routine → TWAP binds, no human in the loop;
+   - TWAP stale → last real market price, drifting conservative as it ages, so
+     quorum gets *harder*, never easier;
+   - emergency → the multisig slams `woodUsdPriceX8` down and the `min` caps
+     everything at once.
+
+   Reverting is still refused, for the original reason: it would let anyone
+   halt the protocol by not running a keeper.
+
+   **OPEN — needs an owner call.** What happens at the end of the decay, when
+   the last good TWAP is too old to trust at any haircut? The candidates are
+   (a) floor the decay and keep serving a heavily-discounted price forever,
+   (b) stop admitting *new* coverage while leaving existing operations priced,
+   or (c) fall through to the governance number and accept that the emergency
+   lever must then be used as a price after all. (b) is the most honest —
+   degrading capability rather than silently degrading a number — but it is a
+   larger change and touches `requireApproveQuorum` rather than just pricing.
+   Flagged rather than guessed.
 3. **Window length: ≥ 1 hour, configurable, bounded.** The live risk is
    sustained down-manipulation, and cost scales with the window. Short windows
    are cheap to hold; excessively long ones stop tracking a real drawdown,

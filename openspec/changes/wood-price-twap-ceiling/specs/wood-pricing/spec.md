@@ -32,9 +32,19 @@ The change must be incapable of failing *worse* than the current design.
 #### Scenario: stale snapshot
 
 - **GIVEN** the oracle's last `update()` is older than `maxTwapAge`
-- **THEN** `consult()` reports unavailable, the `min` is skipped, and the
-  governance number stands alone. It does **not** revert — reverting would let
-  anyone halt the protocol by not running a keeper.
+- **THEN** the last known good TWAP continues to be served, progressively
+  haircut as it ages, still capped by the governance number via the `min`.
+- **AND** it does **not** revert — reverting would let anyone halt the protocol
+  by not running a keeper.
+- **AND** it does **not** simply fall back to the governance number: under the
+  emergency-only doctrine that number is deliberately set high, so falling back
+  to it would fail in the dangerous direction at exactly the moment market data
+  stopped arriving.
+
+> **OPEN — owner decision required.** The terminal behaviour once the last good
+> TWAP is too old to trust at any haircut is unresolved: floor the decay, stop
+> admitting new coverage, or fall through to the governance number. See
+> design.md decision 2. This spec is not implementable until that is settled.
 
 #### Scenario: oracle reverts, is codeless, or returns malformed data
 
