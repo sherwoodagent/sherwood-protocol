@@ -157,6 +157,7 @@ contract DeployPlanBPreflightTest is Test {
     StakedWood internal swood;
     GuardianRegistry internal registry;
     SyndicateFactory internal factory;
+    ProtocolConfig internal protocolConfig;
 
     DeployPlanB internal script;
 
@@ -169,6 +170,10 @@ contract DeployPlanBPreflightTest is Test {
     address internal bookRegistry;
     address internal bookFactory;
     uint256 internal bookCap = COVERED_TVL_CAP;
+    // Seeded in `setUp` from `script.DEFAULT_MAX_STRATEGY_DURATION()` — the
+    // value an UNSET `MAX_STRATEGY_DURATION` produces in `run()`. See
+    // `test_deploy_seatsTheProtocolDurationCeiling`.
+    uint256 internal bookMaxStrategyDuration;
 
     function setUp() public {
         wood = new ERC20Mock("WOOD", "WOOD", 18);
@@ -204,7 +209,9 @@ contract DeployPlanBPreflightTest is Test {
         );
         registry = GuardianRegistry(address(new ERC1967Proxy(address(registryImpl), registryInit)));
 
-        ProtocolConfig protocolConfig = new ProtocolConfig(DEFAULT_SENDER);
+        // Owned by DEFAULT_SENDER: the script SEATS `maxStrategyDuration` on it
+        // (pre-flight 6), and pre-flight 6b refuses the run otherwise.
+        protocolConfig = new ProtocolConfig(DEFAULT_SENDER);
         address govImpl = address(new SyndicateGovernor(24 hours, 1 hours));
         GovernorBeacon beacon = new GovernorBeacon(govImpl, DEFAULT_SENDER);
         SyndicateFactory factoryImpl = new SyndicateFactory();
@@ -225,6 +232,11 @@ contract DeployPlanBPreflightTest is Test {
         factory = SyndicateFactory(address(new ERC1967Proxy(address(factoryImpl), factoryInit)));
 
         script = new DeployPlanB();
+        // Hoisted out of the `_setBook` argument list: an external call sitting
+        // in argument position is evaluated FIRST and would eat any pending
+        // one-shot cheatcode. Nothing is armed here today; the habit is what
+        // stops the next edit from being the one that breaks.
+        bookMaxStrategyDuration = script.DEFAULT_MAX_STRATEGY_DURATION();
         // OWNED BY `DEFAULT_SENDER`, not the test contract — see
         // `PlanBScriptCaller`'s own natspec for why.
         vm.etch(DEFAULT_SENDER, address(new PlanBScriptCaller()).code);
@@ -428,6 +440,82 @@ contract DeployPlanBPreflightTest is Test {
         assertEq(freshFactory.exposureLedger(), swood.exposureLedger(), "a fresh factory must be wired normally");
     }
 
+    // ───── pre-flights 6 and 7: the two seated invariants (issue #32) ─────
+
+    /// @dev PRE-FLIGHT 6, DEFAULT RUN. The ceiling is SEATED by the deploy, not
+    ///      left to a follow-up transaction — a `maxStrategyDuration` an operator
+    ///      is merely told to set afterwards is one that ships at 0, and 0 means
+    ///      NO ceiling: a vault owner could then seat their own
+    ///      `maxStrategyDuration` up to `ABSOLUTE_MAX_STRATEGY_DURATION` (3,650
+    ///      days) and bind the approving guardians for a decade per approval.
+    ///
+    ///      `bookMaxStrategyDuration` holds exactly what an UNSET
+    ///      `MAX_STRATEGY_DURATION` yields in `run()` (`vm.envOr` falls back to
+    ///      this constant), so this is the default run. The env read itself stays
+    ///      untested here for the reason the whole suite avoids `run()` — see
+    ///      `_setBook`.
+    function test_deploy_seatsTheProtocolDurationCeiling() public {
+        assertEq(protocolConfig.maxStrategyDuration(), 0, "fixture must start with no ceiling");
+        assertEq(bookMaxStrategyDuration, 30 days, "the documented default");
+
+        _run();
+
+        assertEq(protocolConfig.maxStrategyDuration(), 30 days, "the deploy must seat the ceiling");
+    }
+
+    /// @dev PRE-FLIGHT 6, ZERO OVERRIDE. 0 is a LEGAL argument to
+    ///      `setMaxStrategyDuration` — it is how the parameter is unset — so
+    ///      without this check an operator could route an explicit "no ceiling"
+    ///      through the very script that exists to prevent one, and it would read
+    ///      as a deliberate configuration rather than as the omission it
+    ///      reproduces. Refused BEFORE the broadcast, so it costs nothing.
+    function test_preflight_bites_whenTheDurationCeilingIsZero() public {
+        bookMaxStrategyDuration = 0;
+
+        _runExpecting("PRE-FLIGHT: MAX_STRATEGY_DURATION is 0");
+
+        assertEq(swood.exposureLedger(), address(0), "a refused deploy must not have wired anything");
+        assertEq(protocolConfig.maxStrategyDuration(), 0, "a refused deploy must not have seated anything");
+    }
+
+    /// @dev PRE-FLIGHT 7 BITES. `StakedWood` no longer HAS `delegationEnabled()`
+    ///      — the `StakedWoodDelegation` base was removed pre-mainnet — so the
+    ///      state under test is not reachable through the current contract at
+    ///      all. It is still the state this script must refuse: `DeployPlanB`
+    ///      runs against an EXISTING sWOOD proxy, and a chain still serving a
+    ///      pre-removal implementation answers this selector for real.
+    ///
+    ///      Mocked rather than stubbed on purpose. A stub sWOOD would have to
+    ///      re-implement everything the script reads and writes, and the
+    ///      resulting test would prove the assertion fires on a contract that is
+    ///      not `StakedWood`. Mocking one selector onto the REAL fixture makes
+    ///      the claim the sharp one: the same deployment that passes every other
+    ///      test in this file is refused the moment that selector answers true.
+    function test_preflight_bites_whenDelegationIsOn() public {
+        vm.mockCall(address(swood), abi.encodeWithSignature("delegationEnabled()"), abi.encode(true));
+
+        _runExpecting("PRE-FLIGHT: sWOOD reports delegationEnabled == true");
+    }
+
+    /// @dev PRE-FLIGHT 7 DOES NOT OVER-REFUSE. A sWOOD answering `false` runs
+    ///      normally. The OTHER passing shape — no such selector at all, which is
+    ///      what every current `StakedWood` presents and what every other passing
+    ///      test in this suite therefore exercises — is asserted here too, since
+    ///      the probe treats an absent selector as "off": code that does not
+    ///      exist cannot be enabled, which is strictly stronger than a flag
+    ///      reading false.
+    function test_deploy_allowedWhenDelegationIsOff() public {
+        (bool answered,) = address(swood).staticcall(abi.encodeWithSignature("delegationEnabled()"));
+        assertFalse(answered, "current StakedWood must not carry the selector at all");
+
+        vm.mockCall(address(swood), abi.encodeWithSignature("delegationEnabled()"), abi.encode(false));
+
+        _run();
+
+        assertTrue(swood.exposureLedger() != address(0), "delegation off must not block the deploy");
+        assertEq(protocolConfig.maxStrategyDuration(), 30 days, "and the run must still seat the ceiling");
+    }
+
     // ─────────────────────────────── helpers ───────────────────────────────
 
     /// @dev THE ADDRESS BOOK IS PASSED, NOT SET IN THE ENVIRONMENT. `run()`'s
@@ -456,7 +544,9 @@ contract DeployPlanBPreflightTest is Test {
             usdgFeed: address(usdgFeed),
             feedMaxDelay: FEED_MAX_DELAY,
             woodPriceX8: WOOD_PRICE_X8,
-            coveredTvlCapUsd: bookCap
+            coveredTvlCapUsd: bookCap,
+            protocolConfig: address(protocolConfig),
+            maxStrategyDuration: bookMaxStrategyDuration
         });
     }
 

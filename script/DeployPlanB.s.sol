@@ -23,6 +23,20 @@ interface ISwoodCooldown {
     function owner() external view returns (address);
 }
 
+/// @dev The admin surface of `ProtocolConfig` this script needs. Declared here
+///      rather than taken from `IProtocolConfig` because that interface is the
+///      READ side — what `GovernorParameters` consumes — and deliberately
+///      carries no setters. Same local-interface idiom as `ISwoodCooldown`.
+interface IProtocolConfigAdmin {
+    function maxStrategyDuration() external view returns (uint256);
+    /// @dev `onlyOwner`. CALLED inside the broadcast (pre-flight 6): a ceiling
+    ///      an operator is merely TOLD to set afterwards is a ceiling that ships
+    ///      unset, which is exactly the state this pre-flight exists to end.
+    function setMaxStrategyDuration(uint256 newValue) external;
+    /// @dev Read PRE-broadcast, same reason as `ISwoodCooldown.owner`.
+    function owner() external view returns (address);
+}
+
 /**
  * @title  DeployPlanB
  * @notice Plan B deployment against an EXISTING Plan A deployment. Address
@@ -58,6 +72,14 @@ interface ISwoodCooldown {
  *      forbidden on this stack — `SyndicateGovernor`'s layout was re-baselined
  *      non-append-only, so an impl swap on a populated beacon corrupts every
  *      proxy. See the block itself; it also shapes the manual follow-ups.
+ * @dev PRE-FLIGHT 6 (issue #32, ADR 2026-07-26): `ProtocolConfig.maxStrategyDuration`
+ *      is SEATED by this script, not merely checked. It ships 0 = no ceiling, and
+ *      a vault owner may then bind guardians for up to `ABSOLUTE_MAX_STRATEGY_DURATION`
+ *      (3,650 days) per approval. The ADR defers the VALUE to the multisig but not
+ *      the invariant; seating it here is what makes the deferral safe.
+ * @dev PRE-FLIGHT 7 (issue #32): `delegationEnabled == false`. Delegation is
+ *      deferred to v2, and the delegator-walkout hole stays dormant only while it
+ *      is off. See the block itself.
  * @dev PRE-FLIGHT 3 (review B3): the three ledger pointers — registry, factory
  *      and sWOOD — must all name THE LEDGER THIS RUN DEPLOYED. sWOOD's is wired
  *      inside the broadcast rather than demanded of the operator beforehand,
@@ -68,7 +90,8 @@ interface ISwoodCooldown {
  *      setters are onlyOwner; `Deploy.s.sol` hands all three to the same owner
  *      multisig). On mainnet that means running this from the owner multisig, or
  *      running it with the deployer as owner and handing off afterwards.
- *      Pre-flight 2b checks the sWOOD half of that up front.
+ *      Pre-flight 2b checks the sWOOD half of that up front. Pre-flight 6b does
+ *      the same for the ProtocolConfig, which this script also writes to.
  *
  *   Environment:
  *     STAKED_WOOD               — sWOOD (cooldown pre-flight + bond reads).
@@ -80,6 +103,12 @@ interface ISwoodCooldown {
  *     ASSET_FEED_MAX_DELAY      — feed staleness bound, seconds (see setAssetFeed below).
  *     WOOD_PRICE_HAIRCUT_X8     — conservative WOOD/USD, 8-dec (<= 30-day low).
  *     COVERED_TVL_CAP_USD18     — per-vault covered-TVL ceiling, USD-18. Non-zero.
+ *     PROTOCOL_CONFIG           — ProtocolConfig to seat the duration ceiling on
+ *                                 (`Deploy.s.sol` already writes this key into
+ *                                 chains/<chainid>.json).
+ *     MAX_STRATEGY_DURATION     — OPTIONAL protocol-wide strategy-duration ceiling,
+ *                                 seconds. Defaults to DEFAULT_MAX_STRATEGY_DURATION
+ *                                 (30d) when unset. 0 is REFUSED — see pre-flight 6.
  *
  *   Usage (simulate; never --broadcast blind):
  *     forge script script/DeployPlanB.s.sol:DeployPlanB --rpc-url <rpc> -vvvv
@@ -93,6 +122,42 @@ contract DeployPlanB is Script {
     ///         ledger exists to read it from. Asserted against the deployed
     ///         ledger below so this constant can never silently drift.
     uint256 internal constant EXPECTED_CHALLENGE_WINDOW = 14 days;
+
+    /// @notice Protocol-wide strategy-duration ceiling seated when
+    ///         `MAX_STRATEGY_DURATION` is not set. Public so the pre-flight
+    ///         tests can assert against the SAME value an unset environment
+    ///         produces, without touching the process environment.
+    ///
+    /// @dev    WHY 30 DAYS. The ADR (docs/superpowers/specs/2026-07-26-capped-duration-coverage.md)
+    ///         defers the value to the multisig, so this is the script's default,
+    ///         not a protocol constant — but it is not a free choice either. Three
+    ///         things already assume it:
+    ///
+    ///           - `ExposureLedger.MAX_COVERAGE_HORIZON` is 60 days and its own
+    ///             comment sizes it as "a 30d duration cap plus a 7d execution
+    ///             window with room to spare". A ceiling above 30d walks
+    ///             approvals into `CoverageHorizonExceeded` at propose time.
+    ///           - `SyndicateFactory._defaultGovernorParams()` seats every new
+    ///             vault's own `maxStrategyDuration` at 30 days. A protocol
+    ///             ceiling BELOW that would make `createSyndicate` revert on its
+    ///             own defaults (`GovernorParameters` validates the vault value
+    ///             against this one), bricking syndicate creation outright.
+    ///           - The testnet scripts pin the same figure — `script/testnet`
+    ///             checks 30 days, `script/robinhood-testnet` checks 7 days.
+    ///             A 30d ceiling admits both; anything lower refuses the first.
+    ///
+    ///         So 30 days is the unique value that binds without breaking
+    ///         anything already shipped: the largest ceiling the coverage horizon
+    ///         supports, and the smallest one the factory's own defaults survive.
+    ///         Raising it means re-examining `MAX_COVERAGE_HORIZON` first.
+    uint256 public constant DEFAULT_MAX_STRATEGY_DURATION = 30 days;
+
+    /// @notice Mirror of `ProtocolConfig.MIN_PROTOCOL_MAX_STRATEGY_DURATION`.
+    /// @dev    Mirrored rather than read so the refusal happens BEFORE the
+    ///         broadcast. The setter's own revert is an `InvalidMaxStrategyDuration`
+    ///         custom error raised mid-broadcast, after a ledger and an escrow are
+    ///         already deployed — same argument as pre-flight 2b.
+    uint256 internal constant MIN_PROTOCOL_MAX_STRATEGY_DURATION = 1 days;
 
     /// @notice The address book this deployment runs against, exactly as
     ///         `run()` reads it out of the environment.
@@ -117,6 +182,8 @@ contract DeployPlanB is Script {
         uint256 feedMaxDelay;
         uint256 woodPriceX8; // conservative, <= 30-day low
         uint256 coveredTvlCapUsd;
+        address protocolConfig;
+        uint256 maxStrategyDuration; // protocol-wide ceiling. Non-zero.
     }
 
     function run() external {
@@ -130,7 +197,13 @@ contract DeployPlanB is Script {
                 usdgFeed: vm.envAddress("CHAINLINK_USDG_USD_FEED"),
                 feedMaxDelay: vm.envUint("ASSET_FEED_MAX_DELAY"),
                 woodPriceX8: vm.envUint("WOOD_PRICE_HAIRCUT_X8"),
-                coveredTvlCapUsd: vm.envUint("COVERED_TVL_CAP_USD18")
+                coveredTvlCapUsd: vm.envUint("COVERED_TVL_CAP_USD18"),
+                protocolConfig: vm.envAddress("PROTOCOL_CONFIG"),
+                // `envOr`, so the ordinary run needs no new key in the operator's
+                // environment and still seats a ceiling. An operator who WANTS a
+                // different one sets the key; one who wants NO ceiling cannot
+                // express that here at all (pre-flight 6).
+                maxStrategyDuration: vm.envOr("MAX_STRATEGY_DURATION", DEFAULT_MAX_STRATEGY_DURATION)
             })
         );
     }
@@ -150,6 +223,8 @@ contract DeployPlanB is Script {
         uint256 feedMaxDelay = book.feedMaxDelay;
         uint256 woodPriceX8 = book.woodPriceX8;
         uint256 coveredTvlCapUsd = book.coveredTvlCapUsd;
+        address protocolConfig = book.protocolConfig;
+        uint256 maxStrategyDuration = book.maxStrategyDuration;
         // ── Pre-flight 1: REMOVED (ADR 2026-07-26) ──
         // This asserted `coolDownPeriod >= epochLength + challengeWindow` (42d
         // at defaults). It was both unsatisfiable and unnecessary:
@@ -205,6 +280,56 @@ contract DeployPlanB is Script {
             ISwoodCooldown(swood).owner() == deployer,
             "PRE-FLIGHT: broadcaster does not own STAKED_WOOD, so it cannot arm the unstake gate. "
             "Re-run with --sender set to the sWOOD owner (the same multisig that owns the registry " "and the factory)."
+        );
+
+        // ── Pre-flight 6: "no ceiling" must not be expressible through this
+        //    script (issue #32) ──
+        // `ProtocolConfig.maxStrategyDuration` treats 0 as UNSET, hence
+        // unbounded, and that default is correct where it lives: failing closed
+        // there would brick every vault deployed before the parameter existed.
+        // What is NOT correct is a fresh deployment shipping in it. With the
+        // ceiling unset a vault owner may seat `maxStrategyDuration` anywhere up
+        // to `ABSOLUTE_MAX_STRATEGY_DURATION` (3,650 days) and bind the
+        // APPROVING GUARDIANS — who never agreed to it and are not the party
+        // setting it — for a decade per approval. That is finding N4's enabling
+        // condition, and the ADR's deferral of the VALUE to the multisig was
+        // never a deferral of the INVARIANT.
+        //
+        // So the script seats it (inside the broadcast, below) rather than
+        // printing a follow-up: a ceiling an operator is told to set afterwards
+        // is a ceiling that ships unset, which is the state being closed.
+        //
+        // A ZERO OVERRIDE IS REFUSED RATHER THAN PASSED THROUGH. Zero is a legal
+        // argument to the setter, so without this an operator could route an
+        // explicit "no ceiling" through the very script that exists to prevent
+        // one — and it would look like a deliberate configuration rather than the
+        // omission it reproduces. Unsetting the ceiling on a live protocol
+        // remains possible; it just is not something this deployment path can do.
+        require(
+            maxStrategyDuration != 0,
+            "PRE-FLIGHT: MAX_STRATEGY_DURATION is 0, which means NO protocol ceiling -- a vault "
+            "owner could then bind guardians for up to 3650 days per approval. Unset the variable "
+            "to take the 30d default, or set a non-zero value."
+        );
+        require(
+            maxStrategyDuration >= MIN_PROTOCOL_MAX_STRATEGY_DURATION,
+            "PRE-FLIGHT: MAX_STRATEGY_DURATION is below ProtocolConfig's 1-day floor, which would "
+            "make every vault unproposable protocol-wide. Set it to at least 1 days."
+        );
+
+        // ── Pre-flight 6b: the broadcaster must be able to seat that ceiling ──
+        // `setMaxStrategyDuration` is `onlyOwner` and the broadcast below CALLS
+        // it. Same argument as pre-flight 2b: left to revert inside the
+        // broadcast this costs a ledger and an escrow deploy and reports itself
+        // as an opaque `OwnableUnauthorizedAccount`. Note `Deploy.s.sol` hands
+        // ProtocolConfig over with `Ownable2Step`, so a handoff whose
+        // `acceptOwnership()` was never called lands here — and that is exactly
+        // the state worth naming, since the address book still looks right.
+        require(
+            IProtocolConfigAdmin(protocolConfig).owner() == deployer,
+            "PRE-FLIGHT: broadcaster does not own PROTOCOL_CONFIG, so it cannot seat the strategy-"
+            "duration ceiling. Re-run with --sender set to the ProtocolConfig owner (if ownership "
+            "was just transferred, the new owner must call acceptOwnership() first)."
         );
 
         // ── Pre-flight 5: the governor beacon must not need an impl swap it
@@ -331,6 +456,12 @@ contract DeployPlanB is Script {
         // transaction an operator is trusted to remember.
         ISwoodCooldown(swood).setExposureLedger(address(ledger));
 
+        // THE DURATION CEILING (pre-flight 6). Seated in the same broadcast as
+        // the wiring for the same reason sWOOD's pointer is: this is the last
+        // moment where the omission is still cheap, and every deployment made
+        // without it has already shipped the unbounded state.
+        IProtocolConfigAdmin(protocolConfig).setMaxStrategyDuration(maxStrategyDuration);
+
         vm.stopBroadcast();
 
         // ── Pre-flight 3 (POST-wiring): the unstake gate must be live, and
@@ -400,9 +531,60 @@ contract DeployPlanB is Script {
             "required at EVERY tier. Call setQuorumTierThreshold(0), then re-run."
         );
 
+        // ── Pre-flight 6 (POST-broadcast): the ceiling actually landed ──
+        // The same shape as pre-flight 3's sWOOD leg, and for the same reason: a
+        // ProtocolConfig that swallows the write — a proxy on an impl without the
+        // setter, an address book naming a contract that is not this protocol's
+        // config — leaves a deployment that looks entirely healthy while the
+        // ceiling is still unset. Read back rather than trusted.
+        require(
+            IProtocolConfigAdmin(protocolConfig).maxStrategyDuration() != 0,
+            "PRE-FLIGHT: ProtocolConfig.maxStrategyDuration is still 0 after this run seated it -- "
+            "the ceiling did not land, so vault owners can bind guardians for up to 3650 days per "
+            "approval. Check PROTOCOL_CONFIG names this protocol's config, then re-run."
+        );
+
+        // ── Pre-flight 7 (POST-broadcast): delegation must be OFF ──
+        // Delegation is deferred to v2 (ADR 2026-07-26), and the deferral is
+        // load-bearing, not bookkeeping. While it is on, `slashableBondUsd`
+        // credits delegated stake toward a coverage window of ~35 days, but
+        // `requestUnstakeDelegation` checks only the DELEGATOR's own state and
+        // the unbonding pool stays slashable for just `coolDownPeriod` (7d). A
+        // delegator therefore backs coverage they can exit from under while a
+        // conviction is still heading for their delegate — credit, liability and
+        // hold period are misaligned, and the ledger's `recovery >= allocation`
+        // argument is built on delegation being off.
+        //
+        // The two candidate fixes were both rejected on their merits (stop
+        // crediting delegated stake, or gate the delegator's exit on the
+        // DELEGATE's exposure); deferring delegation is what removed the need to
+        // choose. This asserts the deferral instead of assuming it, which is what
+        // the ADR itself asks for.
+        //
+        // A CAPABILITY PROBE, NOT A TYPED CALL. `StakedWood` no longer HAS this
+        // selector — the `StakedWoodDelegation` base was removed pre-mainnet — so
+        // a typed call would revert on every healthy chain. But this script runs
+        // against an EXISTING sWOOD proxy, and a chain still serving a
+        // pre-removal implementation is precisely the case worth catching. A
+        // missing selector therefore PASSES: delegation absent from the bytecode
+        // is strictly stronger than a flag reading false. Anything that answers
+        // with a non-zero word is refused, including a fallback returning
+        // garbage — over-refusal is the safe direction here, and it costs a
+        // re-run rather than a redeployment.
+        require(
+            !_delegationIsOn(swood),
+            "PRE-FLIGHT: sWOOD reports delegationEnabled == true, but delegation is deferred to v2 "
+            "and this deployment's coverage math assumes it is off. THE DELEGATOR-WALKOUT HOLE IS "
+            "OPEN: delegated stake is credited to a ~35-day coverage window while "
+            "requestUnstakeDelegation checks only the delegator and the unbonding pool stays "
+            "slashable for coolDownPeriod alone, so a delegator can exit from under a conviction "
+            "still heading for their delegate. Call setDelegationEnabled(false), then re-run."
+        );
+
         console.log("ExposureLedger:     %s", address(ledger));
         console.log("ProposerBondEscrow: %s", address(escrow));
         console.log("asset feed maxDelay (s): %s", feedMaxDelay);
+        console.log("protocol maxStrategyDuration (s): %s", maxStrategyDuration);
 
         // The manual follow-ups are NOT the same list in both states, and the
         // difference is the whole of review M5. The old unconditional text told
@@ -435,6 +617,27 @@ contract DeployPlanB is Script {
             console.log("  syndicates need a FRESH factory + beacon and a migration, not an upgrade.");
         }
         console.log("MANUAL NEXT: hand ledger ownership to the protocol owner (Ownable2Step: transfer + accept).");
+    }
+
+    /// @notice True when `swood` answers `delegationEnabled()` with a non-zero
+    ///         word — i.e. delegation is live on the deployment this script is
+    ///         about to wire itself into.
+    /// @dev    A staticcall rather than a typed call because the CURRENT
+    ///         `StakedWood` has no such selector: the `StakedWoodDelegation`
+    ///         base was removed pre-mainnet, and a typed call would revert on
+    ///         every healthy chain. A missing selector answers `false` — code
+    ///         that does not exist cannot be enabled — while a pre-removal impl
+    ///         behind the same proxy still answers honestly.
+    ///
+    ///         Decoded as a `uint256`, not a `bool`, on purpose: `abi.decode`
+    ///         into a `bool` REVERTS on any word that is not 0 or 1, which would
+    ///         turn a malformed answer into an undecodable script failure
+    ///         instead of the refusal it should be. Any non-zero word counts as
+    ///         "on" and is refused.
+    function _delegationIsOn(address swood) internal view returns (bool) {
+        (bool ok, bytes memory ret) = swood.staticcall(abi.encodeWithSignature("delegationEnabled()"));
+        if (!ok || ret.length != 32) return false;
+        return abi.decode(ret, (uint256)) != 0;
     }
 
     /// @notice True when `beacon`'s CURRENT implementation is a governor that
