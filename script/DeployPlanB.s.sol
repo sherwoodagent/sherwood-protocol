@@ -128,7 +128,7 @@ contract DeployPlanB is Script {
     ///         tests can assert against the SAME value an unset environment
     ///         produces, without touching the process environment.
     ///
-    /// @dev    WHY 30 DAYS. The ADR (docs/superpowers/specs/2026-07-26-capped-duration-coverage.md)
+    /// @dev    WHY 30 DAYS. The ADR (openspec/specs/guardian-coverage/spec.md)
     ///         defers the value to the multisig, so this is the script's default,
     ///         not a protocol constant — but it is not a free choice either. Three
     ///         things already assume it:

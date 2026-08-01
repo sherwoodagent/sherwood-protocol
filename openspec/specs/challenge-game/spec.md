@@ -263,8 +263,12 @@ The game SHALL be plain `Ownable2Step` (not upgradeable). It requires three exte
 - **WHEN** `backstop` equals the case's vault address at sweep time
 - **THEN** `sweepResidue` reverts `BackstopIsVault`
 
-### Requirement: Proposer bond lock and release
-`ProposerBondEscrow` SHALL be ownerless with no discretionary exit. `lockBond(proposalId, proposer, amount)` SHALL be callable only by a registry-authorized governor (`NotAuthorizedGovernor`), with a non-zero proposer, `amount <= type(uint96).max` (`AmountTooLarge`), and at most one bond per `(governor, proposalId)` key (`BondAlreadyLocked`); the WOOD is pulled from the named proposer. `releaseBond(proposalId)` SHALL key the bond to `msg.sender` (so only the governor that locked it can address it) and deliberately SKIP the live registry check — a later-deauthorized governor can still release open bonds to the recorded proposer rather than stranding them; the payout always goes to the recorded proposer, never a caller-chosen payee. The governor gates WHEN release is legal (terminal proposal state); the escrow does not re-derive lifecycle. `bondOf(governor, proposalId)` SHALL report the recorded proposer and amount. In the current code the bond's ONLY exit is release to the proposer — no forfeiture path exists on this escrow.
+### Requirement: Proposer bond lock, release, and forfeiture
+`ProposerBondEscrow` SHALL be ownerless with no discretionary exit — exactly two exits exist, release and forfeiture, and both are keyed rather than caller-directed. `lockBond(proposalId, proposer, amount)` SHALL be callable only by a registry-authorized governor (`NotAuthorizedGovernor`), with a non-zero proposer, `amount <= type(uint96).max` (`AmountTooLarge`), and at most one bond per `(governor, proposalId)` key (`BondAlreadyLocked`); the WOOD is pulled from the named proposer. `releaseBond(proposalId)` SHALL key the bond to `msg.sender` (so only the governor that locked it can address it) and deliberately SKIP the live registry check — a later-deauthorized governor can still release open bonds to the recorded proposer rather than stranding them; the payout always goes to the recorded proposer, never a caller-chosen payee. `bondOf(governor, proposalId)` SHALL report the recorded proposer and amount.
+
+`forfeitBond(governor, proposalId)` SHALL be callable only by the live `coverageFreezer` of the wired exposure ledger — the challenge game and nothing else (`NotAuthorizedConvictor`) — fail-closed when the freezer is unset. It SHALL delete the bond record before transferring (so a second forfeit on the same key hits `NoBond` rather than double-burning) and SHALL burn the full amount to `BURN_ADDRESS` — no partial forfeit, no bounty carved off, and no reachable payee (every alternative destination is a round trip back to the party that forfeited or to whoever governs). `ChallengeGame._settle` SHALL call `forfeitBond` best-effort (wrapped in try/catch, emitting `ProposerBondForfeited` on success or `ProposerBondForfeitureFailed` on revert) exactly once per proposal, inside the `_convicted` branch, so a proposal with one liability and one bond cannot have it taken twice by concurrent challenges.
+
+The governor gates WHEN release is legal, not the escrow: `SyndicateGovernor.reclaimProposerBond` requires the proposal in a terminal state (`Rejected`/`Expired`/`Cancelled`/`Settled`), and for an EXECUTED proposal additionally requires `block.timestamp >= executedAt + challengeWindow` AND coverage not currently frozen for that proposal (`ChallengeWindowOpen` otherwise) — fail-closed if the exposure ledger is unset (`ExposureLedgerUnset`). A bond therefore cannot be reclaimed while it could still be forfeited: the challenge window (during which a challenge may be filed) and any live freeze (an open, unresolved challenge) both block reclaim.
 
 #### Scenario: Double lock refused
 - **WHEN** a governor locks a bond for a proposal that already has one
@@ -273,3 +277,23 @@ The game SHALL be plain `Ownable2Step` (not upgradeable). It requires three exte
 #### Scenario: Deauthorized governor can still release
 - **WHEN** a governor that locked a bond is later removed from the registry and calls `releaseBond`
 - **THEN** the bond is deleted and paid to the recorded proposer; a random caller for the same proposalId hits `NoBond` (its key differs)
+
+#### Scenario: Convicted proposal forfeits its bond
+- **WHEN** `ChallengeGame._settle` reaches a `_convicted` verdict for a proposal with a non-zero locked bond
+- **THEN** the escrow burns the bond to `BURN_ADDRESS`, deletes the record, and `ProposerBondForfeited` is emitted; the proposer can never reclaim it
+
+#### Scenario: Forfeiture failure does not block settlement
+- **WHEN** `forfeitBond` reverts during `_settle` (e.g. the bond was already reclaimed, or the escrow is re-pointed)
+- **THEN** settlement continues — the slash, challenger payout, and coverage unfreeze all still complete — and `ProposerBondForfeitureFailed` is emitted instead
+
+#### Scenario: Reclaim refused while the challenge window is open
+- **WHEN** an executed proposal's proposer calls `reclaimProposerBond` before `executedAt + challengeWindow` has elapsed
+- **THEN** the call reverts `ChallengeWindowOpen`
+
+#### Scenario: Reclaim refused while coverage is still frozen
+- **WHEN** the challenge window has elapsed but the proposal's coverage is still frozen (an unresolved dispute)
+- **THEN** `reclaimProposerBond` reverts `ChallengeWindowOpen`
+
+#### Scenario: Unauthorized forfeiture attempt refused
+- **WHEN** an address other than the wired ledger's live `coverageFreezer` calls `forfeitBond`
+- **THEN** the call reverts `NotAuthorizedConvictor` and the bond is untouched

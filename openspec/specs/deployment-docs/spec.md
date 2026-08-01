@@ -129,6 +129,28 @@ To make guardian blocking real (not the cold-start bypass), total staked guardia
 - **WHEN** the broadcast completes but sWOOD's `exposureLedger` pointer is still zero
 - **THEN** the script reverts, directing the operator to call `setExposureLedger(ledger)` by governance and re-run
 
+### Requirement: DeployPlanB seats the strategy-duration ceiling
+`DeployPlanB` SHALL seat `ProtocolConfig.maxStrategyDuration` inside the broadcast: to the documented default when `MAX_STRATEGY_DURATION` is unset in the environment, or to the operator-supplied value when set. A zero override SHALL be rejected before broadcast — an explicit "no ceiling" MUST NOT be expressible through this script. The post-broadcast assert SHALL confirm `maxStrategyDuration` is non-zero.
+
+#### Scenario: Default run
+- **WHEN** DeployPlanB runs without `MAX_STRATEGY_DURATION` set
+- **THEN** `ProtocolConfig.maxStrategyDuration` is seated to the documented default inside the broadcast, and the post-broadcast assert confirms it is non-zero
+
+#### Scenario: Operator override
+- **WHEN** `MAX_STRATEGY_DURATION` is set in the environment
+- **THEN** that value is seated instead; zero is REJECTED before broadcast
+
+### Requirement: DeployPlanB asserts delegation is off
+`DeployPlanB`'s post-broadcast pre-flights SHALL fail the run if `delegationEnabled` reads true on the target chain, naming the delegator-walkout hole: delegated stake is credited to a ~35-day coverage window while `requestUnstakeDelegation` checks only the delegator, and the unbonding pool is slashable for only `coolDownPeriod`.
+
+#### Scenario: Delegation accidentally on
+- **GIVEN** `delegationEnabled` reads true on the target chain
+- **WHEN** the post-broadcast pre-flights run
+- **THEN** the run FAILS with a message naming the delegator-walkout hole
+
+#### Scenario: Preflight tests cover both invariants
+- **THEN** `test/deploy/DeployPlanBPreflight.t.sol` covers: default duration seating lands; zero override rejected; delegation-on fails the named assert; delegation-off passes
+
 ### Requirement: Plan D deployment pre-flights and wiring order
 `DeployPlanD` (ChallengeGame against an existing Plan B + Plan C deployment) SHALL run pre-flights before deploying anything, then wire the game's four roles in this order: `ledger.setCoverageFreezer(game)` → `tierRegistry.setAuthorizedDemoter(game)` → `swood.setAuthorizedSlasher(game)` → `game.setStakedWood(swood)` (the reciprocal pointer, owner-set rather than a constructor arg because the role is granted on sWOOD's side; the slasher grant and the reciprocal pointer can be wired in either order). Checks:
 - PRE-FLIGHT 1: all three roles (`coverageFreezer`, `authorizedDemoter`, `authorizedSlasher`) MUST currently be UNSET — the setters overwrite silently, so re-running would quietly steal a role from a live holder. Refuse rather than clobber; rotations require clearing by governance first.
@@ -175,3 +197,14 @@ On Robinhood Chain (no ENS/Durin registrar, no ERC-8004 identity registry) the f
 #### Scenario: Zero-adapter router fails closed
 - **WHEN** a price is requested before any adapter is registered
 - **THEN** the router falls through to Lane B rather than serving an adapter price
+
+### Requirement: Accepted oracle risks are stated in the deploy runbook
+Two oracle exposures are accepted for v1, not open defects, and SHALL be documented in the operator's line of sight rather than only in source natspec: (1) Chainlink aggregators clamp at `minAnswer`/`maxAnswer` — a clamped price is anti-conservative, understating `coverageUsd` (asset side) and over-valuing guardian bonds via `woodPriceX8` (WOOD side), with `woodHaircutBps` a fixed discount rather than a clamp bound; and (2) Robinhood Chain 4663 publishes no sequencer-uptime feed, so the standard staleness-plus-grace-period gate (`src/libraries/ChainlinkReader.sol`'s `SequencerDown`/`GracePeriodNotOver`) cannot be built — `ExposureLedger` reads aggregators directly, and `ASSET_FEED_MAX_DELAY` SHALL be sized tightly enough that a plausible outage pushes reads past staleness while still covering the full vote + review + execute lifecycle.
+
+#### Scenario: Reviewer reads the runbook
+- **WHEN** a reviewer or deploy operator reads the runbook end to end
+- **THEN** they encounter the aggregator clamping risk with its anti-conservative direction and the affected read paths (`coverageUsd`, `woodPriceX8`), and the absence of a sequencer-uptime feed on Robinhood 4663 with why the usual staleness gate cannot exist, both stated as accepted-for-v1
+
+#### Scenario: Operator wires a Chainlink WOOD feed
+- **WHEN** the operator wires `setWoodFeed(feed, maxDelay)`
+- **THEN** the runbook states that `woodUsdPriceX8` remains load-bearing as the fallback on all four degraded shapes (feed unset, non-positive answer, stale, reverting), so the operator SHALL keep maintaining it as a conservative floor and poll `woodPriceDetail()` — alerting on `usingFallback == true` persisting beyond a short blip, since there is no event for the degraded path

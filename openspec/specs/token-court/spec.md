@@ -25,7 +25,21 @@ The court SHALL hold no WOOD at any point in any case lifecycle: no bonds, no co
 - the clock check passes: `block.timestamp + voteWindow + FINALIZE_BUFFER <= filedAt + disputeTimeoutAtFiling` (else revert `InsufficientClock`) — a vote that could not finish before the challenge's own timeout never opens;
 - the challenge's pinned `executedAt` is non-zero (else revert `InvalidParameter`, fail-closed against an underflowed snapshot).
 
-On success the court SHALL create a 1-indexed case in phase `Voting`, pin into it the referring `game` address, `snapshotTs`, `referredAt = block.timestamp`, and `voteWindowAtReferral` (the live `voteWindow` at referral), record the accused set, and emit `CaseReferred` carrying `snapshotTs`. The court SHALL claim `caseOfChallenge` before any external read of challenge state.
+On success the court SHALL create a 1-indexed case in phase `Voting`, pin into it the referring `game` address, `snapshotTs`, `referredAt = block.timestamp`, `voteWindowAtReferral` (the live `voteWindow` at referral), and `Case.ledger` (the exposure ledger read from `IChallengeGameLedger(game).exposureLedger()` — resolved exactly once, at `refer`), record the accused set using that same resolved `Case.ledger` (single read, no second live resolution within the call), and emit `CaseReferred` carrying `snapshotTs`. The court SHALL claim `caseOfChallenge` before any external read of challenge state.
+
+Because `Case.ledger` is a snapshot taken at `refer` and not at `file`, an owner re-point of the game's exposure ledger strictly between `file` and `refer` still produces an empty accused set — this residual gap is owner-only, recoverable by re-pointing back before `refer`, and is documented in natspec on `refer`/`_recordAccused` as an accepted follow-up (closing it fully would require an at-`file` pin inside `ChallengeGame` or a live-challenge guard on `setExposureLedger`, out of scope here).
+
+#### Scenario: Ledger pinned at refer
+
+- **GIVEN** a disputed challenge on the wired `ChallengeGame`
+- **WHEN** `refer(challengeId)` executes
+- **THEN** the ledger address read from `IChallengeGameLedger(game).exposureLedger()` is stored in `Case.ledger`, and `_recordAccused` consumes that same resolved address
+
+#### Scenario: Owner re-point after refer does not disturb the case
+
+- **GIVEN** a referred case with a non-empty accused set and `accusedWeight > 0`
+- **WHEN** the game owner calls `ChallengeGame.setExposureLedger(newLedger)` where `newLedger.approversOf(...)` returns an empty set
+- **THEN** `Case.ledger`, the `isAccused` set, and `Case.accusedWeight` are unchanged, and `finalize`'s participation floor uses the pinned `accusedWeight`
 
 #### Scenario: Referral of a disputed challenge
 
@@ -63,7 +77,7 @@ The electorate for a case SHALL be fixed at `snapshotTs = executedAt - 1` — th
 
 ### Requirement: Accused set recording
 
-At referral the court SHALL record the accused set as the exposure ledger's covering approvers for the challenged `(governor, proposalId)`, read from the ledger THE GAME names (`exposureLedger()` on the pinned game), never from the challenger-supplied governor. Approvers whose committed share is zero (released before the filing) SHALL be excluded — they backed nothing on this proposal, so they are neither slashed for it nor barred from voting on it. Duplicate entries SHALL NOT be double-counted. The case's `accusedWeight` SHALL be the sum of raw `getPastStake` (not aged `getPastVotes`) over the recorded set at `snapshotTs`, and `AccusedSetRecorded(caseId, count, accusedWeight)` SHALL be emitted. The bar covers the specific approving addresses the ledger named — not any broader notion of the party behind them.
+At referral the court SHALL record the accused set as `Case.ledger`'s covering approvers for the challenged `(governor, proposalId)`, using the single resolution of `Case.ledger` made at `refer` (never a second live read, and never the challenger-supplied governor). Approvers whose committed share is zero (released before the filing) SHALL be excluded — they backed nothing on this proposal, so they are neither slashed for it nor barred from voting on it. Duplicate entries SHALL NOT be double-counted. The case's `accusedWeight` SHALL be the sum of raw `getPastStake` (not aged `getPastVotes`) over the recorded set at `snapshotTs`, computed over the approvers of `Case.ledger` (never a different ledger than the one pinned), and `AccusedSetRecorded(caseId, count, accusedWeight)` SHALL be emitted. The bar covers the specific approving addresses the ledger named — not any broader notion of the party behind them.
 
 #### Scenario: Released approver excluded
 
@@ -74,6 +88,11 @@ At referral the court SHALL record the accused set as the exposure ledger's cove
 
 - **WHEN** the accused set is recorded
 - **THEN** each member's contribution is `getPastStake(approver, snapshotTs)` — the same raw basis `getPastTotalVotes` sums — so the participation floor's subtraction never compares two different measures of the same WOOD, and a pending unstake request cannot shrink an accused member's contribution to raise the floor
+
+#### Scenario: Ledger and accused weight are pinned together
+
+- **GIVEN** any referred case
+- **THEN** `Case.accusedWeight` equals the `getPastStake` sum computed over the approvers of `Case.ledger` at `Case.snapshotTs` — the derived weight can never come from a different ledger than the one pinned on the case
 
 ### Requirement: Voting
 
