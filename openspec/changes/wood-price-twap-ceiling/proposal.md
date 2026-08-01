@@ -1,5 +1,17 @@
 # Bound the WOOD governance price with a DEX TWAP ceiling
 
+> ## ⚠️ THE TWO-NUMBER MODEL BELOW IS SUPERSEDED
+>
+> See `design-revision-2026-08-01.md`. The split into a high emergency ceiling
+> plus a snug maintained fallback is withdrawn: it pointed the `min` at a
+> number specified never to bind, which left the TWAP effectively unbounded
+> upward. The revision collapses back to **one** maintained reference that
+> caps the TWAP, serves as the staleness fallback, and doubles as the
+> emergency brake when lowered.
+>
+> The **Why** section below stands unchanged and is still the reason to do
+> this work.
+
 ## Why
 
 **There is no Chainlink WOOD/USD feed on Robinhood Chain 4663, and none is

@@ -1,5 +1,22 @@
 # Design
 
+> ## ⚠️ DECISIONS 1–3 ARE SUPERSEDED — read `design-revision-2026-08-01.md` first
+>
+> A 12-agent audit of the shipped implementation found eight defects, four of
+> them caused by decision 2's two-number split. In short: the `min` was pointed
+> at `woodUsdPriceX8`, which decision 2 requires to be set **HIGH and
+> non-binding** — and a `min` against a number chosen never to bind is not a
+> bound. The manipulation table below ("push up → gains nothing") was written
+> against the earlier single-number model and is **false** for the two-number
+> model that shipped.
+>
+> What survives unchanged: the measured on-chain state, the venue analysis
+> (V3 empty shells, V4 hook constraint), the CREATE2 proof that the pair is
+> canonical, and the direction table showing why the two prices want opposite
+> biases. Read the manipulation arithmetic as a *cost model*, not as a safety
+> argument — the audit showed the cost collapses to roughly $545 when the pair
+> is idle across the window (finding 8).
+
 ## Measured state (2026-08-01, chain 4663 mainnet)
 
 Every number below was read on-chain, not assumed. Re-verify before
