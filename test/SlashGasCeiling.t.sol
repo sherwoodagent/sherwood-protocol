@@ -16,7 +16,6 @@ import {ChallengeGame} from "../src/ChallengeGame.sol";
 import {IChallengeGame} from "../src/interfaces/IChallengeGame.sol";
 import {TokenCourt} from "../src/TokenCourt.sol";
 import {ITokenCourt} from "../src/interfaces/ITokenCourt.sol";
-import {CompensationEscrow} from "../src/CompensationEscrow.sol";
 import {ProposerBondEscrow} from "../src/ProposerBondEscrow.sol";
 import {BatchExecutorLib} from "../src/BatchExecutorLib.sol";
 import {ProtocolConfig} from "../src/ProtocolConfig.sol";
@@ -122,7 +121,6 @@ contract SlashGasCeilingTest is Test {
     ExposureLedger public ledger;
     TierRegistry public tierRegistry;
     ProposerBondEscrow public bondEscrow;
-    CompensationEscrow public escrow;
     ChallengeGame public game;
     TokenCourt public court;
 
@@ -258,7 +256,6 @@ contract SlashGasCeilingTest is Test {
         registry.setExposureLedger(address(ledger));
 
         bondEscrow = new ProposerBondEscrow(address(wood), address(registry), address(ledger));
-        escrow = new CompensationEscrow(owner, address(wood));
 
         game = new ChallengeGame(owner, address(wood), address(ledger), address(tierRegistry));
         court = new TokenCourt(owner);
@@ -267,9 +264,6 @@ contract SlashGasCeilingTest is Test {
         tierRegistry.setAuthorizedDemoter(address(game));
         vm.startPrank(owner);
         swood.setAuthorizedSlasher(address(game));
-        swood.setCompensationEscrow(address(escrow));
-        escrow.setAuthorizedFunder(address(swood));
-        escrow.setBackstop(backstop);
         game.setStakedWood(address(swood));
         court.setChallengeGame(address(game));
         court.setStakedWood(address(swood));
@@ -595,7 +589,8 @@ contract SlashGasCeilingTest is Test {
         assertEq(uint256(game.challengeOf(cid).status), uint256(IChallengeGame.Status.Settled), "Settled, not Failed");
         assertEq(uint256(court.caseOf(caseId).verdict), uint256(IChallengeGame.Verdict.Guilty), "Guilty");
         assertLt(swood.guardianStake(approvers[7]), stakeBefore, "the cohort really was slashed");
-        assertEq(escrow.caseCount(), 1, "and the victims' case was really opened");
+        // The proceeds were destroyed, not routed: there is no case to open.
+        assertEq(swood.pendingBurn(), 0, "and the burn landed rather than parking for a flush retry");
     }
 
     // ── 3. The measurement the constants are set from ─────────────────────

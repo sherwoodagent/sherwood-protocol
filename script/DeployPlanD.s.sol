@@ -15,17 +15,9 @@ interface ITierRegistryDemoterRole {
     function setAuthorizedDemoter(address demoter) external;
 }
 
-/// @dev `ICompensationEscrow` declares `setAuthorizedFunder` but no getter, and
-///      the pre-flight below needs to READ the funder — Plan C's wiring is a
-///      precondition of this deployment, not something to re-apply here.
-interface ICompensationEscrowFunder {
-    function authorizedFunder() external view returns (address);
-}
-
-/// @dev `IStakedWood` carries `authorizedSlasher` and `compensationEscrow` but
-///      not `exposureLedger`, which pre-flight 2b below has to read. Same reason
-///      the two interfaces above exist: one view function does not justify
-///      dragging the concrete `StakedWood` into a wiring script.
+/// @dev `IStakedWood` carries `authorizedSlasher` but not `exposureLedger`,
+///      which pre-flight 2 below has to read. One view function does not
+///      justify dragging the concrete `StakedWood` into a wiring script.
 interface ISwoodExposureLedger {
     function exposureLedger() external view returns (address);
 }
@@ -53,13 +45,11 @@ interface ISwoodExposureLedger {
  *      quietly steal the role from the live holder and leave it unable to
  *      freeze, demote or slash. Refuse rather than clobber; if a rotation is
  *      genuinely intended, clear the role by governance first and say so.
- * @dev PRE-FLIGHT 2 (Plan C's wiring must already be in place): the slash path
- *      ends in `StakedWood.slashToEscrow` → `CompensationEscrow.fundCase`, so
- *      it dead-ends unless BOTH directions of Plan C's wiring hold —
- *      `escrow.authorizedFunder() == swood` and `swood.compensationEscrow() ==
- *      escrow`. Either one missing makes every settled challenge revert at the
- *      last step, after the coverage was frozen and the bond was posted.
- * @dev PRE-FLIGHT 2b (review B4): Plan B's exit gate must read the SAME ledger
+ *      NOTE — the escrow wiring pre-flight is gone. The slash path used to end
+ *      in `StakedWood.slashToEscrow` → `CompensationEscrow`, which dead-ended
+ *      unless both directions of Plan C's wiring held. The verdict slash now
+ *      burns internally, so there is no external sink to mis-wire.
+ * @dev PRE-FLIGHT 2 (review B4): Plan B's exit gate must read the SAME ledger
  *      the game is constructed against — `swood.exposureLedger() ==
  *      EXPOSURE_LEDGER`. A split (or a zero, where the gate fails open by
  *      design) lets an accused approver unstake before `resolve` and be
@@ -83,7 +73,6 @@ interface ISwoodExposureLedger {
  *     WOOD_TOKEN           — bond currency for challenger and counter bonds.
  *     EXPOSURE_LEDGER      — Plan B ledger; approver set + coverage freeze.
  *     TIER_REGISTRY        — adapter certification registry to demote against.
- *     COMPENSATION_ESCROW  — Plan C escrow; read-only here (pre-flight 2).
  *
  *   Usage (simulate; never --broadcast blind):
  *     forge script script/DeployPlanD.s.sol:DeployPlanD --rpc-url <rpc> -vvvv
@@ -104,7 +93,6 @@ contract DeployPlanD is Script {
         address wood;
         address ledger;
         address tierRegistry;
-        address escrow;
     }
 
     function run() external {
@@ -113,8 +101,7 @@ contract DeployPlanD is Script {
                 swood: vm.envAddress("STAKED_WOOD"),
                 wood: vm.envAddress("WOOD_TOKEN"),
                 ledger: vm.envAddress("EXPOSURE_LEDGER"),
-                tierRegistry: vm.envAddress("TIER_REGISTRY"),
-                escrow: vm.envAddress("COMPENSATION_ESCROW")
+                tierRegistry: vm.envAddress("TIER_REGISTRY")
             })
         );
     }
@@ -129,7 +116,6 @@ contract DeployPlanD is Script {
         address wood = book.wood;
         address ledger = book.ledger;
         address tierRegistry = book.tierRegistry;
-        address escrow = book.escrow;
 
         // ── Pre-flight 1: never silently steal a role from a live holder ──
         require(
@@ -148,19 +134,7 @@ contract DeployPlanD is Script {
             "FIRST if a rotation is intended - this script will not overwrite a live holder."
         );
 
-        // ── Pre-flight 2: Plan C's rails, both directions ──
-        require(
-            ICompensationEscrowFunder(escrow).authorizedFunder() == swood,
-            "PRE-FLIGHT: CompensationEscrow.authorizedFunder != STAKED_WOOD. Plan C wiring is "
-            "missing - every settled challenge would revert funding the case."
-        );
-        require(
-            IStakedWood(swood).compensationEscrow() == escrow,
-            "PRE-FLIGHT: StakedWood.compensationEscrow != COMPENSATION_ESCROW. Plan C wiring is "
-            "missing - slashToEscrow has nowhere to send the proceeds."
-        );
-
-        // ── Pre-flight 2b: Plan B's exit gate must read THIS ledger (review B4) ──
+        // ── Pre-flight 2: Plan B's exit gate must read THIS ledger (review B4) ──
         // The game freezes commitments on the ledger it is constructed with, by
         // writing `_frozenCommitments[guardian]` THERE. `claimUnstakeGuardian`
         // asks whichever ledger sWOOD points at. Point them at different
@@ -171,7 +145,7 @@ contract DeployPlanD is Script {
         // The failure is total and completely silent. An accused approver
         // requests an unstake, waits out `coolDownPeriod` (floor 1 day) inside
         // the 7-day `autoSlashDelay`, and claims. At `resolve`, `_slashOne`
-        // finds nothing staked and returns 0, `slashToEscrow` returns (0,0) —
+        // finds nothing staked and returns 0, `slashVerdict` returns 0 —
         // and `_settle` still marks `_convicted[key]`, so the proposal can never
         // be re-challenged either. No revert, no distinguishing event, zero
         // recovered. Nothing else in this script would notice: pre-flight 1 and

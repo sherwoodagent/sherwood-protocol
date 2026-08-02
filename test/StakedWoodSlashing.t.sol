@@ -499,4 +499,114 @@ contract StakedWoodSlashingTest is Test {
         _slash(alice, openedAt, 5000);
         assertEq(swood.guardianStake(alice), 5_000e18, "50% of RAW 10k, not of aged 2.5k");
     }
+
+    // ── Conviction bounty cap ──────────────────────────────────────────────
+
+    /// @dev Stakes `n` guardians of `amount` each and matures them, returning
+    ///      the cohort in vote order with a full-ceiling rate apiece.
+    function _cohortAt(uint256 n, uint256 amount)
+        internal
+        returns (address[] memory approvers, uint256[] memory bps, uint256 openedAt)
+    {
+        approvers = new address[](n);
+        bps = new uint256[](n);
+        for (uint256 i = 0; i < n; i++) {
+            address g = address(uint160(0x7000 + i));
+            approvers[i] = g;
+            bps[i] = 10_000;
+            wood.mint(g, amount);
+            vm.prank(g);
+            wood.approve(address(swood), type(uint256).max);
+            vm.prank(g);
+            swood.stakeAsGuardian(amount, i + 1);
+        }
+        skip(30 days);
+        openedAt = vm.getBlockTimestamp();
+        vm.warp(openedAt + 1);
+    }
+
+    /// @notice THE SYBIL-CONTEST TRADE MUST NOT PAY. The bounty is only owed
+    ///         when an APPROVER funded the counter-bond — a rule meant to price
+    ///         a staged contest by forcing the stager into the cohort its own
+    ///         conviction slashes. The punitive rate broke that pricing: the
+    ///         bounty is a share of the WHOLE cohort's bonds while the stager
+    ///         still risks only its own, so a minimum-stake attacker profited.
+    ///         Capping at the contestors' summed slash restores it.
+    function test_slashVerdict_bountyCappedAtContestorsOwnSlash() public {
+        vm.prank(owner);
+        swood.setAuthorizedSlasher(address(this));
+
+        (address[] memory approvers, uint256[] memory bps,) = _cohortAt(5, 100_000e18);
+
+        address sybil = address(uint160(0x7FFF));
+        wood.mint(sybil, 100_000e18);
+        vm.prank(sybil);
+        wood.approve(address(swood), type(uint256).max);
+        vm.prank(sybil);
+        swood.stakeAsGuardian(10_000e18, 99); // the minimum this fixture allows
+        skip(30 days);
+        uint256 anchor = vm.getBlockTimestamp();
+        vm.warp(anchor + 1);
+
+        address[] memory all = new address[](6);
+        uint256[] memory allBps = new uint256[](6);
+        bool[] memory contestors = new bool[](6);
+        for (uint256 i = 0; i < 5; i++) {
+            all[i] = approvers[i];
+            allBps[i] = bps[i];
+        }
+        all[5] = sybil;
+        allBps[5] = 10_000;
+        contestors[5] = true; // ONLY the sybil funded the counter-bond
+
+        address challenger = makeAddr("bountyChallenger");
+        uint256 before = wood.balanceOf(challenger);
+
+        // This fixture's ceiling is 9,999 bps, so every bond is taken at
+        // 99.99% — derived rather than hardcoded so the numbers stay honest if
+        // the envelope moves.
+        uint256 ceil = swood.maxSlashBps();
+        uint256 sybilSlash = 10_000e18 * ceil / 10_000;
+        uint256 gross = (5 * 100_000e18 * ceil / 10_000) + sybilSlash;
+
+        uint256 total = swood.slashVerdict(bytes32("sybil"), anchor, all, allBps, contestors, challenger, 500);
+
+        uint256 paid = wood.balanceOf(challenger) - before;
+        // Uncapped this would have paid 500 bps of the WHOLE cohort — about
+        // 25,497 WOOD for the ~9,999 the sybil risked, a ~15,500 profit.
+        assertGt(gross * 500 / 10_000, sybilSlash, "fixture really does expose the amplification");
+        assertEq(paid, sybilSlash, "bounty capped at exactly what the lone contestor forfeited");
+        assertEq(total, gross - paid, "remainder burned, net of the capped bounty");
+    }
+
+    /// @notice ...AND THE CAP MUST NOT PUNISH A GENUINE DEFENCE. When real
+    ///         approvers with real bonds fund the counter-bond, their summed
+    ///         slash sits far above the fee, so the cap never binds and the
+    ///         honest challenger is paid in full. Summing — rather than taking
+    ///         the first contestor found — is what makes this hold.
+    function test_slashVerdict_bountyUncappedWhenTheDefenceIsGenuine() public {
+        vm.prank(owner);
+        swood.setAuthorizedSlasher(address(this));
+
+        (address[] memory approvers, uint256[] memory bps, uint256 openedAt) = _cohortAt(5, 100_000e18);
+        bool[] memory contestors = new bool[](5);
+        contestors[3] = true; // two real approvers defended, and NOT the first
+        contestors[4] = true;
+
+        address challenger = makeAddr("genuineChallenger");
+        uint256 before = wood.balanceOf(challenger);
+
+        uint256 ceil = swood.maxSlashBps();
+        uint256 each = 100_000e18 * ceil / 10_000;
+        uint256 gross = 5 * each;
+        uint256 expected = gross * 500 / 10_000;
+
+        uint256 total = swood.slashVerdict(bytes32("genuine"), openedAt, approvers, bps, contestors, challenger, 500);
+
+        // Two real approvers forfeited `2 * each` between them, far above the
+        // fee, so the cap is nowhere near binding.
+        assertGt(2 * each, expected, "fixture: a genuine defence out-stakes the fee");
+        assertEq(wood.balanceOf(challenger) - before, expected, "full bounty: the cap did not bind");
+        assertEq(total, gross - expected, "remainder burned");
+    }
 }

@@ -8,7 +8,6 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Checkpoints} from "@openzeppelin/contracts/utils/structs/Checkpoints.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
-import {ICompensationEscrow} from "./interfaces/ICompensationEscrow.sol";
 
 /// @notice Minimal `SyndicateGovernor` surface consumed by sWOOD: the
 ///         open-proposal signals used by the rage-quit gate in
@@ -57,32 +56,20 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///      declares its own errors rather than inheriting the interface.
     error NotAuthorizedSlasher();
 
-    /// @notice `slashToEscrow` called before the owner wired a compensation
-    ///         escrow. The verdict path has no sink without one, and sWOOD
-    ///         deliberately does NOT accept an escrow address from the caller
-    ///         (see `compensationEscrow`).
-    /// @dev Mirrors `IStakedWood.CompensationEscrowNotSet`.
-    error CompensationEscrowNotSet();
-
-    /// @notice `slashToEscrow` rejected because the requested compensation
-    ///         snapshot is LATER than the verdict's own open timestamp.
-    /// @dev Mirrors `IStakedWood.SnapshotAfterVerdict`.
-    error SnapshotAfterVerdict();
-
-    /// @notice `slashToEscrow` rejected because the per-approver rate array is
+    /// @notice `slashVerdict` rejected because the per-approver rate array is
     ///         not the same length as `approvers`. Positional alignment is the
     ///         only thing tying a guardian to their own rate.
     /// @dev Mirrors `IStakedWood.SlashBpsLengthMismatch`.
     error SlashBpsLengthMismatch();
 
-    /// @notice `slashToEscrow` rejected because `openedAt` is in the future.
+    /// @notice `slashVerdict` rejected because `openedAt` is in the future.
     ///         The at-open anchor `_slashOne` sizes the legs against must be a
     ///         real past instant (also keeps the `uint32` checkpoint lookup
     ///         from wrapping on an absurd value).
     /// @dev Mirrors `IStakedWood.VerdictNotPast`.
     error VerdictNotPast();
 
-    /// @notice `slashToEscrow` rejected because `approvers` names the same
+    /// @notice `slashVerdict` rejected because `approvers` names the same
     ///         address twice. Without dedup, repeating one approver N times
     ///         re-applies its clamped rate to the already-reduced stake,
     ///         compounding past the `maxSlashBps` ceiling. Checked pairwise
@@ -94,9 +81,6 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
 
     /// @dev Mirrors `IStakedWood.ApproverAlreadySlashed`.
     error ApproverAlreadySlashed();
-
-    /// @dev Mirrors `IStakedWood.VaultNotFactoryDeployed`.
-    error VaultNotFactoryDeployed();
 
     /// @notice Insufficient WOOD to satisfy a stake minimum.
     error InsufficientStake();
@@ -209,34 +193,20 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     /// @dev Mirrors `IStakedWood.AuthorizedSlasherSet`.
     event AuthorizedSlasherSet(address indexed slasher);
 
-    /// @notice Emitted when the owner rewires the compensation escrow that
-    ///         `slashToEscrow` funds.
-    /// @dev Mirrors `IStakedWood.CompensationEscrowSet`.
-    event CompensationEscrowSet(address indexed escrow);
-
-    /// @notice Emitted when a verdict slash funds a compensation case.
-    /// @dev Correlates the verdict (`caseKey`, `vault`) with the escrow case it
-    ///      produced, so indexers can join the two without scraping the
-    ///      escrow's own `CaseOpened` log. `total` is the WOOD routed, NET of
-    ///      any conviction bounty; it equals the escrow's own `proceeds` for
-    ///      this case. `caseId` is the escrow's id.
-    ///      Mirrors `IStakedWood.VerdictSlashRouted`.
-    event VerdictSlashRouted(bytes32 indexed caseKey, address indexed vault, uint256 total, uint256 caseId);
-
-    /// @notice Emitted when a verdict slash could NOT fund a compensation case
-    ///         — `openCase` reverted (a vault without the ERC20Votes read
-    ///         surface, block-number clock mode) — and the proceeds were
-    ///         burned instead. The guardian is still slashed; the victims of
-    ///         THIS case go uncompensated.
-    /// @dev Mirrors `IStakedWood.VerdictSlashUncompensated`. `total` here is
-    ///      also NET of the conviction bounty, which is paid regardless of
-    ///      whether `openCase` succeeds — depositors recover 0% of `total` on
-    ///      this path either way, so paying the bounty first costs them
-    ///      nothing.
-    event VerdictSlashUncompensated(bytes32 indexed caseKey, address indexed vault, uint256 total);
+    /// @notice Emitted when a verdict slash is settled: what it took, what the
+    ///         prosecutor was paid, and what was destroyed.
+    /// @dev Reports all three legs so an indexer never has to re-derive the
+    ///      split — `gross == bounty + burned` by construction. `burned` is
+    ///      also the function's return value.
+    ///
+    ///      Replaces the `VerdictSlashRouted` / `VerdictSlashUncompensated`
+    ///      pair, which existed to tell indexers WHETHER the victims got paid.
+    ///      There is now exactly one outcome, so one event states it.
+    ///      Mirrors `IStakedWood.VerdictSlashBurned`.
+    event VerdictSlashBurned(bytes32 indexed caseKey, uint256 gross, uint256 bounty, uint256 burned);
 
     /// @notice A conviction bounty was paid out of a verdict slash before the
-    ///         remainder opened a compensation case.
+    ///         remainder was burned (spec 2026-07-29 §2).
     /// @dev Mirrors `IStakedWood.ConvictionBountyPaid`.
     event ConvictionBountyPaid(bytes32 indexed caseKey, address indexed bountyTo, uint256 amount);
 
@@ -368,10 +338,32 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///      it.
     mapping(address => uint256) internal _pendingBurn;
 
-    /// @dev Reserves upgrade headroom for this leaf contract. New storage
-    ///      fields consume slots off the FRONT of this gap, so every field
-    ///      declared after it keeps a stable slot.
-    uint256[4] private __gap;
+    /// @dev Reserves upgrade headroom for this leaf contract.
+    ///      RE-BASELINED 2026-07-26 (DPoS delegation removal, pre-mainnet):
+    ///      the `StakedWoodDelegation` base contract — every delegation slot
+    ///      that used to precede this contract's storage — was deleted, along
+    ///      with `maxDelegatedSlashBps` and `delegatedWeightCapX` here, and
+    ///      the whole layout re-baselined (goldens regenerated in the same
+    ///      PR; no mainnet 4663 deployment exists, testnets are redeployable).
+    ///      Decremented 6 → 5 in the Plan C round-3 merge: `_verdictSlashed`
+    ///      consumes one slot, so the total size stays stable.
+    ///      DECLARATION ORDER IS DELIBERATE:
+    ///      Plan C's three fields sit BETWEEN the gap and Plan B's
+    ///      `exposureLedger`, so shrinks come off the END of the gap and the
+    ///      fields behind it never shift. From the first mainnet deploy onward
+    ///      changes must be append-only, carved off the FRONT of this gap.
+    ///      Decremented 5 → 4 for `_liabilityCheckpoints`,
+    ///      declared immediately below so the shrink comes off the END of the
+    ///      gap and every field after it keeps its slot.
+    ///      INCREMENTED 4 → 5 by the burn-slash-proceeds change: the
+    ///      `compensationEscrow` slot was REMOVED, not deprecated. It sat after
+    ///      this gap, so deleting it shifts every following field up one slot
+    ///      and the gap grows to hold total size stable — the same convention
+    ///      as the shrinks above, run in reverse. Legitimate only because no
+    ///      mainnet 4663 deployment exists (testnets are redeployable), exactly
+    ///      as in the 2026-07-26 re-baseline; from the first mainnet deploy
+    ///      onward a removal like this is no longer available.
+    uint256[5] private __gap;
 
     /// @dev Per-guardian OWN-STAKE LIABILITY history: what the guardian is on
     ///      the hook for at a past instant, as distinct from what it could VOTE
@@ -396,38 +388,20 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///         verdict a governance action.
     address public authorizedSlasher;
 
-    /// @notice The `CompensationEscrow` that `slashToEscrow` funds.
-    /// @dev OWNER-SET STATE, deliberately NOT a `slashToEscrow` parameter.
-    ///      sWOOD custodies every WOOD bond in the protocol; letting the
-    ///      slasher name an arbitrary destination for this sink would hand it
-    ///      an ERC20 allowance against that whole balance. Pinning the sink to
-    ///      an owner-configured address means a compromised `authorizedSlasher`
-    ///      can misdirect the escrow portion of a slash only INTO the honest
-    ///      escrow — where it is still bound to a snapshot-gated case — never
-    ///      to an address of its own choosing. Zero disables the verdict path
-    ///      (`CompensationEscrowNotSet`).
+    /// @dev One slash per (verdict, approver) — the persistent half of the
+    ///      severity envelope. Keyed by the RAW `caseKey`
+    ///      the caller passed, so a slasher can read `verdictSlashed` with the
+    ///      same key it will pass back in.
     ///
-    ///      This guarantee covers only the escrow portion: `slashToEscrow`'s
-    ///      `bountyTo`/`bountyBps` is a separate, deliberately caller-chosen
-    ///      channel (the bounty recipient is the challenger, a fact sWOOD has
-    ///      no way to know on its own). A compromised `authorizedSlasher` can
-    ///      divert at most `MAX_CONVICTION_BOUNTY_BPS` of any ONE CALL to a
-    ///      caller-named address; the remainder can only reach this owner-set
-    ///      escrow or, on the burn fallback, `BURN_ADDRESS`. This bound is PER
-    ///      CALL, not per guardian: `_verdictSlashed` keys on a caller-chosen
-    ///      `caseKey`, so repeated verdicts under fresh case keys compound.
-    ///      See `MAX_CONVICTION_BOUNTY_BPS`.
-    address public compensationEscrow;
-
-    /// @dev One slash per (verdict, approver) — persistence needed because
-    ///      `_slashOne` applies its rate to the LIVE stake but sizes off the
-    ///      `openedAt` checkpoint, so repeats compound geometrically (N calls
-    ///      at `bps` take `1-(1-bps)^N`). A 100-approver quorum slash costs
-    ///      ~27M gas, more than one Ethereum block, so the batch must be
-    ///      split across transactions; without this map that split would
-    ///      silently void the severity ceiling governance set. Keyed by the
-    ///      RAW `caseKey` the caller passed, so a slasher can read
-    ///      `verdictSlashed` with the same key it will pass back in.
+    ///      Why persistence is needed at all: `_slashOne` applies its rate to
+    ///      the LIVE stake but sizes off the `openedAt` checkpoint, so repeats
+    ///      compound geometrically — N calls at `bps` take `1-(1-bps)^N`. The
+    ///      intra-call pairwise dedup bounds one array; it says nothing about
+    ///      the next transaction. And splitting IS the expected shape here: a
+    ///      100-approver quorum slash costs ~27M gas, more than an Ethereum
+    ///      mainnet block, so the batch has to be split to land at all.
+    ///      Without this map, the workaround for the gas limit silently voids
+    ///      the ceiling governance set.
     mapping(bytes32 caseKey => mapping(address approver => bool)) private _verdictSlashed;
 
     /// @notice Coverage ledger consulted before releasing a guardian's stake.
@@ -444,6 +418,28 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     /// @notice Slashed WOOD is sent here — permanently out of circulation.
     /// @dev Burning via a transfer to a known-dead address keeps WOOD's
     ///      `totalSupply` semantics intact (no `burn` dependency on the token).
+    ///
+    ///      WHAT "BURN" MEANS HERE, PRECISELY. WOOD exposes no `burn()` /
+    ///      `ERC20Burnable`, so this is a SUPPLY SINK, not a supply reduction:
+    ///      `totalSupply` never falls. The effect is on CIRCULATING supply, and
+    ///      only for anyone who treats this address as outside circulation.
+    ///      State any deflation claim in those terms — a claim about
+    ///      `totalSupply` would be false.
+    ///
+    ///      Nothing in this protocol reads WOOD's `totalSupply`, so the
+    ///      accumulating dead balance pollutes no internal denominator (no
+    ///      quorum, rate, or price derives from it). The exposure is purely
+    ///      external reporting: if a data provider does not exclude
+    ///      `0x...dEaD`, the burn is real on-chain and invisible everywhere a
+    ///      holder would look for it.
+    ///
+    ///      Volume is CONVICTION-DRIVEN, not continuous. A healthy protocol
+    ///      burns nothing; the supply curve steps down exactly when the
+    ///      protocol is being successfully attacked. That is the correct
+    ///      incentive and a poor growth narrative, and the two should not be
+    ///      confused. There is no continuous WOOD burn source to complement it
+    ///      — the only protocol fee is the agent performance fee, denominated
+    ///      in the VAULT's asset (see `FeeConstants`), not in WOOD.
     address internal constant BURN_ADDRESS = 0x000000000000000000000000000000000000dEaD;
 
     /// @notice Ceiling on `slashToEscrow`'s `bountyBps`.
@@ -1117,18 +1113,6 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
         emit AuthorizedSlasherSet(slasher);
     }
 
-    /// @notice Set the `CompensationEscrow` that `slashToEscrow` funds.
-    /// @dev Owner-only, mirroring `setAuthorizedSlasher`. The escrow is state
-    ///      rather than a `slashToEscrow` argument on purpose: an
-    ///      argument-named destination would let the slasher point sWOOD's
-    ///      allowance — against the protocol's entire WOOD custody — at any
-    ///      address it liked. Zero is a valid value: it disables the verdict
-    ///      path (`CompensationEscrowNotSet`).
-    function setCompensationEscrow(address escrow) external onlyOwner {
-        compensationEscrow = escrow;
-        emit CompensationEscrowSet(escrow);
-    }
-
     /// @notice Whether `approver` has already been slashed under `caseKey`.
     /// @dev Read this before resuming a verdict that had to be split across
     ///      transactions (a full-quorum batch does not fit one block), so the
@@ -1165,13 +1149,13 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
         _burnWood(total);
     }
 
-    /// @notice Verdict-driven slash whose proceeds fund victim compensation
-    ///         instead of burning.
+    /// @notice Verdict-driven slash whose proceeds are BURNED (spec §3.8 + §4
+    ///         authorized-slasher entrypoint).
     /// @dev Reuses the SAME per-approver own-stake leg as the review path
-    ///      (`_slashOne`) — only the SINK differs. Proceeds are approved to
-    ///      the escrow and booked as a compensation case pinned to
-    ///      `snapshotTimestamp`, so pre-drain holders redeem them instead of
-    ///      the WOOD burning.
+    ///      (`_slashOne`) AND the same sink. The two paths differ now only in
+    ///      who may drive them (`onlyAuthorizedSlasher` vs `onlyRegistry`) and
+    ///      in the conviction bounty this one can pay off the top; the
+    ///      compensation case that used to distinguish them is gone.
     /// @dev SEVERITY ENVELOPE. Every element of `slashBpsPer` is clamped to
     ///      `[minSlashBps, maxSlashBps]` here, so the verdict path enforces
     ///      the SAME envelope as the review path, where `GuardianRegistry`'s
@@ -1204,45 +1188,53 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///      the floor. The per-verdict guard above stops concurrent small
     ///      convictions from stacking those floors.
     ///
-    /// @dev TIMESTAMP BOUNDS — WHAT THEY DO AND DO NOT GUARANTEE. `openedAt`
-    ///      must not be in the future (`VerdictNotPast`) and
-    ///      `snapshotTimestamp` must be at or before `openedAt`
-    ///      (`SnapshotAfterVerdict`). These are HONEST-CALLER sanity bounds:
-    ///      they catch a mis-built verdict and keep the `uint32` checkpoint
-    ///      lookup in `_slashOne` from wrapping. They do NOT constrain a
+    ///      THE SHAPE, NOT JUST THE DATA POINT: the over-slash
+    ///      multiple is `minSlashBps / derivedRate` and is UNBOUNDED as the
+    ///      allocation shrinks — the 10× above is one point on a hyperbola, not
+    ///      a cap. And `derivedRate` itself moves with the WOOD price
+    ///      (`ExposureLedger.slashBpsFor` prices bonds via `woodPriceX8()`), so
+    ///      a price move alone can push a small allocation's rate under the
+    ///      floor and put its holder on the punitive branch.
+    ///
+    /// @dev TIMESTAMP BOUND — WHAT IT DOES AND DOES NOT GUARANTEE.
+    ///      `openedAt` must not be in the future
+    ///      (`VerdictNotPast`). This is an HONEST-CALLER sanity bound: it
+    ///      catches a mis-built verdict and keeps the `uint32` checkpoint
+    ///      lookup in `_slashOne` from wrapping. It does NOT constrain a
     ///      COMPROMISED `authorizedSlasher`, which can always pass
-    ///      `openedAt = block.timestamp` and pin any past snapshot — including
-    ///      a post-drain instant at which an attacker coalition holds the
-    ///      supply, handing the attacker back its own slash. The integrity of
-    ///      `(openedAt, snapshotTimestamp)` is exactly as trustworthy as
-    ///      `authorizedSlasher` itself.
+    ///      `openedAt = block.timestamp`. Until the slasher is Plan D's
+    ///      challenge game passing timestamps from a REGISTERED verdict record
+    ///      rather than caller arguments, the integrity of `openedAt` is
+    ///      exactly as trustworthy as `authorizedSlasher` itself (today: the
+    ///      owner multisig).
+    ///
+    ///      THE F1 SNAPSHOT ATTACK IS GONE WITH THE ESCROW. The companion
+    ///      bound this doc used to carry — `snapshotTimestamp` at or before
+    ///      `openedAt` — guarded an apportionment: a compromised slasher could
+    ///      pin a POST-drain instant at which an attacker coalition held the
+    ///      vault's supply and have the escrow hand the attacker back its own
+    ///      slash. Burning removes the payout that attack aimed at. There is no
+    ///      snapshot, no apportionment, and nothing for a chosen instant to
+    ///      redirect; a compromised slasher can still slash the wrong people,
+    ///      but it can no longer PAY ITSELF for doing so.
     ///
     /// @param caseKey  Composite verdict key; feeds the `GuardianSlashed` topic.
     /// @param openedAt The verdict's open timestamp — the at-open anchor the
-    ///        own-stake leg is sized against (see `_slashOne`), and the
-    ///        latest snapshot the case may be pinned to.
+    ///        own-stake leg is sized against (see `_slashOne`).
     /// @param approvers The approver addresses to slash.
     /// @param slashBpsPer Per-approver slash fractions in bps, positionally
     ///        aligned with `approvers` and each clamped to
-    ///        `[minSlashBps, maxSlashBps]` independently. One rate per approver
-    ///        rather than one for the batch: an approver's liability is what
-    ///        they UNDERWROTE, and `ExposureLedger` books that per guardian
-    ///        (`slashBpsFor` derives this array). A single batch-wide rate
-    ///        would force the ledger to assume any one approver might carry
-    ///        the whole loss, making coverage un-nettable — a flat 100% takes
-    ///        the entire bond once, so a second concurrent conviction against
-    ///        the same guardian recovers nothing.
-    /// @param vault The vault whose pre-drain holders are compensated. Supplied
-    ///        by the caller because a `caseKey` cannot yield it.
-    /// @param snapshotTimestamp The pre-drain snapshot the escrow apportions
-    ///        against, chosen by the caller within the bound above: the block
-    ///        before the drain proposal executed for predicates 1-4, the
-    ///        epoch-N opening checkpoint for a per-epoch drawdown conviction.
-    /// @param bountyTo  Recipient of the conviction bounty, or `address(0)` to
-    ///        disable it. Never storage — the caller (`ChallengeGame`)
-    ///        decides per settle whether this path pays at all, so sWOOD
-    ///        gains no state variable for it and this stays a plain UUPS
-    ///        upgrade.
+    ///        `[minSlashBps, maxSlashBps]` independently. The array stays
+    ///        per-approver even though the production feed now supplies one
+    ///        uniform rate: the clamp is a PER-GUARDIAN envelope, and zero
+    ///        remains meaningful as "this approver underwrote nothing" (see the
+    ///        loop). Collapsing it to a batch-wide scalar would lose that
+    ///        distinction and force every named address to be slashed.
+    /// @param bountyTo  Recipient of the conviction bounty (spec 2026-07-29
+    ///        §2), or `address(0)` to disable it. Never storage — the caller
+    ///        (`ChallengeGame`) decides per settle whether this path pays at
+    ///        all, so sWOOD gains no state variable for it and this stays a
+    ///        plain UUPS upgrade.
     /// @param bountyBps Slice of the recovered total paid to `bountyTo`, in
     ///        bps. `0` disables the bounty even with a non-zero `bountyTo`.
     ///        Rejected outside `[0, MAX_CONVICTION_BOUNTY_BPS]` (reverts, not
@@ -1255,24 +1247,21 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///        `MAX_CONVICTION_BOUNTY_BPS` (in particular any value `>= 10_000`,
     ///        which would otherwise be able to route the ENTIRE slash to
     ///        `bountyTo`) reverts `InvalidParameter`.
-    /// @return total  Total WOOD routed to the escrow across all approvers,
-    ///         NET of the conviction bounty. Also what `VerdictSlashRouted` and
-    ///         `VerdictSlashUncompensated` report as `total` — both are NET.
-    /// @return caseId The escrow case funded, or 0 when nothing was recovered.
-    function slashToEscrow(
+    /// @return total  Total WOOD burned across all approvers, NET of the
+    ///         conviction bounty — the same figure `VerdictSlashBurned` reports
+    ///         as `burned`. The event also carries the gross and the bounty, so
+    ///         an indexer can reconstruct the split without re-deriving it.
+    function slashVerdict(
         bytes32 caseKey,
         uint256 openedAt,
         address[] calldata approvers,
         uint256[] calldata slashBpsPer,
-        address vault,
-        uint256 snapshotTimestamp,
+        bool[] calldata contestors,
         address bountyTo,
         uint256 bountyBps
-    ) external onlyAuthorizedSlasher returns (uint256 total, uint256 caseId) {
-        address escrow = compensationEscrow;
-        if (escrow == address(0)) revert CompensationEscrowNotSet();
+    ) external onlyAuthorizedSlasher returns (uint256 total) {
         if (openedAt > block.timestamp) revert VerdictNotPast();
-        if (snapshotTimestamp > openedAt) revert SnapshotAfterVerdict();
+        if (contestors.length != approvers.length) revert SlashBpsLengthMismatch();
         // Positional alignment is the only thing tying a guardian to their rate,
         // so a mismatch is a caller bug, not something to absorb.
         if (slashBpsPer.length != approvers.length) revert SlashBpsLengthMismatch();
@@ -1285,25 +1274,22 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
         // should never be laundered into a smaller-but-still-caller-chosen
         // one. Left unchecked here, a compromised or buggy `authorizedSlasher`
         // could pass `bountyBps` up to just under 10_000 and route almost the
-        // entire slash to a `bountyTo` of its own choosing — the exact one-
-        // address-of-its-own-choosing outcome `compensationEscrow`'s natspec
-        // says sWOOD does not allow. Enforcing the ceiling here,
+        // entire slash to a `bountyTo` of its own choosing. The guarantee this
+        // preserves: a compromised slasher can divert at most
+        // `MAX_CONVICTION_BOUNTY_BPS` of any ONE call, and the remainder can
+        // only ever reach `BURN_ADDRESS`. Enforcing the ceiling here,
         // unconditionally (even when `bountyTo == address(0)` and the rate
         // would never be spent), keeps that guarantee true regardless of what
         // the caller does. PER CALL, NOT PER GUARDIAN: `_verdictSlashed` keys
         // on a caller-chosen `caseKey`, so this bounds one call's diversion,
         // not what repeated verdicts under fresh case keys can compound to.
         if (bountyBps > MAX_CONVICTION_BOUNTY_BPS) revert InvalidParameter();
-        // FACTORY MEMBERSHIP. The escrow apportions against `vault`'s
-        // ERC20Votes checkpoints, and a nonstandard `getPastTotalSupply` is
-        // the one way `EmptySnapshot`'s classification as recoverable could
-        // fail to hold. Asserting the vault is factory-deployed scopes the
-        // slasher to vaults with OZ semantics. Unconditional: `factory` is
-        // required non-zero at `initialize`, so there is no unwired window to
-        // fail open for.
-        if (IFactoryGovernorLookup(factory).governorOf(vault) == address(0)) {
-            revert VaultNotFactoryDeployed();
-        }
+        // NO VAULT MEMBERSHIP CHECK. The factory lookup that used to stand here
+        // existed to keep the escrow's ERC20Votes
+        // apportionment on vaults with OZ semantics. Nothing is apportioned any
+        // more — the proceeds burn — so the slash no longer needs an opinion
+        // about which vault the verdict concerned, and does not take one as a
+        // parameter.
 
         // Namespace the verdict key before it feeds the shared `GuardianSlashed`
         // topic: a raw caller-chosen `caseKey` could be crafted to collide with
@@ -1313,16 +1299,21 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
         // so indexers join the two deterministically.
         bytes32 slashKey = keccak256(abi.encodePacked("sherwood.verdict", caseKey));
 
-        // INTRA-CALL DEDUP. Each `_slashOne` pass re-applies its clamped rate
-        // to the ALREADY-REDUCED live stake, so N repeats of one approver
-        // compound to `1-(1-bps)^N` — above any `maxSlashBps` ceiling
-        // governance set. Pairwise over calldata rather than requiring sorted
-        // input: the production feed (`ExposureLedger.slashBpsFor`) is
-        // vote-ordered and positionally rate-aligned, and approver sets are
-        // quorum-sized, so O(n²) here (2.30M gas at the 100-approver cap,
-        // against ~27M for the slash itself) is cheaper than every caller
-        // co-sorting two paired arrays. Zero-rate entries are NOT exempt — a
-        // zero slot must not smuggle a duplicate address past the check.
+        /// @dev Summed slash of the approvers who funded the counter-bond —
+        ///      the ceiling on the conviction bounty. See the cap below.
+        uint256 contestorSlash;
+
+        // INTRA-CALL DEDUP. Each `_slashOne` pass
+        // re-applies its clamped rate to the ALREADY-REDUCED live stake, so N
+        // repeats of one approver compound to `1-(1-bps)^N` — above any
+        // `maxSlashBps` ceiling governance set. Pairwise over calldata rather
+        // than requiring sorted input: the production feed
+        // (`ExposureLedger.slashBpsFor`) is vote-ordered and positionally
+        // rate-aligned, and approver sets are quorum-sized, so O(n²) here
+        // (2.30M gas at the 100-approver cap, against ~27M for the slash
+        // itself) is cheaper than every caller co-sorting two paired arrays.
+        // Zero-rate entries are NOT exempt — a zero slot must not smuggle a
+        // duplicate address past the check.
         //
         // This bounds ONE array. The same compounding across SEPARATE calls
         // is bounded by `_verdictSlashed` in the loop below — which is the
@@ -1369,22 +1360,49 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
             if (amt == 0) continue;
             _verdictSlashed[caseKey][approvers[i]] = true;
             total += amt;
+            // Accumulated HERE because this is the only frame that knows what
+            // each approver actually forfeited — see the bounty cap below.
+            if (contestors[i]) contestorSlash += amt;
         }
-        // Nothing recovered: no case to open (the escrow rejects zero proceeds).
-        if (total == 0) return (0, 0);
+        // Nothing recovered: nothing to pay, nothing to burn.
+        if (total == 0) return 0;
 
-        // THE BOUNTY COMES OFF THE TOP, BEFORE THE ESCROW SEES THE MONEY.
-        // Paying the prosecutor out of what the prosecution recovered is
-        // what makes filing rational: a correct but
-        // unanswered challenge otherwise LOSES `settleBurnBps` of its bond, so
-        // nobody outside the drained vault has a reason to watch. Deducting
-        // here rather than inside the escrow keeps `proceeds` honest - the
-        // number a claimant redeems against is the number actually present -
-        // and keeps a non-victim payout out of the contract whose only job is
-        // victim compensation.
+        // THE BOUNTY COMES OFF THE TOP, BEFORE THE BURN (spec 2026-07-29 §2).
+        // Paying the prosecutor out of what the prosecution recovered is what
+        // makes filing rational: a correct but unanswered challenge otherwise
+        // LOSES `settleBurnBps` of its bond, so nobody outside the drained
+        // vault has a reason to watch.
+        //
+        // This is the ONLY leg that leaves to a named address, and that is
+        // exactly what lets the rate be punitive. A sink with no counterparty
+        // cannot over-pay anyone, so the slash is free to exceed the loss —
+        // which is the whole reason the verdict rate is now the severity
+        // ceiling rather than a share of the damages.
+        // CAPPED AT WHAT THE CONTEST ACTUALLY COST ITS FUNDERS. The caller
+        // pays a bounty only when an APPROVER funded the counter-bond, which
+        // is meant to price a staged contest: to fake one you must join the
+        // cohort your own conviction slashes. That pricing argument holds only
+        // while the payout is bounded by what the faker forfeits — and the
+        // punitive rate broke that bound, because the bounty is a share of the
+        // WHOLE cohort's bonds while the faker still risks only its own.
+        //
+        // Worked: five approvers at 100,000 WOOD, an attacker joining at a
+        // 1,000 WOOD minimum stake and self-funding the pool, 500 bps ->
+        // 25,050 WOOD paid for 1,000 WOOD risked. Capping at `contestorSlash`
+        // makes that trade exactly break-even at best, for any parameter set,
+        // without a threshold to tune.
+        //
+        // SUMMED OVER EVERY CONTRIBUTING APPROVER, not the first one found: a
+        // genuine defence is funded by real approvers with real bonds, so the
+        // cap sits far above the fee and never binds. It binds only when the
+        // contest was staged by someone with nothing at stake — which is the
+        // case it exists for. A contestor whose own slash landed at zero
+        // (`amt == 0`, no live stake) contributes nothing to the cap and so
+        // unlocks no bounty, which is the same rule stated at the wei level.
         uint256 bounty;
         if (bountyTo != address(0) && bountyBps != 0) {
             bounty = total * bountyBps / 10_000;
+            if (bounty > contestorSlash) bounty = contestorSlash;
             if (bounty != 0) {
                 total -= bounty;
                 wood.safeTransfer(bountyTo, bounty);
@@ -1393,131 +1411,26 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
         }
 
         _totalStakeCheckpoint.push(uint32(block.timestamp), uint224(totalGuardianStake));
-        // Effects are complete; hand the proceeds over and open the case.
-        // `forceApprove` tolerates non-standard tokens that reject a non-zero
-        // to non-zero approve; the allowance is zeroed straight after so the
-        // escrow never holds a standing claim on sWOOD's custody balance.
-        //
-        // BURN FALLBACK: `openCase` is the slash's only sink, and it reverts
-        // on a vault the escrow cannot apportion against (missing ERC20Votes
-        // reads, block-number clock mode). Letting that revert bubble would
-        // make the SLASH hostage to a vault read — a bad vault would mean the
-        // guilty guardian keeps its stake. Instead the slash stands and the
-        // proceeds burn, exactly like the review path's sink;
-        // `VerdictSlashUncompensated` marks the case as never funded so
-        // indexers see the victims went unpaid.
-        //
-        // NARROWED FROM A BARE CATCH. The burn is irreversible and takes the
-        // victims' compensation with it, so it must answer only the failure
-        // it was written for: the vault cannot be apportioned against, and no
-        // retry will change that. Every revert the escrow raises about its
-        // OWN inputs is a recoverable caller or wiring mistake — a
-        // `snapshotTimestamp` that is not strictly past (or that predates the
-        // vault's first deposit: `EmptySnapshot`), a zero vault, an escrow
-        // mid-rewire that no longer recognises sWOOD as its funder — and each
-        // of those is fixable by resubmitting. Those bubble. The slash is
-        // idempotent per (caseKey, approver), so a bubbled revert costs
-        // nothing but the gas: the whole transaction rolls back, including
-        // `_verdictSlashed`, and the corrected call runs clean.
-        IERC20(wood).forceApprove(escrow, total);
-        try ICompensationEscrow(escrow).openCase(vault, snapshotTimestamp, total) returns (uint256 id) {
-            caseId = id;
-            IERC20(wood).forceApprove(escrow, 0);
-            emit VerdictSlashRouted(caseKey, vault, total, caseId);
-        } catch (bytes memory reason) {
-            if (_isRecoverableOpenCaseFailure(reason)) {
-                // Not our failure mode — surface it instead of burning.
-                assembly ("memory-safe") {
-                    revert(add(reason, 0x20), mload(reason))
-                }
-            }
-            IERC20(wood).forceApprove(escrow, 0);
-            // `total` here is already NET of the bounty: it left in the branch
-            // above, before this fallback could ever run. Burning the gross
-            // would double-count it — the bounty recipient keeps its cut
-            // either way, so only what was actually destined for the escrow
-            // burns.
-            //
-            // THE BOUNTY IS DELIBERATELY NOT CLAWED BACK HERE. On this path
-            // `openCase` never ran, so depositors
-            // recover 0% of `total` EITHER WAY — paying the bounty first does
-            // not take anything away from them, because there was never a
-            // funded case to divide. The bounty comes out of what would
-            // otherwise simply burn, not out of anyone's recovery, so the
-            // prosecutor still gets paid even when the vault turns out to be
-            // unpriceable.
-            _burnWood(total);
-            caseId = 0;
-            emit VerdictSlashUncompensated(caseKey, vault, total);
-        }
-    }
 
-    /// @dev Does this `openCase` revert describe a fixable input/wiring mistake
-    ///      rather than a vault the escrow can never apportion against?
-    ///
-    ///      Recognised as RECOVERABLE (re-reverted, nothing burns):
-    ///        - `SnapshotNotPast`     — reachable from here: `slashToEscrow`
-    ///          allows `snapshotTimestamp == block.timestamp`, the escrow
-    ///          requires strictly past. Pure caller arithmetic.
-    ///        - `ZeroAddress`         — `vault` was zero.
-    ///        - `NothingToCompensate` — zero proceeds; unreachable today
-    ///          (`total != 0` above) but listed so a future refactor cannot
-    ///          turn it into a silent burn.
-    ///        - `NotAuthorizedFunder` — the escrow is mid-reconfiguration and
-    ///          no longer accepts sWOOD. Rewire and resubmit.
-    ///        - `EmptySnapshot` — the votes read SUCCEEDED and returned zero
-    ///          supply. The vault demonstrably implements the ERC20Votes
-    ///          surface, so this is not the vault-capability failure the burn
-    ///          answers: on a real conviction a drain implies pre-drain
-    ///          holders, so a zero-supply snapshot means the TIMESTAMP is
-    ///          wrong (pre-first-deposit typo, wrong epoch anchor) — pure
-    ///          caller arithmetic, fixable by resubmitting with the corrected
-    ///          instant. Burning here would consume `_verdictSlashed` and
-    ///          strand the victims permanently on a recoverable input error.
-    ///          The classifier keys on RETRYABILITY, not on which contract
-    ///          raised the error.
-    ///
-    ///          WHY "PERMANENTLY EMPTY" CANNOT HAPPEN ON A REAL VAULT: OZ
-    ///          `Votes._transferVotingUnits` pushes `_totalCheckpoints` on
-    ///          every mint UNCONDITIONALLY — `getPastTotalSupply` counts
-    ///          total supply, NOT delegated votes ("Votes that have not been
-    ///          delegated are still part of total supply", OZ natspec). So a
-    ///          pre-`_update`-upgrade vault whose holders never delegated
-    ///          reads zero VOTES per holder (case opens, claims strand to the
-    ///          backstop) but NEVER zero SUPPLY after its first deposit. A
-    ///          vault where `EmptySnapshot` is permanent despite holders
-    ///          would have to override `getPastTotalSupply` to mean
-    ///          delegated-sum — a nonstandard vault no reachable caller path
-    ///          supplies.
-    ///
-    ///      Everything else BURNS: any unrecognised or empty returndata — a
-    ///      vault missing the ERC20Votes selectors, a block-number clock mode,
-    ///      or an out-of-gas child.
-    ///
-    ///      REQUIREMENT ON THE SLASHER: an out-of-gas child is RETRYABLE but
-    ///      indistinguishable here from a missing selector, so a gas-starved
-    ///      `openCase` burns the victims' compensation irreversibly. The
-    ///      exposure is NOT tx-level gas: the `openCase` call carries no
-    ///      `{gas:}` modifier, so an EOA-initiated call that starves the
-    ///      63/64 child also leaves the parent unable to afford the burn
-    ///      branch — the whole transaction reverts, which is the safe
-    ///      outcome. The regime that burns is a slasher doing
-    ///      `slashToEscrow{gas: g}` with attacker-influenced `g`, where the
-    ///      same 63/64 arithmetic runs one frame up and `g` is chosen
-    ///      directly. A slasher that forwards user-influenced gas MUST pin a
-    ///      gas floor before calling `slashToEscrow` — nothing in THIS
-    ///      contract enforces one.
-    function _isRecoverableOpenCaseFailure(bytes memory reason) private pure returns (bool) {
-        if (reason.length < 4) return false;
-        bytes4 selector;
-        assembly ("memory-safe") {
-            selector := mload(add(reason, 0x20))
-        }
-        return selector == ICompensationEscrow.SnapshotNotPast.selector
-            || selector == ICompensationEscrow.ZeroAddress.selector
-            || selector == ICompensationEscrow.NothingToCompensate.selector
-            || selector == ICompensationEscrow.NotAuthorizedFunder.selector
-            || selector == ICompensationEscrow.EmptySnapshot.selector;
+        // THE SINK. `total` is already NET of the bounty, which left in the
+        // branch above; burning the gross would double-count it.
+        //
+        // ONE SINK, THREE PATHS. `slashGuardians` and `slashOwnerBond` have
+        // always burned outright. This path used to route to a compensation
+        // escrow and burn only as a FALLBACK, for vaults the escrow could not
+        // apportion against (missing ERC20Votes reads, block-number clock
+        // mode). With the escrow gone the fallback became the rule, and the
+        // external call went with it — no allowance dance, no selector
+        // allowlist deciding which reverts may burn, no child-call gas to
+        // reserve, and no way for a vault read to hold a conviction hostage.
+        //
+        // `_burnWood` is failure-tolerant by design: a WOOD transfer that
+        // reverts or returns false parks the amount in `_pendingBurn` for a
+        // permissionless `flushBurn` retry. The slash accounting has already
+        // landed at this point, so only the transfer is at risk — a hostile or
+        // blacklisting token cannot brick a conviction.
+        _burnWood(total);
+        emit VerdictSlashBurned(caseKey, total + bounty, bounty, total);
     }
 
     /// @dev Per-approver slash. Extracted to keep `slashGuardians`'s stack

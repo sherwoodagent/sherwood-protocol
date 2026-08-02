@@ -15,8 +15,6 @@ import {IExposureLedger} from "../src/interfaces/IExposureLedger.sol";
 import {TierRegistry} from "../src/TierRegistry.sol";
 import {ChallengeGame} from "../src/ChallengeGame.sol";
 import {IChallengeGame} from "../src/interfaces/IChallengeGame.sol";
-import {CompensationEscrow} from "../src/CompensationEscrow.sol";
-import {ICompensationEscrow} from "../src/interfaces/ICompensationEscrow.sol";
 import {ProposerBondEscrow} from "../src/ProposerBondEscrow.sol";
 import {BatchExecutorLib} from "../src/BatchExecutorLib.sol";
 import {ProtocolConfig} from "../src/ProtocolConfig.sol";
@@ -71,19 +69,16 @@ contract ChallengeE2EAdapter {
 ///         `SyndicateVault` + `SyndicateGovernor` executing a real proposal, a
 ///         real `ExposureLedger` booking the coverage that approval commits, a
 ///         real `TierRegistry` holding the certification a passed challenge
-///         revokes, a real `CompensationEscrow`, and a real `ChallengeGame`
-///         wired into all of its roles.
+///         revokes, and a real `ChallengeGame` wired into all of its roles.
 ///
 /// @dev    The roles, each of them load-bearing for one leg of the arcs below:
 ///           - `ledger.coverageFreezer`         → the per-proposal freeze (D3)
 ///           - `tierRegistry.authorizedDemoter` → the passed-challenge demotion (D7)
 ///           - `swood.authorizedSlasher`        → the silence verdict's slash (D1)
-///           - `escrow.authorizedFunder` is sWOOD, NOT the game: the escrow
-///             address is owner-set state on sWOOD and deliberately not a
-///             `slashToEscrow` argument, so the game can never redirect the
-///             ESCROW portion of a slash it triggers. It CAN name a caller-
-///             chosen conviction-bounty recipient (`bountyTo`/`bountyBps`,
-///             spec 2026-07-29 §2), but sWOOD caps that channel at
+///           - the slash has no external sink to redirect: proceeds burn. The
+///             game CAN name a caller-chosen conviction-bounty recipient
+///             (`bountyTo`/`bountyBps`, spec 2026-07-29 §2), but sWOOD caps
+///             that channel at
 ///             `MAX_CONVICTION_BOUNTY_BPS` itself rather than trusting the
 ///             game's own clamp — the same reason `slashBpsPer` is re-clamped
 ///             in sWOOD rather than trusted from `ExposureLedger`.
@@ -121,7 +116,6 @@ contract ChallengeEndToEndTest is Test {
     ExposureLedger public ledger;
     TierRegistry public tierRegistry;
     ProposerBondEscrow public bondEscrow;
-    CompensationEscrow public escrow;
     ChallengeGame public game;
 
     SyndicateVault public vault;
@@ -175,10 +169,12 @@ contract ChallengeEndToEndTest is Test {
     ///      protocol. The remainder stays staked and is still available to a
     ///      second, concurrent conviction, which is the point of per-approver
     ///      rates.
-    uint256 constant VERDICT_BPS = 6667;
-    uint256 constant PROCEEDS = (G1_STAKE * VERDICT_BPS) / 10_000;
-    uint256 constant LP1_CLAIM = (PROCEEDS * 70) / 100; // pre-drain cohort, 70%
-    uint256 constant LP2_CLAIM = PROCEEDS - LP1_CLAIM; // ...and 30%, exhausting the case
+    /// @dev RETIRED with the compensatory rate. `VERDICT_BPS` was the
+    ///      coverage-proportional figure `slashBpsFor` used to derive (6,667 —
+    ///      two thirds of a bond, being this fixture's share of the loss). The
+    ///      rate is now the severity ceiling for every committed approver, so
+    ///      the whole of `G1_STAKE` is taken and the split constants that
+    ///      apportioned it between LPs have no meaning.
 
     uint16 constant CERTIFIED_BOUND_BPS = 5_000;
 
@@ -256,7 +252,6 @@ contract ChallengeEndToEndTest is Test {
         registry.setExposureLedger(address(ledger));
 
         bondEscrow = new ProposerBondEscrow(address(wood), address(registry), address(ledger));
-        escrow = new CompensationEscrow(owner, address(wood));
 
         // ── The game, then its roles.
         game = new ChallengeGame(owner, address(wood), address(ledger), address(tierRegistry));
@@ -265,9 +260,6 @@ contract ChallengeEndToEndTest is Test {
         tierRegistry.setAuthorizedDemoter(address(game));
         vm.startPrank(owner);
         swood.setAuthorizedSlasher(address(game));
-        swood.setCompensationEscrow(address(escrow));
-        escrow.setAuthorizedFunder(address(swood));
-        escrow.setBackstop(backstop);
         game.setStakedWood(address(swood));
         vm.stopPrank();
 
@@ -505,28 +497,33 @@ contract ChallengeEndToEndTest is Test {
         vm.expectRevert(IChallengeGame.DelayNotElapsed.selector);
         game.resolve(cid);
 
+        // Hoisted before `resolve`: these are the balances the burn is measured
+        // against, and a cheatcode in argument position is consumed by the
+        // inner call.
+        // sWOOD's OWN balance, not the burn address: the burn address also
+        // receives the challenger's settle-burn, so a delta measured there
+        // conflates two sinks. Only a slash moves WOOD out of the custodian.
+        uint256 swoodBalBefore = wood.balanceOf(address(swood));
+        uint256 lp1Before = wood.balanceOf(lp1);
+        uint256 lp2Before = wood.balanceOf(lp2);
+
         // ── Silence. Resolve is permissionless, so anyone may execute it.
         vm.warp(c.filedAt + game.autoSlashDelay());
         game.resolve(cid);
 
-        // ── The verdict landed: the approver paid, and the whole of it reached
-        //    the escrow as a case pinned to the block BEFORE the drain (D6).
+        // ── The verdict landed. PUNITIVE, NOT COMPENSATORY: the approver loses
+        //    its WHOLE bond — not the slice it underwrote — and every wei is
+        //    destroyed rather than paid to anyone.
         assertEq(uint256(game.challengeOf(cid).status), uint256(IChallengeGame.Status.Settled), "Settled");
         assertEq(
-            swood.guardianStake(g1),
-            G1_STAKE - PROCEEDS,
-            "the approver paid exactly what it underwrote -- and no more, so the residue can still answer a second case"
+            swood.guardianStake(g1), 0, "punitive: the whole bond goes, because a burn has no counterparty to over-pay"
         );
-        assertEq(escrow.caseCount(), 1, "one compensation case");
-        uint256 caseId = escrow.caseCount();
-        (address caseVault, uint256 snapTs, uint256 proceeds, uint256 redeemed,,, bool swept) = escrow.caseOf(caseId);
-        assertEq(caseVault, address(vault), "pinned to the real vault");
-        assertEq(snapTs, executedAt - 1, "and to the block before the drain executed (D6)");
-        assertEq(proceeds, PROCEEDS, "the full slash reached the escrow");
-        assertEq(redeemed, 0);
-        assertFalse(swept);
-        assertEq(wood.balanceOf(address(escrow)), PROCEEDS, "the escrow holds it");
-        assertEq(escrow.totalEscrowed(), PROCEEDS);
+        assertEq(
+            swoodBalBefore - wood.balanceOf(address(swood)),
+            G1_STAKE,
+            "and the whole of it left the custodian for the burn address"
+        );
+        assertEq(swood.pendingBurn(), 0, "the burn transfer landed; nothing parked for a flush retry");
 
         // ── The named adapter lost its certification (§3.4 / D7).
         (uint8 tierAfter, uint16 boundAfter) = tierRegistry.tierOf(address(adapter), adapter.poke.selector);
@@ -552,36 +549,23 @@ contract ChallengeEndToEndTest is Test {
         ledger.releaseApproval(address(gov), pid, g1);
         assertEq(ledger.openExposureUsd(g1), 0, "the guardian recycled its budget");
 
-        // ── §3.8: the pre-drain cohort owns the whole case, exactly 70/30.
-        assertEq(vault.getPastTotalSupply(snapTs), SNAP_SUPPLY, "snapshot supply is the two pre-drain LPs");
-        assertEq(vault.getPastVotes(lp1, snapTs), LP1_SHARES, "LP1 held 70%");
-        assertEq(vault.getPastVotes(lp2, snapTs), LP2_SHARES, "LP2 held 30%");
-        assertEq(vault.getPastVotes(buyer, snapTs), 0, "the buyer held nothing pre-drain");
-        assertEq(escrow.claimable(caseId, lp1), LP1_CLAIM);
-        assertEq(escrow.claimable(caseId, lp2), LP2_CLAIM);
-        assertEq(LP1_CLAIM + LP2_CLAIM, PROCEEDS, "the two claims exhaust the case");
+        // ── CAVEAT EMPTOR. Depositors are NOT made whole: there is no case, no
+        //    claim, and no path by which any holder recovers slashed value. The
+        //    vault's snapshot arithmetic still works — the shares moved exactly
+        //    as they always did — it is simply never consulted, because nothing
+        //    is apportioned.
+        assertEq(vault.getPastTotalSupply(executedAt - 1), SNAP_SUPPLY, "the pre-drain cohort is still identifiable");
+        assertEq(vault.getPastVotes(lp1, executedAt - 1), LP1_SHARES, "LP1 held 70% of it");
+        assertEq(vault.getPastVotes(lp2, executedAt - 1), LP2_SHARES, "LP2 held 30%");
+        assertEq(vault.getPastVotes(buyer, executedAt - 1), 0, "and the buyer held nothing pre-drain");
 
-        // Hoisted before the pranked calls: a cheatcode in argument position is
-        // consumed by the inner call.
-        uint256 lp1Before = wood.balanceOf(lp1);
-        uint256 lp2Before = wood.balanceOf(lp2);
-        vm.prank(lp1);
-        uint256 got1 = escrow.redeem(caseId);
-        vm.prank(lp2);
-        uint256 got2 = escrow.redeem(caseId);
-        assertEq(got1, LP1_CLAIM, "LP1 redeemed its 70%");
-        assertEq(got2, LP2_CLAIM, "LP2 redeemed its 30%");
-        assertEq(wood.balanceOf(lp1), lp1Before + LP1_CLAIM, "LP1 actually received the WOOD");
-        assertEq(wood.balanceOf(lp2), lp2Before + LP2_CLAIM, "LP2 actually received the WOOD");
-        assertEq(escrow.totalEscrowed(), 0, "the whole slash reached pre-drain holders");
+        // ...and none of that entitles anyone to anything.
+        assertEq(wood.balanceOf(lp1), lp1Before, "LP1 recovers nothing from the slash");
+        assertEq(wood.balanceOf(lp2), lp2Before, "nor does LP2");
+        assertEq(wood.balanceOf(buyer), 0, "nor the post-drain buyer");
 
-        // ── Finding F1, against the real vault: post-drain shares carry no
-        //    claim, however real the purchase.
-        assertEq(escrow.claimable(caseId, buyer), 0, "the post-drain buyer has no claim");
-        vm.prank(buyer);
-        vm.expectRevert(ICompensationEscrow.NoClaim.selector);
-        escrow.redeem(caseId);
-        assertEq(wood.balanceOf(buyer), 0, "and got nothing at all");
+        // The old F1 attack — buy shares AFTER the drain to capture the
+        // compensation — has no target left. There is no payout to race.
     }
 
     // ── 2. The bad-faith arc: the bond is a real deterrent ────────────────
@@ -604,6 +588,9 @@ contract ChallengeEndToEndTest is Test {
         uint256 challengerBalBefore = wood.balanceOf(challenger);
         uint256 g1BalBefore = wood.balanceOf(g1);
         uint256 g1StakeBefore = swood.guardianStake(g1);
+        // sWOOD's own balance — the burn address also takes the challenger's
+        // forfeit burn on this path, so it cannot distinguish "no slash".
+        uint256 swoodBalBefore = wood.balanceOf(address(swood));
 
         // ── A bad-faith filing against a clean proposal. Nothing on-chain can
         //    tell it apart from the honest one — that is D1's whole point, and
@@ -645,7 +632,7 @@ contract ChallengeEndToEndTest is Test {
         vm.expectRevert(IChallengeGame.DelayNotElapsed.selector);
         game.resolve(cid);
         assertEq(swood.guardianStake(g1), g1StakeBefore, "nothing slashed while the escalation stands");
-        assertEq(escrow.caseCount(), 0, "and no case opened");
+        assertEq(wood.balanceOf(address(swood)), swoodBalBefore, "and no WOOD left the custodian");
 
         // ── Nobody rules. D5: the challenge fails safe, in favour of the accused.
         vm.warp(filedAt + game.disputeTimeout());
@@ -678,8 +665,7 @@ contract ChallengeEndToEndTest is Test {
 
         // ── A failed challenge leaves no mark anywhere else.
         assertEq(swood.guardianStake(g1), g1StakeBefore, "the accused was never slashed");
-        assertEq(escrow.caseCount(), 0, "no compensation case was ever opened");
-        assertEq(escrow.totalEscrowed(), 0);
+        assertEq(wood.balanceOf(address(swood)), swoodBalBefore, "and no WOOD left the custodian on its behalf");
         (uint8 tierAfter, uint16 boundAfter) = tierRegistry.tierOf(address(adapter), adapter.poke.selector);
         assertEq(tierAfter, 1, "the adapter keeps its certification");
         assertEq(boundAfter, CERTIFIED_BOUND_BPS);
@@ -823,11 +809,17 @@ contract ChallengeEndToEndTest is Test {
         assertEq(bondProposer, address(0), "the bond record is cleared");
         assertEq(bondAmount, 0);
 
+        // THREE SINKS SHARE THIS ADDRESS NOW, so the total is asserted with all
+        // three named rather than as "the bond plus the settle burn". The
+        // conviction also slashes the covering approver, and those proceeds
+        // burn here too — before, they went to the compensation escrow, so this
+        // delta used to see only the bond and the challenger's settle burn. A
+        // bare total would silently absorb a regression in any one leg.
         uint256 settleBurn = (CHALLENGER_BOND * game.settleBurnBps()) / 10_000;
         assertEq(
             wood.balanceOf(game.BURN_ADDRESS()),
-            burnBalBefore + PROPOSER_BOND + settleBurn,
-            "the forfeited proposer bond left the system, alongside the settle burn"
+            burnBalBefore + PROPOSER_BOND + settleBurn + G1_STAKE,
+            "proposer bond + challenger settle burn + the whole slashed guardian bond all left the system"
         );
         assertEq(wood.balanceOf(agent), agentBalAfterBond, "the proposer got nothing back");
 

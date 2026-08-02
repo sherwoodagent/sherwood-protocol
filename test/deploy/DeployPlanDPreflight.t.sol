@@ -6,7 +6,6 @@ import {Vm} from "forge-std/Vm.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {DeployPlanD} from "../../script/DeployPlanD.s.sol";
 import {ChallengeGame} from "../../src/ChallengeGame.sol";
-import {CompensationEscrow} from "../../src/CompensationEscrow.sol";
 import {ExposureLedger} from "../../src/ExposureLedger.sol";
 import {StakedWood} from "../../src/StakedWood.sol";
 import {TierRegistry} from "../../src/TierRegistry.sol";
@@ -31,7 +30,7 @@ contract PlanDScriptCaller {
 }
 
 /// @notice Drives the REAL `DeployPlanD` script against a REAL `StakedWood`,
-///         `ExposureLedger`, `TierRegistry` and `CompensationEscrow` (no
+///         `ExposureLedger` and `TierRegistry` (no
 ///         stubs), from the state Plan B + Plan C actually leave behind, then
 ///         breaks one piece of that state at a time and proves the pre-flight
 ///         refuses. Simulation only — no `--broadcast`.
@@ -56,7 +55,6 @@ contract DeployPlanDPreflightTest is Test {
     StakedWood internal swood;
     ExposureLedger internal ledger;
     TierRegistry internal tiers;
-    CompensationEscrow internal escrow;
 
     DeployPlanD internal script;
 
@@ -85,7 +83,6 @@ contract DeployPlanDPreflightTest is Test {
 
         ledger = new ExposureLedger(DEFAULT_SENDER, address(swood), 28 days);
         tiers = new TierRegistry(DEFAULT_SENDER);
-        escrow = new CompensationEscrow(DEFAULT_SENDER, address(wood));
 
         // The state Plan B and Plan C leave behind, and which this script
         // presumes to find. Plan B's `swood.setExposureLedger` is part of it —
@@ -93,8 +90,6 @@ contract DeployPlanDPreflightTest is Test {
         vm.startPrank(DEFAULT_SENDER);
         ledger.setWoodUsdPrice(WOOD_PRICE_X8);
         swood.setExposureLedger(address(ledger));
-        swood.setCompensationEscrow(address(escrow));
-        escrow.setAuthorizedFunder(address(swood));
         vm.stopPrank();
 
         script = new DeployPlanD();
@@ -188,21 +183,6 @@ contract DeployPlanDPreflightTest is Test {
         _runExpecting("PRE-FLIGHT: ExposureLedger.coverageFreezer already set.");
     }
 
-    /// @dev PRE-FLIGHT 2: Plan C's rails, escrow side.
-    function test_preflight_bites_whenEscrowFunderIsNotStakedWood() public {
-        vm.prank(DEFAULT_SENDER);
-        escrow.setAuthorizedFunder(address(0xDEAD));
-        _runExpecting("PRE-FLIGHT: CompensationEscrow.authorizedFunder != STAKED_WOOD.");
-    }
-
-    /// @dev PRE-FLIGHT 2: Plan C's rails, sWOOD side. Zero is a legal value on
-    ///      the setter, which is exactly why it has to be pre-flighted.
-    function test_preflight_bites_whenStakedWoodHasNoCompensationEscrow() public {
-        vm.prank(DEFAULT_SENDER);
-        swood.setCompensationEscrow(address(0));
-        _runExpecting("PRE-FLIGHT: StakedWood.compensationEscrow != COMPENSATION_ESCROW.");
-    }
-
     /// @dev PRE-FLIGHT 3: an unpriced ledger makes every `file()` revert, so
     ///      the game would deploy into a state where nothing can be challenged.
     ///      Zero stays settable on the ledger (it is the emergency stop), so no
@@ -228,11 +208,7 @@ contract DeployPlanDPreflightTest is Test {
     ///      the book directly, so nothing here is shared.
     function _book() internal view returns (DeployPlanD.AddressBook memory) {
         return DeployPlanD.AddressBook({
-            swood: address(swood),
-            wood: address(wood),
-            ledger: address(ledger),
-            tierRegistry: address(tiers),
-            escrow: address(escrow)
+            swood: address(swood), wood: address(wood), ledger: address(ledger), tierRegistry: address(tiers)
         });
     }
 

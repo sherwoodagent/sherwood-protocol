@@ -692,16 +692,24 @@ contract SyndicateVault is
     {
         if (from != address(0) && to != address(0) && _isLaneALocked(from)) revert SharesLocked();
         super._update(from, to, value);
-        // Auto-delegate on every receipt: the compensation escrow apportions
-        // on `getPastVotes`, which equals balance only if every holder is
-        // delegated. Delegating only on mint would leave plain ERC20
-        // transfers — including `requestRedeem`'s move into queue custody —
-        // landing on undelegated addresses with zero votes at every snapshot,
-        // silently writing a secondary buyer or queued exiter out of victim
-        // compensation while still counting them in its denominator. Runs
-        // AFTER `super._update` so the recipient's post-receipt balance is
-        // what checkpoints. Holders that explicitly delegated away keep their
-        // choice (`delegates(to) != 0`).
+        // AUTO-DELEGATE ON EVERY RECEIPT. Runs AFTER `super._update` so the
+        // recipient's post-receipt balance is what checkpoints. Holders that
+        // explicitly delegated away keep their choice (`delegates(to) != 0`).
+        //
+        // KEPT DELIBERATELY, ON A NEW JUSTIFICATION. This was introduced for
+        // The compensation escrow apportioned on
+        // `getPastVotes`, so an undelegated holder — a secondary buyer, or a
+        // queued exiter whose shares moved by plain transfer — was silently
+        // written out of victim compensation while still counted in its
+        // denominator. That consumer is gone; slash proceeds burn and nothing
+        // is apportioned against this vault at all.
+        //
+        // The behaviour stays because `getPastVotes == balance` is what makes
+        // this vault's OWN governance readable: a holder who never calls
+        // `delegate` still carries weight, which is the property every
+        // snapshot-based read here assumes. Removing it would silently zero
+        // the voting weight of every non-delegating holder — a much larger
+        // change than deleting a dead dependency, and not this one's business.
         //
         // The heal is permissionless and needs no action from the holder: it
         // also runs on a zero-value transfer (ERC20 permits `value == 0`), so
@@ -1079,15 +1087,15 @@ contract SyndicateVault is
             _spendAllowance(owner_, msg.sender, shares);
         }
         // Move shares into queue custody. `_update` auto-delegates the queue to
-        // itself, so custody shares keep checkpointed voting weight AT THE QUEUE
-        // — which is what lets the compensation escrow count them at a pre-drain
-        // snapshot and the queue pay that claim through to request owners
-        // (`VaultWithdrawalQueue.claimCompensation`). The queue never votes: it
-        // has no governance surface. For proposals already open at request
-        // time, the voter's checkpoint at `snapshotTimestamp` is frozen with
-        // the pre-transfer weight, so vote power is preserved for in-flight
-        // proposals. Queued shares forfeit voting power for any proposal
-        // opened after escrow. Shares are burned later by `claim`.
+        // itself, so custody shares keep checkpointed voting weight AT THE
+        // QUEUE. That weight used to be load-bearing — it was how the
+        // compensation escrow counted queued exiters at a pre-drain snapshot —
+        // and is now merely consistent: nothing is apportioned, and the queue
+        // never votes because it has no governance surface. For proposals already
+        // open at request time, the voter's checkpoint at `snapshotTimestamp` is
+        // frozen with the pre-transfer weight, so vote power is preserved for
+        // in-flight proposals. Queued shares forfeit voting power for any
+        // proposal opened after escrow. Shares are burned later by `claim`.
         uint256 pid = _activePid();
         _transfer(owner_, q, shares);
         requestId = IVaultWithdrawalQueue(q).queueRedeem(owner_, shares, pid);

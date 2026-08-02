@@ -226,14 +226,14 @@ contract MockStakedWood is IStakedWood {
     // ── Unused interface methods (revert if a test exercises a path the mock
     //    intentionally does not model — fail loud, never silently no-op) ──
 
-    // Verdict slash path (spec §4). Not modeled: the escrow hand-off needs a
-    // real WOOD balance, so `StakedWoodSlashToEscrow.t.sol` drives a real proxy.
-    function slashToEscrow(bytes32, uint256, address[] calldata, uint256[] calldata, address, uint256, address, uint256)
+    // Verdict slash path (spec §4). Not modeled: the burn needs a real WOOD
+    // balance, so `StakedWoodSlashVerdict.t.sol` drives a real proxy.
+    function slashVerdict(bytes32, uint256, address[] calldata, uint256[] calldata, bool[] calldata, address, uint256)
         external
         pure
-        returns (uint256, uint256)
+        returns (uint256)
     {
-        revert("MockStakedWood: slashToEscrow not modeled");
+        revert("MockStakedWood: slashVerdict not modeled");
     }
 
     /// @dev MODELLED AS A PLAIN SETTABLE SLOT (review PR #56 M2), unlike the
@@ -250,16 +250,8 @@ contract MockStakedWood is IStakedWood {
         authorizedSlasher = slasher;
     }
 
-    function setCompensationEscrow(address) external pure {
-        revert("MockStakedWood: setCompensationEscrow not modeled");
-    }
-
-    function compensationEscrow() external pure returns (address) {
-        revert("MockStakedWood: compensationEscrow not modeled");
-    }
-
     // Per-(caseKey, approver) verdict dedup (PR #24 review 🟠N2). Same reason
-    // as `slashToEscrow`: the path it guards is not modeled here.
+    // as `slashVerdict`: the path it guards is not modeled here.
     function verdictSlashed(bytes32, address) external pure returns (bool) {
         revert("MockStakedWood: verdictSlashed not modeled");
     }

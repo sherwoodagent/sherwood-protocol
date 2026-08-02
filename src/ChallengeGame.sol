@@ -88,26 +88,91 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      (`_requireWindowFits`).
     uint256 public constant MAX_DISPUTE_TIMEOUT = 60 days;
 
-    /// @notice Gas floor `resolve` must have before attempting a slash, so a
-    ///         starved child call inside `slashToEscrow` cannot read as empty
-    ///         returndata and silently burn the victims' compensation instead
-    ///         of bubbling the revert. Sized per approver plus a base because
-    ///         the slash loop runs before the call being protected.
-    /// @dev    Measured end-to-end against the real stack (a full conviction,
-    ///         every approver carrying a non-zero rate): 4 approvers ~714k gas,
-    ///         52 approvers ~5.43M, 100 approvers ~11.18M — fits
-    ///         `~224*n^2 + 85,659*n + 367,629`, dominated by `slashToEscrow`'s
-    ///         O(n^2) pairwise dedup scan (~224 gas/pair). 180k/approver plus a
-    ///         2M base keeps ~1.4x headroom over the marginal cost of the
-    ///         hundredth approver. Full-cap floor is `100 * 180_000 + 2_000_000
-    ///         = 20,000,000` against Robinhood Chain's (4663) 32,000,000
-    ///         per-tx gas cap, EIP-150-discounted three frames deep
-    ///         (`32,000,000 * (63/64)^3 ≈ 30,523,315`) — 1.5x slack.
-    ///         `MAX_APPROVERS_PER_PROPOSAL` stays unchanged: it is also the
-    ///         cohort size a proposal can be underwritten by, so lowering it
-    ///         would cut coverage capacity for no gas benefit.
-    ///         `test_slashGasFloorFitsRobinhoodMaxTxGas` is the CI tripwire
-    ///         that keeps the floor reachable under the chain's tx gas cap.
+    /// @dev THE GAS FLOOR for a permissionless `resolve`.
+    ///
+    ///      WHAT IT PROTECTS, RESTATED FOR THE BURN. It was written for a
+    ///      starved `openCase` child inside `slashToEscrow`, whose out-of-gas
+    ///      revert was indistinguishable from a missing selector and so BURNED
+    ///      the victims' compensation instead of bubbling. That child is gone: proceeds burn inside sWOOD and
+    ///      there is no external sink. What remains is `demoteByChallenge`
+    ///      below — a BEST-EFFORT `try/catch` that runs AFTER
+    ///      the slash. Under EIP-150 a caller supplying just enough gas to
+    ///      finish the slash leaves that child 63/64 of a nearly-empty frame:
+    ///      it starves, the catch swallows it, and the verdict settles with the
+    ///      challenged adapter KEEPING its certification. Everything else after
+    ///      the slash reverts the whole call (unguarded `safeTransfer`s) or is
+    ///      internal bookkeeping, so it is safe by rollback. The floor is still
+    ///      sized per approver plus a base: the slash loop runs first, so a
+    ///      flat floor would let a large batch consume it before the work that
+    ///      needs protecting.
+    ///
+    ///      THE CONSTANTS BELOW ARE MEASURED AGAINST THE PRE-BURN PATH and are
+    ///      therefore CONSERVATIVE, not tight — the `openCase` child they
+    ///      reserved for (~150-200k, plus the allowance dance) no longer runs.
+    ///      They are deliberately NOT re-tightened here. A floor measured
+    ///      against `slashVerdict` ALONE under-reserves: it misses the O(n)
+    ///      `contested` scan, the demote child and the payouts that follow, all
+    ///      of which this check must also cover. Re-derive end to end (through
+    ///      court `finalize`, as `SlashGasCeiling.t.sol` already does) before
+    ///      moving them; over-reserving only rejects an under-gassed caller,
+    ///      while under-reserving silently drops demotions.
+    ///
+    ///      A FLOOR MUST ALSO BE REACHABLE, WHICH THIS ONE WAS NOT. At the
+    ///      previous 300k/1M the full-cap floor was
+    ///      `100 * 300_000 + 1_000_000 = 31,000,000` — read INSIDE
+    ///      `ChallengeGame.rule`, two `CALL`s below an EOA on the court path
+    ///      (`finalize` -> `rule`; `_settle` is private and adds no frame,
+    ///      and neither contract is proxied). Robinhood Chain (4663) caps a
+    ///      transaction at `maxTxGasLimit = 32,000,000`
+    ///      (`ArbGasInfo.getGasAccountingParams()`, probed on mainnet
+    ///      2026-07-24 — the block `gasLimit` field is Orbit's 2^50 "no block
+    ///      cap" sentinel, so the per-tx limit is the binding one). Two
+    ///      EIP-150 haircuts put 31,000,000 out of reach of ANY transaction,
+    ///      so a conviction against a full cohort could not be mined at all:
+    ///      `finalize` bubbles the revert (it swallows only `WrongStatus`),
+    ///      the case sits in `Voting`, and the challenge times out through
+    ///      `resolve` -> `_fail`, ACQUITTING the accused and paying them the
+    ///      challenger's forfeited bond. A gas floor that converts a guilty
+    ///      verdict into an acquittal is worse than the mid-array
+    ///      out-of-gas it was written to prevent.
+    ///
+    ///      THE NUMBERS ARE NOW MEASURED, NOT ESTIMATED
+    ///      (`test/SlashGasCeiling.t.sol`). A conviction run end to end
+    ///      against the real stack — court `finalize`, every approver
+    ///      carrying a real non-zero rate, so every one is a genuine
+    ///      `_slashOne` — costs:
+    ///
+    ///          4 approvers      713,853
+    ///         52 approvers    5,428,313
+    ///        100 approvers   11,176,224
+    ///
+    ///      which fits `~224*n^2 + 85,659*n + 367,629`: a ~368k fixed base,
+    ///      ~86k of linear work per approver, and `slashToEscrow`'s O(n²)
+    ///      pairwise dedup scan at ~224 gas per pair (2.24M of the total at
+    ///      the cap). Average cost per approver at the cap is ~108k; the
+    ///      MARGINAL cost of the hundredth is ~130k. 300k was therefore
+    ///      2.3-3.5x over-provisioned, and that over-provisioning — not the
+    ///      approver cap — is what made the floor unreachable.
+    ///
+    ///      180k/approver keeps ~1.4x over the marginal cost of the last
+    ///      approver and ~1.7x over the average, which is the headroom that
+    ///      matters for the cases this fixture does NOT reproduce: a
+    ///      long-lived guardian whose checkpoint trace makes each
+    ///      `upperLookupRecent` a deeper binary search than a freshly-staked
+    ///      one. The base doubles to 2M rather than shrinking, so the
+    ///      `openCase` child (~150-200k observed) keeps well over the >5x
+    ///      margin after 63/64 forwarding that the original sizing argued
+    ///      for, with the parent's burn/bubble branch still affordable behind
+    ///      it.
+    ///
+    ///      Full-cap floor is now `100 * 180_000 + 2_000_000 = 20,000,000`
+    ///      against a `32,000,000 * (63/64)^3 = 30,523,315` ceiling — 1.5x of
+    ///      slack, and 1.8x over what a full-cap conviction actually spends.
+    ///      THE APPROVER CAP IS UNCHANGED: `MAX_APPROVERS_PER_PROPOSAL` is
+    ///      also the size of the cohort that can underwrite one proposal, so
+    ///      cutting it would cut coverage capacity, and the measurement shows
+    ///      nothing required that. `test_slashGasFloorFitsRobinhoodMaxTxGas`
+    ///      is the CI tripwire that keeps this true.
     uint256 public constant SLASH_GAS_PER_APPROVER = 180_000;
     uint256 public constant SLASH_GAS_BASE = 2_000_000;
 
@@ -176,10 +241,8 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///         `authorizedSlasher`. Owner-set after construction because the
     ///         role is granted on sWOOD's side and the two are wired in either
     ///         order at deploy time.
-    /// @dev    The compensation escrow is NOT named here: it is owner-set state
-    ///         on sWOOD, deliberately not a `slashToEscrow` argument, so this
-    ///         game can never redirect the escrow portion of a slash it
-    ///         triggers to anywhere but that owner-configured sink.
+    /// @dev    There is no sink to name: slash proceeds burn inside sWOOD, so
+    ///         this game cannot redirect them anywhere at all.
     ///
     ///         This game CAN name a caller-chosen conviction-bounty recipient
     ///         (`slashToEscrow`'s `bountyTo`/`bountyBps`) — that channel has to
@@ -600,17 +663,35 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         }
         if (_verdictAlreadyCollected(key, accused)) revert AlreadyConvicted();
 
-        // Reservations are not liability: `recordApproval` deliberately
-        // over-reserves (every approver books up to full coverage, since any
-        // one might end up carrying it alone), so the sum above exceeds what a
-        // conviction could ever take, growing with the approver count. The
-        // bond is sized to the actual allocation instead — capped, not
-        // replaced: an under-covered cohort is still priced on what it
-        // pledged. A `liabilityUsd` call failure is swallowed rather than
-        // reverted: an unpriced feed must not make filing impossible during
-        // exactly the market stress a drain happens in, and over-charging the
-        // challenger via the fallback is recoverable while being unable to
-        // file at all is not.
+        // RESERVATIONS ARE NOT LIABILITY. The sum above is what
+        // the cohort RESERVED, and `recordApproval` deliberately over-reserves —
+        // every approver books up to the full coverage, because at vote time any
+        // one of them might end up carrying it alone. So it exceeds what a
+        // conviction could ever take, by a factor that GROWS WITH THE APPROVER
+        // COUNT: five well-funded approvers on one proposal reserve five times
+        // its need. Sizing the bond off it made a proposal more expensive to
+        // challenge the better covered it was, while the recoverable total
+        // stayed flat — the exact inversion of D4, which sizes the bond to the
+        // exposure a filing freezes. `liabilityUsd` is that exposure, asked for
+        // once.
+        //
+        // NOTE — the slash no longer shares this basis. `slashBpsFor` used to
+        // price convictions against the same ALLOCATION, which is why this
+        // comment once cited it as precedent; it is now punitive and reads no
+        // allocation at all. The bond stays allocation-sized regardless: what
+        // it must be proportional to is the exposure a filing FREEZES, which is
+        // unchanged by how hard the eventual conviction bites.
+        //
+        // CAPPED, NOT REPLACED: an under-covered cohort whose reservations fall
+        // short of the need is still priced on what it pledged, because that is
+        // all there is to take.
+        //
+        // CAUGHT, because `liabilityUsd` reads the ASSET feed and this function
+        // otherwise reads none. A stale feed must not make filing impossible
+        // during exactly the market stress a drain happens in — the same
+        // liveness hole the ledger already documents on the slash path. Falling
+        // back to the reservation sum over-charges the challenger, which is
+        // recoverable; being unable to file at all is not.
         try exposureLedger.liabilityUsd(governor, proposalId) returns (uint256 liability) {
             if (liability != 0 && liability < coverageUsd) coverageUsd = liability;
         } catch {}
@@ -876,10 +957,11 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         }
     }
 
-    /// @dev The challenge passed: either nobody contested inside the window
-    ///      and the silence is the adjudication, or the court ruled guilty.
-    ///      Both slash the covering approvers into the compensation escrow,
-    ///      demote the named adapter, and return the challenger's bond.
+    /// @dev THE CHALLENGE PASSED. Either nobody contested inside the window and
+    ///      the silence IS the adjudication (§3.4, D1), or the court ruled guilty
+    ///      (§3.5). Both say the same thing about the accused, so both slash the
+    ///      covering approvers (proceeds burned), demote the named adapter, and
+    ///      return the challenger's bond.
     ///
     ///      Two entries, two pool states, and the status is what separates
     ///      them:
@@ -927,14 +1009,18 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         _releaseFreeze(key, governor, proposalId);
 
         uint256 slashedWood;
-        uint256 caseId;
-        // Asked of sWOOD, not only the local flag: the local flag catches the
-        // concurrent-challenge case, sWOOD's own view catches an earlier
-        // deployment having already collected this cohort. `file`'s door-time
-        // check cannot assume it stays true, since the owner may re-point
-        // sWOOD afterward. Diverting here rather than letting `slashToEscrow`
-        // revert matters: a revert would leave the challenge in `Filed` with
-        // no terminal exit, taking the bond, pool and coverage freeze with it.
+        // ASKED OF sWOOD, NOT ONLY OF THE LOCAL FLAG. The
+        // local flag catches the concurrent-challenge case this branch was
+        // written for; the sWOOD read catches the case it could not — an EARLIER
+        // DEPLOYMENT of this game having already collected this cohort under the
+        // same, deployment-independent `caseKey`. `file` refuses such a filing at
+        // the door, but that gate reads the slasher wired AT FILING TIME and the
+        // owner may re-point sWOOD (or the old game may settle a concurrent
+        // challenge) at any point afterwards, so the settle path cannot assume it
+        // was reachable. Diverting here rather than letting `slashToEscrow`
+        // revert is the whole point: a revert leaves the challenge in `Filed`
+        // with no terminal exit at all, taking the bond, the counter-bond pool
+        // and the coverage freeze with it.
         if (_verdictAlreadyCollected(key, approvers)) {
             // A concurrent challenge, or a previous deployment, already
             // collected this proposal's one liability, so the conviction is
@@ -953,15 +1039,33 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
                 revert InsufficientSlashGas();
             }
 
-            // The slash basis is the proposal's EXECUTION instant, pinned at
-            // filing — never `filedAt`. `_slashOne` sizes the own-stake leg off
-            // a checkpoint at `openedAt`, and an accused approver could zero
-            // its own basis between the drain and the accusation with one
-            // reversible unstake request if the basis were anchored at
-            // `filedAt`. `executedAt` predates anything the accused could move
-            // in response to being accused, and is the correct basis for the
-            // delegated leg regardless. `executedAt - 1 < executedAt` keeps
-            // sWOOD's `snapshotTimestamp <= openedAt` bound satisfied.
+            // The slash basis is the proposal's EXECUTION
+            // instant, pinned at filing — never `filedAt`. `_slashOne` sizes the
+            // own-stake leg off `_stakeCheckpoints.upperLookupRecent(openedAt)`,
+            // and `requestUnstakeGuardian` pushes a ZERO checkpoint with no
+            // cooldown and no transfer. Anchored at `filedAt`, an accused
+            // approver zeroed its own basis with one reversible transaction
+            // between the drain and the accusation: a 100% conviction took
+            // nothing and burned nothing, after which
+            // `cancelUnstakeGuardian` put the stake back. `executedAt` predates
+            // any state the accused could move in response to being accused,
+            // and it is the more correct basis for the delegated leg besides —
+            // delegated capital at the drain, not at the accusation.
+            // `executedAt - 1 < executedAt` keeps sWOOD's
+            // `snapshotTimestamp <= openedAt` bound satisfied.
+            // ESCALATED CONVICTIONS ONLY (spec 2026-07-29 §2). On the silence
+            // path an honest filer and a liar are indistinguishable to this
+            // contract - both produce a real slash against a real cohort and
+            // both would collect - so any bounty there pays liars exactly as
+            // well as watchdogs, and the two constraints (make honest filing
+            // profitable / keep false filing unprofitable) are contradictory at
+            // every rate. The escalated path separates them: the accused
+            // contested and lost on the merits, and a liar who picks a guardian
+            // that is paying attention forfeits the whole bond on `NotGuilty`.
+            // That is why the bounty is safe here at any size, and why no
+            // anti-abuse bound is needed - PROVIDED the pool that bought the
+            // escalation was actually funded by one of the ACCUSED (see
+            // `contested` below; PR review 2026-07-29 IMPORTANT-1).
             //
             // Bounty is paid only on an escalated conviction where the pool
             // was actually funded by one of the ACCUSED (`contested` below).
@@ -988,28 +1092,42 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             // at the accused-set size and already looped under the gas floor
             // checked above.
             //
-            // Reads `_contributed` after `c.status = Status.Settled` and
-            // after `_releaseFreeze`'s external call into
-            // `exposureLedger.unfreezeCoverage` — safe because
-            // `claimableContribution` returns 0 for a `Settled` challenge
-            // whose pool is complete, so nothing a re-entrant ledger could
-            // trigger can zero `_contributed` before this scan reads it.
+            // REENTRANCY NOTE (reviewer Minor): this reads `_contributed`
+            // AFTER `c.status = Status.Settled` and after `_releaseFreeze`'s
+            // external call into `exposureLedger.unfreezeCoverage`. That is
+            // safe today only because `claimableContribution` returns 0 for a
+            // `Settled` challenge whose pool is complete (`c.counterBondWood
+            // == c.bondWood`, the exact case reachable here), so nothing a
+            // re-entrant ledger could trigger can zero `_contributed` before
+            // this scan reads it. A future change to that view's Settled
+            // branch would silently reopen the bounty to a since-refunded
+            // "contributor".
+            //
+            // The PAYOUT branch below stays keyed on `escalated` alone: a
+            // self- or sybil-disputed win still returns the challenger's own
+            // bond and pool (nothing new happens there) - this only closes the
+            // BOUNTY channel on top of it.
+            // EVERY contributing approver is recorded, not just the first one
+            // found. sWOOD caps the bounty at their SUMMED slash, so the scan
+            // must be complete: stopping early would make the cap depend on
+            // array order, and a genuine defence funded by several approvers
+            // would be capped at whichever one happened to be listed first.
+            bool[] memory contestors = new bool[](approvers.length);
             bool contested;
             if (escalated) {
                 for (uint256 i = 0; i < approvers.length; ++i) {
                     if (_contributed[challengeId][approvers[i]] != 0) {
+                        contestors[i] = true;
                         contested = true;
-                        break;
                     }
                 }
             }
-            (slashedWood, caseId) = swood.slashToEscrow(
+            slashedWood = swood.slashVerdict(
                 key,
                 c.executedAt,
                 approvers,
                 slashBpsPer,
-                c.vault,
-                c.executedAt - 1,
+                contestors,
                 contested ? c.challenger : address(0),
                 contested ? c.convictionBountyBpsAtFiling : 0
             );
@@ -1084,7 +1202,7 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             // single reverting recipient can no longer brick the resolution.
             _bookRefund(challengeId, pool);
         }
-        emit ChallengeSettled(challengeId, slashedWood, caseId);
+        emit ChallengeSettled(challengeId, slashedWood);
     }
 
     /// @dev Drops this challenge's hold on the proposal's coverage, unfreezing

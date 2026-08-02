@@ -104,17 +104,20 @@ interface IExposureLedger {
     /// @notice Per-approver slash rates for a proposal, in bps of each
     ///         guardian's own slashable stake, positionally aligned with the
     ///         returned approver list.
-    /// @dev    Feeds `IStakedWood.slashToEscrow` directly. Each rate is that
-    ///         guardian's booked coverage divided by their live slashable bond
-    ///         — both USD, so the quotient is dimensionally unitless, but both
-    ///         operands are priced: the numerator reads the asset's Chainlink
-    ///         feed behind a `StalePrice` gate (a stale feed makes the
-    ///         conviction unpriceable and this view reverts), and the
-    ///         denominator is priced by `woodPriceX8()` — Chainlink with the
-    ///         haircut, owner-set `woodUsdPriceX8` only as the degraded
-    ///         fallback. See the implementation natspec for the liveness and
-    ///         governance-trust consequences. A guardian who booked nothing
-    ///         returns 0 and is therefore slashed nothing.
+    /// @dev    Feeds `IStakedWood.slashVerdict` directly. PUNITIVE: every
+    ///         approver still holding a live commitment returns the full
+    ///         `BPS_DENOMINATOR`, which `_slashOne` then clamps into
+    ///         `[minSlashBps, maxSlashBps]` — so the severity ceiling is
+    ///         applied at one governance-controlled site rather than read
+    ///         twice. A guardian who booked nothing, or released by changing
+    ///         their vote, returns 0 and is slashed nothing.
+    ///
+    ///         The rate is INDEPENDENT of the loss: it reads no required
+    ///         coverage, no allocation, and no price feed. That last point is
+    ///         a liveness property worth keeping — the allocation this
+    ///         replaced priced both operands, so a stale asset feed made a
+    ///         conviction unpriceable and reverted this view, precisely during
+    ///         the market stress a drain happens in.
     function slashBpsFor(address governor, uint256 proposalId)
         external
         view
@@ -130,12 +133,13 @@ interface IExposureLedger {
 
     /// @notice What a conviction on this proposal can ACTUALLY take, in USD-18 —
     ///         the cohort's whole liability, not the sum of what it reserved.
-    /// @dev    Summing `approversOf` overstates this by a factor that grows
-    ///         with the approver count: `recordApproval` deliberately reserves
-    ///         up to the full coverage from every approver, because at vote
-    ///         time any one of them might end up carrying it alone.
-    ///         `allocatedUsd` and `slashBpsFor` already price against the
-    ///         allocation for exactly that reason.
+    /// @dev    Summing `approversOf` overstates this by a factor that GROWS WITH
+    ///         THE APPROVER COUNT: `recordApproval` deliberately reserves up to
+    ///         the full coverage from every approver, because at vote time any
+    ///         one of them might end up carrying it alone. `allocatedUsd`
+    ///         prices against the allocation for exactly that reason.
+    ///         (`slashBpsFor` once did too; it is now punitive and prices
+    ///         against nothing.)
     ///
     ///         Exposes the same figure as one number, so callers outside the
     ///         ledger need not re-derive the reservation/allocation
