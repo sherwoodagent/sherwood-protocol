@@ -36,7 +36,7 @@ interface IChallengeGameLedger {
  *         compensation. Convictions BURN the accused's bond, and burned WOOD
  *         raises every remaining holder's share of the supply — so a
  *         WOOD-heavy party profits from ANY conviction, on top of the
- *         conviction bounty, and profits whether or not the accused was
+ *         prosecutor's fee, and profits whether or not the accused was
  *         actually guilty.
  *
  *         That turns "can this court be swayed?" from a FAIRNESS question into
@@ -605,7 +605,7 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///      `finalize` then returns `Inconclusive` — no slash, no `_convicted`
     ///      mark, no adapter demotion, counter-bond returned whole, coverage
     ///      freeze released — and the attacker never voted, never coordinated,
-    ///      and is never slashable (`slashToEscrow` only ever touches the
+    ///      and is never slashable (`slashVerdict` only ever touches the
     ///      approver array), recovering its capital after the cooldown.
     ///
     ///      THIS IS NOT THE ALREADY-ACCEPTED ADDRESS-SPLITTING RISK, which is

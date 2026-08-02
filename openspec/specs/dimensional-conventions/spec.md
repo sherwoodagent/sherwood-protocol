@@ -21,7 +21,7 @@ Dollar values (`{USD}`) SHALL always be carried as `D18{USD}` in this layer, and
 - **THEN** it is a violation — the two producers are the only places asset/WOOD quantities are lifted to `D18{USD}`
 
 ### Requirement: WOOD amounts are 18-decimal wei of a plain ERC20
-`{WOOD}` quantities SHALL be WOOD wei (18 decimals), and WOOD SHALL be assumed a plain ERC20 — no fee-on-transfer, no rebasing (asserted in `CompensationEscrow`'s header). Carriers: `Guardian.stakedAmount`, `totalGuardianStake`, `minGuardianStake`, `minOwnerStake`, `bondWood`, `counterBondWood`, `bondedWood`, `forfeitedWood`, `unclaimedWood`, `Case.proceeds`, `Case.redeemed`, `totalEscrowed`.
+`{WOOD}` quantities SHALL be WOOD wei (18 decimals), and WOOD SHALL be assumed a plain ERC20 — no fee-on-transfer, no rebasing. Carriers: `Guardian.stakedAmount`, `totalGuardianStake`, `minGuardianStake`, `minOwnerStake`, `bondWood`, `counterBondWood`, `bondedWood`, `forfeitedWood`, `unclaimedWood`, `Case.proceeds`, `Case.redeemed`, `totalEscrowed`.
 
 #### Scenario: Non-plain token substituted
 - **WHEN** a fee-on-transfer or rebasing token is used where `{WOOD}` is expected
@@ -126,7 +126,7 @@ The `{ASSET}/{SHARE}` vault conversion rate SHALL be materialized as the frozen 
 - **THEN** later vault activity changes the payout — the frozen pair exists so it cannot
 
 ### Requirement: Per-approver slash rate rounds up and is positional
-`bps{slash}` SHALL be `ceil(USD18{allocated} × 10_000 / USD18{bond})`, clamped to `10_000` (`slashBpsFor`) — rounding UP toward the protocol. It SHALL be consumed POSITIONALLY by `StakedWood.slashToEscrow`: alignment with the approver array is load-bearing.
+`bps{slash}` SHALL be the severity ceiling for every approver holding a live commitment (`slashBpsFor`) — punitive, not a share of the loss, so it derives from no USD quantity and reads no price. It SHALL be consumed POSITIONALLY by `StakedWood.slashVerdict`: alignment with the approver array, and with the parallel `contestors` array, is load-bearing.
 
 #### Scenario: Array misalignment
 - **WHEN** the slash-bps array order diverges from the approver array order
@@ -152,13 +152,6 @@ The `{ASSET}/{SHARE}` vault conversion rate SHALL be materialized as the frozen 
 #### Scenario: Exiting guardian slashed correctly
 - **WHEN** a guardian who requested unstake (votable trace zeroed) is slashed for a pre-exit approval
 - **THEN** the slash reads the liability trace via `Math.max` and lands — reading the votable trace alone would find zero
-
-### Requirement: Compensation apportionment uses a cached snapshot supply
-`SHARE{votes}` — vault `ERC20Votes` weight at a past timestamp — SHALL be the compensation apportionment numerator: `proceeds × votes / snapshotSupply` yields `{WOOD}` (`CompensationEscrow`), with `Case.snapshotSupply` cached at case open so a past snapshot cannot change.
-
-#### Scenario: Live supply in the denominator
-- **WHEN** apportionment divides by the live total supply instead of the cached `Case.snapshotSupply`
-- **THEN** post-open mints/burns distort every claim — the cache exists to freeze the denominator
 
 ### Requirement: The two epoch clocks are not comparable
 `{epoch}` SHALL be a dimensionless bucket index, `(block.timestamp - epochGenesis) / epochLength`. Two independent epoch clocks exist and SHALL NOT be compared or mixed: `ExposureLedger.epochLength` (immutable) and `GuardianRegistry.EPOCH_DURATION` (7 days).
