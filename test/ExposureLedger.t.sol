@@ -5,6 +5,11 @@ import {Test} from "forge-std/Test.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {ExposureLedger} from "src/ExposureLedger.sol";
 import {IExposureLedger} from "src/interfaces/IExposureLedger.sol";
+import {
+    MockWoodTwapOracle,
+    DirtyFlagWoodTwapOracle,
+    ShortReturnWoodTwapOracle
+} from "test/mocks/MockWoodTwapOracle.sol";
 
 /// @dev Minimal sWOOD stub exposing exactly the reads the ledger consumes.
 contract MockSwood {
@@ -192,12 +197,38 @@ contract ExposureLedgerTest is Test {
     MockGovernorForLedger internal mgov;
     address internal usdgAsset;
 
+    // ── FIXTURE: THE PRODUCTION CONFIGURATION, CAP ABOVE MARKET ──
+    //
+    // The 2026-08-01 audit's sharpest finding was about this fixture rather
+    // than about the contract: `grep setWoodTwapOracle test/` returned NOTHING,
+    // and the price the ledger served was the governance scalar itself — the
+    // one configuration in which "the market may only lower the price" is
+    // trivially true, because there was no market. Every claim downstream
+    // rested on a `min` that no test ever exercised.
+    //
+    // So the fixture now ships what production ships: a live market source at
+    // MARKET_X8, and the cap at CAP_X8 = 2x above it, NON-BINDING. Reads
+    // resolve to MARKET_X8, which is the same $0.05 every existing assertion in
+    // this file was written against — the numbers did not move, the reason they
+    // hold did.
+    //
+    // A test that wants the cap to bind says so, by lowering it (that is the
+    // emergency brake) or by pushing the market above it.
+    uint256 internal constant MARKET_X8 = 0.05e8;
+    uint256 internal constant CAP_X8 = 0.1e8;
+
+    MockWoodTwapOracle internal twap;
+
     function setUp() public {
         swood = new MockSwood();
         // epochLength 28d immutable; genesis = deploy timestamp.
         ledger = new ExposureLedger(owner, address(swood), 28 days);
-        vm.prank(owner);
-        ledger.setWoodUsdPrice(0.05e8); // $0.05, conservative haircut price
+        twap = new MockWoodTwapOracle(MARKET_X8);
+        vm.startPrank(owner);
+        ledger.setWoodUsdPrice(CAP_X8);
+        ledger.setWoodTwapOracle(address(twap));
+        vm.stopPrank();
+        assertEq(ledger.woodPriceX8(), MARKET_X8, "fixture must price off the market, not the cap");
     }
 
     function test_slashableBondUsd_ownStakeAtPrice() public {
@@ -207,11 +238,43 @@ contract ExposureLedgerTest is Test {
         assertEq(ledger.slashableBondUsd(guardian), 5_000e18);
     }
 
-    function test_slashableBondUsd_zeroWhenPriceUnset() public {
+    /// @notice FINDING 7. An unset cap is NOT "no cap", and it is not a $0
+    ///         valuation either — it is a revert.
+    ///
+    /// @dev    Reading zero as "uncapped" would make the single most likely
+    ///         misconfiguration (a ledger deployed before governance seeded the
+    ///         number) the one state in which a ~$438k pool prices every bond
+    ///         without bound. Reading it as a $0 price, which is what this test
+    ///         used to assert, is quieter but also wrong: it values every bond
+    ///         at nothing while every call still succeeds, and `effectiveTotal
+    ///         == 0` marks a challenge convicted while recovering nothing.
+    ///         Fail LOUD on a state a deploy pre-flight already refuses.
+    function test_woodPrice_zeroCapRevertsRatherThanUncappingOrZeroing() public {
         ExposureLedger fresh = new ExposureLedger(owner, address(swood), 28 days);
         swood.setStake(guardian, 100_000e18);
-        // fail-closed: unset price values every bond at $0 (nothing can be approved)
-        assertEq(fresh.slashableBondUsd(guardian), 0);
+
+        // Cap unset AND a perfectly healthy market source wired: the market
+        // alone is not enough, because nothing would be bounding it.
+        vm.prank(owner);
+        fresh.setWoodTwapOracle(address(twap));
+
+        vm.expectRevert(IExposureLedger.NoWoodPrice.selector);
+        fresh.slashableBondUsd(guardian);
+        vm.expectRevert(IExposureLedger.NoWoodPrice.selector);
+        fresh.woodPriceX8();
+    }
+
+    /// @notice The other half of the same rule: a cap without any market source
+    ///         reverts too. `woodUsdPriceX8` is never served as a price, so
+    ///         "governance number only" is not a working configuration.
+    function test_woodPrice_capAloneIsNotAPrice() public {
+        ExposureLedger fresh = new ExposureLedger(owner, address(swood), 28 days);
+        swood.setStake(guardian, 100_000e18);
+        vm.prank(owner);
+        fresh.setWoodUsdPrice(CAP_X8);
+
+        vm.expectRevert(IExposureLedger.NoWoodPrice.selector);
+        fresh.woodPriceX8();
     }
 
     function test_setWoodUsdPrice_onlyOwner() public {
@@ -450,49 +513,63 @@ contract ExposureLedgerTest is Test {
         assertEq(ledger.openExposureUsd(guardian), 0, "nothing booked, but the vote survives");
     }
 
-    /// @notice M4 — the ceiling bounds one CALL; the interval bounds how many.
-    ///         Without the interval, N calls in a single multisig batch move the
-    ///         price 2^N — seven take $0.05 to $6.40 — and `set(0)` followed by
-    ///         `set(anything)` walked straight through the zero exemption in the
-    ///         same transaction.
+    /// @notice THE TRUST MODEL, PINNED. This contract imposes NO rate limit and
+    ///         no per-call size ceiling on the price cap. Rate limiting is
+    ///         enforced off-chain by a Zodiac Delay/Roles module on the owner
+    ///         Safe (issue #89, owner decision 2026-08-02).
     ///
-    ///         Only the UPWARD move is capped, deliberately: this price exists
-    ///         to absorb a WOOD crash, and rate-limiting the fall would leave
-    ///         bonds over-valued for as long as it took to walk the price down.
-    function test_setWoodUsdPrice_intervalAndUpwardCeiling() public {
+    /// @dev    THE POINT OF THIS TEST IS THAT IT PASSES. It replaces
+    ///         `test_setWoodUsdPrice_intervalAndUpwardCeiling`, which asserted
+    ///         a 1-day `MIN_PRICE_UPDATE_INTERVAL` and a `<= 2x` ceiling on
+    ///         raises. Both were removed, and they had to go TOGETHER: the
+    ///         interval was the only thing making the ceiling a rate limit,
+    ///         since N calls in one multisig batch move the price 2^N. Keeping
+    ///         the ceiling alone would have advertised a protection that the
+    ///         exact party it constrains can bypass in a single batch.
+    ///
+    ///         A future reviewer finding an unrestricted owner here should read
+    ///         this as DELIBERATE and go look at the Safe's module config,
+    ///         rather than filing it. The interval gated both directions while
+    ///         the size cap gated only raises, and after design revision 2
+    ///         lowering the cap IS the emergency action — so the limit sat
+    ///         directly on crisis response, and a routine morning adjustment
+    ///         spent the lever for the rest of the day.
+    function test_setWoodUsdPrice_isUnrestrictedOnChainByDesign() public {
         vm.startPrank(owner);
 
-        // Same block as the fixture's own update: the interval bites first.
-        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
+        // TWO CONSECUTIVE CALLS IN THE SAME BLOCK. This is the behaviour change:
+        // under the old interval the second one reverted, and `setUp` has
+        // already made a first call in this very block.
         ledger.setWoodUsdPrice(0.06e8);
+        ledger.setWoodUsdPrice(0.07e8);
+        assertEq(ledger.woodUsdPriceX8(), 0.07e8, "a same-block second move must now land");
 
-        skip(1 days);
-        ledger.setWoodUsdPrice(0.1e8); // exactly 2x -- allowed
-        assertEq(ledger.woodUsdPriceX8(), 0.1e8);
+        // A raise far beyond the old 2x ceiling, also same-block.
+        ledger.setWoodUsdPrice(100 * CAP_X8);
+        assertEq(ledger.woodUsdPriceX8(), 100 * CAP_X8, "no size ceiling on a raise");
 
-        // A second move in the same block, however small, is still refused.
-        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
-        ledger.setWoodUsdPrice(0.11e8);
+        // THE EMERGENCY PATH, which is what the removal was for: the brake can
+        // be pulled repeatedly as a crash develops, with no waiting.
+        ledger.setWoodUsdPrice(0.01e8);
+        ledger.setWoodUsdPrice(0.001e8);
+        assertEq(ledger.woodUsdPriceX8(), 0.001e8, "the brake can be pulled twice as a crash deepens");
 
-        skip(1 days);
-        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
-        ledger.setWoodUsdPrice(0.2000001e8); // a hair over 2x
-
-        ledger.setWoodUsdPrice(0.001e8); // a 100x collapse -- allowed, conservative
-        assertEq(ledger.woodUsdPriceX8(), 0.001e8);
-
-        // Zero stays settable: it is the emergency stop, and banning it would
-        // strand the price there (any non-zero value exceeds `0 * 2`).
-        skip(1 days);
+        // Zero remains the hard stop, and recovery from it is immediate rather
+        // than costing a day.
         ledger.setWoodUsdPrice(0);
         assertEq(ledger.woodUsdPriceX8(), 0);
-
-        // ...and the recovery that used to be a free second call now costs a day.
-        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
         ledger.setWoodUsdPrice(1_000_000e8);
-        skip(1 days);
-        ledger.setWoodUsdPrice(1_000_000e8); // exempt from the ceiling, not from time
+        assertEq(ledger.woodUsdPriceX8(), 1_000_000e8, "recovery from the stop is not gated either");
         vm.stopPrank();
+    }
+
+    /// @notice Ownership is still the whole access control, and it still bites.
+    ///         Removing the rate limit did not widen WHO may call these.
+    function test_priceLevers_remainOwnerOnly() public {
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(this)));
+        ledger.setWoodUsdPrice(1e8);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(this)));
+        ledger.setWoodHaircutBps(9_000);
     }
 
     /// @notice M1 — the challenge window must outlive the longest
@@ -608,11 +685,16 @@ contract ExposureLedgerTest is Test {
         assertEq(ledger.allocatedUsd(address(mgov), 1, guardian), 500e18, "settles once execution is moot");
     }
 
-    /// @notice N6 — the haircut is the second multiplier on the same quantity
-    ///         and was unbounded, so M4's rate limit was bypassable through it:
-    ///         a legal `[1, 10_000]` range with no interval moved every bond's
-    ///         valuation 10,000x in one transaction.
-    function test_setWoodHaircutBps_rateLimitedAndFloored() public {
+    /// @notice N6 — the haircut is the second multiplier on the same quantity,
+    ///         so its VALUE bounds still matter: an unbounded multiplier would
+    ///         move every bond's valuation 10,000x in one transaction.
+    ///
+    /// @dev    The value bounds STAY; the 1-day interval that used to sit
+    ///         alongside them is GONE (issue #89), so the same-block second
+    ///         move now lands. Bounds cost nothing in a crisis; a timer does,
+    ///         and tightening the haircut is a safe-direction move that a
+    ///         crisis is exactly when you want.
+    function test_setWoodHaircutBps_boundedButNotRateLimited() public {
         vm.startPrank(owner);
         vm.expectRevert(IExposureLedger.InvalidParameter.selector);
         ledger.setWoodHaircutBps(1); // below the floor -- a mis-set parameter
@@ -620,11 +702,7 @@ contract ExposureLedgerTest is Test {
         ledger.setWoodHaircutBps(10_001);
 
         ledger.setWoodHaircutBps(8_000);
-        // Second move in the same block is refused, as for the price itself.
-        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
-        ledger.setWoodHaircutBps(5_000);
-
-        skip(1 days);
+        // Same block, immediately again: allowed now, and this is the change.
         ledger.setWoodHaircutBps(5_000);
         vm.stopPrank();
         assertEq(ledger.woodHaircutBps(), 5_000);
@@ -867,9 +945,8 @@ contract ExposureLedgerTest is Test {
         ledger.setWoodUsdPrice(0.025e8);
         ledger.settleCoverage(address(mgov), 1);
 
-        // WOOD comes back. (Two hops would trip the 2x ceiling; 0.025 -> 0.05 is
-        // exactly 2x, and the interval is why the day passes first.)
-        skip(1 days);
+        // WOOD comes back, immediately — neither the interval nor the 2x
+        // ceiling exists any more (issue #89), so the recovery needs no wait.
         vm.prank(owner);
         ledger.setWoodUsdPrice(0.05e8);
 
@@ -936,14 +1013,18 @@ contract ExposureLedgerTest is Test {
     }
 
     /// @notice The fourth block-only path (siblings: M3, N1, N4). `_woodPrice`
-    ///         handled an UNSET and a STALE feed by falling back, but a bare
+    ///         handled an UNSET and a STALE feed by degrading, but a bare
     ///         `latestRoundData()` revert propagated through `slashableBondUsd`
     ///         into `recordApproval` — which reads the bond OUTSIDE the
     ///         try/catch guarding the asset feed — so approve votes reverted
     ///         while Block votes worked, and `requireApproveQuorum` reverted
     ///         with them, blocking execution protocol-wide. `setWoodFeed(0, …)`
     ///         was refused, so there was no path back either.
-    function test_woodPrice_revertingAggregatorFallsBackAndIsUnwireable() public {
+    ///
+    /// @dev    Re-pointed at revision 2: a dead aggregator now degrades to the
+    ///         TWAP rather than to the governance scalar. What must NOT change
+    ///         is that it degrades at all, silently and in the safe direction.
+    function test_woodPrice_revertingAggregatorDegradesToTheTwapAndIsUnwireable() public {
         _wireRecording();
         mgov.set(1_000e6);
 
@@ -951,9 +1032,10 @@ contract ExposureLedgerTest is Test {
         vm.prank(owner);
         ledger.setWoodFeed(address(dead), 1 days);
 
-        (uint256 px, bool usingFallback) = ledger.woodPriceDetail();
-        assertEq(px, 0.05e8, "falls back to the governance price");
-        assertTrue(usingFallback, "and says so, for monitoring");
+        (uint256 px, bool fromFeed, bool capBinding) = ledger.woodPriceDetail();
+        assertEq(px, MARKET_X8, "degrades to the TWAP, not to the cap");
+        assertFalse(fromFeed, "and says so, for monitoring");
+        assertFalse(capBinding, "the cap sits above market and does not bind");
         assertEq(ledger.slashableBondUsd(guardian), 5_000e18, "bonds still price");
 
         // The approve side is not silenced, and execution is not blocked.
@@ -962,21 +1044,21 @@ contract ExposureLedgerTest is Test {
         assertEq(ledger.openExposureUsd(guardian), 1_000e18);
         ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 1_000e6);
 
-        // A healthy feed still supersedes the governance number...
-        MockFeed healthy = new MockFeed(0.1e8, 8);
+        // A healthy feed is PREFERRED over the TWAP...
+        MockFeed healthy = new MockFeed(0.08e8, 8);
         vm.prank(owner);
         ledger.setWoodFeed(address(healthy), 1 days);
-        (uint256 p2, bool fb2) = ledger.woodPriceDetail();
-        assertEq(p2, 0.1e8);
-        assertFalse(fb2);
+        (uint256 p2, bool fromFeed2,) = ledger.woodPriceDetail();
+        assertEq(p2, 0.08e8, "a live aggregator supersedes the TWAP");
+        assertTrue(fromFeed2);
 
         // ...and zero is the unwire switch, which is the governance path back
-        // from an aggregator that has gone bad.
+        // from an aggregator that has gone bad. It lands on the TWAP.
         vm.prank(owner);
         ledger.setWoodFeed(address(0), 0);
-        (uint256 p3, bool fb3) = ledger.woodPriceDetail();
-        assertEq(p3, 0.05e8, "back on the governance price");
-        assertTrue(fb3);
+        (uint256 p3, bool fromFeed3,) = ledger.woodPriceDetail();
+        assertEq(p3, MARKET_X8, "back on the TWAP");
+        assertFalse(fromFeed3);
     }
 
     /// @notice Settle with a RELEASED approver still in the list. The loop must
@@ -1241,14 +1323,14 @@ contract ExposureLedgerTest is Test {
     ///         deliberately wraps only the ASSET-price read, so the WOOD read
     ///         reverting fails the vote — reproducing the block-only review that
     ///         three review rounds existed to eliminate.
-    function test_woodPrice_fallsBackWhenTheFeedReverts() public {
+    function test_woodPrice_degradesToTheTwapWhenTheFeedReverts() public {
         RevertingFeed dead = new RevertingFeed();
         vm.prank(owner);
         ledger.setWoodFeed(address(dead), 1 days);
 
-        (uint256 price, bool usingFallback) = ledger.woodPriceDetail();
-        assertTrue(usingFallback, "a reverting feed is a degraded feed, not a fatal one");
-        assertEq(price, 0.05e8, "falls back to the governance price");
+        (uint256 price, bool fromFeed,) = ledger.woodPriceDetail();
+        assertFalse(fromFeed, "a reverting feed is a degraded feed, not a fatal one");
+        assertEq(price, MARKET_X8, "degrades to the TWAP");
 
         // The property that matters: bonds still price, so approvals still work.
         swood.setStake(guardian, 100_000e18);
@@ -1258,17 +1340,17 @@ contract ExposureLedgerTest is Test {
     /// @notice Recovery must not require deploying a substitute aggregator.
     ///         `setWoodFeed` rejected `address(0)`, so once a bad feed was
     ///         wired there was no transaction that returned the ledger to its
-    ///         governance fallback.
-    function test_setWoodFeed_canClearBackToTheFallback() public {
+    ///         other source.
+    function test_setWoodFeed_canClearBackToTheTwap() public {
         RevertingFeed dead = new RevertingFeed();
         vm.startPrank(owner);
         ledger.setWoodFeed(address(dead), 1 days);
         ledger.setWoodFeed(address(0), 0); // clear
         vm.stopPrank();
 
-        (uint256 price, bool usingFallback) = ledger.woodPriceDetail();
-        assertTrue(usingFallback, "cleared feed reads the fallback");
-        assertEq(price, 0.05e8, "governance price restored");
+        (uint256 price, bool fromFeed,) = ledger.woodPriceDetail();
+        assertFalse(fromFeed, "cleared feed reads the TWAP");
+        assertEq(price, MARKET_X8, "market price restored");
     }
 
     /// @notice Clearing is an explicit two-zero move, so a mis-typed maxDelay
@@ -1279,20 +1361,19 @@ contract ExposureLedgerTest is Test {
         ledger.setWoodFeed(address(0), 1 days);
     }
 
-    // ── WOOD price: Chainlink feed with a governance fallback ─────────────
+    // ── WOOD price: market sources under a governance cap ──────────────────
 
-    /// @notice Once a feed is wired it supersedes the governance number, and
-    ///         the haircut is applied on top — collateral wants a floor, not a
+    /// @notice Once a feed is wired it is PREFERRED over the TWAP, and the
+    ///         haircut is applied on top — collateral wants a floor, not a
     ///         quote. An unhaircut oracle tracks WOOD UP and inflates every
-    ///         bond exactly when the market is frothy, which is what the old
-    ///         manually-maintained "<= 30-day low" existed to prevent.
-    function test_woodPrice_feedSupersedesGovernanceAndAppliesTheHaircut() public {
-        assertEq(ledger.woodPriceX8(), 0.05e8, "governance value while unwired");
+    ///         bond exactly when the market is frothy.
+    function test_woodPrice_feedPreferredOverTwapAndAppliesTheHaircut() public {
+        assertEq(ledger.woodPriceX8(), MARKET_X8, "TWAP-priced while no aggregator is wired");
 
-        MockFeed woodFeed = new MockFeed(0.08e8, 8); // market says $0.08
+        MockFeed woodFeed = new MockFeed(0.08e8, 8); // aggregator says $0.08
         vm.startPrank(owner);
         ledger.setWoodFeed(address(woodFeed), 1 days);
-        assertEq(ledger.woodPriceX8(), 0.08e8, "feed wins, no haircut by default");
+        assertEq(ledger.woodPriceX8(), 0.08e8, "feed wins over the TWAP, no haircut by default");
 
         ledger.setWoodHaircutBps(7_500); // value bonds at 75% of market
         vm.stopPrank();
@@ -1301,6 +1382,63 @@ contract ExposureLedgerTest is Test {
         // And it flows through to what a bond is worth.
         swood.setStake(guardian, 100_000e18);
         assertEq(ledger.slashableBondUsd(guardian), 6_000e18, "100k WOOD at the haircut price");
+    }
+
+    /// @notice THE INVARIANT, AND IT NEVER HAD A TEST. The market may only
+    ///         LOWER the WOOD price. Pushing the TWAP up must change nothing.
+    ///
+    /// @dev    This is the whole safety argument of the change: the pool behind
+    ///         the TWAP is ~$438k deep and moving its spot 2x costs ~$91k, so
+    ///         an unbounded read from it would put every guardian bond in the
+    ///         protocol on a market an attacker can afford to move. The audit
+    ///         found the shipped `min` pointed at a number the emergency-only
+    ///         doctrine required to be set HIGH and non-binding — a `min`
+    ///         against a number chosen never to bind is not a bound — and no
+    ///         test would have caught it, because none pumped the TWAP.
+    ///
+    ///         Asserted at 20x, well past any plausible manipulation, and on
+    ///         the derived quantity (`slashableBondUsd`) as well as the price,
+    ///         since the bond valuation is what a quorum actually consumes.
+    function test_woodPrice_pumpingTheTwapCannotRaiseThePrice() public {
+        swood.setStake(guardian, 100_000e18);
+        assertEq(ledger.woodPriceX8(), MARKET_X8);
+        assertEq(ledger.slashableBondUsd(guardian), 5_000e18);
+
+        // Just under the cap: still tracked, because the cap is not binding.
+        twap.setPrice(CAP_X8 - 1);
+        assertEq(ledger.woodPriceX8(), CAP_X8 - 1, "the market is followed right up to the cap");
+
+        // At the cap and far beyond it: pinned. The attack is inert.
+        twap.setPrice(CAP_X8);
+        assertEq(ledger.woodPriceX8(), CAP_X8, "exactly at the cap is not yet over it");
+        (,, bool bindingAtCap) = ledger.woodPriceDetail();
+        assertFalse(bindingAtCap, "equal is not binding");
+
+        twap.setPrice(20 * CAP_X8); // a 20x pump
+        assertEq(ledger.woodPriceX8(), CAP_X8, "a pumped TWAP CANNOT raise the price above the cap");
+        assertEq(ledger.slashableBondUsd(guardian), 10_000e18, "and the bond is capped with it");
+        (,, bool binding) = ledger.woodPriceDetail();
+        assertTrue(binding, "and the cap reports itself as binding");
+
+        // The other direction is followed all the way down, immediately and
+        // with no governance transaction — a crash must devalue bonds.
+        twap.setPrice(0.005e8);
+        assertEq(ledger.woodPriceX8(), 0.005e8, "a crash IS tracked");
+        assertEq(ledger.slashableBondUsd(guardian), 500e18);
+    }
+
+    /// @notice The same invariant on the Chainlink leg: the cap binds whichever
+    ///         source is live, so a compromised aggregator buys no more than a
+    ///         compromised pool.
+    function test_woodPrice_capBindsTheChainlinkFeedToo() public {
+        MockFeed woodFeed = new MockFeed(int256(int256(CAP_X8) * 20), 8);
+        vm.prank(owner);
+        ledger.setWoodFeed(address(woodFeed), 1 days);
+
+        (uint256 price, bool fromFeed, bool binding) = ledger.woodPriceDetail();
+        assertEq(price, CAP_X8, "a 20x aggregator is capped exactly like a 20x TWAP");
+        assertTrue(fromFeed);
+        assertTrue(binding);
     }
 
     /// @notice A crash is tracked IMMEDIATELY, which is the direction where lag
@@ -1317,20 +1455,19 @@ contract ExposureLedgerTest is Test {
         assertEq(ledger.slashableBondUsd(guardian), 500e18, "bond revalued with no transaction");
     }
 
-    /// @notice A stale or broken feed FALLS BACK rather than reverting. Failing
-    ///         closed would value every bond at $0 and halt approvals
-    ///         protocol-wide on a Chainlink hiccup — a liveness risk the manual
-    ///         price does not have. The fallback is itself a conservative floor,
-    ///         so the degraded path stays safe; the cost is that the governance
-    ///         number must be MAINTAINED, not abandoned once the feed is wired.
-    function test_woodPrice_fallsBackToGovernanceWhenTheFeedIsStale() public {
+    /// @notice A stale or broken aggregator DEGRADES TO THE TWAP rather than
+    ///         reverting. Failing closed on a Chainlink hiccup while another
+    ///         live source is sitting right there would halt approvals for no
+    ///         reason; the degraded path is a different market source, not a
+    ///         hand-maintained number, so it stays honest.
+    function test_woodPrice_degradesToTheTwapWhenTheFeedIsStale() public {
         MockFeed woodFeed = new MockFeed(0.08e8, 8);
         vm.prank(owner);
         ledger.setWoodFeed(address(woodFeed), 1 hours);
 
         assertEq(ledger.woodPriceX8(), 0.08e8, "fresh: feed");
         skip(2 hours);
-        assertEq(ledger.woodPriceX8(), 0.05e8, "stale: governance fallback, not zero");
+        assertEq(ledger.woodPriceX8(), MARKET_X8, "stale: the TWAP, not the cap and not zero");
 
         swood.setStake(guardian, 100_000e18);
         assertEq(ledger.slashableBondUsd(guardian), 5_000e18, "bonds still valued, approvals still possible");
@@ -1381,55 +1518,144 @@ contract ExposureLedgerTest is Test {
         ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 1_000e6);
     }
 
-    /// @notice FINDING 1 — the haircut must apply to the FALLBACK as well.
+    /// @notice The haircut must apply to EVERY branch, including the one where
+    ///         the cap is what bound.
     ///
-    ///         While `woodHaircutBps` defaults to `BPS_DENOMINATOR` both paths
-    ///         agree and nothing is visibly wrong, which is why the existing
+    ///         While `woodHaircutBps` sits at its 10_000 default every branch
+    ///         agrees and nothing is visibly wrong, which is why the original
     ///         tests passed either way. The inconsistency only appears once
-    ///         governance turns the haircut on: the healthy path valued bonds at
-    ///         0.8x spot while every degraded path returned the manual number
-    ///         raw — so enabling the safety feature made the fallback LESS
-    ///         conservative than the primary, in exactly the state where more
-    ///         margin is wanted.
-    function test_woodPrice_haircutAppliesToTheFallbackToo() public {
+    ///         governance turns the haircut on — so this test turns it on, and
+    ///         walks all three branches under it.
+    function test_woodPrice_haircutAppliesToEveryBranch() public {
         MockFeed woodFeed = new MockFeed(0.05e8, 8);
         vm.startPrank(owner);
         ledger.setWoodFeed(address(woodFeed), 1 hours);
         ledger.setWoodHaircutBps(8_000); // 20% haircut
         vm.stopPrank();
 
-        assertEq(ledger.woodPriceX8(), 0.04e8, "healthy path: 0.8x spot");
+        assertEq(ledger.woodPriceX8(), 0.04e8, "feed branch: 0.8x the aggregator");
 
-        skip(2 hours); // feed goes stale -> fallback
-        assertEq(ledger.woodPriceX8(), 0.04e8, "fallback: 0.8x the manual number, NOT raw 0.05e8");
+        skip(2 hours); // aggregator goes stale -> TWAP branch
+        assertEq(ledger.woodPriceX8(), 0.04e8, "TWAP branch: 0.8x the market, NOT raw 0.05e8");
 
-        // And it flows through to bond valuation, which is what the looser
+        twap.setPrice(20 * CAP_X8); // cap-bound branch
+        assertEq(ledger.woodPriceX8(), (CAP_X8 * 8_000) / 10_000, "capped branch: 0.8x the CAP, not the raw cap");
+
+        // And it flows through to bond valuation, which is what a looser
         // batching cap would have come from.
+        twap.setPrice(MARKET_X8);
         swood.setStake(guardian, 100_000e18);
-        assertEq(ledger.slashableBondUsd(guardian), 4_000e18, "not the 5_000 an unhaircut fallback would give");
+        assertEq(ledger.slashableBondUsd(guardian), 4_000e18, "not the 5_000 an unhaircut branch would give");
     }
 
-    /// @notice FINDING 2 — the degraded path must be observable. Without this,
-    ///         "feed healthy" and "feed dead for months, running on a manual
-    ///         number nobody has touched" are indistinguishable from outside,
-    ///         and monitoring cannot alert on a condition it cannot see.
-    function test_woodPriceDetail_reportsWhenRunningOnTheFallback() public {
-        (, bool fellBack) = ledger.woodPriceDetail();
-        assertTrue(fellBack, "no feed wired -> fallback");
+    /// @notice `woodHaircutBps` IS THE ALLOWANCE against the two overstatements
+    ///         this design accepts rather than eliminates — and at its 10_000
+    ///         default that allowance is exactly zero.
+    ///
+    /// @dev    The accepted overstatements are (a) the oracle's two legs not
+    ///         being contemporaneous, so an ETH drawdown inside the ~10.7h
+    ///         ETH/USD heartbeat makes WOOD/USD read high by roughly the ETH
+    ///         move — with no attacker capital involved; and (b) the residual
+    ///         crash lag of up to `twapWindow + maxTwapAge`. Both were accepted
+    ///         (owner decision 2026-08-02) because the alternative — coupling
+    ///         `ethUsdMaxDelay` to `twapWindow` — forces a ~12h averaging
+    ///         window and half a day of blindness to a WOOD crash.
+    ///
+    ///         That makes this parameter load-bearing, so the claim is pinned:
+    ///         a source overstated 2x, priced at a 5_000 haircut, values bonds
+    ///         at their TRUE worth rather than at double it. The cap is held
+    ///         deliberately NON-BINDING here — the overstated source lands
+    ///         exactly on it — so the haircut is doing the work alone and the
+    ///         test cannot pass for the wrong reason.
+    function test_woodHaircut_absorbsAnOverstatedMarketSource() public {
+        swood.setStake(guardian, 100_000e18);
+        uint256 trueBondUsd = 5_000e18; // 100k WOOD at the true $0.05
+
+        // The oracle reads 2x high — an ETH drawdown inside the heartbeat.
+        twap.setPrice(2 * MARKET_X8);
+        (,, bool binding) = ledger.woodPriceDetail();
+        assertFalse(binding, "the cap must NOT be what absorbs this, or the test proves nothing");
+        assertEq(ledger.slashableBondUsd(guardian), 2 * trueBondUsd, "no haircut: the overstatement lands in full");
+
+        // With the allowance seated, the same overstatement is absorbed.
+        vm.prank(owner);
+        ledger.setWoodHaircutBps(5_000);
+        assertEq(ledger.slashableBondUsd(guardian), trueBondUsd, "the haircut absorbs a 2x overstatement exactly");
+
+        // And it is paid for in normal operation, which is the trade: an
+        // unexaggerated market is valued at half.
+        twap.setPrice(MARKET_X8);
+        assertEq(ledger.slashableBondUsd(guardian), trueBondUsd / 2, "the allowance costs conservatism when healthy");
+    }
+
+    /// @notice THE SHIPPED VALUE, 7,000 — a 30% allowance. Pinned here as the
+    ///         behaviour it buys, not merely as a number in a deploy script.
+    ///
+    /// @dev    `DeployPlanB` seats this as its `DEFAULT_WOOD_HAIRCUT_BPS`, with
+    ///         a pre-flight refusing the ledger's own 10,000 default; 5,000 was
+    ///         rejected as too costly to guardian return on equity. What 7,000
+    ///         buys, exactly: every source is valued at 70%, so an overstatement
+    ///         up to 1/0.7 — about +42.9% — still values bonds at or below their
+    ///         true worth. A 30% overstatement, the sizing case, leaves margin.
+    function test_woodHaircut_shippedValueAbsorbsAThirtyPercentOverstatement() public {
+        swood.setStake(guardian, 100_000e18);
+        uint256 trueBondUsd = 5_000e18; // 100k WOOD at the true $0.05
+
+        vm.prank(owner);
+        ledger.setWoodHaircutBps(7_000);
+
+        // Healthy market: bonds carry the 30% discount. That is what the
+        // allowance costs in normal operation.
+        assertEq(ledger.woodPriceX8(), (MARKET_X8 * 7_000) / 10_000);
+        assertEq(ledger.slashableBondUsd(guardian), (trueBondUsd * 7_000) / 10_000);
+
+        // A 30% overstatement — the sizing case — still leaves bonds valued
+        // BELOW their true worth, which is the property being bought.
+        twap.setPrice((MARKET_X8 * 13_000) / 10_000);
+        (,, bool binding) = ledger.woodPriceDetail();
+        assertFalse(binding, "the cap must not be what absorbs this, or the test proves nothing");
+        assertLt(ledger.slashableBondUsd(guardian), trueBondUsd, "a 30% overstatement is fully absorbed");
+
+        // Break-even: at +1/0.7 the discount exactly cancels the error, so bonds
+        // land at true worth and not a wei above it.
+        twap.setPrice((MARKET_X8 * 10_000) / 7_000);
+        assertLe(ledger.slashableBondUsd(guardian), trueBondUsd, "break-even is the edge of the allowance");
+        assertApproxEqRel(ledger.slashableBondUsd(guardian), trueBondUsd, 1e12, "and it is genuinely AT the edge");
+
+        // Past it the overstatement starts landing — the allowance is finite,
+        // and the cap is the control that takes over.
+        twap.setPrice(2 * MARKET_X8);
+        assertGt(ledger.slashableBondUsd(guardian), trueBondUsd, "a 2x error exceeds a 30% allowance");
+    }
+
+    /// @notice Both degraded states must be observable. Without this, "TWAP
+    ///         healthy" and "cap drifted under market and has been pinning
+    ///         every bond for a month" are indistinguishable from outside, and
+    ///         monitoring cannot alert on a condition it cannot see.
+    function test_woodPriceDetail_reportsTheSourceAndWhetherTheCapBinds() public {
+        (, bool fromFeed, bool binding) = ledger.woodPriceDetail();
+        assertFalse(fromFeed, "no aggregator wired -> TWAP-priced");
+        assertFalse(binding, "cap above market -> not binding, which is the healthy shape");
 
         MockFeed woodFeed = new MockFeed(0.05e8, 8);
         vm.prank(owner);
         ledger.setWoodFeed(address(woodFeed), 1 hours);
-        (, fellBack) = ledger.woodPriceDetail();
-        assertFalse(fellBack, "fresh feed -> primary");
+        (, fromFeed,) = ledger.woodPriceDetail();
+        assertTrue(fromFeed, "fresh aggregator -> feed-priced");
 
         skip(2 hours);
-        (, fellBack) = ledger.woodPriceDetail();
-        assertTrue(fellBack, "stale feed -> fallback, and now visible");
+        (, fromFeed,) = ledger.woodPriceDetail();
+        assertFalse(fromFeed, "stale aggregator -> back on the TWAP, and now visible");
 
         woodFeed.set(0.05e8); // fresh again
-        (, fellBack) = ledger.woodPriceDetail();
-        assertFalse(fellBack, "recovered");
+        (, fromFeed,) = ledger.woodPriceDetail();
+        assertTrue(fromFeed, "recovered");
+
+        // The signal that the CAP has drifted below market: it binds, and stays
+        // bound, which means the market source has gone inert.
+        woodFeed.set(int256(int256(CAP_X8) * 2));
+        (,, binding) = ledger.woodPriceDetail();
+        assertTrue(binding, "cap under market -> binding, the alarm to raise the number");
     }
 
     /// @notice N11 — the propose-time horizon gate was fed `p.executeBy`, which
@@ -1720,9 +1946,6 @@ contract ExposureLedgerTest is Test {
         ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 5_000e6); // covered at $0.05
 
         vm.prank(owner);
-        // `setWoodUsdPrice` is rate-limited (review M4) and `setUp` already set
-        // one, so a second update waits out the interval.
-        skip(1 days);
         ledger.setWoodUsdPrice(0.005e8); // 10x crash — bond now worth $500
         vm.expectRevert(IExposureLedger.InsufficientApproveCoverage.selector);
         ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 5_000e6);
@@ -1845,10 +2068,14 @@ contract ExposureLedgerTest is Test {
         MockVaultForLedger vault = new MockVaultForLedger(usdgAsset);
         MockGovernorForLedger shortGov = new MockGovernorForLedger(address(vault));
         MockGovernorForLedger longGov = new MockGovernorForLedger(address(vault));
+        // Same production shape as the main fixture: market-priced at $0.05,
+        // cap 2x above it and not binding.
+        MockWoodTwapOracle ledTwap = new MockWoodTwapOracle(MARKET_X8);
         vm.startPrank(owner);
         led.setAssetFeed(usdgAsset, address(feed), 365 days);
         led.setGuardianRegistry(registry);
-        led.setWoodUsdPrice(0.05e8);
+        led.setWoodUsdPrice(CAP_X8);
+        led.setWoodTwapOracle(address(ledTwap));
         vm.stopPrank();
         swood.setStake(guardian, 400_000e18); // $20,000 budget
 
@@ -2073,5 +2300,275 @@ contract ExposureLedgerTest is Test {
         (address[] memory gs, uint256[] memory shares) = ledger.approversOf(address(mgov), 1);
         assertEq(gs.length, 0, "released approver is popped, not zeroed");
         assertEq(shares.length, 0);
+    }
+
+    // ── NoWoodPrice: the halting semantics, one test per consumer ──────────
+    //
+    // Revision 2 deleted the fallback price, so `NoWoodPrice` is REACHABLE in
+    // production: no Chainlink WOOD feed on 4663, plus a TWAP that has gone
+    // stale, and nothing can price a bond. The design's whole claim is that
+    // this is a clean fail-safe rather than a halt, and that claim is exactly
+    // one table of per-consumer decisions. Each row gets a test, because a
+    // silent flip of any of them reintroduces the block-only review that three
+    // review rounds were spent removing.
+
+    /// @dev Put the ledger into the "no market data at all" state that the
+    ///      halting table is about: no aggregator wired (the 4663 reality) and
+    ///      a TWAP reporting unavailable.
+    function _killAllPriceSources() internal {
+        twap.setAvailable(false);
+        vm.expectRevert(IExposureLedger.NoWoodPrice.selector);
+        ledger.woodPriceX8();
+    }
+
+    /// @notice THE LOAD-BEARING ROW. `recordApproval` must CATCH `NoWoodPrice`
+    ///         and book nothing.
+    ///
+    /// @dev    Reverting here disenfranchises the approve side while Block
+    ///         votes keep landing, so guardians could veto but never endorse
+    ///         and the proposal would pass optimistically anyway — the
+    ///         block-only review that reviews M3, N1 and N4 each removed, this
+    ///         time reintroduced through the price path. Booking nothing is the
+    ///         conservative half: the commitment is not made, so the
+    ///         execute-time quorum fails loudly instead.
+    function test_recordApproval_booksNothingWhenNoSourceCanPriceWood() public {
+        _wireRecording();
+        mgov.set(1_000e6);
+        _killAllPriceSources();
+
+        // MUST NOT REVERT.
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+
+        assertEq(ledger.openExposureUsd(guardian), 0, "unpriceable WOOD: booked nothing, vote survives");
+        (address[] memory gs,) = ledger.approversOf(address(mgov), 1);
+        assertEq(gs.length, 0, "and was not listed as a covering approver");
+
+        // The cap still binds at execute: nothing was booked, so the quorum
+        // cannot be met. Recovery is a real price coming back, not a retry.
+        twap.setAvailable(true);
+        vm.expectRevert(IExposureLedger.InsufficientApproveCoverage.selector);
+        ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 1_000e6);
+    }
+
+    /// @notice EXECUTION HALTS, and that is correct: no price means no proof of
+    ///         coverage, and executing on an unprovable coverage claim is the
+    ///         exact outcome the gate exists to refuse.
+    function test_requireApproveQuorum_revertsWhenNoSourceCanPriceWood() public {
+        _wireRecording();
+        mgov.set(1_000e6);
+
+        // Book real coverage first, so the revert is about the PRICE and not
+        // about an empty approver list.
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 1_000e6); // healthy
+
+        _killAllPriceSources();
+        vm.expectRevert(IExposureLedger.NoWoodPrice.selector);
+        ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 1_000e6);
+    }
+
+    /// @notice PROPOSAL CREATION HALTS. `SyndicateGovernor.propose` sizes the
+    ///         proposer bond through this view, so new risk cannot be admitted
+    ///         unpriced.
+    function test_proposerBondWood_revertsWhenNoSourceCanPriceWood() public {
+        _wireRecording();
+        assertGt(ledger.proposerBondWood(usdgAsset, 1_000e6), 0, "healthy: a bond is sizeable");
+
+        _killAllPriceSources();
+        vm.expectRevert(IExposureLedger.NoWoodPrice.selector);
+        ledger.proposerBondWood(usdgAsset, 1_000e6);
+    }
+
+    /// @notice The conviction-sizing views halt too. `ChallengeGame.file`
+    ///         catches `liabilityUsd` but then reads `woodPriceX8()` directly,
+    ///         so filing halts as well — acceptable, because the challenge
+    ///         window is 14 days against staleness measured in hours.
+    function test_allocatedAndLiabilityViews_revertWhenNoSourceCanPriceWood() public {
+        _wireRecording();
+        mgov.set(1_000e6);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+
+        _killAllPriceSources();
+        vm.expectRevert(IExposureLedger.NoWoodPrice.selector);
+        ledger.allocatedUsd(address(mgov), 1, guardian);
+        vm.expectRevert(IExposureLedger.NoWoodPrice.selector);
+        ledger.liabilityUsd(address(mgov), 1);
+    }
+
+    /// @notice The slash rail is OUT of the price's blast radius (PR #102), so
+    ///         a conviction is still computable through a total price outage.
+    ///         That is the property that let the fallback be deleted at all.
+    function test_slashBpsFor_survivesATotalPriceOutage() public {
+        _wireRecording();
+        mgov.set(1_000e6);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+
+        _killAllPriceSources();
+        (address[] memory gs, uint256[] memory bps) = ledger.slashBpsFor(address(mgov), 1);
+        assertEq(gs.length, 1);
+        assertEq(bps[0], 10_000, "punitive rate reads no price and is unaffected");
+    }
+
+    // ── The emergency lever ────────────────────────────────────────────────
+
+    /// @notice The brake works, AND IT WORKS UNDER A NON-DEFAULT HAIRCUT.
+    ///
+    /// @dev    Finding 6 (`_haircut(1) == 0`) passed CI only because the
+    ///         fixture left `woodHaircutBps` at 10_000, where the haircut is
+    ///         the identity and no truncation is possible. With a real haircut
+    ///         seated, a cap of 1 wei-X8 truncates to a price of ZERO — and
+    ///         zero is not "very cheap" to the consumers: `ChallengeGame.file`
+    ///         reverts `WoodPriceUnset` on it and `proposerBondWood` reverts
+    ///         `InvalidParameter`, so pulling the brake to a small non-zero
+    ///         value would have bricked the paths governance still needs.
+    ///         The floor at 1 keeps them alive at a valuation that is still,
+    ///         correctly, negligible.
+    function test_emergencyLever_lowersThePriceUnderANonDefaultHaircut() public {
+        _wireRecording(); // stakes the guardian and seats the USDG feed
+        vm.prank(owner);
+        ledger.setWoodHaircutBps(5_000); // the floor: half of market
+
+        assertEq(ledger.woodPriceX8(), MARKET_X8 / 2, "haircut seated, market still above the cap-free path");
+        assertEq(ledger.slashableBondUsd(guardian), 2_500e18);
+
+        // EVERY PULL BELOW HAPPENS IN THE SAME BLOCK, with no `skip`. That is
+        // the crisis shape issue #89 was about: a crash deepens faster than a
+        // daily interval allows, and under the old in-contract rate limit the
+        // second pull here reverted and the brake was spent until tomorrow.
+        //
+        // Pull the brake hard. The cap now binds and drags everything with it.
+        vm.prank(owner);
+        ledger.setWoodUsdPrice(0.001e8);
+        assertEq(ledger.woodPriceX8(), 0.0005e8, "the brake bites through the haircut");
+        assertEq(ledger.slashableBondUsd(guardian), 50e18, "every bond revalued");
+
+        // All the way down to a cap of 1 wei-X8: the haircut would truncate
+        // this to zero, which is the finding. It must floor at 1 instead.
+        vm.prank(owner);
+        ledger.setWoodUsdPrice(1);
+        assertEq(ledger.woodPriceX8(), 1, "floored at 1, NOT truncated to 0 by the haircut");
+        assertGt(ledger.proposerBondWood(usdgAsset, 1_000e6), 0, "the bond path stays alive");
+
+        // And zero is a STOP, not a $0 valuation.
+        vm.prank(owner);
+        ledger.setWoodUsdPrice(0);
+        vm.expectRevert(IExposureLedger.NoWoodPrice.selector);
+        ledger.woodPriceX8();
+    }
+
+    // ── Wiring the oracle ──────────────────────────────────────────────────
+
+    /// @notice The pair is VALIDATED before it is trusted. Four WOOD/WETH V3
+    ///         pools on 4663 are initialised-but-never-traded shells whose
+    ///         `getPool` returns a non-zero address, so "does it exist?" is not
+    ///         a check. The V2 analogue would price guardian collateral off an
+    ///         unrelated market.
+    function test_setWoodTwapOracle_refusesAnOracleWhosePairDoesNotValidate() public {
+        MockWoodTwapOracle bad = new MockWoodTwapOracle(MARKET_X8);
+        bad.setPairValid(false);
+        vm.prank(owner);
+        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
+        ledger.setWoodTwapOracle(address(bad));
+    }
+
+    /// @notice An EOA (or any codeless address) is refused before it is called.
+    ///         The extcodesize guard on a high-level call reverts in the
+    ///         caller's frame, where no `try` could catch it.
+    function test_setWoodTwapOracle_refusesACodelessAddress() public {
+        vm.prank(owner);
+        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
+        ledger.setWoodTwapOracle(makeAddr("notAContract"));
+    }
+
+    function test_setWoodTwapOracle_refusesAnOracleThatRevertsOnValidate() public {
+        MockWoodTwapOracle bad = new MockWoodTwapOracle(MARKET_X8);
+        bad.setValidateReverts(true);
+        vm.prank(owner);
+        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
+        ledger.setWoodTwapOracle(address(bad));
+    }
+
+    function test_setWoodTwapOracle_isOwnerOnly() public {
+        MockWoodTwapOracle other = new MockWoodTwapOracle(MARKET_X8);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(this)));
+        ledger.setWoodTwapOracle(address(other));
+    }
+
+    /// @notice Unwiring to zero is accepted — the rotation path — but it is NOT
+    ///         a safe resting state: with no aggregator on 4663 it leaves the
+    ///         ledger with no price source at all.
+    function test_setWoodTwapOracle_unwireIsAcceptedAndLeavesNoPriceSource() public {
+        vm.prank(owner);
+        ledger.setWoodTwapOracle(address(0));
+        assertEq(ledger.woodTwapOracle(), address(0));
+
+        vm.expectRevert(IExposureLedger.NoWoodPrice.selector);
+        ledger.woodPriceX8();
+
+        // Rotation: a replacement restores pricing in one transaction.
+        MockWoodTwapOracle replacement = new MockWoodTwapOracle(0.06e8);
+        vm.prank(owner);
+        ledger.setWoodTwapOracle(address(replacement));
+        assertEq(ledger.woodPriceX8(), 0.06e8);
+    }
+
+    /// @notice A wired oracle that later REVERTS on `consult()` must not take
+    ///         the price path down with it — it degrades to unavailable, which
+    ///         here means `NoWoodPrice` (no aggregator) rather than a bubbled
+    ///         `"oracle down"`.
+    function test_woodPrice_revertingOracleIsUnavailableRatherThanFatal() public {
+        twap.setConsultReverts(true);
+        vm.expectRevert(IExposureLedger.NoWoodPrice.selector);
+        ledger.woodPriceX8();
+
+        // With an aggregator wired, the same broken oracle costs nothing at all.
+        MockFeed woodFeed = new MockFeed(0.07e8, 8);
+        vm.prank(owner);
+        ledger.setWoodFeed(address(woodFeed), 1 days);
+        assertEq(ledger.woodPriceX8(), 0.07e8, "a dead oracle is invisible while the feed is healthy");
+    }
+
+    /// @notice THE DIRTY-BOOLEAN SHAPE, which is why the availability flag is
+    ///         decoded as a `uint256`.
+    ///
+    /// @dev    `abi.decode(ret, (uint256, bool))` REVERTS on any second word
+    ///         outside {0, 1}, and it reverts in the DECODER's frame — no `try`
+    ///         can catch it. A wired contract returning a dirty word would
+    ///         therefore take every price read down protocol-wide, turning a
+    ///         defensive wrapper into the very failure it was written to
+    ///         prevent. Decoded as a `uint256` and compared against 1, the same
+    ///         answer is simply "unavailable".
+    function test_woodPrice_dirtyAvailabilityWordIsUnavailableNotUndecodable() public {
+        DirtyFlagWoodTwapOracle dirty = new DirtyFlagWoodTwapOracle(MARKET_X8);
+        vm.prank(owner);
+        ledger.setWoodTwapOracle(address(dirty));
+
+        // NoWoodPrice — the ledger's own error — rather than a decode panic.
+        vm.expectRevert(IExposureLedger.NoWoodPrice.selector);
+        ledger.woodPriceX8();
+    }
+
+    /// @notice Short return data is rejected on LENGTH, before `abi.decode`
+    ///         gets a chance to revert on it.
+    function test_woodPrice_shortOracleReturnIsUnavailable() public {
+        ShortReturnWoodTwapOracle short = new ShortReturnWoodTwapOracle();
+        vm.prank(owner);
+        ledger.setWoodTwapOracle(address(short));
+
+        vm.expectRevert(IExposureLedger.NoWoodPrice.selector);
+        ledger.woodPriceX8();
+    }
+
+    /// @notice A zero TWAP is refused rather than served. `min(0, cap)` would
+    ///         drag every bond's valuation to nothing exactly as silently as
+    ///         the failure this design was built to remove.
+    function test_woodPrice_zeroTwapIsUnavailableRatherThanAZeroPrice() public {
+        twap.setPrice(0);
+        vm.expectRevert(IExposureLedger.NoWoodPrice.selector);
+        ledger.woodPriceX8();
     }
 }

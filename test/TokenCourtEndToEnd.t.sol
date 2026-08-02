@@ -23,6 +23,7 @@ import {ProtocolConfig} from "../src/ProtocolConfig.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "./mocks/MockAgentRegistry.sol";
+import {MockWoodTwapOracle} from "./mocks/MockWoodTwapOracle.sol";
 
 /// @dev Chainlink-shaped USD feed for the vault asset. Mirrors
 ///      `ChallengeEndToEndTest`'s own `ChallengeE2EFeed`.
@@ -212,8 +213,13 @@ contract TokenCourtEndToEndTest is Test {
         //    freshness are current.
         ledger = new ExposureLedger(ledgerOwner, address(swood), EPOCH_LENGTH);
         feed = new TCE2EFeed(1e8, 8); // $1.00, 8-dec
+        // Design revision 2: `woodUsdPriceX8` is a CAP, never a price. WOOD is
+        // valued from the TWAP oracle at $0.05, with the cap 2x ABOVE it and
+        // therefore NOT binding — the configuration production ships.
+        MockWoodTwapOracle woodTwap = new MockWoodTwapOracle(0.05e8);
         vm.startPrank(ledgerOwner);
-        ledger.setWoodUsdPrice(0.05e8); // conservative governance haircut
+        ledger.setWoodUsdPrice(0.1e8);
+        ledger.setWoodTwapOracle(address(woodTwap));
         ledger.setAssetFeed(address(usdg), address(feed), 365 days);
         ledger.setCoveredTvlCapUsd(10_000_000e18);
         ledger.setGuardianRegistry(address(registry));
