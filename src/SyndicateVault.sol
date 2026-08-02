@@ -1193,15 +1193,17 @@ contract SyndicateVault is
     // ==================== MANAGEMENT-FEE ACCRUAL ====================
 
     /// @dev Close off the elapsed interval at the base that applied during it,
-    ///      then restamp the base from live fund assets. Called on every event
-    ///      that can move the base: proposal execute, Lane A deposit, Lane A
-    ///      instant exit, and the custody-model share hooks.
+    ///      then restamp the base from live fund assets. Called on every
+    ///      mid-proposal event that can move the base — Lane A deposit and Lane
+    ///      A instant exit — and once more at settlement, via
+    ///      `consumeManagementAccrual`. Proposal execute opens the accrual
+    ///      rather than closing an interval, so it stamps the base directly
+    ///      through `startManagementAccrual`.
     ///
     ///      Restamping from `totalAssets()` rather than applying a per-event
-    ///      delta is what lets `strategyMint` / `strategyBurn` participate at
-    ///      all: those are denominated in SHARES, and reconstructing an asset
-    ///      delta from them mid-mutation is fragile. Reading the base from
-    ///      truth is both simpler and correct for the custody model.
+    ///      delta is deliberate: the base is read from truth, so it stays
+    ///      correct for any caller regardless of whether that caller can
+    ///      express its own effect as an asset delta.
     ///
     ///      The `_mgmtLastUpdate == 0` early return is load-bearing twice over:
     ///      it is the "no live proposal, no fee" rule, and it keeps
