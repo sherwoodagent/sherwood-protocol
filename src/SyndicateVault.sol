@@ -548,6 +548,47 @@ contract SyndicateVault is
     ///      anyway, and hard-reverting would brick vaults deployed without a
     ///      registry.
     function _guardBatchCalls(BatchExecutorLib.Call[] calldata calls) private view {
+        // ── PRIVILEGED-CALLEE GATE, ahead of everything else ──
+        //
+        // The batch runs under delegatecall, so every call carries
+        // `msg.sender == vault`. That is precisely the credential this vault's
+        // own trust boundaries check, which makes the vault and its queue
+        // reachable as batch TARGETS with full authority — `onlyVault` on the
+        // queue, and every `NotQueue`-style self-gate here, is satisfied by a
+        // batch that merely names them.
+        //
+        // No other meter catches it. `queue.queueRedeem(attacker, victimShares,
+        // pid)` mints a redeem claim against shares another owner escrowed
+        // while moving ZERO `asset()`: `netOutflow == 0` clears any
+        // `maxNetOutflow`, the reserve and buffer checks compare balances that
+        // never moved, and the selector is none of the four guarded below. The
+        // value leaves in a LATER transaction via `queue.claim`, which nothing
+        // meters. Coverage does not price it either — an uncertified target is
+        // tier 2, so `maxCapital = 1 wei` asks for ~$0.000002 of coverage, and
+        // any single approver clears that.
+        //
+        // BEFORE THE REGISTRY LOOKUP, DELIBERATELY. The selector guard below
+        // returns early for a governor with no `tierRegistry()` getter or an
+        // unset registry, and being unguarded there is a documented, accepted
+        // default. This check must not inherit that exemption: it is not
+        // pricing a call, it is refusing a capability, and a vault deployed
+        // without a registry needs it most.
+        //
+        // A TARGET CLASS, NOT A SELECTOR LIST. Enumerating today's reachable
+        // privileged functions would leave the next one added unprotected, and
+        // nothing a batch legitimately does names these two addresses as a
+        // target. `stampSettlement` shows why breadth matters — it is one-shot
+        // per pid, so one batch can pre-burn the settlement slot of proposals
+        // that have not happened yet and make `onProposalSettled` revert
+        // forever.
+        address q = _withdrawalQueue;
+        for (uint256 i = 0; i < calls.length; i++) {
+            address target = calls[i].target;
+            if (target == address(this) || (q != address(0) && target == q)) {
+                revert DisallowedBatchTarget(target);
+            }
+        }
+
         // onlyGovernor holds, so msg.sender IS the governor. staticcall (not a
         // typed call) so a governor without the getter degrades to "unset".
         (bool ok, bytes memory ret) = msg.sender.staticcall(abi.encodeCall(ISyndicateGovernor.tierRegistry, ()));
