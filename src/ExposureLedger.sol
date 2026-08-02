@@ -89,6 +89,36 @@ interface IRegistryApproversMinimal {
  *         That is deliberate and the halting semantics are chosen per consumer
  *         — see `IExposureLedger.NoWoodPrice`. In one line: votes still work,
  *         nothing new can be proposed, nothing can execute.
+ *
+ * @dev    ══ TRUST MODEL: THE OWNER IS UNRESTRICTED HERE, BY DESIGN ══
+ *
+ *         `setWoodUsdPrice` and `setWoodHaircutBps` impose NO rate limit and no
+ *         per-call size ceiling. The owner may move either lever to any legal
+ *         value, any number of times, within a single block.
+ *
+ *         THIS IS NOT AN OVERSIGHT AND IT IS NOT A REGRESSION TO FILE. Rate
+ *         limiting is enforced OFF-CHAIN, by a Zodiac Delay/Roles module on the
+ *         owner Safe (issue #89, owner decision 2026-08-02). Earlier revisions
+ *         carried a 1-day interval plus a 2x-per-raise ceiling on the cap; both
+ *         were removed together, because the interval was the only thing making
+ *         the ceiling a rate limit — N calls in one multisig batch move the
+ *         price 2^N — so keeping the ceiling alone would have advertised a
+ *         protection its own subject can bypass.
+ *
+ *         The reason for moving it rather than fixing it: the interval gated
+ *         BOTH directions, and after design revision 2 lowering the cap IS the
+ *         emergency action. A self-limit on an already-trusted owner therefore
+ *         cost crisis responsiveness — a routine morning adjustment spent the
+ *         lever and left no brake that afternoon — for very little gain.
+ *
+ *         AUDITORS AND REVIEWERS: the control you are looking for is in the
+ *         Safe's module configuration, which is invisible from this source. The
+ *         requirement it must satisfy is an ASYMMETRIC delay — raises delayed,
+ *         drops immediate — because a plain Delay module is symmetric and would
+ *         relocate the problem rather than solve it. `DeployPlanB` asserts the
+ *         owner is a contract rather than a bare EOA, which is the most this
+ *         contract can check; the rest is a runbook obligation recorded in
+ *         `openspec/specs/deployment-docs/spec.md`.
  */
 contract ExposureLedger is Ownable2Step, IExposureLedger {
     uint256 internal constant BPS_DENOMINATOR = 10_000;
@@ -115,10 +145,6 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      loop: narrower buckets release a guardian's short commitments
     ///      without waiting on their long ones, at the cost of a longer scan.
     uint256 internal constant MAX_SCAN_BUCKETS = 16;
-
-    /// @dev Minimum spacing between price updates. Without it the 2x ceiling
-    ///      bounds a single call and nothing bounds the number of calls.
-    uint256 internal constant MIN_PRICE_UPDATE_INTERVAL = 1 days;
 
     /// @dev Floor on `woodHaircutBps`. Valuing bonds below half of market is a
     ///      mis-set parameter, not a conservatism policy.
@@ -226,12 +252,14 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///         run with no margin, not a neutral one.
     uint256 public woodHaircutBps = BPS_DENOMINATOR;
 
-    /// @dev Stamps every `setWoodUsdPrice`. Zero means "never set" — the only
-    ///      state exempt from the interval.
-    uint64 public lastPriceUpdateAt;
-
-    /// @dev Stamps every `setWoodHaircutBps`; zero means "never set".
-    uint64 public lastHaircutUpdateAt;
+    // `lastPriceUpdateAt` and `lastHaircutUpdateAt` were REMOVED with the
+    // in-contract rate limit (issue #89). They stamped the two setters for the
+    // 1-day interval and nothing else read them — not this contract, not
+    // `IExposureLedger`, not any script or test. Safe to delete rather than
+    // leave as dead slots because `ExposureLedger` is NOT upgradeable
+    // (constructor + immutables, deployed directly by `DeployPlanB`, no proxy)
+    // and is not among the four layouts `script/check-layout-goldens.sh` pins,
+    // so no deployed lineage stores state at these offsets.
 
     address public guardianRegistry;
 
@@ -511,44 +539,47 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
 
     /// @notice Set the price CAP. This is the emergency brake: lowering it
     ///         lowers every bond's valuation immediately, in the safe
-    ///         direction, without bound.
+    ///         direction, without bound and without delay.
     ///
-    /// @dev BOUNDED AT 2x PER UPWARD CHANGE ONLY. Raising the cap widens how far
-    ///      a manipulated market source may be trusted, so it is the direction
-    ///      that needs bounding; lowering it only tightens quorums.
+    /// @dev ══ NO RATE LIMIT HERE, AND THAT IS DELIBERATE (issue #89) ══
+    ///
+    ///      THIS FUNCTION IMPOSES NO RATE LIMIT AND NO SIZE CEILING. An owner
+    ///      may set any value, any number of times, in the same block. Rate
+    ///      limiting is enforced OFF-CHAIN, by a Zodiac Delay/Roles module on
+    ///      the owner Safe. A reader looking for the self-limit that used to be
+    ///      here should look at the Safe's module configuration, not at this
+    ///      contract — see `openspec/specs/deployment-docs/spec.md`.
+    ///
+    ///      WHAT WAS REMOVED, AND WHY BOTH HAD TO GO TOGETHER. There was a
+    ///      1-day `MIN_PRICE_UPDATE_INTERVAL` plus a `newPriceX8 <= current * 2`
+    ///      ceiling on upward moves. The interval was what made the ceiling a
+    ///      rate limit at all — a 2x cap with no time component is not one,
+    ///      since N calls in a single multisig batch move the price 2^N. So the
+    ///      ceiling could not be kept alone: it would have advertised a
+    ///      protection that the exact party it constrains can trivially bypass,
+    ///      which is worse than no protection, because a reviewer stops looking.
+    ///
+    ///      WHY IT WENT RATHER THAN BEING FIXED. The interval gated BOTH
+    ///      directions while the size ceiling gated only one, so the code
+    ///      limited the size of a move by direction but its timing regardless.
+    ///      After design revision 2, lowering this cap IS the emergency action,
+    ///      so the limit sat directly on crisis response: a routine morning
+    ///      adjustment spent the lever and left no brake that afternoon. A
+    ///      self-limit on an already-trusted owner bought little and cost
+    ///      exactly the responsiveness it most needed to preserve.
+    ///
+    ///      WHAT THE OFF-CHAIN CONTROL MUST PRESERVE: the delay has to be
+    ///      ASYMMETRIC — raises delayed, drops immediate. A plain Zodiac Delay
+    ///      module is symmetric and would relocate this bug rather than fix it.
     ///
     ///      ZERO IS STILL ALLOWED, and under design revision 2 it is a HARD
     ///      STOP rather than a $0 valuation: `_woodPrice` reverts `NoWoodPrice`
     ///      on a zero cap, so proposing and executing halt while votes continue
     ///      to land. Rejecting zero would not prevent stopping the protocol —
     ///      1 wei-X8 comes close enough — and would strand the cap with no way
-    ///      back up. The FIRST cap is exempt from the 2x bound since there is
-    ///      nothing to bound it against.
-    ///
-    ///      Rate-limiting downward would be harmful — the brake exists to
-    ///      absorb a WOOD crash, and capping the recovery at 2x per transaction
-    ///      would leave bonds over-valued for as long as it took to walk the
-    ///      cap down, exactly when coverage matters most. The 1-day INTERVAL
-    ///      still applies in both directions; see issue #89, which asks whether
-    ///      it should apply downward at all.
+    ///      back up.
     function setWoodUsdPrice(uint256 newPriceX8) external onlyOwner {
         uint256 current = woodUsdPriceX8;
-        uint256 last = lastPriceUpdateAt;
-
-        // THE INTERVAL IS WHAT MAKES THIS A RATE LIMIT. A 2x ceiling with no
-        // time component is not one: N calls in a single multisig batch move
-        // the price 2^N. Only the first-ever price is exempt, since there is
-        // nothing to compare it against.
-        if (last != 0 && block.timestamp < last + MIN_PRICE_UPDATE_INTERVAL) revert InvalidParameter();
-
-        // The ceiling binds every upward move except a recovery from zero.
-        // Zero stays SETTABLE as the emergency stop; any non-zero value
-        // exceeds `0 * 2` so a stuck-at-zero price could never recover
-        // otherwise. The interval above closes the `set(0)` then
-        // `set(anything)` round trip, at a day's cost instead of two calls.
-        if (current != 0 && newPriceX8 > current * 2) revert InvalidParameter();
-
-        lastPriceUpdateAt = uint64(block.timestamp);
         emit WoodUsdPriceSet(current, newPriceX8);
         woodUsdPriceX8 = newPriceX8;
     }
@@ -627,18 +658,22 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         woodTwapOracle = oracle;
     }
 
-    /// @dev Bounded like every other bps setter here. A zero haircut would
-    ///      value bonds at $0 and brick approvals; above 100% would value them
-    ///      ABOVE market, overstating coverage.
-    /// @dev Rate-limited and floored like `setWoodUsdPrice`: an unbounded
-    ///      multiplier on the same quantity would let the owner move every
-    ///      bond's valuation 10,000x in a single transaction. A haircut below
-    ///      `MIN_WOOD_HAIRCUT_BPS` is a mis-set parameter rather than a policy.
+    /// @dev BOUNDED, BUT NOT RATE-LIMITED (issue #89). The `[MIN_WOOD_HAIRCUT_BPS,
+    ///      BPS_DENOMINATOR]` range stays — a haircut below the floor values
+    ///      every bond under half of market, which is a mis-set parameter
+    ///      rather than a policy, and above 100% would value bonds ABOVE market
+    ///      and overstate coverage. Those are VALUE bounds and they cost
+    ///      nothing in a crisis.
+    ///
+    ///      The 1-day interval that used to sit here is GONE, for the same
+    ///      reason it left `setWoodUsdPrice`: rate limiting is enforced
+    ///      off-chain by a Zodiac module on the owner Safe, and this contract
+    ///      deliberately imposes none. The interval was doubly awkward here —
+    ///      it gated the two levers independently, so spending one did not
+    ///      unlock the other, and tightening the haircut is a safe-direction
+    ///      move that a crisis is exactly when you want.
     function setWoodHaircutBps(uint256 newBps) external onlyOwner {
         if (newBps < MIN_WOOD_HAIRCUT_BPS || newBps > BPS_DENOMINATOR) revert InvalidParameter();
-        uint256 lastH = lastHaircutUpdateAt;
-        if (lastH != 0 && block.timestamp < lastH + MIN_PRICE_UPDATE_INTERVAL) revert InvalidParameter();
-        lastHaircutUpdateAt = uint64(block.timestamp);
         emit ParameterChangeFinalized(keccak256("woodHaircutBps"), woodHaircutBps, newBps);
         woodHaircutBps = newBps;
     }

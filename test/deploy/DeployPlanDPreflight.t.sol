@@ -198,9 +198,9 @@ contract DeployPlanDPreflightTest is Test {
     ///      Zero stays settable on the ledger (it is the emergency stop), so no
     ///      storage poke is needed.
     function test_preflight_bites_whenTheLedgerIsUnpriced() public {
-        // `setWoodUsdPrice` rate-limits to one move per `MIN_PRICE_UPDATE_INTERVAL`;
-        // the fixture already set a price in `setUp`, so move time first.
-        vm.warp(vm.getBlockTimestamp() + 2 days);
+        // No warp needed: `setWoodUsdPrice` is no longer rate-limited (issue
+        // #89 moved that to a Zodiac module on the owner Safe), so a second
+        // move in the same block `setUp` already used simply lands.
         vm.prank(DEFAULT_SENDER);
         ledger.setWoodUsdPrice(0);
         _runExpecting("PRE-FLIGHT: ExposureLedger.woodPriceX8 is 0");

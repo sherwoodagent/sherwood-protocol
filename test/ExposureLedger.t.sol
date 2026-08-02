@@ -513,49 +513,63 @@ contract ExposureLedgerTest is Test {
         assertEq(ledger.openExposureUsd(guardian), 0, "nothing booked, but the vote survives");
     }
 
-    /// @notice M4 — the ceiling bounds one CALL; the interval bounds how many.
-    ///         Without the interval, N calls in a single multisig batch move the
-    ///         price 2^N — seven take $0.05 to $6.40 — and `set(0)` followed by
-    ///         `set(anything)` walked straight through the zero exemption in the
-    ///         same transaction.
+    /// @notice THE TRUST MODEL, PINNED. This contract imposes NO rate limit and
+    ///         no per-call size ceiling on the price cap. Rate limiting is
+    ///         enforced off-chain by a Zodiac Delay/Roles module on the owner
+    ///         Safe (issue #89, owner decision 2026-08-02).
     ///
-    ///         Only the UPWARD move is capped, deliberately: this price exists
-    ///         to absorb a WOOD crash, and rate-limiting the fall would leave
-    ///         bonds over-valued for as long as it took to walk the price down.
-    function test_setWoodUsdPrice_intervalAndUpwardCeiling() public {
+    /// @dev    THE POINT OF THIS TEST IS THAT IT PASSES. It replaces
+    ///         `test_setWoodUsdPrice_intervalAndUpwardCeiling`, which asserted
+    ///         a 1-day `MIN_PRICE_UPDATE_INTERVAL` and a `<= 2x` ceiling on
+    ///         raises. Both were removed, and they had to go TOGETHER: the
+    ///         interval was the only thing making the ceiling a rate limit,
+    ///         since N calls in one multisig batch move the price 2^N. Keeping
+    ///         the ceiling alone would have advertised a protection that the
+    ///         exact party it constrains can bypass in a single batch.
+    ///
+    ///         A future reviewer finding an unrestricted owner here should read
+    ///         this as DELIBERATE and go look at the Safe's module config,
+    ///         rather than filing it. The interval gated both directions while
+    ///         the size cap gated only raises, and after design revision 2
+    ///         lowering the cap IS the emergency action — so the limit sat
+    ///         directly on crisis response, and a routine morning adjustment
+    ///         spent the lever for the rest of the day.
+    function test_setWoodUsdPrice_isUnrestrictedOnChainByDesign() public {
         vm.startPrank(owner);
 
-        // Same block as the fixture's own update: the interval bites first.
-        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
+        // TWO CONSECUTIVE CALLS IN THE SAME BLOCK. This is the behaviour change:
+        // under the old interval the second one reverted, and `setUp` has
+        // already made a first call in this very block.
         ledger.setWoodUsdPrice(0.06e8);
+        ledger.setWoodUsdPrice(0.07e8);
+        assertEq(ledger.woodUsdPriceX8(), 0.07e8, "a same-block second move must now land");
 
-        skip(1 days);
-        ledger.setWoodUsdPrice(2 * CAP_X8); // exactly 2x -- allowed
-        assertEq(ledger.woodUsdPriceX8(), 2 * CAP_X8);
+        // A raise far beyond the old 2x ceiling, also same-block.
+        ledger.setWoodUsdPrice(100 * CAP_X8);
+        assertEq(ledger.woodUsdPriceX8(), 100 * CAP_X8, "no size ceiling on a raise");
 
-        // A second move in the same block, however small, is still refused.
-        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
-        ledger.setWoodUsdPrice(2 * CAP_X8 + 1);
+        // THE EMERGENCY PATH, which is what the removal was for: the brake can
+        // be pulled repeatedly as a crash develops, with no waiting.
+        ledger.setWoodUsdPrice(0.01e8);
+        ledger.setWoodUsdPrice(0.001e8);
+        assertEq(ledger.woodUsdPriceX8(), 0.001e8, "the brake can be pulled twice as a crash deepens");
 
-        skip(1 days);
-        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
-        ledger.setWoodUsdPrice(4 * CAP_X8 + 1); // a hair over 2x
-
-        ledger.setWoodUsdPrice(0.001e8); // a 100x collapse -- allowed, conservative
-        assertEq(ledger.woodUsdPriceX8(), 0.001e8);
-
-        // Zero stays settable: it is the emergency stop, and banning it would
-        // strand the price there (any non-zero value exceeds `0 * 2`).
-        skip(1 days);
+        // Zero remains the hard stop, and recovery from it is immediate rather
+        // than costing a day.
         ledger.setWoodUsdPrice(0);
         assertEq(ledger.woodUsdPriceX8(), 0);
-
-        // ...and the recovery that used to be a free second call now costs a day.
-        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
         ledger.setWoodUsdPrice(1_000_000e8);
-        skip(1 days);
-        ledger.setWoodUsdPrice(1_000_000e8); // exempt from the ceiling, not from time
+        assertEq(ledger.woodUsdPriceX8(), 1_000_000e8, "recovery from the stop is not gated either");
         vm.stopPrank();
+    }
+
+    /// @notice Ownership is still the whole access control, and it still bites.
+    ///         Removing the rate limit did not widen WHO may call these.
+    function test_priceLevers_remainOwnerOnly() public {
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(this)));
+        ledger.setWoodUsdPrice(1e8);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(this)));
+        ledger.setWoodHaircutBps(9_000);
     }
 
     /// @notice M1 — the challenge window must outlive the longest
@@ -671,11 +685,16 @@ contract ExposureLedgerTest is Test {
         assertEq(ledger.allocatedUsd(address(mgov), 1, guardian), 500e18, "settles once execution is moot");
     }
 
-    /// @notice N6 — the haircut is the second multiplier on the same quantity
-    ///         and was unbounded, so M4's rate limit was bypassable through it:
-    ///         a legal `[1, 10_000]` range with no interval moved every bond's
-    ///         valuation 10,000x in one transaction.
-    function test_setWoodHaircutBps_rateLimitedAndFloored() public {
+    /// @notice N6 — the haircut is the second multiplier on the same quantity,
+    ///         so its VALUE bounds still matter: an unbounded multiplier would
+    ///         move every bond's valuation 10,000x in one transaction.
+    ///
+    /// @dev    The value bounds STAY; the 1-day interval that used to sit
+    ///         alongside them is GONE (issue #89), so the same-block second
+    ///         move now lands. Bounds cost nothing in a crisis; a timer does,
+    ///         and tightening the haircut is a safe-direction move that a
+    ///         crisis is exactly when you want.
+    function test_setWoodHaircutBps_boundedButNotRateLimited() public {
         vm.startPrank(owner);
         vm.expectRevert(IExposureLedger.InvalidParameter.selector);
         ledger.setWoodHaircutBps(1); // below the floor -- a mis-set parameter
@@ -683,11 +702,7 @@ contract ExposureLedgerTest is Test {
         ledger.setWoodHaircutBps(10_001);
 
         ledger.setWoodHaircutBps(8_000);
-        // Second move in the same block is refused, as for the price itself.
-        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
-        ledger.setWoodHaircutBps(5_000);
-
-        skip(1 days);
+        // Same block, immediately again: allowed now, and this is the change.
         ledger.setWoodHaircutBps(5_000);
         vm.stopPrank();
         assertEq(ledger.woodHaircutBps(), 5_000);
@@ -930,9 +945,8 @@ contract ExposureLedgerTest is Test {
         ledger.setWoodUsdPrice(0.025e8);
         ledger.settleCoverage(address(mgov), 1);
 
-        // WOOD comes back. (Two hops would trip the 2x ceiling; 0.025 -> 0.05 is
-        // exactly 2x, and the interval is why the day passes first.)
-        skip(1 days);
+        // WOOD comes back, immediately — neither the interval nor the 2x
+        // ceiling exists any more (issue #89), so the recovery needs no wait.
         vm.prank(owner);
         ledger.setWoodUsdPrice(0.05e8);
 
@@ -1771,9 +1785,6 @@ contract ExposureLedgerTest is Test {
         ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 5_000e6); // covered at $0.05
 
         vm.prank(owner);
-        // `setWoodUsdPrice` is rate-limited (review M4) and `setUp` already set
-        // one, so a second update waits out the interval.
-        skip(1 days);
         ledger.setWoodUsdPrice(0.005e8); // 10x crash — bond now worth $500
         vm.expectRevert(IExposureLedger.InsufficientApproveCoverage.selector);
         ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 5_000e6);
@@ -2263,8 +2274,12 @@ contract ExposureLedgerTest is Test {
         assertEq(ledger.woodPriceX8(), MARKET_X8 / 2, "haircut seated, market still above the cap-free path");
         assertEq(ledger.slashableBondUsd(guardian), 2_500e18);
 
+        // EVERY PULL BELOW HAPPENS IN THE SAME BLOCK, with no `skip`. That is
+        // the crisis shape issue #89 was about: a crash deepens faster than a
+        // daily interval allows, and under the old in-contract rate limit the
+        // second pull here reverted and the brake was spent until tomorrow.
+        //
         // Pull the brake hard. The cap now binds and drags everything with it.
-        skip(1 days);
         vm.prank(owner);
         ledger.setWoodUsdPrice(0.001e8);
         assertEq(ledger.woodPriceX8(), 0.0005e8, "the brake bites through the haircut");
@@ -2272,14 +2287,12 @@ contract ExposureLedgerTest is Test {
 
         // All the way down to a cap of 1 wei-X8: the haircut would truncate
         // this to zero, which is the finding. It must floor at 1 instead.
-        skip(1 days);
         vm.prank(owner);
         ledger.setWoodUsdPrice(1);
         assertEq(ledger.woodPriceX8(), 1, "floored at 1, NOT truncated to 0 by the haircut");
         assertGt(ledger.proposerBondWood(usdgAsset, 1_000e6), 0, "the bond path stays alive");
 
         // And zero is a STOP, not a $0 valuation.
-        skip(1 days);
         vm.prank(owner);
         ledger.setWoodUsdPrice(0);
         vm.expectRevert(IExposureLedger.NoWoodPrice.selector);

@@ -80,6 +80,13 @@ interface IProtocolConfigAdmin {
  * @dev PRE-FLIGHT 7 (issue #32): `delegationEnabled == false`. Delegation is
  *      deferred to v2, and the delegator-walkout hole stays dormant only while it
  *      is off. See the block itself.
+ * @dev PRE-FLIGHT 10 (issue #89): POST-broadcast, the ledger owner must be a
+ *      CONTRACT, not a bare EOA. Rate limiting on the two price levers moved
+ *      off-chain to a Zodiac module on the owner Safe, so an EOA owner leaves a
+ *      deployment with neither the on-chain limit nor the off-chain one — and
+ *      the source no longer carries a trace of the requirement. This checks a
+ *      Safe exists; it CANNOT check that a module is attached or that its delay
+ *      is asymmetric. See the block itself, and the runbook.
  * @dev PRE-FLIGHT 9 (owner decision 2026-08-02): POST-broadcast,
  *      `woodHaircutBps` must be strictly below 10,000 and at or above the
  *      ledger's floor. The ledger DEFAULTS to 10,000 — no haircut — and its own
@@ -539,14 +546,11 @@ contract DeployPlanB is Script {
         // two are one control between them: the cap truncates an overstatement
         // above it, the haircut absorbs one below it.
         //
-        // THE FIRST CALL IS EXEMPT FROM THE RATE LIMIT, which is what makes
-        // this possible at all: `setWoodHaircutBps` gates on
-        // `lastHaircutUpdateAt != 0`, and a freshly deployed ledger has it at
-        // zero (mirroring `setWoodUsdPrice`). VERIFIED against the ledger, not
-        // assumed. The corollary is operational and worth stating: this call
-        // STAMPS that timestamp, so the haircut cannot be adjusted again for
-        // `MIN_PRICE_UPDATE_INTERVAL` (1 day) — including in a same-day
-        // correction, and including mid-crash. See issue #89.
+        // Neither setter is rate-limited any more (issue #89 — the interval and
+        // the 2x ceiling moved to a Zodiac module on the owner Safe), so this
+        // call is unconstrained and a same-run correction is possible. Under
+        // the earlier in-contract interval this call would have stamped a
+        // 1-day lock on the haircut, including against a mid-crash tightening.
         ledger.setWoodHaircutBps(book.woodHaircutBps);
         // THE MARKET SOURCE. Wired inside the broadcast rather than left as a
         // manual follow-up for the same reason the duration ceiling is: chain
@@ -784,8 +788,35 @@ contract DeployPlanB is Script {
             "this script has drifted from the ledger's."
         );
 
+        // ── Pre-flight 10 (POST-broadcast): the owner must not be a bare EOA ──
+        //
+        // Issue #89 moved rate limiting OFF-CHAIN: `setWoodUsdPrice` and
+        // `setWoodHaircutBps` now impose no interval and no size ceiling, and
+        // the delay lives in a Zodiac Delay/Roles module on the owner Safe. The
+        // failure mode that creates is a deployment carrying NEITHER control —
+        // the on-chain one deleted, the off-chain one never configured — and
+        // nothing in the source would hint that anything is missing.
+        //
+        // THIS IS THE MOST THIS SCRIPT CAN CHECK, and it is deliberately not
+        // dressed up as more. `code.length != 0` proves the owner is a contract
+        // rather than an EOA, i.e. that a Safe exists at all. It does NOT prove
+        // a module is attached, and even enumerating the Safe's modules would
+        // not prove the property that actually matters — the delay must be
+        // ASYMMETRIC (raises delayed, drops immediate), which no on-chain probe
+        // can establish. The asymmetry stays a runbook obligation; see
+        // openspec/specs/deployment-docs/spec.md.
+        require(
+            ledger.owner().code.length != 0,
+            "PRE-FLIGHT: ExposureLedger owner is an EOA, not a contract. Rate limiting on "
+            "setWoodUsdPrice/setWoodHaircutBps was moved OFF-CHAIN to a Zodiac module on the owner "
+            "Safe (issue #89), so an EOA owner means the protocol has NEITHER the on-chain limit "
+            "nor the off-chain one. Run this from the owner Safe. The module's delay must be "
+            "ASYMMETRIC -- raises delayed, drops immediate -- which this script cannot verify."
+        );
+
         console.log("ExposureLedger:     %s", address(ledger));
         console.log("ProposerBondEscrow: %s", address(escrow));
+        console.log("ledger owner:       %s (must carry the Zodiac delay module)", ledger.owner());
         console.log("WoodTwapOracle:     %s", ledger.woodTwapOracle());
         console.log("WOOD price cap (X8): %s", ledger.woodUsdPriceX8());
         console.log("WOOD haircut (bps):  %s", ledger.woodHaircutBps());

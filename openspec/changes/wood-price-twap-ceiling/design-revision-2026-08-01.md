@@ -195,19 +195,69 @@ of up to `1/0.7` — about **+42.9%** — still leaves bonds valued at or below
 their true worth. The 30% sizing case clears it with margin. Past that point the
 allowance is exhausted and the cap is the control that takes over.
 
-**The interval is the catch, and it is issue #89.** Lowering the haircut is the
-safe direction and costs one transaction — but it is gated by the same
-once-per-day `MIN_PRICE_UPDATE_INTERVAL` as the cap, and the deploy's own
-seating call stamps that clock. So the haircut cannot be corrected for 24 hours
-after deploy, and **cannot be tightened in the middle of a crash**. Both
-controls this design leans on are wanted precisely during the events that make
-them matter, and both are rate-limited against exactly that. **This makes #89 a
-launch blocker rather than a refinement.**
+**The interval was the catch — and it has since been REMOVED (#89).** Lowering
+the haircut is the safe direction and costs one transaction, but it used to be
+gated by the same once-per-day `MIN_PRICE_UPDATE_INTERVAL` as the cap, with the
+deploy's own seating call stamping that clock. Both controls this design leans
+on were wanted precisely during the events that make them matter, and both were
+rate-limited against exactly that. See the next section.
 
-*Verified, not assumed:* `setWoodHaircutBps` gates on `lastHaircutUpdateAt != 0`,
-mirroring `setWoodUsdPrice`'s `lastPriceUpdateAt != 0`, so the FIRST call is
-exempt and the deploy can seat the value at all. Had it not been, the deploy
-could not have seated a haircut and #89 would have blocked this change outright.
+*Verified, not assumed (at the time):* `setWoodHaircutBps` gated on
+`lastHaircutUpdateAt != 0`, mirroring `setWoodUsdPrice`, so the FIRST call was
+exempt and the deploy could seat the value. Had it not been, the deploy could
+not have seated a haircut at all and #89 would have blocked this change outright.
+
+## Rate limiting moves off-chain (owner decision, 2026-08-02, issue #89)
+
+**The contract now imposes none.** Removed from `ExposureLedger`:
+
+- the 1-day `MIN_PRICE_UPDATE_INTERVAL` check in `setWoodUsdPrice` **and** in
+  `setWoodHaircutBps`;
+- the `newPriceX8 <= current * 2` ceiling on cap raises;
+- the storage backing them (`lastPriceUpdateAt`, `lastHaircutUpdateAt`) and the
+  constant itself.
+
+**Both had to go together.** The interval was the only thing making the ceiling
+a rate limit — N calls in one multisig batch move the price 2ᴺ — so keeping the
+ceiling alone would have advertised a protection its own subject can bypass,
+which is worse than none because a reviewer stops looking.
+
+**Why moved rather than fixed.** The interval gated BOTH directions while the
+size cap gated only raises: the code limited a move's *size* by direction but
+its *timing* regardless. After revision 2, lowering the cap IS the emergency
+action, so the limit sat directly on crisis response — whoever touched the lever
+first spent it, urgency-blind, and a routine morning adjustment left no brake
+that afternoon. A self-limit on an already-trusted owner bought little and cost
+exactly the responsiveness it existed to protect.
+
+**The trust model changed, and that must be visible.** An auditor reading this
+contract now sees an unrestricted owner where there was a self-limit, with the
+control in a Safe configuration invisible from the source. Stated explicitly in
+the setter natspec, the contract-level natspec, and the deployment-docs
+requirement: *rate limiting is enforced off-chain by a Zodiac Delay/Roles
+module; this contract deliberately imposes none.*
+
+**The property the Zodiac config MUST preserve: an ASYMMETRIC delay — raises
+delayed, drops immediate.** A plain Delay module is symmetric and would delay
+the emergency lowering too, relocating the bug. A Roles modifier cannot compare
+an argument against current on-chain state, so it cannot express "allow if lower
+than stored"; the workable shape is a fast path for arguments below a fixed
+threshold comfortably beneath any plausible cap, with everything above routed
+through the Delay module. **If that cannot be configured, the in-contract limit
+should not have been removed.**
+
+**Deploy check, and its honest limit.** `DeployPlanB` pre-flight 10 asserts the
+ledger owner is a contract rather than a bare EOA. It deliberately does NOT
+probe for modules: enumerating a Safe's modules proves only that *some* module
+is attached, never that the delay is asymmetric — and a probe that looks like it
+verifies the requirement while verifying something weaker is worse than none.
+The asymmetry stays a human runbook step. The Zodiac configuration is a
+prerequisite for **launch**, not for merge.
+
+*Storage removal verified safe:* `ExposureLedger` is not upgradeable
+(constructor + immutables, deployed directly by `DeployPlanB`, no proxy) and is
+not among the four layouts `script/check-layout-goldens.sh` pins, and nothing —
+not `IExposureLedger`, not any script or test — read either slot.
 
 ## Testing requirements
 

@@ -228,7 +228,7 @@ The WOOD half of exposure (1) is now BOUNDED rather than merely disclosed: every
 
 The runbook SHALL state the operational consequences:
 - **Seed and maintain the cap ABOVE market.** It bounds upward manipulation and nothing else; a cap at `M×` market caps manipulation at `M×`. It does not need accuracy, because it is never the valuation — a monthly review is sufficient, since a drifted cap simply stops binding. It does need MAINTENANCE: it is the only thing bounding upward manipulation of a ~$438k pool, where moving spot 2× costs ~$91k.
-- **Lowering the cap is the emergency brake** — safe direction, unbounded, immediate, subject to the ledger's one-move-per-day interval (see issue #89, which asks whether that interval should gate downward moves at all).
+- **Lowering the cap is the emergency brake** — safe direction, unbounded, immediate, and NOT rate-limited on-chain. The ledger's one-move-per-day interval and its 2×-per-raise ceiling were both removed (issue #89); rate limiting is enforced off-chain by a Zodiac module on the owner Safe. See "Rate limiting is enforced off-chain" below.
 - **A keeper SHALL call `WoodTwapOracle.update()`**, permissionlessly and on a schedule shorter than `maxTwapAge`. A failing keeper is how the oracle goes stale, and a stale oracle with no Chainlink WOOD feed is `NoWoodPrice`.
 - **`NoWoodPrice` is fail-safe, not a halt, and the asymmetry is deliberate.** `recordApproval` CATCHES it and books nothing, so approve votes still land and reviews never become block-only. `requireApproveQuorum` (execute), `proposerBondWood` (propose) and `ChallengeGame.file` all let it revert. `slashBpsFor` reads no price at all (PR #102), so convictions still compute through a total outage. Net effect: votes work, nothing new can be proposed, nothing can execute, live challenges resolve.
 - **Monitoring SHALL poll `woodPriceDetail()`**, which returns `(price, fromFeed, capBinding)`. Alert on `capBinding == true` persisting beyond a short excursion: it means the cap has drifted BELOW market and is pinning every bond while the market source sits inert. Alert on `woodPriceX8()` reverting at all. There is no event for either state.
@@ -258,7 +258,7 @@ Both OVERSTATE bond value — the dangerous direction — and both are bounded b
 
 **The shipped value is 7,000 — a 30% allowance — and `DeployPlanB` SHALL seat it** inside its broadcast (constant `DEFAULT_WOOD_HAIRCUT_BPS`, overridable via `WOOD_HAIRCUT_BPS`). The ledger's own default is 10,000, which is no haircut and therefore no allowance at all, and its setter ACCEPTS 10,000 as a legal value — so nothing else in the stack refuses that configuration and it would ship silently. Pre-flight 9 refuses it. 5,000 (the ledger floor) was REJECTED as too costly to guardian return on equity, a recurring concern in review. Precisely: 7,000 values every source at 70%, so an overstatement of up to ~42.9% still leaves bonds valued at or below their true worth — the 30% sizing case with margin to spare.
 
-**Lowering the haircut is the safe direction** (more allowance, bonds valued lower, quorums harder) and takes one owner transaction. But it is subject to the SAME once-per-day `MIN_PRICE_UPDATE_INTERVAL` as the cap, and `DeployPlanB`'s own seating call stamps that clock — so the haircut cannot be adjusted again for 24 hours after deploy, and **cannot be tightened in the middle of a crash**. That is the concrete argument for resolving **issue #89** (the brake's once-per-day gate) BEFORE launch rather than after: the gate applies to both of the controls this design leans on, and both are wanted precisely during the events that make them matter.
+**Lowering the haircut is the safe direction** (more allowance, bonds valued lower, quorums harder), takes one owner transaction, and is NOT rate-limited on-chain — issue #89 removed the once-per-day interval from this setter too, so the haircut can be tightened repeatedly as a crisis develops. Its VALUE bounds `[5_000, 10_000]` remain; those cost nothing in a crisis.
 
 Finding 5's `twapWindow <= maxTwapAge` invariant is unaffected and remains enforced — a different problem (structural unavailability) with a different fix.
 
@@ -271,8 +271,37 @@ Finding 5's `twapWindow <= maxTwapAge` invariant is unaffected and remains enfor
 - **THEN** pre-flight 9 FAILS, naming what the allowance is FOR rather than only that the value is out of range
 
 #### Scenario: Haircut needs tightening during a crash
-- **GIVEN** the haircut was seated by the deploy less than a day earlier
-- **THEN** `setWoodHaircutBps` reverts on `MIN_PRICE_UPDATE_INTERVAL` — recorded as a live limitation and as the reason issue #89 is a launch-blocking concern rather than a refinement
+- **GIVEN** the haircut was seated by the deploy minutes earlier
+- **THEN** `setWoodHaircutBps` succeeds — the on-chain interval that would have refused it is gone (issue #89), and any delay now comes from the owner Safe's module configuration
+
+### Requirement: Rate limiting is enforced off-chain, and the contract imposes none
+`ExposureLedger.setWoodUsdPrice` and `setWoodHaircutBps` SHALL impose no rate limit and no per-call size ceiling. The owner may move either lever to any legal value, any number of times, within one block. **Rate limiting is enforced OFF-CHAIN by a Zodiac Delay/Roles module on the owner Safe** (issue #89, owner decision 2026-08-02).
+
+This is a TRUST-MODEL CHANGE and SHALL be documented as one in both the setter natspec and this runbook. An auditor reading `ExposureLedger` previously saw a self-limiting owner; they now see an unrestricted one, with the control living in a Safe configuration that is invisible from the source. Undocumented, the next reviewer either files it as a finding or — worse — assumes a protection that was moved.
+
+**What was removed, and why both together.** A 1-day `MIN_PRICE_UPDATE_INTERVAL` on both setters, and a `newPriceX8 <= current * 2` ceiling on cap raises. The interval was the only thing that made the ceiling a rate limit at all — N calls in one multisig batch move the price 2ᴺ — so the ceiling could not be kept alone without advertising a protection that the exact party it constrains can bypass in a single batch. The storage that backed the interval (`lastPriceUpdateAt`, `lastHaircutUpdateAt`) was deleted; this is safe because `ExposureLedger` is not upgradeable and is not among the layouts `check-layout-goldens.sh` pins.
+
+**Why moved rather than fixed.** The interval gated BOTH directions while the size ceiling gated only raises, so the code limited a move's *size* by direction but its *timing* regardless. After design revision 2 lowering the cap IS the emergency action, so the limit sat directly on crisis response: whoever touched the lever first spent it, urgency-blind, and a routine morning adjustment left no brake that afternoon. A self-limit on an already-trusted owner bought little and cost exactly the responsiveness it most needed to preserve.
+
+**THE PROPERTY THE ZODIAC CONFIGURATION MUST PRESERVE — the delay SHALL be ASYMMETRIC: raises delayed, drops immediate.** A plain Zodiac Delay module is symmetric and would delay the emergency lowering too, relocating the bug rather than fixing it — possibly with a longer delay than the one removed. A Roles modifier can scope by selector and by static parameter conditions but **cannot compare an argument against current on-chain state**, so it cannot express "allow if lower than the stored value". The practical shape is therefore a **fast path for arguments below a fixed threshold** set comfortably beneath any plausible cap, with everything above it routed through the Delay module. **If the configuration cannot preserve the asymmetry, the in-contract limit SHALL NOT have been removed** — restore the direction-scoped interval instead.
+
+**It must actually be deployed.** A documented off-chain control that nobody configured is worse than an on-chain one, because the source no longer carries a trace of the requirement. `DeployPlanB` pre-flight 10 asserts the ledger owner is a CONTRACT rather than a bare EOA — the most an on-chain check can establish. It deliberately does not probe for modules: enumerating a Safe's modules would prove only that *some* module is attached, not that the delay is asymmetric, and a probe that appears to verify the requirement while verifying something weaker is worse than none. **The asymmetry is a runbook obligation, verified by a human before launch.** The Zodiac configuration is a prerequisite for LAUNCH, not for merge; until it exists the protocol has neither the on-chain limit nor the off-chain one.
+
+#### Scenario: Auditor reads the price setters
+- **WHEN** a reviewer reads `setWoodUsdPrice` and finds no interval and no size ceiling
+- **THEN** the natspec states plainly that rate limiting is enforced off-chain by a Zodiac module and that this contract deliberately imposes none, so the absence reads as a documented decision rather than a missing control
+
+#### Scenario: EOA owner refused at deploy
+- **WHEN** `DeployPlanB` completes with an externally-owned account as the ledger owner
+- **THEN** pre-flight 10 FAILS, naming that the protocol would carry neither the on-chain limit nor the off-chain one
+
+#### Scenario: Symmetric delay module configured
+- **GIVEN** the Safe carries a plain Zodiac Delay module applying the same delay to every call
+- **THEN** the configuration is REJECTED at review: the emergency lowering is delayed exactly as the removed interval delayed it, which relocates the problem instead of solving it
+
+#### Scenario: Crash requires two cap reductions in one day
+- **WHEN** WOOD drops 40% in the morning and a further 50% that afternoon
+- **THEN** both reductions land — the on-chain interval that previously locked the lever until the next day is gone, and the Safe's fast path passes low arguments straight through
 
 #### Scenario: ETH drawdown inside the feed heartbeat
 - **GIVEN** ETH falls sharply while the ETH/USD answer is several hours old
