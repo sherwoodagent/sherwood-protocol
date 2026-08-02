@@ -114,12 +114,28 @@ To make guardian blocking real (not the cold-start bypass), total staked guardia
 - **THEN** the refund cannot be paid — seeding the reserve is a required post-deploy step
 
 ### Requirement: Plan B deployment pre-flights and wiring
-`DeployPlanB` (ExposureLedger + ProposerBondEscrow against an existing Plan A deployment) SHALL fail its pre-flights BEFORE anything is deployed, and SHALL wire in the order: deploy ledger (epoch length 28d, immutable) → deploy escrow → seed ledger params (`setWoodUsdPrice`, `setAssetFeed`, `setGuardianRegistry`, `setCoveredTvlCapUsd`) → `registry.setExposureLedger` → `factory.setExposureLedger` / `setBondEscrow`. Checks:
+`DeployPlanB` (ExposureLedger + ProposerBondEscrow against an existing Plan A deployment) SHALL fail its pre-flights BEFORE anything is deployed, and SHALL wire in the order: deploy ledger (epoch length 28d, immutable) → deploy escrow → seed ledger params (`setWoodUsdPrice`, `setWoodTwapOracle`, `setAssetFeed`, `setGuardianRegistry`, `setCoveredTvlCapUsd`) → `registry.setExposureLedger` → `factory.setExposureLedger` / `setBondEscrow`. Checks:
 - PRE-FLIGHT (pre-broadcast): `swood.maxSlashBps() == 10_000` — the ledger books liability at 100% of allocation, so a lower ceiling makes recovery a strict shortfall by construction; and `COVERED_TVL_CAP_USD18 != 0` — a zero cap is fail-closed and would brick all proposing.
 - Drift guard: the deployed ledger's `challengeWindow` SHALL equal the script's expected 14d constant.
 - POST-wiring: `swood.exposureLedger() != address(0)` — `claimUnstakeGuardian` fails OPEN when unset, so an unwired pointer silently lets guardians walk out from under pending challenges; and `ledger.quorumTierThreshold() == 0` — coverage enforcement runs at every tier (ADR 2026-07-27 decision 2; the paired `maxEnvelopeTier <= 1` ceiling was dropped 2026-07-31, so there is no ceiling to assert).
 - `ASSET_FEED_MAX_DELAY` SHALL be sized against the governor's actual `votingPeriod + reviewPeriod + executionWindow` lifecycle (the approve quorum re-reads the feed at execute time), not a habitual `1 days`.
 - The obsolete cooldown pre-flight (`coolDownPeriod >= epochLength + challengeWindow`) is REMOVED — unsatisfiable (cooldown caps at 30d) and superseded by the exact exit gate on `claimUnstakeGuardian`.
+- PRE-FLIGHT 8 (POST-broadcast, design revision 2): `ledger.woodUsdPriceX8() != 0` AND the composed `ledger.woodPriceX8()` SHALL resolve to a non-zero price. These are two independent failures with different remedies. The first is the price CAP being unset, which under the cap-only model is a revert (`NoWoodPrice`) rather than "uncapped" — reading zero as "no ceiling" would make the likeliest misconfiguration the one state in which a ~$438k pool prices every guardian bond without bound. The second is a CAP configured with nothing priced beneath it, which a cap-only check misses entirely. `woodPriceX8()` SHALL be read by low-level probe rather than a typed call, because it now reverts instead of returning zero when unpriceable, and a bare revert would surface as an opaque script failure with no instruction attached.
+- The env key is `WOOD_PRICE_CAP_X8`, RENAMED from `WOOD_PRICE_HAIRCUT_X8` because the number's meaning inverted: it is a ceiling on manipulation, never served as a price, and SHALL be seeded **ABOVE** market — 1.25–2× is the intended band, reviewed monthly. The old "≤ 30-day low" instruction is now exactly backwards: a cap below market binds permanently, pins every bond at the cap and makes the market source inert.
+- `WOOD_TWAP_ORACLE` SHALL name a `WoodTwapOracle` that ALREADY HAS A COMPLETED AVERAGING WINDOW. The oracle needs at least `twapWindow` of keeper activity before `consult()` answers, so the ceremony ordering is: deploy the oracle → run the keeper → run Plan B. Pre-flight 8 enforces this rather than merely documenting it.
+
+#### Scenario: Unset price cap refused post-broadcast
+- **WHEN** `DeployPlanB` completes its broadcast with `woodUsdPriceX8` still zero
+- **THEN** the run FAILS naming the cap, because a zero cap reverts every price read and nothing can be proposed, executed or challenged
+
+#### Scenario: Cap set but nothing priced under it
+- **GIVEN** `WOOD_PRICE_CAP_X8` is non-zero but no TWAP oracle is wired (and chain 4663 has no Chainlink WOOD/USD feed)
+- **WHEN** the post-broadcast pre-flights run
+- **THEN** the run FAILS on the composed price — proving the cap-only assert would have passed a dead deployment
+
+#### Scenario: Oracle wired but not yet primed
+- **GIVEN** the TWAP oracle is wired but has no completed averaging window
+- **THEN** pre-flight 8 FAILS, directing the operator to run the keeper for at least `twapWindow` before re-running
 
 #### Scenario: Wrong slash ceiling refused pre-deploy
 - **WHEN** `DeployPlanB` runs against an sWOOD with `maxSlashBps < 10_000`
@@ -154,7 +170,7 @@ To make guardian blocking real (not the cold-start bypass), total staked guardia
 ### Requirement: Plan D deployment pre-flights and wiring order
 `DeployPlanD` (ChallengeGame against an existing Plan B + Plan C deployment) SHALL run pre-flights before deploying anything, then wire the game's four roles in this order: `ledger.setCoverageFreezer(game)` → `tierRegistry.setAuthorizedDemoter(game)` → `swood.setAuthorizedSlasher(game)` → `game.setStakedWood(swood)` (the reciprocal pointer, owner-set rather than a constructor arg because the role is granted on sWOOD's side; the slasher grant and the reciprocal pointer can be wired in either order). Checks:
 - PRE-FLIGHT 1: all three roles (`coverageFreezer`, `authorizedDemoter`, `authorizedSlasher`) MUST currently be UNSET — the setters overwrite silently, so re-running would quietly steal a role from a live holder. Refuse rather than clobber; rotations require clearing by governance first.
-- PRE-FLIGHT 2: the COMPOSED `ledger.woodPriceX8() != 0` (not the raw scalar) — a zero composed price means `file()` reverts `WoodPriceUnset` and nothing can be challenged.
+- PRE-FLIGHT 2: the COMPOSED `ledger.woodPriceX8() != 0` (not the raw scalar) — a zero composed price means `file()` reverts `WoodPriceUnset` and nothing can be challenged. Read by low-level PROBE rather than a typed call: under design revision 2 that view reverts `NoWoodPrice` instead of returning zero when no source can price WOOD, and a typed call would let the revert propagate as an opaque script failure. Both shapes (reverts, or answers zero) fold into the same refusal, since to the game they are the same problem.
 - Drift guard: `game.challengeWindow() == ledger.challengeWindow()`.
 - Post-conditions: all four roles verified to land on THIS game, plus the game's `exposureLedger`/`tierRegistry` constructor pointers.
 
@@ -200,10 +216,96 @@ On Robinhood Chain (no ENS/Durin registrar, no ERC-8004 identity registry) the f
 ### Requirement: Accepted oracle risks are stated in the deploy runbook
 Two oracle exposures are accepted for v1, not open defects, and SHALL be documented in the operator's line of sight rather than only in source natspec: (1) Chainlink aggregators clamp at `minAnswer`/`maxAnswer` — a clamped price is anti-conservative, understating `coverageUsd` (asset side) and over-valuing guardian bonds via `woodPriceX8` (WOOD side), with `woodHaircutBps` a fixed discount rather than a clamp bound; and (2) Robinhood Chain 4663 publishes no sequencer-uptime feed, so the standard staleness-plus-grace-period gate (`src/libraries/ChainlinkReader.sol`'s `SequencerDown`/`GracePeriodNotOver`) cannot be built — `ExposureLedger` reads aggregators directly, and `ASSET_FEED_MAX_DELAY` SHALL be sized tightly enough that a plausible outage pushes reads past staleness while still covering the full vote + review + execute lifecycle.
 
+The WOOD half of exposure (1) is now BOUNDED rather than merely disclosed: every market source, Chainlink included, is admitted only under `min(source, woodUsdPriceX8)`, so a clamped-high aggregator can over-value bonds by at most the cap. The asset half is unchanged — `coverageUsd` has no such ceiling.
+
 #### Scenario: Reviewer reads the runbook
 - **WHEN** a reviewer or deploy operator reads the runbook end to end
-- **THEN** they encounter the aggregator clamping risk with its anti-conservative direction and the affected read paths (`coverageUsd`, `woodPriceX8`), and the absence of a sequencer-uptime feed on Robinhood 4663 with why the usual staleness gate cannot exist, both stated as accepted-for-v1
+- **THEN** they encounter the aggregator clamping risk with its anti-conservative direction and the affected read paths (`coverageUsd`, `woodPriceX8`), the fact that the WOOD path is capped and the asset path is not, and the absence of a sequencer-uptime feed on Robinhood 4663 with why the usual staleness gate cannot exist, all stated as accepted-for-v1
+
+### Requirement: The WOOD price is market-sourced and governance-capped
+`ExposureLedger` SHALL resolve the WOOD price as `haircut(min(market, woodUsdPriceX8))`, floored at 1, where `market` is a Chainlink WOOD/USD feed when one is wired and fresh, otherwise the `WoodTwapOracle` TWAP. `woodUsdPriceX8` SHALL NEVER be served as a price. With no market source available the ledger SHALL revert `NoWoodPrice` rather than fall back to the governance scalar (design revision 2, 2026-08-02).
+
+The runbook SHALL state the operational consequences:
+- **Seed and maintain the cap ABOVE market.** It bounds upward manipulation and nothing else; a cap at `M×` market caps manipulation at `M×`. It does not need accuracy, because it is never the valuation — a monthly review is sufficient, since a drifted cap simply stops binding. It does need MAINTENANCE: it is the only thing bounding upward manipulation of a ~$438k pool, where moving spot 2× costs ~$91k.
+- **Lowering the cap is the emergency brake** — safe direction, unbounded, immediate, and NOT rate-limited on-chain. The ledger's one-move-per-day interval and its 2×-per-raise ceiling were both removed (issue #89); rate limiting is enforced off-chain by a Zodiac module on the owner Safe. See "Rate limiting is enforced off-chain" below.
+- **A keeper SHALL call `WoodTwapOracle.update()`**, permissionlessly and on a schedule shorter than `maxTwapAge`. A failing keeper is how the oracle goes stale, and a stale oracle with no Chainlink WOOD feed is `NoWoodPrice`.
+- **`NoWoodPrice` is fail-safe, not a halt, and the asymmetry is deliberate.** `recordApproval` CATCHES it and books nothing, so approve votes still land and reviews never become block-only. `requireApproveQuorum` (execute), `proposerBondWood` (propose) and `ChallengeGame.file` all let it revert. `slashBpsFor` reads no price at all (PR #102), so convictions still compute through a total outage. Net effect: votes work, nothing new can be proposed, nothing can execute, live challenges resolve.
+- **Monitoring SHALL poll `woodPriceDetail()`**, which returns `(price, fromFeed, capBinding)`. Alert on `capBinding == true` persisting beyond a short excursion: it means the cap has drifted BELOW market and is pinning every bond while the market source sits inert. Alert on `woodPriceX8()` reverting at all. There is no event for either state.
 
 #### Scenario: Operator wires a Chainlink WOOD feed
 - **WHEN** the operator wires `setWoodFeed(feed, maxDelay)`
-- **THEN** the runbook states that `woodUsdPriceX8` remains load-bearing as the fallback on all four degraded shapes (feed unset, non-positive answer, stale, reverting), so the operator SHALL keep maintaining it as a conservative floor and poll `woodPriceDetail()` — alerting on `usingFallback == true` persisting beyond a short blip, since there is no event for the degraded path
+- **THEN** the runbook states that the feed becomes the PREFERRED market source but is still capped by `woodUsdPriceX8`, that the TWAP oracle remains the source on all four degraded shapes (feed unset, non-positive answer, stale, reverting), and that unwiring the feed is safe only while the TWAP oracle is live
+
+#### Scenario: Operator considers the cap a conservative price
+- **WHEN** an operator seeds `woodUsdPriceX8` at or below market, as the retired "≤ 30-day low" instruction said to
+- **THEN** the cap binds permanently, every bond is valued at the cap, and the market source can no longer track a crash — the runbook names this as the misconfiguration to avoid, not a conservative choice
+
+#### Scenario: TWAP goes stale with no Chainlink WOOD feed
+- **WHEN** the keeper stops and the newest snapshot ages past `maxTwapAge`
+- **THEN** approve and block votes both continue to land, new proposals are refused at `propose`, tier-gated proposals cannot execute, and convictions on already-filed challenges still compute
+
+### Requirement: The WOOD price carries two accepted overstatements, and `woodHaircutBps` is the control
+Two exposures are ACCEPTED rather than eliminated (owner decision 2026-08-02). The runbook SHALL state both, together with the parameter that covers them.
+
+**(a) The two legs are not contemporaneous.** `WoodTwapOracle` multiplies a near-real-time WOOD/ETH average by a single Chainlink ETH/USD answer that may be up to one heartbeat old — the live 4663 feed was measured **10.7 hours old while perfectly healthy**, so this is the normal case, not a degraded one. During an ETH drawdown inside that heartbeat the pair ratio rises while the stale, pre-drawdown ETH price is still the multiplier, so WOOD/USD reads high by roughly the size of the ETH move and every bond is over-valued until the feed ticks. **No attacker capital is required** — ordinary market movement against a slow feed, which makes it likelier than any manipulation scenario.
+
+It is accepted because the remedy is worse. Requiring the ETH answer to be no older than `twapWindow` forces `twapWindow >= ~12h`, and a 12-hour averaging window means half a day of blindness to a WOOD crash — unbounded in magnitude and fixed in duration, traded against an overstatement that is bounded in magnitude. Tracking a drawdown without waiting on a human is the whole purpose of the oracle. `ethUsdMaxDelay` is therefore bounded ONLY by `MAX_ETH_USD_DELAY_LIMIT` (24h, itself sized to clear the measured heartbeat with margin) and is deliberately INDEPENDENT of `twapWindow`, so the window can be short.
+
+**(b) Residual crash lag** of up to `twapWindow + maxTwapAge`, inherent to averaging and the price paid for manipulation resistance.
+
+Both OVERSTATE bond value — the dangerous direction — and both are bounded by the same two controls: `woodUsdPriceX8` truncates anything above the cap, and `woodHaircutBps` pre-funds an allowance below it. **`woodHaircutBps` is therefore LOAD-BEARING.**
+
+**The shipped value is 7,000 — a 30% allowance — and `DeployPlanB` SHALL seat it** inside its broadcast (constant `DEFAULT_WOOD_HAIRCUT_BPS`, overridable via `WOOD_HAIRCUT_BPS`). The ledger's own default is 10,000, which is no haircut and therefore no allowance at all, and its setter ACCEPTS 10,000 as a legal value — so nothing else in the stack refuses that configuration and it would ship silently. Pre-flight 9 refuses it. 5,000 (the ledger floor) was REJECTED as too costly to guardian return on equity, a recurring concern in review. Precisely: 7,000 values every source at 70%, so an overstatement of up to ~42.9% still leaves bonds valued at or below their true worth — the 30% sizing case with margin to spare.
+
+**Lowering the haircut is the safe direction** (more allowance, bonds valued lower, quorums harder), takes one owner transaction, and is NOT rate-limited on-chain — issue #89 removed the once-per-day interval from this setter too, so the haircut can be tightened repeatedly as a crisis develops. Its VALUE bounds `[5_000, 10_000]` remain; those cost nothing in a crisis.
+
+Finding 5's `twapWindow <= maxTwapAge` invariant is unaffected and remains enforced — a different problem (structural unavailability) with a different fix.
+
+#### Scenario: Operator sizes the haircut
+- **WHEN** the operator seats `woodHaircutBps` before launch
+- **THEN** the runbook states that the value is an allowance against the ETH-staleness overstatement and the crash lag, that the shipped value is 7,000 (a 30% allowance), that 10,000 leaves none at all and is refused by pre-flight 9, and that 5,000 was rejected on guardian-ROE grounds
+
+#### Scenario: Deploy would leave the haircut at the ledger default
+- **WHEN** `DeployPlanB` would complete with `woodHaircutBps == 10_000`
+- **THEN** pre-flight 9 FAILS, naming what the allowance is FOR rather than only that the value is out of range
+
+#### Scenario: Haircut needs tightening during a crash
+- **GIVEN** the haircut was seated by the deploy minutes earlier
+- **THEN** `setWoodHaircutBps` succeeds — the on-chain interval that would have refused it is gone (issue #89), and any delay now comes from the owner Safe's module configuration
+
+### Requirement: Rate limiting is enforced off-chain, and the contract imposes none
+`ExposureLedger.setWoodUsdPrice` and `setWoodHaircutBps` SHALL impose no rate limit and no per-call size ceiling. The owner may move either lever to any legal value, any number of times, within one block. **Rate limiting is enforced OFF-CHAIN by a Zodiac Delay/Roles module on the owner Safe** (issue #89, owner decision 2026-08-02).
+
+This is a TRUST-MODEL CHANGE and SHALL be documented as one in both the setter natspec and this runbook. An auditor reading `ExposureLedger` previously saw a self-limiting owner; they now see an unrestricted one, with the control living in a Safe configuration that is invisible from the source. Undocumented, the next reviewer either files it as a finding or — worse — assumes a protection that was moved.
+
+**What was removed, and why both together.** A 1-day `MIN_PRICE_UPDATE_INTERVAL` on both setters, and a `newPriceX8 <= current * 2` ceiling on cap raises. The interval was the only thing that made the ceiling a rate limit at all — N calls in one multisig batch move the price 2ᴺ — so the ceiling could not be kept alone without advertising a protection that the exact party it constrains can bypass in a single batch. The storage that backed the interval (`lastPriceUpdateAt`, `lastHaircutUpdateAt`) was deleted; this is safe because `ExposureLedger` is not upgradeable and is not among the layouts `check-layout-goldens.sh` pins.
+
+**Why moved rather than fixed.** The interval gated BOTH directions while the size ceiling gated only raises, so the code limited a move's *size* by direction but its *timing* regardless. After design revision 2 lowering the cap IS the emergency action, so the limit sat directly on crisis response: whoever touched the lever first spent it, urgency-blind, and a routine morning adjustment left no brake that afternoon. A self-limit on an already-trusted owner bought little and cost exactly the responsiveness it most needed to preserve.
+
+**THE PROPERTY THE ZODIAC CONFIGURATION MUST PRESERVE — the delay SHALL be ASYMMETRIC: raises delayed, drops immediate.** A plain Zodiac Delay module is symmetric and would delay the emergency lowering too, relocating the bug rather than fixing it — possibly with a longer delay than the one removed. A Roles modifier can scope by selector and by static parameter conditions but **cannot compare an argument against current on-chain state**, so it cannot express "allow if lower than the stored value". The practical shape is therefore a **fast path for arguments below a fixed threshold** set comfortably beneath any plausible cap, with everything above it routed through the Delay module. **If the configuration cannot preserve the asymmetry, the in-contract limit SHALL NOT have been removed** — restore the direction-scoped interval instead.
+
+**It must actually be deployed.** A documented off-chain control that nobody configured is worse than an on-chain one, because the source no longer carries a trace of the requirement. `DeployPlanB` pre-flight 10 asserts the ledger owner is a CONTRACT rather than a bare EOA — the most an on-chain check can establish. It deliberately does not probe for modules: enumerating a Safe's modules would prove only that *some* module is attached, not that the delay is asymmetric, and a probe that appears to verify the requirement while verifying something weaker is worse than none. **The asymmetry is a runbook obligation, verified by a human before launch.** The Zodiac configuration is a prerequisite for LAUNCH, not for merge; until it exists the protocol has neither the on-chain limit nor the off-chain one.
+
+#### Scenario: Auditor reads the price setters
+- **WHEN** a reviewer reads `setWoodUsdPrice` and finds no interval and no size ceiling
+- **THEN** the natspec states plainly that rate limiting is enforced off-chain by a Zodiac module and that this contract deliberately imposes none, so the absence reads as a documented decision rather than a missing control
+
+#### Scenario: EOA owner refused at deploy
+- **WHEN** `DeployPlanB` completes with an externally-owned account as the ledger owner
+- **THEN** pre-flight 10 FAILS, naming that the protocol would carry neither the on-chain limit nor the off-chain one
+
+#### Scenario: Symmetric delay module configured
+- **GIVEN** the Safe carries a plain Zodiac Delay module applying the same delay to every call
+- **THEN** the configuration is REJECTED at review: the emergency lowering is delayed exactly as the removed interval delayed it, which relocates the problem instead of solving it
+
+#### Scenario: Crash requires two cap reductions in one day
+- **WHEN** WOOD drops 40% in the morning and a further 50% that afternoon
+- **THEN** both reductions land — the on-chain interval that previously locked the lever until the next day is gone, and the Safe's fast path passes low arguments straight through
+
+#### Scenario: ETH drawdown inside the feed heartbeat
+- **GIVEN** ETH falls sharply while the ETH/USD answer is several hours old
+- **THEN** WOOD/USD reads high by roughly the ETH move until the feed ticks, bonds are over-valued for that period, and the exposure is bounded above by the cap and below by the haircut — an accepted risk, documented, not a defect to file
+
+#### Scenario: Short averaging window with a slow USD feed
+- **WHEN** the operator configures `twapWindow = 1 hour` alongside `ethUsdMaxDelay = 24 hours`
+- **THEN** the configuration is ACCEPTED — the two are independent by design, and coupling them would force a ~12-hour window and surrender the crash tracking the oracle exists to provide

@@ -166,8 +166,22 @@ contract DeployPlanD is Script {
         // The COMPOSED price, matching what `ChallengeGame.file` divides by
         // (review 🟠F16). Pre-flighting the raw scalar would pass while the
         // figure the game actually uses was zero, and fail while it was healthy.
-        uint256 priceX8 = IExposureLedger(ledger).woodPriceX8();
-        require(priceX8 != 0, "PRE-FLIGHT: ExposureLedger.woodPriceX8 is 0 (fail-closed: no challenge could be filed)");
+        //
+        // PROBED, NOT CALLED TYPED. Under design revision 2 `woodPriceX8()`
+        // REVERTS `NoWoodPrice` rather than returning zero when no source can
+        // price WOOD — an unset cap, or no live market source under it. A typed
+        // call would let that revert propagate as an opaque script failure,
+        // skipping the instruction below and telling the operator nothing. The
+        // probe folds both shapes (reverts, or answers zero) into one refusal,
+        // which is correct: to the game they are the same problem.
+        (bool priced, bytes memory ret) = ledger.staticcall(abi.encodeWithSignature("woodPriceX8()"));
+        uint256 priceX8 = (priced && ret.length >= 32) ? abi.decode(ret, (uint256)) : 0;
+        require(
+            priceX8 != 0,
+            "PRE-FLIGHT: ExposureLedger.woodPriceX8 is 0 (fail-closed: no challenge could be filed). "
+            "Either the price CAP woodUsdPriceX8 is unset, or no market source is wired under it -- "
+            "chain 4663 has no Chainlink WOOD/USD feed, so the ledger needs setWoodTwapOracle."
+        );
 
         console.log("deployer / game owner:  %s", deployer);
         console.log("ledger woodPriceX8:     %s", priceX8);

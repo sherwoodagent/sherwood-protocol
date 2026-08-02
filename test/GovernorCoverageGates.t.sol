@@ -15,6 +15,7 @@ import {IERC20Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.so
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "./mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "./mocks/MockRegistryMinimal.sol";
+import {MockWoodTwapOracle} from "./mocks/MockWoodTwapOracle.sol";
 import {ProtocolConfig} from "../src/ProtocolConfig.sol";
 import {TierRegistry} from "../src/TierRegistry.sol";
 
@@ -132,8 +133,13 @@ contract GovernorCoverageGatesTest is Test {
         swood = new MockSwood();
         ledger = new ExposureLedger(ledgerOwner, address(swood), 28 days);
         feed = new MockFeed(1e8, 8); // $1.00, 8-dec
+        // Design revision 2: `woodUsdPriceX8` is a CAP, never a price. WOOD is
+        // valued from the TWAP oracle at $0.05, with the cap 2x ABOVE it and
+        // therefore NOT binding — the configuration production ships.
+        MockWoodTwapOracle woodTwap = new MockWoodTwapOracle(0.05e8);
         vm.startPrank(ledgerOwner);
-        ledger.setWoodUsdPrice(0.05e8); // $0.05, conservative haircut
+        ledger.setWoodUsdPrice(0.1e8);
+        ledger.setWoodTwapOracle(address(woodTwap));
         // Generous staleness bound: the §3.3a quorum re-reads this feed at
         // EXECUTE time, which is a voting period (+ review window) after
         // propose. A `maxDelay` shorter than that lifecycle would make every
