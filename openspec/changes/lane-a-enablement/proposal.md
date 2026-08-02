@@ -24,8 +24,10 @@ Non-goals: perps venues (Lighter) — structurally unpriceable on-chain, stays L
 
 ### Modified Capabilities
 
-<!-- None. Lane A vault/router behavior (epoch-nav, syndicate-vault) is already
-     specced and unchanged; this change supplies the first conforming
+- `instant-exit-fees`: the early-exit penalty becomes a flat charge on the whole instant exit instead of only the strategy-pulled portion. The float carve-out left a penalty-free window that fresh Lane A deposits kept enlarging, making the enablement precondition (`instantExitFeeBps == 200`) vacuous for exactly the basis arbitrage it exists to price.
+
+<!-- epoch-nav and syndicate-vault are unchanged: their Lane A behavior was
+     already specced and this change supplies the first conforming
      implementations and their parameters. -->
 
 ## Impact

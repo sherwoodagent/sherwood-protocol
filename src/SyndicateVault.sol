@@ -1411,32 +1411,33 @@ contract SyndicateVault is
 
     /// @dev The early-exit penalty on `netAssets` leaving now.
     ///
-    ///      Charged on the PULLED portion only — the part of the exit that idle
-    ///      float cannot absorb and that therefore forces the strategy to
-    ///      unwind early. That matches what the penalty is compensating the
-    ///      remaining depositors for. An exit small enough to be served from
-    ///      float causes no unwind and pays nothing.
+    ///      Charged on the WHOLE exit, unconditionally, whenever Lane A is
+    ///      live. The penalty prices the oracle-vs-pool basis a Lane A exit
+    ///      realizes: `totalAssets()` marks the strategy's positions at the
+    ///      router's price, and the divergence gate deliberately tolerates a
+    ///      spread (up to `maxDivergenceBps`) between that mark and what the
+    ///      positions would actually fetch. An exiter paid against the mark
+    ///      therefore takes that spread out of the LPs who stay — and does so
+    ///      identically whether or not their exit happened to force a sale.
     ///
-    ///      This makes the fee function kinked at the float boundary, so
-    ///      `previewWithdraw` cannot invert it in closed form; it grosses up and
-    ///      rounds conservatively instead. `previewRedeem` stays exact and
-    ///      monotone either side of the kink (d(net)/d(assets) = 1 - bps/1e4 > 0),
-    ///      which is what EIP-4626 actually requires.
+    ///      Adversary (the reason this is not float-scoped): idle float is
+    ///      continuously topped up by fresh Lane A deposits, so a float-scoped
+    ///      charge leaves a fee-free exit window whose size grows with
+    ///      inflows. An arbitrageur waits for the mark and the market to drift
+    ///      apart — which happens unaided whenever the 24/5 equity feeds hold
+    ///      a price while pools keep trading — sizes the exit to the float, and
+    ///      harvests the spread at zero cost, funded by the very deposits that
+    ///      enlarged the window. Charging the pulled portion only would make
+    ///      the enablement precondition (`instantExitFeeBps == 200`) vacuous
+    ///      for exactly the adversary it is meant to price.
     ///
-    ///      Known trade-off: because the charge depends on float, the first
-    ///      exiters in a rush pay nothing and the
-    ///      last pays full — which adds a little pressure to run early, the
-    ///      opposite of what an anti-mercenary term wants. Kept because it
-    ///      matches the fee's stated purpose and instant-exit capacity is
-    ///      already bounded by `availableLiquidity()` regardless.
+    ///      Cost recovery for a forced unwind is a DIFFERENT concern from this
+    ///      one; if it is wanted it belongs as a separate surcharge on the
+    ///      pulled portion, not as a carve-out from the basis toll.
     function _exitPenalty(uint256 netAssets) private view returns (uint256) {
         uint256 bps = instantExitFeeBps;
         if (bps == 0 || netAssets == 0) return 0;
-        uint256 float = IERC20(asset()).balanceOf(address(this));
-        uint256 reserve = reservedQueueAssets();
-        uint256 absorbable = float > reserve ? float - reserve : 0;
-        if (netAssets <= absorbable) return 0;
-        return ((netAssets - absorbable) * bps) / 10_000;
+        return (netAssets * bps) / 10_000;
     }
 
     /// @notice Assets an instant exit of `shares` would release, net of the
@@ -1462,20 +1463,15 @@ contract SyndicateVault is
     }
 
     /// @notice Shares to burn for `assets` out of an instant exit.
-    /// @dev The fee function is kinked at the float boundary (see
-    ///      `_exitPenalty`) and concave above it, so it has no closed-form
-    ///      inverse and a single linear correction lands short — grossing up
-    ///      pushes more of the exit past the boundary, which the first estimate
-    ///      did not price. Iterate instead, rounding UP each time: the caller
-    ///      burns marginally more shares than strictly necessary rather than
-    ///      receiving less than they asked for. Erring the other way would
-    ///      break the EIP-4626 guarantee that `withdraw` delivers the requested
-    ///      assets.
-    ///
-    ///      Convergence is quadratic in the penalty rate (each round leaves a
-    ///      residual of order `bps^(n+1)`), so at the 200 bps ceiling three
-    ///      rounds are exact to well under one wei. The bound also makes this
-    ///      view unconditionally terminating.
+    /// @dev The penalty is linear in the exit (see `_exitPenalty`), so the
+    ///      first grossed-up correction already lands on or above the target
+    ///      and the loop exits after one round. The iteration is kept because
+    ///      `_exitFees` rounds independently of the penalty: rounding UP each
+    ///      round means the caller burns marginally more shares than strictly
+    ///      necessary rather than receiving less than they asked for, and
+    ///      erring the other way would break the EIP-4626 guarantee that
+    ///      `withdraw` delivers the requested assets. The fixed bound also
+    ///      makes this view unconditionally terminating.
     function previewWithdraw(uint256 assets) public view override returns (uint256) {
         uint256 shares = super.previewWithdraw(assets);
         (,,, bool laneA) = _laneState();

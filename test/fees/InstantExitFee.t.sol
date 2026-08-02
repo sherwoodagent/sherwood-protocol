@@ -177,39 +177,43 @@ contract InstantExitFeeTest is Test {
 
     // ── Incidence ──
 
-    /// @notice An exit small enough for idle float causes no unwind, so it pays
-    ///         no penalty. This is the whole basis for charging the pulled
-    ///         portion only.
-    function test_anExitServedEntirelyFromFloatPaysNoPenalty() public {
+    /// @notice An exit served entirely from idle float still pays the full
+    ///         penalty. The toll prices the oracle-vs-pool basis the exiter
+    ///         realizes against the marked NAV, and that harm to the LPs who
+    ///         stay is identical whether or not a sale was forced.
+    ///
+    ///         Regression: a float-scoped charge left a fee-free window that
+    ///         fresh Lane A deposits kept enlarging, so an arbitrageur could
+    ///         size an exit to the float and harvest the basis at zero cost.
+    function test_anExitServedEntirelyFromFloatStillPaysTheFullPenalty() public {
         vm.prank(alice);
         vault.deposit(1_000_000e6, alice);
-        _openLaneA(500_000e6); // 500k deployed, 500k idle
+        _openLaneA(500_000e6); // 500k deployed, 500k idle — fat float
 
         // Redeem 10% of supply -> ~100k, comfortably inside the 500k float.
         uint256 shares = vault.balanceOf(alice) / 10;
         uint256 gross = vault.convertToAssets(shares);
         uint256 quoted = vault.previewRedeem(shares);
+        uint256 charged = gross - quoted;
 
-        assertEq(quoted, gross, "float-served exits pay nothing");
+        assertApproxEqAbs(charged, (gross * PENALTY_BPS) / 10_000, 1, "float-served exits pay in full");
+        assertLt(quoted, gross, "no fee-free window");
     }
 
-    /// @notice An exit that outruns float forces a pull, and pays on the pulled
-    ///         portion only — not on the whole exit.
-    function test_anExitThatForcesAnUnwindPaysOnThePulledPortionOnly() public {
+    /// @notice An exit that outruns float pays on the whole exit, at the same
+    ///         flat rate as the float-served case above — the charge does not
+    ///         depend on how much of the exit forced a pull.
+    function test_anExitThatForcesAnUnwindPaysOnTheWholeExit() public {
         vm.prank(alice);
         vault.deposit(1_000_000e6, alice);
-        _openLaneA(900_000e6); // only 100k idle
+        _openLaneA(900_000e6); // only 100k idle — thin float
 
         uint256 shares = vault.balanceOf(alice) / 2; // ~500k
         uint256 gross = vault.convertToAssets(shares);
         uint256 quoted = vault.previewRedeem(shares);
         uint256 charged = gross - quoted;
 
-        uint256 pulled = gross - 100_000e6;
-        uint256 expected = (pulled * PENALTY_BPS) / 10_000;
-
-        assertApproxEqAbs(charged, expected, 1, "penalty applies to the pulled portion");
-        assertLt(charged, (gross * PENALTY_BPS) / 10_000, "and is strictly less than a flat charge");
+        assertApproxEqAbs(charged, (gross * PENALTY_BPS) / 10_000, 1, "penalty applies to the whole exit");
     }
 
     /// @notice The penalty stays in the fund. It compensates the depositors who

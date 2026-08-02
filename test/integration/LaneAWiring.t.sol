@@ -513,12 +513,12 @@ contract LaneAWiringTest is Test {
 
         _depositExecuteLock();
 
-        // Withdraw 700 over a 400 float: 300 is pulled from the strategy, and
-        // ONLY that portion is penalized at 200bps. Ideal gross assets x
-        // solves x - (x - 400e6) * 2% = 700e6 -> x = 706_122_449; convert to
-        // shares at the pre-exit ratio (the vault mints shares at a decimals
-        // offset, so compare in share units).
-        uint256 idealShares = vault.convertToShares(706_122_449);
+        // Withdraw 700 over a 400 float. The penalty is a flat 200bps on the
+        // WHOLE exit (float-served or pulled alike), so the ideal gross assets
+        // x solves x * 98% = 700e6 -> x = 714_285_714; convert to shares at the
+        // pre-exit ratio (the vault mints shares at a decimals offset, so
+        // compare in share units).
+        uint256 idealShares = vault.convertToShares(714_285_714);
         uint256 shares700 = vault.convertToShares(700e6); // fee-free burn, pre-exit ratio
         uint256 shareSlack = vault.convertToShares(10); // 10 asset units of rounding room
         uint256 sharesBefore = vault.balanceOf(alice);
@@ -528,7 +528,7 @@ contract LaneAWiringTest is Test {
 
         assertEq(usdc.balanceOf(alice) - balBefore, 700e6, "exact assets delivered (EIP-4626 withdraw)");
         uint256 sharesBurned = sharesBefore - vault.balanceOf(alice);
-        assertApproxEqAbs(sharesBurned, idealShares, shareSlack, "penalty charged on the pulled portion only");
+        assertApproxEqAbs(sharesBurned, idealShares, shareSlack, "flat penalty charged on the whole exit");
 
         // The penalty stays in the vault for remaining LPs: the burn exceeded
         // the fee-free burn (share price rose). Remaining value: the unwind
