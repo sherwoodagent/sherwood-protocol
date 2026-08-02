@@ -4,6 +4,8 @@ pragma solidity 0.8.28;
 import {BaseStrategy} from "./BaseStrategy.sol";
 import {IStrategy} from "../interfaces/IStrategy.sol";
 import {ISwapAdapter} from "../interfaces/ISwapAdapter.sol";
+import {Position} from "../interfaces/IPriceRouter.sol";
+import {PositionKinds} from "../libraries/PositionKinds.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -89,6 +91,12 @@ contract PortfolioStrategy is BaseStrategy {
     /// @notice Basket cannot contain the same token address twice —
     ///         duplicates would double-count balances and inflate live NAV.
     error DuplicateToken(address token);
+    /// @notice `withdrawTo` needed a basket sale but no oracle-anchored mark is
+    ///         available on-chain (Data Streams mode has no push feed to read).
+    error MarkUnavailable();
+    /// @notice The unwind could not raise the requested assets within the
+    ///         slippage bound — all-or-revert, no partial delivery.
+    error InsufficientUnwindProceeds();
 
     // ── Constants ──
     uint256 public constant MAX_BASKET_SIZE = 20;
@@ -703,6 +711,193 @@ contract PortfolioStrategy is BaseStrategy {
         // preserved here; decimal-correct scaling happens in `rebalanceDelta`
         // via `_tokensToValue` using the per-allocation `_priceDecimals`.
         price = uint256(uint192(report.price));
+    }
+
+    // ── Lane A surface: positions / availableLiquidity / withdrawTo ──
+    //
+    // Opt-in overrides of the BaseStrategy Lane B defaults. They add a
+    // read/unwind surface only — execute, settle, updateParams, and the two
+    // rebalance paths are untouched, and settle remains the sole terminal
+    // unwind (spec: portfolio-strategy-lane-a).
+
+    /// @inheritdoc IStrategy
+    /// @dev One ERC-20 spot position per basket slot while the basket is held
+    ///      (Executed state, no rebalance/unwind in flight); empty before
+    ///      execute, after settle, and mid-rebalance. `ref` is empty by
+    ///      design: the pricing adapter's governance registry selects the feed
+    ///      keyed by the venue token, so there is nothing a locator could add
+    ///      except an attack surface (design D2). No value or quantity figures
+    ///      are reported — the router reads `balanceOf` at the venue.
+    ///      Adversary: a mid-rebalance basket (sell leg done, buy leg pending)
+    ///      would price transiently distorted, so `_rebalancing` — also set
+    ///      during a `withdrawTo` basket sale — suspends enumeration and Lane A
+    ///      fails closed for the duration (design D5).
+    function positions() external view override returns (Position[] memory) {
+        if (_state != State.Executed || _rebalancing) return new Position[](0);
+        uint256 len = _allocations.length;
+        Position[] memory ps = new Position[](len);
+        for (uint256 i; i < len; ++i) {
+            ps[i] = Position({venue: _allocations[i].token, kind: PositionKinds.ERC20_SPOT, ref: ""});
+        }
+        return ps;
+    }
+
+    /// @inheritdoc IStrategy
+    /// @dev Idle vault-asset balance plus a conservative basket estimate:
+    ///      per slot, min(swap-adapter quote, Chainlink mark value) discounted
+    ///      by `maxSlippageBps` — exactly the floor `withdrawTo` can guarantee,
+    ///      and never above the router-priced (mark) value. Degrades to the
+    ///      idle balance alone whenever the estimate cannot be trusted: not
+    ///      executed, rebalance/unwind in flight, Data Streams mode (no
+    ///      on-chain mark to anchor to), a stale/broken feed, or a slot the
+    ///      swap venue cannot quote (the quote is a raw staticcall — a
+    ///      state-mutating or reverting `quote()` degrades rather than lies).
+    ///      Adversary: an overstated figure makes the vault attempt an unwind
+    ///      that under-delivers and reverts exits Lane A advertised.
+    function availableLiquidity() external view override returns (uint256) {
+        uint256 idle = IERC20(asset).balanceOf(address(this));
+        if (_state != State.Executed || _rebalancing) return idle;
+        if (chainlinkVerifier != address(0)) return idle;
+
+        uint256 assetDec = uint256(_assetDecimals);
+        uint256 len = _allocations.length;
+        uint256 basket;
+        for (uint256 i; i < len; ++i) {
+            address token = _allocations[i].token;
+            uint256 bal = IERC20(token).balanceOf(address(this));
+            if (bal == 0) continue;
+            (uint256 price, bool ok) = _pushMark(i);
+            if (!ok) return idle;
+            uint256 markValue = _tokensToValue(bal, price, i, assetDec);
+            (bool okQ, uint256 quoted) = _staticQuote(token, asset, bal, _swapExtraData[i]);
+            if (!okQ || quoted == 0) return idle;
+            uint256 v = quoted < markValue ? quoted : markValue;
+            basket += (v * (BPS_DENOMINATOR - maxSlippageBps)) / BPS_DENOMINATOR;
+        }
+        return idle + basket;
+    }
+
+    /// @inheritdoc IStrategy
+    /// @dev All-or-revert shortfall unwind for the vault's instant-exit path:
+    ///      idle balance first, then pro-rata (by current mark value) basket
+    ///      sales, then transfer exactly `assets` to the vault in the same
+    ///      transaction. Pro-rata keeps basket weights unchanged by exits so
+    ///      an instant exit does not silently re-tilt the remaining LPs'
+    ///      portfolio (design D4). Each sale enforces `maxSlippageBps` against
+    ///      the slot's Chainlink push-feed mark — NOT against the adapter's
+    ///      own quote — so a searcher who moves the pool cannot move the floor
+    ///      with it. Routes are the frozen per-slot `_swapExtraData`.
+    ///      Adversary: an unwind that silently under-delivers strands the exit
+    ///      at the vault's balance-diff check; the proceeds check below reverts
+    ///      first, and any raise beyond `assets` stays idle in the strategy
+    ///      (returned to the vault at settle).
+    function withdrawTo(uint256 assets) external override onlyVault {
+        if (assets == 0) revert InvalidAmount();
+        uint256 idle = IERC20(asset).balanceOf(address(this));
+        if (idle < assets) {
+            _unwindBasket(assets - idle);
+            if (IERC20(asset).balanceOf(address(this)) < assets) revert InsufficientUnwindProceeds();
+        }
+        _pushToVault(asset, assets);
+    }
+
+    /// @dev Sell basket tokens pro-rata by current mark value to raise at least
+    ///      `shortfall` of the asset. Sets `_rebalancing` for the duration so a
+    ///      reentrant `positions()` / `availableLiquidity()` read (e.g. via the
+    ///      swap adapter) sees Lane A closed rather than a half-sold basket,
+    ///      and so a reentrant rebalance is locked out. The gross-up by
+    ///      `maxSlippageBps` sizes the sale so the per-leg floors sum to at
+    ///      least `shortfall` even if every leg fills exactly at its floor.
+    function _unwindBasket(uint256 shortfall) private {
+        if (_state != State.Executed) revert NotExecuted();
+        if (_rebalancing) revert RebalancingInProgress();
+        if (chainlinkVerifier != address(0)) revert MarkUnavailable();
+        _rebalancing = true;
+
+        uint256 len = _allocations.length;
+        uint256 assetDec = uint256(_assetDecimals);
+        uint256[] memory prices = new uint256[](len);
+        uint256[] memory values = new uint256[](len);
+        uint256 totalValue;
+        for (uint256 i; i < len; ++i) {
+            uint256 bal = IERC20(_allocations[i].token).balanceOf(address(this));
+            if (bal == 0) continue;
+            (uint256 price, bool ok) = _pushMark(i);
+            // Loud here (vs the fail-closed views): the vault only calls in
+            // with an exit in flight, and a silent skip would under-deliver.
+            if (!ok) revert StalePrice();
+            prices[i] = price;
+            values[i] = _tokensToValue(bal, price, i, assetDec);
+            totalValue += values[i];
+        }
+        if (totalValue == 0) revert InsufficientUnwindProceeds();
+
+        uint256 grossTarget = (shortfall * BPS_DENOMINATOR) / (BPS_DENOMINATOR - maxSlippageBps) + 1;
+        for (uint256 i; i < len; ++i) {
+            if (values[i] == 0) continue;
+            uint256 sellValue = (grossTarget * values[i]) / totalValue + 1;
+            if (sellValue > values[i]) sellValue = values[i];
+            _sellForUnwind(i, sellValue, prices[i], assetDec);
+        }
+
+        _rebalancing = false;
+    }
+
+    /// @dev One unwind leg: sell `sellValue` (asset units) of allocation `i`
+    ///      with the minOut floored at the Chainlink mark less `maxSlippageBps`.
+    ///      Extracted so the legacy (no via_ir) coverage pipeline doesn't trip
+    ///      stack-too-deep, mirroring `_sellOverweight`.
+    function _sellForUnwind(uint256 i, uint256 sellValue, uint256 price, uint256 assetDec) private {
+        address token = _allocations[i].token;
+        uint256 bal = IERC20(token).balanceOf(address(this));
+        uint256 tokensToSell = _valueToTokens(sellValue, price, i, assetDec);
+        if (tokensToSell > bal) tokensToSell = bal;
+        if (tokensToSell == 0) return;
+        IERC20(token).forceApprove(address(swapAdapter), tokensToSell);
+        uint256 minOut =
+            (_tokensToValue(tokensToSell, price, i, assetDec) * (BPS_DENOMINATOR - maxSlippageBps)) / BPS_DENOMINATOR;
+        swapAdapter.swap(token, asset, tokensToSell, minOut, _swapExtraData[i]);
+        _allocations[i].tokenAmount = IERC20(token).balanceOf(address(this));
+    }
+
+    /// @dev Non-reverting push-feed mark for allocation `i`: `(price, ok)` in
+    ///      the slot's declared `_priceDecimals[i]`. Mirrors `_verifyPrice`'s
+    ///      push branch (live decimals re-check, positive answer, per-slot max
+    ///      age) but fails soft so view callers can degrade instead of revert.
+    ///      Only meaningful in push mode; callers gate on
+    ///      `chainlinkVerifier == address(0)`.
+    function _pushMark(uint256 i) private view returns (uint256, bool) {
+        (address feed, uint256 maxAge) = _decodePushFeed(_feedIds[i]);
+        try AggregatorV3Interface(feed).decimals() returns (uint8 dec) {
+            if (dec != _priceDecimals[i]) return (0, false);
+        } catch {
+            return (0, false);
+        }
+        try AggregatorV3Interface(feed).latestRoundData() returns (
+            uint80, int256 answer, uint256, uint256 updatedAt, uint80
+        ) {
+            if (answer <= 0) return (0, false);
+            if (updatedAt == 0 || updatedAt > block.timestamp) return (0, false);
+            if (block.timestamp - updatedAt > maxAge) return (0, false);
+            return (uint256(answer), true);
+        } catch {
+            return (0, false);
+        }
+    }
+
+    /// @dev Staticcall wrapper around `ISwapAdapter.quote` (declared non-view)
+    ///      so the view `availableLiquidity` can consult it: a quote that
+    ///      mutates state, reverts, or returns malformed data yields
+    ///      `(false, 0)` and the caller degrades to idle-only.
+    function _staticQuote(address tokenIn, address tokenOut, uint256 amountIn, bytes memory extraData)
+        private
+        view
+        returns (bool, uint256)
+    {
+        (bool s, bytes memory d) = address(swapAdapter)
+            .staticcall(abi.encodeCall(ISwapAdapter.quote, (tokenIn, tokenOut, amountIn, extraData)));
+        if (!s || d.length < 32) return (false, 0);
+        return (true, abi.decode(d, (uint256)));
     }
 
     // ── View functions ──
