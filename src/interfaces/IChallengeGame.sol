@@ -122,7 +122,7 @@ interface IChallengeGame {
     ///        pool whose payout this rate scales, so a raise after they
     ///        paid in would shrink what they collect for a defence that
     ///        won.
-    /// @param convictionBountyBpsAtFiling The conviction-bounty rate in
+    /// @param prosecutorFeeBpsAtFiling The conviction-bounty rate in
     ///        force at filing, pinned for the same reason as the clocks and
     ///        burn rates above: read live, the owner could raise it after
     ///        filing and change what the challenger stood to collect on a
@@ -148,7 +148,7 @@ interface IChallengeGame {
         uint256 disputeTimeoutAtFiling;
         uint256 settleBurnBpsAtFiling;
         uint256 forfeitBurnBpsAtFiling;
-        uint256 convictionBountyBpsAtFiling;
+        uint256 prosecutorFeeBpsAtFiling;
         /// @dev The forfeited challenger bond, net of the fail-path burn,
         ///      that the pool's funders split pro-rata to what each put in.
         ///      Written once by `_fail`, read by `claimContribution`, zero
@@ -443,7 +443,7 @@ interface IChallengeGame {
     event DisputeTimeoutSet(uint256 oldTimeout, uint256 newTimeout);
     event SettleBurnBpsSet(uint256 oldBps, uint256 newBps);
     event FilingsPausedSet(bool oldPaused, bool newPaused);
-    event ConvictionBountyBpsSet(uint256 oldBps, uint256 newBps);
+    event ProsecutorFeeBpsSet(uint256 oldBps, uint256 newBps);
     event InconclusiveBurnBpsSet(uint256 oldBps, uint256 newBps);
 
     // ── Filing ──
@@ -634,7 +634,7 @@ interface IChallengeGame {
     ///         ruling, an `Inconclusive` unwind and the dispute timeout all
     ///         route through `_fail`/`_refundAll`, which slash nothing and
     ///         so pay nothing.
-    function convictionBountyBps() external view returns (uint256);
+    function prosecutorFeeBps() external view returns (uint256);
     /// @notice The ROUND-4-AND-BEYOND steady-state share of the
     ///         challenger's bond burned on an `Inconclusive` unwind, in
     ///         bps. Rounds 1-3 follow a fixed, lower schedule (round 1
@@ -752,7 +752,7 @@ interface IChallengeGame {
     ///         a low `settleBurnBps` never blocks filing itself.
     function setSettleBurnBps(uint256 newBps) external;
     function setFilingsPaused(bool paused) external;
-    function setConvictionBountyBps(uint256 newBps) external;
+    function setProsecutorFeeBps(uint256 newBps) external;
     /// @notice Set the round-4-and-beyond steady state of the escalating
     ///         Inconclusive-burn schedule. Bounded by a ceiling at or below
     ///         `settleBurnBps`'s own, AND rejects rising above the LIVE

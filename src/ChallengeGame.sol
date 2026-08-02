@@ -248,11 +248,11 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///         (`slashToEscrow`'s `bountyTo`/`bountyBps`) — that channel has to
     ///         be caller-chosen, since only the caller knows which challenger
     ///         caused THIS conviction. This game does not restate
-    ///         `MAX_CONVICTION_BOUNTY_BPS` as its own clamp: `setConvictionBountyBps`
+    ///         `MAX_CONVICTION_BOUNTY_BPS` as its own clamp: `setProsecutorFeeBps`
     ///         and `setStakedWood` both read sWOOD's ceiling live rather than
     ///         duplicating the literal, so a compromised or buggy caller here
     ///         is bounded by sWOOD's own ceiling. `_settle` forwards the
-    ///         challenge's pinned `convictionBountyBpsAtFiling` only on a
+    ///         challenge's pinned `prosecutorFeeBpsAtFiling` only on a
     ///         contested escalated conviction — a `Guilty` ruling where the
     ///         challenger did not fund its own counter-bond — and passes
     ///         `(address(0), 0)` on every other path.
@@ -356,7 +356,18 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///         separates them: the accused contested and lost on the merits,
     ///         and a liar who is contested loses the whole bond on
     ///         `NotGuilty`. That's why the bounty is safe here at any size.
-    uint256 public convictionBountyBps = 500;
+    /// @notice Ceiling on `prosecutorFeeBps`, mirroring
+    ///         `ProposerBondEscrow.MAX_PROSECUTOR_FEE_BPS`.
+    /// @dev    A CONVENIENCE GUARD, NOT THE AUTHORITY. The escrow enforces its
+    ///         own bound on every forfeiture and is the contract that actually
+    ///         moves the WOOD; this only stops governance setting a rate that
+    ///         would be rejected later. The escrow is chosen per proposal, so
+    ///         there is no single one to consult at set time — and reading it
+    ///         at filing would make the pinned rate depend on an external call
+    ///         and pin zero for any proposal carrying no bond at all.
+    uint256 public constant MAX_PROSECUTOR_FEE_BPS = 2_000;
+
+    uint256 public prosecutorFeeBps = 500;
 
     /// @notice The round-4-and-beyond steady-state share of the challenger's
     ///         bond burned on an `Inconclusive` unwind, in bps. Default 20% —
@@ -740,9 +751,10 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             forfeitBurnBpsAtFiling: forfeitBurnBps,
             // Pinned for the same reason: a live read would change what the
             // challenger stood to collect on a conviction it already bonded
-            // against. Forwarded to `slashToEscrow` only on an escalated
-            // conviction — see `_settle`.
-            convictionBountyBpsAtFiling: convictionBountyBps,
+            // against. Bounded by `MAX_PROSECUTOR_FEE_BPS` at set time, and
+            // bounded AGAIN by the paying escrow at forfeit time — the escrow
+            // is the authority, this is the convenience guard.
+            prosecutorFeeBpsAtFiling: prosecutorFeeBps,
             // Written only by `_fail`, which is the sole path that gives the
             // pool's funders anything beyond their stake back.
             forfeitPayoutWood: 0,
@@ -1107,30 +1119,19 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             // self- or sybil-disputed win still returns the challenger's own
             // bond and pool (nothing new happens there) - this only closes the
             // BOUNTY channel on top of it.
-            // EVERY contributing approver is recorded, not just the first one
-            // found. sWOOD caps the bounty at their SUMMED slash, so the scan
-            // must be complete: stopping early would make the cap depend on
-            // array order, and a genuine defence funded by several approvers
-            // would be capped at whichever one happened to be listed first.
-            bool[] memory contestors = new bool[](approvers.length);
-            bool contested;
-            if (escalated) {
-                for (uint256 i = 0; i < approvers.length; ++i) {
-                    if (_contributed[challengeId][approvers[i]] != 0) {
-                        contestors[i] = true;
-                        contested = true;
-                    }
-                }
-            }
-            slashedWood = swood.slashVerdict(
-                key,
-                c.executedAt,
-                approvers,
-                slashBpsPer,
-                contestors,
-                contested ? c.challenger : address(0),
-                contested ? c.convictionBountyBpsAtFiling : 0
-            );
+            // THE SLASH PAYS NOBODY. Every wei taken from the approvers is
+            // burned; the prosecutor is paid from the proposer's forfeited
+            // bond below instead. The slash used to fund a conviction bounty,
+            // gated on whether one of the ACCUSED had funded the counter-bond
+            // — a predicate meant to price a staged contest by forcing the
+            // stager into the cohort its own conviction slashes. Two things
+            // were wrong with it. The accused chose the funding address, so
+            // they could zero the prosecutor's fee for free by defending from
+            // an unrelated wallet. And the slash is a pot a prosecutor CAN
+            // fund for itself, by staking and approving the proposal it is
+            // about to accuse, so the predicate needed a cap to stay priced.
+            // The proposer's bond has neither problem.
+            slashedWood = swood.slashVerdict(key, c.executedAt, approvers, slashBpsPer);
 
             // The proposer pays too: every slash above falls on the approvers
             // who underwrote the proposal, but the proposer — the actual
@@ -1154,7 +1155,14 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             // of those harms.
             address bondEscrow = c.proposerBondEscrow;
             if (bondEscrow != address(0)) {
-                try IProposerBondEscrow(bondEscrow).forfeitBond(governor, proposalId) returns (
+                // The prosecutor's fee rides here, pinned at filing like every
+                // other rate. It is paid on EVERY conviction, silence or
+                // adjudicated, because a correct accusation is equally correct
+                // either way — and the silence path is the one where the
+                // challenger is otherwise out of pocket, having burned
+                // `settleBurnBps` of its bond for a verdict nobody contested.
+                try IProposerBondEscrow(bondEscrow)
+                    .forfeitBond(governor, proposalId, c.challenger, c.prosecutorFeeBpsAtFiling) returns (
                     address bondProposer, uint256 bondAmount
                 ) {
                     emit ProposerBondForfeited(challengeId, governor, proposalId, bondProposer, bondAmount);
@@ -1674,11 +1682,11 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         forfeitBurnBps = newBps;
     }
 
-    /// @dev Re-validates `convictionBountyBps` against the NEW slasher's own
-    ///      ceiling, not just at `setConvictionBountyBps` time: re-pointing to
+    /// @dev Re-validates `prosecutorFeeBps` against the NEW slasher's own
+    ///      ceiling, not just at `setProsecutorFeeBps` time: re-pointing to
     ///      a sWOOD with a lower `MAX_CONVICTION_BOUNTY_BPS` while the rate is
     ///      unchanged would leave any already-open, already-contested
-    ///      challenge's pinned `convictionBountyBpsAtFiling` rejected by the
+    ///      challenge's pinned `prosecutorFeeBpsAtFiling` rejected by the
     ///      new slasher the moment `_settle` tries to forward it — a
     ///      permanent failure for that one challenge's conviction path (the
     ///      silence and dispute-timeout paths are unaffected, since neither
@@ -1694,7 +1702,6 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      so this enforces the sequence the scripts already follow.
     function setStakedWood(address stakedWood_) external onlyOwner {
         if (stakedWood_ == address(0)) revert ZeroAddress();
-        if (convictionBountyBps > IStakedWood(stakedWood_).MAX_CONVICTION_BOUNTY_BPS()) revert InvalidParameter();
         if (IStakedWood(stakedWood_).authorizedSlasher() != address(this)) revert RoleNotGranted();
         emit StakedWoodSet(address(stakedWood), stakedWood_);
         stakedWood = IStakedWood(stakedWood_);
@@ -1808,12 +1815,14 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      challenge (the silence and dispute-timeout paths are unaffected).
     ///      Failing closed here, at configuration time, is cheap; failing
     ///      closed at resolution time, mid-challenge, is not.
-    function setConvictionBountyBps(uint256 newBps) external onlyOwner {
-        IStakedWood swood = stakedWood;
-        if (address(swood) == address(0)) revert ZeroAddress();
-        if (newBps > swood.MAX_CONVICTION_BOUNTY_BPS()) revert InvalidParameter();
-        emit ConvictionBountyBpsSet(convictionBountyBps, newBps);
-        convictionBountyBps = newBps;
+    function setProsecutorFeeBps(uint256 newBps) external onlyOwner {
+        // Bounded here only against the absolute scale. The binding ceiling is
+        // `ProposerBondEscrow.MAX_PROSECUTOR_FEE_BPS`, enforced by the escrow
+        // itself and applied per filing by `_clampProsecutorFee` — the escrow
+        // is per-proposal, so there is no single one to consult at this point.
+        if (newBps > MAX_PROSECUTOR_FEE_BPS) revert InvalidParameter();
+        emit ProsecutorFeeBpsSet(prosecutorFeeBps, newBps);
+        prosecutorFeeBps = newBps;
     }
 
     /// @dev Bounded [0, `MAX_INCONCLUSIVE_BURN_BPS`]. Zero is allowed, exactly

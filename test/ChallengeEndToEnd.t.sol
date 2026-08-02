@@ -75,13 +75,12 @@ contract ChallengeE2EAdapter {
 ///           - `ledger.coverageFreezer`         → the per-proposal freeze (D3)
 ///           - `tierRegistry.authorizedDemoter` → the passed-challenge demotion (D7)
 ///           - `swood.authorizedSlasher`        → the silence verdict's slash (D1)
-///           - the slash has no external sink to redirect: proceeds burn. The
-///             game CAN name a caller-chosen conviction-bounty recipient
-///             (`bountyTo`/`bountyBps`, spec 2026-07-29 §2), but sWOOD caps
-///             that channel at
-///             `MAX_CONVICTION_BOUNTY_BPS` itself rather than trusting the
-///             game's own clamp — the same reason `slashBpsPer` is re-clamped
-///             in sWOOD rather than trusted from `ExposureLedger`.
+///           - the slash has no sink to redirect and no payee at all: every
+///             wei burns. The prosecutor's fee comes from the convicted
+///             proposer's forfeited bond instead, and `ProposerBondEscrow`
+///             bounds the rate itself rather than trusting the game's clamp —
+///             the same reason `slashBpsPer` is re-clamped in sWOOD rather
+///             than trusted from `ExposureLedger`.
 ///
 /// @dev    Fixture arithmetic, all exact:
 ///           - USDG 6-dec at $1.00; `_decimalsOffset()` is the asset's decimals,
@@ -534,9 +533,21 @@ contract ChallengeEndToEndTest is Test {
         //    a correct filing is cheap, not free — the old full refund fully
         //    subsidised an attacker whose payoff is the consequence rather than
         //    the bond). Nothing is stranded in the game either way.
+        //
+        //    IT ALSO COLLECTS THE PROSECUTOR'S FEE, and this is the silence
+        //    path — the one where a correct filing used to pay nothing at all
+        //    and cost the filer `settleBurnBps` of its bond. The fee comes from
+        //    the convicted PROPOSER's forfeited bond, the one pot a prosecutor
+        //    cannot fund for itself.
         uint256 settleBurn = (CHALLENGER_BOND * game.settleBurnBps()) / 10_000;
         assertGt(settleBurn, 0, "the burn is live in this fixture");
-        assertEq(wood.balanceOf(challenger), challengerBalBefore - settleBurn, "bond back less the burn");
+        uint256 prosecutorFee = (PROPOSER_BOND * game.prosecutorFeeBps()) / 10_000;
+        assertGt(prosecutorFee, 0, "and the fee is live too");
+        assertEq(
+            wood.balanceOf(challenger),
+            challengerBalBefore - settleBurn + prosecutorFee,
+            "bond back less the settle burn, plus the prosecutor's cut of the proposer bond"
+        );
         assertEq(wood.balanceOf(address(game)), 0, "the game holds nothing");
         assertEq(game.bondedWood(), 0, "and books nothing as live");
         assertEq(game.liveChallengeOf(address(gov), pid), 0, "no live challenge remains");
@@ -815,11 +826,16 @@ contract ChallengeEndToEndTest is Test {
         // burn here too — before, they went to the compensation escrow, so this
         // delta used to see only the bond and the challenger's settle burn. A
         // bare total would silently absorb a regression in any one leg.
+        //
+        //    The proposer bond arrives NET of the prosecutor's fee: that slice
+        //    pays the challenger rather than burning, which is the whole point
+        //    of funding the fee from this pot.
         uint256 settleBurn = (CHALLENGER_BOND * game.settleBurnBps()) / 10_000;
+        uint256 prosecutorFee = (PROPOSER_BOND * game.prosecutorFeeBps()) / 10_000;
         assertEq(
             wood.balanceOf(game.BURN_ADDRESS()),
-            burnBalBefore + PROPOSER_BOND + settleBurn + G1_STAKE,
-            "proposer bond + challenger settle burn + the whole slashed guardian bond all left the system"
+            burnBalBefore + (PROPOSER_BOND - prosecutorFee) + settleBurn + G1_STAKE,
+            "proposer bond net of the fee, plus the settle burn, plus the whole slashed guardian bond"
         );
         assertEq(wood.balanceOf(agent), agentBalAfterBond, "the proposer got nothing back");
 

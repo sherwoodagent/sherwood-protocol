@@ -193,22 +193,13 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     /// @dev Mirrors `IStakedWood.AuthorizedSlasherSet`.
     event AuthorizedSlasherSet(address indexed slasher);
 
-    /// @notice Emitted when a verdict slash is settled: what it took, what the
-    ///         prosecutor was paid, and what was destroyed.
-    /// @dev Reports all three legs so an indexer never has to re-derive the
-    ///      split — `gross == bounty + burned` by construction. `burned` is
-    ///      also the function's return value.
-    ///
-    ///      Replaces the `VerdictSlashRouted` / `VerdictSlashUncompensated`
-    ///      pair, which existed to tell indexers WHETHER the victims got paid.
-    ///      There is now exactly one outcome, so one event states it.
-    ///      Mirrors `IStakedWood.VerdictSlashBurned`.
-    event VerdictSlashBurned(bytes32 indexed caseKey, uint256 gross, uint256 bounty, uint256 burned);
-
-    /// @notice A conviction bounty was paid out of a verdict slash before the
-    ///         remainder was burned (spec 2026-07-29 §2).
-    /// @dev Mirrors `IStakedWood.ConvictionBountyPaid`.
-    event ConvictionBountyPaid(bytes32 indexed caseKey, address indexed bountyTo, uint256 amount);
+    /// @notice Emitted when a verdict slash is settled, reporting what was
+    ///         destroyed. `burned` is also the function's return value.
+    /// @dev The slash pays no one — there is one leg, so the event states one
+    ///      number. The prosecutor is paid from the convicted proposer's bond
+    ///      by `ProposerBondEscrow`, which is the only pot a prosecutor cannot
+    ///      fund for itself. Mirrors `IStakedWood.VerdictSlashBurned`.
+    event VerdictSlashBurned(bytes32 indexed caseKey, uint256 burned);
 
     /// @notice Emitted once per approver actually slashed for a blocked proposal.
     /// @dev A slash is a significant value-destroying change; the appeal flow
@@ -441,21 +432,6 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///      — the only protocol fee is the agent performance fee, denominated
     ///      in the VAULT's asset (see `FeeConstants`), not in WOOD.
     address internal constant BURN_ADDRESS = 0x000000000000000000000000000000000000dEaD;
-
-    /// @notice Ceiling on `slashToEscrow`'s `bountyBps`.
-    /// @dev Enforced here, not only in the caller: `ChallengeGame` pins its
-    ///      own `convictionBountyBps` to this same range at filing, but sWOOD
-    ///      is the contract that actually moves the WOOD, so it re-checks
-    ///      rather than trusting the caller's bound. An out-of-range
-    ///      `bountyBps` REVERTS (unlike `slashBpsPer`, which is silently
-    ///      clamped) so a compromised or buggy `authorizedSlasher` cannot name
-    ///      an arbitrary `bountyBps` and route the whole slash to a
-    ///      caller-chosen address — the worst it can do, per call, is redirect
-    ///      `MAX_CONVICTION_BOUNTY_BPS` of that call's slash. This bound is
-    ///      per call, not per guardian: `_verdictSlashed` keys on a
-    ///      caller-chosen `caseKey`, so repeated verdicts under fresh case
-    ///      keys still compound.
-    uint256 public constant MAX_CONVICTION_BOUNTY_BPS = 2_000;
 
     /// @notice Grouped `initialize` arguments. A struct keeps the call site
     ///         keyword-addressed, avoiding a swap-prone positional arg list.
@@ -1153,9 +1129,9 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///         authorized-slasher entrypoint).
     /// @dev Reuses the SAME per-approver own-stake leg as the review path
     ///      (`_slashOne`) AND the same sink. The two paths differ now only in
-    ///      who may drive them (`onlyAuthorizedSlasher` vs `onlyRegistry`) and
-    ///      in the conviction bounty this one can pay off the top; the
-    ///      compensation case that used to distinguish them is gone.
+    ///      who may drive them (`onlyAuthorizedSlasher` vs `onlyRegistry`).
+    ///      The compensation case that used to distinguish them is gone, and
+    ///      so is the conviction bounty: the slash pays no one.
     /// @dev SEVERITY ENVELOPE. Every element of `slashBpsPer` is clamped to
     ///      `[minSlashBps, maxSlashBps]` here, so the verdict path enforces
     ///      the SAME envelope as the review path, where `GuardianRegistry`'s
@@ -1230,60 +1206,18 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///        remains meaningful as "this approver underwrote nothing" (see the
     ///        loop). Collapsing it to a batch-wide scalar would lose that
     ///        distinction and force every named address to be slashed.
-    /// @param bountyTo  Recipient of the conviction bounty (spec 2026-07-29
-    ///        §2), or `address(0)` to disable it. Never storage — the caller
-    ///        (`ChallengeGame`) decides per settle whether this path pays at
-    ///        all, so sWOOD gains no state variable for it and this stays a
-    ///        plain UUPS upgrade.
-    /// @param bountyBps Slice of the recovered total paid to `bountyTo`, in
-    ///        bps. `0` disables the bounty even with a non-zero `bountyTo`.
-    ///        Rejected outside `[0, MAX_CONVICTION_BOUNTY_BPS]` (reverts, not
-    ///        silently clamped down) — NOT trusted from the caller, for the
-    ///        same motivation sWOOD re-checks `slashBpsPer` rather than
-    ///        trusting `ExposureLedger`'s bound: `ChallengeGame` pins its own
-    ///        rate to this range at filing, but sWOOD is the contract that
-    ///        actually moves the WOOD, so it enforces its own ceiling rather
-    ///        than relying on the caller's. Anything above
-    ///        `MAX_CONVICTION_BOUNTY_BPS` (in particular any value `>= 10_000`,
-    ///        which would otherwise be able to route the ENTIRE slash to
-    ///        `bountyTo`) reverts `InvalidParameter`.
-    /// @return total  Total WOOD burned across all approvers, NET of the
-    ///         conviction bounty — the same figure `VerdictSlashBurned` reports
-    ///         as `burned`. The event also carries the gross and the bounty, so
-    ///         an indexer can reconstruct the split without re-deriving it.
+    /// @return total  Total WOOD burned across all approvers — the figure
+    ///         `VerdictSlashBurned` reports. The slash pays no one.
     function slashVerdict(
         bytes32 caseKey,
         uint256 openedAt,
         address[] calldata approvers,
-        uint256[] calldata slashBpsPer,
-        bool[] calldata contestors,
-        address bountyTo,
-        uint256 bountyBps
+        uint256[] calldata slashBpsPer
     ) external onlyAuthorizedSlasher returns (uint256 total) {
         if (openedAt > block.timestamp) revert VerdictNotPast();
-        if (contestors.length != approvers.length) revert SlashBpsLengthMismatch();
         // Positional alignment is the only thing tying a guardian to their rate,
         // so a mismatch is a caller bug, not something to absorb.
         if (slashBpsPer.length != approvers.length) revert SlashBpsLengthMismatch();
-        // BOUNTY RATE IS NOT TRUSTED FROM THE CALLER. Same motivation as
-        // re-checking `slashBpsPer` below against `[minSlashBps,
-        // maxSlashBps]` instead of trusting `ExposureLedger`: `ChallengeGame`
-        // pins `convictionBountyBps` to `[0, 2_000]` at filing, but that bound
-        // lives in the CALLER. The mechanism differs — `slashBpsPer` is
-        // silently clamped, this reverts — because a bad payout ADDRESS
-        // should never be laundered into a smaller-but-still-caller-chosen
-        // one. Left unchecked here, a compromised or buggy `authorizedSlasher`
-        // could pass `bountyBps` up to just under 10_000 and route almost the
-        // entire slash to a `bountyTo` of its own choosing. The guarantee this
-        // preserves: a compromised slasher can divert at most
-        // `MAX_CONVICTION_BOUNTY_BPS` of any ONE call, and the remainder can
-        // only ever reach `BURN_ADDRESS`. Enforcing the ceiling here,
-        // unconditionally (even when `bountyTo == address(0)` and the rate
-        // would never be spent), keeps that guarantee true regardless of what
-        // the caller does. PER CALL, NOT PER GUARDIAN: `_verdictSlashed` keys
-        // on a caller-chosen `caseKey`, so this bounds one call's diversion,
-        // not what repeated verdicts under fresh case keys can compound to.
-        if (bountyBps > MAX_CONVICTION_BOUNTY_BPS) revert InvalidParameter();
         // NO VAULT MEMBERSHIP CHECK. The factory lookup that used to stand here
         // existed to keep the escrow's ERC20Votes
         // apportionment on vaults with OZ semantics. Nothing is apportioned any
@@ -1298,10 +1232,6 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
         // `refundSlash`. `VerdictSlashRouted` still carries the RAW `caseKey`,
         // so indexers join the two deterministically.
         bytes32 slashKey = keccak256(abi.encodePacked("sherwood.verdict", caseKey));
-
-        /// @dev Summed slash of the approvers who funded the counter-bond —
-        ///      the ceiling on the conviction bounty. See the cap below.
-        uint256 contestorSlash;
 
         // INTRA-CALL DEDUP. Each `_slashOne` pass
         // re-applies its clamped rate to the ALREADY-REDUCED live stake, so N
@@ -1360,9 +1290,6 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
             if (amt == 0) continue;
             _verdictSlashed[caseKey][approvers[i]] = true;
             total += amt;
-            // Accumulated HERE because this is the only frame that knows what
-            // each approver actually forfeited — see the bounty cap below.
-            if (contestors[i]) contestorSlash += amt;
         }
         // Nothing recovered: nothing to pay, nothing to burn.
         if (total == 0) return 0;
@@ -1378,42 +1305,11 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
         // cannot over-pay anyone, so the slash is free to exceed the loss —
         // which is the whole reason the verdict rate is now the severity
         // ceiling rather than a share of the damages.
-        // CAPPED AT WHAT THE CONTEST ACTUALLY COST ITS FUNDERS. The caller
-        // pays a bounty only when an APPROVER funded the counter-bond, which
-        // is meant to price a staged contest: to fake one you must join the
-        // cohort your own conviction slashes. That pricing argument holds only
-        // while the payout is bounded by what the faker forfeits — and the
-        // punitive rate broke that bound, because the bounty is a share of the
-        // WHOLE cohort's bonds while the faker still risks only its own.
-        //
-        // Worked: five approvers at 100,000 WOOD, an attacker joining at a
-        // 1,000 WOOD minimum stake and self-funding the pool, 500 bps ->
-        // 25,050 WOOD paid for 1,000 WOOD risked. Capping at `contestorSlash`
-        // makes that trade exactly break-even at best, for any parameter set,
-        // without a threshold to tune.
-        //
-        // SUMMED OVER EVERY CONTRIBUTING APPROVER, not the first one found: a
-        // genuine defence is funded by real approvers with real bonds, so the
-        // cap sits far above the fee and never binds. It binds only when the
-        // contest was staged by someone with nothing at stake — which is the
-        // case it exists for. A contestor whose own slash landed at zero
-        // (`amt == 0`, no live stake) contributes nothing to the cap and so
-        // unlocks no bounty, which is the same rule stated at the wei level.
-        uint256 bounty;
-        if (bountyTo != address(0) && bountyBps != 0) {
-            bounty = total * bountyBps / 10_000;
-            if (bounty > contestorSlash) bounty = contestorSlash;
-            if (bounty != 0) {
-                total -= bounty;
-                wood.safeTransfer(bountyTo, bounty);
-                emit ConvictionBountyPaid(caseKey, bountyTo, bounty);
-            }
-        }
-
         _totalStakeCheckpoint.push(uint32(block.timestamp), uint224(totalGuardianStake));
 
-        // THE SINK. `total` is already NET of the bounty, which left in the
-        // branch above; burning the gross would double-count it.
+        // THE SINK. Every wei taken burns — the slash pays no one. The
+        // prosecutor is paid from the convicted proposer's bond instead, the
+        // one pot a prosecutor cannot fund for itself.
         //
         // ONE SINK, THREE PATHS. `slashGuardians` and `slashOwnerBond` have
         // always burned outright. This path used to route to a compensation
@@ -1430,7 +1326,7 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
         // landed at this point, so only the transfer is at risk — a hostile or
         // blacklisting token cannot brick a conviction.
         _burnWood(total);
-        emit VerdictSlashBurned(caseKey, total + bounty, bounty, total);
+        emit VerdictSlashBurned(caseKey, total);
     }
 
     /// @dev Per-approver slash. Extracted to keep `slashGuardians`'s stack
