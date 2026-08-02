@@ -1246,17 +1246,21 @@ contract ExposureLedgerTest is Test {
 
         // Settled at a trough: the live cohort is worth $5,000 against an $8,000
         // need, so `_allocate` returns each bond's trough value and both bookings
-        // are written down to $2,500.
+        // are written down to $2,500. Post-#88 the effective price is
+        // `min(market, cap)`, so dropping the CAP below MARKET_X8 is what moves
+        // it — the same lever the sibling trough test pulls.
         vm.prank(owner);
-        ledger.setWoodUsdPrice(0.025e8);
+        ledger.setWoodUsdPrice(MARKET_X8 / 2);
+        assertEq(ledger.woodPriceX8(), MARKET_X8 / 2, "the cap is binding: this is the trough");
         ledger.settleCoverage(address(mgov), 1);
         uint256 atTrough = ledger.openExposureUsd(guardian);
         assertEq(atTrough, 2_500e18, "written down at the trough");
 
-        // WOOD recovers and anyone refreshes the split.
-        skip(1 days);
+        // WOOD recovers and anyone refreshes the split. Neither the interval nor
+        // the 2x ceiling exists any more (issue #89), so no wait is needed.
         vm.prank(owner);
-        ledger.setWoodUsdPrice(0.05e8);
+        ledger.setWoodUsdPrice(CAP_X8);
+        assertEq(ledger.woodPriceX8(), MARKET_X8, "back on the market price");
         ledger.settleCoverage(address(mgov), 1);
 
         assertGt(ledger.openExposureUsd(guardian), atTrough, "the booking WALKED BACK UP: still re-runnable");
