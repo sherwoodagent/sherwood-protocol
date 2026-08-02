@@ -1,5 +1,38 @@
 # wood-pricing (delta)
 
+> ## ⚠️ THE UNAVAILABILITY SCENARIOS BELOW ARE SUPERSEDED
+>
+> Read `../../design-revision-2026-08-01.md` first. Revision 2 deleted
+> `woodFallbackPriceX8`, so three things here no longer describe the code:
+>
+> - **"An unavailable TWAP degrades to today's behaviour"** — it does not.
+>   `woodUsdPriceX8` is a CAP and is never served as a price, so an unavailable
+>   TWAP with no Chainlink WOOD feed reverts `NoWoodPrice`. "No oracle wired" is
+>   not a working configuration on chain 4663.
+> - **"stale snapshot falls back to the maintained price"** — there is no
+>   maintained price left to fall back to.
+> - **"oracle reverts, is codeless, or returns malformed data"** — it still
+>   degrades to unavailable rather than propagating, which is the load-bearing
+>   half; but "still returns a price from the governance number" is wrong.
+>
+> What SURVIVES, and is the whole point: **the market may only LOWER the WOOD
+> price, never raise it** (the first requirement below), the emergency ceiling
+> caps every source, the oracle is permissionless and non-discretionary, and the
+> pair is validated before it is trusted.
+>
+> The replacement semantics, in one block:
+>
+> ```
+> sourceX8 = feed fresh ? min(feedX8, woodUsdPriceX8)
+>          : twap fresh ? min(twapX8, woodUsdPriceX8)
+>          :              revert NoWoodPrice          // incl. a zero cap
+> price    = haircut(sourceX8), floored at 1 when sourceX8 != 0
+> ```
+>
+> `recordApproval` CATCHES `NoWoodPrice` and books nothing; every other consumer
+> lets it revert. See the revision's halting-semantics table. `woodPriceDetail()`
+> returns `(price, fromFeed, capBinding)` rather than `(price, usingFallback)`.
+
 ## ADDED Requirement: The TWAP may only lower the WOOD price, never raise it
 
 This is the load-bearing invariant. It is stated as a requirement rather than a

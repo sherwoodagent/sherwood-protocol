@@ -1,5 +1,27 @@
 # Tasks
 
+> ## ⚠️ TASKS 4, 4a, 7a AND 9 ARE SUPERSEDED — read `design-revision-2026-08-01.md`
+>
+> They describe the two-number model (`woodFallbackPriceX8` plus a ceiling),
+> which revision 2 deleted. What actually shipped, and how each differs:
+>
+> - **4** — the resolution order is `feed fresh ? min(feed, cap) : twap fresh ?
+>   min(twap, cap) : revert NoWoodPrice`. The cap is never served as a price, so
+>   there is no "fallback" branch left to order. `woodPriceDetail()` returns
+>   `(price, fromFeed, capBinding)`.
+> - **4a** — `woodFallbackPriceX8` was NOT added. Deleting it *is* the change.
+> - **4c** — resolved by finding 7: a zero cap now REVERTS rather than driving
+>   the price to zero, so the `effectiveTotal == 0` hazard this task worried
+>   about is unreachable through the emergency stop.
+> - **7a** — the pre-flight asserts `woodUsdPriceX8 != 0` AND that the composed
+>   `woodPriceX8()` resolves. The second half is the one that matters: a
+>   cap-only assert passes a deployment with nothing priced beneath the cap.
+> - **9** — `docs/robinhood-fork-deployment.md` was deleted by PR #85 (docs
+>   migrated to OpenSpec). That content now lives in
+>   `openspec/specs/deployment-docs/spec.md` and was updated there.
+>
+> Tasks 1, 2, 3, 5, 6, 8 and 10 stand as written.
+
 - [x] 1. ~~Verify the fork before building anything.~~ **DONE 2026-08-01 —
   proven standard by CREATE2 derivation** (see design.md risks). The pair at
   `0xBF3BB81de6285b8310A028d1C2Cd38F9419d54C1` reproduces exactly from the

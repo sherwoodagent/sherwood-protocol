@@ -38,12 +38,26 @@ contract WoodTwapOracleTest is Test {
     /// @dev $1,867.55, the live 4663 ETH/USD answer on 2026-08-01.
     int256 internal constant ETH_USD_ANSWER = 186_755_036_180;
 
-    uint256 internal constant WINDOW = 1 hours;
-    uint256 internal constant MAX_AGE = 6 hours;
-    /// @dev The live 4663 ETH/USD feed was measured ~10 hours old while healthy,
-    ///      so a tight delay here would make the USD leg permanently
-    ///      unavailable. See `MAX_ETH_USD_DELAY_LIMIT` in the oracle.
-    uint256 internal constant ETH_DELAY = 2 days;
+    // ── THE PRODUCTION TRIPLE, AND WHY IT IS SHAPED THIS WAY ──
+    //
+    // The three parameters are cross-constrained:
+    //
+    //     ethUsdMaxDelay  <=  twapWindow  <=  maxTwapAge  <=  1 day
+    //
+    // and the binding constraint at the bottom is EMPIRICAL: the live 4663
+    // ETH/USD feed was measured ~10.7 HOURS old while perfectly healthy, so any
+    // `ethUsdMaxDelay` below that makes the USD leg permanently unavailable —
+    // which under design revision 2 is a protocol halt, not a skipped ceiling.
+    // 12 hours clears it with margin, and the window must then be at least 12
+    // hours too (finding 4: a WOOD/ETH average taken over an hour and converted
+    // by a half-day-old ETH quote splices two eras).
+    //
+    // The old fixture ran 1h / 6h / 2d, which BOTH the finding-4 and finding-5
+    // invariants now reject — that combination is precisely the compounding
+    // this change closes.
+    uint256 internal constant WINDOW = 12 hours;
+    uint256 internal constant MAX_AGE = 24 hours;
+    uint256 internal constant ETH_DELAY = 12 hours;
 
     function setUp() public {
         // Start the clock somewhere realistic. Forge begins at `block.timestamp
@@ -234,8 +248,13 @@ contract WoodTwapOracleTest is Test {
         vm.expectRevert(IWoodTwapOracle.InvalidParameter.selector);
         oracle.setTwapWindow(hi + 1);
 
-        vm.prank(owner);
+        // Reaching the absolute floor takes TWO transactions, because the
+        // window may not drop below `ethUsdMaxDelay` (finding 4). That
+        // ordering requirement is the point, not an inconvenience.
+        vm.startPrank(owner);
+        oracle.setEthUsdMaxDelay(lo);
         oracle.setTwapWindow(lo);
+        vm.stopPrank();
         assertEq(oracle.twapWindow(), lo, "an in-bounds window must be accepted");
     }
 
@@ -255,6 +274,156 @@ contract WoodTwapOracleTest is Test {
         vm.prank(keeper);
         vm.expectRevert();
         oracle.setTwapWindow(2 hours);
+    }
+
+    // ── FINDING 5: the window and the age bound must be satisfiable ────────
+
+    /// @notice `MAX_TWAP_WINDOW` was 3 days against a `MAX_SNAPSHOT_AGE_LIMIT`
+    ///         of 1 day, so every window above a day was STRUCTURALLY
+    ///         unavailable: `update()` refuses a second snapshot before the
+    ///         window elapses, by which point the first is already older than
+    ///         any legal `maxTwapAge`. The oracle reported unavailable forever
+    ///         with no error to point at.
+    function test_maxTwapWindow_cannotExceedTheSnapshotAgeLimit() public view {
+        assertEq(
+            oracle.MAX_TWAP_WINDOW(),
+            oracle.MAX_SNAPSHOT_AGE_LIMIT(),
+            "a window longer than the age bound can never be fresh"
+        );
+    }
+
+    /// @notice The invariant is enforced from BOTH sides, so it cannot be
+    ///         inverted by moving the other parameter.
+    function test_setters_refuseToInvertWindowAndMaxAge() public {
+        vm.startPrank(owner);
+
+        // Window above the current age bound: refused.
+        vm.expectRevert(IWoodTwapOracle.InvalidParameter.selector);
+        oracle.setTwapWindow(MAX_AGE + 1 hours);
+
+        // Age bound below the current window: refused.
+        vm.expectRevert(IWoodTwapOracle.InvalidParameter.selector);
+        oracle.setMaxTwapAge(WINDOW - 1 hours);
+
+        // The legal moves are the ones that keep the chain ordered. `MAX_AGE`
+        // is already the hard limit here, so the window may grow right up to
+        // it — and no further.
+        oracle.setTwapWindow(MAX_AGE);
+        assertEq(oracle.twapWindow(), MAX_AGE, "a window equal to the age bound is legal");
+        vm.stopPrank();
+    }
+
+    /// @notice The constructor enforces the same triple. A deploy could
+    ///         otherwise seat a configuration no setter would ever accept, and
+    ///         nothing downstream revalidates it.
+    function test_constructor_refusesAWindowLongerThanTheAgeBound() public {
+        vm.expectRevert(IWoodTwapOracle.InvalidParameter.selector);
+        new WoodTwapOracle(owner, address(pair), wood, weth, address(ethUsd), 20 hours, 12 hours, ETH_DELAY);
+    }
+
+    // ── FINDING 4: ETH/USD staleness must not compound ─────────────────────
+
+    /// @notice The compound bound. `consult()` may serve a snapshot up to
+    ///         `maxTwapAge` old converted by an ETH/USD answer up to
+    ///         `ethUsdMaxDelay` old; at the old 7-day ceiling that admitted a
+    ///         "current" WOOD/USD price assembled from data eight days stale.
+    ///
+    /// @dev    The ceiling must not be tightened below the MEASURED healthy
+    ///         heartbeat either — 10.7 hours on the live 4663 feed — or the USD
+    ///         leg is permanently unavailable and the protocol permanently
+    ///         halted. Both directions are asserted, because both are bugs.
+    function test_ethUsdDelayLimit_boundsCompoundStalenessWithoutBrickingTheFeed() public view {
+        assertLe(oracle.MAX_ETH_USD_DELAY_LIMIT(), 1 days, "compound staleness must be bounded at ~2 days");
+        assertGe(
+            oracle.MAX_ETH_USD_DELAY_LIMIT(),
+            12 hours,
+            "must clear the 10.7h heartbeat measured on the live 4663 feed, with margin"
+        );
+    }
+
+    /// @notice The USD leg may not be staler than the WOOD/ETH average it
+    ///         converts. Enforced at CONFIGURATION time, so the alternative —
+    ///         an oracle that silently reports unavailable forever — is
+    ///         unreachable.
+    function test_setters_refuseAnEthDelayLongerThanTheWindow() public {
+        vm.startPrank(owner);
+
+        vm.expectRevert(IWoodTwapOracle.InvalidParameter.selector);
+        oracle.setEthUsdMaxDelay(WINDOW + 1);
+
+        // And the window cannot be shortened under the delay from the other
+        // side either.
+        vm.expectRevert(IWoodTwapOracle.InvalidParameter.selector);
+        oracle.setTwapWindow(ETH_DELAY - 1);
+
+        vm.stopPrank();
+    }
+
+    function test_constructor_refusesAnEthDelayLongerThanTheWindow() public {
+        vm.expectRevert(IWoodTwapOracle.InvalidParameter.selector);
+        new WoodTwapOracle(owner, address(pair), wood, weth, address(ethUsd), 1 hours, MAX_AGE, 12 hours);
+    }
+
+    /// @notice The runtime half: even if the configured delay were somehow
+    ///         looser than the window, the read itself takes `min(delay,
+    ///         window)` and refuses.
+    function test_consult_refusesAnEthAnswerOlderThanTheWindow() public {
+        _primeWindow();
+
+        // One second inside the window: still priced.
+        ethUsd.setUpdatedAt(vm.getBlockTimestamp() - (WINDOW - 1));
+        (, bool ok) = oracle.consult();
+        assertTrue(ok, "an ETH answer inside the averaging window is usable");
+
+        // One second outside it: refused.
+        ethUsd.setUpdatedAt(vm.getBlockTimestamp() - (WINDOW + 1));
+        (, bool stillOk) = oracle.consult();
+        assertFalse(stillOk, "an ETH answer older than the window splices two eras");
+    }
+
+    // ── FINDING 8: the extrapolated tail is bounded against the SPAN ───────
+
+    /// @notice The old guard compared `idle` to `maxTwapAge`, which is
+    ///         `>= twapWindow` by construction — so a pair that had not traded
+    ///         for the WHOLE window passed it and produced a "TWAP" that was
+    ///         100% extrapolated at spot, exactly reproducing the manipulable
+    ///         quantity while still reporting `ok == true`. Exact accumulator
+    ///         arithmetic is not a defence when every input is spot.
+    function test_update_refusesATailWorthMoreThanAFractionOfTheWindow() public {
+        uint256 limit = WINDOW / oracle.MAX_IDLE_SPAN_DIVISOR();
+
+        // A tail at exactly the bound is accepted.
+        pair.touch();
+        vm.warp(vm.getBlockTimestamp() + limit);
+        assertTrue(oracle.update(), "a tail at exactly the bound is fine");
+
+        // One second more is refused — and note this is FAR below `maxTwapAge`,
+        // which is what the old guard compared against.
+        vm.warp(vm.getBlockTimestamp() + WINDOW + 1);
+        pair.touch();
+        oracle.update();
+        vm.warp(vm.getBlockTimestamp() + limit + 1);
+        assertLt(limit + 1, oracle.maxTwapAge(), "the old bound would have let this through");
+        assertFalse(oracle.update(), "a tail past the bound must not be snapshotted");
+    }
+
+    /// @notice The concrete attack the bound closes: a pair idle across the
+    ///         whole window, whose "average" is just whatever spot the last
+    ///         swap set. `update()` must refuse to record it at all.
+    function test_update_refusesAFullyExtrapolatedSnapshot() public {
+        pair.touch();
+        oracle.update();
+
+        // Idle for the entire averaging window: every wei of the second
+        // snapshot's contribution would be filled in at CURRENT spot.
+        vm.warp(vm.getBlockTimestamp() + WINDOW);
+        assertLe(WINDOW, oracle.maxTwapAge(), "this is the shape the old guard admitted");
+        assertFalse(oracle.update(), "a 100%-extrapolated snapshot is refused");
+
+        // And nothing was recorded, so `consult()` stays unavailable rather
+        // than serving the spot reading.
+        (, bool ok) = oracle.consult();
+        assertFalse(ok, "no completed window from a refused snapshot");
     }
 
     // ── validatePair ──

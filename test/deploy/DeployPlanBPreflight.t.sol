@@ -15,6 +15,7 @@ import {SyndicateVault} from "../../src/SyndicateVault.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAggregatorV3} from "../mocks/MockAggregatorV3.sol";
+import {MockWoodTwapOracle} from "../mocks/MockWoodTwapOracle.sol";
 
 /// @dev THE ONLY WAY TO RUN A SCRIPT AS ITS OWN BROADCASTER FROM A TEST.
 ///      `vm.startBroadcast()` executes the script's calls as forge's
@@ -162,7 +163,13 @@ contract DeployPlanBPreflightTest is Test {
     DeployPlanB internal script;
 
     uint256 internal constant FEED_MAX_DELAY = 1 days;
-    uint256 internal constant WOOD_PRICE_X8 = 5e7; // $0.50, 8-dec
+    /// @dev The price CAP, $0.50. It is NOT a price — pre-flight 8 requires it
+    ///      non-zero, and the market sits BELOW it (see `WOOD_MARKET_X8`), which
+    ///      is the configuration production ships.
+    uint256 internal constant WOOD_PRICE_CAP_X8 = 5e7;
+    /// @dev What the TWAP oracle reports, $0.25 — half the cap, so the cap is
+    ///      non-binding and the deployed ledger prices off the market.
+    uint256 internal constant WOOD_MARKET_X8 = 2.5e7;
     uint256 internal constant COVERED_TVL_CAP = 1_000_000e18;
 
     // The address book the next script run should see. See `_book`.
@@ -174,11 +181,20 @@ contract DeployPlanBPreflightTest is Test {
     // value an UNSET `MAX_STRATEGY_DURATION` produces in `run()`. See
     // `test_deploy_seatsTheProtocolDurationCeiling`.
     uint256 internal bookMaxStrategyDuration;
+    /// @dev The live WOOD price source. Under design revision 2 the deployed
+    ///      ledger CANNOT price a bond without one — `woodUsdPriceX8` is a cap,
+    ///      never a price — so a book with a zero here is a book pre-flight 8
+    ///      refuses. Seeded in `setUp`; a test that wants the refusal clears it.
+    address internal bookTwapOracle;
+    /// @dev The price CAP the next run should seed. A test that wants
+    ///      pre-flight 8's first assert zeroes it.
+    uint256 internal bookCapPriceX8 = WOOD_PRICE_CAP_X8;
 
     function setUp() public {
         wood = new ERC20Mock("WOOD", "WOOD", 18);
         usdg = new ERC20Mock("USDG", "USDG", 6);
         usdgFeed = new MockAggregatorV3(8, 1e8);
+        bookTwapOracle = address(new MockWoodTwapOracle(WOOD_MARKET_X8));
 
         StakedWood swoodImpl = new StakedWood();
         bytes memory swoodInit = abi.encodeCall(
@@ -516,6 +532,55 @@ contract DeployPlanBPreflightTest is Test {
         assertEq(protocolConfig.maxStrategyDuration(), 30 days, "and the run must still seat the ceiling");
     }
 
+    // ── PRE-FLIGHT 8: the WOOD price must actually resolve ─────────────────
+    //
+    // Finding 2. Under design revision 2 `woodUsdPriceX8` is a CAP that is
+    // never served as a price, so a deployment can be misconfigured in two
+    // independent ways that both leave every price read reverting
+    // `NoWoodPrice` — nothing proposable, executable or challengeable — while
+    // every other pre-flight in this file passes. Each gets its own assert, and
+    // each gets its own test, because the operator's remedy differs.
+
+    /// @dev (a) The CAP is unset. A zero cap is not "uncapped"; it is a revert.
+    function test_preflight_bites_whenTheWoodPriceCapIsZero() public {
+        bookCapPriceX8 = 0;
+        _runExpecting("PRE-FLIGHT: ExposureLedger.woodUsdPriceX8 is 0");
+    }
+
+    /// @dev (b) The CAP is set but nothing prices under it. This is the shape a
+    ///      cap-only check would MISS: `woodUsdPriceX8 != 0` proves the ceiling
+    ///      is configured and says nothing about whether anything is priced
+    ///      beneath it. Chain 4663 has no Chainlink WOOD/USD feed, so with no
+    ///      oracle wired the ledger has no source at all.
+    function test_preflight_bites_whenNoWoodPriceSourceIsWired() public {
+        bookTwapOracle = address(0);
+        _runExpecting("PRE-FLIGHT: ExposureLedger.woodPriceX8() does not resolve");
+    }
+
+    /// @dev (c) The oracle is wired but has no completed averaging window yet —
+    ///      the operationally likely mistake, since `WoodTwapOracle` needs at
+    ///      least `twapWindow` of keeper activity before `consult()` answers.
+    ///      Refused, which is what forces the deploy-and-prime-first ordering.
+    function test_preflight_bites_whenTheOracleHasNoCompletedWindowYet() public {
+        MockWoodTwapOracle(bookTwapOracle).setAvailable(false);
+        _runExpecting("PRE-FLIGHT: ExposureLedger.woodPriceX8() does not resolve");
+    }
+
+    /// @dev The passing shape, asserted on the DEPLOYED state rather than on
+    ///      the book: the oracle landed, the cap landed, and the composed price
+    ///      is the MARKET — proving the cap was seeded above it and is not
+    ///      binding, which is the configuration production ships.
+    function test_deploy_wiresTheOracleAndPricesOffTheMarket() public {
+        _run();
+
+        ExposureLedger ledger = ExposureLedger(swood.exposureLedger());
+        assertEq(ledger.woodTwapOracle(), bookTwapOracle, "the oracle must be wired by the script");
+        assertEq(ledger.woodUsdPriceX8(), WOOD_PRICE_CAP_X8, "the cap must land");
+        assertEq(ledger.woodPriceX8(), WOOD_MARKET_X8, "priced off the market, with the cap above it");
+        (,, bool capBinding) = ledger.woodPriceDetail();
+        assertFalse(capBinding, "a cap seeded BELOW market would bind and make the oracle inert");
+    }
+
     // ─────────────────────────────── helpers ───────────────────────────────
 
     /// @dev THE ADDRESS BOOK IS PASSED, NOT SET IN THE ENVIRONMENT. `run()`'s
@@ -543,10 +608,11 @@ contract DeployPlanBPreflightTest is Test {
             usdg: address(usdg),
             usdgFeed: address(usdgFeed),
             feedMaxDelay: FEED_MAX_DELAY,
-            woodPriceX8: WOOD_PRICE_X8,
+            woodPriceCapX8: bookCapPriceX8,
             coveredTvlCapUsd: bookCap,
             protocolConfig: address(protocolConfig),
-            maxStrategyDuration: bookMaxStrategyDuration
+            maxStrategyDuration: bookMaxStrategyDuration,
+            woodTwapOracle: bookTwapOracle
         });
     }
 
