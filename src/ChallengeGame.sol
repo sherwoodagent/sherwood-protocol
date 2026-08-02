@@ -1112,6 +1112,30 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             // must be complete: stopping early would make the cap depend on
             // array order, and a genuine defence funded by several approvers
             // would be capped at whichever one happened to be listed first.
+            //
+            // KNOWN RESIDUAL — THE ACCUSED CAN STILL ZERO THE BOUNTY, FOR FREE.
+            // `dispute` has open standing, so the accused may fund the pool
+            // from a fresh address that never approved. `contested` then stays
+            // false, sWOOD's cap reads zero, and the challenger is paid nothing
+            // beyond its bond and the forfeited pool. The accused gain nothing
+            // by it — the pool is forfeited either way and every approver is
+            // slashed at the ceiling regardless — so it is a costless grief
+            // rather than a profit.
+            //
+            // It has no clean on-chain fix at this seam. Paying on `escalated`
+            // alone changes nothing, because the cap still reads zero with no
+            // approver contributor. Widening the cap to include the forfeited
+            // pool re-opens the sybil it was added to close: a challenger who
+            // self-funds through a proxy would collect a bounty against money
+            // it gets back anyway, and proxy addresses are not distinguishable
+            // here. Restricting `dispute` to the accused set would work, but it
+            // would deny a defence to an honest guardian whose WOOD is all
+            // staked, which is a worse failure than an unpaid bounty.
+            //
+            // The durable fix is to stop paying the prosecutor on the path
+            // where it is already paid: on an escalated win the challenger
+            // takes bond + pool, while a correct SILENCE conviction pays it
+            // nothing and burns `settleBurnBps` of its bond. See issue #91.
             bool[] memory contestors = new bool[](approvers.length);
             bool contested;
             if (escalated) {
@@ -1162,19 +1186,35 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
                     emit ProposerBondForfeitureFailed(challengeId, governor, proposalId, bondEscrow);
                 }
             }
-        }
 
-        // Demotes only the adapter the filing named, already checked against
-        // the proposal's own execute calls in `file`. Best-effort, deliberately:
-        // `demoteByChallenge` is role-gated on the registry's side, so a
-        // revocable role pointed elsewhere while this challenge was live must
-        // not take the whole verdict down with it — the miss is surfaced as an
-        // event and the verdict proceeds; the registry owner's own `demote`
-        // fixes it afterward.
-        if (c.adapterTarget != address(0)) {
-            try tierRegistry.demoteByChallenge(c.adapterTarget, c.adapterSelector) {}
-            catch {
-                emit AdapterDemotionFailed(challengeId, c.adapterTarget, c.adapterSelector);
+            // Demotes only the adapter the filing named, already checked
+            // against the proposal's own execute calls in `file`. Best-effort,
+            // deliberately: `demoteByChallenge` is role-gated on the registry's
+            // side, so a revocable role pointed elsewhere while this challenge
+            // was live must not take the whole verdict down with it — the miss
+            // is surfaced as an event and the verdict proceeds; the registry
+            // owner's own `demote` fixes it afterward.
+            //
+            // INSIDE THIS BRANCH, NOT AFTER THE IF/ELSE. Demotion is a
+            // consequence of a conviction this settle actually collected. The
+            // diverted branch adjudicates nothing — it slashes no one and
+            // forfeits no bond — so letting it demote handed out the game's
+            // `authorizedDemoter` role for a settle that recovered nothing.
+            //
+            // That was reachable and cheap. Concurrency is unguarded by
+            // design: `_liveByChallenger` is keyed per challenger, `_convicted`
+            // is false for every filing made before the first settle, and
+            // `_liveCount` is uncapped. An attacker filed N challenges from N
+            // addresses naming N different certified adapters touched by one
+            // proposal; the first settle collected the liability and the rest
+            // diverted here but still demoted, at `settleBurnBps` of a bond
+            // that is itself `challengerBondBps` of coverage — roughly 1% of
+            // the proposal's coverage per certification revoked.
+            if (c.adapterTarget != address(0)) {
+                try tierRegistry.demoteByChallenge(c.adapterTarget, c.adapterSelector) {}
+                catch {
+                    emit AdapterDemotionFailed(challengeId, c.adapterTarget, c.adapterSelector);
+                }
             }
         }
 

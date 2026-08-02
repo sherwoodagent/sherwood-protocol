@@ -3885,6 +3885,54 @@ contract ChallengeGameTest is Test {
         _assertLiveBondsBacked();
     }
 
+    /// @notice A DIVERTED SETTLE MUST NOT SPEND THE DEMOTER ROLE. The
+    ///         `VerdictAlreadyCollected` branch adjudicates nothing — it
+    ///         slashes no one and forfeits no bond — so it has no conviction to
+    ///         carry a consequence for. The demotion used to sit AFTER the
+    ///         if/else and therefore fired on this branch too.
+    ///
+    ///         That was cheap to farm. Concurrency is unguarded by design:
+    ///         `_liveByChallenger` is keyed per challenger, `_convicted` is
+    ///         false for every filing made before the first settle, and
+    ///         `_liveCount` is uncapped. File N challenges from N addresses
+    ///         naming N different certified adapters the proposal touched, let
+    ///         the first collect the liability, and the remaining N-1 divert
+    ///         here while still revoking a certification apiece — for
+    ///         `settleBurnBps` of a bond that is itself `challengerBondBps` of
+    ///         coverage, roughly 1% of the proposal's coverage per adapter.
+    function test_settle_divertedVerdictDoesNotDemoteTheAdapter() public {
+        uint256 id = _fileStandard(PROPOSAL);
+        assertTrue(game.challengeOf(id).adapterTarget != address(0), "fixture: the filing named an adapter");
+
+        // Collect the liability out from under the live challenge, so the
+        // settle takes the diverted branch.
+        bytes32 key = _reviewKeyFor(address(gov), PROPOSAL);
+        swood.setVerdictSlashed(key, guardianA, true);
+        swood.setVerdictSlashed(key, guardianB, true);
+
+        uint256 demotesBefore = tiers.demoteCount();
+
+        vm.warp(_filedAt(id) + game.autoSlashDelay());
+        vm.expectEmit(true, true, true, true, address(game));
+        emit IChallengeGame.VerdictAlreadyCollected(id, address(gov), PROPOSAL);
+        game.resolve(id);
+
+        assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Settled), "still terminal");
+        assertEq(tiers.demoteCount(), demotesBefore, "a settle that collected nothing must revoke nothing");
+    }
+
+    /// @notice ...and the collecting settle still DOES demote, so the fix
+    ///         narrowed the branch rather than disabling the consequence.
+    function test_settle_collectingVerdictStillDemotesTheAdapter() public {
+        uint256 id = _fileStandard(PROPOSAL);
+        uint256 demotesBefore = tiers.demoteCount();
+
+        vm.warp(_filedAt(id) + game.autoSlashDelay());
+        game.resolve(id);
+
+        assertEq(tiers.demoteCount(), demotesBefore + 1, "a real conviction still demotes the named adapter");
+    }
+
     /// @notice B1 END TO END ON THE REDEPLOY ITSELF: a V2 filing that was legal
     ///         when made (nothing collected yet) but whose liability V1 collects
     ///         while it is live. This is the case `file`'s gate structurally
