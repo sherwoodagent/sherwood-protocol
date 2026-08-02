@@ -621,9 +621,14 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///         `TokenCourt._participationFloor` subtracts the accused cohort
     ///         from the electorate using this getter rather than
     ///         `getPastVotes`, so the accused sum can never exceed the total
-    ///         by construction — both traces are pushed in the same
+    ///         AT THE SAME TIMESTAMP — both traces are pushed in the same
     ///         transaction at every mutation site (stake, request, cancel,
-    ///         slash). Using the raw basis also denies the accused a lever on
+    ///         slash). That bound is same-instant only: the court's base is
+    ///         the MIN over a 30-day lookback, so the accused sum at the
+    ///         snapshot CAN exceed a smaller earlier electorate, and the court
+    ///         clamps that subtraction at zero rather than falling back to the
+    ///         unreduced base. Using the raw basis also denies the accused a
+    ///         lever on
     ///         its own conviction threshold: an aged basis would let an
     ///         accused approver call `requestUnstakeGuardian` between the
     ///         drain and `refer`, re-anchoring its `stakedAt` and flooring its

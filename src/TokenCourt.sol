@@ -358,12 +358,15 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///         bar outright: none of the beneficiary's other addresses are in
     ///         the accused set, so they vote freely. The floor mechanics make
     ///         this worse, not neutral: `_participationFloor` subtracts the
-    ///         accused set's raw stake from the electorate base, so every
-    ///         address the accused set DOES name shrinks the floor the
-    ///         siblings' un-accused addresses must clear to carry the vote —
-    ///         a larger accused cohort makes the remaining, still-interested
-    ///         electorate's job easier, not harder. This is likely unfixable
-    ///         under permissionless staking (there is no on-chain notion of
+    ///         accused set's raw stake from the electorate base and CLAMPS
+    ///         THAT SUBTRACTION AT ZERO, so every address the accused set DOES
+    ///         name shrinks the floor the siblings' un-accused addresses must
+    ///         clear to carry the vote — unconditionally, all the way down to
+    ///         a floor of zero once the named cohort covers the base. A larger
+    ///         accused cohort makes the remaining, still-interested
+    ///         electorate's job easier, never harder, at every size. This is
+    ///         likely unfixable under permissionless staking (there is no
+    ///         on-chain notion of
     ///         "the same party"); the natspec must not claim the bar covers a
     ///         defendant or a party — only that it covers the specific
     ///         addresses the ledger already named as approvers.
@@ -566,24 +569,45 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
         }
     }
 
-    /// @dev THE FLOOR'S BASE IS `min(getPastTotalVotes(snapshotTs),
-    ///      getPastTotalVotes(snapshotTs - FLOOR_LOOKBACK)) - accusedWeight`,
-    ///      with a `>` fallback to the unreduced base when the subtrahend
-    ///      would not strictly reduce it. `accusedWeight` sums `getPastStake`
+    /// @dev THE FLOOR'S BASE IS `max(0, min(getPastTotalVotes(snapshotTs),
+    ///      getPastTotalVotes(snapshotTs - FLOOR_LOOKBACK)) - accusedWeight)`
+    ///      — the accused subtraction CLAMPS AT ZERO when the subtrahend
+    ///      meets or exceeds the base. `accusedWeight` sums `getPastStake`
     ///      over the accused set, the exact same raw-own-stake basis
     ///      `getPastTotalVotes` sums over the whole electorate — so the two
     ///      operands are the same measure of the same WOOD.
-    /// @dev THE `>` FALLBACK IS A LIVE BRANCH, NOT DEFENCE-IN-DEPTH:
+    /// @dev THE CLAMPED BRANCH IS A LIVE BRANCH, NOT DEFENCE-IN-DEPTH:
     ///      `accusedWeight <= total` does not hold by construction once the
     ///      lookback below is in play — the base can come from `snapshotTs -
     ///      FLOOR_LOOKBACK`, an instant at which an accused approver who
     ///      staked recently was not yet counted, so `accusedWeight` (still
     ///      measured at `snapshotTs`, where it must be, because that is the
     ///      stake a conviction actually slashes) can legitimately exceed it.
-    ///      The fallback direction is the safe one: it yields
-    ///      `bps * base` with `base <= accusedWeight`, i.e. a SMALLER floor
-    ///      than the subtraction would have produced — never a larger one, so
-    ///      it cannot be turned into a denial lever of its own.
+    ///      THE INVARIANT THE CLAMP BUYS IS MONOTONICITY: the floor is
+    ///      monotone NON-INCREASING in `accusedWeight`, so growing the accused
+    ///      cohort's recorded stake can only ever lower the bar its jury must
+    ///      clear, never raise it, and there is no discontinuity at the
+    ///      crossing. The adversary is the accused set itself. Falling back to
+    ///      the UNREDUCED base instead would make the floor jump from
+    ///      near-zero straight to its maximum (`bps * base`) at the crossing,
+    ///      so an accused approver — who controls `accusedWeight` by staking
+    ///      more before its own drain, inside `FLOOR_LOOKBACK` — could buy a
+    ///      forced `Inconclusive` (no slash, no `_convicted` mark, no adapter
+    ///      demotion, counter-bond returned whole) for one extra wei of stake.
+    ///      That is strictly cheaper than the non-approving-address denial
+    ///      lever the lookback min below exists to close, and it lands in this
+    ///      exact branch.
+    ///
+    ///      A ZERO FLOOR IS SAFE HERE because the floor was never the guard
+    ///      against an empty vote: `finalize`'s `turnout == 0` check sits
+    ///      ahead of the `turnout < floor` comparison and forces
+    ///      `Inconclusive` on a silent electorate no matter what this returns,
+    ///      so a zero floor can never let a zero-turnout case resolve on the
+    ///      merits. What a zero floor DOES admit is any single unaccused voter
+    ///      with non-zero aged weight carrying the case — which is the correct
+    ///      continuous limit of the subtraction (at `accusedWeight = base - 1`
+    ///      the floor is already dust), and the right answer when the accused
+    ///      cohort is the electorate: whoever is left unaccused IS the jury.
     /// @dev THE BASE IS THE MIN OVER A LOOKBACK. The snapshot defends the
     ///      NUMERATOR: vote weight is read at `executedAt - 1`, so post-drain
     ///      buyers and flash loans
@@ -735,7 +759,10 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
         // which case the snapshot total stands — see the fallback rationale
         // above for why zero is the wrong failure there.
         uint256 base = (earlier != 0 && earlier < total) ? earlier : total;
-        base = base > accusedWeight ? base - accusedWeight : base;
+        // Clamped at zero, NOT fallen back to the unreduced base: the floor
+        // must be monotone non-increasing in `accusedWeight` — see the
+        // clamp rationale above.
+        base = base > accusedWeight ? base - accusedWeight : 0;
         return participationFloorBps * base / BPS_DENOMINATOR;
     }
 
