@@ -122,14 +122,15 @@ interface IChallengeGame {
     ///        pool whose payout this rate scales, so a raise after they
     ///        paid in would shrink what they collect for a defence that
     ///        won.
-    /// @param prosecutorFeeBpsAtFiling The conviction-bounty rate in
-    ///        force at filing, pinned for the same reason as the clocks and
-    ///        burn rates above: read live, the owner could raise it after
-    ///        filing and change what the challenger stood to collect on a
-    ///        conviction it had already committed its bond toward.
-    ///        Forwarded to `IStakedWood.slashToEscrow` as `bountyBps`, but
-    ///        only on an escalated (`Guilty`-ruled) conviction, never on the
-    ///        silence settle. See `ChallengeGame._settle`.
+    /// @param prosecutorFeeBpsAtFiling The prosecutor-fee rate in force at
+    ///        filing, pinned for the same reason as the clocks and burn rates
+    ///        above: read live, the owner could raise it after filing and
+    ///        change what the challenger stood to collect on a conviction it
+    ///        had already committed its bond toward. Forwarded to
+    ///        `IProposerBondEscrow.forfeitBond` as `feeBps` on EVERY
+    ///        conviction, silence settle included — it is a slice of the
+    ///        proposer's forfeited bond, not of the slash, which pays no one.
+    ///        See `ChallengeGame._settle`.
     struct Challenge {
         address governor;
         uint256 proposalId;
@@ -278,7 +279,7 @@ interface IChallengeGame {
     ///         harmlessly: every terminal path of a live challenge routes
     ///         through `unfreezeCoverage` (which reverts
     ///         `NotCoverageFreezer`) and every conviction through
-    ///         `slashToEscrow` (which reverts on its own caller gate),
+    ///         `slashVerdict` (which reverts on its own caller gate),
     ///         leaving bonds and the counter-bond pool with no exit and the
     ///         coverage frozen on a ledger that can no longer be told to
     ///         release it. Grant the role on the target contract first,
@@ -358,7 +359,8 @@ interface IChallengeGame {
     ///       slice of its own bond (the silence-path burn applies regardless of
     ///       which concurrent challenge actually collected) and receives
     ///       nothing back beyond the remainder of its own bond — no slash
-    ///       share, no bounty, because nothing was slashed on ITS behalf. A
+    ///       share and no prosecutor fee, because this settle collected no
+    ///       liability and forfeited no bond on ITS behalf. A
     ///       second, independently correct challenger racing an already-
     ///       settled one is therefore net `-settleBurnBps` of its bond for a
     ///       filing that could never have collected — spec-compliant (the
@@ -505,10 +507,12 @@ interface IChallengeGame {
     ///         instead — a `Guilty` ruling forfeits the whole pool to the
     ///         challenger, so an outside funder risks real capital.
     ///
-    ///         What IS still restricted is what the contribution EARNS,
-    ///         not who may make it: `_settle` pays the conviction bounty
-    ///         only when one of the ACCUSED funded the pool, so a
-    ///         self-staged contest by the challenger buys no bounty.
+    ///         Nothing about the contribution gates a payout any more.
+    ///         `_settle` used to pay the conviction bounty only when one of
+    ///         the ACCUSED funded the pool — a predicate the accused could
+    ///         switch off for free by defending from an unrelated address
+    ///         (issue #101). The prosecutor's fee now comes from the
+    ///         proposer's forfeited bond and is gated on nothing here.
     /// @dev    Only strictly before `filedAt + autoSlashDelay`, the same
     ///         instant `resolve` starts settling an undisputed challenge:
     ///         at that second the silence verdict is already final and
