@@ -87,6 +87,17 @@ contract ProposerBondEscrow is IProposerBondEscrow {
     ///      uncompensatable slash residue.
     address public constant BURN_ADDRESS = 0x000000000000000000000000000000000000dEaD;
 
+    /// @notice Ceiling on the prosecutor's cut of a forfeited bond, in bps.
+    /// @dev    20%, mirroring the bound sWOOD puts on its own caller-named
+    ///         payout. It exists for the same reason: `forfeitBond`'s payee is
+    ///         chosen by the convictor, a replaceable role, so the escrow
+    ///         bounds how much of any ONE bond a compromised game could send to
+    ///         an address of its choosing. The remainder can only ever reach
+    ///         `BURN_ADDRESS`. This is the ONLY discretion in the contract —
+    ///         both exits are otherwise non-discretionary, and the payee is
+    ///         bounded rather than free.
+    uint256 public constant MAX_PROSECUTOR_FEE_BPS = 2_000;
+
     mapping(bytes32 bondKey => Bond) internal _bonds;
 
     constructor(address wood_, address registry_, address exposureLedger_) {
@@ -209,8 +220,19 @@ contract ProposerBondEscrow is IProposerBondEscrow {
     /// @dev NO PARTIAL FORFEIT, and no bounty carved off the top. The proposer
     ///      bond is priced at what the proposal could extract; a conviction
     ///      means it extracted. Splitting it would reintroduce a payee.
-    function forfeitBond(address governor, uint256 proposalId) external returns (address, uint256) {
+    function forfeitBond(address governor, uint256 proposalId, address feeTo, uint256 feeBps)
+        external
+        returns (address, uint256)
+    {
         if (msg.sender != exposureLedger.coverageFreezer()) revert NotAuthorizedConvictor();
+        // NOT TRUSTED FROM THE CALLER, for the same reason sWOOD re-checks the
+        // rates it is handed: the convictor is a replaceable role, and this
+        // contract is the one that actually moves the WOOD. Bounding the rate
+        // here is what keeps "a compromised convictor can divert AT MOST
+        // `MAX_PROSECUTOR_FEE_BPS` of any one bond" true no matter what the
+        // game does. Reverts rather than clamping — a caller-chosen payee must
+        // never be laundered into a smaller-but-still-caller-chosen one.
+        if (feeBps > MAX_PROSECUTOR_FEE_BPS) revert FeeBpsTooHigh();
         bytes32 key = _key(governor, proposalId);
         Bond memory b = _bonds[key];
         if (b.proposer == address(0)) revert NoBond();
@@ -220,7 +242,31 @@ contract ProposerBondEscrow is IProposerBondEscrow {
         // rather than double-burning, and a hooked WOOD cannot re-enter into a
         // still-live bond.
         delete _bonds[key];
-        if (b.amount != 0) wood.safeTransfer(BURN_ADDRESS, b.amount);
+
+        // THE PROSECUTOR'S FEE, AND WHY IT COMES FROM HERE. Catching a bad
+        // proposal has to pay someone, and this is the only pot in the protocol
+        // that a prosecutor cannot fund for itself: to self-deal you must BE
+        // the proposer, and then you are paying yourself a fraction of a bond
+        // you forfeit in full — always a net loss while the rate is under
+        // 10_000. That makes the fee sybil-proof by construction, with no role
+        // predicate to game and no cap to tune.
+        //
+        // It is deliberately NOT taken from the guardians' slash. That pot is
+        // fundable by a prosecutor willing to stake and approve the proposal it
+        // is about to accuse, which is why a slash-funded fee needed an
+        // approver-role predicate to price the sybil — and that predicate was
+        // controlled by the accused, who could zero the fee for free by
+        // funding their defence from an unrelated address.
+        uint256 fee;
+        if (feeTo != address(0) && feeBps != 0 && b.amount != 0) {
+            fee = (b.amount * feeBps) / 10_000;
+            if (fee != 0) {
+                wood.safeTransfer(feeTo, fee);
+                emit ProsecutorFeePaid(governor, proposalId, feeTo, fee);
+            }
+        }
+        uint256 burned = b.amount - fee;
+        if (burned != 0) wood.safeTransfer(BURN_ADDRESS, burned);
         emit BondForfeited(governor, proposalId, b.proposer, b.amount);
         return (b.proposer, b.amount);
     }

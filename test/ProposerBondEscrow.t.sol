@@ -178,7 +178,7 @@ contract ProposerBondEscrowTest is Test {
         escrow.lockBond(1, proposer, 100e18);
 
         vm.prank(game);
-        (address who, uint256 amount) = escrow.forfeitBond(governor, 1);
+        (address who, uint256 amount) = escrow.forfeitBond(governor, 1, address(0), 0);
         assertEq(who, proposer, "the loss is attributed to the proposer");
         assertEq(amount, 100e18);
 
@@ -199,15 +199,15 @@ contract ProposerBondEscrowTest is Test {
 
         vm.prank(makeAddr("rogue"));
         vm.expectRevert(IProposerBondEscrow.NotAuthorizedConvictor.selector);
-        escrow.forfeitBond(governor, 1);
+        escrow.forfeitBond(governor, 1, address(0), 0);
 
         vm.prank(governor);
         vm.expectRevert(IProposerBondEscrow.NotAuthorizedConvictor.selector);
-        escrow.forfeitBond(governor, 1);
+        escrow.forfeitBond(governor, 1, address(0), 0);
 
         vm.prank(proposer);
         vm.expectRevert(IProposerBondEscrow.NotAuthorizedConvictor.selector);
-        escrow.forfeitBond(governor, 1);
+        escrow.forfeitBond(governor, 1, address(0), 0);
 
         // Nothing moved on any of the three.
         assertEq(wood.balanceOf(address(escrow)), 100e18);
@@ -228,10 +228,10 @@ contract ProposerBondEscrowTest is Test {
 
         vm.prank(game);
         vm.expectRevert(IProposerBondEscrow.NotAuthorizedConvictor.selector);
-        escrow.forfeitBond(governor, 1);
+        escrow.forfeitBond(governor, 1, address(0), 0);
 
         vm.prank(newGame);
-        escrow.forfeitBond(governor, 1);
+        escrow.forfeitBond(governor, 1, address(0), 0);
         assertEq(wood.balanceOf(escrow.BURN_ADDRESS()), 100e18);
     }
 
@@ -245,7 +245,7 @@ contract ProposerBondEscrowTest is Test {
 
         vm.prank(game);
         vm.expectRevert(IProposerBondEscrow.NotAuthorizedConvictor.selector);
-        escrow.forfeitBond(governor, 1);
+        escrow.forfeitBond(governor, 1, address(0), 0);
         assertEq(wood.balanceOf(address(escrow)), 100e18, "the bond is merely un-confiscatable, not lost");
     }
 
@@ -257,11 +257,11 @@ contract ProposerBondEscrowTest is Test {
         vm.prank(governor);
         escrow.lockBond(1, proposer, 100e18);
         vm.prank(game);
-        escrow.forfeitBond(governor, 1);
+        escrow.forfeitBond(governor, 1, address(0), 0);
 
         vm.prank(game);
         vm.expectRevert(IProposerBondEscrow.NoBond.selector);
-        escrow.forfeitBond(governor, 1);
+        escrow.forfeitBond(governor, 1, address(0), 0);
 
         vm.prank(governor);
         vm.expectRevert(IProposerBondEscrow.NoBond.selector);
@@ -274,7 +274,7 @@ contract ProposerBondEscrowTest is Test {
         escrow.releaseBond(2);
         vm.prank(game);
         vm.expectRevert(IProposerBondEscrow.NoBond.selector);
-        escrow.forfeitBond(governor, 2);
+        escrow.forfeitBond(governor, 2, address(0), 0);
     }
 
     /// The bond key is (governor, proposalId) on the forfeit path too, so a
@@ -288,7 +288,7 @@ contract ProposerBondEscrowTest is Test {
         escrow.lockBond(1, proposer, 200e18);
 
         vm.prank(game);
-        escrow.forfeitBond(governor, 1);
+        escrow.forfeitBond(governor, 1, address(0), 0);
 
         assertEq(wood.balanceOf(escrow.BURN_ADDRESS()), 100e18);
         (address pB, uint256 amtB) = escrow.bondOf(governorB, 1);
@@ -307,5 +307,85 @@ contract ProposerBondEscrowTest is Test {
         vm.stopPrank();
         uint256 expected = release1 ? b2 : b1 + b2;
         assertEq(wood.balanceOf(address(escrow)), expected);
+    }
+
+    // ── Prosecutor fee ─────────────────────────────────────────────────────
+
+    /// @notice The fee leg and the burn leg together are the whole bond.
+    function test_forfeitBond_paysTheProsecutorFeeAndBurnsTheRest() public {
+        address prosecutor = makeAddr("prosecutor");
+        vm.prank(governor);
+        escrow.lockBond(1, proposer, 100e18);
+
+        vm.prank(game);
+        (, uint256 amount) = escrow.forfeitBond(governor, 1, prosecutor, 500);
+
+        assertEq(amount, 100e18, "the return value is the GROSS forfeited bond");
+        assertEq(wood.balanceOf(prosecutor), 5e18, "5% to the prosecutor");
+        assertEq(wood.balanceOf(escrow.BURN_ADDRESS()), 95e18, "the remainder burned");
+        assertEq(wood.balanceOf(address(escrow)), 0, "nothing stranded");
+    }
+
+    /// @notice THE PROPERTY THE WHOLE DESIGN RESTS ON. This is the one pot a
+    ///         prosecutor cannot fund for itself: to self-deal you must BE the
+    ///         proposer, and then you are paying yourself a fraction of a bond
+    ///         you forfeit in full. Always a net loss, for any rate under
+    ///         10_000 — no role predicate to game, no cap to tune.
+    ///
+    ///         Contrast the guardians' slash, which a prosecutor CAN fund for
+    ///         itself by staking and approving the proposal it is about to
+    ///         accuse. That is why a slash-funded fee needed an approver-role
+    ///         predicate to stay priced, and why the accused could switch the
+    ///         fee off by defending from an unrelated address.
+    function test_forfeitBond_selfDealingProposerAlwaysLoses() public {
+        // The proposer prosecutes its own proposal, naming itself as payee.
+        vm.prank(governor);
+        escrow.lockBond(1, proposer, 100e18);
+        uint256 before = wood.balanceOf(proposer);
+
+        // Hoisted: a call in ARGUMENT position is evaluated first and would
+        // consume the pending `vm.prank`, leaving `forfeitBond` unpranked.
+        uint256 cap = escrow.MAX_PROSECUTOR_FEE_BPS();
+        vm.prank(game);
+        escrow.forfeitBond(governor, 1, proposer, cap);
+
+        // Even at the ceiling it recovers a fraction of what it forfeited.
+        uint256 recovered = wood.balanceOf(proposer) - before;
+        assertEq(recovered, 20e18, "the maximum it can pay itself");
+        assertLt(recovered, 100e18, "strictly less than the bond it lost");
+        assertEq(wood.balanceOf(escrow.BURN_ADDRESS()), 80e18, "the rest is destroyed");
+    }
+
+    /// @notice The rate is bounded by the escrow, not trusted from the
+    ///         convictor — the same posture sWOOD takes toward the rates it is
+    ///         handed. It reverts rather than clamping, so a caller-chosen
+    ///         payee is never laundered into a smaller caller-chosen one.
+    function test_forfeitBond_rejectsAFeeAboveTheCeiling() public {
+        vm.prank(governor);
+        escrow.lockBond(1, proposer, 100e18);
+
+        // Hoisted for the same reason as above — both the ceiling read and
+        // `makeAddr` would otherwise eat the prank.
+        uint256 tooHigh = escrow.MAX_PROSECUTOR_FEE_BPS() + 1;
+        address greedy = makeAddr("greedy");
+        vm.prank(game);
+        vm.expectRevert(IProposerBondEscrow.FeeBpsTooHigh.selector);
+        escrow.forfeitBond(governor, 1, greedy, tooHigh);
+    }
+
+    /// @notice A zero payee or a zero rate burns the whole bond, which is the
+    ///         behaviour every pre-fee caller relied on.
+    function test_forfeitBond_zeroPayeeOrRateBurnsEverything() public {
+        vm.prank(governor);
+        escrow.lockBond(1, proposer, 100e18);
+        vm.prank(game);
+        escrow.forfeitBond(governor, 1, address(0), 2_000);
+        assertEq(wood.balanceOf(escrow.BURN_ADDRESS()), 100e18, "zero payee burns all");
+
+        vm.prank(governor);
+        escrow.lockBond(2, proposer, 50e18);
+        vm.prank(game);
+        escrow.forfeitBond(governor, 2, makeAddr("p2"), 0);
+        assertEq(wood.balanceOf(escrow.BURN_ADDRESS()), 150e18, "zero rate burns all");
     }
 }
