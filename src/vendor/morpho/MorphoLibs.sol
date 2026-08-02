@@ -112,7 +112,12 @@ library MorphoBalancesLib {
         totalBorrowShares = market.totalBorrowShares;
 
         uint256 elapsed = block.timestamp - market.lastUpdate;
-        if (elapsed != 0 && totalBorrowAssets != 0) {
+        // Match upstream `MorphoBalancesLib`/`Morpho._accrueInterest`: a market
+        // with `irm == address(0)` is a valid zero-rate market that accrues no
+        // interest. Without this guard a codeless-address call reverts, which
+        // would silently disable Lane A pricing for the whole vault the moment
+        // any third party borrows a single wei from such a market.
+        if (elapsed != 0 && totalBorrowAssets != 0 && marketParams.irm != address(0)) {
             uint256 borrowRate = IIrm(marketParams.irm).borrowRateView(marketParams, market);
             uint256 interest = totalBorrowAssets.wMulDown(borrowRate.wTaylorCompounded(elapsed));
             totalBorrowAssets += interest;

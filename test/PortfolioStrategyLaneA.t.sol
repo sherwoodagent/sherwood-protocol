@@ -225,13 +225,17 @@ contract PortfolioStrategyLaneATest is Test {
         assertEq(strategy.availableLiquidity(), 1e18 + 9.9e18, "idle + basket estimate");
     }
 
-    /// @notice Spec scenario: the swap venue cannot quote a basket token →
-    ///         idle balance only.
-    function test_availableLiquidity_degradesToIdle_onQuoteUnavailable() public {
+    /// @notice The basket estimate is anchored to the Chainlink push mark, NOT
+    ///         the swap-adapter quote: a broken/unavailable quote must NOT
+    ///         reduce advertised capacity. (In production every adapter's
+    ///         `quote()` is a state-mutating simulator that a view staticcall
+    ///         cannot survive, so a quote-dependent estimate would collapse the
+    ///         whole basket term to idle-only on-chain.)
+    function test_availableLiquidity_independentOfQuote() public {
         _execute(strategy);
         weth.mint(address(strategy), 1e18);
-        adapter.setRate(address(amzn), address(weth), 0); // quote() now reverts RateNotSet
-        assertEq(strategy.availableLiquidity(), 1e18, "unquotable slot degrades to idle");
+        adapter.setRate(address(amzn), address(weth), 0); // quote() would revert RateNotSet
+        assertEq(strategy.availableLiquidity(), 1e18 + 9.9e18, "mark-anchored: quote irrelevant");
     }
 
     function test_availableLiquidity_degradesToIdle_onStaleMark() public {

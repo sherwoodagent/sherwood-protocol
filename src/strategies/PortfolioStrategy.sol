@@ -110,6 +110,14 @@ contract PortfolioStrategy is BaseStrategy {
     ///         floor is `rebalanceDelta`, which prices off signed Chainlink
     ///         reports; see the note on `_quoteMinOut`.
     uint256 public constant MAX_SLIPPAGE_CEILING_BPS = 1_000;
+    /// @notice Hard floor on the swap slippage tolerance, at init and on every
+    ///         update (50 bps). `maxSlippageBps` doubles as the mark-anchored
+    ///         `minOut` floor for vault-initiated instant-exit unwinds
+    ///         (`_sellForUnwind`), so a value below the venue fee makes every
+    ///         unwind unfillable. Adversary: a proposer calling `updateParams`
+    ///         with a near-zero slippage to irreversibly brick the instant lane
+    ///         while `availableLiquidity` keeps advertising capacity.
+    uint256 public constant MIN_SLIPPAGE_BPS = 50;
     uint256 public constant PRICE_PRECISION = 1e18;
     /// @notice Default max staleness for a push-feed `latestRoundData` when a
     ///         slot declares no per-slot age. Robinhood Chainlink push feeds
@@ -245,7 +253,7 @@ contract PortfolioStrategy is BaseStrategy {
         // Ceiling, not just a sanity bound — bounds the initial tolerance below
         // 100% so the tighten-only guard in `_updateParams` has room to enforce
         // a monotonic decrease.
-        if (maxSlippageBps_ == 0 || maxSlippageBps_ > MAX_SLIPPAGE_CEILING_BPS) revert InvalidSlippage();
+        if (maxSlippageBps_ < MIN_SLIPPAGE_BPS || maxSlippageBps_ > MAX_SLIPPAGE_CEILING_BPS) revert InvalidSlippage();
 
         // Push-feed mode when no Data Streams verifier is wired: each
         // `feedIds[i]` encodes an AggregatorV3 proxy as bytes32(uint160(feed)).
@@ -365,7 +373,10 @@ contract PortfolioStrategy is BaseStrategy {
         // sandwich they control (`settleProposal` is proposer-callable an hour
         // after execute).
         if (newMaxSlippageBps > 0) {
-            if (newMaxSlippageBps > maxSlippageBps) revert InvalidSlippage();
+            // Tighten-only, but never below the floor: `maxSlippageBps` is also
+            // the mark-anchored unwind `minOut` floor, so a sub-fee value would
+            // brick every instant exit irreversibly (raising is disallowed).
+            if (newMaxSlippageBps > maxSlippageBps || newMaxSlippageBps < MIN_SLIPPAGE_BPS) revert InvalidSlippage();
             maxSlippageBps = newMaxSlippageBps;
         }
 
@@ -735,23 +746,40 @@ contract PortfolioStrategy is BaseStrategy {
     function positions() external view override returns (Position[] memory) {
         if (_state != State.Executed || _rebalancing) return new Position[](0);
         uint256 len = _allocations.length;
-        Position[] memory ps = new Position[](len);
+        // Report the strategy's idle vault-asset balance as a numeraire position
+        // (the adapter prices `venue == numeraire` at par) so that value the
+        // strategy holds but has not yet returned to the vault — the
+        // `_unwindBasket` slippage gross-up residue and `rebalanceDelta`
+        // leftovers — is counted in live NAV instead of understating it and
+        // letting a mid-proposal Lane A depositor mint against the gap.
+        uint256 idle = IERC20(asset).balanceOf(address(this));
+        uint256 extra = idle == 0 ? 0 : 1;
+        Position[] memory ps = new Position[](len + extra);
         for (uint256 i; i < len; ++i) {
             ps[i] = Position({venue: _allocations[i].token, kind: PositionKinds.ERC20_SPOT, ref: ""});
+        }
+        if (extra == 1) {
+            ps[len] = Position({venue: asset, kind: PositionKinds.ERC20_SPOT, ref: ""});
         }
         return ps;
     }
 
     /// @inheritdoc IStrategy
-    /// @dev Idle vault-asset balance plus a conservative basket estimate:
-    ///      per slot, min(swap-adapter quote, Chainlink mark value) discounted
-    ///      by `maxSlippageBps` — exactly the floor `withdrawTo` can guarantee,
-    ///      and never above the router-priced (mark) value. Degrades to the
-    ///      idle balance alone whenever the estimate cannot be trusted: not
-    ///      executed, rebalance/unwind in flight, Data Streams mode (no
-    ///      on-chain mark to anchor to), a stale/broken feed, or a slot the
-    ///      swap venue cannot quote (the quote is a raw staticcall — a
-    ///      state-mutating or reverting `quote()` degrades rather than lies).
+    /// @dev Idle vault-asset balance plus a conservative basket estimate: per
+    ///      slot, the Chainlink mark value discounted by `maxSlippageBps` —
+    ///      the SAME basis `_sellForUnwind` floors each sale at, so what this
+    ///      advertises is exactly what `withdrawTo` enforces (the divergence
+    ///      gate keeps the executable pool price within `maxDivergenceBps` of
+    ///      the mark, and `maxSlippageBps` is set above that plus venue fee).
+    ///      Degrades to the idle balance alone whenever the mark cannot be
+    ///      trusted: not executed, rebalance/unwind in flight, Data Streams
+    ///      mode (no on-chain mark to anchor to), or a stale/broken feed.
+    ///
+    ///      Deliberately does NOT consult the swap adapter's `quote()`: every
+    ///      production `ISwapAdapter.quote` routes into a Uniswap-style
+    ///      simulate-and-revert quoter that mutates state, so a staticcall from
+    ///      this view always fails and would collapse the whole basket term to
+    ///      idle-only in production (invisible under view-quote test mocks).
     ///      Adversary: an overstated figure makes the vault attempt an unwind
     ///      that under-delivers and reverts exits Lane A advertised.
     function availableLiquidity() external view override returns (uint256) {
@@ -769,10 +797,7 @@ contract PortfolioStrategy is BaseStrategy {
             (uint256 price, bool ok) = _pushMark(i);
             if (!ok) return idle;
             uint256 markValue = _tokensToValue(bal, price, i, assetDec);
-            (bool okQ, uint256 quoted) = _staticQuote(token, asset, bal, _swapExtraData[i]);
-            if (!okQ || quoted == 0) return idle;
-            uint256 v = quoted < markValue ? quoted : markValue;
-            basket += (v * (BPS_DENOMINATOR - maxSlippageBps)) / BPS_DENOMINATOR;
+            basket += (markValue * (BPS_DENOMINATOR - maxSlippageBps)) / BPS_DENOMINATOR;
         }
         return idle + basket;
     }
@@ -883,21 +908,6 @@ contract PortfolioStrategy is BaseStrategy {
         } catch {
             return (0, false);
         }
-    }
-
-    /// @dev Staticcall wrapper around `ISwapAdapter.quote` (declared non-view)
-    ///      so the view `availableLiquidity` can consult it: a quote that
-    ///      mutates state, reverts, or returns malformed data yields
-    ///      `(false, 0)` and the caller degrades to idle-only.
-    function _staticQuote(address tokenIn, address tokenOut, uint256 amountIn, bytes memory extraData)
-        private
-        view
-        returns (bool, uint256)
-    {
-        (bool s, bytes memory d) = address(swapAdapter)
-            .staticcall(abi.encodeCall(ISwapAdapter.quote, (tokenIn, tokenOut, amountIn, extraData)));
-        if (!s || d.length < 32) return (false, 0);
-        return (true, abi.decode(d, (uint256)));
     }
 
     // ── View functions ──

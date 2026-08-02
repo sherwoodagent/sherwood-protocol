@@ -533,9 +533,10 @@ contract LaneAWiringTest is Test {
         // The penalty stays in the vault for remaining LPs: the burn exceeded
         // the fee-free burn (share price rose). Remaining value: the unwind
         // grosses the basket sale up by maxSlippageBps to guarantee min-out,
-        // and the surplus parks as strategy-idle numeraire — invisible to
-        // `positions()` until settle — so live NAV + that idle is the full 300.
-        assertApproxEqAbs(vault.totalAssets() + usdc.balanceOf(address(strategy)), 300e6, 10, "remaining value");
+        // and the surplus parks as strategy-idle numeraire — which `positions()`
+        // now enumerates as a par-priced numeraire position, so live NAV alone
+        // (no manual add of the strategy's idle balance) is the full 300.
+        assertApproxEqAbs(vault.totalAssets(), 300e6, 10, "remaining value in NAV");
         assertGt(sharesBurned, shares700, "penalty burned extra shares beyond the fee-free burn");
     }
 

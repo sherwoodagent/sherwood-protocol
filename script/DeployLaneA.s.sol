@@ -297,6 +297,29 @@ contract DeployLaneA is Script {
             "silently - replace a live adapter by deliberate governance action, not by re-running wiring."
         );
 
+        // ── Pre-flight G1a: enabling requires a non-empty target-vault list ──
+        // The G1 fee gate below iterates `cfg.vaults`; an empty list (the
+        // default when LANE_A_VAULTS is unset) would make it vacuous while the
+        // switch it guards is protocol-global (per-kind on the shared router),
+        // enabling Lane A for every vault at a zero instant-exit fee.
+        require(
+            !cfg.enableLaneA || cfg.vaults.length != 0,
+            "PRE-FLIGHT G1: cannot enable Lane A with an empty target-vault list - "
+            "every consuming vault's instantExitFeeBps must be proven == 200 first"
+        );
+
+        // ── Pre-flight G1b: neither kind may already be Lane-A-enabled ──
+        // Activation must happen via `setLaneAEnabled` LAST. If a kind is
+        // already enabled, `registerAdapter` becomes the activation event and
+        // goes live several transactions before instantCap/haircut/fee land -
+        // an uncapped, untolled window. Fail closed.
+        require(
+            !IPriceRouterAdmin(cfg.router).laneAEnabled(PositionKinds.ERC20_SPOT)
+                && !IPriceRouterAdmin(cfg.router).laneAEnabled(PositionKinds.MORPHO_BLUE_SUPPLY),
+            "PRE-FLIGHT G1: a Lane-A kind is already enabled - registerAdapter would activate "
+            "before caps/fees land. Disable the kind before re-wiring."
+        );
+
         // ── Pre-flight G3 + G4: parameter-table validation ──
         uint256 maxEntryCap;
         for (uint256 i; i < cfg.entries.length; ++i) {
