@@ -166,20 +166,7 @@ contract DeployPlanD is Script {
         // The COMPOSED price, matching what `ChallengeGame.file` divides by
         // (review 🟠F16). Pre-flighting the raw scalar would pass while the
         // figure the game actually uses was zero, and fail while it was healthy.
-        //
-        // WRAPPED, because `woodPriceX8()` gained a revert. A ledger with no
-        // feed, no TWAP oracle and no `woodFallbackPriceX8` now reverts
-        // `NoWoodPrice` rather than serving zero — deliberately, since a zero
-        // price marks a challenge convicted while recovering nothing. Both
-        // shapes are the same operator error (nothing is priced), so both get
-        // the same message rather than one of them aborting the run with a raw
-        // custom error and no remedy.
-        uint256 priceX8;
-        try IExposureLedger(ledger).woodPriceX8() returns (uint256 p) {
-            priceX8 = p;
-        } catch {
-            priceX8 = 0;
-        }
+        uint256 priceX8 = IExposureLedger(ledger).woodPriceX8();
         require(priceX8 != 0, "PRE-FLIGHT: ExposureLedger.woodPriceX8 is 0 (fail-closed: no challenge could be filed)");
 
         console.log("deployer / game owner:  %s", deployer);

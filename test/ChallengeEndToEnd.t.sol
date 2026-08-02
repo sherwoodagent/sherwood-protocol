@@ -242,10 +242,6 @@ contract ChallengeEndToEndTest is Test {
         feed = new ChallengeE2EFeed(1e8, 8); // $1.00, 8-dec
         vm.startPrank(ledgerOwner);
         ledger.setWoodUsdPrice(0.05e8); // conservative governance haircut
-        // The MAINTAINED price. The line above is the emergency CEILING;
-        // seating both at $0.05 makes `min(fallback, ceiling)` $0.05, which
-        // is the number every expectation in this file was written against.
-        ledger.setWoodFallbackPriceX8(0.05e8);
         // Generous staleness bound: the §3.3a quorum re-reads this feed at
         // EXECUTE time, a full voting + review window after propose.
         ledger.setAssetFeed(address(usdg), address(feed), 365 days);
