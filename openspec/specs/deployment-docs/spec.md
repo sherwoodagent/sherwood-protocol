@@ -244,3 +244,28 @@ The runbook SHALL state the operational consequences:
 #### Scenario: TWAP goes stale with no Chainlink WOOD feed
 - **WHEN** the keeper stops and the newest snapshot ages past `maxTwapAge`
 - **THEN** approve and block votes both continue to land, new proposals are refused at `propose`, tier-gated proposals cannot execute, and convictions on already-filed challenges still compute
+
+### Requirement: The WOOD price carries two accepted overstatements, and `woodHaircutBps` is the control
+Two exposures are ACCEPTED rather than eliminated (owner decision 2026-08-02). The runbook SHALL state both, together with the parameter that covers them.
+
+**(a) The two legs are not contemporaneous.** `WoodTwapOracle` multiplies a near-real-time WOOD/ETH average by a single Chainlink ETH/USD answer that may be up to one heartbeat old — the live 4663 feed was measured **10.7 hours old while perfectly healthy**, so this is the normal case, not a degraded one. During an ETH drawdown inside that heartbeat the pair ratio rises while the stale, pre-drawdown ETH price is still the multiplier, so WOOD/USD reads high by roughly the size of the ETH move and every bond is over-valued until the feed ticks. **No attacker capital is required** — ordinary market movement against a slow feed, which makes it likelier than any manipulation scenario.
+
+It is accepted because the remedy is worse. Requiring the ETH answer to be no older than `twapWindow` forces `twapWindow >= ~12h`, and a 12-hour averaging window means half a day of blindness to a WOOD crash — unbounded in magnitude and fixed in duration, traded against an overstatement that is bounded in magnitude. Tracking a drawdown without waiting on a human is the whole purpose of the oracle. `ethUsdMaxDelay` is therefore bounded ONLY by `MAX_ETH_USD_DELAY_LIMIT` (24h, itself sized to clear the measured heartbeat with margin) and is deliberately INDEPENDENT of `twapWindow`, so the window can be short.
+
+**(b) Residual crash lag** of up to `twapWindow + maxTwapAge`, inherent to averaging and the price paid for manipulation resistance.
+
+Both OVERSTATE bond value — the dangerous direction — and both are bounded by the same two controls: `woodUsdPriceX8` truncates anything above the cap, and `woodHaircutBps` pre-funds an allowance below it. **`woodHaircutBps` is therefore LOAD-BEARING and SHALL be seated deliberately at launch rather than left at its default.** At 10,000 the allowance is ZERO; 5,000 (the floor) absorbs a 50% error. Shipping at the default is a choice to run with no margin, not a neutral one.
+
+Finding 5's `twapWindow <= maxTwapAge` invariant is unaffected and remains enforced — a different problem (structural unavailability) with a different fix.
+
+#### Scenario: Operator sizes the haircut
+- **WHEN** the operator seats `woodHaircutBps` before launch
+- **THEN** the runbook states that the value is an allowance against the ETH-staleness overstatement and the crash lag, that 10,000 leaves none at all, and that 5,000 absorbs a 50% error
+
+#### Scenario: ETH drawdown inside the feed heartbeat
+- **GIVEN** ETH falls sharply while the ETH/USD answer is several hours old
+- **THEN** WOOD/USD reads high by roughly the ETH move until the feed ticks, bonds are over-valued for that period, and the exposure is bounded above by the cap and below by the haircut — an accepted risk, documented, not a defect to file
+
+#### Scenario: Short averaging window with a slow USD feed
+- **WHEN** the operator configures `twapWindow = 1 hour` alongside `ethUsdMaxDelay = 24 hours`
+- **THEN** the configuration is ACCEPTED — the two are independent by design, and coupling them would force a ~12-hour window and surrender the crash tracking the oracle exists to provide

@@ -75,6 +75,54 @@ interface IAggregatorMinimal {
  *         protocol's liveness, and every bound below is sized with that in mind:
  *         each one must be tight enough to be meaningful and loose enough that a
  *         healthy chain never trips it.
+ *
+ * @dev    ══ ACCEPTED RISK: THE TWO LEGS DESCRIBE DIFFERENT PERIODS ══
+ *
+ *         This price is a product of two numbers that are NOT contemporaneous:
+ *
+ *           - the WOOD/ETH leg is a time-weighted average over `twapWindow`,
+ *             ending at a snapshot at most `maxTwapAge` old — near-real-time;
+ *           - the ETH/USD leg is a single Chainlink answer that may be up to
+ *             one heartbeat old. The live 4663 feed was measured 10.7 HOURS
+ *             old WHILE PERFECTLY HEALTHY, so this is the normal case, not a
+ *             degraded one.
+ *
+ *         THE CONCRETE EXPOSURE. During an ETH drawdown inside that heartbeat,
+ *         WOOD/ETH rises (WOOD falls less than ETH, or holds) while the stale,
+ *         pre-drawdown ETH/USD price is still the multiplier. The product reads
+ *         HIGH by roughly the size of the ETH move, and bonds are over-valued
+ *         for the remainder of the heartbeat. NO ATTACKER CAPITAL IS REQUIRED —
+ *         this is ordinary market movement against a slow feed, which makes it
+ *         more likely than any manipulation scenario, not less.
+ *
+ *         WHY IT IS ACCEPTED RATHER THAN FIXED. The obvious remedy — require
+ *         the ETH/USD answer to be no older than `twapWindow` — is
+ *         UNSATISFIABLE against the measured heartbeat: it forces
+ *         `twapWindow >= ~12h`, and a 12-hour averaging window means the oracle
+ *         needs half a day to reflect a WOOD crash. That trade is strictly
+ *         worse. A crash-tracking blind spot is unbounded in magnitude and
+ *         lasts a fixed half-day; the staleness overstatement is bounded in
+ *         magnitude by the ETH move and by the two controls below. The whole
+ *         purpose of this contract is to track a drawdown without waiting on a
+ *         human, and a 12-hour window gives most of that purpose back.
+ *
+ *         WHAT BOUNDS IT (both already exist, neither is new):
+ *
+ *           1. `ExposureLedger.woodUsdPriceX8` — the cap. The overstatement is
+ *              admitted only through `min(source, cap)`, so anything above the
+ *              cap is truncated outright. An ETH move large enough to matter is
+ *              exactly the move likely to push the product past the cap.
+ *           2. `ExposureLedger.woodHaircutBps` — the allowance. It discounts
+ *              every price by a fixed factor, pre-funding headroom for an
+ *              overstatement of that size. THIS PARAMETER IS NOW LOAD-BEARING:
+ *              at its 10_000 default (no haircut) the allowance is ZERO. 5_000
+ *              absorbs a 50% error. It is also the compensating control for the
+ *              residual crash lag of up to `twapWindow + maxTwapAge`.
+ *
+ *         `ethUsdMaxDelay` is therefore bounded ONLY by
+ *         `MAX_ETH_USD_DELAY_LIMIT` and is deliberately independent of
+ *         `twapWindow`, so the window can be short. Owner decision 2026-08-02;
+ *         see `design-revision-2026-08-01.md` finding 4.
  */
 contract WoodTwapOracle is Ownable2Step, IWoodTwapOracle {
     /// @dev UQ112x112 scaling factor, the fixed-point format `UniswapV2Pair`
@@ -121,15 +169,18 @@ contract WoodTwapOracle is Ownable2Step, IWoodTwapOracle {
     ///      while healthy on 2026-08-01 — without letting an operator disable
     ///      the staleness check outright.
     ///
-    ///      LOWERED 7 DAYS -> 24 HOURS (finding 4). Staleness COMPOUNDS across
-    ///      the two legs: `consult()` may serve a snapshot up to `maxTwapAge`
-    ///      old converted by an ETH/USD answer up to `ethUsdMaxDelay` old, so
-    ///      the old pairing admitted a "current" WOOD/USD price assembled from
-    ///      data up to eight days stale. At 24 hours the compound bound is two
-    ///      days, and the value still clears the measured 10.7-hour heartbeat
-    ///      with 2.2x of margin — going tighter would make the USD leg
-    ///      permanently unavailable on a HEALTHY feed, which under revision 2
-    ///      is a protocol halt rather than a skipped ceiling.
+    ///      LOWERED 7 DAYS -> 24 HOURS. Staleness COMPOUNDS across the two legs:
+    ///      `consult()` may serve a snapshot up to `maxTwapAge` old converted by
+    ///      an ETH/USD answer up to `ethUsdMaxDelay` old, so the old pairing
+    ///      admitted a "current" WOOD/USD price assembled from data up to eight
+    ///      days stale. At 24 hours the compound bound is two days.
+    ///
+    ///      THIS IS A FLOOR, NOT A PREFERENCE. Going tighter than the measured
+    ///      10.7-hour heartbeat would make the USD leg permanently unavailable
+    ///      on a HEALTHY feed, which under design revision 2 is a protocol halt
+    ///      rather than a skipped ceiling. 24 hours is the smallest value that
+    ///      clears the heartbeat with margin. It is deliberately NOT tied to
+    ///      `twapWindow` — see the ACCEPTED RISK note on the contract.
     uint256 public constant MAX_ETH_USD_DELAY_LIMIT = 1 days;
 
     /// @dev How much of the averaging window a single extrapolated tail may
@@ -190,9 +241,10 @@ contract WoodTwapOracle is Ownable2Step, IWoodTwapOracle {
     ///         unavailable. Constrained to be at least `twapWindow`, since a
     ///         shorter age bound describes a window that can never be fresh.
     uint256 public maxTwapAge;
-    /// @notice Staleness bound on the ETH/USD leg. Constrained to be at most
-    ///         `twapWindow`, so the USD leg can never be older than the
-    ///         WOOD/ETH average it converts (finding 4).
+    /// @notice Staleness bound on the ETH/USD leg. INDEPENDENT of `twapWindow`
+    ///         — this answer may legitimately be older than the average it
+    ///         converts, because the live feed's healthy heartbeat is ~10.7h.
+    ///         See the ACCEPTED RISK note on the contract.
     uint256 public ethUsdMaxDelay;
 
     /// @notice The two snapshots `consult()` averages between. `previous` is
@@ -240,19 +292,19 @@ contract WoodTwapOracle is Ownable2Step, IWoodTwapOracle {
         ethUsdFeed = ethUsdFeed_;
         _ethUsdFeedDecimals = IAggregatorMinimal(ethUsdFeed_).decimals();
 
-        // ORDER IS LOAD-BEARING, not stylistic. The three parameters are
-        // cross-constrained — `ethUsdMaxDelay <= twapWindow <= maxTwapAge` —
-        // and each internal setter compares against the CURRENT value of its
-        // neighbours, which is zero for one not yet seated. Seating them
-        // widest-first is the one order in which BOTH inequalities are actually
-        // evaluated: `maxTwapAge` lands first (its `>= twapWindow` check is
-        // vacuous against 0), `twapWindow` is then held to `<= maxTwapAge`, and
-        // `ethUsdMaxDelay` to `<= twapWindow`. Any other order leaves one of
-        // the two comparisons made against a zero and therefore unchecked.
+        // ORDER IS LOAD-BEARING, not stylistic. `twapWindow <= maxTwapAge`
+        // (finding 5) is checked inside `_setTwapWindow` against the CURRENT
+        // `maxTwapAge`, which is zero until seated — so `maxTwapAge` must land
+        // FIRST or the comparison is made against a zero and passes vacuously.
+        // Widest-first is that order.
         //
         // Constructing under the same guards the setters use is finding 5's
-        // other half: the deploy could otherwise seat a triple that no setter
+        // other half: the deploy could otherwise seat a pair that no setter
         // would ever accept, and nothing downstream revalidates it.
+        //
+        // `ethUsdMaxDelay` is order-independent — it is bounded only by
+        // `MAX_ETH_USD_DELAY_LIMIT` and constrains nothing else (owner decision
+        // 2026-08-02; see the ACCEPTED RISK note on the contract).
         _setMaxTwapAge(maxTwapAge_);
         _setTwapWindow(twapWindow_);
         _setEthUsdMaxDelay(ethUsdMaxDelay_);
@@ -381,32 +433,25 @@ contract WoodTwapOracle is Ownable2Step, IWoodTwapOracle {
 
     // ── Internals ──
 
-    /// @dev THE WINDOW IS THE MIDDLE OF A CHAIN, and both of its neighbours are
-    ///      enforced here:
+    /// @dev ONE CROSS-CONSTRAINT, AND IT IS FINDING 5: `newWindow <=
+    ///      maxTwapAge`. `consult()` demands a span of at least `twapWindow`
+    ///      and an age of at most `maxTwapAge`, and `update()` will not roll a
+    ///      second snapshot before the window elapses — so a window longer than
+    ///      the age bound describes an oracle that can never be fresh and never
+    ///      says why. Lengthening the window past `maxTwapAge` therefore
+    ///      requires raising that first: one extra owner transaction, and it
+    ///      cannot be got wrong silently.
     ///
-    ///        - `newWindow <= maxTwapAge` (finding 5). `consult()` demands a
-    ///          span of at least `twapWindow` and an age of at most
-    ///          `maxTwapAge`, and `update()` will not roll a second snapshot
-    ///          before the window elapses — so a window longer than the age
-    ///          bound describes an oracle that can never be fresh and never
-    ///          says why.
-    ///        - `newWindow >= ethUsdMaxDelay` (finding 4). Averaging WOOD/ETH
-    ///          over an hour and then converting it with a half-day-old ETH/USD
-    ///          answer is not an hour-old price; the legs describe disjoint
-    ///          eras. Requiring the window to be at least as long as the
-    ///          staleness tolerated on the USD leg is what makes them
-    ///          commensurable, and it is enforced at CONFIGURATION time so the
-    ///          alternative — silently reporting unavailable forever — cannot
-    ///          be reached.
-    ///
-    ///      Shortening the window therefore requires shortening
-    ///      `ethUsdMaxDelay` first, and lengthening it past `maxTwapAge`
-    ///      requires raising that first. Both are one extra owner transaction
-    ///      and neither can be got wrong silently.
+    ///      DELIBERATELY NOT TIED TO `ethUsdMaxDelay`. An earlier revision
+    ///      required `newWindow >= ethUsdMaxDelay` so the USD leg could never
+    ///      be staler than the average it converts. Against the MEASURED 10.7-
+    ///      hour ETH/USD heartbeat that forces a window of ~12 hours, which
+    ///      costs the oracle half a day of crash-tracking — a strictly worse
+    ///      exposure than the overstatement it prevented. The window must be
+    ///      free to be SHORT. See the ACCEPTED RISK note on the contract.
     function _setTwapWindow(uint256 newWindow) internal {
         if (newWindow < MIN_TWAP_WINDOW || newWindow > MAX_TWAP_WINDOW) revert InvalidParameter();
         if (newWindow > maxTwapAge) revert InvalidParameter();
-        if (newWindow < ethUsdMaxDelay) revert InvalidParameter();
         emit TwapWindowSet(twapWindow, newWindow);
         twapWindow = newWindow;
     }
@@ -421,11 +466,13 @@ contract WoodTwapOracle is Ownable2Step, IWoodTwapOracle {
         maxTwapAge = newAge;
     }
 
-    /// @dev Refuses to exceed `twapWindow` — the other side of the finding-4
-    ///      invariant. See `_setTwapWindow`.
+    /// @dev BOUNDED ONLY BY `MAX_ETH_USD_DELAY_LIMIT`, independently of the
+    ///      window. It has to admit the measured 10.7-hour heartbeat, and
+    ///      coupling it to `twapWindow` would drag the window up with it. See
+    ///      the ACCEPTED RISK note on the contract for what that costs and what
+    ///      bounds it instead.
     function _setEthUsdMaxDelay(uint256 newDelay) internal {
         if (newDelay == 0 || newDelay > MAX_ETH_USD_DELAY_LIMIT) revert InvalidParameter();
-        if (newDelay > twapWindow) revert InvalidParameter();
         emit EthUsdMaxDelaySet(ethUsdMaxDelay, newDelay);
         ethUsdMaxDelay = newDelay;
     }
@@ -490,21 +537,17 @@ contract WoodTwapOracle is Ownable2Step, IWoodTwapOracle {
     ///      than reverting, so a sick ETH/USD feed costs this contract its
     ///      answer rather than reverting inside the ledger's price path.
     ///
-    /// @dev THE STALENESS BOUND IS `min(ethUsdMaxDelay, twapWindow)` (finding 4).
-    ///      Compounding is the failure: a WOOD/ETH average taken over
-    ///      `twapWindow` converted by an ETH/USD answer OLDER than that window
-    ///      is not a price over the window at all, it splices two eras. Stating
-    ///      it as a `min` here rather than relying on the setter invariant is
-    ///      deliberate belt-and-braces — under `_setTwapWindow`'s
-    ///      `ethUsdMaxDelay <= twapWindow` rule the two agree, and if a later
-    ///      change ever relaxes that rule this read still refuses rather than
-    ///      quietly splicing.
+    /// @dev THE STALENESS BOUND IS `ethUsdMaxDelay` ALONE, and this answer may
+    ///      therefore be OLDER THAN `twapWindow` — the two legs are not
+    ///      contemporaneous, by design. That is the accepted risk documented on
+    ///      the contract: bounding it here instead would force a ~12-hour
+    ///      averaging window and cost the oracle half a day of crash tracking.
+    ///      The overstatement it admits is bounded downstream by the ledger's
+    ///      price cap and by `woodHaircutBps`.
     function _ethUsdX8() internal view returns (uint256 priceX8, bool ok) {
         address feed = ethUsdFeed;
         if (feed.code.length == 0) return (0, false);
-        uint256 window = twapWindow;
         uint256 maxDelay = ethUsdMaxDelay;
-        if (window < maxDelay) maxDelay = window;
         try IAggregatorMinimal(feed).latestRoundData() returns (
             uint80, int256 answer, uint256, uint256 updatedAt, uint80
         ) {

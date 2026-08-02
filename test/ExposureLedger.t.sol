@@ -1373,6 +1373,46 @@ contract ExposureLedgerTest is Test {
         assertEq(ledger.slashableBondUsd(guardian), 4_000e18, "not the 5_000 an unhaircut branch would give");
     }
 
+    /// @notice `woodHaircutBps` IS THE ALLOWANCE against the two overstatements
+    ///         this design accepts rather than eliminates — and at its 10_000
+    ///         default that allowance is exactly zero.
+    ///
+    /// @dev    The accepted overstatements are (a) the oracle's two legs not
+    ///         being contemporaneous, so an ETH drawdown inside the ~10.7h
+    ///         ETH/USD heartbeat makes WOOD/USD read high by roughly the ETH
+    ///         move — with no attacker capital involved; and (b) the residual
+    ///         crash lag of up to `twapWindow + maxTwapAge`. Both were accepted
+    ///         (owner decision 2026-08-02) because the alternative — coupling
+    ///         `ethUsdMaxDelay` to `twapWindow` — forces a ~12h averaging
+    ///         window and half a day of blindness to a WOOD crash.
+    ///
+    ///         That makes this parameter load-bearing, so the claim is pinned:
+    ///         a source overstated 2x, priced at a 5_000 haircut, values bonds
+    ///         at their TRUE worth rather than at double it. The cap is held
+    ///         deliberately NON-BINDING here — the overstated source lands
+    ///         exactly on it — so the haircut is doing the work alone and the
+    ///         test cannot pass for the wrong reason.
+    function test_woodHaircut_absorbsAnOverstatedMarketSource() public {
+        swood.setStake(guardian, 100_000e18);
+        uint256 trueBondUsd = 5_000e18; // 100k WOOD at the true $0.05
+
+        // The oracle reads 2x high — an ETH drawdown inside the heartbeat.
+        twap.setPrice(2 * MARKET_X8);
+        (,, bool binding) = ledger.woodPriceDetail();
+        assertFalse(binding, "the cap must NOT be what absorbs this, or the test proves nothing");
+        assertEq(ledger.slashableBondUsd(guardian), 2 * trueBondUsd, "no haircut: the overstatement lands in full");
+
+        // With the allowance seated, the same overstatement is absorbed.
+        vm.prank(owner);
+        ledger.setWoodHaircutBps(5_000);
+        assertEq(ledger.slashableBondUsd(guardian), trueBondUsd, "the haircut absorbs a 2x overstatement exactly");
+
+        // And it is paid for in normal operation, which is the trade: an
+        // unexaggerated market is valued at half.
+        twap.setPrice(MARKET_X8);
+        assertEq(ledger.slashableBondUsd(guardian), trueBondUsd / 2, "the allowance costs conservatism when healthy");
+    }
+
     /// @notice Both degraded states must be observable. Without this, "TWAP
     ///         healthy" and "cap drifted under market and has been pinning
     ///         every bond for a month" are indistinguishable from outside, and

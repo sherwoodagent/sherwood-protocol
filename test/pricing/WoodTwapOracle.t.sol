@@ -40,24 +40,27 @@ contract WoodTwapOracleTest is Test {
 
     // ── THE PRODUCTION TRIPLE, AND WHY IT IS SHAPED THIS WAY ──
     //
-    // The three parameters are cross-constrained:
+    // ONE cross-constraint, and it is finding 5: `twapWindow <= maxTwapAge`. A
+    // longer window can never be fresh, because `update()` will not roll a
+    // second snapshot until the window has elapsed.
     //
-    //     ethUsdMaxDelay  <=  twapWindow  <=  maxTwapAge  <=  1 day
-    //
-    // and the binding constraint at the bottom is EMPIRICAL: the live 4663
-    // ETH/USD feed was measured ~10.7 HOURS old while perfectly healthy, so any
-    // `ethUsdMaxDelay` below that makes the USD leg permanently unavailable —
-    // which under design revision 2 is a protocol halt, not a skipped ceiling.
-    // 12 hours clears it with margin, and the window must then be at least 12
-    // hours too (finding 4: a WOOD/ETH average taken over an hour and converted
-    // by a half-day-old ETH quote splices two eras).
-    //
-    // The old fixture ran 1h / 6h / 2d, which BOTH the finding-4 and finding-5
-    // invariants now reject — that combination is precisely the compounding
-    // this change closes.
-    uint256 internal constant WINDOW = 12 hours;
-    uint256 internal constant MAX_AGE = 24 hours;
-    uint256 internal constant ETH_DELAY = 12 hours;
+    // `ethUsdMaxDelay` is INDEPENDENT, bounded only by
+    // `MAX_ETH_USD_DELAY_LIMIT`, and here it is deliberately set LONGER than
+    // the window — 24h against 1h. That is the shape production runs, and it is
+    // the ACCEPTED RISK: the live 4663 ETH/USD feed was measured ~10.7 HOURS
+    // old WHILE HEALTHY, so tying the delay to the window would force a ~12h
+    // averaging window and cost the oracle half a day of crash tracking. An
+    // earlier revision of this file ran 12h/24h/12h for exactly that reason,
+    // and it was the wrong trade (owner decision 2026-08-02).
+    uint256 internal constant WINDOW = 1 hours;
+    uint256 internal constant MAX_AGE = 12 hours;
+    uint256 internal constant ETH_DELAY = 24 hours;
+
+    /// @dev 10.7 hours, the age of the live 4663 ETH/USD answer when it was
+    ///      read on 2026-08-01 in a perfectly healthy state. Every bound on the
+    ///      USD leg has to clear this or the oracle is unavailable in normal
+    ///      operation.
+    uint256 internal constant MEASURED_ETH_HEARTBEAT = 38_520;
 
     function setUp() public {
         // Start the clock somewhere realistic. Forge begins at `block.timestamp
@@ -248,13 +251,8 @@ contract WoodTwapOracleTest is Test {
         vm.expectRevert(IWoodTwapOracle.InvalidParameter.selector);
         oracle.setTwapWindow(hi + 1);
 
-        // Reaching the absolute floor takes TWO transactions, because the
-        // window may not drop below `ethUsdMaxDelay` (finding 4). That
-        // ordering requirement is the point, not an inconvenience.
-        vm.startPrank(owner);
-        oracle.setEthUsdMaxDelay(lo);
+        vm.prank(owner);
         oracle.setTwapWindow(lo);
-        vm.stopPrank();
         assertEq(oracle.twapWindow(), lo, "an in-bounds window must be accepted");
     }
 
@@ -274,6 +272,30 @@ contract WoodTwapOracleTest is Test {
         vm.prank(keeper);
         vm.expectRevert();
         oracle.setTwapWindow(2 hours);
+    }
+
+    /// @notice `MAX_ETH_USD_DELAY_LIMIT` is now the ONLY bound on the USD leg's
+    ///         staleness tolerance, so it has to actually hold.
+    ///
+    /// @dev    Untested before this revision, when the tighter
+    ///         `ethUsdMaxDelay <= twapWindow` rule masked it — that rule is
+    ///         gone, and this ceiling is what stops an operator disabling the
+    ///         staleness check outright by passing a decade. Zero is refused at
+    ///         the other end: it would make the USD leg unavailable always.
+    function test_setEthUsdMaxDelay_rejectsZeroAndOverLimit() public {
+        uint256 limit = oracle.MAX_ETH_USD_DELAY_LIMIT();
+
+        vm.prank(owner);
+        vm.expectRevert(IWoodTwapOracle.InvalidParameter.selector);
+        oracle.setEthUsdMaxDelay(0);
+
+        vm.prank(owner);
+        vm.expectRevert(IWoodTwapOracle.InvalidParameter.selector);
+        oracle.setEthUsdMaxDelay(limit + 1);
+
+        vm.prank(owner);
+        oracle.setEthUsdMaxDelay(limit);
+        assertEq(oracle.ethUsdMaxDelay(), limit, "the ceiling itself is settable");
     }
 
     // ── FINDING 5: the window and the age bound must be satisfiable ────────
@@ -301,13 +323,12 @@ contract WoodTwapOracleTest is Test {
         vm.expectRevert(IWoodTwapOracle.InvalidParameter.selector);
         oracle.setTwapWindow(MAX_AGE + 1 hours);
 
-        // Age bound below the current window: refused.
+        // Age bound below the current window: refused from the other side.
         vm.expectRevert(IWoodTwapOracle.InvalidParameter.selector);
-        oracle.setMaxTwapAge(WINDOW - 1 hours);
+        oracle.setMaxTwapAge(WINDOW - 1 minutes);
 
-        // The legal moves are the ones that keep the chain ordered. `MAX_AGE`
-        // is already the hard limit here, so the window may grow right up to
-        // it — and no further.
+        // The legal moves are the ones that keep the pair ordered: the window
+        // may grow right up to the age bound, and no further.
         oracle.setTwapWindow(MAX_AGE);
         assertEq(oracle.twapWindow(), MAX_AGE, "a window equal to the age bound is legal");
         vm.stopPrank();
@@ -321,17 +342,33 @@ contract WoodTwapOracleTest is Test {
         new WoodTwapOracle(owner, address(pair), wood, weth, address(ethUsd), 20 hours, 12 hours, ETH_DELAY);
     }
 
-    // ── FINDING 4: ETH/USD staleness must not compound ─────────────────────
+    // ── FINDING 4: an ACCEPTED risk, deliberately not eliminated ───────────
+    //
+    // The two legs are NOT contemporaneous. The WOOD/ETH average is
+    // near-real-time; the ETH/USD answer may be up to one heartbeat old, and
+    // the live 4663 feed was measured 10.7 HOURS old WHILE HEALTHY. During an
+    // ETH drawdown inside that heartbeat the pair ratio rises while the stale,
+    // pre-drawdown ETH price is still the multiplier, so WOOD/USD reads high by
+    // roughly the ETH move — with NO attacker capital involved.
+    //
+    // The obvious remedy (require the ETH answer to be no older than
+    // `twapWindow`) is unsatisfiable against that heartbeat: it forces a ~12h
+    // window, and a 12h window means half a day of blindness to a WOOD crash.
+    // That is strictly worse — unbounded in magnitude, fixed in duration —
+    // than a bounded overstatement. So the constraint is DROPPED, and the
+    // exposure is carried by two controls that already exist: the ledger's
+    // price cap truncates anything above it, and `woodHaircutBps` pre-funds an
+    // allowance below it. Owner decision 2026-08-02.
 
-    /// @notice The compound bound. `consult()` may serve a snapshot up to
-    ///         `maxTwapAge` old converted by an ETH/USD answer up to
-    ///         `ethUsdMaxDelay` old; at the old 7-day ceiling that admitted a
-    ///         "current" WOOD/USD price assembled from data eight days stale.
+    /// @notice The delay ceiling is bounded ABOVE (compound staleness) and
+    ///         BELOW (the measured heartbeat). Both directions are bugs.
     ///
-    /// @dev    The ceiling must not be tightened below the MEASURED healthy
-    ///         heartbeat either — 10.7 hours on the live 4663 feed — or the USD
-    ///         leg is permanently unavailable and the protocol permanently
-    ///         halted. Both directions are asserted, because both are bugs.
+    /// @dev    `consult()` may serve a snapshot up to `maxTwapAge` old
+    ///         converted by an answer up to `ethUsdMaxDelay` old; at the old
+    ///         7-day ceiling that admitted a "current" price assembled from
+    ///         data eight days stale. Tightening it below 10.7 hours would make
+    ///         the USD leg permanently unavailable on a HEALTHY feed, which
+    ///         under design revision 2 is a protocol halt.
     function test_ethUsdDelayLimit_boundsCompoundStalenessWithoutBrickingTheFeed() public view {
         assertLe(oracle.MAX_ETH_USD_DELAY_LIMIT(), 1 days, "compound staleness must be bounded at ~2 days");
         assertGe(
@@ -341,44 +378,56 @@ contract WoodTwapOracleTest is Test {
         );
     }
 
-    /// @notice The USD leg may not be staler than the WOOD/ETH average it
-    ///         converts. Enforced at CONFIGURATION time, so the alternative —
-    ///         an oracle that silently reports unavailable forever — is
-    ///         unreachable.
-    function test_setters_refuseAnEthDelayLongerThanTheWindow() public {
+    /// @notice THE CONFIGURATION THE DROPPED CONSTRAINT WOULD HAVE FORBIDDEN,
+    ///         and the one production runs: a SHORT averaging window (1h)
+    ///         alongside a LONG ETH/USD staleness bound (24h).
+    ///
+    /// @dev    This is the whole point of the owner's decision. Tying the two
+    ///         together would have made this combination unconfigurable and
+    ///         forced the window up to ~12h, surrendering the crash tracking
+    ///         the oracle exists to provide. Asserted through the constructor
+    ///         AND both setters, since the constraint previously lived in all
+    ///         three.
+    function test_aShortWindowCoexistsWithALongEthUsdDelay() public {
+        // Via the constructor.
+        WoodTwapOracle fresh =
+            new WoodTwapOracle(owner, address(pair), wood, weth, address(ethUsd), 1 hours, MAX_AGE, 24 hours);
+        assertEq(fresh.twapWindow(), 1 hours);
+        assertEq(fresh.ethUsdMaxDelay(), 24 hours, "the delay may exceed the window");
+
+        // Via the setters, in both orders — neither direction may refuse.
         vm.startPrank(owner);
-
-        vm.expectRevert(IWoodTwapOracle.InvalidParameter.selector);
-        oracle.setEthUsdMaxDelay(WINDOW + 1);
-
-        // And the window cannot be shortened under the delay from the other
-        // side either.
-        vm.expectRevert(IWoodTwapOracle.InvalidParameter.selector);
-        oracle.setTwapWindow(ETH_DELAY - 1);
-
+        fresh.setEthUsdMaxDelay(1 hours);
+        fresh.setTwapWindow(2 hours);
+        fresh.setEthUsdMaxDelay(24 hours); // raise the delay far above the window
+        assertEq(fresh.ethUsdMaxDelay(), 24 hours);
+        fresh.setTwapWindow(1 hours); // and shrink the window back under it
+        assertEq(fresh.twapWindow(), 1 hours);
         vm.stopPrank();
     }
 
-    function test_constructor_refusesAnEthDelayLongerThanTheWindow() public {
-        vm.expectRevert(IWoodTwapOracle.InvalidParameter.selector);
-        new WoodTwapOracle(owner, address(pair), wood, weth, address(ethUsd), 1 hours, MAX_AGE, 12 hours);
-    }
-
-    /// @notice The runtime half: even if the configured delay were somehow
-    ///         looser than the window, the read itself takes `min(delay,
-    ///         window)` and refuses.
-    function test_consult_refusesAnEthAnswerOlderThanTheWindow() public {
+    /// @notice The accepted exposure, made concrete and pinned: an ETH/USD
+    ///         answer OLDER than the averaging window still prices.
+    ///
+    /// @dev    Pinned as a test so that re-introducing the constraint is a
+    ///         deliberate, visible act rather than a silent tightening. The
+    ///         answer here is ~10.7 hours old against a 1-hour window — the
+    ///         MEASURED healthy state of the live feed, not a degraded one — so
+    ///         a version of this contract that refused it would be unavailable
+    ///         in normal operation.
+    function test_consult_acceptsAnEthAnswerOlderThanTheWindow() public {
         _primeWindow();
 
-        // One second inside the window: still priced.
-        ethUsd.setUpdatedAt(vm.getBlockTimestamp() - (WINDOW - 1));
-        (, bool ok) = oracle.consult();
-        assertTrue(ok, "an ETH answer inside the averaging window is usable");
+        ethUsd.setUpdatedAt(vm.getBlockTimestamp() - MEASURED_ETH_HEARTBEAT);
+        assertGt(MEASURED_ETH_HEARTBEAT, WINDOW, "the fixture must actually exercise the accepted case");
+        (uint256 priceX8, bool ok) = oracle.consult();
+        assertTrue(ok, "a healthy-but-slow ETH heartbeat must NOT make the oracle unavailable");
+        assertGt(priceX8, 0);
 
-        // One second outside it: refused.
-        ethUsd.setUpdatedAt(vm.getBlockTimestamp() - (WINDOW + 1));
+        // It is still bounded: past `ethUsdMaxDelay` the answer is refused.
+        ethUsd.setUpdatedAt(vm.getBlockTimestamp() - (ETH_DELAY + 1));
         (, bool stillOk) = oracle.consult();
-        assertFalse(stillOk, "an ETH answer older than the window splices two eras");
+        assertFalse(stillOk, "the delay ceiling is what bounds it, not the window");
     }
 
     // ── FINDING 8: the extrapolated tail is bounded against the SPAN ───────

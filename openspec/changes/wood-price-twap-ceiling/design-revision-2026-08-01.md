@@ -129,11 +129,54 @@ claim to make for this change — **not** "no maintenance."
 | 1 | `min` binds against a non-binding ceiling | **Design change above.** Harm reframed as deterrence shortfall per #102. |
 | 2 | `DeployPlanB` never seeds the fallback | Moot for the fallback (deleted). Still must assert `woodUsdPriceX8 != 0` post-broadcast, and re-document `WOOD_PRICE_HAIRCUT_X8` — a "≤ 30-day low" cap binds permanently and makes the TWAP inert. Seed **above** market. |
 | 3 | Slash rail reads the price live | **Resolved by PR #102** — `slashBpsFor` no longer reads the price. |
-| 4 | ETH/USD staleness compounds | Reject the TWAP when the ETH/USD answer is older than `twapWindow`; lower `MAX_ETH_USD_DELAY_LIMIT` to ~12–24h. |
+| 4 | ETH/USD staleness compounds | **ACCEPTED, bounded by the cap + the haircut** — see the note below. `MAX_ETH_USD_DELAY_LIMIT` lowered 7d → 24h, which bounds the compound staleness; the `ethUsdMaxDelay <= twapWindow` half is NOT enforced, because it is unsatisfiable against the measured heartbeat. |
 | 5 | `twapWindow > maxTwapAge` unsatisfiable | Enforce `maxTwapAge >= twapWindow`; lower `MAX_TWAP_WINDOW` to `MAX_SNAPSHOT_AGE_LIMIT`. |
 | 6 | `_haircut(1) == 0` | The convicted-but-recovers-nothing chain is **broken by #102**. Still floor the post-haircut result at 1 — a zero price reverts `WoodPriceUnset` in `ChallengeGame` and breaks `proposerBondWood`. |
 | 7 | Zero disables the `min` | Zero now means **revert**, not "no cap". |
 | 8 | Idle guard permits 100% extrapolation | Bound the tail against the **span** (`idle * N <= twapWindow`), not against `maxTwapAge`. Exact math is not a defence when it exactly reproduces spot. |
+
+### Finding 4 — why it is accepted (owner decision, 2026-08-02)
+
+**The original remedy was unsatisfiable.** Revision 1 asked to "reject the TWAP
+when the ETH/USD answer is older than `twapWindow`". Implementing it revealed
+the conflict: the live 4663 ETH/USD feed was measured **10.7 hours old while
+perfectly healthy**, so that rule forces `twapWindow >= ~12h`. Every shorter
+window makes the USD leg permanently unavailable — and under this revision an
+unavailable TWAP with no Chainlink WOOD feed is `NoWoodPrice`, i.e. a protocol
+halt, not a skipped ceiling. The remedy as written could not be shipped.
+
+**The exposure, stated plainly.** The price is a product of two numbers that
+are not contemporaneous: a near-real-time WOOD/ETH average, and an ETH/USD
+answer up to one heartbeat old. During an ETH drawdown inside that heartbeat
+the pair ratio rises while the stale, pre-drawdown ETH price is still the
+multiplier, so WOOD/USD reads **high by roughly the ETH move**. Bonds are
+over-valued until the feed ticks. **No attacker capital is required** — this is
+ordinary market movement against a slow feed, which makes it likelier than any
+manipulation scenario, not less.
+
+**Why accepting it is the better trade.** The alternative buys freedom from a
+*bounded* overstatement by paying with a *half-day blind spot* during a WOOD
+crash. A crash-tracking lag is unbounded in magnitude and fixed in duration;
+the staleness overstatement is bounded in magnitude by the ETH move and by both
+controls below. Tracking a drawdown without waiting on a human is the entire
+purpose of this change, and a 12-hour window gives most of it back.
+
+**What bounds it** (both already exist; neither is new machinery):
+
+1. **`woodUsdPriceX8`, the cap.** The overstatement is admitted only through
+   `min(source, cap)`, so anything above the cap is truncated outright. An ETH
+   move large enough to matter is exactly the move likely to push the product
+   past the cap.
+2. **`woodHaircutBps`, the allowance.** A fixed discount on every price,
+   pre-funding headroom of that size. **This parameter is now load-bearing** —
+   it is also the compensating control for the residual crash lag of up to
+   `twapWindow + maxTwapAge`. At its 10,000 default the allowance is **zero**;
+   5,000 absorbs a 50% error.
+
+Consequently `ethUsdMaxDelay` is bounded **only** by `MAX_ETH_USD_DELAY_LIMIT`
+(24h) and is deliberately independent of `twapWindow`, so the window can be
+short. Finding 5's `twapWindow <= maxTwapAge` is unaffected and still enforced —
+it is a different problem (structural unavailability) and a different fix.
 
 ## Testing requirements
 

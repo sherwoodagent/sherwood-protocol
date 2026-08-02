@@ -195,13 +195,35 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///         Every read of it is defensive — see `_twapPriceX8`.
     address public woodTwapOracle;
 
-    /// @notice Haircut applied to the feed price, in bps. The governance number
-    ///         it replaces was a manually-maintained "<= 30-day low"; this is
-    ///         the same conservatism expressed as a factor on a live read.
+    /// @notice Haircut applied to whichever market source won, in bps.
+    ///
     /// @dev    Collateral wants a floor, not a quote — an unhaircut oracle
     ///         tracks WOOD UP and inflates every bond exactly when the market is
-    ///         frothy. Default 10_000 (no haircut) so wiring a feed alone does
+    ///         frothy. Default 10_000 (no haircut) so wiring a source alone does
     ///         not silently change valuations; governance sets it deliberately.
+    ///
+    /// @dev    THIS PARAMETER IS LOAD-BEARING (owner decision 2026-08-02). It is
+    ///         the compensating control for the two exposures this design
+    ///         deliberately ACCEPTS rather than eliminates, and once a price has
+    ///         cleared the cap it is the only thing standing under either:
+    ///
+    ///           1. NON-CONTEMPORANEOUS LEGS in `WoodTwapOracle`. The WOOD/ETH
+    ///              average is near-real-time; the ETH/USD answer may be up to
+    ///              one heartbeat old (~10.7h measured on 4663, WHILE HEALTHY).
+    ///              During an ETH drawdown inside that heartbeat the product
+    ///              reads HIGH by roughly the ETH move — no attacker capital
+    ///              involved. Constraining it would force a ~12-hour averaging
+    ///              window, which is worse; see that contract's ACCEPTED RISK
+    ///              note.
+    ///           2. RESIDUAL CRASH LAG of up to `twapWindow + maxTwapAge`,
+    ///              inherent to averaging and the price of manipulation
+    ///              resistance.
+    ///
+    ///         Both OVERSTATE bond value — the dangerous direction — and the
+    ///         haircut is what pre-funds an allowance against them. AT THE
+    ///         10_000 DEFAULT THAT ALLOWANCE IS ZERO. 5_000 (the floor) absorbs
+    ///         a 50% error. Shipping at the default is a deliberate choice to
+    ///         run with no margin, not a neutral one.
     uint256 public woodHaircutBps = BPS_DENOMINATOR;
 
     /// @dev Stamps every `setWoodUsdPrice`. Zero means "never set" — the only
