@@ -572,7 +572,11 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      reachable. The third gate therefore asks the game itself and
     ///      mirrors `ChallengeGame.file`'s own deadline,
     ///      `max(executedAt + game.challengeWindow(), challengeableUntil[rk])`,
-    ///      so reclaim is definitionally the negation of filing admissibility.
+    ///      so reclaim mirrors filing admissibility as long as `_exposureLedger`
+    ///      is stable. It is NOT an identity: these gates reach the game THROUGH
+    ///      that pointer, which is owner-mutable, so re-pointing it mid-challenge
+    ///      detaches them (issue #116). The escrow pointer is pinned per proposal;
+    ///      this one is not.
     ///      Reading the game's window rather than only `challengeableUntil`
     ///      also covers the ledger owner lowering the LEDGER's window below the
     ///      game's, which nothing on the game side prevents.
@@ -587,9 +591,11 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      freezer) can never collect, so no conviction is reachable and there
     ///      is nothing for this gate to protect; an unwired or rotated-away
     ///      freezer must not strand an honest proposer's bond. A non-zero
-    ///      freezer that cannot answer these views fails closed, like every
-    ///      other gate here — recover by rotating `coverageFreezer` or
-    ///      re-pointing the ledger. Note `challengeableUntil` is zero for an
+    ///      freezer that REVERTS or cannot be read fails closed — recover by
+    ///      rotating `coverageFreezer` or re-pointing the ledger. Note the
+    ///      asymmetry: a freezer that ANSWERS zero passes rather than failing
+    ///      closed, so "fails closed" covers unreadability, not every unhelpful
+    ///      answer (issue #117). Note `challengeableUntil` is zero for an
     ///      untouched key and zero is not a sentinel, so an unchallenged
     ///      proposal still reclaims on the ordinary schedule.
     ///
