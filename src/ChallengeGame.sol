@@ -237,7 +237,7 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ITierRegistryDemoterMinimal public tierRegistry;
 
     /// @notice The sole WOOD custodian and the contract that executes the
-    ///         verdict slash (`slashToEscrow`). This game must be its
+    ///         verdict slash (`slashVerdict`). This game must be its
     ///         `authorizedSlasher`. Owner-set after construction because the
     ///         role is granted on sWOOD's side and the two are wired in either
     ///         order at deploy time.
@@ -344,15 +344,6 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///         it's meant to price.
     uint256 public settleBurnBps = 2_000;
 
-    /// @notice Slice of a verdict slash paid to the challenger that caused it,
-    ///         in bps. Default 5%.
-    /// @dev    Escalated convictions only (see `_settle`'s gate on `escalated`).
-    ///         On the silence path an honest filer and a liar produce the same
-    ///         on-chain shape — a real slash against a real cohort — so a
-    ///         bounty there would pay both equally. The escalated path
-    ///         separates them: the accused contested and lost on the merits,
-    ///         and a liar who is contested loses the whole bond on
-    ///         `NotGuilty`. That's why the bounty is safe here at any size.
     /// @notice Ceiling on `prosecutorFeeBps`, mirroring
     ///         `ProposerBondEscrow.MAX_PROSECUTOR_FEE_BPS`.
     /// @dev    A CONVENIENCE GUARD, NOT THE AUTHORITY. The escrow enforces its
@@ -364,6 +355,32 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///         and pin zero for any proposal carrying no bond at all.
     uint256 public constant MAX_PROSECUTOR_FEE_BPS = 2_000;
 
+    /// @notice Slice of the convicted PROPOSER's forfeited bond paid to the
+    ///         challenger that caused the conviction, in bps. Default 5%.
+    /// @dev    NOT a slice of the slash. The slash pays nobody — `slashVerdict`
+    ///         takes no payee and burns everything it collects — and that
+    ///         separation is the point. A reward funded from the slash is a pot
+    ///         the prosecutor can fill for itself, by staking, approving the
+    ///         proposal it is about to accuse, and collecting a fee sized by
+    ///         its own punishment. The proposer's bond cannot be self-funded:
+    ///         nobody can post the accused's bond on their behalf, so a
+    ///         self-dealing filer pays the bond in full and recovers at most
+    ///         `MAX_PROSECUTOR_FEE_BPS` of it. Sybil-proof by construction
+    ///         rather than by parameter, which is why no anti-abuse gate rides
+    ///         on top of this rate.
+    /// @dev    PAID ON EVERY CONVICTION, silence path included — the path this
+    ///         reward exists for. A correct filing nobody answered used to pay
+    ///         nothing at all AND cost the filer `settleBurnBps` of its bond,
+    ///         so the only profitable honest filing was one that provoked a
+    ///         fight (issue #91). On the escalated path the challenger already
+    ///         takes bond + the forfeited pool; the fee is additive there.
+    /// @dev    Pinned per challenge at filing (`prosecutorFeeBpsAtFiling`), so
+    ///         a governance change cannot re-rate a challenge already in
+    ///         flight. If the escrow rejects a pinned rate, `_settle` retries
+    ///         the forfeiture without a fee rather than losing the conviction.
+    /// @dev    UNDERIVED. 5% is inherited from the conviction bounty this
+    ///         replaced and has never been priced against what a correct filing
+    ///         actually costs to produce. Bounded, not justified.
     uint256 public prosecutorFeeBps = 500;
 
     /// @notice The round-4-and-beyond steady-state share of the challenger's
@@ -525,7 +542,7 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///
     ///      The local flag is checked first (cheap, answers the common case);
     ///      the sWOOD scan is what makes the answer correct across a redeploy.
-    ///      Any hit is decisive: `slashToEscrow` reverts `ApproverAlreadySlashed`
+    ///      Any hit is decisive: `slashVerdict` reverts `ApproverAlreadySlashed`
     ///      if any accused member is already marked under this `caseKey`, so
     ///      one marked approver means a slash of this cohort can never land
     ///      again.
@@ -657,12 +674,12 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         // `(governor, proposalId)` and survives one. Without this, a game
         // deployed to replace an earlier one would accept filings against a
         // cohort the OLD game already convicted, freeze coverage and take the
-        // bond, then be unable to terminate (`_settle`'s `slashToEscrow` would
+        // bond, then be unable to terminate (`_settle`'s `slashVerdict` would
         // revert `ApproverAlreadySlashed`, and `rule` is unreachable from
         // `Filed`).
         //
         // The accused set is the committed cohort, the same one `_settle`
-        // sends to `slashToEscrow`; a released approver reports zero committed
+        // sends to `slashVerdict`; a released approver reports zero committed
         // USD and is excluded from both.
         address[] memory accused = new address[](accusedCount);
         for (uint256 i = 0; i < committedUsd.length; i++) {
@@ -1026,7 +1043,7 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         // the door, but that gate reads the slasher wired AT FILING TIME and the
         // owner may re-point sWOOD (or the old game may settle a concurrent
         // challenge) at any point afterwards, so the settle path cannot assume it
-        // was reachable. Diverting here rather than letting `slashToEscrow`
+        // was reachable. Diverting here rather than letting `slashVerdict`
         // revert is the whole point: a revert leaves the challenge in `Filed`
         // with no terminal exit at all, taking the bond, the counter-bond pool
         // and the coverage freeze with it.
@@ -1650,7 +1667,7 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     /// @dev Also requires the OTHER half of the grant: `authorizedSlasher` is
     ///      sWOOD's side of the same two-sided relationship — pointing this
     ///      game at a sWOOD that has not named it would send every `_settle`
-    ///      into `slashToEscrow`'s own caller gate, since `Filed`'s only other
+    ///      into `slashVerdict`'s own caller gate, since `Filed`'s only other
     ///      exit (`rule`) demands `Disputed`. The reciprocal pointer is
     ///      already the documented deploy order
     ///      (`swood.setAuthorizedSlasher(game)` then `game.setStakedWood(swood)`),

@@ -372,7 +372,7 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     mapping(address guardian => Checkpoints.Trace224) internal _liabilityCheckpoints;
 
     /// @notice The one address permitted to drive the VERDICT slash path
-    ///         (`slashToEscrow`). Deliberately distinct from `onlyRegistry`,
+    ///         (`slashVerdict`). Deliberately distinct from `onlyRegistry`,
     ///         which drives the block-quorum review slash: the paths must stay
     ///         separate so the registry's `refundSlash` reserve can never
     ///         refund a proven-malice verdict. Owner-set, which makes a
@@ -1080,7 +1080,7 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
         emit ExposureLedgerSet(ledger);
     }
 
-    /// @notice Set the address permitted to drive `slashToEscrow`.
+    /// @notice Set the address permitted to drive `slashVerdict`.
     /// @dev Owner-only, and deliberately NOT `setRegistry`'s set-once shape:
     ///      the role is rewirable to a future challenge game. Zero is a valid
     ///      value — it disables the verdict path entirely.
@@ -1294,17 +1294,13 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
         // Nothing recovered: nothing to pay, nothing to burn.
         if (total == 0) return 0;
 
-        // THE BOUNTY COMES OFF THE TOP, BEFORE THE BURN (spec 2026-07-29 §2).
-        // Paying the prosecutor out of what the prosecution recovered is what
-        // makes filing rational: a correct but unanswered challenge otherwise
-        // LOSES `settleBurnBps` of its bond, so nobody outside the drained
-        // vault has a reason to watch.
-        //
-        // This is the ONLY leg that leaves to a named address, and that is
-        // exactly what lets the rate be punitive. A sink with no counterparty
-        // cannot over-pay anyone, so the slash is free to exceed the loss —
-        // which is the whole reason the verdict rate is now the severity
-        // ceiling rather than a share of the damages.
+        // NO LEG LEAVES TO A NAMED ADDRESS, and that is exactly what lets the
+        // rate be punitive. A sink with no counterparty cannot over-pay anyone,
+        // so the slash is free to exceed the loss — which is the whole reason
+        // the verdict rate is the severity ceiling rather than a share of the
+        // damages. Any payee here would re-impose the windfall constraint that
+        // capped it at 1x, which is why the prosecutor is paid from the
+        // proposer's forfeited bond instead of from this.
         _totalStakeCheckpoint.push(uint32(block.timestamp), uint224(totalGuardianStake));
 
         // THE SINK. Every wei taken burns — the slash pays no one. The

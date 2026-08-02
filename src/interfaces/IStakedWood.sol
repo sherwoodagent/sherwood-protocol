@@ -43,13 +43,16 @@ interface IStakedWood {
 
     event AuthorizedSlasherSet(address indexed slasher);
 
-    /// @notice A verdict slash was settled: what it took, what the prosecutor
-    ///         was paid, and what was destroyed.
-    /// @dev `gross == bounty + burned` by construction, so an indexer never has
-    ///      to re-derive the split. `burned` is also `slashVerdict`'s return
-    ///      value. Replaces the `VerdictSlashRouted` / `VerdictSlashUncompensated`
-    ///      pair, whose whole purpose was to report WHETHER victims were paid —
-    ///      a question with one answer now.
+    /// @notice A verdict slash was settled: what it took, all of which was
+    ///         destroyed.
+    /// @dev ONE FIELD, BECAUSE THERE IS ONE LEG. `gross == burned` by
+    ///      construction — the slash has no payee — so there is no split for an
+    ///      indexer to re-derive. `burned` is also `slashVerdict`'s return
+    ///      value. Replaces the `VerdictSlashRouted` /
+    ///      `VerdictSlashUncompensated` pair, whose whole purpose was to report
+    ///      WHETHER victims were paid — a question with one answer now. The
+    ///      prosecutor's fee is a separate leg on a separate contract and
+    ///      surfaces as `IProposerBondEscrow.ProsecutorFeePaid`.
     event VerdictSlashBurned(bytes32 indexed caseKey, uint256 burned);
 
     // ── Guardian stake ──
