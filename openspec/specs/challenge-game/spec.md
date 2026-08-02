@@ -2,7 +2,7 @@
 
 ## Purpose
 
-The challenge trigger of the guardian economic-security model: anyone may post a bonded challenge against an executed proposal, freezing the coverage its approvers committed; silence convicts, a dispute escalates to the token court, and verdicts execute through the slash rails into snapshot-gated victim compensation. Covers `ChallengeGame`, `CompensationEscrow`, and `ProposerBondEscrow`.
+The challenge trigger of the guardian economic-security model: anyone may post a bonded challenge against an executed proposal, freezing the coverage its approvers committed; silence convicts, a dispute escalates to the token court, and verdicts execute through the slash rails, burning the convicted approvers' bonds. Depositors are not compensated. Covers `ChallengeGame` and `ProposerBondEscrow`.
 
 ## Requirements
 
@@ -129,11 +129,11 @@ The contribution that brings the pool to exactly the bond SHALL flip the status 
 - **THEN** the conviction executes and a later `resolve` reverts `WrongStatus`
 
 ### Requirement: Settle path — conviction, slash into escrow, per-path bond handling
-`_settle` (reached from the silence timeout or a `Guilty` ruling) SHALL fail closed with `ZeroAddress` if `stakedWood` is unwired (recoverable: wiring the slasher makes every stuck challenge resolvable). It SHALL mark the status `Settled`, release this challenge's freeze hold, and — unless the proposal was already convicted by a concurrent challenge, in which case it SHALL emit `VerdictAlreadyCollected` and slash nothing — set the convicted flag and execute the slash via `IStakedWood.slashToEscrow` using the ledger's per-approver rates (`slashBpsFor`, filtered to non-zero entries so released approvers are not named in the conviction), the pinned `executedAt` as basis and `executedAt - 1` as snapshot. Bond handling SHALL differ by entry: on the ESCALATED entry (`Guilty` ruling) the challenger receives its bond whole plus the entire forfeited pool, with no burn; on the SILENCE entry, `settleBurnBpsAtFiling` of the bond is burned to `0x…dEaD` (`ChallengerBondBurned`), the remainder returns to the challenger, and any part-funded pool is booked for pull-refund to its contributors. `ChallengeSettled(challengeId, slashedWood, caseId)` SHALL be emitted, where `slashedWood` is what the compensation escrow actually received (net of any conviction bounty).
+`_settle` (reached from the silence timeout or a `Guilty` ruling) SHALL fail closed with `ZeroAddress` if `stakedWood` is unwired (recoverable: wiring the slasher makes every stuck challenge resolvable). It SHALL mark the status `Settled`, release this challenge's freeze hold, and — unless the proposal was already convicted by a concurrent challenge, in which case it SHALL emit `VerdictAlreadyCollected` and slash nothing — set the convicted flag and execute the slash via `IStakedWood.slashVerdict` using the ledger's per-approver rates (`slashBpsFor`, filtered to non-zero entries so released approvers are not named in the conviction) and the pinned `executedAt` as basis. It SHALL also pass a `contestors` array, positionally aligned with the approvers, flagging every approver that funded the counter-bond — sWOOD caps the conviction bounty at their summed slash, so the scan MUST be complete rather than stopping at the first match. Bond handling SHALL differ by entry: on the ESCALATED entry (`Guilty` ruling) the challenger receives its bond whole plus the entire forfeited pool, with no burn; on the SILENCE entry, `settleBurnBpsAtFiling` of the bond is burned to `0x…dEaD` (`ChallengerBondBurned`), the remainder returns to the challenger, and any part-funded pool is booked for pull-refund to its contributors. `ChallengeSettled(challengeId, slashedWood)` SHALL be emitted, where `slashedWood` is what was actually BURNED (net of any conviction bounty).
 
 #### Scenario: Silence conviction burns the settle slice
 - **WHEN** an undisputed challenge settles by timeout
-- **THEN** the accused approvers are slashed into the compensation escrow, the named adapter demotion is attempted, `settleBurnBpsAtFiling` (default 2,000 bps) of the bond is burned, and the challenger receives the rest
+- **THEN** the accused approvers are slashed and their bonds burned, the named adapter demotion is attempted, `settleBurnBpsAtFiling` (default 2,000 bps) of the bond is burned, and the challenger receives the rest
 
 #### Scenario: Escalated conviction pays the challenger the pool
 - **WHEN** the court rules `Guilty` on a disputed challenge
@@ -144,14 +144,14 @@ The contribution that brings the pool to exactly the bond SHALL flip the status 
 - **THEN** no slash is attempted, `VerdictAlreadyCollected` is emitted, and the challenge still terminates normally (settle-path bond handling included)
 
 ### Requirement: Conviction bounty only on a genuinely contested escalated conviction
-The pinned `convictionBountyBpsAtFiling` SHALL be forwarded to `slashToEscrow` (with the challenger as recipient) ONLY when the conviction is escalated (`Guilty` ruling) AND at least one member of the ACCUSED approver set contributed to the counter-bond pool. On the silence path, and on an escalated conviction whose pool no accused approver funded (a challenger-staged contest), the game SHALL pass `(address(0), 0)` — no bounty. The bounty ceiling is sWOOD's own `MAX_CONVICTION_BOUNTY_BPS`, read live, never restated in this contract.
+The pinned `convictionBountyBpsAtFiling` SHALL be forwarded to `slashVerdict` (with the challenger as recipient) ONLY when the conviction is escalated (`Guilty` ruling) AND at least one member of the ACCUSED approver set contributed to the counter-bond pool. On the silence path, and on an escalated conviction whose pool no accused approver funded (a challenger-staged contest), the game SHALL pass `(address(0), 0)` — no bounty. The bounty ceiling is sWOOD's own `MAX_CONVICTION_BOUNTY_BPS`, read live, never restated in this contract.
 
 #### Scenario: Sybil-staged contest earns no bounty
 - **WHEN** a `Guilty` ruling lands on a dispute whose pool was funded only by non-accused addresses
 - **THEN** the slash executes with zero bounty; the challenger still receives bond plus pool but collects no slice of the slash
 
 ### Requirement: Slash gas floor
-Because `resolve` is permissionless and a gas-starved `openCase` child inside `slashToEscrow` would burn the victims' compensation instead of reverting, `_settle` SHALL revert `InsufficientSlashGas` when `gasleft() < approvers.length * SLASH_GAS_PER_APPROVER + SLASH_GAS_BASE`, with `SLASH_GAS_PER_APPROVER = 300_000` and `SLASH_GAS_BASE = 1_000_000`. The per-approver term is sized to the slash loop at the accused-set cap (`GuardianRegistry.MAX_APPROVERS_PER_PROPOSAL = 100`); the base leaves the `openCase` child a >5x margin after 63/64 forwarding. The check is skipped on the `VerdictAlreadyCollected` branch (nothing is slashed) and a failed check changes no challenge state — retry with more gas.
+Because `resolve` is permissionless, `_settle` SHALL revert `InsufficientSlashGas` when `gasleft() < approvers.length * SLASH_GAS_PER_APPROVER + SLASH_GAS_BASE`, with `SLASH_GAS_PER_APPROVER = 180_000` and `SLASH_GAS_BASE = 2_000_000` — measured end to end through court `finalize`, not against the slash call alone. What the floor protects is the best-effort `demoteByChallenge` that runs AFTER the slash inside a bare `try/catch`: a caller who supplies just enough gas to finish the slash leaves that child 63/64 of a nearly-empty frame, so it starves, the catch swallows it, and the verdict settles with the challenged adapter keeping its certification. Everything else after the slash either reverts the whole call or is internal bookkeeping. The full-cap floor SHALL fit Robinhood's 32M per-transaction limit. The check is skipped on the `VerdictAlreadyCollected` branch (nothing is slashed) and a failed check changes no challenge state — retry with more gas.
 
 #### Scenario: Under-gassed resolve reverts cleanly
 - **WHEN** `resolve` reaches the slash with less than the floor remaining
@@ -220,7 +220,7 @@ Owner setters SHALL enforce: `challengeWindow` non-zero and never above the wire
 - **THEN** `setCourt` reverts `WindowInvariantViolated` against the new court's own `voteWindow`/`FINALIZE_BUFFER`
 
 ### Requirement: Cross-contract wiring and roles
-The game SHALL be plain `Ownable2Step` (not upgradeable). It requires three externally granted roles: the exposure ledger's `coverageFreezer`, the tier registry's `authorizedDemoter`, and sWOOD's `authorizedSlasher`. `wood`, `exposureLedger`, and `tierRegistry` are constructor-set (zero addresses revert); `stakedWood` SHALL be owner-set AFTER construction via `setStakedWood`, because the slasher role is granted on sWOOD's side and the two contracts are wired in either order at deploy time — until wired, `_settle` fail-closes with `ZeroAddress` and no challenge can settle. `setStakedWood` SHALL revalidate the live `convictionBountyBps` against the new slasher's `MAX_CONVICTION_BOUNTY_BPS`; `setExposureLedger` SHALL revalidate `challengeWindow` against the new ledger's window. `setCourt(address(0))` SHALL be permitted — it is the governance off-switch that returns disputes to the fail-safe timeout — and `rule` reads the LIVE `court` deliberately, so a replaced court can still rule pending disputes. The compensation escrow is NOT named by the game: it is owner-set state on sWOOD, so the game can never redirect slash proceeds.
+The game SHALL be plain `Ownable2Step` (not upgradeable). It requires three externally granted roles: the exposure ledger's `coverageFreezer`, the tier registry's `authorizedDemoter`, and sWOOD's `authorizedSlasher`. `wood`, `exposureLedger`, and `tierRegistry` are constructor-set (zero addresses revert); `stakedWood` SHALL be owner-set AFTER construction via `setStakedWood`, because the slasher role is granted on sWOOD's side and the two contracts are wired in either order at deploy time — until wired, `_settle` fail-closes with `ZeroAddress` and no challenge can settle. `setStakedWood` SHALL revalidate the live `convictionBountyBps` against the new slasher's `MAX_CONVICTION_BOUNTY_BPS`; `setExposureLedger` SHALL revalidate `challengeWindow` against the new ledger's window. `setCourt(address(0))` SHALL be permitted — it is the governance off-switch that returns disputes to the fail-safe timeout — and `rule` reads the LIVE `court` deliberately, so a replaced court can still rule pending disputes. The game names no sink: slash proceeds burn inside sWOOD, so there is nothing for the game to redirect.
 
 #### Scenario: Settling before the slasher is wired fails closed
 - **WHEN** `resolve` reaches the settle path while `stakedWood` is unset
@@ -229,39 +229,6 @@ The game SHALL be plain `Ownable2Step` (not upgradeable). It requires three exte
 #### Scenario: Unwiring the court restores the fail-safe
 - **WHEN** governance calls `setCourt(address(0))` with disputes open
 - **THEN** `rule` becomes unreachable and every open dispute can only terminate via the timeout acquittal
-
-### Requirement: Compensation cases pinned to a pre-drain snapshot
-`CompensationEscrow.openCase(vault, snapshotTimestamp, proceeds)` SHALL be callable only by the `authorizedFunder` (sWOOD, whose `slashToEscrow` opens the case; otherwise `NotAuthorizedFunder`), with a non-zero vault, a snapshot strictly in the past (`SnapshotNotPast`), non-zero proceeds (`NothingToCompensate`), and a non-zero vault `getPastTotalSupply` at the snapshot (`EmptySnapshot`). The case SHALL cache the snapshot supply and freeze `residueWindowAtOpen` at the live `residueWindow` — terms are fixed at open. Proceeds are booked into `totalEscrowed` and pulled from the funder; `CaseOpened` is emitted. Slash proceeds MUST NOT flow to the vault's live NAV: only holders of record at the snapshot can redeem, and claims are mapping entries with no transfer surface, so a coalition that drains and buys the depressed shares of exiting holders recoups nothing (F1).
-
-#### Scenario: Non-funder cannot open a case
-- **WHEN** any address other than `authorizedFunder` calls `openCase`
-- **THEN** the call reverts `NotAuthorizedFunder`
-
-#### Scenario: Empty snapshot refused at open
-- **WHEN** the vault's past total supply at the snapshot is zero
-- **THEN** `openCase` reverts `EmptySnapshot` rather than accepting WOOD nobody can ever redeem
-
-### Requirement: Snapshot-gated pro-rata redemption
-`claimable(caseId, holder)` SHALL be `proceeds * getPastVotes(holder, snapshot) / snapshotSupply`, rounded down, capped at the case's own unpaid remainder (`proceeds - redeemed`) for per-case fund isolation — a hostile vault reporting oversummed votes can never drain a sibling case — and zero once the holder redeemed or the case was swept. `redeem(caseId)` SHALL be pull-based and single-shot per holder per case: revert `CaseNotFound` on an unopened case, `AlreadyRedeemed` on a repeat, `NoClaim` on a zero entitlement; the per-holder flag is set before the transfer. Apportionment uses the vault's ERC20Votes checkpoints (the vault auto-delegates every receipt), which is also a known-open F1 channel: a claim follows the delegate pointer set before the snapshot.
-
-#### Scenario: Snapshot holder redeems pro-rata
-- **WHEN** a holder with 30% of the snapshot's votes redeems from a case
-- **THEN** it receives 30% of the case's proceeds (floored, capped at the case remainder), `totalEscrowed` decreases by that amount, and a second `redeem` reverts `AlreadyRedeemed`
-
-#### Scenario: Post-drain buyer collects nothing
-- **WHEN** an address that acquired vault shares only after the snapshot calls `redeem`
-- **THEN** the call reverts `NoClaim` — its past votes at the snapshot are zero
-
-### Requirement: Residue sweep to the backstop
-`sweepResidue(caseId)` SHALL be permissionless (the destination is fixed, so a caller can only accelerate) and SHALL transfer the case's unredeemed remainder to the owner-set `backstop` only after `openedAt + residueWindowAtOpen` (the FROZEN window, never the live one — a later `setResidueWindow` governs only cases opened after it; otherwise `ResidueWindowOpen`). It SHALL revert `ZeroAddress` with no backstop set, `BackstopIsVault` when the backstop equals the case's vault (a typo-catcher, not a full guarantee), and `NothingToCompensate` when already swept or nothing remains. A swept case's claims are closed. Escrow setters SHALL enforce non-zero funder and backstop, and `residueWindow` in [30 days, 365 days] (`InvalidWindow`); default 180 days.
-
-#### Scenario: Sweep only after the frozen window
-- **WHEN** the owner lowers `residueWindow` after a case opened under 180 days
-- **THEN** that case still cannot be swept before `openedAt + 180 days`
-
-#### Scenario: Backstop misconfigured as the vault
-- **WHEN** `backstop` equals the case's vault address at sweep time
-- **THEN** `sweepResidue` reverts `BackstopIsVault`
 
 ### Requirement: Proposer bond lock, release, and forfeiture
 `ProposerBondEscrow` SHALL be ownerless with no discretionary exit — exactly two exits exist, release and forfeiture, and both are keyed rather than caller-directed. `lockBond(proposalId, proposer, amount)` SHALL be callable only by a registry-authorized governor (`NotAuthorizedGovernor`), with a non-zero proposer, `amount <= type(uint96).max` (`AmountTooLarge`), and at most one bond per `(governor, proposalId)` key (`BondAlreadyLocked`); the WOOD is pulled from the named proposer. `releaseBond(proposalId)` SHALL key the bond to `msg.sender` (so only the governor that locked it can address it) and deliberately SKIP the live registry check — a later-deauthorized governor can still release open bonds to the recorded proposer rather than stranding them; the payout always goes to the recorded proposer, never a caller-chosen payee. `bondOf(governor, proposalId)` SHALL report the recorded proposer and amount.
