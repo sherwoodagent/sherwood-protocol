@@ -358,6 +358,11 @@ contract CrystallizeOnExitTest is Test {
 
         uint256 parked = vault.crystallizedMgmt();
         assertGt(parked, 0);
+
+        // Release is settled-only: the governor clears the active proposal
+        // before charging fees, so the parked assets are back from the strategy
+        // by the time it consumes them. Mirror that ordering here.
+        _setLocked(false);
         uint256 assetsBefore = vault.totalAssets();
 
         vm.prank(MOCK_GOVERNOR);

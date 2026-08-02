@@ -27,6 +27,24 @@ interface AggregatorV3Interface {
         returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound);
 }
 
+/// @notice The hops walked to resolve the governance-owned ERC-20 spot feed
+///         registry from this strategy: `vault()` → `factory()` →
+///         `priceRouter()` → `adapterOf(ERC20_SPOT)` → `feedOf(token)`.
+/// @dev    Declared locally rather than importing the pricing stack: every hop
+///         is a length-checked raw staticcall (`_readAddress`), so the strategy
+///         takes on no type dependency and no hop can revert into `_initialize`
+///         or into a fail-soft view. `feedOf` is declared with only its FIRST
+///         return field because the read decodes word 0 alone — the registry's
+///         config struct leads with `aggregator`. This interface exists to
+///         generate selectors, not to type the responses.
+interface IFeedBindingPath {
+    function factory() external view returns (address);
+    function priceRouter() external view returns (address);
+    function adapterOf(bytes32 kind) external view returns (address);
+    function feedOf(address token) external view returns (address aggregator);
+    function instantCapAssets(address token) external view returns (uint256);
+}
+
 /// @notice Decoded Chainlink Data Streams V3 report
 struct ChainlinkReport {
     bytes32 feedId;
@@ -88,6 +106,12 @@ contract PortfolioStrategy is BaseStrategy {
     /// @notice Push-mode per-slot max-age (upper 96 bits of `_feedIds[i]`) is
     ///         outside `[MIN_PUSH_PRICE_AGE, MAX_PUSH_PRICE_AGE_CAP]`.
     error InvalidPriceAge();
+    /// @notice A slot's declared push feed is not the aggregator governance
+    ///         registered for that slot's token in the pricing adapter's feed
+    ///         registry. Adversary: a proposer declaring an aggregator that
+    ///         quotes something other than the token it sits next to — see the
+    ///         binding note on `_initialize`.
+    error FeedNotRegistered(address token, address declared, address registered);
     /// @notice Basket cannot contain the same token address twice —
     ///         duplicates would double-count balances and inflate live NAV.
     error DuplicateToken(address token);
@@ -177,6 +201,12 @@ contract PortfolioStrategy is BaseStrategy {
     ///          `[MIN_PUSH_PRICE_AGE, MAX_PUSH_PRICE_AGE_CAP]`. Equity feeds
     ///          don't heartbeat outside market hours, so their slots pack a
     ///          longer age (e.g. 96h) while crypto slots use the default.
+    ///
+    ///      Proposer-supplied, and in push mode the mark it yields sizes and
+    ///      floors every instant-exit unwind — so it is bound to the token by
+    ///      `_registeredAggregator` at init AND re-bound on every read in
+    ///      `_pushMark`, and published by `getFeedIds()` for review. Adversary:
+    ///      see the binding note on `_initialize`.
     bytes32[] internal _feedIds;
 
     // ── Events ──
@@ -229,6 +259,36 @@ contract PortfolioStrategy is BaseStrategy {
     ///         → default `MAX_PUSH_PRICE_AGE`; nonzero must be within
     ///         `[MIN_PUSH_PRICE_AGE, MAX_PUSH_PRICE_AGE_CAP]` (equity feeds go
     ///         stale outside market hours and need a longer bound than crypto).
+    ///
+    ///         FEED-TO-TOKEN BINDING (push mode). Matching `decimals()` proves
+    ///         only that the address is *a* feed, not that it quotes
+    ///         `tokens[i]`. The mark `_pushMark` reads from this feed is what
+    ///         sizes and floors every leg of an instant-exit unwind
+    ///         (`_unwindBasket` / `_sellForUnwind`), and the mark cancels out of
+    ///         the `minOut` computation — so a wrong-LOW feed makes the basket
+    ///         surrender an unbounded multiple of the stock a fair mark would
+    ///         (a minimum-size exit can drain nearly the whole basket), while a
+    ///         wrong-HIGH feed reverts every instant exit that
+    ///         `availableLiquidity` advertises. Adversary: a proposer who
+    ///         declares slot `i`'s feed as some cheap token's aggregator, waits
+    ///         for the vault's instant lane to open, and exits into the
+    ///         mispriced unwind at the remaining LPs' expense.
+    ///
+    ///         So each push-mode slot must declare the SAME aggregator
+    ///         governance registered for `tokens[i]` in the pricing adapter's
+    ///         feed registry — the registry the `PriceRouter` itself prices
+    ///         that token with — resolved through
+    ///         `vault() → factory() → priceRouter() → adapterOf(ERC20_SPOT)`.
+    ///         CONDITIONAL, by exactly one condition: the check is skipped when
+    ///         that walk yields no registered aggregator for the token (Lane A
+    ///         not wired yet, no ERC-20 spot adapter, or the token not listed),
+    ///         because a hard requirement would brick legitimate Lane-B-only
+    ///         baskets on vaults whose kind has no adapter. Skipping is safe
+    ///         because it is the same condition under which the router prices
+    ///         the position `(0, false)`, the vault's lane never opens, and
+    ///         `withdrawTo` is therefore never called — the unbound mark is
+    ///         inert. Its one residual window, a token listed only AFTER init,
+    ///         is closed by re-binding on every read in `_pushMark`.
     function _initialize(bytes calldata data) internal override {
         (
             address asset_,
@@ -258,6 +318,9 @@ contract PortfolioStrategy is BaseStrategy {
         // Push-feed mode when no Data Streams verifier is wired: each
         // `feedIds[i]` encodes an AggregatorV3 proxy as bytes32(uint160(feed)).
         bool pushMode = chainlinkVerifier_ == address(0);
+        // Resolved once, outside the loop: the walk is four staticcalls and the
+        // answer is identical for every slot.
+        address feedRegistry = pushMode ? _spotFeedRegistry() : address(0);
 
         uint256 weightSum;
         for (uint256 i; i < tokens.length; ++i) {
@@ -276,6 +339,14 @@ contract PortfolioStrategy is BaseStrategy {
                     revert InvalidPriceAge();
                 }
                 if (AggregatorV3Interface(feed).decimals() != priceDecimals_[i]) revert InvalidPriceDecimals();
+                // Bind the feed to the token (see the binding note above).
+                // Loud here, fail-soft on read: a mismatch is a proposal that
+                // should never have been written, so it dies at creation rather
+                // than silently pinning the basket to Lane B months later.
+                address registered = _registeredAggregator(feedRegistry, tokens[i]);
+                if (registered != address(0) && registered != feed) {
+                    revert FeedNotRegistered(tokens[i], feed, registered);
+                }
             }
             // Rejects duplicate token addresses: a basket like [TSLA, TSLA]
             // aggregates into a single TSLA balance while rebalance math treats
@@ -682,6 +753,56 @@ contract PortfolioStrategy is BaseStrategy {
         maxAge = age == 0 ? MAX_PUSH_PRICE_AGE : age;
     }
 
+    // ── Feed-to-token binding (see the binding note on `_initialize`) ──
+
+    /// @dev The governance-owned ERC-20 spot feed registry this strategy's
+    ///      vault prices through — the adapter the `PriceRouter` itself hands
+    ///      `PositionKinds.ERC20_SPOT` positions to — or `address(0)` when any
+    ///      hop is unavailable. Unavailable is a legitimate state, not an
+    ///      error: a vault with no `factory()`, a factory with Lane A unwired
+    ///      (`priceRouter() == 0`), or a router with no spot adapter all mean
+    ///      the router cannot price this basket either, so its marks are never
+    ///      consumed. Every hop is a raw staticcall so none of them can revert
+    ///      `_initialize` or a fail-soft view — a hostile or codeless target
+    ///      reads as unavailable, which only ever loses this check, never
+    ///      weakens another.
+    function _spotFeedRegistry() private view returns (address) {
+        address factory_ = _readAddress(vault(), abi.encodeCall(IFeedBindingPath.factory, ()));
+        if (factory_ == address(0)) return address(0);
+        address router = _readAddress(factory_, abi.encodeCall(IFeedBindingPath.priceRouter, ()));
+        if (router == address(0)) return address(0);
+        return _readAddress(router, abi.encodeCall(IFeedBindingPath.adapterOf, (PositionKinds.ERC20_SPOT)));
+    }
+
+    /// @dev Aggregator `registry` has registered against `token`, or
+    ///      `address(0)` when the registry is unresolved or the token unlisted.
+    ///      Decodes the FIRST word of `feedOf`'s return only: the registry's
+    ///      per-token config leads with `aggregator`. A future registry that
+    ///      reorders that field reads as a mismatch — init reverts, Lane A
+    ///      shuts — never as a silent pass.
+    function _registeredAggregator(address registry, address token) private view returns (address) {
+        if (registry == address(0)) return address(0);
+        return _readAddress(registry, abi.encodeCall(IFeedBindingPath.feedOf, (token)));
+    }
+
+    /// @dev Staticcall-safe address read: codeless target, revert, short
+    ///      return, or dirty upper bits all resolve to `address(0)`. The
+    ///      length bound is `>=` rather than `==` because `feedOf` returns a
+    ///      multi-field config of which only the leading word is read.
+    function _readAddress(address target, bytes memory data) private view returns (address) {
+        if (target.code.length == 0) return address(0);
+        (bool ok, bytes memory ret) = target.staticcall(data);
+        if (!ok || ret.length < 32) return address(0);
+        uint256 word;
+        // Reads the first return word directly: `abi.decode` cannot express
+        // "leading word of a longer payload".
+        assembly ("memory-safe") {
+            word := mload(add(ret, 0x20))
+        }
+        if (word >> 160 != 0) return address(0);
+        return address(uint160(word));
+    }
+
     // ── Chainlink price verification ──
 
     /// @param i             Allocation index — used to check `report.feedId`
@@ -782,6 +903,24 @@ contract PortfolioStrategy is BaseStrategy {
     ///      idle-only in production (invisible under view-quote test mocks).
     ///      Adversary: an overstated figure makes the vault attempt an unwind
     ///      that under-delivers and reverts exits Lane A advertised.
+    ///
+    ///      DEPTH BOUND. Capacity is additionally capped so no single unwind
+    ///      leg exceeds its token's measured DEX depth, published per token by
+    ///      the spot pricing registry (`Erc20SpotAdapter.instantCapAssets`).
+    ///      `_unwindBasket` sells pro-rata by mark value, so a total sale of
+    ///      `g` sells `g * v_i / V` from slot `i` (v_i = that slot's mark
+    ///      value, V = the basket's). Keeping every leg inside its cap means
+    ///      `g <= V * min_i(cap_i / v_i)`, which is what the loop below
+    ///      computes before applying the slippage discount. Adversary: an
+    ///      instant exit sized beyond a token's real depth unwinds at a
+    ///      slippage the instant-exit fee cannot cover, socializing the gap to
+    ///      the LPs who stay. Against a LIVE registry, a slot with no cap has
+    ///      no measured depth to justify ANY instant capacity, so it degrades
+    ///      the whole basket to idle-only rather than being skipped — skipping
+    ///      it would let the pro-rata sale reach an unbounded token anyway.
+    ///      When no registry resolves at all, the router cannot price this
+    ///      strategy either, so Lane A is shut and the bound is moot. The
+    ///      numeraire is exempt: it is the unit of account, realized at par.
     function availableLiquidity() external view override returns (uint256) {
         uint256 idle = IERC20(asset).balanceOf(address(this));
         if (_state != State.Executed || _rebalancing) return idle;
@@ -789,17 +928,63 @@ contract PortfolioStrategy is BaseStrategy {
 
         uint256 assetDec = uint256(_assetDecimals);
         uint256 len = _allocations.length;
-        uint256 basket;
+        uint256 totalValue;
+        // Largest total basket sale that keeps EVERY leg inside its token's
+        // depth cap (see the pro-rata derivation in the natspec above).
+        uint256 grossLimit = type(uint256).max;
+        address registry = _spotFeedRegistry();
         for (uint256 i; i < len; ++i) {
             address token = _allocations[i].token;
             uint256 bal = IERC20(token).balanceOf(address(this));
             if (bal == 0) continue;
-            (uint256 price, bool ok) = _pushMark(i);
+            (uint256 price, bool ok) = _pushMark(i, registry);
             if (!ok) return idle;
             uint256 markValue = _tokensToValue(bal, price, i, assetDec);
-            basket += (markValue * (BPS_DENOMINATOR - maxSlippageBps)) / BPS_DENOMINATOR;
+            if (markValue == 0) continue;
+            totalValue += markValue;
+
+            // The numeraire needs no depth bound (it is the unit of account,
+            // realized at par).
+            if (token == asset) continue;
+            // No registry resolved at all (Lane A unwired: no factory, no
+            // router, or no ERC20_SPOT adapter) means the router cannot price
+            // this strategy either, so Lane A is structurally shut and this
+            // figure is never consumed by an instant exit — leave the estimate
+            // mark-anchored rather than pretending the basket is illiquid.
+            if (registry == address(0)) continue;
+            // A registry that IS live but vouches no cap for this token is the
+            // dangerous case: `setFeed` requires a nonzero cap, so a zero here
+            // means the token is unlisted, or the registered adapter does not
+            // publish caps at all. Either way nothing has justified a depth
+            // number, and the lane may still be open — fail closed to
+            // idle-only rather than advertise an unbounded basket.
+            uint256 cap = _instantCapAssets(registry, token);
+            if (cap == 0) return idle;
+            // Leg i of a sale totalling `g` is `g * markValue / totalValue`,
+            // so `g <= totalValue * (cap / markValue)` keeps it inside the cap.
+            // Clamped at 1e18 (the whole basket) so the later multiply cannot
+            // overflow on a slot whose cap dwarfs its current value.
+            uint256 ratio = (cap * 1e18) / markValue;
+            if (ratio > 1e18) ratio = 1e18;
+            if (ratio < grossLimit) grossLimit = ratio;
         }
-        return idle + basket;
+        if (totalValue == 0) return idle;
+
+        // grossLimit is min_i(cap_i / v_i) in 1e18 fixed point, clamped to 1e18.
+        uint256 gross = grossLimit >= 1e18 ? totalValue : (totalValue * grossLimit) / 1e18;
+        return idle + (gross * (BPS_DENOMINATOR - maxSlippageBps)) / BPS_DENOMINATOR;
+    }
+
+    /// @dev Per-token instant-exit depth cap from the spot pricing registry, in
+    ///      vault-asset units; `0` when the registry is unresolved or the token
+    ///      is unlisted. Staticcall-safe: `availableLiquidity` is consumed
+    ///      inside `SyndicateVault.maxWithdraw`, so an unreadable registry must
+    ///      degrade capacity, never revert the vault's view.
+    function _instantCapAssets(address registry, address token) private view returns (uint256) {
+        if (registry == address(0) || registry.code.length == 0) return 0;
+        (bool ok, bytes memory ret) = registry.staticcall(abi.encodeCall(IFeedBindingPath.instantCapAssets, (token)));
+        if (!ok || ret.length < 32) return 0;
+        return abi.decode(ret, (uint256));
     }
 
     /// @inheritdoc IStrategy
@@ -844,10 +1029,11 @@ contract PortfolioStrategy is BaseStrategy {
         uint256[] memory prices = new uint256[](len);
         uint256[] memory values = new uint256[](len);
         uint256 totalValue;
+        address registry = _spotFeedRegistry();
         for (uint256 i; i < len; ++i) {
             uint256 bal = IERC20(_allocations[i].token).balanceOf(address(this));
             if (bal == 0) continue;
-            (uint256 price, bool ok) = _pushMark(i);
+            (uint256 price, bool ok) = _pushMark(i, registry);
             // Loud here (vs the fail-closed views): the vault only calls in
             // with an exit in flight, and a silent skip would under-deliver.
             if (!ok) revert StalePrice();
@@ -891,8 +1077,20 @@ contract PortfolioStrategy is BaseStrategy {
     ///      age) but fails soft so view callers can degrade instead of revert.
     ///      Only meaningful in push mode; callers gate on
     ///      `chainlinkVerifier == address(0)`.
-    function _pushMark(uint256 i) private view returns (uint256, bool) {
+    /// @param registry The spot feed registry from `_spotFeedRegistry()`,
+    ///        resolved once by the caller and passed down (identical for every
+    ///        slot, four staticcalls to resolve).
+    /// @dev Re-binds the feed to the token on every read, closing the two
+    ///      windows the init-time bind cannot see: a token listed in the
+    ///      registry only AFTER this strategy was initialized, and an
+    ///      aggregator rotated under a live basket. Both would leave the mark
+    ///      that sizes an unwind diverging from the one the router prices the
+    ///      very same position with. Fails soft in the same direction as every
+    ///      other doubt here — Lane A shuts, the async queue stays open.
+    function _pushMark(uint256 i, address registry) private view returns (uint256, bool) {
         (address feed, uint256 maxAge) = _decodePushFeed(_feedIds[i]);
+        address registered = _registeredAggregator(registry, _allocations[i].token);
+        if (registered != address(0) && registered != feed) return (0, false);
         try AggregatorV3Interface(feed).decimals() returns (uint8 dec) {
             if (dec != _priceDecimals[i]) return (0, false);
         } catch {
@@ -936,6 +1134,26 @@ contract PortfolioStrategy is BaseStrategy {
     /// @notice Per-allocation token decimals snapshotted at init.
     function getTokenDecimals() external view returns (uint8[] memory) {
         return _tokenDecimals;
+    }
+
+    /// @notice Per-allocation feed id exactly as the proposer declared it,
+    ///         parallel to `getAllocations()`. Data Streams mode: the expected
+    ///         report `feedId`. Push mode: the packed
+    ///         `maxAgeSeconds << 160 | aggregator` (decode with
+    ///         `address(uint160(uint256(id)))` and `uint256(id) >> 160`).
+    /// @dev    The oracle side of the basket is the one input a proposer
+    ///         supplies that the rest of the contract cannot re-derive, and in
+    ///         push mode it sets the mark that sizes every instant-exit unwind.
+    ///         Adversary: a proposer sneaking a feed that quotes something
+    ///         other than the token beside it. The binding check on
+    ///         `_initialize` rejects that on-chain; this getter is what lets a
+    ///         guardian, a monitor, or `DeployLaneA.checkStrategyCoverage`
+    ///         SEE the declared feed rather than take the check on faith —
+    ///         including for the slots the bind deliberately skips (token not
+    ///         yet in the registry) and for the whole Data Streams mode, where
+    ///         there is no on-chain registry to bind against at all.
+    function getFeedIds() external view returns (bytes32[] memory) {
+        return _feedIds;
     }
 
     /// @notice Vault asset decimals snapshotted at init.

@@ -75,6 +75,41 @@ interface IUniswapV3PoolMinimal {
 ///         publishing a poisoned position to make `totalAssets()` revert and
 ///         freeze exits — every external read below is a length-checked raw
 ///         staticcall so no venue or feed can force a revert into NAV reads.
+///
+///         VALUE vs EXECUTABILITY — why the per-token depth cap is published
+///         here but NOT enforced here. `value` answers one question: what is
+///         this position worth. It never sees an exit size; quantity is
+///         `IERC20(venue).balanceOf(holder)`, so a cap enforced in this
+///         function bounds the POSITION, not the exit, and the only lever it
+///         has to enforce it is to declare the position unpriceable. Both ends
+///         of that are worse than the risk it prices:
+///           - Donation DoS. `balanceOf` is inflatable by anyone: a transfer to
+///             the strategy raises it. `PriceRouter.valueStrategy` requires
+///             EVERY position to be ok, so one slot pushed over its cap closes
+///             Lane A — instant deposits AND instant exits — for the whole
+///             vault until settlement. Adversary: a griefer donating ~$101 of
+///             TSLA to a strategy holding $7,400 against the seeded $7,500 cap.
+///             The donated tokens are swept to the vault at settle, so the
+///             griefer's true cost is the time value of the transfer, and the
+///             vault's LPs pay with a closed lane.
+///           - No adversary required. A price rally past the cap, or a proposer
+///             sizing a sleeve above it, closes Lane A with nobody attacking.
+///         Clamping (`v = cap`) is NOT the alternative: it would UNDER-report
+///         `totalAssets()`, and `SyndicateVault._deposit` mints Lane A shares
+///         against that understated NAV — the same one-sided-mark wealth
+///         transfer `PriceRouter.setHaircutBps` documents, trading a liveness
+///         bug for a value-transfer bug. So value stays truthful and the size
+///         bound moves to where exits are actually sized; the cap is published
+///         by `instantCapAssets` for that consumer.
+///
+///         WHERE THE BOUND LIVES: `PortfolioStrategy.availableLiquidity`
+///         (consumed by `SyndicateVault.maxWithdraw`) reads `instantCapAssets`
+///         and caps instant-exit capacity so no single pro-rata unwind leg
+///         exceeds its token's cap; a slot with no registered cap degrades that
+///         strategy to idle-only capacity. Any future Lane A strategy must
+///         apply the same bound in its own `availableLiquidity` — this adapter
+///         publishes the number but cannot enforce it, because valuation never
+///         sees an exit size.
 contract Erc20SpotAdapter is Ownable, IPriceAdapter {
     /// @notice Per-token pricing config. Packs into two storage slots.
     /// @param aggregator       Chainlink AggregatorV3 proxy quoting token/numeraire.
@@ -87,10 +122,15 @@ contract Erc20SpotAdapter is Ownable, IPriceAdapter {
     ///                         Meaningful only when `referencePool` is set.
     /// @param referencePool    Uniswap-v3-style token/numeraire pool whose spot
     ///                         gates the feed price. `address(0)` = gate off.
-    /// @param capAssets        Per-token instant cap in numeraire units. The
-    ///                         router's `instantCap` is per-KIND; measured safe
-    ///                         DEX depths differ ~13× across tokens (design
-    ///                         D9b), so the per-token bound lives here.
+    /// @param capAssets        Per-token instant-EXIT depth bound in numeraire
+    ///                         units: the most of this token that may be sold
+    ///                         into one instant unwind. The router's
+    ///                         `instantCap` is per-KIND; measured safe DEX
+    ///                         depths differ ~13× across tokens (design D9b),
+    ///                         so the per-token bound lives here. Registry data
+    ///                         only — read via `instantCapAssets` by the
+    ///                         consumer that sizes exits, NEVER enforced by
+    ///                         `value` (see "VALUE vs EXECUTABILITY" above).
     struct FeedConfig {
         address aggregator;
         uint48 maxAge;
@@ -180,10 +220,14 @@ contract Erc20SpotAdapter is Ownable, IPriceAdapter {
     ///         reverts here so it can never be half-installed. Reads both
     ///         `decimals()` live and probes `latestRoundData()` so a wrong
     ///         address (EOA, non-feed contract) is rejected at wiring time.
-    /// @param capAssets        Per-token instant cap in numeraire units
-    ///                         (required nonzero: every listed token has a
-    ///                         measured depth; "unlimited" is expressed
-    ///                         explicitly as a huge cap, never by omission).
+    /// @param capAssets        Per-token instant-EXIT depth bound in numeraire
+    ///                         units, published by `instantCapAssets` for the
+    ///                         exit sizer — NOT a pricing guard (see "VALUE vs
+    ///                         EXECUTABILITY" in the header). Required nonzero:
+    ///                         every listed token has a measured depth, and a
+    ///                         zero here reads as "no instant capacity" to the
+    ///                         consumer; "unlimited" is expressed explicitly as
+    ///                         a huge bound, never by omission.
     /// @param referencePool    Uniswap-v3-style token/numeraire pool for the
     ///                         divergence gate; `address(0)` disables the gate
     ///                         (valid for non-equity tokens whose feeds track
@@ -246,6 +290,22 @@ contract Erc20SpotAdapter is Ownable, IPriceAdapter {
         emit FeedRemoved(token);
     }
 
+    /// @notice The registered per-token instant-EXIT depth bound for `token`, in
+    ///         numeraire units — the published half of the value/executability
+    ///         split (see the header). The consumer that sizes instant exits
+    ///         reads this and bounds capacity so that no single unwind leg
+    ///         exceeds its token's measured depth.
+    /// @dev    Zero means "unregistered": a consumer MUST read it as "no
+    ///         instant-exit capacity for this token", never as "unlimited" —
+    ///         `setFeed` rejects a zero cap, so a registered token always
+    ///         publishes a positive bound. The numeraire itself is never
+    ///         registered (it prices at par and needs no sale to be returned),
+    ///         so a consumer must treat `token == numeraire` as uncapped rather
+    ///         than reading a zero here.
+    function instantCapAssets(address token) external view returns (uint256) {
+        return feedOf[token].capAssets;
+    }
+
     // ── Valuation ──
 
     /// @inheritdoc IPriceAdapter
@@ -261,6 +321,9 @@ contract Erc20SpotAdapter is Ownable, IPriceAdapter {
     ///          would aggregate mixed units into `totalAssets()`; fail closed.
     ///        - registry miss / decimals drift / stale, incomplete, or
     ///          non-positive round: pricing doubt → `(0, false)`, Lane B.
+    ///      Every guard here answers "can this be priced truthfully". Position
+    ///      SIZE is not such a question and is not gated here — see "VALUE vs
+    ///      EXECUTABILITY" in the header and `instantCapAssets`.
     function value(Position calldata p, address holder) external view returns (uint256, bool) {
         if (p.kind != PositionKinds.ERC20_SPOT) return (0, false);
         if (p.venue == address(0) || holder == address(0)) return (0, false);
@@ -295,11 +358,13 @@ contract Erc20SpotAdapter is Ownable, IPriceAdapter {
         (uint256 v, bool okScale) = _scale(bal, price, cfg.tokenDecimals, cfg.feedDecimals);
         if (!okScale) return (0, false);
 
-        // Per-token instant cap (design D9b). Adversary: an instant exit sized
-        // beyond the token's real DEX depth unwinds at a slippage the
-        // instant-exit fee cannot cover, socializing the gap to remaining LPs.
-        // The router's per-kind `instantCap` cannot express per-token depth.
-        if (v > cfg.capAssets) return (0, false);
+        // NO per-token cap check here, deliberately (see "VALUE vs
+        // EXECUTABILITY" in the header). `cfg.capAssets` bounds an EXIT and
+        // this function never sees one, so enforcing it here would bound the
+        // position instead — and enforcing it the only way `value` can, by
+        // declaring the position unpriceable, lets a ~$101 donation close the
+        // whole vault's Lane A. The bound is published by `instantCapAssets`
+        // and belongs to the consumer that sizes exits.
 
         // Oracle-vs-pool divergence gate (design D9c). Adversary: 24/5 equity
         // feeds hold the last price over weekends while pools keep trading —

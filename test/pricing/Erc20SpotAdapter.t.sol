@@ -24,6 +24,31 @@ contract HolderStub {
     }
 }
 
+/// @notice Stand-in for a Lane A strategy: `vault()` for the adapter's
+///         numeraire binding plus `positions()` for `PriceRouter.valueStrategy`,
+///         so a test can exercise the vault-facing all-or-nothing aggregation
+///         (one not-ok position closes the lane for the whole vault).
+contract StrategyStub {
+    address internal immutable _vault;
+    Position[] internal _positions;
+
+    constructor(address vault_) {
+        _vault = vault_;
+    }
+
+    function vault() external view returns (address) {
+        return _vault;
+    }
+
+    function addPosition(address venue) external {
+        _positions.push(Position({venue: venue, kind: PositionKinds.ERC20_SPOT, ref: ""}));
+    }
+
+    function positions() external view returns (Position[] memory) {
+        return _positions;
+    }
+}
+
 /// @notice Stand-in for the vault side of the binding chain.
 contract VaultStub {
     address internal immutable _asset;
@@ -589,28 +614,110 @@ contract Erc20SpotAdapterTest is LaneAFixture {
         assertEq(v, 0);
     }
 
-    // ── Per-token instant cap (design D9b) ──
+    // ── Per-token depth cap: published, not a pricing guard (audit #6) ──
 
-    function test_value_overCap_failsClosed() public {
+    /// @dev $1-a-token fixture so donation sizes read directly in dollars:
+    ///      18-dec token, 8-dec feed at $1, 6-dec numeraire ⇒ 1e18 raw == $1.
+    function _dollarToken() internal returns (ERC20Mock token, MockAggregatorV3 feed) {
+        token = _newToken("TOK", 18);
+        feed = _newFeed(8, int256(1e8));
+    }
+
+    /// @notice THE PROPERTY: a dust donation that pushes one position past its
+    ///         per-token depth cap must NOT close the instant lane for the
+    ///         vault, and must NOT be silently clamped out of NAV.
+    ///
+    ///         Quantity comes from `balanceOf` (the design's deliberate trust
+    ///         inversion), so anyone can inflate it by transferring tokens to
+    ///         the strategy. `valueStrategy` is all-or-nothing across positions,
+    ///         so at HEAD one slot over its cap took instant deposits AND
+    ///         instant exits offline for the whole vault until settlement —
+    ///         for the griefer's cost of a $101 transfer that the vault sweeps
+    ///         back at settle. The second assertion pins the other half: the
+    ///         donation is counted at full value, because clamping to the cap
+    ///         would under-report `totalAssets()` and mint Lane A deposits
+    ///         against understated NAV (`PriceRouter.setHaircutBps` natspec).
+    function test_donationOverPerTokenCap_cannotCloseLaneA_andNavStaysTruthful() public {
+        (ERC20Mock token, MockAggregatorV3 feed) = _dollarToken();
+        _registerFull(address(token), address(feed), MAX_AGE, 7_500e6, address(0), 0); // TSLA's seeded cap
+
+        // A strategy holding $7,400 of the capped token plus $200 idle
+        // numeraire — two positions, so the all-or-nothing aggregation is live.
+        StrategyStub strat = new StrategyStub(address(new VaultStub(address(usdc))));
+        token.mint(address(strat), 7_400e18);
+        usdc.mint(address(strat), 200e6);
+        strat.addPosition(address(token));
+        strat.addPosition(address(usdc));
+
+        (uint256 navBefore, bool okBefore) = router.valueStrategy(address(strat));
+        assertTrue(okBefore, "precondition: under-cap position keeps Lane A open");
+        assertEq(navBefore, 7_600e6, "precondition NAV");
+
+        // Griefer pushes the slot $1 past its cap for $101.
+        address griefer = makeAddr("griefer");
+        token.mint(griefer, 101e18);
+        vm.prank(griefer);
+        token.transfer(address(strat), 101e18);
+
+        (uint256 navAfter, bool okAfter) = router.valueStrategy(address(strat));
+        assertTrue(okAfter, "a $101 donation must not close the vault's instant lane");
+        assertEq(navAfter, 7_701e6, "donation counted at full value - no clamp, no understated NAV");
+    }
+
+    /// @notice The same defect with no adversary: a price rally past the cap
+    ///         (or a proposer sizing a sleeve above it) must not close the lane.
+    function test_value_overCap_pricesTruthfully_capIsNotAPricingGuard() public {
         ERC20Mock token = _newToken("TOK", 18);
         MockAggregatorV3 feed = _newFeed(8, int256(150e8));
         _registerFull(address(token), address(feed), MAX_AGE, 100e6, address(0), 0); // $100 cap
-        token.mint(holder, 1e18); // $150 position
+        token.mint(holder, 1e18); // $150 position: 50% over the cap
 
         (uint256 v, bool ok) = adapter.value(_pos(address(token)), holder);
-        assertFalse(ok, "position beyond measured depth is instant-ineligible");
-        assertEq(v, 0);
+        assertTrue(ok, "size is not a pricing doubt");
+        assertEq(v, 150e6, "full value, not the cap");
     }
 
-    function test_value_atCap_passes() public {
+    /// @notice The cap is published for the consumer that sizes exits. Zero
+    ///         means unregistered, which that consumer must read as "no instant
+    ///         capacity", never as "unlimited".
+    function test_instantCapAssets_publishesDepthBound() public {
         ERC20Mock token = _newToken("TOK", 18);
         MockAggregatorV3 feed = _newFeed(8, int256(150e8));
-        _registerFull(address(token), address(feed), MAX_AGE, 150e6, address(0), 0); // cap == value
-        token.mint(holder, 1e18);
+        _registerFull(address(token), address(feed), MAX_AGE, 7_500e6, address(0), 0);
 
-        (uint256 v, bool ok) = adapter.value(_pos(address(token)), holder);
-        assertTrue(ok, "cap is inclusive");
-        assertEq(v, 150e6);
+        assertEq(adapter.instantCapAssets(address(token)), 7_500e6, "registered depth bound");
+        assertEq(adapter.instantCapAssets(makeAddr("unlisted")), 0, "unregistered reads zero");
+
+        vm.prank(adapterOwner);
+        adapter.removeFeed(address(token));
+        assertEq(adapter.instantCapAssets(address(token)), 0, "delisting withdraws the bound");
+    }
+
+    /// @notice NOT COVERED BY THIS FIX, pinned so the residual is visible:
+    ///         `PriceRouter._priceOne`'s per-KIND `instantCap` has the identical
+    ///         position-vs-exit defect one level up, and `PriceRouter` is a
+    ///         deployed contract outside this change's scope. Post-fix a griefer
+    ///         must donate past the ROUTER cap (100_000e6 as seeded) instead of
+    ///         the per-token cap (7_500e6 for TSLA) — 13× more expensive, still
+    ///         possible. The same bound-the-exit move is needed there.
+    function test_routerPerKindCap_stillClosesLane_notCoveredByThisFix() public {
+        (ERC20Mock token, MockAggregatorV3 feed) = _dollarToken();
+        _registerFull(address(token), address(feed), MAX_AGE, 7_500e6, address(0), 0);
+
+        vm.prank(routerOwner);
+        router.setInstantCap(PositionKinds.ERC20_SPOT, 100_000e6);
+
+        StrategyStub strat = new StrategyStub(address(new VaultStub(address(usdc))));
+        token.mint(address(strat), 99_000e18);
+        strat.addPosition(address(token));
+
+        (, bool okBefore) = router.valueStrategy(address(strat));
+        assertTrue(okBefore, "under the router cap: open");
+
+        token.mint(address(strat), 2_000e18); // over 100_000e6
+        (uint256 v, bool ok) = router.valueStrategy(address(strat));
+        assertFalse(ok, "router per-kind cap still closes the lane (residual, PriceRouter-side)");
+        assertEq(v, 0);
     }
 
     function test_setFeed_zeroCap_reverts() public {

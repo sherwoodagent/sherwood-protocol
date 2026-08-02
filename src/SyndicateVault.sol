@@ -968,20 +968,57 @@ contract SyndicateVault is
     ///      and LPs use the async redeem queue (`requestRedeem`). The bound
     ///      queue (`caller == _withdrawalQueue`) bypasses the reserve guard
     ///      because the reserved float belongs to it.
+    ///
+    /// @dev INVARIANT: the fee booked to the recipients is exactly the fee
+    ///      withheld from the exiter, both measured against the same pre-pull
+    ///      state that `previewRedeem` quoted. OZ derives `assets`/`shares`
+    ///      from the previews before entering here, so the state on entry IS
+    ///      the quoted state — which is why BOTH the Lane A flag and
+    ///      `_exitFees(shares)` are latched at the top of this function, above
+    ///      `_pullFromStrategy`, and the crystallization below reads nothing
+    ///      but those latched values.
+    ///
+    ///      Adversary 1 (Lane A flipping off mid-transaction): an exit sized to
+    ///      empty the basket. The unwind can leave the strategy with nothing
+    ///      priceable — a PortfolioStrategy that sold out, or a Morpho position
+    ///      whose sub-unit share residue rounds to 0 assets — and
+    ///      `PriceRouter.valueStrategy` answers `(0, false)` from then on.
+    ///      Re-reading the flag after the pull would let that exiter be charged
+    ///      the fees by `previewRedeem` and book none of them: the withheld
+    ///      assets would stay behind as a windfall to the LPs who remain, and
+    ///      the fee recipients would be shortchanged by the exact amount the
+    ///      exiter paid.
+    ///
+    ///      Adversary 2 (the pull is not NAV-neutral): re-computing `_exitFees`
+    ///      after the pull prices the recipients' side at a share price the
+    ///      exiter was never quoted. `withdrawTo` moves the strategy's idle
+    ///      vault-asset balance into vault float, and the two sides of that move
+    ///      are not guaranteed to be marked identically, so a post-pull
+    ///      recomputation can book the recipients MORE than was withheld — the
+    ///      difference coming out of the LPs who stay.
     function _withdraw(address caller, address receiver, address _owner, uint256 assets, uint256 shares)
         internal
         override
         whenNotPaused
         nonReentrant
     {
+        // ── Latch the quoted state before anything moves ──
+        bool crystallizes;
+        uint256 mgmtFee;
+        uint256 perfFee;
         if (caller != _withdrawalQueue) {
+            (,,, bool laneAExit) = _laneState();
+            // The queue deliberately crystallizes nothing: a Lane B claim
+            // settles at the frozen post-settlement price and has already borne
+            // its share, so charging it here would double-bill.
+            crystallizes = laneAExit;
+            if (crystallizes) (mgmtFee, perfFee) = _exitFees(shares);
+
             uint256 reserve = reservedQueueAssets();
             uint256 float = IERC20(asset()).balanceOf(address(this));
             // Shortfall beyond idle float is pulled from the active strategy in
             // the same tx (Yearn default_queue pattern, queue length 1). The
-            // pull happens BEFORE the burn/transfer; value moves position →
-            // float, so live NAV (and thus this exit's share pricing) is
-            // unchanged.
+            // pull happens BEFORE the burn/transfer.
             if (assets + reserve > float) {
                 _pullFromStrategy(assets + reserve - float);
             }
@@ -992,16 +1029,12 @@ contract SyndicateVault is
         // simply stays behind in the vault — no transfer, no recipient lookup,
         // no external call on the ERC-4626 hot path. The exiter pays the fees
         // they owe at the moment they leave, so exit timing is fee-neutral.
-        (,,, bool laneAExit) = _laneState();
-        if (caller != _withdrawalQueue && laneAExit) {
-            (uint256 mgmtFee, uint256 perfFee) = _exitFees(shares);
-            if (mgmtFee != 0 || perfFee != 0) {
-                // forge-lint: disable-next-line(unsafe-typecast)
-                _crystallizedMgmt += uint128(mgmtFee);
-                // forge-lint: disable-next-line(unsafe-typecast)
-                _crystallizedPerf += uint128(perfFee);
-                emit ExitFeesCrystallized(_owner, shares, mgmtFee, perfFee);
-            }
+        if (crystallizes && (mgmtFee != 0 || perfFee != 0)) {
+            // forge-lint: disable-next-line(unsafe-typecast)
+            _crystallizedMgmt += uint128(mgmtFee);
+            // forge-lint: disable-next-line(unsafe-typecast)
+            _crystallizedPerf += uint128(perfFee);
+            emit ExitFeesCrystallized(_owner, shares, mgmtFee, perfFee);
         }
 
         super._withdraw(caller, receiver, _owner, assets, shares);
@@ -1503,13 +1536,26 @@ contract SyndicateVault is
 
     /// @inheritdoc ISyndicateVault
     /// @notice Governor-only: release the parked management fees for payout.
-    /// @dev The assets never left the vault — this only moves them from
-    ///      "parked, excluded from `totalAssets`" to "payable", which is why
-    ///      the two legs are released separately. Releasing raises
-    ///      `totalAssets()`, so the performance leg must read its base BEFORE
-    ///      `consumeCrystallizedPerf` is called or it would charge a fee on
-    ///      money that already belongs to the recipients.
+    /// @dev Releasing moves the amount from "parked, excluded from
+    ///      `totalAssets`" to "payable", which is why the two legs are released
+    ///      separately: releasing raises `totalAssets()`, so the performance leg
+    ///      must read its base BEFORE `consumeCrystallizedPerf` is called or it
+    ///      would charge a fee on money that already belongs to the recipients.
+    ///
+    ///      SETTLED-ONLY. The parked assets are not necessarily IN the vault
+    ///      while a proposal is live: a Lane A exit that outruns float pulls
+    ///      exactly the exiter's payout back from the strategy, so the fee it
+    ///      withheld stays in the strategy until settlement returns everything.
+    ///      Adversary: a future mid-proposal fee sweep (or a partial-settlement
+    ///      path) consuming a balance the vault cannot transfer — the counter
+    ///      would zero while the assets sit elsewhere, and the shortfall would
+    ///      come out of whatever the vault does hold, i.e. the LPs who stayed.
+    ///      The governor already consumes these only from `_finishSettlement`,
+    ///      after `_activeProposal` is cleared; this guard makes that ordering
+    ///      an enforced precondition rather than an assumption a refactor can
+    ///      silently break.
     function consumeCrystallizedMgmt() external onlyGovernor returns (uint256 amount) {
+        if (redemptionsLocked()) revert RedemptionsLocked();
         amount = _crystallizedMgmt;
         _crystallizedMgmt = 0;
     }
@@ -1517,7 +1563,10 @@ contract SyndicateVault is
     /// @inheritdoc ISyndicateVault
     /// @notice Governor-only: release the parked performance fees for payout.
     ///         Call only after the above-mark base has been read.
+    /// @dev Settled-only for the same reason as `consumeCrystallizedMgmt` —
+    ///      see the adversary note there.
     function consumeCrystallizedPerf() external onlyGovernor returns (uint256 amount) {
+        if (redemptionsLocked()) revert RedemptionsLocked();
         amount = _crystallizedPerf;
         _crystallizedPerf = 0;
     }

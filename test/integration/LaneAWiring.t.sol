@@ -455,18 +455,25 @@ contract LaneAWiringTest is Test {
         assertTrue(ok, "re-converged pool reopens Lane A");
     }
 
-    // ── (f) over-cap → Lane B (adapter per-token cap AND router kind cap) ──
+    // ── (f) caps: per-token bounds EXIT SIZE, router kind cap closes the lane ──
 
-    function test_ladder_f_overCap_closesLaneB() public {
+    function test_ladder_f_perTokenCapBoundsExitSizeNotPricing() public {
         _depositExecuteLock();
 
-        // Adapter per-token cap below the TSLA position's $300 value.
+        // A per-token cap below the TSLA position's $300 value does NOT make
+        // the position unpriceable — value stays truthful, so NAV stays
+        // truthful and a dust donation cannot close the vault's lane. The cap
+        // bounds how much can leave through an instant exit instead.
+        uint256 uncapped = strategy.availableLiquidity();
         vm.prank(DEFAULT_SENDER);
         spotAdapter.setFeed(address(tsla), address(fTsla), MAX_AGE, 100e6, address(poolTsla), 100);
-        (, bool ok) = router.valueStrategy(address(strategy));
-        assertFalse(ok, "per-token cap exceeded: Lane B");
 
-        // Restore, then trip the router's per-kind cap instead.
+        (, bool ok) = router.valueStrategy(address(strategy));
+        assertTrue(ok, "per-token cap is not a pricing guard: lane stays open");
+        assertLt(strategy.availableLiquidity(), uncapped, "but instant-exit capacity is bounded by it");
+
+        // Restore, then trip the router's per-kind cap, which IS a valuation
+        // guard and does close the lane.
         vm.prank(DEFAULT_SENDER);
         spotAdapter.setFeed(address(tsla), address(fTsla), MAX_AGE, BIG_CAP, address(poolTsla), 100);
         (, ok) = router.valueStrategy(address(strategy));

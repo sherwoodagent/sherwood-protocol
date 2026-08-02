@@ -31,10 +31,14 @@ interface ILaneAVault {
 }
 
 /// @dev Local mirror of `PortfolioStrategy.TokenAllocation` for the optional
-///      strategy-coverage cross-check (`checkStrategyCoverage`). The strategy's
-///      `_feedIds` are internal, so feed IDENTITY cannot be cross-checked
-///      on-chain — only registry COVERAGE can (see design risk table: drift
-///      between the two registries degrades to Lane B, never misprices).
+///      strategy-coverage cross-check (`checkStrategyCoverage`), which asserts
+///      registry COVERAGE: every basket token has an entry, so the strategy's
+///      Lane A can open at all (a miss degrades to Lane B, never misprices).
+///      Feed IDENTITY no longer needs asserting here — the strategy binds each
+///      push-mode slot's feed to the aggregator this registry holds for that
+///      token, at init and again on every mark read
+///      (`PortfolioStrategy._registeredAggregator`), and publishes the declared
+///      ids via `getFeedIds()` for off-chain review.
 struct TokenAllocationView {
     address token;
     uint256 targetWeightBps;
@@ -157,8 +161,11 @@ contract DeployLaneA is Script {
     /// @notice Feed heartbeat (24h) — the registered `maxAge` for every token.
     uint256 public constant FEED_MAX_AGE = 86_400;
     /// @notice Router-level per-kind cap for `ERC20_SPOT`: the LARGEST
-    ///         per-token cap, valid ONLY because the adapter enforces the
-    ///         per-token caps itself (analysis §8 router-mechanics caveat).
+    ///         per-token cap. The router's cap is per-KIND and is a valuation
+    ///         guard (an over-cap position prices as not-ok, closing the lane);
+    ///         the per-TOKEN depth bound is enforced separately, on exit size,
+    ///         by `PortfolioStrategy.availableLiquidity` reading the adapter's
+    ///         `instantCapAssets` (analysis §8 router-mechanics caveat).
     uint256 public constant INSTANT_CAP_ERC20_SPOT = 100_000e6;
     /// @notice Router-level cap for `MORPHO_BLUE_SUPPLY` — an operational
     ///         bound, not an arbitrage bound (valuation is share->asset at par;
