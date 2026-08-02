@@ -150,12 +150,24 @@ contract MorphoSupplyStrategy is BaseStrategy {
 
     /// @inheritdoc IStrategy
     /// @dev min(own redeemable supply value, market unborrowed liquidity,
-    ///      Morpho's actual idle loan-token balance). The utilization cap is
-    ///      the spec's adversary guard: a highly utilized market must not
-    ///      advertise liquidity Morpho cannot pay out (the vault verifies
-    ///      delivery by balance diff and reverts `UnwindShortfall` on a lying
-    ///      strategy). The token-balance cap is belt-and-suspenders against
-    ///      accounting/balance divergence on the singleton.
+    ///      Morpho's actual idle loan-token balance, the router's per-kind
+    ///      instant cap). The utilization cap is the spec's adversary guard: a
+    ///      highly utilized market must not advertise liquidity Morpho cannot
+    ///      pay out (the vault verifies delivery by balance diff and reverts
+    ///      `UnwindShortfall` on a lying strategy). The token-balance cap is
+    ///      belt-and-suspenders against accounting/balance divergence on the
+    ///      singleton.
+    ///
+    ///      The per-kind cap is enforced HERE rather than in
+    ///      `PriceRouter._priceOne`, which prices truthfully and never sees an
+    ///      exit size: a cap applied at valuation could only bound the position,
+    ///      and only by declaring it unpriceable — which closed the whole
+    ///      vault's instant lane whenever a position outgrew it, griefable by
+    ///      anyone able to inflate that position (see the note on `_priceOne`).
+    ///      Unlike the spot side there is no per-token registry here, so this
+    ///      per-kind bound is the only depth limit on a Morpho unwind. A cap of
+    ///      0 means "no bound configured", matching the router's own
+    ///      convention; the market and utilization caps above still apply.
     function availableLiquidity() external view override returns (uint256) {
         if (_state != State.Executed) return 0;
 
@@ -169,7 +181,39 @@ contract MorphoSupplyStrategy is BaseStrategy {
         uint256 idleBalance = IERC20(asset).balanceOf(address(morpho));
 
         uint256 available = own < marketLiquidity ? own : marketLiquidity;
-        return available < idleBalance ? available : idleBalance;
+        if (idleBalance < available) available = idleBalance;
+
+        uint256 kindCap = _instantKindCap();
+        if (kindCap != 0 && kindCap < available) available = kindCap;
+        return available;
+    }
+
+    /// @dev The router's per-kind instant cap for `MORPHO_BLUE_SUPPLY`, or 0
+    ///      when unresolvable. Staticcall-safe at every hop: this feeds
+    ///      `SyndicateVault.maxWithdraw`, so an unreachable factory or router
+    ///      must degrade the bound, never revert the vault's view. An
+    ///      unresolvable router also means the vault cannot price this strategy
+    ///      at all, so Lane A is already shut and the bound is moot.
+    function _instantKindCap() private view returns (uint256) {
+        address factory_ = _readAddress(vault(), abi.encodeWithSignature("factory()"));
+        if (factory_ == address(0)) return 0;
+        address router = _readAddress(factory_, abi.encodeWithSignature("priceRouter()"));
+        if (router == address(0)) return 0;
+        (bool ok, bytes memory ret) =
+            router.staticcall(abi.encodeWithSignature("instantCap(bytes32)", PositionKinds.MORPHO_BLUE_SUPPLY));
+        if (!ok || ret.length < 32) return 0;
+        return abi.decode(ret, (uint256));
+    }
+
+    /// @dev Staticcall-safe address read: codeless target, revert, short return
+    ///      or dirty upper bits all resolve to `address(0)`.
+    function _readAddress(address target, bytes memory data) private view returns (address) {
+        if (target.code.length == 0) return address(0);
+        (bool ok, bytes memory ret) = target.staticcall(data);
+        if (!ok || ret.length < 32) return address(0);
+        uint256 word = abi.decode(ret, (uint256));
+        if (word >> 160 != 0) return address(0);
+        return address(uint160(word));
     }
 
     /// @inheritdoc IStrategy

@@ -700,7 +700,15 @@ contract Erc20SpotAdapterTest is LaneAFixture {
     ///         must donate past the ROUTER cap (100_000e6 as seeded) instead of
     ///         the per-token cap (7_500e6 for TSLA) — 13× more expensive, still
     ///         possible. The same bound-the-exit move is needed there.
-    function test_routerPerKindCap_stillClosesLane_notCoveredByThisFix() public {
+    /// @notice The router's per-kind cap is no longer a pricing guard either.
+    ///         It used to close the lane for the whole vault once any position
+    ///         outgrew it — the same defect as the adapter's per-token cap, one
+    ///         level up, and griefable the same way (position size is a venue
+    ///         `balanceOf` anyone can inflate by donating). Both caps now bound
+    ///         EXIT SIZE at the strategies that size exits; valuation stays
+    ///         truthful so NAV cannot be understated into a deposit-side
+    ///         wealth transfer.
+    function test_routerPerKindCap_isNotAPricingGuard() public {
         (ERC20Mock token, MockAggregatorV3 feed) = _dollarToken();
         _registerFull(address(token), address(feed), MAX_AGE, 7_500e6, address(0), 0);
 
@@ -714,10 +722,10 @@ contract Erc20SpotAdapterTest is LaneAFixture {
         (, bool okBefore) = router.valueStrategy(address(strat));
         assertTrue(okBefore, "under the router cap: open");
 
-        token.mint(address(strat), 2_000e18); // over 100_000e6
+        token.mint(address(strat), 2_000e18); // over the 100_000e6 kind cap
         (uint256 v, bool ok) = router.valueStrategy(address(strat));
-        assertFalse(ok, "router per-kind cap still closes the lane (residual, PriceRouter-side)");
-        assertEq(v, 0);
+        assertTrue(ok, "over the kind cap: still priced, lane stays open");
+        assertEq(v, 101_000e6, "and priced truthfully, not clamped to the cap");
     }
 
     function test_setFeed_zeroCap_reverts() public {

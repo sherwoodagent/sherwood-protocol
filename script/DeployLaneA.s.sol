@@ -161,15 +161,24 @@ contract DeployLaneA is Script {
     /// @notice Feed heartbeat (24h) — the registered `maxAge` for every token.
     uint256 public constant FEED_MAX_AGE = 86_400;
     /// @notice Router-level per-kind cap for `ERC20_SPOT`: the LARGEST
-    ///         per-token cap. The router's cap is per-KIND and is a valuation
-    ///         guard (an over-cap position prices as not-ok, closing the lane);
-    ///         the per-TOKEN depth bound is enforced separately, on exit size,
-    ///         by `PortfolioStrategy.availableLiquidity` reading the adapter's
-    ///         `instantCapAssets` (analysis §8 router-mechanics caveat).
+    ///         per-token cap.
+    /// @dev    INERT for stock baskets, and set here only so the kind carries a
+    ///         non-zero bound. Exit capacity is bounded by the adapter's
+    ///         per-TOKEN caps (`instantCapAssets`), read by
+    ///         `PortfolioStrategy.availableLiquidity`, which are strictly
+    ///         tighter than this figure. To change how much of a stock can
+    ///         leave in one instant exit, change that token's `capAssets` in
+    ///         the entry table below — NOT this constant (analysis §8
+    ///         router-mechanics caveat).
     uint256 public constant INSTANT_CAP_ERC20_SPOT = 100_000e6;
     /// @notice Router-level cap for `MORPHO_BLUE_SUPPLY` — an operational
     ///         bound, not an arbitrage bound (valuation is share->asset at par;
     ///         under-delivery reverts same-tx via the vault's balance check).
+    /// @dev    LOAD-BEARING, unlike its ERC20_SPOT counterpart above: there is
+    ///         no per-token registry on the Morpho side, so this is the only
+    ///         depth bound on a Morpho unwind.
+    ///         `MorphoSupplyStrategy.availableLiquidity` reads it; setting it
+    ///         to 0 removes the bound.
     uint256 public constant INSTANT_CAP_MORPHO_SUPPLY = 250_000e6;
 
     // ── Config ──

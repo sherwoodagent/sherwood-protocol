@@ -151,9 +151,23 @@ every entry.
 | ERC20_SPOT | AMD | — | — | — | **excluded** (depth < $10k, never clears the fee wedge) |
 | MORPHO_BLUE_SUPPLY | USDG supply | Morpho `0x9D53d5E3bd5E8d4Cbfa6DB1ca238AEA02E651010` | par (no oracle) | n/a | `250000000000` ($250k ops bound) |
 
-Router-level: `instantCap[ERC20_SPOT] = 100000000000` (largest per-token cap —
-valid only because the adapter enforces the per-token caps itself),
+Router-level: `instantCap[ERC20_SPOT] = 100000000000`,
 `instantCap[MORPHO_BLUE_SUPPLY] = 250000000000`.
+
+**Which cap actually binds — read before tuning.** All caps bound how much a
+single instant exit may take out; none of them affect what a position is
+*priced* at. They are asymmetric between the two kinds:
+
+- **Stocks.** The router's per-kind cap is **inert**. It is set to the largest
+  per-token cap, so a position always hits its own tighter token bound first
+  (TSLA stops at $7.5k, nowhere near the $100k kind cap).
+  `PortfolioStrategy.availableLiquidity` reads the adapter's per-token
+  `instantCapAssets`. **To change stock exit capacity, change that token's
+  `capAssets` — changing `instantCap[ERC20_SPOT]` will do nothing.**
+- **Morpho.** The per-kind cap is **load-bearing**. There is no per-token
+  registry on the Morpho side, so it is the only depth bound on a Morpho
+  unwind (`MorphoSupplyStrategy.availableLiquidity` reads it). Setting it to 0
+  removes that bound entirely.
 
 **AAPL is excluded by default.** The analysis found only a Uniswap **v4**
 AAPL/USDG pool, and the adapter's divergence gate reads a v3-style `observe()` TWAP —

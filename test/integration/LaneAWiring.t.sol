@@ -472,17 +472,20 @@ contract LaneAWiringTest is Test {
         assertTrue(ok, "per-token cap is not a pricing guard: lane stays open");
         assertLt(strategy.availableLiquidity(), uncapped, "but instant-exit capacity is bounded by it");
 
-        // Restore, then trip the router's per-kind cap, which IS a valuation
-        // guard and does close the lane.
+        // Restore, then trip the router's per-kind cap. It is not a valuation
+        // guard either: both caps bound EXIT SIZE at the strategies that size
+        // exits, so neither can be used to shut a vault's lane by inflating a
+        // position (see PriceRouter._priceOne).
         vm.prank(DEFAULT_SENDER);
         spotAdapter.setFeed(address(tsla), address(fTsla), MAX_AGE, BIG_CAP, address(poolTsla), 100);
-        (, ok) = router.valueStrategy(address(strategy));
-        assertTrue(ok, "restored cap reopens");
+        (uint256 full, bool okFull) = router.valueStrategy(address(strategy));
+        assertTrue(okFull, "restored cap reopens");
 
         vm.prank(DEFAULT_SENDER);
         router.setInstantCap(PositionKinds.ERC20_SPOT, 1e6);
-        (, ok) = router.valueStrategy(address(strategy));
-        assertFalse(ok, "router kind cap exceeded: Lane B");
+        (uint256 capped, bool okCapped) = router.valueStrategy(address(strategy));
+        assertTrue(okCapped, "router kind cap does not close the lane");
+        assertEq(capped, full, "and does not change the valuation");
     }
 
     // ── (g) haircut guard: the script refuses a nonzero-haircut router ──
