@@ -266,27 +266,6 @@ contract MockChallengeStakedWood {
     function lastSlashBpsPer() external view returns (uint256[] memory) {
         return _lastSlashBpsPer;
     }
-    /// @dev Task 1 (spec 2026-07-29 §2) added the conviction-bounty params;
-    ///      Task 2 wired the real routing. Recorded, not swallowed, so a test
-    ///      can pin exactly what `_settle` passes: `(challenger,
-    ///      prosecutorFeeBpsAtFiling)` on a CONTESTED escalated conviction
-    ///      — a `Guilty` ruling where the challenger did not fund its own
-    ///      counter-bond — and `(address(0), 0)` on every other path (the
-    ///      silence settle, and a self-funded escalated conviction, see
-    ///      `ChallengeGame._settle`'s `contested` gate).
-    address public lastBountyTo;
-    uint256 public lastBountyBps;
-
-    /// @dev Mirrors the real `StakedWood.MAX_CONVICTION_BOUNTY_BPS` (2_000
-    ///      default) so `ChallengeGame.setProsecutorFeeBps`'s live-read
-    ///      ceiling has something to read in this suite. Settable, unlike the
-    ///      real constant, so `setStakedWood`'s re-point guard can be tested
-    ///      against a SECOND mock deployment with a lower ceiling.
-    uint256 public MAX_CONVICTION_BOUNTY_BPS = 2_000;
-
-    function setMaxConvictionBountyBps(uint256 v) external {
-        MAX_CONVICTION_BOUNTY_BPS = v;
-    }
 
     uint256 internal _nextTotal = 1_000e18;
 
@@ -1115,14 +1094,12 @@ contract ChallengeGameTest is Test {
         assertEq(slashed.length, 2);
         assertEq(slashed[0], guardianA);
         assertEq(slashed[1], guardianB);
-        // This is the SILENCE path (undisputed, resolved by timeout), and Task
-        // 2 (spec 2026-07-29 §2) pays the conviction bounty ONLY on a
-        // CONTESTED escalated conviction — never here, where an honest filer
-        // and a liar are indistinguishable to the contract. Pinned explicitly
-        // so a future change to the routing shows up here as an intentional,
-        // reviewed diff rather than a silent behavior change.
-        assertEq(swood.lastBountyTo(), address(0), "the silence settle pays no bounty: bountyTo is zero");
-        assertEq(swood.lastBountyBps(), 0, "the silence settle pays no bounty: bountyBps is zero");
+        // The slash names no payee on ANY path — `slashVerdict` has no
+        // recipient argument to pass one through, so the property is now
+        // enforced by the signature rather than by a runtime check. Pinned
+        // structurally in `test_slash_carriesNoPayoutRecipient`; the
+        // prosecutor's fee arrives from the proposer's forfeited bond, which
+        // this mock never touches.
 
         // The adapter the challenger named is demoted (§3.4, D7).
         assertEq(tiers.demoteCount(), 1);
@@ -3721,6 +3698,54 @@ contract ChallengeGameTest is Test {
         assertFalse(ledger.isCoverageFrozen(address(gov), PROPOSAL), "unfrozen");
         ledger.releaseApproval(address(gov), PROPOSAL, guardianA);
         _assertLiveBondsBacked();
+    }
+
+    /// @notice A DIVERTED SETTLE MUST NOT SPEND THE DEMOTER ROLE. The
+    ///         `VerdictAlreadyCollected` branch adjudicates nothing — it
+    ///         slashes no one and forfeits no bond — so it has no conviction to
+    ///         carry a consequence for. The demotion used to sit AFTER the
+    ///         if/else and therefore fired on this branch too.
+    ///
+    ///         That was cheap to farm. Concurrency is unguarded by design:
+    ///         `_liveByChallenger` is keyed per challenger, `_convicted` is
+    ///         false for every filing made before the first settle, and
+    ///         `_liveCount` is uncapped. File N challenges from N addresses
+    ///         naming N different certified adapters the proposal touched, let
+    ///         the first collect the liability, and the remaining N-1 divert
+    ///         here while still revoking a certification apiece — for
+    ///         `settleBurnBps` of a bond that is itself `challengerBondBps` of
+    ///         coverage, roughly 1% of the proposal's coverage per adapter.
+    function test_settle_divertedVerdictDoesNotDemoteTheAdapter() public {
+        uint256 id = _fileStandard(PROPOSAL);
+        assertTrue(game.challengeOf(id).adapterTarget != address(0), "fixture: the filing named an adapter");
+
+        // Collect the liability out from under the live challenge, so the
+        // settle takes the diverted branch.
+        bytes32 key = _reviewKeyFor(address(gov), PROPOSAL);
+        swood.setVerdictSlashed(key, guardianA, true);
+        swood.setVerdictSlashed(key, guardianB, true);
+
+        uint256 demotesBefore = tiers.demoteCount();
+
+        vm.warp(_filedAt(id) + game.autoSlashDelay());
+        vm.expectEmit(true, true, true, true, address(game));
+        emit IChallengeGame.VerdictAlreadyCollected(id, address(gov), PROPOSAL);
+        game.resolve(id);
+
+        assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Settled), "still terminal");
+        assertEq(tiers.demoteCount(), demotesBefore, "a settle that collected nothing must revoke nothing");
+    }
+
+    /// @notice ...and the collecting settle still DOES demote, so the fix
+    ///         narrowed the branch rather than disabling the consequence.
+    function test_settle_collectingVerdictStillDemotesTheAdapter() public {
+        uint256 id = _fileStandard(PROPOSAL);
+        uint256 demotesBefore = tiers.demoteCount();
+
+        vm.warp(_filedAt(id) + game.autoSlashDelay());
+        game.resolve(id);
+
+        assertEq(tiers.demoteCount(), demotesBefore + 1, "a real conviction still demotes the named adapter");
     }
 
     /// @notice B1 END TO END ON THE REDEPLOY ITSELF: a V2 filing that was legal

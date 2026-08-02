@@ -335,14 +335,11 @@ interface IChallengeGame {
     event AutoReferFailed(uint256 indexed challengeId);
     /// @param slashedWood What was actually BURNED — NOT the gross amount taken
     ///        off the accused.
-    ///        On a CONTESTED escalated conviction (spec 2026-07-29 §2) this is
-    ///        NET of the conviction bounty paid to the challenger, since
-    ///        `IStakedWood.slashVerdict` deducts the bounty before burning the
-    ///        remainder; on the silence path, and on an escalated conviction
-    ///        the challenger itself funded (see `ChallengeGame._settle`'s
-    ///        `contested` gate), no bounty is paid and this equals the gross
-    ///        slash. `IStakedWood.VerdictSlashBurned` carries all three legs if
-    ///        an indexer needs the split.
+    ///        Gross and burned are now the same number on every path:
+    ///        `IStakedWood.slashVerdict` takes no payee and burns everything it
+    ///        collects. The prosecutor's fee is a slice of the PROPOSER's
+    ///        forfeited bond instead and never touches this figure — see
+    ///        `IProposerBondEscrow.ProsecutorFeePaid` for that leg.
     event ChallengeSettled(uint256 indexed challengeId, uint256 slashedWood);
     /// @dev The slice of the challenger's bond burned on the SETTLE path
     ///      (`settleBurnBps`) or the INCONCLUSIVE unwind path

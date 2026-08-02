@@ -388,7 +388,7 @@ contract SlashGasCeilingTest is Test {
     /// @dev File a challenge and escalate it, so the terminal path runs through
     ///      the court — the DEEPEST route to `_settle`, and the one the finding
     ///      is about. The disputer is one of the ACCUSED, which is what makes
-    ///      `_settle`'s `contested` scan run over the approver array and hands
+    ///      `_settle`'s per-approver work run over the approver array and hands
     ///      `slashToEscrow` a non-zero `bountyBps`: the gas-hungriest settle
     ///      there is.
     function _fileDisputeRefer(uint256 pid) internal returns (uint256 cid, uint256 caseId) {
