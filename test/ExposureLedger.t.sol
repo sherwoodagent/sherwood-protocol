@@ -1067,6 +1067,167 @@ contract ExposureLedgerTest is Test {
         );
     }
 
+    /// @dev Second proposal on its own governor, so `getRequiredCoverage` for
+    ///      P2 is independent of P1's — the shared mock returns one number for
+    ///      every id, and mutating it between calls would silently re-price the
+    ///      proposal a later `settleCoverage` is about to re-derive.
+    function _secondGovernor(uint256 coverage, uint256 duration) internal returns (MockGovernorForLedger) {
+        MockVaultForLedger vault2 = new MockVaultForLedger(usdgAsset);
+        MockGovernorForLedger g = new MockGovernorForLedger(address(vault2));
+        g.set(coverage);
+        g.setSchedule(block.timestamp + 1 days, duration);
+        return g;
+    }
+
+    /// @notice #110 — THE BATCHING CAP WAS ENFORCED AT EXACTLY ONE PLACE.
+    ///         `openExposureUsd(g) <= kNumerator * slashableBondUsd(g)` is a
+    ///         property of `_buckets`, but `recordApproval` is not the only
+    ///         writer of `_buckets`: `_rebook` is too, and its upward branch had
+    ///         no cap check. `settleCoverage` is `external`, permissionless and
+    ///         deliberately re-runnable, so the walk-up could be replayed AFTER
+    ///         the guardian had legally spent the budget an earlier pass freed.
+    ///
+    ///         The whole trace needs no capital, no price manipulation and no
+    ///         privileged role — step 4 is ordinary protocol operation and step 5
+    ///         is an EOA paying gas.
+    function test_settleCoverage_reRunCannotPushAGuardianPastItsCap() public {
+        _wireRecording();
+        address g2 = makeAddr("g2");
+        swood.setStake(g2, 100_000e18); // both hold $5,000 at $0.05
+        assertEq(ledger.kNumerator(), 1, "the trace is written for k = 1");
+
+        // 1. Both approve P1, each reserving the full coverage. g1 is at its cap.
+        mgov.set(5_000e6); // needUsd = $5,000 = one guardian's whole budget
+        mgov.setSchedule(block.timestamp + 1 days, 3 days);
+        vm.startPrank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        ledger.recordApproval(address(mgov), 1, g2);
+        vm.stopPrank();
+        assertEq(ledger.openExposureUsd(guardian), 5_000e18, "fully pledged: exactly at the cap");
+
+        // 2. Anyone settles P1 once execution is moot. The pro-rata split writes
+        //    both bookings DOWN and hands half of g1's budget back.
+        skip(31 days);
+        ledger.settleCoverage(address(mgov), 1);
+        assertEq(ledger.openExposureUsd(guardian), 2_500e18, "written down: $2,500 came free");
+
+        // 3. g1 spends the freed budget on an unrelated proposal. The cap check
+        //    in `recordApproval` passes, and it is right to pass.
+        MockGovernorForLedger mgov2 = _secondGovernor(2_500e6, 3 days);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov2), 1, guardian);
+        assertEq(ledger.openExposureUsd(guardian), 5_000e18, "back at the cap, legitimately");
+
+        // 4. g2 is slashed to zero on an unrelated conviction.
+        swood.setStake(g2, 0);
+
+        // 5. Anyone re-runs settlement on P1. `_effectiveReservedTotal` sums over
+        //    LIVE bonds, so it has halved, and `_allocate` now wants to hand g1
+        //    the whole $5,000 back — on top of the $2,500 already spent on P2.
+        ledger.settleCoverage(address(mgov), 1);
+
+        // Pre-fix this read $7,500 against a $5,000 cap: one bond underwriting
+        // 1.5x its own value, slashable in full exactly once.
+        assertLe(
+            ledger.openExposureUsd(guardian),
+            ledger.kNumerator() * ledger.slashableBondUsd(guardian),
+            "one bond must never underwrite more than k x its own value"
+        );
+        assertEq(ledger.openExposureUsd(guardian), 5_000e18, "clamped to zero free budget: the re-run gains nothing");
+        assertEq(ledger.allocatedUsd(address(mgov2), 1, guardian), 2_500e18, "and P2's booking is untouched");
+    }
+
+    /// @notice The clamp must be a CLAMP, not a freeze. #110's fix bounds an
+    ///         upward `_rebook` by the guardian's free budget, and the whole
+    ///         reason claim A of that audit was dismissed is that settlement
+    ///         REPAIRS: a pass taken at a WOOD trough is a stale number anyone
+    ///         can refresh. Bounding the walk-up so hard that it stopped
+    ///         repairing would be the rejected option — a de-facto once-only
+    ///         settlement, which re-opens the trough-pinning attack H1 closed.
+    ///
+    ///         With no competing exposure, `openExposureUsd` is just this key's
+    ///         own booking, so the bound is the full cap and the repair runs to
+    ///         completion.
+    function test_settleCoverage_capClampStillRepairsOnReRun() public {
+        _wireRecording();
+        address g2 = makeAddr("g2");
+        swood.setStake(g2, 100_000e18); // both hold $5,000 at $0.05
+        mgov.set(8_000e6); // $8,000 needed; each reserves its whole $5,000
+        mgov.setSchedule(block.timestamp + 1 days, 3 days);
+
+        vm.startPrank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        ledger.recordApproval(address(mgov), 1, g2);
+        vm.stopPrank();
+
+        skip(31 days);
+
+        // Settled at a trough: the live cohort is worth $5,000 against an $8,000
+        // need, so `_allocate` returns each bond's trough value and both bookings
+        // are written down to $2,500.
+        vm.prank(owner);
+        ledger.setWoodUsdPrice(0.025e8);
+        ledger.settleCoverage(address(mgov), 1);
+        uint256 atTrough = ledger.openExposureUsd(guardian);
+        assertEq(atTrough, 2_500e18, "written down at the trough");
+
+        // WOOD recovers and anyone refreshes the split.
+        skip(1 days);
+        vm.prank(owner);
+        ledger.setWoodUsdPrice(0.05e8);
+        ledger.settleCoverage(address(mgov), 1);
+
+        assertGt(ledger.openExposureUsd(guardian), atTrough, "the booking WALKED BACK UP: still re-runnable");
+        assertEq(ledger.allocatedUsd(address(mgov), 1, guardian), 4_000e18, "repaired in full, not partially");
+        assertEq(ledger.allocatedUsd(address(mgov), 1, g2), 4_000e18);
+        assertEq(ledger.liabilityUsd(address(mgov), 1), 8_000e18, "the whole coverage is recoverable again");
+        assertLe(
+            ledger.openExposureUsd(guardian),
+            ledger.kNumerator() * ledger.slashableBondUsd(guardian),
+            "and the repair stayed inside the cap"
+        );
+        ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 8_000e6);
+    }
+
+    /// @notice The two halves together: a repair that is PARTIALLY clamped. The
+    ///         guardian spent some but not all of the freed budget elsewhere, so
+    ///         the walk-up must run as far as the remaining headroom and stop
+    ///         there — neither refused outright (that would be the freeze) nor
+    ///         allowed through to `_allocate`'s figure (that is #110).
+    function test_settleCoverage_upwardRebookStopsAtTheRemainingHeadroom() public {
+        _wireRecording();
+        address g2 = makeAddr("g2");
+        swood.setStake(g2, 100_000e18); // both hold $5,000 at $0.05
+
+        mgov.set(5_000e6);
+        mgov.setSchedule(block.timestamp + 1 days, 3 days);
+        vm.startPrank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        ledger.recordApproval(address(mgov), 1, g2);
+        vm.stopPrank();
+
+        skip(31 days);
+        ledger.settleCoverage(address(mgov), 1); // both down to $2,500
+
+        // g1 spends only $1,000 of the $2,500 that came free.
+        MockGovernorForLedger mgov2 = _secondGovernor(1_000e6, 3 days);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov2), 1, guardian);
+        assertEq(ledger.openExposureUsd(guardian), 3_500e18, "$1,500 of headroom left");
+
+        swood.setStake(g2, 0);
+        ledger.settleCoverage(address(mgov), 1);
+
+        // `_allocate` wanted $5,000; the headroom allowed $2,500 + $1,500.
+        assertEq(ledger.allocatedUsd(address(mgov), 1, guardian), 4_000e18, "repaired up to the headroom, no further");
+        assertEq(ledger.openExposureUsd(guardian), 5_000e18, "which lands exactly on the cap");
+        assertLe(
+            ledger.openExposureUsd(guardian),
+            ledger.kNumerator() * ledger.slashableBondUsd(guardian),
+            "cap holds on the partially-clamped path too"
+        );
+    }
+
     /// @notice `_woodPrice` degrades to the governance fallback on an unset
     ///         feed, a non-positive answer and a stale answer — but the read
     ///         itself was unwrapped, so a feed that REVERTS propagated instead.
