@@ -170,13 +170,44 @@ purpose of this change, and a 12-hour window gives most of it back.
 2. **`woodHaircutBps`, the allowance.** A fixed discount on every price,
    pre-funding headroom of that size. **This parameter is now load-bearing** —
    it is also the compensating control for the residual crash lag of up to
-   `twapWindow + maxTwapAge`. At its 10,000 default the allowance is **zero**;
-   5,000 absorbs a 50% error.
+   `twapWindow + maxTwapAge`. At its 10,000 default the allowance is **zero**.
 
 Consequently `ethUsdMaxDelay` is bounded **only** by `MAX_ETH_USD_DELAY_LIMIT`
 (24h) and is deliberately independent of `twapWindow`, so the window can be
 short. Finding 5's `twapWindow <= maxTwapAge` is unaffected and still enforced —
 it is a different problem (structural unavailability) and a different fix.
+
+### The haircut ships at 7,000 (owner decision, 2026-08-02)
+
+A **30% allowance**, and `DeployPlanB` SEATS it inside its broadcast rather than
+leaving it to a follow-up transaction. The ledger's default is 10,000 — no
+haircut — and its own setter accepts that as a legal value, so the
+zero-allowance configuration would otherwise ship silently while looking
+entirely healthy. Pre-flight 9 refuses it.
+
+**Why not 5,000.** The ledger's floor was rejected as too costly to guardian
+return on equity, a recurring concern across review rounds. Valuing every bond
+at half of market prices guardians out of the role, and the coverage layer only
+works if the role is worth taking.
+
+**What 7,000 buys, exactly.** Every source is valued at 70%, so an overstatement
+of up to `1/0.7` — about **+42.9%** — still leaves bonds valued at or below
+their true worth. The 30% sizing case clears it with margin. Past that point the
+allowance is exhausted and the cap is the control that takes over.
+
+**The interval is the catch, and it is issue #89.** Lowering the haircut is the
+safe direction and costs one transaction — but it is gated by the same
+once-per-day `MIN_PRICE_UPDATE_INTERVAL` as the cap, and the deploy's own
+seating call stamps that clock. So the haircut cannot be corrected for 24 hours
+after deploy, and **cannot be tightened in the middle of a crash**. Both
+controls this design leans on are wanted precisely during the events that make
+them matter, and both are rate-limited against exactly that. **This makes #89 a
+launch blocker rather than a refinement.**
+
+*Verified, not assumed:* `setWoodHaircutBps` gates on `lastHaircutUpdateAt != 0`,
+mirroring `setWoodUsdPrice`'s `lastPriceUpdateAt != 0`, so the FIRST call is
+exempt and the deploy can seat the value at all. Had it not been, the deploy
+could not have seated a haircut and #89 would have blocked this change outright.
 
 ## Testing requirements
 

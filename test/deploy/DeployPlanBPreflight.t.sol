@@ -189,6 +189,11 @@ contract DeployPlanBPreflightTest is Test {
     /// @dev The price CAP the next run should seed. A test that wants
     ///      pre-flight 8's first assert zeroes it.
     uint256 internal bookCapPriceX8 = WOOD_PRICE_CAP_X8;
+    /// @dev The haircut the next run should seed. Seeded in `setUp` from the
+    ///      script's own default so this suite asserts against exactly what an
+    ///      unset `WOOD_HAIRCUT_BPS` produces; a test that wants pre-flight 9
+    ///      raises it to the ledger's 10,000 no-allowance default.
+    uint256 internal bookHaircutBps;
 
     function setUp() public {
         wood = new ERC20Mock("WOOD", "WOOD", 18);
@@ -253,6 +258,7 @@ contract DeployPlanBPreflightTest is Test {
         // one-shot cheatcode. Nothing is armed here today; the habit is what
         // stops the next edit from being the one that breaks.
         bookMaxStrategyDuration = script.DEFAULT_MAX_STRATEGY_DURATION();
+        bookHaircutBps = script.DEFAULT_WOOD_HAIRCUT_BPS();
         // OWNED BY `DEFAULT_SENDER`, not the test contract — see
         // `PlanBScriptCaller`'s own natspec for why.
         vm.etch(DEFAULT_SENDER, address(new PlanBScriptCaller()).code);
@@ -576,9 +582,54 @@ contract DeployPlanBPreflightTest is Test {
         ExposureLedger ledger = ExposureLedger(swood.exposureLedger());
         assertEq(ledger.woodTwapOracle(), bookTwapOracle, "the oracle must be wired by the script");
         assertEq(ledger.woodUsdPriceX8(), WOOD_PRICE_CAP_X8, "the cap must land");
-        assertEq(ledger.woodPriceX8(), WOOD_MARKET_X8, "priced off the market, with the cap above it");
+        // Market-priced, THEN discounted by the seated allowance. The cap sits
+        // above the market and so plays no part in the number.
+        assertEq(
+            ledger.woodPriceX8(),
+            (WOOD_MARKET_X8 * DeployPlanB(script).DEFAULT_WOOD_HAIRCUT_BPS()) / 10_000,
+            "priced off the market, with the cap above it and the haircut applied"
+        );
         (,, bool capBinding) = ledger.woodPriceDetail();
         assertFalse(capBinding, "a cap seeded BELOW market would bind and make the oracle inert");
+    }
+
+    // ── PRE-FLIGHT 9: a real haircut allowance must exist ──────────────────
+
+    /// @dev THE LEDGER'S OWN DEFAULT IS THE FAILING VALUE, which is what makes
+    ///      this check worth having. `woodHaircutBps` ships at 10,000 — no
+    ///      haircut — and the ledger's setter ACCEPTS 10,000 as a legal value,
+    ///      so nothing else in the stack refuses the one configuration with
+    ///      zero allowance against the accepted overstatements. Left unchecked
+    ///      it ships silently and looks entirely healthy.
+    function test_preflight_bites_whenTheHaircutLeavesNoAllowance() public {
+        bookHaircutBps = 10_000;
+        _runExpecting("PRE-FLIGHT: ExposureLedger.woodHaircutBps is 10000");
+    }
+
+    /// @dev The shipped value, asserted on the DEPLOYED state and pinned to the
+    ///      script's own constant so the two cannot drift. 7,000 is a 30%
+    ///      allowance; 5,000 (the ledger floor) was rejected as too costly to
+    ///      guardian return on equity.
+    function test_deploy_seatsTheShippedHaircut() public {
+        assertEq(script.DEFAULT_WOOD_HAIRCUT_BPS(), 7_000, "the shipped haircut is 7,000 -- a 30% allowance");
+
+        _run();
+
+        ExposureLedger ledger = ExposureLedger(swood.exposureLedger());
+        assertEq(ledger.woodHaircutBps(), 7_000, "the haircut must be seated by the script, not left at 10,000");
+
+        // It is a real discount on a real valuation, not a stored number: the
+        // composed price is 70% of what the market source reports.
+        assertEq(ledger.woodPriceX8(), (WOOD_MARKET_X8 * 7_000) / 10_000, "the allowance reaches the price");
+    }
+
+    /// @dev An operator override is honoured, and the floor still binds. The
+    ///      ledger's own setter rejects anything under 5,000 mid-broadcast, so
+    ///      this proves the script does not quietly widen the range.
+    function test_deploy_honoursAHaircutOverrideAndRespectsTheFloor() public {
+        bookHaircutBps = 6_000;
+        _run();
+        assertEq(ExposureLedger(swood.exposureLedger()).woodHaircutBps(), 6_000, "an override must be seated");
     }
 
     // ─────────────────────────────── helpers ───────────────────────────────
@@ -609,6 +660,7 @@ contract DeployPlanBPreflightTest is Test {
             usdgFeed: address(usdgFeed),
             feedMaxDelay: FEED_MAX_DELAY,
             woodPriceCapX8: bookCapPriceX8,
+            woodHaircutBps: bookHaircutBps,
             coveredTvlCapUsd: bookCap,
             protocolConfig: address(protocolConfig),
             maxStrategyDuration: bookMaxStrategyDuration,

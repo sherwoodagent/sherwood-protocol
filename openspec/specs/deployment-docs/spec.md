@@ -254,13 +254,25 @@ It is accepted because the remedy is worse. Requiring the ETH answer to be no ol
 
 **(b) Residual crash lag** of up to `twapWindow + maxTwapAge`, inherent to averaging and the price paid for manipulation resistance.
 
-Both OVERSTATE bond value — the dangerous direction — and both are bounded by the same two controls: `woodUsdPriceX8` truncates anything above the cap, and `woodHaircutBps` pre-funds an allowance below it. **`woodHaircutBps` is therefore LOAD-BEARING and SHALL be seated deliberately at launch rather than left at its default.** At 10,000 the allowance is ZERO; 5,000 (the floor) absorbs a 50% error. Shipping at the default is a choice to run with no margin, not a neutral one.
+Both OVERSTATE bond value — the dangerous direction — and both are bounded by the same two controls: `woodUsdPriceX8` truncates anything above the cap, and `woodHaircutBps` pre-funds an allowance below it. **`woodHaircutBps` is therefore LOAD-BEARING.**
+
+**The shipped value is 7,000 — a 30% allowance — and `DeployPlanB` SHALL seat it** inside its broadcast (constant `DEFAULT_WOOD_HAIRCUT_BPS`, overridable via `WOOD_HAIRCUT_BPS`). The ledger's own default is 10,000, which is no haircut and therefore no allowance at all, and its setter ACCEPTS 10,000 as a legal value — so nothing else in the stack refuses that configuration and it would ship silently. Pre-flight 9 refuses it. 5,000 (the ledger floor) was REJECTED as too costly to guardian return on equity, a recurring concern in review. Precisely: 7,000 values every source at 70%, so an overstatement of up to ~42.9% still leaves bonds valued at or below their true worth — the 30% sizing case with margin to spare.
+
+**Lowering the haircut is the safe direction** (more allowance, bonds valued lower, quorums harder) and takes one owner transaction. But it is subject to the SAME once-per-day `MIN_PRICE_UPDATE_INTERVAL` as the cap, and `DeployPlanB`'s own seating call stamps that clock — so the haircut cannot be adjusted again for 24 hours after deploy, and **cannot be tightened in the middle of a crash**. That is the concrete argument for resolving **issue #89** (the brake's once-per-day gate) BEFORE launch rather than after: the gate applies to both of the controls this design leans on, and both are wanted precisely during the events that make them matter.
 
 Finding 5's `twapWindow <= maxTwapAge` invariant is unaffected and remains enforced — a different problem (structural unavailability) with a different fix.
 
 #### Scenario: Operator sizes the haircut
 - **WHEN** the operator seats `woodHaircutBps` before launch
-- **THEN** the runbook states that the value is an allowance against the ETH-staleness overstatement and the crash lag, that 10,000 leaves none at all, and that 5,000 absorbs a 50% error
+- **THEN** the runbook states that the value is an allowance against the ETH-staleness overstatement and the crash lag, that the shipped value is 7,000 (a 30% allowance), that 10,000 leaves none at all and is refused by pre-flight 9, and that 5,000 was rejected on guardian-ROE grounds
+
+#### Scenario: Deploy would leave the haircut at the ledger default
+- **WHEN** `DeployPlanB` would complete with `woodHaircutBps == 10_000`
+- **THEN** pre-flight 9 FAILS, naming what the allowance is FOR rather than only that the value is out of range
+
+#### Scenario: Haircut needs tightening during a crash
+- **GIVEN** the haircut was seated by the deploy less than a day earlier
+- **THEN** `setWoodHaircutBps` reverts on `MIN_PRICE_UPDATE_INTERVAL` — recorded as a live limitation and as the reason issue #89 is a launch-blocking concern rather than a refinement
 
 #### Scenario: ETH drawdown inside the feed heartbeat
 - **GIVEN** ETH falls sharply while the ETH/USD answer is several hours old

@@ -43,7 +43,7 @@ interface IProtocolConfigAdmin {
  *         book via env vars (from chains/<chainid>.json). Order:
  *           1. pre-flights (see below) — fail BEFORE anything is deployed
  *           2. deploy ExposureLedger (epochLength 28d) + ProposerBondEscrow
- *           3. seed ledger params (WOOD price cap, TWAP oracle, asset feed, caps, registry link)
+ *           3. seed ledger params (WOOD price cap, haircut, TWAP oracle, asset feed, caps, registry link)
  *           4. registry.setExposureLedger   (owner op — REQUIRES the UUPS-upgraded impl)
  *           5. factory.setExposureLedger / setBondEscrow (new syndicates)
  *           6. swood.setExposureLedger      (owner op — arms the unstake gate)
@@ -80,6 +80,12 @@ interface IProtocolConfigAdmin {
  * @dev PRE-FLIGHT 7 (issue #32): `delegationEnabled == false`. Delegation is
  *      deferred to v2, and the delegator-walkout hole stays dormant only while it
  *      is off. See the block itself.
+ * @dev PRE-FLIGHT 9 (owner decision 2026-08-02): POST-broadcast,
+ *      `woodHaircutBps` must be strictly below 10,000 and at or above the
+ *      ledger's floor. The ledger DEFAULTS to 10,000 — no haircut — and its own
+ *      setter accepts that value, so nothing else refuses the one configuration
+ *      with zero allowance against the accepted overstatements. This script
+ *      SEATS the haircut (7,000) rather than merely checking it. See the block.
  * @dev PRE-FLIGHT 8 (design revision 2, 2026-08-02): POST-broadcast, the WOOD
  *      price CAP must be non-zero AND the composed `woodPriceX8()` must resolve
  *      to a non-zero price. The cap is no longer a fallback price — it only
@@ -118,6 +124,15 @@ interface IProtocolConfigAdmin {
  *                                 A cap at M x market caps manipulation at M x;
  *                                 1.25-2x market is the intended band, reviewed
  *                                 monthly. Non-zero (pre-flight 8).
+ *     WOOD_HAIRCUT_BPS          — OPTIONAL bond-valuation haircut, bps. Defaults
+ *                                 to DEFAULT_WOOD_HAIRCUT_BPS (7,000 = a 30%
+ *                                 discount) when unset. This is the ALLOWANCE
+ *                                 against the two overstatements the design
+ *                                 accepts — the oracle's stale ETH/USD leg and
+ *                                 the residual crash lag. The ledger DEFAULTS to
+ *                                 10,000, which is no haircut and no allowance;
+ *                                 pre-flight 9 refuses that. 5,000 is the floor
+ *                                 and was rejected as too costly to guardian ROE.
  *     WOOD_TWAP_ORACLE          — deployed WoodTwapOracle, the live WOOD price
  *                                 source. OPTIONAL as a key, REQUIRED in
  *                                 practice: chain 4663 has no Chainlink
@@ -183,6 +198,42 @@ contract DeployPlanB is Script {
     ///         already deployed — same argument as pre-flight 2b.
     uint256 internal constant MIN_PROTOCOL_MAX_STRATEGY_DURATION = 1 days;
 
+    /// @notice The WOOD haircut this deployment seats when `WOOD_HAIRCUT_BPS` is
+    ///         unset. Public so the pre-flight tests assert against the SAME
+    ///         value an unset environment produces.
+    ///
+    /// @dev    WHY 7,000, i.e. a 30% discount on every bond valuation. The
+    ///         ledger ships this parameter at 10,000 — no haircut — and that
+    ///         default leaves ZERO allowance against the two overstatements
+    ///         this design deliberately ACCEPTS rather than eliminates:
+    ///
+    ///           - the oracle's two legs are not contemporaneous, so an ETH
+    ///             drawdown inside the ~10.7h ETH/USD heartbeat makes WOOD/USD
+    ///             read high by roughly the ETH move, with no attacker capital
+    ///             involved (design revision, finding 4);
+    ///           - the residual crash lag of up to `twapWindow + maxTwapAge`,
+    ///             inherent to averaging.
+    ///
+    ///         Both OVERSTATE bond value — the dangerous direction — and the
+    ///         haircut is the compensating control for both. 5,000 (the ledger's
+    ///         floor) was REJECTED as too costly to guardian return on equity, a
+    ///         recurring concern in review. 7,000 is the accepted balance: a 30%
+    ///         allowance bought at 30% of every guardian's headline bond value.
+    ///
+    ///         Seated here rather than left to a follow-up transaction for the
+    ///         same reason the duration ceiling is: a parameter an operator is
+    ///         merely TOLD to set afterwards is a parameter that ships at its
+    ///         default, and this default is the one with no margin in it.
+    uint256 public constant DEFAULT_WOOD_HAIRCUT_BPS = 7_000;
+
+    /// @notice Mirror of `ExposureLedger.MIN_WOOD_HAIRCUT_BPS`, which is
+    ///         `internal` and so cannot be read from here.
+    /// @dev    Keep in step with the ledger. The post-broadcast assert uses it
+    ///         to bound the seated value from below; the ledger's own setter
+    ///         enforces the same floor, so this catches a DRIFTED mirror rather
+    ///         than a bad env value.
+    uint256 internal constant MIN_WOOD_HAIRCUT_BPS = 5_000;
+
     /// @notice The address book this deployment runs against, exactly as
     ///         `run()` reads it out of the environment.
     /// @dev    THE ENV READ AND THE DEPLOYMENT ARE SPLIT ON PURPOSE. `vm.setEnv`
@@ -207,6 +258,9 @@ contract DeployPlanB is Script {
         /// @dev The WOOD/USD price CAP, 8 decimals — seeded ABOVE market. It is
         ///      never served as a price; see pre-flight 8.
         uint256 woodPriceCapX8;
+        /// @dev The bond-valuation haircut in bps. Must leave a real allowance:
+        ///      10,000 means none at all. See `DEFAULT_WOOD_HAIRCUT_BPS`.
+        uint256 woodHaircutBps;
         uint256 coveredTvlCapUsd;
         address protocolConfig;
         uint256 maxStrategyDuration; // protocol-wide ceiling. Non-zero.
@@ -232,6 +286,12 @@ contract DeployPlanB is Script {
                 // instruction ("<= 30-day low") into the new semantics. It is a
                 // CAP now, not a price — seed it ABOVE market. See pre-flight 8.
                 woodPriceCapX8: vm.envUint("WOOD_PRICE_CAP_X8"),
+                // `envOr`, same convention as MAX_STRATEGY_DURATION: the
+                // ordinary run needs no new key and still seats a real
+                // allowance. An operator who wants a different one sets the
+                // key; one who wants NO allowance (10,000) is refused by the
+                // post-broadcast assert rather than allowed to express it here.
+                woodHaircutBps: vm.envOr("WOOD_HAIRCUT_BPS", DEFAULT_WOOD_HAIRCUT_BPS),
                 coveredTvlCapUsd: vm.envUint("COVERED_TVL_CAP_USD18"),
                 protocolConfig: vm.envAddress("PROTOCOL_CONFIG"),
                 // `envOr`, so the ordinary run needs no new key in the operator's
@@ -475,6 +535,19 @@ contract DeployPlanB is Script {
         ProposerBondEscrow escrow = new ProposerBondEscrow(wood, registry, address(ledger));
 
         ledger.setWoodUsdPrice(woodPriceCapX8);
+        // THE ALLOWANCE, seated in the same broadcast as the cap because the
+        // two are one control between them: the cap truncates an overstatement
+        // above it, the haircut absorbs one below it.
+        //
+        // THE FIRST CALL IS EXEMPT FROM THE RATE LIMIT, which is what makes
+        // this possible at all: `setWoodHaircutBps` gates on
+        // `lastHaircutUpdateAt != 0`, and a freshly deployed ledger has it at
+        // zero (mirroring `setWoodUsdPrice`). VERIFIED against the ledger, not
+        // assumed. The corollary is operational and worth stating: this call
+        // STAMPS that timestamp, so the haircut cannot be adjusted again for
+        // `MIN_PRICE_UPDATE_INTERVAL` (1 day) — including in a same-day
+        // correction, and including mid-crash. See issue #89.
+        ledger.setWoodHaircutBps(book.woodHaircutBps);
         // THE MARKET SOURCE. Wired inside the broadcast rather than left as a
         // manual follow-up for the same reason the duration ceiling is: chain
         // 4663 has no Chainlink WOOD/USD aggregator, so a ledger that ships
@@ -681,10 +754,41 @@ contract DeployPlanB is Script {
             "feed, so without the TWAP oracle nothing can be proposed or executed."
         );
 
+        // ── Pre-flight 9 (POST-broadcast): a real allowance must exist ──
+        //
+        // `woodHaircutBps` is the compensating control for the two
+        // overstatements this design ACCEPTS rather than eliminates — the
+        // oracle's non-contemporaneous legs (an ETH drawdown inside the ~10.7h
+        // ETH/USD heartbeat reads WOOD/USD high by roughly the ETH move, with
+        // no attacker capital involved) and the residual crash lag of up to
+        // `twapWindow + maxTwapAge`. Both overstate bond value, which is the
+        // dangerous direction.
+        //
+        // THE LEDGER'S OWN SETTER CANNOT CATCH THIS. It accepts the full
+        // `[5_000, 10_000]` range, and 10_000 — its DEFAULT — is a legal value
+        // meaning "no haircut". That is precisely the state with zero
+        // allowance, so it has to be refused here or it ships silently.
+        require(
+            ledger.woodHaircutBps() < 10_000,
+            "PRE-FLIGHT: ExposureLedger.woodHaircutBps is 10000 -- that is NO haircut, which leaves "
+            "ZERO allowance for the two overstatements this design accepts: the oracle's stale "
+            "ETH/USD leg (an ETH drawdown inside the ~10.7h heartbeat reads WOOD/USD high by roughly "
+            "the ETH move, no attacker needed) and the crash lag of up to twapWindow + maxTwapAge. "
+            "Set WOOD_HAIRCUT_BPS -- 7000 is the shipped value and absorbs a 30% overstatement."
+        );
+        require(
+            ledger.woodHaircutBps() >= MIN_WOOD_HAIRCUT_BPS,
+            "PRE-FLIGHT: ExposureLedger.woodHaircutBps is below the ledger's floor. Valuing every "
+            "guardian bond under half of market is a mis-set parameter, not conservatism -- and it "
+            "prices guardians out of the role. If this fires, the mirrored MIN_WOOD_HAIRCUT_BPS in "
+            "this script has drifted from the ledger's."
+        );
+
         console.log("ExposureLedger:     %s", address(ledger));
         console.log("ProposerBondEscrow: %s", address(escrow));
         console.log("WoodTwapOracle:     %s", ledger.woodTwapOracle());
         console.log("WOOD price cap (X8): %s", ledger.woodUsdPriceX8());
+        console.log("WOOD haircut (bps):  %s", ledger.woodHaircutBps());
         console.log("asset feed maxDelay (s): %s", feedMaxDelay);
         console.log("protocol maxStrategyDuration (s): %s", maxStrategyDuration);
 

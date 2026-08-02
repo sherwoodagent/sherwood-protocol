@@ -1413,6 +1413,46 @@ contract ExposureLedgerTest is Test {
         assertEq(ledger.slashableBondUsd(guardian), trueBondUsd / 2, "the allowance costs conservatism when healthy");
     }
 
+    /// @notice THE SHIPPED VALUE, 7,000 — a 30% allowance. Pinned here as the
+    ///         behaviour it buys, not merely as a number in a deploy script.
+    ///
+    /// @dev    `DeployPlanB` seats this as its `DEFAULT_WOOD_HAIRCUT_BPS`, with
+    ///         a pre-flight refusing the ledger's own 10,000 default; 5,000 was
+    ///         rejected as too costly to guardian return on equity. What 7,000
+    ///         buys, exactly: every source is valued at 70%, so an overstatement
+    ///         up to 1/0.7 — about +42.9% — still values bonds at or below their
+    ///         true worth. A 30% overstatement, the sizing case, leaves margin.
+    function test_woodHaircut_shippedValueAbsorbsAThirtyPercentOverstatement() public {
+        swood.setStake(guardian, 100_000e18);
+        uint256 trueBondUsd = 5_000e18; // 100k WOOD at the true $0.05
+
+        vm.prank(owner);
+        ledger.setWoodHaircutBps(7_000);
+
+        // Healthy market: bonds carry the 30% discount. That is what the
+        // allowance costs in normal operation.
+        assertEq(ledger.woodPriceX8(), (MARKET_X8 * 7_000) / 10_000);
+        assertEq(ledger.slashableBondUsd(guardian), (trueBondUsd * 7_000) / 10_000);
+
+        // A 30% overstatement — the sizing case — still leaves bonds valued
+        // BELOW their true worth, which is the property being bought.
+        twap.setPrice((MARKET_X8 * 13_000) / 10_000);
+        (,, bool binding) = ledger.woodPriceDetail();
+        assertFalse(binding, "the cap must not be what absorbs this, or the test proves nothing");
+        assertLt(ledger.slashableBondUsd(guardian), trueBondUsd, "a 30% overstatement is fully absorbed");
+
+        // Break-even: at +1/0.7 the discount exactly cancels the error, so bonds
+        // land at true worth and not a wei above it.
+        twap.setPrice((MARKET_X8 * 10_000) / 7_000);
+        assertLe(ledger.slashableBondUsd(guardian), trueBondUsd, "break-even is the edge of the allowance");
+        assertApproxEqRel(ledger.slashableBondUsd(guardian), trueBondUsd, 1e12, "and it is genuinely AT the edge");
+
+        // Past it the overstatement starts landing — the allowance is finite,
+        // and the cap is the control that takes over.
+        twap.setPrice(2 * MARKET_X8);
+        assertGt(ledger.slashableBondUsd(guardian), trueBondUsd, "a 2x error exceeds a 30% allowance");
+    }
+
     /// @notice Both degraded states must be observable. Without this, "TWAP
     ///         healthy" and "cap drifted under market and has been pinning
     ///         every bond for a month" are indistinguishable from outside, and
