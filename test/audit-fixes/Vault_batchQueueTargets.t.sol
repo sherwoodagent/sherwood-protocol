@@ -10,6 +10,9 @@ import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
+import {MockStrategy} from "../mocks/MockStrategy.sol";
+import {BaseStrategy} from "../../src/strategies/BaseStrategy.sol";
+import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 
 /// @dev A tier registry that allows nothing. Present only so
 ///      `_guardBatchCalls` does NOT take either of its early returns: a
@@ -268,5 +271,46 @@ contract VaultBatchQueueTargetsTest is Test {
 
         vm.prank(MOCK_GOVERNOR);
         vault.executeGovernorBatch(_batch(address(usdc), abi.encodeCall(ERC20Mock.decimals, ())), 1);
+    }
+
+    /// @notice ADAPTERS STAY REACHABLE — the regression that matters most.
+    ///         `BaseStrategy.execute` / `settle` / `withdrawTo` are `onlyVault`
+    ///         too, so they are satisfied by the very same delegatecall
+    ///         credential that made the queue reachable. But they are the
+    ///         LEGITIMATE batch surface: a denylist that caught them would break
+    ///         every honest proposal, which is worse than the hole it closed.
+    ///
+    /// @dev    The guard compares `calls[i].target` against exactly two
+    ///         addresses and never inspects the callee's own access control, so
+    ///         adapters are structurally out of reach of it. This test asserts
+    ///         that rather than arguing it — an argument rots the moment someone
+    ///         widens the denylist, an assertion fails loudly.
+    ///
+    ///         Uses a real `BaseStrategy` subclass (cloned, since the
+    ///         constructor marks the template initialized), not a bare mock, so
+    ///         the production `onlyVault` bodies are the ones being reached.
+    function test_adapterOnlyVaultEntrypointsStayReachable() public {
+        MockStrategy template = new MockStrategy();
+        MockStrategy strategy = MockStrategy(Clones.clone(address(template)));
+        strategy.initialize(address(vault), owner, abi.encode(address(usdc), address(0), uint256(0), uint256(0), false));
+
+        // execute() — onlyVault, named as a batch target, runs.
+        vm.prank(MOCK_GOVERNOR);
+        vault.executeGovernorBatch(_batch(address(strategy), abi.encodeCall(BaseStrategy.execute, ())), 1);
+        assertEq(strategy.executeCount(), 1, "adapter execute() ran through the batch");
+
+        // settle() — same.
+        vm.prank(MOCK_GOVERNOR);
+        vault.executeGovernorBatch(_batch(address(strategy), abi.encodeCall(BaseStrategy.settle, ())), 1);
+        assertEq(strategy.settleCount(), 1, "adapter settle() ran through the batch");
+
+        // withdrawTo() — `BaseStrategy`'s default body reverts
+        // `OnDemandExitUnsupported`, and reaching THAT revert is the assertion:
+        // it proves the call cleared the target denylist and the adapter's own
+        // `onlyVault` check before failing on its own terms. A denylisted target
+        // would have reverted `DisallowedBatchTarget` instead, never arriving.
+        vm.prank(MOCK_GOVERNOR);
+        vm.expectRevert(BaseStrategy.OnDemandExitUnsupported.selector);
+        vault.executeGovernorBatch(_batch(address(strategy), abi.encodeCall(BaseStrategy.withdrawTo, (1))), 1);
     }
 }
