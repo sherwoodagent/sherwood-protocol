@@ -73,8 +73,16 @@ that closes Lane A when the held oracle mark drifts away from the executable
 pool price — the regime the fee cannot cover (analysis §4: at ≥ 200 bps basis,
 no exit size is safe). The 100 bps bound is the design point the per-token
 caps were derived at; the script refuses larger bounds and ungated entries.
-Note the gate is a comparator, not a price source: manipulating the reference
-pool can only *close* Lane A (grief), never misprice it.
+
+The pool leg is a **30-minute `observe()` TWAP** (`Erc20SpotAdapter.TWAP_WINDOW`),
+never the instantaneous `slot0`. A spot price is the endpoint of the last swap
+in the current block, so reading it would let the party consuming the gate set
+the value the gate checks — opening Lane A onto a stale mark, or shoving the
+pool to force a close and revert someone's exit, both atomically for the cost
+of a round-trip fee. Averaging over the window makes either direction cost
+sustained inventory risk across many blocks. Registration probes `observe()`
+with the window, so a pool whose observation buffer is too short is rejected
+at `setFeed` time — grow `observationCardinalityNext` on the pool first.
 
 ---
 
@@ -148,7 +156,7 @@ valid only because the adapter enforces the per-token caps itself),
 `instantCap[MORPHO_BLUE_SUPPLY] = 250000000000`.
 
 **AAPL is excluded by default.** The analysis found only a Uniswap **v4**
-AAPL/USDG pool, and the adapter's divergence gate reads a v3-style `slot0()` —
+AAPL/USDG pool, and the adapter's divergence gate reads a v3-style `observe()` TWAP —
 v4 pools live inside the PoolManager and expose no per-pool contract, so G4
 cannot be satisfied for AAPL today. To include AAPL, either source/verify a
 v3-style AAPL/USDG pool of adequate depth and pass it as

@@ -52,7 +52,19 @@ The registry entry for each token SHALL carry a per-token cap in vault-asset uni
 
 ### Requirement: Oracle-vs-pool divergence gate
 
-The registry entry for each token SHALL carry a reference DEX pool and a maximum divergence in bps; when set, the adapter SHALL compare the feed price against the pool's current spot price and return `(0, false)` when they diverge beyond the bound. Adversary: a held/stale oracle mark (e.g. the 24/5 equity feed's weekend hold-last-price regime, or a deviation-threshold lag) sitting above the live pool price, letting an exiter be paid an oracle mark the vault cannot realize — measured basis of ~40bps exists at rest and the instant-exit fee ceiling (200bps) cannot cover a stale-mark regime, so marks diverging >100bps from executable price must close Lane A rather than misprice it.
+The registry entry for each token SHALL carry a reference DEX pool and a maximum divergence in bps; when set, the adapter SHALL compare the feed price against a **time-weighted average** of the pool price over a fixed averaging window — never an instantaneous spot price — and return `(0, false)` when they diverge beyond the bound. Registration SHALL prove the pool can serve the full window and reject it otherwise. Adversary: an instantaneous price is the endpoint of the last swap in the current block, so the party consuming the gate could set the value the gate checks in the same transaction — moving the pool onto a stale mark to open Lane A and exit against it, or shoving the pool off a healthy mark to force a close and revert a victim's exit, both for the cost of a round-trip fee.
+
+#### Scenario: In-block spot manipulation cannot open the gate
+- **WHEN** the time-weighted pool price diverges beyond the bound but an attacker moves the instantaneous price onto the feed price within the transaction
+- **THEN** the adapter still returns `(0, false)`
+
+#### Scenario: In-block spot manipulation cannot close the gate
+- **WHEN** the time-weighted pool price agrees with the feed but an attacker moves the instantaneous price far away within the transaction
+- **THEN** the adapter still prices the position normally
+
+#### Scenario: Pool with insufficient history is rejected at registration
+- **WHEN** a reference pool cannot serve the full averaging window
+- **THEN** registration reverts rather than registering a feed that would fail closed forever Adversary: a held/stale oracle mark (e.g. the 24/5 equity feed's weekend hold-last-price regime, or a deviation-threshold lag) sitting above the live pool price, letting an exiter be paid an oracle mark the vault cannot realize — measured basis of ~40bps exists at rest and the instant-exit fee ceiling (200bps) cannot cover a stale-mark regime, so marks diverging >100bps from executable price must close Lane A rather than misprice it.
 
 #### Scenario: Divergent oracle fails closed
 - **WHEN** the feed price and the reference pool spot diverge beyond the registered bound

@@ -6,6 +6,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {IPriceAdapter, Position} from "../interfaces/IPriceRouter.sol";
 import {PositionKinds} from "../libraries/PositionKinds.sol";
+import {TickMath} from "../libraries/TickMath.sol";
 
 /// @notice Minimal Chainlink push-feed (AggregatorV3) surface the adapter reads.
 interface IAggregatorV3 {
@@ -44,6 +45,10 @@ interface IUniswapV3PoolMinimal {
             uint8 feeProtocol,
             bool unlocked
         );
+    function observe(uint32[] calldata secondsAgos)
+        external
+        view
+        returns (int56[] memory tickCumulatives, uint160[] memory secondsPerLiquidityCumulativeX128s);
 }
 
 /// @title  Erc20SpotAdapter
@@ -108,6 +113,21 @@ contract Erc20SpotAdapter is Ownable, IPriceAdapter {
     /// @notice Max supported token/feed decimals. Bounds the `10 **` scaling
     ///         math well inside uint256 so exponentiation can never overflow.
     uint8 public constant MAX_SUPPORTED_DECIMALS = 36;
+
+    /// @notice Averaging window for the reference pool's TWAP, in seconds.
+    /// @dev    The divergence gate MUST NOT read an instantaneous price. `slot0`
+    ///         is the endpoint of the last swap in the current block, so the
+    ///         caller consuming the gate can set the value the gate checks
+    ///         against — in the SAME transaction as their exit. Adversary: move
+    ///         the pool onto a held/stale weekend equity mark, redeem at that
+    ///         mark, move it back (a round trip costing ~2x the pool fee); or,
+    ///         inverted, shove the pool off the mark to force `(0,false)` and
+    ///         revert a victim's exit. A time-weighted average over this window
+    ///         makes both directions cost sustained inventory risk across many
+    ///         blocks instead of one atomic swap. Registration proves the pool
+    ///         can actually serve the window (`observe` reverts `OLD` when its
+    ///         observation buffer is shorter).
+    uint32 public constant TWAP_WINDOW = 1800;
 
     /// @notice The vault asset every valuation is denominated in.
     address public immutable numeraire;
@@ -195,7 +215,15 @@ contract Erc20SpotAdapter is Ownable, IPriceAdapter {
             address t1 = IUniswapV3PoolMinimal(referencePool).token1();
             bool pairMatches = (t0 == token && t1 == numeraire) || (t0 == numeraire && t1 == token);
             if (!pairMatches) revert InvalidPool();
-            IUniswapV3PoolMinimal(referencePool).slot0(); // shape probe
+            // Prove the pool can actually serve the TWAP window NOW: a pool
+            // whose observation buffer is shorter than `TWAP_WINDOW` reverts
+            // `OLD` here, so an under-provisioned pool is rejected loudly at
+            // registration instead of silently pinning its token to Lane B
+            // forever. Governance must grow `observationCardinalityNext` first.
+            uint32[] memory probe = new uint32[](2);
+            probe[0] = TWAP_WINDOW;
+            probe[1] = 0;
+            IUniswapV3PoolMinimal(referencePool).observe(probe);
         } else if (maxDivergenceBps != 0) {
             revert InvalidDivergenceBound();
         }
@@ -399,26 +427,54 @@ contract Erc20SpotAdapter is Ownable, IPriceAdapter {
         return (true, (diff * BPS_DENOMINATOR) / oracleNum);
     }
 
-    /// @dev Pool spot in numeraire raw units per whole token, from a raw
-    ///      `slot0()` staticcall (first word = sqrtPriceX96). token0/token1
-    ///      ordering follows the Uniswap invariant token0 < token1, and
-    ///      registration proved the pair is exactly {token, numeraire}, so the
-    ///      side is derived from the addresses alone — a lying `token0()`
-    ///      cannot flip the quote direction. The checked arithmetic lives in
-    ///      an external self-call so an overflow on adversarial magnitudes is
-    ///      caught and fails closed instead of reverting NAV.
+    /// @dev Pool price in numeraire raw units per whole token, time-weighted
+    ///      over `TWAP_WINDOW` via a raw `observe()` staticcall — NEVER the
+    ///      instantaneous `slot0` (see `TWAP_WINDOW` for the adversary).
+    ///      token0/token1 ordering follows the Uniswap invariant token0 <
+    ///      token1, and registration proved the pair is exactly {token,
+    ///      numeraire}, so the side is derived from the addresses alone — a
+    ///      lying `token0()` cannot flip the quote direction. Decoding and the
+    ///      checked arithmetic live in an external self-call so malformed
+    ///      return data, an out-of-range tick, or an overflow on adversarial
+    ///      magnitudes is caught and fails closed instead of reverting NAV.
     function _poolPrice(address pool, address token, uint8 tokenDec) private view returns (bool, uint256) {
         if (pool.code.length == 0) return (false, 0);
-        (bool s, bytes memory d) = pool.staticcall(abi.encodeWithSignature("slot0()"));
-        if (!s || d.length < 32) return (false, 0);
-        uint256 sqrtPriceX96 = abi.decode(d, (uint256));
-        if (sqrtPriceX96 == 0 || sqrtPriceX96 >> 160 != 0) return (false, 0);
+        uint32[] memory secondsAgos = new uint32[](2);
+        secondsAgos[0] = TWAP_WINDOW;
+        secondsAgos[1] = 0;
+        (bool s, bytes memory d) = pool.staticcall(abi.encodeCall(IUniswapV3PoolMinimal.observe, (secondsAgos)));
+        if (!s || d.length < 64) return (false, 0);
         bool tokenIsToken0 = token < numeraire;
-        try this.poolSpotPerWholeToken(sqrtPriceX96, tokenDec, tokenIsToken0) returns (uint256 spot) {
-            return (true, spot);
+        try this.poolTwapSpotPerWholeToken(d, tokenDec, tokenIsToken0) returns (uint256 spot) {
+            return (spot != 0, spot);
         } catch {
             return (false, 0);
         }
+    }
+
+    /// @notice Decode an `observe()` return payload and convert the resulting
+    ///         time-weighted tick to numeraire raw units per whole token.
+    ///         External ONLY so `_poolPrice` can contain decode/arithmetic
+    ///         reverts in a try/catch (fail-closed contract); harmless to call
+    ///         directly.
+    /// @dev    Mirrors Uniswap's `OracleLibrary.consult` averaging: the mean
+    ///         tick is the cumulative-tick delta over the window, floored
+    ///         toward negative infinity so the average is never rounded up
+    ///         into a friendlier price.
+    function poolTwapSpotPerWholeToken(bytes memory observeReturn, uint8 tokenDec, bool tokenIsToken0)
+        external
+        pure
+        returns (uint256)
+    {
+        (int56[] memory tickCumulatives,) = abi.decode(observeReturn, (int56[], uint160[]));
+        require(tickCumulatives.length == 2, "bad observe arity");
+        int56 window = int56(uint56(TWAP_WINDOW));
+        int56 delta = tickCumulatives[1] - tickCumulatives[0];
+        int56 avg = delta / window;
+        if (delta < 0 && delta % window != 0) avg--;
+        require(avg >= TickMath.MIN_TICK && avg <= TickMath.MAX_TICK, "tick out of range");
+        uint256 sqrtPriceX96 = uint256(TickMath.getSqrtRatioAtTick(int24(avg)));
+        return _spotFromSqrtPrice(sqrtPriceX96, tokenDec, tokenIsToken0);
     }
 
     /// @notice Q64.96 → numeraire-raw-per-whole-token conversion. External
@@ -432,6 +488,17 @@ contract Erc20SpotAdapter is Ownable, IPriceAdapter {
     ///           token == token1: spot = 10^tokenDec × 2^128 / ratioX128
     function poolSpotPerWholeToken(uint256 sqrtPriceX96, uint8 tokenDec, bool tokenIsToken0)
         external
+        pure
+        returns (uint256)
+    {
+        return _spotFromSqrtPrice(sqrtPriceX96, tokenDec, tokenIsToken0);
+    }
+
+    /// @dev Shared Q64.96 → numeraire-raw-per-whole-token conversion. Reverts
+    ///      on out-of-range magnitudes; every caller reaches it through a
+    ///      try/catch so a revert degrades to Lane B rather than reverting NAV.
+    function _spotFromSqrtPrice(uint256 sqrtPriceX96, uint8 tokenDec, bool tokenIsToken0)
+        private
         pure
         returns (uint256)
     {

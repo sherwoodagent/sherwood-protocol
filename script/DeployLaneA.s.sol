@@ -101,7 +101,7 @@ interface IPortfolioAllocations {
  *      to governance afterwards (MANUAL step printed at the end).
  *
  *      AAPL: the analysis lists only a Uniswap v4 pool for AAPL/USDG, and the
- *      adapter's divergence gate reads v3-style `slot0()` — v4 pools live
+ *      adapter's divergence gate reads a v3-style `observe()` TWAP — v4 pools live
  *      inside the PoolManager and expose no per-pool contract. AAPL is
  *      therefore EXCLUDED from the default table until a v3-style AAPL/USDG
  *      reference pool is supplied via `AAPL_REFERENCE_POOL` (G4 refuses an
@@ -201,7 +201,7 @@ contract DeployLaneA is Script {
         if (aaplPool == address(0)) {
             console.log("NOTE: AAPL_REFERENCE_POOL unset - AAPL is EXCLUDED from the seeded table.");
             console.log("  The analysis lists only a v4 AAPL/USDG pool and the adapter's divergence");
-            console.log("  gate needs a v3-style slot0() pool (G4 refuses ungated equity entries).");
+            console.log("  gate needs a v3-style observe() pool (G4 refuses ungated equity entries).");
         }
 
         deploy(

@@ -8,6 +8,7 @@ import {PositionKinds} from "../../src/libraries/PositionKinds.sol";
 import {Position} from "../../src/interfaces/IPriceRouter.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAggregatorV3} from "../mocks/MockAggregatorV3.sol";
+import {TickMath} from "../../src/libraries/TickMath.sol";
 
 /// @notice Stand-in for the strategy holder: exposes `vault()` so the
 ///         adapter's numeraire-binding chain (holder → vault → asset) resolves.
@@ -68,7 +69,14 @@ contract MockUniV3Pool {
     address public token0;
     address public token1;
     uint160 internal _sqrtPriceX96;
+    /// @dev Time-weighted price, independent of spot. Zero = "TWAP tracks
+    ///      spot" (a pool that has held this price for the whole window).
+    ///      Setting it apart from spot models an in-block manipulation: spot
+    ///      moves, the window average does not.
+    uint160 internal _twapSqrtPriceX96;
     bool internal _broken;
+    bool internal _shortHistory;
+    uint32 internal constant _BASE = 1_000_000;
 
     constructor(address token0_, address token1_, uint160 sqrtPriceX96_) {
         token0 = token0_;
@@ -87,6 +95,39 @@ contract MockUniV3Pool {
     function slot0() external view returns (uint160, int24, uint16, uint16, uint16, uint8, bool) {
         require(!_broken, "pool boom");
         return (_sqrtPriceX96, 0, 0, 0, 0, 0, true);
+    }
+
+    /// @dev Cumulative ticks for a pool that has held `_sqrtPriceX96` flat for
+    ///      the whole window, so `(cum[1] - cum[0]) / window` recovers exactly
+    ///      the configured tick. `_BASE` is an arbitrary large elapsed time so
+    ///      both cumulatives stay positive for positive ticks.
+    function observe(uint32[] calldata secondsAgos)
+        external
+        view
+        returns (int56[] memory tickCumulatives, uint160[] memory secondsPerLiquidityCumulativeX128s)
+    {
+        require(!_broken, "pool boom");
+        require(!_shortHistory, "OLD");
+        uint160 twapSqrtP = _twapSqrtPriceX96 == 0 ? _sqrtPriceX96 : _twapSqrtPriceX96;
+        int56 tick = int56(TickMath.getTickAtSqrtRatio(twapSqrtP));
+        tickCumulatives = new int56[](secondsAgos.length);
+        secondsPerLiquidityCumulativeX128s = new uint160[](secondsAgos.length);
+        for (uint256 i; i < secondsAgos.length; ++i) {
+            tickCumulatives[i] = tick * int56(uint56(_BASE - secondsAgos[i]));
+        }
+    }
+
+    /// @notice Simulate a pool whose observation buffer is shorter than the
+    ///         requested window (Uniswap reverts `OLD`).
+    function setShortHistory(bool short_) external {
+        _shortHistory = short_;
+    }
+
+    /// @notice Move the instantaneous price WITHOUT moving the window average —
+    ///         i.e. exactly what an attacker's in-block swap does.
+    function setSpotOnly(uint160 spotSqrtPriceX96) external {
+        if (_twapSqrtPriceX96 == 0) _twapSqrtPriceX96 = _sqrtPriceX96; // pin the pre-attack average
+        _sqrtPriceX96 = spotSqrtPriceX96;
     }
 }
 
@@ -611,6 +652,61 @@ contract Erc20SpotAdapterTest is LaneAFixture {
         (uint256 v, bool ok) = adapter.value(_pos(address(token)), holder);
         assertFalse(ok, "divergence gate is direction-agnostic");
         assertEq(v, 0);
+    }
+
+    // ── TWAP anchoring: the gate must ignore in-block spot (audit #1) ──
+
+    /// @notice Attacker moves the pool ONTO a stale-high oracle mark inside
+    ///         their own transaction to re-open Lane A. With a TWAP the window
+    ///         average is unmoved, so the gate stays shut.
+    function test_value_spotManipulationCannotOpenGate() public {
+        // Real market is 2% under the $150 held mark → gate correctly shut.
+        (ERC20Mock token,, MockUniV3Pool pool) = _pooledFixture(true, 147e6, 100);
+        (, bool okBefore) = adapter.value(_pos(address(token)), holder);
+        assertFalse(okBefore, "precondition: divergent pool closes Lane A");
+
+        // Attacker's in-block swap pushes spot exactly onto the oracle mark.
+        pool.setSpotOnly(_sqrtPForPrice(150e6, 18, true));
+
+        (uint256 v, bool ok) = adapter.value(_pos(address(token)), holder);
+        assertFalse(ok, "TWAP ignores the manipulated spot - gate stays shut");
+        assertEq(v, 0);
+    }
+
+    /// @notice Inverse direction: attacker shoves spot far off a HEALTHY mark
+    ///         to force (0,false) and revert a victim's instant exit. The TWAP
+    ///         keeps Lane A open, so the cheap griefing DoS is closed too.
+    function test_value_spotManipulationCannotCloseGate() public {
+        (ERC20Mock token,, MockUniV3Pool pool) = _pooledFixture(true, 150e6, 100);
+
+        pool.setSpotOnly(_sqrtPForPrice(120e6, 18, true)); // 20% shove
+
+        (uint256 v, bool ok) = adapter.value(_pos(address(token)), holder);
+        assertTrue(ok, "TWAP ignores the shove - victim's exit still priced");
+        assertEq(v, 150e6);
+    }
+
+    /// @notice A sustained (window-length) divergence is still caught — the
+    ///         TWAP resists manipulation without going blind to real drift.
+    function test_value_sustainedDivergenceStillFailsClosed() public {
+        (ERC20Mock token,,) = _pooledFixture(true, 147e6, 100);
+        (uint256 v, bool ok) = adapter.value(_pos(address(token)), holder);
+        assertFalse(ok, "genuine sustained divergence still closes the lane");
+        assertEq(v, 0);
+    }
+
+    /// @notice A pool whose observation buffer cannot serve TWAP_WINDOW is
+    ///         rejected loudly at registration rather than silently pinning its
+    ///         token to Lane B forever.
+    function test_setFeed_rejectsPoolWithShortHistory() public {
+        ERC20Mock token = _newToken("TOK", 18);
+        MockAggregatorV3 feed = _newFeed(8, int256(150e8));
+        MockUniV3Pool pool = new MockUniV3Pool(address(token), address(usdc), _sqrtPForPrice(150e6, 18, true));
+        pool.setShortHistory(true);
+
+        vm.prank(adapterOwner);
+        vm.expectRevert(bytes("OLD"));
+        adapter.setFeed(address(token), address(feed), MAX_AGE, NO_CAP, address(pool), 100);
     }
 
     function test_value_gateOff_ignoresPools() public {
