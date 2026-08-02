@@ -16,7 +16,7 @@
 
 ## 3. Suite sweep and verification
 
-- [ ] 3.1 Run the full suite (`forge test`, foreground, serialized against other solc runs per the 16 GB guardrail) and triage with `sort | uniq -c` (never `sort -u`). Any suite whose reclaim path now hits the new gate should be inspected for whether it was silently relying on the bug.
+- [x] 3.1 Run the full suite (`forge test`, foreground, serialized against other solc runs per the 16 GB guardrail) and triage with `sort | uniq -c` (never `sort -u`). Any suite whose reclaim path now hits the new gate should be inspected for whether it was silently relying on the bug.
 - [x] 3.2 Confirm no mock ledger used in reclaim paths lacks `coverageFreezer()` (all three covering suites — `GovernorCoverageGates`, `ChallengeEndToEnd`, `CoverageEndToEnd` — wire the real `ExposureLedger`, so this is expected to be a no-op; fix any straggler by returning `address(0)`).
-- [ ] 3.3 `forge fmt` with a CI-matching forge; `forge build` size check is moot for Robinhood (98,304-byte ceiling) but record the governor's new size in the PR description.
-- [ ] 3.4 `openspec validate fix-bond-reclaim-deadline` passes; update the `challenge-game` main spec via archive flow at merge time, not by hand now.
+- [x] 3.3 `forge fmt` with a CI-matching forge; `forge build` size check is moot for Robinhood (98,304-byte ceiling) but record the governor's new size in the PR description.
+- [x] 3.4 `openspec validate fix-bond-reclaim-deadline` passes; update the `challenge-game` main spec via archive flow at merge time, not by hand now.
