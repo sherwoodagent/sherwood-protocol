@@ -141,10 +141,10 @@ sWOOD SHALL maintain two per-guardian timestamp-keyed traces answering different
 - **THEN** the total is transferred to the dead burn address in one transfer
 
 ### Requirement: Verdict-path slash to escrow (authorizedSlasher-only)
-`slashToEscrow(caseKey, openedAt, approvers, slashBpsPer, vault, snapshotTimestamp, bountyTo, bountyBps)` SHALL be callable only by `authorizedSlasher` (revert `NotAuthorizedSlasher` otherwise) and SHALL route slash proceeds to victim compensation instead of burning. Preconditions, each reverting: `compensationEscrow` unset → `CompensationEscrowNotSet`; `openedAt` in the future → `VerdictNotPast`; `snapshotTimestamp > openedAt` → `SnapshotAfterVerdict`; `slashBpsPer.length != approvers.length` → `SlashBpsLengthMismatch`; `bountyBps > MAX_CONVICTION_BOUNTY_BPS` → `InvalidParameter` (enforced unconditionally, even with a zero `bountyTo`); `vault` not factory-deployed (`governorOf(vault) == 0`) → `VaultNotFactoryDeployed`; any address repeated within `approvers` → `DuplicateApprover` (zero-rate entries are not exempt from the duplicate scan). The timestamp bounds are honest-caller sanity checks only — they do not constrain a compromised slasher, which chooses both timestamps freely. Per approver: a zero rate SHALL be skipped entirely (zero is the absence of liability, not a severity to floor); an approver already slashed under the same `caseKey` by an earlier call SHALL revert `ApproverAlreadySlashed`; each non-zero rate SHALL be clamped per-element to `[minSlashBps, maxSlashBps]`; the slash leg is the same own-stake leg as the review path (sized at `openedAt` off `max(liability, votable)`, clamped to live). The per-`(caseKey, approver)` mark SHALL be recorded only when the slash actually recovered a non-zero amount, so a zero take does not consume the verdict's one slash and foreclose a retry after re-stake. The mark (readable via `verdictSlashed(caseKey, approver)`) makes the severity envelope bind per VERDICT, not merely per call — splitting a quorum-sized batch across transactions stays legal, replaying an approver does not. The event topic key SHALL be namespaced (`keccak256("sherwood.verdict" ‖ caseKey)`) so a crafted `caseKey` cannot make a verdict slash collide with a review key in `GuardianSlashed` topics.
+`slashVerdict(caseKey, openedAt, approvers, slashBpsPer, contestors, bountyTo, bountyBps)` SHALL be callable only by `authorizedSlasher` (revert `NotAuthorizedSlasher` otherwise) and SHALL BURN its proceeds — the protocol makes no compensation promise to depositors. Preconditions, each reverting: `openedAt` in the future → `VerdictNotPast`; `slashBpsPer.length != approvers.length`, or `contestors.length != approvers.length` → `SlashBpsLengthMismatch`; `bountyBps > MAX_CONVICTION_BOUNTY_BPS` → `InvalidParameter` (enforced unconditionally, even with a zero `bountyTo`); any address repeated within `approvers` → `DuplicateApprover` (zero-rate entries are not exempt from the duplicate scan). The verdict takes no vault address and no snapshot timestamp: nothing is apportioned, so it needs no opinion about which vault the verdict concerned. The `openedAt` bound is an honest-caller sanity check only — it does not constrain a compromised slasher, which chooses it freely. Per approver: a zero rate SHALL be skipped entirely (zero is the absence of liability, not a severity to floor); an approver already slashed under the same `caseKey` by an earlier call SHALL revert `ApproverAlreadySlashed`; each non-zero rate SHALL be clamped per-element to `[minSlashBps, maxSlashBps]`; the slash leg is the same own-stake leg as the review path (sized at `openedAt` off `max(liability, votable)`, clamped to live). The per-`(caseKey, approver)` mark SHALL be recorded only when the slash actually recovered a non-zero amount, so a zero take does not consume the verdict's one slash and foreclose a retry after re-stake. The mark (readable via `verdictSlashed(caseKey, approver)`) makes the severity envelope bind per VERDICT, not merely per call — splitting a quorum-sized batch across transactions stays legal, replaying an approver does not. The event topic key SHALL be namespaced (`keccak256("sherwood.verdict" ‖ caseKey)`) so a crafted `caseKey` cannot make a verdict slash collide with a review key in `GuardianSlashed` topics.
 
 #### Scenario: Unauthorized caller
-- **WHEN** an address other than `authorizedSlasher` calls `slashToEscrow`
+- **WHEN** an address other than `authorizedSlasher` calls `slashVerdict`
 - **THEN** the call reverts `NotAuthorizedSlasher`
 
 #### Scenario: Rate clamped to the envelope
@@ -156,7 +156,7 @@ sWOOD SHALL maintain two per-guardian timestamp-keyed traces answering different
 - **THEN** that approver is skipped — no slash, no floor applied, and its one-slash-per-verdict mark is not consumed
 
 #### Scenario: Replay within one verdict
-- **WHEN** a second `slashToEscrow` call under the same `caseKey` names an approver whose earlier slash recovered WOOD
+- **WHEN** a second `slashVerdict` call under the same `caseKey` names an approver whose earlier slash recovered WOOD
 - **THEN** the call reverts `ApproverAlreadySlashed`, so severity cannot compound past the ceiling by splitting a verdict across transactions
 
 #### Scenario: Retry after a zero take
@@ -164,33 +164,33 @@ sWOOD SHALL maintain two per-guardian timestamp-keyed traces answering different
 - **THEN** a retried call may slash them — the at-open basis is unchanged and the mark was never set
 
 ### Requirement: Conviction bounty and escrow routing
-When `slashToEscrow` recovers a non-zero total: if `bountyTo != address(0)` and `bountyBps != 0`, a bounty of `total * bountyBps / 10_000` SHALL be transferred to `bountyTo` first and `ConvictionBountyPaid` emitted; the remainder is what funds compensation. The bounty rate is bounded by `MAX_CONVICTION_BOUNTY_BPS = 2_000` (20%) enforced in sWOOD itself, so a compromised slasher can divert at most that fraction of any one call to a caller-named address — the remainder can only ever reach the owner-set escrow or the burn address (per call, not per guardian: fresh case keys compound across calls). The net total SHALL be approved to `compensationEscrow` and `openCase(vault, snapshotTimestamp, total)` invoked; on success the allowance is zeroed and `VerdictSlashRouted(caseKey, vault, total, caseId)` is emitted with the NET total. If `openCase` reverts with a recoverable input/wiring error (`SnapshotNotPast`, `ZeroAddress`, `NothingToCompensate`, `NotAuthorizedFunder`, `EmptySnapshot`), the whole transaction SHALL re-revert so the corrected call can be resubmitted (the slash rolls back too). Any other failure (missing ERC20Votes surface, block-number clock mode, empty returndata) SHALL NOT brick the verdict: the slash stands, the net proceeds burn, and `VerdictSlashUncompensated(caseKey, vault, total)` marks the case as never funded. The bounty is deliberately not clawed back on the burn fallback — depositors recover nothing on that path either way. When nothing was recovered across all approvers, no case is opened and `(0, 0)` is returned.
+When `slashVerdict` recovers a non-zero total: if `bountyTo != address(0)` and `bountyBps != 0`, a bounty of `min(total × bountyBps / 10_000, contestorSlash)` SHALL be transferred to `bountyTo` and `ConvictionBountyPaid` emitted, where `contestorSlash` is the SUMMED slash of the approvers flagged in `contestors` — those who funded the counter-bond. That cap is load-bearing: the bounty is only owed when an approver funded the defence, a rule meant to price a staged contest by forcing the stager into the cohort its own conviction slashes, and the punitive rate breaks that pricing because the bounty is a share of the WHOLE cohort's bonds while a faker risks only its own. Capping at the contestors' own slash makes staging break-even at best for any parameter set. A contestor whose own slash landed at zero contributes nothing to the cap and so unlocks no bounty. The rate is additionally bounded by `MAX_CONVICTION_BOUNTY_BPS = 2_000` (20%) enforced in sWOOD itself, so a compromised slasher can divert at most that fraction of any ONE call to a caller-named address — the remainder can only ever reach `BURN_ADDRESS` (per call, not per guardian: fresh case keys compound across calls). The net remainder SHALL be burned via `_burnWood`, which parks the amount in `_pendingBurn` for a permissionless `flushBurn` retry if the WOOD transfer reverts or returns false, so a hostile token cannot brick a conviction whose accounting already landed. `VerdictSlashBurned(caseKey, gross, bounty, burned)` SHALL be emitted with `gross == bounty + burned`. When nothing was recovered across all approvers, `0` is returned and nothing is paid or burned.
 
-#### Scenario: Successful verdict funds a case
-- **WHEN** `slashToEscrow` recovers WOOD and `openCase` succeeds
-- **THEN** the net-of-bounty total funds the escrow case pinned to `snapshotTimestamp` and `VerdictSlashRouted` reports the net figure and case id
+#### Scenario: Successful verdict burns the remainder
+- **WHEN** `slashVerdict` recovers WOOD
+- **THEN** the net-of-bounty total is burned and `VerdictSlashBurned` reports gross, bounty and burned and case id
 
 #### Scenario: Excessive bounty rate
 - **WHEN** the slasher passes `bountyBps > 2_000`
 - **THEN** the call reverts `InvalidParameter` — it is never silently clamped, because a caller-chosen payout address must not be laundered into a smaller diversion
 
-#### Scenario: Unpriceable vault burns instead of bricking
-- **WHEN** `openCase` fails for a vault the escrow can never apportion against
-- **THEN** the guardians stay slashed, the net proceeds burn, and `VerdictSlashUncompensated` is emitted
+#### Scenario: Staged contest cannot out-earn its own cost
+- **WHEN** the only approver flagged in `contestors` forfeited less than `total × bountyBps / 10_000`
+- **THEN** the bounty is capped at that approver's own slash, so manufacturing a contest is break-even at best
 
-#### Scenario: Recoverable escrow error re-reverts
-- **WHEN** `openCase` reverts with a fixable caller/wiring error such as `SnapshotNotPast`
-- **THEN** the entire transaction reverts (including the slash marks) so a corrected call runs clean, and nothing burns
+#### Scenario: Genuine defence is paid in full
+- **WHEN** approvers whose summed slash exceeds the fee funded the counter-bond
+- **THEN** the cap does not bind and the challenger receives the whole `bountyBps` share
 
-### Requirement: authorizedSlasher and compensationEscrow roles
-`setAuthorizedSlasher(slasher)` and `setCompensationEscrow(escrow)` SHALL be owner-only and freely re-wireable (not set-once); zero is a valid value for either and disables the verdict path (`slashToEscrow` reverts `CompensationEscrowNotSet` when the escrow is zero; no caller matches a zero slasher). Each setter SHALL emit its event (`AuthorizedSlasherSet`, `CompensationEscrowSet`). The verdict-slash role SHALL be distinct from the registry role by design: the review slash and the verdict slash must never share a caller, so the registry's appeal reserve can never refund a proven-malice verdict. The escrow is owner-set STATE, deliberately not a `slashToEscrow` parameter — sWOOD custodies every WOOD bond in the protocol, and a caller-named sink would hand the slasher an allowance against that whole balance. The role is intended for the challenge game; until it is wired, a verdict is effectively a governance action by the owner-set slasher.
+### Requirement: authorizedSlasher role
+`setAuthorizedSlasher(slasher)` SHALL be owner-only and freely re-wireable (not set-once); zero is a valid value and disables the verdict path, since no caller matches a zero slasher. The setter SHALL emit `AuthorizedSlasherSet`. The verdict-slash role SHALL be distinct from the registry role by design: the review slash and the verdict slash must never share a caller, so the registry's appeal reserve can never refund a proven-malice verdict. The verdict takes no sink parameter — proceeds burn inside sWOOD, so there is no destination a caller could name and no allowance against the protocol's WOOD custody to hand out. The role is intended for the challenge game; until it is wired, a verdict is effectively a governance action by the owner-set slasher.
 
 #### Scenario: Verdict path disabled
-- **WHEN** `compensationEscrow` is zero
-- **THEN** `slashToEscrow` reverts `CompensationEscrowNotSet` regardless of caller
+- **WHEN** `authorizedSlasher` is zero
+- **THEN** no caller can reach `slashVerdict` — it reverts `NotAuthorizedSlasher`
 
 #### Scenario: Role separation
-- **WHEN** the registry attempts to call `slashToEscrow`, or the authorized slasher attempts `slashGuardians`
+- **WHEN** the registry attempts to call `slashVerdict`, or the authorized slasher attempts `slashGuardians`
 - **THEN** each reverts (`NotAuthorizedSlasher` / `NotRegistry`) — the two slash paths never share a caller role
 
 ### Requirement: Burn resilience
