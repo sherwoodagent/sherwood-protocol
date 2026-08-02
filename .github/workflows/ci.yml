@@ -47,11 +47,16 @@ jobs:
       - name: Build
         run: forge build
 
-      # Fork/integration tests need live RPC endpoints (no secrets in CI):
-      # everything under test/integration/ plus WstETHMoonwellStrategy.t.sol,
-      # which forks public Base RPC in setUp(). All other tests run.
+      # Fork/integration tests need live RPC endpoints (no secrets in CI), so
+      # everything under test/integration/ is excluded. All other tests run.
+      #
+      # `test/WstETHMoonwellStrategy.t.sol` was excluded here too until the
+      # Base-chain strategies were deleted (PR #53). That path no longer exists,
+      # so the glob was dead — and worse than dead: a future file landing there
+      # would have been silently skipped by CI. Removed rather than kept "just
+      # in case" (issue #73).
       - name: Test
-        run: forge test --no-match-path "{test/integration/**,test/WstETHMoonwellStrategy.t.sol}" -vv
+        run: forge test --no-match-path "test/integration/**" -vv
 
   coverage:
     name: Coverage (advisory)
@@ -100,7 +105,7 @@ jobs:
           forge coverage \
             --report lcov \
             --report summary \
-            --no-match-path "{test/integration/**,test/WstETHMoonwellStrategy.t.sol}"
+            --no-match-path "test/integration/**"
 
       # TODO(#63): sink is artifact-only for now — wiring Codecov needs a
       # CODECOV_TOKEN repository secret, a decision deferred out of this change.
