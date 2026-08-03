@@ -130,3 +130,47 @@
       covering test: certify-before-readyAt revert, mid-window codehash
       change voids, cancel then certify reverts, delay bounds, demotion
       unaffected while pending, layout-goldens N/A note.
+
+## 6. Audit remediation (PR #156 Pashov review, 6 confirmed findings)
+
+See design.md "Audit Remediation" for the rationale behind each design call.
+
+- [x] 6.1 Finding #1 (confidence 92): add `bondToken` (`IERC20`) to
+      `PendingCertification`, snapshot `wood` into it in
+      `proposeCertification`, pull via `p.bondToken.safeTransferFrom(...)`
+      in `certify` instead of the live `wood` state variable.
+- [x] 6.2 Finding #2 (confidence 85): `_demote` also deletes `_pending[k]`
+      and emits `CertificationCancelled` when a same-key pending
+      certification exists, across all three demotion paths (`demote`,
+      `demoteByChallenge`, `poke`).
+- [x] 6.3 Finding #3 (confidence 85): `certify` reverts `NotSubmitter` when
+      `p.bondAmount != 0 && msg.sender != p.submitter` — conditioned on a
+      non-zero pinned bond so the unbonded case stays fully permissionless
+      (design.md R3 explains why the unconditional form was rejected).
+- [x] 6.4 Finding #4 (confidence 80): broadened the contract-level codehash
+      natspec to cover any fund-routing-relevant mutable storage, not just
+      recognized proxy shapes. Process/documentation only — no code change.
+- [x] 6.5 Finding #5 (confidence 80): new constant `MAX_CERTIFY_WINDOW = 14
+      days`; `certify` reverts `CertificationExpired` past
+      `readyAt + MAX_CERTIFY_WINDOW`. Live `submitterBondWood` re-validation
+      considered and rejected as redundant given 6.3 (design.md R5).
+- [x] 6.6 Finding #6 (confidence 75): `proposeCertification` gained a
+      required `expectedCodehash` parameter; reverts `CodehashChanged` when
+      the target's live codehash at propose-time execution doesn't match
+      the caller-supplied value, closing the propose-time TOCTOU gap.
+- [x] 6.7 Updated all `proposeCertification` call sites (58 across 9 test
+      files) for the new `expectedCodehash` argument; added
+      `vm.prank(submitter)` before bonded `certify` calls in
+      `test/TierRegistry.t.sol` and
+      `test/TierRegistryCertificationTimelock.t.sol` per 6.3.
+- [x] 6.8 New adversarial tests in `test/TierRegistryCertificationTimelock.t.sol`
+      mirroring each finding's own proof: `setWood` mid-window doesn't
+      retoken the pull (F1); `demoteByChallenge`/`demote`/`poke` all cancel
+      a same-key pending renewal, scoped to that key only (F2); a
+      non-submitter (including the owner) cannot trigger a bonded `certify`,
+      while the unbonded case stays permissionless (F3); `certify` expires
+      at `readyAt + MAX_CERTIFY_WINDOW` and is recoverable via re-proposal
+      (F5); `proposeCertification` reverts on an `expectedCodehash` mismatch
+      and succeeds when it matches (F6).
+- [x] 6.9 Updated proposal.md, design.md, and this spec delta
+      (specs/tier-policy/spec.md) to describe the remediated behavior.

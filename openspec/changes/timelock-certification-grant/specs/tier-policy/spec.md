@@ -11,27 +11,44 @@ value for every vault at once. The announcement window is the review the
 other layers (guardians repricing, depositors exiting, watchtowers
 inspecting the target) act in.
 
-`proposeCertification(target, selector, tier, extractableBoundBps, submitter)`
-SHALL be owner-only and SHALL enforce every input guard the instant path
-enforced: revert `InvalidTier` when `tier >= 2`; `BoundRequired` when
-`extractableBoundBps` is `0` or `>= 10_000`; `NotAContract` when the target's
-codehash is `bytes32(0)` or `keccak256("")`; `ZeroAddressSubmitter` when the
-current `submitterBondWood` is non-zero and `submitter` is `address(0)`. On
-success it SHALL record a pending certification for the key carrying the
+`proposeCertification(target, selector, tier, extractableBoundBps, submitter,
+expectedCodehash)` SHALL be owner-only and SHALL enforce every input guard the
+instant path enforced: revert `InvalidTier` when `tier >= 2`; `BoundRequired`
+when `extractableBoundBps` is `0` or `>= 10_000`; `NotAContract` when the
+target's codehash is `bytes32(0)` or `keccak256("")`; `ZeroAddressSubmitter`
+when the current `submitterBondWood` is non-zero and `submitter` is
+`address(0)`. It SHALL additionally revert `CodehashChanged` when the
+target's LIVE codehash (read at this call's own execution time) does not
+equal the caller-supplied `expectedCodehash` — the hash the owner actually
+reviewed off-chain (PR #156 audit remediation, finding #6 — closes a
+propose-time TOCTOU: without this check, a gap between off-chain review and
+on-chain mining, e.g. mempool or multisig confirmation latency, would let a
+third party — the target's own deployer, not this registry's owner —
+redeploy different bytecode at `target` before the proposal transaction
+lands, silently pinning a codehash nobody actually reviewed; `certify`'s own
+codehash re-check only re-verifies THIS snapshot and can never detect that
+the snapshot itself was wrong).
+
+On success it SHALL record a pending certification for the key carrying the
 proposed `(tier, extractableBoundBps, submitter)`, the target's current
-`EXTCODEHASH`, the current `submitterBondWood` as the pinned bond amount, and
+`EXTCODEHASH`, the current `wood` token address as the pinned bond token
+(finding #1 — see the modified bond requirement below), the current
+`submitterBondWood` as the pinned bond amount, and
 `readyAt = block.timestamp + certifyDelay`, and SHALL emit
 `CertificationProposed(target, selector, tier, extractableBoundBps, submitter,
 bondAmount, codehash, readyAt)`.
 
 Re-proposing a key that already has a pending certification SHALL overwrite
 the pending record entirely (fresh parameters, fresh codehash snapshot, fresh
-pinned bond amount, fresh `readyAt`) — a re-announcement restarts the clock,
-it never shortens it.
+pinned bond amount and token, fresh `readyAt`) — a re-announcement restarts
+the clock, it never shortens it.
 
-A pending certification SHALL have no effect on `tierOf`, on demotion paths,
-or on the adapter allowlist until executed — announcement is not
-certification.
+A pending certification SHALL have no effect on `tierOf` or on the adapter
+allowlist until executed — announcement is not certification. It SHALL,
+however, be cancelled as a side effect of a same-key demotion (finding #2 —
+see the new demotion-cancels-pending requirement below); that exception
+exists precisely so a for-cause revocation can never be silently overridden
+by an announcement that predates it.
 
 #### Scenario: Proposal records intent without changing the effective tier
 - **WHEN** the owner proposes a certification for an uncertified pair
@@ -47,37 +64,75 @@ certification.
   for that input (`InvalidTier` / `BoundRequired` / `NotAContract` /
   `ZeroAddressSubmitter`)
 
+#### Scenario: Proposal enforces the reviewed-codehash assertion
+- **WHEN** the owner proposes with `expectedCodehash` set to the bytecode
+  hash they reviewed off-chain, but a third party has redeployed different
+  bytecode at `target` before this transaction mines
+- **THEN** the call reverts `CodehashChanged` and no pending record is
+  written — the owner's stale review can never be blindly re-photographed
+  into a pinned certification for bytecode nobody actually reviewed
+
 #### Scenario: Non-owner cannot propose
 - **WHEN** a non-owner calls `proposeCertification`
 - **THEN** the call reverts (Ownable)
 
 #### Scenario: Re-proposal restarts the clock and re-pins everything
 - **WHEN** the owner proposes again for a key with an existing pending
-  certification, after the bond config or the delay changed
+  certification, after the bond config, the bond token, or the delay changed
 - **THEN** the pending record carries only the new parameters, the new
-  codehash snapshot, the newly pinned bond amount, and a new
+  codehash snapshot, the newly pinned bond amount and token, and a new
   `readyAt = block.timestamp + certifyDelay` — nothing from the old
   announcement survives
 
-### Requirement: Certification execution is permissionless, delayed, and code-pinned
-`certify(target, selector)` SHALL be callable by anyone. It SHALL revert when
-no pending certification exists for the key (`NoPendingCertification`), when
-`block.timestamp < readyAt` (`CertifyDelayNotElapsed`), and when the target's
-live codehash no longer equals the proposal-time snapshot
+### Requirement: Certification execution is permissionless when unbonded, submitter-gated when bonded, delayed, code-pinned, and time-bounded
+`certify(target, selector)` SHALL be callable by anyone when the pending
+certification's pinned bond amount is zero. When the pinned bond amount is
+non-zero, `certify` SHALL revert `NotSubmitter` unless
+`msg.sender == p.submitter` (PR #156 audit remediation, finding #3). Without
+this restriction, `submitter` — an arbitrary address the owner names at
+proposal time with no signature or `msg.sender` tie-in — could have their
+bond pulled by any permissionless caller off whatever STANDING ERC20
+allowance that address already happens to have on this registry, never
+scoped to this specific certification, even though that address never saw
+or approved this particular grant. Gating execution to the submitter
+whenever funds are actually at stake turns a stale, general-purpose
+allowance into live, in-the-moment consent: the party whose funds are at
+risk is also the only one who can put them at risk. An unbonded
+certification has no funds to consent about, so it stays fully
+permissionless — narrowing "anyone can trigger" only where fund custody is
+actually in play.
+
+`certify` SHALL revert when no pending certification exists for the key
+(`NoPendingCertification`), when `block.timestamp < readyAt`
+(`CertifyDelayNotElapsed`), when `block.timestamp > readyAt +
+MAX_CERTIFY_WINDOW` (`CertificationExpired` — finding #5, see below), and
+when the target's live codehash no longer equals the proposal-time snapshot
 (`CodehashChanged`) — a code change during the window voids the grant rather
-than certifying different bytecode under an old announcement. The bond-conflict
-guards SHALL be enforced here, at execution (see the modified re-certification
-requirement below).
+than certifying different bytecode under an old announcement. The
+bond-conflict guards SHALL be enforced here, at execution (see the modified
+re-certification requirement below).
 
-On success it SHALL pull the pinned bond (see the modified bond requirement
-below), write the tier config with the snapshotted codehash, delete the
-pending record, and emit the existing `TierCertified`.
+On success it SHALL pull the pinned bond, using the bond TOKEN pinned at
+proposal time rather than the live `wood` state variable (see the modified
+bond requirement below), write the tier config with the snapshotted
+codehash, delete the pending record, and emit the existing `TierCertified`.
 
-Permissionless execution is safe because every parameter was pinned and
-announced at proposal time: an executing third party can choose only the
-timing after `readyAt`, never the content. The announcement is the owner's
+Permissionless (or submitter-gated) execution is safe because every
+parameter was pinned and announced at proposal time: an executing party can
+choose only the timing after `readyAt` and before `readyAt +
+MAX_CERTIFY_WINDOW`, never the content. The announcement is the owner's
 consent; the owner's remedies against an execution it no longer wants are
 `cancelCertification` before execution and instant `demote` after it.
+
+The registry SHALL carry a constant `MAX_CERTIFY_WINDOW = 14 days` bounding
+how long after `readyAt` a pending certification may still be executed
+(finding #5). Without an upper bound, a submitter fully controls WHEN to
+trigger a permissionless-or-self-gated execution and can wait out a price
+collapse on the bond token's liquidity before posting badly-stale collateral
+against an unchanged extractable bound. `MAX_CERTIFY_WINDOW` is a fixed
+constant, not an owner-configurable delay (unlike `certifyDelay`), so the
+owner has no lever to shorten it and expire someone else's pending
+certification early.
 
 #### Scenario: Execution before readyAt refused
 - **WHEN** anyone calls `certify` on a pending certification before its
@@ -95,12 +150,26 @@ consent; the owner's remedies against an execution it no longer wants are
   written — the stale pending record grants nothing and the owner can
   `cancelCertification` or re-propose against the new code
 
-#### Scenario: Third-party execution realizes exactly the announced state
+#### Scenario: Third-party execution realizes exactly the announced state (unbonded)
 - **WHEN** an unrelated address calls `certify` after `readyAt` on a healthy
-  pending certification
+  pending certification with a zero pinned bond amount
 - **THEN** the pair is certified with precisely the proposed tier, bound, and
   snapshotted codehash, the pending record is deleted, and `TierCertified`
   is emitted — identical to the owner executing it
+
+#### Scenario: A non-submitter cannot trigger a bonded execution
+- **WHEN** a pending certification carries a non-zero pinned bond amount and
+  any address other than the pinned `submitter` (including the registry
+  owner) calls `certify` after `readyAt`
+- **THEN** the call reverts `NotSubmitter`, and the pinned submitter's own
+  call still succeeds
+
+#### Scenario: Execution refused once the certify window expires
+- **WHEN** anyone calls `certify` more than `MAX_CERTIFY_WINDOW` after
+  `readyAt`
+- **THEN** the call reverts `CertificationExpired`, and the pending record
+  is left inert (recoverable only via a fresh `proposeCertification`) —
+  identical in spirit to a codehash-voided pending
 
 ### Requirement: Pending certification can be cancelled by the owner
 `cancelCertification(target, selector)` SHALL be owner-only, SHALL revert
@@ -123,6 +192,46 @@ for the key — it withdraws only the announcement.
 #### Scenario: Non-owner cannot cancel
 - **WHEN** a non-owner calls `cancelCertification`
 - **THEN** the call reverts (Ownable)
+
+### Requirement: Demotion cancels a same-key pending certification
+Every demotion path (`demote`, `demoteByChallenge`, `poke`) SHALL, as part of
+the same `_demote` convergence point that clears `_configs[k]`, also delete
+any pending certification recorded for that same key and emit
+`CertificationCancelled(target, selector)` if one existed (PR #156 audit
+remediation, finding #2). Without this, a "renewal" proposed while a
+certification is still live would survive that certification's later
+for-cause demotion untouched, and would go on to execute at `readyAt`
+re-certifying the just-convicted target — possibly at looser terms than
+before the conviction. `demoteByChallenge`'s caller (the challenge game) has
+no other lever to stop this, since `cancelCertification` is owner-only; this
+requirement gives every demotion path — not just the owner's — the power to
+void a stale announcement it would otherwise be defenseless against.
+
+This cancellation SHALL be scoped to the demoted key only: an unrelated
+key's pending certification SHALL be unaffected by a demotion on a different
+key (see the existing "demotion unaffected" scenarios for the un-demoted
+side of this same guarantee).
+
+#### Scenario: Challenge-triggered demotion cancels a pending renewal
+- **WHEN** a live certification is convicted via `demoteByChallenge` while a
+  same-key pending certification (a "renewal") is announced but not yet
+  executed
+- **THEN** `_configs[k]` is cleared as before, the pending renewal is
+  deleted, `CertificationCancelled` is emitted, and a later `certify` call
+  for that key reverts `NoPendingCertification` instead of silently
+  re-certifying the convicted target
+
+#### Scenario: Owner demotion and permissionless poke cancel identically
+- **WHEN** a same-key pending certification exists and the live certification
+  is demoted via the owner's `demote` or the permissionless `poke`
+- **THEN** the pending record is deleted in both cases, exactly as under
+  `demoteByChallenge` — all three paths converge on the same `_demote` logic
+
+#### Scenario: Demoting one key does not cancel another key's pending
+- **WHEN** two different keys each carry independent state (one live and
+  demoted, one pending) 
+- **THEN** demoting the first key's certification leaves the second key's
+  pending certification untouched
 
 ### Requirement: Certify delay is bounded and announced deadlines are pinned
 The registry SHALL carry an owner-settable `certifyDelay` (default `3 days`)
@@ -156,26 +265,43 @@ which restarts the full window.
 
 ## MODIFIED Requirements
 
-### Requirement: Submitter bond pulled at certification when configured
-The bond amount SHALL be pinned at proposal time and pulled at execution
-time. `proposeCertification` SHALL snapshot the then-current
-`submitterBondWood` into the pending record (reverting
-`ZeroAddressSubmitter` when that snapshot is non-zero and `submitter` is
-`address(0)`); later changes to `submitterBondWood` SHALL NOT affect the
-pending grant — the submitter consented (via approval) to a known amount,
-and a permissionless executor must not be able to pull a different one.
+### Requirement: Submitter bond token and amount are both pinned at proposal, pulled at execution
+The bond amount AND the bond token SHALL both be pinned at proposal time and
+pulled together at execution time. `proposeCertification` SHALL snapshot the
+then-current `submitterBondWood` and the then-current `wood` token address
+into the pending record (reverting `ZeroAddressSubmitter` when the amount
+snapshot is non-zero and `submitter` is `address(0)`); later changes to
+`submitterBondWood` OR to `wood` (via `setWood`) SHALL NOT affect the pending
+grant — the submitter consented (via approval on a specific token) to a
+known amount denominated in that token, and an executor must not be able to
+pull a different amount, or the same amount in a different token, than what
+was announced.
+
+Pinning the bond token closes a gap (PR #156 audit remediation, finding #1,
+confidence 92): `setWood`'s only guard (`totalBondedWood != 0`) is blind to
+unexecuted pending certifications, since `totalBondedWood` is incremented
+only inside `certify`. Without pinning the token, an entirely ordinary,
+honest token migration (`setWood`) during the certify-delay window would
+make execution pull the pinned AMOUNT denominated in whatever token is live
+at execution time — not the token the submitter actually approved against —
+either silently pulling value in the wrong token (if the submitter happens
+to hold a standing approval on it) or permanently bricking the certification
+with no expiry (if not). Pinning the token at proposal time makes `setWood`
+inert to any already-pending certification's bond economics by
+construction, regardless of when it is called relative to execution.
 
 When the pinned amount is non-zero, `certify` SHALL — at execution — record a
 `SubmitterBond{submitter, amount, releasableAt: 0}` for the key, add the
 pinned amount to `totalBondedWood`, pull it from the recorded submitter via
-`safeTransferFrom`, and emit `SubmitterBondLocked`. No WOOD moves at proposal
-time: the submitter's capital is not locked during a window in which nothing
-is certified, and cancellation or a voided grant needs no refund path. If the
-pull fails at execution (allowance revoked, balance insufficient), the
-`certify` call reverts and remains retryable — a submitter who withholds
-approval thereby withholds the certification, which is the correct reading of
-a bond as the submitter's live consent; the owner's remedy is
-`cancelCertification` and a re-proposal with a different submitter.
+`safeTransferFrom` on the PINNED bond token (never the live `wood`), and emit
+`SubmitterBondLocked`. No WOOD moves at proposal time: the submitter's
+capital is not locked during a window in which nothing is certified, and
+cancellation or a voided grant needs no refund path. If the pull fails at
+execution (allowance revoked, balance insufficient), the `certify` call
+reverts and remains retryable — a submitter who withholds approval thereby
+withholds the certification, which is the correct reading of a bond as the
+submitter's live consent; the owner's remedy is `cancelCertification` and a
+re-proposal with a different submitter.
 
 When the pinned amount is zero, execution SHALL write the config without
 touching WOOD or the bonds mapping (the Plan A no-bond passthrough), even if
@@ -187,7 +313,7 @@ exist only for executed certifications, never for pending ones.
 
 #### Scenario: Bonded certification locks WOOD at execution
 - **WHEN** a certification proposed with a non-zero pinned bond is executed
-  after `readyAt` by any caller, the submitter having approved the registry
+  after `readyAt` by the pinned submitter, having approved the registry
 - **THEN** exactly the pinned amount transfers from the submitter into the
   registry, `totalBondedWood` increases by it, and `SubmitterBondLocked` is
   emitted
@@ -197,6 +323,15 @@ exist only for executed certifications, never for pending ones.
   certification was proposed, and the pending certification is then executed
 - **THEN** the amount pulled is the amount pinned at proposal time, not the
   live config
+
+#### Scenario: A `setWood` token migration mid-window does not retoken the pull
+- **WHEN** a certification is proposed while `wood` is TokenA, the owner
+  calls `setWood` to migrate to TokenB before execution (legal because
+  `totalBondedWood == 0` while nothing has executed yet), and the pending
+  certification is then executed by the pinned submitter
+- **THEN** the pull is against TokenA — the token pinned at proposal time —
+  and TokenB (the now-live `wood`) is never touched by this certification's
+  bond, regardless of what allowances the submitter holds on either token
 
 #### Scenario: Lapsed submitter approval blocks execution retryably
 - **WHEN** the submitter revokes their WOOD approval during the window and
@@ -247,6 +382,20 @@ sizing consumes the bound directly
 (`requiredCoverage = maxCapital × Σ boundBps / 10_000`, tier-2 calls
 contributing full notional), so the bound is the real risk parameter.
 
+This discipline is NOT limited to recognized proxy shapes (PR #156 audit
+remediation, finding #4): EXTCODEHASH attests only to unchanged bytecode,
+never to unchanged behavior. ANY target exposing ordinary, non-`immutable`
+storage that is settable after deployment and can affect fund routing — a
+beneficiary address, a fee sink, a swap-path parameter, and so on — can have
+that state rewired and be certified atomically in the same transaction,
+since its codehash never moves. Governance SHALL treat "certifiable at tier
+0/1" as bytecode-AND-storage-immutable for every fund-routing-relevant
+parameter, not merely "not a known proxy shape": review the target's full
+storage layout for post-deployment setters before certifying, not just the
+presence or absence of a delegatecall. This is a process/documentation
+requirement, not a code-enforced one — the codehash check has no on-chain
+way to distinguish a fund-routing setter from an inert one.
+
 The certification timelock is the enforcement aid for this discipline: every
 grant is announced at least `MIN_CERTIFY_DELAY` before it can take effect,
 with the target, tier, bound, and codehash in the `CertificationProposed`
@@ -284,7 +433,11 @@ modification of the old header, whose "owner-only" no longer describes the
 execution step.
 **Migration**: Callers of `certify(target, selector, tier,
 extractableBoundBps, submitter)` call `proposeCertification` with the same
-five arguments, wait `certifyDelay`, then call (or let anyone call)
-`certify(target, selector)`. Deploy ceremonies propose the launch set while
-the deployer still owns the registry and let execution land permissionlessly
-after handoff.
+five arguments plus a sixth, `expectedCodehash` (the bytecode hash reviewed
+off-chain — see the propose requirement's `CodehashChanged` guard), wait
+`certifyDelay`, then call `certify(target, selector)` — permissionlessly if
+the pinned bond amount is zero, or as the pinned `submitter` if it is
+non-zero (see the execution requirement's `NotSubmitter` guard), and within
+`MAX_CERTIFY_WINDOW` of `readyAt`. Deploy ceremonies propose the launch set
+while the deployer still owns the registry and let execution land
+permissionlessly (the launch set carries no bond) after handoff.

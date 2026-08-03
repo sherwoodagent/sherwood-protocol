@@ -31,6 +31,18 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
  *      can never be "closed-loop" or "oracle-bounded" by inspection of frozen
  *      code. Leave proxies at the tier-2 default.
  *
+ *      THIS RULE IS NOT LIMITED TO RECOGNIZED PROXY SHAPES: EXTCODEHASH
+ *      attests only to unchanged bytecode, never to unchanged behavior. ANY
+ *      target exposing ordinary, non-`immutable` storage that is settable
+ *      after deployment and can affect fund routing — a beneficiary address,
+ *      a fee sink, a swap-path parameter, and so on — can have that state
+ *      rewired and be certified atomically in the same transaction, since its
+ *      codehash never moves. Governance MUST treat "certifiable at tier 0/1"
+ *      as bytecode-AND-storage-immutable for every fund-routing-relevant
+ *      parameter, not merely "not a known proxy shape": review the target's
+ *      full storage layout for post-deployment setters before certifying,
+ *      not just the presence or absence of a delegatecall.
+ *
  *      GRANTING is announced, not instant: `proposeCertification` (owner-only)
  *      records intent and pins the target's codehash and bond amount;
  *      `certify` (permissionless) executes it no earlier than `certifyDelay`
@@ -62,17 +74,25 @@ contract TierRegistry is Ownable2Step {
     }
 
     /// @dev A proposed-but-not-yet-executed certification. `readyAt == 0` is
-    ///      the existence sentinel (no pending record). `codehash` and
-    ///      `bondAmount` are snapshotted/pinned at proposal time so that
-    ///      permissionless execution can only choose WHEN, never WHAT — see
-    ///      `proposeCertification` / `certify` natspec.
+    ///      the existence sentinel (no pending record). `codehash`,
+    ///      `bondAmount`, and `bondToken` are snapshotted/pinned at proposal
+    ///      time so that permissionless execution can only choose WHEN, never
+    ///      WHAT — see `proposeCertification` / `certify` natspec.
+    ///
+    ///      `bondToken` pins the live `wood` at proposal time (audit finding
+    ///      #1): without it, an ordinary `setWood` token migration during the
+    ///      certify-delay window would make `certify` pull the pinned AMOUNT
+    ///      denominated in a token the submitter never approved against for
+    ///      this certification — `setWood`'s only guard
+    ///      (`totalBondedWood != 0`) cannot see an unexecuted pending bond.
     struct PendingCertification {
         uint8 tier; // ┐
-        uint16 extractableBoundBps; // │ one slot: 1 + 2 + 20 + 8 = 31 bytes
+        uint16 extractableBoundBps; // │ slot 1: 1 + 2 + 20 + 8 = 31 bytes
         address submitter; // │
         uint64 readyAt; // ┘ 0 = no pending (existence sentinel)
-        uint96 bondAmount; // pinned submitterBondWood at proposal time
-        bytes32 codehash; // proposal-time EXTCODEHASH snapshot
+        uint96 bondAmount; // ┐ slot 2: 12 + 20 = 32 bytes
+        IERC20 bondToken; // ┘ pinned `wood` at proposal time (finding #1)
+        bytes32 codehash; // slot 3: proposal-time EXTCODEHASH snapshot
     }
 
     uint8 public constant TIER_ARBITRARY = 2;
@@ -91,6 +111,20 @@ contract TierRegistry is Ownable2Step {
     ///      is un-settable rather than merely survivable.
     uint256 public constant MIN_CERTIFY_DELAY = 1 days;
     uint256 public constant MAX_CERTIFY_DELAY = 30 days;
+
+    /// @dev Upper bound on how long after `readyAt` a pending certification
+    ///      may still be executed (audit finding #5). Without this, `certify`
+    ///      has no upper bound at all — a submitter fully controls WHEN to
+    ///      trigger the permissionless execute and can wait out a price
+    ///      collapse on the bond token's liquidity before posting badly-stale
+    ///      collateral against an unchanged extractable bound. A fixed
+    ///      constant (not an owner-configurable delay, unlike
+    ///      `certifyDelay`) deliberately gives the owner no lever to shorten
+    ///      this window and expire someone else's pending certification
+    ///      early. 14 days is generous relative to `certifyDelay`'s 30-day
+    ///      ceiling for review, while still bounding collateral staleness to
+    ///      a fixed, known window.
+    uint256 public constant MAX_CERTIFY_WINDOW = 14 days;
 
     /// @dev EXTCODEHASH of an EXISTING account with no code (EIP-1052). A funded
     ///      EOA hashes to this, not bytes32(0) — `certify` rejects both.
@@ -175,6 +209,8 @@ contract TierRegistry is Ownable2Step {
     error NoPendingCertification();
     error CertifyDelayNotElapsed();
     error CodehashChanged();
+    error CertificationExpired();
+    error NotSubmitter();
 
     /// @notice Set the WOOD token used for submitter bonds.
     /// @dev    Token-swap constraint: the bond token cannot change while ANY
@@ -184,6 +220,17 @@ contract TierRegistry is Ownable2Step {
     ///         Drain all bonds (demote → timelock → claim) before swapping.
     ///         Clearing the token to address(0) while the bond amount is still
     ///         armed is also rejected — zero the amount first.
+    ///
+    ///         `totalBondedWood != 0` is the ONLY guard here and it is
+    ///         deliberately silent about pending (unexecuted) certifications:
+    ///         a certification proposed while `wood` was TokenA no longer
+    ///         cares what this setter does before it executes, because
+    ///         `PendingCertification.bondToken` pins TokenA at proposal time
+    ///         (audit finding #1) and `certify` pulls against that pinned
+    ///         token, never against this live variable. Swapping `wood` here
+    ///         mid-window is therefore inert to any already-pending
+    ///         certification's bond economics by construction, not merely by
+    ///         accident of timing.
     function setWood(address wood_) external onlyOwner {
         if (totalBondedWood != 0) revert BondsOutstanding();
         if (wood_ == address(0) && submitterBondWood != 0) revert BondConfigUnset();
@@ -243,17 +290,33 @@ contract TierRegistry is Ownable2Step {
     ///         `certify` where the new bond is actually written) — so the
     ///         certify delay and the bond-release timelock can run
     ///         concurrently instead of serializing.
+    ///
+    ///         `expectedCodehash` (audit finding #6) makes the owner's
+    ///         off-chain review cryptographically asserted rather than
+    ///         blindly re-photographed: without it, this function reads
+    ///         `target.codehash` live at its OWN mining time, not at the
+    ///         time the owner actually reviewed the bytecode. A gap between
+    ///         review and mining (mempool, multisig confirmation latency)
+    ///         lets a third party — the target's own deployer, not this
+    ///         registry's owner — redeploy different bytecode at `target`
+    ///         before the proposal transaction lands, silently pinning the
+    ///         wrong codehash. Passing the hash the owner actually reviewed
+    ///         and reverting on drift closes that gap; `certify`'s own
+    ///         `CodehashChanged` check only re-verifies THIS snapshot, so it
+    ///         can never catch a snapshot that was wrong from the start.
     function proposeCertification(
         address target,
         bytes4 selector,
         uint8 tier,
         uint16 extractableBoundBps,
-        address submitter
+        address submitter,
+        bytes32 expectedCodehash
     ) external onlyOwner {
         if (tier >= TIER_ARBITRARY) revert InvalidTier();
         if (extractableBoundBps == 0 || extractableBoundBps >= FULL_NOTIONAL_BPS) revert BoundRequired();
         bytes32 ch = target.codehash;
         if (ch == bytes32(0) || ch == _EMPTY_CODEHASH) revert NotAContract();
+        if (ch != expectedCodehash) revert CodehashChanged();
         uint256 bondAmount = submitterBondWood;
         if (bondAmount != 0 && submitter == address(0)) revert ZeroAddressSubmitter();
         bytes32 k = key(target, selector);
@@ -267,30 +330,56 @@ contract TierRegistry is Ownable2Step {
             // amounts above type(uint96).max (BondTooLarge)
             // forge-lint: disable-next-line(unsafe-typecast)
             bondAmount: uint96(bondAmount),
+            bondToken: wood,
             codehash: ch
         });
         emit CertificationProposed(target, selector, tier, extractableBoundBps, submitter, bondAmount, ch, readyAt);
     }
 
     /// @notice Execute a pending certification once its delay has elapsed.
-    ///         PERMISSIONLESS — callable by anyone, not just the owner.
-    /// @dev    Safe to leave permissionless because every parameter was
-    ///         pinned and announced at `proposeCertification` time: an
-    ///         executing third party chooses only WHEN (after `readyAt`),
-    ///         never WHAT. The owner's remedies against an execution it no
-    ///         longer wants are `cancelCertification` before this runs, and
-    ///         instant `demote` after it lands.
+    ///         PERMISSIONLESS when no bond is at stake (`p.bondAmount == 0`);
+    ///         otherwise only the pinned `submitter` may trigger it.
+    /// @dev    Safe to leave permissionless in the no-bond case because every
+    ///         parameter was pinned and announced at `proposeCertification`
+    ///         time: an executing third party chooses only WHEN (after
+    ///         `readyAt`), never WHAT. The owner's remedies against an
+    ///         execution it no longer wants are `cancelCertification` before
+    ///         this runs, and instant `demote` after it lands.
+    ///
+    ///         When a bond IS pinned, execution is restricted to
+    ///         `msg.sender == p.submitter` (audit finding #3): `submitter`
+    ///         is an arbitrary, owner-chosen parameter with no signature or
+    ///         `msg.sender` tie-in at proposal time, so without this check a
+    ///         permissionless caller could pull the pinned bond off whatever
+    ///         STANDING ERC20 allowance that address already happens to have
+    ///         on this registry — never scoped to THIS certification — even
+    ///         though that address never saw or approved this specific
+    ///         grant. Restricting the pull-triggering call to the submitter
+    ///         turns that stale allowance into live, in-the-moment consent:
+    ///         the party whose funds are actually at stake is also the only
+    ///         one who can put them at stake. This is a deliberate narrowing
+    ///         of "anyone can trigger" to "the submitter can trigger" for
+    ///         bonded certifications only — an unbonded certification still
+    ///         has no funds to consent about, so it stays fully
+    ///         permissionless.
     ///
     ///         Reverts `NoPendingCertification` when no proposal is pending
     ///         for the key (`readyAt == 0`), `CertifyDelayNotElapsed` before
-    ///         `readyAt`, and `CodehashChanged` when the target's live
-    ///         EXTCODEHASH no longer matches the proposal-time snapshot — a
-    ///         code change mid-window voids the pending grant instead of
-    ///         certifying different bytecode under an old announcement. A
-    ///         voided pending is NOT deleted on a failed execution (reverts
-    ///         don't write state) and carries no expiry: it stays inert
-    ///         unless the owner `cancelCertification`s it or the bytecode
-    ///         returns to the announced hash.
+    ///         `readyAt`, `CertificationExpired` once `MAX_CERTIFY_WINDOW`
+    ///         has elapsed past `readyAt` (audit finding #5 — bounds how
+    ///         stale the pinned bond's real-world value may get before it can
+    ///         still post; an unbounded window lets a submitter wait out a
+    ///         price collapse on the bond token's liquidity before triggering
+    ///         with badly-stale collateral), `CodehashChanged` when the
+    ///         target's live EXTCODEHASH no longer matches the proposal-time
+    ///         snapshot — a code change mid-window voids the pending grant
+    ///         instead of certifying different bytecode under an old
+    ///         announcement — and `NotSubmitter` when a bond is pinned and
+    ///         `msg.sender != p.submitter`. A voided pending is NOT deleted
+    ///         on a failed execution (reverts don't write state): it stays
+    ///         inert unless the owner `cancelCertification`s it, the
+    ///         bytecode returns to the announced hash, or it ages past
+    ///         `MAX_CERTIFY_WINDOW` and becomes permanently unexecutable.
     ///
     ///         The bond-conflict guards live HERE, not in
     ///         `proposeCertification`, because bond state can change during
@@ -300,21 +389,26 @@ contract TierRegistry is Ownable2Step {
     ///         `BondActive` (still held under a live certification) or
     ///         `BondPendingRelease` (demoted, in its release timelock).
     ///
-    ///         The bond amount was PINNED at proposal time and is pulled
-    ///         only now (see the requirement's rationale in
-    ///         `proposeCertification`'s natspec): a permissionless executor
-    ///         must never be able to pull an amount the submitter did not
-    ///         approve against. If the pull fails (allowance revoked,
-    ///         balance insufficient), this call reverts entirely, the
-    ///         pending record is untouched, and a later `certify` succeeds
-    ///         once approval is restored — a submitter who withholds
-    ///         approval thereby withholds the certification.
+    ///         The bond amount AND bond token are both PINNED at proposal
+    ///         time (`p.bondAmount`, `p.bondToken` — audit finding #1) and
+    ///         pulled only now (see the requirement's rationale in
+    ///         `proposeCertification`'s natspec): reading the live `wood`
+    ///         state variable here instead of the pinned `p.bondToken` would
+    ///         let an ordinary, honest `setWood` token migration during the
+    ///         window silently repoint the pull at a token the submitter
+    ///         never approved for this certification. A submitter who
+    ///         withholds approval on the pinned token thereby withholds the
+    ///         certification: if the pull fails (allowance revoked, balance
+    ///         insufficient), this call reverts entirely and the pending
+    ///         record is untouched, retryable once approval is restored.
     function certify(address target, bytes4 selector) external {
         bytes32 k = key(target, selector);
         PendingCertification memory p = _pending[k];
         if (p.readyAt == 0) revert NoPendingCertification();
         if (block.timestamp < p.readyAt) revert CertifyDelayNotElapsed();
+        if (block.timestamp > p.readyAt + MAX_CERTIFY_WINDOW) revert CertificationExpired();
         if (target.codehash != p.codehash) revert CodehashChanged();
+        if (p.bondAmount != 0 && msg.sender != p.submitter) revert NotSubmitter();
         // ANY existing bond blocks (re-)certification — one bond per key, and
         // a live bond must never be overwritten (that would strand the old
         // submitter's WOOD in the registry with no claim path).
@@ -327,7 +421,7 @@ contract TierRegistry is Ownable2Step {
         if (p.bondAmount != 0) {
             _bonds[k] = SubmitterBond({submitter: p.submitter, amount: p.bondAmount, releasableAt: 0});
             totalBondedWood += p.bondAmount;
-            wood.safeTransferFrom(p.submitter, address(this), p.bondAmount);
+            p.bondToken.safeTransferFrom(p.submitter, address(this), p.bondAmount);
             emit SubmitterBondLocked(target, selector, p.submitter, p.bondAmount);
         }
         _configs[k] =
@@ -476,9 +570,23 @@ contract TierRegistry is Ownable2Step {
     ///      conservative direction of error — recovery is one owner
     ///      `setAdapterAllowed(adapter, true)` call — and it is pinned by
     ///      test. Do NOT "fix" this back to a per-selector allowlist.
+    ///
+    ///      ALSO clears a same-key PENDING certification, if one exists
+    ///      (audit finding #2): without this, a "renewal" proposed while a
+    ///      certification is still live would survive that certification's
+    ///      later for-cause demotion untouched, and would go on to execute
+    ///      at `readyAt` re-certifying the just-convicted target — possibly
+    ///      at looser terms than before the conviction. `demoteByChallenge`
+    ///      has no other lever to stop this, since `cancelCertification` is
+    ///      `onlyOwner`. Reuses the existing `CertificationCancelled` event
+    ///      so watchtowers see the same signal as an owner cancel.
     function _demote(address target, bytes4 selector) private {
         bytes32 k = key(target, selector);
         delete _configs[k];
+        if (_pending[k].readyAt != 0) {
+            delete _pending[k];
+            emit CertificationCancelled(target, selector);
+        }
         SubmitterBond storage b = _bonds[k];
         if (b.amount != 0 && b.releasableAt == 0) {
             uint64 releasableAt = uint64(block.timestamp + bondReleaseDelay);

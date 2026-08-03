@@ -148,7 +148,7 @@ contract TierEndToEndTest is Test {
     ///      `block.timestamp` local — this repo's optimizer CSEs it across
     ///      `vm.warp`), then execute.
     function _certifyNow(address target_, bytes4 selector_, uint8 tier_, uint16 bound_, address submitter_) internal {
-        tierRegistry.proposeCertification(target_, selector_, tier_, bound_, submitter_);
+        tierRegistry.proposeCertification(target_, selector_, tier_, bound_, submitter_, target_.codehash);
         vm.warp(vm.getBlockTimestamp() + tierRegistry.certifyDelay());
         tierRegistry.certify(target_, selector_);
     }

@@ -258,7 +258,7 @@ contract TokenCourtEndToEndTest is Test {
         // execute. Every later warp in this suite reads live state
         // (`vm.getBlockTimestamp() + X` or a value computed from
         // in-test-live `filedAt`/`referredAt`), so this setUp-time shift is safe.
-        tierRegistry.proposeCertification(address(adapter), adapter.poke.selector, 1, CERTIFIED_BOUND_BPS, address(0));
+        tierRegistry.proposeCertification(address(adapter), adapter.poke.selector, 1, CERTIFIED_BOUND_BPS, address(0), address(adapter).codehash);
         vm.warp(vm.getBlockTimestamp() + tierRegistry.certifyDelay());
         tierRegistry.certify(address(adapter), adapter.poke.selector);
 

@@ -253,3 +253,114 @@ New events: `CertificationProposed`, `CertificationCancelled`,
 None — parameter values (`3 days` default, `[1, 30] days` bounds) are
 proposed here and cheap to adjust at review time without touching the
 approach.
+
+## Audit Remediation (PR #156 Pashov review, 2026-08)
+
+A 12-agent security review of this change's diff (`src/TierRegistry.sol`)
+found 6 CONFIRMED findings, all remediated in this same change before merge.
+Full report: PR #156 comment. Summary and the design call made for each:
+
+### R1. Bond token pinned alongside amount (finding #1, confidence 92)
+
+`PendingCertification` gained a `bondToken` field (`IERC20`, packed into the
+same slot as `bondAmount` — 12 + 20 = 32 bytes, so total storage cost is
+unchanged at 3 slots). `proposeCertification` snapshots `wood` into it;
+`certify` pulls via `p.bondToken.safeTransferFrom(...)`, never the live
+`wood`. This was flagged as "theoretical/fail-safe" in D1 above — that
+framing undersold it: `setWood`'s only guard (`totalBondedWood != 0`) is
+blind to unexecuted pending certifications by construction, so an entirely
+ordinary, honest token migration during the window was a real, no-malice-
+required path to pulling the wrong token. D1's closing argument ("the pull
+in the new token has no approval and reverts") assumed no incidental
+approval exists on the new token — this repo's own fuzz test pattern
+(`approve(reg, type(uint256).max)`) shows that assumption doesn't hold in
+realistic UX. Pinning the token is strictly additive to D1's chosen design
+(bond pulled at execution, amount pinned at proposal) — it does not reopen
+any of D1's alternatives.
+
+### R2. Demotion cancels a same-key pending certification (finding #2, confidence 85)
+
+`_demote` — the single convergence point for `demote`, `demoteByChallenge`,
+and `poke` — now also deletes `_pending[k]` and emits `CertificationCancelled`
+when one exists. This was an oversight in the original D5/D8 storage design,
+not a considered rejection: nothing in the design discussion addressed what
+should happen to an in-flight announcement when the LIVE certification on the
+same key gets revoked for cause. Scoped strictly to the demoted key (verified
+by test) so it cannot interact with the existing "demotion unaffected by an
+UNRELATED pending" guarantee (3.8 in tasks.md), which remains true for every
+other key.
+
+### R3. Execution gated to the submitter when a bond is pinned (finding #3, confidence 85)
+
+`certify` now reverts `NotSubmitter` when `p.bondAmount != 0 && msg.sender !=
+p.submitter`. Design decision, made explicitly per the audit's own framing of
+this as a judgment call: the check is CONDITIONED on a non-zero pinned bond,
+not applied unconditionally. Unconditional `msg.sender == submitter` was
+considered and rejected — `submitter` legitimately defaults to `address(0)`
+whenever no bond is configured (the common case; see `test_certifyIsPermissionless`
+and the Plan A no-bond passthrough throughout this design), and nobody can
+ever be `msg.sender == address(0)` in a real transaction. An unconditional
+check would have silently made every unbonded certification permanently
+unexecutable, destroying the core "permissionless execution" property this
+whole change is built around for the majority of certifications. Conditioning
+on `bondAmount != 0` targets the check at exactly the harm the audit
+identified (an unconsented fund pull) while leaving the no-funds-at-stake
+case exactly as permissionless as D2 designed it to be. This is the one
+finding where "use your judgment" in the remediation brief was exercised to
+narrow the audit's literal suggested diff rather than apply it verbatim; the
+narrowing is documented here and in the PR description for re-audit.
+
+### R4. Broadened codehash-check governance guidance (finding #4, confidence 80)
+
+Process/documentation fix only, per the audit's own recommended option A: the
+contract-level natspec's existing proxy-pattern warning is broadened to state
+explicitly that ANY target with post-deployment-settable state affecting fund
+routing — not just recognized proxy shapes — must not be certified at tier
+0/1. No on-chain change; option B (a bytecode-hash-only certifiable-target
+allowlist independent of any specific deployed instance) is noted as a
+larger, out-of-scope follow-up rather than implemented here.
+
+### R5. Execution deadline added (finding #5, confidence 80)
+
+New constant `MAX_CERTIFY_WINDOW = 14 days`; `certify` reverts
+`CertificationExpired` once `block.timestamp > p.readyAt + MAX_CERTIFY_WINDOW`.
+Chosen as a plain, non-owner-configurable constant rather than a
+`setCertifyWindow`-style setter with its own min/max bounds (unlike
+`certifyDelay`): a configurable window would let the owner shorten it and
+expire someone else's pending certification early, which is a strictly worse
+failure mode than a fixed, publicly-known bound. On the audit's secondary
+suggestion (also requiring `p.bondAmount >= submitterBondWood` live at
+execution): rejected as redundant defense-in-depth given R3 — once execution
+is gated to the submitter whenever a bond is pinned, a stale bond amount is a
+risk the submitter alone bears and alone controls (they choose when to
+trigger, up to the new expiry), not a risk imposed on them by a third party.
+The expiry window alone bounds the blast radius of that self-risk to a fixed,
+known interval; adding a live-repricing check would reopen the D1 concern
+("owner repricing `submitterBondWood` mid-window changes what execution
+pulls") for no corresponding safety gain now that only the submitter can
+pull.
+
+### R6. `expectedCodehash` TOCTOU guard on proposal (finding #6, confidence 75)
+
+`proposeCertification` gained a required `expectedCodehash` parameter;
+reverts the existing `CodehashChanged` error when the target's live codehash
+at propose-time execution doesn't match it. This is the mirror image of the
+existing `certify`-time codehash check (D6): that one re-verifies a snapshot
+taken at propose time against execution time; this one asserts the snapshot
+ITSELF, at propose time, against what the owner actually reviewed off-chain,
+closing the one gap `certify`'s check structurally cannot reach (a wrong
+snapshot re-verifies as "unchanged" forever). No new error type — reuses
+`CodehashChanged`, since the failure mode ("live codehash isn't what was
+expected") is identical in kind to the execution-time check, just at a
+different point in the lifecycle.
+
+### Migration note
+
+All 72+ existing `proposeCertification` call sites across 9 test files gained
+a sixth argument (the live codehash at each call site, since nothing in the
+test suite changes bytecode between review and mining — the TOCTOU gap R6
+closes doesn't exist in a synchronous test). Bonded-certification call sites
+in `test/TierRegistry.t.sol` and `test/TierRegistryCertificationTimelock.t.sol`
+(the only two suites that configure `submitterBondWood`) gained
+`vm.prank(submitter)` immediately before their `certify` calls per R3; the
+seven suites that never configure a bond needed no `certify`-side changes.

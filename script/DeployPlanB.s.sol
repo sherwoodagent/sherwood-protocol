@@ -838,9 +838,13 @@ contract DeployPlanB is Script {
         console.log("MANUAL NEXT: registry UUPS upgrade.");
         console.log("MANUAL NEXT: TierRegistry redeploy + re-apply the live certification set.");
         console.log("  Sequencing (issue #45 two-step grant): deploy the new registry, call");
-        console.log("  proposeCertification for every (target, selector, tier, bound, submitter)");
-        console.log("  in the OLD registry's live set, wait certifyDelay, then call certify on");
-        console.log("  each (anyone may execute -- it is permissionless once the delay elapses).");
+        console.log("  proposeCertification(target, selector, tier, bound, submitter,");
+        console.log("  expectedCodehash) for every pair in the OLD registry's live set (pass the");
+        console.log("  target's current codehash as expectedCodehash -- PR #156 finding #6), wait");
+        console.log("  certifyDelay, then call certify on each. Execution is permissionless once");
+        console.log("  the delay elapses UNLESS a submitter bond is pinned, in which case only");
+        console.log("  that submitter may call certify (finding #3), and must do so before");
+        console.log("  MAX_CERTIFY_WINDOW elapses past readyAt (finding #5).");
         console.log("  Re-apply setAdapterAllowed and setAuthorizedDemoter on the NEW registry");
         console.log("  before the switch. Only once the new registry is fully populated, call");
         console.log("  factory.setTierRegistry(new) so no governor ever reads an empty registry");

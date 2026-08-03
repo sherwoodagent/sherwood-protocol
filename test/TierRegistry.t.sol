@@ -22,11 +22,18 @@ contract TierRegistryTest is Test {
     ///      — propose as owner, warp past the pinned `readyAt`, execute. Uses
     ///      `vm.getBlockTimestamp()` (never a cached `block.timestamp` local)
     ///      because this repo's optimizer CSEs `block.timestamp` across
-    ///      `vm.warp`.
+    ///      `vm.warp`. Pranks the final `certify` call as `submitter_` when
+    ///      one is set (audit finding #3: execution is submitter-gated once a
+    ///      bond is pinned) — every caller of this helper only ever pins a
+    ///      bond when `submitter_ != address(0)`, so this exactly mirrors
+    ///      each test's intent without changing any assertions.
     function _certifyNow(address target_, bytes4 selector_, uint8 tier_, uint16 bound_, address submitter_) internal {
         vm.prank(owner);
-        reg.proposeCertification(target_, selector_, tier_, bound_, submitter_);
+        reg.proposeCertification(target_, selector_, tier_, bound_, submitter_, target_.codehash);
         vm.warp(vm.getBlockTimestamp() + reg.certifyDelay());
+        if (submitter_ != address(0)) {
+            vm.prank(submitter_);
+        }
         reg.certify(target_, selector_);
     }
 
@@ -53,19 +60,19 @@ contract TierRegistryTest is Test {
     function test_proposeCertificationRevertsForTier2() public {
         vm.prank(owner);
         vm.expectRevert(TierRegistry.InvalidTier.selector);
-        reg.proposeCertification(target, bytes4(0x12345678), 2, 50, address(0));
+        reg.proposeCertification(target, bytes4(0x12345678), 2, 50, address(0), target.codehash);
     }
 
     function test_proposeCertificationRevertsForZeroBound() public {
         vm.prank(owner);
         vm.expectRevert(TierRegistry.BoundRequired.selector);
-        reg.proposeCertification(target, bytes4(0x12345678), 0, 0, address(0));
+        reg.proposeCertification(target, bytes4(0x12345678), 0, 0, address(0), target.codehash);
     }
 
     function test_proposeCertificationRevertsForFullNotionalBound() public {
         vm.prank(owner);
         vm.expectRevert(TierRegistry.BoundRequired.selector);
-        reg.proposeCertification(target, bytes4(0x12345678), 0, 10_000, address(0));
+        reg.proposeCertification(target, bytes4(0x12345678), 0, 10_000, address(0), target.codehash);
     }
 
     function test_certifyAcceptsBoundaryValues() public {
@@ -82,7 +89,7 @@ contract TierRegistryTest is Test {
     function test_certifyEmitsEventWithCodehash() public {
         bytes32 expectedHash = target.codehash;
         vm.prank(owner);
-        reg.proposeCertification(target, bytes4(0x12345678), 1, 250, address(0));
+        reg.proposeCertification(target, bytes4(0x12345678), 1, 250, address(0), target.codehash);
         vm.warp(vm.getBlockTimestamp() + reg.certifyDelay());
         vm.expectEmit(true, true, false, true);
         emit TierRegistry.TierCertified(target, bytes4(0x12345678), 1, 250, expectedHash);
@@ -100,7 +107,7 @@ contract TierRegistryTest is Test {
     function test_proposeCertificationRevertsForEOATarget() public {
         vm.prank(owner);
         vm.expectRevert(TierRegistry.NotAContract.selector);
-        reg.proposeCertification(makeAddr("eoa"), bytes4(0x12345678), 0, 50, address(0));
+        reg.proposeCertification(makeAddr("eoa"), bytes4(0x12345678), 0, 50, address(0), makeAddr("eoa").codehash);
     }
 
     function test_proposeCertificationRevertsForFundedEOATarget() public {
@@ -109,17 +116,17 @@ contract TierRegistryTest is Test {
         vm.deal(eoa, 1 ether);
         vm.prank(owner);
         vm.expectRevert(TierRegistry.NotAContract.selector);
-        reg.proposeCertification(eoa, bytes4(0x12345678), 0, 50, address(0));
+        reg.proposeCertification(eoa, bytes4(0x12345678), 0, 50, address(0), eoa.codehash);
     }
 
     function test_proposeCertificationOnlyOwner() public {
         vm.expectRevert(); // OwnableUnauthorizedAccount
-        reg.proposeCertification(target, bytes4(0x12345678), 0, 50, address(0));
+        reg.proposeCertification(target, bytes4(0x12345678), 0, 50, address(0), target.codehash);
     }
 
     function test_certifyIsPermissionless() public {
         vm.prank(owner);
-        reg.proposeCertification(target, bytes4(0x12345678), 0, 50, address(0));
+        reg.proposeCertification(target, bytes4(0x12345678), 0, 50, address(0), target.codehash);
         vm.warp(vm.getBlockTimestamp() + reg.certifyDelay());
         // anyone, not the owner, executes
         vm.prank(makeAddr("rando"));
@@ -202,11 +209,11 @@ contract TierRegistryTest is Test {
         // pending owner has no power until acceptance
         vm.prank(newOwner);
         vm.expectRevert(); // OwnableUnauthorizedAccount
-        reg.proposeCertification(target, bytes4(0x12345678), 0, 50, address(0));
+        reg.proposeCertification(target, bytes4(0x12345678), 0, 50, address(0), target.codehash);
         vm.prank(newOwner);
         reg.acceptOwnership();
         vm.prank(newOwner);
-        reg.proposeCertification(target, bytes4(0x12345678), 0, 50, address(0));
+        reg.proposeCertification(target, bytes4(0x12345678), 0, 50, address(0), target.codehash);
         vm.warp(vm.getBlockTimestamp() + reg.certifyDelay());
         reg.certify(target, bytes4(0x12345678));
         (uint8 tier,) = reg.tierOf(target, bytes4(0x12345678));
@@ -267,9 +274,13 @@ contract TierRegistryTest is Test {
         // proposing is NOT bond-gated (D5): the announcement may run while the
         // old bond is still releasing.
         vm.prank(owner);
-        reg.proposeCertification(target, bytes4(0x44444444), 1, 500, submitter);
+        reg.proposeCertification(target, bytes4(0x44444444), 1, 500, submitter, target.codehash);
         vm.warp(vm.getBlockTimestamp() + reg.certifyDelay());
         vm.expectRevert(TierRegistry.BondPendingRelease.selector);
+        // pranked as the pinned submitter so the revert exercised is
+        // genuinely `BondPendingRelease`, not `NotSubmitter` (finding #3)
+        // masking it.
+        vm.prank(submitter);
         reg.certify(target, bytes4(0x44444444));
     }
 
@@ -285,16 +296,20 @@ contract TierRegistryTest is Test {
         // re-propose + execute with a DIFFERENT submitter: reverts at
         // execution, must not overwrite the live bond
         vm.prank(owner);
-        reg.proposeCertification(target, bytes4(0x55555555), 0, 100, otherSubmitter);
+        reg.proposeCertification(target, bytes4(0x55555555), 0, 100, otherSubmitter, target.codehash);
         vm.warp(vm.getBlockTimestamp() + reg.certifyDelay());
         vm.expectRevert(TierRegistry.BondActive.selector);
+        // pranked as the pinned (new) submitter so the revert exercised is
+        // genuinely `BondActive`, not `NotSubmitter` (finding #3) masking it.
+        vm.prank(otherSubmitter);
         reg.certify(target, bytes4(0x55555555));
 
         // re-propose + execute with the SAME submitter: also reverts
         vm.prank(owner);
-        reg.proposeCertification(target, bytes4(0x55555555), 0, 100, submitter);
+        reg.proposeCertification(target, bytes4(0x55555555), 0, 100, submitter, target.codehash);
         vm.warp(vm.getBlockTimestamp() + reg.certifyDelay());
         vm.expectRevert(TierRegistry.BondActive.selector);
+        vm.prank(submitter);
         reg.certify(target, bytes4(0x55555555));
 
         // old bond record intact: registry still holds exactly one bond, and the
@@ -371,7 +386,7 @@ contract TierRegistryTest is Test {
         _bondSetup();
         vm.prank(owner);
         vm.expectRevert(TierRegistry.ZeroAddressSubmitter.selector);
-        reg.proposeCertification(target, bytes4(0x99999999), 1, 500, address(0));
+        reg.proposeCertification(target, bytes4(0x99999999), 1, 500, address(0), target.codehash);
     }
 
     function test_certify_noApprovalReverts() public {
@@ -379,19 +394,25 @@ contract TierRegistryTest is Test {
         address broke = makeAddr("noApproval");
         wood.mint(broke, 100_000e18); // funded but never approved the registry
         vm.prank(owner);
-        reg.proposeCertification(target, bytes4(0xaaaaaaaa), 1, 500, broke);
+        reg.proposeCertification(target, bytes4(0xaaaaaaaa), 1, 500, broke, target.codehash);
         vm.warp(vm.getBlockTimestamp() + reg.certifyDelay());
         vm.expectRevert();
+        // pranked as the pinned submitter (finding #3 gates execution to
+        // msg.sender == p.submitter whenever a bond is pinned) so the revert
+        // exercised here is genuinely the lapsed-allowance failure, not
+        // `NotSubmitter` masking it.
+        vm.prank(broke);
         reg.certify(target, bytes4(0xaaaaaaaa));
     }
 
     function test_bondEventsEmitted() public {
         (, address submitter) = _bondSetup();
         vm.prank(owner);
-        reg.proposeCertification(target, bytes4(0xbbbbbbbb), 1, 500, submitter);
+        reg.proposeCertification(target, bytes4(0xbbbbbbbb), 1, 500, submitter, target.codehash);
         vm.warp(vm.getBlockTimestamp() + reg.certifyDelay());
         vm.expectEmit(true, true, true, true);
         emit TierRegistry.SubmitterBondLocked(target, bytes4(0xbbbbbbbb), submitter, 10_000e18);
+        vm.prank(submitter); // finding #3: execution is submitter-gated once a bond is pinned
         reg.certify(target, bytes4(0xbbbbbbbb));
         vm.prank(owner);
         vm.expectEmit(true, true, true, true);
@@ -505,7 +526,7 @@ contract TierRegistryTest is Test {
         reg.setAuthorizedDemoter(demoter);
         vm.prank(demoter);
         vm.expectRevert();
-        reg.proposeCertification(target, bytes4(0x88888888), 1, 500, address(0));
+        reg.proposeCertification(target, bytes4(0x88888888), 1, 500, address(0), target.codehash);
     }
 
     // ── Issue #77: demotion auto-clears the adapter allowlist ──

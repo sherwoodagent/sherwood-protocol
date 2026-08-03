@@ -34,7 +34,7 @@ contract TierRegistryCertificationTimelockTest is Test {
         vm.expectEmit(true, true, false, true);
         emit TierRegistry.CertificationProposed(target, SEL, 0, 50, address(0), 0, expectedHash, expectedReadyAt);
         vm.prank(owner);
-        reg.proposeCertification(target, SEL, 0, 50, address(0));
+        reg.proposeCertification(target, SEL, 0, 50, address(0), target.codehash);
 
         // announcement is not certification
         (uint8 tier, uint16 bound) = reg.tierOf(target, SEL);
@@ -52,33 +52,33 @@ contract TierRegistryCertificationTimelockTest is Test {
 
     function test_propose_onlyOwner() public {
         vm.expectRevert(); // OwnableUnauthorizedAccount
-        reg.proposeCertification(target, SEL, 0, 50, address(0));
+        reg.proposeCertification(target, SEL, 0, 50, address(0), target.codehash);
     }
 
     function test_propose_revertsForTier2() public {
         vm.prank(owner);
         vm.expectRevert(TierRegistry.InvalidTier.selector);
-        reg.proposeCertification(target, SEL, 2, 50, address(0));
+        reg.proposeCertification(target, SEL, 2, 50, address(0), target.codehash);
     }
 
     function test_propose_revertsForZeroOrFullNotionalBound() public {
         vm.startPrank(owner);
         vm.expectRevert(TierRegistry.BoundRequired.selector);
-        reg.proposeCertification(target, SEL, 0, 0, address(0));
+        reg.proposeCertification(target, SEL, 0, 0, address(0), target.codehash);
         vm.expectRevert(TierRegistry.BoundRequired.selector);
-        reg.proposeCertification(target, SEL, 0, 10_000, address(0));
+        reg.proposeCertification(target, SEL, 0, 10_000, address(0), target.codehash);
         vm.stopPrank();
     }
 
     function test_propose_revertsForNonContractTarget() public {
         vm.startPrank(owner);
         vm.expectRevert(TierRegistry.NotAContract.selector);
-        reg.proposeCertification(makeAddr("eoa"), SEL, 0, 50, address(0));
+        reg.proposeCertification(makeAddr("eoa"), SEL, 0, 50, address(0), makeAddr("eoa").codehash);
 
         address fundedEoa = makeAddr("fundedEoa");
         vm.deal(fundedEoa, 1 ether);
         vm.expectRevert(TierRegistry.NotAContract.selector);
-        reg.proposeCertification(fundedEoa, SEL, 0, 50, address(0));
+        reg.proposeCertification(fundedEoa, SEL, 0, 50, address(0), fundedEoa.codehash);
         vm.stopPrank();
     }
 
@@ -88,19 +88,19 @@ contract TierRegistryCertificationTimelockTest is Test {
         reg.setWood(address(wood));
         reg.setSubmitterBondWood(10_000e18);
         vm.expectRevert(TierRegistry.ZeroAddressSubmitter.selector);
-        reg.proposeCertification(target, SEL, 0, 50, address(0));
+        reg.proposeCertification(target, SEL, 0, 50, address(0), target.codehash);
         vm.stopPrank();
     }
 
     function test_reproposal_overwritesEverythingAndRestartsTheClock() public {
         vm.prank(owner);
-        reg.proposeCertification(target, SEL, 0, 50, address(0));
+        reg.proposeCertification(target, SEL, 0, 50, address(0), target.codehash);
         TierRegistry.PendingCertification memory first = reg.pendingCertificationOf(target, SEL);
 
         vm.warp(vm.getBlockTimestamp() + 1 days);
         address submitter = makeAddr("submitter");
         vm.prank(owner);
-        reg.proposeCertification(target, SEL, 1, 900, submitter);
+        reg.proposeCertification(target, SEL, 1, 900, submitter, target.codehash);
         TierRegistry.PendingCertification memory second = reg.pendingCertificationOf(target, SEL);
 
         assertTrue(second.readyAt > first.readyAt, "re-announcement restarts the clock, never shortens it");
@@ -113,7 +113,7 @@ contract TierRegistryCertificationTimelockTest is Test {
 
     function test_certify_revertsBeforeReadyAt() public {
         vm.prank(owner);
-        reg.proposeCertification(target, SEL, 0, 50, address(0));
+        reg.proposeCertification(target, SEL, 0, 50, address(0), target.codehash);
         vm.warp(vm.getBlockTimestamp() + reg.certifyDelay() - 1);
         vm.expectRevert(TierRegistry.CertifyDelayNotElapsed.selector);
         reg.certify(target, SEL);
@@ -126,7 +126,7 @@ contract TierRegistryCertificationTimelockTest is Test {
 
     function test_certify_succeedsExactlyAtReadyAtByThirdParty() public {
         vm.prank(owner);
-        reg.proposeCertification(target, SEL, 0, 50, address(0));
+        reg.proposeCertification(target, SEL, 0, 50, address(0), target.codehash);
         TierRegistry.PendingCertification memory p = reg.pendingCertificationOf(target, SEL);
         vm.warp(p.readyAt); // exactly at readyAt, not one second later
 
@@ -145,7 +145,7 @@ contract TierRegistryCertificationTimelockTest is Test {
 
     function test_certify_codehashChangeMidWindow_voidsAndIsRecoverable() public {
         vm.prank(owner);
-        reg.proposeCertification(target, SEL, 0, 50, address(0));
+        reg.proposeCertification(target, SEL, 0, 50, address(0), target.codehash);
         vm.warp(vm.getBlockTimestamp() + reg.certifyDelay());
 
         // metamorphic redeploy: bytecode changes at the same address
@@ -163,7 +163,7 @@ contract TierRegistryCertificationTimelockTest is Test {
 
         // re-proposal against the NEW code then succeeds cleanly
         vm.prank(owner);
-        reg.proposeCertification(target, SEL, 1, 200, address(0));
+        reg.proposeCertification(target, SEL, 1, 200, address(0), target.codehash);
         vm.warp(vm.getBlockTimestamp() + reg.certifyDelay());
         reg.certify(target, SEL);
         (uint8 tierAfter, uint16 boundAfter) = reg.tierOf(target, SEL);
@@ -175,7 +175,7 @@ contract TierRegistryCertificationTimelockTest is Test {
 
     function test_cancel_clearsPending_subsequentCertifyReverts() public {
         vm.prank(owner);
-        reg.proposeCertification(target, SEL, 0, 50, address(0));
+        reg.proposeCertification(target, SEL, 0, 50, address(0), target.codehash);
 
         vm.prank(owner);
         vm.expectEmit(true, true, false, true);
@@ -200,14 +200,15 @@ contract TierRegistryCertificationTimelockTest is Test {
         wood.approve(address(reg), type(uint256).max);
 
         vm.prank(owner);
-        reg.proposeCertification(target, SEL, 0, 50, submitter);
+        reg.proposeCertification(target, SEL, 0, 50, submitter, target.codehash);
         vm.warp(vm.getBlockTimestamp() + reg.certifyDelay());
+        vm.prank(submitter); // finding #3: execution is submitter-gated once a bond is pinned
         reg.certify(target, SEL);
         (uint8 tierBefore, uint16 boundBefore) = reg.tierOf(target, SEL);
 
         // a replacement is proposed, then cancelled
         vm.prank(owner);
-        reg.proposeCertification(target, SEL, 1, 900, submitter);
+        reg.proposeCertification(target, SEL, 1, 900, submitter, target.codehash);
         vm.prank(owner);
         reg.cancelCertification(target, SEL);
 
@@ -221,7 +222,7 @@ contract TierRegistryCertificationTimelockTest is Test {
 
     function test_cancel_onlyOwner() public {
         vm.prank(owner);
-        reg.proposeCertification(target, SEL, 0, 50, address(0));
+        reg.proposeCertification(target, SEL, 0, 50, address(0), target.codehash);
         vm.expectRevert(); // OwnableUnauthorizedAccount
         reg.cancelCertification(target, SEL);
     }
@@ -253,7 +254,7 @@ contract TierRegistryCertificationTimelockTest is Test {
 
     function test_setCertifyDelay_doesNotMoveAnAlreadyPinnedReadyAt() public {
         vm.prank(owner);
-        reg.proposeCertification(target, SEL, 0, 50, address(0));
+        reg.proposeCertification(target, SEL, 0, 50, address(0), target.codehash);
         TierRegistry.PendingCertification memory p = reg.pendingCertificationOf(target, SEL);
         uint64 originalReadyAt = p.readyAt;
 
@@ -297,11 +298,12 @@ contract TierRegistryCertificationTimelockTest is Test {
         (ERC20Mock wood, address submitter) = _bondSetup();
 
         vm.prank(owner);
-        reg.proposeCertification(target, SEL, 0, 50, submitter);
+        reg.proposeCertification(target, SEL, 0, 50, submitter, target.codehash);
         assertEq(wood.balanceOf(address(reg)), 0, "no WOOD moves at propose time");
         assertEq(reg.totalBondedWood(), 0);
 
         vm.warp(vm.getBlockTimestamp() + reg.certifyDelay());
+        vm.prank(submitter); // finding #3: execution is submitter-gated once a bond is pinned
         reg.certify(target, SEL);
         assertEq(wood.balanceOf(address(reg)), 10_000e18, "pulled exactly at execution");
         assertEq(reg.totalBondedWood(), 10_000e18);
@@ -310,13 +312,14 @@ contract TierRegistryCertificationTimelockTest is Test {
     function test_bond_configChangeMidWindow_doesNotRepriceThePull() public {
         (ERC20Mock wood, address submitter) = _bondSetup();
         vm.prank(owner);
-        reg.proposeCertification(target, SEL, 0, 50, submitter);
+        reg.proposeCertification(target, SEL, 0, 50, submitter, target.codehash);
 
         // owner raises the live bond config after the proposal pinned 10_000e18
         vm.prank(owner);
         reg.setSubmitterBondWood(50_000e18);
 
         vm.warp(vm.getBlockTimestamp() + reg.certifyDelay());
+        vm.prank(submitter); // finding #3: execution is submitter-gated once a bond is pinned
         reg.certify(target, SEL);
         assertEq(wood.balanceOf(address(reg)), 10_000e18, "pinned amount, not the live (raised) config");
     }
@@ -324,7 +327,7 @@ contract TierRegistryCertificationTimelockTest is Test {
     function test_bond_zeroPinnedAmountSkipsThePull_evenAfterConfigRaised() public {
         // propose while submitterBondWood == 0
         vm.prank(owner);
-        reg.proposeCertification(target, SEL, 0, 50, address(0));
+        reg.proposeCertification(target, SEL, 0, 50, address(0), target.codehash);
 
         // owner arms a bond config AFTER the proposal already pinned zero
         ERC20Mock wood = new ERC20Mock();
@@ -344,13 +347,17 @@ contract TierRegistryCertificationTimelockTest is Test {
     function test_bond_lapsedApproval_revertsRetryably() public {
         (ERC20Mock wood, address submitter) = _bondSetup();
         vm.prank(owner);
-        reg.proposeCertification(target, SEL, 0, 50, submitter);
+        reg.proposeCertification(target, SEL, 0, 50, submitter, target.codehash);
         vm.warp(vm.getBlockTimestamp() + reg.certifyDelay());
 
         vm.prank(submitter);
         wood.approve(address(reg), 0); // revoke approval during the window
 
         vm.expectRevert();
+        // pranked as the pinned submitter so the revert exercised here is
+        // genuinely the lapsed-allowance failure, not `NotSubmitter`
+        // (finding #3) masking it.
+        vm.prank(submitter);
         reg.certify(target, SEL);
 
         // pending record is untouched, and retry succeeds once approval is restored
@@ -359,6 +366,7 @@ contract TierRegistryCertificationTimelockTest is Test {
 
         vm.prank(submitter);
         wood.approve(address(reg), type(uint256).max);
+        vm.prank(submitter);
         reg.certify(target, SEL);
         assertEq(wood.balanceOf(address(reg)), 10_000e18);
     }
@@ -368,15 +376,17 @@ contract TierRegistryCertificationTimelockTest is Test {
     function test_certify_revertsBondActive_overALiveBond() public {
         (, address submitter) = _bondSetup();
         vm.prank(owner);
-        reg.proposeCertification(target, SEL, 1, 500, submitter);
+        reg.proposeCertification(target, SEL, 1, 500, submitter, target.codehash);
         vm.warp(vm.getBlockTimestamp() + reg.certifyDelay());
+        vm.prank(submitter); // finding #3: execution is submitter-gated once a bond is pinned
         reg.certify(target, SEL);
 
         // a replacement proposal is legal (not bond-gated) but execution is refused
         vm.prank(owner);
-        reg.proposeCertification(target, SEL, 0, 100, submitter);
+        reg.proposeCertification(target, SEL, 0, 100, submitter, target.codehash);
         vm.warp(vm.getBlockTimestamp() + reg.certifyDelay());
         vm.expectRevert(TierRegistry.BondActive.selector);
+        vm.prank(submitter);
         reg.certify(target, SEL);
     }
 
@@ -387,8 +397,9 @@ contract TierRegistryCertificationTimelockTest is Test {
         vm.stopPrank();
 
         vm.prank(owner);
-        reg.proposeCertification(target, SEL, 1, 500, submitter);
+        reg.proposeCertification(target, SEL, 1, 500, submitter, target.codehash);
         vm.warp(vm.getBlockTimestamp() + reg.certifyDelay());
+        vm.prank(submitter); // finding #3: execution is submitter-gated once a bond is pinned
         reg.certify(target, SEL);
 
         vm.prank(owner);
@@ -397,15 +408,17 @@ contract TierRegistryCertificationTimelockTest is Test {
         // propose the replacement while the old bond is still releasing —
         // legal per D5, the two timelocks run concurrently
         vm.prank(owner);
-        reg.proposeCertification(target, SEL, 0, 100, submitter);
+        reg.proposeCertification(target, SEL, 0, 100, submitter, target.codehash);
         vm.warp(vm.getBlockTimestamp() + reg.certifyDelay());
 
         vm.expectRevert(TierRegistry.BondPendingRelease.selector);
+        vm.prank(submitter);
         reg.certify(target, SEL);
 
         // release delay (1 day) < certifyDelay (>= 1 day, default 3 days)
         // already elapsed by the warp above, so the claim now succeeds
         reg.claimSubmitterBond(target, SEL);
+        vm.prank(submitter);
         reg.certify(target, SEL);
         (uint8 tier,) = reg.tierOf(target, SEL);
         assertEq(tier, 0);
@@ -419,13 +432,13 @@ contract TierRegistryCertificationTimelockTest is Test {
         address target2 = address(new TierRegistry(owner));
         bytes4 sel2 = bytes4(0x22222222);
         vm.prank(owner);
-        reg.proposeCertification(target2, sel2, 1, 100, address(0));
+        reg.proposeCertification(target2, sel2, 1, 100, address(0), target2.codehash);
         vm.warp(vm.getBlockTimestamp() + reg.certifyDelay());
         reg.certify(target2, sel2);
 
         // a pending (but not yet executed) certification exists for `target`/SEL
         vm.prank(owner);
-        reg.proposeCertification(target, SEL, 0, 50, address(0));
+        reg.proposeCertification(target, SEL, 0, 50, address(0), target.codehash);
         TierRegistry.PendingCertification memory pendingBefore = reg.pendingCertificationOf(target, SEL);
 
         // owner demote on target2 still runs instantly, unaffected by the
@@ -443,13 +456,13 @@ contract TierRegistryCertificationTimelockTest is Test {
 
     function test_poke_stillPermissionlessAndInstant_whileAnUnrelatedCertificationIsPending() public {
         vm.prank(owner);
-        reg.proposeCertification(target, SEL, 0, 50, address(0));
+        reg.proposeCertification(target, SEL, 0, 50, address(0), target.codehash);
         vm.warp(vm.getBlockTimestamp() + reg.certifyDelay());
         reg.certify(target, SEL);
 
         // a pending replacement is announced but not yet ready
         vm.prank(owner);
-        reg.proposeCertification(target, SEL, 1, 900, address(0));
+        reg.proposeCertification(target, SEL, 1, 900, address(0), target.codehash);
 
         vm.etch(target, hex"6001600101");
         vm.prank(makeAddr("rando"));
@@ -460,5 +473,304 @@ contract TierRegistryCertificationTimelockTest is Test {
         // the pending replacement itself is untouched by the poke
         TierRegistry.PendingCertification memory p = reg.pendingCertificationOf(target, SEL);
         assertTrue(p.readyAt != 0);
+    }
+
+    // ── Audit remediation (PR #156 Pashov review) ──
+
+    /// @notice Finding #1 [92]: the bond token is pinned at proposal time, so
+    ///         an ordinary `setWood` migration during the certify-delay
+    ///         window can never make `certify` pull the pinned AMOUNT
+    ///         denominated in a token the submitter never approved for this
+    ///         certification. Mirrors the audit's own proof: propose while
+    ///         `wood == TokenA`, swap to TokenB mid-window (legal, since
+    ///         `totalBondedWood == 0` before execution), then certify must
+    ///         pull TokenA from the submitter — never TokenB — even though
+    ///         TokenB is now the live `wood`.
+    function test_finding1_bondTokenPinnedSurvivesSetWoodMidWindow() public {
+        ERC20Mock tokenA = new ERC20Mock();
+        ERC20Mock tokenB = new ERC20Mock();
+        address submitter = makeAddr("submitter");
+        tokenA.mint(submitter, 100_000e18);
+        tokenB.mint(submitter, 100_000e18);
+
+        vm.startPrank(owner);
+        reg.setWood(address(tokenA));
+        reg.setSubmitterBondWood(10_000e18);
+        vm.stopPrank();
+        vm.prank(submitter);
+        tokenA.approve(address(reg), type(uint256).max);
+        // the submitter never approves TokenB — proving the exploit path
+        // (pulling from a stale TokenB allowance) is unavailable even if
+        // attempted, and the honest path (pulling TokenA) still works.
+
+        vm.prank(owner);
+        reg.proposeCertification(target, SEL, 0, 50, submitter, target.codehash);
+        TierRegistry.PendingCertification memory p = reg.pendingCertificationOf(target, SEL);
+        assertEq(address(p.bondToken), address(tokenA), "bondToken pinned to the token live at proposal time");
+
+        // ordinary, honest token migration mid-window: legal because
+        // totalBondedWood == 0 (nothing has executed yet)
+        vm.prank(owner);
+        reg.setWood(address(tokenB));
+        assertEq(address(reg.wood()), address(tokenB), "sanity: wood really did move to TokenB");
+
+        vm.warp(vm.getBlockTimestamp() + reg.certifyDelay());
+        vm.prank(submitter);
+        reg.certify(target, SEL);
+
+        assertEq(tokenA.balanceOf(address(reg)), 10_000e18, "pulled the PINNED token (A), not live wood (B)");
+        assertEq(tokenB.balanceOf(address(reg)), 0, "TokenB untouched: certify never reads live wood for the pull");
+        TierRegistry.SubmitterBond memory b = reg.bondOf(target, SEL);
+        assertEq(b.amount, 10_000e18);
+    }
+
+    /// @notice Finding #2 [85]: a same-key pending certification must not
+    ///         survive that key's for-cause demotion. Mirrors the audit's
+    ///         proof: a live tier-1 certification gets a "renewal" proposed
+    ///         at looser tier-0 terms, then `demoteByChallenge` convicts the
+    ///         LIVE certification — the pending renewal must be cancelled by
+    ///         the same `_demote`, not left to execute later and silently
+    ///         override the conviction.
+    function test_finding2_demoteByChallenge_cancelsPendingRenewal() public {
+        address demoter = makeAddr("demoter");
+        vm.prank(owner);
+        reg.setAuthorizedDemoter(demoter);
+
+        // live tier-1 certification
+        vm.prank(owner);
+        reg.proposeCertification(target, SEL, 1, 500, address(0), target.codehash);
+        vm.warp(vm.getBlockTimestamp() + reg.certifyDelay());
+        reg.certify(target, SEL);
+        (uint8 tierBefore,) = reg.tierOf(target, SEL);
+        assertEq(tierBefore, 1);
+
+        // a "renewal" is proposed at looser tier-0 terms while the tier-1
+        // certification is still live
+        vm.prank(owner);
+        reg.proposeCertification(target, SEL, 0, 9_000, address(0), target.codehash);
+        TierRegistry.PendingCertification memory pendingBefore = reg.pendingCertificationOf(target, SEL);
+        assertTrue(pendingBefore.readyAt != 0, "renewal is pending");
+
+        // the challenge game convicts the LIVE certification before the
+        // renewal's readyAt
+        vm.expectEmit(true, true, false, true);
+        emit TierRegistry.CertificationCancelled(target, SEL);
+        vm.prank(demoter);
+        reg.demoteByChallenge(target, SEL);
+
+        (uint8 tierAfter,) = reg.tierOf(target, SEL);
+        assertEq(tierAfter, 2, "conviction demotes to the tier-2 default");
+
+        // the pending renewal must be gone — NOT survive to execute later
+        // and silently re-certify the just-convicted target at looser terms
+        TierRegistry.PendingCertification memory pendingAfter = reg.pendingCertificationOf(target, SEL);
+        assertEq(pendingAfter.readyAt, 0, "pending renewal cancelled by the conviction");
+
+        vm.warp(vm.getBlockTimestamp() + reg.certifyDelay());
+        vm.expectRevert(TierRegistry.NoPendingCertification.selector);
+        reg.certify(target, SEL);
+    }
+
+    /// @notice Finding #2, owner `demote` path: the same cancellation must
+    ///         happen for an ordinary owner demotion, not just the challenge
+    ///         path — `_demote` is the single convergence point for both.
+    function test_finding2_ownerDemote_cancelsPendingRenewal() public {
+        vm.prank(owner);
+        reg.proposeCertification(target, SEL, 1, 500, address(0), target.codehash);
+        vm.warp(vm.getBlockTimestamp() + reg.certifyDelay());
+        reg.certify(target, SEL);
+
+        vm.prank(owner);
+        reg.proposeCertification(target, SEL, 0, 9_000, address(0), target.codehash);
+        assertTrue(reg.pendingCertificationOf(target, SEL).readyAt != 0);
+
+        vm.prank(owner);
+        reg.demote(target, SEL);
+
+        assertEq(reg.pendingCertificationOf(target, SEL).readyAt, 0, "owner demote also cancels the pending renewal");
+    }
+
+    /// @notice Finding #2, `poke` path: a permissionless codehash-drift
+    ///         demotion must also cancel a same-key pending renewal.
+    function test_finding2_poke_cancelsPendingRenewal() public {
+        vm.prank(owner);
+        reg.proposeCertification(target, SEL, 1, 500, address(0), target.codehash);
+        vm.warp(vm.getBlockTimestamp() + reg.certifyDelay());
+        reg.certify(target, SEL);
+
+        vm.prank(owner);
+        reg.proposeCertification(target, SEL, 0, 9_000, address(0), target.codehash);
+        assertTrue(reg.pendingCertificationOf(target, SEL).readyAt != 0);
+
+        vm.etch(target, hex"6001600101");
+        vm.prank(makeAddr("rando"));
+        reg.poke(target, SEL);
+
+        assertEq(reg.pendingCertificationOf(target, SEL).readyAt, 0, "poke also cancels the pending renewal");
+    }
+
+    /// @notice Finding #2: demoting a DIFFERENT key must never touch this
+    ///         key's pending certification — the cancellation is scoped to
+    ///         the demoted key only. (Complements the existing "demotion
+    ///         unaffected" 3.8 tests, which cover the un-demoted side; this
+    ///         covers that the new cancel logic doesn't leak across keys.)
+    function test_finding2_demote_doesNotCancelUnrelatedKeysPending() public {
+        bytes4 otherSel = bytes4(0x99999999);
+        vm.prank(owner);
+        reg.proposeCertification(target, otherSel, 1, 500, address(0), target.codehash);
+        vm.warp(vm.getBlockTimestamp() + reg.certifyDelay());
+        reg.certify(target, otherSel);
+
+        // unrelated pending on SEL
+        vm.prank(owner);
+        reg.proposeCertification(target, SEL, 0, 50, address(0), target.codehash);
+
+        vm.prank(owner);
+        reg.demote(target, otherSel);
+
+        assertTrue(reg.pendingCertificationOf(target, SEL).readyAt != 0, "unrelated key's pending survives");
+    }
+
+    /// @notice Finding #3 [85]: once a bond is pinned, only the pinned
+    ///         `submitter` may trigger `certify` — a third party must not be
+    ///         able to pull the bond off the submitter's standing allowance
+    ///         for a certification that party never consented to.
+    function test_finding3_nonSubmitterCannotTriggerBondedCertify() public {
+        (, address submitter) = _bondSetup();
+        vm.prank(owner);
+        reg.proposeCertification(target, SEL, 0, 50, submitter, target.codehash);
+        vm.warp(vm.getBlockTimestamp() + reg.certifyDelay());
+
+        vm.prank(makeAddr("rando"));
+        vm.expectRevert(TierRegistry.NotSubmitter.selector);
+        reg.certify(target, SEL);
+
+        // the submitter itself can still trigger it
+        vm.prank(submitter);
+        reg.certify(target, SEL);
+        (uint8 tier,) = reg.tierOf(target, SEL);
+        assertEq(tier, 0);
+    }
+
+    /// @notice Finding #3: even the registry owner — who chose `submitter`
+    ///         in the first place — cannot stand in for them at execution.
+    ///         Only `msg.sender == p.submitter` satisfies the gate.
+    function test_finding3_ownerCannotTriggerBondedCertifyEither() public {
+        (, address submitter) = _bondSetup();
+        vm.prank(owner);
+        reg.proposeCertification(target, SEL, 0, 50, submitter, target.codehash);
+        vm.warp(vm.getBlockTimestamp() + reg.certifyDelay());
+
+        vm.prank(owner);
+        vm.expectRevert(TierRegistry.NotSubmitter.selector);
+        reg.certify(target, SEL);
+    }
+
+    /// @notice Finding #3, negative control: the unbonded case must remain
+    ///         fully permissionless — the submitter-gate exists only to
+    ///         protect actual fund custody, so a certification with no bond
+    ///         at stake must still execute for anyone. (Reaffirms
+    ///         `test_certify_succeedsExactlyAtReadyAtByThirdParty`
+    ///         explicitly in the context of this remediation.)
+    function test_finding3_unbondedCertifyStaysPermissionless() public {
+        vm.prank(owner);
+        reg.proposeCertification(target, SEL, 0, 50, address(0), target.codehash);
+        vm.warp(vm.getBlockTimestamp() + reg.certifyDelay());
+
+        vm.prank(makeAddr("anyRando"));
+        reg.certify(target, SEL); // must NOT revert NotSubmitter
+
+        (uint8 tier,) = reg.tierOf(target, SEL);
+        assertEq(tier, 0);
+    }
+
+    /// @notice Finding #5 [80]: `certify` must refuse to execute once
+    ///         `MAX_CERTIFY_WINDOW` has elapsed past `readyAt` — bounding how
+    ///         stale the pinned bond's real-world value may get before it can
+    ///         still post. Mirrors the audit's proof (submitter waits out a
+    ///         price collapse before triggering): here we simply prove the
+    ///         expiry fires exactly at the boundary, regardless of price.
+    function test_finding5_certifyExpiresAfterMaxCertifyWindow() public {
+        vm.prank(owner);
+        reg.proposeCertification(target, SEL, 0, 50, address(0), target.codehash);
+        TierRegistry.PendingCertification memory p = reg.pendingCertificationOf(target, SEL);
+
+        // still executable exactly at the boundary
+        vm.warp(p.readyAt + reg.MAX_CERTIFY_WINDOW());
+        vm.prank(makeAddr("rando"));
+        reg.certify(target, SEL);
+        (uint8 tier,) = reg.tierOf(target, SEL);
+        assertEq(tier, 0, "still executable exactly at readyAt + MAX_CERTIFY_WINDOW");
+    }
+
+    function test_finding5_certifyRevertsOneSecondPastMaxCertifyWindow() public {
+        vm.prank(owner);
+        reg.proposeCertification(target, SEL, 0, 50, address(0), target.codehash);
+        TierRegistry.PendingCertification memory p = reg.pendingCertificationOf(target, SEL);
+
+        vm.warp(p.readyAt + reg.MAX_CERTIFY_WINDOW() + 1);
+        vm.expectRevert(TierRegistry.CertificationExpired.selector);
+        reg.certify(target, SEL);
+
+        // the stale pending is not deleted by the failed execution — it is
+        // simply permanently unexecutable from here on, same discipline as
+        // a codehash-voided pending
+        TierRegistry.PendingCertification memory stillPending = reg.pendingCertificationOf(target, SEL);
+        assertTrue(stillPending.readyAt != 0);
+        (uint8 tier,) = reg.tierOf(target, SEL);
+        assertEq(tier, 2, "never certified");
+    }
+
+    /// @notice Finding #5: an expired pending is recoverable exactly like a
+    ///         codehash-voided one — the owner re-proposes and the fresh
+    ///         announcement executes normally.
+    function test_finding5_expiredPendingIsRecoverableViaReproposal() public {
+        vm.prank(owner);
+        reg.proposeCertification(target, SEL, 0, 50, address(0), target.codehash);
+        TierRegistry.PendingCertification memory p = reg.pendingCertificationOf(target, SEL);
+        vm.warp(p.readyAt + reg.MAX_CERTIFY_WINDOW() + 1);
+        vm.expectRevert(TierRegistry.CertificationExpired.selector);
+        reg.certify(target, SEL);
+
+        vm.prank(owner);
+        reg.proposeCertification(target, SEL, 1, 200, address(0), target.codehash);
+        vm.warp(vm.getBlockTimestamp() + reg.certifyDelay());
+        reg.certify(target, SEL);
+        (uint8 tier, uint16 bound) = reg.tierOf(target, SEL);
+        assertEq(tier, 1);
+        assertEq(bound, 200);
+    }
+
+    /// @notice Finding #6 [75]: `proposeCertification` must revert
+    ///         `CodehashChanged` when the caller's `expectedCodehash` (what
+    ///         the owner actually reviewed off-chain) no longer matches the
+    ///         target's LIVE codehash at the moment the transaction mines —
+    ///         closing the TOCTOU gap where a third party redeploys
+    ///         different bytecode between review and mining.
+    function test_finding6_proposeRevertsOnExpectedCodehashMismatch() public {
+        bytes32 reviewedHash = target.codehash;
+
+        // a third party — the target's own deployer, not this registry's
+        // owner — redeploys different bytecode at the same address between
+        // the owner's off-chain review and the proposal transaction mining
+        vm.etch(target, hex"6001600101");
+        assertTrue(target.codehash != reviewedHash, "sanity: bytecode really did change");
+
+        vm.prank(owner);
+        vm.expectRevert(TierRegistry.CodehashChanged.selector);
+        reg.proposeCertification(target, SEL, 0, 50, address(0), reviewedHash);
+
+        // no pending record was written by the reverted call
+        assertEq(reg.pendingCertificationOf(target, SEL).readyAt, 0);
+    }
+
+    /// @notice Finding #6, positive control: passing the CURRENT live
+    ///         codehash as `expectedCodehash` (the honest, no-TOCTOU case)
+    ///         must succeed exactly as before.
+    function test_finding6_proposeSucceedsWhenExpectedCodehashMatches() public {
+        vm.prank(owner);
+        reg.proposeCertification(target, SEL, 0, 50, address(0), target.codehash);
+        TierRegistry.PendingCertification memory p = reg.pendingCertificationOf(target, SEL);
+        assertEq(p.codehash, target.codehash);
     }
 }

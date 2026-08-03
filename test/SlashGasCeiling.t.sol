@@ -287,7 +287,7 @@ contract SlashGasCeilingTest is Test {
         // execute. Every later warp in this suite is relative
         // (`vm.getBlockTimestamp() + X` or a live `gov.getProposal(...)`
         // field), so this setUp-time shift is safe.
-        tierRegistry.proposeCertification(address(adapter), adapter.poke.selector, 1, CERTIFIED_BOUND_BPS, address(0));
+        tierRegistry.proposeCertification(address(adapter), adapter.poke.selector, 1, CERTIFIED_BOUND_BPS, address(0), address(adapter).codehash);
         vm.warp(vm.getBlockTimestamp() + tierRegistry.certifyDelay());
         tierRegistry.certify(address(adapter), adapter.poke.selector);
 

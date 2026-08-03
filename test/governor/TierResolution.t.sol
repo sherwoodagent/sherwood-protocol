@@ -119,7 +119,7 @@ contract TierResolutionTest is Test {
     ///      `block.timestamp` local — this repo's optimizer CSEs it across
     ///      `vm.warp`), then execute.
     function _certifyNow(address target_, bytes4 selector_, uint8 tier_, uint16 bound_, address submitter_) internal {
-        tierRegistry.proposeCertification(target_, selector_, tier_, bound_, submitter_);
+        tierRegistry.proposeCertification(target_, selector_, tier_, bound_, submitter_, target_.codehash);
         vm.warp(vm.getBlockTimestamp() + tierRegistry.certifyDelay());
         tierRegistry.certify(target_, selector_);
     }
@@ -302,7 +302,7 @@ contract TierResolutionTest is Test {
         // Announce the replacement (same tier 0, 10x the extractable bound) as
         // soon as the delay allows it to land inside the execution window.
         tierRegistry.setCertifyDelay(tierRegistry.MIN_CERTIFY_DELAY());
-        tierRegistry.proposeCertification(address(mockAdapter), mockAdapter.approve.selector, 0, 500, address(0));
+        tierRegistry.proposeCertification(address(mockAdapter), mockAdapter.approve.selector, 0, 500, address(0), address(mockAdapter).codehash);
 
         _advancePastVoting(); // == MIN_CERTIFY_DELAY, so the replacement is also ready
 

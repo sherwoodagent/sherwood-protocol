@@ -36,22 +36,37 @@ discipline, not check in code.
 
 - **BREAKING (external ABI + flow)**: certification becomes two-step.
   - `proposeCertification(target, selector, tier, extractableBoundBps,
-    submitter)` — `onlyOwner`. Runs all of today's input guards
-    (`InvalidTier`, `BoundRequired`, `NotAContract`, `ZeroAddressSubmitter`
-    when a bond is armed), snapshots the target's current `EXTCODEHASH` and
-    the current `submitterBondWood`, records
+    submitter, expectedCodehash)` — `onlyOwner`. Runs all of today's input
+    guards (`InvalidTier`, `BoundRequired`, `NotAContract`,
+    `ZeroAddressSubmitter` when a bond is armed), plus `CodehashChanged` when
+    the target's live codehash doesn't match the caller-supplied
+    `expectedCodehash` (audit remediation, finding #6 — asserts the owner's
+    off-chain review against propose-time reality rather than blindly
+    re-photographing whatever is live when the transaction mines). Snapshots
+    the target's current `EXTCODEHASH`, the current `wood` token address
+    (finding #1), and the current `submitterBondWood`, records
     `readyAt = block.timestamp + certifyDelay`, emits
     `CertificationProposed(target, selector, tier, extractableBoundBps,
     submitter, bondAmount, codehash, readyAt)`.
-  - `certify(target, selector)` — **permissionless** once `readyAt` has
-    passed, and only if the target's live codehash still matches the
-    proposal-time snapshot (a code change mid-window voids the pending grant
-    rather than certifying something else). Pulls the pinned submitter bond
-    (if any) at this point, applies the config, deletes the pending record,
-    emits the existing `TierCertified`. The old five-argument instant
-    `certify` signature is removed.
+  - `certify(target, selector)` — **permissionless when the pinned bond
+    amount is zero; restricted to the pinned `submitter` when it is
+    non-zero** (finding #3 — an owner-named `submitter` has no proof of
+    consent for a specific grant, so execution that would pull funds is
+    gated to the party those funds belong to). Callable once `readyAt` has
+    passed and only until `readyAt + MAX_CERTIFY_WINDOW` (finding #5), and
+    only if the target's live codehash still matches the proposal-time
+    snapshot (a code change mid-window voids the pending grant rather than
+    certifying something else). Pulls the pinned submitter bond (if any)
+    against the pinned bond TOKEN, not the live `wood` (finding #1), applies
+    the config, deletes the pending record, emits the existing
+    `TierCertified`. The old five-argument instant `certify` signature is
+    removed.
   - `cancelCertification(target, selector)` — `onlyOwner`, withdraws a
-    pending grant, emits `CertificationCancelled`.
+    pending grant, emits `CertificationCancelled`. A same-key pending
+    certification is now ALSO cancelled automatically as a side effect of
+    that key's demotion (`demote` / `demoteByChallenge` / `poke`) — finding
+    #2, closing the gap where a for-cause revocation could be silently
+    overridden by an announcement that predates it.
 - New owner parameter `certifyDelay` (default 3 days) with
   `setCertifyDelay(delay)` bounded to
   `[MIN_CERTIFY_DELAY = 1 days, MAX_CERTIFY_DELAY = 30 days]` — a floor so
