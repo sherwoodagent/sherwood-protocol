@@ -302,7 +302,9 @@ contract TierResolutionTest is Test {
         // Announce the replacement (same tier 0, 10x the extractable bound) as
         // soon as the delay allows it to land inside the execution window.
         tierRegistry.setCertifyDelay(tierRegistry.MIN_CERTIFY_DELAY());
-        tierRegistry.proposeCertification(address(mockAdapter), mockAdapter.approve.selector, 0, 500, address(0), address(mockAdapter).codehash);
+        tierRegistry.proposeCertification(
+            address(mockAdapter), mockAdapter.approve.selector, 0, 500, address(0), address(mockAdapter).codehash
+        );
 
         _advancePastVoting(); // == MIN_CERTIFY_DELAY, so the replacement is also ready
 

@@ -1056,7 +1056,9 @@ contract CoverageEndToEndTest is Test {
         // `block.timestamp` local — the optimizer CSEs it across `vm.warp`),
         // execute. `_propose` and every later window below reads live state
         // relative to this new baseline, so the forward shift is safe.
-        tierRegistry.proposeCertification(address(adapter), adapter.poke.selector, 1, 100, address(0), address(adapter).codehash);
+        tierRegistry.proposeCertification(
+            address(adapter), adapter.poke.selector, 1, 100, address(0), address(adapter).codehash
+        );
         vm.warp(vm.getBlockTimestamp() + tierRegistry.certifyDelay());
         tierRegistry.certify(address(adapter), adapter.poke.selector);
 

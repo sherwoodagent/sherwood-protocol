@@ -288,7 +288,9 @@ contract SlashGasCeilingTest is Test {
         // execute. Every later warp in this suite is relative
         // (`vm.getBlockTimestamp() + X` or a live `gov.getProposal(...)`
         // field), so this setUp-time shift is safe.
-        tierRegistry.proposeCertification(address(adapter), adapter.poke.selector, 1, CERTIFIED_BOUND_BPS, address(0), address(adapter).codehash);
+        tierRegistry.proposeCertification(
+            address(adapter), adapter.poke.selector, 1, CERTIFIED_BOUND_BPS, address(0), address(adapter).codehash
+        );
         vm.warp(vm.getBlockTimestamp() + tierRegistry.certifyDelay());
         tierRegistry.certify(address(adapter), adapter.poke.selector);
 
@@ -745,7 +747,16 @@ contract SlashGasCeilingTest is Test {
         wood.approve(address(tierRegistry), type(uint256).max);
         // Re-certify the fixture's adapter with a real bond so the demotion
         // below actually starts the bond-release timelock — the worst case.
-        tierRegistry.certify(address(adapter), adapter.poke.selector, 1, CERTIFIED_BOUND_BPS, submitter);
+        // Two-step flow (issue #45): propose (with the reviewed codehash),
+        // warp past the pinned readyAt, then execute pranked as the pinned
+        // submitter (PR #156 finding #3: execution is submitter-gated once a
+        // bond is pinned).
+        tierRegistry.proposeCertification(
+            address(adapter), adapter.poke.selector, 1, CERTIFIED_BOUND_BPS, submitter, address(adapter).codehash
+        );
+        vm.warp(vm.getBlockTimestamp() + tierRegistry.certifyDelay());
+        vm.prank(submitter);
+        tierRegistry.certify(address(adapter), adapter.poke.selector);
 
         uint256 forwarded = (game.DEMOTION_GAS() * 63) / 64;
 

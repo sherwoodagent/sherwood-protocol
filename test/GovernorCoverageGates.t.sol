@@ -665,7 +665,9 @@ contract GovernorCoverageGatesTest is Test {
         governor.setTierRegistry(address(reg)); // test contract is the factory
         reg.setAdapterAllowed(address(targetToken), true);
         reg.setAdapterAllowed(address(usdg), true);
-        reg.proposeCertification(address(targetToken), targetToken.approve.selector, tier, bound, address(0), address(targetToken).codehash);
+        reg.proposeCertification(
+            address(targetToken), targetToken.approve.selector, tier, bound, address(0), address(targetToken).codehash
+        );
         reg.proposeCertification(address(usdg), usdg.approve.selector, tier, bound, address(0), address(usdg).codehash);
         vm.warp(vm.getBlockTimestamp() + reg.certifyDelay());
         reg.certify(address(targetToken), targetToken.approve.selector);
