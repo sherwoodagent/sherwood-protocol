@@ -518,4 +518,183 @@ contract SelectorGuardTest is Test {
         _exec(calls);
         assertEq(usdc.balanceOf(address(vault)), 10_000e6);
     }
+
+    // ── PR #157 audit ROUND 3: four more sibling selectors missed by round
+    // 2's own remediation, on the exact routers/standards it claimed to
+    // cover (Permit2, DSToken) plus one it didn't touch at all (ERC1363).
+    // Same reasoning as the round-2 tests above: the guard reverts inside
+    // `_guardBatchCalls` before ever delegatecalling into its targets, so
+    // these use bare address stand-ins — no mock router contract needed.
+
+    bytes4 constant SEL_DSTOKEN_PUSH = 0xb753a98c; // DSToken push(address,uint256)
+    bytes4 constant SEL_ERC1363_TRANSFER_FROM_AND_CALL = 0xd8fbe994; // ERC1363 transferFromAndCall(address,address,uint256)
+    bytes4 constant SEL_ERC1363_TRANSFER_FROM_AND_CALL_DATA = 0xc1d34b89; // ERC1363 transferFromAndCall(address,address,uint256,bytes)
+    bytes4 constant SEL_ERC1363_APPROVE_AND_CALL = 0x3177029f; // ERC1363 approveAndCall(address,uint256)
+    bytes4 constant SEL_ERC1363_APPROVE_AND_CALL_DATA = 0xcae9ca51; // ERC1363 approveAndCall(address,uint256,bytes)
+    bytes4 constant SEL_PERMIT2_BATCH_TRANSFER_FROM = 0x0d58b1db; // Permit2 AllowanceTransfer.transferFrom(AllowanceTransferDetails[])
+
+    address erc1363Token = makeAddr("erc1363Token");
+
+    /// @dev Test-side mirror of Permit2's `AllowanceTransferDetails` — only
+    ///      used to `abi.encode` a batch selector's calldata, never to call
+    ///      Permit2 itself.
+    struct PermitBatchDetail {
+        address from;
+        address to;
+        uint160 amount;
+        address token;
+    }
+
+    /// @notice DSToken `push(dst, wad)` is `transfer`'s sibling — dst at
+    ///         bytes 4:36, same offset as `_SEL_TRANSFER`, missed by round 2
+    ///         even though `pull`/`move` were added for the same lineage.
+    function test_dstokenPushToNonAllowlistedReverts() public {
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                ISyndicateVault.DisallowedTransferTarget.selector, dstoken, SEL_DSTOKEN_PUSH, attacker
+            )
+        );
+        _exec(_one(dstoken, abi.encodeWithSelector(SEL_DSTOKEN_PUSH, attacker, 1_000e18)));
+    }
+
+    function test_dstokenPushToAllowlistedAdapterPasses() public {
+        _exec(_one(dstoken, abi.encodeWithSelector(SEL_DSTOKEN_PUSH, adapter, 1_000e18)));
+    }
+
+    /// @notice Round-3 audit's most severe finding: ERC1363
+    ///         `transferFromAndCall(from, to, amount)` has the identical
+    ///         `from`/`to` layout as legacy `transferFrom` but a different
+    ///         selector — reproduces the exact LP-allowance-confiscation
+    ///         shape as `test_permit2TransferFromThirdPartySourceReverts_LPAllowanceConfiscation`,
+    ///         just on a third router.
+    function test_erc1363TransferFromAndCallThirdPartySourceReverts_LPAllowanceConfiscation() public {
+        address victimLP = makeAddr("erc1363VictimLP");
+        vm.expectRevert(
+            abi.encodeWithSelector(ISyndicateVault.DisallowedTransferFromSource.selector, erc1363Token, victimLP)
+        );
+        _exec(
+            _one(erc1363Token, abi.encodeWithSelector(SEL_ERC1363_TRANSFER_FROM_AND_CALL, victimLP, attacker, 1_000e18))
+        );
+    }
+
+    /// @notice The 4-arg `bytes` overload's trailing `data` parameter must
+    ///         not shift the `from`/`to` offsets — same source guard must
+    ///         fire.
+    function test_erc1363TransferFromAndCallDataOverloadThirdPartySourceReverts() public {
+        address victimLP = makeAddr("erc1363VictimLP2");
+        vm.expectRevert(
+            abi.encodeWithSelector(ISyndicateVault.DisallowedTransferFromSource.selector, erc1363Token, victimLP)
+        );
+        _exec(
+            _one(
+                erc1363Token,
+                abi.encodeWithSelector(SEL_ERC1363_TRANSFER_FROM_AND_CALL_DATA, victimLP, attacker, 1_000e18, bytes(""))
+            )
+        );
+    }
+
+    function test_erc1363TransferFromAndCallVaultSourceToAllowlistedAdapterPasses() public {
+        _exec(
+            _one(
+                erc1363Token,
+                abi.encodeWithSelector(SEL_ERC1363_TRANSFER_FROM_AND_CALL, address(vault), adapter, 1_000e18)
+            )
+        );
+    }
+
+    /// @notice ERC1363 `approveAndCall(spender, amount)` reopens the exact
+    ///         poison-then-drain shape `test_permit2ApproveToNonAllowlistedSpenderReverts`
+    ///         closes for Permit2's `approve` — same `[4:36]` spender offset
+    ///         as legacy `approve`.
+    function test_erc1363ApproveAndCallToNonAllowlistedSpenderReverts() public {
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                ISyndicateVault.DisallowedTransferTarget.selector, erc1363Token, SEL_ERC1363_APPROVE_AND_CALL, attacker
+            )
+        );
+        _exec(_one(erc1363Token, abi.encodeWithSelector(SEL_ERC1363_APPROVE_AND_CALL, attacker, type(uint256).max)));
+    }
+
+    function test_erc1363ApproveAndCallDataOverloadToNonAllowlistedSpenderReverts() public {
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                ISyndicateVault.DisallowedTransferTarget.selector,
+                erc1363Token,
+                SEL_ERC1363_APPROVE_AND_CALL_DATA,
+                attacker
+            )
+        );
+        _exec(
+            _one(
+                erc1363Token,
+                abi.encodeWithSelector(SEL_ERC1363_APPROVE_AND_CALL_DATA, attacker, type(uint256).max, bytes(""))
+            )
+        );
+    }
+
+    function test_erc1363ApproveAndCallToAllowlistedAdapterPasses() public {
+        _exec(_one(erc1363Token, abi.encodeWithSelector(SEL_ERC1363_APPROVE_AND_CALL, adapter, 1_000e18)));
+    }
+
+    // ── Permit2 batch `transferFrom(AllowanceTransferDetails[])` ──
+    //
+    // Worse than the round-2-fixed single-transfer overload: with zero fix,
+    // this selector skipped BOTH the source AND destination guard entirely
+    // (fell to Part 2's unconditional `else { continue; }`), so funds never
+    // needed to transit the vault at all to evade `netOutflow`. The fix
+    // must check EVERY element of the dynamic array, not just the first.
+
+    function test_permit2BatchTransferFromThirdPartySourceReverts_LPAllowanceConfiscation() public {
+        address victimLP = makeAddr("permit2BatchVictimLP");
+        PermitBatchDetail[] memory details = new PermitBatchDetail[](1);
+        details[0] = PermitBatchDetail({from: victimLP, to: attacker, amount: uint160(1_000e6), token: address(usdc)});
+        vm.expectRevert(
+            abi.encodeWithSelector(ISyndicateVault.DisallowedTransferFromSource.selector, permit2, victimLP)
+        );
+        _exec(_one(permit2, abi.encodeWithSelector(SEL_PERMIT2_BATCH_TRANSFER_FROM, details)));
+    }
+
+    /// @notice A batch with one vault-sourced element and one third-party
+    ///         element must still revert on the bad element — the fix loops
+    ///         every array entry rather than stopping at the first.
+    function test_permit2BatchTransferFromSecondElementThirdPartySourceReverts() public {
+        address victimLP = makeAddr("permit2BatchVictimLP2");
+        PermitBatchDetail[] memory details = new PermitBatchDetail[](2);
+        details[0] =
+            PermitBatchDetail({from: address(vault), to: adapter, amount: uint160(500e6), token: address(usdc)});
+        details[1] = PermitBatchDetail({from: victimLP, to: attacker, amount: uint160(500e6), token: address(usdc)});
+        vm.expectRevert(
+            abi.encodeWithSelector(ISyndicateVault.DisallowedTransferFromSource.selector, permit2, victimLP)
+        );
+        _exec(_one(permit2, abi.encodeWithSelector(SEL_PERMIT2_BATCH_TRANSFER_FROM, details)));
+    }
+
+    function test_permit2BatchTransferFromVaultSourceToNonAllowlistedDestinationReverts() public {
+        PermitBatchDetail[] memory details = new PermitBatchDetail[](1);
+        details[0] =
+            PermitBatchDetail({from: address(vault), to: attacker, amount: uint160(1_000e6), token: address(usdc)});
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                ISyndicateVault.DisallowedTransferTarget.selector, permit2, SEL_PERMIT2_BATCH_TRANSFER_FROM, attacker
+            )
+        );
+        _exec(_one(permit2, abi.encodeWithSelector(SEL_PERMIT2_BATCH_TRANSFER_FROM, details)));
+    }
+
+    function test_permit2BatchTransferFromVaultSourceToAllowlistedAdapterPasses() public {
+        PermitBatchDetail[] memory details = new PermitBatchDetail[](2);
+        details[0] =
+            PermitBatchDetail({from: address(vault), to: adapter, amount: uint160(500e6), token: address(usdc)});
+        details[1] =
+            PermitBatchDetail({from: address(vault), to: adapter, amount: uint160(500e6), token: address(usdc)});
+        _exec(_one(permit2, abi.encodeWithSelector(SEL_PERMIT2_BATCH_TRANSFER_FROM, details)));
+    }
+
+    /// @notice A malformed batch call whose calldata is too short to even
+    ///         contain the dynamic array's offset/length words must revert
+    ///         `MalformedCall`, not decode garbage or panic.
+    function test_permit2BatchTransferFromMalformedCallReverts() public {
+        vm.expectRevert(ISyndicateVault.MalformedCall.selector);
+        _exec(_one(permit2, abi.encodeWithSelector(SEL_PERMIT2_BATCH_TRANSFER_FROM)));
+    }
 }
