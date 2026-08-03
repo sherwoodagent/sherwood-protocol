@@ -32,7 +32,6 @@ interface ISyndicateFactory {
     function syndicateCount() external view returns (uint256);
     function beacon() external view returns (address);
     function protocolConfig() external view returns (address);
-    function priceRouter() external view returns (address);
     function vaultImpl() external view returns (address);
     function vaultToSyndicate(address vault) external view returns (uint256);
     function guardianRegistry() external view returns (address);

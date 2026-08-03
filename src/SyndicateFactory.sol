@@ -119,10 +119,12 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     ///         `vault → governor`. Read externally via `governorOf(vault)`.
     mapping(address vault => address governor) private _governorOf;
 
-    /// @notice Protocol PriceRouter for Lane A live-NAV pricing (governance-owned).
-    ///         Vaults read it live via `_getPriceRouter`; `address(0)` ⇒ Lane A
-    ///         off (async Lane B only), so this can be wired in after launch.
-    address public priceRouter;
+    /// @dev Deprecated. Formerly the protocol PriceRouter for Lane A live-NAV
+    ///      pricing, now retired (issue #54). Slot 7 stays occupied — same
+    ///      slot, same type — because the factory is deployed and its layout
+    ///      is golden-pinned (`script/syndicate-factory-layout.golden.json`);
+    ///      only the label changes, which the EVM never sees.
+    address private __deprecated_priceRouter;
 
     /// @notice Management fee for vault owners (bps of strategy profits)
     uint256 public managementFeeBps;
@@ -236,7 +238,6 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     event BeaconUpdated(address indexed oldBeacon, address indexed newBeacon);
     event ProtocolConfigUpdated(address indexed oldConfig, address indexed newConfig);
     event EnsRegistrarUpdated(address indexed oldRegistrar, address indexed newRegistrar);
-    event PriceRouterUpdated(address indexed router);
 
     struct InitParams {
         address owner;
@@ -537,14 +538,6 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         address old = address(ensRegistrar);
         ensRegistrar = IL2Registrar(newRegistrar);
         emit EnsRegistrarUpdated(old, newRegistrar);
-    }
-
-    /// @notice Set the protocol PriceRouter (Lane A live-NAV). Vaults read it
-    ///         live, so this enables / repoints Lane A pricing across all vaults
-    ///         at once. `address(0)` disables Lane A (async Lane B only).
-    function setPriceRouter(address newRouter) external onlyOwner {
-        priceRouter = newRouter;
-        emit PriceRouterUpdated(newRouter);
     }
 
     /// @notice Re-point the beacon that new governor proxies read their impl from.

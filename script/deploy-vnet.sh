@@ -37,7 +37,6 @@ run() {
 
 run DeployWood.s.sol:DeployWood                       # fixture WOOD + mint
 run Deploy.s.sol:DeploySherwood                       # core: factory/governor/registry/sWOOD/vault
-run DeployPriceRouter.s.sol:DeployPriceRouter         # PriceRouter + Moonwell adapter + factory.setPriceRouter
 run DeployTemplates.s.sol:DeployTemplates             # strategy templates
 run DeployStrategyFactory.s.sol:DeployStrategyFactory # keyless-clone factory + template approvals
 

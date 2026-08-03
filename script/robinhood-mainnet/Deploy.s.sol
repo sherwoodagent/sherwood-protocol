@@ -2,12 +2,10 @@
 pragma solidity 0.8.28;
 
 import {console} from "forge-std/Script.sol";
-import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {SyndicateFactory} from "../../src/SyndicateFactory.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {StakedWood} from "../../src/StakedWood.sol";
-import {PriceRouter} from "../../src/pricing/PriceRouter.sol";
 import {DeploySherwood} from "../Deploy.s.sol";
 
 /**
@@ -20,13 +18,8 @@ import {DeploySherwood} from "../Deploy.s.sol";
  *         Inherits the canonical `DeploySherwood` and delegates the core
  *         ceremony to its `deployCore` (CREATE3-salted, insertion-order-
  *         independent) — no hand-maintained linear-nonce offsets. This override
- *         layers the Robinhood-specific bits on top: a zero-adapter PriceRouter
- *         wired to the factory, the multisig handoff, post-deploy validation,
- *         and address persistence.
- *
- *         PortfolioStrategy is Lane-B-only so the PriceRouter carries zero
- *         adapters — it always fails closed to Lane B until governance registers
- *         an adapter post-audit.
+ *         layers the Robinhood-specific bits on top: the multisig handoff,
+ *         post-deploy validation, and address persistence.
  *
  *   Environment:
  *     WOOD_TOKEN            — REQUIRED. Guardian-layer WOOD custody token.
@@ -91,16 +84,6 @@ contract DeployRobinhoodMainnet is DeploySherwood {
         // Called on `this` so `msg.sender` inside deployCore is the broadcaster.
         Deployed memory d = deployCore(cfg);
 
-        // PriceRouter with zero adapters. PortfolioStrategy is Lane-B-only so no
-        // price adapters are needed; the router always fails closed to Lane B
-        // until governance registers an adapter post-audit. Wired to the factory
-        // so vaults read it live via `factory.priceRouter()`.
-        PriceRouter priceRouterImpl = new PriceRouter();
-        PriceRouter priceRouter = PriceRouter(
-            address(new ERC1967Proxy(address(priceRouterImpl), abi.encodeCall(PriceRouter.initialize, (deployer))))
-        );
-        SyndicateFactory(d.factoryProxy).setPriceRouter(address(priceRouter));
-
         // Multisig handoff (final action inside the broadcast).
         address effectiveOwner = deployer;
         if (!skipHandoff) {
@@ -112,22 +95,13 @@ contract DeployRobinhoodMainnet is DeploySherwood {
             Ownable(d.factoryProxy).transferOwnership(ownerMultisig);
             Ownable(d.registryProxy).transferOwnership(ownerMultisig);
             Ownable(d.swoodProxy).transferOwnership(ownerMultisig);
-            Ownable(address(priceRouter)).transferOwnership(ownerMultisig);
             effectiveOwner = ownerMultisig;
         }
 
         vm.stopBroadcast();
 
         _validateMainnet(
-            effectiveOwner,
-            deployer,
-            d.beacon,
-            d.protocolConfig,
-            d.factoryProxy,
-            d.registryProxy,
-            d.swoodProxy,
-            woodToken,
-            address(priceRouter)
+            effectiveOwner, deployer, d.beacon, d.protocolConfig, d.factoryProxy, d.registryProxy, d.swoodProxy, woodToken
         );
 
         // Persist. `_writeAddresses` patches the core keys in place, so the
@@ -140,14 +114,12 @@ contract DeployRobinhoodMainnet is DeploySherwood {
         _patchAddress("GUARDIAN_REGISTRY", d.registryProxy);
         _patchAddress("STAKED_WOOD", d.swoodProxy);
         _patchAddress("WOOD_TOKEN", woodToken);
-        _patchAddress("PRICE_ROUTER", address(priceRouter));
 
         console.log("SyndicateFactory:", d.factoryProxy);
         console.log("GovernorBeacon:", d.beacon);
         console.log("ProtocolConfig:", d.protocolConfig);
         console.log("GuardianRegistry:", d.registryProxy);
         console.log("StakedWood:", d.swoodProxy);
-        console.log("PriceRouter:", address(priceRouter));
         console.log(
             "\nNext: forge script script/robinhood-mainnet/DeployPortfolioStrategy.s.sol --rpc-url robinhood --broadcast"
         );
@@ -161,8 +133,7 @@ contract DeployRobinhoodMainnet is DeploySherwood {
         address factoryAddr,
         address registryAddr,
         address swoodAddr,
-        address wood,
-        address priceRouter
+        address wood
     ) internal view {
         SyndicateFactory factory = SyndicateFactory(factoryAddr);
         ProtocolConfig protocolConfig = ProtocolConfig(protocolConfigAddr);
@@ -182,8 +153,5 @@ contract DeployRobinhoodMainnet is DeploySherwood {
         _checkAddr("registry.owner", Ownable(registryAddr).owner(), expectedOwner);
         _checkAddr("swood.wood", address(StakedWood(swoodAddr).wood()), wood);
         _checkAddr("swood.registry", StakedWood(swoodAddr).registry(), registryAddr);
-
-        _checkAddr("factory.priceRouter", factory.priceRouter(), priceRouter);
-        _checkAddr("priceRouter.owner", Ownable(priceRouter).owner(), expectedOwner);
     }
 }
