@@ -212,33 +212,46 @@ contract VaultBatchQueueTargetsLifecycleTest is Test {
 
     // ── the reported trace, end to end ──
 
-    /// @notice ISSUE #93's SIX-STEP TRACE, driven through `executeProposal`.
+    /// @notice ISSUE #93/#118's SIX-STEP TRACE, now stopped at step 3.
     ///           1. the victim `requestRedeem`s; the queue holds their shares
     ///           2. the prior proposal settles and stamps
-    ///           3. propose with `maxCapital = 1` and
+    ///           3. `propose` with `maxCapital = 1` and
     ///              `executeCalls = [queueRedeem(attacker, victimShares, pid)]`
-    ///           4. it passes review — nothing about it looks expensive: the
-    ///              outflow meter reads zero, tier-2 coverage asks for 1 wei
-    ///           5. `executeProposal` reaches `vault.executeGovernorBatch`
-    ///           6. the target denylist refuses it before any call runs
-    ///         Steps 5-6 on unpatched `main` were: the queue mints the attacker
-    ///         a claim on the victim's shares, the attacker claims, and the
-    ///         victim's own claim then reverts.
-    function test_sixStepQueueSteal_isRejectedAtExecuteProposal() public {
+    ///              reverts immediately — the target denylist runs inside
+    ///              `propose` itself, before a vote cycle is ever spent
+    ///         On pre-#118 `main`, steps 3-6 instead were: it PASSED review
+    ///         (nothing about it looks expensive — the outflow meter reads
+    ///         zero, tier-2 coverage asks for 1 wei), `executeProposal`
+    ///         reached `vault.executeGovernorBatch`, and only THERE did the
+    ///         target denylist refuse it. That execute-time chokepoint claim
+    ///         is retained by the sibling unit file
+    ///         (`Vault_batchQueueTargets.t.sol`), which drives
+    ///         `executeGovernorBatch` directly behind a mocked governor.
+    function test_sixStepQueueSteal_isRejectedAtPropose() public {
         uint256 victimShares = _victimEscrowsThenProposalSettles();
 
         // A 1-wei envelope: tier-2 coverage is `requiredCoverage == maxCapital`,
-        // so the whole steal is underwritten for a rounding error.
+        // so the whole steal would have been underwritten for a rounding
+        // error — had it ever reached review.
         ISyndicateGovernor.RiskEnvelope memory steal =
             ISyndicateGovernor.RiskEnvelope({maxCapital: 1, maxDrawdownBps: 10_000});
-        uint256 pid2 = _proposeAndApprove(steal, _queueRedeemCalls(victimShares, 2), _benignCalls());
-        assertEq(governor.getProposal(pid2).maxCapital, 1, "1 wei of declared capital");
 
+        vm.prank(agent);
         vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.DisallowedBatchTarget.selector, address(queue)));
-        governor.executeProposal(pid2);
+        governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://p",
+            STRATEGY_DURATION,
+            steal,
+            _queueRedeemCalls(victimShares, 2),
+            _benignCalls(),
+            _noCoProposers()
+        );
 
-        // The escrow is intact and the victim can still exit — the outcome that
-        // actually matters, asserted rather than inferred from the revert.
+        // No proposal was ever stored. The escrow is intact and the victim
+        // can still exit — the outcome that actually matters, asserted
+        // rather than inferred from the revert.
         assertEq(vault.balanceOf(address(queue)), victimShares, "victim escrow untouched");
         assertEq(queue.pendingShares(), victimShares, "no forged claim was recorded");
         vm.prank(victim);
@@ -247,37 +260,44 @@ contract VaultBatchQueueTargetsLifecycleTest is Test {
         assertEq(usdc.balanceOf(attacker), 0, "the attacker got nothing");
     }
 
-    /// @notice THE SETTLEMENT BATCH IS THE SAME CHOKEPOINT. Settlement calls are
-    ///         arbitrary pre-committed calldata, so a proposal can look harmless
-    ///         at execute time and carry the steal in its settle leg — reviewed
-    ///         once, long before it runs.
-    function test_queueTargetingSettlementBatch_isRejectedAtSettleProposal() public {
+    /// @notice THIS IS ISSUE #118's EXACT ORIGINAL SCENARIO. Settlement calls
+    ///         are arbitrary pre-committed calldata, so a proposal used to
+    ///         look harmless at execute time and carry the steal in its
+    ///         settle leg — reviewed once, executed cleanly, and only then
+    ///         discovered permanently stuck: `settleProposal` reverted with
+    ///         the proposal wedged in `Executed` and redemptions locked
+    ///         forever (no expiry edge out of `Executed`, and `unstick`
+    ///         replays the same poisoned calls). `propose` now rejects the
+    ///         same targets before the proposal is ever stored, voted, or
+    ///         executed — turning a silent, terminal failure into a loud,
+    ///         immediate one.
+    function test_queueTargetingSettlementBatch_isRejectedAtPropose() public {
         ISyndicateGovernor.RiskEnvelope memory env = _permissiveEnv();
-        uint256 pid = _proposeAndApprove(env, _benignCalls(), _queueRedeemCalls(1e6, 1));
-        governor.executeProposal(pid);
-        vm.warp(vm.getBlockTimestamp() + SELF_SETTLE_FLOOR + 1);
 
         vm.prank(agent);
         vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.DisallowedBatchTarget.selector, address(queue)));
-        governor.settleProposal(pid);
+        governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://p",
+            STRATEGY_DURATION,
+            env,
+            _benignCalls(),
+            _queueRedeemCalls(1e6, 1),
+            _noCoProposers()
+        );
     }
 
     // ── the owner-driven emergency path ──
 
-    /// @notice `unstick` runs the pre-committed settlement calls on the vault
-    ///         owner's say-so alone — no guardian review, no fresh vote, no
-    ///         coverage quorum. It still routes through `executeGovernorBatch`,
-    ///         which is precisely why one guard covers it.
-    function test_unstickWithQueueTargetingCalls_reverts() public {
-        ISyndicateGovernor.RiskEnvelope memory env = _permissiveEnv();
-        uint256 pid = _proposeAndApprove(env, _benignCalls(), _queueRedeemCalls(1e6, 1));
-        governor.executeProposal(pid);
-        vm.warp(vm.getBlockTimestamp() + STRATEGY_DURATION + 1);
-
-        vm.prank(owner);
-        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.DisallowedBatchTarget.selector, address(queue)));
-        governor.unstick(pid);
-    }
+    // `test_unstickWithQueueTargetingCalls_reverts` is RETIRED (issue #118):
+    // it required a STORED queue-targeting settlement batch reaching
+    // `unstick`, and that state can no longer exist — `propose` now rejects
+    // such a batch before it is ever stored (see
+    // `test_queueTargetingSettlementBatch_isRejectedAtPropose` above). The
+    // `unstick` path's own reliance on `executeGovernorBatch` (and therefore
+    // on `_guardBatchCalls`) remains covered at the unit level by
+    // `Vault_batchQueueTargets.t.sol`, which drives that entrypoint directly.
 
     /// @notice And the emergency path still WORKS for honest calls — the guard
     ///         did not brick the rescue hatch it now polices.
