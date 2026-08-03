@@ -1119,7 +1119,17 @@ contract SyndicateVault is
 
         // A Lane A entry locks the receiver's shares until this proposal
         // settles — closes the deposit-low / exit-high intra-proposal MEV.
-        if (laneA) {
+        //
+        // `shares != 0` GUARDS THE LATCH (issue #99). Without it, ANYONE could
+        // call `deposit(0, victim)` — no approval from the victim, no shares
+        // of their own, nothing transferred at all (`previewDeposit(0) == 0`,
+        // a zero-value `safeTransferFrom`/`_mint` both succeed trivially) —
+        // and freeze an existing, approved holder who deposited NOTHING this
+        // round out of `test_instantWithdraw_duringLaneA_existingHolder`'s
+        // exact guarantee: instant-exiting at live NAV during Lane A. The
+        // check is on `receiver`, never `msg.sender`, so the griefer need not
+        // hold a single share.
+        if (laneA && shares != 0) {
             _laneALockPid[receiver] = _activePid();
             // Mid-proposal principal in — excluded from settlement PnL so
             // performance fees are never charged on depositor principal.
