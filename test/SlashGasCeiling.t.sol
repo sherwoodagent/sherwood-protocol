@@ -617,9 +617,7 @@ contract SlashGasCeilingTest is Test {
         // The TIER is the binding check — it is the invariant that matters
         // and it survives any renaming of the event below.
         (uint8 tierAfter,) = tierRegistry.tierOf(address(adapter), adapter.poke.selector);
-        assertEq(
-            tierAfter, tierRegistry.TIER_ARBITRARY(), "the challenged adapter really lost its certification"
-        );
+        assertEq(tierAfter, tierRegistry.TIER_ARBITRARY(), "the challenged adapter really lost its certification");
 
         // The event absence is the explicit form of the same claim: the
         // demotion did not merely fail into the catch.
