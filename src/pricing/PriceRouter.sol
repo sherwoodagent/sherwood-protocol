@@ -38,7 +38,25 @@ contract PriceRouter is Initializable, OwnableUpgradeable, UUPSUpgradeable, IPri
     mapping(bytes32 kind => address adapter) public adapterOf;
     /// @notice kind => realizability haircut in bps (monotone-increasing).
     mapping(bytes32 kind => uint16 bps) public haircutBps;
-    /// @notice kind => max single-position value eligible for instant pricing (0 = unlimited).
+    /// @notice kind => max value a single instant EXIT may take out of a
+    ///         position of this kind (0 = no bound configured).
+    /// @dev    Published here, enforced by the consumers that size exits — NOT
+    ///         by `_priceOne`, which prices truthfully and never sees an exit
+    ///         size (see the note there for the griefing vector that enforcing
+    ///         it at valuation opened).
+    ///
+    ///         READ THIS BEFORE TUNING IT. The two kinds are asymmetric:
+    ///           - `ERC20_SPOT`: INERT. `Erc20SpotAdapter` carries per-TOKEN
+    ///             depth caps and `PortfolioStrategy.availableLiquidity` binds
+    ///             against those, which are strictly tighter (this value is set
+    ///             to the LARGEST per-token cap, so nothing reaches it before
+    ///             hitting its own token's bound). Changing it will not change
+    ///             stock-basket exit capacity — change the adapter's per-token
+    ///             cap instead.
+    ///           - `MORPHO_BLUE_SUPPLY`: LOAD-BEARING. There is no per-token
+    ///             registry on the Morpho side, so this is the only depth bound
+    ///             on a Morpho unwind (`MorphoSupplyStrategy.availableLiquidity`
+    ///             reads it). Setting it to 0 removes that bound entirely.
     mapping(bytes32 kind => uint256 cap) public instantCap;
     /// @notice kind => whether the instant (Lane A) lane is governance-enabled.
     ///         Default false: a position is instant-eligible only after governance
@@ -107,18 +125,34 @@ contract PriceRouter is Initializable, OwnableUpgradeable, UUPSUpgradeable, IPri
         }
     }
 
-    /// @dev Single-position pricing: adapter venue-read → haircut → instant cap.
-    ///      Fail-closed to `(0, false)` on unknown kind / adapter revert /
-    ///      not-OK / over-cap.
+    /// @dev Single-position pricing: adapter venue-read → haircut. Fail-closed
+    ///      to `(0, false)` on unknown kind / adapter revert / not-OK.
+    ///
+    ///      `instantCap` is deliberately NOT applied here. Size is not a
+    ///      pricing doubt: this function answers what a position is worth, and
+    ///      it never sees an exit size, so a cap enforced here could only bound
+    ///      the POSITION — and the only lever available would be to declare the
+    ///      position unpriceable. Because `valueStrategy` requires every
+    ///      position to be ok, that turned one over-cap slot into a vault-wide
+    ///      shutdown of the instant lane, in both directions. Adversary: a
+    ///      griefer donating tokens to a strategy (position size comes from a
+    ///      venue `balanceOf`, which anyone can inflate) to push a slot past the
+    ///      cap and freeze deposits and exits for every LP until settlement.
+    ///      Clamping instead would be worse — it under-reports `totalAssets()`
+    ///      and Lane A deposits mint against the understatement (the one-sided
+    ///      mark transfer `setHaircutBps` documents).
+    ///
+    ///      The cap is instead published (`instantCap` is public) and enforced
+    ///      by the consumers that actually size exits — see
+    ///      `MorphoSupplyStrategy.availableLiquidity`, and
+    ///      `PortfolioStrategy.availableLiquidity`, which binds tighter still
+    ///      via the spot adapter's per-token depth caps.
     function _priceOne(Position memory p, address holder) private view returns (uint256, bool) {
         address adapter = adapterOf[p.kind];
         if (adapter == address(0)) return (0, false);
         try IPriceAdapter(adapter).value(p, holder) returns (uint256 raw, bool ok) {
             if (!ok) return (0, false);
-            uint256 v = (raw * uint256(MAX_HAIRCUT_BPS - haircutBps[p.kind])) / MAX_HAIRCUT_BPS;
-            uint256 cap = instantCap[p.kind];
-            if (cap != 0 && v > cap) return (0, false);
-            return (v, true);
+            return ((raw * uint256(MAX_HAIRCUT_BPS - haircutBps[p.kind])) / MAX_HAIRCUT_BPS, true);
         } catch {
             return (0, false);
         }

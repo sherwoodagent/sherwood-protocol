@@ -100,13 +100,21 @@ contract PriceRouterTest is Test {
         assertFalse(ok);
     }
 
-    function test_valuePosition_overCap_returnsZeroFalse() public {
+    /// @notice `instantCap` bounds EXIT SIZE and is published for the
+    ///         strategies that size exits — it is not a pricing guard.
+    ///         Valuation answers what a position is worth and never sees an
+    ///         exit size, so enforcing the cap here could only bound the
+    ///         position, and only by declaring it unpriceable — which closed
+    ///         the instant lane for the whole vault (`valueStrategy` needs
+    ///         every position ok) and was griefable by donating tokens to the
+    ///         strategy.
+    function test_valuePosition_overCap_stillPricesTruthfully() public {
         adapter.set(1000, true);
         vm.prank(owner);
         router.setInstantCap(KIND, 500);
         (uint256 v, bool ok) = router.valuePosition(_pos(), address(this));
-        assertEq(v, 0, "over instant cap -> Lane B");
-        assertFalse(ok);
+        assertEq(v, 1000, "priced in full, not zeroed and not clamped to the cap");
+        assertTrue(ok, "size is not a pricing doubt");
     }
 
     function test_valuePosition_atCap_isInstantEligible() public {

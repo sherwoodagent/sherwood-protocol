@@ -169,17 +169,21 @@ contract MgmtFeeAccrualTest is Test {
 
         _executeWithLaneA(0);
         vm.warp(vm.getBlockTimestamp() + 15 days);
+        uint256 firstHalf = _settle();
 
-        // Lane A deposit: doubles the base for the back half.
+        // Capital added between proposals — the only route left once Lane A's
+        // instant door is closed for the duration of any open proposal
+        // (finding #14 / Option B). Doubles the base for the back half.
         vm.prank(bob);
         vault.deposit(1_000_000e6, bob);
 
+        _executeWithLaneA(0);
         vm.warp(vm.getBlockTimestamp() + 15 days);
-        uint256 assetSeconds = _settle();
+        uint256 secondHalf = _settle();
 
         // 1M for 15d, then 2M for 15d.
         uint256 expected = 1_000_000e6 * uint256(15 days) + 2_000_000e6 * uint256(15 days);
-        assertEq(assetSeconds, expected, "late capital must not be charged for the front half");
+        assertEq(firstHalf + secondHalf, expected, "late capital must not be charged for the front half");
     }
 
     /// @notice The mirror: a late depositor is not charged for time before the
@@ -191,13 +195,20 @@ contract MgmtFeeAccrualTest is Test {
 
         _executeWithLaneA(0);
         vm.warp(vm.getBlockTimestamp() + 29 days);
+        uint256 firstPart = _settle();
+
+        // Between proposals — Lane A's instant door is closed for the
+        // duration of any open proposal (finding #14 / Option B), so a
+        // mid-proposal deposit is no longer reachable here.
         vm.prank(bob);
         vault.deposit(1_000_000e6, bob);
+
+        _executeWithLaneA(0);
         vm.warp(vm.getBlockTimestamp() + 1 days);
         uint256 lateEntry = _settle();
 
         uint256 bothPresentThroughout = 2_000_000e6 * uint256(30 days);
-        assertLt(lateEntry, bothPresentThroughout, "a 1-day-old deposit must not pay for 30 days");
+        assertLt(firstPart + lateEntry, bothPresentThroughout, "a 1-day-old deposit must not pay for 30 days");
     }
 
     /// @notice Capital withdrawn mid-proposal stops accruing at withdrawal.
