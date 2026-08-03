@@ -1376,6 +1376,19 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             // guard above — unlike the re-arm write, which only raises when
             // needed.
             inconclusiveRounds[rk]++;
+
+            // COUPLED TO THE RE-ARM, NOT OPTIONAL (issue #95). `_releaseFreeze`
+            // above just dropped `hasFrozenCoverage` to false for every
+            // approver here, but this branch is exactly the one that keeps the
+            // proposal LEGALLY re-challengeable through `challengeableUntil[rk]`
+            // — a window `openExposureUsd`'s wall-clock epoch buckets were
+            // never built to cover, since they age out `challengeWindow` after
+            // EXECUTION, not after any later re-arm. Pinning through the
+            // JUST-WRITTEN `challengeableUntil[rk]` (not `extended` — an
+            // earlier round may have left it higher already) keeps sWOOD's
+            // unstake gate honest for exactly as long as a conviction remains
+            // reachable, and not one second longer.
+            exposureLedger.pinCoverageUntil(governor, proposalId, challengeableUntil[rk]);
         }
 
         _bookRefund(challengeId, pool);

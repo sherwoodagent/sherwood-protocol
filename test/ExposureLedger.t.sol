@@ -909,6 +909,107 @@ contract ExposureLedgerTest is Test {
         ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 1_000e6);
     }
 
+    // ── pinCoverageUntil (issue #95) ──
+
+    /// @notice THE MECHANISM ITSELF: pinning holds `hasFrozenCoverage` true
+    ///         through a chosen future instant, independent of `freezeCoverage`
+    ///         ever having been called at all — and it decays on its own once
+    ///         wall-clock passes that instant, with no unpin call required.
+    function test_pinCoverageUntil_holdsThenDecaysOnWallClock() public {
+        _wireRecording();
+        mgov.set(1_000e6);
+        mgov.setSchedule(block.timestamp + 1 days, 3 days);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+
+        assertFalse(ledger.hasFrozenCoverage(guardian), "never frozen, never pinned");
+
+        uint256 deadline = block.timestamp + 30 days;
+        vm.prank(freezer);
+        ledger.pinCoverageUntil(address(mgov), 1, deadline);
+        assertTrue(ledger.hasFrozenCoverage(guardian), "pinned, though `freezeCoverage` was never called");
+
+        vm.warp(deadline - 1);
+        assertTrue(ledger.hasFrozenCoverage(guardian), "one second before the deadline: still pinned");
+
+        vm.warp(deadline);
+        assertFalse(ledger.hasFrozenCoverage(guardian), "at the deadline: decayed with no unpin call");
+    }
+
+    /// @notice ONLY EVER RAISES, mirroring `ChallengeGame.challengeableUntil`'s
+    ///         own monotonic-raise semantics one layer up. A smaller, later pin
+    ///         must not shadow a larger, earlier one still in effect — the exact
+    ///         property `ChallengeGame._refundAll` relies on across repeated
+    ///         Inconclusive rounds.
+    function test_pinCoverageUntil_onlyEverRaises() public {
+        _wireRecording();
+        mgov.set(1_000e6);
+        mgov.setSchedule(block.timestamp + 1 days, 3 days);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+
+        uint256 far = block.timestamp + 60 days;
+        uint256 near = block.timestamp + 10 days;
+        vm.startPrank(freezer);
+        ledger.pinCoverageUntil(address(mgov), 1, far);
+        ledger.pinCoverageUntil(address(mgov), 1, near); // smaller, later call
+        vm.stopPrank();
+
+        vm.warp(far - 1);
+        assertTrue(ledger.hasFrozenCoverage(guardian), "the earlier, LARGER pin survives the smaller call");
+
+        vm.warp(far);
+        assertFalse(ledger.hasFrozenCoverage(guardian), "and decays at its own instant, not the smaller one's");
+    }
+
+    /// @notice ONLY GUARDIANS WHO ACTUALLY COMMITTED are pinned — mirroring
+    ///         `freezeCoverage`'s own `_recorded[key][g].usd == 0` skip. A
+    ///         guardian with nothing booked against this proposal has nothing
+    ///         a conviction could recover from them, so pinning them would hold
+    ///         an unstake claim for no protective reason.
+    function test_pinCoverageUntil_skipsGuardiansWithNoCommitment() public {
+        _wireRecording();
+        mgov.set(1_000e6);
+        mgov.setSchedule(block.timestamp + 1 days, 3 days);
+        address uncommitted = makeAddr("uncommitted");
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        // `uncommitted` is never recorded as an approver of this proposal.
+
+        vm.prank(freezer);
+        ledger.pinCoverageUntil(address(mgov), 1, block.timestamp + 30 days);
+
+        assertTrue(ledger.hasFrozenCoverage(guardian), "the actual approver is pinned");
+        assertFalse(ledger.hasFrozenCoverage(uncommitted), "an address never approving this proposal is not");
+    }
+
+    /// @notice THE FIX'S WHOLE PURPOSE: the pin outlives `unfreezeCoverage`.
+    ///         This is the exact sequence `ChallengeGame._refundAll` performs —
+    ///         release the live freeze, then pin through the re-armed
+    ///         deadline — proven directly against the ledger rather than only
+    ///         through `ChallengeGame`'s own call.
+    function test_pinCoverageUntil_survivesUnfreezeCoverage() public {
+        _wireRecording();
+        mgov.set(1_000e6);
+        mgov.setSchedule(block.timestamp + 1 days, 3 days);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+
+        vm.startPrank(freezer);
+        ledger.freezeCoverage(address(mgov), 1);
+        assertTrue(ledger.hasFrozenCoverage(guardian), "live freeze holds first");
+
+        uint256 deadline = block.timestamp + 26 days; // e.g. a re-armed challengeableUntil
+        ledger.unfreezeCoverage(address(mgov), 1);
+        ledger.pinCoverageUntil(address(mgov), 1, deadline);
+        vm.stopPrank();
+
+        assertTrue(ledger.hasFrozenCoverage(guardian), "the pin holds even though the live freeze was JUST released");
+
+        vm.warp(deadline);
+        assertFalse(ledger.hasFrozenCoverage(guardian), "and finally releases at the pinned instant");
+    }
+
     /// @notice H1 — `settleCoverage` was a ONE-SHOT priced at the caller's
     ///         chosen instant, so an approver could time it to a WOOD trough and
     ///         permanently write down what a conviction could recover.
