@@ -252,11 +252,16 @@ current-codehash pair behind it; anything else is the §4 gap.
 3. (bondReleaseDelay later) claimSubmitterBond(target, selector)
 ```
 
-`demote` ([`TierRegistry.sol:265`](../src/TierRegistry.sol#L265)) is
-`onlyOwner` and routes to `_demote` ([`:287`](../src/TierRegistry.sol#L287)),
-which deletes the `TierConfig` and starts the submitter-bond release timer
-(`bondReleaseDelay`, default 14 days, [`:80`](../src/TierRegistry.sol#L80),
-bounded to [1 day, 365 days] by [`:61-62`](../src/TierRegistry.sol#L61)).
+`demote` ([`TierRegistry.sol:255`](../src/TierRegistry.sol#L255)) is
+`onlyOwner` and routes to `_demote` ([`:296`](../src/TierRegistry.sol#L296)),
+which deletes the `TierConfig`, starts the submitter-bond release timer
+(`bondReleaseDelay`, default 14 days, [`:78`](../src/TierRegistry.sol#L78),
+bounded to [1 day, 365 days] by [`:59-60`](../src/TierRegistry.sol#L59)), and
+**also clears the adapter's allowlist entry on-chain** (see below). Step 1
+above therefore now duplicates what step 2 does for a single adapter in the
+common case; it stays the documented order as belt-and-suspenders, and
+because it remains the only lever for the two gaps the watcher still has to
+cover.
 
 Decertifying first opens a window in which the adapter is **allowlisted but
 uncertified**: governance has withdrawn its statement about what the target
@@ -264,32 +269,55 @@ does, while the guard still lets vault funds be approved to it. Turning the
 allowlist off first closes the funds path immediately; the certification can
 then be withdrawn at whatever pace the bond mechanics require.
 
-### `_demote` does not touch the allowlist — and you are not the only caller
+### `_demote` clears the allowlist too — over-broad by design, one-way
 
-`_demote` deletes `_configs[k]` and nothing else
-([`:287-297`](../src/TierRegistry.sol#L287)). `_adapterAllowed` is a separate
-mapping ([`:76`](../src/TierRegistry.sol#L76)) that only `setAdapterAllowed`
-writes. Three paths can therefore drop an adapter to tier 2 **without any owner
-action**, leaving Gate B open behind it:
+Every persisted demotion routes through `_demote`
+([`:296-310`](../src/TierRegistry.sol#L296)), which deletes `_configs[k]`
+**and**, when the target was allowlisted, clears `_adapterAllowed[target]`
+([`:74`](../src/TierRegistry.sol#L74)), emitting the existing
+`AdapterAllowedSet(target, false)` ([`:105`](../src/TierRegistry.sol#L105)
+declared, [`:307`](../src/TierRegistry.sol#L307) emitted here) — the same
+event `setAdapterAllowed` itself emits
+([`:348`](../src/TierRegistry.sol#L348)), so there is no new indexer channel
+to wire. All three demotion paths get this atomically with the demotion, for
+free:
 
-- `poke(target, selector)` — **permissionless**
-  ([`:280`](../src/TierRegistry.sol#L280)), callable by anyone the moment the
-  live codehash diverges from the certified one;
+- owner `demote` ([`:255`](../src/TierRegistry.sol#L255));
 - `demoteByChallenge` — the ChallengeGame's role
-  ([`:273`](../src/TierRegistry.sol#L273)), on a passed challenge;
+  ([`:263`](../src/TierRegistry.sol#L263)), on a passed challenge;
+- `poke(target, selector)` — **permissionless**
+  ([`:270`](../src/TierRegistry.sol#L270)), callable by anyone the moment the
+  live codehash diverges from the certified one.
+
+The clear is **deliberately over-broad**: certification is keyed (target,
+selector), the allowlist by bare address, so demoting *one* selector
+de-allowlists the *whole* adapter even if its other selectors remain
+certified — the conservative, accepted direction of error. Recovery is a
+single owner `setAdapterAllowed(adapter, true)` call. Re-certifying never
+restores it: `certify` ([`:198`](../src/TierRegistry.sol#L198)) never sets or
+restores `_adapterAllowed`, so re-allowlisting after any clear is always this
+explicit, separate owner decision — never a side effect of re-certification.
+
+**What still needs the watcher.** Two paths leave `_adapterAllowed` untouched
+because they either don't run `_demote`, or don't persist at all:
+
+- The ChallengeGame calls `demoteByChallenge` **best-effort**, inside a
+  `try/catch` ([`src/ChallengeGame.sol:1141`](../src/ChallengeGame.sol#L1141)).
+  If that call reverts — e.g. `authorizedDemoter` was rotated away
+  mid-challenge — no `_demote` runs, so nothing is cleared; the only signal is
+  `AdapterDemotionFailed`. This case is structurally uncoverable on-chain: the
+  clear is a side effect of a demotion that never happened.
 - `tierOf` reporting tier 2 lazily on a codehash mismatch
-  ([`:97`](../src/TierRegistry.sol#L97)) with no state write at all — the
-  registry's *stored* config still says certified.
+  ([`:95`](../src/TierRegistry.sol#L95)) writes no state until someone calls
+  `poke` — until then the stored allowlist entry survives untouched.
 
-The ChallengeGame's demotion is additionally **best-effort**: if the registry's
-`authorizedDemoter` role has been rotated away, `_settle` catches the revert
-and emits `AdapterDemotionFailed` rather than blocking the verdict
-([`src/ChallengeGame.sol:1471`](../src/ChallengeGame.sol#L1471)). A challenge
-can therefore pass, with an adapter judged bad, and the certification survive.
-
-**Operational consequence:** treat `TierDemoted` and `AdapterDemotionFailed` as
-allowlist alarms. On either, call `setAdapterAllowed(adapter, false)` — the
-protocol will not do it for you.
+**Operational consequence:** `TierDemoted` alone no longer needs a manual
+allowlist reaction for `demote`, `demoteByChallenge`, or `poke` — the clear
+already happened on-chain, atomically. The allowlist alarms that remain: (a)
+`AdapterDemotionFailed` — apply the lost demotion via owner `demote` (which
+itself clears the allowlist) or call `setAdapterAllowed(adapter, false)`
+directly; (b) an un-`poke`d lazy demotion — keep running the §3 drift sweep to
+catch it.
 
 ---
 

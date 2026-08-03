@@ -2,6 +2,7 @@
 pragma solidity 0.8.28;
 
 import {Test} from "forge-std/Test.sol";
+import {Vm} from "forge-std/Vm.sol";
 import {TierRegistry} from "src/TierRegistry.sol";
 import {ERC20Mock} from "@openzeppelin/contracts/mocks/token/ERC20Mock.sol";
 
@@ -485,5 +486,137 @@ contract TierRegistryTest is Test {
         vm.prank(demoter);
         vm.expectRevert();
         reg.certify(target, bytes4(0x88888888), 1, 500, address(0));
+    }
+
+    // ── Issue #77: demotion auto-clears the adapter allowlist ──
+
+    /// @notice Owner `demote` clears the target's allowlist entry atomically,
+    ///         reusing the existing `AdapterAllowedSet` event.
+    function test_demote_clearsAdapterAllowlist() public {
+        vm.startPrank(owner);
+        reg.certify(target, bytes4(0x12345678), 1, 500, address(0));
+        reg.setAdapterAllowed(target, true);
+        vm.stopPrank();
+        assertTrue(reg.isAdapterAllowed(target));
+
+        vm.expectEmit(true, false, false, true);
+        emit TierRegistry.AdapterAllowedSet(target, false);
+        vm.prank(owner);
+        reg.demote(target, bytes4(0x12345678));
+
+        assertFalse(reg.isAdapterAllowed(target));
+    }
+
+    /// @notice `demoteByChallenge` clears the allowlist identically to owner
+    ///         `demote` — both converge on `_demote`.
+    function test_demoteByChallenge_clearsAdapterAllowlist() public {
+        address demoter = makeAddr("demoter");
+        vm.startPrank(owner);
+        reg.certify(target, bytes4(0x12345678), 1, 500, address(0));
+        reg.setAdapterAllowed(target, true);
+        reg.setAuthorizedDemoter(demoter);
+        vm.stopPrank();
+        assertTrue(reg.isAdapterAllowed(target));
+
+        // hoist: any argument-position call would consume the one-shot prank
+        vm.expectEmit(true, false, false, true);
+        emit TierRegistry.AdapterAllowedSet(target, false);
+        vm.prank(demoter);
+        reg.demoteByChallenge(target, bytes4(0x12345678));
+
+        assertFalse(reg.isAdapterAllowed(target));
+    }
+
+    /// @notice Permissionless `poke` (on codehash drift) clears the allowlist
+    ///         too — the third of the three `_demote`-converging paths.
+    function test_poke_clearsAdapterAllowlist() public {
+        vm.startPrank(owner);
+        reg.certify(target, bytes4(0x12345678), 1, 500, address(0));
+        reg.setAdapterAllowed(target, true);
+        vm.stopPrank();
+        vm.etch(target, hex"6001600101");
+        assertTrue(reg.isAdapterAllowed(target));
+
+        vm.expectEmit(true, false, false, true);
+        emit TierRegistry.AdapterAllowedSet(target, false);
+        vm.prank(makeAddr("rando"));
+        reg.poke(target, bytes4(0x12345678));
+
+        assertFalse(reg.isAdapterAllowed(target));
+    }
+
+    /// @notice Demoting a target that was never allowlisted must NOT emit a
+    ///         phantom `AdapterAllowedSet` — the guarded emission keeps the
+    ///         channel truthful and existing `vm.expectEmit` assertions in
+    ///         this file (which never allowlist before demoting) unaffected.
+    function test_demote_neverAllowlisted_noAllowedSetEvent() public {
+        vm.prank(owner);
+        reg.certify(target, bytes4(0x12345678), 1, 500, address(0));
+        assertFalse(reg.isAdapterAllowed(target));
+
+        bytes32 allowedSetSig = keccak256("AdapterAllowedSet(address,bool)");
+        vm.recordLogs();
+        vm.prank(owner);
+        reg.demote(target, bytes4(0x12345678));
+
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i = 0; i < logs.length; i++) {
+            assertTrue(logs[i].topics[0] != allowedSetSig, "no phantom AdapterAllowedSet");
+        }
+    }
+
+    /// @notice DELIBERATE over-breadth (design.md Decision 3): certification
+    ///         is keyed (target, selector), the allowlist by bare address, so
+    ///         demoting ONE selector de-allowlists the WHOLE adapter even
+    ///         though its other selectors remain certified. This pins the
+    ///         over-broad clear as specified behavior, not a bug — do not
+    ///         "fix" it back to per-selector.
+    function test_demoteOneSelector_clearsWholeAdapter_intended() public {
+        vm.startPrank(owner);
+        reg.certify(target, bytes4(0x12345678), 1, 500, address(0));
+        reg.certify(target, bytes4(0x87654321), 0, 200, address(0));
+        reg.setAdapterAllowed(target, true);
+        vm.stopPrank();
+
+        vm.prank(owner);
+        reg.demote(target, bytes4(0x12345678));
+
+        assertFalse(reg.isAdapterAllowed(target), "whole adapter de-allowlisted by one selector's demotion");
+        (uint8 survivingTier, uint16 survivingBound) = reg.tierOf(target, bytes4(0x87654321));
+        assertEq(survivingTier, 0, "other selector remains certified");
+        assertEq(survivingBound, 200);
+    }
+
+    /// @notice Re-certifying a demoted (target, selector) must NOT restore
+    ///         the allowlist — `certify` never sets or restores
+    ///         `_adapterAllowed`; the coupling is one-way and fail-closed.
+    function test_recertify_doesNotRestoreAllowlist() public {
+        vm.startPrank(owner);
+        reg.certify(target, bytes4(0x12345678), 1, 500, address(0));
+        reg.setAdapterAllowed(target, true);
+        reg.demote(target, bytes4(0x12345678)); // auto-clears the allowlist
+        vm.stopPrank();
+        assertFalse(reg.isAdapterAllowed(target));
+
+        vm.prank(owner);
+        reg.certify(target, bytes4(0x12345678), 1, 500, address(0));
+
+        assertFalse(reg.isAdapterAllowed(target), "re-certification must not re-grant the allowlist");
+    }
+
+    /// @notice The recovery path: after a demotion-triggered clear, the owner
+    ///         can always explicitly re-allowlist the adapter.
+    function test_ownerReallowsAfterClear() public {
+        vm.startPrank(owner);
+        reg.certify(target, bytes4(0x12345678), 1, 500, address(0));
+        reg.setAdapterAllowed(target, true);
+        reg.demote(target, bytes4(0x12345678));
+        vm.stopPrank();
+        assertFalse(reg.isAdapterAllowed(target));
+
+        vm.prank(owner);
+        reg.setAdapterAllowed(target, true);
+
+        assertTrue(reg.isAdapterAllowed(target));
     }
 }

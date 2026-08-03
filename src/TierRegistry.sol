@@ -188,6 +188,13 @@ contract TierRegistry is Ownable2Step {
     ///         legitimate adapter upgrade, costs the full demote → delay →
     ///         claim → certify cycle, and the key sits at tier 2 (full
     ///         notional, priced not bounded) for the whole window.
+    ///
+    ///         Re-certifying a (target, selector) that a prior demotion
+    ///         auto-cleared from the adapter allowlist (see `_demote`) does
+    ///         NOT restore that allowlist entry — `certify` never sets or
+    ///         restores `_adapterAllowed`. Restoring it is always a separate,
+    ///         explicit owner `setAdapterAllowed(adapter, true)` call; the
+    ///         coupling between the two axes is one-way and fail-closed.
     function certify(address target, bytes4 selector, uint8 tier, uint16 extractableBoundBps, address submitter)
         external
         onlyOwner
@@ -267,6 +274,25 @@ contract TierRegistry is Ownable2Step {
         _demote(target, selector);
     }
 
+    /// @dev Convergence point for all three demotion paths (owner `demote`,
+    ///      `demoteByChallenge`, `poke`). ALSO clears the target's adapter
+    ///      allowlist entry, emitting the existing `AdapterAllowedSet(target,
+    ///      false)` if (and only if) the entry was set — a never-allowlisted
+    ///      target emits no phantom event. The adversary: an adapter that was
+    ///      just convicted in a challenge, or whose bytecode was just swapped
+    ///      under it (the `poke` trigger), otherwise retains the standing
+    ///      right to appear as spender/recipient of value-moving ERC20 calls
+    ///      (approve / increaseAllowance / transfer / transferFrom-out) inside
+    ///      a governor batch — tier 2 raises the coverage price but is a
+    ///      price, not a prohibition.
+    ///
+    ///      DELIBERATELY OVER-BROAD: certification is keyed `(target,
+    ///      selector)`; the allowlist is keyed by bare `address`. Demoting
+    ///      ONE selector therefore de-allowlists the WHOLE adapter, even if
+    ///      other selectors on it remain certified. This is the chosen,
+    ///      conservative direction of error — recovery is one owner
+    ///      `setAdapterAllowed(adapter, true)` call — and it is pinned by
+    ///      test. Do NOT "fix" this back to a per-selector allowlist.
     function _demote(address target, bytes4 selector) private {
         bytes32 k = key(target, selector);
         delete _configs[k];
@@ -275,6 +301,10 @@ contract TierRegistry is Ownable2Step {
             uint64 releasableAt = uint64(block.timestamp + bondReleaseDelay);
             b.releasableAt = releasableAt;
             emit SubmitterBondReleaseStarted(target, selector, b.submitter, releasableAt);
+        }
+        if (_adapterAllowed[target]) {
+            delete _adapterAllowed[target];
+            emit AdapterAllowedSet(target, false);
         }
         emit TierDemoted(target, selector);
     }
@@ -307,6 +337,12 @@ contract TierRegistry is Ownable2Step {
     /// @notice Allow or disallow `adapter` as the spender/recipient of
     ///         value-moving ERC20 calls (approve / increaseAllowance /
     ///         transfer / transferFrom-out) inside governor batches.
+    /// @dev    The only path that SETS this to true. `_demote` is the only
+    ///         path that clears it (see `_demote` natspec for the
+    ///         over-broad-by-design clear on any demotion of the adapter).
+    ///         `certify` never touches this mapping — re-allowlisting after a
+    ///         demotion-triggered clear is always this explicit owner call,
+    ///         never a side effect of re-certification.
     function setAdapterAllowed(address adapter, bool allowed) external onlyOwner {
         _adapterAllowed[adapter] = allowed;
         emit AdapterAllowedSet(adapter, allowed);
