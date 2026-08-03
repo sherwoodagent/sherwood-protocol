@@ -209,16 +209,16 @@ contract VaultSolvencyHandler is Test {
         vm.prank(vaultOwner);
         vault.setAgentFeeBps(perfFeeBps);
         vm.prank(leadAgent);
-        uint256 proposalId = governor.propose(
-            address(vault),
+        uint256 proposalId = governor.propose(address(vault),
             address(0),
             "ipfs://test",
             strategyDuration,
             GovEnvelope.permissive(address(vault)),
             calls,
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (calls).length),
             calls,
-            new ISyndicateGovernor.CoProposer[](0)
-        );
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (calls).length),
+            new ISyndicateGovernor.CoProposer[](0));
 
         vm.warp(vm.getBlockTimestamp() + 1);
 

@@ -165,16 +165,16 @@ contract SyndicateGovernorTest is Test {
         vm.prank(owner);
         vault.setAgentFeeBps(perfFeeBps);
         vm.prank(agent);
-        proposalId = governor.propose(
-            address(vault),
+        proposalId = governor.propose(address(vault),
             address(0),
             "ipfs://test",
             duration,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
-            _emptyCoProposers()
-        );
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            _emptyCoProposers());
         vm.warp(block.timestamp + 1);
     }
 
@@ -204,16 +204,16 @@ contract SyndicateGovernorTest is Test {
         vm.prank(owner);
         vault.setAgentFeeBps(perfFeeBps);
         vm.prank(agent);
-        proposalId = governor.propose(
-            address(vault),
+        proposalId = governor.propose(address(vault),
             strategy,
             "ipfs://test",
             duration,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
-            _emptyCoProposers()
-        );
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            _emptyCoProposers());
         vm.warp(block.timestamp + 1);
         vm.prank(lp1);
         governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
@@ -263,93 +263,93 @@ contract SyndicateGovernorTest is Test {
     function test_propose_notRegisteredAgent_reverts() public {
         vm.prank(random);
         vm.expectRevert(ISyndicateGovernor.NotRegisteredAgent.selector);
-        governor.propose(
-            address(vault),
+        governor.propose(address(vault),
             address(0),
             "ipfs://test",
             7 days,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
-            _emptyCoProposers()
-        );
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            _emptyCoProposers());
     }
 
     function test_propose_vaultNotRegistered_reverts() public {
         vm.prank(agent);
         vm.expectRevert(ISyndicateGovernor.VaultNotRegistered.selector);
-        governor.propose(
-            makeAddr("fakeVault"),
+        governor.propose(makeAddr("fakeVault"),
             address(0),
             "ipfs://test",
             7 days,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
-            _emptyCoProposers()
-        );
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            _emptyCoProposers());
     }
 
     function test_propose_strategyDurationTooLong_reverts() public {
         vm.prank(agent);
         vm.expectRevert(ISyndicateGovernor.StrategyDurationTooLong.selector);
-        governor.propose(
-            address(vault),
+        governor.propose(address(vault),
             address(0),
             "ipfs://test",
             MAX_STRATEGY_DURATION + 1,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
-            _emptyCoProposers()
-        );
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            _emptyCoProposers());
     }
 
     function test_propose_strategyDurationTooShort_reverts() public {
         vm.prank(agent);
         vm.expectRevert(ISyndicateGovernor.StrategyDurationTooShort.selector);
-        governor.propose(
-            address(vault),
+        governor.propose(address(vault),
             address(0),
             "ipfs://test",
             30 minutes,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
-            _emptyCoProposers()
-        );
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            _emptyCoProposers());
     }
 
     function test_propose_emptyExecuteCalls_reverts() public {
         BatchExecutorLib.Call[] memory empty = new BatchExecutorLib.Call[](0);
         vm.prank(agent);
         vm.expectRevert(ISyndicateGovernor.EmptyExecuteCalls.selector);
-        governor.propose(
-            address(vault),
+        governor.propose(address(vault),
             address(0),
             "ipfs://test",
             7 days,
             permissiveEnv,
             empty,
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (empty).length),
             _simpleSettlementCalls(),
-            _emptyCoProposers()
-        );
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            _emptyCoProposers());
     }
 
     function test_propose_emptySettlementCalls_reverts() public {
         BatchExecutorLib.Call[] memory empty = new BatchExecutorLib.Call[](0);
         vm.prank(agent);
         vm.expectRevert(ISyndicateGovernor.EmptySettlementCalls.selector);
-        governor.propose(
-            address(vault),
+        governor.propose(address(vault),
             address(0),
             "ipfs://test",
             7 days,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             empty,
-            _emptyCoProposers()
-        );
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (empty).length),
+            _emptyCoProposers());
     }
 
     /// @notice G-C1: propose() stamps snapshot at block.timestamp - 1 so any
@@ -359,16 +359,16 @@ contract SyndicateGovernorTest is Test {
         uint256 tsBefore = block.timestamp;
         uint256 proposalId = governor.proposalCount() + 1;
         vm.prank(agent);
-        governor.propose(
-            address(vault),
+        governor.propose(address(vault),
             address(0),
             "ipfs://test",
             7 days,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
-            _emptyCoProposers()
-        );
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            _emptyCoProposers());
         ISyndicateGovernor.StrategyProposal memory p = governor.getProposal(proposalId);
         assertEq(p.snapshotTimestamp, tsBefore - 1);
     }
@@ -392,16 +392,16 @@ contract SyndicateGovernorTest is Test {
         vault.delegate(flashVoter);
 
         vm.prank(agent);
-        uint256 proposalId = governor.propose(
-            address(vault),
+        uint256 proposalId = governor.propose(address(vault),
             address(0),
             "ipfs://test",
             7 days,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
-            _emptyCoProposers()
-        );
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            _emptyCoProposers());
 
         // Snapshot is block.timestamp - 1; delegation checkpoint was written
         // at block.timestamp, so getPastVotes returns 0 and vote() reverts.
@@ -513,16 +513,16 @@ contract SyndicateGovernorTest is Test {
         _createAndExecuteProposal(1500, 7 days);
         vm.prank(agent);
         vm.expectRevert(ISyndicateGovernor.VaultHasOpenProposal.selector);
-        governor.propose(
-            address(vault),
+        governor.propose(address(vault),
             address(0),
             "ipfs://dup",
             7 days,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
-            _emptyCoProposers()
-        );
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            _emptyCoProposers());
     }
 
     function test_executeProposal_afterCooldown_succeeds() public {
@@ -735,7 +735,9 @@ contract SyndicateGovernorTest is Test {
             7 days,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps(permissiveEnv.maxCapital, _simpleExecuteCalls().length),
             _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps(permissiveEnv.maxCapital, _simpleSettlementCalls().length),
             empty
         );
     }
@@ -831,16 +833,16 @@ contract SyndicateGovernorTest is Test {
         vm.expectEmit(true, true, true, false, address(governor));
         emit ISyndicateGovernor.FeeClamped(expectedId, MAX_PERF_FEE_BPS, 1000);
         vm.prank(agent);
-        governor.propose(
-            address(vault),
+        governor.propose(address(vault),
             address(0),
             "ipfs://test",
             7 days,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
-            _emptyCoProposers()
-        );
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            _emptyCoProposers());
     }
 
     /// @notice H1: no clamp when the vault fee is at or below the cap — the

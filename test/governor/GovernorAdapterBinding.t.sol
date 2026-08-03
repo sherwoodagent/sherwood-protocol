@@ -136,16 +136,16 @@ contract GovernorStrategyOnProposalTest is Test {
 
     function _propose(address strategy) internal returns (uint256 proposalId) {
         vm.prank(agent);
-        proposalId = governor.propose(
-            address(vault),
+        proposalId = governor.propose(address(vault),
             strategy,
             "ipfs://test",
             7 days,
             GovEnvelope.permissive(address(vault)),
             _execCalls(),
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_execCalls()).length),
             _settleCalls(),
-            _emptyCoProposers()
-        );
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_settleCalls()).length),
+            _emptyCoProposers());
         vm.warp(vm.getBlockTimestamp() + 1);
     }
 

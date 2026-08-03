@@ -21,6 +21,7 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "./mocks/MockAgentRegistry.sol";
 import {MockWoodTwapOracle} from "./mocks/MockWoodTwapOracle.sol";
+import {GovEnvelope} from "./helpers/GovEnvelope.sol";
 
 /// @dev Chainlink-shaped USD feed for the vault asset: fixed answer, `decimals`,
 ///      `updatedAt` stamped at construction.
@@ -340,16 +341,16 @@ contract CoverageEndToEndTest is Test {
         BatchExecutorLib.Call[] memory settle
     ) internal returns (uint256) {
         vm.prank(as_);
-        return gov.propose(
-            v,
+        return gov.propose(v,
             address(0),
             "ipfs://coverage-e2e",
             7 days,
             ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000}),
             exec,
+            GovEnvelope.defaultCaps((ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000})).maxCapital, (exec).length),
             settle,
-            new ISyndicateGovernor.CoProposer[](0)
-        );
+            GovEnvelope.defaultCaps((ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000})).maxCapital, (settle).length),
+            new ISyndicateGovernor.CoProposer[](0));
     }
 
     /// @dev Warp to just past `voteEnd` and open the registry-side review — the
@@ -454,29 +455,32 @@ contract CoverageEndToEndTest is Test {
 
         vm.prank(agentA);
         vm.expectRevert(IExposureLedger.CoverageHorizonExceeded.selector);
-        govA.propose(
-            address(vaultA),
+        govA.propose(address(vaultA),
             address(0),
             "ipfs://n11",
-            100 days, // settles far past MAX_COVERAGE_HORIZON
+            100 days,
+            // settles far past MAX_COVERAGE_HORIZON
             ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000}),
             _execCalls(),
+            GovEnvelope.defaultCaps((// settles far past MAX_COVERAGE_HORIZON
+            ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000})).maxCapital, (_execCalls()).length),
             _settleCalls(),
-            cps
-        );
+            GovEnvelope.defaultCaps((// settles far past MAX_COVERAGE_HORIZON
+            ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000})).maxCapital, (_settleCalls()).length),
+            cps);
 
         // An in-horizon duration still proposes on the same path.
         vm.prank(agentA);
-        govA.propose(
-            address(vaultA),
+        govA.propose(address(vaultA),
             address(0),
             "ipfs://n11-ok",
             7 days,
             ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000}),
             _execCalls(),
+            GovEnvelope.defaultCaps((ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000})).maxCapital, (_execCalls()).length),
             _settleCalls(),
-            cps
-        );
+            GovEnvelope.defaultCaps((ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000})).maxCapital, (_settleCalls()).length),
+            cps);
     }
 
     // ── N1: budget exhaustion must not silence the approve side ───────────

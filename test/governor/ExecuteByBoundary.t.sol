@@ -121,16 +121,16 @@ contract ExecuteByBoundaryTest is Test {
     ///      and returns the proposalId plus its `executeBy` timestamp.
     function _createApproved() internal returns (uint256 proposalId, uint256 executeBy) {
         vm.prank(agent);
-        proposalId = governor.propose(
-            address(vault),
+        proposalId = governor.propose(address(vault),
             address(0),
             "ipfs://boundary",
             7 days,
             GovEnvelope.permissive(address(vault)),
             _execCalls(),
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_execCalls()).length),
             _settleCalls(),
-            new ISyndicateGovernor.CoProposer[](0)
-        );
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_settleCalls()).length),
+            new ISyndicateGovernor.CoProposer[](0));
         vm.warp(vm.getBlockTimestamp() + 1);
 
         vm.prank(lp1);

@@ -12,6 +12,7 @@ import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
+import {GovEnvelope} from "../helpers/GovEnvelope.sol";
 
 /// @notice Task 3 — per-proposal risk envelope (spec 2026-07-22 §3.1). The
 ///         proposer declares `maxCapital` (net-outflow ceiling, vault-enforced
@@ -111,16 +112,16 @@ contract RiskEnvelopeTest is Test {
     /// @dev Builds a normal single-proposer proposal carrying the given envelope.
     function _proposeWithEnvelope(uint256 maxCapital, uint16 maxDrawdownBps) internal returns (uint256 proposalId) {
         vm.prank(agent);
-        proposalId = governor.propose(
-            address(vault),
+        proposalId = governor.propose(address(vault),
             address(0),
             "ipfs://risk-envelope",
             7 days,
             ISyndicateGovernor.RiskEnvelope({maxCapital: maxCapital, maxDrawdownBps: maxDrawdownBps}),
             _execCalls(),
+            GovEnvelope.defaultCaps((ISyndicateGovernor.RiskEnvelope({maxCapital: maxCapital, maxDrawdownBps: maxDrawdownBps})).maxCapital, (_execCalls()).length),
             _settleCalls(),
-            new ISyndicateGovernor.CoProposer[](0)
-        );
+            GovEnvelope.defaultCaps((ISyndicateGovernor.RiskEnvelope({maxCapital: maxCapital, maxDrawdownBps: maxDrawdownBps})).maxCapital, (_settleCalls()).length),
+            new ISyndicateGovernor.CoProposer[](0));
     }
 
     function test_proposeStoresEnvelope() public {
@@ -232,8 +233,14 @@ contract RiskEnvelopeTest is Test {
     /// @notice Finding 2: settlement runs under the SAME maxCapital cap as
     ///         execute. A malicious proposer who parks extraction in the
     ///         pre-committed settlementCalls (execute is benign, then
-    ///         self-settle after 1h) must trip MaxNetOutflowExceeded instead of
-    ///         draining uncapped.
+    ///         self-settle after 1h) must trip a hard cap instead of draining
+    ///         uncapped. Issue #43: the single settlement call's declared
+    ///         per-call cap (= maxCapital, the default for a single-call
+    ///         batch) is STRICTLY TIGHTER than the vault's own coarse
+    ///         `maxNetOutflow` check and fires first (design.md D4: batch net
+    ///         outflow <= Σ per-call gross outflows <= Σ caps <= maxCapital,
+    ///         so a correctly-metered batch's vault-level meter cannot fire
+    ///         first) — `CallCapExceeded`, not `MaxNetOutflowExceeded`.
     function test_settlementBatchExceedingMaxCapitalReverts() public {
         address sinkAddr = makeAddr("extractionSink");
         uint256 maxCapital = 1_000e6;
@@ -245,16 +252,18 @@ contract RiskEnvelopeTest is Test {
         });
 
         vm.prank(agent);
-        uint256 pid = governor.propose(
-            address(vault),
+        uint256 pid = governor.propose(address(vault),
             address(0),
             "ipfs://settle-drain",
             7 days,
             ISyndicateGovernor.RiskEnvelope({maxCapital: maxCapital, maxDrawdownBps: 10_000}),
-            _execCalls(), // benign approve — zero net outflow at execute
+            _execCalls(),
+            GovEnvelope.defaultCaps((ISyndicateGovernor.RiskEnvelope({maxCapital: maxCapital, maxDrawdownBps: 10_000})).maxCapital, (_execCalls()).length),
+            // benign approve — zero net outflow at execute
             settleCalls,
-            new ISyndicateGovernor.CoProposer[](0)
-        );
+            GovEnvelope.defaultCaps((ISyndicateGovernor.RiskEnvelope({maxCapital: maxCapital, maxDrawdownBps: 10_000})).maxCapital, (// benign approve — zero net outflow at execute
+            settleCalls).length),
+            new ISyndicateGovernor.CoProposer[](0));
 
         vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
         governor.executeProposal(pid);
@@ -262,7 +271,7 @@ contract RiskEnvelopeTest is Test {
         // Proposer self-settles at the 1h minimum — the drain moment.
         vm.warp(vm.getBlockTimestamp() + 1 hours + 1);
         vm.prank(agent);
-        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.MaxNetOutflowExceeded.selector, drain, maxCapital));
+        vm.expectRevert(abi.encodeWithSelector(BatchExecutorLib.CallCapExceeded.selector, 0, drain, maxCapital));
         governor.settleProposal(pid);
     }
 
@@ -293,16 +302,16 @@ contract RiskEnvelopeTest is Test {
         coProps[0] = ISyndicateGovernor.CoProposer({agent: coAgent, splitBps: 3000});
 
         vm.prank(agent);
-        uint256 pid = governor.propose(
-            address(vault),
+        uint256 pid = governor.propose(address(vault),
             address(0),
             "ipfs://collab-envelope",
             7 days,
             ISyndicateGovernor.RiskEnvelope({maxCapital: 2_000e6, maxDrawdownBps: 750}),
             _execCalls(),
+            GovEnvelope.defaultCaps((ISyndicateGovernor.RiskEnvelope({maxCapital: 2_000e6, maxDrawdownBps: 750})).maxCapital, (_execCalls()).length),
             _settleCalls(),
-            coProps
-        );
+            GovEnvelope.defaultCaps((ISyndicateGovernor.RiskEnvelope({maxCapital: 2_000e6, maxDrawdownBps: 750})).maxCapital, (_settleCalls()).length),
+            coProps);
         assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Draft));
 
         (uint256 maxCapital, uint16 maxDrawdownBps) = governor.getRiskEnvelope(pid);

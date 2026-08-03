@@ -142,16 +142,16 @@ contract CancelProposalTest is Test {
 
     function _propose() internal returns (uint256 pid) {
         vm.prank(agent);
-        pid = governor.propose(
-            address(vault),
+        pid = governor.propose(address(vault),
             address(0),
             "ipfs://test",
             7 days,
             GovEnvelope.permissive(address(vault)),
             _execCalls(),
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_execCalls()).length),
             _settleCalls(),
-            _emptyCoProposers()
-        );
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_settleCalls()).length),
+            _emptyCoProposers());
         vm.warp(vm.getBlockTimestamp() + 1);
     }
 
@@ -214,16 +214,16 @@ contract CancelProposalTest is Test {
         vm.warp(vm.getBlockTimestamp() + COOLDOWN_PERIOD + 1);
 
         vm.prank(agent);
-        uint256 pid2 = governor.propose(
-            address(vault),
+        uint256 pid2 = governor.propose(address(vault),
             address(0),
             "ipfs://retry",
             7 days,
             GovEnvelope.permissive(address(vault)),
             _execCalls(),
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_execCalls()).length),
             _settleCalls(),
-            _emptyCoProposers()
-        );
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_settleCalls()).length),
+            _emptyCoProposers());
         assertGt(pid2, pid);
     }
 

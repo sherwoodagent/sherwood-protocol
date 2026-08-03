@@ -13,6 +13,7 @@ import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
+import {GovEnvelope} from "../helpers/GovEnvelope.sol";
 
 /// @notice Task 5 — propose-time tier resolution (spec 2026-07-22 §3.2). The
 ///         proposal's tier is the MAX tier across its execute calls (resolved
@@ -121,6 +122,36 @@ contract TierResolutionTest is Test {
 
     function _propose(BatchExecutorLib.Call[] memory executeCalls) internal returns (uint256 proposalId) {
         vm.prank(agent);
+        proposalId = governor.propose(address(vault),
+            address(0),
+            "ipfs://tier-resolution",
+            7 days,
+            ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000}),
+            executeCalls,
+            GovEnvelope.defaultCaps((ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000})).maxCapital, (executeCalls).length),
+            _settleCalls(),
+            GovEnvelope.defaultCaps((ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000})).maxCapital, (_settleCalls()).length),
+            new ISyndicateGovernor.CoProposer[](0));
+    }
+
+    /// @dev Variant of `_propose` for the multi-exec-call coverage tests
+    ///      (issue #43): the generic `GovEnvelope.defaultCaps` convention caps
+    ///      only the FIRST call — fine for single-mover batches, but these
+    ///      tests specifically exercise the per-call SUM across MULTIPLE
+    ///      execute calls, so each call needs its own explicit, nonzero cap.
+    ///      Splitting `MAX_CAPITAL` evenly across `executeCalls` is sum-legal
+    ///      by construction (n * (MAX_CAPITAL / n) <= MAX_CAPITAL). The settle
+    ///      leg stays on the single-call default (cap = MAX_CAPITAL, matching
+    ///      the one settlement call every test in this file shares).
+    function _proposeWithSplitExecCaps(BatchExecutorLib.Call[] memory executeCalls)
+        internal
+        returns (uint256 proposalId)
+    {
+        uint256[] memory execCaps = new uint256[](executeCalls.length);
+        for (uint256 i = 0; i < executeCalls.length; i++) {
+            execCaps[i] = MAX_CAPITAL / executeCalls.length;
+        }
+        vm.prank(agent);
         proposalId = governor.propose(
             address(vault),
             address(0),
@@ -128,7 +159,9 @@ contract TierResolutionTest is Test {
             7 days,
             ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000}),
             executeCalls,
+            execCaps,
             _settleCalls(),
+            GovEnvelope.defaultCaps(MAX_CAPITAL, _settleCalls().length),
             new ISyndicateGovernor.CoProposer[](0)
         );
     }
@@ -142,7 +175,10 @@ contract TierResolutionTest is Test {
 
     /// @notice Every call (execute AND settlement — finding 5 counts both)
     ///         certified at tier 0 with a 50 bps bound → proposal tier 0,
-    ///         coverage = Σ per-call bounds = 150 bps of maxCapital.
+    ///         coverage = Σ per-call (cap_i * boundBps_i) / 10_000 (issue #43:
+    ///         per-call, not a shared `maxCapital` notional). Each exec call
+    ///         is capped at MAX_CAPITAL/2 = 500e6 (split evenly, sum-legal);
+    ///         the single settle call keeps the default cap of MAX_CAPITAL.
     function test_allCertifiedTier0CallsYieldTier0Coverage() public {
         _wireTierRegistry();
         tierRegistry.certify(address(mockAdapter), mockAdapter.approve.selector, 0, 50, address(0));
@@ -151,16 +187,20 @@ contract TierResolutionTest is Test {
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](2);
         calls[0] = _certifiedCall();
         calls[1] = _certifiedCall();
-        uint256 pid = _propose(calls);
+        uint256 pid = _proposeWithSplitExecCaps(calls);
 
         assertEq(governor.getProposalTier(pid), 0);
-        // (50 + 50 exec) + (50 settle) = 150 bps of 1_000e6
-        assertEq(governor.getRequiredCoverage(pid), 15e6);
+        // exec: (500e6 * 50/10_000) * 2 calls = 2.5e6 * 2 = 5e6
+        // settle: 1_000e6 (default cap, 1 call) * 50/10_000 = 5e6
+        // total = 10e6
+        assertEq(governor.getRequiredCoverage(pid), 10e6);
     }
 
     /// @notice One certified tier-0 call plus one uncertified selector → the MAX
-    ///         tier wins: proposal is tier 2, and the uncertified calls each
-    ///         contribute full notional (10_000 bps) to the coverage sum.
+    ///         tier wins: proposal is tier 2, and the uncertified call
+    ///         contributes its OWN declared cap at full notional (10_000 bps)
+    ///         to the coverage sum (issue #43: per-call, not a shared
+    ///         `maxCapital` notional per call).
     function test_oneUncertifiedCallMakesProposalTier2() public {
         _wireTierRegistry();
         tierRegistry.certify(address(mockAdapter), mockAdapter.approve.selector, 0, 50, address(0));
@@ -170,12 +210,15 @@ contract TierResolutionTest is Test {
         calls[1] = BatchExecutorLib.Call({
             target: address(mockAdapter), data: abi.encodeCall(mockAdapter.transfer, (address(usdc), 1)), value: 0
         });
-        uint256 pid = _propose(calls);
+        uint256 pid = _proposeWithSplitExecCaps(calls);
 
         assertEq(governor.getProposalTier(pid), 2);
-        // 50 (certified exec) + 10_000 (uncertified exec) + 10_000 (uncertified
-        // settle) = 20_050 bps of 1_000e6
-        assertEq(governor.getRequiredCoverage(pid), 2_005e6);
+        // exec: 500e6 (certified, 50bps) * 50/10_000 = 2.5e6
+        //     + 500e6 (uncertified, 10_000bps) * 10_000/10_000 = 500e6
+        //     = 502.5e6
+        // settle: 1_000e6 (default cap, 1 uncertified call) * 10_000/10_000 = 1_000e6
+        // total = 502.5e6 + 1_000e6 = 1_502_500_000
+        assertEq(governor.getRequiredCoverage(pid), 1_502_500_000);
     }
 
     /// @notice Registry unset (address(0)) → everything defaults to tier 2 /
@@ -209,9 +252,11 @@ contract TierResolutionTest is Test {
 
     /// @notice Finding 5(a): mixed tier-0 (50 bps) + tier-1 (200 bps) calls →
     ///         proposal tier is the MAX (1, not 2), and coverage is the SUM of
-    ///         per-call bounds — 50 + 200 + 50 (settle) = 300 bps — NOT the
-    ///         single max bound (200 bps). Two adapters can each extract their
-    ///         own bound; a max under-counts multi-adapter batches.
+    ///         per-call (cap_i * boundBps_i) contributions — NOT the single
+    ///         max bound (200 bps) and NOT a shared `maxCapital` notional
+    ///         per call (issue #43: each call prices against its OWN declared
+    ///         cap). Two adapters can each extract their own bound; a max
+    ///         under-counts multi-adapter batches.
     function test_mixedTier0AndTier1CoverageIsSumNotMax() public {
         _wireTierRegistry();
         tierRegistry.certify(address(mockAdapter), mockAdapter.approve.selector, 0, 50, address(0));
@@ -223,10 +268,13 @@ contract TierResolutionTest is Test {
         calls[1] = BatchExecutorLib.Call({
             target: address(mockAdapter), data: abi.encodeCall(mockAdapter.transfer, (address(usdc), 1)), value: 0
         }); // tier 1, 200 bps
-        uint256 pid = _propose(calls);
+        uint256 pid = _proposeWithSplitExecCaps(calls);
 
         assertEq(governor.getProposalTier(pid), 1); // max(0, 1)
-        assertEq(governor.getRequiredCoverage(pid), 30e6); // Σ = 300 bps of 1_000e6, not max(200)
+        // exec: 500e6 * 50/10_000 + 500e6 * 200/10_000 = 2.5e6 + 10e6 = 12.5e6
+        // settle: 1_000e6 (default cap, 1 call) * 50/10_000 = 5e6
+        // total = 17.5e6
+        assertEq(governor.getRequiredCoverage(pid), 17_500_000);
     }
 
     // ── Task 6: execute-time tier regression fail-safe (spec §3.2) ──

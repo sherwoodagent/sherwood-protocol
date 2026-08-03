@@ -128,16 +128,16 @@ contract Governor_proposerSelfSettle_minDuration_Test is Test {
 
     function _createAndExecute() internal returns (uint256 pid) {
         vm.prank(agent);
-        pid = governor.propose(
-            address(vault),
+        pid = governor.propose(address(vault),
             address(0),
             "ipfs://self-settle",
             STRATEGY_DURATION,
             GovEnvelope.permissive(address(vault)),
             _execCalls(),
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_execCalls()).length),
             _settleCalls(),
-            _emptyCoProposers()
-        );
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_settleCalls()).length),
+            _emptyCoProposers());
         vm.warp(vm.getBlockTimestamp() + 1);
         vm.prank(lp1);
         governor.vote(pid, ISyndicateGovernor.VoteType.For);

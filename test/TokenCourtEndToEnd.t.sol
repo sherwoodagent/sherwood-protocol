@@ -24,6 +24,7 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "./mocks/MockAgentRegistry.sol";
 import {MockWoodTwapOracle} from "./mocks/MockWoodTwapOracle.sol";
+import {GovEnvelope} from "./helpers/GovEnvelope.sol";
 
 /// @dev Chainlink-shaped USD feed for the vault asset. Mirrors
 ///      `ChallengeEndToEndTest`'s own `ChallengeE2EFeed`.
@@ -146,11 +147,19 @@ contract TokenCourtEndToEndTest is Test {
     uint256 constant LP1_ASSETS = 70_000e6;
 
     uint256 constant MAX_CAPITAL = 500e6;
-    /// @dev maxCapital x (exec 15,000 bps + settle 5,000 bps) / 10,000 -- see
-    ///      `ChallengeEndToEndTest`'s identical constant for the full derivation.
-    uint256 constant REQUIRED_COVERAGE = 1_000e6;
-    uint256 constant COVERAGE_USD = 1_000e18;
-    uint256 constant CHALLENGER_BOND = 1_000e18; // $1,000 x 5% / $0.05
+    /// @dev Issue #43 per-call caps: `_execCalls()` has 2 calls (`poke`
+    ///      certified at CERTIFIED_BOUND_BPS, `bump` uncertified) and the
+    ///      test-fixture default (`GovEnvelope.defaultCaps`) caps only the
+    ///      FIRST call — `poke` gets `maxCapital`, `bump` gets 0 (a zero cap
+    ///      is a legal declaration at every tier: "this call moves no vault
+    ///      asset"). `requiredCoverage` = (maxCapital * 5_000/10_000) [exec
+    ///      poke] + 0 [exec bump, zero cap] + (maxCapital * 5_000/10_000)
+    ///      [settle poke, default cap = maxCapital] = maxCapital = 500e6 —
+    ///      see `ChallengeEndToEndTest`'s identical constant for the full
+    ///      derivation.
+    uint256 constant REQUIRED_COVERAGE = 500e6;
+    uint256 constant COVERAGE_USD = 500e18;
+    uint256 constant CHALLENGER_BOND = 500e18; // $500 x 5% / $0.05
 
     uint16 constant CERTIFIED_BOUND_BPS = 5_000;
 
@@ -347,16 +356,16 @@ contract TokenCourtEndToEndTest is Test {
 
     function _propose() internal returns (uint256) {
         vm.prank(agent);
-        return gov.propose(
-            address(vault),
+        return gov.propose(address(vault),
             address(0),
             "ipfs://token-court-e2e",
             7 days,
             ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000}),
             _execCalls(),
+            GovEnvelope.defaultCaps((ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000})).maxCapital, (_execCalls()).length),
             _settleCalls(),
-            new ISyndicateGovernor.CoProposer[](0)
-        );
+            GovEnvelope.defaultCaps((ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000})).maxCapital, (_settleCalls()).length),
+            new ISyndicateGovernor.CoProposer[](0));
     }
 
     /// @dev propose -> review opens -> g1 approves (coverage committed) ->

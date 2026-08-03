@@ -137,16 +137,16 @@ contract GuardianFeeBuybackTest is Test {
         vm.prank(owner);
         vault.setAgentFeeBps(perfFeeBps);
         vm.prank(agent);
-        proposalId = governor.propose(
-            address(vault),
+        proposalId = governor.propose(address(vault),
             address(0),
             "ipfs://test",
             duration,
             GovEnvelope.permissive(address(vault)),
             _noopCalls(),
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_noopCalls()).length),
             _noopCalls(),
-            new ISyndicateGovernor.CoProposer[](0)
-        );
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_noopCalls()).length),
+            new ISyndicateGovernor.CoProposer[](0));
         vm.warp(block.timestamp + 1);
 
         vm.prank(lp1);

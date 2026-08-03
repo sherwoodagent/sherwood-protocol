@@ -18,6 +18,7 @@ import {MockRegistryMinimal} from "./mocks/MockRegistryMinimal.sol";
 import {MockWoodTwapOracle} from "./mocks/MockWoodTwapOracle.sol";
 import {ProtocolConfig} from "../src/ProtocolConfig.sol";
 import {TierRegistry} from "../src/TierRegistry.sol";
+import {GovEnvelope} from "./helpers/GovEnvelope.sol";
 
 /// @dev Minimal sWOOD read surface the ExposureLedger constructor consumes.
 ///      `coolDownPeriod` (45d) covers epochLength (28d) + challengeWindow (14d).
@@ -317,16 +318,16 @@ contract GovernorCoverageGatesTest is Test {
 
     function _proposeSolo(SyndicateGovernor gov, address v, address as_, uint256 cap) internal returns (uint256) {
         vm.prank(as_);
-        return gov.propose(
-            v,
+        return gov.propose(v,
             address(0),
             "uri",
             7 days,
             _envelope(cap),
             _execCalls(),
+            GovEnvelope.defaultCaps((_envelope(cap)).maxCapital, (_execCalls()).length),
             _settleCalls(),
-            new ISyndicateGovernor.CoProposer[](0)
-        );
+            GovEnvelope.defaultCaps((_envelope(cap)).maxCapital, (_settleCalls()).length),
+            new ISyndicateGovernor.CoProposer[](0));
     }
 
     // ── Tests ──
@@ -338,16 +339,16 @@ contract GovernorCoverageGatesTest is Test {
         ledger.setCoveredTvlCapUsd(100e18); // $100 cap
         vm.prank(agent);
         vm.expectRevert(IExposureLedger.CoveredTvlCapExceeded.selector);
-        governor.propose(
-            address(vault),
+        governor.propose(address(vault),
             address(0),
             "uri",
             7 days,
             _envelope(1_000e6),
             _execCalls(),
+            GovEnvelope.defaultCaps((_envelope(1_000e6)).maxCapital, (_execCalls()).length),
             _settleCalls(),
-            new ISyndicateGovernor.CoProposer[](0)
-        );
+            GovEnvelope.defaultCaps((_envelope(1_000e6)).maxCapital, (_settleCalls()).length),
+            new ISyndicateGovernor.CoProposer[](0));
     }
 
     /// @notice The bond is coverage × bps ÷ WOOD price. $1,000 coverage, 100 bps
@@ -355,16 +356,16 @@ contract GovernorCoverageGatesTest is Test {
     ///         the stored `proposerBondWood` must reflect it.
     function test_propose_locksRiskScaledBond() public {
         vm.prank(agent);
-        uint256 pid = governor.propose(
-            address(vault),
+        uint256 pid = governor.propose(address(vault),
             address(0),
             "uri",
             7 days,
             _envelope(1_000e6),
             _execCalls(),
+            GovEnvelope.defaultCaps((_envelope(1_000e6)).maxCapital, (_execCalls()).length),
             _settleCalls(),
-            new ISyndicateGovernor.CoProposer[](0)
-        );
+            GovEnvelope.defaultCaps((_envelope(1_000e6)).maxCapital, (_settleCalls()).length),
+            new ISyndicateGovernor.CoProposer[](0));
         (address p, uint256 amt) = escrow.bondOf(address(governor), pid);
         assertEq(p, agent);
         assertEq(amt, 200e18);
@@ -386,32 +387,32 @@ contract GovernorCoverageGatesTest is Test {
         vm.expectRevert(
             abi.encodeWithSelector(IERC20Errors.ERC20InsufficientAllowance.selector, address(escrow), 0, 200e18)
         );
-        governor.propose(
-            address(vault),
+        governor.propose(address(vault),
             address(0),
             "uri",
             7 days,
             _envelope(1_000e6),
             _execCalls(),
+            GovEnvelope.defaultCaps((_envelope(1_000e6)).maxCapital, (_execCalls()).length),
             _settleCalls(),
-            new ISyndicateGovernor.CoProposer[](0)
-        );
+            GovEnvelope.defaultCaps((_envelope(1_000e6)).maxCapital, (_settleCalls()).length),
+            new ISyndicateGovernor.CoProposer[](0));
     }
 
     /// @notice A governor with no ledger wired skips both gates: no cap check, no
     ///         bond, `proposerBondWood` stays zero.
     function test_propose_ledgerUnwired_skipsGates() public {
         vm.prank(agent2);
-        uint256 pid = unwiredGovernor.propose(
-            address(unwiredVault),
+        uint256 pid = unwiredGovernor.propose(address(unwiredVault),
             address(0),
             "uri",
             7 days,
             _envelope(1_000e6),
             _execCalls(),
+            GovEnvelope.defaultCaps((_envelope(1_000e6)).maxCapital, (_execCalls()).length),
             _settleCalls(),
-            new ISyndicateGovernor.CoProposer[](0)
-        );
+            GovEnvelope.defaultCaps((_envelope(1_000e6)).maxCapital, (_settleCalls()).length),
+            new ISyndicateGovernor.CoProposer[](0));
         assertEq(unwiredGovernor.getProposal(pid).proposerBondWood, 0);
     }
 
@@ -424,9 +425,16 @@ contract GovernorCoverageGatesTest is Test {
     ///         maps the zero `collaborationDeadline` to Expired.
     function test_propose_collaborativeDraft_bondsAndStaysDraft() public {
         vm.prank(agent);
-        uint256 pid = governor.propose(
-            address(vault), address(0), "uri", 7 days, _envelope(1_000e6), _execCalls(), _settleCalls(), _coProposers()
-        );
+        uint256 pid = governor.propose(address(vault),
+            address(0),
+            "uri",
+            7 days,
+            _envelope(1_000e6),
+            _execCalls(),
+            GovEnvelope.defaultCaps((_envelope(1_000e6)).maxCapital, (_execCalls()).length),
+            _settleCalls(),
+            GovEnvelope.defaultCaps((_envelope(1_000e6)).maxCapital, (_settleCalls()).length),
+            _coProposers());
 
         // Bond locked against the collaborative Draft.
         (address p, uint256 amt) = escrow.bondOf(address(governor), pid);
@@ -469,9 +477,16 @@ contract GovernorCoverageGatesTest is Test {
         rwood.arm(address(governor), pid);
 
         vm.prank(agent);
-        uint256 got = governor.propose(
-            address(vault), address(0), "uri", 7 days, _envelope(1_000e6), _execCalls(), _settleCalls(), _coProposers()
-        );
+        uint256 got = governor.propose(address(vault),
+            address(0),
+            "uri",
+            7 days,
+            _envelope(1_000e6),
+            _execCalls(),
+            GovEnvelope.defaultCaps((_envelope(1_000e6)).maxCapital, (_execCalls()).length),
+            _settleCalls(),
+            GovEnvelope.defaultCaps((_envelope(1_000e6)).maxCapital, (_settleCalls()).length),
+            _coProposers());
         assertEq(got, pid);
         // The hook really did re-enter (otherwise this test proves nothing).
         assertTrue(rwood.reentered(), "reentry did not fire");
@@ -494,16 +509,16 @@ contract GovernorCoverageGatesTest is Test {
         ledger.setCoveredTvlCapUsd(100e18);
         vm.prank(agent);
         vm.expectRevert(IExposureLedger.CoveredTvlCapExceeded.selector);
-        governor.propose(
-            address(vault),
+        governor.propose(address(vault),
             address(0),
             "uri",
             7 days,
             _envelope(1_000e6),
             _execCalls(),
+            GovEnvelope.defaultCaps((_envelope(1_000e6)).maxCapital, (_execCalls()).length),
             _settleCalls(),
-            new ISyndicateGovernor.CoProposer[](0)
-        );
+            GovEnvelope.defaultCaps((_envelope(1_000e6)).maxCapital, (_settleCalls()).length),
+            new ISyndicateGovernor.CoProposer[](0));
 
         // Under the cap: proposal goes through with no bond.
         vm.prank(ledgerOwner);

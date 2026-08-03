@@ -165,16 +165,16 @@ contract CollaborativeProposalsTest is Test {
         vm.prank(owner);
         vault.setAgentFeeBps(1500);
         vm.prank(leadAgent);
-        proposalId = governor.propose(
-            address(vault),
+        proposalId = governor.propose(address(vault),
             address(0),
             "ipfs://collab",
             7 days,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
-            coProps
-        );
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            coProps);
     }
 
     /// @dev Create collab proposal, get all approvals, advance to Pending
@@ -207,16 +207,16 @@ contract CollaborativeProposalsTest is Test {
 
     function test_soloProposal_backwardCompatible() public {
         vm.prank(leadAgent);
-        uint256 proposalId = governor.propose(
-            address(vault),
+        uint256 proposalId = governor.propose(address(vault),
             address(0),
             "ipfs://solo",
             7 days,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
-            _emptyCoProposers()
-        );
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            _emptyCoProposers());
 
         ISyndicateGovernor.StrategyProposal memory p = governor.getProposal(proposalId);
         assertEq(uint256(p.state), uint256(ISyndicateGovernor.ProposalState.Pending));
@@ -229,16 +229,16 @@ contract CollaborativeProposalsTest is Test {
         vm.prank(owner);
         vault.setAgentFeeBps(1500);
         vm.prank(leadAgent);
-        uint256 proposalId = governor.propose(
-            address(vault),
+        uint256 proposalId = governor.propose(address(vault),
             address(0),
             "ipfs://solo",
             7 days,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
-            _emptyCoProposers()
-        );
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            _emptyCoProposers());
         vm.warp(block.timestamp + 1);
 
         vm.prank(lp1);
@@ -476,16 +476,16 @@ contract CollaborativeProposalsTest is Test {
         vm.prank(owner);
         vault.setAgentFeeBps(1500);
         vm.prank(leadAgent);
-        uint256 proposalId = governor.propose(
-            address(vault),
+        uint256 proposalId = governor.propose(address(vault),
             address(0),
             "ipfs://round",
             7 days,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
-            coProps
-        );
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            coProps);
 
         vm.prank(coAgent1);
         governor.approveCollaboration(proposalId);
@@ -551,16 +551,16 @@ contract CollaborativeProposalsTest is Test {
         vm.prank(owner);
         vault.setAgentFeeBps(1500);
         vm.prank(leadAgent);
-        uint256 proposalId = governor.propose(
-            address(vault),
+        uint256 proposalId = governor.propose(address(vault),
             address(0),
             "ipfs://tiny",
             7 days,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
-            coProps
-        );
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            coProps);
         vm.prank(coAgent1);
         governor.approveCollaboration(proposalId);
         vm.prank(coAgent2);
@@ -640,16 +640,16 @@ contract CollaborativeProposalsTest is Test {
 
         vm.prank(leadAgent);
         vm.expectRevert(ISyndicateGovernor.LeadSplitTooLow.selector);
-        governor.propose(
-            address(vault),
+        governor.propose(address(vault),
             address(0),
             "ipfs://test",
             7 days,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
-            coProps
-        );
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            coProps);
     }
 
     function test_validation_splitTooLow() public {
@@ -658,16 +658,16 @@ contract CollaborativeProposalsTest is Test {
 
         vm.prank(leadAgent);
         vm.expectRevert(ISyndicateGovernor.SplitTooLow.selector);
-        governor.propose(
-            address(vault),
+        governor.propose(address(vault),
             address(0),
             "ipfs://test",
             7 days,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
-            coProps
-        );
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            coProps);
     }
 
     function test_validation_tooManyCoProposers() public {
@@ -692,16 +692,16 @@ contract CollaborativeProposalsTest is Test {
 
         vm.prank(leadAgent);
         vm.expectRevert(ISyndicateGovernor.TooManyCoProposers.selector);
-        governor.propose(
-            address(vault),
+        governor.propose(address(vault),
             address(0),
             "ipfs://test",
             7 days,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
-            coProps
-        );
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            coProps);
     }
 
     function test_validation_unregisteredAgent() public {
@@ -710,16 +710,16 @@ contract CollaborativeProposalsTest is Test {
 
         vm.prank(leadAgent);
         vm.expectRevert(ISyndicateGovernor.NotRegisteredAgent.selector);
-        governor.propose(
-            address(vault),
+        governor.propose(address(vault),
             address(0),
             "ipfs://test",
             7 days,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
-            coProps
-        );
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            coProps);
     }
 
     function test_validation_duplicateCoProposer() public {
@@ -729,16 +729,16 @@ contract CollaborativeProposalsTest is Test {
 
         vm.prank(leadAgent);
         vm.expectRevert(ISyndicateGovernor.DuplicateCoProposer.selector);
-        governor.propose(
-            address(vault),
+        governor.propose(address(vault),
             address(0),
             "ipfs://test",
             7 days,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
-            coProps
-        );
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            coProps);
     }
 
     /// @notice P1: a collaborative proposal snapshots the fee at Draft creation

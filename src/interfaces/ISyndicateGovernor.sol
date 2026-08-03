@@ -506,6 +506,18 @@ interface ISyndicateGovernor {
     ///         Pass `address(0)` for a queue-only proposal (no instant lane).
     /// @dev    The strategy is set immutably at propose time — voters approve
     ///         based on this address, and there is no later bind / rebind path.
+    /// @dev    BREAKING ABI CHANGE (issue #43): `executeCallCaps` and
+    ///         `settlementCallCaps` are new parallel arrays, one `uint256` per
+    ///         entry in `executeCalls`/`settlementCalls` respectively — each
+    ///         call's own declared gross-outflow cap, denominated in the vault
+    ///         asset. Zero is a legal declaration at every tier ("this call
+    ///         moves no vault asset"). `Σ executeCallCaps` and
+    ///         `Σ settlementCallCaps` must each be `<= envelope.maxCapital`,
+    ///         checked PER BATCH (not combined — the two batches run in
+    ///         separate transactions, each independently bounded by the
+    ///         vault's `maxCapital` net-outflow meter; an honest settlement
+    ///         legitimately re-moves the same capital the execute batch
+    ///         deployed).
     function propose(
         address vault,
         address strategy,
@@ -513,7 +525,9 @@ interface ISyndicateGovernor {
         uint256 strategyDuration,
         RiskEnvelope calldata envelope,
         BatchExecutorLib.Call[] calldata executeCalls,
+        uint256[] calldata executeCallCaps,
         BatchExecutorLib.Call[] calldata settlementCalls,
+        uint256[] calldata settlementCallCaps,
         CoProposer[] calldata coProposers
     ) external returns (uint256 proposalId);
 

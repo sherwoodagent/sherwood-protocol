@@ -218,6 +218,18 @@ abstract contract BaseIntegrationTest is Test {
         vm.prank(owner);
         vault.setAgentFeeBps(feeBps);
 
+        // Issue #43: every exec batch built by this file's strategy test
+        // suites is `[approve(strategy, amount), strategy.execute()]` — the
+        // MOVER (`execute()`, which pulls `amount` from the vault) is at the
+        // LAST index, not the first, so the generic
+        // `GovEnvelope.defaultCaps` convention (cap the FIRST call) would
+        // zero-cap the actual mover and trip `CallCapExceeded`. Cap the LAST
+        // exec call instead; settle batches here are single-call, so first
+        // and last coincide and the generic default stays correct for them.
+        uint256 maxCapital = GovEnvelope.permissive(address(vault)).maxCapital;
+        uint256[] memory execCaps = new uint256[](execCalls.length);
+        if (execCalls.length > 0) execCaps[execCalls.length - 1] = maxCapital;
+
         // Agent proposes
         vm.prank(agent);
         proposalId = governor.propose(
@@ -227,7 +239,9 @@ abstract contract BaseIntegrationTest is Test {
             duration,
             GovEnvelope.permissive(address(vault)),
             execCalls,
+            execCaps,
             settleCalls,
+            GovEnvelope.defaultCaps(maxCapital, settleCalls.length),
             _emptyCoProposers()
         );
 
