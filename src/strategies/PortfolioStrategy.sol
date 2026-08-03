@@ -45,6 +45,21 @@ interface IFeedBindingPath {
     function instantCapAssets(address token) external view returns (uint256);
 }
 
+/// @notice The hops walked to resolve the governance-owned adapter allowlist
+///         from this strategy: `vault()` → `governor()` → `tierRegistry()` →
+///         `isAdapterAllowed(spender)`. The SAME registry, reached the same
+///         way, that `SyndicateVault._guardBatchCalls` gates the spender of
+///         every value-moving ERC-20 selector in a governor batch against.
+/// @dev    Declared locally for the same reason as `IFeedBindingPath`: every
+///         hop is a length-checked raw staticcall, so the strategy takes on no
+///         type dependency and no hop can revert `_initialize`. This interface
+///         exists to generate selectors, not to type the responses.
+interface ITierBindingPath {
+    function governor() external view returns (address);
+    function tierRegistry() external view returns (address);
+    function isAdapterAllowed(address adapter) external view returns (bool);
+}
+
 /// @notice Decoded Chainlink Data Streams V3 report
 struct ChainlinkReport {
     bytes32 feedId;
@@ -121,6 +136,14 @@ contract PortfolioStrategy is BaseStrategy {
     /// @notice The unwind could not raise the requested assets within the
     ///         slippage bound — all-or-revert, no partial delivery.
     error InsufficientUnwindProceeds();
+    /// @notice The proposer-supplied `swapAdapter_` is not allowlisted in the
+    ///         `TierRegistry` the vault's own governor gates batch approvals
+    ///         against. Adversary: a proposer naming an address they control as
+    ///         the swap adapter, which `_execute` then `forceApprove`s the
+    ///         vault's whole capital to — one hop outside the batch guard that
+    ///         would otherwise have caught it. See the binding note on
+    ///         `_initialize`.
+    error AdapterNotAllowed(address swapAdapter, address registry);
 
     // ── Constants ──
     uint256 public constant MAX_BASKET_SIZE = 20;
@@ -128,11 +151,13 @@ contract PortfolioStrategy is BaseStrategy {
     /// @notice Hard ceiling on the swap slippage tolerance, at init and on every
     ///         update (10%). Live baskets run at 100–500 bps, so this bounds the
     ///         parameter well above real use while excluding degenerate settings.
-    /// @dev    NOT sandwich protection on its own: `_quoteMinOut` measures against
-    ///         a quote taken in the same transaction as the swap, so this bounds
-    ///         drift from that quote, not from a fair price. The oracle-anchored
-    ///         floor is `rebalanceDelta`, which prices off signed Chainlink
-    ///         reports; see the note on `_quoteMinOut`.
+    /// @dev    In PUSH mode this is a real bound on a fair price: every swap
+    ///         path floors at the Chainlink mark as well as the adapter quote,
+    ///         taking whichever is stronger (`_legMinOut`), and `rebalanceDelta`
+    ///         prices off the oracle alone. In DATA STREAMS mode `execute` /
+    ///         `settle` / `rebalance` have no on-chain mark to read, so there
+    ///         this bounds drift from a same-transaction quote rather than from
+    ///         a fair price — see the residual on `_legMinOut`.
     uint256 public constant MAX_SLIPPAGE_CEILING_BPS = 1_000;
     /// @notice Hard floor on the swap slippage tolerance, at init and on every
     ///         update (50 bps). `maxSlippageBps` doubles as the mark-anchored
@@ -289,6 +314,34 @@ contract PortfolioStrategy is BaseStrategy {
     ///         `withdrawTo` is therefore never called — the unbound mark is
     ///         inert. Its one residual window, a token listed only AFTER init,
     ///         is closed by re-binding on every read in `_pushMark`.
+    ///
+    ///         SWAP-ADAPTER BINDING. `swapAdapter_` is proposer input and
+    ///         `_execute` `forceApprove`s it the whole of `totalAmount` — the
+    ///         vault's capital — from inside the strategy, one hop OUTSIDE the
+    ///         governor batch. `SyndicateVault._guardBatchCalls` gates the
+    ///         spender of every approve/transfer in the batch against
+    ///         `TierRegistry.isAdapterAllowed` and calls that "a complete bound
+    ///         on ERC20 exfiltration"; the strategy's own re-approval is the
+    ///         hop that bound does not see. Adversary: a proposer naming an
+    ///         address they control as the swap adapter and draining the
+    ///         approval in a later transaction. So the adapter must be
+    ///         allowlisted in the SAME registry, resolved through
+    ///         `vault() → governor() → tierRegistry()`.
+    ///         CONDITIONAL, by exactly one condition: skipped when that walk
+    ///         yields no registry (no `governor()` surface, a governor
+    ///         predating the getter, or `tierRegistry() == 0`). Skipping is
+    ///         safe and is NOT attacker-forcible: the whole walk starts at
+    ///         `vault()`, which the proposer does not supply, so nothing in the
+    ///         init calldata can steer it. And that skip condition is exactly
+    ///         the condition under which `_guardBatchCalls` disables ITSELF
+    ///         ("UNSET REGISTRY: the guard cannot run and the batch is
+    ///         unguarded by design") — with no registry the governor batch can
+    ///         already approve vault funds to any address, so the strategy's
+    ///         re-approval grants nothing that is not already granted. Where
+    ///         the registry IS live the requirement is hard: governance must
+    ///         allowlist the swap adapter, the same one-line action it already
+    ///         performs for the strategy clone itself so the batch's
+    ///         `asset.approve(strategy, …)` can pass.
     function _initialize(bytes calldata data) internal override {
         (
             address asset_,
@@ -306,6 +359,9 @@ contract PortfolioStrategy is BaseStrategy {
         );
 
         if (asset_ == address(0) || swapAdapter_ == address(0)) revert ZeroAddress();
+        // Bind the proposer's swap adapter to the governance allowlist before
+        // anything else is written (see the swap-adapter binding note above).
+        _requireAllowedAdapter(swapAdapter_);
         if (tokens.length == 0 || tokens.length > MAX_BASKET_SIZE) revert TooManyTokens();
         if (tokens.length != weightsBps.length || tokens.length != swapExtraData_.length) revert LengthMismatch();
         if (tokens.length != priceDecimals_.length || tokens.length != feedIds_.length) revert LengthMismatch();
@@ -343,7 +399,7 @@ contract PortfolioStrategy is BaseStrategy {
                 // Loud here, fail-soft on read: a mismatch is a proposal that
                 // should never have been written, so it dies at creation rather
                 // than silently pinning the basket to Lane B months later.
-                address registered = _registeredAggregator(feedRegistry, tokens[i]);
+                (address registered,) = _registeredFeed(feedRegistry, tokens[i]);
                 if (registered != address(0) && registered != feed) {
                     revert FeedNotRegistered(tokens[i], feed, registered);
                 }
@@ -376,9 +432,14 @@ contract PortfolioStrategy is BaseStrategy {
 
     // ── Execute: buy basket tokens ──
 
+    /// @dev NOT terminal: an unquotable leg still reverts `QuoteUnavailable`
+    ///      here rather than falling back to the mark alone (see `_legMinOut`)
+    ///      — a route whose quoter cannot price it has no business receiving
+    ///      the vault's capital, and nothing is stranded by refusing to enter.
     function _execute() internal override {
         _pullFromVault(asset, totalAmount);
 
+        address registry = _markRegistry();
         uint256 len = _allocations.length;
         for (uint256 i; i < len; ++i) {
             TokenAllocation storage alloc = _allocations[i];
@@ -386,7 +447,7 @@ contract PortfolioStrategy is BaseStrategy {
             if (allocation == 0) continue;
 
             IERC20(asset).forceApprove(address(swapAdapter), allocation);
-            uint256 minOut = _quoteMinOut(asset, alloc.token, allocation, _swapExtraData[i]);
+            uint256 minOut = _legMinOut(i, true, allocation, registry, false);
             uint256 amountOut = swapAdapter.swap(asset, alloc.token, allocation, minOut, _swapExtraData[i]);
             if (amountOut == 0) revert SwapFailed();
 
@@ -399,7 +460,16 @@ contract PortfolioStrategy is BaseStrategy {
 
     // ── Settle: sell all basket tokens ──
 
+    /// @dev THE terminal unwind — the `terminal` flag on `_legMinOut` is set
+    ///      here and nowhere else. A leg whose quote is unavailable falls back
+    ///      to the push-feed mark floor instead of reverting the whole
+    ///      settlement. Adversary: a proposer who routed a slot through a pool
+    ///      they solely LP, and withdraws that liquidity after execute. Routes
+    ///      are frozen by `RoutesFrozen`, so they cannot be repointed; without
+    ///      the fallback one dead quoter reverts `_settle` forever and the
+    ///      vault's capital is hostage to an owner + guardian emergency path.
     function _settle() internal override {
+        address registry = _markRegistry();
         uint256 len = _allocations.length;
         for (uint256 i; i < len; ++i) {
             TokenAllocation storage alloc = _allocations[i];
@@ -407,7 +477,7 @@ contract PortfolioStrategy is BaseStrategy {
             if (bal == 0) continue;
 
             IERC20(alloc.token).forceApprove(address(swapAdapter), bal);
-            uint256 minOut = _quoteMinOut(alloc.token, asset, bal, _swapExtraData[i]);
+            uint256 minOut = _legMinOut(i, false, bal, registry, true);
             swapAdapter.swap(alloc.token, asset, bal, minOut, _swapExtraData[i]);
 
             alloc.tokenAmount = 0;
@@ -451,12 +521,16 @@ contract PortfolioStrategy is BaseStrategy {
             maxSlippageBps = newMaxSlippageBps;
         }
 
-        // Routes are frozen once the proposal executes: `_quoteMinOut` prices the
-        // SAME `extraData` route it swaps through, so rewriting the route would
-        // move the slippage floor with it — `maxSlippageBps` can't bound that
-        // because the percentage applies to the attacker's own quote.
-        // `rebalanceDelta` stays available since its floors come from signed
-        // oracle feeds rather than the route.
+        // Routes are frozen once the proposal executes: the quote half of
+        // `_legMinOut` prices the SAME `extraData` route it swaps through, so
+        // rewriting the route would move that half of the floor with it, and
+        // `maxSlippageBps` can't bound it because the percentage applies to the
+        // attacker's own quote. In push mode the mark half of the floor is
+        // route-independent and would survive a rewrite; the freeze stays
+        // because Data Streams mode has no mark, because the routes are what
+        // the guardian review actually reviewed, and because a repointed route
+        // is a new venue nobody vouched for. `rebalanceDelta` stays available
+        // since its floors come from oracle feeds rather than the route.
         if (newSwapExtraData.length > 0) revert RoutesFrozen();
     }
 
@@ -464,11 +538,17 @@ contract PortfolioStrategy is BaseStrategy {
 
     /// @notice Simple rebalance: sell all positions, re-buy at current target weights.
     ///         Proposer-only, Executed state only.
+    /// @dev NOT terminal: like `_execute`, an unquotable leg reverts rather
+    ///      than falling back to a mark-only floor. `rebalance()` is
+    ///      `onlyProposer` with no cooldown — it is the most repeatable of the
+    ///      three swap paths and gets the strictest availability requirement,
+    ///      and refusing to rebalance strands nothing (`_settle` still exits).
     function rebalance() external onlyProposer {
         if (_state != State.Executed) revert NotExecuted();
         if (_rebalancing) revert RebalancingInProgress();
         _rebalancing = true;
 
+        address registry = _markRegistry();
         uint256 len = _allocations.length;
 
         // Snapshot before state for event
@@ -490,7 +570,7 @@ contract PortfolioStrategy is BaseStrategy {
             if (bal == 0) continue;
 
             IERC20(alloc.token).forceApprove(address(swapAdapter), bal);
-            uint256 minOut = _quoteMinOut(alloc.token, asset, bal, _swapExtraData[i]);
+            uint256 minOut = _legMinOut(i, false, bal, registry, false);
             swapAdapter.swap(alloc.token, asset, bal, minOut, _swapExtraData[i]);
             alloc.tokenAmount = 0;
             alloc.investedAmount = 0;
@@ -504,7 +584,7 @@ contract PortfolioStrategy is BaseStrategy {
             if (allocation == 0) continue;
 
             IERC20(asset).forceApprove(address(swapAdapter), allocation);
-            uint256 minOut = _quoteMinOut(asset, alloc.token, allocation, _swapExtraData[i]);
+            uint256 minOut = _legMinOut(i, true, allocation, registry, false);
             uint256 amountOut = swapAdapter.swap(asset, alloc.token, allocation, minOut, _swapExtraData[i]);
             if (amountOut == 0) revert SwapFailed();
 
@@ -560,8 +640,9 @@ contract PortfolioStrategy is BaseStrategy {
         // magnitude and propagate into the target/overweight/underweight math.
         uint256 totalValue;
         uint256 assetDec = uint256(_assetDecimals);
+        address registry = _markRegistry();
         for (uint256 i; i < len; ++i) {
-            snap.prices[i] = _verifyPrice(i, priceReports[i]);
+            snap.prices[i] = _verifyPrice(i, priceReports[i], registry);
             snap.currentValues[i] = _tokensToValue(snap.oldBalances[i], snap.prices[i], i, assetDec);
             totalValue += snap.currentValues[i];
         }
@@ -705,42 +786,121 @@ contract PortfolioStrategy is BaseStrategy {
 
     // ── Slippage helper ──
 
-    /// @dev Adapter-quote-driven minOut. Adapters with reliable quote() (e.g.
-    ///      UniswapSwapAdapter against a real V3 pool) return the expected
-    ///      output, off which we apply maxSlippageBps. Adapters whose quote()
-    ///      returns 0 or reverts cannot guarantee slippage, so we revert with
-    ///      `QuoteUnavailable`.
+    /// @dev The `minOut` for one swap leg of allocation `i`, in `tokenOut`
+    ///      units. Two INDEPENDENT lower bounds on fair output exist, and the
+    ///      floor is the STRONGER (larger) of the two, each already discounted
+    ///      by `maxSlippageBps`:
+    ///        - the ADAPTER QUOTE through the slot's frozen route;
+    ///        - the CHAINLINK PUSH MARK — the same anchor `_sellForUnwind`
+    ///          already floors every instant-exit leg at.
     ///
-    ///      NOT SANDWICH PROTECTION, and it must not be described as such. The
-    ///      quote is taken in the same transaction — and through the same
-    ///      `extraData` route — as the swap that follows, so both operands come
-    ///      from the same pool state. What this bounds is drift between the
-    ///      quote and the execution, which within one transaction is zero; it
-    ///      does NOT bound the price against a fair external reference. A
-    ///      searcher who moves the pool before the call gets a quote at the
-    ///      moved price and a floor derived from it, and the swap clears.
-    ///      `UniswapSwapAdapter._swapV4` states the same reasoning for its own
-    ///      construction.
+    ///      WHY THE MARK AT ALL. The quote alone is not sandwich protection and
+    ///      must not be described as such: it is taken in the same transaction,
+    ///      through the same `extraData` route, as the swap it floors, so both
+    ///      operands come from one pool state and the bound is self-referential
+    ///      — `maxSlippageBps` bounds drift from the attacker's own number, not
+    ///      from a fair price. Adversary: `rebalance()` is `onlyProposer` with
+    ///      no cooldown and `settleProposal` is proposer-callable an hour after
+    ///      execute, so a proposer who moves the route pool first gets a quote
+    ///      at the moved price AND a floor derived from it, and the swap clears
+    ///      — a repeatable PRIVILEGED extraction, not merely searcher MEV.
     ///
-    ///      The oracle-anchored path is `rebalanceDelta`, which derives its
-    ///      floors from signed Chainlink reports via `_verifyPrice` /
-    ///      `_tokensToValue` and does not consult the adapter quote at all.
-    ///      Extending that anchoring to `execute` / `settle` / `rebalance`
-    ///      requires price data at those call sites, which their `IStrategy`
-    ///      signatures do not carry — tracked separately. Until then the
-    ///      exposure is bounded by `MAX_SLIPPAGE_CEILING_BPS`, by the routes
-    ///      being frozen at execute, and by the guardian review of the routes
-    ///      the proposal declared.
-    function _quoteMinOut(address tokenIn, address tokenOut, uint256 amountIn, bytes memory extraData)
+    ///      WHY MAX, NOT MIN. Taking the MINIMUM of the two would leave that
+    ///      attack intact: the manipulated quote is the SMALLER number in
+    ///      exactly the direction that pays the attacker (on a sell it is the
+    ///      pool pushed below the mark; on a buy it is the pool pushed above
+    ///      it), so a min-floor still clears. `max` means the pool cannot pull
+    ///      the floor below the mark. It is symmetric on the other side too:
+    ///      the mark comes from a PROPOSER-declared feed, and where the feed
+    ///      registry does not resolve that feed is unbound, so a mark reading
+    ///      the wrong way must not be able to pull the floor below the quote
+    ///      either. `max` never returns a floor weaker than the one this
+    ///      contract enforced before.
+    ///
+    ///      LIVENESS COST OF MAX OVER A MARK-ONLY FLOOR: none. `quoteFloor` is
+    ///      `quote * (1 - maxSlippageBps)` while the pool delivers ~`quote`, so
+    ///      the quote term never binds; a leg reverts iff the MARK exceeds the
+    ///      executable price by more than `maxSlippageBps` — precisely the
+    ///      stale / held-mark regime in which the basket should not be trading,
+    ///      and the regime `Erc20SpotAdapter`'s divergence gate exists to close
+    ///      on the valuation side. Deployments are expected to set
+    ///      `maxSlippageBps` above the registered `maxDivergenceBps` plus the
+    ///      venue fee (the same relation `availableLiquidity` documents).
+    ///
+    ///      DATA STREAMS MODE (`chainlinkVerifier != 0`) has no on-chain mark
+    ///      to read — the price only exists inside a signed report the
+    ///      `IStrategy` execute/settle signatures cannot carry — so it keeps
+    ///      the quote-only floor and keeps the residual above. Push mode is the
+    ///      mode that gets the guarantee; `rebalanceDelta` is oracle-anchored
+    ///      in both modes.
+    /// @param buy      true: asset → token (`amountIn` in asset units, output
+    ///                 in token units). false: token → asset. The mark is a
+    ///                 TOKEN price, so the two legs invert its application —
+    ///                 `_valueToTokens` on the buy, `_tokensToValue` on the
+    ///                 sell. Getting this backwards silently inverts the floor.
+    /// @param terminal True only on `_settle`. See `_settle` for why the mark
+    ///                 alone is accepted there when no quote is available, and
+    ///                 `_execute` / `rebalance` for why it is not accepted
+    ///                 there. With NEITHER a quote nor a mark the leg reverts
+    ///                 on every path including settle: an unfloored `minOut` on
+    ///                 a frozen route the proposer chose is a signed blank
+    ///                 cheque, strictly worse than a stuck settlement that the
+    ///                 owner + guardian emergency path can still resolve.
+    function _legMinOut(uint256 i, bool buy, uint256 amountIn, address registry, bool terminal)
         internal
         returns (uint256)
     {
-        try swapAdapter.quote(tokenIn, tokenOut, amountIn, extraData) returns (uint256 expected) {
-            if (expected == 0) revert QuoteUnavailable();
-            return (expected * (BPS_DENOMINATOR - maxSlippageBps)) / BPS_DENOMINATOR;
+        (uint256 markFloor, bool okMark) = _markFloor(i, buy, amountIn, registry);
+        address token = _allocations[i].token;
+        (uint256 quoteFloor, bool okQuote) =
+            buy ? _quoteFloor(asset, token, amountIn, i) : _quoteFloor(token, asset, amountIn, i);
+
+        if (okQuote) return (okMark && markFloor > quoteFloor) ? markFloor : quoteFloor;
+        if (okMark && terminal) return markFloor;
+        revert QuoteUnavailable();
+    }
+
+    /// @dev Adapter-quote half of `_legMinOut`. An adapter whose `quote()`
+    ///      reverts or returns zero cannot bound slippage, so it reports
+    ///      unavailable rather than a zero floor — a zero floor is not a weaker
+    ///      bound, it is no bound.
+    function _quoteFloor(address tokenIn, address tokenOut, uint256 amountIn, uint256 i)
+        private
+        returns (uint256, bool)
+    {
+        try swapAdapter.quote(tokenIn, tokenOut, amountIn, _swapExtraData[i]) returns (uint256 expected) {
+            if (expected == 0) return (0, false);
+            return ((expected * (BPS_DENOMINATOR - maxSlippageBps)) / BPS_DENOMINATOR, true);
         } catch {
-            revert QuoteUnavailable();
+            return (0, false);
         }
+    }
+
+    /// @dev Chainlink-mark half of `_legMinOut`, in `tokenOut` units. Reuses
+    ///      `_pushMark` verbatim — the same feed-to-token re-bind, live decimals
+    ///      re-check, positive-answer and per-slot age gauntlet that sizes every
+    ///      instant-exit unwind — so there is exactly one definition of "the
+    ///      mark" in this contract. Unavailable (Data Streams mode, stale or
+    ///      broken feed, rebound failure, or a value that rounds to zero) is
+    ///      reported, never substituted with a zero floor.
+    function _markFloor(uint256 i, bool buy, uint256 amountIn, address registry) private view returns (uint256, bool) {
+        if (chainlinkVerifier != address(0)) return (0, false);
+        (uint256 price, bool ok) = _pushMark(i, registry);
+        if (!ok) return (0, false);
+        uint256 assetDec = uint256(_assetDecimals);
+        uint256 expected =
+            buy ? _valueToTokens(amountIn, price, i, assetDec) : _tokensToValue(amountIn, price, i, assetDec);
+        if (expected == 0) return (0, false);
+        return ((expected * (BPS_DENOMINATOR - maxSlippageBps)) / BPS_DENOMINATOR, true);
+    }
+
+    /// @dev The spot feed registry, resolved once per swap path and passed down
+    ///      to every `_pushMark` / `_verifyPrice` in that path — the walk is
+    ///      four staticcalls and the answer is identical for every slot. Only
+    ///      push mode has an on-chain mark to bind, so Data Streams mode skips
+    ///      the walk entirely.
+    function _markRegistry() private view returns (address) {
+        return chainlinkVerifier == address(0) ? _spotFeedRegistry() : address(0);
     }
 
     /// @dev Decode a push-mode packed feed id into its AggregatorV3 proxy and
@@ -774,15 +934,62 @@ contract PortfolioStrategy is BaseStrategy {
         return _readAddress(router, abi.encodeCall(IFeedBindingPath.adapterOf, (PositionKinds.ERC20_SPOT)));
     }
 
-    /// @dev Aggregator `registry` has registered against `token`, or
-    ///      `address(0)` when the registry is unresolved or the token unlisted.
-    ///      Decodes the FIRST word of `feedOf`'s return only: the registry's
-    ///      per-token config leads with `aggregator`. A future registry that
-    ///      reorders that field reads as a mismatch — init reverts, Lane A
-    ///      shuts — never as a silent pass.
-    function _registeredAggregator(address registry, address token) private view returns (address) {
-        if (registry == address(0)) return address(0);
-        return _readAddress(registry, abi.encodeCall(IFeedBindingPath.feedOf, (token)));
+    /// @dev What `registry` has registered against `token`: the aggregator and
+    ///      the max staleness governance accepts for it. Both are
+    ///      `0`/`address(0)` when the registry is unresolved or the token
+    ///      unlisted. Decodes words 0 and 1 of `feedOf`'s return: the
+    ///      registry's per-token config is `(aggregator, maxAge, …)`, and the
+    ///      public-mapping getter ABI-encodes each field into its own word. A
+    ///      future registry that reorders those fields reads as an aggregator
+    ///      mismatch — init reverts, Lane A shuts — never as a silent pass; a
+    ///      reordered age reads as either a tighter bound (fails closed) or an
+    ///      enormous one (no tightening, i.e. the pre-bound behaviour), never
+    ///      as a loosening past the slot's own `MAX_PUSH_PRICE_AGE_CAP`.
+    function _registeredFeed(address registry, address token) private view returns (address, uint256) {
+        if (registry == address(0) || registry.code.length == 0) return (address(0), 0);
+        (bool ok, bytes memory ret) = registry.staticcall(abi.encodeCall(IFeedBindingPath.feedOf, (token)));
+        if (!ok || ret.length < 64) return (address(0), 0);
+        uint256 aggregatorWord;
+        uint256 maxAgeWord;
+        // Reads the leading two return words directly: `abi.decode` cannot
+        // express "first two words of a longer payload".
+        assembly ("memory-safe") {
+            aggregatorWord := mload(add(ret, 0x20))
+            maxAgeWord := mload(add(ret, 0x40))
+        }
+        if (aggregatorWord >> 160 != 0) return (address(0), 0);
+        return (address(uint160(aggregatorWord)), maxAgeWord);
+    }
+
+    // ── Swap-adapter binding (see the binding note on `_initialize`) ──
+
+    /// @dev Reverts unless `swapAdapter_` is allowlisted in the `TierRegistry`
+    ///      the vault's own governor gates batch approvals against, resolved
+    ///      `vault() → governor() → tierRegistry()`. Skips only when that walk
+    ///      yields no registry — the same condition under which
+    ///      `SyndicateVault._guardBatchCalls` disables itself, and one the
+    ///      proposer cannot steer because no hop of the walk is proposer input.
+    ///      A registry that IS resolved but whose `isAdapterAllowed` is
+    ///      unreadable (wrong address wired, non-registry contract) fails
+    ///      CLOSED: a registry that cannot vouch for the adapter has not
+    ///      vouched for it. Every hop is a length-checked raw staticcall so a
+    ///      codeless or hostile target reads as unresolved rather than
+    ///      reverting some unrelated deployment.
+    function _requireAllowedAdapter(address swapAdapter_) private view {
+        address governor_ = _readAddress(vault(), abi.encodeCall(ITierBindingPath.governor, ()));
+        if (governor_ == address(0)) return;
+        address registry = _readAddress(governor_, abi.encodeCall(ITierBindingPath.tierRegistry, ()));
+        if (registry == address(0)) return;
+        if (!_isAdapterAllowed(registry, swapAdapter_)) revert AdapterNotAllowed(swapAdapter_, registry);
+    }
+
+    /// @dev Staticcall-safe `isAdapterAllowed`. Unreadable → `false` (see the
+    ///      fail-closed rationale on `_requireAllowedAdapter`).
+    function _isAdapterAllowed(address registry, address adapter) private view returns (bool) {
+        if (registry.code.length == 0) return false;
+        (bool ok, bytes memory ret) = registry.staticcall(abi.encodeCall(ITierBindingPath.isAdapterAllowed, (adapter)));
+        if (!ok || ret.length != 32) return false;
+        return abi.decode(ret, (bool));
     }
 
     /// @dev Staticcall-safe address read: codeless target, revert, short
@@ -805,14 +1012,51 @@ contract PortfolioStrategy is BaseStrategy {
 
     // ── Chainlink price verification ──
 
+    /// @dev The staleness bound actually enforced for a push-mode slot: the
+    ///      TIGHTER of the per-slot age the proposer packed into `_feedIds[i]`
+    ///      and the `maxAge` governance registered for that token in the spot
+    ///      pricing registry. `registeredAge == 0` means the registry is
+    ///      unresolved or the token unlisted — no governance opinion exists, so
+    ///      the slot's own bound stands.
+    ///
+    ///      Adversary: the slot's own bound is validated only against
+    ///      `[MIN_PUSH_PRICE_AGE, MAX_PUSH_PRICE_AGE_CAP]`, and that cap is 30
+    ///      DAYS. There is no oracle-vs-pool divergence check anywhere in this
+    ///      contract — that gate lives in `Erc20SpotAdapter` and gates
+    ///      valuation, not swaps — so during a stale-mark regime a proposer
+    ///      could call `rebalanceDelta` and sell the basket into their own
+    ///      frozen route at a month-old mark, pocketing the gap. Deferring to
+    ///      the registry (whose own `MAX_FEED_MAX_AGE` is 30 days but which the
+    ///      Lane A deploy script pins at 24h) means the mark this contract
+    ///      trades on can never be older than the mark the protocol is willing
+    ///      to PRICE on, for exactly the tokens it prices.
+    ///
+    ///      RESIDUAL: a token the registry does not list gets no tightening.
+    ///      That token also gets no Lane A — `Erc20SpotAdapter.value` returns
+    ///      `(0, false)` for an unlisted venue, so no instant exit and no
+    ///      instant deposit can be priced against it — which leaves the stale
+    ///      mark able to mis-size an internal rebalance between basket slots
+    ///      but not to move value in or out of the vault, and still bounded by
+    ///      `MAX_PUSH_PRICE_AGE_CAP`.
+    function _boundedMaxAge(uint256 slotAge, uint256 registeredAge) private pure returns (uint256) {
+        if (registeredAge == 0 || registeredAge >= slotAge) return slotAge;
+        return registeredAge;
+    }
+
     /// @param i             Allocation index — used to check `report.feedId`
     ///                      against the slot's expected feed id.
     /// @param signedReport  LayerZero-style signed Chainlink Data Streams report.
+    /// @param registry      Spot feed registry from `_markRegistry()`, resolved
+    ///                      once by `rebalanceDelta` and passed down; bounds
+    ///                      the push branch's accepted staleness (see
+    ///                      `_boundedMaxAge`). Ignored on the Data Streams
+    ///                      branch, whose freshness comes from the signed
+    ///                      report's own `expiresAt`.
     /// @dev Verifies the report's `feedId` matches the slot's expected id
     ///      before returning the price, so a valid-but-mismatched report
     ///      (e.g. WBTC's report accepted into the AAPL slot) cannot inflate
     ///      cached NAV.
-    function _verifyPrice(uint256 i, bytes calldata signedReport) internal returns (uint256 price) {
+    function _verifyPrice(uint256 i, bytes calldata signedReport, address registry) internal returns (uint256 price) {
         // Push-feed mode: `_feedIds[i]` packs an AggregatorV3 proxy (low 160
         // bits) + an optional per-slot max age (upper 96 bits). No signed
         // report is consumed, so callers must pass empty bytes (a nonempty
@@ -820,6 +1064,11 @@ contract PortfolioStrategy is BaseStrategy {
         if (chainlinkVerifier == address(0)) {
             if (signedReport.length != 0) revert InvalidFeedId();
             (address feed, uint256 maxAge) = _decodePushFeed(_feedIds[i]);
+            // Defer to governance's own staleness bound for this token when one
+            // exists — a 30-day slot age must not outlive the age the protocol
+            // prices with (see `_boundedMaxAge`).
+            (, uint256 registeredAge) = _registeredFeed(registry, _allocations[i].token);
+            maxAge = _boundedMaxAge(maxAge, registeredAge);
             // Re-check decimals live every call: a proxy upgrade to a different
             // scale would otherwise silently mis-scale NAV against the init
             // snapshot (mirrors the Data Streams path's per-call feedId bind).
@@ -1087,10 +1336,13 @@ contract PortfolioStrategy is BaseStrategy {
     ///      that sizes an unwind diverging from the one the router prices the
     ///      very same position with. Fails soft in the same direction as every
     ///      other doubt here — Lane A shuts, the async queue stays open.
+    /// @dev Also bounds the slot's per-slot staleness by the one governance
+    ///      registered for the token (see `_boundedMaxAge`).
     function _pushMark(uint256 i, address registry) private view returns (uint256, bool) {
         (address feed, uint256 maxAge) = _decodePushFeed(_feedIds[i]);
-        address registered = _registeredAggregator(registry, _allocations[i].token);
+        (address registered, uint256 registeredAge) = _registeredFeed(registry, _allocations[i].token);
         if (registered != address(0) && registered != feed) return (0, false);
+        maxAge = _boundedMaxAge(maxAge, registeredAge);
         try AggregatorV3Interface(feed).decimals() returns (uint8 dec) {
             if (dec != _priceDecimals[i]) return (0, false);
         } catch {
