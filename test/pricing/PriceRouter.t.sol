@@ -266,4 +266,109 @@ contract PriceRouterTest is Test {
         vm.expectRevert(abi.encodeWithSelector(OwnableUpgradeable.OwnableUnauthorizedAccount.selector, stranger));
         router.setLaneAEnabled(KIND, true);
     }
+
+    // ── haircut / Lane A exclusivity (issue #59) ──
+
+    bytes32 constant KIND_A = keccak256("EXCLUSIVITY_KIND_A");
+    bytes32 constant KIND_B = keccak256("EXCLUSIVITY_KIND_B");
+
+    function test_setHaircut_revertsOnLaneAEnabledKind() public {
+        vm.startPrank(owner);
+        router.setLaneAEnabled(KIND, true); // haircut still 0
+        vm.expectRevert(PriceRouter.HaircutLaneAConflict.selector);
+        router.setHaircutBps(KIND, 1);
+        vm.stopPrank();
+        assertEq(router.haircutBps(KIND), 0, "haircut unchanged by the reverted call");
+    }
+
+    function test_setLaneAEnabled_revertsOnHaircutKind() public {
+        vm.startPrank(owner);
+        router.setHaircutBps(KIND, 100); // KIND stays Lane-A-disabled
+        vm.expectRevert(PriceRouter.HaircutLaneAConflict.selector);
+        router.setLaneAEnabled(KIND, true);
+        vm.stopPrank();
+        assertFalse(router.laneAEnabled(KIND), "enablement unchanged by the reverted call");
+    }
+
+    /// @notice The unsafe pair `haircutBps != 0 && laneAEnabled == true` is
+    ///         unreachable regardless of which setter runs first.
+    function test_haircutLaneA_unreachableFromEitherOrder() public {
+        vm.startPrank(owner);
+
+        // (a) enable first, then haircut reverts.
+        router.setLaneAEnabled(KIND_A, true);
+        vm.expectRevert(PriceRouter.HaircutLaneAConflict.selector);
+        router.setHaircutBps(KIND_A, 1);
+
+        // (b) haircut first, then enable reverts.
+        router.setHaircutBps(KIND_B, 1);
+        vm.expectRevert(PriceRouter.HaircutLaneAConflict.selector);
+        router.setLaneAEnabled(KIND_B, true);
+
+        vm.stopPrank();
+
+        assertTrue(router.laneAEnabled(KIND_A));
+        assertEq(router.haircutBps(KIND_A), 0);
+        assertFalse(router.laneAEnabled(KIND_B));
+        assertEq(router.haircutBps(KIND_B), 1);
+    }
+
+    function test_setLaneAEnabled_disableNeverBlocked() public {
+        vm.startPrank(owner);
+
+        // Case 1: an enabled zero-haircut kind can be disabled.
+        router.setLaneAEnabled(KIND_A, true);
+        vm.expectEmit(true, false, false, true);
+        emit PriceRouter.LaneAEnabledSet(KIND_A, false);
+        router.setLaneAEnabled(KIND_A, false);
+        assertFalse(router.laneAEnabled(KIND_A));
+
+        // Case 2: disabling a nonzero-haircut, never-enabled kind is a no-op
+        // that still succeeds and emits.
+        router.setHaircutBps(KIND_B, 100);
+        vm.expectEmit(true, false, false, true);
+        emit PriceRouter.LaneAEnabledSet(KIND_B, false);
+        router.setLaneAEnabled(KIND_B, false);
+        assertFalse(router.laneAEnabled(KIND_B));
+
+        vm.stopPrank();
+    }
+
+    function test_setLaneAEnabled_zeroHaircut_stillWorks() public {
+        vm.startPrank(owner);
+        router.setLaneAEnabled(KIND, true);
+        assertTrue(router.laneAEnabled(KIND));
+        // Re-setting the haircut to 0 while enabled still succeeds (cannot
+        // conflict — the honest-path scenario the spec pins).
+        router.setHaircutBps(KIND, 0);
+        vm.stopPrank();
+        assertEq(router.haircutBps(KIND), 0);
+        assertTrue(router.laneAEnabled(KIND));
+    }
+
+    function test_setHaircut_onDisabledKind_stillWorks() public {
+        vm.expectEmit(true, false, false, true);
+        emit PriceRouter.HaircutSet(KIND, 100);
+        vm.prank(owner);
+        router.setHaircutBps(KIND, 100);
+        assertEq(router.haircutBps(KIND), 100);
+        assertFalse(router.laneAEnabled(KIND));
+    }
+
+    /// @notice Living documentation of design D2: a kind that acquires a
+    ///         nonzero haircut can never re-enter Lane A without a contract
+    ///         upgrade — `HaircutCannotDecrease` forecloses lowering it, and
+    ///         `HaircutLaneAConflict` forecloses enabling over it.
+    function test_haircutIsOneWayDoor_kindPermanentlyLaneB() public {
+        vm.startPrank(owner);
+        router.setHaircutBps(KIND, 100); // KIND stays Lane-A-disabled
+
+        vm.expectRevert(PriceRouter.HaircutCannotDecrease.selector);
+        router.setHaircutBps(KIND, 0);
+
+        vm.expectRevert(PriceRouter.HaircutLaneAConflict.selector);
+        router.setLaneAEnabled(KIND, true);
+
+        vm.stopPrank();
+    }
 }

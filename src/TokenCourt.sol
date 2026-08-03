@@ -15,6 +15,20 @@ interface IChallengeGameLedger {
     function exposureLedger() external view returns (address);
 }
 
+/// @notice The one thing the court needs from the electorate that
+///         `IStakedWood` deliberately does not declare: its age floor, to
+///         enforce `participationFloorBps < ageFloorBps` (issue #84). Kept
+///         local rather than added to the shared interface for the same
+///         reason `script/DeployTokenCourt.s.sol`'s own pre-flight carries
+///         this exact function locally — widening `IStakedWood` would touch
+///         every mock implementing it and quietly weaken
+///         `_participationFloor`'s natspec, which leans on `IStakedWood` NOT
+///         exposing this parameter as part of why `FLOOR_LOOKBACK` is
+///         hardcoded rather than read live.
+interface IStakedWoodAgeFloor {
+    function ageFloorBps() external view returns (uint256);
+}
+
 /**
  * @title TokenCourt
  * @notice Single-layer WOOD-vote adjudication of disputed `ChallengeGame`
@@ -175,8 +189,26 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     }
 
     /// @inheritdoc ITokenCourt
+    /// @dev Guards the wiring itself, same class as `setChallengeGame`'s own
+    ///      re-wire guard above. Re-pointing to a new electorate is a setter
+    ///      that can break the floor invariant just like
+    ///      `setParticipationFloorBps` below, and the two compose into a
+    ///      bypass if only one is guarded: e.g. this court's
+    ///      `setParticipationFloorBps` raises `participationFloorBps` while
+    ///      unwired (passes vacuously — no age floor to check against yet),
+    ///      then this setter wires it to an electorate whose own age floor
+    ///      that raised value already meets or exceeds. Checked against the
+    ///      new sWOOD's own LIVE `ageFloorBps()`, not whatever the old
+    ///      `stakedWood` (if any) reported — this setter requires non-zero
+    ///      unconditionally, so there is no vacuous branch to preserve here;
+    ///      every call validates. A target without `ageFloorBps()` reverts on
+    ///      the read (fail-closed) — no real electorate lacks it, since the
+    ///      court also needs its `getPastTotalVotes`/`getPastStake`/`getVotes`.
     function setStakedWood(address newStakedWood) external onlyOwner {
         if (newStakedWood == address(0)) revert ZeroAddress();
+        if (participationFloorBps >= IStakedWoodAgeFloor(newStakedWood).ageFloorBps()) {
+            revert FloorInvariantViolated();
+        }
         emit StakedWoodSet(stakedWood, newStakedWood);
         stakedWood = newStakedWood;
     }
@@ -202,8 +234,37 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     }
 
     /// @inheritdoc ITokenCourt
+    /// @dev Mirrors `setVoteWindow`'s shape: the cross-contract invariant
+    ///      `participationFloorBps < ageFloorBps` spans both contracts, so
+    ///      this setter enforces it against the wired sWOOD's LIVE
+    ///      `ageFloorBps()` rather than trusting a stale value. Vacuous with
+    ///      no electorate wired: there is no age floor to compare against
+    ///      yet — `setStakedWood` above closes that vacuous branch by
+    ///      validating unconditionally on the wiring side.
+    ///
+    ///      Strictness is strict `<`, not `<=`: `finalize` clears at
+    ///      `turnout >= floor`, turnout sums AGED weight bounded below by
+    ///      `ageFloorBps/10_000` of raw stake, and the floor's base is RAW
+    ///      stake, so the raw-turnout fraction needed to clear is
+    ///      `participationFloorBps / ageFloorBps`. At equality that fraction
+    ///      is exactly 100% — every un-accused staked wei voting at age
+    ///      zero — which is not a liveness guarantee anyone can stand on,
+    ///      and is exactly what the deploy pre-flight (`floorBps <
+    ///      ageFloorBps`) already rejects; the setter must agree with it.
+    ///
+    ///      DELIBERATELY NOT GUARDED: `StakedWood.setAgeFloorBps` lowering
+    ///      the OTHER side of this pair after the fact. sWOOD is the
+    ///      base-layer custodian and holds no pointer back to this court;
+    ///      giving it one would invert the dependency direction for a
+    ///      court-local liveness property. That lever is covered by the
+    ///      wire-time pre-flight and off-chain monitoring, not by this
+    ///      setter — see issue #84.
     function setParticipationFloorBps(uint256 newBps) external onlyOwner {
         if (newBps == 0 || newBps > BPS_DENOMINATOR) revert InvalidParameter();
+        address sw = stakedWood;
+        if (sw != address(0) && newBps >= IStakedWoodAgeFloor(sw).ageFloorBps()) {
+            revert FloorInvariantViolated();
+        }
         emit ParticipationFloorBpsSet(participationFloorBps, newBps);
         participationFloorBps = newBps;
     }
@@ -810,15 +871,67 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
         return participationFloorBps * base / BPS_DENOMINATOR;
     }
 
-    /// @dev MIRRORS `ChallengeGame`'s own accused definition exactly, and
-    ///      deliberately does not invent a second one: the ledger's covering
-    ///      approvers, filtered to those whose committed share is still
-    ///      non-zero. The ledger reports a RELEASED commitment as zero rather
-    ///      than dropping the entry, and a guardian that released before the
-    ///      filing backed nothing on this proposal — so it is not slashed for
-    ///      it, and by the same token it is not barred from voting on it. The
-    ///      set that loses its stake on a conviction and the set that may not
-    ///      vote on that conviction are one list read from one place.
+    /// @dev THE PREDICATE IS THE PLEDGE, NOT THE LIVE BOOKING (issue #83).
+    ///      Both fields sit on the ledger, both are keyed by the same review
+    ///      key, and both look like they answer "did this guardian underwrite
+    ///      this proposal?". Only one of them is a fact nobody can rewrite
+    ///      under a live case:
+    ///
+    ///        `_reservedUsd`  — THE PLEDGE. `recordApproval` is its only
+    ///          writer, `releaseApproval` its only eraser, and a filed
+    ///          challenge blocks that eraser outright (`CoverageFrozen`).
+    ///          Read here, through `pledgedOf`.
+    ///        `_recorded.usd` — THE LIVE BOOKING. `settleCoverage` rewrites
+    ///          it in BOTH directions; that call is permissionless,
+    ///          re-runnable by design, and deliberately not freeze-gated.
+    ///          Read through `approversOf`, which this function used to use.
+    ///
+    ///      Filtering on the booking put the accused set inside a stranger's
+    ///      reach, with no attacker capital and no privileged role. A guardian
+    ///      convicted on a SEPARATE, CONCURRENT challenge lands at exactly
+    ///      zero own stake (Plan B pre-flights `maxSlashBps == 10_000`, so
+    ///      `StakedWood._slashOne` takes the whole live balance). Its
+    ///      slashable bond is then zero, so the next `settleCoverage` on THIS
+    ///      proposal books it at zero — and anyone may make that call, at any
+    ///      time after `executeBy`. The guardian dropped out of the loop
+    ///      below, never had `isAccused` set, and walked straight past `vote`'s
+    ///      `AccusedCannotVote` bar. Its BALLOT still weighed the full
+    ///      pre-slash amount, because `vote` reads `getPastVotes` at
+    ///      `c.snapshotTs == executedAt - 1` and checkpoints are append-only —
+    ///      an instant no later slash can reach back to. The result was the
+    ///      exact inversion this bar exists to prevent: the accused judging,
+    ///      at full weight, the case its own approval caused. The pledge is
+    ///      immune to every step of it — no conviction, no price move and no
+    ///      settlement pass can lower it.
+    /// @dev A RELEASED APPROVER IS STILL EXCLUDED, which is what this filter
+    ///      was written for, and it survives the change untouched.
+    ///      `releaseApproval` zeroes the pledge AND swap-and-pops the guardian
+    ///      out of `_approversOf`, so a commitment released before the filing
+    ///      is not in the list this loop walks at all. It is NOT reported as a
+    ///      zero-share entry — an earlier revision of this comment claimed the
+    ///      ledger keeps the full historical set that way, and that has been
+    ///      false since the swap-and-pop landed. The zero-check below is kept
+    ///      as the belt to that brace: filtering on one predicate rather than
+    ///      on list membership costs nothing and stays correct if the ledger
+    ///      ever does start retaining released entries.
+    /// @dev THE BAR IS WIDER THAN THE SLASH, BY CONSTRUCTION. The earlier
+    ///      claim that the two sets are "one list read from one place" was
+    ///      never true: they are two reads, at two instants, in two contracts.
+    ///      `ChallengeGame._settle` derives who is SLASHED from `slashBpsFor`
+    ///      at RULE time, and that view still filters on the live booking.
+    ///      What holds is CONTAINMENT, which is the direction that matters:
+    ///      `_recorded.usd != 0` implies `_reservedUsd != 0` — the booking is
+    ///      derived from the pledge and bounded by it, and a release clears
+    ///      both — so everyone a conviction can take stake from is barred
+    ///      here. Nobody votes on a case that is about to slash them.
+    ///
+    ///      The converse gap — barred here, slashed nothing there — costs
+    ///      nothing to leave open. A booking only reaches zero once the
+    ///      guardian's own slashable bond has; `_slashOne` clamps every rate
+    ///      to live stake and the delegated leg is always zero. So the entry
+    ///      `slashBpsFor` drops is one there was never anything to collect
+    ///      from. Widening that read as well would change the conviction path
+    ///      without recovering a wei, so it is deliberately left alone.
     /// @dev  THE LEDGER COMES FROM THE GAME, NOT FROM `governor`. See
     ///       `IChallengeGameLedger` for why substituting the challenger-
     ///       supplied governor's ledger would hand the accused an empty
@@ -873,7 +986,7 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///       extra SLOAD per approver and makes the floor's denominator
     ///       independent of that.
     /// @dev  THE LOOP IS BOUNDED, not unbounded despite the caller-controlled
-    ///       `proposalId`: `approversOf` returns the same list
+    ///       `proposalId`: `pledgedOf` returns the same list
     ///       `GuardianRegistry` walks on every approve/settle, which is capped
     ///       at `MAX_APPROVERS_PER_PROPOSAL = 100` (`GuardianRegistry.sol`).
     ///       So this loop is at most 100 iterations, each one `getPastStake`
@@ -904,14 +1017,17 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
         uint256 proposalId,
         uint256 snapshotTs
     ) internal {
-        (address[] memory approvers, uint256[] memory committedUsd) =
-            IExposureLedger(ledger).approversOf(governor, proposalId);
+        (address[] memory approvers, uint256[] memory pledgedUsd) =
+            IExposureLedger(ledger).pledgedOf(governor, proposalId);
 
         address swood = stakedWood;
         uint256 weight;
         uint256 count;
         for (uint256 i; i < approvers.length; ++i) {
-            if (committedUsd[i] == 0) continue; // released before the filing: backs nothing, answers for nothing
+            // The PLEDGE, not the live booking: a release before the filing
+            // backs nothing and answers for nothing, but a settlement pass
+            // writing a booking down to zero is not a release (#83).
+            if (pledgedUsd[i] == 0) continue;
             address approver = approvers[i];
             if (isAccused[caseId][approver]) continue; // dedup guard
 

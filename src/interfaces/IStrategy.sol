@@ -61,10 +61,6 @@ interface IStrategy {
     ///         strategies with on-chain-priceable positions override it.
     function positions() external view returns (Position[] memory);
 
-    /// @notice true ⇒ the strategy self-manages fees; the governor skips settle-fee
-    ///         distribution for its proposals.
-    function selfManagesFees() external view returns (bool);
-
     /// @notice Assets (vault-asset units) the strategy can return to the vault
     ///         on demand, mid-lifecycle, net of unwind costs. 0 when the
     ///         strategy does not support on-demand exit (the default) or is not

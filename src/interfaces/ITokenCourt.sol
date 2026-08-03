@@ -177,6 +177,15 @@ interface ITokenCourt {
     ///         `setVoteWindow` — see `ChallengeGame._requireWindowFits` for why
     ///         neither contract can hold this invariant alone.
     error WindowInvariantViolated();
+    /// @notice A setter would break the cross-contract invariant
+    ///         `participationFloorBps < ageFloorBps`. Raised by
+    ///         `setParticipationFloorBps` (against the wired sWOOD, when one is
+    ///         wired) and `setStakedWood` (against the new sWOOD, always) — see
+    ///         the floor-invariant requirement for why the raw-turnout fraction
+    ///         needed to clear the floor is `participationFloorBps / ageFloorBps`
+    ///         and why equality already means "100% of un-accused stake voting
+    ///         at age zero", not a liveness guarantee anyone can stand on.
+    error FloorInvariantViolated();
 
     /// @notice A case opened. `snapshotTs` is logged here so indexers never
     ///         need a second read to learn the electorate cutoff `refer`
@@ -352,6 +361,14 @@ interface ITokenCourt {
     function setChallengeGame(address newGame) external;
     /// @notice Wire (or re-wire) the electorate source. The zero address is
     ///         refused — an unwired court has no vote weight to read.
+    ///         Unconditionally validates the cross-contract floor invariant
+    ///         `participationFloorBps < newStakedWood.ageFloorBps()` against
+    ///         the NEW sWOOD, reverting `FloorInvariantViolated` if it does
+    ///         not hold — closing the compose-bypass where a floor raised
+    ///         while unwired is then wired to an electorate whose age floor
+    ///         it meets or exceeds (see `setChallengeGame`'s identical
+    ///         rationale for the window invariant). Also refuses a target
+    ///         that does not implement `ageFloorBps()`.
     function setStakedWood(address newStakedWood) external;
     /// @notice Set the vote window newly referred cases receive. Bounded to
     ///         `(0, MAX_VOTE_WINDOW]`; zero would open a case that could
@@ -360,6 +377,11 @@ interface ITokenCourt {
     function setVoteWindow(uint256 newWindow) external;
     /// @notice Set the anti-capture participation floor. Bounded to
     ///         `(0, 10_000]`; zero would let any nonzero turnout, however
-    ///         thin, reach a verdict on the merits.
+    ///         thin, reach a verdict on the merits. When an electorate is
+    ///         wired, also validates the cross-contract floor invariant
+    ///         `newBps < stakedWood.ageFloorBps()` against its LIVE age
+    ///         floor, reverting `FloorInvariantViolated` if it does not
+    ///         hold — vacuous while unwired, since there is no age floor to
+    ///         compare against yet.
     function setParticipationFloorBps(uint256 newBps) external;
 }

@@ -73,6 +73,32 @@ contract TierRegistry is Ownable2Step {
     ///         vault funds may be approved or sent at all.
     mapping(address adapter => bool) private _adapterAllowed;
 
+    /// @dev Grant-time codehash snapshot for the allowlist axis (issue #137).
+    ///      The adversary: an allowlisted adapter whose bytecode is swapped at
+    ///      the same address (metamorphic CREATE2 + SELFDESTRUCT redeploy), or
+    ///      a codeless allowlisted address at which code later appears
+    ///      (counterfactual CREATE2), otherwise keeps the standing right to
+    ///      appear as spender/recipient of vault-fund movements until someone
+    ///      happens to persist a demotion — and `poke` is unreachable
+    ///      (`NotCertified`) for an allowlisted-but-uncertified adapter, so no
+    ///      permissionless persistence path exists at all for that case.
+    ///
+    ///      INVARIANT: meaningful only while `_adapterAllowed[adapter]` is
+    ///      true; records the effective codehash (see `_effectiveCodehash`)
+    ///      attested at the LAST grant. Inert under a cleared flag and
+    ///      unconditionally overwritten by the next grant — `_demote` and
+    ///      `setAdapterAllowed(adapter, false)` do NOT clear it (design.md D1
+    ///      of fix-adapter-allowlist-selfheal; keeps `_demote` and issue #51's
+    ///      `DEMOTION_GAS` sizing untouched).
+    ///
+    ///      DEDICATED TO THE TRANSFER-PERMISSION AXIS ONLY: a future
+    ///      certify-path audit trail (e.g. issue #45's certify timelock) MUST
+    ///      use a SEPARATE mapping — certification tier is a per-(target,
+    ///      selector) pricing axis with its own snapshot
+    ///      (`TierConfig.certifiedCodehash`); repurposing this one would
+    ///      re-couple the two axes exactly where they must stay independent.
+    mapping(address adapter => bytes32) private _adapterAllowedCodehash;
+
     IERC20 public wood;
     uint256 public submitterBondWood;
     uint256 public bondReleaseDelay = 14 days;
@@ -353,6 +379,18 @@ contract TierRegistry is Ownable2Step {
 
     // ── Adapter allowlist (spender/recipient gate for value-moving selectors) ──
 
+    /// @dev EXTCODEHASH of `a`, normalized so a non-existent account
+    ///      (`bytes32(0)`, EIP-1052) and an existing account with no code
+    ///      (`_EMPTY_CODEHASH`) both read as `bytes32(0)` — "no code" is one
+    ///      value. Without this, merely funding a codeless allowlisted
+    ///      address (non-existent -> existing-codeless) would flip its raw
+    ///      EXTCODEHASH and could be used as a 1-wei donation that griefs the
+    ///      vault's funds path closed.
+    function _effectiveCodehash(address a) internal view returns (bytes32) {
+        bytes32 ch = a.codehash;
+        return ch == _EMPTY_CODEHASH ? bytes32(0) : ch;
+    }
+
     /// @notice Allow or disallow `adapter` as the spender/recipient of
     ///         value-moving ERC20 calls (approve / increaseAllowance /
     ///         transfer / transferFrom-out) inside governor batches.
@@ -362,14 +400,57 @@ contract TierRegistry is Ownable2Step {
     ///         `certify` never touches this mapping — re-allowlisting after a
     ///         demotion-triggered clear is always this explicit owner call,
     ///         never a side effect of re-certification.
+    ///
+    ///         On the grant path (`allowed == true`), (re)writes
+    ///         `_adapterAllowedCodehash[adapter]` to the adapter's CURRENT
+    ///         effective codehash — every grant re-attests the code the owner
+    ///         is looking at right now. Consequences: (i) the grant MUST be
+    ///         made AFTER the adapter's final code is deployed and verified —
+    ///         granting against a predicted (counterfactual) address snapshots
+    ///         "no code" and the funds path closes the instant code appears
+    ///         there (see `isAdapterAllowed`); (ii) re-granting after a
+    ///         verified legitimate bytecode change at the adapter's address is
+    ///         the intended recovery ceremony, mirroring the demote ->
+    ///         re-certify cycle for tiers. The `false` branch does not touch
+    ///         the snapshot — it is left inert and is overwritten by the next
+    ///         grant (design.md D1 of fix-adapter-allowlist-selfheal).
     function setAdapterAllowed(address adapter, bool allowed) external onlyOwner {
         _adapterAllowed[adapter] = allowed;
+        if (allowed) {
+            _adapterAllowedCodehash[adapter] = _effectiveCodehash(adapter);
+        }
         emit AdapterAllowedSet(adapter, allowed);
     }
 
     /// @notice True when `adapter` may receive approvals/transfers of vault
     ///         funds through a governor batch.
+    /// @dev    Fail-safe self-heal is LAZY, mirroring `tierOf`: this returns
+    ///         true only when the allowlist flag is set AND the adapter's
+    ///         live effective codehash still matches the grant-time snapshot
+    ///         — no state write in the hot path, nothing to grief, and no
+    ///         dependence on `poke` (or any demotion path) ever running.
+    ///         Persistence of a `false` result into storage still comes from
+    ///         `poke` / `demote` / `demoteByChallenge` (where a certification
+    ///         exists) or an explicit owner `setAdapterAllowed(adapter,
+    ///         false)` (the only path for an allowlisted-but-uncertified
+    ///         adapter, since `poke` reverts `NotCertified` there).
+    ///
+    ///         The adversary: an allowlisted adapter whose bytecode is
+    ///         swapped at the same address (metamorphic CREATE2 +
+    ///         SELFDESTRUCT redeploy), or a codeless allowlisted address at
+    ///         which code later appears (counterfactual CREATE2), otherwise
+    ///         retains the standing right to appear as spender/recipient of
+    ///         vault-fund movements until someone happens to persist a
+    ///         demotion. `SyndicateVault._guardBatchCalls` is the sole `src/`
+    ///         consumer of this read and is itself `private view` — this
+    ///         function MUST stay `view` (design.md D2).
+    ///
+    ///         SCOPE CAVEAT (same as `tierOf`, see contract natspec): this
+    ///         catches only same-address bytecode mutation, not proxy
+    ///         implementation swaps — a proxy's runtime bytecode is static
+    ///         across upgrades, so allowlisting a proxied adapter carries the
+    ///         same governance-discipline caveat as certifying one.
     function isAdapterAllowed(address adapter) external view returns (bool) {
-        return _adapterAllowed[adapter];
+        return _adapterAllowed[adapter] && _effectiveCodehash(adapter) == _adapterAllowedCodehash[adapter];
     }
 }

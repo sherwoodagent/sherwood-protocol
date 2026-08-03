@@ -12,12 +12,38 @@ import {
 } from "test/mocks/MockWoodTwapOracle.sol";
 
 /// @dev Minimal sWOOD stub exposing exactly the reads the ledger consumes.
+///      `slashableStakeAt` (issue #35) mirrors `StakedWood`'s own
+///      `min(snapshot at anchor, live)` shape with real checkpoint semantics
+///      (not just an alias for live stake), so tests can prove a
+///      post-execution top-up is excluded from the anchored basis: each
+///      `setStake` call snapshots at the CURRENT `block.timestamp`, and
+///      `slashableStakeAt(g, anchor)` returns `min(latest snapshot at or
+///      before anchor, live)`.
 contract MockSwood {
     mapping(address => uint256) public guardianStake;
     uint256 public coolDownPeriod = 45 days;
 
+    struct Checkpoint {
+        uint256 ts;
+        uint256 amount;
+    }
+
+    mapping(address => Checkpoint[]) internal _checkpoints;
+
     function setStake(address g, uint256 own) external {
         guardianStake[g] = own;
+        _checkpoints[g].push(Checkpoint({ts: block.timestamp, amount: own}));
+    }
+
+    function slashableStakeAt(address g, uint256 anchor) external view returns (uint256) {
+        Checkpoint[] storage cps = _checkpoints[g];
+        uint256 snap;
+        for (uint256 i = 0; i < cps.length; i++) {
+            if (cps[i].ts > anchor) break;
+            snap = cps[i].amount;
+        }
+        uint256 live = guardianStake[g];
+        return snap < live ? snap : live;
     }
 }
 
@@ -78,6 +104,7 @@ contract MockGovernorForLedger {
         address vault;
         uint256 executeBy;
         uint256 strategyDuration;
+        uint256 executedAt;
     }
 
     uint256 public executeBy;
@@ -88,6 +115,15 @@ contract MockGovernorForLedger {
     ///      pre-ADR behaviour every existing test in this file was written
     ///      against. Set them to exercise the settlement-dated bucket.
     uint256 public reviewEnd;
+
+    /// @dev 0 (unexecuted) by default — every existing test in this file that
+    ///      never calls this keeps reading the LIVE basis, unchanged (issue
+    ///      #35). Set to exercise the execution-anchored basis.
+    uint256 public executedAt;
+
+    function setExecutedAt(uint256 executedAt_) external {
+        executedAt = executedAt_;
+    }
 
     /// @dev Separates `reviewEnd` from `executeBy`, which `setSchedule` collapses.
     ///      `settleCoverage` gates on `executeBy` now, and the window between the
@@ -112,6 +148,7 @@ contract MockGovernorForLedger {
         v.executeBy = executeBy;
         v.strategyDuration = strategyDuration;
         v.reviewEnd = reviewEnd;
+        v.executedAt = executedAt;
     }
 }
 
@@ -1621,6 +1658,124 @@ contract ExposureLedgerTest is Test {
         // Still fully covered -- which is the point. Before n1 the devalued
         // guardian kept a 500 slice it could not honour and $250 was unbacked.
         ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 1_000e6);
+    }
+
+    /// @notice Issue #35, spec scenarios "Accused cohort cannot price up its
+    ///         own prosecution" and "Post-execution top-up is not coverage".
+    ///
+    ///         Reproduces the exact attack design.md describes: a WOOD price
+    ///         crash between vote and read opens a gap between what the
+    ///         guardian reserved and what its bond is worth NOW; a
+    ///         post-execution top-up (in WOOD units) restores the LIVE bond
+    ///         value back to the reservation. Under the OLD (pre-fix, always-
+    ///         live) basis that top-up would have fully restored
+    ///         `allocatedUsd`/`liabilityUsd` to the pre-crash figure — capital
+    ///         the verdict slash, anchored at execution, can never reach. The
+    ///         anchored basis prices the guardian at its PRE-top-up WOOD
+    ///         snapshot even at the post-crash price, so the top-up buys
+    ///         nothing.
+    function test_allocatedUsd_and_liabilityUsd_postExecutionTopUpCannotUndoAPriceCrash() public {
+        _wireRecording();
+        mgov.set(1_000e6); // needUsd = $1,000
+        mgov.setSchedule(block.timestamp + 1 days, 3 days);
+
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        // Sole approver, bond ($5,000) >> need ($1,000): reserves the full
+        // $1,000, unscaled (reservedTotal == needUsd).
+        assertEq(ledger.allocatedUsd(address(mgov), 1, guardian), 1_000e18, "pre-crash: fully reserved");
+
+        // Execute: the anchor snapshots the CURRENT 100,000 WOOD.
+        mgov.setExecutedAt(block.timestamp);
+        assertEq(ledger.liabilityUsd(address(mgov), 1), 1_000e18, "pre-crash: fully covered");
+
+        skip(12 hours);
+
+        // WOOD crashes 10x: $0.05 -> $0.005. Live bond falls to 100,000 *
+        // 0.005 = $500, below the $1,000 reservation -- exactly the gap
+        // design.md's "reachable magnitude" analysis describes.
+        twap.setPrice(0.005e8);
+        assertEq(ledger.allocatedUsd(address(mgov), 1, guardian), 500e18, "post-crash: mine drops with the price");
+        assertEq(ledger.liabilityUsd(address(mgov), 1), 500e18, "post-crash: liability drops with the price");
+
+        // The guardian tops up 100,000 MORE WOOD, post-execution: at the
+        // crashed price this exactly restores LIVE bond value to $1,000.
+        swood.setStake(guardian, 200_000e18);
+        assertEq(ledger.slashableBondUsd(guardian), 1_000e18, "sanity: live bond IS fully restored by the top-up");
+
+        // The anchored reads are NOT restored: the anchor still snapshots the
+        // pre-top-up 100,000 WOOD, so pricing it at the crashed rate still
+        // gives $500 -- the top-up cannot buy back what the price crash took,
+        // because the verdict slash (anchored at execution) can never reach
+        // WOOD staked after that instant.
+        assertEq(
+            ledger.allocatedUsd(address(mgov), 1, guardian), 500e18, "anchored: top-up does not restore the booking"
+        );
+        assertEq(ledger.liabilityUsd(address(mgov), 1), 500e18, "anchored: top-up does not inflate the filing bond");
+    }
+
+    /// @notice Same attack as the read-side test above, run through
+    ///         `settleCoverage`: a post-execution top-up must not let a
+    ///         rebook or the residue top-up recover more than the anchored
+    ///         basis allows.
+    function test_settleCoverage_postExecutionTopUpCannotUndoAPriceCrash() public {
+        _wireRecording();
+        mgov.set(1_000e6); // needUsd = $1,000
+        mgov.setSchedule(block.timestamp + 1 days, 3 days);
+
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        assertEq(ledger.openExposureUsd(guardian), 1_000e18, "reserved the full coverage");
+
+        mgov.setExecutedAt(block.timestamp); // anchor snapshots 100,000 WOOD
+
+        skip(31 days); // past executeBy: settleCoverage's window gate opens
+        twap.setPrice(0.005e8); // 10x crash: live bond now $500 < $1,000 reserved
+
+        // Top up post-execution, post-crash: live bond restored to $1,000.
+        swood.setStake(guardian, 200_000e18);
+        assertEq(ledger.slashableBondUsd(guardian), 1_000e18, "sanity: live bond restored by the top-up");
+
+        ledger.settleCoverage(address(mgov), 1);
+
+        // Settlement books the guardian at the ANCHORED basis: $500, not the
+        // top-up-restored $1,000. A conviction anchored at execution could
+        // never have reached the top-up tranche.
+        assertEq(
+            ledger.allocatedUsd(address(mgov), 1, guardian),
+            500e18,
+            "settle: anchored basis, top-up buys no extra booking"
+        );
+        assertEq(ledger.openExposureUsd(guardian), 500e18, "settle: bucket reflects the anchored booking only");
+    }
+
+    /// @notice Spec: "an unexecuted proposal (`executedAt == 0`) settles on
+    ///         the live basis unchanged." Contrast with the two tests above:
+    ///         with NO anchor (never executed, only the review window
+    ///         closed), the same price-crash-then-top-up sequence DOES
+    ///         restore the booking, because live is all there is to read and
+    ///         a live-priced bond is genuinely reachable capital -- there is
+    ///         no verdict to bound it against.
+    function test_settleCoverage_unexecutedProposal_topUpDoesRestoreTheLiveBooking() public {
+        _wireRecording();
+        mgov.set(1_000e6);
+        mgov.setSchedule(block.timestamp + 1 days, 3 days);
+        // executedAt intentionally left at 0: no verdict anchor exists.
+
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+
+        skip(31 days);
+        twap.setPrice(0.005e8);
+        swood.setStake(guardian, 200_000e18); // restores live bond to $1,000
+
+        ledger.settleCoverage(address(mgov), 1);
+
+        assertEq(
+            ledger.allocatedUsd(address(mgov), 1, guardian),
+            1_000e18,
+            "no anchor: live basis, the top-up genuinely restores reachable coverage"
+        );
     }
 
     /// @notice The haircut must apply to EVERY branch, including the one where

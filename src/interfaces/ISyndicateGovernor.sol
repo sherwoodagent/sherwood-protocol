@@ -113,11 +113,6 @@ interface ISyndicateGovernor {
         ///      they are drained or migrated first.
         address snapshotProtocolFeeRecipient;
         address snapshotGuardiansFeeRecipient;
-        /// @notice `IStrategy.selfManagesFees()` snapshotted at propose time (like
-        ///         performanceFeeBps). Read from storage at settle so a non-pure
-        ///         implementation can't flip it between review and settle (TOCTOU),
-        ///         and a broken/EOA strategy can't brick settle via a revert.
-        bool selfManagesFees;
         // ── APPENDED FIELDS ONLY BELOW (beacon-upgraded governors; storage parity) ──
         uint256 maxCapital; // risk envelope: net-outflow ceiling
         uint16 maxDrawdownBps; // risk envelope: declared drawdown bound
@@ -157,6 +152,16 @@ interface ISyndicateGovernor {
         /// @notice Performance-fee split snapshotted at propose time. Four
         ///         `uint16`s, one slot.
         IProtocolConfig.PerfSplit snapshotPerfSplit;
+        /// @notice The exposure ledger `reclaimProposerBond`'s challenge-window
+        ///         gates read for this proposal, pinned at propose time
+        ///         alongside `proposerBondWood` / `proposerBondEscrow`. A
+        ///         factory re-point of the governor's live `_exposureLedger`
+        ///         slot after this proposal locks a bond MUST NOT change which
+        ///         ledger gates it — see `reclaimProposerBond`. Zero when no
+        ///         bond was locked, or the proposal predates ledger pinning
+        ///         (falls back to the live slot, preserving pre-pin behavior
+        ///         including the `ExposureLedgerUnset` fail-closed path).
+        address proposerBondLedger;
     }
 
     struct CoProposer {
@@ -230,6 +235,21 @@ interface ISyndicateGovernor {
     error StrategyDurationNotElapsed();
     error InvalidProtocolFeeBps();
     error InvalidProtocolFeeRecipient();
+    /// @notice `_bondEscrow` and `_exposureLedger` are two independently
+    ///         factory-settable slots with no on-chain pairing guarantee —
+    ///         `setBondEscrow` requires draining all outstanding bonds first,
+    ///         `setExposureLedger` only requires `_openProposalCount == 0`
+    ///         (a much weaker gate), so ledger rotation can outpace escrow
+    ///         rotation in ordinary operation. Locking a new bond into an
+    ///         escrow whose own immutable `exposureLedger` differs from the
+    ///         ledger this proposal is pinning would price/pin the bond
+    ///         against one ledger's live challenge machinery while holding it
+    ///         in an escrow that will reject every forfeiture attempt from
+    ///         that ledger's game, forever (`ProposerBondEscrow.forfeitBond`
+    ///         reverts `NotAuthorizedConvictor`) — a convicted proposer keeps
+    ///         the bond. `_snapshotTierAndGate` refuses to lock rather than
+    ///         create that state (audit finding, PR #136 round 1).
+    error LedgerEscrowMismatch();
     /// @notice Revert if a vault already has a non-terminal proposal
     ///         (Draft / Pending / GuardianReview / Approved / Executed) when
     ///         a new propose() or approveCollaboration Draft->Pending is
@@ -431,6 +451,14 @@ interface ISyndicateGovernor {
 
     /// @notice Proposer bond escrow wired (or un-wired, newEscrow == address(0)).
     event BondEscrowSet(address indexed oldEscrow, address indexed newEscrow);
+
+    /// @notice `reclaimProposerBond` reached a proposal whose bond had already
+    ///         been forfeited by a conviction (the pinned escrow reports none
+    ///         held while the governor still recorded `amount`). The recorded
+    ///         amount is zeroed and nothing is transferred — this is the
+    ///         terminal, distinguishable outcome in place of a permanent
+    ///         `NoBond` revert from the escrow.
+    event ProposerBondForfeitureAcknowledged(uint256 indexed proposalId, uint256 amount);
 
     /// @notice Emitted in `_distributeFees` when `guardianFeeBps > 0`.
     ///         Guardian fee is carved from gross PnL and transferred to

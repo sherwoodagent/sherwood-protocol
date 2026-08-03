@@ -132,15 +132,6 @@ abstract contract BaseStrategy is IStrategy {
     }
 
     /// @inheritdoc IStrategy
-    /// @dev Default: governor distributes settle-fees. Self-fee'd strategies override to `true`.
-    ///      NOTE: `true` makes the governor skip ALL settle-fees (protocol + guardian + agent +
-    ///      management) — a self-fee'd strategy MUST self-collect the protocol fee itself
-    ///      or the protocol earns nothing. No in-tree strategy overrides this today.
-    function selfManagesFees() external view virtual returns (bool) {
-        return false;
-    }
-
-    /// @inheritdoc IStrategy
     /// @dev Default: no on-demand exit — instant withdrawals are served from
     ///      vault float only; excess routes to the Lane B queue. Strategies
     ///      with venue-liquid positions (e.g. Moonwell supply) override both

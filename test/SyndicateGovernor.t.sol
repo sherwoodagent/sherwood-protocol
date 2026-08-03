@@ -16,7 +16,6 @@ import {ProtocolConfig} from "../src/ProtocolConfig.sol";
 import {VaultWithdrawalQueue} from "../src/queue/VaultWithdrawalQueue.sol";
 import {IVaultWithdrawalQueue} from "../src/interfaces/IVaultWithdrawalQueue.sol";
 import {MockStrategyAdapter} from "./mocks/MockStrategyAdapter.sol";
-import {IStrategy} from "../src/interfaces/IStrategy.sol";
 import {GovEnvelope} from "./helpers/GovEnvelope.sol";
 
 contract SyndicateGovernorTest is Test {
@@ -195,8 +194,8 @@ contract SyndicateGovernorTest is Test {
     }
 
     /// @dev As `_createAndExecuteProposal` but pins a concrete `strategy` address on the proposal
-    ///      (the default helpers use address(0) = Lane-B-only). Used by the H2/M4 opt-out tests,
-    ///      which need a non-zero strategy whose `selfManagesFees()` the governor reads at settle.
+    ///      (the default helpers use address(0) = Lane-B-only). Used by tests that pin proposals
+    ///      carrying a real strategy address.
     function _createAndExecuteProposalWithStrategy(uint256 perfFeeBps, uint256 duration, address strategy)
         internal
         returns (uint256 proposalId)
@@ -620,36 +619,17 @@ contract SyndicateGovernorTest is Test {
         assertLt(usdc.balanceOf(agent) - agentBalBefore, 1_500e6, "agent share stays within the performance fee");
     }
 
-    // ==================== H2/M4: self-managed-fee opt-out ====================
+    // ==================== issue #151: selfManagesFees deleted ====================
 
-    /// @notice H2/M4: a strategy whose `selfManagesFees()` returns true opts out of the governor's
-    ///         PERFORMANCE fee — it crystallises its own. The exemption exists because the governor's
-    ///         float-delta PnL misreads custody-model deposits as profit, which is a defect in
-    ///         *profit measurement*.
-    ///
-    ///         It does NOT reach the management fee: that is capital x time and uses no PnL at all,
-    ///         so the reason for the opt-out does not apply to it (design.md Decision 3). Before the
-    ///         two-number model every fee was profit-derived, so the opt-out covered all of them.
-    function test_settlement_selfManagedStrategy_skipsPerformanceButPaysManagement() public {
+    /// @notice Universal post-#151 rule: a proposal with a real (non-zero) `strategy`
+    ///         address has fees distributed exactly as one with no strategy attached.
+    ///         There is no self-report a strategy can make to exempt any fee leg —
+    ///         the mechanism that used to allow that (`selfManagesFees`) is deleted.
+    ///         The distinguishing signal is the OWNER's balance: it moves whenever a
+    ///         performance fee is charged, which under the old mechanism was exactly
+    ///         the leg a `selfManagesFees() == true` strategy could skip.
+    function test_settlement_strategyProposal_chargesNormalFees() public {
         MockStrategyAdapter strat = new MockStrategyAdapter();
-        vm.mockCall(address(strat), abi.encodeWithSelector(IStrategy.selfManagesFees.selector), abi.encode(true));
-
-        uint256 proposalId = _createAndExecuteProposalWithStrategy(1500, 7 days, address(strat));
-        usdc.mint(address(vault), 10_000e6); // simulate profit (float delta)
-
-        uint256 agentBalBefore = usdc.balanceOf(agent);
-
-        assertFalse(_settleAndSawPerformanceFee(proposalId), "self-fee'd: the performance leg is skipped");
-        assertGt(usdc.balanceOf(agent), agentBalBefore, "self-fee'd: management is still charged");
-    }
-
-    /// @notice Control: a strategy with `selfManagesFees()==false` (the BaseStrategy default) still
-    ///         has governor fees distributed normally — proving the opt-out is driven by the FLAG,
-    ///         not merely by a non-zero `strategy` on the proposal. The distinguishing signal is the
-    ///         OWNER's balance: it moves only when a performance fee is charged, which is exactly the
-    ///         leg the flag suppresses.
-    function test_settlement_nonSelfManagedStrategy_chargesNormalFees() public {
-        MockStrategyAdapter strat = new MockStrategyAdapter(); // selfManagesFees() == false
         uint256 proposalId = _createAndExecuteProposalWithStrategy(1500, 7 days, address(strat));
         usdc.mint(address(vault), 10_000e6);
 
@@ -659,78 +639,25 @@ contract SyndicateGovernorTest is Test {
         vm.prank(agent);
         governor.settleProposal(proposalId);
 
-        assertGt(usdc.balanceOf(agent), agentBalBefore, "non-self-fee'd: agent earns on both legs");
-        assertGt(usdc.balanceOf(owner), ownerBalBefore, "non-self-fee'd: performance fee charged");
+        assertGt(usdc.balanceOf(agent), agentBalBefore, "agent earns on both legs");
+        assertGt(usdc.balanceOf(owner), ownerBalBefore, "performance fee charged");
     }
 
-    // ── PR #388 #2: selfManagesFees snapshotted at propose, read from storage at settle ──
-
-    /// @notice Regression A (brick closed): the flag is snapshotted at propose, so a
-    ///         strategy whose `selfManagesFees()` REVERTS after propose no longer bricks
-    ///         settlement. Pre-fix `_finishSettlement` did a live call with `pnl > 0`,
-    ///         so a settle-time revert stranded normal AND emergency settlement.
-    function test_settlement_selfManagesFeesSnapshot_revertAfterProposeDoesNotBrickSettle() public {
-        MockStrategyAdapter strat = new MockStrategyAdapter(); // selfFee=false at propose
-        uint256 proposalId = _createAndExecuteProposalWithStrategy(1500, 7 days, address(strat));
-        usdc.mint(address(vault), 10_000e6); // positive PnL (float delta)
-
-        // Strategy breaks after propose — a live settle-time read would revert here.
-        strat.setRevertOnSelfManagesFees(true);
-
-        uint256 agentBalBefore = usdc.balanceOf(agent);
-        uint256 ownerBalBefore = usdc.balanceOf(owner);
-        vm.prank(agent);
-        governor.settleProposal(proposalId); // must NOT revert
-
-        // Snapshot was false ⇒ normal fee distribution still runs.
-        // Snapshot proven above; here pin only that fees were charged and
-        // stayed within the snapshotted 15% of the 10k gain.
-        uint256 gain688 = usdc.balanceOf(agent) - agentBalBefore;
-        assertGt(gain688, 0, "settle used snapshot; fees charged");
-        assertLt(gain688, 1_500e6, "and no more than the snapshotted rate");
-        // The owner is this fixture's protocolFeeRecipient, so it receives the
-        // protocol share of BOTH legs. Pin that it was paid rather than an
-        // amount computed from the retired waterfall.
-        assertGt(usdc.balanceOf(owner), ownerBalBefore, "protocol + mgmt charged");
-    }
-
-    /// @notice Regression B (TOCTOU closed): a non-pure strategy that reports `false` at
-    ///         propose then flips to `true` before settle must not change the outcome —
-    ///         settle reads the storage snapshot (`false`), so `_distributeFees` runs.
-    function test_settlement_selfManagesFeesSnapshot_toctouFlipIgnored() public {
-        MockStrategyAdapter strat = new MockStrategyAdapter(); // selfFee=false at propose
-        uint256 proposalId = _createAndExecuteProposalWithStrategy(1500, 7 days, address(strat));
-        assertEq(governor.getProposal(proposalId).selfManagesFees, false, "snapshot false at propose");
-        usdc.mint(address(vault), 10_000e6);
-
-        // Attacker flips the live value AFTER propose; a live read would skip all fees.
-        strat.setSelfFee(true);
-        assertTrue(strat.selfManagesFees(), "live value flipped to true");
-
-        uint256 agentBalBefore = usdc.balanceOf(agent);
-        uint256 ownerBalBefore = usdc.balanceOf(owner);
-        vm.prank(agent);
-        governor.settleProposal(proposalId);
-
-        // Uses the false snapshot ⇒ normal fees, not the flipped opt-out.
-        uint256 gain711 = usdc.balanceOf(agent) - agentBalBefore;
-        assertGt(gain711, 0, "flip ignored; agent fee charged");
-        assertLt(gain711, 1_500e6, "at the snapshotted rate, not a live re-read");
-        // Owner doubles as protocolFeeRecipient in this fixture — see the note
-        // on the sibling test above.
-        assertGt(usdc.balanceOf(owner), ownerBalBefore, "flip ignored; protocol + mgmt charged");
-    }
-
-    /// @notice Regression C (fail-fast): proposing with an EOA / non-strategy address now
-    ///         reverts at propose (the snapshot call has no code to return a bool), instead
-    ///         of storing a junk address that would brick settle later.
-    function test_propose_eoaStrategyRevertsAtPropose() public {
+    /// @notice Issue #151 removed the only external call `propose()` made into an
+    ///         agent-supplied address (the `selfManagesFees()` snapshot read). One
+    ///         accepted side effect: `propose()` no longer probes `strategy` for
+    ///         code, so an EOA / codeless address now succeeds at propose instead of
+    ///         reverting. This is the decided tradeoff (design.md D2) — strategy
+    ///         provenance remains an open, owned problem tracked separately under
+    ///         #58 (clone registry) and #118 (propose-time call-target validation),
+    ///         not a fee-integrity concern now that nothing reads the strategy for
+    ///         fee purposes.
+    function test_propose_eoaStrategySucceedsAtPropose() public {
         ISyndicateGovernor.CoProposer[] memory empty = _emptyCoProposers();
         vm.prank(agent);
-        vm.expectRevert();
-        governor.propose(
+        uint256 proposalId = governor.propose(
             address(vault),
-            address(0xBEEF), // EOA, no selfManagesFees()
+            address(0xBEEF), // EOA, no code — no longer probed at propose
             "ipfs://eoa",
             7 days,
             permissiveEnv,
@@ -738,6 +665,7 @@ contract SyndicateGovernorTest is Test {
             _simpleSettlementCalls(),
             empty
         );
+        assertEq(governor.getProposal(proposalId).strategy, address(0xBEEF), "EOA strategy stored as-is");
     }
 
     /// @notice H2: the snapshot is clamped to `maxPerformanceFeeBps` at propose,

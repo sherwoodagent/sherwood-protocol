@@ -9,7 +9,6 @@ import {ITierRegistry} from "./interfaces/ITierRegistry.sol";
 import {IExposureLedger} from "./interfaces/IExposureLedger.sol";
 import {IChallengeGame} from "./interfaces/IChallengeGame.sol";
 import {IProposerBondEscrow} from "./interfaces/IProposerBondEscrow.sol";
-import {IStrategy} from "./interfaces/IStrategy.sol";
 import {GovernorParameters} from "./GovernorParameters.sol";
 import {GovernorEmergency} from "./GovernorEmergency.sol";
 import {BatchExecutorLib} from "./BatchExecutorLib.sol";
@@ -270,12 +269,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         p.proposer = msg.sender;
         p.vault = vault;
         p.strategy = strategy;
-        // Snapshot the strategy's self-fee flag at propose (like performanceFeeBps)
-        // so settle reads storage, not a live call: closes the TOCTOU flip between
-        // review and settle and the brick vector where a settle-time revert would
-        // strand normal AND emergency settlement. No try/catch — a revert here is
-        // the intended fail-fast (an EOA / broken strategy fails at propose).
-        p.selfManagesFees = strategy != address(0) && IStrategy(strategy).selfManagesFees();
         p.metadataURI = metadataURI;
         p.performanceFeeBps =
             _clampPerformanceFee(proposalId, ISyndicateVault(vault).agentFeeBps(), _params.maxPerformanceFeeBps);
@@ -379,6 +372,16 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // Update state BEFORE external call (CEI pattern)
         _activeProposal = proposalId;
         _transition(proposal, ProposalState.Executed);
+        // INVARIANT (issue #35): THIS STAMP MUST PRECEDE THE
+        // `requireApproveQuorum` GATE BELOW, IN THE SAME TRANSACTION. The
+        // gate reads each approver's LIVE `slashableBondUsd`, which is sound
+        // ONLY because every sWOOD stake mutation checkpoints at
+        // `block.timestamp`, so the checkpoint at `executedAt` equals the
+        // live stake the gate just read — the gate and the eventual verdict
+        // slash (anchored at this same `executedAt` by `ChallengeGame`) are
+        // then provably valuing the same WOOD. Move the gate out of this
+        // transaction, or ahead of this line, and that equality stops being
+        // structural and becomes an accident of call ordering.
         proposal.executedAt = block.timestamp;
         // Start the management-fee clock. Must follow `_activeProposal` so the
         // vault's `totalAssets()` reads live NAV through the now-active lane,
@@ -414,6 +417,13 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // here leaves the proposal Approved — it expires at `executeBy`
         // unless covering approvals arrive first, so suppressing the cohort
         // blocks execution without forcing cancellation.
+        //
+        // RUNS AFTER `proposal.executedAt = block.timestamp` ABOVE, IN THE
+        // SAME TRANSACTION — load-bearing (issue #35, see the stamp's own
+        // note). This gate's live read is what makes it sound to leave
+        // every OTHER post-execution ledger read (`allocatedUsd`,
+        // `liabilityUsd`, `settleCoverage`) anchored at `executedAt` instead:
+        // the two are provably equal at this one instant.
         {
             address ledger = _exposureLedger;
             // `requiredCoverage == 0` keeps optimistic passage: a proposal
@@ -554,6 +564,19 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      proposals never executed, so there is nothing a challenge could
     ///      allege.
     ///
+    ///      A bond already confiscated by a conviction is acknowledged, not
+    ///      reverted: `ProposerBondEscrow.forfeitBond` deletes the escrow
+    ///      record without touching this proposal's `proposerBondWood`, so a
+    ///      forfeited bond would otherwise pass every gate below and die
+    ///      forever in the escrow's `NoBond`. Detected by reading the pinned
+    ///      escrow's `bondOf` — the governor still records a bond but the
+    ///      escrow holds none for this key — and handled BEFORE the
+    ///      executed-proposal gates (a forfeited bond has no window left to
+    ///      wait out): zero `proposerBondWood`, emit
+    ///      `ProposerBondForfeitureAcknowledged`, return without transferring.
+    ///      A second call then hits the ordinary `NoBondToReclaim` path, the
+    ///      same terminal answer as after a normal release.
+    ///
     ///      Settled proposals wait `challengeWindow` after `executedAt`, and
     ///      only release while the ledger's per-proposal coverage freeze is
     ///      clear — a proposer who executes a drain and self-settles within
@@ -571,12 +594,16 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      while a conviction — and with it `forfeitBond` — is still
     ///      reachable. The third gate therefore asks the game itself and
     ///      mirrors `ChallengeGame.file`'s own deadline,
-    ///      `max(executedAt + game.challengeWindow(), challengeableUntil[rk])`,
-    ///      so reclaim mirrors filing admissibility as long as `_exposureLedger`
-    ///      is stable. It is NOT an identity: these gates reach the game THROUGH
-    ///      that pointer, which is owner-mutable, so re-pointing it mid-challenge
-    ///      detaches them (issue #116). The escrow pointer is pinned per proposal;
-    ///      this one is not.
+    ///      `max(executedAt + game.challengeWindow(), challengeableUntil[rk])`.
+    ///      All three gates run against `proposal.proposerBondLedger`, the
+    ///      ledger PINNED at propose time (falling back to the live
+    ///      `_exposureLedger` slot only for a pre-pin proposal that recorded
+    ///      no ledger) — never the live slot directly. The escrow pointer was
+    ///      already pinned per proposal; the ledger now is too, so a factory
+    ///      re-point of `_exposureLedger` after this proposal settles (the
+    ///      `_openProposalCount` guard on `setExposureLedger` no longer holds
+    ///      by then) cannot detach these gates from a still-convictable
+    ///      challenge.
     ///      Reading the game's window rather than only `challengeableUntil`
     ///      also covers the ledger owner lowering the LEDGER's window below the
     ///      game's, which nothing on the game side prevents.
@@ -592,12 +619,18 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      is nothing for this gate to protect; an unwired or rotated-away
     ///      freezer must not strand an honest proposer's bond. A non-zero
     ///      freezer that REVERTS or cannot be read fails closed — recover by
-    ///      rotating `coverageFreezer` or re-pointing the ledger. Note the
-    ///      asymmetry: a freezer that ANSWERS zero passes rather than failing
-    ///      closed, so "fails closed" covers unreadability, not every unhelpful
-    ///      answer (issue #117). Note `challengeableUntil` is zero for an
-    ///      untouched key and zero is not a sentinel, so an unchallenged
-    ///      proposal still reclaims on the ordinary schedule.
+    ///      rotating `coverageFreezer` ON THE PINNED LEDGER (its owner-side
+    ///      surface, e.g. `ExposureLedger.setCoverageFreezer`); re-pointing
+    ///      this governor's live `_exposureLedger` slot no longer reaches an
+    ///      already-locked bond's gates. Note the asymmetry: a freezer that
+    ///      ANSWERS zero passes rather than failing closed, so "fails closed"
+    ///      covers unreadability, not every unhelpful answer — whether that
+    ///      should also fail closed is an open, separately-tracked decision;
+    ///      the forfeiture-acknowledge path above is the fix for the
+    ///      indistinguishable-permanent-revert half of the same finding. Note
+    ///      `challengeableUntil` is zero for an untouched key and zero is not
+    ///      a sentinel, so an unchallenged proposal still reclaims on the
+    ///      ordinary schedule.
     ///
     ///      Releases against `proposal.proposerBondEscrow` (bound at propose),
     ///      NOT the live `_bondEscrow` slot: the escrow has no owner and no
@@ -615,18 +648,42 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         }
         uint256 bond = proposal.proposerBondWood;
         if (bond == 0) revert NoBondToReclaim();
+        address escrow = proposal.proposerBondEscrow;
+        // Forfeiture acknowledge (issue #117 L1): the governor still records
+        // a bond, but a conviction already made `forfeitBond` delete the
+        // escrow's record for this key. `bondOf` reports (proposer, amount);
+        // amount == 0 here is exact — the only two record-deleting exits are
+        // this reclaim's own release (which zeroes proposerBondWood in the
+        // same transaction) and forfeiture, so the half-state where the
+        // escrow is empty but proposerBondWood is still nonzero can only mean
+        // forfeiture. Handled before the window gates: a forfeited bond has
+        // nothing left to wait out, and gate 3 below could otherwise revert
+        // ChallengeWindowOpen for a bond that no longer exists.
+        (, uint256 held) = IProposerBondEscrow(escrow).bondOf(address(this), proposalId);
+        if (held == 0) {
+            proposal.proposerBondWood = 0;
+            emit ProposerBondForfeitureAcknowledged(proposalId, bond);
+            return;
+        }
         // The challenge-window hold, for EXECUTED proposals only. Ordered after
         // the `bond == 0` check so a proposal that never posted a bond still
         // reports `NoBondToReclaim` rather than being told to wait for a window
         // it has nothing at stake in.
         uint256 executedAt = proposal.executedAt;
         if (executedAt != 0) {
-            address ledger = _exposureLedger;
-            // Fails closed: fail-open would let the vault owner (who may be
-            // the proposer, or colluding with it) bypass this delay in one
-            // transaction via `setExposureLedger(0)`. The freeze cannot
-            // strand the bond permanently — re-pointing `setExposureLedger`
-            // at any ledger makes it reclaimable again.
+            // Pinned at propose time (issue #116): a factory re-point of the
+            // live `_exposureLedger` slot after this proposal locked its bond
+            // must not change which ledger these gates read. Zero pin means a
+            // pre-upgrade proposal that recorded no ledger — fall back to the
+            // live slot so it keeps its exact pre-pin behavior.
+            address ledger = proposal.proposerBondLedger;
+            if (ledger == address(0)) ledger = _exposureLedger;
+            // Fails closed: fail-open would let the factory (`onlyFactory` on
+            // `setExposureLedger` — a protocol-level actor, not this vault's
+            // own owner) bypass this delay in one transaction via
+            // `setExposureLedger(0)`. The freeze cannot strand the bond
+            // permanently — rotating the pinned ledger's own
+            // `coverageFreezer` makes it reclaimable again.
             if (ledger == address(0)) revert ExposureLedgerUnset();
             if (block.timestamp < executedAt + IExposureLedger(ledger).challengeWindow()) {
                 revert ChallengeWindowOpen();
@@ -648,7 +705,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
                 if (block.timestamp <= deadline) revert ChallengeWindowOpen();
             }
         }
-        address escrow = proposal.proposerBondEscrow;
         // Effects before interaction: zeroing first makes the reclaim
         // idempotent (a second call reverts NoBondToReclaim) and closes any
         // re-entrant double-release through a hooked WOOD.
@@ -886,11 +942,15 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         return _proposals[proposalId].strategy;
     }
 
-    /// @notice Narrow proposal view: (`voteEnd`, `reviewEnd`, `vault`).
+    /// @notice Narrow proposal view: (`voteEnd`, `reviewEnd`, `vault`, ...,
+    ///         `executedAt`).
     /// @dev The guardian registry no longer calls this (it reads its own
     ///      pushed `reviewWindow` and `vaultOf`), but `ExposureLedger` reads
-    ///      `.vault` through this getter on the approve-vote path. Do not
-    ///      remove until that consumer migrates to the registry's `vaultOf`.
+    ///      `.vault` through this getter on the approve-vote path, and reads
+    ///      `.executedAt` on every post-execution coverage read to anchor a
+    ///      guardian's slashable-stake basis (issue #35;
+    ///      `IStakedWood.slashableStakeAt`). Do not remove until those
+    ///      consumers migrate.
     function getProposalView(uint256 proposalId) external view returns (ProposalViewLite memory v) {
         StrategyProposal storage p = _proposals[proposalId];
         v.voteEnd = p.voteEnd;
@@ -903,15 +963,23 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // `executedAt` is not known yet and may never be set.
         v.executeBy = p.executeBy;
         v.strategyDuration = p.strategyDuration;
+        // 0 until `executeProposal` stamps it (see the invariant note at that
+        // assignment). `ExposureLedger` treats 0 as "no anchor yet — read
+        // live", exactly matching what a not-yet/never-executed proposal
+        // means for a verdict that cannot exist.
+        v.executedAt = p.executedAt;
     }
 
-    /// @dev Narrow proposal tuple returned by `getProposalView`.
+    /// @dev Narrow proposal tuple returned by `getProposalView`. Memory-only
+    ///      — this struct is never stored, so appending `executedAt` is an
+    ///      ABI extension with no storage-layout effect (issue #35).
     struct ProposalViewLite {
         uint256 voteEnd;
         uint256 reviewEnd;
         address vault;
         uint256 executeBy;
         uint256 strategyDuration;
+        uint256 executedAt;
     }
 
     // ==================== INTERNAL ====================
@@ -1009,14 +1077,35 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             if (escrow != address(0)) {
                 uint256 bondWood = IExposureLedger(ledger).proposerBondWood(asset, coverage_);
                 if (bondWood != 0) {
-                    // Bind the bond to THIS escrow: `reclaimProposerBond`
-                    // releases against the stored address, so re-pointing
-                    // `_bondEscrow` later cannot strand it (the escrow has no
+                    // FAIL CLOSED ON A MISMATCHED PAIR, before any state
+                    // write. `_bondEscrow` and `_exposureLedger` are
+                    // independently factory-settable with no on-chain pairing
+                    // guarantee (`setBondEscrow` requires draining all
+                    // outstanding bonds first; `setExposureLedger` only
+                    // requires `_openProposalCount == 0`, a much weaker
+                    // gate — ledger rotation routinely outpaces escrow
+                    // rotation in ordinary operation). Locking a bond into an
+                    // escrow whose own immutable `exposureLedger` differs
+                    // from `ledger` would price/pin it against a ledger whose
+                    // live game the escrow will never recognize as the
+                    // authorized convictor — `forfeitBond` would revert
+                    // `NotAuthorizedConvictor` forever, and a convicted
+                    // proposer would keep the bond (audit finding, PR #136
+                    // round 1).
+                    if (IProposerBondEscrow(escrow).exposureLedger() != ledger) {
+                        revert LedgerEscrowMismatch();
+                    }
+                    // Bind the bond to THIS escrow AND this ledger:
+                    // `reclaimProposerBond` releases against the stored escrow
+                    // and gates against the stored ledger, so re-pointing
+                    // `_bondEscrow` / `_exposureLedger` later cannot strand
+                    // the bond or detach its reclaim gates (the escrow has no
                     // owner and no discretionary exit; its bond key is
                     // (governor, proposalId), so nobody else can address it).
-                    // Both writes precede the external call (CEI).
+                    // All three writes precede the external call (CEI).
                     p.proposerBondWood = bondWood;
                     p.proposerBondEscrow = escrow;
+                    p.proposerBondLedger = ledger;
                     // STATE-CHANGING external call: `lockBond` pulls WOOD via
                     // `transferFrom`, so a WOOD with a transfer hook can
                     // re-enter this governor here. INVARIANT: every
@@ -1242,22 +1331,16 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // there is no profit to share.
         uint256 totalFee = _chargeManagementFee(proposalId, vault, asset, proposal.proposer);
 
-        // A self-fee'd strategy (custody model — LPs deposit/redeem into the
-        // strategy, shares minted/burned on the vault) crystallises its own fees; the
-        // governor's float-delta PnL would misread net deposits as profit and double-
-        // charge. Read the propose-time snapshot, never a live call (TOCTOU +
-        // brick-on-revert).
-        //
-        // The opt-out covers the PERFORMANCE leg only. `selfManagesFees` exists
-        // because float-delta PnL misreads custody deposits as profit — a defect
-        // in profit measurement. The management fee does not use PnL at all
-        // (it is capital x time), so the reason for the exemption does not reach
-        // it.
-        // Always called, even on the self-managed path — see `chargeNew`.
+        // No strategy self-report can exempt a proposal from the performance
+        // leg (issue #151 deleted that mechanism: it was a self-reported
+        // opt-out for a custody-model strategy that never shipped, and it let
+        // any registered agent skip the performance fee by pointing a
+        // proposal at a contract that claimed to self-manage fees). Every
+        // proposal is charged the same way.
+        // Always called regardless — see `chargeNew`.
         {
             uint256 perfFee;
-            (agentFee, perfFee) =
-                _chargePerformanceFee(proposalId, vault, asset, proposal.proposer, !proposal.selfManagesFees);
+            (agentFee, perfFee) = _chargePerformanceFee(proposalId, vault, asset, proposal.proposer, true);
             totalFee += perfFee;
         }
 
@@ -1335,11 +1418,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      so co-proposer splits apply to management as well as carry.
     ///      Guardian delivery is a WOOD airdrop via Merkl, attributed by the
     ///      GuardianFeeAccrued event.
-    ///      Escape hatch: IStrategy.selfManagesFees() == true (snapshotted at
-    ///      propose) skips the PERFORMANCE leg only — the management fee does
-    ///      not use PnL, so the misread-PnL reason for the exemption does not
-    ///      reach it. No in-tree strategy currently sets
-    ///      the flag; any that does must implement its own protocol-fee leg.
     ///      Failure mode: any recipient transfer that reverts escrows in _unclaimedFees
     ///      (pull via claimUnclaimedFees) so settlement never bricks.
     /// @return mgmtFee The whole management fee charged.
@@ -1422,12 +1500,17 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      base first would charge performance on assets already taken.
     /// @return agentFee The agent's slice, reported for the settle event.
     /// @return perfFee  The whole fee charged.
-    /// @param chargeNew False on the `selfManagesFees` path: the strategy
-    ///        collects its own performance fee, so settlement charges none.
-    ///        The function still runs, because fees already crystallized from
-    ///        instant exiters must be released and paid — skipping the call
-    ///        entirely would strand them in the vault forever, permanently
-    ///        excluded from `totalAssets()` and therefore lost to depositors.
+    /// @param chargeNew Currently always `true`; the parameter survives
+    ///        because the function must still run when it is conceptually
+    ///        "false" for a reason unrelated to the deleted self-managed-fees
+    ///        exemption: fees already crystallized from instant exiters must
+    ///        be released and paid — skipping the call entirely would strand
+    ///        them in the vault forever, permanently excluded from
+    ///        `totalAssets()` and therefore lost to depositors. Re-evaluate
+    ///        once #54 (Lane A crystallization retirement) removes
+    ///        `consumeCrystallizedPerf` — at that point this parameter is
+    ///        plausibly vacuous and removable, but that is #54's
+    ///        determination, not this change's.
     function _chargePerformanceFee(uint256 proposalId, address vault, address asset, address proposer, bool chargeNew)
         internal
         returns (uint256 agentFee, uint256 perfFee)
@@ -1619,6 +1702,30 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      practice. Recover instead at the ledger (ledger-owner:
     ///      `setAssetFeed` / `setCoveredTvlCapUsd`), or point the factory at a
     ///      fresh permissive ledger and `pushWiring` this governor.
+    ///
+    ///      Re-pointing this slot does NOT move a POST-UPGRADE bond's reclaim
+    ///      gates: `reclaimProposerBond` pins the ledger it gates against
+    ///      onto the proposal at propose time (`proposal.proposerBondLedger`)
+    ///      and reads that, not this live slot, for any bond locked by THIS
+    ///      governor implementation.
+    ///
+    ///      IT DOES MOVE A LEGACY BOND'S GATES. `proposerBondLedger` is a
+    ///      field appended to `StrategyProposal` by the fix for issue #116;
+    ///      any proposal that locked a bond under a PRIOR governor
+    ///      implementation never wrote it, so it reads `address(0)` forever,
+    ///      and `reclaimProposerBond`'s fallback resolves that to THIS live
+    ///      slot — reproducing, for that entire cohort, the exact re-point
+    ///      bypass this fix exists to close. `setExposureLedger`'s only guard
+    ///      (`_openProposalCount > 0`) stops blocking a re-point the moment a
+    ///      legacy proposal itself settles (`_decOpen()` fires in
+    ///      `_finishSettlement`, before that proposal's bond-hold window even
+    ///      starts) — so an ORDINARY ledger migration, no malice required,
+    ///      silently detaches a legacy bond's challenge-window protection.
+    ///      Accepted trade-off (design.md, `fix-proposer-bond-reclaim-gates`,
+    ///      Decision D2): bricking every pre-upgrade bond was judged worse.
+    ///      Operational requirement: drain every outstanding legacy bond
+    ///      (`reclaimProposerBond` or a genuine conviction) before re-pointing
+    ///      this slot after deploying this fix.
     function setExposureLedger(address newLedger) external onlyFactory {
         // Not while proposals are open: a proposal created before the ledger
         // existed carries no booked coverage, but `executeProposal` starts
