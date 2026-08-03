@@ -1518,6 +1518,69 @@ contract TokenCourtTest is Test {
         assertGt(floor, 0, "electorate growth past the lookback must not collapse the floor to zero");
     }
 
+    /// @notice RE-AUDIT FINDING (PR #120 round 2): THE PRIOR REGRESSION TEST
+    ///         DOES NOT PIN THE FIX, BECAUSE `earlier` BINDS IN IT.
+    ///
+    ///         `test_finalize_floorSurvivesElectorateGrowthPastTheLookback`
+    ///         uses earlier=60k < reduced=260k, so `earlier` is the binding
+    ///         term and `accusedWeight` never actually reaches the min
+    ///         comparison. A mutant that compares the lookback read against
+    ///         the UNREDUCED `total` instead of `reduced` —
+    ///         `base = (earlier != 0 && earlier < total) ? earlier : reduced`
+    ///         — is byte-equivalent to the real formula on every existing
+    ///         fixture, this one included, because none of them has
+    ///         `accusedWeight > 0` together with `earlier > 0` in the regime
+    ///         where `reduced`, not `earlier`, is the smaller term.
+    ///
+    ///         This fixture closes that gap: earlier=500k, total=560k,
+    ///         accused=300k, so `reduced = 260k < earlier = 500k` and
+    ///         `reduced` binds. The mutant above would instead take the
+    ///         `earlier < total` branch (500k < 560k is true) and return
+    ///         `earlier` = 500k — a floor of 50,000e18, more than 8x the
+    ///         real 26,000e18, wide open to the #96 bug class (an
+    ///         unclearable floor) the moment `accusedWeight` is large enough
+    ///         to make `reduced` the smaller term.
+    ///
+    ///         MUTATION-CHECKED: comparing against `total` instead of
+    ///         `reduced` in the lookback condition computes floor=50,000e18
+    ///         here instead of 26,000e18, failing the exact-value assertion.
+    function test_finalize_floorPinsTheReducedTermWhenItBindsBeforeTheLookback() public {
+        game.setChallenge(
+            CHALLENGE_ID,
+            governor,
+            PROPOSAL_ID,
+            IChallengeGame.Status.Disputed,
+            vm.getBlockTimestamp(),
+            30 days,
+            vm.getBlockTimestamp() - 1 days
+        );
+        address accused = makeAddr("reducedBindsAccused");
+        address[] memory a = new address[](1);
+        uint256[] memory cm = new uint256[](1);
+        a[0] = accused;
+        cm[0] = 100e18;
+        ledger.setApprovers(a, cm);
+
+        uint256 snap = vm.getBlockTimestamp() - 1 days - 1;
+        uint256 lookbackTs = snap - court.FLOOR_LOOKBACK();
+
+        // reduced = 560k - 300k = 260k, which is LESS than earlier (500k),
+        // so `reduced` is the binding term — the regime no prior fixture
+        // reaches with a nonzero `accusedWeight`.
+        swood.setPastStake(accused, snap, 300_000e18);
+        swood.setPastTotalVotes(lookbackTs, 500_000e18);
+        swood.setPastTotalVotes(snap, 560_000e18);
+
+        uint256 caseId = court.refer(CHALLENGE_ID);
+        assertEq(court.caseOf(caseId).accusedWeight, 300_000e18, "accused raw stake recorded");
+
+        vm.warp(vm.getBlockTimestamp() + 5 days);
+
+        (uint256 floor,) = _finalizeAndReadFloor(caseId);
+
+        assertEq(floor, 26_000e18, "10% of min(500_000e18, 560_000e18 - 300_000e18) = 10% of 260_000e18");
+    }
+
     // ── ownership ──
 
     /// @notice An ownerless court is unrecoverable: it is non-upgradeable, so

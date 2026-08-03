@@ -359,13 +359,17 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///         bar outright: none of the beneficiary's other addresses are in
     ///         the accused set, so they vote freely. The floor mechanics make
     ///         this worse, not neutral: `_participationFloor` subtracts the
-    ///         accused set's raw stake from the electorate base and CLAMPS
-    ///         THAT SUBTRACTION AT ZERO, so every address the accused set DOES
-    ///         name shrinks the floor the siblings' un-accused addresses must
-    ///         clear to carry the vote — unconditionally, all the way down to
-    ///         a floor of zero once the named cohort covers the base. A larger
-    ///         accused cohort makes the remaining, still-interested
-    ///         electorate's job easier, never harder, at every size. This is
+    ///         accused set's raw stake from the total, same-instant, and
+    ///         clamps that subtraction at zero, so once the REDUCED branch
+    ///         binds (`total - accusedWeight <= earlier`), every address the
+    ///         accused set DOES name shrinks the floor the siblings'
+    ///         un-accused addresses must clear to carry the vote — all the
+    ///         way down to a floor of zero once the named cohort covers the
+    ///         base. (While the EARLIER branch still binds, naming more
+    ///         accused has no effect on the floor at all — see the lookback
+    ///         rationale below.) A larger accused cohort never raises the
+    ///         bar the remaining electorate must clear, only lowers or holds
+    ///         it, once it moves the floor at all. This is
     ///         likely unfixable under permissionless staking (there is no
     ///         on-chain notion of
     ///         "the same party"); the natspec must not claim the bar covers a
@@ -587,25 +591,29 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///      to nothing while a large, honest, unaccused electorate stood by
     ///      unable to move it — the fix for #96 was found to introduce this
     ///      failure and was corrected before merge.
-    /// @dev THE CLAMPED BRANCH IS A LIVE BRANCH, NOT DEFENCE-IN-DEPTH:
-    ///      `accusedWeight <= total` does NOT hold by construction — the
-    ///      accused set is exactly whoever the challenge named, and nothing
-    ///      stops that set (measured at `snapshotTs`, where it must be,
-    ///      because that is the stake a conviction actually slashes) from
-    ///      approaching or reaching the full electorate. THE INVARIANT THE
-    ///      CLAMP BUYS IS MONOTONICITY: the floor is monotone NON-INCREASING
-    ///      in `accusedWeight`, so growing the accused cohort's recorded
-    ///      stake can only ever lower the bar its jury must clear, never
-    ///      raise it, and there is no discontinuity anywhere on the domain.
-    ///      The adversary is the accused set itself. Falling back to the
-    ///      UNREDUCED base instead would make the floor jump from near-zero
-    ///      straight to its maximum (`bps * base`) at the crossing, so an
-    ///      accused approver — who controls `accusedWeight` by staking more
-    ///      before its own drain — could buy a forced `Inconclusive` (no
-    ///      slash, no `_convicted` mark, no adapter demotion, counter-bond
-    ///      returned whole) for one extra wei of stake. That is strictly
-    ///      cheaper than the non-approving-address denial lever the lookback
-    ///      min below exists to close, and it lands in this exact branch.
+    /// @dev THE CLAMP IS DEFENCE-IN-DEPTH, NOT A LIVE BRANCH:
+    ///      `accusedWeight` sums `getPastStake` over the accused set, which
+    ///      is a SUBSET of the addresses `total` (`getPastTotalVotes`) sums,
+    ///      read from the same source at the same instant `snapshotTs` — a
+    ///      subset-sum of `total` cannot exceed `total`, so
+    ///      `accusedWeight <= total` holds structurally under one
+    ///      consistently-wired `StakedWood`. `max(0, total - accusedWeight)`
+    ///      never actually clamps in normal operation; it exists for the one
+    ///      path that could desynchronize the subset relationship — a
+    ///      `setStakedWood` re-point (`:748-760`) landing between the two
+    ///      reads, so `accusedWeight` and `total` briefly come from different
+    ///      sources.
+    ///      MONOTONICITY HOLDS, BUT NOT VIA STAKING: an accused approver
+    ///      cannot lower the base by staking more, because staking raises
+    ///      `total` by exactly the same amount it raises `accusedWeight`
+    ///      (the staked address's balance is counted in both, being a member
+    ///      of the subset) — so `total - accusedWeight` is unchanged, and
+    ///      there is no "buy a forced `Inconclusive` for one extra wei of
+    ///      stake" attack. What IS monotone non-increasing is the base as a
+    ///      function of WHO is named accused: naming one more address as
+    ///      accused (a structural act by the challenge, at `_recordAccused`,
+    ///      not a staking action) can only remove that address's already-
+    ///      staked balance from `total - accusedWeight`, never add to it.
     ///
     ///      A ZERO FLOOR IS SAFE HERE, and — unlike the earlier revision —
     ///      that claim is now TRUE rather than merely asserted: because the
@@ -615,11 +623,15 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///      sits ahead of the `turnout < floor` comparison and forces
     ///      `Inconclusive` on a silent electorate no matter what this
     ///      returns, so a zero floor can never let a zero-turnout case
-    ///      resolve on the merits — and when it is non-zero-but-thin, the
+    ///      resolve on the merits — and when it is non-zero-but-thin AND the
+    ///      REDUCED branch binds (`total - accusedWeight <= earlier`), the
     ///      single unaccused voter it admits is genuinely the entire
-    ///      unaccused electorate, not an artifact of comparing stake at two
-    ///      different timestamps. Whoever is left unaccused IS the jury,
-    ///      because there is no one else left to be it.
+    ///      unaccused electorate at `snapshotTs`, not an artifact of
+    ///      comparing stake at two different timestamps. When the EARLIER
+    ///      branch binds instead, the floor is a month-old snapshot value
+    ///      unrelated to today's unaccused stake — that is the lookback
+    ///      trading precision for anti-inflation, not a claim about who is
+    ///      currently in the room.
     /// @dev THE BASE IS THE MIN OVER A LOOKBACK. The snapshot defends the
     ///      NUMERATOR: vote weight is read at `executedAt - 1`, so post-drain
     ///      buyers and flash loans
@@ -706,12 +718,17 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///      once the protocol has a month of stake history, and it is the
     ///      period in which TVL — and therefore the payoff for denying a
     ///      verdict — is smallest.
-    /// @dev THE MIN ALSO NEUTRALISES THE ACCUSED'S OWN INFLATION LEVER, which
-    ///      runs the other way: without it, an accused approver topping up
-    ///      its stake just before the drain would raise `total` and
-    ///      `accusedWeight` together, while a NON-approving sibling address
-    ///      topping up would raise only `total`. Neither moves the base at
-    ///      all unless it was already staked a month earlier.
+    /// @dev THE ACCUSED'S OWN TOP-UP IS ALREADY NEUTRAL, WITH OR WITHOUT THE
+    ///      MIN: an accused approver topping up its stake just before the
+    ///      drain raises `total` and `accusedWeight` together, by the same
+    ///      amount, so `total - accusedWeight` — and therefore the base — is
+    ///      unchanged regardless of which branch binds. A NON-approving
+    ///      sibling address topping up raises only `total`, which raises
+    ///      `total - accusedWeight` immediately, with no lookback delay,
+    ///      WHENEVER THE REDUCED BRANCH BINDS. The min only withholds that
+    ///      immediate effect while the EARLIER branch still binds — in that
+    ///      regime alone, a same-block top-up moves the base by nothing
+    ///      unless it was already staked a month earlier.
     /// @dev THE FLOOR READS THE LIVE `participationFloorBps`, DELIBERATELY NOT
     ///      PINNED per-case. This is the opposite choice from `snapshotTs` and
     ///      `voteWindowAtReferral`, which ARE pinned at `refer` — and the
