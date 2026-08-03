@@ -240,6 +240,21 @@ interface ISyndicateGovernor {
     error StrategyDurationNotElapsed();
     error InvalidProtocolFeeBps();
     error InvalidProtocolFeeRecipient();
+    /// @notice `_bondEscrow` and `_exposureLedger` are two independently
+    ///         factory-settable slots with no on-chain pairing guarantee —
+    ///         `setBondEscrow` requires draining all outstanding bonds first,
+    ///         `setExposureLedger` only requires `_openProposalCount == 0`
+    ///         (a much weaker gate), so ledger rotation can outpace escrow
+    ///         rotation in ordinary operation. Locking a new bond into an
+    ///         escrow whose own immutable `exposureLedger` differs from the
+    ///         ledger this proposal is pinning would price/pin the bond
+    ///         against one ledger's live challenge machinery while holding it
+    ///         in an escrow that will reject every forfeiture attempt from
+    ///         that ledger's game, forever (`ProposerBondEscrow.forfeitBond`
+    ///         reverts `NotAuthorizedConvictor`) — a convicted proposer keeps
+    ///         the bond. `_snapshotTierAndGate` refuses to lock rather than
+    ///         create that state (audit finding, PR #136 round 1).
+    error LedgerEscrowMismatch();
     /// @notice Revert if a vault already has a non-terminal proposal
     ///         (Draft / Pending / GuardianReview / Approved / Executed) when
     ///         a new propose() or approveCollaboration Draft->Pending is

@@ -668,10 +668,11 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             // live slot so it keeps its exact pre-pin behavior.
             address ledger = proposal.proposerBondLedger;
             if (ledger == address(0)) ledger = _exposureLedger;
-            // Fails closed: fail-open would let the vault owner (who may be
-            // the proposer, or colluding with it) bypass this delay in one
-            // transaction via `setExposureLedger(0)`. The freeze cannot
-            // strand the bond permanently — rotating the pinned ledger's own
+            // Fails closed: fail-open would let the factory (`onlyFactory` on
+            // `setExposureLedger` — a protocol-level actor, not this vault's
+            // own owner) bypass this delay in one transaction via
+            // `setExposureLedger(0)`. The freeze cannot strand the bond
+            // permanently — rotating the pinned ledger's own
             // `coverageFreezer` makes it reclaimable again.
             if (ledger == address(0)) revert ExposureLedgerUnset();
             if (block.timestamp < executedAt + IExposureLedger(ledger).challengeWindow()) {
@@ -1054,6 +1055,24 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             if (escrow != address(0)) {
                 uint256 bondWood = IExposureLedger(ledger).proposerBondWood(asset, coverage_);
                 if (bondWood != 0) {
+                    // FAIL CLOSED ON A MISMATCHED PAIR, before any state
+                    // write. `_bondEscrow` and `_exposureLedger` are
+                    // independently factory-settable with no on-chain pairing
+                    // guarantee (`setBondEscrow` requires draining all
+                    // outstanding bonds first; `setExposureLedger` only
+                    // requires `_openProposalCount == 0`, a much weaker
+                    // gate — ledger rotation routinely outpaces escrow
+                    // rotation in ordinary operation). Locking a bond into an
+                    // escrow whose own immutable `exposureLedger` differs
+                    // from `ledger` would price/pin it against a ledger whose
+                    // live game the escrow will never recognize as the
+                    // authorized convictor — `forfeitBond` would revert
+                    // `NotAuthorizedConvictor` forever, and a convicted
+                    // proposer would keep the bond (audit finding, PR #136
+                    // round 1).
+                    if (IProposerBondEscrow(escrow).exposureLedger() != ledger) {
+                        revert LedgerEscrowMismatch();
+                    }
                     // Bind the bond to THIS escrow AND this ledger:
                     // `reclaimProposerBond` releases against the stored escrow
                     // and gates against the stored ledger, so re-pointing
@@ -1668,15 +1687,29 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      `setAssetFeed` / `setCoveredTvlCapUsd`), or point the factory at a
     ///      fresh permissive ledger and `pushWiring` this governor.
     ///
-    ///      Re-pointing this slot does NOT move any already-locked bond's
-    ///      reclaim gates: `reclaimProposerBond` pins the ledger it gates
-    ///      against onto the proposal at propose time
-    ///      (`proposal.proposerBondLedger`) and reads that, not this live
-    ///      slot, for any bond that locked one. This function's effect is
-    ///      scoped to proposals proposed AFTER the change (their pin is
-    ///      written from the new value) and, for the covered-TVL/coverage-
-    ///      horizon gates in `_snapshotTierAndGate`, to propose-time checks
-    ///      generally — it is never a lever over a bond already in escrow.
+    ///      Re-pointing this slot does NOT move a POST-UPGRADE bond's reclaim
+    ///      gates: `reclaimProposerBond` pins the ledger it gates against
+    ///      onto the proposal at propose time (`proposal.proposerBondLedger`)
+    ///      and reads that, not this live slot, for any bond locked by THIS
+    ///      governor implementation.
+    ///
+    ///      IT DOES MOVE A LEGACY BOND'S GATES. `proposerBondLedger` is a
+    ///      field appended to `StrategyProposal` by the fix for issue #116;
+    ///      any proposal that locked a bond under a PRIOR governor
+    ///      implementation never wrote it, so it reads `address(0)` forever,
+    ///      and `reclaimProposerBond`'s fallback resolves that to THIS live
+    ///      slot — reproducing, for that entire cohort, the exact re-point
+    ///      bypass this fix exists to close. `setExposureLedger`'s only guard
+    ///      (`_openProposalCount > 0`) stops blocking a re-point the moment a
+    ///      legacy proposal itself settles (`_decOpen()` fires in
+    ///      `_finishSettlement`, before that proposal's bond-hold window even
+    ///      starts) — so an ORDINARY ledger migration, no malice required,
+    ///      silently detaches a legacy bond's challenge-window protection.
+    ///      Accepted trade-off (design.md, `fix-proposer-bond-reclaim-gates`,
+    ///      Decision D2): bricking every pre-upgrade bond was judged worse.
+    ///      Operational requirement: drain every outstanding legacy bond
+    ///      (`reclaimProposerBond` or a genuine conviction) before re-pointing
+    ///      this slot after deploying this fix.
     function setExposureLedger(address newLedger) external onlyFactory {
         // Not while proposals are open: a proposal created before the ledger
         // existed carries no booked coverage, but `executeProposal` starts
