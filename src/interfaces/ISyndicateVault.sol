@@ -110,6 +110,13 @@ interface ISyndicateVault {
 
     // ── Governor ──
     function executeGovernorBatch(BatchExecutorLib.Call[] calldata calls, uint256 maxNetOutflow) external;
+    /// @notice Whether `target` is a privileged batch target — the vault
+    ///         itself or its bound withdrawal queue — the SAME predicate
+    ///         `executeGovernorBatch`'s `_guardBatchCalls` enforces. Exposed so
+    ///         the governor's propose-time validation can consume this single
+    ///         implementation instead of restating the address set; consumers
+    ///         must never duplicate the check, only call through this view.
+    function isPrivilegedBatchTarget(address target) external view returns (bool);
     function owner() external view returns (address);
     function transferPerformanceFee(address asset, address to, uint256 amount) external;
     function governor() external view returns (address);
