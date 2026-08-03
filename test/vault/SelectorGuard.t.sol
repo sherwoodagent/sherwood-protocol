@@ -139,19 +139,69 @@ contract SelectorGuardTest is Test {
         assertEq(usdc.balanceOf(adapter), 1e6);
     }
 
-    /// @notice transferFrom pulling INTO the vault (to == vault) is an inflow —
-    ///         always fine regardless of the allowlist.
-    function test_transferFromIntoVaultPasses() public {
+    /// @notice issue #115 (LP-allowance confiscation). This test used to be
+    ///         `test_transferFromIntoVaultPasses` and pinned "pull into the
+    ///         vault always passes" as INTENDED behaviour: it minted `sink`
+    ///         100e6, had `sink` approve the vault, then asserted a batch
+    ///         `transferFrom(sink, vault, 100e6)` succeeded because `to ==
+    ///         vault` reads as an inflow. That is exactly the confiscation
+    ///         primitive — a governor batch runs under delegatecall, so
+    ///         `msg.sender == vault` on every sub-call, and `transferFrom`
+    ///         only needs `allowance[from][vault]` to be set. Any LP's deposit
+    ///         allowance (routinely `type(uint256).max`) qualifies; net-outflow
+    ///         reads 0 because the vault's OWN balance rises, so no other meter
+    ///         sees it. The old assertion was deliberately removed and replaced
+    ///         with this regression: the source (`from`) must equal the vault
+    ///         itself, unconditionally, or the batch reverts.
+    function test_transferFromThirdPartySourceReverts_LPAllowanceConfiscation() public {
         address sink = makeAddr("sink");
         usdc.mint(sink, 100e6);
         vm.prank(sink);
-        usdc.approve(address(vault), 100e6);
+        usdc.approve(address(vault), type(uint256).max);
 
-        uint256 before = usdc.balanceOf(address(vault));
+        vm.expectRevert(
+            abi.encodeWithSelector(ISyndicateVault.DisallowedTransferFromSource.selector, address(usdc), sink)
+        );
         _exec(_one(address(usdc), abi.encodeCall(usdc.transferFrom, (sink, address(vault), 100e6))));
-        assertEq(usdc.balanceOf(address(vault)), before + 100e6);
+
+        assertEq(usdc.balanceOf(sink), 100e6);
+        assertEq(usdc.allowance(sink, address(vault)), type(uint256).max);
     }
 
+    /// @notice Decision 1 (design.md): destination allowlisting confers no
+    ///         source consent. `adapter` is allowlisted as a RECIPIENT
+    ///         (`isAdapterAllowed`), which says nothing about whether a batch
+    ///         may pull FROM it — guards against a future "symmetric" refactor
+    ///         that reuses the destination allowlist as a source allowlist.
+    function test_transferFromFromAllowlistedAdapterReverts() public {
+        vm.expectRevert(
+            abi.encodeWithSelector(ISyndicateVault.DisallowedTransferFromSource.selector, address(usdc), adapter)
+        );
+        _exec(_one(address(usdc), abi.encodeCall(usdc.transferFrom, (adapter, address(vault), 1e6))));
+    }
+
+    /// @notice Decision 4 (design.md): `from == address(this)` stays permitted
+    ///         — `transferFrom(vault, x, amt)` is semantically `transfer(x,
+    ///         amt)`. The self-approve creates `allowance[vault][vault]`
+    ///         (guarded by Part 2, recipient == vault); the pull then spends it
+    ///         and lands on an allowlisted adapter.
+    function test_vaultSourcedTransferFromToAllowlistedAdapterPasses() public {
+        BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](2);
+        calls[0] = BatchExecutorLib.Call({
+            target: address(usdc), data: abi.encodeCall(usdc.approve, (address(vault), 1e6)), value: 0
+        });
+        calls[1] = BatchExecutorLib.Call({
+            target: address(usdc), data: abi.encodeCall(usdc.transferFrom, (address(vault), adapter, 1e6)), value: 0
+        });
+        _exec(calls);
+        assertEq(usdc.balanceOf(adapter), 1e6);
+    }
+
+    /// @notice Decision 4 companion: the source guard permits `from == vault`,
+    ///         but Part 2's destination guard is untouched — a vault-sourced
+    ///         pull to a non-allowlisted recipient still reverts
+    ///         `DisallowedTransferTarget`. Also doubles as task 2.4's pinned
+    ///         scenario (vault-sourced-to-non-allowlisted-recipient).
     function test_transferFromToNonAllowlistedReverts() public {
         _expectDisallowed(address(usdc), SEL_TRANSFER_FROM, attacker);
         _exec(_one(address(usdc), abi.encodeCall(usdc.transferFrom, (address(vault), attacker, 1e6))));
@@ -171,13 +221,29 @@ contract SelectorGuardTest is Test {
         _exec(_one(address(usdc), abi.encodePacked(SEL_APPROVE, uint64(0xdead))));
     }
 
+    /// @notice transferFrom selector + a single 32-byte word — no `to`
+    ///         argument. Now caught by the SOURCE guard's own length check in
+    ///         PART 1 (`data.length < 68`), before Part 2 ever runs — still
+    ///         `MalformedCall`, same as before this change, just from a
+    ///         different (earlier, unconditional) site.
     function test_transferFromWithOnlyOneArgReverts() public {
-        // transferFrom selector + a single 32-byte word — no `to` argument.
         vm.expectRevert(ISyndicateVault.MalformedCall.selector);
         _exec(_one(address(usdc), abi.encodePacked(SEL_TRANSFER_FROM, uint256(uint160(attacker)))));
     }
 
-    // ── unset registry / legacy governor: guard off by design ──
+    /// @notice Registry-less twin of the test above. Decision 2 (design.md)
+    ///         accepted side effect: short `transferFrom` calldata now reverts
+    ///         `MalformedCall` UNCONDITIONALLY, including with the registry
+    ///         unset — previously this calldata was never inspected when the
+    ///         registry was unset (Part 2 returned early) and the batch would
+    ///         have proceeded to execute.
+    function test_transferFromWithOnlyOneArgReverts_RegistryUnset() public {
+        governor.setTierRegistry(address(0));
+        vm.expectRevert(ISyndicateVault.MalformedCall.selector);
+        _exec(_one(address(usdc), abi.encodePacked(SEL_TRANSFER_FROM, uint256(uint160(attacker)))));
+    }
+
+    // ── unset registry / legacy governor: guard off by design (Part 2 only) ──
 
     /// @notice Registry unset (address(0)) on the governor → the batch runs
     ///         UNguarded. Documented v1 posture: an unset registry already means
@@ -201,6 +267,47 @@ contract SelectorGuardTest is Test {
             _one(address(usdc), abi.encodeCall(usdc.approve, (attacker, 1e6))), type(uint256).max
         );
         assertEq(usdc.allowance(address(vault), attacker), 1e6);
+    }
+
+    // ── transferFrom source guard (PART 1b) is unconditional — degrade-open coverage ──
+
+    /// @notice Decision 2 (design.md): the source check is UNCONDITIONAL, so it
+    ///         must still bite with the registry unset — mirrors the #93
+    ///         pattern (`test_targetGate_bitesEvenWithNoTierRegistryWired`).
+    ///         The audit-diff placement (inside Part 2) would have let this
+    ///         pass; this test pins that it doesn't.
+    function test_transferFromSourceGuard_bitesEvenWithNoTierRegistryWired() public {
+        governor.setTierRegistry(address(0));
+        address sink = makeAddr("sink2");
+        usdc.mint(sink, 50e6);
+        vm.prank(sink);
+        usdc.approve(address(vault), 50e6);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(ISyndicateVault.DisallowedTransferFromSource.selector, address(usdc), sink)
+        );
+        _exec(_one(address(usdc), abi.encodeCall(usdc.transferFrom, (sink, address(vault), 50e6))));
+    }
+
+    /// @notice Decision 2 companion: same, but for a governor predating the
+    ///         `tierRegistry()` getter entirely (mirrors
+    ///         `test_targetGate_bitesEvenWhenGovernorHasNoTierGetter`).
+    function test_transferFromSourceGuard_bitesEvenWhenGovernorHasNoTierGetter() public {
+        MockGovernorNoTierGetter legacy = new MockGovernorNoTierGetter();
+        vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(legacy)));
+
+        address sink = makeAddr("sink3");
+        usdc.mint(sink, 50e6);
+        vm.prank(sink);
+        usdc.approve(address(vault), 50e6);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(ISyndicateVault.DisallowedTransferFromSource.selector, address(usdc), sink)
+        );
+        vm.prank(address(legacy));
+        vault.executeGovernorBatch(
+            _one(address(usdc), abi.encodeCall(usdc.transferFrom, (sink, address(vault), 50e6))), type(uint256).max
+        );
     }
 
     // ── non-guarded selectors stay unrestricted ──

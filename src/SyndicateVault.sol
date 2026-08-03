@@ -549,6 +549,40 @@ contract SyndicateVault is
     ///      surface and stay open, bounded by Part 2, the outflow meter and tier
     ///      pricing as before.
     ///
+    ///      ── PART 1b: transferFrom SOURCE guard (LP-ALLOWANCE CONFISCATION) ──
+    ///
+    ///      Same loop, same unconditional posture, different adversary: the
+    ///      batch runs via delegatecall, so every sub-call carries
+    ///      msg.sender == vault. `asset.transferFrom(victim, vault, victimBal)`
+    ///      therefore spends `allowance[victim][vault]` — the very allowance
+    ///      every LP grants to deposit, which UIs routinely set to
+    ///      type(uint256).max. Every other meter is blind to it: net-outflow
+    ///      reads 0 because the vault's OWN balance rises (this reads as an
+    ///      inflow, not an exfiltration); coverage prices an uncertified
+    ///      target at tier 2 against the vault's own maxCapital, never a third
+    ///      party's wallet; and Part 2's `to == vault → continue` exemption
+    ///      (below) passes it outright as legitimate. `from` (calldata bytes
+    ///      4..36) is decoded here and MUST equal the vault itself — this is
+    ///      unconditional (runs above the registry lookup) for the identical
+    ///      reason Part 1's target denylist is: confiscating a third party's
+    ///      allowance is not a priced capability, so a registry-less governor
+    ///      must not be able to skip it either.
+    ///
+    ///      `isAdapterAllowed` is DELIBERATELY NOT CONSULTED as a source
+    ///      allowlist. It encodes destination consent — "may *receive*
+    ///      approvals/transfers of vault funds" (see `TierRegistry`) — not
+    ///      "this address's allowances to the vault may be spent by a batch".
+    ///      No honest batch pulls FROM a non-vault address: capital deploys
+    ///      via `approve(adapter)` + the adapter pulling in its own code
+    ///      (`BaseStrategy._pullFromVault`, swap adapters' own
+    ///      `safeTransferFrom(msg.sender, ...)` — never batch calldata), and
+    ///      returns are pushes (`_pushToVault` / `withdrawTo` / `_settle`); no
+    ///      adapter grants the vault an allowance. `from == address(this)`
+    ///      stays permitted — `transferFrom(vault, x, amt)` is semantically
+    ///      `transfer(x, amt)`, spends only `allowance[vault][vault]` (which
+    ///      only a batch's own guarded self-approve can create), and `x`
+    ///      remains destination-guarded by Part 2 below.
+    ///
     ///      ── PART 2: value-moving-selector allowlist gate ──
     ///
     ///      WHY: the net-outflow meter above only sees the vault's own asset()
@@ -564,11 +598,13 @@ contract SyndicateVault is
     ///      target allowlist: for approve / increaseAllowance / transfer the
     ///      guarded address is arg 1 (calldata bytes 4..36); for transferFrom
     ///      it is `to`, arg 2 (bytes 36..68) — pulling INTO the vault
-    ///      (to == vault) is an inflow and always passes. The address must be
-    ///      the vault itself or an adapter allowlisted in the TierRegistry
-    ///      (resolved through the calling governor). Runs on every governor
-    ///      batch — execute, settlement, and both emergency paths — since
-    ///      settlement calls are arbitrary, pre-committed calldata too.
+    ///      (to == vault) is an inflow and always passes. (Its `from`, arg 1,
+    ///      is guarded unconditionally in PART 1b above and is not re-checked
+    ///      here.) The address must be the vault itself or an adapter
+    ///      allowlisted in the TierRegistry (resolved through the calling
+    ///      governor). Runs on every governor batch — execute, settlement, and
+    ///      both emergency paths — since settlement calls are arbitrary,
+    ///      pre-committed calldata too.
     ///
     ///      RESIDUAL: exotic assets are not yet guarded — ERC721
     ///      `setApprovalForAll` (0xa22cb465) / `approve`, ERC1155, and
@@ -639,6 +675,16 @@ contract SyndicateVault is
             address target = calls[i].target;
             if (target == address(this) || (q != address(0) && target == q)) {
                 revert DisallowedBatchTarget(target);
+            }
+            // `transferFrom` SOURCE guard — also unconditional, same pass, same
+            // rationale as the target denylist above. See the dedicated block
+            // comment further up (search "LP-ALLOWANCE CONFISCATION") for the
+            // adversary and why `isAdapterAllowed` must NOT be consulted here.
+            bytes calldata data = calls[i].data;
+            if (data.length >= 4 && bytes4(data[0:4]) == _SEL_TRANSFER_FROM) {
+                if (data.length < 68) revert MalformedCall();
+                address from = address(uint160(uint256(bytes32(data[4:36]))));
+                if (from != address(this)) revert DisallowedTransferFromSource(target, from);
             }
         }
 
