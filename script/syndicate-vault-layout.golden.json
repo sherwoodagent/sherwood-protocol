@@ -67,88 +67,58 @@
       "type": "t_address"
     },
     {
-      "label": "_laneALockPid",
-      "slot": "11",
-      "offset": 0,
-      "type": "t_mapping(t_address,t_uint256)"
-    },
-    {
       "label": "_agentFeeBpsPlusOne",
-      "slot": "12",
+      "slot": "11",
       "offset": 0,
       "type": "t_uint256"
     },
     {
       "label": "minBufferBps",
-      "slot": "13",
+      "slot": "12",
       "offset": 0,
       "type": "t_uint16"
     },
     {
       "label": "minHoldingPeriod",
-      "slot": "13",
+      "slot": "12",
       "offset": 2,
       "type": "t_uint32"
     },
     {
-      "label": "instantExitFeeBps",
-      "slot": "13",
-      "offset": 6,
-      "type": "t_uint16"
-    },
-    {
-      "label": "_interimNetFlow",
-      "slot": "14",
-      "offset": 0,
-      "type": "t_int256"
-    },
-    {
       "label": "lastDepositAt",
-      "slot": "15",
+      "slot": "13",
       "offset": 0,
       "type": "t_mapping(t_address,t_uint40)"
     },
     {
       "label": "_mgmtAssetSeconds",
-      "slot": "16",
+      "slot": "14",
       "offset": 0,
       "type": "t_uint256"
     },
     {
       "label": "_mgmtBase",
-      "slot": "17",
+      "slot": "15",
       "offset": 0,
       "type": "t_uint192"
     },
     {
       "label": "_mgmtLastUpdate",
-      "slot": "17",
+      "slot": "15",
       "offset": 24,
       "type": "t_uint64"
     },
     {
       "label": "_highWaterPricePerShare",
-      "slot": "18",
+      "slot": "16",
       "offset": 0,
       "type": "t_uint256"
     },
     {
-      "label": "_crystallizedMgmt",
-      "slot": "19",
-      "offset": 0,
-      "type": "t_uint128"
-    },
-    {
-      "label": "_crystallizedPerf",
-      "slot": "19",
-      "offset": 16,
-      "type": "t_uint128"
-    },
-    {
       "label": "__gap",
-      "slot": "20",
+      "slot": "17",
       "offset": 0,
-      "type": "t_array(t_uint256)28_storage"
+      "type": "t_array(t_uint256)31_storage"
     }
   ],
   "types": {
