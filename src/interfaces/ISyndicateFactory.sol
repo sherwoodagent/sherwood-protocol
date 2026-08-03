@@ -22,8 +22,20 @@ interface ISyndicateFactory {
     event BondEscrowSet(address indexed oldEscrow, address indexed newEscrow);
     event WiringPushed(address indexed governor);
 
+    // ── Events (issue #43 — executor migration) ──
+    /// @notice Emitted by `setExecutorImpl` — the shared `BatchExecutorLib`
+    ///         new syndicates are wired to at `createSyndicate`.
+    event ExecutorImplUpdated(address oldImpl, address newImpl);
+    /// @notice Emitted when `pushExecutor` re-points an existing vault at the
+    ///         factory's current `executorImpl`.
+    event ExecutorPushed(address indexed vault, address indexed executorImpl);
+
     // ── Views ──
     function governorOf(address vault) external view returns (address);
+    /// @notice Shared `BatchExecutorLib` new syndicates are wired to at
+    ///         `createSyndicate`. Existing vaults keep whatever they were
+    ///         wired with until `pushExecutor` re-points them individually.
+    function executorImpl() external view returns (address);
     /// @notice Number of syndicates this factory has created — i.e. the number
     ///         of LIVE governor `BeaconProxy`s reading their implementation
     ///         from `beacon()`. Non-zero means a governor-impl swap on that
@@ -53,4 +65,14 @@ interface ISyndicateFactory {
     /// @notice Push the factory's current tierRegistry / exposureLedger / bondEscrow
     ///         into an EXISTING factory-deployed governor.
     function pushWiring(address governor) external;
+    /// @notice Update the shared `BatchExecutorLib` new syndicates are wired
+    ///         to at `createSyndicate` (issue #43). Existing vaults are
+    ///         untouched — re-point them individually via `pushExecutor`.
+    function setExecutorImpl(address newExecutorImpl) external;
+    /// @notice Re-point an EXISTING factory-deployed vault at the factory's
+    ///         current `executorImpl`, lifecycle-gated on the vault's
+    ///         governor (`getActiveProposal() == 0 && openProposalCount() ==
+    ///         0`) — a re-point under a live proposal would swap the
+    ///         metering library out from under stored, coverage-priced calls.
+    function pushExecutor(address vault) external;
 }

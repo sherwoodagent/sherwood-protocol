@@ -232,6 +232,12 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     /// @notice Emitted when `pushWiring` re-pushes the factory's current
     ///         tierRegistry / exposureLedger / bondEscrow into an existing governor.
     event WiringPushed(address indexed governor);
+    /// @notice Emitted by `setExecutorImpl` — the shared `BatchExecutorLib`
+    ///         new syndicates are wired to at `createSyndicate` (issue #43).
+    event ExecutorImplUpdated(address oldImpl, address newImpl);
+    /// @notice Emitted when `pushExecutor` re-points an existing vault at the
+    ///         factory's current `executorImpl` (issue #43).
+    event ExecutorPushed(address indexed vault, address indexed executorImpl);
     event GovernorDeployed(address indexed vault, address indexed governor);
     event BeaconUpdated(address indexed oldBeacon, address indexed newBeacon);
     event ProtocolConfigUpdated(address indexed oldConfig, address indexed newConfig);
@@ -508,6 +514,38 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         address old = vaultImpl;
         vaultImpl = newVaultImpl;
         emit VaultImplUpdated(old, newVaultImpl);
+    }
+
+    /// @notice Update the shared `BatchExecutorLib` new syndicates are wired to
+    ///         at `createSyndicate` (issue #43, design.md D5 migration
+    ///         primitive #1). Existing vaults are untouched — re-point them
+    ///         individually via `pushExecutor`.
+    function setExecutorImpl(address newExecutorImpl) external onlyOwner {
+        if (newExecutorImpl == address(0)) revert InvalidExecutorImpl();
+        address old = executorImpl;
+        executorImpl = newExecutorImpl;
+        emit ExecutorImplUpdated(old, newExecutorImpl);
+    }
+
+    /// @notice Re-point an EXISTING factory-deployed vault at the factory's
+    ///         CURRENT `executorImpl`, re-stamping its expected codehash
+    ///         atomically (issue #43, design.md D5 migration primitive #2).
+    /// @dev Mirrors `pushWiring`'s factory-deployed check (the unforgeable
+    ///      `governor.vault()` round-trip via `_isFactoryGovernor`... here
+    ///      applied to the VAULT: resolve its governor through `_governorOf`,
+    ///      which only ever holds proxies this factory deployed) and
+    ///      `rotateOwner`'s lifecycle gates: a re-point under a live proposal
+    ///      would swap the metering library out from under stored,
+    ///      coverage-priced calls, so both `getActiveProposal() == 0` and
+    ///      `openProposalCount() == 0` must hold on the vault's governor.
+    function pushExecutor(address vault) external onlyOwner {
+        uint256 syndicateId = vaultToSyndicate[vault];
+        if (syndicateId == 0) revert VaultNotDeployed();
+        ISyndicateGovernor gov = ISyndicateGovernor(_governorOf[vault]);
+        if (gov.getActiveProposal() != 0) revert ProposalActive();
+        if (gov.openProposalCount() != 0) revert ProposalsOpen();
+        ISyndicateVault(vault).setExecutorImpl(executorImpl);
+        emit ExecutorPushed(vault, executorImpl);
     }
 
     /// @notice Update management fee for new vaults (existing vaults unaffected)
