@@ -863,6 +863,12 @@ contract TokenCourtTest is Test {
         swood.setPastTotalVotes(snap, 1_000e18);
     }
 
+    /// @dev Exercises the issue #82 growth-gated min's BOOTSTRAP FALLBACK, not
+    ///      the clamp: `_referredCase` never sets a lookback total
+    ///      (`getPastTotalVotes(snap - FLOOR_LOOKBACK)` reads the mock's
+    ///      default 0), so the gate's `&& getPastTotalVotes(lookbackTs) != 0`
+    ///      conjunct is false and the recorded weight is the unclamped
+    ///      `getPastVotes(voter, snap)` — bit-identical to pre-#82 behaviour.
     function test_vote_tallies_agedWeight() public {
         uint256 id = _referredCase();
         vm.prank(voterA);
@@ -946,6 +952,10 @@ contract TokenCourtTest is Test {
         court.vote(id, true);
     }
 
+    /// @dev Also exercises the bootstrap-fallback branch (issue #82): no
+    ///      lookback total is set on `_referredCase`'s fixture, so the gate's
+    ///      total conjunct is false and the recorded weight below is the
+    ///      unclamped snapshot read, same as before the growth gate existed.
     function test_vote_acceptsACurrentHolderWithHistoricWeight() public {
         uint256 id = _referredCase();
         swood.setVotes(voterA, 42); // present stake distinguishable from the mock's default-1
@@ -1013,6 +1023,167 @@ contract TokenCourtTest is Test {
         court.vote(id, true);
         court.finalize(id); // pinned window is genuinely closed at this instant
         assertEq(uint256(court.caseOf(id).phase), uint256(ITokenCourt.Phase.Resolved));
+    }
+
+    // ── issue #82: the growth-gated ballot min ──
+
+    /// @dev Opens a bare referable case recording NO fixture weight — each
+    ///      growth-gate test below wires `voterA`'s (or an attacker's)
+    ///      raw/aged state itself, explicitly via `setPastStake`, to decouple
+    ///      raw from aged weight (the mock's `getPastStake` otherwise
+    ///      defaults to the `getPastVotes` fixture, coupling the two).
+    function _openGateCase() internal returns (uint256 caseId, uint256 snap, uint256 lookbackTs) {
+        _disputedChallenge();
+        address[] memory a = new address[](1);
+        uint256[] memory cm = new uint256[](1);
+        a[0] = accusedG;
+        cm[0] = 100e18;
+        ledger.setApprovers(a, cm);
+        caseId = court.refer(CHALLENGE_ID);
+        snap = court.caseOf(caseId).snapshotTs;
+        lookbackTs = snap - court.FLOOR_LOOKBACK();
+    }
+
+    /// @dev (a) Steady-mature regression: equal raw AND equal aged weight at
+    ///      both instants -> gate false -> tally and `VoteCast` equal
+    ///      `getPastVotes(snap)` bit-exactly.
+    function test_vote_growthGate_steadyMatureRegression_tallyBitIdenticalToSnapshotRead() public {
+        (uint256 id, uint256 snap, uint256 lookbackTs) = _openGateCase();
+        swood.setPastTotalVotes(lookbackTs, 1_000e18);
+        swood.setPastStake(voterA, snap, 500e18);
+        swood.setPastStake(voterA, lookbackTs, 500e18);
+        swood.setPastVotes(voterA, snap, 500e18);
+        swood.setPastVotes(voterA, lookbackTs, 500e18);
+
+        vm.expectEmit(true, true, false, true);
+        emit ITokenCourt.VoteCast(id, voterA, true, 500e18);
+        vm.prank(voterA);
+        court.vote(id, true);
+        assertEq(court.caseOf(id).guiltyVotes, 500e18);
+    }
+
+    /// @dev (b) YOUNG STEADY STAKER AT PAR — the 2b headline test, kills 2a's
+    ///      unconditional min and any weight-gated variant. Equal raw at both
+    ///      instants (steady position, gate must be false) but the aged
+    ///      weight at the lookback is LOWER than at the snapshot (still
+    ///      maturing) -> tally equals the UNCLAMPED `weightNow`, never the
+    ///      smaller historical figure.
+    function test_vote_growthGate_youngSteadyStakerVotesAtParUnclamped() public {
+        (uint256 id, uint256 snap, uint256 lookbackTs) = _openGateCase();
+        swood.setPastTotalVotes(lookbackTs, 1_000e18);
+        swood.setPastStake(voterA, snap, 500e18);
+        swood.setPastStake(voterA, lookbackTs, 500e18); // steady raw: gate must stay false
+        swood.setPastVotes(voterA, snap, 500e18); // matured to par by the snapshot
+        swood.setPastVotes(voterA, lookbackTs, 125e18); // still at the age floor a month ago
+
+        vm.prank(voterA);
+        court.vote(id, true);
+        assertEq(court.caseOf(id).guiltyVotes, 500e18, "steady raw must never clamp to the lookback figure");
+    }
+
+    /// @dev (c) Top-up bound: `rawNow > rawThen > 0`, `weightThen` non-zero ->
+    ///      tally is exactly `weightThen`, unreduced by any snapshot-side
+    ///      factor (kills a live-anchor-style implementation that would let
+    ///      the top-up's re-anchor drag the historical side down too).
+    function test_vote_growthGate_topUpBoundsTallyAtLookbackWeight() public {
+        (uint256 id, uint256 snap, uint256 lookbackTs) = _openGateCase();
+        swood.setPastTotalVotes(lookbackTs, 1_000e18);
+        swood.setPastStake(voterA, lookbackTs, 400e18);
+        swood.setPastStake(voterA, snap, 900e18); // topped up inside the window
+        swood.setPastVotes(voterA, lookbackTs, 380e18); // the base's aged worth a month ago
+        swood.setPastVotes(voterA, snap, 900e18); // full re-anchored weight, near par
+
+        vm.prank(voterA);
+        court.vote(id, true);
+        assertEq(
+            court.caseOf(id).guiltyVotes, 380e18, "top-up must not raise the ballot above the base's month-ago worth"
+        );
+    }
+
+    /// @dev (d) Gate-true, weight-fell coherence (design §1.1): raw grew
+    ///      (gate true) but the aged weight at the snapshot is SMALLER than
+    ///      at the lookback (a re-anchoring sequence) -> tally is
+    ///      `weightNow`, the smaller side: a gated voter never collects the
+    ///      larger historical figure either.
+    function test_vote_growthGate_weightFellOnGrowthPath_tallyIsTheSmallerCurrentWeight() public {
+        (uint256 id, uint256 snap, uint256 lookbackTs) = _openGateCase();
+        swood.setPastTotalVotes(lookbackTs, 1_000e18);
+        swood.setPastStake(voterA, lookbackTs, 100e18);
+        swood.setPastStake(voterA, snap, 200e18); // raw grew: gate true
+        swood.setPastVotes(voterA, lookbackTs, 150e18); // aged weight was HIGHER back then
+        swood.setPastVotes(voterA, snap, 90e18); // re-anchor knocked current weight down
+
+        vm.prank(voterA);
+        court.vote(id, true);
+        assertEq(court.caseOf(id).guiltyVotes, 90e18, "min must never hand a gated voter the larger historical figure");
+    }
+
+    /// @dev (e) Shrink: `rawNow < rawThen` -> gate false -> tally is
+    ///      `weightNow`, never the larger historical figure, even though
+    ///      `weightThen > weightNow` here (kills `>=`-gating and any rule
+    ///      handing a shrinker the historical figure).
+    function test_vote_growthGate_shrunkPositionNeverGetsTheHistoricalFigure() public {
+        (uint256 id, uint256 snap, uint256 lookbackTs) = _openGateCase();
+        swood.setPastTotalVotes(lookbackTs, 1_000e18);
+        swood.setPastStake(voterA, lookbackTs, 500e18);
+        swood.setPastStake(voterA, snap, 200e18); // raw shrank
+        swood.setPastVotes(voterA, lookbackTs, 500e18); // larger historical weight
+        swood.setPastVotes(voterA, snap, 200e18); // current (smaller) weight
+
+        vm.prank(voterA);
+        court.vote(id, true);
+        assertEq(
+            court.caseOf(id).guiltyVotes, 200e18, "a shrunk position must never be rewarded with its historical figure"
+        );
+    }
+
+    /// @dev (f) Fresh-address attack regression (issue #82): `rawThen == 0`,
+    ///      non-zero snapshot weight, non-zero lookback total ->
+    ///      `NoVotingPower`, mutation-killing a revert back to the bare
+    ///      single-instant read. This is the issue's worked trace: WOOD
+    ///      staked one second before a drain, previously voting at
+    ///      `ageFloorBps` of raw.
+    function test_vote_growthGate_freshAddressAttackClosed() public {
+        (uint256 id, uint256 snap, uint256 lookbackTs) = _openGateCase();
+        swood.setPastTotalVotes(lookbackTs, 1_000e18); // a real electorate existed a lookback ago
+        address attacker = makeAddr("freshWhale");
+        swood.setPastStake(attacker, snap, 1_200_000e18); // staked one second before the drain
+        swood.setPastStake(attacker, lookbackTs, 0); // nothing a lookback ago
+        swood.setPastVotes(attacker, snap, 300_000e18); // ageFloorBps (25%) of raw
+
+        vm.prank(attacker);
+        vm.expectRevert(ITokenCourt.NoVotingPower.selector);
+        court.vote(id, true);
+    }
+
+    /// @dev (g) Partial-position attacker (design §3.1): `rawThen = P > 0`,
+    ///      topped up at drain time by any amount -> tally is exactly the
+    ///      base's month-ago worth, unmoved by the increment's size.
+    function test_vote_growthGate_partialPositionTopUpBuysNothingBeyondMonthAgoWorth() public {
+        (uint256 id, uint256 snap, uint256 lookbackTs) = _openGateCase();
+        swood.setPastTotalVotes(lookbackTs, 1_000e18);
+        swood.setPastStake(voterA, lookbackTs, 100e18); // pre-existing base P = 100e18
+        swood.setPastStake(voterA, snap, 100e18 + 1_000_000e18); // drain-time top-up of any size
+        swood.setPastVotes(voterA, lookbackTs, 25e18); // P's aged worth (ageFloorBps) a month ago
+        swood.setPastVotes(voterA, snap, 1_000_100e18); // full re-anchored weight, near par on the huge base
+
+        vm.prank(voterA);
+        court.vote(id, true);
+        assertEq(court.caseOf(id).guiltyVotes, 25e18, "the top-up must buy nothing beyond the base's month-ago worth");
+    }
+
+    /// @dev (h) Bootstrap: no lookback total is ever recorded (mock default
+    ///      0) -> the fallback fires regardless of what the raw comparison
+    ///      would have been -> weight unclamped.
+    function test_vote_growthGate_bootstrapSkipsTheClampEvenWhenGateWouldBeTrue() public {
+        (uint256 id, uint256 snap,) = _openGateCase();
+        // Deliberately no setPastTotalVotes at the lookback: mock default 0.
+        swood.setPastStake(voterA, snap, 500e18);
+        swood.setPastVotes(voterA, snap, 500e18);
+
+        vm.prank(voterA);
+        court.vote(id, true);
+        assertEq(court.caseOf(id).guiltyVotes, 500e18, "bootstrap must leave the ballot unclamped");
     }
 
     // ── finalize ──
@@ -1276,9 +1447,23 @@ contract TokenCourtTest is Test {
         assertEq(court.caseOf(caseId).accusedWeight, 0, "fixture assumes a zero-stake accused set");
 
         swood.setPastTotalVotes(snap, totalAtSnapshot);
-        if (totalAtLookback != 0) swood.setPastTotalVotes(snap - court.FLOOR_LOOKBACK(), totalAtLookback);
         swood.setPastVotes(voterA, snap, 300e18);
         swood.setPastVotes(voterB, snap, 200e18);
+        // Issue #82: model MATURE STEADY voters, not fresh ones. Without this,
+        // the mock's `getPastStake` default (falls back to the `getPastVotes`
+        // fixture when no explicit `setPastStake` was recorded) reads
+        // rawThen = 0 at the lookback while rawNow = 300e18/200e18 at the
+        // snapshot — the growth gate fires on every one of these voters and
+        // `NoVotingPower` reverts, even though this fixture means to describe
+        // an electorate that was already there a lookback ago. Setting equal
+        // `getPastVotes` at the lookback makes the mock's defaulted raw equal
+        // at both instants too, so the gate reads false and the clamp never
+        // evaluates — bit-identical weights, per design §3.3/§8.
+        if (totalAtLookback != 0) {
+            swood.setPastTotalVotes(snap - court.FLOOR_LOOKBACK(), totalAtLookback);
+            swood.setPastVotes(voterA, snap - court.FLOOR_LOOKBACK(), 300e18);
+            swood.setPastVotes(voterB, snap - court.FLOOR_LOOKBACK(), 200e18);
+        }
     }
 
     /// @dev Casts the full achievable turnout (500e18, both voters, guilty)

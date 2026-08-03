@@ -251,26 +251,35 @@ contract GuardianRegistryVoteTest is RegistryTestHarness {
         registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Approve);
     }
 
-    function test_voteOnProposal_snapshotsStake_topUpDeflatesNotInflates() public {
+    /// @notice Issue #82's anchor-checkpoint fix: a top-up strictly AFTER
+    ///         `openReview` neither inflates NOR deflates the frozen review
+    ///         ballot. The RAW checkpoint is frozen at `r.openedAt` (the
+    ///         extra 5_000e18 can never inflate vote weight — unchanged from
+    ///         before), and the AGE factor is now anchor-exact too:
+    ///         `getPastVotes(g, openedAt)` resolves `stakedAt` against
+    ///         `_anchorCheckpoints[g]` AS OF `openedAt`, which is the
+    ///         ORIGINAL stake's anchor — the top-up's forward re-anchor lands
+    ///         at a later checkpoint (`openedAt + 1`) and cannot reach back
+    ///         into this read. Pre-#82 (live-anchor read) the same top-up
+    ///         DEFLATED this ballot to 7_499e18 (documented drift, "deflation
+    ///         only"); post-#82 it stays at exactly 10_000e18 (par — the
+    ///         cohort matured a full 30 days before `openReview` in `setUp`).
+    function test_voteOnProposal_snapshotsStake_topUpNeitherInflatesNorDeflates() public {
         _openReview();
         address g = _guardian(0);
 
-        // Top up AFTER openReview: the RAW checkpoint is frozen at
-        // `r.openedAt`, so the extra 5_000e18 can never inflate vote weight.
-        // But the top-up re-anchors the live `stakedAt` forward (weighted
-        // average, spec 2026-07-19 §4), and `_ageFactorBps` reads the live
-        // anchor — so the past snapshot DEFLATES (drift is deflation-only,
-        // never inflation).
+        // Top up AFTER openReview: raw checkpoint frozen at `r.openedAt`, so
+        // the extra 5_000e18 can never inflate vote weight.
         _stakeGuardian(g, 5_000e18, 42);
         assertEq(swood.guardianStake(g), 15_000e18);
 
-        // Vote weight = raw pre-open checkpoint (10_000e18) × re-anchored age
-        // factor. Top-up at openedAt+1 shifts stakedAt forward by
-        // ceil(5_000·(30d+1)/15_000) = 864_001s → age at openedAt =
-        // 2_592_000 − 864_001 = 1_727_999s → factor = 2500 +
-        // ⌊7500·1_727_999/2_592_000⌋ = 7499 bps → 7_499e18.
+        // Vote weight = raw pre-open checkpoint (10_000e18) × the age factor
+        // AT `openedAt`, evaluated against the anchor AS IT STOOD then (the
+        // original stake, fully matured 30 days before `openReview`) — the
+        // top-up's later re-anchor is invisible to this read. factor = 10_000
+        // (par) → 10_000e18, unmoved by the top-up.
         vm.expectEmit(true, true, false, true);
-        emit IGuardianRegistry.GuardianVoteCast(PROPOSAL_ID, g, IGuardianRegistry.GuardianVoteType.Block, 7_499e18);
+        emit IGuardianRegistry.GuardianVoteCast(PROPOSAL_ID, g, IGuardianRegistry.GuardianVoteType.Block, 10_000e18);
         vm.prank(g);
         registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Block);
     }

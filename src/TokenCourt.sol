@@ -95,6 +95,12 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///         electorate base is cross-checked. The base is the SMALLER
     ///         of the electorate at the snapshot and the electorate this long
     ///         before it, so stake younger than this cannot raise the floor.
+    ///         (issue #82) `vote`'s own ballot weight is bounded by the same
+    ///         lookback: a caller's raw stake growth over this window gates a
+    ///         min against the caller's aged weight this long ago, so the
+    ///         numerator and the floor's denominator are measured against the
+    ///         same pair of instants — see `vote`'s growth-gated-min @dev
+    ///         block.
     /// @dev    A `constant`, NOT an owner parameter, and deliberately so — see
     ///         `_participationFloor` for the full argument. In short: an owner
     ///         setter here would be a lever to shrink the lookback to zero
@@ -399,7 +405,83 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///         staked after the drain, by the exploiter or by anyone who saw
     ///         it happen, has no weight at all. There is no borrow, no flash
     ///         loan, and no post-hoc accumulation that reaches back past a
-    ///         stored timestamp.
+    ///         stored timestamp. The single-instant snapshot is not the whole
+    ///         defence any more, though: stake acquired BEFORE the snapshot
+    ///         but still inside the `FLOOR_LOOKBACK` window is priced by the
+    ///         growth-gated min below rather than admitted at face value —
+    ///         see that block for why the snapshot alone under-priced it
+    ///         (issue #82).
+    /// @dev    THE GROWTH-GATED MIN (issue #82). The bare snapshot read above
+    ///         let WOOD staked one second before a drain vote at
+    ///         `ageFloorBps` of raw (25% at deployed values) — enough,
+    ///         combined with the accused's own non-participation, to buy a
+    ///         tie (`NotGuilty`) for the cost of ~`FLOOR_LOOKBACK` of capital
+    ///         lock. The fix: with `lookbackTs = snapshotTs > FLOOR_LOOKBACK
+    ///         ? snapshotTs - FLOOR_LOOKBACK : 0`, `rawNow =
+    ///         getPastStake(caller, snapshotTs)` and `rawThen =
+    ///         getPastStake(caller, lookbackTs)`, the ballot is `min(weightNow,
+    ///         weightThen)` when `rawNow > rawThen` (STRICT) AND an electorate
+    ///         existed at the lookback (`getPastTotalVotes(lookbackTs) != 0`);
+    ///         otherwise it is the unclamped `weightNow`, bit-identical to
+    ///         today.
+    ///         GATE ON RAW, CLAMP ON WEIGHT — deliberate asymmetry, not a
+    ///         shortcut. Age growth without raw growth is pure aging:
+    ///         legitimate by construction, since age cannot be acquired
+    ///         inside the window without capital that was already present a
+    ///         full lookback before the snapshot. Raw growth is the only
+    ///         observable that isolates the attack vector (capital arriving
+    ///         inside the window) from that legitimate aging. Gating on
+    ///         WEIGHT growth instead would fire on every steady, merely-aging
+    ///         position too (aging always grows weight below par) and
+    ///         collapse back into an unconditional min that re-taxes the
+    ///         honest 30-to-60-day cohort — a shape already tried and
+    ///         rejected (openspec/changes/fix-ballot-growth-lookback,
+    ///         variant 2a).
+    ///         THE ADVERSARY: an address that stakes (or tops up) inside
+    ///         `FLOOR_LOOKBACK` before a drain it intends to vote on.
+    ///         `rawThen = 0` for a fresh address forces the gate true
+    ///         unconditionally and `weightThen = 0 x anything / 10_000 = 0`
+    ///         — zero raw times any age multiplier is zero — so the ballot
+    ///         is refused outright (`NoVotingPower`). A partial pre-existing
+    ///         position of size `P` topped up at drain time still has
+    ///         `rawThen = P`, still gates true for any top-up size, and the
+    ///         ballot is bounded by `weightThen <= P`'s month-ago aged worth
+    ///         — the top-up buys nothing.
+    ///         STRICT `>` CLOSES THE SHRINK CASE: a position whose raw stake
+    ///         held or fell over the window never has the clamp evaluate at
+    ///         all (the total read short-circuits away too), so it is never
+    ///         handed the larger historical figure it did not earn.
+    ///         THE BOOTSTRAP FALLBACK is keyed on the TOTAL electorate at the
+    ///         lookback (`getPastTotalVotes(lookbackTs) == 0`), never on the
+    ///         caller's own `rawThen`/`weightThen` — a per-caller fallback
+    ///         would re-admit exactly the fresh-whale ballot this clamp
+    ///         exists to remove, since a zero lookback position is the
+    ///         attack's own signature. Mirrors `_participationFloor`'s own
+    ///         `earlier == 0` fallback (below) for the identical reason:
+    ///         without it, every case referred inside the protocol's first
+    ///         `FLOOR_LOOKBACK` of staking history would be unvotable by
+    ///         anyone, a guaranteed `Inconclusive`.
+    /// @dev    RESIDUALS — WHAT THE GATE DOES AND DOES NOT CLOSE. (1) Dormant
+    ///         capital parked AT OR BEFORE `lookbackTs` gates false and votes
+    ///         its full unclamped aged weight — at deployed values (lookback
+    ///         = maturation = 30 days) that is PAR. This is the direct price
+    ///         of not taxing the honest steady cohort: the gate cannot
+    ///         distinguish premeditated month-old capital from an honest
+    ///         month-old guardian, they are on-chain identical. Counter-levers
+    ///         are unchanged: the stake is public and idle for a full month
+    ///         before the drain it exists to protect, and a ballot still has
+    ///         to WIN against honest turnout. (2) A one-second boundary cliff
+    ///         at exactly `lookbackTs` is inherent to any two-point rule
+    ///         (parked at `lookbackTs` votes at par; parked one second later
+    ///         gates true and votes zero) and cuts AGAINST the attacker, not
+    ///         for it. (3) The touch-stake residual (stake before
+    ///         `lookbackTs`, unstake mid-window, re-stake at drain time) is
+    ///         UNCHANGED: `rawNow == rawThen` gates false, and the re-stake's
+    ///         forward re-anchor discounts `weightNow` to `ageFloorBps` of raw
+    ///         on its own, with no help from the clamp. Closing either
+    ///         residual needs a true windowed minimum over the checkpoint
+    ///         trace (gas-unbounded) or new state; out of scope here,
+    ///         documented rather than hidden.
     /// @dev    THE ACCUSED MAY NOT VOTE, and this is the check the snapshot
     ///         alone could never make. The snapshot bars whoever bought in
     ///         AFTER the drain; it says nothing about the approvers who were
@@ -475,7 +557,14 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///         exactly the 25%-of-historic-weight shape described above, now
     ///         costing `minGuardianStake` instead of nothing — a residual
     ///         bounded by that cost, not eliminated. That is the inherent
-    ///         shape of a binary gate, not a bug in it.
+    ///         shape of a binary gate, not a bug in it. THE GROWTH-GATED MIN
+    ///         ABOVE DOES NOT CLOSE THIS: a full unstake-then-re-stake of the
+    ///         same amount reads `rawNow == rawThen` at the two lookback
+    ///         instants (the re-stake happened after `lookbackTs` in the
+    ///         attack's own timeline), so the gate is false and the
+    ///         `ageFloorBps` discount comes entirely from `weightNow`'s own
+    ///         re-anchor, with no help from the clamp either way (issue #82
+    ///         design §6, "touch-stake" residual).
     ///         Re-WEIGHTING on present holdings would reintroduce the
     ///         post-hoc accumulation the snapshot exists to close, so this
     ///         stays binary.
@@ -486,10 +575,24 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
         if (voteOf[caseId][msg.sender] != ITokenCourt.Ruling.None) revert AlreadyVoted();
         if (isAccused[caseId][msg.sender]) revert AccusedCannotVote();
 
-        uint256 weight = IStakedWood(stakedWood).getPastVotes(msg.sender, c.snapshotTs);
+        IStakedWood swood = IStakedWood(stakedWood);
+        uint256 weight = swood.getPastVotes(msg.sender, c.snapshotTs);
+        // GROWTH-GATED MIN — see the @dev block above `vote` (issue #82).
+        // Gate on RAW stake growth over `FLOOR_LOOKBACK`, strict `>`; clamp
+        // on the finished AGED weights. Gate first in the `&&` so the
+        // lookback-total read short-circuits away for every non-growth
+        // voter (the perpetual steady majority never pays for it).
+        uint256 lookbackTs = c.snapshotTs > FLOOR_LOOKBACK ? c.snapshotTs - FLOOR_LOOKBACK : 0;
+        if (
+            swood.getPastStake(msg.sender, c.snapshotTs) > swood.getPastStake(msg.sender, lookbackTs)
+                && swood.getPastTotalVotes(lookbackTs) != 0
+        ) {
+            uint256 weightThen = swood.getPastVotes(msg.sender, lookbackTs);
+            if (weightThen < weight) weight = weightThen;
+        }
         if (weight == 0) revert NoVotingPower();
         // Present-holdings gate — see the @dev block above `vote`.
-        if (IStakedWood(stakedWood).getVotes(msg.sender) == 0) revert NoPresentHoldings();
+        if (swood.getVotes(msg.sender) == 0) revert NoPresentHoldings();
 
         voteOf[caseId][msg.sender] = guilty ? ITokenCourt.Ruling.Guilty : ITokenCourt.Ruling.NotGuilty;
         if (guilty) {
