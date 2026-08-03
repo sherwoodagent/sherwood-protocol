@@ -2,6 +2,7 @@
 pragma solidity 0.8.28;
 
 import {Test} from "forge-std/Test.sol";
+import {Vm} from "forge-std/Vm.sol";
 
 import {SyndicateGovernor} from "../src/SyndicateGovernor.sol";
 import {ISyndicateGovernor} from "../src/interfaces/ISyndicateGovernor.sol";
@@ -581,6 +582,12 @@ contract SlashGasCeilingTest is Test {
 
         uint256 stakeBefore = swood.guardianStake(approvers[7]);
 
+        // The adapter this filing named is certified GOING IN, so its tier
+        // after the conviction is a real signal rather than a tautology.
+        (uint8 tierBefore,) = tierRegistry.tierOf(address(adapter), adapter.poke.selector);
+        assertEq(tierBefore, 1, "the challenged adapter is certified before the conviction");
+        vm.recordLogs();
+
         // THE BUDGET A REAL TRANSACTION HAS. Frame 0 is entered by the
         // transaction itself (no 63/64 haircut on that hop); every haircut below
         // it is the EVM's own.
@@ -602,6 +609,31 @@ contract SlashGasCeilingTest is Test {
         assertLt(swood.guardianStake(approvers[7]), stakeBefore, "the cohort really was slashed");
         // The proceeds were destroyed, not routed: there is no case to open.
         assertEq(swood.pendingBurn(), 0, "and the burn landed rather than parking for a flush retry");
+
+        // AND THE DEMOTION LANDED — the assertion this test was missing.
+        // This is the only test that drives a full-cap, adapter-naming
+        // conviction through the real call depth at the real worst-case
+        // budget, which is the exact condition `DEMOTION_GAS` exists for. But
+        // `_settle` swallows a failed demotion in a bare catch, so without
+        // this check a future regression that re-narrows the margin at
+        // precisely this boundary would leave the test green: the verdict
+        // would still settle, the cohort would still be slashed, and the
+        // challenged adapter would quietly keep its certification.
+        //
+        // The TIER is the binding check — it is the invariant that matters
+        // and it survives any renaming of the event below.
+        (uint8 tierAfter,) = tierRegistry.tierOf(address(adapter), adapter.poke.selector);
+        assertEq(tierAfter, tierRegistry.TIER_ARBITRARY(), "the challenged adapter really lost its certification");
+
+        // The event absence is the explicit form of the same claim: the
+        // demotion did not merely fail into the catch.
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i = 0; i < logs.length; i++) {
+            assertTrue(
+                logs[i].topics[0] != keccak256("AdapterDemotionFailed(uint256,address,bytes4)"),
+                "the demotion must not have been swallowed by the bare catch"
+            );
+        }
     }
 
     // ── 3. The measurement the constants are set from ─────────────────────
