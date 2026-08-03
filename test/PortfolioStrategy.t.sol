@@ -8,6 +8,7 @@ import {BaseStrategy} from "../src/strategies/BaseStrategy.sol";
 import {MockSwapAdapter} from "./mocks/MockSwapAdapter.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
+import {MockGovernorAlwaysActive, MockVaultGovernorStub} from "./mocks/MockGovernorAlwaysActive.sol";
 
 /// @notice Mock Chainlink Data Streams verifier proxy.
 /// @dev Sherlock #56: signed reports now carry a `feedId` so the strategy can
@@ -87,7 +88,14 @@ contract PortfolioStrategyTest is Test {
     ERC20Mock public amzn;
     ERC20Mock public nflx;
 
-    address public vault = makeAddr("vault");
+    /// @dev Issue #150 fix: `BaseStrategy.execute()` now resolves
+    ///      `vault() -> governor()` and requires the governor's active
+    ///      proposal to declare the executing clone as its strategy. This
+    ///      suite is about `PortfolioStrategy`'s own math/lifecycle, not that
+    ///      binding property, so `vault` is wired to a permissive
+    ///      `MockGovernorAlwaysActive` (see that file for the dedicated,
+    ///      non-permissive binding tests) instead of a bare `makeAddr`.
+    address public vault;
     address public proposer = makeAddr("proposer");
 
     uint256 constant TOTAL_AMOUNT = 10e18; // 10 WETH
@@ -95,6 +103,9 @@ contract PortfolioStrategyTest is Test {
     uint256 constant RATE_PRECISION = 1e18;
 
     function setUp() public {
+        // Issue #150 fix wiring: vault -> governor() -> permissive strategyOf.
+        vault = address(new MockVaultGovernorStub(address(new MockGovernorAlwaysActive())));
+
         // Deploy mock tokens
         weth = new ERC20Mock("Wrapped Ether", "WETH", 18);
         tsla = new ERC20Mock("Tesla Token", "TSLA", 18);

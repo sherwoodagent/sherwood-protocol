@@ -294,6 +294,15 @@ contract VaultBatchQueueTargetsTest is Test {
         MockStrategy strategy = MockStrategy(Clones.clone(address(template)));
         strategy.initialize(address(vault), owner, abi.encode(address(usdc), address(0), uint256(0), uint256(0), false));
 
+        // Issue #150 fix: `BaseStrategy.execute()` now resolves
+        // `vault() -> governor()` and requires the governor's active
+        // proposal to declare THIS clone as its strategy. Wire the mocked
+        // governor to answer that (this test is about the batch-target gate,
+        // not the clone-ratchet binding property — see
+        // `test/audit-fixes/Strategy_cloneRatchetBinding.t.sol` for that).
+        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal()"), abi.encode(uint256(1)));
+        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("strategyOf(uint256)"), abi.encode(address(strategy)));
+
         // execute() — onlyVault, named as a batch target, runs.
         vm.prank(MOCK_GOVERNOR);
         vault.executeGovernorBatch(_batch(address(strategy), abi.encodeCall(BaseStrategy.execute, ())), 1);
