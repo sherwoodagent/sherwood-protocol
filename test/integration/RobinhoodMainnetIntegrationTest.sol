@@ -9,6 +9,7 @@ import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 import {SyndicateVault} from "../../src/SyndicateVault.sol";
 import {SyndicateFactory} from "../../src/SyndicateFactory.sol";
 import {GuardianRegistry} from "../../src/GuardianRegistry.sol";
+import {TierRegistry} from "../../src/TierRegistry.sol";
 import {StakedWood} from "../../src/StakedWood.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {DeploySherwood} from "../../script/Deploy.s.sol";
@@ -86,6 +87,11 @@ abstract contract RobinhoodMainnetIntegrationTest is Test {
     address vaultImpl;
     address executorLib;
     address deployer;
+    /// @dev Owned by `deployer` (see `_deployProtocol`) — the same address a
+    ///      real deploy hands to the multisig via `TierRegistry.
+    ///      transferOwnership`. Resolved here so fork suites can allowlist
+    ///      swap adapters / strategy clones (issue #147; see `_cloneAndInit`).
+    address tierRegistry;
 
     uint256 constant MIN_OWNER_STAKE = 10_000e18;
 
@@ -137,6 +143,7 @@ abstract contract RobinhoodMainnetIntegrationTest is Test {
         vaultImpl = d.vaultImpl;
         executorLib = d.executorLib;
         deployer = d.deployer;
+        tierRegistry = d.tierRegistry;
     }
 
     function _bondOwnerStake() internal {
@@ -192,6 +199,15 @@ abstract contract RobinhoodMainnetIntegrationTest is Test {
         (bool success,) =
             clone.call(abi.encodeWithSignature("initialize(address,address,bytes)", address(vault), agent, initData));
         require(success, "Strategy initialization failed");
+        // PRE-EXISTING fix, not fallout of issue #147: `_guardBatchCalls`
+        // (guard + registry wiring landed 9fafa00, post-dating this suite;
+        // RPC gating hid it) requires the strategy CLONE itself to be
+        // allowlisted before a governor batch's `asset.approve(strategy,
+        // amount)` can pass. Callers allowlist the SWAP ADAPTER separately,
+        // before this function runs, since #147's `_requireAllowedAdapter`
+        // check is enforced synchronously inside `initialize` above.
+        vm.prank(deployer);
+        TierRegistry(tierRegistry).setAdapterAllowed(clone, true);
     }
 
     /// @dev Propose → vote → open+resolve guardian review → execute. The cohort

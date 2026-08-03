@@ -25,6 +25,21 @@ interface AggregatorV3Interface {
         returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound);
 }
 
+/// @notice The hops walked to resolve the governance-owned adapter allowlist
+///         from this strategy: `vault()` → `governor()` → `tierRegistry()` →
+///         `isAdapterAllowed(spender)`. The SAME registry, reached the same
+///         way, that `SyndicateVault._guardBatchCalls` gates the spender of
+///         every value-moving ERC-20 selector in a governor batch against.
+/// @dev    Declared locally rather than imported: every hop is a
+///         length-checked raw staticcall, so the strategy takes on no type
+///         dependency and no hop can revert `_initialize`. This interface
+///         exists to generate selectors, not to type the responses.
+interface ITierBindingPath {
+    function governor() external view returns (address);
+    function tierRegistry() external view returns (address);
+    function isAdapterAllowed(address adapter) external view returns (bool);
+}
+
 /// @notice Decoded Chainlink Data Streams V3 report
 struct ChainlinkReport {
     bytes32 feedId;
@@ -89,6 +104,14 @@ contract PortfolioStrategy is BaseStrategy {
     /// @notice Basket cannot contain the same token address twice —
     ///         duplicates would double-count balances and inflate live NAV.
     error DuplicateToken(address token);
+    /// @notice The proposer-supplied `swapAdapter_` is not allowlisted in the
+    ///         `TierRegistry` the vault's own governor gates batch approvals
+    ///         against. Adversary: a proposer naming an address they control as
+    ///         the swap adapter, which `_execute` then `forceApprove`s the
+    ///         vault's whole capital to — one hop outside the batch guard that
+    ///         would otherwise have caught it. See the binding note on
+    ///         `_initialize`.
+    error AdapterNotAllowed(address swapAdapter, address registry);
 
     // ── Constants ──
     uint256 public constant MAX_BASKET_SIZE = 20;
@@ -102,6 +125,18 @@ contract PortfolioStrategy is BaseStrategy {
     ///         floor is `rebalanceDelta`, which prices off signed Chainlink
     ///         reports; see the note on `_quoteMinOut`.
     uint256 public constant MAX_SLIPPAGE_CEILING_BPS = 1_000;
+    /// @notice Hard floor on the swap slippage tolerance, at init and on every
+    ///         update (50 bps). `rebalanceDelta` floors its `minOut` against
+    ///         signed Chainlink reports discounted by `maxSlippageBps`
+    ///         (`_verifyPrice` / `_tokensToValue`), so a tolerance below the
+    ///         venue fee plus oracle-vs-pool basis makes every delta swap
+    ///         structurally unfillable. Combined with the tighten-only rule in
+    ///         `_updateParams`, a too-low value would be irreversible for the
+    ///         strategy's lifetime; the floor turns that from a permanent
+    ///         self-brick into a rejected input. Adversary: a proposer calling
+    ///         `updateParams` with a near-zero slippage to irreversibly brick
+    ///         `rebalanceDelta`.
+    uint256 public constant MIN_SLIPPAGE_BPS = 50;
     uint256 public constant PRICE_PRECISION = 1e18;
     /// @notice Default max staleness for a push-feed `latestRoundData` when a
     ///         slot declares no per-slot age. Robinhood Chainlink push feeds
@@ -213,6 +248,33 @@ contract PortfolioStrategy is BaseStrategy {
     ///         → default `MAX_PUSH_PRICE_AGE`; nonzero must be within
     ///         `[MIN_PUSH_PRICE_AGE, MAX_PUSH_PRICE_AGE_CAP]` (equity feeds go
     ///         stale outside market hours and need a longer bound than crypto).
+    ///
+    ///         SWAP-ADAPTER BINDING. `swapAdapter_` is proposer input and
+    ///         `_execute` `forceApprove`s it the whole of `totalAmount` — the
+    ///         vault's capital — from inside the strategy, one hop OUTSIDE the
+    ///         governor batch. `SyndicateVault._guardBatchCalls` gates the
+    ///         spender of every approve/transfer in the batch against
+    ///         `TierRegistry.isAdapterAllowed` and calls that "a complete bound
+    ///         on ERC20 exfiltration"; the strategy's own re-approval is the
+    ///         hop that bound does not see. Adversary: a proposer naming an
+    ///         address they control as the swap adapter and draining the
+    ///         approval in a later transaction. So the adapter must be
+    ///         allowlisted in the SAME registry, resolved through
+    ///         `vault() → governor() → tierRegistry()`.
+    ///         CONDITIONAL, by exactly one condition: skipped when that walk
+    ///         yields no registry (no `governor()` surface, a governor
+    ///         predating the getter, or `tierRegistry() == 0`). Skipping is
+    ///         safe and is NOT attacker-forcible: the whole walk starts at
+    ///         `vault()`, which the proposer does not supply, so nothing in the
+    ///         init calldata can steer it. And that skip condition is exactly
+    ///         the condition under which `_guardBatchCalls` disables ITSELF
+    ///         (its own "UNSET REGISTRY" degrade) — with no registry the
+    ///         governor batch can already approve vault funds to any address,
+    ///         so the strategy's re-approval grants nothing that is not
+    ///         already granted. Where the registry IS live the requirement is
+    ///         hard: governance must allowlist the swap adapter, the same
+    ///         one-line action it already performs for the strategy clone
+    ///         itself so the batch's `asset.approve(strategy, …)` can pass.
     function _initialize(bytes calldata data) internal override {
         (
             address asset_,
@@ -230,14 +292,17 @@ contract PortfolioStrategy is BaseStrategy {
         );
 
         if (asset_ == address(0) || swapAdapter_ == address(0)) revert ZeroAddress();
+        // Bind the proposer's swap adapter to the governance allowlist before
+        // anything else is written (see the swap-adapter binding note above).
+        _requireAllowedAdapter(swapAdapter_);
         if (tokens.length == 0 || tokens.length > MAX_BASKET_SIZE) revert TooManyTokens();
         if (tokens.length != weightsBps.length || tokens.length != swapExtraData_.length) revert LengthMismatch();
         if (tokens.length != priceDecimals_.length || tokens.length != feedIds_.length) revert LengthMismatch();
         if (totalAmount_ == 0) revert InvalidAmount();
         // Ceiling, not just a sanity bound — bounds the initial tolerance below
         // 100% so the tighten-only guard in `_updateParams` has room to enforce
-        // a monotonic decrease.
-        if (maxSlippageBps_ == 0 || maxSlippageBps_ > MAX_SLIPPAGE_CEILING_BPS) revert InvalidSlippage();
+        // a monotonic decrease. Floor subsumes the previous `== 0` rejection.
+        if (maxSlippageBps_ < MIN_SLIPPAGE_BPS || maxSlippageBps_ > MAX_SLIPPAGE_CEILING_BPS) revert InvalidSlippage();
 
         // Push-feed mode when no Data Streams verifier is wired: each
         // `feedIds[i]` encodes an AggregatorV3 proxy as bytes32(uint160(feed)).
@@ -357,7 +422,9 @@ contract PortfolioStrategy is BaseStrategy {
         // sandwich they control (`settleProposal` is proposer-callable an hour
         // after execute).
         if (newMaxSlippageBps > 0) {
-            if (newMaxSlippageBps > maxSlippageBps) revert InvalidSlippage();
+            // Tighten-only, but never below the floor: a sub-floor value would
+            // brick `rebalanceDelta` irreversibly (raising is disallowed).
+            if (newMaxSlippageBps > maxSlippageBps || newMaxSlippageBps < MIN_SLIPPAGE_BPS) revert InvalidSlippage();
             maxSlippageBps = newMaxSlippageBps;
         }
 
@@ -377,6 +444,17 @@ contract PortfolioStrategy is BaseStrategy {
     function rebalance() external onlyProposer {
         if (_state != State.Executed) revert NotExecuted();
         if (_rebalancing) revert RebalancingInProgress();
+        // Live re-check (Pashov audit, issue #147). Unlike `_execute`/
+        // `_settle`'s deliberate one-shot check (see the binding note on
+        // `_initialize`), `rebalance`/`rebalanceDelta` are proposer-callable an
+        // unbounded number of times while `Executed`, with no time limit. A
+        // demotion that lands after execute is otherwise invisible here: every
+        // subsequent call would keep `forceApprove`-ing the demoted adapter
+        // with zero re-validation. Blocking a rebalance strands nothing —
+        // `settle()` remains the untouched exit path either way — so fail
+        // CLOSED here rather than degrade-open. Reuses `_requireAllowedAdapter`
+        // unchanged: same skip-when-unresolved behavior, just a new call site.
+        _requireAllowedAdapter(address(swapAdapter));
         _rebalancing = true;
 
         uint256 len = _allocations.length;
@@ -456,6 +534,9 @@ contract PortfolioStrategy is BaseStrategy {
     function rebalanceDelta(bytes[] calldata priceReports) external onlyProposer {
         if (_state != State.Executed) revert NotExecuted();
         if (_rebalancing) revert RebalancingInProgress();
+        // Live re-check, fail-closed on demotion — see the identical guard on
+        // `rebalance()` above for the full rationale (issue #147).
+        _requireAllowedAdapter(address(swapAdapter));
         _rebalancing = true;
 
         uint256 len = _allocations.length;
@@ -651,6 +732,62 @@ contract PortfolioStrategy is BaseStrategy {
         } catch {
             revert QuoteUnavailable();
         }
+    }
+
+    // ── Swap-adapter binding (see the binding note on `_initialize`) ──
+
+    /// @dev Reverts unless `swapAdapter_` is allowlisted in the `TierRegistry`
+    ///      the vault's own governor gates batch approvals against, resolved
+    ///      `vault() → governor() → tierRegistry()`. Skips only when that walk
+    ///      yields no registry — the same condition under which
+    ///      `SyndicateVault._guardBatchCalls` disables itself, and one the
+    ///      proposer cannot steer because no hop of the walk is proposer input.
+    ///      A registry that IS resolved but whose `isAdapterAllowed` is
+    ///      unreadable (wrong address wired, non-registry contract) fails
+    ///      CLOSED: a registry that cannot vouch for the adapter has not
+    ///      vouched for it. Every hop is a length-checked raw staticcall so a
+    ///      codeless or hostile target reads as unresolved rather than
+    ///      reverting some unrelated deployment.
+    ///
+    ///      Called from THREE sites, each with different intent:
+    ///        - `_initialize`: certifies provenance once, at binding time.
+    ///        - `rebalance` / `rebalanceDelta` (issue #147 Pashov finding):
+    ///          re-certifies on every call, since these are proposer-callable
+    ///          an unbounded number of times post-execute with no time limit,
+    ///          and — unlike settle — blocking one strands no capital.
+    ///      `_execute`/`_settle` deliberately do NOT call this: see the
+    ///      capital-hostage rationale on the `_initialize` binding note.
+    function _requireAllowedAdapter(address swapAdapter_) private view {
+        address governor_ = _readAddress(vault(), abi.encodeCall(ITierBindingPath.governor, ()));
+        if (governor_ == address(0)) return;
+        address registry = _readAddress(governor_, abi.encodeCall(ITierBindingPath.tierRegistry, ()));
+        if (registry == address(0)) return;
+        if (!_isAdapterAllowed(registry, swapAdapter_)) revert AdapterNotAllowed(swapAdapter_, registry);
+    }
+
+    /// @dev Staticcall-safe `isAdapterAllowed`. Unreadable → `false` (see the
+    ///      fail-closed rationale on `_requireAllowedAdapter`).
+    function _isAdapterAllowed(address registry, address adapter) private view returns (bool) {
+        if (registry.code.length == 0) return false;
+        (bool ok, bytes memory ret) = registry.staticcall(abi.encodeCall(ITierBindingPath.isAdapterAllowed, (adapter)));
+        if (!ok || ret.length != 32) return false;
+        return abi.decode(ret, (bool));
+    }
+
+    /// @dev Staticcall-safe address read: codeless target, revert, short
+    ///      return, or dirty upper bits all resolve to `address(0)`.
+    function _readAddress(address target, bytes memory data) private view returns (address) {
+        if (target.code.length == 0) return address(0);
+        (bool ok, bytes memory ret) = target.staticcall(data);
+        if (!ok || ret.length < 32) return address(0);
+        uint256 word;
+        // Reads the first return word directly: `abi.decode` cannot express
+        // "leading word of a longer payload".
+        assembly ("memory-safe") {
+            word := mload(add(ret, 0x20))
+        }
+        if (word >> 160 != 0) return address(0);
+        return address(uint160(word));
     }
 
     /// @dev Decode a push-mode packed feed id into its AggregatorV3 proxy and

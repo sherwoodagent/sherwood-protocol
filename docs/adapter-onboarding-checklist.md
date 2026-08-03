@@ -96,6 +96,46 @@ write in the hot path. Consequences for onboarding:
   codeless payout address and later merely funding it with native currency
   cannot, by itself, close the funds path.
 
+### Gate B has a second consumer (issue #147)
+
+`isAdapterAllowed` is no longer read only by the vault's batch guard.
+`PortfolioStrategy._initialize` resolves the same registry through
+`vault() → governor() → tierRegistry()` and reverts `AdapterNotAllowed` unless
+the proposer-supplied `swapAdapter_` is allowlisted — closing a gap the batch
+guard structurally cannot see: the strategy's own `forceApprove(swapAdapter,
+…)` calls happen one frame deeper than anything in the governor's batch
+calldata, after `strategy.execute()` has already been dispatched.
+
+Consequences for onboarding:
+
+- **Allowlisting must precede strategy clone+init, not just batch execution.**
+  A proposer creates and initializes a `PortfolioStrategy` clone in their own
+  transaction, before `propose()`. On a wired stack (governor's
+  `tierRegistry()` resolves), init reverts `AdapterNotAllowed` if the swap
+  adapter is not yet on the allowlist — the same one-line `setAdapterAllowed`
+  action this checklist already requires before the strategy clone itself can
+  receive `asset.approve(strategy, amount)` in a batch (§1 Gate B).
+- **The check degrades the same way the batch guard does.** If the walk
+  cannot resolve a registry — codeless vault, no `governor()` surface, a
+  governor predating the `tierRegistry()` getter, or `tierRegistry() == 0` —
+  the strategy skips the check rather than reverting, mirroring
+  `_guardBatchCalls`'s own "UNSET REGISTRY" degrade (§5). This is not a new
+  gap: with no registry wired, a governor batch could already approve vault
+  funds to any address, so the strategy's internal re-approval grants nothing
+  not already grantable.
+- **A demotion's auto-clear (§4) now also blocks new strategy bindings.**
+  Because `_demote` clears `_adapterAllowed[adapter]`, a demoted adapter is
+  simultaneously refused by both consumers — existing batches cannot fund it
+  AND no new `PortfolioStrategy` clone can bind to it — with no additional
+  wiring. The check is init-time only: a strategy already initialized and
+  executed against an adapter that is later demoted is not re-checked at
+  settle (by design — see
+  `openspec/changes/portfolio-swap-adapter-allowlist/design.md` decision 3).
+- **This does not change §2.1–§2.3.** The adapter still must not be a generic
+  executor, still needs a written selector inventory, and still must not be a
+  proxy — the strategy-side check only enforces the SAME allowlist bit, one
+  more place.
+
 ### Why they do not imply each other
 
 The keys are different objects. A call like `USDC.approve(adapter, x)` has
@@ -377,11 +417,13 @@ awareness of what it is substituting for:
 - **The codehash snapshot does not cover proxies** (§2.3).
 - **The guard covers ERC20 only.** ERC721/ERC1155/LP-NFT approvals are
   unguarded ([`SyndicateVault.sol:495-501`](../src/SyndicateVault.sol#L495)).
-- **An unwired registry means an unguarded batch.** If the governor returns
-  `address(0)` (or lacks the getter), `_guardBatchCalls` returns early and the
-  batch runs unguarded by design
-  ([`SyndicateVault.sol:503-514`](../src/SyndicateVault.sol#L503)). Read §3
-  step 0 before assuming Gate B is live.
+- **An unwired registry means an unguarded batch — and an unguarded strategy
+  init.** If the governor returns `address(0)` (or lacks the getter),
+  `_guardBatchCalls` returns early and the batch runs unguarded by design
+  ([`SyndicateVault.sol:503-514`](../src/SyndicateVault.sol#L503)); the same
+  unresolved walk makes `PortfolioStrategy._initialize` skip its swap-adapter
+  check (issue #147). Read §3 step 0 before assuming Gate B is live for
+  either consumer.
 
 ### Candidate follow-ups (tracked, not committed)
 
