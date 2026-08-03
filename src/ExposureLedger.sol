@@ -368,6 +368,92 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      live freeze.
     uint256 internal _frozenKeyCount;
 
+    /// @notice EXACT, NON-WALL-CLOCK-DECAYING sum of `_recorded[key][guardian]
+    ///         .usd` across every key currently listing `guardian` as an
+    ///         approver (Pashov re-audit of #158, finding 2, confidence 85).
+    ///
+    /// @dev    THE SHARED-STAKE DENOMINATOR, BOOKING BASIS. Before this,
+    ///         `_sharedSlashableUsd` divided by `openExposureUsd(guardian)` —
+    ///         a rolling WALL-CLOCK bucket scan — as a proxy for "sum of this
+    ///         guardian's live open reservations." The proxy silently went
+    ///         stale in at least five distinct ways (ordinary bucket aging
+    ///         with no release, a frozen/pinned proposal outliving its own
+    ///         bucket, an owner `setChallengeWindow` shrink, a
+    ///         `ChallengeGame` `Inconclusive` re-arm outliving the bucket, and
+    ///         a `_recorded`/`_reservedUsd` entry that plain never gets
+    ///         released) while the NUMERATOR (`_recorded[key][g].usd`, read by
+    ///         `_effectiveTotal`/`allocatedUsd`/`requireApproveQuorum`) has no
+    ///         wall-clock decay of its own — it is cleared ONLY by an explicit
+    ///         `releaseApproval` or a `_rebook` write. A denominator that ages
+    ///         out while the numerator terms it is supposed to sum do not is
+    ///         exactly the double-count Finding 2 (D9) was written to close,
+    ///         reopened at the seam between two independently-decaying clocks.
+    ///
+    ///         This mapping instead mirrors `_buckets`' own writes exactly —
+    ///         incremented in `recordApproval`, decremented in
+    ///         `releaseApproval`, adjusted by `_rebook`'s delta in both
+    ///         directions — but with NO wall-clock scan and NO expiry. It is
+    ///         therefore, by construction, always EXACTLY `Σ over every key
+    ///         still listing guardian as an approver of _recorded[key]
+    ///         [guardian].usd`, which is precisely what `_sharedSlashableUsd`'s
+    ///         safety argument (`Σ reserved_i == denominator`) requires when
+    ///         `reserved_i` is read on the booking basis.
+    ///
+    ///         `openExposureUsd` ITSELF IS UNCHANGED and keeps its wall-clock
+    ///         decay — it remains the correct, DELIBERATE basis for
+    ///         `recordApproval`'s and `_rebook`'s BATCHING cap (issue #110):
+    ///         that cap's whole point is to let a guardian's budget recycle
+    ///         once a commitment ages past challengeability. The shared-stake
+    ///         denominator and the batching-cap denominator answer different
+    ///         questions ("what does this guardian's stake currently, really,
+    ///         back?" vs. "how much of this guardian's stake may still be
+    ///         newly committed?") and must not share one wall-clock-coupled
+    ///         implementation, which is the root cause this mapping removes.
+    ///
+    ///         KNOWN, ACCEPTED TRADE-OFF: a guardian with an approval that is
+    ///         never released and never settled (both permissionless,
+    ///         "safe to skip" by design) stays counted here FOREVER, even long
+    ///         after its own challenge window has elapsed and it is no longer
+    ///         legally slashable. This is not a new problem: `_recorded[key]
+    ///         [g].usd` — the numerator every sharing consumer already reads —
+    ///         has the identical property today, for the identical reason
+    ///         (only `releaseApproval`/`_rebook` clear it). Making the
+    ///         denominator match the numerator's existing staleness is
+    ///         strictly more correct than the wall-clock proxy it replaces,
+    ///         never less; it does not introduce a new staleness class, it
+    ///         removes an INCONSISTENT one.
+    mapping(address guardian => uint256) internal _liveBookedUsd;
+
+    /// @notice EXACT, NON-WALL-CLOCK-DECAYING sum of `_reservedUsd[key]
+    ///         [guardian]` (the PLEDGE, not the current booking) across every
+    ///         key currently listing `guardian` as an approver.
+    ///
+    /// @dev    THE SHARED-STAKE DENOMINATOR, PLEDGE BASIS — used only where
+    ///         the numerator is also read on the pledge basis
+    ///         (`_effectiveReservedTotal`/`settleCoverage`). `_reservedUsd` is
+    ///         written exactly once per key (`recordApproval`) and cleared
+    ///         exactly once (`releaseApproval`) — `_rebook`/`settleCoverage`
+    ///         never touch it — so this accumulator only ever moves at those
+    ///         two sites, mirroring `_reservedUsd`'s own lifecycle exactly.
+    ///
+    ///         WHY TWO ACCUMULATORS RATHER THAN ONE (Pashov re-audit of #158,
+    ///         finding 4, confidence 75). `_effectiveReservedTotal` used to
+    ///         divide the frozen PLEDGE numerator by the live BOOKING
+    ///         denominator (`openExposureUsd`, which tracks `_recorded`, not
+    ///         `_reservedUsd`) — a basis mismatch that could push the "shares
+    ///         sum to <= 1" partition-of-unity property above 1 once a prior
+    ///         `settleCoverage` pass had diverged the two bases on some OTHER
+    ///         proposal sharing this guardian. Keeping a dedicated
+    ///         pledge-basis accumulator for the pledge-basis callers (this
+    ///         one) and a dedicated booking-basis accumulator
+    ///         (`_liveBookedUsd`) for the booking-basis callers makes every
+    ///         `_sharedSlashableUsd` call site divide by a denominator built
+    ///         from EXACTLY the same basis as its own numerator, closing
+    ///         finding 4 as a side effect of closing finding 2 rather than
+    ///         needing a second, targeted fix — see design.md D10 for the
+    ///         full reasoning and the regression test that proves it.
+    mapping(address guardian => uint256) internal _livePledgedUsd;
+
     // ── Modifiers / helpers ──
 
     modifier onlyRegistry() {
@@ -1013,6 +1099,13 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         // pledge and nothing but a release clears it.
         _reservedUsd[key][guardian] = share;
         _committedUsd[key] += share;
+        // Mirrors `_buckets[guardian][epoch] += share` above, but WITHOUT the
+        // wall-clock window — see the invariant note on `_liveBookedUsd`
+        // (Pashov re-audit of #158, finding 2). Both accumulators start equal
+        // to `share` here; they diverge only once `_rebook` writes the
+        // booking away from the pledge.
+        _liveBookedUsd[guardian] += share;
+        _livePledgedUsd[guardian] += share;
         // The ledger keeps its OWN approver list: the quorum reads this, never
         // the registry, so the ledger's registry pointer and the governor's can
         // never disagree about who covered a proposal.
@@ -1045,6 +1138,13 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         // counter has to be unwound with the number that was added to it.
         _buckets[guardian][r.epoch] -= r.usd;
         _committedUsd[key] -= reserved;
+        // Mirrors the two lines above exactly, on the two accumulators
+        // `_sharedSlashableUsd` divides by (Pashov re-audit of #158, finding
+        // 2): the booking-basis accumulator unwinds by the booking (`r.usd`),
+        // the pledge-basis one by the pledge (`reserved`) — same pairing as
+        // `_buckets`/`_committedUsd` just above.
+        _liveBookedUsd[guardian] -= r.usd;
+        _livePledgedUsd[guardian] -= reserved;
 
         // Swap-and-pop out of the approver list, so it stays bounded by the
         // cohort rather than growing with every guardian that ever approved.
@@ -1295,6 +1395,38 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      anything, and executing on an unprovable coverage claim is the
     ///      exact outcome the gate exists to refuse. `recordApproval` is the
     ///      one consumer that catches instead — see `IExposureLedger`.
+    ///
+    /// @dev SHARED ACROSS OPEN PROPOSALS TOO (Pashov re-audit of #158, finding
+    ///      1, confidence 88 — the HIGHEST-severity gap in that re-audit).
+    ///      This is the ACTUAL execute-time gate — `SyndicateGovernor.
+    ///      executeProposal` calls exactly this to decide whether a proposal
+    ///      may execute at all — and it was the one post-execution consumer
+    ///      of a guardian's slashable bond that hardening #35's shared-stake
+    ///      fix (D9) never reached: it kept computing `live =
+    ///      _slashableBondUsd(g, priceX8, 0)` and clamping only
+    ///      `min(live, reserved)` for THIS ONE proposal, with no awareness of
+    ///      what the same live stake was simultaneously backing on every
+    ///      OTHER open proposal. Two proposals sole-approved by the same
+    ///      guardian could therefore EACH independently pass this gate and
+    ///      execute against a stake that, once shared, covers only one of
+    ///      them — the exact double-count D9 exists to prevent, reopened at
+    ///      the one call site that actually gates execution. The natspec
+    ///      comment on the old `live` read ("provably equal to the anchored
+    ///      read every OTHER post-execution consumer takes") was true and
+    ///      irrelevant: it establishes temporal/price consistency for THIS
+    ///      proposal's own anchor, and says nothing about a SECOND proposal
+    ///      reading the same guardian's stake with nothing decremented
+    ///      between the two checks.
+    ///
+    ///      FIX: route through `_sharedSlashableUsd` exactly like every other
+    ///      consumer, on the BOOKING basis (`reserved` is `_recorded[key]
+    ///      [g].usd` here, so the denominator is `_liveBookedUsd[g]`) — see
+    ///      the dev-note on `_sharedSlashableUsd`. `_sharedSlashableUsd`
+    ///      already clamps its return to `reserved`, so the old manual
+    ///      `live < reserved ? live : reserved` becomes redundant and is
+    ///      dropped. `anchor = 0` (live) is unchanged and still correct for
+    ///      the reason stated above — this fix only closes the missing
+    ///      sharing, not the anchor basis, which was never in question.
     function requireApproveQuorum(address governor, uint256 proposalId, address asset, uint256 requiredCoverage)
         external
         view
@@ -1325,8 +1457,10 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
             // gate runs in the same transaction, immediately after the
             // stamp, so the live read here is provably equal to the
             // anchored read every OTHER post-execution consumer takes.
-            uint256 live = _slashableBondUsd(g, priceX8, 0);
-            haveUsd += live < reserved ? live : reserved;
+            //
+            // SHARED, NOT MERELY LIVE (Pashov re-audit of #158, finding 1) —
+            // see the `@dev` block above this function.
+            haveUsd += _sharedSlashableUsd(g, reserved, priceX8, 0, _liveBookedUsd[g]);
             if (haveUsd >= needUsd) return; // early exit
         }
         // The loop early-returns on success — reaching here means the covering
@@ -1447,8 +1581,12 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         uint256 priceX8 = woodPriceX8();
         // ANCHORED (issue #35): once executed, a post-execution top-up must
         // not inflate what this guardian carries — see `_slashableBondUsd`.
-        uint256 live = _slashableBondUsd(guardian, priceX8, pv.executedAt);
-        uint256 mine = live < reserved ? live : reserved;
+        // SHARED ACROSS OPEN PROPOSALS (Pashov audit finding 2, hardening
+        // #35): `_sharedSlashableUsd` additionally pro-rates this guardian's
+        // slashable basis against every OTHER proposal it currently backs, so
+        // this proposal cannot claim more of the guardian's one bond than its
+        // own share of it — see the invariant note above `_sharedSlashableUsd`.
+        uint256 mine = _sharedSlashableUsd(guardian, reserved, priceX8, pv.executedAt, _liveBookedUsd[guardian]);
         if (mine == 0) return 0;
         return _allocate(mine, _effectiveTotal(key, priceX8, pv.executedAt), needUsd);
     }
@@ -1485,6 +1623,48 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         return needUsd < effectiveTotal ? needUsd : effectiveTotal;
     }
 
+    /// @inheritdoc IExposureLedger
+    /// @dev UNSHARED, DELIBERATELY (Pashov re-audit of #158, finding 3,
+    ///      confidence 78). `liabilityUsd` above is the right basis for
+    ///      pricing what a CONVICTION on this proposal can actually recover —
+    ///      it is MEANT to shrink under D9's pro-rata sharing once the same
+    ///      guardian(s) also back other open proposals, because a conviction
+    ///      can only ever take one real, shared bond no matter how many
+    ///      proposals claim a piece of it.
+    ///
+    ///      `ChallengeGame.file()`'s challenger bond is a DIFFERENT quantity:
+    ///      an anti-frivolous-filing deterrent sized off what THIS FILING
+    ///      freezes for THIS accused cohort. It must NOT shrink merely
+    ///      because the same guardians happen to be juggling other open
+    ///      commitments under `kNumerator > 1` — an entirely ordinary,
+    ///      legitimate operating condition that D9's sharing fix exists
+    ///      specifically to accommodate elsewhere, not a reason to charge
+    ///      less to accuse THIS cohort. Feeding the shared figure into the
+    ///      bond let a guardian's own, unrelated multi-proposal activity
+    ///      dilute the deterrent against filing on any ONE of its proposals —
+    ///      and `slashVerdict`'s actual punitive take is NOT pro-rated
+    ///      either, so the bond tracked something smaller than what a
+    ///      conviction can still actually take.
+    ///
+    ///      Same shape as `liabilityUsd` — `min(needUsd, Σ over approvers of
+    ///      min(reserved, slashableBondUsd(g, anchor)))` — but through
+    ///      `_unsharedEffectiveTotal` instead of `_effectiveTotal`: exactly
+    ///      `_effectiveTotal`'s PRE-D9 behaviour, i.e. the figure
+    ///      `liabilityUsd` itself returned before the shared-stake fix.
+    ///      `ChallengeGame.file` is the intended caller; every other
+    ///      consumer of a guardian's recoverable bond keeps reading the
+    ///      shared figure via `liabilityUsd`/`allocatedUsd`.
+    function unsharedLiabilityUsd(address governor, uint256 proposalId) external view returns (uint256) {
+        bytes32 key = _reviewKey(governor, proposalId);
+        ILedgerGovernorMinimal gov = ILedgerGovernorMinimal(governor);
+        ILedgerGovernorMinimal.ProposalViewLite memory pv = gov.getProposalView(proposalId);
+        uint256 effectiveTotal = _unsharedEffectiveTotal(key, woodPriceX8(), pv.executedAt);
+        if (effectiveTotal == 0) return 0;
+
+        uint256 needUsd = coverageUsd(IVaultAssetMinimal(pv.vault).asset(), gov.getRequiredCoverage(proposalId));
+        return needUsd < effectiveTotal ? needUsd : effectiveTotal;
+    }
+
     /// @dev Sum of `min(reserved, slashable bond)` across a proposal's
     ///      approvers — what the cohort can ACTUALLY pay, not what it
     ///      pledged.
@@ -1504,15 +1684,142 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      the adversary this closes — an accused approver topping up AFTER
     ///      the drain to inflate its own share of `needUsd` — is priced at
     ///      what the verdict can reach, not at what it can stake.
+    ///
+    /// @dev SHARED ACROSS OPEN PROPOSALS (Pashov audit finding 2, hardening
+    ///      #35): each term now goes through `_sharedSlashableUsd` instead of
+    ///      a bare `min(live, reserved)` — see the invariant note there. A
+    ///      guardian backing only this one proposal sees no change.
     function _effectiveTotal(bytes32 key, uint256 priceX8, uint256 anchor) internal view returns (uint256 total) {
         address[] storage listed = _approversOf[key];
         uint256 n = listed.length;
         for (uint256 i = 0; i < n; i++) {
-            uint256 reserved = _recorded[key][listed[i]].usd;
+            address g = listed[i];
+            uint256 reserved = _recorded[key][g].usd;
             if (reserved == 0) continue;
-            uint256 live = _slashableBondUsd(listed[i], priceX8, anchor);
-            total += live < reserved ? live : reserved;
+            // BOOKING BASIS: `reserved` is `_recorded[key][g].usd`, so the
+            // denominator must be the accumulator built from the SAME writes
+            // — `_liveBookedUsd`, not `_livePledgedUsd`. See the `@dev` on
+            // `_sharedSlashableUsd` (Pashov re-audit of #158, findings 2/4).
+            total += _sharedSlashableUsd(g, reserved, priceX8, anchor, _liveBookedUsd[g]);
         }
+    }
+
+    /// @dev `_effectiveTotal`'s PRE-D9 computation — `min(reserved,
+    ///      slashableBondUsd(g, anchor))` per approver, with NO cross-proposal
+    ///      sharing — kept alive exclusively for `unsharedLiabilityUsd`. See
+    ///      the invariant note there (Pashov re-audit of #158, finding 3) for
+    ///      why `ChallengeGame.file`'s bond basis must NOT go through
+    ///      `_sharedSlashableUsd`: the challenger bond prices what this one
+    ///      filing freezes for this one accused cohort, and must not shrink
+    ///      just because the same guardians also back other open proposals.
+    function _unsharedEffectiveTotal(bytes32 key, uint256 priceX8, uint256 anchor)
+        internal
+        view
+        returns (uint256 total)
+    {
+        address[] storage listed = _approversOf[key];
+        uint256 n = listed.length;
+        for (uint256 i = 0; i < n; i++) {
+            address g = listed[i];
+            uint256 reserved = _recorded[key][g].usd;
+            if (reserved == 0) continue;
+            uint256 slashable = _slashableBondUsd(g, priceX8, anchor);
+            total += slashable < reserved ? slashable : reserved;
+        }
+    }
+
+    /// @dev THE SHARED-STAKE INVARIANT (Pashov audit finding 2, hardening
+    ///      #35). Before this, `_effectiveTotal`/`_effectiveReservedTotal`
+    ///      (and `allocatedUsd`/`settleCoverage`'s own per-guardian clamps)
+    ///      computed a guardian's contribution to ONE proposal independently
+    ///      as `min(reserved, slashableBondUsd(g, anchor))` — using the
+    ///      guardian's CURRENT total live/anchored stake with zero awareness
+    ///      of what that SAME stake is simultaneously backing on every OTHER
+    ///      still-open, already-executed proposal it also approved. Two
+    ///      individually-correct anchored reads can therefore sum to more
+    ///      than the guardian's one, finite, shared recoverable pool: PROVEN
+    ///      (guardian stakes 1,000 WOOD, books $400 + $400 legally across two
+    ///      proposals under the k-multiplier sharing design, is then slashed
+    ///      $400 elsewhere leaving only $600 live — yet both proposals
+    ///      independently reported $400 "recoverable", $800 claimed against
+    ///      $600 real). This requires no privileged action at all: it fires
+    ///      from ordinary, legitimate multi-proposal operation combined with
+    ///      an unrelated conviction landing in between.
+    ///
+    ///      INVARIANT THIS ENFORCES: for any guardian g, the sum over all
+    ///      currently-open anchored proposals of that proposal's
+    ///      claimed-recoverable-from-g must never exceed g's actual
+    ///      live/anchored recoverable stake.
+    ///
+    ///      HOW (option (a), pro-rata distribution — chosen over an explicit
+    ///      escrow ledger or first-settled-wins because it reuses bookkeeping
+    ///      shape this contract already pays for elsewhere, rather than
+    ///      adding an unbounded new ledger): the caller passes `liveTotal`, an
+    ///      EXACT, non-wall-clock-decaying sum (`_liveBookedUsd[g]` or
+    ///      `_livePledgedUsd[g]`, see the dedicated dev-note below) of every
+    ///      still-open reservation this SAME guardian holds, on the same
+    ///      basis as `reserved`. That sum is exactly the shared denominator
+    ///      g's slashable stake must be split across: `share = slashable *
+    ///      reserved / liveTotal`, clamped to `reserved`. Two proposals
+    ///      reading independently read the SAME `liveTotal`, so their shares
+    ///      can sum to at most `slashable` — never more than the one bond
+    ///      that actually backs both. Generalizes to N simultaneously-open
+    ///      proposals for the same guardian, since the accumulator already
+    ///      sums over all of them (O(1) storage read, no scan).
+    ///
+    ///      ORIGINALLY (`hardening #35`) this reused `openExposureUsd(g)`'s
+    ///      existing wall-clock bucket scan directly instead of a dedicated
+    ///      accumulator, on the theory that it already summed exactly this
+    ///      guardian's open reservations. A Pashov re-audit of that version
+    ///      (#158) found the reuse unsound in five distinct ways — see the
+    ///      dev-note below — which is why the denominator is now a
+    ///      caller-supplied EXACT accumulator instead.
+    ///
+    ///      A GUARDIAN WITH ONLY ONE OPEN PROPOSAL SEES NO CHANGE: `reserved
+    ///      == liveTotal` exactly, so `share` reduces algebraically to
+    ///      `slashable` un-scaled — identical to the pre-fix `min(reserved,
+    ///      slashable)`. The sharing only ever bites when a guardian is
+    ///      genuinely juggling more than one open commitment, which is
+    ///      exactly the case the invariant exists for.
+    ///
+    ///      `liveTotal == 0` falls back to the un-shared `min(reserved,
+    ///      slashable)` rather than dividing by zero; unreachable in practice
+    ///      (every caller only invokes this with `reserved != 0`, and
+    ///      `liveTotal` — `_liveBookedUsd[guardian]` or
+    ///      `_livePledgedUsd[guardian]`, see the caller — is by construction
+    ///      >= `reserved` whenever `reserved` is itself a live summand of it),
+    ///      kept as a defensive floor rather than an assumed invariant.
+    ///
+    /// @dev DENOMINATOR IS CALLER-SUPPLIED, ON PURPOSE (Pashov re-audit of
+    ///      #158, findings 2 and 4). This used to read `openExposureUsd
+    ///      (guardian)` internally — a single, WALL-CLOCK-DECAYING bucket
+    ///      scan reused as the denominator for every caller regardless of
+    ///      which basis (booking vs. pledge) that caller's own `reserved`
+    ///      term was read on. Two problems followed from sharing one
+    ///      denominator across two bases: (1) the scan's wall-clock decay let
+    ///      a proposal's OWN contribution silently exit the sum while its
+    ///      `_recorded`/`_reservedUsd` entry — and therefore its numerator
+    ///      claim — stayed fully live (finding 2); (2) `_effectiveReservedTotal`
+    ///      fed this function a PLEDGE numerator against a BOOKING
+    ///      denominator, breaking the "shares sum to <= 1" partition-of-unity
+    ///      property whenever a sibling proposal's settlement had diverged
+    ///      the two bases (finding 4). Requiring the caller to pass its own
+    ///      basis-matched, non-decaying accumulator (`_liveBookedUsd` for
+    ///      booking-basis callers, `_livePledgedUsd` for pledge-basis ones)
+    ///      fixes both at once: every call site now divides a `reserved` term
+    ///      by a `liveTotal` built from EXACTLY the same underlying writes,
+    ///      so `Σ reserved_i == liveTotal` holds by construction for that
+    ///      basis, and `Σ share_i <= slashable` follows algebraically. See
+    ///      design.md D10 for the full comparison against the audit's Option
+    ///      A/B framing and the regression tests that prove each trigger.
+    function _sharedSlashableUsd(address guardian, uint256 reserved, uint256 priceX8, uint256 anchor, uint256 liveTotal)
+        internal
+        view
+        returns (uint256)
+    {
+        uint256 slashable = _slashableBondUsd(guardian, priceX8, anchor);
+        uint256 share = liveTotal == 0 ? slashable : (slashable * reserved) / liveTotal;
+        return share < reserved ? share : reserved;
     }
 
     /// @inheritdoc IExposureLedger
@@ -1651,8 +1958,16 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
             uint256 reserved = _reservedUsd[key][g];
             if (reserved == 0) continue; // released via a vote change
 
-            uint256 liveG = _slashableBondUsd(g, priceX8, pv.executedAt);
-            uint256 mine = liveG < reserved ? liveG : reserved;
+            // SHARED ACROSS OPEN PROPOSALS (Pashov audit finding 2, hardening
+            // #35) — see `_sharedSlashableUsd`: this guardian's slashable
+            // basis is pro-rated against every other proposal it currently
+            // backs, not clamped to this proposal's reservation alone.
+            // PLEDGE BASIS: `reserved` here is `_reservedUsd[key][g]`, so the
+            // denominator must be `_livePledgedUsd`, not `_liveBookedUsd`
+            // (Pashov re-audit of #158, finding 4 — a pledge numerator over a
+            // booking denominator is exactly the basis mismatch that finding
+            // proved).
+            uint256 mine = _sharedSlashableUsd(g, reserved, priceX8, pv.executedAt, _livePledgedUsd[g]);
             uint256 alloc = _allocate(mine, effectiveTotal, needUsd);
             // BOOKED, NOT ALLOCATED. `_rebook` clamps an upward move to the
             // guardian's free budget (issue #110), so what it returns can be
@@ -1791,8 +2106,16 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         if (target == current) return current;
         if (target < current) {
             _buckets[g][r.epoch] -= (current - target);
+            // Mirrors the bucket write on the SAME delta — keeps
+            // `_liveBookedUsd` (the booking-basis shared-stake denominator,
+            // Pashov re-audit of #158 finding 2) exactly equal to `Σ
+            // _recorded[key][g].usd` at every instant, in both directions.
+            // `_livePledgedUsd`/`_reservedUsd` are untouched here: settlement
+            // never rewrites the pledge, only the booking.
+            _liveBookedUsd[g] -= (current - target);
         } else {
             _buckets[g][r.epoch] += (target - current);
+            _liveBookedUsd[g] += (target - current);
         }
         // forge-lint: disable-next-line(unsafe-typecast)
         _recorded[key][g].usd = uint192(target);
@@ -1807,6 +2130,10 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///
     ///      ANCHORED (issue #35): same `anchor` threading as `_effectiveTotal`
     ///      — `pv.executedAt`, 0 (live) for a proposal that never executed.
+    ///
+    /// @dev SHARED ACROSS OPEN PROPOSALS (Pashov audit finding 2, hardening
+    ///      #35): same `_sharedSlashableUsd` treatment as `_effectiveTotal`,
+    ///      see the invariant note there.
     function _effectiveReservedTotal(bytes32 key, uint256 priceX8, uint256 anchor)
         internal
         view
@@ -1815,10 +2142,13 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         address[] storage listed = _approversOf[key];
         uint256 n = listed.length;
         for (uint256 i = 0; i < n; i++) {
-            uint256 reserved = _reservedUsd[key][listed[i]];
+            address g = listed[i];
+            uint256 reserved = _reservedUsd[key][g];
             if (reserved == 0) continue;
-            uint256 live = _slashableBondUsd(listed[i], priceX8, anchor);
-            total += live < reserved ? live : reserved;
+            // PLEDGE BASIS — see the matching note in `settleCoverage`'s own
+            // loop; both callers reading `_reservedUsd` must divide by
+            // `_livePledgedUsd`, never `_liveBookedUsd`.
+            total += _sharedSlashableUsd(g, reserved, priceX8, anchor, _livePledgedUsd[g]);
         }
     }
 

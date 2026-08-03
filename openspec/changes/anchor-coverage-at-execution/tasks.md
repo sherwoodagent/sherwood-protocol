@@ -83,3 +83,40 @@
       post-execution remainder. NOT DONE in this pass — out of scope per the
       dispatching agent's brief (PR body references #83 per design.md's
       framing instead; posting GH issue comments was not requested).
+
+## 6. Post-merge audit hardening (Pashov review, PR #152, design D8/D9)
+
+- [x] 6.1 Finding 1 (D8): move the same-block top-up `-1` hardening to the
+      two RAW-anchor callers (`slashableStakeAt`, `slashVerdict`) instead of
+      the shared `_slashableAt`/`_slashOne` — the first attempt inside the
+      shared function double-shifted `slashGuardians`' already-`ts1`-offset
+      `openedAt` and regressed six `StakedWoodSlashing.t.sol` tests; caught
+      by the full suite run and corrected in the same pass.
+- [x] 6.2 `slashVerdict` reverts `InvalidParameter()` on `openedAt == 0`
+      (defense-in-depth item from the audit's Rejected section).
+      `slashGuardians` deliberately NOT given the same guard — it would
+      contradict the existing, intentional
+      `test_slashGuardians_openedAtZero_uninformativeSnapshot`.
+- [x] 6.3 New adversarial test `test_slashableStakeAt_sameBlockTopUpExcluded`
+      (`test/StakedWoodSlashableStakeAt.t.sol`) proving a same-instant top-up
+      cannot backdate into the anchor.
+- [x] 6.4 Finding 2 (D9): new internal `_sharedSlashableUsd` in
+      `ExposureLedger`, reusing `openExposureUsd(guardian)` as the shared
+      pro-rata denominator; wired into `_effectiveTotal`,
+      `_effectiveReservedTotal`, `allocatedUsd`, and `settleCoverage`'s
+      per-guardian clamp (option (a), see design.md D9 for the rejected
+      alternatives (b)/(c) and the accepted residual pledge/booking
+      asymmetry).
+- [x] 6.5 New adversarial tests in `test/ExposureLedger.t.sol`:
+      `test_finding2_sharedStakeAcrossOpenProposalsNeverOversumsTheRealRecoverableBond`
+      (reproduces the audit's own $800-claimed-against-$600-real numeric
+      trace on both `liabilityUsd` and `allocatedUsd`) and
+      `test_finding2_singleOpenProposalIsUnaffectedByTheSharedStakeFix`
+      (regression guard for the common single-proposal case).
+- [x] 6.6 Full non-integration suite (1709 tests), `SwoodReviewSlash.t.sol`
+      integration end-to-end, `forge fmt`, `./script/check-layout-goldens.sh`,
+      and `openspec validate --changes --strict` all clean after the
+      hardening. (The 9 `UniswapAdapterFork.t.sol` fork-test failures in the
+      integration run are pre-existing and environment-only — that suite's
+      own header requires `--fork-url $BASE_RPC_URL`; unrelated to this
+      change.)
