@@ -1026,6 +1026,65 @@ contract SyndicateVaultTest is Test {
         vault.executeGovernorBatch(calls, new uint256[](0), type(uint256).max);
     }
 
+    // ==================== ISSUE #43: EXECUTOR MIGRATION (setExecutorImpl) ====================
+
+    /// @notice Only the factory (msg.sender == _factory, which is the test
+    ///         contract itself here — it deployed the proxy) may re-point.
+    function test_setExecutorImpl_onlyFactory() public {
+        BatchExecutorLib newLib = new BatchExecutorLib();
+        vm.prank(makeAddr("stranger"));
+        vm.expectRevert(ISyndicateVault.NotFactory.selector);
+        vault.setExecutorImpl(address(newLib));
+    }
+
+    function test_setExecutorImpl_rejectsZeroAndCodelessTargets() public {
+        vm.expectRevert(ISyndicateVault.InvalidExecutorImpl.selector);
+        vault.setExecutorImpl(address(0));
+
+        vm.expectRevert(ISyndicateVault.InvalidExecutorImpl.selector);
+        vault.setExecutorImpl(makeAddr("codelessEOA"));
+    }
+
+    /// @notice Re-points the executor address AND re-stamps the expected
+    ///         codehash atomically (design.md D5) — the vault-level half of
+    ///         the migration primitive `SyndicateFactory.pushExecutor` calls.
+    function test_setExecutorImpl_updatesAddressAndCodehashAtomically() public {
+        BatchExecutorLib newLib = new BatchExecutorLib();
+        vault.setExecutorImpl(address(newLib)); // msg.sender == _factory == this test contract
+
+        assertEq(address(uint160(uint256(vm.load(address(vault), bytes32(uint256(3)))))), address(newLib));
+        assertEq(vm.load(address(vault), bytes32(uint256(9))), bytes32(address(newLib).codehash));
+
+        // A batch through the NEW lib succeeds (codehash check passes).
+        BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](0);
+        vm.prank(MOCK_GOVERNOR);
+        vault.executeGovernorBatch(calls, new uint256[](0), type(uint256).max);
+    }
+
+    /// @notice design.md D5's "unmigrated vault fails closed" scenario: a
+    ///         vault re-pointed at an OLD-shaped executor (`DifferentExecutor`
+    ///         below only has the pre-#43 unmetered 1-arg
+    ///         `executeBatch(Call[])` selector, no metered 3-arg overload —
+    ///         the exact "keep the old lib bytecode as a test fixture"
+    ///         design.md D5 calls for) fails CLOSED on the next batch —
+    ///         unknown selector, no fallback on the library — rather than
+    ///         silently running unmetered. This is the exact mis-pairing D5
+    ///         warns about: a codehash-matching but ABI-mismatched executor.
+    function test_unmigratedVault_failsClosed_notSilentlyUnmetered() public {
+        DifferentExecutor oldLib = new DifferentExecutor();
+        vault.setExecutorImpl(address(oldLib));
+        assertEq(address(uint160(uint256(vm.load(address(vault), bytes32(uint256(3)))))), address(oldLib));
+        // Codehash re-stamped to match the (old) lib, so the codehash check
+        // itself passes -- the failure must come from the ABI mismatch, not
+        // a stale-hash rejection (design.md D5's own distinction).
+        assertEq(vm.load(address(vault), bytes32(uint256(9))), bytes32(address(oldLib).codehash));
+
+        BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](0);
+        vm.prank(MOCK_GOVERNOR);
+        vm.expectRevert(); // unknown selector, no fallback on DifferentExecutor -- fails closed
+        vault.executeGovernorBatch(calls, new uint256[](0), type(uint256).max);
+    }
+
     /// @dev V-C2 reentrancy guard: if a target re-enters `executeGovernorBatch`
     ///      during its callback, the re-entry must revert.
     ///      We deploy a `ReentrantTarget` and re-mock

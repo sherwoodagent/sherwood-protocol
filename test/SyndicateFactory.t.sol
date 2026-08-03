@@ -921,4 +921,126 @@ contract SyndicateFactoryTest is Test {
         vm.expectRevert(SyndicateFactory.VaultNotDeployed.selector);
         factory.setParamsOverride(makeAddr("noVault"), p);
     }
+
+    // ==================== ISSUE #43: EXECUTOR MIGRATION ====================
+
+    /// @dev `_expectedExecutorCodehash` — verified via `forge inspect
+    ///      SyndicateVault storageLayout` (base-contract inheritance shifts
+    ///      slots, so this is NOT the same as counting declared variables in
+    ///      SyndicateVault.sol alone). `_executorImpl` is slot 3 (already
+    ///      used elsewhere in this file).
+    uint256 constant EXPECTED_EXECUTOR_CODEHASH_SLOT = 9;
+
+    function test_setExecutorImpl_onlyOwner() public {
+        BatchExecutorLib newLib = new BatchExecutorLib();
+        vm.prank(makeAddr("stranger"));
+        vm.expectRevert();
+        factory.setExecutorImpl(address(newLib));
+    }
+
+    function test_setExecutorImpl_zeroAddressReverts() public {
+        vm.prank(owner);
+        vm.expectRevert(SyndicateFactory.InvalidExecutorImpl.selector);
+        factory.setExecutorImpl(address(0));
+    }
+
+    /// @notice `setExecutorImpl` only affects NEW syndicates — an
+    ///         already-deployed vault keeps its original executor until
+    ///         `pushExecutor` re-points it individually.
+    function test_setExecutorImpl_onlyAffectsNewSyndicates() public {
+        vm.prank(creator1);
+        (, address vaultAddr) = factory.createSyndicate(creator1AgentId, _defaultConfig());
+
+        BatchExecutorLib newLib = new BatchExecutorLib();
+        vm.prank(owner);
+        factory.setExecutorImpl(address(newLib));
+        assertEq(factory.executorImpl(), address(newLib));
+
+        // The EXISTING vault is untouched.
+        assertEq(address(uint160(uint256(vm.load(vaultAddr, bytes32(uint256(3)))))), address(executorLib));
+
+        // A NEW syndicate picks up the new lib.
+        vm.prank(creator2);
+        (, address vaultAddr2) = factory.createSyndicate(creator2AgentId, _configWithSubdomain("second-syndicate"));
+        assertEq(address(uint160(uint256(vm.load(vaultAddr2, bytes32(uint256(3)))))), address(newLib));
+    }
+
+    function test_pushExecutor_onlyOwner() public {
+        vm.prank(creator1);
+        (, address vaultAddr) = factory.createSyndicate(creator1AgentId, _defaultConfig());
+
+        vm.prank(makeAddr("stranger"));
+        vm.expectRevert();
+        factory.pushExecutor(vaultAddr);
+    }
+
+    function test_pushExecutor_revertsIfVaultNotFactoryDeployed() public {
+        vm.prank(owner);
+        vm.expectRevert(SyndicateFactory.VaultNotDeployed.selector);
+        factory.pushExecutor(makeAddr("notAVault"));
+    }
+
+    /// @notice The migration primitive itself: re-points the vault's executor
+    ///         address AND re-stamps its expected codehash atomically.
+    function test_pushExecutor_repointsAddressAndCodehashAtomically() public {
+        vm.prank(creator1);
+        (, address vaultAddr) = factory.createSyndicate(creator1AgentId, _defaultConfig());
+
+        BatchExecutorLib newLib = new BatchExecutorLib();
+        vm.prank(owner);
+        factory.setExecutorImpl(address(newLib));
+
+        vm.prank(owner);
+        factory.pushExecutor(vaultAddr);
+
+        assertEq(
+            address(uint160(uint256(vm.load(vaultAddr, bytes32(uint256(3)))))), address(newLib), "address re-pointed"
+        );
+        assertEq(
+            vm.load(vaultAddr, bytes32(EXPECTED_EXECUTOR_CODEHASH_SLOT)),
+            bytes32(address(newLib).codehash),
+            "codehash re-stamped to match"
+        );
+    }
+
+    /// @notice Lifecycle-gated: `pushExecutor` reverts while the vault's
+    ///         governor reports an active OR merely open proposal — re-pointing
+    ///         mid-proposal would swap the metering library out from under
+    ///         stored, coverage-priced calls. Mirrors `rotateOwner`'s gates.
+    function test_pushExecutor_revertsWhileActiveProposal() public {
+        vm.prank(creator1);
+        (, address vaultAddr) = factory.createSyndicate(creator1AgentId, _defaultConfig());
+        address gov = factory.governorOf(vaultAddr);
+        vm.mockCall(gov, abi.encodeWithSelector(ISyndicateGovernor.getActiveProposal.selector), abi.encode(uint256(42)));
+        vm.mockCall(gov, abi.encodeWithSelector(ISyndicateGovernor.openProposalCount.selector), abi.encode(uint256(0)));
+
+        BatchExecutorLib newLib = new BatchExecutorLib();
+        vm.prank(owner);
+        factory.setExecutorImpl(address(newLib));
+
+        vm.prank(owner);
+        vm.expectRevert(SyndicateFactory.ProposalActive.selector);
+        factory.pushExecutor(vaultAddr);
+
+        // Untouched.
+        assertEq(address(uint160(uint256(vm.load(vaultAddr, bytes32(uint256(3)))))), address(executorLib));
+    }
+
+    function test_pushExecutor_revertsWhileOpenProposalCount() public {
+        vm.prank(creator1);
+        (, address vaultAddr) = factory.createSyndicate(creator1AgentId, _defaultConfig());
+        address gov = factory.governorOf(vaultAddr);
+        vm.mockCall(gov, abi.encodeWithSelector(ISyndicateGovernor.getActiveProposal.selector), abi.encode(uint256(0)));
+        vm.mockCall(gov, abi.encodeWithSelector(ISyndicateGovernor.openProposalCount.selector), abi.encode(uint256(1)));
+
+        BatchExecutorLib newLib = new BatchExecutorLib();
+        vm.prank(owner);
+        factory.setExecutorImpl(address(newLib));
+
+        vm.prank(owner);
+        vm.expectRevert(SyndicateFactory.ProposalsOpen.selector);
+        factory.pushExecutor(vaultAddr);
+
+        assertEq(address(uint160(uint256(vm.load(vaultAddr, bytes32(uint256(3)))))), address(executorLib));
+    }
 }
