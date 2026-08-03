@@ -267,6 +267,22 @@ re-derive this decision against the landed code; if the gate's per-term read
 becomes shared, the returned `coverageRaisedUsd` inherits it and this
 section's residual paragraph is moot.
 
+**RE-VERIFIED (2026-08-03, this implementation): the gate IS shared.** This
+assumption was WRONG as written — not because PR #158 itself touched the gate
+(it didn't; PR #152/#158's diffs have no hunk in `requireApproveQuorum`, as
+D1/D6 above record), but because a POST-MERGE follow-up commit
+(`0ea33d6`, "fix(guardian-coverage): remediate 4 PR #158 audit findings",
+landed same-day ahead of this implementation) routed
+`requireApproveQuorum`'s per-term read through `_sharedSlashableUsd` to close
+Pashov re-audit finding [88] — exactly the residual this section flagged as
+"accepted." Per this section's own instruction, the residual paragraph above
+is now moot: `coverageRaisedUsd` inherits the shared/pro-rated basis, and this
+change's implementation consumes whatever `haveUsd` the gate produces without
+caring which basis it used — D1's signature and D2's revert set are
+unaffected either way. Confirmed via `test_finding1_requireApproveQuorum_sharedAcrossOpenProposals`
+in `test/ExposureLedger.t.sol`, updated for issue #27 (nonzero dilution now
+sizes instead of reverting) and passing against the shared-read gate.
+
 ## D7 — Consuming #43's per-call caps (spec'd against `per-call-capital-declarations` @ 062e8c0, UNMERGED — re-verify)
 
 #43's openspec change records the exact seam for this issue (its design.md
@@ -311,6 +327,23 @@ are independent of #43 (they operate on `maxCapital` and the coverage ratio
 alone). Tasks §0 pins the re-verification. Until #43 lands, the spec deltas
 in this change describe the cap-vector scaling conditionally ("when per-call
 capital declarations are in force").
+
+**RE-VERIFIED (2026-08-03, this implementation): #43 landed exactly as
+assumed here**, as PR #180 (`feat/issue-43-per-call-capital-rebased`):
+`getCallCaps(uint256) -> (uint256[] memory executeCallCaps, uint256[] memory
+settlementCallCaps)`, caps threaded as batch ARGUMENTS through
+`executeGovernorBatch(calls, callCaps, maxNetOutflow)`, `Σ executeCallCaps <=
+maxCapital` and `Σ settlementCallCaps <= maxCapital` validated separately per
+batch at propose (`SyndicateGovernor._validateAndStoreBatch`). Given the clean
+match, this change implements the FULL scaling described above (not deferred
+as a follow-up): `_deriveAndStoreEffectiveCapital` scales both leg's caps by
+the same ratio via `_scaleCaps` (which includes the largest-cap-clamp
+re-assert, provably a no-op given the propose-time `Σ caps <= maxCapital`
+invariant but kept as defense-in-depth per this section's own instruction),
+and persists the scaled settlement caps in a new appended mapping
+`_effectiveSettlementCallCaps`. Covered by
+`test_execute_perCallCapsScaleByTheSameCoverageRatio` in
+`test/GovernorCoverageGates.t.sol`.
 
 ## D8 — Ledger liability and settlement denominators do NOT scale
 
