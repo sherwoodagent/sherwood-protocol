@@ -9,7 +9,6 @@ import {ITierRegistry} from "./interfaces/ITierRegistry.sol";
 import {IExposureLedger} from "./interfaces/IExposureLedger.sol";
 import {IChallengeGame} from "./interfaces/IChallengeGame.sol";
 import {IProposerBondEscrow} from "./interfaces/IProposerBondEscrow.sol";
-import {IStrategy} from "./interfaces/IStrategy.sol";
 import {GovernorParameters} from "./GovernorParameters.sol";
 import {GovernorEmergency} from "./GovernorEmergency.sol";
 import {BatchExecutorLib} from "./BatchExecutorLib.sol";
@@ -270,12 +269,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         p.proposer = msg.sender;
         p.vault = vault;
         p.strategy = strategy;
-        // Snapshot the strategy's self-fee flag at propose (like performanceFeeBps)
-        // so settle reads storage, not a live call: closes the TOCTOU flip between
-        // review and settle and the brick vector where a settle-time revert would
-        // strand normal AND emergency settlement. No try/catch — a revert here is
-        // the intended fail-fast (an EOA / broken strategy fails at propose).
-        p.selfManagesFees = strategy != address(0) && IStrategy(strategy).selfManagesFees();
         p.metadataURI = metadataURI;
         p.performanceFeeBps =
             _clampPerformanceFee(proposalId, ISyndicateVault(vault).agentFeeBps(), _params.maxPerformanceFeeBps);
@@ -1338,22 +1331,16 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // there is no profit to share.
         uint256 totalFee = _chargeManagementFee(proposalId, vault, asset, proposal.proposer);
 
-        // A self-fee'd strategy (custody model — LPs deposit/redeem into the
-        // strategy, shares minted/burned on the vault) crystallises its own fees; the
-        // governor's float-delta PnL would misread net deposits as profit and double-
-        // charge. Read the propose-time snapshot, never a live call (TOCTOU +
-        // brick-on-revert).
-        //
-        // The opt-out covers the PERFORMANCE leg only. `selfManagesFees` exists
-        // because float-delta PnL misreads custody deposits as profit — a defect
-        // in profit measurement. The management fee does not use PnL at all
-        // (it is capital x time), so the reason for the exemption does not reach
-        // it.
-        // Always called, even on the self-managed path — see `chargeNew`.
+        // No strategy self-report can exempt a proposal from the performance
+        // leg (issue #151 deleted that mechanism: it was a self-reported
+        // opt-out for a custody-model strategy that never shipped, and it let
+        // any registered agent skip the performance fee by pointing a
+        // proposal at a contract that claimed to self-manage fees). Every
+        // proposal is charged the same way.
+        // Always called regardless — see `chargeNew`.
         {
             uint256 perfFee;
-            (agentFee, perfFee) =
-                _chargePerformanceFee(proposalId, vault, asset, proposal.proposer, !proposal.selfManagesFees);
+            (agentFee, perfFee) = _chargePerformanceFee(proposalId, vault, asset, proposal.proposer, true);
             totalFee += perfFee;
         }
 
@@ -1431,11 +1418,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      so co-proposer splits apply to management as well as carry.
     ///      Guardian delivery is a WOOD airdrop via Merkl, attributed by the
     ///      GuardianFeeAccrued event.
-    ///      Escape hatch: IStrategy.selfManagesFees() == true (snapshotted at
-    ///      propose) skips the PERFORMANCE leg only — the management fee does
-    ///      not use PnL, so the misread-PnL reason for the exemption does not
-    ///      reach it. No in-tree strategy currently sets
-    ///      the flag; any that does must implement its own protocol-fee leg.
     ///      Failure mode: any recipient transfer that reverts escrows in _unclaimedFees
     ///      (pull via claimUnclaimedFees) so settlement never bricks.
     /// @return mgmtFee The whole management fee charged.
@@ -1518,12 +1500,17 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      base first would charge performance on assets already taken.
     /// @return agentFee The agent's slice, reported for the settle event.
     /// @return perfFee  The whole fee charged.
-    /// @param chargeNew False on the `selfManagesFees` path: the strategy
-    ///        collects its own performance fee, so settlement charges none.
-    ///        The function still runs, because fees already crystallized from
-    ///        instant exiters must be released and paid — skipping the call
-    ///        entirely would strand them in the vault forever, permanently
-    ///        excluded from `totalAssets()` and therefore lost to depositors.
+    /// @param chargeNew Currently always `true`; the parameter survives
+    ///        because the function must still run when it is conceptually
+    ///        "false" for a reason unrelated to the deleted self-managed-fees
+    ///        exemption: fees already crystallized from instant exiters must
+    ///        be released and paid — skipping the call entirely would strand
+    ///        them in the vault forever, permanently excluded from
+    ///        `totalAssets()` and therefore lost to depositors. Re-evaluate
+    ///        once #54 (Lane A crystallization retirement) removes
+    ///        `consumeCrystallizedPerf` — at that point this parameter is
+    ///        plausibly vacuous and removable, but that is #54's
+    ///        determination, not this change's.
     function _chargePerformanceFee(uint256 proposalId, address vault, address asset, address proposer, bool chargeNew)
         internal
         returns (uint256 agentFee, uint256 perfFee)

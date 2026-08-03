@@ -113,11 +113,6 @@ interface ISyndicateGovernor {
         ///      they are drained or migrated first.
         address snapshotProtocolFeeRecipient;
         address snapshotGuardiansFeeRecipient;
-        /// @notice `IStrategy.selfManagesFees()` snapshotted at propose time (like
-        ///         performanceFeeBps). Read from storage at settle so a non-pure
-        ///         implementation can't flip it between review and settle (TOCTOU),
-        ///         and a broken/EOA strategy can't brick settle via a revert.
-        bool selfManagesFees;
         // ── APPENDED FIELDS ONLY BELOW (beacon-upgraded governors; storage parity) ──
         uint256 maxCapital; // risk envelope: net-outflow ceiling
         uint16 maxDrawdownBps; // risk envelope: declared drawdown bound
