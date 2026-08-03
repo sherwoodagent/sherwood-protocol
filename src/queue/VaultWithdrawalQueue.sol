@@ -72,6 +72,21 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
     uint256 private _pendingShares; // escrowed redeem shares (not yet claimed/cancelled)
     uint256 private _pendingDepositAssets; // escrowed deposit assets
     uint256 private _reservedAssets; // frozen assets owed to stamped-unclaimed redeems
+    /// @notice Escrowed redeem shares whose price is already STAMPED but which
+    ///         have not been claimed yet — the share-side counterpart of
+    ///         `_reservedAssets`, and the exact set the vault must exclude from
+    ///         pricing (issue #92).
+    /// @dev    A STRICT SUBSET OF `_pendingShares`, and the distinction is the
+    ///         whole point: pre-stamp escrowed shares still float with the pool
+    ///         and belong in the price, because their payout is not fixed yet.
+    ///         Only once `stampSettlement` freezes `num/den` does a share stop
+    ///         being a claim on the pool and become a claim for a fixed number
+    ///         of assets.
+    /// @dev    NO CANCEL PATH TO UNWIND. `cancel` reverts `AlreadySettled` for a
+    ///         stamped pid, so once a share enters this counter the only exit is
+    ///         `claim`. That is why maintaining it needs exactly two hooks
+    ///         rather than three.
+    uint256 private _stampedUnclaimedShares;
 
     constructor(address vault_) {
         if (vault_ == address(0)) revert NotVault();
@@ -145,6 +160,12 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
             uint256 reservedForPid = Math.mulDiv(redeemShares, num, den);
             _pidReserved[pid] = reservedForPid;
             _reservedAssets += reservedForPid;
+            // BOTH SIDES MOVE TOGETHER, always. These shares just stopped being
+            // a claim on the pool and became a claim for `reservedForPid` fixed
+            // assets; pricing must lose the shares at the same instant it loses
+            // the assets, or the gap between the two is exactly the mispricing
+            // window issue #92 describes.
+            _stampedUnclaimedShares += redeemShares;
         }
         emit SettlementStamped(pid, num, den);
     }
@@ -191,6 +212,12 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
             }
             uint256 reserved = _reservedAssets;
             _reservedAssets = reserved > release ? reserved - release : 0;
+            // The share-side release, paired with the asset-side one above. The
+            // vault's `_burn` below removes these shares from `totalSupply`, so
+            // they must leave this counter in the same call — otherwise pricing
+            // would subtract them twice.
+            uint256 stamped = _stampedUnclaimedShares;
+            _stampedUnclaimedShares = stamped > amount ? stamped - amount : 0;
             IRequestableVault(vault).settleRedeem(amount, outAmount, r.owner);
         } else {
             // PRICED AT THE LATEST SETTLEMENT, not at the request's own pid.
@@ -270,6 +297,11 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
 
     function reservedAssets() external view returns (uint256) {
         return _reservedAssets;
+    }
+
+    /// @inheritdoc IVaultWithdrawalQueue
+    function stampedUnclaimedShares() external view returns (uint256) {
+        return _stampedUnclaimedShares;
     }
 
     function getRequestsByOwner(address owner_) external view returns (uint256[] memory) {

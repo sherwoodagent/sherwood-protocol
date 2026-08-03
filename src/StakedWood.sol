@@ -133,6 +133,23 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///         fully unstake or be slashed before the slot can be transferred.
     error PriorStakeNotCleared();
 
+    /// @notice The incoming owner has not consented to having their prepared
+    ///         stake bound to this vault.
+    /// @dev Adversary: the owner of a vault whose bond slot is empty, rotating
+    ///      that vault onto a third party purely to SPEND the third party's
+    ///      escrowed prepared stake. `SyndicateFactory.rotateOwner` authorizes
+    ///      only its own caller; `newOwner` is a bare parameter checked solely
+    ///      against `address(0)`. Without this guard the victim's escrow
+    ///      becomes bound to a vault they never chose: `cancelPreparedStake`
+    ///      reverts `PreparedStakeNotFound`, their own `createSyndicate` is
+    ///      blocked (`canCreateVault` false), and the bond is exposed to
+    ///      `GuardianRegistry._resolveEmergency` → `slashOwnerBond` for the
+    ///      whole `requestUnstakeOwner` → cooldown → `claimUnstakeOwner`
+    ///      recovery. Consent lives HERE, at the spend site, so every present
+    ///      and future factory route into `transferOwnerStakeSlot` lands on the
+    ///      guard rather than on the hazard.
+    error BindingNotApproved();
+
     /// @notice Emitted on every guardian stake / top-up.
     event GuardianStaked(address indexed guardian, uint256 amount, uint256 agentId);
 
@@ -165,6 +182,15 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
 
     /// @notice Emitted when the factory re-points a vault's owner-stake slot.
     event OwnerStakeSlotTransferred(address indexed vault, address indexed oldOwner, address indexed newOwner);
+
+    /// @notice Emitted when a prospective owner consents to having their
+    ///         prepared stake bound to `vault` by a slot transfer.
+    event OwnerStakeBindingApproved(address indexed owner, address indexed vault);
+
+    /// @notice Emitted when a prospective owner withdraws that consent.
+    /// @dev `vault` is the approval being cleared, so an indexer can retire the
+    ///      exact record rather than inferring it from the last approve.
+    event OwnerStakeBindingRevoked(address indexed owner, address indexed vault);
 
     /// @notice Parameter key for `minGuardianStake`.
     bytes32 public constant PARAM_MIN_GUARDIAN_STAKE = keccak256("minGuardianStake");
@@ -354,7 +380,37 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///      mainnet 4663 deployment exists (testnets are redeployable), exactly
     ///      as in the 2026-07-26 re-baseline; from the first mainnet deploy
     ///      onward a removal like this is no longer available.
-    uint256[5] private __gap;
+    ///      Decremented 5 → 4 for `approvedBindVault`, declared immediately
+    ///      below so the shrink comes off the END of the gap and every field
+    ///      after it keeps its slot (same convention as
+    ///      `_liabilityCheckpoints`).
+    uint256[4] private __gap;
+
+    /// @notice The single vault an address consents to have its PREPARED owner
+    ///         stake bound to via `transferOwnerStakeSlot`. Zero = no consent.
+    /// @dev Issue #98. The slot transfer spends `_prepared[newOwner]`, but its
+    ///      only caller (`SyndicateFactory.rotateOwner`) authorizes `msg.sender`
+    ///      alone — so without an opt-in recorded BY the incoming owner, any
+    ///      owner of an empty-slot vault could bind a stranger's escrow. This
+    ///      mapping is that opt-in.
+    ///
+    ///      At most one approved vault per address, deliberately: an address
+    ///      can hold at most one prepared escrow (`PreparedStakeAlreadyExists`),
+    ///      so an approval set spanning several vaults would model a consent
+    ///      the escrow cannot honor. Approving again overwrites.
+    ///
+    ///      SCOPED TO ONE ESCROW LIFETIME. Cleared on the successful bind
+    ///      (consumed), on `cancelPreparedStake`, and on a fresh
+    ///      `prepareOwnerStake`. Without the last two, an approval given for a
+    ///      rotation that was then abandoned would still be standing when the
+    ///      approver later escrows a NEW stake for their own vault — and the
+    ///      vault owner could bind that new escrow against the stale consent.
+    ///
+    ///      An approval on its own moves nothing and locks nothing: the
+    ///      approver keeps `cancelPreparedStake` at all times before the bind,
+    ///      and a standing approval with no live escrow is inert (the
+    ///      prepared-stake guards still reject the transfer).
+    mapping(address owner => address vault) public approvedBindVault;
 
     /// @dev Per-guardian OWN-STAKE LIABILITY history: what the guardian is on
     ///      the hook for at a past instant, as distinct from what it could VOTE
@@ -621,9 +677,17 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///         `TokenCourt._participationFloor` subtracts the accused cohort
     ///         from the electorate using this getter rather than
     ///         `getPastVotes`, so the accused sum can never exceed the total
-    ///         by construction — both traces are pushed in the same
+    ///         AT THE SAME TIMESTAMP — both traces are pushed in the same
     ///         transaction at every mutation site (stake, request, cancel,
-    ///         slash). Using the raw basis also denies the accused a lever on
+    ///         slash). The court reduces the accused sum against this
+    ///         same-instant total ONLY, before ever looking at the 30-day
+    ///         lookback: `reduced = total(snapshotTs) - accusedWeight`,
+    ///         clamped at zero (defence-in-depth for an out-of-band
+    ///         `setStakedWood` re-point, not a path this same-source getter
+    ///         can reach). The lookback min is a separate later step —
+    ///         `min(reduced, total(snapshotTs - 30 days))` — and the accused
+    ///         cohort is never subtracted from the earlier electorate at all.
+    ///         Using the raw basis also denies the accused a lever on
     ///         its own conviction threshold: an aged basis would let an
     ///         accused approver call `requestUnstakeGuardian` between the
     ///         drain and `refer`, re-anchoring its `stakedAt` and flooring its
@@ -884,6 +948,10 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
 
         _prepared[msg.sender] =
             PreparedOwnerStake({amount: uint128(amount), preparedAt: uint64(block.timestamp), bound: false});
+        // A new escrow lifetime starts here, so any consent left over from the
+        // previous one is void — otherwise an approval granted for a rotation
+        // that never happened could be replayed against THIS stake.
+        delete approvedBindVault[msg.sender];
 
         emit OwnerStakePrepared(msg.sender, amount);
     }
@@ -898,10 +966,52 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
 
         uint256 amount = p.amount;
         delete _prepared[msg.sender];
+        // The escrow this consent was scoped to is gone; the consent goes with
+        // it (see `approvedBindVault`).
+        delete approvedBindVault[msg.sender];
 
         wood.safeTransfer(msg.sender, amount);
 
         emit PreparedStakeCancelled(msg.sender, amount);
+    }
+
+    /// @notice Consent to having your prepared owner stake bound to `vault` by
+    ///         a factory owner-rotation.
+    /// @dev THE OPT-IN THIS GUARD EXISTS FOR (issue #98). `rotateOwner` names
+    ///      the incoming owner as a bare parameter and is authorized against
+    ///      the OUTGOING owner only. Adversary: the owner of a vault with an
+    ///      empty bond slot rotates it onto whoever currently holds a prepared
+    ///      stake, spending that stranger's escrow — locking it behind the
+    ///      owner-unstake cooldown on a vault they never chose and exposing it
+    ///      to `slashOwnerBond` throughout. Recording the approval here, from
+    ///      the escrow holder's own `msg.sender`, is what makes the bind
+    ///      consensual.
+    ///
+    ///      One approved vault per address; calling again overwrites. The
+    ///      approval survives until it is consumed by the bind, revoked, or
+    ///      cleared by the escrow lifecycle — including across a front-run
+    ///      revoke: if the rotation lands first, it lands on a consent that was
+    ///      granted and not yet withdrawn, which is a consented outcome and not
+    ///      the attack above. `requestUnstakeOwner` remains the exit.
+    /// @dev nonReentrant omitted — no external calls, no value movement.
+    function approveOwnerStakeBinding(address vault) external {
+        if (vault == address(0)) revert ZeroAddress();
+
+        approvedBindVault[msg.sender] = vault;
+
+        emit OwnerStakeBindingApproved(msg.sender, vault);
+    }
+
+    /// @notice Withdraw a previously granted binding consent.
+    /// @dev A no-op consent (nothing approved) is not an error — the
+    ///      post-condition callers care about is "no standing approval", and
+    ///      reverting would only make the safe state harder to reach.
+    /// @dev nonReentrant omitted — no external calls, no value movement.
+    function revokeOwnerStakeBinding() external {
+        address vault = approvedBindVault[msg.sender];
+        delete approvedBindVault[msg.sender];
+
+        emit OwnerStakeBindingRevoked(msg.sender, vault);
     }
 
     /// @notice Bind a prepared owner stake to a newly created vault.
@@ -932,6 +1042,14 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///      A zero-bond slot (`stakedAmount == 0`, incl. one cleared by
     ///      `claimUnstakeOwner` or a full slash) still binds, so floor-0
     ///      onboarding and multi-vault creators are unchanged.
+    /// @dev NO `approvedBindVault` CHECK HERE, deliberately. Consent is
+    ///      STRUCTURAL on this path: `createSyndicate` passes its own
+    ///      `msg.sender` as `owner_`, so the stake being bound always belongs
+    ///      to the account that initiated the call. The consent guard in
+    ///      `transferOwnerStakeSlot` exists because THAT path takes the
+    ///      incoming owner as a parameter chosen by someone else. Requiring an
+    ///      approval here would only add a second transaction to a flow that
+    ///      cannot bind a stranger's escrow.
     /// @dev nonReentrant dropped — no external calls after state write.
     function bindOwnerStake(address owner_, address vault) external onlyFactory {
         if (_ownerStakes[vault].stakedAmount != 0) revert PriorStakeNotCleared();
@@ -1028,6 +1146,15 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///      (they must first complete `requestUnstakeOwner` →
     ///      `claimUnstakeOwner`, or be slashed, before the slot can be
     ///      transferred).
+    /// @dev CONSENT REQUIRED (issue #98). `newOwner` must have called
+    ///      `approveOwnerStakeBinding(vault)` on this contract first, else
+    ///      `BindingNotApproved`. The caller of the factory's `rotateOwner` is
+    ///      the OUTGOING owner, so `newOwner` is a parameter picked by someone
+    ///      else — see `BindingNotApproved` for the spend this blocks. The
+    ///      approval is single-use: it is consumed here, so a second transfer
+    ///      naming the same incoming owner needs a fresh one. UX consequence:
+    ///      a rotation is two transactions across two contracts (approve on
+    ///      sWOOD, then rotate on the factory).
     /// @dev nonReentrant dropped — no external calls after state write.
     function transferOwnerStakeSlot(address vault, address newOwner) external onlyFactory {
         OwnerStake storage existing = _ownerStakes[vault];
@@ -1037,10 +1164,13 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
         PreparedOwnerStake storage p = _prepared[newOwner];
         if (p.amount == 0 || p.bound) revert PreparedStakeNotFound();
         if (p.amount < minOwnerStake) revert OwnerBondInsufficient();
+        if (approvedBindVault[newOwner] != vault) revert BindingNotApproved();
 
         _ownerStakes[vault] =
             OwnerStake({stakedAmount: p.amount, unstakeRequestedAt: 0, owner: newOwner, cooldownAtRequest: 0});
         p.bound = true;
+        // Consume: one consent authorizes exactly one bind.
+        delete approvedBindVault[newOwner];
 
         emit OwnerStakeSlotTransferred(vault, oldOwner, newOwner);
     }

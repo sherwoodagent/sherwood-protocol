@@ -67,6 +67,19 @@ interface IStakedWood {
     function bindOwnerStake(address owner, address vault) external;
     function requestUnstakeOwner(address vault) external;
     function claimUnstakeOwner(address vault) external;
+
+    /// @notice Consent to having your prepared owner stake bound to `vault` by
+    ///         the factory's owner-rotation flow (issue #98). Callable only by
+    ///         the prospective owner themselves; one approved vault per
+    ///         address, overwritten on re-approval, consumed by the bind.
+    function approveOwnerStakeBinding(address vault) external;
+
+    /// @notice Withdraw a previously granted binding consent.
+    function revokeOwnerStakeBinding() external;
+
+    /// @notice Re-point a vault's owner-stake slot to `newOwner`'s prepared
+    ///         stake. Reverts `BindingNotApproved` unless `newOwner` approved
+    ///         exactly `vault` first.
     function transferOwnerStakeSlot(address vault, address newOwner) external;
 
     /// @notice The owner bond a vault must hold. TVL scaling is not implemented
@@ -122,6 +135,10 @@ interface IStakedWood {
     function totalGuardianStake() external view returns (uint256);
     function preparedStakeOf(address owner) external view returns (uint256);
     function canCreateVault(address owner) external view returns (bool);
+
+    /// @notice The single vault `owner` has consented to have their prepared
+    ///         stake bound to. Zero when there is no standing consent.
+    function approvedBindVault(address owner) external view returns (address);
 
     /// @notice The guardian unstake cooldown period. The registry reads this
     ///         in `setReviewPeriod` to enforce the cross-contract invariant

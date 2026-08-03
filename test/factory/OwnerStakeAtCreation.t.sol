@@ -248,6 +248,13 @@ contract OwnerStakeAtCreationTest is Test {
         address vault = _createAndUnstake();
         _prepareStake(newOwner);
 
+        // Issue #98: the rotation SPENDS `newOwner`'s escrow, so `newOwner`
+        // must consent to the binding first. Rotation is two transactions now.
+        // The negative case lives in
+        // test/audit-fixes/StakedWood_ownerStakeBindingConsent.t.sol.
+        vm.prank(newOwner);
+        swood.approveOwnerStakeBinding(vault);
+
         vm.prank(creator);
         factory.rotateOwner(vault, newOwner);
 

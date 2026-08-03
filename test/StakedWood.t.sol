@@ -831,6 +831,11 @@ contract StakedWoodTest is Test {
         vm.prank(newOwner);
         swood.prepareOwnerStake(1_000e18);
 
+        // Consent: the incoming owner must approve the binding before the
+        // factory can spend their escrow (issue #98).
+        vm.prank(newOwner);
+        swood.approveOwnerStakeBinding(vault);
+
         // `claimUnstakeOwner` deleted `_ownerStakes[vault]`, so `existing.owner`
         // is zero by the time the slot is re-pointed — `oldOwner` is address(0).
         vm.expectEmit(true, true, true, false);
