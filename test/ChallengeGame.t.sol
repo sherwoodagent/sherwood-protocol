@@ -1247,18 +1247,20 @@ contract ChallengeGameTest is Test {
     ///         `slashToEscrow` burned the victims' compensation instead of
     ///         bubbling; the burn removed that child, and what the floor now
     ///         protects is the best-effort `demoteByChallenge` that runs AFTER
-    ///         the slash.
+    ///         the slash — structurally, via `DEMOTION_GAS`, since issue #51
+    ///         (openspec settle-demotion-gas-floor).
     function test_resolve_enforcesTheSlashGasFloor() public {
         uint256 id = _fileStandard(PROPOSAL);
         vm.warp(_filedAt(id) + game.autoSlashDelay());
 
-        // Two approvers -> floor = 2 * SLASH_GAS_PER_APPROVER + SLASH_GAS_BASE.
-        // Starve the call to just under it: ample for all the pre-floor work,
-        // never enough for the floor itself. Derived from the LIVE constants
-        // rather than hardcoded, so re-sizing the floor (PR #56 H2 did, from
-        // 300k/1M to 180k/2M) cannot quietly turn this into an out-of-gas test
-        // that passes for the wrong reason.
-        uint256 starved = 2 * game.SLASH_GAS_PER_APPROVER() + game.SLASH_GAS_BASE() - 100_000;
+        // Two approvers, adapter named (`_fileStandard`) -> floor =
+        // 2 * SLASH_GAS_PER_APPROVER + SLASH_GAS_BASE + DEMOTION_GAS. Starve
+        // the call to just under it: ample for all the pre-floor work, never
+        // enough for the floor itself. Derived from the LIVE constants rather
+        // than hardcoded, so re-sizing the floor (PR #56 H2 did, from 300k/1M
+        // to 180k/2M; issue #51 added the DEMOTION_GAS term) cannot quietly
+        // turn this into an out-of-gas test that passes for the wrong reason.
+        uint256 starved = 2 * game.SLASH_GAS_PER_APPROVER() + game.SLASH_GAS_BASE() + game.DEMOTION_GAS() - 100_000;
         bytes memory callData = abi.encodeWithSelector(game.resolve.selector, id);
         (bool ok, bytes memory ret) = address(game).call{gas: starved}(callData);
         assertFalse(ok, "a gas-starved resolve must not settle");
@@ -1269,6 +1271,70 @@ contract ChallengeGameTest is Test {
         swood.setNextResult(9_999e18);
         game.resolve(id);
         assertEq(swood.callCount(), 1, "the retry lost nothing");
+    }
+
+    /// @notice Issue #51's reproduction, in its honest form (openspec
+    ///         settle-demotion-gas-floor — the literal "silent miss converts
+    ///         to a clean revert" scenario cannot be built because the silent
+    ///         miss was never reachable, see design.md). What CAN be shown: a
+    ///         gas budget that would have cleared the pre-#51 floor (slash
+    ///         terms alone) — the exact budget the issue argued a caller could
+    ///         dial to land the conviction while starving the demotion — is
+    ///         now refused outright, before the slash ever runs. Only a budget
+    ///         that also affords the demotion is accepted, and that budget
+    ///         both slashes and demotes.
+    function test_resolve_refusesABudgetThatClearsOnlyTheOldFloor() public {
+        uint256 id = _fileStandard(PROPOSAL);
+        vm.warp(_filedAt(id) + game.autoSlashDelay());
+
+        uint256 oldFloor = 2 * game.SLASH_GAS_PER_APPROVER() + game.SLASH_GAS_BASE();
+        uint256 newFloor = oldFloor + game.DEMOTION_GAS();
+        uint256 budget = oldFloor + 50_000;
+        assertLt(budget, newFloor, "the probed budget must sit strictly below the extended floor");
+
+        bytes memory callData = abi.encodeWithSelector(game.resolve.selector, id);
+        (bool ok, bytes memory ret) = address(game).call{gas: budget}(callData);
+        assertFalse(ok, "a budget that only clears the pre-#51 floor must not settle");
+        assertEq(bytes4(ret), IChallengeGame.InsufficientSlashGas.selector, "refused at the extended floor, not an OOG");
+        assertEq(swood.callCount(), 0, "no state moved on the refused attempt");
+
+        // Retry with honest gas: the conviction lands AND the demotion
+        // succeeds. `demoteCount() == 1` is exclusive with
+        // `AdapterDemotionFailed` (the try/catch takes exactly one branch),
+        // so it alone proves the demotion was not silently dropped.
+        swood.setNextResult(9_999e18);
+        game.resolve(id);
+        assertEq(swood.callCount(), 1, "the retry slashes");
+        assertEq(tiers.demoteCount(), 1, "and the retry demotes - no silent miss");
+    }
+
+    /// @notice The `DEMOTION_GAS` term is owed only where a demotion is owed.
+    ///         A zero-adapter filing demotes nothing, so a gas budget between
+    ///         the slash-only floor and what would be the adapter-naming
+    ///         floor still settles cleanly — the term is not charged where
+    ///         nothing is at risk of starving.
+    function test_resolve_noAdapterFloorDoesNotChargeDemotionGas() public {
+        _setCoverage(PROPOSAL, 6_000e18, 4_000e18);
+        _execute(PROPOSAL);
+        vm.prank(challenger);
+        uint256 id = game.file(
+            address(gov), PROPOSAL, IChallengeGame.Predicate.OraclePriceDeviation, address(0), bytes4(0), EVIDENCE
+        );
+        vm.warp(_filedAt(id) + game.autoSlashDelay());
+
+        uint256 slashOnlyFloor = 2 * game.SLASH_GAS_PER_APPROVER() + game.SLASH_GAS_BASE();
+        // Comfortably above the slash-only floor but well below what the
+        // extended (adapter-naming) floor would have required — if the
+        // no-adapter branch were mistakenly charged DEMOTION_GAS, this budget
+        // would be refused.
+        uint256 budget = slashOnlyFloor + game.DEMOTION_GAS() / 2;
+        swood.setNextResult(9_999e18);
+
+        bytes memory callData = abi.encodeWithSelector(game.resolve.selector, id);
+        (bool ok,) = address(game).call{gas: budget}(callData);
+        assertTrue(ok, "a no-adapter settle must not be charged the demotion term");
+        assertEq(swood.callCount(), 1, "still slashed");
+        assertEq(tiers.demoteCount(), 0, "nothing named, nothing demoted");
     }
 
     function test_resolve_revertsOnATerminalOrUnknownChallenge() public {
