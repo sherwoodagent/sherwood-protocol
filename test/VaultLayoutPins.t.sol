@@ -80,8 +80,7 @@ contract VaultLayoutPinsTest is Test {
         SyndicateVault impl = new SyndicateVault();
         bytes memory init = abi.encodeCall(
             SyndicateVault.initialize,
-            (
-                ISyndicateVault.InitParams({
+            (ISyndicateVault.InitParams({
                     asset: address(asset),
                     name: "Sherwood Vault",
                     symbol: "swUSDC",
@@ -90,8 +89,7 @@ contract VaultLayoutPinsTest is Test {
                     openDeposits: false,
                     agentRegistry: address(0), // no ERC-8004 registry wired
                     managementFeeBps: MANAGEMENT_FEE_BPS
-                })
-            )
+                }))
         );
         // This test contract deploys the proxy, so it becomes `_factory`
         // (msg.sender at `initialize`) — same convention `GovernorLayoutPinsTest`
@@ -149,9 +147,7 @@ contract VaultLayoutPinsTest is Test {
 
         assertEq(uint256(_slot(1)), 1, "slot 1: _agentSet._inner._values.length");
         bytes32 posDerived = keccak256(abi.encode(AGENT_SENTINEL, uint256(2)));
-        assertEq(
-            uint256(vm.load(address(vault), posDerived)), 1, "slot 2: _agentSet._inner._positions base slot moved"
-        );
+        assertEq(uint256(vm.load(address(vault), posDerived)), 1, "slot 2: _agentSet._inner._positions base slot moved");
     }
 
     // ==================== 3: _executorImpl ====================
