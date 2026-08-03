@@ -458,23 +458,66 @@ contract SyndicateVault is
     }
 
     /// @inheritdoc ISyndicateVault
-    /// @dev Every delegatecall re-verifies that `_executorImpl`'s bytecode
-    ///      still matches the hash stamped at init. A factory misconfig or a
-    ///      swapped executor address cannot deflect the delegatecall to a
-    ///      different library.
-    /// @dev Gated by `whenNotPaused`. When the owner pauses the vault,
-    ///      strategy execution is halted alongside LP flow.
+    /// @dev TRANSITIONAL shim (issue #43 §5 deletes this): applies the same
+    ///      access/reentrancy/pause gates as the 3-arg overload, then forwards
+    ///      to the shared body with an EMPTY `callCaps` — i.e. per-call
+    ///      metering skipped. This overload predates per-call caps entirely,
+    ///      so it carries no propose-time declaration to enforce. Kept only so
+    ///      callers mid-migration to the 3-arg ABI keep compiling; deleted
+    ///      once every caller (governor + tests) has moved to the 3-arg form.
     function executeGovernorBatch(BatchExecutorLib.Call[] calldata calls, uint256 maxNetOutflow)
         external
         onlyGovernor
         nonReentrant
         whenNotPaused
     {
+        _executeGovernorBatch(calls, new uint256[](0), maxNetOutflow);
+    }
+
+    /// @inheritdoc ISyndicateVault
+    /// @dev Every delegatecall re-verifies that `_executorImpl`'s bytecode
+    ///      still matches the hash stamped at init. A factory misconfig or a
+    ///      swapped executor address cannot deflect the delegatecall to a
+    ///      different library.
+    /// @dev Gated by `whenNotPaused`. When the owner pauses the vault,
+    ///      strategy execution is halted alongside LP flow.
+    function executeGovernorBatch(
+        BatchExecutorLib.Call[] calldata calls,
+        uint256[] calldata callCaps,
+        uint256 maxNetOutflow
+    ) external onlyGovernor nonReentrant whenNotPaused {
+        _executeGovernorBatch(calls, callCaps, maxNetOutflow);
+    }
+
+    /// @dev Shared body for both `executeGovernorBatch` overloads. `calls` is
+    ///      `calldata` (referenced directly, no copy, on this `private`
+    ///      function); `callCaps` is `memory` so the 2-arg shim's freshly
+    ///      allocated empty array and the 3-arg overload's forwarded calldata
+    ///      array (implicitly copied to memory) both bind without a second
+    ///      overload.
+    function _executeGovernorBatch(
+        BatchExecutorLib.Call[] calldata calls,
+        uint256[] memory callCaps,
+        uint256 maxNetOutflow
+    ) private {
         if (_executorImpl.codehash != _expectedExecutorCodehash) revert ExecutorCodehashMismatch();
         _guardBatchCalls(calls);
         uint256 balanceBefore = IERC20(asset()).balanceOf(address(this));
-        (bool success, bytes memory returnData) =
-            _executorImpl.delegatecall(abi.encodeCall(BatchExecutorLib.executeBatch, (calls)));
+        // `abi.encodeWithSelector` (not `abi.encodeCall`) because
+        // `BatchExecutorLib.executeBatch` is overloaded during the issue #43
+        // migration window (the unmetered 1-arg overload is kept until §5
+        // deletes it) — `abi.encodeCall`'s bare `Contract.function` reference
+        // is ambiguous across overloads, while the selector below names the
+        // metered 3-arg signature explicitly. Revert to `abi.encodeCall` once
+        // §5 removes the unmetered overload.
+        (bool success, bytes memory returnData) = _executorImpl.delegatecall(
+            abi.encodeWithSelector(
+                bytes4(keccak256("executeBatch((address,bytes,uint256)[],address,uint256[])")),
+                calls,
+                asset(),
+                callCaps
+            )
+        );
         if (!success) {
             assembly {
                 revert(add(returnData, 32), mload(returnData))
@@ -513,6 +556,26 @@ contract SyndicateVault is
         // Idle-liquidity floor: a batch may deploy at most (1 − minBufferBps)
         // of the pre-batch float. Inflow (settle) batches pass trivially.
         if (balanceAfter < reserve + (balanceBefore * minBufferBps) / 10_000) revert BufferBreached();
+    }
+
+    /// @inheritdoc ISyndicateVault
+    /// @notice Re-point the shared `BatchExecutorLib` and re-stamp its
+    ///         expected codehash, atomically. The migration primitive for the
+    ///         deploy-once-and-share library (issue #43, design.md D5):
+    ///         reached only through the factory's lifecycle-gated
+    ///         `pushExecutor`, never called directly by anyone else.
+    /// @dev Factory-only. Rejects zero and codeless targets — a swapped-in
+    ///      address with no code would pass every future `codehash` check
+    ///      vacuously (an EOA's codehash is the empty-code hash, and the very
+    ///      next delegatecall would just no-op against it), silently
+    ///      disabling batch execution instead of failing loudly here.
+    function setExecutorImpl(address newImpl) external {
+        if (msg.sender != _factory) revert NotFactory();
+        if (newImpl == address(0) || newImpl.code.length == 0) revert InvalidExecutorImpl();
+        address old = _executorImpl;
+        _executorImpl = newImpl;
+        _expectedExecutorCodehash = newImpl.codehash;
+        emit ExecutorImplSet(old, newImpl);
     }
 
     /// @dev Two-part batch gate: a privileged-TARGET denylist (Part 1, always
