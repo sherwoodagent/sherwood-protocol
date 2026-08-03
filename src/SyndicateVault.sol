@@ -514,7 +514,41 @@ contract SyndicateVault is
         if (balanceAfter < reserve + (balanceBefore * minBufferBps) / 10_000) revert BufferBreached();
     }
 
-    /// @dev Value-moving-selector allowlist gate.
+    /// @dev Two-part batch gate: a privileged-TARGET denylist (Part 1, always
+    ///      runs), then the value-moving-SELECTOR allowlist (Part 2, registry-
+    ///      dependent). The two are independent — do not collapse them, and do
+    ///      not move Part 1 below Part 2's registry lookup. See the block
+    ///      comments in the body for the adversary each part answers.
+    ///
+    ///      ── PART 1: privileged-target denylist ──
+    ///
+    ///      WHY TARGETS TOO: selector-guarding is not enough, because this
+    ///      adversary needs no value-moving selector at all. The batch runs via
+    ///      delegatecall, so every sub-call reaches its target carrying
+    ///      msg.sender == vault — exactly what the withdrawal queue's
+    ///      `onlyVault` gate checks. `queue.queueRedeem(attacker, victimShares,
+    ///      pid)` therefore clears that gate and mints the attacker a claim on
+    ///      shares the queue already escrows for someone else, while every other
+    ///      guard reads it as harmless: the queue's entrypoints move ZERO vault
+    ///      asset() in-tx (the value leaves later via `queue.claim`), so the
+    ///      net-outflow meter, the queue-reserve floor and the buffer floor all
+    ///      see nothing, and coverage prices an uncertified target at tier 2 —
+    ///      requiredCoverage == maxCapital, a price a 1-wei proposal buys.
+    ///      Blocked as a target CLASS rather than a selector list, so the next
+    ///      privileged queue function is covered by default.
+    ///
+    ///      UNCONDITIONAL: Part 1 runs above Part 2's registry staticcall and
+    ///      above BOTH of its degrade-open returns. That is deliberate and is
+    ///      the point of the fix: a queue steal is not priced, it is theft, so
+    ///      a registry-less governor must not be able to skip it.
+    ///
+    ///      SCOPE: exactly two addresses — the vault and its bound queue. NOT a
+    ///      target allowlist. Strategy adapters' own `onlyVault` entrypoints
+    ///      (`BaseStrategy.execute/settle/withdrawTo`) are the LEGITIMATE batch
+    ///      surface and stay open, bounded by Part 2, the outflow meter and tier
+    ///      pricing as before.
+    ///
+    ///      ── PART 2: value-moving-selector allowlist gate ──
     ///
     ///      WHY: the net-outflow meter above only sees the vault's own asset()
     ///      balance delta. `token.approve(attacker, max)` moves no balance, so
@@ -543,11 +577,70 @@ contract SyndicateVault is
     ///      gated (or reverts `MalformedCall`) conservatively.
     ///
     ///      UNSET REGISTRY: if the governor has no tier registry wired (or
-    ///      predates the getter), the guard cannot run and the batch is
-    ///      unguarded by design — the default is tier-2 / full-notional pricing
-    ///      anyway, and hard-reverting would brick vaults deployed without a
-    ///      registry.
+    ///      predates the getter), PART 2 cannot run and that half is skipped by
+    ///      design — the default is tier-2 / full-notional pricing anyway, and
+    ///      hard-reverting would brick vaults deployed without a registry.
+    ///      PART 1 IS NOT AFFECTED: it needs no registry, sits above both early
+    ///      returns, and still rejects the vault and its queue. Pinned by
+    ///      `test_targetGate_bitesEvenWithNoTierRegistryWired` (unset registry)
+    ///      and `test_targetGate_bitesEvenWhenGovernorHasNoTierGetter` (missing
+    ///      getter) — one per degrade-open branch, so relocating Part 1 below
+    ///      either return fails a test instead of silently re-opening the hole.
     function _guardBatchCalls(BatchExecutorLib.Call[] calldata calls) private view {
+        // ── PRIVILEGED-CALLEE GATE, ahead of everything else ──
+        //
+        // The batch runs under delegatecall, so every call carries
+        // `msg.sender == vault`. For the QUEUE that is decisive: its `onlyVault`
+        // gate is satisfied by a batch that merely names it as a target.
+        //
+        // For the VAULT the reason is different, and worth stating precisely so
+        // nobody re-permits it on a wrong premise. `msg.sender == vault` does
+        // NOT open this contract's self-gated functions: `settleRedeem` /
+        // `settleDeposit` require `msg.sender == _withdrawalQueue`, which the
+        // vault is not, and it satisfies neither `onlyOwner`, `onlyGovernor` nor
+        // the factory gate. The exposure is the PERMISSIONLESS surface instead —
+        // chiefly `requestDeposit`, which anyone may call: a batch naming the
+        // vault can escrow the vault's own float into the queue while directing
+        // the resulting deposit claim to an attacker (it self-approves first,
+        // which Part 2 permits, since `recipient == address(this)` is treated as
+        // an inflow). That one IS metered — the float genuinely leaves, so the
+        // net-outflow ceiling bounds it to maxCapital — which is why blocking
+        // the vault is defense-in-depth rather than a second live hole. It
+        // removes the standing dependency on "no permissionless entrypoint ever
+        // becomes dangerous to call as ourselves".
+        //
+        // No other meter catches it. `queue.queueRedeem(attacker, victimShares,
+        // pid)` mints a redeem claim against shares another owner escrowed
+        // while moving ZERO `asset()`: `netOutflow == 0` clears any
+        // `maxNetOutflow`, the reserve and buffer checks compare balances that
+        // never moved, and the selector is none of the four guarded below. The
+        // value leaves in a LATER transaction via `queue.claim`, which nothing
+        // meters. Coverage does not price it either — an uncertified target is
+        // tier 2, so `maxCapital = 1 wei` asks for ~$0.000002 of coverage, and
+        // any single approver clears that.
+        //
+        // BEFORE THE REGISTRY LOOKUP, DELIBERATELY. The selector guard below
+        // returns early for a governor with no `tierRegistry()` getter or an
+        // unset registry, and being unguarded there is a documented, accepted
+        // default. This check must not inherit that exemption: it is not
+        // pricing a call, it is refusing a capability, and a vault deployed
+        // without a registry needs it most.
+        //
+        // A TARGET CLASS, NOT A SELECTOR LIST. Enumerating today's reachable
+        // privileged functions would leave the next one added unprotected, and
+        // nothing a batch legitimately does names these two addresses as a
+        // target. `stampSettlement` shows why breadth matters — it is one-shot
+        // per pid, so one batch can pre-burn the settlement slot of proposals
+        // that have not happened yet and make `onProposalSettled` revert
+        // forever.
+        address q = _withdrawalQueue;
+        for (uint256 i = 0; i < calls.length; i++) {
+            address target = calls[i].target;
+            if (target == address(this) || (q != address(0) && target == q)) {
+                revert DisallowedBatchTarget(target);
+            }
+        }
+
         // onlyGovernor holds, so msg.sender IS the governor. staticcall (not a
         // typed call) so a governor without the getter degrades to "unset".
         (bool ok, bytes memory ret) = msg.sender.staticcall(abi.encodeCall(ISyndicateGovernor.tierRegistry, ()));

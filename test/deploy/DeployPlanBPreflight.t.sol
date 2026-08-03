@@ -632,6 +632,91 @@ contract DeployPlanBPreflightTest is Test {
         assertEq(ExposureLedger(swood.exposureLedger()).woodHaircutBps(), 6_000, "an override must be seated");
     }
 
+    // ─────────────── pre-flight 10: the ledger owner (issue #89) ───────────────
+    //
+    // WHAT THESE TWO TESTS ESTABLISH, AND WHAT THEY DELIBERATELY DO NOT.
+    //
+    // Issue #89 deleted the in-contract rate limit on `setWoodUsdPrice` and
+    // `setWoodHaircutBps` and moved it to a Zodiac Delay/Roles module on the
+    // owner Safe. Pre-flight 10 is the only on-chain trace of that requirement,
+    // and it checks exactly one thing: the ledger owner is a CONTRACT, not a
+    // bare EOA. These tests pin that, and nothing more.
+    //
+    // DO NOT "IMPROVE" THIS INTO A MODULE PROBE. That was considered and
+    // rejected on the merged design, and `openspec/specs/deployment-docs/spec.md`
+    // records the reasoning: pre-flight 10
+    //
+    //   "deliberately does not probe for modules: enumerating a Safe's modules
+    //    would prove only that *some* module is attached, not that the delay is
+    //    asymmetric, and a probe that appears to verify the requirement while
+    //    verifying something weaker is worse than none."
+    //
+    // The property that actually matters — the delay must be ASYMMETRIC, raises
+    // delayed and drops immediate — is not expressible on chain at all, because
+    // a Roles modifier cannot compare an argument against current on-chain
+    // state. It stays a runbook obligation verified by a human before launch.
+    // A test asserting `getModulesPaginated` returns a non-empty page would look
+    // like coverage of the Zodiac requirement while covering something strictly
+    // weaker, which is the failure mode the spec is warning about.
+
+    /// @dev THE PASSING BRANCH. The harness etches a forwarder at
+    ///      `DEFAULT_SENDER` (see `PlanBScriptCaller`), so the broadcaster — and
+    ///      therefore the ledger owner — genuinely has code, which is the shape
+    ///      pre-flight 10 is built to accept.
+    ///
+    ///      This test also PINS THE CREATE PREDICTION that the EOA test below
+    ///      depends on. The ledger is the first contract the broadcaster creates
+    ///      inside `vm.startBroadcast` (`DeployPlanB.s.sol:531`), so its address
+    ///      is `computeCreateAddress(DEFAULT_SENDER, nonce)`. Asserting it here
+    ///      means a broken prediction is diagnosed by THIS test, rather than
+    ///      surfacing as a mysteriously silent mock in the next one.
+    function test_preflight10_passes_whenTheLedgerOwnerIsAContract() public {
+        address predicted = vm.computeCreateAddress(DEFAULT_SENDER, vm.getNonce(DEFAULT_SENDER));
+
+        _run();
+
+        address ledger = swood.exposureLedger();
+        assertEq(ledger, predicted, "ledger must be the broadcaster's first CREATE -- the EOA test relies on it");
+        assertEq(ExposureLedger(ledger).owner(), DEFAULT_SENDER, "the broadcaster owns the ledger it deployed");
+        assertTrue(DEFAULT_SENDER.code.length != 0, "pre-flight 10's condition: the owner is a contract");
+    }
+
+    /// @dev THE REFUSING BRANCH, and the state a real deployment starts in:
+    ///      `DeployPlanB` deploys the ledger owned by the broadcaster, so a run
+    ///      from a plain deployer key leaves an EOA owning both price levers.
+    ///      With the in-contract limit gone that deployment carries NEITHER the
+    ///      on-chain control nor the off-chain one — and nothing in the source
+    ///      would hint anything is missing. Hence the refusal.
+    ///
+    ///      THE OWNER IS THE BROADCASTER, so this makes the broadcaster a
+    ///      genuine EOA rather than faking the read. The forwarder the other
+    ///      tests need exists only to make `deployer == msg.sender` equal the
+    ///      broadcast sender; here both are `DEFAULT_SENDER` already, so its
+    ///      code can be stripped and the call pranked from that same address —
+    ///      the owner-gated setters in the broadcast still run as the owner,
+    ///      and the run reaches the pre-flight for the right reason.
+    ///
+    ///      Mocking the ledger's `owner()` instead does NOT work, and the reason
+    ///      is worth recording: `vm.mockCall` gives the target account code, so
+    ///      mocking the not-yet-deployed ledger address makes the script's
+    ///      `new ExposureLedger(...)` collide with it and revert with no reason
+    ///      string — a failure that looks nothing like the refusal under test.
+    function test_preflight10_bites_whenTheLedgerOwnerIsABareEOA() public {
+        address predicted = vm.computeCreateAddress(DEFAULT_SENDER, vm.getNonce(DEFAULT_SENDER));
+        address eoa = address(0xE0A);
+        assertEq(eoa.code.length, 0, "the fixture must be a genuine EOA for this to mean anything");
+
+        vm.mockCall(predicted, abi.encodeWithSignature("owner()"), abi.encode(eoa));
+        // `vm.mockCall` gives the target account code, which would make the
+        // script's `new ExposureLedger(...)` collide with this very address and
+        // revert with no reason string (EIP-684). Clear the code again: the mock
+        // registration survives, so the CREATE lands and the pre-flight still
+        // reads the EOA.
+        vm.etch(predicted, "");
+
+        _runExpecting("PRE-FLIGHT: ExposureLedger owner is an EOA, not a contract.");
+    }
+
     // ─────────────────────────────── helpers ───────────────────────────────
 
     /// @dev THE ADDRESS BOOK IS PASSED, NOT SET IN THE ENVIRONMENT. `run()`'s
