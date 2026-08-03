@@ -197,6 +197,24 @@ contract MockStakedWood is IStakedWood {
         return _ownerStake[vault];
     }
 
+    /// @dev Anchor-aware slash basis (issue #35). DEFAULTS to live
+    ///      `guardianStake`, same pattern as `getPastStake`'s default: most
+    ///      fixtures do not care about the anchor distinction, so an
+    ///      unconfigured anchor reads as "the top-up already happened before
+    ///      this anchor too". Set explicitly to model a post-anchor top-up
+    ///      the anchored basis must exclude.
+    mapping(address => mapping(uint256 => uint256)) internal _slashableStakeAt;
+    mapping(address => mapping(uint256 => bool)) internal _slashableStakeAtSet;
+
+    function setSlashableStakeAt(address guardian, uint256 anchor, uint256 v) external {
+        _slashableStakeAt[guardian][anchor] = v;
+        _slashableStakeAtSet[guardian][anchor] = true;
+    }
+
+    function slashableStakeAt(address guardian, uint256 anchor) external view returns (uint256) {
+        return _slashableStakeAtSet[guardian][anchor] ? _slashableStakeAt[guardian][anchor] : _guardianStake[guardian];
+    }
+
     function preparedStakeOf(address owner) external view returns (uint256) {
         return _preparedStakeOf[owner];
     }

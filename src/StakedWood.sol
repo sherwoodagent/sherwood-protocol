@@ -1455,13 +1455,60 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
         emit VerdictSlashBurned(caseKey, total);
     }
 
+    /// @dev THE SHARED SLASH BASIS (issue #35). Returns exactly what
+    ///      `_slashOne` recovers from `guardian`'s own stake at `anchor`:
+    ///      `min(max(liability at anchor, votableStake at anchor), liveStake)`.
+    ///      LIABILITY, NOT VOTABILITY, for the snapshot leg — the liability
+    ///      trace, which `requestUnstakeGuardian` does not zero, so an
+    ///      approver cannot pre-position an exit before the drain it voted
+    ///      for and make its own conviction recover nothing. Maxed with the
+    ///      votable trace so the read degrades gracefully over history
+    ///      written before the liability trace existed. Clamped to LIVE
+    ///      stake so a concurrent slash that already reduced live stake below
+    ///      the at-anchor checkpoint is not double-recovered. One
+    ///      implementation for both the verdict slash (`_slashOne`) and the
+    ///      public view (`slashableStakeAt`), so the WOOD a coverage reader
+    ///      books and the WOOD a conviction actually takes cannot drift
+    ///      apart — see `ExposureLedger._slashableBondUsd`.
+    function _slashableAt(address guardian, uint256 anchor) internal view returns (uint256) {
+        uint256 live = _guardians[guardian].stakedAmount;
+        uint256 snapOwnRaw = Math.max(
+            _liabilityCheckpoints[guardian].upperLookupRecent(uint32(anchor)),
+            _stakeCheckpoints[guardian].upperLookupRecent(uint32(anchor))
+        );
+        return Math.min(snapOwnRaw, live);
+    }
+
+    /// @notice The WOOD a verdict slash anchored at `anchor` could recover
+    ///         from `guardian`'s own stake right now: `min(max(liability at
+    ///         anchor, votableStake at anchor), liveStake)`. Byte-for-byte the basis
+    ///         `_slashOne` sizes its per-approver take from — this view and
+    ///         the slash share `_slashableAt`, so they cannot drift apart.
+    /// @dev THE ADVERSARY THIS CLOSES (issue #35): a guardian who tops up its
+    ///      stake AFTER `anchor` must not have that top-up counted as
+    ///      coverage for a proposal whose verdict is already anchored in the
+    ///      past — the verdict can only ever reach the at-anchor checkpoint,
+    ///      clamped to live. `ExposureLedger`'s post-execution reads
+    ///      (`allocatedUsd`, `liabilityUsd`, `settleCoverage`) call this with
+    ///      `anchor = executedAt` instead of reading live `guardianStake`.
+    ///      Reverts `VerdictNotPast` on a future `anchor`, mirroring
+    ///      `slashVerdict`'s own guard — an honest caller only ever anchors
+    ///      at a real past instant, and the guard keeps the `uint32`
+    ///      checkpoint lookup from wrapping.
+    /// @param guardian The guardian whose own-stake slash basis is read.
+    /// @param anchor   The past timestamp the verdict is anchored at (e.g.
+    ///                 a proposal's `executedAt`).
+    function slashableStakeAt(address guardian, uint256 anchor) external view returns (uint256) {
+        if (anchor > block.timestamp) revert VerdictNotPast();
+        return _slashableAt(guardian, anchor);
+    }
+
     /// @dev Per-approver slash. Extracted to keep `slashGuardians`'s stack
     ///      frame shallow. Returns the WOOD slashed from `approver`: `slashBps`
-    ///      of the OWN stake, sized by the raw own-stake checkpoint at
-    ///      `openedAt` and clamped to live stake (a concurrent slash may have
-    ///      already reduced live stake below the at-open checkpoint). Age
-    ///      discounts VOTING POWER, not liability: the capital at risk is the
-    ///      staked amount.
+    ///      of the OWN stake, sized by `_slashableAt` at `openedAt` (the
+    ///      shared basis `slashableStakeAt` also exposes). Age discounts
+    ///      VOTING POWER, not liability: the capital at risk is the staked
+    ///      amount.
     ///      `reviewKey` only feeds the `GuardianSlashed` event topic.
     function _slashOne(bytes32 reviewKey, uint256 openedAt, address approver, uint256 slashBps)
         private
@@ -1469,17 +1516,7 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     {
         Guardian storage g = _guardians[approver];
         uint256 live = g.stakedAmount;
-        // LIABILITY, NOT VOTABILITY. Reads the liability
-        // trace, which `requestUnstakeGuardian` does not zero, so an approver
-        // cannot pre-position an exit before the drain it voted for and make its
-        // own conviction recover nothing. Maxed with the votable trace so the
-        // read degrades gracefully over history written before the liability
-        // trace existed.
-        uint256 snapOwnRaw = Math.max(
-            _liabilityCheckpoints[approver].upperLookupRecent(uint32(openedAt)),
-            _stakeCheckpoints[approver].upperLookupRecent(uint32(openedAt))
-        );
-        uint256 ownSlash = Math.mulDiv(Math.min(snapOwnRaw, live), slashBps, 10_000);
+        uint256 ownSlash = Math.mulDiv(_slashableAt(approver, openedAt), slashBps, 10_000);
 
         if (ownSlash != 0) {
             // forge-lint: disable-next-line(unchecked-cast)
