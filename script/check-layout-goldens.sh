@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # check-layout-goldens.sh — storage-layout golden guard for the beacon/proxy-upgraded
-# governance contracts (SyndicateGovernor, SyndicateFactory, GuardianRegistry).
+# governance contracts (SyndicateGovernor, SyndicateFactory, GuardianRegistry,
+# StakedWood, SyndicateVault).
 #
-# All three live behind upgradeable proxies (governor: beacon; factory + registry: UUPS), so
-# their storage layouts are FROZEN for deployed lineages: fields are append-only, gaps
-# shrink only from the front, and any reorder/insert/retype corrupts live state on the
-# next upgrade. This script pins the compiler-emitted layout (label, slot, offset, type
-# per variable — order significant) against committed golden JSON snapshots, mirroring
-# script/check-storage-parity.sh (the LeveragedAero seam guard).
+# All five live behind upgradeable proxies (governor: beacon; factory, registry,
+# StakedWood, vault: UUPS), so their storage layouts are FROZEN for deployed lineages:
+# fields are append-only, gaps shrink only from the front, and any reorder/insert/retype
+# corrupts live state on the next upgrade. This script pins the compiler-emitted layout
+# (label, slot, offset, type per variable — order significant) against committed golden
+# JSON snapshots, mirroring script/check-storage-parity.sh (the LeveragedAero seam guard).
 #
 # Fails loudly (exit 1) if either contract's live layout differs from its golden. After
 # a legitimate APPEND-ONLY change (e.g. a new param carved from a __gap), regenerate
@@ -227,6 +228,15 @@ check_contract GuardianRegistry script/guardian-registry-layout.golden.json
 # the gap when slash proceeds moved to a burn); pinned here so the next append
 # is checked automatically rather than by hand.
 check_contract StakedWood script/staked-wood-layout.golden.json
+# SyndicateVault is UUPS (upgrades factory-gated) and is the contract that
+# CUSTODIES LP ASSETS — a layout break here is fund-loss on the first
+# upgraded live proxy, not a bricked parameter. Pinned before any mainnet
+# vault exists (issue #148; owner confirmed no live vault proxy), so this
+# golden is the FIRST baseline, not a re-baseline. From the first real
+# deploy onward the layout is frozen and every change must be append-only
+# (carved from the front of __gap) against this golden. In-test twin:
+# test/VaultLayoutPins.t.sol.
+check_contract SyndicateVault script/syndicate-vault-layout.golden.json
 
 [ "${UPDATE_GOLDEN:-0}" = "1" ] ||
-  echo "layout-goldens: OK — SyndicateGovernor + SyndicateFactory + GuardianRegistry + StakedWood layouts match their goldens"
+  echo "layout-goldens: OK — SyndicateGovernor + SyndicateFactory + GuardianRegistry + StakedWood + SyndicateVault layouts match their goldens"
