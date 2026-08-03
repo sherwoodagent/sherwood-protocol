@@ -2,6 +2,7 @@
 pragma solidity 0.8.28;
 
 import {Test} from "forge-std/Test.sol";
+import {Vm} from "forge-std/Vm.sol";
 import {TokenCourt} from "../src/TokenCourt.sol";
 import {ITokenCourt} from "../src/interfaces/ITokenCourt.sol";
 import {IChallengeGame} from "../src/interfaces/IChallengeGame.sol";
@@ -1277,6 +1278,307 @@ contract TokenCourtTest is Test {
     ///         NUMERATOR already ages stake over.
     function test_floorLookback_isAThirtyDayConstant() public view {
         assertEq(court.FLOOR_LOOKBACK(), 30 days);
+    }
+
+    // ── issue #96: the accused subtraction clamps at zero ──
+
+    /// @dev Opens a referable case whose ONLY accused approver carries
+    ///      `accusedStake` of raw own stake at the snapshot, against a fixed
+    ///      1_000e18 electorate base. Nothing is staked a `FLOOR_LOOKBACK`
+    ///      earlier, so the `earlier == 0` fallback stands the snapshot total
+    ///      up and the base is a clean 1_000e18 — the whole floor then turns
+    ///      on the accused subtraction alone, which is the subject here.
+    ///      Takes an explicit `challengeId` so several cases can be referred
+    ///      at the SAME timestamp (hence the same `snapshotTs`) and compared
+    ///      against each other with nothing else varying.
+    /// @param challengeId  A challenge id not yet referred on `game`.
+    /// @param accused      The sole covering approver, recorded as accused.
+    /// @param accusedStake Its raw `getPastStake` at `snapshotTs`, i.e. the
+    ///                     case's `accusedWeight`.
+    function _caseWithAccusedWeight(uint256 challengeId, address accused, uint256 accusedStake)
+        internal
+        returns (uint256 caseId, uint256 snap)
+    {
+        game.setChallenge(
+            challengeId,
+            governor,
+            PROPOSAL_ID,
+            IChallengeGame.Status.Disputed,
+            vm.getBlockTimestamp(),
+            30 days,
+            vm.getBlockTimestamp() - 1 days
+        );
+        address[] memory a = new address[](1);
+        uint256[] memory cm = new uint256[](1);
+        a[0] = accused;
+        cm[0] = 100e18; // committed USD, nonzero so `accused` is in the accused set
+        ledger.setApprovers(a, cm);
+
+        snap = vm.getBlockTimestamp() - 1 days - 1;
+        swood.setPastStake(accused, snap, accusedStake);
+
+        caseId = court.refer(challengeId);
+        assertEq(court.caseOf(caseId).snapshotTs, snap, "snapshotTs is executedAt - 1");
+        assertEq(court.caseOf(caseId).accusedWeight, accusedStake, "accused raw stake recorded");
+
+        swood.setPastTotalVotes(snap, 1_000e18);
+    }
+
+    /// @dev Finalizes and returns the floor the case actually resolved
+    ///      against, read off `CaseFinalized` rather than recomputed — the
+    ///      floor is not stored on the `Case`, and recomputing it in the test
+    ///      would just restate the implementation instead of pinning it.
+    function _finalizeAndReadFloor(uint256 caseId) internal returns (uint256 floor, IChallengeGame.Verdict verdict) {
+        vm.recordLogs();
+        court.finalize(caseId);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i; i < logs.length; ++i) {
+            if (logs[i].emitter != address(court)) continue;
+            if (logs[i].topics[0] != ITokenCourt.CaseFinalized.selector) continue;
+            if (uint256(logs[i].topics[1]) != caseId) continue;
+            (uint8 v,,, uint256 f) = abi.decode(logs[i].data, (uint8, uint256, uint256, uint256));
+            return (f, IChallengeGame.Verdict(v));
+        }
+        revert("CaseFinalized was not emitted for this case");
+    }
+
+    /// @notice ISSUE #96, AS A REGRESSION TEST: THE FLOOR MUST NOT JUMP UP
+    ///         WHEN `accusedWeight` CROSSES THE ELECTORATE BASE.
+    ///
+    ///         Pre-fix, `_participationFloor` skipped the subtraction entirely
+    ///         when `accusedWeight >= base` and used the FULL unreduced base
+    ///         instead, so the floor was non-monotone: it shrank toward zero
+    ///         as the accused cohort approached the base, then snapped to its
+    ///         maximum at the crossing. The adversary is the accused set
+    ///         itself, which controls `accusedWeight` by staking more before
+    ///         its own drain (inside `FLOOR_LOOKBACK`, so the lookback min can
+    ///         hold the base down while `accusedWeight` climbs past it): one
+    ///         extra wei of stake bought a floor beyond any achievable turnout
+    ///         and a forced `Inconclusive` — no slash, no `_convicted` mark,
+    ///         no adapter demotion, counter-bond returned whole.
+    ///
+    ///         Three otherwise identical cases, referred in the same block so
+    ///         they share a `snapshotTs` and a 1_000e18 base, differing only
+    ///         in `accusedWeight`: 999e18 (below), 1_000e18 (exactly at), and
+    ///         1_001e18 (above).
+    ///
+    ///         MUTATION-CHECKED: restoring the `: base` fallback finalizes the
+    ///         last two against a 100e18 floor instead of 0, failing both the
+    ///         exact-value and the non-increasing assertions.
+    function test_finalize_floorIsMonotoneAcrossTheAccusedWeightBoundary() public {
+        (uint256 below,) = _caseWithAccusedWeight(CHALLENGE_ID, makeAddr("accusedBelowBase"), 999e18);
+        (uint256 atBase,) = _caseWithAccusedWeight(CHALLENGE_ID + 1, makeAddr("accusedAtBase"), 1_000e18);
+        (uint256 above,) = _caseWithAccusedWeight(CHALLENGE_ID + 2, makeAddr("accusedAboveBase"), 1_001e18);
+
+        vm.warp(vm.getBlockTimestamp() + 5 days);
+
+        (uint256 floorBelow,) = _finalizeAndReadFloor(below);
+        (uint256 floorAtBase,) = _finalizeAndReadFloor(atBase);
+        (uint256 floorAbove,) = _finalizeAndReadFloor(above);
+
+        assertEq(floorBelow, 0.1e18, "10% of (1_000e18 - 999e18)");
+        assertEq(floorAtBase, 0, "clamped to zero at the crossing, not fallen back to the unreduced base");
+        assertEq(floorAbove, 0, "still clamped one whole WOOD past the crossing");
+
+        assertLe(floorAtBase, floorBelow, "the floor must not jump up as accusedWeight reaches the base");
+        assertLe(floorAbove, floorAtBase, "nor as it passes the base");
+    }
+
+    /// @notice ISSUE #96: THE DENIAL LEVER IS CLOSED. With the accused cohort
+    ///         at or above the whole electorate base the floor is zero, so a
+    ///         single unaccused voter — 1e18 of aged weight, dust against the
+    ///         100e18 floor the pre-fix fallback would have imposed — carries
+    ///         the case to a verdict on the merits. That is the correct
+    ///         continuous limit of the subtraction (at `accusedWeight = base -
+    ///         1` the floor is already dust) and the right answer when the
+    ///         accused cohort IS the electorate: whoever is left unaccused is
+    ///         the jury. Pre-fix this same fixture returned `Inconclusive`,
+    ///         which is precisely what the accused was buying.
+    function test_finalize_accusedOutweighingTheElectorateCannotDenyAVerdict() public {
+        (uint256 id, uint256 snap) = _caseWithAccusedWeight(CHALLENGE_ID, makeAddr("accusedWhale"), 1_000e18);
+
+        address dust = makeAddr("dustVoter");
+        swood.setPastVotes(dust, snap, 1e18);
+        vm.prank(dust);
+        court.vote(id, true);
+        vm.warp(vm.getBlockTimestamp() + 5 days);
+
+        vm.expectEmit(true, false, false, true);
+        emit ITokenCourt.CaseFinalized(id, IChallengeGame.Verdict.Guilty, 1e18, 0, 0);
+        court.finalize(id);
+
+        assertEq(
+            uint256(court.caseOf(id).verdict),
+            uint256(IChallengeGame.Verdict.Guilty),
+            "an accused cohort outweighing the base must not buy a denial"
+        );
+        assertTrue(game.ruled(), "the verdict reached the game");
+    }
+
+    /// @notice ISSUE #96: A ZERO FLOOR NEVER RESOLVES AN EMPTY VOTE. The
+    ///         clamp does not weaken the anti-capture property it looks like
+    ///         it might, because the floor was never the guard against a
+    ///         silent electorate: `finalize`'s `turnout == 0` check sits ahead
+    ///         of the `turnout < floor` comparison and forces `Inconclusive`
+    ///         regardless. Same fixture as the test above, no ballots cast —
+    ///         `0 < 0` is false, so the verdict here is carried by the guard
+    ///         alone, and the emitted floor of 0 shows which branch fired.
+    function test_finalize_zeroFloorStillInconclusiveOnAnEmptyVote() public {
+        (uint256 id,) = _caseWithAccusedWeight(CHALLENGE_ID, makeAddr("accusedWhale"), 1_000e18);
+        vm.warp(vm.getBlockTimestamp() + 5 days);
+
+        vm.expectEmit(true, false, false, true);
+        emit ITokenCourt.CaseFinalized(id, IChallengeGame.Verdict.Inconclusive, 0, 0, 0);
+        court.finalize(id);
+
+        assertEq(
+            uint256(court.caseOf(id).verdict),
+            uint256(IChallengeGame.Verdict.Inconclusive),
+            "the turnout == 0 guard, not the floor, carries the empty vote"
+        );
+    }
+
+    /// @notice AUDIT FINDING (PR #120, confidence 92): THE `: 0` CLAMP ALONE
+    ///         COLLAPSES THE FLOOR TO ZERO UNDER ORDINARY ELECTORATE GROWTH —
+    ///         NO ATTACKER REQUIRED. THIS IS THE REGRESSION FOR THE FIX, NOT
+    ///         FOR THE ORIGINAL BUG.
+    ///
+    ///         Every test above shares one property the audit caught: `earlier`
+    ///         is never set, so `getPastTotalVotes(lookbackTs)` reads its
+    ///         zero-checkpoint default and every one of them resolves through
+    ///         the `earlier == 0` fallback (`base = total`). None of them
+    ///         exercises `earlier != 0 && earlier < total` — the regime the
+    ///         production formula actually lands in whenever the protocol has
+    ///         grown over the lookback window, which is the common case, not
+    ///         an edge case.
+    ///
+    ///         The bug the audit found: an EARLIER buggy revision subtracted
+    ///         `accusedWeight` from `min(earlier, total)` — mixing an
+    ///         `accusedWeight` measured NOW against an electorate measured a
+    ///         month ago. In a growing protocol, "the accused today" routinely
+    ///         exceeds "the whole electorate a month ago" with zero attacker
+    ///         action, so that formula read `base <= accusedWeight` and
+    ///         returned a floor of ZERO while a large, honest, unaccused
+    ///         electorate stood by unable to move it — worse than the original
+    ///         bug, because a `NotGuilty` bought this way is terminal (the
+    ///         forfeited bond routes to the accused's own counter-bond
+    ///         funders and the proposal becomes permanently unchallengeable),
+    ///         where the original bug's `Inconclusive` was merely recoverable.
+    ///
+    ///         The fix: reduce `total` by `accusedWeight` FIRST (same
+    ///         instant), THEN take the lookback min. Reproduces the audit's
+    ///         own worked numbers: earlier=60,000, total=560,000,
+    ///         accused=300,000. `reduced = 560,000 - 300,000 = 260,000`;
+    ///         `base = min(60,000, 260,000) = 60,000` (earlier is the binding
+    ///         constraint here, not the subtraction) — a real, sizeable floor,
+    ///         not zero, with 260,000 WOOD of honest electorate correctly
+    ///         still counted as available to clear it.
+    ///
+    ///         MUTATION-CHECKED: reducing against `min(earlier, total)`
+    ///         instead of against `total` alone (i.e. reverting to
+    ///         `base = base > accusedWeight ? base - accusedWeight : 0` where
+    ///         `base` was already `min(earlier, total)`) computes
+    ///         `60,000 > 300,000? false -> 0` and fails this test's nonzero
+    ///         assertion.
+    function test_finalize_floorSurvivesElectorateGrowthPastTheLookback() public {
+        game.setChallenge(
+            CHALLENGE_ID,
+            governor,
+            PROPOSAL_ID,
+            IChallengeGame.Status.Disputed,
+            vm.getBlockTimestamp(),
+            30 days,
+            vm.getBlockTimestamp() - 1 days
+        );
+        address accused = makeAddr("growingProtocolAccused");
+        address[] memory a = new address[](1);
+        uint256[] memory cm = new uint256[](1);
+        a[0] = accused;
+        cm[0] = 100e18;
+        ledger.setApprovers(a, cm);
+
+        uint256 snap = vm.getBlockTimestamp() - 1 days - 1;
+        uint256 lookbackTs = snap - court.FLOOR_LOOKBACK();
+
+        // The audit's own worked example: the protocol grew ~9x over the
+        // lookback window, and the accused cohort (300k) sits between
+        // `earlier` (60k) and `total` (560k) — the untested regime.
+        swood.setPastStake(accused, snap, 300_000e18);
+        swood.setPastTotalVotes(lookbackTs, 60_000e18);
+        swood.setPastTotalVotes(snap, 560_000e18);
+
+        uint256 caseId = court.refer(CHALLENGE_ID);
+        assertEq(court.caseOf(caseId).accusedWeight, 300_000e18, "accused raw stake recorded");
+
+        vm.warp(vm.getBlockTimestamp() + 5 days);
+
+        (uint256 floor,) = _finalizeAndReadFloor(caseId);
+
+        assertEq(floor, 6_000e18, "10% of min(60_000e18, 560_000e18 - 300_000e18) = 10% of 60_000e18");
+        assertGt(floor, 0, "electorate growth past the lookback must not collapse the floor to zero");
+    }
+
+    /// @notice RE-AUDIT FINDING (PR #120 round 2): THE PRIOR REGRESSION TEST
+    ///         DOES NOT PIN THE FIX, BECAUSE `earlier` BINDS IN IT.
+    ///
+    ///         `test_finalize_floorSurvivesElectorateGrowthPastTheLookback`
+    ///         uses earlier=60k < reduced=260k, so `earlier` is the binding
+    ///         term and `accusedWeight` never actually reaches the min
+    ///         comparison. A mutant that compares the lookback read against
+    ///         the UNREDUCED `total` instead of `reduced` —
+    ///         `base = (earlier != 0 && earlier < total) ? earlier : reduced`
+    ///         — is byte-equivalent to the real formula on every existing
+    ///         fixture, this one included, because none of them has
+    ///         `accusedWeight > 0` together with `earlier > 0` in the regime
+    ///         where `reduced`, not `earlier`, is the smaller term.
+    ///
+    ///         This fixture closes that gap: earlier=500k, total=560k,
+    ///         accused=300k, so `reduced = 260k < earlier = 500k` and
+    ///         `reduced` binds. The mutant above would instead take the
+    ///         `earlier < total` branch (500k < 560k is true) and return
+    ///         `earlier` = 500k — a floor of 50,000e18, more than 8x the
+    ///         real 26,000e18, wide open to the #96 bug class (an
+    ///         unclearable floor) the moment `accusedWeight` is large enough
+    ///         to make `reduced` the smaller term.
+    ///
+    ///         MUTATION-CHECKED: comparing against `total` instead of
+    ///         `reduced` in the lookback condition computes floor=50,000e18
+    ///         here instead of 26,000e18, failing the exact-value assertion.
+    function test_finalize_floorPinsTheReducedTermWhenItBindsBeforeTheLookback() public {
+        game.setChallenge(
+            CHALLENGE_ID,
+            governor,
+            PROPOSAL_ID,
+            IChallengeGame.Status.Disputed,
+            vm.getBlockTimestamp(),
+            30 days,
+            vm.getBlockTimestamp() - 1 days
+        );
+        address accused = makeAddr("reducedBindsAccused");
+        address[] memory a = new address[](1);
+        uint256[] memory cm = new uint256[](1);
+        a[0] = accused;
+        cm[0] = 100e18;
+        ledger.setApprovers(a, cm);
+
+        uint256 snap = vm.getBlockTimestamp() - 1 days - 1;
+        uint256 lookbackTs = snap - court.FLOOR_LOOKBACK();
+
+        // reduced = 560k - 300k = 260k, which is LESS than earlier (500k),
+        // so `reduced` is the binding term — the regime no prior fixture
+        // reaches with a nonzero `accusedWeight`.
+        swood.setPastStake(accused, snap, 300_000e18);
+        swood.setPastTotalVotes(lookbackTs, 500_000e18);
+        swood.setPastTotalVotes(snap, 560_000e18);
+
+        uint256 caseId = court.refer(CHALLENGE_ID);
+        assertEq(court.caseOf(caseId).accusedWeight, 300_000e18, "accused raw stake recorded");
+
+        vm.warp(vm.getBlockTimestamp() + 5 days);
+
+        (uint256 floor,) = _finalizeAndReadFloor(caseId);
+
+        assertEq(floor, 26_000e18, "10% of min(500_000e18, 560_000e18 - 300_000e18) = 10% of 260_000e18");
     }
 
     // ── ownership ──

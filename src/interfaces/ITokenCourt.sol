@@ -261,8 +261,11 @@ interface ITokenCourt {
     ///         referred under regardless of later changes here.
     function voteWindow() external view returns (uint256);
     /// @notice The anti-capture participation floor, in bps of
-    ///         `min(total(snapshotTs), total(snapshotTs - FLOOR_LOOKBACK))`
-    ///         minus `accusedWeight`. Turnout below this floor resolves
+    ///         `min(total(snapshotTs) - accusedWeight, total(snapshotTs -
+    ///         FLOOR_LOOKBACK))`, where the subtraction is floored at zero
+    ///         and taken BEFORE the lookback min — `accusedWeight` is always
+    ///         reduced against the same-instant `total`, never against the
+    ///         earlier one. Turnout below this floor resolves
     ///         `Inconclusive` rather than on the raw tally, so a thin,
     ///         rented-stake vote cannot convict or acquit alone. Read LIVE at
     ///         `finalize`, never pinned per case — which also makes it the
