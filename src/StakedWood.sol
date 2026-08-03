@@ -133,6 +133,23 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///         fully unstake or be slashed before the slot can be transferred.
     error PriorStakeNotCleared();
 
+    /// @notice The incoming owner has not consented to having their prepared
+    ///         stake bound to this vault.
+    /// @dev Adversary: the owner of a vault whose bond slot is empty, rotating
+    ///      that vault onto a third party purely to SPEND the third party's
+    ///      escrowed prepared stake. `SyndicateFactory.rotateOwner` authorizes
+    ///      only its own caller; `newOwner` is a bare parameter checked solely
+    ///      against `address(0)`. Without this guard the victim's escrow
+    ///      becomes bound to a vault they never chose: `cancelPreparedStake`
+    ///      reverts `PreparedStakeNotFound`, their own `createSyndicate` is
+    ///      blocked (`canCreateVault` false), and the bond is exposed to
+    ///      `GuardianRegistry._resolveEmergency` → `slashOwnerBond` for the
+    ///      whole `requestUnstakeOwner` → cooldown → `claimUnstakeOwner`
+    ///      recovery. Consent lives HERE, at the spend site, so every present
+    ///      and future factory route into `transferOwnerStakeSlot` lands on the
+    ///      guard rather than on the hazard.
+    error BindingNotApproved();
+
     /// @notice Emitted on every guardian stake / top-up.
     event GuardianStaked(address indexed guardian, uint256 amount, uint256 agentId);
 
@@ -166,6 +183,15 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     /// @notice Emitted when the factory re-points a vault's owner-stake slot.
     event OwnerStakeSlotTransferred(address indexed vault, address indexed oldOwner, address indexed newOwner);
 
+    /// @notice Emitted when a prospective owner consents to having their
+    ///         prepared stake bound to `vault` by a slot transfer.
+    event OwnerStakeBindingApproved(address indexed owner, address indexed vault);
+
+    /// @notice Emitted when a prospective owner withdraws that consent.
+    /// @dev `vault` is the approval being cleared, so an indexer can retire the
+    ///      exact record rather than inferring it from the last approve.
+    event OwnerStakeBindingRevoked(address indexed owner, address indexed vault);
+
     /// @notice Parameter key for `minGuardianStake`.
     bytes32 public constant PARAM_MIN_GUARDIAN_STAKE = keccak256("minGuardianStake");
 
@@ -193,22 +219,13 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     /// @dev Mirrors `IStakedWood.AuthorizedSlasherSet`.
     event AuthorizedSlasherSet(address indexed slasher);
 
-    /// @notice Emitted when a verdict slash is settled: what it took, what the
-    ///         prosecutor was paid, and what was destroyed.
-    /// @dev Reports all three legs so an indexer never has to re-derive the
-    ///      split — `gross == bounty + burned` by construction. `burned` is
-    ///      also the function's return value.
-    ///
-    ///      Replaces the `VerdictSlashRouted` / `VerdictSlashUncompensated`
-    ///      pair, which existed to tell indexers WHETHER the victims got paid.
-    ///      There is now exactly one outcome, so one event states it.
-    ///      Mirrors `IStakedWood.VerdictSlashBurned`.
-    event VerdictSlashBurned(bytes32 indexed caseKey, uint256 gross, uint256 bounty, uint256 burned);
-
-    /// @notice A conviction bounty was paid out of a verdict slash before the
-    ///         remainder was burned (spec 2026-07-29 §2).
-    /// @dev Mirrors `IStakedWood.ConvictionBountyPaid`.
-    event ConvictionBountyPaid(bytes32 indexed caseKey, address indexed bountyTo, uint256 amount);
+    /// @notice Emitted when a verdict slash is settled, reporting what was
+    ///         destroyed. `burned` is also the function's return value.
+    /// @dev The slash pays no one — there is one leg, so the event states one
+    ///      number. The prosecutor is paid from the convicted proposer's bond
+    ///      by `ProposerBondEscrow`, which is the only pot a prosecutor cannot
+    ///      fund for itself. Mirrors `IStakedWood.VerdictSlashBurned`.
+    event VerdictSlashBurned(bytes32 indexed caseKey, uint256 burned);
 
     /// @notice Emitted once per approver actually slashed for a blocked proposal.
     /// @dev A slash is a significant value-destroying change; the appeal flow
@@ -363,7 +380,37 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///      mainnet 4663 deployment exists (testnets are redeployable), exactly
     ///      as in the 2026-07-26 re-baseline; from the first mainnet deploy
     ///      onward a removal like this is no longer available.
-    uint256[5] private __gap;
+    ///      Decremented 5 → 4 for `approvedBindVault`, declared immediately
+    ///      below so the shrink comes off the END of the gap and every field
+    ///      after it keeps its slot (same convention as
+    ///      `_liabilityCheckpoints`).
+    uint256[4] private __gap;
+
+    /// @notice The single vault an address consents to have its PREPARED owner
+    ///         stake bound to via `transferOwnerStakeSlot`. Zero = no consent.
+    /// @dev Issue #98. The slot transfer spends `_prepared[newOwner]`, but its
+    ///      only caller (`SyndicateFactory.rotateOwner`) authorizes `msg.sender`
+    ///      alone — so without an opt-in recorded BY the incoming owner, any
+    ///      owner of an empty-slot vault could bind a stranger's escrow. This
+    ///      mapping is that opt-in.
+    ///
+    ///      At most one approved vault per address, deliberately: an address
+    ///      can hold at most one prepared escrow (`PreparedStakeAlreadyExists`),
+    ///      so an approval set spanning several vaults would model a consent
+    ///      the escrow cannot honor. Approving again overwrites.
+    ///
+    ///      SCOPED TO ONE ESCROW LIFETIME. Cleared on the successful bind
+    ///      (consumed), on `cancelPreparedStake`, and on a fresh
+    ///      `prepareOwnerStake`. Without the last two, an approval given for a
+    ///      rotation that was then abandoned would still be standing when the
+    ///      approver later escrows a NEW stake for their own vault — and the
+    ///      vault owner could bind that new escrow against the stale consent.
+    ///
+    ///      An approval on its own moves nothing and locks nothing: the
+    ///      approver keeps `cancelPreparedStake` at all times before the bind,
+    ///      and a standing approval with no live escrow is inert (the
+    ///      prepared-stake guards still reject the transfer).
+    mapping(address owner => address vault) public approvedBindVault;
 
     /// @dev Per-guardian OWN-STAKE LIABILITY history: what the guardian is on
     ///      the hook for at a past instant, as distinct from what it could VOTE
@@ -381,7 +428,7 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     mapping(address guardian => Checkpoints.Trace224) internal _liabilityCheckpoints;
 
     /// @notice The one address permitted to drive the VERDICT slash path
-    ///         (`slashToEscrow`). Deliberately distinct from `onlyRegistry`,
+    ///         (`slashVerdict`). Deliberately distinct from `onlyRegistry`,
     ///         which drives the block-quorum review slash: the paths must stay
     ///         separate so the registry's `refundSlash` reserve can never
     ///         refund a proven-malice verdict. Owner-set, which makes a
@@ -441,21 +488,6 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///      — the only protocol fee is the agent performance fee, denominated
     ///      in the VAULT's asset (see `FeeConstants`), not in WOOD.
     address internal constant BURN_ADDRESS = 0x000000000000000000000000000000000000dEaD;
-
-    /// @notice Ceiling on `slashToEscrow`'s `bountyBps`.
-    /// @dev Enforced here, not only in the caller: `ChallengeGame` pins its
-    ///      own `convictionBountyBps` to this same range at filing, but sWOOD
-    ///      is the contract that actually moves the WOOD, so it re-checks
-    ///      rather than trusting the caller's bound. An out-of-range
-    ///      `bountyBps` REVERTS (unlike `slashBpsPer`, which is silently
-    ///      clamped) so a compromised or buggy `authorizedSlasher` cannot name
-    ///      an arbitrary `bountyBps` and route the whole slash to a
-    ///      caller-chosen address — the worst it can do, per call, is redirect
-    ///      `MAX_CONVICTION_BOUNTY_BPS` of that call's slash. This bound is
-    ///      per call, not per guardian: `_verdictSlashed` keys on a
-    ///      caller-chosen `caseKey`, so repeated verdicts under fresh case
-    ///      keys still compound.
-    uint256 public constant MAX_CONVICTION_BOUNTY_BPS = 2_000;
 
     /// @notice Grouped `initialize` arguments. A struct keeps the call site
     ///         keyword-addressed, avoiding a swap-prone positional arg list.
@@ -645,9 +677,17 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///         `TokenCourt._participationFloor` subtracts the accused cohort
     ///         from the electorate using this getter rather than
     ///         `getPastVotes`, so the accused sum can never exceed the total
-    ///         by construction — both traces are pushed in the same
+    ///         AT THE SAME TIMESTAMP — both traces are pushed in the same
     ///         transaction at every mutation site (stake, request, cancel,
-    ///         slash). Using the raw basis also denies the accused a lever on
+    ///         slash). The court reduces the accused sum against this
+    ///         same-instant total ONLY, before ever looking at the 30-day
+    ///         lookback: `reduced = total(snapshotTs) - accusedWeight`,
+    ///         clamped at zero (defence-in-depth for an out-of-band
+    ///         `setStakedWood` re-point, not a path this same-source getter
+    ///         can reach). The lookback min is a separate later step —
+    ///         `min(reduced, total(snapshotTs - 30 days))` — and the accused
+    ///         cohort is never subtracted from the earlier electorate at all.
+    ///         Using the raw basis also denies the accused a lever on
     ///         its own conviction threshold: an aged basis would let an
     ///         accused approver call `requestUnstakeGuardian` between the
     ///         drain and `refer`, re-anchoring its `stakedAt` and flooring its
@@ -908,6 +948,10 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
 
         _prepared[msg.sender] =
             PreparedOwnerStake({amount: uint128(amount), preparedAt: uint64(block.timestamp), bound: false});
+        // A new escrow lifetime starts here, so any consent left over from the
+        // previous one is void — otherwise an approval granted for a rotation
+        // that never happened could be replayed against THIS stake.
+        delete approvedBindVault[msg.sender];
 
         emit OwnerStakePrepared(msg.sender, amount);
     }
@@ -922,10 +966,52 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
 
         uint256 amount = p.amount;
         delete _prepared[msg.sender];
+        // The escrow this consent was scoped to is gone; the consent goes with
+        // it (see `approvedBindVault`).
+        delete approvedBindVault[msg.sender];
 
         wood.safeTransfer(msg.sender, amount);
 
         emit PreparedStakeCancelled(msg.sender, amount);
+    }
+
+    /// @notice Consent to having your prepared owner stake bound to `vault` by
+    ///         a factory owner-rotation.
+    /// @dev THE OPT-IN THIS GUARD EXISTS FOR (issue #98). `rotateOwner` names
+    ///      the incoming owner as a bare parameter and is authorized against
+    ///      the OUTGOING owner only. Adversary: the owner of a vault with an
+    ///      empty bond slot rotates it onto whoever currently holds a prepared
+    ///      stake, spending that stranger's escrow — locking it behind the
+    ///      owner-unstake cooldown on a vault they never chose and exposing it
+    ///      to `slashOwnerBond` throughout. Recording the approval here, from
+    ///      the escrow holder's own `msg.sender`, is what makes the bind
+    ///      consensual.
+    ///
+    ///      One approved vault per address; calling again overwrites. The
+    ///      approval survives until it is consumed by the bind, revoked, or
+    ///      cleared by the escrow lifecycle — including across a front-run
+    ///      revoke: if the rotation lands first, it lands on a consent that was
+    ///      granted and not yet withdrawn, which is a consented outcome and not
+    ///      the attack above. `requestUnstakeOwner` remains the exit.
+    /// @dev nonReentrant omitted — no external calls, no value movement.
+    function approveOwnerStakeBinding(address vault) external {
+        if (vault == address(0)) revert ZeroAddress();
+
+        approvedBindVault[msg.sender] = vault;
+
+        emit OwnerStakeBindingApproved(msg.sender, vault);
+    }
+
+    /// @notice Withdraw a previously granted binding consent.
+    /// @dev A no-op consent (nothing approved) is not an error — the
+    ///      post-condition callers care about is "no standing approval", and
+    ///      reverting would only make the safe state harder to reach.
+    /// @dev nonReentrant omitted — no external calls, no value movement.
+    function revokeOwnerStakeBinding() external {
+        address vault = approvedBindVault[msg.sender];
+        delete approvedBindVault[msg.sender];
+
+        emit OwnerStakeBindingRevoked(msg.sender, vault);
     }
 
     /// @notice Bind a prepared owner stake to a newly created vault.
@@ -956,6 +1042,14 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///      A zero-bond slot (`stakedAmount == 0`, incl. one cleared by
     ///      `claimUnstakeOwner` or a full slash) still binds, so floor-0
     ///      onboarding and multi-vault creators are unchanged.
+    /// @dev NO `approvedBindVault` CHECK HERE, deliberately. Consent is
+    ///      STRUCTURAL on this path: `createSyndicate` passes its own
+    ///      `msg.sender` as `owner_`, so the stake being bound always belongs
+    ///      to the account that initiated the call. The consent guard in
+    ///      `transferOwnerStakeSlot` exists because THAT path takes the
+    ///      incoming owner as a parameter chosen by someone else. Requiring an
+    ///      approval here would only add a second transaction to a flow that
+    ///      cannot bind a stranger's escrow.
     /// @dev nonReentrant dropped — no external calls after state write.
     function bindOwnerStake(address owner_, address vault) external onlyFactory {
         if (_ownerStakes[vault].stakedAmount != 0) revert PriorStakeNotCleared();
@@ -1052,6 +1146,15 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///      (they must first complete `requestUnstakeOwner` →
     ///      `claimUnstakeOwner`, or be slashed, before the slot can be
     ///      transferred).
+    /// @dev CONSENT REQUIRED (issue #98). `newOwner` must have called
+    ///      `approveOwnerStakeBinding(vault)` on this contract first, else
+    ///      `BindingNotApproved`. The caller of the factory's `rotateOwner` is
+    ///      the OUTGOING owner, so `newOwner` is a parameter picked by someone
+    ///      else — see `BindingNotApproved` for the spend this blocks. The
+    ///      approval is single-use: it is consumed here, so a second transfer
+    ///      naming the same incoming owner needs a fresh one. UX consequence:
+    ///      a rotation is two transactions across two contracts (approve on
+    ///      sWOOD, then rotate on the factory).
     /// @dev nonReentrant dropped — no external calls after state write.
     function transferOwnerStakeSlot(address vault, address newOwner) external onlyFactory {
         OwnerStake storage existing = _ownerStakes[vault];
@@ -1061,10 +1164,13 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
         PreparedOwnerStake storage p = _prepared[newOwner];
         if (p.amount == 0 || p.bound) revert PreparedStakeNotFound();
         if (p.amount < minOwnerStake) revert OwnerBondInsufficient();
+        if (approvedBindVault[newOwner] != vault) revert BindingNotApproved();
 
         _ownerStakes[vault] =
             OwnerStake({stakedAmount: p.amount, unstakeRequestedAt: 0, owner: newOwner, cooldownAtRequest: 0});
         p.bound = true;
+        // Consume: one consent authorizes exactly one bind.
+        delete approvedBindVault[newOwner];
 
         emit OwnerStakeSlotTransferred(vault, oldOwner, newOwner);
     }
@@ -1104,7 +1210,7 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
         emit ExposureLedgerSet(ledger);
     }
 
-    /// @notice Set the address permitted to drive `slashToEscrow`.
+    /// @notice Set the address permitted to drive `slashVerdict`.
     /// @dev Owner-only, and deliberately NOT `setRegistry`'s set-once shape:
     ///      the role is rewirable to a future challenge game. Zero is a valid
     ///      value — it disables the verdict path entirely.
@@ -1153,9 +1259,9 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///         authorized-slasher entrypoint).
     /// @dev Reuses the SAME per-approver own-stake leg as the review path
     ///      (`_slashOne`) AND the same sink. The two paths differ now only in
-    ///      who may drive them (`onlyAuthorizedSlasher` vs `onlyRegistry`) and
-    ///      in the conviction bounty this one can pay off the top; the
-    ///      compensation case that used to distinguish them is gone.
+    ///      who may drive them (`onlyAuthorizedSlasher` vs `onlyRegistry`).
+    ///      The compensation case that used to distinguish them is gone, and
+    ///      so is the conviction bounty: the slash pays no one.
     /// @dev SEVERITY ENVELOPE. Every element of `slashBpsPer` is clamped to
     ///      `[minSlashBps, maxSlashBps]` here, so the verdict path enforces
     ///      the SAME envelope as the review path, where `GuardianRegistry`'s
@@ -1230,60 +1336,18 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///        remains meaningful as "this approver underwrote nothing" (see the
     ///        loop). Collapsing it to a batch-wide scalar would lose that
     ///        distinction and force every named address to be slashed.
-    /// @param bountyTo  Recipient of the conviction bounty (spec 2026-07-29
-    ///        §2), or `address(0)` to disable it. Never storage — the caller
-    ///        (`ChallengeGame`) decides per settle whether this path pays at
-    ///        all, so sWOOD gains no state variable for it and this stays a
-    ///        plain UUPS upgrade.
-    /// @param bountyBps Slice of the recovered total paid to `bountyTo`, in
-    ///        bps. `0` disables the bounty even with a non-zero `bountyTo`.
-    ///        Rejected outside `[0, MAX_CONVICTION_BOUNTY_BPS]` (reverts, not
-    ///        silently clamped down) — NOT trusted from the caller, for the
-    ///        same motivation sWOOD re-checks `slashBpsPer` rather than
-    ///        trusting `ExposureLedger`'s bound: `ChallengeGame` pins its own
-    ///        rate to this range at filing, but sWOOD is the contract that
-    ///        actually moves the WOOD, so it enforces its own ceiling rather
-    ///        than relying on the caller's. Anything above
-    ///        `MAX_CONVICTION_BOUNTY_BPS` (in particular any value `>= 10_000`,
-    ///        which would otherwise be able to route the ENTIRE slash to
-    ///        `bountyTo`) reverts `InvalidParameter`.
-    /// @return total  Total WOOD burned across all approvers, NET of the
-    ///         conviction bounty — the same figure `VerdictSlashBurned` reports
-    ///         as `burned`. The event also carries the gross and the bounty, so
-    ///         an indexer can reconstruct the split without re-deriving it.
+    /// @return total  Total WOOD burned across all approvers — the figure
+    ///         `VerdictSlashBurned` reports. The slash pays no one.
     function slashVerdict(
         bytes32 caseKey,
         uint256 openedAt,
         address[] calldata approvers,
-        uint256[] calldata slashBpsPer,
-        bool[] calldata contestors,
-        address bountyTo,
-        uint256 bountyBps
+        uint256[] calldata slashBpsPer
     ) external onlyAuthorizedSlasher returns (uint256 total) {
         if (openedAt > block.timestamp) revert VerdictNotPast();
-        if (contestors.length != approvers.length) revert SlashBpsLengthMismatch();
         // Positional alignment is the only thing tying a guardian to their rate,
         // so a mismatch is a caller bug, not something to absorb.
         if (slashBpsPer.length != approvers.length) revert SlashBpsLengthMismatch();
-        // BOUNTY RATE IS NOT TRUSTED FROM THE CALLER. Same motivation as
-        // re-checking `slashBpsPer` below against `[minSlashBps,
-        // maxSlashBps]` instead of trusting `ExposureLedger`: `ChallengeGame`
-        // pins `convictionBountyBps` to `[0, 2_000]` at filing, but that bound
-        // lives in the CALLER. The mechanism differs — `slashBpsPer` is
-        // silently clamped, this reverts — because a bad payout ADDRESS
-        // should never be laundered into a smaller-but-still-caller-chosen
-        // one. Left unchecked here, a compromised or buggy `authorizedSlasher`
-        // could pass `bountyBps` up to just under 10_000 and route almost the
-        // entire slash to a `bountyTo` of its own choosing. The guarantee this
-        // preserves: a compromised slasher can divert at most
-        // `MAX_CONVICTION_BOUNTY_BPS` of any ONE call, and the remainder can
-        // only ever reach `BURN_ADDRESS`. Enforcing the ceiling here,
-        // unconditionally (even when `bountyTo == address(0)` and the rate
-        // would never be spent), keeps that guarantee true regardless of what
-        // the caller does. PER CALL, NOT PER GUARDIAN: `_verdictSlashed` keys
-        // on a caller-chosen `caseKey`, so this bounds one call's diversion,
-        // not what repeated verdicts under fresh case keys can compound to.
-        if (bountyBps > MAX_CONVICTION_BOUNTY_BPS) revert InvalidParameter();
         // NO VAULT MEMBERSHIP CHECK. The factory lookup that used to stand here
         // existed to keep the escrow's ERC20Votes
         // apportionment on vaults with OZ semantics. Nothing is apportioned any
@@ -1298,10 +1362,6 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
         // `refundSlash`. `VerdictSlashRouted` still carries the RAW `caseKey`,
         // so indexers join the two deterministically.
         bytes32 slashKey = keccak256(abi.encodePacked("sherwood.verdict", caseKey));
-
-        /// @dev Summed slash of the approvers who funded the counter-bond —
-        ///      the ceiling on the conviction bounty. See the cap below.
-        uint256 contestorSlash;
 
         // INTRA-CALL DEDUP. Each `_slashOne` pass
         // re-applies its clamped rate to the ALREADY-REDUCED live stake, so N
@@ -1360,60 +1420,22 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
             if (amt == 0) continue;
             _verdictSlashed[caseKey][approvers[i]] = true;
             total += amt;
-            // Accumulated HERE because this is the only frame that knows what
-            // each approver actually forfeited — see the bounty cap below.
-            if (contestors[i]) contestorSlash += amt;
         }
         // Nothing recovered: nothing to pay, nothing to burn.
         if (total == 0) return 0;
 
-        // THE BOUNTY COMES OFF THE TOP, BEFORE THE BURN (spec 2026-07-29 §2).
-        // Paying the prosecutor out of what the prosecution recovered is what
-        // makes filing rational: a correct but unanswered challenge otherwise
-        // LOSES `settleBurnBps` of its bond, so nobody outside the drained
-        // vault has a reason to watch.
-        //
-        // This is the ONLY leg that leaves to a named address, and that is
-        // exactly what lets the rate be punitive. A sink with no counterparty
-        // cannot over-pay anyone, so the slash is free to exceed the loss —
-        // which is the whole reason the verdict rate is now the severity
-        // ceiling rather than a share of the damages.
-        // CAPPED AT WHAT THE CONTEST ACTUALLY COST ITS FUNDERS. The caller
-        // pays a bounty only when an APPROVER funded the counter-bond, which
-        // is meant to price a staged contest: to fake one you must join the
-        // cohort your own conviction slashes. That pricing argument holds only
-        // while the payout is bounded by what the faker forfeits — and the
-        // punitive rate broke that bound, because the bounty is a share of the
-        // WHOLE cohort's bonds while the faker still risks only its own.
-        //
-        // Worked: five approvers at 100,000 WOOD, an attacker joining at a
-        // 1,000 WOOD minimum stake and self-funding the pool, 500 bps ->
-        // 25,050 WOOD paid for 1,000 WOOD risked. Capping at `contestorSlash`
-        // makes that trade exactly break-even at best, for any parameter set,
-        // without a threshold to tune.
-        //
-        // SUMMED OVER EVERY CONTRIBUTING APPROVER, not the first one found: a
-        // genuine defence is funded by real approvers with real bonds, so the
-        // cap sits far above the fee and never binds. It binds only when the
-        // contest was staged by someone with nothing at stake — which is the
-        // case it exists for. A contestor whose own slash landed at zero
-        // (`amt == 0`, no live stake) contributes nothing to the cap and so
-        // unlocks no bounty, which is the same rule stated at the wei level.
-        uint256 bounty;
-        if (bountyTo != address(0) && bountyBps != 0) {
-            bounty = total * bountyBps / 10_000;
-            if (bounty > contestorSlash) bounty = contestorSlash;
-            if (bounty != 0) {
-                total -= bounty;
-                wood.safeTransfer(bountyTo, bounty);
-                emit ConvictionBountyPaid(caseKey, bountyTo, bounty);
-            }
-        }
-
+        // NO LEG LEAVES TO A NAMED ADDRESS, and that is exactly what lets the
+        // rate be punitive. A sink with no counterparty cannot over-pay anyone,
+        // so the slash is free to exceed the loss — which is the whole reason
+        // the verdict rate is the severity ceiling rather than a share of the
+        // damages. Any payee here would re-impose the windfall constraint that
+        // capped it at 1x, which is why the prosecutor is paid from the
+        // proposer's forfeited bond instead of from this.
         _totalStakeCheckpoint.push(uint32(block.timestamp), uint224(totalGuardianStake));
 
-        // THE SINK. `total` is already NET of the bounty, which left in the
-        // branch above; burning the gross would double-count it.
+        // THE SINK. Every wei taken burns — the slash pays no one. The
+        // prosecutor is paid from the convicted proposer's bond instead, the
+        // one pot a prosecutor cannot fund for itself.
         //
         // ONE SINK, THREE PATHS. `slashGuardians` and `slashOwnerBond` have
         // always burned outright. This path used to route to a compensation
@@ -1430,7 +1452,7 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
         // landed at this point, so only the transfer is at risk — a hostile or
         // blacklisting token cannot brick a conviction.
         _burnWood(total);
-        emit VerdictSlashBurned(caseKey, total + bounty, bounty, total);
+        emit VerdictSlashBurned(caseKey, total);
     }
 
     /// @dev Per-approver slash. Extracted to keep `slashGuardians`'s stack

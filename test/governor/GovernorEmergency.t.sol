@@ -584,6 +584,41 @@ contract GovernorEmergencyTest is Test {
         governor.finalizeEmergencySettle(pid);
     }
 
+    /// @notice Issue #93 — the emergency path is the WEAKEST way into
+    ///         `executeGovernorBatch`, and therefore the one that matters most:
+    ///         the calls are owner-supplied, there is no LP vote, no coverage
+    ///         quorum, and with no guardian block votes cast, no second
+    ///         signature either. `_guardBatchCalls` runs on every
+    ///         `executeGovernorBatch` invocation regardless of which governor
+    ///         entrypoint drove it, so the privileged-target denylist covers
+    ///         this path for free — no per-entrypoint duplication.
+    ///
+    /// @dev    Asserts the vault-self target, because this harness binds no
+    ///         withdrawal queue. The queue variant of the same claim is in
+    ///         `test/audit-fixes/Vault_batchQueueTargets_lifecycle.t.sol`, which
+    ///         drives `unstick` against a real bound queue.
+    function test_finalizeEmergencySettle_vaultSelfTargetingCalls_reverts() public {
+        uint256 pid = _createExecutedProposal(7 days);
+        vm.warp(vm.getBlockTimestamp() + 7 days);
+
+        BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](1);
+        calls[0] = BatchExecutorLib.Call({
+            target: address(vault),
+            data: abi.encodeCall(ISyndicateVault.transferPerformanceFee, (address(usdc), random, 1_000e6)),
+            value: 0
+        });
+
+        vm.prank(owner);
+        governor.emergencySettleWithCalls(pid, calls);
+
+        // No guardian blocks → the review resolves clean and the owner is
+        // entitled to finalize. The batch itself is what refuses.
+        vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.DisallowedBatchTarget.selector, address(vault)));
+        governor.finalizeEmergencySettle(pid);
+    }
+
     // ──────────────────────────────────────────────────────────────
     // Task 27.B — full-flow emergency settle: blocked slashes owner,
     //              not-blocked finalizes cleanly

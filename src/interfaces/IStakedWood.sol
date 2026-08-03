@@ -43,18 +43,17 @@ interface IStakedWood {
 
     event AuthorizedSlasherSet(address indexed slasher);
 
-    /// @notice A verdict slash was settled: what it took, what the prosecutor
-    ///         was paid, and what was destroyed.
-    /// @dev `gross == bounty + burned` by construction, so an indexer never has
-    ///      to re-derive the split. `burned` is also `slashVerdict`'s return
-    ///      value. Replaces the `VerdictSlashRouted` / `VerdictSlashUncompensated`
-    ///      pair, whose whole purpose was to report WHETHER victims were paid —
-    ///      a question with one answer now.
-    event VerdictSlashBurned(bytes32 indexed caseKey, uint256 gross, uint256 bounty, uint256 burned);
-
-    /// @notice A conviction bounty was paid out of a verdict slash before the
-    ///         remainder opened a compensation case.
-    event ConvictionBountyPaid(bytes32 indexed caseKey, address indexed bountyTo, uint256 amount);
+    /// @notice A verdict slash was settled: what it took, all of which was
+    ///         destroyed.
+    /// @dev ONE FIELD, BECAUSE THERE IS ONE LEG. `gross == burned` by
+    ///      construction — the slash has no payee — so there is no split for an
+    ///      indexer to re-derive. `burned` is also `slashVerdict`'s return
+    ///      value. Replaces the `VerdictSlashRouted` /
+    ///      `VerdictSlashUncompensated` pair, whose whole purpose was to report
+    ///      WHETHER victims were paid — a question with one answer now. The
+    ///      prosecutor's fee is a separate leg on a separate contract and
+    ///      surfaces as `IProposerBondEscrow.ProsecutorFeePaid`.
+    event VerdictSlashBurned(bytes32 indexed caseKey, uint256 burned);
 
     // ── Guardian stake ──
     function stakeAsGuardian(uint256 amount, uint256 agentId) external;
@@ -68,6 +67,19 @@ interface IStakedWood {
     function bindOwnerStake(address owner, address vault) external;
     function requestUnstakeOwner(address vault) external;
     function claimUnstakeOwner(address vault) external;
+
+    /// @notice Consent to having your prepared owner stake bound to `vault` by
+    ///         the factory's owner-rotation flow (issue #98). Callable only by
+    ///         the prospective owner themselves; one approved vault per
+    ///         address, overwritten on re-approval, consumed by the bind.
+    function approveOwnerStakeBinding(address vault) external;
+
+    /// @notice Withdraw a previously granted binding consent.
+    function revokeOwnerStakeBinding() external;
+
+    /// @notice Re-point a vault's owner-stake slot to `newOwner`'s prepared
+    ///         stake. Reverts `BindingNotApproved` unless `newOwner` approved
+    ///         exactly `vault` first.
     function transferOwnerStakeSlot(address vault, address newOwner) external;
 
     /// @notice The owner bond a vault must hold. TVL scaling is not implemented
@@ -124,6 +136,10 @@ interface IStakedWood {
     function preparedStakeOf(address owner) external view returns (uint256);
     function canCreateVault(address owner) external view returns (bool);
 
+    /// @notice The single vault `owner` has consented to have their prepared
+    ///         stake bound to. Zero when there is no standing consent.
+    function approvedBindVault(address owner) external view returns (address);
+
     /// @notice The guardian unstake cooldown period. The registry reads this
     ///         in `setReviewPeriod` to enforce the cross-contract invariant
     ///         `coolDownPeriod >= reviewPeriod`.
@@ -173,58 +189,16 @@ interface IStakedWood {
     ///      is no child call whose revert could hold a conviction hostage, no
     ///      allowance against sWOOD's custody balance, and no gas to reserve
     ///      for a callee.
-    /// @dev    THE BOUNTY IS THE PROSECUTOR'S FEE (spec 2026-07-29 §2). It is
-    ///         paid only when a slash actually recovers WOOD, and it is
-    ///         deducted BEFORE the burn. `bountyTo == address(0)` or
-    ///         `bountyBps == 0` disables it and the whole slash burns — which
-    ///         is how the caller expresses "this path pays no bounty" (see
-    ///         `ChallengeGame._settle`: only an ESCALATED conviction pays,
-    ///         never the silence settle).
-    ///
-    ///         `bountyBps` IS NOT TRUSTED FROM THE CALLER. sWOOD rejects it
-    ///         outside `[0, MAX_CONVICTION_BOUNTY_BPS]` itself
-    ///         (`InvalidParameter`, including any value `>= 10_000`) — the
-    ///         same MOTIVATION as re-checking `slashBpsPer` against
-    ///         `[minSlashBps, maxSlashBps]` rather than trusting it from
-    ///         `ExposureLedger`, though the MECHANISM differs: `slashBpsPer`
-    ///         is silently clamped, `bountyBps` reverts. `ChallengeGame` also
-    ///         pins its own rate to this range at filing, but that bound
-    ///         lives in the CALLER; sWOOD is the contract that actually moves
-    ///         the WOOD, so a compromised or buggy slasher can divert at most
-    ///         `MAX_CONVICTION_BOUNTY_BPS` of any ONE CALL's slash to a
-    ///         caller-named `bountyTo` — that call's remainder can only ever
-    ///         reach `BURN_ADDRESS`, never an arbitrary destination of the
-    ///         slasher's own choosing. PER CALL, NOT PER GUARDIAN:
-    ///         `verdictSlashed` keys on a caller-chosen `caseKey`, so repeated
-    ///         verdicts against the same approver under fresh case keys
-    ///         compound.
-    /// @param  bountyTo   Recipient of the conviction bounty, or `address(0)`.
-    /// @param  bountyBps  Slice of the recovered total, in bps. Rejected
-    ///                     outside `[0, MAX_CONVICTION_BOUNTY_BPS]` by sWOOD
-    ///                     itself (reverts, not silently clamped down).
-    /// @return total  WOOD burned across all approvers, NET of the conviction
-    ///                bounty — the `burned` leg of `VerdictSlashBurned`.
-    /// @param  contestors Positionally aligned with `approvers`: true where that
-    ///         approver funded the counter-bond. Their SUMMED slash caps the
-    ///         bounty, so staging a contest can never pay more than it costs
-    ///         the stager — the bound the punitive rate would otherwise break,
-    ///         since the bounty is a share of the whole cohort's bonds while a
-    ///         faker risks only its own.
+    /// @return total  WOOD burned across all approvers. The slash pays no one;
+    ///                the prosecutor is paid from the convicted proposer's bond
+    ///                by `ProposerBondEscrow`, the one pot a prosecutor cannot
+    ///                fund for itself.
     function slashVerdict(
         bytes32 caseKey,
         uint256 openedAt,
         address[] calldata approvers,
-        uint256[] calldata slashBpsPer,
-        bool[] calldata contestors,
-        address bountyTo,
-        uint256 bountyBps
+        uint256[] calldata slashBpsPer
     ) external returns (uint256 total);
-
-    /// @notice The authoritative ceiling on `slashVerdict`'s `bountyBps` —
-    ///         read this rather than restating the literal bps value
-    ///         elsewhere (e.g. in `ChallengeGame`), so a caller's own clamp
-    ///         and sWOOD's enforced one cannot silently drift apart.
-    function MAX_CONVICTION_BOUNTY_BPS() external view returns (uint256);
 
     function setAuthorizedSlasher(address slasher) external;
     function authorizedSlasher() external view returns (address);

@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {IExposureLedger} from "./interfaces/IExposureLedger.sol";
+import {IWoodTwapOracle} from "./interfaces/IWoodTwapOracle.sol";
 
 /// @dev Narrow sWOOD read surface (own stake, cooldown). Mirrors the
 ///      IGovernorMinimal pattern in GuardianRegistry — the ledger does not
@@ -62,12 +63,62 @@ interface IRegistryApproversMinimal {
  *         commitment per approval is therefore bounded at one epoch + challenge
  *         window regardless of strategy duration.
  *
- * @dev    WOOD is priced by `woodPriceX8()`: a Chainlink read times
- *         `woodHaircutBps` when a feed is wired and fresh, falling back to the
- *         governance-set `woodUsdPriceX8` otherwise. A stale or unset feed
- *         falls back rather than reverting, because failing closed here would
- *         value every bond at $0 and halt approvals protocol-wide on a
- *         Chainlink hiccup — so the fallback must stay maintained.
+ * @dev    WOOD IS PRICED BY THE MARKET, CAPPED BY GOVERNANCE (design revision
+ *         2, 2026-08-02). `woodPriceX8()` resolves:
+ *
+ *             sourceX8 = feed fresh ? min(feedX8, woodUsdPriceX8)
+ *                      : twap fresh ? min(twapX8, woodUsdPriceX8)
+ *                      :              revert NoWoodPrice
+ *             price    = haircut(sourceX8), floored at 1
+ *
+ *         `woodUsdPriceX8` is NEVER SERVED AS A PRICE. It is only ever a cap on
+ *         whatever the market reports, so the market may LOWER a bond's value
+ *         and never raise it, and lowering the cap is the emergency brake.
+ *
+ *         The earlier arrangement — a maintained scalar as the price, with a
+ *         Chainlink feed superseding it — was inverted by the 2026-08-01 audit:
+ *         a manually maintained number sitting above market makes guardians
+ *         look better collateralised than they are and clears
+ *         `requireApproveQuorum` on collateral that does not exist, silently
+ *         and for as long as nobody notices. Under the cap-only model that
+ *         drift is inert: a cap above market simply stops binding, and a cap
+ *         below market only under-values bonds, which is the safe direction.
+ *
+ *         WHAT IT COSTS: there is no longer a branch that keeps pricing when
+ *         all market data is gone, so `NoWoodPrice` is reachable in production.
+ *         That is deliberate and the halting semantics are chosen per consumer
+ *         — see `IExposureLedger.NoWoodPrice`. In one line: votes still work,
+ *         nothing new can be proposed, nothing can execute.
+ *
+ * @dev    ══ TRUST MODEL: THE OWNER IS UNRESTRICTED HERE, BY DESIGN ══
+ *
+ *         `setWoodUsdPrice` and `setWoodHaircutBps` impose NO rate limit and no
+ *         per-call size ceiling. The owner may move either lever to any legal
+ *         value, any number of times, within a single block.
+ *
+ *         THIS IS NOT AN OVERSIGHT AND IT IS NOT A REGRESSION TO FILE. Rate
+ *         limiting is enforced OFF-CHAIN, by a Zodiac Delay/Roles module on the
+ *         owner Safe (issue #89, owner decision 2026-08-02). Earlier revisions
+ *         carried a 1-day interval plus a 2x-per-raise ceiling on the cap; both
+ *         were removed together, because the interval was the only thing making
+ *         the ceiling a rate limit — N calls in one multisig batch move the
+ *         price 2^N — so keeping the ceiling alone would have advertised a
+ *         protection its own subject can bypass.
+ *
+ *         The reason for moving it rather than fixing it: the interval gated
+ *         BOTH directions, and after design revision 2 lowering the cap IS the
+ *         emergency action. A self-limit on an already-trusted owner therefore
+ *         cost crisis responsiveness — a routine morning adjustment spent the
+ *         lever and left no brake that afternoon — for very little gain.
+ *
+ *         AUDITORS AND REVIEWERS: the control you are looking for is in the
+ *         Safe's module configuration, which is invisible from this source. The
+ *         requirement it must satisfy is an ASYMMETRIC delay — raises delayed,
+ *         drops immediate — because a plain Delay module is symmetric and would
+ *         relocate the problem rather than solve it. `DeployPlanB` asserts the
+ *         owner is a contract rather than a bare EOA, which is the most this
+ *         contract can check; the rest is a runbook obligation recorded in
+ *         `openspec/specs/deployment-docs/spec.md`.
  */
 contract ExposureLedger is Ownable2Step, IExposureLedger {
     uint256 internal constant BPS_DENOMINATOR = 10_000;
@@ -95,10 +146,6 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      without waiting on their long ones, at the cost of a longer scan.
     uint256 internal constant MAX_SCAN_BUCKETS = 16;
 
-    /// @dev Minimum spacing between price updates. Without it the 2x ceiling
-    ///      bounds a single call and nothing bounds the number of calls.
-    uint256 internal constant MIN_PRICE_UPDATE_INTERVAL = 1 days;
-
     /// @dev Floor on `woodHaircutBps`. Valuing bonds below half of market is a
     ///      mis-set parameter, not a conservatism policy.
     uint256 internal constant MIN_WOOD_HAIRCUT_BPS = 5_000;
@@ -115,7 +162,21 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     uint256 public immutable epochLength;
     uint256 public immutable epochGenesis;
 
-    /// @notice Conservative WOOD→USD price, 8 decimals (spec §5 `priceHaircut`).
+    /// @notice CAP on the WOOD→USD price, 8 decimals. Never served as a price.
+    ///
+    /// @dev    SEED IT ABOVE MARKET. Its whole job is to bound how far a market
+    ///         source can be manipulated UPWARD; kept within `M×` of market,
+    ///         upward manipulation is capped at `M×`. A cap set BELOW market —
+    ///         the old "conservative, ≤ 30-day low" reading — binds
+    ///         permanently, pins every bond at the cap, and makes the market
+    ///         source inert, which is precisely the arrangement design revision
+    ///         2 replaced.
+    ///
+    ///         It no longer needs ACCURACY, because it is never the valuation;
+    ///         a monthly review is sufficient, since drift degrades the cap
+    ///         gradually and never mis-prices anything. It does still need
+    ///         MAINTENANCE — it is the only thing bounding upward manipulation
+    ///         of a ~$438k pool.
     uint256 public woodUsdPriceX8;
     /// @notice Post-epoch challenge window (spec §5: 14d initial, single window
     ///         in v1 — per-tier windows are a later refinement).
@@ -142,28 +203,63 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     /// @notice Proposer bond as bps of USD coverage (spec §3.9/§5). Default 1%.
     uint256 public proposerBondBps = 100;
 
-    /// @notice Chainlink WOOD/USD feed. Once wired it supersedes the
-    ///         governance price for every bond valuation.
+    /// @notice Chainlink WOOD/USD feed. Once wired it is the PREFERRED market
+    ///         source; the TWAP oracle serves only while it is unset or
+    ///         degraded. Still capped by `woodUsdPriceX8` like every source.
     /// @dev    Reuses the same `AssetFeed` shape and staleness handling as the
     ///         vault-asset feeds, so WOOD is priced by the machinery already
     ///         exercised by `coverageUsd` rather than a parallel path.
+    ///         Expected to stay UNSET on chain 4663 — there is no WOOD/USD
+    ///         aggregator there — which is why the TWAP oracle is not an
+    ///         optional extra but the live source.
     AssetFeed internal _woodFeed;
 
-    /// @notice Haircut applied to the feed price, in bps. The governance number
-    ///         it replaces was a manually-maintained "<= 30-day low"; this is
-    ///         the same conservatism expressed as a factor on a live read.
+    /// @notice The WOOD/WETH TWAP oracle (`IWoodTwapOracle`), or zero.
+    /// @dev    Not `immutable` and not a constructor argument: the ledger is
+    ///         deployed before the oracle has a completed averaging window, and
+    ///         a bad oracle must be rotatable without redeploying the ledger.
+    ///         Every read of it is defensive — see `_twapPriceX8`.
+    address public woodTwapOracle;
+
+    /// @notice Haircut applied to whichever market source won, in bps.
+    ///
     /// @dev    Collateral wants a floor, not a quote — an unhaircut oracle
     ///         tracks WOOD UP and inflates every bond exactly when the market is
-    ///         frothy. Default 10_000 (no haircut) so wiring a feed alone does
+    ///         frothy. Default 10_000 (no haircut) so wiring a source alone does
     ///         not silently change valuations; governance sets it deliberately.
+    ///
+    /// @dev    THIS PARAMETER IS LOAD-BEARING (owner decision 2026-08-02). It is
+    ///         the compensating control for the two exposures this design
+    ///         deliberately ACCEPTS rather than eliminates, and once a price has
+    ///         cleared the cap it is the only thing standing under either:
+    ///
+    ///           1. NON-CONTEMPORANEOUS LEGS in `WoodTwapOracle`. The WOOD/ETH
+    ///              average is near-real-time; the ETH/USD answer may be up to
+    ///              one heartbeat old (~10.7h measured on 4663, WHILE HEALTHY).
+    ///              During an ETH drawdown inside that heartbeat the product
+    ///              reads HIGH by roughly the ETH move — no attacker capital
+    ///              involved. Constraining it would force a ~12-hour averaging
+    ///              window, which is worse; see that contract's ACCEPTED RISK
+    ///              note.
+    ///           2. RESIDUAL CRASH LAG of up to `twapWindow + maxTwapAge`,
+    ///              inherent to averaging and the price of manipulation
+    ///              resistance.
+    ///
+    ///         Both OVERSTATE bond value — the dangerous direction — and the
+    ///         haircut is what pre-funds an allowance against them. AT THE
+    ///         10_000 DEFAULT THAT ALLOWANCE IS ZERO. 5_000 (the floor) absorbs
+    ///         a 50% error. Shipping at the default is a deliberate choice to
+    ///         run with no margin, not a neutral one.
     uint256 public woodHaircutBps = BPS_DENOMINATOR;
 
-    /// @dev Stamps every `setWoodUsdPrice`. Zero means "never set" — the only
-    ///      state exempt from the interval.
-    uint64 public lastPriceUpdateAt;
-
-    /// @dev Stamps every `setWoodHaircutBps`; zero means "never set".
-    uint64 public lastHaircutUpdateAt;
+    // `lastPriceUpdateAt` and `lastHaircutUpdateAt` were REMOVED with the
+    // in-contract rate limit (issue #89). They stamped the two setters for the
+    // 1-day interval and nothing else read them — not this contract, not
+    // `IExposureLedger`, not any script or test. Safe to delete rather than
+    // leave as dead slots because `ExposureLedger` is NOT upgradeable
+    // (constructor + immutables, deployed directly by `DeployPlanB`, no proxy)
+    // and is not among the four layouts `script/check-layout-goldens.sh` pins,
+    // so no deployed lineage stores state at these offsets.
 
     address public guardianRegistry;
 
@@ -243,6 +339,19 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      double-count against the live buckets and silently tighten the
     ///      batching cap, which is a different control.
     mapping(address guardian => uint256) internal _frozenCommitments;
+    /// @notice The latest instant through which a guardian's coverage is
+    ///         pinned open, independent of whether any challenge naming them
+    ///         is currently LIVE (issue #95).
+    /// @dev A MAX, not a per-key value. A guardian can be pinned by more than
+    ///      one accusation at once, and `pinCoverageUntil` only ever raises
+    ///      this — so a later accusation's deadline correctly outlives an
+    ///      earlier one's, and once the LATEST of them elapses, so does the
+    ///      pin for everyone it covered. No release call is needed: unlike
+    ///      `_frozenCommitments`, which requires an explicit `unfreezeCoverage`
+    ///      to clear, this decays on its own by wall-clock — the same way
+    ///      `openExposureUsd`'s epoch buckets do, and for the same reason: a
+    ///      value nobody has to remember to unwind cannot be forgotten.
+    mapping(address guardian => uint256) internal _pinnedCoverageUntil;
 
     /// @dev How many proposals are frozen right now, across every guardian.
     ///      Lets `setCoverageFreezer` refuse a rotation that would orphan a
@@ -294,73 +403,141 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
 
     /// @notice The WOOD/USD price every bond is valued at, 8 decimals.
     ///
-    /// @dev    FEED FIRST, GOVERNANCE AS FALLBACK. A live read tracks a crash
+    /// @dev    MARKET-PRICED, GOVERNANCE-CAPPED. A live source tracks a crash
     ///         immediately, which is the direction where lag actually hurts:
-    ///         under the manual number somebody has to notice and transact
-    ///         while bonds stay over-valued in the meantime.
+    ///         under a manual number somebody has to notice and transact while
+    ///         bonds stay over-valued in the meantime. The cap is what keeps
+    ///         the market source from being trusted UPWARD — the WOOD/WETH pool
+    ///         is ~$438k deep, so an unbounded read from it would make that pool
+    ///         the valuation basis for every guardian bond in the protocol.
     ///
-    ///         FALLS BACK RATHER THAN REVERTING when the feed is unset or
-    ///         stale. Failing closed here would value every bond at $0 and halt
-    ///         approvals protocol-wide on a Chainlink hiccup — a liveness risk
-    ///         the manual price does not have. The fallback is
-    ///         `woodUsdPriceX8`, which is itself a conservative floor, so the
-    ///         degraded path is still safe. It does mean the governance number
-    ///         must be MAINTAINED as a fallback rather than abandoned once the
-    ///         feed is wired.
+    ///         REVERTS `NoWoodPrice` when no source can price WOOD. See
+    ///         `IExposureLedger.NoWoodPrice` for why that is fail-safe rather
+    ///         than a halt, and which single consumer catches it.
     function woodPriceX8() public view returns (uint256) {
-        (uint256 price,) = _woodPrice();
+        (uint256 price,,) = _woodPrice();
         return price;
     }
 
-    /// @notice The WOOD price and whether it came from the FALLBACK rather than
-    ///         the feed.
-    /// @dev    Exists because the degraded path was otherwise invisible: no
-    ///         event, and `woodUsdPriceX8` carries no `updatedAt` of its own, so
-    ///         "feed healthy" and "feed dead for three months, running on a
-    ///         manual number nobody has touched" read identically from outside.
-    ///         §6 monitoring cannot alert on a condition it cannot observe.
-    function woodPriceDetail() external view returns (uint256 price, bool usingFallback) {
+    /// @inheritdoc IExposureLedger
+    /// @dev Exists because both degraded states are otherwise invisible: there
+    ///      is no event on either, and `woodUsdPriceX8` carries no `updatedAt`
+    ///      of its own, so "TWAP healthy" and "cap has drifted under market and
+    ///      has been pinning every bond for a month" read identically from
+    ///      outside. §6 monitoring cannot alert on a condition it cannot
+    ///      observe.
+    function woodPriceDetail() external view returns (uint256 price, bool fromFeed, bool capBinding) {
         return _woodPrice();
     }
 
-    /// @dev EVERY failure mode of the aggregator falls back, including a bare
-    ///      revert from `latestRoundData` — a reverting feed would otherwise
-    ///      take approve votes and `requireApproveQuorum` down with it,
-    ///      bricking coverage protocol-wide with no governance path back.
+    /// @dev THE RESOLUTION ORDER, and why each branch is where it is:
+    ///
+    ///        cap == 0                 -> revert (finding 7)
+    ///        feed fresh               -> min(feed, cap)
+    ///        else twap fresh          -> min(twap, cap)
+    ///        else                     -> revert NoWoodPrice
+    ///
+    ///      ZERO CAP IS A REVERT, NOT "UNCAPPED". Treating it as "no ceiling"
+    ///      would make the single most likely misconfiguration — a ledger
+    ///      deployed before governance seeded the number — the one state in
+    ///      which a ~$438k pool prices every bond without bound. Fail-closed is
+    ///      the only safe reading, and `DeployPlanB` asserts the cap
+    ///      post-broadcast so the revert is a configuration guard rather than a
+    ///      live failure mode.
+    ///
+    ///      THE `min` IS THE WHOLE SAFETY ARGUMENT. Push the market source UP
+    ///      and the `min` ignores it — the attack is inert. Push it DOWN and
+    ///      bonds are valued lower and quorums get harder: a denial of service
+    ///      with no payoff. This is the invariant the change exists for, and it
+    ///      is only a real bound because the cap is maintained ABOVE market.
+    ///
+    ///      NEITHER SOURCE FALLS BACK TO THE CAP. That was revision 1's error:
+    ///      the cap is chosen high and non-binding, so serving it as a price
+    ///      when market data stops arriving fails in the dangerous direction at
+    ///      exactly the moment there is nothing to check it against.
+    function _woodPrice() internal view returns (uint256 price, bool fromFeed, bool capBinding) {
+        uint256 cap = woodUsdPriceX8;
+        if (cap == 0) revert NoWoodPrice();
+
+        uint256 marketX8;
+        (marketX8, fromFeed) = _feedPriceX8();
+        if (!fromFeed) {
+            bool twapOk;
+            (marketX8, twapOk) = _twapPriceX8();
+            if (!twapOk) revert NoWoodPrice();
+        }
+
+        capBinding = cap < marketX8;
+        uint256 sourceX8 = capBinding ? cap : marketX8;
+        price = _haircut(sourceX8);
+        // FLOOR AT 1 (finding 6). `_haircut` truncates, so a source small
+        // enough — below 2 wei-X8 at the 5,000 bps floor — resolves to a price
+        // of exactly zero, and zero is not "very cheap" to the consumers: it
+        // reverts `WoodPriceUnset` in `ChallengeGame.file` and makes
+        // `proposerBondWood` revert `InvalidParameter`. One wei-X8 keeps those
+        // paths alive at a valuation that is still, correctly, negligible.
+        // Guarded on `sourceX8 != 0` so a genuinely zero source stays zero
+        // rather than being invented into existence.
+        if (price == 0 && sourceX8 != 0) price = 1;
+    }
+
+    /// @dev The Chainlink WOOD/USD leg, normalised to 8 decimals. EVERY failure
+    ///      mode reports unavailable rather than reverting, including a bare
+    ///      revert from `latestRoundData`: a reverting aggregator must fall
+    ///      through to the TWAP, not take the price path down with it.
     ///
     ///      `code.length` is checked FIRST because Solidity's extcodesize guard
     ///      on a high-level call to a codeless address reverts in THIS frame,
     ///      which `try` cannot catch — the same reason `setGuardianRegistry`
     ///      guards its tolerant read that way.
-    function _woodPrice() internal view returns (uint256 price, bool usingFallback) {
+    function _feedPriceX8() internal view returns (uint256 priceX8, bool ok) {
         AssetFeed storage f = _woodFeed;
-        // `code.length` FIRST: `try` cannot catch the extcodesize revert a
-        // high-level call to a codeless address raises in THIS frame, so a
-        // zeroed proxy would still propagate past the wrap below.
         address feed = f.feed;
-        if (feed == address(0) || feed.code.length == 0) return (_haircut(woodUsdPriceX8), true);
+        if (feed == address(0) || feed.code.length == 0) return (0, false);
         try IAggregatorMinimal(feed).latestRoundData() returns (
             uint80, int256 answer, uint256, uint256 updatedAt, uint80
         ) {
-            if (answer <= 0) return (_haircut(woodUsdPriceX8), true);
+            if (answer <= 0) return (0, false);
             uint256 age = block.timestamp > updatedAt ? block.timestamp - updatedAt : 0;
-            if (age > f.maxDelay) return (_haircut(woodUsdPriceX8), true);
+            if (age > f.maxDelay) return (0, false);
             // Normalise to 8 decimals. `answer > 0` checked above.
             // forge-lint: disable-next-line(unsafe-typecast)
-            uint256 priceX8 = (uint256(answer) * 1e8) / (10 ** f.feedDecimals);
-            return (_haircut(priceX8), false);
+            return ((uint256(answer) * 1e8) / (10 ** f.feedDecimals), true);
         } catch {
-            return (_haircut(woodUsdPriceX8), true);
+            return (0, false);
         }
     }
 
-    /// @dev THE HAIRCUT APPLIES TO BOTH PATHS. Applying it only to the feed
-    ///      would make the fallback LESS conservative than the primary
-    ///      whenever governance sets a haircut below 100%: the degraded path
-    ///      would return `woodUsdPriceX8` raw while the healthy path discounts
-    ///      it, over-valuing bonds precisely when more margin is wanted.
-    ///      `setWoodUsdPrice` bounds only upward moves, so the manual number may
-    ///      sit at spot — haircutting both is what keeps it a conservative floor.
+    /// @dev The TWAP leg. A LOW-LEVEL STATICCALL, not a typed `try`, and the
+    ///      `ok` flag is decoded as a `uint256`.
+    ///
+    ///      `abi.decode(ret, (uint256, bool))` REVERTS — uncatchably, in this
+    ///      frame — on any second word that is not 0 or 1. A wired contract
+    ///      whose `consult()` returns a dirty word would therefore take the
+    ///      entire price path down, which is exactly the failure this defensive
+    ///      wrapper exists to prevent. Decoding both words as `uint256` and
+    ///      comparing the flag against 1 cannot revert on any return data, and
+    ///      treats anything that is not a clean `true` as unavailable.
+    ///
+    ///      `code.length` first, for the same extcodesize reason as
+    ///      `_feedPriceX8`; a short return is rejected before decoding; and a
+    ///      zero price is rejected because `min(0, cap)` would drag every bond
+    ///      to nothing exactly as silently as the failure this replaced.
+    function _twapPriceX8() internal view returns (uint256 priceX8, bool ok) {
+        address oracle = woodTwapOracle;
+        if (oracle == address(0) || oracle.code.length == 0) return (0, false);
+        (bool success, bytes memory ret) = oracle.staticcall(abi.encodeCall(IWoodTwapOracle.consult, ()));
+        if (!success || ret.length < 64) return (0, false);
+        (uint256 twapX8, uint256 flag) = abi.decode(ret, (uint256, uint256));
+        if (flag != 1 || twapX8 == 0) return (0, false);
+        return (twapX8, true);
+    }
+
+    /// @dev THE HAIRCUT APPLIES TO WHATEVER SOURCE WON, and to the cap when the
+    ///      cap is what bound. Applying it to only one of them would make one
+    ///      branch less conservative than the other for no reason a reader
+    ///      could see; applying it after the `min` keeps a single discount on a
+    ///      single number.
     function _haircut(uint256 priceX8) internal view returns (uint256) {
         return (priceX8 * woodHaircutBps) / BPS_DENOMINATOR;
     }
@@ -373,42 +550,49 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
 
     // ── Owner setters ──
 
-    /// @dev BOUNDED AT 2x PER UPWARD CHANGE ONLY. This is the single scalar
-    ///      behind every guardian's coverage: set high, every quorum is
-    ///      trivially satisfied and the coverage check becomes theatre.
+    /// @notice Set the price CAP. This is the emergency brake: lowering it
+    ///         lowers every bond's valuation immediately, in the safe
+    ///         direction, without bound and without delay.
     ///
-    ///      ZERO IS STILL ALLOWED. Rejecting it would not prevent disabling
-    ///      coverage — 1 wei-X8 does the same — and would strand the price with
-    ///      no way back up once at zero. The fail-closed direction is
-    ///      intentional (spec §3.7); the mitigation is owner custody, not a
-    ///      value check. The FIRST price is exempt since there is nothing to
-    ///      bound it against.
+    /// @dev ══ NO RATE LIMIT HERE, AND THAT IS DELIBERATE (issue #89) ══
     ///
-    ///      ONLY THE UPWARD MOVE IS BOUNDED, because the two directions are not
-    ///      symmetric: upward over-values bonds and makes quorums easier to
-    ///      clear (the dangerous direction), while downward only tightens
-    ///      quorums. Rate-limiting downward would be harmful — this price
-    ///      exists to absorb a WOOD crash, and capping the recovery at 2x per
-    ///      transaction would leave bonds over-valued for as long as it took to
-    ///      walk the price down, exactly when coverage matters most.
+    ///      THIS FUNCTION IMPOSES NO RATE LIMIT AND NO SIZE CEILING. An owner
+    ///      may set any value, any number of times, in the same block. Rate
+    ///      limiting is enforced OFF-CHAIN, by a Zodiac Delay/Roles module on
+    ///      the owner Safe. A reader looking for the self-limit that used to be
+    ///      here should look at the Safe's module configuration, not at this
+    ///      contract — see `openspec/specs/deployment-docs/spec.md`.
+    ///
+    ///      WHAT WAS REMOVED, AND WHY BOTH HAD TO GO TOGETHER. There was a
+    ///      1-day `MIN_PRICE_UPDATE_INTERVAL` plus a `newPriceX8 <= current * 2`
+    ///      ceiling on upward moves. The interval was what made the ceiling a
+    ///      rate limit at all — a 2x cap with no time component is not one,
+    ///      since N calls in a single multisig batch move the price 2^N. So the
+    ///      ceiling could not be kept alone: it would have advertised a
+    ///      protection that the exact party it constrains can trivially bypass,
+    ///      which is worse than no protection, because a reviewer stops looking.
+    ///
+    ///      WHY IT WENT RATHER THAN BEING FIXED. The interval gated BOTH
+    ///      directions while the size ceiling gated only one, so the code
+    ///      limited the size of a move by direction but its timing regardless.
+    ///      After design revision 2, lowering this cap IS the emergency action,
+    ///      so the limit sat directly on crisis response: a routine morning
+    ///      adjustment spent the lever and left no brake that afternoon. A
+    ///      self-limit on an already-trusted owner bought little and cost
+    ///      exactly the responsiveness it most needed to preserve.
+    ///
+    ///      WHAT THE OFF-CHAIN CONTROL MUST PRESERVE: the delay has to be
+    ///      ASYMMETRIC — raises delayed, drops immediate. A plain Zodiac Delay
+    ///      module is symmetric and would relocate this bug rather than fix it.
+    ///
+    ///      ZERO IS STILL ALLOWED, and under design revision 2 it is a HARD
+    ///      STOP rather than a $0 valuation: `_woodPrice` reverts `NoWoodPrice`
+    ///      on a zero cap, so proposing and executing halt while votes continue
+    ///      to land. Rejecting zero would not prevent stopping the protocol —
+    ///      1 wei-X8 comes close enough — and would strand the cap with no way
+    ///      back up.
     function setWoodUsdPrice(uint256 newPriceX8) external onlyOwner {
         uint256 current = woodUsdPriceX8;
-        uint256 last = lastPriceUpdateAt;
-
-        // THE INTERVAL IS WHAT MAKES THIS A RATE LIMIT. A 2x ceiling with no
-        // time component is not one: N calls in a single multisig batch move
-        // the price 2^N. Only the first-ever price is exempt, since there is
-        // nothing to compare it against.
-        if (last != 0 && block.timestamp < last + MIN_PRICE_UPDATE_INTERVAL) revert InvalidParameter();
-
-        // The ceiling binds every upward move except a recovery from zero.
-        // Zero stays SETTABLE as the emergency stop; any non-zero value
-        // exceeds `0 * 2` so a stuck-at-zero price could never recover
-        // otherwise. The interval above closes the `set(0)` then
-        // `set(anything)` round trip, at a day's cost instead of two calls.
-        if (current != 0 && newPriceX8 > current * 2) revert InvalidParameter();
-
-        lastPriceUpdateAt = uint64(block.timestamp);
         emit WoodUsdPriceSet(current, newPriceX8);
         woodUsdPriceX8 = newPriceX8;
     }
@@ -419,10 +603,11 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///         governance path back from a bad aggregator, since every coverage
     ///         path prices bonds through `_woodPrice`.
     ///
-    ///         Unwiring is SAFE: it falls back to `woodUsdPriceX8`, haircut on
-    ///         the same terms as the feed and maintained as a conservative
-    ///         floor. It is a degraded mode, not a resting state — the manual
-    ///         number lags a crash.
+    ///         Unwiring is safe ONLY WHILE A TWAP ORACLE IS WIRED — it drops to
+    ///         that source, capped on the same terms. With neither wired there
+    ///         is no market data and every price read reverts `NoWoodPrice`, so
+    ///         an operator clearing a bad aggregator must confirm
+    ///         `woodTwapOracle` is live first.
     ///
     ///         UNWIRING MUST BE SPELLED `setWoodFeed(address(0), 0)`. `maxDelay`
     ///         is REQUIRED to be zero rather than merely ignored, so a mis-typed
@@ -450,18 +635,58 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         emit WoodFeedSet(feed, maxDelay);
     }
 
-    /// @dev Bounded like every other bps setter here. A zero haircut would
-    ///      value bonds at $0 and brick approvals; above 100% would value them
-    ///      ABOVE market, overstating coverage.
-    /// @dev Rate-limited and floored like `setWoodUsdPrice`: an unbounded
-    ///      multiplier on the same quantity would let the owner move every
-    ///      bond's valuation 10,000x in a single transaction. A haircut below
-    ///      `MIN_WOOD_HAIRCUT_BPS` is a mis-set parameter rather than a policy.
+    /// @inheritdoc IExposureLedger
+    ///
+    /// @dev THE PAIR IS VALIDATED BEFORE IT IS TRUSTED. Four WOOD/WETH Uniswap
+    ///      V3 pools exist on chain 4663 and all four are initialised-but-never-
+    ///      traded shells: `getPool` returns a non-zero address, so "does the
+    ///      pool exist?" passes and the price read comes back garbage. The V2
+    ///      analogue — an oracle pointed at a pair of the right shape holding
+    ///      the wrong tokens, or holding nothing — would price guardian
+    ///      collateral off an unrelated market. `validatePair()` re-checks the
+    ///      token ordering, both reserves and the accumulator, and wiring is
+    ///      refused unless it answers a clean `true`.
+    ///
+    ///      PROBED, NOT CALLED TYPED, and the answer decoded as a `uint256`.
+    ///      Identical reasoning to `_twapPriceX8` and to `DeployPlanB`'s
+    ///      delegation probe: `abi.decode` into a `bool` reverts on any word
+    ///      that is not 0 or 1, so a malformed answer would become an
+    ///      undecodable revert instead of the refusal it should be. Anything
+    ///      that is not exactly 1 is refused.
+    ///
+    ///      `code.length` FIRST — the extcodesize guard on a high-level call to
+    ///      a codeless address reverts in this frame, which no `try` can catch.
+    ///
+    ///      UNWIRING TO ZERO IS ACCEPTED and validates nothing, because there
+    ///      is nothing to validate. It is not a safe resting state on 4663; see
+    ///      the interface note.
+    function setWoodTwapOracle(address oracle) external onlyOwner {
+        if (oracle != address(0)) {
+            if (oracle.code.length == 0) revert InvalidParameter();
+            (bool success, bytes memory ret) = oracle.staticcall(abi.encodeCall(IWoodTwapOracle.validatePair, ()));
+            if (!success || ret.length < 32) revert InvalidParameter();
+            if (abi.decode(ret, (uint256)) != 1) revert InvalidParameter();
+        }
+        emit WoodTwapOracleSet(woodTwapOracle, oracle);
+        woodTwapOracle = oracle;
+    }
+
+    /// @dev BOUNDED, BUT NOT RATE-LIMITED (issue #89). The `[MIN_WOOD_HAIRCUT_BPS,
+    ///      BPS_DENOMINATOR]` range stays — a haircut below the floor values
+    ///      every bond under half of market, which is a mis-set parameter
+    ///      rather than a policy, and above 100% would value bonds ABOVE market
+    ///      and overstate coverage. Those are VALUE bounds and they cost
+    ///      nothing in a crisis.
+    ///
+    ///      The 1-day interval that used to sit here is GONE, for the same
+    ///      reason it left `setWoodUsdPrice`: rate limiting is enforced
+    ///      off-chain by a Zodiac module on the owner Safe, and this contract
+    ///      deliberately imposes none. The interval was doubly awkward here —
+    ///      it gated the two levers independently, so spending one did not
+    ///      unlock the other, and tightening the haircut is a safe-direction
+    ///      move that a crisis is exactly when you want.
     function setWoodHaircutBps(uint256 newBps) external onlyOwner {
         if (newBps < MIN_WOOD_HAIRCUT_BPS || newBps > BPS_DENOMINATOR) revert InvalidParameter();
-        uint256 lastH = lastHaircutUpdateAt;
-        if (lastH != 0 && block.timestamp < lastH + MIN_PRICE_UPDATE_INTERVAL) revert InvalidParameter();
-        lastHaircutUpdateAt = uint64(block.timestamp);
         emit ParameterChangeFinalized(keccak256("woodHaircutBps"), woodHaircutBps, newBps);
         woodHaircutBps = newBps;
     }
@@ -604,6 +829,11 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///         maxExtractable — honest proposers not priced out, a rug forfeits
     ///         meaningfully"). Zero when the bond bps is zero; reverts
     ///         (fail-closed) when the WOOD price is unset.
+    /// @dev    ALSO REVERTS `NoWoodPrice` when no source can price WOOD, and
+    ///         that halt is deliberate: `SyndicateGovernor.propose` sizes the
+    ///         proposer bond through this view, so an unpriceable WOOD means no
+    ///         new risk can be admitted. Halting proposal CREATION costs
+    ///         nothing that cannot wait; admitting an unbonded proposal does.
     function proposerBondWood(address asset, uint256 requiredCoverage) external view returns (uint256) {
         uint256 usd = (coverageUsd(asset, requiredCoverage) * proposerBondBps) / BPS_DENOMINATOR;
         if (usd == 0) return 0;
@@ -681,10 +911,36 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         // stranded: it clears when the epoch bucket expires, or immediately on
         // a vote change.
         //
+        // AN UNPRICEABLE WOOD BOOKS NOTHING RATHER THAN REVERTING — the same
+        // treatment, and the same argument, as the `coverageUsd` wrap above.
+        // Under design revision 2 `_woodPrice` REVERTS `NoWoodPrice` when no
+        // market source can price WOOD (there is no fallback scalar any more),
+        // and that revert reaches here through `slashableBondUsd`. Letting it
+        // propagate would fail the APPROVE vote while Block votes kept landing,
+        // turning the review block-only: guardians could veto but never
+        // endorse, and the proposal would pass optimistically anyway. That is
+        // the failure reviews M3, N1 and N4 each removed, and it must not be
+        // reintroduced by the price path.
+        //
+        // Booking nothing is the conservative half: this guardian commits no
+        // coverage, so `requireApproveQuorum` cannot be met at execute and
+        // fails loudly there — where reverting is the safe direction.
+        //
+        // Called through `this` so the revert is catchable; a same-contract
+        // call cannot be wrapped. Only the PRICE is wrapped, not the sWOOD
+        // read: a reverting `guardianStake` is a broken core dependency, not an
+        // oracle outage, and should not be silently absorbed.
+        uint256 priceX8;
+        try this.woodPriceX8() returns (uint256 p) {
+            priceX8 = p;
+        } catch {
+            return; // no WOOD price right now: book nothing, let the quorum decide
+        }
+
         // Free budget = k * bond - open exposure. Zero free budget is the
         // batching attack's boundary: this guardian's bond is already fully
         // spoken for by its other open approvals, so it cannot back another drain.
-        uint256 capUsd = kNumerator * slashableBondUsd(guardian);
+        uint256 capUsd = kNumerator * _slashableBondUsd(guardian, priceX8);
         uint256 open = openExposureUsd(guardian);
         // NO FREE BUDGET -> BOOK NOTHING, DON'T REVERT. Reverting here would
         // silence the approve side entirely for a guardian whose budget is
@@ -851,7 +1107,37 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
 
     /// @inheritdoc IExposureLedger
     function hasFrozenCoverage(address guardian) external view returns (bool) {
-        return _frozenCommitments[guardian] != 0;
+        return _frozenCommitments[guardian] != 0 || _pinnedCoverageUntil[guardian] > block.timestamp;
+    }
+
+    /// @inheritdoc IExposureLedger
+    /// @dev EXTENDS THE FREEZE'S REACH PAST ITS OWN RELEASE (issue #95).
+    ///      `unfreezeCoverage` drops the moment no challenge against this key
+    ///      is LIVE — but `ChallengeGame` can re-arm a legal re-challenge
+    ///      window (`challengeableUntil`) that outlives the live challenge
+    ///      that just resolved `Inconclusive`. Without this, both of sWOOD's
+    ///      unstake gates (`openExposureUsd`, which ages out on its own
+    ///      wall-clock tied to `challengeWindow` from EXECUTION, not from any
+    ///      re-arm) and `hasFrozenCoverage` (which just went false) can read
+    ///      clean while a conviction is still legally reachable — the accused
+    ///      claims its stake, and the eventual verdict recovers nothing.
+    ///
+    ///      Walks the SAME `_approversOf[key]` list `freezeCoverage` walks,
+    ///      for the same reason: only guardians who actually committed
+    ///      coverage to this proposal are the ones a still-open accusation
+    ///      can slash. `deadline` only ever RAISES `_pinnedCoverageUntil`,
+    ///      mirroring `challengeableUntil`'s own monotonic-raise semantics one
+    ///      layer up — a later, larger extension must not be shadowed by an
+    ///      earlier, smaller one still in effect.
+    function pinCoverageUntil(address governor, uint256 proposalId, uint256 deadline) external onlyFreezer {
+        bytes32 key = _reviewKey(governor, proposalId);
+        address[] storage listed = _approversOf[key];
+        for (uint256 i = 0; i < listed.length; i++) {
+            address g = listed[i];
+            if (_recorded[key][g].usd == 0) continue;
+            if (deadline > _pinnedCoverageUntil[g]) _pinnedCoverageUntil[g] = deadline;
+        }
+        emit CoveragePinned(governor, proposalId, deadline);
     }
 
     /// @inheritdoc IExposureLedger
@@ -942,6 +1228,13 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      identified, bonded signer behind anything tier-gated into this
     ///      check, and an unbonded approver is exactly what the punitive slash
     ///      has no grip on.
+    ///
+    /// @dev LETS `NoWoodPrice` PROPAGATE, deliberately. This gate runs at
+    ///      execution, where reverting is the safe direction: with no source
+    ///      able to price WOOD there is no proof that anyone's bond covers
+    ///      anything, and executing on an unprovable coverage claim is the
+    ///      exact outcome the gate exists to refuse. `recordApproval` is the
+    ///      one consumer that catches instead — see `IExposureLedger`.
     function requireApproveQuorum(address governor, uint256 proposalId, address asset, uint256 requiredCoverage)
         external
         view
@@ -1189,6 +1482,15 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      guardian's own pledge — exactly what they would be holding had
     ///      nobody ever settled — so it can only walk back toward the
     ///      un-settled baseline and never past it.
+    ///
+    ///      THE PLEDGE IS NOT THE ONLY BOUND, because the guardian may have
+    ///      spent the freed budget in the meantime. `_rebook` clamps every
+    ///      upward move to `kNumerator * slashableBondUsd` less the guardian's
+    ///      exposure elsewhere (issue #110) — without it, a re-run could push a
+    ///      guardian past the batching cap that `recordApproval` enforces, using
+    ///      nothing but gas. The clamp binds only when the guardian genuinely
+    ///      over-committed elsewhere; with no competing exposure the walk-up is
+    ///      unrestricted and the repair property above is untouched.
     function settleCoverage(address governor, uint256 proposalId) external {
         bytes32 key = _reviewKey(governor, proposalId);
 
@@ -1235,6 +1537,12 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         // rather than the live bookings, since the bookings are what this
         // function is about to rewrite — dividing by them would make each pass
         // depend on the last.
+        // REVERTS ON `NoWoodPrice` rather than settling at a price nobody can
+        // vouch for. Settlement is permissionless and safe to skip — a pass
+        // that does not happen leaves the budget over-reserved, which is the
+        // conservative state — so an outage costs a retry, not a stuck
+        // proposal. Contrast `recordApproval`, where declining to act would
+        // disenfranchise a voter rather than merely delay a refund.
         uint256 priceX8 = woodPriceX8();
         uint256 effectiveTotal = _effectiveReservedTotal(key, priceX8);
         if (effectiveTotal == 0) {
@@ -1254,9 +1562,16 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
             uint256 liveG = _slashableBondUsd(g, priceX8);
             uint256 mine = liveG < reserved ? liveG : reserved;
             uint256 alloc = _allocate(mine, effectiveTotal, needUsd);
-            assigned += alloc;
-            headroom[i] = mine - alloc; // `_allocate` never scales up: alloc <= mine
-            _rebook(key, g, alloc);
+            // BOOKED, NOT ALLOCATED. `_rebook` clamps an upward move to the
+            // guardian's free budget (issue #110), so what it returns can be
+            // below `alloc`. Accruing the allocation instead would overstate
+            // `assigned`, understate the residue, and put a number in
+            // `CoverageSettled` that no bucket holds.
+            uint256 booked = _rebook(key, g, alloc, priceX8);
+            assigned += booked;
+            // `_allocate` never scales up (alloc <= mine) and the clamp only
+            // lowers, so booked <= mine.
+            headroom[i] = mine - booked;
         }
 
         // Truncation leaves the total a few wei under `needUsd`. Hand the
@@ -1288,9 +1603,16 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
                 if (room == 0) continue;
                 uint256 take = room < residue ? room : residue;
                 address g = listed[i];
-                _rebook(key, g, uint256(_recorded[key][g].usd) + take);
-                residue -= take;
-                assigned += take;
+                // AND BOUNDED A SECOND TIME BY THE BATCHING CAP. `room` bounds
+                // the top-up by what this guardian could PAY; `_rebook`'s clamp
+                // bounds it by what this guardian may still UNDERWRITE (issue
+                // #110). Credit only what the bucket actually took, or a
+                // guardian already at its cap would silently swallow the residue
+                // and starve the approvers behind it in the list.
+                uint256 before = uint256(_recorded[key][g].usd);
+                uint256 gained = _rebook(key, g, before + take, priceX8) - before;
+                residue -= gained;
+                assigned += gained;
             }
         }
 
@@ -1299,16 +1621,70 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     }
 
     /// @dev Move a guardian's live booking to `target`, keeping its epoch bucket
-    ///      in step. Both directions: settlement is re-runnable, so a booking
-    ///      that was written down at a bad price has to be able to walk back up.
-    ///      `target` is always `<= _reservedUsd[key][g]`, which `recordApproval`
+    ///      in step, and return what was ACTUALLY booked. Both directions:
+    ///      settlement is re-runnable, so a booking that was written down at a
+    ///      bad price has to be able to walk back up.
+    ///
+    ///      `target` is bounded by `_reservedUsd[key][g]`, which `recordApproval`
     ///      bounded to `uint192`, so neither the cast nor the bucket arithmetic
     ///      can misbehave — the bucket was incremented by the pledge and every
-    ///      subsequent booking is a fraction of it.
-    function _rebook(bytes32 key, address g, uint256 target) internal {
+    ///      subsequent booking is a fraction of it. The RETURN VALUE may be
+    ///      strictly below `target`; see the clamp.
+    ///
+    /// @dev THE BATCHING CAP IS RE-CHECKED ON THE WAY UP (issue #110).
+    ///      `_buckets` is §3.3's state — `openExposureUsd(g) <= kNumerator *
+    ///      slashableBondUsd(g)` is a property of it — and this function is the
+    ///      only writer of it besides `recordApproval`. Enforcing the cap only at
+    ///      approve time left a hole, because the pledge a settlement pass walks
+    ///      a booking back up to was checked against the guardian's exposure AS
+    ///      IT WAS AT THE VOTE, and an earlier pass may have freed budget the
+    ///      guardian has since legally spent elsewhere:
+    ///
+    ///        1. g1 and g2 each reserve the full coverage of P1; g1 is at its cap.
+    ///        2. Anyone settles P1: both bookings are written DOWN pro-rata and
+    ///           half of g1's budget comes free.
+    ///        3. g1 approves P2 with it. Legal — `recordApproval`'s check passes.
+    ///        4. g2 is slashed to zero on an unrelated conviction.
+    ///        5. Anyone re-runs settlement on P1. `_effectiveReservedTotal` sums
+    ///           over LIVE bonds, so it has fallen, so `_allocate` hands g1 more
+    ///           and this function books it — g1 now backs 1.5x its own bond.
+    ///
+    ///      Step 5 is permissionless and step 4 is ordinary operation, so the
+    ///      state `recordApproval`'s natspec calls unreachable was reachable
+    ///      without capital, manipulation, or a privileged role.
+    ///
+    ///      CLAMPED, NOT REVERTED, matching `recordApproval`: a guardian with no
+    ///      free budget books nothing there rather than taking the vote down, and
+    ///      a settlement that reverted would be one an adversary could brick for
+    ///      a whole cohort by parking exposure on a single approver. The clamp
+    ///      costs an `openExposureUsd` bucket scan, so it is paid ONLY on the
+    ///      upward branch — shrinking a booking can never breach the cap, and the
+    ///      first pass on any proposal is all shrink.
+    ///
+    ///      `openExposureUsd(g)` ALREADY counts this key's current booking, so
+    ///      the bound is `current + (cap - open)` and not `cap - open`;
+    ///      subtracting the booking twice would clamp repairs that breach
+    ///      nothing. This also keeps the clamp a CLAMP rather than a freeze: with
+    ///      no competing exposure `open == current`, the bound is the full cap,
+    ///      and a written-down booking still walks all the way back to its
+    ///      pledge.
+    ///
+    ///      A clamp can leave the cohort's aggregate under `needUsd`. That is the
+    ///      same honest shortfall the residue top-up already produces when the
+    ///      cohort's live value has fallen below the need: `requireApproveQuorum`
+    ///      sums the bookings and fails loudly at execute. Settling still neither
+    ///      creates nor destroys coverage.
+    function _rebook(bytes32 key, address g, uint256 target, uint256 priceX8) internal returns (uint256) {
         RecordedExposure memory r = _recorded[key][g];
         uint256 current = uint256(r.usd);
-        if (target == current) return;
+        if (target > current) {
+            uint256 capUsd = kNumerator * _slashableBondUsd(g, priceX8);
+            uint256 open = openExposureUsd(g);
+            uint256 headroom = capUsd > open ? capUsd - open : 0;
+            uint256 maxTarget = current + headroom;
+            if (target > maxTarget) target = maxTarget;
+        }
+        if (target == current) return current;
         if (target < current) {
             _buckets[g][r.epoch] -= (current - target);
         } else {
@@ -1316,6 +1692,7 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         }
         // forge-lint: disable-next-line(unsafe-typecast)
         _recorded[key][g].usd = uint192(target);
+        return target;
     }
 
     /// @dev `_effectiveTotal` over the PLEDGES rather than the live bookings.

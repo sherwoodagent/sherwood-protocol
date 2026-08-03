@@ -23,6 +23,7 @@ import {ProtocolConfig} from "../src/ProtocolConfig.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "./mocks/MockAgentRegistry.sol";
+import {MockWoodTwapOracle} from "./mocks/MockWoodTwapOracle.sol";
 
 /// @dev Chainlink-shaped USD feed for the vault asset. Mirrors
 ///      `ChallengeEndToEndTest`'s own `ChallengeE2EFeed`.
@@ -212,8 +213,13 @@ contract TokenCourtEndToEndTest is Test {
         //    freshness are current.
         ledger = new ExposureLedger(ledgerOwner, address(swood), EPOCH_LENGTH);
         feed = new TCE2EFeed(1e8, 8); // $1.00, 8-dec
+        // Design revision 2: `woodUsdPriceX8` is a CAP, never a price. WOOD is
+        // valued from the TWAP oracle at $0.05, with the cap 2x ABOVE it and
+        // therefore NOT binding — the configuration production ships.
+        MockWoodTwapOracle woodTwap = new MockWoodTwapOracle(0.05e8);
         vm.startPrank(ledgerOwner);
-        ledger.setWoodUsdPrice(0.05e8); // conservative governance haircut
+        ledger.setWoodUsdPrice(0.1e8);
+        ledger.setWoodTwapOracle(address(woodTwap));
         ledger.setAssetFeed(address(usdg), address(feed), 365 days);
         ledger.setCoveredTvlCapUsd(10_000_000e18);
         ledger.setGuardianRegistry(address(registry));
@@ -487,6 +493,9 @@ contract TokenCourtEndToEndTest is Test {
         // into sWOOD partway through, so an earlier baseline would net that
         // inflow against the slash and understate it.
         uint256 swoodBalPreSlash = wood.balanceOf(address(swood));
+        // Read while the bond is still escrowed: conviction forfeits it, and
+        // the prosecutor's fee is a slice of exactly this amount.
+        (, uint256 proposerBond) = bondEscrow.bondOf(address(gov), pid);
         court.finalize(caseId);
 
         // ── The verdict landed on the REAL game.
@@ -498,20 +507,19 @@ contract TokenCourtEndToEndTest is Test {
         uint256 slashedGross = (G1_STAKE * expectedBps) / 10_000;
         assertEq(swood.guardianStake(g1), G1_STAKE - slashedGross, "g1 paid exactly what it owed");
 
-        // ── The challenger is repaid bond + the whole forfeited pool, PLUS the
-        //    conviction bounty (Task 2, spec 2026-07-29 §2): this ruling is an
-        //    ESCALATED conviction (a real `Guilty` verdict from the court, on
-        //    the real StakedWood), so `_settle` forwards the challenge's pinned
-        //    `convictionBountyBpsAtFiling` and sWOOD pays it straight to the
-        //    challenger, off the top of the gross slash, before the escrow ever
-        //    sees the proceeds -- exactly what makes this arc different from an
-        //    unanswered silence settle, which pays none of this.
+        // ── The challenger is repaid its bond plus the whole forfeited pool,
+        //    plus the prosecutor's fee. THE SLASH ITSELF PAYS NO ONE: every wei
+        //    of it burns. The fee comes from the convicted proposer's forfeited
+        //    bond instead, which is the one pot a prosecutor cannot fund for
+        //    itself — so even an escalated win here is paid by the accused
+        //    proposer, never out of the guardians' slash.
         IChallengeGame.Challenge memory c = game.challengeOf(cid);
-        uint256 bounty = (slashedGross * c.convictionBountyBpsAtFiling) / 10_000;
+        uint256 prosecutorFee = (proposerBond * game.prosecutorFeeBps()) / 10_000;
+        assertGt(prosecutorFee, 0, "the fee is live in this fixture");
         assertEq(
             wood.balanceOf(challenger),
-            challengerBalBefore + c.counterBondWood + bounty,
-            "bond back plus the whole pool plus the escalated conviction bounty"
+            challengerBalBefore + c.counterBondWood + prosecutorFee,
+            "bond back, the whole forfeited pool, and the prosecutor's cut of the proposer bond"
         );
 
         // ── The named adapter lost its certification (D7).

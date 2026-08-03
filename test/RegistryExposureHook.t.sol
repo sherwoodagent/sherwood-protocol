@@ -11,6 +11,7 @@ import {IGuardianRegistry} from "../src/interfaces/IGuardianRegistry.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 import {MockGovernorMinimal} from "./mocks/MockGovernorMinimal.sol";
+import {MockWoodTwapOracle} from "./mocks/MockWoodTwapOracle.sol";
 
 /// @dev Chainlink feed stub (copied from test/ExposureLedger.t.sol) — the
 ///      ledger reads `latestRoundData` + `decimals` to value coverage.
@@ -151,8 +152,13 @@ contract RegistryExposureHookTest is Test {
         // price. epochLength 28d + challengeWindow 14d = 42d <= coolDown 45d.
         ledger = new ExposureLedger(ledgerOwner, address(wired.swood), 28 days);
         feed = new MockFeed(1e8, 8); // $1.00, 8-dec feed
+        // Design revision 2: `woodUsdPriceX8` is a CAP, never a price. WOOD is
+        // valued from the TWAP oracle at $0.05, with the cap 2x ABOVE it and
+        // therefore NOT binding — the configuration production ships.
+        MockWoodTwapOracle woodTwap = new MockWoodTwapOracle(0.05e8);
         vm.startPrank(ledgerOwner);
-        ledger.setWoodUsdPrice(0.05e8); // $0.05 conservative haircut
+        ledger.setWoodUsdPrice(0.1e8);
+        ledger.setWoodTwapOracle(address(woodTwap));
         ledger.setAssetFeed(address(wired.asset), address(feed), 1 days);
         ledger.setCoveredTvlCapUsd(1_000_000e18); // generous
         ledger.setGuardianRegistry(address(wired.registry));

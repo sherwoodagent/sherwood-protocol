@@ -87,6 +87,17 @@ contract ProposerBondEscrow is IProposerBondEscrow {
     ///      uncompensatable slash residue.
     address public constant BURN_ADDRESS = 0x000000000000000000000000000000000000dEaD;
 
+    /// @notice Ceiling on the prosecutor's cut of a forfeited bond, in bps.
+    /// @dev    20%, mirroring the bound sWOOD puts on its own caller-named
+    ///         payout. It exists for the same reason: `forfeitBond`'s payee is
+    ///         chosen by the convictor, a replaceable role, so the escrow
+    ///         bounds how much of any ONE bond a compromised game could send to
+    ///         an address of its choosing. The remainder can only ever reach
+    ///         `BURN_ADDRESS`. This is the ONLY discretion in the contract —
+    ///         both exits are otherwise non-discretionary, and the payee is
+    ///         bounded rather than free.
+    uint256 public constant MAX_PROSECUTOR_FEE_BPS = 2_000;
+
     mapping(bytes32 bondKey => Bond) internal _bonds;
 
     constructor(address wood_, address registry_, address exposureLedger_) {
@@ -158,7 +169,7 @@ contract ProposerBondEscrow is IProposerBondEscrow {
     ///
     /// @dev AUTHORIZATION — WHO. `msg.sender` must be the live
     ///      `coverageFreezer` of the wired ledger, which is the challenge game
-    ///      and nothing else. The precedent is `StakedWood.slashToEscrow`'s
+    ///      and nothing else. The precedent is `StakedWood.slashVerdict`'s
     ///      `authorizedSlasher`: one named contract, the one that reaches
     ///      verdicts, may move somebody else's capital. The difference is where
     ///      the name is kept — sWOOD keeps its own owner-set copy, this escrow
@@ -172,45 +183,60 @@ contract ProposerBondEscrow is IProposerBondEscrow {
     ///      unreachable forfeiture leaves bonds releasable, while a
     ///      permissive one destroys them.
     ///
-    /// @dev DESTINATION — WHERE. Burned, not routed to `CompensationEscrow`:
-    ///      `CompensationEscrow.openCase` is `onlyFunder` against a SINGLE
-    ///      owner-set funder slot, already held by `StakedWood`. Paying a bond
-    ///      into it would mean changing the escrow's access model — a
-    ///      contract that custodies LP compensation and is not otherwise
-    ///      touched here — which belongs in its own review.
+    /// @dev DESTINATION — WHERE. Burned, less the prosecutor's fee. There is
+    ///      no compensation sink left to route to: `CompensationEscrow` was
+    ///      deleted when the slash became punitive rather than compensatory,
+    ///      so the choice is not burn-versus-compensate but burn-versus-payee.
     ///
-    ///      Burning is also independently defensible, by the same reasoning
+    ///      Burning is independently defensible, by the same reasoning
     ///      `forfeitBurnBps` sets out for the challenger bond, applied to a
     ///      party that is by construction the attacker: EVERY REACHABLE PAYEE
     ///      IS A ROUND TRIP.
-    ///        - The challenger? Addresses are free. A proposer can file against
-    ///          its own drain and refund itself the bond it was supposed to
-    ///          lose, at the cost of a challenger bond it also gets back.
-    ///        - The vault's LPs, via `CompensationEscrow`? Closest to the
-    ///          ideal — but even there the proposer may hold shares and
-    ///          recover its pro-rata slice, since the case is apportioned on
-    ///          a pre-drain snapshot it could have bought into before
-    ///          proposing. Beyond the `onlyFunder` blocker above, `openCase`
-    ///          can revert on `EmptySnapshot` / `SnapshotNotPast` /
-    ///          `NothingToCompensate`, and it would be reverting inside
-    ///          `_settle`, where the caller already treats a failable
-    ///          external call as something to wrap rather than trust (see
-    ///          the best-effort `demoteByChallenge`).
+    ///        - The challenger, in FULL? Addresses are free. A proposer could
+    ///          file against its own drain and refund itself the whole bond it
+    ///          was supposed to lose, at the cost of a challenger bond it also
+    ///          gets back. This is why the prosecutor's fee is a BOUNDED slice
+    ///          and never the whole bond: at `MAX_PROSECUTOR_FEE_BPS` the
+    ///          self-filing proposer recovers at most 20% and destroys 80%, so
+    ///          the round trip exists but loses money on every pass. A capped
+    ///          leak is a different object from an open door.
+    ///        - The vault's LPs? Compensation was retired with the escrow: the
+    ///          slash is punitive now, not compensatory, and there is no
+    ///          apportionment contract left to pay into. Even when there was,
+    ///          the proposer could hold shares and recover its pro-rata slice
+    ///          from a pre-drain snapshot it had bought into before proposing.
     ///        - A treasury? Pays whoever governs, which the attacker may be or
     ///          may lobby.
-    ///      Destruction is the only sink with no beneficiary to be, so the loss
-    ///      falls exactly on whoever forfeited. It is also why this is a
-    ///      constant and not a parameter: a caller-chosen destination would
-    ///      hand a compromised game the power to redirect bonds to itself,
-    ///      which is the specific thing sWOOD refuses when it keeps the
-    ///      compensation escrow as owner-set state rather than a
-    ///      `slashToEscrow` argument.
+    ///      Destruction is the only sink with no beneficiary to be, so the
+    ///      remainder falls exactly on whoever forfeited. It is also why the
+    ///      BURN destination is a constant and not a parameter: a caller-chosen
+    ///      sink would hand a compromised game the power to redirect whole
+    ///      bonds to itself.
     ///
-    /// @dev NO PARTIAL FORFEIT, and no bounty carved off the top. The proposer
-    ///      bond is priced at what the proposal could extract; a conviction
-    ///      means it extracted. Splitting it would reintroduce a payee.
-    function forfeitBond(address governor, uint256 proposalId) external returns (address, uint256) {
+    /// @dev NO PARTIAL FORFEIT: the whole bond always leaves the proposer. The
+    ///      bond is priced at what the proposal could extract and a conviction
+    ///      means it extracted, so the proposer's loss is invariant — what
+    ///      `feeBps` decides is only how much of that loss is PAID to the
+    ///      prosecutor rather than burned, never how much the proposer keeps.
+    /// @dev THE FEE PAYEE IS CALLER-CHOSEN, deliberately, because only the
+    ///      caller knows which challenger caused this conviction — but the RATE
+    ///      is not: `MAX_PROSECUTOR_FEE_BPS` is enforced here rather than
+    ///      trusted from the game, the same way sWOOD re-clamps `slashBpsPer`
+    ///      rather than trusting `ExposureLedger`. A compromised game can
+    ///      choose who collects 20%; it cannot choose to hand over the rest.
+    function forfeitBond(address governor, uint256 proposalId, address feeTo, uint256 feeBps)
+        external
+        returns (address, uint256)
+    {
         if (msg.sender != exposureLedger.coverageFreezer()) revert NotAuthorizedConvictor();
+        // NOT TRUSTED FROM THE CALLER, for the same reason sWOOD re-checks the
+        // rates it is handed: the convictor is a replaceable role, and this
+        // contract is the one that actually moves the WOOD. Bounding the rate
+        // here is what keeps "a compromised convictor can divert AT MOST
+        // `MAX_PROSECUTOR_FEE_BPS` of any one bond" true no matter what the
+        // game does. Reverts rather than clamping — a caller-chosen payee must
+        // never be laundered into a smaller-but-still-caller-chosen one.
+        if (feeBps > MAX_PROSECUTOR_FEE_BPS) revert FeeBpsTooHigh();
         bytes32 key = _key(governor, proposalId);
         Bond memory b = _bonds[key];
         if (b.proposer == address(0)) revert NoBond();
@@ -220,7 +246,31 @@ contract ProposerBondEscrow is IProposerBondEscrow {
         // rather than double-burning, and a hooked WOOD cannot re-enter into a
         // still-live bond.
         delete _bonds[key];
-        if (b.amount != 0) wood.safeTransfer(BURN_ADDRESS, b.amount);
+
+        // THE PROSECUTOR'S FEE, AND WHY IT COMES FROM HERE. Catching a bad
+        // proposal has to pay someone, and this is the only pot in the protocol
+        // that a prosecutor cannot fund for itself: to self-deal you must BE
+        // the proposer, and then you are paying yourself a fraction of a bond
+        // you forfeit in full — always a net loss while the rate is under
+        // 10_000. That makes the fee sybil-proof by construction, with no role
+        // predicate to game and no cap to tune.
+        //
+        // It is deliberately NOT taken from the guardians' slash. That pot is
+        // fundable by a prosecutor willing to stake and approve the proposal it
+        // is about to accuse, which is why a slash-funded fee needed an
+        // approver-role predicate to price the sybil — and that predicate was
+        // controlled by the accused, who could zero the fee for free by
+        // funding their defence from an unrelated address.
+        uint256 fee;
+        if (feeTo != address(0) && feeBps != 0 && b.amount != 0) {
+            fee = (b.amount * feeBps) / 10_000;
+            if (fee != 0) {
+                wood.safeTransfer(feeTo, fee);
+                emit ProsecutorFeePaid(governor, proposalId, feeTo, fee);
+            }
+        }
+        uint256 burned = b.amount - fee;
+        if (burned != 0) wood.safeTransfer(BURN_ADDRESS, burned);
         emit BondForfeited(governor, proposalId, b.proposer, b.amount);
         return (b.proposer, b.amount);
     }

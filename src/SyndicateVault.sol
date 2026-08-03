@@ -29,6 +29,7 @@ import {ERC721Holder} from "@openzeppelin/contracts/token/ERC721/utils/ERC721Hol
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Address} from "@openzeppelin/contracts/utils/Address.sol";
 import {EnumerableSet} from "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 /**
  * @title SyndicateVault
@@ -532,7 +533,41 @@ contract SyndicateVault is
         if (balanceAfter < reserve + (balanceBefore * minBufferBps) / 10_000) revert BufferBreached();
     }
 
-    /// @dev Value-moving-selector allowlist gate.
+    /// @dev Two-part batch gate: a privileged-TARGET denylist (Part 1, always
+    ///      runs), then the value-moving-SELECTOR allowlist (Part 2, registry-
+    ///      dependent). The two are independent — do not collapse them, and do
+    ///      not move Part 1 below Part 2's registry lookup. See the block
+    ///      comments in the body for the adversary each part answers.
+    ///
+    ///      ── PART 1: privileged-target denylist ──
+    ///
+    ///      WHY TARGETS TOO: selector-guarding is not enough, because this
+    ///      adversary needs no value-moving selector at all. The batch runs via
+    ///      delegatecall, so every sub-call reaches its target carrying
+    ///      msg.sender == vault — exactly what the withdrawal queue's
+    ///      `onlyVault` gate checks. `queue.queueRedeem(attacker, victimShares,
+    ///      pid)` therefore clears that gate and mints the attacker a claim on
+    ///      shares the queue already escrows for someone else, while every other
+    ///      guard reads it as harmless: the queue's entrypoints move ZERO vault
+    ///      asset() in-tx (the value leaves later via `queue.claim`), so the
+    ///      net-outflow meter, the queue-reserve floor and the buffer floor all
+    ///      see nothing, and coverage prices an uncertified target at tier 2 —
+    ///      requiredCoverage == maxCapital, a price a 1-wei proposal buys.
+    ///      Blocked as a target CLASS rather than a selector list, so the next
+    ///      privileged queue function is covered by default.
+    ///
+    ///      UNCONDITIONAL: Part 1 runs above Part 2's registry staticcall and
+    ///      above BOTH of its degrade-open returns. That is deliberate and is
+    ///      the point of the fix: a queue steal is not priced, it is theft, so
+    ///      a registry-less governor must not be able to skip it.
+    ///
+    ///      SCOPE: exactly two addresses — the vault and its bound queue. NOT a
+    ///      target allowlist. Strategy adapters' own `onlyVault` entrypoints
+    ///      (`BaseStrategy.execute/settle/withdrawTo`) are the LEGITIMATE batch
+    ///      surface and stay open, bounded by Part 2, the outflow meter and tier
+    ///      pricing as before.
+    ///
+    ///      ── PART 2: value-moving-selector allowlist gate ──
     ///
     ///      WHY: the net-outflow meter above only sees the vault's own asset()
     ///      balance delta. `token.approve(attacker, max)` moves no balance, so
@@ -561,11 +596,70 @@ contract SyndicateVault is
     ///      gated (or reverts `MalformedCall`) conservatively.
     ///
     ///      UNSET REGISTRY: if the governor has no tier registry wired (or
-    ///      predates the getter), the guard cannot run and the batch is
-    ///      unguarded by design — the default is tier-2 / full-notional pricing
-    ///      anyway, and hard-reverting would brick vaults deployed without a
-    ///      registry.
+    ///      predates the getter), PART 2 cannot run and that half is skipped by
+    ///      design — the default is tier-2 / full-notional pricing anyway, and
+    ///      hard-reverting would brick vaults deployed without a registry.
+    ///      PART 1 IS NOT AFFECTED: it needs no registry, sits above both early
+    ///      returns, and still rejects the vault and its queue. Pinned by
+    ///      `test_targetGate_bitesEvenWithNoTierRegistryWired` (unset registry)
+    ///      and `test_targetGate_bitesEvenWhenGovernorHasNoTierGetter` (missing
+    ///      getter) — one per degrade-open branch, so relocating Part 1 below
+    ///      either return fails a test instead of silently re-opening the hole.
     function _guardBatchCalls(BatchExecutorLib.Call[] calldata calls) private view {
+        // ── PRIVILEGED-CALLEE GATE, ahead of everything else ──
+        //
+        // The batch runs under delegatecall, so every call carries
+        // `msg.sender == vault`. For the QUEUE that is decisive: its `onlyVault`
+        // gate is satisfied by a batch that merely names it as a target.
+        //
+        // For the VAULT the reason is different, and worth stating precisely so
+        // nobody re-permits it on a wrong premise. `msg.sender == vault` does
+        // NOT open this contract's self-gated functions: `settleRedeem` /
+        // `settleDeposit` require `msg.sender == _withdrawalQueue`, which the
+        // vault is not, and it satisfies neither `onlyOwner`, `onlyGovernor` nor
+        // the factory gate. The exposure is the PERMISSIONLESS surface instead —
+        // chiefly `requestDeposit`, which anyone may call: a batch naming the
+        // vault can escrow the vault's own float into the queue while directing
+        // the resulting deposit claim to an attacker (it self-approves first,
+        // which Part 2 permits, since `recipient == address(this)` is treated as
+        // an inflow). That one IS metered — the float genuinely leaves, so the
+        // net-outflow ceiling bounds it to maxCapital — which is why blocking
+        // the vault is defense-in-depth rather than a second live hole. It
+        // removes the standing dependency on "no permissionless entrypoint ever
+        // becomes dangerous to call as ourselves".
+        //
+        // No other meter catches it. `queue.queueRedeem(attacker, victimShares,
+        // pid)` mints a redeem claim against shares another owner escrowed
+        // while moving ZERO `asset()`: `netOutflow == 0` clears any
+        // `maxNetOutflow`, the reserve and buffer checks compare balances that
+        // never moved, and the selector is none of the four guarded below. The
+        // value leaves in a LATER transaction via `queue.claim`, which nothing
+        // meters. Coverage does not price it either — an uncertified target is
+        // tier 2, so `maxCapital = 1 wei` asks for ~$0.000002 of coverage, and
+        // any single approver clears that.
+        //
+        // BEFORE THE REGISTRY LOOKUP, DELIBERATELY. The selector guard below
+        // returns early for a governor with no `tierRegistry()` getter or an
+        // unset registry, and being unguarded there is a documented, accepted
+        // default. This check must not inherit that exemption: it is not
+        // pricing a call, it is refusing a capability, and a vault deployed
+        // without a registry needs it most.
+        //
+        // A TARGET CLASS, NOT A SELECTOR LIST. Enumerating today's reachable
+        // privileged functions would leave the next one added unprotected, and
+        // nothing a batch legitimately does names these two addresses as a
+        // target. `stampSettlement` shows why breadth matters — it is one-shot
+        // per pid, so one batch can pre-burn the settlement slot of proposals
+        // that have not happened yet and make `onProposalSettled` revert
+        // forever.
+        address q = _withdrawalQueue;
+        for (uint256 i = 0; i < calls.length; i++) {
+            address target = calls[i].target;
+            if (target == address(this) || (q != address(0) && target == q)) {
+                revert DisallowedBatchTarget(target);
+            }
+        }
+
         // onlyGovernor holds, so msg.sender IS the governor. staticcall (not a
         // typed call) so a governor without the getter degrades to "unset".
         (bool ok, bytes memory ret) = msg.sender.staticcall(abi.encodeCall(ISyndicateGovernor.tierRegistry, ()));
@@ -595,10 +689,24 @@ contract SyndicateVault is
     }
 
     /// @inheritdoc ISyndicateVault
+    /// @dev THE QUEUE RESERVE IS NOT SPENDABLE HERE (issue #92). This was the
+    ///      one asset-outflow path that checked only the raw balance, so a
+    ///      settlement fee — or a later `claimUnclaimedFees` — could spend float
+    ///      already frozen against stamped-unclaimed redeems, leaving the second
+    ///      claimant's `settleRedeem` to revert with no `cancel` available to it
+    ///      (`cancel` refuses a stamped pid).
+    ///
+    ///      REVERTING IS THE SAFE DIRECTION, not a lost fee: the governor's
+    ///      `_payFee` already treats a failure here as "escrow it instead", so
+    ///      the fee is deferred rather than dropped. Paying it out of a
+    ///      redeemer's reserved assets would not be.
     function transferPerformanceFee(address asset_, address to, uint256 amount) external onlyGovernor {
         if (asset_ != asset()) revert InvalidAsset();
         if (to == address(0)) revert ZeroAddress();
-        if (amount > IERC20(asset_).balanceOf(address(this))) revert AmountExceedsBalance();
+        uint256 spendable = IERC20(asset_).balanceOf(address(this));
+        uint256 reserve = reservedQueueAssets();
+        spendable = spendable > reserve ? spendable - reserve : 0;
+        if (amount > spendable) revert AmountExceedsBalance();
         IERC20(asset_).safeTransfer(to, amount);
     }
 
@@ -918,10 +1026,72 @@ contract SyndicateVault is
     function totalAssets() public view override returns (uint256) {
         (,, uint256 liveNav,) = _laneState();
         uint256 gross = IERC20(asset()).balanceOf(address(this)) + liveNav;
-        uint256 owed = uint256(_crystallizedMgmt) + _crystallizedPerf;
+        // THREE KINDS OF CLAIM, ALL SUBTRACTED. Crystallized fees are money the
+        // vault holds but no longer owns. The queue reserve is the same kind of
+        // claim and is subtracted for the same reason: `stampSettlement` froze
+        // those assets against a `num/den` that can no longer move, so they are
+        // owed in a fixed amount and are no longer part of what a residual share
+        // is a claim on (issue #92).
+        //
+        // NEVER ALONE. The matching shares must leave the pricing supply in the
+        // same breath — see `_pricingSupply`. Subtracting assets without their
+        // shares would understate the price as badly as the original blend
+        // overstated it.
+        uint256 owed = uint256(_crystallizedMgmt) + _crystallizedPerf + reservedQueueAssets();
         // Cannot legitimately underflow — the counters track assets the vault
         // holds — but under-reporting beats inventing value if it ever did.
         return gross > owed ? gross - owed : 0;
+    }
+
+    /// @dev The supply a price is actually taken against: circulating shares
+    ///      LESS the escrowed redeem shares whose settle price is already
+    ///      stamped. Those shares are still in `totalSupply()` — the vault burns
+    ///      them at `claim`, not at the stamp — but they are no longer a claim on
+    ///      the pool, so pricing must not divide by them.
+    ///
+    ///      PAIRED WITH `totalAssets`, INSEPARABLY. Both legs of the same claim
+    ///      leave together, so a `claim` moves neither the price nor anyone
+    ///      else's position: `settleRedeem` removes `shares` from supply and
+    ///      `assets` from float at the same instant the queue's two counters
+    ///      drop by the same amounts.
+    ///
+    ///      PRE-STAMP ESCROW STAYS IN. A queued-but-unsettled redeem has no
+    ///      frozen price yet, so it still floats with the pool and still belongs
+    ///      in the denominator. That is why this reads
+    ///      `stampedUnclaimedShares()` rather than `pendingShares()`.
+    ///
+    ///      FLOORED AT ZERO defensively; the counter is a subset of the balance
+    ///      the queue holds, so the branch is unreachable today.
+    ///
+    ///      Deliberately a low-level staticcall rather than a typed interface
+    ///      call: `VaultWithdrawalQueue` is not a proxy (plain constructor, no
+    ///      `initialize`, no upgradeability), so a queue deployed before this
+    ///      function existed can never gain the `stampedUnclaimedShares()`
+    ///      selector. A typed call would revert for that legacy pairing, and
+    ///      this sits on `_convertToShares`/`_convertToAssets`, so the revert
+    ///      would brick every deposit, withdraw, preview and fee calc. Missing
+    ///      selector degrades to 0 (today's pre-#92 blended pricing) instead —
+    ///      full remediation for an existing syndicate requires redeploying the
+    ///      vault/queue pair.
+    function _pricingSupply() internal view returns (uint256) {
+        address q = _withdrawalQueue;
+        uint256 supply = totalSupply();
+        if (q == address(0)) return supply;
+        (bool ok, bytes memory ret) = q.staticcall(abi.encodeCall(IVaultWithdrawalQueue.stampedUnclaimedShares, ()));
+        uint256 stamped = (ok && ret.length == 32) ? abi.decode(ret, (uint256)) : 0;
+        return supply > stamped ? supply - stamped : 0;
+    }
+
+    /// @dev Overridden solely to divide by `_pricingSupply()` instead of
+    ///      `totalSupply()`; the rounding and virtual-offset arithmetic is
+    ///      OpenZeppelin's, unchanged.
+    function _convertToShares(uint256 assets, Math.Rounding rounding) internal view override returns (uint256) {
+        return Math.mulDiv(assets, _pricingSupply() + 10 ** _decimalsOffset(), totalAssets() + 1, rounding);
+    }
+
+    /// @dev Mirror of `_convertToShares` above, same single change.
+    function _convertToAssets(uint256 shares, Math.Rounding rounding) internal view override returns (uint256) {
+        return Math.mulDiv(shares, totalAssets() + 1, _pricingSupply() + 10 ** _decimalsOffset(), rounding);
     }
 
     /// @dev Returns 0 when `paused()` so the EIP-4626 IMP-1 invariant holds
@@ -993,6 +1163,12 @@ contract SyndicateVault is
         // management-fee restamp: all three existed to make a mid-proposal
         // Lane A entry safe, and no deposit can reach this line while a
         // proposal is open. `_interimNetFlow` still tracks instant EXITS.
+        //
+        // issue #99 (main): a `deposit(0, victim)` grief that abused the old
+        // Lane-A-locks-the-receiver design to freeze an uninvolved holder's
+        // shares. Moot here — `_laneALockPid` is never written at all now
+        // (see above), so there is no lock left for a zero-value deposit to
+        // latch onto, guard or no guard.
     }
 
     /// @dev `maxWithdraw` / `maxRedeem` are the canonical lock gate (OZ ERC4626
@@ -1259,15 +1435,17 @@ contract SyndicateVault is
     // ==================== MANAGEMENT-FEE ACCRUAL ====================
 
     /// @dev Close off the elapsed interval at the base that applied during it,
-    ///      then restamp the base from live fund assets. Called on every event
-    ///      that can move the base: proposal execute, Lane A deposit, Lane A
-    ///      instant exit, and the custody-model share hooks.
+    ///      then restamp the base from live fund assets. Called on every
+    ///      mid-proposal event that can move the base — Lane A deposit and Lane
+    ///      A instant exit — and once more at settlement, via
+    ///      `consumeManagementAccrual`. Proposal execute opens the accrual
+    ///      rather than closing an interval, so it stamps the base directly
+    ///      through `startManagementAccrual`.
     ///
     ///      Restamping from `totalAssets()` rather than applying a per-event
-    ///      delta is what lets `strategyMint` / `strategyBurn` participate at
-    ///      all: those are denominated in SHARES, and reconstructing an asset
-    ///      delta from them mid-mutation is fragile. Reading the base from
-    ///      truth is both simpler and correct for the custody model.
+    ///      delta is deliberate: the base is read from truth, so it stays
+    ///      correct for any caller regardless of whether that caller can
+    ///      express its own effect as an asset delta.
     ///
     ///      The `_mgmtLastUpdate == 0` early return is load-bearing twice over:
     ///      it is the "no live proposal, no fee" rule, and it keeps
@@ -1346,9 +1524,42 @@ contract SyndicateVault is
 
     // ==================== HIGH-WATER MARK ====================
 
-    /// @notice Shares the price-per-share figure is quoted against. Fixed at
-    ///         1e18 so the mark's unit is independent of the asset's decimals.
-    uint256 private constant PPS_SHARES = 1e18;
+    /// @notice AT LEAST one whole share, in this vault's OWN decimals — never
+    ///         a smaller, arbitrary `1e18` (issue #97). Share decimals are
+    ///         `assetDecimals + _decimalsOffset()`, and this vault sets
+    ///         `_decimalsOffset()` to the asset's own decimals, so share
+    ///         decimals are `2 * assetDecimals`. A literal `1e18` is "one
+    ///         whole share" only at `assetDecimals == 9`; at 18 (WETH-like) it
+    ///         was `1e-18` of a share, and `convertToAssets` of that quantized
+    ///         to whole-integer steps of `pps` at 100% NAV moves —
+    ///         `aboveHighWaterMark` read a fund up 99% as sitting AT the mark,
+    ///         charging zero performance fee.
+    /// @dev    `max(1e18, 10 ** decimals())`, NOT bare `10 ** decimals()`. The
+    ///         obvious fix — always convert against exactly one share — is
+    ///         wrong for LOW-decimal assets: at `assetDecimals == 6` (USDC),
+    ///         `10 ** decimals() = 1e12`, a SMALLER unit than the `1e18` this
+    ///         vault always used. `convertToAssets` floors, and the absolute
+    ///         floor error in `pps` is bounded by <1 unit of THIS constant; a
+    ///         smaller unit means that same <1-unit error represents more real
+    ///         value once multiplied back out by `totalSupply()` in
+    ///         `aboveHighWaterMark`/`_exitFees`. Measured: a bare
+    ///         `10 ** decimals()` reintroduced ~$1 of drift on a $200,000 fee
+    ///         base for a 6-decimal asset (`test/fees/HighWaterMark.t.sol`),
+    ///         precision the OLD `1e18` constant never lost. The `max` floors
+    ///         at exactly `1e18` for every `assetDecimals <= 9` — which is
+    ///         every asset this protocol has ever tested against — so those
+    ///         vaults get the IDENTICAL constant, and identical numerics, they
+    ///         always had. Only `assetDecimals > 9`, where `1e18` genuinely
+    ///         stops being close to one real share, switches to the larger,
+    ///         decimals-scaled unit.
+    /// @dev    Computed, not cached: `decimals()` itself reads only cached
+    ///         immutable-like state (`_cachedDecimalsOffset` + the asset's own
+    ///         decimals, pinned at init), so this costs one `EXP` by a small
+    ///         constant and one comparison, not an external call.
+    function _pricePerShareUnit() private view returns (uint256) {
+        uint256 wholeShare = 10 ** decimals();
+        return wholeShare > 1e18 ? wholeShare : 1e18;
+    }
 
     /// @inheritdoc ISyndicateVault
     /// @dev Routed through `convertToAssets` rather than computing
@@ -1357,7 +1568,7 @@ contract SyndicateVault is
     ///      conversion. A hand-rolled ratio would drift from real share pricing
     ///      and the drift would land in the fee.
     function pricePerShare() public view returns (uint256) {
-        return convertToAssets(PPS_SHARES);
+        return convertToAssets(_pricePerShareUnit());
     }
 
     /// @inheritdoc ISyndicateVault
@@ -1375,7 +1586,7 @@ contract SyndicateVault is
         uint256 mark = _highWaterPricePerShare;
         uint256 pps = pricePerShare();
         if (pps <= mark) return 0;
-        return (pps - mark) * totalSupply() / PPS_SHARES;
+        return (pps - mark) * _pricingSupply() / _pricePerShareUnit();
     }
 
     /// @inheritdoc ISyndicateVault
@@ -1430,7 +1641,7 @@ contract SyndicateVault is
     ///      an exiter more than a hold-to-settle depositor pays — breaking the
     ///      neutrality this function exists to provide.
     function _exitFees(uint256 shares) private view returns (uint256 mgmtFee, uint256 perfFee) {
-        uint256 supply = totalSupply();
+        uint256 supply = _pricingSupply();
         if (shares == 0 || supply == 0) return (0, 0);
 
         // ── Management: pro-rata of the fund-level accrual to now ──
@@ -1450,7 +1661,7 @@ contract SyndicateVault is
             uint256 bps = agentFeeBps();
             uint256 cap = _governorPerformanceCap();
             if (bps > cap) bps = cap;
-            perfFee = (((pps - mark) * shares) / PPS_SHARES) * bps / 10_000;
+            perfFee = (((pps - mark) * shares) / _pricePerShareUnit()) * bps / 10_000;
         }
     }
 

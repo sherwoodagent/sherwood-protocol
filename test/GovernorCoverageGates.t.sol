@@ -15,6 +15,7 @@ import {IERC20Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.so
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "./mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "./mocks/MockRegistryMinimal.sol";
+import {MockWoodTwapOracle} from "./mocks/MockWoodTwapOracle.sol";
 import {ProtocolConfig} from "../src/ProtocolConfig.sol";
 import {TierRegistry} from "../src/TierRegistry.sol";
 
@@ -67,6 +68,32 @@ contract MockFeed {
         return (1, answer, updatedAt, updatedAt, 1);
     }
 }
+
+/// @dev Stands in for `ChallengeGame` as the ledger's `coverageFreezer`, with
+///      only the two views the governor's filing-deadline gate reads
+///      (`challengeWindow()` and `challengeableUntil(bytes32)`). A stub rather
+///      than the real game because what is under test here is the GOVERNOR's
+///      arithmetic over those two numbers — the `max`, and the strict
+///      comparison — and a stub is the only way to drive them independently:
+///      the real game's own setters forbid exactly the window divergence one of
+///      these tests needs. The full `_refundAll` re-arm arc against the real
+///      game lives in `ChallengeEndToEnd.t.sol`.
+contract MockFilingDeadline {
+    uint256 public challengeWindow;
+    mapping(bytes32 => uint256) public challengeableUntil;
+
+    constructor(uint256 window_) {
+        challengeWindow = window_;
+    }
+
+    function setChallengeableUntil(bytes32 key, uint256 until) external {
+        challengeableUntil[key] = until;
+    }
+}
+
+/// @dev A non-zero freezer that answers neither of those views — a slot rotated
+///      to something that is not a game, or simply a broken address.
+contract MuteFreezer {}
 
 /// @dev Escrow auth surface (separate from the governor's guardian registry):
 ///      the escrow only reads `isAuthorizedGovernor`.
@@ -132,8 +159,13 @@ contract GovernorCoverageGatesTest is Test {
         swood = new MockSwood();
         ledger = new ExposureLedger(ledgerOwner, address(swood), 28 days);
         feed = new MockFeed(1e8, 8); // $1.00, 8-dec
+        // Design revision 2: `woodUsdPriceX8` is a CAP, never a price. WOOD is
+        // valued from the TWAP oracle at $0.05, with the cap 2x ABOVE it and
+        // therefore NOT binding — the configuration production ships.
+        MockWoodTwapOracle woodTwap = new MockWoodTwapOracle(0.05e8);
         vm.startPrank(ledgerOwner);
-        ledger.setWoodUsdPrice(0.05e8); // $0.05, conservative haircut
+        ledger.setWoodUsdPrice(0.1e8);
+        ledger.setWoodTwapOracle(address(woodTwap));
         // Generous staleness bound: the §3.3a quorum re-reads this feed at
         // EXECUTE time, which is a voting period (+ review window) after
         // propose. A `maxDelay` shorter than that lifecycle would make every
@@ -802,6 +834,180 @@ contract GovernorCoverageGatesTest is Test {
         governor.cancelProposal(pid);
         vm.expectRevert(ISyndicateGovernor.NoBondToReclaim.selector);
         governor.reclaimProposerBond(pid);
+    }
+
+    // ── Reclaim vs. the challenge game's filing deadline (issue #94) ───────
+
+    /// @dev Executed and then self-settled an hour in — the terminal state a
+    ///      proposer reaches fastest, and therefore the one every reclaim gate
+    ///      below is measured against.
+    function _executeThenSettle() internal returns (uint256 pid) {
+        pid = _proposeSolo(governor, address(vault), agent, 1_000e6);
+        address[] memory gs = new address[](1);
+        gs[0] = makeAddr("g1");
+        _seatApprovers(pid, gs, 20_000e18);
+        _toApproved(pid);
+        governor.executeProposal(pid);
+
+        vm.warp(governor.getProposal(pid).executedAt + 1 hours + 1);
+        vm.prank(agent);
+        governor.settleProposal(pid);
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
+    }
+
+    /// @notice REGRESSION, and the shape of every deployment with no game
+    ///         wired: with `coverageFreezer` unset the filing-deadline gate is
+    ///         skipped entirely and an executed proposal reclaims on exactly
+    ///         the schedule it always did — at `executedAt + challengeWindow`,
+    ///         not a second later.
+    ///
+    ///         The skip is structural, not charitable. Without a freezer
+    ///         nothing can call `ExposureLedger.freezeCoverage` (`onlyFreezer`)
+    ///         and nothing can reach `ProposerBondEscrow.forfeitBond` (the
+    ///         caller must BE the freezer), so no conviction is reachable and
+    ///         there is nothing for the gate to protect. An unwired or
+    ///         rotated-away freezer must never strand an honest bond.
+    function test_reclaimBond_unsetCoverageFreezer_reclaimsOnTheOrdinarySchedule() public {
+        assertEq(ledger.coverageFreezer(), address(0), "this fixture wires no game");
+        uint256 pid = _executeThenSettle();
+        uint256 opensAt = governor.getProposal(pid).executedAt + ledger.challengeWindow();
+        uint256 balBefore = wood.balanceOf(agent);
+
+        vm.warp(opensAt - 1);
+        vm.expectRevert(ISyndicateGovernor.ChallengeWindowOpen.selector);
+        governor.reclaimProposerBond(pid);
+
+        vm.warp(opensAt);
+        governor.reclaimProposerBond(pid);
+        assertEq(wood.balanceOf(agent), balBefore + 200e18, "unchanged schedule: opens AT the ledger's deadline");
+    }
+
+    /// @notice The unchallenged case WITH a game wired. `challengeableUntil` is
+    ///         zero for a key the game never touched and zero is NOT a
+    ///         sentinel, so the gate collapses to the game's ordinary window
+    ///         and an honest proposer waits no longer than it did before.
+    ///
+    ///         The one second is the strict comparison, and it is deliberate:
+    ///         `ChallengeGame.file` admits while `block.timestamp <= deadline`,
+    ///         so at the deadline itself an accusation is still legal.
+    function test_reclaimBond_gameWiredNeverChallenged_opensOneSecondPastTheDeadline() public {
+        uint256 pid = _executeThenSettle();
+        MockFilingDeadline stubGame = new MockFilingDeadline(ledger.challengeWindow());
+        vm.prank(ledgerOwner);
+        ledger.setCoverageFreezer(address(stubGame));
+
+        bytes32 rk = keccak256(abi.encode(address(governor), pid));
+        assertEq(stubGame.challengeableUntil(rk), 0, "an untouched key reads zero");
+
+        uint256 deadline = governor.getProposal(pid).executedAt + ledger.challengeWindow();
+        vm.warp(deadline);
+        vm.expectRevert(ISyndicateGovernor.ChallengeWindowOpen.selector);
+        governor.reclaimProposerBond(pid);
+
+        uint256 balBefore = wood.balanceOf(agent);
+        vm.warp(deadline + 1);
+        governor.reclaimProposerBond(pid);
+        assertEq(wood.balanceOf(agent), balBefore + 200e18);
+    }
+
+    /// @notice DESIGN D2 — why the gate is a `max` and not `challengeableUntil`
+    ///         alone. The two windows can diverge with no `Inconclusive`
+    ///         anywhere in the picture: `ChallengeGame`'s own setters floor its
+    ///         window under the ledger's, but `ExposureLedger.setChallengeWindow`
+    ///         floors only against the registry's review period and has no
+    ///         game-side check, so the ledger owner can drop the ledger's window
+    ///         below the game's afterwards.
+    ///
+    ///         Here `challengeableUntil` is ZERO throughout — a gate reading
+    ///         only that value would have released on the ledger's deadline
+    ///         while the game still admitted a filing for another week. The
+    ///         divergence is set up from the game's side (a stub with a longer
+    ///         window) because it is the identical condition and does not
+    ///         require an `ExposureLedger` setter whose floor this fixture's
+    ///         EOA registry cannot answer.
+    function test_reclaimBond_gameWindowAboveTheLedgers_waitsForTheGame() public {
+        uint256 pid = _executeThenSettle();
+        uint256 gameWindow = ledger.challengeWindow() + 7 days;
+        MockFilingDeadline stubGame = new MockFilingDeadline(gameWindow);
+        vm.prank(ledgerOwner);
+        ledger.setCoverageFreezer(address(stubGame));
+
+        uint256 executedAt = governor.getProposal(pid).executedAt;
+        assertEq(
+            stubGame.challengeableUntil(keccak256(abi.encode(address(governor), pid))),
+            0,
+            "no Inconclusive here -- the divergence IS the two windows"
+        );
+
+        // Both original gates are open at the ledger's deadline...
+        vm.warp(executedAt + ledger.challengeWindow());
+        assertFalse(ledger.isCoverageFrozen(address(governor), pid), "and nothing is frozen");
+        vm.expectRevert(ISyndicateGovernor.ChallengeWindowOpen.selector);
+        governor.reclaimProposerBond(pid);
+
+        // ...and the hold runs to the GAME's deadline, strictly.
+        vm.warp(executedAt + gameWindow);
+        vm.expectRevert(ISyndicateGovernor.ChallengeWindowOpen.selector);
+        governor.reclaimProposerBond(pid);
+
+        uint256 balBefore = wood.balanceOf(agent);
+        vm.warp(executedAt + gameWindow + 1);
+        governor.reclaimProposerBond(pid);
+        assertEq(wood.balanceOf(agent), balBefore + 200e18);
+    }
+
+    /// @notice The other arm of the same `max`: a `challengeableUntil` raised
+    ///         above the ordinary window — what `ChallengeGame._refundAll`
+    ///         writes on an `Inconclusive` unwind — holds the bond past
+    ///         `executedAt + challengeWindow`. Placed exactly, from a stub; the
+    ///         real unwind that produces it is in `ChallengeEndToEnd.t.sol`.
+    function test_reclaimBond_challengeableUntilAboveTheWindow_waitsForIt() public {
+        uint256 pid = _executeThenSettle();
+        MockFilingDeadline stubGame = new MockFilingDeadline(ledger.challengeWindow());
+        vm.prank(ledgerOwner);
+        ledger.setCoverageFreezer(address(stubGame));
+
+        uint256 executedAt = governor.getProposal(pid).executedAt;
+        uint256 rearmed = executedAt + 38 days; // issue #94's own figure
+        stubGame.setChallengeableUntil(keccak256(abi.encode(address(governor), pid)), rearmed);
+
+        vm.warp(executedAt + ledger.challengeWindow() + 1);
+        vm.expectRevert(ISyndicateGovernor.ChallengeWindowOpen.selector);
+        governor.reclaimProposerBond(pid);
+
+        vm.warp(rearmed);
+        vm.expectRevert(ISyndicateGovernor.ChallengeWindowOpen.selector);
+        governor.reclaimProposerBond(pid);
+
+        uint256 balBefore = wood.balanceOf(agent);
+        vm.warp(rearmed + 1);
+        governor.reclaimProposerBond(pid);
+        assertEq(wood.balanceOf(agent), balBefore + 200e18);
+    }
+
+    /// @notice FAIL CLOSED. A non-zero freezer that cannot answer the game's
+    ///         views blocks the reclaim rather than waving it through — a
+    ///         freezer we cannot read is indistinguishable from one that lies,
+    ///         and under fail-open a lying freezer releases early. Matches this
+    ///         function's existing posture for an unset ledger, and is
+    ///         recoverable the same way: the ledger owner rotates the slot.
+    function test_reclaimBond_freezerThatCannotAnswer_failsClosedButIsRecoverable() public {
+        uint256 pid = _executeThenSettle();
+        address mute = address(new MuteFreezer());
+        vm.prank(ledgerOwner);
+        ledger.setCoverageFreezer(mute);
+
+        vm.warp(governor.getProposal(pid).executedAt + ledger.challengeWindow() + 365 days);
+        vm.expectRevert();
+        governor.reclaimProposerBond(pid);
+        assertEq(governor.getProposal(pid).proposerBondWood, 200e18, "nothing was released");
+
+        // Not a permanent strand: rotating the slot reopens the ordinary path.
+        vm.prank(ledgerOwner);
+        ledger.setCoverageFreezer(address(0));
+        uint256 balBefore = wood.balanceOf(agent);
+        governor.reclaimProposerBond(pid);
+        assertEq(wood.balanceOf(agent), balBefore + 200e18);
     }
 }
 

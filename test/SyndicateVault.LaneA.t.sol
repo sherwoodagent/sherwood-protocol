@@ -145,6 +145,35 @@ contract VaultLaneATest is Test {
     //    Option B) — see `SyndicateVault._deposit` and `_isLaneALocked`. No
     //    shares can ever exist in the locked state these tests exercised.
 
+    // ── Issue #99: a zero-value deposit locks the RECEIVER, not the caller ──
+
+    /// @notice ISSUE #99, RESOLVED: `_deposit` now guards the Lane A lock
+    ///         latch on `shares != 0`, so `vault.deposit(0, victim)` — no
+    ///         approval from the victim, no shares of the caller's own,
+    ///         nothing transferred at all — is a genuine no-op rather than a
+    ///         free grief. Written against unpatched `main` first (it passed
+    ///         there, confirming the exploit) before this assertion was
+    ///         flipped to prove the fix.
+    function test_zeroValueDeposit_doesNotLockAnExistingHolder() public {
+        vm.prank(alice);
+        uint256 aliceShares = vault.deposit(1_000e6, alice); // genuine, pre-proposal deposit
+        _lockLaneA(500e6);
+
+        // Alice is not locked — the property the existing suite already
+        // proves (`test_instantWithdraw_duringLaneA_existingHolder`).
+        assertGt(vault.maxWithdraw(alice), 0, "before the attempted grief: alice can instant-exit");
+
+        // Bob (unrelated, no approval from alice, no shares) attempts to grief.
+        vm.prank(bob);
+        vault.deposit(0, alice);
+
+        assertEq(vault.balanceOf(alice), aliceShares, "not a single share moved");
+        assertGt(vault.maxWithdraw(alice), 0, "alice can still instant-exit: the grief did nothing");
+        assertGt(vault.maxRedeem(alice), 0, "same for redeem");
+        vm.prank(alice);
+        vault.transfer(bob, 1); // she can still move her own shares
+    }
+
     // ── instant exit during Lane A (existing holder, not locked) ──
 
     function test_instantWithdraw_duringLaneA_existingHolder() public {

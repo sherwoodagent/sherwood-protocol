@@ -82,6 +82,14 @@ interface IVaultWithdrawalQueue {
     function pendingShares() external view returns (uint256);
     function pendingDepositAssets() external view returns (uint256);
     function reservedAssets() external view returns (uint256);
+
+    /// @notice Escrowed redeem shares whose settle price is already stamped but
+    ///         which have not been claimed. The share-side counterpart of
+    ///         `reservedAssets`, and the set the vault excludes from pricing.
+    /// @dev    A strict subset of `pendingShares`: pre-stamp escrowed shares
+    ///         still float with the pool and belong in the price, because their
+    ///         payout is not fixed yet.
+    function stampedUnclaimedShares() external view returns (uint256);
     function getRequestsByOwner(address owner_) external view returns (uint256[] memory);
     function nextRequestId() external view returns (uint256);
 }

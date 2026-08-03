@@ -110,8 +110,8 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      therefore CONSERVATIVE, not tight — the `openCase` child they
     ///      reserved for (~150-200k, plus the allowance dance) no longer runs.
     ///      They are deliberately NOT re-tightened here. A floor measured
-    ///      against `slashVerdict` ALONE under-reserves: it misses the O(n)
-    ///      `contested` scan, the demote child and the payouts that follow, all
+    ///      against `slashVerdict` ALONE under-reserves: it misses the bond
+    ///      forfeiture, the demote child and the payouts that follow, all
     ///      of which this check must also cover. Re-derive end to end (through
     ///      court `finalize`, as `SlashGasCeiling.t.sol` already does) before
     ///      moving them; over-reserving only rejects an under-gassed caller,
@@ -237,25 +237,22 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ITierRegistryDemoterMinimal public tierRegistry;
 
     /// @notice The sole WOOD custodian and the contract that executes the
-    ///         verdict slash (`slashToEscrow`). This game must be its
+    ///         verdict slash (`slashVerdict`). This game must be its
     ///         `authorizedSlasher`. Owner-set after construction because the
     ///         role is granted on sWOOD's side and the two are wired in either
     ///         order at deploy time.
     /// @dev    There is no sink to name: slash proceeds burn inside sWOOD, so
     ///         this game cannot redirect them anywhere at all.
     ///
-    ///         This game CAN name a caller-chosen conviction-bounty recipient
-    ///         (`slashToEscrow`'s `bountyTo`/`bountyBps`) — that channel has to
-    ///         be caller-chosen, since only the caller knows which challenger
-    ///         caused THIS conviction. This game does not restate
-    ///         `MAX_CONVICTION_BOUNTY_BPS` as its own clamp: `setConvictionBountyBps`
-    ///         and `setStakedWood` both read sWOOD's ceiling live rather than
-    ///         duplicating the literal, so a compromised or buggy caller here
-    ///         is bounded by sWOOD's own ceiling. `_settle` forwards the
-    ///         challenge's pinned `convictionBountyBpsAtFiling` only on a
-    ///         contested escalated conviction — a `Guilty` ruling where the
-    ///         challenger did not fund its own counter-bond — and passes
-    ///         `(address(0), 0)` on every other path.
+    ///         Nor can it name a payee: `slashVerdict` takes no recipient at
+    ///         all, so there is no bounty channel here to bound. The
+    ///         prosecutor is paid out of the convicted PROPOSER's forfeited
+    ///         bond instead (`ProposerBondEscrow.forfeitBond`), which is the
+    ///         one pot a prosecutor cannot fund for itself — a guardian that
+    ///         approves a proposal in order to accuse it can move the slash,
+    ///         but it can never post the accused's bond. `_settle` forwards
+    ///         the challenge's pinned `prosecutorFeeBpsAtFiling` to the escrow
+    ///         on every conviction, silence path included.
     IStakedWood public stakedWood;
 
     /// @notice The adjudicator for disputed challenges — the only address that
@@ -347,16 +344,44 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///         it's meant to price.
     uint256 public settleBurnBps = 2_000;
 
-    /// @notice Slice of a verdict slash paid to the challenger that caused it,
-    ///         in bps. Default 5%.
-    /// @dev    Escalated convictions only (see `_settle`'s gate on `escalated`).
-    ///         On the silence path an honest filer and a liar produce the same
-    ///         on-chain shape — a real slash against a real cohort — so a
-    ///         bounty there would pay both equally. The escalated path
-    ///         separates them: the accused contested and lost on the merits,
-    ///         and a liar who is contested loses the whole bond on
-    ///         `NotGuilty`. That's why the bounty is safe here at any size.
-    uint256 public convictionBountyBps = 500;
+    /// @notice Ceiling on `prosecutorFeeBps`, mirroring
+    ///         `ProposerBondEscrow.MAX_PROSECUTOR_FEE_BPS`.
+    /// @dev    A CONVENIENCE GUARD, NOT THE AUTHORITY. The escrow enforces its
+    ///         own bound on every forfeiture and is the contract that actually
+    ///         moves the WOOD; this only stops governance setting a rate that
+    ///         would be rejected later. The escrow is chosen per proposal, so
+    ///         there is no single one to consult at set time — and reading it
+    ///         at filing would make the pinned rate depend on an external call
+    ///         and pin zero for any proposal carrying no bond at all.
+    uint256 public constant MAX_PROSECUTOR_FEE_BPS = 2_000;
+
+    /// @notice Slice of the convicted PROPOSER's forfeited bond paid to the
+    ///         challenger that caused the conviction, in bps. Default 5%.
+    /// @dev    NOT a slice of the slash. The slash pays nobody — `slashVerdict`
+    ///         takes no payee and burns everything it collects — and that
+    ///         separation is the point. A reward funded from the slash is a pot
+    ///         the prosecutor can fill for itself, by staking, approving the
+    ///         proposal it is about to accuse, and collecting a fee sized by
+    ///         its own punishment. The proposer's bond cannot be self-funded:
+    ///         nobody can post the accused's bond on their behalf, so a
+    ///         self-dealing filer pays the bond in full and recovers at most
+    ///         `MAX_PROSECUTOR_FEE_BPS` of it. Sybil-proof by construction
+    ///         rather than by parameter, which is why no anti-abuse gate rides
+    ///         on top of this rate.
+    /// @dev    PAID ON EVERY CONVICTION, silence path included — the path this
+    ///         reward exists for. A correct filing nobody answered used to pay
+    ///         nothing at all AND cost the filer `settleBurnBps` of its bond,
+    ///         so the only profitable honest filing was one that provoked a
+    ///         fight (issue #91). On the escalated path the challenger already
+    ///         takes bond + the forfeited pool; the fee is additive there.
+    /// @dev    Pinned per challenge at filing (`prosecutorFeeBpsAtFiling`), so
+    ///         a governance change cannot re-rate a challenge already in
+    ///         flight. If the escrow rejects a pinned rate, `_settle` retries
+    ///         the forfeiture without a fee rather than losing the conviction.
+    /// @dev    UNDERIVED. 5% is inherited from the conviction bounty this
+    ///         replaced and has never been priced against what a correct filing
+    ///         actually costs to produce. Bounded, not justified.
+    uint256 public prosecutorFeeBps = 500;
 
     /// @notice The round-4-and-beyond steady-state share of the challenger's
     ///         bond burned on an `Inconclusive` unwind, in bps. Default 20% —
@@ -517,7 +542,7 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///
     ///      The local flag is checked first (cheap, answers the common case);
     ///      the sWOOD scan is what makes the answer correct across a redeploy.
-    ///      Any hit is decisive: `slashToEscrow` reverts `ApproverAlreadySlashed`
+    ///      Any hit is decisive: `slashVerdict` reverts `ApproverAlreadySlashed`
     ///      if any accused member is already marked under this `caseKey`, so
     ///      one marked approver means a slash of this cohort can never land
     ///      again.
@@ -649,12 +674,12 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         // `(governor, proposalId)` and survives one. Without this, a game
         // deployed to replace an earlier one would accept filings against a
         // cohort the OLD game already convicted, freeze coverage and take the
-        // bond, then be unable to terminate (`_settle`'s `slashToEscrow` would
+        // bond, then be unable to terminate (`_settle`'s `slashVerdict` would
         // revert `ApproverAlreadySlashed`, and `rule` is unreachable from
         // `Filed`).
         //
         // The accused set is the committed cohort, the same one `_settle`
-        // sends to `slashToEscrow`; a released approver reports zero committed
+        // sends to `slashVerdict`; a released approver reports zero committed
         // USD and is excluded from both.
         address[] memory accused = new address[](accusedCount);
         for (uint256 i = 0; i < committedUsd.length; i++) {
@@ -740,9 +765,10 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             forfeitBurnBpsAtFiling: forfeitBurnBps,
             // Pinned for the same reason: a live read would change what the
             // challenger stood to collect on a conviction it already bonded
-            // against. Forwarded to `slashToEscrow` only on an escalated
-            // conviction — see `_settle`.
-            convictionBountyBpsAtFiling: convictionBountyBps,
+            // against. Bounded by `MAX_PROSECUTOR_FEE_BPS` at set time, and
+            // bounded AGAIN by the paying escrow at forfeit time — the escrow
+            // is the authority, this is the convenience guard.
+            prosecutorFeeBpsAtFiling: prosecutorFeeBps,
             // Written only by `_fail`, which is the sole path that gives the
             // pool's funders anything beyond their stake back.
             forfeitPayoutWood: 0,
@@ -1017,7 +1043,7 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         // the door, but that gate reads the slasher wired AT FILING TIME and the
         // owner may re-point sWOOD (or the old game may settle a concurrent
         // challenge) at any point afterwards, so the settle path cannot assume it
-        // was reachable. Diverting here rather than letting `slashToEscrow`
+        // was reachable. Diverting here rather than letting `slashVerdict`
         // revert is the whole point: a revert leaves the challenge in `Filed`
         // with no terminal exit at all, taking the bond, the counter-bond pool
         // and the coverage freeze with it.
@@ -1053,84 +1079,19 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             // delegated capital at the drain, not at the accusation.
             // `executedAt - 1 < executedAt` keeps sWOOD's
             // `snapshotTimestamp <= openedAt` bound satisfied.
-            // ESCALATED CONVICTIONS ONLY (spec 2026-07-29 §2). On the silence
-            // path an honest filer and a liar are indistinguishable to this
-            // contract - both produce a real slash against a real cohort and
-            // both would collect - so any bounty there pays liars exactly as
-            // well as watchdogs, and the two constraints (make honest filing
-            // profitable / keep false filing unprofitable) are contradictory at
-            // every rate. The escalated path separates them: the accused
-            // contested and lost on the merits, and a liar who picks a guardian
-            // that is paying attention forfeits the whole bond on `NotGuilty`.
-            // That is why the bounty is safe here at any size, and why no
-            // anti-abuse bound is needed - PROVIDED the pool that bought the
-            // escalation was actually funded by one of the ACCUSED (see
-            // `contested` below; PR review 2026-07-29 IMPORTANT-1).
-            //
-            // Bounty is paid only on an escalated conviction where the pool
-            // was actually funded by one of the ACCUSED (`contested` below).
-            // On the silence path an honest filer and a liar are
-            // indistinguishable — both produce a real slash — so a bounty
-            // there would pay both equally; a contested loss on the merits
-            // separates them, since a liar who is contested forfeits the whole
-            // bond on `NotGuilty`.
-            //
-            // `status == Disputed` alone only says somebody completed the
-            // pool, which a challenger could stage from a second address it
-            // controls to collect a bounty for a fight nobody had. Asking "was
-            // the funder one of the ACCUSED?" is answerable where "was the
-            // funder the challenger?" is not: faking accused membership means
-            // staking WOOD and recording an approval on the very proposal
-            // about to be accused, joining the cohort the conviction slashes.
-            //
-            // Accepted false negative: a third party who funds a defence
-            // because it believes the accused innocent still forces
-            // adjudication, but a `Guilty` ruling it provoked pays no bounty.
-            // This only narrows what EARNS the bounty, not what is allowed.
-            //
-            // Bounded: the scan below runs over `approvers`, already capped
-            // at the accused-set size and already looped under the gas floor
-            // checked above.
-            //
-            // REENTRANCY NOTE (reviewer Minor): this reads `_contributed`
-            // AFTER `c.status = Status.Settled` and after `_releaseFreeze`'s
-            // external call into `exposureLedger.unfreezeCoverage`. That is
-            // safe today only because `claimableContribution` returns 0 for a
-            // `Settled` challenge whose pool is complete (`c.counterBondWood
-            // == c.bondWood`, the exact case reachable here), so nothing a
-            // re-entrant ledger could trigger can zero `_contributed` before
-            // this scan reads it. A future change to that view's Settled
-            // branch would silently reopen the bounty to a since-refunded
-            // "contributor".
-            //
-            // The PAYOUT branch below stays keyed on `escalated` alone: a
-            // self- or sybil-disputed win still returns the challenger's own
-            // bond and pool (nothing new happens there) - this only closes the
-            // BOUNTY channel on top of it.
-            // EVERY contributing approver is recorded, not just the first one
-            // found. sWOOD caps the bounty at their SUMMED slash, so the scan
-            // must be complete: stopping early would make the cap depend on
-            // array order, and a genuine defence funded by several approvers
-            // would be capped at whichever one happened to be listed first.
-            bool[] memory contestors = new bool[](approvers.length);
-            bool contested;
-            if (escalated) {
-                for (uint256 i = 0; i < approvers.length; ++i) {
-                    if (_contributed[challengeId][approvers[i]] != 0) {
-                        contestors[i] = true;
-                        contested = true;
-                    }
-                }
-            }
-            slashedWood = swood.slashVerdict(
-                key,
-                c.executedAt,
-                approvers,
-                slashBpsPer,
-                contestors,
-                contested ? c.challenger : address(0),
-                contested ? c.convictionBountyBpsAtFiling : 0
-            );
+            // THE SLASH PAYS NOBODY. Every wei taken from the approvers is
+            // burned; the prosecutor is paid from the proposer's forfeited
+            // bond below instead. The slash used to fund a conviction bounty,
+            // gated on whether one of the ACCUSED had funded the counter-bond
+            // — a predicate meant to price a staged contest by forcing the
+            // stager into the cohort its own conviction slashes. Two things
+            // were wrong with it. The accused chose the funding address, so
+            // they could zero the prosecutor's fee for free by defending from
+            // an unrelated wallet. And the slash is a pot a prosecutor CAN
+            // fund for itself, by staking and approving the proposal it is
+            // about to accuse, so the predicate needed a cap to stay priced.
+            // The proposer's bond has neither problem.
+            slashedWood = swood.slashVerdict(key, c.executedAt, approvers, slashBpsPer);
 
             // The proposer pays too: every slash above falls on the approvers
             // who underwrote the proposal, but the proposer — the actual
@@ -1154,7 +1115,14 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             // of those harms.
             address bondEscrow = c.proposerBondEscrow;
             if (bondEscrow != address(0)) {
-                try IProposerBondEscrow(bondEscrow).forfeitBond(governor, proposalId) returns (
+                // The prosecutor's fee rides here, pinned at filing like every
+                // other rate. It is paid on EVERY conviction, silence or
+                // adjudicated, because a correct accusation is equally correct
+                // either way — and the silence path is the one where the
+                // challenger is otherwise out of pocket, having burned
+                // `settleBurnBps` of its bond for a verdict nobody contested.
+                try IProposerBondEscrow(bondEscrow)
+                    .forfeitBond(governor, proposalId, c.challenger, c.prosecutorFeeBpsAtFiling) returns (
                     address bondProposer, uint256 bondAmount
                 ) {
                     emit ProposerBondForfeited(challengeId, governor, proposalId, bondProposer, bondAmount);
@@ -1162,19 +1130,35 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
                     emit ProposerBondForfeitureFailed(challengeId, governor, proposalId, bondEscrow);
                 }
             }
-        }
 
-        // Demotes only the adapter the filing named, already checked against
-        // the proposal's own execute calls in `file`. Best-effort, deliberately:
-        // `demoteByChallenge` is role-gated on the registry's side, so a
-        // revocable role pointed elsewhere while this challenge was live must
-        // not take the whole verdict down with it — the miss is surfaced as an
-        // event and the verdict proceeds; the registry owner's own `demote`
-        // fixes it afterward.
-        if (c.adapterTarget != address(0)) {
-            try tierRegistry.demoteByChallenge(c.adapterTarget, c.adapterSelector) {}
-            catch {
-                emit AdapterDemotionFailed(challengeId, c.adapterTarget, c.adapterSelector);
+            // Demotes only the adapter the filing named, already checked
+            // against the proposal's own execute calls in `file`. Best-effort,
+            // deliberately: `demoteByChallenge` is role-gated on the registry's
+            // side, so a revocable role pointed elsewhere while this challenge
+            // was live must not take the whole verdict down with it — the miss
+            // is surfaced as an event and the verdict proceeds; the registry
+            // owner's own `demote` fixes it afterward.
+            //
+            // INSIDE THIS BRANCH, NOT AFTER THE IF/ELSE. Demotion is a
+            // consequence of a conviction this settle actually collected. The
+            // diverted branch adjudicates nothing — it slashes no one and
+            // forfeits no bond — so letting it demote handed out the game's
+            // `authorizedDemoter` role for a settle that recovered nothing.
+            //
+            // That was reachable and cheap. Concurrency is unguarded by
+            // design: `_liveByChallenger` is keyed per challenger, `_convicted`
+            // is false for every filing made before the first settle, and
+            // `_liveCount` is uncapped. An attacker filed N challenges from N
+            // addresses naming N different certified adapters touched by one
+            // proposal; the first settle collected the liability and the rest
+            // diverted here but still demoted, at `settleBurnBps` of a bond
+            // that is itself `challengerBondBps` of coverage — roughly 1% of
+            // the proposal's coverage per certification revoked.
+            if (c.adapterTarget != address(0)) {
+                try tierRegistry.demoteByChallenge(c.adapterTarget, c.adapterSelector) {}
+                catch {
+                    emit AdapterDemotionFailed(challengeId, c.adapterTarget, c.adapterSelector);
+                }
             }
         }
 
@@ -1392,6 +1376,19 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             // guard above — unlike the re-arm write, which only raises when
             // needed.
             inconclusiveRounds[rk]++;
+
+            // COUPLED TO THE RE-ARM, NOT OPTIONAL (issue #95). `_releaseFreeze`
+            // above just dropped `hasFrozenCoverage` to false for every
+            // approver here, but this branch is exactly the one that keeps the
+            // proposal LEGALLY re-challengeable through `challengeableUntil[rk]`
+            // — a window `openExposureUsd`'s wall-clock epoch buckets were
+            // never built to cover, since they age out `challengeWindow` after
+            // EXECUTION, not after any later re-arm. Pinning through the
+            // JUST-WRITTEN `challengeableUntil[rk]` (not `extended` — an
+            // earlier round may have left it higher already) keeps sWOOD's
+            // unstake gate honest for exactly as long as a conviction remains
+            // reachable, and not one second longer.
+            exposureLedger.pinCoverageUntil(governor, proposalId, challengeableUntil[rk]);
         }
 
         _bookRefund(challengeId, pool);
@@ -1674,27 +1671,22 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         forfeitBurnBps = newBps;
     }
 
-    /// @dev Re-validates `convictionBountyBps` against the NEW slasher's own
-    ///      ceiling, not just at `setConvictionBountyBps` time: re-pointing to
-    ///      a sWOOD with a lower `MAX_CONVICTION_BOUNTY_BPS` while the rate is
-    ///      unchanged would leave any already-open, already-contested
-    ///      challenge's pinned `convictionBountyBpsAtFiling` rejected by the
-    ///      new slasher the moment `_settle` tries to forward it — a
-    ///      permanent failure for that one challenge's conviction path (the
-    ///      silence and dispute-timeout paths are unaffected, since neither
-    ///      ever calls `slashToEscrow` with a bounty). Checked here, at
-    ///      re-point time, is what prevents creating that state at all.
+    /// @dev Does NOT re-validate `prosecutorFeeBps`, and no longer needs to.
+    ///      The fee is paid by `ProposerBondEscrow`, not by the slasher, so
+    ///      re-pointing sWOOD cannot strand a pinned rate the new slasher
+    ///      would reject. `_settle` also retries the forfeiture without a fee
+    ///      if the escrow rejects the pinned rate, so no rate change on either
+    ///      side can wedge a conviction.
     /// @dev Also requires the OTHER half of the grant: `authorizedSlasher` is
     ///      sWOOD's side of the same two-sided relationship — pointing this
     ///      game at a sWOOD that has not named it would send every `_settle`
-    ///      into `slashToEscrow`'s own caller gate, since `Filed`'s only other
+    ///      into `slashVerdict`'s own caller gate, since `Filed`'s only other
     ///      exit (`rule`) demands `Disputed`. The reciprocal pointer is
     ///      already the documented deploy order
     ///      (`swood.setAuthorizedSlasher(game)` then `game.setStakedWood(swood)`),
     ///      so this enforces the sequence the scripts already follow.
     function setStakedWood(address stakedWood_) external onlyOwner {
         if (stakedWood_ == address(0)) revert ZeroAddress();
-        if (convictionBountyBps > IStakedWood(stakedWood_).MAX_CONVICTION_BOUNTY_BPS()) revert InvalidParameter();
         if (IStakedWood(stakedWood_).authorizedSlasher() != address(this)) revert RoleNotGranted();
         emit StakedWoodSet(address(stakedWood), stakedWood_);
         stakedWood = IStakedWood(stakedWood_);
@@ -1794,11 +1786,12 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         settleBurnBps = newBps;
     }
 
-    /// @dev Bounded by the SLASHER's own ceiling, read live rather than
-    ///      restated here: sWOOD enforces `MAX_CONVICTION_BOUNTY_BPS` on every
-    ///      call regardless of what this game asks for, so duplicating the
-    ///      literal would create two constants with nothing checking they
-    ///      agree. Zero is legal and turns the bounty off.
+    /// @dev Bounded here by `MAX_PROSECUTOR_FEE_BPS`, a MIRROR of the escrow's
+    ///      own constant rather than the binding one: the escrow is
+    ///      per-proposal, so there is no single authority to consult at set
+    ///      time. The escrow re-enforces its ceiling when it actually pays,
+    ///      exactly as sWOOD re-clamps `slashBpsPer` rather than trusting
+    ///      `ExposureLedger`. Zero is legal and turns the fee off.
     /// @dev Requires `stakedWood` wired first, unlike every other rate setter
     ///      here, because there is nothing to bound against otherwise. The
     ///      rate is pinned per challenge at filing and outlives any later
@@ -1808,12 +1801,14 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      challenge (the silence and dispute-timeout paths are unaffected).
     ///      Failing closed here, at configuration time, is cheap; failing
     ///      closed at resolution time, mid-challenge, is not.
-    function setConvictionBountyBps(uint256 newBps) external onlyOwner {
-        IStakedWood swood = stakedWood;
-        if (address(swood) == address(0)) revert ZeroAddress();
-        if (newBps > swood.MAX_CONVICTION_BOUNTY_BPS()) revert InvalidParameter();
-        emit ConvictionBountyBpsSet(convictionBountyBps, newBps);
-        convictionBountyBps = newBps;
+    function setProsecutorFeeBps(uint256 newBps) external onlyOwner {
+        // Bounded here only against the absolute scale. The binding ceiling is
+        // `ProposerBondEscrow.MAX_PROSECUTOR_FEE_BPS`, enforced by the escrow
+        // itself when it pays — the escrow is per-proposal, so there is no
+        // single one to consult at this point.
+        if (newBps > MAX_PROSECUTOR_FEE_BPS) revert InvalidParameter();
+        emit ProsecutorFeeBpsSet(prosecutorFeeBps, newBps);
+        prosecutorFeeBps = newBps;
     }
 
     /// @dev Bounded [0, `MAX_INCONCLUSIVE_BURN_BPS`]. Zero is allowed, exactly

@@ -36,9 +36,36 @@ interface IExposureLedger {
     error NotCoverageFreezer();
     error CoverageFrozen();
 
+    /// @notice No source could price WOOD: the Chainlink WOOD feed is unwired
+    ///         or degraded AND the TWAP oracle is unwired or unavailable — or
+    ///         the price CAP `woodUsdPriceX8` is zero.
+    ///
+    /// @dev    THE CAP IS NEVER SERVED AS A PRICE (design revision 2,
+    ///         2026-08-02), so there is no branch left in which a
+    ///         hand-maintained scalar becomes the valuation. That is the
+    ///         property that makes its staleness tolerable, and it is why "no
+    ///         market data" has to be a revert rather than a fallback.
+    ///
+    ///         `woodUsdPriceX8 == 0` lands here too, rather than meaning "no
+    ///         cap". An unset cap would admit an unbounded market price and
+    ///         hand a ~$438k WOOD/WETH pool the valuation of every guardian
+    ///         bond in the protocol — the one thing the cap exists to prevent —
+    ///         so fail-closed is the only safe reading.
+    ///
+    ///         HALTING SEMANTICS. Every consumer lets this propagate except
+    ///         `recordApproval`, which catches it and books nothing. Reverting
+    ///         there would let Block votes land while Approve votes failed,
+    ///         turning the review block-only — the failure mode reviews M3, N1
+    ///         and N4 each removed. Execution (`requireApproveQuorum`),
+    ///         proposal creation (`proposerBondWood`) and challenge filing
+    ///         (`ChallengeGame.file`) all halt, which is correct: no price
+    ///         means no proof of coverage.
+    error NoWoodPrice();
+
     // ── Events ──
     event WoodUsdPriceSet(uint256 oldPriceX8, uint256 newPriceX8);
     event WoodFeedSet(address indexed feed, uint256 maxDelay);
+    event WoodTwapOracleSet(address indexed oldOracle, address indexed newOracle);
     event GuardianRegistrySet(address indexed oldRegistry, address indexed newRegistry);
     event AssetFeedSet(address indexed asset, address feed, uint256 maxDelay, uint8 assetDecimals);
     event ExposureRecorded(address indexed guardian, bytes32 indexed reviewKey, uint256 usd, uint256 epoch);
@@ -46,6 +73,9 @@ interface IExposureLedger {
     event ParameterChangeFinalized(bytes32 indexed paramKey, uint256 oldValue, uint256 newValue);
     event CoverageFreezerSet(address indexed oldFreezer, address indexed newFreezer);
     event CoverageFrozenSet(address indexed governor, uint256 indexed proposalId, bool frozen);
+    /// @notice A proposal's coverage was pinned open through `deadline`,
+    ///         independent of whether it is currently frozen.
+    event CoveragePinned(address indexed governor, uint256 indexed proposalId, uint256 deadline);
 
     // ── Registry-only mutations ──
     function recordApproval(address governor, uint256 proposalId, address guardian) external;
@@ -67,12 +97,19 @@ interface IExposureLedger {
     function unfreezeCoverage(address governor, uint256 proposalId) external;
     function isCoverageFrozen(address governor, uint256 proposalId) external view returns (bool);
     /// @notice Whether ANY frozen proposal names this guardian as a covering
-    ///         approver. sWOOD gates the unstake CLAIM on it, which is what
+    ///         approver, OR this guardian is still within a `pinCoverageUntil`
+    ///         deadline. sWOOD gates the unstake CLAIM on it, which is what
     ///         makes the freeze load-bearing rather than decorative: epoch
     ///         buckets age out on wall-clock and a disputed challenge outlives
     ///         them, so `openExposureUsd` alone would let an accused guardian
     ///         claim its bond mid-accusation.
     function hasFrozenCoverage(address guardian) external view returns (bool);
+    /// @notice Pin every approver of (governor, proposalId) as frozen through
+    ///         `deadline`, regardless of `freezeCoverage`/`unfreezeCoverage`
+    ///         state. Only ever RAISES a guardian's pin; decays on its own
+    ///         once `block.timestamp` passes `deadline` — no unpin call
+    ///         exists or is needed.
+    function pinCoverageUntil(address governor, uint256 proposalId, uint256 deadline) external;
     /// @dev Zero is legal and deliberate — it is the UNWIRE switch, closing
     ///      the freeze surface when the challenge game is replaced: with no
     ///      freezer wired there is no filing, so the unwired state fails
@@ -167,13 +204,36 @@ interface IExposureLedger {
     function coverageUsd(address asset, uint256 amount) external view returns (uint256);
     function proposerBondWood(address asset, uint256 requiredCoverage) external view returns (uint256);
     function currentEpoch() external view returns (uint256);
+
+    /// @notice The WOOD/USD price CAP, 8 decimals. NEVER SERVED AS A PRICE — it
+    ///         only bounds whatever the market reports, and lowering it is the
+    ///         emergency brake.
+    /// @dev    Seed it ABOVE market and review it monthly. A cap below market
+    ///         binds permanently, which pins every bond at the cap and makes
+    ///         the market source inert — the exact inversion design revision 2
+    ///         exists to undo. Zero means `NoWoodPrice`, not "uncapped".
     function woodUsdPriceX8() external view returns (uint256);
     function woodPriceX8() external view returns (uint256);
 
-    /// @notice The WOOD price plus whether it came from the fallback rather than
-    ///         the feed — so monitoring can observe the degraded path.
-    function woodPriceDetail() external view returns (uint256 price, bool usingFallback);
+    /// @notice The WOOD price, which source produced it, and whether the cap is
+    ///         currently binding — so monitoring can observe both degraded
+    ///         paths without an event.
+    /// @param  price       `_haircut(min(market, cap))`, floored at 1.
+    /// @param  fromFeed    True when a Chainlink WOOD feed priced it; false
+    ///                     means the TWAP oracle did. There is no third source:
+    ///                     with neither available this view REVERTS
+    ///                     `NoWoodPrice` rather than returning a made-up number.
+    /// @param  capBinding  True when `woodUsdPriceX8 < market`, i.e. the manual
+    ///                     cap — not the market — is setting every bond's value.
+    ///                     Sustained `true` is the alarm that the cap has
+    ///                     drifted BELOW market and the market source has gone
+    ///                     inert; it is not a safety failure, but it is the
+    ///                     signal that the number needs raising.
+    function woodPriceDetail() external view returns (uint256 price, bool fromFeed, bool capBinding);
     function woodHaircutBps() external view returns (uint256);
+
+    /// @notice The wired `IWoodTwapOracle`, or `address(0)` when unwired.
+    function woodTwapOracle() external view returns (address);
     function epochLength() external view returns (uint256);
     function challengeWindow() external view returns (uint256);
     function kNumerator() external view returns (uint256);
@@ -184,6 +244,15 @@ interface IExposureLedger {
     // ── Owner setters ──
     function setWoodUsdPrice(uint256 newPriceX8) external;
     function setWoodFeed(address feed, uint256 maxDelay) external;
+
+    /// @notice Wire (or unwire, with `address(0)`) the WOOD/WETH TWAP oracle.
+    /// @dev    Wiring VALIDATES the oracle's pair before trusting it, so an
+    ///         empty or wrong-token pool cannot be adopted by address alone.
+    ///         Unwiring is legal but is NOT a safe resting state under design
+    ///         revision 2: with no Chainlink WOOD feed on chain 4663 it leaves
+    ///         the ledger with no price source at all and every price read
+    ///         reverts `NoWoodPrice`. Unwire only to rotate onto a replacement.
+    function setWoodTwapOracle(address oracle) external;
     function setWoodHaircutBps(uint256 newBps) external;
     function setAssetFeed(address asset, address feed, uint256 maxDelay) external;
     function setGuardianRegistry(address registry) external;

@@ -711,6 +711,24 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     ///      enforces this at bind time.
     /// @dev Forbidden while any proposal binds the vault — the new owner would
     ///      otherwise inherit `pause()` and other owner-only powers mid-flight.
+    /// @dev INCOMING-OWNER CONSENT REQUIRED (issue #98). `newOwner` must first
+    ///      call `approveOwnerStakeBinding(vault)` on sWOOD, or this reverts
+    ///      `StakedWood.BindingNotApproved`. Rotation is not a bare title
+    ///      assignment: it SPENDS `newOwner`'s escrowed prepared stake via the
+    ///      `transferOwnerStakeSlot` call below. The auth above covers only
+    ///      `msg.sender` — the outgoing side — so without that opt-in the owner
+    ///      of any vault with an empty bond slot could bind a stranger's escrow
+    ///      to it, blocking the victim's `cancelPreparedStake` and their own
+    ///      `createSyndicate`, and exposing the bond to `slashOwnerBond` for
+    ///      the length of an owner-unstake cooldown they never chose. Consent
+    ///      is enforced at the sWOOD spend site rather than here, so any future
+    ///      factory route into `transferOwnerStakeSlot` inherits it.
+    /// @dev UX consequence: rotation is two transactions across two contracts —
+    ///      `newOwner` approves on sWOOD, then the owner/creator calls this. The
+    ///      approval is single-use (consumed by the bind) and revocable until
+    ///      then. A missing approval reverts the WHOLE call, so the
+    ///      `rotateOwnership` performed just before it unwinds atomically and
+    ///      no ownership, owner-stake, or creator-record state changes.
     function rotateOwner(address vault, address newOwner) external {
         if (newOwner == address(0)) revert ZeroAddress();
         uint256 syndicateId = vaultToSyndicate[vault];

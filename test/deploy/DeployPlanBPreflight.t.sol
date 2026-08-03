@@ -15,6 +15,7 @@ import {SyndicateVault} from "../../src/SyndicateVault.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAggregatorV3} from "../mocks/MockAggregatorV3.sol";
+import {MockWoodTwapOracle} from "../mocks/MockWoodTwapOracle.sol";
 
 /// @dev THE ONLY WAY TO RUN A SCRIPT AS ITS OWN BROADCASTER FROM A TEST.
 ///      `vm.startBroadcast()` executes the script's calls as forge's
@@ -162,7 +163,13 @@ contract DeployPlanBPreflightTest is Test {
     DeployPlanB internal script;
 
     uint256 internal constant FEED_MAX_DELAY = 1 days;
-    uint256 internal constant WOOD_PRICE_X8 = 5e7; // $0.50, 8-dec
+    /// @dev The price CAP, $0.50. It is NOT a price — pre-flight 8 requires it
+    ///      non-zero, and the market sits BELOW it (see `WOOD_MARKET_X8`), which
+    ///      is the configuration production ships.
+    uint256 internal constant WOOD_PRICE_CAP_X8 = 5e7;
+    /// @dev What the TWAP oracle reports, $0.25 — half the cap, so the cap is
+    ///      non-binding and the deployed ledger prices off the market.
+    uint256 internal constant WOOD_MARKET_X8 = 2.5e7;
     uint256 internal constant COVERED_TVL_CAP = 1_000_000e18;
 
     // The address book the next script run should see. See `_book`.
@@ -174,11 +181,25 @@ contract DeployPlanBPreflightTest is Test {
     // value an UNSET `MAX_STRATEGY_DURATION` produces in `run()`. See
     // `test_deploy_seatsTheProtocolDurationCeiling`.
     uint256 internal bookMaxStrategyDuration;
+    /// @dev The live WOOD price source. Under design revision 2 the deployed
+    ///      ledger CANNOT price a bond without one — `woodUsdPriceX8` is a cap,
+    ///      never a price — so a book with a zero here is a book pre-flight 8
+    ///      refuses. Seeded in `setUp`; a test that wants the refusal clears it.
+    address internal bookTwapOracle;
+    /// @dev The price CAP the next run should seed. A test that wants
+    ///      pre-flight 8's first assert zeroes it.
+    uint256 internal bookCapPriceX8 = WOOD_PRICE_CAP_X8;
+    /// @dev The haircut the next run should seed. Seeded in `setUp` from the
+    ///      script's own default so this suite asserts against exactly what an
+    ///      unset `WOOD_HAIRCUT_BPS` produces; a test that wants pre-flight 9
+    ///      raises it to the ledger's 10,000 no-allowance default.
+    uint256 internal bookHaircutBps;
 
     function setUp() public {
         wood = new ERC20Mock("WOOD", "WOOD", 18);
         usdg = new ERC20Mock("USDG", "USDG", 6);
         usdgFeed = new MockAggregatorV3(8, 1e8);
+        bookTwapOracle = address(new MockWoodTwapOracle(WOOD_MARKET_X8));
 
         StakedWood swoodImpl = new StakedWood();
         bytes memory swoodInit = abi.encodeCall(
@@ -237,6 +258,7 @@ contract DeployPlanBPreflightTest is Test {
         // one-shot cheatcode. Nothing is armed here today; the habit is what
         // stops the next edit from being the one that breaks.
         bookMaxStrategyDuration = script.DEFAULT_MAX_STRATEGY_DURATION();
+        bookHaircutBps = script.DEFAULT_WOOD_HAIRCUT_BPS();
         // OWNED BY `DEFAULT_SENDER`, not the test contract — see
         // `PlanBScriptCaller`'s own natspec for why.
         vm.etch(DEFAULT_SENDER, address(new PlanBScriptCaller()).code);
@@ -516,6 +538,185 @@ contract DeployPlanBPreflightTest is Test {
         assertEq(protocolConfig.maxStrategyDuration(), 30 days, "and the run must still seat the ceiling");
     }
 
+    // ── PRE-FLIGHT 8: the WOOD price must actually resolve ─────────────────
+    //
+    // Finding 2. Under design revision 2 `woodUsdPriceX8` is a CAP that is
+    // never served as a price, so a deployment can be misconfigured in two
+    // independent ways that both leave every price read reverting
+    // `NoWoodPrice` — nothing proposable, executable or challengeable — while
+    // every other pre-flight in this file passes. Each gets its own assert, and
+    // each gets its own test, because the operator's remedy differs.
+
+    /// @dev (a) The CAP is unset. A zero cap is not "uncapped"; it is a revert.
+    function test_preflight_bites_whenTheWoodPriceCapIsZero() public {
+        bookCapPriceX8 = 0;
+        _runExpecting("PRE-FLIGHT: ExposureLedger.woodUsdPriceX8 is 0");
+    }
+
+    /// @dev (b) The CAP is set but nothing prices under it. This is the shape a
+    ///      cap-only check would MISS: `woodUsdPriceX8 != 0` proves the ceiling
+    ///      is configured and says nothing about whether anything is priced
+    ///      beneath it. Chain 4663 has no Chainlink WOOD/USD feed, so with no
+    ///      oracle wired the ledger has no source at all.
+    function test_preflight_bites_whenNoWoodPriceSourceIsWired() public {
+        bookTwapOracle = address(0);
+        _runExpecting("PRE-FLIGHT: ExposureLedger.woodPriceX8() does not resolve");
+    }
+
+    /// @dev (c) The oracle is wired but has no completed averaging window yet —
+    ///      the operationally likely mistake, since `WoodTwapOracle` needs at
+    ///      least `twapWindow` of keeper activity before `consult()` answers.
+    ///      Refused, which is what forces the deploy-and-prime-first ordering.
+    function test_preflight_bites_whenTheOracleHasNoCompletedWindowYet() public {
+        MockWoodTwapOracle(bookTwapOracle).setAvailable(false);
+        _runExpecting("PRE-FLIGHT: ExposureLedger.woodPriceX8() does not resolve");
+    }
+
+    /// @dev The passing shape, asserted on the DEPLOYED state rather than on
+    ///      the book: the oracle landed, the cap landed, and the composed price
+    ///      is the MARKET — proving the cap was seeded above it and is not
+    ///      binding, which is the configuration production ships.
+    function test_deploy_wiresTheOracleAndPricesOffTheMarket() public {
+        _run();
+
+        ExposureLedger ledger = ExposureLedger(swood.exposureLedger());
+        assertEq(ledger.woodTwapOracle(), bookTwapOracle, "the oracle must be wired by the script");
+        assertEq(ledger.woodUsdPriceX8(), WOOD_PRICE_CAP_X8, "the cap must land");
+        // Market-priced, THEN discounted by the seated allowance. The cap sits
+        // above the market and so plays no part in the number.
+        assertEq(
+            ledger.woodPriceX8(),
+            (WOOD_MARKET_X8 * DeployPlanB(script).DEFAULT_WOOD_HAIRCUT_BPS()) / 10_000,
+            "priced off the market, with the cap above it and the haircut applied"
+        );
+        (,, bool capBinding) = ledger.woodPriceDetail();
+        assertFalse(capBinding, "a cap seeded BELOW market would bind and make the oracle inert");
+    }
+
+    // ── PRE-FLIGHT 9: a real haircut allowance must exist ──────────────────
+
+    /// @dev THE LEDGER'S OWN DEFAULT IS THE FAILING VALUE, which is what makes
+    ///      this check worth having. `woodHaircutBps` ships at 10,000 — no
+    ///      haircut — and the ledger's setter ACCEPTS 10,000 as a legal value,
+    ///      so nothing else in the stack refuses the one configuration with
+    ///      zero allowance against the accepted overstatements. Left unchecked
+    ///      it ships silently and looks entirely healthy.
+    function test_preflight_bites_whenTheHaircutLeavesNoAllowance() public {
+        bookHaircutBps = 10_000;
+        _runExpecting("PRE-FLIGHT: ExposureLedger.woodHaircutBps is 10000");
+    }
+
+    /// @dev The shipped value, asserted on the DEPLOYED state and pinned to the
+    ///      script's own constant so the two cannot drift. 7,000 is a 30%
+    ///      allowance; 5,000 (the ledger floor) was rejected as too costly to
+    ///      guardian return on equity.
+    function test_deploy_seatsTheShippedHaircut() public {
+        assertEq(script.DEFAULT_WOOD_HAIRCUT_BPS(), 7_000, "the shipped haircut is 7,000 -- a 30% allowance");
+
+        _run();
+
+        ExposureLedger ledger = ExposureLedger(swood.exposureLedger());
+        assertEq(ledger.woodHaircutBps(), 7_000, "the haircut must be seated by the script, not left at 10,000");
+
+        // It is a real discount on a real valuation, not a stored number: the
+        // composed price is 70% of what the market source reports.
+        assertEq(ledger.woodPriceX8(), (WOOD_MARKET_X8 * 7_000) / 10_000, "the allowance reaches the price");
+    }
+
+    /// @dev An operator override is honoured, and the floor still binds. The
+    ///      ledger's own setter rejects anything under 5,000 mid-broadcast, so
+    ///      this proves the script does not quietly widen the range.
+    function test_deploy_honoursAHaircutOverrideAndRespectsTheFloor() public {
+        bookHaircutBps = 6_000;
+        _run();
+        assertEq(ExposureLedger(swood.exposureLedger()).woodHaircutBps(), 6_000, "an override must be seated");
+    }
+
+    // ─────────────── pre-flight 10: the ledger owner (issue #89) ───────────────
+    //
+    // WHAT THESE TWO TESTS ESTABLISH, AND WHAT THEY DELIBERATELY DO NOT.
+    //
+    // Issue #89 deleted the in-contract rate limit on `setWoodUsdPrice` and
+    // `setWoodHaircutBps` and moved it to a Zodiac Delay/Roles module on the
+    // owner Safe. Pre-flight 10 is the only on-chain trace of that requirement,
+    // and it checks exactly one thing: the ledger owner is a CONTRACT, not a
+    // bare EOA. These tests pin that, and nothing more.
+    //
+    // DO NOT "IMPROVE" THIS INTO A MODULE PROBE. That was considered and
+    // rejected on the merged design, and `openspec/specs/deployment-docs/spec.md`
+    // records the reasoning: pre-flight 10
+    //
+    //   "deliberately does not probe for modules: enumerating a Safe's modules
+    //    would prove only that *some* module is attached, not that the delay is
+    //    asymmetric, and a probe that appears to verify the requirement while
+    //    verifying something weaker is worse than none."
+    //
+    // The property that actually matters — the delay must be ASYMMETRIC, raises
+    // delayed and drops immediate — is not expressible on chain at all, because
+    // a Roles modifier cannot compare an argument against current on-chain
+    // state. It stays a runbook obligation verified by a human before launch.
+    // A test asserting `getModulesPaginated` returns a non-empty page would look
+    // like coverage of the Zodiac requirement while covering something strictly
+    // weaker, which is the failure mode the spec is warning about.
+
+    /// @dev THE PASSING BRANCH. The harness etches a forwarder at
+    ///      `DEFAULT_SENDER` (see `PlanBScriptCaller`), so the broadcaster — and
+    ///      therefore the ledger owner — genuinely has code, which is the shape
+    ///      pre-flight 10 is built to accept.
+    ///
+    ///      This test also PINS THE CREATE PREDICTION that the EOA test below
+    ///      depends on. The ledger is the first contract the broadcaster creates
+    ///      inside `vm.startBroadcast` (`DeployPlanB.s.sol:531`), so its address
+    ///      is `computeCreateAddress(DEFAULT_SENDER, nonce)`. Asserting it here
+    ///      means a broken prediction is diagnosed by THIS test, rather than
+    ///      surfacing as a mysteriously silent mock in the next one.
+    function test_preflight10_passes_whenTheLedgerOwnerIsAContract() public {
+        address predicted = vm.computeCreateAddress(DEFAULT_SENDER, vm.getNonce(DEFAULT_SENDER));
+
+        _run();
+
+        address ledger = swood.exposureLedger();
+        assertEq(ledger, predicted, "ledger must be the broadcaster's first CREATE -- the EOA test relies on it");
+        assertEq(ExposureLedger(ledger).owner(), DEFAULT_SENDER, "the broadcaster owns the ledger it deployed");
+        assertTrue(DEFAULT_SENDER.code.length != 0, "pre-flight 10's condition: the owner is a contract");
+    }
+
+    /// @dev THE REFUSING BRANCH, and the state a real deployment starts in:
+    ///      `DeployPlanB` deploys the ledger owned by the broadcaster, so a run
+    ///      from a plain deployer key leaves an EOA owning both price levers.
+    ///      With the in-contract limit gone that deployment carries NEITHER the
+    ///      on-chain control nor the off-chain one — and nothing in the source
+    ///      would hint anything is missing. Hence the refusal.
+    ///
+    ///      THE OWNER IS THE BROADCASTER, so this makes the broadcaster a
+    ///      genuine EOA rather than faking the read. The forwarder the other
+    ///      tests need exists only to make `deployer == msg.sender` equal the
+    ///      broadcast sender; here both are `DEFAULT_SENDER` already, so its
+    ///      code can be stripped and the call pranked from that same address —
+    ///      the owner-gated setters in the broadcast still run as the owner,
+    ///      and the run reaches the pre-flight for the right reason.
+    ///
+    ///      Mocking the ledger's `owner()` instead does NOT work, and the reason
+    ///      is worth recording: `vm.mockCall` gives the target account code, so
+    ///      mocking the not-yet-deployed ledger address makes the script's
+    ///      `new ExposureLedger(...)` collide with it and revert with no reason
+    ///      string — a failure that looks nothing like the refusal under test.
+    function test_preflight10_bites_whenTheLedgerOwnerIsABareEOA() public {
+        address predicted = vm.computeCreateAddress(DEFAULT_SENDER, vm.getNonce(DEFAULT_SENDER));
+        address eoa = address(0xE0A);
+        assertEq(eoa.code.length, 0, "the fixture must be a genuine EOA for this to mean anything");
+
+        vm.mockCall(predicted, abi.encodeWithSignature("owner()"), abi.encode(eoa));
+        // `vm.mockCall` gives the target account code, which would make the
+        // script's `new ExposureLedger(...)` collide with this very address and
+        // revert with no reason string (EIP-684). Clear the code again: the mock
+        // registration survives, so the CREATE lands and the pre-flight still
+        // reads the EOA.
+        vm.etch(predicted, "");
+
+        _runExpecting("PRE-FLIGHT: ExposureLedger owner is an EOA, not a contract.");
+    }
+
     // ─────────────────────────────── helpers ───────────────────────────────
 
     /// @dev THE ADDRESS BOOK IS PASSED, NOT SET IN THE ENVIRONMENT. `run()`'s
@@ -543,10 +744,12 @@ contract DeployPlanBPreflightTest is Test {
             usdg: address(usdg),
             usdgFeed: address(usdgFeed),
             feedMaxDelay: FEED_MAX_DELAY,
-            woodPriceX8: WOOD_PRICE_X8,
+            woodPriceCapX8: bookCapPriceX8,
+            woodHaircutBps: bookHaircutBps,
             coveredTvlCapUsd: bookCap,
             protocolConfig: address(protocolConfig),
-            maxStrategyDuration: bookMaxStrategyDuration
+            maxStrategyDuration: bookMaxStrategyDuration,
+            woodTwapOracle: bookTwapOracle
         });
     }
 

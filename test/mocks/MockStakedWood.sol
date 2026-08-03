@@ -57,14 +57,11 @@ contract MockStakedWood is IStakedWood {
     mapping(address => uint256) internal _guardianStake;
     mapping(address => uint256) internal _preparedStakeOf;
     mapping(address => bool) internal _canCreateVault;
+    mapping(address => address) public approvedBindVault;
     uint256 public flatRequiredOwnerBond;
     uint256 public minSlashBps;
     uint256 public maxSlashBps;
     uint256 public coolDownPeriod;
-    /// @dev Mirrors the real `StakedWood.MAX_CONVICTION_BOUNTY_BPS` value.
-    ///      `slashToEscrow` is not modeled by this mock (see below), so this
-    ///      exists only so `IStakedWood`-typed callers can read it.
-    uint256 public constant MAX_CONVICTION_BOUNTY_BPS = 2_000;
 
     // ── Recorded mutation args (for assertions) ──
     uint256 public slashGuardiansCallCount;
@@ -151,6 +148,14 @@ contract MockStakedWood is IStakedWood {
         _canCreateVault[owner] = v;
     }
 
+    /// @dev Owner-stake binding consent (issue #98) is a settable read here,
+    ///      like the rest of the mock's surface. The real clearing lifecycle
+    ///      (consume on bind, clear on cancel / fresh prepare) lives in
+    ///      `StakedWood` — tests that exercise it use a real proxy.
+    function setApprovedBindVault(address owner, address vault) external {
+        approvedBindVault[owner] = vault;
+    }
+
     function setSlashBounds(uint256 minBps, uint256 maxBps) external {
         minSlashBps = minBps;
         maxSlashBps = maxBps;
@@ -228,11 +233,7 @@ contract MockStakedWood is IStakedWood {
 
     // Verdict slash path (spec §4). Not modeled: the burn needs a real WOOD
     // balance, so `StakedWoodSlashVerdict.t.sol` drives a real proxy.
-    function slashVerdict(bytes32, uint256, address[] calldata, uint256[] calldata, bool[] calldata, address, uint256)
-        external
-        pure
-        returns (uint256)
-    {
+    function slashVerdict(bytes32, uint256, address[] calldata, uint256[] calldata) external pure returns (uint256) {
         revert("MockStakedWood: slashVerdict not modeled");
     }
 
@@ -294,6 +295,14 @@ contract MockStakedWood is IStakedWood {
 
     function transferOwnerStakeSlot(address, address) external pure {
         revert("MockStakedWood: transferOwnerStakeSlot not modeled");
+    }
+
+    function approveOwnerStakeBinding(address) external pure {
+        revert("MockStakedWood: approveOwnerStakeBinding not modeled; use setApprovedBindVault");
+    }
+
+    function revokeOwnerStakeBinding() external pure {
+        revert("MockStakedWood: revokeOwnerStakeBinding not modeled; use setApprovedBindVault");
     }
 
     function setMinGuardianStake(uint256) external pure {

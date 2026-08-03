@@ -7,6 +7,7 @@ import {IProtocolConfig} from "./interfaces/IProtocolConfig.sol";
 import {IGuardianRegistry} from "./interfaces/IGuardianRegistry.sol";
 import {ITierRegistry} from "./interfaces/ITierRegistry.sol";
 import {IExposureLedger} from "./interfaces/IExposureLedger.sol";
+import {IChallengeGame} from "./interfaces/IChallengeGame.sol";
 import {IProposerBondEscrow} from "./interfaces/IProposerBondEscrow.sol";
 import {IStrategy} from "./interfaces/IStrategy.sol";
 import {GovernorParameters} from "./GovernorParameters.sol";
@@ -561,10 +562,42 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      elapsed time AND the freeze matters because a late filing can
     ///      convict after `challengeWindow` has passed on its own.
     ///
-    ///      Known gap: `ChallengeGame.challengeableUntil` can extend the
-    ///      filing deadline past this gate after an `Inconclusive` unwind, so
-    ///      a bond can release while a re-filing is still technically
-    ///      admissible.
+    ///      Elapsed time and the freeze are not sufficient on their own: the
+    ///      adversary is a proposer racing an `Inconclusive` unwind's re-armed
+    ///      window. `ChallengeGame._refundAll` releases the coverage freeze AND
+    ///      raises `challengeableUntil[reviewKey]` to
+    ///      `block.timestamp + challengeWindow` in the same call, so between
+    ///      that unwind and the re-armed deadline both gates above are open
+    ///      while a conviction — and with it `forfeitBond` — is still
+    ///      reachable. The third gate therefore asks the game itself and
+    ///      mirrors `ChallengeGame.file`'s own deadline,
+    ///      `max(executedAt + game.challengeWindow(), challengeableUntil[rk])`,
+    ///      so reclaim mirrors filing admissibility as long as `_exposureLedger`
+    ///      is stable. It is NOT an identity: these gates reach the game THROUGH
+    ///      that pointer, which is owner-mutable, so re-pointing it mid-challenge
+    ///      detaches them (issue #116). The escrow pointer is pinned per proposal;
+    ///      this one is not.
+    ///      Reading the game's window rather than only `challengeableUntil`
+    ///      also covers the ledger owner lowering the LEDGER's window below the
+    ///      game's, which nothing on the game side prevents.
+    ///
+    ///      Strict `>`: `file` admits while `block.timestamp <= deadline`, so
+    ///      at the deadline itself a filing is still legal and reclaim must
+    ///      still refuse.
+    ///
+    ///      Skipped entirely when the ledger's `coverageFreezer` is unset. With
+    ///      no freezer, `ExposureLedger.freezeCoverage` (onlyFreezer) can never
+    ///      fire and `ProposerBondEscrow.forfeitBond` (caller must BE the
+    ///      freezer) can never collect, so no conviction is reachable and there
+    ///      is nothing for this gate to protect; an unwired or rotated-away
+    ///      freezer must not strand an honest proposer's bond. A non-zero
+    ///      freezer that REVERTS or cannot be read fails closed — recover by
+    ///      rotating `coverageFreezer` or re-pointing the ledger. Note the
+    ///      asymmetry: a freezer that ANSWERS zero passes rather than failing
+    ///      closed, so "fails closed" covers unreadability, not every unhelpful
+    ///      answer (issue #117). Note `challengeableUntil` is zero for an
+    ///      untouched key and zero is not a sentinel, so an unchallenged
+    ///      proposal still reclaims on the ordinary schedule.
     ///
     ///      Releases against `proposal.proposerBondEscrow` (bound at propose),
     ///      NOT the live `_bondEscrow` slot: the escrow has no owner and no
@@ -600,6 +633,19 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             }
             if (IExposureLedger(ledger).isCoverageFrozen(address(this), proposalId)) {
                 revert ChallengeWindowOpen();
+            }
+            // Gate 3: the game's LIVE filing deadline. See the natspec above
+            // for why the two gates above are not sufficient on their own.
+            address freezer = IExposureLedger(ledger).coverageFreezer();
+            if (freezer != address(0)) {
+                uint256 deadline = executedAt + IChallengeGame(freezer).challengeWindow();
+                // Same review-key derivation as `ChallengeGame._reviewKey`
+                // (abi.encode, not encodePacked).
+                uint256 extended =
+                    IChallengeGame(freezer).challengeableUntil(keccak256(abi.encode(address(this), proposalId)));
+                if (extended > deadline) deadline = extended;
+                // Strict: `file` still admits at `block.timestamp == deadline`.
+                if (block.timestamp <= deadline) revert ChallengeWindowOpen();
             }
         }
         address escrow = proposal.proposerBondEscrow;

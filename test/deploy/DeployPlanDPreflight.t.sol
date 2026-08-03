@@ -10,6 +10,7 @@ import {ExposureLedger} from "../../src/ExposureLedger.sol";
 import {StakedWood} from "../../src/StakedWood.sol";
 import {TierRegistry} from "../../src/TierRegistry.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
+import {MockWoodTwapOracle} from "../mocks/MockWoodTwapOracle.sol";
 
 /// @dev See `DeployTokenCourtPreflight.t.sol`'s copy of this contract for the
 ///      full explanation: `vm.startBroadcast` runs the script's calls as
@@ -58,7 +59,10 @@ contract DeployPlanDPreflightTest is Test {
 
     DeployPlanD internal script;
 
-    uint256 internal constant WOOD_PRICE_X8 = 5e7; // $0.50, 8-dec
+    /// @dev The price CAP, $0.50 — never served as a price. The market sits
+    ///      below it, so the cap does not bind (the production shape).
+    uint256 internal constant WOOD_PRICE_CAP_X8 = 5e7;
+    uint256 internal constant WOOD_MARKET_X8 = 2.5e7; // $0.25, 8-dec
 
     function setUp() public {
         wood = new ERC20Mock("WOOD", "WOOD", 18);
@@ -87,8 +91,14 @@ contract DeployPlanDPreflightTest is Test {
         // The state Plan B and Plan C leave behind, and which this script
         // presumes to find. Plan B's `swood.setExposureLedger` is part of it —
         // `DeployPlanB` now makes that call inside its own broadcast.
+        // Design revision 2: the scalar is a CAP, never a price, so Plan B also
+        // leaves a live market source behind. Without one the ledger cannot
+        // price WOOD at all and pre-flight 3 refuses — which is the state
+        // `test_preflight_bites_whenTheLedgerIsUnpriced` provokes deliberately.
+        MockWoodTwapOracle woodTwap = new MockWoodTwapOracle(WOOD_MARKET_X8);
         vm.startPrank(DEFAULT_SENDER);
-        ledger.setWoodUsdPrice(WOOD_PRICE_X8);
+        ledger.setWoodUsdPrice(WOOD_PRICE_CAP_X8);
+        ledger.setWoodTwapOracle(address(woodTwap));
         swood.setExposureLedger(address(ledger));
         vm.stopPrank();
 
@@ -188,9 +198,9 @@ contract DeployPlanDPreflightTest is Test {
     ///      Zero stays settable on the ledger (it is the emergency stop), so no
     ///      storage poke is needed.
     function test_preflight_bites_whenTheLedgerIsUnpriced() public {
-        // `setWoodUsdPrice` rate-limits to one move per `MIN_PRICE_UPDATE_INTERVAL`;
-        // the fixture already set a price in `setUp`, so move time first.
-        vm.warp(vm.getBlockTimestamp() + 2 days);
+        // No warp needed: `setWoodUsdPrice` is no longer rate-limited (issue
+        // #89 moved that to a Zodiac module on the owner Safe), so a second
+        // move in the same block `setUp` already used simply lands.
         vm.prank(DEFAULT_SENDER);
         ledger.setWoodUsdPrice(0);
         _runExpecting("PRE-FLIGHT: ExposureLedger.woodPriceX8 is 0");

@@ -190,6 +190,25 @@ contract MockChallengeLedger {
         _frozen[_key(governor, proposalId)] = false;
     }
 
+    /// @dev Issue #95: `_refundAll` calls this through the typed
+    ///      `IExposureLedger` interface, so every existing `Inconclusive` test
+    ///      in this suite needs the mock to implement it or the call reverts.
+    ///      Recorded, not merely accepted, so a test can pin exactly what
+    ///      `_refundAll` passed — `pinCoverageUntil`'s whole job is carrying
+    ///      the JUST-EXTENDED `challengeableUntil[rk]`, not some other value.
+    mapping(bytes32 reviewKey => uint256) internal _pinnedUntil;
+    uint256 public pinCoverageUntilCallCount;
+
+    function pinCoverageUntil(address governor, uint256 proposalId, uint256 deadline) external {
+        pinCoverageUntilCallCount++;
+        bytes32 k = _key(governor, proposalId);
+        if (deadline > _pinnedUntil[k]) _pinnedUntil[k] = deadline;
+    }
+
+    function pinnedUntil(address governor, uint256 proposalId) external view returns (uint256) {
+        return _pinnedUntil[_key(governor, proposalId)];
+    }
+
     function isCoverageFrozen(address governor, uint256 proposalId) external view returns (bool) {
         return _frozen[_key(governor, proposalId)];
     }
@@ -266,27 +285,6 @@ contract MockChallengeStakedWood {
     function lastSlashBpsPer() external view returns (uint256[] memory) {
         return _lastSlashBpsPer;
     }
-    /// @dev Task 1 (spec 2026-07-29 §2) added the conviction-bounty params;
-    ///      Task 2 wired the real routing. Recorded, not swallowed, so a test
-    ///      can pin exactly what `_settle` passes: `(challenger,
-    ///      convictionBountyBpsAtFiling)` on a CONTESTED escalated conviction
-    ///      — a `Guilty` ruling where the challenger did not fund its own
-    ///      counter-bond — and `(address(0), 0)` on every other path (the
-    ///      silence settle, and a self-funded escalated conviction, see
-    ///      `ChallengeGame._settle`'s `contested` gate).
-    address public lastBountyTo;
-    uint256 public lastBountyBps;
-
-    /// @dev Mirrors the real `StakedWood.MAX_CONVICTION_BOUNTY_BPS` (2_000
-    ///      default) so `ChallengeGame.setConvictionBountyBps`'s live-read
-    ///      ceiling has something to read in this suite. Settable, unlike the
-    ///      real constant, so `setStakedWood`'s re-point guard can be tested
-    ///      against a SECOND mock deployment with a lower ceiling.
-    uint256 public MAX_CONVICTION_BOUNTY_BPS = 2_000;
-
-    function setMaxConvictionBountyBps(uint256 v) external {
-        MAX_CONVICTION_BOUNTY_BPS = v;
-    }
 
     uint256 internal _nextTotal = 1_000e18;
 
@@ -339,10 +337,7 @@ contract MockChallengeStakedWood {
         bytes32 caseKey,
         uint256 openedAt,
         address[] calldata approvers,
-        uint256[] calldata slashBpsPer,
-        bool[] calldata contestors,
-        address bountyTo,
-        uint256 bountyBps
+        uint256[] calldata slashBpsPer
     ) external returns (uint256) {
         for (uint256 i = 0; i < approvers.length; i++) {
             if (_verdictSlashed[caseKey][approvers[i]]) revert ApproverAlreadySlashed();
@@ -353,9 +348,6 @@ contract MockChallengeStakedWood {
         lastOpenedAt = openedAt;
         _lastApprovers = approvers;
         _lastSlashBpsPer = slashBpsPer;
-        _lastContestors = contestors;
-        lastBountyTo = bountyTo;
-        lastBountyBps = bountyBps;
         return _nextTotal;
     }
 
@@ -1121,14 +1113,12 @@ contract ChallengeGameTest is Test {
         assertEq(slashed.length, 2);
         assertEq(slashed[0], guardianA);
         assertEq(slashed[1], guardianB);
-        // This is the SILENCE path (undisputed, resolved by timeout), and Task
-        // 2 (spec 2026-07-29 §2) pays the conviction bounty ONLY on a
-        // CONTESTED escalated conviction — never here, where an honest filer
-        // and a liar are indistinguishable to the contract. Pinned explicitly
-        // so a future change to the routing shows up here as an intentional,
-        // reviewed diff rather than a silent behavior change.
-        assertEq(swood.lastBountyTo(), address(0), "the silence settle pays no bounty: bountyTo is zero");
-        assertEq(swood.lastBountyBps(), 0, "the silence settle pays no bounty: bountyBps is zero");
+        // The slash names no payee on ANY path — `slashVerdict` has no
+        // recipient argument to pass one through, so the property is now
+        // enforced by the signature rather than by a runtime check. Pinned
+        // structurally in `test_slash_carriesNoPayoutRecipient`; the
+        // prosecutor's fee arrives from the proposer's forfeited bond, which
+        // this mock never touches.
 
         // The adapter the challenger named is demoted (§3.4, D7).
         assertEq(tiers.demoteCount(), 1);
@@ -2085,30 +2075,17 @@ contract ChallengeGameTest is Test {
         game.setStakedWood(address(0));
     }
 
-    /// @notice PR review 2026-07-29 IMPORTANT-2: `setConvictionBountyBps` only
-    ///         bounds a NEW rate against whichever slasher is wired at that
-    ///         moment — it says nothing about the slasher changing later
-    ///         underneath an unchanged rate. `game.convictionBountyBps()` is
-    ///         `500` by default; re-pointing to a slasher whose own ceiling is
-    ///         BELOW that must revert, not silently leave every open
-    ///         challenge's pinned rate one `_settle` call away from a
-    ///         permanent revert inside the new sWOOD.
-    function test_setStakedWood_rejectsRePointBelowTheCurrentRate() public {
-        MockChallengeStakedWood tooStrict = new MockChallengeStakedWood();
-        tooStrict.setMaxConvictionBountyBps(100); // below the default 500 bps
+    /// @notice The prosecutor's fee no longer rides on sWOOD, so re-pointing
+    ///         the slasher cannot strand a pinned rate. sWOOD is handed no rate
+    ///         at all now — the fee is paid by `ProposerBondEscrow`, which
+    ///         bounds it itself on every forfeiture.
+    function test_setStakedWood_doesNotConstrainTheProsecutorFee() public {
+        MockChallengeStakedWood other = new MockChallengeStakedWood();
+        other.setAuthorizedSlasher(address(game));
         vm.prank(owner);
-        vm.expectRevert(IChallengeGame.InvalidParameter.selector);
-        game.setStakedWood(address(tooStrict));
-
-        // A ceiling AT OR ABOVE the current rate is unaffected.
-        MockChallengeStakedWood lenient = new MockChallengeStakedWood();
-        lenient.setMaxConvictionBountyBps(500);
-        // ...provided it has also named this game its slasher (review PR #56 M2)
-        // — the reciprocal half, asserted on its own in the sibling test below.
-        lenient.setAuthorizedSlasher(address(game));
-        vm.prank(owner);
-        game.setStakedWood(address(lenient));
-        assertEq(address(game.stakedWood()), address(lenient));
+        game.setStakedWood(address(other)); // no rate check to fail
+        assertEq(address(game.stakedWood()), address(other), "re-point accepted");
+        assertEq(game.prosecutorFeeBps(), 500, "and the fee rate is untouched");
     }
 
     /// @notice The defaults ship with a dispute window generous relative to the
@@ -2521,6 +2498,34 @@ contract ChallengeGameTest is Test {
 
         uint256 r5 = _fileAndDispute();
         assertEq(game.challengeOf(r5).inconclusiveBurnBpsAtFiling, 2_000, "round 5 (4+): stays at the steady state");
+    }
+
+    // ── Issue #95: an Inconclusive re-arm must pin exposure to match ──
+
+    /// @notice `_refundAll` releases the LIVE freeze but re-arms
+    ///         `challengeableUntil[rk]` for another `challengeWindow` — this
+    ///         test pins that the SAME call now also extends the ledger's
+    ///         exposure pin to match, via `pinCoverageUntil`, rather than
+    ///         leaving the re-armed window unprotected.
+    /// @dev    MUTATION-CHECKED: deleting the `pinCoverageUntil` call from
+    ///         `_refundAll` makes `pinCoverageUntilCallCount` stay `0` here,
+    ///         failing the first assertion — this is the exact call the fix
+    ///         adds, not incidental mock plumbing.
+    function test_inconclusive_pinsExposureThroughTheReArmedDeadline() public {
+        bytes32 key = _reviewKeyFor(address(gov), PROPOSAL);
+        uint256 id = _fileAndDispute();
+
+        vm.prank(court);
+        game.rule(id, IChallengeGame.Verdict.Inconclusive);
+
+        assertEq(ledger.pinCoverageUntilCallCount(), 1, "the re-arm calls pinCoverageUntil exactly once");
+        uint256 rearmed = game.challengeableUntil(key);
+        assertGt(rearmed, block.timestamp, "the window is genuinely re-armed");
+        assertEq(
+            ledger.pinnedUntil(address(gov), PROPOSAL),
+            rearmed,
+            "pinned through the SAME instant the re-armed deadline reads, not a stale or independent one"
+        );
     }
 
     /// @notice THE ESCALATION IS REAL WOOD, NOT JUST A BIGGER BPS NUMBER: round
@@ -3554,199 +3559,56 @@ contract ChallengeGameTest is Test {
         vm.stopPrank();
     }
 
-    /// @notice THE SILENCE PATH PAYS NO BOUNTY, and that is the design's
-    ///         central decision (spec 2026-07-29 §2): on that path an honest
-    ///         filer and a liar are indistinguishable to the contract, so any
-    ///         bounty there rewards both identically and no size works.
-    function test_convictionBounty_notPaidOnTheSilencePath() public {
+    /// @notice THE SLASH PAYS NO ONE. sWOOD is handed a case key, a basis and
+    ///         the rates — and nothing else. There is no recipient argument to
+    ///         misdirect and no bounty leg to divert, which is the whole point
+    ///         of moving the prosecutor's fee onto the proposer's bond: the
+    ///         slash pot is one a prosecutor can fund for itself by staking and
+    ///         approving the proposal it is about to accuse.
+    function test_slash_carriesNoPayoutRecipient() public {
         uint256 id = _fileStandard(PROPOSAL);
         vm.warp(vm.getBlockTimestamp() + 7 days + 1);
         game.resolve(id);
-        assertEq(swood.lastBountyTo(), address(0), "no recipient on the silence settle");
-        assertEq(swood.lastBountyBps(), 0, "no rate on the silence settle");
+
+        assertEq(swood.callCount(), 1, "the slash ran");
+        // The mock records everything sWOOD is given. A recipient is not among
+        // it, because the ABI no longer has one.
+        assertEq(swood.lastCaseKey(), _reviewKeyFor(address(gov), PROPOSAL), "case key forwarded");
+        assertGt(swood.lastApprovers().length, 0, "and the cohort");
     }
 
-    function test_convictionBounty_paidOnTheGuiltyRuling() public {
-        uint256 id = _fileAndDispute();
-        vm.prank(court);
-        game.rule(id, IChallengeGame.Verdict.Guilty);
-        assertEq(swood.lastBountyTo(), challenger, "the challenger is the recipient");
-        assertEq(swood.lastBountyBps(), 500, "the pinned rate is forwarded");
-    }
-
-    /// @notice `_fail`/`_refundAll` never call `slashToEscrow` at all — asserted
-    ///         via `callCount`, not via `lastBountyBps`. `lastBountyBps() == 0`
-    ///         is true on a fresh mock whether or not it was ever called, so it
-    ///         would pass just as well against a future bug that wired the
-    ///         slash into one of these paths (as long as that bug also zeroed
-    ///         the bounty rate). `callCount` pins the actual claim: the mock was
-    ///         never invoked on either non-conviction path.
-    function test_convictionBounty_notPaidOnFailOrInconclusive() public {
-        uint256 a = _fileAndDispute();
-        vm.prank(court);
-        game.rule(a, IChallengeGame.Verdict.NotGuilty);
-        assertEq(swood.callCount(), 0, "_fail never calls the slasher, so never pays");
-
-        uint256 b = _fileAndDisputeSecondProposal();
-        vm.prank(court);
-        game.rule(b, IChallengeGame.Verdict.Inconclusive);
-        assertEq(swood.callCount(), 0, "_refundAll never calls the slasher, so never pays");
-    }
-
-    function test_convictionBounty_pinnedAtFiling() public {
-        uint256 id = _fileAndDispute(); // escalated - the only path that pays
-        vm.prank(owner);
-        game.setConvictionBountyBps(2_000); // raise AFTER filing
-        vm.prank(court);
-        game.rule(id, IChallengeGame.Verdict.Guilty);
-        assertEq(game.challengeOf(id).convictionBountyBpsAtFiling, 500, "the challenge keeps its filing rate");
-        assertEq(swood.lastBountyBps(), 500, "forwarded at the pinned rate, not the raised one");
-    }
-
-    /// @notice Both resolves here are silence-path settles, so `lastBountyBps()`
-    ///         is just the sticky value the FIRST settle left behind (0, since
-    ///         the silence path never pays) — it is not evidence the SECOND
-    ///         settle skipped anything, because a call that never happened and
-    ///         a call that happened and paid nothing look identical through
-    ///         that view. `callCount` is the real claim: the second `resolve`
-    ///         hits the `_convicted` short-circuit and never calls the slasher
-    ///         at all, so the count stays at exactly one.
-    function test_convictionBounty_notPaidTwiceOnAConcurrentChallenge() public {
-        (uint256 first, uint256 second) = _twoConcurrentChallenges();
-        vm.warp(vm.getBlockTimestamp() + 7 days + 1);
-        game.resolve(first);
-        game.resolve(second); // hits the _convicted short-circuit - no slash at all
-        assertEq(swood.callCount(), 1, "the second settle never calls the slasher again");
-    }
-
-    /// @notice THE ESCALATED GATE ALONE IS NOT ENOUGH (PR review 2026-07-29
-    ///         IMPORTANT-1): permissionless pool contribution (PR #50) lets the
-    ///         CHALLENGER fund its own counter-bond, forcing `Disputed` while
-    ///         locking the real accused out of the only slot the pool has left
-    ///         (the target is clamped to `bondWood`, so once the challenger has
-    ///         put in the whole thing there is no shortfall left for anyone
-    ///         else to fund). Gating the bounty on `escalated` alone would pay
-    ///         it on a `Guilty` ruling here too — recovering bond + its own pool
-    ///         PLUS the bounty, while a `NotGuilty` ruling would only cost
-    ///         `forfeitBurnBps` of the bond — a 5x-lighter downside than never
-    ///         disputing, which would make self-disputing strictly dominant for
-    ///         a liar and an honest filer alike, denying the real accused a
-    ///         defence window either way.
-    ///
-    ///         `contested` closes it: this mirrors
-    ///         `test_selfChallenge_roundTripCostsExactlyTheBurn`'s fixture but
-    ///         drives it to a `Guilty` ruling instead of a timeout, and pins
-    ///         that the self-funded pool pays no bounty even there, and that
-    ///         the challenger's net position is NOT profitable — it recovers
-    ///         exactly what it put in (its filing bond, plus the pool it funded
-    ///         itself), nothing more.
-    /// @dev Updated for the approver-membership gate (PR review 2026-07-29,
-    ///      option 1): the challenger is blocked here not because the funder
-    ///      literally equals `c.challenger` (that identity check is exactly
-    ///      what a sybil defeats — see
-    ///      `test_convictionBounty_notPaidWhenASybilFundsThePool` below) but
-    ///      because the funder is not one of the ACCUSED approvers
-    ///      (guardianA/guardianB in this fixture): nobody who could be slashed
-    ///      by this conviction bought the defence, so nothing was contested.
-    function test_selfChallenge_guiltyRulingOnASelfFundedPoolPaysNoBounty() public {
-        uint256 challengerBefore = wood.balanceOf(challenger);
-
-        uint256 id = _fileStandard(PROPOSAL); // pulls the filing bond from `challenger`
-        uint256 bond = game.challengeOf(id).bondWood;
-
-        // The challenger funds its OWN counter-bond in full — permissionless
-        // since PR #50, and nobody else needs to touch it.
-        vm.prank(challenger);
-        game.dispute(id, type(uint256).max);
-        assertEq(game.counterBondContributionOf(id, challenger), bond, "100% self-funded");
-        assertEq(uint256(game.challengeOf(id).status), uint256(IChallengeGame.Status.Disputed), "forced to Disputed");
-
-        vm.prank(court);
-        game.rule(id, IChallengeGame.Verdict.Guilty);
-
-        // NO BOUNTY: the challenger is not one of the accused approvers.
-        assertEq(swood.lastBountyTo(), address(0), "self-funded pool: no bounty recipient");
-        assertEq(swood.lastBountyBps(), 0, "self-funded pool: no bounty rate");
-
-        // NOT PROFITABLE: bond + its own pool return, and nothing on top. The
-        // WOOD the challenger put in (bond for filing, bond again for the
-        // self-funded pool) is exactly the WOOD it gets back.
-        assertEq(
-            wood.balanceOf(challenger),
-            challengerBefore,
-            "self-funded guilty ruling nets exactly zero - no bounty profit on top"
-        );
-        _assertLiveBondsBacked();
-    }
-
-    /// @notice THE SYBIL SHAPE THIS GATE EXISTS FOR (PR review 2026-07-29
-    ///         IMPORTANT-1, option 1): a second address the challenger
-    ///         controls — distinct from `c.challenger`, never staked, never an
-    ///         approver of anything — funds the pool instead of the challenger
-    ///         funding it directly. A same-wallet check
-    ///         (`_contributed[id][c.challenger] == 0`) reads this as a genuine
-    ///         contest, because the funder literally is not `c.challenger`, and
-    ///         would pay the bounty for a fight nobody had. The
-    ///         approver-membership gate does not ask WHOSE wallet funded the
-    ///         pool at all; it asks whether the funder is one of the ACCUSED —
-    ///         and a fresh address with no stake and no recorded approval on
-    ///         this proposal is not, no matter which EOA happens to control it.
-    function test_convictionBounty_notPaidWhenASybilFundsThePool() public {
-        address sybil = makeAddr("sybilFunder");
-        _fund(sybil);
-
+    /// @notice THE FEE IS PINNED AT FILING, like every other rate the challenge
+    ///         is priced against — a live read would change what the challenger
+    ///         stood to collect on a conviction it had already bonded against.
+    function test_prosecutorFee_pinnedAtFiling() public {
         uint256 id = _fileStandard(PROPOSAL);
-        uint256 bond = game.challengeOf(id).bondWood;
+        assertEq(game.challengeOf(id).prosecutorFeeBpsAtFiling, 500, "pinned at the filing rate");
 
-        // A DISTINCT address — not the challenger, not an accused approver —
-        // funds the whole counter-bond.
-        vm.prank(sybil);
-        game.dispute(id, type(uint256).max);
-        assertEq(game.counterBondContributionOf(id, sybil), bond, "the sybil funded 100% of the pool");
-        assertEq(uint256(game.challengeOf(id).status), uint256(IChallengeGame.Status.Disputed), "forced to Disputed");
+        vm.prank(owner);
+        game.setProsecutorFeeBps(1_000);
 
-        vm.prank(court);
-        game.rule(id, IChallengeGame.Verdict.Guilty);
-
-        // NO BOUNTY: the funder (the sybil address) is not one of the accused
-        // approvers, so `contested` stays false even though the funder is not
-        // literally `c.challenger` either.
-        assertEq(swood.lastBountyTo(), address(0), "sybil-funded pool: no bounty recipient");
-        assertEq(swood.lastBountyBps(), 0, "sybil-funded pool: no bounty rate");
-        _assertLiveBondsBacked();
+        assertEq(game.challengeOf(id).prosecutorFeeBpsAtFiling, 500, "the open challenge keeps its rate");
+        uint256 later = _fileStandard(2);
+        assertEq(game.challengeOf(later).prosecutorFeeBpsAtFiling, 1_000, "a later filing takes the new one");
     }
 
-    /// @notice THE PROPERTY THE GATE MUST NOT BREAK: when an ACTUAL accused
-    ///         approver funds the counter-bond — guardianA here, via the
-    ///         standard `_fileAndDispute` fixture — a `Guilty` ruling still
-    ///         pays the bounty at the pinned rate. Without this, the
-    ///         membership scan could be stuck `false` from an unrelated bug
-    ///         (wrong array, off-by-one, wrong mapping) and every `notPaid*`
-    ///         test above would still pass for the wrong reason. Duplicates
-    ///         `test_convictionBounty_paidOnTheGuiltyRuling` in substance —
-    ///         named separately here to sit next to the negative cases as the
-    ///         fixture's positive control.
-    function test_convictionBounty_paidWhenAnAccusedApproverFundsThePool() public {
-        uint256 id = _fileAndDispute(); // guardianA, an accused approver, funds the pool
-        assertGt(game.counterBondContributionOf(id, guardianA), 0, "fixture sanity: guardianA is the funder");
-
-        vm.prank(court);
-        game.rule(id, IChallengeGame.Verdict.Guilty);
-
-        assertEq(swood.lastBountyTo(), challenger, "an approver-funded defence is a real contest: bounty paid");
-        assertEq(swood.lastBountyBps(), 500, "at the pinned rate");
+    /// @notice The game's ceiling MIRRORS the escrow's; the escrow is the
+    ///         authority. Pinned so the two cannot drift apart silently.
+    function test_prosecutorFee_ceilingMirrorsTheEscrow() public view {
+        assertEq(game.MAX_PROSECUTOR_FEE_BPS(), 2_000, "the game's convenience guard");
+        assertLe(game.prosecutorFeeBps(), game.MAX_PROSECUTOR_FEE_BPS(), "the default sits under it");
     }
 
-    function test_setConvictionBountyBps_boundsAndOwner() public {
+    function test_setProsecutorFeeBps_boundsAndOwner() public {
         vm.prank(owner);
         vm.expectRevert(IChallengeGame.InvalidParameter.selector);
-        game.setConvictionBountyBps(2_001); // above sWOOD's ceiling
+        game.setProsecutorFeeBps(2_001); // above MAX_PROSECUTOR_FEE_BPS
         vm.prank(challenger);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, challenger));
-        game.setConvictionBountyBps(100);
+        game.setProsecutorFeeBps(100);
         vm.prank(owner);
-        game.setConvictionBountyBps(0); // zero is legal - bounty off
-        assertEq(game.convictionBountyBps(), 0);
+        game.setProsecutorFeeBps(0); // zero is legal - bounty off
+        assertEq(game.prosecutorFeeBps(), 0);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -3883,6 +3745,54 @@ contract ChallengeGameTest is Test {
         assertFalse(ledger.isCoverageFrozen(address(gov), PROPOSAL), "unfrozen");
         ledger.releaseApproval(address(gov), PROPOSAL, guardianA);
         _assertLiveBondsBacked();
+    }
+
+    /// @notice A DIVERTED SETTLE MUST NOT SPEND THE DEMOTER ROLE. The
+    ///         `VerdictAlreadyCollected` branch adjudicates nothing — it
+    ///         slashes no one and forfeits no bond — so it has no conviction to
+    ///         carry a consequence for. The demotion used to sit AFTER the
+    ///         if/else and therefore fired on this branch too.
+    ///
+    ///         That was cheap to farm. Concurrency is unguarded by design:
+    ///         `_liveByChallenger` is keyed per challenger, `_convicted` is
+    ///         false for every filing made before the first settle, and
+    ///         `_liveCount` is uncapped. File N challenges from N addresses
+    ///         naming N different certified adapters the proposal touched, let
+    ///         the first collect the liability, and the remaining N-1 divert
+    ///         here while still revoking a certification apiece — for
+    ///         `settleBurnBps` of a bond that is itself `challengerBondBps` of
+    ///         coverage, roughly 1% of the proposal's coverage per adapter.
+    function test_settle_divertedVerdictDoesNotDemoteTheAdapter() public {
+        uint256 id = _fileStandard(PROPOSAL);
+        assertTrue(game.challengeOf(id).adapterTarget != address(0), "fixture: the filing named an adapter");
+
+        // Collect the liability out from under the live challenge, so the
+        // settle takes the diverted branch.
+        bytes32 key = _reviewKeyFor(address(gov), PROPOSAL);
+        swood.setVerdictSlashed(key, guardianA, true);
+        swood.setVerdictSlashed(key, guardianB, true);
+
+        uint256 demotesBefore = tiers.demoteCount();
+
+        vm.warp(_filedAt(id) + game.autoSlashDelay());
+        vm.expectEmit(true, true, true, true, address(game));
+        emit IChallengeGame.VerdictAlreadyCollected(id, address(gov), PROPOSAL);
+        game.resolve(id);
+
+        assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Settled), "still terminal");
+        assertEq(tiers.demoteCount(), demotesBefore, "a settle that collected nothing must revoke nothing");
+    }
+
+    /// @notice ...and the collecting settle still DOES demote, so the fix
+    ///         narrowed the branch rather than disabling the consequence.
+    function test_settle_collectingVerdictStillDemotesTheAdapter() public {
+        uint256 id = _fileStandard(PROPOSAL);
+        uint256 demotesBefore = tiers.demoteCount();
+
+        vm.warp(_filedAt(id) + game.autoSlashDelay());
+        game.resolve(id);
+
+        assertEq(tiers.demoteCount(), demotesBefore + 1, "a real conviction still demotes the named adapter");
     }
 
     /// @notice B1 END TO END ON THE REDEPLOY ITSELF: a V2 filing that was legal

@@ -157,11 +157,10 @@ contract DeployTokenCourtPreflightTest is Test {
     ///      it from the GAME's side (the court's own pointer is untouched),
     ///      proving this check is independent of pre-flight 1.
     /// @dev A REAL `IStakedWood` IMPLEMENTER, NOT A BARE ADDRESS. `setStakedWood`
-    ///      re-validates `convictionBountyBps` against the NEW slasher's own
-    ///      `MAX_CONVICTION_BOUNTY_BPS()` (PR review 2026-07-29 IMPORTANT-2,
-    ///      predates this task) — a code-less `address(0xBEEF)` has no such
-    ///      function to call and the setter itself reverts before this test
-    ///      ever reaches the wire pre-flight it means to exercise.
+    ///      demands the reciprocal grant, calling `authorizedSlasher()` on the
+    ///      candidate — a code-less `address(0xBEEF)` has no such function and
+    ///      the setter itself reverts before this test ever reaches the wire
+    ///      pre-flight it means to exercise.
     ///      `MockStakedWood` (already used identically in `TokenCourt.t.sol`)
     ///      is a minimal `IStakedWood` that satisfies the re-point guard while
     ///      still genuinely differing from `swood`.
