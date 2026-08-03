@@ -339,6 +339,19 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      double-count against the live buckets and silently tighten the
     ///      batching cap, which is a different control.
     mapping(address guardian => uint256) internal _frozenCommitments;
+    /// @notice The latest instant through which a guardian's coverage is
+    ///         pinned open, independent of whether any challenge naming them
+    ///         is currently LIVE (issue #95).
+    /// @dev A MAX, not a per-key value. A guardian can be pinned by more than
+    ///      one accusation at once, and `pinCoverageUntil` only ever raises
+    ///      this — so a later accusation's deadline correctly outlives an
+    ///      earlier one's, and once the LATEST of them elapses, so does the
+    ///      pin for everyone it covered. No release call is needed: unlike
+    ///      `_frozenCommitments`, which requires an explicit `unfreezeCoverage`
+    ///      to clear, this decays on its own by wall-clock — the same way
+    ///      `openExposureUsd`'s epoch buckets do, and for the same reason: a
+    ///      value nobody has to remember to unwind cannot be forgotten.
+    mapping(address guardian => uint256) internal _pinnedCoverageUntil;
 
     /// @dev How many proposals are frozen right now, across every guardian.
     ///      Lets `setCoverageFreezer` refuse a rotation that would orphan a
@@ -1094,7 +1107,37 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
 
     /// @inheritdoc IExposureLedger
     function hasFrozenCoverage(address guardian) external view returns (bool) {
-        return _frozenCommitments[guardian] != 0;
+        return _frozenCommitments[guardian] != 0 || _pinnedCoverageUntil[guardian] > block.timestamp;
+    }
+
+    /// @inheritdoc IExposureLedger
+    /// @dev EXTENDS THE FREEZE'S REACH PAST ITS OWN RELEASE (issue #95).
+    ///      `unfreezeCoverage` drops the moment no challenge against this key
+    ///      is LIVE — but `ChallengeGame` can re-arm a legal re-challenge
+    ///      window (`challengeableUntil`) that outlives the live challenge
+    ///      that just resolved `Inconclusive`. Without this, both of sWOOD's
+    ///      unstake gates (`openExposureUsd`, which ages out on its own
+    ///      wall-clock tied to `challengeWindow` from EXECUTION, not from any
+    ///      re-arm) and `hasFrozenCoverage` (which just went false) can read
+    ///      clean while a conviction is still legally reachable — the accused
+    ///      claims its stake, and the eventual verdict recovers nothing.
+    ///
+    ///      Walks the SAME `_approversOf[key]` list `freezeCoverage` walks,
+    ///      for the same reason: only guardians who actually committed
+    ///      coverage to this proposal are the ones a still-open accusation
+    ///      can slash. `deadline` only ever RAISES `_pinnedCoverageUntil`,
+    ///      mirroring `challengeableUntil`'s own monotonic-raise semantics one
+    ///      layer up — a later, larger extension must not be shadowed by an
+    ///      earlier, smaller one still in effect.
+    function pinCoverageUntil(address governor, uint256 proposalId, uint256 deadline) external onlyFreezer {
+        bytes32 key = _reviewKey(governor, proposalId);
+        address[] storage listed = _approversOf[key];
+        for (uint256 i = 0; i < listed.length; i++) {
+            address g = listed[i];
+            if (_recorded[key][g].usd == 0) continue;
+            if (deadline > _pinnedCoverageUntil[g]) _pinnedCoverageUntil[g] = deadline;
+        }
+        emit CoveragePinned(governor, proposalId, deadline);
     }
 
     /// @inheritdoc IExposureLedger
