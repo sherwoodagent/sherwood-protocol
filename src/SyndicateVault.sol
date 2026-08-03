@@ -137,6 +137,20 @@ contract SyndicateVault is
     bytes4 private constant _SEL_ERC1363_APPROVE_AND_CALL_DATA = 0xcae9ca51; // ERC1363 approveAndCall(address spender,uint256,bytes)
     bytes4 private constant _SEL_PERMIT2_BATCH_TRANSFER_FROM = 0x0d58b1db; // Permit2 AllowanceTransfer.transferFrom(AllowanceTransferDetails[]) — dynamic-array batch sibling of the guarded single-transfer overload; decoded via `_Permit2BatchDetail`, NOT the fixed-offset slices the other selectors share
 
+    // ── ROUND 4 (re-audit https://github.com/sherwoodagent/sherwood-protocol/pull/157#issuecomment-5166496090) ──
+    // ERC4626 withdraw/redeem: a THIRD allowance-pull shape, distinct from
+    // every selector above. `owner` (the debited source, analogous to
+    // `transferFrom`'s `from`) sits at arg 2 (bytes 68:100), not arg 0 like
+    // every previously-guarded selector — every prior round's OR-chains
+    // assumed the source was always at bytes[4:36], so these needed their
+    // own dedicated branch rather than joining an existing one.
+    bytes4 private constant _SEL_ERC4626_WITHDRAW = 0xb460af94; // withdraw(uint256 assets, address receiver, address owner)
+    bytes4 private constant _SEL_ERC4626_REDEEM = 0xba087652; // redeem(uint256 shares, address receiver, address owner) — same arg shape as withdraw
+    // ERC1363 transferAndCall: push-with-callback sibling of the guarded
+    // `transfer`/`push`/`approveAndCall` — recipient at arg 0, same offset.
+    bytes4 private constant _SEL_ERC1363_TRANSFER_AND_CALL = 0x1296ee62; // transferAndCall(address to, uint256 value)
+    bytes4 private constant _SEL_ERC1363_TRANSFER_AND_CALL_DATA = 0x4000aea0; // transferAndCall(address to, uint256 value, bytes data)
+
     /// @dev Decode-only mirror of Permit2's `AllowanceTransferDetails` struct
     ///      (`{address from; address to; uint160 amount; address token;}`) —
     ///      never used to call Permit2, only to `abi.decode` a batch
@@ -859,6 +873,15 @@ contract SyndicateVault is
                             revert DisallowedTransferFromSource(target, details[j].from);
                         }
                     }
+                } else if (sel == _SEL_ERC4626_WITHDRAW || sel == _SEL_ERC4626_REDEEM) {
+                    // `owner` (the debited source) is arg 2 (bytes 68:100),
+                    // not arg 0 like every other guarded selector above —
+                    // OZ's ERC4626 `_withdraw` spends `owner`'s allowance to
+                    // `caller` (the vault) exactly like `transferFrom` spends
+                    // `from`'s.
+                    if (data.length < 100) revert MalformedCall();
+                    address ownerArg = address(uint160(uint256(bytes32(data[68:100]))));
+                    if (ownerArg != address(this)) revert DisallowedTransferFromSource(target, ownerArg);
                 }
             }
         }
@@ -878,12 +901,14 @@ contract SyndicateVault is
             if (
                 sel == _SEL_APPROVE || sel == _SEL_INCREASE_ALLOWANCE || sel == _SEL_TRANSFER
                     || sel == _SEL_DSTOKEN_PUSH || sel == _SEL_ERC1363_APPROVE_AND_CALL
-                    || sel == _SEL_ERC1363_APPROVE_AND_CALL_DATA
+                    || sel == _SEL_ERC1363_APPROVE_AND_CALL_DATA || sel == _SEL_ERC1363_TRANSFER_AND_CALL
+                    || sel == _SEL_ERC1363_TRANSFER_AND_CALL_DATA
             ) {
                 // DSToken push(dst, wad) is transfer's sibling — dst at arg 1
                 // (bytes 4:36), same as _SEL_TRANSFER. ERC1363 approveAndCall
-                // (+data) is approve's sibling — spender at arg 1, same
-                // offset, trailing args (amount/bytes) unread and irrelevant.
+                // (+data) is approve's sibling, and transferAndCall(+data) is
+                // transfer's sibling — spender/to at arg 1, same offset,
+                // trailing args (amount/bytes) unread and irrelevant.
                 if (data.length < 36) revert MalformedCall();
                 recipient = address(uint160(uint256(bytes32(data[4:36]))));
             } else if (
@@ -901,6 +926,14 @@ contract SyndicateVault is
                 // an extra leading `token` arg vs legacy `approve(spender,
                 // amount)`, shifting the guarded `spender` to arg 2 (bytes
                 // 36:68) instead of arg 1 (bytes 4:36).
+                if (data.length < 68) revert MalformedCall();
+                recipient = address(uint160(uint256(bytes32(data[36:68]))));
+            } else if (sel == _SEL_ERC4626_WITHDRAW || sel == _SEL_ERC4626_REDEEM) {
+                // `receiver` is arg 1 (bytes 36:68); `owner` (already
+                // source-checked in Part 1b above) is arg 2 and irrelevant
+                // here — same offset as the transferFrom-shaped group above,
+                // kept as its own branch since the source check that landed
+                // it here uses a different offset (arg 2, not arg 0).
                 if (data.length < 68) revert MalformedCall();
                 recipient = address(uint160(uint256(bytes32(data[36:68]))));
             } else if (sel == _SEL_PERMIT2_BATCH_TRANSFER_FROM) {

@@ -697,4 +697,92 @@ contract SelectorGuardTest is Test {
         vm.expectRevert(ISyndicateVault.MalformedCall.selector);
         _exec(_one(permit2, abi.encodeWithSelector(SEL_PERMIT2_BATCH_TRANSFER_FROM)));
     }
+
+    // ── PR #157 audit ROUND 4: two more gaps found in the direct manual
+    // re-audit of round 3 — ERC4626 withdraw/redeem (a third allowance-pull
+    // shape, source at arg 2 not arg 0) and ERC1363 transferAndCall (the
+    // push-with-callback sibling of transfer/push/approveAndCall, missed
+    // the same way DSToken push was missed in round 3).
+
+    bytes4 constant SEL_ERC4626_WITHDRAW = 0xb460af94; // withdraw(uint256,address,address)
+    bytes4 constant SEL_ERC4626_REDEEM = 0xba087652; // redeem(uint256,address,address)
+    bytes4 constant SEL_ERC1363_TRANSFER_AND_CALL = 0x1296ee62; // transferAndCall(address,uint256)
+    bytes4 constant SEL_ERC1363_TRANSFER_AND_CALL_DATA = 0x4000aea0; // transferAndCall(address,uint256,bytes)
+
+    address erc4626Token = makeAddr("erc4626Token");
+
+    /// @notice `withdraw(assets, receiver, owner)` pulls from `owner` via the
+    ///         same allowance-spend mechanism as `transferFrom`, but `owner`
+    ///         sits at arg 2 (bytes 68:100) — a shape none of round 1-3's
+    ///         source-check branches recognized, so this fell through
+    ///         completely unguarded. Reproduces the same LP-allowance-
+    ///         confiscation shape as the transferFrom/Permit2/DSToken tests
+    ///         above, on a fourth (and structurally distinct) offset layout.
+    function test_erc4626WithdrawThirdPartyOwnerReverts_LPAllowanceConfiscation() public {
+        address victimLP = makeAddr("erc4626VictimLP");
+        vm.expectRevert(
+            abi.encodeWithSelector(ISyndicateVault.DisallowedTransferFromSource.selector, erc4626Token, victimLP)
+        );
+        _exec(_one(erc4626Token, abi.encodeWithSelector(SEL_ERC4626_WITHDRAW, 1_000e18, attacker, victimLP)));
+    }
+
+    function test_erc4626RedeemThirdPartyOwnerReverts_LPAllowanceConfiscation() public {
+        address victimLP = makeAddr("erc4626VictimLP2");
+        vm.expectRevert(
+            abi.encodeWithSelector(ISyndicateVault.DisallowedTransferFromSource.selector, erc4626Token, victimLP)
+        );
+        _exec(_one(erc4626Token, abi.encodeWithSelector(SEL_ERC4626_REDEEM, 1_000e18, attacker, victimLP)));
+    }
+
+    function test_erc4626WithdrawVaultOwnerToNonAllowlistedReceiverReverts() public {
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                ISyndicateVault.DisallowedTransferTarget.selector, erc4626Token, SEL_ERC4626_WITHDRAW, attacker
+            )
+        );
+        _exec(_one(erc4626Token, abi.encodeWithSelector(SEL_ERC4626_WITHDRAW, 1_000e18, attacker, address(vault))));
+    }
+
+    function test_erc4626RedeemVaultOwnerToAllowlistedAdapterPasses() public {
+        _exec(_one(erc4626Token, abi.encodeWithSelector(SEL_ERC4626_REDEEM, 1_000e18, adapter, address(vault))));
+    }
+
+    function test_erc4626WithdrawMalformedCallReverts() public {
+        vm.expectRevert(ISyndicateVault.MalformedCall.selector);
+        _exec(_one(erc4626Token, abi.encodeWithSelector(SEL_ERC4626_WITHDRAW, 1_000e18, attacker)));
+    }
+
+    /// @notice `transferAndCall(to, value)` moves the VAULT's own funds
+    ///         (push, not pull) with the same `[4:36]` recipient offset as
+    ///         `transfer`/`push`/`approveAndCall` — missed the same way
+    ///         `push` was missed by round 2, on a router round 3 already
+    ///         partially covers.
+    function test_erc1363TransferAndCallToNonAllowlistedReverts() public {
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                ISyndicateVault.DisallowedTransferTarget.selector, erc1363Token, SEL_ERC1363_TRANSFER_AND_CALL, attacker
+            )
+        );
+        _exec(_one(erc1363Token, abi.encodeWithSelector(SEL_ERC1363_TRANSFER_AND_CALL, attacker, 1_000e18)));
+    }
+
+    function test_erc1363TransferAndCallDataOverloadToNonAllowlistedReverts() public {
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                ISyndicateVault.DisallowedTransferTarget.selector,
+                erc1363Token,
+                SEL_ERC1363_TRANSFER_AND_CALL_DATA,
+                attacker
+            )
+        );
+        _exec(
+            _one(
+                erc1363Token, abi.encodeWithSelector(SEL_ERC1363_TRANSFER_AND_CALL_DATA, attacker, 1_000e18, bytes(""))
+            )
+        );
+    }
+
+    function test_erc1363TransferAndCallToAllowlistedAdapterPasses() public {
+        _exec(_one(erc1363Token, abi.encodeWithSelector(SEL_ERC1363_TRANSFER_AND_CALL, adapter, 1_000e18)));
+    }
 }
