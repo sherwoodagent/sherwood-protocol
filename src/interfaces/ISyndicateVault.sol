@@ -70,6 +70,12 @@ interface ISyndicateVault {
     /// @notice A governor-batch call carries a guarded value-moving selector but
     ///         its calldata is too short to hold the spender/recipient argument.
     error MalformedCall();
+    /// @notice A governor-batch call carries `transferFrom` whose `from` is not
+    ///         the vault itself. Unconditional: pulling a third party's ERC20
+    ///         allowance (e.g. an LP's deposit allowance) is not a capability
+    ///         the tier system prices, so this is refused regardless of the
+    ///         TierRegistry's presence or the `to` recipient.
+    error DisallowedTransferFromSource(address target, address from);
 
     // ── Init Params ──
     struct InitParams {
