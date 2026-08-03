@@ -904,4 +904,142 @@ contract GovernorEmergencyTest is Test {
         );
         assertFalse(vault.redemptionsLocked());
     }
+
+    // ──────────────────────────────────────────────────────────────
+    // Issue #43 §8.5 — the cap-breach lifecycle end to end
+    // ──────────────────────────────────────────────────────────────
+
+    /// @dev Propose, vote, and let the guardian review resolve to Approved —
+    ///      mirrors `_createExecutedProposal` exactly up to (but not
+    ///      including) `executeProposal`, so callers can drive execute/settle
+    ///      themselves and assert on a breach.
+    function _proposeVoteApprove(
+        BatchExecutorLib.Call[] memory execCalls,
+        uint256[] memory execCaps,
+        BatchExecutorLib.Call[] memory settleCalls,
+        uint256[] memory settleCaps,
+        uint256 duration
+    ) internal returns (uint256 proposalId) {
+        vm.prank(agent);
+        proposalId = governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://cap-breach",
+            duration,
+            GovEnvelope.permissive(address(vault)),
+            execCalls,
+            execCaps,
+            settleCalls,
+            settleCaps,
+            _emptyCoProposers()
+        );
+        vm.warp(vm.getBlockTimestamp() + 1);
+        vm.prank(lp1);
+        governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
+        vm.prank(lp2);
+        governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
+        vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
+        registry.openReview(address(governor), proposalId);
+        vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
+    }
+
+    /// @notice An execute-leg cap breach reverts `executeProposal` and the
+    ///         proposal stays `Approved` (it simply expires at `executeBy` if
+    ///         never re-executed within bounds) — matching the vault's own
+    ///         `MaxNetOutflowExceeded` idiom at execute time.
+    function test_capBreach_executeLeg_leavesProposalApproved() public {
+        address sink = makeAddr("execSink");
+        BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](1);
+        execCalls[0] =
+            BatchExecutorLib.Call({target: address(usdc), data: abi.encodeCall(usdc.transfer, (sink, 1_000e6)), value: 0});
+        uint256[] memory execCaps = new uint256[](1);
+        execCaps[0] = 500e6; // too tight -- the call moves 1_000e6
+
+        uint256 pid = _proposeVoteApprove(execCalls, execCaps, _settleCalls(), new uint256[](1), 7 days);
+        assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Approved));
+
+        vm.expectRevert(abi.encodeWithSelector(BatchExecutorLib.CallCapExceeded.selector, 0, 1_000e6, 500e6));
+        governor.executeProposal(pid);
+
+        assertEq(
+            uint256(governor.getProposalState(pid)),
+            uint256(ISyndicateGovernor.ProposalState.Approved),
+            "stays Approved -- expires at executeBy, never silently executed"
+        );
+        assertEq(usdc.balanceOf(sink), 0, "nothing moved");
+    }
+
+    /// @notice A settle-leg cap breach leaves the proposal stuck `Executed`
+    ///         (matching a settlement-leg `MaxNetOutflowExceeded` breach's
+    ///         existing shape), and `unstick` — which REPLAYS the exact
+    ///         stored settlement calls under the exact stored caps — reverts
+    ///         identically. Relief is the guardian-reviewed
+    ///         `emergencySettleWithCalls` path (next test), not `unstick`.
+    function test_capBreach_settleLeg_leavesExecutedAndUnstickReplaysIdentically() public {
+        address sink = makeAddr("settleSink");
+        uint256[] memory execCaps = GovEnvelope.defaultCaps(GovEnvelope.permissive(address(vault)).maxCapital, 1);
+        BatchExecutorLib.Call[] memory settleCalls = new BatchExecutorLib.Call[](1);
+        settleCalls[0] =
+            BatchExecutorLib.Call({target: address(usdc), data: abi.encodeCall(usdc.transfer, (sink, 1_000e6)), value: 0});
+        uint256[] memory settleCaps = new uint256[](1);
+        settleCaps[0] = 500e6; // too tight -- the call moves 1_000e6
+
+        uint256 pid = _proposeVoteApprove(_execCalls(), execCaps, settleCalls, settleCaps, 7 days);
+        governor.executeProposal(pid); // exec leg is benign (approve only) -- succeeds
+        assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Executed));
+
+        vm.warp(vm.getBlockTimestamp() + 7 days + 1);
+        vm.expectRevert(abi.encodeWithSelector(BatchExecutorLib.CallCapExceeded.selector, 0, 1_000e6, 500e6));
+        governor.settleProposal(pid);
+        assertEq(
+            uint256(governor.getProposalState(pid)),
+            uint256(ISyndicateGovernor.ProposalState.Executed),
+            "stuck Executed, not silently settled"
+        );
+
+        // unstick replays the SAME stored settlement calls under the SAME
+        // stored caps -- it does not relax the declaration, so it fails
+        // identically.
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(BatchExecutorLib.CallCapExceeded.selector, 0, 1_000e6, 500e6));
+        governor.unstick(pid);
+        assertEq(usdc.balanceOf(sink), 0, "nothing moved by either attempt");
+    }
+
+    /// @notice The spec's rescue story end to end: from the SAME stuck-Executed
+    ///         proposal a settlement-leg cap breach produces, the owner's
+    ///         guardian-reviewed `emergencySettleWithCalls` ->
+    ///         `finalizeEmergencySettle` path succeeds under EMPTY caps —
+    ///         bounded only by the batch-level `maxCapital`, not the
+    ///         declaration that stranded the proposal. This is precisely why
+    ///         the rescue path must accept empty caps (design.md D3): a
+    ///         settlement-leg `CallCapExceeded` is a legitimate reason to
+    ///         need it.
+    function test_capBreach_settleLeg_emergencyRescueSucceedsUnderEmptyCaps() public {
+        address sink = makeAddr("rescueSink");
+        uint256[] memory execCaps = GovEnvelope.defaultCaps(GovEnvelope.permissive(address(vault)).maxCapital, 1);
+        BatchExecutorLib.Call[] memory settleCalls = new BatchExecutorLib.Call[](1);
+        settleCalls[0] =
+            BatchExecutorLib.Call({target: address(usdc), data: abi.encodeCall(usdc.transfer, (sink, 1_000e6)), value: 0});
+        uint256[] memory settleCaps = new uint256[](1);
+        settleCaps[0] = 500e6;
+
+        uint256 pid = _proposeVoteApprove(_execCalls(), execCaps, settleCalls, settleCaps, 7 days);
+        governor.executeProposal(pid);
+        vm.warp(vm.getBlockTimestamp() + 7 days + 1);
+        vm.expectRevert(abi.encodeWithSelector(BatchExecutorLib.CallCapExceeded.selector, 0, 1_000e6, 500e6));
+        governor.settleProposal(pid); // confirms the stuck state this test starts from
+
+        // Owner rescues with the SAME calls (an honest unwind, just re-declared
+        // outside the per-call cap system) via the guardian-reviewed path.
+        vm.prank(owner);
+        governor.emergencySettleWithCalls(pid, settleCalls);
+        // No guardian block votes cast -> not blocked.
+        vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
+        vm.prank(owner);
+        governor.finalizeEmergencySettle(pid);
+
+        assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Settled));
+        assertEq(usdc.balanceOf(sink), 1_000e6, "the rescue actually moved the funds");
+    }
 }
