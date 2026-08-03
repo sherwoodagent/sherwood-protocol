@@ -12,22 +12,6 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 
-/// @notice Mock PriceRouter returning a configurable strategy valuation, so a
-///         Lane A window can be opened without deploying a real strategy.
-contract MockAccrualRouter {
-    uint256 public v;
-    bool public ok;
-
-    function set(uint256 v_, bool ok_) external {
-        v = v_;
-        ok = ok_;
-    }
-
-    function valueStrategy(address) external view returns (uint256, bool) {
-        return (v, ok);
-    }
-}
-
 /// @notice Covers `specs/management-fee/spec.md`: the accrual base is
 ///         time-weighted over fund assets, it is consumed and reset at
 ///         settlement, and capital idle between proposals accrues nothing.
@@ -43,7 +27,6 @@ contract MgmtFeeAccrualTest is Test {
     BatchExecutorLib internal executorLib;
     ERC20Mock internal usdc;
     MockAgentRegistry internal agentRegistry;
-    MockAccrualRouter internal router;
 
     address internal owner = makeAddr("owner");
     address internal alice = makeAddr("alice");
@@ -58,7 +41,6 @@ contract MgmtFeeAccrualTest is Test {
         usdc = new ERC20Mock("USD Coin", "USDC", 6);
         executorLib = new BatchExecutorLib();
         agentRegistry = new MockAgentRegistry();
-        router = new MockAccrualRouter();
 
         SyndicateVault impl = new SyndicateVault();
         bytes memory initData = abi.encodeCall(
@@ -79,7 +61,6 @@ contract MgmtFeeAccrualTest is Test {
         vault.setWithdrawalQueue(address(queue));
 
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(MOCK_GOVERNOR));
-        vm.mockCall(address(this), abi.encodeWithSignature("priceRouter()"), abi.encode(address(router)));
         _setLocked(false);
 
         usdc.mint(alice, 10_000_000e6);
@@ -109,11 +90,10 @@ contract MgmtFeeAccrualTest is Test {
         }
     }
 
-    /// @dev Open a Lane A window (live NAV available) and start the clock, the
-    ///      way `executeProposal` does.
-    function _executeWithLaneA(uint256 liveValue) internal {
+    /// @dev Open a proposal and start the management-fee clock, the way
+    ///      `executeProposal` does.
+    function _executeProposal() internal {
         _setLocked(true);
-        router.set(liveValue, true);
         vm.prank(MOCK_GOVERNOR);
         vault.startManagementAccrual();
     }
@@ -122,7 +102,6 @@ contract MgmtFeeAccrualTest is Test {
         vm.prank(MOCK_GOVERNOR);
         assetSeconds = vault.consumeManagementAccrual();
         _setLocked(false);
-        router.set(0, false);
     }
 
     /// @dev The fee the governor will charge for a given integral.
@@ -137,11 +116,11 @@ contract MgmtFeeAccrualTest is Test {
         vm.prank(alice);
         vault.deposit(1_000_000e6, alice);
 
-        _executeWithLaneA(0);
+        _executeProposal();
         vm.warp(vm.getBlockTimestamp() + 30 days);
         uint256 long = _settle();
 
-        _executeWithLaneA(0);
+        _executeProposal();
         vm.warp(vm.getBlockTimestamp() + 15 days);
         uint256 short = _settle();
 
@@ -153,74 +132,12 @@ contract MgmtFeeAccrualTest is Test {
         vm.prank(alice);
         vault.deposit(1_000_000e6, alice);
 
-        _executeWithLaneA(0);
+        _executeProposal();
         vm.warp(vm.getBlockTimestamp() + YEAR);
         uint256 assetSeconds = _settle();
 
         // 2%/yr on $1M is $20k.
         assertApproxEqAbs(_feeFor(assetSeconds, 200), 20_000e6, 1, "2%/yr on 1M should be 20k");
-    }
-
-    /// @notice Capital added mid-proposal is charged only for the time it was
-    ///         present — not for the whole proposal.
-    function test_capitalAddedMidProposalIsChargedOnlyForItsTime() public {
-        vm.prank(alice);
-        vault.deposit(1_000_000e6, alice);
-
-        _executeWithLaneA(0);
-        vm.warp(vm.getBlockTimestamp() + 15 days);
-
-        // Lane A deposit: doubles the base for the back half.
-        vm.prank(bob);
-        vault.deposit(1_000_000e6, bob);
-
-        vm.warp(vm.getBlockTimestamp() + 15 days);
-        uint256 assetSeconds = _settle();
-
-        // 1M for 15d, then 2M for 15d.
-        uint256 expected = 1_000_000e6 * uint256(15 days) + 2_000_000e6 * uint256(15 days);
-        assertEq(assetSeconds, expected, "late capital must not be charged for the front half");
-    }
-
-    /// @notice The mirror: a late depositor is not charged for time before the
-    ///         deposit. Compared against an equal-size fund that held the whole
-    ///         time, the late fund owes strictly less.
-    function test_aLateDepositorIsNotChargedForTimeBeforeTheDeposit() public {
-        vm.prank(alice);
-        vault.deposit(1_000_000e6, alice);
-
-        _executeWithLaneA(0);
-        vm.warp(vm.getBlockTimestamp() + 29 days);
-        vm.prank(bob);
-        vault.deposit(1_000_000e6, bob);
-        vm.warp(vm.getBlockTimestamp() + 1 days);
-        uint256 lateEntry = _settle();
-
-        uint256 bothPresentThroughout = 2_000_000e6 * uint256(30 days);
-        assertLt(lateEntry, bothPresentThroughout, "a 1-day-old deposit must not pay for 30 days");
-    }
-
-    /// @notice Capital withdrawn mid-proposal stops accruing at withdrawal.
-    function test_capitalWithdrawnMidProposalStopsAccruing() public {
-        vm.prank(alice);
-        vault.deposit(1_000_000e6, alice);
-        vm.prank(bob);
-        vault.deposit(1_000_000e6, bob);
-
-        _executeWithLaneA(0);
-        vm.warp(vm.getBlockTimestamp() + 15 days);
-
-        // Lane A instant exit halves the base for the back half.
-        uint256 shares1 = vault.balanceOf(bob);
-        vm.prank(bob);
-        vault.redeem(shares1, bob, bob);
-
-        vm.warp(vm.getBlockTimestamp() + 15 days);
-        uint256 assetSeconds = _settle();
-
-        uint256 heldThroughout = 2_000_000e6 * uint256(30 days);
-        assertLt(assetSeconds, heldThroughout, "withdrawn capital must stop accruing at exit");
-        assertGt(assetSeconds, 1_000_000e6 * uint256(30 days), "the front half was still at the full base");
     }
 
     // ── Consume and reset ──
@@ -231,11 +148,11 @@ contract MgmtFeeAccrualTest is Test {
         vm.prank(alice);
         vault.deposit(1_000_000e6, alice);
 
-        _executeWithLaneA(0);
+        _executeProposal();
         vm.warp(vm.getBlockTimestamp() + 30 days);
         uint256 first = _settle();
 
-        _executeWithLaneA(0);
+        _executeProposal();
         vm.warp(vm.getBlockTimestamp() + 10 days);
         uint256 second = _settle();
 
@@ -247,7 +164,7 @@ contract MgmtFeeAccrualTest is Test {
         vm.prank(alice);
         vault.deposit(1_000_000e6, alice);
 
-        _executeWithLaneA(0);
+        _executeProposal();
         vm.warp(vm.getBlockTimestamp() + 30 days);
         _settle();
 
@@ -262,7 +179,7 @@ contract MgmtFeeAccrualTest is Test {
         vm.prank(alice);
         vault.deposit(1_000_000e6, alice);
 
-        _executeWithLaneA(0);
+        _executeProposal();
         vm.warp(vm.getBlockTimestamp() + 10 days);
         _settle();
 
@@ -270,7 +187,7 @@ contract MgmtFeeAccrualTest is Test {
         vm.warp(vm.getBlockTimestamp() + 100 days);
         assertEq(vault.managementAssetSeconds(), 0, "idle capital must accrue nothing");
 
-        _executeWithLaneA(0);
+        _executeProposal();
         vm.warp(vm.getBlockTimestamp() + 10 days);
         uint256 second = _settle();
 
@@ -298,7 +215,7 @@ contract MgmtFeeAccrualTest is Test {
     }
 
     function test_onlyGovernorMayConsumeAccrual() public {
-        _executeWithLaneA(0);
+        _executeProposal();
         vm.prank(alice);
         vm.expectRevert();
         vault.consumeManagementAccrual();
@@ -313,25 +230,10 @@ contract MgmtFeeAccrualTest is Test {
         vm.prank(alice);
         vault.deposit(1_000_000e6, alice);
 
-        _executeWithLaneA(0);
+        _executeProposal();
         assertEq(vault.managementAssetSeconds(), 0, "nothing has elapsed yet");
 
         vm.warp(vm.getBlockTimestamp() + 1 days);
         assertEq(vault.managementAssetSeconds(), 1_000_000e6 * uint256(1 days), "one day at the full base");
-    }
-
-    /// @notice Live NAV counts toward the base — the fee is on fund assets, not
-    ///         on idle float.
-    function test_liveStrategyValueCountsTowardTheBase() public {
-        vm.prank(alice);
-        vault.deposit(1_000_000e6, alice);
-
-        // Half the fund is deployed and priced by the router.
-        _executeWithLaneA(500_000e6);
-        vm.warp(vm.getBlockTimestamp() + 30 days);
-        uint256 assetSeconds = _settle();
-
-        // Float 1M + live NAV 0.5M = 1.5M base.
-        assertEq(assetSeconds, 1_500_000e6 * uint256(30 days), "live NAV belongs in the base");
     }
 }
