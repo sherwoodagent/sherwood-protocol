@@ -134,10 +134,25 @@ contract TierRegistry is Ownable2Step {
 
     /// @notice Owner-managed allowlist of adapter addresses that may appear as
     ///         the spender/recipient of value-moving ERC20 calls inside a
-    ///         governor batch (see `SyndicateVault._guardBatchCalls`). A
-    ///         separate axis from (target, selector) tier certification: tiers
+    ///         governor batch (see `SyndicateVault._guardBatchCalls` PART 2b).
+    ///         A separate axis from (target, selector) tier certification: tiers
     ///         PRICE extractable value for coverage; this list bounds WHERE
     ///         vault funds may be approved or sent at all.
+    ///
+    ///         SECOND CONSUMER (issue #166): also the predicate for whether a
+    ///         target "may be reached by a governor batch at all, and hence may
+    ///         receive vault funds" (`_guardBatchCalls` PART 2a, the callee
+    ///         gate) — same mapping, same owner ceremony, not a second
+    ///         allowlist. `asset()` is the sole callee exempt from this check
+    ///         (metered separately via the vault's own balance diff); every
+    ///         other batch target, whether or not it carries a value-moving
+    ///         selector, must clear this predicate to be callable at all.
+    ///         GOVERNANCE DISCIPLINE: exotic-asset contracts (ERC-721/1155/777
+    ///         and other non-fungible/position tokens) MUST NOT be allowlisted
+    ///         here as batch callees — their non-ERC20 selectors are not
+    ///         examined by the retained selector switch, so allowlisting one as
+    ///         a callee would open an unexamined surface. Batches reach such
+    ///         positions through allowlisted adapters instead.
     mapping(address adapter => bool) private _adapterAllowed;
 
     /// @dev Grant-time codehash snapshot for the allowlist axis (issue #137).
@@ -683,7 +698,16 @@ contract TierRegistry is Ownable2Step {
 
     /// @notice Allow or disallow `adapter` as the spender/recipient of
     ///         value-moving ERC20 calls (approve / increaseAllowance /
-    ///         transfer / transferFrom-out) inside governor batches.
+    ///         transfer / transferFrom-out) inside governor batches, AND
+    ///         (issue #166) as a batch callee at all — a target that fails
+    ///         this check cannot be named in a governor batch regardless of
+    ///         selector or calldata (see `isAdapterAllowed` and
+    ///         `SyndicateVault._guardBatchCalls` PART 2a). Exotic-asset
+    ///         contracts (ERC-721/1155/777, LP-position NFTs) MUST NOT be
+    ///         allowlisted here as batch callees — their non-ERC20 selectors
+    ///         are not examined by the retained PART 2b selector switch, so
+    ///         batches should reach such positions through allowlisted
+    ///         adapters instead.
     /// @dev    The only path that SETS this to true. `_demote` is the only
     ///         path that clears it (see `_demote` natspec for the
     ///         over-broad-by-design clear on any demotion of the adapter).
@@ -713,7 +737,12 @@ contract TierRegistry is Ownable2Step {
     }
 
     /// @notice True when `adapter` may receive approvals/transfers of vault
-    ///         funds through a governor batch.
+    ///         funds through a governor batch, AND (issue #166) whether
+    ///         `adapter` may be named as a batch callee at all —
+    ///         `SyndicateVault._guardBatchCalls` PART 2a consults this same
+    ///         read to decide callability, not just fund-destination consent;
+    ///         the two roles are deliberately the collapsed same predicate
+    ///         (design.md Decision 1 of `target-based-batch-gating`).
     /// @dev    Fail-safe self-heal is LAZY, mirroring `tierOf`: this returns
     ///         true only when the allowlist flag is set AND the adapter's
     ///         live effective codehash still matches the grant-time snapshot
