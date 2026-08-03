@@ -1439,6 +1439,15 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      guardian's own pledge — exactly what they would be holding had
     ///      nobody ever settled — so it can only walk back toward the
     ///      un-settled baseline and never past it.
+    ///
+    ///      THE PLEDGE IS NOT THE ONLY BOUND, because the guardian may have
+    ///      spent the freed budget in the meantime. `_rebook` clamps every
+    ///      upward move to `kNumerator * slashableBondUsd` less the guardian's
+    ///      exposure elsewhere (issue #110) — without it, a re-run could push a
+    ///      guardian past the batching cap that `recordApproval` enforces, using
+    ///      nothing but gas. The clamp binds only when the guardian genuinely
+    ///      over-committed elsewhere; with no competing exposure the walk-up is
+    ///      unrestricted and the repair property above is untouched.
     function settleCoverage(address governor, uint256 proposalId) external {
         bytes32 key = _reviewKey(governor, proposalId);
 
@@ -1510,9 +1519,16 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
             uint256 liveG = _slashableBondUsd(g, priceX8);
             uint256 mine = liveG < reserved ? liveG : reserved;
             uint256 alloc = _allocate(mine, effectiveTotal, needUsd);
-            assigned += alloc;
-            headroom[i] = mine - alloc; // `_allocate` never scales up: alloc <= mine
-            _rebook(key, g, alloc);
+            // BOOKED, NOT ALLOCATED. `_rebook` clamps an upward move to the
+            // guardian's free budget (issue #110), so what it returns can be
+            // below `alloc`. Accruing the allocation instead would overstate
+            // `assigned`, understate the residue, and put a number in
+            // `CoverageSettled` that no bucket holds.
+            uint256 booked = _rebook(key, g, alloc, priceX8);
+            assigned += booked;
+            // `_allocate` never scales up (alloc <= mine) and the clamp only
+            // lowers, so booked <= mine.
+            headroom[i] = mine - booked;
         }
 
         // Truncation leaves the total a few wei under `needUsd`. Hand the
@@ -1544,9 +1560,16 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
                 if (room == 0) continue;
                 uint256 take = room < residue ? room : residue;
                 address g = listed[i];
-                _rebook(key, g, uint256(_recorded[key][g].usd) + take);
-                residue -= take;
-                assigned += take;
+                // AND BOUNDED A SECOND TIME BY THE BATCHING CAP. `room` bounds
+                // the top-up by what this guardian could PAY; `_rebook`'s clamp
+                // bounds it by what this guardian may still UNDERWRITE (issue
+                // #110). Credit only what the bucket actually took, or a
+                // guardian already at its cap would silently swallow the residue
+                // and starve the approvers behind it in the list.
+                uint256 before = uint256(_recorded[key][g].usd);
+                uint256 gained = _rebook(key, g, before + take, priceX8) - before;
+                residue -= gained;
+                assigned += gained;
             }
         }
 
@@ -1555,16 +1578,70 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     }
 
     /// @dev Move a guardian's live booking to `target`, keeping its epoch bucket
-    ///      in step. Both directions: settlement is re-runnable, so a booking
-    ///      that was written down at a bad price has to be able to walk back up.
-    ///      `target` is always `<= _reservedUsd[key][g]`, which `recordApproval`
+    ///      in step, and return what was ACTUALLY booked. Both directions:
+    ///      settlement is re-runnable, so a booking that was written down at a
+    ///      bad price has to be able to walk back up.
+    ///
+    ///      `target` is bounded by `_reservedUsd[key][g]`, which `recordApproval`
     ///      bounded to `uint192`, so neither the cast nor the bucket arithmetic
     ///      can misbehave — the bucket was incremented by the pledge and every
-    ///      subsequent booking is a fraction of it.
-    function _rebook(bytes32 key, address g, uint256 target) internal {
+    ///      subsequent booking is a fraction of it. The RETURN VALUE may be
+    ///      strictly below `target`; see the clamp.
+    ///
+    /// @dev THE BATCHING CAP IS RE-CHECKED ON THE WAY UP (issue #110).
+    ///      `_buckets` is §3.3's state — `openExposureUsd(g) <= kNumerator *
+    ///      slashableBondUsd(g)` is a property of it — and this function is the
+    ///      only writer of it besides `recordApproval`. Enforcing the cap only at
+    ///      approve time left a hole, because the pledge a settlement pass walks
+    ///      a booking back up to was checked against the guardian's exposure AS
+    ///      IT WAS AT THE VOTE, and an earlier pass may have freed budget the
+    ///      guardian has since legally spent elsewhere:
+    ///
+    ///        1. g1 and g2 each reserve the full coverage of P1; g1 is at its cap.
+    ///        2. Anyone settles P1: both bookings are written DOWN pro-rata and
+    ///           half of g1's budget comes free.
+    ///        3. g1 approves P2 with it. Legal — `recordApproval`'s check passes.
+    ///        4. g2 is slashed to zero on an unrelated conviction.
+    ///        5. Anyone re-runs settlement on P1. `_effectiveReservedTotal` sums
+    ///           over LIVE bonds, so it has fallen, so `_allocate` hands g1 more
+    ///           and this function books it — g1 now backs 1.5x its own bond.
+    ///
+    ///      Step 5 is permissionless and step 4 is ordinary operation, so the
+    ///      state `recordApproval`'s natspec calls unreachable was reachable
+    ///      without capital, manipulation, or a privileged role.
+    ///
+    ///      CLAMPED, NOT REVERTED, matching `recordApproval`: a guardian with no
+    ///      free budget books nothing there rather than taking the vote down, and
+    ///      a settlement that reverted would be one an adversary could brick for
+    ///      a whole cohort by parking exposure on a single approver. The clamp
+    ///      costs an `openExposureUsd` bucket scan, so it is paid ONLY on the
+    ///      upward branch — shrinking a booking can never breach the cap, and the
+    ///      first pass on any proposal is all shrink.
+    ///
+    ///      `openExposureUsd(g)` ALREADY counts this key's current booking, so
+    ///      the bound is `current + (cap - open)` and not `cap - open`;
+    ///      subtracting the booking twice would clamp repairs that breach
+    ///      nothing. This also keeps the clamp a CLAMP rather than a freeze: with
+    ///      no competing exposure `open == current`, the bound is the full cap,
+    ///      and a written-down booking still walks all the way back to its
+    ///      pledge.
+    ///
+    ///      A clamp can leave the cohort's aggregate under `needUsd`. That is the
+    ///      same honest shortfall the residue top-up already produces when the
+    ///      cohort's live value has fallen below the need: `requireApproveQuorum`
+    ///      sums the bookings and fails loudly at execute. Settling still neither
+    ///      creates nor destroys coverage.
+    function _rebook(bytes32 key, address g, uint256 target, uint256 priceX8) internal returns (uint256) {
         RecordedExposure memory r = _recorded[key][g];
         uint256 current = uint256(r.usd);
-        if (target == current) return;
+        if (target > current) {
+            uint256 capUsd = kNumerator * _slashableBondUsd(g, priceX8);
+            uint256 open = openExposureUsd(g);
+            uint256 headroom = capUsd > open ? capUsd - open : 0;
+            uint256 maxTarget = current + headroom;
+            if (target > maxTarget) target = maxTarget;
+        }
+        if (target == current) return current;
         if (target < current) {
             _buckets[g][r.epoch] -= (current - target);
         } else {
@@ -1572,6 +1649,7 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         }
         // forge-lint: disable-next-line(unsafe-typecast)
         _recorded[key][g].usd = uint192(target);
+        return target;
     }
 
     /// @dev `_effectiveTotal` over the PLEDGES rather than the live bookings.
