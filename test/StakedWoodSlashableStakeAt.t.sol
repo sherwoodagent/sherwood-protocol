@@ -148,4 +148,52 @@ contract StakedWoodSlashableStakeAtTest is Test {
         vm.expectRevert(StakedWood.VerdictNotPast.selector);
         swood.slashableStakeAt(alice, vm.getBlockTimestamp() + 1);
     }
+
+    /// @notice Pashov audit finding 1 (hardening #35, confidence 90): a
+    ///         same-block (or same-second) top-up must NOT be counted as
+    ///         coverage that existed AT the anchor. `Checkpoints.Trace224.
+    ///         upperLookupRecent` is INCLUSIVE of `key == anchor`, so a
+    ///         checkpoint pushed at exactly `block.timestamp == anchor` used
+    ///         to be read back into the anchored snapshot — a guardian could
+    ///         restore/inflate its stake in the SAME instant a verdict is
+    ///         anchored at (e.g. the same block as
+    ///         `SyndicateGovernor.executeProposal`'s `executedAt` stamp) and
+    ///         have that top-up retroactively counted as if it existed at the
+    ///         anchor. The fix looks up at `anchor - 1` instead, so a
+    ///         same-block-or-later top-up (landing at `key == anchor`) can
+    ///         never backdate into the anchored basis.
+    ///
+    ///         Distinguishes the same-block case from the ALREADY-COVERED
+    ///         next-instant case (`test_slashableStakeAt_excludesPostAnchorTopUp`,
+    ///         which warps a full day forward before the top-up): here the
+    ///         top-up lands at the EXACT same timestamp as the anchor itself,
+    ///         which the pre-fix `upperLookupRecent(uint32(anchor))` would
+    ///         have happily included.
+    function test_slashableStakeAt_sameBlockTopUpExcluded() public {
+        vm.prank(alice);
+        swood.stakeAsGuardian(10_000e18, 1);
+
+        vm.warp(vm.getBlockTimestamp() + 1 days);
+        uint256 anchor = vm.getBlockTimestamp();
+
+        // Same-instant top-up: pushes a checkpoint at key == anchor, exactly
+        // the collision the fix must close. No `vm.warp` between the anchor
+        // instant and the top-up — this is the same-block/same-second attack,
+        // not the later top-up the other test already covers.
+        vm.prank(alice);
+        swood.stakeAsGuardian(20_000e18, 1);
+        assertEq(swood.guardianStake(alice), 30_000e18, "live stake includes the same-block top-up");
+
+        // The anchored view must exclude it: the anchor can only ever see the
+        // stake that existed STRICTLY BEFORE this instant.
+        assertEq(
+            swood.slashableStakeAt(alice, anchor), 10_000e18, "same-block top-up must not backdate into the anchor"
+        );
+
+        // And a verdict anchored there can only ever recover the pre-top-up
+        // amount — the same-block top-up buys the guardian nothing.
+        uint256 recovered = _slashVerdict(bytes32(uint256(4)), anchor, alice, 10_000);
+        assertEq(recovered, 10_000e18, "verdict recovers only the pre-top-up basis, not the same-block inflation");
+        assertEq(swood.guardianStake(alice), 20_000e18, "the same-block top-up tranche survives the conviction");
+    }
 }

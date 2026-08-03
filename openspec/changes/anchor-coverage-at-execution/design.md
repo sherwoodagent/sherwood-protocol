@@ -270,6 +270,155 @@ cap re-check.
   stake. StakedWoodSlashing.t.sol:425-427 tests the at-open clamp on the
   review path, untouched.
 
+## Post-merge audit hardening (2026-08-03, Pashov review on PR #152)
+
+A 12-agent Pashov security review of this change's merged diff found two
+CONFIRMED findings against the anchoring mechanism this design introduced.
+Both are hardening of the same seam, not a reopening of D1-D7 above.
+
+### D8 — Same-block top-up into the anchor itself (finding 1, confidence 90)
+
+**The gap.** `Checkpoints.Trace224.upperLookupRecent` is INCLUSIVE of
+`key == anchor`. `stakeAsGuardian` has no guard against landing in the same
+block as the event an anchor values, and TWO different callers pass
+`_slashableAt`/`_slashOne` an anchor with different pre-conditions:
+
+- `slashGuardians`' `openedAt` = `GuardianRegistry.openReview`'s
+  `ts1 = block.timestamp - 1` — already hardened AT THE SOURCE against a
+  same-block stake, by the identical `-1` pattern this design's own D1-D7
+  narrative did not need to touch.
+- `slashVerdict`'s `openedAt` / `slashableStakeAt`'s `anchor` — a RAW instant
+  (`SyndicateGovernor.executeProposal`'s `executedAt`, forwarded verbatim by
+  `ChallengeGame`/`ExposureLedger`), with NO caller-side offset. A same-block
+  `stakeAsGuardian` pushes a checkpoint at exactly `key == anchor`, which the
+  inclusive lookup then counts as if it existed AT the anchor — defeating
+  this design's whole premise (D1: "any stake present at execution is
+  reachable" was meant to describe PRE-existing stake, not stake added in the
+  same instant the anchor is trying to exclude).
+
+**Where the fix lives, and why not inside `_slashableAt`.** The first attempt
+put `anchor - 1` inside the shared `_slashableAt` itself. That regressed six
+pre-existing `StakedWoodSlashing.t.sol` tests: because `slashGuardians`'
+`openedAt` is ALREADY `ts1`-offset by the time it reaches `_slashOne`, a
+second `-1` inside the shared function double-shifts it, wrongly excluding a
+checkpoint that genuinely existed AT `ts1` (one real second before review
+opened). The correct fix pushes the offset to the two RAW-anchor callers
+instead, leaving `_slashableAt`/`_slashOne` exactly as D2 specified:
+
+- `slashableStakeAt(guardian, anchor)`: looks up `_slashableAt(guardian,
+  anchor == 0 ? 0 : anchor - 1)`. `anchor == 0` passes through unchanged —
+  that is the separate, pre-existing, out-of-scope "direct call returns ~0"
+  landmine (no live caller reaches it: `ExposureLedger._slashableBondUsd`
+  branches to live `guardianStake` before ever anchoring at 0).
+- `slashVerdict(caseKey, openedAt, ...)`: computes `lookupAnchor = openedAt -
+  1` once (after rejecting `openedAt == 0`, see the defense-in-depth note
+  below) and passes `lookupAnchor` — not the raw `openedAt` — into
+  `_slashOne`. `slashGuardians` is untouched: it still passes its own
+  (already-hardened) `openedAt` straight through.
+
+This mirrors the two existing precedents named in the original finding
+(`SyndicateGovernor`'s collaboration snapshot, `GuardianRegistry.openReview`'s
+`ts1`) at the CALL SITE that owns a raw anchor, rather than baking a second,
+conflicting offset into a function shared with a caller that already applied
+one.
+
+**Defense-in-depth, same pass:** `slashVerdict` now reverts
+`InvalidParameter()` on `openedAt == 0` (a real verdict never legitimately
+anchors at the zero timestamp; pre-fix this silently no-opped — no revert, no
+event — under a mis-built or compromised `authorizedSlasher` input).
+`slashGuardians` is NOT given the same guard: `StakedWoodSlashing.t.sol`
+already has a dedicated test (`test_slashGuardians_openedAtZero_
+uninformativeSnapshot`) documenting the review path's `openedAt == 0` no-op
+as deliberate, registry-driven behavior, and forcing a revert there would
+contradict that existing, intentional test rather than harden an unreached
+path.
+
+### D9 — A guardian's shared stake was not reserved across open proposals (finding 2, confidence 85)
+
+**The gap.** `_effectiveTotal`/`_effectiveReservedTotal` clamped a guardian's
+contribution to ONE proposal independently — `min(reserved,
+slashableBondUsd(g, anchor))` — using the guardian's CURRENT total
+live/anchored stake with no awareness of what that SAME stake simultaneously
+backs on every OTHER still-open, already-executed proposal. Two
+individually-correct anchored reads could therefore sum to more than the
+guardian's one, finite, shared recoverable pool (proved: two $400
+reservations against a guardian later slashed to $600 live both
+independently reported $400 "recoverable" — $800 claimed against $600 real).
+This requires no privileged action: it fires from ordinary multi-proposal
+operation combined with an unrelated conviction landing in between.
+
+**Options considered** (per the audit's own framing): (a) pro-rata
+distribution of the shared basis across every open proposal reserving
+against the guardian; (b) first-settled-proposal-wins; (c) an explicit
+per-guardian "committed-but-not-yet-recovered" escrow subtracted before every
+clamp.
+
+**Decision: (a), implemented by REUSING `openExposureUsd`, not a new ledger.**
+`ExposureLedger` already maintains, for every guardian, exactly the
+denominator this needs: `openExposureUsd(g)` sums `_buckets[g][epoch]` across
+every currently-open proposal's booking (`_recorded[key][g].usd`), bounded by
+the same `MAX_SCAN_BUCKETS` walk `_rebook`'s #110 cap-recheck already pays
+for. A new internal helper, `_sharedSlashableUsd(guardian, reserved, priceX8,
+anchor)`, computes `share = slashable * reserved / openExposureUsd(guardian)`
+clamped to `reserved`, and replaces the bare `min(reserved, slashable)` clamp
+in `_effectiveTotal`, `_effectiveReservedTotal`, `allocatedUsd`'s own
+per-guardian term, and `settleCoverage`'s own per-guardian term. Two
+proposals reading independently read the SAME `openExposureUsd(g)`
+denominator, so their shares sum to at most the guardian's one `slashable`
+basis — never more.
+
+Rejected (b) and (c): (b) makes the reported figure depend on read order,
+which is exactly the "figure a challenger is charged against must not drift
+from the figure a conviction takes" property `liabilityUsd`'s own natspec
+already promises; picking whichever proposal happens to be read/settled
+first as the "winner" reintroduces that drift. (c) requires new per-guardian
+storage (a cumulative-claimed counter) with its own decay/release
+bookkeeping to avoid permanently starving a guardian after a proposal
+resolves — solving a problem `_buckets`/`openExposureUsd` already solve via
+wall-clock bucket expiry. (a) via the existing bucket sum was strictly
+cheaper (one extra `openExposureUsd` view call, itself O(16)) and required no
+new storage, so it was preferred per "pick whichever is simplest to implement
+correctly and cheapest in gas."
+
+**Why it generalizes to N proposals, not just two.** `openExposureUsd`
+already sums over every bucket in its scan window regardless of how many
+proposals fed them; the fix's cost and correctness argument are identical for
+2 or 20 simultaneously-open proposals for the same guardian.
+
+**Why a guardian with one open proposal sees no change.** When
+`openExposureUsd(g)` equals exactly the one `reserved` term being read (the
+common case — no other open commitment), the ratio reduces algebraically to
+`slashable` unscaled: byte-identical to the pre-fix `min(reserved,
+slashable)`. Verified against every pre-existing multi-proposal test in
+`ExposureLedger.t.sol` (`test_settleCoverage_reRunCannotPushAGuardianPastItsCap`,
+`test_settleCoverage_upwardRebookStopsAtTheRemainingHeadroom`) by hand-tracing
+the exact arithmetic both call sites still had to satisfy — both continue to
+pass unmodified.
+
+**Known residual asymmetry, accepted.** `_effectiveReservedTotal`/
+`settleCoverage` read `reserved` from `_reservedUsd` (the PLEDGE, fixed at
+`recordApproval` and unchanged by settlement), while `openExposureUsd` sums
+`_recorded` (the current BOOKING, which a settle pass can write down below
+the pledge). When a guardian's pledge on one proposal exceeds its currently
+booked total across all proposals — which only arises after that proposal's
+OWN first settle has already written its booking down — the ratio can exceed
+1 and gets clamped back to `reserved`, i.e. the PRE-fix behavior for that one
+term. This never regresses below what existed before (same value, not a
+smaller one) and only recurs in the narrow re-settle-after-partial-settle
+window `_rebook`'s existing #110 cap-recheck already bounds separately; a
+fully general pledge-basis sharing ledger would close it completely but was
+judged not worth the added storage for a window that degrades no worse than
+pre-fix.
+
+**Invariant (also stated as a code comment above `_sharedSlashableUsd`):**
+for any guardian g, the sum over all currently-open anchored proposals of
+that proposal's claimed-recoverable-from-g must never exceed g's actual
+live/anchored recoverable stake. Proven with a dedicated adversarial test
+reproducing the audit's own numeric trace
+(`test_finding2_sharedStakeAcrossOpenProposalsNeverOversumsTheRealRecoverableBond`),
+plus a regression guard for the single-open-proposal case
+(`test_finding2_singleOpenProposalIsUnaffectedByTheSharedStakeFix`).
+
 ## Migration Plan
 
 Pure code + view additions; no storage migration, no golden regeneration

@@ -1447,8 +1447,12 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         uint256 priceX8 = woodPriceX8();
         // ANCHORED (issue #35): once executed, a post-execution top-up must
         // not inflate what this guardian carries — see `_slashableBondUsd`.
-        uint256 live = _slashableBondUsd(guardian, priceX8, pv.executedAt);
-        uint256 mine = live < reserved ? live : reserved;
+        // SHARED ACROSS OPEN PROPOSALS (Pashov audit finding 2, hardening
+        // #35): `_sharedSlashableUsd` additionally pro-rates this guardian's
+        // slashable basis against every OTHER proposal it currently backs, so
+        // this proposal cannot claim more of the guardian's one bond than its
+        // own share of it — see the invariant note above `_sharedSlashableUsd`.
+        uint256 mine = _sharedSlashableUsd(guardian, reserved, priceX8, pv.executedAt);
         if (mine == 0) return 0;
         return _allocate(mine, _effectiveTotal(key, priceX8, pv.executedAt), needUsd);
     }
@@ -1504,15 +1508,89 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      the adversary this closes — an accused approver topping up AFTER
     ///      the drain to inflate its own share of `needUsd` — is priced at
     ///      what the verdict can reach, not at what it can stake.
+    ///
+    /// @dev SHARED ACROSS OPEN PROPOSALS (Pashov audit finding 2, hardening
+    ///      #35): each term now goes through `_sharedSlashableUsd` instead of
+    ///      a bare `min(live, reserved)` — see the invariant note there. A
+    ///      guardian backing only this one proposal sees no change.
     function _effectiveTotal(bytes32 key, uint256 priceX8, uint256 anchor) internal view returns (uint256 total) {
         address[] storage listed = _approversOf[key];
         uint256 n = listed.length;
         for (uint256 i = 0; i < n; i++) {
-            uint256 reserved = _recorded[key][listed[i]].usd;
+            address g = listed[i];
+            uint256 reserved = _recorded[key][g].usd;
             if (reserved == 0) continue;
-            uint256 live = _slashableBondUsd(listed[i], priceX8, anchor);
-            total += live < reserved ? live : reserved;
+            total += _sharedSlashableUsd(g, reserved, priceX8, anchor);
         }
+    }
+
+    /// @dev THE SHARED-STAKE INVARIANT (Pashov audit finding 2, hardening
+    ///      #35). Before this, `_effectiveTotal`/`_effectiveReservedTotal`
+    ///      (and `allocatedUsd`/`settleCoverage`'s own per-guardian clamps)
+    ///      computed a guardian's contribution to ONE proposal independently
+    ///      as `min(reserved, slashableBondUsd(g, anchor))` — using the
+    ///      guardian's CURRENT total live/anchored stake with zero awareness
+    ///      of what that SAME stake is simultaneously backing on every OTHER
+    ///      still-open, already-executed proposal it also approved. Two
+    ///      individually-correct anchored reads can therefore sum to more
+    ///      than the guardian's one, finite, shared recoverable pool: PROVEN
+    ///      (guardian stakes 1,000 WOOD, books $400 + $400 legally across two
+    ///      proposals under the k-multiplier sharing design, is then slashed
+    ///      $400 elsewhere leaving only $600 live — yet both proposals
+    ///      independently reported $400 "recoverable", $800 claimed against
+    ///      $600 real). This requires no privileged action at all: it fires
+    ///      from ordinary, legitimate multi-proposal operation combined with
+    ///      an unrelated conviction landing in between.
+    ///
+    ///      INVARIANT THIS ENFORCES: for any guardian g, the sum over all
+    ///      currently-open anchored proposals of that proposal's
+    ///      claimed-recoverable-from-g must never exceed g's actual
+    ///      live/anchored recoverable stake.
+    ///
+    ///      HOW (option (a), pro-rata distribution — chosen over an explicit
+    ///      escrow ledger or first-settled-wins because it reuses bookkeeping
+    ///      this contract already maintains and pays for elsewhere, rather
+    ///      than adding new per-guardian storage): `openExposureUsd(g)`
+    ///      already sums, for every proposal g is STILL an approver of and
+    ///      whose epoch bucket has not aged out, exactly the same booking
+    ///      this function's callers pass in as `reserved`
+    ///      (`_recorded[key][g].usd` from `_effectiveTotal`/`allocatedUsd`;
+    ///      `_reservedUsd[key][g]` from `_effectiveReservedTotal`/
+    ///      `settleCoverage`, which coincides with the booking until that
+    ///      proposal's own first `settleCoverage` pass). That sum is exactly
+    ///      the shared denominator g's slashable stake must be split across:
+    ///      `share = slashable * reserved / openExposureUsd(g)`, clamped to
+    ///      `reserved`. Two proposals reading independently read the SAME
+    ///      `openExposureUsd(g)`, so their shares can sum to at most
+    ///      `slashable` — never more than the one bond that actually backs
+    ///      both. Generalizes to N simultaneously-open proposals for the same
+    ///      guardian at the same O(1)-extra-call cost, since
+    ///      `openExposureUsd` already sums over all of them in one bounded
+    ///      (`MAX_SCAN_BUCKETS`) scan.
+    ///
+    ///      A GUARDIAN WITH ONLY ONE OPEN PROPOSAL SEES NO CHANGE: `reserved
+    ///      == openExposureUsd(g)` exactly, so `share` reduces algebraically
+    ///      to `slashable` un-scaled — identical to the pre-fix
+    ///      `min(reserved, slashable)`. The sharing only ever bites when a
+    ///      guardian is genuinely juggling more than one open commitment,
+    ///      which is exactly the case the invariant exists for.
+    ///
+    ///      `openTotal == 0` (this key's own booking has aged out of
+    ///      `openExposureUsd`'s wall-clock window while still listed as an
+    ///      approver — the pre-existing, separately-tracked `_rebook`
+    ///      stale-bucket edge case, out of scope here) falls back to the
+    ///      un-shared `min(reserved, slashable)` rather than dividing by
+    ///      zero; that fallback is at least as protective as the pre-fix
+    ///      behaviour it replaces, never less.
+    function _sharedSlashableUsd(address guardian, uint256 reserved, uint256 priceX8, uint256 anchor)
+        internal
+        view
+        returns (uint256)
+    {
+        uint256 slashable = _slashableBondUsd(guardian, priceX8, anchor);
+        uint256 openTotal = openExposureUsd(guardian);
+        uint256 share = openTotal == 0 ? slashable : (slashable * reserved) / openTotal;
+        return share < reserved ? share : reserved;
     }
 
     /// @inheritdoc IExposureLedger
@@ -1651,8 +1729,11 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
             uint256 reserved = _reservedUsd[key][g];
             if (reserved == 0) continue; // released via a vote change
 
-            uint256 liveG = _slashableBondUsd(g, priceX8, pv.executedAt);
-            uint256 mine = liveG < reserved ? liveG : reserved;
+            // SHARED ACROSS OPEN PROPOSALS (Pashov audit finding 2, hardening
+            // #35) — see `_sharedSlashableUsd`: this guardian's slashable
+            // basis is pro-rated against every other proposal it currently
+            // backs, not clamped to this proposal's reservation alone.
+            uint256 mine = _sharedSlashableUsd(g, reserved, priceX8, pv.executedAt);
             uint256 alloc = _allocate(mine, effectiveTotal, needUsd);
             // BOOKED, NOT ALLOCATED. `_rebook` clamps an upward move to the
             // guardian's free budget (issue #110), so what it returns can be
@@ -1807,6 +1888,10 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///
     ///      ANCHORED (issue #35): same `anchor` threading as `_effectiveTotal`
     ///      — `pv.executedAt`, 0 (live) for a proposal that never executed.
+    ///
+    /// @dev SHARED ACROSS OPEN PROPOSALS (Pashov audit finding 2, hardening
+    ///      #35): same `_sharedSlashableUsd` treatment as `_effectiveTotal`,
+    ///      see the invariant note there.
     function _effectiveReservedTotal(bytes32 key, uint256 priceX8, uint256 anchor)
         internal
         view
@@ -1815,10 +1900,10 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         address[] storage listed = _approversOf[key];
         uint256 n = listed.length;
         for (uint256 i = 0; i < n; i++) {
-            uint256 reserved = _reservedUsd[key][listed[i]];
+            address g = listed[i];
+            uint256 reserved = _reservedUsd[key][g];
             if (reserved == 0) continue;
-            uint256 live = _slashableBondUsd(listed[i], priceX8, anchor);
-            total += live < reserved ? live : reserved;
+            total += _sharedSlashableUsd(g, reserved, priceX8, anchor);
         }
     }
 

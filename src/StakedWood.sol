@@ -1345,6 +1345,17 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
         uint256[] calldata slashBpsPer
     ) external onlyAuthorizedSlasher returns (uint256 total) {
         if (openedAt > block.timestamp) revert VerdictNotPast();
+        // DEFENSE-IN-DEPTH (Pashov audit, rejected-but-real hardening item).
+        // `openedAt == 0` looks up `_slashableAt(., 0)`, which has no
+        // checkpoint at key 0 on any real chain and so silently returns 0 for
+        // every named approver: the call "succeeds" (no revert, no
+        // `GuardianSlashed`/`VerdictSlashBurned` event) while slashing
+        // nothing. A real verdict never legitimately anchors at the zero
+        // timestamp, so this can only fire on a mis-built or malicious
+        // `authorizedSlasher` input — not reachable by any honest caller —
+        // but failing loudly here is strictly cheaper than leaving a verdict
+        // that silently voided itself.
+        if (openedAt == 0) revert InvalidParameter();
         // Positional alignment is the only thing tying a guardian to their rate,
         // so a mismatch is a caller bug, not something to absorb.
         if (slashBpsPer.length != approvers.length) revert SlashBpsLengthMismatch();
@@ -1362,6 +1373,16 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
         // `refundSlash`. `VerdictSlashRouted` still carries the RAW `caseKey`,
         // so indexers join the two deterministically.
         bytes32 slashKey = keccak256(abi.encodePacked("sherwood.verdict", caseKey));
+
+        // SAME-BLOCK TOP-UP HARDENING (Pashov audit finding 1, hardening #35)
+        // — see `slashableStakeAt`'s natspec for the full mechanism. `openedAt`
+        // here is a RAW instant with no caller-side `-1` pre-offset (unlike
+        // `slashGuardians`' `openedAt`, which `GuardianRegistry.openReview`
+        // already stamps as `ts1 = block.timestamp - 1`), so THIS caller must
+        // do the offsetting itself before it ever reaches `_slashableAt`.
+        // Computed once, outside the loop: `openedAt == 0` already reverted
+        // above, so this is always a genuine nonzero instant minus one.
+        uint256 lookupAnchor = openedAt - 1;
 
         // INTRA-CALL DEDUP. Each `_slashOne` pass
         // re-applies its clamped rate to the ALREADY-REDUCED live stake, so N
@@ -1406,7 +1427,7 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
             // approver's own rate. Hoisting it would let one approver's rate set
             // the envelope for everyone.
             uint256 bps = Math.min(Math.max(requested, minSlashBps), maxSlashBps);
-            uint256 amt = _slashOne(slashKey, openedAt, approvers[i], bps);
+            uint256 amt = _slashOne(slashKey, lookupAnchor, approvers[i], bps);
             // MARK ONLY A SLASH THAT LANDED. `_slashOne`
             // returns 0 when the approver has no live stake at slash time —
             // already emptied by a concurrent conviction, or exited. Writing
@@ -1470,6 +1491,21 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///      public view (`slashableStakeAt`), so the WOOD a coverage reader
     ///      books and the WOOD a conviction actually takes cannot drift
     ///      apart — see `ExposureLedger._slashableBondUsd`.
+    ///
+    /// @dev SAME-BLOCK TOP-UP HARDENING LIVES AT THE CALLERS, NOT HERE
+    ///      (Pashov audit finding 1, hardening #35) — see `slashableStakeAt`
+    ///      and `slashVerdict` for why. This function stays a PLAIN, inclusive
+    ///      lookup at whatever `anchor` it is given: `Checkpoints.Trace224.
+    ///      upperLookupRecent` is INCLUSIVE of `key == anchor`, and that is
+    ///      exactly right for a caller whose `anchor` is ALREADY the instant
+    ///      strictly before the event it guards — e.g. `slashGuardians`'
+    ///      `openedAt`, which `GuardianRegistry.openReview` stamps as
+    ///      `ts1 = block.timestamp - 1` before ever calling in here. Baking a
+    ///      SECOND `- 1` into this shared function would double-shift that
+    ///      already-hardened anchor by one extra second, wrongly excluding a
+    ///      checkpoint that genuinely existed AT `ts1` — proven by six
+    ///      pre-existing `StakedWoodSlashing.t.sol` tests that stake, capture
+    ///      `openedAt` at that same instant, and assert the checkpoint counts.
     function _slashableAt(address guardian, uint256 anchor) internal view returns (uint256) {
         uint256 live = _guardians[guardian].stakedAmount;
         uint256 snapOwnRaw = Math.max(
@@ -1498,25 +1534,57 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     /// @param guardian The guardian whose own-stake slash basis is read.
     /// @param anchor   The past timestamp the verdict is anchored at (e.g.
     ///                 a proposal's `executedAt`).
+    ///
+    /// @dev SAME-BLOCK TOP-UP HARDENING (Pashov audit finding 1, hardening
+    ///      #35, confidence 90). `anchor` here is a RAW instant — e.g.
+    ///      `SyndicateGovernor.executeProposal`'s `executedAt` stamp,
+    ///      forwarded verbatim through `ExposureLedger._slashableBondUsd` —
+    ///      with no `-1` pre-offset baked in by the caller, unlike
+    ///      `slashGuardians`' `openedAt` (see `_slashableAt`'s natspec).
+    ///      `stakeAsGuardian` has no guard against landing in the SAME block
+    ///      as that stamp, and `Checkpoints.Trace224.upperLookupRecent` is
+    ///      INCLUSIVE of `key == anchor` — so a same-block top-up would push
+    ///      a checkpoint at exactly `key == anchor` and get read back into a
+    ///      snapshot that is supposed to value the guardian strictly BEFORE
+    ///      the drain, defeating issue #35's whole premise. Looking up at
+    ///      `anchor - 1` instead closes that window: a same-block-or-later
+    ///      checkpoint can never backdate into it. Mirrors the identical
+    ///      pattern already used twice elsewhere in this codebase to close
+    ///      the same class of same-block inflation:
+    ///      `SyndicateGovernor._initPendingProposal`/`approveCollaboration`'s
+    ///      `block.timestamp - 1` snapshot (same-block flash-delegate) and
+    ///      `GuardianRegistry.openReview`'s `ts1 = block.timestamp - 1`
+    ///      (same-block flash-stake). `anchor == 0` is passed through
+    ///      UNCHANGED — that is the documented, pre-existing "direct call
+    ///      returns ~0" landmine (no live caller reaches it this way; see
+    ///      `ExposureLedger._slashableBondUsd`'s live/anchored branch), not
+    ///      something this hardening is scoped to touch.
     function slashableStakeAt(address guardian, uint256 anchor) external view returns (uint256) {
         if (anchor > block.timestamp) revert VerdictNotPast();
-        return _slashableAt(guardian, anchor);
+        return _slashableAt(guardian, anchor == 0 ? 0 : anchor - 1);
     }
 
-    /// @dev Per-approver slash. Extracted to keep `slashGuardians`'s stack
-    ///      frame shallow. Returns the WOOD slashed from `approver`: `slashBps`
-    ///      of the OWN stake, sized by `_slashableAt` at `openedAt` (the
-    ///      shared basis `slashableStakeAt` also exposes). Age discounts
-    ///      VOTING POWER, not liability: the capital at risk is the staked
-    ///      amount.
+    /// @dev Per-approver slash. Shared by both `slashGuardians` and
+    ///      `slashVerdict` — extracted to keep `slashGuardians`'s stack frame
+    ///      shallow. Returns the WOOD slashed from `approver`: `slashBps` of
+    ///      the OWN stake, sized by `_slashableAt` at `lookupAnchor`. Age
+    ///      discounts VOTING POWER, not liability: the capital at risk is the
+    ///      staked amount.
     ///      `reviewKey` only feeds the `GuardianSlashed` event topic.
-    function _slashOne(bytes32 reviewKey, uint256 openedAt, address approver, uint256 slashBps)
+    /// @param lookupAnchor The instant `_slashableAt` looks up at — NOT
+    ///        necessarily the caller's own `openedAt` verbatim. `slashGuardians`
+    ///        passes its `openedAt` straight through (already `-1`-hardened
+    ///        upstream by `GuardianRegistry.openReview`'s `ts1`); `slashVerdict`
+    ///        passes `openedAt - 1` (its own `openedAt` is a raw, unhardened
+    ///        instant — see `slashableStakeAt`'s natspec for why the two paths
+    ///        need different treatment here).
+    function _slashOne(bytes32 reviewKey, uint256 lookupAnchor, address approver, uint256 slashBps)
         private
         returns (uint256 amt)
     {
         Guardian storage g = _guardians[approver];
         uint256 live = g.stakedAmount;
-        uint256 ownSlash = Math.mulDiv(_slashableAt(approver, openedAt), slashBps, 10_000);
+        uint256 ownSlash = Math.mulDiv(_slashableAt(approver, lookupAnchor), slashBps, 10_000);
 
         if (ownSlash != 0) {
             // forge-lint: disable-next-line(unchecked-cast)

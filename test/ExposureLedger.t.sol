@@ -1778,6 +1778,133 @@ contract ExposureLedgerTest is Test {
         );
     }
 
+    /// @notice Pashov audit finding 2 (hardening #35, confidence 85): a
+    ///         guardian's shared live stake was not reserved across
+    ///         simultaneously-open anchored proposals, so two
+    ///         individually-correct anchored reads could sum to MORE than the
+    ///         guardian's one, finite, shared recoverable pool.
+    ///
+    ///         Reproduces the audit's own numeric trace: guardian g approves
+    ///         TWO independent proposals (P1, P2), each reserving $400 of a
+    ///         $1,000 bond ($800 total, legally within the k=1 batching cap).
+    ///         Both execute, each stamping its own anchor. An UNRELATED
+    ///         conviction (never modelled here beyond its effect: a plain
+    ///         `swood.setStake` write, exactly what a real slash does to live
+    ///         stake) then drops g's LIVE stake to $600 — below the $800 the
+    ///         two proposals together still claim.
+    ///
+    ///         Pre-fix, `liabilityUsd`/`allocatedUsd` each independently
+    ///         computed `min(reserved=$400, slashableBondUsd(g, anchor)=$600)
+    ///         = $400` for BOTH proposals — $800 claimed against $600 real,
+    ///         exactly the audit's proof. Post-fix, `_sharedSlashableUsd`
+    ///         pro-rates g's $600 slashable basis across BOTH proposals'
+    ///         $400 shares of g's $800 total open exposure ($600 * 400 / 800
+    ///         = $300 each), so the two reads sum to exactly $600 — g's real
+    ///         remaining recoverable stake, never more.
+    ///
+    ///         THE INVARIANT THIS TEST PROVES: for any guardian g, the sum
+    ///         over all currently-open anchored proposals of that proposal's
+    ///         claimed-recoverable-from-g must never exceed g's actual
+    ///         live/anchored recoverable stake. Checked on BOTH `liabilityUsd`
+    ///         (what the audit's own proof used — `ChallengeGame.file()`'s
+    ///         bond-sizing basis) and `allocatedUsd` (the guardian-fee
+    ///         attribution basis the audit's finding 1 proof separately
+    ///         exploited via a different mechanism).
+    function test_finding2_sharedStakeAcrossOpenProposalsNeverOversumsTheRealRecoverableBond() public {
+        _wireRecording();
+        // Override `_wireRecording`'s $5,000 fixture stake down to $1,000, so
+        // the numbers here match the audit's own trace exactly (1,000 WOOD
+        // basis, $1/WOOD in the audit's telling; here 20,000 WOOD at the
+        // fixture's $0.05, same $1,000).
+        swood.setStake(guardian, 20_000e18);
+        assertEq(ledger.slashableBondUsd(guardian), 1_000e18, "sanity: $1,000 bond before either proposal");
+
+        // P1: reserves $400 of the $1,000 bond.
+        mgov.set(400e6);
+        mgov.setSchedule(block.timestamp + 1 days, 3 days);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        assertEq(ledger.openExposureUsd(guardian), 400e18, "P1 books its $400 reservation");
+        mgov.setExecutedAt(block.timestamp); // anchor A
+
+        skip(1 days);
+
+        // P2: reserves the OTHER $400 — both fit inside the $1,000 cap
+        // (open $400 + free $600 >= needUsd $400), exactly the audit's
+        // "legally books shared exposure under the k-multiplier design".
+        MockGovernorForLedger mgov2 = _secondGovernor(400e6, 3 days);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov2), 1, guardian);
+        assertEq(ledger.openExposureUsd(guardian), 800e18, "both proposals booked: $800 of the $1,000 cap");
+        mgov2.setExecutedAt(block.timestamp); // anchor B, strictly later than A
+
+        // The unrelated conviction: g's live stake drops to $600 — below the
+        // $800 the two EXECUTED proposals still jointly claim. This is a bare
+        // `setStake` write standing in for a real slash's effect on live
+        // stake; nothing about P1 or P2 themselves changes.
+        swood.setStake(guardian, 12_000e18);
+        assertEq(ledger.slashableBondUsd(guardian), 600e18, "live bond crashed to $600 on the unrelated conviction");
+
+        // THE INVARIANT: both proposals' independently-read `liabilityUsd`
+        // must sum to AT MOST g's real $600 — never the $800 both would have
+        // reported pre-fix.
+        uint256 liabilityP1 = ledger.liabilityUsd(address(mgov), 1);
+        uint256 liabilityP2 = ledger.liabilityUsd(address(mgov2), 1);
+        assertLe(
+            liabilityP1 + liabilityP2,
+            ledger.slashableBondUsd(guardian),
+            "sum of both proposals' liabilityUsd must never exceed g's real recoverable stake"
+        );
+        // Exact, not just bounded: pro-rata over two equal $400 shares of an
+        // $800 total splits g's $600 evenly.
+        assertEq(liabilityP1, 300e18, "P1's pro-rata share of the $600 real bond");
+        assertEq(liabilityP2, 300e18, "P2's pro-rata share of the $600 real bond");
+
+        // Same invariant on `allocatedUsd` — the guardian-fee attribution
+        // basis. Sole approver on each proposal, so `allocatedUsd` here
+        // equals the same pro-rata share `liabilityUsd` computed.
+        uint256 allocatedP1 = ledger.allocatedUsd(address(mgov), 1, guardian);
+        uint256 allocatedP2 = ledger.allocatedUsd(address(mgov2), 1, guardian);
+        assertLe(
+            allocatedP1 + allocatedP2,
+            ledger.slashableBondUsd(guardian),
+            "sum of both proposals' allocatedUsd must never exceed g's real recoverable stake"
+        );
+        assertEq(allocatedP1, 300e18);
+        assertEq(allocatedP2, 300e18);
+    }
+
+    /// @notice A guardian backing only ONE open proposal sees no change from
+    ///         the finding-2 fix: `_sharedSlashableUsd`'s pro-rata ratio
+    ///         reduces algebraically to the pre-fix `min(reserved,
+    ///         slashable)` whenever `openExposureUsd(g) == reserved` for that
+    ///         guardian's one commitment. Regression guard for the common
+    ///         case, alongside the fuller re-derivation already covered by
+    ///         `test_allocatedUsd_and_liabilityUsd_postExecutionTopUpCannotUndoAPriceCrash`.
+    function test_finding2_singleOpenProposalIsUnaffectedByTheSharedStakeFix() public {
+        _wireRecording();
+        mgov.set(1_000e6);
+        mgov.setSchedule(block.timestamp + 1 days, 3 days);
+
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        mgov.setExecutedAt(block.timestamp);
+
+        skip(1 hours);
+        swood.setStake(guardian, 50_000e18); // live bond now $2,500, below the $5,000 checkpoint at anchor
+
+        assertEq(
+            ledger.liabilityUsd(address(mgov), 1),
+            1_000e18,
+            "one open proposal: liabilityUsd unaffected by the sharing fix"
+        );
+        assertEq(
+            ledger.allocatedUsd(address(mgov), 1, guardian),
+            1_000e18,
+            "one open proposal: allocatedUsd unaffected by the sharing fix"
+        );
+    }
+
     /// @notice The haircut must apply to EVERY branch, including the one where
     ///         the cap is what bound.
     ///
