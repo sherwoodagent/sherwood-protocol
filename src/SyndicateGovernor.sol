@@ -379,6 +379,16 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // Update state BEFORE external call (CEI pattern)
         _activeProposal = proposalId;
         _transition(proposal, ProposalState.Executed);
+        // INVARIANT (issue #35): THIS STAMP MUST PRECEDE THE
+        // `requireApproveQuorum` GATE BELOW, IN THE SAME TRANSACTION. The
+        // gate reads each approver's LIVE `slashableBondUsd`, which is sound
+        // ONLY because every sWOOD stake mutation checkpoints at
+        // `block.timestamp`, so the checkpoint at `executedAt` equals the
+        // live stake the gate just read — the gate and the eventual verdict
+        // slash (anchored at this same `executedAt` by `ChallengeGame`) are
+        // then provably valuing the same WOOD. Move the gate out of this
+        // transaction, or ahead of this line, and that equality stops being
+        // structural and becomes an accident of call ordering.
         proposal.executedAt = block.timestamp;
         // Start the management-fee clock. Must follow `_activeProposal` so the
         // vault's `totalAssets()` reads live NAV through the now-active lane,
@@ -414,6 +424,13 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // here leaves the proposal Approved — it expires at `executeBy`
         // unless covering approvals arrive first, so suppressing the cohort
         // blocks execution without forcing cancellation.
+        //
+        // RUNS AFTER `proposal.executedAt = block.timestamp` ABOVE, IN THE
+        // SAME TRANSACTION — load-bearing (issue #35, see the stamp's own
+        // note). This gate's live read is what makes it sound to leave
+        // every OTHER post-execution ledger read (`allocatedUsd`,
+        // `liabilityUsd`, `settleCoverage`) anchored at `executedAt` instead:
+        // the two are provably equal at this one instant.
         {
             address ledger = _exposureLedger;
             // `requiredCoverage == 0` keeps optimistic passage: a proposal
@@ -932,11 +949,15 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         return _proposals[proposalId].strategy;
     }
 
-    /// @notice Narrow proposal view: (`voteEnd`, `reviewEnd`, `vault`).
+    /// @notice Narrow proposal view: (`voteEnd`, `reviewEnd`, `vault`, ...,
+    ///         `executedAt`).
     /// @dev The guardian registry no longer calls this (it reads its own
     ///      pushed `reviewWindow` and `vaultOf`), but `ExposureLedger` reads
-    ///      `.vault` through this getter on the approve-vote path. Do not
-    ///      remove until that consumer migrates to the registry's `vaultOf`.
+    ///      `.vault` through this getter on the approve-vote path, and reads
+    ///      `.executedAt` on every post-execution coverage read to anchor a
+    ///      guardian's slashable-stake basis (issue #35;
+    ///      `IStakedWood.slashableStakeAt`). Do not remove until those
+    ///      consumers migrate.
     function getProposalView(uint256 proposalId) external view returns (ProposalViewLite memory v) {
         StrategyProposal storage p = _proposals[proposalId];
         v.voteEnd = p.voteEnd;
@@ -949,15 +970,23 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // `executedAt` is not known yet and may never be set.
         v.executeBy = p.executeBy;
         v.strategyDuration = p.strategyDuration;
+        // 0 until `executeProposal` stamps it (see the invariant note at that
+        // assignment). `ExposureLedger` treats 0 as "no anchor yet — read
+        // live", exactly matching what a not-yet/never-executed proposal
+        // means for a verdict that cannot exist.
+        v.executedAt = p.executedAt;
     }
 
-    /// @dev Narrow proposal tuple returned by `getProposalView`.
+    /// @dev Narrow proposal tuple returned by `getProposalView`. Memory-only
+    ///      — this struct is never stored, so appending `executedAt` is an
+    ///      ABI extension with no storage-layout effect (issue #35).
     struct ProposalViewLite {
         uint256 voteEnd;
         uint256 reviewEnd;
         address vault;
         uint256 executeBy;
         uint256 strategyDuration;
+        uint256 executedAt;
     }
 
     // ==================== INTERNAL ====================

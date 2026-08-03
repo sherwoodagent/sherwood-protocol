@@ -51,6 +51,7 @@ contract MockGovernorWithCoverage is MockGovernorMinimal {
         address vault;
         uint256 executeBy;
         uint256 strategyDuration;
+        uint256 executedAt;
     }
 
     uint256 public executeBy;
@@ -68,6 +69,15 @@ contract MockGovernorWithCoverage is MockGovernorMinimal {
     uint256 public requiredCoverage;
     address public proposalVault;
 
+    /// @dev 0 (unexecuted) by default — this file's fixtures exercise the
+    ///      approve-vote path, which stays on the live basis regardless
+    ///      (issue #35). Set to exercise the execution-anchored basis.
+    uint256 public executedAt;
+
+    function setExecutedAt(uint256 executedAt_) external {
+        executedAt = executedAt_;
+    }
+
     function setRequiredCoverage(uint256 c) external {
         requiredCoverage = c;
     }
@@ -84,6 +94,7 @@ contract MockGovernorWithCoverage is MockGovernorMinimal {
         v.vault = proposalVault;
         v.executeBy = executeBy;
         v.strategyDuration = strategyDuration;
+        v.executedAt = executedAt;
     }
 }
 

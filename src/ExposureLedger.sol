@@ -11,6 +11,10 @@ import {IWoodTwapOracle} from "./interfaces/IWoodTwapOracle.sol";
 interface ISwoodMinimal {
     function guardianStake(address guardian) external view returns (uint256);
     function coolDownPeriod() external view returns (uint256);
+    /// @dev Issue #35: anchor-aware slash basis, shared with
+    ///      `StakedWood._slashOne`. `min(max(liability at anchor,
+    ///      votableStake at anchor), liveStake)`.
+    function slashableStakeAt(address guardian, uint256 anchor) external view returns (uint256);
 }
 
 interface IAggregatorMinimal {
@@ -29,6 +33,12 @@ interface ILedgerGovernorMinimal {
         address vault;
         uint256 executeBy;
         uint256 strategyDuration;
+        /// @dev 0 until the proposal has executed. Issue #35: the anchor
+        ///      every post-execution coverage read (`allocatedUsd`,
+        ///      `liabilityUsd`/`_effectiveTotal`, `settleCoverage`/
+        ///      `_effectiveReservedTotal`) values guardians at, via
+        ///      `swood.slashableStakeAt`, instead of live stake.
+        uint256 executedAt;
     }
 
     function getProposalView(uint256 proposalId) external view returns (ProposalViewLite memory);
@@ -398,7 +408,10 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
 
     /// @inheritdoc IExposureLedger
     function slashableBondUsd(address guardian) public view returns (uint256) {
-        return _slashableBondUsd(guardian, woodPriceX8());
+        // LIVE (anchor = 0): no proposal-specific verdict exists at this
+        // call, so there is nothing to anchor against — see
+        // `_slashableBondUsd`'s natspec.
+        return _slashableBondUsd(guardian, woodPriceX8(), 0);
     }
 
     /// @notice The WOOD/USD price every bond is valued at, 8 decimals.
@@ -544,8 +557,23 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
 
     /// @dev `slashableBondUsd` with the loop-invariant price passed in, so a
     ///      multi-approver quorum reads it once instead of once per approver.
-    function _slashableBondUsd(address guardian, uint256 priceX8) internal view returns (uint256) {
-        return (swood.guardianStake(guardian) * priceX8) / 1e8;
+    ///
+    ///      ANCHOR-AWARE (issue #35). `anchor == 0` reads LIVE
+    ///      `guardianStake` — the pre-execution basis, used where no verdict
+    ///      anchor exists yet (`recordApproval`'s budget cap,
+    ///      `requireApproveQuorum`'s execute-time gate, and the public
+    ///      `slashableBondUsd` view) and where any stake present is still
+    ///      reachable. `anchor != 0` reads `swood.slashableStakeAt(guardian,
+    ///      anchor)` instead — `min(snapshot at anchor, live)`, exactly what a
+    ///      verdict slash anchored at that instant (`StakedWood._slashOne`)
+    ///      can recover — so a guardian who tops up stake AFTER the anchor
+    ///      is never counted as coverage the conviction cannot reach. Every
+    ///      post-execution ledger read (`allocatedUsd`, `_effectiveTotal`,
+    ///      `settleCoverage`, `_effectiveReservedTotal`) passes
+    ///      `pv.executedAt` as the anchor.
+    function _slashableBondUsd(address guardian, uint256 priceX8, uint256 anchor) internal view returns (uint256) {
+        uint256 stake = anchor == 0 ? swood.guardianStake(guardian) : swood.slashableStakeAt(guardian, anchor);
+        return (stake * priceX8) / 1e8;
     }
 
     // ── Owner setters ──
@@ -940,7 +968,8 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         // Free budget = k * bond - open exposure. Zero free budget is the
         // batching attack's boundary: this guardian's bond is already fully
         // spoken for by its other open approvals, so it cannot back another drain.
-        uint256 capUsd = kNumerator * _slashableBondUsd(guardian, priceX8);
+        // LIVE (anchor = 0): pre-execution, no verdict anchor exists yet.
+        uint256 capUsd = kNumerator * _slashableBondUsd(guardian, priceX8, 0);
         uint256 open = openExposureUsd(guardian);
         // NO FREE BUDGET -> BOOK NOTHING, DON'T REVERT. Reverting here would
         // silence the approve side entirely for a guardian whose budget is
@@ -1291,7 +1320,12 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
             address g = approvers[i];
             uint256 reserved = _recorded[key][g].usd;
             if (reserved == 0) continue; // released via a vote change
-            uint256 live = _slashableBondUsd(g, priceX8);
+            // LIVE (anchor = 0), DELIBERATELY — see the invariant note on
+            // `SyndicateGovernor.executeProposal`'s `executedAt` stamp: this
+            // gate runs in the same transaction, immediately after the
+            // stamp, so the live read here is provably equal to the
+            // anchored read every OTHER post-execution consumer takes.
+            uint256 live = _slashableBondUsd(g, priceX8, 0);
             haveUsd += live < reserved ? live : reserved;
             if (haveUsd >= needUsd) return; // early exit
         }
@@ -1407,13 +1441,16 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         uint256 reserved = _recorded[key][guardian].usd;
         if (reserved == 0) return 0;
         ILedgerGovernorMinimal gov = ILedgerGovernorMinimal(governor);
-        address asset = IVaultAssetMinimal(gov.getProposalView(proposalId).vault).asset();
+        ILedgerGovernorMinimal.ProposalViewLite memory pv = gov.getProposalView(proposalId);
+        address asset = IVaultAssetMinimal(pv.vault).asset();
         uint256 needUsd = coverageUsd(asset, gov.getRequiredCoverage(proposalId));
         uint256 priceX8 = woodPriceX8();
-        uint256 live = _slashableBondUsd(guardian, priceX8);
+        // ANCHORED (issue #35): once executed, a post-execution top-up must
+        // not inflate what this guardian carries — see `_slashableBondUsd`.
+        uint256 live = _slashableBondUsd(guardian, priceX8, pv.executedAt);
         uint256 mine = live < reserved ? live : reserved;
         if (mine == 0) return 0;
-        return _allocate(mine, _effectiveTotal(key, priceX8), needUsd);
+        return _allocate(mine, _effectiveTotal(key, priceX8, pv.executedAt), needUsd);
     }
 
     /// @inheritdoc IExposureLedger
@@ -1423,24 +1460,34 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      `ChallengeGame.file()` must not sum the RESERVATION while slashing
     ///      prices the ALLOCATION.
     ///
+    ///      ANCHORED AT `executedAt` (issue #35), not live. Without the
+    ///      anchor, an accused cohort could permissionlessly top up its
+    ///      stake AFTER the drain to price up its own filing bond with
+    ///      capital the eventual verdict slash (itself anchored at
+    ///      `executedAt`, `StakedWood._slashOne`) can never reach. Once both
+    ///      sides read the same anchor, they cannot drift apart.
+    ///
     ///      Reverts rather than returning a stale figure when the asset feed is
     ///      down, inheriting `coverageUsd`'s `StalePrice` gate. A caller that
     ///      must stay live through a feed outage has to say so explicitly — see
     ///      `ChallengeGame.file()`, which catches and falls back.
     function liabilityUsd(address governor, uint256 proposalId) external view returns (uint256) {
         bytes32 key = _reviewKey(governor, proposalId);
-        uint256 effectiveTotal = _effectiveTotal(key, woodPriceX8());
+        ILedgerGovernorMinimal gov = ILedgerGovernorMinimal(governor);
+        ILedgerGovernorMinimal.ProposalViewLite memory pv = gov.getProposalView(proposalId);
+        // ANCHORED (issue #35): sizes the challenger's filing bond off what
+        // the verdict slash can actually reach, not off post-drain top-ups
+        // an accused cohort adds to price up its own prosecution.
+        uint256 effectiveTotal = _effectiveTotal(key, woodPriceX8(), pv.executedAt);
         if (effectiveTotal == 0) return 0;
 
-        ILedgerGovernorMinimal gov = ILedgerGovernorMinimal(governor);
-        uint256 needUsd = coverageUsd(
-            IVaultAssetMinimal(gov.getProposalView(proposalId).vault).asset(), gov.getRequiredCoverage(proposalId)
-        );
+        uint256 needUsd = coverageUsd(IVaultAssetMinimal(pv.vault).asset(), gov.getRequiredCoverage(proposalId));
         return needUsd < effectiveTotal ? needUsd : effectiveTotal;
     }
 
-    /// @dev Sum of `min(reserved, live bond)` across a proposal's approvers —
-    ///      what the cohort can ACTUALLY pay, not what it pledged.
+    /// @dev Sum of `min(reserved, slashable bond)` across a proposal's
+    ///      approvers — what the cohort can ACTUALLY pay, not what it
+    ///      pledged.
     ///
     ///      Using raw `_committedUsd` as the denominator would let a guardian
     ///      who unstaked or was devalued after approving keep diluting
@@ -1448,13 +1495,22 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      of the loss by more than rounding. `requireApproveQuorum` already
     ///      discounts by `min(live, reserved)`; this applies the same discount
     ///      to the split, so the two agree about the same guardian.
-    function _effectiveTotal(bytes32 key, uint256 priceX8) internal view returns (uint256 total) {
+    ///
+    ///      ANCHORED (issue #35): `anchor` is `pv.executedAt`, threaded from
+    ///      the caller rather than re-read per guardian — 0 (unexecuted)
+    ///      keeps every term on the live basis, unchanged from before this
+    ///      change. Once executed, the "slashable bond" term is
+    ///      `min(snapshot at executedAt, live)` rather than raw live stake, so
+    ///      the adversary this closes — an accused approver topping up AFTER
+    ///      the drain to inflate its own share of `needUsd` — is priced at
+    ///      what the verdict can reach, not at what it can stake.
+    function _effectiveTotal(bytes32 key, uint256 priceX8, uint256 anchor) internal view returns (uint256 total) {
         address[] storage listed = _approversOf[key];
         uint256 n = listed.length;
         for (uint256 i = 0; i < n; i++) {
             uint256 reserved = _recorded[key][listed[i]].usd;
             if (reserved == 0) continue;
-            uint256 live = _slashableBondUsd(listed[i], priceX8);
+            uint256 live = _slashableBondUsd(listed[i], priceX8, anchor);
             total += live < reserved ? live : reserved;
         }
     }
@@ -1575,7 +1631,12 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         // proposal. Contrast `recordApproval`, where declining to act would
         // disenfranchise a voter rather than merely delay a refund.
         uint256 priceX8 = woodPriceX8();
-        uint256 effectiveTotal = _effectiveReservedTotal(key, priceX8);
+        // ANCHORED (issue #35): `pv.executedAt` is 0 for a proposal that
+        // never executed (expired unexecuted, window merely closed) — the
+        // live basis then, unchanged from before this change. For an
+        // executed proposal, every booking below is capped at what the
+        // verdict slash can actually reach.
+        uint256 effectiveTotal = _effectiveReservedTotal(key, priceX8, pv.executedAt);
         if (effectiveTotal == 0) {
             _settled[key] = true;
             return;
@@ -1590,7 +1651,7 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
             uint256 reserved = _reservedUsd[key][g];
             if (reserved == 0) continue; // released via a vote change
 
-            uint256 liveG = _slashableBondUsd(g, priceX8);
+            uint256 liveG = _slashableBondUsd(g, priceX8, pv.executedAt);
             uint256 mine = liveG < reserved ? liveG : reserved;
             uint256 alloc = _allocate(mine, effectiveTotal, needUsd);
             // BOOKED, NOT ALLOCATED. `_rebook` clamps an upward move to the
@@ -1619,8 +1680,13 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         // collateral nobody pledged.
         //
         // Capping each top-up at `mine - alloc` bounds the booking by
-        // `min(live bond, pledge)`, the most a conviction could ever take from
-        // it — crediting past that would consume budget that buys no recovery.
+        // `min(slashable bond, pledge)` — the most a conviction could ever
+        // take from it, TRUE again under the anchored basis (issue #35):
+        // once executed, `mine` is already capped at
+        // `min(snapshot at executedAt, live)`, so this residue credit cannot be
+        // inflated by a stake top-up an accused approver adds after the
+        // drain. Crediting past that bound would consume budget that buys no
+        // recovery.
         // In the shortfall case every headroom is zero, so nothing is handed
         // out and the aggregate lands UNDER `needUsd`: `requireApproveQuorum`
         // sums `min(live, booked)`, the same `effectiveTotal` it would have
@@ -1709,7 +1775,14 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         RecordedExposure memory r = _recorded[key][g];
         uint256 current = uint256(r.usd);
         if (target > current) {
-            uint256 capUsd = kNumerator * _slashableBondUsd(g, priceX8);
+            // LIVE (anchor = 0), DELIBERATELY (issue #35, design D6). This is
+            // the #110 BATCHING cap — how much of this guardian's bond is
+            // free across ALL its open proposals right now — not a
+            // per-proposal verdict-recovery bound, so it stays on the same
+            // basis `recordApproval`'s original cap uses. Anchoring it would
+            // change #110's re-check semantics, which this change is
+            // designed not to disturb.
+            uint256 capUsd = kNumerator * _slashableBondUsd(g, priceX8, 0);
             uint256 open = openExposureUsd(g);
             uint256 headroom = capUsd > open ? capUsd - open : 0;
             uint256 maxTarget = current + headroom;
@@ -1731,13 +1804,20 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      afterwards; settlement needs this one, because it is rewriting the
     ///      very numbers `_effectiveTotal` reads and must divide by an input its
     ///      own previous passes did not move.
-    function _effectiveReservedTotal(bytes32 key, uint256 priceX8) internal view returns (uint256 total) {
+    ///
+    ///      ANCHORED (issue #35): same `anchor` threading as `_effectiveTotal`
+    ///      — `pv.executedAt`, 0 (live) for a proposal that never executed.
+    function _effectiveReservedTotal(bytes32 key, uint256 priceX8, uint256 anchor)
+        internal
+        view
+        returns (uint256 total)
+    {
         address[] storage listed = _approversOf[key];
         uint256 n = listed.length;
         for (uint256 i = 0; i < n; i++) {
             uint256 reserved = _reservedUsd[key][listed[i]];
             if (reserved == 0) continue;
-            uint256 live = _slashableBondUsd(listed[i], priceX8);
+            uint256 live = _slashableBondUsd(listed[i], priceX8, anchor);
             total += live < reserved ? live : reserved;
         }
     }
