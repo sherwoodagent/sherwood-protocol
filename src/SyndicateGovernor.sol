@@ -241,6 +241,11 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         if (executeCalls.length > MAX_CALLS_PER_PROPOSAL || settlementCalls.length > MAX_CALLS_PER_PROPOSAL) {
             revert TooManyCalls();
         }
+        // Reject any call in either array whose target the vault's
+        // privileged-batch-target predicate flags (issue #118). Runs here,
+        // bounded by the TooManyCalls cap above, before any state write or
+        // state-changing external call (lockBond).
+        _rejectPrivilegedTargets(vault, executeCalls, settlementCalls);
         // Caps metadata URI length.
         if (bytes(metadataURI).length > MAX_METADATA_URI_LENGTH) revert MetadataURITooLong();
         // Risk envelope: nonzero outflow ceiling, clamped to the maxCapitalBps
@@ -1036,6 +1041,54 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         if (maxCapital > ceiling) revert MaxCapitalExceedsCeiling();
     }
 
+    /// @dev Propose-time half of issue #118's fix: rejects any target in
+    ///      EITHER call array that the vault's own privileged-batch-target
+    ///      predicate flags (the vault itself, or its bound withdrawal
+    ///      queue) — the SAME predicate `_guardBatchCalls` enforces at
+    ///      execute/settle time (`isPrivilegedBatchTarget`, single-sourced
+    ///      on the vault so this check cannot drift from it). Denylist half
+    ///      ONLY: the registry-gated selector half of the vault's guard
+    ///      depends on mutable, even codehash-sensitive, state
+    ///      (`isAdapterAllowed`) and would prove nothing about settle time —
+    ///      deliberately not evaluated here (design.md, issue #118).
+    ///
+    ///      Consumed via staticcall as a capability probe, mirroring the
+    ///      vault's own `tierRegistry()` staticcall pattern in
+    ///      `_guardBatchCalls`: a failed or malformed call (a vault that
+    ///      predates this view) degrades OPEN — propose must never brick on
+    ///      a fail-early check. `executeGovernorBatch`'s guard remains the
+    ///      authoritative enforcement on every batch path regardless of
+    ///      whether this check ran, degraded open, or was skipped.
+    function _rejectPrivilegedTargets(
+        address vault_,
+        BatchExecutorLib.Call[] calldata executeCalls_,
+        BatchExecutorLib.Call[] calldata settlementCalls_
+    ) private view {
+        // Capability probe: address(0) is never a privileged target, so this
+        // call's SUCCESS (not its result) is what gates the loop below.
+        (bool ok, bytes memory ret) =
+            vault_.staticcall(abi.encodeCall(ISyndicateVault.isPrivilegedBatchTarget, (address(0))));
+        if (!ok || ret.length != 32) return;
+
+        for (uint256 i = 0; i < executeCalls_.length; i++) {
+            _revertIfPrivilegedTarget(vault_, executeCalls_[i].target);
+        }
+        for (uint256 i = 0; i < settlementCalls_.length; i++) {
+            _revertIfPrivilegedTarget(vault_, settlementCalls_[i].target);
+        }
+    }
+
+    /// @dev staticcall (not a typed call) so a vault that stops answering
+    ///      mid-loop (it cannot: the probe above already proved it exists,
+    ///      and this is a `view` in the same tx) still degrades open rather
+    ///      than reverting propose for an unrelated reason.
+    function _revertIfPrivilegedTarget(address vault_, address target) private view {
+        (bool ok, bytes memory ret) = vault_.staticcall(abi.encodeCall(ISyndicateVault.isPrivilegedBatchTarget, (target)));
+        if (ok && ret.length == 32 && abi.decode(ret, (bool))) {
+            revert ISyndicateVault.DisallowedBatchTarget(target);
+        }
+    }
+
     /// @dev Resolves and stores the proposal's tier + required coverage, then
     ///      runs the propose-time gates: the maxCapital ceiling check, the
     ///      exposure ledger's covered-TVL cap, and the risk-scaled proposer
@@ -1655,11 +1708,17 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     }
 
     /// @inheritdoc ISyndicateGovernor
-    /// @dev No `nonReentrant` required: CEI is respected (escrow slot cleared
-    ///      before the external `transferPerformanceFee` call). A reentrant
-    ///      call with the same `(vault, msg.sender, token)` key sees a zeroed
-    ///      slot and short-circuits. Different keys are independent escrows.
-    function claimUnclaimedFees(address vault, address token) external {
+    /// @dev `nonReentrant` here is uniformity with every other state-changing
+    ///      governor entrypoint, not the closure of a live hole. The old
+    ///      reasoning was, and remains, correct: CEI is respected (escrow slot
+    ///      cleared before the external `transferPerformanceFee` call), so a
+    ///      reentrant call with the same `(vault, msg.sender, token)` key sees
+    ///      a zeroed slot and short-circuits harmlessly. CEI stays the primary
+    ///      defense; the latch is defence-in-depth that closes the
+    ///      re-derivation cost the next time surrounding code changes — being
+    ///      the one unguarded entrypoint among guarded siblings is the
+    ///      asymmetry that turns into a bug later, not a bug today.
+    function claimUnclaimedFees(address vault, address token) external nonReentrant {
         bytes32 k = _unclaimedKey(vault, msg.sender, token);
         uint256 amt = _unclaimedFees[k];
         if (amt == 0) return;
