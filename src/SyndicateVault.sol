@@ -1462,9 +1462,42 @@ contract SyndicateVault is
 
     // ==================== HIGH-WATER MARK ====================
 
-    /// @notice Shares the price-per-share figure is quoted against. Fixed at
-    ///         1e18 so the mark's unit is independent of the asset's decimals.
-    uint256 private constant PPS_SHARES = 1e18;
+    /// @notice AT LEAST one whole share, in this vault's OWN decimals — never
+    ///         a smaller, arbitrary `1e18` (issue #97). Share decimals are
+    ///         `assetDecimals + _decimalsOffset()`, and this vault sets
+    ///         `_decimalsOffset()` to the asset's own decimals, so share
+    ///         decimals are `2 * assetDecimals`. A literal `1e18` is "one
+    ///         whole share" only at `assetDecimals == 9`; at 18 (WETH-like) it
+    ///         was `1e-18` of a share, and `convertToAssets` of that quantized
+    ///         to whole-integer steps of `pps` at 100% NAV moves —
+    ///         `aboveHighWaterMark` read a fund up 99% as sitting AT the mark,
+    ///         charging zero performance fee.
+    /// @dev    `max(1e18, 10 ** decimals())`, NOT bare `10 ** decimals()`. The
+    ///         obvious fix — always convert against exactly one share — is
+    ///         wrong for LOW-decimal assets: at `assetDecimals == 6` (USDC),
+    ///         `10 ** decimals() = 1e12`, a SMALLER unit than the `1e18` this
+    ///         vault always used. `convertToAssets` floors, and the absolute
+    ///         floor error in `pps` is bounded by <1 unit of THIS constant; a
+    ///         smaller unit means that same <1-unit error represents more real
+    ///         value once multiplied back out by `totalSupply()` in
+    ///         `aboveHighWaterMark`/`_exitFees`. Measured: a bare
+    ///         `10 ** decimals()` reintroduced ~$1 of drift on a $200,000 fee
+    ///         base for a 6-decimal asset (`test/fees/HighWaterMark.t.sol`),
+    ///         precision the OLD `1e18` constant never lost. The `max` floors
+    ///         at exactly `1e18` for every `assetDecimals <= 9` — which is
+    ///         every asset this protocol has ever tested against — so those
+    ///         vaults get the IDENTICAL constant, and identical numerics, they
+    ///         always had. Only `assetDecimals > 9`, where `1e18` genuinely
+    ///         stops being close to one real share, switches to the larger,
+    ///         decimals-scaled unit.
+    /// @dev    Computed, not cached: `decimals()` itself reads only cached
+    ///         immutable-like state (`_cachedDecimalsOffset` + the asset's own
+    ///         decimals, pinned at init), so this costs one `EXP` by a small
+    ///         constant and one comparison, not an external call.
+    function _pricePerShareUnit() private view returns (uint256) {
+        uint256 wholeShare = 10 ** decimals();
+        return wholeShare > 1e18 ? wholeShare : 1e18;
+    }
 
     /// @inheritdoc ISyndicateVault
     /// @dev Routed through `convertToAssets` rather than computing
@@ -1473,7 +1506,7 @@ contract SyndicateVault is
     ///      conversion. A hand-rolled ratio would drift from real share pricing
     ///      and the drift would land in the fee.
     function pricePerShare() public view returns (uint256) {
-        return convertToAssets(PPS_SHARES);
+        return convertToAssets(_pricePerShareUnit());
     }
 
     /// @inheritdoc ISyndicateVault
@@ -1491,7 +1524,7 @@ contract SyndicateVault is
         uint256 mark = _highWaterPricePerShare;
         uint256 pps = pricePerShare();
         if (pps <= mark) return 0;
-        return (pps - mark) * _pricingSupply() / PPS_SHARES;
+        return (pps - mark) * _pricingSupply() / _pricePerShareUnit();
     }
 
     /// @inheritdoc ISyndicateVault
@@ -1566,7 +1599,7 @@ contract SyndicateVault is
             uint256 bps = agentFeeBps();
             uint256 cap = _governorPerformanceCap();
             if (bps > cap) bps = cap;
-            perfFee = (((pps - mark) * shares) / PPS_SHARES) * bps / 10_000;
+            perfFee = (((pps - mark) * shares) / _pricePerShareUnit()) * bps / 10_000;
         }
     }
 
