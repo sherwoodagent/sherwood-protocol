@@ -157,6 +157,16 @@ interface ISyndicateGovernor {
         /// @notice Performance-fee split snapshotted at propose time. Four
         ///         `uint16`s, one slot.
         IProtocolConfig.PerfSplit snapshotPerfSplit;
+        /// @notice The exposure ledger `reclaimProposerBond`'s challenge-window
+        ///         gates read for this proposal, pinned at propose time
+        ///         alongside `proposerBondWood` / `proposerBondEscrow`. A
+        ///         factory re-point of the governor's live `_exposureLedger`
+        ///         slot after this proposal locks a bond MUST NOT change which
+        ///         ledger gates it — see `reclaimProposerBond`. Zero when no
+        ///         bond was locked, or the proposal predates ledger pinning
+        ///         (falls back to the live slot, preserving pre-pin behavior
+        ///         including the `ExposureLedgerUnset` fail-closed path).
+        address proposerBondLedger;
     }
 
     struct CoProposer {
@@ -431,6 +441,14 @@ interface ISyndicateGovernor {
 
     /// @notice Proposer bond escrow wired (or un-wired, newEscrow == address(0)).
     event BondEscrowSet(address indexed oldEscrow, address indexed newEscrow);
+
+    /// @notice `reclaimProposerBond` reached a proposal whose bond had already
+    ///         been forfeited by a conviction (the pinned escrow reports none
+    ///         held while the governor still recorded `amount`). The recorded
+    ///         amount is zeroed and nothing is transferred — this is the
+    ///         terminal, distinguishable outcome in place of a permanent
+    ///         `NoBond` revert from the escrow.
+    event ProposerBondForfeitureAcknowledged(uint256 indexed proposalId, uint256 amount);
 
     /// @notice Emitted in `_distributeFees` when `guardianFeeBps > 0`.
     ///         Guardian fee is carved from gross PnL and transferred to
