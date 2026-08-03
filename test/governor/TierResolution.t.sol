@@ -122,16 +122,24 @@ contract TierResolutionTest is Test {
 
     function _propose(BatchExecutorLib.Call[] memory executeCalls) internal returns (uint256 proposalId) {
         vm.prank(agent);
-        proposalId = governor.propose(address(vault),
+        proposalId = governor.propose(
+            address(vault),
             address(0),
             "ipfs://tier-resolution",
             7 days,
             ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000}),
             executeCalls,
-            GovEnvelope.defaultCaps((ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000})).maxCapital, (executeCalls).length),
+            GovEnvelope.defaultCaps(
+                (ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000})).maxCapital,
+                (executeCalls).length
+            ),
             _settleCalls(),
-            GovEnvelope.defaultCaps((ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000})).maxCapital, (_settleCalls()).length),
-            new ISyndicateGovernor.CoProposer[](0));
+            GovEnvelope.defaultCaps(
+                (ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000})).maxCapital,
+                (_settleCalls()).length
+            ),
+            new ISyndicateGovernor.CoProposer[](0)
+        );
     }
 
     /// @dev Variant of `_propose` for the multi-exec-call coverage tests

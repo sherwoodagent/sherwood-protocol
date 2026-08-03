@@ -375,16 +375,24 @@ contract SlashGasCeilingTest is Test {
     ///      slash rate) -> execute.
     function _proposeApproveExecute() internal returns (uint256 pid) {
         vm.prank(agent);
-        pid = gov.propose(address(vault),
+        pid = gov.propose(
+            address(vault),
             address(0),
             "ipfs://slash-gas-ceiling",
             7 days,
             ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000}),
             _execCalls(),
-            GovEnvelope.defaultCaps((ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000})).maxCapital, (_execCalls()).length),
+            GovEnvelope.defaultCaps(
+                (ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000})).maxCapital,
+                (_execCalls()).length
+            ),
             _settleCalls(),
-            GovEnvelope.defaultCaps((ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000})).maxCapital, (_settleCalls()).length),
-            new ISyndicateGovernor.CoProposer[](0));
+            GovEnvelope.defaultCaps(
+                (ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000})).maxCapital,
+                (_settleCalls()).length
+            ),
+            new ISyndicateGovernor.CoProposer[](0)
+        );
 
         vm.warp(gov.getProposal(pid).voteEnd + 1);
         registry.openReview(address(gov), pid);

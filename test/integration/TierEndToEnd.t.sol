@@ -151,16 +151,24 @@ contract TierEndToEndTest is Test {
 
     function _propose(BatchExecutorLib.Call[] memory executeCalls) internal returns (uint256 proposalId) {
         vm.prank(agent);
-        proposalId = governor.propose(address(vault),
+        proposalId = governor.propose(
+            address(vault),
             address(0),
             "ipfs://tier-e2e",
             7 days,
             ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000}),
             executeCalls,
-            GovEnvelope.defaultCaps((ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000})).maxCapital, (executeCalls).length),
+            GovEnvelope.defaultCaps(
+                (ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000})).maxCapital,
+                (executeCalls).length
+            ),
             _settleCalls(),
-            GovEnvelope.defaultCaps((ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000})).maxCapital, (_settleCalls()).length),
-            new ISyndicateGovernor.CoProposer[](0));
+            GovEnvelope.defaultCaps(
+                (ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000})).maxCapital,
+                (_settleCalls()).length
+            ),
+            new ISyndicateGovernor.CoProposer[](0)
+        );
     }
 
     /// @dev Variant for `_deployCalls`-shaped batches (issue #43): the MOVER is
@@ -255,9 +263,7 @@ contract TierEndToEndTest is Test {
         // The whole `amountOver` is moved out by the `deploy` call (index 1),
         // so its measured outflow == amountOver, against its declared cap of
         // MAX_CAPITAL.
-        vm.expectRevert(
-            abi.encodeWithSelector(BatchExecutorLib.CallCapExceeded.selector, 1, amountOver, MAX_CAPITAL)
-        );
+        vm.expectRevert(abi.encodeWithSelector(BatchExecutorLib.CallCapExceeded.selector, 1, amountOver, MAX_CAPITAL));
         governor.executeProposal(pidOver);
 
         // Free the (still-Approved) slot so a fresh proposal can be filed.

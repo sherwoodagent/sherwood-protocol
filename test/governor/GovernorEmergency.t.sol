@@ -258,7 +258,8 @@ contract GovernorEmergencyTest is Test {
 
     function _createExecutedProposal(uint256 duration) internal returns (uint256 proposalId) {
         vm.prank(agent);
-        proposalId = governor.propose(address(vault),
+        proposalId = governor.propose(
+            address(vault),
             address(0),
             "ipfs://emergency",
             duration,
@@ -267,7 +268,8 @@ contract GovernorEmergencyTest is Test {
             GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_execCalls()).length),
             _settleCalls(),
             GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_settleCalls()).length),
-            _emptyCoProposers());
+            _emptyCoProposers()
+        );
         vm.warp(vm.getBlockTimestamp() + 1);
         vm.prank(lp1);
         governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
@@ -950,8 +952,9 @@ contract GovernorEmergencyTest is Test {
     function test_capBreach_executeLeg_leavesProposalApproved() public {
         address sink = makeAddr("execSink");
         BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](1);
-        execCalls[0] =
-            BatchExecutorLib.Call({target: address(usdc), data: abi.encodeCall(usdc.transfer, (sink, 1_000e6)), value: 0});
+        execCalls[0] = BatchExecutorLib.Call({
+            target: address(usdc), data: abi.encodeCall(usdc.transfer, (sink, 1_000e6)), value: 0
+        });
         uint256[] memory execCaps = new uint256[](1);
         execCaps[0] = 500e6; // too tight -- the call moves 1_000e6
 
@@ -979,8 +982,9 @@ contract GovernorEmergencyTest is Test {
         address sink = makeAddr("settleSink");
         uint256[] memory execCaps = GovEnvelope.defaultCaps(GovEnvelope.permissive(address(vault)).maxCapital, 1);
         BatchExecutorLib.Call[] memory settleCalls = new BatchExecutorLib.Call[](1);
-        settleCalls[0] =
-            BatchExecutorLib.Call({target: address(usdc), data: abi.encodeCall(usdc.transfer, (sink, 1_000e6)), value: 0});
+        settleCalls[0] = BatchExecutorLib.Call({
+            target: address(usdc), data: abi.encodeCall(usdc.transfer, (sink, 1_000e6)), value: 0
+        });
         uint256[] memory settleCaps = new uint256[](1);
         settleCaps[0] = 500e6; // too tight -- the call moves 1_000e6
 
@@ -1019,8 +1023,9 @@ contract GovernorEmergencyTest is Test {
         address sink = makeAddr("rescueSink");
         uint256[] memory execCaps = GovEnvelope.defaultCaps(GovEnvelope.permissive(address(vault)).maxCapital, 1);
         BatchExecutorLib.Call[] memory settleCalls = new BatchExecutorLib.Call[](1);
-        settleCalls[0] =
-            BatchExecutorLib.Call({target: address(usdc), data: abi.encodeCall(usdc.transfer, (sink, 1_000e6)), value: 0});
+        settleCalls[0] = BatchExecutorLib.Call({
+            target: address(usdc), data: abi.encodeCall(usdc.transfer, (sink, 1_000e6)), value: 0
+        });
         uint256[] memory settleCaps = new uint256[](1);
         settleCaps[0] = 500e6;
 

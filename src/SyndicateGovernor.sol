@@ -529,9 +529,12 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // (issue #43) additionally bound each settlement call's own gross
         // outflow — extraction parked in a single settlement call is bounded
         // per call, not only by the batch-level `maxCapital`.
-        ISyndicateVault(proposal.vault).executeGovernorBatch(
-            _loadCalls(_settlementCalls, proposalId), _loadCaps(_settlementCallCaps, proposalId), proposal.maxCapital
-        );
+        ISyndicateVault(proposal.vault)
+            .executeGovernorBatch(
+                _loadCalls(_settlementCalls, proposalId),
+                _loadCaps(_settlementCallCaps, proposalId),
+                proposal.maxCapital
+            );
 
         _finishSettlement(proposalId, proposal);
     }

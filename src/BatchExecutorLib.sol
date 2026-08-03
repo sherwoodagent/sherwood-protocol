@@ -11,9 +11,21 @@ pragma solidity 0.8.28;
  *     - All calls to DeFi protocols happen FROM the vault
  *
  *   This contract has NO state and NO access control. The calling vault must
- *   enforce allowlists and caps BEFORE delegatecalling here.
+ *   enforce allowlists BEFORE delegatecalling here; per-call capital
+ *   declarations (issue #43) are enforced HERE, inside the metered
+ *   `executeBatch(calls, asset, caps)` overload — gross per-call outflow vs.
+ *   its declared `caps[i]`, fail-closed, breach reverts the whole batch with
+ *   `CallCapExceeded`. An empty `caps` array is the deliberate unmetered
+ *   escape valve (used only by the guardian-reviewed emergency rescue path).
  *
- *   Deploy once, share across all syndicate vaults.
+ *   Deploy once, share across all syndicate vaults. Upgrading this
+ *   implementation for an already-deployed vault is NOT a bytecode swap: use
+ *   `SyndicateFactory.setExecutorImpl` (new syndicates) and
+ *   `SyndicateFactory.pushExecutor(vault)` (existing vaults, lifecycle-gated
+ *   on `openProposalCount == 0`) — see `SyndicateVault.setExecutorImpl` and
+ *   design.md D5. There is deliberately no compatibility shim for the old
+ *   unmetered selector: a vault still pointed at old executor bytecode fails
+ *   closed (`CapsLengthMismatch`/no such selector), never silently unmetered.
  */
 contract BatchExecutorLib {
     struct Call {

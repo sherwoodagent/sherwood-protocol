@@ -112,16 +112,25 @@ contract RiskEnvelopeTest is Test {
     /// @dev Builds a normal single-proposer proposal carrying the given envelope.
     function _proposeWithEnvelope(uint256 maxCapital, uint16 maxDrawdownBps) internal returns (uint256 proposalId) {
         vm.prank(agent);
-        proposalId = governor.propose(address(vault),
+        proposalId = governor.propose(
+            address(vault),
             address(0),
             "ipfs://risk-envelope",
             7 days,
             ISyndicateGovernor.RiskEnvelope({maxCapital: maxCapital, maxDrawdownBps: maxDrawdownBps}),
             _execCalls(),
-            GovEnvelope.defaultCaps((ISyndicateGovernor.RiskEnvelope({maxCapital: maxCapital, maxDrawdownBps: maxDrawdownBps})).maxCapital, (_execCalls()).length),
+            GovEnvelope.defaultCaps(
+                    (ISyndicateGovernor.RiskEnvelope({maxCapital: maxCapital, maxDrawdownBps: maxDrawdownBps}))
+                    .maxCapital,
+                    (_execCalls()).length
+                ),
             _settleCalls(),
-            GovEnvelope.defaultCaps((ISyndicateGovernor.RiskEnvelope({maxCapital: maxCapital, maxDrawdownBps: maxDrawdownBps})).maxCapital, (_settleCalls()).length),
-            new ISyndicateGovernor.CoProposer[](0));
+            GovEnvelope.defaultCaps(
+                (ISyndicateGovernor.RiskEnvelope({maxCapital: maxCapital, maxDrawdownBps: maxDrawdownBps})).maxCapital,
+                (_settleCalls()).length
+            ),
+            new ISyndicateGovernor.CoProposer[](0)
+        );
     }
 
     function test_proposeStoresEnvelope() public {
@@ -252,18 +261,27 @@ contract RiskEnvelopeTest is Test {
         });
 
         vm.prank(agent);
-        uint256 pid = governor.propose(address(vault),
+        uint256 pid = governor.propose(
+            address(vault),
             address(0),
             "ipfs://settle-drain",
             7 days,
             ISyndicateGovernor.RiskEnvelope({maxCapital: maxCapital, maxDrawdownBps: 10_000}),
             _execCalls(),
-            GovEnvelope.defaultCaps((ISyndicateGovernor.RiskEnvelope({maxCapital: maxCapital, maxDrawdownBps: 10_000})).maxCapital, (_execCalls()).length),
+            GovEnvelope.defaultCaps(
+                (ISyndicateGovernor.RiskEnvelope({maxCapital: maxCapital, maxDrawdownBps: 10_000})).maxCapital,
+                (_execCalls()).length
+            ),
             // benign approve — zero net outflow at execute
             settleCalls,
-            GovEnvelope.defaultCaps((ISyndicateGovernor.RiskEnvelope({maxCapital: maxCapital, maxDrawdownBps: 10_000})).maxCapital, (// benign approve — zero net outflow at execute
-            settleCalls).length),
-            new ISyndicateGovernor.CoProposer[](0));
+            GovEnvelope.defaultCaps(
+                (ISyndicateGovernor.RiskEnvelope({maxCapital: maxCapital, maxDrawdownBps: 10_000})).maxCapital,
+                ( // benign approve — zero net outflow at execute
+                        settleCalls
+                    ).length
+            ),
+            new ISyndicateGovernor.CoProposer[](0)
+        );
 
         vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
         governor.executeProposal(pid);
@@ -302,16 +320,24 @@ contract RiskEnvelopeTest is Test {
         coProps[0] = ISyndicateGovernor.CoProposer({agent: coAgent, splitBps: 3000});
 
         vm.prank(agent);
-        uint256 pid = governor.propose(address(vault),
+        uint256 pid = governor.propose(
+            address(vault),
             address(0),
             "ipfs://collab-envelope",
             7 days,
             ISyndicateGovernor.RiskEnvelope({maxCapital: 2_000e6, maxDrawdownBps: 750}),
             _execCalls(),
-            GovEnvelope.defaultCaps((ISyndicateGovernor.RiskEnvelope({maxCapital: 2_000e6, maxDrawdownBps: 750})).maxCapital, (_execCalls()).length),
+            GovEnvelope.defaultCaps(
+                (ISyndicateGovernor.RiskEnvelope({maxCapital: 2_000e6, maxDrawdownBps: 750})).maxCapital,
+                (_execCalls()).length
+            ),
             _settleCalls(),
-            GovEnvelope.defaultCaps((ISyndicateGovernor.RiskEnvelope({maxCapital: 2_000e6, maxDrawdownBps: 750})).maxCapital, (_settleCalls()).length),
-            coProps);
+            GovEnvelope.defaultCaps(
+                (ISyndicateGovernor.RiskEnvelope({maxCapital: 2_000e6, maxDrawdownBps: 750})).maxCapital,
+                (_settleCalls()).length
+            ),
+            coProps
+        );
         assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Draft));
 
         (uint256 maxCapital, uint16 maxDrawdownBps) = governor.getRiskEnvelope(pid);

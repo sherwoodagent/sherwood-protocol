@@ -51,8 +51,7 @@ contract PerCallCapitalDeclarationsTest is Test {
         SyndicateVault vaultImpl = new SyndicateVault();
         bytes memory vaultInit = abi.encodeCall(
             SyndicateVault.initialize,
-            (
-                ISyndicateVault.InitParams({
+            (ISyndicateVault.InitParams({
                     asset: address(usdc),
                     name: "Sherwood Vault",
                     symbol: "swUSDC",
@@ -61,8 +60,7 @@ contract PerCallCapitalDeclarationsTest is Test {
                     openDeposits: true,
                     agentRegistry: address(agentRegistry),
                     managementFeeBps: 50
-                })
-            )
+                }))
         );
         vault = SyndicateVault(payable(address(new ERC1967Proxy(address(vaultImpl), vaultInit))));
 
@@ -420,8 +418,9 @@ contract PerCallCapitalDeclarationsTest is Test {
     function test_validation_zeroCapCallMoving1WeiReverts() public {
         // A call that actually moves the vault's asset(): transfer 1 wei out.
         BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](1);
-        execCalls[0] =
-            BatchExecutorLib.Call({target: address(usdc), data: abi.encodeCall(usdc.transfer, (address(0xBEEF), 1)), value: 0});
+        execCalls[0] = BatchExecutorLib.Call({
+            target: address(usdc), data: abi.encodeCall(usdc.transfer, (address(0xBEEF), 1)), value: 0
+        });
         uint256[] memory execCaps = new uint256[](1); // zero cap
 
         vm.prank(agent);

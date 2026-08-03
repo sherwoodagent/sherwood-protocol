@@ -186,10 +186,12 @@ contract BatchExecutorLibTest is Test {
         token.mint(address(mover), 150e18);
 
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](2);
-        calls[0] =
-            BatchExecutorLib.Call({target: address(token), data: abi.encodeCall(token.transfer, (_sink(), 100e18)), value: 0});
-        calls[1] =
-            BatchExecutorLib.Call({target: address(mover), data: abi.encodeCall(TokenMover.refund, (150e18)), value: 0});
+        calls[0] = BatchExecutorLib.Call({
+            target: address(token), data: abi.encodeCall(token.transfer, (_sink(), 100e18)), value: 0
+        });
+        calls[1] = BatchExecutorLib.Call({
+            target: address(mover), data: abi.encodeCall(TokenMover.refund, (150e18)), value: 0
+        });
         uint256[] memory caps = new uint256[](2);
         caps[0] = 100e18;
         caps[1] = 0;
@@ -211,10 +213,12 @@ contract BatchExecutorLibTest is Test {
         token.mint(address(mover), 150e18);
 
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](2);
-        calls[0] =
-            BatchExecutorLib.Call({target: address(mover), data: abi.encodeCall(TokenMover.refund, (150e18)), value: 0});
-        calls[1] =
-            BatchExecutorLib.Call({target: address(token), data: abi.encodeCall(token.transfer, (_sink(), 100e18)), value: 0});
+        calls[0] = BatchExecutorLib.Call({
+            target: address(mover), data: abi.encodeCall(TokenMover.refund, (150e18)), value: 0
+        });
+        calls[1] = BatchExecutorLib.Call({
+            target: address(token), data: abi.encodeCall(token.transfer, (_sink(), 100e18)), value: 0
+        });
         uint256[] memory caps = new uint256[](2);
         caps[0] = 0; // pure inflow, cap 0 is satisfied
         caps[1] = 50e18; // call 1's own outflow (100e18) exceeds ITS cap
@@ -229,7 +233,9 @@ contract BatchExecutorLibTest is Test {
         token.mint(address(lib), 1e18);
 
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](1);
-        calls[0] = BatchExecutorLib.Call({target: address(token), data: abi.encodeCall(token.transfer, (_sink(), 1)), value: 0});
+        calls[0] = BatchExecutorLib.Call({
+            target: address(token), data: abi.encodeCall(token.transfer, (_sink(), 1)), value: 0
+        });
         uint256[] memory caps = new uint256[](1);
         caps[0] = 0;
 
@@ -243,8 +249,9 @@ contract BatchExecutorLibTest is Test {
         token.mint(address(lib), 1_000e18);
 
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](1);
-        calls[0] =
-            BatchExecutorLib.Call({target: address(token), data: abi.encodeCall(token.transfer, (_sink(), 1_000e18)), value: 0});
+        calls[0] = BatchExecutorLib.Call({
+            target: address(token), data: abi.encodeCall(token.transfer, (_sink(), 1_000e18)), value: 0
+        });
 
         lib.executeBatch(calls, address(token), new uint256[](0));
         assertEq(token.balanceOf(_sink()), 1_000e18);
@@ -278,8 +285,9 @@ contract BatchExecutorLibTest is Test {
         token.mint(address(simMover), 30e18);
 
         BatchExecutorLib.Call[] memory simCalls = new BatchExecutorLib.Call[](2);
-        simCalls[0] =
-            BatchExecutorLib.Call({target: address(token), data: abi.encodeCall(token.transfer, (_sink(), 70e18)), value: 0});
+        simCalls[0] = BatchExecutorLib.Call({
+            target: address(token), data: abi.encodeCall(token.transfer, (_sink(), 70e18)), value: 0
+        });
         simCalls[1] = BatchExecutorLib.Call({
             target: address(simMover), data: abi.encodeCall(TokenMover.refund, (30e18)), value: 0
         });
@@ -294,8 +302,9 @@ contract BatchExecutorLibTest is Test {
         TokenMover execMover = new TokenMover(token);
         token.mint(address(execMover), 30e18);
         BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](2);
-        execCalls[0] =
-            BatchExecutorLib.Call({target: address(token), data: abi.encodeCall(token.transfer, (_sink(), 70e18)), value: 0});
+        execCalls[0] = BatchExecutorLib.Call({
+            target: address(token), data: abi.encodeCall(token.transfer, (_sink(), 70e18)), value: 0
+        });
         execCalls[1] = BatchExecutorLib.Call({
             target: address(execMover), data: abi.encodeCall(TokenMover.refund, (30e18)), value: 0
         });

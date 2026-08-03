@@ -260,7 +260,8 @@ contract SyndicateGovernorIntegrationTest is Test {
         });
 
         vm.prank(agent);
-        uint256 proposalId = governor.propose(address(vault),
+        uint256 proposalId = governor.propose(
+            address(vault),
             address(0),
             "ipfs://test",
             7 days,
@@ -269,7 +270,8 @@ contract SyndicateGovernorIntegrationTest is Test {
             GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (execCalls).length),
             settleCalls,
             GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (settleCalls).length),
-            _emptyCoProposers());
+            _emptyCoProposers()
+        );
         vm.warp(block.timestamp + 1);
 
         // Both vote against -- triggers veto threshold

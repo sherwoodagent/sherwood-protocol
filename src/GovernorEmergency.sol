@@ -70,9 +70,8 @@ abstract contract GovernorEmergency is ProposalLifecycle {
         // #43) — `unstick` REPLAYS the voted batch, so it carries the exact
         // caps that batch was priced with; relief from an over-tight cap is
         // the guardian-reviewed `emergencySettleWithCalls` path, not this one.
-        ISyndicateVault(p.vault).executeGovernorBatch(
-            _getSettlementCalls(proposalId), _getSettlementCallCaps(proposalId), p.maxCapital
-        );
+        ISyndicateVault(p.vault)
+            .executeGovernorBatch(_getSettlementCalls(proposalId), _getSettlementCallCaps(proposalId), p.maxCapital);
         _finishSettlementHook(proposalId, p);
     }
 

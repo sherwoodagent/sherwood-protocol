@@ -264,7 +264,8 @@ contract ProposalLifecycleTest is Test {
     /// @dev Non-collaborative propose — lands straight in Pending.
     function _propose() private returns (uint256 proposalId) {
         vm.prank(agent);
-        proposalId = governor.propose(address(vault),
+        proposalId = governor.propose(
+            address(vault),
             address(0),
             "ipfs://proposal-lifecycle",
             7 days,
@@ -273,7 +274,8 @@ contract ProposalLifecycleTest is Test {
             GovEnvelope.defaultCaps((_env).maxCapital, (_execCalls()).length),
             _settleCalls(),
             GovEnvelope.defaultCaps((_env).maxCapital, (_settleCalls()).length),
-            _emptyCoProposers());
+            _emptyCoProposers()
+        );
     }
 
     /// @dev Collaborative propose — lands in Draft with a single co-proposer, so
@@ -282,7 +284,8 @@ contract ProposalLifecycleTest is Test {
         ISyndicateGovernor.CoProposer[] memory coProps = new ISyndicateGovernor.CoProposer[](1);
         coProps[0] = ISyndicateGovernor.CoProposer({agent: coAgent, splitBps: 3000});
         vm.prank(agent);
-        proposalId = governor.propose(address(vault),
+        proposalId = governor.propose(
+            address(vault),
             address(0),
             "ipfs://proposal-lifecycle-collab",
             7 days,
@@ -291,7 +294,8 @@ contract ProposalLifecycleTest is Test {
             GovEnvelope.defaultCaps((_env).maxCapital, (_execCalls()).length),
             _settleCalls(),
             GovEnvelope.defaultCaps((_env).maxCapital, (_settleCalls()).length),
-            coProps);
+            coProps
+        );
     }
 
     function _voteFor(uint256 pid) private {
@@ -569,7 +573,8 @@ contract ProposalLifecycleTest is Test {
         // Negative control: the stale binding really does block a new proposal.
         vm.prank(agent);
         vm.expectRevert(ISyndicateGovernor.VaultHasOpenProposal.selector);
-        governor.propose(address(vault),
+        governor.propose(
+            address(vault),
             address(0),
             "ipfs://blocked-by-stale-binding",
             7 days,
@@ -578,7 +583,8 @@ contract ProposalLifecycleTest is Test {
             GovEnvelope.defaultCaps((_env).maxCapital, (_execCalls()).length),
             _settleCalls(),
             GovEnvelope.defaultCaps((_env).maxCapital, (_settleCalls()).length),
-            _emptyCoProposers());
+            _emptyCoProposers()
+        );
 
         // Flush the lazy terminal transition. The Approved -> Expired edge must
         // NOT re-fire the economic commit.

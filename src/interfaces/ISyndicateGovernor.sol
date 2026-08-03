@@ -127,12 +127,15 @@ interface ISyndicateGovernor {
         uint8 envelopeTier;
         /// @notice Extractable-value figure the aggregate exposure cap
         ///         consumes: the SUM of per-call contributions across
-        ///         execute AND settlement calls — `maxCapital * Σ boundBps /
-        ///         10_000`, where each tier-0/1 call contributes its
-        ///         certified bound and each tier-2/uncertified call
-        ///         contributes 10_000 (full notional). Conservative
-        ///         (over-counting) since per-call notional isn't threaded
-        ///         through. `maxCapital` flat when no registry is wired.
+        ///         execute AND settlement calls — `Σ cap_i * boundBps_i /
+        ///         10_000`, where `cap_i` is that call's proposer-declared
+        ///         per-call capital declaration (issue #43) and `boundBps_i`
+        ///         is its certified bound (tier-2/uncertified calls use
+        ///         10_000, i.e. their full declared cap). No longer an
+        ///         over-count: each call's contribution is now scaled by its
+        ///         own declared notional rather than the batch-wide
+        ///         `maxCapital`. `maxCapital` flat when no registry is wired
+        ///         (caps are still metered at execution regardless).
         uint256 requiredCoverage;
         /// @notice WOOD amount of the risk-scaled proposer bond locked in
         ///         the ProposerBondEscrow at propose time. Zero when no

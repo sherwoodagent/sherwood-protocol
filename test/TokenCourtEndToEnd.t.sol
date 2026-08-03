@@ -356,16 +356,24 @@ contract TokenCourtEndToEndTest is Test {
 
     function _propose() internal returns (uint256) {
         vm.prank(agent);
-        return gov.propose(address(vault),
+        return gov.propose(
+            address(vault),
             address(0),
             "ipfs://token-court-e2e",
             7 days,
             ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000}),
             _execCalls(),
-            GovEnvelope.defaultCaps((ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000})).maxCapital, (_execCalls()).length),
+            GovEnvelope.defaultCaps(
+                (ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000})).maxCapital,
+                (_execCalls()).length
+            ),
             _settleCalls(),
-            GovEnvelope.defaultCaps((ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000})).maxCapital, (_settleCalls()).length),
-            new ISyndicateGovernor.CoProposer[](0));
+            GovEnvelope.defaultCaps(
+                (ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000})).maxCapital,
+                (_settleCalls()).length
+            ),
+            new ISyndicateGovernor.CoProposer[](0)
+        );
     }
 
     /// @dev propose -> review opens -> g1 approves (coverage committed) ->

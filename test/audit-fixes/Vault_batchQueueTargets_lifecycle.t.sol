@@ -182,7 +182,8 @@ contract VaultBatchQueueTargetsLifecycleTest is Test {
         BatchExecutorLib.Call[] memory settleCalls
     ) internal returns (uint256 pid) {
         vm.prank(agent);
-        pid = governor.propose(address(vault),
+        pid = governor.propose(
+            address(vault),
             address(0),
             "ipfs://p",
             STRATEGY_DURATION,
@@ -191,7 +192,8 @@ contract VaultBatchQueueTargetsLifecycleTest is Test {
             GovEnvelope.defaultCaps((env).maxCapital, (openCalls).length),
             settleCalls,
             GovEnvelope.defaultCaps((env).maxCapital, (settleCalls).length),
-            _noCoProposers());
+            _noCoProposers()
+        );
         vm.warp(vm.getBlockTimestamp() + 1);
         vm.prank(voter);
         governor.vote(pid, ISyndicateGovernor.VoteType.For);

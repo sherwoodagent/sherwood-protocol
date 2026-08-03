@@ -469,15 +469,16 @@ contract SyndicateVault is
         uint256[] calldata callCaps,
         uint256 maxNetOutflow
     ) external onlyGovernor nonReentrant whenNotPaused {
-        if (_executorImpl.codehash != _expectedExecutorCodehash) revert ExecutorCodehashMismatch();
+        if (_executorImpl.codehash != _expectedExecutorCodehash) {
+            revert ExecutorCodehashMismatch();
+        }
         _guardBatchCalls(calls);
         uint256 balanceBefore = IERC20(asset()).balanceOf(address(this));
         // The lib's unmetered 1-arg `executeBatch(Call[])` overload was
         // deleted in issue #43 §5 — the metered 3-arg signature is the only
         // one left, so `abi.encodeCall` resolves it unambiguously again.
-        (bool success, bytes memory returnData) = _executorImpl.delegatecall(
-            abi.encodeCall(BatchExecutorLib.executeBatch, (calls, asset(), callCaps))
-        );
+        (bool success, bytes memory returnData) =
+            _executorImpl.delegatecall(abi.encodeCall(BatchExecutorLib.executeBatch, (calls, asset(), callCaps)));
         if (!success) {
             assembly {
                 revert(add(returnData, 32), mload(returnData))
@@ -507,8 +508,21 @@ contract SyndicateVault is
         // NOT cover: exotic assets — ERC721/ERC1155 approvals and LP-position
         // NFTs — which rely on tier-2 full-notional pricing until their
         // selectors join the guarded set (see `_guardBatchCalls` RESIDUAL).
-        // The precise extractable bound is the tier system's per-call
-        // coverage (requiredCoverage).
+        //
+        // There are now TWO layers (issue #43, design.md D4), from finest to
+        // coarsest:
+        //   1. `BatchExecutorLib.executeBatch`'s per-call meter (this
+        //      delegatecall, above): each call's gross outflow vs. its
+        //      proposer-declared `caps[i]`, `CallCapExceeded` on breach. This
+        //      is the tier system's precise extractable bound
+        //      (`requiredCoverage = Σ cap_i * boundBps_i / 10_000`).
+        //   2. This function's `netOutflow` check (below): a batch-wide
+        //      backstop against `maxCapital`. When caps are supplied and
+        //      cover every moving call, layer 1 is strictly tighter
+        //      (`netOutflow <= Σ outflow_i <= Σ caps_i <= maxCapital`), so
+        //      layer 2 structurally cannot fire first — it only binds when
+        //      caps are empty (the emergency-rescue escape valve) or when a
+        //      batch's declared caps happen to sum right up to maxCapital.
         uint256 netOutflow = balanceBefore > balanceAfter ? balanceBefore - balanceAfter : 0;
         if (netOutflow > maxNetOutflow) revert MaxNetOutflowExceeded(netOutflow, maxNetOutflow);
         uint256 reserve = reservedQueueAssets();

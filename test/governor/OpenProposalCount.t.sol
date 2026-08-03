@@ -219,7 +219,8 @@ contract OpenProposalCountTest is Test {
 
     function _propose() internal returns (uint256 proposalId) {
         vm.prank(agent);
-        proposalId = governor.propose(address(vault),
+        proposalId = governor.propose(
+            address(vault),
             address(0),
             "ipfs://open-count",
             7 days,
@@ -228,7 +229,8 @@ contract OpenProposalCountTest is Test {
             GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_execCalls()).length),
             _settleCalls(),
             GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_settleCalls()).length),
-            _emptyCoProposers());
+            _emptyCoProposers()
+        );
     }
 
     function _voteFor(uint256 pid) internal {
@@ -549,7 +551,8 @@ contract OpenProposalCountTest is Test {
         coProps[0] = ISyndicateGovernor.CoProposer({agent: agent2, splitBps: 2000});
 
         vm.prank(agent);
-        uint256 pid = governor.propose(address(vault),
+        uint256 pid = governor.propose(
+            address(vault),
             address(0),
             "ipfs://collab",
             7 days,
@@ -558,7 +561,8 @@ contract OpenProposalCountTest is Test {
             GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_execCalls()).length),
             _settleCalls(),
             GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_settleCalls()).length),
-            coProps);
+            coProps
+        );
 
         // Sherlock #8: Draft now binds the vault — counter incremented at
         // propose time.
@@ -597,7 +601,8 @@ contract OpenProposalCountTest is Test {
         coProps[0] = ISyndicateGovernor.CoProposer({agent: agent2, splitBps: 2000});
 
         vm.prank(agent);
-        uint256 pid = governor.propose(address(vault),
+        uint256 pid = governor.propose(
+            address(vault),
             address(0),
             "ipfs://collab-reject",
             7 days,
@@ -606,7 +611,8 @@ contract OpenProposalCountTest is Test {
             GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_execCalls()).length),
             _settleCalls(),
             GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_settleCalls()).length),
-            coProps);
+            coProps
+        );
         // Sherlock #8: Draft binds the vault.
         assertEq(governor.openProposalCount(), 1, "Sherlock #8: Draft counted");
 
@@ -635,7 +641,8 @@ contract OpenProposalCountTest is Test {
         coProps[0] = ISyndicateGovernor.CoProposer({agent: agent2, splitBps: 2000});
 
         vm.prank(agent);
-        uint256 pid = governor.propose(address(vault),
+        uint256 pid = governor.propose(
+            address(vault),
             address(0),
             "ipfs://draft-emerg",
             7 days,
@@ -644,7 +651,8 @@ contract OpenProposalCountTest is Test {
             GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_execCalls()).length),
             _settleCalls(),
             GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_settleCalls()).length),
-            coProps);
+            coProps
+        );
         // Sherlock #8: Draft binds the vault.
         assertEq(governor.openProposalCount(), 1, "Sherlock #8: Draft counted");
         assertEq(
@@ -666,7 +674,8 @@ contract OpenProposalCountTest is Test {
         // Liveness regression: a fresh `propose` must succeed. Pre-fix this
         // reverted `VaultHasOpenProposal` because the counter stayed at 1.
         vm.prank(agent);
-        uint256 pid2 = governor.propose(address(vault),
+        uint256 pid2 = governor.propose(
+            address(vault),
             address(0),
             "ipfs://draft-emerg-2",
             7 days,
@@ -675,7 +684,8 @@ contract OpenProposalCountTest is Test {
             GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_execCalls()).length),
             _settleCalls(),
             GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_settleCalls()).length),
-            _emptyCoProposers());
+            _emptyCoProposers()
+        );
         assertGt(pid2, pid, "new proposal created post-emergencyCancel");
         assertEq(governor.openProposalCount(), 1, "counter at 1 after fresh propose");
     }
@@ -696,7 +706,8 @@ contract OpenProposalCountTest is Test {
         coProps[0] = ISyndicateGovernor.CoProposer({agent: agent2, splitBps: 2000});
 
         vm.prank(agent);
-        governor.propose(address(vault),
+        governor.propose(
+            address(vault),
             address(0),
             "ipfs://draft-lock",
             7 days,
@@ -705,7 +716,8 @@ contract OpenProposalCountTest is Test {
             GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_execCalls()).length),
             _settleCalls(),
             GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_settleCalls()).length),
-            coProps);
+            coProps
+        );
 
         // openProposalCount = 1; vault's _depositsLocked() returns true.
         assertEq(governor.openProposalCount(), 1, "Draft bumps openProposalCount");

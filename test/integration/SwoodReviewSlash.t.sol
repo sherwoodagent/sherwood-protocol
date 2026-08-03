@@ -280,7 +280,8 @@ contract SwoodReviewSlashTest is Test {
 
     function _propose() internal returns (uint256 proposalId) {
         vm.prank(agent);
-        proposalId = governor.propose(address(vault),
+        proposalId = governor.propose(
+            address(vault),
             address(0),
             "ipfs://swood-review-slash",
             7 days,
@@ -289,7 +290,8 @@ contract SwoodReviewSlashTest is Test {
             GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_execCalls()).length),
             _settleCalls(),
             GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_settleCalls()).length),
-            _emptyCoProposers());
+            _emptyCoProposers()
+        );
     }
 
     // ── The end-to-end test ──

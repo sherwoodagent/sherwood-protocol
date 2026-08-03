@@ -116,7 +116,8 @@ contract PerVaultParamsTest is Test {
 
     function _propose() internal returns (uint256 proposalId) {
         vm.prank(agent);
-        proposalId = governor.propose(address(vault),
+        proposalId = governor.propose(
+            address(vault),
             address(0),
             "ipfs://test",
             7 days,
@@ -125,7 +126,8 @@ contract PerVaultParamsTest is Test {
             GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_noopCalls()).length),
             _noopCalls(),
             GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_noopCalls()).length),
-            new ISyndicateGovernor.CoProposer[](0));
+            new ISyndicateGovernor.CoProposer[](0)
+        );
         vm.warp(vm.getBlockTimestamp() + 1);
     }
 
