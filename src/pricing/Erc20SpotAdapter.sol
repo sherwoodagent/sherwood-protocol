@@ -341,13 +341,26 @@ contract Erc20SpotAdapter is Ownable, IPriceAdapter {
         // open question).
         if (p.venue == numeraire) return (bal, true);
 
-        FeedConfig memory cfg = feedOf[p.venue];
+        // Split out of `value` deliberately: the registry-lookup, freshness,
+        // scale and divergence tail carries enough live locals (a 7-field
+        // memory struct plus five price/decimal pairs) to overflow the EVM
+        // stack under a non-via-IR compile (e.g. `forge coverage`, which does
+        // not instrument via-IR bytecode). Splitting the frame is the fix, not
+        // `via_ir` alone — this contract must build under either pipeline.
+        return _valuePriced(p.venue, bal);
+    }
+
+    /// @dev The registered-token pricing path: feed lookup, live decimals
+    ///      re-check, freshness, scale, and the divergence gate. Called only
+    ///      after `value` has resolved `bal` and ruled out the numeraire.
+    function _valuePriced(address token, uint256 bal) private view returns (uint256, bool) {
+        FeedConfig memory cfg = feedOf[token];
         if (cfg.aggregator == address(0)) return (0, false);
 
         // Live decimals re-check against the registration snapshot: a token or
         // feed proxy upgraded to a different scale would otherwise silently
         // mis-scale NAV by orders of magnitude.
-        (bool okTd, uint256 liveTokenDec) = _readDecimals(p.venue);
+        (bool okTd, uint256 liveTokenDec) = _readDecimals(token);
         if (!okTd || liveTokenDec != cfg.tokenDecimals) return (0, false);
         (bool okFd, uint256 liveFeedDec) = _readDecimals(cfg.aggregator);
         if (!okFd || liveFeedDec != cfg.feedDecimals) return (0, false);
@@ -372,7 +385,7 @@ contract Erc20SpotAdapter is Ownable, IPriceAdapter {
         // and the 200bps fee ceiling cannot cover a stale-mark regime. A mark
         // diverging beyond the bound closes Lane A instead of mispricing it.
         if (cfg.referencePool != address(0)) {
-            (bool okDiv, uint256 divBps) = _divergenceBps(cfg, p.venue, price);
+            (bool okDiv, uint256 divBps) = _divergenceBps(cfg, token, price);
             if (!okDiv || divBps > cfg.maxDivergenceBps) return (0, false);
         }
 
