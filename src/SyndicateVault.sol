@@ -952,11 +952,23 @@ contract SyndicateVault is
     ///
     ///      FLOORED AT ZERO defensively; the counter is a subset of the balance
     ///      the queue holds, so the branch is unreachable today.
+    ///
+    ///      Deliberately a low-level staticcall rather than a typed interface
+    ///      call: `VaultWithdrawalQueue` is not a proxy (plain constructor, no
+    ///      `initialize`, no upgradeability), so a queue deployed before this
+    ///      function existed can never gain the `stampedUnclaimedShares()`
+    ///      selector. A typed call would revert for that legacy pairing, and
+    ///      this sits on `_convertToShares`/`_convertToAssets`, so the revert
+    ///      would brick every deposit, withdraw, preview and fee calc. Missing
+    ///      selector degrades to 0 (today's pre-#92 blended pricing) instead —
+    ///      full remediation for an existing syndicate requires redeploying the
+    ///      vault/queue pair.
     function _pricingSupply() internal view returns (uint256) {
         address q = _withdrawalQueue;
         uint256 supply = totalSupply();
         if (q == address(0)) return supply;
-        uint256 stamped = IVaultWithdrawalQueue(q).stampedUnclaimedShares();
+        (bool ok, bytes memory ret) = q.staticcall(abi.encodeCall(IVaultWithdrawalQueue.stampedUnclaimedShares, ()));
+        uint256 stamped = (ok && ret.length == 32) ? abi.decode(ret, (uint256)) : 0;
         return supply > stamped ? supply - stamped : 0;
     }
 
@@ -1376,7 +1388,7 @@ contract SyndicateVault is
         uint256 mark = _highWaterPricePerShare;
         uint256 pps = pricePerShare();
         if (pps <= mark) return 0;
-        return (pps - mark) * totalSupply() / PPS_SHARES;
+        return (pps - mark) * _pricingSupply() / PPS_SHARES;
     }
 
     /// @inheritdoc ISyndicateVault
@@ -1431,7 +1443,7 @@ contract SyndicateVault is
     ///      an exiter more than a hold-to-settle depositor pays — breaking the
     ///      neutrality this function exists to provide.
     function _exitFees(uint256 shares) private view returns (uint256 mgmtFee, uint256 perfFee) {
-        uint256 supply = totalSupply();
+        uint256 supply = _pricingSupply();
         if (shares == 0 || supply == 0) return (0, 0);
 
         // ── Management: pro-rata of the fund-level accrual to now ──
