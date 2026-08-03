@@ -22,6 +22,19 @@ import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 ///         suite, and pass CI, then silently corrupt every live vault's
 ///         storage on the next upgrade. Nothing pinned this before now.
 ///
+///         RE-BASELINED (issue #54, the SAME day #148 landed): Lane A retired
+///         outright, deleting `_laneALockPid`, `instantExitFeeBps`,
+///         `_interimNetFlow`, and `_crystallizedMgmt`/`_crystallizedPerf` from
+///         the vault's OWN storage. Field deletion (not a same-slot
+///         placeholder) is legal here ONLY because no `SyndicateVault` proxy
+///         is deployed on any chain (design.md "Deployment reality") — the
+///         exact condition #148's own NatSpec required for its "initial
+///         baseline, not re-baseline" framing still held at the moment of
+///         this second edit, so re-baselining rather than placeholder-padding
+///         carries no live-proxy compatibility risk. `__gap` grew
+///         28 -> 31 words to hold the freed slots, so the contract's total
+///         reserved footprint (through slot 47) is unchanged.
+///
 ///         Layout map (linear; every OZ upgradeable base this contract
 ///         inherits — `Initializable`, `ERC4626Upgradeable`,
 ///         `ERC20VotesUpgradeable`/`VotesUpgradeable`, `OwnableUpgradeable`,
@@ -30,26 +43,17 @@ import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 ///         `ReentrancyGuardTransient` contribute none either, so the vault's
 ///         OWN declared storage begins at slot 0, confirmed against
 ///         `forge inspect SyndicateVault storageLayout`):
-///           0  _agents (mapping)             11 _laneALockPid (mapping)
-///           1-2 _agentSet (AddressSet)        12 _agentFeeBpsPlusOne
-///           3  _executorImpl                  13 minBufferBps(u16)/
-///           4-5 _approvedDepositors               minHoldingPeriod(u32)/
-///           6  _openDeposits(bool)/               instantExitFeeBps(u16)
-///              _agentRegistry(address)        14 _interimNetFlow
-///           7  _managementFeeBps              15 lastDepositAt (mapping)
-///           8  _factory                       16 _mgmtAssetSeconds
-///           9  _expectedExecutorCodehash      17 _mgmtBase(u192)/
-///           10 _cachedDecimalsOffset(u8)/          _mgmtLastUpdate(u64)
-///              _withdrawalQueue(address)      18 _highWaterPricePerShare
-///                                              19 _crystallizedMgmt(u128)/
-///                                                  _crystallizedPerf(u128)
-///                                              20..47 __gap[28]
-///
-///         THIS IS AN INITIAL BASELINE, NOT A RE-BASELINE — `chains/4663.json`
-///         records no vault lineage, so pinning the current layout carries no
-///         live-proxy compatibility risk (same "fresh deployment" condition
-///         `check-layout-goldens.sh` already documents for the other four
-///         contracts it guards).
+///           0  _agents (mapping)             11 _agentFeeBpsPlusOne
+///           1-2 _agentSet (AddressSet)        12 minBufferBps(u16)/
+///           3  _executorImpl                      minHoldingPeriod(u32)
+///           4-5 _approvedDepositors           13 lastDepositAt (mapping)
+///           6  _openDeposits(bool)/           14 _mgmtAssetSeconds
+///              _agentRegistry(address)        15 _mgmtBase(u192)/
+///           7  _managementFeeBps                  _mgmtLastUpdate(u64)
+///           8  _factory                       16 _highWaterPricePerShare
+///           9  _expectedExecutorCodehash      17..47 __gap[31]
+///           10 _cachedDecimalsOffset(u8)/
+///              _withdrawalQueue(address)
 ///
 ///         FUTURE CONVENTION (issue #148): new fields are APPEND-ONLY, carved
 ///         from the FRONT of `__gap` — add a pin, never edit one. A REMOVED
@@ -57,7 +61,13 @@ import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 ///         `uint256[1] private __deprecated_x;`) or fold into `__gap`; it must
 ///         NEVER simply be deleted, since deleting a declared field shifts
 ///         every field below it down one slot and corrupts a live proxy's
-///         storage on the next upgrade exactly as a reorder would.
+///         storage on the next upgrade exactly as a reorder would. The
+///         retire-lane-a re-baseline above is the sanctioned one-time
+///         exception this convention itself anticipates, and only while the
+///         "no live proxy" precondition holds — the moment a vault proxy is
+///         deployed on any chain, EVERY future storage change (including
+///         further deletions) must follow the append-only/placeholder rule,
+///         no exceptions.
 contract VaultLayoutPinsTest is Test {
     SyndicateVault vault;
     ERC20Mock asset;
@@ -101,7 +111,6 @@ contract VaultLayoutPinsTest is Test {
         // mocks (no encoded args) match any argument, mirroring
         // `test/SyndicateVault.t.sol`'s setUp.
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(GOV_SENTINEL));
-        vm.mockCall(address(this), abi.encodeWithSignature("priceRouter()"), abi.encode(address(0)));
         vm.mockCall(GOV_SENTINEL, abi.encodeWithSignature("getActiveProposal()"), abi.encode(uint256(0)));
         vm.mockCall(GOV_SENTINEL, abi.encodeWithSignature("openProposalCount()"), abi.encode(uint256(0)));
     }
@@ -228,104 +237,76 @@ contract VaultLayoutPinsTest is Test {
         assertEq(vault.withdrawalQueue(), QUEUE_SENTINEL);
     }
 
-    // ==================== 11: _laneALockPid ====================
-
-    /// @notice No getter exists (the field backs an internal-only check), so
-    ///         this is pinned through externally OBSERVABLE behavior rather
-    ///         than a bare `vm.store`/`vm.load` round-trip: lock a holder via
-    ///         the derived slot, make the active proposal match the locked
-    ///         pid, and prove `requestRedeem` reverts `SharesLocked` — i.e.
-    ///         the CONTRACT, not just this test, reads the lock from slot 11.
-    function test_layout_laneALockPidPinnedToSlot11() public {
-        uint256 pid = 42;
-        bytes32 derived = keccak256(abi.encode(LP_SENTINEL, uint256(11)));
-        vm.store(address(vault), derived, bytes32(pid));
-
-        vault.setWithdrawalQueue(QUEUE_SENTINEL);
-        vm.mockCall(GOV_SENTINEL, abi.encodeWithSignature("getActiveProposal()"), abi.encode(pid));
-
-        vm.prank(LP_SENTINEL);
-        vm.expectRevert(ISyndicateVault.SharesLocked.selector);
-        vault.requestRedeem(1, LP_SENTINEL);
-    }
-
-    // ==================== 12: _agentFeeBpsPlusOne ====================
+    // ==================== 11: _agentFeeBpsPlusOne ====================
 
     /// @notice Stored offset-by-one (0 = unset ⇒ default 5%); pin the raw
     ///         `bps + 1` encoding, not just the getter's un-offset view.
-    function test_layout_agentFeeBpsPlusOnePinnedToSlot12() public {
+    ///         Slot 11 (was 12 pre-retire-lane-a): `_laneALockPid`, the field
+    ///         that used to occupy slot 11, was deleted whole (issue #54).
+    function test_layout_agentFeeBpsPlusOnePinnedToSlot11() public {
         uint256 bps = 1_234;
-        assertEq(_slot(12), bytes32(0), "slot 12 starts unset");
+        assertEq(_slot(11), bytes32(0), "slot 11 starts unset");
         vm.prank(OWNER_SENTINEL);
         vault.setAgentFeeBps(bps);
-        assertEq(_slot(12), bytes32(bps + 1), "slot 12: _agentFeeBpsPlusOne (offset-by-one)");
+        assertEq(_slot(11), bytes32(bps + 1), "slot 11: _agentFeeBpsPlusOne (offset-by-one)");
         assertEq(vault.agentFeeBps(), bps);
     }
 
-    // ==================== 13: minBufferBps / minHoldingPeriod / instantExitFeeBps ====================
+    // ==================== 12: minBufferBps / minHoldingPeriod ====================
 
-    /// @notice Three-way packed slot: `minBufferBps` (uint16, offset 0) and
-    ///         `instantExitFeeBps` (uint16, offset 6) each have a real owner
-    ///         setter; `minHoldingPeriod` (uint32, offset 2) has none — it is
-    ///         declared but "not yet exposed" (see its natspec) — so it is
-    ///         pinned via `vm.store` at the compiler-reported offset, checked
-    ///         alongside the other two so a slot/offset mistake on any of the
-    ///         three would corrupt a sibling and fail this assert.
-    function test_layout_packedBufferHoldingExitFeeSlot13() public {
+    /// @notice Two-way packed slot: `minBufferBps` (uint16, offset 0) has a
+    ///         real owner setter; `minHoldingPeriod` (uint32, offset 2) has
+    ///         none — it is declared but "not yet exposed" (see its natspec)
+    ///         — so it is pinned via `vm.store` at the compiler-reported
+    ///         offset, checked alongside the other so a slot/offset mistake
+    ///         on either would corrupt its sibling and fail this assert.
+    ///         Slot 12 (was 13 pre-retire-lane-a, minus the third packed
+    ///         field `instantExitFeeBps`, deleted whole with the rest of the
+    ///         exit-fee crystallization system — issue #54).
+    function test_layout_packedBufferHoldingSlot12() public {
         uint16 minBuffer = 1_234; // <= MAX_MIN_BUFFER_BPS (5_000)
-        uint16 exitFee = 150; // <= MAX_INSTANT_EXIT_FEE_BPS (200)
         uint32 holdingPeriod = 777;
 
         vm.prank(OWNER_SENTINEL);
         vault.setMinBufferBps(minBuffer);
-        vm.prank(OWNER_SENTINEL);
-        vault.setInstantExitFeeBps(exitFee);
 
-        bytes32 packed = bytes32(uint256(minBuffer) | (uint256(holdingPeriod) << 16) | (uint256(exitFee) << 48));
-        vm.store(address(vault), bytes32(uint256(13)), packed);
+        bytes32 packed = bytes32(uint256(minBuffer) | (uint256(holdingPeriod) << 16));
+        vm.store(address(vault), bytes32(uint256(12)), packed);
 
-        assertEq(_slot(13), packed, "slot 13: minBufferBps / minHoldingPeriod / instantExitFeeBps");
+        assertEq(_slot(12), packed, "slot 12: minBufferBps / minHoldingPeriod");
         assertEq(vault.minBufferBps(), minBuffer, "minBufferBps getter disagrees with raw slot");
-        assertEq(vault.instantExitFeeBps(), exitFee, "instantExitFeeBps getter disagrees with raw slot");
     }
 
-    // ==================== 14: _interimNetFlow ====================
-
-    /// @notice Only mutated mid-proposal (Lane A deposit / locked withdraw);
-    ///         `vm.store` + the `interimNetFlow()` getter cross-checks that
-    ///         the assumed slot is the one the contract itself reads from.
-    function test_layout_interimNetFlowPinnedToSlot14() public {
-        int256 flow = -12_345;
-        vm.store(address(vault), bytes32(uint256(14)), bytes32(uint256(flow)));
-        assertEq(_slot(14), bytes32(uint256(flow)), "slot 14: _interimNetFlow");
-        assertEq(vault.interimNetFlow(), flow, "interimNetFlow() getter disagrees with raw slot");
-    }
-
-    // ==================== 15: lastDepositAt ====================
+    // ==================== 13: lastDepositAt ====================
 
     /// @notice No getter — like `minHoldingPeriod`, declared but reserved for
     ///         future instant-exit logic and read by nothing today. Pinned by
     ///         `vm.store`/`vm.load` self-consistency at the derived slot; the
     ///         ceiling of what is provable for a field nothing yet reads.
-    function test_layout_lastDepositAtPinnedToSlot15() public {
+    ///         Slot 13 (was 15 pre-retire-lane-a; `_interimNetFlow`, the field
+    ///         that used to occupy slot 14, was deleted whole — issue #54).
+    function test_layout_lastDepositAtPinnedToSlot13() public {
         uint40 ts = 1_700_000_000;
-        bytes32 derived = keccak256(abi.encode(LP_SENTINEL, uint256(15)));
+        bytes32 derived = keccak256(abi.encode(LP_SENTINEL, uint256(13)));
         vm.store(address(vault), derived, bytes32(uint256(ts)));
-        assertEq(vm.load(address(vault), derived), bytes32(uint256(ts)), "slot 15: lastDepositAt base slot moved");
+        assertEq(vm.load(address(vault), derived), bytes32(uint256(ts)), "slot 13: lastDepositAt base slot moved");
     }
 
-    // ==================== 16-18: management accrual + high-water mark ====================
+    // ==================== 14-16: management accrual + high-water mark ====================
 
     /// @notice Real values, not `vm.store`: an approved LP deposit seeds
-    ///         `_highWaterPricePerShare` (slot 18) via `_initHighWaterMarkIfUnset`,
+    ///         `_highWaterPricePerShare` (slot 16) via `_initHighWaterMarkIfUnset`,
     ///         and the governor-only `startManagementAccrual` stamps
-    ///         `_mgmtAssetSeconds` (slot 16, zeroed) and the packed
-    ///         `_mgmtBase`/`_mgmtLastUpdate` (slot 17) from live `totalAssets()`.
+    ///         `_mgmtAssetSeconds` (slot 14, zeroed) and the packed
+    ///         `_mgmtBase`/`_mgmtLastUpdate` (slot 15) from live `totalAssets()`.
     ///         Withdrawal queue is deliberately NOT set yet in this test — it
     ///         would make `totalAssets()`'s `reservedQueueAssets()` call
     ///         revert against a codeless sentinel, which `_stampMgmtBase`
     ///         would silently swallow into its balance-only fallback branch
     ///         and defeat the point of pinning the primary branch's value.
+    ///         Slots 14-16 (were 16-18 pre-retire-lane-a; issue #54 deleted
+    ///         two fields ahead of this trio: `_laneALockPid`,
+    ///         `instantExitFeeBps`, `_interimNetFlow`).
     function test_layout_managementAccrualAndHighWaterMarkSlots() public {
         vm.prank(OWNER_SENTINEL);
         vault.approveDepositor(LP_SENTINEL);
@@ -337,47 +318,33 @@ contract VaultLayoutPinsTest is Test {
 
         // The first deposit seeds the high-water mark at the post-deposit price.
         uint256 pps = vault.pricePerShare();
-        assertEq(_slot(18), bytes32(pps), "slot 18: _highWaterPricePerShare");
+        assertEq(_slot(16), bytes32(pps), "slot 16: _highWaterPricePerShare");
         assertEq(vault.highWaterPricePerShare(), pps);
 
         vm.prank(GOV_SENTINEL);
         vault.startManagementAccrual();
 
-        assertEq(_slot(16), bytes32(0), "slot 16: _mgmtAssetSeconds (freshly zeroed)");
+        assertEq(_slot(14), bytes32(0), "slot 14: _mgmtAssetSeconds (freshly zeroed)");
         assertEq(vault.managementAssetSeconds(), 0);
 
         uint256 base = vault.totalAssets();
         assertEq(base, DEPOSIT_ASSETS, "sanity: idle float equals the deposit with no fees/queue yet");
-        bytes32 packed17 = bytes32(base | (block.timestamp << 192));
-        assertEq(_slot(17), packed17, "slot 17: _mgmtBase / _mgmtLastUpdate");
+        bytes32 packed15 = bytes32(base | (block.timestamp << 192));
+        assertEq(_slot(15), packed15, "slot 15: _mgmtBase / _mgmtLastUpdate");
         assertTrue(vault.isAccruingManagementFee(), "_mgmtLastUpdate getter disagrees with raw slot");
     }
 
-    // ==================== 19: _crystallizedMgmt / _crystallizedPerf ====================
+    // ==================== 17-47: __gap ====================
 
-    /// @notice Reaching this pair through the real exit-fee-crystallization
-    ///         path needs a full Lane A live-NAV fixture (PriceRouter, active
-    ///         strategy); `vm.store` + the dedicated getters
-    ///         (`crystallizedMgmt()`/`crystallizedPerf()`) is the same
-    ///         trade-off documented in this change's design.md.
-    function test_layout_crystallizedFeesPinnedToSlot19() public {
-        uint128 mgmt = 12_345;
-        uint128 perf = 67_890;
-        vm.store(address(vault), bytes32(uint256(19)), bytes32(uint256(mgmt) | (uint256(perf) << 128)));
-
-        assertEq(vault.crystallizedMgmt(), mgmt, "crystallizedMgmt() getter disagrees with raw slot");
-        assertEq(vault.crystallizedPerf(), perf, "crystallizedPerf() getter disagrees with raw slot");
-    }
-
-    // ==================== 20-47: __gap ====================
-
-    /// @notice The reserved gap starts immediately after `_crystallizedPerf`
-    ///         (slot 19) and spans 28 words. Both boundary words must be
-    ///         unwritten in a fresh proxy — if a field were appended without
-    ///         shrinking the gap, or inserted above, one of these would hold
-    ///         data.
-    function test_layout_gapStartsAtSlot20() public view {
-        assertEq(_slot(20), bytes32(0), "slot 20: __gap[0] must be unused");
-        assertEq(_slot(47), bytes32(0), "slot 47: __gap[27] (last word) must be unused");
+    /// @notice The reserved gap starts immediately after `_highWaterPricePerShare`
+    ///         (slot 16) and spans 31 words (grown from 28 — issue #54 — to
+    ///         hold the three deleted-field slots, keeping the contract's
+    ///         total reserved footprint through slot 47 unchanged). Both
+    ///         boundary words must be unwritten in a fresh proxy — if a field
+    ///         were appended without shrinking the gap, or inserted above,
+    ///         one of these would hold data.
+    function test_layout_gapStartsAtSlot17() public view {
+        assertEq(_slot(17), bytes32(0), "slot 17: __gap[0] must be unused");
+        assertEq(_slot(47), bytes32(0), "slot 47: __gap[30] (last word) must be unused");
     }
 }

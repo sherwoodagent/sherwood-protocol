@@ -116,7 +116,7 @@ contract VaultBatchQueueTargetsLifecycleTest is Test {
         governor = SyndicateGovernor(address(new ERC1967Proxy(address(govImpl), govInit)));
 
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
-        // Lane A off (no PriceRouter) — exercises the async Lane B queue paths.
+        // Inert post-retirement (issue #54): nothing calls `priceRouter()` anymore.
         vm.mockCall(address(this), abi.encodeWithSignature("priceRouter()"), abi.encode(address(0)));
 
         usdc.mint(victim, 60_000e6);

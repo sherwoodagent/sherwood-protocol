@@ -10,7 +10,7 @@ import {UniswapSwapAdapter} from "../../src/adapters/UniswapSwapAdapter.sol";
  * @notice Targeted redeploy of the fixed `SynthraQuoterV2Shim` + its
  *         `UniswapSwapAdapter` on Robinhood L2 testnet (chain 46630).
  *
- *         Only these two contracts are redeployed — the core stack, PriceRouter,
+ *         Only these two contracts are redeployed — the core stack,
  *         PortfolioStrategy template, and StrategyFactory are untouched. The
  *         freshly-deployed strategy clones read the adapter via the vault/strategy
  *         wiring, so patching `UNISWAP_SWAP_ADAPTER` here is sufficient for new

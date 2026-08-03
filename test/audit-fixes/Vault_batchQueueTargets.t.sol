@@ -274,11 +274,11 @@ contract VaultBatchQueueTargetsTest is Test {
     }
 
     /// @notice ADAPTERS STAY REACHABLE — the regression that matters most.
-    ///         `BaseStrategy.execute` / `settle` / `withdrawTo` are `onlyVault`
-    ///         too, so they are satisfied by the very same delegatecall
-    ///         credential that made the queue reachable. But they are the
-    ///         LEGITIMATE batch surface: a denylist that caught them would break
-    ///         every honest proposal, which is worse than the hole it closed.
+    ///         `BaseStrategy.execute` / `settle` are `onlyVault` too, so they
+    ///         are satisfied by the very same delegatecall credential that made
+    ///         the queue reachable. But they are the LEGITIMATE batch surface:
+    ///         a denylist that caught them would break every honest proposal,
+    ///         which is worse than the hole it closed.
     ///
     /// @dev    The guard compares `calls[i].target` against exactly two
     ///         addresses and never inspects the callee's own access control, so
@@ -303,14 +303,5 @@ contract VaultBatchQueueTargetsTest is Test {
         vm.prank(MOCK_GOVERNOR);
         vault.executeGovernorBatch(_batch(address(strategy), abi.encodeCall(BaseStrategy.settle, ())), 1);
         assertEq(strategy.settleCount(), 1, "adapter settle() ran through the batch");
-
-        // withdrawTo() — `BaseStrategy`'s default body reverts
-        // `OnDemandExitUnsupported`, and reaching THAT revert is the assertion:
-        // it proves the call cleared the target denylist and the adapter's own
-        // `onlyVault` check before failing on its own terms. A denylisted target
-        // would have reverted `DisallowedBatchTarget` instead, never arriving.
-        vm.prank(MOCK_GOVERNOR);
-        vm.expectRevert(BaseStrategy.OnDemandExitUnsupported.selector);
-        vault.executeGovernorBatch(_batch(address(strategy), abi.encodeCall(BaseStrategy.withdrawTo, (1))), 1);
     }
 }

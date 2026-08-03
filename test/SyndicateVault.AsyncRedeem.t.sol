@@ -12,6 +12,24 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "./mocks/MockAgentRegistry.sol";
 
+/// @dev Test-only harness exposing `_withdraw` directly. Retire-lane-a (#54)
+///      task 3.4 / design Q3: the replacement shortfall check in `_withdraw`
+///      (`if (assets + reserve > float) revert QueueReserveBreached();`) is
+///      unreachable through the public `withdraw`/`redeem` entrypoints in any
+///      honest configuration — `maxWithdraw`/`maxRedeem` read the exact same
+///      `reservedQueueAssets()`/float inputs in the same call and cap `assets`
+///      below `float - reserve` by construction (mathematically, for
+///      `maxRedeem`, via the floor-floor `convertToShares`/`convertToAssets`
+///      roundtrip). This mirrors the pre-existing `_pullFromStrategy` branch's
+///      own unreachability in a non-Lane-A vault. The harness bypasses the
+///      OZ gate so the replacement line's behaviour can be pinned in
+///      isolation, exactly as `_withdraw`'s NatSpec describes it.
+contract VaultWithdrawHarness is SyndicateVault {
+    function withdrawDirect(address caller, address receiver, address owner_, uint256 assets, uint256 shares) external {
+        _withdraw(caller, receiver, owner_, assets, shares);
+    }
+}
+
 contract VaultAsyncRedeemTest is Test {
     SyndicateVault vault;
     VaultWithdrawalQueue queue;
@@ -367,5 +385,66 @@ contract VaultAsyncRedeemTest is Test {
         uint256 assetsOut = vault.redeem(100, alice, alice);
         assertEq(assetsOut, 0, "dust burn yields 0 assets");
         assertEq(vault.balanceOf(alice), 0, "dust shares burned cleanly");
+    }
+
+    // ── Retire-lane-a (#54) task 3.4: behaviour-preservation pins ──
+
+    /// @notice Re-pins the property the deleted
+    ///         `test_maxWithdraw_zeroStrategyCapacity_whenLaneAOff` guarded:
+    ///         while a proposal is active, both instant-exit views are zero
+    ///         and every exit must route through the Lane B queue
+    ///         (`requestRedeem`), regardless of idle float.
+    function test_maxWithdrawAndMaxRedeem_zeroDuringActiveProposal() public {
+        vm.prank(alice);
+        vault.deposit(1_000e6, alice);
+
+        // Plenty of idle float sits in the vault — proves the zero return is
+        // driven by the lock, not by a float shortfall.
+        assertGt(usdc.balanceOf(address(vault)), 0, "test invariant: float present");
+
+        _setProposalActive(true);
+
+        assertEq(vault.maxWithdraw(alice), 0, "maxWithdraw is 0 during an active proposal");
+        assertEq(vault.maxRedeem(alice), 0, "maxRedeem is 0 during an active proposal");
+    }
+
+    /// @notice Pins the Q3 replacement error surface directly: `_withdraw`'s
+    ///         shortfall check (`assets + reserve > float` ⇒
+    ///         `QueueReserveBreached`) fires exactly as the deleted
+    ///         `_pullFromStrategy` path did for a non-Lane-A vault. Reached via
+    ///         `VaultWithdrawHarness` because `maxWithdraw`/`maxRedeem` (which
+    ///         gate the public `withdraw`/`redeem` entrypoints) provably cap
+    ///         `assets` at `float - reserve`, making this branch unreachable
+    ///         honestly — see the harness's own NatSpec.
+    function test_withdraw_shortfallBeyondFloat_revertsQueueReserveBreached() public {
+        VaultWithdrawHarness harness = new VaultWithdrawHarness();
+        bytes memory initData = abi.encodeCall(
+            SyndicateVault.initialize,
+            (ISyndicateVault.InitParams({
+                    asset: address(usdc),
+                    name: "Harness",
+                    symbol: "H",
+                    owner: owner,
+                    executorImpl: address(executorLib),
+                    openDeposits: true,
+                    agentRegistry: address(agentRegistry),
+                    managementFeeBps: 0
+                }))
+        );
+        ERC1967Proxy proxy = new ERC1967Proxy(address(harness), initData);
+        VaultWithdrawHarness h = VaultWithdrawHarness(payable(address(proxy)));
+
+        // No withdrawal queue bound — `reservedQueueAssets()` reads 0, so
+        // `reserve` is 0 and the whole shortfall is against float alone.
+        vm.prank(alice);
+        usdc.approve(address(h), type(uint256).max);
+        vm.prank(alice);
+        uint256 shares = h.deposit(1_000e6, alice);
+
+        // Request strictly more assets than the vault's float — with no queue
+        // (reserve == 0) and no strategy to pull from, this is exactly the
+        // "shortfall beyond float" the replacement line guards.
+        vm.expectRevert(ISyndicateVault.QueueReserveBreached.selector);
+        h.withdrawDirect(alice, alice, alice, 1_000e6 + 1, shares);
     }
 }

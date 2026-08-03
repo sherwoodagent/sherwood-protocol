@@ -52,8 +52,8 @@ uint256 constant ROBINHOOD_TESTNET_FORK_BLOCK = 88_767_205;
  *           - WOOD is a non-production fixture (18 dec) minted 100M to the
  *             deployer at deploy. On the fork we `deal` WOOD to the test owner
  *             for the V2 owner-bond flow.
- *           - PriceRouter is zero-adapter → PortfolioStrategy is Lane-B-only
- *             (deposits/withdraws never consult a strategy price).
+ *           - Lane A is retired (issue #54): deposits/withdraws never consult a
+ *             strategy price.
  *           - No ENS / ERC-8004 (factory has address(0) for both) → identity
  *             checks are skipped.
  *

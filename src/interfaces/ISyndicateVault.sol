@@ -42,18 +42,13 @@ interface ISyndicateVault {
     error QueueReserveBreached();
     error NotQueue();
     error ZeroAssets();
-    error SharesLocked();
     /// @notice `setAgentFeeBps` was called with `bps > MAX_AGENT_FEE_BPS`.
     error AgentFeeTooHigh();
     /// @notice `setMinBufferBps` was called with `bps > 5_000` (50%).
     error BufferTooHigh();
-    error InstantExitFeeTooHigh();
     /// @notice A governor batch left the vault below the idle floor
     ///         (`reservedQueueAssets + minBufferBps%` of the pre-batch float).
     error BufferBreached();
-    /// @notice The active strategy's `withdrawTo` delivered fewer assets than
-    ///         requested (balance-diff verified vault-side).
-    error UnwindShortfall();
     /// @notice The batch's net asset outflow exceeded the proposal's declared
     ///         maxCapital.
     error MaxNetOutflowExceeded(uint256 netOutflow, uint256 cap);
@@ -157,11 +152,6 @@ interface ISyndicateVault {
     function settleRedeem(uint256 shares, uint256 assets, address to) external; // queue-only
     function settleDeposit(uint256 shares, address to) external; // queue-only
     function onProposalSettled(uint256 proposalId) external; // governor-only
-    /// @notice Signed LP asset flow (Lane A deposits − instant exits) accrued
-    ///         while the current proposal is active. The governor subtracts this
-    ///         from the settlement float delta so mid-proposal flows don't
-    ///         corrupt strategy PnL (and fees aren't charged on principal).
-    function interimNetFlow() external view returns (int256);
 
     // ── Management-fee accrual (two-number fee model) ──
 
@@ -205,46 +195,6 @@ interface ISyndicateVault {
     /// @notice Governor-only: advance the mark to the current price per share.
     ///         Monotonic — a loss leaves it unchanged.
     function ratchetHighWaterMark() external;
-
-    // ── Exit-time fee crystallization ──
-
-    /// @notice Emitted when an instant exit pays its accrued fees on the way out.
-    event ExitFeesCrystallized(address indexed owner, uint256 shares, uint256 mgmtFee, uint256 perfFee);
-
-    /// @notice Management fees taken from instant exiters, awaiting payout at
-    ///         the next settlement. Excluded from `totalAssets()`.
-    function crystallizedMgmt() external view returns (uint256);
-
-    /// @notice Performance fees taken from instant exiters, awaiting payout.
-    ///         Excluded from `totalAssets()`.
-    function crystallizedPerf() external view returns (uint256);
-
-    /// @notice Fees `shares` would owe on an instant exit right now. Zero
-    ///         outside a Lane A window — a queue exit bears its share through
-    ///         the post-settlement price instead.
-    function previewExitFees(uint256 shares) external view returns (uint256 mgmtFee, uint256 perfFee);
-
-    /// @notice Governor-only: release parked management fees for payout.
-    function consumeCrystallizedMgmt() external returns (uint256 amount);
-
-    /// @notice Governor-only: release parked performance fees for payout. Call
-    ///         only after `aboveHighWaterMark()` has been read — releasing
-    ///         raises `totalAssets()` and would inflate that base.
-    function consumeCrystallizedPerf() external returns (uint256 amount);
-
-    // ── Early-exit penalty ──
-
-    /// @notice Emitted when the owner changes the early-exit penalty rate.
-    event InstantExitFeeUpdated(uint16 bps);
-
-    /// @notice Early-exit penalty in basis points of the portion of an instant
-    ///         exit that had to be pulled back from the strategy. Accrues to
-    ///         the vault — the depositors who stay — never to a fee recipient.
-    function instantExitFeeBps() external view returns (uint16);
-
-    /// @notice Owner-only: set the early-exit penalty. Bounded by
-    ///         `MAX_INSTANT_EXIT_FEE_BPS`.
-    function setInstantExitFeeBps(uint16 bps) external;
 
     // ── Rescue ──
     function rescueEth(address payable to, uint256 amount) external;

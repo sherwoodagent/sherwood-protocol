@@ -2,7 +2,6 @@
 pragma solidity 0.8.28;
 
 import {IStrategy} from "../interfaces/IStrategy.sol";
-import {Position} from "../interfaces/IPriceRouter.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
@@ -35,7 +34,6 @@ abstract contract BaseStrategy is IStrategy {
     error AlreadyExecuted();
     error AlreadySettled();
     error ZeroAddress();
-    error OnDemandExitUnsupported();
 
     // ── State ──
     enum State {
@@ -122,27 +120,6 @@ abstract contract BaseStrategy is IStrategy {
     /// @notice Current lifecycle state
     function state() external view returns (State) {
         return _state;
-    }
-
-    /// @inheritdoc IStrategy
-    /// @dev Default: no instant-priceable positions (queue-only / Lane B).
-    ///      Strategies whose positions the PriceRouter can value override this.
-    function positions() external view virtual returns (Position[] memory) {
-        return new Position[](0);
-    }
-
-    /// @inheritdoc IStrategy
-    /// @dev Default: no on-demand exit — instant withdrawals are served from
-    ///      vault float only; excess routes to the Lane B queue. Strategies
-    ///      with venue-liquid positions (e.g. Moonwell supply) override both
-    ///      this and `withdrawTo`.
-    function availableLiquidity() external view virtual returns (uint256) {
-        return 0;
-    }
-
-    /// @inheritdoc IStrategy
-    function withdrawTo(uint256) external virtual onlyVault {
-        revert OnDemandExitUnsupported();
     }
 
     // ── Internal helpers ──
