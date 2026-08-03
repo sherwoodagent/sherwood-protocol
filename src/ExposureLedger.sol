@@ -1335,8 +1335,12 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     }
 
     /// @inheritdoc IExposureLedger
-    /// @dev Spec §3.3a: execution requires the covering approvers' AGGREGATE
-    ///      bond to meet the proposal's coverage. Each approver contributes
+    /// @dev Spec §3.3a: measures whether the covering approvers' AGGREGATE
+    ///      bond meets the proposal's coverage, returning the raised and
+    ///      required figures instead of gating all-or-nothing (issue #27) —
+    ///      the caller derives a coverage-proportional effective capital from
+    ///      the ratio, rather than being refused outright on a shortfall.
+    ///      Each approver contributes
     ///      `min(what it committed at vote time, what its bond is worth NOW)`:
     ///
     ///        - the committed leg is what makes the aggregate meaningful — a
@@ -1356,15 +1360,22 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///
     ///      Zero committed coverage ALWAYS reverts, even at zero required
     ///      coverage — a tier-gated proposal requires an identified signer.
-    ///      Called by `SyndicateGovernor.executeProposal` for proposals with
-    ///      `envelopeTier >= quorumTierThreshold`.
+    ///      A NONZERO-but-partial aggregate no longer reverts (issue #27): it
+    ///      returns `(coverageRaisedUsd, requiredCoverageUsd)` so the governor
+    ///      can size execution to the coverage actually raised instead of
+    ///      blocking it outright. Called by `SyndicateGovernor.executeProposal`
+    ///      for proposals with `envelopeTier >= quorumTierThreshold`.
     ///
-    /// @dev THIS IS AN ELIGIBILITY FLOOR, NOT AN INDEMNITY. The inequality
-    ///      `Σ min(live_i, reserved_i) >= needUsd` answers "are these approvers
-    ///      bonded enough to be trusted with this tier?" — it does NOT promise
+    /// @dev THIS IS A COVERAGE MEASUREMENT WITH A ZERO FLOOR, NOT AN INDEMNITY
+    ///      (issue #27 reframe of the prior "eligibility floor" framing). The
+    ///      returned `coverageRaisedUsd` answers "how much bonded conviction
+    ///      stands behind this proposal right now?" — it does NOT promise
     ///      that a later slash recovers the loss, and nothing downstream tries
     ///      to. Slash proceeds are burned, not paid to anyone harmed, and the
-    ///      protocol makes no compensation promise to depositors.
+    ///      protocol makes no compensation promise to depositors. Below full
+    ///      coverage the caller sizes execution to the fraction actually
+    ///      raised instead of refusing outright; only a raised aggregate of
+    ///      exactly zero is treated as no signer at all and reverts.
     ///
     ///      Read `requiredCoverage` accordingly: it is the price of admission
     ///      to a tier, expressed in the same dollars the loss would be, because
@@ -1384,10 +1395,12 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      value?) rather than a solvency one.
     ///
     ///      Zero committed coverage still ALWAYS reverts, even at zero required
-    ///      coverage. That rule survives the reframe unchanged: R1 wants an
-    ///      identified, bonded signer behind anything tier-gated into this
-    ///      check, and an unbonded approver is exactly what the punitive slash
-    ///      has no grip on.
+    ///      coverage. That rule survives BOTH reframes (the burn, and #27's
+    ///      partial-sizing change) unchanged: R1 wants an identified, bonded
+    ///      signer behind anything tier-gated into this check, and an
+    ///      unbonded approver is exactly what the punitive slash has no grip
+    ///      on. A nonzero-but-partial aggregate is a different case entirely —
+    ///      see the return-instead-of-revert framing above.
     ///
     /// @dev LETS `NoWoodPrice` PROPAGATE, deliberately. This gate runs at
     ///      execution, where reverting is the safe direction: with no source
@@ -1430,8 +1443,9 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     function requireApproveQuorum(address governor, uint256 proposalId, address asset, uint256 requiredCoverage)
         external
         view
+        returns (uint256 coverageRaisedUsd, uint256 requiredCoverageUsd)
     {
-        uint256 needUsd = coverageUsd(asset, requiredCoverage);
+        requiredCoverageUsd = coverageUsd(asset, requiredCoverage);
         bytes32 key = _reviewKey(governor, proposalId);
         address[] storage approvers = _approversOf[key];
         uint256 n = approvers.length;
@@ -1461,11 +1475,16 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
             // SHARED, NOT MERELY LIVE (Pashov re-audit of #158, finding 1) —
             // see the `@dev` block above this function.
             haveUsd += _sharedSlashableUsd(g, reserved, priceX8, 0, _liveBookedUsd[g]);
-            if (haveUsd >= needUsd) return; // early exit
+            if (haveUsd >= requiredCoverageUsd) return (haveUsd, requiredCoverageUsd); // early exit; surplus may be clamped
         }
-        // The loop early-returns on success — reaching here means the covering
-        // approvers' aggregate never met the required coverage.
-        revert InsufficientApproveCoverage();
+        // The loop early-returns on full coverage — reaching here means the
+        // covering approvers' aggregate fell short of `requiredCoverageUsd`.
+        // A genuinely zero aggregate is still an error (R1's identified-
+        // bonded-signer floor, issue #27 design D2); any nonzero-but-partial
+        // aggregate is reported to the caller instead of reverting, so
+        // execution can size to the coverage actually raised.
+        if (haveUsd == 0) revert InsufficientApproveCoverage();
+        return (haveUsd, requiredCoverageUsd);
     }
 
     /// @inheritdoc IExposureLedger

@@ -162,6 +162,19 @@ interface ISyndicateGovernor {
         ///         (falls back to the live slot, preserving pre-pin behavior
         ///         including the `ExposureLedgerUnset` fail-closed path).
         address proposerBondLedger;
+        /// @notice Coverage-proportional net-outflow ceiling (issue #27),
+        ///         derived and stored ONCE at execute, immutable thereafter:
+        ///         `maxCapital` when the approve-quorum gate did not run or
+        ///         raised coverage at/above `requiredCoverage`'s USD price,
+        ///         else `floor(maxCapital * coverageRaisedUsd /
+        ///         requiredCoverageUsd)`. `settleProposal` reuses this exact
+        ///         value rather than recomputing — a live recompute could cap
+        ///         the unwind below the size legitimately deployed at
+        ///         execution (owner decision 2026-08-03, option A; design.md
+        ///         D4). Zero before execution; written on EVERY execute path
+        ///         so a stored zero never means "unset" on an `Executed`
+        ///         proposal.
+        uint256 effectiveMaxCapital;
     }
 
     struct CoProposer {
@@ -403,6 +416,20 @@ interface ISyndicateGovernor {
     event VoteCast(uint256 indexed proposalId, address indexed voter, VoteType support, uint256 weight);
 
     event ProposalExecuted(uint256 indexed proposalId, address indexed vault, uint256 capitalSnapshot);
+
+    /// @notice The coverage-proportional effective capital derived at
+    ///         execute (issue #27). `coverageRaisedUsd`/`requiredCoverageUsd`
+    ///         are both zero when the approve-quorum gate did not run (no
+    ///         ledger wired, zero `requiredCoverage`, or tier below the
+    ///         quorum threshold) — `effectiveMaxCapital` equals
+    ///         `declaredMaxCapital` on that path.
+    event EffectiveMaxCapitalSet(
+        uint256 indexed proposalId,
+        uint256 declaredMaxCapital,
+        uint256 effectiveMaxCapital,
+        uint256 coverageRaisedUsd,
+        uint256 requiredCoverageUsd
+    );
 
     event ProposalSettled(
         uint256 indexed proposalId, address indexed vault, int256 pnl, uint256 performanceFee, uint256 duration
@@ -673,6 +700,13 @@ interface ISyndicateGovernor {
     ///         Unambiguous here: `maxCapital == 0` is rejected at propose, so a
     ///         zero `maxCapital` reliably means "no such proposal".
     function getRiskEnvelope(uint256 proposalId) external view returns (uint256 maxCapital, uint16 maxDrawdownBps);
+
+    /// @notice The coverage-proportional effective capital stored at execute
+    ///         (issue #27) — 0 before execution, `maxCapital` on ungated
+    ///         paths, otherwise the coverage-scaled ceiling. `getRiskEnvelope`
+    ///         keeps returning the DECLARED `maxCapital`; this returns what
+    ///         the proposal actually ran (or will run) at.
+    function getEffectiveMaxCapital(uint256 proposalId) external view returns (uint256);
     function vault() external view returns (address);
     function protocolConfig() external view returns (address);
 
