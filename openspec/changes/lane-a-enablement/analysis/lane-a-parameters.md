@@ -206,15 +206,42 @@ adapter; this analysis makes the sanity gate a **requirement for mainnet**, not 
 option. (A TWAP or last-trade read is acceptable; the gate is a comparator, not a price
 source, so manipulation of the pool can only *close* Lane A — grief, not theft.)
 
-**R1 — residual: float-served exits pay no fee (bounded basis harvest).** Because
-`_exitPenalty` charges only the strategy-pulled portion, a pre-existing LP exiting into
-idle float is paid at the mark with zero fee and zero unwind — profit up to `b` per unit
-exited, i.e. ≤ ~100 bps of the float-absorbable amount per divergence episode with G4 in
-place. Entry-side timing is already blocked (`_laneALockPid` locks Lane A entrants until
-settlement; `minHoldingPeriod` storage is reserved for a future cooldown), so the
-attacker must hold pre-committed capital and eat strategy risk to wait for an episode.
-Accepted for v1 with G4 at 100 bps; tightening options if observed in practice: lower
-the gate tolerance, or the two-sided-quote router change (§7).
+**R1 — SUPERSEDED, both premises implemented as fixes.** This paragraph originally
+accepted two residuals for v1: `_exitPenalty` charging only the strategy-pulled
+portion, and entry-side timing being "already blocked" by `_laneALockPid`. Neither
+holds against the shipped code.
+
+The float-scoped exit fee was closed directly: `_exitPenalty` now charges the WHOLE
+exit, unconditionally, whenever Lane A is live — see `SyndicateVault._exitPenalty`.
+A float-served exit no longer pays zero fee.
+
+The entry-side claim was actively FALSE, not merely unhardened, and its own
+parenthetical names the reason it looks true without being true: `_laneALockPid`
+locks entrants "until settlement" — but `SyndicateGovernor.settleProposal` is
+PERMISSIONLESS once `strategyDuration` has elapsed. An entrant does not wait for
+settlement; they trigger it. `deposit → settleProposal → redeem` in ONE
+transaction: the lock expires inside the same call frame that realizes true
+prices, so there is no elapsed time, no strategy risk, and no need for
+pre-committed capital (flash-loanable). The post-settlement exit additionally
+lands in Lane B, paying neither the exit fee this paragraph's own fix relies on
+nor any depth cap. This was RISKLESS, not "hold pre-committed capital and eat
+strategy risk to wait for an episode" as originally assessed — see audit finding
+#14.
+
+Fixed by removing the door rather than pricing it: `SyndicateVault._deposit` now
+reverts `DepositsLocked` for ANY instant deposit while a proposal is open, Lane A
+live or not. Mid-proposal entry routes through `requestDeposit` (the async queue),
+which mints at the realized settlement price and is correctly priced by
+construction — the mechanism this whole finding exploited never starts. See
+`test/fees/InstantEntryDoorClosed.t.sol` for the regression pin.
+
+(Separately, G4 above — "a TWAP or last-trade read is acceptable; manipulation
+of the pool can only *close* Lane A" — undersold the requirement: an
+instantaneous `slot0()`/last-trade read is exactly what let an attacker set the
+gate's own comparison value inside the transaction consuming it, opening it as
+readily as closing it. The shipped adapter reads a TWAP over a fixed window
+(`Erc20SpotAdapter.TWAP_WINDOW`); see audit finding #1. Both corrections are
+dated 2026-08-02, this session.)
 
 **R2 — residual: `maxSlippageBps` is the last-line bound on unwind execution.**
 `PortfolioStrategy` enforces per-leg min-out vs the Chainlink mark

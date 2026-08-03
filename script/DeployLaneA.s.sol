@@ -62,7 +62,7 @@ interface IPortfolioAllocations {
  *           3. seed the spot adapter's feed registry from the parameter table
  *              (feed, maxAge, per-token cap, divergence pool + bound)
  *           4. register both kinds on the router, set the per-kind instant caps
- *           5. set `instantExitFeeBps = 200` on every target vault (G1)
+ *           5. set `instantExitFeeBps = 200` (G1) on every target vault
  *           6. `setLaneAEnabled` LAST — the activation switch, gated behind an
  *              explicit config flag that DEFAULTS TO FALSE. Everything before
  *              it is inert: the router fails closed until the kind is enabled.
@@ -85,6 +85,23 @@ interface IPortfolioAllocations {
  *      haircut is also monotone-increasing (`HaircutCannotDecrease`): a nonzero
  *      value is a ONE-WAY DOOR, so this script refuses rather than "fixes" —
  *      there is no fixing it.
+ * @dev DEPOSIT DIRECTION: no G5, by design. `SyndicateVault._deposit` closes
+ *      the instant lane to entry ENTIRELY while a proposal is open — Lane A
+ *      live or not. Mid-proposal entry always routes through the async
+ *      deposit queue (`requestDeposit`), which mints at the realized
+ *      settlement price and is therefore correctly priced by construction.
+ *      An earlier version of this design tolled instant entry instead of
+ *      closing it (mirroring G1's exit toll): rejected, because the toll would
+ *      have to be re-tuned against G4's divergence bound forever, and it made
+ *      the instant-deposit path economically dead anyway once tolled — the
+ *      free, correctly-priced queue is strictly better for an honest
+ *      depositor. Adversary the closed door forecloses: `settleProposal` is
+ *      permissionless once `strategyDuration` has elapsed, so a mid-proposal
+ *      entrant could deposit, settle and redeem in ONE transaction — the
+ *      `_laneALockPid` lock expires inside the same call frame that realizes
+ *      true prices, and the post-settlement exit is Lane B (no exit fee, no
+ *      depth cap) — riskless, at the G4-tolerated spread, entirely bypassing
+ *      the exit-side defence stack.
  * @dev PRE-FLIGHT G3 (staleness bound): every registered `maxAge` must be at
  *      most 24h — the equity feeds' heartbeat. A larger bound would leave Lane A
  *      open on marks the market has abandoned for longer than a full heartbeat.
@@ -417,9 +434,11 @@ contract DeployLaneA is Script {
         router.setInstantCap(PositionKinds.ERC20_SPOT, cfg.instantCapSpot);
         router.setInstantCap(PositionKinds.MORPHO_BLUE_SUPPLY, cfg.instantCapMorpho);
 
-        // G1: the fee precedes the switch, always.
+        // G1: the exit toll precedes the switch, always.
         for (uint256 i; i < cfg.vaults.length; ++i) {
-            if (deployerOwned[i]) ILaneAVault(cfg.vaults[i]).setInstantExitFeeBps(INSTANT_EXIT_FEE_BPS);
+            if (deployerOwned[i]) {
+                ILaneAVault(cfg.vaults[i]).setInstantExitFeeBps(INSTANT_EXIT_FEE_BPS);
+            }
         }
 
         if (cfg.enableLaneA) {
@@ -474,10 +493,11 @@ contract DeployLaneA is Script {
             if (!deployerOwned[i]) {
                 address v = cfg.vaults[i];
                 console.log("MANUAL (G1): vault %s is owned by %s, not the deployer.", v, ILaneAVault(v).owner());
-                console.log("  The owner MUST call setInstantExitFeeBps(200) BEFORE Lane A is enabled:");
+                console.log("  The owner MUST call this BEFORE Lane A is enabled:");
                 console.log("  target:   %s", v);
                 console.log(
-                    "  calldata: %s", vm.toString(abi.encodeCall(ILaneAVault.setInstantExitFeeBps, (uint16(200))))
+                    "  calldata (G1, exit toll):  %s",
+                    vm.toString(abi.encodeCall(ILaneAVault.setInstantExitFeeBps, (INSTANT_EXIT_FEE_BPS)))
                 );
             }
         }

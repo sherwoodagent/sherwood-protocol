@@ -102,6 +102,13 @@ contract SyndicateVault is
     bytes4 private constant _SEL_TRANSFER = 0xa9059cbb; // transfer(address,uint256)
     bytes4 private constant _SEL_TRANSFER_FROM = 0x23b872dd; // transferFrom(address,address,uint256)
 
+    // ==================== LOCAL ERRORS / EVENTS ====================
+    //
+    // Declared here rather than on `ISyndicateVault` only because the interface
+    // was not in scope for this change. They belong alongside
+    // `InstantExitFeeTooHigh` / `InstantExitFeeUpdated`; promote them in a
+    // follow-up so integrators can decode them from the interface ABI.
+
     // ==================== STORAGE ====================
 
     /// @notice Agent address => agent config
@@ -145,11 +152,22 @@ contract SyndicateVault is
     /// @notice Per-vault async withdrawal queue (set-once at deploy by the factory).
     address private _withdrawalQueue;
 
-    /// @notice Lane A (instant) per-holder lockup: the proposal id whose Lane A
-    ///         entry locked this holder's shares. The holder cannot exit (Lane A
-    ///         redeem or Lane B requestRedeem) while that proposal is still the
-    ///         active one — closes the deposit-low / exit-high intra-proposal MEV.
-    ///         Cleared implicitly when the proposal settles (active != pid).
+    /// @notice DEAD, kept for storage-layout stability: this vault is
+    ///         UUPS-upgradeable and this mapping is not the trailing slot, so
+    ///         removing it would shift every field declared after it — a
+    ///         breaking layout change for any already-deployed proxy, gated by
+    ///         CI's storage-layout check. Do not repurpose this slot; retire it
+    ///         via `__gap` consumption in a dedicated storage-layout change.
+    ///
+    ///         Formerly: the proposal id whose Lane A entry locked a holder's
+    ///         shares, so they could not exit while that proposal was active —
+    ///         closing the deposit-low / exit-high intra-proposal MEV. `_deposit`
+    ///         no longer writes to it (Lane A instant entry was removed, not
+    ///         tolled — see `_deposit`'s natspec, audit finding #14), so every
+    ///         read now sees 0 and `_isLaneALocked` is permanently false. Its
+    ///         three call sites (`_update`, `_laneBOnly`, `requestRedeem`) are
+    ///         therefore fail-safe no-ops, not dead in the sense of being wrong
+    ///         — just no longer reachable in the "true" branch.
     mapping(address holder => uint256 pid) private _laneALockPid;
 
     /// @notice Vault-owner-set agent performance fee, stored offset-by-one so a
@@ -679,12 +697,11 @@ contract SyndicateVault is
     // ==================== OVERRIDES ====================
 
     /// @dev Resolve diamond between ERC20Upgradeable and ERC20VotesUpgradeable.
-    ///      A Lane-A-locked holder cannot move shares out until the proposal
-    ///      settles. Without this the per-holder lock is trivially bypassed by
-    ///      transferring to a fresh (unlocked) address that then instant-redeems
-    ///      at the higher mid-proposal NAV. Mint (`from == 0`) and burn
-    ///      (`to == 0`) are unaffected — burns are gated by `maxRedeem` /
-    ///      `requestRedeem`. `_isLaneALocked` short-circuits on
+    ///      The `_isLaneALocked` guard here is currently a no-op — see that
+    ///      function's natspec — kept as the transfer-side half of a
+    ///      three-call-site lock mechanism that Lane A instant entry no longer
+    ///      arms. Mint (`from == 0`) and burn (`to == 0`) are unaffected — burns
+    ///      are gated by `maxRedeem` / `requestRedeem`. `_isLaneALocked` short-circuits on
     ///      `_laneALockPid[from] == 0`, so non-Lane-A holders pay only an SLOAD.
     function _update(address from, address to, uint256 value)
         internal
@@ -799,11 +816,11 @@ contract SyndicateVault is
         } catch {} // fail-closed: laneA stays false
     }
 
-    /// @dev True while `holder`'s shares are Lane-A-locked — a Lane A entry made
-    ///      during the currently-active proposal. The lock lifts implicitly when
-    ///      that proposal settles (the active proposal id changes / clears), so
-    ///      no timestamp bookkeeping is needed. Bounds the deposit-low / exit-high
-    ///      intra-proposal arb for both Lane A redeem and Lane B requestRedeem.
+    /// @dev PERMANENTLY FALSE: `_laneALockPid` is never written any more (see
+    ///      its storage declaration). Kept — rather than inlined to `false` —
+    ///      so the three call sites' intent stays legible and so a future
+    ///      reintroduction of some lockable Lane A surface has one place to
+    ///      wire into, not three.
     function _isLaneALocked(address holder) private view returns (bool) {
         uint256 p = _laneALockPid[holder];
         return p != 0 && p == _activePid();
@@ -922,23 +939,48 @@ contract SyndicateVault is
         return maxDeposit(receiver);
     }
 
-    /// @dev Instant deposit is allowed outside any open proposal, OR during an
-    ///      Executed proposal when Lane A live-NAV is available (positions priced
-    ///      vault-side by the PriceRouter). Otherwise it reverts and LPs use the
-    ///      async deposit queue (`requestDeposit`), entering at the realized
-    ///      settle price. Auto-delegate to self so shareholders get voting power.
+    /// @dev Instant deposit is allowed ONLY outside an open proposal. While a
+    ///      proposal is open — Pending or Executed, Lane A live or not — entry
+    ///      routes through the async deposit queue (`requestDeposit`), which
+    ///      mints at the realized settle price. Auto-delegate to self so
+    ///      shareholders get voting power. See the body for why the instant
+    ///      door is closed rather than tolled.
     function _deposit(address caller, address receiver, uint256 assets, uint256 shares)
         internal
         override
         whenNotPaused
         nonReentrant
     {
-        (,,, bool laneA) = _laneState();
-        // During an open proposal (Pending..Executed) instant deposits are
-        // closed unless Lane A is live — a depositor mid-lifecycle would
-        // otherwise be pulled into a strategy they never voted on, or mint
-        // against an unrealized NAV.
-        if (_depositsLocked() && !laneA) revert DepositsLocked();
+        // NO INSTANT ENTRY WHILE A PROPOSAL IS OPEN — not even with Lane A
+        // live. Mid-proposal entry routes through the async queue
+        // (`requestDeposit`), which mints at the realized settlement price and
+        // is therefore correctly priced by construction.
+        //
+        // Lane A entry used to be permitted here, priced against the same live
+        // NAV the exit side uses. That was a one-sided door: the divergence
+        // gate deliberately TOLERATES a spread (up to `maxDivergenceBps`)
+        // between the mark and executable value, and every defence against
+        // trading that spread — the instant-exit fee, the per-token depth caps,
+        // `maxSlippageBps` — sits on the EXIT path. Entry paid nothing.
+        //
+        // Adversary, and why the per-holder lockup did not contain it: shares
+        // minted here were locked to the active proposal id, which looked like
+        // it forced the entrant to hold the basket and bear its market risk.
+        // It did not. `SyndicateGovernor.settleProposal` is PERMISSIONLESS once
+        // `strategyDuration` has elapsed, and the lock is keyed to the proposal
+        // being active — so the entrant does not wait for settlement, they
+        // CAUSE it, and the lock expires inside the same call frame that
+        // realizes true prices. deposit → settleProposal → redeem in one
+        // transaction: no elapsed time, no price risk, flash-loanable, and the
+        // exit leg lands post-settlement where no instant-exit fee applies.
+        // Worse than a transfer from remaining LPs: the harvested spread books
+        // as settlement PnL, so a performance fee is charged on it and holders
+        // lose MORE than the entrant gains.
+        //
+        // Closing the door beats pricing it. A toll would have to be re-tuned
+        // against `maxDivergenceBps` forever and would make this path
+        // economically dead anyway, since the queue is free and better priced.
+        if (_depositsLocked()) revert DepositsLocked();
         _requireApprovedDepositor(receiver);
         super._deposit(caller, receiver, assets, shares);
         // The fund's first shares establish the high-water mark. Cannot be done
@@ -946,20 +988,11 @@ contract SyndicateVault is
         _initHighWaterMarkIfUnset();
 
         // Auto-delegation happens in `_update` (every receipt path).
-
-        // A Lane A entry locks the receiver's shares until this proposal
-        // settles — closes the deposit-low / exit-high intra-proposal MEV.
-        if (laneA) {
-            _laneALockPid[receiver] = _activePid();
-            // Mid-proposal principal in — excluded from settlement PnL so
-            // performance fees are never charged on depositor principal.
-            _interimNetFlow += int256(assets);
-            // The management fee IS charged on it, for the time it is present:
-            // close the interval at the old base, restamp at the new one. A late
-            // depositor therefore pays only for the days their capital was in
-            // the fund.
-            _accrueManagementFee();
-        }
+        //
+        // No `_laneALockPid` write, no `_interimNetFlow` credit and no
+        // management-fee restamp: all three existed to make a mid-proposal
+        // Lane A entry safe, and no deposit can reach this line while a
+        // proposal is open. `_interimNetFlow` still tracks instant EXITS.
     }
 
     /// @dev `maxWithdraw` / `maxRedeem` are the canonical lock gate (OZ ERC4626

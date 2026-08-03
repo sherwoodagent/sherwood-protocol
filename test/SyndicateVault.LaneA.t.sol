@@ -27,9 +27,11 @@ contract MockLaneARouter {
 
 /// @title VaultLaneATest
 /// @notice Unit tests for the Lane A instant-lane on the vault: live-NAV pricing
-///         via the PriceRouter during a proposal, instant entry/exit when
-///         available, fail-closed to Lane B otherwise, and the G1 per-share
-///         lockup (Lane A entry → no exit until the proposal settles).
+///         via the PriceRouter during a proposal, instant EXIT for existing
+///         holders when available, and fail-closed to Lane B otherwise.
+///         Instant entry is closed for the life of any open proposal
+///         (finding #14 / Option B), so the G1 per-share lockup this suite
+///         used to exercise on the entry side is now unreachable.
 contract VaultLaneATest is Test {
     SyndicateVault vault;
     VaultWithdrawalQueue queue;
@@ -116,19 +118,18 @@ contract VaultLaneATest is Test {
 
     // ── instant deposit ──
 
-    function test_deposit_instant_duringLaneA() public {
+    /// @notice Instant entry is closed for the whole life of any open
+    ///         proposal, Lane A live or not (finding #14 / Option B) — the
+    ///         door never opens for bob to mint at live NAV in the first
+    ///         place.
+    function test_deposit_reverts_duringLaneA() public {
         vm.prank(alice);
         vault.deposit(1_000e6, alice);
         _lockLaneA(500e6);
 
-        // Bob deposits instantly at live NAV during the proposal.
         vm.prank(bob);
-        uint256 shares = vault.deposit(300e6, bob);
-        assertGt(shares, 0, "instant Lane A deposit mints");
-        // Bob's shares are Lane-A-locked: he can't queue an exit this proposal.
-        vm.prank(bob);
-        vm.expectRevert(ISyndicateVault.SharesLocked.selector);
-        vault.requestRedeem(shares, bob);
+        vm.expectRevert(ISyndicateVault.DepositsLocked.selector);
+        vault.deposit(300e6, bob);
     }
 
     function test_deposit_reverts_whenLockedNoLaneA() public {
@@ -139,52 +140,10 @@ contract VaultLaneATest is Test {
         vault.deposit(1_000e6, alice);
     }
 
-    // ── G1 lockup ──
-
-    function test_laneALock_blocksInstantExit() public {
-        _lockLaneA(0);
-        vm.prank(alice);
-        vault.deposit(1_000e6, alice); // Lane A entry, locked to PID
-        assertEq(vault.maxWithdraw(alice), 0, "locked: no instant withdraw");
-        assertEq(vault.maxRedeem(alice), 0, "locked: no instant redeem");
-    }
-
-    function test_laneALock_liftsAfterSettle() public {
-        _lockLaneA(0);
-        vm.prank(alice);
-        vault.deposit(1_000e6, alice);
-        assertEq(vault.maxRedeem(alice), 0, "locked while proposal active");
-
-        // Proposal settles → active proposal clears → lock lifts.
-        _setLocked(false);
-        assertGt(vault.maxRedeem(alice), 0, "unlocked after settle");
-    }
-
-    /// @notice G1 bypass regression (review #380): a Lane-A-locked holder must not
-    ///         be able to escape the lock by transferring shares to a fresh
-    ///         address that then instant-redeems at the higher mid-proposal NAV.
-    ///         `_update` rejects transfers out of a locked holder.
-    function test_laneALock_blocksTransferBypass() public {
-        address charlie = makeAddr("charlie");
-        vm.prank(alice);
-        vault.deposit(1_000e6, alice); // pre-proposal float
-        _lockLaneA(500e6);
-
-        // Bob enters via Lane A → his shares are locked to this proposal.
-        vm.prank(bob);
-        uint256 shares = vault.deposit(300e6, bob);
-
-        // Bypass attempt: move the locked shares to a fresh (unlocked) address.
-        vm.prank(bob);
-        vm.expectRevert(ISyndicateVault.SharesLocked.selector);
-        vault.transfer(charlie, shares);
-
-        // The lock lifts at settle; the transfer then succeeds.
-        _setLocked(false);
-        vm.prank(bob);
-        vault.transfer(charlie, shares);
-        assertEq(vault.balanceOf(charlie), shares, "transfer allowed after settle");
-    }
+    // ── G1 lockup: dead. `_laneALockPid` can never be written now that no
+    //    deposit reaches the vault while a proposal is open (finding #14 /
+    //    Option B) — see `SyndicateVault._deposit` and `_isLaneALocked`. No
+    //    shares can ever exist in the locked state these tests exercised.
 
     // ── instant exit during Lane A (existing holder, not locked) ──
 

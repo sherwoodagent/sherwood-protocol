@@ -306,13 +306,6 @@ contract VaultInstantLiquidityTest is Test {
 
     // ── Task 5: interim net-flow tracking ──
 
-    function test_interimNetFlow_tracksLaneADeposit() public {
-        _enterAndLock(1_000e6, 900e6, 900e6);
-        vm.prank(bob);
-        vault.deposit(300e6, bob);
-        assertEq(vault.interimNetFlow(), int256(300e6), "deposit tracked");
-    }
-
     function test_interimNetFlow_tracksInstantExit() public {
         _enterAndLock(1_000e6, 900e6, 900e6);
         vm.prank(alice);
@@ -330,8 +323,11 @@ contract VaultInstantLiquidityTest is Test {
 
     function test_interimNetFlow_resetOnSettle() public {
         _enterAndLock(1_000e6, 900e6, 900e6);
-        vm.prank(bob);
-        vault.deposit(300e6, bob);
+        // Deposits are closed for the life of any open proposal (finding #14
+        // / Option B) — only the exit side can populate a nonzero netflow
+        // to reset.
+        vm.prank(alice);
+        vault.withdraw(300e6, alice, alice);
         _setLocked(false); // proposal cleared
         vm.prank(address(governor));
         vault.onProposalSettled(PID);
@@ -339,14 +335,13 @@ contract VaultInstantLiquidityTest is Test {
     }
 
     /// @notice The governor-side formula: float delta minus netflow == true
-    ///         strategy PnL. Break-even strategy + 300e6 mid-proposal deposit
-    ///         + 200e6 instant exit → formula must yield exactly 0.
+    ///         strategy PnL. Break-even strategy + a 200e6 instant exit ->
+    ///         formula must yield exactly 0. (Deposits are closed for the
+    ///         life of any open proposal — finding #14 / Option B — so only
+    ///         the exit side of the flow-exclusion formula is reachable here.)
     function test_settlementPnl_excludesLaneAFlows() public {
         _enterAndLock(1_000e6, 900e6, 900e6);
         uint256 snapshot = 1_000e6; // governor's pre-execute capital snapshot
-
-        vm.prank(bob);
-        vault.deposit(300e6, bob); // principal in — not strategy performance
 
         vm.prank(alice);
         vault.withdraw(200e6, alice, alice); // principal out (float covers it)

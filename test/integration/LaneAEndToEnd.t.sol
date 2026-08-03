@@ -227,18 +227,16 @@ contract LaneAEndToEndTest is Test {
         assertGt(vault.maxWithdraw(alice), 0, "remaining holder can exit at par");
     }
 
-    function test_instantDeposit_duringLaneA_isLockedUntilSettle() public {
+    function test_instantDeposit_duringLaneA_reverts() public {
         _depositExecuteLock();
 
-        // Bob enters instantly at live NAV during the proposal.
+        // Instant entry is closed for the whole life of any open proposal,
+        // Lane A live or not (finding #14 / Option B) — the door never opens
+        // for bob to mint at live NAV in the first place, so there is no
+        // G1 exit-lockup left to observe here.
         vm.prank(bob);
-        uint256 shares = vault.deposit(100e6, bob);
-        assertGt(shares, 0, "instant Lane A entry mints");
-
-        // G1 lockup: no exit (even queued) until the proposal settles.
-        vm.prank(bob);
-        vm.expectRevert(ISyndicateVault.SharesLocked.selector);
-        vault.requestRedeem(shares, bob);
+        vm.expectRevert(ISyndicateVault.DepositsLocked.selector);
+        vault.deposit(100e6, bob);
     }
 
     // ── Lane A closes: stale feed ──
