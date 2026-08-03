@@ -722,4 +722,24 @@ contract TierRegistryTest is Test {
         reg.setAdapterAllowed(adapter, true); // re-grant snapshots the NEW code
         assertTrue(reg.isAdapterAllowed(adapter), "next grant overwrites the stale snapshot with current code");
     }
+
+    /// @notice Issue #40 launch-gate pin: with `submitterBondWood` at its
+    ///         default (0, unset by any deploy path), `certify` must lock
+    ///         nothing and emit no `SubmitterBondLocked` — the unbonded,
+    ///         governance-judged certification path this repo actually
+    ///         deploys today.
+    function test_certifyWithZeroBondLocksNothingAndEmitsNoBondEvent() public {
+        assertEq(reg.submitterBondWood(), 0, "fresh TierRegistry defaults to unbonded");
+
+        vm.recordLogs();
+        vm.prank(owner);
+        reg.certify(target, bytes4(0x40404040), 0, 50, address(0));
+
+        assertEq(reg.totalBondedWood(), 0, "no bond locked when submitterBondWood is 0");
+        // Exactly one event (TierCertified) — SubmitterBondLocked is emitted
+        // ONLY inside the `bondAmount != 0` branch, so its absence here is
+        // equivalent to "the only log is TierCertified".
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        assertEq(logs.length, 1, "certify with a disabled bond must emit only TierCertified, never SubmitterBondLocked");
+    }
 }

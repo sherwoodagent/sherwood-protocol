@@ -100,6 +100,24 @@ contract TierRegistry is Ownable2Step {
     mapping(address adapter => bytes32) private _adapterAllowedCodehash;
 
     IERC20 public wood;
+    /// @dev LAUNCH GATE (issue #40): a non-zero value is inert as a warranty
+    ///      — and imposes a real, currently-unrecoverable cost on adapter
+    ///      submitters — until ALL THREE hold:
+    ///        1. a guard-bypass slash function exists and can reach `_bonds`
+    ///           (the seam is here — `MIN_BOND_RELEASE_DELAY` and the
+    ///           `slash`-referencing comments throughout this file hold the
+    ///           bond long enough for it — but the function itself does not
+    ///           exist yet);
+    ///        2. a seated court can enforce a DISPUTED slash (Plan E) — per
+    ///           issue #25, a disputed challenge currently times out in the
+    ///           accused's favour, so a submitter who disputes keeps the bond
+    ///           regardless of (1);
+    ///        3. third-party adapter submission actually exists, so the bond
+    ///           filters submitters rather than merely deterring the only
+    ///           participant with no revenue from the adapter it warrants.
+    ///      `script/Deploy.s.sol` never calls `setSubmitterBondWood`, so this
+    ///      stays `0` (unbonded, governance-judged certification) at launch —
+    ///      do not enable it from the setter without meeting the gate above.
     uint256 public submitterBondWood;
     uint256 public bondReleaseDelay = 14 days;
     mapping(bytes32 configKey => SubmitterBond) internal _bonds;
