@@ -434,12 +434,6 @@
         "type": "t_address"
       },
       {
-        "label": "selfManagesFees",
-        "slot": "18",
-        "offset": 20,
-        "type": "t_bool"
-      },
-      {
         "label": "maxCapital",
         "slot": "19",
         "offset": 0,
