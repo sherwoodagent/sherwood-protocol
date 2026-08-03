@@ -68,6 +68,7 @@ contract PriceRouter is Initializable, OwnableUpgradeable, UUPSUpgradeable, IPri
     error ZeroAddress();
     error HaircutTooHigh();
     error HaircutCannotDecrease();
+    error HaircutLaneAConflict();
 
     event AdapterRegistered(bytes32 indexed kind, address indexed adapter);
     event HaircutSet(bytes32 indexed kind, uint16 bps);
@@ -181,15 +182,19 @@ contract PriceRouter is Initializable, OwnableUpgradeable, UUPSUpgradeable, IPri
     ///
     ///      The correct fix is a two-sided quote — un-haircut "ask" for mints,
     ///      haircut "bid" for redemptions — an `IPriceRouter` interface change.
-    ///      Until then, keep the haircut at 0 for any kind with
-    ///      `laneAEnabled == true`, or route deposits for that kind to Lane B.
     ///
-    ///      Currently dormant: no `IPriceAdapter` implementation exists
-    ///      in-tree, no deploy script registers one or enables Lane A, and
-    ///      this mapping defaults to 0.
+    ///      Enforced on-chain: this setter reverts `HaircutLaneAConflict` when
+    ///      `bps != 0` and `laneAEnabled[kind]` is true, so the depositor-side
+    ///      wealth transfer above can never be armed while the kind's instant
+    ///      lane is live. A kind that needs a haircut stays Lane B (queue-only)
+    ///      until the two-sided quote ships; `Erc20SpotAdapter` and
+    ///      `MorphoSupplyAdapter` exist in-tree and `script/DeployLaneA.s.sol`
+    ///      registers them and can enable Lane A, so this is reachable in
+    ///      practice, not theoretical.
     function setHaircutBps(bytes32 kind, uint16 bps) external onlyOwner {
         if (bps > MAX_HAIRCUT_BPS) revert HaircutTooHigh();
         if (bps < haircutBps[kind]) revert HaircutCannotDecrease();
+        if (bps != 0 && laneAEnabled[kind]) revert HaircutLaneAConflict();
         haircutBps[kind] = bps;
         emit HaircutSet(kind, bps);
     }
@@ -203,7 +208,14 @@ contract PriceRouter is Initializable, OwnableUpgradeable, UUPSUpgradeable, IPri
     /// @inheritdoc IPriceRouter
     /// @notice Enable / disable the instant (Lane A) lane for a position kind.
     ///         Governance flips this on only after auditing the kind's adapter.
+    /// @dev    Enabling requires `haircutBps[kind] == 0`: reverts
+    ///         `HaircutLaneAConflict` when `enabled == true` and the kind
+    ///         carries a nonzero haircut, guarding the same invariant as
+    ///         `setHaircutBps` from the other direction (see its natspec).
+    ///         Disabling (`enabled == false`) is never blocked — it is the
+    ///         de-escalation path and must always be available.
     function setLaneAEnabled(bytes32 kind, bool enabled) external onlyOwner {
+        if (enabled && haircutBps[kind] != 0) revert HaircutLaneAConflict();
         laneAEnabled[kind] = enabled;
         emit LaneAEnabledSet(kind, enabled);
     }

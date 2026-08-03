@@ -85,6 +85,19 @@ interface IPortfolioAllocations {
  *      haircut is also monotone-increasing (`HaircutCannotDecrease`): a nonzero
  *      value is a ONE-WAY DOOR, so this script refuses rather than "fixes" —
  *      there is no fixing it.
+ *
+ *      Both `PriceRouter.setHaircutBps` and `setLaneAEnabled` now enforce this
+ *      same exclusion on-chain (`HaircutLaneAConflict`, from either order), so
+ *      a router running the guarded implementation cannot reach the unsafe
+ *      pair through the setters at all. G2 still earns its keep for two
+ *      reasons this script cannot delegate to the runtime guard: (a) this
+ *      script wires an EXISTING router by address (`cfg.router`), which may
+ *      still be running a pre-guard implementation — G2 is the only check
+ *      standing between a poisoned haircut and enablement in that case; and
+ *      (b) G2 fails BEFORE any adapter is deployed or registered, whereas
+ *      relying on the runtime guard would deploy and wire everything and only
+ *      then revert at the enable step, leaving a partially-wired broadcast to
+ *      reason about.
  * @dev PRE-FLIGHT G3 (staleness bound): every registered `maxAge` must be at
  *      most 24h — the equity feeds' heartbeat. A larger bound would leave Lane A
  *      open on marks the market has abandoned for longer than a full heartbeat.
@@ -508,6 +521,13 @@ contract DeployLaneA is Script {
     ///         wealth transfer from existing holders to Lane A depositors. And
     ///         because the setter is monotone-increasing, a nonzero haircut
     ///         CANNOT be walked back: refuse, never "temporarily" accept.
+    /// @dev    `PriceRouter.setHaircutBps`/`setLaneAEnabled` now refuse this
+    ///         same pair on-chain (`HaircutLaneAConflict`) for any router
+    ///         running the guarded implementation. This check remains for
+    ///         routers that may not be — `cfg.router` is an existing,
+    ///         by-address deployment, not necessarily one running the latest
+    ///         implementation — and it fails before this broadcast deploys or
+    ///         registers anything, rather than mid-broadcast.
     function checkHaircutsZero(address router) public view {
         require(
             IPriceRouterAdmin(router).haircutBps(PositionKinds.ERC20_SPOT) == 0,
