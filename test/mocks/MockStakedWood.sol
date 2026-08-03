@@ -57,6 +57,7 @@ contract MockStakedWood is IStakedWood {
     mapping(address => uint256) internal _guardianStake;
     mapping(address => uint256) internal _preparedStakeOf;
     mapping(address => bool) internal _canCreateVault;
+    mapping(address => address) public approvedBindVault;
     uint256 public flatRequiredOwnerBond;
     uint256 public minSlashBps;
     uint256 public maxSlashBps;
@@ -145,6 +146,14 @@ contract MockStakedWood is IStakedWood {
 
     function setCanCreateVault(address owner, bool v) external {
         _canCreateVault[owner] = v;
+    }
+
+    /// @dev Owner-stake binding consent (issue #98) is a settable read here,
+    ///      like the rest of the mock's surface. The real clearing lifecycle
+    ///      (consume on bind, clear on cancel / fresh prepare) lives in
+    ///      `StakedWood` — tests that exercise it use a real proxy.
+    function setApprovedBindVault(address owner, address vault) external {
+        approvedBindVault[owner] = vault;
     }
 
     function setSlashBounds(uint256 minBps, uint256 maxBps) external {
@@ -286,6 +295,14 @@ contract MockStakedWood is IStakedWood {
 
     function transferOwnerStakeSlot(address, address) external pure {
         revert("MockStakedWood: transferOwnerStakeSlot not modeled");
+    }
+
+    function approveOwnerStakeBinding(address) external pure {
+        revert("MockStakedWood: approveOwnerStakeBinding not modeled; use setApprovedBindVault");
+    }
+
+    function revokeOwnerStakeBinding() external pure {
+        revert("MockStakedWood: revokeOwnerStakeBinding not modeled; use setApprovedBindVault");
     }
 
     function setMinGuardianStake(uint256) external pure {

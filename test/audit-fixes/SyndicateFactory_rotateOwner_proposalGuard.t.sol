@@ -180,6 +180,15 @@ contract SyndicateFactory_rotateOwner_proposalGuard is Test {
         assertEq(gov.getActiveProposal(), 0);
         assertEq(gov.openProposalCount(), 0);
 
+        // Issue #98: the rotation SPENDS `newOwner`'s escrow, so `newOwner`
+        // must consent to the binding first. The three revert tests below
+        // deliberately skip this step — their guards (`ProposalActive`,
+        // `ProposalsOpen`, `VaultStillStaked`) all fire in the factory before
+        // it reaches sWOOD, and keeping them approval-free is what pins that
+        // ordering.
+        vm.prank(newOwner);
+        swood.approveOwnerStakeBinding(vault);
+
         // Sherlock #32: rotateOwner is now called by the vault owner (creator)
         // not the factory owner.
         vm.prank(creator);
