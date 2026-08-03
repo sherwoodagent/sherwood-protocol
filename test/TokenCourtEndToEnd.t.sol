@@ -250,7 +250,19 @@ contract TokenCourtEndToEndTest is Test {
 
         // Certification a passed challenge will revoke; `bump` stays
         // uncertified so the exec batch as a whole is still tier 2.
-        tierRegistry.certify(address(adapter), adapter.poke.selector, 1, CERTIFIED_BOUND_BPS, address(0));
+        //
+        // Two-step certification (design.md / tasks.md 2.1): the test contract
+        // IS the registry owner, so no prank is needed — propose, warp past
+        // the pinned `readyAt` (`vm.getBlockTimestamp()`, never a cached
+        // `block.timestamp` local — the optimizer CSEs it across `vm.warp`),
+        // execute. Every later warp in this suite reads live state
+        // (`vm.getBlockTimestamp() + X` or a value computed from
+        // in-test-live `filedAt`/`referredAt`), so this setUp-time shift is safe.
+        tierRegistry.proposeCertification(
+            address(adapter), adapter.poke.selector, 1, CERTIFIED_BOUND_BPS, address(0), address(adapter).codehash
+        );
+        vm.warp(vm.getBlockTimestamp() + tierRegistry.certifyDelay());
+        tierRegistry.certify(address(adapter), adapter.poke.selector);
 
         // ── WOOD for the proposer's bond, both challengers' bonds, and g1's
         //    counter-bond pool contributions (sized generously: some arcs have

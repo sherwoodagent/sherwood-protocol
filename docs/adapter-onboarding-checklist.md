@@ -16,16 +16,38 @@ Re-verify them if the contracts move.
 
 ### Gate A — tier certification (pricing)
 
-`TierRegistry.certify(address target, bytes4 selector, uint8 tier, uint16 extractableBoundBps, address submitter)`
-— `onlyOwner`, [`src/TierRegistry.sol:198`](../src/TierRegistry.sol#L198).
+**Two-step since issue #45.** Certification is announce-then-execute, not a
+single write:
+
+1. `TierRegistry.proposeCertification(address target, bytes4 selector, uint8 tier, uint16 extractableBoundBps, address submitter)`
+   — `onlyOwner`, [`src/TierRegistry.sol:246`](../src/TierRegistry.sol#L246).
+   Runs every input guard below and records a pending grant: the target's
+   current `EXTCODEHASH`, the current `submitterBondWood` as the pinned bond
+   amount, and `readyAt = block.timestamp + certifyDelay` (default 3 days,
+   bounded `[1, 30]` days by `setCertifyDelay`,
+   [`:380`](../src/TierRegistry.sol#L380)). Emits `CertificationProposed` with
+   every one of those fields — this is the queue to watch (§2.2/§2.3 below can
+   now be done by a third party against the ANNOUNCEMENT, not just by the
+   submitter before the fact).
+2. `TierRegistry.certify(address target, bytes4 selector)` —
+   **permissionless**, [`src/TierRegistry.sol:312`](../src/TierRegistry.sol#L312).
+   Callable by anyone once `readyAt` has passed, and only if the target's live
+   codehash still matches the snapshot from step 1 (a code change during the
+   window voids the pending grant — `CodehashChanged`,
+   re-`proposeCertification` against the new code to recover). Pulls the
+   PINNED bond amount (if any) at this point — not at step 1 — and writes the
+   certification.
+3. `TierRegistry.cancelCertification(address target, bytes4 selector)` —
+   `onlyOwner`, withdraws a pending grant before it executes
+   ([`:344`](../src/TierRegistry.sol#L344)).
 
 Keyed on **(target, selector)** — `key()` is `keccak256(target, selector)`
-([`:89`](../src/TierRegistry.sol#L89)). It answers *"how much can this call
-extract?"*. `tierOf` ([`:95`](../src/TierRegistry.sol#L95)) returns the
+([`:120`](../src/TierRegistry.sol#L120)). It answers *"how much can this call
+extract?"*. `tierOf` ([`:126`](../src/TierRegistry.sol#L126)) returns the
 certified `(tier, boundBps)`, or `(TIER_ARBITRARY=2, FULL_NOTIONAL_BPS=10_000)`
-([`:55-56`](../src/TierRegistry.sol#L55)) for anything uncertified — or whose
-live `EXTCODEHASH` no longer matches the hash snapshotted at certification
-([`:97`](../src/TierRegistry.sol#L97)).
+([`:78-79`](../src/TierRegistry.sol#L78)) for anything uncertified, PENDING
+(not yet executed), or whose live `EXTCODEHASH` no longer matches the hash
+snapshotted at certification.
 
 Consumed by the governor: `_resolveTierAndCoverage` / `_scanCalls`
 ([`src/SyndicateGovernor.sol:1020`](../src/SyndicateGovernor.sol#L1020),
@@ -33,10 +55,13 @@ Consumed by the governor: `_resolveTierAndCoverage` / `_scanCalls`
 proposal's execute + settle calls to size guardian coverage. With no registry
 wired the governor returns `(2, maxCapital)` — the safe default.
 
-Certification is **rejected** for `tier >= 2` (`InvalidTier`,
-[`:202`](../src/TierRegistry.sol#L202)), for `extractableBoundBps == 0` or
-`>= 10_000` (`BoundRequired`, [`:203`](../src/TierRegistry.sol#L203)), and for
-a target with no code (`NotAContract`, [`:205`](../src/TierRegistry.sol#L205)).
+`proposeCertification` **rejects** `tier >= 2` (`InvalidTier`,
+[`:253`](../src/TierRegistry.sol#L253)), `extractableBoundBps == 0` or
+`>= 10_000` (`BoundRequired`, [`:254`](../src/TierRegistry.sol#L254)), and a
+target with no code (`NotAContract`). `certify` separately rejects execution
+before `readyAt` (`CertifyDelayNotElapsed`), with no pending record
+(`NoPendingCertification`), and against a mismatched live codehash
+(`CodehashChanged`).
 
 ### Gate B — transfer allowlist (reachability)
 
@@ -215,10 +240,11 @@ consequence 5.
 
 ### [ ] 2.3 The target is not a proxy
 
-`certify` snapshots `target.codehash`
-([`TierRegistry.sol:204`](../src/TierRegistry.sol#L204)) and `tierOf`
-re-checks it on every read ([`:97`](../src/TierRegistry.sol#L97)). That catches
-**metamorphic redeploys only** (CREATE2 + SELFDESTRUCT at the same address).
+`proposeCertification` snapshots `target.codehash` at announcement time, and
+`certify` re-checks it against the LIVE codehash at execution time
+(`CodehashChanged` on mismatch); `tierOf` then re-checks the certified hash on
+every read. That catches **metamorphic redeploys only** (CREATE2 +
+SELFDESTRUCT at the same address).
 
 It does **not** catch proxy implementation swaps. For EIP-1967 / UUPS /
 transparent / beacon proxies the proxy's own runtime bytecode is constant
@@ -235,23 +261,31 @@ tier-2 default. Check the three EIP-1967 slots before certifying (§3).
 
 ### [ ] 2.4 Flip both gates in the same governance session
 
-Both `certify` and `setAdapterAllowed` are `onlyOwner` on the *same* contract,
-so a single owner batch can carry both — there is no cross-contract
+`proposeCertification` and `setAdapterAllowed` are `onlyOwner` on the *same*
+contract, so a single owner batch can carry both — there is no cross-contract
 coordination excuse for splitting them. In production the owner is the
 multisig, reached through the two-step `Ownable2Step` handoff in
 [`script/Deploy.s.sol:176`](../script/Deploy.s.sol#L176) (the multisig must
 call `acceptOwnership()`).
 
-Order within the session does not matter; *splitting across sessions* does. A
-session that lands only Gate B leaves an allowlisted address that nobody has
-priced. A session that lands only Gate A ships a certification that reverts in
-production.
+Order within the session does not matter for the PROPOSAL; *splitting across
+sessions* does. A session that lands only Gate B leaves an allowlisted address
+that nobody has priced. A session that lands only Gate A's proposal ships an
+announcement whose bound nobody reviewed — that is now the point (§2.2/§2.3
+happen against the queue), but the allowlist write should still land in the
+same session as the certification proposal, not drift apart from it.
+
+`certify` itself is a SEPARATE, later, permissionless step — it executes once
+`certifyDelay` has elapsed (default 3 days) and may be called by anyone, not
+just the owner. Do not treat `proposeCertification` landing as the adapter
+being live: `tierOf` still reports tier 2 until `certify` actually executes.
 
 ### [ ] 2.5 Verify both gates on-chain after execution
 
 Read both back. See §3 for the commands. Do not close the onboarding on the
-transaction receipt alone — `certify` succeeding does not tell you the codehash
-still matches at read time, and it says nothing at all about the allowlist.
+`proposeCertification` receipt, or even the `certify` receipt, alone —
+`certify` succeeding does not tell you the codehash still matches at read
+time, and it says nothing at all about the allowlist.
 
 ### [ ] 2.6 Record the de-onboarding plan
 
@@ -298,9 +332,15 @@ cast storage $ADAPTER 0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a71785
 # Read the deployed source before certifying.
 
 # 5. Bond state, if submitter bonds are configured. A non-zero `releasableAt`
-#    means this key is mid-release and `certify` will revert BondPendingRelease
-#    (TierRegistry.sol:212).
+#    means this key is mid-release and `certify` will revert BondPendingRelease.
 cast call $REG "bondOf(address,bytes4)((address,uint96,uint64))" $ADAPTER $SEL --rpc-url $RPC
+
+# 6. Pending certification queue (issue #45). A non-zero `readyAt` means a
+#    grant is announced but not yet live -- `tierOf` still reports tier 2.
+#    `readyAt` is a unix timestamp; `certify` reverts CertifyDelayNotElapsed
+#    before it and CodehashChanged if the live codehash no longer matches
+#    the `codehash` field snapshotted here.
+cast call $REG "pendingCertificationOf(address,bytes4)((uint8,uint16,address,uint64,uint96,bytes32))" $ADAPTER $SEL --rpc-url $RPC
 ```
 
 **Sweep for drift.** `AdapterAllowedSet(address indexed adapter, bool allowed)`
@@ -362,9 +402,11 @@ selector), the allowlist by bare address, so demoting *one* selector
 de-allowlists the *whole* adapter even if its other selectors remain
 certified — the conservative, accepted direction of error. Recovery is a
 single owner `setAdapterAllowed(adapter, true)` call. Re-certifying never
-restores it: `certify` ([`:198`](../src/TierRegistry.sol#L198)) never sets or
-restores `_adapterAllowed`, so re-allowlisting after any clear is always this
-explicit, separate owner decision — never a side effect of re-certification.
+restores it: neither `proposeCertification` nor `certify`
+([`:246`](../src/TierRegistry.sol#L246),
+[`:312`](../src/TierRegistry.sol#L312)) ever sets or restores
+`_adapterAllowed`, so re-allowlisting after any clear is always this explicit,
+separate owner decision — never a side effect of re-certification.
 
 **What still needs the watcher.** Two paths leave `_adapterAllowed` untouched
 because they either don't run `_demote`, or don't persist at all:
@@ -427,10 +469,6 @@ awareness of what it is substituting for:
 
 ### Candidate follow-ups (tracked, not committed)
 
-- **#45 — timelock `certify`.** A delay on grant would give this checklist an
-  actual review window: the selector inventory (§2.2) and the proxy check
-  (§2.3) could be performed by third parties against a queued certification
-  rather than only by the submitter before the fact.
 - **CI invariant for allowlisted-but-generic targets** (from issue #17): flag
   any address with `isAdapterAllowed == true` whose bytecode exposes an
   arbitrary-call entry point, or which has no certified (target, selector)
@@ -438,5 +476,4 @@ awareness of what it is substituting for:
   Feasibility is unestablished — bytecode-level detection of "can forward to an
   arbitrary destination" is not a solved problem.
 
-Neither is a commitment; both are the reasons this document exists in the
-interim.
+Not a commitment; it is the reason this document exists in the interim.

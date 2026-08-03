@@ -652,13 +652,26 @@ contract GovernorCoverageGatesTest is Test {
     ///      tier with `requiredCoverage = maxCapital × 2 × bound / 10_000`.
     ///      Created inside the tests rather than in `setUp` so the rest of this
     ///      suite keeps its simpler tier-2 / full-notional arithmetic.
+    ///
+    ///      Two-step certification (design.md / tasks.md 2.1): the test
+    ///      contract IS the registry owner (`new TierRegistry(address(this))`),
+    ///      so no prank is needed — propose, warp past the pinned `readyAt`
+    ///      (via `vm.getBlockTimestamp()`, never a cached `block.timestamp`
+    ///      local — this repo's optimizer CSEs it across `vm.warp`), execute.
+    ///      Called before proposal creation in every site, so the forward warp
+    ///      never interacts with an in-flight proposal's execution window.
     function _wireTierRegistryCertifiedAt(uint8 tier, uint16 bound) internal returns (TierRegistry reg) {
         reg = new TierRegistry(address(this));
         governor.setTierRegistry(address(reg)); // test contract is the factory
         reg.setAdapterAllowed(address(targetToken), true);
         reg.setAdapterAllowed(address(usdg), true);
-        reg.certify(address(targetToken), targetToken.approve.selector, tier, bound, address(0));
-        reg.certify(address(usdg), usdg.approve.selector, tier, bound, address(0));
+        reg.proposeCertification(
+            address(targetToken), targetToken.approve.selector, tier, bound, address(0), address(targetToken).codehash
+        );
+        reg.proposeCertification(address(usdg), usdg.approve.selector, tier, bound, address(0), address(usdg).codehash);
+        vm.warp(vm.getBlockTimestamp() + reg.certifyDelay());
+        reg.certify(address(targetToken), targetToken.approve.selector);
+        reg.certify(address(usdg), usdg.approve.selector);
     }
 
     /// @notice The launch default is 0 — every tier fail-closed. The §3.10 ROE
