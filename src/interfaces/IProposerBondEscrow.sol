@@ -56,4 +56,12 @@ interface IProposerBondEscrow {
     ///         escrow's enforced one cannot drift apart.
     function MAX_PROSECUTOR_FEE_BPS() external view returns (uint256);
     function bondOf(address governor, uint256 proposalId) external view returns (address proposer, uint256 amount);
+
+    /// @notice The ledger this escrow trusts to authorize `forfeitBond` —
+    ///         immutable, fixed at the escrow's own deployment. A governor
+    ///         must not lock a bond into an escrow whose `exposureLedger`
+    ///         differs from the ledger it is pricing/pinning that bond
+    ///         against, or the escrow will reject every forfeiture attempt
+    ///         from the ledger's game, forever (audit finding, PR #136 round 1).
+    function exposureLedger() external view returns (address);
 }

@@ -486,6 +486,12 @@
         "slot": "25",
         "offset": 0,
         "type": "t_struct(PerfSplit)_storage"
+      },
+      {
+        "label": "proposerBondLedger",
+        "slot": "26",
+        "offset": 0,
+        "type": "t_address"
       }
     ]
   }

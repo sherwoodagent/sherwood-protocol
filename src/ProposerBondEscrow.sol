@@ -80,7 +80,13 @@ contract ProposerBondEscrow is IProposerBondEscrow {
     ///         rotating that role is guarded on its side (`setCoverageFreezer`
     ///         refuses while anything is frozen), which is a
     ///         stronger rotation guard than anything this escrow could impose.
-    ILedgerFreezerMinimal public immutable exposureLedger;
+    /// @dev Typed `address`, not `ILedgerFreezerMinimal`, so the public
+    ///      getter satisfies `IProposerBondEscrow.exposureLedger() external
+    ///      view returns (address)` — the type a caller comparing it against
+    ///      another `address`-typed ledger reference (e.g. the governor's
+    ///      pinned `proposal.proposerBondLedger`) actually needs. Cast to
+    ///      `ILedgerFreezerMinimal` at the one call site that needs it.
+    address public immutable exposureLedger;
 
     /// @dev Where a forfeited bond goes. Same sink and same constant as
     ///      `ChallengeGame`'s `settleBurnBps`/`forfeitBurnBps` and sWOOD's
@@ -104,7 +110,7 @@ contract ProposerBondEscrow is IProposerBondEscrow {
         if (wood_ == address(0) || registry_ == address(0) || exposureLedger_ == address(0)) revert ZeroAddress();
         wood = IERC20(wood_);
         registry = IRegistryAuthMinimal(registry_);
-        exposureLedger = ILedgerFreezerMinimal(exposureLedger_);
+        exposureLedger = exposureLedger_;
     }
 
     modifier onlyGovernor() {
@@ -228,7 +234,9 @@ contract ProposerBondEscrow is IProposerBondEscrow {
         external
         returns (address, uint256)
     {
-        if (msg.sender != exposureLedger.coverageFreezer()) revert NotAuthorizedConvictor();
+        if (msg.sender != ILedgerFreezerMinimal(exposureLedger).coverageFreezer()) {
+            revert NotAuthorizedConvictor();
+        }
         // NOT TRUSTED FROM THE CALLER, for the same reason sWOOD re-checks the
         // rates it is handed: the convictor is a replaceable role, and this
         // contract is the one that actually moves the WOOD. Bounding the rate
