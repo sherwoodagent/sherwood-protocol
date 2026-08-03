@@ -379,16 +379,26 @@ contract Erc20SpotAdapter is Ownable, IPriceAdapter {
         // whole vault's Lane A. The bound is published by `instantCapAssets`
         // and belongs to the consumer that sizes exits.
 
-        // Oracle-vs-pool divergence gate (design D9c). Adversary: 24/5 equity
-        // feeds hold the last price over weekends while pools keep trading —
-        // a held mark above executable price lets exiters harvest the basis,
-        // and the 200bps fee ceiling cannot cover a stale-mark regime. A mark
-        // diverging beyond the bound closes Lane A instead of mispricing it.
-        if (cfg.referencePool != address(0)) {
-            (bool okDiv, uint256 divBps) = _divergenceBps(cfg, token, price);
-            if (!okDiv || divBps > cfg.maxDivergenceBps) return (0, false);
-        }
+        // Split for the same reason as `value`/`_valuePriced`: the divergence
+        // tail's own locals (`okDiv`, `divBps`) would otherwise stay live
+        // alongside everything above and re-trip the non-via-IR stack limit.
+        return _applyDivergenceGate(cfg, token, price, v);
+    }
 
+    /// @dev Oracle-vs-pool divergence gate (design D9c). Adversary: 24/5
+    ///      equity feeds hold the last price over weekends while pools keep
+    ///      trading — a held mark above executable price lets exiters harvest
+    ///      the basis, and the 200bps fee ceiling cannot cover a stale-mark
+    ///      regime. A mark diverging beyond the bound closes Lane A instead of
+    ///      mispricing it.
+    function _applyDivergenceGate(FeedConfig memory cfg, address token, uint256 price, uint256 v)
+        private
+        view
+        returns (uint256, bool)
+    {
+        if (cfg.referencePool == address(0)) return (v, true);
+        (bool okDiv, uint256 divBps) = _divergenceBps(cfg, token, price);
+        if (!okDiv || divBps > cfg.maxDivergenceBps) return (0, false);
         return (v, true);
     }
 
