@@ -63,6 +63,11 @@ The self-transfer fast-path (destination decodes to the vault itself) SHALL appl
 - **WHEN** the governor's tier registry is unset
 - **THEN** the destination guard does not run and the batch proceeds under the transferFrom source guard, the privileged-target guard, and the outflow/reserve/buffer checks only
 
+#### Scenario: Pull into the vault always passes
+
+- **WHEN** a batch call is `transferFrom(x, vault, amount)`
+- **THEN** the destination guard passes it as an inflow — this requirement governs only the destination check; a non-vault `x` is separately rejected by the transferFrom source guard specified above before the batch can succeed
+
 #### Scenario: Permit2 approve to a non-allowlisted spender is rejected
 
 - **WHEN** a governor batch contains `Permit2.approve(token, attacker, amount, expiration)` and `attacker` is not the vault or an allowlisted adapter

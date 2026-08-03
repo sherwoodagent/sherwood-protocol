@@ -7,6 +7,7 @@ import {VeniceInferenceStrategy, IVeniceStaking, IAeroRouter} from "../src/strat
 import {BaseStrategy} from "../src/strategies/BaseStrategy.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
+import {MockGovernorAlwaysActive, MockVaultGovernorStub} from "./mocks/MockGovernorAlwaysActive.sol";
 
 /// @notice Simplified mock Venice staking — accepts VVV, mints sVVV to recipient. No unstake.
 contract MockVeniceStaking is ERC20Mock {
@@ -64,13 +65,16 @@ contract VeniceInferenceStrategy_DirectTest is Test {
     ERC20Mock public vvvToken;
     MockVeniceStaking public sVVVToken;
 
-    address public vault = makeAddr("vault");
+    /// @dev Issue #150 fix: wired to a permissive `MockGovernorAlwaysActive`
+    ///      instead of a bare `makeAddr` — see `MockGovernorAlwaysActive.sol`.
+    address public vault;
     address public proposer = makeAddr("proposer");
     address public agentWallet = makeAddr("agentWallet");
 
     uint256 constant VVV_AMOUNT = 1000e18;
 
     function setUp() public {
+        vault = address(new MockVaultGovernorStub(address(new MockGovernorAlwaysActive())));
         vvvToken = new ERC20Mock("VVV", "VVV", 18);
         sVVVToken = new MockVeniceStaking(address(vvvToken));
         vvvToken.mint(vault, 10_000e18);
@@ -379,7 +383,9 @@ contract VeniceInferenceStrategy_SwapTest is Test {
     MockVeniceStaking public sVVVToken;
     MockSwapRouter public swapRouter;
 
-    address public vault = makeAddr("vault");
+    /// @dev Issue #150 fix: wired to a permissive `MockGovernorAlwaysActive`
+    ///      instead of a bare `makeAddr` — see `MockGovernorAlwaysActive.sol`.
+    address public vault;
     address public proposer = makeAddr("proposer");
     address public agentWallet = makeAddr("agentWallet");
     address public aeroFactory = makeAddr("aeroFactory");
@@ -389,6 +395,7 @@ contract VeniceInferenceStrategy_SwapTest is Test {
     uint256 constant SWAP_RATE = 2e30; // accounts for 6→18 decimal gap: 500e6 * 2e30 / 1e18 = 1000e18
 
     function setUp() public {
+        vault = address(new MockVaultGovernorStub(address(new MockGovernorAlwaysActive())));
         usdc = new ERC20Mock("USD Coin", "USDC", 6);
         vvvToken = new ERC20Mock("VVV", "VVV", 18);
         sVVVToken = new MockVeniceStaking(address(vvvToken));

@@ -23,7 +23,16 @@ contract MockVaultWithGovernor {
     }
 }
 
-/// @notice Minimal governor stand-in exposing only `tierRegistry()`.
+/// @notice Minimal governor stand-in exposing `tierRegistry()` (the #147
+///         adapter-allowlist walk) plus, since issue #150, a DELIBERATELY
+///         PERMISSIVE `IProposalStatus` pair for `BaseStrategy.execute()`'s
+///         active-proposal-binding check: `strategyOf` answers `msg.sender`
+///         regardless of `pid`, so any clone that resolves to this governor
+///         via a `MockVaultWithGovernor` passes the check without per-test
+///         proposal wiring. This suite is about the adapter allowlist and the
+///         slippage floor, not the binding property itself — see
+///         `test/audit-fixes/Strategy_cloneRatchetBinding.t.sol` for the
+///         dedicated, non-permissive tests of that.
 contract MockGovernorWithRegistry {
     address public tierRegistry;
 
@@ -33,6 +42,14 @@ contract MockGovernorWithRegistry {
 
     function setTierRegistry(address registry_) external {
         tierRegistry = registry_;
+    }
+
+    function getActiveProposal() external pure returns (uint256) {
+        return 1;
+    }
+
+    function strategyOf(uint256) external view returns (address) {
+        return msg.sender;
     }
 }
 
@@ -410,17 +427,22 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
 
     function test_floorBottomsOut_reassertSucceeds_belowFails() public {
         PortfolioStrategy strategy = _clone();
-        address codelessVault = makeAddr("codelessVault-floor-bottom");
-        weth.mint(codelessVault, TOTAL_AMOUNT);
-        vm.prank(codelessVault);
+        // Issue #150 fix: `execute()` now needs a vault whose `governor()`
+        // resolves. Registry left unset (`tierRegistry() == address(0)`)
+        // keeps the adapter-allowlist walk skipped, same as the old codeless
+        // vault — this test is about the slippage floor, not the allowlist.
+        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(0));
+        MockVaultWithGovernor vaultStub = new MockVaultWithGovernor(address(governor));
+        weth.mint(address(vaultStub), TOTAL_AMOUNT);
+        vm.prank(address(vaultStub));
         weth.approve(address(strategy), type(uint256).max);
         tsla.mint(address(adapter), 1_000_000e18);
         weth.mint(address(adapter), 1_000_000e18);
         adapter.setRate(address(weth), address(tsla), 1e18);
         adapter.setRate(address(tsla), address(weth), 1e18);
 
-        strategy.initialize(codelessVault, proposer, _initData(strategy.MIN_SLIPPAGE_BPS()));
-        vm.prank(codelessVault);
+        strategy.initialize(address(vaultStub), proposer, _initData(strategy.MIN_SLIPPAGE_BPS()));
+        vm.prank(address(vaultStub));
         strategy.execute();
 
         uint256[] memory weights = new uint256[](1);
@@ -547,26 +569,32 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
     }
 
     /// @dev Shared setup for the `updateParams` tighten tests: init + execute
-    ///      a single-token basket against a codeless vault (hop-1 skip, so the
+    ///      a single-token basket against a vault whose governor has no
+    ///      registry wired (`tierRegistry() == address(0)`, hop-2 skip, so the
     ///      allowlist walk is inert here — these tests are about the slippage
-    ///      floor, not the allowlist). `salt` keeps each `makeAddr` distinct
-    ///      across calls in the same test run.
+    ///      floor, not the allowlist). Issue #150 fix: `execute()` needs
+    ///      `governor()` to resolve, which a bare `makeAddr` no longer
+    ///      provides, hence the `MockVaultWithGovernor` wrapper. `salt` keeps
+    ///      each deployment distinct across calls in the same test run (no
+    ///      longer load-bearing for address uniqueness, kept for readability).
     function _initAndExecuteSingleToken(uint256 initSlippageBps, string memory salt)
         internal
         returns (PortfolioStrategy strategy)
     {
+        salt; // silence unused-param warning now that makeAddr no longer consumes it
         strategy = _clone();
-        address codelessVault = makeAddr(string(abi.encodePacked("codelessVault-", salt)));
-        weth.mint(codelessVault, TOTAL_AMOUNT);
-        vm.prank(codelessVault);
+        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(0));
+        MockVaultWithGovernor vaultStub = new MockVaultWithGovernor(address(governor));
+        weth.mint(address(vaultStub), TOTAL_AMOUNT);
+        vm.prank(address(vaultStub));
         weth.approve(address(strategy), type(uint256).max);
         tsla.mint(address(adapter), 1_000_000e18);
         weth.mint(address(adapter), 1_000_000e18);
         adapter.setRate(address(weth), address(tsla), 1e18);
         adapter.setRate(address(tsla), address(weth), 1e18);
 
-        strategy.initialize(codelessVault, proposer, _initData(initSlippageBps));
-        vm.prank(codelessVault);
+        strategy.initialize(address(vaultStub), proposer, _initData(initSlippageBps));
+        vm.prank(address(vaultStub));
         strategy.execute();
     }
 }
