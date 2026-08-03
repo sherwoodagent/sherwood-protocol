@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # check-layout-goldens.sh — storage-layout golden guard for the beacon/proxy-upgraded
-# governance contracts (SyndicateGovernor, SyndicateFactory, GuardianRegistry).
+# governance contracts and the vault (SyndicateGovernor, SyndicateFactory,
+# GuardianRegistry, StakedWood, SyndicateVault).
 #
-# All three live behind upgradeable proxies (governor: beacon; factory + registry: UUPS), so
+# All five live behind upgradeable proxies (governor: beacon; the rest: UUPS), so
 # their storage layouts are FROZEN for deployed lineages: fields are append-only, gaps
 # shrink only from the front, and any reorder/insert/retype corrupts live state on the
 # next upgrade. This script pins the compiler-emitted layout (label, slot, offset, type
@@ -189,7 +190,7 @@ check_contract() {
 [ "${1:-}" = "--update-golden" ] && UPDATE_GOLDEN=1
 
 # SyndicateGovernor sits behind a BEACON, so one `beacon.upgradeTo` re-points
-# EVERY per-vault governor at once — the widest blast radius of the four.
+# EVERY per-vault governor at once — the widest blast radius of the five.
 #
 # ITS GOLDEN WAS FULLY RE-BASELINED (proposal-lifecycle refactor, PR #56), the
 # one exception to the append-only rule stated in the header above.
@@ -227,6 +228,17 @@ check_contract GuardianRegistry script/guardian-registry-layout.golden.json
 # the gap when slash proceeds moved to a burn); pinned here so the next append
 # is checked automatically rather than by hand.
 check_contract StakedWood script/staked-wood-layout.golden.json
+# SyndicateVault is UUPS and is the one proxy in this protocol that directly
+# custodies user assets (LP deposits, via ERC-4626) — see issue #148. Its
+# storage begins at slot 0: every base contract it inherits (Initializable,
+# ERC4626Upgradeable, ERC20VotesUpgradeable/VotesUpgradeable, OwnableUpgradeable,
+# PausableUpgradeable, UUPSUpgradeable) uses ERC-7201 namespaced storage and
+# holds no linear slot, and ERC721Holder / ReentrancyGuardTransient (transient
+# storage only) contribute none either. THIS IS AN INITIAL BASELINE, NOT A
+# RE-BASELINE — chains/4663.json records no vault lineage, so there is no live
+# proxy to stay compatible with. From here the append-only rule applies:
+# test/VaultLayoutPins.t.sol pins the same layout at the forge-test level.
+check_contract SyndicateVault script/syndicate-vault-layout.golden.json
 
 [ "${UPDATE_GOLDEN:-0}" = "1" ] ||
-  echo "layout-goldens: OK — SyndicateGovernor + SyndicateFactory + GuardianRegistry + StakedWood layouts match their goldens"
+  echo "layout-goldens: OK — SyndicateGovernor + SyndicateFactory + GuardianRegistry + StakedWood + SyndicateVault layouts match their goldens"
