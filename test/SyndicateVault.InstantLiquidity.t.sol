@@ -259,6 +259,8 @@ contract VaultInstantLiquidityTest is Test {
         vault.executeGovernorBatch(_deployBatch(address(strat), deployAmt), type(uint256).max);
         strat.setLiquidity(deployAmt);
         _setLocked(true);
+        vm.prank(owner);
+        vault.setInstantExitFeeBps(uint16(vault.MAX_INSTANT_EXIT_FEE_BPS())); // laneA requires max fee (issue #130)
         router.set(liveVal, true); // Lane A on
     }
 

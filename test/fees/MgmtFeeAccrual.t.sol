@@ -114,6 +114,8 @@ contract MgmtFeeAccrualTest is Test {
     function _executeWithLaneA(uint256 liveValue) internal {
         _setLocked(true);
         router.set(liveValue, true);
+        vm.prank(owner);
+        vault.setInstantExitFeeBps(uint16(vault.MAX_INSTANT_EXIT_FEE_BPS()));
         vm.prank(MOCK_GOVERNOR);
         vault.startManagementAccrual();
     }

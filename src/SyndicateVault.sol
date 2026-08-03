@@ -897,8 +897,24 @@ contract SyndicateVault is
     ///        liveNav — the strategy's positions priced vault-side by the
     ///                  PriceRouter (never the strategy's self-report)
     ///        laneA   — instant lane open: locked AND the router proves every
-    ///                  position instant-eligible. Fail-closed: any missing
+    ///                  position instant-eligible AND this vault charges the
+    ///                  max instant-exit fee. Fail-closed: any missing
     ///                  precondition or router failure ⇒ laneA=false, liveNav=0.
+    ///
+    ///      The fee check (issue #130) is the runtime enforcement of what was
+    ///      previously only a deploy-script convention: `PriceRouter`'s
+    ///      `laneAEnabled[kind]` is a single protocol-wide switch shared by
+    ///      every vault pointed at that router, but the only economic
+    ///      safeguard against a 0%-toll instant round-trip is this vault's
+    ///      OWN `instantExitFeeBps` — which defaults to 0 and is never touched
+    ///      by `initialize()`. A vault created after the enablement broadcast
+    ///      (permissionless `SyndicateFactory.createSyndicate`), or any
+    ///      pre-existing vault a deploy script's allowlist happened to omit,
+    ///      would otherwise go Lane-A-live at 0% fee the moment its strategy
+    ///      holds a position of an already-enabled kind — no privileged action
+    ///      required beyond ordinary deposit/withdraw. Requiring the fee at
+    ///      MAX here makes it a vault-level invariant instead of an
+    ///      operator's ability to enumerate every vault that will ever exist.
     ///      Every lane predicate (`_laneBOnly`, `totalAssets`, `_deposit`,
     ///      `_strategyLiquidity`, `_pullFromStrategy`) consumes this — a new
     ///      gating condition (e.g. minHoldingPeriod) lands here once, not
@@ -917,7 +933,7 @@ contract SyndicateVault is
         address pr = _getPriceRouter();
         if (pr == address(0)) return (locked, strat, liveNav, laneA);
         try IPriceRouter(pr).valueStrategy(active) returns (uint256 v, bool ok) {
-            if (ok) {
+            if (ok && instantExitFeeBps >= MAX_INSTANT_EXIT_FEE_BPS) {
                 liveNav = v;
                 laneA = true;
             }

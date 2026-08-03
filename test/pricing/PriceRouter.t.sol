@@ -72,8 +72,10 @@ contract PriceRouterTest is Test {
 
     function test_valuePosition_appliesHaircut() public {
         adapter.set(1000, true);
-        vm.prank(owner);
+        vm.startPrank(owner);
         router.setHaircutBps(KIND, 100); // 1%
+        router.setLaneAEnabled(KIND, true);
+        vm.stopPrank();
         (uint256 v, bool ok) = router.valuePosition(_pos(), address(this));
         assertEq(v, 990, "1% haircut applied");
         assertTrue(ok);
@@ -81,6 +83,8 @@ contract PriceRouterTest is Test {
 
     function test_valuePosition_noHaircut_passThrough() public {
         adapter.set(1000, true);
+        vm.prank(owner);
+        router.setLaneAEnabled(KIND, true);
         (uint256 v, bool ok) = router.valuePosition(_pos(), address(this));
         assertEq(v, 1000);
         assertTrue(ok);
@@ -110,8 +114,10 @@ contract PriceRouterTest is Test {
     ///         strategy.
     function test_valuePosition_overCap_stillPricesTruthfully() public {
         adapter.set(1000, true);
-        vm.prank(owner);
+        vm.startPrank(owner);
         router.setInstantCap(KIND, 500);
+        router.setLaneAEnabled(KIND, true);
+        vm.stopPrank();
         (uint256 v, bool ok) = router.valuePosition(_pos(), address(this));
         assertEq(v, 1000, "priced in full, not zeroed and not clamped to the cap");
         assertTrue(ok, "size is not a pricing doubt");
@@ -119,8 +125,10 @@ contract PriceRouterTest is Test {
 
     function test_valuePosition_atCap_isInstantEligible() public {
         adapter.set(500, true);
-        vm.prank(owner);
+        vm.startPrank(owner);
         router.setInstantCap(KIND, 500);
+        router.setLaneAEnabled(KIND, true);
+        vm.stopPrank();
         (uint256 v, bool ok) = router.valuePosition(_pos(), address(this));
         assertEq(v, 500);
         assertTrue(ok);
@@ -128,6 +136,8 @@ contract PriceRouterTest is Test {
 
     function test_valuePosition_capZeroIsUnlimited() public {
         adapter.set(1e30, true);
+        vm.prank(owner);
+        router.setLaneAEnabled(KIND, true);
         (uint256 v, bool ok) = router.valuePosition(_pos(), address(this));
         assertEq(v, 1e30);
         assertTrue(ok);

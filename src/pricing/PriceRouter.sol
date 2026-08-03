@@ -6,6 +6,7 @@ import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/U
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {IPriceRouter, IPriceAdapter, Position} from "../interfaces/IPriceRouter.sol";
 import {IStrategy} from "../interfaces/IStrategy.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 /// @title  PriceRouter
 /// @notice Governance-owned, vault-side pricing oracle for live-NAV. Maps a
@@ -68,6 +69,7 @@ contract PriceRouter is Initializable, OwnableUpgradeable, UUPSUpgradeable, IPri
     error ZeroAddress();
     error HaircutTooHigh();
     error HaircutCannotDecrease();
+    error AdapterLiveSwapBlocked();
 
     event AdapterRegistered(bytes32 indexed kind, address indexed adapter);
     event HaircutSet(bytes32 indexed kind, uint16 bps);
@@ -91,7 +93,17 @@ contract PriceRouter is Initializable, OwnableUpgradeable, UUPSUpgradeable, IPri
     ///      back to the async (Lane B) path. When `instantOK == false`, value
     ///      is 0 — `totalAssets()` shows only instantly-priceable value while
     ///      locked.
+    ///
+    ///      issue #133: this used to price ANY kind with a registered adapter,
+    ///      including one governance deliberately kept out of the instant lane
+    ///      (`laneAEnabled[kind] == false`) — `valueStrategy` already gated on
+    ///      this per-position; `valuePosition` did not, so the two entry
+    ///      points disagreed on the identical kind/state. `instantCap` is
+    ///      still deliberately NOT enforced here — see `_priceOne`'s natspec
+    ///      for why (size is not a pricing doubt, and the cap belongs to the
+    ///      consumers that actually size exits).
     function valuePosition(Position calldata p, address holder) external view returns (uint256, bool) {
+        if (!laneAEnabled[p.kind]) return (0, false);
         return _priceOne(p, holder);
     }
 
@@ -152,7 +164,13 @@ contract PriceRouter is Initializable, OwnableUpgradeable, UUPSUpgradeable, IPri
         if (adapter == address(0)) return (0, false);
         try IPriceAdapter(adapter).value(p, holder) returns (uint256 raw, bool ok) {
             if (!ok) return (0, false);
-            return ((raw * uint256(MAX_HAIRCUT_BPS - haircutBps[p.kind])) / MAX_HAIRCUT_BPS, true);
+            // issue #131: multiply-before-divide overflows uint256 for
+            // raw > ~1.158e73, escaping this try/catch as an uncaught panic
+            // (the external call already returned — try/catch only traps a
+            // revert from THAT call, not from the haircut math after it).
+            // The true result is always <= raw and therefore representable;
+            // Math.mulDiv computes a*b/c without an overflowing intermediate.
+            return (Math.mulDiv(raw, MAX_HAIRCUT_BPS - haircutBps[p.kind], MAX_HAIRCUT_BPS), true);
         } catch {
             return (0, false);
         }
@@ -161,8 +179,20 @@ contract PriceRouter is Initializable, OwnableUpgradeable, UUPSUpgradeable, IPri
     // ── Governance ──
 
     /// @inheritdoc IPriceRouter
+    /// @dev issue #132: a kind already Lane-A-enabled cannot have its adapter
+    ///      hot-swapped in place. `setHaircutBps`/`setLaneAEnabled` treat "kind
+    ///      already live" as a precondition that changes what's safe to do;
+    ///      this setter is the same live-NAV surface and deserves the same
+    ///      discipline — swapping the pricing source under a kind whose
+    ///      instant lane is already armed corrupts the next NAV read (and any
+    ///      deposit/redemption in the same block) with zero haircut cushion,
+    ///      since a freshly-registered adapter's kind has none accrued.
+    ///      First-time wiring (`adapterOf[kind] == address(0)`) is unaffected.
+    ///      To swap a live kind's adapter: `setLaneAEnabled(kind, false)` →
+    ///      `registerAdapter` → re-enable.
     function registerAdapter(bytes32 kind, address adapter) external onlyOwner {
         if (adapter == address(0)) revert ZeroAddress();
+        if (laneAEnabled[kind] && adapterOf[kind] != address(0)) revert AdapterLiveSwapBlocked();
         adapterOf[kind] = adapter;
         emit AdapterRegistered(kind, adapter);
     }

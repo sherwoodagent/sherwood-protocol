@@ -96,6 +96,8 @@ contract VaultLaneATest is Test {
 
     function _lockLaneA(uint256 liveValue) internal {
         _setLocked(true);
+        vm.prank(owner);
+        vault.setInstantExitFeeBps(uint16(vault.MAX_INSTANT_EXIT_FEE_BPS())); // laneA requires max fee (issue #130)
         router.set(liveValue, true);
     }
 

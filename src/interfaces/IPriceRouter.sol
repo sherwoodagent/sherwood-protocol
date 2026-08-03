@@ -21,18 +21,22 @@ interface IPriceAdapter {
     function value(Position calldata p, address holder) external view returns (uint256 value, bool ok);
 }
 
-/// @notice Governance-owned router. Maps a position `kind` to its adapter,
-///         applies a realizability haircut, and enforces an instant size cap.
-///         `valuePosition` is the only function the vault consumes.
+/// @notice Governance-owned router. Maps a position `kind` to its adapter and
+///         applies a realizability haircut. `valueStrategy` is the function
+///         the vault actually consumes (`SyndicateVault._laneState`) —
+///         `valuePosition` prices a single position directly and is not
+///         currently called by any in-tree consumer.
 interface IPriceRouter {
     /// @param p      the position to price (venue + kind + locator)
     /// @param holder the address whose position is read at the venue
     /// @return value     haircut-adjusted value in the position's underlying
     ///                   units, or 0 when not instantly priceable.
-    /// @return instantOK true only when the position is safely priceable now
-    ///                   AND within the instant cap. When false, `value` is 0
-    ///                   and the caller must use the async (Lane B)
-    ///                   settlement path.
+    /// @return instantOK true only when the position's kind is Lane-A-enabled
+    ///                   AND safely priceable now. Deliberately NOT bounded by
+    ///                   `instantCap` — size is not a pricing question; the
+    ///                   cap is enforced by whichever consumer sizes an exit.
+    ///                   When false, `value` is 0 and the caller must use the
+    ///                   async (Lane B) settlement path.
     function valuePosition(Position calldata p, address holder) external view returns (uint256 value, bool instantOK);
 
     /// @notice Aggregate vault-facing valuation: reads a strategy's on-venue
