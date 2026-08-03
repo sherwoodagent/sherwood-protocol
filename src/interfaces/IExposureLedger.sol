@@ -73,6 +73,9 @@ interface IExposureLedger {
     event ParameterChangeFinalized(bytes32 indexed paramKey, uint256 oldValue, uint256 newValue);
     event CoverageFreezerSet(address indexed oldFreezer, address indexed newFreezer);
     event CoverageFrozenSet(address indexed governor, uint256 indexed proposalId, bool frozen);
+    /// @notice A proposal's coverage was pinned open through `deadline`,
+    ///         independent of whether it is currently frozen.
+    event CoveragePinned(address indexed governor, uint256 indexed proposalId, uint256 deadline);
 
     // ── Registry-only mutations ──
     function recordApproval(address governor, uint256 proposalId, address guardian) external;
@@ -94,12 +97,19 @@ interface IExposureLedger {
     function unfreezeCoverage(address governor, uint256 proposalId) external;
     function isCoverageFrozen(address governor, uint256 proposalId) external view returns (bool);
     /// @notice Whether ANY frozen proposal names this guardian as a covering
-    ///         approver. sWOOD gates the unstake CLAIM on it, which is what
+    ///         approver, OR this guardian is still within a `pinCoverageUntil`
+    ///         deadline. sWOOD gates the unstake CLAIM on it, which is what
     ///         makes the freeze load-bearing rather than decorative: epoch
     ///         buckets age out on wall-clock and a disputed challenge outlives
     ///         them, so `openExposureUsd` alone would let an accused guardian
     ///         claim its bond mid-accusation.
     function hasFrozenCoverage(address guardian) external view returns (bool);
+    /// @notice Pin every approver of (governor, proposalId) as frozen through
+    ///         `deadline`, regardless of `freezeCoverage`/`unfreezeCoverage`
+    ///         state. Only ever RAISES a guardian's pin; decays on its own
+    ///         once `block.timestamp` passes `deadline` — no unpin call
+    ///         exists or is needed.
+    function pinCoverageUntil(address governor, uint256 proposalId, uint256 deadline) external;
     /// @dev Zero is legal and deliberate — it is the UNWIRE switch, closing
     ///      the freeze surface when the challenge game is replaced: with no
     ///      freezer wired there is no filing, so the unwired state fails

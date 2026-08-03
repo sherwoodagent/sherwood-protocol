@@ -190,6 +190,25 @@ contract MockChallengeLedger {
         _frozen[_key(governor, proposalId)] = false;
     }
 
+    /// @dev Issue #95: `_refundAll` calls this through the typed
+    ///      `IExposureLedger` interface, so every existing `Inconclusive` test
+    ///      in this suite needs the mock to implement it or the call reverts.
+    ///      Recorded, not merely accepted, so a test can pin exactly what
+    ///      `_refundAll` passed — `pinCoverageUntil`'s whole job is carrying
+    ///      the JUST-EXTENDED `challengeableUntil[rk]`, not some other value.
+    mapping(bytes32 reviewKey => uint256) internal _pinnedUntil;
+    uint256 public pinCoverageUntilCallCount;
+
+    function pinCoverageUntil(address governor, uint256 proposalId, uint256 deadline) external {
+        pinCoverageUntilCallCount++;
+        bytes32 k = _key(governor, proposalId);
+        if (deadline > _pinnedUntil[k]) _pinnedUntil[k] = deadline;
+    }
+
+    function pinnedUntil(address governor, uint256 proposalId) external view returns (uint256) {
+        return _pinnedUntil[_key(governor, proposalId)];
+    }
+
     function isCoverageFrozen(address governor, uint256 proposalId) external view returns (bool) {
         return _frozen[_key(governor, proposalId)];
     }
@@ -2479,6 +2498,34 @@ contract ChallengeGameTest is Test {
 
         uint256 r5 = _fileAndDispute();
         assertEq(game.challengeOf(r5).inconclusiveBurnBpsAtFiling, 2_000, "round 5 (4+): stays at the steady state");
+    }
+
+    // ── Issue #95: an Inconclusive re-arm must pin exposure to match ──
+
+    /// @notice `_refundAll` releases the LIVE freeze but re-arms
+    ///         `challengeableUntil[rk]` for another `challengeWindow` — this
+    ///         test pins that the SAME call now also extends the ledger's
+    ///         exposure pin to match, via `pinCoverageUntil`, rather than
+    ///         leaving the re-armed window unprotected.
+    /// @dev    MUTATION-CHECKED: deleting the `pinCoverageUntil` call from
+    ///         `_refundAll` makes `pinCoverageUntilCallCount` stay `0` here,
+    ///         failing the first assertion — this is the exact call the fix
+    ///         adds, not incidental mock plumbing.
+    function test_inconclusive_pinsExposureThroughTheReArmedDeadline() public {
+        bytes32 key = _reviewKeyFor(address(gov), PROPOSAL);
+        uint256 id = _fileAndDispute();
+
+        vm.prank(court);
+        game.rule(id, IChallengeGame.Verdict.Inconclusive);
+
+        assertEq(ledger.pinCoverageUntilCallCount(), 1, "the re-arm calls pinCoverageUntil exactly once");
+        uint256 rearmed = game.challengeableUntil(key);
+        assertGt(rearmed, block.timestamp, "the window is genuinely re-armed");
+        assertEq(
+            ledger.pinnedUntil(address(gov), PROPOSAL),
+            rearmed,
+            "pinned through the SAME instant the re-armed deadline reads, not a stale or independent one"
+        );
     }
 
     /// @notice THE ESCALATION IS REAL WOOD, NOT JUST A BIGGER BPS NUMBER: round
