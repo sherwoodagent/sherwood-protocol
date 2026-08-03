@@ -467,9 +467,15 @@ contract ExposureLedgerTest is Test {
         ledger.recordApproval(address(mgov), 1, guardian);
         // Commits its whole budget, not the full $6,000.
         assertEq(ledger.openExposureUsd(guardian), 5_000e18);
-        // ...and the proposal is NOT covered: the quorum still fails.
-        vm.expectRevert(IExposureLedger.InsufficientApproveCoverage.selector);
-        ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 6_000e6);
+        // ...and the proposal is NOT fully covered (issue #27: a partial but
+        // nonzero aggregate now SIZES instead of reverting) — the measurement
+        // reports the $5,000 raised against the $6,000 required, so the
+        // governor can size execution to 5/6 instead of blocking it outright.
+        (uint256 coverageRaisedUsd, uint256 requiredCoverageUsd) =
+            ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 6_000e6);
+        assertEq(coverageRaisedUsd, 5_000e18, "raised is capped at the guardian's own free budget");
+        assertEq(requiredCoverageUsd, 6_000e18);
+        assertLt(coverageRaisedUsd, requiredCoverageUsd, "still short of full coverage");
     }
 
     /// @notice Two half-bonded guardians jointly cover one proposal — §3.3a's
@@ -1143,11 +1149,14 @@ contract ExposureLedgerTest is Test {
 
         // The aggregate lands UNDER `needUsd`, which is the honest answer and
         // costs the quorum nothing: it sums the same `min(live, booked)` it
-        // would have summed had settling never run, so the proposal fails its
-        // coverage check exactly as it already would have.
+        // would have summed had settling never run — a nonzero shortfall now
+        // SIZES (issue #27) rather than reverting, exactly as the proposal's
+        // coverage measurement already would have reported.
         assertEq(ledger.liabilityUsd(address(mgov), 1), 650e18, "bounded by what the cohort can actually pay");
-        vm.expectRevert(IExposureLedger.InsufficientApproveCoverage.selector);
-        ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 1_000e6);
+        (uint256 coverageRaisedUsd, uint256 requiredCoverageUsd) =
+            ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 1_000e6);
+        assertEq(coverageRaisedUsd, 650e18, "bounded by what the cohort can actually pay");
+        assertEq(requiredCoverageUsd, 1_000e18);
     }
 
     /// @notice The fourth block-only path (siblings: M3, N1, N4). `_woodPrice`
@@ -2182,10 +2191,15 @@ contract ExposureLedgerTest is Test {
         ledger.recordApproval(address(mgov), 2, guardian);
         assertEq(ledger.openExposureUsd(guardian), 5_000e18, "total exposure capped at the bond");
 
-        // Proposal 1 stays covered; proposal 2 is under-covered and cannot execute.
+        // Proposal 1 stays fully covered; proposal 2 is under-covered — a
+        // nonzero shortfall now SIZES (issue #27) rather than blocking
+        // execution outright, so it returns the raised/required pair instead
+        // of reverting.
         ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 3_000e6);
-        vm.expectRevert(IExposureLedger.InsufficientApproveCoverage.selector);
-        ledger.requireApproveQuorum(address(mgov), 2, usdgAsset, 3_000e6);
+        (uint256 coverageRaisedUsd, uint256 requiredCoverageUsd) =
+            ledger.requireApproveQuorum(address(mgov), 2, usdgAsset, 3_000e6);
+        assertEq(coverageRaisedUsd, 2_000e18, "only the remaining $2,000 of budget backs proposal 2");
+        assertEq(requiredCoverageUsd, 3_000e18);
     }
 
     // EARLY-EXIT INTENDED: `recordApproval`'s no-free-budget return. This test IS
@@ -2317,9 +2331,14 @@ contract ExposureLedgerTest is Test {
         ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 5_000e6);
         // The discriminating threshold: only the reservation rule clears this.
         ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 6_000e6);
-        // Asking for more than was ever committed still fails.
-        vm.expectRevert(IExposureLedger.InsufficientApproveCoverage.selector);
-        ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 7_000e6);
+        // Asking for more than was ever committed no longer fails outright
+        // (issue #27) — the aggregate is reported CLAMPED at what was
+        // actually committed ($6,000), never inflated to meet the ask, so the
+        // governor sizes execution to 6/7 instead of blocking it.
+        (uint256 coverageRaisedUsd, uint256 requiredCoverageUsd) =
+            ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 7_000e6);
+        assertEq(coverageRaisedUsd, 6_000e18, "capped at the cohort's actual committed total");
+        assertEq(requiredCoverageUsd, 7_000e18);
     }
 
     /// @notice The LIVE leg of the quorum (F2): a committed share counts only at
@@ -2334,8 +2353,14 @@ contract ExposureLedgerTest is Test {
 
         vm.prank(owner);
         ledger.setWoodUsdPrice(0.005e8); // 10x crash — bond now worth $500
-        vm.expectRevert(IExposureLedger.InsufficientApproveCoverage.selector);
-        ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 5_000e6);
+        // Nonzero-but-shrunken coverage now SIZES (issue #27) instead of
+        // reverting: the crashed bond still backs $500 of the $5,000
+        // required, so the governor can size execution to 1/10 instead of
+        // blocking it outright.
+        (uint256 coverageRaisedUsd, uint256 requiredCoverageUsd) =
+            ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 5_000e6);
+        assertEq(coverageRaisedUsd, 500e18, "live leg shrank with the price crash");
+        assertEq(requiredCoverageUsd, 5_000e18);
     }
 
     /// @notice A vote change releases the commitment, so the proposal loses the
@@ -3027,11 +3052,19 @@ contract ExposureLedgerTest is Test {
         // whether they run in the same block. This is the established,
         // symmetric pro-rata semantics `_sharedSlashableUsd` already applies
         // everywhere else (see `test_finding2_...` below) — not a new rule
-        // invented for this gate.
-        vm.expectRevert(IExposureLedger.InsufficientApproveCoverage.selector);
-        ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 500e6);
-        vm.expectRevert(IExposureLedger.InsufficientApproveCoverage.selector);
-        ledger.requireApproveQuorum(address(mgov2), 1, usdgAsset, 500e6);
+        // invented for this gate. A nonzero-but-diluted aggregate now SIZES
+        // (issue #27) rather than reverting — both proposals report the same
+        // $300 raised against their $500 need, symmetric per the dilution
+        // ratio above, so the governor sizes both DOWN together instead of
+        // letting one "win" by call order.
+        (uint256 coverageRaisedUsd1, uint256 requiredCoverageUsd1) =
+            ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 500e6);
+        assertEq(coverageRaisedUsd1, 300e18, "diluted pro-rata share, proposal 1");
+        assertEq(requiredCoverageUsd1, 500e18);
+        (uint256 coverageRaisedUsd2, uint256 requiredCoverageUsd2) =
+            ledger.requireApproveQuorum(address(mgov2), 1, usdgAsset, 500e6);
+        assertEq(coverageRaisedUsd2, 300e18, "diluted pro-rata share, proposal 2, symmetric with proposal 1");
+        assertEq(requiredCoverageUsd2, 500e18);
     }
 
     /// @notice Companion to the test above: when the guardian's live stake
