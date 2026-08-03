@@ -4,19 +4,34 @@ pragma solidity 0.8.28;
 import {IMorpho, IIrm, Id, MarketParams, Market} from "./IMorpho.sol";
 
 /// @title  Vendored Morpho Blue math + periphery accounting
-/// @notice Provenance (GPL-2.0-or-later, no behavioral changes):
+/// @notice Provenance (GPL-2.0-or-later):
 ///           - `MathLib`         ← morpho-org/morpho-blue `src/libraries/MathLib.sol`
 ///           - `SharesMathLib`   ← morpho-org/morpho-blue `src/libraries/SharesMathLib.sol`
 ///           - `MarketParamsLib` ← morpho-org/morpho-blue `src/libraries/MarketParamsLib.sol`
+///           - `SafeCastLib`     ← morpho-org/morpho-blue `src/libraries/SafeCastLib.sol`
+///             (revert string from `src/libraries/ErrorsLib.sol`)
 ///           - `MorphoBalancesLib` ← morpho-org/morpho-blue periphery
 ///             `src/libraries/periphery/MorphoBalancesLib.sol`
 ///         Reimplemented locally so valuation has no runtime dependency beyond
-///         the canonical singleton itself (design decision D6). Differences
-///         from upstream are cosmetic only: accrual math runs in uint256 locals
-///         instead of `toUint128`-checked struct fields (identical results for
-///         any state the singleton can hold, since it enforces uint128 bounds),
-///         and `MarketParamsLib.id` uses `keccak256(abi.encode(...))` instead
-///         of upstream's equivalent hand-rolled assembly.
+///         the canonical singleton itself (design decision D6).
+///
+///         DEVIATIONS FROM UPSTREAM — the complete list, all non-behavioral:
+///           1. Subsetting. Only the functions Sherwood consumes are ported:
+///              `MathLib` omits `wDivDown`/`wDivUp`/`min`/`zeroFloorSub`;
+///              `MorphoBalancesLib` ports `expectedMarketBalances` and
+///              `expectedSupplyAssets` and omits the total/borrow-side
+///              variants. Every ported body is line-for-line upstream.
+///           2. `MarketParamsLib.id` uses `keccak256(abi.encode(marketParams))`
+///              where upstream hashes the same 160 contiguous bytes with
+///              hand-rolled assembly — identical digest for a 5-word struct.
+///           3. Packaging: four upstream files live in this one file, and the
+///              libraries are `internal`-only (no deployed bytecode).
+///         Arithmetic, rounding, guard order and revert conditions are
+///         upstream's. In particular accrual narrows through
+///         `SafeCastLib.toUint128` into the `Market` memory struct's uint128
+///         fields exactly as the singleton does, so a projection the singleton
+///         could not hold reverts here too instead of returning an inflated
+///         total (see `expectedMarketBalances`).
 
 /// @notice WAD fixed-point + Taylor-series helpers (Morpho `MathLib`).
 library MathLib {
@@ -71,6 +86,17 @@ library SharesMathLib {
     }
 }
 
+/// @notice uint256 → uint128 narrowing that reverts instead of truncating
+///         (Morpho `SafeCastLib`; the revert string is upstream's
+///         `ErrorsLib.MAX_UINT128_EXCEEDED`, kept verbatim so a caller
+///         matching on Morpho's own revert data still matches here).
+library SafeCastLib {
+    function toUint128(uint256 x) internal pure returns (uint128) {
+        require(x <= type(uint128).max, "max uint128 exceeded");
+        return uint128(x);
+    }
+}
+
 /// @notice `MarketParams → Id` derivation (Morpho `MarketParamsLib`).
 library MarketParamsLib {
     function id(MarketParams memory marketParams) internal pure returns (Id) {
@@ -85,6 +111,7 @@ library MarketParamsLib {
 library MorphoBalancesLib {
     using MathLib for uint256;
     using SharesMathLib for uint256;
+    using SafeCastLib for uint256;
 
     /// @notice Market totals as they would stand after accruing pending
     ///         interest at `block.timestamp`.
@@ -93,6 +120,23 @@ library MorphoBalancesLib {
     ///         borrow totals; a nonzero fee additionally mints fee shares
     ///         (diluting the fee out of suppliers' share price exactly as the
     ///         singleton does).
+    ///
+    ///         Accrual is accumulated INTO THE `Market` MEMORY STRUCT, whose
+    ///         totals are uint128, and narrowed through `toUint128` — upstream's
+    ///         exact arithmetic. The bound is load-bearing, not decoration: it
+    ///         is the invariant that this view can never report a total the
+    ///         singleton's own storage could not hold. Accumulating in uint256
+    ///         locals instead would let a projection past uint128 return a
+    ///         silently inflated, `ok = true` valuation that `withdrawTo` /
+    ///         `_settle` could never deliver, where upstream reverts. Reverting
+    ///         is the safe direction here: `MorphoSupplyAdapter.value` catches
+    ///         it into `(0, false)` and the vault degrades to Lane B.
+    ///
+    ///         Adversary: a market whose IRM (Morpho governance gates IRM
+    ///         enablement, so this is narrow) or whose unaccrued age drives
+    ///         `totalBorrowAssets * taylor(rate * elapsed)` past uint128 while
+    ///         staying inside uint256 — the only band where the two
+    ///         formulations disagree.
     function expectedMarketBalances(IMorpho morpho, MarketParams memory marketParams)
         internal
         view
@@ -106,31 +150,29 @@ library MorphoBalancesLib {
         Id marketId = MarketParamsLib.id(marketParams);
         Market memory market = morpho.market(marketId);
 
-        totalSupplyAssets = market.totalSupplyAssets;
-        totalSupplyShares = market.totalSupplyShares;
-        totalBorrowAssets = market.totalBorrowAssets;
-        totalBorrowShares = market.totalBorrowShares;
-
         uint256 elapsed = block.timestamp - market.lastUpdate;
         // Match upstream `MorphoBalancesLib`/`Morpho._accrueInterest`: a market
         // with `irm == address(0)` is a valid zero-rate market that accrues no
         // interest. Without this guard a codeless-address call reverts, which
         // would silently disable Lane A pricing for the whole vault the moment
         // any third party borrows a single wei from such a market.
-        if (elapsed != 0 && totalBorrowAssets != 0 && marketParams.irm != address(0)) {
+        if (elapsed != 0 && market.totalBorrowAssets != 0 && marketParams.irm != address(0)) {
             uint256 borrowRate = IIrm(marketParams.irm).borrowRateView(marketParams, market);
-            uint256 interest = totalBorrowAssets.wMulDown(borrowRate.wTaylorCompounded(elapsed));
-            totalBorrowAssets += interest;
-            totalSupplyAssets += interest;
+            uint256 interest = uint256(market.totalBorrowAssets).wMulDown(borrowRate.wTaylorCompounded(elapsed));
+            market.totalBorrowAssets += interest.toUint128();
+            market.totalSupplyAssets += interest.toUint128();
 
             if (market.fee != 0) {
                 uint256 feeAmount = interest.wMulDown(market.fee);
                 // Fee shares are priced against totals excluding the fee
                 // amount itself, matching the singleton.
-                uint256 feeShares = feeAmount.toSharesDown(totalSupplyAssets - feeAmount, totalSupplyShares);
-                totalSupplyShares += feeShares;
+                uint256 feeShares =
+                    feeAmount.toSharesDown(uint256(market.totalSupplyAssets) - feeAmount, market.totalSupplyShares);
+                market.totalSupplyShares += feeShares.toUint128();
             }
         }
+
+        return (market.totalSupplyAssets, market.totalSupplyShares, market.totalBorrowAssets, market.totalBorrowShares);
     }
 
     /// @notice `user`'s supply shares converted to loan-token assets over the

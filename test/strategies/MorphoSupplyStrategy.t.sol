@@ -472,4 +472,121 @@ contract MorphoSupplyAdapterTest is MorphoSupplyFixture {
         assertFalse(ok, "router maps adapter not-OK to lane B");
         assertEq(v, 0);
     }
+
+    // ── #16: accrual is bounded by uint128, exactly as upstream ──
+
+    /// @dev Drive `totalBorrowAssets * taylor(rate * elapsed)` past uint128
+    ///      while staying inside uint256 — the only band where accumulating in
+    ///      uint256 locals disagrees with upstream's `toUint128` narrowing.
+    ///      Borrow total is parked high but legal, and a steep rate is accrued
+    ///      over a day, so the projected total cannot fit the `Market` struct
+    ///      the singleton itself writes.
+    ///      Numbers: totals at uint128.max/4 ≈ 8.5e37 (legal), and a rate whose
+    ///      product with one day is 2e18, so the Taylor term is
+    ///      2e18 + 2e18 + 1.33e18 ≈ 5.33e18 and the projected borrow total is
+    ///      8.5e37 × 6.33 ≈ 5.4e38 — past uint128 (3.4e38), while every
+    ///      intermediate stays far inside uint256.
+    function _forceOverflowingAccrual() internal {
+        uint128 nearMax = type(uint128).max / 4;
+        mockMorpho.forceTotals(marketId, nearMax, nearMax, nearMax, nearMax);
+        mockMorpho.forcePosition(marketId, address(strategy), nearMax / 2);
+        irm.setRate(uint256(2e18) / 1 days);
+        vm.warp(vm.getBlockTimestamp() + 1 days);
+    }
+
+    /// @notice A projection the singleton's own uint128 storage could not hold
+    ///         must REVERT, not return an inflated total. Upstream narrows
+    ///         accrual through `toUint128`; accumulating in uint256 locals
+    ///         instead would report NAV the vault can never realize.
+    function test_accrual_beyondUint128_reverts_ratherThanInflating() public {
+        _forceOverflowingAccrual();
+        vm.expectRevert(bytes("max uint128 exceeded"));
+        adapter.unguardedValue(marketId, address(strategy));
+    }
+
+    /// @notice And that revert must land as Lane B, not as a broken NAV read:
+    ///         the adapter's try/catch turns it into `(0, false)`.
+    function test_adapter_failsClosedOnOverflowingAccrual() public {
+        _forceOverflowingAccrual();
+        (uint256 v, bool ok) = adapter.value(_livePosition(), address(strategy));
+        assertFalse(ok, "unrealizable projection degrades to Lane B");
+        assertEq(v, 0, "and reports no value, rather than an inflated one");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// #18b — settlement cannot be held hostage by market utilization
+// ═══════════════════════════════════════════════════════════════════════
+
+contract MorphoSupplySettlementTest is MorphoSupplyFixture {
+    /// @dev Borrow all but `leave` of the market so a full-position withdraw
+    ///      cannot be paid out, and do NOT repay: utilization stays pinned,
+    ///      which is exactly the hostage state.
+    function _pinUtilization(uint256 leave) internal {
+        mockMorpho.simulateBorrow(mp, SUPPLY - leave, borrower);
+    }
+
+    /// @notice Settlement takes what the market can deliver instead of
+    ///         reverting. Adversary: a borrower pinning utilization to freeze
+    ///         the whole vault — `redemptionsLocked()` would stay true, instant
+    ///         exits shut and the queue unable to settle, for as long as they
+    ///         hold the position.
+    function test_settle_atPinnedUtilization_deliversMaximum_ratherThanReverting() public {
+        _approveAndExecute();
+        _pinUtilization(10_000e6); // only 10k of the 100k is withdrawable
+
+        uint256 vaultBefore = usdg.balanceOf(address(vaultStub));
+        vm.prank(address(vaultStub));
+        strategy.settle(); // must NOT revert
+
+        assertEq(usdg.balanceOf(address(vaultStub)) - vaultBefore, 10_000e6, "delivered what the market could pay");
+        assertGt(
+            mockMorpho.position(marketId, address(strategy)).supplyShares, 0, "residue stays supplied, not destroyed"
+        );
+    }
+
+    /// @notice The residue is recoverable: once utilization recedes, anyone can
+    ///         sweep it back to the vault.
+    function test_sweep_returnsTheResidueOnceLiquidityReturns() public {
+        _approveAndExecute();
+        _pinUtilization(10_000e6);
+        vm.prank(address(vaultStub));
+        strategy.settle();
+
+        // Borrower repays; the market can now pay the rest.
+        usdg.mint(borrower, SUPPLY);
+        vm.startPrank(borrower);
+        usdg.approve(address(mockMorpho), type(uint256).max);
+        mockMorpho.simulateRepayAll(mp);
+        vm.stopPrank();
+
+        uint256 vaultBefore = usdg.balanceOf(address(vaultStub));
+        uint256 swept = strategy.sweep(); // permissionless
+        assertGt(swept, 0, "residue recovered");
+        assertEq(usdg.balanceOf(address(vaultStub)) - vaultBefore, swept, "and lands in the vault");
+        assertEq(mockMorpho.position(marketId, address(strategy)).supplyShares, 0, "position fully unwound");
+    }
+
+    /// @notice `sweep` is a post-settlement recovery path only — before
+    ///         settlement the position is unwound by `settle`/`withdrawTo`.
+    function test_sweep_revertsBeforeSettlement() public {
+        _approveAndExecute();
+        vm.expectRevert(MorphoSupplyStrategy.NotSettled.selector);
+        strategy.sweep();
+    }
+
+    /// @notice No regression on the liquid path: a market that can pay in full
+    ///         still settles by SHARES, so accrued interest comes out with no
+    ///         dust stranded.
+    function test_settle_whenFullyLiquid_unwindsCompletelyWithInterest() public {
+        _approveAndExecute();
+        _borrowWarpRepay(50_000e6, 30 days); // leaves interest on the supply side
+
+        uint256 vaultBefore = usdg.balanceOf(address(vaultStub));
+        vm.prank(address(vaultStub));
+        strategy.settle();
+
+        assertGt(usdg.balanceOf(address(vaultStub)) - vaultBefore, SUPPLY, "principal plus accrued interest");
+        assertEq(mockMorpho.position(marketId, address(strategy)).supplyShares, 0, "nothing left behind");
+    }
 }

@@ -54,6 +54,41 @@ contract MockMorpho is IMorpho {
         _market[id].fee = fee;
     }
 
+    /// @notice Force the market's four totals directly, bypassing supply/borrow
+    ///         bookkeeping and token backing.
+    /// @dev    TEST-ONLY, and deliberately unbacked: it exists to construct
+    ///         states at the edge of what the singleton's uint128 fields can
+    ///         hold — the only band where an accrual accumulated in uint256
+    ///         locals disagrees with upstream's `toUint128`-narrowed arithmetic.
+    ///         Do not use it to model ordinary markets; `simulateBorrow` /
+    ///         `simulateRepayAll` keep token balances honest and should be
+    ///         preferred everywhere else.
+    function forceTotals(
+        Id id,
+        uint128 totalSupplyAssets,
+        uint128 totalSupplyShares,
+        uint128 totalBorrowAssets,
+        uint128 totalBorrowShares
+    ) external {
+        Market storage m = _market[id];
+        m.totalSupplyAssets = totalSupplyAssets;
+        m.totalSupplyShares = totalSupplyShares;
+        m.totalBorrowAssets = totalBorrowAssets;
+        m.totalBorrowShares = totalBorrowShares;
+    }
+
+    /// @notice Force a position's supply shares. TEST-ONLY, same caveat as
+    ///         `forceTotals`.
+    function forcePosition(Id id, address who, uint128 supplyShares) external {
+        _position[id][who].supplyShares = supplyShares;
+    }
+
+    /// @notice Roll `lastUpdate` back so a view accrual sees `secs` of pending
+    ///         interest without warping the whole test's clock forward.
+    function backdate(Id id, uint128 secs) external {
+        _market[id].lastUpdate -= secs;
+    }
+
     /// @notice Raise utilization: books `assets` as borrowed and moves the
     ///         loan tokens out to `to` (so the mock's token balance tracks
     ///         real idle liquidity).
