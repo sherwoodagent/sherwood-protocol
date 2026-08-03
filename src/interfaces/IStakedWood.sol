@@ -98,6 +98,14 @@ interface IStakedWood {
     ///         stake. Live counterpart of `getPastVotes`.
     function getVotes(address account) external view returns (uint256);
 
+    /// @notice The WOOD a verdict slash anchored at `anchor` could recover
+    ///         from `guardian`'s own stake right now: `min(max(liability at
+    ///         anchor, votableStake at anchor), liveStake)`. Byte-for-byte the basis
+    ///         `_slashOne` sizes its per-approver take from (issue #35) — a
+    ///         guardian who tops up its stake after `anchor` is not counted.
+    ///         Reverts `VerdictNotPast` on a future `anchor`.
+    function slashableStakeAt(address guardian, uint256 anchor) external view returns (uint256);
+
     /// @notice Guardian's age-weighted own vote weight at a past timestamp.
     /// @dev    Not a term of `getPastTotalVotes`: the total sums RAW own
     ///         stake; this applies `_ageFactorBps` on top, so the two are

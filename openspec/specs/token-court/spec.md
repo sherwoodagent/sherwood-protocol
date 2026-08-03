@@ -3,9 +3,7 @@
 ## Purpose
 
 Single-layer WOOD-vote adjudication of disputed `ChallengeGame` challenges. One referral opens one vote window; one tally against a participation floor produces a three-valued verdict (`Guilty` / `NotGuilty` / `Inconclusive`) delivered to the game via `rule`. The court holds no WOOD, ever — every value-moving consequence of a verdict lives on `ChallengeGame` and `StakedWood` (see `openspec/specs/challenge-game/spec.md`).
-
 ## Requirements
-
 ### Requirement: Zero custody
 
 The court SHALL hold no WOOD at any point in any case lifecycle: no bonds, no counter-bonds, no reward pools, no custody bookkeeping. Its only output SHALL be a verdict handed to the pinned game's `rule` function. A verdict that fails to land on the game (terminal race) is bookkeeping, never stranded funds.
@@ -173,12 +171,35 @@ The court SHALL write `verdict`, `finalizedAt`, and phase `Resolved`, and emit `
 
 ### Requirement: Participation floor
 
-The participation floor SHALL be `participationFloorBps × base / 10_000` where `base = getPastTotalVotes(snapshotTs) - accusedWeight`, falling back to the unreduced total when the subtraction would not strictly reduce it (defence-in-depth; both operands share the raw-own-stake basis, so `accusedWeight <= total` by construction). Turnout is summed in aged weight while the base is raw, so aging only ever makes the floor harder to reach, never easier — the floor stays conservative. The floor SHALL read the LIVE `participationFloorBps` and the LIVE `stakedWood` at `finalize` time, deliberately not pinned per case: the floor is consumed exactly once, after voting has closed, so a change cannot retroactively alter any cast ballot, and a floor change applies to every case finalizing after it takes effect.
+The participation floor SHALL be `participationFloorBps × base / 10_000` where the base is computed in two steps, both at `finalize` time:
+
+1. **Same-instant accused reduction, clamped at zero**: `reduced = total(snapshotTs) > accusedWeight ? total(snapshotTs) - accusedWeight : 0`. `accusedWeight` sums the same raw-stake basis as `total(snapshotTs)` over a subset of the same addresses (the accused set), read at the same instant, so `accusedWeight <= total(snapshotTs)` holds structurally under one consistently-wired electorate source and the clamp exists only as defence-in-depth for an out-of-band `setStakedWood` re-point. Because the subtraction is same-instant, staking more by an accused address raises `total(snapshotTs)` and `accusedWeight` together and leaves `reduced` unchanged — there is no lever by which the accused can buy a higher floor by staking. The floor SHALL be monotone non-increasing as a function of WHICH addresses are named accused: naming one more address can only remove that address's stake from `reduced`, never add to it.
+2. **Lookback min**: `base = (getPastTotalVotes(snapshotTs - FLOOR_LOOKBACK) != 0 && getPastTotalVotes(snapshotTs - FLOOR_LOOKBACK) < reduced) ? getPastTotalVotes(snapshotTs - FLOOR_LOOKBACK) : reduced`, i.e. `base = min(earlier, reduced)` with a fallback to `reduced` when the lookback read is zero (no electorate existed a lookback ago, including a `snapshotTs` inside the chain's first `FLOOR_LOOKBACK`, where the lookback instant clamps to 0) — a zero base there would disable the anti-capture floor for the protocol's whole bootstrap window. `accusedWeight` is never subtracted from the earlier read; only `reduced` (step 1's output) is compared against it. The min defeats the pre-drain stake-surge denial lever: an attacker inflating the electorate immediately before their own drain (the attacker is exactly the party who knows when `executedAt` will be) must have the inflating stake present at BOTH instants, i.e. visibly parked on-chain for a month before the drain it exists to protect. A zero floor is safe because `finalize`'s `turnout == 0` guard still forces `Inconclusive` on an empty vote — a zero floor never lets a zero-turnout case resolve on the merits.
+
+Turnout is summed in aged weight while the base is raw, so aging only ever makes the floor harder to reach, never easier — the floor stays conservative. The floor SHALL read the LIVE `participationFloorBps` and the LIVE `stakedWood` at `finalize` time, deliberately not pinned per case: the floor is consumed exactly once, after voting has closed, so a change cannot retroactively alter any cast ballot, and a floor change applies to every case finalizing after it takes effect.
 
 #### Scenario: Floor base excludes accused stake
 
-- **WHEN** `finalize` computes the floor
-- **THEN** the base is the snapshot raw total minus the case's recorded `accusedWeight`, so the accused's own stake never inflates the turnout bar its jury must clear
+- **WHEN** `finalize` computes the floor and `accusedWeight` is below the electorate base
+- **THEN** the base is the electorate base minus the case's recorded `accusedWeight`, so the accused's own stake never inflates the turnout bar its jury must clear
+
+#### Scenario: Floor is monotone across the accused-weight boundary
+
+- **GIVEN** two otherwise identical cases whose recorded `accusedWeight` differ only in that one is just below the electorate base and the other is at or above it
+- **WHEN** `finalize` computes each floor
+- **THEN** the floor of the larger-`accusedWeight` case is less than or equal to the floor of the smaller — the floor never jumps up when `accusedWeight` crosses the base
+
+#### Scenario: Accused outweighing the electorate cannot deny a verdict
+
+- **GIVEN** a case whose recorded `accusedWeight` is at or above the electorate base
+- **WHEN** a single unaccused voter with any non-zero aged snapshot weight votes and the window elapses
+- **THEN** the floor is zero, turnout meets it, and `finalize` resolves the case on the merits rather than `Inconclusive` — the accused cannot buy a denial by staking past the base
+
+#### Scenario: Zero floor never resolves an empty vote
+
+- **GIVEN** a case whose recorded `accusedWeight` is at or above the electorate base, so the floor is zero
+- **WHEN** the window elapses with no votes cast
+- **THEN** `finalize` still returns `Inconclusive` via the `turnout == 0` guard — the clamp delegates the empty-vote case to that guard, never to the floor
 
 #### Scenario: Floor change applies to a live case
 
@@ -223,9 +244,9 @@ An `Inconclusive` verdict SHALL be a non-event that unwinds both sides on the ga
 All configuration setters SHALL be `onlyOwner` under plain `Ownable2Step` (two-step transfer; non-upgradeable), bounded, and event-emitting:
 
 - `setChallengeGame(newGame)`: rejects the zero address, and validates the cross-contract window invariant against the NEW game unconditionally (see the window-invariant requirement). Emits `ChallengeGameSet`.
-- `setStakedWood(newStakedWood)`: rejects the zero address. Emits `StakedWoodSet`.
+- `setStakedWood(newStakedWood)`: rejects the zero address, and validates the cross-contract floor invariant against the NEW sWOOD unconditionally (see the floor-invariant requirement). Emits `StakedWoodSet`.
 - `setVoteWindow(newWindow)`: requires `0 < newWindow <= MAX_VOTE_WINDOW` (14 days), and validates the window invariant against the live game when one is wired. Emits `VoteWindowSet`.
-- `setParticipationFloorBps(newBps)`: requires `0 < newBps <= 10_000`. Emits `ParticipationFloorBpsSet`.
+- `setParticipationFloorBps(newBps)`: requires `0 < newBps <= 10_000`, and validates the floor invariant against the live sWOOD when one is wired. Emits `ParticipationFloorBpsSet`.
 
 Re-wiring and window changes SHALL govern future referrals only: a case already `Voting` or `Resolved` keeps its pinned `game`, `snapshotTs`, and `voteWindowAtReferral`, so no owner action redirects a live case's `finalize` to a different game or moves a live case's clock or electorate.
 
@@ -275,3 +296,44 @@ The court SHALL expose full case state for indexers and callers: `caseOf(caseId)
 
 - **WHEN** a case finalizes `Inconclusive`
 - **THEN** the `CaseFinalized` event carries `guiltyVotes`, `notGuiltyVotes`, and `floor`, so `turnout < floor` is verifiable off-chain without re-deriving the floor
+
+### Requirement: Cross-contract floor invariant
+
+The court SHALL enforce `participationFloorBps < ageFloorBps` against the electorate contract's LIVE `ageFloorBps()` on both of its own setters that can break it: `setParticipationFloorBps` (when an electorate contract is wired; vacuous while unwired — there is no age floor to compare against yet) and `setStakedWood` (always, against the NEW electorate contract — closing the compose-bypass where a floor raised while unwired is then wired to an electorate whose age floor it meets or exceeds). Violations SHALL revert `FloorInvariantViolated`.
+
+The comparison SHALL be strict. Turnout is summed in aged vote weight, whose per-account factor is bounded below by `ageFloorBps/10_000`, while the floor's base is raw stake — so a fully young electorate voting completely produces turnout no less than `ageFloorBps/10_000` of the base, and the raw-turnout fraction required to clear the floor is `participationFloorBps / ageFloorBps`. At equality that fraction is 100% — every un-accused staked wei must vote, at exactly age zero, for `turnout >= floor` to hold — which is participation the system cannot assume; above it the fraction exceeds 100% and the floor is arithmetically unclearable for an all-young electorate. Equality therefore violates the invariant, exactly as the deploy pre-flight (`floorBps < ageFloorBps`) already asserts.
+
+The read SHALL fail closed: if the wired electorate contract does not expose `ageFloorBps()` (or the read reverts), the setter reverts rather than skipping the check — a floor change against an electorate whose age floor cannot be read is refused, matching how `setVoteWindow` bubbles a revert from the wired game's clock reads.
+
+The court SHALL NOT impose the reciprocal guard on the electorate contract: `StakedWood.setAgeFloorBps` remains free to lower `ageFloorBps` to or below the court's live floor. The dependency direction is deliberate — the court reads the staking layer, the staking layer does not know the court — so the invariant's other side is an accepted, monitored residual (see the deploy pre-flight requirement in `deployment-docs` and the off-chain monitoring commitment of issue #84 option 3).
+
+#### Scenario: Floor raised to meet or exceed the wired age floor
+
+- **WHEN** the owner calls `setParticipationFloorBps` with a value greater than or equal to the wired sWOOD's live `ageFloorBps()`
+- **THEN** the call reverts `FloorInvariantViolated`
+
+#### Scenario: Floor strictly below the age floor accepted
+
+- **WHEN** the owner calls `setParticipationFloorBps` with a value in `(0, 10_000]` strictly below the wired sWOOD's live `ageFloorBps()`
+- **THEN** the call succeeds, emits `ParticipationFloorBpsSet`, and the new floor is live for the next `finalize`
+
+#### Scenario: Vacuous while no electorate is wired
+
+- **WHEN** the owner calls `setParticipationFloorBps` on a court whose `stakedWood` is the zero address
+- **THEN** only the `(0, 10_000]` bound applies and the call succeeds — there is no age floor to compare against yet; the invariant is instead checked when `setStakedWood` later wires one
+
+#### Scenario: Wiring an electorate the current floor cannot clear
+
+- **WHEN** the owner calls `setStakedWood` with a sWOOD whose `ageFloorBps()` is less than or equal to the court's current `participationFloorBps`
+- **THEN** the call reverts `FloorInvariantViolated` — the invariant is checked on every wiring call, with no vacuous branch
+
+#### Scenario: Electorate that cannot report an age floor refused
+
+- **WHEN** the owner calls `setStakedWood` with a non-zero address that does not implement `ageFloorBps()`
+- **THEN** the call reverts — the guard fails closed rather than wiring an electorate whose age floor cannot be read
+
+#### Scenario: Age floor lowered on the staking side is NOT guarded here
+
+- **WHEN** the sWOOD owner calls `StakedWood.setAgeFloorBps` with a value at or below the court's live `participationFloorBps`
+- **THEN** the call succeeds on sWOOD and the invariant is broken until monitoring or governance restores it — the court's guard covers only the court's own two levers; this residual is accepted and monitored off-chain
+

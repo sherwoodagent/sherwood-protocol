@@ -97,9 +97,26 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      there is no external sink. What remains is `demoteByChallenge`
     ///      below — a BEST-EFFORT `try/catch` that runs AFTER
     ///      the slash. Under EIP-150 a caller supplying just enough gas to
-    ///      finish the slash leaves that child 63/64 of a nearly-empty frame:
-    ///      it starves, the catch swallows it, and the verdict settles with the
-    ///      challenged adapter KEEPING its certification. Everything else after
+    ///      finish the slash alone would leave that child 63/64 of a
+    ///      nearly-empty frame. Issue #51 posited that this silently starves
+    ///      the demotion: the child OOGs, the catch swallows it, and the
+    ///      verdict settles with the challenged adapter KEEPING its
+    ///      certification. VERIFIED AGAINST THE REAL STACK (openspec
+    ///      settle-demotion-gas-floor `design.md`, "Is the silent miss
+    ///      reachable?"): that path was never reachable, even before
+    ///      `DEMOTION_GAS` existed — an OOG child consumes its entire 63/64
+    ///      stipend, leaving the parent only 1/64 of a frame, which is too
+    ///      small to pay for the settle's own tail below the demotion (the
+    ///      burn/refund transfers and events), so a budget tight enough to
+    ///      starve the demotion OOGs the WHOLE settle instead of completing
+    ///      it silently. That protection was incidental, though: an artifact
+    ///      of these constants' measured slack and the tail's size, neither
+    ///      stated nor tested, one refactor (retuned constants, a slimmer
+    ///      tail) from disappearing. `DEMOTION_GAS` below makes it
+    ///      structural — a settle that clears the floor is GUARANTEED enough
+    ///      gas to reach the demotion child with room for it to succeed, not
+    ///      merely likely to OOG the whole call before completing silently.
+    ///      Everything else after
     ///      the slash reverts the whole call (unguarded `safeTransfer`s) or is
     ///      internal bookkeeping, so it is safe by rollback. The floor is still
     ///      sized per approver plus a base: the slash loop runs first, so a
@@ -165,9 +182,12 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      for, with the parent's burn/bubble branch still affordable behind
     ///      it.
     ///
-    ///      Full-cap floor is now `100 * 180_000 + 2_000_000 = 20,000,000`
-    ///      against a `32,000,000 * (63/64)^3 = 30,523,315` ceiling — 1.5x of
-    ///      slack, and 1.8x over what a full-cap conviction actually spends.
+    ///      Full-cap floor for a zero-adapter settle (these two terms alone)
+    ///      is `100 * 180_000 + 2_000_000 = 20,000,000` against a
+    ///      `32,000,000 * (63/64)^3 = 30,523,315` ceiling — 1.5x of slack,
+    ///      and 1.8x over what a full-cap conviction actually spends. An
+    ///      adapter-naming settle adds `DEMOTION_GAS` below — see that
+    ///      constant's natspec for the resulting total and headroom.
     ///      THE APPROVER CAP IS UNCHANGED: `MAX_APPROVERS_PER_PROPOSAL` is
     ///      also the size of the cohort that can underwrite one proposal, so
     ///      cutting it would cut coverage capacity, and the measurement shows
@@ -175,6 +195,42 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      is the CI tripwire that keeps this true.
     uint256 public constant SLASH_GAS_PER_APPROVER = 180_000;
     uint256 public constant SLASH_GAS_BASE = 2_000_000;
+
+    /// @dev THE DEMOTION GAS TERM (issue #51, openspec
+    ///      settle-demotion-gas-floor). Added to the floor above ONLY when
+    ///      the challenge names a non-zero adapter
+    ///      (`c.adapterTarget != address(0)` in `_settle`) — a zero-adapter
+    ///      filing demotes nothing and owes nothing for it.
+    ///
+    ///      THE ADVERSARY: a permissionless `resolve`/`finalize` caller
+    ///      dialling gas so the conviction lands but `demoteByChallenge`'s
+    ///      child starves under EIP-150's 63/64 forwarding, letting the
+    ///      adapter keep its certification with only `AdapterDemotionFailed`
+    ///      to show for it. That path is unreachable even without this term
+    ///      (see the comment above `SLASH_GAS_PER_APPROVER`), but the
+    ///      unreachability was incidental — this term makes the guarantee
+    ///      structural instead of emergent.
+    ///
+    ///      SIZING: `TierRegistry._demote` (`demoteByChallenge`'s callee)
+    ///      does a role check, deletes a 2-slot `_configs` entry, may flip
+    ///      one bond-release timelock slot 0->nonzero, and emits two events —
+    ///      estimated worst case ~45k, ~50k once issue #77 adds a
+    ///      `delete _adapterAllowed[target]` inside it. `DEMOTION_GAS =
+    ///      200_000` forwards ~197k after 63/64 forwarding even if every gas
+    ///      unit before the demotion call was spent exactly to the floor's
+    ///      budget — ~4x the estimated worst case including #77's headroom,
+    ///      in line with this file's other constants (the per-approver term
+    ///      is ~1.4x its measured value, the base >5x). The demotion-cost
+    ///      bracketing test in `test/SlashGasCeiling.t.sol` anchors this to a
+    ///      measurement against the real `TierRegistry`, not just the
+    ///      estimate above.
+    ///
+    ///      Full-cap floor for an adapter-naming settle is now
+    ///      `100 * 180_000 + 2_000_000 + 200_000 = 20,200,000` against the
+    ///      same `30,523,315` ceiling — 1.511x headroom (was 1.526x without
+    ///      this term; it costs about 1% of the slack).
+    ///      `test_slashGasFloorFitsRobinhoodMaxTxGas` gates this in CI.
+    uint256 public constant DEMOTION_GAS = 200_000;
 
     /// @notice Where every burned slice of a challenger's bond goes — both the
     ///         settle path's `settleBurnBps` and the fail path's
@@ -1061,7 +1117,21 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             // Enforces the gas floor sWOOD's burn-vs-bubble classifier
             // assumes. Checked as late as possible so everything already
             // spent counts against the caller, not the margin.
-            if (gasleft() < approvers.length * SLASH_GAS_PER_APPROVER + SLASH_GAS_BASE) {
+            //
+            // ADAPTER-NAMING SETTLES ALSO OWE `DEMOTION_GAS`. The slash-only
+            // terms above budget for `slashVerdict`; they say nothing about
+            // the best-effort `demoteByChallenge` child below, which this
+            // settle will attempt whenever `c.adapterTarget != address(0)`.
+            // Without the extra term a caller could dial gas to a value that
+            // clears the slash but leaves the demotion underfunded — see
+            // `DEMOTION_GAS`'s natspec for why that no longer silently drops
+            // the demotion. The term is skipped for zero-adapter filings,
+            // which demote nothing and owe nothing for it.
+            uint256 requiredGas = approvers.length * SLASH_GAS_PER_APPROVER + SLASH_GAS_BASE;
+            if (c.adapterTarget != address(0)) {
+                requiredGas += DEMOTION_GAS;
+            }
+            if (gasleft() < requiredGas) {
                 revert InsufficientSlashGas();
             }
 
@@ -1138,6 +1208,24 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             // was live must not take the whole verdict down with it — the miss
             // is surfaced as an event and the verdict proceeds; the registry
             // owner's own `demote` fixes it afterward.
+            //
+            // THE CATCH STAYS BARE, DELIBERATELY (openspec
+            // settle-demotion-gas-floor design.md, Decision 2 — selector
+            // filtering was considered and rejected). The floor above now
+            // refuses, up front, any budget that could starve this call —
+            // the caller-selectable failure axis (gas) is closed before the
+            // slash even runs. Everything that still reaches this catch is
+            // therefore registry-side: on the real `TierRegistry`,
+            // `_demote` has no revert path of its own except the role check
+            // (F11's revoked `authorizedDemoter`), so there is nothing left
+            // for a selector filter to classify — and an out-of-gas child
+            // (were one still possible) returns empty revert data no filter
+            // can distinguish from a legitimate one anyway. Bubbling a
+            // registry-side revert instead of swallowing it would re-open
+            // F11's wedge: a challenge that can never settle, bonds
+            // stranded, coverage frozen, the accused barred from
+            // `claimUnstakeGuardian` — forever, since a role rotation is not
+            // something the settle caller can fix by retrying.
             //
             // INSIDE THIS BRANCH, NOT AFTER THE IF/ELSE. Demotion is a
             // consequence of a conviction this settle actually collected. The

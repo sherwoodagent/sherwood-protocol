@@ -2,6 +2,7 @@
 pragma solidity 0.8.28;
 
 import {Test} from "forge-std/Test.sol";
+import {Vm} from "forge-std/Vm.sol";
 
 import {SyndicateGovernor} from "../src/SyndicateGovernor.sol";
 import {ISyndicateGovernor} from "../src/interfaces/ISyndicateGovernor.sol";
@@ -471,8 +472,12 @@ contract SlashGasCeilingTest is Test {
     function test_slashGasFloorFitsRobinhoodMaxTxGas() public {
         _deployStack(0); // the gate needs the constants, not a cohort
 
+        // Worst case is an adapter-naming settle (issue #51,
+        // openspec settle-demotion-gas-floor): it owes DEMOTION_GAS on top of
+        // the slash terms. A zero-adapter filing's floor is strictly smaller,
+        // so the adapter-naming total is the binding case for this gate.
         uint256 cap = registry.MAX_APPROVERS_PER_PROPOSAL();
-        uint256 floor = cap * game.SLASH_GAS_PER_APPROVER() + game.SLASH_GAS_BASE();
+        uint256 floor = cap * game.SLASH_GAS_PER_APPROVER() + game.SLASH_GAS_BASE() + game.DEMOTION_GAS();
 
         // 32,000,000 * 63^3 / 64^3, integer-exact.
         uint256 ceiling = (MAX_TX_GAS * 63 * 63 * 63) / (64 * 64 * 64);
@@ -480,7 +485,8 @@ contract SlashGasCeilingTest is Test {
         emit log_named_uint("MAX_APPROVERS_PER_PROPOSAL", cap);
         emit log_named_uint("SLASH_GAS_PER_APPROVER", game.SLASH_GAS_PER_APPROVER());
         emit log_named_uint("SLASH_GAS_BASE", game.SLASH_GAS_BASE());
-        emit log_named_uint("full-cap slash gas floor", floor);
+        emit log_named_uint("DEMOTION_GAS", game.DEMOTION_GAS());
+        emit log_named_uint("full-cap slash gas floor (adapter-naming)", floor);
         emit log_named_uint("32M after (63/64)^3", ceiling);
 
         assertLt(floor, ceiling, "a full-cap conviction must fit inside one Robinhood transaction");
@@ -585,6 +591,12 @@ contract SlashGasCeilingTest is Test {
 
         uint256 stakeBefore = swood.guardianStake(approvers[7]);
 
+        // The adapter this filing named is certified GOING IN, so its tier
+        // after the conviction is a real signal rather than a tautology.
+        (uint8 tierBefore,) = tierRegistry.tierOf(address(adapter), adapter.poke.selector);
+        assertEq(tierBefore, 1, "the challenged adapter is certified before the conviction");
+        vm.recordLogs();
+
         // THE BUDGET A REAL TRANSACTION HAS. Frame 0 is entered by the
         // transaction itself (no 63/64 haircut on that hop); every haircut below
         // it is the EVM's own.
@@ -606,6 +618,31 @@ contract SlashGasCeilingTest is Test {
         assertLt(swood.guardianStake(approvers[7]), stakeBefore, "the cohort really was slashed");
         // The proceeds were destroyed, not routed: there is no case to open.
         assertEq(swood.pendingBurn(), 0, "and the burn landed rather than parking for a flush retry");
+
+        // AND THE DEMOTION LANDED — the assertion this test was missing.
+        // This is the only test that drives a full-cap, adapter-naming
+        // conviction through the real call depth at the real worst-case
+        // budget, which is the exact condition `DEMOTION_GAS` exists for. But
+        // `_settle` swallows a failed demotion in a bare catch, so without
+        // this check a future regression that re-narrows the margin at
+        // precisely this boundary would leave the test green: the verdict
+        // would still settle, the cohort would still be slashed, and the
+        // challenged adapter would quietly keep its certification.
+        //
+        // The TIER is the binding check — it is the invariant that matters
+        // and it survives any renaming of the event below.
+        (uint8 tierAfter,) = tierRegistry.tierOf(address(adapter), adapter.poke.selector);
+        assertEq(tierAfter, tierRegistry.TIER_ARBITRARY(), "the challenged adapter really lost its certification");
+
+        // The event absence is the explicit form of the same claim: the
+        // demotion did not merely fail into the catch.
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i = 0; i < logs.length; i++) {
+            assertTrue(
+                logs[i].topics[0] != keccak256("AdapterDemotionFailed(uint256,address,bytes4)"),
+                "the demotion must not have been swallowed by the bare catch"
+            );
+        }
     }
 
     // ── 3. The measurement the constants are set from ─────────────────────
@@ -660,11 +697,68 @@ contract SlashGasCeilingTest is Test {
     ///         classifier in `StakedWood` that the floor exists to protect loses
     ///         its guarantee.
     function test_theFloorExceedsWhatAFullCapConvictionSpends() public {
+        // `_measureConvictionGas` runs through `_fileDisputeRefer`, which
+        // names a real adapter — the measured spend already includes the
+        // demotion, so the floor it is compared against must include
+        // DEMOTION_GAS too (issue #51, openspec settle-demotion-gas-floor).
         uint256 spent = _measureConvictionGas(100);
-        uint256 floor = uint256(100) * game.SLASH_GAS_PER_APPROVER() + game.SLASH_GAS_BASE();
+        uint256 floor = uint256(100) * game.SLASH_GAS_PER_APPROVER() + game.SLASH_GAS_BASE() + game.DEMOTION_GAS();
         emit log_named_uint("full-cap conviction gas", spent);
-        emit log_named_uint("full-cap gas floor", floor);
+        emit log_named_uint("full-cap gas floor (adapter-naming)", floor);
         assertLt(spent, floor, "the floor must reserve more than the conviction actually spends");
+    }
+
+    // ── 4. The demotion-cost bracketing (issue #51) ────────────────────────
+
+    /// @notice Task 2.4 (openspec settle-demotion-gas-floor). `DEMOTION_GAS`'s
+    ///         natspec estimates the worst-case `demoteByChallenge` frame at
+    ///         ~45-50k; this anchors that to a real measurement against the
+    ///         real `TierRegistry` rather than trusting the estimate.
+    ///
+    /// @dev    Measures the WORST-CASE demotion, not the fixture's default
+    ///         zero-bond one: `_deployStack`'s `certify` call passes
+    ///         `submitter = address(0)`, which skips the submitter-bond
+    ///         machinery entirely. This test re-certifies the same
+    ///         (target, selector) with a real, funded submitter bond first, so
+    ///         `_demote`'s conditional bond-release branch — the
+    ///         `releasableAt` SSTORE from zero to non-zero, plus
+    ///         `SubmitterBondReleaseStarted` — actually runs, matching the
+    ///         sizing note's worst-case accounting.
+    ///
+    ///         Measured directly against `demoteByChallenge`, pranked as the
+    ///         registry's `authorizedDemoter` (the game, per `_deployStack`),
+    ///         rather than through a full `_settle` — isolating the child's
+    ///         own cost from the slash and payout work around it, which is
+    ///         what `DEMOTION_GAS` actually reserves gas for.
+    function test_demotionGas_fitsInsideTheReservedStipend() public {
+        _deployStack(0);
+
+        // `_deployStack` constructs `tierRegistry = new TierRegistry(address(this))`
+        // — the test contract itself is the owner, not the `owner` fixture
+        // address used for the rest of the stack. No prank needed here.
+        address submitter = makeAddr("demotionGasSubmitter");
+        wood.mint(submitter, 10_000e18);
+        tierRegistry.setWood(address(wood));
+        tierRegistry.setSubmitterBondWood(10_000e18);
+        tierRegistry.setBondReleaseDelay(14 days);
+        vm.prank(submitter);
+        wood.approve(address(tierRegistry), type(uint256).max);
+        // Re-certify the fixture's adapter with a real bond so the demotion
+        // below actually starts the bond-release timelock — the worst case.
+        tierRegistry.certify(address(adapter), adapter.poke.selector, 1, CERTIFIED_BOUND_BPS, submitter);
+
+        uint256 forwarded = (game.DEMOTION_GAS() * 63) / 64;
+
+        vm.prank(address(game));
+        uint256 before = gasleft();
+        tierRegistry.demoteByChallenge(address(adapter), adapter.poke.selector);
+        uint256 spent = before - gasleft();
+
+        emit log_named_uint("measured demoteByChallenge gas (worst case, real bond release)", spent);
+        emit log_named_uint("DEMOTION_GAS * 63/64 (the stipend a starved-to-the-floor caller forwards)", forwarded);
+        emit log_named_uint("headroom left for issue #77's extra delete", forwarded - spent);
+
+        assertLt(spent, forwarded, "DEMOTION_GAS must reserve more than a real demotion actually spends");
     }
 
     function _measureConvictionGas(uint256 n) internal returns (uint256 spent) {

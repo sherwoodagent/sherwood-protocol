@@ -95,6 +95,25 @@ contract MockFilingDeadline {
 ///      to something that is not a game, or simply a broken address.
 contract MuteFreezer {}
 
+/// @dev The permissive ledger an attacker re-points the governor's LIVE
+///      `_exposureLedger` slot at (issue #116): zero challenge window, no
+///      freezer, never reports a freeze. Only the three views the reclaim
+///      gates read. Used to prove the gates follow the PINNED ledger, not
+///      whatever this slot points at when `reclaimProposerBond` is called.
+contract PermissiveLedgerMock {
+    function challengeWindow() external pure returns (uint256) {
+        return 0;
+    }
+
+    function coverageFreezer() external pure returns (address) {
+        return address(0);
+    }
+
+    function isCoverageFrozen(address, uint256) external pure returns (bool) {
+        return false;
+    }
+}
+
 /// @dev Escrow auth surface (separate from the governor's guardian registry):
 ///      the escrow only reads `isAuthorizedGovernor`.
 contract MockEscrowAuth {
@@ -1019,6 +1038,137 @@ contract GovernorCoverageGatesTest is Test {
         uint256 balBefore = wood.balanceOf(agent);
         governor.reclaimProposerBond(pid);
         assertEq(wood.balanceOf(agent), balBefore + 200e18);
+    }
+
+    // ── Issue #116/#117: pinned reclaim-gate ledger + forfeiture acknowledge ──
+
+    /// @dev Locates the storage slot holding a proposal's `proposerBondLedger`
+    ///      empirically — by scanning the mapping element's slots for the one
+    ///      that reads back the pinned ledger address — rather than
+    ///      hand-deriving the struct's packing (fragile, and this file is not
+    ///      the layout golden's source of truth). `_proposals` is slot 1
+    ///      (`test/governor/GovernorLayoutPins.t.sol`). Used only to fabricate
+    ///      a pre-pin (zero) record for the fallback tests below; the pin
+    ///      itself is written by production code (`_snapshotTierAndGate`) in
+    ///      every other test.
+    function _proposerBondLedgerSlot(uint256 pid) internal view returns (bytes32) {
+        bytes32 base = keccak256(abi.encode(pid, uint256(1)));
+        bytes32 want = bytes32(uint256(uint160(address(ledger))));
+        for (uint256 i = 0; i < 40; i++) {
+            bytes32 slot = bytes32(uint256(base) + i);
+            if (vm.load(address(governor), slot) == want) return slot;
+        }
+        revert("proposerBondLedger slot not found");
+    }
+
+    /// @notice Issue #116 REGRESSION: once this proposal settles, the
+    ///         `_openProposalCount > 0` guard on `setExposureLedger` no
+    ///         longer holds — exactly the window the finding describes — so
+    ///         the factory can re-point the governor's LIVE ledger at a
+    ///         permissive one (no freezer, zero window) while the bond is
+    ///         still held. Under the live read this used to open every gate
+    ///         in one transaction; pinned, the gates keep reading the ledger
+    ///         recorded at propose time and stay shut, and a conviction
+    ///         reached inside that window still finds the bond in escrow.
+    function test_reclaimBond_rePointedLedgerCannotDetachTheGate() public {
+        uint256 pid = _executeThenSettle();
+        assertEq(governor.openProposalCount(), 0, "settled proposal freed the setExposureLedger guard");
+        assertEq(governor.getProposal(pid).proposerBondLedger, address(ledger), "pinned at propose time");
+
+        address permissive = address(new PermissiveLedgerMock());
+        governor.setExposureLedger(permissive); // factory re-point, mid-hold-window
+        assertEq(governor.getProposal(pid).proposerBondLedger, address(ledger), "the pin does not move");
+
+        // Under a live read this would pass instantly (zero window, no
+        // freezer). Pinned, it still refuses at the ORIGINAL ledger's
+        // deadline.
+        vm.warp(governor.getProposal(pid).executedAt + ledger.challengeWindow() - 1);
+        vm.expectRevert(ISyndicateGovernor.ChallengeWindowOpen.selector);
+        governor.reclaimProposerBond(pid);
+
+        // And a conviction filed against the pinned ledger's own game inside
+        // that window still forfeits the bond — the re-point never actually
+        // opened anything for this proposal.
+        vm.prank(ledgerOwner);
+        ledger.setCoverageFreezer(address(this));
+        escrow.forfeitBond(address(governor), pid, address(0), 0);
+        (, uint256 held) = escrow.bondOf(address(governor), pid);
+        assertEq(held, 0, "the bond was still convictable and is now forfeited");
+    }
+
+    /// @notice Issue #116 fallback (design D2): a proposal that predates
+    ///         ledger pinning (simulated: its `proposerBondLedger` is zero)
+    ///         gates against the LIVE `_exposureLedger` slot exactly as
+    ///         before this change — the fallback must not brick an old
+    ///         bond-carrying record.
+    function test_reclaimBond_prePinFallsBackToLiveLedger() public {
+        uint256 pid = _executeThenSettle();
+        vm.store(address(governor), _proposerBondLedgerSlot(pid), bytes32(0));
+        assertEq(governor.getProposal(pid).proposerBondLedger, address(0), "simulated pre-pin record");
+
+        uint256 opensAt = governor.getProposal(pid).executedAt + ledger.challengeWindow();
+        vm.warp(opensAt - 1);
+        vm.expectRevert(ISyndicateGovernor.ChallengeWindowOpen.selector);
+        governor.reclaimProposerBond(pid);
+
+        vm.warp(opensAt);
+        uint256 balBefore = wood.balanceOf(agent);
+        governor.reclaimProposerBond(pid);
+        assertEq(wood.balanceOf(agent), balBefore + 200e18, "reclaimed via the live-slot fallback");
+    }
+
+    /// @notice The other half of the same fallback: when BOTH the pin and the
+    ///         live slot are zero, reclaim still fails closed exactly as an
+    ///         unpinned governor always has — the fallback preserves the
+    ///         `ExposureLedgerUnset` posture, it does not relax it.
+    function test_reclaimBond_prePinFallback_failsClosedWhenLiveLedgerIsAlsoUnset() public {
+        uint256 pid = _executeThenSettle();
+        vm.store(address(governor), _proposerBondLedgerSlot(pid), bytes32(0));
+        governor.setExposureLedger(address(0)); // un-wiring is exempt from the open-proposal guard
+
+        vm.warp(governor.getProposal(pid).executedAt + 365 days);
+        vm.expectRevert(ISyndicateGovernor.ExposureLedgerUnset.selector);
+        governor.reclaimProposerBond(pid);
+    }
+
+    /// @notice Issue #117 L1: `forfeitBond` deletes the escrow's record on
+    ///         conviction without touching the governor's `proposerBondWood`.
+    ///         Before this fix, `reclaimProposerBond` passed every gate and
+    ///         then died forever in the escrow's `NoBond`. Now it acknowledges
+    ///         the forfeiture instead: zeroes the stale record, emits a
+    ///         dedicated event, moves no WOOD, and a second call reaches the
+    ///         ordinary terminal `NoBondToReclaim` — the same answer as after
+    ///         a normal release.
+    function test_reclaimBond_forfeitedBond_acknowledgesInstead() public {
+        uint256 pid = _executeThenSettle();
+        vm.prank(ledgerOwner);
+        ledger.setCoverageFreezer(address(this));
+
+        uint256 agentBefore = wood.balanceOf(agent);
+
+        escrow.forfeitBond(address(governor), pid, address(0), 0);
+        (, uint256 held) = escrow.bondOf(address(governor), pid);
+        assertEq(held, 0, "escrow record deleted by forfeiture");
+        assertEq(governor.getProposal(pid).proposerBondWood, 200e18, "governor's record is stale until reclaim");
+
+        // Snapshotted AFTER forfeiture (which already moved the WOOD) so these
+        // isolate the ACKNOWLEDGE step's own effect: it must move nothing
+        // further.
+        uint256 escrowAfterForfeiture = wood.balanceOf(address(escrow));
+        uint256 burnAfterForfeiture = wood.balanceOf(escrow.BURN_ADDRESS());
+
+        vm.warp(governor.getProposal(pid).executedAt + ledger.challengeWindow() + 365 days);
+        vm.expectEmit(true, true, true, true, address(governor));
+        emit ISyndicateGovernor.ProposerBondForfeitureAcknowledged(pid, 200e18);
+        governor.reclaimProposerBond(pid);
+
+        assertEq(governor.getProposal(pid).proposerBondWood, 0, "the stale record is cleared");
+        assertEq(wood.balanceOf(agent), agentBefore, "no transfer to the proposer");
+        assertEq(wood.balanceOf(address(escrow)), escrowAfterForfeiture, "acknowledge moves no further WOOD");
+        assertEq(wood.balanceOf(escrow.BURN_ADDRESS()), burnAfterForfeiture, "no additional burn from the acknowledge");
+
+        vm.expectRevert(ISyndicateGovernor.NoBondToReclaim.selector);
+        governor.reclaimProposerBond(pid);
     }
 }
 

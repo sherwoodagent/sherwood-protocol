@@ -827,6 +827,65 @@ contract CoverageEndToEndTest is Test {
         assertEq(ledger.openExposureUsd(g1), 0, "epoch + challenge window elapsed => budget recycled");
     }
 
+    /// @notice Issue #35, end-to-end: an accused approver cannot use a
+    ///         post-execution top-up to restore the filing-bond basis a WOOD
+    ///         price crash took away. Drives a REAL proposal through the real
+    ///         governor, registry, and sWOOD stack -- no coverage-path mocks.
+    ///
+    ///         g1 approves with a $1,500 bond against a $1,000 need (reserves
+    ///         the full $1,000). WOOD then crashes 2.5x ($0.05 -> $0.02),
+    ///         dropping g1's LIVE bond to $600 -- below its reservation. g1
+    ///         tops up post-execution by exactly enough WOOD to restore its
+    ///         live bond to $1,000 at the crashed price. Under the OLD
+    ///         (pre-issue-#35, always-live) basis that top-up would have fully
+    ///         restored `liabilityUsd` to $1,000 -- capital the verdict slash,
+    ///         anchored at `executedAt`, can never reach. The fix prices g1 at
+    ///         its pre-top-up WOOD snapshot even at the crashed rate, so
+    ///         `liabilityUsd` -- and the filing bond `ChallengeGame.file`
+    ///         sizes from it -- stays at the pre-top-up figure.
+    function test_n35_postExecutionTopUpCannotPriceUpItsOwnProsecution() public {
+        uint256 pid = _propose(govA, address(vaultA), agentA);
+        _openReview(govA, pid);
+        _vote(govA, pid, g1, IGuardianRegistry.GuardianVoteType.Approve);
+        assertEq(ledger.openExposureUsd(g1), COVERAGE_USD, "g1 reserves the full $1,000 coverage");
+
+        _pastReview(govA, pid);
+        govA.executeProposal(pid);
+        assertEq(_state(govA, pid), uint256(ISyndicateGovernor.ProposalState.Executed), "executed");
+
+        // Advance time past the execute instant. Checkpoints are
+        // timestamp-keyed: a top-up landing in the SAME timestamp as
+        // `executedAt` would merge into that checkpoint instead of creating
+        // a strictly-later one (same-second lookups are intentional
+        // elsewhere in this codebase too), so the top-up below must be
+        // pushed at a genuinely later instant to test the anchor at all.
+        skip(1 hours);
+
+        // WOOD crashes 2.5x: $0.05 -> $0.02. g1's live bond falls from $1,500
+        // to $600 -- below its $1,000 reservation.
+        MockWoodTwapOracle(ledger.woodTwapOracle()).setPrice(0.02e8);
+        assertEq(ledger.slashableBondUsd(g1), 600e18, "live bond crashed with the price");
+        uint256 liabilityAfterCrash = ledger.liabilityUsd(address(govA), pid);
+        assertEq(liabilityAfterCrash, 600e18, "filing-bond basis drops with the price");
+
+        // g1 (the accused approver) tops up post-execution: at the crashed
+        // price this exactly restores its LIVE bond to the $1,000 reservation.
+        wood.mint(g1, 20_000e18);
+        vm.startPrank(g1);
+        wood.approve(address(swood), type(uint256).max);
+        swood.stakeAsGuardian(20_000e18, 1);
+        vm.stopPrank();
+        assertEq(ledger.slashableBondUsd(g1), 1_000e18, "sanity: live bond IS fully restored by the top-up");
+
+        // The anchored `liabilityUsd` is UNMOVED: the verdict slash, anchored
+        // at `executedAt`, can never reach the top-up tranche.
+        assertEq(
+            ledger.liabilityUsd(address(govA), pid),
+            liabilityAfterCrash,
+            "post-execution top-up cannot price up g1's own prosecution"
+        );
+    }
+
     // ── 2. Batching attack: the netting cap blocks simultaneous exposure ──
 
     /// @notice Spec §3.3's core anti-batching property. ONE guardian, TWO

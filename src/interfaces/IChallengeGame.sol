@@ -246,10 +246,13 @@ interface IChallengeGame {
     ///         timeout stays the only way out of `Disputed`.
     error NotCourt();
     /// @dev `resolve` was called with too little gas to guarantee the slash
-    ///      loop can finish. Retry with more gas; nothing about the challenge
-    ///      state changes. The floor is currently conservative — it was sized
-    ///      around an external `openCase` child that no longer exists (see
-    ///      `ChallengeGame.SLASH_GAS_BASE`).
+    ///      loop can finish, or — on a challenge naming an adapter — too
+    ///      little to also guarantee the best-effort `demoteByChallenge` that
+    ///      follows it (`ChallengeGame.DEMOTION_GAS`, added by issue #51's
+    ///      openspec settle-demotion-gas-floor). Retry with more gas; nothing
+    ///      about the challenge state changes. The slash-only terms are
+    ///      currently conservative — sized around an external `openCase`
+    ///      child that no longer exists (see `ChallengeGame.SLASH_GAS_BASE`).
     error InsufficientSlashGas();
     /// @dev The filing named an adapter `(target, selector)` that does not
     ///      appear in the challenged proposal's own execute calls. A

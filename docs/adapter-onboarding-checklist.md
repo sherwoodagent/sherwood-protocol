@@ -93,6 +93,34 @@ reverts `DisallowedTransferTarget(target, selector, recipient)`
 [`:525`](../src/SyndicateVault.sol#L525)). Any other selector is skipped
 ([`:527`](../src/SyndicateVault.sol#L527)).
 
+### Gate B is codehash-bound (issue #137)
+
+`setAdapterAllowed(adapter, true)` snapshots the adapter's effective codehash
+at grant time into a dedicated mapping, and `isAdapterAllowed` answers `true`
+only while the adapter's live code still matches that snapshot — a lazy,
+read-side self-heal mirroring `tierOf`'s codehash check (§2.3), with no state
+write in the hot path. Consequences for onboarding:
+
+- **Grant only after the adapter's final code is deployed and verified.** The
+  grant snapshots whatever code is live at that moment. Granting against a
+  predicted (counterfactual) CREATE2 address snapshots "no code"; the funds
+  path closes the instant code appears there, and stays closed until the
+  owner re-attests it.
+- **A legitimate bytecode change at the adapter's address closes the funds
+  path** on the very next read, without waiting for `poke`, until the owner
+  re-attests the new code with a fresh `setAdapterAllowed(adapter, true)` —
+  the designed recovery ceremony, mirroring the demote → re-certify cycle for
+  tiers (§4).
+- **The binding does not cover proxy implementation swaps**, for the same
+  reason `tierOf`'s does not (§2.3): a proxy's own runtime bytecode is
+  constant across upgrades. The §2.3 proxied-adapter prohibition covers Gate
+  B for the same reason it covers Gate A.
+- Non-existent and existing-but-codeless addresses (EIP-1052:
+  `EXTCODEHASH == bytes32(0)` vs `keccak256("")`) both normalize to one "no
+  code" value for the snapshot and the comparison — so allowlisting a plain
+  codeless payout address and later merely funding it with native currency
+  cannot, by itself, close the funds path.
+
 ### Why they do not imply each other
 
 The keys are different objects. A call like `USDC.approve(adapter, x)` has
@@ -351,15 +379,28 @@ because they either don't run `_demote`, or don't persist at all:
   clear is a side effect of a demotion that never happened.
 - `tierOf` reporting tier 2 lazily on a codehash mismatch
   ([`:95`](../src/TierRegistry.sol#L95)) writes no state until someone calls
-  `poke` — until then the stored allowlist entry survives untouched.
+  `poke` — until then the stored `_configs`/`_adapterAllowed` entries survive
+  untouched. As of issue #137, `isAdapterAllowed` self-heals the same way on
+  the same read: it cross-checks the adapter's live codehash against the
+  snapshot taken at the last grant and answers `false` on a mismatch, with no
+  state write. **This is now a hygiene gap, not a funds-path hazard**: on a
+  codehash mismatch both `tierOf` AND `isAdapterAllowed` already report the
+  safe answer before anyone calls `poke`, so a governor batch cannot fund a
+  code-changed adapter regardless of whether `poke` has ever run. What
+  survives un-`poke`d is stale STORAGE and stale indexer state only —
+  `AdapterAllowedSet` history still says `allowed`, while the live read
+  already says `false`.
 
 **Operational consequence:** `TierDemoted` alone no longer needs a manual
 allowlist reaction for `demote`, `demoteByChallenge`, or `poke` — the clear
 already happened on-chain, atomically. The allowlist alarms that remain: (a)
 `AdapterDemotionFailed` — apply the lost demotion via owner `demote` (which
 itself clears the allowlist) or call `setAdapterAllowed(adapter, false)`
-directly; (b) an un-`poke`d lazy demotion — keep running the §3 drift sweep to
-catch it.
+directly; (b) an un-`poke`d codehash drift — now storage/indexer hygiene
+only, since the funds path is already closed on read; keep running the §3
+drift sweep to persist the demotion via `poke` where a certification exists,
+and to owner-clear the allowlist-only entries `poke` cannot reach (it reverts
+`NotCertified` for an uncertified pair).
 
 ---
 

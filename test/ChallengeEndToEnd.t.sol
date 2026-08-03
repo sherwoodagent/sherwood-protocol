@@ -16,7 +16,6 @@ import {TierRegistry} from "../src/TierRegistry.sol";
 import {ChallengeGame} from "../src/ChallengeGame.sol";
 import {IChallengeGame} from "../src/interfaces/IChallengeGame.sol";
 import {ProposerBondEscrow} from "../src/ProposerBondEscrow.sol";
-import {IProposerBondEscrow} from "../src/interfaces/IProposerBondEscrow.sol";
 import {BatchExecutorLib} from "../src/BatchExecutorLib.sol";
 import {ProtocolConfig} from "../src/ProtocolConfig.sol";
 
@@ -885,11 +884,31 @@ contract ChallengeEndToEndTest is Test {
         );
         assertEq(wood.balanceOf(agent), agentBalAfterBond, "the proposer got nothing back");
 
-        // And the reclaim path cannot resurrect it, at any later time.
+        // Reclaim's forfeiture-acknowledge path only applies from a TERMINAL
+        // state (design D3, same terminal gate every other reclaim path
+        // goes through) — self-settle here, as a real proposer would once
+        // the strategy winds down, well past `_settle`'s conviction above.
+        vm.prank(agent);
+        gov.settleProposal(pid);
+        assertEq(_state(pid), uint256(ISyndicateGovernor.ProposalState.Settled), "self-settled after conviction");
+
+        // And the reclaim path does not resurrect the bond, at any later
+        // time — but (issue #117 L1) it also does not revert forever: it
+        // acknowledges the forfeiture, clears the stale record, and moves no
+        // WOOD.
         vm.warp(gov.getProposal(pid).executedAt + ledger.challengeWindow() + 365 days);
-        vm.expectRevert();
+        uint256 burnBalBeforeReclaim = wood.balanceOf(game.BURN_ADDRESS());
+        vm.expectEmit(true, true, true, true, address(gov));
+        emit ISyndicateGovernor.ProposerBondForfeitureAcknowledged(pid, PROPOSER_BOND);
         gov.reclaimProposerBond(pid);
         assertEq(wood.balanceOf(agent), agentBalAfterBond, "still nothing");
+        assertEq(wood.balanceOf(game.BURN_ADDRESS()), burnBalBeforeReclaim, "acknowledge moves no WOOD");
+        assertEq(gov.getProposal(pid).proposerBondWood, 0, "the stale bond record is cleared");
+
+        // A second call lands on the same terminal answer as an ordinary
+        // release.
+        vm.expectRevert(ISyndicateGovernor.NoBondToReclaim.selector);
+        gov.reclaimProposerBond(pid);
     }
 
     // ── 4. Issue #94: the two clocks are independent ───────────────────────
@@ -1059,10 +1078,19 @@ contract ChallengeEndToEndTest is Test {
             "bond net of the fee, plus the settle burn, plus the whole slashed guardian bond"
         );
 
-        // ── And no later reclaim can resurrect it: the governor's own gates
-        //    all pass eventually, and the escrow is the one that says no.
+        // ── And no later reclaim can resurrect it — but (issue #117 L1) the
+        //    governor's own gates all pass eventually, and reclaim now
+        //    acknowledges the forfeiture instead of dying in the escrow's
+        //    `NoBond`.
         vm.warp(executedAt + 365 days);
-        vm.expectRevert(IProposerBondEscrow.NoBond.selector);
+        uint256 burnBalBeforeReclaim = wood.balanceOf(game.BURN_ADDRESS());
+        vm.expectEmit(true, true, true, true, address(gov));
+        emit ISyndicateGovernor.ProposerBondForfeitureAcknowledged(pid, PROPOSER_BOND);
+        gov.reclaimProposerBond(pid);
+        assertEq(gov.getProposal(pid).proposerBondWood, 0, "the stale bond record is cleared");
+        assertEq(wood.balanceOf(game.BURN_ADDRESS()), burnBalBeforeReclaim, "acknowledge moves no further WOOD");
+
+        vm.expectRevert(ISyndicateGovernor.NoBondToReclaim.selector);
         gov.reclaimProposerBond(pid);
     }
 

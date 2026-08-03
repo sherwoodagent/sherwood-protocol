@@ -197,6 +197,24 @@ contract MockStakedWood is IStakedWood {
         return _ownerStake[vault];
     }
 
+    /// @dev Anchor-aware slash basis (issue #35). DEFAULTS to live
+    ///      `guardianStake`, same pattern as `getPastStake`'s default: most
+    ///      fixtures do not care about the anchor distinction, so an
+    ///      unconfigured anchor reads as "the top-up already happened before
+    ///      this anchor too". Set explicitly to model a post-anchor top-up
+    ///      the anchored basis must exclude.
+    mapping(address => mapping(uint256 => uint256)) internal _slashableStakeAt;
+    mapping(address => mapping(uint256 => bool)) internal _slashableStakeAtSet;
+
+    function setSlashableStakeAt(address guardian, uint256 anchor, uint256 v) external {
+        _slashableStakeAt[guardian][anchor] = v;
+        _slashableStakeAtSet[guardian][anchor] = true;
+    }
+
+    function slashableStakeAt(address guardian, uint256 anchor) external view returns (uint256) {
+        return _slashableStakeAtSet[guardian][anchor] ? _slashableStakeAt[guardian][anchor] : _guardianStake[guardian];
+    }
+
     function preparedStakeOf(address owner) external view returns (uint256) {
         return _preparedStakeOf[owner];
     }
@@ -249,6 +267,27 @@ contract MockStakedWood is IStakedWood {
 
     function setAuthorizedSlasher(address slasher) external {
         authorizedSlasher = slasher;
+    }
+
+    /// @dev MODELLED AS A PLAIN SETTABLE SLOT, same reason as
+    ///      `authorizedSlasher` above: `TokenCourt.setParticipationFloorBps`
+    ///      and `TokenCourt.setStakedWood` now READ this back (issue #84,
+    ///      "enforce the floor invariant in the setters") to enforce
+    ///      `participationFloorBps < ageFloorBps`. NOT an `IStakedWood`
+    ///      member — the real interface deliberately omits it (see
+    ///      `TokenCourt.sol`'s `IStakedWoodAgeFloor`), so this sits with the
+    ///      mock's other extra setters, not its interface-implementing
+    ///      surface. Defaults to `2_500` to match every real fixture's
+    ///      `StakedWood` `InitParams.ageFloorBps` (`TokenCourtEndToEnd.t.sol`,
+    ///      `SlashGasCeiling.t.sol`, `ChallengeEndToEnd.t.sol`,
+    ///      `DeployTokenCourtPreflight.t.sol`) so every existing suite that
+    ///      wires this mock into a `TokenCourt` keeps behaving exactly as
+    ///      before (default court floor `1_000 < 2_500`). No access control:
+    ///      it is a test double.
+    uint256 public ageFloorBps = 2_500;
+
+    function setAgeFloorBps(uint256 v) external {
+        ageFloorBps = v;
     }
 
     // Per-(caseKey, approver) verdict dedup (PR #24 review 🟠N2). Same reason

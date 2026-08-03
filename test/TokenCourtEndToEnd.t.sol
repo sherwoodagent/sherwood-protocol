@@ -1027,4 +1027,174 @@ contract TokenCourtEndToEndTest is Test {
             uint256(court.caseOf(caseId).verdict), uint256(IChallengeGame.Verdict.Guilty), "g2 alone still convicts"
         );
     }
+
+    // ── 6. Issue #83: a concurrent conviction must not lift the voting bar ──
+
+    /// @dev TWO covering approvers, not the fixture's usual one. The arc below
+    ///      needs `settleCoverage` to actually REACH `_rebook` for g1, and with
+    ///      g1 alone on the key its emptied bond makes `_effectiveReservedTotal`
+    ///      zero — which `settleCoverage` early-returns on before rebooking
+    ///      anything. g2 keeps the cohort's effective total non-zero, so the
+    ///      pass runs and books g1 at zero: the state the whole issue turns on.
+    ///      g2 is consequently accused here too; nothing below depends on the
+    ///      size of the accused set, only on whether g1 is in it.
+    function _proposeApproveExecuteTwoApprovers() internal returns (uint256 pid) {
+        pid = _propose();
+        vm.warp(gov.getProposal(pid).voteEnd + 1);
+        registry.openReview(address(gov), pid);
+        vm.prank(g1);
+        registry.voteOnProposal(address(gov), pid, IGuardianRegistry.GuardianVoteType.Approve);
+        vm.prank(g2);
+        registry.voteOnProposal(address(gov), pid, IGuardianRegistry.GuardianVoteType.Approve);
+        assertEq(ledger.openExposureUsd(g1), COVERAGE_USD, "g1 reserved the whole coverage");
+        assertEq(ledger.openExposureUsd(g2), COVERAGE_USD, "g2 reserved the whole coverage");
+
+        vm.warp(gov.getProposal(pid).reviewEnd + 1);
+        gov.executeProposal(pid);
+        assertEq(gov.getProposal(pid).executedAt, vm.getBlockTimestamp(), "executedAt stamped now");
+    }
+
+    /// @notice ISSUE #83, the whole chain on the real stack: an approver
+    ///         convicted on a SEPARATE, CONCURRENT challenge must still be
+    ///         barred from voting on THIS one, even though a permissionless
+    ///         `settleCoverage` has since booked its coverage at zero.
+    ///
+    /// @dev    Every step is either ordinary protocol operation or a call
+    ///         anyone may make — no attacker capital and no privileged role:
+    ///
+    ///           1. g1 approves P; P executes at `executedAt`. `refer` will
+    ///              snapshot the electorate at `executedAt - 1`.
+    ///           2. A challenge is filed against P. Coverage freezes.
+    ///           3. g1 is convicted on a DIFFERENT challenge. `maxSlashBps` is
+    ///              10,000 (the Plan B pre-flight requires it), so `_slashOne`
+    ///              takes the whole live balance and `guardianStake(g1)` lands
+    ///              on exactly zero rather than on dust.
+    ///           4. A stranger calls `settleCoverage` on P's key. g1's
+    ///              slashable bond is now zero, so `_rebook` writes its live
+    ///              booking down to zero. The PLEDGE is untouched.
+    ///           5. `refer` runs. This is the step the fix changes: reading the
+    ///              booking, g1 fell out of the accused set entirely.
+    ///           6. g1 votes. Its ballot weighs `getPastVotes(g1, executedAt-1)`
+    ///              — the FULL PRE-SLASH amount, because checkpoints are
+    ///              append-only and a later slash cannot reach back past a
+    ///              stored timestamp. The accused judged its own case at full
+    ///              strength, which is exactly what `AccusedCannotVote` exists
+    ///              to prevent.
+    ///
+    ///         Step 3 runs as a direct `slashVerdict` from the authorized
+    ///         slasher under a DIFFERENT `caseKey`, which is precisely what a
+    ///         concurrent challenge's `_settle` does. Standing up a second full
+    ///         proposal-and-challenge lifecycle reaches the identical state
+    ///         (`stakedAmount == 0`) through much more fixture and proves
+    ///         nothing extra about the court.
+    function test_arc_convictedElsewhereThenSettledToZero_isStillAccused() public {
+        uint256 pid = _proposeApproveExecuteTwoApprovers();
+        uint256 executedAt = gov.getProposal(pid).executedAt;
+
+        // 2. The filing. Sized off the live bookings, which are still intact.
+        vm.prank(challenger);
+        uint256 cid = game.file(
+            address(gov),
+            pid,
+            IChallengeGame.Predicate.OutOfAdapterOutflow,
+            address(adapter),
+            adapter.poke.selector,
+            "ipfs://evidence/issue-83"
+        );
+
+        // Settlement is gated strictly past `executeBy`; the proposal executed
+        // one second into its review close, so this is roughly a day — well
+        // inside the 7-day `autoSlashDelay` the dispute below has to land in.
+        vm.warp(gov.getProposal(pid).executeBy + 1);
+
+        // 3. The concurrent conviction, under a case key that has nothing to do
+        //    with the challenge filed above.
+        assertEq(swood.guardianStake(g1), G1_STAKE, "fixture: g1 is fully staked going in");
+        address[] memory convicted = new address[](1);
+        convicted[0] = g1;
+        uint256[] memory fullRate = new uint256[](1);
+        fullRate[0] = 10_000;
+        vm.prank(address(game));
+        swood.slashVerdict(keccak256("issue-83.concurrent-challenge"), executedAt - 1, convicted, fullRate);
+        assertEq(swood.guardianStake(g1), 0, "a 100% conviction lands on exactly zero, not on dust");
+
+        // 4. Anyone settles. g1's slashable bond is gone, so its booking goes
+        //    to zero; g2's live bond keeps the cohort's effective total
+        //    non-zero, so the pass actually runs rather than early-returning.
+        vm.prank(stranger);
+        ledger.settleCoverage(address(gov), pid);
+        (address[] memory bookedWho, uint256[] memory bookedUsd) = ledger.approversOf(address(gov), pid);
+        (address[] memory pledgedWho, uint256[] memory pledgedUsd) = ledger.pledgedOf(address(gov), pid);
+        assertEq(_usdFor(bookedWho, bookedUsd, g1), 0, "the live booking was written down to nothing");
+        assertEq(
+            _usdFor(pledgedWho, pledgedUsd, g1),
+            COVERAGE_USD,
+            "the pledge is untouched: g1 did underwrite this proposal"
+        );
+
+        // 5. Refer. Before the fix, `_recordAccused` read the booking above and
+        //    dropped g1 here.
+        _disputeFull(cid);
+        uint256 caseId = court.caseOfChallenge(address(game), cid);
+        assertTrue(caseId != 0, "the pool-completing auto-referral landed a real case");
+        assertTrue(court.isAccused(caseId, g1), "ISSUE #83: a settled-to-zero booking is not an acquittal");
+
+        // Its stake is also back in `accusedWeight`, which the participation
+        // floor's base subtracts. This half of the harm needs nothing further
+        // from g1 at all — it lands the moment the accused set is built.
+        assertTrue(court.caseOf(caseId).accusedWeight >= G1_STAKE, "g1's stake counts against the floor again");
+
+        // 6. And the bar bites. The weight read is what makes this a
+        //    vulnerability rather than a cosmetic set-membership question: g1
+        //    holds nothing right now, yet its ballot is weighed at a checkpoint
+        //    the slash cannot reach back to.
+        uint256 snapshotTs = court.caseOf(caseId).snapshotTs;
+        assertEq(snapshotTs, executedAt - 1, "the electorate is snapshotted before the drain");
+        assertEq(
+            swood.getPastVotes(g1, snapshotTs),
+            G1_STAKE,
+            "the ballot g1 is about to cast carries its FULL pre-slash weight"
+        );
+
+        // `vote` has a SECOND, independent gate — present holdings — and a
+        // guardian slashed to nothing trips it before the accused bar could
+        // ever be tested. That gate is cheap to step over: `StakedWood`'s own
+        // natspec records the residual, and `minGuardianStake` is its whole
+        // price. Paying it here is what makes this arc prove the ACCUSED bar
+        // rather than accidentally re-proving the holdings one.
+        wood.mint(g1, MIN_GUARDIAN_STAKE);
+        vm.startPrank(g1);
+        wood.approve(address(swood), type(uint256).max);
+        swood.stakeAsGuardian(MIN_GUARDIAN_STAKE, 1);
+        vm.stopPrank();
+        assertTrue(swood.getVotes(g1) != 0, "present holdings restored: the other gate no longer bites");
+        assertTrue(swood.getPastVotes(g1, snapshotTs) != 0, "and the historic weight is still there to be cast");
+
+        vm.prank(g1);
+        vm.expectRevert(ITokenCourt.AccusedCannotVote.selector);
+        court.vote(caseId, false);
+
+        // The unaccused electorate is unaffected: g3 never approved, votes
+        // normally, and the case still reaches a verdict.
+        vm.prank(g3);
+        court.vote(caseId, true);
+        _warpPastVoteWindow(caseId);
+        court.finalize(caseId);
+        assertEq(
+            uint256(court.caseOf(caseId).verdict),
+            uint256(IChallengeGame.Verdict.Guilty),
+            "barring the accused did not brick the case"
+        );
+    }
+
+    /// @dev Positional lookup over one of the ledger's paired return arrays.
+    ///      Reverts rather than returning zero for an address that is not
+    ///      listed at all — "absent" and "listed at zero" are exactly the two
+    ///      states this arc exists to tell apart.
+    function _usdFor(address[] memory who, uint256[] memory usd, address guardian) internal pure returns (uint256) {
+        for (uint256 i = 0; i < who.length; i++) {
+            if (who[i] == guardian) return usd[i];
+        }
+        revert("guardian is not a listed approver");
+    }
 }

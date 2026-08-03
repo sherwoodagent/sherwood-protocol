@@ -3,9 +3,7 @@
 ## Purpose
 
 Per-vault governance for agent-managed syndicate vaults: agents propose strategies as pre-committed call batches, shareholders vote optimistically (a proposal passes unless AGAINST votes reach a veto threshold), guardians review, and approved strategies execute and settle through the vault under a risk envelope. Covers the proposal lifecycle state machine, voting and quorum rules, execution safety guards, emergency settlement paths, beacon-based upgrades, factory creation of syndicates, and parameter governance.
-
 ## Requirements
-
 ### Requirement: Proposal lifecycle state machine
 The governor SHALL maintain exactly one authoritative state per proposal, drawn from: `Draft`, `Pending`, `GuardianReview`, `Approved`, `Rejected`, `Expired`, `Executed`, `Settled`, `Cancelled`. State SHALL be written only through a single internal transition point, and SHALL be resolved by a single resolver exposed as the true view `stateOf(proposalId)`: the view reports `Approved` / `Rejected` / `Expired` the instant the outcome is determinable from time and stored votes, never lagging behind a pending state-commit transaction. The legal transitions are:
 
@@ -204,7 +202,7 @@ For a proposal stuck in `Executed` past `executedAt + strategyDuration`, the vau
 - **THEN** `emergencySettleWithCalls` SHALL revert with `OwnerBondInsufficient`
 
 ### Requirement: Risk tiering and proposer bond at propose
-At propose time the governor SHALL resolve the proposal's tier and required coverage through the tier registry: tier = MAX tier across execute calls; coverage = `maxCapital × Σ boundBps / 10_000` summed per-call across BOTH execute and settlement calls, where a certified tier-0/1 call contributes its certified bound and a tier-2/uncertified call contributes 10_000 (full notional). With no tier registry wired, every proposal SHALL resolve to tier 2 / full-notional coverage (the safe default). When an exposure ledger is wired, propose SHALL additionally enforce the ledger's covered-TVL cap and coverage-horizon gates (fail-closed, failing on the proposer; the collaborative path uses the worst-case deadline `now + collaborationWindow + votingPeriod + reviewPeriod + executionWindow`), and when a bond escrow is also wired SHALL lock the ledger-priced risk-scaled WOOD proposer bond in the escrow, recording both the amount and the escrow address on the proposal before the external lock call.
+At propose time the governor SHALL resolve the proposal's tier and required coverage through the tier registry: tier = MAX tier across execute calls; coverage = `maxCapital × Σ boundBps / 10_000` summed per-call across BOTH execute and settlement calls, where a certified tier-0/1 call contributes its certified bound and a tier-2/uncertified call contributes 10_000 (full notional). With no tier registry wired, every proposal SHALL resolve to tier 2 / full-notional coverage (the safe default). When an exposure ledger is wired, propose SHALL additionally enforce the ledger's covered-TVL cap and coverage-horizon gates (fail-closed, failing on the proposer; the collaborative path uses the worst-case deadline `now + collaborationWindow + votingPeriod + reviewPeriod + executionWindow`), and when a bond escrow is also wired SHALL lock the ledger-priced risk-scaled WOOD proposer bond in the escrow, recording the amount, the escrow address, AND the exposure-ledger address on the proposal before the external lock call. The recorded ledger is the one the reclaim gates read for the life of the bond — re-pointing the governor's live ledger slot afterwards MUST NOT change which ledger gates an already-locked bond (adversary: a vault owner colluding with the proposer re-points at a permissive ledger after settlement, when the open-proposal guard no longer holds, to detach the reclaim gates from a live challenge).
 
 #### Scenario: Unwired registries keep the safe default
 - **WHEN** no tier registry is wired
@@ -212,8 +210,12 @@ At propose time the governor SHALL resolve the proposal's tier and required cove
 
 #### Scenario: Bond reclaim is terminal-only and permissionless
 - **WHEN** any caller invokes `reclaimProposerBond` on a proposal in a terminal state (Rejected, Expired, Cancelled, or Settled) with a nonzero recorded bond
-- **THEN** the governor SHALL zero the recorded bond and release it from the escrow recorded on the proposal at lock time (never the live escrow slot), paying the proposer; a second call SHALL revert with `NoBondToReclaim`
+- **THEN** the governor SHALL zero the recorded bond and release it from the escrow recorded on the proposal at lock time (never the live escrow slot), paying the proposer, with the executed-proposal challenge gates evaluated against the ledger recorded on the proposal at lock time (never the live ledger slot); a second call SHALL revert with `NoBondToReclaim`
 - **AND** a call while the proposal is non-terminal SHALL revert with `ProposalNotTerminal`
+
+#### Scenario: Forfeited bond reclaim is an acknowledged no-op
+- **WHEN** any caller invokes `reclaimProposerBond` on a terminal proposal whose recorded bond is nonzero but whose recorded escrow no longer holds a bond for it (a conviction forfeited it)
+- **THEN** the governor SHALL zero the recorded bond, emit `ProposerBondForfeitureAcknowledged(proposalId, amount)`, and return without transferring — never reverting indefinitely and never leaving the recorded amount stale; a second call SHALL revert with `NoBondToReclaim`
 
 #### Scenario: Forfeiture is never a lifecycle outcome
 - **WHEN** a proposal is rejected by veto, blocked by guardians, expired, or cancelled
@@ -276,11 +278,15 @@ Every per-vault governor SHALL be deployed as a `BeaconProxy` reading its implem
 - **THEN** the call SHALL revert with `SubdomainTaken`
 
 ### Requirement: Factory lifecycle-gated administration
-The factory SHALL gate structural changes on the governor's lifecycle state. `rotateOwner(vault, newOwner)` SHALL require the caller to be the current vault owner or the original creator, the old owner stake to be fully withdrawn, and both `getActiveProposal() == 0` and `openProposalCount() == 0`; it SHALL transfer vault ownership, rebind the owner-stake slot on sWOOD, and update the creator record. `upgradeVault(vault, expectedImpl)` SHALL require upgrades enabled, the caller to be the creator, `vaultImpl == expectedImpl` (so a factory-owner impl swap cannot land an implementation the creator did not opt into), and the same two lifecycle gates. `pushWiring(governor)` SHALL be factory-owner-only, SHALL verify the target is a governor this factory deployed (via the unforgeable `governor.vault()` → `governorOf` round-trip), and SHALL push only the factory's currently-set tier registry / exposure ledger / bond escrow — never writing zero, so wiring can be added but never silently removed. `setGuardianRegistry` SHALL fail-closed unless the new registry advertises this factory (or address(0) for a stateless stub).
+The factory SHALL gate structural changes on the governor's lifecycle state. `rotateOwner(vault, newOwner)` SHALL require the caller to be the current vault owner or the original creator, the old owner stake to be fully withdrawn, both `getActiveProposal() == 0` and `openProposalCount() == 0`, and the incoming owner's prior vault-specific consent to the stake binding (recorded on sWOOD by `newOwner` via `approveOwnerStakeBinding(vault)` — adversary: a current owner of an empty-slot vault must not be able to spend a third party's escrowed prepared stake by rotating the vault onto them); it SHALL transfer vault ownership, rebind the owner-stake slot on sWOOD (consuming the consent), and update the creator record. The signature and single-call semantics of `rotateOwner` SHALL be unchanged — consent is enforced at the sWOOD spend site, not by a new factory entrypoint. `upgradeVault(vault, expectedImpl)` SHALL require upgrades enabled, the caller to be the creator, `vaultImpl == expectedImpl` (so a factory-owner impl swap cannot land an implementation the creator did not opt into), and the same two lifecycle gates. `pushWiring(governor)` SHALL be factory-owner-only, SHALL verify the target is a governor this factory deployed (via the unforgeable `governor.vault()` → `governorOf` round-trip), and SHALL push only the factory's currently-set tier registry / exposure ledger / bond escrow — never writing zero, so wiring can be added but never silently removed. `setGuardianRegistry` SHALL fail-closed unless the new registry advertises this factory (or address(0) for a stateless stub).
 
 #### Scenario: Rotation blocked mid-lifecycle
 - **WHEN** `rotateOwner` or `upgradeVault` is called while the vault's governor has an executing proposal or any open proposal
 - **THEN** the call SHALL revert (`ProposalActive` / `StrategyActive` or `ProposalsOpen`)
+
+#### Scenario: Rotation without the incoming owner's consent
+- **WHEN** `rotateOwner(vault, newOwner)` passes the caller and lifecycle gates but `newOwner` has not approved `vault` for stake binding on sWOOD
+- **THEN** the call SHALL revert with `BindingNotApproved`, and no vault ownership, owner-stake, or creator-record state SHALL change
 
 #### Scenario: pushWiring rejects foreign governors
 - **WHEN** `pushWiring` targets an address that is not a governor deployed by this factory
@@ -296,3 +302,4 @@ The governor SHALL expose the narrow `IProposalStatus` seam the vault consumes �
 #### Scenario: Draft vote weight query rejected
 - **WHEN** `getVoteWeight` is called for a proposal still in Draft
 - **THEN** the call SHALL revert with `ProposalInDraft`
+
