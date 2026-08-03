@@ -2,9 +2,7 @@
 
 ## Purpose
 Define the observable behavior of the SyndicateVault: an ERC-4626, ERC20Votes-checkpointed, UUPS-upgradeable vault that custodies a syndicate's assets, prices shares against vault-side live NAV (Lane A), routes mid-proposal LP flow through a per-vault async request queue (Lane B), enforces an instant-withdrawal liquidity buffer and queue-reserve seniority against governor strategy batches, and confines all privileged surfaces to owner, factory, governor, and queue roles.
-
 ## Requirements
-
 ### Requirement: ERC-4626 share accounting and NAV
 The vault SHALL be an ERC-4626 vault over a single underlying asset fixed at initialization. `totalAssets()` SHALL equal the vault's idle asset balance plus a live-NAV term that is nonzero only when Lane A is available; the vault SHALL never trust a strategy's self-reported value — live NAV is the active strategy's positions priced vault-side by the protocol PriceRouter. The ERC-4626 virtual-shares decimals offset SHALL equal the asset's `decimals()`, cached once at initialization.
 
@@ -301,3 +299,35 @@ The queue SHALL accept `queueRedeem`, `queueDeposit`, and `stampSettlement` only
 #### Scenario: Third party cannot mint via queue surface
 - **WHEN** any address other than the bound queue calls `settleDeposit` or `settleRedeem` on the vault
 - **THEN** the call reverts `NotQueue`
+
+### Requirement: Privileged-target guard on batches
+
+`_guardBatchCalls` SHALL reject any governor batch containing a call whose `target` is the vault itself or the vault's bound withdrawal queue, reverting `DisallowedBatchTarget(target)`. This target check SHALL be enforced **unconditionally on every call in the batch, before the value-moving-selector switch and independently of whether a TierRegistry is wired** — it SHALL NOT be skipped by the `registry == address(0)` degrade-open path that gates the selector guard. Because `_guardBatchCalls` runs inside `executeGovernorBatch`, the guard SHALL apply on the execute, settlement, and both emergency batch paths alike.
+
+The adversary is a governor batch that carries `msg.sender == vault` into a vault-only entrypoint: because batches execute via `delegatecall`, calling the withdrawal queue's `onlyVault` functions (`queueRedeem`, `queueDeposit`, `stampSettlement`) satisfies its `onlyVault` gate while moving zero vault `asset()` balance in the same transaction — so the net-outflow meter, the queue-reserve check, and the tier-2 coverage price all read it as harmless. Blocking the vault and the queue as batch targets is the complete boundary: no legitimate strategy batch targets either address (they target strategy adapters, the asset token, or external protocols).
+
+#### Scenario: Queue-targeting batch call is rejected
+
+- **WHEN** a governor batch contains a call whose `target` is the bound withdrawal queue (e.g. `queueRedeem(attacker, victimShares, pid)`)
+- **THEN** `executeGovernorBatch` reverts `DisallowedBatchTarget(withdrawalQueue)` before any call executes, even though the call moves no vault `asset()` balance and would otherwise clear the outflow meter and tier-2 coverage
+
+#### Scenario: Vault self-targeting batch call is rejected
+
+- **WHEN** a governor batch contains a call whose `target` is the vault itself (`address(this)`)
+- **THEN** `executeGovernorBatch` reverts `DisallowedBatchTarget(vault)`
+
+#### Scenario: Guard fires even without a wired TierRegistry
+
+- **WHEN** the calling governor exposes no TierRegistry (getter missing or returning `address(0)`) and a batch targets the withdrawal queue
+- **THEN** the batch still reverts `DisallowedBatchTarget` — the target guard runs outside the registry-less degrade-open path that skips the selector guard
+
+#### Scenario: Emergency path is covered
+
+- **WHEN** the vault owner drives `emergencySettleWithCalls` / `finalizeEmergencySettle` (or `unstick`) with owner-supplied calls that target the withdrawal queue, bypassing the LP vote and coverage quorum
+- **THEN** the batch reverts `DisallowedBatchTarget` because `_guardBatchCalls` runs on every `executeGovernorBatch` invocation regardless of entrypoint
+
+#### Scenario: Honest strategy batch is unaffected
+
+- **WHEN** a governor batch targets only strategy adapters, the vault's underlying asset token, or external protocol contracts (never the vault or its queue)
+- **THEN** the target guard passes every call and the batch proceeds under the existing selector, outflow, reserve, and buffer checks
+
