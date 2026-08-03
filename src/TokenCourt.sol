@@ -580,10 +580,13 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///      staked recently was not yet counted, so `accusedWeight` (still
     ///      measured at `snapshotTs`, where it must be, because that is the
     ///      stake a conviction actually slashes) can legitimately exceed it.
-    ///      The fallback direction is the safe one: it yields
-    ///      `bps * base` with `base <= accusedWeight`, i.e. a SMALLER floor
-    ///      than the subtraction would have produced — never a larger one, so
-    ///      it cannot be turned into a denial lever of its own.
+    ///      The fallback yields `0` there — the subtraction's own result when
+    ///      the subtrahend meets or exceeds the base — NOT the unreduced
+    ///      `base` (issue #96). Falling back to `base` made the floor
+    ///      NON-MONOTONE in `accusedWeight`: one extra WOOD staked, crossing
+    ///      `accusedWeight == base`, jumped the floor from ~0 straight to
+    ///      `bps * base` — the accused's own stake, which they control,
+    ///      deciding whether the case can be denied a verdict at all.
     /// @dev THE BASE IS THE MIN OVER A LOOKBACK. The snapshot defends the
     ///      NUMERATOR: vote weight is read at `executedAt - 1`, so post-drain
     ///      buyers and flash loans
@@ -735,7 +738,7 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
         // which case the snapshot total stands — see the fallback rationale
         // above for why zero is the wrong failure there.
         uint256 base = (earlier != 0 && earlier < total) ? earlier : total;
-        base = base > accusedWeight ? base - accusedWeight : base;
+        base = base > accusedWeight ? base - accusedWeight : 0;
         return participationFloorBps * base / BPS_DENOMINATOR;
     }
 

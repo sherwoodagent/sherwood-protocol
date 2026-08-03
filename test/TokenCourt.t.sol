@@ -2,6 +2,7 @@
 pragma solidity 0.8.28;
 
 import {Test} from "forge-std/Test.sol";
+import {Vm} from "forge-std/Vm.sol";
 import {TokenCourt} from "../src/TokenCourt.sol";
 import {ITokenCourt} from "../src/interfaces/ITokenCourt.sol";
 import {IChallengeGame} from "../src/interfaces/IChallengeGame.sol";
@@ -1133,6 +1134,141 @@ contract TokenCourtTest is Test {
             uint256(IChallengeGame.Verdict.Inconclusive),
             "thin turnout is still no answer"
         );
+    }
+
+    // ── Issue #96: the `>` fallback is non-monotone in accusedWeight ──
+
+    /// @dev Sets `accusedG`'s raw stake at the case's OWN snapshot instant,
+    ///      before `refer` runs — `accusedWeight` is recorded once, at refer
+    ///      time, from `getPastStake(accusedG, snapshotTs)`, so this must
+    ///      happen before `_disputedChallenge`'s pinned `snapshotTs` is
+    ///      consumed by `court.refer`, not after.
+    function _caseWithAccusedWeight(uint256 challengeId, uint256 accusedWeight)
+        internal
+        returns (uint256 caseId, uint256 snap)
+    {
+        // A fresh, caller-chosen challenge id: `CHALLENGE_ID` is a shared
+        // constant that `refer` marks used, so exercising more than one case
+        // in a single test needs distinct ids — reusing `_disputedChallenge`'s
+        // fixed id would revert the second `refer` with `AlreadyReferred`.
+        game.setChallenge(
+            challengeId,
+            governor,
+            PROPOSAL_ID,
+            IChallengeGame.Status.Disputed,
+            vm.getBlockTimestamp(),
+            30 days,
+            vm.getBlockTimestamp() - 1 days
+        );
+        snap = vm.getBlockTimestamp() - 1 days - 1; // matches `_disputedChallenge`'s executedAt - 1
+
+        address[] memory a = new address[](1);
+        uint256[] memory cm = new uint256[](1);
+        a[0] = accusedG;
+        cm[0] = 100e18; // any non-zero commitment marks accusedG as accused
+        ledger.setApprovers(a, cm);
+        swood.setPastStake(accusedG, snap, accusedWeight);
+
+        // Both electorate reads pinned equal, so `base` is unambiguously
+        // `total` (the `earlier < total` branch is not what is under test
+        // here — B2 above already covers it in isolation).
+        swood.setPastTotalVotes(snap, 3_000_000e18);
+        swood.setPastTotalVotes(snap - court.FLOOR_LOOKBACK(), 1_000_000e18);
+        swood.setPastVotes(voterA, snap, 300e18);
+        swood.setPastVotes(voterB, snap, 200e18);
+
+        caseId = court.refer(challengeId);
+        assertEq(court.caseOf(caseId).accusedWeight, accusedWeight, "pinned at refer");
+    }
+
+    /// @notice ISSUE #96, AS A REGRESSION TEST. `base = base > accusedWeight
+    ///         ? base - accusedWeight : 0` used to fall back to the FULL,
+    ///         unreduced base the instant `accusedWeight` reached `base`,
+    ///         instead of the `0` the subtraction would have produced there —
+    ///         making the floor non-monotone in `accusedWeight`, a quantity
+    ///         the accused control by staking more before the drain. The exact
+    ///         numbers from the issue, so this test IS the proof.
+    ///
+    ///         `base = min(3_000_000e18, 1_000_000e18) = 1_000_000e18`,
+    ///         `participationFloorBps = 1_000` (10%, the suite default).
+    ///
+    ///         `accusedWeight = 999_999e18` (one WOOD short of `base`):
+    ///           subtraction fires → `base - accusedWeight = 1e18` →
+    ///           floor = `1e17` — a fifth of the smallest voter's weight, so
+    ///           any single voter decides the case.
+    ///
+    ///         `accusedWeight = 1_000_001e18` (one WOOD OVER `base`):
+    ///           fallback fires → `base` stands at `1_000_000e18` →
+    ///           floor = `100_000e18` — 10% of the WHOLE electorate, 200x the
+    ///           other branch's floor, for one extra WOOD staked.
+    ///
+    ///         MUTATION-CHECKED: reverting the fallback to `: base` makes
+    ///         this test fail with `100_000000000000000000000 !=
+    ///         1_000000000000000000` — proving the two branches now agree
+    ///         (both floors are ~0, both verdicts `Guilty`) rather than
+    ///         disagreeing by the claimed 10^5 factor.
+    function test_finalize_floorFallback_doesNotJumpAcrossAccusedWeightThreshold() public {
+        (uint256 idBelow,) = _caseWithAccusedWeight(9601, 999_999e18);
+        _castFullTurnoutAndCloseWindow(idBelow);
+        vm.expectEmit(true, false, false, true);
+        emit ITokenCourt.CaseFinalized(idBelow, IChallengeGame.Verdict.Guilty, 500e18, 0, 1e17);
+        court.finalize(idBelow);
+        assertEq(
+            uint256(court.caseOf(idBelow).verdict),
+            uint256(IChallengeGame.Verdict.Guilty),
+            "one WOOD short: floor is ~nothing, turnout clears it"
+        );
+
+        (uint256 idOver,) = _caseWithAccusedWeight(9602, 1_000_001e18);
+        _castFullTurnoutAndCloseWindow(idOver);
+        // `base(1_000_000e18) <= accusedWeight(1_000_001e18)` now yields the
+        // subtraction's own answer, `0` — floor stays ~0, same as the other
+        // branch, and the verdict is reached rather than denied.
+        vm.expectEmit(true, false, false, true);
+        emit ITokenCourt.CaseFinalized(idOver, IChallengeGame.Verdict.Guilty, 500e18, 0, 0);
+        court.finalize(idOver);
+        assertEq(
+            uint256(court.caseOf(idOver).verdict),
+            uint256(IChallengeGame.Verdict.Guilty),
+            "one WOOD more no longer denies the verdict"
+        );
+    }
+
+    /// @notice THE PROPERTY THE FIX ESTABLISHES: monotone, not merely
+    ///         bounded. Sweeping `accusedWeight` across the `base` threshold
+    ///         must never let the floor go UP as `accusedWeight` goes up — a
+    ///         weaker "floor never exceeds `participationFloorBps * total`"
+    ///         check would still pass the broken fallback, since 100_000e18
+    ///         never exceeds that ceiling either. Monotonicity is the actual
+    ///         property the natspec claims and the one worth pinning.
+    function test_finalize_floorFallback_isMonotoneInAccusedWeight() public {
+        uint256[4] memory weights = [uint256(0), 500_000e18, 999_999e18, 1_000_001e18];
+        uint256 prevFloor = type(uint256).max;
+        for (uint256 i = 0; i < weights.length; i++) {
+            (uint256 id,) = _caseWithAccusedWeight(9610 + i, weights[i]);
+            _castFullTurnoutAndCloseWindow(id);
+            vm.recordLogs();
+            court.finalize(id);
+            uint256 floor = _floorFromFinalizeLogs();
+            assertLe(floor, prevFloor, "floor must not rise as accusedWeight rises");
+            prevFloor = floor;
+        }
+    }
+
+    /// @dev Pulls `floor` out of the single `CaseFinalized` emission recorded
+    ///      by the preceding `vm.recordLogs()`, rather than re-deriving it —
+    ///      the whole point is to observe what the CONTRACT computed.
+    function _floorFromFinalizeLogs() internal returns (uint256 floor) {
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i = 0; i < logs.length; i++) {
+            // Only `caseId` is indexed; `verdict`, `guiltyVotes`,
+            // `notGuiltyVotes`, `floor` are all in `data`, in that order.
+            if (logs[i].topics[0] == ITokenCourt.CaseFinalized.selector) {
+                (,,, floor) = abi.decode(logs[i].data, (uint256, uint256, uint256, uint256));
+                return floor;
+            }
+        }
+        revert("CaseFinalized not found in recorded logs");
     }
 
     /// @notice THE RESIDUAL, PINNED DELIBERATELY RATHER THAN LEFT IMPLICIT.
