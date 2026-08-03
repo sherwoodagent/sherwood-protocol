@@ -957,11 +957,13 @@ contract SyndicateVault is
     ///      exit. Reverts `QueueReserveBreached` when there is no pullable
     ///      strategy (preserves the pre-existing error surface for float-only
     ///      exits).
-    function _pullFromStrategy(uint256 shortfall) private {
-        // `strat` is zeroed for a codeless strategy (defense-in-depth on this
-        // fund-moving path; unreachable honestly — maxWithdraw caps at float
-        // when strategy liquidity is 0).
-        (, address strat,, bool laneA) = _laneState();
+    /// @dev `strat`/`laneA` are the CALLER'S already-hoisted `_laneState()`
+    ///      snapshot (issue #100), not re-derived here — a second internal
+    ///      read would defeat the whole point of hoisting it in `_withdraw`.
+    ///      `strat` is zeroed for a codeless strategy (defense-in-depth on
+    ///      this fund-moving path; unreachable honestly — maxWithdraw caps at
+    ///      float when strategy liquidity is 0).
+    function _pullFromStrategy(uint256 shortfall, address strat, bool laneA) private {
         if (strat == address(0) || !laneA) revert QueueReserveBreached();
         IERC20 asset_ = IERC20(asset());
         uint256 balBefore = asset_.balanceOf(address(this));
@@ -1154,6 +1156,27 @@ contract SyndicateVault is
         whenNotPaused
         nonReentrant
     {
+        // ONE snapshot, before `_pullFromStrategy` can move anything (issue
+        // #100). `previewRedeem`/`previewWithdraw` already deducted
+        // `_exitFees(shares)` from `assets` using state read before this call
+        // even started — so the crystallization below MUST price against
+        // that SAME instant, not a fresh one taken after the pull. Re-reading
+        // `_laneState()`/`totalAssets()`/`pricePerShare()` post-pull is
+        // unsound in TWO ways, not one: many real single-position strategies
+        // (one Uniswap V3 NFT range, one Aave supply position) cannot
+        // service a partial withdrawal without fully unwinding, so a pull of
+        // ANY size can empty `positions()` and flip `PriceRouter.valueStrategy`
+        // to `(0, false)` mid-call. A fresh `_laneState()` read at that point
+        // would (1) skip crystallizing the fee entirely, since the gate
+        // reads false — the fee is gone, not booked; and, more subtly, (2)
+        // even a partial flip (the router still reporting SOME reduced
+        // value) would price the gain base against a `totalAssets()` that
+        // silently dropped the strategy's live contribution, undercharging
+        // whatever it DOES still crystallize. Both are closed by pricing this
+        // exit against `ppsAtEntry`, taken here, before anything moves.
+        (, address stratAtEntry,, bool laneAAtEntry) = _laneState();
+        uint256 ppsAtEntry = pricePerShare();
+
         if (caller != _withdrawalQueue) {
             uint256 reserve = reservedQueueAssets();
             uint256 float = IERC20(asset()).balanceOf(address(this));
@@ -1163,7 +1186,7 @@ contract SyndicateVault is
             // float, so live NAV (and thus this exit's share pricing) is
             // unchanged.
             if (assets + reserve > float) {
-                _pullFromStrategy(assets + reserve - float);
+                _pullFromStrategy(assets + reserve - float, stratAtEntry, laneAAtEntry);
             }
         }
         // Crystallize the exiting shares' fees BEFORE the burn, while the
@@ -1172,9 +1195,10 @@ contract SyndicateVault is
         // simply stays behind in the vault — no transfer, no recipient lookup,
         // no external call on the ERC-4626 hot path. The exiter pays the fees
         // they owe at the moment they leave, so exit timing is fee-neutral.
-        (,,, bool laneAExit) = _laneState();
-        if (caller != _withdrawalQueue && laneAExit) {
-            (uint256 mgmtFee, uint256 perfFee) = _exitFees(shares);
+        //
+        // `laneAAtEntry`/`ppsAtEntry`, NOT a fresh read of either — see above.
+        if (caller != _withdrawalQueue && laneAAtEntry) {
+            (uint256 mgmtFee, uint256 perfFee) = _exitFeesAt(shares, ppsAtEntry);
             if (mgmtFee != 0 || perfFee != 0) {
                 // forge-lint: disable-next-line(unsafe-typecast)
                 _crystallizedMgmt += uint128(mgmtFee);
@@ -1579,6 +1603,23 @@ contract SyndicateVault is
     ///      an exiter more than a hold-to-settle depositor pays — breaking the
     ///      neutrality this function exists to provide.
     function _exitFees(uint256 shares) private view returns (uint256 mgmtFee, uint256 perfFee) {
+        return _exitFeesAt(shares, pricePerShare());
+    }
+
+    /// @dev Split out of `_exitFees` so `_withdraw` can price an exit against a
+    ///      PRE-PULL `pps` snapshot instead of a fresh one (issue #100).
+    ///      `pricePerShare()` reads `totalAssets()`, which calls `_laneState()`
+    ///      internally — the SAME hazard the pull-eligibility gate has: many
+    ///      real single-position strategies cannot service a partial
+    ///      withdrawal without fully unwinding, so `_pullFromStrategy` can
+    ///      empty `positions()` and flip `laneA` false mid-`_withdraw`. A `pps`
+    ///      computed AFTER that flip silently drops the strategy's live value
+    ///      from the gain base, undercharging the fee actually owed — not
+    ///      merely failing to book it, understating it. The two view callers
+    ///      below (`previewRedeem`, `previewExitFees`) have no pull in
+    ///      flight, so they keep calling `_exitFees` and get the live,
+    ///      current `pps` — correct for a quote with nothing in progress.
+    function _exitFeesAt(uint256 shares, uint256 pps) private view returns (uint256 mgmtFee, uint256 perfFee) {
         uint256 supply = _pricingSupply();
         if (shares == 0 || supply == 0) return (0, 0);
 
@@ -1594,7 +1635,6 @@ contract SyndicateVault is
 
         // ── Performance: per-share, above the mark, on the shares leaving ──
         uint256 mark = _highWaterPricePerShare;
-        uint256 pps = pricePerShare();
         if (pps > mark) {
             uint256 bps = agentFeeBps();
             uint256 cap = _governorPerformanceCap();
