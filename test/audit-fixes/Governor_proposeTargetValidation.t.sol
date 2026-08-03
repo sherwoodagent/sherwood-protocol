@@ -148,8 +148,9 @@ contract GovernorProposeTargetValidationTest is Test {
 
     function _vaultSelfCalls() internal view returns (BatchExecutorLib.Call[] memory calls) {
         calls = new BatchExecutorLib.Call[](1);
-        calls[0] =
-            BatchExecutorLib.Call({target: address(vault), data: abi.encodeCall(ISyndicateVault.reservedQueueAssets, ()), value: 0});
+        calls[0] = BatchExecutorLib.Call({
+            target: address(vault), data: abi.encodeCall(ISyndicateVault.reservedQueueAssets, ()), value: 0
+        });
     }
 
     function _voteAndAdvance(uint256 pid) internal {
@@ -171,7 +172,14 @@ contract GovernorProposeTargetValidationTest is Test {
         vm.prank(agent);
         vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.DisallowedBatchTarget.selector, address(vault)));
         governor.propose(
-            address(vault), address(0), "ipfs://p", STRATEGY_DURATION, env, _vaultSelfCalls(), _benignCalls(), _noCoProposers()
+            address(vault),
+            address(0),
+            "ipfs://p",
+            STRATEGY_DURATION,
+            env,
+            _vaultSelfCalls(),
+            _benignCalls(),
+            _noCoProposers()
         );
     }
 
@@ -182,7 +190,14 @@ contract GovernorProposeTargetValidationTest is Test {
 
         vm.prank(agent);
         uint256 pid = governor.propose(
-            address(vault), address(0), "ipfs://p", STRATEGY_DURATION, env, _benignCalls(), _benignCalls(), _noCoProposers()
+            address(vault),
+            address(0),
+            "ipfs://p",
+            STRATEGY_DURATION,
+            env,
+            _benignCalls(),
+            _benignCalls(),
+            _noCoProposers()
         );
         assertGt(pid, 0, "benign proposal is accepted at propose");
     }
@@ -264,7 +279,14 @@ contract GovernorProposeTargetValidationTest is Test {
         ISyndicateGovernor.RiskEnvelope memory env1 = GovEnvelope.permissive(address(vault));
         vm.prank(agent);
         uint256 pid1 = governor.propose(
-            address(vault), address(0), "ipfs://p1", STRATEGY_DURATION, env1, _benignCalls(), _benignCalls(), _noCoProposers()
+            address(vault),
+            address(0),
+            "ipfs://p1",
+            STRATEGY_DURATION,
+            env1,
+            _benignCalls(),
+            _benignCalls(),
+            _noCoProposers()
         );
         _voteAndAdvance(pid1);
         governor.executeProposal(pid1);
@@ -287,7 +309,14 @@ contract GovernorProposeTargetValidationTest is Test {
         ISyndicateGovernor.RiskEnvelope memory env2 = GovEnvelope.permissive(address(vault));
         vm.prank(agent);
         uint256 pid2 = governor.propose(
-            address(vault), address(0), "ipfs://p2", STRATEGY_DURATION, env2, reentrantCall, _benignCalls(), _noCoProposers()
+            address(vault),
+            address(0),
+            "ipfs://p2",
+            STRATEGY_DURATION,
+            env2,
+            reentrantCall,
+            _benignCalls(),
+            _noCoProposers()
         );
         _voteAndAdvance(pid2);
 
@@ -296,9 +325,7 @@ contract GovernorProposeTargetValidationTest is Test {
 
         // The escrow survives untouched: the reentrant attempt failed the
         // whole batch instead of silently paying out mid-execution.
-        assertEq(
-            governor.unclaimedFees(address(vault), address(vault), address(usdc)), escrowed, "escrow unaffected"
-        );
+        assertEq(governor.unclaimedFees(address(vault), address(vault), address(usdc)), escrowed, "escrow unaffected");
     }
 
     /// @notice The latch changes nothing for the legitimate pull path: an
@@ -310,7 +337,14 @@ contract GovernorProposeTargetValidationTest is Test {
         ISyndicateGovernor.RiskEnvelope memory env = GovEnvelope.permissive(address(vault));
         vm.prank(agent);
         uint256 pid = governor.propose(
-            address(vault), address(0), "ipfs://p", STRATEGY_DURATION, env, _benignCalls(), _benignCalls(), _noCoProposers()
+            address(vault),
+            address(0),
+            "ipfs://p",
+            STRATEGY_DURATION,
+            env,
+            _benignCalls(),
+            _benignCalls(),
+            _noCoProposers()
         );
         _voteAndAdvance(pid);
         governor.executeProposal(pid);

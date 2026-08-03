@@ -1083,7 +1083,8 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      and this is a `view` in the same tx) still degrades open rather
     ///      than reverting propose for an unrelated reason.
     function _revertIfPrivilegedTarget(address vault_, address target) private view {
-        (bool ok, bytes memory ret) = vault_.staticcall(abi.encodeCall(ISyndicateVault.isPrivilegedBatchTarget, (target)));
+        (bool ok, bytes memory ret) =
+            vault_.staticcall(abi.encodeCall(ISyndicateVault.isPrivilegedBatchTarget, (target)));
         if (ok && ret.length == 32 && abi.decode(ret, (bool))) {
             revert ISyndicateVault.DisallowedBatchTarget(target);
         }
