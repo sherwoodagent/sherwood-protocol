@@ -209,4 +209,32 @@ contract SelectorGuardTest is Test {
         // balanceOf(address) — harmless read selector routed through the batch.
         _exec(_one(address(usdc), abi.encodeCall(usdc.balanceOf, (attacker))));
     }
+
+    // ── issue #137: metamorphic adapter swap dies in the guard ──
+
+    /// @notice The issue's exact attack path, end to end: an allowlisted
+    ///         adapter backed by a REAL contract (not the codeless `adapter`
+    ///         fixture at `:44`) has its bytecode swapped at the same address
+    ///         after the grant. `isAdapterAllowed`'s lazy self-heal
+    ///         (`TierRegistry`, issue #137) closes the funds path on the very
+    ///         next read — no `poke`/`demote` call of any kind runs here, and
+    ///         the swapped-in bytecode's spender/recipient standing is
+    ///         rejected by the vault's batch guard. The adapter is never
+    ///         certified (uncertified/tier-2 the whole time), so no
+    ///         `TierRegressed` path is even reachable — this suite drives
+    ///         `vault.executeGovernorBatch` directly rather than through
+    ///         `SyndicateGovernor.executeProposal`.
+    function test_metamorphicAdapterSwap_diesInGuard() public {
+        ERC20Mock swappedAdapter = new ERC20Mock("Adapter", "ADP", 18);
+        tierRegistry.setAdapterAllowed(address(swappedAdapter), true);
+
+        // Sanity: the allowlisted contract adapter passes before the swap.
+        _exec(_one(address(usdc), abi.encodeCall(usdc.approve, (address(swappedAdapter), 1e6))));
+        assertEq(usdc.allowance(address(vault), address(swappedAdapter)), 1e6);
+
+        vm.etch(address(swappedAdapter), hex"6001600101");
+
+        _expectDisallowed(address(usdc), SEL_APPROVE, address(swappedAdapter));
+        _exec(_one(address(usdc), abi.encodeCall(usdc.approve, (address(swappedAdapter), 500e6))));
+    }
 }

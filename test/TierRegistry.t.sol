@@ -535,7 +535,13 @@ contract TierRegistryTest is Test {
         reg.setAdapterAllowed(target, true);
         vm.stopPrank();
         vm.etch(target, hex"6001600101");
-        assertTrue(reg.isAdapterAllowed(target));
+        // issue #137: isAdapterAllowed self-heals lazily on read, exactly like
+        // tierOf, so it already reports false here even though `poke` has not
+        // run yet and `_adapterAllowed[target]` storage is still `true`. This
+        // assertion used to be `assertTrue` and was pinning the stale-`true`
+        // window that let a metamorphic redeploy keep standing funds-path
+        // rights until someone happened to poke.
+        assertFalse(reg.isAdapterAllowed(target));
 
         vm.expectEmit(true, false, false, true);
         emit TierRegistry.AdapterAllowedSet(target, false);
@@ -618,5 +624,102 @@ contract TierRegistryTest is Test {
         reg.setAdapterAllowed(target, true);
 
         assertTrue(reg.isAdapterAllowed(target));
+    }
+
+    /// @notice issue #137, design.md D1/D2: a metamorphic same-address
+    ///         bytecode swap on an allowlisted adapter self-heals to `false`
+    ///         on the very next read — with NO demotion call of any kind
+    ///         (no `poke`, no `demote`, no `demoteByChallenge`). The owner can
+    ///         then re-attest the new code with a fresh grant, which refreshes
+    ///         the snapshot and restores `true`.
+    function test_metamorphicSwap_selfHealsWithoutPoke() public {
+        address adapter = address(new TierRegistry(owner));
+        vm.prank(owner);
+        reg.setAdapterAllowed(adapter, true);
+        assertTrue(reg.isAdapterAllowed(adapter));
+
+        vm.etch(adapter, hex"6001600101");
+        assertFalse(reg.isAdapterAllowed(adapter), "self-heals without any demotion call");
+
+        vm.prank(owner);
+        reg.setAdapterAllowed(adapter, true); // re-attestation, not a demotion recovery
+        assertTrue(reg.isAdapterAllowed(adapter), "re-grant refreshes the snapshot to the new code");
+    }
+
+    /// @notice design.md D2: for an allowlisted adapter that was NEVER
+    ///         certified, `poke` is permanently unreachable (`NotCertified`),
+    ///         so the lazy read-side self-heal is the ONLY automatic
+    ///         protection — proving the fix cannot be "just call poke more".
+    ///         Owner `setAdapterAllowed(adapter, false)` remains the manual
+    ///         storage-cleanup path for this case.
+    function test_uncertifiedAdapter_readSideGateIsOnlyProtection() public {
+        address adapter = address(new TierRegistry(owner));
+        vm.prank(owner);
+        reg.setAdapterAllowed(adapter, true);
+        assertTrue(reg.isAdapterAllowed(adapter));
+
+        vm.etch(adapter, hex"6001600101");
+        assertFalse(reg.isAdapterAllowed(adapter), "read-side gate closes the funds path");
+
+        vm.expectRevert(TierRegistry.NotCertified.selector);
+        reg.poke(adapter, bytes4(0x12345678));
+
+        vm.prank(owner);
+        reg.setAdapterAllowed(adapter, false);
+        assertFalse(reg.isAdapterAllowed(adapter));
+    }
+
+    /// @notice design.md D3: normalization treats a non-existent account
+    ///         (`bytes32(0)`) and an existing-but-codeless account
+    ///         (`keccak256("")`) as one "no code" value. (a) a codeless
+    ///         allowlisted payout address stays allowed after merely
+    ///         receiving a native-balance donation — the anti-grief property
+    ///         that `test/vault/SelectorGuard.t.sol`'s codeless adapter
+    ///         fixture depends on; (b) code later appearing there fails
+    ///         closed; (c) a contract whose code disappears (selfdestruct)
+    ///         also fails closed.
+    function test_zeroCodeNormalization() public {
+        address payout = makeAddr("payout");
+        vm.prank(owner);
+        reg.setAdapterAllowed(payout, true);
+        assertTrue(reg.isAdapterAllowed(payout), "codeless address allowlists cleanly");
+
+        vm.deal(payout, 1 wei); // non-existent -> existing-codeless
+        assertTrue(reg.isAdapterAllowed(payout), "a 1-wei donation must not grief the funds path closed");
+
+        vm.etch(payout, hex"6001600101");
+        assertFalse(reg.isAdapterAllowed(payout), "code appearing at a codeless allowlisted address fails closed");
+
+        // Separate fixture: a contract that had code at grant time and later
+        // has none (simulating a post-Dencun-rare but still possible
+        // selfdestruct) also fails closed.
+        address adapter = address(new TierRegistry(owner));
+        vm.prank(owner);
+        reg.setAdapterAllowed(adapter, true);
+        assertTrue(reg.isAdapterAllowed(adapter));
+
+        vm.etch(adapter, "");
+        assertFalse(reg.isAdapterAllowed(adapter), "code disappearing (selfdestruct) fails closed");
+    }
+
+    /// @notice design.md D1: `setAdapterAllowed(adapter, false)` answers
+    ///         false regardless of codehash state, and a stale snapshot left
+    ///         behind under a cleared flag is inert — the next grant
+    ///         overwrites it unconditionally with whatever code is live then.
+    function test_revokeThenRegrant_snapshotOverwrittenByNextGrant() public {
+        address adapter = address(new TierRegistry(owner));
+        vm.startPrank(owner);
+        reg.setAdapterAllowed(adapter, true);
+        vm.stopPrank();
+        assertTrue(reg.isAdapterAllowed(adapter));
+
+        vm.etch(adapter, hex"6001600101"); // stale snapshot no longer matches
+        vm.prank(owner);
+        reg.setAdapterAllowed(adapter, false);
+        assertFalse(reg.isAdapterAllowed(adapter), "revoke answers false regardless of codehash state");
+
+        vm.prank(owner);
+        reg.setAdapterAllowed(adapter, true); // re-grant snapshots the NEW code
+        assertTrue(reg.isAdapterAllowed(adapter), "next grant overwrites the stale snapshot with current code");
     }
 }
