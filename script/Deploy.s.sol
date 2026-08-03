@@ -274,11 +274,22 @@ contract DeploySherwood is ScriptBase {
         require(d.factoryProxy == predictedFactoryProxy, "factory addr mismatch");
 
         // Adapter-selector tier registry (spec §3.2). Owned by the deployer at
-        // birth so `certify`/`demote` listing can run before the multisig
-        // handoff; wired into the factory now (deployer still owns it) so every
-        // governor `createSyndicate` stamps out picks it up via the
-        // factory-only `setTierRegistry`. A plain Ownable2Step contract — no
-        // proxy needed (certifications are re-issuable, not upgrade-state).
+        // birth so `demote`/`poke` and the launch-set announcement can run
+        // before the multisig handoff; wired into the factory now (deployer
+        // still owns it) so every governor `createSyndicate` stamps out picks
+        // it up via the factory-only `setTierRegistry`. A plain Ownable2Step
+        // contract — no proxy needed (certifications are re-issuable, not
+        // upgrade-state).
+        //
+        // Granting is two-step (issue #45): `proposeCertification` is
+        // owner-only, but `certify` is permissionless once `certifyDelay` has
+        // elapsed. RUNBOOK for the launch adapter set: propose the whole set
+        // HERE, while the deployer still owns the registry (this call is not
+        // in this function — see the deploy runbook), hand off ownership to
+        // the multisig immediately after (below), and let anyone (deployer,
+        // multisig, a bot) execute each certification once its delay has
+        // passed. Announcement and ownership handoff overlap instead of
+        // serializing; demotion (`demote`/`poke`) stays instant throughout.
         d.tierRegistry = address(new TierRegistry(d.deployer));
         SyndicateFactory(d.factoryProxy).setTierRegistry(d.tierRegistry);
     }

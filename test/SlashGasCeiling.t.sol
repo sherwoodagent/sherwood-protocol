@@ -280,7 +280,16 @@ contract SlashGasCeilingTest is Test {
         gov.setBondEscrow(address(bondEscrow));
         gov.setTierRegistry(address(tierRegistry));
 
-        tierRegistry.certify(address(adapter), adapter.poke.selector, 1, CERTIFIED_BOUND_BPS, address(0));
+        // Two-step certification (design.md / tasks.md 2.1): the test contract
+        // IS the registry owner, so no prank is needed — propose, warp past
+        // the pinned `readyAt` (`vm.getBlockTimestamp()`, never a cached
+        // `block.timestamp` local — the optimizer CSEs it across `vm.warp`),
+        // execute. Every later warp in this suite is relative
+        // (`vm.getBlockTimestamp() + X` or a live `gov.getProposal(...)`
+        // field), so this setUp-time shift is safe.
+        tierRegistry.proposeCertification(address(adapter), adapter.poke.selector, 1, CERTIFIED_BOUND_BPS, address(0));
+        vm.warp(vm.getBlockTimestamp() + tierRegistry.certifyDelay());
+        tierRegistry.certify(address(adapter), adapter.poke.selector);
 
         wood.mint(agent, 1_000_000e18);
         vm.prank(agent);

@@ -141,6 +141,18 @@ contract TierEndToEndTest is Test {
         tierRegistry.setAdapterAllowed(address(adapter), true);
     }
 
+    /// @dev Shared fixture helper (design.md / tasks.md 2.1): the test
+    ///      contract IS the TierRegistry owner (`new TierRegistry(address(this))`
+    ///      in setUp), so no prank is needed — propose, warp past the pinned
+    ///      `readyAt` (via `vm.getBlockTimestamp()`, never a cached
+    ///      `block.timestamp` local — this repo's optimizer CSEs it across
+    ///      `vm.warp`), then execute.
+    function _certifyNow(address target_, bytes4 selector_, uint8 tier_, uint16 bound_, address submitter_) internal {
+        tierRegistry.proposeCertification(target_, selector_, tier_, bound_, submitter_);
+        vm.warp(vm.getBlockTimestamp() + tierRegistry.certifyDelay());
+        tierRegistry.certify(target_, selector_);
+    }
+
     function _settleCalls() internal view returns (BatchExecutorLib.Call[] memory calls) {
         calls = new BatchExecutorLib.Call[](1);
         calls[0] = BatchExecutorLib.Call({
@@ -251,10 +263,10 @@ contract TierEndToEndTest is Test {
     ///         at the stale, under-covered price.
     function test_e2e_certifiedAdapterReducedCoverage() public {
         _wireTierRegistry();
-        tierRegistry.certify(address(adapter), adapter.deploy.selector, 0, 100, address(0)); // tier 0, 1%
+        _certifyNow(address(adapter), adapter.deploy.selector, 0, 100, address(0)); // tier 0, 1%
         // Finding 5: settlement calls count toward coverage too — certify the
         // settle call's (usdc, approve) pair so the whole proposal is bounded.
-        tierRegistry.certify(address(usdc), usdc.approve.selector, 0, 100, address(0));
+        _certifyNow(address(usdc), usdc.approve.selector, 0, 100, address(0));
 
         uint256 pid = _propose(_singleDeployCall(MAX_CAPITAL));
         assertEq(governor.getProposalTier(pid), 0, "certified tier 0 snapshotted at propose");

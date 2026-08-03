@@ -48,8 +48,11 @@ interface IProtocolConfigAdmin {
  *           5. factory.setExposureLedger / setBondEscrow (new syndicates)
  *           6. swood.setExposureLedger      (owner op — arms the unstake gate)
  *         MANUAL follow-ups printed at the end (UUPS upgrade, TierRegistry
- *         redeploy + recertify, and — CONDITIONAL ON THE CHAIN, see pre-flight
- *         5 — either a governor beacon upgrade or pushWiring per governor).
+ *         redeploy + re-propose the live certification set + wait
+ *         `certifyDelay` + execute (issue #45's two-step grant — see the
+ *         printed note for the full populate-before-rewire sequencing), and
+ *         — CONDITIONAL ON THE CHAIN, see pre-flight 5 — either a governor
+ *         beacon upgrade or pushWiring per governor).
  *
  * @dev PRE-FLIGHT 1 was REMOVED (ADR 2026-07-26) — it demanded a 42d sWOOD
  *      cooldown that `setCooldownPeriod`'s own 30d cap made unreachable, so its
@@ -832,7 +835,16 @@ contract DeployPlanB is Script {
         // each is printed with its own precondition spelled out, so the safety
         // of the step is legible from the transcript rather than from having
         // read this file.
-        console.log("MANUAL NEXT: registry UUPS upgrade, TierRegistry redeploy + recertify.");
+        console.log("MANUAL NEXT: registry UUPS upgrade.");
+        console.log("MANUAL NEXT: TierRegistry redeploy + re-apply the live certification set.");
+        console.log("  Sequencing (issue #45 two-step grant): deploy the new registry, call");
+        console.log("  proposeCertification for every (target, selector, tier, bound, submitter)");
+        console.log("  in the OLD registry's live set, wait certifyDelay, then call certify on");
+        console.log("  each (anyone may execute -- it is permissionless once the delay elapses).");
+        console.log("  Re-apply setAdapterAllowed and setAuthorizedDemoter on the NEW registry");
+        console.log("  before the switch. Only once the new registry is fully populated, call");
+        console.log("  factory.setTierRegistry(new) so no governor ever reads an empty registry");
+        console.log("  as tier 2 for an already-certified pair. Rollback: factory.setTierRegistry(old).");
         if (liveGovernors == 0) {
             console.log("MANUAL NEXT: governor beacon upgrade.");
             console.log("  PRECONDITION MET: syndicateCount == 0 -- this beacon has no live governor");
