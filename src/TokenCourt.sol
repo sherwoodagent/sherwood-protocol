@@ -810,15 +810,67 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
         return participationFloorBps * base / BPS_DENOMINATOR;
     }
 
-    /// @dev MIRRORS `ChallengeGame`'s own accused definition exactly, and
-    ///      deliberately does not invent a second one: the ledger's covering
-    ///      approvers, filtered to those whose committed share is still
-    ///      non-zero. The ledger reports a RELEASED commitment as zero rather
-    ///      than dropping the entry, and a guardian that released before the
-    ///      filing backed nothing on this proposal — so it is not slashed for
-    ///      it, and by the same token it is not barred from voting on it. The
-    ///      set that loses its stake on a conviction and the set that may not
-    ///      vote on that conviction are one list read from one place.
+    /// @dev THE PREDICATE IS THE PLEDGE, NOT THE LIVE BOOKING (issue #83).
+    ///      Both fields sit on the ledger, both are keyed by the same review
+    ///      key, and both look like they answer "did this guardian underwrite
+    ///      this proposal?". Only one of them is a fact nobody can rewrite
+    ///      under a live case:
+    ///
+    ///        `_reservedUsd`  — THE PLEDGE. `recordApproval` is its only
+    ///          writer, `releaseApproval` its only eraser, and a filed
+    ///          challenge blocks that eraser outright (`CoverageFrozen`).
+    ///          Read here, through `pledgedOf`.
+    ///        `_recorded.usd` — THE LIVE BOOKING. `settleCoverage` rewrites
+    ///          it in BOTH directions; that call is permissionless,
+    ///          re-runnable by design, and deliberately not freeze-gated.
+    ///          Read through `approversOf`, which this function used to use.
+    ///
+    ///      Filtering on the booking put the accused set inside a stranger's
+    ///      reach, with no attacker capital and no privileged role. A guardian
+    ///      convicted on a SEPARATE, CONCURRENT challenge lands at exactly
+    ///      zero own stake (Plan B pre-flights `maxSlashBps == 10_000`, so
+    ///      `StakedWood._slashOne` takes the whole live balance). Its
+    ///      slashable bond is then zero, so the next `settleCoverage` on THIS
+    ///      proposal books it at zero — and anyone may make that call, at any
+    ///      time after `executeBy`. The guardian dropped out of the loop
+    ///      below, never had `isAccused` set, and walked straight past `vote`'s
+    ///      `AccusedCannotVote` bar. Its BALLOT still weighed the full
+    ///      pre-slash amount, because `vote` reads `getPastVotes` at
+    ///      `c.snapshotTs == executedAt - 1` and checkpoints are append-only —
+    ///      an instant no later slash can reach back to. The result was the
+    ///      exact inversion this bar exists to prevent: the accused judging,
+    ///      at full weight, the case its own approval caused. The pledge is
+    ///      immune to every step of it — no conviction, no price move and no
+    ///      settlement pass can lower it.
+    /// @dev A RELEASED APPROVER IS STILL EXCLUDED, which is what this filter
+    ///      was written for, and it survives the change untouched.
+    ///      `releaseApproval` zeroes the pledge AND swap-and-pops the guardian
+    ///      out of `_approversOf`, so a commitment released before the filing
+    ///      is not in the list this loop walks at all. It is NOT reported as a
+    ///      zero-share entry — an earlier revision of this comment claimed the
+    ///      ledger keeps the full historical set that way, and that has been
+    ///      false since the swap-and-pop landed. The zero-check below is kept
+    ///      as the belt to that brace: filtering on one predicate rather than
+    ///      on list membership costs nothing and stays correct if the ledger
+    ///      ever does start retaining released entries.
+    /// @dev THE BAR IS WIDER THAN THE SLASH, BY CONSTRUCTION. The earlier
+    ///      claim that the two sets are "one list read from one place" was
+    ///      never true: they are two reads, at two instants, in two contracts.
+    ///      `ChallengeGame._settle` derives who is SLASHED from `slashBpsFor`
+    ///      at RULE time, and that view still filters on the live booking.
+    ///      What holds is CONTAINMENT, which is the direction that matters:
+    ///      `_recorded.usd != 0` implies `_reservedUsd != 0` — the booking is
+    ///      derived from the pledge and bounded by it, and a release clears
+    ///      both — so everyone a conviction can take stake from is barred
+    ///      here. Nobody votes on a case that is about to slash them.
+    ///
+    ///      The converse gap — barred here, slashed nothing there — costs
+    ///      nothing to leave open. A booking only reaches zero once the
+    ///      guardian's own slashable bond has; `_slashOne` clamps every rate
+    ///      to live stake and the delegated leg is always zero. So the entry
+    ///      `slashBpsFor` drops is one there was never anything to collect
+    ///      from. Widening that read as well would change the conviction path
+    ///      without recovering a wei, so it is deliberately left alone.
     /// @dev  THE LEDGER COMES FROM THE GAME, NOT FROM `governor`. See
     ///       `IChallengeGameLedger` for why substituting the challenger-
     ///       supplied governor's ledger would hand the accused an empty
@@ -873,7 +925,7 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///       extra SLOAD per approver and makes the floor's denominator
     ///       independent of that.
     /// @dev  THE LOOP IS BOUNDED, not unbounded despite the caller-controlled
-    ///       `proposalId`: `approversOf` returns the same list
+    ///       `proposalId`: `pledgedOf` returns the same list
     ///       `GuardianRegistry` walks on every approve/settle, which is capped
     ///       at `MAX_APPROVERS_PER_PROPOSAL = 100` (`GuardianRegistry.sol`).
     ///       So this loop is at most 100 iterations, each one `getPastStake`
@@ -904,14 +956,17 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
         uint256 proposalId,
         uint256 snapshotTs
     ) internal {
-        (address[] memory approvers, uint256[] memory committedUsd) =
-            IExposureLedger(ledger).approversOf(governor, proposalId);
+        (address[] memory approvers, uint256[] memory pledgedUsd) =
+            IExposureLedger(ledger).pledgedOf(governor, proposalId);
 
         address swood = stakedWood;
         uint256 weight;
         uint256 count;
         for (uint256 i; i < approvers.length; ++i) {
-            if (committedUsd[i] == 0) continue; // released before the filing: backs nothing, answers for nothing
+            // The PLEDGE, not the live booking: a release before the filing
+            // backs nothing and answers for nothing, but a settlement pass
+            // writing a booking down to zero is not a release (#83).
+            if (pledgedUsd[i] == 0) continue;
             address approver = approvers[i];
             if (isAccused[caseId][approver]) continue; // dedup guard
 

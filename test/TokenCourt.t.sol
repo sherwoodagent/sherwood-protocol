@@ -102,17 +102,41 @@ contract MockGameForCourt {
     }
 }
 
+/// @dev Mirrors the real ledger's TWO numbers per approver, because #83 is
+///      about the gap between them. `recordApproval` writes the pledge and the
+///      live booking equal, so `setApprovers` does too; `settleCoverage` moves
+///      only the booking, so `setCommittedOnly` is this mock's stand-in for a
+///      settlement pass and is what lets a test drive the booking to zero while
+///      the pledge stands.
 contract MockLedgerForCourt {
     address[] internal _approvers;
     uint256[] internal _committed;
+    uint256[] internal _pledged;
 
     function setApprovers(address[] memory a, uint256[] memory c) external {
         _approvers = a;
         _committed = c;
+        _pledged = c;
+    }
+
+    /// @dev A settlement pass: rewrites the LIVE BOOKING for one approver and
+    ///      leaves the pledge alone, exactly as `_rebook` does.
+    function setCommittedOnly(address guardian, uint256 usd) external {
+        for (uint256 i; i < _approvers.length; ++i) {
+            if (_approvers[i] == guardian) {
+                _committed[i] = usd;
+                return;
+            }
+        }
+        revert("not an approver");
     }
 
     function approversOf(address, uint256) external view returns (address[] memory, uint256[] memory) {
         return (_approvers, _committed);
+    }
+
+    function pledgedOf(address, uint256) external view returns (address[] memory, uint256[] memory) {
+        return (_approvers, _pledged);
     }
 }
 
@@ -601,6 +625,130 @@ contract TokenCourtTest is Test {
         assertEq(secondCase, 2, "the new game's challenge gets its own case");
         assertEq(court.caseOfChallenge(address(game2), CHALLENGE_ID), secondCase);
         assertEq(court.caseOfChallenge(address(game), CHALLENGE_ID), firstCase, "the old mapping is intact");
+    }
+
+    /// @notice ISSUE #83, the seam in one assertion: the accused set is derived
+    ///         from the PLEDGE, so a settlement pass that wrote a guardian's
+    ///         LIVE BOOKING down to zero cannot lift the bar off it.
+    /// @dev    `setCommittedOnly` is what `ExposureLedger._rebook` does to an
+    ///         approver whose own slashable bond has been emptied by a
+    ///         concurrent conviction — the booking goes to zero, the pledge is
+    ///         untouched. Before the fix `_recordAccused` read the booking,
+    ///         saw zero, and `continue`d: `accusedG` came out unaccused, with
+    ///         its stake missing from `accusedWeight`, free to vote at full
+    ///         pre-slash weight on the case its own approval caused.
+    ///
+    ///         `released` is the control. It really did release, so BOTH its
+    ///         numbers are zero and it must stay out of the set — the
+    ///         behaviour the zero-filter was written for, unchanged.
+    function test_refer_accusedByPledgeNotBySettledBooking() public {
+        _disputedChallenge();
+        address released = makeAddr("released");
+        address[] memory a = new address[](2);
+        uint256[] memory cm = new uint256[](2);
+        a[0] = accusedG;
+        cm[0] = 100e18;
+        a[1] = released;
+        cm[1] = 0;
+        ledger.setApprovers(a, cm);
+        // Step 4 of the chain: anyone calls `settleCoverage`, and the approver
+        // a concurrent conviction already emptied is booked at zero.
+        ledger.setCommittedOnly(accusedG, 0);
+        (, uint256[] memory bookedNow) = ledger.approversOf(governor, PROPOSAL_ID);
+        (, uint256[] memory pledgedNow) = ledger.pledgedOf(governor, PROPOSAL_ID);
+        assertEq(bookedNow[0], 0, "fixture: the live booking really is zero");
+        assertEq(pledgedNow[0], 100e18, "fixture: the pledge is untouched by settlement");
+
+        uint256 snap = vm.getBlockTimestamp() - 1 days - 1;
+        swood.setPastStake(accusedG, snap, 500e18);
+        swood.setPastStake(released, snap, 900e18); // must never enter the sum
+
+        uint256 caseId = court.refer(CHALLENGE_ID);
+
+        assertTrue(court.isAccused(caseId, accusedG), "a zeroed BOOKING does not clear the accusation");
+        assertFalse(court.isAccused(caseId, released), "a real release still is not accused");
+        assertEq(court.accusedOf(caseId).length, 1);
+        assertEq(court.caseOf(caseId).accusedWeight, 500e18, "its stake still counts against the floor");
+
+        // Step 6, the inversion itself: the bar must actually bite.
+        swood.setPastVotes(accusedG, snap, 500e18); // full PRE-slash weight, as `getPastVotes` reports it
+        vm.prank(accusedG);
+        vm.expectRevert(ITokenCourt.AccusedCannotVote.selector);
+        court.vote(caseId, false);
+    }
+
+    /// @notice The set and the weight are FROZEN at `refer`. Nothing the ledger
+    ///         does afterwards — a further settlement pass in either direction,
+    ///         or a release — may reach back into a live case.
+    /// @dev    Complements `test_repointAfterReferDoesNotDisturbCase`, which
+    ///         pins WHICH ledger the case reads (#69). This pins WHAT that
+    ///         ledger said (#83): the accused set is written into storage once
+    ///         and never re-derived, so a post-`refer` mutation of either
+    ///         number is inert.
+    function test_referSnapshotsTheAccusedSet_laterLedgerMovesAreInert() public {
+        _disputedChallenge();
+        address[] memory a = new address[](1);
+        uint256[] memory cm = new uint256[](1);
+        a[0] = accusedG;
+        cm[0] = 100e18;
+        ledger.setApprovers(a, cm);
+        uint256 snap = vm.getBlockTimestamp() - 1 days - 1;
+        swood.setPastStake(accusedG, snap, 500e18);
+
+        uint256 caseId = court.refer(CHALLENGE_ID);
+        assertTrue(court.isAccused(caseId, accusedG));
+        assertEq(court.caseOf(caseId).accusedWeight, 500e18);
+
+        // A later settlement pass writes the booking down to nothing...
+        ledger.setCommittedOnly(accusedG, 0);
+        assertTrue(court.isAccused(caseId, accusedG), "still accused");
+        assertEq(court.caseOf(caseId).accusedWeight, 500e18, "weight unmoved");
+
+        // ...and a wholesale rewrite of the ledger's content, pledge included,
+        // is equally inert. Even the raw stake read moving cannot shift it.
+        address[] memory empty = new address[](0);
+        ledger.setApprovers(empty, new uint256[](0));
+        swood.setPastStake(accusedG, snap, 1e18);
+        assertTrue(court.isAccused(caseId, accusedG), "the flag is storage, not a live re-read");
+        assertEq(court.accusedOf(caseId).length, 1, "the list is storage too");
+        assertEq(court.caseOf(caseId).accusedWeight, 500e18, "and so is the weight");
+
+        vm.prank(accusedG);
+        vm.expectRevert(ITokenCourt.AccusedCannotVote.selector);
+        court.vote(caseId, true);
+    }
+
+    /// @notice THE ORDINARY CASE MUST NOT REGRESS: an approver whose booking
+    ///         legitimately reads non-zero at `refer` is accused and barred,
+    ///         exactly as before #83. Widening the predicate from the booking
+    ///         to the pledge may only ADD to the set, never remove from it.
+    function test_vote_accusedCannotVote_ordinaryNonZeroBooking() public {
+        _disputedChallenge();
+        address[] memory a = new address[](1);
+        uint256[] memory cm = new uint256[](1);
+        a[0] = accusedG;
+        cm[0] = 100e18; // never settled: booking and pledge agree, both non-zero
+        ledger.setApprovers(a, cm);
+        uint256 snap = vm.getBlockTimestamp() - 1 days - 1;
+        swood.setPastStake(accusedG, snap, 500e18);
+
+        uint256 caseId = court.refer(CHALLENGE_ID);
+        (, uint256[] memory booked) = ledger.approversOf(governor, PROPOSAL_ID);
+        assertEq(booked[0], 100e18, "fixture: this is the un-settled, non-zero-booking case");
+        assertTrue(court.isAccused(caseId, accusedG));
+
+        swood.setPastVotes(accusedG, snap, 500e18);
+        vm.prank(accusedG);
+        vm.expectRevert(ITokenCourt.AccusedCannotVote.selector);
+        court.vote(caseId, true);
+
+        // And an unrelated holder is still perfectly able to vote — the bar is
+        // aimed at the accused, not at the electorate.
+        swood.setPastVotes(voterA, snap, 300e18);
+        swood.setPastTotalVotes(snap, 1_000e18);
+        vm.prank(voterA);
+        court.vote(caseId, true);
+        assertEq(court.caseOf(caseId).guiltyVotes, 300e18);
     }
 
     function _referredCase() internal returns (uint256 caseId) {

@@ -65,6 +65,12 @@ contract MockChallengeLedger {
 
     mapping(bytes32 reviewKey => address[]) internal _approvers;
     mapping(bytes32 reviewKey => mapping(address guardian => uint256)) internal _committed;
+    /// @dev The PLEDGE — the real ledger's `_reservedUsd`. `recordApproval`
+    ///      writes it equal to the live booking and only `releaseApproval`
+    ///      clears it; `settleCoverage` never touches it. Kept separate here so
+    ///      a test can drive the BOOKING to zero under a live challenge (the
+    ///      #83 chain) without pretending the guardian released.
+    mapping(bytes32 reviewKey => mapping(address guardian => uint256)) internal _pledged;
     mapping(bytes32 reviewKey => bool) internal _frozen;
     mapping(address guardian => uint256) internal _slashableBondUsd;
 
@@ -107,8 +113,20 @@ contract MockChallengeLedger {
         delete _approvers[k];
         for (uint256 i = 0; i < guardians.length; i++) {
             _approvers[k].push(guardians[i]);
+            // `recordApproval` writes the same number into both: the pledge and
+            // the live booking only diverge once settlement runs.
             _committed[k][guardians[i]] = usd[i];
+            _pledged[k][guardians[i]] = usd[i];
         }
+    }
+
+    /// @dev A settlement pass on ONE approver: rewrites the LIVE BOOKING and
+    ///      leaves the pledge alone, exactly as `ExposureLedger._rebook` does.
+    ///      Driving it to zero is what a `settleCoverage` call does to a
+    ///      guardian whose own slashable bond was emptied by a concurrent
+    ///      conviction.
+    function setCommittedOnly(address governor, uint256 proposalId, address guardian, uint256 usd) external {
+        _committed[_key(governor, proposalId)][guardian] = usd;
     }
 
     function approversOf(address governor, uint256 proposalId)
@@ -121,6 +139,19 @@ contract MockChallengeLedger {
         committedUsd = new uint256[](guardians.length);
         for (uint256 i = 0; i < guardians.length; i++) {
             committedUsd[i] = _committed[k][guardians[i]];
+        }
+    }
+
+    function pledgedOf(address governor, uint256 proposalId)
+        external
+        view
+        returns (address[] memory guardians, uint256[] memory pledgedUsd)
+    {
+        bytes32 k = _key(governor, proposalId);
+        guardians = _approvers[k];
+        pledgedUsd = new uint256[](guardians.length);
+        for (uint256 i = 0; i < guardians.length; i++) {
+            pledgedUsd[i] = _pledged[k][guardians[i]];
         }
     }
 
