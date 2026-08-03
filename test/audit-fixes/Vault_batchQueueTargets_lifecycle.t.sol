@@ -255,7 +255,9 @@ contract VaultBatchQueueTargetsLifecycleTest is Test {
             STRATEGY_DURATION,
             steal,
             _queueRedeemCalls(victimShares, 2),
+            GovEnvelope.defaultCaps(steal.maxCapital, (_queueRedeemCalls(victimShares, 2)).length),
             _benignCalls(),
+            GovEnvelope.defaultCaps(steal.maxCapital, (_benignCalls()).length),
             _noCoProposers()
         );
 
@@ -293,7 +295,9 @@ contract VaultBatchQueueTargetsLifecycleTest is Test {
             STRATEGY_DURATION,
             env,
             _benignCalls(),
+            GovEnvelope.defaultCaps(env.maxCapital, (_benignCalls()).length),
             _queueRedeemCalls(1e6, 1),
+            GovEnvelope.defaultCaps(env.maxCapital, (_queueRedeemCalls(1e6, 1)).length),
             _noCoProposers()
         );
     }

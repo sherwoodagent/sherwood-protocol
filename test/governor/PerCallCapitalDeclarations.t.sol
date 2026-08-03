@@ -108,6 +108,20 @@ contract PerCallCapitalDeclarationsTest is Test {
         tierRegistry.setAdapterAllowed(address(usdc), true);
     }
 
+    /// @dev Shared fixture helper (mirrors `TierRegistryTest._certifyNow`):
+    ///      reaches the same end state as the old instant `certify` via the
+    ///      new two-step flow from #45's certification timelock — propose
+    ///      (test contract is `tierRegistry`'s owner, no prank needed), warp
+    ///      past the pinned `readyAt` (`vm.getBlockTimestamp()`, never a
+    ///      cached `block.timestamp` local — this repo's optimizer CSEs it
+    ///      across `vm.warp`), execute. Every call site here pins no bond
+    ///      (`submitter == address(0)`), so the finalize step needs no prank.
+    function _certifyNow(address target_, bytes4 selector_, uint8 tier_, uint16 bound_, address submitter_) internal {
+        tierRegistry.proposeCertification(target_, selector_, tier_, bound_, submitter_, target_.codehash);
+        vm.warp(vm.getBlockTimestamp() + tierRegistry.certifyDelay());
+        tierRegistry.certify(target_, selector_);
+    }
+
     function _benignSettle() internal view returns (BatchExecutorLib.Call[] memory calls) {
         calls = new BatchExecutorLib.Call[](1);
         calls[0] = BatchExecutorLib.Call({
@@ -131,8 +145,8 @@ contract PerCallCapitalDeclarationsTest is Test {
     ///         per-call sum.
     function test_issueHeadlineScenario_tierAndCoverage() public {
         _wireTierRegistry();
-        tierRegistry.certify(address(mockAdapter), mockAdapter.approve.selector, 0, 100, address(0));
-        tierRegistry.certify(address(mockAdapter), mockAdapter.transfer.selector, 1, 500, address(0));
+        _certifyNow(address(mockAdapter), mockAdapter.approve.selector, 0, 100, address(0));
+        _certifyNow(address(mockAdapter), mockAdapter.transfer.selector, 1, 500, address(0));
         // Third call: uncertified (tier 2, 10_000 bps) -- mockAdapter.mint has
         // no certification entry.
 
@@ -212,7 +226,7 @@ contract PerCallCapitalDeclarationsTest is Test {
     ///         binds tier-2 pricing specifically, not caps in general.
     function test_tier2Ceiling_sameCapAcceptedOnCertifiedTier0Call() public {
         _wireTierRegistry();
-        tierRegistry.certify(address(mockAdapter), mockAdapter.mint.selector, 0, 50, address(0));
+        _certifyNow(address(mockAdapter), mockAdapter.mint.selector, 0, 50, address(0));
         vm.prank(owner);
         governor.setTier2CallCapBps(200);
 
@@ -448,7 +462,7 @@ contract PerCallCapitalDeclarationsTest is Test {
     ///         actual outflow at execute time.
     function test_allZeroCaps_pricesZeroCoverage_meterStillBlocksOutflow() public {
         _wireTierRegistry();
-        tierRegistry.certify(address(mockAdapter), mockAdapter.mint.selector, 0, 50, address(0));
+        _certifyNow(address(mockAdapter), mockAdapter.mint.selector, 0, 50, address(0));
         // The vault's selector guard (Part 2, registry-dependent) requires
         // transfer recipients to be allowlisted -- orthogonal to this test's
         // subject (the per-call cap meter), so allowlist it explicitly rather
@@ -486,7 +500,7 @@ contract PerCallCapitalDeclarationsTest is Test {
 
     function test_regression_coverageRegressed_whenACappedCallsBoundRises() public {
         _wireTierRegistry();
-        tierRegistry.certify(address(mockAdapter), mockAdapter.mint.selector, 0, 50, address(0));
+        _certifyNow(address(mockAdapter), mockAdapter.mint.selector, 0, 50, address(0));
 
         BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](1);
         execCalls[0] = BatchExecutorLib.Call({
@@ -510,10 +524,25 @@ contract PerCallCapitalDeclarationsTest is Test {
         );
         assertEq(governor.getRequiredCoverage(pid), 5e6, "1_000e6 * 50/10_000");
 
-        _advancePastVoting();
         // Same tier, but the certified bound rises 10x -- coverage regresses
-        // even though the tier does not.
-        tierRegistry.certify(address(mockAdapter), mockAdapter.mint.selector, 0, 500, address(0));
+        // even though the tier does not. The re-certification must clear
+        // #45's certification timelock before `executeProposal` re-resolves
+        // live coverage below, but a second full `certifyDelay` (default 3
+        // days) stacked on top of `_advancePastVoting`'s warp would blow past
+        // this proposal's EXECUTION_WINDOW (1 day) and revert
+        // `ProposalNotApproved` instead of the `CoverageRegressed` this test
+        // is actually about. Fix: shrink `certifyDelay` to its floor
+        // (MIN_CERTIFY_DELAY, exactly VOTING_PERIOD here) and propose the
+        // re-cert NOW, so its `readyAt` elapses from the SAME
+        // `_advancePastVoting` warp that clears the vote, instead of adding
+        // a second one.
+        tierRegistry.setCertifyDelay(tierRegistry.MIN_CERTIFY_DELAY());
+        tierRegistry.proposeCertification(
+            address(mockAdapter), mockAdapter.mint.selector, 0, 500, address(0), address(mockAdapter).codehash
+        );
+
+        _advancePastVoting();
+        tierRegistry.certify(address(mockAdapter), mockAdapter.mint.selector);
 
         vm.expectRevert(ISyndicateGovernor.CoverageRegressed.selector);
         governor.executeProposal(pid);
@@ -521,7 +550,7 @@ contract PerCallCapitalDeclarationsTest is Test {
 
     function test_regression_tierRegressed_whenAdapterDemoted() public {
         _wireTierRegistry();
-        tierRegistry.certify(address(mockAdapter), mockAdapter.mint.selector, 0, 50, address(0));
+        _certifyNow(address(mockAdapter), mockAdapter.mint.selector, 0, 50, address(0));
 
         BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](1);
         execCalls[0] = BatchExecutorLib.Call({
@@ -574,7 +603,7 @@ contract PerCallCapitalDeclarationsTest is Test {
         execCalls[1] = BatchExecutorLib.Call({
             target: address(mockAdapter), data: abi.encodeCall(mockAdapter.mint, (address(this), 1)), value: 0
         });
-        tierRegistry.certify(address(mockAdapter), mockAdapter.mint.selector, 0, 50, address(0));
+        _certifyNow(address(mockAdapter), mockAdapter.mint.selector, 0, 50, address(0));
         uint256[] memory execCaps = new uint256[](2);
         execCaps[0] = 0; // uncertified call -- moves nothing declared
         execCaps[1] = 0; // certified tier-0 call, ALSO capped at zero

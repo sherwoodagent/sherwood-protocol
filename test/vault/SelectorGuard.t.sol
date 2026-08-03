@@ -315,7 +315,9 @@ contract SelectorGuardTest is Test {
         );
         vm.prank(address(legacy));
         vault.executeGovernorBatch(
-            _one(address(usdc), abi.encodeCall(usdc.transferFrom, (sink, address(vault), 50e6))), type(uint256).max
+            _one(address(usdc), abi.encodeCall(usdc.transferFrom, (sink, address(vault), 50e6))),
+            new uint256[](0),
+            type(uint256).max
         );
     }
 
