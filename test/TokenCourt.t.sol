@@ -1438,6 +1438,86 @@ contract TokenCourtTest is Test {
         );
     }
 
+    /// @notice AUDIT FINDING (PR #120, confidence 92): THE `: 0` CLAMP ALONE
+    ///         COLLAPSES THE FLOOR TO ZERO UNDER ORDINARY ELECTORATE GROWTH —
+    ///         NO ATTACKER REQUIRED. THIS IS THE REGRESSION FOR THE FIX, NOT
+    ///         FOR THE ORIGINAL BUG.
+    ///
+    ///         Every test above shares one property the audit caught: `earlier`
+    ///         is never set, so `getPastTotalVotes(lookbackTs)` reads its
+    ///         zero-checkpoint default and every one of them resolves through
+    ///         the `earlier == 0` fallback (`base = total`). None of them
+    ///         exercises `earlier != 0 && earlier < total` — the regime the
+    ///         production formula actually lands in whenever the protocol has
+    ///         grown over the lookback window, which is the common case, not
+    ///         an edge case.
+    ///
+    ///         The bug the audit found: an EARLIER buggy revision subtracted
+    ///         `accusedWeight` from `min(earlier, total)` — mixing an
+    ///         `accusedWeight` measured NOW against an electorate measured a
+    ///         month ago. In a growing protocol, "the accused today" routinely
+    ///         exceeds "the whole electorate a month ago" with zero attacker
+    ///         action, so that formula read `base <= accusedWeight` and
+    ///         returned a floor of ZERO while a large, honest, unaccused
+    ///         electorate stood by unable to move it — worse than the original
+    ///         bug, because a `NotGuilty` bought this way is terminal (the
+    ///         forfeited bond routes to the accused's own counter-bond
+    ///         funders and the proposal becomes permanently unchallengeable),
+    ///         where the original bug's `Inconclusive` was merely recoverable.
+    ///
+    ///         The fix: reduce `total` by `accusedWeight` FIRST (same
+    ///         instant), THEN take the lookback min. Reproduces the audit's
+    ///         own worked numbers: earlier=60,000, total=560,000,
+    ///         accused=300,000. `reduced = 560,000 - 300,000 = 260,000`;
+    ///         `base = min(60,000, 260,000) = 60,000` (earlier is the binding
+    ///         constraint here, not the subtraction) — a real, sizeable floor,
+    ///         not zero, with 260,000 WOOD of honest electorate correctly
+    ///         still counted as available to clear it.
+    ///
+    ///         MUTATION-CHECKED: reducing against `min(earlier, total)`
+    ///         instead of against `total` alone (i.e. reverting to
+    ///         `base = base > accusedWeight ? base - accusedWeight : 0` where
+    ///         `base` was already `min(earlier, total)`) computes
+    ///         `60,000 > 300,000? false -> 0` and fails this test's nonzero
+    ///         assertion.
+    function test_finalize_floorSurvivesElectorateGrowthPastTheLookback() public {
+        game.setChallenge(
+            CHALLENGE_ID,
+            governor,
+            PROPOSAL_ID,
+            IChallengeGame.Status.Disputed,
+            vm.getBlockTimestamp(),
+            30 days,
+            vm.getBlockTimestamp() - 1 days
+        );
+        address accused = makeAddr("growingProtocolAccused");
+        address[] memory a = new address[](1);
+        uint256[] memory cm = new uint256[](1);
+        a[0] = accused;
+        cm[0] = 100e18;
+        ledger.setApprovers(a, cm);
+
+        uint256 snap = vm.getBlockTimestamp() - 1 days - 1;
+        uint256 lookbackTs = snap - court.FLOOR_LOOKBACK();
+
+        // The audit's own worked example: the protocol grew ~9x over the
+        // lookback window, and the accused cohort (300k) sits between
+        // `earlier` (60k) and `total` (560k) — the untested regime.
+        swood.setPastStake(accused, snap, 300_000e18);
+        swood.setPastTotalVotes(lookbackTs, 60_000e18);
+        swood.setPastTotalVotes(snap, 560_000e18);
+
+        uint256 caseId = court.refer(CHALLENGE_ID);
+        assertEq(court.caseOf(caseId).accusedWeight, 300_000e18, "accused raw stake recorded");
+
+        vm.warp(vm.getBlockTimestamp() + 5 days);
+
+        (uint256 floor,) = _finalizeAndReadFloor(caseId);
+
+        assertEq(floor, 6_000e18, "10% of min(60_000e18, 560_000e18 - 300_000e18) = 10% of 60_000e18");
+        assertGt(floor, 0, "electorate growth past the lookback must not collapse the floor to zero");
+    }
+
     // ── ownership ──
 
     /// @notice An ownerless court is unrecoverable: it is non-upgradeable, so

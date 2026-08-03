@@ -100,7 +100,8 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///         referred under regardless of later changes here.
     uint256 public voteWindow = 5 days;
     /// @notice The anti-capture participation floor, in bps of
-    ///         `total - accusedWeight` at a case's snapshot.
+    ///         `min(earlier, total - accusedWeight)` — see
+    ///         `_participationFloor` for the full lookback-min rationale.
     uint256 public participationFloorBps = 1_000;
 
     /// @notice Count of cases ever referred. Case ids are 1-indexed.
@@ -569,45 +570,56 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
         }
     }
 
-    /// @dev THE FLOOR'S BASE IS `max(0, min(getPastTotalVotes(snapshotTs),
-    ///      getPastTotalVotes(snapshotTs - FLOOR_LOOKBACK)) - accusedWeight)`
-    ///      — the accused subtraction CLAMPS AT ZERO when the subtrahend
-    ///      meets or exceeds the base. `accusedWeight` sums `getPastStake`
-    ///      over the accused set, the exact same raw-own-stake basis
-    ///      `getPastTotalVotes` sums over the whole electorate — so the two
-    ///      operands are the same measure of the same WOOD.
+    /// @dev THE FLOOR'S BASE IS `min(earlier, max(0, total - accusedWeight))`
+    ///      — `total` and `accusedWeight` are reduced against EACH OTHER
+    ///      FIRST, at the SAME INSTANT (`snapshotTs`), and only that
+    ///      same-instant result is then subjected to the `earlier` lookback
+    ///      min below. `accusedWeight` sums `getPastStake` over the accused
+    ///      set, the exact same raw-own-stake basis `getPastTotalVotes` sums
+    ///      over the whole electorate — so the two operands of the
+    ///      subtraction are the same measure of the same WOOD at the same
+    ///      timestamp. Reducing against a DIFFERENT instant (an earlier
+    ///      revision of this function subtracted `accusedWeight` from
+    ///      `min(earlier, total)` rather than from `total` alone) mixes two
+    ///      timestamps: in a growing protocol, "the accused today" routinely
+    ///      exceeds "the whole electorate a month ago" with no attacker
+    ///      action at all, which read as `base == 0` and collapsed the floor
+    ///      to nothing while a large, honest, unaccused electorate stood by
+    ///      unable to move it — the fix for #96 was found to introduce this
+    ///      failure and was corrected before merge.
     /// @dev THE CLAMPED BRANCH IS A LIVE BRANCH, NOT DEFENCE-IN-DEPTH:
-    ///      `accusedWeight <= total` does not hold by construction once the
-    ///      lookback below is in play — the base can come from `snapshotTs -
-    ///      FLOOR_LOOKBACK`, an instant at which an accused approver who
-    ///      staked recently was not yet counted, so `accusedWeight` (still
-    ///      measured at `snapshotTs`, where it must be, because that is the
-    ///      stake a conviction actually slashes) can legitimately exceed it.
-    ///      THE INVARIANT THE CLAMP BUYS IS MONOTONICITY: the floor is
-    ///      monotone NON-INCREASING in `accusedWeight`, so growing the accused
-    ///      cohort's recorded stake can only ever lower the bar its jury must
-    ///      clear, never raise it, and there is no discontinuity at the
-    ///      crossing. The adversary is the accused set itself. Falling back to
-    ///      the UNREDUCED base instead would make the floor jump from
-    ///      near-zero straight to its maximum (`bps * base`) at the crossing,
-    ///      so an accused approver — who controls `accusedWeight` by staking
-    ///      more before its own drain, inside `FLOOR_LOOKBACK` — could buy a
-    ///      forced `Inconclusive` (no slash, no `_convicted` mark, no adapter
-    ///      demotion, counter-bond returned whole) for one extra wei of stake.
-    ///      That is strictly cheaper than the non-approving-address denial
-    ///      lever the lookback min below exists to close, and it lands in this
-    ///      exact branch.
+    ///      `accusedWeight <= total` does NOT hold by construction — the
+    ///      accused set is exactly whoever the challenge named, and nothing
+    ///      stops that set (measured at `snapshotTs`, where it must be,
+    ///      because that is the stake a conviction actually slashes) from
+    ///      approaching or reaching the full electorate. THE INVARIANT THE
+    ///      CLAMP BUYS IS MONOTONICITY: the floor is monotone NON-INCREASING
+    ///      in `accusedWeight`, so growing the accused cohort's recorded
+    ///      stake can only ever lower the bar its jury must clear, never
+    ///      raise it, and there is no discontinuity anywhere on the domain.
+    ///      The adversary is the accused set itself. Falling back to the
+    ///      UNREDUCED base instead would make the floor jump from near-zero
+    ///      straight to its maximum (`bps * base`) at the crossing, so an
+    ///      accused approver — who controls `accusedWeight` by staking more
+    ///      before its own drain — could buy a forced `Inconclusive` (no
+    ///      slash, no `_convicted` mark, no adapter demotion, counter-bond
+    ///      returned whole) for one extra wei of stake. That is strictly
+    ///      cheaper than the non-approving-address denial lever the lookback
+    ///      min below exists to close, and it lands in this exact branch.
     ///
-    ///      A ZERO FLOOR IS SAFE HERE because the floor was never the guard
-    ///      against an empty vote: `finalize`'s `turnout == 0` check sits
-    ///      ahead of the `turnout < floor` comparison and forces
-    ///      `Inconclusive` on a silent electorate no matter what this returns,
-    ///      so a zero floor can never let a zero-turnout case resolve on the
-    ///      merits. What a zero floor DOES admit is any single unaccused voter
-    ///      with non-zero aged weight carrying the case — which is the correct
-    ///      continuous limit of the subtraction (at `accusedWeight = base - 1`
-    ///      the floor is already dust), and the right answer when the accused
-    ///      cohort is the electorate: whoever is left unaccused IS the jury.
+    ///      A ZERO FLOOR IS SAFE HERE, and — unlike the earlier revision —
+    ///      that claim is now TRUE rather than merely asserted: because the
+    ///      subtraction is same-instant, `base == 0` if and only if
+    ///      `accusedWeight >= total`, i.e. the accused genuinely ARE the
+    ///      entire snapshot electorate. `finalize`'s `turnout == 0` check
+    ///      sits ahead of the `turnout < floor` comparison and forces
+    ///      `Inconclusive` on a silent electorate no matter what this
+    ///      returns, so a zero floor can never let a zero-turnout case
+    ///      resolve on the merits — and when it is non-zero-but-thin, the
+    ///      single unaccused voter it admits is genuinely the entire
+    ///      unaccused electorate, not an artifact of comparing stake at two
+    ///      different timestamps. Whoever is left unaccused IS the jury,
+    ///      because there is no one else left to be it.
     /// @dev THE BASE IS THE MIN OVER A LOOKBACK. The snapshot defends the
     ///      NUMERATOR: vote weight is read at `executedAt - 1`, so post-drain
     ///      buyers and flash loans
@@ -754,15 +766,30 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
         // by definition and lands in the `earlier == 0` fallback below.
         uint256 lookbackTs = snapshotTs > FLOOR_LOOKBACK ? snapshotTs - FLOOR_LOOKBACK : 0;
         uint256 earlier = swood.getPastTotalVotes(lookbackTs);
+        // SAME-INSTANT SUBTRACTION, THEN THE LOOKBACK MIN — order matters.
+        // `accusedWeight` is always measured at `snapshotTs`. Subtracting it
+        // from a 30-day-old `earlier` compares two different instants: in a
+        // growing protocol, "the accused today" routinely exceeds "the whole
+        // electorate a month ago" with no attacker action at all, and an
+        // earlier revision of this function read that state as `base == 0`
+        // — collapsing the floor to nothing while a large, honest, unaccused
+        // electorate stood by unable to move it. Reducing `total` first
+        // keeps both operands at `snapshotTs`, so the subtraction answers
+        // "how much of TODAY's electorate is unaccused" — the question the
+        // floor is actually supposed to ask.
+        uint256 reduced = total > accusedWeight ? total - accusedWeight : 0;
         // B2: the smaller of the two electorates, EXCEPT when there is no
         // earlier electorate at all to compare against (`earlier == 0`), in
-        // which case the snapshot total stands — see the fallback rationale
-        // above for why zero is the wrong failure there.
-        uint256 base = (earlier != 0 && earlier < total) ? earlier : total;
-        // Clamped at zero, NOT fallen back to the unreduced base: the floor
-        // must be monotone non-increasing in `accusedWeight` — see the
-        // clamp rationale above.
-        base = base > accusedWeight ? base - accusedWeight : 0;
+        // which case the same-instant reduction stands — see the fallback
+        // rationale above for why zero is the wrong failure there.
+        //
+        // Monotone non-increasing in `accusedWeight` by construction, and it
+        // now reaches zero ONLY when the accused genuinely are the entire
+        // snapshot electorate (`accusedWeight >= total`) — the one case
+        // where `finalize`'s `turnout == 0` guard correctly and truthfully
+        // covers an empty room, rather than merely a floor that says nothing
+        // about who could have voted.
+        uint256 base = (earlier != 0 && earlier < reduced) ? earlier : reduced;
         return participationFloorBps * base / BPS_DENOMINATOR;
     }
 
