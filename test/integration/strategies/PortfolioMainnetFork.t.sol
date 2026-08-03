@@ -5,6 +5,7 @@ import {console2} from "forge-std/Test.sol";
 import {RobinhoodMainnetIntegrationTest} from "../RobinhoodMainnetIntegrationTest.sol";
 import {PortfolioStrategy, AggregatorV3Interface} from "../../../src/strategies/PortfolioStrategy.sol";
 import {UniswapSwapAdapter, PathHop} from "../../../src/adapters/UniswapSwapAdapter.sol";
+import {TierRegistry} from "../../../src/TierRegistry.sol";
 import {BatchExecutorLib} from "../../../src/BatchExecutorLib.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
@@ -35,6 +36,13 @@ contract PortfolioMainnetForkTest is RobinhoodMainnetIntegrationTest {
         swapAdapter =
             address(new UniswapSwapAdapter(UNISWAP_SWAP_ROUTER, UNISWAP_QUOTER_V2, V4_POOL_MANAGER, V4_QUOTER));
         template = address(new PortfolioStrategy());
+        // Issue #147: `PortfolioStrategy._initialize` now walks
+        // vault()→governor()→tierRegistry() and refuses a non-allowlisted
+        // swap adapter on this wired stack. Allowlist it before any clone can
+        // bind — the strategy CLONE itself is allowlisted separately, inside
+        // `_cloneAndInit` (a pre-existing fix, not fallout of this change).
+        vm.prank(deployer);
+        TierRegistry(tierRegistry).setAdapterAllowed(swapAdapter, true);
     }
 
     // ── Init-data builder: 100% WETH basket, push-feed mode ──
