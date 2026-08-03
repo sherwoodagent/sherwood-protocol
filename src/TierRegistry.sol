@@ -252,7 +252,10 @@ contract TierRegistry is Ownable2Step {
     }
 
     /// @notice Owner demotion (revoke certification).
+    /// @dev    Requires an existing certification, same as `poke` — see
+    ///         `demoteByChallenge`'s natspec for why this guard exists.
     function demote(address target, bytes4 selector) external onlyOwner {
+        if (_configs[key(target, selector)].certifiedCodehash == bytes32(0)) revert NotCertified();
         _demote(target, selector);
     }
 
@@ -260,8 +263,24 @@ contract TierRegistry is Ownable2Step {
     ///         challenge against it passed. Reuses the same `_demote` path as
     ///         owner demotion, so the submitter-bond release timelock starts
     ///         identically.
+    /// @dev    REQUIRES AN EXISTING CERTIFICATION, mirroring `poke`'s
+    ///         `NotCertified` guard. Without it, `_demote`'s adapter-allowlist
+    ///         clear (see its own natspec) is reachable for a `(target,
+    ///         selector)` that was never certified: `ChallengeGame.file`'s
+    ///         only check on the named pair is that it appears somewhere in
+    ///         the executed proposal's calldata, not that TierRegistry
+    ///         certified it — so a challenger could name a routine, uncertified
+    ///         selector on an otherwise-legitimate, allowlisted adapter,
+    ///         let the challenge settle on silence (`ChallengeGame`'s
+    ///         adjudication model treats an uncontested filing as convicted),
+    ///         and strip that adapter's ENTIRE fund-movement standing for
+    ///         ~1% of the proposal's coverage — without anything about the
+    ///         adapter ever actually being adjudicated. This guard confines
+    ///         the allowlist-clearing side effect to demotions of pairs that
+    ///         were real certifications.
     function demoteByChallenge(address target, bytes4 selector) external {
         if (msg.sender != authorizedDemoter) revert NotAuthorizedDemoter();
+        if (_configs[key(target, selector)].certifiedCodehash == bytes32(0)) revert NotCertified();
         _demote(target, selector);
     }
 
