@@ -29,6 +29,22 @@ interface IVeniceStaking {
     function stake(address recipient, uint256 amount) external;
 }
 
+/// @notice The hops walked to resolve the governance-owned adapter allowlist
+///         from this strategy: `vault()` → `governor()` → `tierRegistry()` →
+///         `isAdapterAllowed(spender)`. The SAME registry, reached the same
+///         way, that `SyndicateVault._guardBatchCalls` and `PortfolioStrategy`
+///         (issue #147) gate the spender/recipient of vault-funded approvals
+///         against.
+/// @dev    Declared locally rather than imported: every hop is a
+///         length-checked raw staticcall, so the strategy takes on no type
+///         dependency and no hop can revert `_initialize`. This interface
+///         exists to generate selectors, not to type the responses.
+interface ITierBindingPath {
+    function governor() external view returns (address);
+    function tierRegistry() external view returns (address);
+    function isAdapterAllowed(address adapter) external view returns (bool);
+}
+
 /**
  * @title VeniceInferenceStrategy
  * @notice Loan-model strategy: vault lends asset to an agent for Venice private
@@ -67,6 +83,9 @@ contract VeniceInferenceStrategy is BaseStrategy {
     error NoAgent();
     /// @notice repaymentAmount cannot drop below the loan's principal (`assetAmount`).
     error RepaymentBelowPrincipal();
+    /// @notice `aeroRouter`/`sVVV` must be allowlisted in the vault's tier
+    ///         registry — see `_requireAllowedAdapter`.
+    error AdapterNotAllowed(address adapter, address registry);
 
     // ── Initialization parameters ──
     struct InitParams {
@@ -122,7 +141,9 @@ contract VeniceInferenceStrategy is BaseStrategy {
             if (p.aeroRouter == address(0) || p.aeroFactory == address(0)) revert ZeroAddress();
             if (!p.singleHop && p.weth == address(0)) revert ZeroAddress();
             if (p.minVVV == 0) revert InvalidAmount();
+            _requireAllowedAdapter(p.aeroRouter);
         }
+        _requireAllowedAdapter(p.sVVV);
 
         asset = p.asset;
         weth = p.weth;
@@ -218,4 +239,53 @@ contract VeniceInferenceStrategy is BaseStrategy {
     // model — the vault's asset was transferred to the agent at execute, and
     // sVVV (held by the agent, non-transferrable) is not an asset this strategy
     // owns. There is no mid-strategy position on this contract to value.
+
+    // ── Adapter binding (issue #155, mirrors PortfolioStrategy / issue #147) ──
+
+    /// @dev Reverts unless `adapter` is allowlisted in the `TierRegistry` the
+    ///      vault's own governor gates batch approvals against, resolved
+    ///      `vault() → governor() → tierRegistry()`. Skips only when that
+    ///      walk yields no registry — the same condition under which
+    ///      `SyndicateVault._guardBatchCalls` disables itself, and one the
+    ///      proposer cannot steer because no hop of the walk is proposer
+    ///      input. A registry that IS resolved but whose `isAdapterAllowed`
+    ///      is unreadable (wrong address wired, non-registry contract) fails
+    ///      CLOSED: a registry that cannot vouch for the adapter has not
+    ///      vouched for it. Every hop is a length-checked raw staticcall so a
+    ///      codeless or hostile target reads as unresolved rather than
+    ///      reverting some unrelated deployment.
+    ///
+    ///      Called from `_initialize` only, once per address that receives an
+    ///      ERC-20 approval: `aeroRouter` (only when a swap is needed) and
+    ///      `sVVV` (always). Not re-checked from `_execute`/`_settle` —
+    ///      re-checking post-init would turn a post-execute demotion into a
+    ///      capital hostage (the loan is already outstanding to the agent by
+    ///      then).
+    function _requireAllowedAdapter(address adapter) private view {
+        address governor_ = _readAddress(vault(), abi.encodeCall(ITierBindingPath.governor, ()));
+        if (governor_ == address(0)) return;
+        address registry = _readAddress(governor_, abi.encodeCall(ITierBindingPath.tierRegistry, ()));
+        if (registry == address(0)) return;
+        if (!_isAdapterAllowed(registry, adapter)) revert AdapterNotAllowed(adapter, registry);
+    }
+
+    /// @dev Staticcall-safe `isAdapterAllowed`. Unreadable → `false` (see the
+    ///      fail-closed rationale on `_requireAllowedAdapter`).
+    function _isAdapterAllowed(address registry, address adapter) private view returns (bool) {
+        if (registry.code.length == 0) return false;
+        (bool ok, bytes memory ret) = registry.staticcall(abi.encodeCall(ITierBindingPath.isAdapterAllowed, (adapter)));
+        if (!ok || ret.length != 32) return false;
+        return abi.decode(ret, (bool));
+    }
+
+    /// @dev Staticcall-safe address read: codeless target, revert, short
+    ///      return, or dirty upper bits all resolve to `address(0)`.
+    function _readAddress(address target, bytes memory data) private view returns (address) {
+        if (target.code.length == 0) return address(0);
+        (bool ok, bytes memory ret) = target.staticcall(data);
+        if (!ok || ret.length != 32) return address(0);
+        uint256 word = abi.decode(ret, (uint256));
+        if (word > type(uint160).max) return address(0);
+        return address(uint160(word));
+    }
 }
