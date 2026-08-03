@@ -355,9 +355,8 @@ contract FeeDistributionTest is Test {
     }
 
     /// @notice And the money is not lost — it is claimable once the block
-    ///         lifts. This matters most for crystallized fees, which were
-    ///         already collected from an exiter: if they escrowed without being
-    ///         recoverable they would be neither in the fund nor claimable.
+    ///         lifts: a fee that escrowed without being recoverable would be
+    ///         neither in the fund nor claimable.
     function test_anUnpayableFeeIsEscrowedAndRecoverable() public {
         uint256 proposalId = _propose();
         _execute(proposalId);

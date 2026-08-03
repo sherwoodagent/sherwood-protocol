@@ -84,7 +84,7 @@ contract MgmtFeeAccrualTest is Test {
             vm.mockCall(
                 MOCK_GOVERNOR, abi.encodeWithSelector(ISyndicateGovernor.getProposal.selector, PID), abi.encode(p)
             );
-            // `_laneState` resolves the active strategy through the lighter
+            // `_activeStrategy` resolves the active strategy through the lighter
             // `strategyOf(pid)` getter, not `getProposal`.
             vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("strategyOf(uint256)", PID), abi.encode(STRAT));
         }

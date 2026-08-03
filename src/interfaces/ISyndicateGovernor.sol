@@ -74,12 +74,9 @@ interface ISyndicateGovernor {
         uint256 id;
         address proposer;
         address vault;
-        /// @notice Address of the strategy contract for this proposal. In the V2
-        ///         live-NAV design the vault reads the strategy's on-venue
-        ///         positions and prices them vault-side (via the PriceRouter) —
-        ///         the strategy is never trusted for value. Set at propose time;
-        ///         immutable thereafter. Pass `address(0)` for a queue-only
-        ///         proposal (no instant live-NAV lane).
+        /// @notice Address of the strategy contract for this proposal. Set at
+        ///         propose time; immutable thereafter. Pass `address(0)` for a
+        ///         queue-only proposal.
         address strategy;
         string metadataURI;
         /// @notice Agent performance fee (bps), snapshotted from the vault's

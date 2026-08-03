@@ -59,7 +59,7 @@ contract VaultRedemptionLockSemanticsTest is Test {
 
         // factory.governor() returns the mock governor address.
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(MOCK_GOVERNOR));
-        // Lane A off (no PriceRouter) — exercises the async (Lane B) lock behavior.
+        // Inert post-retirement (issue #54): nothing calls `priceRouter()` anymore.
         vm.mockCall(address(this), abi.encodeWithSignature("priceRouter()"), abi.encode(address(0)));
         // Default: no active proposal anywhere — deposits/withdraws unlocked.
         _mockState({active: false, openCount: 0});
