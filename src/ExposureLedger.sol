@@ -1052,6 +1052,37 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     }
 
     /// @inheritdoc IExposureLedger
+    /// @dev The same list `approversOf` returns, paired with the PLEDGE
+    ///      (`_reservedUsd`) instead of the live booking (`_recorded.usd`).
+    ///      The two numbers are equal until `settleCoverage` first runs and
+    ///      diverge afterwards, which is the entire reason this view exists
+    ///      separately: `settleCoverage` is permissionless, re-runnable and
+    ///      deliberately NOT freeze-gated, so the booking is a number anyone
+    ///      may move while a challenge is live. The pledge is not —
+    ///      `recordApproval` is its only writer and `releaseApproval` its only
+    ///      eraser, and a live challenge blocks the latter outright
+    ///      (`CoverageFrozen`).
+    ///
+    ///      A caller asking "did this guardian underwrite this proposal?" must
+    ///      ask it of the pledge. `TokenCourt._recordAccused` — which decides
+    ///      who may not vote on the case their own approval caused — asked it
+    ///      of the booking, so a guardian convicted on a SEPARATE, concurrent
+    ///      challenge could be settled down to a zero booking on THIS one by
+    ///      anyone and drop straight out of the accused set (issue #83).
+    function pledgedOf(address governor, uint256 proposalId)
+        external
+        view
+        returns (address[] memory approvers, uint256[] memory pledgedUsd)
+    {
+        bytes32 key = _reviewKey(governor, proposalId);
+        approvers = _approversOf[key];
+        pledgedUsd = new uint256[](approvers.length);
+        for (uint256 i = 0; i < approvers.length; i++) {
+            pledgedUsd[i] = _reservedUsd[key][approvers[i]];
+        }
+    }
+
+    /// @inheritdoc IExposureLedger
     /// @dev Spec §3.4 freeze scope: this pins ONE proposal's committed
     ///      coverage. It deliberately does not touch the guardian's stake or
     ///      its other open approvals — a challenge freezes the coverage it

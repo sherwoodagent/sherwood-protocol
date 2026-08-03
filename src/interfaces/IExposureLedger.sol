@@ -130,13 +130,51 @@ interface IExposureLedger {
     function frozenCoverageCount() external view returns (uint256);
 
     // ── Views ──
-    /// @notice The covering approvers of a proposal and the USD each committed.
-    ///         A released commitment reports a zero share rather than being
-    ///         dropped, so a caller sees the full historical set.
+    /// @notice The covering approvers of a proposal and the USD each has
+    ///         BOOKED right now.
+    /// @dev    NOT A HISTORICAL SET. `releaseApproval` swap-and-pops the
+    ///         guardian out of the approver list, so a released commitment is
+    ///         DROPPED, not reported as a zero share. A zero here means
+    ///         something else entirely: a booking `settleCoverage` wrote down
+    ///         to nothing, which it does for any approver whose own slashable
+    ///         bond has gone — a concurrent conviction, or an exit.
+    ///
+    ///         That makes this the wrong read for "did this guardian
+    ///         underwrite this proposal?": `settleCoverage` is permissionless,
+    ///         re-runnable, and deliberately un-gated on the freeze, so the
+    ///         number moves under a live challenge. Use `pledgedOf` for that
+    ///         question. This view answers the one it is named for — what is
+    ///         on the books at this instant.
     function approversOf(address governor, uint256 proposalId)
         external
         view
         returns (address[] memory approvers, uint256[] memory committedUsd);
+
+    /// @notice The covering approvers of a proposal and the USD each PLEDGED
+    ///         when it approved — the reservation `recordApproval` booked,
+    ///         before any settlement pass redistributed it.
+    /// @dev    The settle-immune half of the pair. `approversOf` reports the
+    ///         live booking, which `settleCoverage` rewrites in both
+    ///         directions without a freeze gate; this reports the pledge,
+    ///         which only `recordApproval` writes and only `releaseApproval`
+    ///         clears — and `releaseApproval` reverts `CoverageFrozen` for the
+    ///         whole life of a challenge.
+    ///
+    ///         So this is the read that answers whether a guardian underwrote
+    ///         a proposal, as opposed to what it happens to be carrying now.
+    ///         `TokenCourt` derives its accused set from it: a guardian whose
+    ///         booking a later settlement zeroed still underwrote the drain,
+    ///         and must still be barred from voting on its own case (#83).
+    ///
+    ///         Every listed approver has a non-zero pledge in practice —
+    ///         `recordApproval` lists a guardian only when it pledges
+    ///         something, and `releaseApproval` clears the pledge and the
+    ///         listing together. The zero remains meaningful anyway, so
+    ///         callers can filter on one predicate rather than on membership.
+    function pledgedOf(address governor, uint256 proposalId)
+        external
+        view
+        returns (address[] memory approvers, uint256[] memory pledgedUsd);
 
     /// @notice Per-approver slash rates for a proposal, in bps of each
     ///         guardian's own slashable stake, positionally aligned with the
