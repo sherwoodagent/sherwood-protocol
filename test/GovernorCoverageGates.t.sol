@@ -1037,9 +1037,11 @@ contract GovernorCoverageGatesTest is Test {
     ///      hand-deriving the struct's packing (fragile, and this file is not
     ///      the layout golden's source of truth). `_proposals` is slot 1
     ///      (`test/governor/GovernorLayoutPins.t.sol`). Used only to fabricate
-    ///      a pre-pin (zero) record for the fallback tests below; the pin
-    ///      itself is written by production code (`_snapshotTierAndGate`) in
-    ///      every other test.
+    ///      a zero pin — a state production code cannot reach, since a bond is
+    ///      only priced and locked when a ledger is wired and
+    ///      `_snapshotTierAndGate` writes the pin in the same block — so the
+    ///      test below can prove the unreachable branch fails closed. The pin
+    ///      itself is written by production code in every other test.
     function _proposerBondLedgerSlot(uint256 pid) internal view returns (bytes32) {
         bytes32 base = keccak256(abi.encode(pid, uint256(1)));
         bytes32 want = bytes32(uint256(uint160(address(ledger))));
@@ -1085,39 +1087,82 @@ contract GovernorCoverageGatesTest is Test {
         assertEq(held, 0, "the bond was still convictable and is now forfeited");
     }
 
-    /// @notice Issue #116 fallback (design D2): a proposal that predates
-    ///         ledger pinning (simulated: its `proposerBondLedger` is zero)
-    ///         gates against the LIVE `_exposureLedger` slot exactly as
-    ///         before this change — the fallback must not brick an old
-    ///         bond-carrying record.
-    function test_reclaimBond_prePinFallsBackToLiveLedger() public {
+    /// @notice DESIGN D2 (revised): a zero `proposerBondLedger` fails closed
+    ///         with NO fallback to the live `_exposureLedger` slot, even when
+    ///         that slot is wired and permissive. The state is fabricated —
+    ///         production code cannot produce a bond-carrying proposal with a
+    ///         zero pin — and this is the composed scenario the round-1 audit
+    ///         flagged as untested: the re-point-after-settle window of
+    ///         `test_reclaimBond_rePointedLedgerCannotDetachTheGate` run
+    ///         against a zero-pin record. Under the old fallback this exact
+    ///         composition released the bond instantly through the permissive
+    ///         ledger; now it reverts, so the pin has no bypass left at all.
+    function test_reclaimBond_zeroPinFailsClosedEvenWhenTheLiveSlotIsPermissive() public {
         uint256 pid = _executeThenSettle();
         vm.store(address(governor), _proposerBondLedgerSlot(pid), bytes32(0));
-        assertEq(governor.getProposal(pid).proposerBondLedger, address(0), "simulated pre-pin record");
+        assertEq(governor.getProposal(pid).proposerBondLedger, address(0), "fabricated zero pin");
 
-        uint256 opensAt = governor.getProposal(pid).executedAt + ledger.challengeWindow();
-        vm.warp(opensAt - 1);
-        vm.expectRevert(ISyndicateGovernor.ChallengeWindowOpen.selector);
-        governor.reclaimProposerBond(pid);
+        // The settle freed the `_openProposalCount` guard, so the factory can
+        // re-point mid-hold-window at a ledger that opens every gate.
+        assertEq(governor.openProposalCount(), 0, "the re-point guard is open");
+        governor.setExposureLedger(address(new PermissiveLedgerMock()));
 
-        vm.warp(opensAt);
-        uint256 balBefore = wood.balanceOf(agent);
-        governor.reclaimProposerBond(pid);
-        assertEq(wood.balanceOf(agent), balBefore + 200e18, "reclaimed via the live-slot fallback");
-    }
-
-    /// @notice The other half of the same fallback: when BOTH the pin and the
-    ///         live slot are zero, reclaim still fails closed exactly as an
-    ///         unpinned governor always has — the fallback preserves the
-    ///         `ExposureLedgerUnset` posture, it does not relax it.
-    function test_reclaimBond_prePinFallback_failsClosedWhenLiveLedgerIsAlsoUnset() public {
-        uint256 pid = _executeThenSettle();
-        vm.store(address(governor), _proposerBondLedgerSlot(pid), bytes32(0));
-        governor.setExposureLedger(address(0)); // un-wiring is exempt from the open-proposal guard
-
+        // Zero window, no freezer, no freeze: a live read would release here.
         vm.warp(governor.getProposal(pid).executedAt + 365 days);
         vm.expectRevert(ISyndicateGovernor.ExposureLedgerUnset.selector);
         governor.reclaimProposerBond(pid);
+        assertEq(governor.getProposal(pid).proposerBondWood, 200e18, "nothing was released");
+
+        // Same answer with the live slot unset — the posture does not depend
+        // on what the live slot happens to hold.
+        governor.setExposureLedger(address(0)); // un-wiring is exempt from the open-proposal guard
+        vm.expectRevert(ISyndicateGovernor.ExposureLedgerUnset.selector);
+        governor.reclaimProposerBond(pid);
+    }
+
+    /// @notice Issue #117 L2: a WIRED freezer that answers zero for
+    ///         `challengeWindow()` fails closed, matching the posture for one
+    ///         that reverts. A genuine `ChallengeGame` cannot answer zero
+    ///         (`setChallengeWindow` rejects it), so zero means a stub, a
+    ///         broken proxy, or a lookalike — and accepting it would put the
+    ///         deadline at `executedAt`, already past, releasing the bond
+    ///         while a conviction is still reachable. Recovery is unchanged:
+    ///         the pinned ledger's owner rotates the freezer.
+    function test_reclaimBond_freezerAnsweringZeroWindow_failsClosedButIsRecoverable() public {
+        uint256 pid = _executeThenSettle();
+        MockFilingDeadline zeroWindowGame = new MockFilingDeadline(0);
+        vm.prank(ledgerOwner);
+        ledger.setCoverageFreezer(address(zeroWindowGame));
+
+        vm.warp(governor.getProposal(pid).executedAt + ledger.challengeWindow() + 365 days);
+        vm.expectRevert(ISyndicateGovernor.ChallengeWindowOpen.selector);
+        governor.reclaimProposerBond(pid);
+        assertEq(governor.getProposal(pid).proposerBondWood, 200e18, "nothing was released");
+
+        // Not a permanent strand.
+        vm.prank(ledgerOwner);
+        ledger.setCoverageFreezer(address(0));
+        uint256 balBefore = wood.balanceOf(agent);
+        governor.reclaimProposerBond(pid);
+        assertEq(wood.balanceOf(agent), balBefore + 200e18);
+    }
+
+    /// @notice The scoping half of the same decision: only `challengeWindow()`
+    ///         is treated as a zero-means-broken answer. `challengeableUntil`
+    ///         is zero for every key nobody ever challenged — the common case
+    ///         — and must keep passing on the ordinary schedule.
+    function test_reclaimBond_zeroChallengeableUntil_stillReclaimsNormally() public {
+        uint256 pid = _executeThenSettle();
+        MockFilingDeadline game = new MockFilingDeadline(ledger.challengeWindow());
+        vm.prank(ledgerOwner);
+        ledger.setCoverageFreezer(address(game));
+
+        assertEq(game.challengeableUntil(keccak256(abi.encode(address(governor), pid))), 0, "untouched key");
+
+        uint256 balBefore = wood.balanceOf(agent);
+        vm.warp(governor.getProposal(pid).executedAt + ledger.challengeWindow() + 1);
+        governor.reclaimProposerBond(pid);
+        assertEq(wood.balanceOf(agent), balBefore + 200e18);
     }
 
     /// @notice Issue #117 L1: `forfeitBond` deletes the escrow's record on

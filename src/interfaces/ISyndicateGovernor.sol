@@ -162,10 +162,12 @@ interface ISyndicateGovernor {
         ///         alongside `proposerBondWood` / `proposerBondEscrow`. A
         ///         factory re-point of the governor's live `_exposureLedger`
         ///         slot after this proposal locks a bond MUST NOT change which
-        ///         ledger gates it — see `reclaimProposerBond`. Zero when no
-        ///         bond was locked, or the proposal predates ledger pinning
-        ///         (falls back to the live slot, preserving pre-pin behavior
-        ///         including the `ExposureLedgerUnset` fail-closed path).
+        ///         ledger gates it — see `reclaimProposerBond`. Zero only
+        ///         when no bond was locked: a bond is priced and locked only
+        ///         against a wired ledger, and this pin is written in the
+        ///         same transaction, so a zero here alongside a non-zero
+        ///         `proposerBondWood` is unreachable — and fails closed
+        ///         (`ExposureLedgerUnset`) rather than reading the live slot.
         address proposerBondLedger;
     }
 

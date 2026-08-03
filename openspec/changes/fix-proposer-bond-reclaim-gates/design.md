@@ -63,8 +63,8 @@ main, post-#112/#119):
 
 **Non-Goals:**
 
-- Changing zero-answer freezer semantics (#117 L2) — recommendation recorded
-  below, implementation blocked on Ana's decision.
+- (Was a non-goal; now in scope.) Zero-answer freezer semantics (#117 L2)
+  fail closed — Ana approved the recommendation on 2026-08-03; see D7.
 - The interim guard alternative from issue #116 (refusing `setExposureLedger`
   while bonds are outstanding) — superseded by pinning; see D1 alternatives.
 - Issue #35 (the other booking-vs-enforcement divergence, in
@@ -85,10 +85,11 @@ before the external `lockBond` call (CEI, same invariant comment that
 already governs that block). `reclaimProposerBond` resolves:
 
 ```
-ledger = proposal.proposerBondLedger; if zero → _exposureLedger (fallback)
+ledger = proposal.proposerBondLedger; if zero → revert ExposureLedgerUnset
 ```
 
-and runs all three gates against it.
+and runs all three gates against it. The live `_exposureLedger` slot is
+never consulted by the gates — see D2.
 
 *Why this over a parallel mapping* (`mapping(uint256 => address)` carved
 from `__gap`): the pin is the third leg of one propose-time record —
@@ -110,15 +111,30 @@ outstanding-bond counter (none exists; `_openProposalCount` provably does
 not cover it), and still leaves the gate semantically attached to a mutable
 slot. Pinning is the same design the escrow already proved.
 
-### D2 — Zero pinned value falls back to the live slot
+### D2 — Zero pinned value fails closed; no fallback to the live slot
 
-Bond-carrying proposals created before the upgrade have
-`proposerBondLedger == 0`; they keep today's exact semantics (live read,
-`ExposureLedgerUnset` fail-closed on zero). Post-upgrade, any proposal that
-locks a bond necessarily has a non-zero ledger (the bond is only priced and
-locked when a ledger is wired, `:985-1041`), so the fallback is dead code
-for new records — purely a migration seam. No initializer/reinitializer
-needed.
+`reclaimProposerBond` reverts `ExposureLedgerUnset` on a zero
+`proposerBondLedger` rather than reading the live `_exposureLedger` slot.
+
+Any proposal that locks a bond necessarily pins a non-zero ledger — the bond
+is only priced and locked when one is wired, and `_snapshotTierAndGate`
+writes the pin in the same block right before `lockBond` (`:985-1041`) — so
+on a bond-carrying proposal a zero pin is unreachable, not a legacy record.
+
+*Superseded first draft.* This decision originally kept a live-slot fallback
+for the pre-upgrade cohort, accepting that those bonds stay exposed to the
+#116 re-point until drained, on the grounds that bricking them was worse.
+Ana confirmed (2026-08-03) that the protocol is not deployed anywhere, so
+that cohort is empty and the fallback was dead code carrying a live
+fail-open branch — the same detachment the pin exists to prevent, one
+resolution step later. Dropped. Consequences: the "drain outstanding legacy
+bonds before re-pointing" operational precondition the fallback imposed no
+longer exists, and the round-1 audit's request for a composed
+re-point-against-zero-pin regression test is satisfied by
+`test_reclaimBond_zeroPinFailsClosedEvenWhenTheLiveSlotIsPermissive`, which
+now asserts the fail-closed outcome for that exact composition.
+
+No initializer/reinitializer needed.
 
 ### D3 — Forfeiture acknowledge: success-no-op, detected via `bondOf`
 
@@ -173,8 +189,8 @@ the same trust the game itself places in its constructor-wired ledger.
 
 Both fixes edit `reclaimProposerBond`'s ~40-line gate block and its natspec;
 two PRs would conflict textually and semantically (the forfeiture check's
-ordering interacts with the gate block D3 reorders). L2, if approved later,
-is a two-line follow-up inside gate 3.
+ordering interacts with the gate block D3 reorders). L2 landed in the same
+block once approved (D7), for the same reason.
 
 ### D6 — Storage/ABI mechanics
 
@@ -222,18 +238,27 @@ is a two-line follow-up inside gate 3.
 1. Land contract change + regenerated golden + tests in one PR to `main`.
 2. Fresh deploys pick it up automatically. For any chain with a live
    governor beacon AND a paired game: upgrade the beacon and deploy a
-   recompiled game in the same operation (ABI note, D6); pre-existing
-   bond-carrying proposals ride the D2 fallback until drained.
+   recompiled game in the same operation (ABI note, D6). No live
+   bond-carrying proposals exist anywhere (confirmed 2026-08-03), so there
+   is no legacy cohort to drain and no ordering constraint beyond the ABI
+   pairing; were one ever to exist, D2 now fails its reclaim closed rather
+   than falling back, so it MUST be drained before the upgrade.
 3. Rollback: revert the beacon to the prior implementation — the appended
    member is at the struct tail, so old code simply never reads it; no state
    migration in either direction.
 
-## Open Questions
+### D7 — A freezer that ANSWERS zero fails closed (#117 L2)
 
-### #117 L2 — should a freezer that ANSWERS zero fail closed? [BLOCKED ON ANA — do not implement either way without her explicit confirmation]
+**RESOLVED 2026-08-03 — Ana approved the recommendation below.** Gate 3
+reads `game.challengeWindow()` into a local and reverts `ChallengeWindowOpen`
+when it is zero, before computing the deadline. Scoped to that one view:
+`challengeableUntil == 0` still passes. Test:
+`test_reclaimBond_freezerAnsweringZeroWindow_failsClosedButIsRecoverable`,
+with `test_reclaimBond_zeroChallengeableUntil_stillReclaimsNormally` pinning
+the scope boundary.
 
 The audit flagged it and deliberately did not resolve it; one panel agent
-proposed the hard-block and the lead rejected it. Both sides:
+proposed the hard-block and the lead rejected it. Both sides, as weighed:
 
 **For treating `game.challengeWindow() == 0` as failure (recommended):**
 a genuine `ChallengeGame` can never answer 0 — `setChallengeWindow` rejects
@@ -255,9 +280,13 @@ hard-block over. `challengeableUntil == 0` is a NORMAL answer (untouched
 key) and must keep passing under either outcome; a zero-check that
 overreaches by one view turns every unchallenged proposal into a wedge.
 
-**Recommendation:** fail closed on `challengeWindow() == 0` only, keep
-`challengeableUntil` zero-pass, reuse `ChallengeWindowOpen` (semantics: the
-window cannot be proven shut). Scope if approved: ~2 lines inside gate 3 +
-one test with a zero-answering mock freezer; no spec-structure change beyond
-flipping one sentence in the challenge-game delta. NOT settled — Ana
-decides.
+**Resolution (Ana, 2026-08-03): fail closed** on `challengeWindow() == 0`
+only, keep `challengeableUntil` zero-pass, reuse `ChallengeWindowOpen`
+(semantics: the window cannot be proven shut). The stranding objection is
+bounded by the same recovery every other fail-closed arm of this gate has —
+the pinned ledger's owner rotates `coverageFreezer`, to a working game or to
+zero, which skips gate 3 outright.
+
+## Open Questions
+
+None outstanding.

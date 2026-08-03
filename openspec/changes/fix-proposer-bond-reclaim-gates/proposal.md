@@ -23,11 +23,11 @@ Two Pashov-panel findings on merged PR #112 (issue #94), both in
   `NoBond`), indistinguishable from "still locked" for a retrying integration,
   and `proposal.proposerBondWood` stays non-zero forever — stale state for any
   reader.
-- **#117 L2 (low, decision required)**: the natspec's "fails closed" claim
-  covers a freezer that REVERTS, but a freezer that ANSWERS zero for
-  `challengeWindow()` passes the gate silently
-  (`src/SyndicateGovernor.sol:639-649`). PR #119 corrected the comment to
-  state this honestly; whether the BEHAVIOR should change is an open call.
+- **#117 L2 (low)**: the natspec's "fails closed" claim covered a freezer
+  that REVERTS, but a freezer that ANSWERS zero for `challengeWindow()`
+  passed the gate silently (`src/SyndicateGovernor.sol:639-649`). PR #119
+  corrected the comment to state this honestly; Ana approved changing the
+  BEHAVIOR on 2026-08-03, so it is fixed here.
 
 One change for both issues: they edit the same ~40-line region of the same
 function, and separate PRs would conflict.
@@ -38,18 +38,18 @@ function, and separate PRs would conflict.
   on the proposal at propose time, next to `proposerBondWood` /
   `proposerBondEscrow` (`_snapshotTierAndGate`), and make all three reclaim
   gates read the pinned address rather than the live `_exposureLedger` slot.
-  Zero pinned value (pre-upgrade proposals) falls back to the live slot,
-  preserving current behavior including the `ExposureLedgerUnset` fail-closed
-  path.
+  A zero pinned value fails closed (`ExposureLedgerUnset`) with no fallback
+  to the live slot — unreachable for a bond-carrying proposal, since the
+  pin is written in the same transaction that locks the bond.
 - **Acknowledge forfeiture at reclaim** (#117 L1): when the governor still
   records a bond but the pinned escrow's `bondOf` reports none, the bond was
   forfeited — zero `proposal.proposerBondWood`, emit a distinguishable event,
   and return without transferring, instead of reverting forever.
-- **Zero-answer freezer semantics** (#117 L2): recommendation is to treat a
-  wired freezer answering `challengeWindow() == 0` as fail-closed (a genuine
-  `ChallengeGame` can never answer zero — `setChallengeWindow` rejects it) —
-  **PENDING Ana's confirmation; not to be implemented until she decides**
-  (see design.md Open Questions).
+- **Zero-answer freezer semantics** (#117 L2): a wired freezer answering
+  `challengeWindow() == 0` now fails closed (a genuine `ChallengeGame` can
+  never answer zero — `setChallengeWindow` rejects it). Scoped to that view
+  alone; `challengeableUntil == 0` still passes. Approved by Ana 2026-08-03,
+  see design.md D7.
 - Natspec updates at `src/SyndicateGovernor.sol:575` and `:588-598` closing
   the loops PR #119 left referencing issues #116/#117 by number.
 - Storage: one appended member on `StrategyProposal` (mapping-held struct —

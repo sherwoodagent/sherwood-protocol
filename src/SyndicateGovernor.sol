@@ -586,11 +586,10 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      mirrors `ChallengeGame.file`'s own deadline,
     ///      `max(executedAt + game.challengeWindow(), challengeableUntil[rk])`.
     ///      All three gates run against `proposal.proposerBondLedger`, the
-    ///      ledger PINNED at propose time (falling back to the live
-    ///      `_exposureLedger` slot only for a pre-pin proposal that recorded
-    ///      no ledger) — never the live slot directly. The escrow pointer was
-    ///      already pinned per proposal; the ledger now is too, so a factory
-    ///      re-point of `_exposureLedger` after this proposal settles (the
+    ///      ledger PINNED at propose time — never the live `_exposureLedger`
+    ///      slot, and with no fallback to it. The escrow pointer was already
+    ///      pinned per proposal; the ledger now is too, so a factory re-point
+    ///      of `_exposureLedger` after this proposal settles (the
     ///      `_openProposalCount` guard on `setExposureLedger` no longer holds
     ///      by then) cannot detach these gates from a still-convictable
     ///      challenge.
@@ -608,19 +607,22 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      freezer) can never collect, so no conviction is reachable and there
     ///      is nothing for this gate to protect; an unwired or rotated-away
     ///      freezer must not strand an honest proposer's bond. A non-zero
-    ///      freezer that REVERTS or cannot be read fails closed — recover by
-    ///      rotating `coverageFreezer` ON THE PINNED LEDGER (its owner-side
-    ///      surface, e.g. `ExposureLedger.setCoverageFreezer`); re-pointing
-    ///      this governor's live `_exposureLedger` slot no longer reaches an
-    ///      already-locked bond's gates. Note the asymmetry: a freezer that
-    ///      ANSWERS zero passes rather than failing closed, so "fails closed"
-    ///      covers unreadability, not every unhelpful answer — whether that
-    ///      should also fail closed is an open, separately-tracked decision;
-    ///      the forfeiture-acknowledge path above is the fix for the
-    ///      indistinguishable-permanent-revert half of the same finding. Note
-    ///      `challengeableUntil` is zero for an untouched key and zero is not
-    ///      a sentinel, so an unchallenged proposal still reclaims on the
-    ///      ordinary schedule.
+    ///      freezer that REVERTS, cannot be read, or ANSWERS ZERO for
+    ///      `challengeWindow()` fails closed — recover by rotating
+    ///      `coverageFreezer` ON THE PINNED LEDGER (its owner-side surface,
+    ///      e.g. `ExposureLedger.setCoverageFreezer`); re-pointing this
+    ///      governor's live `_exposureLedger` slot no longer reaches an
+    ///      already-locked bond's gates. A zero window is rejected because a
+    ///      genuine game cannot produce one (`setChallengeWindow` rejects
+    ///      zero, the default is 14 days), so it can only come from a stub, a
+    ///      broken proxy, or a hostile lookalike — and waving it through
+    ///      would re-open, one layer down, the same gate detachment the
+    ///      pinned ledger closes. The legitimate "no window, reclaim freely"
+    ///      configuration is `coverageFreezer == 0`, which skips this gate
+    ///      outright, so nothing correctly configured is stranded. Note this
+    ///      is scoped to `challengeWindow()` alone: `challengeableUntil` is
+    ///      zero for an untouched key and zero is not a sentinel there, so an
+    ///      unchallenged proposal still reclaims on the ordinary schedule.
     ///
     ///      Releases against `proposal.proposerBondEscrow` (bound at propose),
     ///      NOT the live `_bondEscrow` slot: the escrow has no owner and no
@@ -663,17 +665,21 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         if (executedAt != 0) {
             // Pinned at propose time (issue #116): a factory re-point of the
             // live `_exposureLedger` slot after this proposal locked its bond
-            // must not change which ledger these gates read. Zero pin means a
-            // pre-upgrade proposal that recorded no ledger — fall back to the
-            // live slot so it keeps its exact pre-pin behavior.
-            address ledger = proposal.proposerBondLedger;
-            if (ledger == address(0)) ledger = _exposureLedger;
+            // must not change which ledger these gates read. No fallback to
+            // the live slot: a bond is only priced and locked when a ledger
+            // is wired (`_snapshotTierAndGate` writes this pin in the same
+            // block, right before `lockBond`), so a zero pin on a
+            // bond-carrying proposal is unreachable rather than a legacy
+            // record, and reading the live slot here would hand back exactly
+            // the detachment the pin exists to prevent.
+            //
             // Fails closed: fail-open would let the factory (`onlyFactory` on
             // `setExposureLedger` — a protocol-level actor, not this vault's
             // own owner) bypass this delay in one transaction via
             // `setExposureLedger(0)`. The freeze cannot strand the bond
             // permanently — rotating the pinned ledger's own
             // `coverageFreezer` makes it reclaimable again.
+            address ledger = proposal.proposerBondLedger;
             if (ledger == address(0)) revert ExposureLedgerUnset();
             if (block.timestamp < executedAt + IExposureLedger(ledger).challengeWindow()) {
                 revert ChallengeWindowOpen();
@@ -685,7 +691,16 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             // for why the two gates above are not sufficient on their own.
             address freezer = IExposureLedger(ledger).coverageFreezer();
             if (freezer != address(0)) {
-                uint256 deadline = executedAt + IChallengeGame(freezer).challengeWindow();
+                // A wired freezer answering zero fails closed, the same as
+                // one that reverts: no genuine `ChallengeGame` can answer
+                // zero (`setChallengeWindow` rejects it), so zero means a
+                // stub or lookalike, and accepting it would set the deadline
+                // to `executedAt` — already past — releasing the bond while a
+                // conviction is still reachable. "No window" is configured by
+                // unsetting `coverageFreezer`, which skips this gate above.
+                uint256 gameWindow = IChallengeGame(freezer).challengeWindow();
+                if (gameWindow == 0) revert ChallengeWindowOpen();
+                uint256 deadline = executedAt + gameWindow;
                 // Same review-key derivation as `ChallengeGame._reviewKey`
                 // (abi.encode, not encodePacked).
                 uint256 extended =
@@ -1687,29 +1702,23 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      `setAssetFeed` / `setCoveredTvlCapUsd`), or point the factory at a
     ///      fresh permissive ledger and `pushWiring` this governor.
     ///
-    ///      Re-pointing this slot does NOT move a POST-UPGRADE bond's reclaim
+    ///      Re-pointing this slot does NOT move any locked bond's reclaim
     ///      gates: `reclaimProposerBond` pins the ledger it gates against
     ///      onto the proposal at propose time (`proposal.proposerBondLedger`)
-    ///      and reads that, not this live slot, for any bond locked by THIS
-    ///      governor implementation.
-    ///
-    ///      IT DOES MOVE A LEGACY BOND'S GATES. `proposerBondLedger` is a
-    ///      field appended to `StrategyProposal` by the fix for issue #116;
-    ///      any proposal that locked a bond under a PRIOR governor
-    ///      implementation never wrote it, so it reads `address(0)` forever,
-    ///      and `reclaimProposerBond`'s fallback resolves that to THIS live
-    ///      slot — reproducing, for that entire cohort, the exact re-point
-    ///      bypass this fix exists to close. `setExposureLedger`'s only guard
-    ///      (`_openProposalCount > 0`) stops blocking a re-point the moment a
-    ///      legacy proposal itself settles (`_decOpen()` fires in
+    ///      and reads that, never this live slot. There is no fallback — a
+    ///      zero pin fails closed — so this holds unconditionally, including
+    ///      once `_openProposalCount > 0` stops blocking a re-point (which it
+    ///      does the moment a proposal settles, via `_decOpen()` in
     ///      `_finishSettlement`, before that proposal's bond-hold window even
-    ///      starts) — so an ORDINARY ledger migration, no malice required,
-    ///      silently detaches a legacy bond's challenge-window protection.
-    ///      Accepted trade-off (design.md, `fix-proposer-bond-reclaim-gates`,
-    ///      Decision D2): bricking every pre-upgrade bond was judged worse.
-    ///      Operational requirement: drain every outstanding legacy bond
-    ///      (`reclaimProposerBond` or a genuine conviction) before re-pointing
-    ///      this slot after deploying this fix.
+    ///      starts). See design.md, `fix-proposer-bond-reclaim-gates`,
+    ///      Decision D2.
+    ///
+    ///      COROLLARY for any future upgrade that appends a comparable pin: a
+    ///      proposal that locked a bond under a PRIOR implementation would
+    ///      read `address(0)` for it forever and, under this fail-closed
+    ///      resolution, could never reclaim. Drain every outstanding bond
+    ///      before shipping such an upgrade. Not a live concern for this one:
+    ///      no deployment predates it.
     function setExposureLedger(address newLedger) external onlyFactory {
         // Not while proposals are open: a proposal created before the ledger
         // existed carries no booked coverage, but `executeProposal` starts
