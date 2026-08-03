@@ -30,7 +30,7 @@ contract BatchExecutorLibTest is Test {
         calls[1] = BatchExecutorLib.Call({target: address(target), data: abi.encodeCall(Target.set, (2)), value: 0});
         calls[2] = BatchExecutorLib.Call({target: address(target), data: abi.encodeCall(Target.set, (3)), value: 0});
 
-        lib.executeBatch(calls);
+        lib.executeBatch(calls, address(token), new uint256[](0));
 
         assertEq(target.value(), 3, "last call wins; all calls executed in order");
         assertEq(target.callCount(), 3, "every call executed once");
@@ -38,7 +38,7 @@ contract BatchExecutorLibTest is Test {
 
     function test_executeBatch_emptyBatchSucceeds() public {
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](0);
-        lib.executeBatch(calls);
+        lib.executeBatch(calls, address(token), new uint256[](0));
         assertEq(target.callCount(), 0);
     }
 
@@ -48,7 +48,7 @@ contract BatchExecutorLibTest is Test {
         calls[1] = BatchExecutorLib.Call({target: address(target), data: abi.encodeCall(Target.boom, ()), value: 0});
 
         vm.expectRevert(bytes("boom"));
-        lib.executeBatch(calls);
+        lib.executeBatch(calls, address(token), new uint256[](0));
 
         // Atomicity: revert undoes the first call's state change too.
         assertEq(target.value(), 0, "first call's state rolled back on revert");
@@ -60,7 +60,7 @@ contract BatchExecutorLibTest is Test {
             BatchExecutorLib.Call({target: address(target), data: abi.encodeCall(Target.boomCustom, ()), value: 0});
 
         vm.expectRevert(Target.CustomError.selector);
-        lib.executeBatch(calls);
+        lib.executeBatch(calls, address(token), new uint256[](0));
     }
 
     function test_executeBatch_forwardsValue() public {
@@ -72,7 +72,7 @@ contract BatchExecutorLibTest is Test {
         calls[1] =
             BatchExecutorLib.Call({target: address(target), data: abi.encodeCall(Target.deposit, ()), value: 2 ether});
 
-        lib.executeBatch(calls);
+        lib.executeBatch(calls, address(token), new uint256[](0));
 
         assertEq(address(target).balance, 3 ether, "value forwarded to target");
         assertEq(target.totalReceived(), 3 ether, "target's bookkeeping matches");
@@ -86,7 +86,7 @@ contract BatchExecutorLibTest is Test {
             target: address(target), data: abi.encodeCall(Target.requireValueEquals, (7)), value: 0
         });
 
-        lib.executeBatch(calls);
+        lib.executeBatch(calls, address(token), new uint256[](0));
         assertEq(target.value(), 7);
     }
 
@@ -97,7 +97,7 @@ contract BatchExecutorLibTest is Test {
         });
         calls[1] = BatchExecutorLib.Call({target: address(target), data: abi.encodeCall(Target.set, (42)), value: 0});
 
-        lib.executeBatch(calls);
+        lib.executeBatch(calls, address(token), new uint256[](0));
 
         assertEq(token.balanceOf(address(0xBEEF)), 100e18);
         assertEq(target.value(), 42);
@@ -110,7 +110,7 @@ contract BatchExecutorLibTest is Test {
         calls[0] = BatchExecutorLib.Call({target: address(target), data: abi.encodeCall(Target.set, (1)), value: 0});
         calls[1] = BatchExecutorLib.Call({target: address(target), data: abi.encodeCall(Target.echo, (5)), value: 0});
 
-        BatchExecutorLib.CallResult[] memory results = lib.simulateBatch(calls);
+        BatchExecutorLib.CallResult[] memory results = lib.simulateBatch(calls, address(token), new uint256[](0));
         assertEq(results.length, 2);
         assertTrue(results[0].success);
         assertTrue(results[1].success);
@@ -123,7 +123,7 @@ contract BatchExecutorLibTest is Test {
         calls[1] = BatchExecutorLib.Call({target: address(target), data: abi.encodeCall(Target.boom, ()), value: 0});
         calls[2] = BatchExecutorLib.Call({target: address(target), data: abi.encodeCall(Target.set, (2)), value: 0});
 
-        BatchExecutorLib.CallResult[] memory results = lib.simulateBatch(calls);
+        BatchExecutorLib.CallResult[] memory results = lib.simulateBatch(calls, address(token), new uint256[](0));
         assertEq(results.length, 3);
         assertTrue(results[0].success);
         assertFalse(results[1].success, "second call failed");
@@ -137,7 +137,7 @@ contract BatchExecutorLibTest is Test {
         calls[0] = BatchExecutorLib.Call({target: address(target), data: abi.encodeCall(Target.set, (123)), value: 0});
         calls[1] = BatchExecutorLib.Call({target: address(target), data: abi.encodeCall(Target.read, ()), value: 0});
 
-        BatchExecutorLib.CallResult[] memory results = lib.simulateBatch(calls);
+        BatchExecutorLib.CallResult[] memory results = lib.simulateBatch(calls, address(token), new uint256[](0));
         assertTrue(results[0].success);
         assertTrue(results[1].success);
         assertEq(abi.decode(results[1].returnData, (uint256)), 123, "second call read first's state");

@@ -198,7 +198,7 @@ contract VaultQueueReservedNavTest is Test {
             BatchExecutorLib.Call({target: address(usdc), value: 0, data: abi.encodeCall(ERC20Mock.decimals, ())});
         vm.prank(MOCK_GOVERNOR);
         vm.expectRevert(ISyndicateVault.QueueReserveBreached.selector);
-        vault.executeGovernorBatch(calls, 0);
+        vault.executeGovernorBatch(calls, new uint256[](0), 0);
     }
 
     /// @notice THE INVARIANT THE FIX EXISTS TO ESTABLISH: settling a stamped

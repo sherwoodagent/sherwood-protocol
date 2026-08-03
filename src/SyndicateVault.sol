@@ -458,23 +458,6 @@ contract SyndicateVault is
     }
 
     /// @inheritdoc ISyndicateVault
-    /// @dev TRANSITIONAL shim (issue #43 §5 deletes this): applies the same
-    ///      access/reentrancy/pause gates as the 3-arg overload, then forwards
-    ///      to the shared body with an EMPTY `callCaps` — i.e. per-call
-    ///      metering skipped. This overload predates per-call caps entirely,
-    ///      so it carries no propose-time declaration to enforce. Kept only so
-    ///      callers mid-migration to the 3-arg ABI keep compiling; deleted
-    ///      once every caller (governor + tests) has moved to the 3-arg form.
-    function executeGovernorBatch(BatchExecutorLib.Call[] calldata calls, uint256 maxNetOutflow)
-        external
-        onlyGovernor
-        nonReentrant
-        whenNotPaused
-    {
-        _executeGovernorBatch(calls, new uint256[](0), maxNetOutflow);
-    }
-
-    /// @inheritdoc ISyndicateVault
     /// @dev Every delegatecall re-verifies that `_executorImpl`'s bytecode
     ///      still matches the hash stamped at init. A factory misconfig or a
     ///      swapped executor address cannot deflect the delegatecall to a
@@ -486,37 +469,14 @@ contract SyndicateVault is
         uint256[] calldata callCaps,
         uint256 maxNetOutflow
     ) external onlyGovernor nonReentrant whenNotPaused {
-        _executeGovernorBatch(calls, callCaps, maxNetOutflow);
-    }
-
-    /// @dev Shared body for both `executeGovernorBatch` overloads. `calls` is
-    ///      `calldata` (referenced directly, no copy, on this `private`
-    ///      function); `callCaps` is `memory` so the 2-arg shim's freshly
-    ///      allocated empty array and the 3-arg overload's forwarded calldata
-    ///      array (implicitly copied to memory) both bind without a second
-    ///      overload.
-    function _executeGovernorBatch(
-        BatchExecutorLib.Call[] calldata calls,
-        uint256[] memory callCaps,
-        uint256 maxNetOutflow
-    ) private {
         if (_executorImpl.codehash != _expectedExecutorCodehash) revert ExecutorCodehashMismatch();
         _guardBatchCalls(calls);
         uint256 balanceBefore = IERC20(asset()).balanceOf(address(this));
-        // `abi.encodeWithSelector` (not `abi.encodeCall`) because
-        // `BatchExecutorLib.executeBatch` is overloaded during the issue #43
-        // migration window (the unmetered 1-arg overload is kept until §5
-        // deletes it) — `abi.encodeCall`'s bare `Contract.function` reference
-        // is ambiguous across overloads, while the selector below names the
-        // metered 3-arg signature explicitly. Revert to `abi.encodeCall` once
-        // §5 removes the unmetered overload.
+        // The lib's unmetered 1-arg `executeBatch(Call[])` overload was
+        // deleted in issue #43 §5 — the metered 3-arg signature is the only
+        // one left, so `abi.encodeCall` resolves it unambiguously again.
         (bool success, bytes memory returnData) = _executorImpl.delegatecall(
-            abi.encodeWithSelector(
-                bytes4(keccak256("executeBatch((address,bytes,uint256)[],address,uint256[])")),
-                calls,
-                asset(),
-                callCaps
-            )
+            abi.encodeCall(BatchExecutorLib.executeBatch, (calls, asset(), callCaps))
         );
         if (!success) {
             assembly {

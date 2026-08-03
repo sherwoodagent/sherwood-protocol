@@ -26,8 +26,9 @@ contract BatchExecutorLib {
         bool success;
         bytes returnData;
         /// @notice Gross outflow of `asset` measured around this call
-        ///         (balanceBefore - balanceAfter, floored at 0). Zero from
-        ///         the unmetered `simulateBatch(Call[])` overload.
+        ///         (balanceBefore - balanceAfter, floored at 0). `simulateBatch`
+        ///         always measures this (never enforces); it is never gated by
+        ///         the `caps` argument.
         uint256 outflow;
     }
 
@@ -45,23 +46,6 @@ contract BatchExecutorLib {
     /// @param outflow Measured gross outflow (balanceBefore - balanceAfter).
     /// @param cap The declared cap that was exceeded.
     error CallCapExceeded(uint256 index, uint256 outflow, uint256 cap);
-
-    /**
-     * @notice Execute a batch of calls atomically.
-     * @dev Called via delegatecall from vault. All calls execute as the vault.
-     *      If any call fails, the entire batch reverts.
-     * @param calls Array of (target, data, value) to execute in order
-     */
-    function executeBatch(Call[] calldata calls) external {
-        for (uint256 i = 0; i < calls.length; i++) {
-            (bool success, bytes memory returnData) = calls[i].target.call{value: calls[i].value}(calls[i].data);
-            if (!success) {
-                assembly {
-                    revert(add(returnData, 32), mload(returnData))
-                }
-            }
-        }
-    }
 
     /**
      * @notice Execute a batch of calls atomically, metering each call's gross
@@ -105,22 +89,6 @@ contract BatchExecutorLib {
                 if (outflow > caps[i]) revert CallCapExceeded(i, outflow, caps[i]);
                 beforeBal = afterBal;
             }
-        }
-    }
-
-    /**
-     * @notice Simulate a batch without reverting on failure.
-     * @dev Call via eth_call for dry-run. Returns per-call results.
-     *      State changes from earlier calls ARE visible to later calls,
-     *      matching real execution behavior.
-     * @param calls Array of calls to simulate
-     * @return results Array of (success, returnData) per call
-     */
-    function simulateBatch(Call[] calldata calls) external returns (CallResult[] memory results) {
-        results = new CallResult[](calls.length);
-        for (uint256 i = 0; i < calls.length; i++) {
-            (bool success, bytes memory returnData) = calls[i].target.call{value: calls[i].value}(calls[i].data);
-            results[i] = CallResult({success: success, returnData: returnData, outflow: 0});
         }
     }
 

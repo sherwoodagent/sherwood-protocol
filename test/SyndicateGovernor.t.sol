@@ -1059,7 +1059,7 @@ contract SyndicateGovernorTest is Test {
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](0);
         vm.prank(random);
         vm.expectRevert(ISyndicateVault.NotGovernor.selector);
-        vault.executeGovernorBatch(calls, type(uint256).max);
+        vault.executeGovernorBatch(calls, new uint256[](0), type(uint256).max);
     }
 
     // ==================== VETO ON EXECUTED PROPOSAL ====================

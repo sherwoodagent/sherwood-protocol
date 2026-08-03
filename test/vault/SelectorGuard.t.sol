@@ -91,7 +91,7 @@ contract SelectorGuardTest is Test {
 
     function _exec(BatchExecutorLib.Call[] memory calls) internal {
         vm.prank(address(governor));
-        vault.executeGovernorBatch(calls, type(uint256).max);
+        vault.executeGovernorBatch(calls, new uint256[](0), type(uint256).max);
     }
 
     function _expectDisallowed(address target, bytes4 sel, address recipient) internal {
@@ -197,9 +197,7 @@ contract SelectorGuardTest is Test {
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(legacy)));
 
         vm.prank(address(legacy));
-        vault.executeGovernorBatch(
-            _one(address(usdc), abi.encodeCall(usdc.approve, (attacker, 1e6))), type(uint256).max
-        );
+        vault.executeGovernorBatch(_one(address(usdc), abi.encodeCall(usdc.approve, (attacker, 1e6))), new uint256[](0), type(uint256).max);
         assertEq(usdc.allowance(address(vault), attacker), 1e6);
     }
 

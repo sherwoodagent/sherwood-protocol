@@ -109,10 +109,6 @@ interface ISyndicateVault {
     function factory() external view returns (address);
 
     // ── Governor ──
-    /// @notice TRANSITIONAL shim (issue #43 §5 deletes this): forwards to the
-    ///         3-arg overload with an empty `callCaps` (per-call metering
-    ///         skipped). Kept only until every caller has migrated.
-    function executeGovernorBatch(BatchExecutorLib.Call[] calldata calls, uint256 maxNetOutflow) external;
     /// @notice Run a governor-approved batch of calls, metering each call's
     ///         gross outflow of `asset()` against its declared `callCaps[i]`
     ///         (issue #43) and the whole batch's net outflow against
