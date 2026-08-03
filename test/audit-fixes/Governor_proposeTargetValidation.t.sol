@@ -178,7 +178,9 @@ contract GovernorProposeTargetValidationTest is Test {
             STRATEGY_DURATION,
             env,
             _vaultSelfCalls(),
+            GovEnvelope.defaultCaps(env.maxCapital, (_vaultSelfCalls()).length),
             _benignCalls(),
+            GovEnvelope.defaultCaps(env.maxCapital, (_benignCalls()).length),
             _noCoProposers()
         );
     }
@@ -196,7 +198,9 @@ contract GovernorProposeTargetValidationTest is Test {
             STRATEGY_DURATION,
             env,
             _benignCalls(),
+            GovEnvelope.defaultCaps(env.maxCapital, (_benignCalls()).length),
             _benignCalls(),
+            GovEnvelope.defaultCaps(env.maxCapital, (_benignCalls()).length),
             _noCoProposers()
         );
         assertGt(pid, 0, "benign proposal is accepted at propose");
@@ -242,7 +246,9 @@ contract GovernorProposeTargetValidationTest is Test {
             STRATEGY_DURATION,
             env,
             _queueRedeemCalls(1e6, 1),
+            GovEnvelope.defaultCaps(env.maxCapital, (_queueRedeemCalls(1e6, 1)).length),
             _benignCalls(),
+            GovEnvelope.defaultCaps(env.maxCapital, (_benignCalls()).length),
             _noCoProposers()
         );
         assertGt(pid, 0, "propose accepted a queue-targeting batch when the view is unavailable");
@@ -285,7 +291,9 @@ contract GovernorProposeTargetValidationTest is Test {
             STRATEGY_DURATION,
             env1,
             _benignCalls(),
+            GovEnvelope.defaultCaps(env1.maxCapital, (_benignCalls()).length),
             _benignCalls(),
+            GovEnvelope.defaultCaps(env1.maxCapital, (_benignCalls()).length),
             _noCoProposers()
         );
         _voteAndAdvance(pid1);
@@ -315,7 +323,9 @@ contract GovernorProposeTargetValidationTest is Test {
             STRATEGY_DURATION,
             env2,
             reentrantCall,
+            GovEnvelope.defaultCaps(env2.maxCapital, reentrantCall.length),
             _benignCalls(),
+            GovEnvelope.defaultCaps(env2.maxCapital, (_benignCalls()).length),
             _noCoProposers()
         );
         _voteAndAdvance(pid2);
@@ -343,7 +353,9 @@ contract GovernorProposeTargetValidationTest is Test {
             STRATEGY_DURATION,
             env,
             _benignCalls(),
+            GovEnvelope.defaultCaps(env.maxCapital, (_benignCalls()).length),
             _benignCalls(),
+            GovEnvelope.defaultCaps(env.maxCapital, (_benignCalls()).length),
             _noCoProposers()
         );
         _voteAndAdvance(pid);

@@ -78,6 +78,7 @@ abstract contract GovernorParameters is ProposalLifecycle {
     bytes32 public constant PARAM_COLLAB_WINDOW = keccak256("collaborationWindow");
     bytes32 public constant PARAM_MAX_CO_PROPOSERS = keccak256("maxCoProposers");
     bytes32 public constant PARAM_MAX_CAPITAL_BPS = keccak256("maxCapitalBps");
+    bytes32 public constant PARAM_TIER2_CALL_CAP_BPS = keccak256("tier2CallCapBps");
 
     // ── Storage ──
 
@@ -109,9 +110,18 @@ abstract contract GovernorParameters is ProposalLifecycle {
     ///         as the 10_000 (100% of TVL) default via `maxCapitalBps()`.
     uint256 internal _maxCapitalBps;
 
+    /// @notice Per-call tier-2 (uncertified) capital-cap ceiling, in bps of the
+    ///         vault's `totalAssets()` at propose time (issue #43, design.md
+    ///         D2). Stored 0 means "unset" and reads as 10_000 (no ceiling —
+    ///         inert default) via `tier2CallCapBps()`, mirroring
+    ///         `_maxCapitalBps`/`maxCapitalBps()` exactly.
+    uint256 internal _tier2CallCapBps;
+
     /// @dev Reserved storage slots at the `GovernorParameters` layer so future
     ///      param additions here don't shift `SyndicateGovernor`'s layout.
-    uint256[7] private __paramsGap;
+    ///      Carved by 1 slot (from 7) for `_tier2CallCapBps` above —
+    ///      append-only (see `script/syndicate-governor-layout.golden.json`).
+    uint256[6] private __paramsGap;
 
     // ── Constructor (impl-time; sets per-deployment timing floors) ──
 
@@ -295,6 +305,20 @@ abstract contract GovernorParameters is ProposalLifecycle {
     function maxCapitalBps() public view returns (uint256) {
         uint256 v = _maxCapitalBps;
         return v == 0 ? BPS_DENOMINATOR : v; // 0 sentinel = unset = 100% of TVL
+    }
+
+    /// @inheritdoc ISyndicateGovernor
+    function setTier2CallCapBps(uint256 newValue) external onlyVaultOwner whenNoActiveProposal {
+        if (newValue == 0 || newValue > BPS_DENOMINATOR) revert InvalidTier2CallCapBps();
+        uint256 old = tier2CallCapBps();
+        _tier2CallCapBps = newValue;
+        emit ParameterChangeFinalized(PARAM_TIER2_CALL_CAP_BPS, old, newValue);
+    }
+
+    /// @inheritdoc ISyndicateGovernor
+    function tier2CallCapBps() public view returns (uint256) {
+        uint256 v = _tier2CallCapBps;
+        return v == 0 ? BPS_DENOMINATOR : v; // 0 sentinel = unset = inert (no per-call tier-2 ceiling)
     }
 
     /// @inheritdoc ISyndicateGovernor

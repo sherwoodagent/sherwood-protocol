@@ -119,7 +119,6 @@ interface ISyndicateVault {
     function factory() external view returns (address);
 
     // ── Governor ──
-    function executeGovernorBatch(BatchExecutorLib.Call[] calldata calls, uint256 maxNetOutflow) external;
     /// @notice Whether `target` is a privileged batch target — the vault
     ///         itself or its bound withdrawal queue — the SAME predicate
     ///         `executeGovernorBatch`'s `_guardBatchCalls` enforces. Exposed so
@@ -127,6 +126,23 @@ interface ISyndicateVault {
     ///         implementation instead of restating the address set; consumers
     ///         must never duplicate the check, only call through this view.
     function isPrivilegedBatchTarget(address target) external view returns (bool);
+    /// @notice Run a governor-approved batch of calls, metering each call's
+    ///         gross outflow of `asset()` against its declared `callCaps[i]`
+    ///         (issue #43) and the whole batch's net outflow against
+    ///         `maxNetOutflow`. `callCaps.length == 0` skips per-call
+    ///         metering (the emergency-rescue escape valve); a non-empty
+    ///         array whose length differs from `calls` reverts inside the
+    ///         library (`CapsLengthMismatch`).
+    function executeGovernorBatch(
+        BatchExecutorLib.Call[] calldata calls,
+        uint256[] calldata callCaps,
+        uint256 maxNetOutflow
+    ) external;
+    /// @notice Factory-only: re-point the shared executor library and
+    ///         re-stamp its expected codehash atomically. Reached through
+    ///         `SyndicateFactory.pushExecutor`, which lifecycle-gates the
+    ///         call (no open or executing proposal).
+    function setExecutorImpl(address newImpl) external;
     function owner() external view returns (address);
     function transferPerformanceFee(address asset, address to, uint256 amount) external;
     function governor() external view returns (address);
@@ -230,6 +246,10 @@ interface ISyndicateVault {
     ///         vault via `executeGovernorBatch`. `callCount` is the number of
     ///         sub-calls fanned out by `BatchExecutorLib.executeBatch`.
     event GovernorBatchExecuted(address indexed governor, uint256 callCount);
+    /// @notice Emitted by `setExecutorImpl` (factory-only, via
+    ///         `SyndicateFactory.pushExecutor`) whenever the shared executor
+    ///         library is re-pointed and its expected codehash re-stamped.
+    event ExecutorImplSet(address oldImpl, address newImpl);
     event WithdrawalQueueSet(address indexed queue);
     event RedeemRequested(uint256 indexed requestId, address indexed owner, uint256 shares);
     event DepositRequested(uint256 indexed requestId, address indexed receiver, uint256 assets);

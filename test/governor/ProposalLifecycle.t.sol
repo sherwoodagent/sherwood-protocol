@@ -271,7 +271,9 @@ contract ProposalLifecycleTest is Test {
             7 days,
             _env,
             _execCalls(),
+            GovEnvelope.defaultCaps((_env).maxCapital, (_execCalls()).length),
             _settleCalls(),
+            GovEnvelope.defaultCaps((_env).maxCapital, (_settleCalls()).length),
             _emptyCoProposers()
         );
     }
@@ -289,7 +291,9 @@ contract ProposalLifecycleTest is Test {
             7 days,
             _env,
             _execCalls(),
+            GovEnvelope.defaultCaps((_env).maxCapital, (_execCalls()).length),
             _settleCalls(),
+            GovEnvelope.defaultCaps((_env).maxCapital, (_settleCalls()).length),
             coProps
         );
     }
@@ -576,7 +580,9 @@ contract ProposalLifecycleTest is Test {
             7 days,
             _env,
             _execCalls(),
+            GovEnvelope.defaultCaps((_env).maxCapital, (_execCalls()).length),
             _settleCalls(),
+            GovEnvelope.defaultCaps((_env).maxCapital, (_settleCalls()).length),
             _emptyCoProposers()
         );
 

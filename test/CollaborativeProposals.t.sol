@@ -172,7 +172,9 @@ contract CollaborativeProposalsTest is Test {
             7 days,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
             coProps
         );
     }
@@ -214,7 +216,9 @@ contract CollaborativeProposalsTest is Test {
             7 days,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
             _emptyCoProposers()
         );
 
@@ -236,7 +240,9 @@ contract CollaborativeProposalsTest is Test {
             7 days,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
             _emptyCoProposers()
         );
         vm.warp(block.timestamp + 1);
@@ -483,7 +489,9 @@ contract CollaborativeProposalsTest is Test {
             7 days,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
             coProps
         );
 
@@ -558,7 +566,9 @@ contract CollaborativeProposalsTest is Test {
             7 days,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
             coProps
         );
         vm.prank(coAgent1);
@@ -647,7 +657,9 @@ contract CollaborativeProposalsTest is Test {
             7 days,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
             coProps
         );
     }
@@ -665,7 +677,9 @@ contract CollaborativeProposalsTest is Test {
             7 days,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
             coProps
         );
     }
@@ -699,7 +713,9 @@ contract CollaborativeProposalsTest is Test {
             7 days,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
             coProps
         );
     }
@@ -717,7 +733,9 @@ contract CollaborativeProposalsTest is Test {
             7 days,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
             coProps
         );
     }
@@ -736,7 +754,9 @@ contract CollaborativeProposalsTest is Test {
             7 days,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
             coProps
         );
     }

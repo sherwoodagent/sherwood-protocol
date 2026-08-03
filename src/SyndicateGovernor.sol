@@ -147,8 +147,27 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///         locking. Wired via `setBondEscrow` (factory-only).
     address internal _bondEscrow;
 
-    /// @dev Reserved storage for future upgrades.
-    uint256[31] private __gap;
+    /// @notice Proposal ID -> per-call gross-outflow caps for the EXECUTE
+    ///         (opening) calls, one entry per `_executeCalls[id]` entry,
+    ///         denominated in the vault asset. Stored immutably at propose
+    ///         (issue #43); coverage is priced from these, and they are
+    ///         forwarded to `executeGovernorBatch` unchanged at execute.
+    mapping(uint256 => uint256[]) private _executeCallCaps;
+
+    /// @notice Proposal ID -> per-call gross-outflow caps for the SETTLEMENT
+    ///         (closing) calls, mirroring `_executeCallCaps`. Forwarded at
+    ///         settle, `unstick`, and re-resolved at execute-time regression
+    ///         checks; NOT forwarded on the owner-supplied
+    ///         `finalizeEmergencySettle` path (empty caps there — design.md D3).
+    mapping(uint256 => uint256[]) private _settlementCallCaps;
+
+    /// @dev Reserved storage for future upgrades. Carved by 2 slots (from 31)
+    ///      for the two mappings above — append-only: every pre-existing
+    ///      named variable keeps its slot, and the mappings occupy exactly
+    ///      the front of what used to be gap space. See
+    ///      `script/syndicate-governor-layout.golden.json` (regenerated,
+    ///      task 7.1).
+    uint256[29] private __gap;
 
     /// @param minVotingPeriod_   Per-deployment floor for `votingPeriod` (mainnet 24h).
     /// @param minCooldownPeriod_ Per-deployment floor for `cooldownPeriod` (mainnet 1h).
@@ -199,6 +218,10 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         return _settlementCalls[id];
     }
 
+    function _getSettlementCallCaps(uint256 id) internal view override returns (uint256[] storage) {
+        return _settlementCallCaps[id];
+    }
+
     function _emergencyReentrancyEnter() internal override {
         if (_reentrancyStatus == _ENTERED) revert Reentrancy();
         _reentrancyStatus = _ENTERED;
@@ -222,7 +245,9 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         uint256 strategyDuration,
         RiskEnvelope calldata envelope,
         BatchExecutorLib.Call[] calldata executeCalls,
+        uint256[] calldata executeCallCaps,
         BatchExecutorLib.Call[] calldata settlementCalls,
+        uint256[] calldata settlementCallCaps,
         CoProposer[] calldata coProposers
     ) external returns (uint256 proposalId) {
         if (vault != GovernorParameters.vault) revert VaultNotRegistered();
@@ -236,7 +261,14 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         if (strategyDuration < _params.minStrategyDuration) revert StrategyDurationTooShort();
         if (executeCalls.length == 0) revert EmptyExecuteCalls();
         if (settlementCalls.length == 0) revert EmptySettlementCalls();
-        // Caps batch sizes.
+        // Caps batch sizes. Kept HERE (not folded into `_validateAndStoreBatch`
+        // below) to preserve the original check ORDER relative to
+        // `MetadataURITooLong`/`ZeroMaxCapital`/`InvalidDrawdown` below — tests
+        // pin which error fires first on a doubly-invalid proposal, and this
+        // is pure `.length` arithmetic on params already read by the two
+        // lines above, so it costs nothing extra on the stack budget (the
+        // cap-array-specific checks, which DO need the new calldata params,
+        // still live in the deferred helper).
         if (executeCalls.length > MAX_CALLS_PER_PROPOSAL || settlementCalls.length > MAX_CALLS_PER_PROPOSAL) {
             revert TooManyCalls();
         }
@@ -259,6 +291,21 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         }
 
         proposalId = ++_proposalCount;
+
+        // Per-call capital declarations (issue #43): validate AND store in
+        // ONE early call so the `executeCallCaps`/`settlementCallCaps`
+        // calldata refs die immediately after, instead of staying live
+        // across the rest of this function — Yul stack-too-deep mitigation
+        // (design.md Risks, "validate-while-storing"). A revert here rolls
+        // back the `_proposalCount` increment above alongside everything
+        // else, so ordering validation after it costs nothing. Never folded
+        // into #118's `_rejectPrivilegedTargets` staticcall-probe loop
+        // (design.md D6): different subject (capital vs targets), different
+        // failure mode (this never degrades open; it depends on nothing
+        // optional).
+        _validateAndStoreBatch(
+            proposalId, executeCalls, executeCallCaps, settlementCalls, settlementCallCaps, envelope.maxCapital
+        );
 
         bool isCollaborative = coProposers.length > 0;
 
@@ -310,9 +357,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         } else {
             _initPendingProposal(p, reviewPeriod_);
         }
-
-        _storeCalls(_executeCalls, proposalId, executeCalls);
-        _storeCalls(_settlementCalls, proposalId, settlementCalls);
 
         // Tier resolution: proposal tier = MAX tier across execute calls;
         // requiredCoverage (per-call SUM over execute AND settlement calls)
@@ -410,8 +454,14 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // Tier alone misses a same-tier re-certification with a higher
         // extractableBoundBps — also revert when the re-resolved coverage
         // exceeds the propose-time snapshot.
-        (uint8 liveTier, uint256 liveCoverage) =
-            _resolveTierAndCoverage(calls, _loadCalls(_settlementCalls, proposalId), proposal.maxCapital);
+        (uint8 liveTier, uint256 liveCoverage) = _resolveTierAndCoverage(
+            calls,
+            _loadCaps(_executeCallCaps, proposalId),
+            _loadCalls(_settlementCalls, proposalId),
+            _loadCaps(_settlementCallCaps, proposalId),
+            proposal.maxCapital,
+            false
+        );
         if (liveTier > proposal.envelopeTier) revert TierRegressed();
         if (liveCoverage > proposal.requiredCoverage) revert CoverageRegressed();
 
@@ -432,11 +482,12 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         {
             address ledger = _exposureLedger;
             // `requiredCoverage == 0` keeps optimistic passage: a proposal
-            // that can extract nothing needs no covering signer. Largely
-            // defensive today — `propose` rejects `maxCapital == 0`
-            // (`ZeroMaxCapital`), so zero coverage at tier 2 is not currently
-            // reachable — but the gate keys on extractable value, which is
-            // what the quorum actually underwrites.
+            // that can extract nothing needs no covering signer. Reachable as
+            // of issue #43: an all-zero-cap proposal (with a wired registry)
+            // legitimately prices to zero — it declares zero asset-extractable
+            // value, and the per-call meter below enforces exactly that
+            // declaration, so no covering signer is needed for a batch that
+            // cannot move the asset out of custody.
             if (
                 ledger != address(0) && proposal.requiredCoverage != 0
                     && proposal.envelopeTier >= IExposureLedger(ledger).quorumTierThreshold()
@@ -447,8 +498,11 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         }
 
         // Execute the opening calls via the vault. The risk envelope's
-        // maxCapital caps the batch's net asset outflow.
-        ISyndicateVault(vault).executeGovernorBatch(calls, proposal.maxCapital);
+        // maxCapital caps the batch's net asset outflow (batch-level); the
+        // stored per-call caps (issue #43) additionally bound each call's own
+        // gross outflow (BatchExecutorLib-level) — two distinct accounting
+        // layers, both mandatory on this path (design.md D4).
+        ISyndicateVault(vault).executeGovernorBatch(calls, _loadCaps(_executeCallCaps, proposalId), proposal.maxCapital);
 
         emit ProposalExecuted(proposalId, vault, balanceBefore);
     }
@@ -469,9 +523,16 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // as execute. An honest unwind is net-INFLOW (netOutflow == 0), so any
         // finite cap passes it trivially — the cap only binds a malicious
         // proposer who parked extraction in settlementCalls to self-settle
-        // after 1h and drain uncapped.
+        // after 1h and drain uncapped. The stored per-call settlement caps
+        // (issue #43) additionally bound each settlement call's own gross
+        // outflow — extraction parked in a single settlement call is bounded
+        // per call, not only by the batch-level `maxCapital`.
         ISyndicateVault(proposal.vault)
-            .executeGovernorBatch(_loadCalls(_settlementCalls, proposalId), proposal.maxCapital);
+            .executeGovernorBatch(
+                _loadCalls(_settlementCalls, proposalId),
+                _loadCaps(_settlementCallCaps, proposalId),
+                proposal.maxCapital
+            );
 
         _finishSettlement(proposalId, proposal);
     }
@@ -865,6 +926,16 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     }
 
     /// @inheritdoc ISyndicateGovernor
+    function getCallCaps(uint256 proposalId)
+        external
+        view
+        returns (uint256[] memory executeCallCaps, uint256[] memory settlementCallCaps)
+    {
+        executeCallCaps = _loadCaps(_executeCallCaps, proposalId);
+        settlementCallCaps = _loadCaps(_settlementCallCaps, proposalId);
+    }
+
+    /// @inheritdoc ISyndicateGovernor
     function getVoteWeight(uint256 proposalId, address voter) external view returns (uint256) {
         StrategyProposal storage proposal = _proposals[proposalId];
         if (proposal.id == 0) revert ProposalNotFound();
@@ -1083,6 +1154,63 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         }
     }
 
+    /// @dev Propose-time cap-array validation AND storage of BOTH the calls
+    ///      and the caps, combined into ONE call (issue #43). Combined
+    ///      deliberately: `propose`'s Yul stack budget is documented at the
+    ///      edge, and two new calldata array params tipped it over even after
+    ///      the validate-and-store-caps-together mitigation alone (design.md
+    ///      Risks). Folding `_storeCalls` in here too means `executeCalls`/
+    ///      `settlementCalls`/`executeCallCaps`/`settlementCallCaps` are ALL
+    ///      referenced only within this one early call — called right after
+    ///      `proposalId` is minted — instead of staying live stack slots
+    ///      across the rest of `propose`'s body (calls previously lived until
+    ///      a separate `_storeCalls` call much later). No external calls, no
+    ///      degrading — sibling to (never folded into) #118's
+    ///      `_rejectPrivilegedTargets` staticcall-probe loop (design.md D6).
+    ///      Checks, in order:
+    ///        1. Each cap array's length equals its call array's length
+    ///           (`CallCapsLengthMismatch`) — every call must declare exactly
+    ///           one cap.
+    ///        2. `Σ executeCallCaps <= maxCapital` AND
+    ///           `Σ settlementCallCaps <= maxCapital`, evaluated PER BATCH,
+    ///           never combined (`CallCapsExceedMaxCapital`) — the execute and
+    ///           settlement batches run in separate transactions, each
+    ///           independently bounded by the vault's `maxCapital` net-outflow
+    ///           meter, so requiring the COMBINED sum under `maxCapital` would
+    ///           halve every proposal's settlement budget for no safety gain.
+    ///      Overflow is a non-issue: `cap_i <= maxCapital <= totalAssets()`
+    ///      and each array is bounded by `MAX_CALLS_PER_PROPOSAL` (checked
+    ///      just above this helper's call site). Only reverts BEFORE any
+    ///      storage write in this function is committed — a revert here
+    ///      still rolls back the `_proposalCount` bump from `propose`'s CEI
+    ///      ordering, so validating after storing nothing yet is safe.
+    function _validateAndStoreBatch(
+        uint256 proposalId,
+        BatchExecutorLib.Call[] calldata executeCalls,
+        uint256[] calldata executeCallCaps,
+        BatchExecutorLib.Call[] calldata settlementCalls,
+        uint256[] calldata settlementCallCaps,
+        uint256 maxCapital
+    ) private {
+        if (executeCallCaps.length != executeCalls.length || settlementCallCaps.length != settlementCalls.length) {
+            revert CallCapsLengthMismatch();
+        }
+        uint256 execSum;
+        for (uint256 i = 0; i < executeCallCaps.length; i++) {
+            execSum += executeCallCaps[i];
+        }
+        if (execSum > maxCapital) revert CallCapsExceedMaxCapital();
+        uint256 settleSum;
+        for (uint256 i = 0; i < settlementCallCaps.length; i++) {
+            settleSum += settlementCallCaps[i];
+        }
+        if (settleSum > maxCapital) revert CallCapsExceedMaxCapital();
+        _storeCalls(_executeCalls, proposalId, executeCalls);
+        _storeCalls(_settlementCalls, proposalId, settlementCalls);
+        _storeCaps(_executeCallCaps, proposalId, executeCallCaps);
+        _storeCaps(_settlementCallCaps, proposalId, settlementCallCaps);
+    }
+
     /// @dev Resolves and stores the proposal's tier + required coverage, then
     ///      runs the propose-time gates: the maxCapital ceiling check, the
     ///      exposure ledger's covered-TVL cap, and the risk-scaled proposer
@@ -1098,8 +1226,19 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // block) purely for the same stack-budget reason — an extra call
         // frame in propose() tips it over. Same-tx revert either way.
         _checkMaxCapitalCeiling(p.maxCapital);
-        (uint8 tier_, uint256 coverage_) =
-            _resolveTierAndCoverage(execCalls, _loadCalls(_settlementCalls, p.id), p.maxCapital);
+        // checkCeiling=true: this IS the propose-time sweep the per-call
+        // tier-2 ceiling runs inside (design.md D1/D2). Caps are loaded from
+        // storage (stored by `propose` via `_storeCaps` before this call
+        // runs) rather than taken as stack arguments, for the same
+        // stack-budget reason `execCalls` already is.
+        (uint8 tier_, uint256 coverage_) = _resolveTierAndCoverage(
+            execCalls,
+            _loadCaps(_executeCallCaps, p.id),
+            _loadCalls(_settlementCalls, p.id),
+            _loadCaps(_settlementCallCaps, p.id),
+            p.maxCapital,
+            true
+        );
         p.envelopeTier = tier_;
         p.requiredCoverage = coverage_;
         // Skipped when unwired — the pre-ledger safe default matches the
@@ -1174,59 +1313,78 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         }
     }
 
-    /// @dev Proposal tier = max tier across EXECUTE calls; coverage = the
-    ///      extractable-weighted demand the aggregate exposure cap will consume.
-    ///
-    ///      Coverage is the SUM of per-call contributions across BOTH execute
-    ///      and settlement calls — a single MAX bound under-counts
-    ///      multi-adapter batches (two 50%-bound adapters can each extract
-    ///      their bound) and ignores settlement-routed extraction entirely
-    ///      (settlement calls are arbitrary, pre-committed calldata). Per-call
-    ///      notional is not threaded through, so each call conservatively
-    ///      uses maxCapital as its notional:
-    ///        coverage = maxCapital * Σ(boundBps_i) / 10_000,
+    /// @dev Proposal tier = max tier across EXECUTE calls (batch-wide,
+    ///      unchanged — design.md D2: every consumer of the aggregate tier
+    ///      wants the fail-closed max). Coverage (issue #43) is the SUM of
+    ///      PER-CALL contributions across BOTH execute and settlement calls:
+    ///        coverage = Σ (cap_i * boundBps_i) / 10_000,
     ///      boundBps_i = the certified bound for tier-0/1 calls, 10_000 (full
-    ///      notional) for tier-2/uncertified calls. Monotonic and
-    ///      never-under-counting; deliberately OVER-counts multi-call batches
-    ///      (n tier-2 calls price n×maxCapital).
+    ///      notional) for tier-2/uncertified calls, cap_i = that call's OWN
+    ///      declared gross-outflow cap. Monotonic in every cap and every
+    ///      boundBps — the property the regression guard and issue #27's
+    ///      proportional scaling both lean on.
     ///
     ///      With no registry wired every proposal is tier 2 / full notional
-    ///      (coverage = maxCapital) — the pre-registry safe default. `memory`
-    ///      params (not calldata) so this can be reused on storage-loaded
-    ///      calls at execute time.
+    ///      (coverage = maxCapital) — the pre-registry safe default is NOT
+    ///      made cheaper by per-call caps. `memory` params (not calldata) so
+    ///      this can be reused on storage-loaded calls at execute time.
+    ///
+    ///      `checkCeiling` gates the per-call tier-2 ceiling (true at propose,
+    ///      false at execute re-resolve — post-propose tier drift is the
+    ///      regression guards' job, not a second ceiling check).
     function _resolveTierAndCoverage(
         BatchExecutorLib.Call[] memory execCalls,
+        uint256[] memory execCaps,
         BatchExecutorLib.Call[] memory settleCalls,
-        uint256 maxCapital
+        uint256[] memory settleCaps,
+        uint256 maxCapital,
+        bool checkCeiling
     ) private view returns (uint8 tier, uint256 coverage) {
         address registry = _tierRegistry;
         if (registry == address(0)) return (2, maxCapital);
-        (uint8 execTier, uint256 execBps) = _scanCalls(registry, execCalls);
-        (, uint256 settleBps) = _scanCalls(registry, settleCalls);
+        uint256 tier2Ceiling = checkCeiling
+            ? (IERC4626(GovernorParameters.vault).totalAssets() * tier2CallCapBps()) / BPS_DENOMINATOR
+            : type(uint256).max;
+        (uint8 execTier, uint256 execCoverage) = _scanCalls(registry, execCalls, execCaps, checkCeiling, tier2Ceiling);
+        (, uint256 settleCoverage) = _scanCalls(registry, settleCalls, settleCaps, checkCeiling, tier2Ceiling);
         tier = execTier;
-        // Σ boundBps ≤ 10_000 * 2 * MAX_CALLS_PER_PROPOSAL and maxCapital ≤
-        // totalAssets (propose ceiling) — no realistic overflow.
-        coverage = (maxCapital * (execBps + settleBps)) / 10_000;
+        coverage = execCoverage + settleCoverage;
     }
 
-    /// @dev Max tier and Σ extractable-bound bps (10_000 per tier-2 call)
-    ///      across `calls`, resolved through the TierRegistry.
-    function _scanCalls(address registry, BatchExecutorLib.Call[] memory calls)
-        private
-        view
-        returns (uint8 tier, uint256 sumBps)
-    {
+    /// @dev Max tier and Σ (cap_i * boundBps_i) / 10_000 across `calls`,
+    ///      resolved through the TierRegistry. When `checkCeiling` is set,
+    ///      also enforces the per-call tier-2 ceiling in the SAME sweep (one
+    ///      registry scan, not two): any call whose resolved tier is 2
+    ///      (uncertified included) must declare `caps[i] <= tier2Ceiling`,
+    ///      else `Tier2CallCapExceedsCeiling(i)` — `i` is this array's own
+    ///      index; exec and settle are scanned as two separate calls to this
+    ///      function, exec first (design.md D2).
+    function _scanCalls(
+        address registry,
+        BatchExecutorLib.Call[] memory calls,
+        uint256[] memory caps,
+        bool checkCeiling,
+        uint256 tier2Ceiling
+    ) private view returns (uint8 tier, uint256 coverage) {
         for (uint256 i = 0; i < calls.length; i++) {
             bytes memory d = calls[i].data;
             bytes4 sel;
             if (d.length >= 4) {
-                assembly {
+                // memory-safe: pure read of an in-bounds offset of `d`'s own
+                // memory-array content (guarded by the `d.length >= 4` check
+                // above), no writes. Annotated so the via-ir pipeline's
+                // memory-safety proof is not blocked contract-wide by this
+                // block, unlocking memory-based stack spilling elsewhere
+                // (issue #43's `propose` Yul stack budget).
+                assembly ("memory-safe") {
                     sel := mload(add(d, 32))
                 }
             }
             (uint8 t, uint16 boundBps) = ITierRegistry(registry).tierOf(calls[i].target, sel);
             if (t > tier) tier = t;
-            sumBps += boundBps;
+            uint256 cap_i = caps[i];
+            if (checkCeiling && t == 2 && cap_i > tier2Ceiling) revert Tier2CallCapExceedsCeiling(i);
+            coverage += (cap_i * boundBps) / 10_000;
         }
     }
 
@@ -1249,6 +1407,32 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     {
         BatchExecutorLib.Call[] storage stored = source[proposalId];
         result = new BatchExecutorLib.Call[](stored.length);
+        for (uint256 i = 0; i < stored.length; i++) {
+            result[i] = stored[i];
+        }
+    }
+
+    /// @dev Push calldata caps into a storage mapping slot, mirroring
+    ///      `_storeCalls`. Introduced ahead of the propose() ABI change (§4)
+    ///      so §3 already has the storage primitive; not yet called from
+    ///      `propose` (nothing populates `_executeCallCaps`/
+    ///      `_settlementCallCaps` until §4 stores the new calldata params).
+    function _storeCaps(mapping(uint256 => uint256[]) storage target, uint256 proposalId, uint256[] calldata caps)
+        internal
+    {
+        for (uint256 i = 0; i < caps.length; i++) {
+            target[proposalId].push(caps[i]);
+        }
+    }
+
+    /// @dev Copy caps from storage to memory, mirroring `_loadCalls`.
+    function _loadCaps(mapping(uint256 => uint256[]) storage source, uint256 proposalId)
+        internal
+        view
+        returns (uint256[] memory result)
+    {
+        uint256[] storage stored = source[proposalId];
+        result = new uint256[](stored.length);
         for (uint256 i = 0; i < stored.length; i++) {
             result[i] = stored[i];
         }

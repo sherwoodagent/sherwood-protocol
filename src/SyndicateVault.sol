@@ -495,17 +495,21 @@ contract SyndicateVault is
     ///      different library.
     /// @dev Gated by `whenNotPaused`. When the owner pauses the vault,
     ///      strategy execution is halted alongside LP flow.
-    function executeGovernorBatch(BatchExecutorLib.Call[] calldata calls, uint256 maxNetOutflow)
-        external
-        onlyGovernor
-        nonReentrant
-        whenNotPaused
-    {
-        if (_executorImpl.codehash != _expectedExecutorCodehash) revert ExecutorCodehashMismatch();
+    function executeGovernorBatch(
+        BatchExecutorLib.Call[] calldata calls,
+        uint256[] calldata callCaps,
+        uint256 maxNetOutflow
+    ) external onlyGovernor nonReentrant whenNotPaused {
+        if (_executorImpl.codehash != _expectedExecutorCodehash) {
+            revert ExecutorCodehashMismatch();
+        }
         _guardBatchCalls(calls);
         uint256 balanceBefore = IERC20(asset()).balanceOf(address(this));
+        // The lib's unmetered 1-arg `executeBatch(Call[])` overload was
+        // deleted in issue #43 §5 — the metered 3-arg signature is the only
+        // one left, so `abi.encodeCall` resolves it unambiguously again.
         (bool success, bytes memory returnData) =
-            _executorImpl.delegatecall(abi.encodeCall(BatchExecutorLib.executeBatch, (calls)));
+            _executorImpl.delegatecall(abi.encodeCall(BatchExecutorLib.executeBatch, (calls, asset(), callCaps)));
         if (!success) {
             assembly {
                 revert(add(returnData, 32), mload(returnData))
@@ -542,6 +546,21 @@ contract SyndicateVault is
         // is not selector-examined (see `_guardBatchCalls` RESIDUAL). The
         // precise extractable bound is the tier system's per-call coverage
         // (requiredCoverage).
+        //
+        // There are now TWO layers (issue #43, design.md D4), from finest to
+        // coarsest:
+        //   1. `BatchExecutorLib.executeBatch`'s per-call meter (this
+        //      delegatecall, above): each call's gross outflow vs. its
+        //      proposer-declared `caps[i]`, `CallCapExceeded` on breach. This
+        //      is the tier system's precise extractable bound
+        //      (`requiredCoverage = Σ cap_i * boundBps_i / 10_000`).
+        //   2. This function's `netOutflow` check (below): a batch-wide
+        //      backstop against `maxCapital`. When caps are supplied and
+        //      cover every moving call, layer 1 is strictly tighter
+        //      (`netOutflow <= Σ outflow_i <= Σ caps_i <= maxCapital`), so
+        //      layer 2 structurally cannot fire first — it only binds when
+        //      caps are empty (the emergency-rescue escape valve) or when a
+        //      batch's declared caps happen to sum right up to maxCapital.
         uint256 netOutflow = balanceBefore > balanceAfter ? balanceBefore - balanceAfter : 0;
         if (netOutflow > maxNetOutflow) revert MaxNetOutflowExceeded(netOutflow, maxNetOutflow);
         uint256 reserve = reservedQueueAssets();
@@ -558,6 +577,25 @@ contract SyndicateVault is
     ///      instead of restating the address set (vault, bound queue).
     function isPrivilegedBatchTarget(address target) external view returns (bool) {
         return _isPrivilegedBatchTarget(target);
+    }
+
+    /// @notice Re-point the shared `BatchExecutorLib` and re-stamp its
+    ///         expected codehash, atomically. The migration primitive for the
+    ///         deploy-once-and-share library (issue #43, design.md D5):
+    ///         reached only through the factory's lifecycle-gated
+    ///         `pushExecutor`, never called directly by anyone else.
+    /// @dev Factory-only. Rejects zero and codeless targets — a swapped-in
+    ///      address with no code would pass every future `codehash` check
+    ///      vacuously (an EOA's codehash is the empty-code hash, and the very
+    ///      next delegatecall would just no-op against it), silently
+    ///      disabling batch execution instead of failing loudly here.
+    function setExecutorImpl(address newImpl) external {
+        if (msg.sender != _factory) revert NotFactory();
+        if (newImpl == address(0) || newImpl.code.length == 0) revert InvalidExecutorImpl();
+        address old = _executorImpl;
+        _executorImpl = newImpl;
+        _expectedExecutorCodehash = newImpl.codehash;
+        emit ExecutorImplSet(old, newImpl);
     }
 
     /// @dev Two-part batch gate: a privileged-TARGET denylist (Part 1, always

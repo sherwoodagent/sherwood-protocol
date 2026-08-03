@@ -119,12 +119,15 @@ interface ISyndicateGovernor {
         uint8 envelopeTier;
         /// @notice Extractable-value figure the aggregate exposure cap
         ///         consumes: the SUM of per-call contributions across
-        ///         execute AND settlement calls — `maxCapital * Σ boundBps /
-        ///         10_000`, where each tier-0/1 call contributes its
-        ///         certified bound and each tier-2/uncertified call
-        ///         contributes 10_000 (full notional). Conservative
-        ///         (over-counting) since per-call notional isn't threaded
-        ///         through. `maxCapital` flat when no registry is wired.
+        ///         execute AND settlement calls — `Σ cap_i * boundBps_i /
+        ///         10_000`, where `cap_i` is that call's proposer-declared
+        ///         per-call capital declaration (issue #43) and `boundBps_i`
+        ///         is its certified bound (tier-2/uncertified calls use
+        ///         10_000, i.e. their full declared cap). No longer an
+        ///         over-count: each call's contribution is now scaled by its
+        ///         own declared notional rather than the batch-wide
+        ///         `maxCapital`. `maxCapital` flat when no registry is wired
+        ///         (caps are still metered at execution regardless).
         uint256 requiredCoverage;
         /// @notice WOOD amount of the risk-scaled proposer bond locked in
         ///         the ProposerBondEscrow at propose time. Zero when no
@@ -298,6 +301,24 @@ interface ISyndicateGovernor {
     ///         arrays that otherwise let a proposer grief gas when the batch
     ///         is executed.
     error TooManyCalls();
+    /// @notice Revert if `executeCallCaps.length != executeCalls.length` or
+    ///         `settlementCallCaps.length != settlementCalls.length` at
+    ///         propose (issue #43). Every call must declare exactly one cap.
+    error CallCapsLengthMismatch();
+    /// @notice Revert if `Σ executeCallCaps` or `Σ settlementCallCaps`
+    ///         exceeds `envelope.maxCapital`, evaluated PER BATCH (issue #43)
+    ///         — the two batches run in separate transactions, each
+    ///         independently bounded by the vault's `maxCapital` net-outflow
+    ///         meter, so a batch whose own sum is within `maxCapital` passes
+    ///         even when the two sums combined exceed it.
+    error CallCapsExceedMaxCapital();
+    /// @notice Revert if a call in either array whose (target, selector)
+    ///         resolves to tier 2 (uncertified included) declares a cap above
+    ///         `totalAssets() * tier2CallCapBps / 10_000` at propose (issue
+    ///         #43). `index` disambiguates; arrays are scanned exec-then-settle.
+    error Tier2CallCapExceedsCeiling(uint256 index);
+    /// @notice `setTier2CallCapBps` called with 0 or a value above 10_000.
+    error InvalidTier2CallCapBps();
 
     // ── Guardian-review emergency settle errors ──
     error OwnerBondInsufficient();
@@ -480,6 +501,18 @@ interface ISyndicateGovernor {
     ///         Pass `address(0)` for a queue-only proposal (no instant lane).
     /// @dev    The strategy is set immutably at propose time — voters approve
     ///         based on this address, and there is no later bind / rebind path.
+    /// @dev    BREAKING ABI CHANGE (issue #43): `executeCallCaps` and
+    ///         `settlementCallCaps` are new parallel arrays, one `uint256` per
+    ///         entry in `executeCalls`/`settlementCalls` respectively — each
+    ///         call's own declared gross-outflow cap, denominated in the vault
+    ///         asset. Zero is a legal declaration at every tier ("this call
+    ///         moves no vault asset"). `Σ executeCallCaps` and
+    ///         `Σ settlementCallCaps` must each be `<= envelope.maxCapital`,
+    ///         checked PER BATCH (not combined — the two batches run in
+    ///         separate transactions, each independently bounded by the
+    ///         vault's `maxCapital` net-outflow meter; an honest settlement
+    ///         legitimately re-moves the same capital the execute batch
+    ///         deployed).
     function propose(
         address vault,
         address strategy,
@@ -487,7 +520,9 @@ interface ISyndicateGovernor {
         uint256 strategyDuration,
         RiskEnvelope calldata envelope,
         BatchExecutorLib.Call[] calldata executeCalls,
+        uint256[] calldata executeCallCaps,
         BatchExecutorLib.Call[] calldata settlementCalls,
+        uint256[] calldata settlementCallCaps,
         CoProposer[] calldata coProposers
     ) external returns (uint256 proposalId);
 
@@ -538,6 +573,13 @@ interface ISyndicateGovernor {
     /// @notice Effective maxCapital ceiling in bps of TVL (10_000 = 100%, the
     ///         default when never set).
     function maxCapitalBps() external view returns (uint256);
+    /// @notice Set the per-call tier-2 (uncertified) capital-cap ceiling, in
+    ///         bps of the vault's `totalAssets()` at propose time (issue #43).
+    ///         Bounds: 1..10_000.
+    function setTier2CallCapBps(uint256 newTier2CallCapBps) external;
+    /// @notice Effective per-call tier-2 ceiling in bps of TVL (10_000 = no
+    ///         ceiling, the inert default when never set).
+    function tier2CallCapBps() external view returns (uint256);
     function setProtocolConfig(address newConfig) external;
     /// @notice Wire the tier registry. Factory-only, like
     ///         `setProtocolConfig`. address(0) un-wires: every proposal then
@@ -599,6 +641,14 @@ interface ISyndicateGovernor {
     function getProposalState(uint256 proposalId) external view returns (ProposalState);
     function getExecuteCalls(uint256 proposalId) external view returns (BatchExecutorLib.Call[] memory);
     function getSettlementCalls(uint256 proposalId) external view returns (BatchExecutorLib.Call[] memory);
+    /// @notice The per-call gross-outflow caps declared at propose time
+    ///         (issue #43), immutable for the proposal's lifetime. Positional
+    ///         against `getExecuteCalls`/`getSettlementCalls` — the interface
+    ///         issue #27's proportional sizing will consume (design.md D7).
+    function getCallCaps(uint256 proposalId)
+        external
+        view
+        returns (uint256[] memory executeCallCaps, uint256[] memory settlementCallCaps);
     function getVoteWeight(uint256 proposalId, address voter) external view returns (uint256);
     function hasVoted(uint256 proposalId, address voter) external view returns (bool);
     function proposalCount() external view returns (uint256);

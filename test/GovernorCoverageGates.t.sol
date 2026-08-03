@@ -18,6 +18,7 @@ import {MockRegistryMinimal} from "./mocks/MockRegistryMinimal.sol";
 import {MockWoodTwapOracle} from "./mocks/MockWoodTwapOracle.sol";
 import {ProtocolConfig} from "../src/ProtocolConfig.sol";
 import {TierRegistry} from "../src/TierRegistry.sol";
+import {GovEnvelope} from "./helpers/GovEnvelope.sol";
 
 /// @dev Minimal sWOOD read surface the ExposureLedger constructor consumes.
 ///      `coolDownPeriod` (45d) covers epochLength (28d) + challengeWindow (14d).
@@ -324,7 +325,9 @@ contract GovernorCoverageGatesTest is Test {
             7 days,
             _envelope(cap),
             _execCalls(),
+            GovEnvelope.defaultCaps((_envelope(cap)).maxCapital, (_execCalls()).length),
             _settleCalls(),
+            GovEnvelope.defaultCaps((_envelope(cap)).maxCapital, (_settleCalls()).length),
             new ISyndicateGovernor.CoProposer[](0)
         );
     }
@@ -345,7 +348,9 @@ contract GovernorCoverageGatesTest is Test {
             7 days,
             _envelope(1_000e6),
             _execCalls(),
+            GovEnvelope.defaultCaps((_envelope(1_000e6)).maxCapital, (_execCalls()).length),
             _settleCalls(),
+            GovEnvelope.defaultCaps((_envelope(1_000e6)).maxCapital, (_settleCalls()).length),
             new ISyndicateGovernor.CoProposer[](0)
         );
     }
@@ -362,7 +367,9 @@ contract GovernorCoverageGatesTest is Test {
             7 days,
             _envelope(1_000e6),
             _execCalls(),
+            GovEnvelope.defaultCaps((_envelope(1_000e6)).maxCapital, (_execCalls()).length),
             _settleCalls(),
+            GovEnvelope.defaultCaps((_envelope(1_000e6)).maxCapital, (_settleCalls()).length),
             new ISyndicateGovernor.CoProposer[](0)
         );
         (address p, uint256 amt) = escrow.bondOf(address(governor), pid);
@@ -393,7 +400,9 @@ contract GovernorCoverageGatesTest is Test {
             7 days,
             _envelope(1_000e6),
             _execCalls(),
+            GovEnvelope.defaultCaps((_envelope(1_000e6)).maxCapital, (_execCalls()).length),
             _settleCalls(),
+            GovEnvelope.defaultCaps((_envelope(1_000e6)).maxCapital, (_settleCalls()).length),
             new ISyndicateGovernor.CoProposer[](0)
         );
     }
@@ -409,7 +418,9 @@ contract GovernorCoverageGatesTest is Test {
             7 days,
             _envelope(1_000e6),
             _execCalls(),
+            GovEnvelope.defaultCaps((_envelope(1_000e6)).maxCapital, (_execCalls()).length),
             _settleCalls(),
+            GovEnvelope.defaultCaps((_envelope(1_000e6)).maxCapital, (_settleCalls()).length),
             new ISyndicateGovernor.CoProposer[](0)
         );
         assertEq(unwiredGovernor.getProposal(pid).proposerBondWood, 0);
@@ -425,7 +436,16 @@ contract GovernorCoverageGatesTest is Test {
     function test_propose_collaborativeDraft_bondsAndStaysDraft() public {
         vm.prank(agent);
         uint256 pid = governor.propose(
-            address(vault), address(0), "uri", 7 days, _envelope(1_000e6), _execCalls(), _settleCalls(), _coProposers()
+            address(vault),
+            address(0),
+            "uri",
+            7 days,
+            _envelope(1_000e6),
+            _execCalls(),
+            GovEnvelope.defaultCaps((_envelope(1_000e6)).maxCapital, (_execCalls()).length),
+            _settleCalls(),
+            GovEnvelope.defaultCaps((_envelope(1_000e6)).maxCapital, (_settleCalls()).length),
+            _coProposers()
         );
 
         // Bond locked against the collaborative Draft.
@@ -470,7 +490,16 @@ contract GovernorCoverageGatesTest is Test {
 
         vm.prank(agent);
         uint256 got = governor.propose(
-            address(vault), address(0), "uri", 7 days, _envelope(1_000e6), _execCalls(), _settleCalls(), _coProposers()
+            address(vault),
+            address(0),
+            "uri",
+            7 days,
+            _envelope(1_000e6),
+            _execCalls(),
+            GovEnvelope.defaultCaps((_envelope(1_000e6)).maxCapital, (_execCalls()).length),
+            _settleCalls(),
+            GovEnvelope.defaultCaps((_envelope(1_000e6)).maxCapital, (_settleCalls()).length),
+            _coProposers()
         );
         assertEq(got, pid);
         // The hook really did re-enter (otherwise this test proves nothing).
@@ -501,7 +530,9 @@ contract GovernorCoverageGatesTest is Test {
             7 days,
             _envelope(1_000e6),
             _execCalls(),
+            GovEnvelope.defaultCaps((_envelope(1_000e6)).maxCapital, (_execCalls()).length),
             _settleCalls(),
+            GovEnvelope.defaultCaps((_envelope(1_000e6)).maxCapital, (_settleCalls()).length),
             new ISyndicateGovernor.CoProposer[](0)
         );
 
