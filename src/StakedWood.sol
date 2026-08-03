@@ -384,7 +384,41 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///      below so the shrink comes off the END of the gap and every field
     ///      after it keeps its slot (same convention as
     ///      `_liabilityCheckpoints`).
-    uint256[4] private __gap;
+    ///      Decremented 4 → 3 for `_anchorCheckpoints` (issue #82, ballot
+    ///      growth-gated min), declared immediately below so the shrink comes
+    ///      off the END of the gap and `approvedBindVault` (slot 21) and
+    ///      every field after it keeps its slot (same convention as
+    ///      `_liabilityCheckpoints` / `approvedBindVault` above).
+    uint256[3] private __gap;
+
+    /// @notice Per-guardian history of the `stakedAt` anchor, so a historical
+    ///         `getPastVotes` read can apply `_ageFactorBps` against the
+    ///         anchor AS IT STOOD at the queried timestamp instead of the
+    ///         live one.
+    /// @dev Issue #82. `stakedAt` on `Guardian` is a plain live field with no
+    ///      history of its own; a past `getPastVotes` read used to apply the
+    ///      LIVE anchor, which only ever moves forward — so a later top-up or
+    ///      unstake-request re-anchor could silently deflate an
+    ///      already-past read (the previously-documented "deflation-only
+    ///      drift"). This trace makes historical reads exact instead.
+    ///      Pushed `uint224(g.stakedAt)` at every anchor WRITE site,
+    ///      same-transaction as the existing raw `_stakeCheckpoints` push:
+    ///      first stake (`stakeAsGuardian`'s `wasInactive` branch),
+    ///      top-up re-anchor (`stakeAsGuardian`'s weighted-average branch),
+    ///      and unstake-request re-anchor (`requestUnstakeGuardian`).
+    ///      Deliberately NOT pushed at `cancelUnstakeGuardian` (does not
+    ///      write the anchor — restores `unstakeRequestedAt` and
+    ///      `totalGuardianStake` only), at `claimUnstakeGuardian` (the raw
+    ///      trace already reads 0 from the request instant onward, so any
+    ///      historical read between claim and a re-stake is `0 x f = 0`
+    ///      regardless of the anchor; a subsequent re-stake lands in the
+    ///      `wasInactive` branch and pushes a fresh anchor there), or on any
+    ///      slash path (slashing never writes `stakedAt`).
+    ///      An empty trace (read before a guardian's first ever anchor push)
+    ///      resolves to 0 via `upperLookupRecent`, and `_ageFactorBps(0, ts)`
+    ///      returns `ageFloorBps` — consistent, because the raw checkpoint
+    ///      trace is empty there too, so the product is 0 regardless.
+    mapping(address guardian => Checkpoints.Trace224) internal _anchorCheckpoints;
 
     /// @notice The single vault an address consents to have its PREPARED owner
     ///         stake bound to via `transferOwnerStakeSlot`. Zero = no consent.
@@ -632,6 +666,11 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
         // unstake request.
         _liabilityCheckpoints[msg.sender].push(uint32(block.timestamp), uint224(newTotal));
         _totalStakeCheckpoint.push(uint32(block.timestamp), uint224(totalGuardianStake));
+        // Issue #82: checkpoint the anchor `g.stakedAt` just finalized above
+        // (first-stake or the weighted-average top-up re-anchor, whichever
+        // branch ran) so a historical `getPastVotes` read sees the anchor AS
+        // IT STOOD at the queried timestamp, not the live one.
+        _anchorCheckpoints[msg.sender].push(uint32(block.timestamp), uint224(g.stakedAt));
 
         emit GuardianStaked(msg.sender, amount, agentId);
     }
@@ -645,8 +684,15 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///      ramps from `ageFloorBps` at age 0 to 10_000 (par) at
     ///      `maturationPeriod`, then plateaus — never exceeds raw stake, so
     ///      the raw checkpointed totals remain a valid (conservative) quorum
-    ///      denominator. `ts < stakedAt_` (a past read after a forward
-    ///      re-anchor) saturates to age 0 — drift is deflation-only.
+    ///      denominator. `stakedAt_` is now always the anchor AS OF the
+    ///      queried timestamp (`getPastVotes` resolves it from
+    ///      `_anchorCheckpoints`, issue #82) rather than a live, only-forward
+    ///      field, so `ts < stakedAt_` no longer arises for a historical
+    ///      read: `upperLookupRecent` never returns a checkpoint later than
+    ///      the timestamp it is queried at. The formerly-documented
+    ///      "deflation-only drift" (a forward re-anchor after `ts` silently
+    ///      shrinking an already-past `getPastVotes(g, ts)` read) is removed
+    ///      along with the behaviour that caused it.
     function _ageFactorBps(uint64 stakedAt_, uint256 ts) internal view returns (uint256) {
         if (stakedAt_ == 0) return ageFloorBps; // never staked in this era
         uint256 age = ts > stakedAt_ ? ts - uint256(stakedAt_) : 0;
@@ -663,9 +709,29 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///      (`getPastTotalVotes`, `getPastTotalSupply`) deliberately stay RAW
     ///      — aging only shrinks numerators, so the raw denominator is
     ///      conservative.
+    /// @dev ANCHOR-EXACT HISTORICAL READS (issue #82). The age factor is
+    ///      applied against `_anchorCheckpoints[guardian]` AS OF `timestamp`,
+    ///      not the live `_guardians[guardian].stakedAt` — so a later top-up
+    ///      or unstake-request re-anchor can neither inflate nor deflate an
+    ///      already-past read. At the current timestamp the checkpointed
+    ///      anchor IS the live anchor, so `getVotes` (which delegates here at
+    ///      `block.timestamp`) is bit-identical to before this change. A
+    ///      timestamp before the guardian's first anchor checkpoint reads an
+    ///      empty trace (anchor 0); the raw checkpoint is empty there too, so
+    ///      the product is 0 regardless of `_ageFactorBps(0, ts) ==
+    ///      ageFloorBps`. One qualification carried over unchanged from
+    ///      before this anchor trace existed: `_ageFactorBps` itself still
+    ///      reads the LIVE `ageFloorBps` / `maturationPeriod` parameters, so a
+    ///      historical evaluation uses today's parameter values, exactly as
+    ///      every historical read always has — this is an existing,
+    ///      owner-timelocked exposure the anchor trace does not change either
+    ///      way (see `TokenCourt`'s issue #84 setter-invariant guard, which
+    ///      is what keeps that exposure from opening a floor deadlock for
+    ///      the growth-gated ballot min).
     function getPastVotes(address guardian, uint256 timestamp) public view returns (uint256) {
         uint256 rawOwn = _stakeCheckpoints[guardian].upperLookupRecent(uint32(timestamp));
-        return rawOwn * _ageFactorBps(_guardians[guardian].stakedAt, timestamp) / 10_000;
+        uint64 anchor = uint64(_anchorCheckpoints[guardian].upperLookupRecent(uint32(timestamp)));
+        return rawOwn * _ageFactorBps(anchor, timestamp) / 10_000;
     }
 
     /// @notice A guardian's RAW votable own stake at a past timestamp — the same
@@ -852,6 +918,10 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
         // that is where liability drops.
         _stakeCheckpoints[msg.sender].push(uint32(block.timestamp), 0);
         _totalStakeCheckpoint.push(uint32(block.timestamp), uint224(totalGuardianStake));
+        // Issue #82: the re-anchor above is a `stakedAt` write like any
+        // other — checkpoint it so a historical read at or after the
+        // request sees this anchor, not a later one.
+        _anchorCheckpoints[msg.sender].push(uint32(block.timestamp), uint224(g.stakedAt));
 
         emit GuardianUnstakeRequested(msg.sender, block.timestamp);
     }

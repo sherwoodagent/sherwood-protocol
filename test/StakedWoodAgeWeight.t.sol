@@ -174,4 +174,76 @@ contract StakedWoodAgeWeightTest is Test {
         // the pre-request 10 days being dropped.
         assertEq(swood.getVotes(alice), 100e18);
     }
+
+    // ── issue #82: anchor checkpoint exactness (the mock cannot witness this
+    //    — TokenCourt.t.sol's MockStakedWood has no age-factor model at all,
+    //    so only the REAL contract can prove a historical read is immune to
+    //    a LATER anchor write) ──
+
+    /// @notice A top-up strictly AFTER `ts` must not move `getPastVotes(g,
+    ///         ts)` — the top-up's forward re-anchor (`stakeAsGuardian`'s
+    ///         weighted-average branch) only ever pushes a NEW checkpoint at
+    ///         `block.timestamp`; `upperLookupRecent(ts)` still resolves to
+    ///         the anchor that existed at `ts`. Pre-#82 (live-anchor read),
+    ///         this same top-up would have dragged the read toward age 0.
+    function test_ageWeight_topUpAfterTsDoesNotChangePastRead() public {
+        vm.prank(alice);
+        swood.stakeAsGuardian(100e18, 1);
+        skip(15 days); // age 15d -> factor 2500 + 7500*15/30 = 6250
+        uint256 ts = vm.getBlockTimestamp();
+        uint256 before = swood.getPastVotes(alice, ts);
+        assertEq(before, 62.5e18);
+
+        skip(1 days);
+        vm.prank(alice);
+        swood.stakeAsGuardian(300e18, 1); // top-up: re-anchors the LIVE stakedAt forward
+
+        assertEq(swood.getPastVotes(alice, ts), before, "a later top-up must not change an already-past read");
+    }
+
+    /// @notice An unstake request strictly AFTER `ts` must not move
+    ///         `getPastVotes(g, ts)` either — `requestUnstakeGuardian` also
+    ///         re-anchors `stakedAt` (to the request instant) and zeroes the
+    ///         raw checkpoint, but both writes land at `block.timestamp`, a
+    ///         later instant than `ts`.
+    function test_ageWeight_unstakeRequestAfterTsDoesNotChangePastRead() public {
+        vm.prank(alice);
+        swood.stakeAsGuardian(100e18, 1);
+        skip(10 days); // age 10d -> factor 2500 + 7500*10/30 = 5000
+        uint256 ts = vm.getBlockTimestamp();
+        uint256 before = swood.getPastVotes(alice, ts);
+        assertEq(before, 50e18);
+
+        skip(5 days);
+        vm.prank(alice);
+        swood.requestUnstakeGuardian();
+
+        assertEq(swood.getPastVotes(alice, ts), before, "a later unstake request must not change an already-past read");
+    }
+
+    /// @notice A read at a timestamp strictly before the guardian's first
+    ///         anchor checkpoint sees an empty trace (anchor 0) — and the raw
+    ///         checkpoint trace is empty there too, so the product is 0
+    ///         regardless of `_ageFactorBps(0, ts) == ageFloorBps`.
+    function test_ageWeight_readBeforeFirstStakeReturnsZero() public {
+        uint256 tBefore = vm.getBlockTimestamp();
+        skip(1 days);
+        vm.prank(alice);
+        swood.stakeAsGuardian(100e18, 1);
+        assertEq(swood.getPastVotes(alice, tBefore), 0);
+    }
+
+    /// @notice `getVotes` (the live read, delegating to `getPastVotes` at
+    ///         `block.timestamp`) is bit-identical before and after the
+    ///         anchor-checkpoint change: at the CURRENT timestamp the
+    ///         checkpointed anchor IS the live anchor, so this guards that
+    ///         the historical-exactness fix did not perturb the live path at
+    ///         all.
+    function test_ageWeight_getVotesStaysBitIdenticalToLiveGetPastVotes() public {
+        vm.prank(alice);
+        swood.stakeAsGuardian(100e18, 1);
+        skip(12 days); // factor 2500 + 7500*12/30 = 5500
+        assertEq(swood.getVotes(alice), swood.getPastVotes(alice, block.timestamp));
+        assertEq(swood.getVotes(alice), 100e18 * 5500 / 10_000); // 55e18
+    }
 }

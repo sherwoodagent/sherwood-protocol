@@ -149,11 +149,15 @@ interface ITokenCourt {
     /// @notice `vote` called by an address in the accused set. The accused
     ///         cannot vote on their own verdict.
     error AccusedCannotVote();
-    /// @notice `vote` called by an address whose `getPastVotes` at
-    ///         `snapshotTs` is zero — no aged weight, no ballot. This is a
-    ///         verdict on the past: the address held nothing at the snapshot
-    ///         and there is no remedy — it was never going to be a voter on
-    ///         this case.
+    /// @notice `vote` called by an address whose growth-gated ballot weight
+    ///         (issue #82) is zero — either it had no aged weight at
+    ///         `snapshotTs` at all, or its raw stake grew over the preceding
+    ///         `FLOOR_LOOKBACK` window and its aged weight that far back was
+    ///         zero (`rawThen == 0`, the fresh-whale signature: any raw stake
+    ///         acquired entirely inside the window carries no ballot,
+    ///         regardless of any age-floor multiplier). This is a verdict on
+    ///         the past: there is no remedy — it was never going to be a
+    ///         voter on this case.
     error NoVotingPower();
     /// @notice `vote` called by an address that had weight at `snapshotTs`
     ///         but holds nothing NOW (`getVotes == 0`) — the present-holdings
@@ -204,7 +208,10 @@ interface ITokenCourt {
     event AccusedSetRecorded(uint256 indexed caseId, uint256 count, uint256 accusedWeight);
     /// @notice One vote cast. `weight` is the aged `getPastVotes` amount this
     ///         ballot carried, not a raw stake — the same number `finalize`
-    ///         sums into `guiltyVotes`/`notGuiltyVotes`.
+    ///         sums into `guiltyVotes`/`notGuiltyVotes`. May be a
+    ///         growth-gated min against the caller's aged weight
+    ///         `FLOOR_LOOKBACK` before `snapshotTs` rather than the bare
+    ///         snapshot read — see `vote`'s natspec (issue #82).
     event VoteCast(uint256 indexed caseId, address indexed voter, bool guilty, uint256 weight);
     /// @notice A case resolved. `floor` is logged alongside the tally so an
     ///         `Inconclusive` verdict is explainable from the log alone —
@@ -326,13 +333,19 @@ interface ITokenCourt {
     function refer(uint256 challengeId) external returns (uint256 caseId);
     /// @notice Cast the one vote this address gets on `caseId`.
     /// @dev    Weight is `getPastVotes(msg.sender, case.snapshotTs)` — aged,
-    ///         snapshot-fixed. Reverts outside the open window, for a second
-    ///         vote, for an accused address, for zero snapshot weight
-    ///         (`NoVotingPower`), or for holding nothing at the present
-    ///         instant (`NoPresentHoldings`) — the caller must be an
-    ///         active guardian (present stake, no pending unstake request) at
-    ///         the moment the vote is cast, even though the weight it counts
-    ///         for is the historic one.
+    ///         snapshot-fixed — UNLESS the caller's raw stake grew over the
+    ///         `FLOOR_LOOKBACK` window preceding the snapshot (issue #82), in
+    ///         which case it is the minimum of that snapshot weight and the
+    ///         caller's aged weight `FLOOR_LOOKBACK` earlier; see
+    ///         `TokenCourt.vote`'s implementation natspec for the full
+    ///         growth-gated-min rule, why it gates on raw stake rather than
+    ///         weight, and its documented residuals. Reverts outside the open
+    ///         window, for a second vote, for an accused address, for zero
+    ///         growth-gated weight (`NoVotingPower`), or for holding nothing
+    ///         at the present instant (`NoPresentHoldings`) — the caller must
+    ///         be an active guardian (present stake, no pending unstake
+    ///         request) at the moment the vote is cast, even though the
+    ///         weight it counts for is historic.
     function vote(uint256 caseId, bool guilty) external;
     /// @notice Close the vote window and adjudicate `caseId`.
     /// @dev    Requires the window to have elapsed. `Inconclusive` when

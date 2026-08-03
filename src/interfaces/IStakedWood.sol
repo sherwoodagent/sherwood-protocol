@@ -115,6 +115,14 @@ interface IStakedWood {
     ///         per-account weight is bounded above by raw stake, biasing
     ///         `TokenCourt._participationFloor` too HIGH when the accused are
     ///         freshly staked (favoring an inconclusive result).
+    /// @dev    ANCHOR-EXACT (issue #82): the age factor is evaluated against
+    ///         the `stakedAt` anchor AS IT STOOD at `timestamp`, checkpointed
+    ///         alongside the raw stake, not the live anchor. A top-up or
+    ///         unstake-request re-anchor AFTER `timestamp` can therefore
+    ///         neither inflate nor deflate an already-past read — including
+    ///         the frozen ballots `GuardianRegistry` review votes snapshot at
+    ///         `openedAt`, which previously deflated toward `ageFloorBps` if
+    ///         the same guardian topped up after the review opened.
     function getPastVotes(address guardian, uint256 timestamp) external view returns (uint256);
 
     /// @notice A guardian's RAW votable own stake at a past timestamp — the same
