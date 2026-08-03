@@ -58,7 +58,7 @@ registry that cannot vouch for the adapter has not vouched for it.
 - **THEN** initialization reverts `AdapterNotAllowed` — unreadable is refusal,
   not a skip
 
-### Requirement: The swap adapter binding is immutable after initialization and checked only there
+### Requirement: The swap adapter binding is immutable after initialization; `_execute`/`_settle` check only at init
 
 `swapAdapter` SHALL be written exactly once, in `_initialize`; no
 parameter-update or any other path may change it (`_updateParams` accepts only
@@ -72,11 +72,59 @@ init-time check certifies provenance at binding time; later registry changes
 are handled by governance (veto/guardian review before execute, demotion
 machinery and the emergency path after).
 
+This no-recheck rule is scoped to `_execute`/`_settle` specifically — it does
+NOT extend to `rebalance`/`rebalanceDelta`, which have their own requirement
+below, because blocking those does not carry the same capital-hostage cost.
+
 #### Scenario: Demotion after init does not brick settlement
 - **WHEN** a strategy initialized with an allowlisted adapter has executed, and
   the adapter's allowlist entry is subsequently cleared by a demotion
 - **THEN** `settle()` still runs to completion — the strategy performs no
   allowlist read after initialization
+
+### Requirement: `rebalance` and `rebalanceDelta` re-check the swap adapter allowlist on every call
+
+Unlike `_execute`/`_settle`, `rebalance()` and `rebalanceDelta(bytes[])` SHALL
+call `_requireAllowedAdapter` — the SAME check `_initialize` performs, reused
+unchanged — before doing any swap on every invocation. Both functions are
+`external onlyProposer` and callable an unbounded number of times while the
+strategy sits in `State.Executed`, with no time limit, so a demotion landing
+after execute would otherwise be invisible to them: every subsequent call
+would keep `forceApprove`-ing a de-allowlisted adapter and swapping vault
+capital through it with zero re-validation (Pashov audit finding, PR #165,
+issue #147).
+
+This re-check is FAIL-CLOSED where `_execute`/`_settle` deliberately are not,
+because the cost/benefit is the opposite: blocking a `rebalance`/
+`rebalanceDelta` call strands no capital — no reallocation happens on that
+call, and `settle()` remains the untouched, unchecked exit path either way.
+The settle-time capital-hostage argument that justifies degrading open at
+`_settle` therefore does not apply here, so the ordinary fail-closed default
+governs: a resolved registry that no longer vouches for the adapter SHALL
+revert `AdapterNotAllowed(swapAdapter, registry)`, the same error
+`_initialize` raises. The degrade-open behavior for an UNRESOLVED walk
+(codeless vault, no `governor()`/`tierRegistry()` surface, or a zero
+registry) is UNCHANGED and still applies at these call sites: a vault without
+a wired registry does not newly become unable to rebalance.
+
+#### Scenario: Demoted adapter blocks a later rebalance
+- **WHEN** a strategy initialized and executed with an allowlisted adapter has
+  that adapter's allowlist entry cleared by a demotion, and the proposer then
+  calls `rebalance()`
+- **THEN** the call reverts `AdapterNotAllowed(swapAdapter, registry)` before
+  any swap or state mutation, and `settle()` remains callable and unaffected
+
+#### Scenario: Demoted adapter blocks a later rebalanceDelta
+- **WHEN** the same demotion has occurred and the proposer calls
+  `rebalanceDelta(priceReports)`
+- **THEN** the call reverts `AdapterNotAllowed(swapAdapter, registry)` before
+  any price is verified or swap performed
+
+#### Scenario: Still-allowlisted adapter leaves rebalancing unaffected
+- **WHEN** the bound adapter remains allowlisted (or the walk is unresolved, as
+  in the skip scenarios above)
+- **THEN** `rebalance()` and `rebalanceDelta()` behave exactly as before this
+  change — the live re-check adds no new revert for a legitimate adapter
 
 ### Requirement: Swap slippage tolerance is floored at MIN_SLIPPAGE_BPS
 

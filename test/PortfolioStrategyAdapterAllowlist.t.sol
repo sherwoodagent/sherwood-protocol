@@ -74,11 +74,38 @@ contract MalformedReturnRegistry {
     }
 }
 
+/// @notice Minimal Chainlink push-feed aggregator, local to this file so the
+///         rebalanceDelta happy-path regression test (issue #147) can price a
+///         real allocation. `rebalance()` never calls `_verifyPrice`, and the
+///         demoted-adapter `rebalanceDelta` test reverts before `_verifyPrice`
+///         runs, so only one test in this file ever calls `latestRoundData`.
+contract AllowlistMockAggregator {
+    uint8 public decimals;
+    int256 internal _answer;
+    uint256 internal _updatedAt;
+
+    constructor(uint8 decimals_, int256 answer_, uint256 updatedAt_) {
+        decimals = decimals_;
+        _answer = answer_;
+        _updatedAt = updatedAt_;
+    }
+
+    function latestRoundData() external view returns (uint80, int256, uint256, uint256, uint80) {
+        return (0, _answer, 0, _updatedAt, 0);
+    }
+}
+
 /// @notice Unit tests for the mock vault→governor→registry walk added to
 ///         `PortfolioStrategy._initialize` (issue #147) and the
 ///         `MIN_SLIPPAGE_BPS` floor. No fork dependency — every scenario in
 ///         design.md's "Test and fixture blast radius" ("New tests this
 ///         change owes") is exercised here against mock contracts.
+///
+///         Also covers the Pashov-audit follow-up remediation on issue #147:
+///         `rebalance()`/`rebalanceDelta()` now re-check the bound adapter's
+///         allowlist status live (fail-closed on demotion), distinct from
+///         `_initialize`'s one-shot check and from `_execute`/`_settle`'s
+///         deliberate no-recheck.
 contract PortfolioStrategyAdapterAllowlistTest is Test {
     PortfolioStrategy public template;
     MockSwapAdapter public adapter;
@@ -130,8 +157,107 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
         );
     }
 
+    /// @dev Same single-token push-mode basket as `_initData`, but with a
+    ///      caller-supplied feed address — needed for the rebalanceDelta
+    ///      happy-path test, which (unlike `_initData`'s tsla-as-its-own-feed
+    ///      shortcut) actually calls `latestRoundData()` on the feed.
+    function _initDataWithFeed(uint256 maxSlippageBps_, address feed) internal view returns (bytes memory) {
+        address[] memory tokens = new address[](1);
+        tokens[0] = address(tsla);
+        uint256[] memory weights = new uint256[](1);
+        weights[0] = 10_000;
+        bytes[] memory extra = new bytes[](1);
+        extra[0] = "";
+        uint8[] memory priceDecs = new uint8[](1);
+        priceDecs[0] = 18;
+        bytes32[] memory feedIds = new bytes32[](1);
+        feedIds[0] = bytes32(uint256(uint160(feed)));
+
+        return abi.encode(
+            address(weth),
+            address(adapter),
+            address(0), // push mode
+            tokens,
+            weights,
+            TOTAL_AMOUNT,
+            maxSlippageBps_,
+            extra,
+            priceDecs,
+            feedIds
+        );
+    }
+
     function _clone() internal returns (PortfolioStrategy) {
         return PortfolioStrategy(Clones.clone(address(template)));
+    }
+
+    /// @dev Shared setup for the rebalance/rebalanceDelta live-recheck tests
+    ///      (issue #147 Pashov finding): init + execute against a FULLY
+    ///      RESOLVED vault→governor→registry walk with the adapter
+    ///      allowlisted — same fixture shape as
+    ///      `test_demotionAfterInit_doesNotBrickSettle`, so settle's
+    ///      deliberate no-recheck and rebalance's new recheck are exercised
+    ///      against the same kind of registry. `rebalance()` never calls
+    ///      `_verifyPrice`, so the tsla-as-its-own-feed shortcut in
+    ///      `_initData` is fine here.
+    function _initAndExecuteWithResolvedRegistry(uint256 initSlippageBps)
+        internal
+        returns (PortfolioStrategy strategy, MockTierRegistry registry, MockVaultWithGovernor vault)
+    {
+        registry = new MockTierRegistry();
+        registry.setAllowed(address(adapter), true);
+        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry));
+        vault = new MockVaultWithGovernor(address(governor));
+
+        strategy = _clone();
+        weth.mint(address(vault), TOTAL_AMOUNT);
+        vm.prank(address(vault));
+        weth.approve(address(strategy), type(uint256).max);
+
+        tsla.mint(address(adapter), 1_000_000e18);
+        weth.mint(address(adapter), 1_000_000e18);
+        adapter.setRate(address(weth), address(tsla), 1e18);
+        adapter.setRate(address(tsla), address(weth), 1e18);
+
+        strategy.initialize(address(vault), proposer, _initData(initSlippageBps));
+
+        vm.prank(address(vault));
+        strategy.execute();
+    }
+
+    /// @dev Same as `_initAndExecuteWithResolvedRegistry` but wires a real
+    ///      `AllowlistMockAggregator` as the feed, for the rebalanceDelta
+    ///      happy-path regression test, which DOES reach `_verifyPrice`.
+    function _initAndExecuteWithResolvedRegistryAndAggregator(uint256 initSlippageBps)
+        internal
+        returns (
+            PortfolioStrategy strategy,
+            MockTierRegistry registry,
+            MockVaultWithGovernor vault,
+            AllowlistMockAggregator feed
+        )
+    {
+        registry = new MockTierRegistry();
+        registry.setAllowed(address(adapter), true);
+        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry));
+        vault = new MockVaultWithGovernor(address(governor));
+
+        feed = new AllowlistMockAggregator(18, int256(1e18), block.timestamp);
+
+        strategy = _clone();
+        weth.mint(address(vault), TOTAL_AMOUNT);
+        vm.prank(address(vault));
+        weth.approve(address(strategy), type(uint256).max);
+
+        tsla.mint(address(adapter), 1_000_000e18);
+        weth.mint(address(adapter), 1_000_000e18);
+        adapter.setRate(address(weth), address(tsla), 1e18);
+        adapter.setRate(address(tsla), address(weth), 1e18);
+
+        strategy.initialize(address(vault), proposer, _initDataWithFeed(initSlippageBps, address(feed)));
+
+        vm.prank(address(vault));
+        strategy.execute();
     }
 
     // ── Adapter allowlist: resolved registry ──
@@ -351,6 +477,73 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
         vm.prank(address(vault));
         strategy.settle();
         assertEq(uint256(strategy.state()), uint256(BaseStrategy.State.Settled));
+    }
+
+    // ── rebalance/rebalanceDelta live re-check (Pashov audit, issue #147) ──
+    //
+    // The gap: `_execute`/`_settle` deliberately never re-check the allowlist
+    // (see `test_demotionAfterInit_doesNotBrickSettle` above), but that
+    // reasoning does NOT extend to `rebalance`/`rebalanceDelta` — both are
+    // proposer-callable an unbounded number of times while `Executed`, and
+    // blocking one strands no capital (`settle()` stays reachable either
+    // way). These four tests prove the new fail-closed re-check at both call
+    // sites, plus a regression guard that the happy path is untouched.
+
+    function test_demotedAdapter_rebalance_reverts() public {
+        (PortfolioStrategy strategy, MockTierRegistry registry,) = _initAndExecuteWithResolvedRegistry(SLIPPAGE_100);
+
+        // Demotion after execute clears the allowlist entry for the adapter
+        // this strategy is already bound to.
+        registry.setAllowed(address(adapter), false);
+
+        vm.prank(proposer);
+        vm.expectRevert(
+            abi.encodeWithSelector(PortfolioStrategy.AdapterNotAllowed.selector, address(adapter), address(registry))
+        );
+        strategy.rebalance();
+    }
+
+    function test_demotedAdapter_rebalanceDelta_reverts() public {
+        (PortfolioStrategy strategy, MockTierRegistry registry,) = _initAndExecuteWithResolvedRegistry(SLIPPAGE_100);
+
+        registry.setAllowed(address(adapter), false);
+
+        // The revert fires before any report is consumed (the re-check runs
+        // ahead of `_verifyPrice`), so an empty push-mode report is fine.
+        bytes[] memory reports = new bytes[](1);
+        reports[0] = "";
+
+        vm.prank(proposer);
+        vm.expectRevert(
+            abi.encodeWithSelector(PortfolioStrategy.AdapterNotAllowed.selector, address(adapter), address(registry))
+        );
+        strategy.rebalanceDelta(reports);
+    }
+
+    /// @dev Regression guard: a resolved, still-allowlisted adapter must not
+    ///      be newly blocked by the live re-check.
+    function test_allowlistedAdapter_rebalance_stillSucceeds() public {
+        (PortfolioStrategy strategy,,) = _initAndExecuteWithResolvedRegistry(SLIPPAGE_100);
+
+        vm.prank(proposer);
+        strategy.rebalance();
+        assertEq(uint256(strategy.state()), uint256(BaseStrategy.State.Executed), "rebalance does not change state");
+    }
+
+    /// @dev Regression guard for the delta path, which (unlike `rebalance`)
+    ///      also exercises `_verifyPrice` after the allowlist re-check passes
+    ///      — needs a real aggregator, hence the dedicated fixture.
+    function test_allowlistedAdapter_rebalanceDelta_stillSucceeds() public {
+        (PortfolioStrategy strategy,,,) = _initAndExecuteWithResolvedRegistryAndAggregator(SLIPPAGE_100);
+
+        bytes[] memory reports = new bytes[](1);
+        reports[0] = "";
+
+        vm.prank(proposer);
+        strategy.rebalanceDelta(reports);
+        assertEq(
+            uint256(strategy.state()), uint256(BaseStrategy.State.Executed), "rebalanceDelta does not change state"
+        );
     }
 
     /// @dev Shared setup for the `updateParams` tighten tests: init + execute

@@ -444,6 +444,17 @@ contract PortfolioStrategy is BaseStrategy {
     function rebalance() external onlyProposer {
         if (_state != State.Executed) revert NotExecuted();
         if (_rebalancing) revert RebalancingInProgress();
+        // Live re-check (Pashov audit, issue #147). Unlike `_execute`/
+        // `_settle`'s deliberate one-shot check (see the binding note on
+        // `_initialize`), `rebalance`/`rebalanceDelta` are proposer-callable an
+        // unbounded number of times while `Executed`, with no time limit. A
+        // demotion that lands after execute is otherwise invisible here: every
+        // subsequent call would keep `forceApprove`-ing the demoted adapter
+        // with zero re-validation. Blocking a rebalance strands nothing —
+        // `settle()` remains the untouched exit path either way — so fail
+        // CLOSED here rather than degrade-open. Reuses `_requireAllowedAdapter`
+        // unchanged: same skip-when-unresolved behavior, just a new call site.
+        _requireAllowedAdapter(address(swapAdapter));
         _rebalancing = true;
 
         uint256 len = _allocations.length;
@@ -523,6 +534,9 @@ contract PortfolioStrategy is BaseStrategy {
     function rebalanceDelta(bytes[] calldata priceReports) external onlyProposer {
         if (_state != State.Executed) revert NotExecuted();
         if (_rebalancing) revert RebalancingInProgress();
+        // Live re-check, fail-closed on demotion — see the identical guard on
+        // `rebalance()` above for the full rationale (issue #147).
+        _requireAllowedAdapter(address(swapAdapter));
         _rebalancing = true;
 
         uint256 len = _allocations.length;
@@ -734,6 +748,15 @@ contract PortfolioStrategy is BaseStrategy {
     ///      vouched for it. Every hop is a length-checked raw staticcall so a
     ///      codeless or hostile target reads as unresolved rather than
     ///      reverting some unrelated deployment.
+    ///
+    ///      Called from THREE sites, each with different intent:
+    ///        - `_initialize`: certifies provenance once, at binding time.
+    ///        - `rebalance` / `rebalanceDelta` (issue #147 Pashov finding):
+    ///          re-certifies on every call, since these are proposer-callable
+    ///          an unbounded number of times post-execute with no time limit,
+    ///          and — unlike settle — blocking one strands no capital.
+    ///      `_execute`/`_settle` deliberately do NOT call this: see the
+    ///      capital-hostage rationale on the `_initialize` binding note.
     function _requireAllowedAdapter(address swapAdapter_) private view {
         address governor_ = _readAddress(vault(), abi.encodeCall(ITierBindingPath.governor, ()));
         if (governor_ == address(0)) return;

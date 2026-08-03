@@ -142,3 +142,23 @@ through a pipe).
   and approve it via `StrategyFactory` (existing clones keep old code and
   semantics forever; no migration), and owners must `setAdapterAllowed` each
   Portfolio swap adapter before proposers can init against it.
+
+- [ ] 11. **Pashov audit remediation on PR #165** (issue #147 follow-up; see
+  design.md section 7 and the new `portfolio-strategy` spec requirement).
+  Scope: `src/strategies/PortfolioStrategy.sol`,
+  `test/PortfolioStrategyAdapterAllowlist.t.sol`, and this change's docs only
+  — not a broader refactor.
+  - Add `_requireAllowedAdapter(address(swapAdapter))` as the first thing
+    `rebalance()` and `rebalanceDelta(bytes[])` do (ahead of the
+    `_rebalancing` flip and any `forceApprove`), reusing the existing
+    private helper unchanged — no new allowlist logic, only two new call
+    sites. Fail-closed on a resolved-but-demoted adapter; degrade-open on an
+    unresolved walk is unchanged (same as decision 2's table).
+  - New tests: demoted adapter reverts `AdapterNotAllowed` from `rebalance()`;
+    same from `rebalanceDelta()`; both still succeed unchanged when the
+    adapter remains allowlisted (regression guard).
+  - `forge build`, `forge test --match-path
+    "test/PortfolioStrategyAdapterAllowlist.t.sol"`, `forge test --match-path
+    "test/PortfolioStrategy.t.sol"` (regression guard on the existing
+    happy-path rebalance/rebalanceDelta suites), `forge fmt --check src/
+    test/`, `openspec validate portfolio-swap-adapter-allowlist --strict`.

@@ -85,7 +85,11 @@ clone lifetime, in an already six-figure-gas init — negligible.
 
 ## 3. Init-time only, or re-checked at execute/settle?
 
-**Init-time only.** Three reasons, in descending force:
+**Init-time only for `_execute`/`_settle`.** (Amended by a Pashov-audit
+follow-up, issue #147: `rebalance`/`rebalanceDelta` DO get a live re-check —
+see section 7. The reasoning below is specific to `_execute`/`_settle`, whose
+capital-hostage risk `rebalance`/`rebalanceDelta` do not share.) Three
+reasons, in descending force:
 
 1. **A settle-time re-check is a capital hostage.** After `_execute`, the
    vault's capital lives in the strategy as basket tokens. If a demotion (which
@@ -213,3 +217,48 @@ unresolved walk (codeless vault / getterless governor / zero registry) skips;
 resolved-but-unreadable registry fails closed; init below the floor refused;
 tighten below the floor refused; zero sentinel still means keep-current;
 demotion after init does not affect an executed strategy's settle.
+
+## 7. Pashov audit follow-up: `rebalance`/`rebalanceDelta` need their own live re-check (issue #147)
+
+The Pashov audit on PR #165 flagged that decision 3's "init-time only"
+reasoning does not automatically extend past `_execute`/`_settle`. It was
+right: `rebalance()` and `rebalanceDelta()` are both `external onlyProposer`,
+callable an UNBOUNDED number of times while the strategy sits in
+`State.Executed`, with no time limit — nothing like settle's single
+irreversible step. Without a re-check, a demotion that lands after execute
+(the adapter is later found compromised, via `_demote`/`demoteByChallenge`)
+is invisible to either function: every subsequent call keeps
+`forceApprove`-ing the demoted adapter and swapping vault capital through it,
+with zero re-validation, for as long as the proposer keeps calling.
+
+**The cost/benefit is the opposite of decision 3's, because the capital-hostage
+risk isn't there.** Decision 3 keeps `_settle` unchecked because a settle-time
+revert stub would strand the vault's capital as basket tokens, recoverable
+only through the emergency path — a real, load-bearing cost. Blocking a
+`rebalance()`/`rebalanceDelta()` call has no equivalent cost: it just means no
+reallocation happens on that call. The capital stays exactly where it already
+is (as basket tokens, mid-strategy) and `settle()` remains the untouched exit
+path either way, since `_settle` still performs no allowlist read. So the one
+reason decision 3 gives for degrading open at settle does not apply here, and
+the ordinary fail-closed default should govern instead.
+
+**Fix:** both functions now open with
+`_requireAllowedAdapter(address(swapAdapter))` — the SAME private helper
+`_initialize` calls, unchanged, at a new pair of call sites, before either
+function's first `forceApprove`. This means:
+- Same skip-on-unresolved behavior (decision 2's degrade-open table) is
+  preserved: a vault without a wired registry doesn't newly become unable to
+  rebalance — that would be a liveness regression unrelated to this finding.
+- Same fail-closed behavior when the registry IS resolved and the adapter is
+  demoted — `AdapterNotAllowed(swapAdapter, registry)`, the identical error
+  `_initialize`'s check raises, so callers/tooling get one error shape for
+  "this adapter isn't vouched for" regardless of which entry point tripped it.
+- Placed ahead of the `_rebalancing` reentrancy-guard flip and any state
+  mutation in both functions, so a reverted re-check leaves no partial state.
+
+**What's still true from decision 3, unchanged:** `_execute`/`_settle`
+continue to perform NO allowlist read after init — this finding does not
+reopen that question. The spec requirement "the swap adapter binding is ...
+checked only [at init]" (section on `_execute`/`_settle`) is narrowed by this
+follow-up to describe execute/settle specifically; `rebalance`/`rebalanceDelta`
+get their own requirement (see the `portfolio-strategy` spec delta).
