@@ -1350,17 +1350,12 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         address vault = proposal.vault;
         address asset = IERC4626(vault).asset();
 
-        // Asset-only measurement (see NatSpec above). PnL is the realized float
-        // delta minus the interim LP net flow: Lane A deposits and instant
-        // exits during the proposal move the vault's float but are principal,
-        // not strategy performance, so charging fees on them would be wrong.
-        // The vault resets the accumulator in `onProposalSettled` (called below,
-        // after fees).
+        // Asset-only measurement (see NatSpec above).
         // forge-lint: disable-next-line(unsafe-typecast)
         uint256 snapshot = _capitalSnapshots[proposalId];
         // forge-lint: disable-next-line(unsafe-typecast)
         uint256 balanceAdjusted = IERC20(asset).balanceOf(vault);
-        pnl = int256(balanceAdjusted) - int256(snapshot) - ISyndicateVault(vault).interimNetFlow();
+        pnl = int256(balanceAdjusted) - int256(snapshot);
 
         // Finalize state before external transfers to prevent reentrancy on stale state
         _activeProposal = 0;
@@ -1489,24 +1484,8 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // and would cost `propose` a stack slot it does not have.
         uint256 rateBps = ISyndicateVault(vault).managementFeeBps();
 
-        // The fee owed for the WHOLE proposal, including the time exiters'
-        // capital was present — the accumulator kept ticking on it.
+        // The fee owed for the WHOLE proposal.
         mgmtFee = (assetSeconds * rateBps) / (BPS_DENOMINATOR * 365 days);
-
-        // Releases what instant exiters already paid: the figure above still
-        // contains the exiters' share, so paying out the full amount is
-        // funded partly from their parked contribution rather than entirely
-        // from the fund. Releasing raises `totalAssets()` by exactly that
-        // contribution, so depositors who stayed bear only
-        // `mgmtFee - crystallized`. (The performance leg needs no
-        // equivalent: exited shares are burned, so they are absent from its
-        // base by construction.)
-        uint256 crystallized = ISyndicateVault(vault).consumeCrystallizedMgmt();
-        if (crystallized > mgmtFee) {
-            // Rounding only — the parked amount is a pro-rata slice of the same
-            // accrual. Pay out what was actually collected.
-            mgmtFee = crystallized;
-        }
 
         if (mgmtFee == 0) return 0;
 
@@ -1554,17 +1533,16 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      base first would charge performance on assets already taken.
     /// @return agentFee The agent's slice, reported for the settle event.
     /// @return perfFee  The whole fee charged.
-    /// @param chargeNew Currently always `true`; the parameter survives
-    ///        because the function must still run when it is conceptually
-    ///        "false" for a reason unrelated to the deleted self-managed-fees
-    ///        exemption: fees already crystallized from instant exiters must
-    ///        be released and paid — skipping the call entirely would strand
-    ///        them in the vault forever, permanently excluded from
-    ///        `totalAssets()` and therefore lost to depositors. Re-evaluate
-    ///        once #54 (Lane A crystallization retirement) removes
-    ///        `consumeCrystallizedPerf` — at that point this parameter is
-    ///        plausibly vacuous and removable, but that is #54's
-    ///        determination, not this change's.
+    /// @param chargeNew Always `true` as of both #151 (deleted the
+    ///        `selfManagesFees` opt-out that used to pass `false`) and #54
+    ///        (deleted `consumeCrystallizedPerf`, the other reason a `false`
+    ///        call still had to run — releasing fees already crystallized
+    ///        from Lane A instant exiters). Both original reasons for this
+    ///        parameter to exist are now gone, so it is provably vacuous —
+    ///        this is #54's determination, per #151's own note deferring it.
+    ///        NOT removed here: filed as a follow-up on #151 rather than
+    ///        folded into this change, to keep this PR's diff to Lane A
+    ///        retirement only.
     function _chargePerformanceFee(uint256 proposalId, address vault, address asset, address proposer, bool chargeNew)
         internal
         returns (uint256 agentFee, uint256 perfFee)
@@ -1574,11 +1552,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // Profit measured against the fund's previous peak, not against this
         // proposal's own starting balance — a fund that fell and recovered has
         // already paid for this ground.
-        //
-        // Read BEFORE releasing the parked performance fees: those assets sit
-        // in the vault but already belong to the recipients, and releasing them
-        // raises `totalAssets()` and therefore the price per share. Reading
-        // after would charge a performance fee on money the fund does not own.
         uint256 base = chargeNew ? ISyndicateVault(vault).aboveHighWaterMark() : 0;
 
         if (base > 0) {
@@ -1588,10 +1561,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             uint256 perfFeeBps = _clampPerformanceFee(proposalId, prop.performanceFeeBps, _params.maxPerformanceFeeBps);
             perfFee = (base * perfFeeBps) / BPS_DENOMINATOR;
         }
-
-        // Now safe to release: whatever instant exiters already paid is
-        // distributed on top of what settlement charges the stayers.
-        perfFee += ISyndicateVault(vault).consumeCrystallizedPerf();
 
         IProtocolConfig.PerfSplit memory s = prop.snapshotPerfSplit;
         // A zero-sum split is unreachable for a real config; skipping beats

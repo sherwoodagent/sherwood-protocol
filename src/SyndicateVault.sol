@@ -8,8 +8,6 @@ import {IProposalStatus} from "./interfaces/IProposalStatus.sol";
 import {FeeConstants} from "./FeeConstants.sol";
 import {ISyndicateFactory} from "./interfaces/ISyndicateFactory.sol";
 import {IVaultWithdrawalQueue} from "./interfaces/IVaultWithdrawalQueue.sol";
-import {IPriceRouter} from "./interfaces/IPriceRouter.sol";
-import {IStrategy} from "./interfaces/IStrategy.sol";
 import {BatchExecutorLib} from "./BatchExecutorLib.sol";
 import {SyndicateVaultAdminLib} from "./SyndicateVaultAdminLib.sol";
 import {ERC4626Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/ERC4626Upgradeable.sol";
@@ -92,9 +90,6 @@ contract SyndicateVault is
 
     /// @notice Cap on the owner-set idle-liquidity floor (50%).
     uint256 private constant MAX_MIN_BUFFER_BPS = 5_000;
-
-    /// @notice Cap on the early-exit penalty (2%).
-    uint256 public constant MAX_INSTANT_EXIT_FEE_BPS = 200;
 
     // ── Value-moving ERC20 selectors guarded in governor batches ──
     // (see `_guardBatchCalls`)
@@ -209,13 +204,6 @@ contract SyndicateVault is
     /// @notice Per-vault async withdrawal queue (set-once at deploy by the factory).
     address private _withdrawalQueue;
 
-    /// @notice Lane A (instant) per-holder lockup: the proposal id whose Lane A
-    ///         entry locked this holder's shares. The holder cannot exit (Lane A
-    ///         redeem or Lane B requestRedeem) while that proposal is still the
-    ///         active one — closes the deposit-low / exit-high intra-proposal MEV.
-    ///         Cleared implicitly when the proposal settles (active != pid).
-    mapping(address holder => uint256 pid) private _laneALockPid;
-
     /// @notice Vault-owner-set agent performance fee, stored offset-by-one so a
     ///         single slot doubles as the "is it set?" flag: 0 = never set →
     ///         `agentFeeBps()` returns `FeeConstants.DEFAULT_AGENT_FEE_BPS` (5%);
@@ -235,22 +223,6 @@ contract SyndicateVault is
     ///      the EIP-170 runtime size limit. Storage slot/type reserved for
     ///      future instant-exit logic.
     uint32 internal minHoldingPeriod;
-
-    /// @notice Early-exit penalty on a Lane A instant exit, in basis points of
-    ///         the portion that had to be pulled back from the strategy.
-    /// @dev Accrues to the VAULT — the depositors who stay — not to any fee
-    ///      recipient. It is an anti-mercenary redemption term compensating
-    ///      them for the forced unwind, not revenue, which is why it is
-    ///      deliberately NOT excluded from `totalAssets()` the way crystallized
-    ///      fees are. Packs into the slot above (16 + 32 + 16 bits), so the
-    ///      linear layout is unchanged and no `__gap` slot is consumed.
-    uint16 public instantExitFeeBps;
-
-    /// @notice Net LP asset flow (deposits − instant exits) accumulated while
-    ///         the current proposal is active. Read by the governor at
-    ///         settlement so mid-proposal flows don't corrupt strategy PnL;
-    ///         reset in `onProposalSettled`.
-    int256 private _interimNetFlow;
 
     /// @notice Timestamp of each account's most recent instant deposit
     ///         (receiver-side). Gates instant exit via `minHoldingPeriod`.
@@ -286,19 +258,12 @@ contract SyndicateVault is
     ///         falls and recovers is not charged twice on the same dollars.
     uint256 private _highWaterPricePerShare;
 
-    /// @notice Management fee already collected from exiting shares on the Lane
-    ///         A instant path, awaiting distribution at the next settlement.
-    ///         Netted out of the settlement charge so nothing is billed twice.
-    uint128 private _crystallizedMgmt;
-
-    /// @notice Performance fee already collected from exiting shares, same
-    ///         deferral. Excluded from `totalAssets()` alongside the above, so
-    ///         retaining it does not move the remaining holders' share price.
-    uint128 private _crystallizedPerf;
-
     /// @dev Reserved storage for future upgrades. Shrinks whenever a new state
-    ///      variable is added above.
-    uint256[28] private __gap;
+    ///      variable is added above. Grown from 28 → 31 slots: this deletion
+    ///      frees `_laneALockPid` (1), `_interimNetFlow` (1), and
+    ///      `_crystallizedMgmt`+`_crystallizedPerf` (1, shared) — legal only
+    ///      because no vault proxy is live (see design.md "Deployment reality").
+    uint256[31] private __gap;
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -617,8 +582,8 @@ contract SyndicateVault is
     ///
     ///      SCOPE: exactly two addresses — the vault and its bound queue. NOT a
     ///      target allowlist. Strategy adapters' own `onlyVault` entrypoints
-    ///      (`BaseStrategy.execute/settle/withdrawTo`) are the LEGITIMATE batch
-    ///      surface and stay open, bounded by Part 2, the outflow meter and tier
+    ///      (`BaseStrategy.execute/settle`) are the LEGITIMATE batch surface
+    ///      and stay open, bounded by Part 2, the outflow meter and tier
     ///      pricing as before.
     ///
     ///      ── PART 1b: transferFrom SOURCE guard (LP-ALLOWANCE CONFISCATION) ──
@@ -1040,15 +1005,14 @@ contract SyndicateVault is
 
     /// @dev Reads the active proposal's strategy through the governor's scalar
     ///      `strategyOf` getter. Returns `address(0)` when no proposal is active
-    ///      OR when the active proposal opted out of live NAV (proposer passed
-    ///      `strategy=0`). Still wrapped in try/catch: a simple `address` return
-    ///      says nothing about EXISTENCE. The vault is a UUPS proxy and the
-    ///      governor is a BEACON proxy — they upgrade on independent paths, so a
-    ///      vault impl that calls `strategyOf` can go live before the governor
-    ///      beacon carries it, and the call then reverts with no data.
-    ///      `_activeStrategy` feeds `_laneState`, hence `maxWithdraw`/
-    ///      `maxRedeem`, so an uncaught revert here is a vault-wide brick
-    ///      rather than a degradation.
+    ///      OR when the active proposal opted out (proposer passed `strategy=0`).
+    ///      Still wrapped in try/catch: a simple `address` return says nothing
+    ///      about EXISTENCE. The vault is a UUPS proxy and the governor is a
+    ///      BEACON proxy — they upgrade on independent paths, so a vault impl
+    ///      that calls `strategyOf` can go live before the governor beacon
+    ///      carries it, and the call then reverts with no data. Only consumer
+    ///      today is `activeStrategyAdapter()`, an off-chain-facing view — an
+    ///      uncaught revert here would brick that view rather than degrade it.
     function _activeStrategy() internal view returns (address) {
         address gov = _getGovernor();
         if (gov == address(0)) return address(0);
@@ -1067,9 +1031,6 @@ contract SyndicateVault is
     }
 
     /// @inheritdoc ISyndicateVault
-    /// @dev `public` rather than `external`: `_exitFees` reads it internally to
-    ///      price an instant exiter's performance fee at the same rate
-    ///      settlement would charge.
     function agentFeeBps() public view returns (uint256) {
         // One SLOAD: 0 = never set → the 5% default (agent never silently
         // unpaid); otherwise the stored value is fee+1, so an explicit 0%
@@ -1094,28 +1055,13 @@ contract SyndicateVault is
         emit MinBufferUpdated(bps);
     }
 
-    /// @inheritdoc ISyndicateVault
-    function setInstantExitFeeBps(uint16 bps) external onlyOwner {
-        if (bps > MAX_INSTANT_EXIT_FEE_BPS) revert InstantExitFeeTooHigh();
-        instantExitFeeBps = bps;
-        emit InstantExitFeeUpdated(bps);
-    }
-
     // ==================== OVERRIDES ====================
 
     /// @dev Resolve diamond between ERC20Upgradeable and ERC20VotesUpgradeable.
-    ///      A Lane-A-locked holder cannot move shares out until the proposal
-    ///      settles. Without this the per-holder lock is trivially bypassed by
-    ///      transferring to a fresh (unlocked) address that then instant-redeems
-    ///      at the higher mid-proposal NAV. Mint (`from == 0`) and burn
-    ///      (`to == 0`) are unaffected — burns are gated by `maxRedeem` /
-    ///      `requestRedeem`. `_isLaneALocked` short-circuits on
-    ///      `_laneALockPid[from] == 0`, so non-Lane-A holders pay only an SLOAD.
     function _update(address from, address to, uint256 value)
         internal
         override(ERC20Upgradeable, ERC20VotesUpgradeable)
     {
-        if (from != address(0) && to != address(0) && _isLaneALocked(from)) revert SharesLocked();
         super._update(from, to, value);
         // AUTO-DELEGATE ON EVERY RECEIPT. Runs AFTER `super._update` so the
         // recipient's post-receipt balance is what checkpoints. Holders that
@@ -1179,69 +1125,6 @@ contract SyndicateVault is
         return IProposalStatus(_getGovernor()).openProposalCount() != 0;
     }
 
-    /// @dev Protocol PriceRouter (Lane A live-NAV), read live from the factory.
-    ///      `address(0)` (unset) ⇒ Lane A off — the vault shows float-only NAV
-    ///      and routes mid-proposal flow to the async (Lane B) queue.
-    function _getPriceRouter() internal view returns (address) {
-        return ISyndicateFactory(_factory).priceRouter();
-    }
-
-    /// @dev The single home of the lane-eligibility rule: everything the
-    ///      instant lane needs to decide "can LPs enter/exit at live NAV right
-    ///      now" in one derivation.
-    ///        locked  — an active proposal binds the vault (Executed window)
-    ///        strat   — the active strategy IF pullable: nonzero AND has code.
-    ///                  Codeless is zeroed here because a high-level call to a
-    ///                  codeless address reverts on the extcodesize check
-    ///                  BEFORE try/catch can trap it (would brick maxWithdraw).
-    ///        liveNav — the strategy's positions priced vault-side by the
-    ///                  PriceRouter (never the strategy's self-report)
-    ///        laneA   — instant lane open: locked AND the router proves every
-    ///                  position instant-eligible. Fail-closed: any missing
-    ///                  precondition or router failure ⇒ laneA=false, liveNav=0.
-    ///      Every lane predicate (`_laneBOnly`, `totalAssets`, `_deposit`,
-    ///      `_strategyLiquidity`, `_pullFromStrategy`) consumes this — a new
-    ///      gating condition (e.g. minHoldingPeriod) lands here once, not
-    ///      threaded through five predicates. Stack tuple (not a
-    ///      struct) deliberately: a memory struct costs ~130 bytes of zero-init
-    ///      + copies across the call sites — over the EIP-170 budget.
-    function _laneState() private view returns (bool locked, address strat, uint256 liveNav, bool laneA) {
-        locked = redemptionsLocked();
-        if (!locked) return (locked, strat, liveNav, laneA);
-        address active = _activeStrategy();
-        if (active == address(0)) return (locked, strat, liveNav, laneA);
-        // Pullable only with code (extcodesize revert on a codeless address
-        // escapes try/catch and would brick maxWithdraw/maxRedeem); Lane A
-        // pricing itself is the router's call.
-        if (active.code.length != 0) strat = active;
-        address pr = _getPriceRouter();
-        if (pr == address(0)) return (locked, strat, liveNav, laneA);
-        try IPriceRouter(pr).valueStrategy(active) returns (uint256 v, bool ok) {
-            if (ok) {
-                liveNav = v;
-                laneA = true;
-            }
-        } catch {} // fail-closed: laneA stays false
-    }
-
-    /// @dev True while `holder`'s shares are Lane-A-locked — a Lane A entry made
-    ///      during the currently-active proposal. The lock lifts implicitly when
-    ///      that proposal settles (the active proposal id changes / clears), so
-    ///      no timestamp bookkeeping is needed. Bounds the deposit-low / exit-high
-    ///      intra-proposal arb for both Lane A redeem and Lane B requestRedeem.
-    function _isLaneALocked(address holder) private view returns (bool) {
-        uint256 p = _laneALockPid[holder];
-        return p != 0 && p == _activePid();
-    }
-
-    /// @dev Shared instant-exit gate for `maxWithdraw` / `maxRedeem`: an exit
-    ///      must route through the Lane B queue when the vault is locked without
-    ///      a Lane A live-NAV term, or while the holder is under the per-holder lockup.
-    function _laneBOnly(address owner_) private view returns (bool) {
-        (bool locked,,, bool laneA) = _laneState();
-        return (locked && !laneA) || _isLaneALocked(owner_);
-    }
-
     /// @dev Float available for instant exits = vault asset balance minus the
     ///      queue's reserved (already-settled, unclaimed) redeem float. Shared by
     ///      `maxWithdraw` / `maxRedeem`. Floors at 0 when float < reserve.
@@ -1249,43 +1132,6 @@ contract SyndicateVault is
         uint256 reserve = reservedQueueAssets();
         uint256 float = IERC20(asset()).balanceOf(address(this));
         return float > reserve ? float - reserve : 0;
-    }
-
-    /// @dev On-demand liquidity the active strategy can return mid-lifecycle,
-    ///      counted toward instant-exit capacity ONLY while Lane A is available
-    ///      (no pricing ⇒ no instant exit, regardless of serviceability).
-    ///      try/catch + fail-to-0 so a strategy without the interface can never
-    ///      brick `maxWithdraw` / `maxRedeem`.
-    function _strategyLiquidity() private view returns (uint256) {
-        // `strat` is already zeroed for a codeless strategy (see _laneState);
-        // try/catch still guards a coded strat that reverts or lacks the selector.
-        (, address strat,, bool laneA) = _laneState();
-        if (!laneA || strat == address(0)) return 0;
-        try IStrategy(strat).availableLiquidity() returns (uint256 l) {
-            return l;
-        } catch {
-            return 0;
-        }
-    }
-
-    /// @dev Pull `shortfall` of the vault asset from the active strategy for an
-    ///      in-flight instant exit. All-or-revert: delivery is verified by
-    ///      balance-diff so a lying `availableLiquidity` cannot under-fund the
-    ///      exit. Reverts `QueueReserveBreached` when there is no pullable
-    ///      strategy (preserves the pre-existing error surface for float-only
-    ///      exits).
-    /// @dev `strat`/`laneA` are the CALLER'S already-hoisted `_laneState()`
-    ///      snapshot (issue #100), not re-derived here — a second internal
-    ///      read would defeat the whole point of hoisting it in `_withdraw`.
-    ///      `strat` is zeroed for a codeless strategy (defense-in-depth on
-    ///      this fund-moving path; unreachable honestly — maxWithdraw caps at
-    ///      float when strategy liquidity is 0).
-    function _pullFromStrategy(uint256 shortfall, address strat, bool laneA) private {
-        if (strat == address(0) || !laneA) revert QueueReserveBreached();
-        IERC20 asset_ = IERC20(asset());
-        uint256 balBefore = asset_.balanceOf(address(this));
-        IStrategy(strat).withdrawTo(shortfall);
-        if (asset_.balanceOf(address(this)) < balBefore + shortfall) revert UnwindShortfall();
     }
 
     /// @dev Closed-deposit gate: reverts unless deposits are open OR `who` is
@@ -1311,36 +1157,19 @@ contract SyndicateVault is
     // still blocked by `_deposit`'s nonReentrant latch.
 
     /// @inheritdoc ERC4626Upgradeable
-    /// @dev V2 live-NAV redesign: the vault never trusts a strategy's
-    ///      self-reported value. NAV is the idle float PLUS, only when Lane A is
-    ///      available, the active strategy's positions priced vault-side by the
-    ///      PriceRouter (`_laneState`). When Lane A is unavailable the live term is
-    ///      0, so during a proposal the vault shows float-only and mid-flight LP
-    ///      flow goes through the async queue, settling at the realized price.
-    /// @dev Crystallized fees are physically in the vault's balance but are no
-    ///      longer the fund's money — they belong to the split recipients and
-    ///      are paid out at the next settlement. Excluding them here is what
-    ///      makes an instant exit invisible to the holders who stay: their
-    ///      price per share is the same before and after, and the payout at
-    ///      settle moves nothing. Since price per share, the high-water mark
-    ///      and the management-fee base ALL read this function, the exclusion
-    ///      has to live here and only here.
+    /// @dev Idle float minus the queue reserve, floored at zero (issue #92).
+    ///      `stampSettlement` froze the reserved assets against a `num/den`
+    ///      that can no longer move, so they are owed in a fixed amount and are
+    ///      no longer part of what a residual share is a claim on.
+    ///
+    ///      NEVER ALONE. The matching shares must leave the pricing supply in
+    ///      the same breath — see `_pricingSupply`. Subtracting assets without
+    ///      their shares would understate the price as badly as double-counting
+    ///      them would overstate it.
     function totalAssets() public view override returns (uint256) {
-        (,, uint256 liveNav,) = _laneState();
-        uint256 gross = IERC20(asset()).balanceOf(address(this)) + liveNav;
-        // THREE KINDS OF CLAIM, ALL SUBTRACTED. Crystallized fees are money the
-        // vault holds but no longer owns. The queue reserve is the same kind of
-        // claim and is subtracted for the same reason: `stampSettlement` froze
-        // those assets against a `num/den` that can no longer move, so they are
-        // owed in a fixed amount and are no longer part of what a residual share
-        // is a claim on (issue #92).
-        //
-        // NEVER ALONE. The matching shares must leave the pricing supply in the
-        // same breath — see `_pricingSupply`. Subtracting assets without their
-        // shares would understate the price as badly as the original blend
-        // overstated it.
-        uint256 owed = uint256(_crystallizedMgmt) + _crystallizedPerf + reservedQueueAssets();
-        // Cannot legitimately underflow — the counters track assets the vault
+        uint256 gross = IERC20(asset()).balanceOf(address(this));
+        uint256 owed = reservedQueueAssets();
+        // Cannot legitimately underflow — the reserve tracks assets the vault
         // holds — but under-reporting beats inventing value if it ever did.
         return gross > owed ? gross - owed : 0;
     }
@@ -1411,23 +1240,17 @@ contract SyndicateVault is
         return maxDeposit(receiver);
     }
 
-    /// @dev Instant deposit is allowed outside any open proposal, OR during an
-    ///      Executed proposal when Lane A live-NAV is available (positions priced
-    ///      vault-side by the PriceRouter). Otherwise it reverts and LPs use the
-    ///      async deposit queue (`requestDeposit`), entering at the realized
-    ///      settle price. Auto-delegate to self so shareholders get voting power.
+    /// @dev Instant deposit is allowed only outside an open proposal. During an
+    ///      open proposal (Pending..Executed) it reverts and LPs use the async
+    ///      deposit queue (`requestDeposit`), entering at the realized settle
+    ///      price. Auto-delegate to self so shareholders get voting power.
     function _deposit(address caller, address receiver, uint256 assets, uint256 shares)
         internal
         override
         whenNotPaused
         nonReentrant
     {
-        (,,, bool laneA) = _laneState();
-        // During an open proposal (Pending..Executed) instant deposits are
-        // closed unless Lane A is live — a depositor mid-lifecycle would
-        // otherwise be pulled into a strategy they never voted on, or mint
-        // against an unrealized NAV.
-        if (_depositsLocked() && !laneA) revert DepositsLocked();
+        if (_depositsLocked()) revert DepositsLocked();
         _requireApprovedDepositor(receiver);
         super._deposit(caller, receiver, assets, shares);
         // The fund's first shares establish the high-water mark. Cannot be done
@@ -1435,30 +1258,6 @@ contract SyndicateVault is
         _initHighWaterMarkIfUnset();
 
         // Auto-delegation happens in `_update` (every receipt path).
-
-        // A Lane A entry locks the receiver's shares until this proposal
-        // settles — closes the deposit-low / exit-high intra-proposal MEV.
-        //
-        // `shares != 0` GUARDS THE LATCH (issue #99). Without it, ANYONE could
-        // call `deposit(0, victim)` — no approval from the victim, no shares
-        // of their own, nothing transferred at all (`previewDeposit(0) == 0`,
-        // a zero-value `safeTransferFrom`/`_mint` both succeed trivially) —
-        // and freeze an existing, approved holder who deposited NOTHING this
-        // round out of `test_instantWithdraw_duringLaneA_existingHolder`'s
-        // exact guarantee: instant-exiting at live NAV during Lane A. The
-        // check is on `receiver`, never `msg.sender`, so the griefer need not
-        // hold a single share.
-        if (laneA && shares != 0) {
-            _laneALockPid[receiver] = _activePid();
-            // Mid-proposal principal in — excluded from settlement PnL so
-            // performance fees are never charged on depositor principal.
-            _interimNetFlow += int256(assets);
-            // The management fee IS charged on it, for the time it is present:
-            // close the interval at the old base, restamp at the new one. A late
-            // depositor therefore pays only for the days their capital was in
-            // the fund.
-            _accrueManagementFee();
-        }
     }
 
     /// @dev `maxWithdraw` / `maxRedeem` are the canonical lock gate (OZ ERC4626
@@ -1473,70 +1272,16 @@ contract SyndicateVault is
         whenNotPaused
         nonReentrant
     {
-        // ONE snapshot, before `_pullFromStrategy` can move anything (issue
-        // #100). `previewRedeem`/`previewWithdraw` already deducted
-        // `_exitFees(shares)` from `assets` using state read before this call
-        // even started — so the crystallization below MUST price against
-        // that SAME instant, not a fresh one taken after the pull. Re-reading
-        // `_laneState()`/`totalAssets()`/`pricePerShare()` post-pull is
-        // unsound in TWO ways, not one: many real single-position strategies
-        // (one Uniswap V3 NFT range, one Aave supply position) cannot
-        // service a partial withdrawal without fully unwinding, so a pull of
-        // ANY size can empty `positions()` and flip `PriceRouter.valueStrategy`
-        // to `(0, false)` mid-call. A fresh `_laneState()` read at that point
-        // would (1) skip crystallizing the fee entirely, since the gate
-        // reads false — the fee is gone, not booked; and, more subtly, (2)
-        // even a partial flip (the router still reporting SOME reduced
-        // value) would price the gain base against a `totalAssets()` that
-        // silently dropped the strategy's live contribution, undercharging
-        // whatever it DOES still crystallize. Both are closed by pricing this
-        // exit against `ppsAtEntry`, taken here, before anything moves.
-        (, address stratAtEntry,, bool laneAAtEntry) = _laneState();
-        uint256 ppsAtEntry = pricePerShare();
-
         if (caller != _withdrawalQueue) {
             uint256 reserve = reservedQueueAssets();
             uint256 float = IERC20(asset()).balanceOf(address(this));
-            // Shortfall beyond idle float is pulled from the active strategy in
-            // the same tx (Yearn default_queue pattern, queue length 1). The
-            // pull happens BEFORE the burn/transfer; value moves position →
-            // float, so live NAV (and thus this exit's share pricing) is
-            // unchanged.
-            if (assets + reserve > float) {
-                _pullFromStrategy(assets + reserve - float, stratAtEntry, laneAAtEntry);
-            }
-        }
-        // Crystallize the exiting shares' fees BEFORE the burn, while the
-        // pro-rata denominator still includes them. `assets` arriving here is
-        // already net of these fees (see `previewRedeem`), so the fee portion
-        // simply stays behind in the vault — no transfer, no recipient lookup,
-        // no external call on the ERC-4626 hot path. The exiter pays the fees
-        // they owe at the moment they leave, so exit timing is fee-neutral.
-        //
-        // `laneAAtEntry`/`ppsAtEntry`, NOT a fresh read of either — see above.
-        if (caller != _withdrawalQueue && laneAAtEntry) {
-            (uint256 mgmtFee, uint256 perfFee) = _exitFeesAt(shares, ppsAtEntry);
-            if (mgmtFee != 0 || perfFee != 0) {
-                // forge-lint: disable-next-line(unsafe-typecast)
-                _crystallizedMgmt += uint128(mgmtFee);
-                // forge-lint: disable-next-line(unsafe-typecast)
-                _crystallizedPerf += uint128(perfFee);
-                emit ExitFeesCrystallized(_owner, shares, mgmtFee, perfFee);
-            }
+            // A shortfall beyond idle float has nowhere to come from — there is
+            // no strategy pull without Lane A. Same error surface as the old
+            // `_pullFromStrategy` path for a non-Lane-A vault.
+            if (assets + reserve > float) revert QueueReserveBreached();
         }
 
         super._withdraw(caller, receiver, _owner, assets, shares);
-        // Mid-proposal principal out — excluded from settlement PnL. Queue
-        // settlements post-date the PnL read, so only live instant exits count.
-        if (caller != _withdrawalQueue && redemptionsLocked()) {
-            _interimNetFlow -= int256(assets);
-            // Accrual continues on the reduced base from this moment; the
-            // withdrawn capital accrues nothing for the remainder of the
-            // proposal. The high-water mark is deliberately NOT ratcheted here:
-            // it advances only at settlement, so the holders who stayed keep
-            // measuring from the same mark.
-            _accrueManagementFee();
-        }
     }
 
     /// @dev Cap visible to integrators so they don't propose withdrawals that
@@ -1547,9 +1292,9 @@ contract SyndicateVault is
     function maxWithdraw(address owner_) public view override returns (uint256) {
         if (paused()) return 0;
         if (owner_ == _withdrawalQueue) return super.maxWithdraw(owner_);
-        if (_laneBOnly(owner_)) return 0;
+        if (redemptionsLocked()) return 0;
         uint256 userMax = super.maxWithdraw(owner_);
-        uint256 available = _availableFloat() + _strategyLiquidity();
+        uint256 available = _availableFloat();
         return userMax > available ? available : userMax;
     }
 
@@ -1559,13 +1304,13 @@ contract SyndicateVault is
     function maxRedeem(address owner_) public view override returns (uint256) {
         if (paused()) return 0;
         if (owner_ == _withdrawalQueue) return super.maxRedeem(owner_);
-        if (_laneBOnly(owner_)) return 0;
+        if (redemptionsLocked()) return 0;
         uint256 userMax = super.maxRedeem(owner_);
         uint256 reserveShares = pendingQueueShares();
         uint256 ts = totalSupply();
         if (ts == 0 || reserveShares >= ts) return 0;
         uint256 availableShares = ts - reserveShares;
-        uint256 backingAssets = _availableFloat() + _strategyLiquidity();
+        uint256 backingAssets = _availableFloat();
         // No `backingAssets == 0` early return — skip the floatShares cap
         // entirely when the user's full balance fits within `backingAssets`
         // (covers the dust case where `convertToAssets(userMax) == 0`, which
@@ -1601,9 +1346,6 @@ contract SyndicateVault is
         if (q == address(0)) revert WithdrawalQueueNotSet();
         if (!redemptionsLocked()) revert RedemptionsNotLocked();
         if (shares == 0) revert InsufficientShares();
-        // Shares entered via Lane A this proposal are locked until it settles
-        // (blocks the Lane A entry → Lane B exit bypass within one proposal).
-        if (_isLaneALocked(owner_)) revert SharesLocked();
         if (msg.sender != owner_) {
             _spendAllowance(owner_, msg.sender, shares);
         }
@@ -1696,19 +1438,11 @@ contract SyndicateVault is
     ///         price. `num/den` carry the ERC-4626 virtual offsets so the queue
     ///         reproduces the vault's conversion rounding exactly.
     function onProposalSettled(uint256 proposalId) external onlyGovernor {
-        // Reset the interim-flow accumulator for the next proposal. MUST precede
-        // the no-queue early-return below so a queueless vault still resets.
-        delete _interimNetFlow;
         address q = _withdrawalQueue;
         if (q == address(0)) return;
         uint256 num = totalAssets() + 1;
         uint256 den = totalSupply() + 10 ** _decimalsOffset();
         IVaultWithdrawalQueue(q).stampSettlement(proposalId, num, den);
-    }
-
-    /// @inheritdoc ISyndicateVault
-    function interimNetFlow() external view returns (int256) {
-        return _interimNetFlow;
     }
 
     // ==================== MANAGEMENT-FEE ACCRUAL ====================
@@ -1744,13 +1478,16 @@ contract SyndicateVault is
     /// @dev Restamp the accrual base from live fund assets, falling back to
     ///      idle float if the valuation is unavailable.
     ///
-    ///      `totalAssets()` resolves live NAV through `factory.priceRouter()`.
     ///      A fee accrual must never be the reason `executeProposal` or a
-    ///      settlement reverts, so a router that is unwired or reverting
-    ///      degrades the BASE rather than the transaction — the fund is valued
-    ///      at its float for that interval and the fee comes out conservative
-    ///      (too low), never inflated. Routed through an external self-call
-    ///      because `try` cannot wrap an internal one.
+    ///      settlement reverts, so the try/catch degrades the BASE rather than
+    ///      the transaction if `totalAssets()` ever reverts — the fund is
+    ///      valued at its raw float for that interval and the fee comes out
+    ///      conservative (too low), never inflated. Kept even though
+    ///      `totalAssets()` is currently a simple float-minus-reserve read
+    ///      that should not revert: this is the load-bearing backstop should
+    ///      that function ever grow an external dependency again. Routed
+    ///      through an external self-call because `try` cannot wrap an
+    ///      internal one.
     function _stampMgmtBase() private {
         uint256 base;
         try this.totalAssets() returns (uint256 a) {
@@ -1788,8 +1525,6 @@ contract SyndicateVault is
     }
 
     /// @inheritdoc ISyndicateVault
-    /// @dev `public` rather than `external`: `_exitFees` reads it internally to
-    ///      size an exiter's pro-rata slice of the accrual so far.
     function managementAssetSeconds() public view returns (uint256) {
         uint256 last = _mgmtLastUpdate;
         if (last == 0 || block.timestamp <= last) return _mgmtAssetSeconds;
@@ -1821,7 +1556,7 @@ contract SyndicateVault is
     ///         floor error in `pps` is bounded by <1 unit of THIS constant; a
     ///         smaller unit means that same <1-unit error represents more real
     ///         value once multiplied back out by `totalSupply()` in
-    ///         `aboveHighWaterMark`/`_exitFees`. Measured: a bare
+    ///         `aboveHighWaterMark`. Measured: a bare
     ///         `10 ** decimals()` reintroduced ~$1 of drift on a $200,000 fee
     ///         base for a 6-decimal asset (`test/fees/HighWaterMark.t.sol`),
     ///         precision the OLD `1e18` constant never lost. The `max` floors
@@ -1892,210 +1627,6 @@ contract SyndicateVault is
             _highWaterPricePerShare = pps;
             emit HighWaterMarkUpdated(pps);
         }
-    }
-
-    // ==================== EXIT-TIME FEE CRYSTALLIZATION ====================
-
-    /// @inheritdoc ISyndicateVault
-    function crystallizedMgmt() external view returns (uint256) {
-        return _crystallizedMgmt;
-    }
-
-    /// @inheritdoc ISyndicateVault
-    function crystallizedPerf() external view returns (uint256) {
-        return _crystallizedPerf;
-    }
-
-    /// @dev The fees `shares` owe if they leave right now: their pro-rata slice
-    ///      of the management fee accrued-but-uncollected so far, plus their
-    ///      per-share performance fee above the high-water mark.
-    ///
-    ///      This is what makes exit timing fee-neutral. Without it an instant
-    ///      exiter walks away mid-proposal at a live price having paid nothing,
-    ///      and the fees they owed land on the depositors who stayed.
-    ///
-    ///      The performance rate is clamped to the governor's per-vault ceiling
-    ///      exactly as settlement clamps it. Reading the vault's own
-    ///      `agentFeeBps()` unclamped would let an over-configured vault charge
-    ///      an exiter more than a hold-to-settle depositor pays — breaking the
-    ///      neutrality this function exists to provide.
-    function _exitFees(uint256 shares) private view returns (uint256 mgmtFee, uint256 perfFee) {
-        return _exitFeesAt(shares, pricePerShare());
-    }
-
-    /// @dev Split out of `_exitFees` so `_withdraw` can price an exit against a
-    ///      PRE-PULL `pps` snapshot instead of a fresh one (issue #100).
-    ///      `pricePerShare()` reads `totalAssets()`, which calls `_laneState()`
-    ///      internally — the SAME hazard the pull-eligibility gate has: many
-    ///      real single-position strategies cannot service a partial
-    ///      withdrawal without fully unwinding, so `_pullFromStrategy` can
-    ///      empty `positions()` and flip `laneA` false mid-`_withdraw`. A `pps`
-    ///      computed AFTER that flip silently drops the strategy's live value
-    ///      from the gain base, undercharging the fee actually owed — not
-    ///      merely failing to book it, understating it. The two view callers
-    ///      below (`previewRedeem`, `previewExitFees`) have no pull in
-    ///      flight, so they keep calling `_exitFees` and get the live,
-    ///      current `pps` — correct for a quote with nothing in progress.
-    function _exitFeesAt(uint256 shares, uint256 pps) private view returns (uint256 mgmtFee, uint256 perfFee) {
-        uint256 supply = _pricingSupply();
-        if (shares == 0 || supply == 0) return (0, 0);
-
-        // ── Management: pro-rata of the fund-level accrual to now ──
-        uint256 rate = _managementFeeBps;
-        if (rate != 0) {
-            uint256 owedNow = (managementAssetSeconds() * rate) / (10_000 * 365 days);
-            uint256 collected = _crystallizedMgmt;
-            if (owedNow > collected) {
-                mgmtFee = ((owedNow - collected) * shares) / supply;
-            }
-        }
-
-        // ── Performance: per-share, above the mark, on the shares leaving ──
-        uint256 mark = _highWaterPricePerShare;
-        if (pps > mark) {
-            uint256 bps = agentFeeBps();
-            uint256 cap = _governorPerformanceCap();
-            if (bps > cap) bps = cap;
-            perfFee = (((pps - mark) * shares) / _pricePerShareUnit()) * bps / 10_000;
-        }
-    }
-
-    /// @dev The governor's per-vault performance-fee ceiling. Falls back to the
-    ///      protocol constant when the governor is unwired, has no code, or
-    ///      returns something undecodable — a quoting view on the ERC-4626
-    ///      withdraw path must never revert.
-    ///
-    ///      Deliberately a low-level staticcall rather than `try`/`catch`:
-    ///      `try` catches a REVERT, but a call that succeeds and returns short
-    ///      or empty data fails while decoding the return value, and that
-    ///      failure is not catchable. Checking `returndata.length` first is the
-    ///      only form that survives an EOA or a stubbed governor.
-    function _governorPerformanceCap() private view returns (uint256) {
-        address gov = _getGovernor();
-        if (gov == address(0) || gov.code.length == 0) return FeeConstants.MAX_PERFORMANCE_FEE_BPS;
-        (bool ok, bytes memory ret) =
-            gov.staticcall(abi.encodeWithSelector(ISyndicateGovernor.getGovernorParams.selector));
-        // GovernorParams is nine words; anything shorter is not one.
-        if (!ok || ret.length < 9 * 32) return FeeConstants.MAX_PERFORMANCE_FEE_BPS;
-        ISyndicateGovernor.GovernorParams memory p = abi.decode(ret, (ISyndicateGovernor.GovernorParams));
-        return p.maxPerformanceFeeBps;
-    }
-
-    /// @dev The early-exit penalty on `netAssets` leaving now.
-    ///
-    ///      Charged on the PULLED portion only — the part of the exit that idle
-    ///      float cannot absorb and that therefore forces the strategy to
-    ///      unwind early. That matches what the penalty is compensating the
-    ///      remaining depositors for. An exit small enough to be served from
-    ///      float causes no unwind and pays nothing.
-    ///
-    ///      This makes the fee function kinked at the float boundary, so
-    ///      `previewWithdraw` cannot invert it in closed form; it grosses up and
-    ///      rounds conservatively instead. `previewRedeem` stays exact and
-    ///      monotone either side of the kink (d(net)/d(assets) = 1 - bps/1e4 > 0),
-    ///      which is what EIP-4626 actually requires.
-    ///
-    ///      Known trade-off: because the charge depends on float, the first
-    ///      exiters in a rush pay nothing and the
-    ///      last pays full — which adds a little pressure to run early, the
-    ///      opposite of what an anti-mercenary term wants. Kept because it
-    ///      matches the fee's stated purpose and instant-exit capacity is
-    ///      already bounded by `availableLiquidity()` regardless.
-    function _exitPenalty(uint256 netAssets) private view returns (uint256) {
-        uint256 bps = instantExitFeeBps;
-        if (bps == 0 || netAssets == 0) return 0;
-        uint256 float = IERC20(asset()).balanceOf(address(this));
-        uint256 reserve = reservedQueueAssets();
-        uint256 absorbable = float > reserve ? float - reserve : 0;
-        if (netAssets <= absorbable) return 0;
-        return ((netAssets - absorbable) * bps) / 10_000;
-    }
-
-    /// @notice Assets an instant exit of `shares` would release, net of the
-    ///         fees those shares owe and the early-exit penalty.
-    /// @dev Only the Lane A instant path is charged. A Lane B queue exit claims
-    ///      at the frozen post-settlement price and has therefore already borne
-    ///      its share — charging it here would double-bill.
-    ///
-    ///      Order is fixed and the two charges are independent: crystallization
-    ///      first, against the exiting shares' value (it goes to the fee
-    ///      recipients — fees the exiter owed anyway), then the penalty on what
-    ///      remains (it goes to the vault — compensation for the early unwind).
-    function previewRedeem(uint256 shares) public view override returns (uint256) {
-        uint256 gross = super.previewRedeem(shares);
-        (,,, bool laneA) = _laneState();
-        if (!laneA) return gross;
-
-        (uint256 mgmtFee, uint256 perfFee) = _exitFees(shares);
-        uint256 fees = mgmtFee + perfFee;
-        uint256 net = gross > fees ? gross - fees : 0;
-
-        return net - _exitPenalty(net);
-    }
-
-    /// @notice Shares to burn for `assets` out of an instant exit.
-    /// @dev The fee function is kinked at the float boundary (see
-    ///      `_exitPenalty`) and concave above it, so it has no closed-form
-    ///      inverse and a single linear correction lands short — grossing up
-    ///      pushes more of the exit past the boundary, which the first estimate
-    ///      did not price. Iterate instead, rounding UP each time: the caller
-    ///      burns marginally more shares than strictly necessary rather than
-    ///      receiving less than they asked for. Erring the other way would
-    ///      break the EIP-4626 guarantee that `withdraw` delivers the requested
-    ///      assets.
-    ///
-    ///      Convergence is quadratic in the penalty rate (each round leaves a
-    ///      residual of order `bps^(n+1)`), so at the 200 bps ceiling three
-    ///      rounds are exact to well under one wei. The bound also makes this
-    ///      view unconditionally terminating.
-    function previewWithdraw(uint256 assets) public view override returns (uint256) {
-        uint256 shares = super.previewWithdraw(assets);
-        (,,, bool laneA) = _laneState();
-        if (!laneA || shares == 0) return shares;
-
-        uint256 bps = instantExitFeeBps;
-        for (uint256 i = 0; i < 3; ++i) {
-            uint256 net = previewRedeem(shares);
-            if (net >= assets) break;
-            // Top up by what the shortfall is worth in shares — but gross the
-            // shortfall up by the penalty first. Shares added to cover a
-            // deficit are themselves charged on the way out, so closing on the
-            // raw deficit only ever recovers `(1 - bps)` of it and the estimate
-            // creeps toward the target from below without reaching it.
-            // Grossing up makes each round overshoot instead, which terminates.
-            uint256 deficit = assets - net;
-            if (bps != 0) deficit = (deficit * 10_000) / (10_000 - bps) + 1;
-            shares += convertToShares(deficit) + 1;
-        }
-        return shares;
-    }
-
-    /// @inheritdoc ISyndicateVault
-    function previewExitFees(uint256 shares) external view returns (uint256 mgmtFee, uint256 perfFee) {
-        (,,, bool laneA) = _laneState();
-        if (!laneA) return (0, 0);
-        return _exitFees(shares);
-    }
-
-    /// @inheritdoc ISyndicateVault
-    /// @notice Governor-only: release the parked management fees for payout.
-    /// @dev The assets never left the vault — this only moves them from
-    ///      "parked, excluded from `totalAssets`" to "payable", which is why
-    ///      the two legs are released separately. Releasing raises
-    ///      `totalAssets()`, so the performance leg must read its base BEFORE
-    ///      `consumeCrystallizedPerf` is called or it would charge a fee on
-    ///      money that already belongs to the recipients.
-    function consumeCrystallizedMgmt() external onlyGovernor returns (uint256 amount) {
-        amount = _crystallizedMgmt;
-        _crystallizedMgmt = 0;
-    }
-
-    /// @inheritdoc ISyndicateVault
-    /// @notice Governor-only: release the parked performance fees for payout.
-    ///         Call only after the above-mark base has been read.
-    function consumeCrystallizedPerf() external onlyGovernor returns (uint256 amount) {
-        amount = _crystallizedPerf;
-        _crystallizedPerf = 0;
     }
 
     // ==================== RESCUE ====================
