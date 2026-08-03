@@ -241,12 +241,14 @@ contract StakedWood_ownerStakeBindingConsent is Test {
         assertEq(swood.ownerStake(aliceVault), ALICE_STAKE, "her stake bonded where she chose");
 
         // The refund path also survives — proven on a fresh escrow, since the
-        // one above is now legitimately bound to Alice's own vault.
+        // one above is now legitimately bound to Alice's own vault. Preparing
+        // and cancelling nets to zero, so her balance returns to exactly
+        // `aliceWoodBefore` (only her self-chosen bond ever left it for good).
         _prepare(alice, ALICE_STAKE);
         vm.prank(alice);
         swood.cancelPreparedStake();
         assertEq(swood.preparedStakeOf(alice), 0, "escrow refunded");
-        assertEq(wood.balanceOf(alice), aliceWoodBefore - ALICE_STAKE, "only the self-chosen bond left her balance");
+        assertEq(wood.balanceOf(alice), aliceWoodBefore, "only the self-chosen bond left her balance for good");
     }
 
     // ──────────────────────────────────────────────────────────────
@@ -265,8 +267,13 @@ contract StakedWood_ownerStakeBindingConsent is Test {
         swood.approveOwnerStakeBinding(v);
         assertEq(swood.approvedBindVault(alice), v, "consent recorded");
 
+        // `oldOwner` is address(0), not mallory: `_malloryEmptySlotVault` drains
+        // the slot via `claimUnstakeOwner`, which `delete`s the whole
+        // `OwnerStake` struct (src/StakedWood.sol:1125) — owner included — so
+        // by the time this rotation binds, the slot has no recorded owner left
+        // to name.
         vm.expectEmit(true, true, true, false, address(swood));
-        emit StakedWood.OwnerStakeSlotTransferred(v, mallory, alice);
+        emit StakedWood.OwnerStakeSlotTransferred(v, address(0), alice);
         vm.prank(mallory);
         factory.rotateOwner(v, alice);
 
