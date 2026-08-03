@@ -106,6 +106,42 @@ interface IProtocolConfigAdmin {
  *      and sWOOD — must all name THE LEDGER THIS RUN DEPLOYED. sWOOD's is wired
  *      inside the broadcast rather than demanded of the operator beforehand,
  *      because the ledger does not exist until step 2. See the block itself.
+ * @dev PRE-FLIGHT 11 (issue #43): `TIER2_CALL_CAP_BPS` (the per-call tier-2
+ *      ceiling POLICY value this script tells operators to seat) stays inside
+ *      the issue's own "~100-200bps" band. This script cannot seat the value
+ *      itself — `SyndicateGovernor.setTier2CallCapBps` is `onlyVaultOwner`,
+ *      not factory-gated, unlike tierRegistry/exposureLedger/bondEscrow — so
+ *      it is printed as a MANUAL NEXT step; see the block itself.
+ * @dev ISSUE #43's `BatchExecutorLib` MIGRATION (design.md D5) — NOT run by
+ *      this script, but the operational sequence any Plan B operator with
+ *      live syndicates (testnet 46630 today; mainnet 4663 has none) must
+ *      follow once the metered lib and Plan B's governor/vault impls are
+ *      built, in order:
+ *        1. Quiesce: settle/expire every proposal on every vault
+ *           (`openProposalCount == 0` everywhere) — `pushExecutor`'s own
+ *           lifecycle gate enforces this per-vault, but nothing needs to be
+ *           mid-execution when the window opens.
+ *        2. Deploy the new `BatchExecutorLib` singleton; record its address
+ *           and codehash.
+ *        3. Upgrade the governor beacon (`upgradeTo`, all governors at once)
+ *           and each vault (`upgradeVault`, creator-consented) to impls that
+ *           speak the metered 3-arg `executeGovernorBatch`/`executeBatch`
+ *           ABI — free ordering, since step 1 guarantees nothing executes
+ *           during the window, and every pairing with the OLD lib fails
+ *           closed regardless.
+ *        4. Re-point: `factory.setExecutorImpl(newLib)`, then
+ *           `factory.pushExecutor(vault)` for each existing vault (re-points
+ *           the address AND re-stamps the expected codehash atomically, one
+ *           tx per vault).
+ *        5. Verify before re-opening: per vault, confirm the executor address
+ *           and codehash match the deployment record, and prove the selector
+ *           chain end-to-end (a `simulateBatch` eth_call dry-run through the
+ *           vault path, or a canary propose -> execute on a test vault).
+ *        6. New syndicates created after step 4 wire the new lib
+ *           automatically via `createSyndicate`'s live `executorImpl` read.
+ *      A vault NOT migrated fails closed on its next governor batch (unknown
+ *      selector, no fallback on the library) — strategies unavailable, funds
+ *      and LP exits unaffected — until `pushExecutor` runs for it.
  *
  *      Ownership: the broadcaster becomes the ledger owner and must ALREADY own
  *      the GuardianRegistry, the SyndicateFactory and StakedWood (all three
@@ -243,6 +279,23 @@ contract DeployPlanB is Script {
     ///         enforces the same floor, so this catches a DRIFTED mirror rather
     ///         than a bad env value.
     uint256 internal constant MIN_WOOD_HAIRCUT_BPS = 5_000;
+
+    /// @notice The policy value for `SyndicateGovernor.tier2CallCapBps` (issue
+    ///         #43, design.md D2): 200 bps (2% of TVL) — the issue's own
+    ///         "~100-200bps" band, ceiling end. The MECHANISM (the ceiling
+    ///         check itself, and the parameter's unset-reads-as-10_000 inert
+    ///         default) ships with the contract regardless of this script; the
+    ///         POLICY value is a deployment/governance act, which is what this
+    ///         constant and the pre-flight below pin.
+    /// @dev    THIS SCRIPT CANNOT CALL `setTier2CallCapBps` ITSELF: unlike
+    ///         `tierRegistry`/`exposureLedger`/`bondEscrow` (pushed by the
+    ///         FACTORY, which this script's deployer owns), the per-call
+    ///         ceiling is `onlyVaultOwner` on each individual governor — a
+    ///         role this script has no standing access to, and one that
+    ///         varies per syndicate. Printed as a MANUAL NEXT step instead
+    ///         (see the end of `deploy()`); new governors read the inert
+    ///         10_000 default until their vault owner sets it.
+    uint256 internal constant TIER2_CALL_CAP_BPS = 200;
 
     /// @notice The address book this deployment runs against, exactly as
     ///         `run()` reads it out of the environment.
@@ -524,6 +577,21 @@ contract DeployPlanB is Script {
                 "GovernorBeacon on the Plan B governor impl and run this against that factory."
             );
         }
+
+        // ── Pre-flight 11 (issue #43): the per-call tier-2 ceiling POLICY
+        //    value stays inside the issue's own "~100-200bps" band ──
+        // Guards against a future edit of TIER2_CALL_CAP_BPS drifting outside
+        // the approved policy without anyone noticing — this script cannot
+        // seat the value on any governor itself (see the constant's own
+        // natspec: `setTier2CallCapBps` is `onlyVaultOwner`, not
+        // factory-gated), so the one thing left for a pre-flight to protect
+        // is the constant the MANUAL NEXT instructions below tell every
+        // operator to use.
+        require(
+            TIER2_CALL_CAP_BPS > 0 && TIER2_CALL_CAP_BPS <= 200,
+            "PRE-FLIGHT: TIER2_CALL_CAP_BPS is outside issue #43's approved 1-200bps policy band -- "
+            "fix the constant, do not just re-run."
+        );
 
         console.log("sWOOD coolDownPeriod (s): %s", coolDown);
         console.log("deployer / ledger owner:  %s", deployer);
@@ -870,6 +938,20 @@ contract DeployPlanB is Script {
             console.log("  syndicates need a FRESH factory + beacon and a migration, not an upgrade.");
         }
         console.log("MANUAL NEXT: hand ledger ownership to the protocol owner (Ownable2Step: transfer + accept).");
+
+        // Issue #43: `setTier2CallCapBps` is `onlyVaultOwner` per governor —
+        // this script has no standing access to any individual vault owner,
+        // so it cannot seat the value itself (unlike tierRegistry /
+        // exposureLedger / bondEscrow, which the FACTORY OWNER pushes and
+        // this script's deployer controls). Printed as its own MANUAL NEXT
+        // regardless of `liveGovernors`: new syndicates created after this
+        // run ALSO start at the inert 10_000 default until their owner sets it.
+        console.log(
+            "MANUAL NEXT: each vault owner calls governor.setTier2CallCapBps(%s) (issue #43, ~2%% of TVL).",
+            TIER2_CALL_CAP_BPS
+        );
+        console.log("  Owner-instant, not factory-gated -- this script cannot do it on any owner's behalf.");
+        console.log("  Until set, tier2CallCapBps reads the inert 10_000 default (no per-call ceiling).");
     }
 
     /// @notice True when `swood` answers `delegationEnabled()` with a non-zero

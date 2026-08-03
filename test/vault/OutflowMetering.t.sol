@@ -89,7 +89,7 @@ contract OutflowMeteringTest is Test {
         vault.deposit(2_000e6, alice);
 
         vm.prank(address(governor));
-        vault.executeGovernorBatch(_outflowBatch(500e6), 1_000e6);
+        vault.executeGovernorBatch(_outflowBatch(500e6), new uint256[](0), 1_000e6);
         assertEq(usdc.balanceOf(address(sink)), 500e6, "capital deployed");
     }
 
@@ -99,7 +99,7 @@ contract OutflowMeteringTest is Test {
 
         // Boundary: netOutflow == cap must pass (comparison is strict >).
         vm.prank(address(governor));
-        vault.executeGovernorBatch(_outflowBatch(1_000e6), 1_000e6);
+        vault.executeGovernorBatch(_outflowBatch(1_000e6), new uint256[](0), 1_000e6);
         assertEq(usdc.balanceOf(address(sink)), 1_000e6, "exact-cap deploy executes");
     }
 
@@ -109,7 +109,7 @@ contract OutflowMeteringTest is Test {
 
         vm.prank(address(governor));
         vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.MaxNetOutflowExceeded.selector, 1_500e6, 1_000e6));
-        vault.executeGovernorBatch(_outflowBatch(1_500e6), 1_000e6);
+        vault.executeGovernorBatch(_outflowBatch(1_500e6), new uint256[](0), 1_000e6);
     }
 
     function test_inflowBatchPassesTrivially() public {
@@ -122,7 +122,7 @@ contract OutflowMeteringTest is Test {
             BatchExecutorLib.Call({target: address(sink), data: abi.encodeCall(sink.pushBack, (500e6)), value: 0});
 
         vm.prank(address(governor));
-        vault.executeGovernorBatch(calls, 0);
+        vault.executeGovernorBatch(calls, new uint256[](0), 0);
         assertEq(usdc.balanceOf(address(vault)), 500e6, "funds returned");
     }
 }

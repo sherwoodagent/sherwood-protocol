@@ -14,6 +14,7 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
+import {GovEnvelope} from "../helpers/GovEnvelope.sol";
 
 /// @title Vault_batchQueueTargets_lifecycle
 /// @notice Issue #93 through the REAL governor lifecycle. The sibling unit file
@@ -182,7 +183,16 @@ contract VaultBatchQueueTargetsLifecycleTest is Test {
     ) internal returns (uint256 pid) {
         vm.prank(agent);
         pid = governor.propose(
-            address(vault), address(0), "ipfs://p", STRATEGY_DURATION, env, openCalls, settleCalls, _noCoProposers()
+            address(vault),
+            address(0),
+            "ipfs://p",
+            STRATEGY_DURATION,
+            env,
+            openCalls,
+            GovEnvelope.defaultCaps((env).maxCapital, (openCalls).length),
+            settleCalls,
+            GovEnvelope.defaultCaps((env).maxCapital, (settleCalls).length),
+            _noCoProposers()
         );
         vm.warp(vm.getBlockTimestamp() + 1);
         vm.prank(voter);

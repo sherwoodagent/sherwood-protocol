@@ -27,4 +27,16 @@ library GovEnvelope {
         env = ISyndicateGovernor.RiskEnvelope({maxCapital: IERC4626(vault).totalAssets(), maxDrawdownBps: 10_000});
         if (mode == VmSafe.CallerMode.Prank) vm.prank(sender, origin);
     }
+
+    /// @notice Default per-call caps for the issue #43 test-fixture sweep:
+    ///         the FIRST call gets the full `maxCapital`, every other call
+    ///         gets zero. Sum-legal for any batch size (`maxCapital <=
+    ///         envelope.maxCapital` always), and permissive for the common
+    ///         single-mover batch shape used across this suite. Call sites
+    ///         exercising cap semantics directly pass their own arrays
+    ///         instead.
+    function defaultCaps(uint256 maxCapital, uint256 n) internal pure returns (uint256[] memory caps) {
+        caps = new uint256[](n);
+        if (n > 0) caps[0] = maxCapital;
+    }
 }
