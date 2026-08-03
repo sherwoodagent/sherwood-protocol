@@ -515,6 +515,15 @@ contract SyndicateVault is
         if (balanceAfter < reserve + (balanceBefore * minBufferBps) / 10_000) revert BufferBreached();
     }
 
+    /// @inheritdoc ISyndicateVault
+    /// @dev Wraps `_isPrivilegedBatchTarget` — the same predicate
+    ///      `_guardBatchCalls` enforces. Exposed so the governor's
+    ///      propose-time validation answers through this one implementation
+    ///      instead of restating the address set (vault, bound queue).
+    function isPrivilegedBatchTarget(address target) external view returns (bool) {
+        return _isPrivilegedBatchTarget(target);
+    }
+
     /// @dev Two-part batch gate: a privileged-TARGET denylist (Part 1, always
     ///      runs), then the value-moving-SELECTOR allowlist (Part 2, registry-
     ///      dependent). The two are independent — do not collapse them, and do
@@ -634,10 +643,9 @@ contract SyndicateVault is
         // per pid, so one batch can pre-burn the settlement slot of proposals
         // that have not happened yet and make `onProposalSettled` revert
         // forever.
-        address q = _withdrawalQueue;
         for (uint256 i = 0; i < calls.length; i++) {
             address target = calls[i].target;
-            if (target == address(this) || (q != address(0) && target == q)) {
+            if (_isPrivilegedBatchTarget(target)) {
                 revert DisallowedBatchTarget(target);
             }
         }
@@ -668,6 +676,17 @@ contract SyndicateVault is
                 revert DisallowedTransferTarget(calls[i].target, sel, recipient);
             }
         }
+    }
+
+    /// @dev The single implementation of the privileged-batch-target
+    ///      predicate — the vault itself, or the bound withdrawal queue.
+    ///      `_guardBatchCalls`'s Part 1 loop and the external
+    ///      `isPrivilegedBatchTarget` view are its only two callers; neither
+    ///      may restate the address set (see the class-not-list rationale in
+    ///      `_guardBatchCalls`'s doc comment above).
+    function _isPrivilegedBatchTarget(address target) private view returns (bool) {
+        address q = _withdrawalQueue;
+        return target == address(this) || (q != address(0) && target == q);
     }
 
     /// @inheritdoc ISyndicateVault

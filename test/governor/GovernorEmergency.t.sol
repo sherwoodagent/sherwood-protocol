@@ -594,9 +594,15 @@ contract GovernorEmergencyTest is Test {
     ///         this path for free — no per-entrypoint duplication.
     ///
     /// @dev    Asserts the vault-self target, because this harness binds no
-    ///         withdrawal queue. The queue variant of the same claim is in
-    ///         `test/audit-fixes/Vault_batchQueueTargets_lifecycle.t.sol`, which
-    ///         drives `unstick` against a real bound queue.
+    ///         withdrawal queue. The queue variant of the same claim — a
+    ///         batch naming the bound queue rejected by
+    ///         `executeGovernorBatch` — is pinned at the unit level in
+    ///         `test/audit-fixes/Vault_batchQueueTargets.t.sol`, which drives
+    ///         that entrypoint directly. (Issue #118 retired the lifecycle
+    ///         version reached via `unstick`: it required a STORED
+    ///         queue-targeting settlement batch, and `propose` now rejects
+    ///         such a batch before it can ever be stored — see
+    ///         `test/audit-fixes/Vault_batchQueueTargets_lifecycle.t.sol`.)
     function test_finalizeEmergencySettle_vaultSelfTargetingCalls_reverts() public {
         uint256 pid = _createExecutedProposal(7 days);
         vm.warp(vm.getBlockTimestamp() + 7 days);
