@@ -767,9 +767,12 @@ contract TierRegistryTest is Test {
     function test_certifyWithZeroBondLocksNothingAndEmitsNoBondEvent() public {
         assertEq(reg.submitterBondWood(), 0, "fresh TierRegistry defaults to unbonded");
 
-        vm.recordLogs();
         vm.prank(owner);
-        reg.certify(target, bytes4(0x40404040), 0, 50, address(0));
+        reg.proposeCertification(target, bytes4(0x40404040), 0, 50, address(0), target.codehash);
+        vm.warp(vm.getBlockTimestamp() + reg.certifyDelay());
+
+        vm.recordLogs();
+        reg.certify(target, bytes4(0x40404040));
 
         assertEq(reg.totalBondedWood(), 0, "no bond locked when submitterBondWood is 0");
         // Exactly one event (TierCertified) — SubmitterBondLocked is emitted
