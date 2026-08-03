@@ -281,6 +281,15 @@ contract DeploySherwood is ScriptBase {
         // proxy needed (certifications are re-issuable, not upgrade-state).
         d.tierRegistry = address(new TierRegistry(d.deployer));
         SyndicateFactory(d.factoryProxy).setTierRegistry(d.tierRegistry);
+        // Issue #40: the submitter bond has no slash path yet, so it must
+        // stay disabled until the launch gate documented on
+        // `TierRegistry.submitterBondWood` is met. This script never calls
+        // `setSubmitterBondWood` — the assertion pins that fact rather than
+        // changing behavior.
+        require(
+            TierRegistry(d.tierRegistry).submitterBondWood() == 0,
+            "submitter bond must stay 0 at launch - see issue #40"
+        );
     }
 
     /// @dev Deploys the StakedWood (sWOOD) proxy via CREATE3. The governor +
