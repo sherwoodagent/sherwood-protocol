@@ -201,7 +201,9 @@ contract FeeBlacklistHandler is Test {
             strategyDuration,
             GovEnvelope.permissive(address(vault)),
             calls,
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (calls).length),
             calls,
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (calls).length),
             coProps
         );
 

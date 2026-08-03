@@ -28,6 +28,11 @@ abstract contract GovernorEmergency is ProposalLifecycle {
     // which owns the lifecycle state. What remains virtual below is governor-owned.
 
     function _getSettlementCalls(uint256) internal view virtual returns (BatchExecutorLib.Call[] storage);
+    /// @dev The stored per-call settlement caps (issue #43), mirroring
+    ///      `_getSettlementCalls`. `unstick` replays the voted settlement
+    ///      batch under these SAME caps — it does not relax the declaration
+    ///      the batch was priced with.
+    function _getSettlementCallCaps(uint256) internal view virtual returns (uint256[] storage);
     function _emergencyReentrancyEnter() internal virtual;
     function _emergencyReentrancyLeave() internal virtual;
     function _finishSettlementHook(uint256 pid, StrategyProposal storage p)
@@ -61,8 +66,12 @@ abstract contract GovernorEmergency is ProposalLifecycle {
         if (block.timestamp < p.executedAt + p.strategyDuration) revert StrategyDurationNotElapsed();
         // Same maxCapital cap as execute/settle: an honest unwind is net-inflow
         // and passes any finite cap; only extraction parked in the pre-committed
-        // settlement calls can trip it.
-        ISyndicateVault(p.vault).executeGovernorBatch(_getSettlementCalls(proposalId), p.maxCapital);
+        // settlement calls can trip it. Same stored settlement caps too (issue
+        // #43) — `unstick` REPLAYS the voted batch, so it carries the exact
+        // caps that batch was priced with; relief from an over-tight cap is
+        // the guardian-reviewed `emergencySettleWithCalls` path, not this one.
+        ISyndicateVault(p.vault)
+            .executeGovernorBatch(_getSettlementCalls(proposalId), _getSettlementCallCaps(proposalId), p.maxCapital);
         _finishSettlementHook(proposalId, p);
     }
 
@@ -110,8 +119,14 @@ abstract contract GovernorEmergency is ProposalLifecycle {
 
         // Same maxCapital cap as execute/settle: an honest emergency unwind is
         // net-inflow and passes any finite cap; only extraction smuggled into
-        // the owner-supplied calls can trip it.
-        ISyndicateVault(p.vault).executeGovernorBatch(calls, p.maxCapital);
+        // the owner-supplied calls can trip it. EMPTY caps (issue #43): these
+        // are owner-supplied rescue calls with no propose-time declaration to
+        // enforce — guardian review + the owner bond + the maxCapital meter
+        // bound them instead. Must not per-call-meter here: this is precisely
+        // the escape hatch for a proposal stuck by a settlement-leg
+        // `CallCapExceeded` (design.md D3) — enforcing caps on the rescue path
+        // could brick on the very declaration that stranded the proposal.
+        ISyndicateVault(p.vault).executeGovernorBatch(calls, new uint256[](0), p.maxCapital);
         (int256 pnl,) = _finishSettlementHook(proposalId, p);
         emit EmergencySettleFinalized(proposalId, pnl);
     }

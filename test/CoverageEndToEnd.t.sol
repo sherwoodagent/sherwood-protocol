@@ -21,6 +21,7 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "./mocks/MockAgentRegistry.sol";
 import {MockWoodTwapOracle} from "./mocks/MockWoodTwapOracle.sol";
+import {GovEnvelope} from "./helpers/GovEnvelope.sol";
 
 /// @dev Chainlink-shaped USD feed for the vault asset: fixed answer, `decimals`,
 ///      `updatedAt` stamped at construction.
@@ -347,7 +348,15 @@ contract CoverageEndToEndTest is Test {
             7 days,
             ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000}),
             exec,
+            GovEnvelope.defaultCaps(
+                (ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000})).maxCapital,
+                (exec).length
+            ),
             settle,
+            GovEnvelope.defaultCaps(
+                (ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000})).maxCapital,
+                (settle).length
+            ),
             new ISyndicateGovernor.CoProposer[](0)
         );
     }
@@ -458,10 +467,23 @@ contract CoverageEndToEndTest is Test {
             address(vaultA),
             address(0),
             "ipfs://n11",
-            100 days, // settles far past MAX_COVERAGE_HORIZON
+            100 days,
+            // settles far past MAX_COVERAGE_HORIZON
             ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000}),
             _execCalls(),
+            GovEnvelope.defaultCaps(
+                ( // settles far past MAX_COVERAGE_HORIZON
+                        ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000})
+                    ).maxCapital,
+                (_execCalls()).length
+            ),
             _settleCalls(),
+            GovEnvelope.defaultCaps(
+                ( // settles far past MAX_COVERAGE_HORIZON
+                        ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000})
+                    ).maxCapital,
+                (_settleCalls()).length
+            ),
             cps
         );
 
@@ -474,7 +496,15 @@ contract CoverageEndToEndTest is Test {
             7 days,
             ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000}),
             _execCalls(),
+            GovEnvelope.defaultCaps(
+                (ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000})).maxCapital,
+                (_execCalls()).length
+            ),
             _settleCalls(),
+            GovEnvelope.defaultCaps(
+                (ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000})).maxCapital,
+                (_settleCalls()).length
+            ),
             cps
         );
     }

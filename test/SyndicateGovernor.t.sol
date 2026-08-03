@@ -171,7 +171,9 @@ contract SyndicateGovernorTest is Test {
             duration,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
             _emptyCoProposers()
         );
         vm.warp(block.timestamp + 1);
@@ -210,7 +212,9 @@ contract SyndicateGovernorTest is Test {
             duration,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
             _emptyCoProposers()
         );
         vm.warp(block.timestamp + 1);
@@ -269,7 +273,9 @@ contract SyndicateGovernorTest is Test {
             7 days,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
             _emptyCoProposers()
         );
     }
@@ -284,7 +290,9 @@ contract SyndicateGovernorTest is Test {
             7 days,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
             _emptyCoProposers()
         );
     }
@@ -299,7 +307,9 @@ contract SyndicateGovernorTest is Test {
             MAX_STRATEGY_DURATION + 1,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
             _emptyCoProposers()
         );
     }
@@ -314,7 +324,9 @@ contract SyndicateGovernorTest is Test {
             30 minutes,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
             _emptyCoProposers()
         );
     }
@@ -330,7 +342,9 @@ contract SyndicateGovernorTest is Test {
             7 days,
             permissiveEnv,
             empty,
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (empty).length),
             _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
             _emptyCoProposers()
         );
     }
@@ -346,7 +360,9 @@ contract SyndicateGovernorTest is Test {
             7 days,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             empty,
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (empty).length),
             _emptyCoProposers()
         );
     }
@@ -365,7 +381,9 @@ contract SyndicateGovernorTest is Test {
             7 days,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
             _emptyCoProposers()
         );
         ISyndicateGovernor.StrategyProposal memory p = governor.getProposal(proposalId);
@@ -398,7 +416,9 @@ contract SyndicateGovernorTest is Test {
             7 days,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
             _emptyCoProposers()
         );
 
@@ -519,7 +539,9 @@ contract SyndicateGovernorTest is Test {
             7 days,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
             _emptyCoProposers()
         );
     }
@@ -662,7 +684,9 @@ contract SyndicateGovernorTest is Test {
             7 days,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps(permissiveEnv.maxCapital, _simpleExecuteCalls().length),
             _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps(permissiveEnv.maxCapital, _simpleSettlementCalls().length),
             empty
         );
         assertEq(governor.getProposal(proposalId).strategy, address(0xBEEF), "EOA strategy stored as-is");
@@ -766,7 +790,9 @@ contract SyndicateGovernorTest is Test {
             7 days,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
             _emptyCoProposers()
         );
     }
@@ -985,7 +1011,7 @@ contract SyndicateGovernorTest is Test {
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](0);
         vm.prank(random);
         vm.expectRevert(ISyndicateVault.NotGovernor.selector);
-        vault.executeGovernorBatch(calls, type(uint256).max);
+        vault.executeGovernorBatch(calls, new uint256[](0), type(uint256).max);
     }
 
     // ==================== VETO ON EXECUTED PROPOSAL ====================

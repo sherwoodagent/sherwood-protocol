@@ -25,6 +25,7 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "./mocks/MockAgentRegistry.sol";
 import {MockWoodTwapOracle} from "./mocks/MockWoodTwapOracle.sol";
+import {GovEnvelope} from "./helpers/GovEnvelope.sol";
 
 /// @dev Chainlink-shaped USD feed for the vault asset.
 contract SlashGasFeed {
@@ -158,11 +159,18 @@ contract SlashGasCeilingTest is Test {
 
     uint256 constant LP1_ASSETS = 70_000e6;
     /// @dev Sized so that ONE approver at `minGuardianStake` already clears the
-    ///      coverage quorum: `requiredCoverage = maxCapital * 20,000/10,000` =
-    ///      $200 at the $1.00 asset price, against the $500 of slashable bond a
-    ///      10,000-WOOD seat carries at the $0.05 governance haircut. That keeps
-    ///      the SAME proposal executable at every cohort size this file
-    ///      measures, which is the only way the sizes are comparable.
+    ///      coverage quorum. Issue #43's per-call caps changed the exact
+    ///      figure: `_execCalls()` has 2 calls (`poke` certified at
+    ///      CERTIFIED_BOUND_BPS, `bump` uncertified) and the test-fixture
+    ///      default caps only the FIRST call (`poke`, cap = maxCapital) —
+    ///      `bump`'s cap is 0, contributing nothing. `requiredCoverage` =
+    ///      (maxCapital * 5_000/10_000) [exec poke] + 0 [exec bump] +
+    ///      (maxCapital * 5_000/10_000) [settle poke, default cap =
+    ///      maxCapital] = maxCapital = $100 at the $1.00 asset price — still
+    ///      comfortably against the $500 of slashable bond a 10,000-WOOD seat
+    ///      carries at the $0.05 governance haircut. That keeps the SAME
+    ///      proposal executable at every cohort size this file measures,
+    ///      which is the only way the sizes are comparable.
     uint256 constant MAX_CAPITAL = 100e6;
     uint16 constant CERTIFIED_BOUND_BPS = 5_000;
 
@@ -385,7 +393,15 @@ contract SlashGasCeilingTest is Test {
             7 days,
             ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000}),
             _execCalls(),
+            GovEnvelope.defaultCaps(
+                (ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000})).maxCapital,
+                (_execCalls()).length
+            ),
             _settleCalls(),
+            GovEnvelope.defaultCaps(
+                (ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000})).maxCapital,
+                (_settleCalls()).length
+            ),
             new ISyndicateGovernor.CoProposer[](0)
         );
 

@@ -73,10 +73,16 @@
       "type": "t_uint256"
     },
     {
-      "label": "__paramsGap",
+      "label": "_tier2CallCapBps",
       "slot": "29",
       "offset": 0,
-      "type": "t_array(t_uint256)7_storage"
+      "type": "t_uint256"
+    },
+    {
+      "label": "__paramsGap",
+      "slot": "30",
+      "offset": 0,
+      "type": "t_array(t_uint256)6_storage"
     },
     {
       "label": "__emergencyGap",
@@ -175,10 +181,22 @@
       "type": "t_address"
     },
     {
-      "label": "__gap",
+      "label": "_executeCallCaps",
       "slot": "61",
       "offset": 0,
-      "type": "t_array(t_uint256)31_storage"
+      "type": "t_mapping(t_uint256,t_array(t_uint256)dyn_storage)"
+    },
+    {
+      "label": "_settlementCallCaps",
+      "slot": "62",
+      "offset": 0,
+      "type": "t_mapping(t_uint256,t_array(t_uint256)dyn_storage)"
+    },
+    {
+      "label": "__gap",
+      "slot": "63",
+      "offset": 0,
+      "type": "t_array(t_uint256)29_storage"
     }
   ],
   "types": {

@@ -128,7 +128,9 @@ contract ExecuteByBoundaryTest is Test {
             7 days,
             GovEnvelope.permissive(address(vault)),
             _execCalls(),
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_execCalls()).length),
             _settleCalls(),
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_settleCalls()).length),
             new ISyndicateGovernor.CoProposer[](0)
         );
         vm.warp(vm.getBlockTimestamp() + 1);

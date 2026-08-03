@@ -237,7 +237,16 @@ contract ActiveProposalPreservationTest is Test {
     function _propose(string memory uri) internal returns (uint256 proposalId) {
         vm.prank(agent);
         proposalId = governor.propose(
-            address(vault), address(0), uri, 7 days, permissiveEnv, _execCalls(), _settleCalls(), _emptyCoProposers()
+            address(vault),
+            address(0),
+            uri,
+            7 days,
+            permissiveEnv,
+            _execCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_execCalls()).length),
+            _settleCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_settleCalls()).length),
+            _emptyCoProposers()
         );
     }
 
@@ -307,7 +316,9 @@ contract ActiveProposalPreservationTest is Test {
             7 days,
             permissiveEnv,
             _execCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_execCalls()).length),
             _settleCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_settleCalls()).length),
             _emptyCoProposers()
         );
 
@@ -331,7 +342,9 @@ contract ActiveProposalPreservationTest is Test {
             7 days,
             permissiveEnv,
             _execCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_execCalls()).length),
             _settleCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_settleCalls()).length),
             _emptyCoProposers()
         );
 
@@ -353,7 +366,9 @@ contract ActiveProposalPreservationTest is Test {
             7 days,
             permissiveEnv,
             _execCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_execCalls()).length),
             _settleCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_settleCalls()).length),
             _emptyCoProposers()
         );
 

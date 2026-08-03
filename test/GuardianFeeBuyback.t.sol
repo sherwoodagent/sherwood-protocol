@@ -144,7 +144,9 @@ contract GuardianFeeBuybackTest is Test {
             duration,
             GovEnvelope.permissive(address(vault)),
             _noopCalls(),
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_noopCalls()).length),
             _noopCalls(),
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_noopCalls()).length),
             new ISyndicateGovernor.CoProposer[](0)
         );
         vm.warp(block.timestamp + 1);

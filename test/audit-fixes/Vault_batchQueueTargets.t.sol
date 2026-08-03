@@ -138,7 +138,9 @@ contract VaultBatchQueueTargetsTest is Test {
         vm.prank(MOCK_GOVERNOR);
         vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.DisallowedBatchTarget.selector, address(queue)));
         vault.executeGovernorBatch(
-            _batch(address(queue), abi.encodeCall(IVaultWithdrawalQueue.queueRedeem, (attacker, shares, 1))), 1
+            _batch(address(queue), abi.encodeCall(IVaultWithdrawalQueue.queueRedeem, (attacker, shares, 1))),
+            new uint256[](0),
+            1
         );
 
         // No claim was minted, so there is nothing for the attacker to redeem.
@@ -185,7 +187,7 @@ contract VaultBatchQueueTargetsTest is Test {
 
         vm.prank(MOCK_GOVERNOR);
         vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.DisallowedBatchTarget.selector, address(queue)));
-        vault.executeGovernorBatch(calls, 1);
+        vault.executeGovernorBatch(calls, new uint256[](0), 1);
 
         // No slot was burned, so every one of those settlements still lands.
         for (uint256 i = 0; i < 3; i++) {
@@ -205,7 +207,9 @@ contract VaultBatchQueueTargetsTest is Test {
         vm.prank(MOCK_GOVERNOR);
         vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.DisallowedBatchTarget.selector, address(queue)));
         vault.executeGovernorBatch(
-            _batch(address(queue), abi.encodeCall(IVaultWithdrawalQueue.queueDeposit, (attacker, DEPOSIT, 1))), 1
+            _batch(address(queue), abi.encodeCall(IVaultWithdrawalQueue.queueDeposit, (attacker, DEPOSIT, 1))),
+            new uint256[](0),
+            1
         );
 
         assertEq(queue.getRequestsByOwner(attacker).length, 0, "no unfunded deposit claim exists");
@@ -223,7 +227,9 @@ contract VaultBatchQueueTargetsTest is Test {
 
         vm.prank(MOCK_GOVERNOR);
         vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.DisallowedBatchTarget.selector, address(vault)));
-        vault.executeGovernorBatch(_batch(address(vault), abi.encodeCall(ISyndicateVault.reservedQueueAssets, ())), 1);
+        vault.executeGovernorBatch(
+            _batch(address(vault), abi.encodeCall(ISyndicateVault.reservedQueueAssets, ())), new uint256[](0), 1
+        );
     }
 
     /// @notice THE GATE DOES NOT INHERIT THE REGISTRY EXEMPTION. `_guardBatchCalls`
@@ -241,7 +247,9 @@ contract VaultBatchQueueTargetsTest is Test {
         vm.prank(MOCK_GOVERNOR);
         vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.DisallowedBatchTarget.selector, address(queue)));
         vault.executeGovernorBatch(
-            _batch(address(queue), abi.encodeCall(IVaultWithdrawalQueue.stampSettlement, (2, 1, 1))), 1
+            _batch(address(queue), abi.encodeCall(IVaultWithdrawalQueue.stampSettlement, (2, 1, 1))),
+            new uint256[](0),
+            1
         );
     }
 
@@ -259,7 +267,9 @@ contract VaultBatchQueueTargetsTest is Test {
         vm.prank(MOCK_GOVERNOR);
         vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.DisallowedBatchTarget.selector, address(queue)));
         vault.executeGovernorBatch(
-            _batch(address(queue), abi.encodeCall(IVaultWithdrawalQueue.stampSettlement, (2, 1, 1))), 1
+            _batch(address(queue), abi.encodeCall(IVaultWithdrawalQueue.stampSettlement, (2, 1, 1))),
+            new uint256[](0),
+            1
         );
     }
 
@@ -270,7 +280,7 @@ contract VaultBatchQueueTargetsTest is Test {
         _victimEscrowsRedeem();
 
         vm.prank(MOCK_GOVERNOR);
-        vault.executeGovernorBatch(_batch(address(usdc), abi.encodeCall(ERC20Mock.decimals, ())), 1);
+        vault.executeGovernorBatch(_batch(address(usdc), abi.encodeCall(ERC20Mock.decimals, ())), new uint256[](0), 1);
     }
 
     /// @notice ADAPTERS STAY REACHABLE — the regression that matters most.
@@ -305,12 +315,16 @@ contract VaultBatchQueueTargetsTest is Test {
 
         // execute() — onlyVault, named as a batch target, runs.
         vm.prank(MOCK_GOVERNOR);
-        vault.executeGovernorBatch(_batch(address(strategy), abi.encodeCall(BaseStrategy.execute, ())), 1);
+        vault.executeGovernorBatch(
+            _batch(address(strategy), abi.encodeCall(BaseStrategy.execute, ())), new uint256[](0), 1
+        );
         assertEq(strategy.executeCount(), 1, "adapter execute() ran through the batch");
 
         // settle() — same.
         vm.prank(MOCK_GOVERNOR);
-        vault.executeGovernorBatch(_batch(address(strategy), abi.encodeCall(BaseStrategy.settle, ())), 1);
+        vault.executeGovernorBatch(
+            _batch(address(strategy), abi.encodeCall(BaseStrategy.settle, ())), new uint256[](0), 1
+        );
         assertEq(strategy.settleCount(), 1, "adapter settle() ran through the batch");
     }
 }

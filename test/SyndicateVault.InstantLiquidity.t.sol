@@ -140,7 +140,7 @@ contract VaultInstantLiquidityTest is Test {
         vault.setMinBufferBps(1_000); // 10% of 1_000e6 = 100e6 must stay
 
         vm.prank(address(governor));
-        vault.executeGovernorBatch(_deployBatch(address(strat), 900e6), type(uint256).max);
+        vault.executeGovernorBatch(_deployBatch(address(strat), 900e6), new uint256[](0), type(uint256).max);
         assertEq(usdc.balanceOf(address(vault)), 100e6);
     }
 
@@ -152,14 +152,14 @@ contract VaultInstantLiquidityTest is Test {
 
         vm.prank(address(governor));
         vm.expectRevert(ISyndicateVault.BufferBreached.selector);
-        vault.executeGovernorBatch(_deployBatch(address(strat), 900e6 + 1), type(uint256).max);
+        vault.executeGovernorBatch(_deployBatch(address(strat), 900e6 + 1), new uint256[](0), type(uint256).max);
     }
 
     function test_governorBatch_bufferOff_allowsFullDeploy() public {
         vm.prank(alice);
         vault.deposit(1_000e6, alice);
         vm.prank(address(governor));
-        vault.executeGovernorBatch(_deployBatch(address(strat), 1_000e6), type(uint256).max);
+        vault.executeGovernorBatch(_deployBatch(address(strat), 1_000e6), new uint256[](0), type(uint256).max);
         assertEq(usdc.balanceOf(address(vault)), 0);
     }
 
@@ -169,10 +169,10 @@ contract VaultInstantLiquidityTest is Test {
         vm.prank(owner);
         vault.setMinBufferBps(1_000);
         vm.prank(address(governor));
-        vault.executeGovernorBatch(_deployBatch(address(strat), 900e6), type(uint256).max);
+        vault.executeGovernorBatch(_deployBatch(address(strat), 900e6), new uint256[](0), type(uint256).max);
 
         strat.pushBack(900e6);
         vm.prank(address(governor));
-        vault.executeGovernorBatch(new BatchExecutorLib.Call[](0), type(uint256).max);
+        vault.executeGovernorBatch(new BatchExecutorLib.Call[](0), new uint256[](0), type(uint256).max);
     }
 }

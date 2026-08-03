@@ -156,7 +156,9 @@ contract FeeBlacklistResilienceTest is Test {
             duration,
             GovEnvelope.permissive(address(vault)),
             _noopCalls(),
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_noopCalls()).length),
             _noopCalls(),
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_noopCalls()).length),
             coProps
         );
         vm.warp(block.timestamp + 1);
