@@ -1,0 +1,198 @@
+{
+  "storage": [
+    {
+      "label": "_agents",
+      "slot": "0",
+      "offset": 0,
+      "type": "t_mapping(t_address,t_struct(AgentConfig)_storage)"
+    },
+    {
+      "label": "_agentSet",
+      "slot": "1",
+      "offset": 0,
+      "type": "t_struct(AddressSet)_storage"
+    },
+    {
+      "label": "_executorImpl",
+      "slot": "3",
+      "offset": 0,
+      "type": "t_address"
+    },
+    {
+      "label": "_approvedDepositors",
+      "slot": "4",
+      "offset": 0,
+      "type": "t_struct(AddressSet)_storage"
+    },
+    {
+      "label": "_openDeposits",
+      "slot": "6",
+      "offset": 0,
+      "type": "t_bool"
+    },
+    {
+      "label": "_agentRegistry",
+      "slot": "6",
+      "offset": 1,
+      "type": "t_contract(IERC721)"
+    },
+    {
+      "label": "_managementFeeBps",
+      "slot": "7",
+      "offset": 0,
+      "type": "t_uint256"
+    },
+    {
+      "label": "_factory",
+      "slot": "8",
+      "offset": 0,
+      "type": "t_address"
+    },
+    {
+      "label": "_expectedExecutorCodehash",
+      "slot": "9",
+      "offset": 0,
+      "type": "t_bytes32"
+    },
+    {
+      "label": "_cachedDecimalsOffset",
+      "slot": "10",
+      "offset": 0,
+      "type": "t_uint8"
+    },
+    {
+      "label": "_withdrawalQueue",
+      "slot": "10",
+      "offset": 1,
+      "type": "t_address"
+    },
+    {
+      "label": "_laneALockPid",
+      "slot": "11",
+      "offset": 0,
+      "type": "t_mapping(t_address,t_uint256)"
+    },
+    {
+      "label": "_agentFeeBpsPlusOne",
+      "slot": "12",
+      "offset": 0,
+      "type": "t_uint256"
+    },
+    {
+      "label": "minBufferBps",
+      "slot": "13",
+      "offset": 0,
+      "type": "t_uint16"
+    },
+    {
+      "label": "minHoldingPeriod",
+      "slot": "13",
+      "offset": 2,
+      "type": "t_uint32"
+    },
+    {
+      "label": "instantExitFeeBps",
+      "slot": "13",
+      "offset": 6,
+      "type": "t_uint16"
+    },
+    {
+      "label": "_interimNetFlow",
+      "slot": "14",
+      "offset": 0,
+      "type": "t_int256"
+    },
+    {
+      "label": "lastDepositAt",
+      "slot": "15",
+      "offset": 0,
+      "type": "t_mapping(t_address,t_uint40)"
+    },
+    {
+      "label": "_mgmtAssetSeconds",
+      "slot": "16",
+      "offset": 0,
+      "type": "t_uint256"
+    },
+    {
+      "label": "_mgmtBase",
+      "slot": "17",
+      "offset": 0,
+      "type": "t_uint192"
+    },
+    {
+      "label": "_mgmtLastUpdate",
+      "slot": "17",
+      "offset": 24,
+      "type": "t_uint64"
+    },
+    {
+      "label": "_highWaterPricePerShare",
+      "slot": "18",
+      "offset": 0,
+      "type": "t_uint256"
+    },
+    {
+      "label": "_crystallizedMgmt",
+      "slot": "19",
+      "offset": 0,
+      "type": "t_uint128"
+    },
+    {
+      "label": "_crystallizedPerf",
+      "slot": "19",
+      "offset": 16,
+      "type": "t_uint128"
+    },
+    {
+      "label": "__gap",
+      "slot": "20",
+      "offset": 0,
+      "type": "t_array(t_uint256)28_storage"
+    }
+  ],
+  "types": {
+    "t_struct(AddressSet)_storage": [
+      {
+        "label": "_inner",
+        "slot": "0",
+        "offset": 0,
+        "type": "t_struct(Set)_storage"
+      }
+    ],
+    "t_struct(AgentConfig)_storage": [
+      {
+        "label": "agentId",
+        "slot": "0",
+        "offset": 0,
+        "type": "t_uint256"
+      },
+      {
+        "label": "agentAddress",
+        "slot": "1",
+        "offset": 0,
+        "type": "t_address"
+      },
+      {
+        "label": "active",
+        "slot": "1",
+        "offset": 20,
+        "type": "t_bool"
+      }
+    ],
+    "t_struct(Set)_storage": [
+      {
+        "label": "_values",
+        "slot": "0",
+        "offset": 0,
+        "type": "t_array(t_bytes32)dyn_storage"
+      },
+      {
+        "label": "_positions",
+        "slot": "1",
+        "offset": 0,
+        "type": "t_mapping(t_bytes32,t_uint256)"
+      }
+    ]
+  }
+}
