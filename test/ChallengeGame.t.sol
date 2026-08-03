@@ -269,6 +269,37 @@ contract MockChallengeLedger {
         return total;
     }
 
+    /// @dev `ChallengeGame.file`'s ACTUAL bond-sizing basis (Pashov re-audit
+    ///      of #158, finding 3): the real ledger's `unsharedLiabilityUsd` is a
+    ///      separate function from `liabilityUsd` precisely so the challenger
+    ///      bond does not shrink under `liabilityUsd`'s cross-proposal
+    ///      sharing. This mock mirrors that split with its own independent
+    ///      default/override pair, so a test that calls `setLiabilityUsd`
+    ///      alone (exercising some OTHER consumer of `liabilityUsd`) does not
+    ///      silently also move the bond `file()` charges, and vice versa.
+    ///      DEFAULTS identically to `liabilityUsd` above — the sum of
+    ///      reservations — so a suite that never calls either setter sees the
+    ///      same bond sizing regardless of which function `file()` calls.
+    mapping(bytes32 reviewKey => uint256) internal _unsharedLiabilityUsd;
+    mapping(bytes32 reviewKey => bool) internal _unsharedLiabilitySet;
+
+    function setUnsharedLiabilityUsd(address governor, uint256 proposalId, uint256 usd) external {
+        bytes32 k = _key(governor, proposalId);
+        _unsharedLiabilityUsd[k] = usd;
+        _unsharedLiabilitySet[k] = true;
+    }
+
+    function unsharedLiabilityUsd(address governor, uint256 proposalId) external view returns (uint256) {
+        bytes32 k = _key(governor, proposalId);
+        if (_unsharedLiabilitySet[k]) return _unsharedLiabilityUsd[k];
+        address[] storage list = _approvers[k];
+        uint256 total;
+        for (uint256 i = 0; i < list.length; i++) {
+            total += _committed[k][list[i]];
+        }
+        return total;
+    }
+
     function _key(address governor, uint256 proposalId) internal pure returns (bytes32) {
         return keccak256(abi.encode(governor, proposalId));
     }
@@ -803,7 +834,10 @@ contract ChallengeGameTest is Test {
 
     function test_file_bondIsSizedOnLiabilityNotReservations() public {
         _setCoverage(PROPOSAL, 6_000e18, 4_000e18); // reservations sum to $10,000
-        ledger.setLiabilityUsd(address(gov), PROPOSAL, 8_000e18); // but only $8,000 is takeable
+        // `file()` reads `unsharedLiabilityUsd`, not `liabilityUsd` (Pashov
+        // re-audit of #158, finding 3) — see the mock's own note on the two
+        // functions' independent defaults/overrides.
+        ledger.setUnsharedLiabilityUsd(address(gov), PROPOSAL, 8_000e18); // but only $8,000 is takeable
         _execute(PROPOSAL);
 
         vm.prank(challenger);
@@ -823,7 +857,9 @@ contract ChallengeGameTest is Test {
     ///         could take from it.
     function test_file_bondUsesReservationsWhenTheyAreTheSmallerFigure() public {
         _setCoverage(PROPOSAL, 6_000e18, 4_000e18); // reservations sum to $10,000
-        ledger.setLiabilityUsd(address(gov), PROPOSAL, 25_000e18); // a larger need
+        // `file()` reads `unsharedLiabilityUsd`, not `liabilityUsd` — see the
+        // note on `test_file_bondIsSizedOnLiabilityNotReservations`.
+        ledger.setUnsharedLiabilityUsd(address(gov), PROPOSAL, 25_000e18); // a larger need
         _execute(PROPOSAL);
 
         vm.prank(challenger);

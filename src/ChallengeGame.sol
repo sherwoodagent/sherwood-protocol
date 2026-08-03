@@ -753,8 +753,23 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         // its need. Sizing the bond off it made a proposal more expensive to
         // challenge the better covered it was, while the recoverable total
         // stayed flat — the exact inversion of D4, which sizes the bond to the
-        // exposure a filing freezes. `liabilityUsd` is that exposure, asked for
-        // once.
+        // exposure a filing freezes. `unsharedLiabilityUsd` is that exposure,
+        // asked for once.
+        //
+        // UNSHARED, DELIBERATELY (Pashov re-audit of #158, finding 3,
+        // confidence 78) — NOT `liabilityUsd`. Once hardening #35 made
+        // `liabilityUsd` pro-rate a guardian's slashable basis across every
+        // OTHER open proposal it also backs (D9, the shared-stake fix), using
+        // that SHARED figure here diluted this bond every time
+        // `kNumerator > 1` and the accused cohort happened to also be backing
+        // another proposal — an ordinary, legitimate operating condition, not
+        // an adversarial one. The bond exists to price what THIS FILING
+        // freezes for THIS accused cohort; it must not get cheaper just
+        // because the same guardians are busy elsewhere. `slashVerdict`'s
+        // actual punitive take is not pro-rated either, so a shared-basis
+        // bond tracked something strictly smaller than what a conviction can
+        // still take — exactly the gap `unsharedLiabilityUsd` closes by
+        // reproducing `liabilityUsd`'s PRE-D9 computation.
         //
         // NOTE — the slash no longer shares this basis. `slashBpsFor` used to
         // price convictions against the same ALLOCATION, which is why this
@@ -767,21 +782,22 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         // short of the need is still priced on what it pledged, because that is
         // all there is to take.
         //
-        // CAUGHT, because `liabilityUsd` reads the ASSET feed and this function
-        // otherwise reads none. A stale feed must not make filing impossible
-        // during exactly the market stress a drain happens in — the same
-        // liveness hole the ledger already documents on the slash path. Falling
-        // back to the reservation sum over-charges the challenger, which is
-        // recoverable; being unable to file at all is not.
-        try exposureLedger.liabilityUsd(governor, proposalId) returns (uint256 liability) {
+        // CAUGHT, because `unsharedLiabilityUsd` reads the ASSET feed and this
+        // function otherwise reads none. A stale feed must not make filing
+        // impossible during exactly the market stress a drain happens in — the
+        // same liveness hole the ledger already documents on the slash path.
+        // Falling back to the reservation sum over-charges the challenger,
+        // which is recoverable; being unable to file at all is not.
+        try exposureLedger.unsharedLiabilityUsd(governor, proposalId) returns (uint256 liability) {
             if (liability != 0 && liability < coverageUsd) coverageUsd = liability;
         } catch {}
 
         // The bond scales with the exposure the filing freezes, converted at
         // the ledger's composed WOOD/USD price (X8) — the same haircut-applied
         // price every other conversion in this codebase divides by, so it
-        // stays in the same units as `liabilityUsd`'s own numerator and stays
-        // fresh with market stress rather than a manually-updated scalar.
+        // stays in the same units as `unsharedLiabilityUsd`'s own numerator
+        // and stays fresh with market stress rather than a manually-updated
+        // scalar.
         // Fails closed on both an unset price (transient, protocol-wide — wait
         // for governance) and a bond that floors to zero (permanent,
         // proposal-specific — no coverage or price change fixes it), named

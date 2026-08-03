@@ -227,6 +227,21 @@ interface IExposureLedger {
     ///         actually pay when it cannot.
     function liabilityUsd(address governor, uint256 proposalId) external view returns (uint256);
 
+    /// @notice The UNSHARED counterpart of `liabilityUsd`: what a conviction on
+    ///         THIS proposal alone can take, ignoring any pro-rata sharing with
+    ///         OTHER open proposals the same guardian(s) also back.
+    /// @dev    `liabilityUsd` is the right basis for pricing a conviction's
+    ///         actual recovery, and is deliberately pro-rated once a guardian
+    ///         backs more than one open proposal — a conviction can only ever
+    ///         take one real, shared bond. `ChallengeGame.file`'s
+    ///         anti-frivolous-filing bond is a different quantity: it prices
+    ///         what THIS FILING freezes for THIS accused cohort, and must not
+    ///         shrink merely because the same guardians happen to be juggling
+    ///         other open commitments under `kNumerator > 1` (Pashov re-audit
+    ///         of #158, finding 3). `ChallengeGame.file` is the intended
+    ///         caller; every other consumer keeps reading `liabilityUsd`.
+    function unsharedLiabilityUsd(address governor, uint256 proposalId) external view returns (uint256);
+
     /// @notice Return each approver's over-reservation once the review has shut
     ///         and the approver set is final. Permissionless; safe to skip.
     /// @dev    Re-runnable, and a caller that prices money off a settled

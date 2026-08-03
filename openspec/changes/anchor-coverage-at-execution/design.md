@@ -419,12 +419,202 @@ reproducing the audit's own numeric trace
 plus a regression guard for the single-open-proposal case
 (`test_finding2_singleOpenProposalIsUnaffectedByTheSharedStakeFix`).
 
+## Post-merge audit hardening #2 (2026-08-03, Pashov re-audit of PR #158)
+
+The 12-agent re-audit of the D8/D9 fix above (issuecomment-5165468296) found
+four confirmed gaps in the D9 shared-stake mechanism specifically. D8 (finding
+1 of the FIRST review) was independently re-verified clean by 9 of 12 agents
+in this round and required no change. This section is a remediation of a
+remediation — every design choice below is scoped to closing D9's own gaps,
+not reopening D1-D8.
+
+### D10 — Four gaps in the shared-stake mechanism (findings 1-4, confidence 88/85/78/75)
+
+**Finding 1 [88] — `requireApproveQuorum` was never routed through D9's fix.**
+D9's `_sharedSlashableUsd` replaced the bare `min(reserved, slashable)` clamp
+in `_effectiveTotal`, `_effectiveReservedTotal`, `allocatedUsd`, and
+`settleCoverage` — but `requireApproveQuorum`, the ACTUAL gate
+`SyndicateGovernor.executeProposal` calls to decide whether a proposal may
+execute, was missed. It kept computing `live = _slashableBondUsd(g, priceX8,
+0)` and clamping only `min(live, reserved)` per approver, with nothing shared
+across that guardian's other open proposals — reproducing D9's exact
+double-count at the one call site that actually gates execution. This was the
+highest-confidence finding in the re-audit precisely because it is the
+call site with the most direct consequence: two proposals could each
+independently execute against a stake that, once shared, covers only one.
+
+Fix: route through `_sharedSlashableUsd` exactly like every other consumer
+(`ExposureLedger.sol`, `requireApproveQuorum`'s loop body). No new
+storage or interface change was needed for this finding alone — it was a
+missed call site, not a missing mechanism.
+
+**Finding 2 [85] — `openExposureUsd` is not a sound proxy for "sum of this
+guardian's live open reservations."** D9's `_sharedSlashableUsd` divided by
+`openExposureUsd(g)` on the theory that it already summed exactly what the
+sharing invariant needed. It does not: `openExposureUsd` is a rolling
+WALL-CLOCK bucket scan (`[from, to]` keyed off `challengeWindow`), while
+`_recorded[key][g].usd`/`_reservedUsd[key][g]` — the numerator every sharing
+consumer reads — are cleared ONLY by an explicit `releaseApproval` or a
+`_rebook` write, never by wall-clock decay. The re-audit found five distinct,
+concretely-reproduced triggers for this mismatch: ordinary bucket aging with
+no release action (agents 9, 5), a frozen/pinned proposal (issue #95's
+mechanism) outliving its own bucket while still legally accusable (agent 3),
+an owner `setChallengeWindow` shrink retroactively excluding an already-open
+bucket (agent 11), a `ChallengeGame` `Inconclusive`-resolution re-arm
+outliving the bucket (agent 12), and the general case of a proposal never
+being released or settled at all — which the contract's own docs call safe
+to do.
+
+*Options considered* (per the audit's own framing): (A) maintain a
+per-guardian running sum keyed directly off the `_recorded`/`_reservedUsd`
+writes, decremented only on explicit release/settlement; (B) union the
+denominator with `_frozenCommitments`/`_pinnedCoverageUntil` (issue #95's
+existing frozen/pinned tracking).
+
+*Decision: (A), via TWO exact accumulators, not one.* Two new per-guardian
+mappings, `_liveBookedUsd` and `_livePledgedUsd`, mirror `_buckets`'
+(booking) and `_reservedUsd`'s (pledge) own writes exactly —
+incremented in `recordApproval`, decremented in `releaseApproval`, and (for
+`_liveBookedUsd` only, since `_rebook` never touches `_reservedUsd`) adjusted
+by `_rebook`'s delta in both directions — but with NO wall-clock window and
+NO expiry. `_sharedSlashableUsd`'s denominator is now a `liveTotal` parameter
+the CALLER supplies, matched to whichever basis (booking or pledge) that
+caller's own `reserved` term was read on, rather than a single function
+internally re-deriving one denominator for every basis. This closes finding 2
+by construction: `Σ reserved_i == liveTotal` holds exactly, for every trigger
+above, because neither accumulator has any wall-clock dependency to exploit.
+
+Option B was rejected as explicitly insufficient by the audit itself (agent
+9: does not cover ordinary aging or the `setChallengeWindow` trigger; agent
+12: a per-read floor protects only the read proposal, not its siblings
+dividing by the same shrunken pool) — it would need to be combined with
+option A to close every trigger, at which point option A alone is simpler and
+strictly more complete.
+
+`openExposureUsd` ITSELF IS UNCHANGED, deliberately: it remains the correct,
+wall-clock-decaying basis for `recordApproval`'s and `_rebook`'s BATCHING cap
+(issue #110), whose whole point IS to let a guardian's budget recycle once a
+commitment ages past challengeability. The shared-stake denominator and the
+batching-cap denominator answer different questions and must not share one
+implementation — that conflation was D9's actual mistake, not merely an
+implementation detail of it.
+
+*Accepted trade-off, stated explicitly:* a guardian's approval that is never
+released and never settled stays counted in the new accumulators FOREVER,
+even once its own challenge window has long elapsed and it is no longer
+legally slashable. This is not a new staleness class — `_recorded[key][g]
+.usd`, the numerator every sharing consumer already reads, has the identical
+property today, for the identical reason. Making the denominator match the
+numerator's existing staleness is strictly more correct than the wall-clock
+proxy it replaces (which was inconsistent with the numerator, not merely
+imprecise), never less protective. A guardian that wants its budget back from
+an abandoned approval can still call `releaseApproval` (via a registry vote
+change) at any time; nothing about this fix removes that path.
+
+*Coverage claimed:* regression tests reproduce triggers 1
+(`test_finding2_trigger1_ordinaryWallClockAgingWithNoRelease`), 2
+(`test_finding2_trigger2_frozenPinnedProposalAgesOutOfTheOldDenominatorButNotTheNewOne`),
+and 3
+(`test_finding2_trigger3_challengeWindowShrinkDoesNotReopenTheSharedDenominator`)
+against the FIXED contract, each showing the OLD `openExposureUsd`-based
+denominator would have reproduced the double-count (documented in the test
+comments with hand-derived arithmetic, since the pre-fix code path no longer
+exists to execute directly) while the fixed code sums correctly. Triggers 4
+(the `Inconclusive` re-arm) and the general "never released" case are not
+independently tested by name, but are covered by the SAME architectural
+argument as triggers 1-3: none of them depend on wall-clock state that the
+new accumulators read, so there is no trigger-specific code path left for
+them to exploit. This is a claim about the fix's structure (removing the
+shared mechanism's only wall-clock dependency), not a claim that every
+individual trigger was independently reproduced end-to-end.
+
+**Finding 3 [78] — `ChallengeGame.file`'s bond sizing must not use the
+now-shared `liabilityUsd`.** Once D9 made `liabilityUsd` pro-rate a
+guardian's slashable basis across every other open proposal it backs,
+`ChallengeGame.file`'s anti-frivolous-filing bond — which reads
+`liabilityUsd` to cap what it charges — got diluted every time `kNumerator >
+1` and the accused cohort also happened to be backing another open proposal:
+an ordinary, legitimate operating condition, not an adversarial one. The bond
+prices what THIS filing freezes for THIS accused cohort and must not shrink
+because the same guardians are busy elsewhere; meanwhile `slashVerdict`'s
+actual punitive take is not pro-rated at all, so the mismatch was real (bond
+tracks something smaller than what a conviction can still take).
+
+Fix: a new view, `ExposureLedger.unsharedLiabilityUsd` (and the internal
+`_unsharedEffectiveTotal` it wraps), reproduces `_effectiveTotal`'s PRE-D9
+computation — `min(reserved, slashableBondUsd(g, anchor))` per approver, no
+sharing — exposed as a separate function rather than a mode flag on
+`liabilityUsd`, so the two concepts (what a conviction can recover, cohort-
+wide; what one filing must bond against, cohort-specific) stay textually
+distinct at every call site. `ChallengeGame.file` now calls
+`unsharedLiabilityUsd` instead of `liabilityUsd`; every other consumer
+(off-chain fee attribution, `allocatedUsd`) keeps reading the shared figure,
+unchanged. Proven against the audit's own k=2 numeric trace
+(`test_finding3_unsharedLiabilityUsdIsNotDilutedByASiblingProposal`).
+
+**Finding 4 [75] — `_effectiveReservedTotal` mixed a frozen pledge numerator
+with a live booking denominator.** Before this fix, `_effectiveReservedTotal`
+fed `_sharedSlashableUsd` a PLEDGE numerator (`_reservedUsd[key][g]`, fixed at
+`recordApproval`) while dividing by `openExposureUsd(g)`, which sums the
+CURRENT booking — actively shrunk by `settleCoverage`'s own prior `_rebook`
+writes, including writes from an EARLIER pass on the SAME proposal. On a
+re-settle, this could push the "shares sum to <= 1" partition-of-unity
+property above 1: the denominator had already fallen (from the first pass)
+while the numerator (the pledge) had not moved at all, inflating the ratio.
+
+This is the SAME root cause as finding 2 (a caller reading `openExposureUsd`
+on one basis while another basis was really needed), and the finding 2 fix
+closes it as a direct consequence: `_effectiveReservedTotal`'s denominator is
+now `_livePledgedUsd[g]`, which — like `_reservedUsd` itself — is written
+ONLY by `recordApproval`/`releaseApproval` and is completely untouched by
+`settleCoverage`/`_rebook`. For a guardian whose pledge on this proposal has
+not changed, `reserved == _livePledgedUsd[g]` (when this is the guardian's
+only open commitment) or is at least measured on the identical basis as every
+other term summed into `_livePledgedUsd[g]`, so the denominator can no longer
+be inflated by this proposal's OWN prior settlement pass, closing the
+mismatch at its root rather than needing a second, targeted fix. No separate
+implementation was required for finding 4 — it is a corollary of finding 2's
+fix, verified (not merely asserted) with a dedicated regression test
+reproducing the audit's own trace: two guardians pledge $1,000 each on a
+$1,000-need proposal, settle once (writing both bookings down to $500
+pro-rata), WOOD price crashes 60% (dropping each live bond to $400),
+re-settle — `allocatedUsd` after the re-settle is exactly $400 for each
+guardian, never exceeding the crashed live cap
+(`test_finding4_reSettleAfterAPriceCrashNeverExceedsTheLiveCap`). The test's
+comments hand-derive what the OLD `openExposureUsd`-based denominator would
+have produced instead (a booking left at $500 against a $400 real cap — a
+genuine breach) for direct contrast.
+
+**Why two accumulators, not one shared by every caller.** Using a single
+non-decaying accumulator (say, always the pledge-basis one) for every call
+site would have been simpler, but would silently change `allocatedUsd`'s
+and `liabilityUsd`'s existing numeric behaviour in the ordinary case where a
+proposal's booking has been written down below its pledge by its own prior
+settlement (a legitimate, common state, not an edge case) — those callers
+read `_recorded[key][g].usd` (booking), and dividing a booking numerator by
+a pledge denominator reproduces exactly finding 4's basis-mismatch bug in the
+opposite direction. Matching each call site's existing basis exactly was
+judged safer than introducing a new, uniform approximation, at the cost of
+one extra `mapping(address => uint256)` slot — cheap, and `ExposureLedger` is
+not upgradeable/golden-pinned, so the addition carries no storage-layout
+risk (`script/check-layout-goldens.sh` does not cover this contract).
+
 ## Migration Plan
 
-Pure code + view additions; no storage migration, no golden regeneration
-(`./script/check-layout-goldens.sh` must pass UNCHANGED — a golden diff in
-this change is a bug). Deploy order unaffected (no new wiring). Rollback is
-a revert of the code change.
+Pure code + view additions, PLUS two new `internal` storage mappings on
+`ExposureLedger` (`_liveBookedUsd`, `_livePledgedUsd`, added 2026-08-03 for
+D10 finding 2/4) and one new external view (`unsharedLiabilityUsd`, added for
+D10 finding 3). `ExposureLedger` is deployed directly (constructor +
+immutables, no proxy) and is NOT one of the four contracts
+`script/check-layout-goldens.sh` pins, so the new storage carries no
+layout-collision risk and needs no golden regeneration; that script must
+still pass UNCHANGED (a golden diff on the three contracts it DOES pin would
+be a bug). `IExposureLedger.unsharedLiabilityUsd` is a pure interface
+addition — existing implementers of the interface other than
+`ExposureLedger` itself (there are none in this codebase) would need to add
+it, same as any other interface extension. Deploy order unaffected (no new
+wiring; `ChallengeGame` calls the new view through the SAME `exposureLedger`
+pointer it already holds). Rollback is a revert of the code change.
 
 ## Open Questions
 
