@@ -48,6 +48,15 @@ contract SelectorGuardTest is Test {
     bytes4 constant SEL_TRANSFER = 0xa9059cbb;
     bytes4 constant SEL_TRANSFER_FROM = 0x23b872dd;
 
+    // Alternate-signature "pull via delegated allowance" selectors — see the
+    // PR #157 audit remediation (issue #115). `cast sig`-verified in
+    // design.md; the guard now recognizes these alongside the four legacy
+    // selectors above.
+    bytes4 constant SEL_PERMIT2_TRANSFER_FROM = 0x36c78516; // Permit2 AllowanceTransfer.transferFrom(address,address,uint160,address)
+    bytes4 constant SEL_PERMIT2_APPROVE = 0x87517c45; // Permit2 AllowanceTransfer.approve(address,address,uint160,uint48)
+    bytes4 constant SEL_DSTOKEN_PULL = 0xf2d5d56b; // DSToken pull(address,uint256)
+    bytes4 constant SEL_DSTOKEN_MOVE = 0xbb35783b; // DSToken move(address,address,uint256)
+
     function setUp() public {
         usdc = new ERC20Mock("USD Coin", "USDC", 6);
         otherToken = new ERC20Mock("Other", "OTH", 18);
@@ -315,5 +324,170 @@ contract SelectorGuardTest is Test {
     function test_nonGuardedSelectorPassesUntouched() public {
         // balanceOf(address) — harmless read selector routed through the batch.
         _exec(_one(address(usdc), abi.encodeCall(usdc.balanceOf, (attacker))));
+    }
+
+    // ── PR #157 audit remediation: alternate-signature allowance routers ──
+    //
+    // Finding 1 [90, 3-agent convergence]: `_guardBatchCalls` matched ONLY the
+    // four legacy-ERC20 selectors, so Permit2's AllowanceTransfer singleton
+    // and DSToken-lineage pull/move exposed the identical "move tokens via
+    // delegated allowance" capability under different selectors — completely
+    // invisible to both the Part 1b source guard and the Part 2 destination
+    // guard. The guard reverts inside `_guardBatchCalls`, BEFORE the batch
+    // ever delegatecalls into its targets, so these tests use a bare address
+    // stand-in for Permit2/DSToken (no mock contract needed) — the assertion
+    // is purely about the guard's own selector/offset decoding.
+    address permit2 = makeAddr("permit2");
+    address dstoken = makeAddr("dstoken");
+
+    /// @notice Mirrors the audit's own trace verbatim: a governor batch calls
+    ///         `Permit2.transferFrom(victimLP, attacker, amount, token)`. The
+    ///         legacy guard's selector match (`_SEL_TRANSFER_FROM`) never
+    ///         fires — `0x36c78516 != 0x23b872dd` — so before this fix the
+    ///         call passed both Part 1b and Part 2 with zero inspection,
+    ///         reproducing the exact single-tx LP-allowance-confiscation bug
+    ///         PR #157 exists to close, just routed through Permit2.
+    function test_permit2TransferFromThirdPartySourceReverts_LPAllowanceConfiscation() public {
+        address victimLP = makeAddr("victimLP");
+        vm.expectRevert(
+            abi.encodeWithSelector(ISyndicateVault.DisallowedTransferFromSource.selector, permit2, victimLP)
+        );
+        _exec(
+            _one(
+                permit2,
+                abi.encodeWithSelector(SEL_PERMIT2_TRANSFER_FROM, victimLP, attacker, uint160(1_000e6), address(usdc))
+            )
+        );
+    }
+
+    /// @notice Companion to the trace above: `from == vault` via Permit2 is
+    ///         still permitted, exactly like legacy `transferFrom` (Decision 4,
+    ///         design.md) — the guard's Permit2 recognition is symmetric with
+    ///         the legacy selector it stands in for, not a one-sided
+    ///         restriction.
+    function test_permit2TransferFromVaultSourceToAllowlistedAdapterPasses() public {
+        _exec(
+            _one(
+                permit2,
+                abi.encodeWithSelector(
+                    SEL_PERMIT2_TRANSFER_FROM, address(vault), adapter, uint160(1_000e6), address(usdc)
+                )
+            )
+        );
+    }
+
+    /// @notice Second confirmed attack shape from the audit: a governor batch
+    ///         calls `Permit2.approve(token, attacker, max, max)` — invisible
+    ///         to the legacy guard's selector match (`0x87517c45 !=
+    ///         0x095ea7b3`), reopening the pre-existing two-tx
+    ///         poison-then-drain bug Part 2 exists to close, just routed
+    ///         through Permit2. Permit2's `approve` carries an extra leading
+    ///         `token` arg vs legacy `approve`, shifting the guarded `spender`
+    ///         to arg 2 (bytes 36:68) — this test also pins that offset.
+    function test_permit2ApproveToNonAllowlistedSpenderReverts() public {
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                ISyndicateVault.DisallowedTransferTarget.selector, permit2, SEL_PERMIT2_APPROVE, attacker
+            )
+        );
+        _exec(
+            _one(
+                permit2,
+                abi.encodeWithSelector(
+                    SEL_PERMIT2_APPROVE, address(usdc), attacker, uint160(type(uint160).max), uint48(type(uint48).max)
+                )
+            )
+        );
+    }
+
+    function test_permit2ApproveToAllowlistedAdapterPasses() public {
+        _exec(
+            _one(
+                permit2,
+                abi.encodeWithSelector(SEL_PERMIT2_APPROVE, address(usdc), adapter, uint160(1_000e6), uint48(0))
+            )
+        );
+    }
+
+    /// @notice DSToken `pull(usr, wad)` always pulls TO msg.sender (the vault,
+    ///         under delegatecall) — same class of bypass as Permit2's
+    ///         transferFrom, just a two-argument selector with no explicit
+    ///         `to`.
+    function test_dstokenPullThirdPartySourceReverts() public {
+        address victim = makeAddr("dstokenVictim");
+        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.DisallowedTransferFromSource.selector, dstoken, victim));
+        _exec(_one(dstoken, abi.encodeWithSelector(SEL_DSTOKEN_PULL, victim, 1_000e18)));
+    }
+
+    /// @notice DSToken `move(src, dst, wad)` — source at bytes 4:36 like
+    ///         `transferFrom`; Part 1b must catch a non-vault `src`
+    ///         regardless of `dst`.
+    function test_dstokenMoveThirdPartySourceReverts() public {
+        address victim = makeAddr("dstokenVictim2");
+        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.DisallowedTransferFromSource.selector, dstoken, victim));
+        _exec(_one(dstoken, abi.encodeWithSelector(SEL_DSTOKEN_MOVE, victim, attacker, 1_000e18)));
+    }
+
+    /// @notice Vault-sourced DSToken `move` to a non-allowlisted destination
+    ///         still hits the Part 2 destination guard (dst at bytes 36:68) —
+    ///         same shape as the legacy `test_transferFromToNonAllowlistedReverts`.
+    function test_dstokenMoveVaultSourceToNonAllowlistedReverts() public {
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                ISyndicateVault.DisallowedTransferTarget.selector, dstoken, SEL_DSTOKEN_MOVE, attacker
+            )
+        );
+        _exec(_one(dstoken, abi.encodeWithSelector(SEL_DSTOKEN_MOVE, address(vault), attacker, 1_000e18)));
+    }
+
+    // ── PR #157 audit remediation: self-transfer fast-path scoped to asset() ──
+    //
+    // Finding 2 [80]: Part 2's `recipient == address(this) -> continue`
+    // exempted ANY token whose destination decoded to the vault, not only
+    // `asset()` — the one token the outer `netOutflow` balance-diff meter in
+    // `executeGovernorBatch` actually verifies. A non-standard token the
+    // vault holds as a strategy position could execute arbitrary logic under
+    // `transferFrom(vault, vault, amount)` with zero verification anywhere in
+    // the pipeline.
+
+    /// @notice The audit's exact attack shape: `EvilToken.transferFrom(vault,
+    ///         vault, amount)` on a token that is neither `asset()` nor
+    ///         allowlisted in the TierRegistry. Before this fix, `recipient ==
+    ///         vault` short-circuited straight past the registry check
+    ///         regardless of which token — this must now revert.
+    function test_nonAssetSelfTransferFastPathNoLongerExempt() public {
+        otherToken.mint(address(vault), 1_000e18);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                ISyndicateVault.DisallowedTransferTarget.selector,
+                address(otherToken),
+                SEL_TRANSFER_FROM,
+                address(vault)
+            )
+        );
+        _exec(
+            _one(
+                address(otherToken), abi.encodeCall(otherToken.transferFrom, (address(vault), address(vault), 1_000e18))
+            )
+        );
+    }
+
+    /// @notice `asset()` itself keeps the fast-path: it is the one token the
+    ///         outer net-outflow meter independently verifies via a balance
+    ///         diff, so a vault-to-vault self-transfer of `asset()` is still
+    ///         exempt from the registry check (same self-approve pattern as
+    ///         `test_vaultSourcedTransferFromToAllowlistedAdapterPasses`).
+    function test_assetSelfTransferFastPathStillExempt() public {
+        BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](2);
+        calls[0] = BatchExecutorLib.Call({
+            target: address(usdc), data: abi.encodeCall(usdc.approve, (address(vault), 1e6)), value: 0
+        });
+        calls[1] = BatchExecutorLib.Call({
+            target: address(usdc),
+            data: abi.encodeCall(usdc.transferFrom, (address(vault), address(vault), 1e6)),
+            value: 0
+        });
+        _exec(calls);
+        assertEq(usdc.balanceOf(address(vault)), 10_000e6);
     }
 }

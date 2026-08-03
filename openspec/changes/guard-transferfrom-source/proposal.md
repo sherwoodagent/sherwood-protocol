@@ -27,3 +27,12 @@
 - **Behavior**: strictly rejects previously-accepted-but-malicious batches. No honest batch encodes a raw `transferFrom` at all (verified across `src/strategies/*`, `src/adapters/*`, and all batch fixtures), so there is no functional regression.
 - **Tests**: `test/vault/SelectorGuard.t.sol` — one asserted-safe test replaced (see above), new pins for the source guard including the registry-less path and the "allowlisted adapter is NOT a permitted source" decision.
 - **Sequencing**: same function as #93 (landed, PR #111), #19 (fail-closed on unset registry) and #18 (exotic-asset selectors). Issue #115 states the natural order: #93 → **this** → #19 → #18.
+
+## Post-merge remediation round (Pashov audit of PR #157)
+
+A 12-agent Pashov security audit of this change's PR (#157) returned 2 confirmed findings, addressed in this same change before merge (see design.md § "Post-merge remediation round" for full rationale):
+
+- **Finding 1 [90, 3-agent convergence]**: the new Part-1b source guard and the pre-existing Part-2 destination guard both matched only the four legacy-ERC20 selectors, leaving Permit2's `AllowanceTransfer.transferFrom`/`.approve` and DSToken's `pull`/`move` — different selectors, identical "pull via delegated allowance" capability — completely unguarded. Fixed by extending the guarded-selector set (Option A) rather than the audit's suggested target-based redesign (Option B), which was assessed as more durable but deferred as a required follow-up because it would re-plumb the tier-pricing/TierRegistry relationship for every non-value-moving adapter call, outside this change's footprint.
+- **Finding 2 [80]**: Part 2's self-transfer fast-path (`recipient == address(this) → continue`) exempted any token decoding to the vault, not only `asset()` — the one token the outer net-outflow meter verifies. Fixed by scoping the fast-path to `calls[i].target == asset()`.
+
+This adds `_SEL_PERMIT2_TRANSFER_FROM`, `_SEL_PERMIT2_APPROVE`, `_SEL_DSTOKEN_PULL`, `_SEL_DSTOKEN_MOVE` to the spec's guarded-selector requirements (see the ADDED/MODIFIED requirement deltas) and is reflected in `specs/syndicate-vault/spec.md`'s new scenarios.

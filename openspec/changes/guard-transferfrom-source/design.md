@@ -93,3 +93,21 @@ Single-contract change behind the vault's existing UUPS upgrade path; no storage
 ## Open Questions
 
 None — the issue's open question (correct guard condition for `from`; whether the vault-self exemption stays) is resolved in Decisions 1 and 4.
+
+## Post-merge remediation round (Pashov audit of PR #157)
+
+A 12-agent Pashov security audit ran against this change's diff after it opened as PR #157 and returned 2 confirmed findings (full report on the PR). Both are addressed here, before merge.
+
+**6. Finding 1 [confidence 90, 3-agent convergence] — selector-based guard bypassed by alternate-signature allowance routers.**
+
+Both this change's new Part-1b `from`-guard and the pre-existing Part-2 destination guard matched only the four hardcoded legacy-ERC20 selectors. Uniswap's Permit2 singleton (`AllowanceTransfer.transferFrom` = `0x36c78516`, `.approve` = `0x87517c45`, both `cast sig`-verified, both distinct from the guarded legacy selectors) and DSToken-lineage `pull`/`move` expose the identical "move tokens via delegated allowance" capability under different selectors — invisible to both guards regardless of TierRegistry wiring, reproducing this change's own confiscation bug and the pre-existing poison-then-drain bug, just routed through a different target.
+
+_Chosen: Option A (extend the guarded-selector set)_, not the audit's suggested Option B (gate every batch call by target regardless of selector, folding Part 2's registry check into Part 1's unconditional target class). Option A adds `_SEL_PERMIT2_TRANSFER_FROM`, `_SEL_PERMIT2_APPROVE`, `_SEL_DSTOKEN_PULL`, `_SEL_DSTOKEN_MOVE` to both Part 1b's source decode and Part 2's destination decode (Permit2 `approve`'s extra leading `token` arg shifts its guarded `spender` to arg 1, bytes 36:68, requiring its own branch rather than reuse of the arg-0 branch).
+
+_Why not Option B, for this change_: every non-value-moving adapter call (e.g. a strategy's `execute`/`harvest`/`settle` entrypoint) currently reaches its target through Part 1's target-CLASS denylist (vault/queue excluded, everything else open) and is priced through `SyndicateGovernor`'s separate `tierOf`-based coverage sizing — it is never required to be `isAdapterAllowed` in the TierRegistry, only tier-2/full-notional-priced by default (see the `_guardBatchCalls` RESIDUAL natspec). Making Part 2's registry check fire for every call target regardless of selector — the shape of Option B — would require every such adapter to ALSO be explicitly allowlisted merely to remain callable, i.e. re-plumbing the tier-pricing/TierRegistry relationship across `SyndicateGovernor` and `TierRegistry`. That is well outside this change's stated footprint (`SyndicateVault.sol`'s `_guardBatchCalls`, one function) and risks silently tightening a documented, intentional degrade-open default for every existing/future adapter. Option A is explicitly whack-a-mole against an open-ended set of pull-style APIs — accepted here as the live, concretely-proven risk (Permit2 + DSToken) is closed, and Option B is recorded as a **required follow-up**, tracked as a new issue rather than silently dropped.
+
+**7. Finding 2 [confidence 80] — self-transfer fast-path skips the registry check for any token, not just `asset()`.**
+
+Part 2's `if (recipient == address(this)) continue;` exempted ANY token whose destination decoded to the vault, not only `asset()` — the one token the outer `netOutflow` balance-diff meter in `executeGovernorBatch` actually verifies. A non-standard/malicious token the vault holds as a strategy position could execute arbitrary logic under `transferFrom(vault, vault, amount)` with zero verification anywhere in the pipeline.
+
+_Fix_: `if (recipient == address(this) && calls[i].target == asset()) continue;`. Every other token's vault-destined call now routes through the same TierRegistry check as any other destination. No honest batch has a reason to route a non-`asset()` token back to the vault via a guarded selector, so the tightening has no legitimate-flow cost.

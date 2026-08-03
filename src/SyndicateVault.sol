@@ -103,6 +103,25 @@ contract SyndicateVault is
     bytes4 private constant _SEL_TRANSFER = 0xa9059cbb; // transfer(address,uint256)
     bytes4 private constant _SEL_TRANSFER_FROM = 0x23b872dd; // transferFrom(address,address,uint256)
 
+    // ── Alternate-signature "pull/push via delegated allowance" selectors ──
+    // Same guarded CAPABILITY as the four legacy-ERC20 selectors above, just
+    // exposed under different 4-byte selectors by non-legacy-ERC20 allowance
+    // routers. A post-merge audit of this PR (issue #115, PR #157) found that
+    // Permit2's AllowanceTransfer singleton — deployed at the same address on
+    // nearly every EVM chain, with huge numbers of standing LP allowances —
+    // and DSToken-lineage `pull`/`move` wrappers reproduce the exact
+    // LP-allowance-confiscation and poison-then-drain bugs Part 1b/Part 2
+    // exist to close, invisible to both because neither matched any of the
+    // four selectors above. Verified via `cast sig` (see PR #157 audit
+    // comment). Each decodes with the SAME argument layout as its legacy
+    // counterpart (source address always at bytes 4:36; destination, where
+    // present, at bytes 36:68), so they slot into the existing decode logic
+    // in `_guardBatchCalls` rather than needing bespoke offsets.
+    bytes4 private constant _SEL_PERMIT2_TRANSFER_FROM = 0x36c78516; // Permit2 AllowanceTransfer.transferFrom(address from,address to,uint160,address token)
+    bytes4 private constant _SEL_PERMIT2_APPROVE = 0x87517c45; // Permit2 AllowanceTransfer.approve(address token,address spender,uint160,uint48)
+    bytes4 private constant _SEL_DSTOKEN_PULL = 0xf2d5d56b; // DSToken pull(address usr, uint256 wad) — pulls TO msg.sender (the vault)
+    bytes4 private constant _SEL_DSTOKEN_MOVE = 0xbb35783b; // DSToken move(address src, address dst, uint256 wad)
+
     // ==================== STORAGE ====================
 
     /// @notice Agent address => agent config
@@ -583,6 +602,48 @@ contract SyndicateVault is
     ///      only a batch's own guarded self-approve can create), and `x`
     ///      remains destination-guarded by Part 2 below.
     ///
+    ///      ── ALTERNATE-SIGNATURE ALLOWANCE ROUTERS (Permit2, DSToken) ──
+    ///
+    ///      A post-merge audit of this PR (issue #115, PR #157 review round)
+    ///      found that Part 1b's `from`-decode and Part 2's destination-decode
+    ///      below both matched ONLY the four legacy-ERC20 selectors, so any
+    ///      allowance-delegation router using a different selector for the
+    ///      identical capability sailed through unguarded — chiefly Uniswap's
+    ///      Permit2 `AllowanceTransfer.transferFrom`/`.approve` (deployed at
+    ///      the same address on nearly every EVM chain; enormous numbers of
+    ///      standing LP allowances live there) and DSToken-lineage
+    ///      `pull`/`move`. Both reproduce this PR's own confiscation bug and
+    ///      the pre-existing poison-then-drain bug, just routed through a
+    ///      different target. Fixed by extending the guarded-selector set
+    ///      (`_SEL_PERMIT2_TRANSFER_FROM`, `_SEL_PERMIT2_APPROVE`,
+    ///      `_SEL_DSTOKEN_PULL`, `_SEL_DSTOKEN_MOVE` — selectors verified via
+    ///      `cast sig`, see the PR #157 audit comment) — chosen as
+    ///      "Option A" (whack-a-mole, extend the selector list) over the
+    ///      audit's "Option B" (gate every batch call by TARGET regardless of
+    ///      selector, folding Part 2's registry check into Part 1's
+    ///      unconditional target class). Option B is more robust in the
+    ///      abstract but was rejected FOR THIS PATCH: it would require every
+    ///      non-value-moving adapter call already relying on the documented
+    ///      tier-2/full-notional pricing default (see RESIDUAL below and
+    ///      `SyndicateGovernor`'s `tierOf`-based coverage sizing) to ALSO
+    ///      carry an explicit TierRegistry `isAdapterAllowed` entry merely to
+    ///      remain callable — i.e. re-plumbing the tier-pricing/allowlist
+    ///      relationship across `SyndicateGovernor`/`TierRegistry`, well
+    ///      outside this PR's footprint (`SyndicateVault.sol` only). Tracked
+    ///      as a required follow-up rather than silently dropped; see the
+    ///      PR #157 description. Each newly-guarded selector decodes with the
+    ///      SAME calldata layout as its legacy counterpart it stands in for —
+    ///      Permit2 `transferFrom(from,to,uint160,token)` and DSToken
+    ///      `move(src,dst,wad)` place source/destination at the identical
+    ///      offsets (bytes 4:36 / 36:68) as legacy `transferFrom`; DSToken
+    ///      `pull(usr,wad)` always pulls TO msg.sender (the vault under
+    ///      delegatecall), so only its source (bytes 4:36) needs checking,
+    ///      exactly like `from == address(this)` above; Permit2
+    ///      `approve(token,spender,uint160,uint48)` carries an extra leading
+    ///      `token` arg, shifting the guarded `spender` to arg 1 (bytes
+    ///      36:68) instead of arg 0 — handled explicitly in Part 2's decode
+    ///      below, NOT folded into the arg-0 branch.
+    ///
     ///      ── PART 2: value-moving-selector allowlist gate ──
     ///
     ///      WHY: the net-outflow meter above only sees the vault's own asset()
@@ -593,25 +654,58 @@ contract SyndicateVault is
     ///      WHAT: the batch runs via delegatecall, so external targets see
     ///      msg.sender == vault; a plain call to an arbitrary target cannot
     ///      exfiltrate ERC20 funds unless the vault approves it or transfers to
-    ///      it. Gating the spender/recipient of the four value-moving ERC20
+    ///      it. Gating the spender/recipient of the guarded value-moving
     ///      selectors is a complete bound on ERC20 exfiltration without a full
     ///      target allowlist: for approve / increaseAllowance / transfer the
     ///      guarded address is arg 1 (calldata bytes 4..36); for transferFrom
-    ///      it is `to`, arg 2 (bytes 36..68) — pulling INTO the vault
-    ///      (to == vault) is an inflow and always passes. (Its `from`, arg 1,
-    ///      is guarded unconditionally in PART 1b above and is not re-checked
-    ///      here.) The address must be the vault itself or an adapter
-    ///      allowlisted in the TierRegistry (resolved through the calling
-    ///      governor). Runs on every governor batch — execute, settlement, and
-    ///      both emergency paths — since settlement calls are arbitrary,
-    ///      pre-committed calldata too.
+    ///      (legacy and Permit2) and DSToken move it is `to`, arg 2 (bytes
+    ///      36..68); for Permit2 approve it is `spender`, ALSO arg 2 (bytes
+    ///      36..68 — Permit2's extra leading `token` arg shifts it one slot
+    ///      right of legacy `approve`, see the selector-family note above) —
+    ///      pulling INTO the vault (to == vault) is an inflow and passes ONLY
+    ///      when the moved token is `asset()` (see the self-transfer
+    ///      fast-path note below). (`from`/`src`/`usr`, where present, is
+    ///      guarded unconditionally in PART 1b above and is not re-checked
+    ///      here.) The address must be the vault itself (with the asset()
+    ///      exception) or an adapter allowlisted in the TierRegistry (resolved
+    ///      through the calling governor). Runs on every governor batch —
+    ///      execute, settlement, and both emergency paths — since settlement
+    ///      calls are arbitrary, pre-committed calldata too.
+    ///
+    ///      SELF-TRANSFER FAST-PATH SCOPED TO asset(): a second post-merge
+    ///      audit finding (issue #115, PR #157 review round) noted that
+    ///      `recipient == address(this) → continue` skipped the registry
+    ///      check for ANY token whose destination decodes to the vault, not
+    ///      only `asset()` — the one token the outer `netOutflow` meter in
+    ///      `executeGovernorBatch` independently verifies via a balance diff.
+    ///      A non-standard token the vault holds as a strategy position could
+    ///      execute arbitrary logic under e.g. `transferFrom(vault, vault,
+    ///      amount)` with zero verification anywhere in the pipeline. Fixed
+    ///      by additionally requiring `calls[i].target == asset()` for the
+    ///      fast-path to fire; every other token's vault-destined call now
+    ///      routes through the same TierRegistry check as any other
+    ///      destination (recipient == vault will simply need `vault` itself
+    ///      allowlisted for that token, which is not the accepted default —
+    ///      intentionally, since no honest batch has a reason to route a
+    ///      non-asset() token back to the vault via a guarded selector).
     ///
     ///      RESIDUAL: exotic assets are not yet guarded — ERC721
     ///      `setApprovalForAll` (0xa22cb465) / `approve`, ERC1155, and
     ///      LP-position NFTs. Add their selectors here as those adapters are
     ///      onboarded; until then such holdings rely on tier-2 full-notional
     ///      pricing. A selector-colliding non-ERC20 function on some adapter is
-    ///      gated (or reverts `MalformedCall`) conservatively.
+    ///      gated (or reverts `MalformedCall`) conservatively. Also residual,
+    ///      carried over from the PR #157 audit and NOT fixed by this round:
+    ///      (a) other pull-style APIs not yet enumerated (ERC-1363, ERC-777
+    ///      hooks, less common allowance-delegation routers) remain an
+    ///      open-ended selector list — this is precisely why the audit
+    ///      recommended Option B (target-based gating) as the durable fix,
+    ///      deferred here as a follow-up (see the note above); (b) both parts
+    ///      still trust calldata pattern-matching over verified balance
+    ///      movement for every token except asset() — a non-conforming
+    ///      token's `transferFrom` is free to ignore the calldata `from`/`to`
+    ///      fields for its real accounting; only `asset()` calls are backed
+    ///      by the outer balance-diff meter.
     ///
     ///      UNSET REGISTRY: if the governor has no tier registry wired (or
     ///      predates the getter), PART 2 cannot run and that half is skipped by
@@ -680,11 +774,23 @@ contract SyndicateVault is
             // rationale as the target denylist above. See the dedicated block
             // comment further up (search "LP-ALLOWANCE CONFISCATION") for the
             // adversary and why `isAdapterAllowed` must NOT be consulted here.
+            // Covers legacy `transferFrom` AND every alternate-signature
+            // "pull tokens via delegated allowance" selector this guard
+            // recognizes (Permit2 `AllowanceTransfer.transferFrom`, DSToken
+            // `pull`/`move`) — see the "ALTERNATE-SIGNATURE ALLOWANCE
+            // ROUTERS" note above. All four place the debited source address
+            // at the same offset (calldata bytes 4:36).
             bytes calldata data = calls[i].data;
-            if (data.length >= 4 && bytes4(data[0:4]) == _SEL_TRANSFER_FROM) {
-                if (data.length < 68) revert MalformedCall();
-                address from = address(uint160(uint256(bytes32(data[4:36]))));
-                if (from != address(this)) revert DisallowedTransferFromSource(target, from);
+            if (data.length >= 4) {
+                bytes4 sel = bytes4(data[0:4]);
+                if (
+                    sel == _SEL_TRANSFER_FROM || sel == _SEL_PERMIT2_TRANSFER_FROM || sel == _SEL_DSTOKEN_PULL
+                        || sel == _SEL_DSTOKEN_MOVE
+                ) {
+                    if (data.length < 68) revert MalformedCall();
+                    address from = address(uint160(uint256(bytes32(data[4:36]))));
+                    if (from != address(this)) revert DisallowedTransferFromSource(target, from);
+                }
             }
         }
 
@@ -703,13 +809,28 @@ contract SyndicateVault is
             if (sel == _SEL_APPROVE || sel == _SEL_INCREASE_ALLOWANCE || sel == _SEL_TRANSFER) {
                 if (data.length < 36) revert MalformedCall();
                 recipient = address(uint160(uint256(bytes32(data[4:36]))));
-            } else if (sel == _SEL_TRANSFER_FROM) {
+            } else if (sel == _SEL_TRANSFER_FROM || sel == _SEL_PERMIT2_TRANSFER_FROM || sel == _SEL_DSTOKEN_MOVE) {
+                // Legacy/Permit2 transferFrom and DSToken move all place
+                // `to`/`dst` at arg 2 (bytes 36:68).
+                if (data.length < 68) revert MalformedCall();
+                recipient = address(uint160(uint256(bytes32(data[36:68]))));
+            } else if (sel == _SEL_PERMIT2_APPROVE) {
+                // Permit2's `approve(token, spender, uint160, uint48)` carries
+                // an extra leading `token` arg vs legacy `approve(spender,
+                // amount)`, shifting the guarded `spender` to arg 2 (bytes
+                // 36:68) instead of arg 1 (bytes 4:36).
                 if (data.length < 68) revert MalformedCall();
                 recipient = address(uint160(uint256(bytes32(data[36:68]))));
             } else {
                 continue;
             }
-            if (recipient == address(this)) continue;
+            // Self-transfer fast-path is scoped to asset() ONLY: it is the
+            // one token the outer `netOutflow` meter in `executeGovernorBatch`
+            // independently verifies via a balance diff. Any other token
+            // whose destination decodes to the vault still routes through the
+            // TierRegistry check below — see the "SELF-TRANSFER FAST-PATH
+            // SCOPED TO asset()" note above.
+            if (recipient == address(this) && calls[i].target == asset()) continue;
             if (!ITierRegistry(registry).isAdapterAllowed(recipient)) {
                 revert DisallowedTransferTarget(calls[i].target, sel, recipient);
             }
