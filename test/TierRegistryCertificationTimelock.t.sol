@@ -454,25 +454,55 @@ contract TierRegistryCertificationTimelockTest is Test {
         assertEq(pendingAfter.tier, pendingBefore.tier);
     }
 
-    function test_poke_stillPermissionlessAndInstant_whileAnUnrelatedCertificationIsPending() public {
+    function test_poke_stillPermissionlessAndInstant() public {
         vm.prank(owner);
         reg.proposeCertification(target, SEL, 0, 50, address(0), target.codehash);
         vm.warp(vm.getBlockTimestamp() + reg.certifyDelay());
         reg.certify(target, SEL);
 
-        // a pending replacement is announced but not yet ready
-        vm.prank(owner);
-        reg.proposeCertification(target, SEL, 1, 900, address(0), target.codehash);
-
         vm.etch(target, hex"6001600101");
         vm.prank(makeAddr("rando"));
-        reg.poke(target, SEL); // instant, permissionless, unaffected by the pending replacement
+        reg.poke(target, SEL); // instant, permissionless
+        (uint8 tier,) = reg.tierOf(target, SEL);
+        assertEq(tier, 2);
+    }
+
+    /// @notice Audit finding #2 (PR #156): `poke`'s demotion path clears a
+    ///         SAME-KEY pending renewal, not just the live certification.
+    ///         Without this, a renewal proposed while the certification is
+    ///         still live would survive the poke's for-cause demotion
+    ///         untouched and later execute at `readyAt`, re-certifying the
+    ///         just-demoted (codehash-mismatched) target. This replaces the
+    ///         old `..._whileAnUnrelatedCertificationIsPending` test, which
+    ///         pinned the pre-fix ("pending replacement untouched by poke")
+    ///         behavior as correct — that was exactly the gap finding #2
+    ///         closed, so the old assertion is now the wrong invariant.
+    ///         Unrelated (different-key) pendings still survive demotion —
+    ///         see `test_demotionPaths_unaffectedByAnUnrelatedPendingCertification`.
+    function test_poke_cancelsSameKeyPendingRenewal() public {
+        vm.prank(owner);
+        reg.proposeCertification(target, SEL, 0, 50, address(0), target.codehash);
+        vm.warp(vm.getBlockTimestamp() + reg.certifyDelay());
+        reg.certify(target, SEL);
+
+        // a same-key renewal is proposed while the certification is still live
+        vm.prank(owner);
+        reg.proposeCertification(target, SEL, 1, 900, address(0), target.codehash);
+        TierRegistry.PendingCertification memory pendingBefore = reg.pendingCertificationOf(target, SEL);
+        assertTrue(pendingBefore.readyAt != 0, "renewal is pending before the poke");
+
+        vm.etch(target, hex"6001600101");
+        vm.expectEmit(true, true, false, false, address(reg));
+        emit TierRegistry.CertificationCancelled(target, SEL);
+        vm.prank(makeAddr("rando"));
+        reg.poke(target, SEL); // instant, permissionless, unaffected by anything about the renewal
         (uint8 tier,) = reg.tierOf(target, SEL);
         assertEq(tier, 2);
 
-        // the pending replacement itself is untouched by the poke
-        TierRegistry.PendingCertification memory p = reg.pendingCertificationOf(target, SEL);
-        assertTrue(p.readyAt != 0);
+        // the same-key pending renewal is cancelled by the poke, so it can
+        // never re-certify the just-demoted target at its old (looser) terms
+        TierRegistry.PendingCertification memory pendingAfter = reg.pendingCertificationOf(target, SEL);
+        assertEq(pendingAfter.readyAt, 0, "same-key renewal must be cancelled by poke's demotion");
     }
 
     // ── Audit remediation (PR #156 Pashov review) ──
