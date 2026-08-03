@@ -25,9 +25,7 @@ import {MockAgentRegistry} from "./mocks/MockAgentRegistry.sol";
 ///      OZ gate so the replacement line's behaviour can be pinned in
 ///      isolation, exactly as `_withdraw`'s NatSpec describes it.
 contract VaultWithdrawHarness is SyndicateVault {
-    function withdrawDirect(address caller, address receiver, address owner_, uint256 assets, uint256 shares)
-        external
-    {
+    function withdrawDirect(address caller, address receiver, address owner_, uint256 assets, uint256 shares) external {
         _withdraw(caller, receiver, owner_, assets, shares);
     }
 }

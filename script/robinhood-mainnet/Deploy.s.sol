@@ -101,7 +101,14 @@ contract DeployRobinhoodMainnet is DeploySherwood {
         vm.stopBroadcast();
 
         _validateMainnet(
-            effectiveOwner, deployer, d.beacon, d.protocolConfig, d.factoryProxy, d.registryProxy, d.swoodProxy, woodToken
+            effectiveOwner,
+            deployer,
+            d.beacon,
+            d.protocolConfig,
+            d.factoryProxy,
+            d.registryProxy,
+            d.swoodProxy,
+            woodToken
         );
 
         // Persist. `_writeAddresses` patches the core keys in place, so the
