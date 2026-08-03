@@ -239,8 +239,11 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
     function test_initAboveCeiling_stillReverts() public {
         PortfolioStrategy strategy = _clone();
         address codelessVault = makeAddr("codelessVault4");
+        // Hoisted: a call in argument position would consume the pending
+        // `vm.expectRevert` before `initialize` itself runs.
+        bytes memory data = _initData(strategy.MAX_SLIPPAGE_CEILING_BPS() + 1);
         vm.expectRevert(PortfolioStrategy.InvalidSlippage.selector);
-        strategy.initialize(codelessVault, proposer, _initData(strategy.MAX_SLIPPAGE_CEILING_BPS() + 1));
+        strategy.initialize(codelessVault, proposer, data);
     }
 
     function test_initAtExactFloor_succeeds() public {
@@ -298,15 +301,22 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
         weights[0] = 10_000;
         bytes[] memory noRoutes = new bytes[](0);
 
+        // Hoisted: `strategy.MIN_SLIPPAGE_BPS()` in argument position would
+        // consume the pending `vm.prank`/`vm.expectRevert` before
+        // `updateParams` itself runs.
+        uint256 floor = strategy.MIN_SLIPPAGE_BPS();
+
         // Re-asserting the floor (equality) passes the tighten-only `>` check.
+        bytes memory reassertData = abi.encode(weights, floor, noRoutes);
         vm.prank(proposer);
-        strategy.updateParams(abi.encode(weights, strategy.MIN_SLIPPAGE_BPS(), noRoutes));
-        assertEq(strategy.maxSlippageBps(), strategy.MIN_SLIPPAGE_BPS());
+        strategy.updateParams(reassertData);
+        assertEq(strategy.maxSlippageBps(), floor);
 
         // Anything strictly below the floor is refused.
+        bytes memory belowFloorData = abi.encode(weights, floor - 1, noRoutes);
         vm.prank(proposer);
         vm.expectRevert(PortfolioStrategy.InvalidSlippage.selector);
-        strategy.updateParams(abi.encode(weights, strategy.MIN_SLIPPAGE_BPS() - 1, noRoutes));
+        strategy.updateParams(belowFloorData);
     }
 
     // ── Demotion after init does not brick settlement ──
