@@ -29,6 +29,7 @@ import {ERC721Holder} from "@openzeppelin/contracts/token/ERC721/utils/ERC721Hol
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Address} from "@openzeppelin/contracts/utils/Address.sol";
 import {EnumerableSet} from "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 /**
  * @title SyndicateVault
@@ -670,10 +671,24 @@ contract SyndicateVault is
     }
 
     /// @inheritdoc ISyndicateVault
+    /// @dev THE QUEUE RESERVE IS NOT SPENDABLE HERE (issue #92). This was the
+    ///      one asset-outflow path that checked only the raw balance, so a
+    ///      settlement fee — or a later `claimUnclaimedFees` — could spend float
+    ///      already frozen against stamped-unclaimed redeems, leaving the second
+    ///      claimant's `settleRedeem` to revert with no `cancel` available to it
+    ///      (`cancel` refuses a stamped pid).
+    ///
+    ///      REVERTING IS THE SAFE DIRECTION, not a lost fee: the governor's
+    ///      `_payFee` already treats a failure here as "escrow it instead", so
+    ///      the fee is deferred rather than dropped. Paying it out of a
+    ///      redeemer's reserved assets would not be.
     function transferPerformanceFee(address asset_, address to, uint256 amount) external onlyGovernor {
         if (asset_ != asset()) revert InvalidAsset();
         if (to == address(0)) revert ZeroAddress();
-        if (amount > IERC20(asset_).balanceOf(address(this))) revert AmountExceedsBalance();
+        uint256 spendable = IERC20(asset_).balanceOf(address(this));
+        uint256 reserve = reservedQueueAssets();
+        spendable = spendable > reserve ? spendable - reserve : 0;
+        if (amount > spendable) revert AmountExceedsBalance();
         IERC20(asset_).safeTransfer(to, amount);
     }
 
@@ -994,10 +1009,72 @@ contract SyndicateVault is
     function totalAssets() public view override returns (uint256) {
         (,, uint256 liveNav,) = _laneState();
         uint256 gross = IERC20(asset()).balanceOf(address(this)) + liveNav;
-        uint256 owed = uint256(_crystallizedMgmt) + _crystallizedPerf;
+        // THREE KINDS OF CLAIM, ALL SUBTRACTED. Crystallized fees are money the
+        // vault holds but no longer owns. The queue reserve is the same kind of
+        // claim and is subtracted for the same reason: `stampSettlement` froze
+        // those assets against a `num/den` that can no longer move, so they are
+        // owed in a fixed amount and are no longer part of what a residual share
+        // is a claim on (issue #92).
+        //
+        // NEVER ALONE. The matching shares must leave the pricing supply in the
+        // same breath — see `_pricingSupply`. Subtracting assets without their
+        // shares would understate the price as badly as the original blend
+        // overstated it.
+        uint256 owed = uint256(_crystallizedMgmt) + _crystallizedPerf + reservedQueueAssets();
         // Cannot legitimately underflow — the counters track assets the vault
         // holds — but under-reporting beats inventing value if it ever did.
         return gross > owed ? gross - owed : 0;
+    }
+
+    /// @dev The supply a price is actually taken against: circulating shares
+    ///      LESS the escrowed redeem shares whose settle price is already
+    ///      stamped. Those shares are still in `totalSupply()` — the vault burns
+    ///      them at `claim`, not at the stamp — but they are no longer a claim on
+    ///      the pool, so pricing must not divide by them.
+    ///
+    ///      PAIRED WITH `totalAssets`, INSEPARABLY. Both legs of the same claim
+    ///      leave together, so a `claim` moves neither the price nor anyone
+    ///      else's position: `settleRedeem` removes `shares` from supply and
+    ///      `assets` from float at the same instant the queue's two counters
+    ///      drop by the same amounts.
+    ///
+    ///      PRE-STAMP ESCROW STAYS IN. A queued-but-unsettled redeem has no
+    ///      frozen price yet, so it still floats with the pool and still belongs
+    ///      in the denominator. That is why this reads
+    ///      `stampedUnclaimedShares()` rather than `pendingShares()`.
+    ///
+    ///      FLOORED AT ZERO defensively; the counter is a subset of the balance
+    ///      the queue holds, so the branch is unreachable today.
+    ///
+    ///      Deliberately a low-level staticcall rather than a typed interface
+    ///      call: `VaultWithdrawalQueue` is not a proxy (plain constructor, no
+    ///      `initialize`, no upgradeability), so a queue deployed before this
+    ///      function existed can never gain the `stampedUnclaimedShares()`
+    ///      selector. A typed call would revert for that legacy pairing, and
+    ///      this sits on `_convertToShares`/`_convertToAssets`, so the revert
+    ///      would brick every deposit, withdraw, preview and fee calc. Missing
+    ///      selector degrades to 0 (today's pre-#92 blended pricing) instead —
+    ///      full remediation for an existing syndicate requires redeploying the
+    ///      vault/queue pair.
+    function _pricingSupply() internal view returns (uint256) {
+        address q = _withdrawalQueue;
+        uint256 supply = totalSupply();
+        if (q == address(0)) return supply;
+        (bool ok, bytes memory ret) = q.staticcall(abi.encodeCall(IVaultWithdrawalQueue.stampedUnclaimedShares, ()));
+        uint256 stamped = (ok && ret.length == 32) ? abi.decode(ret, (uint256)) : 0;
+        return supply > stamped ? supply - stamped : 0;
+    }
+
+    /// @dev Overridden solely to divide by `_pricingSupply()` instead of
+    ///      `totalSupply()`; the rounding and virtual-offset arithmetic is
+    ///      OpenZeppelin's, unchanged.
+    function _convertToShares(uint256 assets, Math.Rounding rounding) internal view override returns (uint256) {
+        return Math.mulDiv(assets, _pricingSupply() + 10 ** _decimalsOffset(), totalAssets() + 1, rounding);
+    }
+
+    /// @dev Mirror of `_convertToShares` above, same single change.
+    function _convertToAssets(uint256 shares, Math.Rounding rounding) internal view override returns (uint256) {
+        return Math.mulDiv(shares, totalAssets() + 1, _pricingSupply() + 10 ** _decimalsOffset(), rounding);
     }
 
     /// @dev Returns 0 when `paused()` so the EIP-4626 IMP-1 invariant holds
@@ -1404,7 +1481,7 @@ contract SyndicateVault is
         uint256 mark = _highWaterPricePerShare;
         uint256 pps = pricePerShare();
         if (pps <= mark) return 0;
-        return (pps - mark) * totalSupply() / PPS_SHARES;
+        return (pps - mark) * _pricingSupply() / PPS_SHARES;
     }
 
     /// @inheritdoc ISyndicateVault
@@ -1459,7 +1536,7 @@ contract SyndicateVault is
     ///      an exiter more than a hold-to-settle depositor pays — breaking the
     ///      neutrality this function exists to provide.
     function _exitFees(uint256 shares) private view returns (uint256 mgmtFee, uint256 perfFee) {
-        uint256 supply = totalSupply();
+        uint256 supply = _pricingSupply();
         if (shares == 0 || supply == 0) return (0, 0);
 
         // ── Management: pro-rata of the fund-level accrual to now ──
