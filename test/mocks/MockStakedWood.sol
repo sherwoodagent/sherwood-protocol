@@ -269,6 +269,27 @@ contract MockStakedWood is IStakedWood {
         authorizedSlasher = slasher;
     }
 
+    /// @dev MODELLED AS A PLAIN SETTABLE SLOT, same reason as
+    ///      `authorizedSlasher` above: `TokenCourt.setParticipationFloorBps`
+    ///      and `TokenCourt.setStakedWood` now READ this back (issue #84,
+    ///      "enforce the floor invariant in the setters") to enforce
+    ///      `participationFloorBps < ageFloorBps`. NOT an `IStakedWood`
+    ///      member — the real interface deliberately omits it (see
+    ///      `TokenCourt.sol`'s `IStakedWoodAgeFloor`), so this sits with the
+    ///      mock's other extra setters, not its interface-implementing
+    ///      surface. Defaults to `2_500` to match every real fixture's
+    ///      `StakedWood` `InitParams.ageFloorBps` (`TokenCourtEndToEnd.t.sol`,
+    ///      `SlashGasCeiling.t.sol`, `ChallengeEndToEnd.t.sol`,
+    ///      `DeployTokenCourtPreflight.t.sol`) so every existing suite that
+    ///      wires this mock into a `TokenCourt` keeps behaving exactly as
+    ///      before (default court floor `1_000 < 2_500`). No access control:
+    ///      it is a test double.
+    uint256 public ageFloorBps = 2_500;
+
+    function setAgeFloorBps(uint256 v) external {
+        ageFloorBps = v;
+    }
+
     // Per-(caseKey, approver) verdict dedup (PR #24 review 🟠N2). Same reason
     // as `slashVerdict`: the path it guards is not modeled here.
     function verdictSlashed(bytes32, address) external pure returns (bool) {

@@ -15,6 +15,20 @@ interface IChallengeGameLedger {
     function exposureLedger() external view returns (address);
 }
 
+/// @notice The one thing the court needs from the electorate that
+///         `IStakedWood` deliberately does not declare: its age floor, to
+///         enforce `participationFloorBps < ageFloorBps` (issue #84). Kept
+///         local rather than added to the shared interface for the same
+///         reason `script/DeployTokenCourt.s.sol`'s own pre-flight carries
+///         this exact function locally — widening `IStakedWood` would touch
+///         every mock implementing it and quietly weaken
+///         `_participationFloor`'s natspec, which leans on `IStakedWood` NOT
+///         exposing this parameter as part of why `FLOOR_LOOKBACK` is
+///         hardcoded rather than read live.
+interface IStakedWoodAgeFloor {
+    function ageFloorBps() external view returns (uint256);
+}
+
 /**
  * @title TokenCourt
  * @notice Single-layer WOOD-vote adjudication of disputed `ChallengeGame`
@@ -175,8 +189,26 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     }
 
     /// @inheritdoc ITokenCourt
+    /// @dev Guards the wiring itself, same class as `setChallengeGame`'s own
+    ///      re-wire guard above. Re-pointing to a new electorate is a setter
+    ///      that can break the floor invariant just like
+    ///      `setParticipationFloorBps` below, and the two compose into a
+    ///      bypass if only one is guarded: e.g. this court's
+    ///      `setParticipationFloorBps` raises `participationFloorBps` while
+    ///      unwired (passes vacuously — no age floor to check against yet),
+    ///      then this setter wires it to an electorate whose own age floor
+    ///      that raised value already meets or exceeds. Checked against the
+    ///      new sWOOD's own LIVE `ageFloorBps()`, not whatever the old
+    ///      `stakedWood` (if any) reported — this setter requires non-zero
+    ///      unconditionally, so there is no vacuous branch to preserve here;
+    ///      every call validates. A target without `ageFloorBps()` reverts on
+    ///      the read (fail-closed) — no real electorate lacks it, since the
+    ///      court also needs its `getPastTotalVotes`/`getPastStake`/`getVotes`.
     function setStakedWood(address newStakedWood) external onlyOwner {
         if (newStakedWood == address(0)) revert ZeroAddress();
+        if (participationFloorBps >= IStakedWoodAgeFloor(newStakedWood).ageFloorBps()) {
+            revert FloorInvariantViolated();
+        }
         emit StakedWoodSet(stakedWood, newStakedWood);
         stakedWood = newStakedWood;
     }
@@ -202,8 +234,37 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     }
 
     /// @inheritdoc ITokenCourt
+    /// @dev Mirrors `setVoteWindow`'s shape: the cross-contract invariant
+    ///      `participationFloorBps < ageFloorBps` spans both contracts, so
+    ///      this setter enforces it against the wired sWOOD's LIVE
+    ///      `ageFloorBps()` rather than trusting a stale value. Vacuous with
+    ///      no electorate wired: there is no age floor to compare against
+    ///      yet — `setStakedWood` above closes that vacuous branch by
+    ///      validating unconditionally on the wiring side.
+    ///
+    ///      Strictness is strict `<`, not `<=`: `finalize` clears at
+    ///      `turnout >= floor`, turnout sums AGED weight bounded below by
+    ///      `ageFloorBps/10_000` of raw stake, and the floor's base is RAW
+    ///      stake, so the raw-turnout fraction needed to clear is
+    ///      `participationFloorBps / ageFloorBps`. At equality that fraction
+    ///      is exactly 100% — every un-accused staked wei voting at age
+    ///      zero — which is not a liveness guarantee anyone can stand on,
+    ///      and is exactly what the deploy pre-flight (`floorBps <
+    ///      ageFloorBps`) already rejects; the setter must agree with it.
+    ///
+    ///      DELIBERATELY NOT GUARDED: `StakedWood.setAgeFloorBps` lowering
+    ///      the OTHER side of this pair after the fact. sWOOD is the
+    ///      base-layer custodian and holds no pointer back to this court;
+    ///      giving it one would invert the dependency direction for a
+    ///      court-local liveness property. That lever is covered by the
+    ///      wire-time pre-flight and off-chain monitoring, not by this
+    ///      setter — see issue #84.
     function setParticipationFloorBps(uint256 newBps) external onlyOwner {
         if (newBps == 0 || newBps > BPS_DENOMINATOR) revert InvalidParameter();
+        address sw = stakedWood;
+        if (sw != address(0) && newBps >= IStakedWoodAgeFloor(sw).ageFloorBps()) {
+            revert FloorInvariantViolated();
+        }
         emit ParticipationFloorBpsSet(participationFloorBps, newBps);
         participationFloorBps = newBps;
     }
