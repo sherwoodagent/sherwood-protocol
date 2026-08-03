@@ -85,12 +85,41 @@ contract SelectorGuardTest is Test {
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
 
         tierRegistry.setAdapterAllowed(adapter, true);
+        // issue #166: the new callee gate (`_guardBatchCalls` PART 2a) refuses
+        // ANY non-asset(), non-allowlisted target outright, before the
+        // selector switch below (PART 2b) ever runs. Every router/token
+        // fixture this suite drives as a batch CALL TARGET must be
+        // allowlisted here so existing assertions keep pinning the INNER
+        // (selector) layer they were written for, rather than being masked by
+        // the new outer layer's DisallowedBatchCallee. No assertion is
+        // weakened: recipients/spenders meant to stay non-allowlisted
+        // (attacker, third-party victim sources) are untouched, and
+        // test_calleeGateBitesForNonAllowlistedTarget below keeps at least
+        // one un-allowlisted-target case pinning the new error's ordering.
+        tierRegistry.setAdapterAllowed(permit2, true);
+        tierRegistry.setAdapterAllowed(dstoken, true);
+        tierRegistry.setAdapterAllowed(erc1363Token, true);
+        tierRegistry.setAdapterAllowed(erc4626Token, true);
+        tierRegistry.setAdapterAllowed(address(otherToken), true);
 
         usdc.mint(alice, 1_000_000e6);
         vm.startPrank(alice);
         usdc.approve(address(vault), type(uint256).max);
         vault.deposit(10_000e6, alice);
         vm.stopPrank();
+    }
+
+    // ── issue #166: callee-gate ordering pin (kept un-allowlisted on purpose) ──
+
+    /// @notice Task 4.2: at least one un-allowlisted-target case must stay in
+    ///         this suite so the NEW outer boundary's ordering is pinned here
+    ///         too, not only in the dedicated CalleeGate.t.sol suite. A target
+    ///         that is neither asset() nor allowlisted is refused before the
+    ///         selector switch ever inspects its calldata.
+    function test_calleeGateBitesForNonAllowlistedTarget() public {
+        address randomTarget = makeAddr("randomTargetNotAllowlisted");
+        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.DisallowedBatchCallee.selector, randomTarget));
+        _exec(_one(randomTarget, abi.encodeCall(usdc.approve, (adapter, 1e6))));
     }
 
     function _one(address target, bytes memory data) internal pure returns (BatchExecutorLib.Call[] memory calls) {

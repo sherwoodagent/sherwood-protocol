@@ -121,10 +121,13 @@ contract SyndicateVault is
     // routers/standards round 2 above claims to cover, missed by the same
     // enumeration approach. Round 2's own selector list was itself incomplete
     // — see the RESIDUAL note further down for the corrected (per-selector,
-    // not per-router) framing, and `design.md` for why Option A (extend the
-    // list) is retained here rather than pivoting to Option B (target-based
-    // gating): that redesign is deferred as required follow-up work, not
-    // attempted in this round.
+    // not per-router) framing. This was the round-3 evidence that motivated
+    // issue #166's Option B (target-based callee gate, `_guardBatchCalls`
+    // PART 2a): these selectors, and everything below, remain retained as the
+    // INNER boundary — still load-bearing for e.g. `approve(attacker)` on an
+    // otherwise-allowlisted token — but they are no longer the outer boundary
+    // against an unenumerated selector on an arbitrary target; the callee gate
+    // is.
     bytes4 private constant _SEL_DSTOKEN_PUSH = 0xb753a98c; // DSToken push(address dst, uint256 wad) — transfer-lineage sibling of guarded pull/move; internally transfer(dst, wad)
     bytes4 private constant _SEL_ERC1363_TRANSFER_FROM_AND_CALL = 0xd8fbe994; // ERC1363 transferFromAndCall(address from,address to,uint256)
     bytes4 private constant _SEL_ERC1363_TRANSFER_FROM_AND_CALL_DATA = 0xc1d34b89; // ERC1363 transferFromAndCall(address from,address to,uint256,bytes) — trailing bytes arg does not shift the leading from/to offsets
@@ -529,13 +532,20 @@ contract SyndicateVault is
         // asset() balance delta, so capital deployed INTO an allowlisted
         // adapter counts as outflow the same as an extraction (conservative
         // over-count). What the meter GUARANTEES holds only TOGETHER with the
-        // selector guard above (`_guardBatchCalls`): the meter bounds the
-        // asset() a single batch moves out of custody to maxCapital, and the
-        // guard closes the balance-invisible exfiltration routes (approve /
-        // transfer of ANY ERC20 to a non-allowlisted address). What they do
-        // NOT cover: exotic assets — ERC721/ERC1155 approvals and LP-position
-        // NFTs — which rely on tier-2 full-notional pricing until their
-        // selectors join the guarded set (see `_guardBatchCalls` RESIDUAL).
+        // guard above (`_guardBatchCalls`): the meter bounds the asset() a
+        // single batch moves out of custody to maxCapital, and the guard
+        // closes the balance-invisible exfiltration routes — both the
+        // callee-gate's class closure (any target that is neither asset() nor
+        // TierRegistry-allowlisted is refused outright, issue #166) and the
+        // retained selector checks beneath it (approve/transfer of an
+        // allowlisted ERC20 to a non-allowlisted address). Exotic-asset
+        // contracts — ERC721/ERC1155/LP-position NFTs — are refused as
+        // callees by default under the callee gate; the residual is narrower
+        // than before: only an unenumerated selector on `asset()` itself, or
+        // on a token/adapter explicitly allowlisted via `setAdapterAllowed`,
+        // is not selector-examined (see `_guardBatchCalls` RESIDUAL). The
+        // precise extractable bound is the tier system's per-call coverage
+        // (requiredCoverage).
         //
         // There are now TWO layers (issue #43, design.md D4), from finest to
         // coarsest:
@@ -671,21 +681,26 @@ contract SyndicateVault is
     ///      different target. Fixed by extending the guarded-selector set
     ///      (`_SEL_PERMIT2_TRANSFER_FROM`, `_SEL_PERMIT2_APPROVE`,
     ///      `_SEL_DSTOKEN_PULL`, `_SEL_DSTOKEN_MOVE` — selectors verified via
-    ///      `cast sig`, see the PR #157 audit comment) — chosen as
+    ///      `cast sig`, see the PR #157 audit comment) — chosen at the time as
     ///      "Option A" (whack-a-mole, extend the selector list) over the
     ///      audit's "Option B" (gate every batch call by TARGET regardless of
-    ///      selector, folding Part 2's registry check into Part 1's
-    ///      unconditional target class). Option B is more robust in the
-    ///      abstract but was rejected FOR THIS PATCH: it would require every
-    ///      non-value-moving adapter call already relying on the documented
-    ///      tier-2/full-notional pricing default (see RESIDUAL below and
-    ///      `SyndicateGovernor`'s `tierOf`-based coverage sizing) to ALSO
-    ///      carry an explicit TierRegistry `isAdapterAllowed` entry merely to
-    ///      remain callable — i.e. re-plumbing the tier-pricing/allowlist
-    ///      relationship across `SyndicateGovernor`/`TierRegistry`, well
-    ///      outside this PR's footprint (`SyndicateVault.sol` only). Tracked
-    ///      as a required follow-up rather than silently dropped; see the
-    ///      PR #157 description. Each newly-guarded selector decodes with the
+    ///      selector). Option B was deferred rather than attempted in that PR
+    ///      because it would have required every non-value-moving adapter call
+    ///      already relying on the documented tier-2/full-notional pricing
+    ///      default (see RESIDUAL below and `SyndicateGovernor`'s
+    ///      `tierOf`-based coverage sizing) to ALSO carry an explicit
+    ///      TierRegistry `isAdapterAllowed` entry merely to remain callable —
+    ///      a larger, deliberate redesign tracked as required follow-up rather
+    ///      than silently dropped (PR #157 description). **That follow-up is
+    ///      what PART 2a below now is** (issue #166, landed): every batch
+    ///      callee — not just the ones carrying a recognized selector — must
+    ///      be `asset()` or TierRegistry-allowlisted. The selector list here
+    ///      and below did NOT become redundant: it is retained as the INNER
+    ///      boundary over the now-finite set of allowlisted callees (an
+    ///      allowlisted token still needs its `approve`/`transferFrom`
+    ///      recipient checked — the callee gate alone would pass
+    ///      `token.approve(attacker, max)` on an allowlisted token). Each
+    ///      selector below decodes with the
     ///      SAME calldata layout as its legacy counterpart it stands in for —
     ///      Permit2 `transferFrom(from,to,uint160,token)` and DSToken
     ///      `move(src,dst,wad)` place source/destination at the identical
@@ -698,7 +713,21 @@ contract SyndicateVault is
     ///      36:68) instead of arg 0 — handled explicitly in Part 2's decode
     ///      below, NOT folded into the arg-0 branch.
     ///
-    ///      ── PART 2: value-moving-selector allowlist gate ──
+    ///      ── PART 2: registry-gated checks, in order ──
+    ///
+    ///      Two concerns, both gated on the same registry resolution above:
+    ///      PART 2a (the callee gate, in the loop body below) is the OUTER
+    ///      boundary — it runs on every call, before any selector is even
+    ///      examined, and closes the unenumerable-selector class by refusing
+    ///      any callee that is neither `asset()` nor TierRegistry-allowlisted
+    ///      (issue #166). PART 2b (this selector-based allowlist, described
+    ///      next) is the INNER boundary — defense-in-depth on the now-finite
+    ///      set of allowlisted callees, since an allowlisted TOKEN can still
+    ///      be handed an attacker as `approve`'s spender or `transfer`'s
+    ///      recipient; only decoding the selector's argument catches that.
+    ///      Neither subsumes the other.
+    ///
+    ///      ── PART 2b: value-moving-selector allowlist gate ──
     ///
     ///      WHY: the net-outflow meter above only sees the vault's own asset()
     ///      balance delta. `token.approve(attacker, max)` moves no balance, so
@@ -709,8 +738,8 @@ contract SyndicateVault is
     ///      msg.sender == vault; a plain call to an arbitrary target cannot
     ///      exfiltrate ERC20 funds unless the vault approves it or transfers to
     ///      it. Gating the spender/recipient of the guarded value-moving
-    ///      selectors is a complete bound on ERC20 exfiltration without a full
-    ///      target allowlist: for approve / increaseAllowance / transfer the
+    ///      selectors is a complete bound on ERC20 exfiltration on top of the
+    ///      callee gate above: for approve / increaseAllowance / transfer the
     ///      guarded address is arg 1 (calldata bytes 4..36); for transferFrom
     ///      (legacy and Permit2) and DSToken move it is `to`, arg 2 (bytes
     ///      36..68); for Permit2 approve it is `spender`, ALSO arg 2 (bytes
@@ -743,12 +772,23 @@ contract SyndicateVault is
     ///      intentionally, since no honest batch has a reason to route a
     ///      non-asset() token back to the vault via a guarded selector).
     ///
-    ///      RESIDUAL: exotic assets are not yet guarded — ERC721
+    ///      RESIDUAL (pre-#166, now closed by default): exotic assets — ERC721
     ///      `setApprovalForAll` (0xa22cb465) / `approve`, ERC1155, and
-    ///      LP-position NFTs. Add their selectors here as those adapters are
-    ///      onboarded; until then such holdings rely on tier-2 full-notional
-    ///      pricing. A selector-colliding non-ERC20 function on some adapter is
-    ///      gated (or reverts `MalformedCall`) conservatively.
+    ///      LP-position NFTs — used to be unguarded, relying on tier-2
+    ///      full-notional pricing. The PART 2a callee gate now refuses ANY
+    ///      such contract as a batch target by default (it is neither
+    ///      `asset()` nor TierRegistry-allowlisted), closing the whole class
+    ///      including standards never enumerated below (ERC-6909, future
+    ///      ones) — see issue #18, subsumed by issue #166. The residual is
+    ///      narrower and now a GOVERNANCE-DISCIPLINE requirement rather than a
+    ///      mechanical gap: if an exotic-asset contract is ever allowlisted as
+    ///      a callee anyway, its non-ERC20 selectors pass this switch
+    ///      unexamined (reverting `MalformedCall` only where calldata is too
+    ///      short to fit an assumed offset, not because the shape was
+    ///      recognized). Operator invariant: exotic-asset contracts MUST NOT
+    ///      be allowlisted as batch callees; batches reach positions through
+    ///      allowlisted adapters instead (mirrors `TierRegistry`'s own
+    ///      certify-nothing-upgradeable discipline, src/TierRegistry.sol).
     ///
     ///      COVERAGE IS PER-SELECTOR, NOT PER-ROUTER — read this precisely.
     ///      A THIRD post-merge audit round (issue #115, PR #157, round 3) found
@@ -759,30 +799,30 @@ contract SyndicateVault is
     ///      100% miss rate matched to that round's hit rate. Round 3 added
     ///      these four; do NOT read "Permit2/DSToken/ERC1363 are guarded" as
     ///      "every function on Permit2/DSToken/ERC1363 is guarded" — only the
-    ///      selectors enumerated above are. The audit's Option B (gate every
-    ///      batch call by TARGET regardless of selector, eliminating this
-    ///      class of gap entirely) remains the recommended durable fix and is
-    ///      NOT implemented by this round either — deferred as required
-    ///      follow-up given its larger scope (redesigning the relationship
-    ///      between this guard and `TierRegistry`/tier-pricing, see
-    ///      `design.md`), not because the risk is considered closed. Also
-    ///      residual: (a) ERC-777 `operatorSend` and any other
-    ///      allowance-delegation router not yet enumerated remain an
-    ///      open-ended list by construction — the same argument applies to
-    ///      every future one; (b) both parts still trust calldata
-    ///      pattern-matching over verified balance movement for every token
-    ///      except asset() — a non-conforming token's `transferFrom` is free
-    ///      to ignore the calldata `from`/`to` fields for its real
-    ///      accounting; only `asset()` calls are backed by the outer
-    ///      balance-diff meter; (c) the self-transfer fast-path
-    ///      (`recipient == address(this) && target == asset()`) is
-    ///      structurally unreachable for every Permit2-routed selector, since
-    ///      a Permit2 call's `target` is always the Permit2 singleton, never
-    ///      the token itself — this fails CLOSED (forces the full registry
-    ///      check, likely reverting a hypothetical legitimate Permit2-routed
-    ///      self-transfer of `asset()`) rather than open, so it is a
-    ///      possible over-restriction, not a fund-safety gap; no current flow
-    ///      is known to need that path.
+    ///      selectors enumerated above are, WITHIN the set of callees the
+    ///      PART 2a callee gate lets through. That round's own recommended
+    ///      durable fix — gate every batch call by TARGET regardless of
+    ///      selector — is issue #166's Option B, landed as PART 2a above; this
+    ///      selector switch is retained beneath it as the inner boundary (see
+    ///      the "PART 2: registry-gated checks, in order" note above for why
+    ///      neither layer subsumes the other). Also residual: (a) ERC-777
+    ///      `operatorSend` and any other allowance-delegation router not yet
+    ///      enumerated here still pass PART 2a's callee gate unexamined by
+    ///      this switch if their target is allowlisted — an open-ended list by
+    ///      construction, same argument as before, now bounded to allowlisted
+    ///      callees only; (b) both parts still trust calldata pattern-matching
+    ///      over verified balance movement for every token except asset() — a
+    ///      non-conforming token's `transferFrom` is free to ignore the
+    ///      calldata `from`/`to` fields for its real accounting; only
+    ///      `asset()` calls are backed by the outer balance-diff meter; (c)
+    ///      the self-transfer fast-path (`recipient == address(this) &&
+    ///      target == asset_`) is structurally unreachable for every
+    ///      Permit2-routed selector, since a Permit2 call's `target` is always
+    ///      the Permit2 singleton, never the token itself — this fails CLOSED
+    ///      (forces the full registry check, likely reverting a hypothetical
+    ///      legitimate Permit2-routed self-transfer of `asset()`) rather than
+    ///      open, so it is a possible over-restriction, not a fund-safety gap;
+    ///      no current flow is known to need that path.
     ///
     ///      UNSET REGISTRY: if the governor has no tier registry wired (or
     ///      predates the getter), PART 2 cannot run and that half is skipped by
@@ -902,8 +942,19 @@ contract SyndicateVault is
         address registry = abi.decode(ret, (address));
         if (registry == address(0)) return;
 
+        address asset_ = asset();
         for (uint256 i = 0; i < calls.length; i++) {
+            // ── PART 2a: target-based callee gate (issue #166, Option B) ──
+            // Runs on EVERY call — before the short-calldata continue below, so
+            // empty-calldata and native-`value` calls are gated too. asset() is
+            // the sole exemption (design.md Decision 2); everything else must be
+            // an allowlisted, codehash-current adapter.
+            address target = calls[i].target;
+            if (target != asset_ && !ITierRegistry(registry).isAdapterAllowed(target)) {
+                revert DisallowedBatchCallee(target);
+            }
             bytes calldata data = calls[i].data;
+            // ── PART 2b: value-moving-selector checks (retained, unchanged) ──
             if (data.length < 4) continue;
             bytes4 sel = bytes4(data[0:4]);
             address recipient;
@@ -955,7 +1006,7 @@ contract SyndicateVault is
                 _Permit2BatchDetail[] memory details = abi.decode(data[4:], (_Permit2BatchDetail[]));
                 for (uint256 j = 0; j < details.length; j++) {
                     address to = details[j].to;
-                    if (to == address(this) && calls[i].target == asset()) continue;
+                    if (to == address(this) && calls[i].target == asset_) continue;
                     if (!ITierRegistry(registry).isAdapterAllowed(to)) {
                         revert DisallowedTransferTarget(calls[i].target, sel, to);
                     }
@@ -970,7 +1021,7 @@ contract SyndicateVault is
             // whose destination decodes to the vault still routes through the
             // TierRegistry check below — see the "SELF-TRANSFER FAST-PATH
             // SCOPED TO asset()" note above.
-            if (recipient == address(this) && calls[i].target == asset()) continue;
+            if (recipient == address(this) && calls[i].target == asset_) continue;
             if (!ITierRegistry(registry).isAdapterAllowed(recipient)) {
                 revert DisallowedTransferTarget(calls[i].target, sel, recipient);
             }

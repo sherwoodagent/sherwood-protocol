@@ -26,6 +26,26 @@ contract DenyAllTierRegistry {
     }
 }
 
+/// @dev issue #166 companion fixture: `DenyAllTierRegistry` above is
+///      deliberately hardcoded to deny everything, which was fine pre-#166
+///      (the old Part 2 selector switch ignored non-value-moving calls like
+///      `execute()`/`settle()` regardless of the registry's answer). The NEW
+///      callee gate (PART 2a) now checks `isAdapterAllowed` on EVERY batch
+///      target, so `test_adapterOnlyVaultEntrypointsStayReachable` below —
+///      whose whole point is that an ORDINARY adapter stays reachable, i.e.
+///      Part 1's denylist does not overreach — needs a registry that can
+///      actually allow that one adapter, without touching the other seven
+///      tests in this file (which all hit Part 1's unconditional target
+///      denylist before Part 2 is ever reached, so `DenyAllTierRegistry`
+///      remains correct and untouched for them).
+contract AllowlistableTierRegistry {
+    mapping(address => bool) public isAdapterAllowed;
+
+    function setAdapterAllowed(address adapter, bool allowed) external {
+        isAdapterAllowed[adapter] = allowed;
+    }
+}
+
 /// @title Vault_batchQueueTargets
 /// @notice Issue #93 — a governor batch could reach the withdrawal queue's
 ///         `onlyVault` entrypoints, because `BatchExecutorLib.executeBatch`
@@ -303,6 +323,16 @@ contract VaultBatchQueueTargetsTest is Test {
         MockStrategy template = new MockStrategy();
         MockStrategy strategy = MockStrategy(Clones.clone(address(template)));
         strategy.initialize(address(vault), owner, abi.encode(address(usdc), address(0), uint256(0), uint256(0), false));
+
+        // issue #166: the file-wide `DenyAllTierRegistry` fixture would now
+        // trip the NEW callee gate on this ordinary adapter target — swap in
+        // an allowlist-capable registry and allowlist `strategy` so this test
+        // keeps proving what it always proved (Part 1's denylist does not
+        // overreach onto ordinary adapters), not something the callee gate
+        // would refuse for an unrelated reason.
+        AllowlistableTierRegistry adapterRegistry = new AllowlistableTierRegistry();
+        adapterRegistry.setAdapterAllowed(address(strategy), true);
+        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("tierRegistry()"), abi.encode(address(adapterRegistry)));
 
         // Issue #150 fix: `BaseStrategy.execute()` now resolves
         // `vault() -> governor()` and requires the governor's active

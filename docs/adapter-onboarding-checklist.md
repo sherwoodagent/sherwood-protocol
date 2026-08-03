@@ -93,6 +93,20 @@ reverts `DisallowedTransferTarget(target, selector, recipient)`
 [`:525`](../src/SyndicateVault.sol#L525)). Any other selector is skipped
 ([`:527`](../src/SyndicateVault.sol#L527)).
 
+**Issue #166 — Gate B now also gates callability itself, not only recipients.**
+`_guardBatchCalls` PART 2a checks `isAdapterAllowed(target)` on EVERY batch
+call, before any selector is inspected: a target that is neither `asset()` nor
+allowlisted is refused outright with `DisallowedBatchCallee(target)`, whatever
+its selector or calldata length (including empty-calldata, `value`-only calls
+— previously invisible to every check above). This is the SAME mapping and
+the SAME `setAdapterAllowed` write as the recipient-side table above — not a
+second allowlist — so onboarding is unchanged in mechanics: allowlist the
+adapter once, and it is both a legal recipient and a legal callee. See
+`openspec/changes/target-based-batch-gating/design.md` for the full design.
+The selector table above is retained underneath as defense-in-depth (an
+allowlisted TOKEN can still be handed a non-allowlisted spender/recipient in
+its calldata, which only the table above catches).
+
 ### Gate B is codehash-bound (issue #137)
 
 `setAdapterAllowed(adapter, true)` snapshots the adapter's effective codehash
@@ -444,6 +458,40 @@ and to owner-clear the allowlist-only entries `poke` cannot reach (it reverts
 
 ---
 
+## 4a. Vault-implementation upgrade checklist (issue #166 callee gate)
+
+`_guardBatchCalls` validates stored calldata at USE time, not at store time —
+so upgrading a vault to a `SyndicateVault` implementation carrying the callee
+gate changes the rule for proposals ALREADY in flight, not just future ones.
+Before rolling the implementation to any vault:
+
+1. **Pre-populate the registry.** Run `setAdapterAllowed(t, true)` (§2.4) for
+   every non-`asset()` target that the vault's LIVE or QUEUED batches
+   legitimately call. Every live strategy adapter already qualifies via the
+   existing Gate B requirement above — the new burden is only for any
+   direct-to-protocol call that bypasses an adapter.
+2. **Upgrade only while the vault has no open proposal** — `_openProposalCount`
+   caps a vault at one open proposal, so this is a single on-chain read per
+   vault (`governor.getActiveProposal() == 0` / the vault's own open-proposal
+   accounting) — **or**, if a proposal IS open, read its stored
+   `executeCalls`/`settlementCalls` targets first and confirm each one is
+   already `asset()` or allowlisted before upgrading that vault.
+3. **If the checklist is skipped, the failure is loud and recoverable, not
+   silent.** A stored call whose target fails the new gate reverts
+   `DisallowedBatchCallee(target)` naming the exact missing target — fixed by
+   running §2.4 for that target, then re-driving the normal `unstick` /
+   `emergencySettleWithCalls` recovery path. No lifecycle state is
+   grandfathered in code; this checklist is what makes the honest set of
+   "will this proposal still execute after the upgrade" answers empty at
+   upgrade time.
+
+See `openspec/changes/target-based-batch-gating/design.md` Decision 3 for the
+full in-flight-proposal asymmetry analysis (an `Approved` proposal self-heals
+to `Expired`; an `Executed` proposal's settlement failing is terminal without
+an owner rescue).
+
+---
+
 ## 5. What is *not* enforced
 
 Stated plainly, because the checklist above is only as good as the reader's
@@ -457,8 +505,16 @@ awareness of what it is substituting for:
   human judgment, and there is no code path that will catch you getting it
   wrong.
 - **The codehash snapshot does not cover proxies** (§2.3).
-- **The guard covers ERC20 only.** ERC721/ERC1155/LP-NFT approvals are
-  unguarded ([`SyndicateVault.sol:495-501`](../src/SyndicateVault.sol#L495)).
+- **The guard covers ERC20 only** for the SELECTOR-level checks (recipient of
+  `approve`/`transfer`/etc). As of issue #166, ERC721/ERC1155/LP-NFT contracts
+  are refused as batch CALLEES by default (they are never `asset()` and are
+  not meant to be allowlisted — see the governance-discipline note below), so
+  the old `setApprovalForAll`-shaped gap is closed as a class. The residual is
+  narrower and now a governance-discipline requirement rather than a
+  mechanical one: **exotic-asset contracts MUST NOT be allowlisted as batch
+  callees** — if one ever were, its non-ERC20 selectors would still pass this
+  selector table unexamined. Batches reach such positions through allowlisted
+  adapters instead, never direct calldata against the position contract.
 - **An unwired registry means an unguarded batch — and an unguarded strategy
   init.** If the governor returns `address(0)` (or lacks the getter),
   `_guardBatchCalls` returns early and the batch runs unguarded by design

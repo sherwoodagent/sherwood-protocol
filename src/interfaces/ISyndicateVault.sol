@@ -62,6 +62,15 @@ interface ISyndicateVault {
     ///         batch executes under `delegatecall`, so `msg.sender == vault`
     ///         would satisfy those contracts' own trust gates.
     error DisallowedBatchTarget(address target);
+    /// @notice A governor-batch call named a target that is neither the vault's
+    ///         underlying asset() nor an adapter allowlisted in the TierRegistry.
+    ///         Refused regardless of selector or calldata length — the callee
+    ///         gate is what closes the unenumerable-selector class (issue #166);
+    ///         the selector checks beneath it are defense-in-depth on allowlisted
+    ///         callees. Only raised when the calling governor resolves a nonzero
+    ///         TierRegistry (the callee gate degrades open with the rest of the
+    ///         registry-gated half).
+    error DisallowedBatchCallee(address target);
     /// @notice A governor-batch call carries a guarded value-moving selector but
     ///         its calldata is too short to hold the spender/recipient argument.
     error MalformedCall();
