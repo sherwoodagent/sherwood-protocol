@@ -264,6 +264,97 @@ contract TokenCourtTest is Test {
         vm.stopPrank();
     }
 
+    /// @notice Issue #84, option 1: `setParticipationFloorBps` must not accept
+    ///         a value that meets or exceeds the wired sWOOD's LIVE
+    ///         `ageFloorBps()` (setUp's `MockStakedWood` defaults to 2_500).
+    ///         Both the boundary (equality) and above it revert — see the
+    ///         design's D2 for why equality is already the violating case:
+    ///         `finalize` needs `turnout >= floor`, turnout is aged weight
+    ///         bounded below by `ageFloorBps/10_000` of raw stake, so at
+    ///         `participationFloorBps == ageFloorBps` the raw-turnout fraction
+    ///         needed to clear is exactly 100% — every un-accused staked wei
+    ///         voting at age zero, not a liveness guarantee anyone can stand
+    ///         on, and exactly what the deploy pre-flight already rejects.
+    function test_setParticipationFloorBps_revertsFloorInvariantViolated_atOrAboveWiredAgeFloor() public {
+        assertEq(swood.ageFloorBps(), 2_500, "fixture assumption");
+        vm.startPrank(owner);
+        vm.expectRevert(ITokenCourt.FloorInvariantViolated.selector);
+        court.setParticipationFloorBps(2_500); // equality: violates
+        vm.expectRevert(ITokenCourt.FloorInvariantViolated.selector);
+        court.setParticipationFloorBps(2_501); // above: violates
+        vm.stopPrank();
+    }
+
+    /// @notice The mirror: strictly below the wired age floor succeeds,
+    ///         emits, and lands in storage — the guard has a live path, not
+    ///         only a revert path.
+    function test_setParticipationFloorBps_acceptsStrictlyBelowWiredAgeFloor() public {
+        vm.expectEmit(false, false, false, true);
+        emit ITokenCourt.ParticipationFloorBpsSet(1_000, 2_499);
+        vm.prank(owner);
+        court.setParticipationFloorBps(2_499);
+        assertEq(court.participationFloorBps(), 2_499);
+    }
+
+    /// @notice The invariant is VACUOUS with no electorate wired — there is
+    ///         no age floor to compare against yet (mirrors
+    ///         `test_setVoteWindow_vacuousWithNoGameWired`). The bypass this
+    ///         opens is closed at the other end: wiring an electorate whose
+    ///         age floor the raised value now meets or exceeds must revert.
+    function test_setParticipationFloorBps_vacuousWithNoStakedWoodWired_bypassClosedAtWiring() public {
+        TokenCourt freshCourt = new TokenCourt(owner);
+        vm.startPrank(owner);
+        freshCourt.setParticipationFloorBps(9_999); // no sWOOD wired: would violate against any real electorate
+        assertEq(freshCourt.participationFloorBps(), 9_999);
+
+        MockStakedWood freshSwood = new MockStakedWood(); // default ageFloorBps 2_500
+        vm.expectRevert(ITokenCourt.FloorInvariantViolated.selector);
+        freshCourt.setStakedWood(address(freshSwood)); // wiring must catch what the vacuous branch let through
+        vm.stopPrank();
+    }
+
+    /// @notice `setStakedWood` validates unconditionally against the NEW
+    ///         sWOOD's `ageFloorBps()` — no vacuous branch, every call
+    ///         validates (design D4). Equality is refused; strictly above the
+    ///         current floor is accepted.
+    function test_setStakedWood_revertsFloorInvariantViolated_whenNewAgeFloorAtOrBelowCurrentFloor() public {
+        assertEq(court.participationFloorBps(), 1_000, "fixture assumption");
+        MockStakedWood tooLow = new MockStakedWood();
+        tooLow.setAgeFloorBps(1_000); // equals the current floor: violates
+        vm.prank(owner);
+        vm.expectRevert(ITokenCourt.FloorInvariantViolated.selector);
+        court.setStakedWood(address(tooLow));
+
+        MockStakedWood justAbove = new MockStakedWood();
+        justAbove.setAgeFloorBps(1_001); // strictly above: accepted
+        vm.prank(owner);
+        court.setStakedWood(address(justAbove));
+        assertEq(court.stakedWood(), address(justAbove));
+    }
+
+    /// @notice Behavioural end-to-end sanity for the documented residual
+    ///         (design D5): lowering `ageFloorBps` on the STAKING side is the
+    ///         one lever this change deliberately does not guard, because
+    ///         sWOOD holds no pointer back to the court. Proves (a) that
+    ///         lowering it is legal and immediately visible to the court's
+    ///         live read, (b) a subsequent `setParticipationFloorBps` at or
+    ///         above the new (lower) age floor now correctly reverts, and (c)
+    ///         the ALREADY-SET floor keeps operating — no retroactive wedge.
+    function test_ageFloorLoweredOnStakedWoodSide_isLegalAndVisibleButNotGuardedHere() public {
+        vm.prank(owner);
+        court.setParticipationFloorBps(2_000); // legal: 2_000 < 2_500 (wired mock's default)
+        assertEq(court.participationFloorBps(), 2_000);
+
+        swood.setAgeFloorBps(2_000); // sWOOD-side lever: LEGAL, not guarded here — the documented residual
+        assertEq(swood.ageFloorBps(), 2_000);
+
+        vm.prank(owner);
+        vm.expectRevert(ITokenCourt.FloorInvariantViolated.selector);
+        court.setParticipationFloorBps(2_000); // now equals the LOWERED age floor: the court's guard catches it live
+
+        assertEq(court.participationFloorBps(), 2_000, "no retroactive wedge: the already-set floor is untouched");
+    }
+
     function test_views_nonexistentCaseReturnDefaults() public view {
         ITokenCourt.Case memory cs = court.caseOf(999);
         assertEq(cs.challengeId, 0);
@@ -285,7 +376,14 @@ contract TokenCourtTest is Test {
         vm.prank(owner);
         court.setChallengeGame(newGame);
 
-        address newSwood = makeAddr("newSwood");
+        // A REAL `IStakedWood`-shaped stand-in, not a bare address (issue
+        // #84): `setStakedWood` now reads the new sWOOD's own `ageFloorBps()`
+        // to enforce the floor invariant, which a code-less `makeAddr` has no
+        // answer for. Hoisted before `vm.prank` — a call in argument position
+        // would evaluate first and eat the one-shot prank. `MockStakedWood`'s
+        // default `ageFloorBps` (2_500) comfortably clears the floor this
+        // test raises to (2_000) below.
+        address newSwood = address(new MockStakedWood());
         vm.expectEmit(true, true, false, true);
         emit ITokenCourt.StakedWoodSet(address(swood), newSwood);
         vm.prank(owner);

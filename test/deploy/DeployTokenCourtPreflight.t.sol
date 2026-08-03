@@ -6,6 +6,7 @@ import {Vm} from "forge-std/Vm.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {DeployTokenCourt, WireTokenCourt} from "../../script/DeployTokenCourt.s.sol";
 import {TokenCourt} from "../../src/TokenCourt.sol";
+import {ITokenCourt} from "../../src/interfaces/ITokenCourt.sol";
 import {ChallengeGame} from "../../src/ChallengeGame.sol";
 import {StakedWood} from "../../src/StakedWood.sol";
 import {ExposureLedger} from "../../src/ExposureLedger.sol";
@@ -232,17 +233,40 @@ contract DeployTokenCourtPreflightTest is Test {
         assertEq(game.court(), address(court), "boundary must wire");
     }
 
-    /// @dev PRE-FLIGHT 4: launch-math. `setParticipationFloorBps` allows any
-    ///      value in `(0, 10_000]`, so raising it to `AGE_FLOOR_BPS` itself
-    ///      (still a perfectly legal call on the court's own setter) is
-    ///      enough to reach the violating state — no slot poke required.
+    /// @dev PRE-FLIGHT 4: launch-math. Issue #84 ("enforce the floor
+    ///      invariant in the setters") guarded `TokenCourt.setParticipationFloorBps`
+    ///      / `setStakedWood` on-chain, so the route this test used to take —
+    ///      `court.setParticipationFloorBps(AGE_FLOOR_BPS)` — now reverts
+    ///      `FloorInvariantViolated` before ever reaching the wire step (see
+    ///      the companion test below). What this pre-flight still uniquely
+    ///      covers, and the reason it stays, is the side the court's setters
+    ///      CANNOT guard: `StakedWood.setAgeFloorBps` LOWERING the age floor
+    ///      after deploy — sWOOD holds no pointer back to the court, so
+    ///      nothing on the court's side observes this move. Lowering to
+    ///      `1_000` (the court's own default `participationFloorBps`, never
+    ///      touched by a guarded setter) is legal on sWOOD's own setter and
+    ///      reaches the violating state (`1_000 >= 1_000`) that only the
+    ///      wire-time pre-flight now catches.
     function test_wirePreflight_bites_whenParticipationFloorMeetsAgeFloor() public {
         TokenCourt court = _deployAndSetCourtEnv();
         vm.prank(DEFAULT_SENDER);
-        court.setParticipationFloorBps(AGE_FLOOR_BPS); // no longer STRICTLY less than ageFloorBps
+        swood.setAgeFloorBps(1_000); // legal on sWOOD's own setter; the court's route is now guarded (see below)
 
         assertEq(court.participationFloorBps(), swood.ageFloorBps(), "floor should equal age floor, not be below it");
         _runWireExpecting("PRE-FLIGHT: TokenCourt.participationFloorBps >= StakedWood.ageFloorBps.");
+    }
+
+    /// @dev Companion to the above: proves the OLD route to the violating
+    ///      state — raising `participationFloorBps` on the court's own
+    ///      setter — is now dead. `DEFAULT_SENDER` is still the court's owner
+    ///      at this point (pre-handoff, same as every other pre-flight test
+    ///      in this file), so this exercises the setter's guard directly
+    ///      rather than the wire script's pre-flight.
+    function test_setParticipationFloorBps_revertsFloorInvariantViolated_viaTheOldRoute() public {
+        TokenCourt court = _deployAndSetCourtEnv();
+        vm.prank(DEFAULT_SENDER);
+        vm.expectRevert(ITokenCourt.FloorInvariantViolated.selector);
+        court.setParticipationFloorBps(AGE_FLOOR_BPS);
     }
 
     /// @dev PRE-FLIGHT 5 (a): Plan D's coverage-freezer role lost.

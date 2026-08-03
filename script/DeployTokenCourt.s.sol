@@ -158,6 +158,20 @@ contract DeployTokenCourt is Script {
  *      court's only decision path. At defaults: `1_000 < 2_500` OK, implying
  *      `1_000 * 10_000 / 2_500 == 4_000` bps (40%) of RAW stake must vote to
  *      clear the floor at launch.
+ *
+ *      CORRECTED (issue #84, "enforce the floor invariant in the setters"):
+ *      `TokenCourt.setParticipationFloorBps` and `TokenCourt.setStakedWood`
+ *      now enforce this same invariant on-chain, each against the OTHER
+ *      side's LIVE value at call time, exactly as PRE-FLIGHT 3's setters do
+ *      for the window invariant. What THIS pre-flight still uniquely
+ *      covers, and did not stop covering: (a) `StakedWood.setAgeFloorBps`
+ *      LOWERING the age floor between `DeployTokenCourt` and
+ *      `WireTokenCourt` — sWOOD holds no pointer back to the court, so
+ *      nothing on the court's side can see that move, and (b) the pair's
+ *      very first live values at wiring time, since the constructor's
+ *      default `participationFloorBps` (`1_000`, set at declaration) never
+ *      passes through the guarded setter. Neither setter guard makes this
+ *      redundant.
  * @dev PRE-FLIGHT 5: Plan D's wiring is still intact, or a `Guilty` verdict
  *      dead-ends at `_settle`. Ranked by what a miss actually costs (review
  *      M4).
