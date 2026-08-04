@@ -1615,8 +1615,20 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///         relief no longer depends on an external keeper (issue #33,
     ///         settle-coverage-self-trigger design D1/D2). Never reverts.
     /// @dev    Guard first: `settleCoverage` itself reverts `ReviewNotClosed`
-    ///         unless `block.timestamp > proposal.executeBy` — settlement is
-    ///         NOT reliably past that deadline (a proposer self-settle at
+    ///         unless `pv.executeBy != 0 && block.timestamp > pv.executeBy` —
+    ///         mirrored here exactly, including the `== 0` disjunct.
+    ///         `proposal.executeBy` stays zero for a collaborative Draft that
+    ///         never reaches Pending (collaboration-window timeout ->
+    ///         Expired, or a lead cancel -> Cancelled via `cancelProposal`'s
+    ///         Draft branch) — `_snapshotTierAndGate` locks a bond and pins
+    ///         `proposerBondLedger` on that path regardless. Without the
+    ///         `== 0` check, `block.timestamp <= 0` is always false, so the
+    ///         guard would NOT skip and the ledger call would run only to
+    ///         revert `ReviewNotClosed` itself (since the ledger reads the
+    ///         same zero `executeBy`) — caught by the bare catch below, but
+    ///         a spurious `CoverageSettleFailed` for a proposal that was
+    ///         never capable of a real failure. Settlement is NOT reliably
+    ///         past `executeBy` either (a proposer self-settle at
     ///         `executedAt + 1 hours`, or a `strategyDuration` shorter than
     ///         the remaining execution window, lands before it), so an
     ///         early call here is a statically-knowable no-op. Skipping it
@@ -1639,7 +1651,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///         `CoverageSettleFailed` and permissionlessly repairable via the
     ///         unchanged external `ExposureLedger.settleCoverage`.
     function _settleCoverageBestEffort(uint256 proposalId, StrategyProposal storage proposal) private {
-        if (block.timestamp <= proposal.executeBy) return;
+        if (proposal.executeBy == 0 || block.timestamp <= proposal.executeBy) return;
         address ledger = proposal.proposerBondLedger;
         if (ledger == address(0)) ledger = _exposureLedger;
         if (ledger == address(0)) return;

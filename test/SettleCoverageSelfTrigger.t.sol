@@ -663,6 +663,73 @@ contract SettleCoverageSelfTriggerTest is Test {
         govC.reclaimProposerBond(pid); // no bond was ever locked -> reverts before the trigger tail
     }
 
+    /// @notice Audit fix: a Draft proposal (collaborative, coProposers.length
+    ///         > 0) that never reaches Pending has `executeBy == 0` forever
+    ///         (only `_initPendingProposal`, on the non-collaborative branch,
+    ///         ever writes it) -- but `_snapshotTierAndGate` still locks a
+    ///         bond and pins `proposerBondLedger` unconditionally at propose.
+    ///         The lead proposer cancels while still in Draft (a routine,
+    ///         non-adversarial path -- no collaboration-window wait needed
+    ///         since a single co-proposer's Draft is cancellable at any
+    ///         point). `reclaimProposerBond` on the resulting Cancelled
+    ///         proposal must hit the `proposal.executeBy == 0` disjunct of
+    ///         the guard and skip SILENTLY: no ledger call, no
+    ///         `CoverageSettleFailed` -- NOT a caught `ReviewNotClosed` for a
+    ///         proposal that was never capable of a real trigger failure.
+    function test_reclaimProposerBond_draftNeverPending_executeByZero_skipsSilently() public {
+        address coAgentA = makeAddr("coAgentA");
+        // Hoisted: `agentRegistry.mint(coAgentA)` in argument position would
+        // consume the pending one-shot `vm.prank(owner)` before
+        // `registerAgent` itself runs (repo gotcha).
+        uint256 coAgentNftId = agentRegistry.mint(coAgentA);
+        vm.prank(owner);
+        vaultA.registerAgent(coAgentNftId, coAgentA);
+
+        ISyndicateGovernor.CoProposer[] memory coProposers = new ISyndicateGovernor.CoProposer[](1);
+        coProposers[0] = ISyndicateGovernor.CoProposer({agent: coAgentA, splitBps: 3000});
+
+        BatchExecutorLib.Call[] memory exec = _execCalls();
+        BatchExecutorLib.Call[] memory settle = _settleCalls();
+        vm.prank(agentA);
+        uint256 pid = govA.propose(
+            address(vaultA),
+            address(0),
+            "ipfs://draft-never-pending",
+            3 days,
+            ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000}),
+            exec,
+            GovEnvelope.defaultCaps(MAX_CAPITAL, exec.length),
+            settle,
+            GovEnvelope.defaultCaps(MAX_CAPITAL, settle.length),
+            coProposers
+        );
+
+        assertEq(_state(govA, pid), uint256(ISyndicateGovernor.ProposalState.Draft), "collaborative propose -> Draft");
+        assertEq(govA.getProposal(pid).executeBy, 0, "executeBy never written on the Draft path");
+        assertEq(govA.getProposal(pid).proposerBondWood, BOND_WOOD, "bond locked unconditionally at propose");
+        assertTrue(govA.getProposal(pid).proposerBondLedger != address(0), "ledger pinned unconditionally too");
+
+        // Lead cancels immediately -- a single co-proposer Draft (total == 1)
+        // is cancellable at any point, no collaboration-window wait needed.
+        vm.prank(agentA);
+        govA.cancelProposal(pid);
+        assertEq(_state(govA, pid), uint256(ISyndicateGovernor.ProposalState.Cancelled));
+        assertEq(govA.getProposal(pid).executeBy, 0, "still zero -- Cancelled from Draft never touches it");
+
+        uint256 agentBalBefore = wood.balanceOf(agentA);
+        vm.recordLogs();
+        govA.reclaimProposerBond(pid); // executedAt == 0 too -> no challenge-window gate to wait on
+        assertEq(wood.balanceOf(agentA), agentBalBefore + BOND_WOOD, "bond released normally");
+
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        assertEq(
+            _countCoverageSettleFailed(logs, address(govA)),
+            0,
+            "silent skip, NOT a caught ReviewNotClosed -- executeBy == 0 is a skip condition, not a failure"
+        );
+        assertEq(_countCoverageSettled(logs, address(ledger)), 0, "ledger was never called at all");
+    }
+
     // ── 3.8 Gas snapshot (nice-to-have; not blocking) ──
 
     /// @dev Isolates the trigger's added gas by diffing `settleProposal`
