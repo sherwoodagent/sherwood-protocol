@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import {console} from "forge-std/Script.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {SyndicateFactory} from "../../src/SyndicateFactory.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {StakedWood} from "../../src/StakedWood.sol";
@@ -108,31 +109,13 @@ contract DeployRobinhoodMainnet is DeploySherwood {
         ProtocolConfig(d.protocolConfig).setProtocolFeeRecipient(deployer);
 
         // Multisig handoff (final action inside the broadcast).
-        address effectiveOwner = deployer;
-        if (!skipHandoff) {
-            // Per-vault governors: the beacon (shared impl) and ProtocolConfig
-            // (global fee params) are the governance handles — there is no
-            // singleton governor proxy to hand off.
-            Ownable(d.beacon).transferOwnership(ownerMultisig);
-            Ownable(d.protocolConfig).transferOwnership(ownerMultisig);
-            Ownable(d.factoryProxy).transferOwnership(ownerMultisig);
-            Ownable(d.registryProxy).transferOwnership(ownerMultisig);
-            Ownable(d.swoodProxy).transferOwnership(ownerMultisig);
-            effectiveOwner = ownerMultisig;
-        }
+        if (!skipHandoff) _handoffRobinhood(d, ownerMultisig);
 
         vm.stopBroadcast();
 
-        _validateMainnet(
-            effectiveOwner,
-            deployer,
-            d.beacon,
-            d.protocolConfig,
-            d.factoryProxy,
-            d.registryProxy,
-            d.swoodProxy,
-            woodToken
-        );
+        // `address(0)` for the multisig is how validation is told the handoff
+        // was skipped — the fork posture, where the deployer keeps everything.
+        _validateMainnet(d, deployer, skipHandoff ? address(0) : ownerMultisig, woodToken);
 
         // Persist. `_writeAddresses` patches the core keys in place, so the
         // external addresses (WETH / USDG / Uniswap / Chainlink feeds) that were
@@ -159,33 +142,69 @@ contract DeployRobinhoodMainnet is DeploySherwood {
         );
     }
 
-    function _validateMainnet(
-        address expectedOwner,
-        address deployer,
-        address beaconAddr,
-        address protocolConfigAddr,
-        address factoryAddr,
-        address registryAddr,
-        address swoodAddr,
-        address wood
-    ) internal view {
-        SyndicateFactory factory = SyndicateFactory(factoryAddr);
-        ProtocolConfig protocolConfig = ProtocolConfig(protocolConfigAddr);
+    /// @dev THE OWNERSHIP MODELS ARE NOT UNIFORM, and treating them as if they
+    ///      were is what made this script revert on every real mainnet run.
+    ///      Beacon / factory / registry / sWOOD are one-step `Ownable`, so
+    ///      `transferOwnership` moves `owner()` immediately. `ProtocolConfig`
+    ///      and `TierRegistry` are `Ownable2Step`, so the same call only ARMS
+    ///      the transfer: `owner()` stays the deployer and the multisig has to
+    ///      call `acceptOwnership()`. Validation has to expect each shape.
+    ///
+    ///      `TierRegistry` was missing here entirely. `deployCore` mints it
+    ///      owned by the deployer and wires it into the factory, and nothing
+    ///      afterwards moved it — so a mainnet ceremony handed five contracts to
+    ///      the Safe and left the adapter-certification authority
+    ///      (`proposeCertification`, `demote`, `setAdapterAllowed`) on the
+    ///      deployer key, with no assertion anywhere to notice.
+    function _handoffRobinhood(Deployed memory d, address ownerMultisig) internal {
+        // Per-vault governors: the beacon (shared impl) and ProtocolConfig
+        // (global fee params) are the governance handles — there is no
+        // singleton governor proxy to hand off.
+        Ownable(d.beacon).transferOwnership(ownerMultisig);
+        Ownable(d.factoryProxy).transferOwnership(ownerMultisig);
+        Ownable(d.registryProxy).transferOwnership(ownerMultisig);
+        Ownable(d.swoodProxy).transferOwnership(ownerMultisig);
+
+        Ownable2Step(d.protocolConfig).transferOwnership(ownerMultisig);
+        Ownable2Step(d.tierRegistry).transferOwnership(ownerMultisig);
+        console.log("RUNBOOK: the multisig MUST call acceptOwnership() on ProtocolConfig AND TierRegistry");
+    }
+
+    /// @param ownerMultisig the Safe the handoff targeted, or `address(0)` when
+    ///        the handoff was skipped (fork posture: the deployer keeps all).
+    function _validateMainnet(Deployed memory d, address deployer, address ownerMultisig, address wood) internal view {
+        SyndicateFactory factory = SyndicateFactory(d.factoryProxy);
+
+        bool handedOff = ownerMultisig != address(0);
+        address oneStepOwner = handedOff ? ownerMultisig : deployer;
+        // A two-step transfer never moves `owner()`; only `pendingOwner()`.
+        address expectedPending = handedOff ? ownerMultisig : address(0);
 
         // Per-vault governors are minted at `createSyndicate`, so there is no
         // governor instance to inspect here. What's checkable at deploy time is
         // the beacon (shared impl + upgrade authority) and ProtocolConfig.
-        _checkAddr("beacon.owner", Ownable(beaconAddr).owner(), expectedOwner);
-        _checkAddr("protocolConfig.owner", Ownable(protocolConfigAddr).owner(), expectedOwner);
-        _checkAddr("protocolConfig.protocolFeeRecipient", protocolConfig.protocolFeeRecipient(), deployer);
+        _checkAddr("beacon.owner", Ownable(d.beacon).owner(), oneStepOwner);
+        _checkAddr("factory.owner", Ownable(d.factoryProxy).owner(), oneStepOwner);
+        _checkAddr("registry.owner", Ownable(d.registryProxy).owner(), oneStepOwner);
+        _checkAddr("swood.owner", Ownable(d.swoodProxy).owner(), oneStepOwner);
 
-        _checkAddr("factory.owner", Ownable(factoryAddr).owner(), expectedOwner);
-        _checkAddr("factory.beacon", factory.beacon(), beaconAddr);
+        // The `Ownable2Step` pair. Asserting the PENDING owner is what catches a
+        // deployer who never ran the `acceptOwnership()` runbook step.
+        _checkAddr("protocolConfig.owner", Ownable(d.protocolConfig).owner(), deployer);
+        _checkAddr("protocolConfig.pendingOwner", Ownable2Step(d.protocolConfig).pendingOwner(), expectedPending);
+        _checkAddr("tierRegistry.owner", Ownable(d.tierRegistry).owner(), deployer);
+        _checkAddr("tierRegistry.pendingOwner", Ownable2Step(d.tierRegistry).pendingOwner(), expectedPending);
+
+        _checkAddr(
+            "protocolConfig.protocolFeeRecipient", ProtocolConfig(d.protocolConfig).protocolFeeRecipient(), deployer
+        );
+
+        _checkAddr("factory.beacon", factory.beacon(), d.beacon);
+        _checkAddr("factory.tierRegistry", address(factory.tierRegistry()), d.tierRegistry);
         _checkAddr("factory.ensRegistrar", address(factory.ensRegistrar()), address(0));
         _checkAddr("factory.agentRegistry", address(factory.agentRegistry()), address(0));
 
-        _checkAddr("registry.owner", Ownable(registryAddr).owner(), expectedOwner);
-        _checkAddr("swood.wood", address(StakedWood(swoodAddr).wood()), wood);
-        _checkAddr("swood.registry", StakedWood(swoodAddr).registry(), registryAddr);
+        _checkAddr("swood.wood", address(StakedWood(d.swoodProxy).wood()), wood);
+        _checkAddr("swood.registry", StakedWood(d.swoodProxy).registry(), d.registryProxy);
     }
 }
