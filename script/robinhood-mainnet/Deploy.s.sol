@@ -39,8 +39,25 @@ contract DeployRobinhoodMainnet is DeploySherwood {
     address constant AGENT_REGISTRY = address(0);
 
     // Production governor / factory parameters (mirror script/Deploy.s.sol prod).
-    uint256 constant MANAGEMENT_FEE_BPS = 50;
-    uint256 constant PROTOCOL_FEE_BPS = 100;
+    /// @dev 200 = the 2%-management headline of the two-number fee model, and
+    ///      the same value the canonical `DeploySherwood` defaults to. THIS IS A
+    ///      GUARDIAN-BUDGET NUMBER, NOT A REVENUE ONE: 20% of the management fee
+    ///      funds the guardian pool (`ProtocolConfig._mgmtSplit.guardianBps`),
+    ///      and it is the only leg that pays in flat and losing markets — the
+    ///      performance leg pays nothing below the high-water mark while the
+    ///      review workload is unchanged.
+    ///
+    ///      The prior 50 here was a leftover from before the split rework and
+    ///      undershot the tier-1 guardian ROE hurdle: at 50 bps the pool reaches
+    ///      0.60% of TVL/yr against the 0.90% the 15% hurdle needs. It is a
+    ///      FLOOR rather than a generous choice, because management accrues only
+    ///      while a strategy is deployed — at partial utilisation the mgmt leg
+    ///      shrinks proportionally and 200 itself lands near the hurdle.
+    ///
+    ///      STAMPED ONCE PER VAULT at `initialize`; `SyndicateVault` has no
+    ///      setter and the factory's `setManagementFeeBps` reaches only NEW
+    ///      vaults, so every fund created under a wrong value keeps it forever.
+    uint256 constant MANAGEMENT_FEE_BPS = 200;
     uint256 constant MAX_STRATEGY_DAYS = 14;
     uint256 constant VOTING_PERIOD = 1 days;
 
